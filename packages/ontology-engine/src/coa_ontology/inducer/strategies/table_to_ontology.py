@@ -24,7 +24,12 @@ from rdflib.namespace import SKOS
 from coa_ontology.inducer.schemas import ConceptMatch
 from coa_ontology.inducer.services.data_catalog import CatalogTable
 from coa_ontology.inducer.services.subtype_detection import detect_pk_sharing_subtypes
-from coa_ontology.inducer.strategies.base import SCL, InductionStrategy, pascal_names_for
+from coa_ontology.inducer.strategies.base import (
+    SCL,
+    InductionStrategy,
+    composite_fk_columns,
+    pascal_names_for,
+)
 
 log = logging.getLogger(__name__)
 
@@ -333,13 +338,23 @@ class TableToOntologyStrategy(InductionStrategy):
                         g.add((table_cls, OWL.hasKey, key_bnode))
                         break
 
+            # Columns absorbed into a sibling's composite-FK POM. build_r2rml emits
+            # ONE Referencing Object Map per composite FK (R2RML §7.5), anchored on
+            # the constraint's first column, so declaring an ObjectProperty for the
+            # others would mint properties with no mapping behind them — present in
+            # the TBox and in the NL→SPARQL context, but unresolvable by Ontop, so
+            # queries using them silently return nothing. Declare them as plain
+            # datatype properties instead: the columns do exist, they simply are not
+            # the relationship's anchor.
+            absorbed_fk_columns = composite_fk_columns(table)
+
             for col in table.columns:
                 prop_uri = table_prop(table.name, col.name)
                 is_fk = False
                 fk_target = None
                 fk_target_col = None
                 fk_provenance: str | None = None
-                if table.tableConstraints:
+                if table.tableConstraints and col.name not in absorbed_fk_columns:
                     for tc in table.tableConstraints:
                         if tc.constraintType == "FOREIGN_KEY" and col.name in tc.columns and tc.referredColumns:
                             is_fk = True
@@ -378,6 +393,21 @@ class TableToOntologyStrategy(InductionStrategy):
                     g.add((prop_uri, RDF.type, OWL.DatatypeProperty))
                     g.add((prop_uri, RDFS.domain, table_cls))
                     g.add((prop_uri, RDFS.range, _xsd_for(col.dataType, col.name)))
+                    if col.name in absorbed_fk_columns:
+                        # Record why an FK column is a datatype property, so the
+                        # relationship stays discoverable from the ontology alone.
+                        owner = absorbed_fk_columns[col.name]
+                        note = (
+                            f"Part of a composite foreign key on {table.name}; the relationship is carried by "
+                            f"{camel_by_name[table.name]}_{_to_camel(owner)}"
+                            if owner
+                            else (
+                                f"Part of a malformed composite foreign key on {table.name} "
+                                "(column/target counts differ, or targets span several tables); "
+                                "mapped as a literal because no join can be derived"
+                            )
+                        )
+                        g.add((prop_uri, RDFS.comment, Literal(note)))
 
                 g.add((prop_uri, RDFS.label, Literal(col.name)))
                 if col.description and not (is_fk and fk_target):
