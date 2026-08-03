@@ -58,7 +58,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 PROFILE=""
 REGION="${AWS_DEFAULT_REGION:-us-west-2}"
-PREFIX="scl"
+# Keep in sync with DEFAULT_RESOURCE_PREFIX in libs/ts-shared/src/constants.ts.
+PREFIX="${SCL_PREFIX:-coa}"
 ENV_NAME="dev"
 INDUSTRY="insurance"
 MANIFEST=""              # explicit manifest path (else demo/$INDUSTRY/manifest.yaml)

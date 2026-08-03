@@ -12,7 +12,11 @@ set -euo pipefail
 
 REGION=""
 PROFILE=""
-PREFIX="scl"
+# Keep in sync with DEFAULT_RESOURCE_PREFIX in libs/ts-shared/src/constants.ts.
+# Defaulting to "scl" while the CDK app defaults to "coa" made this script read
+# outputs from a stack named scl-dev-* that a default deployment never creates,
+# so runtime-config.json came back empty instead of failing loudly.
+PREFIX="${SCL_PREFIX:-coa}"
 ENV="dev"
 
 while [[ $# -gt 0 ]]; do

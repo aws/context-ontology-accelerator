@@ -20,7 +20,7 @@ Usage:
 
 Environment:
     AWS_REGION       (default: us-east-1)
-    SCL_PREFIX       (default: scl)
+    SCL_PREFIX       (default: coa)
     SCL_USERNAME     Cognito username (default: from Secrets Manager)
     SCL_PASSWORD     Cognito password (default: from Secrets Manager)
     BENCH_NS         Namespace override
