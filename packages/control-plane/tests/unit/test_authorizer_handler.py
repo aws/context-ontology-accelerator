@@ -168,9 +168,9 @@ class TestRolesCaching:
         from coa_control_plane.authorization.handler import _resolve_roles, _roles_cache
 
         mock_dao = MagicMock()
-        mock_dao.query.side_effect = [
-            MagicMock(items=[{"role": "ADMIN", "resourceId": "GLOBAL"}]),
-            MagicMock(items=[{"role": "data-steward", "resourceId": "ns-123"}]),
+        mock_dao.query_all.side_effect = [
+            [{"role": "ADMIN", "resourceId": "GLOBAL"}],
+            [{"role": "data-steward", "resourceId": "ns-123"}],
         ]
 
         global_roles, resource_roles = _resolve_roles("user@example.com", ["Admins"], mock_dao)
@@ -190,12 +190,12 @@ class TestRolesCaching:
         from coa_control_plane.authorization.handler import _resolve_roles
 
         mock_dao = MagicMock()
-        mock_dao.query.return_value = MagicMock(items=[])
+        mock_dao.query_all.return_value = []
 
         _resolve_roles("foo+123@amazon.com", [], mock_dao)
 
         # Verify the query was made with URL-encoded principal ID
-        query_call = mock_dao.query.call_args_list[0]
+        query_call = mock_dao.query_all.call_args_list[0]
         query_params = query_call[0][0]
         assert query_params.expression_values[":pk"] == "User::foo%2B123@amazon.com"
 
@@ -211,13 +211,13 @@ class TestRolesCaching:
 
         assert global_roles == ["VIEWER"]
         assert resource_roles == [{"role": "data-analyst", "resourceUID": "ns-456"}]
-        mock_dao.query.assert_not_called()
+        mock_dao.query_all.assert_not_called()
 
     def test_cache_key_groups_sorted(self, env_vars):
         from coa_control_plane.authorization.handler import _resolve_roles, _roles_cache
 
         mock_dao = MagicMock()
-        mock_dao.query.return_value = MagicMock(items=[])
+        mock_dao.query_all.return_value = []
 
         _resolve_roles("user@example.com", ["GroupB", "GroupA"], mock_dao)
 
@@ -234,15 +234,15 @@ class TestRolesCaching:
 
         mock_dao = MagicMock()
         # User query returns a role, group query returns nothing
-        mock_dao.query.side_effect = [
-            MagicMock(items=[{"role": "VIEWER", "resourceId": "GLOBAL"}]),
-            MagicMock(items=[]),
+        mock_dao.query_all.side_effect = [
+            [{"role": "VIEWER", "resourceId": "GLOBAL"}],
+            [],
         ]
 
         global_roles, resource_roles = _resolve_roles("user@example.com", ["GroupX"], mock_dao)
 
         # Should have queried DDB since cache was corrupt
-        assert mock_dao.query.called
+        assert mock_dao.query_all.called
         assert global_roles == ["VIEWER"]
         # Cache population disabled — entry should not exist after eviction
         assert cache_key not in _roles_cache

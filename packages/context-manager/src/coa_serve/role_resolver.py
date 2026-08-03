@@ -70,6 +70,12 @@ def resolve_profile(
 
     If no namespace is provided, only roles are resolved (no table/column merge).
     If RRM_TABLE_NAME is not configured, returns a minimal profile with just userId/groups.
+
+    Raises:
+        Exception: Propagates a grant-lookup failure. Resolution must not fall
+            back to a partial read — restrictions derived from a subset of the
+            grants are more permissive than the truth, so a transient DynamoDB
+            error would widen data access.
     """
     result = ResolvedProfile(user_id=user_id, groups=groups)
 
@@ -81,21 +87,35 @@ def resolve_profile(
     principal_keys = [f"User::{sanitize_principal_key(user_id)}"]
     principal_keys.extend(f"Group::{sanitize_principal_key(g)}" for g in groups)
 
-    # Collect all grant items for this principal
+    # Collect all grant items for this principal.
+    #
+    # query_all, not query: one query returns a single 1 MB page, and the grants
+    # on later pages carry tableAllowlist / columnDenylist. Dropping a restricted
+    # grant while an unrestricted one survives makes _merge_data_restrictions see
+    # no restrictions at all, so the SQL firewall stops enforcing them — a PII
+    # denylist silently disabled by a pagination boundary.
+    #
+    # A failure here must NOT degrade to a partial read for the same reason: the
+    # restrictions computed from a subset are more permissive than the truth. Fail
+    # the resolution instead and let the caller reject the request, matching the
+    # control-plane authorizer's fail-closed posture (it re-raises in the
+    # equivalent spot).
     all_items: list[dict[str, Any]] = []
     for pk in principal_keys:
         try:
-            query_result = dao.query(
-                QueryParams(
-                    key_condition="#pk = :pk",
-                    expression_values={":pk": pk},
-                    expression_names={"#pk": "principalKey"},
-                    index_name="PrincipalIndex",
+            all_items.extend(
+                dao.query_all(
+                    QueryParams(
+                        key_condition="#pk = :pk",
+                        expression_values={":pk": pk},
+                        expression_names={"#pk": "principalKey"},
+                        index_name="PrincipalIndex",
+                    )
                 )
             )
-            all_items.extend(query_result.items)
         except Exception:
             logger.exception("role_resolve_query_failed", principal_key=pk)
+            raise
 
     # Resolve roles from all items
     for item in all_items:

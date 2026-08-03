@@ -27,18 +27,22 @@ def _result(items):
 
 
 def _mock_dao(items_by_pk):
-    """Return a DynamoDBDAO factory whose query() dispatches on principalKey.
+    """Return a DynamoDBDAO factory whose query dispatches on principalKey.
 
     ``items_by_pk`` maps the ``:pk`` expression value to the list of grant items
     returned for that principal.
+
+    Both ``query`` and ``query_all`` are stubbed: the resolver uses ``query_all``
+    (a single page would silently drop grants past 1 MB), and ``query_all``
+    returns a plain list rather than a ``PaginatedResult``.
     """
     dao = MagicMock()
 
-    def _query(params):
-        pk = params.expression_values[":pk"]
-        return _result(items_by_pk.get(pk, []))
+    def _items_for(params):
+        return items_by_pk.get(params.expression_values[":pk"], [])
 
-    dao.query.side_effect = _query
+    dao.query.side_effect = lambda params: _result(_items_for(params))
+    dao.query_all.side_effect = _items_for
     return dao
 
 
@@ -78,17 +82,25 @@ class TestResolveProfileRoles:
         assert "platform-viewer" in resolved.global_roles
         assert {"role": "namespace-maintainer", "resourceUID": _NS} in resolved.resource_roles
 
-    def test_query_exception_is_swallowed(self):
+    def test_query_exception_propagates(self):
+        """A grant-lookup failure must NOT degrade to a partial read.
+
+        Previously the exception was swallowed and resolution continued with
+        whatever had been collected. That is unsafe for this specific data:
+        restrictions computed from a subset of the grants are more PERMISSIVE
+        than the truth (see `_merge_data_restrictions` — a missing restricted
+        grant leaves `tableAllowlist`/`columnDenylist` unset, which the SQL
+        firewall reads as unrestricted). So a transient DynamoDB error widened
+        data access. Fail closed instead, matching the control-plane authorizer.
+        """
         dao = MagicMock()
-        dao.query.side_effect = RuntimeError("ddb down")
+        dao.query_all.side_effect = RuntimeError("ddb down")
         with (
             patch.object(role_resolver, "_RRM_TABLE", "rrm"),
             patch.object(role_resolver, "DynamoDBDAO", return_value=dao),
+            pytest.raises(RuntimeError, match="ddb down"),
         ):
-            resolved = resolve_profile("bob@x.com", [], namespace=_NS)
-        # No roles resolved, but no exception propagated (fail-closed posture).
-        assert resolved.global_roles == []
-        assert resolved.resource_roles == []
+            resolve_profile("bob@x.com", [], namespace=_NS)
 
     def test_no_namespace_skips_data_restriction_merge(self):
         items = {"User::alice@x.com": [{"role": "platform-admin", "resourceId": "GLOBAL"}]}
@@ -116,9 +128,25 @@ class TestResolveProfileRoles:
         ):
             resolve_profile("foo+123@x.com", ["group/eng"], namespace=_NS)
 
-        queried_pks = [call.args[0].expression_values[":pk"] for call in dao.query.call_args_list]
+        queried_pks = [call.args[0].expression_values[":pk"] for call in dao.query_all.call_args_list]
         assert "User::foo%2B123@x.com" in queried_pks
         assert "Group::group%2Feng" in queried_pks
+
+    def test_reads_every_page_of_grants(self):
+        """Grants must be read with query_all, not a single 1 MB query page.
+
+        A one-page read drops grants past the page boundary; when the dropped one
+        carries the restrictions, the SQL firewall stops enforcing them.
+        """
+        dao = _mock_dao({"User::u": [{"role": "data-analyst", "resourceId": _NS}]})
+        with (
+            patch.object(role_resolver, "_RRM_TABLE", "rrm"),
+            patch.object(role_resolver, "DynamoDBDAO", return_value=dao),
+        ):
+            resolve_profile("u", [], namespace=_NS)
+
+        dao.query_all.assert_called()
+        dao.query.assert_not_called()
 
 
 @pytest.mark.unit

@@ -10,7 +10,6 @@ import os
 from unittest.mock import MagicMock, patch
 
 import pytest
-from coa_common.dao import PaginatedResult
 
 os.environ.update(
     {
@@ -63,21 +62,18 @@ class TestListPrincipalGrants:
     def test_lists_grants_for_self(self, mock_dao_cls):
         mock_dao = MagicMock()
         mock_dao_cls.return_value = mock_dao
-        mock_dao.query.return_value = PaginatedResult(
-            items=[
-                {
-                    "PK": f"Namespace::{VALID_NS_ID}#User::alice@company.com",
-                    "SK": "ROLE#analyst",
-                    "resourceId": VALID_NS_ID,
-                    "principalType": "User",
-                    "principalId": "alice@company.com",
-                    "role": "analyst",
-                    "grantedBy": "bob@company.com",
-                    "grantedAt": "2026-04-09T10:00:00Z",
-                },
-            ],
-            last_evaluated_key=None,
-        )
+        mock_dao.query_all.return_value = [
+            {
+                "PK": f"Namespace::{VALID_NS_ID}#User::alice@company.com",
+                "SK": "ROLE#analyst",
+                "resourceId": VALID_NS_ID,
+                "principalType": "User",
+                "principalId": "alice@company.com",
+                "role": "analyst",
+                "grantedBy": "bob@company.com",
+                "grantedAt": "2026-04-09T10:00:00Z",
+            },
+        ]
 
         resp = handler(_event_me(), None)
         assert resp["statusCode"] == 200
@@ -86,7 +82,7 @@ class TestListPrincipalGrants:
         assert body["grants"][0]["role"] == "analyst"
 
         # Verify PrincipalIndex GSI was used with sanitized email
-        query_call = mock_dao.query.call_args[0][0]
+        query_call = mock_dao.query_all.call_args[0][0]
         assert query_call.index_name == "PrincipalIndex"
         assert ":pk" in query_call.expression_values
         assert query_call.expression_values[":pk"] == "User::alice@company.com"
@@ -95,14 +91,14 @@ class TestListPrincipalGrants:
     def test_queries_user_and_groups(self, mock_dao_cls):
         mock_dao = MagicMock()
         mock_dao_cls.return_value = mock_dao
-        mock_dao.query.return_value = PaginatedResult(items=[], last_evaluated_key=None)
+        mock_dao.query_all.return_value = []
 
         resp = handler(_event_me("alice@co.com", "admins,viewers"), None)
         assert resp["statusCode"] == 200
 
         # Should query 3 times: User + 2 groups
-        assert mock_dao.query.call_count == 3
-        keys_queried = [call[0][0].expression_values[":pk"] for call in mock_dao.query.call_args_list]
+        assert mock_dao.query_all.call_count == 3
+        keys_queried = [call[0][0].expression_values[":pk"] for call in mock_dao.query_all.call_args_list]
         assert "User::alice@co.com" in keys_queried
         assert "Group::admins" in keys_queried
         assert "Group::viewers" in keys_queried
@@ -122,7 +118,7 @@ class TestListPrincipalGrants:
             "grantedBy": "admin@co.com",
             "grantedAt": "2026-05-01T00:00:00Z",
         }
-        mock_dao.query.return_value = PaginatedResult(items=[grant_item], last_evaluated_key=None)
+        mock_dao.query_all.return_value = [grant_item]
 
         resp = handler(_event_me("alice@co.com", "team"), None)
         body = json.loads(resp["body"])
@@ -133,46 +129,46 @@ class TestListPrincipalGrants:
     def test_normalizes_email_to_lowercase(self, mock_dao_cls):
         mock_dao = MagicMock()
         mock_dao_cls.return_value = mock_dao
-        mock_dao.query.return_value = PaginatedResult(items=[], last_evaluated_key=None)
+        mock_dao.query_all.return_value = []
 
         resp = handler(_event_me("Alice@Company.COM"), None)
         assert resp["statusCode"] == 200
 
-        key = mock_dao.query.call_args[0][0].expression_values[":pk"]
+        key = mock_dao.query_all.call_args[0][0].expression_values[":pk"]
         assert key == "User::alice@company.com"
 
     @patch("coa_control_plane.grants.list_principal_grants_handler.DynamoDBDAO")
     def test_limits_groups_to_max(self, mock_dao_cls):
         mock_dao = MagicMock()
         mock_dao_cls.return_value = mock_dao
-        mock_dao.query.return_value = PaginatedResult(items=[], last_evaluated_key=None)
+        mock_dao.query_all.return_value = []
 
         many_groups = ",".join(f"group{i}" for i in range(20))
         resp = handler(_event_me("a@b.com", many_groups), None)
         assert resp["statusCode"] == 200
         # 1 user + max 10 groups = 11 queries
-        assert mock_dao.query.call_count == 11
+        assert mock_dao.query_all.call_count == 11
 
     @patch("coa_control_plane.grants.list_principal_grants_handler.DynamoDBDAO")
     def test_skips_invalid_group_names(self, mock_dao_cls):
         mock_dao = MagicMock()
         mock_dao_cls.return_value = mock_dao
-        mock_dao.query.return_value = PaginatedResult(items=[], last_evaluated_key=None)
+        mock_dao.query_all.return_value = []
 
         resp = handler(_event_me("a@b.com", "valid-group,bad::group,ok_group"), None)
         assert resp["statusCode"] == 200
         # 1 user + 2 valid groups (bad::group skipped)
-        assert mock_dao.query.call_count == 3
+        assert mock_dao.query_all.call_count == 3
 
     @patch("coa_control_plane.grants.list_principal_grants_handler.DynamoDBDAO")
     def test_fallback_to_claims_email(self, mock_dao_cls):
         mock_dao = MagicMock()
         mock_dao_cls.return_value = mock_dao
-        mock_dao.query.return_value = PaginatedResult(items=[], last_evaluated_key=None)
+        mock_dao.query_all.return_value = []
 
         resp = handler(_event_me_claims("bob@co.com", "devs"), None)
         assert resp["statusCode"] == 200
-        key = mock_dao.query.call_args_list[0][0][0].expression_values[":pk"]
+        key = mock_dao.query_all.call_args_list[0][0][0].expression_values[":pk"]
         assert key == "User::bob@co.com"
 
     def test_rejects_non_me_principal(self):
@@ -207,7 +203,7 @@ class TestListPrincipalGrants:
     def test_dynamo_error_returns_500(self, mock_dao_cls):
         mock_dao = MagicMock()
         mock_dao_cls.return_value = mock_dao
-        mock_dao.query.side_effect = Exception("DynamoDB throttled")
+        mock_dao.query_all.side_effect = Exception("DynamoDB throttled")
 
         resp = handler(_event_me(), None)
         assert resp["statusCode"] == 500
@@ -238,7 +234,7 @@ class TestListPrincipalGrantsToGrantSummary:
             "columnDenylist": {"customers": ["ssn", "dob"]},
             "allowedMetrics": ["revenue", "order_count"],
         }
-        mock_dao.query.return_value = PaginatedResult(items=[item], last_evaluated_key=None)
+        mock_dao.query_all.return_value = [item]
         resp = handler(_event_me(), None)
         body = json.loads(resp["body"])
         grant = body["grants"][0]
@@ -251,7 +247,7 @@ class TestListPrincipalGrantsToGrantSummary:
     def test_overrides_absent_are_omitted(self, mock_dao_cls):
         mock_dao = MagicMock()
         mock_dao_cls.return_value = mock_dao
-        mock_dao.query.return_value = PaginatedResult(items=[self.BASE_ITEM], last_evaluated_key=None)
+        mock_dao.query_all.return_value = [self.BASE_ITEM]
         resp = handler(_event_me(), None)
         body = json.loads(resp["body"])
         grant = body["grants"][0]
@@ -270,7 +266,7 @@ class TestListPrincipalGrantsToGrantSummary:
             "columnDenylist": {},
             "allowedMetrics": [],
         }
-        mock_dao.query.return_value = PaginatedResult(items=[item], last_evaluated_key=None)
+        mock_dao.query_all.return_value = [item]
         resp = handler(_event_me(), None)
         body = json.loads(resp["body"])
         grant = body["grants"][0]
@@ -283,7 +279,7 @@ class TestListPrincipalGrantsToGrantSummary:
         mock_dao = MagicMock()
         mock_dao_cls.return_value = mock_dao
         item = {**self.BASE_ITEM, "columnDenylist": {"customers": ["ssn"]}}
-        mock_dao.query.return_value = PaginatedResult(items=[item], last_evaluated_key=None)
+        mock_dao.query_all.return_value = [item]
         resp = handler(_event_me(), None)
         body = json.loads(resp["body"])
         grant = body["grants"][0]

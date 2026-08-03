@@ -113,7 +113,10 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
         grants: list[dict[str, Any]] = []
 
         for pk in principal_keys:
-            result = mappings_dao.query(
+            # query_all, not query: a single query returns one 1 MB page, so a
+            # principal with many grants would see an arbitrary subset of their
+            # own permissions here — with no indication the list is incomplete.
+            items = mappings_dao.query_all(
                 QueryParams(
                     key_condition="#pk = :pk",
                     expression_values={":pk": pk},
@@ -121,7 +124,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
                     index_name="PrincipalIndex",
                 )
             )
-            for item in result.items:
+            for item in items:
                 summary = _to_grant_summary(item)
                 if summary["grantId"] not in seen_grant_ids:
                     seen_grant_ids.add(summary["grantId"])

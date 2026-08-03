@@ -239,6 +239,108 @@ class TestDynamoDBDAOQuery:
         assert call_args["Limit"] == 10
 
 
+class TestDynamoDBDAOQueryAll:
+    """query_all must follow LastEvaluatedKey to exhaustion.
+
+    DynamoDB caps a query response at 1 MB regardless of how many items match, so
+    a caller reading only ``result.items`` silently truncates. For authorization
+    reads that means roles / data restrictions disappear with no error.
+    """
+
+    def test_follows_pagination_cursor_across_pages(self, mock_table):
+        table, _ = mock_table
+        table.query.side_effect = [
+            {"Items": [{"PK": "a"}], "LastEvaluatedKey": {"PK": "a"}},
+            {"Items": [{"PK": "b"}], "LastEvaluatedKey": {"PK": "b"}},
+            {"Items": [{"PK": "c"}]},
+        ]
+
+        dao = DynamoDBDAO("test-table", region="us-east-1")
+        items = dao.query_all(QueryParams(key_condition="PK = :pk", expression_values={":pk": "x"}))
+
+        assert [i["PK"] for i in items] == ["a", "b", "c"]
+        assert table.query.call_count == 3
+
+    def test_passes_cursor_as_exclusive_start_key(self, mock_table):
+        table, _ = mock_table
+        table.query.side_effect = [
+            {"Items": [{"PK": "a"}], "LastEvaluatedKey": {"PK": "a", "SK": "s"}},
+            {"Items": [{"PK": "b"}]},
+        ]
+
+        dao = DynamoDBDAO("test-table", region="us-east-1")
+        dao.query_all(QueryParams(key_condition="PK = :pk", expression_values={":pk": "x"}))
+
+        assert table.query.call_args_list[1].kwargs["ExclusiveStartKey"] == {"PK": "a", "SK": "s"}
+
+    def test_single_page_makes_one_call(self, mock_table):
+        table, _ = mock_table
+        table.query.return_value = {"Items": [{"PK": "a"}]}
+
+        dao = DynamoDBDAO("test-table", region="us-east-1")
+        items = dao.query_all(QueryParams(key_condition="PK = :pk", expression_values={":pk": "x"}))
+
+        assert len(items) == 1
+        assert table.query.call_count == 1
+
+    def test_empty_result(self, mock_table):
+        table, _ = mock_table
+        table.query.return_value = {"Items": []}
+
+        dao = DynamoDBDAO("test-table", region="us-east-1")
+        assert dao.query_all(QueryParams(key_condition="PK = :pk", expression_values={":pk": "x"})) == []
+
+    def test_preserves_index_and_expression_names_on_every_page(self, mock_table):
+        table, _ = mock_table
+        table.query.side_effect = [
+            {"Items": [{"PK": "a"}], "LastEvaluatedKey": {"PK": "a"}},
+            {"Items": [{"PK": "b"}]},
+        ]
+
+        dao = DynamoDBDAO("test-table", region="us-east-1")
+        dao.query_all(
+            QueryParams(
+                key_condition="#pk = :pk",
+                expression_values={":pk": "x"},
+                expression_names={"#pk": "principalKey"},
+                index_name="PrincipalIndex",
+            )
+        )
+
+        for call in table.query.call_args_list:
+            assert call.kwargs["IndexName"] == "PrincipalIndex"
+            assert call.kwargs["ExpressionAttributeNames"] == {"#pk": "principalKey"}
+
+    def test_honours_a_caller_supplied_start_cursor(self, mock_table):
+        table, _ = mock_table
+        table.query.return_value = {"Items": [{"PK": "b"}]}
+
+        dao = DynamoDBDAO("test-table", region="us-east-1")
+        dao.query_all(
+            QueryParams(
+                key_condition="PK = :pk",
+                expression_values={":pk": "x"},
+                exclusive_start_key={"PK": "a"},
+            )
+        )
+
+        assert table.query.call_args.kwargs["ExclusiveStartKey"] == {"PK": "a"}
+
+    def test_raises_rather_than_returning_a_partial_set(self, mock_table):
+        """Hitting the page bound must fail loudly — silent truncation is the bug."""
+        table, _ = mock_table
+        table.query.return_value = {"Items": [{"PK": "a"}], "LastEvaluatedKey": {"PK": "a"}}
+
+        dao = DynamoDBDAO("test-table", region="us-east-1")
+        with pytest.raises(RuntimeError, match="without exhausting the cursor"):
+            dao.query_all(
+                QueryParams(key_condition="PK = :pk", expression_values={":pk": "x"}),
+                max_pages=3,
+            )
+
+        assert table.query.call_count == 3
+
+
 class TestDynamoDBDAOBatchGet:
     def test_batch_get(self, mock_table):
         _, mock_resource = mock_table
