@@ -2078,8 +2078,15 @@ class TestPascalCaseCollisions:
         assert (ns.TriplesMap_Orders, RDF.type, RR.TriplesMap) in g
         assert (ns.TriplesMap_Customers, RDF.type, RR.TriplesMap) in g
 
-    def test_first_colliding_table_keeps_the_bare_iri(self, strategy):
-        """Existing deployments keep byte-identical IRIs for the first name."""
+    def test_the_lowest_identity_keeps_the_bare_iri(self, strategy):
+        """The bare form is assigned by identity, never by input order.
+
+        Order would be the obvious rule and is the wrong one: ``_catalog_to_tables``
+        emits tables in whatever order the catalog enumerated them, so an
+        order-dependent assignment moves the bare IRI to a different table when that
+        order changes and a freshly generated mapping stops matching an
+        already-accepted ontology.
+        """
         tables = self._tables("order_item", "order-item")
         g = _build(strategy, tables)
         ns = Namespace(PREFIX)
@@ -2088,7 +2095,20 @@ class TestPascalCaseCollisions:
         names = [
             str(n) for lt in g.objects(ns.TriplesMap_OrderItem, RR.logicalTable) for n in g.objects(lt, RR.tableName)
         ]
-        assert names == ['"order_item"']
+        # min("db.order-item", "db.order_item") — "-" sorts before "_".
+        assert names == ['"order-item"']
+
+    def test_assignment_does_not_depend_on_input_order(self, strategy):
+        """Reversing the caller's list must mint exactly the same IRIs."""
+        forward = _build(strategy, self._tables("order_item", "order-item"))
+        reverse = _build(strategy, self._tables("order-item", "order_item"))
+
+        assert set(forward.subjects(RDF.type, RR.TriplesMap)) == set(reverse.subjects(RDF.type, RR.TriplesMap))
+        # Not just the same IRIs — the same table behind each one.
+        for tmap in forward.subjects(RDF.type, RR.TriplesMap):
+            fwd = [str(n) for lt in forward.objects(tmap, RR.logicalTable) for n in forward.objects(lt, RR.tableName)]
+            rev = [str(n) for lt in reverse.objects(tmap, RR.logicalTable) for n in reverse.objects(lt, RR.tableName)]
+            assert fwd == rev, f"{tmap} maps {fwd} one way and {rev} the other"
 
     def test_assignment_is_deterministic_across_runs(self, strategy):
         """Same input order must mint the same IRIs every time."""
@@ -2622,3 +2642,246 @@ class TestOverlappingCompositeForeignKeys:
         assert _object_map_parent_tmap(g, ns["TriplesMap_Child/POM_D"]) == ns.TriplesMap_P3
         # b is the only folded column, so it is the only literal.
         assert _object_map_column(g, ns["TriplesMap_Child/POM_B"]) == '"b"'
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 13: A column in a malformed FK that also anchors a well-formed one
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestMalformedAndUsableCompositeFksShareAColumn:
+    """A broken constraint must not cost an unrelated, expressible relationship.
+
+    ``build_r2rml`` degrades every column of a malformed composite FK to a literal,
+    and ``composite_fk_anchors`` assigns anchors for the usable ones. A column can be
+    in both sets. The malformed check used to run FIRST, so such a column was emitted
+    as ``rr:column`` + ``rr:datatype`` — while the ontology, which asks
+    ``composite_fk_anchors``, still declared it an ``owl:ObjectProperty`` with
+    ``rdfs:range <Parent>``. That is the ontology/mapping contradiction the
+    composite-FK work set out to remove, reintroduced through a different door, and
+    it silently dropped the usable FK's relationship from the mapping entirely: the
+    anchor was consumed, so no other column re-emitted it.
+    """
+
+    @staticmethod
+    def _tables():
+        # Column order matters: `c` must be the first column of a usable composite
+        # FK so `composite_fk_anchors` picks it as the anchor.
+        child = CatalogTable(
+            id="1",
+            name="child",
+            fullyQualifiedName="s.child",
+            columns=[CatalogColumn(name=n, dataType="INT") for n in ("c", "a", "d")],
+            tableConstraints=[
+                # Malformed: two columns, one referred column — no join derivable.
+                CatalogConstraint(constraintType="FOREIGN_KEY", columns=["c", "d"], referredColumns=["broken.x"]),
+                # Usable: anchored on `c`, folding in `a`.
+                CatalogConstraint(
+                    constraintType="FOREIGN_KEY", columns=["c", "a"], referredColumns=["good.px", "good.py"]
+                ),
+            ],
+        )
+        good = CatalogTable(
+            id="2",
+            name="good",
+            fullyQualifiedName="s.good",
+            columns=[CatalogColumn(name=n, dataType="INT") for n in ("px", "py")],
+            tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["px", "py"])],
+        )
+        return [child, good]
+
+    def test_the_usable_relationship_survives(self, strategy):
+        g = _build(strategy, self._tables())
+        ns = Namespace(PREFIX)
+        pom = ns["TriplesMap_Child/POM_C"]
+
+        assert _object_map_parent_tmap(g, pom) == ns.TriplesMap_Good
+        assert _object_map_join_conditions(g, pom) == [('"a"', '"py"'), ('"c"', '"px"')]
+
+    def test_the_anchor_is_not_degraded_to_a_literal(self, strategy):
+        g = _build(strategy, self._tables())
+        ns = Namespace(PREFIX)
+        pom = ns["TriplesMap_Child/POM_C"]
+
+        assert _object_map_datatype(g, pom) is None
+        assert _object_map_column(g, pom) is None
+
+    def test_a_column_only_in_the_malformed_fk_still_degrades(self, strategy):
+        """The malformed constraint is still unmappable — `d` must stay a literal."""
+        g = _build(strategy, self._tables())
+        ns = Namespace(PREFIX)
+        pom = ns["TriplesMap_Child/POM_D"]
+
+        assert _object_map_column(g, pom) == '"d"'
+        assert _object_map_parent_tmap(g, pom) is None
+
+    def test_range_and_datatype_do_not_contradict(self, strategy):
+        """The invariant that actually broke: rdfs:range vs rr:datatype."""
+        tables = self._tables()
+        onto, novel = strategy._build_proposal_ontology(PREFIX, tables, [])
+        r2rml = strategy.build_r2rml(PREFIX, tables, novel, onto)
+        ns = Namespace(PREFIX)
+
+        # The ontology declares an object property pointing at the USABLE FK's
+        # parent — not at `broken`, which the first-matching-constraint lookup used
+        # to return because the malformed constraint is listed first.
+        assert (ns.child_c, RDF.type, OWL.ObjectProperty) in onto
+        assert onto.value(ns.child_c, RDFS.range) == ns.Good
+
+        # And the mapping agrees: a referencing object map, no rr:datatype.
+        pom = ns["TriplesMap_Child/POM_C"]
+        assert _object_map_parent_tmap(r2rml, pom) == ns.TriplesMap_Good
+        assert _object_map_datatype(r2rml, pom) is None
+
+        # `d` is a literal in both artifacts.
+        assert (ns.child_d, RDF.type, OWL.DatatypeProperty) in onto
+        assert _object_map_datatype(r2rml, ns["TriplesMap_Child/POM_D"]) == XSD.integer
+
+    def test_every_declared_property_is_still_mapped(self, strategy):
+        tables = self._tables()
+        onto, novel = strategy._build_proposal_ontology(PREFIX, tables, [])
+        r2rml = strategy.build_r2rml(PREFIX, tables, novel, onto)
+
+        declared = {str(p) for p in onto.subjects(RDF.type, OWL.ObjectProperty)} | {
+            str(p) for p in onto.subjects(RDF.type, OWL.DatatypeProperty)
+        }
+        mapped = {str(p) for _, _, p in r2rml.triples((None, RR.predicate, None))}
+        assert declared - mapped == set()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 14: Same table name in two databases
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestSameNameInDifferentDatabases:
+    """Two tables sharing a bare name are two tables.
+
+    One induction flattens every database of every requested datasource into a
+    single list (``_catalog_to_tables`` fills ``name`` from the bare table name and
+    puts the qualified form in ``fullyQualifiedName``), so ``public.customers`` and
+    ``analytics.customers`` arrive as two entries both named ``customers``. Keying
+    the local-name helper on the NAME collapsed them: one TriplesMap with two
+    ``rr:logicalTable`` / ``rr:tableName`` values — invalid R2RML, the same defect
+    the separator/case collisions produced, reached by a different route.
+    """
+
+    @staticmethod
+    def _tables():
+        return [
+            CatalogTable(
+                id=f"{schema}.customers",
+                name="customers",
+                fullyQualifiedName=f"{schema}.customers",
+                sourceSchema=schema,
+                columns=[CatalogColumn(name="id", dataType="INT")],
+                tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["id"])],
+            )
+            for schema in ("public", "analytics")
+        ]
+
+    def test_two_triples_maps(self, strategy):
+        g = _build(strategy, self._tables())
+
+        assert len(set(g.subjects(RDF.type, RR.TriplesMap))) == 2
+
+    def test_each_triples_map_has_exactly_one_table_name(self, strategy):
+        """The R2RML invariant (§2.2: a TriplesMap has one logical table)."""
+        g = _build(strategy, self._tables())
+
+        for tmap in g.subjects(RDF.type, RR.TriplesMap):
+            logical_tables = list(g.objects(tmap, RR.logicalTable))
+            assert len(logical_tables) == 1, f"{tmap} has {len(logical_tables)} logical tables"
+            names = [str(n) for lt in logical_tables for n in g.objects(lt, RR.tableName)]
+            assert len(names) == 1, f"{tmap} maps {len(names)} tables: {names}"
+
+    def test_two_classes(self, strategy):
+        tables = self._tables()
+        onto, _ = strategy._build_proposal_ontology(PREFIX, tables, [])
+
+        classes = {str(c) for c in onto.subjects(RDF.type, OWL.Class)}
+        assert len([c for c in classes if "Customers" in c]) == 2, classes
+
+    def test_the_ontology_and_the_mapping_name_the_same_classes(self, strategy):
+        tables = self._tables()
+        onto, novel = strategy._build_proposal_ontology(PREFIX, tables, [])
+        r2rml = strategy.build_r2rml(PREFIX, tables, novel, onto)
+
+        declared = {str(c) for c in onto.subjects(RDF.type, OWL.Class)}
+        mapped = {str(c) for _, _, c in r2rml.triples((None, RR["class"], None))}
+        assert mapped <= declared, mapped - declared
+
+    def test_an_fk_resolves_within_its_own_schema(self, strategy):
+        """An ambiguous bare target must not join to the other database's table."""
+        tables = self._tables()
+        tables.append(
+            CatalogTable(
+                id="public.orders",
+                name="orders",
+                fullyQualifiedName="public.orders",
+                sourceSchema="public",
+                columns=[CatalogColumn(name="customer_id", dataType="INT")],
+                tableConstraints=[
+                    CatalogConstraint(
+                        constraintType="FOREIGN_KEY", columns=["customer_id"], referredColumns=["customers.id"]
+                    )
+                ],
+            )
+        )
+        g = _build(strategy, tables)
+        ns = Namespace(PREFIX)
+
+        parent = _object_map_parent_tmap(g, ns["TriplesMap_Orders/POM_CustomerId"])
+        assert parent is not None
+        assert str(parent).startswith(f"{PREFIX}TriplesMap_Customers")
+        # The FK must follow the referrer's own schema, not whichever same-named
+        # table happens to be reachable by bare name.
+        parent_schema = g.value(parent, SCL.sourceSchema)
+        assert str(parent_schema) == "public", f"FK left its own schema: {parent_schema}"
+
+    def test_a_unique_bare_name_still_resolves(self, strategy):
+        """The bare-name path must keep working when there is no ambiguity."""
+        tables = [
+            CatalogTable(
+                id="public.customers",
+                name="customers",
+                fullyQualifiedName="public.customers",
+                sourceSchema="public",
+                columns=[CatalogColumn(name="id", dataType="INT")],
+                tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["id"])],
+            ),
+            CatalogTable(
+                id="analytics.orders",
+                name="orders",
+                fullyQualifiedName="analytics.orders",
+                sourceSchema="analytics",
+                columns=[CatalogColumn(name="customer_id", dataType="INT")],
+                tableConstraints=[
+                    CatalogConstraint(
+                        constraintType="FOREIGN_KEY", columns=["customer_id"], referredColumns=["customers.id"]
+                    )
+                ],
+            ),
+        ]
+        g = _build(strategy, tables)
+        ns = Namespace(PREFIX)
+
+        # Cross-schema, but unambiguous: resolve it rather than dropping the join.
+        assert _object_map_parent_tmap(g, ns["TriplesMap_Orders/POM_CustomerId"]) == ns.TriplesMap_Customers
+
+    def test_a_single_table_keeps_its_bare_iri(self, strategy):
+        """IRI stability: qualifying the identity must not change the local name."""
+        tables = [
+            CatalogTable(
+                id="public.customers",
+                name="customers",
+                fullyQualifiedName="public.customers",
+                sourceSchema="public",
+                columns=[CatalogColumn(name="id", dataType="INT")],
+                tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["id"])],
+            )
+        ]
+        g = _build(strategy, tables)
+        ns = Namespace(PREFIX)
+
+        assert (ns.TriplesMap_Customers, RDF.type, RR.TriplesMap) in g

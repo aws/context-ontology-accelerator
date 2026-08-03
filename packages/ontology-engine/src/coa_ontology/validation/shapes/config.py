@@ -20,6 +20,8 @@ from rdflib.namespace import RDF
 # (they lived in 3+ places). ``base.py`` owns the authoritative copies.
 from coa_ontology.inducer.services.data_catalog import parse_referred_column
 from coa_ontology.inducer.strategies.base import pascal_names_for as _pascal_names_for
+from coa_ontology.inducer.strategies.base import reference_index as _reference_index
+from coa_ontology.inducer.strategies.base import table_identity as _table_identity
 from coa_ontology.inducer.strategies.base import to_camel as _to_camel
 from coa_ontology.inducer.strategies.base import to_pascal as _to_pascal
 from coa_ontology.inducer.strategies.base import xsd_for as _xsd_for
@@ -100,11 +102,13 @@ def generate_config_from_db(tables, uri_prefix: str) -> ConstraintConfig:
 
     # Same collision-resolved local names the ontology and R2RML builders mint,
     # so the shapes target the classes/properties that actually exist.
-    pascal_by_name = _pascal_names_for(t.name for t in tables)
-    camel_by_name = {n: p[0].lower() + p[1:] if p else p for n, p in pascal_by_name.items()}
+    pascal_by_id = _pascal_names_for(tables)
+    camel_by_id = {i: p[0].lower() + p[1:] if p else p for i, p in pascal_by_id.items()}
+    ref_index = _reference_index(tables)
 
     for table in tables:
-        class_uri = f"{ns_str}{pascal_by_name[table.name]}"
+        identity = _table_identity(table)
+        class_uri = f"{ns_str}{pascal_by_id[identity]}"
         constraints: list[PropertyConstraint] = []
 
         pk_cols: set[str] = set()
@@ -123,7 +127,7 @@ def generate_config_from_db(tables, uri_prefix: str) -> ConstraintConfig:
                         fk_map[col_name] = fk_target
 
         for col in table.columns:
-            prop_path = f"{ns_str}{camel_by_name[table.name]}_{_to_camel(col.name)}"
+            prop_path = f"{ns_str}{camel_by_id[identity]}_{_to_camel(col.name)}"
             is_pk = col.name in pk_cols
             is_not_null = col.constraint in ("NOT_NULL", "PRIMARY_KEY") or is_pk
             is_unique = col.constraint in ("UNIQUE", "PRIMARY_KEY") or col.name in unique_cols or is_pk
@@ -153,7 +157,12 @@ def generate_config_from_db(tables, uri_prefix: str) -> ConstraintConfig:
 
             if is_fk:
                 fk_target_name = fk_map[col.name]
-                target_class = f"{ns_str}{pascal_by_name.get(fk_target_name, _to_pascal(fk_target_name))}"
+                # Resolve through the shared index so the shape targets the same
+                # class the ontology declared and the mapping joins to.
+                qualified = f"{table.sourceSchema}.{fk_target_name}" if table.sourceSchema else None
+                target_id = (qualified and ref_index.get(qualified)) or ref_index.get(fk_target_name)
+                target_local = pascal_by_id[target_id] if target_id in pascal_by_id else _to_pascal(fk_target_name)
+                target_class = f"{ns_str}{target_local}"
                 constraints.append(
                     PropertyConstraint(
                         property_path=prop_path,

@@ -158,25 +158,43 @@ def to_camel(s: str) -> str:
     return p[0].lower() + p[1:] if p else p
 
 
-def _name_discriminator(name: str) -> str:
-    """Return a short deterministic suffix distinguishing ``name`` from its peers.
+def _name_discriminator(identity: str) -> str:
+    """Return a short deterministic suffix distinguishing ``identity`` from its peers.
 
-    Derived from the verbatim name, so it is stable across runs (no hashing of
-    iteration order or object identity) and identical in every consumer that
-    mints IRIs for the same table.
+    Derived from the table's verbatim identity (see :func:`table_identity`), so it
+    is stable across runs (no hashing of iteration order or object identity) and
+    identical in every consumer that mints IRIs for the same table.
     """
-    return hashlib.sha256(name.encode("utf-8")).hexdigest()[:8]
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:8]
 
 
-def pascal_names_for(names: Iterable[str]) -> dict[str, str]:
-    r"""Map each verbatim table name to a COLLISION-FREE PascalCase local name.
+def table_identity(table: CatalogTable) -> str:
+    """Return the key that distinguishes ``table`` from every other table in a run.
+
+    ``CatalogTable.name`` is the BARE table name: ``_catalog_to_tables`` fills it
+    from ``tbl["name"]`` and puts the qualified form in ``fullyQualifiedName``. A
+    single induction flattens every database of every requested datasource into one
+    list, so bare names repeat routinely — ``public.customers`` and
+    ``analytics.customers`` are two tables that must stay two classes, two
+    TriplesMaps, and two sets of properties. Keying anything on ``name`` fuses them.
+
+    The qualified name is the identity; the bare name still supplies the *display*
+    form the PascalCase local name is derived from, so a table whose name is unique
+    mints exactly the IRI it minted before.
+    """
+    return table.fullyQualifiedName or table.name
+
+
+def pascal_names_for(tables: Iterable[CatalogTable]) -> dict[str, str]:
+    r"""Map each table IDENTITY to a COLLISION-FREE PascalCase local name.
 
     :func:`to_pascal` is lossy: it strips every character outside
     ``[a-zA-Z0-9\s_\-]``, treats space/underscore/hyphen as one separator
     class, and normalizes case. So ``order_item``, ``order-item``,
     ``Order_Item``, and ``ORDER ITEM`` all collapse onto ``OrderItem``, and any
     name made entirely of stripped characters collapses onto the ``"Entity"``
-    fallback. Minting class / TriplesMap IRIs straight from ``to_pascal`` therefore
+    fallback. Two tables in different databases can also share a bare name
+    outright. Minting class / TriplesMap IRIs straight from ``to_pascal`` therefore
     silently FUSES distinct source tables onto one IRI: one class carrying both
     tables' labels, key axioms, and cardinality restrictions, and — worse — one
     TriplesMap carrying two ``rr:logicalTable`` / ``rr:tableName`` values, which
@@ -184,12 +202,22 @@ def pascal_names_for(names: Iterable[str]) -> dict[str, str]:
     either rejects the whole mapping (VKG load fails for the namespace) or picks
     one table non-deterministically and drops the other's data.
 
-    This helper resolves collisions instead: the first name (in the caller's
-    order) keeps the bare PascalCase form so existing single-table-per-name
-    deployments mint byte-identical IRIs, and each subsequent colliding name gets
-    ``{Pascal}_{sha256(name)[:8]}`` appended. The discriminator is derived from
-    the verbatim name, so the assignment is deterministic given the same input
-    order and is reproducible across the ontology builder, the R2RML builder, and
+    This helper resolves collisions instead. Within a colliding set, ONE identity
+    keeps the bare PascalCase form so existing single-table-per-name deployments
+    mint byte-identical IRIs, and the others get ``{Pascal}_{sha256(identity)[:8]}``
+    appended.
+
+    Which one keeps the bare form is decided by ``min()`` over the identities, NOT
+    by input order. Order would be the more obvious rule and is wrong here: the
+    caller's list comes from ``_catalog_to_tables``, which flattens catalogs in
+    whatever order Glue / OMD enumerated them and never sorts. Under an
+    order-dependent rule, re-inducing the same schema after an enumeration change
+    moves the bare name to a different table, so the IRIs in a newly generated
+    mapping stop matching the ones in an already-accepted ontology — the exact
+    divergence this helper exists to prevent. Keying on the identity instead makes
+    the assignment a pure function of the schema.
+
+    The result is reproducible across the ontology builder, the R2RML builder, and
     the SHACL config generator — all three must agree or the artifacts diverge.
 
     Callers should also surface a collision to the user (see the ``log.warning``
@@ -198,34 +226,94 @@ def pascal_names_for(names: Iterable[str]) -> dict[str, str]:
     the source.
 
     Args:
-        names: Verbatim table names, in a stable order.
+        tables: Tables in the induction run. Duplicate identities are collapsed.
 
     Returns:
-        ``{verbatim_name: unique_pascal_local_name}`` covering every input name.
+        ``{table_identity: unique_pascal_local_name}`` covering every input table,
+        keyed by :func:`table_identity` — NOT by ``table.name``.
     """
-    result: dict[str, str] = {}
-    taken: set[str] = set()
-    for name in names:
-        if name in result:
+    identities: list[str] = []
+    display_base: dict[str, str] = {}
+    for table in tables:
+        identity = table_identity(table)
+        if identity in display_base:
             continue  # duplicate entry for the same table — one mapping is enough
-        base = to_pascal(name)
-        candidate = base
-        if candidate in taken:
-            candidate = f"{base}_{_name_discriminator(name)}"
+        identities.append(identity)
+        display_base[identity] = to_pascal(table.name)
+
+    by_base: dict[str, list[str]] = {}
+    for identity in identities:
+        by_base.setdefault(display_base[identity], []).append(identity)
+
+    assigned: dict[str, str] = {}
+    taken: set[str] = set()
+    # Sorted so that a residual collision between one base and another base's
+    # discriminated form resolves the same way on every run.
+    for base in sorted(by_base):
+        members = by_base[base]
+        keeper = min(members)
+        for identity in sorted(members):
+            candidate = base if identity == keeper else f"{base}_{_name_discriminator(identity)}"
+            if identity != keeper:
+                log.warning(
+                    "table_name_collides_after_pascal_case",
+                    extra={"table": identity, "collided_on": base, "minted": candidate},
+                )
+            if candidate in taken:
+                # Pathological: the form is already taken (identities were deduped
+                # above, so this needs a genuine hash collision, or a base equal to
+                # another base's discriminated form). Widen until unique.
+                candidate = f"{base}_{_name_discriminator(identity)}"
+                suffix = 2
+                while candidate in taken:
+                    candidate = f"{base}_{_name_discriminator(identity)}_{suffix}"
+                    suffix += 1
+            taken.add(candidate)
+            assigned[identity] = candidate
+    # Returned in caller order: the assignment does not depend on it, but stable
+    # iteration keeps logs and serialized artifacts diff-friendly.
+    return {identity: assigned[identity] for identity in identities}
+
+
+def reference_index(tables: Iterable[CatalogTable]) -> dict[str, str]:
+    """Map the forms an FK target can be written in to a table identity.
+
+    ``referredColumns`` names its target table WITHOUT a database qualifier —
+    :func:`parse_referred_column` yields ``(table, column)`` — so resolving a
+    parent requires a lookup keyed on the bare name. That is ambiguous the moment
+    two databases in the run contain the same table name, which is exactly the case
+    :func:`table_identity` exists for.
+
+    Keys, in the order callers should try them:
+
+    - ``"{sourceSchema}.{name}"`` — prefer the referrer's own database. An FK
+      almost never crosses databases, so this is the reading that matches the SQL
+      the mapping will be compiled into.
+    - ``"{name}"`` — only when that bare name is unambiguous across the whole run.
+      An ambiguous bare name is deliberately ABSENT so the caller falls back to its
+      out-of-run behaviour rather than picking a parent at random; a wrong
+      ``rr:parentTriplesMap`` joins real data to the wrong table, which is worse
+      than an unresolved reference.
+    - the identity itself, so an already-qualified reference resolves too.
+    """
+    index: dict[str, str] = {}
+    by_name: dict[str, list[str]] = {}
+    for table in tables:
+        identity = table_identity(table)
+        index[identity] = identity
+        if table.sourceSchema:
+            index[f"{table.sourceSchema}.{table.name}"] = identity
+        if identity not in by_name.get(table.name, []):
+            by_name.setdefault(table.name, []).append(identity)
+    for name, identities in by_name.items():
+        if len(identities) == 1:
+            index.setdefault(name, identities[0])
+        else:
             log.warning(
-                "table_name_collides_after_pascal_case",
-                extra={"table": name, "collided_on": base, "minted": candidate},
+                "fk_target_table_name_is_ambiguous",
+                extra={"table": name, "candidates": sorted(identities)},
             )
-            # Pathological: the discriminated form is itself taken (two tables
-            # with the same verbatim name would have been deduped above, so this
-            # needs a genuine hash collision). Widen until unique.
-            suffix = 2
-            while candidate in taken:
-                candidate = f"{base}_{_name_discriminator(name)}_{suffix}"
-                suffix += 1
-        taken.add(candidate)
-        result[name] = candidate
-    return result
+    return index
 
 
 def composite_fk_is_usable(tc: CatalogConstraint) -> bool:
@@ -317,9 +405,12 @@ def composite_fk_columns(table: CatalogTable) -> dict[str, str]:
         for col_name in tc.columns:
             if col_name != owner and col_name in table_columns:
                 absorbed.setdefault(col_name, owner)
-    # An anchor is never absorbed: it carries its own relationship. This can only
-    # bite when constraints overlap — `composite_fk_anchors` skips folded columns,
-    # so a column it chose as an anchor was not folded in by an earlier one.
+    # An anchor is never absorbed: it carries its own relationship. This also
+    # overrides the malformed pass above, which may have marked the column as
+    # relationship-free because a DIFFERENT, broken constraint lists it —
+    # ``build_r2rml`` checks the anchor before the malformed degradation for the
+    # same reason, and the two must agree or the ontology declares an
+    # ``owl:ObjectProperty`` against an ``rr:datatype`` literal.
     for anchor in anchors:
         absorbed.pop(anchor, None)
     return absorbed
@@ -471,22 +562,42 @@ class InductionStrategy(ABC):
         g.bind("ind", ns)
         g.bind("xsd", XSD)
 
-        # Build a lookup from table name → TriplesMap URI for parentTriplesMap refs.
-        # Local names come from the collision-resolving helper, not bare
-        # to_pascal: two tables differing only in separators/case would otherwise
-        # share one TriplesMap IRI and produce two rr:tableName values on it
-        # (invalid R2RML — see pascal_names_for).
-        pascal_by_name = pascal_names_for(t.name for t in tables)
+        # Build a lookup from table identity → TriplesMap URI for parentTriplesMap
+        # refs. Local names come from the collision-resolving helper, not bare
+        # to_pascal: two tables differing only in separators/case — or two tables
+        # with the same bare name in different databases — would otherwise share
+        # one TriplesMap IRI and produce two rr:tableName values on it (invalid
+        # R2RML — see pascal_names_for). The key is the IDENTITY, not the name:
+        # keying on the name is what let same-named tables collapse.
+        pascal_by_id = pascal_names_for(tables)
         # Property local names derive from the (possibly discriminated) class
         # local name, so a disambiguated class carries disambiguated predicates.
-        camel_by_name = {n: p[0].lower() + p[1:] if p else p for n, p in pascal_by_name.items()}
-        tmap_by_name: dict[str, URIRef] = {}
+        camel_by_id = {i: p[0].lower() + p[1:] if p else p for i, p in pascal_by_id.items()}
+        # How an FK's bare target name resolves to an identity (schema-qualified
+        # first, then bare when unambiguous).
+        ref_index = reference_index(tables)
+        tmap_by_id: dict[str, URIRef] = {}
         for table in tables:
-            tmap_by_name[table.name] = ns[f"TriplesMap_{pascal_by_name[table.name]}"]
+            identity = table_identity(table)
+            tmap_by_id[identity] = ns[f"TriplesMap_{pascal_by_id[identity]}"]
+
+        def _parent_tmap(target_name: str, referrer: CatalogTable) -> URIRef:
+            """Resolve an FK target table name to its TriplesMap IRI."""
+            qualified = f"{referrer.sourceSchema}.{target_name}" if referrer.sourceSchema else None
+            target_id = (qualified and ref_index.get(qualified)) or ref_index.get(target_name)
+            if target_id is not None and target_id in tmap_by_id:
+                return tmap_by_id[target_id]
+            # Target table is outside this induction run (or its bare name is
+            # ambiguous, in which case guessing a parent would join real data to
+            # the wrong table). Fall back to the bare form — nothing to collide
+            # with here, since a table we did not process has no TriplesMap in
+            # this mapping either.
+            return ns[f"TriplesMap_{to_pascal(target_name)}"]
 
         for table in tables:
-            tmap = tmap_by_name[table.name]
-            table_cls = ns[pascal_by_name[table.name]]
+            identity = table_identity(table)
+            tmap = tmap_by_id[identity]
+            table_cls = ns[pascal_by_id[identity]]
 
             g.add((tmap, RDF.type, RR.TriplesMap))
             _annotate_triples_map(g, tmap, table)
@@ -551,7 +662,7 @@ class InductionStrategy(ABC):
                 if col.name in absorbed_columns:
                     pom = URIRef(f"{tmap}/POM_{to_pascal(col.name)}")
                     g.add((tmap, RR.predicateObjectMap, pom))
-                    g.add((pom, RR.predicate, ns[f"{camel_by_name[table.name]}_{to_camel(col.name)}"]))
+                    g.add((pom, RR.predicate, ns[f"{camel_by_id[identity]}_{to_camel(col.name)}"]))
                     om = URIRef(f"{pom}/ObjectMap")
                     g.add((pom, RR.objectMap, om))
                     g.add((om, RR.column, Literal(sql_ident(col.name))))
@@ -561,7 +672,7 @@ class InductionStrategy(ABC):
                 pom = URIRef(f"{tmap}/POM_{to_pascal(col.name)}")
                 g.add((tmap, RR.predicateObjectMap, pom))
 
-                prop_uri = ns[f"{camel_by_name[table.name]}_{to_camel(col.name)}"]
+                prop_uri = ns[f"{camel_by_id[identity]}_{to_camel(col.name)}"]
                 g.add((pom, RR.predicate, prop_uri))
 
                 om = URIRef(f"{pom}/ObjectMap")
@@ -570,6 +681,34 @@ class InductionStrategy(ABC):
                 # This column anchors a composite FK when the shared anchor table
                 # says so — never by re-deriving it here.
                 composite_fk = composite_anchors.get(col.name)
+
+                if composite_fk is not None and composite_fk.referredColumns:
+                    # Composite FK: emit a single Referencing Object Map for the
+                    # entire relationship, with one joinCondition per column pair.
+                    #
+                    # Checked BEFORE the malformed branch below, and the order is
+                    # load-bearing. A column can sit in a malformed constraint AND
+                    # anchor a well-formed one; degrading it to a literal because
+                    # some OTHER constraint mentioning it is broken threw away a
+                    # relationship that is perfectly expressible, and left the
+                    # ontology (which asks composite_fk_anchors, and so still
+                    # declared an owl:ObjectProperty with rdfs:range) contradicting
+                    # this mapping's rr:datatype — the very mismatch the composite-FK
+                    # fix set out to remove.
+                    fk_target, _ = parse_referred_column(composite_fk.referredColumns[0])
+                    g.add((om, RR.parentTriplesMap, _parent_tmap(fk_target, table)))
+                    for child_col, ref_col in zip(composite_fk.columns, composite_fk.referredColumns, strict=True):
+                        _, parsed_parent = parse_referred_column(ref_col)
+                        parent_col = parsed_parent if parsed_parent is not None else ref_col
+                        jc = BNode()
+                        g.add((om, RR.joinCondition, jc))
+                        g.add((jc, RR.child, Literal(sql_ident(child_col))))
+                        g.add((jc, RR.parent, Literal(sql_ident(parent_col))))
+
+                    # No bookkeeping needed: composite_fk_anchors already assigned
+                    # each constraint to exactly one column, so no other column can
+                    # re-emit this relationship.
+                    continue
 
                 if col.name in malformed_composite_columns:
                     # columns/referredColumns disagree in length, or the targets span
@@ -584,32 +723,6 @@ class InductionStrategy(ABC):
                     )
                     g.add((om, RR.column, Literal(sql_ident(col.name))))
                     g.add((om, RR.datatype, xsd_for_column(col.dataType, col.name)))
-                    continue
-
-                if composite_fk is not None and composite_fk.referredColumns:
-                    # Composite FK: emit a single Referencing Object Map for the
-                    # entire relationship, with one joinCondition per column pair.
-                    fk_target, _ = parse_referred_column(composite_fk.referredColumns[0])
-                    parent_tmap = tmap_by_name.get(fk_target)
-                    if parent_tmap is None:
-                        # Target table is outside this induction run, so it has no
-                        # entry in pascal_by_name. Fall back to the bare form —
-                        # nothing to collide with here, since a table we did not
-                        # process has no TriplesMap in this mapping either.
-                        parent_tmap = ns[f"TriplesMap_{to_pascal(fk_target)}"]
-
-                    g.add((om, RR.parentTriplesMap, parent_tmap))
-                    for child_col, ref_col in zip(composite_fk.columns, composite_fk.referredColumns, strict=True):
-                        _, parsed_parent = parse_referred_column(ref_col)
-                        parent_col = parsed_parent if parsed_parent is not None else ref_col
-                        jc = BNode()
-                        g.add((om, RR.joinCondition, jc))
-                        g.add((jc, RR.child, Literal(sql_ident(child_col))))
-                        g.add((jc, RR.parent, Literal(sql_ident(parent_col))))
-
-                    # No bookkeeping needed: composite_fk_anchors already assigned
-                    # each constraint to exactly one column, so no other column can
-                    # re-emit this relationship.
                     continue
 
                 # Check for simple (single-column) FK
@@ -633,9 +746,7 @@ class InductionStrategy(ABC):
                     # fk_parent_col is required — without it we cannot emit a valid
                     # joinCondition and a bare parentTriplesMap would produce a
                     # Cartesian product in Ontop (R2RML §7.5).
-                    parent_tmap = tmap_by_name.get(simple_fk_target)
-                    if parent_tmap is None:
-                        parent_tmap = ns[f"TriplesMap_{to_pascal(simple_fk_target)}"]
+                    parent_tmap = _parent_tmap(simple_fk_target, table)
 
                     g.add((om, RR.parentTriplesMap, parent_tmap))
                     jc = BNode()
