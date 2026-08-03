@@ -236,29 +236,46 @@ class TestCedarEvaluation:
 class TestRoleResolutionFailure:
     """Behavior when the shared role_resolver raises."""
 
+    # An admin caller used to get platform-admin + namespace-owner here, returned
+    # EARLY — before the Cedar evaluation — off nothing but an "admin" entry in
+    # their IdP groups. A failed grant read means we do not know what the caller
+    # may do, which is never a reason to assume the most privileged answer. The
+    # path also became reachable once resolve_profile stopped swallowing its query
+    # errors, so a DynamoDB throttle would have escalated any admin-group caller.
+
     @pytest.mark.asyncio
     @patch("coa_serve.role_resolver.resolve_profile")
-    async def test_admin_role_falls_back_to_owner_profile(self, mock_resolve):
-        """When role resolution fails but caller is admin, allow with owner profile."""
+    async def test_admin_role_resolution_failure_raises(self, mock_resolve):
+        """Admins fail closed too — no privilege escalation on a backend error."""
         mock_resolve.side_effect = RuntimeError("RRM table unavailable")
         caller = _make_caller(user_id="root", namespaces=["sales"], roles=["Admin"])
 
-        profile = await resolve_grant(caller, "sales")
-
-        assert profile.namespace == "sales"
-        assert profile.user_id == "root"
-        assert profile.global_roles == ["platform-admin"]
-        assert profile.resource_roles == [{"role": "namespace-owner", "resourceUID": "sales"}]
+        with pytest.raises(GrantResolutionError, match="Failed to resolve grant"):
+            await resolve_grant(caller, "sales")
 
     @pytest.mark.asyncio
     @patch("coa_serve.role_resolver.resolve_profile")
-    async def test_lowercase_admin_role_falls_back(self, mock_resolve):
+    async def test_lowercase_admin_role_also_fails_closed(self, mock_resolve):
         mock_resolve.side_effect = RuntimeError("boom")
         caller = _make_caller(user_id="root", namespaces=["sales"], roles=["admin"])
 
-        profile = await resolve_grant(caller, "sales")
+        with pytest.raises(GrantResolutionError, match="Failed to resolve grant"):
+            await resolve_grant(caller, "sales")
 
-        assert profile.global_roles == ["platform-admin"]
+    @pytest.mark.asyncio
+    @patch("coa_serve.role_resolver.resolve_profile")
+    async def test_failure_never_returns_a_profile_that_skips_cedar(self, mock_resolve):
+        """The escalation was worse than its roles: it returned before Cedar ran."""
+        mock_resolve.side_effect = RuntimeError("throttled")
+        caller = _make_caller(user_id="root", namespaces=["sales"], roles=["Admin"])
+
+        with (
+            patch("coa_mcp.auth.grant_resolver._evaluate_cedar") as mock_cedar,
+            pytest.raises(GrantResolutionError),
+        ):
+            await resolve_grant(caller, "sales")
+
+        mock_cedar.assert_not_called()
 
     @pytest.mark.asyncio
     @patch("coa_serve.role_resolver.resolve_profile")
