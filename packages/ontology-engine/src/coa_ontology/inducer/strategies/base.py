@@ -17,7 +17,7 @@ from coa_common.constants import VOCAB_URI
 from rdflib import RDF, XSD, BNode, Graph, Literal, Namespace, URIRef
 
 from coa_ontology.inducer.schemas import ConceptMatch
-from coa_ontology.inducer.services.data_catalog import CatalogTable
+from coa_ontology.inducer.services.data_catalog import CatalogTable, parse_referred_column
 
 log = logging.getLogger(__name__)
 
@@ -240,7 +240,7 @@ def composite_fk_is_usable(tc) -> bool:
         return False
     if len(tc.columns) != len(tc.referredColumns):
         return False
-    fk_tables = {rc.split(".")[0] for rc in tc.referredColumns if "." in rc}
+    fk_tables = {parse_referred_column(rc)[0] for rc in tc.referredColumns if "." in rc}
     return len(fk_tables) <= 1
 
 
@@ -515,7 +515,7 @@ class InductionStrategy(ABC):
                         continue
 
                     # Validate: all referredColumns must reference the same target table.
-                    fk_tables = {rc.split(".")[0] for rc in composite_fk.referredColumns if "." in rc}
+                    fk_tables = {parse_referred_column(rc)[0] for rc in composite_fk.referredColumns if "." in rc}
                     if len(fk_tables) > 1:
                         log.warning(
                             "Skipping composite FK on %s: referredColumns span multiple tables %s",
@@ -528,7 +528,7 @@ class InductionStrategy(ABC):
                         g.add((om, RR.datatype, dt))
                         continue
 
-                    fk_target = composite_fk.referredColumns[0].split(".")[0]
+                    fk_target, _ = parse_referred_column(composite_fk.referredColumns[0])
                     parent_tmap = tmap_by_name.get(fk_target)
                     if parent_tmap is None:
                         # Target table is outside this induction run, so it has no
@@ -539,8 +539,8 @@ class InductionStrategy(ABC):
 
                     g.add((om, RR.parentTriplesMap, parent_tmap))
                     for child_col, ref_col in zip(composite_fk.columns, composite_fk.referredColumns, strict=True):
-                        parts = ref_col.split(".")
-                        parent_col = parts[-1] if len(parts) >= 2 else parts[0]
+                        _, parsed_parent = parse_referred_column(ref_col)
+                        parent_col = parsed_parent if parsed_parent is not None else ref_col
                         jc = BNode()
                         g.add((om, RR.joinCondition, jc))
                         g.add((jc, RR.child, Literal(sql_ident(child_col))))
@@ -563,9 +563,7 @@ class InductionStrategy(ABC):
                             and tc.referredColumns
                         ):
                             is_fk = True
-                            parts = tc.referredColumns[0].split(".")
-                            simple_fk_target = parts[0]
-                            fk_parent_col = parts[-1] if len(parts) >= 2 else None
+                            simple_fk_target, fk_parent_col = parse_referred_column(tc.referredColumns[0])
                             break
 
                 if is_fk and simple_fk_target and fk_parent_col:

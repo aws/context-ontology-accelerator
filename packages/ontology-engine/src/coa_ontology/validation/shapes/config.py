@@ -18,6 +18,7 @@ from rdflib.namespace import RDF
 
 # Reuse the canonical SQL→XSD map + naming helpers rather than redefining them
 # (they lived in 3+ places). ``base.py`` owns the authoritative copies.
+from coa_ontology.inducer.services.data_catalog import parse_referred_column
 from coa_ontology.inducer.strategies.base import pascal_names_for as _pascal_names_for
 from coa_ontology.inducer.strategies.base import to_camel as _to_camel
 from coa_ontology.inducer.strategies.base import to_pascal as _to_pascal
@@ -117,9 +118,7 @@ def generate_config_from_db(tables, uri_prefix: str) -> ConstraintConfig:
                 elif tc.constraintType == "UNIQUE" and tc.columns and len(tc.columns) == 1:
                     unique_cols.update(tc.columns)
                 elif tc.constraintType == "FOREIGN_KEY" and tc.columns and tc.referredColumns:
-                    ref = tc.referredColumns[0]
-                    parts = ref.split(".")
-                    fk_target = parts[-2] if len(parts) >= 2 else ref
+                    fk_target, _ = parse_referred_column(tc.referredColumns[0])
                     for col_name in tc.columns:
                         fk_map[col_name] = fk_target
 
