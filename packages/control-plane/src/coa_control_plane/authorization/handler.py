@@ -267,7 +267,13 @@ def _resolve_roles(
 
     for pk in principal_keys:
         try:
-            result = dao.query(
+            # query_all, not query: a single query returns one 1 MB page, so a
+            # principal whose grants span more than that would have the roles on
+            # later pages silently dropped — yielding a 403 on a namespace the
+            # user holds a valid grant for. Page boundaries depend on internal
+            # item ordering, so which roles vanish can change between
+            # invocations, making it look intermittent and unreproducible.
+            items = dao.query_all(
                 QueryParams(
                     key_condition="#pk = :pk",
                     expression_values={":pk": pk},
@@ -278,7 +284,7 @@ def _resolve_roles(
         except Exception:
             logger.exception("Failed to query roles", principal_key=pk)
             raise
-        for item in result.items:
+        for item in items:
             role = item.get("role", "")
             resource_id = item.get("resourceId", "")
             if resource_id == "GLOBAL" and role:

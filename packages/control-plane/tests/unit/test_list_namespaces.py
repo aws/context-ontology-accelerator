@@ -90,11 +90,11 @@ class TestResolveAccessibleNamespaceIds:
         from coa_control_plane.namespace.list_handler import resolve_accessible_namespace_ids
 
         mappings_dao = MagicMock()
-        mappings_dao.query.return_value = PaginatedResult(items=[])
+        mappings_dao.query_all.return_value = []
 
         resolve_accessible_namespace_ids(mappings_dao, "foo+123@co.com", ["group/eng"])
 
-        queried_pks = [call.args[0].expression_values[":pk"] for call in mappings_dao.query.call_args_list]
+        queried_pks = [call.args[0].expression_values[":pk"] for call in mappings_dao.query_all.call_args_list]
         assert "User::foo%2B123@co.com" in queried_pks
         assert "Group::group%2Feng" in queried_pks
 
@@ -256,9 +256,9 @@ class TestScopedUser:
         mock_mappings_dao = MagicMock()
         mock_dao_cls.side_effect = [mock_ns_dao, mock_mappings_dao]
 
-        mock_mappings_dao.query.return_value = PaginatedResult(
-            items=[{"resourceType": "Namespace", "resourceId": "11111111-1111-1111-1111-111111111111", "role": "owner"}]
-        )
+        mock_mappings_dao.query_all.return_value = [
+            {"resourceType": "Namespace", "resourceId": "11111111-1111-1111-1111-111111111111", "role": "owner"}
+        ]
         mock_ns_dao.batch_get.return_value = [NS_ITEM]
 
         resp = handler(_event(user_id="alice@co.com"), None)
@@ -274,7 +274,7 @@ class TestScopedUser:
         mock_mappings_dao = MagicMock()
         mock_dao_cls.side_effect = [mock_ns_dao, mock_mappings_dao]
 
-        mock_mappings_dao.query.return_value = PaginatedResult(items=[])
+        mock_mappings_dao.query_all.return_value = []
 
         resp = handler(_event(user_id="nobody@co.com"), None)
 
@@ -288,17 +288,15 @@ class TestScopedUser:
         mock_mappings_dao = MagicMock()
         mock_dao_cls.side_effect = [mock_ns_dao, mock_mappings_dao]
 
-        mock_mappings_dao.query.side_effect = [
-            PaginatedResult(items=[]),
-            PaginatedResult(
-                items=[
-                    {
-                        "resourceType": "Namespace",
-                        "resourceId": "22222222-2222-2222-2222-222222222222",
-                        "role": "data-steward",
-                    }
-                ]
-            ),
+        mock_mappings_dao.query_all.side_effect = [
+            [],
+            [
+                {
+                    "resourceType": "Namespace",
+                    "resourceId": "22222222-2222-2222-2222-222222222222",
+                    "role": "data-steward",
+                }
+            ],
         ]
         mock_ns_dao.batch_get.return_value = [NS_ITEM_2]
 
@@ -315,21 +313,15 @@ class TestScopedUser:
         mock_mappings_dao = MagicMock()
         mock_dao_cls.side_effect = [mock_ns_dao, mock_mappings_dao]
 
-        mock_mappings_dao.query.side_effect = [
-            PaginatedResult(
-                items=[
-                    {"resourceType": "Namespace", "resourceId": "11111111-1111-1111-1111-111111111111", "role": "owner"}
-                ]
-            ),
-            PaginatedResult(
-                items=[
-                    {
-                        "resourceType": "Namespace",
-                        "resourceId": "11111111-1111-1111-1111-111111111111",
-                        "role": "data-steward",
-                    }
-                ]
-            ),
+        mock_mappings_dao.query_all.side_effect = [
+            [{"resourceType": "Namespace", "resourceId": "11111111-1111-1111-1111-111111111111", "role": "owner"}],
+            [
+                {
+                    "resourceType": "Namespace",
+                    "resourceId": "11111111-1111-1111-1111-111111111111",
+                    "role": "data-steward",
+                }
+            ],
         ]
         mock_ns_dao.batch_get.return_value = [NS_ITEM]
 
@@ -349,13 +341,11 @@ class TestScopedUser:
         mock_dao_cls.side_effect = [mock_ns_dao, mock_mappings_dao]
 
         # User has access to 3 namespaces
-        mock_mappings_dao.query.return_value = PaginatedResult(
-            items=[
-                {"resourceType": "Namespace", "resourceId": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "role": "owner"},
-                {"resourceType": "Namespace", "resourceId": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", "role": "owner"},
-                {"resourceType": "Namespace", "resourceId": "cccccccc-cccc-cccc-cccc-cccccccccccc", "role": "owner"},
-            ]
-        )
+        mock_mappings_dao.query_all.return_value = [
+            {"resourceType": "Namespace", "resourceId": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "role": "owner"},
+            {"resourceType": "Namespace", "resourceId": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", "role": "owner"},
+            {"resourceType": "Namespace", "resourceId": "cccccccc-cccc-cccc-cccc-cccccccccccc", "role": "owner"},
+        ]
         mock_ns_dao.batch_get.return_value = [
             {
                 **NS_ITEM,
@@ -387,13 +377,11 @@ class TestScopedUser:
 
         # Request page 2 using the token
         mock_dao_cls.side_effect = [mock_ns_dao, mock_mappings_dao]
-        mock_mappings_dao.query.return_value = PaginatedResult(
-            items=[
-                {"resourceType": "Namespace", "resourceId": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "role": "owner"},
-                {"resourceType": "Namespace", "resourceId": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", "role": "owner"},
-                {"resourceType": "Namespace", "resourceId": "cccccccc-cccc-cccc-cccc-cccccccccccc", "role": "owner"},
-            ]
-        )
+        mock_mappings_dao.query_all.return_value = [
+            {"resourceType": "Namespace", "resourceId": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "role": "owner"},
+            {"resourceType": "Namespace", "resourceId": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", "role": "owner"},
+            {"resourceType": "Namespace", "resourceId": "cccccccc-cccc-cccc-cccc-cccccccccccc", "role": "owner"},
+        ]
         resp2 = handler(
             _event(user_id="alice@co.com", query_params={"maxResults": "2", "nextToken": body["nextToken"]}),
             None,
@@ -410,14 +398,14 @@ class TestScopedUser:
         mock_mappings_dao = MagicMock()
         mock_dao_cls.side_effect = [mock_ns_dao, mock_mappings_dao]
 
-        mock_mappings_dao.query.return_value = PaginatedResult(
-            items=[{"resourceType": "Namespace", "resourceId": "11111111-1111-1111-1111-111111111111", "role": "owner"}]
-        )
+        mock_mappings_dao.query_all.return_value = [
+            {"resourceType": "Namespace", "resourceId": "11111111-1111-1111-1111-111111111111", "role": "owner"}
+        ]
         mock_ns_dao.batch_get.return_value = [NS_ITEM]
 
         handler(_event(user_id="alice@co.com"), None)
 
-        call_args = mock_mappings_dao.query.call_args[0][0]
+        call_args = mock_mappings_dao.query_all.call_args[0][0]
         assert "begins_with" in call_args.key_condition
         assert call_args.expression_values[":prefix"] == "Namespace::"
 

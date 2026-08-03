@@ -249,7 +249,10 @@ def resolve_accessible_namespace_ids(
 
     namespace_ids: set[str] = set()
     for pk in principal_keys:
-        result = mappings_dao.query(
+        # query_all, not query: one query returns a single 1 MB page, so a
+        # principal with many grants would have the namespaces on later pages
+        # omitted from every caller's view of "what this user can reach".
+        items = mappings_dao.query_all(
             QueryParams(
                 key_condition="#pk = :pk AND begins_with(#sk, :prefix)",
                 expression_values={":pk": pk, ":prefix": f"{ResourceType.NAMESPACE}::"},
@@ -257,7 +260,7 @@ def resolve_accessible_namespace_ids(
                 index_name="PrincipalIndex",
             )
         )
-        for item in result.items:
+        for item in items:
             namespace_ids.add(item["resourceId"])
 
     return namespace_ids
