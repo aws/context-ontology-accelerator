@@ -9,7 +9,7 @@ import { resolveContext, prefixed } from "../context";
  * Base stack for all SemanticContext CloudFormation stacks.
  *
  * ## CDK Context Variables
- *   - `resource_prefix` (default: `"scl"`)
+ *   - `resource_prefix` (default: `DEFAULT_RESOURCE_PREFIX`, i.e. `"coa"`)
  *   - `env`             (default: `"dev"`)
  *   - `project_tag`     (default: `"semantic-context"`)
  *   - `vpc_id`          (optional, on NetworkStack - import existing VPC)
