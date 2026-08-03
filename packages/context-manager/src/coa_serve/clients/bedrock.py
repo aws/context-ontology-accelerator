@@ -61,6 +61,40 @@ def _assessment_has_block(assessment: dict) -> bool:
         return False
 
 
+def _close_stream_quietly(stream: Any) -> None:
+    """Close a boto3 EventStream, ignoring absence and close errors.
+
+    Closing the underlying HTTP response is the only way to unblock a worker thread
+    parked in ``for event in stream``: a thread-pool thread has no cancellation
+    point. Best-effort by design — this runs during generator finalization, where
+    raising would mask the original outcome.
+    """
+    if stream is None:
+        return
+    close = getattr(stream, "close", None)
+    if close is None:
+        return
+    try:
+        close()
+    except Exception as exc:  # noqa: BLE001 - finalization must not raise
+        logger.debug("bedrock_stream_close_failed", error=type(exc).__name__, error_msg=str(exc))
+
+
+def _log_detached_worker_result(task: Any) -> None:
+    """Surface a detached stream worker's failure instead of discarding it.
+
+    Attached as a done-callback once the generator stops awaiting the worker, so an
+    exception raised after detachment is still visible rather than swallowed by the
+    unretrieved-result warning.
+    """
+    try:
+        task.result()
+    except asyncio.CancelledError:  # pragma: no cover - normal on shutdown
+        pass
+    except Exception as exc:  # noqa: BLE001 - diagnostics only
+        logger.debug("bedrock_stream_worker_after_detach", error=type(exc).__name__, error_msg=str(exc))
+
+
 class BedrockLLMClient:
     """Bedrock Converse API + embeddings client (Cohere Embed v4 by default)."""
 
@@ -180,7 +214,10 @@ class BedrockLLMClient:
         if not text_blocks:
             raise ValueError(f"No text content in Bedrock response: stopReason={stop_reason}")
 
-        text = text_blocks[0]
+        # Join ALL text blocks. The Converse API may split a response across several
+        # content blocks; taking only the first silently truncated the generation
+        # (and for NL→SQL / NL→SPARQL that means a query cut off mid-statement).
+        text = "".join(text_blocks)
         blocked = False
 
         # Parse guardrail trace to distinguish BLOCK from ANONYMIZE.
@@ -235,6 +272,12 @@ class BedrockLLMClient:
         queue: asyncio.Queue[str | None | Exception | tuple] = asyncio.Queue()
         loop = asyncio.get_running_loop()
 
+        # Published by the worker as soon as the EventStream exists, so the
+        # event-loop side can close it. Closing the stream is what actually
+        # unblocks the worker's synchronous `for event in ...` — there is no other
+        # cancellation path into a thread-pool thread.
+        stream_holder: dict[str, Any] = {}
+
         def _run_stream() -> None:
             """Run in thread — iterate EventStream, push text chunks to queue."""
             guardrail_triggered = False
@@ -242,6 +285,7 @@ class BedrockLLMClient:
             try:
                 client = self._get_client()
                 response = self._call_with_temperature_fallback(client.converse_stream, kwargs)
+                stream_holder["stream"] = response["stream"]
                 for event in response["stream"]:
                     if "contentBlockDelta" in event:
                         text = event["contentBlockDelta"].get("delta", {}).get("text", "")
@@ -289,7 +333,24 @@ class BedrockLLMClient:
         except TimeoutError:
             pending_exception = TimeoutError("Bedrock stream timed out waiting for next token")
         finally:
-            await task
+            # Do NOT await the worker here.
+            #
+            # The worker iterates boto3's SYNCHRONOUS EventStream in a thread-pool
+            # thread and has no cancellation point, so awaiting it blocked for up to
+            # BEDROCK_READ_TIMEOUT (120s) more — which defeated the 300s idle-timeout
+            # guard above: it fired, then this line waited again.
+            #
+            # Worse, on early generator close (the SSE consumer in main.py cancelling
+            # resolve_task when the client disconnects) `GeneratorExit` is thrown in
+            # at the `yield`, and suspending on an await inside the resulting
+            # `finally` makes CPython raise "async generator ignored GeneratorExit".
+            #
+            # Instead: close the stream from this side to unblock the thread, then
+            # detach the worker with a done-callback that surfaces any error. The
+            # generator finalizes synchronously, and the worker cannot keep consuming
+            # the Bedrock stream (and billing tokens) after the client is gone.
+            _close_stream_quietly(stream_holder.get("stream"))
+            task.add_done_callback(_log_detached_worker_result)
 
         if pending_exception:
             raise pending_exception
