@@ -723,6 +723,7 @@ export class SourcesStack extends SCLStack {
       "FederationProvisionerLfAdmin",
       {
         roleArnSsmParameterName: `${ssmPrefix}/sources/federation-provisioner-role-arn`,
+        roleArn: fedFnRole.roleArn,
       },
     );
     lfAdmin.node.addDependency(fedRoleArnParam);

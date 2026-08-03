@@ -3,16 +3,21 @@
 
 """Custom resource — non-destructively registers an IAM role as an LF data-lake admin.
 
-Reads the target role ARN from SSM, then GetDataLakeSettings -> append the role
-to DataLakeAdmins if absent -> PutDataLakeSettings (full settings object), so
-existing admins and other settings are preserved. Removes the role on Delete
-(best-effort, so it never blocks stack teardown). Returns the
-Provider-framework OnEventResponse shape.
+On Create/Update: reads the target role ARN from SSM, then GetDataLakeSettings ->
+append the role to DataLakeAdmins if absent -> PutDataLakeSettings (full settings
+object), so existing admins and other settings are preserved.
+
+On Delete: removes the role recorded in this physical resource's own
+``PhysicalResourceId`` (``lf-admin-{arn}``) — deliberately NOT the current SSM
+value, which under CloudFormation replacement semantics points at the *new* role
+by the time the old resource's cleanup Delete arrives. Best-effort, so an LF
+error never blocks stack teardown, but failures are logged.
+
+Returns the Provider-framework OnEventResponse shape.
 """
 
 from __future__ import annotations
 
-import contextlib
 import re
 
 import boto3
@@ -28,16 +33,14 @@ _sts = boto3.client("sts")
 _ROLE_ARN_RE = re.compile(r"^arn:aws[a-z-]*:iam::(\d{12}):role/.+")
 
 
-def _target(event: dict) -> str:
-    """Resolve and validate the target role ARN from the SSM parameter."""
-    name = event["ResourceProperties"]["RoleArnSsmParameterName"]
-    try:
-        arn = _ssm.get_parameter(Name=name)["Parameter"]["Value"]
-    except ClientError as e:
-        raise ValueError(f"Failed to read SSM parameter {name!r}: {e}") from e
+_PHYSICAL_ID_PREFIX = "lf-admin-"
+
+
+def _validate(arn: str, source: str) -> str:
+    """Validate ``arn`` is a same-account IAM role ARN, or raise."""
     m = _ROLE_ARN_RE.match(arn or "")
     if not m:
-        raise ValueError(f"SSM parameter {name!r} is not an IAM role ARN: {arn!r}")
+        raise ValueError(f"{source} is not an IAM role ARN: {arn!r}")
     try:
         account = _sts.get_caller_identity()["Account"]
     except ClientError as e:
@@ -45,6 +48,46 @@ def _target(event: dict) -> str:
     if m.group(1) != account:
         raise ValueError(f"Refusing to register cross-account principal as LF admin: {arn!r}")
     return arn
+
+
+def _target(event: dict) -> str:
+    """Resolve and validate the target role ARN from the SSM parameter."""
+    name = event["ResourceProperties"]["RoleArnSsmParameterName"]
+    try:
+        arn = _ssm.get_parameter(Name=name)["Parameter"]["Value"]
+    except ClientError as e:
+        raise ValueError(f"Failed to read SSM parameter {name!r}: {e}") from e
+    return _validate(arn, f"SSM parameter {name!r}")
+
+
+def _delete_target(event: dict) -> str | None:
+    """Resolve the ARN this physical resource registered, from its own id.
+
+    Delete MUST deregister the principal *this* physical resource created, which
+    is encoded in ``PhysicalResourceId`` (``lf-admin-{arn}``) — NOT whatever the
+    SSM parameter happens to point at now. When an update changes the role ARN,
+    CloudFormation creates the new physical resource first and then sends a
+    cleanup Delete for the OLD id; resolving from SSM at that point returns the
+    NEW arn, so the handler deregistered the role it had just registered and left
+    the stale one in place. Every LF-privileged operation downstream (federated
+    catalog creation during JDBC scans, LF-governed catalog teardown) then failed
+    with authorization errors unrelated-looking to the deploy — and
+    ``contextlib.suppress`` in the caller hid it while the deployment reported
+    success.
+
+    Returns ``None`` when the id carries no ARN (the ``"lf-admin"`` fallback a
+    failed Create returns, or a resource created before the id carried the ARN),
+    in which case there is nothing safe to deregister and Delete is a no-op.
+    """
+    physical_id = event.get("PhysicalResourceId") or ""
+    if not physical_id.startswith(_PHYSICAL_ID_PREFIX):
+        return None
+    arn = physical_id[len(_PHYSICAL_ID_PREFIX) :]
+    if not arn:
+        return None
+    # Still validate: the id is round-tripped through CloudFormation, and this
+    # keeps the cross-account guard on the deregister path too.
+    return _validate(arn, f"PhysicalResourceId {physical_id!r}")
 
 
 def _apply(request_type: str, target: str) -> None:
@@ -85,10 +128,17 @@ def handler(event: dict, context: object = None) -> dict:
         ``PhysicalResourceId``.
     """
     if event["RequestType"] == "Delete":
-        # Best-effort: never block stack deletion on an LF error.
-        with contextlib.suppress(Exception):
-            _apply("Delete", _target(event))
+        # Deregister the principal recorded in THIS physical resource's id, not
+        # the current SSM value — see _delete_target. Best-effort: never block
+        # stack deletion on an LF error, but log it, since a swallowed failure
+        # here is how a stale admin silently survives a teardown.
+        try:
+            target = _delete_target(event)
+            if target is not None:
+                _apply("Delete", target)
+        except Exception as e:  # noqa: BLE001 - deliberately non-fatal
+            print(f"WARNING: failed to deregister LF admin on Delete: {type(e).__name__}: {e}")
         return {"PhysicalResourceId": event.get("PhysicalResourceId", "lf-admin")}
     target = _target(event)
     _apply(event["RequestType"], target)
-    return {"PhysicalResourceId": f"lf-admin-{target}"}
+    return {"PhysicalResourceId": f"{_PHYSICAL_ID_PREFIX}{target}"}
