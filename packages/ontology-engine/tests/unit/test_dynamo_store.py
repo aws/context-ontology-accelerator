@@ -733,6 +733,90 @@ class TestListProposalsScanPaginationDrain:
         assert {r["proposal_id"] for r in rows} == {"p1", "p2", "p3"}
 
 
+class TestListNamespacesScanPagination:
+    """``list_namespaces`` must follow ``LastEvaluatedKey``.
+
+    DynamoDB applies ``Limit`` to items EVALUATED before filtering, not to matches
+    returned. This single-table design stores job / proposal / ingest-job rows
+    alongside the ``NAMESPACE#`` ones, so once the table holds more non-namespace
+    rows than the limit, a single-page scan returns few or zero namespaces and
+    silently omits the rest — driven by TOTAL item count, not namespace count.
+    """
+
+    @staticmethod
+    def _seed_namespace(table, name: str) -> None:
+        table.put_item(Item={"PK": f"NAMESPACE#{name}", "SK": "META", "namespace": name})
+
+    @staticmethod
+    def _seed_noise(table, n: int) -> None:
+        """Non-namespace rows of the kind that accumulate in normal use."""
+        for i in range(n):
+            table.put_item(Item={"PK": f"NS#x#JOB#{i}", "SK": "STATUS", "job_id": str(i)})
+
+    def test_namespace_on_a_later_page_is_returned(self, monkeypatch):
+        from coa_ontology import dynamo_store as ds
+
+        table = _FakeDynamoTable(page_size=2)
+        self._seed_namespace(table, "ns-a")
+        self._seed_namespace(table, "ns-b")
+        self._seed_namespace(table, "ns-c")  # lands on page 2
+        monkeypatch.setattr(ds, "_get_table", lambda: table)
+
+        rows = ds.list_namespaces()
+
+        assert {r["namespace"] for r in rows} == {"ns-a", "ns-b", "ns-c"}
+
+    def test_namespaces_hidden_behind_unrelated_rows_are_still_found(self, monkeypatch):
+        """The actual production failure mode.
+
+        The old code passed ``Limit=limit`` (100), and DynamoDB applies Limit to
+        items EVALUATED, so with >100 job/proposal rows ahead of the namespace rows
+        the single page it read contained no namespaces at all. Seeds past the
+        default limit so the first evaluated page is entirely noise.
+        """
+        from coa_ontology import dynamo_store as ds
+
+        table = _FakeDynamoTable(page_size=40)
+        self._seed_noise(table, 150)  # more than the default limit of 100
+        self._seed_namespace(table, "ns-late")
+        monkeypatch.setattr(ds, "_get_table", lambda: table)
+
+        rows = ds.list_namespaces()
+
+        assert {r["namespace"] for r in rows} == {"ns-late"}
+
+    def test_limit_still_caps_the_result(self, monkeypatch):
+        from coa_ontology import dynamo_store as ds
+
+        table = _FakeDynamoTable(page_size=2)
+        for i in range(5):
+            self._seed_namespace(table, f"ns-{i}")
+        monkeypatch.setattr(ds, "_get_table", lambda: table)
+
+        assert len(ds.list_namespaces(limit=3)) == 3
+
+    def test_only_namespace_meta_rows_are_returned(self, monkeypatch):
+        from coa_ontology import dynamo_store as ds
+
+        table = _FakeDynamoTable(page_size=3)
+        self._seed_namespace(table, "ns-a")
+        self._seed_noise(table, 4)
+        # A NAMESPACE# partition row that is not the META row must not match.
+        table.put_item(Item={"PK": "NAMESPACE#ns-a", "SK": "OTHER", "namespace": "ns-a"})
+        monkeypatch.setattr(ds, "_get_table", lambda: table)
+
+        rows = ds.list_namespaces()
+
+        assert [r["SK"] for r in rows] == ["META"]
+
+    def test_empty_table_returns_empty(self, monkeypatch):
+        from coa_ontology import dynamo_store as ds
+
+        monkeypatch.setattr(ds, "_get_table", lambda: _FakeDynamoTable(page_size=2))
+
+        assert ds.list_namespaces() == []
+
+
 class TestListProposalsCrossNamespaceContainsFilter:
     """``list_proposals(namespace=None)`` filters on ``contains(PK, "#PROPOSAL#")``.
 
