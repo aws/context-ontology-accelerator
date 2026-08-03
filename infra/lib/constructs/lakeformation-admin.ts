@@ -11,6 +11,16 @@ import { Construct } from "constructs";
 export interface LakeFormationAdminProps {
   /** SSM parameter name holding the IAM role ARN to register as an LF data-lake admin. */
   readonly roleArnSsmParameterName: string;
+  /**
+   * The role ARN the SSM parameter resolves to.
+   *
+   * Passed as a custom-resource property purely so a change to the *value*
+   * produces a property diff. With only the parameter *name* as a property, a
+   * deployment that repointed the parameter at a different role left the custom
+   * resource untouched (no diff → no Update → the new role never registered);
+   * the handler still reads the authoritative value from SSM at runtime.
+   */
+  readonly roleArn: string;
 }
 
 /**
@@ -71,7 +81,13 @@ export class LakeFormationAdmin extends Construct {
     });
     new cdk.CustomResource(this, "Resource", {
       serviceToken: provider.serviceToken,
-      properties: { RoleArnSsmParameterName: props.roleArnSsmParameterName },
+      properties: {
+        RoleArnSsmParameterName: props.roleArnSsmParameterName,
+        // Value-carrying property so repointing the parameter triggers an
+        // Update — see LakeFormationAdminProps.roleArn. The handler reads the
+        // authoritative ARN from SSM; this is only a change detector.
+        RoleArn: props.roleArn,
+      },
     });
   }
 }
