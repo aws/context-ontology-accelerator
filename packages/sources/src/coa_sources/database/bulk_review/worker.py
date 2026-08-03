@@ -342,6 +342,74 @@ def _verify_in_transient(
     return bool(item and item.get("status") == expected_transient)
 
 
+def _rejected_key_column_reason(assets: list[dict[str, Any]], source_id: str) -> str | None:
+    """Return a denial reason if an approved table would ship without its key columns.
+
+    Runs AFTER the cascade, which is fine — and necessary — because the condition
+    it tests is one the cascade cannot manufacture: a bulk APPROVE never turns a
+    column REJECTED (it flips only ``PENDING_REVIEW`` → ``APPROVED`` and
+    deliberately preserves explicit REJECTED decisions, see
+    ``coa_common.review_logic``). So a REJECTED key column here was rejected by a
+    human, and survives the cascade untouched.
+
+    Why this is the condition that matters: ``catalog_reader`` projects only
+    ``APPROVED`` columns into the induction payload
+    (``_table_to_induction_format``). A REJECTED primary-key column therefore
+    disappears from the catalog while the table itself is APPROVED, and induction
+    mints a subject template with no key to build from — surfacing later as a
+    PK-column-missing error in Ontop, far from the review that caused it. A
+    REJECTED foreign-key column silently drops the relationship instead, so the
+    ontology loses an object property the schema does have.
+
+    This replaces a gate that looked for ``PENDING_REVIEW`` columns *after* the
+    cascade had already flipped every one of them to ``APPROVED`` — structurally
+    unreachable dead code. Checking pending columns pre-cascade is not the fix
+    either: the enricher leaves ALL columns ``PENDING_REVIEW``
+    (``table_enricher.py``), and clearing them is precisely what bulk approve is
+    for, so blocking on pending would reject every normal bulk approval.
+
+    Args:
+        assets: Loaded assets for this page, post-cascade.
+        source_id: Source id, for logging.
+
+    Returns:
+        A human-readable reason when the approval must be blocked, else ``None``.
+    """
+    offenders: list[tuple[str, str, str]] = []  # (table, column, key kind)
+    for asset in assets:
+        table = asset["table"]
+        if table.business_metadata.review_status != ReviewStatus.APPROVED:
+            continue  # not shipping, so its column states are moot
+
+        key_kinds: dict[str, str] = {}
+        for pk_col in table.primary_key.columns or []:
+            key_kinds[pk_col] = "primary key"
+        for fk in table.foreign_keys or []:
+            if fk.column and fk.column not in key_kinds:
+                key_kinds[fk.column] = "foreign key"
+
+        for col in table.columns:
+            kind = key_kinds.get(col.name)
+            if kind and col.business_metadata.review_status == ReviewStatus.REJECTED:
+                offenders.append((table.name, col.name, kind))
+
+    if not offenders:
+        return None
+
+    sample = offenders[:10]
+    logger.warning(
+        "bulk_approve_blocked_rejected_key_columns",
+        extra={"source_id": source_id, "rejected_key_count": len(offenders), "sample": sample},
+    )
+    return (
+        f"Cannot approve: {len(offenders)} key column(s) across "
+        f"{len({t for t, _, _ in offenders})} table(s) are REJECTED, but their tables are approved. "
+        "A rejected key column is dropped from the induction catalog, leaving the table without a "
+        "usable key. Un-reject these columns or reject the whole table. Examples: "
+        + ", ".join(f"{t}.{c} ({kind})" for t, c, kind in sample)
+    )
+
+
 def process_bulk_review(
     *,
     msg: BulkReviewMessage,
@@ -432,36 +500,12 @@ def process_bulk_review(
     # Fold in the count accumulated by earlier pages in the chain.
     tables_approved = msg.tables_approved_so_far + tables_approved_this_page
 
-    # Gate: if approving, verify no column is left in PENDING_REVIEW after the
-    # cascade. Columns that the enricher couldn't auto-approve (structural/identity
-    # columns like PKs/FKs) would break downstream consumers (schema.sql generation
-    # filters to APPROVED-only columns, causing PK-column-missing errors in Ontop).
-    # Fail the approval with a clear message so the user reviews those columns first.
+    # Gate: refuse an approval that would ship a table whose PK/FK column is
+    # REJECTED. See _rejected_key_column_reason for why this is the condition
+    # that actually breaks downstream, and why the previous check could not fire.
     if msg.decision == ReviewDecision.APPROVED and not failed:
-        pending_cols: list[tuple[str, str]] = []
-        for asset in assets:
-            # Only check tables that are APPROVED — rejected/pending tables won't
-            # feed into induction/schema-generation, so their column states are moot.
-            if asset["table"].business_metadata.review_status != ReviewStatus.APPROVED:
-                continue
-            for col in asset["table"].columns:
-                if col.business_metadata.review_status == ReviewStatus.PENDING_REVIEW:
-                    pending_cols.append((asset["table"].name, col.name))
-        if pending_cols:
-            sample = pending_cols[:10]
-            reason = (
-                f"Cannot approve: {len(pending_cols)} column(s) across "
-                f"{len({t for t, _ in pending_cols})} table(s) are still PENDING_REVIEW. "
-                f"Review or approve these columns first. Examples: " + ", ".join(f"{t}.{c}" for t, c in sample)
-            )
-            logger.warning(
-                "bulk_approve_blocked_pending_columns",
-                extra={
-                    "source_id": msg.source_id,
-                    "pending_count": len(pending_cols),
-                    "sample": sample,
-                },
-            )
+        reason = _rejected_key_column_reason(assets, msg.source_id)
+        if reason is not None:
             failed.append(reason)
 
     # More assets remain AND this page had no failures → continue in a fresh

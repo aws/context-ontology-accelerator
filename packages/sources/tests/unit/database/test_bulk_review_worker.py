@@ -29,6 +29,8 @@ import coa_sources.database.bulk_review.worker as worker  # noqa: E402
 from coa_common.domain_models import (  # noqa: E402
     BusinessMetadata,
     Column,
+    ForeignKey,
+    PrimaryKey,
     Table,
 )
 from coa_common.review_logic import apply_decision_to_table  # noqa: E402
@@ -745,3 +747,180 @@ class TestBulkReviewPaging:
             )
         assert result.tables_total == 0
         mock_client.search_assets.assert_not_called()
+
+
+# ===================================================================
+# Rejected key-column gate
+# ===================================================================
+
+
+@pytest.mark.unit
+class TestRejectedKeyColumnGate:
+    """An approved table must not ship with a REJECTED primary/foreign key column.
+
+    `catalog_reader._table_to_induction_format` projects only APPROVED columns, so
+    a rejected PK vanishes from the induction catalog while its table stays
+    APPROVED — induction then has no key to build a subject template from and the
+    failure surfaces as a PK-column-missing error in Ontop, far from the review
+    that caused it.
+
+    This gate replaced one that scanned for PENDING_REVIEW columns *after* the
+    bulk cascade had already flipped every one of them to APPROVED (unreachable),
+    and which could not be moved pre-cascade either: the enricher leaves all
+    columns PENDING_REVIEW, so blocking on pending would reject every normal bulk
+    approval.
+    """
+
+    _DAO_PATCH = "coa_sources.database.bulk_review.worker.DynamoDBDAO"
+
+    @staticmethod
+    def _table_with_keys(
+        *,
+        table_name: str = "orders",
+        table_status: str = "APPROVED",
+        columns: list[tuple[str, str]],
+        pk_columns: list[str] | None = None,
+        fk_column: str | None = None,
+    ) -> Table:
+        return Table(
+            name=table_name,
+            database="db",
+            data_source_id=_SOURCE_ID,
+            namespace_id=_NAMESPACE_ID,
+            business_metadata=BusinessMetadata(review_status=table_status),
+            primary_key=PrimaryKey(columns=pk_columns or []),
+            foreign_keys=(
+                [ForeignKey(column=fk_column, target_table="other", target_column="id")] if fk_column else []
+            ),
+            columns=[
+                Column(name=name, data_type="string", business_metadata=BusinessMetadata(review_status=status))
+                for name, status in columns
+            ],
+        )
+
+    def _run(self, tables: list[Table]):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {"status": "APPROVING"}
+        mock_client = _mock_smus_with_assets(tables)
+        with patch(self._DAO_PATCH, return_value=mock_dao):
+            return worker.process_bulk_review(
+                msg=worker.BulkReviewMessage(namespace_id=_NAMESPACE_ID, source_id=_SOURCE_ID, decision="APPROVED"),
+                client=mock_client,
+                project_id="proj-123",
+                sources_table="test-sources",
+                region="us-east-1",
+            )
+
+    def test_rejected_primary_key_column_blocks_approval(self):
+        result = self._run(
+            [
+                self._table_with_keys(
+                    columns=[("id", "REJECTED"), ("name", "APPROVED")],
+                    pk_columns=["id"],
+                )
+            ]
+        )
+        assert result.tables_failed, "approval should have been blocked"
+        assert "orders.id (primary key)" in result.tables_failed[0]
+
+    def test_rejected_foreign_key_column_blocks_approval(self):
+        result = self._run(
+            [
+                self._table_with_keys(
+                    columns=[("id", "APPROVED"), ("customer_id", "REJECTED")],
+                    pk_columns=["id"],
+                    fk_column="customer_id",
+                )
+            ]
+        )
+        assert result.tables_failed
+        assert "orders.customer_id (foreign key)" in result.tables_failed[0]
+
+    def test_rejected_non_key_column_does_not_block(self):
+        """Rejecting an ordinary column is a legitimate review decision."""
+        result = self._run(
+            [
+                self._table_with_keys(
+                    columns=[("id", "APPROVED"), ("notes", "REJECTED")],
+                    pk_columns=["id"],
+                )
+            ]
+        )
+        assert result.tables_failed == []
+
+    def test_all_approved_keys_do_not_block(self):
+        result = self._run(
+            [
+                self._table_with_keys(
+                    columns=[("id", "APPROVED"), ("customer_id", "APPROVED")],
+                    pk_columns=["id"],
+                    fk_column="customer_id",
+                )
+            ]
+        )
+        assert result.tables_failed == []
+
+    def test_pending_columns_do_not_block_the_normal_case(self):
+        """The regression the previous gate would have caused if moved pre-cascade.
+
+        The enricher leaves every column PENDING_REVIEW; clearing them is the
+        entire point of bulk approve.
+        """
+        result = self._run(
+            [
+                self._table_with_keys(
+                    table_status="PENDING_REVIEW",
+                    columns=[("id", "PENDING_REVIEW"), ("name", "PENDING_REVIEW")],
+                    pk_columns=["id"],
+                )
+            ]
+        )
+        assert result.tables_failed == []
+        assert result.tables_changed == 1
+
+    def test_rejected_key_on_a_rejected_table_does_not_block(self):
+        """A table that is not shipping cannot break induction."""
+        result = self._run(
+            [
+                self._table_with_keys(
+                    table_status="REJECTED",
+                    columns=[("id", "REJECTED")],
+                    pk_columns=["id"],
+                )
+            ]
+        )
+        assert result.tables_failed == []
+
+    def test_composite_primary_key_partially_rejected_blocks(self):
+        result = self._run(
+            [
+                self._table_with_keys(
+                    columns=[("day", "APPROVED"), ("hour", "REJECTED")],
+                    pk_columns=["day", "hour"],
+                )
+            ]
+        )
+        assert result.tables_failed
+        assert "orders.hour (primary key)" in result.tables_failed[0]
+
+    def test_reject_decision_never_runs_the_gate(self):
+        """The gate guards approvals only; a bulk REJECT is always allowed."""
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {"status": "REJECTING"}
+        tables = [
+            self._table_with_keys(
+                table_status="APPROVED",
+                columns=[("id", "REJECTED")],
+                pk_columns=["id"],
+            )
+        ]
+        mock_client = _mock_smus_with_assets(tables)
+        with patch(self._DAO_PATCH, return_value=mock_dao):
+            result = worker.process_bulk_review(
+                msg=worker.BulkReviewMessage(namespace_id=_NAMESPACE_ID, source_id=_SOURCE_ID, decision="REJECTED"),
+                client=mock_client,
+                project_id="proj-123",
+                sources_table="test-sources",
+                region="us-east-1",
+            )
+        assert result.tables_failed == []
