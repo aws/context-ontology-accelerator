@@ -10,14 +10,22 @@ Delete carrying the OLD PhysicalResourceId. Resolving the target from SSM at tha
 point yields the NEW arn, so the handler deregisters the role it just registered.
 """
 
-import importlib
+import importlib.util
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
-_HANDLER_DIR = Path(__file__).resolve().parents[2] / "lib" / "lambdas" / "lakeformation-admin"
+_HANDLER_PATH = Path(__file__).resolve().parents[2] / "lib" / "lambdas" / "lakeformation-admin" / "index.py"
+
+# Every Lambda handler in this repo is named ``index.py``, so importing them by
+# bare module name makes them collide in ``sys.modules["index"]``: whichever test
+# module imports last wins, and ``@patch("index.<attr>")`` in the other one then
+# targets the wrong module (AttributeError). Load this handler under a unique
+# module name via an explicit spec so it never participates in that race — and
+# never mutate ``sys.path``.
+_MODULE_NAME = "lakeformation_admin_index_under_test"
 
 ACCOUNT = "111122223333"
 ROLE_A = f"arn:aws:iam::{ACCOUNT}:role/provisioner-a"
@@ -27,13 +35,13 @@ PARAM = "/coa/sources/federation-provisioner-role-arn"
 
 @pytest.fixture
 def index(monkeypatch):
-    """Import the handler with its module-level boto3 clients stubbed out."""
-    sys.path.insert(0, str(_HANDLER_DIR))
-    try:
-        mod = importlib.import_module("index")
-        mod = importlib.reload(mod)
-    finally:
-        sys.path.remove(str(_HANDLER_DIR))
+    """Import the handler under a unique module name, with boto3 clients stubbed."""
+    spec = importlib.util.spec_from_file_location(_MODULE_NAME, _HANDLER_PATH)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[_MODULE_NAME] = mod
+    monkeypatch.delitem(sys.modules, _MODULE_NAME, raising=False)
+    spec.loader.exec_module(mod)
 
     monkeypatch.setattr(mod, "_ssm", MagicMock())
     monkeypatch.setattr(mod, "_lf", MagicMock())
