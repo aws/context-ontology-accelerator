@@ -122,9 +122,12 @@ def _compute_structural_fingerprint(tables) -> str:
     import hashlib
 
     def _norm_ref(ref: str) -> str:
-        # Keep only the trailing table.column (drop catalog/db qualifiers).
-        parts = ref.split(".")
-        return ".".join(parts[-2:]) if len(parts) >= 2 else ref
+        # Keep only the trailing table.column (drop catalog/db qualifiers), using
+        # the one shared parser so the fingerprint agrees with every consumer.
+        from coa_ontology.inducer.services.data_catalog import parse_referred_column
+
+        table, column = parse_referred_column(ref)
+        return f"{table}.{column}" if column is not None else table
 
     parts = []
     for t in sorted(tables, key=lambda x: x.name):

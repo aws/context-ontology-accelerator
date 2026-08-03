@@ -943,14 +943,14 @@ class TestForeignKeyObjectMaps:
         col = _object_map_column(g, ns["TriplesMap_Invoices/POM_OrderRef"])
         assert col == '"order_ref"'
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="Three-part referredColumns ('schema.table.column') extracts schema as target — not supported",
-    )
     def test_referred_columns_three_part_schema_table_column(self, strategy):
-        """Future-proofing: referredColumns as 'schema.table.column'.
-        parts[0] extracts 'schema' — this is WRONG. The correct target is parts[1]
-        (the table name). Marked xfail so a future fix auto-promotes."""
+        """referredColumns as 'schema.table.column' resolves to the TABLE, not the schema.
+
+        Was xfail: the R2RML builder took ``parts[0]`` (the schema) while the
+        ontology, the SHACL config, and the subtype detector all took
+        ``parts[-2]`` (the table), so the mapping pointed at a TriplesMap that does
+        not exist. All six call sites now share ``parse_referred_column``.
+        """
         tables = [
             CatalogTable(
                 id="1",
@@ -2355,3 +2355,155 @@ class TestOntologyR2rmlParity:
         onto, r2rml = self._both(strategy, tables)
 
         assert self._declared_properties(onto) - self._mapped_predicates(r2rml) == set()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 12: referredColumns parsing is one shared rule
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.unit
+class TestReferredColumnParsing:
+    """All consumers must resolve an FK target identically.
+
+    The rule was re-implemented at six call sites under two incompatible
+    conventions: `parts[0]` in the R2RML builder and the RIGOR topological sort,
+    `parts[-2]` in the ontology builder, the SHACL config, the subtype detector,
+    and the fingerprint normalizer. For `schema.table.column` the former yields
+    the SCHEMA, so the mapping referenced a nonexistent TriplesMap while the
+    ontology and shapes correctly referenced the table.
+    """
+
+    @pytest.mark.parametrize(
+        ("ref", "expected"),
+        [
+            ("orders.order_id", ("orders", "order_id")),
+            ("public.orders.order_id", ("orders", "order_id")),
+            ("db.public.orders.order_id", ("orders", "order_id")),
+            ("orders", ("orders", None)),
+        ],
+    )
+    def test_parser_keeps_the_trailing_table_and_column(self, ref, expected):
+        from coa_ontology.inducer.services.data_catalog import parse_referred_column
+
+        assert parse_referred_column(ref) == expected
+
+    @staticmethod
+    def _schema_qualified_tables():
+        return [
+            CatalogTable(
+                id="1",
+                name="invoices",
+                fullyQualifiedName="billing.invoices",
+                columns=[CatalogColumn(name="order_ref", dataType="INT")],
+                tableConstraints=[
+                    CatalogConstraint(
+                        constraintType="FOREIGN_KEY",
+                        columns=["order_ref"],
+                        referredColumns=["public.orders.order_id"],
+                    )
+                ],
+            ),
+            CatalogTable(
+                id="2",
+                name="orders",
+                fullyQualifiedName="public.orders",
+                columns=[CatalogColumn(name="order_id", dataType="INT")],
+                tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["order_id"])],
+            ),
+        ]
+
+    def test_r2rml_and_ontology_agree_on_a_schema_qualified_target(self, strategy):
+        tables = self._schema_qualified_tables()
+        onto, novel = strategy._build_proposal_ontology(PREFIX, tables, [])
+        r2rml = strategy.build_r2rml(PREFIX, tables, novel, onto)
+        ns = Namespace(PREFIX)
+
+        # Ontology: range is the TABLE's class, never a class named after the schema
+        assert onto.value(ns.invoices_orderRef, RDFS.range) == ns.Orders
+        # R2RML: parent is the TABLE's TriplesMap
+        parent = _object_map_parent_tmap(r2rml, ns["TriplesMap_Invoices/POM_OrderRef"])
+        assert parent == ns.TriplesMap_Orders
+
+    def test_shacl_config_agrees_on_a_schema_qualified_target(self, strategy):
+        from coa_ontology.validation.shapes.config import generate_config_from_db
+
+        config = generate_config_from_db(self._schema_qualified_tables(), PREFIX)
+
+        targets = [
+            c.params.get("target_class")
+            for cls in config.classes
+            for c in cls.constraints
+            if c.params and "target_class" in c.params
+        ]
+        assert targets == [f"{PREFIX}Orders"]
+
+    def test_no_class_is_minted_from_the_schema_name(self, strategy):
+        tables = self._schema_qualified_tables()
+        onto, _ = strategy._build_proposal_ontology(PREFIX, tables, [])
+
+        classes = {str(c) for c in onto.subjects(RDF.type, OWL.Class)}
+        assert f"{PREFIX}Public" not in classes
+
+    def test_join_condition_uses_the_trailing_column(self, strategy):
+        tables = self._schema_qualified_tables()
+        g = _build(strategy, tables)
+        ns = Namespace(PREFIX)
+
+        conditions = _object_map_join_conditions(g, ns["TriplesMap_Invoices/POM_OrderRef"])
+        assert conditions == [('"order_ref"', '"order_id"')]
+
+    def test_fingerprint_treats_qualified_and_bare_refs_as_equal(self):
+        """A rescan reporting a longer qualification must not look like a new schema."""
+        from coa_ontology.induce_catalog import _compute_structural_fingerprint
+
+        def _tables(ref):
+            return [
+                CatalogTable(
+                    id="1",
+                    name="invoices",
+                    fullyQualifiedName="billing.invoices",
+                    columns=[CatalogColumn(name="order_ref", dataType="INT")],
+                    tableConstraints=[
+                        CatalogConstraint(constraintType="FOREIGN_KEY", columns=["order_ref"], referredColumns=[ref])
+                    ],
+                )
+            ]
+
+        bare = _compute_structural_fingerprint(_tables("orders.order_id"))
+        qualified = _compute_structural_fingerprint(_tables("db.public.orders.order_id"))
+        assert bare == qualified
+
+    def test_subtype_detection_handles_a_schema_qualified_self_reference(self):
+        """PK-sharing detection must resolve the parent table, not the schema."""
+        from coa_ontology.inducer.services.subtype_detection import detect_pk_sharing_subtypes
+
+        parent = CatalogTable(
+            id="1",
+            name="claim_amount",
+            fullyQualifiedName="ins.claim_amount",
+            columns=[CatalogColumn(name="claim_id", dataType="INT")],
+            tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["claim_id"])],
+        )
+        children = [
+            CatalogTable(
+                id=str(i + 2),
+                name=name,
+                fullyQualifiedName=f"ins.{name}",
+                columns=[CatalogColumn(name="claim_id", dataType="INT")],
+                tableConstraints=[
+                    CatalogConstraint(constraintType="PRIMARY_KEY", columns=["claim_id"]),
+                    CatalogConstraint(
+                        constraintType="FOREIGN_KEY",
+                        columns=["claim_id"],
+                        referredColumns=["ins.claim_amount.claim_id"],
+                    ),
+                ],
+            )
+            for i, name in enumerate(("loss_payment", "expense_payment"))
+        ]
+
+        confirmed, _suggested = detect_pk_sharing_subtypes([parent, *children])
+
+        assert ("loss_payment", "claim_amount") in confirmed
+        assert ("expense_payment", "claim_amount") in confirmed

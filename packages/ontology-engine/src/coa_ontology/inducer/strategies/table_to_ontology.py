@@ -22,7 +22,7 @@ from rdflib import OWL, RDF, RDFS, XSD, BNode, Graph, Literal, Namespace, URIRef
 from rdflib.namespace import SKOS
 
 from coa_ontology.inducer.schemas import ConceptMatch
-from coa_ontology.inducer.services.data_catalog import CatalogTable
+from coa_ontology.inducer.services.data_catalog import CatalogTable, parse_referred_column
 from coa_ontology.inducer.services.subtype_detection import detect_pk_sharing_subtypes
 from coa_ontology.inducer.strategies.base import (
     SCL,
@@ -358,9 +358,7 @@ class TableToOntologyStrategy(InductionStrategy):
                     for tc in table.tableConstraints:
                         if tc.constraintType == "FOREIGN_KEY" and col.name in tc.columns and tc.referredColumns:
                             is_fk = True
-                            parts = tc.referredColumns[0].split(".")
-                            fk_target = parts[-2] if len(parts) >= 2 else parts[0]
-                            fk_target_col = parts[-1] if len(parts) >= 2 else None
+                            fk_target, fk_target_col = parse_referred_column(tc.referredColumns[0])
                             fk_provenance = tc.relationshipType
                             break
 

@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import logging
 
-from coa_ontology.inducer.services.data_catalog import CatalogTable
+from coa_ontology.inducer.services.data_catalog import CatalogTable, parse_referred_column
 
 logger = logging.getLogger(__name__)
 
@@ -55,11 +55,9 @@ def _single_col_fks(table: CatalogTable) -> list[tuple[str, str, str]]:
             continue
         if not tc.referredColumns or len(tc.referredColumns) != 1:
             continue
-        parts = tc.referredColumns[0].split(".")
-        if len(parts) < 2:
-            continue
-        parent_table = parts[-2]
-        parent_col = parts[-1]
+        parent_table, parent_col = parse_referred_column(tc.referredColumns[0])
+        if parent_col is None:
+            continue  # no column component — cannot match against the parent PK
         fks.append((tc.columns[0], parent_table, parent_col))
     return fks
 

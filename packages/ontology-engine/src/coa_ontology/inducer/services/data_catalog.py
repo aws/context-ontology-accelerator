@@ -34,6 +34,45 @@ class CatalogConstraint(BaseModel):
     relationshipType: str | None = None
 
 
+def parse_referred_column(ref: str) -> tuple[str, str | None]:
+    """Split a ``referredColumns`` entry into ``(target_table, target_column)``.
+
+    The catalog reports an FK target as a dotted identifier whose LAST TWO
+    segments are ``TABLE.COLUMN``. Everything before them is qualification
+    (database, schema, catalog) and is dropped:
+
+        ``"orders.order_id"``               → ``("orders", "order_id")``
+        ``"public.orders.order_id"``        → ``("orders", "order_id")``
+        ``"db.public.orders.order_id"``     → ``("orders", "order_id")``
+        ``"orders"``                        → ``("orders", None)``
+
+    A single-segment value carries no column, so the caller cannot build a
+    join condition from it — ``build_r2rml`` treats that as a plain datatype
+    column rather than emitting a bare ``rr:parentTriplesMap``, which would make
+    Ontop produce a Cartesian product (R2RML §7.5).
+
+    This lives here, next to :class:`CatalogConstraint`, because the rule was
+    previously re-implemented at six call sites under TWO INCOMPATIBLE
+    conventions: ``parts[0]`` in the R2RML builder and the RIGOR topological sort,
+    ``parts[-2]`` in the ontology builder, the SHACL config generator, the subtype
+    detector, and the fingerprint normalizer. For a three-part reference the
+    former yields the SCHEMA name, so the mapping pointed ``rr:parentTriplesMap``
+    at a TriplesMap that does not exist while the ontology and shapes correctly
+    referenced the table — the artifacts described different graphs.
+
+    Args:
+        ref: A ``referredColumns`` entry.
+
+    Returns:
+        ``(target_table, target_column)``; ``target_column`` is ``None`` when
+        ``ref`` has no dot.
+    """
+    parts = ref.split(".")
+    if len(parts) >= 2:
+        return parts[-2], parts[-1]
+    return ref, None
+
+
 class CatalogTable(BaseModel):
     """A table from the data catalog, with its columns, constraints, and datasource."""
 
