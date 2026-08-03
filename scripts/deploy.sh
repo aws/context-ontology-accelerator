@@ -26,7 +26,8 @@ CONTEXT="--context env=$ENV"
 [ -n "${SCL_HOSTED_ZONE_ID:-}" ] && CONTEXT="$CONTEXT --context hosted_zone_id=$SCL_HOSTED_ZONE_ID"
 
 # ── Resolve VPC peering context from test-databases stack (if deployed) ──
-TEST_STACK_NAME="${SCL_PREFIX:-scl}-integ-test-databases"
+# Prefix default matches the CDK app (see DEFAULT_RESOURCE_PREFIX).
+TEST_STACK_NAME="${SCL_PREFIX:-coa}-integ-test-databases"
 if [ -z "${SCL_JDBC_PEER_VPC_ID:-}" ]; then
   SCL_JDBC_PEER_VPC_ID=$(aws cloudformation describe-stacks \
     --stack-name "$TEST_STACK_NAME" \
@@ -43,6 +44,11 @@ if [ -n "${SCL_JDBC_PEER_VPC_ID:-}" ] && [ "$SCL_JDBC_PEER_VPC_ID" != "None" ] \
   && [ -n "${SCL_JDBC_PEER_CIDRS:-}" ] && [ "$SCL_JDBC_PEER_CIDRS" != "None" ]; then
   echo "Peering into test VPC ${SCL_JDBC_PEER_VPC_ID} (${SCL_JDBC_PEER_CIDRS})"
   CONTEXT="$CONTEXT --context jdbc_peer_vpc_id=$SCL_JDBC_PEER_VPC_ID --context jdbc_peer_cidrs=$SCL_JDBC_PEER_CIDRS"
+else
+  # The stack is optional, so skipping is normal — but say so. Silence here is
+  # indistinguishable from a prefix mismatch resolving the wrong stack name, which
+  # is how this went unnoticed while the default was 'scl'.
+  echo "No JDBC peering context (stack ${TEST_STACK_NAME} not found or has no VPC outputs) — skipping"
 fi
 
 # ponytail: CDK_DOCKER selection — only pick Finch if its daemon is actually

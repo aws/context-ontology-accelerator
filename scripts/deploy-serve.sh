@@ -22,7 +22,11 @@ set -euo pipefail
 #   IMAGE_TAG=v1.2.3 ./scripts/deploy-serve.sh
 
 ENV="${1:-dev}"
-PREFIX="${SCL_PREFIX:-scl}"
+# Default MUST match the CDK app's DEFAULT_RESOURCE_PREFIX
+# (libs/ts-shared/src/constants.ts, resolved in infra/lib/context.ts).
+# A mismatch means this script resolves scl-* names / /scl SSM parameters
+# while `cdk` operates on coa-* — every lookup silently misses.
+PREFIX="${SCL_PREFIX:-coa}"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 ECR_REPO="${PREFIX}-${ENV}-context-manager"
@@ -105,32 +109,47 @@ RUNTIME_ARN=$(aws cloudformation describe-stacks \
   --query 'Stacks[0].Outputs[?OutputKey==`AgentRuntimeArn`].OutputValue' \
   --output text 2>/dev/null || echo "")
 
-ENDPOINT_NAME=$(aws cloudformation describe-stacks \
-  --stack-name "${PREFIX}-${ENV}-serve" \
-  --query 'Stacks[0].Outputs[?OutputKey==`AgentRuntimeEndpointName`].OutputValue' \
-  --output text 2>/dev/null || echo "")
+# The serve stack exports AgentRuntimeArn / AgentRuntimeId / AgentRuntimeName —
+# there is no AgentRuntimeEndpointName output. Reading it always yielded an empty
+# qualifier, and because every failure below was redirected to /dev/null the smoke
+# test "passed" while verifying nothing. DEFAULT is the qualifier AgentCore
+# creates alongside a runtime.
+ENDPOINT_NAME="${AGENT_RUNTIME_QUALIFIER:-DEFAULT}"
 
-if [ -n "${RUNTIME_ARN}" ] && [ "${RUNTIME_ARN}" != "None" ]; then
-  HEALTH_PAYLOAD=$(mktemp)
-  RESPONSE_FILE=$(mktemp)
-  echo '{"query":"ping","namespace":"smoke-test"}' > "${HEALTH_PAYLOAD}"
+if [ -z "${RUNTIME_ARN}" ] || [ "${RUNTIME_ARN}" = "None" ]; then
+  echo "  FAILED: stack ${PREFIX}-${ENV}-serve has no AgentRuntimeArn output" >&2
+  exit 1
+fi
 
-  # Allow warm-up time — retry up to 3 times
-  for attempt in 1 2 3; do
-    if aws bedrock-agentcore invoke-agent-runtime \
-      --agent-runtime-arn "${RUNTIME_ARN}" \
-      --qualifier "${ENDPOINT_NAME}" \
-      --content-type "application/json" \
-      --payload "fileb://${HEALTH_PAYLOAD}" \
-      "${RESPONSE_FILE}" > /dev/null 2>&1; then
-      echo "  Health: $(cat "${RESPONSE_FILE}")"
-      break
-    fi
-    [ "${attempt}" -lt 3 ] && sleep 10
-  done
-  rm -f "${HEALTH_PAYLOAD}" "${RESPONSE_FILE}"
-else
-  echo "  Skipped (no AgentRuntimeArn output)"
+HEALTH_PAYLOAD=$(mktemp)
+RESPONSE_FILE=$(mktemp)
+INVOKE_LOG=$(mktemp)
+echo '{"query":"ping","namespace":"smoke-test"}' > "${HEALTH_PAYLOAD}"
+
+SMOKE_OK=0
+# Allow warm-up time — retry up to 3 times
+for attempt in 1 2 3; do
+  if aws bedrock-agentcore invoke-agent-runtime \
+    --agent-runtime-arn "${RUNTIME_ARN}" \
+    --qualifier "${ENDPOINT_NAME}" \
+    --content-type "application/json" \
+    --payload "fileb://${HEALTH_PAYLOAD}" \
+    "${RESPONSE_FILE}" > "${INVOKE_LOG}" 2>&1; then
+    echo "  Health: $(cat "${RESPONSE_FILE}")"
+    SMOKE_OK=1
+    break
+  fi
+  echo "  attempt ${attempt}/3 failed: $(tail -n 3 "${INVOKE_LOG}")" >&2
+  [ "${attempt}" -lt 3 ] && sleep 10
+done
+
+rm -f "${HEALTH_PAYLOAD}" "${RESPONSE_FILE}" "${INVOKE_LOG}"
+
+# Fail loudly. A deploy script whose verification cannot fail is not a
+# verification.
+if [ "${SMOKE_OK}" -ne 1 ]; then
+  echo "  FAILED: smoke test could not invoke the runtime after 3 attempts" >&2
+  exit 1
 fi
 
 # ── Summary ──────────────────────────────────────────────────────────────────

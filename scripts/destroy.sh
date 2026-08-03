@@ -37,7 +37,11 @@ set -uo pipefail
 ENV="${1:-dev}"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 REGION="${CDK_DEFAULT_REGION:-${AWS_DEFAULT_REGION:-${AWS_REGION:-us-east-1}}}"
-PREFIX="${SCL_PREFIX:-scl}"
+# Default MUST match the CDK app's DEFAULT_RESOURCE_PREFIX
+# (libs/ts-shared/src/constants.ts, resolved in infra/lib/context.ts).
+# A mismatch means this script resolves scl-* names / /scl SSM parameters
+# while `cdk` operates on coa-* — every lookup silently misses.
+PREFIX="${SCL_PREFIX:-coa}"
 STACK_PREFIX="${PREFIX}-${ENV}"
 SSM_PREFIX="/${PREFIX}"
 
