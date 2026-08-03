@@ -80,7 +80,7 @@ deploy-serve:
 ## deletes VKG's ECS services, force-deletes the DataZone domain (cascades
 ## to RETAINed child resources CFN can't clear on its own), then runs
 ## `cdk destroy --all` and verifies no stacks remain (see #660, #661, #707).
-## Optional env vars: SCL_PREFIX (default: scl), SCL_DESTROY_YES=1 to skip
+## Optional env vars: SCL_PREFIX (default: coa — matches the CDK app), SCL_DESTROY_YES=1 to skip
 ## the confirmation prompt (e.g. in CI), SCL_ENI_WAIT_MAX_SECONDS (default
 ## 600), SCL_ECS_WAIT_MAX_SECONDS (default 300), and
 ## SCL_DOMAIN_WAIT_MAX_SECONDS (default 300) to tune wait budgets.
