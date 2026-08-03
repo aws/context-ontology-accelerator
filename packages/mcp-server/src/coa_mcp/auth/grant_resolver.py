@@ -192,25 +192,28 @@ async def resolve_grant(
             namespace=namespace_id,
         )
     except Exception as e:
-        # If role resolution fails but user is admin, allow with empty restrictions
-        if "Admin" in caller.roles or "admin" in caller.roles:
-            logger.warning(
-                "grant_resolution_failed_admin_fallback",
-                user_id=caller.user_id,
-                namespace=namespace_id,
-                error=str(e),
-            )
-            return ResolvedProfile(
-                namespace=namespace_id,
-                user_id=caller.user_id,
-                global_roles=["platform-admin"],
-                resource_roles=[{"role": "namespace-owner", "resourceUID": namespace_id}],
-            )
-
+        # Fail closed for EVERY caller, admins included.
+        #
+        # There used to be an admin fallback here that returned platform-admin +
+        # namespace-owner and returned EARLY — before the Cedar evaluation below,
+        # despite that block's comment claiming it is never bypassed. It granted
+        # those roles off nothing but an "admin" entry in the caller's IdP groups,
+        # with no policy check and no data restrictions.
+        #
+        # It was near-unreachable while resolve_profile swallowed its own query
+        # errors, but that method now propagates them (a partial grant read is more
+        # permissive than the truth, so degrading there widened data access). A
+        # DynamoDB throttle would therefore have escalated any admin-group caller.
+        #
+        # A failed grant read means we do not know what this caller may do, which is
+        # never a reason to assume the most privileged answer. Denying turns a
+        # transient backend error into a retryable failure instead of a silent
+        # privilege escalation.
         logger.error(
             "grant_resolution_failed",
             user_id=caller.user_id,
             namespace=namespace_id,
+            is_admin_group_member=any(r.lower() == "admin" for r in caller.roles),
             error=str(e),
         )
         raise GrantResolutionError(f"Failed to resolve grant for user '{caller.user_id}': {e}") from e
