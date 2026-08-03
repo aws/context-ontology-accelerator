@@ -459,6 +459,143 @@ class TestBedrockConverseStream:
 
 
 @pytest.mark.unit
+class TestConverseMultipleTextBlocks:
+    """The Converse API may split a response across several content blocks."""
+
+    async def test_all_text_blocks_are_joined(self):
+        from coa_serve.clients.bedrock import BedrockLLMClient
+
+        mock_client = MagicMock()
+        mock_client.converse.return_value = {
+            "output": {
+                "message": {
+                    "content": [
+                        {"text": "SELECT ?claim WHERE {"},
+                        {"text": " ?claim a :Claim }"},
+                    ]
+                }
+            }
+        }
+        client = BedrockLLMClient(model_id="test-model", region="us-east-1")
+        client._client = mock_client
+
+        result = await client.converse("q")
+
+        assert result.text == "SELECT ?claim WHERE { ?claim a :Claim }", (
+            "blocks after the first were dropped, truncating the generation"
+        )
+
+    async def test_non_text_blocks_are_still_skipped(self):
+        from coa_serve.clients.bedrock import BedrockLLMClient
+
+        mock_client = MagicMock()
+        mock_client.converse.return_value = {
+            "output": {
+                "message": {
+                    "content": [
+                        {"text": "a"},
+                        {"toolUse": {"name": "x"}},
+                        {"text": "b"},
+                    ]
+                }
+            }
+        }
+        client = BedrockLLMClient(model_id="test-model", region="us-east-1")
+        client._client = mock_client
+
+        assert (await client.converse("q")).text == "ab"
+
+
+@pytest.mark.unit
+class TestConverseStreamCleanup:
+    """Generator finalization must not block on the uncancellable worker thread.
+
+    The worker iterates boto3's synchronous EventStream in a thread-pool thread, so
+    there is no cancellation point: `await task` in `finally` waited out
+    BEDROCK_READ_TIMEOUT, defeating the idle-timeout guard, and on early close it
+    suspended inside GeneratorExit handling — which CPython rejects for async
+    generators ("async generator ignored GeneratorExit").
+    """
+
+    class _BlockingStream:
+        """Emits one chunk, then blocks like boto3's EventStream until closed."""
+
+        def __init__(self, ticks: int = 200, tick_s: float = 0.05):
+            self.closed = False
+            self._ticks = ticks
+            self._tick_s = tick_s
+
+        def __iter__(self):
+            import time
+
+            yield {"contentBlockDelta": {"delta": {"text": "hello"}}}
+            for _ in range(self._ticks):
+                if self.closed:
+                    raise RuntimeError("stream closed")
+                time.sleep(self._tick_s)
+
+        def close(self):
+            self.closed = True
+
+    def _client_over(self, stream):
+        from coa_serve.clients.bedrock import BedrockLLMClient
+
+        mock_client = MagicMock()
+        mock_client.converse_stream.return_value = {"stream": stream}
+        client = BedrockLLMClient(model_id="test-model", region="us-east-1")
+        client._client = mock_client
+        return client
+
+    async def test_early_close_returns_promptly(self):
+        import time
+
+        stream = self._BlockingStream()
+        agen = self._client_over(stream).converse_stream("q")
+
+        assert await agen.__anext__() == "hello"
+        started = time.monotonic()
+        await agen.aclose()
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 2.0, f"aclose() blocked for {elapsed:.1f}s waiting on the worker thread"
+
+    async def test_early_close_closes_the_upstream_stream(self):
+        """Otherwise the worker keeps consuming Bedrock (and billing) after disconnect."""
+        stream = self._BlockingStream()
+        agen = self._client_over(stream).converse_stream("q")
+
+        await agen.__anext__()
+        await agen.aclose()
+
+        assert stream.closed
+
+    async def test_early_close_does_not_raise(self):
+        stream = self._BlockingStream()
+        agen = self._client_over(stream).converse_stream("q")
+
+        await agen.__anext__()
+        await agen.aclose()  # must not raise "async generator ignored GeneratorExit"
+
+    async def test_normal_completion_still_yields_every_token(self):
+        """The detached-worker change must not truncate a healthy stream."""
+        events = [
+            {"contentBlockDelta": {"delta": {"text": "a"}}},
+            {"contentBlockDelta": {"delta": {"text": "b"}}},
+            {"messageStop": {"stopReason": "end_turn"}},
+        ]
+        client = self._client_over(iter(events))
+
+        assert [t async for t in client.converse_stream("q")] == ["a", "b"]
+
+    async def test_stream_without_close_method_is_tolerated(self):
+        """A plain iterator has no close(); finalization must still not raise."""
+        agen = self._client_over(iter([{"contentBlockDelta": {"delta": {"text": "x"}}}])).converse_stream("q")
+
+        assert await agen.__anext__() == "x"
+        await agen.aclose()
+
+
+@pytest.mark.unit
 class TestModelIdValidation:
     def test_validate_rejects_empty(self):
         from coa_serve.model_validation import validate_model_id
