@@ -5,9 +5,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from abc import ABC, abstractmethod
+from collections.abc import Iterable
 
 from coa_common import sql_ident
 from coa_common.bedrock_metrics import CostTracker
@@ -152,6 +154,76 @@ def to_camel(s: str) -> str:
     return p[0].lower() + p[1:] if p else p
 
 
+def _name_discriminator(name: str) -> str:
+    """Return a short deterministic suffix distinguishing ``name`` from its peers.
+
+    Derived from the verbatim name, so it is stable across runs (no hashing of
+    iteration order or object identity) and identical in every consumer that
+    mints IRIs for the same table.
+    """
+    return hashlib.sha256(name.encode("utf-8")).hexdigest()[:8]
+
+
+def pascal_names_for(names: Iterable[str]) -> dict[str, str]:
+    r"""Map each verbatim table name to a COLLISION-FREE PascalCase local name.
+
+    :func:`to_pascal` is lossy: it strips every character outside
+    ``[a-zA-Z0-9\s_\-]``, treats space/underscore/hyphen as one separator
+    class, and normalizes case. So ``order_item``, ``order-item``,
+    ``Order_Item``, and ``ORDER ITEM`` all collapse onto ``OrderItem``, and any
+    name made entirely of stripped characters collapses onto the ``"Entity"``
+    fallback. Minting class / TriplesMap IRIs straight from ``to_pascal`` therefore
+    silently FUSES distinct source tables onto one IRI: one class carrying both
+    tables' labels, key axioms, and cardinality restrictions, and — worse — one
+    TriplesMap carrying two ``rr:logicalTable`` / ``rr:tableName`` values, which
+    is invalid R2RML (a TriplesMap has exactly one logical table). Ontop then
+    either rejects the whole mapping (VKG load fails for the namespace) or picks
+    one table non-deterministically and drops the other's data.
+
+    This helper resolves collisions instead: the first name (in the caller's
+    order) keeps the bare PascalCase form so existing single-table-per-name
+    deployments mint byte-identical IRIs, and each subsequent colliding name gets
+    ``{Pascal}_{sha256(name)[:8]}`` appended. The discriminator is derived from
+    the verbatim name, so the assignment is deterministic given the same input
+    order and is reproducible across the ontology builder, the R2RML builder, and
+    the SHACL config generator — all three must agree or the artifacts diverge.
+
+    Callers should also surface a collision to the user (see the ``log.warning``
+    below): a silent merge is the worst of the possible outcomes, and a schema
+    that needs a discriminator usually indicates a naming problem worth fixing at
+    the source.
+
+    Args:
+        names: Verbatim table names, in a stable order.
+
+    Returns:
+        ``{verbatim_name: unique_pascal_local_name}`` covering every input name.
+    """
+    result: dict[str, str] = {}
+    taken: set[str] = set()
+    for name in names:
+        if name in result:
+            continue  # duplicate entry for the same table — one mapping is enough
+        base = to_pascal(name)
+        candidate = base
+        if candidate in taken:
+            candidate = f"{base}_{_name_discriminator(name)}"
+            log.warning(
+                "table_name_collides_after_pascal_case",
+                extra={"table": name, "collided_on": base, "minted": candidate},
+            )
+            # Pathological: the discriminated form is itself taken (two tables
+            # with the same verbatim name would have been deduped above, so this
+            # needs a genuine hash collision). Widen until unique.
+            suffix = 2
+            while candidate in taken:
+                candidate = f"{base}_{_name_discriminator(name)}_{suffix}"
+                suffix += 1
+        taken.add(candidate)
+        result[name] = candidate
+    return result
+
+
 def _annotate_triples_map(g: Graph, tmap: URIRef, table: CatalogTable) -> None:
     """Annotate a TriplesMap with datasource provenance (coa:datasourceId, coa:sourceSchema).
 
@@ -254,14 +326,22 @@ class InductionStrategy(ABC):
         g.bind("ind", ns)
         g.bind("xsd", XSD)
 
-        # Build a lookup from table name → TriplesMap URI for parentTriplesMap refs
+        # Build a lookup from table name → TriplesMap URI for parentTriplesMap refs.
+        # Local names come from the collision-resolving helper, not bare
+        # to_pascal: two tables differing only in separators/case would otherwise
+        # share one TriplesMap IRI and produce two rr:tableName values on it
+        # (invalid R2RML — see pascal_names_for).
+        pascal_by_name = pascal_names_for(t.name for t in tables)
+        # Property local names derive from the (possibly discriminated) class
+        # local name, so a disambiguated class carries disambiguated predicates.
+        camel_by_name = {n: p[0].lower() + p[1:] if p else p for n, p in pascal_by_name.items()}
         tmap_by_name: dict[str, URIRef] = {}
         for table in tables:
-            tmap_by_name[table.name] = ns[f"TriplesMap_{to_pascal(table.name)}"]
+            tmap_by_name[table.name] = ns[f"TriplesMap_{pascal_by_name[table.name]}"]
 
         for table in tables:
             tmap = tmap_by_name[table.name]
-            table_cls = ns[to_pascal(table.name)]
+            table_cls = ns[pascal_by_name[table.name]]
 
             g.add((tmap, RDF.type, RR.TriplesMap))
             _annotate_triples_map(g, tmap, table)
@@ -311,7 +391,7 @@ class InductionStrategy(ABC):
                 pom = URIRef(f"{tmap}/POM_{to_pascal(col.name)}")
                 g.add((tmap, RR.predicateObjectMap, pom))
 
-                prop_uri = ns[f"{to_camel(table.name)}_{to_camel(col.name)}"]
+                prop_uri = ns[f"{camel_by_name[table.name]}_{to_camel(col.name)}"]
                 g.add((pom, RR.predicate, prop_uri))
 
                 om = URIRef(f"{pom}/ObjectMap")
@@ -363,6 +443,10 @@ class InductionStrategy(ABC):
                     fk_target = composite_fk.referredColumns[0].split(".")[0]
                     parent_tmap = tmap_by_name.get(fk_target)
                     if parent_tmap is None:
+                        # Target table is outside this induction run, so it has no
+                        # entry in pascal_by_name. Fall back to the bare form —
+                        # nothing to collide with here, since a table we did not
+                        # process has no TriplesMap in this mapping either.
                         parent_tmap = ns[f"TriplesMap_{to_pascal(fk_target)}"]
 
                     g.add((om, RR.parentTriplesMap, parent_tmap))

@@ -25,7 +25,7 @@ from coa_ontology.inducer.services.data_catalog import (
     CatalogTable,
 )
 from coa_ontology.inducer.strategies.base import RR, SCL
-from rdflib import RDF, XSD, Graph, Namespace
+from rdflib import OWL, RDF, RDFS, XSD, Graph, Namespace, URIRef
 
 pytestmark = pytest.mark.unit
 
@@ -1995,3 +1995,157 @@ class TestEdgeCases:
         # First FK constraint wins — parentTriplesMap points to table_a
         parent = _object_map_parent_tmap(g, ns["TriplesMap_Refs/POM_TargetId"])
         assert parent == ns.TriplesMap_TableA
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 10: IRI collision resolution (to_pascal is lossy)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.unit
+class TestPascalCaseCollisions:
+    """Distinct tables must never share a class / TriplesMap IRI.
+
+    ``to_pascal`` folds separators and case, so names like ``order_item`` and
+    ``order-item`` collapse onto one local name. Minting IRIs from it directly
+    fused the two tables: one TriplesMap carrying two ``rr:tableName`` values
+    (invalid R2RML — a TriplesMap has exactly one logical table) and one class
+    carrying both tables' labels and key axioms.
+    """
+
+    @staticmethod
+    def _tables(*names):
+        return [
+            CatalogTable(
+                id=str(i),
+                name=name,
+                fullyQualifiedName=f"db.{name}",
+                columns=[CatalogColumn(name="id", dataType="INT")],
+                tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["id"])],
+            )
+            for i, name in enumerate(names, start=1)
+        ]
+
+    def test_separator_variants_get_distinct_triples_maps(self, strategy):
+        tables = self._tables("order_item", "order-item")
+        g = _build(strategy, tables)
+
+        tmaps = set(g.subjects(RDF.type, RR.TriplesMap))
+        assert len(tmaps) == 2, f"Expected one TriplesMap per table, got {tmaps}"
+
+    def test_each_triples_map_has_exactly_one_table_name(self, strategy):
+        """The R2RML invariant that the collision broke."""
+        tables = self._tables("order_item", "order-item")
+        g = _build(strategy, tables)
+
+        for tmap in g.subjects(RDF.type, RR.TriplesMap):
+            logical_tables = list(g.objects(tmap, RR.logicalTable))
+            assert len(logical_tables) == 1, f"{tmap} has {len(logical_tables)} logical tables"
+            names = [str(n) for lt in logical_tables for n in g.objects(lt, RR.tableName)]
+            assert len(names) == 1, f"{tmap} maps {len(names)} tables: {names}"
+
+    def test_both_source_tables_are_mapped(self, strategy):
+        """Neither table may be silently dropped by the disambiguation."""
+        tables = self._tables("order_item", "order-item")
+        g = _build(strategy, tables)
+
+        mapped = {
+            str(n)
+            for tmap in g.subjects(RDF.type, RR.TriplesMap)
+            for lt in g.objects(tmap, RR.logicalTable)
+            for n in g.objects(lt, RR.tableName)
+        }
+        assert mapped == {'"order_item"', '"order-item"'}
+
+    def test_case_only_variants_get_distinct_triples_maps(self, strategy):
+        tables = self._tables("Customer", "customer")
+        g = _build(strategy, tables)
+
+        assert len(set(g.subjects(RDF.type, RR.TriplesMap))) == 2
+
+    def test_non_colliding_names_keep_bare_pascal_iris(self, strategy):
+        """No discriminator when there is nothing to disambiguate (IRI stability)."""
+        tables = self._tables("orders", "customers")
+        g = _build(strategy, tables)
+        ns = Namespace(PREFIX)
+
+        assert (ns.TriplesMap_Orders, RDF.type, RR.TriplesMap) in g
+        assert (ns.TriplesMap_Customers, RDF.type, RR.TriplesMap) in g
+
+    def test_first_colliding_table_keeps_the_bare_iri(self, strategy):
+        """Existing deployments keep byte-identical IRIs for the first name."""
+        tables = self._tables("order_item", "order-item")
+        g = _build(strategy, tables)
+        ns = Namespace(PREFIX)
+
+        assert (ns.TriplesMap_OrderItem, RDF.type, RR.TriplesMap) in g
+        names = [
+            str(n) for lt in g.objects(ns.TriplesMap_OrderItem, RR.logicalTable) for n in g.objects(lt, RR.tableName)
+        ]
+        assert names == ['"order_item"']
+
+    def test_assignment_is_deterministic_across_runs(self, strategy):
+        """Same input order must mint the same IRIs every time."""
+        first = _build(strategy, self._tables("order_item", "order-item"))
+        second = _build(strategy, self._tables("order_item", "order-item"))
+
+        assert set(first.subjects(RDF.type, RR.TriplesMap)) == set(second.subjects(RDF.type, RR.TriplesMap))
+
+    def test_ontology_and_r2rml_agree_on_class_iris(self, strategy):
+        """The two builders must mint identical class IRIs for colliding names."""
+        tables = self._tables("order_item", "order-item")
+        onto, novel = strategy._build_proposal_ontology(PREFIX, tables, [])
+        r2rml = strategy.build_r2rml(PREFIX, tables, novel, onto)
+
+        onto_classes = set(onto.subjects(RDF.type, OWL.Class))
+        r2rml_classes = {c for _, _, c in r2rml.triples((None, RR["class"], None))}
+        assert r2rml_classes <= onto_classes, (
+            f"R2RML references classes absent from the ontology: {r2rml_classes - onto_classes}"
+        )
+        assert len(r2rml_classes) == 2
+
+    def test_ontology_gives_each_table_its_own_class_and_label(self, strategy):
+        tables = self._tables("order_item", "order-item")
+        onto, _ = strategy._build_proposal_ontology(PREFIX, tables, [])
+
+        labels_by_class = {
+            str(cls): sorted(str(lbl) for lbl in onto.objects(cls, RDFS.label))
+            for cls in onto.subjects(RDF.type, OWL.Class)
+        }
+        assert len(labels_by_class) == 2
+        for cls, labels in labels_by_class.items():
+            assert len(labels) == 1, f"{cls} carries labels from multiple tables: {labels}"
+
+    def test_colliding_tables_get_distinct_property_iris(self, strategy):
+        """Discriminated classes must carry discriminated property IRIs too."""
+        tables = [
+            CatalogTable(
+                id="1",
+                name="order_item",
+                fullyQualifiedName="db.order_item",
+                columns=[CatalogColumn(name="qty", dataType="INT")],
+            ),
+            CatalogTable(
+                id="2",
+                name="order-item",
+                fullyQualifiedName="db.order-item",
+                columns=[CatalogColumn(name="qty", dataType="INT")],
+            ),
+        ]
+        g = _build(strategy, tables)
+
+        predicates = {str(p) for _, _, p in g.triples((None, RR.predicate, None))}
+        assert len(predicates) == 2, f"Property IRIs still collide: {predicates}"
+
+    def test_shacl_config_agrees_with_ontology_class_iris(self, strategy):
+        """generate_config_from_db must target the classes the ontology declares."""
+        from coa_ontology.validation.shapes.config import generate_config_from_db
+
+        tables = self._tables("order_item", "order-item")
+        onto, _ = strategy._build_proposal_ontology(PREFIX, tables, [])
+        config = generate_config_from_db(tables, PREFIX)
+
+        onto_classes = set(onto.subjects(RDF.type, OWL.Class))
+        shape_classes = {URIRef(c.class_uri) for c in config.classes}
+        assert shape_classes <= onto_classes, f"Shapes target absent classes: {shape_classes - onto_classes}"
+        assert len(shape_classes) == 2
