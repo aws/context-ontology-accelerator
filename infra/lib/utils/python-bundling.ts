@@ -75,8 +75,10 @@ function resolvePipCommand(): string {
  * ```
  */
 export function bundlePython(opts: PythonBundlingOptions): lambda.Code {
-  // Compute a stable hash from only the files that matter for this Lambda.
-  const assetHash = _computeSourceHash(opts.srcDirs, opts.requirementsFile);
+  // Compute a stable hash over EVERY input that affects the produced bundle.
+  // Omitting one means CDK reuses a stale cached asset and the Lambda keeps
+  // running old code or old dependencies, with no error at deploy time.
+  const assetHash = _computeSourceHash(opts);
 
   // Normalize all source paths to forward slashes for Docker compatibility
   const srcDirs = opts.srcDirs.map((d) => d.replace(/\\/g, "/"));
@@ -94,10 +96,15 @@ export function bundlePython(opts: PythonBundlingOptions): lambda.Code {
     "s3transfer",
     "jmespath",
   ];
+  // Anchor the dist-info glob on the version separator (`-`) so it cannot match a
+  // DIFFERENT package that merely starts with the same name: `boto3*dist-info`
+  // also matched `boto3_stubs-1.2.3.dist-info`, deleting that package's metadata
+  // while leaving its code in place — a half-removed install. A real dist-info is
+  // always `{name}-{version}.dist-info`.
   const cleanup = runtimePkgs
     .map(
       (p) =>
-        `rm -rf /asset-output/${p} /asset-output/${p.replace("-", "_")}*dist-info`,
+        `rm -rf /asset-output/${p} /asset-output/${p.replace("-", "_")}-*.dist-info`,
     )
     .join(" && ");
 
@@ -157,58 +164,87 @@ function escapeRegExp(s: string): string {
 }
 
 /**
- * Compute a stable SHA-256 hash from only the source files and requirements
- * that actually affect this Lambda bundle. Used as a custom CDK asset hash
- * so that unrelated repo changes (test outputs, coverage files, etc.) don't
- * trigger unnecessary re-bundles.
+ * Compute a stable SHA-256 hash over every input that affects this Lambda
+ * bundle. Used as a custom CDK asset hash so unrelated repo changes (test
+ * outputs, coverage files, …) don't trigger needless re-bundles.
  *
- * On Linux/macOS: uses `find | sort | xargs sha256sum` (preserves existing hashes).
- * On Windows: uses Node.js fs (quiet, no shell noise).
+ * Hashes ALL files under `srcDirs` — not just `*.py`. The bundle command copies
+ * everything (`cp -r ${d}/*`), so JSON/schema/template files shipped alongside
+ * the code are part of the output and must invalidate the asset when edited.
+ *
+ * Also folds in `pipDeps` and `architecture`, which change the produced bundle
+ * without touching any file:
+ *   - `pipDeps` is the alternative to `requirementsFile`; callers using it could
+ *     add, remove, or re-pin a dependency with no hash change, so the deployed
+ *     bundle kept the old dependency set (symptom: `ImportModuleError` for a
+ *     freshly added dep).
+ *   - `architecture` selects the pip `--platform` tag and therefore which binary
+ *     wheels land in the bundle, so flipping x86_64 ↔ arm64 reused an asset built
+ *     for the wrong architecture.
+ *
+ * Reads files via Node on every platform. The previous `find … || true` shell
+ * pipeline was unquoted and failure-suppressed, so a repo path containing a space
+ * degraded every hash to the empty-input hash — permanently disabling
+ * invalidation — and any `find` failure passed silently.
  */
-function _computeSourceHash(
-  srcDirs: string[],
-  requirementsFile?: string,
-): string {
+export function _computeSourceHash(opts: PythonBundlingOptions): string {
   const hash = crypto.createHash("sha256");
-  for (const dir of srcDirs) {
-    try {
-      if (process.platform === "win32") {
-        const normalizedDir = dir.replace(/\\/g, "/");
-        const files = _collectPyFiles(normalizedDir).sort();
-        for (const file of files) {
-          const fileHash = crypto
-            .createHash("sha256")
-            .update(fs.readFileSync(file))
-            .digest("hex");
-          hash.update(`${fileHash}  ${file}\n`);
-        }
-      } else {
-        const out = execSync(
-          `find ${dir} -type f -name "*.py" | sort | xargs sha256sum 2>/dev/null || true`,
-          { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] },
-        );
-        hash.update(out);
-      }
-    } catch {
-      // Directory may not exist yet — ignore
+
+  // Bundle-shaping inputs first, so they are covered even if a srcDir is absent.
+  hash.update(`architecture:${opts.architecture ?? "x86_64"}\n`);
+  if (opts.pipDeps?.length) {
+    // Sorted: dependency ORDER does not change the installed set, so it must not
+    // change the hash (an unsorted list would cause spurious re-bundles).
+    hash.update(`pipDeps:${[...opts.pipDeps].sort().join(",")}\n`);
+  }
+
+  for (const dir of opts.srcDirs) {
+    const normalizedDir = dir.replace(/\\/g, "/");
+    if (!fs.existsSync(normalizedDir)) {
+      // A source dir that does not exist yet still has to affect the hash, or
+      // creating it later would not invalidate the asset.
+      hash.update(`missing:${normalizedDir}\n`);
+      continue;
+    }
+    for (const file of _collectFiles(normalizedDir).sort()) {
+      const fileHash = crypto
+        .createHash("sha256")
+        .update(fs.readFileSync(file))
+        .digest("hex");
+      // Path is included so a rename alone invalidates the asset.
+      hash.update(`${fileHash}  ${file}\n`);
     }
   }
-  if (requirementsFile && fs.existsSync(requirementsFile)) {
-    hash.update(fs.readFileSync(requirementsFile));
+
+  if (opts.requirementsFile) {
+    if (fs.existsSync(opts.requirementsFile)) {
+      hash.update(fs.readFileSync(opts.requirementsFile));
+    } else {
+      hash.update(`missing:${opts.requirementsFile}\n`);
+    }
   }
   return hash.digest("hex");
 }
 
-/** Recursively collect all .py file paths in a directory. */
-function _collectPyFiles(dir: string): string[] {
+/**
+ * Recursively collect every file path in a directory.
+ *
+ * Deliberately NOT limited to `*.py`: the bundle copies the whole tree, so any
+ * non-Python file it ships (JSON, schemas, templates, Cedar policies) must
+ * invalidate the asset when edited.
+ *
+ * `__pycache__` is skipped — it is build output, not input, and hashing it would
+ * make the asset depend on whether tests happened to run first.
+ */
+function _collectFiles(dir: string): string[] {
   if (!fs.existsSync(dir)) return [];
   const results: string[] = [];
-  const entries = fs.readdirSync(dir, { withFileTypes: true });
-  for (const entry of entries) {
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     const fullPath = `${dir}/${entry.name}`;
     if (entry.isDirectory()) {
-      results.push(..._collectPyFiles(fullPath));
-    } else if (entry.isFile() && entry.name.endsWith(".py")) {
+      if (entry.name === "__pycache__") continue;
+      results.push(..._collectFiles(fullPath));
+    } else if (entry.isFile() && !entry.name.endsWith(".pyc")) {
       results.push(fullPath);
     }
   }
