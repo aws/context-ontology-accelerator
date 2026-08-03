@@ -2507,3 +2507,118 @@ class TestReferredColumnParsing:
 
         assert ("loss_payment", "claim_amount") in confirmed
         assert ("expense_payment", "claim_amount") in confirmed
+
+
+@pytest.mark.unit
+class TestOverlappingCompositeForeignKeys:
+    """Two composite FKs sharing a column must both keep their relationship.
+
+    `build_r2rml` walks the columns and CONSUMES each constraint as it anchors it,
+    so for FK1=(a,b)->p1 and FK2=(b,c)->p2: `a` anchors FK1 (absorbing `b`), and
+    `c` — reached with FK1 already consumed — anchors FK2.
+
+    A non-consuming `composite_fk_columns` matched `c` against FK2 while also
+    treating it as absorbed by `b`, so `c` degraded to a literal and the child→p2
+    relationship vanished from the R2RML mapping AND (since both builders share the
+    helper) from the ontology.
+    """
+
+    @staticmethod
+    def _tables():
+        child = CatalogTable(
+            id="1",
+            name="child",
+            fullyQualifiedName="s.child",
+            columns=[
+                CatalogColumn(name="a", dataType="INT"),
+                CatalogColumn(name="b", dataType="INT"),
+                CatalogColumn(name="c", dataType="INT"),
+            ],
+            tableConstraints=[
+                CatalogConstraint(constraintType="FOREIGN_KEY", columns=["a", "b"], referredColumns=["p1.a", "p1.b"]),
+                CatalogConstraint(constraintType="FOREIGN_KEY", columns=["b", "c"], referredColumns=["p2.b", "p2.c"]),
+            ],
+        )
+        p1 = CatalogTable(
+            id="2",
+            name="p1",
+            fullyQualifiedName="s.p1",
+            columns=[CatalogColumn(name="a", dataType="INT"), CatalogColumn(name="b", dataType="INT")],
+            tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["a", "b"])],
+        )
+        p2 = CatalogTable(
+            id="3",
+            name="p2",
+            fullyQualifiedName="s.p2",
+            columns=[CatalogColumn(name="b", dataType="INT"), CatalogColumn(name="c", dataType="INT")],
+            tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["b", "c"])],
+        )
+        return [child, p1, p2]
+
+    def test_both_relationships_survive_in_r2rml(self, strategy):
+        g = _build(strategy, self._tables())
+        ns = Namespace(PREFIX)
+
+        parents = {str(p) for _, _, p in g.triples((None, RR.parentTriplesMap, None))}
+        assert str(ns.TriplesMap_P1) in parents
+        assert str(ns.TriplesMap_P2) in parents, "the second composite FK's relationship was dropped"
+
+    def test_each_composite_fk_is_anchored_on_a_distinct_column(self, strategy):
+        g = _build(strategy, self._tables())
+        ns = Namespace(PREFIX)
+
+        assert _object_map_parent_tmap(g, ns["TriplesMap_Child/POM_A"]) == ns.TriplesMap_P1
+        assert _object_map_parent_tmap(g, ns["TriplesMap_Child/POM_C"]) == ns.TriplesMap_P2
+        # b is absorbed by FK1's map and carries a literal mapping only.
+        assert _object_map_parent_tmap(g, ns["TriplesMap_Child/POM_B"]) is None
+        assert _object_map_column(g, ns["TriplesMap_Child/POM_B"]) == '"b"'
+
+    def test_shared_column_is_absorbed_exactly_once(self, strategy):
+        from coa_ontology.inducer.strategies.base import composite_fk_columns
+
+        child = self._tables()[0]
+
+        assert composite_fk_columns(child) == {"b": "a"}
+
+    def test_ontology_matches_the_mapping(self, strategy):
+        tables = self._tables()
+        onto, novel = strategy._build_proposal_ontology(PREFIX, tables, [])
+        r2rml = strategy.build_r2rml(PREFIX, tables, novel, onto)
+        ns = Namespace(PREFIX)
+
+        assert (ns.child_a, RDF.type, OWL.ObjectProperty) in onto
+        assert (ns.child_c, RDF.type, OWL.ObjectProperty) in onto
+        assert (ns.child_b, RDF.type, OWL.DatatypeProperty) in onto
+        assert onto.value(ns.child_c, RDFS.range) == ns.P2
+
+        declared = {str(p) for p in onto.subjects(RDF.type, OWL.ObjectProperty)} | {
+            str(p) for p in onto.subjects(RDF.type, OWL.DatatypeProperty)
+        }
+        mapped = {str(p) for _, _, p in r2rml.triples((None, RR.predicate, None))}
+        assert declared - mapped == set()
+
+    def test_three_overlapping_composite_fks(self, strategy):
+        """Chained overlap: (a,b)->p1, (b,c)->p2, (c,d)->p3."""
+        child = CatalogTable(
+            id="1",
+            name="child",
+            fullyQualifiedName="s.child",
+            columns=[CatalogColumn(name=n, dataType="INT") for n in ("a", "b", "c", "d")],
+            tableConstraints=[
+                CatalogConstraint(constraintType="FOREIGN_KEY", columns=["a", "b"], referredColumns=["p1.a", "p1.b"]),
+                CatalogConstraint(constraintType="FOREIGN_KEY", columns=["b", "c"], referredColumns=["p2.b", "p2.c"]),
+                CatalogConstraint(constraintType="FOREIGN_KEY", columns=["c", "d"], referredColumns=["p3.c", "p3.d"]),
+            ],
+        )
+        g = _build(strategy, [child])
+
+        ns = Namespace(PREFIX)
+        # a anchors FK1 (folding in b); b is skipped as folded, so c anchors FK2
+        # (folding in nothing new); d then anchors FK3. Every constraint keeps a
+        # relationship — matches what the pre-fix mapping emitted, verified by
+        # running both revisions.
+        assert _object_map_parent_tmap(g, ns["TriplesMap_Child/POM_A"]) == ns.TriplesMap_P1
+        assert _object_map_parent_tmap(g, ns["TriplesMap_Child/POM_C"]) == ns.TriplesMap_P2
+        assert _object_map_parent_tmap(g, ns["TriplesMap_Child/POM_D"]) == ns.TriplesMap_P3
+        # b is the only folded column, so it is the only literal.
+        assert _object_map_column(g, ns["TriplesMap_Child/POM_B"]) == '"b"'
