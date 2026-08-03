@@ -17,7 +17,11 @@ from coa_common.constants import VOCAB_URI
 from rdflib import RDF, XSD, BNode, Graph, Literal, Namespace, URIRef
 
 from coa_ontology.inducer.schemas import ConceptMatch
-from coa_ontology.inducer.services.data_catalog import CatalogTable, parse_referred_column
+from coa_ontology.inducer.services.data_catalog import (
+    CatalogConstraint,
+    CatalogTable,
+    parse_referred_column,
+)
 
 log = logging.getLogger(__name__)
 
@@ -224,7 +228,7 @@ def pascal_names_for(names: Iterable[str]) -> dict[str, str]:
     return result
 
 
-def composite_fk_is_usable(tc) -> bool:
+def composite_fk_is_usable(tc: CatalogConstraint) -> bool:
     """True when a composite FK constraint can produce a valid Referencing Object Map.
 
     :meth:`InductionStrategy.build_r2rml` degrades a composite FK to plain datatype
@@ -273,30 +277,96 @@ def composite_fk_columns(table: CatalogTable) -> dict[str, str]:
         ``{column: ""}`` for every column of a malformed composite FK. The owning
         (first) column of a USABLE composite FK is absent — it keeps both its POM
         and its object property. Empty when the table has no composite FK.
+
+    Mirrors :meth:`InductionStrategy.build_r2rml`'s CONSUMING walk exactly, which
+    matters when two composite FKs share a column. For ``FK1 = (a, b) -> p1`` and
+    ``FK2 = (b, c) -> p2``, walking the columns in order assigns ``a`` to FK1
+    (absorbing ``b``), and then ``c`` — reached with FK1 already consumed — anchors
+    FK2. A non-consuming implementation instead matched ``c`` against FK2 while
+    treating it as absorbed by ``b``, which silently dropped the child→p2
+    relationship from BOTH artifacts. So the walk order and the removal are
+    load-bearing, not incidental.
     """
     absorbed: dict[str, str] = {}
     if not table.tableConstraints:
         return absorbed
     table_columns = {c.name for c in table.columns}
+
+    # Malformed composite FKs first: build_r2rml degrades every one of their
+    # columns to a literal regardless of position, so they never anchor anything.
+    remaining = []
     for tc in table.tableConstraints:
         if tc.constraintType != "FOREIGN_KEY" or not tc.referredColumns or len(tc.columns or []) <= 1:
             continue
-        if not composite_fk_is_usable(tc):
-            # Degraded to datatype ObjectMaps in the mapping — no object property
-            # for ANY of these columns, the first one included.
+        if composite_fk_is_usable(tc):
+            remaining.append(tc)
+        else:
             for col_name in tc.columns:
                 if col_name in table_columns:
                     absorbed.setdefault(col_name, "")
-            continue
-        # build_r2rml anchors the POM on the first column of the constraint that
-        # the table actually has (it iterates table.columns), so mirror that.
-        owner = next((c for c in table.columns if c.name in tc.columns), None)
-        if owner is None:
-            continue
+
+    # Then replay build_r2rml's walk: for each column in order, claim the first
+    # not-yet-claimed constraint it participates in. That column becomes the
+    # anchor, and the constraint is consumed so a later column cannot claim it
+    # again. Anchors are recorded as they are decided; absorbed columns are
+    # resolved afterwards, because a column can be a LATER constraint's anchor
+    # even though an earlier constraint also lists it — with (a,b)->p1,
+    # (b,c)->p2, (c,d)->p3, `c` anchors FK2 and must not be absorbed by FK3.
+    anchors = composite_fk_anchors(table)
+    for owner, tc in anchors.items():
         for col_name in tc.columns:
-            if col_name != owner.name and col_name in table_columns:
-                absorbed.setdefault(col_name, owner.name)
+            if col_name != owner and col_name in table_columns:
+                absorbed.setdefault(col_name, owner)
+    # An anchor is never absorbed: it carries its own relationship. This can only
+    # bite when constraints overlap — `composite_fk_anchors` skips folded columns,
+    # so a column it chose as an anchor was not folded in by an earlier one.
+    for anchor in anchors:
+        absorbed.pop(anchor, None)
     return absorbed
+
+
+def composite_fk_anchors(table: CatalogTable) -> dict[str, CatalogConstraint]:
+    """Map each column that ANCHORS a usable composite FK to that constraint.
+
+    Single source of truth for the anchor assignment, consumed by both
+    :meth:`InductionStrategy.build_r2rml` (which emits one Referencing Object Map
+    per anchor) and :func:`composite_fk_columns` (which derives the absorbed
+    columns from it). Splitting the two apart is what let them disagree: the
+    mapping walked and CONSUMED constraints column by column while the ontology
+    side computed absorption independently, so for two FKs sharing a column they
+    picked different anchors and the relationship landed on different properties
+    in each artifact.
+
+    The rule reproduces the mapping's original walk exactly: visit columns in table
+    order; SKIP a column already folded into an earlier anchor's map; otherwise let
+    it claim the first unclaimed constraint it participates in, and consume that
+    constraint. Both the skip and the consumption matter. For (a,b)->p1 and
+    (b,c)->p2: `a` claims p1 and folds in `b`; `b` is skipped BECAUSE it is folded
+    in, so p2 falls to `c`. Dropping the skip hands p2 to `b` instead, which moves
+    the relationship onto a different property than the original mapping used.
+    """
+    anchors: dict[str, CatalogConstraint] = {}
+    if not table.tableConstraints:
+        return anchors
+    remaining = [
+        tc
+        for tc in table.tableConstraints
+        if tc.constraintType == "FOREIGN_KEY"
+        and tc.referredColumns
+        and len(tc.columns or []) > 1
+        and composite_fk_is_usable(tc)
+    ]
+    folded: set[str] = set()
+    for col in table.columns:
+        if col.name in folded:
+            continue
+        claimed = next((tc for tc in remaining if col.name in tc.columns), None)
+        if claimed is None:
+            continue
+        anchors[col.name] = claimed
+        remaining.remove(claimed)
+        folded.update(c for c in claimed.columns if c != col.name)
+    return anchors
 
 
 def _annotate_triples_map(g: Graph, tmap: URIRef, table: CatalogTable) -> None:
@@ -446,19 +516,27 @@ class InductionStrategy(ABC):
             g.add((subj, RR.template, Literal(template)))
             g.add((subj, RR["class"], table_cls))
 
-            # Pre-collect composite FK constraints so we can detect when a column
-            # participates in a multi-column FK (needs special handling).
-            composite_fk_constraints = []
-            if table.tableConstraints:
-                for tc in table.tableConstraints:
-                    if tc.constraintType == "FOREIGN_KEY" and tc.referredColumns and len(tc.columns) > 1:
-                        composite_fk_constraints.append(tc)
-
-            # Columns a USABLE composite FK folds into its owning column's
-            # referencing map. Computed up front (not accumulated while iterating)
-            # so the branch below is independent of column order, and shared with
-            # the ontology builder so both agree on which columns are literals.
+            # Which column carries which composite FK, and which columns it folds
+            # in. Both come from the SAME helpers the ontology builder uses, so the
+            # two artifacts cannot disagree about where a relationship lives — they
+            # previously derived it independently (a consuming walk here, a separate
+            # computation there) and picked different anchors for FKs sharing a
+            # column.
+            composite_anchors = composite_fk_anchors(table)
             absorbed_columns = {name for name, owner in composite_fk_columns(table).items() if owner}
+
+            # Malformed composite FKs never anchor anything (see
+            # composite_fk_is_usable); their columns fall through to the datatype
+            # path below, which is what build_r2rml has always done.
+            malformed_composite_columns = {
+                col_name
+                for tc in (table.tableConstraints or [])
+                if tc.constraintType == "FOREIGN_KEY"
+                and tc.referredColumns
+                and len(tc.columns or []) > 1
+                and not composite_fk_is_usable(tc)
+                for col_name in tc.columns
+            }
 
             for col in table.columns:
                 # A column absorbed into a sibling's composite-FK Referencing
@@ -489,45 +567,28 @@ class InductionStrategy(ABC):
                 om = URIRef(f"{pom}/ObjectMap")
                 g.add((pom, RR.objectMap, om))
 
-                # Check if this column is part of a composite FK
-                composite_fk = None
-                for tc in composite_fk_constraints:
-                    if col.name in tc.columns:
-                        composite_fk = tc
-                        break
+                # This column anchors a composite FK when the shared anchor table
+                # says so — never by re-deriving it here.
+                composite_fk = composite_anchors.get(col.name)
+
+                if col.name in malformed_composite_columns:
+                    # columns/referredColumns disagree in length, or the targets span
+                    # several tables: no join can be derived, so the column degrades
+                    # to a literal. composite_fk_columns reports these as
+                    # non-object-properties, keeping the ontology in step.
+                    log.warning(
+                        "Composite FK on %s is malformed (column/target counts differ, or targets span "
+                        "several tables); mapping %s as a literal",
+                        table.name,
+                        col.name,
+                    )
+                    g.add((om, RR.column, Literal(sql_ident(col.name))))
+                    g.add((om, RR.datatype, xsd_for_column(col.dataType, col.name)))
+                    continue
 
                 if composite_fk is not None and composite_fk.referredColumns:
                     # Composite FK: emit a single Referencing Object Map for the
                     # entire relationship, with one joinCondition per column pair.
-
-                    # Validate: columns and referredColumns must have equal length.
-                    if len(composite_fk.columns) != len(composite_fk.referredColumns):
-                        log.warning(
-                            "Skipping malformed composite FK on %s: columns/referredColumns length mismatch (%d vs %d)",
-                            table.name,
-                            len(composite_fk.columns),
-                            len(composite_fk.referredColumns),
-                        )
-                        composite_fk_constraints.remove(composite_fk)
-                        g.add((om, RR.column, Literal(sql_ident(col.name))))
-                        dt = xsd_for(col.dataType)
-                        g.add((om, RR.datatype, dt))
-                        continue
-
-                    # Validate: all referredColumns must reference the same target table.
-                    fk_tables = {parse_referred_column(rc)[0] for rc in composite_fk.referredColumns if "." in rc}
-                    if len(fk_tables) > 1:
-                        log.warning(
-                            "Skipping composite FK on %s: referredColumns span multiple tables %s",
-                            table.name,
-                            fk_tables,
-                        )
-                        composite_fk_constraints.remove(composite_fk)
-                        g.add((om, RR.column, Literal(sql_ident(col.name))))
-                        dt = xsd_for(col.dataType)
-                        g.add((om, RR.datatype, dt))
-                        continue
-
                     fk_target, _ = parse_referred_column(composite_fk.referredColumns[0])
                     parent_tmap = tmap_by_name.get(fk_target)
                     if parent_tmap is None:
@@ -546,8 +607,9 @@ class InductionStrategy(ABC):
                         g.add((jc, RR.child, Literal(sql_ident(child_col))))
                         g.add((jc, RR.parent, Literal(sql_ident(parent_col))))
 
-                    # Remove from composite list to avoid re-processing
-                    composite_fk_constraints.remove(composite_fk)
+                    # No bookkeeping needed: composite_fk_anchors already assigned
+                    # each constraint to exactly one column, so no other column can
+                    # re-emit this relationship.
                     continue
 
                 # Check for simple (single-column) FK
