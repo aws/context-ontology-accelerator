@@ -27,8 +27,11 @@ from coa_ontology.inducer.services.subtype_detection import detect_pk_sharing_su
 from coa_ontology.inducer.strategies.base import (
     SCL,
     InductionStrategy,
+    composite_fk_anchors,
     composite_fk_columns,
     pascal_names_for,
+    reference_index,
+    table_identity,
 )
 
 log = logging.getLogger(__name__)
@@ -278,17 +281,30 @@ class TableToOntologyStrategy(InductionStrategy):
         # Collision-free class local names, shared with build_r2rml (base.py) and
         # the SHACL config generator so all three artifacts name the same class
         # identically. Bare _to_pascal would fuse tables differing only in
-        # separators/case (order_item vs order-item) onto one class IRI.
-        pascal_by_name = pascal_names_for(t.name for t in tables)
+        # separators/case (order_item vs order-item), or two same-named tables from
+        # different databases, onto one class IRI. Keyed by table IDENTITY.
+        pascal_by_id = pascal_names_for(tables)
         # Property local names are derived from the class local name (not from
         # _to_camel(table.name)) so a discriminated class carries discriminated
         # property IRIs too — otherwise the two fused tables' properties would
         # still collide even though their classes no longer do.
-        camel_by_name = {n: p[0].lower() + p[1:] if p else p for n, p in pascal_by_name.items()}
+        camel_by_id = {i: p[0].lower() + p[1:] if p else p for i, p in pascal_by_id.items()}
+        ref_index = reference_index(tables)
 
-        def table_prop(table_name: str, column_name: str) -> URIRef:
-            """Mint the property IRI for ``table_name.column_name``."""
-            return ns[f"{camel_by_name.get(table_name, _to_camel(table_name))}_{_to_camel(column_name)}"]
+        def table_prop(table: CatalogTable, column_name: str) -> URIRef:
+            """Mint the property IRI for ``table.column_name``."""
+            local = camel_by_id.get(table_identity(table), _to_camel(table.name))
+            return ns[f"{local}_{_to_camel(column_name)}"]
+
+        def parent_class(target_name: str, referrer: CatalogTable) -> URIRef:
+            """Resolve an FK target table name to its class IRI."""
+            qualified = f"{referrer.sourceSchema}.{target_name}" if referrer.sourceSchema else None
+            target_id = (qualified and ref_index.get(qualified)) or ref_index.get(target_name)
+            if target_id is not None and target_id in pascal_by_id:
+                return ns[pascal_by_id[target_id]]
+            # Outside this run, or an ambiguous bare name: fall back to the bare
+            # form, matching build_r2rml's parentTriplesMap fallback.
+            return ns[_to_pascal(target_name)]
 
         for table in tables:
             tm = match_map.get((table.name, ""))
@@ -297,7 +313,7 @@ class TableToOntologyStrategy(InductionStrategy):
             if not is_grounded:
                 novel_tables.add(table.name)
 
-            table_cls = ns[pascal_by_name[table.name]]
+            table_cls = ns[pascal_by_id[table_identity(table)]]
             g.add((table_cls, RDF.type, OWL.Class))
             g.add((table_cls, RDFS.label, Literal(table.name)))
             if table.description:
@@ -332,7 +348,7 @@ class TableToOntologyStrategy(InductionStrategy):
                     if tc.constraintType == "PRIMARY_KEY" and tc.columns:
                         from rdflib.collection import Collection
 
-                        key_props: list = [table_prop(table.name, c) for c in tc.columns]
+                        key_props: list = [table_prop(table, c) for c in tc.columns]
                         key_bnode = BNode()
                         Collection(g, key_bnode, key_props)
                         g.add((table_cls, OWL.hasKey, key_bnode))
@@ -347,25 +363,38 @@ class TableToOntologyStrategy(InductionStrategy):
             # datatype properties instead: the columns do exist, they simply are not
             # the relationship's anchor.
             absorbed_fk_columns = composite_fk_columns(table)
+            # Which column anchors which composite FK — the SAME helper build_r2rml
+            # consults. Resolving the target by "first FOREIGN_KEY constraint that
+            # lists this column" instead let the two artifacts disagree whenever a
+            # column belongs to more than one constraint: the ontology took whichever
+            # came first in ``tableConstraints`` while the mapping used the anchor, so
+            # ``rdfs:range`` and ``rr:parentTriplesMap`` named different parents.
+            composite_anchors = composite_fk_anchors(table)
 
             for col in table.columns:
-                prop_uri = table_prop(table.name, col.name)
+                prop_uri = table_prop(table, col.name)
                 is_fk = False
                 fk_target = None
                 fk_target_col = None
                 fk_provenance: str | None = None
                 if table.tableConstraints and col.name not in absorbed_fk_columns:
-                    for tc in table.tableConstraints:
-                        if tc.constraintType == "FOREIGN_KEY" and col.name in tc.columns and tc.referredColumns:
-                            is_fk = True
-                            fk_target, fk_target_col = parse_referred_column(tc.referredColumns[0])
-                            fk_provenance = tc.relationshipType
-                            break
+                    anchored = composite_anchors.get(col.name)
+                    if anchored is not None and anchored.referredColumns:
+                        is_fk = True
+                        fk_target, fk_target_col = parse_referred_column(anchored.referredColumns[0])
+                        fk_provenance = anchored.relationshipType
+                    else:
+                        for tc in table.tableConstraints:
+                            if tc.constraintType == "FOREIGN_KEY" and col.name in tc.columns and tc.referredColumns:
+                                is_fk = True
+                                fk_target, fk_target_col = parse_referred_column(tc.referredColumns[0])
+                                fk_provenance = tc.relationshipType
+                                break
 
                 if is_fk and fk_target:
                     # In-run tables use the shared (collision-resolved) name;
                     # a target outside this run falls back to the bare form.
-                    parent_cls = ns[pascal_by_name.get(fk_target, _to_pascal(fk_target))]
+                    parent_cls = parent_class(fk_target, table)
                     if (table.name, fk_target) in pk_sharing_confirmed:
                         g.add((table_cls, RDFS.subClassOf, parent_cls))
                         g.add((table_cls, SCL.subClassProvenance, Literal("PK_SHARING")))
@@ -397,7 +426,7 @@ class TableToOntologyStrategy(InductionStrategy):
                         owner = absorbed_fk_columns[col.name]
                         note = (
                             f"Part of a composite foreign key on {table.name}; the relationship is carried by "
-                            f"{camel_by_name[table.name]}_{_to_camel(owner)}"
+                            f"{camel_by_id[table_identity(table)]}_{_to_camel(owner)}"
                             if owner
                             else (
                                 f"Part of a malformed composite foreign key on {table.name} "
