@@ -224,6 +224,81 @@ def pascal_names_for(names: Iterable[str]) -> dict[str, str]:
     return result
 
 
+def composite_fk_is_usable(tc) -> bool:
+    """True when a composite FK constraint can produce a valid Referencing Object Map.
+
+    :meth:`InductionStrategy.build_r2rml` degrades a composite FK to plain datatype
+    ObjectMaps when it is malformed — ``columns`` / ``referredColumns`` of unequal
+    length (no way to pair them into join conditions), or ``referredColumns``
+    spanning several target tables (a TriplesMap has one parent). The ontology
+    builder must apply the SAME test, or it declares an ``owl:ObjectProperty`` with
+    ``rdfs:range <ParentClass>`` for a column the mapping exposes as a string or
+    integer literal: ``rdfs:range`` and ``rr:datatype`` then disagree, and Ontop's
+    type reasoning drops the triples or fails the SPARQL type filter.
+    """
+    if tc.constraintType != "FOREIGN_KEY" or not tc.referredColumns or len(tc.columns or []) <= 1:
+        return False
+    if len(tc.columns) != len(tc.referredColumns):
+        return False
+    fk_tables = {rc.split(".")[0] for rc in tc.referredColumns if "." in rc}
+    return len(fk_tables) <= 1
+
+
+def composite_fk_columns(table: CatalogTable) -> dict[str, str]:
+    """Map each column absorbed into a composite-FK POM to the column that owns it.
+
+    A composite (multi-column) FK is expressed in R2RML as ONE Referencing Object
+    Map carrying one ``rr:joinCondition`` per column pair (§7.5) — not one map per
+    column. :meth:`InductionStrategy.build_r2rml` therefore emits a single POM,
+    anchored on the constraint's FIRST column, and emits nothing for the rest.
+
+    The ontology builder must know which columns those are. Declaring an
+    ``owl:ObjectProperty`` per participating column (the obvious reading of the
+    constraint) mints properties that have no POM behind them: they appear in the
+    published TBox, in the class/property browser, and in the TBox context handed
+    to the NL→SPARQL LLM, so the model is actively encouraged to author SPARQL
+    against a property Ontop cannot resolve to any column. The query compiles and
+    returns nothing, with no mapping-gap signal in the logs. The gap scales with
+    arity: a 3-column FK orphaned 2 properties.
+
+    A MALFORMED composite FK (see :func:`composite_fk_is_usable`) behaves
+    differently: ``build_r2rml`` gives every one of its columns a datatype
+    ObjectMap, so none is absorbed — but none carries the relationship either, and
+    the ontology must not declare any of them an object property. Those columns map
+    to ``""``, letting the caller distinguish "absorbed into a sibling's POM" from
+    "no relationship at all" while treating both as non-object properties.
+
+    Returns:
+        ``{column: owning_column}`` for columns absorbed into a sibling's POM, plus
+        ``{column: ""}`` for every column of a malformed composite FK. The owning
+        (first) column of a USABLE composite FK is absent — it keeps both its POM
+        and its object property. Empty when the table has no composite FK.
+    """
+    absorbed: dict[str, str] = {}
+    if not table.tableConstraints:
+        return absorbed
+    table_columns = {c.name for c in table.columns}
+    for tc in table.tableConstraints:
+        if tc.constraintType != "FOREIGN_KEY" or not tc.referredColumns or len(tc.columns or []) <= 1:
+            continue
+        if not composite_fk_is_usable(tc):
+            # Degraded to datatype ObjectMaps in the mapping — no object property
+            # for ANY of these columns, the first one included.
+            for col_name in tc.columns:
+                if col_name in table_columns:
+                    absorbed.setdefault(col_name, "")
+            continue
+        # build_r2rml anchors the POM on the first column of the constraint that
+        # the table actually has (it iterates table.columns), so mirror that.
+        owner = next((c for c in table.columns if c.name in tc.columns), None)
+        if owner is None:
+            continue
+        for col_name in tc.columns:
+            if col_name != owner.name and col_name in table_columns:
+                absorbed.setdefault(col_name, owner.name)
+    return absorbed
+
+
 def _annotate_triples_map(g: Graph, tmap: URIRef, table: CatalogTable) -> None:
     """Annotate a TriplesMap with datasource provenance (coa:datasourceId, coa:sourceSchema).
 
@@ -379,13 +454,30 @@ class InductionStrategy(ABC):
                     if tc.constraintType == "FOREIGN_KEY" and tc.referredColumns and len(tc.columns) > 1:
                         composite_fk_constraints.append(tc)
 
-            # Track which columns have already been emitted as part of a composite FK
-            # to avoid emitting duplicate POMs.
-            composite_fk_emitted: set[str] = set()
+            # Columns a USABLE composite FK folds into its owning column's
+            # referencing map. Computed up front (not accumulated while iterating)
+            # so the branch below is independent of column order, and shared with
+            # the ontology builder so both agree on which columns are literals.
+            absorbed_columns = {name for name, owner in composite_fk_columns(table).items() if owner}
 
             for col in table.columns:
-                # Skip columns already emitted as part of a composite FK POM
-                if col.name in composite_fk_emitted:
+                # A column absorbed into a sibling's composite-FK Referencing
+                # Object Map still gets its OWN datatype POM. The relationship is
+                # carried once (by the owning column's referencing map, per R2RML
+                # §7.5) — but the column is a real column, and leaving it unmapped
+                # meant the ontology's declaration for it had nothing behind it, so
+                # any SPARQL touching that property silently returned nothing.
+                # Emitting a literal mapping keeps mapping and ontology in step:
+                # the ontology declares these columns as datatype properties (see
+                # composite_fk_columns).
+                if col.name in absorbed_columns:
+                    pom = URIRef(f"{tmap}/POM_{to_pascal(col.name)}")
+                    g.add((tmap, RR.predicateObjectMap, pom))
+                    g.add((pom, RR.predicate, ns[f"{camel_by_name[table.name]}_{to_camel(col.name)}"]))
+                    om = URIRef(f"{pom}/ObjectMap")
+                    g.add((pom, RR.objectMap, om))
+                    g.add((om, RR.column, Literal(sql_ident(col.name))))
+                    g.add((om, RR.datatype, xsd_for_column(col.dataType, col.name)))
                     continue
 
                 pom = URIRef(f"{tmap}/POM_{to_pascal(col.name)}")
@@ -416,8 +508,6 @@ class InductionStrategy(ABC):
                             len(composite_fk.columns),
                             len(composite_fk.referredColumns),
                         )
-                        for c in composite_fk.columns:
-                            composite_fk_emitted.add(c)
                         composite_fk_constraints.remove(composite_fk)
                         g.add((om, RR.column, Literal(sql_ident(col.name))))
                         dt = xsd_for(col.dataType)
@@ -432,8 +522,6 @@ class InductionStrategy(ABC):
                             table.name,
                             fk_tables,
                         )
-                        for c in composite_fk.columns:
-                            composite_fk_emitted.add(c)
                         composite_fk_constraints.remove(composite_fk)
                         g.add((om, RR.column, Literal(sql_ident(col.name))))
                         dt = xsd_for(col.dataType)
@@ -458,9 +546,6 @@ class InductionStrategy(ABC):
                         g.add((jc, RR.child, Literal(sql_ident(child_col))))
                         g.add((jc, RR.parent, Literal(sql_ident(parent_col))))
 
-                    # Mark all columns in this composite FK as emitted
-                    for c in composite_fk.columns:
-                        composite_fk_emitted.add(c)
                     # Remove from composite list to avoid re-processing
                     composite_fk_constraints.remove(composite_fk)
                     continue
