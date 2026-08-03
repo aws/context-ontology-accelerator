@@ -40,9 +40,13 @@ This is complementary to the tier-1 HermiT substitution: that one rewrites
 
 from __future__ import annotations
 
+import logging
+
 from rdflib import Graph, Literal, URIRef
 from rdflib.namespace import XSD
 from rdflib.term import Node
+
+log = logging.getLogger(__name__)
 
 # Correctly-cased XSD datatype local names we recognize — the authoritative
 # XML Schema Part 2 built-in datatype set (https://www.w3.org/TR/xmlschema11-2/
@@ -163,34 +167,67 @@ def _canonical_for(uri: URIRef) -> URIRef | None:
     return None
 
 
+def _rewrite_is_value_safe(literal: Literal, canonical: URIRef) -> bool:
+    """True when ``literal``'s lexical form is valid for the ``canonical`` datatype.
+
+    The alias table maps SQL type names onto XSD types with far NARROWER lexical
+    spaces than the string-ish tokens they replace (``bigint`` → ``xsd:long``,
+    ``number`` → ``xsd:decimal``, ``timestamp`` → ``xsd:dateTime``). A value that
+    was legal as an opaque ``xsd:bigint``-tagged string is not necessarily legal
+    as an ``xsd:long``: rewriting the datatype alone turns ``"abc"^^xsd:bigint``
+    into the ill-typed ``"abc"^^xsd:long``.
+
+    That matters more here than it would elsewhere because this module runs at the
+    WRITE boundary. Its own docstring is explicit that corruption at that point is
+    irreversible on S3, which is why an unrecognized token is left alone — the
+    same argument applies to a recognized alias whose value does not fit, and this
+    guard extends the policy to cover it. The offending token stays as it was
+    (still opaque to HermiT, so no reasoner abort) rather than becoming a literal
+    with no value in SPARQL semantics, which silently drops out of result sets and
+    can flip an ontology to OWL 2 DL inconsistent on a later run.
+
+    Args:
+        literal: The typed literal whose datatype would be rewritten.
+        canonical: The datatype it would be rewritten to.
+
+    Returns:
+        ``False`` when the rewrite would produce an ill-typed literal.
+    """
+    return not Literal(str(literal), datatype=canonical, normalize=False).ill_typed
+
+
 def _scan_datatype_offenders(
     graph: Graph,
-) -> list[tuple[Node, Node, Node, URIRef, URIRef, bool]]:
+) -> list[tuple[Node, Node, Node, URIRef, URIRef, bool, bool]]:
     """Find every triple carrying a malformed/mis-cased/aliased XSD token.
 
     Single source of truth for BOTH detection and repair, so the two can never
     disagree about what counts as "malformed" (a datatype flagged by
-    ``detect_datatype_issues`` is exactly one ``canonicalize_datatypes`` rewrites,
-    and vice versa). A token ``_canonical_for`` leaves alone — a non-XSD URI, a
-    valid correctly-cased type (incl. ``xsd:date``), or an unknown ``xsd:`` token
-    — is neither reported nor rewritten.
+    ``detect_datatype_issues`` is exactly one ``canonicalize_datatypes``
+    considers, and vice versa). A token ``_canonical_for`` leaves alone — a
+    non-XSD URI, a valid correctly-cased type (incl. ``xsd:date``), or an unknown
+    ``xsd:`` token — is neither reported nor rewritten.
 
-    Returns tuples ``(s, p, o, found_uri, canonical_uri, is_literal)`` where
-    ``found_uri`` is the offending datatype and ``canonical_uri`` its replacement.
-    ``is_literal`` is True when the datatype sits on a typed literal object
-    (``"x"^^xsd:datetime``) rather than on a datatype-URI object
-    (``rdfs:range xsd:datetime`` / ``rr:datatype xsd:datetime``).
+    Returns tuples ``(s, p, o, found_uri, canonical_uri, is_literal,
+    value_safe)`` where ``found_uri`` is the offending datatype and
+    ``canonical_uri`` its replacement. ``is_literal`` is True when the datatype
+    sits on a typed literal object (``"x"^^xsd:datetime``) rather than on a
+    datatype-URI object (``rdfs:range xsd:datetime`` / ``rr:datatype
+    xsd:datetime``). ``value_safe`` is False when rewriting a typed literal to
+    ``canonical_uri`` would make it ill-typed — such an offender is still
+    REPORTED (the token is genuinely malformed and the user should see it) but is
+    not rewritten; see :func:`_rewrite_is_value_safe`.
     """
-    offenders: list[tuple[Node, Node, Node, URIRef, URIRef, bool]] = []
+    offenders: list[tuple[Node, Node, Node, URIRef, URIRef, bool, bool]] = []
     for s, p, o in list(graph):
         if isinstance(o, URIRef):
             canonical = _canonical_for(o)
             if canonical is not None and canonical != o:
-                offenders.append((s, p, o, o, canonical, False))
+                offenders.append((s, p, o, o, canonical, False, True))
         elif isinstance(o, Literal) and o.datatype is not None:
             canonical = _canonical_for(o.datatype)
             if canonical is not None and canonical != o.datatype:
-                offenders.append((s, p, o, o.datatype, canonical, True))
+                offenders.append((s, p, o, o.datatype, canonical, True, _rewrite_is_value_safe(o, canonical)))
     return offenders
 
 
@@ -202,12 +239,35 @@ def canonicalize_datatypes(graph: Graph) -> list[tuple[str, str]]:
     literal datatypes (``"x"^^xsd:datetime``). Returns the list of
     ``(before, after)`` URI strings that were changed (empty when the graph was
     already clean), so callers can log what they touched.
+
+    Only the datatype IRI changes: a literal's lexical form is carried over
+    verbatim, and a rewrite that would leave the literal ill-typed is SKIPPED (the
+    triple is left exactly as it was). ``detect_datatype_issues`` still reports
+    those tokens, so they remain visible to the user even though this function
+    declines to touch them.
     """
     changes: list[tuple[str, str]] = []
-    for s, p, o, found, canonical, is_literal in _scan_datatype_offenders(graph):
+    for s, p, o, found, canonical, is_literal, value_safe in _scan_datatype_offenders(graph):
+        if not value_safe:
+            # Rewriting would produce an ill-typed literal. Leave the token alone:
+            # this runs at the persist boundary, so the corruption would be
+            # irreversible on S3 — the same reason unrecognized tokens are left
+            # untouched. An unknown xsd: URI stays opaque to HermiT (no reasoner
+            # abort), whereas an ill-typed literal has no value in SPARQL
+            # semantics and can flip the ontology to OWL 2 DL inconsistent.
+            log.warning(
+                "datatype_alias_incompatible_with_value",
+                extra={"found": str(found), "canonical": str(canonical), "subject": str(s), "predicate": str(p)},
+            )
+            continue
         graph.remove((s, p, o))
         if is_literal:
-            graph.add((s, p, Literal(str(o), datatype=canonical)))
+            # normalize=False is load-bearing: constructing a Literal with a
+            # datatype rdflib understands rewrites the lexical form to that
+            # datatype's canonical spelling, so a timestamp→dateTime repair
+            # silently turned "2024-01-15" into "2024-01-15T00:00:00". This
+            # function repairs the TOKEN; the value must survive byte-for-byte.
+            graph.add((s, p, Literal(str(o), datatype=canonical, normalize=False)))
         else:
             graph.add((s, p, canonical))
         changes.append((str(found), str(canonical)))
@@ -220,13 +280,27 @@ def detect_datatype_issues(graph: Graph) -> list[dict[str, str]]:
     Read-only counterpart to :func:`canonicalize_datatypes`, used by the
     validator to surface offending tokens to the user (who then consents to a
     repair) rather than rewriting them silently. Returns one dict per offending
-    triple: ``{subject, predicate, found, canonical}`` — the subject/predicate
-    locate the offending element, ``found`` is the malformed datatype IRI and
-    ``canonical`` its proposed replacement. Empty when the graph is clean.
+    triple: ``{subject, predicate, found, canonical, repairable}`` — the
+    subject/predicate locate the offending element, ``found`` is the malformed
+    datatype IRI and ``canonical`` its proposed replacement. Empty when the graph
+    is clean.
+
+    ``repairable`` is ``"false"`` when the token is malformed but the repair would
+    leave the literal ill-typed (e.g. ``"abc"^^xsd:bigint`` → ``xsd:long``), in
+    which case :func:`canonicalize_datatypes` deliberately leaves the triple
+    alone. Such offenders are still reported: the token IS wrong and the user
+    should see it, they just need to fix the value rather than consent to a
+    mechanical rewrite.
     """
     return [
-        {"subject": str(s), "predicate": str(p), "found": str(found), "canonical": str(canonical)}
-        for s, p, _o, found, canonical, _is_literal in _scan_datatype_offenders(graph)
+        {
+            "subject": str(s),
+            "predicate": str(p),
+            "found": str(found),
+            "canonical": str(canonical),
+            "repairable": "true" if value_safe else "false",
+        }
+        for s, p, _o, found, canonical, _is_literal, value_safe in _scan_datatype_offenders(graph)
     ]
 
 
