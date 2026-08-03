@@ -1329,16 +1329,32 @@ def get_namespace_meta(namespace: str) -> dict | None:
 def list_namespaces(limit: int = 100) -> list[dict]:
     """Return every namespace META row.
 
-    Uses a Scan with filter on ``SK = "META"`` and ``begins_with(PK, "NAMESPACE#")``.
-    For small deployments (dozens of namespaces) this is fine; add a GSI
-    later if the namespace count grows past a few hundred.
+    Scans with a filter on ``SK = "META"`` and ``begins_with(PK, "NAMESPACE#")``,
+    following ``LastEvaluatedKey`` until ``limit`` matches are collected or the
+    table is exhausted.
+
+    The pagination is NOT about the namespace count. DynamoDB applies ``Limit`` to
+    the number of items **evaluated before filtering**, not to matches returned,
+    and this single-table design stores job, proposal, and ingest-job rows
+    alongside the ``NAMESPACE#`` ones. With more than ``limit`` such rows — normal
+    after modest usage — the first scanned page can contain few or zero namespace
+    rows, and a single-page read simply omitted the rest with no error. ``list_jobs``
+    / ``list_proposals`` / ``list_ingest_jobs`` in this module already paginate for
+    exactly this reason; this path was the one left behind.
     """
-    resp = _get_table().scan(
-        FilterExpression="begins_with(PK, :p) AND SK = :sk",
-        ExpressionAttributeValues={":p": "NAMESPACE#", ":sk": "META"},
-        Limit=limit,
-    )
-    return resp.get("Items", [])
+    kwargs: dict = {
+        "FilterExpression": "begins_with(PK, :p) AND SK = :sk",
+        "ExpressionAttributeValues": {":p": "NAMESPACE#", ":sk": "META"},
+    }
+    items: list[dict] = []
+    while len(items) < limit:
+        resp = _get_table().scan(**kwargs)
+        items.extend(resp.get("Items", []))
+        last_key = resp.get("LastEvaluatedKey")
+        if not last_key:
+            break
+        kwargs["ExclusiveStartKey"] = last_key
+    return items[:limit]
 
 
 def put_ontology_registry(namespace: str, ontology_id: str, data: dict) -> dict:
