@@ -6,10 +6,11 @@
 from __future__ import annotations
 
 from enum import StrEnum
+from typing import Annotated
 
 import pytest
 from coa_metrics.api.validation_errors import format_validation_error
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 
 class _SqlDialect(StrEnum):
@@ -23,7 +24,11 @@ class _Dialect(BaseModel):
 
 
 class _Expression(BaseModel):
-    dialects: list[_Dialect]
+    # min_length mirrors the generated MetricExpression
+    # (smithy-generated/.../models/metric_expression.py), so an empty list raises
+    # the too_short error the tests below expect. Without it the stub accepted
+    # `dialects: []` and `_validation_error` failed with "DID NOT RAISE".
+    dialects: Annotated[list[_Dialect], Field(min_length=1)]
 
 
 class _Metric(BaseModel):
@@ -85,4 +90,8 @@ class TestFormatValidationError:
             {"name": "m1", "expression": {"dialects": [{"dialect": "ORACLE", "expression": "SUM(x)"}]}}
         )
         msg = format_validation_error(exc)
-        assert "TRINO" not in msg
+        # Assert the HINT is absent, not the word "TRINO": Pydantic's own enum
+        # error already enumerates the permitted values ("Input should be
+        # 'POSTGRESQL' or 'TRINO'"), so `"TRINO" not in msg` could never hold.
+        assert "use TRINO" not in msg
+        assert "Athena" not in msg
