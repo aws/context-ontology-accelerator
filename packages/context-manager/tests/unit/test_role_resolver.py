@@ -183,6 +183,51 @@ class TestMergeDataRestrictions:
         assert resolved.table_allowlist is None
         assert resolved.column_denylist is None
 
+    # ── GLOBAL grants must not relax namespace-scoped data restrictions ──────
+    # A platform grant (platform-admin / platform-viewer) is written with
+    # resourceId="GLOBAL" and carries no tableAllowlist/columnDenylist. It must
+    # NOT enter the per-namespace restriction merge: the "grant without a
+    # restriction means unrestricted" rule would otherwise erase the namespace
+    # grant's restrictions and the SQL firewall would stop enforcing them.
+
+    def test_global_grant_does_not_erase_column_denylist(self):
+        resolved = self._resolve(
+            [
+                {"role": "data-analyst", "resourceId": _NS, "columnDenylist": {"customers": ["ssn"]}},
+                {"role": "platform-viewer", "resourceId": "GLOBAL"},  # no restriction fields
+            ]
+        )
+        assert resolved.column_denylist == {"customers": ["ssn"]}
+
+    def test_global_grant_does_not_erase_table_allowlist(self):
+        resolved = self._resolve(
+            [
+                {"role": "data-analyst", "resourceId": _NS, "tableAllowlist": ["customers"]},
+                {"role": "platform-viewer", "resourceId": "GLOBAL"},
+            ]
+        )
+        assert resolved.table_allowlist == ["customers"]
+
+    def test_global_grant_does_not_erase_allowed_metrics(self):
+        resolved = self._resolve(
+            [
+                {"role": "data-analyst", "resourceId": _NS, "allowedMetrics": ["m1"]},
+                {"role": "platform-viewer", "resourceId": "GLOBAL"},
+            ]
+        )
+        assert resolved.allowed_metrics == ["m1"]
+
+    def test_global_grant_still_resolves_into_global_roles(self):
+        """Scoping the data merge must not affect Cedar-level platform privileges."""
+        resolved = self._resolve(
+            [
+                {"role": "data-analyst", "resourceId": _NS, "columnDenylist": {"customers": ["ssn"]}},
+                {"role": "platform-viewer", "resourceId": "GLOBAL"},
+            ]
+        )
+        assert resolved.global_roles == ["platform-viewer"]
+        assert resolved.column_denylist == {"customers": ["ssn"]}
+
 
 @pytest.mark.unit
 class TestInjectInto:

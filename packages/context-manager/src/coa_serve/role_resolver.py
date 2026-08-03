@@ -125,10 +125,20 @@ def _merge_data_restrictions(
       If ANY grant has no allowlist, the user has unrestricted table access.
     - columnDenylist: INTERSECTION across all matching grants (most permissive).
       A column is denied only if ALL matching grants deny it.
+
+    Scoped to grants on THIS namespace. A ``GLOBAL``-scoped grant (the shape
+    platform-admin / platform-viewer are written with) must NOT participate:
+    platform grants carry no tableAllowlist/columnDenylist fields, so the
+    "any grant without a restriction means unrestricted" rule above would fire
+    on them and erase the namespace grant's restrictions entirely — a user who
+    holds both a restricted namespace role and a platform role would get
+    unrestricted data access, and the SQL firewall would log the query as
+    ``restricted=False`` (no trace of a bypass). Platform privileges still flow
+    through ``result.global_roles``, which is resolved separately in
+    ``resolve_profile`` and drives the Cedar action-level layer; only the
+    data-level merge is namespace-scoped.
     """
-    namespace_grants = [
-        item for item in items if item.get("resourceId") == namespace or item.get("resourceId") == "GLOBAL"
-    ]
+    namespace_grants = [item for item in items if item.get("resourceId") == namespace]
 
     if not namespace_grants:
         return
@@ -160,9 +170,6 @@ def _merge_data_restrictions(
 
     if not has_unrestricted_metrics and merged_metrics:
         result.allowed_metrics = sorted(merged_metrics)
-
-    if not has_unrestricted_grant and merged_tables:
-        result.table_allowlist = sorted(merged_tables)
 
     # Column denylist: intersection (only deny if ALL grants deny it)
     denylist_sets: list[dict[str, set[str]]] = []
