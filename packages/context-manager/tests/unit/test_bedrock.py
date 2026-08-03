@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from unittest.mock import MagicMock
 
 import pytest
@@ -586,6 +588,72 @@ class TestConverseStreamCleanup:
         client = self._client_over(iter(events))
 
         assert [t async for t in client.converse_stream("q")] == ["a", "b"]
+
+    async def test_abandon_during_the_api_call_still_releases_the_worker(self):
+        """The window before the EventStream exists.
+
+        `converse_stream` (the boto3 call) takes time; a client disconnecting during
+        it finds nothing to close, so the worker would drain the entire response —
+        holding an executor slot and billing tokens for a caller already gone. The
+        `abandoned` flag covers that window.
+        """
+        import threading
+        import time
+
+        closed = threading.Event()
+        drained_fully = threading.Event()
+
+        class _Stream:
+            def __iter__(self):
+                for _ in range(40):
+                    if closed.is_set():
+                        raise RuntimeError("closed")
+                    time.sleep(0.02)
+                drained_fully.set()
+                yield {"contentBlockDelta": {"delta": {"text": "late"}}}
+
+            def close(self):
+                closed.set()
+
+        def _slow_api(**_kwargs):
+            time.sleep(0.3)  # API in flight — nothing closeable yet
+            return {"stream": _Stream()}
+
+        from coa_serve.clients.bedrock import BedrockLLMClient
+
+        mock_client = MagicMock()
+        mock_client.converse_stream = _slow_api
+        client = BedrockLLMClient(model_id="test-model", region="us-east-1")
+        client._client = mock_client
+
+        agen = client.converse_stream("q")
+        pending = asyncio.ensure_future(agen.__anext__())
+        await asyncio.sleep(0.05)  # disconnect BEFORE the API returns
+        pending.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await pending
+        await agen.aclose()
+
+        # The worker sees the flag right after the API call returns.
+        for _ in range(50):
+            if closed.is_set():
+                break
+            await asyncio.sleep(0.05)
+
+        assert closed.is_set(), "worker kept the stream open after the caller left"
+        assert not drained_fully.is_set(), "worker drained the whole response for a gone caller"
+
+    async def test_normal_completion_is_not_treated_as_abandoned(self):
+        """The flag must not fire on the healthy path and truncate the stream."""
+        events = [
+            {"contentBlockDelta": {"delta": {"text": "a"}}},
+            {"contentBlockDelta": {"delta": {"text": "b"}}},
+            {"contentBlockDelta": {"delta": {"text": "c"}}},
+            {"messageStop": {"stopReason": "end_turn"}},
+        ]
+        client = self._client_over(iter(events))
+
+        assert [t async for t in client.converse_stream("q")] == ["a", "b", "c"]
 
     async def test_stream_without_close_method_is_tolerated(self):
         """A plain iterator has no close(); finalization must still not raise."""
