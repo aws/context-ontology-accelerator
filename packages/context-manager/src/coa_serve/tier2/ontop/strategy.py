@@ -29,6 +29,9 @@ logger = structlog.get_logger(__name__)
 
 _TIER2_TOOL_USED = TOOL_FOR_STEP
 
+# k-NN depth for the TBox-context retrieval feeding NL→SPARQL.
+_VECTOR_TOP_K = 10
+
 _RETRYABLE_VKG_PATTERNS = (
     "cannot translate",
     "unsupported sparql",
@@ -305,10 +308,54 @@ class OntopStrategy:
             return None
         try:
             index_name = ontology_vector_index_name(self._oss_ontology_index, namespace)
-            raw_hits = await self._vector_client.search(embedding, namespace=namespace, top_k=10, index=index_name)
-            logger.debug(
+
+            # Restrict the CLASS retrieval to R2RML-mapped classes, matching the
+            # gate NL→SQL applies (nl_to_sql/sql_generator.py). Unmapped classes —
+            # document-induced or from a loaded foundational ontology — have no
+            # table behind them, so authoring SPARQL against them produces a query
+            # VKG cannot compile: nothing comes back, in exactly the mixed
+            # DATABASE + DOCUMENTS namespace the ``is_mapped`` design exists to
+            # protect (see external-docs "Mapped classes and Tier-2
+            # answerability"). Without the gate a document-heavy query filled the
+            # top-k with unmapped classes; the provenance skip evaluator only
+            # bails when ALL top-k hits are unmapped, so the partial mix fell
+            # through untouched.
+            #
+            # Legacy bridge, same as NL→SQL: namespaces ingested before
+            # ``data_source_id`` was written carry zero mapped records, and gating
+            # them would hide every class. One cheap count decides whether the
+            # gate applies at all.
+            mapped_count = await self._vector_client.count_documents(
+                index=index_name, entity_type="class", require_mapped=True
+            )
+            use_mapped_gate = mapped_count > 0
+
+            class_hits = await self._vector_client.search(
+                embedding,
+                namespace=namespace,
+                top_k=_VECTOR_TOP_K,
+                index=index_name,
+                entity_type="class",
+                require_mapped=use_mapped_gate,
+            )
+            # Properties and metrics are fetched unfiltered: only classes carry the
+            # data_source_id stamp the mapped gate reads, and metrics are resolved
+            # through Tier-1 rather than the VKG mapping. Classes are dropped from
+            # this pass — they are already covered by the gated search above, and
+            # keeping them would both duplicate hits and reintroduce the unmapped
+            # classes the gate just excluded.
+            other_hits = await self._vector_client.search(
+                embedding, namespace=namespace, top_k=_VECTOR_TOP_K, index=index_name
+            )
+            raw_hits = [*class_hits, *(h for h in other_hits if h.metadata.get("entity_type") != "class")]
+
+            logger.info(
                 "tier2_aoss_raw_hits",
+                namespace=namespace,
                 count=len(raw_hits),
+                mapped_gate=use_mapped_gate,
+                mapped_count=mapped_count,
+                class_hits=len(class_hits),
                 sample_types=[h.metadata.get("entity_type", "MISSING") for h in raw_hits[:5]],
             )
             hits = []

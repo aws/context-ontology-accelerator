@@ -347,14 +347,24 @@ class TestOntopStrategyVectorHits:
             oss_ontology_index="test-index",
         )
 
-        # Vector search returns mixed entity types
-        vector_client.search.return_value = [
-            BaseVectorHit(id="1", text="ClassA", score=0.9, metadata={"entity_type": "class", "entity_uri": "uri:A"}),
-            BaseVectorHit(
-                id="2", text="PropB", score=0.85, metadata={"entity_type": "property", "entity_uri": "uri:B"}
-            ),
-            BaseVectorHit(id="3", text="MetricC", score=0.8, metadata={"entity_type": "metric", "entity_uri": "uri:C"}),
-            BaseVectorHit(id="4", text="Unknown", score=0.7, metadata={"entity_type": "unknown"}),
+        # Classes are retrieved in their own mapped-gated search; properties and
+        # metrics come from the unfiltered one (see _fetch_vector_hits).
+        class_hit = BaseVectorHit(
+            id="1", text="ClassA", score=0.9, metadata={"entity_type": "class", "entity_uri": "uri:A"}
+        )
+        vector_client.count_documents.return_value = 5  # namespace has mapped classes
+        vector_client.search.side_effect = [
+            [class_hit],
+            [
+                class_hit,  # re-returned by the unfiltered pass; must not be counted twice
+                BaseVectorHit(
+                    id="2", text="PropB", score=0.85, metadata={"entity_type": "property", "entity_uri": "uri:B"}
+                ),
+                BaseVectorHit(
+                    id="3", text="MetricC", score=0.8, metadata={"entity_type": "metric", "entity_uri": "uri:C"}
+                ),
+                BaseVectorHit(id="4", text="Unknown", score=0.7, metadata={"entity_type": "unknown"}),
+            ],
         ]
         nl_to_sparql.translate.return_value = _make_sparql_result(valid=False)
 
@@ -370,6 +380,107 @@ class TestOntopStrategyVectorHits:
         assert hits[0].type == "ontology_class"
         assert hits[1].type == "ontology_property"
         assert hits[2].type == "metric"
+
+    # ── mapped-class gate (parity with nl_to_sql/sql_generator.py) ───────────
+    # Unmapped classes (document-induced, or from a loaded foundational ontology)
+    # have no table behind them, so SPARQL authored against them cannot compile in
+    # VKG and the query silently returns nothing. NL→SQL gated its class retrieval
+    # on `require_mapped`; the Ontop path did not, so a document-heavy query in a
+    # mixed namespace filled its top-k with unmapped classes. The provenance skip
+    # evaluator only bails when ALL top-k hits are unmapped, so the partial mix
+    # fell straight through.
+
+    def _strategy(self, nl_to_sparql, vkg_translator, vector_client):
+        return OntopStrategy(
+            nl_to_sparql=nl_to_sparql,
+            vkg_translator=vkg_translator,
+            vector_client=vector_client,
+            oss_ontology_index="test-index",
+        )
+
+    @pytest.mark.asyncio
+    async def test_class_search_is_gated_on_mapped_when_mapped_classes_exist(
+        self, nl_to_sparql, vkg_translator, vector_client
+    ):
+        vector_client.count_documents.return_value = 3
+        vector_client.search.return_value = []
+        nl_to_sparql.translate.return_value = _make_sparql_result(valid=False)
+
+        await self._strategy(nl_to_sparql, vkg_translator, vector_client).resolve(
+            "query", "ns1", _make_context(embedding=[0.1] * 10)
+        )
+
+        class_call = next(c for c in vector_client.search.call_args_list if c.kwargs.get("entity_type") == "class")
+        assert class_call.kwargs["require_mapped"] is True
+
+    @pytest.mark.asyncio
+    async def test_gate_is_dropped_for_a_namespace_with_no_mapped_classes(
+        self, nl_to_sparql, vkg_translator, vector_client
+    ):
+        """Legacy bridge: gating a namespace ingested before data_source_id existed
+        would hide every class and take Tier-2 dark."""
+        vector_client.count_documents.return_value = 0
+        vector_client.search.return_value = []
+        nl_to_sparql.translate.return_value = _make_sparql_result(valid=False)
+
+        await self._strategy(nl_to_sparql, vkg_translator, vector_client).resolve(
+            "query", "ns1", _make_context(embedding=[0.1] * 10)
+        )
+
+        class_call = next(c for c in vector_client.search.call_args_list if c.kwargs.get("entity_type") == "class")
+        assert class_call.kwargs["require_mapped"] is False
+
+    @pytest.mark.asyncio
+    async def test_unmapped_classes_from_the_unfiltered_pass_are_excluded(
+        self, nl_to_sparql, vkg_translator, vector_client
+    ):
+        """The second (unfiltered) search exists for properties/metrics only — its
+        classes must not slip past the gate."""
+        vector_client.count_documents.return_value = 2
+        vector_client.search.side_effect = [
+            [
+                BaseVectorHit(
+                    id="1", text="MappedClass", score=0.9, metadata={"entity_type": "class", "entity_uri": "uri:mapped"}
+                )
+            ],
+            [
+                BaseVectorHit(
+                    id="9",
+                    text="UnmappedDocClass",
+                    score=0.95,
+                    metadata={"entity_type": "class", "entity_uri": "uri:unmapped"},
+                ),
+                BaseVectorHit(
+                    id="2", text="PropB", score=0.8, metadata={"entity_type": "property", "entity_uri": "uri:B"}
+                ),
+            ],
+        ]
+        nl_to_sparql.translate.return_value = _make_sparql_result(valid=False)
+
+        await self._strategy(nl_to_sparql, vkg_translator, vector_client).resolve(
+            "query", "ns1", _make_context(embedding=[0.1] * 10)
+        )
+
+        hits = nl_to_sparql.translate.call_args[1]["vector_hits"]
+        uris = {h.uri for h in hits}
+        assert "uri:mapped" in uris
+        assert "uri:unmapped" not in uris, "an unmapped class reached the NL→SPARQL context"
+
+    @pytest.mark.asyncio
+    async def test_properties_and_metrics_are_not_mapped_gated(self, nl_to_sparql, vkg_translator, vector_client):
+        """Only classes carry the data_source_id stamp the gate reads."""
+        vector_client.count_documents.return_value = 4
+        vector_client.search.return_value = []
+        nl_to_sparql.translate.return_value = _make_sparql_result(valid=False)
+
+        await self._strategy(nl_to_sparql, vkg_translator, vector_client).resolve(
+            "query", "ns1", _make_context(embedding=[0.1] * 10)
+        )
+
+        unfiltered = [c for c in vector_client.search.call_args_list if "entity_type" not in c.kwargs]
+        assert unfiltered, "expected an unfiltered search for properties/metrics"
+        for call in unfiltered:
+            assert not call.kwargs.get("require_mapped")
 
     @pytest.mark.asyncio
     async def test_vector_search_exception_returns_none_gracefully(self, nl_to_sparql, vkg_translator, vector_client):
