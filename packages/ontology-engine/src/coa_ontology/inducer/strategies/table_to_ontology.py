@@ -24,7 +24,7 @@ from rdflib.namespace import SKOS
 from coa_ontology.inducer.schemas import ConceptMatch
 from coa_ontology.inducer.services.data_catalog import CatalogTable
 from coa_ontology.inducer.services.subtype_detection import detect_pk_sharing_subtypes
-from coa_ontology.inducer.strategies.base import SCL, InductionStrategy
+from coa_ontology.inducer.strategies.base import SCL, InductionStrategy, pascal_names_for
 
 log = logging.getLogger(__name__)
 
@@ -270,6 +270,21 @@ class TableToOntologyStrategy(InductionStrategy):
         pk_sharing_confirmed, pk_sharing_suggested = detect_pk_sharing_subtypes(tables)
         novel_tables = set()
 
+        # Collision-free class local names, shared with build_r2rml (base.py) and
+        # the SHACL config generator so all three artifacts name the same class
+        # identically. Bare _to_pascal would fuse tables differing only in
+        # separators/case (order_item vs order-item) onto one class IRI.
+        pascal_by_name = pascal_names_for(t.name for t in tables)
+        # Property local names are derived from the class local name (not from
+        # _to_camel(table.name)) so a discriminated class carries discriminated
+        # property IRIs too — otherwise the two fused tables' properties would
+        # still collide even though their classes no longer do.
+        camel_by_name = {n: p[0].lower() + p[1:] if p else p for n, p in pascal_by_name.items()}
+
+        def table_prop(table_name: str, column_name: str) -> URIRef:
+            """Mint the property IRI for ``table_name.column_name``."""
+            return ns[f"{camel_by_name.get(table_name, _to_camel(table_name))}_{_to_camel(column_name)}"]
+
         for table in tables:
             tm = match_map.get((table.name, ""))
             is_grounded = tm and tm.match_type in ("exact", "high_confidence")
@@ -277,7 +292,7 @@ class TableToOntologyStrategy(InductionStrategy):
             if not is_grounded:
                 novel_tables.add(table.name)
 
-            table_cls = ns[_to_pascal(table.name)]
+            table_cls = ns[pascal_by_name[table.name]]
             g.add((table_cls, RDF.type, OWL.Class))
             g.add((table_cls, RDFS.label, Literal(table.name)))
             if table.description:
@@ -312,14 +327,14 @@ class TableToOntologyStrategy(InductionStrategy):
                     if tc.constraintType == "PRIMARY_KEY" and tc.columns:
                         from rdflib.collection import Collection
 
-                        key_props: list = [ns[f"{_to_camel(table.name)}_{_to_camel(c)}"] for c in tc.columns]
+                        key_props: list = [table_prop(table.name, c) for c in tc.columns]
                         key_bnode = BNode()
                         Collection(g, key_bnode, key_props)
                         g.add((table_cls, OWL.hasKey, key_bnode))
                         break
 
             for col in table.columns:
-                prop_uri = ns[f"{_to_camel(table.name)}_{_to_camel(col.name)}"]
+                prop_uri = table_prop(table.name, col.name)
                 is_fk = False
                 fk_target = None
                 fk_target_col = None
@@ -335,7 +350,9 @@ class TableToOntologyStrategy(InductionStrategy):
                             break
 
                 if is_fk and fk_target:
-                    parent_cls = ns[_to_pascal(fk_target)]
+                    # In-run tables use the shared (collision-resolved) name;
+                    # a target outside this run falls back to the bare form.
+                    parent_cls = ns[pascal_by_name.get(fk_target, _to_pascal(fk_target))]
                     if (table.name, fk_target) in pk_sharing_confirmed:
                         g.add((table_cls, RDFS.subClassOf, parent_cls))
                         g.add((table_cls, SCL.subClassProvenance, Literal("PK_SHARING")))

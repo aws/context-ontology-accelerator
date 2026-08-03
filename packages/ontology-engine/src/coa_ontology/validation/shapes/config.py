@@ -18,6 +18,7 @@ from rdflib.namespace import RDF
 
 # Reuse the canonical SQL→XSD map + naming helpers rather than redefining them
 # (they lived in 3+ places). ``base.py`` owns the authoritative copies.
+from coa_ontology.inducer.strategies.base import pascal_names_for as _pascal_names_for
 from coa_ontology.inducer.strategies.base import to_camel as _to_camel
 from coa_ontology.inducer.strategies.base import to_pascal as _to_pascal
 from coa_ontology.inducer.strategies.base import xsd_for as _xsd_for
@@ -96,8 +97,13 @@ def generate_config_from_db(tables, uri_prefix: str) -> ConstraintConfig:
     ns_str = uri_prefix
     classes: list[ClassConstraints] = []
 
+    # Same collision-resolved local names the ontology and R2RML builders mint,
+    # so the shapes target the classes/properties that actually exist.
+    pascal_by_name = _pascal_names_for(t.name for t in tables)
+    camel_by_name = {n: p[0].lower() + p[1:] if p else p for n, p in pascal_by_name.items()}
+
     for table in tables:
-        class_uri = f"{ns_str}{_to_pascal(table.name)}"
+        class_uri = f"{ns_str}{pascal_by_name[table.name]}"
         constraints: list[PropertyConstraint] = []
 
         pk_cols: set[str] = set()
@@ -118,7 +124,7 @@ def generate_config_from_db(tables, uri_prefix: str) -> ConstraintConfig:
                         fk_map[col_name] = fk_target
 
         for col in table.columns:
-            prop_path = f"{ns_str}{_to_camel(table.name)}_{_to_camel(col.name)}"
+            prop_path = f"{ns_str}{camel_by_name[table.name]}_{_to_camel(col.name)}"
             is_pk = col.name in pk_cols
             is_not_null = col.constraint in ("NOT_NULL", "PRIMARY_KEY") or is_pk
             is_unique = col.constraint in ("UNIQUE", "PRIMARY_KEY") or col.name in unique_cols or is_pk
@@ -147,7 +153,8 @@ def generate_config_from_db(tables, uri_prefix: str) -> ConstraintConfig:
                 )
 
             if is_fk:
-                target_class = f"{ns_str}{_to_pascal(fk_map[col.name])}"
+                fk_target_name = fk_map[col.name]
+                target_class = f"{ns_str}{pascal_by_name.get(fk_target_name, _to_pascal(fk_target_name))}"
                 constraints.append(
                     PropertyConstraint(
                         property_path=prop_path,
