@@ -272,11 +272,20 @@ class BedrockLLMClient:
         queue: asyncio.Queue[str | None | Exception | tuple] = asyncio.Queue()
         loop = asyncio.get_running_loop()
 
-        # Published by the worker as soon as the EventStream exists, so the
-        # event-loop side can close it. Closing the stream is what actually
-        # unblocks the worker's synchronous `for event in ...` — there is no other
-        # cancellation path into a thread-pool thread.
+        # Shared state between the event loop and the worker thread.
+        #
+        # ``stream`` is published by the worker as soon as the EventStream exists so
+        # this side can close it — closing is what unblocks the worker's synchronous
+        # `for event in ...`, since a thread-pool thread has no cancellation point.
+        #
+        # ``abandoned`` covers the window BEFORE that: the ConverseStream API call
+        # itself takes time, and a client that disconnects during it would find
+        # nothing to close, leaving the worker to drain the whole response (holding
+        # an executor slot and billing tokens) for a caller that is already gone.
+        # The worker checks the flag right after the call returns, and again on each
+        # event, so it exits at the first opportunity either way.
         stream_holder: dict[str, Any] = {}
+        abandoned = threading.Event()
 
         def _run_stream() -> None:
             """Run in thread — iterate EventStream, push text chunks to queue."""
@@ -286,7 +295,15 @@ class BedrockLLMClient:
                 client = self._get_client()
                 response = self._call_with_temperature_fallback(client.converse_stream, kwargs)
                 stream_holder["stream"] = response["stream"]
+                if abandoned.is_set():
+                    # Disconnected while the API call was in flight — nothing was
+                    # closeable at that point, so honour the request here.
+                    _close_stream_quietly(response["stream"])
+                    return
                 for event in response["stream"]:
+                    if abandoned.is_set():
+                        _close_stream_quietly(response["stream"])
+                        return
                     if "contentBlockDelta" in event:
                         text = event["contentBlockDelta"].get("delta", {}).get("text", "")
                         if text:
@@ -345,10 +362,14 @@ class BedrockLLMClient:
             # at the `yield`, and suspending on an await inside the resulting
             # `finally` makes CPython raise "async generator ignored GeneratorExit".
             #
-            # Instead: close the stream from this side to unblock the thread, then
-            # detach the worker with a done-callback that surfaces any error. The
-            # generator finalizes synchronously, and the worker cannot keep consuming
-            # the Bedrock stream (and billing tokens) after the client is gone.
+            # Instead: signal the worker to stop, close the stream from this side to
+            # unblock it, then detach it with a done-callback that surfaces any
+            # error. The generator finalizes synchronously, and the worker cannot
+            # keep consuming the Bedrock stream (and billing tokens) after the
+            # client is gone. Setting the flag as well as closing covers the window
+            # where the API call has not returned yet, so there is no stream to
+            # close — see the comment on ``abandoned``.
+            abandoned.set()
             _close_stream_quietly(stream_holder.get("stream"))
             task.add_done_callback(_log_detached_worker_result)
 
