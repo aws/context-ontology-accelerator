@@ -646,6 +646,10 @@ export class ServeStack extends SCLStack {
             "s3:ListBucket",
             "s3:PutObject",
             "s3:GetBucketLocation",
+            // Required for Athena to write query results reliably
+            "s3:AbortMultipartUpload",
+            "s3:ListMultipartUploadParts",
+            "s3:DeleteObject",
           ],
           resources: [
             props.ontologyBucketArn,
@@ -731,12 +735,20 @@ export class ServeStack extends SCLStack {
         }),
       );
 
-      // S3 — Athena federated connector spill bucket (read-only; the managed
-      // connector writes spill, the query engine reads it to assemble results).
+      // S3 — Athena federated connector spill bucket. The managed connector
+      // writes spill data here; the query engine reads it to assemble results.
       const athenaSpillBucket = this.prefixed(`athena-spill-${this.account}`);
       runtime.addToRolePolicy(
         new iam.PolicyStatement({
-          actions: ["s3:GetObject", "s3:ListBucket", "s3:GetBucketLocation"],
+          actions: [
+            "s3:GetObject",
+            "s3:PutObject",
+            "s3:ListBucket",
+            "s3:GetBucketLocation",
+            "s3:AbortMultipartUpload",
+            "s3:ListMultipartUploadParts",
+            "s3:DeleteObject",
+          ],
           resources: [
             `arn:aws:s3:::${athenaSpillBucket}`,
             `arn:aws:s3:::${athenaSpillBucket}/*`,
