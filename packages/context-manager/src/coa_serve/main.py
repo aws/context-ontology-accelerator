@@ -902,7 +902,7 @@ async def invoke(payload: dict, context=None):
     for reserved in _reserved_keys:
         request.profile.pop(reserved, None)
     if upstream_user_id:
-        resolved = resolve_profile(upstream_user_id, upstream_groups, namespace=request.namespace)
+        resolved = resolve_profile(upstream_user_id, upstream_groups, namespace=request.namespace, email=_jwt_email)
         resolved.inject_into(request.profile)
 
     logger.info(

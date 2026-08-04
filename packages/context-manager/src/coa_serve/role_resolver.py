@@ -61,10 +61,15 @@ def resolve_profile(
     user_id: str,
     groups: list[str],
     namespace: str = "",
+    email: str = "",
 ) -> ResolvedProfile:
     """Resolve roles and data-access restrictions for a principal.
 
-    Queries the PrincipalIndex GSI for User::<email> and Group::<group> keys.
+    Queries the PrincipalIndex GSI for User::<sub>, User::<email>, and
+    Group::<group> keys. Querying both sub and email handles the case where
+    grants were written against the user's email address (e.g. by namespace
+    creation or manual bootstrap) while the JWT sub is a Cognito UUID.
+
     For the target namespace, merges tableAllowlist (union) and columnDenylist
     (intersection — a column is denied only if ALL matching grants deny it).
 
@@ -79,6 +84,13 @@ def resolve_profile(
     dao = DynamoDBDAO(_RRM_TABLE, region=_AWS_REGION)
 
     principal_keys = [f"User::{sanitize_principal_key(user_id)}"]
+    # Also look up by email when the JWT sub (UUID) differs from the email.
+    # Grants created via the control-plane API are keyed by email, while the
+    # Context Manager uses the JWT sub as user_id. Without this second lookup,
+    # namespace-owner / data-analyst grants written against email are invisible
+    # to the role resolver and Cedar denies the query.
+    if email and email != user_id:
+        principal_keys.append(f"User::{sanitize_principal_key(email)}")
     principal_keys.extend(f"Group::{sanitize_principal_key(g)}" for g in groups)
 
     # Collect all grant items for this principal
