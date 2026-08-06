@@ -11,7 +11,7 @@
   },
   "dependencies": {
     "@scalar/api-reference-react": "^0.9.59",
-    "mermaid": "^11.6.0",
+    "mermaid": "^11.16.1",
     "react": "^19.2.5",
     "react-dom": "^19.2.5",
     "react-markdown": "^9.0.1",
