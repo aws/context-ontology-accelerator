@@ -624,17 +624,16 @@ describe("SourcesStack", () => {
             status: ["TIMED_OUT", "ABORTED", "FAILED"],
           }),
         }),
-        Targets: Match.arrayWith([
-          Match.objectLike({ Arn: Match.anyValue() }),
-        ]),
+        Targets: Match.arrayWith([Match.objectLike({ Arn: Match.anyValue() })]),
       });
     });
 
     it("scopes the reaper rule to the db-scan state machine ARN", () => {
       // The rule must fire only for the db-scan pipeline, not any state machine.
       const rules = template.findResources("AWS::Events::Rule");
-      const reaperRule = Object.values(rules).find((r: any) =>
-        r.Properties?.EventPattern?.detail?.stateMachineArn !== undefined,
+      const reaperRule = Object.values(rules).find(
+        (r: any) =>
+          r.Properties?.EventPattern?.detail?.stateMachineArn !== undefined,
       ) as any;
       expect(reaperRule).toBeDefined();
       expect(
@@ -655,7 +654,11 @@ describe("SourcesStack", () => {
         env: TEST_ENV,
       });
       return Template.fromStack(
-        new SourcesStack(app, "CtxSources", { network, storage, env: TEST_ENV }),
+        new SourcesStack(app, "CtxSources", {
+          network,
+          storage,
+          env: TEST_ENV,
+        }),
       );
     };
 
@@ -672,9 +675,9 @@ describe("SourcesStack", () => {
     });
 
     it("rejects a non-positive / non-numeric dbScanEnrichmentTimeoutMinutes at synth", () => {
-      expect(() => synthWithContext({ dbScanEnrichmentTimeoutMinutes: 0 })).toThrow(
-        /dbScanEnrichmentTimeoutMinutes must be a positive number/,
-      );
+      expect(() =>
+        synthWithContext({ dbScanEnrichmentTimeoutMinutes: 0 }),
+      ).toThrow(/dbScanEnrichmentTimeoutMinutes must be a positive number/);
       expect(() =>
         synthWithContext({ dbScanEnrichmentTimeoutMinutes: "abc" }),
       ).toThrow(/dbScanEnrichmentTimeoutMinutes must be a positive number/);
@@ -937,5 +940,117 @@ describe("SourcesStack", () => {
         }
       });
     }
+  });
+});
+
+/**
+ * Brownfield Lake Formation bootstrap.
+ *
+ * `PutDataLakeSettings` may only be called by an existing data-lake admin once an
+ * account has any admins, and the caller is the LakeFormationAdmin custom
+ * resource's own Lambda role. Auto-created, that role does not exist until the
+ * deploy that needs it has already run — and a rollback deletes it and re-creates
+ * it under a new auto-generated name, invalidating any registration made against
+ * the previous ARN. `lf_admin_role_arn` lets an operator supply a role that is
+ * already an admin, so registration happens once against a stable ARN.
+ */
+describe("SourcesStack — Lake Formation admin caller role", () => {
+  const SUPPLIED_ROLE_ARN = "arn:aws:iam::123456789012:role/existing-lf-admin";
+
+  function templateWith(extraContext: Record<string, unknown>): Template {
+    const app = new cdk.App({ context: { ...TEST_CONTEXT, ...extraContext } });
+    const network = new NetworkStack(app, "TestNetwork", { env: TEST_ENV });
+    const storage = new StorageStack(app, "TestStorage", {
+      network,
+      env: TEST_ENV,
+    });
+    return Template.fromStack(
+      new SourcesStack(app, "TestSources", {
+        network,
+        storage,
+        allowedOrigin: "https://test.example.com",
+        env: TEST_ENV,
+      }),
+    );
+  }
+
+  /** The onEvent Lambda of the LakeFormationAdmin custom resource. */
+  function lfAdminOnEventRole(template: Template): unknown {
+    const fns = template.findResources("AWS::Lambda::Function");
+    const match = Object.entries(fns).find(([logicalId]) =>
+      logicalId.includes("FederationProvisionerLfAdminOnEvent"),
+    );
+    expect(match).toBeDefined();
+    return match![1].Properties.Role;
+  }
+
+  it("runs the custom resource as the supplied role when lf_admin_role_arn is set", () => {
+    const template = templateWith({ lf_admin_role_arn: SUPPLIED_ROLE_ARN });
+
+    // The literal ARN, not a GetAtt at a role this stack created — that is the
+    // whole point: the ARN is stable and registerable before the first deploy.
+    expect(lfAdminOnEventRole(template)).toEqual(SUPPLIED_ROLE_ARN);
+  });
+
+  it("still grants the supplied role LF settings access and Lambda logging", () => {
+    const template = templateWith({ lf_admin_role_arn: SUPPLIED_ROLE_ARN });
+
+    // A caller-supplied role is expected to be an LF admin, not to have guessed
+    // the IAM statements the handler needs, so the construct attaches them.
+    template.hasResourceProperties("AWS::IAM::Policy", {
+      PolicyDocument: {
+        Statement: Match.arrayWith([
+          Match.objectLike({
+            Action: Match.arrayWith([
+              "lakeformation:GetDataLakeSettings",
+              "lakeformation:PutDataLakeSettings",
+            ]),
+          }),
+        ]),
+      },
+      Roles: Match.arrayWith(["existing-lf-admin"]),
+    });
+
+    // Passing an explicit role suppresses CDK's default basic-execution
+    // attachment, which would silently drop the handler's warning logs. Granted
+    // inline rather than as a managed policy: addManagedPolicy on an IMPORTED
+    // role emits no resource at all, so this assertion is what catches a
+    // regression back to that silent no-op.
+    template.hasResourceProperties("AWS::IAM::Policy", {
+      PolicyDocument: {
+        Statement: Match.arrayWith([
+          Match.objectLike({
+            Action: Match.arrayWith(["logs:PutLogEvents"]),
+          }),
+        ]),
+      },
+      Roles: Match.arrayWith(["existing-lf-admin"]),
+    });
+  });
+
+  it("rejects a cross-account lf_admin_role_arn at synth", () => {
+    // CDK imports a cross-account role as immutable, so the permission
+    // attachments would silently no-op and the failure would surface at deploy
+    // time as an unrelated-looking AccessDenied on SSM. Fail loudly instead.
+    expect(() =>
+      templateWith({
+        lf_admin_role_arn: "arn:aws:iam::999988887777:role/foreign-lf-admin",
+      }),
+    ).toThrow(/must be a role in this account/);
+  });
+
+  it("auto-creates the caller role when lf_admin_role_arn is absent (greenfield self-bootstrap)", () => {
+    const template = templateWith({});
+
+    // Greenfield accounts have no admin for LF to enforce, so the auto-created
+    // role can register itself — no operator action required.
+    expect(lfAdminOnEventRole(template)).toEqual({
+      "Fn::GetAtt": [
+        expect.stringContaining(
+          "FederationProvisionerLfAdminOnEventServiceRole",
+        ),
+        "Arn",
+      ],
+    });
   });
 });

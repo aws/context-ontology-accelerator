@@ -63,11 +63,36 @@ All stacks use context-driven configuration via `CoaStack` base class:
 | `project_tag`              | `semantic-context` | AWS `Project` tag value                                        |
 | `vpc_id`                   | (none)             | Import an existing VPC instead of creating one                 |
 | `aoss_max_ocu`             | `96`               | Max OCU capacity for OpenSearch Serverless (indexing + search) |
-| `aoss_min_ocu`             | `0`                | Min OCU capacity for OpenSearch Serverless (indexing + search) |
+| `aoss_min_ocu`             | `2`                | Min OCU capacity for OpenSearch Serverless (indexing + search). Set to `0` for scale-to-zero — see below |
+| `lf_admin_role_arn`        | (none)             | Existing Lake Formation data-lake admin role to run the LF-admin custom resource as. Required on accounts that already have LF admins |
 | `api_throttle_rate_limit`  | `50`               | API Gateway stage requests-per-second rate limit               |
 | `api_throttle_burst_limit` | `100`              | API Gateway stage burst capacity                               |
 
 Resource naming follows `{prefix}-{env}-{name}` (e.g. `coa-dev-neptune`).
+
+#### OpenSearch Serverless capacity and scale-to-zero
+
+The vector collection is a **NextGen** collection (`generation: "NEXTGEN"` on the
+collection group), not Classic. NextGen supports scaling compute to zero when
+idle, which removes the always-on OCU cost floor, but COA ships a minimum of
+**2 OCU** rather than 0 so that a default deployment does not pay cold-start
+latency on its first query after an idle period.
+
+To opt into scale-to-zero:
+
+```bash
+cdk deploy -c aoss_min_ocu=0
+```
+
+Valid `aoss_min_ocu` values are `0`, `2`, `4`, `8`, `16`, or multiples of 16.
+Leave standby replicas alone — AWS rejects `standbyReplicas: DISABLED` for
+NextGen, which manages replicas internally.
+
+The tradeoff at minimum 0: compute scales down after a period of inactivity and
+takes roughly ten seconds to return, and at very low OCU the NextGen circuit
+breaker sheds load with HTTP 429s under an ingestion burst. That is usually the
+right trade for dev and sandbox environments, and usually the wrong one for an
+environment serving interactive queries or running large scans.
 
 #### First-time deployment
 
@@ -84,13 +109,54 @@ Lake Formation **data-lake admin**. The `LakeFormationAdmin` custom resource
 registers it automatically and non-destructively (it appends to the existing
 admin list rather than overwriting it).
 
-There is a one-time bootstrap caveat: `PutDataLakeSettings` can only be called by
-an existing LF admin once an account already has any admins. So:
+There is a one-time bootstrap caveat: `PutDataLakeSettings` may only be called by
+an existing LF admin once an account already has any admins, and the caller is the
+custom resource's own Lambda role.
 
 - **Greenfield accounts** (no LF admins yet) self-bootstrap — no action needed.
-- **Accounts that already have LF admins:** register the custom resource's Lambda
-  role as an LF admin once, out-of-band, **before the first deploy**. Otherwise
-  JDBC scans fail at `CreateCatalog` with an access-denied error.
+- **Accounts that already have LF admins:** supply a role you already own and have
+  already registered as an LF admin, via the `lf_admin_role_arn` context variable.
+  The custom resource runs as that role, so the call is authorized on the first
+  deploy.
+
+  ```bash
+  cdk deploy coa-dev-sources -c lf_admin_role_arn=arn:aws:iam::<account>:role/<your-lf-admin>
+  ```
+
+  The role must be assumable by `lambda.amazonaws.com`. COA attaches the
+  permissions it needs (LF settings read/write, one SSM parameter read, Lambda
+  logging) to it; it does not need them beforehand.
+
+Without `lf_admin_role_arn` on an account that already has admins, the
+`coa-<env>-sources` **stack fails at deploy time** on the `LakeFormationAdmin`
+custom resource. It does not fail later at scan time, and registering the
+federation provisioner role by hand does not help — that is the role being
+*registered*, not the one making the call.
+
+Recovering without `lf_admin_role_arn` is possible but awkward, because the
+auto-created caller role is deleted by the rollback and re-created under a new
+auto-generated name on retry, invalidating any registration made against the old
+ARN. It requires `cdk deploy --no-rollback` so the role survives with a stable
+ARN, registering it out-of-band, then deploying again. Prefer
+`lf_admin_role_arn`.
+
+#### What COA changes about your Lake Formation posture
+
+Worth knowing before the first deploy, on any account:
+
+- Your existing data-lake admins are **preserved**. The custom resource reads the
+  current settings, appends one principal, and writes them back; it never
+  overwrites the admin list. Other settings, including the
+  `IAM_ALLOWED_PRINCIPALS` defaults that make LF defer to IAM, are round-tripped
+  untouched — deploying COA does not flip an account into strict LF mode.
+- On a **greenfield** account, the first deploy takes `DataLakeAdmins` from empty
+  to non-empty, and LF then begins enforcing admin-only access to settings. Any
+  principal of yours that previously managed LF settings through IAM permission
+  alone — a console role, your own IaC — stops being able to. Add it as an admin
+  alongside COA's (supplying `lf_admin_role_arn` is the easiest way to do both in
+  one up-front registration).
+- `cdk destroy` deregisters the principal COA registered. If you also register it
+  by hand, expect teardown to remove it.
 
 See `infra/README.md` (Lake Formation bootstrap) for the exact registration
 commands and troubleshooting.

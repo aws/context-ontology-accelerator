@@ -7,7 +7,7 @@
 Automated induction of OWL 2 ontologies from relational schemas and
 unstructured documents. Grounds against foundational ontologies
 (Schema.org, Dublin Core, PROV-O, FOAF, FIBO) via vector similarity
-(Amazon Bedrock Titan Text Embeddings V2). Uses large language models
+(Amazon Bedrock Cohere Embed v4). Uses large language models
 (Amazon Bedrock Claude) for concept extraction, alignment, and
 rigor-style generate/judge induction. Persists ontologies and
 embeddings in Amazon Neptune Analytics (graph + HNSW vector index) or
@@ -232,7 +232,7 @@ list):
 - [R2RML — RDB to RDF Mapping Language](https://www.w3.org/TR/r2rml/)
 - [SKOS Simple Knowledge Organization System](https://www.w3.org/TR/skos-reference/)
 - [Amazon Neptune Analytics Vector Search](https://docs.aws.amazon.com/neptune-analytics/latest/userguide/vector-search.html)
-- [Amazon Bedrock Titan Text Embeddings V2](https://docs.aws.amazon.com/bedrock/latest/userguide/titan-embedding-models.html)
+- [Cohere Embed v4 on Amazon Bedrock](https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html)
 - Nayyeri et al., [RIGOR: Retrieval-Augmented Generation of Ontologies](https://arxiv.org/abs/2506.01232), 2025
 - Sequeda et al., [A Benchmark to Understand the Role of Knowledge Graphs on LLM's Accuracy for QA on Enterprise SQL Databases](https://arxiv.org/abs/2311.07509), 2023
 - Tartir et al., OntoQA: Metric-Based Ontology Quality Analysis, 2005

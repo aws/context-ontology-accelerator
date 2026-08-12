@@ -65,7 +65,7 @@ Matching is exact (after normalization). The resolver returns a `MetricMatch` wi
 
 ## Tier 2 retrieval
 
-Tier 2 embeds the query (via Bedrock Titan Embed) and does a k-NN search over the
+Tier 2 embeds the query (via Bedrock Cohere Embed v4) and does a k-NN search over the
 `semantic_entities_{namespace_short_id}` OpenSearch index to select the relevant
 ontology classes/properties for the NL→SQL/SPARQL prompt. The generated SQL/SPARQL
 is then translated (Ontop VKG) and executed. Tier 2 produces a result only over

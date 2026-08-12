@@ -105,7 +105,7 @@ packages/metric-service/
 │   │   └── export_osi.py            # GET /export-osi
 │   ├── validator.py                   # 6-check validation engine
 │   ├── neptune_client.py             # SPARQL CRUD (SigV4 + httpx)
-│   ├── opensearch_client.py          # Vector embeddings (Bedrock Titan + AOSS)
+│   ├── opensearch_client.py          # Vector embeddings (Bedrock Cohere Embed v4 + AOSS)
 │   ├── osi_parser.py                 # OSI v1.0 YAML parse/serialize
 │   ├── dataset_resolver.py           # Resolve OSI datasets → data sources
 │   ├── metadata_reconciler.py        # Additive metadata merge
@@ -305,7 +305,8 @@ non-blocking `warnings` on the `201`/`200` response body.
 | `IMPORT_QUEUE_URL` | Yes | SQS URL for async import messages |
 | `IMPORT_JOBS_TABLE` | Yes | DynamoDB table for import job tracking |
 | `EVENTBRIDGE_BUS_NAME` | No | EventBridge bus name (default: `default`) |
-| `BEDROCK_MODEL_ID` | No | Embedding model (default: `amazon.titan-embed-text-v2:0`) |
+| `BEDROCK_EMBED_MODEL_ID` | No | Embedding model. Takes precedence over `BEDROCK_MODEL_ID` (default: `DEFAULT_EMBED_MODEL_ID` — `us.cohere.embed-v4:0`) |
+| `BEDROCK_MODEL_ID` | No | Embedding model, legacy fallback name (default: `DEFAULT_EMBED_MODEL_ID` — `us.cohere.embed-v4:0`) |
 | `OSS_INDEX_PREFIX` | No | OpenSearch index name prefix — shared with ontology-engine (default: `ontology-workbench-embeddings`) |
 | `OSS_DIMENSIONS` | No | Embedding vector dimensions (default: `1024`) |
 | `ALLOWED_ORIGIN` | No | CORS allowed origin |
@@ -369,9 +370,17 @@ Neptune auth uses SigV4 via `botocore.auth` + `httpx`.
 
 ### OpenSearch (AOSS)
 
-Metrics are embedded using Bedrock Titan Text Embeddings V2 and stored in the
+Metrics are embedded using Bedrock Cohere Embed v4 (1024-dim) and stored in the
 shared ontology vector index (same index as ontology-engine classes/properties),
 using `ontology_vector_index_name(OSS_INDEX_PREFIX, namespace)`.
+
+The model is **not** configured here — it comes from
+`coa_common.constants.DEFAULT_EMBED_MODEL_ID`, the single source of truth shared
+by every embedding producer and consumer. Every writer to this index must use the
+same model or the vectors are cross-model incomparable and retrieval silently
+degrades to noise. Note that Cohere Embed v4 and the previously-used Titan Text
+Embeddings V2 are both 1024-dim, so a mismatch does not fail loudly — it just
+returns bad neighbours.
 
 Document schema conforms to the ontology-engine's mapping:
 ```json
@@ -380,7 +389,7 @@ Document schema conforms to the ontology-engine's mapping:
   "ontology_id": "urn:coa:vocab#GovernedMetrics",
   "entity_type": "metric",
   "embedding_type": "lexical",
-  "model_id": "amazon.titan-embed-text-v2:0",
+  "model_id": "us.cohere.embed-v4:0",
   "namespace": "{ns}",
   "text": "name description synonyms instructions examples",
   "embedding": [1024-dim vector]

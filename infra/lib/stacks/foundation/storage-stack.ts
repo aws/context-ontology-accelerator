@@ -148,7 +148,8 @@ export class StorageStack extends SCLStack {
     // - NEXTGEN generation: 2x indexing throughput, sub-100ms p99 search latency
     // - Standby replicas: must be ENABLED for NEXTGEN (AWS rejects DISABLED).
     //   NEXTGEN strict mode rejects knn_vector method blocks — catches regressions.
-    // - Capacity limits: min 1 OCU (lowest valid), max 96 OCU (cost cap)
+    // - Capacity limits: min 2 OCU (default, override via `aoss_min_ocu`; set 0
+    //   for NextGen scale-to-zero), max 96 OCU (cost cap)
     //
     // BREAKING CHANGE: Collection renamed to {prefix}-vector-store.
     // This creates a new collection — existing vector embeddings must be re-ingested
