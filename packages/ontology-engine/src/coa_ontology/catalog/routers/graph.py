@@ -225,17 +225,34 @@ def get_namespace_schema(
     namespace: str = "default",
     max_results: int = 100,
     include_properties: bool = True,
+    class_filter: str | None = None,
 ):
     """List all OWL classes (and optionally properties) across all ontologies in a namespace.
 
     Returns a bulk schema summary for MCP discovery tools and UI schema views.
     Queries all named graphs under the namespace prefix.
+
+    ``class_filter`` restricts the response to classes whose IRI equals the
+    given value or starts with it (treating a trailing ``#``/``/`` as a
+    prefix). Matches the Smithy ``DescribeSchema.classFilter`` input; a
+    non-matching filter returns an empty ``classes`` list.
+
+    When ``class_filter`` is set the backend is queried with the 500-class
+    ceiling instead of the caller's ``max_results`` and the filter is applied
+    BEFORE the truncation — otherwise a filter targeting a class that isn't
+    in the first ``max_results`` backend rows would return empty even though
+    the class exists. ``max_results`` still bounds the FINAL response so a
+    prefix that matches every class still respects the caller's cap.
     """
     graph = _graph(namespace)
+    # When filtering, fetch the full page so the filter matches even if the
+    # target class isn't in the first ``max_results`` classes the backend
+    # returns; otherwise honour the caller's requested cap directly.
+    backend_limit = 500 if class_filter else min(max_results, 500)
     try:
         result = graph.get_namespace_schema(
             namespace,
-            max_results=min(max_results, 500),
+            max_results=backend_limit,
             include_properties=include_properties,
         )
     except NotImplementedError as e:
@@ -243,7 +260,33 @@ def get_namespace_schema(
     except Exception as e:
         log.exception("get_namespace_schema failed for %s", namespace)
         raise HTTPException(500, f"Internal error querying schema: {type(e).__name__}") from e
+
+    if class_filter:
+        prefix = class_filter
+        classes = result.get("classes") if isinstance(result, dict) else None
+        if isinstance(classes, list):
+            filtered = [c for c in classes if isinstance(c, dict) and _matches_class_filter(c.get("uri", ""), prefix)]
+            # Re-apply the caller's cap AFTER filtering so callers get at most
+            # ``max_results`` matches (not the raw 500 from the backend).
+            result["classes"] = filtered[: min(max_results, 500)]
     return result
+
+
+def _matches_class_filter(uri: str, prefix: str) -> bool:
+    """True if ``uri`` equals ``prefix`` or begins with it as an IRI prefix.
+
+    Treats ``prefix`` as either an exact IRI or a namespace-style prefix.
+    A trailing ``#`` or ``/`` on ``prefix`` is honored verbatim; otherwise
+    the match tolerates a following ``#`` or ``/`` before any local name so
+    ``https://schema.org/`` matches ``https://schema.org/Order``.
+    """
+    if not uri:
+        return False
+    if uri == prefix:
+        return True
+    if prefix.endswith(("#", "/")):
+        return uri.startswith(prefix)
+    return uri.startswith(prefix + "#") or uri.startswith(prefix + "/")
 
 
 @router.get("/vertex", response_model=GraphVertex)

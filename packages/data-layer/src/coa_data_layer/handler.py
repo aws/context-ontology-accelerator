@@ -22,6 +22,13 @@ from urllib.parse import quote
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
+from coa_common.constants import (
+    DESCRIBE_SCHEMA_RESOURCE,
+    LIST_METRICS_RESOURCE,
+    METRIC_SERVICE_LAMBDA_ARN_ENV,
+    ONTOLOGY_PROXY_LAMBDA_ARN_ENV,
+)
+from coa_common.smithy_shapes import normalize_dimensions
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +39,14 @@ REGION = os.environ.get("AWS_REGION", "us-east-1")
 # ``describe_schema`` tool reads the same route, so a UI/data-layer caller and
 # an MCP agent see the same schema — one source of truth for the queryable
 # ontology.
-ONTOLOGY_PROXY_LAMBDA_ARN = os.environ.get("ONTOLOGY_PROXY_LAMBDA_ARN", "")
+ONTOLOGY_PROXY_LAMBDA_ARN = os.environ.get(ONTOLOGY_PROXY_LAMBDA_ARN_ENV, "")
+
+# Metric-service Lambda serving the governed-metric catalog. Data-layer's
+# ServeListMetrics proxies straight to it (the CM never sees the request); the
+# MCP ``discovery.list_metrics`` tool reads the same route, so both surfaces
+# return the same catalog for the same input — one source of truth for governed
+# metrics. Same rationale as DescribeSchema: pure read, no tier orchestration.
+METRIC_SERVICE_LAMBDA_ARN = os.environ.get(METRIC_SERVICE_LAMBDA_ARN_ENV, "")
 
 AGENTCORE_ENDPOINT = f"https://bedrock-agentcore.{REGION}.amazonaws.com"
 ENCODED_ARN = quote(RUNTIME_ARN, safe="")
@@ -175,9 +189,19 @@ def _handle_query(namespace: str, event: dict) -> dict:
     if body.get("mode") is not None:
         payload["options"]["mode"] = body["mode"]
     if body.get("dimensions"):
-        payload["options"]["dimensions"] = body["dimensions"]
-    if body.get("timeoutMs") is not None:
-        payload["options"]["timeoutMs"] = min(body["timeoutMs"], REST_TIMEOUT_MS)
+        # Smithy DimensionFilterList arrives as ``[{name, value}, ...]``; CM's
+        # Tier-1 ``substitute_dimensions`` calls ``.items()`` and expects a
+        # mapping. Normalize here so a Tier-1 metric query with dimensions does
+        # not 500 with ``AttributeError``.
+        normalized = normalize_dimensions(body["dimensions"])
+        if normalized:
+            payload["options"]["dimensions"] = normalized
+    # ``timeoutMs`` is declared on the Smithy contract but the Context Manager
+    # does not currently read ``options.timeoutMs`` — forwarding it would be a
+    # silent no-op that hides "my deadline was ignored" behind a plausible
+    # long-running response. The urllib timeout below (``REST_TIMEOUT_MS``)
+    # is the actual, honoured deadline for this handler's own upstream call.
+    # Track: MR !939 review comment ``b6dea1de``.
     if body.get("includeSupporting") is not None:
         payload["options"]["includeSupporting"] = body["includeSupporting"]
     if body.get("maxResults") is not None:
@@ -323,10 +347,15 @@ def _handle_describe_schema(namespace: str, event: dict) -> dict:
     if query.get("maxResults") is not None:
         forwarded_query["maxResults"] = str(query["maxResults"])
 
+    # Send the canonical Smithy path (``/namespaces/{namespaceId}/schema``); the
+    # ontology-api-proxy's alias table renames it to the FastAPI ``/graph/schema``
+    # route. Both this handler and MCP's ``discovery.describe_schema`` now use
+    # the same path, so the legacy ``/graph/schema`` alias in the api-proxy can
+    # be retired once no caller depends on it.
     proxy_event = {
         "httpMethod": "GET",
-        "resource": "/namespaces/{namespaceId}/graph/schema",
-        "path": f"/namespaces/{namespace}/graph/schema",
+        "resource": DESCRIBE_SCHEMA_RESOURCE,
+        "path": f"/namespaces/{namespace}/schema",
         "pathParameters": {"namespaceId": namespace},
         "queryStringParameters": forwarded_query or None,
         "headers": {"Authorization": f"Bearer {_get_bearer_token(event)}"},
@@ -390,7 +419,94 @@ def _handle_describe_schema(namespace: str, event: dict) -> dict:
         200,
         {
             "classes": body.get("classes", []) if isinstance(body, dict) else [],
-            "ontologyVersion": body.get("ontologyVersion", "") if isinstance(body, dict) else "",
+            "ontologyVersion": body.get("ontologyVersion") if isinstance(body, dict) else None,
+        },
+    )
+
+
+def _handle_list_metrics(namespace: str, event: dict) -> dict:
+    """List the governed metrics available in the namespace.
+
+    Proxies to the metric-service Lambda's ``/namespaces/{namespaceId}/metrics``
+    route — the same source MCP's ``list_metrics`` tool reads. Like
+    DescribeSchema, this handler bypasses the Context Manager because the metric
+    registry is a pure Dynamo read with no tier orchestration to do, and both
+    surfaces (UI/data-layer and MCP agent) must return the same catalog.
+    """
+    if not METRIC_SERVICE_LAMBDA_ARN:
+        return _error_response(501, "ListMetrics unavailable: METRIC_SERVICE_LAMBDA_ARN not configured")
+
+    query = event.get("queryStringParameters") or {}
+    # camelCase (Smithy wire form) forwarded verbatim; the metric-service Lambda
+    # accepts the same query-parameter names, so no renaming is needed here.
+    # ``status`` is intentionally NOT forwarded: the Smithy contract declares it
+    # but the metric-service backend does not yet filter on it, so forwarding
+    # would make an unfiltered response look filtered. Track: MR !939 review
+    # comment ``b6dea1de``.
+    forwarded_query: dict[str, str] = {}
+    if query.get("maxResults") is not None:
+        forwarded_query["maxResults"] = str(query["maxResults"])
+    if query.get("nextToken") is not None:
+        forwarded_query["nextToken"] = str(query["nextToken"])
+
+    proxy_event = {
+        "httpMethod": "GET",
+        "resource": LIST_METRICS_RESOURCE,
+        "path": f"/namespaces/{namespace}/metrics",
+        "pathParameters": {"namespaceId": namespace},
+        "queryStringParameters": forwarded_query or None,
+        "headers": {"Authorization": f"Bearer {_get_bearer_token(event)}"},
+        "body": None,
+        "isBase64Encoded": False,
+        "requestContext": {"stage": "data-layer"},
+    }
+
+    # Same failure-mapping discipline as DescribeSchema: boto3 errors, function
+    # errors, malformed envelopes, and >=400 backend responses all produce a
+    # stable 502 with a schema-specific message rather than bubbling to the
+    # router's generic "Context Manager invocation failed" (misleading — the CM
+    # is not in this path).
+    try:
+        response = _get_lambda_client().invoke(
+            FunctionName=METRIC_SERVICE_LAMBDA_ARN,
+            InvocationType="RequestResponse",
+            Payload=json.dumps(proxy_event).encode("utf-8"),
+        )
+    except (ClientError, BotoCoreError) as exc:
+        logger.exception("list_metrics_invoke_failed", exc_info=exc)
+        return _error_response(502, "Failed to invoke metric-service Lambda")
+
+    if "FunctionError" in response:
+        err_preview = response["Payload"].read().decode("utf-8", errors="replace")[:500]
+        logger.warning("list_metrics_function_error err_preview=%s", err_preview)
+        return _error_response(502, "Metric service backend failed")
+
+    try:
+        proxy_response = json.loads(response["Payload"].read().decode("utf-8"))
+    except (json.JSONDecodeError, ValueError, UnicodeDecodeError) as exc:
+        logger.warning("list_metrics_invalid_envelope", exc_info=exc)
+        return _error_response(502, "Metric service returned invalid JSON")
+
+    status_code = proxy_response.get("statusCode", 200)
+    body_str = proxy_response.get("body", "{}")
+    try:
+        body = json.loads(body_str) if isinstance(body_str, str) else body_str
+    except (json.JSONDecodeError, TypeError) as exc:
+        logger.warning("list_metrics_invalid_body body_preview=%s", str(body_str)[:200], exc_info=exc)
+        body = {}
+
+    if status_code >= 400:
+        message = body.get("message") if isinstance(body, dict) else None
+        return _error_response(status_code, message or f"Metric service returned {status_code}")
+
+    # Project to the Smithy ServeListMetrics output shape so a future backend
+    # change can't leak internal fields (e.g. an echoed ``namespace``) into the
+    # customer-visible response.
+    return _success_response(
+        200,
+        {
+            "metrics": body.get("metrics", []) if isinstance(body, dict) else [],
+            "nextToken": body.get("nextToken") if isinstance(body, dict) else None,
         },
     )
 
@@ -402,6 +518,7 @@ _ROUTE_MAP = {
     ("POST", "/namespaces/{namespaceId}/translate"): _handle_translate,
     ("POST", "/namespaces/{namespaceId}/kb/search"): _handle_kb_search,
     ("POST", "/namespaces/{namespaceId}/graph/traverse"): _handle_graph_traverse,
+    ("GET", "/namespaces/{namespaceId}/metrics"): _handle_list_metrics,
     ("GET", "/namespaces/{namespaceId}/schema"): _handle_describe_schema,
 }
 

@@ -443,6 +443,33 @@ MAX_PAGE_SIZE: int = 100
 
 
 # ---------------------------------------------------------------------------
+# Direct-through discovery: env-var names and Smithy resource paths
+# ---------------------------------------------------------------------------
+# ListMetrics and DescribeSchema are pure catalog reads with no tier
+# orchestration, so both surfaces that expose them (data-layer's ``handler.py``
+# and MCP's ``coa_mcp.tools.discovery``) invoke the backend Lambdas DIRECTLY
+# and skip the Context Manager. The env var names and resource paths below are
+# the contract between those callers and the CDK stacks that wire the ARNs in.
+#
+# If any of these strings diverge between call sites, a caller falls back to
+# an empty ARN (silent 501) or hits a URL the ontology-api-proxy's alias table
+# does not know. Keep this the single source of truth.
+
+# Env var names that the data-layer and MCP-server Lambdas read at cold start
+# to locate the ontology-api-proxy and metric-service Lambdas. Must match what
+# ``data-layer-stack.ts`` and ``mcp-stack.ts`` set in the target Lambda's env.
+ONTOLOGY_PROXY_LAMBDA_ARN_ENV: str = "ONTOLOGY_PROXY_LAMBDA_ARN"
+METRIC_SERVICE_LAMBDA_ARN_ENV: str = "METRIC_SERVICE_LAMBDA_ARN"
+
+# Smithy operation resource paths. Both surfaces must send the identical URI
+# to the backend Lambda so it can route it (via ``api_proxy_handler``'s per-path
+# alias table) to the underlying FastAPI route. These come from
+# ``models/src/main/smithy/serve.smithy`` — the canonical wire contract.
+LIST_METRICS_RESOURCE: str = "/namespaces/{namespaceId}/metrics"
+DESCRIBE_SCHEMA_RESOURCE: str = "/namespaces/{namespaceId}/schema"
+
+
+# ---------------------------------------------------------------------------
 # SQL Dialect — keep in sync with models/src/main/smithy/metric-service.smithy
 # ---------------------------------------------------------------------------
 

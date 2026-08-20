@@ -610,10 +610,10 @@ _PATH_MAPPING: dict[str, dict[str, tuple[str, str]]] = {
     "/namespaces/{namespaceId}/graph/traverse": {
         "POST": ("traverseGraph", "Namespace"),
     },
+    # DescribeSchema is a read of the namespace's ontology summary — gated
+    # under the same ``viewNamespace`` action as the other schema/ontology
+    # reads, matching MCP's ``describe_schema`` Cedar action mapping.
     "/namespaces/{namespaceId}/schema": {
-        # DescribeSchema — read-only schema discovery, same authorization
-        # as viewing the namespace catalog. Matches MCP's ``describe_schema``
-        # which is also viewNamespace-gated.
         "GET": ("viewNamespace", "Namespace"),
     },
     # ── Ontology graph + catalog ────────────────────────────────────────

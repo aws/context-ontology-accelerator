@@ -79,6 +79,25 @@ class TestListMetrics:
         call_kwargs = mock_lambda_client.invoke_api.call_args[1]
         assert call_kwargs["bearer_token"] == "my-jwt-token"
 
+    @pytest.mark.asyncio
+    async def test_next_token_forwarded(self, mock_lambda_client):
+        """Pagination continuation reaches the metric-service backend."""
+        mock_lambda_client.invoke_api.return_value = {"metrics": [], "nextToken": None}
+        await list_metrics(
+            mock_lambda_client,
+            "ns",
+            "tok",
+            next_token="opaque-continuation-cursor",
+        )
+        call_kwargs = mock_lambda_client.invoke_api.call_args[1]
+        assert call_kwargs["query_params"]["nextToken"] == "opaque-continuation-cursor"
+        # ``status`` is intentionally not part of the signature — the Smithy
+        # contract declares it but the metric-service backend does not filter
+        # on it today, so forwarding would produce a silently-unfiltered
+        # result. Pin its absence from the query so a future revert of the
+        # drop shows up here rather than as a silent-wrong-answer bug.
+        assert "status" not in call_kwargs["query_params"]
+
 
 @pytest.mark.unit
 class TestDescribeSchema:
@@ -92,15 +111,27 @@ class TestDescribeSchema:
             "-dev-ontology-api-proxy",
         ):
             await describe_schema(mock_lambda_client, "ns1", "tok")
+        # Path is ``/namespaces/{namespaceId}/schema`` (the Smithy path
+        # data-layer's DescribeSchema targets), not the older
+        # ``/graph/schema`` — the ontology-engine api-proxy handles both,
+        # so both MCP and data-layer converge on one endpoint.
         mock_lambda_client.invoke_api.assert_called_once_with(
             function_name="-dev-ontology-api-proxy",
             method="GET",
-            resource="/namespaces/{namespaceId}/graph/schema",
+            resource="/namespaces/{namespaceId}/schema",
             path_params={"namespaceId": "ns1"},
             query_params={"maxResults": "100", "includeProperties": "true"},
             bearer_token="tok",
             authorizer_context=None,
         )
+
+    @pytest.mark.asyncio
+    async def test_class_filter_forwarded(self, mock_lambda_client):
+        """Missing input the previous signature dropped — now reaches the backend."""
+        mock_lambda_client.invoke_api.return_value = {"classes": [], "ontologyVersion": ""}
+        await describe_schema(mock_lambda_client, "ns", "tok", class_filter="https://schema.org/Order")
+        call_kwargs = mock_lambda_client.invoke_api.call_args[1]
+        assert call_kwargs["query_params"]["classFilter"] == "https://schema.org/Order"
 
     @pytest.mark.asyncio
     async def test_returns_classes(self, mock_lambda_client):
@@ -134,3 +165,35 @@ class TestDescribeSchema:
         await describe_schema(mock_lambda_client, "ns", "tok")
         call_kwargs = mock_lambda_client.invoke_api.call_args[1]
         assert call_kwargs["query_params"]["includeProperties"] == "true"
+
+    @pytest.mark.asyncio
+    async def test_projects_to_smithy_shape(self, mock_lambda_client):
+        """Response is projected to the Smithy ``DescribeSchema`` output —
+        ``{classes, ontologyVersion}`` — even when the backend returns extra
+        fields. Data-layer's ``_handle_describe_schema`` does the same
+        projection; both surfaces must return byte-identical bodies for the
+        same input. Regression for the parity delta caught end-to-end:
+        the ontology-engine backend echoes a ``namespace`` field the Smithy
+        shape doesn't declare, which used to leak through MCP unchanged.
+        """
+        mock_lambda_client.invoke_api.return_value = {
+            "classes": [{"uri": "urn:c:A", "label": "A"}],
+            "ontologyVersion": "v2",
+            # Backend adds this — MUST be stripped.
+            "namespace": "sales",
+            # Belt-and-braces: any other future backend echo also drops.
+            "sourceGraphs": ["urn:g:1"],
+        }
+        result = await describe_schema(mock_lambda_client, "sales", "tok")
+        assert set(result.keys()) == {"classes", "ontologyVersion"}
+        assert result["classes"] == [{"uri": "urn:c:A", "label": "A"}]
+        assert result["ontologyVersion"] == "v2"
+
+    @pytest.mark.asyncio
+    async def test_missing_fields_default_to_smithy_shape(self, mock_lambda_client):
+        """A backend that omits ``ontologyVersion`` still yields the Smithy
+        shape with ``None`` for that field — never absent, so downstream
+        consumers can key without a defensive check."""
+        mock_lambda_client.invoke_api.return_value = {"classes": []}
+        result = await describe_schema(mock_lambda_client, "sales", "tok")
+        assert result == {"classes": [], "ontologyVersion": None}

@@ -4,7 +4,7 @@
 fastapi>=0.141.1
 uvicorn>=0.52.1
 httpx>=0.28.1
-boto3>=1.43.64
+boto3>=1.43.69
 rdflib>=7.6.0
 owlready2>=0.51
 pyshacl>=0.40.1
@@ -13,7 +13,7 @@ python-multipart>=0.0.32
 pyyaml>=6.0.3
 opensearch-py>=2.8.0
 aiosqlite>=0.22.1
-sqlalchemy>=2.0.51
+sqlalchemy>=2.0.52
 sqlglot>=25.34.1
 requests-aws4auth>=1.3.2
 defusedxml>=0.7.1

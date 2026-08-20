@@ -4,4 +4,4 @@
 unstructured[pdf,docx]>=0.25.2
 
 # Scanned PDF detection + page rendering for Textract
-PyMuPDF>=1.28.0
+PyMuPDF>=1.28.2

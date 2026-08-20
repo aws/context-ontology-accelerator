@@ -34,6 +34,7 @@ from .clients.context_manager import ContextManagerClient
 from .clients.lambda_client import LambdaClient
 from .config import MCPConfig
 from .tools import discovery, execution
+from .tools.execution import ContextManagerError
 
 logger = structlog.get_logger(__name__)
 
@@ -178,8 +179,9 @@ def _build_authorizer_context(caller: CallerIdentity, profile: dict) -> dict:
 @mcp.tool()
 async def list_metrics(
     ctx: Context,
-    namespace_id: str,
-    max_results: int = 100,
+    namespaceId: str,
+    maxResults: int = 100,
+    nextToken: str | None = None,
 ) -> str:
     """List governed metric definitions in the namespace.
 
@@ -188,96 +190,117 @@ async def list_metrics(
 
     This is a read-only, lightweight lookup — no LLM calls, no SQL execution.
 
+    The Smithy ``ListMetrics`` operation declares a ``status`` filter, but the
+    metric-service backend does not yet honour it. Rather than accept ``status``
+    here and silently return an unfiltered list (which the caller would read as
+    filtered), the parameter is intentionally not exposed until the backend can
+    apply it. Track: MR !939 review comment ``b6dea1de``.
+
     Args:
         ctx: MCP request context carrying the caller's identity and bearer token.
-        namespace_id: The namespace to list metrics for.
-        max_results: Maximum number of metrics to return (default 100, max 1000).
+        namespaceId: The namespace to list metrics for.
+        maxResults: Maximum number of metrics to return (default 100, max 1000).
+        nextToken: Continuation token from a prior response. When present the
+            call resumes where that response left off; matches the Smithy
+            ``ListMetrics`` input shape.
 
     Returns:
-        JSON with a 'metrics' array containing metric summaries.
+        JSON with a ``metrics`` array; ``nextToken`` when the backend
+        paginated. Same envelope as ``GET /namespaces/{id}/metrics`` on the
+        metric-service surface, so the two paths are drop-in interchangeable.
     """
     start = time.perf_counter()
     caller = None
     try:
         caller, profile = await _resolve_caller_and_profile(
-            namespace_id, ctx, cedar_action=TOOL_CEDAR_ACTION["list_metrics"]
+            namespaceId, ctx, cedar_action=TOOL_CEDAR_ACTION["list_metrics"]
         )
         token = _extract_bearer_token(ctx)
         lc = _get_lambda_client()
         authz_ctx = _build_authorizer_context(caller, profile) if caller.user_id != "local-dev" else None
         result = await discovery.list_metrics(
-            lc, namespace_id, token, max_results=max_results, authorizer_context=authz_ctx
+            lc,
+            namespaceId,
+            token,
+            max_results=maxResults,
+            next_token=nextToken,
+            authorizer_context=authz_ctx,
         )
         duration_ms = int((time.perf_counter() - start) * 1000)
         if caller:
-            log_tool_invocation(caller, "list_metrics", namespace_id, duration_ms=duration_ms)
+            log_tool_invocation(caller, "list_metrics", namespaceId, duration_ms=duration_ms)
         return json.dumps(result, indent=2)
 
     except (ClaimsExtractionError, GrantResolutionError) as e:
         if caller:
-            log_tool_invocation(caller, "list_metrics", namespace_id, success=False, error=str(e))
+            log_tool_invocation(caller, "list_metrics", namespaceId, success=False, error=str(e))
         raise ValueError(str(e)) from e
     except Exception as e:
-        logger.error("list_metrics_failed", namespace=namespace_id, error=str(e))
+        logger.error("list_metrics_failed", namespace=namespaceId, error=str(e))
         if caller:
-            log_tool_invocation(caller, "list_metrics", namespace_id, success=False, error=str(e))
+            log_tool_invocation(caller, "list_metrics", namespaceId, success=False, error=str(e))
         raise
 
 
 @mcp.tool()
 async def describe_schema(
     ctx: Context,
-    namespace_id: str,
-    max_results: int = 100,
-    include_properties: bool = True,
+    namespaceId: str,
+    maxResults: int = 100,
+    includeProperties: bool = True,
+    classFilter: str | None = None,
 ) -> str:
     """Describe available ontology classes, properties, and data source tables.
 
     Returns the schema structure of the namespace — classes, their properties,
-    and connected data sources. Use this tool to understand what data is available
-    and how entities are related before querying.
+    and connected data sources. Use this tool to understand what data is
+    available and how entities are related before querying.
 
     This is a read-only, lightweight lookup — no LLM calls, no SQL execution.
 
     Args:
         ctx: MCP request context carrying the caller's identity and bearer token.
-        namespace_id: The namespace to describe.
-        max_results: Maximum number of classes to return (default 100, max 500).
-        include_properties: Whether to include properties for each class (default True).
+        namespaceId: The namespace to describe.
+        maxResults: Maximum number of classes to return (default 100, max 500).
+        includeProperties: Whether to include properties for each class (default True).
+        classFilter: Optional class URI or prefix to restrict the response to a
+            single class or subtree. Matches the Smithy ``DescribeSchema`` input.
 
     Returns:
-        JSON with 'classes' array and 'dataSources' array.
+        JSON with ``classes`` array and ``ontologyVersion``. Same envelope as
+        ``GET /namespaces/{namespaceId}/schema`` on the data-layer surface.
     """
     start = time.perf_counter()
     caller = None
     try:
         caller, profile = await _resolve_caller_and_profile(
-            namespace_id, ctx, cedar_action=TOOL_CEDAR_ACTION["describe_schema"]
+            namespaceId, ctx, cedar_action=TOOL_CEDAR_ACTION["describe_schema"]
         )
         token = _extract_bearer_token(ctx)
         lc = _get_lambda_client()
         authz_ctx = _build_authorizer_context(caller, profile) if caller.user_id != "local-dev" else None
         result = await discovery.describe_schema(
             lc,
-            namespace_id,
+            namespaceId,
             token,
-            max_results=max_results,
-            include_properties=include_properties,
+            max_results=maxResults,
+            include_properties=includeProperties,
+            class_filter=classFilter,
             authorizer_context=authz_ctx,
         )
         duration_ms = int((time.perf_counter() - start) * 1000)
         if caller:
-            log_tool_invocation(caller, "describe_schema", namespace_id, duration_ms=duration_ms)
+            log_tool_invocation(caller, "describe_schema", namespaceId, duration_ms=duration_ms)
         return json.dumps(result, indent=2)
 
     except (ClaimsExtractionError, GrantResolutionError) as e:
         if caller:
-            log_tool_invocation(caller, "describe_schema", namespace_id, success=False, error=str(e))
+            log_tool_invocation(caller, "describe_schema", namespaceId, success=False, error=str(e))
         raise ValueError(str(e)) from e
     except Exception as e:
-        logger.error("describe_schema_failed", namespace=namespace_id, error=str(e))
+        logger.error("describe_schema_failed", namespace=namespaceId, error=str(e))
         if caller:
-            log_tool_invocation(caller, "describe_schema", namespace_id, success=False, error=str(e))
+            log_tool_invocation(caller, "describe_schema", namespaceId, success=False, error=str(e))
         raise
 
 
@@ -287,11 +310,14 @@ async def describe_schema(
 @mcp.tool()
 async def query(
     ctx: Context,
-    text: str,
-    namespace_id: str,
-    tier_override: int | None = None,
-    max_results: int = 1000,
-    include_supporting: bool = True,
+    query: str,
+    namespaceId: str,
+    execute: bool | None = None,
+    tierOverride: int | None = None,
+    mode: str | None = None,
+    dimensions: list[dict] | None = None,
+    includeSupporting: bool = True,
+    maxResults: int = 1000,
 ) -> str:
     """End-to-end natural language query with tiered resolution.
 
@@ -300,56 +326,77 @@ async def query(
     - Tier 2: Ontology-guided SPARQL→SQL translation
     - Tier 3: Agentic fallback with parallel retrieval and LLM synthesis
 
-    Returns the answer with processing traces showing how it was derived.
+    Input keys are one-for-one with the Smithy ``Query`` operation
+    (data-layer's ``POST /namespaces/{namespaceId}/query``) so an SDK
+    generated from the Smithy models can call either surface without
+    a translation layer.
 
     Args:
         ctx: MCP request context carrying the caller's identity and bearer token.
-        text: Natural language query (e.g., "What is monthly revenue by region?").
-        namespace_id: The namespace to query against.
-        tier_override: Force a specific tier (1, 2, or 3). Omit for automatic routing.
-        max_results: Maximum result rows (default 1000, max 10000).
-        include_supporting: Whether to include supporting document chunks (default True).
+        query: Natural-language question (e.g., "What is monthly revenue by region?").
+        namespaceId: The namespace to query against.
+        execute: When ``False``, translate only — return the generated query
+            without executing it. Absent = default (execute).
+        tierOverride: Pin resolution to a specific tier (1, 2, or 3), bypassing
+            automatic routing. Omit for auto.
+        mode: Execution mode — ``standard`` (single-shot) or ``agentic`` (multi-step
+            reasoning). Absent = the serve deployment default.
+        dimensions: Dimension filters constraining the query. Each entry is a
+            ``{name, value}`` object matching ``DimensionFilter``.
+        includeSupporting: Whether to include supporting document chunks (default True).
+        maxResults: Maximum result rows (default 1000, max 10000).
 
     Returns:
-        JSON QueryResult with tier, confidence, resultRows/synthesizedAnswer, and trace.
+        JSON envelope ``{result, requestId, sessionId}`` matching the Smithy
+        ``Query`` output — same shape data-layer returns, so identifiers stay
+        observable in traces.
     """
     start = time.perf_counter()
     caller = None
     try:
-        caller, profile = await _resolve_caller_and_profile(namespace_id, ctx, cedar_action=TOOL_CEDAR_ACTION["query"])
+        caller, profile = await _resolve_caller_and_profile(namespaceId, ctx, cedar_action=TOOL_CEDAR_ACTION["query"])
         token = _extract_bearer_token(ctx)
         cm = _get_cm_client()
         result = await execution.execute_query(
             cm,
-            text,
-            namespace_id,
+            query,
+            namespaceId,
             profile,
             token,
-            tier_override=tier_override,
-            max_results=max_results,
-            include_supporting=include_supporting,
+            execute=execute,
+            tier_override=tierOverride,
+            mode=mode,
+            dimensions=dimensions,
+            include_supporting=includeSupporting,
+            max_results=maxResults,
         )
         duration_ms = int((time.perf_counter() - start) * 1000)
         if caller:
-            log_tool_invocation(caller, "query", namespace_id, duration_ms=duration_ms)
+            log_tool_invocation(caller, "query", namespaceId, duration_ms=duration_ms)
         return json.dumps(result, indent=2, default=str)
 
     except (ClaimsExtractionError, GrantResolutionError) as e:
         if caller:
-            log_tool_invocation(caller, "query", namespace_id, success=False, error=str(e))
+            log_tool_invocation(caller, "query", namespaceId, success=False, error=str(e))
         raise ValueError(str(e)) from e
-    except Exception as e:
-        logger.error("query_failed", namespace=namespace_id, error=str(e))
+    except ContextManagerError as e:
         if caller:
-            log_tool_invocation(caller, "query", namespace_id, success=False, error=str(e))
+            log_tool_invocation(caller, "query", namespaceId, success=False, error=str(e))
+        # Preserve CM's status code in the raised message so an MCP client
+        # sees the real cause (403/404/etc.) instead of a generic tool crash.
+        raise ValueError(f"CM {e.status_code}: {e.message}") from e
+    except Exception as e:
+        logger.error("query_failed", namespace=namespaceId, error=str(e))
+        if caller:
+            log_tool_invocation(caller, "query", namespaceId, success=False, error=str(e))
         raise
 
 
 @mcp.tool()
 async def translate_sparql(
     ctx: Context,
-    text: str,
-    namespace_id: str,
+    query: str,
+    namespaceId: str,
 ) -> str:
     """Translate a natural language query to SPARQL using the published ontology.
 
@@ -357,145 +404,184 @@ async def translate_sparql(
     Useful for debugging, previewing what the system will execute, and
     for agents that want to inspect the query plan before execution.
 
+    Input keys match the Smithy ``TranslateSPARQL`` operation on the data-layer
+    surface (``POST /namespaces/{namespaceId}/translate``).
+
     Args:
         ctx: MCP request context carrying the caller's identity and bearer token.
-        text: Natural language query to translate.
-        namespace_id: The namespace (determines which ontology is used).
+        query: Natural-language question to translate.
+        namespaceId: The namespace (determines which ontology is used).
 
     Returns:
-        JSON with sparqlQuery, confidence score, and processing trace.
+        JSON ``{sparqlQuery, confidence, trace, ontologyVersion}`` matching
+        the Smithy ``TranslateSPARQL`` output.
     """
     start = time.perf_counter()
     caller = None
     try:
         caller, profile = await _resolve_caller_and_profile(
-            namespace_id, ctx, cedar_action=TOOL_CEDAR_ACTION["translate_sparql"]
+            namespaceId, ctx, cedar_action=TOOL_CEDAR_ACTION["translate_sparql"]
         )
         token = _extract_bearer_token(ctx)
         cm = _get_cm_client()
-        result = await execution.execute_translate_sparql(cm, text, namespace_id, profile, token)
+        result = await execution.execute_translate_sparql(cm, query, namespaceId, profile, token)
         duration_ms = int((time.perf_counter() - start) * 1000)
         if caller:
-            log_tool_invocation(caller, "translate_sparql", namespace_id, duration_ms=duration_ms)
+            log_tool_invocation(caller, "translate_sparql", namespaceId, duration_ms=duration_ms)
         return json.dumps(result, indent=2, default=str)
 
     except (ClaimsExtractionError, GrantResolutionError) as e:
         if caller:
-            log_tool_invocation(caller, "translate_sparql", namespace_id, success=False, error=str(e))
+            log_tool_invocation(caller, "translate_sparql", namespaceId, success=False, error=str(e))
         raise ValueError(str(e)) from e
-    except Exception as e:
-        logger.error("translate_sparql_failed", namespace=namespace_id, error=str(e))
+    except ContextManagerError as e:
         if caller:
-            log_tool_invocation(caller, "translate_sparql", namespace_id, success=False, error=str(e))
+            log_tool_invocation(caller, "translate_sparql", namespaceId, success=False, error=str(e))
+        raise ValueError(f"CM {e.status_code}: {e.message}") from e
+    except Exception as e:
+        logger.error("translate_sparql_failed", namespace=namespaceId, error=str(e))
+        if caller:
+            log_tool_invocation(caller, "translate_sparql", namespaceId, success=False, error=str(e))
         raise
 
 
 @mcp.tool()
 async def rag_retrieval(
     ctx: Context,
-    text: str,
-    namespace_id: str,
-    top_k: int = 10,
-    min_score: float | None = None,
+    query: str,
+    namespaceId: str,
+    topK: int = 10,
+    minScore: float | None = None,
+    sourceFilter: list[str] | None = None,
+    entityFilter: list[str] | None = None,
 ) -> str:
     """Retrieve semantically similar document chunks from the knowledge base.
 
     Performs vector similarity search against indexed documents.
     Returns chunks with source attribution and relevance scores.
 
+    Input keys match the Smithy ``KBSearch`` operation on the data-layer
+    surface (``POST /namespaces/{namespaceId}/kb/search``).
+
     Args:
         ctx: MCP request context carrying the caller's identity and bearer token.
-        text: Query text for semantic search.
-        namespace_id: The namespace to search within.
-        top_k: Number of chunks to retrieve (default 10, max 100).
-        min_score: Minimum similarity score threshold (0.0 to 1.0).
+        query: Natural-language search query.
+        namespaceId: The namespace to search within.
+        topK: Maximum number of chunks to return (default 10, max 100).
+        minScore: Minimum similarity score threshold (0.0 to 1.0).
+        sourceFilter: Restrict results to these source document identifiers.
+        entityFilter: Restrict results to chunks annotated with these entities.
 
     Returns:
-        JSON with 'chunks' array containing text, source, and relevanceScore.
+        JSON ``{chunks, trace, queryEmbeddingModel}`` matching the Smithy
+        ``KBSearch`` output.
     """
     start = time.perf_counter()
     caller = None
     try:
         caller, profile = await _resolve_caller_and_profile(
-            namespace_id, ctx, cedar_action=TOOL_CEDAR_ACTION["rag_retrieval"]
+            namespaceId, ctx, cedar_action=TOOL_CEDAR_ACTION["rag_retrieval"]
         )
         token = _extract_bearer_token(ctx)
         cm = _get_cm_client()
         result = await execution.execute_rag_retrieval(
-            cm, text, namespace_id, profile, token, top_k=top_k, min_score=min_score
+            cm,
+            query,
+            namespaceId,
+            profile,
+            token,
+            top_k=topK,
+            min_score=minScore,
+            source_filter=sourceFilter,
+            entity_filter=entityFilter,
         )
         duration_ms = int((time.perf_counter() - start) * 1000)
         if caller:
-            log_tool_invocation(caller, "rag_retrieval", namespace_id, duration_ms=duration_ms)
+            log_tool_invocation(caller, "rag_retrieval", namespaceId, duration_ms=duration_ms)
         return json.dumps(result, indent=2, default=str)
 
     except (ClaimsExtractionError, GrantResolutionError) as e:
         if caller:
-            log_tool_invocation(caller, "rag_retrieval", namespace_id, success=False, error=str(e))
+            log_tool_invocation(caller, "rag_retrieval", namespaceId, success=False, error=str(e))
         raise ValueError(str(e)) from e
-    except Exception as e:
-        logger.error("rag_retrieval_failed", namespace=namespace_id, error=str(e))
+    except ContextManagerError as e:
         if caller:
-            log_tool_invocation(caller, "rag_retrieval", namespace_id, success=False, error=str(e))
+            log_tool_invocation(caller, "rag_retrieval", namespaceId, success=False, error=str(e))
+        raise ValueError(f"CM {e.status_code}: {e.message}") from e
+    except Exception as e:
+        logger.error("rag_retrieval_failed", namespace=namespaceId, error=str(e))
+        if caller:
+            log_tool_invocation(caller, "rag_retrieval", namespaceId, success=False, error=str(e))
         raise
 
 
 @mcp.tool()
 async def graph_traversal(
     ctx: Context,
-    start_uri: str,
-    namespace_id: str,
-    max_depth: int = 2,
+    startUri: str,
+    namespaceId: str,
+    maxDepth: int = 2,
     direction: str = "both",
-    max_results: int = 100,
+    maxResults: int = 100,
+    relationshipFilter: list[str] | None = None,
 ) -> str:
     """Traverse the semantic graph for entity relationships and context.
 
     Starting from a given entity URI, explores relationships up to the
     specified depth. Returns entities and their relationships.
 
+    Input keys match the Smithy ``GraphTraverse`` operation on the data-layer
+    surface (``POST /namespaces/{namespaceId}/graph/traverse``).
+
     Args:
         ctx: MCP request context carrying the caller's identity and bearer token.
-        start_uri: The URI of the entity to start traversal from.
-        namespace_id: The namespace to traverse within.
-        max_depth: Maximum traversal depth (default 2, max 5).
-        direction: Traversal direction — "outgoing", "incoming", or "both" (default).
-        max_results: Maximum entities to return (default 100, max 1000).
+        startUri: IRI of the entity to start traversal from.
+        namespaceId: The namespace to traverse within.
+        maxDepth: Maximum traversal depth (default 2, max 5).
+        direction: Traversal direction — ``outgoing``, ``incoming``, or ``both`` (default).
+        maxResults: Maximum entities to return (default 100, max 1000).
+        relationshipFilter: Restrict traversal to these relationship (predicate) IRIs.
 
     Returns:
-        JSON with 'entities' and 'relationships' arrays.
+        JSON ``{entities, relationships, trace}`` matching the Smithy
+        ``GraphTraverse`` output.
     """
     start = time.perf_counter()
     caller = None
     try:
         caller, profile = await _resolve_caller_and_profile(
-            namespace_id, ctx, cedar_action=TOOL_CEDAR_ACTION["graph_traversal"]
+            namespaceId, ctx, cedar_action=TOOL_CEDAR_ACTION["graph_traversal"]
         )
         token = _extract_bearer_token(ctx)
         cm = _get_cm_client()
         result = await execution.execute_graph_traversal(
             cm,
-            start_uri,
-            namespace_id,
+            startUri,
+            namespaceId,
             profile,
             token,
-            max_depth=max_depth,
+            max_depth=maxDepth,
             direction=direction,
-            max_results=max_results,
+            max_results=maxResults,
+            relationship_filter=relationshipFilter,
         )
         duration_ms = int((time.perf_counter() - start) * 1000)
         if caller:
-            log_tool_invocation(caller, "graph_traversal", namespace_id, duration_ms=duration_ms)
+            log_tool_invocation(caller, "graph_traversal", namespaceId, duration_ms=duration_ms)
         return json.dumps(result, indent=2, default=str)
 
     except (ClaimsExtractionError, GrantResolutionError) as e:
         if caller:
-            log_tool_invocation(caller, "graph_traversal", namespace_id, success=False, error=str(e))
+            log_tool_invocation(caller, "graph_traversal", namespaceId, success=False, error=str(e))
         raise ValueError(str(e)) from e
-    except Exception as e:
-        logger.error("graph_traversal_failed", namespace=namespace_id, error=str(e))
+    except ContextManagerError as e:
         if caller:
-            log_tool_invocation(caller, "graph_traversal", namespace_id, success=False, error=str(e))
+            log_tool_invocation(caller, "graph_traversal", namespaceId, success=False, error=str(e))
+        raise ValueError(f"CM {e.status_code}: {e.message}") from e
+    except Exception as e:
+        logger.error("graph_traversal_failed", namespace=namespaceId, error=str(e))
+        if caller:
+            log_tool_invocation(caller, "graph_traversal", namespaceId, success=False, error=str(e))
         raise
 
 

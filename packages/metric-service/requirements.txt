@@ -1,7 +1,7 @@
 httpx>=0.28.1
 structlog>=24.4.0
 pydantic>=2.13.4
-pydantic-settings>=2.14.2
+pydantic-settings>=2.15.0
 opensearch-py>=2.8.0
 requests-aws4auth>=1.3.2
 requests>=2.34.2

@@ -62,6 +62,11 @@ _PATH_MAP = {
     "/namespaces/{namespaceId}/proposals/reject": "/ontology/proposals/reject",
     "/namespaces/{namespaceId}/graph/search": "/graph/search",
     "/namespaces/{namespaceId}/graph/ontology-overview": "/graph/ontology-overview",
+    # ``/namespaces/{namespaceId}/schema`` is the canonical Smithy DescribeSchema
+    # URI; ``/graph/schema`` is the legacy alias kept for the ontology-engine
+    # UI/tests. Both route to the same backend so MCP and data-layer converge
+    # on one endpoint.
+    "/namespaces/{namespaceId}/schema": "/graph/schema",
     "/namespaces/{namespaceId}/graph/schema": "/graph/schema",
     # Vertex lookups use ``?uri=`` query param (not path) so OWL IRIs with
     # slashes and ``#`` fragments don't need double URL-encoding.
@@ -104,6 +109,10 @@ _QUERY_ALIASES: dict[str, dict[str, str]] = {
     "/graph/schema": {
         "maxResults": "max_results",
         "includeProperties": "include_properties",
+        # ``classFilter`` matches the Smithy DescribeSchema input. FastAPI
+        # binds ``class_filter`` on the ontology-engine route; without this
+        # rename the param would survive the trip and be silently dropped.
+        "classFilter": "class_filter",
     },
 }
 

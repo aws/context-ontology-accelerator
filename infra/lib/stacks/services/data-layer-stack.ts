@@ -44,16 +44,36 @@ export class DataLayerStack extends SCLStack {
       `${ssmPrefix}/serve/runtime-arn`,
     );
 
-    // Ontology-api-proxy Lambda ARN for DescribeSchema — the same Lambda MCP's
-    // describe_schema tool invokes, so both surfaces read one source of truth.
+    // Ontology-engine api-proxy Lambda ARN — data-layer's DescribeSchema
+    // proxies straight to it (the CM never sees the request). Same source
+    // MCP's discovery.describe_schema uses, so both surfaces converge on
+    // one backend endpoint (``/namespaces/{namespaceId}/schema``).
     const ontologyProxyLambdaArn = ssm.StringParameter.valueForStringParameter(
       this,
       `${ssmPrefix}/ontology-engine/api-fn-arn`,
     );
 
+    // Metric-service Lambda ARN — data-layer's ServeListMetrics proxies
+    // straight to it (the CM never sees the request). Same source MCP's
+    // discovery.list_metrics uses, so both surfaces return the same metric
+    // catalog for the same input (``/namespaces/{namespaceId}/metrics``).
+    const metricServiceLambdaArn = ssm.StringParameter.valueForStringParameter(
+      this,
+      `${ssmPrefix}/metric/api-fn-arn`,
+    );
+
     // ── Lambda code bundle ─────────────────────────────────────────
+    // The handler imports from ``coa_common`` (constants + smithy_shapes).
+    // Importing any ``coa_common`` submodule runs its package ``__init__``,
+    // which eagerly imports pydantic (authnz_types), pydantic-settings (config)
+    // and structlog — so those MUST be in the bundle or the Lambda
+    // ImportModuleErrors at cold start and API Gateway returns 502 on every
+    // route. boto3/botocore are provided by the Lambda runtime and are not
+    // bundled. (Regression guard: handler.py had no coa_common import before the
+    // MCP/data-layer parity refactor, so the bundle shipped zero pip deps.)
     const lambdaCode = bundlePython({
       srcDirs: [fromRoot("packages/data-layer/src"), Paths.commonLib],
+      pipDeps: ["pydantic", "pydantic-settings", "structlog"],
     });
 
     // ── Data Layer API Lambda ──────────────────────────────────────
@@ -70,6 +90,7 @@ export class DataLayerStack extends SCLStack {
       environment: {
         AGENTCORE_RUNTIME_ARN: runtimeArn,
         ONTOLOGY_PROXY_LAMBDA_ARN: ontologyProxyLambdaArn,
+        METRIC_SERVICE_LAMBDA_ARN: metricServiceLambdaArn,
         ALLOWED_ORIGIN: props.allowedOrigin ?? "*",
       },
     });
@@ -84,11 +105,14 @@ export class DataLayerStack extends SCLStack {
       }),
     );
 
-    // ── IAM: invoke the ontology-api-proxy Lambda for DescribeSchema ──
+    // ── IAM: invoke the discovery Lambdas direct-through (bypass CM) ──
+    // Schema queries hit the ontology-api-proxy; metric-catalog queries hit
+    // the metric-service. Both are pure reads with no tier orchestration, so
+    // they skip the Context Manager entirely.
     this.apiFn.addToRolePolicy(
       new iam.PolicyStatement({
         actions: ["lambda:InvokeFunction"],
-        resources: [ontologyProxyLambdaArn],
+        resources: [ontologyProxyLambdaArn, metricServiceLambdaArn],
       }),
     );
 

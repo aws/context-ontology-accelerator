@@ -70,7 +70,10 @@ async function main(): Promise<void> {
   const child = spawn(
     uvxPath,
     [
-      "mcp-proxy",
+      // Pin mcp too: mcp-proxy 0.12.0 needs mcp's pre-v2 `request_ctx` API,
+      // which the v2 rewrite removed. Bump once mcp-proxy supports v2.
+      "--with", "mcp==1.27.1",
+      "mcp-proxy==0.12.0",
       "--transport", "streamablehttp",
       "--headers", "Authorization", `Bearer ${token}`,
       config.runtimeUrl,

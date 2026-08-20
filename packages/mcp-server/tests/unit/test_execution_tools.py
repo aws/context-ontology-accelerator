@@ -59,15 +59,43 @@ class TestExecuteQuery:
         assert token == "my-token"
 
     @pytest.mark.asyncio
-    async def test_returns_tier_and_confidence(self, mock_cm, profile):
+    async def test_returns_query_result_envelope(self, mock_cm, profile):
+        """Response now matches the Smithy ``Query`` output shape:
+        ``{result, requestId, sessionId}`` — same envelope data-layer returns."""
+        mock_cm.invoke.return_value = {
+            "result": {
+                "tier": 2,
+                "confidence": {"score": 0.85, "rationale": "ontology match"},
+                "resultRows": [{"region": "us-east-1", "revenue": "1234567"}],
+                "trace": [
+                    {"step": "vector_search", "status": "success", "durationMs": 45},
+                    {"step": "nl_to_sparql", "status": "success", "durationMs": 1200},
+                ],
+            },
+            "requestId": "req-abc",
+            "sessionId": "sess-xyz",
+        }
         result = await execute_query(mock_cm, "revenue", "sales", profile, "tok")
-        assert result["tier"] == 2
-        assert result["confidence"]["score"] == 0.85
+        assert result["result"]["tier"] == 2
+        assert result["result"]["confidence"]["score"] == 0.85
+        assert len(result["result"]["trace"]) == 2
+        assert result["requestId"] == "req-abc"
+        assert result["sessionId"] == "sess-xyz"
 
     @pytest.mark.asyncio
-    async def test_includes_trace(self, mock_cm, profile):
-        result = await execute_query(mock_cm, "revenue", "sales", profile, "tok")
-        assert len(result["trace"]) == 2
+    async def test_flat_cm_response_wrapped_into_envelope(self, mock_cm, profile):
+        """If CM returns a flat dict (no ``result`` key), the tool still wraps
+        it in the Smithy envelope so callers see a consistent shape. Missing
+        identifiers surface as ``None``."""
+        mock_cm.invoke.return_value = {
+            "tier": 1,
+            "confidence": {"score": 1.0, "rationale": "metric"},
+            "resultRows": [],
+        }
+        result = await execute_query(mock_cm, "test", "ns", profile, "tok")
+        assert result["result"]["tier"] == 1
+        assert result["requestId"] is None
+        assert result["sessionId"] is None
 
     @pytest.mark.asyncio
     async def test_tier_override_passed(self, mock_cm, profile):
@@ -88,29 +116,73 @@ class TestExecuteQuery:
         assert payload["options"]["includeSupporting"] is False
 
     @pytest.mark.asyncio
-    async def test_unwraps_result_envelope(self, mock_cm, profile):
-        """CM wraps response in {result: {...}}, execution tools unwrap it."""
-        mock_cm.invoke.return_value = {
-            "result": {
-                "tier": 1,
-                "confidence": {"score": 1.0, "rationale": "metric"},
-                "resultRows": [{"count": 42}],
-            }
-        }
-        result = await execute_query(mock_cm, "test", "ns", profile, "tok")
-        assert result["tier"] == 1
-        assert result["resultRows"] == [{"count": 42}]
+    async def test_execute_false_translates_only(self, mock_cm, profile):
+        """Smithy input parity: ``execute=False`` short-circuits to translate-only,
+        matching data-layer's Query operation behavior."""
+        await execute_query(mock_cm, "test", "ns", profile, "tok", execute=False)
+        payload = mock_cm.invoke.call_args[0][0]
+        assert payload["options"]["execute"] is False
 
     @pytest.mark.asyncio
-    async def test_flat_response_returned_as_is(self, mock_cm, profile):
-        """If CM returns flat dict (no envelope), pass through."""
-        mock_cm.invoke.return_value = {
-            "tier": 1,
-            "confidence": {"score": 1.0, "rationale": "metric"},
-            "resultRows": [],
-        }
-        result = await execute_query(mock_cm, "test", "ns", profile, "tok")
-        assert result["tier"] == 1
+    async def test_dimensions_and_mode_forwarded(self, mock_cm, profile):
+        """The Smithy inputs the old tool signature dropped (``dimensions``,
+        ``mode``) now reach the CM payload. ``dimensions`` is normalized from
+        the Smithy list-of-DimensionFilter wire shape into the ``{name: value}``
+        mapping CM's Tier-1 resolver expects — reverting this normalization
+        500s every dimensioned Tier-1 query with ``AttributeError`` on
+        ``.items()``.
+
+        ``timeoutMs`` is intentionally NOT in the tool signature: the Smithy
+        contract declares it but the Context Manager has no reader for
+        ``options.timeoutMs`` today, so accepting it here would silently
+        no-op. Pin its absence so a future revert doesn't reintroduce the
+        silent-ignore bug MR !939 comment ``b6dea1de`` flagged.
+        """
+        await execute_query(
+            mock_cm,
+            "test",
+            "ns",
+            profile,
+            "tok",
+            mode="agentic",
+            dimensions=[{"name": "region", "value": "us-east"}],
+        )
+        payload = mock_cm.invoke.call_args[0][0]
+        assert payload["options"]["mode"] == "agentic"
+        assert payload["options"]["dimensions"] == {"region": "us-east"}
+        assert "timeoutMs" not in payload["options"]
+
+    @pytest.mark.asyncio
+    async def test_dimensions_operator_field_is_dropped(self, mock_cm, profile):
+        """CM's Tier-1 ``substitute_dimensions`` supports equality only. The
+        Smithy DimensionFilter may carry an ``operator`` field; it must be
+        dropped rather than forwarded, or the resolver silently applies the
+        wrong filter."""
+        await execute_query(
+            mock_cm,
+            "test",
+            "ns",
+            profile,
+            "tok",
+            dimensions=[{"name": "region", "value": "us-east", "operator": "!="}],
+        )
+        payload = mock_cm.invoke.call_args[0][0]
+        assert payload["options"]["dimensions"] == {"region": "us-east"}
+
+    @pytest.mark.asyncio
+    async def test_empty_dimensions_list_is_not_forwarded(self, mock_cm, profile):
+        """An empty list normalises to an empty dict; forwarding that would
+        add a useless ``options.dimensions`` key. Skip it instead."""
+        await execute_query(
+            mock_cm,
+            "test",
+            "ns",
+            profile,
+            "tok",
+            dimensions=[],
+        )
+        payload = mock_cm.invoke.call_args[0][0]
+        assert "dimensions" not in payload["options"]
 
 
 @pytest.mark.unit
@@ -193,8 +265,26 @@ class TestExecuteGraphTraversal:
         await execute_graph_traversal(mock_cm, "urn:customer:1", "sales", profile, "tok")
         payload = mock_cm.invoke.call_args[0][0]
         assert payload["action"] == "graphTraverse"
-        assert payload["startUri"] == "urn:customer:1"
+        # ``startUri`` now lives inside ``options`` to match the data-layer
+        # handler shape (see ``_handle_graph_traverse``). This is the CM
+        # contract; the previous top-level placement diverged from data-layer.
+        assert payload["options"]["startUri"] == "urn:customer:1"
         assert payload["namespace"] == "sales"
+
+    @pytest.mark.asyncio
+    async def test_relationship_filter_forwarded(self, mock_cm, profile):
+        """Missing input the previous signature dropped — now reaches CM."""
+        mock_cm.invoke.return_value = {"result": {"graphContext": {"entities": [], "relationships": []}, "trace": []}}
+        await execute_graph_traversal(
+            mock_cm,
+            "urn:customer:1",
+            "sales",
+            profile,
+            "tok",
+            relationship_filter=["skos:related", "rdfs:subClassOf"],
+        )
+        payload = mock_cm.invoke.call_args[0][0]
+        assert payload["options"]["relationshipFilter"] == ["skos:related", "rdfs:subClassOf"]
 
     @pytest.mark.asyncio
     async def test_max_depth_capped_at_5(self, mock_cm, profile):
