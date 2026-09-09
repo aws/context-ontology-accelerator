@@ -541,6 +541,26 @@ class TestOrchestratorTier1:
         assert exc_info.value.status_code == 502
 
     @pytest.mark.asyncio
+    async def test_cross_namespace_sql_reference_raises_access_denied(self):
+        """A Tier-1 executor error caused by the namespace-scope firewall surfaces
+        as NamespaceScopeDeniedError (403) with its policy reason — not a masked
+        500/502 — while generic executor errors stay DataSourceUnavailableError."""
+        from coa_serve.exceptions import NamespaceScopeDeniedError
+        from coa_serve.tier2.sql_firewall import NamespaceSQLScopeError
+
+        orch = _make_orchestrator(metric_found=True)
+        cause = NamespaceSQLScopeError("database 'other' not available in the requested namespace")
+        err = RuntimeError("Access denied: SQL reference is outside the requested namespace")
+        err.__cause__ = cause
+        orch._query_executor.execute.side_effect = err
+
+        request = InvokeRequest(query="What is revenue?", namespace="demo")
+        with pytest.raises(NamespaceScopeDeniedError) as exc_info:
+            await orch.resolve(request)
+        assert exc_info.value.status_code == 403
+        assert "outside the requested namespace" in exc_info.value.message
+
+    @pytest.mark.asyncio
     async def test_firewall_error_falls_through_to_tier3(self):
         """firewall rejection (e.g. legacy expression fragment) must not
         crash with 500. Falls through to Tier 2/3."""
