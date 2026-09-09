@@ -63,9 +63,23 @@ export function buildContentSecurityPolicy(
     ? `https://cognito-idp.${runtimeConfig.region}.amazonaws.com`
     : undefined;
 
+  // S3 origins for the browser→S3 presigned PUT/GET used by OSI import/export.
+  // Region-scoped, derived from `region` like cognitoOrigin: the OSI bucket lives
+  // in a later service stack (cross-stack), so we scope to the region's S3 rather
+  // than couple the foundation web stack to it. Both the virtual-hosted host
+  // (`<bucket>.s3.<region>.amazonaws.com`, boto3's default) and the path-style
+  // host are allowed. Without this, connect-src blocks the presigned upload and
+  // OSI import via the UI fails with "Failed to fetch" (issue 103).
+  const s3Origins = runtimeConfig.region
+    ? [
+        `https://*.s3.${runtimeConfig.region}.amazonaws.com`,
+        `https://s3.${runtimeConfig.region}.amazonaws.com`,
+      ]
+    : [];
+
   const connect = new Set<string>(["'self'"]);
   const frame = new Set<string>(["'self'"]);
-  for (const o of [apiOrigin, authOrigin, agentCoreOrigin, cognitoOrigin]) {
+  for (const o of [apiOrigin, authOrigin, agentCoreOrigin, cognitoOrigin, ...s3Origins]) {
     if (o) connect.add(o);
   }
   if (authOrigin) frame.add(authOrigin); // OIDC silent-renew iframe

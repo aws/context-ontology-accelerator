@@ -62,6 +62,25 @@ class AccessDeniedError(ServeError):
         super().__init__("Access denied")
 
 
+class NamespaceScopeDeniedError(AccessDeniedError):
+    """A SQL reference names an object outside the requested namespace — HTTP 403.
+
+    Subclass of :class:`AccessDeniedError` (same 403 / ``AccessDeniedError`` client
+    error type), but this is a *policy* denial that states policy rather than data,
+    so — unlike a data-level deny — its reason IS surfaced in the client message.
+    """
+
+    def __init__(self, reason: str):
+        """Surface the policy reason as the client message.
+
+        Bypasses :class:`AccessDeniedError`'s reason-hiding (which exists for
+        data-level denies where the reason can be sensitive); a cross-namespace
+        SQL reference is a policy statement, safe to return to the caller.
+        """
+        ServeError.__init__(self, reason)
+        self.reason = reason
+
+
 class QueryTranslationError(ServeError):
     """NL-to-SPARQL translation failed — HTTP 400."""
 

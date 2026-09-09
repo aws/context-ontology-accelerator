@@ -223,3 +223,8 @@ packages/mcp-proxy/node_modules/
 
 # Benchmark run artifacts (numbers belong in the MR/description, not the tree)
 scripts/serve/eval_results/
+
+# Provisioned namespace routing maps: UUIDs of namespaces in ONE account, written
+# by benchmarks/**/setup/provision_ns.py. Checking them in would point another
+# account's run at namespaces it does not own; re-run the provisioner instead.
+benchmarks/*/questions/namespace_map.json

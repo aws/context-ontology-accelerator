@@ -26,7 +26,8 @@
 -- them and failed against a schema loaded with different rows, which said nothing about the connector.
 -- Column names, comments, types and constraints ARE asserted, so those must match.
 --
--- Requires: USE CATALOG, USE SCHEMA, CREATE TABLE, MODIFY on the target schema.
+-- Requires: USE CATALOG and CREATE SCHEMA on the catalog; USE SCHEMA, CREATE TABLE and MODIFY on
+-- the schemas it creates.
 -- Idempotent: every statement is CREATE OR REPLACE or DROP IF EXISTS first.
 --
 -- Run it AS A WHOLE, in order. The drops below remove `orders`, which the materialized view and the
@@ -36,6 +37,15 @@
 -- Substitute your own catalog and schema for `workspace`.`coa_dbx_test` throughout, or run
 --   USE CATALOG workspace; USE SCHEMA coa_dbx_test;
 -- first and drop the qualification.
+
+-- ---------------------------------------------------------------------------------------------
+-- The exposed schema itself. First, because every statement below is qualified with it and the
+-- first of them is a DROP: without this, pasting the file into a fresh workspace fails on line one
+-- with "schema not found" rather than on anything to do with the fixtures.
+--
+-- `coa_dbx_test_other` is created further down, next to the one table that lives in it.
+-- ---------------------------------------------------------------------------------------------
+CREATE SCHEMA IF NOT EXISTS `workspace`.`coa_dbx_test`;
 
 -- ---------------------------------------------------------------------------------------------
 -- orders - the parent. Composite primary key, column comments, one mixed-case column name.

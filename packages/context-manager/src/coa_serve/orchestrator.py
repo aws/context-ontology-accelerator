@@ -15,9 +15,10 @@ import structlog
 from coa_common import ontology_vector_index_name
 
 from .clients.base import LLMClient, QueryExecutor, VectorClient
-from .exceptions import AccessDeniedError, DataSourceUnavailableError, NoResultError
+from .exceptions import AccessDeniedError, DataSourceUnavailableError, NamespaceScopeDeniedError, NoResultError
 from .identity import display_principal
 from .mode import Mode, resolve_mode
+from .tier2.sql_firewall import NamespaceSQLScopeError
 
 if TYPE_CHECKING:
     from .clients.sources_registry import SourceComposition, SourcesRegistry
@@ -991,6 +992,13 @@ class Orchestrator:
                     error=type(e).__name__,
                     detail=str(e)[:200],
                 )
+                # A cross-namespace SQL reference is a policy denial, not a data-source
+                # outage: surface it as 403 with its (non-sensitive) policy reason.
+                # Detected via the wrapped firewall cause so the executor keeps raising
+                # its own {Athena,Redshift}QueryError (unit-test contract) and generic
+                # executor failures stay masked as DataSourceUnavailableError.
+                if isinstance(e.__cause__, NamespaceSQLScopeError):
+                    raise NamespaceScopeDeniedError(str(e)) from e
                 raise DataSourceUnavailableError(
                     f"Metric '{metric_match.metric_name}' execution failed: {type(e).__name__}"
                 ) from e
