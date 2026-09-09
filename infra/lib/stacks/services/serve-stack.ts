@@ -26,6 +26,7 @@ import {
   CONNECTOR_TAG_KEY,
   CONNECTOR_TAG_VALUE,
   DEFAULT_BEDROCK_MODEL_ID,
+  DEFAULT_GRAPH_URI_BASE,
 } from "../../constants";
 import { TABLE_NAMES } from "@coa/shared";
 
@@ -106,6 +107,18 @@ export class ServeStack extends SCLStack {
   constructor(scope: Construct, id: string, props: ServeStackProps) {
     super(scope, id, props);
     this.addComponentTag("serve");
+
+    // Removed knob: throwing beats ignoring, which would be the same silent
+    // misconfiguration moved to synth time.
+    if (this.node.tryGetContext("graph_uri_template") !== undefined) {
+      throw new Error(
+        "The `graph_uri_template` CDK context parameter was removed: it moved " +
+          "serve (the graph reader) without the writers, so the prefix matched " +
+          "no named graphs. Change DEFAULT_GRAPH_URI_BASE in " +
+          "infra/lib/constants.ts instead — it feeds serve and metric-service " +
+          "both, and ontology-engine's fallback must match it.",
+      );
+    }
 
     this.agentRuntimeName = this.prefixed("context-manager");
 
@@ -570,9 +583,10 @@ export class ServeStack extends SCLStack {
           RESOLVE_TIMEOUT_S:
             (this.node.tryGetContext("resolve_timeout_s") as string) ?? "170",
           ALLOW_NO_GUARDRAIL: this.envName !== "prod" ? "true" : "false",
-          GRAPH_URI_TEMPLATE:
-            (this.node.tryGetContext("graph_uri_template") as string) ??
-            `https://ontology-workbench.local/{namespace}`,
+          // Same base as the writers (metric-service NDB_GRAPH_URI_BASE,
+          // ontology-engine neptune_db_graph). Serve reads these graphs, so a
+          // reader-only override matches nothing — hence the guard above.
+          GRAPH_URI_TEMPLATE: `${DEFAULT_GRAPH_URI_BASE}/{namespace}`,
           DATA_SOURCES_TABLE: dataSourcesTableName,
           NAMESPACES_TABLE: namespacesTableName,
           // Serve-path Cedar: DDB role-policy loading (control-plane parity).

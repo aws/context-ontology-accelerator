@@ -7,7 +7,11 @@ import * as ec2 from "aws-cdk-lib/aws-ec2";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import { Template, Match } from "aws-cdk-lib/assertions";
 import { ServeStack } from "../../lib/stacks/services/serve-stack";
-import { DEFAULT_RESOURCE_PREFIX, DEFAULT_ENV } from "../../lib/constants";
+import {
+  DEFAULT_RESOURCE_PREFIX,
+  DEFAULT_ENV,
+  DEFAULT_GRAPH_URI_BASE,
+} from "../../lib/constants";
 
 jest.mock("../../lib/utils/python-bundling", () => ({
   bundlePython: () =>
@@ -799,5 +803,49 @@ describe("ServeStack - credential-secret namespace binding", () => {
     expect(read.Condition).toEqual({
       Null: { "secretsmanager:ResourceTag/scl:namespace": "true" },
     });
+  });
+});
+
+describe("ServeStack - GRAPH_URI_TEMPLATE reader/writer alignment", () => {
+  // Serve reads the named graphs that metric-service and ontology-engine write.
+  // If its prefix stops matching their base, it matches zero graphs and the
+  // symptom is "no metrics published", not an error. These pin that invariant.
+  it("derives the template from DEFAULT_GRAPH_URI_BASE, the writers' base", () => {
+    createStack().hasResourceProperties("AWS::BedrockAgentCore::Runtime", {
+      EnvironmentVariables: Match.objectLike({
+        GRAPH_URI_TEMPLATE: `${DEFAULT_GRAPH_URI_BASE}/{namespace}`,
+      }),
+    });
+  });
+
+  it("keeps the {namespace} placeholder query_utils requires", () => {
+    // query_utils.resolve_graph_uri_template() raises ValueError without it.
+    const runtimes = createStack().findResources(
+      "AWS::BedrockAgentCore::Runtime",
+    );
+    const values = Object.values(runtimes);
+    expect(values.length).toBeGreaterThan(0);
+    for (const runtime of values) {
+      const template = runtime.Properties.EnvironmentVariables
+        .GRAPH_URI_TEMPLATE as string;
+      expect(template).toContain("{namespace}");
+      expect(template.split("{namespace}")[0]).toBe(
+        `${DEFAULT_GRAPH_URI_BASE}/`,
+      );
+    }
+  });
+
+  it("throws on a graph_uri_template context override instead of ignoring it", () => {
+    expect(() =>
+      createStack({
+        graph_uri_template: "https://someone-elses-base.example/{namespace}",
+      }),
+    ).toThrow(/graph_uri_template.*was removed/s);
+  });
+
+  it("names DEFAULT_GRAPH_URI_BASE in that error so the fix is actionable", () => {
+    expect(() =>
+      createStack({ graph_uri_template: "https://x.example/{namespace}" }),
+    ).toThrow(/DEFAULT_GRAPH_URI_BASE/);
   });
 });

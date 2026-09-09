@@ -40,6 +40,23 @@ describe("buildContentSecurityPolicy", () => {
     );
   });
 
+  it("allows the region's S3 origin in connect-src for the OSI presigned upload", () => {
+    // OSI import PUTs directly to S3 from the browser (issue 103). Without the
+    // S3 origin here, connect-src blocks the upload with "Failed to fetch".
+    const csp = parse(
+      buildContentSecurityPolicy({
+        ...baseConfig,
+        apiEndpoint: "https://api.example.cloudfront.net/prod",
+      }),
+    );
+    expect(csp["connect-src"]).toEqual(
+      expect.arrayContaining([
+        "https://*.s3.us-east-1.amazonaws.com",
+        "https://s3.us-east-1.amazonaws.com",
+      ]),
+    );
+  });
+
   it("blocks inline/cross-origin scripts with script-src 'self'", () => {
     const csp = parse(buildContentSecurityPolicy(baseConfig));
     expect(csp["script-src"]).toEqual(["'self'"]);

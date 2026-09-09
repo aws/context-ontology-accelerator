@@ -30,7 +30,7 @@ import { isStreamingEvent } from "@utils/sse-type-guards";
 import { deriveRuntimeSessionId } from "@utils/runtime-session-id";
 
 export interface UsePlaygroundStreamOptions {
-  /** AgentCore Runtime endpoint URL (public endpoint or CloudFront path). */
+  /** AgentCore Runtime invocations endpoint (public Bedrock endpoint, fetched cross-origin). */
   queryEndpoint: string | undefined;
   /** OIDC config for token retrieval. */
   oidcConfig: { authority: string; clientId: string } | undefined;
