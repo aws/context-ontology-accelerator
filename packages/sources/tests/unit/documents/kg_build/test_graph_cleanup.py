@@ -538,14 +538,26 @@ class TestMainPassesOnlyExistingIndexes:
     @patch(_P_IDX)
     @patch(_P_GSF)
     @patch(_P_VSF)
-    def test_empty_list_is_passed_explicitly_not_omitted(self, mock_vsf, mock_gsf, mock_idx_cls, mod):
-        """Passing nothing is NOT equivalent to passing [].
+    def test_no_existing_indexes_uses_dummy_store_never_empty_index_names(self, mock_vsf, mock_gsf, mock_idx_cls, mod):
+        """When no AOSS index remains, fall back to the dummy vector store.
 
-        ``VectorStoreFactory.for_vector_store`` defaults ``index_names`` to the
-        toolkit's DEFAULT_EMBEDDING_INDEXES, which includes ``statement`` — an
-        index this pipeline never creates, and therefore the exact 70s-per-batch
-        stall we are avoiding. An explicit empty list keeps the default from
-        kicking in and makes every get_index() return a no-op DummyVectorIndex.
+        Regression for the crash observed on doc-source deletion (exit 1):
+
+            ValueError: Unrecognized vector store info: aoss://<host>:443
+
+        graphrag's ``VectorStoreFactory.for_vector_store`` raises that when handed
+        an EMPTY ``index_names`` — the ``aoss://`` factory's ``try_create``
+        iterates zero names and returns ``[]``, so every factory is treated as a
+        non-match and it falls through to the ValueError. The task then dies
+        before the Neptune subgraph delete runs, leaving the source DELETE_FAILED.
+        (The old assertion here expected ``index_names == []`` and only passed
+        because VectorStoreFactory is mocked in this suite — the mock never
+        reproduced the real failure.)
+
+        The fix: when the filter finds nothing, point at ``dummy://`` with the
+        configured (non-empty) names so a no-op VectorStore is built; deletion's
+        ``get_index(...).delete_embeddings(...)`` no-ops while the Neptune subgraph
+        delete proceeds.
         """
         _make_store_mocks(mock_gsf, mock_vsf)
         _make_graph_index(mock_idx_cls, [])
@@ -553,6 +565,54 @@ class TestMainPassesOnlyExistingIndexes:
         with patch.object(mod, "_existing_embedding_indexes", return_value=[]):
             mod.main()
 
+        uri, kwargs = mock_vsf.for_vector_store.call_args.args, mock_vsf.for_vector_store.call_args.kwargs
+        assert uri and uri[0] == "dummy://", "empty-index case must use the dummy vector store, not aoss://"
+        assert kwargs["index_names"], "index_names must be NON-empty (empty triggers the ValueError)"
+        assert kwargs["index_names"] == mod.EMBEDDING_INDEXES
+
+    @patch(_P_IDX)
+    @patch(_P_GSF)
+    @patch(_P_VSF)
+    def test_no_existing_indexes_still_deletes_the_neptune_subgraph(self, mock_vsf, mock_gsf, mock_idx_cls, mod):
+        """The Neptune subgraph delete is the part that still matters when the
+        vector indexes are already gone — it must still run (not be skipped)."""
+        _make_store_mocks(mock_gsf, mock_vsf)
+        mock_index = _make_graph_index(mock_idx_cls, [{"sourceId": "src-001"}])
+
+        with (
+            patch.object(mod, "_existing_embedding_indexes", return_value=[]),
+            patch(_P_DS) as mock_ds_cls,
+        ):
+            mock_ds = MagicMock()
+            mock_ds.delete_source_documents.return_value = ["src-001"]
+            mock_ds_cls.return_value = mock_ds
+            mod.main()
+
+        mock_ds.delete_source_documents.assert_called_once_with(["src-001"])
+        assert mock_index.get_sources.called
+
+    @patch(_P_IDX)
+    @patch(_P_GSF)
+    @patch(_P_VSF)
+    def test_misconfigured_empty_embedding_indexes_still_never_passes_empty(
+        self, mock_vsf, mock_gsf, mock_idx_cls, mod, monkeypatch
+    ):
+        """The dummy fallback must stay non-empty even if EMBEDDING_INDEXES is empty.
+
+        ``EMBEDDING_INDEXES`` is env-overridable and parses ``EMBEDDING_INDEXES=""``
+        (or whitespace) to ``[]``. Falling back to it directly would hand
+        ``index_names=[]`` to ``for_vector_store("dummy://", [])`` — which raises the
+        SAME ``ValueError`` this MR fixes, since an empty list produces zero indexes
+        for every scheme. Guard: the fallback is coalesced to a fixed non-empty set.
+        """
+        _make_store_mocks(mock_gsf, mock_vsf)
+        _make_graph_index(mock_idx_cls, [])
+        monkeypatch.setattr(mod, "EMBEDDING_INDEXES", [])  # simulate EMBEDDING_INDEXES=""
+
+        with patch.object(mod, "_existing_embedding_indexes", return_value=[]):
+            mod.main()
+
+        uri = mock_vsf.for_vector_store.call_args.args
         kwargs = mock_vsf.for_vector_store.call_args.kwargs
-        assert "index_names" in kwargs, "index_names must be passed explicitly"
-        assert kwargs["index_names"] == []
+        assert uri and uri[0] == "dummy://"
+        assert kwargs["index_names"], "index_names must be NON-empty even when EMBEDDING_INDEXES is empty"
