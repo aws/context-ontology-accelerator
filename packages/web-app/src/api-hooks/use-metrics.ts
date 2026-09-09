@@ -65,12 +65,6 @@ export interface ImportOsiOutput {
   status?: "COMPLETED" | "IN_PROGRESS" | "FAILED";
 }
 
-/** Max file size imported inline (read client-side and POSTed as `content`).
- *  Mirrors the metric-service backend's inline import cap (import_osi.py, 5 MB);
- *  files larger than this fall back to the pre-signed S3 upload flow. Keep in
- *  sync with the backend limit. */
-export const OSI_INLINE_IMPORT_MAX_BYTES = 5 * 1024 * 1024;
-
 export interface ImportJobOutput {
   jobId: string;
   status: "IN_PROGRESS" | "COMPLETED" | "FAILED";
@@ -252,34 +246,25 @@ export function useImportOsiViaS3(namespaceId: string) {
   });
 }
 
-/** Import an OSI file: inline `content` for files under the backend's 5 MB inline
- *  limit (no cross-origin S3 PUT, so it avoids "Failed to fetch" when the OSI
- *  bucket's CORS / the app's CSP doesn't allow a browser PUT to S3), falling back
- *  to the pre-signed S3 upload flow only for larger files. */
+/** Import an OSI file through the pre-signed S3 upload flow.
+ *
+ *  Always routes via S3 (upload-url → browser PUT → import by `s3Key`), never an
+ *  inline `{content}` POST. The inline path went through API Gateway, whose WAF
+ *  (`AWSManagedRulesCommonRuleSet`, `SizeRestrictions_BODY`) rejects any request
+ *  body over 8 KB — so a typical metrics YAML (~10-15 KB) failed with 403
+ *  (issue 103). The S3 object bypasses the WAF; only a small `{s3Key}` reaches
+ *  the API.
+ *
+ *  Requires the browser→S3 PUT to be permitted: the OSI bucket's CORS allows it
+ *  and the SPA's CSP `connect-src` includes the region's S3 origin (see
+ *  `public-ui-construct.ts`). The backend still accepts an inline `{content}`
+ *  body for non-UI callers under the 8 KB limit — only the UI stopped using it. */
 export function useImportOsiFile(namespaceId: string) {
   const client = useApiClient();
   const queryClient = useQueryClient();
 
   return useMutation<ImportOsiOutput, Error, File>({
     mutationFn: async (file: File) => {
-      if (file.size <= OSI_INLINE_IMPORT_MAX_BYTES) {
-        // Inline path — only touches API Gateway (CORS already configured).
-        let content: string;
-        try {
-          content = await file.text();
-        } catch (err) {
-          throw new Error(
-            `Failed to read file: ${err instanceof Error ? err.message : "Unknown error"}`,
-            { cause: err },
-          );
-        }
-        return client.post<ImportOsiOutput>(
-          `/namespaces/${namespaceId}/import-osi`,
-          { content },
-        );
-      }
-
-      // Large file — pre-signed S3 upload, then import by key.
       const { uploadUrl, s3Key } = await client.post<{
         uploadUrl: string;
         s3Key: string;

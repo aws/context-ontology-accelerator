@@ -62,6 +62,30 @@ class GroundingRerankError(Exception):
 # a connection.
 _BEDROCK_MAX_POOL_CONNECTIONS = 32
 
+# The reranker's prompt lists at most this many recall candidates. Was a
+# hardcoded 8, too thin against a large grounding pool (e.g. 342 classes): a
+# correct class recalled at rank 9+ never reached the LLM, so no amount of
+# reranking could recover it (github.com/aws/context-ontology-accelerator
+# issue 72). Bounded, not unbounded, because the reranker runs per-table across
+# _grounding_workers (default 24) sharing one Bedrock client — a large window
+# multiplies prompt tokens and latency for little precision gain past the top
+# candidates. Lexically-recalled candidates are pinned in ADDITION to this
+# window (see _llm_rerank), so raising recall depth without raising this cap
+# still lets a token-overlap hit reach the LLM.
+_RERANK_CANDIDATE_WINDOW = 20
+
+# When the top recall candidates' embedding scores span less than this, the
+# retriever did not discriminate — the ranking is near-arbitrary (issue 72
+# observed a 0.04 spread across ten unrelated classes). A pick from such a
+# distribution is capped at "ambiguous" so it routes to steward review instead
+# of being auto-accepted on a similarity that carries no signal.
+_FLAT_RECALL_SPREAD = 0.05
+
+# A recalled class must share at least one token this long with the subject
+# name to be a lexical candidate. Two-plus chars drops noise (single letters,
+# stray digits) while keeping the real signal ("area", "tuf" in issue 72).
+_MIN_TOKEN_LEN = 2
+
 _RERANK_SYSTEM = (
     "You are an ontology grounding expert. Given a source database table "
     "(with its columns and description) and a list of candidate ontology "
@@ -139,6 +163,11 @@ class GroundingCandidate:
     rerank_score: float | None = None
     rerank_relationship: str | None = None
     rerank_reason: str | None = None
+    # True when this candidate came from the token-overlap retriever rather than
+    # dense embedding recall. It carries no comparable cosine score (lexical_sim
+    # stays 0.0), so it is excluded from the flat-spread measure and pinned into
+    # the reranker window rather than competing on cosine rank.
+    from_lexical: bool = False
 
 
 @dataclass
@@ -163,6 +192,17 @@ def _normalize(s: str) -> str:
     return s
 
 
+def _tokenize(name: str) -> set[str]:
+    """Lowercase token set from a name, splitting camelCase and snake/kebab/space.
+
+    ``apaAreaGross`` → ``{"apa", "area", "gross"}``; ``tuf_petreg_licence`` →
+    ``{"tuf", "petreg", "licence"}``. Tokens shorter than ``_MIN_TOKEN_LEN`` are
+    dropped. Used only by the lexical retriever — dense recall is unaffected.
+    """
+    spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", " ", name)
+    return {t for t in re.split(r"[^a-z0-9]+", spaced.lower()) if len(t) >= _MIN_TOKEN_LEN}
+
+
 def _local_name(uri: str) -> str:
     """Extract local name from an IRI."""
     if "#" in uri:
@@ -170,33 +210,66 @@ def _local_name(uri: str) -> str:
     return uri.rsplit("/", 1)[-1]
 
 
-def classify_score_tier(score: float | None, *, has_rerank: bool = True, confidence_threshold: float = 0.80) -> str:
+def _recall_spread(candidates: list[GroundingCandidate]) -> float | None:
+    """Spread (max − min) of the dense recall candidates' embedding scores.
+
+    ``None`` when fewer than two dense candidates exist (no dispersion to
+    measure). Lexically-recalled candidates carry no comparable cosine score
+    (``from_lexical``) and are excluded, so their synthetic 0.0 cannot fake a
+    wide spread.
+    """
+    sims = [c.lexical_sim for c in candidates if not c.from_lexical]
+    if len(sims) < 2:
+        return None
+    return max(sims) - min(sims)
+
+
+def classify_score_tier(
+    score: float | None,
+    *,
+    has_rerank: bool = True,
+    confidence_threshold: float = 0.80,
+    recall_spread: float | None = None,
+) -> str:
     """Classify a single match score into a grounding tier.
 
-    Tiering is purely score-thresholded: the reranked ladder
+    Tiering is primarily score-thresholded: the reranked ladder
     (``has_rerank=True``, the default, matching how production induction scores
     LLM-reranked candidates) and the STANDARD embedding ladder each map an
     absolute score to ``exact``/``high_confidence``/``ambiguous``/``novel``.
     ``None`` (no candidate) is ``novel``.
+
+    ``recall_spread``, when provided, adds a dispersion guard: if the dense
+    recall did not discriminate (spread < ``_FLAT_RECALL_SPREAD``), a result
+    that would otherwise be ``exact``/``high_confidence`` is capped at
+    ``ambiguous`` and routed to review — a high score off an undiscriminating
+    recall is not trustworthy (issue 72). It never rescues a ``novel`` and
+    never blocks a genuine ``ambiguous``, so the existing calibration bands are
+    unchanged for well-separated recalls.
     """
     if score is None:
         return "novel"
     if has_rerank:
         if score >= 0.85:
-            return "exact"
-        if score >= 0.65:
-            return "high_confidence"
-        if score >= 0.40:
-            return "ambiguous"
-        return "novel"
+            tier = "exact"
+        elif score >= 0.65:
+            tier = "high_confidence"
+        elif score >= 0.40:
+            tier = "ambiguous"
+        else:
+            tier = "novel"
     # STANDARD mode: use embedding scores with original thresholds
-    if score >= 0.95:
-        return "exact"
-    if score >= confidence_threshold:
-        return "high_confidence"
-    if score >= 0.50:
+    elif score >= 0.95:
+        tier = "exact"
+    elif score >= confidence_threshold:
+        tier = "high_confidence"
+    elif score >= 0.50:
+        tier = "ambiguous"
+    else:
+        tier = "novel"
+    if recall_spread is not None and recall_spread < _FLAT_RECALL_SPREAD and tier in ("exact", "high_confidence"):
         return "ambiguous"
-    return "novel"
+    return tier
 
 
 class GroundingService:
@@ -371,7 +444,7 @@ class GroundingService:
         # Exclude its own IRI from the candidate set. Fetch one extra so removing
         # self doesn't shrink the effective top-K.
         recall_k = top_k + 1 if exclude_entity_uri else top_k
-        raw_candidates = self._recall(concept_vector, model_id, ontology_ids, recall_k)
+        raw_candidates = self._recall(concept_vector, model_id, ontology_ids, recall_k, subject_name=table_name)
         if exclude_entity_uri:
             _self = exclude_entity_uri.rstrip("/")
             raw_candidates = [c for c in raw_candidates if c.entity_uri.rstrip("/") != _self][:top_k]
@@ -435,7 +508,10 @@ class GroundingService:
             # No LLM — classify purely on embedding score
             best = raw_candidates[0]
             match_type = classify_score_tier(
-                best.lexical_sim, has_rerank=False, confidence_threshold=confidence_threshold
+                best.lexical_sim,
+                has_rerank=False,
+                confidence_threshold=confidence_threshold,
+                recall_spread=_recall_spread(raw_candidates),
             )
             return GroundingResult(
                 source_table=table_name,
@@ -503,7 +579,12 @@ class GroundingService:
         except (TypeError, ValueError):
             llm_confidence = 0.5
         relationship = rerank_result.get("relationship", "relatedMatch")
-        match_type = classify_score_tier(llm_confidence, has_rerank=True, confidence_threshold=confidence_threshold)
+        match_type = classify_score_tier(
+            llm_confidence,
+            has_rerank=True,
+            confidence_threshold=confidence_threshold,
+            recall_spread=_recall_spread(raw_candidates),
+        )
 
         chosen.rerank_score = llm_confidence
         chosen.rerank_relationship = relationship
@@ -522,7 +603,12 @@ class GroundingService:
         )
 
     def _recall(
-        self, vector: list[float], model_id: str, ontology_ids: list[str] | None, top_k: int
+        self,
+        vector: list[float],
+        model_id: str,
+        ontology_ids: list[str] | None,
+        top_k: int,
+        subject_name: str | None = None,
     ) -> list[GroundingCandidate]:
         """Embedding-based recall: top-K candidates by cosine similarity.
 
@@ -665,7 +751,79 @@ class GroundingService:
         candidates.sort(key=lambda c: -c.lexical_sim)
         top = candidates[:top_k]
 
+        # Additive lexical recall: token-overlap over class local-names surfaces
+        # classes sharing surface tokens with the subject that dense embedding
+        # ranked out (issue 72 — MainArea↔apaAreaGross share "area";
+        # TUFacility↔tuf_petreg_licence share "tuf"). Deduped against the dense
+        # set; pinned through the reranker window in _llm_rerank so they reach
+        # the LLM regardless of dense rank.
+        lexical = self._lexical_recall(ids_to_search, subject_name, top_k)
+        if lexical:
+            have = {c.entity_uri.rstrip("/") for c in top}
+            top = top + [c for c in lexical if c.entity_uri.rstrip("/") not in have]
+
         return top
+
+    def _lexical_recall(
+        self, ontology_ids: list[str], subject_name: str | None, top_k: int
+    ) -> list[GroundingCandidate]:
+        """Token-overlap retrieval over class local-names, additive to dense recall.
+
+        Complements dense embedding recall for the case it is blind to: a class
+        whose name shares surface tokens with the subject but sits in a flat,
+        undiscriminating region of the embedding space (issue 72). Scores each
+        class by Jaccard token overlap between its local-name and the subject
+        name, returning the top ``top_k`` with a positive overlap.
+
+        Portable across both vector backends: it lists the pool's class
+        embeddings through the catalog (both ``StoreOntologyCatalogAdapter`` and
+        the underlying store expose this) and scores in-process — no analyzer,
+        index-mapping, or BM25 assumption. Degrades to a no-op (``[]``) when the
+        catalog cannot list embeddings (e.g. the non-hot-path HTTP client),
+        leaving dense recall unaffected.
+        """
+        if not subject_name:
+            return []
+        lister = getattr(self.oc, "list_embeddings_for_ontology", None)
+        if lister is None:
+            return []
+        subj = _tokenize(subject_name)
+        if not subj:
+            return []
+        scored: list[tuple[float, dict]] = []
+        for oid in ontology_ids:
+            try:
+                docs = lister(oid, entity_type="class", embedding_type="lexical", namespace=self._namespace)
+            except Exception as e:
+                # Additive recall is best-effort: a listing failure must neither
+                # fail the job nor suppress the dense candidates already found.
+                log.warning("lexical_recall: list failed for ontology_id=%s: %s", oid, e)
+                continue
+            for d in docs or []:
+                uri = (d.get("entity_uri") or "").strip()
+                if not uri:
+                    continue
+                cand_tokens = _tokenize(_local_name(uri))
+                overlap = subj & cand_tokens
+                if not overlap:
+                    continue
+                score = len(overlap) / len(subj | cand_tokens)
+                scored.append((score, d))
+        scored.sort(key=lambda s: -s[0])
+        out: list[GroundingCandidate] = []
+        for _score, d in scored[:top_k]:
+            uri = (d.get("entity_uri") or "").strip()
+            out.append(
+                GroundingCandidate(
+                    entity_uri=uri,
+                    ontology_id=d.get("ontology_id"),
+                    label=_local_name(uri),
+                    definition=(d.get("text") or ""),
+                    lexical_sim=0.0,
+                    from_lexical=True,
+                )
+            )
+        return out
 
     def _exact_name_matches(self, table_name: str, candidates: list[GroundingCandidate]) -> list[GroundingCandidate]:
         """Return all candidates whose label is an exact normalized match to the table name."""
@@ -681,6 +839,7 @@ class GroundingService:
         rerank_system: str = _RERANK_SYSTEM,
         subject_kind: str = "table",
         max_tokens: int = 1000,
+        candidate_window: int = _RERANK_CANDIDATE_WINDOW,
     ) -> dict:
         """Ask the LLM to pick the best candidate or abstain.
 
@@ -713,8 +872,15 @@ class GroundingService:
                 parts.append(f"[{col['constraint']}]")
             col_lines.append(" ".join(parts))
 
+        # Show the top of the recall window, PLUS any token-overlap (lexical)
+        # candidate that fell past it. The lexical retriever exists precisely to
+        # surface classes dense recall ranked low, so window truncation must not
+        # drop them before the LLM judges (issue 72). Dense candidates past the
+        # window are dropped as before — that is the intended precision cut.
+        window = list(candidates[:candidate_window])
+        window.extend(c for c in candidates[candidate_window:] if c.from_lexical)
         cand_lines = []
-        for c in candidates[:8]:
+        for c in window:
             defn = c.definition or "(no definition available)"
             source = _local_name(c.ontology_id) if c.ontology_id else "unknown"
             cand_lines.append(f"  - {c.label} [from {source}]: {defn[:200]}")
