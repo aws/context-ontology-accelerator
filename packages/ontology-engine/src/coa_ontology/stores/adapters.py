@@ -99,6 +99,22 @@ class StoreOntologyCatalogAdapter:
         )
         return [asdict(h) for h in hits]
 
+    def list_embeddings_for_ontology(self, ontology_id, entity_type=None, embedding_type=None, namespace=None):
+        """List an ontology's embedding docs (delegates to the vector store).
+
+        Used by the grounding service's lexical (token-overlap) recall to
+        enumerate a pool's class names portably across backends. Namespace
+        resolution mirrors ``search_embeddings``: the bound namespace is
+        authoritative unless a non-None per-call value overrides it.
+        """
+        ns = namespace if namespace is not None else self.namespace
+        return self.vec.list_embeddings_for_ontology(
+            ontology_id,
+            entity_type=entity_type,
+            embedding_type=embedding_type,
+            namespace=ns,
+        )
+
     def get_embeddings_for_entity(self, entity_uri, embedding_type=None, namespace=None):
         """Return stored embeddings for a single entity.
 
