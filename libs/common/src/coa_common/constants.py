@@ -89,6 +89,8 @@ PIPELINE_RUN_FIELDS: tuple[str, ...] = (
     "filesSkipped",
     "filesErrored",
     "preprocessingIssues",
+    "preprocessingIssuesS3Key",
+    "preprocessingIssuesTruncated",
 )
 
 # Statuses where a new ingestion request should be rejected (409).
@@ -126,6 +128,8 @@ SOURCE_PIPELINE_RUN_FIELDS: tuple[str, ...] = (
     "filesSkipped",
     "filesErrored",
     "preprocessingIssues",
+    "preprocessingIssuesS3Key",
+    "preprocessingIssuesTruncated",
 )
 
 

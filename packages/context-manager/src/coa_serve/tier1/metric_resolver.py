@@ -26,6 +26,7 @@ import structlog
 from coa_common.constants import URN_PREFIX as _URN_PREFIX
 
 from coa_serve.query_utils import get_graph_uri_template
+from coa_serve.tier1.stopwords import RESIDUAL_STOP_WORDS
 
 if TYPE_CHECKING:
     from coa_serve.clients.neptune import NeptuneGraphClient
@@ -137,70 +138,10 @@ _PLACEHOLDER_RE = re.compile(r"(?<!:):([a-zA-Z_][a-zA-Z0-9_]*)|\{([a-zA-Z_][a-zA
 # value is being deterministic and sub-millisecond. The failure mode of an
 # unlisted-but-harmless word is a fall-through to Tier 2 (a slower, still-correct
 # answer), which is strictly safer than the silent wrong answer it replaces.
-_RESIDUAL_STOP_WORD_GROUPS = (
-    # Interrogatives, copula, determiners, polite filler.
-    "a an the what whats which who how is are was were be been being have has had do does did"
-    " can could would will shall should give get show tell find report display list return fetch"
-    " calculate compute me us my our ours we you your i it its please value much many"
-    " overall just only there s very",
-    # Aggregate/measure words a metric's own SQL already encodes. Only words that
-    # describe the metric's EXISTING aggregate belong here — see the docstring for
-    # why "average"/"net" are deliberately absent.
-    "total sum count number amount aggregate figure figures metric"
-    " metrics kpi result results data stats statistic statistics",
-    # Bare prepositions (their OBJECT is what survives as residual — see docstring).
-    "of for in on at to by",
-    # Greetings and sign-offs. A chat UI wraps the question in conversational
-    # padding ("Hello. What was total revenue? Thank you"); none of these asks
-    # anything of the SQL, so omitting them let politeness alone trip the gate and
-    # pointlessly demote a fully-consumed question to Tier 2 (review ask).
-    #
-    # Only words that cannot be anything BUT padding are listed. Note the absences:
-    # "morning"/"afternoon"/"evening" are excluded despite "good morning", because
-    # standalone they are time windows ("revenue this morning") — exactly the
-    # qualifier class this gate exists to catch. A greeting that loses its second
-    # word still gates; that is the safe direction to fail.
-    "hello hi hiya hey greetings thanks thank thankyou thx cheers regards welcome",
-    # Units and currencies — "revenue in USD" asks nothing extra of the SQL.
-    "usd eur gbp jpy cad aud chf cny inr dollar dollars euro euros pound pounds yen currency percent percentage pct",
-    # Korean question scaffolding — the Korean counterparts of the groups above:
-    # request verbs ("tell/show me"), question words, counters that restate the
-    # metric's own aggregate (수/명/건), and connective padding. Same closed-list
-    # philosophy: an unlisted harmless word demotes to Tier 2 (slower, still
-    # answerable). Korean particles need no entries of their own because they
-    # attach to the preceding word (tokens are whitespace-delimited chunks).
-    "알려줘 알려줘요 알려주세요 알려주라 보여줘 보여줘요 보여주세요 구해줘 구해줘요 구해주세요"
-    " 말해줘 말해주세요 해줘 해주세요 주세요 줘 좀 부탁해 부탁드립니다"
-    " 얼마야 얼마 얼마나 얼마인지 몇 몇이야 몇인지 언제야 언제 언제인지 무엇 뭐야 뭐 뭔지"
-    " 궁금해 궁금합니다 확인해줘 확인 조회해줘 조회 정리해줘 정리"
-    " 수 수는 수와 수를 수가 명 명이야 건 개 값은 값이"
-    " 그리고 및 랑 이랑 하고 같이 함께 기준 기준으로 대해 대한 관련",
-)
-
-_RESIDUAL_STOP_WORDS = frozenset(word for group in _RESIDUAL_STOP_WORD_GROUPS for word in group.split())
-"""Question scaffolding that does NOT constrain a metric's SQL.
-
-Only words whose removal cannot change the answer belong here. Filter-bearing
-words must NOT be added: ``for``/``by``/``in`` are listed because they are bare
-prepositions that carry no constraint alone — the OBJECT they introduce
-("for the Gold tier", "by region") is what survives as residual and trips the
-gate. Adding a dimension name, a value, or a time word here would reintroduce
-the silent-wrong-answer bug this gate closes.
-
-Two categories look like scaffolding but are NOT, and are deliberately absent
-(each was listed here during review and removed after it was shown to re-open
-the bug this gate exists to close):
-
-* **Aggregate modifiers** — ``average``/``avg``/``mean``/``net``/``gross``
-  *change which aggregate is asked for*. A metric templating ``SUM(amount)``
-  answers "average revenue" with the SUM, and "net revenue" with the gross
-  figure. These are inexpressible in a fixed template, so they must survive as
-  residual. ``total``/``sum``/``count`` are safe only because they restate the
-  aggregate a metric already computes.
-* **Relative time words** — ``today``/``current``/``currently``/``now`` are time
-  windows, which a fixed SQL template cannot express. "Revenue today" is not the
-  all-time total.
-"""
+# The word lists themselves live in per-language modules — see
+# coa_serve.tier1.stopwords for the curation policy (what must NEVER be
+# listed) and the guide for adding a language.
+_RESIDUAL_STOP_WORDS = RESIDUAL_STOP_WORDS
 
 # Punctuation that never carries a qualifier. Tokenising on word characters alone
 # would silently drop a hyphenated or possessive qualifier, so we split on

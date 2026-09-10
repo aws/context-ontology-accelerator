@@ -170,16 +170,38 @@ def main() -> None:
     # _existing_embedding_indexes), and namespace teardown legitimately drops
     # these while this task may still be running.
     existing_indexes = _existing_embedding_indexes(EMBEDDING_INDEXES, TENANT_ID)
-    if not existing_indexes:
+    if existing_indexes:
+        vector_index_names = existing_indexes
+    else:
+        # No AOSS indexes remain (namespace teardown drops chunk_*/topic_* once the
+        # last source is deleted, and this task can still be running when it does).
+        # There are no embeddings to delete — but graphrag's
+        # VectorStoreFactory.for_vector_store raises "Unrecognized vector store info"
+        # when handed an EMPTY index list: the aoss:// factory's try_create iterates
+        # zero names and returns [], every factory is then treated as a non-match, and
+        # it falls through to that ValueError (proven against graphrag-toolkit 3.18.x).
+        # Point at the dummy vector store with a NON-EMPTY set of names instead so it
+        # builds a no-op VectorStore; DeleteSources' get_index(...).delete_embeddings(...)
+        # then no-ops while the Neptune subgraph deletion — the part that still matters —
+        # proceeds. Without this, the cleanup task crashes on exactly the namespaces
+        # whose vector indexes were already reclaimed, leaving the source DELETE_FAILED.
+        #
+        # The name list MUST stay non-empty: for_vector_store raises the same
+        # ValueError for ANY scheme (dummy:// included) when index_names is empty, so
+        # falling back to EMBEDDING_INDEXES alone would reintroduce the crash if it is
+        # misconfigured empty (``EMBEDDING_INDEXES=""`` parses to []). The names are
+        # irrelevant to a dummy store, so default to the standard doc-KG set.
         logger.info(
             "no_embedding_indexes_present_skipping_vector_deletes",
             tenant_id=TENANT_ID,
             configured=EMBEDDING_INDEXES,
         )
+        vector_store_uri = "dummy://"
+        vector_index_names = EMBEDDING_INDEXES or ["chunk", "topic"]
 
     with (
         GraphStoreFactory.for_graph_store(graph_store_uri) as graph_store,
-        VectorStoreFactory.for_vector_store(vector_store_uri, index_names=existing_indexes) as vector_store,
+        VectorStoreFactory.for_vector_store(vector_store_uri, index_names=vector_index_names) as vector_store,
     ):
         graph_index = LexicalGraphIndex(graph_store, vector_store, tenant_id=TENANT_ID)
 

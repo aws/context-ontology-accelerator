@@ -88,23 +88,22 @@ def _client(domain_id: str, session_name: str) -> SMUSClient:
     )
 
 
-def _table_name_from_asset(asset_name: str, ds_key: str) -> str:
-    """Bare table name out of a ``DS#{sourceId}:{database}.{table}`` asset name.
+def _qualified_name_from_asset(asset_name: str, ds_key: str) -> str:
+    """Lower-cased ``{database}.{table}`` out of a ``DS#{sourceId}:{db}.{table}`` name.
 
     The writer composes asset names as ``DS#{sourceId}:{db}.{table}`` (see
-    ``sources_handler``), and the metadata form's ``tableName`` — which is what
-    ``Table.name`` and therefore every table index in this package is keyed on — is
-    the bare table. Split on the FIRST ``.`` so a table name containing a dot still
-    round-trips; a database name containing one would not, and neither Glue nor a
-    JDBC schema permits that.
+    ``sources_handler``); everything after the ``{ds_key}:`` prefix is the
+    database-qualified table name. We keep the database qualifier — rather than
+    reducing to the bare table — so that two tables sharing a bare name in
+    different databases (``sales.customers`` vs ``marketing.customers``) stay
+    distinct keys instead of overwriting each other. Callers that only know the
+    bare name resolve it against the qualified keys at lookup time.
     """
-    remainder = asset_name[len(ds_key) + 1 :]
-    _, _, table = remainder.partition(".")
-    return table or remainder
+    return asset_name[len(ds_key) + 1 :].lower()
 
 
 def read_asset_names_for_datasource(domain_id: str, project_id: str, data_source_id: str) -> dict[str, str]:
-    """Map lower-cased table name → DataZone asset id, from search pages ALONE.
+    """Map lower-cased ``{database}.{table}`` name → DataZone asset id, from search pages ALONE.
 
     The cheap half of :func:`read_assets_for_datasource`. Existence questions
     ("does this source know table X?", "does it know any table?") are answerable
@@ -141,9 +140,9 @@ def read_asset_names_for_datasource(domain_id: str, project_id: str, data_source
         for asset in result.items:
             if not asset.name.startswith(f"{ds_key}:"):
                 continue
-            table = _table_name_from_asset(asset.name, ds_key)
-            if table:
-                names[table.lower()] = asset.asset_id
+            qualified = _qualified_name_from_asset(asset.name, ds_key)
+            if qualified:
+                names[qualified] = asset.asset_id
         next_token = result.next_token
         if not next_token:
             break

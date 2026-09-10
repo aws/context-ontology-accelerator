@@ -94,12 +94,19 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     staging_prefix = f"{namespace_id}/staging/{doc_source_id}/"
     staging_deleted = _delete_s3_prefix(bucket_name, staging_prefix)
 
+    # Scan-result diagnostics reports written by preprocessing (issue 104):
+    # {namespaceId}/scan-results/{docSourceId}/. They carry the customer's full
+    # object keys for every failed file, so they must not outlive the source.
+    scan_results_prefix = f"{namespace_id}/scan-results/{doc_source_id}/"
+    scan_results_deleted = _delete_s3_prefix(bucket_name, scan_results_prefix)
+
     logger.info(
         "s3_cleanup_complete",
         namespace_id=namespace_id,
         doc_source_id=doc_source_id,
         raw_deleted=raw_deleted,
         staging_deleted=staging_deleted,
+        scan_results_deleted=scan_results_deleted,
     )
 
     return {
@@ -108,4 +115,5 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         "tenant_id": event["tenant_id"],
         "raw_objects_deleted": raw_deleted,
         "staging_objects_deleted": staging_deleted,
+        "scan_results_objects_deleted": scan_results_deleted,
     }

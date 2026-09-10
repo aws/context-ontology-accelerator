@@ -56,15 +56,22 @@ describe("useImportOsiFile", () => {
     vi.unstubAllGlobals();
   });
 
-  it("uses the inline content path for small files (no cross-origin S3 PUT)", async () => {
-    const fetchSpy = vi.fn();
+  it("always uses the pre-signed S3 path (never an inline content POST)", async () => {
+    // Even a tiny file goes via S3 now: the inline {content} POST hit API
+    // Gateway's WAF SizeRestrictions_BODY (8 KB) and 403'd (issue 103).
+    const fetchSpy = vi.fn().mockResolvedValue({ ok: true, status: 200 });
     vi.stubGlobal("fetch", fetchSpy);
-    mockPost.mockResolvedValueOnce({
-      status: "COMPLETED",
-      metricsCreated: 2,
-      metricsUpdated: 0,
-      datasetsResolved: 0,
-    });
+    mockPost
+      .mockResolvedValueOnce({
+        uploadUrl: "https://bucket.s3.us-west-2.amazonaws.com/put",
+        s3Key: "ns/imports/x/metrics.yaml",
+      })
+      .mockResolvedValueOnce({
+        status: "COMPLETED",
+        metricsCreated: 2,
+        metricsUpdated: 0,
+        datasetsResolved: 0,
+      });
 
     const { wrapper } = makeHarness();
     const { result } = renderHook(() => useImportOsiFile(NS_ID), { wrapper });
@@ -73,14 +80,27 @@ describe("useImportOsiFile", () => {
       makeFile('osi_spec_version: "1.0"\nmetrics: []\n'),
     );
 
-    expect(mockPost).toHaveBeenCalledTimes(1);
-    expect(mockPost).toHaveBeenCalledWith(
-      `/namespaces/${NS_ID}/import-osi`,
-      expect.objectContaining({
-        content: expect.stringContaining("osi_spec_version"),
-      }),
+    // Upload-url requested, browser PUT to S3, then import by s3Key — no inline content.
+    expect(mockPost).toHaveBeenNthCalledWith(
+      1,
+      `/namespaces/${NS_ID}/import-osi/upload-url`,
+      expect.objectContaining({ filename: "metrics.yaml" }),
     );
-    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(fetchSpy).toHaveBeenCalledWith(
+      "https://bucket.s3.us-west-2.amazonaws.com/put",
+      expect.objectContaining({ method: "PUT" }),
+    );
+    expect(mockPost).toHaveBeenNthCalledWith(
+      2,
+      `/namespaces/${NS_ID}/import-osi`,
+      {
+        s3Key: "ns/imports/x/metrics.yaml",
+      },
+    );
+    // No call ever carries an inline `content` body.
+    for (const call of mockPost.mock.calls) {
+      expect(call[1]).not.toHaveProperty("content");
+    }
   });
 
   it("falls back to the pre-signed S3 upload flow for large files", async () => {
@@ -122,13 +142,21 @@ describe("useImportOsiFile", () => {
   });
 
   it("invalidates the metrics cache on a COMPLETED import", async () => {
-    vi.stubGlobal("fetch", vi.fn());
-    mockPost.mockResolvedValueOnce({
-      status: "COMPLETED",
-      metricsCreated: 1,
-      metricsUpdated: 0,
-      datasetsResolved: 0,
-    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ ok: true, status: 200 }),
+    );
+    mockPost
+      .mockResolvedValueOnce({
+        uploadUrl: "https://bucket.s3.us-west-2.amazonaws.com/put",
+        s3Key: "k",
+      })
+      .mockResolvedValueOnce({
+        status: "COMPLETED",
+        metricsCreated: 1,
+        metricsUpdated: 0,
+        datasetsResolved: 0,
+      });
     const { wrapper, queryClient } = makeHarness();
     const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
 
@@ -141,14 +169,22 @@ describe("useImportOsiFile", () => {
   });
 
   it("does NOT invalidate the cache when the import is not COMPLETED", async () => {
-    vi.stubGlobal("fetch", vi.fn());
-    mockPost.mockResolvedValueOnce({
-      status: "IN_PROGRESS",
-      jobId: "job-1",
-      metricsCreated: 0,
-      metricsUpdated: 0,
-      datasetsResolved: 0,
-    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ ok: true, status: 200 }),
+    );
+    mockPost
+      .mockResolvedValueOnce({
+        uploadUrl: "https://bucket.s3.us-west-2.amazonaws.com/put",
+        s3Key: "k",
+      })
+      .mockResolvedValueOnce({
+        status: "IN_PROGRESS",
+        jobId: "job-1",
+        metricsCreated: 0,
+        metricsUpdated: 0,
+        datasetsResolved: 0,
+      });
     const { wrapper, queryClient } = makeHarness();
     const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
 
@@ -156,35 +192,6 @@ describe("useImportOsiFile", () => {
     await result.current.mutateAsync(makeFile("metrics: []\n"));
 
     expect(invalidateSpy).not.toHaveBeenCalled();
-  });
-
-  it("rejects when the inline import POST fails", async () => {
-    vi.stubGlobal("fetch", vi.fn());
-    mockPost.mockRejectedValueOnce(
-      new Error("API POST /import-osi failed (400): bad"),
-    );
-    const { wrapper } = makeHarness();
-
-    const { result } = renderHook(() => useImportOsiFile(NS_ID), { wrapper });
-    await expect(
-      result.current.mutateAsync(makeFile("metrics: []\n")),
-    ).rejects.toThrow(/400/);
-  });
-
-  it("rejects with a clear message when reading the file fails", async () => {
-    vi.stubGlobal("fetch", vi.fn());
-    const file = new File(["x"], "metrics.yaml", {
-      type: "application/x-yaml",
-    });
-    Object.defineProperty(file, "size", { value: 10 });
-    vi.spyOn(file, "text").mockRejectedValue(new Error("read boom"));
-    const { wrapper } = makeHarness();
-
-    const { result } = renderHook(() => useImportOsiFile(NS_ID), { wrapper });
-    await expect(result.current.mutateAsync(file)).rejects.toThrow(
-      /Failed to read file: read boom/,
-    );
-    expect(mockPost).not.toHaveBeenCalled();
   });
 
   it("rejects when the upload-url request fails (large file)", async () => {

@@ -14,7 +14,7 @@ from coa_common.domain_models import Column, Table
 from coa_common.metadata_store.base import AssetResult, SearchResult
 from coa_common.metadata_store.reader import (
     _parse_asset,
-    _table_name_from_asset,
+    _qualified_name_from_asset,
     read_asset_names_for_datasource,
     read_assets_for_datasource,
 )
@@ -182,7 +182,7 @@ class TestReadAssetNamesForDatasource:
 
         names = read_asset_names_for_datasource("dom-1", "proj-1", "ds-1")
 
-        assert names == {"orders": "a1", "customers": "a2"}
+        assert names == {"sales.orders": "a1", "sales.customers": "a2"}
         client.get_asset_forms.assert_not_called()
         assert client.search_assets.call_count == 1
 
@@ -228,23 +228,25 @@ class TestReadAssetNamesForDatasource:
             )
             cls.return_value = client
 
-            assert read_asset_names_for_datasource("dom-1", "proj-1", "DS#ds-1") == {"orders": "a1"}
+            assert read_asset_names_for_datasource("dom-1", "proj-1", "DS#ds-1") == {"public.orders": "a1"}
 
 
-class TestTableNameFromAsset:
+class TestQualifiedNameFromAsset:
     """Asset names are ``DS#{sourceId}:{database}.{table}``; the index key is the
-    bare table, matching the form's ``tableName`` that ``Table.name`` carries."""
+    lower-cased ``{database}.{table}`` so same-named tables in different databases
+    stay distinct."""
 
     @pytest.mark.parametrize(
         ("asset_name", "expected"),
         [
-            ("DS#ds-1:public.orders", "orders"),
-            ("DS#ds-1:pc_insurance.claim_amount", "claim_amount"),
-            # A dot in the table name survives; the split takes the first only.
-            ("DS#ds-1:public.odd.name", "odd.name"),
-            # No database segment: fall back to the whole remainder.
+            ("DS#ds-1:public.orders", "public.orders"),
+            # Lower-cased so lookups are case-insensitive.
+            ("DS#ds-1:PC_Insurance.Claim_Amount", "pc_insurance.claim_amount"),
+            # A dot in the table name is preserved in the qualified key.
+            ("DS#ds-1:public.odd.name", "public.odd.name"),
+            # No database segment: the bare table is the whole remainder.
             ("DS#ds-1:orders", "orders"),
         ],
     )
-    def test_parses_bare_table_name(self, asset_name, expected):
-        assert _table_name_from_asset(asset_name, "DS#ds-1") == expected
+    def test_parses_qualified_name(self, asset_name, expected):
+        assert _qualified_name_from_asset(asset_name, "DS#ds-1") == expected

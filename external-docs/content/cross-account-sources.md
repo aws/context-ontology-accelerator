@@ -243,6 +243,22 @@ aws glue put-resource-policy --policy-in-json '{
 }'
 ```
 
+!!! note "Nested / federated catalogs (`catalogId` = `account:catalogName`)"
+    The policy above covers the owner account's **default** Glue catalog
+    (`catalogId` = the owner account id). A **federated** catalog — a Databricks
+    Unity Catalog or Snowflake/Redshift Iceberg REST federation, addressed as
+    `catalogId: "<owner-account>:<catalogName>"` — is a nested resource, and Glue
+    authorizes `GetDatabase`/`GetTables` against the nested-catalog resource
+    itself, not just its databases and tables. For that case add `glue:GetCatalog`
+    to the `Action` array and the nested-catalog ARN to `Resource`:
+
+    ```
+    arn:aws:glue:<region>:<owner-account>:catalog/<catalogName>
+    ```
+
+    Without it the read is denied on `catalog/<catalogName>` even though the
+    `database/`  and `table/` grants are present.
+
 For **query-time** in IAM-mode, Athena also needs the catalog shared via AWS RAM
 (and the underlying S3 data readable by the serve runtime role). A Glue resource
 policy alone authorizes the API calls but Athena's cross-account catalog

@@ -271,6 +271,7 @@ class TestHandlerReturnValue:
             "tenant_id",
             "raw_objects_deleted",
             "staging_objects_deleted",
+            "scan_results_objects_deleted",
         }
 
     def test_tenant_id_passed_through(self):
@@ -283,3 +284,30 @@ class TestHandlerReturnValue:
             result = cleanup_handler.handler({**_BASE_EVENT, "s3_prefixes": []}, None)
 
         assert result["tenant_id"] == _TENANT_ID
+
+
+@pytest.mark.unit
+class TestScanResultsCleanup:
+    def test_deletes_scan_results_reports(self):
+        """The preprocessing diagnostics reports under {ns}/scan-results/{ds}/
+        (issue 104) must be deleted with the source — they carry the customer's
+        full object keys for every failed file."""
+        from coa_sources.documents.deletion import cleanup_handler
+
+        staging_prefix = f"{_NAMESPACE_ID}/staging/{_DOC_SOURCE_ID}/"
+        scan_results_prefix = f"{_NAMESPACE_ID}/scan-results/{_DOC_SOURCE_ID}/"
+        s3 = _mock_s3(
+            {
+                staging_prefix: [_make_page(f"{staging_prefix}doc.md")],
+                scan_results_prefix: [_make_page(f"{scan_results_prefix}1-issues.json")],
+            }
+        )
+        s3.delete_objects.side_effect = [
+            {"Deleted": [{"Key": f"{staging_prefix}doc.md"}], "Errors": []},
+            {"Deleted": [{"Key": f"{scan_results_prefix}1-issues.json"}], "Errors": []},
+        ]
+
+        with patch.object(cleanup_handler, "_s3", s3):
+            result = cleanup_handler.handler({**_BASE_EVENT, "source_type": "s3", "s3_prefixes": []}, None)
+
+        assert result["scan_results_objects_deleted"] == 1

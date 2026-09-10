@@ -111,6 +111,45 @@ class TestSmusCatalogDataSourceLookup:
 
     @patch("coa_metrics.lookups.read_table_for_asset")
     @patch("coa_metrics.lookups.read_asset_names_for_datasource")
+    def test_same_table_name_across_databases_stays_distinct(self, mock_names, mock_asset):
+        """Two databases with a same-named table must NOT collide: the index keys
+        on the qualified name, and a qualified lookup resolves to its own asset."""
+        mock_names.return_value = {"sales.customers": "asset-sales", "marketing.customers": "asset-mkt"}
+        mock_asset.side_effect = lambda _domain, asset_id, _name, _ds: _table(
+            name=asset_id, columns=((f"{asset_id}_col", "integer"),)
+        )
+        lookup = _lookup()
+
+        assert lookup.get_column_type("ds-1", "sales.customers", "asset-sales_col") == "integer"
+        assert lookup.get_column_type("ds-1", "marketing.customers", "asset-mkt_col") == "integer"
+        # The two resolved to different assets — no overwrite.
+        assert {c.args[1] for c in mock_asset.call_args_list} == {"asset-sales", "asset-mkt"}
+
+    @patch("coa_metrics.lookups.read_table_for_asset")
+    @patch("coa_metrics.lookups.read_asset_names_for_datasource")
+    def test_ambiguous_bare_name_does_not_resolve(self, mock_names, mock_asset):
+        """A bare name matching tables in two databases is ambiguous — resolve to
+        None (caller must qualify) rather than silently picking one."""
+        mock_names.return_value = {"sales.customers": "asset-sales", "marketing.customers": "asset-mkt"}
+        lookup = _lookup()
+
+        assert lookup.table_exists("ds-1", "customers") is False
+        mock_asset.assert_not_called()
+        # Both forms are enumerable so the caller's guard still sees the catalog.
+        assert lookup.known_tables("ds-1") == {"sales.customers", "marketing.customers", "customers"}
+
+    @patch("coa_metrics.lookups.read_table_for_asset")
+    @patch("coa_metrics.lookups.read_asset_names_for_datasource")
+    def test_bare_name_resolves_when_unique(self, mock_names, mock_asset):
+        """A bare name that matches exactly one database resolves to it."""
+        mock_names.return_value = {"public.orders": "asset-orders"}
+        mock_asset.return_value = _table()
+        lookup = _lookup()
+
+        assert lookup.table_exists("ds-1", "orders") is True
+
+    @patch("coa_metrics.lookups.read_table_for_asset")
+    @patch("coa_metrics.lookups.read_asset_names_for_datasource")
     def test_get_table_columns_returns_named_columns_only(self, mock_names, mock_asset):
         mock_names.return_value = _NAMES
         mock_asset.return_value = _table(columns=(("order_id", "integer"), ("amount", "decimal"), ("", "ignored")))
