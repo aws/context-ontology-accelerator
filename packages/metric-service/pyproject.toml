@@ -1,6 +1,6 @@
 [project]
 name = "coa-metrics"
-version = "0.2.3"
+version = "0.3.1"
 description = "Metric Service for Context Ontology Accelerator"
 requires-python = ">=3.12"
 

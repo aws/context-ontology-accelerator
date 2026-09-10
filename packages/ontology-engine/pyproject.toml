@@ -1,6 +1,6 @@
 [project]
 name = "coa-ontology"
-version = "0.2.3"
+version = "0.3.1"
 description = "Ontology Engine — induction of OWL 2 ontologies from relational schemas and documents"
 requires-python = ">=3.12"
 

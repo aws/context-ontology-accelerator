@@ -3,4 +3,4 @@
 
 """Virtual Knowledge Graph package."""
 
-__version__: str = "0.2.3"
+__version__: str = "0.3.1"
