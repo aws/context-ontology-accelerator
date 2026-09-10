@@ -3,4 +3,4 @@
 
 """Structured Data Ingestion — connectors and scan pipeline for Context Ontology Accelerator."""
 
-__version__ = "0.2.3"
+__version__ = "0.3.1"
