@@ -2,7 +2,7 @@
 # boto3/botocore are excluded (provided by the Lambda runtime).
 structlog>=24.4.0
 python-dateutil>=2.9.0.post0
-pydantic>=2.13.4
+pydantic>=2.13.5
 pydantic-settings>=2.15.0
 python-ulid>=3.2.1
 pg8000>=1.31.5

@@ -292,6 +292,42 @@ describe("SourcesStack", () => {
     const bySid = (sid: string) =>
       allStatements().find((s: any) => s.Sid === sid);
 
+    it("grants nested-catalog Glue access to the discovery and enrichment roles (issue 118)", () => {
+      interface PolicyStmt {
+        Sid?: string;
+        Action: string | string[];
+        Resource: string | string[];
+      }
+      const toArr = (x: string | string[]): string[] => (Array.isArray(x) ? x : [x]);
+      const glue = (suffix: string) => `arn:aws:glue:us-east-1:123456789012:${suffix}`;
+
+      // Both roles' Glue metadata-read statements, targeted by Sid rather than by
+      // filtering on catalog/* (which would pass even if one role lost the grant,
+      // as long as some other role kept it).
+      const discovery: PolicyStmt = bySid("GlueCatalogAccess");
+      const enrichment: PolicyStmt = bySid("EnrichmentGlueCatalogAccess");
+
+      // Federated catalogs (catalogId "account:catalogName") authorize
+      // GetDatabase/GetTables against the nested-catalog resource itself, so the
+      // root `:catalog` alone yields AccessDenied on `catalog/<name>`. Both roles
+      // need GetCatalog(s) AND the full resource set (a refactor dropping any one
+      // resource must fail here, not just a missing catalog/*).
+      for (const stmt of [discovery, enrichment]) {
+        const actions = toArr(stmt.Action);
+        const resources = toArr(stmt.Resource);
+        expect(actions).toEqual(expect.arrayContaining(["glue:GetCatalog", "glue:GetCatalogs"]));
+        expect(resources).toEqual(
+          expect.arrayContaining([
+            glue("catalog"),
+            glue("catalog/*"),
+            glue("database/*"),
+            glue("table/*/*"),
+            glue("connection/*"),
+          ]),
+        );
+      }
+    });
+
     // Discovery role: an in-account customer secret must carry a
     // `{prefix}:namespace` tag (Null:false = key must be present), so a bypassed write path can't
     // read an arbitrary untagged account secret. Still ANDs the account guard.
@@ -1171,6 +1207,29 @@ describe("SourcesStack", () => {
       // The lastScanJobId value (:l) is sourced from $.scanJobSK in the
       // execution input, not a literal.
       expect(definition).toContain("$.scanJobSK");
+    });
+
+    it("carries only the bounded issues fields out of preprocessing, never the full array (issue 104)", () => {
+      const definition = stateMachineDefinition();
+      // The preprocess resultSelector and the DDB write must reference the
+      // bounded fields the handler now returns, not the unbounded issues array
+      // that blew the 256 KB state-payload limit.
+      expect(definition).toContain("issues_preview");
+      expect(definition).toContain("issues_s3_key");
+      expect(definition).toContain("preprocessingIssuesS3Key");
+      expect(definition).toContain("preprocessingIssuesTruncated");
+      // The raw unbounded array must not be persisted whole.
+      expect(definition).not.toContain(
+        "States.JsonToString($.preprocessResult.issues)",
+      );
+      // issues_truncated must persist as a SUBSTITUTED boolean ("BOOL.$"), not a
+      // literal path. booleanFromJsonPath given a raw string emits {"BOOL":"$.x"}
+      // in aws-cdk-lib 2.260.0, which CreateStateMachine rejects; the stringAt()
+      // wrapper makes it "BOOL.$". Normalize escaped quotes before matching since
+      // the definition is a JSON-stringified Fn::Join.
+      const flat = definition.replace(/\\+"/g, '"');
+      expect(flat).toContain('"BOOL.$":"$.preprocessResult.issues_truncated"');
+      expect(flat).not.toMatch(/"BOOL":"\$\./);
     });
   });
 

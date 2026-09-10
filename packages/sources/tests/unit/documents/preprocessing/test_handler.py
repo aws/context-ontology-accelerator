@@ -67,7 +67,7 @@ class TestHandlerValidation:
 
         result = handler({"namespace_id": "../bad", "doc_source_id": "ok"}, None)
         assert result["status"] == "SCAN_FAILED"
-        assert len(result["issues"]) > 0
+        assert len(result["issues_preview"]) > 0
 
     @patch.dict(os.environ, _ENV)
     def test_empty_ids_returns_400(self):
@@ -82,7 +82,7 @@ class TestHandlerValidation:
 
         result = handler({"namespace_id": "ok", "doc_source_id": "bad/id"}, None)
         assert result["status"] == "SCAN_FAILED"
-        assert result["issues"][0]["reason"]
+        assert result["issues_preview"][0]["reason"]
 
 
 # ---------------------------------------------------------------------------
@@ -110,7 +110,9 @@ class TestHandlerResponseShape:
             "files_preprocessed",
             "files_skipped",
             "files_errored",
-            "issues",
+            "issues_preview",
+            "issues_truncated",
+            "issues_s3_key",
             "elapsed_seconds",
         }
         assert expected_keys.issubset(result.keys())
@@ -215,7 +217,7 @@ class TestUploadPrefixNamespaceGuard:
         # Nothing in the other namespace may be listed.
         mock_list.assert_not_called()
         # The offending prefix must not be echoed back to the caller.
-        assert "ns2" not in str(result["issues"])
+        assert "ns2" not in str(result["issues_preview"])
 
     @patch.dict(os.environ, _ENV)
     @patch("coa_sources.documents.preprocessing.handler.list_objects", return_value=[])
@@ -272,7 +274,7 @@ class TestHandlerErrorResponses:
         assert result["status"] == "SCAN_FAILED"
         mock_list.assert_not_called()
         # The reason names the required prefix only, not the caller's role name.
-        assert "evil-role" not in str(result["issues"])
+        assert "evil-role" not in str(result["issues_preview"])
 
     @patch.dict(os.environ, _ENV)
     @patch(
@@ -290,7 +292,7 @@ class TestHandlerErrorResponses:
             None,
         )
         assert result["status"] == "SCAN_FAILED"
-        reason = result["issues"][0]["reason"]
+        reason = result["issues_preview"][0]["reason"]
         assert reason == "Failed to list source files"
         assert "secret-bucket" not in reason
         assert "AccessDenied" not in reason
@@ -407,8 +409,8 @@ class TestEmptyExtractionIsReported:
         assert result["files_errored"] == 0, "empty is skipped, not an error"
         assert mock_upload.call_count == 0, "no 0-byte object may reach staging"
         assert mock_meta.call_count == 0
-        assert len(result["issues"]) == 1
-        issue = result["issues"][0]
+        assert len(result["issues_preview"]) == 1
+        issue = result["issues_preview"][0]
         assert issue["filename"] == "raw/drawing.pdf"
         assert issue["type"] == "skipped"
         assert "No text extracted" in issue["reason"]
@@ -536,7 +538,7 @@ class TestEmptyExtractionIsReported:
 
         assert result["files_preprocessed"] == 1
         assert result["files_skipped"] == 0
-        assert result["issues"] == []
+        assert result["issues_preview"] == []
         assert mock_upload.call_count == 1
         assert mock_upload.call_args[0][2].endswith("reports/notes.txt")
 
@@ -645,3 +647,122 @@ class TestBucketNamespaceAuthorization:
                 None,
             )
         mock_list.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# issue 104 — unbounded issues array must not blow the SFN 256 KB payload limit
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestIssuesPayloadBounding:
+    """A source full of unprocessable objects generates one issue per file. That
+    list is unbounded and used to be returned whole, pushing the Lambda result
+    past the Step Functions 256 KB limit and failing the whole execution. The
+    result must stay bounded: a capped preview inline, a truncated flag, and an
+    S3 pointer to the complete report."""
+
+    @patch.dict(os.environ, _ENV)
+    @patch("coa_sources.documents.preprocessing.handler.list_objects")
+    @patch("coa_sources.documents.preprocessing.handler.get_s3_client")
+    def test_many_issues_are_bounded_and_full_report_persisted(self, mock_client, mock_list):
+        import json as _json
+
+        from coa_sources.documents.preprocessing.handler import _ISSUES_PREVIEW_MAX, handler
+
+        # 500 unsupported objects with long keys — the raw issues list would be
+        # hundreds of KB (each entry carries the full key + a verbose reason).
+        long_key = "raw/" + "d" * 300
+        mock_list.return_value = [{"Key": f"{long_key}/file_{i}.bin", "Size": 10} for i in range(500)]
+
+        result = handler({"namespace_id": "ns1", "doc_source_id": "ds1"}, None)
+
+        # Bounded shape, no raw `issues` array.
+        assert "issues" not in result
+        assert len(result["issues_preview"]) == _ISSUES_PREVIEW_MAX
+        assert result["issues_truncated"] is True
+        assert result["issues_s3_key"].startswith("ns1/scan-results/ds1/")
+        assert result["files_skipped"] == 500
+
+        # The returned payload — what Step Functions size-checks — is well under 256 KB.
+        assert len(_json.dumps(result).encode("utf-8")) < 256 * 1024
+
+        # The complete 500-entry report was persisted to the platform bucket.
+        put_calls = [c for c in mock_client.return_value.put_object.call_args_list]
+        assert len(put_calls) == 1
+        kwargs = put_calls[0].kwargs
+        assert kwargs["Bucket"] == "test-bucket"
+        assert kwargs["Key"] == result["issues_s3_key"]
+        assert len(_json.loads(kwargs["Body"])) == 500
+
+    @patch.dict(os.environ, _ENV)
+    @patch("coa_sources.documents.preprocessing.handler.list_objects")
+    @patch("coa_sources.documents.preprocessing.handler.get_s3_client")
+    def test_few_issues_stay_inline_with_no_s3_write(self, mock_client, mock_list):
+        from coa_sources.documents.preprocessing.handler import handler
+
+        mock_list.return_value = [{"Key": f"raw/file_{i}.bin", "Size": 10} for i in range(3)]
+
+        result = handler({"namespace_id": "ns1", "doc_source_id": "ds1"}, None)
+
+        assert len(result["issues_preview"]) == 3
+        assert result["issues_truncated"] is False
+        assert result["issues_s3_key"] == ""
+        mock_client.return_value.put_object.assert_not_called()
+
+    @patch.dict(os.environ, _ENV)
+    @patch("coa_sources.documents.preprocessing.handler.list_objects")
+    @patch("coa_sources.documents.preprocessing.handler.get_s3_client")
+    def test_s3_persist_failure_is_best_effort_job_still_succeeds(self, mock_client, mock_list):
+        # Best-effort persistence: a put_object failure must NOT fail the job.
+        # The payload stays bounded (preview only), truncated stays True, and the
+        # s3 key is empty so consumers know the full report is unavailable.
+        from botocore.exceptions import ClientError
+        from coa_sources.documents.preprocessing.handler import _ISSUES_PREVIEW_MAX, handler
+
+        mock_client.return_value.put_object.side_effect = ClientError(
+            {"Error": {"Code": "AccessDenied", "Message": "denied"}}, "PutObject"
+        )
+        mock_list.return_value = [{"Key": f"raw/file_{i}.bin", "Size": 10} for i in range(60)]
+
+        result = handler({"namespace_id": "ns1", "doc_source_id": "ds1"}, None)
+
+        # Job did not raise; bounded result returned with no usable S3 pointer.
+        assert result["status"] == "SCAN_FAILED"  # all skipped → no success
+        assert len(result["issues_preview"]) == _ISSUES_PREVIEW_MAX
+        assert result["issues_truncated"] is True
+        assert result["issues_s3_key"] == ""
+        mock_client.return_value.put_object.assert_called_once()
+
+    @patch.dict(os.environ, _ENV)
+    @patch("coa_sources.documents.preprocessing.handler.get_s3_client")
+    def test_preview_is_byte_bounded_even_with_huge_reasons(self, mock_client):
+        # Entry-count cap alone is not enough: an error entry's reason is
+        # str(exc) (unbounded) and filename is the full S3 key. 20 entries with
+        # multi-KB reasons would still cross 256 KB. The preview must cap both
+        # fields; the full text stays in the S3 report.
+        import json as _json
+
+        from coa_sources.documents.preprocessing.handler import (
+            _ISSUES_PREVIEW_MAX,
+            _PREVIEW_FILENAME_MAX,
+            _PREVIEW_REASON_MAX,
+            _bounded_issues,
+        )
+
+        huge = "\u00e9" * 100_000  # 100 KB of non-ASCII (escapes to \uXXXX in JSON)
+        issues = [{"filename": "raw/" + "k" * 2000 + f"_{i}.bin", "type": "error", "reason": huge} for i in range(25)]
+
+        result = _bounded_issues(issues, namespace_id="ns1", doc_source_id="ds1")
+
+        assert len(result["issues_preview"]) == _ISSUES_PREVIEW_MAX
+        for entry in result["issues_preview"]:
+            assert len(entry["filename"]) <= _PREVIEW_FILENAME_MAX
+            assert len(entry["reason"]) <= _PREVIEW_REASON_MAX
+        # The state payload (preview + flags) is provably under the SFN limit.
+        assert len(_json.dumps(result).encode("utf-8")) < 256 * 1024
+        # The full untruncated report still went to S3 with all 25 entries.
+        body = mock_client.return_value.put_object.call_args.kwargs["Body"]
+        full = _json.loads(body)
+        assert len(full) == 25
+        assert len(full[0]["reason"]) == 100_000

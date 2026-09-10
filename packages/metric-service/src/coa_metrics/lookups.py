@@ -187,6 +187,32 @@ class SmusCatalogDataSourceLookup(DataSourceLookup):
         self._names_by_source[data_source_id] = names
         self._names_load_failed[data_source_id] = False
 
+    def _resolve_asset_id(self, data_source_id: str, table_name: str) -> str | None:
+        """Asset id for a table, accepting a bare or ``database.table`` name.
+
+        The index is keyed on the database-qualified name so same-named tables in
+        different databases stay distinct (see ``_qualified_name_from_asset``). An
+        exact match on the given name wins; a bare name resolves only when exactly
+        ONE database has a table by that name. An ambiguous bare name (two
+        databases, same table) returns ``None`` rather than guessing — the caller
+        must qualify it — and is logged so the ambiguity is diagnosable.
+        """
+        names = self._names_by_source.get(data_source_id, {})
+        key = table_name.lower()
+        if key in names:
+            return names[key]
+        candidates = [asset_id for qualified, asset_id in names.items() if qualified.rsplit(".", 1)[-1] == key]
+        if len(candidates) == 1:
+            return candidates[0]
+        if len(candidates) > 1:
+            logger.warning(
+                "smus_ambiguous_table_name",
+                data_source_id=data_source_id,
+                table=table_name,
+                match_count=len(candidates),
+            )
+        return None
+
     def _approved_table(self, data_source_id: str, table_name: str) -> Table | None:
         """The named table's approved metadata, or ``None``.
 
@@ -203,7 +229,7 @@ class SmusCatalogDataSourceLookup(DataSourceLookup):
             return self._table_cache[key]
 
         self._ensure_names_loaded(data_source_id)
-        asset_id = self._names_by_source.get(data_source_id, {}).get(table_name.lower())
+        asset_id = self._resolve_asset_id(data_source_id, table_name)
         if asset_id is None:
             self._table_cache[key] = None
             return None
@@ -348,9 +374,14 @@ class SmusCatalogDataSourceLookup(DataSourceLookup):
             absence is *provable*. Counting unapproved tables makes that guard more
             conservative, which is the safe direction: it can only turn a hard 400
             into the pre-existing soft warning, never the reverse.
+
+            Returns both the database-qualified names (``sales.customers``) and
+            their bare forms (``customers``), so the caller's dual-form membership
+            check matches a ``sourceTable`` declared either way.
         """
         self._ensure_names_loaded(data_source_id)
-        return set(self._names_by_source.get(data_source_id, {}))
+        qualified = set(self._names_by_source.get(data_source_id, {}))
+        return qualified | {name.rsplit(".", 1)[-1] for name in qualified}
 
     def get_table_columns(self, data_source_id: str, table_name: str) -> list[ColumnMetadata] | None:
         """Return the approved column metadata for a table.

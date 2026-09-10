@@ -1,4 +1,4 @@
-boto3>=1.43.80
+boto3>=1.43.86
 structlog>=24.4.0
-pydantic>=2.13.4
+pydantic>=2.13.5
 pydantic-settings>=2.15.0

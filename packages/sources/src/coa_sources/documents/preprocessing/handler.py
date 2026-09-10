@@ -21,14 +21,17 @@ import json
 import logging
 import os
 import time
+import uuid
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
 from typing import Any
 
 import boto3
+from botocore.exceptions import ClientError
 from coa_common import async_boto_config
 from coa_common.constants import (
     DEFAULT_MAX_FILE_SIZE_MB,
+    SAFE_ID_RE,
     SUPPORTED_EXTENSIONS,
     bucket_grants_namespace,
     bucket_namespace_tag_key,
@@ -145,6 +148,84 @@ _BUCKET_NAME = _require_env("BUCKET_NAME")
 _DOC_SOURCES_TABLE = _require_env("DOC_SOURCES_TABLE")
 _ROLE_PREFIX = os.environ.get("CROSS_ACCOUNT_ROLE_PREFIX", "coa")
 
+# Cap on the per-file issue entries carried inline in the Step Functions state
+# payload. The full list is one entry per skipped/errored object and is
+# unbounded, so a heterogeneous source can push the Lambda's returned result
+# past the Step Functions 256 KB limit and fail the whole execution (issue 104).
+_ISSUES_PREVIEW_MAX = 20
+
+# The preview bounds per-entry BYTES too, not just the entry count. An error
+# entry's reason is str(exc) (unbounded) and filename is the full S3 key (up to
+# 1 KB, more once json escapes non-ASCII to \uXXXX), so 20 entries with multi-KB
+# reasons would still cross the 256 KB state limit from the byte axis. Cap both
+# fields; the full untruncated text stays in the S3 report. Worst case with
+# all-non-ASCII escaping is ~(256*6 + 500*6) ≈ 4.5 KB/entry → ~90 KB for 20,
+# provably under the limit.
+_PREVIEW_FILENAME_MAX = 256
+_PREVIEW_REASON_MAX = 500
+
+
+def _bounded_issues(issues: list[dict[str, str]], *, namespace_id: str, doc_source_id: str) -> dict[str, Any]:
+    """Bound the issues list for the Step Functions state payload (issue 104).
+
+    Returns a capped ``issues_preview`` inline, an ``issues_truncated`` flag, and
+    — only when truncated — an ``issues_s3_key`` pointing at the complete report
+    persisted under the platform bucket. Persistence is best-effort: a failure is
+    logged and leaves ``issues_s3_key`` empty, but the payload stays bounded and
+    the job never fails over a diagnostics-write miss. ``issues_s3_key`` is an
+    empty string (never null) when absent, so the state machine's DynamoDB write
+    can treat it as a plain string.
+    """
+    preview = [
+        {
+            "filename": i.get("filename", "")[:_PREVIEW_FILENAME_MAX],
+            "type": i.get("type", ""),
+            "reason": i.get("reason", "")[:_PREVIEW_REASON_MAX],
+        }
+        for i in issues[:_ISSUES_PREVIEW_MAX]
+    ]
+    truncated = len(issues) > _ISSUES_PREVIEW_MAX
+    s3_key = ""
+    # Persist the full report only when truncated AND the identifiers are safe
+    # for an S3 key. The large-list path is only reached after the ids passed
+    # validate_id, but this guard makes id-safety non-negotiable rather than a
+    # caller invariant: an id carrying a path separator (a would-be traversal)
+    # can never reach put_object, whatever future caller passes it.
+    if truncated and SAFE_ID_RE.match(namespace_id) and SAFE_ID_RE.match(doc_source_id):
+        # Millisecond precision + a short random suffix so two scans of one
+        # source in the same second cannot overwrite each other's report. (The
+        # Step Functions execution id would work too if the state machine passed
+        # it into the Lambda payload.)
+        key = (
+            f"{namespace_id}/scan-results/{doc_source_id}/{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}-issues.json"
+        )
+        try:
+            get_s3_client().put_object(
+                Bucket=_BUCKET_NAME,
+                Key=key,
+                Body=json.dumps(issues).encode("utf-8"),
+                ContentType="application/json",
+            )
+            s3_key = key
+        except Exception as exc:
+            # Best-effort: never fail the job over a diagnostics write. Catch
+            # broadly (a ClientError like AccessDenied AND a BotoCoreError like a
+            # connection timeout must both be swallowed), but surface the error
+            # code so operators can tell a retryable throttle from a permanent
+            # permissions/config fault.
+            code = (
+                exc.response.get("Error", {}).get("Code", "Unknown")
+                if isinstance(exc, ClientError)
+                else type(exc).__name__
+            )
+            logger.error("Failed to persist full issues report to s3://%s/%s [%s]: %s", _BUCKET_NAME, key, code, exc)
+    return {
+        "issues_preview": preview,
+        "issues_truncated": truncated,
+        "issues_s3_key": s3_key,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Handler
 # ---------------------------------------------------------------------------
@@ -208,7 +289,11 @@ def handler(event: dict, context: Any) -> dict:
             "files_preprocessed": 0,
             "files_skipped": 0,
             "files_errored": 0,
-            "issues": [{"filename": "", "type": "error", "reason": str(exc)}],
+            **_bounded_issues(
+                [{"filename": "", "type": "error", "reason": str(exc)}],
+                namespace_id=namespace_id,
+                doc_source_id=doc_source_id,
+            ),
             "elapsed_seconds": 0,
         }
 
@@ -281,7 +366,11 @@ def handler(event: dict, context: Any) -> dict:
                 "files_preprocessed": 0,
                 "files_skipped": 0,
                 "files_errored": 0,
-                "issues": [{"filename": "", "type": "error", "reason": "Failed to list source files"}],
+                **_bounded_issues(
+                    [{"filename": "", "type": "error", "reason": "Failed to list source files"}],
+                    namespace_id=namespace_id,
+                    doc_source_id=doc_source_id,
+                ),
                 "elapsed_seconds": round(time.time() - start_ts, 2),
             }
 
@@ -497,6 +586,6 @@ def handler(event: dict, context: Any) -> dict:
         "files_preprocessed": files_preprocessed,
         "files_skipped": files_skipped,
         "files_errored": files_errored,
-        "issues": issues,
+        **_bounded_issues(issues, namespace_id=namespace_id, doc_source_id=doc_source_id),
         "elapsed_seconds": elapsed,
     }

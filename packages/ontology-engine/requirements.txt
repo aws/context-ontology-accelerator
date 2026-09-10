@@ -4,11 +4,11 @@
 fastapi>=0.141.1
 uvicorn>=0.52.4
 httpx>=0.28.1
-boto3>=1.43.80
+boto3>=1.43.86
 rdflib>=7.6.0
 owlready2>=0.51
 pyshacl>=0.40.1
-pydantic>=2.13.4
+pydantic>=2.13.5
 python-multipart>=0.0.32
 pyyaml>=6.0.3
 opensearch-py>=2.8.0

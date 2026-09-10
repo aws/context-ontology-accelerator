@@ -544,6 +544,12 @@ export class SourcesStack extends SCLStack {
           "glue:GetTables",
           "glue:GetPartitions",
           "glue:GetConnection",
+          // Nested/federated Glue catalogs (catalogId "account:catalogName")
+          // authorize GetDatabase/GetTables against the nested-catalog resource
+          // itself, not just its children — without these a federated source
+          // fails discovery with AccessDenied on `catalog/<name>` (issue 118).
+          "glue:GetCatalog",
+          "glue:GetCatalogs",
           // Reads the `coa:namespace` tag by which a database owner declares
           // which namespaces may catalog it — the authorization this role's
           // otherwise account-wide `database/*` read is checked against before
@@ -553,6 +559,11 @@ export class SourcesStack extends SCLStack {
         ],
         resources: [
           `arn:aws:glue:${this.region}:${this.account}:catalog`,
+          // The nested-catalog resource federated reads authorize against.
+          // Account-wide because catalog names arrive per-source at runtime and
+          // are not knowable at synth; mirrors the federation-provisioner and
+          // serve grants. Actions stay read-only.
+          `arn:aws:glue:${this.region}:${this.account}:catalog/*`,
           `arn:aws:glue:${this.region}:${this.account}:database/*`,
           `arn:aws:glue:${this.region}:${this.account}:table/*/*`,
           `arn:aws:glue:${this.region}:${this.account}:connection/*`,
@@ -1232,14 +1243,20 @@ export class SourcesStack extends SCLStack {
     );
     dbEnrichmentTaskDef.taskRole.addToPrincipalPolicy(
       new iam.PolicyStatement({
+        sid: "EnrichmentGlueCatalogAccess",
         actions: [
           "glue:GetTable",
           "glue:GetTables",
           "glue:GetDatabase",
           "glue:GetConnection",
+          // Nested/federated catalogs authorize against the catalog resource
+          // itself — same gap as discovery (issue 118).
+          "glue:GetCatalog",
+          "glue:GetCatalogs",
         ],
         resources: [
           `arn:aws:glue:${this.region}:${this.account}:catalog`,
+          `arn:aws:glue:${this.region}:${this.account}:catalog/*`,
           `arn:aws:glue:${this.region}:${this.account}:database/*`,
           `arn:aws:glue:${this.region}:${this.account}:table/*/*`,
           `arn:aws:glue:${this.region}:${this.account}:connection/*`,
@@ -2077,7 +2094,10 @@ export class SourcesStack extends SCLStack {
         lambdaFunction: preprocessingFn,
         resultPath: "$.preprocessResult",
         // Trim Lambda output to avoid States.DataLimitExceeded (256KB limit).
-        // Only pass the summary fields needed by downstream states.
+        // Only pass the summary fields needed by downstream states. The full
+        // per-file issues list is bounded IN THE LAMBDA (issue 104) — the raw
+        // Lambda payload is size-checked before this selector runs, so the
+        // handler returns a capped preview + an S3 pointer, not the whole array.
         resultSelector: {
           "status.$": "$.Payload.status",
           "files_total.$": "$.Payload.files_total",
@@ -2085,7 +2105,9 @@ export class SourcesStack extends SCLStack {
           "files_skipped.$": "$.Payload.files_skipped",
           "files_errored.$": "$.Payload.files_errored",
           "staging_prefix.$": "$.Payload.staging_prefix",
-          "issues.$": "$.Payload.issues",
+          "issues_preview.$": "$.Payload.issues_preview",
+          "issues_truncated.$": "$.Payload.issues_truncated",
+          "issues_s3_key.$": "$.Payload.issues_s3_key",
         },
         retryOnServiceExceptions: false,
       },
@@ -2229,7 +2251,7 @@ export class SourcesStack extends SCLStack {
           ),
         },
         updateExpression:
-          "SET #s = :s, #ft = :ft, #fp = :fp, #fs = :fs, #fe = :fe, #pi = :pi, #u = :u",
+          "SET #s = :s, #ft = :ft, #fp = :fp, #fs = :fs, #fe = :fe, #pi = :pi, #pik = :pik, #pit = :pit, #u = :u",
         expressionAttributeNames: {
           "#s": "status",
           "#ft": "filesTotal",
@@ -2237,6 +2259,8 @@ export class SourcesStack extends SCLStack {
           "#fs": "filesSkipped",
           "#fe": "filesErrored",
           "#pi": "preprocessingIssues",
+          "#pik": "preprocessingIssuesS3Key",
+          "#pit": "preprocessingIssuesTruncated",
           "#u": "updatedAt",
         },
         expressionAttributeValues: {
@@ -2265,8 +2289,19 @@ export class SourcesStack extends SCLStack {
           ),
           ":pi": tasks.DynamoAttributeValue.fromString(
             sfn.JsonPath.stringAt(
-              "States.JsonToString($.preprocessResult.issues)",
+              "States.JsonToString($.preprocessResult.issues_preview)",
             ),
+          ),
+          ":pik": tasks.DynamoAttributeValue.fromString(
+            sfn.JsonPath.stringAt("$.preprocessResult.issues_s3_key"),
+          ),
+          ":pit": tasks.DynamoAttributeValue.booleanFromJsonPath(
+            // stringAt() is REQUIRED: given a raw "$.x" string this helper emits
+            // {"BOOL": "$.x"} with no ".$", so the path is never substituted and
+            // CreateStateMachine rejects the literal string as a boolean
+            // (aws-cdk-lib 2.260.0). A token value makes the renderer emit
+            // "BOOL.$", substituting the path. Pinned by the synth test below.
+            sfn.JsonPath.stringAt("$.preprocessResult.issues_truncated"),
           ),
           ":u": tasks.DynamoAttributeValue.fromString(
             sfn.JsonPath.stringAt("$$.State.EnteredTime"),
