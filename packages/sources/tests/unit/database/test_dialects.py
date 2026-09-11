@@ -121,6 +121,57 @@ class TestRedshiftDialect:
         assert not pat.match("public")
         assert not pat.match("analytics")
 
+    def test_fetch_columns_recovers_late_binding_view(self):
+        """A late-binding view returns nothing from information_schema.columns and
+        must be recovered via pg_get_late_binding_view_cols(), marked nullable (#134)."""
+
+        def responder(sql, p):
+            if "information_schema.columns" in sql:
+                # Normal table resolves; the late-binding view returns no rows.
+                return [
+                    ("orders", "id", "integer", "NO"),
+                    ("orders", "amount", "numeric", "YES"),
+                ]
+            if "pg_get_late_binding_view_cols" in sql:
+                return [
+                    ("orders__daily", "day", "date"),
+                    ("orders__daily", "total", "numeric(18,2)"),
+                ]
+            return []
+
+        conn = _Conn(responder)
+        rows = RedshiftDialect().fetch_columns(conn, "public", ["orders", "orders__daily"])
+
+        # Normal table unchanged, with real nullability.
+        assert ("orders", "id", "integer", False) in rows
+        assert ("orders", "amount", "numeric", True) in rows
+        # Late-binding view recovered, data types preserved, defaulted nullable.
+        assert ("orders__daily", "day", "date", True) in rows
+        assert ("orders__daily", "total", "numeric(18,2)", True) in rows
+        assert len(rows) == 4
+
+        # The fallback must be scoped to the missing table only.
+        late_calls = [(s, pr) for (s, pr) in conn.cursor_obj.calls if "pg_get_late_binding_view_cols" in s]
+        assert len(late_calls) == 1
+        assert "orders__daily" in late_calls[0][1]
+        assert "orders" not in late_calls[0][1]
+
+    def test_fetch_columns_no_fallback_when_all_covered(self):
+        """The late-binding scan (a full-catalog function) must NOT run when
+        information_schema already answered for every requested table."""
+
+        def responder(sql, p):
+            if "information_schema.columns" in sql:
+                return [("orders", "id", "integer", "NO")]
+            if "pg_get_late_binding_view_cols" in sql:
+                raise AssertionError("late-binding fallback ran despite full information_schema coverage")
+            return []
+
+        conn = _Conn(responder)
+        rows = RedshiftDialect().fetch_columns(conn, "public", ["orders"])
+        assert rows == [("orders", "id", "integer", False)]
+        assert all("pg_get_late_binding_view_cols" not in s for (s, _p) in conn.cursor_obj.calls)
+
 
 @pytest.mark.unit
 class TestInformationSchemaDialect:

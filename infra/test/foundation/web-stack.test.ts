@@ -279,3 +279,112 @@ describe("WebStack runtime-config.json artifact (end-to-end)", () => {
     );
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════
+// WebStack — CSP allowlists the Cognito hosted-UI domain (issue #130)
+// ═══════════════════════════════════════════════════════════════════
+describe("WebStack (CSP hosted-UI origin)", () => {
+  /** The synthesized CSP header value from the Response Headers Policy. */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  function cspOf(template: Template): any {
+    const policy = Object.values(
+      template.findResources("AWS::CloudFront::ResponseHeadersPolicy"),
+    )[0];
+    return policy.Properties.ResponseHeadersPolicyConfig.SecurityHeadersConfig
+      .ContentSecurityPolicy.ContentSecurityPolicy;
+  }
+
+  test("the CSP is an Fn::Join carrying the hosted-UI host, resolved from SSM", () => {
+    // End-to-end for the fix: the prefix arrives as a CFN dynamic reference, so
+    // the header cannot be a plain string — it must be a Join whose literal parts
+    // include the hosted-UI suffix around the resolved prefix. A plain string here
+    // would mean the origin was dropped at synth, which is the bug.
+    const app = new cdk.App({
+      context: { resource_prefix: DEFAULT_RESOURCE_PREFIX, env: "prod" },
+    });
+    const template = Template.fromStack(
+      new WebStack(app, "TestWebCsp", { isCognitoMode: true }),
+    );
+
+    const csp = cspOf(template);
+    expect(typeof csp).not.toBe("string");
+    const literals: string[] = (csp["Fn::Join"][1] as unknown[]).filter(
+      (p): p is string => typeof p === "string",
+    );
+    const joined = literals.join("");
+    expect(joined).toContain(`.auth.`);
+    expect(joined).toContain(`.amazoncognito.com`);
+    // Both directives, not just connect-src: silent renew uses an iframe.
+    expect(joined).toContain("connect-src");
+    expect(joined).toContain("frame-src");
+    // The exact prefix, never a wildcard host.
+    expect(joined).not.toContain("*.auth.");
+  });
+
+  test("reads the hosted-UI prefix from the auth stack's parameter", () => {
+    const app = new cdk.App({
+      context: { resource_prefix: DEFAULT_RESOURCE_PREFIX, env: "prod" },
+    });
+    const template = Template.fromStack(
+      new WebStack(app, "TestWebCspParam", { isCognitoMode: true }),
+    );
+
+    // `valueForStringParameter` renders as a CFN template Parameter of type
+    // AWS::SSM::Parameter::Value<String> whose Default is the path, with the CSP
+    // holding only a Ref to it — so the path is asserted here, not in the header.
+    // A rename on either side fails here rather than at sign-in time.
+    const parameters = template.toJSON().Parameters ?? {};
+    const defaults = Object.values(parameters).map(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (p: any) => p.Default,
+    );
+    expect(defaults).toContain(
+      `/${DEFAULT_RESOURCE_PREFIX}/cognito-domain-prefix`,
+    );
+
+    // And the CSP really does Ref that parameter, rather than inlining a literal.
+    const referenced = Object.entries(parameters)
+      .filter(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        ([, p]: [string, any]) =>
+          p.Default === `/${DEFAULT_RESOURCE_PREFIX}/cognito-domain-prefix`,
+      )
+      .map(([logicalId]) => logicalId);
+    expect(referenced.length).toBe(1);
+    expect(JSON.stringify(cspOf(template))).toContain(referenced[0]);
+  });
+
+  test("direct-OIDC mode neither reads the parameter nor widens the CSP", () => {
+    const app = new cdk.App({
+      context: { resource_prefix: DEFAULT_RESOURCE_PREFIX, env: "prod" },
+    });
+    const template = Template.fromStack(
+      new WebStack(app, "TestWebCspOidc", { isCognitoMode: false }),
+    );
+
+    const csp = JSON.stringify(cspOf(template));
+    expect(csp).not.toContain("cognito-domain-prefix");
+    expect(csp).not.toContain("amazoncognito.com");
+  });
+
+  test("the content_security_policy context key replaces the derived policy", () => {
+    // The override prop existed but reached nothing, so an operator hitting a CSP
+    // gap had to patch CDK source. Wired now — this asserts the wiring, not the
+    // prop's existence.
+    const custom = "default-src 'none'; script-src 'self'";
+    const app = new cdk.App({
+      context: {
+        resource_prefix: DEFAULT_RESOURCE_PREFIX,
+        env: "prod",
+      },
+    });
+    const template = Template.fromStack(
+      new WebStack(app, "TestWebCspOverride", {
+        isCognitoMode: true,
+        contentSecurityPolicy: custom,
+      }),
+    );
+
+    expect(cspOf(template)).toBe(custom);
+  });
+});
