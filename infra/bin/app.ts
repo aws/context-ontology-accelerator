@@ -429,6 +429,11 @@ async function deploy(): Promise<void> {
         ? { autoWebAclParam: cfAutoWebAclParam }
         : {}),
     serveRuntimeArn: serve.queryEndpoint,
+    ...(app.node.tryGetContext("content_security_policy") && {
+      contentSecurityPolicy: String(
+        app.node.tryGetContext("content_security_policy"),
+      ),
+    }),
     ...(customDomain && { customDomain }),
     ...(fs.existsSync(webAppDist) && { websiteContentPath: webAppDist }),
   });
