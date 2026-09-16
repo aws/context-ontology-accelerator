@@ -36,6 +36,7 @@ from typing import Any
 
 from botocore.exceptions import ClientError
 from coa_common import sql_ident as _sql_ident
+from coa_common import sql_qualified_table as _sql_qualified_table
 from coa_common.constants import EVENT_SOURCE_PREFIX, VOCAB_URI
 from coa_control_plane_server.models.proposal_status import ProposalStatus
 from fastapi import APIRouter, HTTPException
@@ -308,14 +309,43 @@ def _tables_to_h2_ddl(tables: list) -> str:
     """Convert CatalogTable list to H2-compatible CREATE TABLE statements.
 
     Table and column names are emitted verbatim as SQL-delimited (double-quoted)
-    identifiers via :func:`sql_ident`. Double-quoting lets H2 accept any source
-    name — spaces, parens, percent signs, hyphens, mixed case, reserved words —
-    so the identifiers exactly match the source datasource (and therefore the
-    R2RML ``rr:tableName`` / ``rr:column`` values that Ontop validates against
-    this schema). No canonicalization or uppercasing is applied.
+    identifiers. Tables are qualified with their source schema (``"schema"."table"``)
+    via :func:`sql_qualified_table` so two same-named tables from different
+    schemas stay distinct — without the qualifier the second ``CREATE TABLE IF
+    NOT EXISTS`` is silently dropped and the discarded table's TriplesMap then
+    references columns that do not exist, so Ontop fails to load the mapping
+    (#149 cause A). The R2RML writer emits the identical qualified ``rr:tableName``
+    so the identifiers match what Ontop validates against this schema. No
+    canonicalization or uppercasing is applied.
     """
     lines = ["-- Auto-generated schema for Ontop H2 validation (from datasource catalog)"]
-    for table in sorted(tables, key=lambda t: t.name):
+
+    # Emit CREATE SCHEMA for every distinct source schema so qualified table
+    # names resolve. H2 requires the schema to exist before a qualified CREATE
+    # TABLE references it.
+    schemas = sorted({t.sourceSchema for t in tables if getattr(t, "sourceSchema", None)})
+    for schema in schemas:
+        lines.append(f"CREATE SCHEMA IF NOT EXISTS {_sql_ident(schema)};")
+
+    # Detect a bare-name collision that qualification resolves — a same-named
+    # table in two schemas. Warn loudly: a silent IF NOT EXISTS drop is exactly
+    # the #149 failure mode, and even with qualification an operator should know
+    # the catalog carries a name clash.
+    seen_bare: dict[str, str | None] = {}
+    for t in tables:
+        schema = getattr(t, "sourceSchema", None)
+        if t.name in seen_bare and seen_bare[t.name] != schema:
+            _log.warning(
+                "H2 DDL: table name %r appears in multiple schemas (%r, %r); "
+                "qualifying with schema to keep them distinct",
+                t.name,
+                seen_bare[t.name],
+                schema,
+            )
+        seen_bare[t.name] = schema
+
+    for table in sorted(tables, key=lambda t: (getattr(t, "sourceSchema", None) or "", t.name)):
+        schema = getattr(table, "sourceSchema", None)
         col_defs = []
         pk_cols = []
         if table.tableConstraints:
@@ -331,7 +361,8 @@ def _tables_to_h2_ddl(tables: list) -> str:
         if pk_cols:
             pk_quoted = ", ".join(_sql_ident(c) for c in pk_cols)
             col_defs.append(f"PRIMARY KEY ({pk_quoted})")
-        lines.append(f"CREATE TABLE IF NOT EXISTS {_sql_ident(table.name)} ({', '.join(col_defs)});")
+        qualified = _sql_qualified_table(table.name, schema)
+        lines.append(f"CREATE TABLE IF NOT EXISTS {qualified} ({', '.join(col_defs)});")
     return "\n".join(lines)
 
 
@@ -743,7 +774,7 @@ def get_proposal(proposal_id: str, namespace: str = "default"):
     place so the client's inline-else-URL fallback still renders their grounding.
     """
     item = dynamo_store.get_proposal_by_id(
-        proposal_id, namespace=namespace, hydrate_turtle=False, hydrate_matches=False
+        proposal_id, namespace=namespace, hydrate_turtle=False, hydrate_matches=False, hydrate_constraints=False
     )
     if not item:
         raise HTTPException(404, f"Proposal '{proposal_id}' not found")
@@ -760,6 +791,14 @@ def get_proposal(proposal_id: str, namespace: str = "default"):
     item["matches_url"] = matches_url
     if matches_url:
         (item.get("metadata") or {}).pop("matches", None)
+    # Serve constraint_config out-of-band the same way. When a presigned URL is
+    # available (modern offloaded proposals), strip the inline copy so the
+    # response cannot carry the (potentially multi-MB) config. Legacy proposals
+    # without an S3 artifact keep their inline value (constraints_url is None).
+    constraints_url = dynamo_store.presign_proposal_constraints(namespace, proposal_id)
+    item["constraints_url"] = constraints_url
+    if constraints_url:
+        (item.get("metadata") or {}).pop("constraint_config", None)
     return item
 
 

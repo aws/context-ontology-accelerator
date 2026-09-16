@@ -178,13 +178,25 @@ def search_entities(
 
 
 @router.get("/ontology-overview", response_model=_OntologyOverview, response_model_by_alias=True)
-def get_ontology_overview(ontology_id: str, namespace: str = "default", sample: bool = False):
+def get_ontology_overview(
+    ontology_id: str,
+    namespace: str = "default",
+    sample: bool = False,
+    limit: int | None = None,
+    offset: int = 0,
+):
     """Enumerate the classes + properties persisted in one ontology's graph.
 
     Reads directly from the graph store (not the Dynamo registry), so the
     result reflects the triples that actually landed in the knowledge
     graph for ``ontology_id``. Returns the ontology's classes, object
     properties (relationships between classes), and datatype properties.
+
+    ``limit``/``offset`` page each of the three collections independently, and
+    the response carries the un-paged totals (``total_classes`` etc.) so a
+    client shows the true count while rendering one page. This bounds the
+    response: a wide ontology (thousands of classes/properties) would otherwise
+    exceed the API Gateway / Lambda response limit and 502 the call (#143).
 
     Set ``sample=true`` for a bounded taxonomy seed (a few largest-subtree
     root classes + a capped set of their descendants, no properties) instead
@@ -208,15 +220,28 @@ def get_ontology_overview(ontology_id: str, namespace: str = "default", sample: 
         raise HTTPException(500, f"Internal error querying ontology graph: {type(e).__name__}") from e
     if overview is None:
         raise HTTPException(501, "Ontology overview is not supported on this backend.")
+
+    all_classes = overview.get("classes", [])
+    all_object_properties = overview.get("object_properties", [])
+    all_datatype_properties = overview.get("datatype_properties", [])
+
+    def _page(items: list) -> list:
+        start = max(offset, 0)
+        return items[start : start + limit] if limit is not None else items[start:]
+
     # Construct the generated model. The store returns dicts with snake_case
-    # keys; the generated model accepts them via populate_by_name=True.
+    # keys; the generated model accepts them via populate_by_name=True. Each
+    # collection is paged independently; totals reflect the full (un-paged) set.
     return _OntologyOverview(
         ontology_id=overview["ontology_id"],
         namespace=namespace,
         graph_uri=overview.get("graph_uri"),
-        classes=[_OntologyClassSummary(**c) for c in overview.get("classes", [])],
-        object_properties=[_OntologyPropertySummary(**p) for p in overview.get("object_properties", [])],
-        datatype_properties=[_OntologyPropertySummary(**p) for p in overview.get("datatype_properties", [])],
+        classes=[_OntologyClassSummary(**c) for c in _page(all_classes)],
+        object_properties=[_OntologyPropertySummary(**p) for p in _page(all_object_properties)],
+        datatype_properties=[_OntologyPropertySummary(**p) for p in _page(all_datatype_properties)],
+        total_classes=len(all_classes),
+        total_object_properties=len(all_object_properties),
+        total_datatype_properties=len(all_datatype_properties),
     )
 
 

@@ -35,50 +35,66 @@ class TestReformulateProbe:
     def test_true_when_reformulate_returns_sql(self):
         raw = "ans1(s)\nCONSTRUCT [...]\nSELECT t0.id FROM claims t0"
         with patch.object(ts.urllib.request, "urlopen", return_value=_resp(raw)):
-            assert ts._reformulate_probe() is True
+            ok, reason = ts._reformulate_probe()
+            assert ok is True
+            assert reason is None
 
     def test_true_when_reformulate_returns_with_cte(self):
         with patch.object(ts.urllib.request, "urlopen", return_value=_resp("WITH x AS (SELECT 1) SELECT * FROM x")):
-            assert ts._reformulate_probe() is True
+            ok, reason = ts._reformulate_probe()
+            assert ok is True
+            assert reason is None
 
-    def test_false_when_reformulate_returns_non_sql(self):
+    def test_false_with_reason_when_reformulate_returns_non_sql(self):
         # Ontop can return an error/empty body even while the process is up.
         with patch.object(ts.urllib.request, "urlopen", return_value=_resp("ERROR: no mapping for predicate")):
-            assert ts._reformulate_probe() is False
+            ok, reason = ts._reformulate_probe()
+            assert ok is False
+            assert reason and "reformulate" in reason.lower()
 
-    def test_false_when_reformulate_raises(self):
+    def test_false_with_reason_when_reformulate_raises(self):
         with patch.object(ts.urllib.request, "urlopen", side_effect=OSError("connection refused")):
-            assert ts._reformulate_probe() is False
+            ok, reason = ts._reformulate_probe()
+            assert ok is False
+            assert reason and "probe failed" in reason.lower()
 
 
 class TestProbeHealth:
     def test_healthy_when_up_and_reformulate_succeeds(self):
         with (
             patch.object(ts.urllib.request, "urlopen", return_value=_resp('{"status": "UP"}')),
-            patch.object(ts, "_reformulate_probe", return_value=True),
+            patch.object(ts, "_reformulate_probe", return_value=(True, None)),
         ):
-            assert ts._probe_health() is True
+            ok, reason = ts._probe_health()
+            assert ok is True
+            assert reason is None
 
-    def test_unhealthy_when_actuator_up_but_reformulate_fails(self):
+    def test_unhealthy_with_reason_when_actuator_up_but_reformulate_fails(self):
         # The core case: process UP under --lazy but mappings not loaded,
         # so translation fails. Must report unhealthy despite actuator UP.
         with (
             patch.object(ts.urllib.request, "urlopen", return_value=_resp('{"status": "UP"}')),
-            patch.object(ts, "_reformulate_probe", return_value=False),
+            patch.object(ts, "_reformulate_probe", return_value=(False, "mappings did not reformulate")),
         ):
-            assert ts._probe_health() is False
+            ok, reason = ts._probe_health()
+            assert ok is False
+            assert reason == "mappings did not reformulate"
 
-    def test_unhealthy_when_actuator_down(self):
+    def test_unhealthy_with_reason_when_actuator_down(self):
         with (
             patch.object(ts.urllib.request, "urlopen", return_value=_resp('{"status": "DOWN"}')),
-            patch.object(ts, "_reformulate_probe", return_value=True) as probe,
+            patch.object(ts, "_reformulate_probe", return_value=(True, None)) as probe,
         ):
-            assert ts._probe_health() is False
+            ok, reason = ts._probe_health()
+            assert ok is False
+            assert reason and "DOWN" in reason
             probe.assert_not_called()  # actuator down short-circuits before the probe
 
-    def test_unhealthy_when_actuator_unreachable(self):
+    def test_unhealthy_with_reason_when_actuator_unreachable(self):
         with patch.object(ts.urllib.request, "urlopen", side_effect=OSError("refused")):
-            assert ts._probe_health() is False
+            ok, reason = ts._probe_health()
+            assert ok is False
+            assert reason and "unreachable" in reason.lower()
 
 
 class TestHealthReader:

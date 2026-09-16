@@ -1,11 +1,12 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import {
   proposalScope,
   proposalScopeSortKey,
   proposalSourceTypeLabel,
+  resolveConstraintConfig,
 } from "./helpers";
 
 describe("proposalSourceTypeLabel", () => {
@@ -86,5 +87,62 @@ describe("proposalScopeSortKey", () => {
     expect(proposalScopeSortKey({ tables_processed: -5 }, "STRUCTURED")).toBe(
       -1,
     );
+  });
+});
+
+describe("resolveConstraintConfig — the constraints out-of-band read path", () => {
+  const CONFIG = { classes: [{ class_uri: "http://ex.org#A" }] };
+
+  it("fetches from constraints_url when the response carries no inline copy", async () => {
+    // The regression this guards: GET /proposals/{id} strips
+    // metadata.constraint_config whenever an S3 artifact exists, and constraints
+    // are offloaded for EVERY proposal that has them. Without this fetch the
+    // editor silently shows no constraints and the Infer merge dedups against an
+    // empty set, duplicating classes and dropping prior edits.
+    const fetchJson = vi.fn().mockResolvedValue(CONFIG);
+
+    await expect(
+      resolveConstraintConfig(
+        {
+          metadata: { has_constraint_config: true },
+          constraints_url: "s3://x",
+        },
+        fetchJson,
+      ),
+    ).resolves.toEqual(CONFIG);
+    expect(fetchJson).toHaveBeenCalledWith("s3://x");
+  });
+
+  it("prefers an inline copy and skips the fetch (legacy proposals)", async () => {
+    const fetchJson = vi.fn();
+
+    await expect(
+      resolveConstraintConfig(
+        { metadata: { constraint_config: CONFIG }, constraints_url: null },
+        fetchJson,
+      ),
+    ).resolves.toEqual(CONFIG);
+    expect(fetchJson).not.toHaveBeenCalled();
+  });
+
+  it("returns undefined when the proposal has neither copy", async () => {
+    const fetchJson = vi.fn();
+
+    await expect(
+      resolveConstraintConfig({}, fetchJson),
+    ).resolves.toBeUndefined();
+    expect(fetchJson).not.toHaveBeenCalled();
+  });
+
+  it("degrades to undefined on a failed fetch rather than rejecting", async () => {
+    // It is awaited alongside the ontology Turtle, so a rejection would blank
+    // the whole detail page over secondary review content.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const fetchJson = vi.fn().mockRejectedValue(new Error("403 expired"));
+
+    await expect(
+      resolveConstraintConfig({ constraints_url: "s3://x" }, fetchJson),
+    ).resolves.toBeUndefined();
+    warn.mockRestore();
   });
 });

@@ -15,6 +15,7 @@ import { useCallback, useEffect, useReducer, useRef } from "react";
 import type {
   ChatMessage,
   ExecutionMode,
+  QueryStrategy,
   StreamingEvent,
 } from "@app-types/playground";
 import { usePlaygroundStream } from "./use-playground-stream";
@@ -22,6 +23,30 @@ import { INITIAL_STATE, playgroundReducer } from "./playground-reducer";
 import type { PlaygroundState } from "./playground-reducer";
 import { useSessions } from "./use-sessions";
 import { useTokenBuffer } from "./use-token-buffer";
+
+/**
+ * Build the request's `options` object, omitting it entirely when nothing is set.
+ *
+ * Written as one helper rather than two conditional spreads because
+ * `...(mode && { options: { mode } })` followed by the same for `strategy` would
+ * have the second overwrite the first — both assign the whole `options` key.
+ * Omitting the object when empty keeps the request identical to before for a
+ * caller that sets neither.
+ *
+ * Exported for test: a silent regression here would drop `mode` as well as
+ * `strategy`, and the Playground page test mocks this whole hook, so there is no
+ * other coverage of the request shape.
+ */
+export function buildOptions(
+  mode?: ExecutionMode,
+  strategy?: QueryStrategy,
+): { options?: { mode?: ExecutionMode; strategy?: QueryStrategy } } {
+  const options = {
+    ...(mode && { mode }),
+    ...(strategy && { strategy }),
+  };
+  return Object.keys(options).length > 0 ? { options } : {};
+}
 
 export interface UsePlaygroundChatSSEOptions {
   queryEndpoint: string | undefined;
@@ -37,8 +62,16 @@ export interface UsePlaygroundChatSSEReturn {
   restoreTimedOut: boolean;
   dismissRestoreWarning: () => void;
   isStreaming: boolean;
-  sendQuery: (query: string, mode?: ExecutionMode) => void;
-  retryQuery: (message: ChatMessage, mode?: ExecutionMode) => void;
+  sendQuery: (
+    query: string,
+    mode?: ExecutionMode,
+    strategy?: QueryStrategy,
+  ) => void;
+  retryQuery: (
+    message: ChatMessage,
+    mode?: ExecutionMode,
+    strategy?: QueryStrategy,
+  ) => void;
   newChat: () => void;
   hasMoreHistory: boolean;
   isLoadingOlderHistory: boolean;
@@ -173,7 +206,7 @@ export function usePlaygroundChatSSE({
   // ── Public API ──
 
   const sendQuery = useCallback(
-    (query: string, mode?: ExecutionMode) => {
+    (query: string, mode?: ExecutionMode, strategy?: QueryStrategy) => {
       if (!namespaceId || isStreaming || sessions.isRestoring) return;
 
       const requestId = crypto.randomUUID();
@@ -186,14 +219,14 @@ export function usePlaygroundChatSSE({
         namespace: namespaceId,
         requestId,
         sessionId: sessions.getSessionId() ?? undefined,
-        ...(mode && { options: { mode } }),
+        ...buildOptions(mode, strategy),
       });
     },
     [namespaceId, submit, sessions, isStreaming],
   );
 
   const retryQuery = useCallback(
-    (message: ChatMessage, mode?: ExecutionMode) => {
+    (message: ChatMessage, mode?: ExecutionMode, strategy?: QueryStrategy) => {
       if (!namespaceId || message.role !== "assistant") return;
       if (message.isLoading || isStreaming) return;
       if (!message.replyToId) return;
@@ -211,7 +244,7 @@ export function usePlaygroundChatSSE({
         namespace: namespaceId,
         requestId,
         sessionId: sessions.getSessionId() ?? undefined,
-        ...(mode && { options: { mode } }),
+        ...buildOptions(mode, strategy),
       });
     },
     [namespaceId, submit, sessions, isStreaming],

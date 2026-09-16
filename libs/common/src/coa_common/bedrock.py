@@ -231,6 +231,10 @@ class BedrockClient:
             intervened = stop_reason in ("guardrail_intervened", "guardrail")
             guardrail_trace = response.get("trace", {}).get("guardrail", {}) if intervened else {}
             blocked = self._check_guardrail_blocked(guardrail_trace) if intervened else False
+            # Flattened per-category assessment (empty when no guardrail/trace). Kept
+            # in a local so a BLOCK can name the category that actually fired instead
+            # of collapsing to an un-diagnosable "CONTENT" filter_type.
+            assessments = assessments_from_trace(guardrail_trace)
 
             # Emit the decision only when a guardrail was actually applied —
             # counting unguarded invocations as ALLOW would make the block rate
@@ -240,7 +244,7 @@ class BedrockClient:
                     component=self._component,
                     blocked=blocked,
                     latency_ms=latency_ms,
-                    filter_type=filter_type_from_assessments(assessments_from_trace(guardrail_trace)),
+                    filter_type=filter_type_from_assessments(assessments),
                     # Both consumers are ECS tasks that publish metrics via PutMetricData.
                     transport="put",
                     region=self._region,
@@ -248,9 +252,11 @@ class BedrockClient:
 
             if blocked:
                 logger.warning(
-                    "Guardrail blocked response: model=%s guardrail=%s",
+                    "Guardrail blocked response: model=%s guardrail=%s filter_type=%s assessments=%s",
                     self._model_id,
                     self._guardrail_id,
+                    filter_type_from_assessments(assessments),
+                    assessments,
                 )
                 raise GuardrailBlockedError(f"Guardrail {self._guardrail_id} blocked the response")
 

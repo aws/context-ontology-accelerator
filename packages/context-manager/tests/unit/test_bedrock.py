@@ -627,6 +627,38 @@ class TestBedrockConverseStream:
             await client.converse("test")
         assert mock_client.converse.call_count == 1
 
+    async def test_retry_loop_reraises_when_params_exhausted_no_fourth_call(self):
+        """Bot finding (HIGH): the loop must not fall through to a silent 4th call.
+
+        If every iteration raises a ValidationException that names a sampling
+        param that has ALREADY been stripped (so nothing more can be shed), the
+        underlying ClientError must propagate — the call must NOT be retried a
+        4th time past the ``for _ in range(3)`` budget.
+        """
+        from botocore.exceptions import ClientError
+        from coa_serve.clients import bedrock as bedrock_mod
+        from coa_serve.clients.bedrock import BedrockLLMClient
+
+        bedrock_mod._MODELS_REJECTING_TEMPERATURE.discard("stuck-model")
+        bedrock_mod._MODELS_REJECTING_TOP_P.discard("stuck-model")
+        # Names "temperature" every time, but after the first strip temperature is
+        # gone from inferenceConfig, so the guard `"temperature" in inference` is
+        # False and the handler re-raises rather than looping to a 4th call.
+        err = ClientError(
+            {"Error": {"Code": "ValidationException", "Message": "temperature is not supported"}},
+            "Converse",
+        )
+        mock_client = MagicMock()
+        mock_client.converse.side_effect = [err, err, err, err]
+
+        client = BedrockLLMClient(model_id="stuck-model", region="us-east-1")
+        client._client = mock_client
+
+        with pytest.raises(ClientError):
+            await client.converse("test", temperature=0.5)
+        # 1 initial + 1 retry after stripping temperature, then re-raise. NOT 4.
+        assert mock_client.converse.call_count == 2
+
     async def test_temperature_rejection_is_remembered_per_model(self):
         """The doomed first call is paid ONCE per model, not on every call.
 
@@ -1663,3 +1695,160 @@ class TestStreamGuardrailOutcome:
                 received.append(chunk)
 
         assert "".join(received) == "leaked prefix"
+
+
+@pytest.mark.unit
+class TestConverseTopPAndTemperatureObservability:
+    """Step 0 (fashion-findings B1): a top_p determinism knob that survives a
+    temperature drop, plus an observable signal when temperature is dropped so
+    the drop stops being invisible."""
+
+    def _mock_client(self):
+        mc = MagicMock()
+        mc.converse.return_value = {"output": {"message": {"content": [{"text": "ok"}]}}}
+        return mc
+
+    async def test_top_p_threaded_into_inference_config(self):
+        from coa_serve.clients.bedrock import BedrockLLMClient
+
+        mc = self._mock_client()
+        client = BedrockLLMClient(model_id="test-model", region="us-east-1")
+        client._client = mc
+        await client.converse("test", temperature=0, top_p=0)
+
+        cfg = mc.converse.call_args[1]["inferenceConfig"]
+        assert cfg["topP"] == 0
+        assert cfg["temperature"] == 0
+
+    async def test_top_p_omitted_when_none(self):
+        from coa_serve.clients.bedrock import BedrockLLMClient
+
+        mc = self._mock_client()
+        client = BedrockLLMClient(model_id="test-model", region="us-east-1")
+        client._client = mc
+        await client.converse("test")  # neither set
+
+        cfg = mc.converse.call_args[1]["inferenceConfig"]
+        assert "topP" not in cfg
+
+    async def test_top_p_survives_temperature_drop(self):
+        """On a temperature-rejecting model, temperature is popped but top_p
+        remains — so a determinism-sensitive caller keeps a sampling constraint."""
+        from botocore.exceptions import ClientError
+        from coa_serve.clients import bedrock as bedrock_mod
+        from coa_serve.clients.bedrock import BedrockLLMClient
+
+        bedrock_mod._MODELS_REJECTING_TEMPERATURE.discard("drop-temp-model")
+        mc = MagicMock()
+        err = {"Error": {"Code": "ValidationException", "Message": "temperature is not supported"}}
+        mc.converse.side_effect = [
+            ClientError(err, "Converse"),
+            {"output": {"message": {"content": [{"text": "ok"}]}}},
+        ]
+        client = BedrockLLMClient(model_id="drop-temp-model", region="us-east-1")
+        client._client = mc
+        result = await client.converse("test", temperature=0, top_p=0)
+
+        assert result.text == "ok"
+        retry_cfg = mc.converse.call_args_list[1][1]["inferenceConfig"]
+        assert "temperature" not in retry_cfg  # dropped
+        assert retry_cfg["topP"] == 0  # but top_p survives
+
+    async def test_temperature_drop_is_logged_on_learned_path(self):
+        """Once a model is known to reject temperature, every subsequent call
+        drops it on the pre-learned path — and that drop must be observable
+        (emits temperature_dropped_for_model at WARNING), not silent."""
+        from coa_serve.clients import bedrock as bedrock_mod
+        from coa_serve.clients.bedrock import BedrockLLMClient
+
+        bedrock_mod._MODELS_REJECTING_TEMPERATURE.add("learned-model")
+        try:
+            mc = self._mock_client()
+            client = BedrockLLMClient(model_id="learned-model", region="us-east-1")
+            client._client = mc
+            with patch.object(bedrock_mod.logger, "warning") as mock_log:
+                await client.converse("test", temperature=0, top_p=0)
+            events = [c.args[0] for c in mock_log.call_args_list if c.args]
+            assert "temperature_dropped_for_model" in events
+            # temperature was actually dropped; top_p preserved
+            cfg = mc.converse.call_args[1]["inferenceConfig"]
+            assert "temperature" not in cfg
+            assert cfg["topP"] == 0
+        finally:
+            bedrock_mod._MODELS_REJECTING_TEMPERATURE.discard("learned-model")
+
+    async def test_top_p_dropped_on_top_p_validation_exception(self):
+        """REGRESSION (live-found): claude-sonnet-5 deprecated top_p as well as
+        temperature. Sending topP=0 for determinism throws ValidationException
+        ('`top_p` is deprecated for this model'); the fallback must drop topP and
+        retry, or the whole NL->SPARQL path fails closed on that model."""
+        from botocore.exceptions import ClientError
+        from coa_serve.clients import bedrock as bedrock_mod
+        from coa_serve.clients.bedrock import BedrockLLMClient
+
+        bedrock_mod._MODELS_REJECTING_TOP_P.discard("drop-topp-model")
+        mc = MagicMock()
+        err = {"Error": {"Code": "ValidationException", "Message": "`top_p` is deprecated for this model."}}
+        mc.converse.side_effect = [
+            ClientError(err, "Converse"),
+            {"output": {"message": {"content": [{"text": "ok"}]}}},
+        ]
+        client = BedrockLLMClient(model_id="drop-topp-model", region="us-east-1")
+        client._client = mc
+        result = await client.converse("test", top_p=0)
+
+        assert result.text == "ok"
+        retry_cfg = mc.converse.call_args_list[1][1]["inferenceConfig"]
+        assert "topP" not in retry_cfg  # dropped on retry
+        assert "drop-topp-model" in bedrock_mod._MODELS_REJECTING_TOP_P  # learned
+        bedrock_mod._MODELS_REJECTING_TOP_P.discard("drop-topp-model")
+
+    async def test_both_temperature_and_top_p_dropped_same_call(self):
+        """A model that rejects BOTH params must shed both within one call: first
+        ValidationException names temperature, second names top_p, third succeeds."""
+        from botocore.exceptions import ClientError
+        from coa_serve.clients import bedrock as bedrock_mod
+        from coa_serve.clients.bedrock import BedrockLLMClient
+
+        bedrock_mod._MODELS_REJECTING_TEMPERATURE.discard("drop-both-model")
+        bedrock_mod._MODELS_REJECTING_TOP_P.discard("drop-both-model")
+        mc = MagicMock()
+        terr = {"Error": {"Code": "ValidationException", "Message": "`temperature` is deprecated for this model"}}
+        perr = {"Error": {"Code": "ValidationException", "Message": "`top_p` is deprecated for this model."}}
+        mc.converse.side_effect = [
+            ClientError(terr, "Converse"),
+            ClientError(perr, "Converse"),
+            {"output": {"message": {"content": [{"text": "ok"}]}}},
+        ]
+        client = BedrockLLMClient(model_id="drop-both-model", region="us-east-1")
+        client._client = mc
+        result = await client.converse("test", temperature=0, top_p=0)
+
+        assert result.text == "ok"
+        assert mc.converse.call_count == 3
+        final_cfg = mc.converse.call_args_list[2][1]["inferenceConfig"]
+        assert "temperature" not in final_cfg
+        assert "topP" not in final_cfg
+        bedrock_mod._MODELS_REJECTING_TEMPERATURE.discard("drop-both-model")
+        bedrock_mod._MODELS_REJECTING_TOP_P.discard("drop-both-model")
+
+    async def test_top_p_dropped_on_learned_path(self):
+        """Once top_p rejection is learned, subsequent calls pre-strip topP up
+        front (no doomed request) and emit top_p_dropped_for_model at WARNING."""
+        from coa_serve.clients import bedrock as bedrock_mod
+        from coa_serve.clients.bedrock import BedrockLLMClient
+
+        bedrock_mod._MODELS_REJECTING_TOP_P.add("learned-topp-model")
+        try:
+            mc = self._mock_client()
+            client = BedrockLLMClient(model_id="learned-topp-model", region="us-east-1")
+            client._client = mc
+            with patch.object(bedrock_mod.logger, "warning") as mock_log:
+                await client.converse("test", top_p=0)
+            events = [c.args[0] for c in mock_log.call_args_list if c.args]
+            assert "top_p_dropped_for_model" in events
+            assert mc.converse.call_count == 1  # no doomed first request
+            cfg = mc.converse.call_args[1]["inferenceConfig"]
+            assert "topP" not in cfg
+        finally:
+            bedrock_mod._MODELS_REJECTING_TOP_P.discard("learned-topp-model")

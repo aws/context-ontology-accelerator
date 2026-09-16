@@ -23,7 +23,11 @@ export function sourceStatusType(
       return "in-progress";
     case "REGISTERED":
       return "pending";
+    // A re-scan review is the same kind of state as a first-scan review: the
+    // source is waiting on a steward, so it gets the same treatment rather than
+    // falling through to the neutral default.
     case "PENDING_REVIEW":
+    case "RESCAN_REVIEW":
       return "warning";
     case "DELETED":
     case "REJECTED":
@@ -41,6 +45,8 @@ export function sourceStatusLabel(status: string | undefined): string {
       return "Completed";
     case "PENDING_REVIEW":
       return "Pending review";
+    case "RESCAN_REVIEW":
+      return "Re-scan review";
     case "REGISTERED":
       return "Registered";
     case "SCANNING":

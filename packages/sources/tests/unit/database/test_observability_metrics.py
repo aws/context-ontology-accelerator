@@ -25,6 +25,14 @@ from botocore.exceptions import ClientError
 
 os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
 os.environ.setdefault("AWS_REGION", "us-east-1")
+# discovery_handler reads these three at import time with no default, and the
+# tests below import it inside the test body. Set them here so this module is
+# self-sufficient: relying on another test module to have set them first makes
+# the file pass only when something else is collected alongside it, and fail on
+# a narrower selection. setdefault so a value another module already set wins.
+os.environ.setdefault("SOURCES_TABLE", "test-sources")
+os.environ.setdefault("SOURCE_SCAN_JOBS_TABLE", "test-scan-jobs")
+os.environ.setdefault("SMUS_DOMAIN_ID", "test-domain-id")
 
 
 def _emitted(mock_emit, name: str) -> list[dict]:
@@ -368,6 +376,7 @@ class TestBulkReviewAcceptanceMetrics:
                 project_id="proj-123",
                 sources_table="test-sources",
                 region="us-east-1",
+                scan_jobs_table="test-scan-jobs",
             )
         return mock_emit
 

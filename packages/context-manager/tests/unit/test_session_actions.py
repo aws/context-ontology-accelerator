@@ -501,7 +501,7 @@ class TestStreamingSessionPersistence:
         mock_init.return_value = None
 
         # Orchestrator
-        async def mock_resolve(request, trace=None, on_token=None, conversation_history=None):
+        async def mock_resolve(request, trace=None, on_token=None, conversation_history=None, deadline=None):
             if trace:
                 trace.record(step="t2.sql", status="done", duration_ms=50)
             return InvokeResponse(
@@ -555,7 +555,7 @@ class TestStreamingSessionPersistence:
 
         mock_init.return_value = None
 
-        async def mock_resolve(request, trace=None, on_token=None, conversation_history=None):
+        async def mock_resolve(request, trace=None, on_token=None, conversation_history=None, deadline=None):
             if trace:
                 trace.record(step="t2.sql", status="done", duration_ms=30)
             return InvokeResponse(
@@ -615,7 +615,7 @@ class TestStreamingSessionPersistence:
 
         mock_init.return_value = None
 
-        async def mock_resolve(request, trace=None, on_token=None, conversation_history=None):
+        async def mock_resolve(request, trace=None, on_token=None, conversation_history=None, deadline=None):
             if trace:
                 trace.record(step="t2.sql", status="done", duration_ms=20)
             return InvokeResponse(

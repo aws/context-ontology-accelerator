@@ -145,6 +145,83 @@ describe("VkgStack", () => {
     });
   });
 
+  test("container sets Ontop heap via ONTOP_JAVA_ARGS, not the dead JAVA_OPTS (#149 cause C)", () => {
+    // The Ontop launcher reads ONTOP_JAVA_ARGS; setting JAVA_OPTS was a silent
+    // no-op that left the heap unbounded (#149 cause C). Assert the correct var
+    // is present so CDK can never regress to JAVA_OPTS.
+    template.hasResourceProperties("AWS::ECS::TaskDefinition", {
+      ContainerDefinitions: Match.arrayWith([
+        Match.objectLike({
+          Environment: Match.arrayWith([
+            Match.objectLike({ Name: "ONTOP_JAVA_ARGS", Value: "-Xmx1536m -Xms512m" }),
+          ]),
+        }),
+      ]),
+    });
+    // Guard: JAVA_OPTS must NOT appear in any container environment.
+    const taskDefs = template.findResources("AWS::ECS::TaskDefinition");
+    for (const td of Object.values(taskDefs)) {
+      for (const container of td.Properties.ContainerDefinitions ?? []) {
+        for (const envVar of container.Environment ?? []) {
+          expect(envVar.Name).not.toBe("JAVA_OPTS");
+        }
+      }
+    }
+  });
+
+  test("reload Lambda carries the task-sizing env as the single source of truth (#149 cause B)", () => {
+    // The reload Lambda re-registers the per-namespace task def from these env
+    // vars, so they must match the CDK-provisioned service. Without them a
+    // reload would silently under-provision (#149 cause B).
+    template.hasResourceProperties("AWS::Lambda::Function", {
+      Environment: {
+        Variables: Match.objectLike({
+          VKG_TASK_CPU: Match.anyValue(),
+          VKG_TASK_MEMORY: Match.anyValue(),
+          VKG_ONTOP_JAVA_ARGS: "-Xmx1536m -Xms512m",
+        }),
+      },
+    });
+  });
+
+  test("Ontop heap scales with memoryLimitMiB when ontopJavaArgs is not overridden", () => {
+    // With a larger task memory and no explicit ontopJavaArgs, the heap derives
+    // from memory (max ~=75%, initial ~=25%) so raising memory alone scales the
+    // heap in step — 8192 -> -Xmx6144m -Xms2048m. Both the container and the
+    // reload Lambda must carry the derived value so they stay in lockstep.
+    const app = new cdk.App({ context: TEST_CONTEXT });
+    const network = new NetworkStack(app, "ScaleNetwork");
+    const bucketStack = new cdk.Stack(app, "ScaleBucketStack");
+    const bucket = new s3.Bucket(bucketStack, "OntologyBucket", {
+      bucketName: `${PREFIX}-ontology-artifacts`,
+    });
+    const scaled = Template.fromStack(
+      new VkgStack(app, "ScaleVkg", {
+        network,
+        serviceNamespace: network.serviceNamespace,
+        ontologyBucket: bucket,
+        memoryLimitMiB: 8192,
+      }),
+    );
+    scaled.hasResourceProperties("AWS::ECS::TaskDefinition", {
+      ContainerDefinitions: Match.arrayWith([
+        Match.objectLike({
+          Environment: Match.arrayWith([
+            Match.objectLike({ Name: "ONTOP_JAVA_ARGS", Value: "-Xmx6144m -Xms2048m" }),
+          ]),
+        }),
+      ]),
+    });
+    scaled.hasResourceProperties("AWS::Lambda::Function", {
+      Environment: {
+        Variables: Match.objectLike({
+          VKG_TASK_MEMORY: "8192",
+          VKG_ONTOP_JAVA_ARGS: "-Xmx6144m -Xms2048m",
+        }),
+      },
+    });
+  });
+
   test("container has CloudWatch logging configured", () => {
     template.hasResourceProperties("AWS::ECS::TaskDefinition", {
       ContainerDefinitions: Match.arrayWith([

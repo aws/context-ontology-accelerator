@@ -20,13 +20,16 @@ import asyncio
 import os
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import structlog
 
 from ..exceptions import AccessDeniedError
 from ..step_ids import StepId
 from ..trace import TraceCollector
+
+if TYPE_CHECKING:
+    from ..deadline import Deadline
 
 logger = structlog.get_logger(__name__)
 
@@ -107,6 +110,10 @@ class StrategyContext:
     options: dict[str, Any] = field(default_factory=dict)
     trace: TraceCollector = field(default_factory=TraceCollector)
     model_id: str | None = None
+    # Request-scoped time budget. None means "no deadline threaded" — strategies
+    # then fall back to their fixed internal timeouts (pre-A0 behaviour), so an
+    # unwired call site degrades safely instead of erroring.
+    deadline: Deadline | None = None
 
 
 # ── Protocol ─────────────────────────────────────────────────────────────
@@ -351,6 +358,7 @@ class StructuredQueryTier:
                 options=dict(context.options),
                 trace=TraceCollector(),
                 model_id=context.model_id,
+                deadline=context.deadline,
             )
             for _ in strategies
         ]

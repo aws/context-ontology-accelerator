@@ -271,8 +271,13 @@ async function deploy(): Promise<void> {
       "/namespaces/{namespaceId}/sources/{sourceId}/tables/{tableId}/review": `/${prefix}/sources/api-fn-arn`,
       "/namespaces/{namespaceId}/sources/{sourceId}/tables/{tableId}/metadata": `/${prefix}/sources/api-fn-arn`,
       "/namespaces/{namespaceId}/sources/{sourceId}/tables/{tableId}/keys": `/${prefix}/sources/api-fn-arn`,
+      // Re-scan: keep (decline) a table/column the re-scan flagged as removed
+      "/namespaces/{namespaceId}/sources/{sourceId}/tables/{tableId}/keep": `/${prefix}/sources/api-fn-arn`,
       "/namespaces/{namespaceId}/sources/{sourceId}/tables/{tableId}/columns/{columnName}/review": `/${prefix}/sources/api-fn-arn`,
       "/namespaces/{namespaceId}/sources/{sourceId}/tables/{tableId}/columns/{columnName}/metadata": `/${prefix}/sources/api-fn-arn`,
+      // Scan history: list a source's scan + steward-review events. Without an
+      // entry here the route falls back to the not-implemented stub (501).
+      "/namespaces/{namespaceId}/sources/{sourceId}/scan": `/${prefix}/sources/api-fn-arn`,
       "/namespaces/{namespaceId}/sources/{sourceId}/scan/{jobId}": `/${prefix}/sources/api-fn-arn`,
       "/namespaces/{namespaceId}/sources/{sourceId}/metadata": `/${prefix}/sources/api-fn-arn`,
       "/namespaces/{namespaceId}/sources/upload-urls": `/${prefix}/sources/api-fn-arn`,
@@ -429,6 +434,11 @@ async function deploy(): Promise<void> {
         ? { autoWebAclParam: cfAutoWebAclParam }
         : {}),
     serveRuntimeArn: serve.queryEndpoint,
+    ...(app.node.tryGetContext("content_security_policy") && {
+      contentSecurityPolicy: String(
+        app.node.tryGetContext("content_security_policy"),
+      ),
+    }),
     ...(customDomain && { customDomain }),
     ...(fs.existsSync(webAppDist) && { websiteContentPath: webAppDist }),
   });

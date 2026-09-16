@@ -274,6 +274,7 @@ class LLMClient(Protocol):
         guardrail_id: str | None = None,
         max_tokens: int = 4096,
         temperature: float | None = None,
+        top_p: float | None = None,
         guard_content: str | None = None,
         model_id: str | None = None,
     ) -> ConverseResult:
@@ -282,6 +283,10 @@ class LLMClient(Protocol):
         ``guard_content`` is the user-supplied text to tag for guardrail
         evaluation (M-5 prompt-injection scoping); when set, only that segment is
         guard-evaluated, leaving retrieved context/instructions untouched.
+
+        ``top_p`` is an optional nucleus-sampling cutoff; determinism-sensitive
+        callers set it alongside temperature=0 so a sampling constraint survives
+        even on models that drop temperature.
 
         ``model_id`` overrides the default LLM model for this call. When None,
         the client's configured default is used.

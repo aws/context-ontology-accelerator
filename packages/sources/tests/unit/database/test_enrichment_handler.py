@@ -360,3 +360,209 @@ class TestEnrichmentMetricEmission:
         assert len(duration_calls) == 1
         assert duration_calls[0][0][1] > 0  # duration must be positive
         assert duration_calls[0][0][2] == "Milliseconds"
+
+
+class TestEnrichmentHandlerReScanStatus:
+    """On a re-scan (IS_RESCAN=true) the terminal source status is RESCAN_REVIEW
+    instead of PENDING_REVIEW, on both the enriched and enrichment-disabled paths."""
+
+    @patch(
+        f"{ENRICHER_MODULE}.run", return_value={"tables_enriched": 5, "tables_failed": 0, "tables_skipped_unchanged": 0}
+    )
+    @patch("coa_common.dao.DynamoDBDAO")
+    def test_success_terminal_is_rescan_review(self, mock_dao_cls, mock_run, monkeypatch):
+        monkeypatch.setenv("IS_RESCAN", "true")
+        mock_dao = _build_dao(source_item={"sourceId": "ds-123"})
+        mock_dao_cls.return_value = mock_dao
+
+        from coa_sources.database.pipeline.enrichment_handler import handler
+
+        handler()
+
+        update_calls = mock_dao.update.call_args_list
+        assert update_calls[0][1]["update_fields"]["status"] == SourceStatus.ENRICHING
+        assert update_calls[-1][1]["update_fields"]["status"] == SourceStatus.RESCAN_REVIEW
+
+    @patch(f"{ENRICHER_MODULE}.run")
+    @patch("coa_common.dao.DynamoDBDAO")
+    def test_disabled_terminal_is_rescan_review(self, mock_dao_cls, mock_run, monkeypatch):
+        monkeypatch.setenv("IS_RESCAN", "true")
+        mock_dao = _build_dao(source_item={"sourceId": "ds-123", "metadataEnrichmentEnabled": False})
+        mock_dao_cls.return_value = mock_dao
+
+        from coa_sources.database.pipeline.enrichment_handler import handler
+
+        handler()
+
+        mock_run.assert_not_called()
+        assert mock_dao.update.call_args_list[0][1]["update_fields"]["status"] == SourceStatus.RESCAN_REVIEW
+
+    @patch(
+        f"{ENRICHER_MODULE}.run", return_value={"tables_enriched": 1, "tables_failed": 0, "tables_skipped_unchanged": 0}
+    )
+    @patch("coa_common.dao.DynamoDBDAO")
+    def test_first_scan_terminal_stays_pending_review(self, mock_dao_cls, mock_run, monkeypatch):
+        # IS_RESCAN="false" (a first scan) keeps the historical PENDING_REVIEW terminal.
+        monkeypatch.setenv("IS_RESCAN", "false")
+        mock_dao = _build_dao(source_item={"sourceId": "ds-123"})
+        mock_dao_cls.return_value = mock_dao
+
+        from coa_sources.database.pipeline.enrichment_handler import handler
+
+        handler()
+
+        assert mock_dao.update.call_args_list[-1][1]["update_fields"]["status"] == SourceStatus.PENDING_REVIEW
+
+    @patch(
+        f"{ENRICHER_MODULE}.run", return_value={"tables_enriched": 0, "tables_failed": 0, "tables_skipped_unchanged": 3}
+    )
+    @patch("coa_common.dao.DynamoDBDAO")
+    def test_no_drift_rescan_returns_to_approved(self, mock_dao_cls, mock_run, monkeypatch):
+        # A re-scan discovery reported as having nothing to review
+        # (RESCAN_REVIEW_NEEDED="false") returns the source straight to APPROVED
+        # instead of parking it in RESCAN_REVIEW with an empty review.
+        monkeypatch.setenv("IS_RESCAN", "true")
+        monkeypatch.setenv("RESCAN_REVIEW_NEEDED", "false")
+        mock_dao = _build_dao(source_item={"sourceId": "ds-123"})
+        mock_dao_cls.return_value = mock_dao
+
+        from coa_sources.database.pipeline.enrichment_handler import handler
+
+        handler()
+
+        assert mock_dao.update.call_args_list[-1][1]["update_fields"]["status"] == SourceStatus.APPROVED
+
+    @patch(f"{ENRICHER_MODULE}.run")
+    @patch("coa_common.dao.DynamoDBDAO")
+    def test_no_drift_rescan_returns_to_approved_on_disabled_path(self, mock_dao_cls, mock_run, monkeypatch):
+        monkeypatch.setenv("IS_RESCAN", "true")
+        monkeypatch.setenv("RESCAN_REVIEW_NEEDED", "false")
+        mock_dao = _build_dao(source_item={"sourceId": "ds-123", "metadataEnrichmentEnabled": False})
+        mock_dao_cls.return_value = mock_dao
+
+        from coa_sources.database.pipeline.enrichment_handler import handler
+
+        handler()
+
+        mock_run.assert_not_called()
+        assert mock_dao.update.call_args_list[0][1]["update_fields"]["status"] == SourceStatus.APPROVED
+
+    @patch(
+        f"{ENRICHER_MODULE}.run", return_value={"tables_enriched": 2, "tables_failed": 0, "tables_skipped_unchanged": 0}
+    )
+    @patch("coa_common.dao.DynamoDBDAO")
+    def test_rescan_with_review_needed_stays_rescan_review(self, mock_dao_cls, mock_run, monkeypatch):
+        # Explicit "true" keeps the drift review open.
+        monkeypatch.setenv("IS_RESCAN", "true")
+        monkeypatch.setenv("RESCAN_REVIEW_NEEDED", "true")
+        mock_dao = _build_dao(source_item={"sourceId": "ds-123"})
+        mock_dao_cls.return_value = mock_dao
+
+        from coa_sources.database.pipeline.enrichment_handler import handler
+
+        handler()
+
+        assert mock_dao.update.call_args_list[-1][1]["update_fields"]["status"] == SourceStatus.RESCAN_REVIEW
+
+    @patch(
+        f"{ENRICHER_MODULE}.run", return_value={"tables_enriched": 1, "tables_failed": 0, "tables_skipped_unchanged": 0}
+    )
+    @patch("coa_common.dao.DynamoDBDAO")
+    def test_first_scan_ignores_review_needed_flag(self, mock_dao_cls, mock_run, monkeypatch):
+        # RESCAN_REVIEW_NEEDED only gates a re-scan; a first scan ignores it and
+        # still lands in PENDING_REVIEW.
+        monkeypatch.setenv("IS_RESCAN", "false")
+        monkeypatch.setenv("RESCAN_REVIEW_NEEDED", "false")
+        mock_dao = _build_dao(source_item={"sourceId": "ds-123"})
+        mock_dao_cls.return_value = mock_dao
+
+        from coa_sources.database.pipeline.enrichment_handler import handler
+
+        handler()
+
+        assert mock_dao.update.call_args_list[-1][1]["update_fields"]["status"] == SourceStatus.PENDING_REVIEW
+
+
+class TestEnrichmentPartialFailureRecording:
+    """A per-table enrichment failure (guardrail block / parse / timeout) does
+    not fail the job — the table is written back blank while the source still
+    advances to review. The handler must record WHICH tables failed so the
+    partial failure is visible instead of hiding behind the aggregate count."""
+
+    @patch(
+        f"{ENRICHER_MODULE}.run",
+        return_value={
+            "tables_enriched": 2,
+            "tables_failed": 1,
+            "tables_skipped_unchanged": 0,
+            "failed_table_ids": ["public.rescan_demo_widgets"],
+        },
+    )
+    @patch("coa_common.dao.DynamoDBDAO")
+    def test_partial_failure_recorded_on_scan_job_row(self, mock_dao_cls, mock_run):
+        mock_dao = _build_dao(source_item={"sourceId": "ds-123"})
+        mock_dao_cls.return_value = mock_dao
+
+        from coa_sources.database.pipeline.enrichment_handler import handler
+
+        handler()
+
+        # The failed table names + partial-failure flag land on the scan-job row
+        # (PK=SRC#<id>, SK=<scan job SK>), read back by GET .../scan/{jobId}.
+        scan_job_writes = [
+            c for c in mock_dao.update.call_args_list if "enrichmentPartialFailure" in c[1]["update_fields"]
+        ]
+        assert len(scan_job_writes) == 1
+        call = scan_job_writes[0]
+        assert call[1]["key"] == {"PK": "SRC#ds-123", "SK": "SCAN#scan-456"}
+        assert call[1]["update_fields"]["enrichmentPartialFailure"] is True
+        assert call[1]["update_fields"]["enrichmentFailedTables"] == ["public.rescan_demo_widgets"]
+        # Best-effort diagnostic write: must not crash an otherwise-successful
+        # enrichment if the scan-job row was concurrently deleted.
+        assert call[1]["condition"] == "attribute_exists(PK)"
+        assert call[1]["raise_on_error"] is False
+
+    @patch(
+        f"{ENRICHER_MODULE}.run",
+        return_value={
+            "tables_enriched": 3,
+            "tables_failed": 1,
+            "tables_skipped_unchanged": 0,
+            "failed_table_ids": ["public.rescan_demo_widgets"],
+        },
+    )
+    @patch("coa_common.dao.DynamoDBDAO")
+    def test_partial_failure_logs_warning_naming_tables(self, mock_dao_cls, mock_run, caplog):
+        import logging
+
+        mock_dao = _build_dao(source_item={"sourceId": "ds-123"})
+        mock_dao_cls.return_value = mock_dao
+
+        from coa_sources.database.pipeline.enrichment_handler import handler
+
+        with caplog.at_level(logging.WARNING):
+            handler()
+
+        assert "partial failure" in caplog.text.lower()
+        assert "public.rescan_demo_widgets" in caplog.text
+
+    @patch(
+        f"{ENRICHER_MODULE}.run",
+        return_value={
+            "tables_enriched": 5,
+            "tables_failed": 0,
+            "tables_skipped_unchanged": 0,
+            "failed_table_ids": [],
+        },
+    )
+    @patch("coa_common.dao.DynamoDBDAO")
+    def test_clean_scan_writes_no_partial_failure_marker(self, mock_dao_cls, mock_run):
+        mock_dao = _build_dao(source_item={"sourceId": "ds-123"})
+        mock_dao_cls.return_value = mock_dao
+
+        from coa_sources.database.pipeline.enrichment_handler import handler
+
+        handler()
+
+        # No failures → no diagnostic marker written anywhere.
+        assert not any("enrichmentPartialFailure" in c[1]["update_fields"] for c in mock_dao.update.call_args_list)

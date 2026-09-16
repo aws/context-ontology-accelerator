@@ -28,6 +28,7 @@ from coa_common.constants import (
     LIST_METRICS_RESOURCE,
     METRIC_SERVICE_LAMBDA_ARN_ENV,
     ONTOLOGY_PROXY_LAMBDA_ARN_ENV,
+    QUERY_STRATEGIES,
     validate_query_text,
 )
 from coa_common.smithy_shapes import normalize_dimensions
@@ -211,6 +212,41 @@ def _handle_query(namespace: str, event: dict) -> dict:
         payload["options"]["tierOverride"] = body["tierOverride"]
     if body.get("mode") is not None:
         payload["options"]["mode"] = body["mode"]
+    # Which Tier-2 engine answers a structured query. Without this the field was
+    # dropped here even when sent, leaving the Ontop/VKG path unreachable by any
+    # REST caller: it ran only as an automatic fallback, so no caller could
+    # select it deliberately.
+    #
+    # Validated rather than forwarded blind. Nothing else checks it: the handler does
+    # not validate the body against the generated Smithy model, and API Gateway has
+    # no RequestValidator, so the ``QueryStrategy`` enum is a codegen/doc artifact at
+    # this boundary. An unrecognised value would reach serve, fall out of
+    # ``Orchestrator._EXPLICIT_STRATEGY_OPTIONS`` and silently resolve to
+    # DEFAULT_STRATEGY — the caller would get the cheap fallback chain believing it
+    # had pinned an engine. A 400 naming the valid values is far kinder than a
+    # plausible-looking wrong answer.
+    #
+    # The isinstance check is load-bearing, not defensive noise: ``body`` is
+    # caller-controlled, and ``["ontop"] not in QUERY_STRATEGIES`` raises TypeError on
+    # an unhashable value (list, dict). That would escape to the top-level
+    # ``except Exception`` and surface as **502 "Context Manager invocation failed"* —
+    # an upstream-failure code for a client mistake, on a request that never left this
+    # function. Serve's ``normalize_strategy_option`` guards the same hazard for the
+    # same field ("options is caller-controlled, so an unhashable value must not raise
+    # here"); this is the edge-side equivalent.
+    strategy = body.get("strategy")
+    if strategy is not None:
+        if not isinstance(strategy, str) or strategy not in QUERY_STRATEGIES:
+            # The rejected value is deliberately NOT echoed. It is unbounded
+            # caller-controlled input, and ``!r`` would serialise whatever arrived —
+            # a multi-KB string or a whole nested object — straight back in the
+            # response. The caller already knows what it sent; the actionable half
+            # is the list of values it should have sent.
+            return _error_response(
+                400,
+                f"Invalid strategy. Must be one of: {', '.join(sorted(QUERY_STRATEGIES))}.",
+            )
+        payload["options"]["strategy"] = strategy
     if body.get("dimensions"):
         # Smithy DimensionFilterList arrives as ``[{name, value}, ...]``; CM's
         # Tier-1 ``substitute_dimensions`` calls ``.items()`` and expects a
@@ -219,12 +255,34 @@ def _handle_query(namespace: str, event: dict) -> dict:
         normalized = normalize_dimensions(body["dimensions"])
         if normalized:
             payload["options"]["dimensions"] = normalized
-    # ``timeoutMs`` is declared on the Smithy contract but the Context Manager
-    # does not currently read ``options.timeoutMs`` — forwarding it would be a
-    # silent no-op that hides "my deadline was ignored" behind a plausible
-    # long-running response. The urllib timeout below (``REST_TIMEOUT_MS``)
-    # is the actual, honoured deadline for this handler's own upstream call.
-    # Track: MR !939 review comment ``b6dea1de``.
+    # ``timeoutMs`` is now honoured by the Context Manager (it builds a
+    # request-scoped deadline from ``options.timeoutMs``), so forwarding it is no
+    # longer a silent no-op. A caller may narrow their budget below this handler's
+    # own REST ceiling (``REST_TIMEOUT_MS``) to get a graceful early return rather
+    # than waiting the full window; they cannot widen past it because serve caps
+    # the deadline at its transport budget and the urllib timeout below still
+    # bounds this handler's upstream call. Values <= 0 are dropped as meaningless.
+    if body.get("timeoutMs") is not None:
+        _raw_timeout = body["timeoutMs"]
+        # Only a genuine positive integer is a valid millisecond budget. Floats,
+        # strings and non-positive values are meaningless as a deadline and are
+        # dropped rather than coerced (int(1.5)==1 would smuggle a 1ms budget).
+        if isinstance(_raw_timeout, bool):
+            _timeout_ms = 0
+        elif isinstance(_raw_timeout, int):
+            _timeout_ms = _raw_timeout
+        else:
+            _timeout_ms = 0
+        if _timeout_ms > 0:
+            payload["options"]["timeoutMs"] = _timeout_ms
+        else:
+            # Surface the drop so a caller can tell "my timeout was ignored" apart
+            # from "I sent no timeout" when debugging why their budget wasn't honored.
+            logger.info(
+                "query_timeout_ms_dropped raw=%r namespace=%s",
+                _raw_timeout,
+                namespace,
+            )
     if body.get("includeSupporting") is not None:
         payload["options"]["includeSupporting"] = body["includeSupporting"]
     if body.get("maxResults") is not None:
@@ -571,6 +629,25 @@ def handler(event: dict, context) -> dict:
             error = None
         return _error_response(e.code, msg, **({"error": error} if error else {}))
     except URLError as e:
+        # A urlopen timeout (the 29s REST budget in _invoke_context_manager) surfaces
+        # as URLError whose .reason is a socket timeout. Distinguish it from a genuine
+        # connectivity failure: the request did reach the Context Manager and is likely
+        # still running server-side (e.g. Tier-3 synthesis routinely needs 20-90s),
+        # it just cannot fit the hard 29s API Gateway ceiling. Return a diagnosable 504
+        # naming the streaming path rather than a misleading 502 "cannot reach", so a
+        # builder does not chase a phantom connectivity/timeout bug.
+        if isinstance(e.reason, TimeoutError):
+            return _error_response(
+                504,
+                (
+                    "Query exceeded the 29s REST timeout. The request may still be "
+                    "completing server-side; long-running queries (e.g. Tier-3 "
+                    "synthesis) should use the streaming query endpoint, which has a "
+                    "larger budget. See the serve docs: 'REST query timeout'."
+                ),
+                error="rest_deadline_exceeded",
+                limitMs=REST_TIMEOUT_MS,
+            )
         return _error_response(502, f"Cannot reach Context Manager: {e.reason}")
     except Exception as e:
         return _error_response(502, f"Context Manager invocation failed: {type(e).__name__}")

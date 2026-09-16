@@ -564,7 +564,7 @@ class TestHandleDelete:
 
         assert status == 200
         assert body["status"] == "DELETED"
-        mock_assets.assert_called_once_with(_NAMESPACE_ID, _SOURCE_ID)
+        mock_assets.assert_called_once_with(_NAMESPACE_ID, _SOURCE_ID, None)
         mock_scans.assert_called_once_with(_SOURCE_ID)
         mock_dao.delete.assert_called_once()
 
@@ -851,11 +851,9 @@ class TestDeleteSourceDatazoneAssets:
     def test_delete_phase_stops_at_wall_clock_budget(self):
         """The synchronous delete loop must bail out once the time budget is spent.
 
-        Pagination (read-only) always completes; only the delete phase is
-        budget-bound. With the budget pinned to 0, the deadline is already past
-        on entry to the delete loop, so zero assets are deleted and the function
-        returns cleanly (the namespace-deletion sweep finishes the rest) rather
-        than running thousands of serial deletes past the Lambda timeout.
+        With budget pinned to 0 the deadline is already past on entry, so
+        both search pagination AND deletes are skipped. (Before GH-137 the
+        budget only constrained the delete phase; it now covers both.)
         """
         ds_key = f"DS#{_SOURCE_ID}"
         items = []
@@ -881,9 +879,9 @@ class TestDeleteSourceDatazoneAssets:
         ):
             removed = _current_sh()._delete_source_datazone_assets(_NAMESPACE_ID, _SOURCE_ID)
 
-        # Pagination still ran; the delete loop exited on the spent budget.
+        # Budget=0 → deadline already past → search and delete both skipped.
         assert removed == 0
-        assert mock_client.search_assets.call_count == 1
+        assert mock_client.search_assets.call_count == 0
         assert mock_client.delete_asset.call_count == 0
 
     @staticmethod
@@ -1127,8 +1125,9 @@ class TestHandleDeleteCounter:
 class TestHandleRescan:
     def test_rescan_database_source_happy_path(self):
         mock_dao = MagicMock()
-        # Only SCAN_FAILED is allowed: re-scan is a recovery action, not a
-        # generic re-trigger. Any other entry status should be rejected.
+        # SCAN_FAILED is the recovery-path entry — a first scan retried after
+        # failure. isRescan stays false so discovery does not take the merge
+        # path (there is nothing curated to preserve on a scan-failed source).
         mock_dao.get.return_value = _db_source_item("SCAN_FAILED")
         mock_scan_dao = MagicMock()
         mock_sqs = MagicMock()
@@ -1139,11 +1138,140 @@ class TestHandleRescan:
             patch(f"{_SH}._get_sqs", return_value=mock_sqs),
             patch(f"{_SH}._SCAN_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/scan-queue"),
         ):
-            status, body = _parse(_current_sh()._handle_rescan(_NAMESPACE_ID, _SOURCE_ID))
+            status, body = _parse(_current_sh()._handle_rescan({}, _NAMESPACE_ID, _SOURCE_ID))
 
         assert status == 202
         assert body["status"] == "IN_PROGRESS"
         mock_sqs.send_message.assert_called_once()
+        body_json = json.loads(mock_sqs.send_message.call_args[1]["MessageBody"])
+        assert body_json["isRescan"] is False
+        # SCAN_FAILED is not an open review, so no backup reconstruction.
+        assert body_json["hadOpenRescan"] is False
+
+    @pytest.mark.parametrize("entry_status", ["APPROVED", "RESCAN_REVIEW"])
+    def test_rescan_approved_source_marks_isrescan_true(self, entry_status):
+        # A drift re-scan of an already-approved (or drift-review) source flows
+        # through the merge path: discovery keeps curated metadata and the
+        # terminal source status becomes RESCAN_REVIEW instead of PENDING_REVIEW.
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = _db_source_item(entry_status)
+        mock_scan_dao = MagicMock()
+        mock_sqs = MagicMock()
+        # Re-scanning from RESCAN_REVIEW discards the open review, so it only
+        # proceeds with the acknowledgement. From APPROVED nothing is discarded
+        # and no acknowledgement is needed.
+        event = {"body": json.dumps({"confirmDiscardOpenReview": True})} if entry_status == "RESCAN_REVIEW" else {}
+
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._get_scan_dao", return_value=mock_scan_dao),
+            patch(f"{_SH}._get_sqs", return_value=mock_sqs),
+            patch(f"{_SH}._SCAN_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/scan-queue"),
+        ):
+            status, _body = _parse(_current_sh()._handle_rescan(event, _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 202
+        body_json = json.loads(mock_sqs.send_message.call_args[1]["MessageBody"])
+        assert body_json["isRescan"] is True
+        # hadOpenRescan is true ONLY from RESCAN_REVIEW (a prior re-scan still
+        # open, so the backup blob is the approved pre-image). From APPROVED the
+        # live assets ARE the baseline and any leftover backup must be ignored.
+        assert body_json["hadOpenRescan"] is (entry_status == "RESCAN_REVIEW")
+
+    def test_rescan_with_open_review_needs_confirmation(self):
+        # Re-scanning a source that already has an open re-scan review throws
+        # away the decisions and edits made in that review, so it must not
+        # happen on an unqualified click. Nothing may be written before the
+        # caller confirms — no scan job row, no status flip, no queue message.
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = _db_source_item("RESCAN_REVIEW")
+        mock_scan_dao = MagicMock()
+        mock_sqs = MagicMock()
+
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._get_scan_dao", return_value=mock_scan_dao),
+            patch(f"{_SH}._get_sqs", return_value=mock_sqs),
+        ):
+            status, body = _parse(_current_sh()._handle_rescan({}, _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 409
+        assert body["confirmationRequired"] == "confirmDiscardOpenReview"
+        assert body["status"] == "RESCAN_REVIEW"
+        mock_scan_dao.put.assert_not_called()
+        mock_dao.update.assert_not_called()
+        mock_sqs.send_message.assert_not_called()
+
+    @pytest.mark.parametrize("entry_status", ["APPROVED", "SCAN_FAILED"])
+    def test_rescan_without_open_review_needs_no_confirmation(self, entry_status):
+        # The acknowledgement is only for the state that loses work. A re-scan
+        # from APPROVED re-diffs against live assets that already are the
+        # approved baseline, and SCAN_FAILED has no review at all, so neither
+        # may be gated behind a prompt.
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = _db_source_item(entry_status)
+        mock_sqs = MagicMock()
+
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._get_scan_dao", return_value=MagicMock()),
+            patch(f"{_SH}._get_sqs", return_value=mock_sqs),
+            patch(f"{_SH}._SCAN_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/scan-queue"),
+        ):
+            status, _ = _parse(_current_sh()._handle_rescan({}, _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 202
+        mock_sqs.send_message.assert_called_once()
+
+    def test_rescan_with_open_review_proceeds_when_confirmed(self):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = _db_source_item("RESCAN_REVIEW")
+        mock_sqs = MagicMock()
+        event = {"body": json.dumps({"confirmDiscardOpenReview": True})}
+
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._get_scan_dao", return_value=MagicMock()),
+            patch(f"{_SH}._get_sqs", return_value=mock_sqs),
+            patch(f"{_SH}._SCAN_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/scan-queue"),
+        ):
+            status, _ = _parse(_current_sh()._handle_rescan(event, _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 202
+        body_json = json.loads(mock_sqs.send_message.call_args[1]["MessageBody"])
+        # The confirmation only unblocks the call; it must not change how
+        # discovery treats the re-scan.
+        assert body_json["hadOpenRescan"] is True
+        assert body_json["isRescan"] is True
+
+    def test_rescan_confirmation_false_is_not_a_confirmation(self):
+        # An explicit false must read the same as omitting the field, not as a
+        # present-and-therefore-truthy value.
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = _db_source_item("RESCAN_REVIEW")
+        mock_sqs = MagicMock()
+        event = {"body": json.dumps({"confirmDiscardOpenReview": False})}
+
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._get_scan_dao", return_value=MagicMock()),
+            patch(f"{_SH}._get_sqs", return_value=mock_sqs),
+        ):
+            status, body = _parse(_current_sh()._handle_rescan(event, _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 409
+        assert body["confirmationRequired"] == "confirmDiscardOpenReview"
+        mock_sqs.send_message.assert_not_called()
+
+    def test_rescan_rejects_malformed_body(self):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = _db_source_item("APPROVED")
+
+        with patch(f"{_SH}._get_dao", return_value=mock_dao):
+            status, body = _parse(_current_sh()._handle_rescan({"body": "not json"}, _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 400
+        assert body["error"] == "Invalid JSON body"
 
     def test_rescan_document_source_happy_path(self):
         mock_dao = MagicMock()
@@ -1155,7 +1283,7 @@ class TestHandleRescan:
             patch(f"{_SH}._get_sqs", return_value=mock_sqs),
             patch(f"{_SH}._INGESTION_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/ingestion-queue"),
         ):
-            status, body = _parse(_current_sh()._handle_rescan(_NAMESPACE_ID, _SOURCE_ID))
+            status, body = _parse(_current_sh()._handle_rescan({}, _NAMESPACE_ID, _SOURCE_ID))
 
         assert status == 200
         mock_sqs.send_message.assert_called_once()
@@ -1165,7 +1293,7 @@ class TestHandleRescan:
         mock_dao.get.return_value = None
 
         with patch(f"{_SH}._get_dao", return_value=mock_dao):
-            status, _ = _parse(_current_sh()._handle_rescan(_NAMESPACE_ID, _SOURCE_ID))
+            status, _ = _parse(_current_sh()._handle_rescan({}, _NAMESPACE_ID, _SOURCE_ID))
 
         assert status == 404
 
@@ -1178,23 +1306,23 @@ class TestHandleRescan:
             "PENDING_REVIEW",
             "APPROVING",
             "REJECTING",
-            "APPROVED",
             "COMPLETED",
             "DELETING",
         ],
     )
-    def test_rescan_database_rejects_non_scan_failed_status(self, status):
-        # Schema-drift re-scans aren't supported yet; the API must reject
-        # any entry status other than SCAN_FAILED to prevent destructive
-        # re-enrichment of already-approved tables.
+    def test_rescan_database_rejects_non_allowed_status(self, status):
+        # A DATABASE re-scan is allowed from SCAN_FAILED, APPROVED, or
+        # RESCAN_REVIEW; every other status is rejected to protect an in-flight
+        # scan or review from a concurrent re-trigger.
         mock_dao = MagicMock()
         mock_dao.get.return_value = _db_source_item(status)
 
         with patch(f"{_SH}._get_dao", return_value=mock_dao):
-            resp_status, body = _parse(_current_sh()._handle_rescan(_NAMESPACE_ID, _SOURCE_ID))
+            resp_status, body = _parse(_current_sh()._handle_rescan({}, _NAMESPACE_ID, _SOURCE_ID))
 
         assert resp_status == 409
         assert "SCAN_FAILED" in body["error"]
+        assert "APPROVED" in body["error"]
 
     def test_rescan_document_completed_is_allowed(self):
         """Documents can re-scan from COMPLETED (re-ingest) unlike DATABASE sources."""
@@ -1207,7 +1335,7 @@ class TestHandleRescan:
             patch(f"{_SH}._get_sqs", return_value=mock_sqs),
             patch(f"{_SH}._INGESTION_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/ingestion-queue"),
         ):
-            status, body = _parse(_current_sh()._handle_rescan(_NAMESPACE_ID, _SOURCE_ID))
+            status, body = _parse(_current_sh()._handle_rescan({}, _NAMESPACE_ID, _SOURCE_ID))
 
         assert status == 200
         mock_sqs.send_message.assert_called_once()
@@ -1221,7 +1349,7 @@ class TestHandleRescan:
         mock_dao.get.return_value = _doc_source_item(status)
 
         with patch(f"{_SH}._get_dao", return_value=mock_dao):
-            resp_status, body = _parse(_current_sh()._handle_rescan(_NAMESPACE_ID, _SOURCE_ID))
+            resp_status, body = _parse(_current_sh()._handle_rescan({}, _NAMESPACE_ID, _SOURCE_ID))
 
         assert resp_status == 409
 
@@ -1232,7 +1360,7 @@ class TestHandleRescan:
         mock_dao.get.side_effect = ClientError({"Error": {"Code": "InternalError"}}, "GetItem")
 
         with patch(f"{_SH}._get_dao", return_value=mock_dao):
-            status, _ = _parse(_current_sh()._handle_rescan(_NAMESPACE_ID, _SOURCE_ID))
+            status, _ = _parse(_current_sh()._handle_rescan({}, _NAMESPACE_ID, _SOURCE_ID))
 
         assert status == 500
 
@@ -1249,7 +1377,7 @@ class TestHandleRescan:
             patch(f"{_SH}._get_sqs", return_value=mock_sqs),
             patch(f"{_SH}._INGESTION_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/ingestion-queue"),
         ):
-            status, _ = _parse(_current_sh()._handle_rescan(_NAMESPACE_ID, _SOURCE_ID))
+            status, _ = _parse(_current_sh()._handle_rescan({}, _NAMESPACE_ID, _SOURCE_ID))
 
         assert status == 500
 
@@ -1261,7 +1389,7 @@ class TestHandleRescan:
         mock_dao.get.return_value = item
 
         with patch(f"{_SH}._get_dao", return_value=mock_dao):
-            status, _ = _parse(_current_sh()._handle_rescan(_NAMESPACE_ID, _SOURCE_ID))
+            status, _ = _parse(_current_sh()._handle_rescan({}, _NAMESPACE_ID, _SOURCE_ID))
 
         assert status == 500
 

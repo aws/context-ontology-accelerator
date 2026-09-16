@@ -416,11 +416,21 @@ stateDiagram-v2
     [*] --> REGISTERED: Create source
     REGISTERED --> SCANNING: Pipeline starts
     SCANNING --> ENRICHING: Discovery complete
-    ENRICHING --> PENDING_REVIEW: Enrichment complete
+    ENRICHING --> PENDING_REVIEW: Enrichment complete (first scan)
     PENDING_REVIEW --> APPROVED: All tables approved
     SCANNING --> SCAN_FAILED: Error
-    SCAN_FAILED --> SCANNING: Re-scan
+    SCAN_FAILED --> SCANNING: Re-scan (retry the failed scan)
+    APPROVED --> SCANNING: Re-scan (pick up schema drift)
+    ENRICHING --> RESCAN_REVIEW: Enrichment complete (re-scan)
+    RESCAN_REVIEW --> APPROVED: Approve the changes
+    RESCAN_REVIEW --> APPROVED: Reject (restore previous state)
+    RESCAN_REVIEW --> SCANNING: Re-scan again
 ```
+
+A first scan ends in `PENDING_REVIEW`. A re-scan of an already-approved source
+ends in `RESCAN_REVIEW` instead, so the two are easy to tell apart: the first
+means "nothing here has been reviewed yet", the second means "this was approved
+before, and something has changed since".
 
 ### Poll Source Status
 
@@ -451,7 +461,7 @@ If you don't need AI-generated metadata and want faster scans, disable enrichmen
 { "metadataEnrichmentEnabled": false }
 ```
 
-The source transitions `SCANNING → PENDING_REVIEW` directly, skipping the `ENRICHING` phase. You can toggle `metadataEnrichmentEnabled` later (see "Updating Source-Level Metadata" below); re-running enrichment on an already-scanned source is part of the planned schema-drift re-scan enhancement (see "Triggering Re-scans" below).
+The source transitions `SCANNING → PENDING_REVIEW` directly, skipping the `ENRICHING` phase. You can toggle `metadataEnrichmentEnabled` later (see "Updating Source-Level Metadata" below), then re-scan the source to run enrichment over it (see "Triggering Re-scans" below). Note that a re-scan only regenerates metadata for items still pending review — anything you have already approved keeps the metadata you approved.
 
 ## Reviewing Enriched Metadata
 
@@ -536,35 +546,114 @@ Edits follow a priority system. Higher-priority sources are never overwritten by
 
 ## Triggering Re-scans
 
-!!! note
-    For structured (database) sources, re-scan is a **recovery action only** — it
-    is permitted **only when the source is in `SCAN_FAILED` status**. Re-scanning
-    an already-scanned source to pick up schema changes (DDL drift) is a **planned
-    enhancement for a future phase** and is not yet supported. Calling re-scan on a
-    database source in any other status returns a `409 Conflict`
-    (`Re-scan is only allowed when status is 'SCAN_FAILED'`).
+Re-scan a database source via `POST .../sources/{sourceId}/rescan` — see
+**RescanSource** in the [API Reference](#/api-reference). It does one of two
+jobs, depending on the status the source is in when you call it:
 
-Re-scan a failed source to retry the scan pipeline after correcting the
-underlying problem (for example, fixed credentials, restored network
-connectivity, or granted Lake Formation permissions) via
-`POST .../sources/{sourceId}/rescan` — see **RescanSource** in the
-[API Reference](#/api-reference).
+| Current status | What a re-scan does |
+|----------------|---------------------|
+| `SCAN_FAILED` | **Recovery.** Retries the scan that failed. Treated as a first scan, so it ends in `PENDING_REVIEW`. |
+| `APPROVED` | **Schema drift.** Picks up changes made to the source since you approved it. Ends in `RESCAN_REVIEW` for you to review the changes. |
+| `RESCAN_REVIEW` | **Redo the drift check.** Re-runs discovery and rebuilds the diff, for when the source changed again mid-review. |
+
+Calling re-scan on a database source in any other status returns a
+`409 Conflict` naming the statuses that are allowed.
 
 ### When to Re-scan
 
-- After a scan fails (`SCAN_FAILED`) and you have corrected the cause — bad
-  credentials, an unreachable host, or missing Lake Formation permissions
+- **After a scan fails** (`SCAN_FAILED`) and you have corrected the cause — bad
+  credentials, an unreachable host, or missing Lake Formation permissions.
+- **After the source schema changes** — someone added a table, dropped a column,
+  changed a column type, or altered a primary key. Re-scanning an `APPROVED`
+  source brings your catalog back in line with the database.
 
 ### What Happens on Re-scan
 
-1. The source transitions `SCAN_FAILED → SCANNING` and the scan pipeline restarts
-2. Discovery, federation (JDBC only), and AI enrichment run again
-3. Steward edits are preserved (see the metadata priority hierarchy above)
+1. The source moves to `SCANNING` and the pipeline restarts.
+2. Discovery, federation (JDBC only), and AI enrichment run again.
+3. Your edits are preserved (see the metadata priority hierarchy above), and
+   enrichment only regenerates items still pending review.
+4. A recovery re-scan ends in `PENDING_REVIEW`. A drift re-scan of an approved
+   source ends in `RESCAN_REVIEW` instead.
 
-!!! info "Coming in a future phase"
-    Schema-drift re-scans of healthy or approved sources — discovering new
-    tables/columns, cleaning up removed objects, and re-enriching with change
-    detection — are a planned enhancement and not yet available.
+Re-scanning while a re-scan review is **already open** is the one exception to
+step 3. That path compares against the last state you *approved*, so any review
+decisions or edits you made inside the open review are discarded. Tables and
+columns you approved earlier are unaffected. Because this loses work, the API
+rejects the call unless it carries an explicit acknowledgement, and the console
+asks you to confirm before it starts.
+
+Nothing is deleted or overwritten while the source sits in `RESCAN_REVIEW`. The
+fresh scan is merged onto your live catalog, and every difference waits for your
+decision.
+
+## Reviewing a Re-scan (`RESCAN_REVIEW`)
+
+A source in `RESCAN_REVIEW` was approved before and has changed since. Your job
+is to confirm what changed before it is applied.
+
+Importantly, the diff is against the **last state you approved**, not against the
+previous scan. So if you re-scan twice before reviewing, you still see the whole
+change since your last approval rather than just the most recent delta.
+
+### What you see
+
+Each table page shows a **Changes since last approved scan** panel, collapsible,
+with the change counts in its header. It groups the differences into:
+
+- **Table-level changes** — for example a changed primary key.
+- **Column changes** — added, removed, or modified columns, each shown as
+  old → new. Modified columns carry an info icon that opens the field-level
+  detail.
+
+Special cases get called out rather than shown as an empty diff:
+
+- A table the re-scan found for the first time shows a **New table** note.
+- A table that has disappeared from the source shows a **Dropped table** panel,
+  warning that it will be deleted when you approve unless you keep it.
+
+Anything the re-scan wants to delete carries a **Pending deletion** badge and
+reads as *Pending review* rather than *Approved*, so it also shows up under the
+**Pending review** filter and count. Nothing awaiting a deletion decision looks
+settled.
+
+### Approving or rejecting
+
+- **Approve** applies the changes and deletes the items marked for removal.
+- **Reject** restores the state from before the re-scan and refreshes the
+  source's summary counts.
+
+Either way the source returns to `APPROVED`.
+
+### Keeping something the re-scan wants to delete
+
+"Missing from the source" is not always "should be deleted". A partial scan, a
+permission change, or a narrowed include/exclude filter can all make an object
+look gone when you still want it. Use the **Keep** action to veto a removal:
+
+`PUT .../sources/{sourceId}/tables/{tableId}/keep` — see **KeepRescanRemoval**
+in the [API Reference](#/api-reference).
+
+- Send an empty body to keep the **whole table**.
+- Send `{ "columnName": "..." }` to keep a **single column** of that table.
+
+Approving the re-scan then leaves that item alone, and its **Pending deletion**
+badge clears. The call is only valid while the source is in `RESCAN_REVIEW`, and
+it is idempotent — keeping something that was not marked for removal succeeds and
+changes nothing.
+
+## Scan and Review History
+
+`GET .../sources/{sourceId}/scan` returns the source's history newest first, as
+a single audit trail — see **ListSourceScanJobs** in the
+[API Reference](#/api-reference). It combines two kinds of event:
+
+- **Scans** — each discovery and enrichment run, including failures.
+- **Review decisions** — approvals, rejections, and re-scan decisions.
+
+The web UI renders this on the source's **Scan history** tab. Use it to answer
+questions like "when did this source last change?" and "who approved the last
+re-scan, and when?".
 
 ## Updating Source-Level Metadata
 
@@ -773,10 +862,18 @@ Document sources accept an optional `extractionConfig` object that tunes how the
 knowledge graph is built from your documents. All fields are optional; the
 defaults are tuned for general prose corpora.
 
+`extractionConfig` is supplied on **`CreateSource`**, nested under
+`documentSource`, and **cannot be changed afterwards** — `RescanSource` does not
+accept it. Changing an entity class also changes the identity of every entity
+derived from it, so re-ingesting with a different vocabulary creates new nodes
+rather than updating existing ones; use a new source (and preferably a new
+namespace) when the vocabulary changes.
+
 | Field | Type | Default | Purpose |
 |-------|------|---------|---------|
 | `preferredEntityClassifications` | `string[]` | `[]` (unset) | Explicit entity-class vocabulary handed to the extraction LLM. |
 | `inferEntityClassifications` | `boolean` | `true` | Derive the entity-class vocabulary from your corpus at ingest start. |
+| `preferredTopics` | `string[]` | `[]` (unset) | Preferred topic names the extractor should reuse when they fit the content. |
 | `enableTableExtraction` | `boolean` | `false` | Route PDFs through Amazon Textract to preserve table structure. |
 | `chunkSize` | `integer` | `0` (toolkit default 256) | Token size of each extraction/embedding chunk. |
 | `chunkOverlap` | `integer` | `0` (toolkit default 25) | Token overlap between adjacent chunks. |
@@ -803,6 +900,78 @@ When `preferredEntityClassifications` is non-empty it **overrides** inference �
 the extractor uses exactly those labels. Leave it empty (the default) to fall
 back to corpus inference. If both are effectively off (empty list and
 `inferEntityClassifications: false`), extraction runs unguided.
+
+**Labels are used exactly as you write them.** The extractor imposes no format on
+the vocabulary you supply — it goes into the prompt verbatim.
+
+One downstream behaviour is worth knowing about: the class name *recorded on each
+entity* is title-cased, so what you configure and what appears in the graph can
+differ:
+
+| You supply | Recorded as |
+|---|---|
+| `"Dress"` | `Dress` |
+| `"DRESS"`, `"dress"` | `Dress` |
+| `"loss ratio"` | `Loss Ratio` |
+| `"Style_Archetype"` | `Style Archetype` |
+| `"t-shirt"` | `T-Shirt` |
+| `"StyleArchetype"` | `Stylearchetype` — the word boundary is lost |
+
+None of these are errors and none are rewritten for you. If you want the configured
+vocabulary to read the same as the graph, supply labels in Title Case With Spaces.
+The last row is the one to avoid: run-together words cannot be recovered, so write
+`"Style Archetype"` rather than `"StyleArchetype"`. The console shows a notice
+listing any labels whose recorded name will differ.
+
+Topics are **not** title-cased, so your capitalisation survives: `"QuietLuxury"` is
+recorded as written. Two smaller transforms still apply, though — an underscore
+becomes a space (`"Quiet_Luxury"` is recorded as `Quiet Luxury`), and a trailing
+full stop is dropped. As with classes, the console names any topic whose recorded
+form will differ.
+
+#### Topic vocabulary: `preferredTopics`
+
+Topics are the *thematic groupings* the extractor assigns each chunk to, as
+distinct from `preferredEntityClassifications`, which types the things it finds:
+
+| | Controls | Example |
+|---|---|---|
+| `preferredEntityClassifications` | what a thing **is** | `Dress`, `Brand`, `Colour` |
+| `preferredTopics` | what a passage is **about** | `Black Tie Gala`, `Everyday Elegance` |
+
+```json
+{
+  "extractionConfig": {
+    "preferredTopics": ["Black Tie Gala", "Everyday Elegance", "Quiet Luxury"]
+  }
+}
+```
+
+This is a **steer, not a closed set**: the extractor reuses a listed topic when one
+matches the content in meaning and specificity, and names a new one otherwise.
+Leave it empty (the default) to let it name every topic from the content — that is
+the behaviour of every ingest before this field existed.
+
+There is no `inferTopics` flag. Unlike entity classes, there is no corpus-inference
+pass for topics, so an empty list already means "let the model decide".
+
+#### Validation applied to both lists
+
+Both `preferredEntityClassifications` and `preferredTopics` are validated on
+`CreateSource`; a violation returns **400** with a message naming the offending
+entry:
+
+| Rule | Applies to | Notes |
+|---|---|---|
+| Must be a list of strings | both | A bare string is rejected, not split |
+| Entries are trimmed; empty entries dropped | both | `"  Policy  "` becomes `"Policy"` |
+| No duplicates, compared case-insensitively | both | `"Policy"` and `"policy"` collide |
+| At most 100 entries | both | Long lists crowd the extraction prompt and reduce adherence; 15&ndash;25 is the practical sweet spot. The console shows a running count and stops you at the cap. |
+| Per-entry length | both | 128 characters for classes, 256 for topics |
+| Spelling is **not** validated or rewritten | both | Labels go to the extractor verbatim; see the note above on title-casing of recorded class names. |
+
+The web console applies the same rules as you type, so a source created through the
+UI cannot hit them — the API validation exists for direct callers.
 
 #### Table-heavy PDFs: `enableTableExtraction`
 

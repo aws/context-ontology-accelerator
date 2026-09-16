@@ -25,6 +25,7 @@ vi.mock("@api-hooks", () => ({
   useApproveSource: (...args: unknown[]) => mockUseApproveSource(...args),
   useRejectSource: (...args: unknown[]) => mockUseRejectSource(...args),
   useGetSourceScanJob: (...args: unknown[]) => mockUseGetSourceScanJob(...args),
+  useKeepRescanRemoval: () => ({ mutate: vi.fn(), isPending: false }),
 }));
 
 // Pin only the enum values the page reads. Avoids loading the full smithy
@@ -43,6 +44,8 @@ vi.mock("@coa/control-plane-client", () => ({
     APPROVING: "APPROVING",
     REJECTING: "REJECTING",
     APPROVED: "APPROVED",
+    RESCAN_REVIEW: "RESCAN_REVIEW",
+    COMPLETED: "COMPLETED",
     SCAN_FAILED: "SCAN_FAILED",
     APPROVAL_FAILED: "APPROVAL_FAILED",
     REJECTION_FAILED: "REJECTION_FAILED",
@@ -138,7 +141,7 @@ describe("SourceDetail", () => {
     vi.clearAllMocks();
   });
 
-  it("disables Re-scan unless status is SCAN_FAILED", () => {
+  it("disables Re-scan for non-re-scannable statuses (e.g. PENDING_REVIEW)", () => {
     setupBaseMocks({ status: "PENDING_REVIEW", tablesDiscovered: 5 });
     renderDetail();
     const rescan = screen.getByRole("button", { name: /re-scan/i });
@@ -147,6 +150,13 @@ describe("SourceDetail", () => {
 
   it("enables Re-scan when status is SCAN_FAILED", () => {
     setupBaseMocks({ status: "SCAN_FAILED", tablesDiscovered: 0 });
+    renderDetail();
+    const rescan = screen.getByRole("button", { name: /re-scan/i });
+    expect(rescan).not.toBeDisabled();
+  });
+
+  it("enables Re-scan when an APPROVED database source can drift (drift re-scan)", () => {
+    setupBaseMocks({ status: "APPROVED", tablesDiscovered: 5 });
     renderDetail();
     const rescan = screen.getByRole("button", { name: /re-scan/i });
     expect(rescan).not.toBeDisabled();

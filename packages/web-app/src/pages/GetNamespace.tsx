@@ -67,6 +67,8 @@ function formatDate(iso: string | undefined): string {
 const VKG_HEALTH_DESCRIPTIONS: Record<VkgHealthStatus, string> = {
   [VkgHealthStatus.HEALTHY]:
     "The VKG translation service is running and able to translate queries.",
+  [VkgHealthStatus.DEGRADED]:
+    "A VKG task is running but its health check is failing, so it cannot translate queries (for example, the published mapping could not be loaded). Queries will fail — check the container's health status.",
   [VkgHealthStatus.UNAVAILABLE]:
     "The VKG service exists but is not serving — queries will fail.",
   [VkgHealthStatus.PROVISIONING]:
@@ -156,19 +158,24 @@ export const GetNamespace: React.FC = () => {
               label: "VKG health",
               value: (() => {
                 const vkgHealth = ns.vkgHealth ?? VkgHealthStatus.UNKNOWN;
+                // Prefer the server-provided reason (the live cause) when
+                // present; fall back to the static per-status description.
+                const vkgHealthContent =
+                  ns.vkgHealthReason ?? VKG_HEALTH_DESCRIPTIONS[vkgHealth];
                 return (
                   <Popover
                     dismissButton={false}
                     position="top"
                     triggerType="text"
                     header="VKG health"
-                    content={VKG_HEALTH_DESCRIPTIONS[vkgHealth]}
+                    content={vkgHealthContent}
                   >
                     <StatusIndicator
                       type={
                         vkgHealth === VkgHealthStatus.HEALTHY
                           ? "success"
-                          : vkgHealth === VkgHealthStatus.UNAVAILABLE
+                          : vkgHealth === VkgHealthStatus.UNAVAILABLE ||
+                              vkgHealth === VkgHealthStatus.DEGRADED
                             ? "error"
                             : vkgHealth === VkgHealthStatus.PROVISIONING
                               ? "in-progress"

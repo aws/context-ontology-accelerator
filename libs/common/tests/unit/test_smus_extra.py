@@ -254,6 +254,110 @@ class TestSearchAssets:
             SMUSClient(domain_id=DOMAIN).search_assets(project_id="p1", search_text="q")
 
 
+class TestSearchAssetsIncludeForms:
+    """Tests for the include_forms kwarg on search_assets."""
+
+    @patch("coa_common.metadata_store.smus.boto3")
+    def test_additional_attributes_present_when_include_forms_true(self, mock_boto3):
+        dz = MagicMock()
+        dz.search.return_value = {"items": []}
+        mock_boto3.client.return_value = dz
+
+        SMUSClient(domain_id=DOMAIN).search_assets(project_id="p1", search_text="q", include_forms=True)
+
+        _, kwargs = dz.search.call_args
+        assert kwargs["additionalAttributes"] == ["FORMS"]
+
+    @patch("coa_common.metadata_store.smus.boto3")
+    def test_additional_attributes_absent_when_include_forms_false(self, mock_boto3):
+        dz = MagicMock()
+        dz.search.return_value = {"items": []}
+        mock_boto3.client.return_value = dz
+
+        SMUSClient(domain_id=DOMAIN).search_assets(project_id="p1", search_text="q", include_forms=False)
+
+        _, kwargs = dz.search.call_args
+        assert "additionalAttributes" not in kwargs
+
+    @patch("coa_common.metadata_store.smus.boto3")
+    def test_additional_attributes_absent_by_default(self, mock_boto3):
+        dz = MagicMock()
+        dz.search.return_value = {"items": []}
+        mock_boto3.client.return_value = dz
+
+        SMUSClient(domain_id=DOMAIN).search_assets(project_id="p1", search_text="q")
+
+        _, kwargs = dz.search.call_args
+        assert "additionalAttributes" not in kwargs
+
+    @patch("coa_common.metadata_store.smus.boto3")
+    def test_forms_output_populated_from_response(self, mock_boto3):
+        forms = [{"formName": "MyForm", "content": '{"col": "val"}'}]
+        dz = MagicMock()
+        dz.search.return_value = {
+            "items": [
+                {
+                    "assetItem": {
+                        "identifier": "a1",
+                        "name": "n1",
+                        "owningProjectId": "p1",
+                        "additionalAttributes": {"formsOutput": forms},
+                    }
+                }
+            ]
+        }
+        mock_boto3.client.return_value = dz
+
+        result = SMUSClient(domain_id=DOMAIN).search_assets(project_id="p1", search_text="q", include_forms=True)
+
+        assert result.items[0].forms_output == forms
+
+    @patch("coa_common.metadata_store.smus.boto3")
+    def test_forms_output_none_when_include_forms_false(self, mock_boto3):
+        forms = [{"formName": "MyForm", "content": '{"col": "val"}'}]
+        dz = MagicMock()
+        dz.search.return_value = {
+            "items": [
+                {
+                    "assetItem": {
+                        "identifier": "a1",
+                        "name": "n1",
+                        "owningProjectId": "p1",
+                        "additionalAttributes": {"formsOutput": forms},
+                    }
+                }
+            ]
+        }
+        mock_boto3.client.return_value = dz
+
+        result = SMUSClient(domain_id=DOMAIN).search_assets(project_id="p1", search_text="q", include_forms=False)
+
+        assert result.items[0].forms_output is None
+
+    @patch("coa_common.metadata_store.smus.boto3")
+    def test_no_additional_attributes_key_tolerated(self, mock_boto3):
+        """When the response item has no additionalAttributes key at all,
+        forms_output should be None and no exception raised."""
+        dz = MagicMock()
+        dz.search.return_value = {
+            "items": [
+                {
+                    "assetItem": {
+                        "identifier": "a1",
+                        "name": "n1",
+                        "owningProjectId": "p1",
+                    }
+                }
+            ]
+        }
+        mock_boto3.client.return_value = dz
+
+        result = SMUSClient(domain_id=DOMAIN).search_assets(project_id="p1", search_text="q", include_forms=True)
+
+        assert result.items[0].forms_output is None
+        assert result.items[0].asset_id == "a1"
+
+
 class TestGetAssetForms:
     @patch("coa_common.metadata_store.smus.boto3")
     def test_returns_full_response_dict(self, mock_boto3):
@@ -284,3 +388,100 @@ class TestGetProjectFailure:
 
         with pytest.raises(MetadataStoreError, match="underlying reason"):
             SMUSClient(domain_id=DOMAIN).create_project(name="n")
+
+
+def _asset(name: str, asset_id: str) -> dict:
+    return {"assetItem": {"identifier": asset_id, "name": name, "owningProjectId": "p1"}}
+
+
+class TestFindAssetByName:
+    """Exact-name asset lookup.
+
+    A top-1 relevance search is not an exact lookup: DataZone scores every
+    searchable attribute, so a full asset name such as ``DS#<id>:<db>.<table>``
+    contributes terms shared by every asset of that source and the exact match
+    is not reliably ranked first. These cover the resulting behaviours.
+    """
+
+    @patch("coa_common.metadata_store.smus.boto3")
+    def test_restricts_matching_to_the_name_attribute(self, mock_boto3):
+        # searchIn is what removes the ranking lottery; without it the other
+        # searchable attributes (description, synonyms, glossary terms, ids) all
+        # contribute to the score.
+        dz = MagicMock()
+        dz.search.return_value = {"items": [_asset("DS#s:db.orders", "a1")]}
+        mock_boto3.client.return_value = dz
+
+        SMUSClient(domain_id=DOMAIN).find_asset_by_name(project_id="p1", name="DS#s:db.orders")
+
+        _, kwargs = dz.search.call_args
+        assert kwargs["searchIn"] == [{"attribute": "name"}]
+
+    @patch("coa_common.metadata_store.smus.boto3")
+    def test_finds_the_exact_match_when_it_is_not_the_first_hit(self, mock_boto3):
+        # The bug this replaces: a top-1 lookup returned the sibling and the
+        # caller reported the table as missing.
+        dz = MagicMock()
+        dz.search.return_value = {
+            "items": [
+                _asset("DS#s:db.categories", "a-cat"),
+                _asset("DS#s:db.order_items", "a-items"),
+                _asset("DS#s:db.orders", "a-orders"),
+            ]
+        }
+        mock_boto3.client.return_value = dz
+
+        found = SMUSClient(domain_id=DOMAIN).find_asset_by_name(project_id="p1", name="DS#s:db.orders")
+
+        assert found is not None
+        assert found.asset_id == "a-orders"
+
+    @patch("coa_common.metadata_store.smus.boto3")
+    def test_pages_until_the_exact_match_is_found(self, mock_boto3):
+        # Restricting to the name attribute is still not an exact match, so the
+        # wanted asset can sit behind a page boundary.
+        dz = MagicMock()
+        dz.search.side_effect = [
+            {"items": [_asset("DS#s:db.order_items", "a-items")], "nextToken": "p2"},
+            {"items": [_asset("DS#s:db.orders", "a-orders")]},
+        ]
+        mock_boto3.client.return_value = dz
+
+        found = SMUSClient(domain_id=DOMAIN).find_asset_by_name(project_id="p1", name="DS#s:db.orders")
+
+        assert found is not None and found.asset_id == "a-orders"
+        assert dz.search.call_count == 2
+        assert dz.search.call_args_list[1][1]["nextToken"] == "p2"
+
+    @patch("coa_common.metadata_store.smus.boto3")
+    def test_returns_none_when_only_near_names_exist(self, mock_boto3):
+        # A tokenised name matches relatives; only an exact name may be returned.
+        dz = MagicMock()
+        dz.search.return_value = {"items": [_asset("DS#s:db.orders_v2", "a-v2"), _asset("DS#s:db.order_items", "a-i")]}
+        mock_boto3.client.return_value = dz
+
+        assert SMUSClient(domain_id=DOMAIN).find_asset_by_name(project_id="p1", name="DS#s:db.orders") is None
+
+    @patch("coa_common.metadata_store.smus.boto3")
+    def test_stops_at_the_page_bound_rather_than_looping_forever(self, mock_boto3):
+        # A name that prefixes many others can match widely; the bound keeps a
+        # never-matching lookup from paging indefinitely.
+        dz = MagicMock()
+        dz.search.return_value = {"items": [_asset("DS#s:db.other", "a-o")], "nextToken": "more"}
+        mock_boto3.client.return_value = dz
+
+        found = SMUSClient(domain_id=DOMAIN).find_asset_by_name(project_id="p1", name="DS#s:db.orders", max_pages=3)
+
+        assert found is None
+        assert dz.search.call_count == 3
+
+    @patch("coa_common.metadata_store.smus.boto3")
+    def test_a_failed_search_raises_rather_than_reading_as_not_found(self, mock_boto3):
+        # "Not found" must never be produced by a broken lookup: callers turn it
+        # into a 404, or into skipping an enrichment write.
+        dz = MagicMock()
+        dz.search.side_effect = RuntimeError("throttled")
+        mock_boto3.client.return_value = dz
+
+        with pytest.raises(MetadataStoreError):
+            SMUSClient(domain_id=DOMAIN).find_asset_by_name(project_id="p1", name="DS#s:db.orders")

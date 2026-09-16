@@ -168,6 +168,32 @@ Once a namespace is created, you can connect:
 | Ontologies | OWL knowledge graphs | Ontology management |
 | Metrics | Governed SQL metric definitions | Metrics page |
 
+## VKG Health Monitoring
+
+When a namespace has an accepted ontology, the platform provisions a Virtual
+Knowledge Graph (VKG) service that answers graph/SPARQL queries. `GetNamespace`
+reports the current state of that service in two fields:
+
+- **`vkgHealth`** — one of five `VkgHealthStatus` values (below). Surfaced in the
+  namespace detail view in the web UI.
+- **`vkgHealthReason`** — an optional, human-readable string present **only when
+  `vkgHealth` is not `HEALTHY`**. It gives a short explanation of why the VKG is
+  in a non-HEALTHY state so you can act without inspecting ECS directly (e.g.
+  `"container health check failing"` for `DEGRADED`, `"no running task"` for
+  `UNAVAILABLE`). For `HEALTHY` namespaces the field is absent.
+
+| `vkgHealth` | Meaning | What to do |
+|-------------|---------|-----------|
+| `HEALTHY` | A running VKG task is passing its container health check and can answer queries. | Nothing — normal operation. |
+| `DEGRADED` | A VKG task **is running** but its container health check is failing (e.g. Ontop could not load the R2RML mappings, or the OWL2QL translation is not completing). Distinct from `UNAVAILABLE`. | Check the VKG service logs in CloudWatch. Common causes: an under-provisioned task (see [VKG Task Sizing](deploying.md#vkg-task-sizing)) or a malformed mapping. |
+| `UNAVAILABLE` | No VKG task is running for this namespace (desired count 0, or all tasks stopped). | Trigger a reload, or check for a failed deployment / circuit-breaker rollback. |
+| `PROVISIONING` | A VKG task is starting up or a new deployment is rolling out; health is not yet confirmed. | Wait — this is transient during create/reload. |
+| `UNKNOWN` | No VKG service exists for this namespace (e.g. no accepted ontology yet), or the health could not be determined. | Expected before an ontology is accepted; otherwise verify the service was provisioned. |
+
+`DEGRADED` and `UNAVAILABLE` are deliberately **disjoint**: a running-but-broken
+VKG reports `DEGRADED` (not a false `HEALTHY` and not `UNAVAILABLE`), so a
+silently-broken graph is visible rather than masked.
+
 ## Authorization
 
 | Action | Required Role |

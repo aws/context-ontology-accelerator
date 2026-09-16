@@ -67,7 +67,7 @@ apply DownloadOntology @examples([
     {
         title: "Download an ontology as Turtle"
         input: { namespaceId: "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d", ontologyId: "sales-crm" }
-        output: { body: "QHByZWZpeCBvd2w6IDxodHRwOi8vd3d3LnczLm9yZy8yMDAyLzA3L293bCM+IC4KZXg6Q3VzdG9tZXIgYSBvd2w6Q2xhc3MgLgo=" }
+        output: { downloadUrl: "https://coa-artifacts.s3.amazonaws.com/downloads/sales-analytics/sales-crm.ttl?X-Amz-Signature=abc123", expiresInSeconds: 3600 }
     }
 ])
 
@@ -235,6 +235,9 @@ apply GetOntologyOverview @examples([
                     range: "http://www.w3.org/2001/XMLSchema#string"
                 }
             ]
+            totalClasses: 1
+            totalObjectProperties: 1
+            totalDatatypeProperties: 1
         }
     }
 ])

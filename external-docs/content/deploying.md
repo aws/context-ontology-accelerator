@@ -343,9 +343,71 @@ SCL_LAMBDA_RESERVED_CONCURRENCY=0 make deploy-dev
 
 The value must be a non-negative integer; CDK fails synth otherwise. `0` (or unset via context) omits the reservation entirely — the functions then draw from the shared unreserved pool with no dedicated guarantee or cap, which is fine for a single-tenant evaluation. On a direct `cdk deploy`, pass it as context instead — `--context lambda_reserved_concurrency=0`, or set it in the `context` block of `infra/cdk.json`.
 
+### VKG Task Sizing
+
+Each namespace's Virtual Knowledge Graph runs as a Fargate task hosting Ontop.
+The task's CPU, memory, and JVM heap are configurable on `VkgStack`, and the
+**same values are propagated to the per-namespace reload Lambda** so a task
+created at deploy time and one re-created by a later reload are provisioned
+identically (a mismatch here is what caused permanently-`UNHEALTHY` VKGs — a
+reloaded task ran under-provisioned and the OWL2QL translation pass never
+finished).
+
+| `VkgStack` prop | Default | Controls |
+|-----------------|---------|----------|
+| `cpu` | `1024` (1 vCPU) | Fargate task CPU units. |
+| `memoryLimitMiB` | `2048` (2 GB) | Fargate task memory. |
+| `ontopJavaArgs` | `-Xmx1536m -Xms512m` | JVM args passed to the Ontop launcher via `ONTOP_JAVA_ARGS`. |
+
+**When to override the defaults:** increase CPU/memory (and heap in step) when a
+namespace's VKG reports `DEGRADED` health, when large-ontology reformulation
+times out, or for ontologies with many classes/properties where OWL2QL rewriting
+is expensive. As a rule of thumb for sizing by ontology complexity (measured by
+the class + property count of the induced ontology, which is what drives OWL2QL
+rewriting cost):
+
+| Ontology size | Classes + properties | Suggested `cpu` / `memoryLimitMiB` |
+|---------------|----------------------|------------------------------------|
+| Small         | up to ~200           | `1024` / `2048` (the default)      |
+| Medium        | ~200–1000            | `2048` / `4096`                    |
+| Large         | ~1000–5000           | `4096` / `8192`                    |
+| Very large    | more than ~5000      | `8192` / `16384` (and profile)     |
+
+The `1024` / `2048` default (heap `-Xmx1536m`) is sized for small-to-medium
+ontologies (up to ~1000 classes + properties). Treat these as starting points —
+if a namespace still reports `DEGRADED` after a reload, step up to the next row.
+When `ontopJavaArgs` is left unset the heap is derived automatically from
+`memoryLimitMiB` (max heap ~= 75%, initial ~= 25%), so bumping memory alone
+scales the heap in step.
+
+**Heap sizing guidance:** set the Ontop max heap (`-Xmx`) to roughly **60–75% of
+the task memory**, leaving headroom for the JVM's own overhead and the OS. For
+example, a `memoryLimitMiB: 4096` task pairs with `ontopJavaArgs:
+"-Xmx3072m -Xms1024m"`. The heap **must** be passed via `ONTOP_JAVA_ARGS` — the
+Ontop launcher does not read `JAVA_OPTS`, so a heap set there is silently ignored
+and the container falls back to its small built-in default.
+
+Configure these where you instantiate `VkgStack` in `bin/app.ts` (or your
+equivalent CDK app entry point):
+
+```typescript
+new VkgStack(app, "coa-dev-vkg", {
+  // ...existing props...
+  cpu: 2048,
+  memoryLimitMiB: 4096,
+  ontopJavaArgs: "-Xmx3072m -Xms1024m",
+});
+```
+
+After changing these, redeploy the VKG stack and trigger a reload for existing
+namespaces so their tasks pick up the new sizing.
+
 ### Internal Environment Variables
 
-These are set by infrastructure stacks and are not user-configurable:
+These are wired by the infrastructure stacks or carry in-code defaults. They are
+not part of the normal deployment interface — most deployments never touch them —
+but the ones marked as a *default* below can be overridden on the relevant Lambda
+when tuning a large or pathological source.
 
 | Variable | Set By | Purpose |
 |----------|--------|---------|
@@ -353,6 +415,20 @@ These are set by infrastructure stacks and are not user-configurable:
 | `BULK_REVIEW_PAGE_BUDGET` | `worker.py` default | Per-invocation table budget for the bulk-review worker (default `1000`); when a source has more tables, the worker processes one page, re-enqueues a continuation, and resumes across chained invocations rather than silently capping. |
 | `BULK_REVIEW_WALL_CLOCK_BUDGET_S` | `worker.py` default | Per-invocation wall-clock budget in seconds (default `240`), a second guard under the 5-minute Lambda timeout that stops the worker after the current search page and continues in a fresh invocation when neared. |
 | `REVIEW_QUEUE_URL` | `sources-stack.ts` | SQS review-queue URL the bulk-review worker re-enqueues page continuations to, wiring its own self-continuation. |
+| `DATAZONE_CLEANUP_BUDGET_S` | `sources_handler.py` default | **Upper clamp** (not an absolute deadline) on DataZone asset cleanup during source delete, in seconds (default `240`). The effective deadline is `min(this value, remaining Lambda time − 2s safety margin)`, so it can shorten the window but never extend past the real timeout. On expiry the delete returns partial-completion counts and the namespace-deletion sweep finishes the remainder, instead of the Lambda being killed mid-request. A malformed value falls back to `240`. |
+| `PROBE_TIMEOUT_MS` | `dialects.py` default | Session-level `statement_timeout` (milliseconds, default `30000`) applied on Postgres/Redshift connections before the column-cardinality probe used for enum detection. Bounds the `COUNT(*) / COUNT(DISTINCT …)` probe and the sampling query that follows it, so one wide or high-cardinality column cannot consume the whole 15-minute `sources-db-connector` budget. Must be a positive integer; a malformed or non-positive value logs a warning and falls back to the default rather than removing the bound. Set it **lower** to fail faster on pathological columns, **higher** only if legitimately large tables are being skipped — too high defeats the protection, and a timed-out column is simply treated as "not an enum" (logged as `distinct_probe_timeout`). |
+
+**Migration note for `DATAZONE_CLEANUP_BUDGET_S`.** Before the GH-137 fix this was
+an absolute wall-clock deadline that bounded only the delete loop, and its `240`
+default was 8× the `sources-api` Lambda's real 30-second timeout — so the
+graceful early-exit could never fire and deleting a several-hundred-table source
+always timed out. It is now derived from the Lambda's actual remaining time and
+bounds the DataZone search/pagination phase as well. **No action is required:**
+the new behaviour is self-correcting and strictly safer, and it stays correct if
+the Lambda timeout is ever changed. If you previously raised this value to work
+around delete timeouts, that override is now redundant and can be removed — it
+cannot extend the deadline past the real remaining time.
+
 
 ### API Request Limits and Rate Limiting
 

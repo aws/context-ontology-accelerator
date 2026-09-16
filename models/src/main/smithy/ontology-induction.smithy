@@ -439,6 +439,12 @@ operation GetProposal {
         /// enough to be returned inline.
         matchesUrl: String
 
+        /// Presigned S3 GET URL for the SHACL constraint config
+        /// (`constraints.ttl`) when it is served out-of-band. Null when no
+        /// constraints artifact exists, in which case any small inline
+        /// `constraintConfig` in `metadata` is returned instead.
+        constraintsUrl: String
+
         /// Proposal metadata (tables processed, classes created, etc.).
         metadata: ProposalMetadata
 

@@ -41,9 +41,10 @@ def _stringify_config_value(v: object) -> object:
 
     Step Functions container-override JsonPath cannot inline a JSON object or
     array and ECS env-var values must be strings, so: bools -> lower-case
-    ``"true"``/``"false"``, lists -> JSON (only ``preferred_entity_classifications``
-    today; the container json.loads it back at boot), ints -> ``str``. Anything
-    already a string (or an unexpected type) passes through unchanged.
+    ``"true"``/``"false"``, lists -> JSON (``preferred_entity_classifications``
+    and ``preferred_topics``; the container json.loads them back at boot),
+    ints -> ``str``. Anything already a string (or an unexpected type) passes
+    through unchanged.
 
     NOTE: bool is checked before int because ``isinstance(True, int)`` is True.
     """

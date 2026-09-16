@@ -510,6 +510,36 @@ list MetricSummaryList {
     member: MetricSummary
 }
 
+/// Which Tier-2 engine answers a structured query. Absent = the serve default
+/// (``nl_to_sql_first``).
+///
+/// This is a DIFFERENT axis from ``mode``: ``mode`` chooses whether the whole
+/// T1→T2→T3 cascade is replaced by the Tier-3 reasoning loop, while ``strategy``
+/// chooses which engine answers within Tier 2. Both were called "agentic" before
+/// the rebrand, which is why the distinction is spelled out here.
+///
+/// An explicit value is caller intent and is never overridden by automatic tier
+/// gating or per-query Tier-2 pruning.
+enum QueryStrategy {
+    /// Run Ontop and NL→SQL in parallel; return the higher-confidence answer.
+    BEST = "best"
+
+    /// Ontop only — the R2RML/VKG semantic path. No NL→SQL fallback.
+    ONTOP = "ontop"
+
+    /// NL→SQL only. No Ontop fallback.
+    NL_TO_SQL = "nl_to_sql"
+
+    /// Ontop first, falling back to NL→SQL.
+    ONTOP_FIRST = "ontop_first"
+
+    /// NL→SQL first, falling back to Ontop. The serve default.
+    NL_TO_SQL_FIRST = "nl_to_sql_first"
+
+    /// The bounded tool-use agent only. Opt-in; never reached as a fallback.
+    DEEP_REASONING = "deep-reasoning"
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // Operations
 // ══════════════════════════════════════════════════════════════════════════════
@@ -541,6 +571,11 @@ operation Query {
         /// "standard". "agentic" is the deprecated pre-rename spelling of
         /// "deep-reasoning" and is still accepted.
         mode: String
+
+        /// Which Tier-2 engine answers a structured query. Absent = the serve
+        /// default (``nl_to_sql_first``). Orthogonal to ``mode`` — see
+        /// ``QueryStrategy``. Ignored when the resolved tier is not 2.
+        strategy: QueryStrategy
 
         /// Dimension filters to constrain the query.
         dimensions: DimensionFilterList

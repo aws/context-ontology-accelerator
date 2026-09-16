@@ -345,3 +345,47 @@ describe("IdpAuthenticationStack (custom refresh token)", () => {
     });
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════
+// IdpAuthenticationStack — hosted-UI domain prefix published for the CSP
+// ═══════════════════════════════════════════════════════════════════
+describe("IdpAuthenticationStack (hosted-UI domain prefix, issue #130)", () => {
+  test("publishes the hosted-UI domain prefix to SSM", () => {
+    // The web stack's Content-Security-Policy needs this origin or the browser
+    // blocks the OAuth token exchange and every sign-in fails. Published rather
+    // than re-derived so the naming rule has one owner — a drifting copy would
+    // not fail a deploy, it would silently block login.
+    const app = new cdk.App({ context: TEST_CONTEXT });
+    const template = Template.fromStack(
+      new IdpAuthenticationStack(app, "TestAuthDomainPrefix"),
+    );
+
+    template.hasResourceProperties("AWS::SSM::Parameter", {
+      Name: `/${DEFAULT_RESOURCE_PREFIX}/cognito-domain-prefix`,
+    });
+  });
+
+  test("the published prefix is the one the user-pool domain actually uses", () => {
+    // Pins the two together: the parameter is only useful if it names the domain
+    // that exists. Reading them out of the same template catches a rename of
+    // either side.
+    const app = new cdk.App({ context: TEST_CONTEXT });
+    const template = Template.fromStack(
+      new IdpAuthenticationStack(app, "TestAuthDomainParity"),
+    );
+
+    const domain = Object.values(
+      template.findResources("AWS::Cognito::UserPoolDomain"),
+    )[0];
+    const param = Object.values(
+      template.findResources("AWS::SSM::Parameter"),
+    ).find(
+      (r) =>
+        r.Properties.Name ===
+        `/${DEFAULT_RESOURCE_PREFIX}/cognito-domain-prefix`,
+    );
+
+    expect(param).toBeDefined();
+    expect(param!.Properties.Value).toEqual(domain.Properties.Domain);
+  });
+});
