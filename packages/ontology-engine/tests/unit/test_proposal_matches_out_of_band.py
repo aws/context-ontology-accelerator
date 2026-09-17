@@ -149,7 +149,7 @@ class TestGetProposalRoute:
         monkeypatch.setattr(
             proposals.dynamo_store,
             "get_proposal_by_id",
-            lambda pid, namespace="default", hydrate_turtle=True, hydrate_matches=True: item,
+            lambda pid, namespace="default", hydrate_turtle=True, hydrate_matches=True, hydrate_constraints=True: item,
         )
         monkeypatch.setattr(
             proposals.dynamo_store,
@@ -160,6 +160,11 @@ class TestGetProposalRoute:
             proposals.dynamo_store,
             "presign_proposal_matches",
             lambda namespace, pid: matches_url,
+        )
+        monkeypatch.setattr(
+            proposals.dynamo_store,
+            "presign_proposal_constraints",
+            lambda namespace, pid: None,
         )
         return proposals
 

@@ -210,13 +210,13 @@ def _find_existing_asset(client: SMUSClient, project_id: str, asset_name: str) -
     :func:`_build_existing_asset_map` to avoid a per-table search.
     """
     try:
-        result = client.search_assets(
-            project_id=project_id,
-            search_text=asset_name,
-            max_results=1,
-        )
-        if result.items and result.items[0].name == asset_name:
-            return result.items[0].asset_id
+        # find_asset_by_name rather than a top-1 search: search scores every
+        # searchable attribute, so a full asset name ranks siblings of the same
+        # source alongside the exact one and the wanted asset is not reliably
+        # first. A miss here re-creates an asset that already exists.
+        asset = client.find_asset_by_name(project_id=project_id, name=asset_name)
+        if asset is not None:
+            return asset.asset_id
     except Exception:
         logger.debug("Asset search failed for %s", asset_name, exc_info=True)
     return None

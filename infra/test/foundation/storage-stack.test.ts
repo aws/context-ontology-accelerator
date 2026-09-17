@@ -154,7 +154,8 @@ describe("StorageStack", () => {
           CorsRules: Match.arrayWith([
             Match.objectLike({
               AllowedMethods: ["GET", "HEAD", "PUT"],
-              AllowedHeaders: ["Content-Type"],
+              AllowedHeaders: ["*"],
+              ExposedHeaders: ["ETag", "Content-Length", "Content-Type"],
               AllowedOrigins: ["*"],
             }),
           ]),

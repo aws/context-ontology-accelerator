@@ -144,6 +144,25 @@ def mod():
     return entrypoint
 
 
+@pytest.fixture()
+def mod_factory():
+    """Import graph_build *after* the test has set env vars.
+
+    Module-level constants (PREFERRED_TOPICS, PREFERRED_ENTITY_CLASSIFICATIONS,
+    CHUNK_SIZE, …) are evaluated at import, so a test that changes the
+    environment must trigger the import itself rather than rely on the ``mod``
+    fixture, which resolves at setup time.
+    """
+
+    def _import():
+        sys.modules.pop("coa_sources.documents.kg_build.graph_build", None)
+        from coa_sources.documents.kg_build import graph_build as entrypoint
+
+        return entrypoint
+
+    return _import
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -962,37 +981,34 @@ class TestBuildIndexingConfig:
     @patch("graphrag_toolkit.lexical_graph.indexing.extract.InferClassificationsConfig")
     @patch("graphrag_toolkit.lexical_graph.ExtractionConfig")
     @patch("graphrag_toolkit.lexical_graph.IndexingConfig")
-    def test_invalid_preferred_json_falls_through_to_infer(self, mock_ic, mock_ec, mock_icc, monkeypatch, mod):
-        """Malformed JSON must NOT crash the container; log and fall through.
-        Regression guard for the "one bad list breaks every future ingest" mode.
+    def test_invalid_preferred_json_raises_at_import(self, mock_ic, mock_ec, mock_icc, monkeypatch, mod):
+        """Malformed JSON now fails loud instead of falling through to infer.
+
+        The API 400s bad vocabulary before ingest, so a malformed env var here is a
+        pipeline defect; crashing (→ SCAN_FAILED) surfaces it, where the old
+        fall-through silently produced a graph ignoring the configured vocabulary.
         """
         monkeypatch.setenv("PREFERRED_ENTITY_CLASSIFICATIONS", "not json")
         sys.modules.pop("coa_sources.documents.kg_build.graph_build", None)
         pkg = sys.modules.get("coa_sources.documents.kg_build")
         if pkg and hasattr(pkg, "graph_build"):
             delattr(pkg, "graph_build")
-        from coa_sources.documents.kg_build import graph_build as entrypoint
-
-        entrypoint._build_indexing_config("bucket", "ns", "ds")
-        kwargs = mock_ec.call_args.kwargs
-        assert kwargs["preferred_entity_classifications"] == []
+        with pytest.raises(ValueError, match="not a JSON array of strings"):
+            from coa_sources.documents.kg_build import graph_build  # noqa: F401
 
     @patch("graphrag_toolkit.lexical_graph.indexing.extract.InferClassificationsConfig")
     @patch("graphrag_toolkit.lexical_graph.ExtractionConfig")
     @patch("graphrag_toolkit.lexical_graph.IndexingConfig")
-    def test_wellformed_json_wrong_type_falls_through_to_infer(self, mock_ic, mock_ec, mock_icc, monkeypatch, mod):
-        """Valid JSON that is NOT a list-of-strings (e.g. an object) must be
-        rejected via the ValueError branch and fall through to infer — not
-        passed to graphrag as a bad vocabulary."""
+    def test_wellformed_json_wrong_type_raises_at_import(self, mock_ic, mock_ec, mock_icc, monkeypatch, mod):
+        """Valid JSON that is NOT a list-of-strings (e.g. an object) now raises
+        rather than being swallowed and falling through to infer."""
         monkeypatch.setenv("PREFERRED_ENTITY_CLASSIFICATIONS", '{"Policy": 1}')
         sys.modules.pop("coa_sources.documents.kg_build.graph_build", None)
         pkg = sys.modules.get("coa_sources.documents.kg_build")
         if pkg and hasattr(pkg, "graph_build"):
             delattr(pkg, "graph_build")
-        from coa_sources.documents.kg_build import graph_build as entrypoint
-
-        entrypoint._build_indexing_config("bucket", "ns", "ds")
-        assert mock_ec.call_args.kwargs["preferred_entity_classifications"] == []
+        with pytest.raises(ValueError, match="not a JSON array of strings"):
+            from coa_sources.documents.kg_build import graph_build  # noqa: F401
 
     @patch("graphrag_toolkit.lexical_graph.indexing.extract.InferClassificationsConfig")
     @patch("graphrag_toolkit.lexical_graph.ExtractionConfig")
@@ -1554,3 +1570,120 @@ class TestBulkIngestRetryPatch:
         mod._graphrag_bulk_ingest_patched = False
         with patch.dict(sys.modules, {"llama_index.vector_stores.opensearch": None}):
             mod._patch_graphrag_bulk_ingest_retry()  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# Extraction vocabulary + topics (env → ExtractionConfig)
+# ---------------------------------------------------------------------------
+
+
+class TestPreferredTopics:
+    """PREFERRED_TOPICS is parsed at import and passed to ExtractionConfig."""
+
+    def test_defaults_to_empty_list(self, mod):
+        assert mod.PREFERRED_TOPICS == []
+
+    def test_parses_json_array(self, monkeypatch, mod_factory):
+        monkeypatch.setenv("PREFERRED_TOPICS", '["Black Tie Gala","Everyday Elegance"]')
+        m = mod_factory()
+        assert m.PREFERRED_TOPICS == ["Black Tie Gala", "Everyday Elegance"]
+
+    def test_strips_and_drops_empty_entries(self, monkeypatch, mod_factory):
+        monkeypatch.setenv("PREFERRED_TOPICS", '["  Black Tie Gala  ","", "   "]')
+        m = mod_factory()
+        assert m.PREFERRED_TOPICS == ["Black Tie Gala"]
+
+    def test_malformed_json_raises_at_import(self, monkeypatch, mod_factory):
+        # Fail loud: the API 400s bad vocab before ingest, so a malformed env var
+        # here is a pipeline bug. Crashing (→ SCAN_FAILED) beats extracting with no
+        # vocabulary and a warning nobody reads.
+        monkeypatch.setenv("PREFERRED_TOPICS", "Black Tie Gala,Everyday Elegance")
+        with pytest.raises(ValueError, match="not a JSON array of strings"):
+            mod_factory()
+
+    def test_non_string_members_raise_at_import(self, monkeypatch, mod_factory):
+        monkeypatch.setenv("PREFERRED_TOPICS", '["ok", 42]')
+        with pytest.raises(ValueError, match="not a JSON array of strings"):
+            mod_factory()
+
+    def test_passed_to_extraction_config(self, monkeypatch, mod_factory):
+        monkeypatch.setenv("PREFERRED_TOPICS", '["Black Tie Gala"]')
+        m = mod_factory()
+        with (
+            patch("graphrag_toolkit.lexical_graph.ExtractionConfig") as ec,
+            patch("graphrag_toolkit.lexical_graph.IndexingConfig"),
+        ):
+            m._build_indexing_config("bucket", "tenant-a", "ds-001")
+        assert ec.call_args.kwargs["preferred_topics"] == ["Black Tie Gala"]
+
+    def test_empty_list_still_passed_explicitly(self, mod):
+        """An empty list is forwarded, not omitted — the toolkit reads it as
+        'no preferred topics', matching pre-existing behaviour."""
+        with (
+            patch("graphrag_toolkit.lexical_graph.ExtractionConfig") as ec,
+            patch("graphrag_toolkit.lexical_graph.IndexingConfig"),
+        ):
+            mod._build_indexing_config("bucket", "tenant-a", "ds-001")
+        assert ec.call_args.kwargs["preferred_topics"] == []
+
+
+class TestEnvStrList:
+    """The shared JSON-list env parser used by both vocabulary axes."""
+
+    def test_valid_list(self, mod):
+        assert mod._env_str_list("NOPE", '["a","b"]') == ["a", "b"]
+
+    def test_empty_string_default(self, mod):
+        assert mod._env_str_list("NOPE", "") == []
+
+    def test_object_instead_of_array_raises(self, mod):
+        with pytest.raises(ValueError, match="not a JSON array of strings"):
+            mod._env_str_list("NOPE", '{"a":1}')
+
+    def test_non_string_member_raises(self, mod):
+        with pytest.raises(ValueError, match="not a JSON array of strings"):
+            mod._env_str_list("NOPE", '["ok", 42]')
+
+    def test_over_cap_still_truncates_not_raises(self, mod):
+        # Over-cap is the one case that degrades: the first N entries are a valid
+        # steer, so truncate with a warning rather than fail the ingest.
+        import json as _json
+
+        from coa_common.constants import MAX_VOCABULARY_ENTRIES
+
+        big = _json.dumps([f"C{i}" for i in range(MAX_VOCABULARY_ENTRIES + 5)])
+        out = mod._env_str_list("NOPE", big)
+        assert len(out) == MAX_VOCABULARY_ENTRIES
+
+
+@pytest.mark.unit
+class TestEnvStrListCap:
+    """The container clamps an over-long list even though the API already caps it.
+
+    Defence in depth for an execution started outside the API — every entry is
+    injected into the prompt for every chunk, so an unbounded list is a cost and
+    adherence problem rather than merely untidy.
+    """
+
+    def test_over_cap_list_is_truncated_not_rejected(self, monkeypatch, mod_factory):
+        import json as _json
+
+        from coa_common.constants import MAX_VOCABULARY_ENTRIES
+
+        too_many = [f"Class {i}" for i in range(MAX_VOCABULARY_ENTRIES + 25)]
+        monkeypatch.setenv("PREFERRED_TOPICS", _json.dumps(too_many))
+        m = mod_factory()
+        # Truncated, not emptied: the first N entries are still a usable steer, and
+        # failing the ingest over a too-long list would be worse than trimming it.
+        assert len(m.PREFERRED_TOPICS) == MAX_VOCABULARY_ENTRIES
+        assert m.PREFERRED_TOPICS[0] == "Class 0"
+
+    def test_list_at_the_cap_is_untouched(self, monkeypatch, mod_factory):
+        import json as _json
+
+        from coa_common.constants import MAX_VOCABULARY_ENTRIES
+
+        at_cap = [f"Class {i}" for i in range(MAX_VOCABULARY_ENTRIES)]
+        monkeypatch.setenv("PREFERRED_ENTITY_CLASSIFICATIONS", _json.dumps(at_cap))
+        m = mod_factory()
+        assert len(m.PREFERRED_ENTITY_CLASSIFICATIONS) == MAX_VOCABULARY_ENTRIES

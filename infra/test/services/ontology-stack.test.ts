@@ -1,6 +1,8 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import * as fs from "fs";
+import * as path from "path";
 import * as cdk from "aws-cdk-lib";
 import { Template, Match } from "aws-cdk-lib/assertions";
 import { OntologyStack } from "../../lib/stacks/services/ontology-stack";
@@ -465,5 +467,66 @@ describe("OntologyStack", () => {
     template.hasResourceProperties("AWS::SSM::Parameter", {
       Name: "/coa/ontology-engine/endpoint",
     });
+  });
+});
+
+// The running coa-dev-ontology-engine image accreted Critical/High OS CVEs
+// (glibc, perl, sqlite3, libssh2, gzip, pcre2) whenever a build predated the
+// Debian point releases that fix them. Two Dockerfile properties keep the image
+// patchable: a pinned base digest (supply-chain integrity + a cache-busting
+// bump lever) and a post-install `apt-get upgrade` (the only mechanism pulling
+// trixie-security point releases in). These guard both against regression —
+// removing the upgrade line, or floating the base back onto a mutable tag, is
+// exactly how the CVEs came back.
+describe("ontology-engine Dockerfile CVE hygiene", () => {
+  const dockerfile = fs.readFileSync(
+    path.join(
+      __dirname,
+      "..",
+      "..",
+      "..",
+      "packages",
+      "ontology-engine",
+      "Dockerfile",
+    ),
+    "utf8",
+  );
+
+  test("pins the base image to a digest, not a mutable tag", () => {
+    const from = dockerfile.match(
+      /^FROM .*python:3\.12-slim(@sha256:[a-f0-9]{64})?/m,
+    );
+    expect(from).not.toBeNull();
+    // A digest pin (@sha256:...) must be present; a bare/:latest tag would let
+    // the base float and silently reintroduce unpatched packages.
+    expect(from?.[1]).toMatch(/@sha256:[a-f0-9]{64}/);
+    expect(dockerfile).not.toMatch(/python:3\.12-slim\s*$/m);
+  });
+
+  test("runs apt-get upgrade so OS security point releases are applied", () => {
+    // This is the line that resolves the Debian package CVEs at build time.
+    // Must be `upgrade`, never `dist-upgrade` (which may remove packages).
+    expect(dockerfile).toMatch(/apt-get upgrade -y/);
+    expect(dockerfile).not.toMatch(/apt-get dist-upgrade/);
+  });
+
+  test("strips owlready2's unused Pellet reasoner (vulnerable bundled JARs)", () => {
+    // We use HermiT only; Pellet's vendored jars (jena, log4j 2.19, httpclient
+    // 4.2, xerces) carry CVEs and are dead weight. The build EMPTIES the pellet
+    // dir but keeps the directory itself: owlready2's reasoning.py runs
+    // os.listdir(<pkg>/pellet) at import time, so `rm -rf`-ing the whole dir
+    // would make `import owlready2` raise FileNotFoundError and break HermiT too
+    // (surfacing as REASONER_ERROR). An empty dir → os.listdir returns [].
+    expect(dockerfile).toMatch(/pellet/);
+    // Deletes the dir's contents (the vulnerable JARs) while keeping the dir.
+    expect(dockerfile).toMatch(/find\b[^\n]*"?\$PELLET_DIR"?[^\n]*-delete/);
+    // Must NOT remove the directory itself — that is the regression above.
+    expect(dockerfile).not.toMatch(/rm -rf\b[^\n]*"?\$PELLET_DIR/);
+    // And the build verifies owlready2 still imports after the strip.
+    expect(dockerfile).toMatch(/import owlready2/);
+  });
+
+  test("upgrades pip so its own advisories are picked up", () => {
+    expect(dockerfile).toMatch(/pip install[^\n]*--upgrade pip/);
   });
 });

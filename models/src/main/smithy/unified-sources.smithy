@@ -408,10 +408,99 @@ structure ColumnMetadata {
     /// unsampled columns. Used by the serve NL→SQL layer to hint the LLM
     /// with correct enum literals for WHERE clauses, and shown in the UI.
     distinctValues: StringList
+
+    /// True when a re-scan found this column removed from the source; it is
+    /// deleted on approve unless the steward keeps it. Absent/false otherwise.
+    pendingDeletion: Boolean
 }
 
 list ColumnMetadataList {
     member: ColumnMetadata
+}
+
+/// Category of a source-owned field a re-scan found changed. Groups the
+/// individual field changes so the review UI can present them by kind.
+enum RescanChangeKind {
+    /// Physical shape: data type, nullability, partition flag, storage format,
+    /// location, or partition keys.
+    SCHEMA
+
+    /// Source-derived comment on the table or column.
+    DESCRIPTION
+
+    /// Primary key or foreign keys.
+    CONSTRAINT
+
+    /// Column distinct-value sample. Reserved: sampled values are data churn
+    /// rather than a schema change, so the diff does not emit this today. Kept
+    /// for a planned re-induction signal.
+    SAMPLED_VALUES
+}
+
+/// One source-owned field that a re-scan changed vs. the last approved scan,
+/// carrying both the old and new values for the steward's before/after view.
+structure RescanFieldChange {
+    /// Field name (e.g. "description", "data_type", "primary_key").
+    @required
+    field: String
+
+    /// Which category of change this is.
+    @required
+    kind: RescanChangeKind
+
+    /// Value at the last approved scan.
+    old: String
+
+    /// Value the latest re-scan discovered.
+    new: String
+}
+
+list RescanFieldChangeList {
+    member: RescanFieldChange
+}
+
+/// How a re-scan changed a column, relative to the last approved scan.
+/// Wire values are lower-case to match what the diff has always emitted, so
+/// naming them here is not a breaking change.
+enum RescanColumnChangeStatus {
+    /// Present in the fresh scan, absent from the last approved scan.
+    ADDED = "added"
+
+    /// Present in the last approved scan, gone from the source. Deleted on
+    /// approve unless the steward keeps it.
+    REMOVED = "removed"
+
+    /// Present in both, but one or more source-owned fields differ.
+    MODIFIED = "modified"
+}
+
+/// A column a re-scan added, removed, or modified, with its changed fields.
+structure RescanColumnChange {
+    /// Column name.
+    @required
+    name: String
+
+    /// Whether the column was added, removed, or modified.
+    @required
+    status: RescanColumnChangeStatus
+
+    /// Changed source-owned fields (populated for MODIFIED).
+    fields: RescanFieldChangeList
+}
+
+list RescanColumnChangeList {
+    member: RescanColumnChange
+}
+
+/// The old-vs-new breakdown of what a re-scan changed for a table, so a Data
+/// Steward can compare against the last approved scan before approving. Present
+/// only while the source is in RESCAN_REVIEW and this table actually changed.
+structure RescanTableDiff {
+    /// Changed table-level source-owned fields (description, keys, format, ...).
+    tableFields: RescanFieldChangeList
+
+    /// Per-column added / removed / modified breakdown.
+    columns: RescanColumnChangeList
 }
 
 /// Technical metadata for a table: column count, partition keys, storage
@@ -496,11 +585,25 @@ structure TableSummary {
     /// per-column detail.
     columnsApproved: Integer
 
+    /// Number of columns the re-scan found removed from the source (retained,
+    /// pending deletion on approval). Lets the list surface column-level removals
+    /// in the Review status column.
+    columnsPendingDeletion: Integer
+
     @required
     reviewStatus: ReviewStatus
 
     /// Origin of the table's business metadata.
     enrichmentSource: String
+
+    /// True when a re-scan found this table removed from the source; it is
+    /// deleted on approve unless the steward keeps it. Absent/false otherwise.
+    pendingDeletion: Boolean
+
+    /// True when this table was created by the re-scan under review (net-new
+    /// since the last approved scan). Derived from the re-scan backup; not
+    /// persisted; absent outside RESCAN_REVIEW.
+    added: Boolean
 }
 
 list TableSummaryList {
@@ -552,6 +655,23 @@ structure ExtractionConfig {
     /// preferredEntityClassifications is set. Defaults to true.
     inferEntityClassifications: Boolean
 
+    /// Explicit TOPIC vocabulary handed to the extraction LLM. Topics are the
+    /// thematic groupings chunks are assigned to — they become ``__Topic__``
+    /// nodes and are later induced as ``skos:Concept`` — as distinct from
+    /// preferredEntityClassifications, which types the entities themselves
+    /// (``__Entity__.class``, induced as ``owl:Class``).
+    ///
+    /// The extractor prefers a listed topic when one matches the content in
+    /// meaning and specificity, and invents a name otherwise, so this is a
+    /// steer rather than a closed set. Case-sensitive, spaces allowed
+    /// (e.g. "Black Tie Gala", "Everyday Elegance").
+    ///
+    /// Leave empty (the default) to let the extractor name every topic from the
+    /// chunk text. There is deliberately no ``inferTopics`` flag: the toolkit
+    /// has no topic equivalent of the entity-classification inference pass, so
+    /// an empty list already *is* "let the model decide".
+    preferredTopics: TopicList
+
     /// Whether to route every PDF through Amazon Textract's AnalyzeDocument
     /// with TABLES feature (instead of unstructured.partition_pdf strategy=
     /// "fast", which does not detect tables). Preserves row/column structure
@@ -583,12 +703,25 @@ structure ExtractionConfig {
 
 /// A user-supplied list of entity classifications. Members must be non-empty
 /// after trim; empty strings are dropped by the API.
+@length(min: 0, max: 100)
 list EntityClassificationList {
     member: EntityClassification
 }
 
 @length(min: 1, max: 128)
 string EntityClassification
+
+/// A user-supplied list of preferred topic names. Members must be non-empty
+/// after trim; empty strings are dropped by the API.
+@length(min: 0, max: 100)
+list TopicList {
+    member: Topic
+}
+
+/// A topic name. Longer than EntityClassification because editorial topic names
+/// are phrases ("Black Tie Gala Dress Code"), not single labels.
+@length(min: 1, max: 256)
+string Topic
 
 list S3PrefixList {
     member: S3Prefix
@@ -703,6 +836,15 @@ enum SourceStatus {
     /// Enrichment complete, awaiting human review (database sources only)
     PENDING_REVIEW
 
+    /// A re-scan of an already-APPROVED source detected changes that are
+    /// awaiting steward review. Distinct from PENDING_REVIEW (initial
+    /// enrichment) so the UI can show "approved source, N changes to review"
+    /// and so downstream consumers that gate on APPROVED treat the source as
+    /// not-currently-approved while its drift is under review. On approve the
+    /// source returns to APPROVED; on reject it returns to APPROVED unchanged.
+    /// (database sources only)
+    RESCAN_REVIEW
+
     /// Bulk approve in progress — async worker is writing DataZone revisions
     /// (database sources only)
     APPROVING
@@ -762,6 +904,16 @@ enum SourceScanJobStatus {
 
     /// Scan job was cancelled.
     CANCELLED
+}
+
+/// Kind of entry in a source's scan history. A row with no explicit type is a
+/// SCAN (the scan-job rows written before review events existed carry none).
+enum ScanJobEventType {
+    /// A discovery/enrichment scan of the source.
+    SCAN
+
+    /// A steward approve/reject decision (including re-scan approve/reject).
+    REVIEW
 }
 
 // =============================================================================
@@ -1166,6 +1318,15 @@ operation RescanSource {
         @required
         @httpLabel
         sourceId: String
+
+        /// Acknowledge that starting this re-scan discards an open re-scan
+        /// review. Required only when the source is in RESCAN_REVIEW: a fresh
+        /// re-scan re-diffs against the last APPROVED state, so any review
+        /// decisions or edits made inside the open review window are lost.
+        /// Omitting it in that state returns 409 rather than silently
+        /// discarding the review. Ignored from every other status, where a
+        /// re-scan discards nothing.
+        confirmDiscardOpenReview: Boolean
     }
 
     output := {
@@ -1337,6 +1498,20 @@ structure GetSourceTableOutput {
     foreignKeys: ForeignKeyList
 
     technicalMetadata: TechnicalMetadataOutput
+
+    /// True when a re-scan found this table removed from the source; it is
+    /// deleted on approve unless the steward keeps it. Absent/false otherwise.
+    pendingDeletion: Boolean
+
+    /// Old-vs-new breakdown of what the current re-scan changed for this table,
+    /// for the steward's before/after review. Present only while the source is
+    /// in RESCAN_REVIEW and this table changed; absent otherwise.
+    rescanDiff: RescanTableDiff
+
+    /// True when the current re-scan discovered this table for the first time
+    /// (it did not exist in the last approved scan). It therefore has no
+    /// old-vs-new diff — the whole table is new. Absent/false otherwise.
+    added: Boolean
 }
 
 // ── Resource-oriented review endpoints ────────────────────────────────────────
@@ -1540,6 +1715,54 @@ operation ReviewSourceColumn {
     }
 }
 
+/// Decline a re-scan-flagged removal so approving the re-scan will NOT delete
+/// it. Drops the table (or one column of it) from the re-scan removal set in the
+/// backup blob; the surfaced pendingDeletion marker clears on the next read.
+///
+/// "Removed from the source" does not always mean "deleted" — a partial scan, a
+/// permission change, or a narrowed include/exclude filter can drop a table or
+/// column that should be kept. This lets the steward veto a specific removal.
+///
+/// Only valid while the source is in RESCAN_REVIEW. Omit columnName to keep the
+/// whole table; set it to keep one removed column. Idempotent — keeping an item
+/// that is not in the removal set is a no-op.
+@http(method: "PUT", uri: "/namespaces/{namespaceId}/sources/{sourceId}/tables/{tableId}/keep")
+@idempotent
+operation KeepRescanRemoval {
+    input := {
+        @required
+        @httpLabel
+        namespaceId: Uuid
+
+        /// Identifier of the source containing the flagged table.
+        @required
+        @httpLabel
+        sourceId: String
+
+        @required
+        @httpLabel
+        tableId: TableId
+
+        /// If set, keep only this removed column of the table. Omit to keep the
+        /// whole removed table.
+        columnName: ColumnName
+    }
+
+    output := {
+        /// Identifier of the table the kept item belongs to.
+        @required
+        tableId: String
+
+        /// The kept column, echoed back only when keeping a single column.
+        columnName: String
+
+        /// The item's removal state after the keep. Always false — the item is
+        /// no longer pending deletion.
+        @required
+        pendingDeletion: Boolean
+    }
+}
+
 /// Edit a single column's business metadata. Sets
 /// enrichmentSource = STEWARD_EDITED. Does NOT change reviewStatus.
 @http(
@@ -1701,4 +1924,78 @@ structure GetSourceScanJobOutput {
 /// Qualified `database.table` names of tables a scan listed but could not read.
 list FailedTableList {
     member: String
+}
+
+// ── Scan history (DATABASE sources) ───────────────────────────────────────────
+/// List the scan and review history for a DATABASE source, newest first.
+/// Combines discovery/enrichment scan rows with steward approve/reject events
+/// so the console can show a real audit trail instead of a derived guess.
+@http(method: "GET", uri: "/namespaces/{namespaceId}/sources/{sourceId}/scan")
+@readonly
+operation ListSourceScanJobs {
+    input := {
+        @required
+        @httpLabel
+        namespaceId: Uuid
+
+        /// Identifier of the source whose history to list.
+        @required
+        @httpLabel
+        sourceId: String
+    }
+
+    output: ListSourceScanJobsOutput
+}
+
+@output
+structure ListSourceScanJobsOutput {
+    /// History entries, newest first.
+    @required
+    items: ScanJobEntryList
+}
+
+/// A single scan-history entry: either a scan of the source or a steward
+/// review decision.
+list ScanJobEntryList {
+    member: ScanJobEntry
+}
+
+/// One row in a source's scan history.
+structure ScanJobEntry {
+    /// When the entry occurred (scan start, or the moment the review resolved).
+    @required
+    at: Timestamp
+
+    /// Whether this row is a scan or a review event. Absent on legacy scan-job
+    /// rows written before review events existed — treat a missing value as SCAN.
+    eventType: ScanJobEventType
+
+    /// Status of the row. For a SCAN this is the scan-job status
+    /// (IN_PROGRESS/DISCOVERING/ENRICHING/COMPLETED/FAILED/CANCELLED); for a
+    /// REVIEW it is the terminal source status the decision produced
+    /// (e.g. APPROVED, REJECTED, APPROVAL_FAILED). Free-form because the two
+    /// event kinds draw from different status vocabularies.
+    status: String
+
+    /// For a SCAN row: whether it was a full or incremental (re-scan) run.
+    scanType: String
+
+    /// Number of tables discovered by the scan (SCAN rows).
+    tablesDiscovered: Integer
+
+    /// Number of tables approved as of this review (REVIEW rows).
+    tablesApproved: Integer
+
+    /// Timestamp when the scan job completed (SCAN rows).
+    completedAt: Timestamp
+
+    /// Error message if the scan job failed (SCAN rows).
+    errorMessage: String
+
+    /// The steward's decision for a REVIEW row.
+    decision: ReviewDecision
+
+    /// True when this event resolved a re-scan review (rather than an initial
+    /// approve/reject). REVIEW rows only.
+    isRescan: Boolean
 }

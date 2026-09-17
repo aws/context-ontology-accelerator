@@ -39,6 +39,7 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 import boto3
@@ -46,13 +47,16 @@ from botocore.exceptions import ClientError
 from coa_common import resolve_region
 from coa_common.dao import DynamoDBDAO
 from coa_common.datazone_forms import FORM_TYPE_NAME, build_forms_input, deserialize_form
+from coa_common.domain_models import Table
 from coa_common.metadata_store import SMUSClient
 from coa_common.review_logic import apply_decision_to_table
+from coa_common.s3 import get_s3_client, read_file_bytes
 from coa_control_plane_server.models.review_decision import ReviewDecision
 from coa_control_plane_server.models.review_status import ReviewStatus
 from coa_control_plane_server.models.source_status import SourceStatus
 
 from coa_sources.database.metrics import emit_metric
+from coa_sources.database.rescan_backup import S3_ABSENT_CODES, backup_s3_key
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
@@ -79,6 +83,11 @@ _PAGE_WALL_CLOCK_BUDGET_S = int(os.environ.get("BULK_REVIEW_WALL_CLOCK_BUDGET_S"
 _PARALLELISM = int(os.environ.get("BULK_REVIEW_PARALLELISM", "10"))
 
 _REVIEW_QUEUE_URL: str = os.environ.get("REVIEW_QUEUE_URL", "")
+
+# S3 bucket holding the re-scan backup blob written by discovery. Read here to
+# delete the re-scan's removed items on approve and to restore the pre-rescan
+# state on reject. Only the re-scan approve/reject paths use it.
+_BUCKET_NAME: str = os.environ.get("BUCKET_NAME", "")
 
 _sqs = None
 
@@ -110,6 +119,11 @@ class BulkReviewMessage:
     decision: str  # ReviewDecision value
     next_token: str | None = None
     tables_approved_so_far: int = 0
+    # True when the source is in RESCAN_REVIEW (set by the API at enqueue time).
+    # An approve then also deletes the re-scan's removed tables/columns; a reject
+    # RESTORES the pre-rescan state from the S3 backup and lands the source back
+    # on APPROVED (not REJECTED) — see process_bulk_review.
+    is_rescan: bool = False
 
 
 @dataclass
@@ -176,12 +190,18 @@ def parse_message(body: str | dict[str, Any]) -> BulkReviewMessage:
     except (TypeError, ValueError):
         approved_so_far = 0
 
+    # Accept both a JSON bool and the string form (the scan pipeline threads
+    # isRescan as a string; the API enqueues a bool).
+    raw_rescan = payload.get("isRescan")
+    is_rescan = raw_rescan is True or str(raw_rescan).strip().lower() == "true"
+
     return BulkReviewMessage(
         namespace_id=str(namespace_id),
         source_id=str(source_id),
         decision=str(decision),
         next_token=str(next_token) if next_token else None,
         tables_approved_so_far=approved_so_far,
+        is_rescan=is_rescan,
     )
 
 
@@ -309,6 +329,54 @@ def _write_revision(client: SMUSClient, asset: dict[str, Any]) -> str | None:
         return table.table_id
 
 
+def _write_review_scan_job(
+    scan_jobs_table: str,
+    region: str,
+    namespace_id: str,
+    source_id: str,
+    decision: str,
+    is_rescan: bool,
+    tables_approved: int,
+    status: str,
+) -> None:
+    """Append a REVIEW event row to the source-scan-jobs table (best-effort).
+
+    Records the approve/reject outcome so the Scan History tab can show a real
+    audit row instead of a client-derived guess. Shares the scan-jobs table with
+    discovery scan rows (PK=SRC#{sourceId}, SK=ISO timestamp); readers treat a
+    row with no ``eventType`` as a SCAN, so REVIEW rows are tagged explicitly.
+
+    Failure here MUST NOT fail the review — the terminal source state is already
+    written by the time we get here — so any error is logged and swallowed.
+    """
+    if not scan_jobs_table:
+        # No scan-jobs table configured (e.g. a misconfigured env): skip the
+        # audit row rather than raising over a non-critical write.
+        return
+    now = datetime.now(tz=UTC).isoformat()
+    try:
+        DynamoDBDAO(scan_jobs_table, region=region).put(
+            {
+                "PK": f"SRC#{source_id}",
+                "SK": now,
+                "sourceId": source_id,
+                "namespaceId": namespace_id,
+                "eventType": "REVIEW",
+                "decision": decision,
+                "isRescan": bool(is_rescan),
+                "tablesApproved": tables_approved,
+                "status": status,
+                "createdAt": now,
+                "startedAt": now,
+            }
+        )
+    except Exception:
+        logger.warning(
+            "review_scan_job_write_failed",
+            extra={"source_id": source_id, "namespace_id": namespace_id, "decision": decision},
+        )
+
+
 def _persist_terminal_state(
     sources_table: str,
     region: str,
@@ -316,13 +384,40 @@ def _persist_terminal_state(
     source_id: str,
     new_status: str,
     tables_approved: int,
+    extra_fields: dict[str, Any] | None = None,
+    *,
+    scan_jobs_table: str = "",
+    decision: str | None = None,
+    is_rescan: bool = False,
 ) -> None:
-    """Update the source record with final status and tablesApproved counter."""
+    """Update the source record with final status and tablesApproved counter.
+
+    ``extra_fields`` merges additional source-record fields — used by a re-scan
+    reject to restore the pre-rescan summary counts alongside the status.
+
+    When ``scan_jobs_table`` and ``decision`` are supplied, a REVIEW audit row
+    is appended to the scan-jobs table AFTER the source update succeeds. That
+    write is best-effort and never fails the review.
+    """
+    fields: dict[str, Any] = {"status": new_status, "tablesApproved": tables_approved}
+    if extra_fields:
+        fields.update(extra_fields)
     DynamoDBDAO(sources_table, region=region).update(
         {"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"},
-        {"status": new_status, "tablesApproved": tables_approved},
+        fields,
         raise_on_error=False,
     )
+    if decision is not None:
+        _write_review_scan_job(
+            scan_jobs_table,
+            region,
+            namespace_id,
+            source_id,
+            decision,
+            is_rescan,
+            tables_approved,
+            new_status,
+        )
 
 
 def _verify_in_transient(
@@ -412,6 +507,195 @@ def _rejected_key_column_reason(assets: list[dict[str, Any]], source_id: str) ->
     )
 
 
+def _read_backup(source_id: str) -> dict[str, Any] | None:
+    """Read the re-scan backup blob for a source, or None if there is none.
+
+    A no-drift re-scan writes no backup, so a missing object (NoSuchKey) is a
+    legitimate empty change-set and returns None. Any OTHER S3 error is
+    re-raised so the worker fails the job rather than silently skipping the
+    restore/delete an approve or reject depends on.
+    """
+    if not _BUCKET_NAME:
+        raise RuntimeError("BUCKET_NAME not set; cannot read the re-scan backup for approve/reject")
+    key = backup_s3_key(source_id)
+    try:
+        raw = read_file_bytes(get_s3_client(), _BUCKET_NAME, key)
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") in S3_ABSENT_CODES:
+            return None
+        raise
+    return json.loads(raw)
+
+
+def _delete_backup(source_id: str) -> None:
+    """Delete the re-scan backup blob once a re-scan review is resolved.
+
+    The blob's PRESENCE is what a later re-scan uses to detect that an
+    un-approved re-scan is still open — it reconstructs the approved baseline
+    from it (see ``rescan.reconstruct_approved_baseline``). Clearing it on both
+    approve and reject keeps "backup present == open un-approved re-scan"
+    reliable, so the next re-scan of a now-approved source diffs against the
+    live assets directly. Best-effort: S3 delete is idempotent (a missing key
+    is a no-op) and any error is swallowed so a resolved review is not blocked
+    on cleanup.
+    """
+    if not _BUCKET_NAME:
+        return
+    try:
+        get_s3_client().delete_object(Bucket=_BUCKET_NAME, Key=backup_s3_key(source_id))
+    except Exception:
+        logger.warning("rescan_backup_delete_failed", extra={"source_id": source_id})
+
+
+def _resolve_asset_ids(client: SMUSClient, project_id: str, source_id: str, wanted_names: set[str]) -> dict[str, str]:
+    """Map DataZone asset names to ids for a bounded set of re-scan targets.
+
+    Pages ``search_assets`` (the same search the cascade uses) only until every
+    wanted name is found or the source is exhausted — the change-set is small,
+    so this rarely walks past the first page.
+    """
+    if not wanted_names:
+        return {}
+    found: dict[str, str] = {}
+    token: str | None = None
+    while wanted_names - set(found):
+        result = client.search_assets(
+            project_id=project_id, search_text=f"DS#{source_id}", max_results=50, next_token=token
+        )
+        for a in result.items:
+            if a.name in wanted_names:
+                found[a.name] = a.asset_id
+        token = result.next_token
+        if not token:
+            break
+    return found
+
+
+def _extract_table(detail: dict[str, Any], source_id: str) -> Table | None:
+    """Deserialize the CoaTableMetadata form out of a get_asset_forms response."""
+    for form in detail.get("formsOutput", []):
+        if form.get("formName") != FORM_TYPE_NAME:
+            continue
+        try:
+            return deserialize_form(json.loads(form["content"]), data_source_id=source_id)
+        except Exception:
+            return None
+    return None
+
+
+def _apply_rescan_removals(
+    client: SMUSClient, project_id: str, source_id: str, backup: dict[str, Any] | None
+) -> tuple[list[str], int]:
+    """Delete a re-scan's removed tables and drop its removed columns (approve).
+
+    Returns ``(failures, deleted_table_count)``: ``failures`` are table_ids whose
+    delete/column-drop raised; ``deleted_table_count`` is how many removed tables
+    were actually deleted, so the caller can keep ``tablesApproved`` honest. A
+    missing backup (no-drift re-scan) is a no-op.
+    """
+    if not backup:
+        return [], 0
+    removed_tables: list[str] = list(backup.get("removed_tables", []))
+    removed_columns: dict[str, list[str]] = dict(backup.get("removed_columns", {}))
+    if not removed_tables and not removed_columns:
+        return [], 0
+
+    wanted = {f"DS#{source_id}:{tid}" for tid in removed_tables + list(removed_columns)}
+    asset_ids = _resolve_asset_ids(client, project_id, source_id, wanted)
+    failures: list[str] = []
+    deleted = 0
+
+    for tid in removed_tables:
+        asset_id = asset_ids.get(f"DS#{source_id}:{tid}")
+        if not asset_id:
+            continue  # already absent — nothing to delete
+        try:
+            client.delete_asset(asset_id=asset_id)
+            deleted += 1
+        except Exception:
+            logger.exception("rescan_delete_removed_table_failed", extra={"source_id": source_id, "table_id": tid})
+            failures.append(tid)
+
+    for tid, cols in removed_columns.items():
+        name = f"DS#{source_id}:{tid}"
+        asset_id = asset_ids.get(name)
+        if not asset_id:
+            continue
+        try:
+            table = _extract_table(client.get_asset_forms(asset_id=asset_id), source_id)
+            if table is None:
+                failures.append(tid)
+                continue
+            drop = set(cols)
+            table.columns = [c for c in table.columns if c.name not in drop]
+            client.create_asset_revision(
+                asset_id=asset_id,
+                name=name,
+                description=table.business_metadata.description or "",
+                forms_input=build_forms_input(table),
+            )
+        except Exception:
+            logger.exception("rescan_drop_removed_columns_failed", extra={"source_id": source_id, "table_id": tid})
+            failures.append(tid)
+
+    return failures, deleted
+
+
+def _process_rescan_reject(
+    client: SMUSClient, project_id: str, source_id: str, backup: dict[str, Any] | None
+) -> list[str]:
+    """Restore the pre-rescan state on a re-scan reject; returns failed table_ids.
+
+    Modified tables are re-written from their backed-up form, added tables are
+    deleted, and removed tables are left untouched (still their approved selves).
+    A missing backup (no-drift re-scan) is a no-op. This deliberately does NOT
+    run the reject cascade — a re-scan reject discards the fresh scan and keeps
+    what was already approved.
+    """
+    if not backup:
+        return []
+    modified: dict[str, Any] = dict(backup.get("modified_backup", {}))
+    added: list[str] = list(backup.get("added_tables", []))
+    if not modified and not added:
+        return []
+
+    wanted = {f"DS#{source_id}:{tid}" for tid in list(modified) + added}
+    asset_ids = _resolve_asset_ids(client, project_id, source_id, wanted)
+    failures: list[str] = []
+
+    for tid, stored_form in modified.items():
+        name = f"DS#{source_id}:{tid}"
+        asset_id = asset_ids.get(name)
+        if not asset_id:
+            # The overwritten asset should still exist; a miss means we cannot
+            # restore it — flag rather than silently leave the rejected scan live.
+            failures.append(tid)
+            continue
+        try:
+            table = deserialize_form(stored_form, data_source_id=source_id)
+            client.create_asset_revision(
+                asset_id=asset_id,
+                name=name,
+                description=table.business_metadata.description or "",
+                forms_input=build_forms_input(table),
+            )
+        except Exception:
+            logger.exception("rescan_restore_modified_failed", extra={"source_id": source_id, "table_id": tid})
+            failures.append(tid)
+
+    for tid in added:
+        asset_id = asset_ids.get(f"DS#{source_id}:{tid}")
+        if not asset_id:
+            continue  # never created or already gone
+        try:
+            client.delete_asset(asset_id=asset_id)
+        except Exception:
+            logger.exception("rescan_delete_added_failed", extra={"source_id": source_id, "table_id": tid})
+            failures.append(tid)
+
+    return failures
+
+
 def process_bulk_review(
     *,
     msg: BulkReviewMessage,
@@ -419,6 +703,7 @@ def process_bulk_review(
     project_id: str,
     sources_table: str,
     region: str,
+    scan_jobs_table: str,
 ) -> BulkReviewResult:
     """Run one page of the bulk review pipeline for a source, paging via SQS.
 
@@ -442,6 +727,10 @@ def process_bulk_review(
     fully approved with no silent drop (#853).
     """
     transient, success_terminal, failure_terminal = _lifecycle(msg.decision)
+    # A re-scan reject discards the fresh scan and keeps what was already
+    # approved, so it lands the source back on APPROVED — not REJECTED.
+    if msg.is_rescan and msg.decision == ReviewDecision.REJECTED:
+        success_terminal = SourceStatus.APPROVED
 
     if not _verify_in_transient(sources_table, region, msg.namespace_id, msg.source_id, transient):
         logger.info(
@@ -453,6 +742,73 @@ def process_bulk_review(
             },
         )
         return BulkReviewResult(tables_total=0, tables_changed=0, tables_failed=[])
+
+    # Re-scan REJECT is a RESTORE, not a cascade: re-write the modified assets
+    # from the S3 backup, delete the added ones, leave the removed ones, and
+    # return the source to APPROVED. Bounded by the change-set, so it does not
+    # page like the approve cascade.
+    if msg.is_rescan and msg.decision == ReviewDecision.REJECTED:
+        backup = _read_backup(msg.source_id)
+        reject_failed = _process_rescan_reject(client, project_id, msg.source_id, backup)
+        if reject_failed:
+            # Leave the source in REJECTION_FAILED for manual intervention; don't
+            # rewrite counts onto a half-restored state.
+            _persist_terminal_state(
+                sources_table,
+                region,
+                msg.namespace_id,
+                msg.source_id,
+                failure_terminal,
+                msg.tables_approved_so_far,
+                scan_jobs_table=scan_jobs_table,
+                decision=msg.decision,
+                is_rescan=msg.is_rescan,
+            )
+        else:
+            # Restore the pre-rescan summary counts so the source's numbers match
+            # the restored (pre-rescan) assets.
+            prior = (backup or {}).get("source_summary") or {}
+            restore: dict[str, Any] = {
+                k: prior[k] for k in ("discoveredSchemas", "lastScanAt", "lastScanJobId") if k in prior
+            }
+            # tablesDiscovered is numeric on the source record and the GetSource
+            # response model requires a number. The backup stores it as a JSON
+            # string, so coerce it back to int (as tablesApproved already is
+            # below); copying the string through makes the detail endpoint fail
+            # model validation and the source page 500s.
+            if "tablesDiscovered" in prior:
+                # A corrupt or non-numeric backup value must not fail the whole
+                # reject — that would strand the source in REJECTION_FAILED with
+                # no way back. Skip the restore instead, leaving the live count
+                # in place: slightly stale beats both a crash and a wrong zero.
+                try:
+                    restore["tablesDiscovered"] = int(prior["tablesDiscovered"])
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "rescan_reject_bad_tables_discovered_skipped",
+                        extra={
+                            "source_id": msg.source_id,
+                            "value": repr(prior["tablesDiscovered"]),
+                        },
+                    )
+            _persist_terminal_state(
+                sources_table,
+                region,
+                msg.namespace_id,
+                msg.source_id,
+                success_terminal,
+                int(prior.get("tablesApproved", msg.tables_approved_so_far) or 0),
+                extra_fields=restore,
+                scan_jobs_table=scan_jobs_table,
+                decision=msg.decision,
+                is_rescan=msg.is_rescan,
+            )
+            # Review resolved (reject applied cleanly) — clear the backup so its
+            # presence reliably signals an OPEN un-approved re-scan to any later
+            # re-scan. Skipped on the failure branch above (state left for manual
+            # intervention; the backup is still needed to retry the restore).
+            _delete_backup(msg.source_id)
+        return BulkReviewResult(tables_total=len(reject_failed), tables_changed=0, tables_failed=reject_failed)
 
     deadline = time.monotonic() + _PAGE_WALL_CLOCK_BUDGET_S if _PAGE_WALL_CLOCK_BUDGET_S > 0 else None
     assets, remaining_token = _load_asset_page(
@@ -474,6 +830,9 @@ def process_bulk_review(
             msg.source_id,
             success_terminal,
             tables_approved=msg.tables_approved_so_far,
+            scan_jobs_table=scan_jobs_table,
+            decision=msg.decision,
+            is_rescan=msg.is_rescan,
         )
         return BulkReviewResult(tables_total=0, tables_changed=0, tables_failed=[])
 
@@ -545,8 +904,37 @@ def process_bulk_review(
             tables_failed=[],
         )
 
+    # Final page of a re-scan APPROVE: every changed item is now APPROVED, so
+    # delete the tables/columns the re-scan flagged as removed (recorded in the
+    # S3 backup). Runs once — only on the last page and only if the cascade had
+    # no failures — and keeps the approved count honest for the deleted tables.
+    if msg.is_rescan and msg.decision == ReviewDecision.APPROVED and remaining_token is None and not failed:
+        removal_failures, deleted_removed = _apply_rescan_removals(
+            client, project_id, msg.source_id, _read_backup(msg.source_id)
+        )
+        failed.extend(removal_failures)
+        tables_approved = max(0, tables_approved - deleted_removed)
+
     new_status = success_terminal if not failed else failure_terminal
-    _persist_terminal_state(sources_table, region, msg.namespace_id, msg.source_id, new_status, tables_approved)
+    _persist_terminal_state(
+        sources_table,
+        region,
+        msg.namespace_id,
+        msg.source_id,
+        new_status,
+        tables_approved,
+        scan_jobs_table=scan_jobs_table,
+        decision=msg.decision,
+        is_rescan=msg.is_rescan,
+    )
+
+    # Terminal page of a successful re-scan APPROVE (removals done above with no
+    # failures): the review is resolved, so clear the backup — same signal
+    # hygiene as the reject path. Only here: continuation pages return earlier,
+    # and a failed page (failed non-empty) is excluded so the backup survives
+    # for retry/inspection.
+    if msg.is_rescan and msg.decision == ReviewDecision.APPROVED and remaining_token is None and not failed:
+        _delete_backup(msg.source_id)
 
     return BulkReviewResult(
         tables_total=len(assets),
@@ -561,6 +949,9 @@ def process_bulk_review(
 
 
 _SOURCES_TABLE: str = os.environ.get("SOURCES_TABLE", "")
+# Scan-history store. A REVIEW audit row is appended here on each terminal
+# approve/reject so the console can show the real history (best-effort).
+_SOURCE_SCAN_JOBS_TABLE: str = os.environ.get("SOURCE_SCAN_JOBS_TABLE", "")
 _NAMESPACES_TABLE: str = os.environ.get("NAMESPACES_TABLE", "")
 _SMUS_DOMAIN_ID: str = os.environ.get("SMUS_DOMAIN_ID", "")
 _PROJECT_ACCESS_ROLE_ARN: str = os.environ.get("PROJECT_ACCESS_ROLE_ARN", "")
@@ -630,6 +1021,7 @@ def handler(event: dict[str, Any], context: object) -> None:
                 project_id=project_id,
                 sources_table=_SOURCES_TABLE,
                 region=_AWS_REGION,
+                scan_jobs_table=_SOURCE_SCAN_JOBS_TABLE,
             )
             logger.info(
                 "bulk_review_complete",

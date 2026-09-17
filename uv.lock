@@ -614,7 +614,7 @@ wheels = [
 
 [[package]]
 name = "coa"
-version = "0.3.1"
+version = "0.3.2"
 source = { virtual = "." }
 
 [package.dev-dependencies]
@@ -653,7 +653,7 @@ dev = [
 
 [[package]]
 name = "coa-common"
-version = "0.3.1"
+version = "0.3.2"
 source = { editable = "libs/common" }
 dependencies = [
     { name = "boto3" },
@@ -682,7 +682,7 @@ requires-dist = [
 
 [[package]]
 name = "coa-control-plane"
-version = "0.3.1"
+version = "0.3.2"
 source = { editable = "packages/control-plane" }
 dependencies = [
     { name = "boto3" },
@@ -720,7 +720,7 @@ requires-dist = [{ name = "pydantic", specifier = ">=2.0" }]
 
 [[package]]
 name = "coa-data-layer"
-version = "0.3.1"
+version = "0.3.2"
 source = { editable = "packages/data-layer" }
 dependencies = [
     { name = "coa-common" },
@@ -742,7 +742,7 @@ requires-dist = [{ name = "pydantic", specifier = ">=2.0" }]
 
 [[package]]
 name = "coa-mcp"
-version = "0.3.1"
+version = "0.3.2"
 source = { editable = "packages/mcp-server" }
 dependencies = [
     { name = "coa-common" },
@@ -769,7 +769,7 @@ requires-dist = [
 
 [[package]]
 name = "coa-metrics"
-version = "0.3.1"
+version = "0.3.2"
 source = { editable = "packages/metric-service" }
 dependencies = [
     { name = "boto3" },
@@ -798,7 +798,7 @@ requires-dist = [
 
 [[package]]
 name = "coa-ontology"
-version = "0.3.1"
+version = "0.3.2"
 source = { editable = "packages/ontology-engine" }
 dependencies = [
     { name = "aiosqlite" },
@@ -866,7 +866,7 @@ dev = [
 
 [[package]]
 name = "coa-serve"
-version = "0.3.1"
+version = "0.3.2"
 source = { editable = "packages/context-manager" }
 dependencies = [
     { name = "aiomysql" },
@@ -925,7 +925,7 @@ requires-dist = [
 
 [[package]]
 name = "coa-sources"
-version = "0.3.1"
+version = "0.3.2"
 source = { editable = "packages/sources" }
 dependencies = [
     { name = "boto3" },
@@ -937,6 +937,7 @@ dependencies = [
 [package.dev-dependencies]
 integ = [
     { name = "pytest-xdist" },
+    { name = "rdflib" },
     { name = "requests" },
 ]
 
@@ -951,12 +952,13 @@ requires-dist = [
 [package.metadata.requires-dev]
 integ = [
     { name = "pytest-xdist", specifier = ">=3.0" },
+    { name = "rdflib", specifier = ">=7.0" },
     { name = "requests", specifier = ">=2.34.2" },
 ]
 
 [[package]]
 name = "coa-vkg"
-version = "0.3.1"
+version = "0.3.2"
 source = { virtual = "packages/vkg" }
 dependencies = [
     { name = "coa-common" },

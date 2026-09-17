@@ -160,7 +160,10 @@ class TestGetNamespace:
     def test_includes_vkg_health(self):
         with (
             patch(f"{MODULE}._get_ns_dao") as mock,
-            patch(f"{MODULE}.resolve_vkg_health", return_value="HEALTHY"),
+            patch(
+                f"{MODULE}.resolve_vkg_health_with_reason",
+                return_value=("HEALTHY", None),
+            ),
         ):
             dao = MagicMock()
             mock.return_value = dao
@@ -180,6 +183,36 @@ class TestGetNamespace:
         assert resp["statusCode"] == 200
         body = json.loads(resp["body"])
         assert body["namespace"]["vkgHealth"] == "HEALTHY"
+        # HEALTHY carries no reason -> the None value is filtered out of the body.
+        assert "vkgHealthReason" not in body["namespace"]
+
+    def test_includes_vkg_health_reason_when_degraded(self):
+        with (
+            patch(f"{MODULE}._get_ns_dao") as mock,
+            patch(
+                f"{MODULE}.resolve_vkg_health_with_reason",
+                return_value=("DEGRADED", "container health check failing"),
+            ),
+        ):
+            dao = MagicMock()
+            mock.return_value = dao
+            dao.get.return_value = _NS_ITEM
+
+            from coa_control_plane.namespace.get_handler import handler
+
+            resp = handler(
+                {
+                    "pathParameters": {"namespaceId": "ns-123"},
+                    "httpMethod": "GET",
+                    "resource": "/namespaces/{namespaceId}",
+                },
+                None,
+            )
+
+        assert resp["statusCode"] == 200
+        body = json.loads(resp["body"])
+        assert body["namespace"]["vkgHealth"] == "DEGRADED"
+        assert body["namespace"]["vkgHealthReason"] == "container health check failing"
 
     def test_omits_athena_workgroup_name_when_absent(self):
         with patch(f"{MODULE}._get_ns_dao") as mock:

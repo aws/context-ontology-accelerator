@@ -511,6 +511,39 @@ describe("SourcesStack", () => {
         ).toBe("scl");
       },
     );
+
+    it("grants the sources-api role s3:ListBucket on the sources bucket", () => {
+      // S3 returns NoSuchKey for a missing key only to a caller that also holds
+      // ListBucket; otherwise GetObject on an absent key answers AccessDenied.
+      // A re-scan that finds no drift writes no backup blob yet still leaves the
+      // source in RESCAN_REVIEW, so the tables API reads a key that is legitimately
+      // absent. Without this grant the read helper's absent-key branch cannot fire
+      // and every no-drift re-scan 500s the tables page. Unit tests mock S3 and
+      // cannot catch a missing grant — only this template assertion does.
+      const apiFn = Object.values(
+        template.findResources("AWS::Lambda::Function"),
+      ).find((fn: any) =>
+        String(fn.Properties?.FunctionName ?? "").endsWith("sources-api"),
+      );
+      expect(apiFn).toBeDefined();
+      const apiRoleId = (apiFn as any).Properties.Role["Fn::GetAtt"][0];
+
+      const statements = Object.values(
+        template.findResources("AWS::IAM::Policy"),
+      )
+        .filter((p: any) =>
+          p.Properties.Roles?.some((r: any) => r.Ref === apiRoleId),
+        )
+        .flatMap((p: any) => p.Properties.PolicyDocument.Statement);
+
+      // Bucket-level resource, not a /*/rescan-backup/* prefix: the 403-vs-404
+      // choice on GetObject is not governed by an s3:prefix condition, so a
+      // narrower grant would leave the 500 in place.
+      const listStatements = statements.filter((s: any) =>
+        [s.Action].flat().includes("s3:ListBucket"),
+      );
+      expect(listStatements.length).toBeGreaterThan(0);
+    });
   });
 
   describe("Discovery role — custom Athena federation connectors", () => {
@@ -992,6 +1025,35 @@ describe("SourcesStack", () => {
       );
       expect(workerCanSend).toBe(true);
     });
+
+    it("worker can write the scan-history store: SOURCE_SCAN_JOBS_TABLE env + DynamoDB write grant", () => {
+      // The worker appends a REVIEW audit row to the scan-jobs table on each
+      // terminal approve/reject so the console's Scan History tab shows real
+      // events. It therefore needs the table name in env AND write access.
+      const worker = Object.entries(
+        template.findResources("AWS::Lambda::Function"),
+      ).find(([, f]) =>
+        /sources-bulk-review-worker$/.test(f.Properties.FunctionName),
+      );
+      expect(worker).toBeDefined();
+      const [, workerFn] = worker!;
+
+      expect(
+        workerFn.Properties.Environment.Variables.SOURCE_SCAN_JOBS_TABLE,
+      ).toBeDefined();
+
+      const workerRoleId = workerFn.Properties.Role["Fn::GetAtt"][0];
+      const workerCanWriteDdb = Object.values(
+        template.findResources("AWS::IAM::Policy"),
+      ).some(
+        (p: any) =>
+          p.Properties.Roles?.some((r: any) => r.Ref === workerRoleId) &&
+          p.Properties.PolicyDocument.Statement.some((s: any) =>
+            [s.Action].flat().includes("dynamodb:PutItem"),
+          ),
+      );
+      expect(workerCanWriteDdb).toBe(true);
+    });
   });
 
   describe("Federated Catalog Role — Glue VPC connection", () => {
@@ -1230,6 +1292,20 @@ describe("SourcesStack", () => {
       const flat = definition.replace(/\\+"/g, '"');
       expect(flat).toContain('"BOOL.$":"$.preprocessResult.issues_truncated"');
       expect(flat).not.toMatch(/"BOOL":"\$\./);
+    });
+  });
+
+  describe("Database Scan State Machine — re-scan marker", () => {
+    it("passes IS_RESCAN from the execution input to the enrichment task", () => {
+      const machines = template.findResources(
+        "AWS::StepFunctions::StateMachine",
+      );
+      const definition = JSON.stringify(Object.values(machines));
+      // The enrichment ECS container override reads the re-scan marker from the
+      // execution input ($.isRescan) as the IS_RESCAN env var; on a re-scan of
+      // an approved source this routes the terminal status to RESCAN_REVIEW.
+      expect(definition).toContain("IS_RESCAN");
+      expect(definition).toContain("$.isRescan");
     });
   });
 
@@ -1539,7 +1615,9 @@ describe("SourcesStack", () => {
       }>;
       const param = env.find((e) => e.Name === "GUARDRAIL_SSM_PARAM");
       expect(param).toBeDefined();
-      expect(JSON.stringify(param!.Value)).toContain("/bedrock/guardrail-id");
+      expect(JSON.stringify(param!.Value)).toContain(
+        "/bedrock/retrieval-guardrail-id",
+      );
     });
 
     it("grants the enrichment task role bedrock:ApplyGuardrail", () => {
@@ -1566,7 +1644,7 @@ describe("SourcesStack", () => {
         (s: any) => s.Action === "ssm:GetParameter",
       );
       const guardrailRead = ssmReads.find((s: any) =>
-        JSON.stringify(s.Resource).includes("/bedrock/guardrail-id"),
+        JSON.stringify(s.Resource).includes("/bedrock/retrieval-guardrail-id"),
       );
       expect(guardrailRead).toBeDefined();
       expect(JSON.stringify(guardrailRead.Resource)).not.toContain("*");
@@ -1785,22 +1863,31 @@ describe("SourcesStack", () => {
 
     it("grants sources-api s3:GetBucketTagging for the registration check", () => {
       // Registration verifies the tag up front so the customer is told at create
-      // time rather than by a failed scan. Tag metadata only — sources-api must NOT
-      // gain s3:GetObject.
+      // time rather than by a failed scan. sources-api reads no customer object
+      // data: its only s3:GetObject is the narrowly-scoped re-scan backup metadata
+      // read (`rescan-backup/*`, system-written table/column forms) that the
+      // tables API needs for the diff panel. Any GetObject NOT scoped to
+      // rescan-backup — a broad grant or one over `raw/*` — is the regression this
+      // guards against.
       const policies = template.findResources("AWS::IAM::Policy");
       let sawTagRead = false;
-      let sawObjectRead = false;
+      let sawCustomerObjectRead = false;
       for (const [id, res] of Object.entries(policies)) {
         if (!id.includes("SourcesApi")) continue;
         for (const st of (res as any).Properties?.PolicyDocument?.Statement ?? []) {
           if (st.Effect !== "Allow") continue;
           const acts = Array.isArray(st.Action) ? st.Action : [st.Action];
           if (acts.includes("s3:GetBucketTagging")) sawTagRead = true;
-          if (acts.includes("s3:GetObject")) sawObjectRead = true;
+          if (acts.includes("s3:GetObject")) {
+            // Allow only the system-written re-scan backup blob; anything else is
+            // a customer-object read this role must not have.
+            const resStr = JSON.stringify(st.Resource ?? "");
+            if (!resStr.includes("rescan-backup")) sawCustomerObjectRead = true;
+          }
         }
       }
       expect(sawTagRead).toBe(true);
-      expect(sawObjectRead).toBe(false);
+      expect(sawCustomerObjectRead).toBe(false);
     });
 
     it("denies the same actions it allows, GetBucketTagging included", () => {
@@ -1854,6 +1941,25 @@ describe("SourcesStack", () => {
           ]),
         },
       });
+    });
+  });
+
+  describe("Scan pipeline (Step Functions)", () => {
+    it("passes the no-drift reviewNeeded signal into the enrichment task env", () => {
+      // The enrichment ECS task reads RESCAN_REVIEW_NEEDED to choose the terminal
+      // status: a re-scan with no drift (and no carried-forward orphaned tables)
+      // returns to APPROVED instead of RESCAN_REVIEW. It is wired from discovery's
+      // result. DbDiscovery is a LambdaInvoke without payloadResponseOnly, so the
+      // signal is under the Lambda envelope at $.discoveryResult.Payload.reviewNeeded;
+      // reading it off $.discoveryResult directly fails the scan at runtime. The
+      // container override lives inside the state machine DefinitionString, so
+      // assert against that.
+      const stateMachines = template.findResources(
+        "AWS::StepFunctions::StateMachine",
+      );
+      const definitions = JSON.stringify(stateMachines);
+      expect(definitions).toContain("RESCAN_REVIEW_NEEDED");
+      expect(definitions).toContain("$.discoveryResult.Payload.reviewNeeded");
     });
   });
 });

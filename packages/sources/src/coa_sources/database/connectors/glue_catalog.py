@@ -15,8 +15,6 @@ Supports:
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 import os
 
@@ -29,6 +27,7 @@ from coa_common.domain_models import (
     ReviewStatus,
     Table,
     TechnicalMetadata,
+    compute_schema_hash,
 )
 
 from . import lf_grant
@@ -367,7 +366,7 @@ class GlueCatalogConnector(MetadataConnector):
         )
 
         # Compute hash for re-scan change detection
-        tech_hash = self._compute_hash(columns)
+        tech_hash = compute_schema_hash(columns)
 
         return Table(
             name=table_name,
@@ -384,15 +383,6 @@ class GlueCatalogConnector(MetadataConnector):
             columns=columns,
             technical_metadata_hash=tech_hash,
         )
-
-    @staticmethod
-    def _compute_hash(columns: list[Column]) -> str:
-        """Deterministic hash of column schema for change detection."""
-        normalized = sorted(
-            [{"n": c.name, "t": c.data_type, "p": c.is_partition_key} for c in columns],
-            key=lambda x: str(x["n"]),
-        )
-        return hashlib.sha256(json.dumps(normalized, sort_keys=True).encode()).hexdigest()[:16]
 
     def _get_glue_client(
         self,

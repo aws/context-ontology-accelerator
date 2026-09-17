@@ -1,6 +1,6 @@
 [project]
 name = "coa-mcp"
-version = "0.3.1"
+version = "0.3.2"
 description = "MCP Server for Context Ontology Accelerator — 6 tools (2 discovery + 4 execution)"
 requires-python = ">=3.12"
 

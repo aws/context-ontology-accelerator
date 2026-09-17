@@ -144,7 +144,8 @@ export interface SsmConfig {
 
   /** Bedrock LLM model ID for ontology induction, grounding rerank, and
    *  description generation (ontology-engine LLM_MODEL_ID /
-   *  DESCRIPTION_LLM_MODEL_ID). Defaults to us.anthropic.claude-sonnet-4-6. */
+   *  DESCRIPTION_LLM_MODEL_ID). Defaults to us.anthropic.claude-sonnet-5
+   *  (DEFAULT_BEDROCK_INDUCTION_MODEL_ID). */
   readonly bedrockInductionLlmModelId?: string;
 
   /** Bedrock chat/completion model ID for source enrichment, constraint

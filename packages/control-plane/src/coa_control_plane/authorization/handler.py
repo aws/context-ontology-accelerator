@@ -491,6 +491,12 @@ _PATH_MAPPING: dict[str, dict[str, tuple[str, str]]] = {
     "/namespaces/{namespaceId}/sources/{sourceId}/tables/{tableId}": {
         "GET": ("viewNamespace", "Source"),
     },
+    # Scan history: list the source's scan + steward-review events, and read one
+    # scan job. Both are reads of scan state, so they carry the same authority as
+    # the other source reads above.
+    "/namespaces/{namespaceId}/sources/{sourceId}/scan": {
+        "GET": ("viewNamespace", "Source"),
+    },
     "/namespaces/{namespaceId}/sources/{sourceId}/scan/{jobId}": {
         "GET": ("viewNamespace", "Source"),
     },
@@ -515,6 +521,10 @@ _PATH_MAPPING: dict[str, dict[str, tuple[str, str]]] = {
     },
     "/namespaces/{namespaceId}/sources/{sourceId}/tables/{tableId}/keys": {
         "PATCH": ("manageSource", "Source"),
+    },
+    # Re-scan review: keep (decline) a flagged removal — same authority as review/edit.
+    "/namespaces/{namespaceId}/sources/{sourceId}/tables/{tableId}/keep": {
+        "PUT": ("manageSource", "Source"),
     },
     # ── Metric service ─────────────────────────────────────────────────
     # Reads → readMetric; authoring/writes → manageMetric.

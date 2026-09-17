@@ -33,6 +33,12 @@ Environment variables:
     PREFERRED_ENTITY_CLASSIFICATIONS — JSON-encoded list of entity-class labels (e.g.
                                    '["Policy","Claim","Loss Ratio"]'). Non-empty overrides
                                    INFER_ENTITY_CLASSIFICATIONS. Default: "[]".
+    PREFERRED_TOPICS          — JSON-encoded list of preferred topic names (e.g.
+                                '["Black Tie Gala","Everyday Elegance"]'). Steers which
+                                thematic groupings the extractor assigns chunks to
+                                (__Topic__ nodes). Empty (default "[]") lets the model
+                                name topics freely. There is no INFER_TOPICS flag — the
+                                toolkit has no topic inference pass.
     CHUNK_SIZE                — Positive integer to override the toolkit's default
                                 SentenceSplitter chunk_size=256; "0" (default) keeps the
                                 toolkit default.
@@ -74,8 +80,10 @@ from coa_common.constants import (
     DEFAULT_EXTRACTION_MODE,
     DEFAULT_INFER_ENTITY_CLASSIFICATIONS,
     DEFAULT_PREFERRED_ENTITY_CLASSIFICATIONS_JSON,
+    DEFAULT_PREFERRED_TOPICS_JSON,
     DEFAULT_USE_BATCH_INFERENCE,
     EXTRACTION_BATCH_SIZE,
+    MAX_VOCABULARY_ENTRIES,
     STAGED_TEXT_EXTENSIONS,
     ExtractionMode,
     validate_id,
@@ -124,25 +132,64 @@ INFER_ENTITY_CLASSIFICATIONS = (
     os.environ.get("INFER_ENTITY_CLASSIFICATIONS", DEFAULT_INFER_ENTITY_CLASSIFICATIONS).lower() == "true"
 )
 
+
 # Explicit vocabulary supplied by the user (or, in a future change, resolved
 # from the namespace's accepted ontology). Arrives as a JSON-encoded list from
 # the trigger Lambda — an object/array can't be inlined into a Step Functions
 # container-override JsonPath, so it must be pre-stringified. When non-empty
 # this WINS over INFER_ENTITY_CLASSIFICATIONS: the user asked for these exact
 # labels, so don't second-guess them with an inference pass.
-_PREFERRED_JSON = os.environ.get("PREFERRED_ENTITY_CLASSIFICATIONS", DEFAULT_PREFERRED_ENTITY_CLASSIFICATIONS_JSON)
-try:
-    _decoded = json.loads(_PREFERRED_JSON) if _PREFERRED_JSON else []
-    if not isinstance(_decoded, list) or not all(isinstance(x, str) for x in _decoded):
-        raise ValueError("must be a JSON array of strings")
-    PREFERRED_ENTITY_CLASSIFICATIONS: list[str] = [x.strip() for x in _decoded if x.strip()]
-except (ValueError, json.JSONDecodeError) as _exc:
-    logger.warning(
-        "invalid PREFERRED_ENTITY_CLASSIFICATIONS, ignoring",
-        value=_PREFERRED_JSON,
-        error=str(_exc),
-    )
-    PREFERRED_ENTITY_CLASSIFICATIONS = []
+def _env_str_list(name: str, default_json: str) -> list[str]:
+    """Decode a JSON-array-of-strings env var into a cleaned ``list[str]``.
+
+    Values arrive pre-stringified because a Step Functions container-override
+    JsonPath cannot inline an array. Entries are stripped and empties dropped.
+
+    **Raises** on malformed / wrong-typed JSON rather than degrading to ``[]``.
+    The API validates this vocabulary and 400s before ingestion starts, so a real
+    caller's bad input never reaches here; a malformed value at container start
+    therefore means a *pipeline* bug, not user input. Failing loudly surfaces it as
+    SCAN_FAILED, where silently extracting with no vocabulary would hide it — the
+    user would just get a graph that ignores what they configured (raised in review).
+
+    Over-cap is the one case that still degrades: it clamps to
+    ``MAX_VOCABULARY_ENTRIES`` with a warning, because the first N entries are a
+    valid steer. The API already enforces the cap, so this is defence in depth for
+    an execution started outside it; every entry is injected into every chunk's
+    prompt, so an unbounded list is a cost and adherence problem.
+    """
+    raw = os.environ.get(name, default_json)
+    try:
+        decoded = json.loads(raw) if raw else []
+        if not isinstance(decoded, list) or not all(isinstance(x, str) for x in decoded):
+            raise ValueError("must be a JSON array of strings")
+    except (ValueError, json.JSONDecodeError) as exc:
+        # Fail loud: an API-validated field arriving malformed here is a pipeline
+        # defect. Crashing the task (→ SCAN_FAILED) is more honest than proceeding
+        # with no vocabulary and a warning the user never reads.
+        raise ValueError(f"{name} is not a JSON array of strings: {raw[:256]!r}") from exc
+    cleaned = [x.strip() for x in decoded if x.strip()]
+    if len(cleaned) > MAX_VOCABULARY_ENTRIES:
+        logger.warning(
+            "vocabulary_env_var_over_cap_truncated",
+            env_var=name,
+            supplied=len(cleaned),
+            cap=MAX_VOCABULARY_ENTRIES,
+        )
+        cleaned = cleaned[:MAX_VOCABULARY_ENTRIES]
+    return cleaned
+
+
+PREFERRED_ENTITY_CLASSIFICATIONS: list[str] = _env_str_list(
+    "PREFERRED_ENTITY_CLASSIFICATIONS", DEFAULT_PREFERRED_ENTITY_CLASSIFICATIONS_JSON
+)
+
+# Explicit topic vocabulary. Steers the thematic grouping the extractor assigns
+# chunks to (``__Topic__`` nodes, later induced as ``skos:Concept``) — a separate
+# axis from the entity classifications above (``__Entity__.class`` → ``owl:Class``).
+# Empty means "let the model name topics from the chunk text", which is the
+# pre-existing behaviour; there is no inference pass to toggle.
+PREFERRED_TOPICS: list[str] = _env_str_list("PREFERRED_TOPICS", DEFAULT_PREFERRED_TOPICS_JSON)
 
 # Optional chunk-size / chunk-overlap override. 0 (default) means "use the
 # graphrag-toolkit default" — SentenceSplitter(chunk_size=256, chunk_overlap=25).
@@ -753,6 +800,14 @@ def _build_indexing_config(bucket_name: str, namespace_id: str, doc_source_id: s
        both off unless the toolkit-default vocabulary has been checked to be
        inappropriate for this corpus.
 
+    Topic vocabulary: ``PREFERRED_TOPICS`` (JSON list) steers which thematic
+    groupings the extractor assigns chunks to. Unlike the classifications above
+    there is no inference option — graphrag-toolkit has no topic analogue of
+    ``InferClassificationsConfig`` — so an empty list already means "let the model
+    name topics freely", which is the behaviour of every ingest before this field
+    existed. Topics land as ``__Topic__`` nodes and are later induced as
+    ``skos:Concept``, so an unsteered vocabulary drifts across chunks.
+
     Chunking: ``CHUNK_SIZE`` / ``CHUNK_OVERLAP`` are ``0`` by default, in
     which case the toolkit's ``SentenceSplitter(chunk_size=256,
     chunk_overlap=25)`` is used. Setting a positive integer switches the
@@ -796,10 +851,16 @@ def _build_indexing_config(bucket_name: str, namespace_id: str, doc_source_id: s
         preferred = []
         infer_config = False
 
+    # ``preferred_topics`` is a separate axis from the classifications above:
+    # it steers the THEMATIC grouping (``__Topic__`` nodes) rather than what an
+    # entity IS. An empty list is passed through unchanged — the toolkit reads it
+    # as "no preferred topics", the extractor names them from the chunk text, and
+    # behaviour matches every ingest before this field existed.
     extraction_config = ExtractionConfig(
         enable_proposition_extraction=ENABLE_PROPOSITION_EXTRACTION,
         preferred_entity_classifications=preferred,
         infer_entity_classifications=infer_config,
+        preferred_topics=PREFERRED_TOPICS,
     )
 
     # --- Chunking ---
@@ -842,6 +903,7 @@ def _build_indexing_config(bucket_name: str, namespace_id: str, doc_source_id: s
         proposition_extraction=ENABLE_PROPOSITION_EXTRACTION,
         preferred_entity_classifications_count=len(preferred),
         infer_entity_classifications=bool(infer_config),
+        preferred_topics_count=len(PREFERRED_TOPICS),
         chunk_size=CHUNK_SIZE if CHUNK_SIZE > 0 else "256 (toolkit default)",
         chunk_overlap=CHUNK_OVERLAP if CHUNK_OVERLAP > 0 else "25 (toolkit default)",
         batch_inference=USE_BATCH_INFERENCE and batch_config is not None,

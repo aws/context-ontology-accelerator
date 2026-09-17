@@ -121,6 +121,57 @@ class TestRedshiftDialect:
         assert not pat.match("public")
         assert not pat.match("analytics")
 
+    def test_fetch_columns_recovers_late_binding_view(self):
+        """A late-binding view returns nothing from information_schema.columns and
+        must be recovered via pg_get_late_binding_view_cols(), marked nullable (#134)."""
+
+        def responder(sql, p):
+            if "information_schema.columns" in sql:
+                # Normal table resolves; the late-binding view returns no rows.
+                return [
+                    ("orders", "id", "integer", "NO"),
+                    ("orders", "amount", "numeric", "YES"),
+                ]
+            if "pg_get_late_binding_view_cols" in sql:
+                return [
+                    ("orders__daily", "day", "date"),
+                    ("orders__daily", "total", "numeric(18,2)"),
+                ]
+            return []
+
+        conn = _Conn(responder)
+        rows = RedshiftDialect().fetch_columns(conn, "public", ["orders", "orders__daily"])
+
+        # Normal table unchanged, with real nullability.
+        assert ("orders", "id", "integer", False) in rows
+        assert ("orders", "amount", "numeric", True) in rows
+        # Late-binding view recovered, data types preserved, defaulted nullable.
+        assert ("orders__daily", "day", "date", True) in rows
+        assert ("orders__daily", "total", "numeric(18,2)", True) in rows
+        assert len(rows) == 4
+
+        # The fallback must be scoped to the missing table only.
+        late_calls = [(s, pr) for (s, pr) in conn.cursor_obj.calls if "pg_get_late_binding_view_cols" in s]
+        assert len(late_calls) == 1
+        assert "orders__daily" in late_calls[0][1]
+        assert "orders" not in late_calls[0][1]
+
+    def test_fetch_columns_no_fallback_when_all_covered(self):
+        """The late-binding scan (a full-catalog function) must NOT run when
+        information_schema already answered for every requested table."""
+
+        def responder(sql, p):
+            if "information_schema.columns" in sql:
+                return [("orders", "id", "integer", "NO")]
+            if "pg_get_late_binding_view_cols" in sql:
+                raise AssertionError("late-binding fallback ran despite full information_schema coverage")
+            return []
+
+        conn = _Conn(responder)
+        rows = RedshiftDialect().fetch_columns(conn, "public", ["orders"])
+        assert rows == [("orders", "id", "integer", False)]
+        assert all("pg_get_late_binding_view_cols" not in s for (s, _p) in conn.cursor_obj.calls)
+
 
 @pytest.mark.unit
 class TestInformationSchemaDialect:
@@ -477,3 +528,80 @@ class TestEnumValueShapeFilter:
         conn = _Conn(responder)
         out = PostgresDialect().fetch_distinct_values(conn, "s", "t", ["note"], max_distinct=25)
         assert out == {}
+
+
+@pytest.mark.unit
+class TestRunRollsBackOnError:
+    """_run() must roll back on a failed statement so a poisoned Postgres/Redshift
+    transaction cannot make the next query fail with a misleading 25P02 (issue #129)."""
+
+    class _AbortableCursor:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, params=()):
+            # Model Postgres/Redshift: once the txn is aborted, every statement is
+            # rejected with 25P02 until an explicit rollback.
+            if self._conn.aborted:
+                raise RuntimeError(
+                    "25P02: current transaction is aborted, commands ignored until end of transaction block"
+                )
+            if "will_fail" in sql.lower():
+                self._conn.aborted = True
+                raise RuntimeError("42883: catalog query failed")
+            self._rows = [(1,)]
+
+        def fetchall(self):
+            return self._rows
+
+        def close(self):
+            pass
+
+    class _AbortableConn:
+        """pg8000-style: autocommit off; an errored statement poisons the session
+        until rollback() is called."""
+
+        def __init__(self, rollback_raises=False):
+            self.aborted = False
+            self.rollbacks = 0
+            self._rollback_raises = rollback_raises
+
+        def cursor(self):
+            return TestRunRollsBackOnError._AbortableCursor(self)
+
+        def rollback(self):
+            self.rollbacks += 1
+            if self._rollback_raises:
+                raise RuntimeError("connection reset during rollback")
+            self.aborted = False
+
+    def test_next_query_succeeds_after_a_swallowed_failure(self):
+        from coa_sources.database.connectors.dialects import _run
+
+        conn = self._AbortableConn()
+        assert _run(conn, "SELECT nspname FROM pg_catalog.pg_namespace") == [(1,)]
+
+        # A best-effort catalog query errors and is swallowed by a _safe_* caller.
+        with pytest.raises(RuntimeError, match="42883"):
+            _run(conn, "SELECT will_fail", ("public",))
+
+        # _run must have rolled back, so the NEXT query on the same connection works.
+        assert conn.rollbacks == 1
+        assert conn.aborted is False
+        assert _run(conn, "SELECT relname FROM pg_catalog.pg_class WHERE relnamespace = %s", ("public",)) == [(1,)]
+
+    def test_reraises_original_error_even_if_rollback_fails(self):
+        from coa_sources.database.connectors.dialects import _run
+
+        conn = self._AbortableConn(rollback_raises=True)
+        # The original catalog error must surface, not the rollback failure.
+        with pytest.raises(RuntimeError, match="42883"):
+            _run(conn, "SELECT will_fail")
+        assert conn.rollbacks == 1
+
+    def test_no_rollback_on_success(self):
+        from coa_sources.database.connectors.dialects import _run
+
+        conn = self._AbortableConn()
+        assert _run(conn, "SELECT 1") == [(1,)]
+        assert conn.rollbacks == 0

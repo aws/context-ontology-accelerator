@@ -2,7 +2,7 @@
 name = "coa"
 # Single source of truth is the repo-root VERSION file. Do not edit by hand —
 # bump VERSION and run `make version` (verified by `make lint`).
-version = "0.3.1"
+version = "0.3.2"
 description = "Context Ontology Accelerator for AWS"
 requires-python = ">=3.12"
 license = {text = "Apache-2.0"}

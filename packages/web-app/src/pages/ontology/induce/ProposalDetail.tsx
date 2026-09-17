@@ -49,6 +49,7 @@ import {
   isAcceptTerminalFailure,
   isProposalAcceptInProgress,
   proposalStatusIndicator,
+  resolveConstraintConfig,
 } from "./helpers";
 import {
   parseConceptMatches,
@@ -553,40 +554,57 @@ export function ProposalDetailPage() {
     setLoading(true);
     getProposal(apiClient, namespaceId, proposalId)
       .then(async (p) => {
-        setProposal(p);
         // Prefer inline content (present for normal-size proposals). Large
         // artifacts are omitted from the response to stay under the 6 MB limit,
         // so fall back to fetching each directly from its presigned S3 URL:
         //   - ontology / r2rml Turtle -> ontology_url / r2rml_url
         //   - grounding matches       -> matches_url (JSON envelope)
+        //   - constraint config       -> constraints_url (bare config object)
         const inlineMatches = p.metadata?.matches;
-        const [ontologyTtl, r2rmlTtl, matches] = await Promise.all([
-          p.ontology_turtle != null
-            ? Promise.resolve(p.ontology_turtle)
-            : p.ontology_url
-              ? fetchTurtleFromUrl(p.ontology_url)
-              : Promise.resolve(null),
-          p.r2rml_turtle != null
-            ? Promise.resolve(p.r2rml_turtle)
-            : p.r2rml_url
-              ? fetchTurtleFromUrl(p.r2rml_url)
-              : Promise.resolve(null),
-          inlineMatches !== undefined
-            ? Promise.resolve(parseConceptMatches(inlineMatches))
-            : p.matches_url
-              ? fetchJsonFromUrl(p.matches_url)
-                  .then(parseConceptMatchesEnvelope)
-                  // Grounding matches are secondary review content. A transient
-                  // matches fetch/parse failure must NOT reject the whole
-                  // Promise.all and blank the page (discarding the ontology
-                  // Turtle that loaded fine) — degrade to "no grounding shown".
-                  // Retrying refresh re-presigns and recovers.
-                  .catch((e: unknown) => {
-                    console.warn("Failed to load grounding matches:", e);
-                    return [] as ConceptMatch[];
-                  })
-              : Promise.resolve([]),
-        ]);
+        const [ontologyTtl, r2rmlTtl, matches, constraintConfig] =
+          await Promise.all([
+            p.ontology_turtle != null
+              ? Promise.resolve(p.ontology_turtle)
+              : p.ontology_url
+                ? fetchTurtleFromUrl(p.ontology_url)
+                : Promise.resolve(null),
+            p.r2rml_turtle != null
+              ? Promise.resolve(p.r2rml_turtle)
+              : p.r2rml_url
+                ? fetchTurtleFromUrl(p.r2rml_url)
+                : Promise.resolve(null),
+            inlineMatches !== undefined
+              ? Promise.resolve(parseConceptMatches(inlineMatches))
+              : p.matches_url
+                ? fetchJsonFromUrl(p.matches_url)
+                    .then(parseConceptMatchesEnvelope)
+                    // Grounding matches are secondary review content. A transient
+                    // matches fetch/parse failure must NOT reject the whole
+                    // Promise.all and blank the page (discarding the ontology
+                    // Turtle that loaded fine) — degrade to "no grounding shown".
+                    // Retrying refresh re-presigns and recovers.
+                    .catch((e: unknown) => {
+                      console.warn("Failed to load grounding matches:", e);
+                      return [] as ConceptMatch[];
+                    })
+                : Promise.resolve([]),
+            resolveConstraintConfig(p, fetchJsonFromUrl),
+          ]);
+        // Seed the fetched config back onto metadata rather than holding it in
+        // separate state: every consumer (ConstraintPanel, the Infer merge, the
+        // save path) already reads and writes metadata.constraint_config, and the
+        // detail response no longer carries it inline once it is offloaded.
+        setProposal(
+          constraintConfig === undefined
+            ? p
+            : {
+                ...p,
+                metadata: {
+                  ...p.metadata,
+                  constraint_config: constraintConfig,
+                },
+              },
+        );
         setEditedTurtle(ontologyTtl);
         setEditedR2rml(r2rmlTtl);
         setGroundingMatches(matches);

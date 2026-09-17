@@ -49,10 +49,12 @@ def sqs_event(valid_message):
 @patch("index.sfn_client")
 def test_starts_execution_on_valid_message(mock_sfn, sqs_event, valid_message):
     handler(sqs_event, None)
+    # `isRescan` and `hadOpenRescan` are always added (normalized to strings),
+    # both defaulting to "false" for a scan whose message carries neither marker.
     mock_sfn.start_execution.assert_called_once_with(
         stateMachineArn=os.environ["STATE_MACHINE_ARN"],
         name="scan-456",
-        input=json.dumps(valid_message),
+        input=json.dumps({**valid_message, "isRescan": "false", "hadOpenRescan": "false"}),
     )
 
 
@@ -69,7 +71,58 @@ def test_only_forwards_required_fields(mock_sfn):
     handler(event, None)
     call_input = json.loads(mock_sfn.start_execution.call_args[1]["input"])
     assert "extraField" not in call_input
-    assert call_input == {k: body[k] for k in ("datasourceId", "scanJobId", "namespaceId", "scanType")}
+    required = {k: body[k] for k in ("datasourceId", "scanJobId", "namespaceId", "scanType")}
+    assert call_input == {**required, "isRescan": "false", "hadOpenRescan": "false"}
+
+
+@patch("index.sfn_client")
+def test_forwards_rescan_marker_as_string_true(mock_sfn):
+    body = {
+        "datasourceId": "DS#x",
+        "scanJobId": "SCAN#y",
+        "namespaceId": "ns-1",
+        "scanType": "full",
+        "isRescan": True,
+    }
+    event = {"Records": [{"messageId": "msg-rescan", "body": json.dumps(body)}]}
+    handler(event, None)
+    call_input = json.loads(mock_sfn.start_execution.call_args[1]["input"])
+    assert call_input["isRescan"] == "true"
+
+
+@patch("index.sfn_client")
+def test_rescan_marker_defaults_to_string_false(mock_sfn, sqs_event):
+    handler(sqs_event, None)
+    call_input = json.loads(mock_sfn.start_execution.call_args[1]["input"])
+    assert call_input["isRescan"] == "false"
+
+
+@patch("index.sfn_client")
+def test_forwards_had_open_rescan_marker_as_string_true(mock_sfn):
+    # hadOpenRescan=true (source was in RESCAN_REVIEW) must reach the execution
+    # input so discovery reconstructs the approved baseline from the backup blob.
+    body = {
+        "datasourceId": "DS#x",
+        "scanJobId": "SCAN#y",
+        "namespaceId": "ns-1",
+        "scanType": "full",
+        "isRescan": True,
+        "hadOpenRescan": True,
+    }
+    event = {"Records": [{"messageId": "msg-open-rescan", "body": json.dumps(body)}]}
+    handler(event, None)
+    call_input = json.loads(mock_sfn.start_execution.call_args[1]["input"])
+    assert call_input["hadOpenRescan"] == "true"
+
+
+@patch("index.sfn_client")
+def test_had_open_rescan_defaults_to_string_false(mock_sfn, sqs_event):
+    # Absent marker (first scan, or a re-scan from APPROVED) => "false", so
+    # discovery treats the live assets as the approved baseline and ignores any
+    # stale backup.
+    handler(sqs_event, None)
+    call_input = json.loads(mock_sfn.start_execution.call_args[1]["input"])
+    assert call_input["hadOpenRescan"] == "false"
 
 
 @patch("index.sfn_client")

@@ -217,7 +217,7 @@ class TestQuerySuccess:
         assert body["requestId"] == "req-1"
         assert body["sessionId"] == "sess-1"
 
-    def test_query_forwards_all_options_and_caps_timeout(self):
+    def test_query_forwards_all_options_including_timeout_ms(self):
         captured: dict = {}
 
         def _fake_invoke(payload: dict, token: str) -> dict:
@@ -237,6 +237,7 @@ class TestQuerySuccess:
             # is dropped — CM's Tier-1 resolver supports equality only.
             "dimensions": [{"name": "region", "value": "EMEA", "operator": "="}],
             "timeoutMs": 999_999,
+            "strategy": "ontop",
             "includeSupporting": True,
             "maxResults": 5,
         }
@@ -257,17 +258,196 @@ class TestQuerySuccess:
         # ever regresses back to the list, every dimensioned Tier-1 metric
         # query 500s with AttributeError on ``.items()``.
         assert payload["options"]["dimensions"] == {"region": "EMEA"}
-        # ``timeoutMs`` is intentionally NOT forwarded to CM — the Context
-        # Manager has no reader for ``options.timeoutMs`` today, so forwarding
-        # it would silently no-op (see MR !939 comment ``b6dea1de``). The
-        # request body's ``timeoutMs`` is dropped here; the real deadline is
-        # the client-side ``REST_TIMEOUT_MS`` on the urllib call.
-        assert "timeoutMs" not in payload["options"]
+        # ``timeoutMs`` IS now forwarded to CM — the Context Manager builds a
+        # request-scoped deadline from ``options.timeoutMs``, so it is no longer a
+        # silent no-op. The data-layer forwards the raw value; serve clamps it to
+        # its own transport budget (a caller cannot widen past the ceiling), so no
+        # cap is applied here. The urllib ``REST_TIMEOUT_MS`` still bounds this
+        # handler's own call.
+        assert payload["options"]["timeoutMs"] == 999_999
+        # ``strategy`` IS forwarded too: CM reads ``options["strategy"]`` in
+        # ``Orchestrator._resolve_strategy_selection``, so it is not a phantom
+        # field. Dropping it here is what made the Ontop / VKG path unreachable by
+        # any REST caller — it ran only as an automatic fallback, never on request.
+        assert payload["options"]["strategy"] == "ontop"
         assert payload["options"]["includeSupporting"] is True
         assert payload["options"]["maxResults"] == 5
         assert payload["profile"]["groups"] == ["g1", "g2"]
         assert payload["profile"]["globalRoles"] == ["admin"]
         assert captured["token"] == "test-token"
+
+    @pytest.mark.parametrize("bad_timeout", [0, -5, "abc", 1.5])
+    def test_query_drops_invalid_or_nonpositive_timeout_ms(self, bad_timeout, caplog):
+        # Negative control for timeoutMs forwarding: a zero/negative/non-integer
+        # timeoutMs is meaningless as a budget and must NOT be forwarded (a 0 would
+        # otherwise degenerate the serve deadline). Distinguishes "supports
+        # forwarding" from "forwards blindly".
+        captured: dict = {}
+
+        def _fake_invoke(payload: dict, token: str) -> dict:
+            captured["payload"] = payload
+            return {"statusCode": 200, "result": {}}
+
+        body = {"query": "q", "timeoutMs": bad_timeout}
+        with patch.object(handler_module, "_invoke_context_manager", side_effect=_fake_invoke):
+            event = _api_event("POST", "/namespaces/{namespaceId}/query", body=body, namespace="ns1")
+            with caplog.at_level("INFO"):
+                result = handler(event, None)
+
+        assert result["statusCode"] == 200
+        assert "timeoutMs" not in captured["payload"]["options"]
+        # The drop is surfaced so a caller can tell it apart from "no timeout sent".
+        assert "query_timeout_ms_dropped" in caplog.text
+
+    def test_query_omits_strategy_when_not_supplied(self):
+        """An unset ``strategy`` must not appear in options at all.
+
+        Sending ``strategy: None`` would reach ``normalize_strategy_option``, fall
+        out of ``_EXPLICIT_STRATEGY_OPTIONS``, and resolve to ``DEFAULT_STRATEGY``
+        anyway — but it would also make the request differ from a pre-change one
+        and would show up in traces as an explicit pin that the caller never made.
+        """
+        captured: dict = {}
+
+        def _fake_invoke(payload: dict, token: str) -> dict:
+            captured["payload"] = payload
+            return {"statusCode": 200, "result": {}}
+
+        with patch.object(handler_module, "_invoke_context_manager", side_effect=_fake_invoke):
+            event = _api_event(
+                "POST",
+                "/namespaces/{namespaceId}/query",
+                body={"query": "revenue by region"},
+                namespace="ns1",
+            )
+            result = handler(event, None)
+
+        assert result["statusCode"] == 200
+        assert "strategy" not in captured["payload"]["options"]
+
+    def test_query_rejects_unknown_strategy_with_400(self):
+        """An unrecognised strategy must 400, not be forwarded.
+
+        Nothing else validates it — the handler does not check the body against the
+        generated Smithy model and API Gateway has no RequestValidator — so without
+        this check the value reaches serve, drops out of
+        ``Orchestrator._EXPLICIT_STRATEGY_OPTIONS`` and silently resolves to
+        DEFAULT_STRATEGY. The caller would get the cheap fallback chain while
+        believing it had pinned an engine.
+        """
+        called = {"n": 0}
+
+        def _fake_invoke(payload: dict, token: str) -> dict:
+            called["n"] += 1
+            return {"statusCode": 200, "result": {}}
+
+        with patch.object(handler_module, "_invoke_context_manager", side_effect=_fake_invoke):
+            event = _api_event(
+                "POST",
+                "/namespaces/{namespaceId}/query",
+                body={"query": "revenue by region", "strategy": "ontopp"},
+                namespace="ns1",
+            )
+            result = handler(event, None)
+
+        assert result["statusCode"] == 400, result
+        # The rejected value must NOT be echoed — it is unbounded caller-controlled
+        # input, and reflecting it back is what AppSec objects to.
+        assert "ontopp" not in result["body"]
+        # Names the valid values, so the caller can fix it without reading the model.
+        assert "ontop_first" in result["body"]
+        # Must fail before reaching CM — a rejected request costs nothing upstream.
+        assert called["n"] == 0
+
+    @pytest.mark.parametrize(
+        "strategy",
+        ["best", "ontop", "nl_to_sql", "ontop_first", "nl_to_sql_first", "deep-reasoning"],
+    )
+    def test_query_accepts_every_declared_strategy(self, strategy):
+        """Every value the contract advertises must pass validation here.
+
+        Parametrised so a set that drifts out of step with the Smithy enum names the
+        offending value instead of failing as one opaque case.
+        """
+        captured: dict = {}
+
+        def _fake_invoke(payload: dict, token: str) -> dict:
+            captured["payload"] = payload
+            return {"statusCode": 200, "result": {}}
+
+        with patch.object(handler_module, "_invoke_context_manager", side_effect=_fake_invoke):
+            event = _api_event(
+                "POST",
+                "/namespaces/{namespaceId}/query",
+                body={"query": "revenue by region", "strategy": strategy},
+                namespace="ns1",
+            )
+            result = handler(event, None)
+
+        assert result["statusCode"] == 200, result
+        assert captured["payload"]["options"]["strategy"] == strategy
+
+    @pytest.mark.parametrize(
+        ("value", "label"),
+        [
+            (["ontop"], "list"),
+            ({"engine": "ontop"}, "dict"),
+            (42, "int"),
+            (True, "bool"),
+        ],
+    )
+    def test_query_rejects_non_string_strategy_with_400(self, value, label):
+        """A non-string strategy must 400, never 502.
+
+        ``body`` is caller-controlled and ``QUERY_STRATEGIES`` is a frozenset, so
+        ``value not in QUERY_STRATEGIES`` raises TypeError for an unhashable value.
+        Unguarded, that escapes to the top-level ``except Exception`` and is reported
+        as 502 "Context Manager invocation failed" — an upstream-failure code for a
+        client mistake, on a request that never left the handler.
+        """
+        called = {"n": 0}
+
+        def _fake_invoke(payload: dict, token: str) -> dict:
+            called["n"] += 1
+            return {"statusCode": 200, "result": {}}
+
+        with patch.object(handler_module, "_invoke_context_manager", side_effect=_fake_invoke):
+            event = _api_event(
+                "POST",
+                "/namespaces/{namespaceId}/query",
+                body={"query": "revenue by region", "strategy": value},
+                namespace="ns1",
+            )
+            result = handler(event, None)
+
+        assert result["statusCode"] == 400, f"{label} gave {result['statusCode']}: {result}"
+        assert "Context Manager" not in result["body"], f"{label} leaked an upstream error: {result['body']}"
+        assert called["n"] == 0, f"{label} reached CM"
+
+    def test_query_error_does_not_reflect_a_large_strategy_value(self):
+        """A rejected value must not be able to inflate the response.
+
+        ``strategy`` is unbounded caller-controlled input. Echoing it — especially via
+        ``!r``, which serialises whatever arrived — lets a client turn a 400 into a
+        response as large as its own request, and reflects its content back verbatim.
+        The error names the valid values instead, so its size is fixed regardless of
+        what was sent.
+        """
+        huge = "x" * 100_000
+
+        with patch.object(handler_module, "_invoke_context_manager", side_effect=AssertionError):
+            event = _api_event(
+                "POST",
+                "/namespaces/{namespaceId}/query",
+                body={"query": "revenue by region", "strategy": huge},
+                namespace="ns1",
+            )
+            result = handler(event, None)
+
+        assert result["statusCode"] == 400
+        assert huge not in result["body"]
+        # Bounded: the message is the fixed valid-values list, not a function of input.
+        assert len(result["body"]) < 500, f"response grew to {len(result['body'])} bytes"
 
     def test_query_upstream_error_status_is_propagated(self):
         with patch.object(
@@ -431,6 +611,37 @@ class TestUpstreamErrorHandling:
             result = handler(event, None)
         assert result["statusCode"] == 502
         assert "Cannot reach Context Manager" in result["body"]
+
+    def test_rest_timeout_maps_to_diagnosable_504(self):
+        # The 29s urlopen budget surfaces as URLError whose .reason is a socket
+        # timeout. It must NOT be reported as a 502 "cannot reach" (which reads as a
+        # connectivity/down failure and sends builders chasing a phantom bug) --
+        # the request reached the Context Manager and is likely still completing
+        # server-side. Assert the diagnosable 504 that names the streaming path.
+        timeout_err = URLError(TimeoutError("timed out"))
+        with patch.object(handler_module, "_invoke_context_manager", side_effect=timeout_err):
+            event = _api_event("POST", "/namespaces/{namespaceId}/query", body={"query": "hi"})
+            result = handler(event, None)
+        assert result["statusCode"] == 504
+        body = json.loads(result["body"])
+        assert body["error"] == "rest_deadline_exceeded"
+        assert body["limitMs"] == handler_module.REST_TIMEOUT_MS
+        assert "streaming" in body["message"].lower()
+
+    def test_connectivity_url_error_still_502_not_504(self):
+        # Negative control for the 504 branch: a genuine connectivity failure
+        # (reason is not a timeout) must remain a 502, not be misclassified as the
+        # deadline-exceeded case.
+        with patch.object(
+            handler_module,
+            "_invoke_context_manager",
+            side_effect=URLError(ConnectionRefusedError("refused")),
+        ):
+            event = _api_event("POST", "/namespaces/{namespaceId}/query", body={"query": "hi"})
+            result = handler(event, None)
+        assert result["statusCode"] == 502
+        assert "Cannot reach Context Manager" in result["body"]
+        assert "rest_deadline_exceeded" not in result["body"]
 
     def test_unexpected_exception_maps_to_502(self):
         with patch.object(handler_module, "_invoke_context_manager", side_effect=ValueError("oops")):

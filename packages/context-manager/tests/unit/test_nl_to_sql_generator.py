@@ -321,6 +321,25 @@ class TestDialectSupport:
             assert "2019-08-20" in p  # zero-padded date example
             assert "SELECT DISTINCT" in p
 
+    def test_determinism_column_shape_pin_in_prompt(self):
+        # B1b (SQL-path column-shape drift): measured N=10 on the deployed default
+        # strategy, the SAME superlative question drifted across 3 column sets
+        # (`id` / `id,amount` / `claim_id,amount`) though answer identity stayed
+        # correct. This prompt pin steers the column shape deterministically. It is
+        # a MITIGATION (prompt-only, best-effort) — the SQL path has no
+        # ontology-canonical column name to fail-closed on, unlike NL→SPARQL. Present
+        # regardless of dialect.
+        for dialect in ("postgresql", "athena"):
+            gen = SQLGenerator(llm_client=AsyncMock(), vector_client=AsyncMock(), dialect=dialect)
+            p = gen._system_prompt
+            assert "DETERMINISM" in p
+            assert "SAME question must return the SAME columns" in p
+            # superlative → identifying column only + ORDER BY ... DESC LIMIT 1
+            assert "superlative" in p
+            assert "ORDER BY <measure> DESC LIMIT 1" in p
+            # stable identifier name (no run-to-run rename: the `id`→`claim_id` drift)
+            assert "do not rename or alias it" in p
+
 
 @pytest.mark.unit
 class TestFKAdjacencyProperty:

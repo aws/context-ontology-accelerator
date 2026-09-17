@@ -23,6 +23,7 @@ import {
   buildOntologyFilterOptions,
   defaultOntologyFilterValue,
   isListPageLoading,
+  planGraphSeed,
   ALL_ONTOLOGIES_VALUE,
 } from "./GraphSearch";
 
@@ -149,6 +150,115 @@ describe("buildTaxonomyVertices", () => {
       { uri: B, subClassOf: [] },
     ]);
     expect(computeRoots(details).sort()).toEqual([A, B]);
+  });
+
+  it("materializes object-property edges when domain and range are both in the class set", () => {
+    // The proposal-detail graph shows domain → range edges for object
+    // properties; the Explorer seed used to drop them. Now that relationships
+    // are threaded through, buildTaxonomyVertices should emit an edge pair
+    // (outgoing on domain, incoming on range) so buildGraphData renders the
+    // relationship exactly as the proposal graph does.
+    const REL = "ex:filedBy";
+    const details = buildTaxonomyVertices(
+      [
+        { uri: A, label: "A" },
+        { uri: B, label: "B" },
+      ],
+      [{ uri: REL, label: "filed by", domain: A, range: B }],
+    );
+    const outgoing = details
+      .get(A)
+      ?.edges.filter((e) => e.predicate === REL && e.direction === "outgoing");
+    expect(outgoing).toHaveLength(1);
+    expect(outgoing?.[0]?.predicate_label).toBe("filed by");
+    expect(outgoing?.[0]?.neighbor.uri).toBe(B);
+    const incoming = details
+      .get(B)
+      ?.edges.filter((e) => e.predicate === REL && e.direction === "incoming");
+    expect(incoming).toHaveLength(1);
+    expect(incoming?.[0]?.neighbor.uri).toBe(A);
+  });
+
+  it("drops object-property edges whose domain or range is not a class vertex", () => {
+    // A property whose domain is unknown to the class set would dangle in the
+    // graph — the render budget shouldn't pay for an edge with a missing
+    // endpoint. Filter those out before the render-count cap is applied.
+    const REL = "ex:orphan";
+    const details = buildTaxonomyVertices(
+      [{ uri: A, label: "A" }],
+      [{ uri: REL, domain: A, range: "ex:Missing" }],
+    );
+    expect(details.get(A)?.edges).toEqual([]);
+    // The missing range didn't get a synthesized vertex either — only
+    // subClassOf parents trigger the materialize-a-missing-parent path.
+    expect(details.has("ex:Missing")).toBe(false);
+  });
+});
+
+describe("planGraphSeed", () => {
+  /** N synthetic classes, enough to push an ontology over a cap. */
+  const classes = (n: number) =>
+    Array.from({ length: n }, (_, i) => ({ uri: `ex:C${i}` }));
+
+  it("renders a small induced ontology in full even beside an oversized reference", () => {
+    // The case the combined-total cap got wrong: a 40-class induced ontology
+    // sitting next to Schema.org (~1010 classes) loaded for grounding. The
+    // induced ontology must NOT be dragged onto the sampled path — that is the
+    // "graph is tiny and has no relationships" complaint.
+    const plan = planGraphSeed([
+      { ontology_id: "schema.org", classes: classes(1010) },
+      { ontology_id: "induced", induced: true, classes: classes(40) },
+    ]);
+    expect(plan.full).toEqual(["induced"]);
+    expect(plan.sampled).toEqual(["schema.org"]);
+  });
+
+  it("samples only the ontologies that individually exceed the per-ontology cap", () => {
+    const plan = planGraphSeed([
+      { ontology_id: "big", classes: classes(501) },
+      { ontology_id: "atCap", classes: classes(500) },
+      { ontology_id: "small", classes: classes(10) },
+    ]);
+    // 500 is at the cap, so it still renders in full; only 501 is over.
+    expect(plan.full).toEqual(["small", "atCap"]);
+    expect(plan.sampled).toEqual(["big"]);
+  });
+
+  it("spends the total budget induced-first, then smallest-first", () => {
+    // 4 × 400 = 1600 exceeds the 1500 total ceiling, so the LAST one considered
+    // falls back — and the induced ontology must never be that one.
+    const plan = planGraphSeed([
+      { ontology_id: "c", classes: classes(400) },
+      { ontology_id: "a", classes: classes(400) },
+      { ontology_id: "b", classes: classes(400) },
+      { ontology_id: "ind", induced: true, classes: classes(400) },
+    ]);
+    expect(plan.full[0]).toBe("ind");
+    expect(plan.full).toHaveLength(3);
+    expect(plan.sampled).toHaveLength(1);
+    // Deterministic: ties break on ontology_id, so the dropped one is stable
+    // rather than dependent on registry order.
+    expect(plan.sampled).toEqual(["c"]);
+  });
+
+  it("is deterministic regardless of the order the registry returned", () => {
+    const input = [
+      { ontology_id: "z", classes: classes(300) },
+      { ontology_id: "m", classes: classes(300) },
+      { ontology_id: "a", classes: classes(300) },
+    ];
+    const forward = planGraphSeed(input);
+    const reversed = planGraphSeed([...input].reverse());
+    expect(reversed).toEqual(forward);
+    expect(forward.full).toEqual(["a", "m", "z"]);
+  });
+
+  it("keeps an empty namespace on the full path with nothing to sample", () => {
+    expect(planGraphSeed([])).toEqual({ full: [], sampled: [] });
+    expect(planGraphSeed([{ ontology_id: "empty", classes: [] }])).toEqual({
+      full: ["empty"],
+      sampled: [],
+    });
   });
 });
 

@@ -96,10 +96,24 @@ export const Auth: React.FC<AuthProps> = ({ children, applicationName }) => {
     events?.addAccessTokenExpired(handleSessionLost);
     events?.addSilentRenewError(handleSessionLost);
 
+    // A dropped user fires UserUnloaded. Unlike accessTokenExpired /
+    // silentRenewError — which may still leave a valid token after a
+    // successful background renew, hence handleSessionLost's re-check — a
+    // UserUnloaded means the session is definitively gone. This is the event
+    // the ad-hoc renewal path in getIdToken/getAccessToken now raises via
+    // removeUser() (issue #136), where the background events never fired. Flip
+    // straight to unauthenticated WITHOUT another signinSilent(): re-renewing
+    // here would also run during signOut()'s removeUser().
+    const handleUserUnloaded = () => {
+      if (!cancelled) setAuthenticated(false);
+    };
+    events?.addUserUnloaded(handleUserUnloaded);
+
     return () => {
       cancelled = true;
       events?.removeAccessTokenExpired(handleSessionLost);
       events?.removeSilentRenewError(handleSessionLost);
+      events?.removeUserUnloaded(handleUserUnloaded);
     };
   }, [runtimeContext, isDevBypass]);
 

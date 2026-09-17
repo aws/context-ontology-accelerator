@@ -27,7 +27,7 @@ from typing import Any
 import structlog
 import yaml
 
-from coa_metrics.constants import SqlDialect
+from coa_metrics.constants import VALID_SQL_DIALECTS, SqlDialect
 
 logger = structlog.get_logger(__name__)
 
@@ -69,6 +69,12 @@ def osi_dialect_to_internal(osi_dialect: str) -> str:
         ValueError: If the OSI dialect is not recognized.
     """
     normalized = osi_dialect.strip().upper()
+    # A real internal dialect named directly (REDSHIFT, TRINO, MYSQL, POSTGRESQL,
+    # ...) is legitimate OSI input — a hand-authored or third-party document need
+    # not go through COA's own ANSI_SQL/SNOWFLAKE/DATABRICKS export aliases. Pass
+    # it through case-normalized before consulting the wire-alias map (#140).
+    if normalized in VALID_SQL_DIALECTS:
+        return normalized
     internal = _OSI_TO_INTERNAL.get(normalized)
     if internal is None:
         raise ValueError(

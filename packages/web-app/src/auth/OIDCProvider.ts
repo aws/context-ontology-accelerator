@@ -3,6 +3,15 @@
 
 import { UserManager, WebStorageStateStore, User } from "oidc-client-ts";
 
+/**
+ * Refresh a token this many seconds BEFORE its own expiry. A proactive buffer:
+ * the token is renewed ahead of lapsing rather than after, so a request never
+ * goes out with an about-to-expire token. Firing early is cheap and harmless;
+ * firing late means a spurious 401/403. Two minutes comfortably covers a
+ * request round-trip plus client/server clock skew.
+ */
+const TOKEN_REFRESH_BUFFER_SECONDS = 120;
+
 /** OIDC provider configuration for the Authorization Code flow with PKCE. */
 export interface OidcConfig {
   /** OIDC provider URL (e.g. `https://cognito-idp.us-east-1.amazonaws.com/us-east-1_XXXXX`). */
@@ -85,17 +94,41 @@ export class OIDCProvider {
     return this.userManager.getUser();
   }
 
-  /** Returns the current ID token, silently refreshing if it expires within 120 s. */
+  /**
+   * Returns the current ID token, silently refreshing it once it is at (or
+   * within {@link TOKEN_REFRESH_BUFFER_SECONDS} of) its own expiry.
+   *
+   * The renewal decision keys off the ID token's own `exp` claim
+   * (`user.profile.exp`) — NOT `user.expires_at`, which oidc-client-ts derives
+   * from the OAuth `expires_in` (the ACCESS token lifetime). This is the token
+   * this method returns and the one the API sends as the bearer, so when a
+   * deployment sets the ID-token TTL shorter than the access-token TTL, gating
+   * on `expires_at` would let an already-expired ID token through with no
+   * renewal attempt (403s, no refresh request) — see the tab-switch report.
+   */
   async getIdToken(): Promise<string> {
     // Prefer in-memory cache (kept fresh by UserLoaded event) over storage.
     let user = this.cachedUser ?? (await this.userManager.getUser());
 
-    // Refresh if expired or expiring within 120s
-    if (user && user.expires_at && user.expires_at < Date.now() / 1000 + 120) {
+    // Refresh once the ID token itself is essentially expired.
+    const idTokenExp = user?.profile?.exp;
+    if (
+      user &&
+      idTokenExp &&
+      idTokenExp < Date.now() / 1000 + TOKEN_REFRESH_BUFFER_SECONDS
+    ) {
       try {
         user = await this.userManager.signinSilent();
         this.cachedUser = user;
       } catch {
+        // This ad-hoc renewal path is separate from oidc-client-ts's
+        // background `automaticSilentRenew` timer, so a failure here does NOT
+        // raise `silentRenewError`/`accessTokenExpired`. Drop the user so
+        // `UserUnloaded` fires and the Auth gate flips to unauthenticated —
+        // otherwise the UI keeps showing "signed in" while every token-bearing
+        // call throws individually (issue #136). Best-effort: never let a
+        // removeUser() failure mask the sign-in-again error.
+        await this.userManager.removeUser().catch(() => {});
         throw new Error("Token refresh failed. Please sign in again.");
       }
     }
@@ -105,16 +138,28 @@ export class OIDCProvider {
     return token;
   }
 
-  /** Returns the current access token, silently refreshing if it expires within 120 s. */
+  /**
+   * Returns the current access token, silently refreshing it once it is at (or
+   * within {@link TOKEN_REFRESH_BUFFER_SECONDS} of) expiry. Gates on
+   * `user.expires_at`, which is the access token's lifetime — the right clock
+   * for the token this method returns.
+   */
   async getAccessToken(): Promise<string> {
     let user = this.cachedUser ?? (await this.userManager.getUser());
 
-    // Refresh if expired or expiring within 120s
-    if (user && user.expires_at && user.expires_at < Date.now() / 1000 + 120) {
+    // Refresh once the access token is essentially expired.
+    if (
+      user &&
+      user.expires_at &&
+      user.expires_at < Date.now() / 1000 + TOKEN_REFRESH_BUFFER_SECONDS
+    ) {
       try {
         user = await this.userManager.signinSilent();
         this.cachedUser = user;
       } catch {
+        // See getIdToken: drop the user so `UserUnloaded` fires and the Auth
+        // gate flips to unauthenticated (issue #136). Best-effort.
+        await this.userManager.removeUser().catch(() => {});
         throw new Error("Token refresh failed. Please sign in again.");
       }
     }
