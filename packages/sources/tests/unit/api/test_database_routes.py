@@ -1035,6 +1035,52 @@ class TestHandleGetScanJob:
         assert body["status"] == "COMPLETED"
         assert body["tablesDiscovered"] == 5
 
+    def test_get_scan_job_surfaces_enrichment_partial_failure(self):
+        # A scan that enriched some tables but had per-table failures records
+        # the failed names on the scan-job row; the read handler surfaces them
+        # so a steward can see which tables came back without enrichment.
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {"PK": f"NS#{_NAMESPACE_ID}", "SK": f"SRC#{_SOURCE_ID}"}
+        mock_scan_dao = MagicMock()
+        mock_scan_dao.get.return_value = {
+            "PK": f"SRC#{_SOURCE_ID}",
+            "SK": "2026-01-01T00:00:00Z",
+            "status": "COMPLETED",
+            "enrichmentPartialFailure": True,
+            "enrichmentFailedTables": ["public.rescan_demo_widgets"],
+        }
+
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}._get_scan_dao", return_value=mock_scan_dao),
+        ):
+            status, body = _parse(_dr._handle_get_scan_job(_NAMESPACE_ID, _SOURCE_ID, "2026-01-01T00:00:00Z"))
+
+        assert status == 200
+        assert body["enrichmentPartialFailure"] is True
+        assert body["enrichmentFailedTables"] == ["public.rescan_demo_widgets"]
+
+    def test_get_scan_job_omits_partial_failure_fields_on_clean_scan(self):
+        # Absent on a clean scan — the None-drop keeps the response backward compatible.
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {"PK": f"NS#{_NAMESPACE_ID}", "SK": f"SRC#{_SOURCE_ID}"}
+        mock_scan_dao = MagicMock()
+        mock_scan_dao.get.return_value = {
+            "PK": f"SRC#{_SOURCE_ID}",
+            "SK": "2026-01-01T00:00:00Z",
+            "status": "COMPLETED",
+        }
+
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}._get_scan_dao", return_value=mock_scan_dao),
+        ):
+            status, body = _parse(_dr._handle_get_scan_job(_NAMESPACE_ID, _SOURCE_ID, "2026-01-01T00:00:00Z"))
+
+        assert status == 200
+        assert "enrichmentPartialFailure" not in body
+        assert "enrichmentFailedTables" not in body
+
     def test_get_scan_job_source_not_found(self):
         mock_dao = MagicMock()
         mock_dao.get.return_value = None
@@ -1892,9 +1938,24 @@ class TestHandleListTables:
         mock_ns_dao = MagicMock()
         mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
 
+        forms_list = [
+            {
+                "formName": FORM_TYPE_NAME,
+                "content": json.dumps(
+                    {
+                        "databaseName": "mydb",
+                        "tableName": "mytable",
+                        "columnCount": 3,
+                        "reviewStatus": "PENDING_REVIEW",
+                    }
+                ),
+            }
+        ]
+
         mock_asset = MagicMock()
         mock_asset.name = f"DS#{_SOURCE_ID}:mydb.mytable"
         mock_asset.asset_id = "asset-001"
+        mock_asset.forms_output = forms_list
 
         mock_result = MagicMock()
         mock_result.items = [mock_asset]
@@ -1902,21 +1963,6 @@ class TestHandleListTables:
 
         mock_smus = MagicMock()
         mock_smus.search_assets.return_value = mock_result
-        mock_smus.get_asset_forms.return_value = {
-            "formsOutput": [
-                {
-                    "formName": FORM_TYPE_NAME,
-                    "content": json.dumps(
-                        {
-                            "databaseName": "mydb",
-                            "tableName": "mytable",
-                            "columnCount": 3,
-                            "reviewStatus": "PENDING_REVIEW",
-                        }
-                    ),
-                }
-            ]
-        }
 
         with (
             patch(f"{_DR}._SMUS_DOMAIN_ID", "domain-id"),
@@ -1929,9 +1975,65 @@ class TestHandleListTables:
         assert len(body["items"]) == 1
         assert body["items"][0]["name"] == "mytable"
 
+    def test_list_tables_column_counts_honest_denominator_and_pending_deletion(self):
+        """columnCount reflects ALL merged columns (incl. a retained
+        pending-deletion column), a column slated for deletion is not counted
+        approved, and the per-table pending-deletion column count is surfaced."""
+        from coa_common.datazone_forms import FORM_TYPE_NAME
+
+        mock_ns_dao = MagicMock()
+        mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
+
+        mock_asset = MagicMock()
+        mock_asset.name = f"DS#{_SOURCE_ID}:mydb.mytable"
+        mock_asset.asset_id = "asset-001"
+
+        mock_smus = MagicMock()
+        mock_smus.search_assets.return_value = MagicMock(items=[mock_asset], next_token=None)
+        mock_smus.get_asset_forms.return_value = {
+            "formsOutput": [
+                {
+                    "formName": FORM_TYPE_NAME,
+                    "content": json.dumps(
+                        {
+                            "databaseName": "mydb",
+                            "tableName": "mytable",
+                            # Stored scalar is intentionally wrong (2) to prove the
+                            # handler counts the merged columns list, not the scalar.
+                            "columnCount": 2,
+                            "reviewStatus": "PENDING_REVIEW",
+                            "columns": [
+                                {"name": "kept_approved", "business_metadata": {"review_status": "APPROVED"}},
+                                {"name": "pending_col", "business_metadata": {"review_status": "PENDING_REVIEW"}},
+                                {"name": "removed_approved", "business_metadata": {"review_status": "APPROVED"}},
+                            ],
+                        }
+                    ),
+                }
+            ]
+        }
+
+        with (
+            patch(f"{_DR}._SMUS_DOMAIN_ID", "domain-id"),
+            patch(f"{_DR}._get_ns_dao", return_value=mock_ns_dao),
+            patch(f"{_DR}._get_smus_client", return_value=mock_smus),
+            # A re-scan retained an APPROVED column tagged pending-deletion.
+            patch(f"{_DR}._removed_sets", return_value=(set(), {"mydb.mytable": {"removed_approved"}}, set())),
+        ):
+            status, body = _parse(_dr._handle_list_tables(self._make_list_event(), _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 200
+        item = body["items"][0]
+        # 3 merged columns retained; the removed-but-APPROVED column is not
+        # counted approved; the retained removed column is surfaced.
+        assert item["columnCount"] == 3
+        assert item["columnsApproved"] == 1
+        assert item["columnsPendingDeletion"] == 1
+
     def test_list_tables_get_asset_forms_failure_logs_warning_and_marks_degraded(self):
-        """When get_asset_forms raises, the asset is skipped with a warning log
-        and the response includes a 'degraded' indicator."""
+        """When inline forms are absent and the get_asset_forms fallback raises,
+        the asset is skipped with a warning log and the response includes
+        a skippedAssets count."""
         from coa_common.datazone_forms import FORM_TYPE_NAME
 
         mock_ns_dao = MagicMock()
@@ -1940,10 +2042,12 @@ class TestHandleListTables:
         mock_asset_ok = MagicMock()
         mock_asset_ok.name = f"DS#{_SOURCE_ID}:mydb.good_table"
         mock_asset_ok.asset_id = "asset-ok"
+        mock_asset_ok.forms_output = None
 
         mock_asset_bad = MagicMock()
         mock_asset_bad.name = f"DS#{_SOURCE_ID}:mydb.bad_table"
         mock_asset_bad.asset_id = "asset-bad"
+        mock_asset_bad.forms_output = None
 
         mock_result = MagicMock()
         mock_result.items = [mock_asset_bad, mock_asset_ok]
@@ -2006,6 +2110,12 @@ class TestHandleListTables:
         mock_asset = MagicMock()
         mock_asset.name = f"DS#{_SOURCE_ID}:mydb.corrupt_table"
         mock_asset.asset_id = "asset-corrupt"
+        mock_asset.forms_output = [
+            {
+                "formName": FORM_TYPE_NAME,
+                "content": "NOT VALID JSON {{{",
+            }
+        ]
 
         mock_result = MagicMock()
         mock_result.items = [mock_asset]
@@ -2013,14 +2123,6 @@ class TestHandleListTables:
 
         mock_smus = MagicMock()
         mock_smus.search_assets.return_value = mock_result
-        mock_smus.get_asset_forms.return_value = {
-            "formsOutput": [
-                {
-                    "formName": FORM_TYPE_NAME,
-                    "content": "NOT VALID JSON {{{",
-                }
-            ]
-        }
 
         with (
             patch(f"{_DR}._SMUS_DOMAIN_ID", "domain-id"),
@@ -2049,20 +2151,35 @@ class TestHandleListTables:
         mock_ns_dao = MagicMock()
         mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
 
-        # Asset 1: get_asset_forms will raise
+        # Asset 1: inline forms absent, fallback get_asset_forms will raise
         mock_asset_api_fail = MagicMock()
         mock_asset_api_fail.name = f"DS#{_SOURCE_ID}:mydb.api_fail"
         mock_asset_api_fail.asset_id = "asset-api-fail"
+        mock_asset_api_fail.forms_output = None
 
-        # Asset 2: form content will be malformed JSON
+        # Asset 2: inline form content will be malformed JSON
         mock_asset_parse_fail = MagicMock()
         mock_asset_parse_fail.name = f"DS#{_SOURCE_ID}:mydb.parse_fail"
         mock_asset_parse_fail.asset_id = "asset-parse-fail"
+        mock_asset_parse_fail.forms_output = [{"formName": FORM_TYPE_NAME, "content": "{{{INVALID"}]
 
-        # Asset 3: will succeed
+        # Asset 3: inline forms populated with good data
         mock_asset_ok = MagicMock()
         mock_asset_ok.name = f"DS#{_SOURCE_ID}:mydb.good_table"
         mock_asset_ok.asset_id = "asset-ok"
+        mock_asset_ok.forms_output = [
+            {
+                "formName": FORM_TYPE_NAME,
+                "content": json.dumps(
+                    {
+                        "databaseName": "mydb",
+                        "tableName": "good_table",
+                        "columnCount": 1,
+                        "reviewStatus": "PENDING_REVIEW",
+                    }
+                ),
+            }
+        ]
 
         mock_result = MagicMock()
         mock_result.items = [mock_asset_api_fail, mock_asset_parse_fail, mock_asset_ok]
@@ -2070,29 +2187,9 @@ class TestHandleListTables:
 
         mock_smus = MagicMock()
         mock_smus.search_assets.return_value = mock_result
-
-        def _get_forms(asset_id):
-            if asset_id == "asset-api-fail":
-                raise RuntimeError("DataZone unavailable")
-            if asset_id == "asset-parse-fail":
-                return {"formsOutput": [{"formName": FORM_TYPE_NAME, "content": "{{{INVALID"}]}
-            return {
-                "formsOutput": [
-                    {
-                        "formName": FORM_TYPE_NAME,
-                        "content": json.dumps(
-                            {
-                                "databaseName": "mydb",
-                                "tableName": "good_table",
-                                "columnCount": 1,
-                                "reviewStatus": "PENDING_REVIEW",
-                            }
-                        ),
-                    }
-                ]
-            }
-
-        mock_smus.get_asset_forms.side_effect = _get_forms
+        # Only asset-api-fail triggers fallback (forms_output=None);
+        # it raises, so it becomes a skipped asset.
+        mock_smus.get_asset_forms.side_effect = RuntimeError("DataZone unavailable")
 
         with (
             patch(f"{_DR}._SMUS_DOMAIN_ID", "domain-id"),
@@ -2117,6 +2214,20 @@ class TestHandleListTables:
         mock_asset = MagicMock()
         mock_asset.name = f"DS#{_SOURCE_ID}:mydb.bad_cols"
         mock_asset.asset_id = "asset-bad-cols"
+        mock_asset.forms_output = [
+            {
+                "formName": FORM_TYPE_NAME,
+                "content": json.dumps(
+                    {
+                        "databaseName": "mydb",
+                        "tableName": "bad_cols",
+                        "columnCount": 3,
+                        "reviewStatus": "PENDING_REVIEW",
+                        "columns": "NOT VALID JSON [[[",
+                    }
+                ),
+            }
+        ]
 
         mock_result = MagicMock()
         mock_result.items = [mock_asset]
@@ -2124,22 +2235,6 @@ class TestHandleListTables:
 
         mock_smus = MagicMock()
         mock_smus.search_assets.return_value = mock_result
-        mock_smus.get_asset_forms.return_value = {
-            "formsOutput": [
-                {
-                    "formName": FORM_TYPE_NAME,
-                    "content": json.dumps(
-                        {
-                            "databaseName": "mydb",
-                            "tableName": "bad_cols",
-                            "columnCount": 3,
-                            "reviewStatus": "PENDING_REVIEW",
-                            "columns": "NOT VALID JSON [[[",
-                        }
-                    ),
-                }
-            ]
-        }
 
         with (
             patch(f"{_DR}._SMUS_DOMAIN_ID", "domain-id"),
@@ -2165,9 +2260,24 @@ class TestHandleListTables:
         mock_ns_dao = MagicMock()
         mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
 
+        forms_list = [
+            {
+                "formName": FORM_TYPE_NAME,
+                "content": json.dumps(
+                    {
+                        "databaseName": "mydb",
+                        "tableName": "mytable",
+                        "columnCount": 3,
+                        "reviewStatus": "PENDING_REVIEW",
+                    }
+                ),
+            }
+        ]
+
         mock_asset = MagicMock()
         mock_asset.name = f"DS#{_SOURCE_ID}:mydb.mytable"
         mock_asset.asset_id = "asset-001"
+        mock_asset.forms_output = forms_list
 
         mock_result = MagicMock()
         mock_result.items = [mock_asset]
@@ -2175,21 +2285,6 @@ class TestHandleListTables:
 
         mock_smus = MagicMock()
         mock_smus.search_assets.return_value = mock_result
-        mock_smus.get_asset_forms.return_value = {
-            "formsOutput": [
-                {
-                    "formName": FORM_TYPE_NAME,
-                    "content": json.dumps(
-                        {
-                            "databaseName": "mydb",
-                            "tableName": "mytable",
-                            "columnCount": 3,
-                            "reviewStatus": "PENDING_REVIEW",
-                        }
-                    ),
-                }
-            ]
-        }
 
         with (
             patch(f"{_DR}._SMUS_DOMAIN_ID", "domain-id"),
@@ -2224,9 +2319,24 @@ class TestHandleListTables:
         mock_ns_dao = MagicMock()
         mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
 
+        forms_list = [
+            {
+                "formName": FORM_TYPE_NAME,
+                "content": json.dumps(
+                    {
+                        "databaseName": "mydb",
+                        "tableName": "mytable",
+                        "columnCount": 1,
+                        "reviewStatus": "PENDING_REVIEW",
+                    }
+                ),
+            }
+        ]
+
         mock_asset = MagicMock()
         mock_asset.name = f"DS#{_SOURCE_ID}:mydb.mytable"
         mock_asset.asset_id = "asset-001"
+        mock_asset.forms_output = forms_list
 
         mock_result = MagicMock()
         mock_result.items = [mock_asset]
@@ -2234,21 +2344,6 @@ class TestHandleListTables:
 
         mock_smus = MagicMock()
         mock_smus.search_assets.return_value = mock_result
-        mock_smus.get_asset_forms.return_value = {
-            "formsOutput": [
-                {
-                    "formName": FORM_TYPE_NAME,
-                    "content": json.dumps(
-                        {
-                            "databaseName": "mydb",
-                            "tableName": "mytable",
-                            "columnCount": 1,
-                            "reviewStatus": "PENDING_REVIEW",
-                        }
-                    ),
-                }
-            ]
-        }
 
         with (
             patch(f"{_DR}._SMUS_DOMAIN_ID", "domain-id"),
@@ -2269,6 +2364,14 @@ class TestHandleListTables:
         mock_asset = MagicMock()
         mock_asset.name = f"DS#{_SOURCE_ID}:mydb.mytable"
         mock_asset.asset_id = "asset-001"
+        mock_asset.forms_output = [
+            {
+                "formName": FORM_TYPE_NAME,
+                "content": json.dumps(
+                    {"databaseName": "mydb", "tableName": "mytable", "columnCount": 1, "reviewStatus": "APPROVED"}
+                ),
+            }
+        ]
 
         mock_result = MagicMock()
         mock_result.items = [mock_asset]
@@ -2276,16 +2379,6 @@ class TestHandleListTables:
 
         mock_smus = MagicMock()
         mock_smus.search_assets.return_value = mock_result
-        mock_smus.get_asset_forms.return_value = {
-            "formsOutput": [
-                {
-                    "formName": FORM_TYPE_NAME,
-                    "content": json.dumps(
-                        {"databaseName": "mydb", "tableName": "mytable", "columnCount": 1, "reviewStatus": "APPROVED"}
-                    ),
-                }
-            ]
-        }
 
         with (
             patch(f"{_DR}._SMUS_DOMAIN_ID", "domain-id"),
@@ -2301,6 +2394,360 @@ class TestHandleListTables:
 
         assert status == 200
         assert len(body["items"]) == 0
+
+    def test_list_tables_inline_forms_skips_get_asset_forms(self):
+        """Canary: when search returns populated forms_output, get_asset_forms
+        is NOT called — this proves the N+1 is gone."""
+        from coa_common.datazone_forms import FORM_TYPE_NAME
+
+        mock_ns_dao = MagicMock()
+        mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
+
+        forms_list = [
+            {
+                "formName": FORM_TYPE_NAME,
+                "content": json.dumps(
+                    {
+                        "databaseName": "mydb",
+                        "tableName": "mytable",
+                        "columnCount": 5,
+                        "reviewStatus": "PENDING_REVIEW",
+                    }
+                ),
+            }
+        ]
+
+        mock_asset = MagicMock()
+        mock_asset.name = f"DS#{_SOURCE_ID}:mydb.mytable"
+        mock_asset.asset_id = "asset-001"
+        mock_asset.forms_output = forms_list
+
+        mock_result = MagicMock()
+        mock_result.items = [mock_asset]
+        mock_result.next_token = None
+
+        mock_smus = MagicMock()
+        mock_smus.search_assets.return_value = mock_result
+
+        with (
+            patch(f"{_DR}._SMUS_DOMAIN_ID", "domain-id"),
+            patch(f"{_DR}._get_ns_dao", return_value=mock_ns_dao),
+            patch(f"{_DR}._get_smus_client", return_value=mock_smus),
+        ):
+            status, body = _parse(_dr._handle_list_tables(self._make_list_event(), _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 200
+        assert len(body["items"]) == 1
+        assert body["items"][0]["name"] == "mytable"
+        mock_smus.get_asset_forms.assert_not_called()
+
+    def test_list_tables_inline_forms_still_apply_rescan_enrichment(self):
+        """Inline forms and re-scan enrichment must both hold AT ONCE.
+
+        Regression guard for the rebase of GH-133 onto the re-scan work. The two
+        features were written independently and each side's tests only exercise
+        its own path: the re-scan assertions elsewhere in this file all reach the
+        payload through the ``get_asset_forms`` fallback (their mock assets have
+        no ``forms_output``), while the inline-forms tests all use payloads with
+        no re-scan state. Removing the per-form inner loop de-indented the whole
+        ``TableSummary`` construction by one level, so a bad merge could quietly
+        drop the re-scan fields from the inline path — the common path in
+        production — while every existing test still passed.
+        """
+        from coa_common.datazone_forms import FORM_TYPE_NAME
+
+        mock_ns_dao = MagicMock()
+        mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
+
+        def _asset(asset_id: str, table: str, payload: dict) -> MagicMock:
+            asset = MagicMock()
+            asset.name = f"DS#{_SOURCE_ID}:{table}"
+            asset.asset_id = asset_id
+            asset.forms_output = [{"formName": FORM_TYPE_NAME, "content": json.dumps(payload)}]
+            return asset
+
+        # Dropped a column; status was reset to PENDING_REVIEW by the merge.
+        shrunk = _asset(
+            "asset-shrunk",
+            "mydb.shrunk",
+            {
+                "databaseName": "mydb",
+                "tableName": "shrunk",
+                "columnCount": 2,  # deliberately stale scalar
+                "reviewStatus": "PENDING_REVIEW",
+                "columns": [
+                    {"name": "kept", "business_metadata": {"review_status": "APPROVED"}},
+                    {"name": "gone", "business_metadata": {"review_status": "APPROVED"}},
+                ],
+            },
+        )
+        # Dropped wholesale, still carrying its old APPROVED status.
+        gone = _asset(
+            "asset-gone",
+            "mydb.gone",
+            {"databaseName": "mydb", "tableName": "gone", "reviewStatus": "APPROVED", "columns": []},
+        )
+        # Brand new in this re-scan.
+        fresh = _asset(
+            "asset-fresh",
+            "mydb.fresh",
+            {"databaseName": "mydb", "tableName": "fresh", "reviewStatus": "PENDING_REVIEW", "columns": []},
+        )
+
+        mock_smus = MagicMock()
+        mock_smus.search_assets.return_value = MagicMock(items=[shrunk, gone, fresh], next_token=None)
+
+        with (
+            patch(f"{_DR}._SMUS_DOMAIN_ID", "domain-id"),
+            patch(f"{_DR}._get_ns_dao", return_value=mock_ns_dao),
+            patch(f"{_DR}._get_smus_client", return_value=mock_smus),
+            patch(
+                f"{_DR}._removed_sets",
+                return_value=({"mydb.gone"}, {"mydb.shrunk": {"gone"}}, {"mydb.fresh"}),
+            ),
+        ):
+            status, body = _parse(_dr._handle_list_tables(self._make_list_event(), _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 200
+        items = {i["name"]: i for i in body["items"]}
+        assert set(items) == {"shrunk", "gone", "fresh"}
+
+        # Honest denominator from the merged list, not the stale scalar; the
+        # APPROVED-but-doomed column is neither approved nor hidden.
+        assert items["shrunk"]["columnCount"] == 2
+        assert items["shrunk"]["columnsApproved"] == 1
+        assert items["shrunk"]["columnsPendingDeletion"] == 1
+        assert items["shrunk"].get("pendingDeletion") is None
+
+        # A wholly-removed table reports PENDING_REVIEW despite its stored
+        # APPROVED, so it shows up in the steward's pending queue.
+        assert items["gone"]["reviewStatus"] == "PENDING_REVIEW"
+        assert items["gone"]["pendingDeletion"] is True
+
+        assert items["fresh"]["added"] is True
+        assert items["fresh"].get("pendingDeletion") is None
+
+        # All of the above came from inline forms — the N+1 stays gone.
+        mock_smus.get_asset_forms.assert_not_called()
+
+    def test_list_tables_fallback_when_forms_output_absent(self):
+        """When search returns absent forms_output, the fallback calls
+        get_asset_forms and the table is still listed correctly."""
+        from coa_common.datazone_forms import FORM_TYPE_NAME
+
+        mock_ns_dao = MagicMock()
+        mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
+
+        mock_asset = MagicMock()
+        mock_asset.name = f"DS#{_SOURCE_ID}:mydb.fb_table"
+        mock_asset.asset_id = "asset-fb"
+        mock_asset.forms_output = None
+
+        mock_result = MagicMock()
+        mock_result.items = [mock_asset]
+        mock_result.next_token = None
+
+        mock_smus = MagicMock()
+        mock_smus.search_assets.return_value = mock_result
+        mock_smus.get_asset_forms.return_value = {
+            "formsOutput": [
+                {
+                    "formName": FORM_TYPE_NAME,
+                    "content": json.dumps(
+                        {
+                            "databaseName": "mydb",
+                            "tableName": "fb_table",
+                            "columnCount": 2,
+                            "reviewStatus": "PENDING_REVIEW",
+                        }
+                    ),
+                }
+            ]
+        }
+
+        with (
+            patch(f"{_DR}._SMUS_DOMAIN_ID", "domain-id"),
+            patch(f"{_DR}._get_ns_dao", return_value=mock_ns_dao),
+            patch(f"{_DR}._get_smus_client", return_value=mock_smus),
+        ):
+            status, body = _parse(_dr._handle_list_tables(self._make_list_event(), _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 200
+        assert len(body["items"]) == 1
+        assert body["items"][0]["name"] == "fb_table"
+        mock_smus.get_asset_forms.assert_called_once_with(asset_id="asset-fb")
+
+    def test_list_tables_fallback_when_forms_output_empty_list(self):
+        """When search returns an empty forms_output list, the fallback fires."""
+        from coa_common.datazone_forms import FORM_TYPE_NAME
+
+        mock_ns_dao = MagicMock()
+        mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
+
+        mock_asset = MagicMock()
+        mock_asset.name = f"DS#{_SOURCE_ID}:mydb.empty_table"
+        mock_asset.asset_id = "asset-empty"
+        mock_asset.forms_output = []
+
+        mock_result = MagicMock()
+        mock_result.items = [mock_asset]
+        mock_result.next_token = None
+
+        mock_smus = MagicMock()
+        mock_smus.search_assets.return_value = mock_result
+        mock_smus.get_asset_forms.return_value = {
+            "formsOutput": [
+                {
+                    "formName": FORM_TYPE_NAME,
+                    "content": json.dumps(
+                        {
+                            "databaseName": "mydb",
+                            "tableName": "empty_table",
+                            "columnCount": 1,
+                            "reviewStatus": "PENDING_REVIEW",
+                        }
+                    ),
+                }
+            ]
+        }
+
+        with (
+            patch(f"{_DR}._SMUS_DOMAIN_ID", "domain-id"),
+            patch(f"{_DR}._get_ns_dao", return_value=mock_ns_dao),
+            patch(f"{_DR}._get_smus_client", return_value=mock_smus),
+        ):
+            status, body = _parse(_dr._handle_list_tables(self._make_list_event(), _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 200
+        assert len(body["items"]) == 1
+        assert body["items"][0]["name"] == "empty_table"
+        mock_smus.get_asset_forms.assert_called_once_with(asset_id="asset-empty")
+
+    def test_list_tables_fallback_when_inline_form_content_is_null(self):
+        """A NON-EMPTY forms_output whose SCL form has ``content: null`` must take
+        the per-asset fallback, not the inline parse.
+
+        Regression: the emptiness probe was at list level, so a populated
+        formsOutput with an unpopulated ``content`` counted as usable and reached
+        ``json.loads(form["content"])`` -> TypeError -> 500 for the WHOLE page.
+        The MR's stated contract is worst-case-today's-behaviour, i.e. fall back."""
+        from coa_common.datazone_forms import FORM_TYPE_NAME
+
+        mock_ns_dao = MagicMock()
+        mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
+
+        mock_asset = MagicMock()
+        mock_asset.name = f"DS#{_SOURCE_ID}:mydb.null_content"
+        mock_asset.asset_id = "asset-null"
+        mock_asset.forms_output = [{"formName": FORM_TYPE_NAME, "content": None}]
+
+        mock_result = MagicMock()
+        mock_result.items = [mock_asset]
+        mock_result.next_token = None
+
+        mock_smus = MagicMock()
+        mock_smus.search_assets.return_value = mock_result
+        mock_smus.get_asset_forms.return_value = {
+            "formsOutput": [
+                {
+                    "formName": FORM_TYPE_NAME,
+                    "content": json.dumps(
+                        {
+                            "databaseName": "mydb",
+                            "tableName": "null_content",
+                            "columnCount": 3,
+                            "reviewStatus": "PENDING_REVIEW",
+                        }
+                    ),
+                }
+            ]
+        }
+
+        with (
+            patch(f"{_DR}._SMUS_DOMAIN_ID", "domain-id"),
+            patch(f"{_DR}._get_ns_dao", return_value=mock_ns_dao),
+            patch(f"{_DR}._get_smus_client", return_value=mock_smus),
+        ):
+            status, body = _parse(_dr._handle_list_tables(self._make_list_event(), _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 200
+        assert len(body["items"]) == 1
+        assert body["items"][0]["name"] == "null_content"
+        mock_smus.get_asset_forms.assert_called_once_with(asset_id="asset-null")
+
+    def test_list_tables_absent_content_key_skips_the_asset_not_the_page(self):
+        """A form dict with NO ``content`` key, whose fallback is also unusable,
+        degrades to a per-asset skip — never a KeyError escaping to a 500."""
+        from coa_common.datazone_forms import FORM_TYPE_NAME
+
+        mock_ns_dao = MagicMock()
+        mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
+
+        mock_bad = MagicMock()
+        mock_bad.name = f"DS#{_SOURCE_ID}:mydb.no_content_key"
+        mock_bad.asset_id = "asset-nokey"
+        mock_bad.forms_output = [{"formName": FORM_TYPE_NAME}]
+
+        mock_ok = MagicMock()
+        mock_ok.name = f"DS#{_SOURCE_ID}:mydb.good_table"
+        mock_ok.asset_id = "asset-ok"
+        mock_ok.forms_output = [
+            {
+                "formName": FORM_TYPE_NAME,
+                "content": json.dumps(
+                    {
+                        "databaseName": "mydb",
+                        "tableName": "good_table",
+                        "columnCount": 4,
+                        "reviewStatus": "PENDING_REVIEW",
+                    }
+                ),
+            }
+        ]
+
+        mock_result = MagicMock()
+        mock_result.items = [mock_bad, mock_ok]
+        mock_result.next_token = None
+
+        mock_smus = MagicMock()
+        mock_smus.search_assets.return_value = mock_result
+        # Fallback cannot help either: the form comes back with empty content.
+        mock_smus.get_asset_forms.return_value = {"formsOutput": [{"formName": FORM_TYPE_NAME, "content": ""}]}
+
+        with (
+            patch(f"{_DR}._SMUS_DOMAIN_ID", "domain-id"),
+            patch(f"{_DR}._get_ns_dao", return_value=mock_ns_dao),
+            patch(f"{_DR}._get_smus_client", return_value=mock_smus),
+        ):
+            status, body = _parse(_dr._handle_list_tables(self._make_list_event(), _NAMESPACE_ID, _SOURCE_ID))
+
+        # The healthy sibling asset still lists; only the broken one is skipped.
+        assert status == 200
+        assert [i["name"] for i in body["items"]] == ["good_table"]
+        assert body["skippedAssets"] == 1
+        mock_smus.get_asset_forms.assert_called_once_with(asset_id="asset-nokey")
+
+    def test_list_tables_passes_include_forms_true(self):
+        """Verify search_assets is called with include_forms=True."""
+        mock_ns_dao = MagicMock()
+        mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
+
+        mock_result = MagicMock()
+        mock_result.items = []
+        mock_result.next_token = None
+
+        mock_smus = MagicMock()
+        mock_smus.search_assets.return_value = mock_result
+
+        with (
+            patch(f"{_DR}._SMUS_DOMAIN_ID", "domain-id"),
+            patch(f"{_DR}._get_ns_dao", return_value=mock_ns_dao),
+            patch(f"{_DR}._get_smus_client", return_value=mock_smus),
+        ):
+            _dr._handle_list_tables(self._make_list_event(), _NAMESPACE_ID, _SOURCE_ID)
+
+        _, kwargs = mock_smus.search_assets.call_args
+        assert kwargs["include_forms"] is True
 
 
 # ===================================================================
@@ -2369,7 +2816,7 @@ class TestHandleGetTable:
         mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
 
         mock_smus = MagicMock()
-        mock_smus.search_assets.side_effect = Exception("search error")
+        mock_smus.find_asset_by_name.side_effect = Exception("search error")
 
         with (
             patch(f"{_DR}._SMUS_DOMAIN_ID", "domain-id"),
@@ -2403,6 +2850,672 @@ class TestHandleGetTable:
             status, _ = _parse(_dr._handle_get_table(_NAMESPACE_ID, _SOURCE_ID, "mydb.mytable"))
 
         assert status == 500
+
+
+# ===================================================================
+# pendingDeletion surfacing (re-scan removals)
+# ===================================================================
+
+
+class TestPendingDeletionSurfacing:
+    def _make_list_event(self, qs=None):
+        return {"httpMethod": "GET", "queryStringParameters": qs or {}}
+
+    def test_list_tables_flags_removed_tables(self):
+        from coa_common.datazone_forms import FORM_TYPE_NAME
+
+        mock_ns_dao = MagicMock()
+        mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
+
+        def _asset(tid):
+            a = MagicMock()
+            a.name = f"DS#{_SOURCE_ID}:{tid}"
+            a.asset_id = f"asset-{tid}"
+            return a
+
+        mock_smus = MagicMock()
+        mock_smus.search_assets.return_value = MagicMock(
+            items=[_asset("mydb.gone"), _asset("mydb.keep")], next_token=None
+        )
+
+        def _forms(asset_id):
+            db, name = asset_id.removeprefix("asset-").split(".")
+            return {
+                "formsOutput": [
+                    {
+                        "formName": FORM_TYPE_NAME,
+                        "content": json.dumps(
+                            {"databaseName": db, "tableName": name, "columnCount": 1, "reviewStatus": "APPROVED"}
+                        ),
+                    }
+                ]
+            }
+
+        mock_smus.get_asset_forms.side_effect = _forms
+        with (
+            patch(f"{_DR}._SMUS_DOMAIN_ID", "domain-id"),
+            patch(f"{_DR}._get_ns_dao", return_value=mock_ns_dao),
+            patch(f"{_DR}._get_smus_client", return_value=mock_smus),
+            patch(f"{_DR}._removed_sets", return_value=({"mydb.gone"}, {}, set())),
+        ):
+            status, body = _parse(_dr._handle_list_tables(self._make_list_event(), _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 200
+        flags = {i["name"]: i.get("pendingDeletion") for i in body["items"]}
+        assert flags["gone"] is True
+        assert not flags.get("keep")
+        # A removed table (stored APPROVED) reads as PENDING_REVIEW so it shows in
+        # the review filter/count; a kept table keeps its stored status.
+        statuses = {i["name"]: i["reviewStatus"] for i in body["items"]}
+        assert statuses["gone"] == "PENDING_REVIEW"
+        assert statuses["keep"] == "APPROVED"
+
+    def test_get_table_flags_removed_table_and_columns(self):
+        mock_ns_dao = MagicMock()
+        mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
+        mock_smus = MagicMock()
+        _mock_single_asset_load(
+            mock_smus,
+            table_id="sales.orders",
+            form_content=_serialize_table(
+                table_name="orders",
+                database="sales",
+                table_status="APPROVED",
+                columns=[
+                    {"name": "keep_col", "review_status": "APPROVED"},
+                    {"name": "gone_col", "review_status": "APPROVED"},
+                ],
+            ),
+        )
+        with (
+            patch(f"{_DR}._SMUS_DOMAIN_ID", "domain-id"),
+            patch(f"{_DR}._get_ns_dao", return_value=mock_ns_dao),
+            patch(f"{_DR}._get_smus_client", return_value=mock_smus),
+            patch(f"{_DR}._removed_sets", return_value=({"sales.orders"}, {"sales.orders": {"gone_col"}}, set())),
+        ):
+            status, body = _parse(_dr._handle_get_table(_NAMESPACE_ID, _SOURCE_ID, "sales.orders"))
+
+        assert status == 200
+        assert body["pendingDeletion"] is True
+        # The removed table (stored APPROVED) reads as PENDING_REVIEW.
+        assert body["reviewStatus"] == "PENDING_REVIEW"
+        col_flags = {c["name"]: c.get("pendingDeletion") for c in body["columns"]}
+        assert col_flags["gone_col"] is True
+        assert not col_flags.get("keep_col")
+        # The whole table is dropped, so EVERY column reads PENDING_REVIEW — a
+        # dropped table is never shown as still-Approved, columns included. The
+        # per-column pendingDeletion badge still only flags the individually
+        # removed column (gone_col), not keep_col.
+        col_status = {c["name"]: c["businessMetadata"]["reviewStatus"] for c in body["columns"]}
+        assert col_status["gone_col"] == "PENDING_REVIEW"
+        assert col_status["keep_col"] == "PENDING_REVIEW"
+
+    def test_get_table_column_only_removal_does_not_flip_other_columns(self):
+        # Table is NOT dropped; only one column is removed. That column reads
+        # PENDING_REVIEW; the other keeps its APPROVED status.
+        mock_ns_dao = MagicMock()
+        mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
+        mock_smus = MagicMock()
+        _mock_single_asset_load(
+            mock_smus,
+            table_id="sales.orders",
+            form_content=_serialize_table(
+                table_name="orders",
+                database="sales",
+                table_status="APPROVED",
+                columns=[
+                    {"name": "keep_col", "review_status": "APPROVED"},
+                    {"name": "gone_col", "review_status": "APPROVED"},
+                ],
+            ),
+        )
+        with (
+            patch(f"{_DR}._SMUS_DOMAIN_ID", "domain-id"),
+            patch(f"{_DR}._get_ns_dao", return_value=mock_ns_dao),
+            patch(f"{_DR}._get_smus_client", return_value=mock_smus),
+            patch(f"{_DR}._removed_sets", return_value=(set(), {"sales.orders": {"gone_col"}}, set())),
+        ):
+            status, body = _parse(_dr._handle_get_table(_NAMESPACE_ID, _SOURCE_ID, "sales.orders"))
+
+        assert status == 200
+        assert body["pendingDeletion"] is None  # table itself not dropped
+        col_status = {c["name"]: c["businessMetadata"]["reviewStatus"] for c in body["columns"]}
+        assert col_status["gone_col"] == "PENDING_REVIEW"
+        assert col_status["keep_col"] == "APPROVED"
+
+    def test_get_table_flags_added_table(self):
+        # A table the re-scan discovered for the first time carries added=True
+        # (and no pendingDeletion) — the UI shows a "new table" note.
+        mock_ns_dao = MagicMock()
+        mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
+        mock_smus = MagicMock()
+        _mock_single_asset_load(
+            mock_smus,
+            table_id="sales.fresh",
+            form_content=_serialize_table(
+                table_name="fresh",
+                database="sales",
+                table_status="PENDING_REVIEW",
+                columns=[{"name": "c1", "review_status": "PENDING_REVIEW"}],
+            ),
+        )
+        with (
+            patch(f"{_DR}._SMUS_DOMAIN_ID", "domain-id"),
+            patch(f"{_DR}._get_ns_dao", return_value=mock_ns_dao),
+            patch(f"{_DR}._get_smus_client", return_value=mock_smus),
+            patch(f"{_DR}._removed_sets", return_value=(set(), {}, {"sales.fresh"})),
+        ):
+            status, body = _parse(_dr._handle_get_table(_NAMESPACE_ID, _SOURCE_ID, "sales.fresh"))
+
+        assert status == 200
+        assert body["added"] is True
+        assert body["pendingDeletion"] is None
+
+    def test_get_table_no_added_flag_when_not_in_added_set(self):
+        mock_ns_dao = MagicMock()
+        mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
+        mock_smus = MagicMock()
+        _mock_single_asset_load(
+            mock_smus,
+            table_id="sales.existing",
+            form_content=_serialize_table(
+                table_name="existing",
+                database="sales",
+                table_status="APPROVED",
+                columns=[{"name": "c1", "review_status": "APPROVED"}],
+            ),
+        )
+        with (
+            patch(f"{_DR}._SMUS_DOMAIN_ID", "domain-id"),
+            patch(f"{_DR}._get_ns_dao", return_value=mock_ns_dao),
+            patch(f"{_DR}._get_smus_client", return_value=mock_smus),
+            patch(f"{_DR}._removed_sets", return_value=(set(), {}, {"sales.other"})),
+        ):
+            status, body = _parse(_dr._handle_get_table(_NAMESPACE_ID, _SOURCE_ID, "sales.existing"))
+
+        assert status == 200
+        assert body.get("added") is None
+
+    def test_effective_review_status_pending_deletion_flips_to_pending(self):
+        assert _dr._effective_review_status("APPROVED", pending_deletion=True) == "PENDING_REVIEW"
+
+    def test_effective_review_status_preserves_rejected(self):
+        # A rejected item stays rejected even when pending deletion (mirrors the
+        # re-scan merge's status rules).
+        assert _dr._effective_review_status("REJECTED", pending_deletion=True) == "REJECTED"
+
+    def test_effective_review_status_passthrough_when_not_pending(self):
+        assert _dr._effective_review_status("APPROVED", pending_deletion=False) == "APPROVED"
+        assert _dr._effective_review_status(None, pending_deletion=False) is None
+
+    def test_removed_sets_empty_unless_rescan_review(self):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {"status": "APPROVED"}
+        with (
+            patch(f"{_DR}._BUCKET_NAME", "bucket"),
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+        ):
+            assert _dr._removed_sets(_NAMESPACE_ID, _SOURCE_ID) == (set(), {}, set())
+
+    def test_removed_sets_reads_backup_in_rescan_review(self):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {"status": "RESCAN_REVIEW"}
+        blob = json.dumps(
+            {
+                "removed_tables": ["db.gone"],
+                "removed_columns": {"db.mod": ["c1"]},
+                "added_tables": ["db.fresh"],
+            }
+        ).encode()
+        with (
+            patch(f"{_DR}._BUCKET_NAME", "bucket"),
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}.get_s3_client", return_value=MagicMock()),
+            patch(f"{_DR}.read_file_bytes", return_value=blob),
+        ):
+            removed_tables, removed_columns, added_tables = _dr._removed_sets(_NAMESPACE_ID, _SOURCE_ID)
+        assert removed_tables == {"db.gone"}
+        assert removed_columns == {"db.mod": {"c1"}}
+        assert added_tables == {"db.fresh"}
+
+    def _rescan_review_dao(self):
+        dao = MagicMock()
+        dao.get.return_value = {"status": "RESCAN_REVIEW"}
+        return dao
+
+    def _patched_read(self, error: Exception):
+        return (
+            patch(f"{_DR}._BUCKET_NAME", "bucket"),
+            patch(f"{_DR}._get_dao", return_value=self._rescan_review_dao()),
+            patch(f"{_DR}.get_s3_client", return_value=MagicMock()),
+            patch(f"{_DR}.read_file_bytes", MagicMock(side_effect=error)),
+        )
+
+    def test_removed_sets_empty_when_backup_absent(self):
+        """No backup object means no open re-scan — genuinely nothing flagged."""
+        absent = ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+        a, b, c, d = self._patched_read(absent)
+        with a, b, c, d:
+            assert _dr._removed_sets(_NAMESPACE_ID, _SOURCE_ID) == (set(), {}, set())
+
+    def test_removed_sets_propagates_real_s3_error(self):
+        """A failed read must NOT look like "nothing pending deletion".
+
+        Reporting empty here hid pending deletions from the review page while
+        approve still deleted them, so a steward could approve removals they
+        were never shown. Fail loudly instead.
+        """
+        for code in ("ThrottlingException", "AccessDenied", "InternalError"):
+            failure = ClientError({"Error": {"Code": code}}, "GetObject")
+            a, b, c, d = self._patched_read(failure)
+            with a, b, c, d, pytest.raises(ClientError):
+                _dr._removed_sets(_NAMESPACE_ID, _SOURCE_ID)
+
+    def test_rescan_table_diff_none_when_backup_absent(self):
+        absent = ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+        a, b, c, d = self._patched_read(absent)
+        with a, b, c, d:
+            assert _dr._rescan_table_diff(_NAMESPACE_ID, _SOURCE_ID, "db.t", MagicMock()) is None
+
+    def test_rescan_table_diff_propagates_real_s3_error(self):
+        """An S3 fault must not render as "no changes" in the diff panel."""
+        failure = ClientError({"Error": {"Code": "ThrottlingException"}}, "GetObject")
+        a, b, c, d = self._patched_read(failure)
+        with a, b, c, d, pytest.raises(ClientError):
+            _dr._rescan_table_diff(_NAMESPACE_ID, _SOURCE_ID, "db.t", MagicMock())
+
+    def test_list_tables_flags_added_tables(self):
+        from coa_common.datazone_forms import FORM_TYPE_NAME
+
+        mock_ns_dao = MagicMock()
+        mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
+
+        def _asset(tid):
+            a = MagicMock()
+            a.name = f"DS#{_SOURCE_ID}:{tid}"
+            a.asset_id = f"asset-{tid}"
+            return a
+
+        mock_smus = MagicMock()
+        mock_smus.search_assets.return_value = MagicMock(
+            items=[_asset("mydb.fresh"), _asset("mydb.same")], next_token=None
+        )
+
+        def _forms(asset_id):
+            db, name = asset_id.removeprefix("asset-").split(".")
+            return {
+                "formsOutput": [
+                    {
+                        "formName": FORM_TYPE_NAME,
+                        "content": json.dumps(
+                            {"databaseName": db, "tableName": name, "columnCount": 1, "reviewStatus": "PENDING_REVIEW"}
+                        ),
+                    }
+                ]
+            }
+
+        mock_smus.get_asset_forms.side_effect = _forms
+        # A net-new table (mydb.fresh) is flagged; a modified/unchanged one is not.
+        with (
+            patch(f"{_DR}._SMUS_DOMAIN_ID", "domain-id"),
+            patch(f"{_DR}._get_ns_dao", return_value=mock_ns_dao),
+            patch(f"{_DR}._get_smus_client", return_value=mock_smus),
+            patch(f"{_DR}._removed_sets", return_value=(set(), {}, {"mydb.fresh"})),
+        ):
+            status, body = _parse(_dr._handle_list_tables(self._make_list_event(), _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 200
+        flags = {i["name"]: i.get("added") for i in body["items"]}
+        assert flags["fresh"] is True
+        assert not flags.get("same")
+
+    def test_list_tables_no_added_flag_outside_rescan_review(self):
+        from coa_common.datazone_forms import FORM_TYPE_NAME
+
+        mock_ns_dao = MagicMock()
+        mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
+
+        mock_asset = MagicMock()
+        mock_asset.name = f"DS#{_SOURCE_ID}:mydb.mytable"
+        mock_asset.asset_id = "asset-001"
+
+        mock_smus = MagicMock()
+        mock_smus.search_assets.return_value = MagicMock(items=[mock_asset], next_token=None)
+        mock_smus.get_asset_forms.return_value = {
+            "formsOutput": [
+                {
+                    "formName": FORM_TYPE_NAME,
+                    "content": json.dumps(
+                        {"databaseName": "mydb", "tableName": "mytable", "columnCount": 1, "reviewStatus": "APPROVED"}
+                    ),
+                }
+            ]
+        }
+        # Not in RESCAN_REVIEW → _removed_sets returns all-empty → no added flag.
+        with (
+            patch(f"{_DR}._SMUS_DOMAIN_ID", "domain-id"),
+            patch(f"{_DR}._get_ns_dao", return_value=mock_ns_dao),
+            patch(f"{_DR}._get_smus_client", return_value=mock_smus),
+            patch(f"{_DR}._removed_sets", return_value=(set(), {}, set())),
+        ):
+            status, body = _parse(_dr._handle_list_tables(self._make_list_event(), _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 200
+        assert body["items"][0].get("added") is None
+
+
+@pytest.mark.unit
+class TestRescanDiffSurfacing:
+    """rescanDiff on GET table — old-vs-new breakdown during RESCAN_REVIEW.
+
+    ``_rescan_table_diff`` reconstructs the pre-rescan (last-approved) table from
+    the S3 backup's ``modified_backup[table_id]`` (a ``serialize_form`` of the
+    OLD table) and re-diffs it against the freshly-merged current asset with the
+    same pure ``diff_tables`` rules. Only surfaces while the source is in
+    RESCAN_REVIEW.
+    """
+
+    _TABLE_ID = "sales.orders"
+
+    def _old_table_with_deterministic_description(self, description: str):
+        """OLD table whose *source-derived* (DETERMINISTIC) description differs
+        from the current asset — a change ``diff_tables`` will flag. Columns
+        mirror the current asset's so only the table-level field changes."""
+        from coa_common.domain_models import BusinessMetadata, Column, EnrichmentSource, ReviewStatus, Table
+
+        return Table(
+            name="orders",
+            database="sales",
+            data_source_id=_SOURCE_ID,
+            namespace_id=_NAMESPACE_ID,
+            business_metadata=BusinessMetadata(
+                description=description,
+                enrichment_source=EnrichmentSource.DETERMINISTIC,
+                review_status=ReviewStatus.APPROVED,
+            ),
+            columns=[
+                Column(name="col_a", data_type="string"),
+                Column(name="col_b", data_type="string"),
+            ],
+        )
+
+    def _backup_blob(self, old_table) -> bytes:
+        from coa_common.datazone_forms import serialize_form
+
+        return json.dumps(
+            {
+                "removed_tables": [],
+                "removed_columns": {},
+                "modified_backup": {self._TABLE_ID: serialize_form(old_table)},
+            }
+        ).encode()
+
+    def test_rescan_review_surfaces_table_field_change(self):
+        # Source-derived (DETERMINISTIC) table description drifted between the
+        # last approved scan and the fresh scan → one DESCRIPTION tableField.
+        mock_ns_dao = MagicMock()
+        mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
+        mock_smus = MagicMock()
+        _mock_single_asset_load(
+            mock_smus,
+            table_id=self._TABLE_ID,
+            form_content=_serialize_table(
+                table_name="orders",
+                database="sales",
+                description="Updated order records",
+            ),
+        )
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {"status": "RESCAN_REVIEW"}
+        blob = self._backup_blob(self._old_table_with_deterministic_description("Customer order records"))
+
+        with (
+            patch(f"{_DR}._SMUS_DOMAIN_ID", "domain-id"),
+            patch(f"{_DR}._get_ns_dao", return_value=mock_ns_dao),
+            patch(f"{_DR}._get_smus_client", return_value=mock_smus),
+            patch(f"{_DR}._BUCKET_NAME", "bucket"),
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}.get_s3_client", return_value=MagicMock()),
+            patch(f"{_DR}.read_file_bytes", return_value=blob),
+        ):
+            status, body = _parse(_dr._handle_get_table(_NAMESPACE_ID, _SOURCE_ID, self._TABLE_ID))
+
+        assert status == 200
+        diff = body["rescanDiff"]
+        assert diff is not None
+        assert diff["tableFields"] == [
+            {
+                "field": "description",
+                "kind": "DESCRIPTION",
+                "old": "Customer order records",
+                "new": "Updated order records",
+            }
+        ]
+        # Only the table-level description changed — no per-column breakdown.
+        assert not diff.get("columns")
+
+    def test_no_rescan_diff_when_not_rescan_review(self):
+        # A backup blob exists (stale from a prior re-scan), but the source is
+        # PENDING_REVIEW, not RESCAN_REVIEW — rescanDiff must stay absent/None.
+        mock_ns_dao = MagicMock()
+        mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
+        mock_smus = MagicMock()
+        _mock_single_asset_load(
+            mock_smus,
+            table_id=self._TABLE_ID,
+            form_content=_serialize_table(
+                table_name="orders",
+                database="sales",
+                description="Updated order records",
+            ),
+        )
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {"status": "PENDING_REVIEW"}
+        blob = self._backup_blob(self._old_table_with_deterministic_description("Customer order records"))
+
+        with (
+            patch(f"{_DR}._SMUS_DOMAIN_ID", "domain-id"),
+            patch(f"{_DR}._get_ns_dao", return_value=mock_ns_dao),
+            patch(f"{_DR}._get_smus_client", return_value=mock_smus),
+            patch(f"{_DR}._BUCKET_NAME", "bucket"),
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}.get_s3_client", return_value=MagicMock()),
+            patch(f"{_DR}.read_file_bytes", return_value=blob),
+        ):
+            status, body = _parse(_dr._handle_get_table(_NAMESPACE_ID, _SOURCE_ID, self._TABLE_ID))
+
+        assert status == 200
+        assert body.get("rescanDiff") is None
+
+    def _blob_with(self, *, modified_form: str, removed_columns: dict) -> bytes:
+        """Backup blob whose ``modified_backup`` pre-image is the deserialized
+        form and whose ``removed_columns`` records the source-dropped columns."""
+        return json.dumps(
+            {
+                "removed_tables": [],
+                "removed_columns": removed_columns,
+                "modified_backup": {self._TABLE_ID: json.loads(modified_form)},
+            }
+        ).encode()
+
+    def _get_table(self, *, form_content: str, blob: bytes, status: str = "RESCAN_REVIEW"):
+        """Drive ``_handle_get_table`` with a live asset (``form_content``) and a
+        backup blob, in the given source status. Returns ``(status, body)``."""
+        mock_ns_dao = MagicMock()
+        mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
+        mock_smus = MagicMock()
+        _mock_single_asset_load(mock_smus, table_id=self._TABLE_ID, form_content=form_content)
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {"status": status}
+        with (
+            patch(f"{_DR}._SMUS_DOMAIN_ID", "domain-id"),
+            patch(f"{_DR}._get_ns_dao", return_value=mock_ns_dao),
+            patch(f"{_DR}._get_smus_client", return_value=mock_smus),
+            patch(f"{_DR}._BUCKET_NAME", "bucket"),
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}.get_s3_client", return_value=MagicMock()),
+            patch(f"{_DR}.read_file_bytes", return_value=blob),
+        ):
+            return _parse(_dr._handle_get_table(_NAMESPACE_ID, _SOURCE_ID, self._TABLE_ID))
+
+    def test_rescan_review_surfaces_removed_columns_from_backup(self):
+        # A re-scan dropped col_c, but the discovery merge KEEPS col_c in the live
+        # asset (tagged pendingDeletion so a steward can "Keep" it), so diff_tables
+        # sees col_c on BOTH sides and never flags it removed. The backup's
+        # removed_columns is the authoritative record — the panel must still list
+        # col_c as removed even though the diff is otherwise empty. (Regression:
+        # rescanDiff used to come back None for a dropped-columns-only re-scan.)
+        cols = [{"name": "col_a"}, {"name": "col_b"}, {"name": "col_c"}]
+        form = _serialize_table(table_name="orders", database="sales", columns=cols)
+        blob = self._blob_with(modified_form=form, removed_columns={self._TABLE_ID: ["col_c"]})
+
+        status, body = self._get_table(form_content=form, blob=blob)
+
+        assert status == 200
+        diff = body["rescanDiff"]
+        assert diff is not None
+        assert not diff.get("tableFields")  # only a column was dropped
+        removed = [c["name"] for c in diff["columns"] if c["status"] == "removed"]
+        assert removed == ["col_c"]
+
+    def test_no_rescan_diff_when_no_changes_and_no_removed_columns(self):
+        # Backup pre-image identical to the current asset and no removed columns →
+        # nothing to show → rescanDiff stays None (a genuine no-op re-diff).
+        form = _serialize_table(table_name="orders", database="sales")
+        blob = self._blob_with(modified_form=form, removed_columns={})
+
+        status, body = self._get_table(form_content=form, blob=blob)
+
+        assert status == 200
+        assert body.get("rescanDiff") is None
+
+    def test_rescan_review_surfaces_added_modified_and_removed_columns(self):
+        # Mixed change set: col_d added, col_b modified (data type string→integer),
+        # col_c dropped-but-retained. diff_tables catches added + modified; the
+        # removed column is folded in from the backup. All three must appear.
+        backup_cols = [{"name": "col_a"}, {"name": "col_b"}, {"name": "col_c"}]
+        current_cols = [
+            {"name": "col_a"},
+            {"name": "col_b", "data_type": "integer"},
+            {"name": "col_c"},
+            {"name": "col_d"},
+        ]
+        backup_form = _serialize_table(table_name="orders", database="sales", columns=backup_cols)
+        current_form = _serialize_table(table_name="orders", database="sales", columns=current_cols)
+        blob = self._blob_with(modified_form=backup_form, removed_columns={self._TABLE_ID: ["col_c"]})
+
+        status, body = self._get_table(form_content=current_form, blob=blob)
+
+        assert status == 200
+        diff = body["rescanDiff"]
+        assert diff is not None
+        statuses = {c["name"]: c["status"] for c in diff["columns"]}
+        assert statuses["col_d"] == "added"
+        assert statuses["col_b"] == "modified"
+        assert statuses["col_c"] == "removed"
+
+
+class TestKeepRescanRemoval:
+    """PUT /tables/{tableId}/keep — decline a re-scan-flagged removal (B6.2).
+
+    Keep edits the S3 backup blob's removal set that the approve worker reads,
+    so approve stops deleting the kept item. No DataZone or worker interaction.
+    """
+
+    _TABLE = "sales.orders"
+
+    def _event(self, column_name=None):
+        body = {} if column_name is None else {"columnName": column_name}
+        return {"httpMethod": "PUT", "body": json.dumps(body)}
+
+    def _dao(self, *, status="RESCAN_REVIEW", source_type="DATABASE", found=True):
+        dao = MagicMock()
+        dao.get.return_value = {"status": status, "sourceType": source_type} if found else None
+        return dao
+
+    def _run(self, event, dao, blob, *, read_error: Exception | None = None):
+        upload = MagicMock()
+        if read_error is not None:
+            read = MagicMock(side_effect=read_error)
+        else:
+            read = MagicMock(return_value=json.dumps(blob).encode())
+        with (
+            patch(f"{_DR}._BUCKET_NAME", "bucket"),
+            patch(f"{_DR}._get_dao", return_value=dao),
+            patch(f"{_DR}.get_s3_client", return_value=MagicMock()),
+            patch(f"{_DR}.read_file_bytes", read),
+            patch(f"{_DR}.upload_json", upload),
+        ):
+            result = _dr._handle_keep_rescan_removal(event, _NAMESPACE_ID, _SOURCE_ID, self._TABLE)
+        return _parse(result), upload
+
+    def test_keep_table_removes_from_removed_tables(self):
+        blob = {"removed_tables": [self._TABLE, "sales.other"], "removed_columns": {}}
+        (status, body), upload = self._run(self._event(), self._dao(), blob)
+        assert status == 200
+        assert body == {"tableId": self._TABLE, "pendingDeletion": False}
+        upload.assert_called_once()
+        written = upload.call_args.args[3]
+        assert written["removed_tables"] == ["sales.other"]
+
+    def test_keep_column_removes_from_removed_columns(self):
+        blob = {"removed_tables": [], "removed_columns": {self._TABLE: ["gone_col", "other_col"]}}
+        (status, body), upload = self._run(self._event(column_name="gone_col"), self._dao(), blob)
+        assert status == 200
+        assert body == {"tableId": self._TABLE, "columnName": "gone_col", "pendingDeletion": False}
+        written = upload.call_args.args[3]
+        assert written["removed_columns"] == {self._TABLE: ["other_col"]}
+
+    def test_keep_last_column_drops_empty_table_entry(self):
+        blob = {"removed_tables": [], "removed_columns": {self._TABLE: ["gone_col"]}}
+        (status, _body), upload = self._run(self._event(column_name="gone_col"), self._dao(), blob)
+        assert status == 200
+        written = upload.call_args.args[3]
+        assert written["removed_columns"] == {}
+
+    def test_keep_is_idempotent_noop_when_not_in_removal_set(self):
+        blob = {"removed_tables": ["sales.other"], "removed_columns": {}}
+        (status, body), upload = self._run(self._event(), self._dao(), blob)
+        assert status == 200
+        assert body["pendingDeletion"] is False
+        upload.assert_not_called()
+
+    def test_keep_requires_rescan_review(self):
+        blob = {"removed_tables": [self._TABLE], "removed_columns": {}}
+        (status, _body), upload = self._run(self._event(), self._dao(status="APPROVED"), blob)
+        assert status == 409
+        upload.assert_not_called()
+
+    def test_keep_source_not_found_returns_404(self):
+        (status, _body), upload = self._run(self._event(), self._dao(found=False), {"removed_tables": []})
+        assert status == 404
+        upload.assert_not_called()
+
+    def test_keep_non_database_source_returns_400(self):
+        blob = {"removed_tables": [self._TABLE], "removed_columns": {}}
+        (status, _body), upload = self._run(self._event(), self._dao(source_type="DOCUMENT"), blob)
+        assert status == 400
+        upload.assert_not_called()
+
+    def test_keep_missing_backup_returns_404(self):
+        absent = ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+        (status, _body), upload = self._run(self._event(), self._dao(), {}, read_error=absent)
+        assert status == 404
+        upload.assert_not_called()
+
+    def test_keep_s3_failure_returns_500_not_404(self):
+        """A throttled or denied read must not masquerade as "nothing to keep".
+
+        404 tells the caller the removal set does not exist, so it stops
+        retrying. Only a genuine NoSuchKey means that; every other S3 fault is
+        server-side and transient-looking, so it has to surface as a 500.
+        """
+        for code in ("ThrottlingException", "AccessDenied", "InternalError"):
+            failure = ClientError({"Error": {"Code": code}}, "GetObject")
+            (status, body), upload = self._run(self._event(), self._dao(), {}, read_error=failure)
+            assert status == 500, f"{code} should be a server fault, not 404"
+            assert "retry" in body["error"].lower()
+            upload.assert_not_called()
 
 
 # ===================================================================
@@ -2476,11 +3589,18 @@ def _mock_single_asset_load(
     table_id: str,
     form_content: str,
 ) -> None:
-    """Configure an SMUSClient mock to return one matching asset for table_id."""
+    """Configure an SMUSClient mock to return one matching asset for table_id.
+
+    Exact-name lookups go through ``find_asset_by_name``, so that is what the
+    handlers call. ``search_assets`` is still configured for the paged
+    enumeration paths (list-tables and the bulk cascade) that search by source
+    prefix rather than by an exact asset name.
+    """
     asset_name = f"DS#{_SOURCE_ID}:{table_id}"
     asset = MagicMock()
     asset.name = asset_name
     asset.asset_id = f"asset-{table_id}"
+    smus_mock.find_asset_by_name.return_value = asset
     smus_mock.search_assets.return_value = MagicMock(items=[asset], next_token=None)
     smus_mock.get_asset_forms.return_value = {
         "formsOutput": [{"formName": "CoaTableMetadata", "content": form_content}]
@@ -2560,7 +3680,8 @@ class TestReviewTable:
         assert status == 404
 
     def test_table_not_found_returns_404(self, _review_env):
-        _review_env["smus"].search_assets.return_value = MagicMock(items=[], next_token=None)
+        # None from find_asset_by_name is the only "absent" signal now.
+        _review_env["smus"].find_asset_by_name.return_value = None
         status, _ = _parse(
             _dr._handle_review_table(self._event({"decision": "APPROVED"}), _NAMESPACE_ID, _SOURCE_ID, self._TABLE_ID)
         )
@@ -3088,6 +4209,7 @@ class TestApproveSource:
         assert set(update_call.kwargs["condition_values"].values()) == {
             "PENDING_REVIEW",
             "APPROVAL_FAILED",
+            "RESCAN_REVIEW",
         }
         assert "#status" in update_call.kwargs["condition_names"]
         # SQS message contains decision=APPROVED
@@ -3098,7 +4220,25 @@ class TestApproveSource:
             "namespaceId": _NAMESPACE_ID,
             "sourceId": _SOURCE_ID,
             "decision": "APPROVED",
+            "isRescan": False,
         }
+
+    def test_rescan_review_source_can_be_approved_with_isrescan_flag(self, _bulk_env):
+        # A re-scan lands the source in RESCAN_REVIEW; approve must be allowed
+        # from there and must tell the worker it is a re-scan.
+        _bulk_env["dao"].get.return_value = {
+            "PK": f"NS#{_NAMESPACE_ID}",
+            "SK": f"SRC#{_SOURCE_ID}",
+            "sourceType": "DATABASE",
+            "status": "RESCAN_REVIEW",
+            "tablesDiscovered": 5,
+        }
+        _bulk_env["dao"].update.return_value = True
+        status, _body = _parse(_dr._handle_approve_source(self._EVENT, _NAMESPACE_ID, _SOURCE_ID))
+        assert status == 202
+        assert "RESCAN_REVIEW" in set(_bulk_env["dao"].update.call_args.kwargs["condition_values"].values())
+        msg_body = json.loads(_bulk_env["sqs"].send_message.call_args.kwargs["MessageBody"])
+        assert msg_body["isRescan"] is True
 
     def test_approve_from_rejected_source_is_locked_409(self, _bulk_env):
         # REJECTED is terminal: bulk approve is not an allowed entry state
@@ -3229,7 +4369,25 @@ class TestRejectSource:
         assert set(update_call.kwargs["condition_values"].values()) == {
             "PENDING_REVIEW",
             "REJECTION_FAILED",
+            "RESCAN_REVIEW",
         }
+
+    def test_rescan_review_source_can_be_rejected_with_isrescan_flag(self, _bulk_env):
+        # A re-scan reject must be allowed from RESCAN_REVIEW and flagged so the
+        # worker restores the pre-rescan state (and returns the source to APPROVED).
+        _bulk_env["dao"].get.return_value = {
+            "PK": f"NS#{_NAMESPACE_ID}",
+            "SK": f"SRC#{_SOURCE_ID}",
+            "sourceType": "DATABASE",
+            "status": "RESCAN_REVIEW",
+            "tablesDiscovered": 5,
+        }
+        _bulk_env["dao"].update.return_value = True
+        status, _body = _parse(_dr._handle_reject_source(self._EVENT, _NAMESPACE_ID, _SOURCE_ID))
+        assert status == 202
+        assert "RESCAN_REVIEW" in set(_bulk_env["dao"].update.call_args.kwargs["condition_values"].values())
+        msg_body = json.loads(_bulk_env["sqs"].send_message.call_args.kwargs["MessageBody"])
+        assert msg_body["isRescan"] is True
 
     def test_retry_from_rejection_failed_succeeds(self, _bulk_env):
         # User retries after a previous reject worker failure
@@ -3360,7 +4518,7 @@ class TestReviewableGuard:
 
     @pytest.mark.parametrize(
         "status",
-        ["PENDING_REVIEW", "APPROVED", "APPROVAL_FAILED", "REJECTION_FAILED"],
+        ["PENDING_REVIEW", "RESCAN_REVIEW", "APPROVED", "APPROVAL_FAILED", "REJECTION_FAILED"],
     )
     def test_review_table_allows_all_reviewable_states(self, _review_env, status):
         _review_env["dao"].get.return_value = {
@@ -3456,6 +4614,25 @@ class TestReviewableGuard:
         assert resp_status == 409
         # Without the guard, this is the silent-edit-loss race scenario.
         _review_env["smus"].create_asset_revision.assert_not_called()
+
+    def test_update_table_metadata_allows_rescan_review(self, _review_env):
+        # A re-scan lands the source in RESCAN_REVIEW; the steward must be able
+        # to touch up the regenerated metadata there, exactly as on a first scan.
+        _review_env["dao"].get.return_value = {
+            "PK": f"NS#{_NAMESPACE_ID}",
+            "SK": f"SRC#{_SOURCE_ID}",
+            "sourceType": "DATABASE",
+            "status": "RESCAN_REVIEW",
+        }
+        _mock_single_asset_load(
+            _review_env["smus"],
+            table_id=self._TABLE_ID,
+            form_content=_serialize_table(columns=[{"name": "col_a", "review_status": "PENDING_REVIEW"}]),
+        )
+        resp_status, _ = _parse(
+            _dr._handle_update_table_metadata(self._override_event(), _NAMESPACE_ID, _SOURCE_ID, self._TABLE_ID)
+        )
+        assert resp_status == 200
 
     def test_review_column_blocks_during_rejecting(self, _review_env):
         _review_env["dao"].get.return_value = {
@@ -3688,3 +4865,90 @@ class TestUpdateTableKeys:
         body = {"foreignKeys": [{"column": "col_a"}]}
         status, _ = _parse(_dr._handle_update_table_keys(self._event(body), _NAMESPACE_ID, _SOURCE_ID, self._TABLE_ID))
         assert status == 400
+
+
+# ===================================================================
+# _handle_list_scan_jobs — Scan History event list
+# ===================================================================
+
+
+@pytest.mark.unit
+class TestHandleListScanJobs:
+    def test_lists_newest_first_and_defaults_missing_event_type_to_scan(self):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {"PK": f"NS#{_NAMESPACE_ID}", "SK": f"SRC#{_SOURCE_ID}"}
+        mock_scan_dao = MagicMock()
+        # Returned oldest-first on purpose: the handler must sort newest-first.
+        mock_scan_dao.query_all.return_value = [
+            {
+                "PK": f"SRC#{_SOURCE_ID}",
+                "SK": "2026-01-01T00:00:00Z",
+                "status": "COMPLETED",
+                "scanType": "full",
+                "tablesDiscovered": 5,
+                # No eventType — a legacy scan row; must default to SCAN.
+            },
+            {
+                "PK": f"SRC#{_SOURCE_ID}",
+                "SK": "2026-01-02T00:00:00Z",
+                "eventType": "REVIEW",
+                "decision": "APPROVED",
+                "isRescan": False,
+                "tablesApproved": 5,
+                "status": "APPROVED",
+            },
+        ]
+
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}._get_scan_dao", return_value=mock_scan_dao),
+        ):
+            status, body = _parse(_dr._handle_list_scan_jobs(_NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 200
+        items = body["items"]
+        assert len(items) == 2
+        # Newest (the REVIEW at 2026-01-02) first.
+        assert items[0]["eventType"] == "REVIEW"
+        assert items[0]["decision"] == "APPROVED"
+        assert items[0]["isRescan"] is False
+        assert items[0]["tablesApproved"] == 5
+        # The legacy scan row defaults to SCAN and drops absent fields.
+        assert items[1]["eventType"] == "SCAN"
+        assert items[1]["tablesDiscovered"] == 5
+        assert "decision" not in items[1]
+
+    def test_list_scan_jobs_source_not_found(self):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = None
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}._get_scan_dao", return_value=MagicMock()),
+        ):
+            status, _ = _parse(_dr._handle_list_scan_jobs(_NAMESPACE_ID, _SOURCE_ID))
+        assert status == 404
+
+    def test_list_scan_jobs_empty_returns_empty_items(self):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {"PK": f"NS#{_NAMESPACE_ID}", "SK": f"SRC#{_SOURCE_ID}"}
+        mock_scan_dao = MagicMock()
+        mock_scan_dao.query_all.return_value = []
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}._get_scan_dao", return_value=mock_scan_dao),
+        ):
+            status, body = _parse(_dr._handle_list_scan_jobs(_NAMESPACE_ID, _SOURCE_ID))
+        assert status == 200
+        assert body["items"] == []
+
+    def test_list_scan_jobs_scan_dao_error_returns_500(self):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {"PK": f"NS#{_NAMESPACE_ID}", "SK": f"SRC#{_SOURCE_ID}"}
+        mock_scan_dao = MagicMock()
+        mock_scan_dao.query_all.side_effect = ClientError({"Error": {"Code": "InternalError"}}, "Query")
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}._get_scan_dao", return_value=mock_scan_dao),
+        ):
+            status, _ = _parse(_dr._handle_list_scan_jobs(_NAMESPACE_ID, _SOURCE_ID))
+        assert status == 500

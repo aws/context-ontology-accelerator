@@ -13,7 +13,7 @@ from coa_common.constants import datasource_external_id
 from coa_common.dao import DynamoDBDAO
 from coa_common.response import api_response
 
-from coa_control_plane.namespace.vkg_health import resolve_vkg_health
+from coa_control_plane.namespace.vkg_health import resolve_vkg_health_with_reason
 
 logger = structlog.get_logger(__name__)
 
@@ -40,6 +40,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         return api_response(404, {"message": f"Namespace not found: {namespace_id}"})
 
     _source_count = item.get("sourceCount", 0)
+    _vkg_health, _vkg_health_reason = resolve_vkg_health_with_reason(namespace_id)
 
     response = {
         "namespace": {
@@ -57,7 +58,8 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             # Derived, not stored: the ExternalId a customer must pin in the trust
             # policy of any cross-account role they onboard into this namespace.
             "datasourceExternalId": datasource_external_id(namespace_id),
-            "vkgHealth": resolve_vkg_health(namespace_id),
+            "vkgHealth": _vkg_health,
+            "vkgHealthReason": _vkg_health_reason,
         }
     }
     response["namespace"] = {k: v for k, v in response["namespace"].items() if v is not None}

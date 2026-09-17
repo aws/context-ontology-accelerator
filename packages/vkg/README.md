@@ -86,6 +86,48 @@ If all 3 attempts fail, the container enters **degraded mode** (503 on all `/spa
 
 **Recovery:** Fix the S3 artifacts, then restart the task. The health check will replace degraded containers automatically (see below).
 
+## Task Sizing and Environment Variables
+
+The VKG task's resource allocation and JVM heap are controlled by environment
+variables set on the ECS task definition (and passed through by the reload
+Lambda). Getting these right matters: an under-provisioned task cannot finish the
+OWL2QL translation pass for larger ontologies, which leaves the container failing
+its health check and the namespace reporting `DEGRADED` health indefinitely.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `VKG_TASK_CPU` | `1024` (1 vCPU) | Fargate task CPU units. Set on the reload Lambda; used when it registers a new task definition. |
+| `VKG_TASK_MEMORY` | `2048` (2 GB) | Fargate task memory. |
+| `ONTOP_JAVA_ARGS` | `-Xmx1536m -Xms512m` | JVM args for the Ontop launcher (read directly by the container). The reload Lambda's `VKG_ONTOP_JAVA_ARGS` is written into the task def as this variable. |
+
+**`ONTOP_JAVA_ARGS`, not `JAVA_OPTS`.** The Ontop launcher reads its heap
+settings from `ONTOP_JAVA_ARGS`. Setting `JAVA_OPTS` has **no effect** — the heap
+is silently ignored and Ontop starts at its small built-in default regardless of
+task memory. The entrypoint keeps a backward-compatibility fallback
+(`ONTOP_JAVA_ARGS="${ONTOP_JAVA_ARGS:-${JAVA_OPTS:-}}"`) so a task def that still
+only sets `JAVA_OPTS` is honoured, but new configuration should always set
+`ONTOP_JAVA_ARGS`.
+
+**Heap vs. task memory.** Size the max heap (`-Xmx`) at roughly **60–75% of
+`VKG_TASK_MEMORY`**, leaving room for JVM overhead and the OS. E.g. a 4 GB task
+pairs with `-Xmx3072m -Xms1024m`.
+
+**Verifying the applied sizing.** Check the running task's definition:
+
+```bash
+aws ecs describe-task-definition --task-definition <family> \
+  --query 'taskDefinition.{cpu:cpu,memory:memory,env:containerDefinitions[0].environment}'
+```
+
+Confirm `cpu`/`memory` match your intended values and that the container
+environment contains `ONTOP_JAVA_ARGS` (and **not** `JAVA_OPTS`). At startup the
+entrypoint also logs the resolved value: `[VKG] Ontop heap args
+(ONTOP_JAVA_ARGS): '...'`.
+
+For how to configure these from CDK (the `VkgStack` `cpu`, `memoryLimitMiB`, and
+`ontopJavaArgs` props), see the **VKG Task Sizing** section of the deployment
+guide.
+
 ## Health Check and Self-Healing
 
 ### /health endpoint

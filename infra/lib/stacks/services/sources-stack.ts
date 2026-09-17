@@ -519,6 +519,10 @@ export class SourcesStack extends SCLStack {
         //    it. Left unset, the runtime default (`coa-dev-`) would disagree with
         //    `fedResourcePrefix` and our own catalogs would read as third-party.
         RESOURCE_PREFIX: this.prefixed(""),
+        // Re-scan backup blob (pre-rescan asset forms + change-set) is written
+        // here before a merge overwrites live assets, and read back by the
+        // bulk-review worker on approve/reject. Same bucket as the API/worker.
+        BUCKET_NAME: sourcesBucket.bucketName,
       },
     });
 
@@ -702,9 +706,10 @@ export class SourcesStack extends SCLStack {
     );
     // Athena writes query results to the shared spill bucket.
     props.storage.athenaSpillBucket.grantReadWrite(dbConnectorFn);
-    // Athena reads the table data during sampling; Glue sources backed by the
-    // sources-data bucket need read (GetObject + ListBucket) on it.
-    sourcesBucket.grantRead(dbConnectorFn);
+    // Read: Athena reads table data during enum sampling for Glue sources
+    // backed by the sources-data bucket. Write: a re-scan writes its pre-rescan
+    // backup blob here before merging onto live assets (approve/reject reads it).
+    sourcesBucket.grantReadWrite(dbConnectorFn);
     // ── Federation provisioner (JDBC-only, dedicated role) ───────────
     // Isolated from discovery so the Lake Formation data-lake-admin privilege
     // required to create managed federated catalogs lives only on this
@@ -1152,7 +1157,7 @@ export class SourcesStack extends SCLStack {
         // Without this the enrichment task's Bedrock calls run UNGUARDED —
         // table_enricher._resolve_guardrail_id() reads this param name to look
         // up the guardrail id. Same param the ontology task reads (#111 AC5).
-        GUARDRAIL_SSM_PARAM: `${ssmPrefix}/bedrock/guardrail-id`,
+        GUARDRAIL_SSM_PARAM: `${ssmPrefix}/bedrock/retrieval-guardrail-id`,
         // Model for table enrichment. The container previously set NO model id,
         // so the shared BedrockClient default (a `us.` profile) always won and
         // enrichment was unreachable from a non-US deploy (#94).
@@ -1192,7 +1197,7 @@ export class SourcesStack extends SCLStack {
       new iam.PolicyStatement({
         actions: ["ssm:GetParameter"],
         resources: [
-          `arn:aws:ssm:${this.region}:${this.account}:parameter${ssmPrefix}/bedrock/guardrail-id`,
+          `arn:aws:ssm:${this.region}:${this.account}:parameter${ssmPrefix}/bedrock/retrieval-guardrail-id`,
         ],
       }),
     );
@@ -1361,6 +1366,18 @@ export class SourcesStack extends SCLStack {
       retryOnServiceExceptions: false,
     });
     dbDiscoveryTask.addRetry({
+      // Retry only failures a re-run can fix: our transient classification plus
+      // Lambda infra faults. PermanentScanError (bad config, denied auth, missing
+      // source, unsupported type) is absent, so it falls straight through to the
+      // SCAN_FAILED catch instead of burning 3 retries (~15s). AWS Lambda reports
+      // the raised exception's class name as the Step Functions error name.
+      errors: [
+        "TransientScanError",
+        "Lambda.ServiceException",
+        "Lambda.AWSLambdaException",
+        "Lambda.SdkClientException",
+        "Lambda.TooManyRequestsException",
+      ],
       maxAttempts: 3,
       backoffRate: 2,
       interval: cdk.Duration.seconds(5),
@@ -1433,6 +1450,26 @@ export class SourcesStack extends SCLStack {
               value: sfn.JsonPath.stringAt("$.namespaceId"),
             },
             { name: "SCAN_TYPE", value: sfn.JsonPath.stringAt("$.scanType") },
+            // Re-scan marker (string "true"/"false", always present in the
+            // execution input via the trigger). Routes the terminal source
+            // status to RESCAN_REVIEW when a re-scan of an approved source
+            // completes, instead of PENDING_REVIEW.
+            { name: "IS_RESCAN", value: sfn.JsonPath.stringAt("$.isRescan") },
+            // No-drift signal from discovery (string "true"/"false", always
+            // present in its result). When a re-scan reports "false" — no drift
+            // and no carried-forward orphaned tables — enrichment returns the
+            // source straight to APPROVED instead of parking it in RESCAN_REVIEW.
+            {
+              name: "RESCAN_REVIEW_NEEDED",
+              // DbDiscovery is a LambdaInvoke without payloadResponseOnly, so its
+              // result at $.discoveryResult is the full Lambda envelope
+              // ({Payload, ExecutedVersion, SdkHttpMetadata, ...}). reviewNeeded
+              // lives under .Payload — reading it directly off $.discoveryResult
+              // raises a runtime "JSONPath could not be found" and fails the scan.
+              value: sfn.JsonPath.stringAt(
+                "$.discoveryResult.Payload.reviewNeeded",
+              ),
+            },
           ],
         },
       ],
@@ -1621,6 +1658,9 @@ export class SourcesStack extends SCLStack {
       securityGroups: [lambdaSecurityGroup],
       environment: {
         SOURCES_TABLE: this.sourcesTable.tableName,
+        // Scan-history store — the worker appends a REVIEW audit row here on
+        // each terminal approve/reject so the console shows real history.
+        SOURCE_SCAN_JOBS_TABLE: this.sourceScanJobsTable.tableName,
         NAMESPACES_TABLE: namespacesTableName,
         SMUS_DOMAIN_ID: domainId,
         PROJECT_ACCESS_ROLE_ARN: projectAccessRoleArn,
@@ -1630,6 +1670,10 @@ export class SourcesStack extends SCLStack {
         // is paged by re-enqueuing to this same queue with a nextToken. Every
         // table is eventually approved with no silent drop (#853).
         REVIEW_QUEUE_URL: bulkReviewQueue.queueUrl,
+        // Re-scan finalize: the worker reads the pre-rescan backup blob to
+        // delete removed items (approve) or restore the pre-rescan state
+        // (reject). Same bucket discovery wrote the backup to.
+        BUCKET_NAME: sourcesBucket.bucketName,
       },
     });
 
@@ -1651,11 +1695,17 @@ export class SourcesStack extends SCLStack {
     // - Read namespaces table (resolve dataZoneProjectId)
     // - Assume the shared project access role for DataZone calls
     this.sourcesTable.grantReadWriteData(bulkReviewWorkerFn);
+    // Append a REVIEW audit row to the scan-jobs table on each terminal
+    // approve/reject so the console's Scan History tab shows real events.
+    this.sourceScanJobsTable.grantReadWriteData(bulkReviewWorkerFn);
     namespacesTable.grantReadData(bulkReviewWorkerFn);
     projectAccessRole.grantAssumeRole(bulkReviewWorkerFn.role!);
     // Self-continuation: the worker re-enqueues to its own queue to page a
     // large source across invocations (#853).
     bulkReviewQueue.grantSendMessages(bulkReviewWorkerFn);
+    // Re-scan finalize reads/writes the pre-rescan backup blob (delete removed
+    // on approve; restore modified + delete added on reject).
+    sourcesBucket.grantReadWrite(bulkReviewWorkerFn);
 
     // The API Lambda needs to push to the bulk review queue.
     // (Granted later, after sourcesApiFn is constructed.)
@@ -2188,6 +2238,28 @@ export class SourcesStack extends SCLStack {
               ),
             },
             {
+              // Preferred TOPIC vocabulary — the thematic groupings chunks are
+              // assigned to (__Topic__ nodes), as distinct from the entity-class
+              // list above. Same JSON-string transport for the same reason: a
+              // container-override JsonPath cannot carry an array. Empty JSON
+              // array "[]" is the default and means "let the model name topics",
+              // which is the behaviour of every ingest before this field existed.
+              // There is no INFER_TOPICS counterpart — graphrag-toolkit has no
+              // topic equivalent of the classification inference pass.
+              //
+              // stringAt() fails the execution if the field is missing, so the
+              // trigger Lambda re-merges EXTRACTION_DEFAULTS into every message
+              // before StartExecution — that is what keeps sources created before
+              // this field shipped working. Both live in this stack, so a change
+              // set that lands the state-machine definition before the Lambda code
+              // leaves a brief window where an old-format input would fail here;
+              // the same is already true of PREFERRED_ENTITY_CLASSIFICATIONS above.
+              name: "PREFERRED_TOPICS",
+              value: sfn.JsonPath.stringAt(
+                "$.extraction_config.preferred_topics",
+              ),
+            },
+            {
               // Route PDFs through Textract AnalyzeDocument(TABLES) instead of
               // unstructured strategy="fast" — preserves table structure at
               // materially higher per-page cost.
@@ -2598,8 +2670,11 @@ export class SourcesStack extends SCLStack {
     this.sourcesTable.grantReadWriteData(sourcesApiFn);
     // Registration verifies that a caller-named bucket carries the
     // `{prefix}:namespace` tag authorizing this namespace, so the customer is told
-    // at create time instead of discovering it as a failed scan. Tag metadata only
-    // — sources-api is deliberately NOT granted s3:GetObject.
+    // at create time instead of discovering it as a failed scan. Tag metadata
+    // only here, and sources-api reads no customer object data (nothing under
+    // `raw/*`). Its one s3:GetObject is the narrowly-scoped re-scan backup
+    // metadata read granted below (`rescan-backup/*`), which the tables API needs
+    // to render the old-vs-new diff panel.
     sourcesApiFn.addToRolePolicy(
       new iam.PolicyStatement({
         sid: "ReadSourceBucketTags",
@@ -2745,6 +2820,39 @@ export class SourcesStack extends SCLStack {
         // region can still be verified at registration (the binding check calls
         // DescribeSecret in the secret's own region).
         resources: [`arn:aws:secretsmanager:*:${this.account}:secret:*`],
+      }),
+    );
+
+    // Re-scan backup blob: the tables API reads the pre-rescan pre-image to
+    // render the old-vs-new diff panel and the removed-item sets under
+    // RESCAN_REVIEW, and rewrites it when a steward keeps a flagged removal.
+    // Without GetObject here the diff read fails closed (rescan_diff_backup_read_failed)
+    // and the diff panel never renders.
+    sourcesApiFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["s3:GetObject", "s3:PutObject"],
+        resources: [`${sourcesBucket.bucketArn}/*/rescan-backup/*`],
+      }),
+    );
+
+    // S3 reports a missing key as NoSuchKey only to a caller that also holds
+    // ListBucket on the bucket; without it, GetObject on an absent key returns
+    // AccessDenied instead. An absent backup blob is a NORMAL state — a re-scan
+    // that finds no drift writes none, yet still lands the source in
+    // RESCAN_REVIEW — so the read helper's absent-key branch has to be able to
+    // fire. Lacking this grant, that branch is unreachable in a deployed
+    // environment and the tables page 500s for every no-drift re-scan.
+    //
+    // Scoped to the bucket ARN with no s3:prefix condition on purpose: the
+    // condition governs ListObjects calls, and GetObject's 403-vs-404 choice is
+    // not guaranteed to honour it, so a prefix-scoped grant risks looking like a
+    // fix while leaving the 500 in place. The grant conveys only "may list this
+    // bucket", which the two other roles touching this bucket already hold via
+    // grantReadWrite.
+    sourcesApiFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["s3:ListBucket"],
+        resources: [sourcesBucket.bucketArn],
       }),
     );
 

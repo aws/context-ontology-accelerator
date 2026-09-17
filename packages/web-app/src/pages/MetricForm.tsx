@@ -42,6 +42,18 @@ const DIALECT_OPTIONS: Array<{ value: SqlDialect; label: string }> = [
   { value: SqlDialectEnum.MYSQL, label: "MySQL" },
 ];
 
+// Legacy/imported metrics may store a mis-cased dialect (e.g. "redshift" from an
+// OSI import before the parser fix — see #140). The Select matches option values
+// case-sensitively, so normalize a loaded dialect to upper-case when it resolves
+// to a known option; otherwise leave it untouched so an unknown value is not
+// silently coerced to a valid one.
+const _DIALECT_VALUES: string[] = DIALECT_OPTIONS.map((o) => o.value);
+export const normalizeLoadedDialect = (raw: string): string => {
+  if (!raw) return "";
+  const upper = raw.toUpperCase();
+  return _DIALECT_VALUES.includes(upper) ? upper : raw;
+};
+
 const TIME_GRAIN_OPTIONS = [
   { value: "", label: "None" },
   { value: "DAY", label: "Day" },
@@ -178,7 +190,7 @@ export const MetricForm: React.FC = () => {
       setDialects(
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         (m.expression?.dialects ?? []).map((d: any) => ({
-          dialect: d.dialect ?? "",
+          dialect: normalizeLoadedDialect(d.dialect ?? ""),
           expression: d.expression ?? "",
         })),
       );

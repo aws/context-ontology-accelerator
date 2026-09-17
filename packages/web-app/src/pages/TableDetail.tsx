@@ -1,7 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import React, { useMemo, useState } from "react";
+import React, { useCallback, useMemo, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import Alert from "@cloudscape-design/components/alert";
 import AttributeEditor from "@cloudscape-design/components/attribute-editor";
@@ -9,6 +9,7 @@ import Badge from "@cloudscape-design/components/badge";
 import Box from "@cloudscape-design/components/box";
 import Button from "@cloudscape-design/components/button";
 import Container from "@cloudscape-design/components/container";
+import ExpandableSection from "@cloudscape-design/components/expandable-section";
 import Flashbar from "@cloudscape-design/components/flashbar";
 import FormField from "@cloudscape-design/components/form-field";
 import Header from "@cloudscape-design/components/header";
@@ -27,6 +28,7 @@ import Table from "@cloudscape-design/components/table";
 import Textarea from "@cloudscape-design/components/textarea";
 import TextFilter from "@cloudscape-design/components/text-filter";
 import TokenGroup from "@cloudscape-design/components/token-group";
+import type { BadgeProps } from "@cloudscape-design/components/badge";
 import type { SelectProps } from "@cloudscape-design/components/select";
 import type { TableProps } from "@cloudscape-design/components/table";
 import { useCollection } from "@cloudscape-design/collection-hooks";
@@ -38,13 +40,18 @@ import {
   useUpdateSourceTableMetadata,
   useUpdateSourceColumnMetadata,
   useUpdateSourceTableKeys,
+  useKeepRescanRemoval,
 } from "@api-hooks";
 import { ReviewStatus, ReviewDecision } from "@coa/control-plane-client";
 import type {
   ColumnMetadata,
   ForeignKeyOutput,
+  RescanColumnChange,
+  RescanFieldChange,
+  RescanTableDiff,
 } from "@coa/control-plane-client";
 import { extractErrorMessage, runSequential } from "@utils";
+import { InfoPopover } from "@components/InfoPopover";
 
 // --- Constants ---
 
@@ -220,6 +227,178 @@ const FK_COLUMN_DEFS: TableProps.ColumnDefinition<ForeignKeyOutput>[] = [
   },
 ];
 
+// --- Re-scan diff (old vs new) ---
+
+/** Badge text + colour for a re-scan column change status. Added is additive
+ * (green), removed is destructive (red), a modified column is a neutral change
+ * (blue). Defaults to "Changed" for any unexpected status. */
+function rescanColumnBadge(status: string): {
+  text: string;
+  color: NonNullable<BadgeProps["color"]>;
+} {
+  if (status === "added") return { text: "Added", color: "green" };
+  if (status === "removed") return { text: "Removed", color: "red" };
+  return { text: "Changed", color: "blue" };
+}
+
+/** Display a re-scan field value; empty/absent renders as an em dash so an
+ * added value (old empty) or a cleared value (new empty) reads cleanly. */
+function rescanValue(value?: string): string {
+  return value && value.length > 0 ? value : "—";
+}
+
+/** One changed source-owned field rendered as "field (KIND): old → new". */
+function rescanFieldChangeRow(fc: RescanFieldChange) {
+  return (
+    <Box variant="small">
+      <strong>{fc.field}</strong>
+      {fc.kind ? ` (${fc.kind})` : ""}: {rescanValue(fc.old)} →{" "}
+      {rescanValue(fc.new)}
+    </Box>
+  );
+}
+
+/** Vertical list of changed source-owned fields (each as old → new). Shared by
+ * the top summary Alert and the per-column info popover. */
+function rescanFieldChangeList(fields: RescanFieldChange[]) {
+  return (
+    <SpaceBetween size="xxs">
+      {fields.map((fc, i) => (
+        <div key={`${fc.field ?? "field"}-${i}`}>
+          {rescanFieldChangeRow(fc)}
+        </div>
+      ))}
+    </SpaceBetween>
+  );
+}
+
+/** One column's re-scan change for the summary Alert: the column name + an
+ * Added/Removed/Changed badge, and — for a modified column — its changed fields
+ * listed (indented) as old → new. */
+function rescanColumnChangeRow(change: RescanColumnChange) {
+  const { text, color } = rescanColumnBadge(change.status ?? "modified");
+  const fields = change.fields ?? [];
+  return (
+    <SpaceBetween size="xxs">
+      <SpaceBetween direction="horizontal" size="xs" alignItems="center">
+        <Box variant="small" fontWeight="bold">
+          {change.name}
+        </Box>
+        <Badge color={color}>{text}</Badge>
+      </SpaceBetween>
+      {fields.length > 0 && (
+        <Box padding={{ left: "l" }}>{rescanFieldChangeList(fields)}</Box>
+      )}
+    </SpaceBetween>
+  );
+}
+
+/** "Changes since last approved scan" summary, shown only while the source is in
+ * RESCAN_REVIEW (when `rescanDiff` is present on the table). Two groups for an
+ * at-a-glance read: table-level field changes and per-column changes, each as
+ * old → new. The same per-column detail is also reachable inline on each column
+ * row in the Columns table below (via the info icon next to its badge). */
+function RescanChangesPanel({ diff }: { diff: RescanTableDiff }) {
+  const tableFields = diff.tableFields ?? [];
+  const columns = diff.columns ?? [];
+  // Foldable so a table with many changed columns doesn't produce a huge panel
+  // on larger graphs. Collapsed still shows the counts, so the steward sees the
+  // magnitude at a glance; expand for the old → new detail.
+  const countLabel =
+    `${tableFields.length} table-level change${tableFields.length === 1 ? "" : "s"}, ` +
+    `${columns.length} column change${columns.length === 1 ? "" : "s"}`;
+  return (
+    <Alert type="info" header="Changes since last approved scan">
+      <ExpandableSection variant="footer" headerText={countLabel}>
+        <SpaceBetween size="m">
+          <div>
+            <Box variant="small" fontWeight="bold">
+              Table-level changes
+            </Box>
+            {tableFields.length > 0 ? (
+              rescanFieldChangeList(tableFields)
+            ) : (
+              <Box variant="small" color="text-status-inactive">
+                None
+              </Box>
+            )}
+          </div>
+          <div>
+            <Box variant="small" fontWeight="bold">
+              Column changes
+            </Box>
+            {columns.length > 0 ? (
+              <SpaceBetween size="xs">
+                {columns.map((cc, i) => (
+                  <div key={`${cc.name ?? "col"}-${i}`}>
+                    {rescanColumnChangeRow(cc)}
+                  </div>
+                ))}
+              </SpaceBetween>
+            ) : (
+              <Box variant="small" color="text-status-inactive">
+                None
+              </Box>
+            )}
+          </div>
+        </SpaceBetween>
+      </ExpandableSection>
+    </Alert>
+  );
+}
+
+/** Shown while the source is in RESCAN_REVIEW for a table the re-scan discovered
+ * for the first time (`added`): it has no old-vs-new diff — the whole table is
+ * new — so we say so instead of showing an empty changes panel. */
+function NewTablePanel() {
+  return (
+    <Alert type="info" header="New table">
+      This table was discovered during the latest re-scan and did not exist in
+      the last approved scan. There is no before/after to compare — review its
+      generated metadata below and approve to add it.
+    </Alert>
+  );
+}
+
+/** Shown while the source is in RESCAN_REVIEW for a table the re-scan found
+ * gone from the source (`pendingDeletion`): it is dropped and will be deleted
+ * when the re-scan is approved, unless the steward keeps it. */
+function DroppedTablePanel() {
+  return (
+    <Alert type="warning" header="Dropped table">
+      This table was not found in the source during the latest re-scan. It will
+      be deleted when you approve the re-scan — use "Keep table" above to retain
+      it if the source removal was unintended (e.g. a partial scan or a changed
+      filter).
+    </Alert>
+  );
+}
+
+/** Per-column re-scan indicator for a column row: an Added/Removed/Changed
+ * badge. For a modified column, an info icon next to the badge opens a popover
+ * listing each changed field as old → new — the icon is the discoverable
+ * trigger (matching the `InfoPopover` pattern used across the app), since a
+ * plain badge gives no signal that it is interactive. */
+function rescanColumnChangeCell(change: RescanColumnChange) {
+  const { text, color } = rescanColumnBadge(change.status ?? "modified");
+  const fields = change.fields ?? [];
+  const badge = <Badge color={color}>{text}</Badge>;
+  if (change.status === "modified" && fields.length > 0) {
+    return (
+      <SpaceBetween direction="horizontal" size="xxs" alignItems="center">
+        {badge}
+        <InfoPopover
+          header="Changes since last approved scan"
+          ariaLabel="Column changes since last approved scan"
+        >
+          {rescanFieldChangeList(fields)}
+        </InfoPopover>
+      </SpaceBetween>
+    );
+  }
+  return badge;
+}
+
 // --- Component ---
 
 export const TableDetail: React.FC = () => {
@@ -281,12 +460,84 @@ export const TableDetail: React.FC = () => {
   const [editingKeys, setEditingKeys] = useState(false);
   const [bulkLoading, setBulkLoading] = useState(false);
 
+  // Re-scan review: keep (decline) a table or column the re-scan flagged for
+  // deletion, so approving the re-scan no longer removes it.
+  const { mutate: keepMutate, isPending: keepPending } = useKeepRescanRemoval(
+    namespaceId ?? "",
+    dataSourceId ?? "",
+  );
+  const [keepingColumn, setKeepingColumn] = useState<string | null>(null);
+  const [keepingTable, setKeepingTable] = useState(false);
+  // useCallback so the column definitions' useMemo stays stable — keepMutate is
+  // a stable react-query reference, so handleKeepColumn only changes with tableId.
+  const handleKeepColumn = useCallback(
+    (columnName: string) => {
+      setKeepingColumn(columnName);
+      keepMutate(
+        { tableId: tableId ?? "", columnName },
+        {
+          onSuccess: () =>
+            setFlash((prev) => [
+              ...prev,
+              {
+                id: String(Date.now()),
+                type: "success",
+                content: `Keeping column "${columnName}". Approving the re-scan will no longer drop it.`,
+              },
+            ]),
+          onError: (e) =>
+            setFlash((prev) => [
+              ...prev,
+              { id: String(Date.now()), type: "error", content: e.message },
+            ]),
+          onSettled: () => setKeepingColumn(null),
+        },
+      );
+    },
+    [keepMutate, tableId],
+  );
+  const handleKeepTable = () => {
+    setKeepingTable(true);
+    keepMutate(
+      { tableId: tableId ?? "" },
+      {
+        onSuccess: () =>
+          setFlash((prev) => [
+            ...prev,
+            {
+              id: String(Date.now()),
+              type: "success",
+              content:
+                "Keeping this table. Approving the re-scan will no longer delete it.",
+            },
+          ]),
+        onError: (e) =>
+          setFlash((prev) => [
+            ...prev,
+            { id: String(Date.now()), type: "error", content: e.message },
+          ]),
+        onSettled: () => setKeepingTable(false),
+      },
+    );
+  };
+
   // Filter columns by review status
   const filteredColumns = useMemo(() => {
     const cols = data?.columns ?? [];
     if (!statusFilter.value || statusFilter.value === "all") return cols;
     return cols.filter((c) => getColumnStatus(c) === statusFilter.value);
   }, [data?.columns, statusFilter]);
+
+  // Re-scan review: per-column change breakdown keyed by column name, so each
+  // row can show an Added/Removed/Changed badge (and, for a modified column,
+  // its changed fields). Empty outside RESCAN_REVIEW — rescanDiff is absent then.
+  const rescanColumnChanges = useMemo(() => {
+    const map = new Map<string, RescanColumnChange>();
+    for (const change of data?.rescanDiff?.columns ?? []) {
+      if (change.name) map.set(change.name, change);
+    }
+    return map;
+  }, [data?.rescanDiff?.columns]);
 
   // Column definitions matching coa-ui style
   const columnDefs = useMemo<TableProps.ColumnDefinition<ColumnMetadata>[]>(
@@ -391,10 +642,51 @@ export const TableDetail: React.FC = () => {
         header: "Review status",
         sortingComparator: (a, b) =>
           getColumnStatus(a).localeCompare(getColumnStatus(b)),
-        cell: statusCell,
+        cell: (col) => {
+          const rescanChange = col.name
+            ? rescanColumnChanges.get(col.name)
+            : undefined;
+          // A re-scan-dropped column is surfaced below as the actionable
+          // "Pending deletion" badge (with a Keep button). Showing the diff's
+          // red "Removed" badge too is a duplicate of the same fact — and reads
+          // as already-gone when it is only pending — so suppress it in that one
+          // case. Added/modified columns still show their diff badge.
+          const showRescanChange =
+            rescanChange &&
+            !(rescanChange.status === "removed" && col.pendingDeletion);
+          return (
+            <SpaceBetween size="xxs">
+              {statusCell(col)}
+              {showRescanChange && rescanColumnChangeCell(rescanChange)}
+              {col.pendingDeletion && (
+                <SpaceBetween
+                  direction="horizontal"
+                  size="xs"
+                  alignItems="center"
+                >
+                  <Badge color="red">Pending deletion</Badge>
+                  <Button
+                    variant="inline-link"
+                    loading={keepingColumn === col.name}
+                    disabled={keepPending}
+                    onClick={() => handleKeepColumn(col.name ?? "")}
+                  >
+                    Keep
+                  </Button>
+                </SpaceBetween>
+              )}
+            </SpaceBetween>
+          );
+        },
       },
     ],
-    [metadataEnrichmentEnabled],
+    [
+      metadataEnrichmentEnabled,
+      keepingColumn,
+      keepPending,
+      handleKeepColumn,
+      rescanColumnChanges,
+    ],
   );
 
   const { items, collectionProps, filterProps, paginationProps, actions } =
@@ -587,6 +879,15 @@ export const TableDetail: React.FC = () => {
               Refresh
             </Button>
             <Button onClick={() => navigate(-1)}>Back</Button>
+            {data.pendingDeletion && (
+              <Button
+                loading={keepingTable}
+                disabled={keepPending}
+                onClick={handleKeepTable}
+              >
+                Keep table
+              </Button>
+            )}
             <Button
               onClick={handleRejectTable}
               loading={reviewTableMutation.isPending}
@@ -608,6 +909,12 @@ export const TableDetail: React.FC = () => {
         {data.name} <Badge color="grey">{data.database}</Badge>
       </Header>
 
+      {/* Re-scan review: old-vs-new changes since the last approved scan.
+          Present only while the source is in RESCAN_REVIEW. */}
+      {data.rescanDiff && <RescanChangesPanel diff={data.rescanDiff} />}
+      {data.added && !data.rescanDiff && <NewTablePanel />}
+      {data.pendingDeletion && <DroppedTablePanel />}
+
       {/* Table metadata summary */}
       <Container
         header={
@@ -628,13 +935,22 @@ export const TableDetail: React.FC = () => {
             {
               label: "Review status",
               value: (
-                <StatusIndicator
-                  type={REVIEW_STATUS_TYPE[tableStatus] ?? "info"}
+                <SpaceBetween
+                  direction="horizontal"
+                  size="xs"
+                  alignItems="center"
                 >
-                  {tableStatus === ReviewStatus.PENDING_REVIEW
-                    ? "Pending review"
-                    : tableStatus}
-                </StatusIndicator>
+                  <StatusIndicator
+                    type={REVIEW_STATUS_TYPE[tableStatus] ?? "info"}
+                  >
+                    {tableStatus === ReviewStatus.PENDING_REVIEW
+                      ? "Pending review"
+                      : tableStatus}
+                  </StatusIndicator>
+                  {data.pendingDeletion && (
+                    <Badge color="red">Pending deletion</Badge>
+                  )}
+                </SpaceBetween>
               ),
             },
             {

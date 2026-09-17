@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
 set -euo pipefail
 
 # VKG Translation Service Entrypoint
@@ -104,6 +106,14 @@ echo "[VKG] Ontology version: ${ONTOLOGY_VERSION}"
 # --dev enables /ontop/reformulate endpoint (returns SQL without executing).
 # Also enables auto-restart on config file changes — safe because our config
 # is immutable after S3 download (no runtime modifications).
+#
+# Heap sizing: the Ontop launcher reads ONTOP_JAVA_ARGS (NOT JAVA_OPTS). The
+# task definition sets ONTOP_JAVA_ARGS; for backward compatibility we fall back
+# to a JAVA_OPTS value if only that is present, otherwise let the launcher use
+# its built-in default. Without this the configured heap is silently ignored and
+# Ontop runs at its ~512m default regardless of task memory (#149 cause C).
+export ONTOP_JAVA_ARGS="${ONTOP_JAVA_ARGS:-${JAVA_OPTS:-}}"
+echo "[VKG] Ontop heap args (ONTOP_JAVA_ARGS): '${ONTOP_JAVA_ARGS}'"
 echo "[VKG] Starting Ontop on port ${ONTOP_PORT}..."
 /opt/ontop/ontop endpoint \
   --ontology="${ONTOLOGY_FILE}" \

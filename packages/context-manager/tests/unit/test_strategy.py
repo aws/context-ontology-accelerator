@@ -840,3 +840,96 @@ class TestAgenticStrategySelection:
     def test_deep_reasoning_excluded_from_best(self):
         picked = self._tier()._strategies_for(StrategyOption.BEST)
         assert StrategyOption.DEEP_REASONING not in [s.name for s in picked]
+
+
+@pytest.mark.unit
+class TestSmithyQueryStrategyParity:
+    """The advertised contract and the honoured values must not drift apart.
+
+    ``strategy`` is a closed enum on the Smithy ``Query`` input, so two silent
+    failures are possible and neither shows up in a normal test:
+
+    * the contract advertises a value serve does not honour — it drops out of
+      ``Orchestrator._EXPLICIT_STRATEGY_OPTIONS`` and quietly resolves to
+      ``DEFAULT_STRATEGY``, running the cheap fallback chain while the caller
+      believes it pinned an engine (the exact trap ``LEGACY_STRATEGY_ALIASES``
+      documents);
+    * serve gains a strategy the contract cannot express, so no REST or MCP caller
+      can reach it — the defect this field was added to fix: before it, the
+      Ontop/VKG engine ran only as an automatic fallback, so no REST or MCP
+      caller could select it deliberately.
+
+    Parsing the model file is deliberate: comparing against the *generated* client
+    would only prove codegen ran, not that the source of truth agrees with the
+    runtime enum.
+    """
+
+    @staticmethod
+    def _smithy_enum_values() -> set[str]:
+        import re
+        from pathlib import Path
+
+        # tests/unit/ -> tests/ -> context-manager/ -> packages/ -> repo root
+        repo_root = Path(__file__).resolve().parents[4]
+        model = repo_root / "models" / "src" / "main" / "smithy" / "serve.smithy"
+        assert model.is_file(), f"Smithy model not found at {model}"
+        text = model.read_text()
+        match = re.search(r"enum QueryStrategy \{(.*?)\n\}", text, re.DOTALL)
+        assert match, "enum QueryStrategy not found in serve.smithy"
+        return set(re.findall(r'=\s*"([^"]+)"', match.group(1)))
+
+    def test_enum_matches_strategy_option_exactly(self):
+        from coa_serve.tier2.strategy import StrategyOption
+
+        declared = self._smithy_enum_values()
+        runtime = {option.value for option in StrategyOption}
+        assert declared == runtime, (
+            f"Smithy QueryStrategy and StrategyOption disagree.\n"
+            f"  advertised but not honoured: {sorted(declared - runtime)}\n"
+            f"  honoured but not advertised: {sorted(runtime - declared)}"
+        )
+
+    def test_every_declared_value_is_an_explicit_pin(self):
+        """Each contract value must survive normalisation into the pin set.
+
+        A value that normalises to something outside
+        ``_EXPLICIT_STRATEGY_OPTIONS`` would be accepted at the edge and then
+        silently ignored — worse than rejecting it.
+        """
+        from coa_serve.orchestrator import Orchestrator
+        from coa_serve.tier2.strategy import normalize_strategy_option
+
+        for value in sorted(self._smithy_enum_values()):
+            normalised = normalize_strategy_option(value)
+            assert normalised in Orchestrator._EXPLICIT_STRATEGY_OPTIONS, (
+                f"{value!r} is advertised on the contract but is not an explicit pin; "
+                f"it would silently fall back to DEFAULT_STRATEGY"
+            )
+
+    def test_coa_common_allowed_set_matches_too(self):
+        """The data-layer validates against ``coa_common.QUERY_STRATEGIES``.
+
+        That is a third copy of the same set — it exists because the Lambda depends
+        only on ``coa-common``, so it cannot import the generated enum or
+        ``StrategyOption`` without adding an undeclared runtime dependency. All three
+        must agree or the REST edge starts rejecting values serve honours (or
+        accepting ones it does not).
+        """
+        from coa_common.constants import QUERY_STRATEGIES
+        from coa_serve.tier2.strategy import StrategyOption
+
+        declared = self._smithy_enum_values()
+        runtime = {option.value for option in StrategyOption}
+        assert set(QUERY_STRATEGIES) == declared == runtime, (
+            f"three-way drift.\n"
+            f"  smithy:      {sorted(declared)}\n"
+            f"  StrategyOption: {sorted(runtime)}\n"
+            f"  coa_common:  {sorted(QUERY_STRATEGIES)}"
+        )
+
+    def test_default_strategy_is_itself_selectable(self):
+        """A caller must be able to ask for the default explicitly, so that
+        'no opinion' and 'deliberately the default' are distinguishable in a trace."""
+        from coa_serve.tier2.strategy import DEFAULT_STRATEGY
+
+        assert DEFAULT_STRATEGY.value in self._smithy_enum_values()

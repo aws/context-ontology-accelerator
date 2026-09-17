@@ -82,23 +82,32 @@ async def execute_query(
     execute: bool | None = None,
     tier_override: int | None = None,
     mode: str | None = None,
+    strategy: str | None = None,
     dimensions: list[dict] | None = None,
     include_supporting: bool = True,
     max_results: int = 1000,
+    timeout_ms: int | float | None = None,
 ) -> dict[str, Any]:
     """End-to-end NL query with tiered resolution.
 
     Mirrors the Smithy ``Query`` operation on the data-layer service — the
     payload keys and response envelope match one-for-one so a client can call
     either surface identically. Options mapped from Smithy input fields:
-    ``execute``, ``tierOverride``, ``mode``, ``dimensions``, ``includeSupporting``,
-    ``maxResults``.
+    ``execute``, ``tierOverride``, ``mode``, ``strategy``, ``dimensions``,
+    ``includeSupporting``, ``maxResults``, ``timeoutMs``.
 
-    The Smithy contract also declares ``timeoutMs``, but the Context Manager
-    does not currently honour it (no reader in ``coa_serve``). Rather than
-    forward a phantom deadline that gets silently ignored, this signature omits
-    it until CM plumbs it into the resolve pipeline. Track: MR !939 review
-    comment ``b6dea1de``.
+    ``strategy`` is forwarded because CM *does* read it:
+    ``Orchestrator._resolve_strategy_selection`` takes ``options["strategy"]``
+    and an explicit pin outranks automatic tier gating. It is the only way a
+    caller can reach the Ontop/VKG path deliberately rather than as a fallback.
+
+    ``timeoutMs`` is honoured by the Context Manager (it builds a request-scoped
+    deadline from ``options.timeoutMs``, clamping to ``min(transport, caller)``),
+    so a caller may ask for a SHORTER budget and get a graceful structured
+    return instead of waiting the full transport budget. Forwarded here on the
+    same terms as the data-layer handler: only a positive numeric value is
+    passed through; zero, negative, non-numeric, or non-integral values are
+    dropped rather than coerced (``int(1.5) == 1`` would smuggle a 1ms budget).
 
     Returns the ``{result, requestId, sessionId}`` envelope; the caller should
     forward it verbatim so downstream identifiers stay observable in traces.
@@ -116,6 +125,8 @@ async def execute_query(
         payload["options"]["tierOverride"] = tier_override
     if mode is not None:
         payload["options"]["mode"] = mode
+    if strategy is not None:
+        payload["options"]["strategy"] = strategy
     if dimensions:
         # Smithy DimensionFilterList arrives as ``[{name, value}, ...]``; CM's
         # Tier-1 ``substitute_dimensions`` calls ``.items()`` and expects a
@@ -126,6 +137,20 @@ async def execute_query(
             payload["options"]["dimensions"] = normalized
     if not include_supporting:
         payload["options"]["includeSupporting"] = False
+    if timeout_ms is not None:
+        # Same validation as the data-layer handler (handler.py): only a genuine
+        # positive int is a valid millisecond budget. bool (a subclass of int),
+        # floats, strings and non-positive values are meaningless as a deadline
+        # and are dropped rather than coerced (int(1.5) == 1 would smuggle a 1ms
+        # budget). Kept byte-for-byte consistent so both surfaces behave alike.
+        if isinstance(timeout_ms, bool):
+            _t = 0
+        elif isinstance(timeout_ms, int):
+            _t = timeout_ms
+        else:
+            _t = 0
+        if _t > 0:
+            payload["options"]["timeoutMs"] = _t
 
     response = await cm_client.invoke(payload, bearer_token)
     _raise_for_cm_error(response)

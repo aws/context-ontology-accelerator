@@ -55,7 +55,65 @@ _SOURCE_FIELDS = [
     "entity_type",
     "entity_uri",
     "data_source_id",
+    # GraphRAG chunk indexes (``chunk_{tenant}``) carry the document identity
+    # nested inside the toolkit's node metadata, not as a flat ``source_doc``
+    # key. Project only the identity fields — pulling ``metadata`` whole would
+    # drag the serialized ``_node_content`` node (chunk text duplicated as
+    # JSON) into every hit.
+    "metadata.source.sourceId",
+    "metadata.source.metadata.source_s3_key",
+    "metadata.source.metadata.filename",
 ]
+
+
+def _source_document_id(source: dict) -> str:
+    """Resolve the unique document identity of a GraphRAG chunk hit (#985).
+
+    A flat ``source_doc`` field wins when present. GraphRAG chunk documents
+    written by the ingest pipeline have no such field; their unique identity is
+    the toolkit's ``sourceId`` at ``metadata.source.sourceId``. Path-shaped
+    metadata (``source_s3_key``, ``filename``) is deliberately NOT used as the
+    identity: it is not unique — two document sources can hold the same
+    ``reports/annual.pdf`` key in different buckets — so it would fuse distinct
+    documents under one id. The human-readable name is a separate field (see
+    :func:`_source_document_name`), matching the API's
+    ``sourceDocumentId`` / ``sourceDocumentName`` split.
+    """
+    flat = source.get("source_doc", "")
+    if isinstance(flat, str) and flat:
+        return flat
+    nested_source = _nested_source(source)
+    source_id = nested_source.get("sourceId")
+    return source_id if isinstance(source_id, str) else ""
+
+
+def _source_document_name(source: dict) -> str:
+    """Resolve the human-readable document name of a chunk hit (#985).
+
+    The name users recognize is the UPLOADED document's — the basename of the
+    raw ``source_s3_key``. The ingest ``filename`` is the STAGING artifact's
+    name and changes extension when preprocessing converts the document
+    (``report.pdf`` is staged as ``report.md``), so it is only the fallback.
+    A display name, not an identity — distinct documents may share it.
+    """
+    nested_metadata = _nested_source(source).get("metadata")
+    if not isinstance(nested_metadata, dict):
+        return ""
+    s3_key = nested_metadata.get("source_s3_key")
+    if isinstance(s3_key, str) and s3_key:
+        return s3_key.rsplit("/", 1)[-1]
+    filename = nested_metadata.get("filename")
+    return filename if isinstance(filename, str) else ""
+
+
+def _nested_source(source: dict) -> dict:
+    """The toolkit's nested ``metadata.source`` dict, or ``{}`` off-shape."""
+    metadata = source.get("metadata")
+    if isinstance(metadata, dict):
+        nested_source = metadata.get("source")
+        if isinstance(nested_source, dict):
+            return nested_source
+    return {}
 
 
 class OpenSearchVectorClient(VectorClient):
@@ -226,7 +284,8 @@ class OpenSearchVectorClient(VectorClient):
             text=source.get("text", "") or source.get("value", ""),
             score=source.get("_score") or 0.0,
             metadata={
-                "source_doc": source.get("source_doc", ""),
+                "source_doc": _source_document_id(source),
+                "source_doc_name": _source_document_name(source),
                 "chunk_index": source.get("chunk_index"),
                 "namespace": source.get("namespace", ""),
                 "uri": source.get("uri", source.get("entity_uri", "")),

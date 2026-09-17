@@ -5,23 +5,28 @@ import React from "react";
 import { render, screen } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 import { GetNamespace } from "./GetNamespace";
+
+const baseNamespace = {
+  namespaceId: "ns-1",
+  name: "test-ns",
+  displayName: "Test Namespace",
+  status: "ACTIVE",
+  owner: "admin@example.com",
+  sourceCount: 4,
+  createdAt: "2026-01-01T00:00:00Z",
+  updatedAt: "2026-05-01T00:00:00Z",
+  description: "A test namespace",
+};
+
+// Mutable so individual tests can set vkgHealth; reset in beforeEach.
+let mockNamespace: Record<string, unknown> = { ...baseNamespace };
 
 vi.mock("../api-hooks/use-get-namespace", () => ({
   useGetNamespace: () => ({
     data: {
-      namespace: {
-        namespaceId: "ns-1",
-        name: "test-ns",
-        displayName: "Test Namespace",
-        status: "ACTIVE",
-        owner: "admin@example.com",
-        sourceCount: 4,
-        createdAt: "2026-01-01T00:00:00Z",
-        updatedAt: "2026-05-01T00:00:00Z",
-        description: "A test namespace",
-      },
+      namespace: mockNamespace,
     },
     isLoading: false,
     error: null,
@@ -81,6 +86,7 @@ vi.mock("@coa/control-plane-client", () => ({
   SourceType: { DATABASE: "DATABASE", DOCUMENTS: "DOCUMENTS" },
   VkgHealthStatus: {
     HEALTHY: "HEALTHY",
+    DEGRADED: "DEGRADED",
     UNAVAILABLE: "UNAVAILABLE",
     PROVISIONING: "PROVISIONING",
     UNKNOWN: "UNKNOWN",
@@ -98,6 +104,10 @@ const wrapper = ({ children }: { children: React.ReactNode }) => (
 );
 
 describe("GetNamespace", () => {
+  beforeEach(() => {
+    mockNamespace = { ...baseNamespace };
+  });
+
   it("renders the namespace display name as header", () => {
     render(<GetNamespace />, { wrapper });
     expect(
@@ -121,6 +131,32 @@ describe("GetNamespace", () => {
     // Popover wraps the indicator as a text trigger (button role).
     expect(
       screen.getByRole("button", { name: /UNKNOWN/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("renders DEGRADED VKG health as an error indicator (running but cannot translate)", () => {
+    mockNamespace = { ...baseNamespace, vkgHealth: "DEGRADED" };
+    render(<GetNamespace />, { wrapper });
+    expect(screen.getByText("VKG health")).toBeInTheDocument();
+    const status = screen.getByText("DEGRADED");
+    expect(status).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /DEGRADED/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("surfaces the server-provided vkgHealthReason in the health popover", async () => {
+    const userEvent = (await import("@testing-library/user-event")).default;
+    mockNamespace = {
+      ...baseNamespace,
+      vkgHealth: "DEGRADED",
+      vkgHealthReason: "container health check failing — cannot answer queries",
+    };
+    render(<GetNamespace />, { wrapper });
+    // Open the popover on the health indicator.
+    await userEvent.click(screen.getByRole("button", { name: /DEGRADED/i }));
+    expect(
+      screen.getByText(/container health check failing/i),
     ).toBeInTheDocument();
   });
 

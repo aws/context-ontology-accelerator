@@ -36,6 +36,7 @@ def _make_strategy_result(*, success=True, empty=False, confidence=0.85, ontop_a
         truncated=False,
         retrieved_tables=[] if ontop_assembly else ["claims"],
         expanded_tables=[] if ontop_assembly else ["claims", "policies"],
+        ontology_version="2026-09-12T08:15:00Z" if ontop_assembly else "",
     )
 
 
@@ -159,6 +160,19 @@ class TestOrchestratorTier2:
         assert response.result.result_rows == [{"id": "1"}]
         assert response.result.sparql_generated == "SELECT ?x WHERE { ?x a :Claim }"
         assert response.result.query_used == "SELECT id FROM claims"
+        # A successful query response names the ontology version it ran
+        # against instead of discarding the value the VKG reported (#986).
+        assert response.result.ontology_version == "2026-09-12T08:15:00Z"
+
+    @pytest.mark.asyncio
+    async def test_tier2_ontop_without_a_version_reports_null_not_empty(self):
+        """An empty StrategyResult version assembles as None, not an empty string."""
+        orch = _make_orchestrator(tier2_success=True, tier2_ontop_assembly=True)
+        request = InvokeRequest(query="Show all claims", namespace="demo", options={"tierOverride": 2})
+        orch._structured_query_tier._strategies[0].resolve.return_value.ontology_version = ""
+        response = await orch.resolve(request)
+
+        assert response.result.ontology_version is None
 
     @pytest.mark.asyncio
     async def test_tier2_success_nl_to_sql_assembly(self):
@@ -257,6 +271,55 @@ class TestOrchestratorTier2:
         assert response.result.tier == 2
         assert response.result.confidence.score == 0.4
         assert response.result.result_rows == [{"id": "1"}]
+
+
+@pytest.mark.unit
+class TestOntologyVersionTruthfulness:
+    """Only the path with an in-band snapshot version (Ontop) names one; every
+    other path reports null BY DESIGN — a namespace-level "current version"
+    is not the version a given query used (#986)."""
+
+    @pytest.mark.asyncio
+    async def test_tier1_metric_answer_is_null(self):
+        orch = _make_orchestrator(metric_found=True)
+        response = await orch.resolve(InvokeRequest(query="What is revenue?", namespace="demo"))
+
+        assert response.result.tier == 1
+        assert response.result.ontology_version is None
+
+    @pytest.mark.asyncio
+    async def test_nl_to_sql_answer_is_null(self):
+        orch = _make_orchestrator(tier2_success=True, tier2_ontop_assembly=False)
+        request = InvokeRequest(query="How many orders?", namespace="demo", options={"tierOverride": 2})
+        response = await orch.resolve(request)
+
+        assert response.result.tier == 2
+        assert response.result.ontology_version is None
+
+    @pytest.mark.asyncio
+    async def test_tier3_answer_is_null(self):
+        orch = _make_orchestrator(tier2_success=False)
+        response = await orch.resolve(InvokeRequest(query="Why did processing spike?", namespace="demo"))
+
+        assert response.result.tier == 3
+        assert response.result.ontology_version is None
+
+    @pytest.mark.asyncio
+    async def test_deep_reasoning_answer_is_null(self):
+        orch = _make_orchestrator()
+        orch._agentic_retriever = AsyncMock()
+        orch._agentic_retriever.resolve.return_value = Tier3Result(
+            synthesized_answer="Combined structured and document evidence answer.",
+            supporting_content=(),
+            graph_context=(),
+            confidence=0.7,
+            trace_steps=(),
+        )
+        request = InvokeRequest(query="q", namespace="demo", options={"mode": "deep-reasoning"})
+        response = await orch.resolve(request)
+
+        assert response.result.metadata["mode"] == "deep-reasoning"
+        assert response.result.ontology_version is None
 
 
 # ── Tier 1: Metric Resolution ───────────────────────────────────────────

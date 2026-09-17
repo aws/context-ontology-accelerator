@@ -30,10 +30,15 @@ import { RuntimeConfig, RUNTIME_CONFIG_FILENAME } from "@coa/shared";
  * `style-src` retains `'unsafe-inline'` because Cloudscape/emotion inject
  * styles at runtime; this does not weaken script protection. Deployers can
  * supply a fully custom policy via `PublicUIConstructProps.contentSecurityPolicy`.
+ *
+ * @param cognitoDomainPrefix Cognito hosted-UI domain prefix, when the
+ *   deployment provisions a user pool. See the `cognitoHostedUiOrigin`
+ *   derivation below for why this is required and not merely nice to have.
  */
 export function buildContentSecurityPolicy(
   runtimeConfig: RuntimeConfig,
   override?: string,
+  cognitoDomainPrefix?: string,
 ): string {
   if (override) return override;
 
@@ -63,6 +68,30 @@ export function buildContentSecurityPolicy(
     ? `https://cognito-idp.${runtimeConfig.region}.amazonaws.com`
     : undefined;
 
+  // Cognito HOSTED-UI origin — a DIFFERENT host from `cognitoOrigin` above, and
+  // the one the browser actually exchanges the authorization code at. Cognito's
+  // discovery document puts `authorization_endpoint`, `token_endpoint` and
+  // `/oauth2/revoke` on `<prefix>.auth.<region>.amazoncognito.com` while keeping
+  // the issuer and JWKS on `cognito-idp.<region>.amazonaws.com`. Allowlisting
+  // only the latter blocks the PKCE code→token POST and every sign-in fails with
+  // nothing in the app to show it — the violation appears only as a CSP report in
+  // devtools (issue #130).
+  //
+  // Needed in BOTH directives, for two separate flows:
+  //   connect-src — the token exchange and the logout-time refresh-token
+  //     revocation, both `fetch` (see OIDCProvider.revokeRefreshToken).
+  //   frame-src   — `automaticSilentRenew: true` renews in a hidden iframe
+  //     pointed at the hosted-UI authorize endpoint.
+  //
+  // Interpolated rather than parsed: the prefix reaches us as a CFN dynamic
+  // reference from SSM, so `new URL()` on it would throw and `originOf` would
+  // return undefined — silently reintroducing the bug. Region comes from
+  // `runtimeConfig.region` for the same reason `cognitoOrigin` does.
+  const cognitoHostedUiOrigin =
+    cognitoDomainPrefix && runtimeConfig.region
+      ? `https://${cognitoDomainPrefix}.auth.${runtimeConfig.region}.amazoncognito.com`
+      : undefined;
+
   // S3 origins for the browser→S3 presigned PUT/GET used by OSI import/export.
   // Region-scoped, derived from `region` like cognitoOrigin: the OSI bucket lives
   // in a later service stack (cross-stack), so we scope to the region's S3 rather
@@ -79,11 +108,19 @@ export function buildContentSecurityPolicy(
 
   const connect = new Set<string>(["'self'"]);
   const frame = new Set<string>(["'self'"]);
-  for (const o of [apiOrigin, authOrigin, agentCoreOrigin, cognitoOrigin, ...s3Origins]) {
+  for (const o of [
+    apiOrigin,
+    authOrigin,
+    agentCoreOrigin,
+    cognitoOrigin,
+    cognitoHostedUiOrigin,
+    ...s3Origins,
+  ]) {
     if (o) connect.add(o);
   }
   if (authOrigin) frame.add(authOrigin); // OIDC silent-renew iframe
   if (cognitoOrigin) frame.add(cognitoOrigin); // OIDC iframe against the IdP
+  if (cognitoHostedUiOrigin) frame.add(cognitoHostedUiOrigin); // silent-renew iframe
 
   // API endpoint not yet wired → permit scheme-level so the app still works;
   // a re-deploy tightens these to the specific origins above.
@@ -117,8 +154,18 @@ export interface PublicUIConstructProps {
    * Optional override for the Content-Security-Policy header value. When
    * omitted, a policy is derived from `runtimeConfig` (script-src 'self' plus
    * connect/frame-src scoped to the API and OIDC authority origins).
+   *
+   * Wired from the `content_security_policy` CDK context key in `bin/app.ts`, so
+   * an operator can extend the policy without patching this source.
    */
   readonly contentSecurityPolicy?: string;
+  /**
+   * Cognito hosted-UI domain prefix (`<prefix>.auth.<region>.amazoncognito.com`),
+   * when the deployment provisions a user pool. Omitted for a direct-OIDC
+   * deployment, which has no Cognito hosted UI. Feeds the CSP — without it the
+   * browser blocks the OAuth token exchange and every sign-in fails (issue #130).
+   */
+  readonly cognitoDomainPrefix?: string;
   /**
    * Custom domain alias for the distribution. When set with
    * {@link uiCertificateArn}, the distribution serves this domain and the
@@ -180,6 +227,7 @@ export class PublicUIConstruct extends SCLConstruct {
             contentSecurityPolicy: buildContentSecurityPolicy(
               props.runtimeConfig,
               props.contentSecurityPolicy,
+              props.cognitoDomainPrefix,
             ),
             override: true,
           },

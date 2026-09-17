@@ -1,6 +1,8 @@
 {
   "app": "npx tsx bin/app.ts",
   "context": {
-    "env": "dev"
+    "env": "dev",
+    "//": "Emit templates without indentation. The control-plane API stack embeds the generated OpenAPI spec, which had pushed its template to 1,007,482 bytes — past CloudFormation's 1,000,000-byte ceiling, so it could not be deployed and CDK could not even build a change set for it. Dropping indentation takes that template to 590,805 bytes. Templates in cdk.out become one long line; use `cdk synth <stack>` or pipe through a formatter when reading them by hand.",
+    "@aws-cdk/core:suppressTemplateIndentation": true
   }
 }

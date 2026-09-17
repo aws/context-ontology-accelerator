@@ -601,12 +601,16 @@ describe("NamespaceStack", () => {
       });
     });
 
-    test("NamespaceApiFn is granted ecs:DescribeServices scoped to the VKG cluster", () => {
+    test("NamespaceApiFn is granted ecs read actions scoped to the VKG cluster", () => {
       vkgTemplate.hasResourceProperties("AWS::IAM::Policy", {
         PolicyDocument: {
           Statement: Match.arrayWith([
             Match.objectLike({
-              Action: "ecs:DescribeServices",
+              Action: [
+                "ecs:DescribeServices",
+                "ecs:ListTasks",
+                "ecs:DescribeTasks",
+              ],
               Effect: "Allow",
               Resource: "*",
               Condition: {

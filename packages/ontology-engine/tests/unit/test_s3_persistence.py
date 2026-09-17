@@ -590,6 +590,149 @@ class TestTablesToH2Ddl:
         # Table name preserved verbatim, delimited
         assert '"test_table"' in ddl
 
+    def test_qualifies_same_named_tables_across_schemas(self):
+        """#149 A: two same-named tables from different schemas must both
+        survive with distinct schema-qualified names (no silent IF NOT EXISTS
+        drop), and a CREATE SCHEMA is emitted for each."""
+        from coa_ontology.inducer.services.data_catalog import (
+            CatalogColumn,
+            CatalogTable,
+        )
+        from coa_ontology.proposals import _tables_to_h2_ddl
+
+        tables = [
+            CatalogTable(
+                id="t1",
+                name="events_daily",
+                fullyQualifiedName="sales.events_daily",
+                sourceSchema="sales",
+                columns=[CatalogColumn(name="sale_id", dataType="INT")],
+            ),
+            CatalogTable(
+                id="t2",
+                name="events_daily",
+                fullyQualifiedName="ops.events_daily",
+                sourceSchema="ops",
+                columns=[CatalogColumn(name="op_id", dataType="INT")],
+            ),
+        ]
+        ddl = _tables_to_h2_ddl(tables)
+        # Both schemas declared
+        assert 'CREATE SCHEMA IF NOT EXISTS "sales";' in ddl
+        assert 'CREATE SCHEMA IF NOT EXISTS "ops";' in ddl
+        # Both tables survive as distinct qualified names
+        assert 'CREATE TABLE IF NOT EXISTS "sales"."events_daily"' in ddl
+        assert 'CREATE TABLE IF NOT EXISTS "ops"."events_daily"' in ddl
+        # Each keeps its OWN columns (the bug was the loser's columns vanishing)
+        assert '"sale_id"' in ddl
+        assert '"op_id"' in ddl
+        # Exactly two CREATE TABLE statements — neither was dropped
+        assert ddl.count("CREATE TABLE IF NOT EXISTS") == 2
+
+    def test_unqualified_when_no_source_schema(self):
+        """Back-compat: a table without sourceSchema emits a bare quoted name
+        and no CREATE SCHEMA, byte-identical to the pre-fix behaviour."""
+        from coa_ontology.inducer.services.data_catalog import (
+            CatalogColumn,
+            CatalogTable,
+        )
+        from coa_ontology.proposals import _tables_to_h2_ddl
+
+        tables = [
+            CatalogTable(
+                id="t1",
+                name="orders",
+                fullyQualifiedName="orders",
+                columns=[CatalogColumn(name="id", dataType="INT")],
+            )
+        ]
+        ddl = _tables_to_h2_ddl(tables)
+        assert "CREATE SCHEMA" not in ddl
+        assert 'CREATE TABLE IF NOT EXISTS "orders"' in ddl
+        # NOT qualified with a dotted prefix
+        assert '"."orders"' not in ddl
+
+    def test_catalog_to_tables_populates_source_schema_end_to_end(self):
+        """#149 A CONTRACT: the schema.sql path must qualify same-named tables
+        when fed a RAW CATALOG (as the live accept pipeline does), not only when
+        a caller pre-sets ``sourceSchema``.
+
+        The original fix patched the DDL EMITTER (_tables_to_h2_ddl) and tested it
+        with sourceSchema already set — but ``_catalog_to_tables`` (the function
+        that actually builds the tables at accept time) never populated
+        sourceSchema, so on live data the guard was silently falsy and the DDL
+        collapsed to two bare colliding ``CREATE TABLE IF NOT EXISTS "claims"``.
+        This test binds the two halves: catalog dict -> _catalog_to_tables ->
+        CatalogTable.sourceSchema -> qualified DDL, so the silent drift cannot
+        recur. Found by live e2e; unit-only coverage missed it.
+        """
+        from coa_ontology.induce_catalog import _catalog_to_tables
+        from coa_ontology.inducer.services.data_catalog import CatalogTable
+        from coa_ontology.proposals import _tables_to_h2_ddl
+
+        # Two schemas, SAME table name — the #149 A collision, as a raw catalog.
+        catalog = {
+            "databases": [
+                {
+                    "name": "schema_a",
+                    "tables": [
+                        {
+                            "name": "claims",
+                            "columns": [{"name": "id", "type": "INT"}],
+                        }
+                    ],
+                },
+                {
+                    "name": "schema_b",
+                    "tables": [
+                        {
+                            "name": "claims",
+                            "columns": [{"name": "id", "type": "INT"}],
+                        }
+                    ],
+                },
+            ]
+        }
+
+        tbl_dicts = _catalog_to_tables(catalog)
+        # CONTRACT 1: _catalog_to_tables must carry the schema through.
+        assert {d["sourceSchema"] for d in tbl_dicts} == {"schema_a", "schema_b"}
+
+        tables = [CatalogTable(**d) for d in tbl_dicts]
+        ddl = _tables_to_h2_ddl(tables)
+        # CONTRACT 2: the DDL the emitter produces from those tables is qualified,
+        # so neither same-named table is silently dropped by IF NOT EXISTS.
+        assert 'CREATE SCHEMA IF NOT EXISTS "schema_a";' in ddl
+        assert 'CREATE SCHEMA IF NOT EXISTS "schema_b";' in ddl
+        assert 'CREATE TABLE IF NOT EXISTS "schema_a"."claims"' in ddl
+        assert 'CREATE TABLE IF NOT EXISTS "schema_b"."claims"' in ddl
+        assert ddl.count("CREATE TABLE IF NOT EXISTS") == 2
+
+    def test_catalog_to_tables_no_schema_prefix_stays_unqualified(self):
+        """NEGATIVE CONTROL: a catalog whose database name is empty must NOT
+        invent a schema — sourceSchema stays falsy and the DDL is bare. This
+        proves CONTRACT 1 above can actually fail (a check that cannot fail
+        proves nothing), so the qualification is data-driven, not hard-coded.
+        """
+        from coa_ontology.induce_catalog import _catalog_to_tables
+        from coa_ontology.inducer.services.data_catalog import CatalogTable
+        from coa_ontology.proposals import _tables_to_h2_ddl
+
+        catalog = {
+            "databases": [
+                {
+                    "name": "",
+                    "tables": [{"name": "orders", "columns": [{"name": "id", "type": "INT"}]}],
+                }
+            ]
+        }
+        tbl_dicts = _catalog_to_tables(catalog)
+        assert tbl_dicts[0]["sourceSchema"] is None
+        ddl = _tables_to_h2_ddl([CatalogTable(**d) for d in tbl_dicts])
+        assert "CREATE SCHEMA" not in ddl
+        assert 'CREATE TABLE IF NOT EXISTS "orders"' in ddl
+        assert '"."orders"' not in ddl
+
 
 class TestSubstepFailureVisibility:
     """#467, second half: a substep that fails must NOT leave the proposal

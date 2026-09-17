@@ -213,6 +213,51 @@ class TestOsiMetricToDefinition:
 
         assert result.expression_dialects[0].dialect == "SNOWFLAKE"
 
+    def test_passes_through_real_dialect_redshift(self) -> None:
+        # #140: a real dialect named directly is kept, not collapsed/lowercased.
+        osi_metric = OsiMetric(
+            name="rs",
+            description="Redshift metric",
+            expression=[OsiDialectExpression(dialect="REDSHIFT", expression="SELECT SUM(x) FROM t")],
+            custom_extensions=OsiCustomExtension(data_source_id="ds-1", source_table="t"),
+        )
+        doc = OsiDocument(metrics=[osi_metric])
+
+        result = _osi_metric_to_definition(osi_metric, doc, "user")
+
+        assert result.expression_dialects[0].dialect == "REDSHIFT"
+
+    def test_normalizes_lowercase_dialect(self) -> None:
+        # #140: a mis-cased real dialect is normalized, never stored lowercase.
+        osi_metric = OsiMetric(
+            name="rs2",
+            description="lower redshift",
+            expression=[OsiDialectExpression(dialect="redshift", expression="SELECT 1 FROM t")],
+            custom_extensions=OsiCustomExtension(data_source_id="ds-1", source_table="t"),
+        )
+        doc = OsiDocument(metrics=[osi_metric])
+
+        result = _osi_metric_to_definition(osi_metric, doc, "user")
+
+        assert result.expression_dialects[0].dialect == "REDSHIFT"
+
+    def test_unknown_dialect_falls_back_lowercased(self) -> None:
+        # An unknown dialect is still imported via the lenient try/except and used
+        # as-is (lowercased). Real dialects (#140) never reach this path — they
+        # pass through osi_dialect_to_internal — so this only covers genuinely
+        # unknown values.
+        osi_metric = OsiMetric(
+            name="odd-dialect",
+            description="unknown dialect",
+            expression=[OsiDialectExpression(dialect="BigQuery", expression="SELECT 1 FROM t")],
+            custom_extensions=OsiCustomExtension(data_source_id="ds-1", source_table="t"),
+        )
+        doc = OsiDocument(metrics=[osi_metric])
+
+        result = _osi_metric_to_definition(osi_metric, doc, "user")
+
+        assert result.expression_dialects[0].dialect == "bigquery"
+
     def test_raises_without_data_source_id(self) -> None:
         osi_metric = OsiMetric(
             name="bad",

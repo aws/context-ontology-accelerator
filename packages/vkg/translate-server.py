@@ -69,13 +69,45 @@ _listen_port = int(os.environ.get("ENDPOINT_PORT", "8080"))
 _table_routing: dict[str, dict[str, str]] = {}
 
 # Cached health state (refreshed by background thread)
-_health_status = {"healthy": False, "last_check": 0.0}
+_health_status = {"healthy": False, "last_check": 0.0, "reason": "starting up"}
 _health_lock = threading.Lock()
 _HEALTH_TTL_SECONDS = 10
 
 
 def _ontop_url(path):
     return f"http://localhost:{_ontop_port}{path}"
+
+
+def _split_sql_qualified(name: str) -> list[str]:
+    """Split a possibly schema-qualified SQL identifier into its parts.
+
+    ``'"sales"."orders"'`` -> ``['"sales"', '"orders"']``; ``'"orders"'`` ->
+    ``['"orders"']``; ``'sales.orders'`` -> ``['sales', 'orders']``. Splits only
+    on dots that sit *outside* double-quoted segments, so a dot embedded in a
+    quoted identifier (``"a.b"``) is preserved. Callers strip the quotes.
+    """
+    parts: list[str] = []
+    buf: list[str] = []
+    in_quotes = False
+    i = 0
+    while i < len(name):
+        ch = name[i]
+        if ch == '"':
+            # A doubled "" inside a quoted identifier is an escaped quote.
+            if in_quotes and i + 1 < len(name) and name[i + 1] == '"':
+                buf.append('""')
+                i += 2
+                continue
+            in_quotes = not in_quotes
+            buf.append(ch)
+        elif ch == "." and not in_quotes:
+            parts.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+        i += 1
+    parts.append("".join(buf))
+    return parts
 
 
 def _load_table_routing(mappings_path: str) -> dict[str, dict[str, str]]:
@@ -109,12 +141,21 @@ def _load_table_routing(mappings_path: str) -> dict[str, dict[str, str]]:
                     if schema:
                         entry["sourceSchema"] = schema
                     if entry:
-                        # Strip SQL-delimited quotes and store both original
-                        # and uppercased keys so lookups match regardless of
-                        # whether sqlglot preserves or normalizes case.
-                        bare = table_name.strip('"')
-                        routing[bare] = entry
-                        routing[bare.upper()] = entry
+                        # rr:tableName may now be schema-qualified
+                        # (`"schema"."table"`) to disambiguate same-named tables
+                        # across schemas (#149 cause A). Parse it into its parts
+                        # and register keys for every form _resolve_routing may
+                        # look up: bare table, and schema.table — each also
+                        # uppercased so lookups match regardless of whether
+                        # sqlglot preserves or normalizes case.
+                        parts = [p.strip('"') for p in _split_sql_qualified(table_name)]
+                        bare = parts[-1]
+                        for key in {bare, bare.upper()}:
+                            routing[key] = entry
+                        if len(parts) > 1:
+                            qualified = ".".join(parts)
+                            for key in {qualified, qualified.upper()}:
+                                routing[key] = entry
         logger.info("Loaded datasource routing for %d tables from %s", len(routing), mappings_path)
         return routing
     except Exception as e:
@@ -122,27 +163,38 @@ def _load_table_routing(mappings_path: str) -> dict[str, dict[str, str]]:
         return {}
 
 
-# Namespace-agnostic query that reformulates to SQL only once mappings load
-# (Ontop's --lazy startup flips actuator UP before then).
+# Health probe query. A namespace-agnostic query that reformulates to SQL only
+# once the mappings load. The unbound triple pattern is intentional: it reports
+# healthy only when Ontop can actually reformulate a query, not just when its
+# process is up (the functional-probe design #149 relies on).
 _PROBE_SPARQL = "SELECT ?s WHERE { ?s ?p ?o } LIMIT 1"
 
 
 def _reformulate_probe():
-    """Return True if the canonical probe query reformulates to SQL."""
+    """Return (ok, reason) — ok True when the probe query reformulates to SQL.
+
+    reason is None on success, else a short human-readable cause suitable for
+    surfacing in the /health 503 body and, downstream, the vkgHealth reason.
+    """
     params = urllib.parse.urlencode({"query": _PROBE_SPARQL})
     req = urllib.request.Request(_ontop_url(f"/ontop/reformulate?{params}"))
     req.add_header("Accept", "text/plain")
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             raw = resp.read().decode("utf-8").strip()
-    except Exception:
-        return False
-    return _extract_sql(raw).upper().startswith(("SELECT", "WITH"))
+    except Exception as e:
+        return False, f"reformulation probe failed: {e}"
+    if _extract_sql(raw).upper().startswith(("SELECT", "WITH")):
+        return True, None
+    # Actuator was UP but the query did not reformulate — the mappings/ontology
+    # loaded partially or not at all (the silent-failure case behind #170/#149).
+    return False, "mappings did not reformulate a probe query (ontology/R2RML not fully loaded)"
 
 
 def _probe_health():
-    """Healthy only when Ontop actuator is UP *and* a real query reformulates.
+    """Return (healthy, reason).
 
+    Healthy only when Ontop actuator is UP *and* a real query reformulates.
     Actuator UP alone is insufficient under --lazy: a broken reload can look up
     while every translation fails silently.
     """
@@ -150,29 +202,36 @@ def _probe_health():
         req = urllib.request.Request(_ontop_url("/actuator/health"))
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read())
-    except Exception:
-        return False
+    except Exception as e:
+        return False, f"Ontop actuator unreachable: {e}"
     if data.get("status") != "UP":
-        return False
+        return False, f"Ontop actuator status={data.get('status')!r}"
     return _reformulate_probe()
 
 
 def _poll_ontop_health():
     """Background thread that refreshes cached health every TTL seconds."""
     while True:
-        healthy = _probe_health()
+        healthy, reason = _probe_health()
 
         with _health_lock:
             _health_status["healthy"] = healthy
+            _health_status["reason"] = None if healthy else (reason or "unhealthy")
             _health_status["last_check"] = time.time()
 
         time.sleep(_HEALTH_TTL_SECONDS)
 
 
 def _check_ontop_health():
-    """Return cached health status."""
+    """Return cached health status (bool)."""
     with _health_lock:
         return _health_status["healthy"]
+
+
+def _health_reason():
+    """Return the cached unhealthy reason (None when healthy)."""
+    with _health_lock:
+        return _health_status.get("reason")
 
 
 def _translate_sparql(sparql, target_dialect):
@@ -543,6 +602,7 @@ class TranslateHandler(BaseHTTPRequestHandler):
                     "status": "unavailable",
                     "ontologyLoaded": False,
                     "message": "Ontop not ready",
+                    "reason": _health_reason() or "Ontop not ready",
                 },
             )
 
@@ -553,6 +613,7 @@ class TranslateHandler(BaseHTTPRequestHandler):
                 {
                     "error": "Service unavailable",
                     "message": "Ontop not ready",
+                    "reason": _health_reason() or "Ontop not ready",
                 },
             )
             return

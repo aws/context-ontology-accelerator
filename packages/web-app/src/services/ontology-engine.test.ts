@@ -126,33 +126,45 @@ describe("uploadOntologyFile", () => {
 });
 
 describe("downloadOntology", () => {
-  it("fetches the download endpoint as text via getText", async () => {
-    const getText = vi.fn().mockResolvedValue("@prefix ex: <http://e/> .");
+  it("gets a presigned URL from the download endpoint and fetches the Turtle from it", async () => {
+    const get = vi.fn().mockResolvedValue({
+      downloadUrl: "https://s3.example/presigned",
+    });
     const mockApiClient: ApiClient = {
-      get: vi.fn(),
+      get,
       post: vi.fn(),
       put: vi.fn(),
       del: vi.fn(),
-      getText,
     };
+    const fetchSpy = vi.spyOn(global, "fetch").mockResolvedValue({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      text: async () => "@prefix ex: <http://e/> .",
+    } as Response);
 
     const ttl = await downloadOntology(mockApiClient, "ns", "http://ex.org/o#");
 
-    expect(getText).toHaveBeenCalledWith(
+    // Fetches the (JSON) download endpoint for a presigned URL — no inline body.
+    expect(get).toHaveBeenCalledWith(
       "/namespaces/ns/ontologies/http%3A%2F%2Fex.org%2Fo%23/download",
     );
+    // Then downloads the Turtle directly from the presigned URL.
+    expect(fetchSpy).toHaveBeenCalledWith("https://s3.example/presigned");
     expect(ttl).toContain("@prefix");
+
+    fetchSpy.mockRestore();
   });
 
-  it("throws when the client has no getText support", async () => {
+  it("throws when the download response has no download URL", async () => {
     const mockApiClient: ApiClient = {
-      get: vi.fn(),
+      get: vi.fn().mockResolvedValue({}),
       post: vi.fn(),
       put: vi.fn(),
       del: vi.fn(),
     };
     await expect(downloadOntology(mockApiClient, "ns", "id")).rejects.toThrow(
-      "does not support text downloads",
+      "did not include a download URL",
     );
   });
 });
