@@ -479,7 +479,7 @@ class TestInvokeFunction:
         main_mod._config = config
         main_mod.RESOLVE_TIMEOUT_S = 0.01
 
-        async def slow_resolve(request):
+        async def slow_resolve(request, **kwargs):
             await asyncio.sleep(1)
 
         mock_orch = MagicMock()
@@ -663,7 +663,7 @@ class TestStreamingSSEMode:
         main_mod._config = config
         mock_orch = MagicMock()
 
-        async def mock_resolve(request, trace=None, on_token=None, conversation_history=None):
+        async def mock_resolve(request, trace=None, on_token=None, conversation_history=None, deadline=None):
             """Simulate orchestrator resolve with trace callback."""
             if trace:
                 trace.record(step="t2.sql", status="done", duration_ms=50)
@@ -850,6 +850,22 @@ class TestHandleTranslate:
             assert result["sparqlQuery"] == "SELECT * WHERE { ?s ?p ?o }"
             assert result["confidence"]["score"] == 0.95
             mock_nl_to_sparql.translate.assert_called_once_with("Show all entities", "test-ns")
+
+    @pytest.mark.asyncio
+    async def test_handle_translate_reports_null_ontology_version_by_design(self):
+        """Translation never touches the VKG and carries no in-band snapshot
+        version, so the response reports null rather than a namespace-level
+        approximation (#986)."""
+        from coa_serve.main import _handle_translate
+
+        mock_nl_to_sparql = AsyncMock()
+        mock_nl_to_sparql.translate.return_value = MagicMock(sparql="SELECT 1", confidence=0.9, trace_steps=[])
+
+        with patch("coa_serve.main._nl_to_sparql", mock_nl_to_sparql):
+            result = await _handle_translate({"query": "q", "namespace": "test-ns"}, "req-986")
+
+        assert result["statusCode"] == 200
+        assert result["ontologyVersion"] is None
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("query", [42, "x" * 4001])

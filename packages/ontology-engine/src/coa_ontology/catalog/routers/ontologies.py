@@ -65,7 +65,7 @@ from coa_control_plane_server.models.ontology_record import (
     OntologyRecord as _OntologyRecord,
 )
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import Response
 
 from coa_ontology import dynamo_store
 from coa_ontology.catalog.ingest import (
@@ -229,9 +229,12 @@ def list_ontologies(
     return ListOntologiesResponseContent(ontologies=[_to_record(r) for r in rows[skip : skip + limit]])
 
 
+_DOWNLOAD_URL_TTL_S = 3600
+
+
 @router.get("/{ontology_id:path}/download")
 def download_ontology_file(ontology_id: str, namespace: str = "default"):
-    """Download the ontology serialized as Turtle.
+    """Download the ontology serialized as Turtle (served via a presigned S3 URL).
 
     The graph store is the source of truth: we ask the backend for the
     contents of the ontology's named graph (``GET /sparql/gsp?graph=…``
@@ -268,17 +271,14 @@ def download_ontology_file(ontology_id: str, namespace: str = "default"):
             )
             body = graph_turtle
         log.info(
-            "download: serving graph-backed turtle (%d bytes raw → %d bytes grouped) for %s in %s",
+            "download: offloading graph-backed turtle (%d bytes raw → %d bytes grouped) for %s in %s",
             len(graph_turtle),
             len(body),
             ontology_id,
             namespace,
         )
-        return Response(
-            content=body,
-            media_type="text/turtle",
-            headers={"Content-Disposition": 'attachment; filename="ontology.ttl"'},
-        )
+        download_url = dynamo_store.write_and_presign_ontology_download(namespace, ontology_id, body)
+        return {"downloadUrl": download_url, "expiresInSeconds": _DOWNLOAD_URL_TTL_S}
 
     # Fallback: legacy local file under data/ontologies/. Used when the
     # graph backend does not support raw Turtle export, when the named
@@ -305,8 +305,11 @@ def download_ontology_file(ontology_id: str, namespace: str = "default"):
     real_fp = os.path.realpath(fp)
     if not _is_within_storage_root(real_fp):
         raise HTTPException(403, "Access denied: file path outside storage boundary")
-    log.info("download: serving local-file fallback %s for %s in %s", fp, ontology_id, namespace)
-    return FileResponse(real_fp, media_type="text/turtle", filename="ontology.ttl")
+    log.info("download: offloading local-file fallback %s for %s in %s", fp, ontology_id, namespace)
+    with open(real_fp, encoding="utf-8") as fh:
+        body = fh.read()
+    download_url = dynamo_store.write_and_presign_ontology_download(namespace, ontology_id, body)
+    return {"downloadUrl": download_url, "expiresInSeconds": _DOWNLOAD_URL_TTL_S}
 
 
 @router.get("/{ontology_id:path}/ingest-status/{job_id}")

@@ -123,6 +123,43 @@ export function isAcceptTerminalFailure(proposal: {
 }
 
 /**
+ * Which copy of a proposal's SHACL constraint config to use.
+ *
+ * ``GET /proposals/{id}`` serves the config out-of-band via a presigned
+ * ``constraints_url`` once it has been offloaded to S3, because a wide schema's
+ * config (one entry per class, one per constrained property) can exceed the
+ * 6 MB API Gateway / Lambda response cap on its own. The inline
+ * ``metadata.constraint_config`` is still present for legacy proposals that
+ * never offloaded, and it wins when present — same inline-else-URL order the
+ * Turtle and grounding-match artifacts use.
+ *
+ * ``undefined`` means "no config to show", which covers both a proposal with no
+ * constraints and a failed S3 fetch. A fetch failure must NOT reject: this is
+ * awaited alongside the ontology Turtle, so throwing would blank the whole page
+ * over secondary review content. Retrying refresh re-presigns and recovers.
+ *
+ * ``fetchJson`` is injected so the decision is unit-testable without rendering
+ * ProposalDetail (mirrors ``isAcceptTerminalFailure``).
+ */
+export async function resolveConstraintConfig(
+  proposal: {
+    metadata?: Record<string, unknown>;
+    constraints_url?: string | null;
+  },
+  fetchJson: (url: string) => Promise<unknown>,
+): Promise<unknown> {
+  const inline = proposal.metadata?.constraint_config;
+  if (inline !== undefined) return inline;
+  if (!proposal.constraints_url) return undefined;
+  try {
+    return await fetchJson(proposal.constraints_url);
+  } catch (e) {
+    console.warn("Failed to load constraint config:", e);
+    return undefined;
+  }
+}
+
+/**
  * Does this proposal block starting a NEW induction for its ontology?
  *
  * Must match the backend guard (``PROPOSAL_STATUSES_BLOCKING_NEW_INDUCTION`` in

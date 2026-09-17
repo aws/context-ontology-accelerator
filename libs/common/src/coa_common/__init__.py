@@ -3,7 +3,7 @@
 
 """Semantic Context Common - shared config, logging, exceptions, constants, S3 utilities, auth, and DAO."""
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 
 from coa_common.authnz_types import (
     PrincipalType,
@@ -52,6 +52,7 @@ from coa_common.constants import (
     graphrag_index_names,
     ontology_vector_index_name,
     sql_ident,
+    sql_qualified_table,
     to_graphrag_tenant_id,
     validate_id,
     validate_namespace_id,
@@ -179,6 +180,7 @@ __all__ = [
     "to_dict",
     "canonical_col",
     "sql_ident",
+    "sql_qualified_table",
     "graphrag_chunk_index_name",
     "graphrag_index_names",
     "ontology_vector_index_name",

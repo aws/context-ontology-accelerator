@@ -358,6 +358,32 @@ class AccumulatedContext:
             out.append((cid, text))
         return out
 
+    def recent_row_snippets(self, limit: int = 5, width: int = 200) -> list[str]:
+        """Return compact renderings of gathered structured rows (evenly sampled).
+
+        Structured rows (NL->SQL / metric tools) were invisible to the planner's
+        content view: the sufficiency/working-answer assessment saw only document
+        chunks, so a sub-question fully answered by rows was assessed as "no data
+        gathered" and the loop wandered or reported nothing. Surfacing a bounded
+        row sample (same shape the synthesizer receives) closes that blind spot.
+        """
+        rows = self.rows
+        if len(rows) > limit:
+            # Evenly-spaced sample (first and last rows always included). A
+            # tail-only sample misrepresents ordered results: on a date-ordered
+            # multi-day table the last rows are all one date, so the assessor
+            # concluded the other days were missing and re-ran the same tool.
+            step = (len(rows) - 1) / (limit - 1) if limit > 1 else 0
+            rows = [rows[round(i * step)] for i in range(limit)]
+        out: list[str] = []
+        for row in rows:
+            items = getattr(row, "items", None)
+            if not callable(items):
+                continue
+            rendered = str({k: str(v).replace("\n", " ")[:width] for k, v in row.items()})
+            out.append(rendered[: width * 2])
+        return out
+
     def _by_relevance(self, limit: int) -> list:
         """Return up to ``limit`` gathered chunks ranked by relevance (idea 8).
 

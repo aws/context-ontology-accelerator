@@ -134,6 +134,8 @@ describe("Auth", () => {
         },
         removeAccessTokenExpired: vi.fn(),
         removeSilentRenewError: vi.fn(),
+        addUserUnloaded: vi.fn(),
+        removeUserUnloaded: vi.fn(),
       },
       signinSilent: vi.fn().mockRejectedValue(new Error("refresh failed")),
       removeUser: vi.fn().mockResolvedValue(undefined),
@@ -186,5 +188,66 @@ describe("Auth", () => {
       expect(screen.getByText("Sign in")).toBeInTheDocument();
     });
     expect(userManager.removeUser).toHaveBeenCalled();
+  });
+
+  it("routes back to login on UserUnloaded without re-attempting silent renew", async () => {
+    // The ad-hoc renewal path in getIdToken/getAccessToken drops the user on
+    // failure, firing UserUnloaded (issue #136). Auth must flip to
+    // unauthenticated directly — NOT call signinSilent again, which would also
+    // run during signOut()'s removeUser().
+    const handlers: { unloaded?: () => void } = {};
+    const userManager = {
+      events: {
+        addAccessTokenExpired: vi.fn(),
+        addSilentRenewError: vi.fn(),
+        addUserUnloaded: (cb: () => void) => {
+          handlers.unloaded = cb;
+        },
+        removeAccessTokenExpired: vi.fn(),
+        removeSilentRenewError: vi.fn(),
+        removeUserUnloaded: vi.fn(),
+      },
+      signinSilent: vi.fn().mockResolvedValue(undefined),
+      removeUser: vi.fn().mockResolvedValue(undefined),
+    };
+    const provider = {
+      getUser: vi.fn().mockResolvedValue({
+        profile: { sub: "user1" },
+        expires_at: Date.now() / 1000 + 3600,
+      }),
+      getIdToken: vi.fn().mockResolvedValue("tok"),
+      signOut: vi.fn(),
+      userManager,
+    };
+    vi.mocked(OIDCProvider.build).mockReturnValue(
+      provider as unknown as OIDCProvider,
+    );
+
+    await act(async () => {
+      render(
+        <RuntimeConfigContext.Provider value={runtimeContext}>
+          <MemoryRouter initialEntries={["/"]}>
+            <Auth applicationName="Test App">
+              <div data-testid="child">Protected Content</div>
+            </Auth>
+          </MemoryRouter>
+        </RuntimeConfigContext.Provider>,
+      );
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("child")).toBeInTheDocument();
+    });
+
+    await act(async () => {
+      handlers.unloaded?.();
+      await Promise.resolve();
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByTestId("child")).not.toBeInTheDocument();
+      expect(screen.getByText("Sign in")).toBeInTheDocument();
+    });
+    expect(userManager.signinSilent).not.toHaveBeenCalled();
   });
 });

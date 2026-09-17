@@ -39,6 +39,25 @@ export interface HistoryMessage {
  */
 export type ExecutionMode = "deep-reasoning" | "standard";
 
+/**
+ * Which Tier-2 engine answers a structured query, sent as `options.strategy`.
+ *
+ * A different axis from {@link ExecutionMode}: `mode` decides whether the whole
+ * T1→T2→T3 cascade is replaced by the Tier-3 reasoning loop, this decides which
+ * engine answers *within* Tier 2. Both were called "agentic" before the rebrand,
+ * which is the reason they are easy to confuse.
+ *
+ * Mirrors the Smithy `QueryStrategy` enum and `StrategyOption` in
+ * `tier2/strategy.py`. Omitting it uses the serve default, `nl_to_sql_first`.
+ */
+export type QueryStrategy =
+  | "best"
+  | "ontop"
+  | "nl_to_sql"
+  | "ontop_first"
+  | "nl_to_sql_first"
+  | "deep-reasoning";
+
 /** Session summary for history sidebar listing. */
 export interface SessionSummary {
   sessionId: string;

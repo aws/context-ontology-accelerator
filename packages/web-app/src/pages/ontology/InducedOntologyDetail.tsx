@@ -125,6 +125,14 @@ export function InducedOntologyDetailPage() {
   const classes = useMemo(() => overview?.classes ?? [], [overview?.classes]);
   const relationships = overview?.objectProperties ?? [];
   const attributes = overview?.datatypeProperties ?? [];
+  // The overview response is a bounded page (#143); the counts come from the
+  // un-paged totals so the UI shows the real scale even when the tables render
+  // only the first page. Fall back to the loaded length when totals are absent.
+  const totalClasses = overview?.totalClasses ?? classes.length;
+  const totalRelationships =
+    overview?.totalObjectProperties ?? relationships.length;
+  const totalAttributes =
+    overview?.totalDatatypeProperties ?? attributes.length;
 
   // Group per-class `groundedTo` IRIs by owning ontology. Uses graph edges, not
   // the induction report — the report is per-job and gone once accepted.
@@ -305,9 +313,9 @@ export function InducedOntologyDetailPage() {
         <KeyValuePairs
           columns={4}
           items={[
-            { label: "Classes", value: String(classes.length) },
-            { label: "Relationships", value: String(relationships.length) },
-            { label: "Attributes", value: String(attributes.length) },
+            { label: "Classes", value: String(totalClasses) },
+            { label: "Relationships", value: String(totalRelationships) },
+            { label: "Attributes", value: String(totalAttributes) },
             {
               label: "Grounded against",
               value:
@@ -331,7 +339,7 @@ export function InducedOntologyDetailPage() {
                       </Box>
                     ))}
                     <Box variant="small" color="text-status-inactive">
-                      {groundedClassCount} of {classes.length} classes grounded
+                      {groundedClassCount} of {totalClasses} classes grounded
                     </Box>
                   </SpaceBetween>
                 ),
@@ -339,6 +347,18 @@ export function InducedOntologyDetailPage() {
           ]}
         />
       </Container>
+
+      {(classes.length < totalClasses ||
+        relationships.length < totalRelationships ||
+        attributes.length < totalAttributes) && (
+        <Alert type="info" header="Showing a partial view">
+          This ontology is larger than the page the tables load, so they show
+          the first {classes.length} of {totalClasses} classes,{" "}
+          {relationships.length} of {totalRelationships} relationships, and{" "}
+          {attributes.length} of {totalAttributes} attributes. Download the .ttl
+          for the complete ontology.
+        </Alert>
+      )}
 
       <Tabs
         ariaLabel="Induced ontology graph contents"
@@ -350,7 +370,7 @@ export function InducedOntologyDetailPage() {
         tabs={[
           {
             id: "classes",
-            label: `Classes (${classes.length})`,
+            label: `Classes (${totalClasses})`,
             content: (
               <SortableTable
                 loading={loading}
@@ -432,7 +452,7 @@ export function InducedOntologyDetailPage() {
           },
           {
             id: "relationships",
-            label: `Relationships (${relationships.length})`,
+            label: `Relationships (${totalRelationships})`,
             content: (
               <SortableTable
                 loading={loading}
@@ -476,7 +496,7 @@ export function InducedOntologyDetailPage() {
           },
           {
             id: "attributes",
-            label: `Attributes (${attributes.length})`,
+            label: `Attributes (${totalAttributes})`,
             content: (
               <SortableTable
                 loading={loading}

@@ -62,11 +62,37 @@ def _httpx_client(get_map: dict[str, MagicMock]) -> MagicMock:
     return client
 
 
-def test_fetch_ontology_turtle_returns_download_text() -> None:
+def test_fetch_ontology_turtle_follows_presigned_download_url() -> None:
+    """#143: /download returns {"downloadUrl"}; the Turtle is fetched out-of-band."""
     meta = MagicMock()
     meta.json.return_value = {"ontology_type": "induced"}
     meta.raise_for_status = MagicMock()
     dl = MagicMock()
+    dl.json.return_value = {
+        "downloadUrl": "https://s3.example/presigned/ontology.ttl",
+        "expiresInSeconds": 3600,
+    }
+    # If the JSON envelope were parsed as Turtle this would be the bug — assert we
+    # never fall back to it when a downloadUrl is present.
+    dl.text = '{"downloadUrl": "https://s3.example/presigned/ontology.ttl"}'
+    dl.raise_for_status = MagicMock()
+    obj = MagicMock()
+    obj.text = "@prefix x: <http://x> ."
+    obj.raise_for_status = MagicMock()
+    client = _httpx_client({"presigned/ontology.ttl": obj, "/download": dl, "ont-1": meta})
+    with patch.object(httpx, "Client", return_value=client):
+        out = vr._fetch_ontology_turtle("http://oc", "ont-1", namespace="ns1")
+    assert out == "@prefix x: <http://x> ."
+
+
+def test_fetch_ontology_turtle_falls_back_to_inline_body() -> None:
+    """Rollout fallback: an ontology-engine that still inlines the Turtle body
+    (no downloadUrl in the response) is still read correctly."""
+    meta = MagicMock()
+    meta.json.return_value = {"ontology_type": "induced"}
+    meta.raise_for_status = MagicMock()
+    dl = MagicMock()
+    dl.json.side_effect = ValueError("not json")
     dl.text = "@prefix x: <http://x> ."
     dl.raise_for_status = MagicMock()
     client = _httpx_client({"/download": dl, "ont-1": meta})

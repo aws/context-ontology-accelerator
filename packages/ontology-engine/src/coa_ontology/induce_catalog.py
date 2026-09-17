@@ -409,6 +409,12 @@ def _catalog_to_tables(catalog: dict) -> list[dict]:
                     "id": f"{db_name}.{tbl['name']}",
                     "name": tbl["name"],
                     "fullyQualifiedName": f"{db_name}.{tbl['name']}",
+                    # sourceSchema = database name (maps to PostgreSQL schema /
+                    # Athena database). Without it _generate_schema_sql cannot
+                    # qualify same-named tables across schemas and silently emits
+                    # colliding bare `CREATE TABLE IF NOT EXISTS "<name>"` DDL —
+                    # the #149 cause-A failure mode. Mirrors main.py induce path.
+                    "sourceSchema": db_name or None,
                     "description": bm.get("description"),
                     "synonyms": bm.get("synonyms", []),
                     "columns": columns,

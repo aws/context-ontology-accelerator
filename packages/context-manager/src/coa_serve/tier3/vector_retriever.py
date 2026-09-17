@@ -33,6 +33,9 @@ class ChunkResult:
     relevance_score: float
     label: str = ""
     uri: str = ""
+    # Human-readable document name (ingest's ``filename``). Display metadata,
+    # not identity — distinct documents may share a name (#985).
+    source_doc_name: str = ""
 
 
 class VectorRetriever:
@@ -83,6 +86,7 @@ class VectorRetriever:
                 chunk_id=hit.id,
                 text=hit.text,
                 source_doc=hit.metadata.get("source_doc", ""),
+                source_doc_name=hit.metadata.get("source_doc_name", ""),
                 relevance_score=hit.score,
                 label=hit.metadata.get("label", ""),
                 uri=hit.metadata.get("uri", ""),

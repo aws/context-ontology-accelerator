@@ -76,6 +76,8 @@ use com.amazon.semanticcontext.unifiedsources#GetSource
 use com.amazon.semanticcontext.unifiedsources#GetSourceScanJob
 use com.amazon.semanticcontext.unifiedsources#GetSourceTable
 use com.amazon.semanticcontext.unifiedsources#GetSourceUploadUrls
+use com.amazon.semanticcontext.unifiedsources#KeepRescanRemoval
+use com.amazon.semanticcontext.unifiedsources#ListSourceScanJobs
 use com.amazon.semanticcontext.unifiedsources#ListSourceTables
 use com.amazon.semanticcontext.unifiedsources#ListSources
 use com.amazon.semanticcontext.unifiedsources#RejectSource
@@ -150,6 +152,7 @@ service ControlPlaneService {
         RescanSource
         GetSourceUploadUrls
         ListSourceTables
+        ListSourceScanJobs
         GetSourceTable
         // Resource-oriented review (replaces the bulk POST /review god endpoint)
         ApproveSource
@@ -159,6 +162,8 @@ service ControlPlaneService {
         ReviewSourceColumn
         UpdateSourceColumnMetadata
         UpdateSourceTableKeys
+        // Re-scan: decline a flagged removal so approve keeps the table/column
+        KeepRescanRemoval
         GetSourceScanJob
         UpdateSourceMetadata
         // ── Metric service ──────────────────────────────────────────────

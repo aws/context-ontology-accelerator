@@ -190,6 +190,17 @@ _SHARED_RULES = (
     "extra columns, aggregates, or string concatenations unless explicitly requested "
     "(e.g. asked to list a first and last name → select them as two separate columns, "
     "not concatenated)\n"
+    # DETERMINISM (mitigation, best-effort — the same question must yield the same
+    # column shape run-to-run). This is a prompt pin only: unlike the NL→SPARQL
+    # path there is no ontology-canonical column name to fail-closed on, and the
+    # answer identity is already stable, so we steer shape rather than reject.
+    "- DETERMINISM: the SAME question must return the SAME columns every time. "
+    "Choose the column set by these fixed rules, not free choice: for a superlative "
+    "singular ('which X has the highest/most …') SELECT only the identifying column of "
+    "X (its primary key / id), NOT the measure being ranked and NOT extra attributes; "
+    "add ORDER BY <measure> DESC LIMIT 1. Project the entity's identifier under its "
+    "own schema column name (e.g. `id` as `id`) — do not rename or alias it "
+    "differently between runs\n"
     "- Write date/time literals in full zero-padded ISO form (e.g. '2019-08-20', not "
     "'2019-8-20')\n"
     "- Use SELECT DISTINCT when the question asks to list/find entities that could "

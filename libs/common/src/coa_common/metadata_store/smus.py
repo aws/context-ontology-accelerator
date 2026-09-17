@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 import random
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import boto3
 from botocore.config import Config
@@ -349,6 +349,8 @@ class SMUSClient(MetadataStoreClient):
         search_text: str,
         max_results: int = 50,
         next_token: str | None = None,
+        search_in_attributes: list[str] | None = None,
+        include_forms: bool = False,
     ) -> SearchResult:
         """Full-text search assets within a project.
 
@@ -357,6 +359,14 @@ class SMUSClient(MetadataStoreClient):
             search_text: Free-text query.
             max_results: Maximum results to return per page.
             next_token: Pagination cursor from a prior call.
+            search_in_attributes: Restrict matching to these asset attributes
+                instead of every searchable one. Pass ``["name"]`` to look an
+                asset up by name — see :meth:`find_asset_by_name` for why that
+                matters. Omit for an unrestricted full-text search.
+            include_forms: When True, request inline form data via
+                ``additionalAttributes=["FORMS"]``. Each returned
+                :class:`AssetResult` will have its ``forms_output``
+                populated from the response (or ``None`` when absent).
 
         Returns:
             Matching assets plus the next pagination token, if any.
@@ -372,8 +382,12 @@ class SMUSClient(MetadataStoreClient):
                 "searchText": search_text,
                 "maxResults": max_results,
             }
+            if search_in_attributes:
+                kwargs["searchIn"] = [{"attribute": a} for a in search_in_attributes]
             if next_token:
                 kwargs["nextToken"] = next_token
+            if include_forms:
+                kwargs["additionalAttributes"] = ["FORMS"]
             resp = self._client.search(**kwargs)
         except Exception as exc:
             msg = exc.args[0] if exc.args else str(exc)
@@ -384,11 +398,76 @@ class SMUSClient(MetadataStoreClient):
                 asset_id=item["assetItem"]["identifier"],
                 name=item["assetItem"].get("name", ""),
                 project_id=item["assetItem"].get("owningProjectId", project_id),
+                forms_output=(
+                    cast(
+                        "list[dict[str, Any]] | None",
+                        item["assetItem"].get("additionalAttributes", {}).get("formsOutput"),
+                    )
+                    if include_forms
+                    else None
+                ),
             )
             for item in resp.get("items", [])
             if "assetItem" in item and "identifier" in item["assetItem"]
         ]
         return SearchResult(items=items, next_token=resp.get("nextToken"))
+
+    def find_asset_by_name(self, *, project_id: str, name: str, max_pages: int = 20) -> AssetResult | None:
+        """Look an asset up by its exact name, or ``None`` when it does not exist.
+
+        Use this instead of ``search_assets(search_text=<asset name>,
+        max_results=1)``. That shape looks like an exact lookup and is not one:
+        search matches every searchable attribute, so a full asset name such as
+        ``DS#<sourceId>:<db>.<table>`` tokenises into terms that are identical
+        across every asset of the same source, leaving only the table name to
+        discriminate. Ranking is then decided by scoring noise and the exact
+        match is not reliably first, so a top-1 lookup returns a *sibling* table
+        and the caller concludes the asset does not exist.
+
+        Two things this does about that:
+
+        * ``searchIn=[{"attribute": "name"}]`` stops the other attributes
+          (description, synonyms, glossary terms, ids) from contributing to the
+          score, which removes the ranking lottery.
+        * It pages instead of trusting one page, because restricting the
+          attribute is still not an exact match — a name is tokenised, so
+          ``…:orders`` also matches ``order_items`` — and the wanted asset can
+          sit behind a page boundary.
+
+        The exact-equality check is therefore kept, and only an exact name is
+        ever returned.
+
+        Args:
+            project_id: Owning project to scope the search to.
+            name: Full asset name to match exactly.
+            max_pages: Stop after this many pages. A bound is needed because a
+                name that is a prefix of many others can match widely; hitting
+                it returns ``None``, which callers already treat as "not found".
+
+        Returns:
+            The asset whose name equals ``name``, or ``None``.
+
+        Raises:
+            MetadataStoreError: If the underlying search call fails. An absent
+                asset is ``None``; a failed lookup is an error, so a caller
+                never reads "not found" out of a broken search.
+        """
+        token: str | None = None
+        for _ in range(max_pages):
+            result = self.search_assets(
+                project_id=project_id,
+                search_text=name,
+                max_results=50,
+                next_token=token,
+                search_in_attributes=["name"],
+            )
+            for item in result.items:
+                if item.name == name:
+                    return item
+            token = result.next_token
+            if not token:
+                return None
+        return None
 
     def get_asset_forms(self, *, asset_id: str) -> dict[str, Any]:
         """Return the raw DataZone asset payload (including its metadata forms).

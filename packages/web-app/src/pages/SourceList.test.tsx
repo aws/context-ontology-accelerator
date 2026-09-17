@@ -215,6 +215,26 @@ describe("SourceList", () => {
     expect(screen.getByText("Database · Glue")).toBeInTheDocument();
   });
 
+  it("renders the Last updated column header", () => {
+    mockUseListSources = {
+      ...defaultMock,
+      data: {
+        pages: [
+          makePage([
+            makeSource({
+              name: "my-glue-db",
+              updatedAt: new Date("2026-05-02T00:00:00Z"),
+            }),
+          ]),
+        ],
+      },
+    };
+    render(<SourceList />, { wrapper });
+
+    // stickyHeader renders a header clone, so the label appears more than once
+    expect(screen.getAllByText("Last updated").length).toBeGreaterThan(0);
+  });
+
   it("renders correct type labels for all source sub-types", () => {
     mockUseListSources = {
       ...defaultMock,

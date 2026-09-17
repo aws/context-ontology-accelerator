@@ -86,6 +86,14 @@ _MAX_CHUNK_SNIPPETS_IN_SUMMARY = 3
 _MAX_CHUNK_SNIPPETS_IN_ASSESS = 12
 _CHUNK_SNIPPET_WIDTH = 280
 _ASSESS_SNIPPET_WIDTH = 500
+# Structured rows surfaced to the planner/assessor. Rows gathered by the
+# NL->SQL / metric tools were previously invisible to both prompts (only
+# chunks/entities were rendered), so a tabular sub-question that had ALREADY
+# been answered was assessed as "no data" — the loop then wandered into
+# unrelated tools and the working answer denied having any data.
+_MAX_ROWS_IN_SUMMARY = 3
+_MAX_ROWS_IN_ASSESS = 12
+_ROW_SNIPPET_WIDTH = 200
 
 # System instruction for next-step selection. All static guidance lives here (not
 # in the user message) to avoid tripping PROMPT_ATTACK guardrail filters, matching
@@ -355,6 +363,17 @@ class BedrockStepPlanner:
         else:
             parts.append("No document chunks gathered yet.")
 
+        rows = getattr(context, "rows", []) or []
+        row_getter = getattr(context, "recent_row_snippets", None)
+        if rows and callable(row_getter):
+            row_snips = row_getter(limit=_MAX_ROWS_IN_ASSESS, width=_ROW_SNIPPET_WIDTH)
+            if row_snips:
+                joined = "\n".join(f"  [row] {r}" for r in row_snips)
+                parts.append(
+                    f"Structured data rows gathered ({len(rows)} total, {len(row_snips)} shown) — "
+                    f"these ARE retrieved data and may fully answer the sub-question:\n{joined}"
+                )
+
         entities = getattr(context, "entities", []) or []
         if entities:
             labels = []
@@ -394,7 +413,20 @@ class BedrockStepPlanner:
             edge_types = list(getattr(ontology, "edge_types", ()) or ())
             shown = ", ".join(edge_types[:_MAX_EDGE_TYPES_IN_SUMMARY]) or "(none)"
             onto_line = f"Ontology resolved. Edge types available for traversal: {shown}"
-        summary = f"Context gathered so far: {n_chunks} document chunk(s), {n_entities} graph entit(y/ies). {onto_line}"
+        rows = getattr(context, "rows", []) or []
+        summary = (
+            f"Context gathered so far: {n_chunks} document chunk(s), {n_entities} graph "
+            f"entit(y/ies), {len(rows)} structured data row(s). {onto_line}"
+        )
+        if rows:
+            row_getter = getattr(context, "recent_row_snippets", None)
+            row_snips = row_getter(limit=_MAX_ROWS_IN_SUMMARY, width=_ROW_SNIPPET_WIDTH) if callable(row_getter) else []
+            if row_snips:
+                joined = "\n".join(f"  [row] {r}" for r in row_snips)
+                summary += (
+                    f"\nStructured rows already retrieved (sample of {len(rows)}) — if these answer "
+                    f"the sub-question, no further tools are needed:\n{joined}"
+                )
         # Predicates discovered present on anchored entities via an 'edge_types'
         # probe (idea 5 soft-prior). These are REAL graph relationships the pruned
         # ontology may omit — the planner may traverse them with 'edge_typed'.

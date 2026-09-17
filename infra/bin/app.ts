@@ -19,6 +19,11 @@ import {
   resolveEndpointServiceAzNames,
 } from "../lib/utils/agentcore-az";
 import { BrandEnvAspect } from "../lib/utils/brand-env";
+import {
+  assertModelIdsInvocableFromRegion,
+  parseDeploymentConfig,
+  resolveConfiguredModelIds,
+} from "../lib/utils/model-region";
 
 // Foundation stacks
 import {
@@ -52,27 +57,47 @@ const prefix =
 const envName = (app.node.tryGetContext(CTX_ENV) as string) ?? DEFAULT_ENV;
 const stackPrefix = `${prefix}-${envName}`;
 
+/** SSM parameter holding the deploy config; named in synth-time error messages. */
+const configParameterName =
+  (app.node.tryGetContext("configParameterName") as string | undefined) ??
+  `/${prefix}/config`;
+
 /**
  * Read deployment configuration from SSM Parameter Store.
  * Falls back to empty config (all defaults) if the parameter doesn't exist.
  */
 async function getConfigFromSSM(): Promise<SsmConfig> {
   const region = process.env.CDK_DEFAULT_REGION ?? "us-east-1";
-  const paramName =
-    (app.node.tryGetContext("configParameterName") as string | undefined) ??
-    `/${prefix}/config`;
+  const paramName = configParameterName;
+  let raw: string;
 
   try {
     const ssm = new SSMClient({ region });
     const res = await ssm.send(
       new GetParameterCommand({ Name: paramName, WithDecryption: true }),
     );
-    return JSON.parse(res.Parameter?.Value ?? "{}") as SsmConfig;
+    if (res.Parameter?.Value == null) {
+      throw new Error("GetParameter returned no Parameter.Value");
+    }
+    raw = res.Parameter.Value;
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
-    console.warn(`SSM ${paramName} not found (${msg}), using defaults`);
-    return {};
+    if (err instanceof Error && err.name === "ParameterNotFound") {
+      console.warn(`SSM ${paramName} not found, using defaults`);
+      return {};
+    }
+    // Credentialless CI synths deliberately compile with defaults. During a
+    // real account-bound deploy, however, ignoring AccessDenied/network errors
+    // would silently replace the operator's config with US defaults.
+    if (!process.env.CDK_DEFAULT_ACCOUNT) {
+      console.warn(
+        `Could not read SSM ${paramName} during credentialless synth (${msg}), using defaults`,
+      );
+      return {};
+    }
+    throw new Error(`Could not read SSM ${paramName} (${msg})`);
   }
+  return parseDeploymentConfig(raw, paramName);
 }
 
 async function deploy(): Promise<void> {
@@ -90,6 +115,16 @@ async function deploy(): Promise<void> {
   // compiles; AZ pinning only matters for actual deploys.
   const deployRegion = process.env.CDK_DEFAULT_REGION ?? "us-east-1";
   const hasCredentials = !!process.env.CDK_DEFAULT_ACCOUNT;
+
+  // Fail fast at synth when a model id — configured or the built-in `us.`
+  // default — is a geographic inference profile the deploy region does not
+  // publish (#1020). Without this, a non-US deploy with no config reaches
+  // CREATE_COMPLETE and every Bedrock call fails at first invoke.
+  assertModelIdsInvocableFromRegion(
+    resolveConfiguredModelIds(config),
+    deployRegion,
+    configParameterName,
+  );
   const importingVpc = !!(app.node.tryGetContext("vpc_id") as
     | string
     | undefined);
@@ -271,8 +306,13 @@ async function deploy(): Promise<void> {
       "/namespaces/{namespaceId}/sources/{sourceId}/tables/{tableId}/review": `/${prefix}/sources/api-fn-arn`,
       "/namespaces/{namespaceId}/sources/{sourceId}/tables/{tableId}/metadata": `/${prefix}/sources/api-fn-arn`,
       "/namespaces/{namespaceId}/sources/{sourceId}/tables/{tableId}/keys": `/${prefix}/sources/api-fn-arn`,
+      // Re-scan: keep (decline) a table/column the re-scan flagged as removed
+      "/namespaces/{namespaceId}/sources/{sourceId}/tables/{tableId}/keep": `/${prefix}/sources/api-fn-arn`,
       "/namespaces/{namespaceId}/sources/{sourceId}/tables/{tableId}/columns/{columnName}/review": `/${prefix}/sources/api-fn-arn`,
       "/namespaces/{namespaceId}/sources/{sourceId}/tables/{tableId}/columns/{columnName}/metadata": `/${prefix}/sources/api-fn-arn`,
+      // Scan history: list a source's scan + steward-review events. Without an
+      // entry here the route falls back to the not-implemented stub (501).
+      "/namespaces/{namespaceId}/sources/{sourceId}/scan": `/${prefix}/sources/api-fn-arn`,
       "/namespaces/{namespaceId}/sources/{sourceId}/scan/{jobId}": `/${prefix}/sources/api-fn-arn`,
       "/namespaces/{namespaceId}/sources/{sourceId}/metadata": `/${prefix}/sources/api-fn-arn`,
       "/namespaces/{namespaceId}/sources/upload-urls": `/${prefix}/sources/api-fn-arn`,
@@ -429,6 +469,11 @@ async function deploy(): Promise<void> {
         ? { autoWebAclParam: cfAutoWebAclParam }
         : {}),
     serveRuntimeArn: serve.queryEndpoint,
+    ...(app.node.tryGetContext("content_security_policy") && {
+      contentSecurityPolicy: String(
+        app.node.tryGetContext("content_security_policy"),
+      ),
+    }),
     ...(customDomain && { customDomain }),
     ...(fs.existsSync(webAppDist) && { websiteContentPath: webAppDist }),
   });

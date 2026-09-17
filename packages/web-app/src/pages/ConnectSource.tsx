@@ -9,6 +9,7 @@ import Alert from "@cloudscape-design/components/alert";
 import Box from "@cloudscape-design/components/box";
 import Button from "@cloudscape-design/components/button";
 import Checkbox from "@cloudscape-design/components/checkbox";
+import RadioGroup from "@cloudscape-design/components/radio-group";
 import Container from "@cloudscape-design/components/container";
 import CopyToClipboard from "@cloudscape-design/components/copy-to-clipboard";
 import ExpandableSection from "@cloudscape-design/components/expandable-section";
@@ -23,6 +24,17 @@ import SpaceBetween from "@cloudscape-design/components/space-between";
 import Tabs from "@cloudscape-design/components/tabs";
 import Tiles from "@cloudscape-design/components/tiles";
 import Toggle from "@cloudscape-design/components/toggle";
+import { TokenInput } from "@components/TokenInput/TokenInput";
+import {
+  MAX_CLASSIFICATION_LENGTH,
+  MAX_TOPIC_LENGTH,
+  MAX_VOCABULARY_ENTRIES,
+  labelsRewrittenOnIngest,
+  topicsRewrittenOnIngest,
+  RECOMMENDED_MAX_LABELS,
+  validateClassification,
+  validateTopic,
+} from "@utils/extraction-vocabulary";
 import {
   useCreateSource,
   useGetNamespace,
@@ -268,6 +280,109 @@ interface Model {
   // Shared extraction config
   enableVersioning: boolean;
   deletePrevVersions: boolean;
+  // Entity-class vocabulary: "infer" runs a corpus sweep at ingest start,
+  // "custom" pins the exact labels below (which disables inference server-side).
+  vocabularyMode: VocabularyMode;
+  preferredEntityClassifications: string[];
+  // Topic vocabulary: "auto" lets the extractor name topics from the chunk text
+  // (there is no corpus-inference pass for topics), "custom" supplies a steer.
+  topicMode: TopicMode;
+  preferredTopics: string[];
+}
+
+/** How the entity-class vocabulary is chosen. */
+export type VocabularyMode = "infer" | "custom";
+/** How topic names are chosen. */
+export type TopicMode = "auto" | "custom";
+
+// RadioGroup hands back a plain string, so narrow it with a guard rather than
+// asserting — project convention, see .claude/rules/frontend-typescript.md. An
+// unrecognised value leaves the current selection alone instead of writing a
+// mode the rest of the form cannot interpret.
+const isVocabularyMode = (value: string): value is VocabularyMode =>
+  value === "infer" || value === "custom";
+const isTopicMode = (value: string): value is TopicMode =>
+  value === "auto" || value === "custom";
+
+/**
+ * Build the `extractionConfig` payload from the form model.
+ *
+ * Shared by both DOCUMENTS paths (S3 and upload) so they cannot drift. Only
+ * sends the vocabulary/topic fields when the user chose to pin them: omitting
+ * them preserves today's server-side defaults (corpus inference for classes,
+ * free-form topic naming) rather than sending an empty list that reads as an
+ * explicit choice.
+ */
+function buildExtractionConfig(model: Model): {
+  enableVersioning: boolean;
+  deletePrevVersions: boolean;
+  preferredEntityClassifications?: string[];
+  inferEntityClassifications?: boolean;
+  preferredTopics?: string[];
+} {
+  const custom = model.vocabularyMode === "custom";
+  return {
+    enableVersioning: model.enableVersioning,
+    deletePrevVersions: model.deletePrevVersions,
+    // An explicit list overrides inference server-side, so send the flag too —
+    // it makes the intent legible in the stored config and in GetSource.
+    ...(custom && model.preferredEntityClassifications.length > 0
+      ? {
+          preferredEntityClassifications: model.preferredEntityClassifications,
+          inferEntityClassifications: false,
+        }
+      : { inferEntityClassifications: true }),
+    ...(model.topicMode === "custom" && model.preferredTopics.length > 0
+      ? { preferredTopics: model.preferredTopics }
+      : {}),
+  };
+}
+
+/**
+ * Field-level warning for the entity-vocabulary control.
+ *
+ * Two things are worth flagging without blocking submission: a list long enough to
+ * hurt prompt adherence, and labels whose recorded class name will differ from what
+ * was typed (extraction title-cases the class it records, so "dress" is recorded as
+ * "Dress"). Neither is an error — the labels are used as written — so this is
+ * `warningText`, not `errorText`.
+ */
+function vocabularyWarning(labels: string[]): string | undefined {
+  const rewritten = labelsRewrittenOnIngest(labels);
+  const parts: string[] = [];
+  if (labels.length > RECOMMENDED_MAX_LABELS) {
+    parts.push(
+      `${labels.length} classes. Long lists measurably reduce how closely the extractor follows them.`,
+    );
+  }
+  if (rewritten.length > 0) {
+    // List every affected label, not a truncated sample: this warning exists to
+    // tell users which of their labels will be renamed on ingest, and hiding some
+    // behind "and N more" defeats it. The set is naturally small — only labels
+    // whose recorded form differs from what was typed.
+    const shown = rewritten
+      .map((r) => `“${r.typed}” as “${r.stored}”`)
+      .join(", ");
+    parts.push(`Extraction will record ${shown}.`);
+  }
+  return parts.length > 0 ? parts.join(" ") : undefined;
+}
+
+/**
+ * Same idea as {@link vocabularyWarning}, for topics. Topics keep their
+ * capitalisation, but an underscore still becomes a space and a trailing full stop
+ * is dropped, so a supplied name can still be recorded differently. Surfacing the
+ * specific names beats a general sentence nobody reads.
+ */
+function topicWarning(topics: string[]): string | undefined {
+  const rewritten = topicsRewrittenOnIngest(topics);
+  if (rewritten.length === 0) return undefined;
+  const shown = rewritten
+    .slice(0, 3)
+    .map((r) => `“${r.typed}” as “${r.stored}”`)
+    .join(", ");
+  const more = rewritten.length > 3 ? ` and ${rewritten.length - 3} more` : "";
+  return `Extraction will record ${shown}${more}.`;
 }
 
 const initialModel: Model = {
@@ -309,6 +424,12 @@ const initialModel: Model = {
   docS3RoleArn: "",
   enableVersioning: true,
   deletePrevVersions: false,
+  // Defaults match server-side behaviour today: infer classifications from the
+  // corpus, and let the extractor name topics freely.
+  vocabularyMode: "infer",
+  preferredEntityClassifications: [],
+  topicMode: "auto",
+  preferredTopics: [],
 };
 
 // ── Validation ────────────────────────────────────────────────────────────────
@@ -369,6 +490,8 @@ interface ValidationErrors {
   docFiles?: string;
   docS3Name?: string;
   docS3BucketArn?: string;
+  preferredEntityClassifications?: string;
+  preferredTopics?: string;
   docS3Prefixes?: Record<number, string>;
 }
 
@@ -460,6 +583,20 @@ function validateStep2(
         if (e) prefixErrs[id] = e;
       });
       if (Object.keys(prefixErrs).length > 0) errs.docS3Prefixes = prefixErrs;
+    }
+    // "Define my own" with nothing defined is a contradiction: the payload would
+    // silently fall back to inference (classes) or automatic naming (topics),
+    // doing the opposite of what was selected. Block it rather than guess.
+    // Applies to both document tabs, hence outside the upload/S3 branch.
+    if (
+      model.vocabularyMode === "custom" &&
+      model.preferredEntityClassifications.length === 0
+    ) {
+      errs.preferredEntityClassifications =
+        "Add at least one class, or choose “Infer from my documents”.";
+    }
+    if (model.topicMode === "custom" && model.preferredTopics.length === 0) {
+      errs.preferredTopics = "Add at least one topic, or choose “Automatic”.";
     }
   }
   if (Object.keys(errs).length > 0) errs.step1 = "Fix the errors above.";
@@ -656,10 +793,7 @@ export const ConnectSource: React.FC = () => {
               .map((p) => p.value.trim())
               .filter(Boolean),
             roleArn: model.docS3RoleArn.trim() || undefined,
-            extractionConfig: {
-              enableVersioning: model.enableVersioning,
-              deletePrevVersions: model.deletePrevVersions,
-            },
+            extractionConfig: buildExtractionConfig(model),
           },
         },
       });
@@ -710,10 +844,7 @@ export const ConnectSource: React.FC = () => {
           documentSource: {
             name: model.docUploadName.trim(),
             uploadId,
-            extractionConfig: {
-              enableVersioning: model.enableVersioning,
-              deletePrevVersions: model.deletePrevVersions,
-            },
+            extractionConfig: buildExtractionConfig(model),
           },
         },
       });
@@ -1530,6 +1661,136 @@ export const ConnectSource: React.FC = () => {
                 },
               ]}
             />
+            {/* Its own section: this configures what the extractor looks for,
+                which is a different concern from the document-lifecycle toggles
+                in "Advanced options" below. Keeping them apart avoids implying a
+                relationship that does not exist. The header names both fields
+                rather than just the first, and "vocabulary" is no longer reused
+                as a field label — it was previously both the section name and
+                the name of one of the two things inside it. */}
+            <ExpandableSection
+              headerText="Entity classes and topics (optional)"
+              variant="container"
+            >
+              <SpaceBetween size="l">
+                <FormField
+                  label="Entity classes"
+                  description="What the extractor calls each thing it finds — a brand, a policy, a material. Each entity is recorded with its class, and those classes become classes in the ontology."
+                  constraintText={
+                    model.vocabularyMode === "custom"
+                      ? `Enter one at a time, or paste several separated by commas. ${MAX_CLASSIFICATION_LENGTH} characters each; 15–25 classes works best.`
+                      : undefined
+                  }
+                  characterCountText={
+                    model.vocabularyMode === "custom"
+                      ? `${model.preferredEntityClassifications.length} of ${MAX_VOCABULARY_ENTRIES} classes`
+                      : undefined
+                  }
+                  warningText={
+                    model.vocabularyMode === "custom"
+                      ? vocabularyWarning(model.preferredEntityClassifications)
+                      : undefined
+                  }
+                  errorText={step2Errs.preferredEntityClassifications}
+                >
+                  <SpaceBetween size="s">
+                    <RadioGroup
+                      value={model.vocabularyMode}
+                      onChange={({ detail }) => {
+                        if (isVocabularyMode(detail.value)) {
+                          setField("vocabularyMode", detail.value);
+                        }
+                      }}
+                      items={[
+                        {
+                          value: "infer",
+                          label: "Infer from my documents",
+                          description:
+                            "Recommended. Classes are derived from a sample of your documents at ingest.",
+                        },
+                        {
+                          value: "custom",
+                          label: "Define my own",
+                          description:
+                            "Your classes are preferred, and a new one is created when nothing on your list fits. No extra classes are derived from your documents.",
+                        },
+                      ]}
+                    />
+                    {model.vocabularyMode === "custom" && (
+                      <TokenInput
+                        value={model.preferredEntityClassifications}
+                        onChange={(next) =>
+                          setField("preferredEntityClassifications", next)
+                        }
+                        placeholder="e.g. Loss Ratio, Claim Handler"
+                        ariaLabel="Entity class labels"
+                        itemLabelPlural="classes"
+                        validate={(candidate, existing) =>
+                          validateClassification(candidate, existing)
+                        }
+                      />
+                    )}
+                  </SpaceBetween>
+                </FormField>
+                <FormField
+                  label="Topics"
+                  description="What a passage is about, rather than what a thing is. Topics group related passages together and drive topic-based retrieval."
+                  constraintText={
+                    model.topicMode === "custom"
+                      ? `Enter one at a time, or paste several separated by commas. Phrases are fine, and your capitalisation is kept. ${MAX_TOPIC_LENGTH} characters each.`
+                      : undefined
+                  }
+                  characterCountText={
+                    model.topicMode === "custom"
+                      ? `${model.preferredTopics.length} of ${MAX_VOCABULARY_ENTRIES} topics`
+                      : undefined
+                  }
+                  warningText={
+                    model.topicMode === "custom"
+                      ? topicWarning(model.preferredTopics)
+                      : undefined
+                  }
+                  errorText={step2Errs.preferredTopics}
+                >
+                  <SpaceBetween size="s">
+                    <RadioGroup
+                      value={model.topicMode}
+                      onChange={({ detail }) => {
+                        if (isTopicMode(detail.value)) {
+                          setField("topicMode", detail.value);
+                        }
+                      }}
+                      items={[
+                        {
+                          value: "auto",
+                          label: "Automatic",
+                          description:
+                            "Recommended. Topics are extracted from your documents.",
+                        },
+                        {
+                          value: "custom",
+                          label: "Define my own",
+                          description:
+                            "Topics are still extracted from your documents; your names are used where one matches. Expect topics beyond your list.",
+                        },
+                      ]}
+                    />
+                    {model.topicMode === "custom" && (
+                      <TokenInput
+                        value={model.preferredTopics}
+                        onChange={(next) => setField("preferredTopics", next)}
+                        placeholder="e.g. Black Tie Gala, Quiet Luxury"
+                        ariaLabel="Preferred topic names"
+                        itemLabelPlural="topics"
+                        validate={(candidate, existing) =>
+                          validateTopic(candidate, existing)
+                        }
+                      />
+                    )}
+                  </SpaceBetween>
+                </FormField>
+              </SpaceBetween>
+            </ExpandableSection>
             <ExpandableSection
               headerText="Advanced options"
               variant="container"

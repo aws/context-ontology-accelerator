@@ -201,7 +201,9 @@ Scan job history for sources.
 | `PATCH` | `/namespaces/{namespaceId}/sources/{sourceId}/tables/{tableId}/keys` | Edit a table's primary key and foreign key relationships — DATABASE only |
 | `PUT` | `/namespaces/{namespaceId}/sources/{sourceId}/tables/{tableId}/columns/{columnName}/review` | Approve/reject a single column (sync) — DATABASE only |
 | `PATCH` | `/namespaces/{namespaceId}/sources/{sourceId}/tables/{tableId}/columns/{columnName}/metadata` | Edit a column's business metadata — DATABASE only |
+| `PUT` | `/namespaces/{namespaceId}/sources/{sourceId}/tables/{tableId}/keep` | Decline a re-scan-flagged removal so approving the re-scan will not delete the table, or one column of it — DATABASE only |
 | `GET` | `/namespaces/{namespaceId}/sources/{sourceId}/scan/{jobId}` | Get scan job status (DATABASE only) |
+| `GET` | `/namespaces/{namespaceId}/sources/{sourceId}/scan` | List scan and review history, newest first (DATABASE only) |
 | `PUT` | `/namespaces/{namespaceId}/sources/{sourceId}/metadata` | Update source-level metadata (DATABASE only) |
 
 ### Authentication

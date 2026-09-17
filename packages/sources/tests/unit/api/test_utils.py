@@ -162,3 +162,109 @@ class TestMergeExtractionConfigUnknownType:
 
         result = merge_extraction_config("some-string")
         assert result == dict(EXTRACTION_DEFAULTS)
+
+
+# ---------------------------------------------------------------------------
+# Vocabulary validation (preferredEntityClassifications / preferredTopics)
+# ---------------------------------------------------------------------------
+# The web console applies the same rules before submitting, but a direct API
+# caller bypasses the console entirely, so they have to hold here to mean
+# anything. Spelling is deliberately NOT validated or rewritten: graphrag-toolkit
+# joins the preferred list straight into the prompt and imposes no format of its
+# own, so the caller's spelling is the caller's choice.
+
+_VOCAB_FIELDS = ["preferred_entity_classifications", "preferred_topics"]
+
+
+@pytest.mark.unit
+class TestVocabularyStoredVerbatim:
+    def test_classifications_are_not_rewritten(self):
+        from coa_sources.utils import merge_extraction_config
+
+        raw = ["DRESS", "loss ratio", "Style_Archetype", "StyleArchetype"]
+        cfg = merge_extraction_config({"preferred_entity_classifications": raw})
+        assert cfg["preferred_entity_classifications"] == raw
+
+    def test_topics_are_not_rewritten(self):
+        from coa_sources.utils import merge_extraction_config
+
+        raw = ["Black Tie Gala", "everyday elegance", "QuietLuxury"]
+        cfg = merge_extraction_config({"preferred_topics": raw})
+        assert cfg["preferred_topics"] == raw
+
+    def test_entries_are_trimmed_and_empties_dropped(self):
+        from coa_sources.utils import merge_extraction_config
+
+        cfg = merge_extraction_config({"preferred_topics": ["  Black Tie Gala  ", "", "   "]})
+        assert cfg["preferred_topics"] == ["Black Tie Gala"]
+
+
+@pytest.mark.unit
+class TestVocabularyValidation:
+    @pytest.mark.parametrize("field", _VOCAB_FIELDS)
+    def test_rejects_non_list(self, field):
+        from coa_sources.utils import merge_extraction_config
+
+        with pytest.raises(ValueError, match="must be a list of strings"):
+            merge_extraction_config({field: "Policy"})
+
+    @pytest.mark.parametrize("field", _VOCAB_FIELDS)
+    def test_rejects_non_string_member(self, field):
+        from coa_sources.utils import merge_extraction_config
+
+        with pytest.raises(ValueError, match="only strings"):
+            merge_extraction_config({field: ["ok", 42]})
+
+    @pytest.mark.parametrize("field", _VOCAB_FIELDS)
+    def test_rejects_duplicates_case_insensitively(self, field):
+        """Two spellings differing only in case cannot be told apart once the
+        recorded class is title-cased, so accepting both would configure a
+        distinction that cannot exist."""
+        from coa_sources.utils import merge_extraction_config
+
+        with pytest.raises(ValueError, match="duplicate entry"):
+            merge_extraction_config({field: ["Policy", "policy"]})
+
+    @pytest.mark.parametrize("field", _VOCAB_FIELDS)
+    def test_rejects_over_long_list(self, field):
+        from coa_common.constants import MAX_VOCABULARY_ENTRIES
+        from coa_sources.utils import merge_extraction_config
+
+        too_many = [f"Entry {i}" for i in range(MAX_VOCABULARY_ENTRIES + 1)]
+        with pytest.raises(ValueError, match=f"maximum is {MAX_VOCABULARY_ENTRIES}"):
+            merge_extraction_config({field: too_many})
+
+    @pytest.mark.parametrize("field", _VOCAB_FIELDS)
+    def test_accepts_list_at_the_cap(self, field):
+        from coa_common.constants import MAX_VOCABULARY_ENTRIES
+        from coa_sources.utils import merge_extraction_config
+
+        at_cap = [f"Entry {i}" for i in range(MAX_VOCABULARY_ENTRIES)]
+        assert len(merge_extraction_config({field: at_cap})[field]) == MAX_VOCABULARY_ENTRIES
+
+
+@pytest.mark.unit
+class TestVocabularyDedupeMatchesTheBrowser:
+    """Dedupe folding must agree with the console's ``toLowerCase()``.
+
+    The console applies the same rules before submitting, so a pair it accepts
+    must not 400 here — that is the whole point of duplicating the check. Python's
+    ``casefold()`` folds MORE than JavaScript does (it maps "ß" to "ss"), so the
+    comparison deliberately uses ``lower()``.
+    """
+
+    @pytest.mark.parametrize("field", _VOCAB_FIELDS)
+    def test_sharp_s_is_not_folded_to_ss(self, field):
+        from coa_sources.utils import merge_extraction_config
+
+        # casefold() would treat these as duplicates and raise; toLowerCase() in
+        # the browser does not, so neither may this.
+        cfg = merge_extraction_config({field: ["Stra\u00dfe", "STRASSE"]})
+        assert cfg[field] == ["Stra\u00dfe", "STRASSE"]
+
+    @pytest.mark.parametrize("field", _VOCAB_FIELDS)
+    def test_plain_case_differences_are_still_duplicates(self, field):
+        from coa_sources.utils import merge_extraction_config
+
+        with pytest.raises(ValueError, match="duplicate entry"):
+            merge_extraction_config({field: ["Policy", "POLICY"]})

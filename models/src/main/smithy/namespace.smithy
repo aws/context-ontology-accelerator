@@ -64,7 +64,12 @@ enum VkgHealthStatus {
     /// Running and able to translate queries.
     HEALTHY
 
-    /// The service exists but is not currently serving.
+    /// A task is running but its container health check is failing, so the
+    /// service cannot answer queries (e.g. the published R2RML/schema could not
+    /// be loaded). Distinct from UNAVAILABLE, which means no task is running.
+    DEGRADED
+
+    /// The service exists but is not currently serving (no running task).
     UNAVAILABLE
 
     /// The service is starting up (deployment in progress); expected to become HEALTHY shortly.
@@ -154,6 +159,12 @@ structure NamespaceDetail {
 
     /// Health of this namespace's VKG translation service (read-time).
     vkgHealth: VkgHealthStatus
+
+    /// Human-readable explanation for a non-HEALTHY vkgHealth, when known
+    /// (e.g. "container health check failing", "no running task"). Absent when
+    /// HEALTHY. Coarse by design — the precise container-side cause is in the
+    /// VKG service /health response and its CloudWatch logs.
+    vkgHealthReason: String
 }
 
 list NamespaceSummaryList {

@@ -18,6 +18,41 @@ A metric is a named business calculation that includes:
 - **Data Source**: which database source provides the underlying data
 - **Source Table**: the primary table the metric aggregates
 
+## Metric, Ontology, or Source Document?
+
+The three layers are **complementary, not alternatives** — the same business
+concept often appears in more than one. A concrete example: should a fixed
+calculation such as *sales amount − order amount* be registered as a Tier-1
+metric? The answer depends on governance and execution needs, not on whether
+the expression contains arithmetic:
+
+| Register as | Use when | Example |
+|---|---|---|
+| **Metric (Tier 1)** | The calculation is reusable, governed, deterministic, named, and should execute identically for every consumer | `net_sales = SUM(sales_amount) - SUM(order_amount)` as a canonical business definition |
+| **Ontology (Tier-2 semantics)** | The information defines concepts, vocabulary, relationships, constraints, or how data fields map to business meaning | `Sale`, `Order`, `hasAmount`, and the relationship between an order and a sale |
+| **Source document (Tier-3 evidence)** | The information is prose: policy, rationale, procedure, exception handling, or supporting evidence | The revenue-recognition policy explaining *when* an order counts as a sale |
+| **Ad-hoc Tier-2 query** | The calculation is one-off, or should be generated from the structured schema rather than governed as a reusable KPI | A temporary comparison requested for a single analysis |
+
+So for *sales amount − order amount*: register it as a **metric** when it is a
+canonical, reusable definition with a stable SQL expression. Model `Sale` and
+`Order` in the **ontology** so Tier 2 can answer ad-hoc variations of the same
+question. Ingest the policy that explains the business rule as a **document**
+so answers can cite the *why*. Each layer strengthens the others.
+
+Current constraints to factor into the decision:
+
+- A metric binds to a **single `dataSourceId` and `sourceTable`**. A calculation
+  spanning sources is not a Tier-1 capability today — model it in the ontology
+  and let Tier 2 generate the cross-source query.
+- Natural-language qualifiers (a time window, a filter, a grouping) make a
+  question fall through to Tier 2 unless supplied via `options.dimensions` or an
+  explicit `options.tierOverride: 1` — see
+  [How Metrics Are Used in Queries](#how-metrics-are-used-in-queries).
+- Registering the ontology or the document does **not** replace the metric: the
+  ontology provides shared vocabulary, documents provide explanation and
+  evidence; only the metric gives the calculation a governed, named, always-
+  identical execution.
+
 ## Creating Metrics
 
 ### Via the Web App
@@ -142,12 +177,24 @@ Ossie rename:
 
 ## How Metrics Are Used in Queries
 
-When a user asks a question like *"What was total revenue last quarter?"*, the query engine:
+When a user asks a question that names a metric, the query engine:
 
-1. **Tier 1 (Metric Resolution)**: Matches the question to the `total_revenue` metric via semantic similarity
-2. Retrieves the metric's SQL expression and source table
-3. Generates a full query with the appropriate time filter
-4. Executes through the SQL Firewall (enforcing table/column access controls)
+1. **Tier 1 (Metric Resolution)**: matches the question to the metric via
+   semantic similarity over names and synonyms
+2. Checks that the metric accounts for the **whole** question
+3. Retrieves the metric's SQL expression and executes it **verbatim** through
+   the SQL Firewall (enforcing table/column access controls)
+
+Tier 1 does **not** rewrite the metric's SQL from your wording. A question that
+names a metric *and* narrows it — *"What was total revenue **last quarter**?"*
+— is a partial match: executing the stored expression would return the
+unfiltered total as though it answered the narrower question. Tier 1 therefore
+declines it and lets **Tier 2 generate the SQL**, which can express the time
+filter. The two supported ways to keep such a question on the deterministic
+metric path are `options.dimensions` (bind the filter as a parameter) and
+`options.tierOverride: 1` (explicit instruction). See
+[Questions carrying a qualifier fall through to Tier 2](serve.md#questions-carrying-a-qualifier-fall-through-to-tier-2)
+in the Serve guide for the full routing rules.
 
 ## Managing Metrics
 

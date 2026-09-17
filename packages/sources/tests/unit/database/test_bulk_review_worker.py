@@ -138,6 +138,15 @@ class TestParseMessage:
         with pytest.raises(ValueError, match="Invalid decision"):
             worker.parse_message({"namespaceId": "ns", "sourceId": "src", "decision": "MAYBE"})
 
+    def test_is_rescan_defaults_false(self):
+        msg = worker.parse_message({"namespaceId": "ns", "sourceId": "src", "decision": "APPROVED"})
+        assert msg.is_rescan is False
+
+    def test_is_rescan_true_from_bool_or_string(self):
+        base = {"namespaceId": "ns", "sourceId": "src"}
+        assert worker.parse_message({**base, "decision": "APPROVED", "isRescan": True}).is_rescan is True
+        assert worker.parse_message({**base, "decision": "REJECTED", "isRescan": "true"}).is_rescan is True
+
 
 # ===================================================================
 # apply_decision_to_table — cascade rules + change tracking
@@ -254,6 +263,7 @@ class TestProcessBulkReview:
                 project_id="proj-123",
                 sources_table="test-sources",
                 region="us-east-1",
+                scan_jobs_table="test-scan-jobs",
             )
         assert result.tables_total == 0
         mock_client.search_assets.assert_not_called()
@@ -274,6 +284,7 @@ class TestProcessBulkReview:
                 project_id="proj-123",
                 sources_table="test-sources",
                 region="us-east-1",
+                scan_jobs_table="test-scan-jobs",
             )
 
         assert result.tables_total == 2
@@ -308,6 +319,7 @@ class TestProcessBulkReview:
                 project_id="proj-123",
                 sources_table="test-sources",
                 region="us-east-1",
+                scan_jobs_table="test-scan-jobs",
             )
 
         assert result.tables_total == 2
@@ -334,6 +346,7 @@ class TestProcessBulkReview:
                 project_id="proj-123",
                 sources_table="test-sources",
                 region="us-east-1",
+                scan_jobs_table="test-scan-jobs",
             )
 
         assert result.tables_total == 1
@@ -361,6 +374,7 @@ class TestProcessBulkReview:
                 project_id="proj-123",
                 sources_table="test-sources",
                 region="us-east-1",
+                scan_jobs_table="test-scan-jobs",
             )
 
         # Both tables flip to REJECTED (t1 APPROVED clobbered, t2 PENDING).
@@ -396,6 +410,7 @@ class TestProcessBulkReview:
                 project_id="proj-123",
                 sources_table="test-sources",
                 region="us-east-1",
+                scan_jobs_table="test-scan-jobs",
             )
 
         # Only t2 (PENDING) flipped to APPROVED. t1 stays REJECTED.
@@ -440,6 +455,7 @@ class TestProcessBulkReview:
                 project_id="proj-123",
                 sources_table="test-sources",
                 region="us-east-1",
+                scan_jobs_table="test-scan-jobs",
             )
 
         written_form = mock_client.create_asset_revision.call_args.kwargs["forms_input"][0]
@@ -474,6 +490,7 @@ class TestProcessBulkReview:
                 project_id="proj-123",
                 sources_table="test-sources",
                 region="us-east-1",
+                scan_jobs_table="test-scan-jobs",
             )
 
         written_form = mock_client.create_asset_revision.call_args.kwargs["forms_input"][0]
@@ -507,6 +524,7 @@ class TestProcessBulkReview:
                 project_id="proj-123",
                 sources_table="test-sources",
                 region="us-east-1",
+                scan_jobs_table="test-scan-jobs",
             )
 
         assert len(result.tables_failed) == 1
@@ -527,6 +545,7 @@ class TestProcessBulkReview:
                 project_id="proj-123",
                 sources_table="test-sources",
                 region="us-east-1",
+                scan_jobs_table="test-scan-jobs",
             )
 
         assert result.tables_total == 0
@@ -617,6 +636,7 @@ class TestBulkReviewPaging:
                         project_id="proj-123",
                         sources_table="test-sources",
                         region="us-east-1",
+                        scan_jobs_table="test-scan-jobs",
                     )
                 )
                 if mock_sqs.send_message.call_count > before:
@@ -666,6 +686,7 @@ class TestBulkReviewPaging:
                 project_id="proj-123",
                 sources_table="test-sources",
                 region="us-east-1",
+                scan_jobs_table="test-scan-jobs",
             )
 
         assert mock_sqs.send_message.call_count == 1
@@ -717,6 +738,7 @@ class TestBulkReviewPaging:
                 project_id="proj-123",
                 sources_table="test-sources",
                 region="us-east-1",
+                scan_jobs_table="test-scan-jobs",
             )
 
         # It resumed the search (processed), and folded the carried count in.
@@ -744,6 +766,7 @@ class TestBulkReviewPaging:
                 project_id="proj-123",
                 sources_table="test-sources",
                 region="us-east-1",
+                scan_jobs_table="test-scan-jobs",
             )
         assert result.tables_total == 0
         mock_client.search_assets.assert_not_called()
@@ -809,6 +832,7 @@ class TestRejectedKeyColumnGate:
                 project_id="proj-123",
                 sources_table="test-sources",
                 region="us-east-1",
+                scan_jobs_table="test-scan-jobs",
             )
 
     def test_rejected_primary_key_column_blocks_approval(self):
@@ -922,5 +946,533 @@ class TestRejectedKeyColumnGate:
                 project_id="proj-123",
                 sources_table="test-sources",
                 region="us-east-1",
+                scan_jobs_table="test-scan-jobs",
             )
         assert result.tables_failed == []
+
+
+# ===================================================================
+# Re-scan approve / reject (B5.2 delete-removed, B5.3 restore)
+# ===================================================================
+
+
+def _mock_smus_for_rescan(tables: list[Table]) -> MagicMock:
+    """_mock_smus_with_assets plus a lock-guarded delete_asset recorder."""
+    client = _mock_smus_with_assets(tables)
+    client.delete_asset = _RecordingCall()
+    return client
+
+
+def _written(recording_call: _RecordingCall, idx: int = -1) -> Table:
+    """Deserialize the Table written by the idx-th create_asset_revision call."""
+    from coa_common.datazone_forms import deserialize_form
+
+    content = recording_call.call_args_list[idx].kwargs["forms_input"][0]["content"]
+    return deserialize_form(json.loads(content), data_source_id=_SOURCE_ID)
+
+
+@pytest.mark.unit
+class TestRescanReview:
+    _DAO_PATCH = "coa_sources.database.bulk_review.worker.DynamoDBDAO"
+
+    def test_rescan_reject_restores_modified_deletes_added_and_returns_approved(self):
+        from coa_common.datazone_forms import serialize_form
+
+        # Pre-rescan orders (approved, old shape) captured in the backup blob.
+        orders_old = Table(
+            name="orders",
+            database="db",
+            data_source_id=_SOURCE_ID,
+            business_metadata=BusinessMetadata(review_status="APPROVED", description="old approved"),
+            columns=[
+                Column(name="oldcol", data_type="int", business_metadata=BusinessMetadata(review_status="APPROVED"))
+            ],
+        )
+        backup = {
+            "version": 1,
+            "source_id": _SOURCE_ID,
+            "scan_job_sk": "sk",
+            "removed_tables": [],
+            "added_tables": ["db.newt"],
+            "removed_columns": {},
+            "modified_backup": {"db.orders": serialize_form(orders_old)},
+        }
+        # Live assets after the re-scan: orders (asset-0, overwritten) + newt (asset-1, added).
+        live = [
+            _make_table(table_name="orders", status="PENDING_REVIEW"),
+            _make_table(table_name="newt", status="PENDING_REVIEW"),
+        ]
+        client = _mock_smus_for_rescan(live)
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {"status": "REJECTING"}
+        msg = worker.BulkReviewMessage(
+            namespace_id=_NAMESPACE_ID, source_id=_SOURCE_ID, decision="REJECTED", is_rescan=True
+        )
+
+        with (
+            patch(self._DAO_PATCH, return_value=mock_dao),
+            patch.object(worker, "_read_backup", return_value=backup),
+        ):
+            result = worker.process_bulk_review(
+                msg=msg,
+                client=client,
+                project_id="proj-123",
+                sources_table="test-sources",
+                region="us-east-1",
+                scan_jobs_table="test-scan-jobs",
+            )
+
+        assert result.tables_failed == []
+        # orders restored to its pre-rescan (old) shape; newt (added) deleted.
+        assert client.create_asset_revision.call_count == 1
+        restored = _written(client.create_asset_revision)
+        assert restored.name == "orders"
+        assert [c.name for c in restored.columns] == ["oldcol"]
+        assert client.delete_asset.call_count == 1
+        assert client.delete_asset.call_args.kwargs == {"asset_id": "asset-1"}
+        # Source returns to APPROVED, NOT REJECTED (re-scan reject keeps what was approved).
+        final = next(c for c in mock_dao.update.call_args_list if "tablesApproved" in c.args[1])
+        assert final.args[1]["status"] == "APPROVED"
+
+    def test_rescan_reject_with_no_backup_returns_approved_without_writes(self):
+        client = _mock_smus_for_rescan([])
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {"status": "REJECTING"}
+        msg = worker.BulkReviewMessage(
+            namespace_id=_NAMESPACE_ID, source_id=_SOURCE_ID, decision="REJECTED", is_rescan=True
+        )
+        with (
+            patch(self._DAO_PATCH, return_value=mock_dao),
+            patch.object(worker, "_read_backup", return_value=None),
+        ):
+            result = worker.process_bulk_review(
+                msg=msg,
+                client=client,
+                project_id="proj-123",
+                sources_table="test-sources",
+                region="us-east-1",
+                scan_jobs_table="test-scan-jobs",
+            )
+        assert result.tables_failed == []
+        assert client.create_asset_revision.call_count == 0
+        assert client.delete_asset.call_count == 0
+        final = next(c for c in mock_dao.update.call_args_list if "tablesApproved" in c.args[1])
+        assert final.args[1]["status"] == "APPROVED"
+
+    def test_rescan_approve_deletes_removed_tables_then_approves(self):
+        backup = {
+            "version": 1,
+            "source_id": _SOURCE_ID,
+            "scan_job_sk": "sk",
+            "removed_tables": ["db.legacy"],
+            "added_tables": [],
+            "removed_columns": {},
+            "modified_backup": {},
+        }
+        # orders (asset-0) will be cascade-approved; legacy (asset-1) is the removed table.
+        live = [
+            _make_table(table_name="orders", status="PENDING_REVIEW"),
+            _make_table(table_name="legacy", status="APPROVED", columns=[("c1", "APPROVED")]),
+        ]
+        client = _mock_smus_for_rescan(live)
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {"status": "APPROVING"}
+        msg = worker.BulkReviewMessage(
+            namespace_id=_NAMESPACE_ID, source_id=_SOURCE_ID, decision="APPROVED", is_rescan=True
+        )
+        with (
+            patch(self._DAO_PATCH, return_value=mock_dao),
+            patch.object(worker, "_read_backup", return_value=backup),
+        ):
+            result = worker.process_bulk_review(
+                msg=msg,
+                client=client,
+                project_id="proj-123",
+                sources_table="test-sources",
+                region="us-east-1",
+                scan_jobs_table="test-scan-jobs",
+            )
+        assert result.tables_failed == []
+        # The removed table's asset is deleted.
+        assert client.delete_asset.call_count == 1
+        assert client.delete_asset.call_args.kwargs == {"asset_id": "asset-1"}
+        # Terminal APPROVED; the deleted removed table is not counted as approved.
+        final = next(c for c in mock_dao.update.call_args_list if "tablesApproved" in c.args[1])
+        assert final.args[1] == {"status": "APPROVED", "tablesApproved": 1}
+
+    def test_apply_rescan_removals_drops_removed_columns(self):
+        orders = _make_table(
+            table_name="orders", status="APPROVED", columns=[("oldcol", "APPROVED"), ("keepcol", "APPROVED")]
+        )
+        client = _mock_smus_for_rescan([orders])
+        backup = {
+            "removed_tables": [],
+            "added_tables": [],
+            "removed_columns": {"db.orders": ["oldcol"]},
+            "modified_backup": {},
+        }
+        failures, deleted = worker._apply_rescan_removals(client, "proj-123", _SOURCE_ID, backup)
+        assert failures == []
+        assert deleted == 0
+        # orders re-written with the removed column dropped.
+        assert [c.name for c in _written(client.create_asset_revision).columns] == ["keepcol"]
+
+    def test_read_backup_missing_returns_none(self):
+        from botocore.exceptions import ClientError
+
+        err = ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+        with (
+            patch.object(worker, "_BUCKET_NAME", "bucket"),
+            patch.object(worker, "get_s3_client", return_value=MagicMock()),
+            patch.object(worker, "read_file_bytes", side_effect=err),
+        ):
+            assert worker._read_backup(_SOURCE_ID) is None
+
+    def test_read_backup_success_returns_dict(self):
+        with (
+            patch.object(worker, "_BUCKET_NAME", "bucket"),
+            patch.object(worker, "get_s3_client", return_value=MagicMock()),
+            patch.object(worker, "read_file_bytes", return_value=b'{"version": 1, "added_tables": []}'),
+        ):
+            assert worker._read_backup(_SOURCE_ID) == {"version": 1, "added_tables": []}
+
+    def test_rescan_reject_restores_prior_summary_counts(self):
+        # The re-scan rewrote the live counts to the fresh scan; a reject must
+        # restore the pre-rescan counts recorded in the backup's source_summary.
+        backup = {
+            "removed_tables": [],
+            "added_tables": [],
+            "removed_columns": {},
+            "modified_backup": {},
+            "source_summary": {
+                "tablesDiscovered": 7,
+                "discoveredSchemas": ["db_old"],
+                "lastScanAt": "t-old",
+                "lastScanJobId": "job-old",
+                "tablesApproved": 7,
+            },
+        }
+        client = _mock_smus_for_rescan([])
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {"status": "REJECTING"}
+        msg = worker.BulkReviewMessage(
+            namespace_id=_NAMESPACE_ID, source_id=_SOURCE_ID, decision="REJECTED", is_rescan=True
+        )
+        with (
+            patch(self._DAO_PATCH, return_value=mock_dao),
+            patch.object(worker, "_read_backup", return_value=backup),
+        ):
+            worker.process_bulk_review(
+                msg=msg,
+                client=client,
+                project_id="proj-123",
+                sources_table="test-sources",
+                region="us-east-1",
+                scan_jobs_table="test-scan-jobs",
+            )
+        fields = next(c for c in mock_dao.update.call_args_list if "tablesApproved" in c.args[1]).args[1]
+        assert fields["status"] == "APPROVED"
+        assert fields["tablesDiscovered"] == 7
+        assert fields["discoveredSchemas"] == ["db_old"]
+        assert fields["lastScanAt"] == "t-old"
+        assert fields["lastScanJobId"] == "job-old"
+        assert fields["tablesApproved"] == 7
+
+    def test_rescan_reject_survives_non_numeric_tables_discovered(self):
+        """A corrupt count must not fail the whole reject.
+
+        ``tablesDiscovered`` is stored as a string in the backup and coerced back
+        to int. An unparseable value used to raise straight out of the reject,
+        stranding the source in REJECTION_FAILED with no route back. It is now
+        skipped instead, so the reject completes and the live count stands —
+        stale beats both a crash and a wrong zero.
+        """
+        backup = {
+            "removed_tables": [],
+            "added_tables": [],
+            "removed_columns": {},
+            "modified_backup": {},
+            "source_summary": {
+                "tablesDiscovered": "not-a-number",
+                "discoveredSchemas": ["db_old"],
+                "lastScanAt": "t-old",
+                "lastScanJobId": "job-old",
+                "tablesApproved": 7,
+            },
+        }
+        client = _mock_smus_for_rescan([])
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {"status": "REJECTING"}
+        msg = worker.BulkReviewMessage(
+            namespace_id=_NAMESPACE_ID, source_id=_SOURCE_ID, decision="REJECTED", is_rescan=True
+        )
+        with (
+            patch(self._DAO_PATCH, return_value=mock_dao),
+            patch.object(worker, "_read_backup", return_value=backup),
+        ):
+            worker.process_bulk_review(
+                msg=msg,
+                client=client,
+                project_id="proj-123",
+                sources_table="test-sources",
+                region="us-east-1",
+                scan_jobs_table="test-scan-jobs",
+            )
+        fields = next(c for c in mock_dao.update.call_args_list if "tablesApproved" in c.args[1]).args[1]
+        assert fields["status"] == "APPROVED", "reject must still complete"
+        assert "tablesDiscovered" not in fields, "bad value skipped, not written as 0"
+        # The rest of the summary still restores.
+        assert fields["discoveredSchemas"] == ["db_old"]
+        assert fields["lastScanJobId"] == "job-old"
+        assert fields["tablesApproved"] == 7
+
+    # ── backup lifecycle: presence of the blob == an OPEN un-approved re-scan ──
+    # The backup is the durable "last approved" snapshot; a later re-scan
+    # reconstructs the approved baseline from it. So it MUST be cleared once the
+    # review is resolved (approve or reject) and MUST survive a failed resolution.
+
+    def test_rescan_reject_clears_backup_on_success(self):
+        backup = {"removed_tables": [], "added_tables": [], "removed_columns": {}, "modified_backup": {}}
+        client = _mock_smus_for_rescan([])
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {"status": "REJECTING"}
+        msg = worker.BulkReviewMessage(
+            namespace_id=_NAMESPACE_ID, source_id=_SOURCE_ID, decision="REJECTED", is_rescan=True
+        )
+        with (
+            patch(self._DAO_PATCH, return_value=mock_dao),
+            patch.object(worker, "_read_backup", return_value=backup),
+            patch.object(worker, "_delete_backup") as mock_delete,
+        ):
+            worker.process_bulk_review(
+                msg=msg,
+                client=client,
+                project_id="proj-123",
+                sources_table="test-sources",
+                region="us-east-1",
+                scan_jobs_table="test-scan-jobs",
+            )
+        mock_delete.assert_called_once_with(_SOURCE_ID)
+
+    def test_rescan_reject_failure_leaves_backup(self):
+        # Restore failed: leave the source in REJECTION_FAILED and KEEP the backup
+        # so the restore can be retried.
+        backup = {"removed_tables": [], "added_tables": ["db.newt"], "removed_columns": {}, "modified_backup": {}}
+        client = _mock_smus_for_rescan([])
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {"status": "REJECTING"}
+        msg = worker.BulkReviewMessage(
+            namespace_id=_NAMESPACE_ID, source_id=_SOURCE_ID, decision="REJECTED", is_rescan=True
+        )
+        with (
+            patch(self._DAO_PATCH, return_value=mock_dao),
+            patch.object(worker, "_read_backup", return_value=backup),
+            patch.object(worker, "_process_rescan_reject", return_value=["db.newt"]),
+            patch.object(worker, "_delete_backup") as mock_delete,
+        ):
+            result = worker.process_bulk_review(
+                msg=msg,
+                client=client,
+                project_id="proj-123",
+                sources_table="test-sources",
+                region="us-east-1",
+                scan_jobs_table="test-scan-jobs",
+            )
+        assert result.tables_failed == ["db.newt"]
+        mock_delete.assert_not_called()
+        final = next(c for c in mock_dao.update.call_args_list if "tablesApproved" in c.args[1])
+        assert final.args[1]["status"] == "REJECTION_FAILED"
+
+    def test_rescan_approve_clears_backup_on_terminal_success(self):
+        backup = {"removed_tables": [], "added_tables": [], "removed_columns": {}, "modified_backup": {}}
+        live = [_make_table(table_name="orders", status="PENDING_REVIEW")]
+        client = _mock_smus_for_rescan(live)
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {"status": "APPROVING"}
+        msg = worker.BulkReviewMessage(
+            namespace_id=_NAMESPACE_ID, source_id=_SOURCE_ID, decision="APPROVED", is_rescan=True
+        )
+        with (
+            patch(self._DAO_PATCH, return_value=mock_dao),
+            patch.object(worker, "_read_backup", return_value=backup),
+            patch.object(worker, "_delete_backup") as mock_delete,
+        ):
+            result = worker.process_bulk_review(
+                msg=msg,
+                client=client,
+                project_id="proj-123",
+                sources_table="test-sources",
+                region="us-east-1",
+                scan_jobs_table="test-scan-jobs",
+            )
+        assert result.tables_failed == []
+        mock_delete.assert_called_once_with(_SOURCE_ID)
+
+    def test_rescan_approve_continuation_does_not_clear_backup(self):
+        # An intermediate (paged) invocation enqueues a continuation and must NOT
+        # clear the backup — the review is not yet resolved.
+        tables = [_make_table(table_name=f"t{i}", status="PENDING_REVIEW") for i in range(150)]
+        client = _make_paginated_client(tables)
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {"status": "APPROVING"}
+        mock_sqs = MagicMock()
+        msg = worker.BulkReviewMessage(
+            namespace_id=_NAMESPACE_ID, source_id=_SOURCE_ID, decision="APPROVED", is_rescan=True
+        )
+        with (
+            patch.object(worker, "_PAGE_TABLE_BUDGET", 100),
+            patch(self._DAO_PATCH, return_value=mock_dao),
+            patch.object(worker, "_get_sqs", return_value=mock_sqs),
+            patch.object(worker, "_REVIEW_QUEUE_URL", "test-review-queue"),
+            patch.object(worker, "_delete_backup") as mock_delete,
+        ):
+            worker.process_bulk_review(
+                msg=msg,
+                client=client,
+                project_id="proj-123",
+                sources_table="test-sources",
+                region="us-east-1",
+                scan_jobs_table="test-scan-jobs",
+            )
+        assert mock_sqs.send_message.call_count == 1  # continuation enqueued
+        mock_delete.assert_not_called()
+
+    def test_delete_backup_noop_without_bucket(self):
+        mock_client = MagicMock()
+        with (
+            patch.object(worker, "_BUCKET_NAME", ""),
+            patch.object(worker, "get_s3_client", return_value=mock_client),
+        ):
+            worker._delete_backup(_SOURCE_ID)
+        mock_client.delete_object.assert_not_called()
+
+    def test_delete_backup_swallows_s3_error(self):
+        mock_client = MagicMock()
+        mock_client.delete_object.side_effect = RuntimeError("boom")
+        with (
+            patch.object(worker, "_BUCKET_NAME", "bucket"),
+            patch.object(worker, "get_s3_client", return_value=mock_client),
+        ):
+            worker._delete_backup(_SOURCE_ID)  # must not raise
+        mock_client.delete_object.assert_called_once()
+
+
+# ===================================================================
+# REVIEW event rows — the Scan History audit trail (store-backed)
+# ===================================================================
+
+
+@pytest.mark.unit
+class TestReviewScanJobWrite:
+    """A terminal approve/reject appends one REVIEW row to the scan-jobs table.
+
+    ``DynamoDBDAO`` is patched to a single mock, so both the sources-table
+    ``update`` and the scan-jobs ``put`` land on it; the review row is the only
+    ``put`` on these paths, so ``mock_dao.put`` isolates it.
+    """
+
+    _DAO_PATCH = "coa_sources.database.bulk_review.worker.DynamoDBDAO"
+    _SCAN_JOBS_TABLE = "test-scan-jobs"
+
+    def _run(
+        self,
+        *,
+        decision: str,
+        transient_status: str,
+        is_rescan: bool = False,
+        scan_jobs_table: str = _SCAN_JOBS_TABLE,
+        backup: dict | None = None,
+    ) -> MagicMock:
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {"status": transient_status}
+        # A single PENDING table so a non-rescan approve/reject has something to write.
+        client = _mock_smus_for_rescan([_make_table(table_name="t1", status="PENDING_REVIEW")])
+        msg = worker.BulkReviewMessage(
+            namespace_id=_NAMESPACE_ID, source_id=_SOURCE_ID, decision=decision, is_rescan=is_rescan
+        )
+        with (
+            patch(self._DAO_PATCH, return_value=mock_dao),
+            patch.object(worker, "_read_backup", return_value=backup),
+        ):
+            worker.process_bulk_review(
+                msg=msg,
+                client=client,
+                project_id="proj-123",
+                sources_table="test-sources",
+                region="us-east-1",
+                scan_jobs_table=scan_jobs_table,
+            )
+        return mock_dao
+
+    @staticmethod
+    def _review_row(mock_dao: MagicMock) -> dict:
+        assert mock_dao.put.call_count == 1, "expected exactly one REVIEW row write"
+        return mock_dao.put.call_args.args[0]
+
+    def test_approve_writes_review_row(self):
+        row = self._review_row(self._run(decision="APPROVED", transient_status="APPROVING"))
+        assert row["PK"] == f"SRC#{_SOURCE_ID}"
+        assert row["eventType"] == "REVIEW"
+        assert row["decision"] == "APPROVED"
+        assert row["isRescan"] is False
+        assert row["status"] == "APPROVED"
+        assert row["namespaceId"] == _NAMESPACE_ID
+        assert row["tablesApproved"] == 1
+        # SK doubles as the timestamp columns.
+        assert row["SK"] == row["createdAt"] == row["startedAt"]
+
+    def test_reject_writes_review_row(self):
+        row = self._review_row(self._run(decision="REJECTED", transient_status="REJECTING"))
+        assert row["eventType"] == "REVIEW"
+        assert row["decision"] == "REJECTED"
+        assert row["isRescan"] is False
+        assert row["status"] == "REJECTED"
+        assert row["tablesApproved"] == 0
+
+    def test_rescan_approve_writes_review_row_flagged_rescan(self):
+        backup = {"removed_tables": [], "added_tables": [], "removed_columns": {}, "modified_backup": {}}
+        row = self._review_row(
+            self._run(decision="APPROVED", transient_status="APPROVING", is_rescan=True, backup=backup)
+        )
+        assert row["eventType"] == "REVIEW"
+        assert row["decision"] == "APPROVED"
+        assert row["isRescan"] is True
+        assert row["status"] == "APPROVED"
+
+    def test_rescan_reject_writes_review_row_flagged_rescan(self):
+        # Re-scan reject restores the pre-rescan state and lands back on APPROVED.
+        backup = {"removed_tables": [], "added_tables": [], "removed_columns": {}, "modified_backup": {}}
+        row = self._review_row(
+            self._run(decision="REJECTED", transient_status="REJECTING", is_rescan=True, backup=backup)
+        )
+        assert row["eventType"] == "REVIEW"
+        assert row["decision"] == "REJECTED"
+        assert row["isRescan"] is True
+        assert row["status"] == "APPROVED"
+
+    def test_no_review_row_when_scan_jobs_table_unset(self):
+        # Best-effort: with no table configured the audit write is skipped and
+        # the review still completes (the sources-table update still happens).
+        mock_dao = self._run(decision="APPROVED", transient_status="APPROVING", scan_jobs_table="")
+        mock_dao.put.assert_not_called()
+        assert any("tablesApproved" in c.args[1] for c in mock_dao.update.call_args_list)
+
+    def test_review_row_write_failure_does_not_fail_review(self):
+        # A raising put must be swallowed — the terminal source update is already done.
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {"status": "APPROVING"}
+        mock_dao.put.side_effect = RuntimeError("ddb down")
+        client = _mock_smus_for_rescan([_make_table(table_name="t1", status="PENDING_REVIEW")])
+        msg = worker.BulkReviewMessage(namespace_id=_NAMESPACE_ID, source_id=_SOURCE_ID, decision="APPROVED")
+        with patch(self._DAO_PATCH, return_value=mock_dao):
+            result = worker.process_bulk_review(
+                msg=msg,
+                client=client,
+                project_id="proj-123",
+                sources_table="test-sources",
+                region="us-east-1",
+                scan_jobs_table=self._SCAN_JOBS_TABLE,
+            )
+        assert result.tables_failed == []
+        final = next(c for c in mock_dao.update.call_args_list if "tablesApproved" in c.args[1])
+        assert final.args[1]["status"] == "APPROVED"

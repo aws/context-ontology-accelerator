@@ -8,6 +8,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from coa_serve.deadline import Deadline
 from coa_serve.exceptions import AccessDeniedError
 from coa_serve.tier2.nl_to_sql.strategy import NLtoSQLStrategy
 from coa_serve.tier2.strategy import MAX_RESULT_ROWS, StrategyContext, StrategyOption, StrategyResult
@@ -550,3 +551,209 @@ class TestNLtoSQLStrategyResolve:
 
         generate_kwargs = sql_generator.generate.call_args[1]
         assert len(generate_kwargs["evidence"]) == 500
+
+
+def _make_context_with_deadline(budget_s: float) -> StrategyContext:
+    """A StrategyContext carrying a request-scoped deadline (A0)."""
+    ctx = _make_context()
+    ctx.deadline = Deadline.from_budget(budget_s, None)
+    return ctx
+
+
+@pytest.mark.unit
+class TestNLtoSQLStrategyDeadline:
+    """A4/A6 — the correction shot and executor timeout become deadline-aware.
+
+    The invariant under test: a request-scoped deadline never STARTS a second
+    generate→execute cycle it cannot finish (which is what 504s the caller after
+    a usable first-shot answer already exists), while the pre-A0 behaviour — no
+    deadline, or an ample one — is preserved exactly.
+    """
+
+    @pytest.fixture
+    def sql_generator(self):
+        return AsyncMock()
+
+    @pytest.fixture
+    def firewall(self):
+        return MagicMock()
+
+    @pytest.fixture
+    def query_executor(self):
+        return AsyncMock()
+
+    @pytest.fixture
+    def strategy(self, sql_generator, firewall, query_executor):
+        return NLtoSQLStrategy(
+            sql_generator=sql_generator,
+            firewall=firewall,
+            query_executor=query_executor,
+            oss_ontology_index="test-index",
+        )
+
+    @pytest.mark.asyncio
+    async def test_exhausted_deadline_skips_correction_returns_empty_fallback(
+        self, strategy, sql_generator, firewall, query_executor
+    ):
+        # Shot 1 returns a clean zero-row result that WOULD normally trigger a
+        # correction (no user literal). With an already-exhausted budget the
+        # correction is skipped and the verified-empty first-shot result is
+        # returned instead of overrunning the ceiling and 504-ing.
+        sql_generator.generate.return_value = _make_nl_to_sql_result(
+            sql="SELECT count(*) FROM orders o JOIN customers c ON o.id = c.id"
+        )
+        firewall.evaluate.return_value = _make_firewall_result(
+            authorized_sql="SELECT count(*) FROM orders o JOIN customers c ON o.id = c.id"
+        )
+        query_executor.execute.return_value = _make_exec_result(rows=[], row_count=0)
+        # 1s budget — the first shot's own elapsed time already exceeds what's
+        # left, so a second shot cannot fit.
+        context = _make_context_with_deadline(1.0)
+
+        result = await strategy.resolve("how many orders", "ns1", context)
+
+        assert result is not None
+        assert result.row_count == 0  # the clean empty first-shot result
+        sql_generator.correct.assert_not_called()
+        assert query_executor.execute.call_count == 1
+        # The skip is observable in the trace as a reasoned skipped step.
+        skipped = [s for s in context.trace.steps if s.step == "t2.sql.generate" and s.status == "skipped"]
+        assert skipped, "deadline skip must record an observable skipped step"
+        # Trace-latency invariant: a step that did NOT run reports 0ms duration and
+        # carries NO latency-looking / budget-derived number in its detail. Step
+        # latency reflects real elapsed time only; the budget is an independent
+        # dimension. Guards against re-mixing seconds into a non-event step.
+        skip_step = skipped[0]
+        assert skip_step.duration_ms == 0
+        detail = skip_step.detail if isinstance(skip_step.detail, dict) else {}
+        assert detail.get("reason") == "deadline_insufficient_for_correction"
+        assert "lastShotSeconds" not in detail
+        assert "remainingSeconds" not in detail
+
+    @pytest.mark.asyncio
+    async def test_exhausted_deadline_on_exec_error_returns_none(
+        self, strategy, sql_generator, firewall, query_executor
+    ):
+        # Execution error with an exhausted budget: no clean fallback exists, so
+        # the strategy skips the correction and returns None (fall through to the
+        # next strategy) rather than starting a shot that cannot return.
+        sql_generator.generate.return_value = _make_nl_to_sql_result()
+        firewall.evaluate.return_value = _make_firewall_result()
+        query_executor.execute.side_effect = Exception("boom")
+        context = _make_context_with_deadline(1.0)
+
+        result = await strategy.resolve("query", "ns1", context)
+
+        assert result is None
+        sql_generator.correct.assert_not_called()
+        assert query_executor.execute.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_ample_deadline_still_self_corrects(self, strategy, sql_generator, firewall, query_executor):
+        # REGRESSION GUARD for the 170s AgentCore/Playground path: with an ample
+        # budget the second shot always fits, so self-correction fires exactly as
+        # before A0. This is the behaviour we must NOT break.
+        sql_generator.generate.return_value = _make_nl_to_sql_result(
+            sql="SELECT count(*) FROM orders o JOIN customers c ON o.id = c.id"
+        )
+        sql_generator.correct.return_value = ("SELECT count(*) FROM orders", 0.8)
+        firewall.evaluate.side_effect = [
+            _make_firewall_result(authorized_sql="SELECT count(*) FROM orders o JOIN customers c ON o.id = c.id"),
+            _make_firewall_result(authorized_sql="SELECT count(*) FROM orders"),
+        ]
+        query_executor.execute.side_effect = [
+            _make_exec_result(rows=[], row_count=0),
+            _make_exec_result(rows=[{"count": 5}], row_count=5),
+        ]
+        context = _make_context_with_deadline(170.0)
+
+        result = await strategy.resolve("how many orders", "ns1", context)
+
+        assert result is not None
+        assert result.row_count == 5
+        sql_generator.correct.assert_called_once()
+        assert query_executor.execute.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_no_deadline_preserves_pre_a0_correction(self, strategy, sql_generator, firewall, query_executor):
+        # No deadline threaded (context.deadline is None) → the correction is
+        # unconditional, identical to the pre-A0 code path.
+        sql_generator.generate.return_value = _make_nl_to_sql_result(
+            sql="SELECT count(*) FROM orders o JOIN customers c ON o.id = c.id"
+        )
+        sql_generator.correct.return_value = ("SELECT count(*) FROM orders", 0.8)
+        firewall.evaluate.side_effect = [
+            _make_firewall_result(authorized_sql="SELECT count(*) FROM orders o JOIN customers c ON o.id = c.id"),
+            _make_firewall_result(authorized_sql="SELECT count(*) FROM orders"),
+        ]
+        query_executor.execute.side_effect = [
+            _make_exec_result(rows=[], row_count=0),
+            _make_exec_result(rows=[{"count": 5}], row_count=5),
+        ]
+        context = _make_context()  # no deadline
+        assert context.deadline is None
+
+        result = await strategy.resolve("how many orders", "ns1", context)
+
+        assert result.row_count == 5
+        sql_generator.correct.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_executor_timeout_default_without_deadline(self, strategy, sql_generator, firewall, query_executor):
+        # No deadline → the historical fixed 35s executor timeout is preserved.
+        sql_generator.generate.return_value = _make_nl_to_sql_result()
+        firewall.evaluate.return_value = _make_firewall_result()
+        query_executor.execute.return_value = _make_exec_result()
+
+        await strategy.resolve("query", "ns1", _make_context())
+
+        assert query_executor.execute.call_args[1]["timeout_seconds"] == 35
+
+    @pytest.mark.asyncio
+    async def test_executor_timeout_clamped_to_remaining_budget(
+        self, strategy, sql_generator, firewall, query_executor
+    ):
+        # A tight deadline shrinks the per-statement executor timeout below 35s so
+        # a single statement cannot itself overrun the request budget. Value is an
+        # int (executor contract) and never exceeds the 35s default.
+        import structlog
+
+        sql_generator.generate.return_value = _make_nl_to_sql_result()
+        firewall.evaluate.return_value = _make_firewall_result()
+        query_executor.execute.return_value = _make_exec_result()
+
+        with structlog.testing.capture_logs() as logs:
+            await strategy.resolve("query", "ns1", _make_context_with_deadline(10.0))
+
+        timeout = query_executor.execute.call_args[1]["timeout_seconds"]
+        assert isinstance(timeout, int)
+        assert 1 <= timeout < 35  # derived from ~10s budget minus margin
+        # A below-default clamp is surfaced so a mis-tuned margin/floor is visible.
+        assert any(e.get("event") == "nl_to_sql_exec_timeout_clamped" for e in logs)
+
+    @pytest.mark.asyncio
+    async def test_execute_step_latency_is_measured_not_the_cap(
+        self, strategy, sql_generator, firewall, query_executor
+    ):
+        # Trace-latency invariant (executor side): even when a tight deadline caps
+        # timeout_seconds below 35, the recorded t2.sql.execute latency is the REAL
+        # elapsed time of the call, never the cap value. Budget shapes the cap;
+        # it must not become a fabricated latency number.
+        import asyncio as _asyncio
+
+        async def _slow_exec(*_args, **_kwargs):
+            await _asyncio.sleep(0.05)  # 50ms real work
+            return _make_exec_result()
+
+        sql_generator.generate.return_value = _make_nl_to_sql_result()
+        firewall.evaluate.return_value = _make_firewall_result()
+        query_executor.execute.side_effect = _slow_exec
+
+        context = _make_context_with_deadline(10.0)
+        await strategy.resolve("query", "ns1", context)
+
+        exec_steps = [s for s in context.trace.steps if s.step == "t2.sql.execute"]
+        assert exec_steps
+        # ~50ms measured, NOT the multi-second timeout cap. Generous upper bound
+        # to stay non-flaky while still excluding any cap-derived value.
+        assert 0 <= exec_steps[0].duration_ms < 1000

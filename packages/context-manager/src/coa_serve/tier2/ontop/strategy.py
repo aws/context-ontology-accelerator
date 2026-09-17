@@ -130,6 +130,10 @@ class OntopStrategy:
             raise AccessDeniedError(tier2_result.firewall_result.reason)
 
         if tier2_result.query_result and not tier2_result.error:
+            # The VKG translate response names the ontology version it executed
+            # against (owl:versionInfo). "unknown" is the service's own
+            # missing-value sentinel, not a version — normalize it away (#986).
+            vkg_version = tier2_result.vkg_result.ontology_version if tier2_result.vkg_result else ""
             return StrategyResult(
                 sql=tier2_result.vkg_result.sql if tier2_result.vkg_result else "",
                 rows=tier2_result.query_result.rows,
@@ -141,6 +145,7 @@ class OntopStrategy:
                 sparql=sparql_result.sparql,
                 row_count=tier2_result.query_result.row_count,
                 truncated=tier2_result.query_result.truncated,
+                ontology_version="" if vkg_version == "unknown" else vkg_version,
             )
 
         return None

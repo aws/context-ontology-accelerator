@@ -48,6 +48,14 @@ export interface VkgStackProps extends cdk.StackProps {
   /** Container port for the Ontop SPARQL endpoint (default: 8080). */
   readonly containerPort?: number;
 
+  /**
+   * JVM args for the Ontop launcher, passed via ONTOP_JAVA_ARGS (NOT JAVA_OPTS,
+   * which the launcher ignores). Default "-Xmx1536m -Xms512m". Applied to both
+   * the CDK-provisioned service and the per-namespace reload Lambda so they
+   * stay in sync.
+   */
+  readonly ontopJavaArgs?: string;
+
   /** Alarm action strategy for monitoring alarms. */
   readonly alarmAction?: IAlarmActionStrategy;
 }
@@ -86,6 +94,17 @@ export class VkgStack extends SCLStack {
 
     const cpu = props.cpu ?? 1024;
     const memoryLimitMiB = props.memoryLimitMiB ?? 2048;
+    // Ontop heap. The launcher reads ONTOP_JAVA_ARGS (NOT JAVA_OPTS) — see
+    // packages/vkg/entrypoint.sh. When not overridden, derive from task memory
+    // (max heap ~= 75%, initial ~= 25%) so raising memoryLimitMiB alone scales
+    // the heap in step, leaving headroom for the JVM, H2, and the Python facade
+    // (#149 causes B/C). This same value is handed to the reload Lambda so
+    // per-namespace reloads and the CDK-provisioned service stay in lockstep
+    // from one source of truth.
+    const ontopJavaArgs =
+      props.ontopJavaArgs ??
+      `-Xmx${Math.max(512, Math.floor((memoryLimitMiB * 3) / 4))}m ` +
+        `-Xms${Math.max(256, Math.floor(memoryLimitMiB / 4))}m`;
     this.containerPort = props.containerPort ?? 8080;
     const namespace = props.serviceNamespace;
     const cloudMapNamespaceName = namespace.namespaceName;
@@ -149,7 +168,7 @@ export class VkgStack extends SCLStack {
         ONTOLOGY_BUCKET: this.ontologyBucket.bucketName,
         ONTOLOGY_PREFIX: "ontologies/",
         ENDPOINT_PORT: String(this.containerPort),
-        JAVA_OPTS: "-Xmx1024m -Xms512m",
+        ONTOP_JAVA_ARGS: ontopJavaArgs,
       },
       portMappings: [
         {
@@ -239,6 +258,12 @@ export class VkgStack extends SCLStack {
           .subnetIds.join(","),
         ECS_SECURITY_GROUP_ID: ecsSecurityGroup.securityGroupId,
         VKG_IMAGE_PARAM_NAME: vkgImageParam.parameterName,
+        // Keep per-namespace reload task sizing in lockstep with the CDK
+        // service above (#149 causes B/C). One source of truth for cpu/memory
+        // and Ontop heap.
+        VKG_TASK_CPU: String(cpu),
+        VKG_TASK_MEMORY: String(memoryLimitMiB),
+        VKG_ONTOP_JAVA_ARGS: ontopJavaArgs,
       },
       timeout: cdk.Duration.seconds(30),
       reservedConcurrentExecutions: reservedConcurrency,
