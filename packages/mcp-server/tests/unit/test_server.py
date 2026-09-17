@@ -438,12 +438,8 @@ class TestQueryTool:
     @pytest.mark.asyncio
     async def test_forwards_new_smithy_inputs(self, monkeypatch, _local_dev):
         """execute + dimensions + mode — Smithy inputs the previous signature
-        dropped — now reach the helper.
-
-        ``timeoutMs`` is intentionally not in the MCP tool signature — CM has
-        no reader for ``options.timeoutMs`` today, so accepting it would
-        silently no-op. Pin its absence so a future revert doesn't reintroduce
-        the silent-ignore that MR !939 comment ``b6dea1de`` flagged.
+        dropped — now reach the helper. ``timeoutMs`` is absent from the
+        captured kwargs when the caller does not pass it (default None).
         """
         captured: dict = {}
 
@@ -463,7 +459,23 @@ class TestQueryTool:
         assert captured["execute"] is False
         assert captured["mode"] == "deep-reasoning"
         assert captured["dimensions"] == [{"name": "region", "value": "us-east"}]
-        assert "timeout_ms" not in captured
+        # Not passed -> forwarded as None (helper then omits it from the payload).
+        assert captured.get("timeout_ms") is None
+
+    @pytest.mark.asyncio
+    async def test_forwards_timeout_ms(self, monkeypatch, _local_dev):
+        """issue #185: the ``query`` tool now accepts Smithy ``timeoutMs`` and
+        hands it to the helper as ``timeout_ms`` so an MCP caller can lower the
+        deadline — the MCP half the issue said 'declines to forward it'."""
+        captured: dict = {}
+
+        async def fake_delegate(cm, query_text, ns, profile, token, **kwargs):
+            captured.update(kwargs)
+            return {"result": {}}
+
+        monkeypatch.setattr(server.execution, "execute_query", fake_delegate)
+        await server.query(None, "hi", "sales", timeoutMs=5000)
+        assert captured["timeout_ms"] == 5000
 
     @pytest.mark.asyncio
     async def test_backend_error_reraised(self, monkeypatch, _local_dev):
@@ -583,3 +595,42 @@ class TestGraphTraversalTool:
             relationshipFilter=["skos:related"],
         )
         assert captured["relationship_filter"] == ["skos:related"]
+
+
+@pytest.mark.unit
+class TestQueryToolStrategySchema:
+    """``strategy`` must reach the published tool schema as an optional enum.
+
+    The type hint alone is not the contract — FastMCP derives the JSON schema the
+    agent actually sees. If ``strategy`` were typed ``str`` the schema would carry no
+    constraint, and an agent inventing a plausible value would get the cheap fallback
+    chain: serve treats an unrecognised strategy as "no pin" and silently runs
+    DEFAULT_STRATEGY.
+    """
+
+    @pytest.mark.asyncio
+    async def test_strategy_is_an_optional_enum_in_the_tool_schema(self):
+        from coa_mcp import server as server_mod
+
+        tools = await server_mod.mcp.list_tools()
+        query_tool = next(t for t in tools if t.name == "query")
+        schema = query_tool.inputSchema
+
+        # Optional: absent from `required`, and defaulted so omitting it is valid.
+        assert "strategy" not in schema.get("required", [])
+
+        prop = schema["properties"]["strategy"]
+        # Nullable enum shape: anyOf[{enum: [...]}, {type: "null"}].
+        enum_values = next(
+            (branch["enum"] for branch in prop["anyOf"] if "enum" in branch),
+            None,
+        )
+        assert enum_values is not None, f"strategy is not an enum in the schema: {prop}"
+        assert set(enum_values) == {
+            "best",
+            "ontop",
+            "nl_to_sql",
+            "ontop_first",
+            "nl_to_sql_first",
+            "deep-reasoning",
+        }

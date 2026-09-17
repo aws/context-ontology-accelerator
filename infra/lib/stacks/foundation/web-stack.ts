@@ -100,6 +100,14 @@ export interface WebStackProps extends cdk.StackProps {
   readonly autoWebAclParam?: { readonly name: string; readonly region: string };
   /** AgentCore Runtime ARN for SSE streaming queries. */
   readonly serveRuntimeArn?: string;
+  /**
+   * Fully custom Content-Security-Policy header value, replacing the derived
+   * one. Wired from the `content_security_policy` CDK context key in
+   * `bin/app.ts` — the escape hatch existed on {@link PublicUIConstructProps}
+   * but reached nothing, so extending the policy meant patching CDK source
+   * (issue #130).
+   */
+  readonly contentSecurityPolicy?: string;
 }
 
 /**
@@ -150,6 +158,16 @@ export class WebStack extends SCLStack {
           `${ssmPrefix}/userpool-id`,
         )
       : "";
+    // Hosted-UI domain prefix, for the CSP. Same Cognito-only gate as above:
+    // the OIDC branch of the auth stack provisions no hosted UI, so there is no
+    // parameter to read and nothing to allowlist (a direct-OIDC deployment's
+    // token endpoint is on its own authority, already covered).
+    const cognitoDomainPrefix = props.isCognitoMode
+      ? ssm.StringParameter.valueForStringParameter(
+          this,
+          `${ssmPrefix}/cognito-domain-prefix`,
+        )
+      : undefined;
 
     const uiDomainName = props.customDomain?.uiDomainName;
     const uiCertificateArn = props.customDomain?.uiCertificateArn;
@@ -215,6 +233,10 @@ export class WebStack extends SCLStack {
       websiteContentPath: props.websiteContentPath,
       runtimeConfig,
       webAclId: resolvedWebAclId,
+      ...(cognitoDomainPrefix && { cognitoDomainPrefix }),
+      ...(props.contentSecurityPolicy && {
+        contentSecurityPolicy: props.contentSecurityPolicy,
+      }),
       ...(uiDomainName &&
         uiCertificateArn && { uiDomainName, uiCertificateArn }),
     });

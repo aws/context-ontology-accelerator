@@ -309,10 +309,50 @@ apply UpdateSourceTableKeys @examples([
     }
 ])
 
+apply KeepRescanRemoval @examples([
+    {
+        title: "Keep a table the re-scan flagged as removed"
+        input: { namespaceId: "3f2504e0-4f89-41d3-9a0c-0305e82c3301", sourceId: "src-7f3a9c1e", tableId: "sales.legacy_orders" }
+        output: { tableId: "sales.legacy_orders", pendingDeletion: false }
+    }
+    {
+        title: "Keep a single column the re-scan flagged as removed"
+        input: { namespaceId: "3f2504e0-4f89-41d3-9a0c-0305e82c3301", sourceId: "src-7f3a9c1e", tableId: "sales.orders", columnName: "legacy_region_code" }
+        output: { tableId: "sales.orders", columnName: "legacy_region_code", pendingDeletion: false }
+    }
+])
+
 apply GetSourceScanJob @examples([
     {
         title: "Get the status of a completed scan job"
         input: { namespaceId: "3f2504e0-4f89-41d3-9a0c-0305e82c3301", sourceId: "src-7f3a9c1e", jobId: "job-8b21d4f0" }
         output: { jobId: "job-8b21d4f0", sourceId: "src-7f3a9c1e", status: "COMPLETED", tablesDiscovered: 12, tablesAdded: 2, tablesRemoved: 0, tablesModified: 1, startedAt: "2026-07-23T14:30:00Z", completedAt: "2026-07-23T14:35:00Z" }
+    }
+])
+
+apply ListSourceScanJobs @examples([
+    {
+        title: "List a source's scan and review history, newest first"
+        input: { namespaceId: "3f2504e0-4f89-41d3-9a0c-0305e82c3301", sourceId: "src-7f3a9c1e" }
+        output: {
+            items: [
+                {
+                    at: "2026-07-23T15:02:00Z"
+                    eventType: "REVIEW"
+                    status: "APPROVED"
+                    decision: "APPROVED"
+                    isRescan: false
+                    tablesApproved: 12
+                }
+                {
+                    at: "2026-07-23T14:30:00Z"
+                    eventType: "SCAN"
+                    status: "COMPLETED"
+                    scanType: "full"
+                    tablesDiscovered: 12
+                    completedAt: "2026-07-23T14:35:00Z"
+                }
+            ]
+        }
     }
 ])

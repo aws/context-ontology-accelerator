@@ -28,6 +28,7 @@ vi.mock("../../../src/api-hooks", () => ({
     mockUseUpdateSourceColumnMetadata(...args),
   useUpdateSourceTableKeys: (...args: unknown[]) =>
     mockUseUpdateSourceTableKeys(...args),
+  useKeepRescanRemoval: () => ({ mutate: vi.fn(), isPending: false }),
 }));
 
 vi.mock("@coa/control-plane-client", () => ({

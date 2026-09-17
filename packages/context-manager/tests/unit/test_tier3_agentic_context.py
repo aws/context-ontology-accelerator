@@ -389,3 +389,36 @@ class TestRelevanceRankedRefs:
 
     def test_relevant_refs_empty_when_no_chunks(self):
         assert AccumulatedContext().relevant_chunk_refs(limit=3) == []
+
+
+@pytest.mark.unit
+class TestRecentRowSnippets:
+    """Structured rows must be renderable for the planner's content view — the
+    blind spot where a rows-only answer was assessed as "no data gathered"."""
+
+    def test_renders_rows_bounded_and_spread(self):
+        ctx = AccumulatedContext()
+        ctx.add(ToolResult(rows=tuple({"d": f"2026-06-0{i}", "v": i} for i in range(1, 8))))
+        snips = ctx.recent_row_snippets(limit=3)
+        assert len(snips) == 3
+        # Evenly-spaced sample spans the WHOLE result (first and last included),
+        # so an ordered multi-day table doesn't read as a single-date slice.
+        assert "2026-06-01" in snips[0]
+        assert "2026-06-07" in snips[-1]
+
+    def test_small_result_returned_whole_in_order(self):
+        ctx = AccumulatedContext()
+        ctx.add(ToolResult(rows=({"d": "a"}, {"d": "b"})))
+        snips = ctx.recent_row_snippets(limit=5)
+        assert len(snips) == 2 and "'a'" in snips[0] and "'b'" in snips[1]
+
+    def test_cell_values_clipped_to_width(self):
+        ctx = AccumulatedContext()
+        ctx.add(ToolResult(rows=({"k": "x" * 500},)))
+        (snip,) = ctx.recent_row_snippets(width=50)
+        assert "x" * 50 in snip and "x" * 51 not in snip
+
+    def test_non_mapping_rows_skipped(self):
+        ctx = AccumulatedContext()
+        ctx.rows.append("not-a-dict")
+        assert ctx.recent_row_snippets() == []

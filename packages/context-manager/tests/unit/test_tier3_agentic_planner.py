@@ -315,6 +315,44 @@ class TestPlannerCallShape:
 
 
 @pytest.mark.unit
+class TestStructuredRowsVisibility:
+    """Rows gathered by structured tools must be visible to BOTH planner prompts.
+
+    Before this, only chunks/entities were rendered: a sub-question fully
+    answered by NL->SQL rows was assessed as "no data", the working answer
+    denied having data, and tool selection wandered into unrelated tools."""
+
+    @pytest.mark.asyncio
+    async def test_propose_prompt_reports_rows(self):
+        fake = FakeLLM(text='{"candidates": []}')
+        planner = BedrockStepPlanner(fake)
+        ctx = AccumulatedContext()
+        ctx.rows.extend([{"base_dt": "2026-06-01", "au": 63044}, {"base_dt": "2026-06-02", "au": 61890}])
+        await planner.propose_steps(sub_question=_sq(), context=ctx, tool_specs=_SPECS)
+        prompt = fake.calls[-1]["prompt"]
+        assert "2 structured data row(s)" in prompt
+        assert "2026-06-01" in prompt
+
+    @pytest.mark.asyncio
+    async def test_assess_prompt_carries_row_content(self):
+        fake = FakeLLM(text='{"sufficient": true, "answer": "ok"}')
+        planner = BedrockStepPlanner(fake)
+        ctx = AccumulatedContext()
+        ctx.rows.append({"country": "US", "revenue": 34317184})
+        await planner.assess(sub_question=_sq(), context=ctx)
+        prompt = fake.calls[-1]["prompt"]
+        assert "Structured data rows gathered" in prompt
+        assert "34317184" in prompt
+
+    @pytest.mark.asyncio
+    async def test_assess_without_rows_unchanged(self):
+        fake = FakeLLM(text='{"sufficient": false, "answer": ""}')
+        planner = BedrockStepPlanner(fake)
+        await planner.assess(sub_question=_sq(), context=AccumulatedContext())
+        assert "Structured data rows gathered" not in fake.calls[-1]["prompt"]
+
+
+@pytest.mark.unit
 class TestLazyImportInvariant:
     def test_importing_planner_does_not_import_graphrag(self):
         """``import ...agentic.planner`` must NOT import ``graphrag_toolkit``."""

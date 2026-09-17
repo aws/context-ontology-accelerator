@@ -9,8 +9,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from coa_common.domain_models import (
+    BusinessMetadata,
     Column,
     DiscoveredMetadata,
+    EnrichmentSource,
+    ReviewStatus,
     Table,
 )
 from coa_control_plane_server.models.source_status import SourceStatus
@@ -19,6 +22,7 @@ from coa_sources.database.connectors import get_connector
 from coa_sources.database.connectors.base import (
     ConnectionTestResult,
 )
+from coa_sources.database.errors import PermanentScanError, TransientScanError
 
 MODULE = "coa_sources.database.pipeline.discovery_handler"
 
@@ -119,6 +123,10 @@ class TestDiscoveryHandler:
             if "queryable" in c.kwargs.get("update_fields", {})
         ]
         assert queryable_updates == [True]
+        # A first scan must NOT write tablesApproved — doing so would clobber the
+        # create-time 0 and any per-table review increments. Only a re-scan
+        # recomputes it (see the rescan recompute test below).
+        assert all("tablesApproved" not in c.kwargs.get("update_fields", {}) for c in mock_ds_dao.update.call_args_list)
 
     @patch(f"{MODULE}.write_to_datazone")
     @patch(f"{MODULE}._get_ns_dao")
@@ -327,7 +335,7 @@ class TestDiscoveryHandler:
         mock_get_ds.return_value = mock_dao
         mock_get_scan.return_value = MagicMock()
 
-        with pytest.raises(RuntimeError, match="Data source not found"):
+        with pytest.raises(PermanentScanError, match="Data source not found"):
             handler(
                 {
                     "datasourceId": "DS#nonexistent",
@@ -352,7 +360,7 @@ class TestDiscoveryHandler:
         mock_get_ds.return_value = mock_dao
         mock_get_scan.return_value = MagicMock()
 
-        with pytest.raises(RuntimeError, match="Unsupported source type"):
+        with pytest.raises(PermanentScanError, match="Unsupported source type"):
             handler(
                 {
                     "datasourceId": "DS#unknown-1",
@@ -393,7 +401,7 @@ class TestDiscoveryHandler:
 
         with (
             patch.object(mod, "MAX_TABLES_PER_SOURCE", 2),
-            pytest.raises(RuntimeError, match="exceeding the limit"),
+            pytest.raises(PermanentScanError, match="exceeding the limit"),
         ):
             handler(
                 {"datasourceId": "DS#ds-1", "scanJobId": "SCAN#s", "namespaceId": "ns-1", "scanType": "full"},
@@ -409,6 +417,640 @@ class TestDiscoveryHandler:
             if "status" in c.kwargs.get("update_fields", {})
         ]
         assert SourceStatus.SCAN_FAILED in statuses
+
+    @patch(f"{MODULE}.BUCKET_NAME", "test-bucket")
+    @patch(f"{MODULE}.upload_json")
+    @patch(f"{MODULE}.get_s3_client")
+    @patch(f"{MODULE}.read_assets_for_datasource")
+    @patch(f"{MODULE}.write_to_datazone")
+    @patch(f"{MODULE}._get_ns_dao")
+    @patch(f"{MODULE}._get_scan_dao")
+    @patch(f"{MODULE}._get_ds_dao")
+    @patch(f"{MODULE}.get_connector")
+    def test_rescan_merges_onto_accepted_and_refreshes_source_summary(
+        self,
+        mock_get_connector,
+        mock_get_ds,
+        mock_get_scan,
+        mock_get_ns,
+        mock_write,
+        mock_read_accepted,
+        mock_s3_client,
+        mock_upload,
+    ):
+        """A re-scan (isRescan=True) merges the fresh scan onto the accepted
+        assets — preserving curated metadata, resetting only changed items to
+        PENDING_REVIEW — and refreshes the source summary to the fresh scan
+        (showing the previous scan's counts after a re-scan would be wrong; a
+        reject restores the pre-rescan counts from the backup)."""
+        from coa_sources.database.pipeline.discovery_handler import handler
+
+        mock_ds_dao = MagicMock()
+        mock_ds_dao.get.return_value = {
+            "sourceSubType": "GLUE_DATABASE",
+            "configuration": {"databaseName": "analytics_db", "catalogId": "123456789012", "region": "us-east-1"},
+        }
+        mock_get_ds.return_value = mock_ds_dao
+        mock_get_scan.return_value = MagicMock()
+        mock_get_ns.return_value = MagicMock(get=MagicMock(return_value={"dataZoneProjectId": "proj-1"}))
+        mock_write.return_value = {"assets_created": 0, "assets_revised": 1}
+
+        # Accepted (approved) asset: orders.total is steward-edited + APPROVED.
+        mock_read_accepted.return_value = [
+            Table(
+                name="orders",
+                database="analytics_db",
+                columns=[
+                    Column(
+                        name="total",
+                        data_type="decimal",
+                        business_metadata=BusinessMetadata(
+                            description="net total (steward)",
+                            enrichment_source=EnrichmentSource.STEWARD_EDITED,
+                            review_status=ReviewStatus.APPROVED,
+                        ),
+                    )
+                ],
+            )
+        ]
+
+        # Fresh scan: same table, column type changed decimal -> varchar.
+        connector = MagicMock()
+        connector.test_connection.return_value = ConnectionTestResult(success=True, message="OK", checks=[])
+        connector.discover_metadata.return_value = DiscoveredMetadata(
+            tables=[Table(name="orders", database="analytics_db", columns=[Column(name="total", data_type="varchar")])]
+        )
+        mock_get_connector.return_value = connector
+
+        handler(
+            {
+                "datasourceId": "DS#ds-1",
+                "scanJobId": "SCAN#s",
+                "namespaceId": "ns-1",
+                "scanType": "full",
+                "isRescan": True,
+            },
+            None,
+        )
+
+        # Accepted assets were read to compute the diff.
+        mock_read_accepted.assert_called_once()
+
+        # The write received the MERGED table: fresh type, preserved steward
+        # description, review reset to PENDING_REVIEW.
+        written = mock_write.call_args.kwargs["metadata"]
+        (table,) = written.tables
+        (col,) = table.columns
+        assert col.data_type == "varchar"
+        assert col.business_metadata.description == "net total (steward)"
+        assert col.business_metadata.review_status == ReviewStatus.PENDING_REVIEW
+
+        # The source summary IS refreshed to the fresh scan on a re-scan (showing
+        # the old scan's counts would be wrong). A reject restores the pre-rescan
+        # counts from the backup — covered in the worker tests.
+        summary_writes = [
+            c.kwargs.get("update_fields", {})
+            for c in mock_ds_dao.update.call_args_list
+            if "tablesDiscovered" in c.kwargs.get("update_fields", {})
+        ]
+        assert len(summary_writes) == 1
+        assert summary_writes[0]["tablesDiscovered"] == 1
+        assert summary_writes[0]["discoveredSchemas"] == ["analytics_db"]
+        assert "lastScanAt" in summary_writes[0]
+
+    @patch(f"{MODULE}.BUCKET_NAME", "test-bucket")
+    @patch(f"{MODULE}.upload_json")
+    @patch(f"{MODULE}.get_s3_client")
+    @patch(f"{MODULE}.read_assets_for_datasource")
+    @patch(f"{MODULE}.write_to_datazone")
+    @patch(f"{MODULE}._get_ns_dao")
+    @patch(f"{MODULE}._get_scan_dao")
+    @patch(f"{MODULE}._get_ds_dao")
+    @patch(f"{MODULE}.get_connector")
+    def test_rescan_writes_backup_of_changeset_before_merge(
+        self,
+        mock_get_connector,
+        mock_get_ds,
+        mock_get_scan,
+        mock_get_ns,
+        mock_write,
+        mock_read_accepted,
+        mock_s3_client,
+        mock_upload,
+    ):
+        """A re-scan with drift writes the backup blob (added/removed/modified
+        change-set + prior forms of modified tables) to S3, keyed per source,
+        before the merge overwrites any asset — so approve/reject can act on it."""
+        from coa_sources.database.pipeline.discovery_handler import handler
+        from coa_sources.database.rescan_backup import backup_s3_key
+
+        mock_ds_dao = MagicMock()
+        mock_ds_dao.get.return_value = {
+            "sourceSubType": "GLUE_DATABASE",
+            "configuration": {"databaseName": "analytics_db", "catalogId": "123456789012", "region": "us-east-1"},
+        }
+        mock_get_ds.return_value = mock_ds_dao
+        mock_get_scan.return_value = MagicMock()
+        mock_get_ns.return_value = MagicMock(get=MagicMock(return_value={"dataZoneProjectId": "proj-1"}))
+        mock_write.return_value = {"assets_created": 1, "assets_revised": 1}
+
+        # Accepted: orders (modified below) + legacy (removed below).
+        mock_read_accepted.return_value = [
+            Table(name="orders", database="analytics_db", columns=[Column(name="total", data_type="decimal")]),
+            Table(name="legacy", database="analytics_db", columns=[Column(name="x", data_type="int")]),
+        ]
+        # Fresh: orders type-changed, new_tbl added, legacy gone.
+        connector = MagicMock()
+        connector.test_connection.return_value = ConnectionTestResult(success=True, message="OK", checks=[])
+        connector.discover_metadata.return_value = DiscoveredMetadata(
+            tables=[
+                Table(name="orders", database="analytics_db", columns=[Column(name="total", data_type="varchar")]),
+                Table(name="new_tbl", database="analytics_db", columns=[Column(name="y", data_type="int")]),
+            ]
+        )
+        mock_get_connector.return_value = connector
+
+        handler(
+            {
+                "datasourceId": "DS#ds-1",
+                "scanJobId": "SCAN#s",
+                "namespaceId": "ns-1",
+                "scanType": "full",
+                "isRescan": True,
+            },
+            None,
+        )
+
+        mock_upload.assert_called_once()
+        # upload_json(client, bucket, key, blob) — called positionally.
+        _client, bucket, key, blob = mock_upload.call_args.args
+        assert bucket == "test-bucket"
+        assert key == backup_s3_key("ds-1")
+        assert blob["added_tables"] == ["analytics_db.new_tbl"]
+        assert blob["removed_tables"] == ["analytics_db.legacy"]
+        assert "analytics_db.orders" in blob["modified_backup"]
+
+    @patch(f"{MODULE}.BUCKET_NAME", "test-bucket")
+    @patch(f"{MODULE}.upload_json")
+    @patch(f"{MODULE}.get_s3_client")
+    @patch(f"{MODULE}.read_assets_for_datasource")
+    @patch(f"{MODULE}.write_to_datazone")
+    @patch(f"{MODULE}._get_ns_dao")
+    @patch(f"{MODULE}._get_scan_dao")
+    @patch(f"{MODULE}._get_ds_dao")
+    @patch(f"{MODULE}.get_connector")
+    def test_rescan_with_no_drift_writes_no_backup(
+        self,
+        mock_get_connector,
+        mock_get_ds,
+        mock_get_scan,
+        mock_get_ns,
+        mock_write,
+        mock_read_accepted,
+        mock_s3_client,
+        mock_upload,
+    ):
+        """A re-scan that finds no change writes no backup — there is nothing to
+        restore or delete, and no asset is overwritten."""
+        from coa_sources.database.pipeline.discovery_handler import handler
+
+        mock_ds_dao = MagicMock()
+        mock_ds_dao.get.return_value = {
+            "sourceSubType": "GLUE_DATABASE",
+            "configuration": {"databaseName": "analytics_db", "catalogId": "1", "region": "us-east-1"},
+        }
+        mock_get_ds.return_value = mock_ds_dao
+        mock_get_scan.return_value = MagicMock()
+        mock_get_ns.return_value = MagicMock(get=MagicMock(return_value={"dataZoneProjectId": "proj-1"}))
+        mock_write.return_value = {"assets_created": 0, "assets_revised": 0}
+
+        mock_read_accepted.return_value = [
+            Table(name="orders", database="analytics_db", columns=[Column(name="total", data_type="decimal")]),
+        ]
+        connector = MagicMock()
+        connector.test_connection.return_value = ConnectionTestResult(success=True, message="OK", checks=[])
+        connector.discover_metadata.return_value = DiscoveredMetadata(
+            tables=[Table(name="orders", database="analytics_db", columns=[Column(name="total", data_type="decimal")])]
+        )
+        mock_get_connector.return_value = connector
+
+        result = handler(
+            {
+                "datasourceId": "DS#ds-1",
+                "scanJobId": "SCAN#s",
+                "namespaceId": "ns-1",
+                "scanType": "full",
+                "isRescan": True,
+            },
+            None,
+        )
+
+        mock_upload.assert_not_called()
+        # No drift and no orphaned added tables → nothing to review, so enrichment
+        # returns the source straight to APPROVED.
+        assert result["reviewNeeded"] == "false"
+
+    @patch(f"{MODULE}.BUCKET_NAME", "test-bucket")
+    @patch(f"{MODULE}.upload_json")
+    @patch(f"{MODULE}.get_s3_client")
+    @patch(f"{MODULE}.read_assets_for_datasource")
+    @patch(f"{MODULE}.write_to_datazone")
+    @patch(f"{MODULE}._get_ns_dao")
+    @patch(f"{MODULE}._get_scan_dao")
+    @patch(f"{MODULE}._get_ds_dao")
+    @patch(f"{MODULE}.get_connector")
+    def test_rescan_recomputes_tables_approved_from_unchanged_approved(
+        self,
+        mock_get_connector,
+        mock_get_ds,
+        mock_get_scan,
+        mock_get_ns,
+        mock_write,
+        mock_read_accepted,
+        mock_s3_client,
+        mock_upload,
+    ):
+        """A drift re-scan refreshes tablesApproved to the post-merge live state:
+        the unchanged table keeps its approval, the drifted table is reset to
+        PENDING and drops out of the count. Without this the source row keeps the
+        stale pre-rescan count through the RESCAN_REVIEW window."""
+        from coa_sources.database.pipeline.discovery_handler import handler
+
+        mock_ds_dao = MagicMock()
+        mock_ds_dao.get.return_value = {
+            "sourceSubType": "GLUE_DATABASE",
+            "configuration": {"databaseName": "analytics_db", "catalogId": "1", "region": "us-east-1"},
+            "tablesApproved": 2,  # stale pre-rescan count: both tables were approved
+        }
+        mock_get_ds.return_value = mock_ds_dao
+        mock_get_scan.return_value = MagicMock()
+        mock_get_ns.return_value = MagicMock(get=MagicMock(return_value={"dataZoneProjectId": "proj-1"}))
+        mock_write.return_value = {"assets_created": 0, "assets_revised": 1}
+
+        # Two APPROVED tables. orders is unchanged in the fresh scan; customers
+        # drifts (column type int -> bigint) and so resets to PENDING on merge.
+        mock_read_accepted.return_value = [
+            Table(
+                name="orders",
+                database="analytics_db",
+                business_metadata=BusinessMetadata(review_status=ReviewStatus.APPROVED),
+                columns=[Column(name="total", data_type="decimal")],
+            ),
+            Table(
+                name="customers",
+                database="analytics_db",
+                business_metadata=BusinessMetadata(review_status=ReviewStatus.APPROVED),
+                columns=[Column(name="id", data_type="int")],
+            ),
+        ]
+        connector = MagicMock()
+        connector.test_connection.return_value = ConnectionTestResult(success=True, message="OK", checks=[])
+        connector.discover_metadata.return_value = DiscoveredMetadata(
+            tables=[
+                Table(name="orders", database="analytics_db", columns=[Column(name="total", data_type="decimal")]),
+                Table(name="customers", database="analytics_db", columns=[Column(name="id", data_type="bigint")]),
+            ]
+        )
+        mock_get_connector.return_value = connector
+
+        handler(
+            {
+                "datasourceId": "DS#ds-1",
+                "scanJobId": "SCAN#s",
+                "namespaceId": "ns-1",
+                "scanType": "full",
+                "isRescan": True,
+            },
+            None,
+        )
+
+        summary_writes = [
+            c.kwargs.get("update_fields", {})
+            for c in mock_ds_dao.update.call_args_list
+            if "tablesDiscovered" in c.kwargs.get("update_fields", {})
+        ]
+        assert len(summary_writes) == 1
+        assert summary_writes[0]["tablesDiscovered"] == 2
+        # Only the unchanged 'orders' stays approved; drifted 'customers' -> PENDING.
+        assert summary_writes[0]["tablesApproved"] == 1
+
+    @patch(f"{MODULE}.BUCKET_NAME", "test-bucket")
+    @patch(f"{MODULE}.upload_json")
+    @patch(f"{MODULE}.read_file_bytes")
+    @patch(f"{MODULE}.get_s3_client")
+    @patch(f"{MODULE}.read_assets_for_datasource")
+    @patch(f"{MODULE}.write_to_datazone")
+    @patch(f"{MODULE}._get_ns_dao")
+    @patch(f"{MODULE}._get_scan_dao")
+    @patch(f"{MODULE}._get_ds_dao")
+    @patch(f"{MODULE}.get_connector")
+    def test_rescan_open_review_diffs_against_approved_baseline_not_interim(
+        self,
+        mock_get_connector,
+        mock_get_ds,
+        mock_get_scan,
+        mock_get_ns,
+        mock_write,
+        mock_read_accepted,
+        mock_s3_client,
+        mock_read_bytes,
+        mock_upload,
+    ):
+        """A re-scan while a PRIOR re-scan is still un-approved must diff against
+        the APPROVED baseline (reconstructed from the existing backup blob), not
+        the interim live assets. Here the fresh scan equals the live interim, so a
+        diff-vs-live would wrongly find nothing; diff-vs-approved correctly
+        re-flags the prior re-scan's column and writes a fresh backup + merge."""
+        import json as _json
+
+        from coa_common.datazone_forms import serialize_form
+        from coa_sources.database.pipeline.discovery_handler import handler
+
+        mock_ds_dao = MagicMock()
+        mock_ds_dao.get.return_value = {
+            "sourceSubType": "GLUE_DATABASE",
+            "configuration": {"databaseName": "analytics_db", "catalogId": "1", "region": "us-east-1"},
+        }
+        mock_get_ds.return_value = mock_ds_dao
+        mock_get_scan.return_value = MagicMock()
+        mock_get_ns.return_value = MagicMock(get=MagicMock(return_value={"dataZoneProjectId": "proj-1"}))
+        mock_write.return_value = {"assets_created": 0, "assets_revised": 1}
+
+        # Approved pre-image captured in the existing backup blob: orders has [id].
+        approved_orders = Table(
+            name="orders",
+            database="analytics_db",
+            business_metadata=BusinessMetadata(review_status=ReviewStatus.APPROVED),
+            columns=[
+                Column(
+                    name="id",
+                    data_type="int",
+                    business_metadata=BusinessMetadata(review_status=ReviewStatus.APPROVED),
+                )
+            ],
+        )
+        backup = {
+            "version": 1,
+            "source_id": "ds-1",
+            "scan_job_sk": "sk-prev",
+            "removed_tables": [],
+            "added_tables": [],
+            "removed_columns": {},
+            "modified_backup": {"analytics_db.orders": serialize_form(approved_orders)},
+        }
+        mock_read_bytes.return_value = _json.dumps(backup).encode("utf-8")
+
+        # Live (interim) assets: the prior un-approved re-scan already added promo_code.
+        mock_read_accepted.return_value = [
+            Table(
+                name="orders",
+                database="analytics_db",
+                columns=[Column(name="id", data_type="int"), Column(name="promo_code", data_type="varchar")],
+            ),
+        ]
+        # Fresh scan #2 == the live interim (no *new* drift vs live).
+        connector = MagicMock()
+        connector.test_connection.return_value = ConnectionTestResult(success=True, message="OK", checks=[])
+        connector.discover_metadata.return_value = DiscoveredMetadata(
+            tables=[
+                Table(
+                    name="orders",
+                    database="analytics_db",
+                    columns=[Column(name="id", data_type="int"), Column(name="promo_code", data_type="varchar")],
+                )
+            ]
+        )
+        mock_get_connector.return_value = connector
+
+        handler(
+            {
+                "datasourceId": "DS#ds-1",
+                "scanJobId": "SCAN#s",
+                "namespaceId": "ns-1",
+                "scanType": "full",
+                "isRescan": True,
+                # A prior re-scan is still open in RESCAN_REVIEW, so the backup
+                # blob is the approved pre-image and MUST be read.
+                "hadOpenRescan": True,
+            },
+            None,
+        )
+
+        # Diff ran against the reconstructed approved baseline ([id]): promo_code is
+        # re-flagged, so a fresh backup is written and the merged orders (with
+        # promo_code) is written. A diff-vs-live would have found nothing and
+        # written neither.
+        mock_read_bytes.assert_called_once()  # backup was read (open review)
+        mock_upload.assert_called_once()
+        written = mock_write.call_args.kwargs["metadata"]
+        (table,) = written.tables
+        assert {c.name for c in table.columns} == {"id", "promo_code"}
+
+    @patch(f"{MODULE}.BUCKET_NAME", "test-bucket")
+    @patch(f"{MODULE}.upload_json")
+    @patch(f"{MODULE}.read_file_bytes")
+    @patch(f"{MODULE}.get_s3_client")
+    @patch(f"{MODULE}.read_assets_for_datasource")
+    @patch(f"{MODULE}.write_to_datazone")
+    @patch(f"{MODULE}._get_ns_dao")
+    @patch(f"{MODULE}._get_scan_dao")
+    @patch(f"{MODULE}._get_ds_dao")
+    @patch(f"{MODULE}.get_connector")
+    def test_rescan_open_review_carries_forward_vanished_added_tables(
+        self,
+        mock_get_connector,
+        mock_get_ds,
+        mock_get_scan,
+        mock_get_ns,
+        mock_write,
+        mock_read_accepted,
+        mock_s3_client,
+        mock_read_bytes,
+        mock_upload,
+    ):
+        """A prior re-scan's added table that has since vanished from the source is
+        carried into the new backup under BOTH added_tables and removed_tables, so a
+        review outcome reaps it. It is NOT re-written as a live asset, and the backup
+        is written even though the fresh diff is otherwise empty (no-drift)."""
+        import json as _json
+
+        from coa_common.datazone_forms import serialize_form
+        from coa_sources.database.pipeline.discovery_handler import handler
+
+        mock_ds_dao = MagicMock()
+        mock_ds_dao.get.return_value = {
+            "sourceSubType": "GLUE_DATABASE",
+            "configuration": {"databaseName": "analytics_db", "catalogId": "1", "region": "us-east-1"},
+        }
+        mock_get_ds.return_value = mock_ds_dao
+        mock_get_scan.return_value = MagicMock()
+        mock_get_ns.return_value = MagicMock(get=MagicMock(return_value={"dataZoneProjectId": "proj-1"}))
+        mock_write.return_value = {"assets_created": 0, "assets_revised": 0}
+
+        # The prior (still-open) re-scan added analytics_db.promo — recorded in its
+        # backup blob and still live as an interim asset.
+        approved_orders = Table(
+            name="orders",
+            database="analytics_db",
+            business_metadata=BusinessMetadata(review_status=ReviewStatus.APPROVED),
+            columns=[Column(name="id", data_type="int")],
+        )
+        backup = {
+            "version": 1,
+            "source_id": "ds-1",
+            "scan_job_sk": "sk-prev",
+            "removed_tables": [],
+            "added_tables": ["analytics_db.promo"],
+            "removed_columns": {},
+            "modified_backup": {"analytics_db.orders": serialize_form(approved_orders)},
+        }
+        mock_read_bytes.return_value = _json.dumps(backup).encode("utf-8")
+
+        # Live interim assets still carry promo (added by the prior re-scan).
+        mock_read_accepted.return_value = [
+            Table(name="orders", database="analytics_db", columns=[Column(name="id", data_type="int")]),
+            Table(name="promo", database="analytics_db", columns=[Column(name="code", data_type="varchar")]),
+        ]
+        # Fresh scan #2: promo is GONE from the source; orders is unchanged. So the
+        # approved baseline ([orders]) equals the fresh scan — no ordinary drift.
+        connector = MagicMock()
+        connector.test_connection.return_value = ConnectionTestResult(success=True, message="OK", checks=[])
+        connector.discover_metadata.return_value = DiscoveredMetadata(
+            tables=[Table(name="orders", database="analytics_db", columns=[Column(name="id", data_type="int")])]
+        )
+        mock_get_connector.return_value = connector
+
+        result = handler(
+            {
+                "datasourceId": "DS#ds-1",
+                "scanJobId": "SCAN#s",
+                "namespaceId": "ns-1",
+                "scanType": "full",
+                "isRescan": True,
+                "hadOpenRescan": True,
+            },
+            None,
+        )
+
+        # Orphans alone count as something to review, so the source is NOT
+        # auto-returned to APPROVED even though the fresh diff is empty.
+        assert result["reviewNeeded"] == "true"
+        # Orphan present -> backup written despite the otherwise-empty diff, with
+        # promo in BOTH lists (approve deletes removed_tables, reject deletes added).
+        mock_upload.assert_called_once()
+        _client, _bucket, _key, blob = mock_upload.call_args.args
+        assert "analytics_db.promo" in blob["added_tables"]
+        assert "analytics_db.promo" in blob["removed_tables"]
+        # The orphan is NOT re-written as a live asset — it stays put until a
+        # review outcome deletes it.
+        written = mock_write.call_args.kwargs["metadata"]
+        assert all(t.table_id != "analytics_db.promo" for t in written.tables)
+
+    @patch(f"{MODULE}.BUCKET_NAME", "test-bucket")
+    @patch(f"{MODULE}.upload_json")
+    @patch(f"{MODULE}.read_file_bytes")
+    @patch(f"{MODULE}.get_s3_client")
+    @patch(f"{MODULE}.read_assets_for_datasource")
+    @patch(f"{MODULE}.write_to_datazone")
+    @patch(f"{MODULE}._get_ns_dao")
+    @patch(f"{MODULE}._get_scan_dao")
+    @patch(f"{MODULE}._get_ds_dao")
+    @patch(f"{MODULE}.get_connector")
+    def test_rescan_from_approved_ignores_stale_backup(
+        self,
+        mock_get_connector,
+        mock_get_ds,
+        mock_get_scan,
+        mock_get_ns,
+        mock_write,
+        mock_read_accepted,
+        mock_s3_client,
+        mock_read_bytes,
+        mock_upload,
+    ):
+        """A re-scan from APPROVED (hadOpenRescan false) must NOT reconstruct from a
+        leftover backup blob. The blob is stale (from before delete-on-resolve, or a
+        paged-approve gap): the live assets already ARE the approved baseline. Here
+        the fresh scan equals live, so with the backup ignored the diff is empty —
+        nothing is re-flagged, no new backup is written, no live asset is rewritten.
+        If the stale backup were read, its added_tables entry would drop orders and
+        re-add it, manufacturing drift on a clean re-scan (the bug this fix closes)."""
+        import json as _json
+
+        from coa_common.datazone_forms import serialize_form
+        from coa_sources.database.pipeline.discovery_handler import handler
+
+        mock_ds_dao = MagicMock()
+        mock_ds_dao.get.return_value = {
+            "sourceSubType": "GLUE_DATABASE",
+            "configuration": {"databaseName": "analytics_db", "catalogId": "1", "region": "us-east-1"},
+        }
+        mock_get_ds.return_value = mock_ds_dao
+        mock_get_scan.return_value = MagicMock()
+        mock_get_ns.return_value = MagicMock(get=MagicMock(return_value={"dataZoneProjectId": "proj-1"}))
+        mock_write.return_value = {"assets_created": 0, "assets_revised": 0}
+
+        # A STALE backup that, if read, would corrupt the baseline: it claims orders
+        # was added by a (long-since resolved) re-scan and stores a truncated
+        # pre-image. had_open_rescan is false, so it must never be read.
+        stale_orders = Table(
+            name="orders",
+            database="analytics_db",
+            business_metadata=BusinessMetadata(review_status=ReviewStatus.APPROVED),
+            columns=[Column(name="id", data_type="int")],
+        )
+        stale_backup = {
+            "version": 1,
+            "source_id": "ds-1",
+            "scan_job_sk": "sk-ancient",
+            "removed_tables": [],
+            "added_tables": ["analytics_db.orders"],
+            "removed_columns": {},
+            "modified_backup": {"analytics_db.orders": serialize_form(stale_orders)},
+        }
+        mock_read_bytes.return_value = _json.dumps(stale_backup).encode("utf-8")
+
+        # Live (approved) assets and the fresh scan agree exactly: no real drift.
+        live_orders = [
+            Table(
+                name="orders",
+                database="analytics_db",
+                business_metadata=BusinessMetadata(review_status=ReviewStatus.APPROVED),
+                columns=[Column(name="id", data_type="int"), Column(name="promo_code", data_type="varchar")],
+            ),
+        ]
+        mock_read_accepted.return_value = live_orders
+        connector = MagicMock()
+        connector.test_connection.return_value = ConnectionTestResult(success=True, message="OK", checks=[])
+        connector.discover_metadata.return_value = DiscoveredMetadata(
+            tables=[
+                Table(
+                    name="orders",
+                    database="analytics_db",
+                    columns=[Column(name="id", data_type="int"), Column(name="promo_code", data_type="varchar")],
+                )
+            ]
+        )
+        mock_get_connector.return_value = connector
+
+        handler(
+            {
+                "datasourceId": "DS#ds-1",
+                "scanJobId": "SCAN#s",
+                "namespaceId": "ns-1",
+                "scanType": "full",
+                "isRescan": True,
+                "hadOpenRescan": False,  # re-scan from APPROVED, not an open review
+            },
+            None,
+        )
+
+        # Stale backup ignored: never read, so no drift manufactured. Diff-vs-live
+        # is empty -> no new backup written and the merged write set is empty.
+        mock_read_bytes.assert_not_called()
+        mock_upload.assert_not_called()
+        written = mock_write.call_args.kwargs["metadata"]
+        assert written.tables == []
 
 
 class TestGlueOwnershipGate:
@@ -585,7 +1227,9 @@ class TestDiscoveryHandlerStatusLifecycle:
             "Failed to write 1 asset(s): TooManyRequestsException (reached max retries: 10)"
         )
 
-        with pytest.raises(RuntimeError):
+        # A generic RuntimeError from the writer is not a permanent failure, so
+        # discovery re-raises it as TransientScanError (the state machine retries).
+        with pytest.raises(TransientScanError):
             handler(
                 {"datasourceId": "DS#ds-1", "scanJobId": "SCAN#s", "namespaceId": "ns-1", "scanType": "full"},
                 None,
@@ -612,7 +1256,7 @@ class TestDiscoveryHandlerStatusLifecycle:
         mock_scan_dao = MagicMock()
         mock_get_scan.return_value = mock_scan_dao
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(PermanentScanError):
             handler({"datasourceId": "DS#ds-1", "scanJobId": "SCAN#s-1", "namespaceId": "ns-1"}, None)
 
         # Data source status set to SCAN_FAILED

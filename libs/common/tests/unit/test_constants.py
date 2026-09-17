@@ -20,6 +20,7 @@ from coa_common.constants import (
     ontology_vector_index_name,
     parse_namespace_tag,
     sql_ident,
+    sql_qualified_table,
     to_graphrag_tenant_id,
     validate_id,
     validate_namespace_id,
@@ -172,6 +173,28 @@ class TestSqlIdent:
 
     def test_none_becomes_empty_quoted(self):
         assert sql_ident(None) == '""'  # type: ignore[arg-type]
+
+
+class TestSqlQualifiedTable:
+    """#149 A: the shared helper both the H2 DDL and the R2RML writer depend on
+    for byte-identical qualified table identifiers."""
+
+    def test_qualifies_with_schema(self):
+        assert sql_qualified_table("orders", "sales") == '"sales"."orders"'
+
+    def test_bare_when_no_schema(self):
+        assert sql_qualified_table("orders") == '"orders"'
+        assert sql_qualified_table("orders", None) == '"orders"'
+
+    def test_empty_schema_is_treated_as_bare(self):
+        # Falsy schema must not produce a leading-dot ("".orders) key.
+        assert sql_qualified_table("orders", "") == '"orders"'
+
+    def test_escapes_embedded_quotes_in_both_parts(self):
+        assert sql_qualified_table('a"b', 's"c') == '"s""c"."a""b"'
+
+    def test_preserves_special_characters(self):
+        assert sql_qualified_table("events daily", "raw-zone") == '"raw-zone"."events daily"'
 
 
 class TestIndexNameHelpers:

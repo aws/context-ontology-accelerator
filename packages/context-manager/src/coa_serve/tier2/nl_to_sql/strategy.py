@@ -61,6 +61,23 @@ _SQL_STRING_LITERAL = re.compile(r"'((?:[^']|'')*)'")
 # Shortest literal we treat as a "user value". A 1-char filter is too likely to
 # be an incidental substring of the question to protect from correction.
 _MIN_USER_LITERAL_LEN = 2
+# Default per-statement execution timeout (seconds) — the NON-REST fallback used
+# only when no request deadline is threaded (the long streaming/AgentCore path,
+# RESOLVE_TIMEOUT_S ~170s, or an unwired caller). Preserves the historical fixed
+# budget for that path. On the REST path a deadline IS threaded, so
+# _exec_timeout_seconds() clamps below this to min(35, remaining - margin) — on a
+# 29s REST budget that is always < 29s; this 35 never applies there.
+_DEFAULT_EXEC_TIMEOUT_S = 35
+# Floor for a deadline-derived execution timeout. Below this a query has no
+# realistic chance of completing, so we do not shrink the executor timeout past
+# it — the request will simply exhaust its budget and the outer wait_for handles
+# the timeout, rather than us handing the engine an unusable 0–1s window.
+_MIN_EXEC_TIMEOUT_S = 5.0
+# Safety margin (seconds) subtracted from "remaining budget" when deciding
+# whether a correction shot fits. Covers firewall re-auth, response assembly and
+# serialization AFTER the shot returns, so we do not approve a shot that finishes
+# with no time left to actually deliver its result.
+_CORRECTION_MARGIN_S = 2.0
 
 
 def _graph_expand_enabled(options: dict | None = None) -> bool:
@@ -145,6 +162,52 @@ class NLtoSQLStrategy:
         self._oss_ontology_index = oss_ontology_index
         self._graph_client = graph_client
         self._max_shots = max_shots if max_shots is not None else _resolve_max_shots()
+
+    def _exec_timeout_seconds(self, context: StrategyContext) -> int:
+        """Per-statement execution timeout, derived from the request deadline (A4/A6).
+
+        With a deadline threaded, cap the executor at the time actually left in the
+        request budget (leaving the correction margin) so a single statement cannot
+        run past the point where its result could still be delivered — but never
+        below ``_MIN_EXEC_TIMEOUT_S`` and never above the historical
+        ``_DEFAULT_EXEC_TIMEOUT_S``. With no deadline (e.g. the long AgentCore path
+        or an unwired caller) the fixed 35s default is preserved exactly. Rounded
+        DOWN to whole seconds — conservative, never rounds up past the budget.
+        """
+        if context.deadline is None:
+            return _DEFAULT_EXEC_TIMEOUT_S
+        remaining = context.deadline.remaining_s() - _CORRECTION_MARGIN_S
+        # Floor at _MIN_EXEC_TIMEOUT_S even when the remaining budget is smaller: the
+        # outer asyncio.wait_for owns request cancellation, so a too-generous executor
+        # timeout can never cause an actual overrun (the request is cancelled first).
+        # Handing the engine a floored 5s vs a literal sub-2s window changes nothing
+        # about correctness but avoids a degenerate 0-1s timeout the engine cannot use.
+        clamped = min(float(_DEFAULT_EXEC_TIMEOUT_S), max(_MIN_EXEC_TIMEOUT_S, remaining))
+        result = int(clamped)
+        if result < _DEFAULT_EXEC_TIMEOUT_S:
+            # Budget forced the executor below its historical default. Surface it so
+            # a mis-tuned _CORRECTION_MARGIN_S / _MIN_EXEC_TIMEOUT_S is visible rather
+            # than silently starving the engine; the normal (unclamped) path stays quiet.
+            logger.info(
+                "nl_to_sql_exec_timeout_clamped",
+                exec_timeout_s=result,
+                remaining_s=round(context.deadline.remaining_s(), 2),
+                floored=result == int(_MIN_EXEC_TIMEOUT_S),
+            )
+        return result
+
+    def _correction_fits_deadline(self, context: StrategyContext, estimated_shot_cost_s: float) -> bool:
+        """True when another correction shot fits the remaining request budget.
+
+        No deadline threaded → always True (pre-A0 behaviour: the correction shot
+        runs unconditionally, as it always did on the long-budget path). With a
+        deadline, the next shot is approved only when the time left (minus a margin
+        for post-shot assembly/serialization) covers its estimated cost — estimated
+        as what the shot just completed took.
+        """
+        if context.deadline is None:
+            return True
+        return context.deadline.remaining_s() >= (estimated_shot_cost_s + _CORRECTION_MARGIN_S)
 
     async def resolve(self, query: str, namespace: str, context: StrategyContext) -> StrategyResult | None:
         """Generate SQL from the query, enforce the firewall, and execute it.
@@ -261,6 +324,7 @@ class NLtoSQLStrategy:
         empty_fallback: StrategyResult | None = None
 
         for shot in range(1, self._max_shots + 1):
+            shot_start = time.perf_counter()
             # Firewall (unsafe → skip strategy; denied → 403). Re-run per shot
             # because each shot produces distinct SQL that must be authorized.
             fw_result = self._firewall_check(sql, profile, namespace, trace)
@@ -274,7 +338,7 @@ class NLtoSQLStrategy:
                     namespace=namespace,
                     data_source_id=data_source_id,
                     max_rows=capped_max_rows(options),
-                    timeout_seconds=35,
+                    timeout_seconds=self._exec_timeout_seconds(context),
                 )
                 exec_ms = int((time.perf_counter() - exec_start) * 1000)
                 result = StrategyResult(
@@ -361,6 +425,53 @@ class NLtoSQLStrategy:
             # with no user-supplied filter value): ask the LLM to correct the SQL
             # from the feedback in ``last_error`` — model-driven, no rule
             # catalogue — reusing the already-retrieved schema context.
+            #
+            # A4 — deadline-aware correction: before spending another full
+            # generate→firewall→execute cycle, check it can FIT the remaining
+            # request budget. The correction shot is a latency-doubling accuracy
+            # feature; over a short transport (REST, ~29s) the second shot pushes
+            # total latency past the ceiling and the caller 504s AFTER serve has
+            # already computed a usable first-shot answer. Rather than start work
+            # that cannot return, skip the correction and return the best result in
+            # hand. Estimated cost of the next shot = what THIS shot just took
+            # (generate was already paid once; a correction is generate+execute of
+            # comparable magnitude). No deadline threaded → estimate is None →
+            # never skip (pre-A0 behaviour preserved, e.g. the 170s AgentCore path
+            # where the second shot always fits).
+            shot_cost_s = time.perf_counter() - shot_start
+            if not self._correction_fits_deadline(context, shot_cost_s):
+                # Record ONLY the decision — not a latency. Per the trace model,
+                # step latency is the true elapsed time of a step that ran; this
+                # step represents a correction that did NOT run, so its duration is
+                # genuinely 0. The shot that DID run already recorded its own
+                # latency on its t2.sql.generate/t2.sql.execute steps — we do not
+                # restate a duration here. The deadline is an independent dimension
+                # surfaced at request level (see main.py), so the detail carries
+                # only the boolean reason for the skip, never seconds.
+                trace.record(
+                    StepId.T2_SQL_GENERATE,
+                    "skipped",
+                    0,
+                    detail={
+                        "reason": "deadline_insufficient_for_correction",
+                        "shot": shot,
+                    },
+                    tool_used="bedrock",
+                )
+                logger.info(
+                    "nl_to_sql_correction_skipped_deadline",
+                    shot=shot,
+                    last_shot_s=round(shot_cost_s, 2),
+                    remaining_s=round(context.deadline.remaining_s(), 2) if context.deadline else None,
+                )
+                # Return the best clean result we have. For the zero-row branch this
+                # is the verified-empty first-shot result (never a miss); for the
+                # execution-error branch there is no clean result, so fall through
+                # to the post-loop miss handling by breaking.
+                if empty_fallback is not None:
+                    return empty_fallback
+                break
+
             correct_start = time.perf_counter()
             try:
                 sql, confidence = await self._sql_generator.correct(

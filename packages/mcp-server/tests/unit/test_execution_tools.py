@@ -131,12 +131,6 @@ class TestExecuteQuery:
         mapping CM's Tier-1 resolver expects — reverting this normalization
         500s every dimensioned Tier-1 query with ``AttributeError`` on
         ``.items()``.
-
-        ``timeoutMs`` is intentionally NOT in the tool signature: the Smithy
-        contract declares it but the Context Manager has no reader for
-        ``options.timeoutMs`` today, so accepting it here would silently
-        no-op. Pin its absence so a future revert doesn't reintroduce the
-        silent-ignore bug MR !939 comment ``b6dea1de`` flagged.
         """
         await execute_query(
             mock_cm,
@@ -150,6 +144,7 @@ class TestExecuteQuery:
         payload = mock_cm.invoke.call_args[0][0]
         assert payload["options"]["mode"] == "deep-reasoning"
         assert payload["options"]["dimensions"] == {"region": "us-east"}
+        # timeoutMs is absent when the caller does not supply it (default None).
         assert "timeoutMs" not in payload["options"]
 
     @pytest.mark.asyncio
@@ -183,6 +178,36 @@ class TestExecuteQuery:
         )
         payload = mock_cm.invoke.call_args[0][0]
         assert "dimensions" not in payload["options"]
+
+    # ── timeoutMs forwarding (issue #185: MCP surface must not decline it) ──
+    @pytest.mark.asyncio
+    async def test_positive_timeout_ms_forwarded(self, mock_cm, profile):
+        """A positive int ``timeoutMs`` reaches ``options.timeoutMs`` so the CM
+        can clamp the request deadline. This is the MCP half of issue #185 — the
+        REST layer already forwards it; the MCP tool used to decline it."""
+        await execute_query(mock_cm, "test", "ns", profile, "tok", timeout_ms=5000)
+        payload = mock_cm.invoke.call_args[0][0]
+        assert payload["options"]["timeoutMs"] == 5000
+
+    @pytest.mark.asyncio
+    async def test_absent_timeout_ms_not_forwarded(self, mock_cm, profile):
+        """Default (None) leaves ``timeoutMs`` off the payload so the caller gets
+        the deployment's transport budget unchanged."""
+        await execute_query(mock_cm, "test", "ns", profile, "tok")
+        payload = mock_cm.invoke.call_args[0][0]
+        assert "timeoutMs" not in payload["options"]
+
+    @pytest.mark.parametrize("bad", [0, -5, "abc", 1.5, 2.0, True, False])
+    @pytest.mark.asyncio
+    async def test_invalid_timeout_ms_dropped(self, mock_cm, profile, bad):
+        """Non-positive, non-int, and bool values are dropped rather than
+        coerced — identical to the data-layer handler, so a bad value can never
+        smuggle a degenerate budget (e.g. ``int(1.5) == 1``) into the CM
+        deadline. Note ``2.0`` is dropped too: only a genuine ``int`` is valid,
+        matching handler.py byte-for-byte."""
+        await execute_query(mock_cm, "test", "ns", profile, "tok", timeout_ms=bad)
+        payload = mock_cm.invoke.call_args[0][0]
+        assert "timeoutMs" not in payload["options"]
 
 
 @pytest.mark.unit
@@ -320,3 +345,34 @@ class TestExecuteGraphTraversal:
         assert len(result["entities"]) == 1
         assert result["entities"][0]["label"] == "Acme Corp"
         assert len(result["relationships"]) == 1
+
+
+@pytest.mark.unit
+class TestQueryStrategyForwarding:
+    """``strategy`` must reach CM's ``options`` — it is the only way a caller can
+    deliberately select the Ontop/VKG engine rather than getting it as a fallback.
+
+    Contrast ``timeoutMs``, which ``execute_query`` deliberately omits because CM has
+    no reader for it. ``strategy`` does have one
+    (``Orchestrator._resolve_strategy_selection``), so dropping it would reinstate
+    the original defect — the Ontop/VKG engine reachable only as an automatic
+    fallback — rather than guarding against a phantom field.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "strategy",
+        ["best", "ontop", "nl_to_sql", "ontop_first", "nl_to_sql_first", "deep-reasoning"],
+    )
+    async def test_strategy_is_forwarded(self, mock_cm, profile, strategy):
+        await execute_query(mock_cm, "revenue by region", "sales", profile, "tok", strategy=strategy)
+        payload, _token = mock_cm.invoke.call_args[0]
+        assert payload["options"]["strategy"] == strategy
+
+    @pytest.mark.asyncio
+    async def test_strategy_absent_by_default(self, mock_cm, profile):
+        """No strategy supplied → the key must not appear, so the request stays
+        byte-identical for every existing caller."""
+        await execute_query(mock_cm, "revenue by region", "sales", profile, "tok")
+        payload, _token = mock_cm.invoke.call_args[0]
+        assert "strategy" not in payload["options"]

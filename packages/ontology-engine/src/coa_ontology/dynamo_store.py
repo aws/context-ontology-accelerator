@@ -23,6 +23,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
+from urllib.parse import quote
 
 import boto3
 from botocore.config import Config
@@ -180,6 +181,49 @@ def presign_proposal_artifact_put(
     key = _proposal_s3_key(namespace, proposal_id, artifact, version)
     return _get_s3().generate_presigned_url(
         "put_object",
+        Params={"Bucket": _S3_BUCKET, "Key": key},
+        ExpiresIn=expires_in,
+    )
+
+
+_S3_DOWNLOADS_PREFIX = "downloads"
+
+
+def _ontology_download_s3_key(namespace: str, ontology_id: str) -> str:
+    # ontology_id is an IRI (contains ://, #, /) — percent-encode it so it is a
+    # single safe S3 key segment.
+    return f"{_S3_DOWNLOADS_PREFIX}/{namespace}/{quote(ontology_id, safe='')}.ttl"
+
+
+def write_and_presign_ontology_download(
+    namespace: str,
+    ontology_id: str,
+    turtle: str,
+    expires_in: int = 3600,
+) -> str:
+    """Write serialized ontology Turtle to the artifacts bucket, return a presigned GET URL.
+
+    ``/download`` must not inline a large ontology: a 6+ MB Turtle body exceeds
+    the API Gateway / Lambda response limit and 502s the call (#143). Mirroring
+    the proposal read path, the graph is serialized, written to S3, and served
+    out-of-band via a presigned URL the client fetches directly. The graph is
+    the source of truth (it reflects post-acceptance edits), so this writes fresh
+    bytes each call rather than presigning a pre-existing induction artifact.
+
+    Content-Type / Content-Disposition are set on the S3 object so the browser
+    download is correctly typed and named regardless of the API response.
+    """
+    key = _ontology_download_s3_key(namespace, ontology_id)
+    s3 = _get_s3()
+    s3.put_object(
+        Bucket=_S3_BUCKET,
+        Key=key,
+        Body=turtle.encode("utf-8"),
+        ContentType="text/turtle",
+        ContentDisposition='attachment; filename="ontology.ttl"',
+    )
+    return s3.generate_presigned_url(
+        "get_object",
         Params={"Bucket": _S3_BUCKET, "Key": key},
         ExpiresIn=expires_in,
     )
@@ -1082,6 +1126,37 @@ def put_proposal_constraints(namespace: str, proposal_id: str, constraint_config
     return _put_artifact_s3(namespace, proposal_id, "constraints", constraint_config_json)
 
 
+def presign_proposal_constraints(
+    namespace: str,
+    proposal_id: str,
+    expires_in: int = 3600,
+) -> str | None:
+    """Presigned S3 GET URL for a proposal's ``constraint_config`` (``None`` if absent).
+
+    The constraints counterpart to :func:`presign_proposal_matches`: lets the
+    browser fetch the full constraint config directly from S3, bypassing the
+    6 MB API Gateway / Lambda response cap that inlining it in
+    ``GET /proposals/{id}`` would hit on wide schemas. Returns ``None`` when no
+    constraints artifact exists (proposals without constraints, or legacy
+    proposals that never offloaded), so the caller can fall back to the inline
+    value or ``null`` accordingly.
+    """
+    key = _proposal_s3_key(namespace, proposal_id, "constraints")
+    s3 = _get_s3()
+    try:
+        s3.head_object(Bucket=_S3_BUCKET, Key=key)
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code")
+        if code in ("404", "NoSuchKey", "NotFound"):
+            return None
+        raise
+    return s3.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": _S3_BUCKET, "Key": key},
+        ExpiresIn=expires_in,
+    )
+
+
 def _sweep_proposal_if_stale(proposal_id: str, namespace: str, item: dict) -> dict:
     """Move a proposal stuck in an in-progress accept state to ``accept_failed``.
 
@@ -1121,6 +1196,7 @@ def get_proposal_by_id(
     namespace: str = DEFAULT_NAMESPACE,
     hydrate_turtle: bool = True,
     hydrate_matches: bool = True,
+    hydrate_constraints: bool = True,
 ) -> dict | None:
     """Fetch a proposal's META item, hydrating S3-offloaded content.
 
@@ -1136,10 +1212,15 @@ def get_proposal_by_id(
             this. The detail endpoint sets it False and serves matches
             out-of-band via a presigned S3 URL instead, because the list can
             exceed the 6 MB API Gateway / Lambda response cap on wide schemas.
+        hydrate_constraints: When True, re-read the offloaded
+            ``constraint_config`` from S3 into ``metadata["constraint_config"]``.
+            The detail endpoint sets it False and serves constraints out-of-band
+            via a presigned S3 URL instead, because the config can exceed the
+            6 MB API Gateway / Lambda response cap on wide schemas.
 
     Returns:
-        The proposal item (with matches/Turtle hydrated from S3 when the
-        corresponding flag is set), or None if no such proposal exists.
+        The proposal item (with matches/Turtle/constraints hydrated from S3
+        when the corresponding flag is set), or None if no such proposal exists.
     """
     resp = _get_table().get_item(Key={"PK": _proposal_pk(namespace, proposal_id), "SK": "META"})
     item = resp.get("Item")
@@ -1174,7 +1255,7 @@ def get_proposal_by_id(
         except (ClientError, BotoCoreError, json.JSONDecodeError, KeyError) as e:
             _log.warning("matches hydration failed for %s in %s: %s", proposal_id, namespace, e)
     # Hydrate constraint_config from S3
-    if (item.get("metadata") or {}).get("has_constraint_config"):
+    if hydrate_constraints and (item.get("metadata") or {}).get("has_constraint_config"):
         try:
             raw = _get_artifact_s3(namespace, proposal_id, "constraints")
             if raw:

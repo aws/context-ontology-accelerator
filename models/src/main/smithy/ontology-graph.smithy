@@ -220,10 +220,15 @@ operation DownloadOntology {
     }
 
     output := {
-        /// The ontology serialized as Turtle.
+        /// Presigned S3 GET URL for the ontology serialized as Turtle. The
+        /// ontology is written to the artifacts bucket and served out-of-band
+        /// rather than inlined, because a large induced ontology (6+ MB) would
+        /// exceed the API Gateway / Lambda response limit and 502 the call.
         @required
-        @httpPayload
-        body: Blob
+        downloadUrl: String
+
+        /// Seconds until the presigned URL expires.
+        expiresInSeconds: Integer
     }
 }
 
@@ -738,6 +743,16 @@ structure OntologyOverview {
 
     /// Datatype properties — attributes of a class with a literal range.
     datatypeProperties: OntologyPropertySummaryList
+
+    /// Total number of classes in the ontology (independent of limit/offset),
+    /// so a client can show the true count while rendering one page.
+    totalClasses: Integer
+
+    /// Total number of object properties in the ontology (independent of limit/offset).
+    totalObjectProperties: Integer
+
+    /// Total number of datatype properties in the ontology (independent of limit/offset).
+    totalDatatypeProperties: Integer
 }
 
 /// Enumerate the classes + properties persisted in one ontology's graph.
@@ -757,6 +772,18 @@ operation GetOntologyOverview {
         @required
         @httpQuery("ontology_id")
         ontologyId: String
+
+        /// Max entities to return per collection (classes, object properties,
+        /// datatype properties are each capped independently). Bounds the
+        /// response so a large ontology does not exceed the API Gateway / Lambda
+        /// response limit. Omit for the server default.
+        @httpQuery("limit")
+        limit: Integer
+
+        /// Zero-based offset into each collection, for paging. Combined with
+        /// ``limit`` this yields a stable page window over the full ontology.
+        @httpQuery("offset")
+        offset: Integer
     }
 
     output: OntologyOverview

@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any
+from typing import Any, Literal
 
 import structlog
 from mcp.server.fastmcp import Context, FastMCP
@@ -307,6 +307,24 @@ async def describe_schema(
 # ── Execution Tools ───────────────────────────────────────────────────
 
 
+# Typed as a Literal, not ``str``, so FastMCP publishes the accepted values in the
+# tool's JSON schema and rejects anything else before this handler runs. That matters
+# more here than on the REST edge: MCP callers are LLM agents, which are the callers
+# most likely to invent a plausible-looking value. Serve treats an unrecognised
+# strategy as "no pin" and silently runs DEFAULT_STRATEGY, so an unvalidated typo
+# would return the cheap fallback chain while the agent believed it had selected an
+# engine. Mirrors the Smithy ``QueryStrategy`` enum and ``StrategyOption``; a
+# three-way parity test guards the copies.
+QueryStrategyLiteral = Literal[
+    "best",
+    "ontop",
+    "nl_to_sql",
+    "ontop_first",
+    "nl_to_sql_first",
+    "deep-reasoning",
+]
+
+
 @mcp.tool()
 async def query(
     ctx: Context,
@@ -315,9 +333,11 @@ async def query(
     execute: bool | None = None,
     tierOverride: int | None = None,
     mode: str | None = None,
+    strategy: QueryStrategyLiteral | None = None,
     dimensions: list[dict] | None = None,
     includeSupporting: bool = True,
     maxResults: int = 1000,
+    timeoutMs: int | None = None,
 ) -> str:
     """End-to-end natural language query with tiered resolution.
 
@@ -342,10 +362,22 @@ async def query(
         mode: Execution mode — ``standard`` (single-shot) or ``deep-reasoning``
             (multi-step reasoning loop; higher recall, much slower). Absent = the
             serve deployment default.
+        strategy: Which Tier-2 engine answers a structured query — ``best``,
+            ``ontop``, ``nl_to_sql``, ``ontop_first``, ``nl_to_sql_first`` or
+            ``deep-reasoning``. Absent = the serve default (``nl_to_sql_first``).
+            A DIFFERENT axis from ``mode``: ``mode`` decides whether the whole
+            T1→T2→T3 cascade is replaced by the Tier-3 reasoning loop, this decides
+            which engine answers within Tier 2. Ignored when the resolved tier is
+            not 2. An explicit value is never overridden by automatic tier gating.
         dimensions: Dimension filters constraining the query. Each entry is a
             ``{name, value}`` object matching ``DimensionFilter``.
         includeSupporting: Whether to include supporting document chunks (default True).
         maxResults: Maximum result rows (default 1000, max 10000).
+        timeoutMs: Optional caller budget in milliseconds. When supplied, the
+            Context Manager clamps the request deadline to ``min(transport,
+            timeoutMs)`` so a caller can ask for a shorter, graceful return
+            instead of the full transport budget. Non-positive or non-integer
+            values are dropped (same rule as the REST surface).
 
     Returns:
         JSON envelope ``{result, requestId, sessionId}`` matching the Smithy
@@ -367,9 +399,11 @@ async def query(
             execute=execute,
             tier_override=tierOverride,
             mode=mode,
+            strategy=strategy,
             dimensions=dimensions,
             include_supporting=includeSupporting,
             max_results=maxResults,
+            timeout_ms=timeoutMs,
         )
         duration_ms = int((time.perf_counter() - start) * 1000)
         if caller:

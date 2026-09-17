@@ -65,7 +65,10 @@ class SPARQLValidator:
         self._graph_uri_template = get_graph_uri_template(graph_uri_template)
 
     async def validate(self, sparql: str, namespace: str) -> ValidationResult:
-        """Two-stage validation: syntax check, then URI existence check.
+        """Four-stage validation: syntax, URI existence, domain/range, determinism.
+
+        Stages run in order: syntax → URI existence → domain/range (fail-open)
+        → determinism/projection (fail-closed).
 
         Args:
             sparql: The SPARQL query to validate.
@@ -94,7 +97,243 @@ class SPARQLValidator:
         # only a CLEAR, evidenced mismatch fails; any uncertainty (no triples to
         # check, Neptune error, ambiguous typing) passes through unchanged so we
         # never over-block a legitimate query.
-        return await self._validate_domain_range(sparql, namespace)
+        dr_result = await self._validate_domain_range(sparql, namespace)
+        if not dr_result.valid:
+            return dr_result
+
+        # Stage 4: determinism / projection check (B1a + B1b). Fail-CLOSED on
+        # DETERMINISTICALLY detectable defects only: (a) an aggregate projection with
+        # no explicit `AS ?alias`, or aliased to a non-descriptive bare name that
+        # drifts run-to-run (?count/?value/?result/?n) — the direct cause of the
+        # ~1-in-3 KeyError for typed clients; and (b) a plain COUNT(?v) over a
+        # variable typed as a class instance (?v a :Class), which counts
+        # join-multiplied rows and drifts between COUNT and COUNT(DISTINCT) run to
+        # run (measured 2/10 on the HAVING/GROUP-BY family). Both are wrong
+        # regardless of the question. It does NOT judge LIMIT or the COUNT-vs-DISTINCT
+        # choice for LITERAL-valued counts — those need the NL question's intent (a
+        # prompt-side rule + the determinism regression suite own them); guessing
+        # there would over-block. Column NAME drift between two correct names
+        # (?id vs ?claimId) is likewise left to the prompt — both are valid, so
+        # failing closed would reject correct output.
+        return self._validate_projection_aliases(sparql)
+
+    # Aggregate functions whose SELECT projection must carry a stable, explicit,
+    # descriptive alias — a bare/absent alias is where B1b column-name drift
+    # (?productCount vs ?count) originates.
+    _AGG_FUNCS = ("COUNT", "SUM", "AVG", "MIN", "MAX", "GROUP_CONCAT", "SAMPLE")
+
+    # Non-descriptive aliases that the LLM swaps between runs. Rejected so the
+    # retry loop regenerates with the descriptive name the prompt mandates.
+    # NOTE: "total" is intentionally NOT here — it is a sanctioned prompt example
+    # (?total) and a prefix of legitimately descriptive names (?totalRevenue).
+    _BARE_ALIASES = frozenset({"count", "value", "result", "n", "a", "b", "c", "x", "y", "z", "col", "res"})
+
+    _AGG_NAME_RE = re.compile(r"\b(?:" + "|".join(_AGG_FUNCS) + r")\s*\(", re.IGNORECASE)
+    # Capture the projection list: everything between SELECT and the graph
+    # pattern. The pattern starts at `WHERE` OR — since `WHERE` is grammatically
+    # OPTIONAL in SPARQL — at the opening `{`, whichever comes first. Anchoring
+    # only on `WHERE` would let a `WHERE`-less `SELECT (COUNT(?p) AS ?count) {…}`
+    # bypass the check entirely (rdflib accepts it, so Stage 1 does not backstop).
+    _SELECT_CLAUSE_RE = re.compile(r"\bSELECT\b(?:\s+DISTINCT)?(.*?)(?:\bWHERE\b|\{)", re.IGNORECASE | re.DOTALL)
+    _TRAILING_AS_RE = re.compile(r"\bAS\s+\?(\w+)\s*$", re.IGNORECASE)
+
+    def _validate_projection_aliases(self, sparql: str) -> ValidationResult:
+        """Fail-closed when an aggregate projection lacks a stable descriptive alias.
+
+        Two rejectable shapes, both deterministically detectable from the SPARQL
+        text alone (no Neptune round-trip, no NL intent needed):
+
+        1. An aggregate projection expression with NO trailing ``AS ?alias`` — the
+           engine then invents a column label that varies run-to-run.
+        2. An aggregate aliased to a non-descriptive bare name in ``_BARE_ALIASES``
+           — the exact ``?productCount`` → ``?count`` drift B1b documents.
+
+        Detection walks the SELECT clause's TOP-LEVEL parenthesised projection
+        groups (SPARQL only permits an aggregate inside a ``( Expression AS Var )``
+        group, so one group may legitimately hold several aggregates — e.g. a
+        ratio of two SUMs — under a single alias; counting raw aggregate calls
+        would false-reject those). Everything else PASSES: plain-variable
+        projections, descriptive aliases, and anything unparseable (conservative
+        — a genuinely malformed SELECT is Stage-1 rdflib's to reject, not this
+        stage's). A bare aggregate with no wrapping group at all is likewise
+        invalid SPARQL caught by Stage 1; the outside-group scan below still
+        flags it defensively.
+        """
+        # Mask string literals before locating the SELECT/WHERE boundary so a
+        # quoted `{`, `}` or `WHERE` inside a projection expression (e.g.
+        # `BIND(CONCAT("{", ?x) AS ?y)`) cannot be mistaken for the graph-pattern
+        # boundary and truncate the captured projection list. Masking preserves
+        # length/offsets, so the span captured here maps back onto the original.
+        m = self._SELECT_CLAUSE_RE.search(self._mask_string_literals(sparql))
+        if m is None:
+            return ValidationResult(valid=True)  # not a SELECT / unparseable → pass
+        # Re-slice from the ORIGINAL sparql using the matched span (mask is
+        # length-preserving) so downstream alias checks see real text.
+        select_clause = sparql[m.start(1) : m.end(1)]
+
+        groups, spans = self._top_level_paren_groups(select_clause)
+
+        # Scan for an aggregate that sits OUTSIDE every top-level projection group
+        # (a stray, unwrapped aggregate). Blank the group spans first so their
+        # inner aggregates don't count here.
+        outside = list(select_clause)
+        for a, b in spans:
+            for i in range(a, b):
+                outside[i] = " "
+        if self._AGG_NAME_RE.search("".join(outside)):
+            return ValidationResult(
+                valid=False,
+                error=(
+                    "Aggregate projection missing explicit alias — every "
+                    "COUNT/SUM/AVG/MIN/MAX must be wrapped as "
+                    "`(AGG(...) AS ?descriptiveName)` so the result column name is "
+                    "stable across runs."
+                ),
+            )
+
+        for group in groups:
+            if not self._AGG_NAME_RE.search(group):
+                continue  # non-aggregate projection expr (e.g. a bound BIND-alike)
+            alias_match = self._TRAILING_AS_RE.search(group.strip())
+            if not alias_match:
+                return ValidationResult(
+                    valid=False,
+                    error=(
+                        "Aggregate projection missing explicit alias — every "
+                        "COUNT/SUM/AVG/MIN/MAX must use `(AGG(...) AS ?descriptiveName)` "
+                        "so the result column name is stable across runs."
+                    ),
+                )
+            if alias_match.group(1).lower() in self._BARE_ALIASES:
+                return ValidationResult(
+                    valid=False,
+                    error=(
+                        f"Aggregate alias '?{alias_match.group(1)}' is non-descriptive "
+                        "and drifts between runs — use a stable descriptive name like "
+                        "?productCount / ?totalRevenue / ?avgPrice."
+                    ),
+                )
+        # B1a (entity-count determinism): a plain COUNT(?v) over a variable that is
+        # bound as a CLASS INSTANCE (?v a :Class / ?v rdf:type :Class) counts
+        # join-multiplied rows, not entities — on 1-to-many data it silently
+        # inflates and the SAME question flips between COUNT and COUNT(DISTINCT)
+        # run-to-run (measured N=10: 2/10 drift, answer masked only by a dataset
+        # with no duplicate rows per group). This is decidable from the SPARQL text
+        # ALONE — no NL intent needed — so it meets the same fail-closed bar as the
+        # alias check: counting a typed entity is wrong-shape regardless of the
+        # question. COUNT(?literal) over a datatype-property value (e.g.
+        # COUNT(DISTINCT ?status)) is NOT flagged — only counts of typed entity
+        # subjects are.
+        entity_count = self._validate_entity_count_distinct(sparql)
+        if not entity_count.valid:
+            return entity_count
+        return ValidationResult(valid=True)
+
+    # A COUNT( ?v ) — single variable, NOT already DISTINCT, NOT COUNT(*).
+    _PLAIN_COUNT_RE = re.compile(r"\bCOUNT\s*\(\s*(?!DISTINCT\b)\??(\w+)\s*\)", re.IGNORECASE)
+
+    # ?v is a typed class instance: `?v a <Class>` or `?v rdf:type <Class>`, where
+    # the type is an IRI (<...>), a prefixed name (ind:Claims), or `a` shorthand.
+    # Also matches blank-node subjects (`_:b1 a :Class`) so a typed blank node is
+    # not missed. Captures the subject name (var name, or blank-node label) in one
+    # of two alternation groups.
+    _TYPED_SUBJECT_RE = re.compile(
+        r"(?:\?(\w+)|_:(\w+))\s+(?:a|rdf:type)\s+(?:<[^>]+>|\w*:\w+)",
+        re.IGNORECASE,
+    )
+
+    def _validate_entity_count_distinct(self, sparql: str) -> ValidationResult:
+        """Fail-closed when a plain ``COUNT(?v)`` counts a typed class instance.
+
+        ``?v a :Class`` / ``?v rdf:type :Class`` marks ``?v`` as an ENTITY. Counting
+        it with a bare ``COUNT`` (no DISTINCT) counts join-multiplied solution rows,
+        so on 1-to-many joins the count inflates and the same question drifts between
+        ``COUNT`` and ``COUNT(DISTINCT)`` between runs (the B1a instance measured on
+        the HAVING/GROUP-BY family). Entity counts must be ``COUNT(DISTINCT ?v)``.
+
+        Conservative — fires ONLY when BOTH hold, both read from the SPARQL text:
+          1. a plain ``COUNT(?v)`` (single var, not already DISTINCT, not ``*``), and
+          2. ``?v`` is a typed subject somewhere in the query (``?v a <...>`` or
+             ``?v rdf:type <...>``).
+        A count of a datatype-property value (``COUNT(DISTINCT ?status)``,
+        ``COUNT(?amount)``) is left alone — those variables are not typed entities.
+        """
+        # findall returns (var, bnode) tuples (one group empty per match); collect
+        # whichever side matched so both ?var and _:bnode typed subjects are covered.
+        typed_vars = {v or b for v, b in self._TYPED_SUBJECT_RE.findall(sparql)}
+        typed_vars.discard("")
+        if not typed_vars:
+            return ValidationResult(valid=True)
+        for var in self._PLAIN_COUNT_RE.findall(sparql):
+            if var in typed_vars:
+                return ValidationResult(
+                    valid=False,
+                    error=(
+                        f"COUNT(?{var}) counts a typed entity (?{var} is bound via "
+                        "`a <Class>`) with row multiplicity — use "
+                        f"COUNT(DISTINCT ?{var}) so the count is stable and does not "
+                        "inflate on 1-to-many joins."
+                    ),
+                )
+        return ValidationResult(valid=True)
+
+    # Matches single- or double-quoted SPARQL string literals (with backslash
+    # escapes), including the triple-quoted long forms, so their contents can be
+    # blanked out before structural regexes run.
+    _STRING_LITERAL_RE = re.compile(
+        r"'''(?:\\.|[^\\])*?'''|\"\"\"(?:\\.|[^\\])*?\"\"\"|'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"",
+        re.DOTALL,
+    )
+
+    @classmethod
+    def _mask_string_literals(cls, text: str) -> str:
+        """Replace the CONTENTS of string literals with spaces, length-preserving.
+
+        Quote delimiters are kept; only the inner characters become spaces. This
+        lets structural regexes (SELECT/WHERE boundary, brace matching) run without
+        being fooled by ``{``, ``}`` or keywords embedded inside string literals,
+        while every character offset still maps back onto the original text.
+        """
+
+        def _blank(m: re.Match[str]) -> str:
+            s = m.group(0)
+            if len(s) < 2:
+                return s
+            # Preserve the opening/closing quote runs; blank the interior.
+            q = "'" if s[0] == "'" else '"'
+            n = 3 if s[:3] in ("'''", '"""') else 1
+            open_q, close_q = q * n, q * n
+            interior = " " * (len(s) - 2 * n)
+            return f"{open_q}{interior}{close_q}"
+
+        return cls._STRING_LITERAL_RE.sub(_blank, text)
+
+    @staticmethod
+    def _top_level_paren_groups(text: str) -> tuple[list[str], list[tuple[int, int]]]:
+        """Return (inner_texts, spans) for each TOP-LEVEL ``( ... )`` group.
+
+        Depth-aware so nested parens (function args, casts) stay inside their
+        enclosing top-level group rather than being treated as separate
+        projections. ``spans`` are (start, end) indices into ``text`` covering
+        the whole group including its outer parens.
+        """
+        groups: list[str] = []
+        spans: list[tuple[int, int]] = []
+        depth = 0
+        start: int | None = None
+        for i, ch in enumerate(text):
+            if ch == "(":
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif ch == ")":
+                if depth > 0:
+                    depth -= 1
+                    if depth == 0 and start is not None:
+                        groups.append(text[start + 1 : i])
+                        spans.append((start, i + 1))
+                        start = None
+        return groups, spans
 
     def _validate_syntax(self, sparql: str) -> ValidationResult:
         """Parse SPARQL with rdflib to check syntax validity."""
@@ -188,7 +427,8 @@ class SPARQLValidator:
         """
         try:
             pairs = self._extract_typed_property_uses(sparql)
-        except Exception:
+        except Exception as e:
+            logger.warning("domain_range_extract_failed", error=str(e), namespace=namespace)
             return ValidationResult(valid=True)
         if not pairs:
             return ValidationResult(valid=True)
@@ -210,7 +450,8 @@ class SPARQLValidator:
         # Range validation: check typed literals against declared rdfs:range
         try:
             range_pairs = self._extract_property_literal_types(sparql)
-        except Exception:
+        except Exception as e:
+            logger.warning("property_literal_type_extract_failed", error=str(e), namespace=namespace)
             return ValidationResult(valid=True)
         for prop_uri, literal_type in range_pairs[:_MAX_URI_VALIDATION_COUNT]:
             if not (_SAFE_URI_RE.match(prop_uri) and _SAFE_URI_RE.match(literal_type)):

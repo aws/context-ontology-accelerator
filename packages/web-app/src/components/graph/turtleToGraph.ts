@@ -6,8 +6,8 @@
  *
  * Delegates tokenisation to ``utils/turtleLexer`` (the shared lexer
  * also used by the R2RML and ClassDetailCard parsers) and walks the
- * resulting triples to assemble the ``{nodes, edges}`` shape the
- * Cytoscape view consumes.
+ * resulting triples to assemble the ``{nodes, edges}`` shape
+ * ``OntologyGraphFlow`` consumes.
  *
  * Recognises:
  *   - ``<iri> a owl:Class .``
@@ -173,14 +173,14 @@ export function turtleToGraph(turtle: string): TurtleGraphData {
         predicateLabel: "subClassOf",
         // The provenance lives on the *child* class (PK_SHARING means
         // the inducer auto-detected this from the FK pattern); attach
-        // to the edge so the cytoscape stylesheet can swap arrow style.
+        // to the edge so the renderer can swap arrow style.
         subClassProvenance: subClassProvenance[child],
       },
     });
   }
-  // Suggested subclass-of edges render dashed in the cytoscape view —
-  // the user is meant to confirm or reject them, not treat them as
-  // committed inheritance.
+  // Suggested subclass-of edges render dashed in the graph view — the
+  // user is meant to confirm or reject them, not treat them as committed
+  // inheritance.
   for (const [child, parents] of Object.entries(suggestedParents)) {
     for (const parent of parents) {
       if (!classes.has(child) || !classes.has(parent)) continue;

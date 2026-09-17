@@ -671,3 +671,47 @@ class TestValidationRetryLoop:
         call_kwargs = llm_client.converse.call_args.kwargs
         assert call_kwargs.get("guardrail_id") is None
         assert call_kwargs.get("guard_content") == query
+
+
+class TestTracedStepErrorLogging:
+    """Bot finding (HIGH): a failing pipeline step must log the error MESSAGE
+    (not just the exception type) so production failures are debuggable."""
+
+    def _translator(self):
+        return NLtoSPARQL(
+            graph_client=AsyncMock(),
+            llm_client=AsyncMock(),
+            graph_uri_template="https://test.local/{namespace}",
+        )
+
+    async def test_failing_step_logs_error_message(self, monkeypatch):
+        import coa_serve.tier2.ontop.nl_to_sparql as mod
+
+        captured: list[tuple[str, dict]] = []
+
+        def _fake_warning(event, **kw):
+            captured.append((event, kw))
+
+        monkeypatch.setattr(mod.logger, "warning", _fake_warning)
+
+        translator = self._translator()
+        trace_steps: list[dict] = []
+
+        async def _boom():
+            raise ValueError("neptune connection reset by peer")
+
+        import time as _t
+
+        result, ok = await translator._traced_step("build_tbox", _boom(), trace_steps, _t.perf_counter())
+
+        assert (result, ok) == (None, False)
+        # Trace entry still records the compact type name for the client.
+        assert trace_steps[-1]["status"] == "error"
+        assert trace_steps[-1]["detail"] == "ValueError"
+        # And the operator log carries the full message + step name.
+        events = {e for e, _ in captured}
+        assert "pipeline_step_failed" in events
+        _, kw = next((e, k) for e, k in captured if e == "pipeline_step_failed")
+        assert kw["step"] == "build_tbox"
+        assert kw["error_type"] == "ValueError"
+        assert "neptune connection reset by peer" in kw["error_msg"]

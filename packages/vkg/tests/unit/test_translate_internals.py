@@ -423,6 +423,72 @@ def test_load_table_routing_unparseable_file_returns_empty(tmp_path):
     assert translate_server._load_table_routing(str(bad)) == {}
 
 
+def test_load_table_routing_parses_schema_qualified_table_name(tmp_path):
+    """#149 A: rr:tableName may now be `"schema"."table"`. The loader must
+    register lookups under the bare table AND the schema.table form (each
+    uppercased) so _resolve_routing matches whichever form Ontop's SQL uses."""
+    ttl = tmp_path / "mappings.ttl"
+    ttl.write_text(
+        """
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix coa: <http://coa.amazon.com/vocab/coa#> .
+@prefix ex: <http://example.com/> .
+
+ex:OrdersMap a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "\\"sales\\".\\"orders\\"" ] ;
+    coa:datasourceId "ds-sales" ;
+    coa:sourceSchema "sales" .
+""",
+        encoding="utf-8",
+    )
+    routing = translate_server._load_table_routing(str(ttl))
+    # bare table key (both cases)
+    assert routing["orders"]["datasourceId"] == "ds-sales"
+    assert routing["ORDERS"]["datasourceId"] == "ds-sales"
+    # schema.table key (both cases)
+    assert routing["sales.orders"]["datasourceId"] == "ds-sales"
+    assert routing["SALES.ORDERS"]["datasourceId"] == "ds-sales"
+
+
+def test_resolve_routing_matches_qualified_key_from_qualified_mapping(tmp_path):
+    """End to end: a qualified mapping resolves for a schema.table SQL ref."""
+    ttl = tmp_path / "m.ttl"
+    ttl.write_text(
+        """
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix coa: <http://coa.amazon.com/vocab/coa#> .
+@prefix ex: <http://example.com/> .
+
+ex:M a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "\\"sales\\".\\"orders\\"" ] ;
+    coa:datasourceId "ds-sales" ;
+    coa:sourceSchema "sales" .
+""",
+        encoding="utf-8",
+    )
+    translate_server._table_routing = translate_server._load_table_routing(str(ttl))
+    result = translate_server._resolve_routing(["sales.orders"])
+    assert result["sales.orders"]["datasourceId"] == "ds-sales"
+
+
+# --- _split_sql_qualified ----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ('"sales"."orders"', ['"sales"', '"orders"']),
+        ('"orders"', ['"orders"']),
+        ("sales.orders", ["sales", "orders"]),
+        ("orders", ["orders"]),
+        # A dot inside a quoted identifier must NOT split.
+        ('"weird.name"', ['"weird.name"']),
+    ],
+)
+def test_split_sql_qualified(raw, expected):
+    assert translate_server._split_sql_qualified(raw) == expected
+
+
 # --- health polling ----------------------------------------------------------
 
 
@@ -439,7 +505,7 @@ def test_poll_ontop_health_sets_healthy_when_probe_passes(monkeypatch):
     # The poll loop caches whatever the functional probe returns. Probe behavior
     # (actuator UP + reformulation) is covered in test_health_probe.py; here we
     # only verify the loop wires a healthy probe result into the cached status.
-    monkeypatch.setattr(translate_server, "_probe_health", lambda: True)
+    monkeypatch.setattr(translate_server, "_probe_health", lambda: (True, None))
 
     def _stop(_):
         raise KeyboardInterrupt
@@ -448,6 +514,7 @@ def test_poll_ontop_health_sets_healthy_when_probe_passes(monkeypatch):
     with pytest.raises(KeyboardInterrupt):
         translate_server._poll_ontop_health()
     assert translate_server._check_ontop_health() is True
+    assert translate_server._health_reason() is None
 
 
 def test_poll_ontop_health_sets_unhealthy_on_error(monkeypatch):
@@ -463,6 +530,8 @@ def test_poll_ontop_health_sets_unhealthy_on_error(monkeypatch):
     with pytest.raises(KeyboardInterrupt):
         translate_server._poll_ontop_health()
     assert translate_server._check_ontop_health() is False
+    # A failed probe caches a non-empty reason for the /health 503 body (#149 Fix 4).
+    assert translate_server._health_reason()
 
 
 # --- _translate_sparql (mocked Ontop) ----------------------------------------

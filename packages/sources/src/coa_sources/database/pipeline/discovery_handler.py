@@ -11,7 +11,19 @@ Input (from Step Functions):
         "datasourceId": "DS#<id>",
         "scanJobId": "SCAN#<jobId>",
         "namespaceId": "<namespace-id>",
-        "scanType": "full" | "incremental"
+        "scanType": "full" | "incremental",
+        "isRescan": true   # optional; set only for a re-scan of an already-
+                           # approved source. When true, discovery MERGES onto
+                           # the live assets (preserving curated metadata)
+                           # instead of overwriting them. Absent/false on a
+                           # first scan.
+        "hadOpenRescan": true  # optional; true only when the source was already
+                           # in RESCAN_REVIEW (a prior re-scan still open and
+                           # un-approved). Only then is the S3 backup blob the
+                           # approved pre-image to reconstruct the diff baseline
+                           # from. When re-scanning from APPROVED (false/absent),
+                           # the live assets ARE the approved baseline and any
+                           # leftover backup blob is stale and must be ignored.
     }
 """
 
@@ -26,7 +38,9 @@ from typing import Any
 
 from coa_common.constants import datasource_external_id
 from coa_common.dao import DynamoDBDAO
-from coa_common.domain_models import DiscoveredMetadata
+from coa_common.domain_models import DiscoveredMetadata, ReviewStatus
+from coa_common.metadata_store.reader import read_assets_for_datasource
+from coa_common.s3 import get_s3_client, read_file_bytes, upload_json
 from coa_control_plane_server.models.source_status import SourceStatus
 from coa_control_plane_server.models.source_sub_type import SourceSubType
 
@@ -34,12 +48,15 @@ from coa_sources.database.connectors import (
     MetadataConnector,
     get_connector,
 )
+from coa_sources.database.errors import PermanentScanError, TransientScanError, is_permanent_scan_error
 from coa_sources.database.glue_ownership import (
     GlueOwnershipError,
     assert_namespace_may_catalog,
 )
 from coa_sources.database.metadata_writer import write_to_datazone
 from coa_sources.database.metrics import emit_metric
+from coa_sources.database.rescan import diff_tables, merged_write_set, reconstruct_approved_baseline
+from coa_sources.database.rescan_backup import backup_s3_key, build_rescan_backup
 from coa_sources.database.secret_binding import require_secret_namespace_binding
 
 logger = logging.getLogger(__name__)
@@ -49,6 +66,10 @@ DATASOURCES_TABLE = os.environ["SOURCES_TABLE"]
 SCAN_JOBS_TABLE = os.environ["SOURCE_SCAN_JOBS_TABLE"]
 SMUS_DOMAIN_ID = os.environ["SMUS_DOMAIN_ID"]
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
+# S3 bucket for the re-scan backup blob (pre-rescan asset forms + change-set),
+# read back by the approve/reject worker. Present on both first-scan and re-scan
+# invocations of this Lambda; only the re-scan path uses it.
+BUCKET_NAME = os.environ.get("BUCKET_NAME", "")
 
 # Guardrail: maximum number of tables a single source may register as DataZone
 # assets in one discovery pass. Above this, the scan fails fast with an
@@ -99,6 +120,31 @@ def _get_ns_dao() -> DynamoDBDAO:
     return _ns_dao
 
 
+def _read_existing_backup(source_id: str) -> dict[str, Any] | None:
+    """Read the current re-scan backup blob (the last-approved pre-image), or None.
+
+    Called ONLY when the source was in RESCAN_REVIEW at re-scan time (a prior
+    re-scan is still open), so the live assets are an interim, un-approved state
+    and this blob is the approved pre-image to diff against (see
+    ``rescan.reconstruct_approved_baseline``). The caller gates on that condition,
+    NOT on blob presence: a blob can also be left behind on an APPROVED source
+    (re-scanned before delete-on-resolve shipped, or a paged-approve gap), and
+    such a stale blob must never drive the baseline. A missing/unreadable blob or
+    any read error returns None. Best-effort by design: it must not fail the scan.
+    """
+    if not BUCKET_NAME:
+        return None
+    try:
+        raw = read_file_bytes(get_s3_client(), BUCKET_NAME, backup_s3_key(source_id))
+        return json.loads(raw)
+    except Exception:
+        logger.info(
+            "No readable re-scan backup for %s; treating live assets as the approved baseline",
+            source_id,
+        )
+        return None
+
+
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     """Lambda entry point for the Discovery step."""
     datasource_id = event["datasourceId"]  # "DS#<uuid>"
@@ -106,6 +152,16 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     namespace_id = event["namespaceId"]
     scan_type = event.get("scanType", "full")
     scan_job_sk = event.get("scanJobSK", scan_job_id)  # ISO timestamp SK for source-scan-jobs
+    # Re-scan of an already-approved source (set by the rescan trigger; "false"
+    # on a first scan). Drives the merge-onto-live-assets path below. The trigger
+    # normalizes this to a string, so parse it as one (a bare bool works too).
+    is_rescan = str(event.get("isRescan", "")).strip().lower() == "true"
+    # True ONLY when the source was already in RESCAN_REVIEW when this re-scan was
+    # triggered — i.e. a PRIOR re-scan is still open and un-approved, so the live
+    # assets are that interim merge and the S3 backup blob holds the approved
+    # pre-image. Gates the backup read below. Normalized as a string by the
+    # trigger (a bare bool works too); defaults to false when absent.
+    had_open_rescan = str(event.get("hadOpenRescan", "")).strip().lower() == "true"
 
     # Strip "DS#" prefix to get the bare source UUID
     source_id = datasource_id.removeprefix("DS#")
@@ -184,16 +240,124 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
                 f"(e.g. exclude system schemas), then re-scan."
             )
 
-        # Persist discovered metadata to DataZone
+        # Persist discovered metadata to DataZone.
         project_id = _get_project_id(namespace_id)
+        write_metadata = metadata
+        rescan_tables_approved = 0
+        # Whether this re-scan leaves anything for the steward to review. A
+        # re-scan that finds nothing (no drift and no carried-forward orphaned
+        # tables) returns straight to APPROVED instead of parking in
+        # RESCAN_REVIEW; enrichment reads this via the reviewNeeded return field.
+        # Default True so a first scan (which ignores it) and any unset path stay
+        # on the review side; set for real inside the re-scan branch below.
+        rescan_review_needed = True
+        if is_rescan:
+            # Re-scan of an already-approved source: MERGE onto the live assets
+            # instead of blindly overwriting them. Curated metadata (steward
+            # edits, approved AI) is preserved; only changed items reset to
+            # PENDING_REVIEW. Unchanged tables are skipped and removed tables
+            # are left in place (deleted only when the steward approves).
+            #
+            # The baseline for the diff / merge / backup must be the last
+            # APPROVED state, not the last scan. If a prior re-scan is still open
+            # in RESCAN_REVIEW (had_open_rescan), the live assets are that interim,
+            # un-approved merge; the existing backup blob holds the approved
+            # pre-image, so we reconstruct the approved baseline from (live, backup)
+            # and read the backup BEFORE the merge below overwrites it. Interim
+            # un-approved edits made during an open review are intentionally NOT
+            # preserved across a fresh re-scan.
+            #
+            # We read the backup ONLY when had_open_rescan is true. Blob PRESENCE
+            # is NOT proof of an open review: a source re-scanned before the
+            # delete-on-approve/reject change shipped (or hit by the paged-approve
+            # gap) is APPROVED yet still has a leftover backup. Reconstructing from
+            # that stale blob would build a WRONG baseline — dropping tables it
+            # lists as added, restoring stale pre-images — and manufacture drift on
+            # a clean re-scan. When re-scanning from APPROVED the live assets ARE
+            # the approved baseline, so we pass None and any stale backup is ignored
+            # (reconstruct_approved_baseline then returns live unchanged).
+            existing_backup = _read_existing_backup(source_id) if had_open_rescan else None
+            live = read_assets_for_datasource(SMUS_DOMAIN_ID, project_id, datasource_id)
+            accepted = reconstruct_approved_baseline(live, existing_backup, source_id=source_id)
+            diff = diff_tables(accepted, metadata.tables)
+            logger.info(
+                "Re-scan diff for %s: added=%d removed=%d modified=%d unchanged=%d",
+                datasource_id,
+                len(diff.added),
+                len(diff.removed),
+                len(diff.modified),
+                len(diff.unchanged),
+            )
+            write_metadata = DiscoveredMetadata(tables=merged_write_set(diff, accepted, metadata.tables))
+
+            # Recompute the approved count for the post-merge live state. The merge
+            # resets every modified and added table to PENDING_REVIEW and leaves
+            # unchanged tables' approval intact, so only unchanged-and-approved
+            # tables still count. Added tables are new/pending; removed tables are
+            # excluded to match the fresh `tablesDiscovered` denominator. Written to
+            # the source row below — without it the row keeps the pre-rescan count
+            # through the whole RESCAN_REVIEW window and per-table reviews then apply
+            # their +/-1 adjustment on a stale base.
+            unchanged_ids = set(diff.unchanged)
+            rescan_tables_approved = sum(
+                1
+                for t in accepted
+                if t.table_id in unchanged_ids and t.business_metadata.review_status == ReviewStatus.APPROVED
+            )
+
+            # Tables a prior (still-open) re-scan added that are gone from this
+            # fresh scan. reconstruct_approved_baseline drops them from the
+            # baseline and they are absent from the fresh scan, so diff_tables
+            # files them under neither added nor removed and their live assets
+            # would be stranded across this review. Carry them into the backup so
+            # a review outcome reaps them (approve via removed_tables, reject via
+            # added_tables). Empty unless an open prior re-scan's backup exists.
+            fresh_table_ids = {t.table_id for t in metadata.tables}
+            orphaned_added = [
+                tid for tid in (existing_backup or {}).get("added_tables", []) if tid not in fresh_table_ids
+            ]
+            # Nothing for the steward to review iff the fresh diff is empty AND no
+            # orphaned added tables were carried forward. Drives the no-drift
+            # auto-return to APPROVED (read by enrichment via reviewNeeded).
+            rescan_review_needed = diff.has_changes or bool(orphaned_added)
+
+            # Back up the pre-rescan state to S3 BEFORE the merge overwrites any
+            # live asset. This blob is the only durable record of what the re-scan
+            # changed (the diff is otherwise discarded) and is what approve (delete
+            # removed) and reject (restore modified, delete added) read back.
+            # Needed when the diff has changes OR there are orphaned added tables
+            # to reap; a no-drift re-scan with neither writes none.
+            if diff.has_changes or orphaned_added:
+                if not BUCKET_NAME:
+                    raise RuntimeError(
+                        "BUCKET_NAME is not set; cannot write the re-scan backup that "
+                        "approve/reject rollback depends on. Refusing to overwrite live assets."
+                    )
+                prior_summary = {
+                    k: item[k]
+                    for k in ("tablesDiscovered", "discoveredSchemas", "lastScanAt", "lastScanJobId", "tablesApproved")
+                    if k in item
+                }
+                backup = build_rescan_backup(
+                    diff,
+                    accepted,
+                    source_id=source_id,
+                    scan_job_sk=scan_job_sk,
+                    prior_summary=prior_summary,
+                    orphaned_added_tables=orphaned_added,
+                )
+                backup_key = backup_s3_key(source_id)
+                upload_json(get_s3_client(), BUCKET_NAME, backup_key, backup)
+                logger.info("Re-scan backup written to s3://%s/%s", BUCKET_NAME, backup_key)
+
         write_result = write_to_datazone(
             domain_id=SMUS_DOMAIN_ID,
             project_id=project_id,
-            metadata=metadata,
+            metadata=write_metadata,
             data_source_id=datasource_id,
         )
 
-        # Update scan job with discovery counts
+        # Update scan job with discovery counts (the full fresh scan).
         scan_job_update: dict[str, Any] = {
             "tablesDiscovered": len(metadata.tables),
             "columnsDiscovered": metadata.total_columns,
@@ -225,7 +389,12 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
                 metadata.failed_tables[:_MAX_REPORTED_FAILED_TABLES],
             )
 
-        # Update source record with discovery results
+        # Update the source record's summary fields with THIS scan's results.
+        # Written on a RE-SCAN too: showing the previous scan's counts after an
+        # explicit re-scan is wrong, not merely stale. During review the source
+        # is in RESCAN_REVIEW (out of the APPROVED gate), so consumers ignore it
+        # meanwhile; a reject restores these pre-rescan counts from the S3 backup
+        # (captured above), and an approve keeps them.
         from datetime import datetime
 
         source_update: dict[str, Any] = {
@@ -236,11 +405,17 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             "lastScanAt": datetime.now(UTC).isoformat(),
             "lastScanJobId": scan_job_sk,
         }
-        # Native Glue sources are queryable via AwsDataCatalog as soon as they're
-        # scanned. JDBC sources become queryable only after the federation step
-        # provisions the catalog, so that handler sets `queryable` for them.
+        # Native Glue sources are queryable via AwsDataCatalog as soon as
+        # they're scanned. JDBC sources become queryable only after the
+        # federation step provisions the catalog, so that handler sets
+        # `queryable` for them.
         if source_type == SourceSubType.GLUE_DATABASE:
             source_update["queryable"] = True
+        # On a re-scan, refresh the approved count to the post-merge live state
+        # (computed above). Omitted on a first scan so the create-time 0 and any
+        # per-table review increments are not clobbered.
+        if is_rescan:
+            source_update["tablesApproved"] = rescan_tables_approved
         _get_ds_dao().update(
             key=source_key,
             update_fields=source_update,
@@ -248,7 +423,8 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         )
 
     except Exception as exc:
-        logger.exception("Discovery failed for datasource %s", datasource_id)
+        permanent = is_permanent_scan_error(exc)
+        logger.exception("Discovery failed for datasource %s (permanent=%s)", datasource_id, permanent)
         # Failure-path updates use raise_on_error=False: if the underlying
         # row has been deleted we still want to surface the original
         # exception, not a ConditionalCheckFailedException from cleanup.
@@ -270,7 +446,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             condition="attribute_exists(PK)",
             raise_on_error=False,
         )
-        raise RuntimeError(str(exc)) from exc
+        raise (PermanentScanError if permanent else TransientScanError)(str(exc)) from exc
 
     return {
         "datasourceId": datasource_id,
@@ -280,6 +456,11 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         "tablesDiscovered": len(metadata.tables),
         "columnsDiscovered": metadata.total_columns,
         "assetsCreated": write_result.get("assets_created", 0),
+        # String "true"/"false" (matches isRescan) so the enrichment container
+        # override can pass it as an env var. A re-scan reporting "false" returns
+        # the source straight to APPROVED instead of RESCAN_REVIEW. Always True on
+        # a first scan (enrichment ignores it unless isRescan).
+        "reviewNeeded": "true" if rescan_review_needed else "false",
     }
 
 

@@ -28,8 +28,11 @@ from urllib.parse import unquote
 
 import structlog
 from botocore.exceptions import ClientError
+from coa_common.dao import QueryParams
+from coa_common.domain_models import Table
 from coa_common.metadata_store import SMUSClient
 from coa_common.response import api_response, iso_to_epoch
+from coa_common.s3 import get_s3_client, read_file_bytes, upload_json
 from coa_control_plane_server.models.custom_connector_configuration import CustomConnectorConfiguration
 from coa_control_plane_server.models.glue_configuration import GlueConfiguration
 from coa_control_plane_server.models.glue_execution_engine import GlueExecutionEngine
@@ -55,11 +58,13 @@ from coa_sources.database.glue_ownership import (
     release_platform_catalog,
 )
 from coa_sources.database.metrics import emit_metric
+from coa_sources.database.rescan_backup import S3_ABSENT_CODES, backup_s3_key
 from coa_sources.database.secret_binding import NAMESPACE_TAG_KEY, check_secret_namespace_binding
 
 from .namespace_counters import adjust_namespace_source_count
 from .sources_handler import (
     _AWS_REGION,
+    _BUCKET_NAME,
     _PROJECT_ACCESS_ROLE_ARN,
     _REVIEW_QUEUE_URL,
     _SCAN_QUEUE_URL,
@@ -762,6 +767,204 @@ def _create_database_source(db_req: Any, namespace_id: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _read_rescan_backup(source_id: str) -> dict[str, Any] | None:
+    """Load a source's re-scan backup blob, or ``None`` when there is none.
+
+    ``None`` means the object genuinely does not exist, which is the normal state
+    for a source with no open re-scan. Every other failure — throttling, denied
+    permission, a corrupt or truncated object — is raised, so callers surface it
+    rather than rendering a page that quietly claims nothing changed.
+
+    That distinction is the point. Treating a failed read as "nothing to report"
+    hid pending deletions from the review page while approve still deleted them
+    (the worker reads this same blob itself), so a steward could approve removals
+    they were never shown. Failing loudly is the safe direction here.
+
+    Note on the ``_BUCKET_NAME`` guard: each caller checks it separately rather
+    than once at module load, because the right answer differs per call site —
+    the two read helpers degrade (empty set / no diff) while the keep endpoint
+    answers 500. Collapsing them into one top-level check would force a single
+    behaviour on all three, and raising at import time would break any caller
+    that does not need the bucket at all.
+    """
+    try:
+        raw = read_file_bytes(get_s3_client(), _BUCKET_NAME, backup_s3_key(source_id))
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") in S3_ABSENT_CODES:
+            return None
+        raise
+    return json.loads(raw)
+
+
+def _removed_sets(namespace_id: str, source_id: str) -> tuple[set[str], dict[str, set[str]], set[str]]:
+    """Removed/added tables + removed columns for a re-scan under review, from S3.
+
+    Returns ``(removed_table_ids, removed_columns_by_table, added_table_ids)`` so
+    the list/get handlers can flag ``pendingDeletion`` (removed) and ``added``
+    (net-new) off a single backup read. Non-empty ONLY when the source is in
+    RESCAN_REVIEW — a stale backup from a prior re-scan must not flag an approved
+    source.
+
+    Empty means there is genuinely nothing flagged. A failed backup read is NOT
+    reported as empty — it propagates, because a page that hides pending
+    deletions is worse than an error (see ``_read_rescan_backup``).
+    """
+    empty: tuple[set[str], dict[str, set[str]], set[str]] = (set(), {}, set())
+    if not _BUCKET_NAME:
+        return empty
+    try:
+        item = _get_dao().get({"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"}, projection=["status"])
+    except ClientError:
+        logger.exception("removed_sets_status_read_failed", source_id=source_id)
+        return empty
+    if not item or item.get("status") != SourceStatus.RESCAN_REVIEW:
+        return empty
+    blob = _read_rescan_backup(source_id)
+    if blob is None:
+        logger.info("removed_sets_backup_absent", source_id=source_id)
+        return empty
+    removed_tables = set(blob.get("removed_tables") or [])
+    removed_columns = {tid: set(cols) for tid, cols in (blob.get("removed_columns") or {}).items()}
+    added_tables = set(blob.get("added_tables") or [])
+    return removed_tables, removed_columns, added_tables
+
+
+def _effective_review_status(stored: str | None, *, pending_deletion: bool) -> str | None:
+    """Review status to report for a table/column, accounting for pending deletion.
+
+    A re-scan-dropped table or column is retained (not deleted until the steward
+    approves the removal) and keeps its stored review status — often APPROVED — so
+    it would read "Approved" and be missed by the pending-review filter. Report it
+    as PENDING_REVIEW instead, so it surfaces for the steward to decide
+    delete-vs-Keep. A stored REJECTED status is preserved (mirrors the re-scan
+    merge's status rules). Otherwise the stored value passes through unchanged
+    (``None`` stays ``None`` so callers keep their own default). Derived at read
+    time only — the stored asset is never mutated, so a reject still reverts by
+    doing nothing.
+
+    Why PENDING_REVIEW rather than a dedicated PENDING_DELETION status: review
+    status answers "has a steward settled this item", and a pending deletion has
+    not been settled, so it belongs in the existing not-settled state. That also
+    makes it fall out of the pending-review filter and count for free. *What* is
+    unsettled is carried separately by the ``pendingDeletion`` flag on the table
+    and column, which is what drives the badge and the Keep button. A fourth
+    ReviewStatus member would be an API-breaking change (the enum is
+    PENDING_REVIEW / APPROVED / REJECTED) and would force every existing client
+    that switches on it to learn a value that means "still pending, but for a
+    different reason".
+    """
+    from coa_control_plane_server.models.review_status import ReviewStatus
+
+    if pending_deletion and stored != ReviewStatus.REJECTED:
+        return ReviewStatus.PENDING_REVIEW
+    return stored
+
+
+def _rescan_table_diff(namespace_id: str, source_id: str, table_id: str, current: Table) -> dict[str, Any] | None:
+    """Old-vs-new field breakdown for a modified table under re-scan review.
+
+    Reconstructs the pre-rescan (last-approved) form of the table from the S3
+    backup and diffs it against the freshly-merged ``current`` asset, reusing the
+    same pure ``diff_tables`` rules the discovery merge used — so a Data Steward
+    sees exactly what changed before approving. Columns the source dropped are
+    folded in from the backup's ``removed_columns`` because ``diff_tables`` cannot
+    see them: the merge keeps a removed column in the live asset (tagged
+    pendingDeletion), so it is present on both sides of the diff. Returns None (no
+    before/after) unless the source is in RESCAN_REVIEW, this table has a stored
+    pre-image (only *modified* tables do), and there is at least one change to
+    show (a table field, a diffed column, or a backed-up removed column).
+    Degrades to None on any read/parse error — a missing panel beats a 500.
+    """
+    from coa_common.datazone_forms import deserialize_form
+    from coa_control_plane_server.models.rescan_column_change import RescanColumnChange
+    from coa_control_plane_server.models.rescan_field_change import RescanFieldChange
+    from coa_control_plane_server.models.rescan_table_diff import RescanTableDiff
+
+    from coa_sources.database.rescan import FieldChange, diff_tables
+
+    if not _BUCKET_NAME:
+        return None
+    try:
+        item = _get_dao().get({"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"}, projection=["status"])
+    except ClientError:
+        logger.exception("rescan_diff_status_read_failed", source_id=source_id)
+        return None
+    if not item or item.get("status") != SourceStatus.RESCAN_REVIEW:
+        return None
+    blob = _read_rescan_backup(source_id)
+    if blob is None:
+        logger.info("rescan_diff_backup_absent", source_id=source_id)
+        return None
+    payload = (blob.get("modified_backup") or {}).get(table_id)
+    if not payload:
+        return None  # added / removed / unchanged tables carry no pre-image
+    try:
+        old = deserialize_form(payload, data_source_id=source_id)
+    except Exception:
+        logger.warning("rescan_diff_deserialize_failed", source_id=source_id, table_id=table_id)
+        return None
+
+    diff = diff_tables([old], [current])
+    change = diff.modified[0] if diff.modified else None
+
+    def _fc(fc: FieldChange) -> dict[str, Any]:
+        return RescanFieldChange(field=fc.field, kind=fc.kind.value, old=fc.old or None, new=fc.new or None).to_dict()
+
+    table_fields = [_fc(fc) for fc in change.table_fields] if change else []
+    columns = (
+        [
+            RescanColumnChange(name=cc.name, status=cc.status, fields=[_fc(fc) for fc in cc.fields] or None).to_dict()
+            for cc in change.columns
+        ]
+        if change
+        else []
+    )
+
+    # Fold in columns the source dropped. ``diff_tables`` structurally can't see
+    # them: the discovery merge RETAINS a removed column in the live ``current``
+    # asset (tagged pendingDeletion so the steward can "Keep" it), so the column
+    # is present on BOTH sides of the diff and never registers as a removal. The
+    # backup's ``removed_columns`` is the authoritative record of what the source
+    # dropped — add each as a status="removed" entry the diff missed, skipping any
+    # already surfaced (e.g. if the current asset did not retain it).
+    removed = (blob.get("removed_columns") or {}).get(table_id) or []
+    already = {c["name"] for c in columns}
+    for col_name in removed:
+        if col_name not in already:
+            columns.append(RescanColumnChange(name=col_name, status="removed", fields=None).to_dict())
+
+    # Render whenever there is anything to show. A dropped-columns-only re-scan has
+    # no table_fields and an empty diff, yet must still surface the removals.
+    if not table_fields and not columns:
+        return None
+
+    return RescanTableDiff(
+        tableFields=table_fields or None,
+        columns=columns or None,
+    ).to_dict()
+
+
+def _scl_form_content(forms_data: list[dict[str, Any]] | None) -> str | None:
+    """Content string of the SCL table form in *forms_data*, or ``None``.
+
+    ``None`` covers every shape that carries no usable payload: no forms list at
+    all, a list with no SCL form, and an SCL form whose ``content`` key is
+    absent, ``null`` or empty. Collapsing those into one answer is what lets the
+    caller probe usability at CONTENT level rather than list level — DataZone
+    ``Search`` with ``additionalAttributes=["FORMS"]`` can return a *non-empty*
+    ``formsOutput`` whose matching form has no content, and a list-level probe
+    calls that usable, then dies on ``json.loads(form["content"])``
+    (``KeyError``/``TypeError``, neither caught by the JSON except) — a 500 for
+    the whole page instead of a per-asset skip.
+    """
+    from coa_common.datazone_forms import FORM_TYPE_NAME
+
+    for form in forms_data or []:
+        if form.get("formName") == FORM_TYPE_NAME:
+            return form.get("content") or None
+    return None
+
+
 def _handle_list_tables(event: dict[str, Any], namespace_id: str, source_id: str) -> dict[str, Any]:
     """GET /namespaces/{namespaceId}/sources/{sourceId}/tables."""
     from coa_common.datazone_forms import FORM_TYPE_NAME
@@ -790,6 +993,7 @@ def _handle_list_tables(event: dict[str, Any], namespace_id: str, source_id: str
         return api_response(404, {"error": f"Namespace {namespace_id} not found"})
 
     client = _get_smus_client()
+    removed_tables, removed_columns, added_tables = _removed_sets(namespace_id, source_id)
     ds_key = f"DS#{source_id}"
     try:
         result = client.search_assets(
@@ -797,6 +1001,7 @@ def _handle_list_tables(event: dict[str, Any], namespace_id: str, source_id: str
             search_text=ds_key,
             max_results=max_results,
             next_token=next_token,
+            include_forms=True,
         )
     except Exception:
         logger.exception("list_tables_search_failed", source_id=source_id, project_id=project_id)
@@ -804,12 +1009,41 @@ def _handle_list_tables(event: dict[str, Any], namespace_id: str, source_id: str
 
     items: list[dict[str, Any]] = []
     skipped_assets: int = 0
+    fallback_count: int = 0
     for asset in result.items:
         if not asset.name.startswith(f"{ds_key}:"):
             continue
-        try:
-            detail = client.get_asset_forms(asset_id=asset.asset_id)
-        except Exception:
+
+        # Prefer inline forms from search; fall back to get_asset_forms per-asset
+        # when the inline payload carries no usable SCL form content. The probe is
+        # deliberately at content level (see _scl_form_content): a non-empty
+        # forms_output whose SCL form has null/absent content is exactly the
+        # empty-form-content case this fallback exists for, so treating it as
+        # usable would both 500 the page and silently drop the table.
+        content = _scl_form_content(asset.forms_output)
+        if content is None:
+            fallback_count += 1
+            logger.info(
+                "list_tables_forms_fallback",
+                source_id=source_id,
+                asset_id=asset.asset_id,
+                asset_name=asset.name,
+            )
+            try:
+                detail = client.get_asset_forms(asset_id=asset.asset_id)
+                content = _scl_form_content(detail.get("formsOutput"))
+            except Exception:
+                skipped_assets += 1
+                logger.warning(
+                    "list_tables_asset_forms_failed",
+                    source_id=source_id,
+                    asset_id=asset.asset_id,
+                    asset_name=asset.name,
+                    exc_info=True,
+                )
+                continue
+
+        if content is None:
             skipped_assets += 1
             logger.warning(
                 "list_tables_asset_forms_failed",
@@ -818,53 +1052,78 @@ def _handle_list_tables(event: dict[str, Any], namespace_id: str, source_id: str
                 asset_name=asset.name,
             )
             continue
-        for form in detail.get("formsOutput", []):
-            if form.get("formName") != FORM_TYPE_NAME:
-                continue
-            try:
-                payload = json.loads(form["content"])
-            except (json.JSONDecodeError, ValueError):
-                skipped_assets += 1
-                logger.warning(
-                    "list_tables_form_parse_failed",
-                    source_id=source_id,
-                    asset_id=asset.asset_id,
-                    asset_name=asset.name,
-                    form_name=form.get("formName"),
-                )
-                continue
-            table_id = f"{payload.get('databaseName', '')}.{payload.get('tableName', '')}"
-            cols_field = payload.get("columns", "[]")
-            try:
-                columns_raw = json.loads(cols_field) if isinstance(cols_field, str) else (cols_field or [])
-            except (json.JSONDecodeError, ValueError):
-                skipped_assets += 1
-                logger.warning(
-                    "list_tables_columns_parse_failed",
-                    source_id=source_id,
-                    asset_id=asset.asset_id,
-                    asset_name=asset.name,
-                    table_id=table_id,
-                )
-                continue
-            columns_approved = sum(
-                1
-                for c in columns_raw
-                if isinstance(c, dict) and c.get("business_metadata", {}).get("review_status") == ReviewStatus.APPROVED
+
+        try:
+            payload = json.loads(content)
+        except (json.JSONDecodeError, ValueError):
+            skipped_assets += 1
+            logger.warning(
+                "list_tables_form_parse_failed",
+                source_id=source_id,
+                asset_id=asset.asset_id,
+                asset_name=asset.name,
+                form_name=FORM_TYPE_NAME,
             )
-            summary = TableSummary(
-                tableId=table_id,
-                name=payload.get("tableName", ""),
-                database=payload.get("databaseName", ""),
-                columnCount=payload.get("columnCount", 0),
-                columnsApproved=columns_approved,
-                reviewStatus=payload.get("reviewStatus", ReviewStatus.PENDING_REVIEW),
-                enrichmentSource=payload.get("enrichmentSource"),
+            continue
+        table_id = f"{payload.get('databaseName', '')}.{payload.get('tableName', '')}"
+        cols_field = payload.get("columns", "[]")
+        try:
+            columns_raw = json.loads(cols_field) if isinstance(cols_field, str) else (cols_field or [])
+        except (json.JSONDecodeError, ValueError):
+            skipped_assets += 1
+            logger.warning(
+                "list_tables_columns_parse_failed",
+                source_id=source_id,
+                asset_id=asset.asset_id,
+                asset_name=asset.name,
+                table_id=table_id,
             )
-            if review_status_filter and summary.review_status != review_status_filter:
-                continue
-            items.append(summary.to_dict())
-            break
+            continue
+        # A re-scan RETAINS a dropped column in the merged asset (tagged
+        # pending-deletion) so the steward can Keep it, so the merged
+        # columns list is the honest total. A column slated for deletion is
+        # not "approved" even if its stored review_status still says so.
+        removed_for_table = removed_columns.get(table_id, set())
+        columns_approved = sum(
+            1
+            for c in columns_raw
+            if isinstance(c, dict)
+            and c.get("business_metadata", {}).get("review_status") == ReviewStatus.APPROVED
+            and c.get("name") not in removed_for_table
+        )
+        columns_pending_deletion = sum(
+            1 for c in columns_raw if isinstance(c, dict) and c.get("name") in removed_for_table
+        )
+        summary = TableSummary(
+            tableId=table_id,
+            name=payload.get("tableName", ""),
+            database=payload.get("databaseName", ""),
+            columnCount=len(columns_raw),
+            columnsApproved=columns_approved,
+            columnsPendingDeletion=columns_pending_deletion or None,
+            # A fully-removed table is retained (deleted only on approve) with
+            # its old status (often APPROVED); report it as PENDING_REVIEW so it
+            # shows in the pending filter/count. A column-losing table already
+            # reads PENDING_REVIEW (the merge reset it).
+            reviewStatus=_effective_review_status(
+                payload.get("reviewStatus"), pending_deletion=table_id in removed_tables
+            )
+            or ReviewStatus.PENDING_REVIEW,
+            enrichmentSource=payload.get("enrichmentSource"),
+            pendingDeletion=(table_id in removed_tables) or None,
+            added=(table_id in added_tables) or None,
+        )
+        if review_status_filter and summary.review_status != review_status_filter:
+            continue
+        items.append(summary.to_dict())
+
+    if fallback_count > 0:
+        logger.info(
+            "list_tables_forms_fallback_summary",
+            source_id=source_id,
+            fallback_count=fallback_count,
+            total_assets=len(result.items),
+        )
 
     response: dict[str, Any] = {"items": items}
     if skipped_assets > 0:
@@ -897,19 +1156,20 @@ def _handle_get_table(namespace_id: str, source_id: str, table_id: str) -> dict[
         return api_response(404, {"error": f"Namespace {namespace_id} not found"})
 
     client = _get_smus_client()
+    removed_tables, removed_columns, added_tables = _removed_sets(namespace_id, source_id)
     ds_key = f"DS#{source_id}"
     asset_name = f"{ds_key}:{table_id}"
     try:
-        result = client.search_assets(project_id=project_id, search_text=asset_name, max_results=1)
+        asset = client.find_asset_by_name(project_id=project_id, name=asset_name)
     except Exception:
         logger.exception("get_table_search_failed", source_id=source_id, table_id=table_id)
         return api_response(500, {"error": "Failed to search for table"})
 
-    if not result.items or result.items[0].name != asset_name:
+    if asset is None:
         return api_response(404, {"error": f"Table {table_id} not found"})
 
     try:
-        detail = client.get_asset_forms(asset_id=result.items[0].asset_id)
+        detail = client.get_asset_forms(asset_id=asset.asset_id)
     except Exception:
         logger.exception("get_table_forms_failed", source_id=source_id, table_id=table_id)
         return api_response(500, {"error": "Failed to retrieve table metadata"})
@@ -925,6 +1185,10 @@ def _handle_get_table(namespace_id: str, source_id: str, table_id: str) -> dict[
             return api_response(500, {"error": "Failed to parse table metadata"})
 
         biz = table.business_metadata
+        # A re-scan-dropped table is retained (deleted only on approve) with its
+        # stored status; report the table AND its columns as PENDING_REVIEW so a
+        # dropped table is never shown as still-Approved.
+        table_removed = table_id in removed_tables
         pk = None
         if table.primary_key and table.primary_key.columns:
             pk = PrimaryKeyOutput(
@@ -944,6 +1208,7 @@ def _handle_get_table(namespace_id: str, source_id: str, table_id: str) -> dict[
         ] or None
         columns = []
         for col in table.columns:
+            col_removed = col.name in removed_columns.get(table_id, set())
             col_biz = None
             if col.business_metadata:
                 col_biz = BusinessMetadataOutput(
@@ -952,7 +1217,14 @@ def _handle_get_table(namespace_id: str, source_id: str, table_id: str) -> dict[
                     glossaryTerms=col.business_metadata.glossary_terms or None,
                     tags=col.business_metadata.tags or None,
                     enrichmentSource=col.business_metadata.enrichment_source or None,
-                    reviewStatus=col.business_metadata.review_status or None,
+                    # A pending-deletion column — or any column of a dropped
+                    # table — reads as PENDING_REVIEW (see _effective_review_status)
+                    # so it isn't shown as still-Approved.
+                    reviewStatus=_effective_review_status(
+                        col.business_metadata.review_status,
+                        pending_deletion=col_removed or table_removed,
+                    )
+                    or None,
                     confidence=col.business_metadata.confidence or None,
                 ).to_dict()
             columns.append(
@@ -970,6 +1242,7 @@ def _handle_get_table(namespace_id: str, source_id: str, table_id: str) -> dict[
                     description=col.business_metadata.description or None,
                     businessMetadata=col_biz,
                     distinctValues=col.distinct_values or None,
+                    pendingDeletion=col_removed or None,
                 ).to_dict()
             )
         tech = TechnicalMetadataOutput(
@@ -978,25 +1251,33 @@ def _handle_get_table(namespace_id: str, source_id: str, table_id: str) -> dict[
             format=table.technical_metadata.format or None,
             location=table.technical_metadata.location or None,
         ).to_dict()
+        rescan_diff = _rescan_table_diff(namespace_id, source_id, table_id, table)
+        # A re-scan-discovered new table has no old-vs-new diff; the UI shows a
+        # "new table" note instead of the before/after panel.
+        table_added = table_id in added_tables
+        effective_status = _effective_review_status(biz.review_status, pending_deletion=table_removed)
         return api_response(
             200,
             {
                 "tableId": table.table_id,
                 "name": table.name,
                 "database": table.database,
-                "reviewStatus": biz.review_status or RS.PENDING_REVIEW,
+                "reviewStatus": effective_status or RS.PENDING_REVIEW,
                 "businessMetadata": BusinessMetadataOutput(
                     description=biz.description or None,
                     synonyms=biz.synonyms or None,
                     glossaryTerms=biz.glossary_terms or None,
                     tags=biz.tags or None,
                     enrichmentSource=biz.enrichment_source or None,
-                    reviewStatus=biz.review_status or None,
+                    reviewStatus=effective_status or None,
                 ).to_dict(),
                 "primaryKey": pk,
                 "foreignKeys": fks,
                 "columns": columns,
                 "technicalMetadata": tech,
+                "pendingDeletion": table_removed or None,
+                "rescanDiff": rescan_diff,
+                "added": table_added or None,
             },
         )
 
@@ -1062,13 +1343,11 @@ def _load_single_asset(
     ds_key = f"DS#{source_id}"
     asset_name = f"{ds_key}:{table_id}"
     try:
-        # max_results=10 tolerates partial-prefix search hits; we filter to the exact name.
-        result = client.search_assets(project_id=project_id, search_text=asset_name, max_results=10)
+        asset = client.find_asset_by_name(project_id=project_id, name=asset_name)
     except Exception:
         logger.exception("load_single_asset_search_failed", source_id=source_id, table_id=table_id)
         return None, api_response(500, {"error": "Failed to load table from catalog"})
 
-    asset = next((a for a in result.items if a.name == asset_name), None)
     if asset is None:
         return None, api_response(404, {"error": f"Table '{table_id}' not found"})
 
@@ -1199,6 +1478,12 @@ _REVIEWABLE_STATES: frozenset[str] = frozenset(
         # the steward must re-onboard a new source. APPROVAL_FAILED /
         # REJECTION_FAILED remain reviewable so a failed bulk run can be retried.
         "PENDING_REVIEW",
+        # A re-scan of an approved source lands in RESCAN_REVIEW. The steward
+        # must be able to edit/touch-up and review its new + changed items
+        # exactly as on a first scan (which sits in PENDING_REVIEW), so
+        # RESCAN_REVIEW is reviewable too. Without this, per-item edit/review
+        # 409s on a rescan and the steward can only bulk approve/reject.
+        "RESCAN_REVIEW",
         "APPROVED",
         "APPROVAL_FAILED",
         "REJECTION_FAILED",
@@ -1335,6 +1620,117 @@ def _handle_review_table(event: dict[str, Any], namespace_id: str, source_id: st
                 emit_metric("TablesRejectedByReview", 1, "Count", ReviewScope="Table")
 
     return api_response(200, {"tableId": table_id, "reviewStatus": new_table_status})
+
+
+def _handle_keep_rescan_removal(
+    event: dict[str, Any], namespace_id: str, source_id: str, table_id: str
+) -> dict[str, Any]:
+    """PUT /namespaces/{namespaceId}/sources/{sourceId}/tables/{tableId}/keep.
+
+    Decline a re-scan-flagged removal so approving the re-scan will NOT delete
+    the table (or, when ``columnName`` is given in the body, one column of it).
+    "Removed from the source" is not always "deleted" — a partial scan, a
+    permission change, or a narrowed include/exclude filter can drop something
+    the steward wants to keep.
+
+    Drops the item from the removal set in the S3 backup blob that the approve
+    worker reads (``removed_tables`` / ``removed_columns``), so no worker change
+    is needed: approve simply stops deleting it, and the surfaced
+    ``pendingDeletion`` marker clears on the next read. Only valid while the
+    source is in RESCAN_REVIEW. Idempotent — keeping an item that is not in the
+    removal set is a 200 no-op.
+
+    On a 5xx no source or asset status is changed, deliberately. Nothing here is
+    a long-running operation with an in-progress state to unwind: either the
+    backup blob was rewritten or it was not. The source stays in RESCAN_REVIEW
+    and the review is exactly as it was, so the caller can just retry. Flipping a
+    row to a failed state would be worse — it would then need clearing before the
+    steward could carry on, turning a transient S3 blip into a stuck review.
+    """
+    try:
+        body: dict[str, Any] = json.loads(event.get("body") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return api_response(400, {"error": "Invalid JSON body"})
+    column_name = body.get("columnName") or None
+
+    if not _BUCKET_NAME:
+        logger.error("keep_removal_no_bucket", source_id=source_id)
+        return api_response(500, {"error": "Backup bucket not configured"})
+
+    try:
+        item = _get_dao().get(
+            {"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"},
+            projection=["status", "sourceType"],
+        )
+    except ClientError:
+        logger.exception("keep_removal_status_read_failed", source_id=source_id)
+        return api_response(500, {"error": "Internal server error"})
+    if not item:
+        return api_response(404, {"error": f"Source '{source_id}' not found"})
+    if item.get("sourceType") != SourceType.DATABASE:
+        return api_response(400, {"error": "Keep operations only apply to DATABASE sources"})
+    status = item.get("status")
+    if status != SourceStatus.RESCAN_REVIEW:
+        return api_response(
+            409,
+            {"error": f"Source is in '{status}' state; keeping a removal requires RESCAN_REVIEW"},
+        )
+
+    s3 = get_s3_client()
+    key = backup_s3_key(source_id)
+    try:
+        blob = _read_rescan_backup(source_id)
+    except ClientError:
+        # Throttling, a denied permission, or a transport fault. Answering 404
+        # here would read as "there is nothing to keep" and stop the caller
+        # retrying, so report it as the server-side fault it actually is.
+        logger.exception("keep_removal_backup_read_failed", source_id=source_id)
+        return api_response(500, {"error": "Re-scan backup temporarily unavailable; retry the request"})
+    if blob is None:
+        return api_response(404, {"error": "No re-scan removal set found for this source"})
+
+    changed = False
+    if column_name:
+        removed_columns: dict[str, list[str]] = blob.get("removed_columns") or {}
+        cols = removed_columns.get(table_id) or []
+        if column_name in cols:
+            remaining = [c for c in cols if c != column_name]
+            if remaining:
+                removed_columns[table_id] = remaining
+            else:
+                # Drop the now-empty table entry so it does not linger as a key.
+                removed_columns.pop(table_id, None)
+            blob["removed_columns"] = removed_columns
+            changed = True
+    else:
+        removed_tables: list[str] = blob.get("removed_tables") or []
+        if table_id in removed_tables:
+            blob["removed_tables"] = [t for t in removed_tables if t != table_id]
+            changed = True
+
+    if changed:
+        # Size note (for the next security review): this write cannot grow the
+        # object. Keep only ever *removes* one entry from `removed_tables` or
+        # `removed_columns` — both branches above rebuild the list by filtering
+        # an item out — so the blob shrinks or stays identical, and no
+        # caller-supplied data enters it. The request body contributes a single
+        # column name, which is used to look up an existing entry, never stored.
+        #
+        # The blob's size is set when discovery writes it, bounded by the
+        # source's table and column counts; the discovery cap is
+        # MAX_TABLES_PER_SOURCE (10000 in the deployed stack). So there is no
+        # unbounded, attacker-influenced growth path here to check against.
+        try:
+            upload_json(s3, _BUCKET_NAME, key, blob)
+        except Exception:
+            logger.exception("keep_removal_backup_write_failed", source_id=source_id, table_id=table_id)
+            return api_response(500, {"error": "Failed to record kept removal"})
+        logger.info("rescan_removal_kept", source_id=source_id, table_id=table_id, column_name=column_name)
+
+    resp: dict[str, Any] = {"tableId": table_id, "pendingDeletion": False}
+    if column_name:
+        resp["columnName"] = column_name
+    return api_response(200, resp)
 
 
 def _handle_update_table_metadata(
@@ -1669,33 +2065,44 @@ def _handle_update_column_metadata(
 #
 # Frontend polls GetSource for the source's `status` field. Terminal states:
 #   - APPROVE flow:  APPROVED        (or APPROVAL_FAILED on worker error)
-#   - REJECT flow:   PENDING_REVIEW  (rejection puts the source back into
-#                                     review; tables marked REJECTED retain
-#                                     that status — REJECTION_FAILED on error)
+#   - REJECT flow:   REJECTED        (a first-scan reject is terminal; tables
+#                                     marked REJECTED retain that status —
+#                                     REJECTION_FAILED on error)
+#   - RE-SCAN (source was RESCAN_REVIEW before the action): approve → APPROVED
+#                                     (the re-scan's removed items are deleted);
+#                                     reject → APPROVED (the pre-rescan state is
+#                                     restored and the fresh scan discarded).
 
 
 # Per-decision lifecycle: maps a ReviewDecision value to the
 # (transient_status, failure_status, allowed_entry_states) triple.
-def _bulk_lifecycle(decision: str) -> tuple[str, str, tuple[str, str]]:
-    """Return (transient, failed, allowed_entry_states) for a decision."""
+def _bulk_lifecycle(decision: str) -> tuple[str, str, tuple[str, ...]]:
+    """Return (transient, failed, allowed_entry_states) for a decision.
+
+    RESCAN_REVIEW is an allowed entry for BOTH approve and reject: a re-scan of
+    an approved source lands in RESCAN_REVIEW and the steward finalizes it with
+    the same approve/reject actions (the worker handles the re-scan specifics).
+    """
     from coa_control_plane_server.models.review_decision import ReviewDecision
 
     if decision == ReviewDecision.APPROVED:
         return (
             SourceStatus.APPROVING,
             SourceStatus.APPROVAL_FAILED,
-            (SourceStatus.PENDING_REVIEW, SourceStatus.APPROVAL_FAILED),
+            (SourceStatus.PENDING_REVIEW, SourceStatus.APPROVAL_FAILED, SourceStatus.RESCAN_REVIEW),
         )
     if decision == ReviewDecision.REJECTED:
         return (
             SourceStatus.REJECTING,
             SourceStatus.REJECTION_FAILED,
-            (SourceStatus.PENDING_REVIEW, SourceStatus.REJECTION_FAILED),
+            (SourceStatus.PENDING_REVIEW, SourceStatus.REJECTION_FAILED, SourceStatus.RESCAN_REVIEW),
         )
     raise ValueError(f"Unsupported decision: {decision}")
 
 
-def _enqueue_bulk_review(namespace_id: str, source_id: str, decision: str) -> dict[str, Any] | None:
+def _enqueue_bulk_review(
+    namespace_id: str, source_id: str, decision: str, *, is_rescan: bool = False
+) -> dict[str, Any] | None:
     """Send a bulk-review SQS message. Returns an error response on failure."""
     if not _REVIEW_QUEUE_URL:
         return api_response(500, {"error": "REVIEW_QUEUE_URL not configured"})
@@ -1703,6 +2110,9 @@ def _enqueue_bulk_review(namespace_id: str, source_id: str, decision: str) -> di
         "namespaceId": namespace_id,
         "sourceId": source_id,
         "decision": decision,
+        # Tells the worker to finalize a re-scan (approve deletes removed items;
+        # reject restores the pre-rescan state and returns the source to APPROVED).
+        "isRescan": is_rescan,
     }
     try:
         _get_sqs().send_message(
@@ -1807,11 +2217,17 @@ def _handle_bulk_review(
     """
     transient, failed, allowed_entry = _bulk_lifecycle(decision)
 
-    _, err = _transition_to_transient(namespace_id, source_id, transient, allowed_entry)
+    item, err = _transition_to_transient(namespace_id, source_id, transient, allowed_entry)
     if err:
         return err
 
-    err = _enqueue_bulk_review(namespace_id, source_id, decision)
+    # A re-scan is finalized differently by the worker (approve deletes the
+    # removed items; reject restores the pre-rescan state and returns to
+    # APPROVED). Detect it from the status the source held BEFORE this
+    # transition — RESCAN_REVIEW — captured in the returned item.
+    is_rescan = bool(item and item.get("status") == SourceStatus.RESCAN_REVIEW)
+
+    err = _enqueue_bulk_review(namespace_id, source_id, decision, is_rescan=is_rescan)
     if err:
         # Best-effort rollback: if SQS enqueue failed, restore status so the user
         # can retry. We don't fail-fast on rollback errors; the worker has its
@@ -1901,8 +2317,75 @@ def _handle_get_scan_job(namespace_id: str, source_id: str, job_id: str) -> dict
         # clean scan's response is unchanged.
         "tablesFailed": _optional_int(scan_item.get("tablesFailed")),
         "failedTables": scan_item.get("failedTables"),
+        # Enrichment can partially fail independently of discovery: individual
+        # tables that error (guardrail block, parse/timeout) are written back
+        # without enrichment while the scan still completes. These fields name
+        # those tables so the partial failure is visible at review; both are
+        # absent (dropped below) on a clean scan. Written by the enrichment
+        # handler onto this scan-job row. Distinct from the discovery failures
+        # above — a table can be read fine and still fail to enrich.
+        "enrichmentPartialFailure": scan_item.get("enrichmentPartialFailure"),
+        "enrichmentFailedTables": scan_item.get("enrichmentFailedTables"),
     }
     return api_response(200, {k: v for k, v in response.items() if v is not None})
+
+
+def _scan_job_to_entry(item: dict[str, Any]) -> dict[str, Any]:
+    """Map one source-scan-jobs row to a ListSourceScanJobs entry.
+
+    Rows written before the review-event feature carry no ``eventType``; those
+    are scans, so a missing ``eventType`` defaults to ``"SCAN"``. ``at`` is the
+    row's SK (the ISO timestamp it was written at). None-valued fields are
+    dropped by the caller so the response only carries what applies to the row.
+    """
+    entry: dict[str, Any] = {
+        "at": iso_to_epoch(item.get("SK")),
+        "eventType": item.get("eventType") or "SCAN",
+        "status": item.get("status"),
+        "scanType": item.get("scanType"),
+        "tablesDiscovered": item.get("tablesDiscovered"),
+        "tablesApproved": item.get("tablesApproved"),
+        "completedAt": iso_to_epoch(item.get("completedAt")),
+        "errorMessage": item.get("errorMessage"),
+        "decision": item.get("decision"),
+        "isRescan": item.get("isRescan"),
+    }
+    return {k: v for k, v in entry.items() if v is not None}
+
+
+def _handle_list_scan_jobs(namespace_id: str, source_id: str) -> dict[str, Any]:
+    """GET /namespaces/{namespaceId}/sources/{sourceId}/scan.
+
+    Lists every scan-job and review-event row for the source, newest first.
+    PK = SRC#{sourceId}; rows are sorted by SK (ISO timestamp) descending.
+    """
+    try:
+        source_item = _get_dao().get({"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"})
+    except ClientError:
+        logger.exception("ddb_get_failed", source_id=source_id)
+        return api_response(500, {"error": "Internal server error"})
+
+    if not source_item:
+        return api_response(404, {"error": f"Source '{source_id}' not found"})
+
+    try:
+        rows = _get_scan_dao().query_all(
+            QueryParams(
+                key_condition="#pk = :pk",
+                expression_values={":pk": f"SRC#{source_id}"},
+                expression_names={"#pk": "PK"},
+                scan_forward=False,
+            )
+        )
+    except ClientError:
+        logger.exception("ddb_query_scan_jobs_failed", source_id=source_id)
+        return api_response(500, {"error": "Internal server error"})
+
+    # Sort newest-first by SK regardless of the store's return order (belt and
+    # suspenders alongside scan_forward=False).
+    rows.sort(key=lambda r: str(r.get("SK", "")), reverse=True)
+    items = [_scan_job_to_entry(r) for r in rows]
+    return api_response(200, {"items": items})
 
 
 # ---------------------------------------------------------------------------

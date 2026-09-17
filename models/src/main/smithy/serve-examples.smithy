@@ -64,6 +64,7 @@ apply KBSearch @examples([
                 {
                     chunkId: "doc-42#p7"
                     text: "Enterprise contracts allow refunds within 30 days of invoice."
+                    sourceDocumentId: "src-6f8b4f12"
                     sourceDocumentName: "Enterprise Terms.pdf"
                     relevanceScore: 0.82
                 }
