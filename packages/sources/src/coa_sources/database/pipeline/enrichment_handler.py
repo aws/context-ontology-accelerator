@@ -43,6 +43,22 @@ def handler() -> None:
     scan_type = os.environ.get("SCAN_TYPE", "full")
     scan_job_sk = os.environ.get("SCAN_JOB_SK", scan_job_id)  # ISO timestamp SK
     domain_id = os.environ["SMUS_DOMAIN_ID"]
+    # Set by the Step Functions enrichment step from the execution input; a
+    # re-scan of an already-approved source ends in RESCAN_REVIEW (the steward
+    # reviews the drift) instead of PENDING_REVIEW. Absent/"false" on a first scan.
+    is_rescan = os.environ.get("IS_RESCAN", "").strip().lower() == "true"
+    # Passed from discovery's reviewNeeded via the RESCAN_REVIEW_NEEDED container
+    # override. A re-scan that found nothing for the steward to review (no drift
+    # and no carried-forward orphaned tables) returns straight to APPROVED instead
+    # of parking the source in RESCAN_REVIEW with an empty review. Default "true"
+    # so an older infra revision without the override stays on the review side.
+    rescan_review_needed = os.environ.get("RESCAN_REVIEW_NEEDED", "true").strip().lower() != "false"
+    if not is_rescan:
+        terminal_status = SourceStatus.PENDING_REVIEW
+    elif rescan_review_needed:
+        terminal_status = SourceStatus.RESCAN_REVIEW
+    else:
+        terminal_status = SourceStatus.APPROVED
 
     # Strip "DS#" prefix to get the bare source UUID
     source_id = datasource_id.removeprefix("DS#")
@@ -97,7 +113,7 @@ def handler() -> None:
         )
         ds_dao.update(
             key=source_key,
-            update_fields={"status": SourceStatus.PENDING_REVIEW},
+            update_fields={"status": terminal_status},
             condition="attribute_exists(PK)",
         )
         return
@@ -144,10 +160,42 @@ def handler() -> None:
                     discovered,
                 )
 
-        # Mark source as PENDING_REVIEW after successful enrichment
+        # Per-table enrichment failures (guardrail block, truncated-JSON parse
+        # error, per-table timeout) do NOT fail the job: the table is written
+        # back without enrichment and the source still advances to review. The
+        # aggregate TablesFailed metric alone hides WHICH tables regressed, so a
+        # steward sees a blank table that looks identical to a legitimately-empty
+        # one. Record the names on this scan-job row (surfaced by
+        # GET .../scan/{jobId}) and log them loudly so the partial failure is
+        # visible rather than silent.
+        failed_table_ids = result.get("failed_table_ids", [])
+        if result["tables_failed"]:
+            logger.warning(
+                "Enrichment partial failure: %d of %d table(s) were written back without "
+                "enrichment (guardrail block or parse/timeout error): %s",
+                result["tables_failed"],
+                result["tables_enriched"] + result["tables_failed"],
+                failed_table_ids,
+            )
+            scan_dao = DynamoDBDAO(os.environ["SOURCE_SCAN_JOBS_TABLE"], region=region)
+            # Best-effort diagnostic write: a concurrently-deleted scan-job row
+            # must not crash an otherwise-successful enrichment (that would flip
+            # the source to SCAN_FAILED and mask the tables that DID enrich).
+            scan_dao.update(
+                key=scan_job_key,
+                update_fields={
+                    "enrichmentPartialFailure": True,
+                    "enrichmentFailedTables": failed_table_ids,
+                },
+                condition="attribute_exists(PK)",
+                raise_on_error=False,
+            )
+
+        # Mark source terminal after successful enrichment: PENDING_REVIEW for a
+        # first scan, RESCAN_REVIEW for a re-scan of an already-approved source.
         ds_dao.update(
             key=source_key,
-            update_fields={"status": SourceStatus.PENDING_REVIEW},
+            update_fields={"status": terminal_status},
             condition="attribute_exists(PK)",
         )
     except Exception as exc:

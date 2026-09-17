@@ -53,6 +53,7 @@ class ResponseAssembler:
         principal: str | None = None,
         strategy: str | None = None,
         model_id: str | None = None,
+        ontology_version: str | None = None,
     ) -> QueryResult:
         """Build a Tier-2 QueryResult from an NL-to-SQL resolution.
 
@@ -68,6 +69,8 @@ class ResponseAssembler:
             principal: Optional authenticated caller identity.
             strategy: Optional Tier-2 strategy label recorded in metadata.
             model_id: Optional per-call model id override.
+            ontology_version: Version of the ontology the query ran against,
+                when the caller can name one (#986).
 
         Returns:
             A QueryResult tagged as Tier 2.
@@ -84,6 +87,7 @@ class ResponseAssembler:
             result_rows=rows,
             query_used=sql_used,
             trace=trace.steps,
+            ontology_version=ontology_version,
             metadata=metadata,
         )
 
@@ -100,6 +104,7 @@ class ResponseAssembler:
         match_confidence: float = 1.0,
         match_source: str = "name",
         model_id: str | None = None,
+        ontology_version: str | None = None,
     ) -> QueryResult:
         """Build a Tier-1 QueryResult from a pre-defined metric resolution.
 
@@ -114,6 +119,8 @@ class ResponseAssembler:
             match_confidence: Matcher similarity ratio (used for fuzzy matches).
             match_source: How the metric was matched (``name`` or ``fuzzy``).
             model_id: Optional per-call model id override.
+            ontology_version: Version of the ontology the query ran against,
+                when the caller can name one (#986).
 
         Returns:
             A QueryResult tagged as Tier 1; confidence is 1.0 for exact matches
@@ -137,6 +144,7 @@ class ResponseAssembler:
             result_rows=rows,
             query_used=sql_used,
             trace=trace.steps,
+            ontology_version=ontology_version,
             metadata=metadata,
         )
 
@@ -254,6 +262,7 @@ class ResponseAssembler:
         degraded_sources: Sequence[dict] | None = None,
         model_id: str | None = None,
         partial: bool = False,
+        ontology_version: str | None = None,
     ) -> QueryResult:
         """Build a Tier-3 QueryResult from an agentic synthesis.
 
@@ -271,6 +280,8 @@ class ResponseAssembler:
             model_id: Optional per-call model id override.
             partial: Whether the result is incomplete (e.g. a budget/timeout cut
                 the reasoning loop short); surfaced on the QueryResult.
+            ontology_version: Version of the ontology the query ran against,
+                when the caller can name one (#986).
 
         Returns:
             A QueryResult tagged as Tier 3.
@@ -298,5 +309,6 @@ class ResponseAssembler:
             # truncation case is owned by Data-Layer ; this is the in-runtime
             # partial-context signal we can set authoritatively here.)
             partial=bool(degraded_sources) or partial,
+            ontology_version=ontology_version,
             metadata=metadata,
         )

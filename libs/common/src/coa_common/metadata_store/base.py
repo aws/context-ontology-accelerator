@@ -25,6 +25,7 @@ class AssetResult:
     asset_id: str
     name: str
     project_id: str
+    forms_output: list[dict[str, Any]] | None = None
 
 
 @dataclass(frozen=True)
@@ -125,8 +126,14 @@ class MetadataStoreClient(ABC):
         search_text: str,
         max_results: int = 50,
         next_token: str | None = None,
+        include_forms: bool = False,
     ) -> SearchResult:
         """Search for assets within a project.
+
+        When *include_forms* is True, implementations should request that the
+        backend inline each asset's form data so that callers can avoid a
+        per-asset ``get_asset_forms`` round-trip.  The form data is populated
+        in :pyattr:`AssetResult.forms_output` only when requested.
 
         Raises:
             MetadataStoreError: on failure.

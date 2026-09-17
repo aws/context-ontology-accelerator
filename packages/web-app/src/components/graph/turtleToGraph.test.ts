@@ -33,7 +33,7 @@ describe("turtleToGraph", () => {
     expect(labelled?.data.prefLabel).toBe("loss_payment");
   });
 
-  it("emits subClassOf edges as kind=subClassOf so cytoscape applies the UML style", () => {
+  it("emits subClassOf edges as kind=subClassOf so the renderer applies the UML style", () => {
     const { edges } = turtleToGraph(SAMPLE);
     const sc = edges.find((e) => e.data?.kind === "subClassOf");
     expect(sc).toBeTruthy();

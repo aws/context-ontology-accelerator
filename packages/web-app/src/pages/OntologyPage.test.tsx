@@ -640,9 +640,13 @@ describe("Induce Ontology modal — grounding is available for both strategies",
 
     // Open the dropdown: BOTH ontologies are selectable options now (induced is
     // no longer excluded).
-    const groundingTrigger = screen
-      .getByText("Pick loaded ontologies to ground against")
-      .closest("button");
+    // `findByText`, not `getByText`: openInductionModal() only awaits the
+    // modal's "Strategy" field, while this trigger renders on a separate async
+    // chain (the listOntologies fetch resolving). A synchronous query races
+    // that chain and throws "unable to find element" under parallel-suite load.
+    const groundingTrigger = (
+      await screen.findByText("Pick loaded ontologies to ground against")
+    ).closest("button");
     expect(groundingTrigger).not.toBeNull();
     fireEvent.mouseDown(groundingTrigger!);
 
@@ -706,9 +710,13 @@ describe("Induce Ontology modal — grounding is available for both strategies",
     ]);
     await openInductionModal();
 
-    const groundingTrigger = screen
-      .getByText("Pick loaded ontologies to ground against")
-      .closest("button");
+    // `findByText`, not `getByText`: openInductionModal() only awaits the
+    // modal's "Strategy" field, while this trigger renders on a separate async
+    // chain (the listOntologies fetch resolving). A synchronous query races
+    // that chain and throws "unable to find element" under parallel-suite load.
+    const groundingTrigger = (
+      await screen.findByText("Pick loaded ontologies to ground against")
+    ).closest("button");
     expect(groundingTrigger).not.toBeNull();
     fireEvent.mouseDown(groundingTrigger!);
 

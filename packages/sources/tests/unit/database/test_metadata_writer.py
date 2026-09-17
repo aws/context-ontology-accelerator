@@ -374,27 +374,23 @@ class TestSearchAccessDeniedSurfacing:
 
 @pytest.mark.unit
 class TestFindExistingAsset:
+    # Looks the asset up by exact name via find_asset_by_name rather than a
+    # top-1 relevance search: search scores every searchable attribute, so a full
+    # asset name ranks siblings of the same source alongside the exact one and a
+    # top-1 miss would re-create an asset that already exists.
     def test_returns_asset_id_when_found(self):
         mock_client = MagicMock()
-        mock_client.search_assets.return_value = _search_page([_existing_asset("DS#src-001:mydb.mytable", "asset-xyz")])
+        mock_client.find_asset_by_name.return_value = _existing_asset("DS#src-001:mydb.mytable", "asset-xyz")
 
         from coa_sources.database.metadata_writer import _find_existing_asset
 
         result = _find_existing_asset(mock_client, "proj-123", "DS#src-001:mydb.mytable")
         assert result == "asset-xyz"
+        mock_client.find_asset_by_name.assert_called_once_with(project_id="proj-123", name="DS#src-001:mydb.mytable")
 
     def test_returns_none_when_not_found(self):
         mock_client = MagicMock()
-        mock_client.search_assets.return_value = _search_page([])
-
-        from coa_sources.database.metadata_writer import _find_existing_asset
-
-        result = _find_existing_asset(mock_client, "proj-123", "DS#src-001:mydb.mytable")
-        assert result is None
-
-    def test_returns_none_when_name_mismatch(self):
-        mock_client = MagicMock()
-        mock_client.search_assets.return_value = _search_page([_existing_asset("DS#src-001:other.table", "asset-xyz")])
+        mock_client.find_asset_by_name.return_value = None
 
         from coa_sources.database.metadata_writer import _find_existing_asset
 
@@ -403,7 +399,7 @@ class TestFindExistingAsset:
 
     def test_returns_none_on_search_exception(self):
         mock_client = MagicMock()
-        mock_client.search_assets.side_effect = Exception("search failed")
+        mock_client.find_asset_by_name.side_effect = Exception("search failed")
 
         from coa_sources.database.metadata_writer import _find_existing_asset
 

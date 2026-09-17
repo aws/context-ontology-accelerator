@@ -1,3 +1,5 @@
+**/neptune-memory/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -228,3 +230,13 @@ scripts/serve/eval_results/
 # by benchmarks/**/setup/provision_ns.py. Checking them in would point another
 # account's run at namespaces it does not own; re-run the provisioner instead.
 benchmarks/*/questions/namespace_map.json
+
+# DemoGenerator run state: captured ${VAR} values and a Playwright storage state
+# holding LIVE session cookies. Written next to a .demo.yaml on every dry-run.
+demos/**/*.state.json
+demos/**/*.storage.json
+
+# DemoGenerator output: recorded video, the pre-mux intermediate, and timing.
+# The .demo.yaml is the artifact worth committing; a 180 MB MP4 is not.
+demos/**/*.mp4
+demos/**/*.timing.json

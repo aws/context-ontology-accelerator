@@ -33,8 +33,145 @@ for the full request/response schema.
 Options:
 - `execute: false` — return the generated SQL without executing it
 - `tierOverride` — force a specific resolution tier (1, 2, or 3)
+- `mode` — choose the execution policy: the Standard tier cascade or Deep
+  Reasoning (see below)
+- `strategy` — choose which Tier-2 engine answers a structured query (see below)
 - `maxResults` — limit result rows
 - `includeSupporting` — include supporting context in the response
+- `timeoutMs` — cap the server-side resolution budget for this request. Only ever
+  *lowers* the budget below the transport ceiling (a value above the ceiling is
+  clamped); non-positive/invalid values are ignored.
+
+> **⚠️ REST has a hard 29-second timeout.** The REST endpoint runs behind API
+> Gateway, whose integration timeout is a fixed **29 s** (`timeoutInMillis: 29000`)
+> that **cannot be raised**. A query that needs longer than 29 s server-side does
+> not return over REST — it responds with:
+>
+> ```json
+> { "error": "rest_deadline_exceeded", "limitMs": 29000,
+>   "message": "Query exceeded the 29s REST timeout ... use the streaming query endpoint ..." }
+> ```
+>
+> This is expected for long-running work — most commonly **Tier 3** knowledge
+> synthesis, which routinely takes 20–90 s. The work may still be completing
+> server-side; the error means only that it cannot be delivered within the REST
+> budget, **not** that the service is down or the query is malformed. For those
+> queries, use the **streaming endpoint** (below), which has a much larger budget.
+> Fast structured lookups (Tier 1 / Tier 2 single-shot) fit comfortably inside 29 s
+> and are well suited to REST.
+
+### Streaming (recommended for interactive query)
+
+For interactive use — and for any query that may take more than a few seconds
+(Tier 3 synthesis, multi-step retrieval) — use the **streaming** path rather than
+the synchronous REST endpoint. It POSTs to the AgentCore Runtime `/invocations`
+endpoint with SSE (Server-Sent Events) and carries a much larger resolution budget
+(**170 s** by default, `resolve_timeout_s`), so it is not subject to the 29 s API
+Gateway ceiling. It also streams resolution steps, generated SQL, and results as
+they are produced instead of blocking for a single response.
+
+This is the path the [Playground](#playground-web-app) uses, and the recommended
+default for building interactive clients. Reserve the synchronous REST endpoint for
+short, scriptable calls where a single blocking request is simpler and the work
+reliably fits inside 29 s.
+
+#### Selecting a Tier-2 engine — `strategy`
+
+Tier 2 can answer a structured question two ways: through the **Ontop/VKG** semantic
+path (SPARQL compiled against your R2RML mappings) or through **NL→SQL**. By default
+it tries NL→SQL and falls back to Ontop. Setting `strategy` pins the choice, which is
+how you compare engines or require the semantic path.
+
+| Value | Behaviour |
+|---|---|
+| `nl_to_sql_first` | NL→SQL, falling back to Ontop. **The default when `strategy` is omitted.** |
+| `ontop_first` | Ontop, falling back to NL→SQL |
+| `ontop` | Ontop only — no fallback |
+| `nl_to_sql` | NL→SQL only — no fallback |
+| `best` | Run both in parallel, return the higher-confidence answer |
+| `deep-reasoning` | The bounded tool-use agent only; never reached as a fallback |
+
+```json
+{ "query": "how many products are there", "options": { "strategy": "ontop" } }
+```
+
+Notes:
+
+- **Optional.** Omitting it behaves exactly as before this option existed.
+- **Ignored unless the query resolves at Tier 2.** A question answered by a Tier-1
+  metric or Tier-3 retrieval is unaffected.
+- **An explicit value is never overridden** by automatic tier gating or per-query
+  Tier-2 pruning — pinning an engine is treated as intent.
+- **Orthogonal to `mode`.** `mode` decides whether the whole Tier 1→2→3 cascade is
+  replaced by the Tier-3 reasoning loop; `strategy` decides which engine answers
+  *within* Tier 2. Both were called "agentic" before the rebrand, so they are easy to
+  confuse. `deep-reasoning` appears in both because it is the same engine reached two
+  ways: `mode="deep-reasoning"` replaces the cascade and returns a prose answer, while
+  `strategy="deep-reasoning"` keeps Tier-1 metric routing and returns the agent's
+  answer in Tier-2 row shape.
+- An unrecognised value returns **400** listing the valid ones, rather than silently
+  falling back to the default.
+- `ontop` requires the namespace to have an accepted ontology with published R2RML
+  mappings; without them the pinned engine fails rather than falling back.
+
+#### Standard vs Deep Reasoning — `mode`
+
+`mode` selects the **execution policy** for the whole request. It answers a
+different question than `tierOverride` (which tier runs) and `strategy` (which
+Tier-2 engine runs): whether the request is resolved by the tier **cascade** at
+all, or handed to the Deep Reasoning loop.
+
+| | `standard` (default) | `deep-reasoning` |
+|---|---|---|
+| **Routing** | Tier 1 → 2 → 3 cascade; the first confident tier answers and later tiers never run | One planning session owns the request; no cascade. **Tier-1 governed metrics are bypassed** — the loop starts without the metric fast path |
+| **Available evidence** | The tier that answers sees only its own sources — a Tier-1/2 answer never consults documents | The planner can call NL→SQL and NL→SPARQL structured-query tools (composition-gated), graph traversal, and document retrieval in the same session and synthesize across them |
+| **Answer shape** | Rows/tables for Tier 1/2, prose for Tier 3 | Prose synthesis with supporting document content. The structured leg's SQL and data sources are **not** returned as provenance fields today |
+| **Latency / cost** | Lowest for structured questions — a Tier-1 hit is a single SQL execution | An iterative reason-act loop with multiple model calls; comparable to Tier-3 synthesis (tens of seconds — use the streaming endpoint) |
+| **Guarantees** | Deterministic routing: the same question takes the same path | **Planner-driven**: the loop chooses its tools per sub-question. It is *able* to combine structured and document evidence, but does **not** guarantee both are consulted for every request |
+
+Use `standard` when you want cascade behaviour — deterministic, cheapest-first
+routing for questions one layer can answer, including governed Tier-1 metrics.
+Use `deep-reasoning` when the answer should *combine* structured data with
+document knowledge, e.g.:
+
+> *"Was last quarter's total revenue consistent with our revenue-recognition
+> policy?"* — the planner can run the revenue query through its structured
+> tools, retrieve the policy document, and return one synthesized answer. The
+> retrieved policy passages come back as supporting content; the structured
+> figures are woven into the prose (their SQL is not itemized in the
+> response).
+
+Selecting it on each surface:
+
+- **REST / streaming** — `{ "query": "…", "options": { "mode": "deep-reasoning" } }`
+- **MCP** — the `query` tool takes the same `mode` value (`standard` or
+  `deep-reasoning`). The tool's JSON schema types it as a plain string — the
+  valid values are documented in the parameter description, not enforced as a
+  schema enum the way `strategy` is.
+- **Playground** — the mode toggle above the input box; it sends `options.mode`
+  with each query and defaults to Standard.
+
+Behaviour notes:
+
+- **Precedence.** An explicit request value wins over the deployment default
+  (`TIER3_STRATEGY`, which ships as standard). `mode: "standard"` is an explicit
+  opt-out even on a deployment whose default is deep reasoning. An explicit
+  `tierOverride` wins over `mode` — it is a direct instruction about which tier
+  to run.
+- **Validation.** The only accepted values are `standard` and `deep-reasoning`
+  (plus the pre-rename spelling `agentic`, kept for compatibility). Any other
+  value is rejected with **400** naming the valid ones, rather than silently
+  falling back.
+- **When Deep Reasoning is not configured** in the deployment (no reasoning
+  retriever built), a `mode: "deep-reasoning"` request is served in Standard mode
+  instead of failing; the fallback is recorded in the server logs
+  (`deep_reasoning_mode_unavailable`).
+- **Source-composition gating still applies**: on a document-only namespace the
+  loop's structured tools are withheld; on a database-only namespace its document
+  retrieval self-skips.
+- Deterministic *always-run-both* joint retrieval (structured + document in one
+  guaranteed pass, rather than at the planner's discretion) is roadmap work,
+  tracked as issue #417.
 
 ### MCP (Model Context Protocol)
 
@@ -46,6 +183,13 @@ For AI agents (Claude, Amazon Q, etc.), Context Ontology Accelerator exposes an 
 - Translating natural language to SPARQL
 - Retrieving semantically similar document chunks
 - Traversing the semantic graph for entity relationships
+
+The `query` tool accepts the same optional `strategy` values as the REST API, with
+identical semantics. They are published in the tool's JSON schema as an enum, so an
+agent discovers the valid values without extra prompting, and an invalid one is
+rejected by schema validation before the tool runs. This is what lets an agent
+deliberately select the Ontop/VKG semantic path rather than reaching it only as a
+fallback.
 
 See the [Agent Access Guide](agent-access.md) for authentication setup and the MCP server's README (`packages/mcp-server/README.md` in the repository) for MCP client configuration.
 
@@ -183,6 +327,11 @@ shape (single- vs cross-source); see the [Sources Guide](sources.md#direct-sql-v
 - **Graph traversal**: walks the Neptune knowledge graph for connected concepts
 - **Synthesis**: combines retrieved context into a natural language answer using Bedrock
 
+> **Latency note.** Tier 3 synthesis is an iterative retrieve-and-reason loop and
+> routinely runs **20–90 s** end to end — longer than the 29 s REST ceiling. Query
+> Tier 3 over the [streaming endpoint](#streaming-recommended-for-interactive-query),
+> not the synchronous REST endpoint, or it will return `rest_deadline_exceeded`.
+
 ## Access Control on Queries
 
 Authorization runs at **two** points, so that surfaces which never generate SQL are
@@ -228,6 +377,12 @@ In addition to full query resolution:
 - `POST /namespaces/{namespaceId}/graph/traverse` — traverse the knowledge graph (**GraphTraverse**)
 - `GET /namespaces/{namespaceId}/schema` — discover the queryable schema (**DescribeSchema**)
 
+`KBSearch` identifies a document in two different ways. `sourceDocumentId` is
+the opaque, unique source identity; use it to correlate chunks from the same
+indexed document. `sourceDocumentName` is the human-readable original file
+name for display. Names are not unique: two document sources can contain a file
+with the same name while returning different `sourceDocumentId` values.
+
 `DescribeSchema` returns the classes and properties currently loaded into the namespace's ontologies, so a caller can find the entities available before writing a query. Optional query params: `includeProperties` (default `true`) to include class properties, and `maxResults` to cap the class count. The same schema is what the MCP `describe_schema` tool exposes — REST and MCP read from one source.
 
 See these operations in the [API Reference](#/api-reference) for their full request/response schemas.
@@ -239,5 +394,5 @@ See these operations in the [API Reference](#/api-reference) for their full requ
 | 403 Access Denied | No role grant for this namespace | Grant the user a role via Permissions |
 | Empty results | No metrics/ontology defined | Connect sources, define metrics, or induce ontology first |
 | SQL Firewall denied | User's grant restricts access to referenced tables | Update the user's table allowlist |
-| 504 Timeout | Query resolution exceeded 29s | Simplify the question or check Lambda cold starts |
+| 504 Timeout / `rest_deadline_exceeded` | Query exceeded the hard 29 s REST (API Gateway) ceiling — common for Tier 3 synthesis (20–90 s) | Use the [streaming endpoint](#streaming-recommended-for-interactive-query) (170 s budget), lower scope via `tierOverride`, or simplify the question. Not a connectivity failure — the query may still be completing server-side. |
 | "No tier produced results" | Question doesn't match any resolution strategy | Rephrase, or ensure relevant data is modeled |

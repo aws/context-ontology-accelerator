@@ -13,6 +13,16 @@ import {
 import type { RescanSourceCommandOutput } from "@coa/control-plane-client";
 import { useControlPlaneClient } from "@components/ControlPlaneClientProvider";
 
+export interface RescanSourceVariables {
+  /**
+   * Acknowledge that starting this re-scan discards an open re-scan review.
+   * The API rejects the call with 409 without it when the source is in
+   * RESCAN_REVIEW, because a fresh re-scan re-diffs against the last approved
+   * state and drops the decisions and edits made in the open review.
+   */
+  readonly confirmDiscardOpenReview?: boolean;
+}
+
 export function useRescanSource(
   namespaceId: string,
   sourceId: string,
@@ -20,7 +30,7 @@ export function useRescanSource(
     UseMutationOptions<
       RescanSourceCommandOutput,
       ControlPlaneServiceServiceException,
-      void
+      RescanSourceVariables
     >,
     "mutationFn"
   >,
@@ -31,10 +41,16 @@ export function useRescanSource(
   return useMutation<
     RescanSourceCommandOutput,
     ControlPlaneServiceServiceException,
-    void
+    RescanSourceVariables
   >({
-    mutationFn: () =>
-      client.send(new RescanSourceCommand({ namespaceId, sourceId })),
+    mutationFn: ({ confirmDiscardOpenReview }: RescanSourceVariables) =>
+      client.send(
+        new RescanSourceCommand({
+          namespaceId,
+          sourceId,
+          confirmDiscardOpenReview,
+        }),
+      ),
     onSuccess: (...args) => {
       queryClient.invalidateQueries({
         queryKey: ["source", namespaceId, sourceId],

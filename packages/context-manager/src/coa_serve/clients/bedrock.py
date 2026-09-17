@@ -91,6 +91,15 @@ _STREAM_QUEUE_TIMEOUT_S = 300
 # rejected call.
 _MODELS_REJECTING_TEMPERATURE: set[str] = set()
 
+# Model ids observed to reject `inferenceConfig.topP` with a ValidationException.
+# Symmetric to _MODELS_REJECTING_TEMPERATURE: the SAME newer Anthropic models
+# (e.g. claude-sonnet-5) deprecated `top_p` alongside `temperature`, returning
+# "`top_p` is deprecated for this model." NL→SPARQL sets topP=0 for determinism,
+# so without this the determinism change itself makes every SPARQL-path Converse
+# fail-closed on those models (temperature drop alone is not enough — the retry
+# still carries topP and fails again). Same process-wide, lock-free rationale.
+_MODELS_REJECTING_TOP_P: set[str] = set()
+
 
 def _assessment_has_action(assessment: dict, action: str) -> bool:
     """Whether any policy item in one assessment carries ``action``."""
@@ -370,6 +379,7 @@ class BedrockLLMClient:
         guardrail_id: str | None = None,
         max_tokens: int = 4096,
         temperature: float | None = None,
+        top_p: float | None = None,
         guard_content: str | None = None,
         model_id: str | None = None,
     ) -> ConverseResult:
@@ -384,6 +394,10 @@ class BedrockLLMClient:
             guardrail_id: Optional Bedrock guardrail identifier to apply.
             max_tokens: Maximum output tokens.
             temperature: Sampling temperature; omitted when None.
+            top_p: Nucleus-sampling cutoff; omitted when None. Determinism-sensitive
+                callers pass top_p=0 alongside temperature=0 so a surviving
+                sampling constraint remains even if temperature is dropped for the
+                model (see _call_with_temperature_fallback).
             guard_content: Text wrapped in a guardContent block for prompt-attack
                 evaluation, leaving the main prompt unchecked.
             model_id: Per-call model override; defaults to the client's model.
@@ -400,6 +414,7 @@ class BedrockLLMClient:
             guardrail_id=guardrail_id,
             max_tokens=max_tokens,
             temperature=temperature,
+            top_p=top_p,
             guard_content=guard_content,
             model_id=model_id,
         )
@@ -675,31 +690,87 @@ class BedrockLLMClient:
 
     @staticmethod
     def _call_with_temperature_fallback(call_fn: Callable[..., Any], kwargs: dict[str, Any]) -> Any:
-        """Invoke call_fn(**kwargs), retrying without temperature on ValidationException.
+        """Invoke call_fn(**kwargs), retrying without a sampling param on ValidationException.
 
-        Some newer models (e.g. Opus 4.8+) deprecated the temperature parameter.
-        The rejection is remembered per model id, so only the FIRST call to such a
-        model pays the failed request + retry; later calls omit temperature up
-        front. See ``_MODELS_REJECTING_TEMPERATURE``.
+        Some newer models (e.g. claude-sonnet-5, Opus 4.8+) deprecated BOTH
+        ``temperature`` and ``top_p`` and reject either with a ValidationException.
+        Each rejection is remembered per model id (``_MODELS_REJECTING_TEMPERATURE``
+        / ``_MODELS_REJECTING_TOP_P``), so only the FIRST call to such a model pays
+        the failed request + retry; later calls omit the offending param up front.
+
+        NL→SPARQL sets ``topP=0`` for determinism, so dropping only ``temperature``
+        is insufficient on these models — the retry would still carry ``topP`` and
+        fail again, taking the whole SPARQL path down. Both params are handled
+        symmetrically, and a single call can shed both (one learned up front, the
+        other on the retry).
         """
         model_id = kwargs.get("modelId")
-        if model_id in _MODELS_REJECTING_TEMPERATURE and "inferenceConfig" in kwargs:
-            kwargs["inferenceConfig"].pop("temperature", None)
-            return call_fn(**kwargs)
-        try:
-            return call_fn(**kwargs)
-        except ClientError as e:
-            if (
-                e.response.get("Error", {}).get("Code") == "ValidationException"
-                and "temperature" in str(e)
-                and "inferenceConfig" in kwargs
-            ):
-                kwargs["inferenceConfig"].pop("temperature", None)
-                if model_id is not None:
-                    _MODELS_REJECTING_TEMPERATURE.add(model_id)
-                logger.info("retry_without_temperature", model=model_id)
+        inference = kwargs.get("inferenceConfig", {})
+
+        # Pre-strip any params this model is already known to reject, so a warm
+        # model pays neither a doomed request nor a retry. Emit observability on
+        # the pre-learned path too (not one-per-process) so dashboards see every
+        # affected call — a determinism-sensitive caller running UNCONSTRAINED
+        # (temperature=0 / topP=0 requested, never sent) is otherwise invisible.
+        if "inferenceConfig" in kwargs:
+            if model_id in _MODELS_REJECTING_TEMPERATURE:
+                dropped = inference.pop("temperature", None)
+                if dropped is not None:
+                    logger.warning(
+                        "temperature_dropped_for_model",
+                        model=model_id,
+                        had_top_p="topP" in inference,
+                        learned=True,
+                    )
+            if model_id in _MODELS_REJECTING_TOP_P:
+                dropped = inference.pop("topP", None)
+                if dropped is not None:
+                    logger.warning(
+                        "top_p_dropped_for_model",
+                        model=model_id,
+                        learned=True,
+                    )
+
+        # Retry loop: at most two learnings (temperature, then topP, or vice
+        # versa). Each ValidationException naming a deprecated sampling param is
+        # learned, the param stripped, and the call retried; any other error, or
+        # running out of strippable params, re-raises.
+        for _ in range(3):
+            try:
                 return call_fn(**kwargs)
-            raise
+            except ClientError as e:
+                if e.response.get("Error", {}).get("Code") != "ValidationException":
+                    raise
+                if "inferenceConfig" not in kwargs:
+                    raise
+                msg = str(e)
+                if "temperature" in msg and "temperature" in inference:
+                    inference.pop("temperature", None)
+                    if model_id is not None:
+                        _MODELS_REJECTING_TEMPERATURE.add(model_id)
+                    logger.warning(
+                        "retry_without_temperature",
+                        model=model_id,
+                        had_top_p="topP" in inference,
+                    )
+                    continue
+                if "top_p" in msg and "topP" in inference:
+                    inference.pop("topP", None)
+                    if model_id is not None:
+                        _MODELS_REJECTING_TOP_P.add(model_id)
+                    logger.warning(
+                        "retry_without_top_p",
+                        model=model_id,
+                        had_temperature="temperature" in inference,
+                    )
+                    continue
+                raise
+        # Exhausted the retry budget without a return. Only two sampling params
+        # (temperature, topP) can ever be shed, so three iterations should always
+        # succeed or re-raise above; reaching here means an unforeseen loop state.
+        # Fail loudly rather than issuing a 4th unguarded call whose exception
+        # would be indistinguishable from a normal failure.
+        raise RuntimeError("converse retry loop exhausted without returning or raising")
 
     def _build_converse_kwargs(
         self,
@@ -709,6 +780,7 @@ class BedrockLLMClient:
         guardrail_id: str | None = None,
         max_tokens: int = 4096,
         temperature: float | None = None,
+        top_p: float | None = None,
         guard_content: str | None = None,
         model_id: str | None = None,
     ) -> dict[str, Any]:
@@ -720,6 +792,11 @@ class BedrockLLMClient:
             guardrail_id: Bedrock guardrail identifier.
             max_tokens: Max output tokens.
             temperature: Sampling temperature; omitted from inferenceConfig when None.
+            top_p: Nucleus-sampling cutoff; omitted from inferenceConfig when None.
+                Set alongside temperature=0 by determinism-sensitive callers
+                (NL→SPARQL) as belt-and-suspenders: on models that reject/deprecate
+                `temperature` (see _MODELS_REJECTING_TEMPERATURE) it is popped before
+                the call, leaving top_p as the only surviving sampling constraint.
             guard_content: If provided, this text is wrapped in a guardContent block
                 and appended as a separate content item. The guardrail evaluates ONLY
                 this block for prompt attack detection — the main prompt text is not
@@ -762,6 +839,7 @@ class BedrockLLMClient:
             "inferenceConfig": {
                 "maxTokens": max_tokens,
                 **({"temperature": temperature} if temperature is not None else {}),
+                **({"topP": top_p} if top_p is not None else {}),
             },
         }
         if system:

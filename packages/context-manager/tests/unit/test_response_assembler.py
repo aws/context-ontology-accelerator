@@ -53,6 +53,74 @@ class TestAssembleTier1:
 
 
 @pytest.mark.unit
+class TestOntologyVersionParity:
+    """Every assembler can name the ontology version when the caller has one,
+    and stays null-by-default when it does not (#986)."""
+
+    def test_tier1_accepts_and_surfaces_ontology_version(self, assembler, trace):
+        result = assembler.assemble_tier1(
+            rows=[],
+            columns=[],
+            metric_name="m",
+            sql_used="",
+            trace=trace,
+            namespace="ns",
+            ontology_version="2026-09-12T08:15:00Z",
+        )
+        assert result.ontology_version == "2026-09-12T08:15:00Z"
+
+    def test_nl_to_sql_accepts_and_surfaces_ontology_version(self, assembler, trace):
+        result = assembler.assemble_nl_to_sql(
+            rows=[],
+            columns=[],
+            sql_used="SELECT 1",
+            confidence=0.7,
+            retrieved_tables=[],
+            expanded_tables=[],
+            trace=trace,
+            namespace="ns",
+            ontology_version="2026-09-12T08:15:00Z",
+        )
+        assert result.ontology_version == "2026-09-12T08:15:00Z"
+
+    def test_tier3_accepts_and_surfaces_ontology_version(self, assembler, trace):
+        result = assembler.assemble_tier3(
+            synthesized_answer="answer",
+            supporting_content=[],
+            graph_context=[],
+            confidence=0.6,
+            trace=trace,
+            namespace="ns",
+            ontology_version="2026-09-12T08:15:00Z",
+        )
+        assert result.ontology_version == "2026-09-12T08:15:00Z"
+
+    def test_all_assemblers_default_to_null(self, assembler, trace):
+        tier1 = assembler.assemble_tier1(rows=[], columns=[], metric_name="m", sql_used="", trace=trace, namespace="ns")
+        nl_to_sql = assembler.assemble_nl_to_sql(
+            rows=[],
+            columns=[],
+            sql_used="",
+            confidence=0.5,
+            retrieved_tables=[],
+            expanded_tables=[],
+            trace=trace,
+            namespace="ns",
+        )
+        tier3 = assembler.assemble_tier3(
+            synthesized_answer="a",
+            supporting_content=[],
+            graph_context=[],
+            confidence=0.5,
+            trace=trace,
+            namespace="ns",
+        )
+        assert tier1.ontology_version is None
+        assert nl_to_sql.ontology_version is None
+        assert tier3.ontology_version is None
+
+
+@pytest.mark.unit
 class TestAssembleTier2:
     def test_tier2_includes_sparql_and_sql(self, assembler, trace):
         result = assembler.assemble_tier2(

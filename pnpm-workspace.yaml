@@ -11,19 +11,23 @@ allowBuilds:
   nx: true
 
 # Supply chain hardening — prevent exotic subdependency installs and silent downgrades.
-packageManagerStrictness:
-  blockExoticSubdeps: true
-  trustPolicy: no-downgrade
+# All three are TOP-LEVEL pnpm-workspace.yaml settings. They were previously nested
+# under `packageManagerStrictness:` / `pnpm: auditConfig:`, neither of which pnpm
+# recognises — and pnpm ignores unknown keys without warning, so all three were dead
+# config. Do not re-nest them.
+blockExoticSubdeps: true
+trustPolicy: no-downgrade
 
 # Quarantine newly-published packages for 7 days before allowing install.
-pnpm:
-  auditConfig:
-    minReleaseAge: "7 days"
+# The unit is MINUTES as a number (7 * 24 * 60). A duration string like "7 days" is
+# Renovate's format (see renovate.json), not pnpm's: it parses to NaN here, which
+# fails closed and rejects every package including decade-old ones.
+minimumReleaseAge: 10080
 
 overrides:
   # downlevel-dts depends on typescript@"next" — a dist-tag that resolves to
   # whatever nightly was published that day. So `pnpm install` pulls a build that
-  # is hours old, and the minReleaseAge quarantine above then rejects the lockfile
+  # is hours old, and the minimumReleaseAge quarantine above then rejects the lockfile
   # it just produced. This is not a stale lockfile: re-resolving reproduces it,
   # because the tag keeps moving. A fresh clone fails `make setup` outright, with
   # node_modules left empty and every TS target (CDK, web-app, Nx) unusable.

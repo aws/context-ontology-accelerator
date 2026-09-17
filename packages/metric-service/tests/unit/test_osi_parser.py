@@ -37,10 +37,23 @@ class TestDialectMapping:
             ("SNOWFLAKE", "SNOWFLAKE"),
             ("Snowflake", "SNOWFLAKE"),
             ("DATABRICKS", "DATABRICKS"),
+            # #140: a real dialect named directly is legitimate input and passes
+            # through case-normalized, not collapsed to POSTGRESQL or lowercased.
+            ("REDSHIFT", "REDSHIFT"),
+            ("redshift", "REDSHIFT"),
+            ("TRINO", "TRINO"),
+            ("MySQL", "MYSQL"),
+            ("POSTGRESQL", "POSTGRESQL"),
         ],
     )
     def test_osi_to_internal(self, osi: str, internal: str) -> None:
         assert osi_dialect_to_internal(osi) == internal
+
+    def test_osi_to_internal_passthrough_is_valid_enum(self) -> None:
+        # A passed-through dialect must be a real SqlDialect value.
+        from coa_metrics.constants import VALID_SQL_DIALECTS
+
+        assert osi_dialect_to_internal("REDSHIFT") in VALID_SQL_DIALECTS
 
     def test_osi_to_internal_unknown_raises(self) -> None:
         with pytest.raises(ValueError, match="Unknown OSI dialect"):

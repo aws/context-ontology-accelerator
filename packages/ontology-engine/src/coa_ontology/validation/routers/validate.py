@@ -103,7 +103,24 @@ def _fetch_ontology_turtle(ontology_catalog_url: str, ontology_id: str, namespac
 
         dl = client.get(f"{ontology_catalog_url}/ontologies/{encoded_id}/download", params=params)
         dl.raise_for_status()
-        return dl.text
+        # /download no longer inlines the Turtle: it returns {"downloadUrl", ...}
+        # pointing at a presigned S3 object, because a 6+ MB ontology would exceed
+        # the API Gateway / Lambda response limit (#143). Follow the URL
+        # out-of-band. The raw-body fallback keeps this working against an
+        # ontology-engine that still inlines (mixed versions during a rollout).
+        download_url = None
+        try:
+            payload = dl.json()
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            download_url = payload.get("downloadUrl") or payload.get("download_url")
+        if not download_url:
+            return dl.text
+
+        obj = client.get(download_url)
+        obj.raise_for_status()
+        return obj.text
 
 
 def _run_validation(job_id: str, body: ValidationRequest, namespace: str, config: dict):

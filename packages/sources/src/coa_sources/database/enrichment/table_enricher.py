@@ -98,6 +98,20 @@ def _prepare_table_context(table: Table) -> dict:
     }
 
 
+def _has_pending(table: Table) -> bool:
+    """True if the table or any of its columns still needs review.
+
+    On a re-scan, a fully-reviewed table (its table-level description and every
+    column already APPROVED or REJECTED) has nothing to regenerate, so
+    enrichment skips it entirely — preserving the steward's approvals and
+    avoiding a needless Bedrock call. On a first scan the table is always
+    PENDING_REVIEW, so nothing is skipped and behaviour is unchanged.
+    """
+    if table.business_metadata.review_status == ReviewStatus.PENDING_REVIEW:
+        return True
+    return any(c.business_metadata.review_status == ReviewStatus.PENDING_REVIEW for c in table.columns)
+
+
 def run(
     datasource_id: str, namespace_id: str, domain_id: str, scan_type: str, emitter: EnrichmentMetricEmitter
 ) -> dict:
@@ -113,7 +127,7 @@ def run(
     tables = read_assets_for_datasource(domain_id, namespace_id, datasource_id)
     if not tables:
         logger.info("No tables found for datasource %s", datasource_id)
-        return {"tables_enriched": 0, "tables_failed": 0, "tables_skipped_unchanged": 0}
+        return {"tables_enriched": 0, "tables_failed": 0, "tables_skipped_unchanged": 0, "failed_table_ids": []}
 
     guardrail_id = _resolve_guardrail_id()
     client = BedrockClient(read_timeout=TABLE_TIMEOUT_SEC, guardrail_id=guardrail_id)
@@ -123,6 +137,10 @@ def run(
     table_batch_counts: dict[str, int] = {}
 
     for table in tables:
+        if not _has_pending(table):
+            # Re-scan: nothing left to review on this table, so leave it exactly
+            # as the steward approved it (no regeneration, no Bedrock call).
+            continue
         ctx = _prepare_table_context(table)
         columns = table.columns
         if len(columns) <= COLUMN_BATCH_THRESHOLD:
@@ -251,6 +269,11 @@ def run(
         "tables_enriched": enriched,
         "tables_failed": failed,
         "tables_skipped_unchanged": skipped_unchanged,
+        # The db.table ids that errored (guardrail block or parse/timeout) and
+        # were written back WITHOUT enrichment. The aggregate `failed` count
+        # alone hides which tables regressed; the caller records these names so
+        # a steward can see them at review time.
+        "failed_table_ids": sorted(failed_tables),
     }
 
 
@@ -332,6 +355,12 @@ def _apply_table_metadata(table: Table, result: dict) -> None:
             review_status=existing.review_status,
             confidence=existing.confidence or 1.0,
         )
+        return
+
+    # Already-reviewed AI table descriptions are preserved verbatim on a
+    # re-scan: an APPROVED or REJECTED table is never regenerated. (Reached only
+    # when the table is still in the work set because some column is PENDING.)
+    if existing.review_status in (ReviewStatus.APPROVED, ReviewStatus.REJECTED):
         return
 
     ai_description = table_meta.get("description") or ""
@@ -429,6 +458,11 @@ def _apply_column_metadata(table: Table, column_results: list[dict]) -> None:
             )
             continue
 
+        # Already-reviewed columns (APPROVED/REJECTED) are preserved verbatim on
+        # a re-scan — only PENDING columns get fresh AI.
+        if existing.review_status in (ReviewStatus.APPROVED, ReviewStatus.REJECTED):
+            continue
+
         col.business_metadata = BusinessMetadata(
             description=meta.get("description", ""),
             synonyms=meta.get("synonyms", []),
@@ -457,19 +491,20 @@ def _write_enriched_assets(tables: list[Table], domain_id: str, project_id: str)
             continue
         asset_name = f"{table.data_source_id}:{table.table_id}"
         try:
-            result = client.search_assets(
-                project_id=project_id,
-                search_text=asset_name,
-                max_results=1,
-            )
-            if not result.items or result.items[0].name != asset_name:
+            # find_asset_by_name, not a top-1 search: a top-1 lookup on the full
+            # asset name can rank a sibling table first and report the asset as
+            # missing, and the miss branch below drops this table's enrichment
+            # write entirely rather than erroring, so a ranking miss silently
+            # loses generated metadata.
+            asset = client.find_asset_by_name(project_id=project_id, name=asset_name)
+            if asset is None:
                 logger.warning(
                     "Asset not found for enriched table %s (searched '%s'). Skipping.", table.table_id, asset_name
                 )
                 continue
 
             client.create_asset_revision(
-                asset_id=result.items[0].asset_id,
+                asset_id=asset.asset_id,
                 name=asset_name,
                 description=table.business_metadata.description,
                 forms_input=build_forms_input(table),

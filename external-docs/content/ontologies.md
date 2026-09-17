@@ -222,6 +222,34 @@ The web app separates *starting* ontology work from *browsing* what already exis
     foundational, and uploaded), filterable by type.
   - **Inducted sources** — the data sources that have fed an induction run.
 
+The Classes tab's graph view seeds with every class in the namespace on first
+open (across all its ontologies) **plus each ontology's object-property
+relationships**, so the initial picture matches the graph shown on an accepted
+proposal's detail page rather than a class-only skeleton. A relationship is
+drawn as an edge when the property declares an `rdfs:domain` and `rdfs:range`
+that are both classes in the view — which is what the induction engine emits
+for foreign-key and inferred relationships. (Some imported foundational
+vocabularies describe their properties differently, so they may show as a
+class hierarchy with few or no relationship edges; their classes still render
+in full.)
+
+Very large ontologies are bounded so layout and rendering stay responsive, and
+the limit applies **per ontology** rather than to the namespace total:
+
+- An ontology with **500 classes or fewer** renders in full, with its
+  relationships.
+- One above that is reduced to a bounded set (its largest-subtree root classes
+  plus a capped number of descendants).
+- Across the whole view, at most **1500** classes and **1000** relationship
+  edges are drawn up front; ontologies are filled in induced-first, then
+  smallest-first.
+
+Because the limit is per ontology, loading a large reference ontology for
+grounding (Schema.org, FIBO) reduces only *that* ontology — your induced
+ontology keeps every class and relationship beside it. Anything not drawn up
+front is still reachable through search and by selecting a node, which upgrades
+it to the full class detail including all its relationships and attributes.
+
 ## Best Practices
 
 - **Start with induction**: let Context Ontology Accelerator generate a baseline ontology from your sources, then refine

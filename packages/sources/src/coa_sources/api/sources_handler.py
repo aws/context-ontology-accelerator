@@ -94,7 +94,14 @@ _FEDERATION_PROVISIONER_ROLE_ARN: str = os.environ.get("FEDERATION_PROVISIONER_R
 # thousands of tables → thousands of serial delete_asset round-trips can exceed
 # the Lambda timeout; cap the work so we exit cleanly and leave the rest to the
 # namespace-deletion sweep, rather than letting the whole DELETE time out hard.
-_DATAZONE_CLEANUP_BUDGET_S: int = int(os.environ.get("DATAZONE_CLEANUP_BUDGET_S", "240"))
+#
+# Since GH-137 this is an **upper clamp** only: the effective deadline is
+# min(env budget, remaining Lambda time − safety margin). A misconfigured or
+# absent value cannot crash cold start; it falls back to 240s.
+try:
+    _DATAZONE_CLEANUP_BUDGET_S: int = int(os.environ.get("DATAZONE_CLEANUP_BUDGET_S", "240"))
+except (ValueError, TypeError):
+    _DATAZONE_CLEANUP_BUDGET_S = 240
 
 _DEFAULT_MAX_RESULTS = 100
 _MAX_RESULTS_LIMIT = 100
@@ -210,6 +217,46 @@ def _get_sts():
     if _sts is None:
         _sts = boto3.client("sts", region_name=_AWS_REGION)
     return _sts
+
+
+# ---------------------------------------------------------------------------
+# Deadline helper — GH-137
+# ---------------------------------------------------------------------------
+
+
+def _cleanup_deadline(context: Any, margin_s: float = 2.0) -> float:
+    """Derive a monotonic deadline from the Lambda runtime's remaining time.
+
+    The effective deadline is the **minimum** of:
+      - ``time.monotonic() + remaining_ms/1000 − margin_s``  (derived)
+      - ``time.monotonic() + _DATAZONE_CLEANUP_BUDGET_S``     (env clamp)
+
+    so the env budget can shrink the window but never extend it past the real
+    Lambda timeout. This self-corrects when the CDK timeout changes and can
+    never again be a fiction (the old 240 s constant was 8× the real 30 s
+    timeout, so the graceful early-exit could never fire).
+
+    When *context* is ``None`` or lacks ``get_remaining_time_in_millis``
+    (unit tests, non-Lambda runtimes) the env budget is used as-is — the
+    function must never crash outside Lambda.
+    """
+    now = time.monotonic()
+    env_deadline = now + _DATAZONE_CLEANUP_BUDGET_S
+
+    remaining_ms: int | None = None
+    if context is not None:
+        getter = getattr(context, "get_remaining_time_in_millis", None)
+        if callable(getter):
+            try:
+                remaining_ms = int(getter())
+            except Exception:
+                logger.warning("cleanup_deadline_remaining_time_failed", exc_info=True)
+
+    if remaining_ms is not None:
+        derived_deadline = now + (remaining_ms / 1000.0) - margin_s
+        return min(derived_deadline, env_deadline)
+
+    return env_deadline
 
 
 # ---------------------------------------------------------------------------
@@ -460,6 +507,8 @@ from .database_routes import (  # noqa: E402
     _handle_approve_source,
     _handle_get_scan_job,
     _handle_get_table,
+    _handle_keep_rescan_removal,
+    _handle_list_scan_jobs,
     _handle_list_tables,
     _handle_reject_source,
     _handle_review_column,
@@ -599,7 +648,11 @@ def _handle_get(namespace_id: str, source_id: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _delete_source_datazone_assets(namespace_id: str, source_id: str) -> int:
+def _delete_source_datazone_assets(
+    namespace_id: str,
+    source_id: str,
+    context: Any = None,
+) -> int:
     """Remove all DataZone (SageMaker Unified Studio Catalog) assets for a source.
 
     Assets created by the discovery/enrichment pipeline are named
@@ -612,6 +665,10 @@ def _delete_source_datazone_assets(namespace_id: str, source_id: str) -> int:
     deleting mid-pagination shrinks that set and the next-page token skips past
     unseen matches — leaving assets orphaned. Mirrors the read-only
     collect-then-act pattern in ``metadata_writer._build_existing_asset_map``.
+
+    Since GH-137 a single derived deadline bounds **both** phases: if the
+    Lambda has little time left, even the pagination must stop early so the
+    caller can return a partial-completion response rather than timing out.
 
     Returns the number of assets deleted. Raises if the SMUS client cannot
     be built or if the underlying domain/project is missing.
@@ -637,17 +694,27 @@ def _delete_source_datazone_assets(namespace_id: str, source_id: str) -> int:
     ds_key = f"DS#{source_id}"
     max_pages = 100
 
+    deadline = _cleanup_deadline(context)
+
     # Phase 1: fully paginate and COLLECT matching asset ids — do NOT delete
-    # while iterating. DataZone search pagination is offset/cursor-based over a
-    # live result set; deleting assets mid-pagination shrinks that set, so the
-    # next-page token skips past the remaining matches and they are never seen.
-    # (Observed: 75 assets, page size 50 → first page deleted 50, the second
-    # page's token pointed past the now-25-asset set, returning empty → 25
-    # orphaned.) Mirror the read-only collect-then-act pattern used by
-    # metadata_writer._build_existing_asset_map.
+    # while iterating. DataZone search pagination is over a live result set;
+    # deleting assets mid-pagination shrinks that set, so the next-page token
+    # skips past the remaining matches and they are never seen.
+    #
+    # The deadline is checked between pages so a near-timeout Lambda exits
+    # cleanly instead of being killed mid-request (GH-137).
     asset_ids: list[str] = []
+    search_stopped_early = False
     next_token: str | None = None
     for _ in range(max_pages):
+        if time.monotonic() > deadline:
+            search_stopped_early = True
+            logger.warning(
+                "datazone_asset_search_deadline_exceeded",
+                source_id=source_id,
+                collected=len(asset_ids),
+            )
+            break
         result = client.search_assets(
             project_id=project_id,
             search_text=ds_key,
@@ -667,15 +734,18 @@ def _delete_source_datazone_assets(namespace_id: str, source_id: str) -> int:
 
     # Visibility into the collection phase — a low count here vs. expected
     # table count is the first signal when chasing orphaned assets.
-    logger.info("datazone_asset_cleanup_collected", source_id=source_id, asset_count=len(asset_ids))
+    logger.info(
+        "datazone_asset_cleanup_collected",
+        source_id=source_id,
+        asset_count=len(asset_ids),
+        search_stopped_early=search_stopped_early,
+    )
 
     # Phase 2: delete from the materialized list. The search result set is no
     # longer being iterated, so deletions can't perturb pagination. This loop
-    # runs synchronously in the DELETE handler, so bound it by a wall-clock
-    # budget: if a very large source would blow the Lambda timeout, stop early
-    # and let the namespace-deletion sweep finish the rest (the assets left are
-    # still removed before DeleteProject) rather than failing the whole request.
-    deadline = time.monotonic() + _DATAZONE_CLEANUP_BUDGET_S
+    # runs synchronously in the DELETE handler, so bound it by the same
+    # derived deadline: if we're near timeout, stop early and let the
+    # namespace-deletion sweep finish the rest.
     removed = 0
     for idx, asset_id in enumerate(asset_ids):
         if time.monotonic() > deadline:
@@ -755,7 +825,7 @@ def _delete_source_scan_jobs(source_id: str) -> int:
     return len(keys)
 
 
-def _handle_delete(namespace_id: str, source_id: str) -> dict[str, Any]:
+def _handle_delete(namespace_id: str, source_id: str, context: Any = None) -> dict[str, Any]:
     try:
         item = _get_dao().get({"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"})
     except ClientError:
@@ -975,7 +1045,7 @@ def _handle_delete(namespace_id: str, source_id: str) -> dict[str, Any]:
         # Failures are logged but do not block the DDB delete; the assets
         # would otherwise also be cleaned up at namespace deletion time.
         try:
-            removed = _delete_source_datazone_assets(namespace_id, source_id)
+            removed = _delete_source_datazone_assets(namespace_id, source_id, context)
             logger.info("datazone_assets_deleted", source_id=source_id, count=removed)
         except Exception:
             logger.exception(
@@ -1022,7 +1092,21 @@ def _handle_delete(namespace_id: str, source_id: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _handle_rescan(namespace_id: str, source_id: str) -> dict[str, Any]:
+def _handle_rescan(event: dict[str, Any], namespace_id: str, source_id: str) -> dict[str, Any]:
+    from coa_control_plane_server.models.rescan_source_request_content import RescanSourceRequestContent
+
+    # The body carries only the discard-open-review acknowledgement. It is
+    # optional, so an absent body is valid and parses to all-defaults.
+    try:
+        raw: dict[str, Any] = json.loads(event.get("body") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return api_response(400, {"error": "Invalid JSON body"})
+    try:
+        req = RescanSourceRequestContent.model_validate(raw)
+    except ValidationError as exc:
+        msg = exc.errors()[0]["msg"] if exc.errors() else str(exc)
+        return api_response(400, {"error": msg})
+
     try:
         item = _get_dao().get({"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"})
     except ClientError:
@@ -1037,23 +1121,69 @@ def _handle_rescan(namespace_id: str, source_id: str) -> dict[str, Any]:
     now = _now_iso()
 
     # Validation differs by source type:
-    # - DATABASE: re-scan is a recovery action only (SCAN_FAILED). Schema-drift
-    #   re-scans of approved sources are a planned enhancement —
-    #   until implemented we reject to prevent destructive re-enrichment.
+    # - DATABASE: re-scan is allowed from SCAN_FAILED (recovery), APPROVED
+    #   (schema-drift re-scan of a live source — merges onto the accepted
+    #   assets, preserves curated metadata, and moves the source to
+    #   RESCAN_REVIEW for steward review), or RESCAN_REVIEW itself (retry a
+    #   drift review). Any other status is rejected.
     # - DOCUMENTS: re-scan is allowed from COMPLETED (re-ingest) or SCAN_FAILED
     #   (retry after failure). Active ingestion statuses are still rejected.
-    if source_type == SourceType.DATABASE and current_status != SourceStatus.SCAN_FAILED:
+    _DB_RESCAN_ALLOWED = (
+        SourceStatus.SCAN_FAILED,
+        SourceStatus.APPROVED,
+        SourceStatus.RESCAN_REVIEW,
+    )
+    if source_type == SourceType.DATABASE and current_status not in _DB_RESCAN_ALLOWED:
         return api_response(
             409,
             {
                 "error": (
-                    f"Re-scan is only allowed when status is '{SourceStatus.SCAN_FAILED}' "
-                    f"(current: '{current_status}'). Schema-drift re-scans are not yet supported."
+                    f"Re-scan is only allowed when status is one of "
+                    f"{', '.join(_DB_RESCAN_ALLOWED)} (current: '{current_status}')."
                 ),
                 "sourceId": source_id,
                 "status": current_status,
             },
         )
+    # Re-scanning a source that already has an OPEN re-scan review is the one
+    # transition that destroys steward work, so it needs an explicit
+    # acknowledgement. Discovery re-diffs against the last APPROVED state
+    # (reconstructed from the live assets plus the backup blob) and then
+    # overwrites that blob, so every review decision and edit made inside the
+    # open window is dropped — see the merge path in
+    # ``pipeline/discovery_handler.py``. Every other allowed status discards
+    # nothing: from APPROVED the live assets already ARE the baseline, and
+    # SCAN_FAILED has no review to lose. Checked before any write below, so a
+    # refused call leaves the source exactly as it was.
+    if (
+        source_type == SourceType.DATABASE
+        and current_status == SourceStatus.RESCAN_REVIEW
+        and not req.confirm_discard_open_review
+    ):
+        return api_response(
+            409,
+            {
+                "error": (
+                    f"Source '{source_id}' has a re-scan review open. Starting a new re-scan discards "
+                    f"the review decisions and edits already made in it. Retry with "
+                    f"'confirmDiscardOpenReview': true to proceed, or resolve the open review first."
+                ),
+                "sourceId": source_id,
+                "status": current_status,
+                # Lets a caller tell this recoverable "confirm and retry" 409
+                # apart from the wrong-status 409 above, which retrying cannot fix.
+                "confirmationRequired": "confirmDiscardOpenReview",
+            },
+        )
+
+    # A re-scan of an already-approved (or previously drift-reviewed) source is
+    # non-destructive: discovery merges onto the live assets and enrichment
+    # regenerates only PENDING items. The scan-failed recovery path is a first
+    # scan, so isRescan stays false there.
+    is_rescan = source_type == SourceType.DATABASE and current_status in (
+        SourceStatus.APPROVED,
+        SourceStatus.RESCAN_REVIEW,
+    )
 
     if source_type == SourceType.DOCUMENTS:
         if current_status in SOURCE_ACTIVE_STATUSES:
@@ -1170,6 +1300,20 @@ def _handle_rescan(namespace_id: str, source_id: str) -> dict[str, Any]:
                         "scanJobSK": scan_job_sk,
                         "namespaceId": namespace_id,
                         "scanType": "full",
+                        # Set only when re-scanning an already-approved (or drift-
+                        # review) source. Drives the merge-onto-live-assets path in
+                        # discovery and RESCAN_REVIEW routing in enrichment.
+                        "isRescan": is_rescan,
+                        # True ONLY when the source was already in RESCAN_REVIEW,
+                        # i.e. a prior re-scan is still open and un-approved. Only
+                        # then are the live assets an interim merge and the S3
+                        # backup blob the approved pre-image discovery must
+                        # reconstruct from. When re-scanning from APPROVED the live
+                        # assets ARE the approved baseline; a leftover backup blob
+                        # (from before delete-on-resolve shipped, or a paged-approve
+                        # gap) is stale and must be ignored. Blob presence alone is
+                        # NOT proof of an open review — this flag is.
+                        "hadOpenRescan": current_status == SourceStatus.RESCAN_REVIEW,
                     }
                 ),
             )
@@ -1195,19 +1339,20 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     Args:
         event: API Gateway proxy integration event (method, resource, path
             parameters, and body).
-        context: Lambda runtime context (unused).
+        context: Lambda runtime context — threaded to cleanup helpers so they
+            can derive a wall-clock deadline from the real remaining time.
 
     Returns:
         API Gateway proxy response dict with status code and JSON body.
     """
     try:
-        return _route(event)
+        return _route(event, context)
     except Exception:
         logger.exception("unhandled_error")
         return api_response(500, {"error": "Internal server error"})
 
 
-def _route(event: dict[str, Any]) -> dict[str, Any]:
+def _route(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
     http_method: str = event.get("httpMethod", "")
     resource: str = event.get("resource", "")
     # REST API Gateway proxy integration passes pathParameters exactly as they
@@ -1249,13 +1394,13 @@ def _route(event: dict[str, Any]) -> dict[str, Any]:
         if http_method == "GET":
             return _handle_get(namespace_id, source_id)
         if http_method == "DELETE":
-            return _handle_delete(namespace_id, source_id)
+            return _handle_delete(namespace_id, source_id, context)
 
     if resource == "/namespaces/{namespaceId}/sources/{sourceId}/rescan" and http_method == "POST":
         source_id = path_params.get("sourceId", "")
         if not source_id:
             return api_response(400, {"error": "sourceId is required"})
-        return _handle_rescan(namespace_id, source_id)
+        return _handle_rescan(event, namespace_id, source_id)
 
     if resource == "/namespaces/{namespaceId}/sources/{sourceId}/approve" and http_method == "POST":
         source_id = path_params.get("sourceId", "")
@@ -1288,6 +1433,13 @@ def _route(event: dict[str, Any]) -> dict[str, Any]:
         if not source_id or not table_id:
             return api_response(400, {"error": "sourceId and tableId are required"})
         return _handle_review_table(event, namespace_id, source_id, table_id)
+
+    if resource == "/namespaces/{namespaceId}/sources/{sourceId}/tables/{tableId}/keep" and http_method == "PUT":
+        source_id = path_params.get("sourceId", "")
+        table_id = path_params.get("tableId", "")
+        if not source_id or not table_id:
+            return api_response(400, {"error": "sourceId and tableId are required"})
+        return _handle_keep_rescan_removal(event, namespace_id, source_id, table_id)
 
     if resource == "/namespaces/{namespaceId}/sources/{sourceId}/tables/{tableId}/metadata" and http_method == "PATCH":
         source_id = path_params.get("sourceId", "")
@@ -1324,6 +1476,12 @@ def _route(event: dict[str, Any]) -> dict[str, Any]:
         if not source_id or not table_id or not column_name:
             return api_response(400, {"error": "sourceId, tableId, and columnName are required"})
         return _handle_update_column_metadata(event, namespace_id, source_id, table_id, column_name)
+
+    if resource == "/namespaces/{namespaceId}/sources/{sourceId}/scan" and http_method == "GET":
+        source_id = path_params.get("sourceId", "")
+        if not source_id:
+            return api_response(400, {"error": "sourceId is required"})
+        return _handle_list_scan_jobs(namespace_id, source_id)
 
     if resource == "/namespaces/{namespaceId}/sources/{sourceId}/scan/{jobId}" and http_method == "GET":
         source_id = path_params.get("sourceId", "")

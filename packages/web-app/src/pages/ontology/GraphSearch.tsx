@@ -57,6 +57,39 @@ const SEARCH_NEIGHBOR_HOPS = 1;
 const MAX_SEARCH_NODES = 60;
 
 /**
+ * Per-ontology cap on classes shown in the initial (no-search) graph seed. An
+ * ontology at or below this renders in FULL (every class + its relationships)
+ * from a single bulk overview call — no per-class fan-out. One above it falls
+ * back to that ontology's bounded sample (largest-subtree roots + capped
+ * descendants), because past this point dagre layout and React Flow's DOM
+ * rendering both degrade.
+ *
+ * The cap is deliberately PER ONTOLOGY, not on the namespace total: a namespace
+ * that loaded a large foundational reference for grounding (Schema.org alone is
+ * ~1010 classes, FIBO more) would otherwise blow a combined budget and drag its
+ * small induced ontology down into the sampled path with it — which is exactly
+ * the "graph is tiny and has no relationships" complaint this seed exists to
+ * fix. Scoping per ontology means the induced ontology a user actually cares
+ * about always renders in full, however big the references beside it are.
+ *
+ * Deliberately higher than MAX_SEARCH_NODES: a search result is meant to stay
+ * tightly focused on a few matches, while the initial seed's whole point is to
+ * show as much of the real namespace shape as the renderer can still handle.
+ */
+const MAX_SEED_CLASSES = 500;
+
+/**
+ * Ceiling on TOTAL seeded classes across all ontologies, so a namespace with
+ * many mid-sized ontologies (each individually under MAX_SEED_CLASSES) can't
+ * multiply into a graph the browser won't lay out. Ontologies are considered
+ * induced-first, then smallest-first, and each one that no longer fits the
+ * remaining budget falls back to its bounded sample — so the budget is spent on
+ * the ontologies most likely to be the point of the view, and running out
+ * degrades those ontologies rather than failing the whole seed.
+ */
+const MAX_SEED_CLASSES_TOTAL = 1500;
+
+/**
  * How many display pages ahead of the current one must be backed by already
  * loaded rows. One page of lookahead means the next server chunk is requested
  * while the user is still reading the last page the current chunk backs, so the
@@ -236,6 +269,19 @@ export function computeRoots(details: Map<string, GraphVertex>): string[] {
 
 const RDFS_SUBCLASS_OF = "http://www.w3.org/2000/01/rdf-schema#subClassOf";
 
+/**
+ * Cap on object-property edges materialized into the initial seed. The
+ * proposal graph (client-side Turtle parse) is unbounded, but the Explorer
+ * seed can reach thousands of edges (Schema.org alone returns ~1676), which
+ * would push dagre into slow layout territory even at 500 nodes. 2× the class
+ * cap gives every class room for a couple of relationships on average, which
+ * is enough to see the "shape" of the ontology without freezing the browser.
+ * Object properties whose domain/range aren't both in the visible class set
+ * are dropped before this cap counts, so the budget goes to edges the user
+ * actually sees.
+ */
+const MAX_SEED_RELATIONSHIPS = 1000;
+
 /** A class as returned by the ontology-overview endpoint — the subset of
  *  {@link OntologyOverviewClass} the taxonomy builder needs. */
 export interface TaxonomyClass {
@@ -243,6 +289,70 @@ export interface TaxonomyClass {
   label?: string | null;
   comment?: string | null;
   subClassOf?: string[] | null;
+}
+
+/** An object property as returned by the ontology-overview endpoint — the
+ *  subset of {@link OntologyPropertySummary} the seed's relationship builder
+ *  reads. The label defaults to the property's local name if omitted. */
+export interface TaxonomyRelationship {
+  uri: string;
+  label?: string | null;
+  domain?: string | null;
+  range?: string | null;
+}
+
+/** One ontology's full (un-sampled) overview, as the seed planner reads it. */
+export interface SeedCandidate {
+  ontology_id: string;
+  /** True for registry rows typed `induced` — these get first call on budget. */
+  induced?: boolean;
+  classes: TaxonomyClass[];
+}
+
+/**
+ * Which ontologies the seed renders in full and which fall back to a bounded
+ * sample, given each one's full class count.
+ */
+export interface SeedPlan {
+  /** Render every class of these, plus their object-property relationships. */
+  full: string[];
+  /** Too large (or out of budget) — re-fetch these with `sample=true`. */
+  sampled: string[];
+}
+
+/**
+ * Decide, per ontology, whether the seed can render it in full.
+ *
+ * An ontology renders in full when its own class count is within
+ * {@link MAX_SEED_CLASSES} *and* still fits the remaining
+ * {@link MAX_SEED_CLASSES_TOTAL} budget; otherwise it falls back to its bounded
+ * server-side sample. Candidates are considered induced-first and then
+ * smallest-first, which (a) guarantees the induced ontology — the one the user
+ * came to look at — is never starved by a large foundational reference loaded
+ * beside it for grounding, and (b) fits as many ontologies as possible into the
+ * budget. Ordering is fully deterministic (ties broken on ontology_id), so the
+ * same namespace always seeds the same way rather than following whatever order
+ * the registry happened to return.
+ */
+export function planGraphSeed(candidates: SeedCandidate[]): SeedPlan {
+  const ordered = [...candidates].sort((a, b) => {
+    if (!!a.induced !== !!b.induced) return a.induced ? -1 : 1;
+    const byCount = a.classes.length - b.classes.length;
+    if (byCount !== 0) return byCount;
+    return a.ontology_id.localeCompare(b.ontology_id);
+  });
+  const plan: SeedPlan = { full: [], sampled: [] };
+  let budget = MAX_SEED_CLASSES_TOTAL;
+  for (const c of ordered) {
+    const n = c.classes.length;
+    if (n <= MAX_SEED_CLASSES && n <= budget) {
+      plan.full.push(c.ontology_id);
+      budget -= n;
+    } else {
+      plan.sampled.push(c.ontology_id);
+    }
+  }
+  return plan;
 }
 
 /**
@@ -254,12 +364,20 @@ export interface TaxonomyClass {
  * Parent edges are emitted even when the parent is not itself in the overview
  * (e.g. a foundational super-class), so grounding parents still render.
  *
- * Vertices are flagged `partial`: they carry only the taxonomy, not the class's
- * relationships/attributes, so the detail panel upgrades them via `getClass`
- * when a node is selected.
+ * When ``relationships`` is passed, each object property whose domain AND
+ * range are both present in the class set is materialized as an edge pair too
+ * (outgoing on the domain vertex, incoming on the range vertex), so the seed
+ * shows the ontology's relationships alongside its taxonomy — matching the
+ * proposal-detail graph. Edges are capped at ``MAX_SEED_RELATIONSHIPS`` so
+ * dagre layout stays responsive even on a Schema.org-scale ontology.
+ *
+ * Vertices are flagged `partial`: they carry only the taxonomy + relationship
+ * edges, not the class's attributes, so the detail panel upgrades them via
+ * `getClass` when a node is selected.
  */
 export function buildTaxonomyVertices(
   classes: TaxonomyClass[],
+  relationships: TaxonomyRelationship[] = [],
 ): Map<string, GraphVertex> {
   const labelOf = new Map<string, string>();
   for (const c of classes) {
@@ -312,6 +430,49 @@ export function buildTaxonomyVertices(
           kind: "class",
         },
       });
+    }
+  }
+
+  // Object-property relationships. Emit an edge pair only when domain AND
+  // range are both class vertices we're already going to render — otherwise
+  // the edge would dangle off-screen and inflate the render budget for
+  // nothing. Cap the total so a dense ontology (~1.7k relationships in
+  // Schema.org) doesn't push dagre into slow-layout territory; anything past
+  // the cap is still reachable via node select (which upgrades the vertex to
+  // its full getClass result).
+  if (relationships.length > 0) {
+    let relEmitted = 0;
+    for (const rel of relationships) {
+      if (relEmitted >= MAX_SEED_RELATIONSHIPS) break;
+      const domain = rel.domain;
+      const range = rel.range;
+      if (!domain || !range) continue;
+      if (!details.has(domain) || !details.has(range)) continue;
+      const label = rel.label || localName(rel.uri);
+      // Domain → range (outgoing on domain, incoming on range) so the shared
+      // buildGraphData renders it as domain → range regardless of which
+      // vertex it's read from.
+      vertexFor(domain).edges.push({
+        predicate: rel.uri,
+        predicate_label: label,
+        direction: "outgoing",
+        neighbor: {
+          uri: range,
+          label: labelOf.get(range) ?? null,
+          kind: "class",
+        },
+      });
+      vertexFor(range).edges.push({
+        predicate: rel.uri,
+        predicate_label: label,
+        direction: "incoming",
+        neighbor: {
+          uri: domain,
+          label: labelOf.get(domain) ?? null,
+          kind: "class",
+        },
+      });
+      relEmitted += 1;
     }
   }
   return details;
@@ -640,6 +801,20 @@ export function GraphSearchPage() {
   const rowRef = useRef<HTMLDivElement>(null);
   const bottomInsetRef = useRef<number | null>(null);
   const [rowHeight, setRowHeight] = useState<number>();
+
+  // Tracks whether the component is still mounted so async handlers invoked
+  // from user events (not from a useEffect) can skip their trailing setState
+  // if the user navigated away mid-flight — otherwise React logs a warning
+  // and, in Strict Mode, tears the surviving state. useEffect-driven fetches
+  // already use their own `cancelled` closure; this ref is for the imperative
+  // async paths like ``focusVertexInGraph``.
+  const isMountedRef = useRef(true);
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
   useLayoutEffect(() => {
     const measure = () => {
       const el = rowRef.current;
@@ -709,12 +884,21 @@ export function GraphSearchPage() {
   }, [namespaceId, apiClient, ontologyById]);
 
   // Build the graph seed the first time the Graph view is opened without an
-  // active search. Rather than materialize every class, fetch a BOUNDED sample
-  // per ontology (`sample=true` → a few largest-subtree roots + ≤50 descendants,
-  // no properties) and build the taxonomy from just that. This keeps opening the
-  // Graph view O(bounded) even for multi-thousand-class ontologies — the old
-  // path fanned out one getClass per class (~1s × N). Deeper levels and a node's
-  // relationships/attributes are fetched on demand (expand / select).
+  // active search. Fetches the FULL (un-sampled) class list per ontology —
+  // one bulk SPARQL round-trip per ontology via getOntologyOverview, same
+  // primitive the description-loading effect above already uses — rather
+  // than the old `sample=true` bounded seed (a few largest-subtree roots +
+  // ≤50 descendants). Feedback was that the sampled seed felt "too
+  // simplistic"; a namespace's real shape only shows once every class and its
+  // relationships are on screen.
+  //
+  // planGraphSeed then decides PER ONTOLOGY which ones render in full and
+  // which fall back to their bounded sample, so an oversized foundational
+  // reference (Schema.org, FIBO) loaded for grounding degrades only itself and
+  // not the induced ontology sitting beside it. Only the ontologies that don't
+  // fit pay a second (sampled) round-trip. Classes past a sampled ontology's
+  // bound stay reachable via expand/search, and deeper attributes per node are
+  // still fetched on demand (expand / select).
   //
   // The "loaded once" latch is a ref (only read as a guard, never rendered), so
   // setting it never re-runs the effect — that self-invalidation was the earlier
@@ -737,30 +921,81 @@ export function GraphSearchPage() {
     setLoading(true);
 
     // Every ontology in the namespace registry (complete — not derived from a
-    // capped class fetch), so the seed samples across all of them.
+    // capped class fetch), so the seed covers all of them.
     const ontologyIds = [...ontologyById.keys()];
 
     Promise.all(
       ontologyIds.map((id) =>
-        getOntologyOverview(apiClient, namespaceId, id, { sample: true }).catch(
-          () => null,
-        ),
+        getOntologyOverview(apiClient, namespaceId, id)
+          .then((ov) => ({ id, ov }))
+          .catch(() => ({ id, ov: null })),
       ),
     )
-      .then((overviews) => {
+      .then((results) => {
         if (cancelled) return;
-        const sampled: TaxonomyClass[] = [];
-        for (const ov of overviews) {
-          for (const c of ov?.classes ?? []) sampled.push(c);
+        // Decide per ontology whether it renders in full, so one oversized
+        // foundational reference can't drag the whole namespace (notably a
+        // small induced ontology) onto the sampled path with it.
+        const plan = planGraphSeed(
+          results.map(({ id, ov }) => ({
+            ontology_id: id,
+            induced: ontologyById.get(id)?.ontologyType === "induced",
+            classes: ov?.classes ?? [],
+          })),
+        );
+        const byId = new Map(results.map(({ id, ov }) => [id, ov]));
+        // Walk the plan (induced/smallest first) rather than the registry
+        // order, so the relationship budget inside buildTaxonomyVertices is
+        // also spent induced-first instead of on whichever ontology the
+        // registry happened to list first.
+        const seedOrder = [...plan.full, ...plan.sampled];
+        const classes: TaxonomyClass[] = [];
+        const relationships: TaxonomyRelationship[] = [];
+        const fullSet = new Set(plan.full);
+        for (const id of seedOrder) {
+          const ov = byId.get(id);
+          if (fullSet.has(id)) {
+            for (const c of ov?.classes ?? []) classes.push(c);
+          }
+          // Relationships are collected for EVERY ontology, sampled ones
+          // included: we already hold their full overview, and
+          // buildTaxonomyVertices drops any edge whose domain/range isn't a
+          // rendered class. So a sampled ontology still shows the
+          // relationships that fall inside its sampled subset, instead of
+          // rendering as a bare hierarchy.
+          for (const p of ov?.objectProperties ?? []) relationships.push(p);
         }
-        const details = buildTaxonomyVertices(sampled);
-        // The bounded seed is shown in full (roots + their sampled descendants);
-        // everything else is reachable by expanding a node or searching.
-        const visible = new Set(details.keys());
-        const roots = computeRoots(details);
-        setDetailsMap(details);
-        setTotalRoots(roots.length);
-        setVisibleUris(visible);
+
+        const finish = () => {
+          const details = buildTaxonomyVertices(classes, relationships);
+          const visible = new Set(details.keys());
+          const roots = computeRoots(details);
+          setDetailsMap(details);
+          setTotalRoots(roots.length);
+          setVisibleUris(visible);
+        };
+
+        // Everything fit — no second round-trip.
+        if (plan.sampled.length === 0) {
+          finish();
+          return;
+        }
+        // Only the oversized ontologies pay a second call, for their bounded
+        // sample (largest-subtree roots + capped descendants) — a coherent set
+        // of taxonomies rather than an arbitrary slice of a truncated list.
+        return Promise.all(
+          plan.sampled.map((id) =>
+            getOntologyOverview(apiClient, namespaceId, id, {
+              sample: true,
+            }).catch(() => null),
+          ),
+        ).then((sampledOverviews) => {
+          if (cancelled) return;
+          for (const ov of sampledOverviews) {
+            for (const c of ov?.classes ?? []) classes.push(c);
+          }
+          finish();
+        });
       })
       .catch((e) =>
         setError(e instanceof Error ? e.message : "Failed to load graph"),
@@ -1015,6 +1250,9 @@ export function GraphSearchPage() {
             : fetchVertexByKind(apiClient, namespaceId, nUri, nKind),
         ),
       );
+      // Neighbour fetches can outlive an unmount (event-handler async, not a
+      // useEffect); skip the trailing setState in that case.
+      if (!isMountedRef.current) return;
       batch.forEach(([nUri], i) => {
         const v = fetched[i];
         if (v) {
@@ -1029,9 +1267,10 @@ export function GraphSearchPage() {
       // Reflect the focus in the search box without triggering a search.
       setQuery(vertex.labels?.[0] || localName(vertex.uri));
     } catch (e) {
+      if (!isMountedRef.current) return;
       setError(e instanceof Error ? e.message : "Failed to open graph view");
     } finally {
-      setLoading(false);
+      if (isMountedRef.current) setLoading(false);
     }
   };
 

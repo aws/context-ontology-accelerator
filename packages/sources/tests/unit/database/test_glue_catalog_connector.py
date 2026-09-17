@@ -8,7 +8,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 import pytest
-from coa_common.domain_models import Column, Table
+from coa_common.domain_models import Column, EnrichmentSource, Table
 from coa_sources.database.connectors.glue_catalog import (
     GlueCatalogConnector,
 )
@@ -159,6 +159,77 @@ class TestDiscoverMetadata:
         assert partition_cols[0].nullable is False
 
         assert result.total_columns == 4
+
+    @patch("coa_sources.database.connectors.glue_catalog.boto3")
+    def test_source_owned_fields_are_populated_for_rescan_diff(self, mock_boto3, connector):
+        """A discovered Table carries exactly the source-owned fields ``rescan.diff_tables``
+        compares — so a Glue re-scan can actually detect drift.
+
+        Pins: per-column ``data_type`` / ``is_partition_key`` / hardcoded ``nullable``
+        (Glue exposes no nullability: regular cols → True, partition cols → False);
+        ``technical_metadata`` format/location/partition_keys; a Glue Comment surfaced as
+        a ``DETERMINISTIC`` (source-derived) ``business_metadata.description`` — the exact
+        provenance that makes ``diff_tables`` compare it — while a comment-less column is
+        left empty and NOT source-derived (so a no-op re-scan won't flag it); and that no
+        primary/foreign keys are produced (documents the known Glue limitation).
+        """
+        mock_client = MagicMock()
+        paginator = MagicMock()
+        paginator.paginate.return_value = [
+            {
+                "TableList": [
+                    {
+                        "Name": "orders",
+                        "Description": "Order records table",
+                        "Parameters": {"classification": "parquet"},
+                        "StorageDescriptor": {
+                            "Location": "s3://bucket/orders/",
+                            "Columns": [
+                                {"Name": "order_id", "Type": "bigint", "Comment": "unique order id"},
+                                {"Name": "amount", "Type": "decimal(10,2)", "Comment": ""},
+                            ],
+                        },
+                        "PartitionKeys": [{"Name": "order_date", "Type": "date", "Comment": ""}],
+                    }
+                ]
+            }
+        ]
+        mock_client.get_paginator.return_value = paginator
+        mock_boto3.client.return_value = mock_client
+
+        result = connector.discover_metadata({"database_name": "sales_db", "region": "us-east-1"})
+        (table,) = result.tables
+        cols = {c.name: c for c in table.columns}
+
+        # data_type + is_partition_key
+        assert cols["order_id"].data_type == "bigint"
+        assert cols["order_id"].is_partition_key is False
+        assert cols["order_date"].data_type == "date"
+        assert cols["order_date"].is_partition_key is True
+
+        # hardcoded nullability (Glue exposes none): regular → True, partition → False
+        assert cols["order_id"].nullable is True
+        assert cols["amount"].nullable is True
+        assert cols["order_date"].nullable is False
+
+        # technical metadata the diff reads
+        assert table.technical_metadata.format == "parquet"
+        assert table.technical_metadata.location == "s3://bucket/orders/"
+        assert table.technical_metadata.partition_keys == ["order_date"]
+
+        # a Glue Comment becomes a source-derived (DETERMINISTIC) description → diff compares it
+        assert cols["order_id"].business_metadata.description == "unique order id"
+        assert cols["order_id"].business_metadata.enrichment_source == EnrichmentSource.DETERMINISTIC
+        # no comment → empty and NOT source-derived, so a no-op re-scan won't flag it
+        assert cols["amount"].business_metadata.description == ""
+        assert cols["amount"].business_metadata.enrichment_source == ""
+        # table-level Description is likewise source-derived
+        assert table.business_metadata.description == "Order records table"
+        assert table.business_metadata.enrichment_source == EnrichmentSource.DETERMINISTIC
+
+        # known Glue limitation: no primary/foreign keys are discovered
+        assert table.primary_key.columns == []
+        assert table.foreign_keys == []
 
     @patch("coa_sources.database.connectors.glue_catalog.boto3")
     def test_table_exclude_filter(self, mock_boto3, connector):

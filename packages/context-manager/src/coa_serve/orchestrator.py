@@ -22,6 +22,7 @@ from .tier2.sql_firewall import NamespaceSQLScopeError
 
 if TYPE_CHECKING:
     from .clients.sources_registry import SourceComposition, SourcesRegistry
+    from .deadline import Deadline
     from .tier2.skip import Tier2SkipEvaluator
     from .tier3.agentic.retriever import AgenticRetriever
 from .model_validation import validate_model_id as _validate_model_id
@@ -187,6 +188,7 @@ class Orchestrator:
         trace: TraceCollector | None = None,
         on_token: Callable[[str], Awaitable[None]] | None = None,
         conversation_history: list[dict[str, str]] | None = None,
+        deadline: Deadline | None = None,
     ) -> InvokeResponse:
         """Resolve a query through the tier cascade and return the first hit.
 
@@ -199,6 +201,10 @@ class Orchestrator:
             trace: Optional trace collector; a new one is created when omitted.
             on_token: Optional async callback for streaming Tier-3 tokens.
             conversation_history: Optional prior turns for conversational context.
+            deadline: Optional request-scoped time budget (A0). When supplied, it is
+                threaded into the Tier-2 StrategyContext so the NL→SQL correction
+                shot can skip itself rather than overrun the transport ceiling. None
+                preserves pre-A0 behaviour (strategies use fixed internal timeouts).
 
         Returns:
             The assembled InvokeResponse from the first tier that resolves.
@@ -300,6 +306,7 @@ class Orchestrator:
                 strategy_selection=strategy,
                 tier_override=tier_override,
                 model_id=model_id_override,
+                deadline=deadline,
             )
             if strategy_result:
                 return strategy_result
@@ -638,6 +645,7 @@ class Orchestrator:
         strategy_selection: StrategyOption,
         tier_override: int | None,
         model_id: str | None = None,
+        deadline: Deadline | None = None,
     ) -> tuple[InvokeResponse | None, str | None]:
         """Run Tier 2 strategies and return (response, sparql_for_tier3_grounding).
 
@@ -650,6 +658,7 @@ class Orchestrator:
             options=options,
             trace=trace,
             model_id=model_id,
+            deadline=deadline,
         )
 
         result = await self._structured_query_tier.resolve(query, namespace, context, option=strategy_selection)
@@ -726,7 +735,11 @@ class Orchestrator:
                     sql_used=result.sql,
                     sparql=result.sparql,
                     confidence=result.confidence,
-                    ontology_version=None,
+                    # The ONLY truthful source: the translate response of the
+                    # VKG that executed this query. Paths without an in-band
+                    # snapshot version report null by design — a namespace-level
+                    # "current version" is not the version THIS query used (#986).
+                    ontology_version=result.ontology_version or None,
                     data_sources=None,
                     trace=trace,
                     namespace=namespace,

@@ -81,6 +81,114 @@ class TestParseHits:
 
 
 @pytest.mark.unit
+class TestSourceDocumentIdentity:
+    """Document identity/name resolution for GraphRAG chunk hits (#985).
+
+    The nested fixture shape below is a real ``chunk_{tenant}`` document
+    captured live from a deployed ap-northeast-1 environment, trimmed to the
+    fields the ``_source`` projection requests.
+    """
+
+    _CHUNK_SOURCE = {
+        "value": "外形図: 全高 98mm、レンズ部 φ120…",
+        "metadata": {
+            "source": {
+                "sourceId": "aws:7ef12381488a4c3e9822c735d:8ca598df:2037",
+                "metadata": {
+                    # Staging artifact name — preprocessing converted the
+                    # uploaded PDF to markdown, so this is NOT the name the
+                    # user recognizes.
+                    "filename": "nwcamera-NC-2600_dimensions.md",
+                    "source_s3_key": "7ef12381/raw/320d3d58/nwcamera-NC-2600_dimensions.pdf",
+                },
+            },
+        },
+    }
+
+    def test_chunk_hit_resolves_unique_id_and_display_name(self):
+        """A retrieved chunk names its document: unique id + the UPLOADED
+        document's name (raw-key basename), not the staging artifact's."""
+        client, _ = _client()
+        raw = {"hits": {"hits": [{"_id": "c1", "_score": 0.9, "_source": dict(self._CHUNK_SOURCE)}]}}
+
+        hits = client._parse_hits(raw)
+
+        assert hits[0].metadata["source_doc"] == "aws:7ef12381488a4c3e9822c735d:8ca598df:2037"
+        assert hits[0].metadata["source_doc_name"] == "nwcamera-NC-2600_dimensions.pdf"
+        assert hits[0].text == "外形図: 全高 98mm、レンズ部 φ120…"
+
+    def test_staging_filename_is_only_the_fallback_name(self):
+        """Without a raw key, the staging filename is better than nothing."""
+        from coa_serve.clients.opensearch import _source_document_name
+
+        source = {"metadata": {"source": {"sourceId": "aws:x:y:z", "metadata": {"filename": "report.md"}}}}
+        assert _source_document_name(source) == "report.md"
+
+    def test_same_path_in_two_sources_never_fuses_ids(self):
+        """Regression: path-shaped metadata is NOT identity.
+
+        Two document sources can each hold ``reports/annual.pdf``; their
+        toolkit sourceIds differ, and the resolved ids must too. The shared
+        path may only surface as the display name.
+        """
+        from coa_serve.clients.opensearch import _source_document_id, _source_document_name
+
+        def _chunk(source_id: str) -> dict:
+            return {
+                "metadata": {
+                    "source": {
+                        "sourceId": source_id,
+                        "metadata": {
+                            "filename": "annual.pdf",
+                            "source_s3_key": "reports/annual.pdf",
+                        },
+                    }
+                }
+            }
+
+        chunk_a = _chunk("aws:tenant:1111:1")
+        chunk_b = _chunk("aws:tenant:2222:9")
+
+        assert _source_document_id(chunk_a) != _source_document_id(chunk_b)
+        assert _source_document_id(chunk_a) == "aws:tenant:1111:1"
+        assert _source_document_name(chunk_a) == _source_document_name(chunk_b) == "annual.pdf"
+
+    def test_flat_source_doc_still_wins(self):
+        from coa_serve.clients.opensearch import _source_document_id
+
+        source = {"source_doc": "flat.pdf", **self._CHUNK_SOURCE}
+        assert _source_document_id(source) == "flat.pdf"
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            {},
+            {"metadata": None},
+            {"metadata": "not-a-dict"},
+            {"metadata": {"source": "bare-string"}},
+            {"metadata": {"source": {"sourceId": 42, "metadata": {"filename": 7}}}},
+        ],
+    )
+    def test_unknown_shapes_stay_empty(self, source):
+        from coa_serve.clients.opensearch import _source_document_id, _source_document_name
+
+        assert _source_document_id(source) == ""
+        assert _source_document_name(source) == ""
+
+    def test_projection_requests_the_nested_identity_fields(self):
+        """The identity/name fields must be in the ``_source`` projection, or
+        the resolvers never see them regardless of what the index holds."""
+        from coa_serve.clients.opensearch import _SOURCE_FIELDS
+
+        for path in (
+            "metadata.source.sourceId",
+            "metadata.source.metadata.source_s3_key",
+            "metadata.source.metadata.filename",
+        ):
+            assert path in _SOURCE_FIELDS
+
+
+@pytest.mark.unit
 class TestConstruction:
     def test_missing_endpoint_raises(self):
         from coa_serve.clients.opensearch import OpenSearchVectorClient

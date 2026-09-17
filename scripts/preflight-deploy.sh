@@ -253,41 +253,166 @@ else
   warn "AWS credentials not available — skipping CDK bootstrap check"
 fi
 
-# ── 9. Configured Bedrock model IDs exist in the deploy region ────────────
-# Nothing validates model IDs at synth or deploy time, so an unusable ID (e.g. a
-# `us.` inference profile in a non-US region) still reaches CREATE_COMPLETE and
-# only fails at first invocation. Deliberately a WARNING, not an error: model
-# availability can be account-scoped and a bare in-region ID lives in a different
-# API than a geographic profile, so a hard failure here could block a valid
-# deploy. Needs jq (the config is JSON) — skipped without it.
+# ── 9. Effective Bedrock model IDs are invocable from the deploy region ───
+# Two checks, with different strengths, on the model IDs the stacks will
+# actually deploy — the value in /{prefix}/config when set, else the built-in
+# default (#1020: with no config every default is a `us.` profile, so a
+# non-US deploy reaches CREATE_COMPLETE and fails at the first Bedrock call).
+#
+#   ERROR  a geographic inference profile the deploy region's geography does
+#          not publish (`us.` in ap-northeast-1). Deterministic; bin/app.ts
+#          fails synth on the same condition, this is the earlier, friendlier
+#          report.
+#   WARN   the model is not listed in the region. Availability is
+#          account-scoped and a bare in-region ID lives in a different API
+#          than a geographic profile, so a hard failure here could block a
+#          valid deploy.
+#
+# The defaults MUST match libs/ts-shared/src/constants.ts — pinned by
+# infra/test/model-id-defaults.test.ts. Node is already a required deploy
+# prerequisite, so use it here instead of making model validation depend on jq.
+_DEFAULT_LLM_MODEL_ID="us.anthropic.claude-sonnet-5"
+_DEFAULT_EMBED_MODEL_ID="us.cohere.embed-v4:0"
+_DEFAULT_INDUCTION_MODEL_ID="us.anthropic.claude-sonnet-5"
+_DEFAULT_CHAT_MODEL_ID="us.anthropic.claude-haiku-4-5-20251001-v1:0"
 _CONFIG_PARAM="/${SCL_PREFIX:-coa}/config"
-if command -v aws >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 \
+
+# Geographies (as inference-profile prefixes) whose profiles are published in
+# a region. Mirrors regionGeographies() in infra/lib/utils/model-region.ts —
+# infra/test/model-id-defaults.test.ts runs this function and compares.
+_coa_region_geographies() {
+  case "$1" in
+    us-gov-*) echo "us-gov" ;;
+    cn-*) echo "" ;;
+    us-*) echo "us global" ;;
+    eu-*) echo "eu global" ;;
+    ca-*) echo "ca global" ;;
+    ap-northeast-1|ap-northeast-3) echo "jp apac global" ;;
+    ap-southeast-2|ap-southeast-4) echo "au apac global" ;;
+    me-central-1) echo "apac global" ;;
+    ap-*) echo "apac global" ;;
+    *) echo "global" ;;
+  esac
+}
+
+# The leading geography of an inference-profile ID (3+ dot segments, known
+# prefix), else nothing — bare IDs, ARNs and unknown geographies are not judged.
+_coa_model_geo_prefix() {
+  case "$1" in
+    *.*.*) ;;
+    *) return ;;
+  esac
+  _p="$(printf '%s' "$1" | cut -d. -f1 | tr '[:upper:]' '[:lower:]')"
+  case "$_p" in
+    us|eu|apac|jp|au|ca|us-gov|global) echo "$_p" ;;
+  esac
+}
+
+_coa_resolve_model_ids() {
+  _COA_DEFAULT_LLM_MODEL_ID="$_DEFAULT_LLM_MODEL_ID" \
+  _COA_DEFAULT_EMBED_MODEL_ID="$_DEFAULT_EMBED_MODEL_ID" \
+  _COA_DEFAULT_INDUCTION_MODEL_ID="$_DEFAULT_INDUCTION_MODEL_ID" \
+  _COA_DEFAULT_CHAT_MODEL_ID="$_DEFAULT_CHAT_MODEL_ID" \
+  node -e '
+    const fail = (message) => {
+      console.error(message);
+      process.exit(1);
+    };
+
+    let config;
+    try {
+      config = JSON.parse(process.argv[1]);
+    } catch (error) {
+      fail(error instanceof Error ? error.message : String(error));
+    }
+    if (config === null || Array.isArray(config) || typeof config !== "object") {
+      fail("config root must be an object");
+    }
+
+    const defaults = [
+      ["bedrockLlmModelId", process.env._COA_DEFAULT_LLM_MODEL_ID],
+      ["bedrockEmbedModelId", process.env._COA_DEFAULT_EMBED_MODEL_ID],
+      ["bedrockInductionLlmModelId", process.env._COA_DEFAULT_INDUCTION_MODEL_ID],
+      ["bedrockChatModelId", process.env._COA_DEFAULT_CHAT_MODEL_ID],
+    ];
+    const rows = defaults.map(([key, fallback]) => {
+      const value = Object.prototype.hasOwnProperty.call(config, key)
+        ? config[key]
+        : null;
+      if (value === null) {
+        return [key, fallback, "default"];
+      }
+      if (typeof value !== "string") {
+        fail(`${key} must be a string`);
+      }
+      if (/^\s*$/.test(value)) {
+        return [key, fallback, "default"];
+      }
+      if (/\s/.test(value)) {
+        fail(`${key} must not contain whitespace`);
+      }
+      return [key, value, "config"];
+    });
+    process.stdout.write(`${rows.map((row) => row.join("\t")).join("\n")}\n`);
+  ' "$1"
+}
+
+if command -v aws >/dev/null 2>&1 \
     && aws sts get-caller-identity >/dev/null 2>&1; then
-  _cfg_json="$(aws ssm get-parameter --name "$_CONFIG_PARAM" --region "$REGION" \
-    --query 'Parameter.Value' --output text 2>/dev/null || echo "")"
+  if _cfg_json="$(aws ssm get-parameter --name "$_CONFIG_PARAM" --region "$REGION" \
+      --query 'Parameter.Value' --output text 2>&1)"; then
+    :
+  elif printf '%s' "$_cfg_json" | grep -q 'ParameterNotFound'; then
+    warn "$_CONFIG_PARAM not found in $REGION — every Bedrock model ID falls back to its built-in default."
+    _cfg_json="{}"
+  else
+    err "Could not read $_CONFIG_PARAM in $REGION — model-ID validation cannot proceed."
+    echo "       detail: $_cfg_json" >&2
+    _cfg_json=""
+  fi
   if [ -n "$_cfg_json" ]; then
-    _model_ids="$(printf '%s' "$_cfg_json" | jq -r '
-      [.bedrockLlmModelId, .bedrockEmbedModelId, .bedrockInductionLlmModelId, .bedrockChatModelId]
-      | map(select(. != null and . != "")) | .[]' 2>/dev/null || echo "")"
-    if [ -n "$_model_ids" ]; then
-      _profiles="$(aws bedrock list-inference-profiles --region "$REGION" \
-        --query 'inferenceProfileSummaries[].inferenceProfileId' --output text 2>/dev/null || echo "")"
-      _models="$(aws bedrock list-foundation-models --region "$REGION" \
-        --query 'modelSummaries[].modelId' --output text 2>/dev/null || echo "")"
-      if [ -z "$_profiles" ] && [ -z "$_models" ]; then
-        warn "Could not list Bedrock models in $REGION — skipping model-ID check"
-      else
-        for _mid in $_model_ids; do
-          if printf '%s %s' "$_profiles" "$_models" | grep -qF "$_mid"; then
-            ok "Bedrock model available in $REGION: $_mid"
-          else
-            warn "Bedrock model '$_mid' not found in $REGION (from $_CONFIG_PARAM)."
-            warn "  A cross-geography profile (e.g. 'us.' outside the US) fails at first invocation with"
-            warn "  ValidationException. See 'Where the model IDs live' in external-docs/content/deploying.md."
-          fi
-        done
-      fi
+    # One line per key: key<TAB>effective id<TAB>origin
+    if _effective="$(_coa_resolve_model_ids "$_cfg_json" 2>&1)"; then
+      :
+    else
+      err "$_CONFIG_PARAM is not valid deployment JSON — model-ID validation cannot proceed."
+      echo "       detail: $_effective" >&2
+      _effective=""
     fi
+  fi
+  if [ -n "${_effective:-}" ]; then
+    _geos="$(_coa_region_geographies "$REGION")"
+    _profiles="$(aws bedrock list-inference-profiles --region "$REGION" \
+      --query 'inferenceProfileSummaries[].inferenceProfileId' --output text 2>/dev/null || echo "")"
+    _models="$(aws bedrock list-foundation-models --region "$REGION" \
+      --query 'modelSummaries[].modelId' --output text 2>/dev/null || echo "")"
+    if [ -z "$_profiles" ] && [ -z "$_models" ]; then
+      warn "Could not list Bedrock models in $REGION — skipping the availability check"
+    fi
+    while IFS="$(printf '\t')" read -r _key _mid _origin; do
+      [ -n "$_key" ] || continue
+      case "$_origin" in
+        config) _from="from $_CONFIG_PARAM" ;;
+        *) _from="built-in default; $_CONFIG_PARAM does not set $_key" ;;
+      esac
+      _geo="$(_coa_model_geo_prefix "$_mid")"
+      if [ -n "$_geo" ] && ! printf ' %s ' "$_geos" | grep -qF " $_geo "; then
+        err "$_key '$_mid' is a '$_geo.' inference profile, which Bedrock does not publish in $REGION ($_from)."
+        echo "       fix: set $_key in $_CONFIG_PARAM to a profile published in $REGION (${_geos:-no geographic profiles here}) or the bare in-region model ID." >&2
+        continue
+      fi
+      if [ -n "$_profiles" ] || [ -n "$_models" ]; then
+        if printf '%s %s' "$_profiles" "$_models" | grep -qF "$_mid"; then
+          ok "Bedrock model available in $REGION: $_key=$_mid ($_origin)"
+        else
+          warn "Bedrock model '$_mid' ($_key, $_from) not found in $REGION."
+          warn "  It may be account-scoped or not yet enabled; if it is a cross-geography profile it fails at"
+          warn "  first invocation with ValidationException. See 'Where the model IDs live' in external-docs/content/deploying.md."
+        fi
+      fi
+    done <<EOF_EFFECTIVE
+$_effective
+EOF_EFFECTIVE
   fi
 fi
 

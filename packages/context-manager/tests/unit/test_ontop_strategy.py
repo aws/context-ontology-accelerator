@@ -50,6 +50,7 @@ def _make_tier2_result(*, error: str | None = None, firewall_denied: bool = Fals
     # VKG result
     vkg = MagicMock()
     vkg.sql = "SELECT col FROM tbl"
+    vkg.ontology_version = "2026-09-12T08:15:00Z"
     result.vkg_result = vkg
 
     # Query result
@@ -136,6 +137,22 @@ class TestOntopStrategyResolve:
         assert result.rows == [{"col": "val"}]
         assert result.columns == ["col"]
         assert result.confidence == 0.8
+        # The VKG names the ontology version it executed against; the value
+        # must survive into the StrategyResult instead of being discarded (#986).
+        assert result.ontology_version == "2026-09-12T08:15:00Z"
+
+    @pytest.mark.asyncio
+    async def test_vkg_unknown_ontology_version_is_not_reported(self, strategy, nl_to_sparql, vkg_translator):
+        """ "unknown" is the VKG's missing-value sentinel, not a version (#986)."""
+        nl_to_sparql.translate.return_value = _make_sparql_result()
+        tier2_result = _make_tier2_result()
+        tier2_result.vkg_result.ontology_version = "unknown"
+        vkg_translator.resolve.return_value = tier2_result
+
+        result = await strategy.resolve("How many orders?", "ns1", _make_context())
+
+        assert result is not None
+        assert result.ontology_version == ""
 
     @pytest.mark.asyncio
     async def test_sparql_translation_substeps_replayed(self, strategy, nl_to_sparql, vkg_translator):

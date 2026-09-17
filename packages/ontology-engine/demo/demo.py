@@ -105,6 +105,34 @@ def _http_fetch(method: str, url: str, **kwargs) -> dict | list:
     sys.exit(1)
 
 
+def _download_ontology_turtle(encoded_id: str, timeout: int = 30) -> str:
+    """GET /ontologies/{id}/download and return the ontology Turtle.
+
+    ``/download`` no longer inlines the Turtle: it returns
+    ``{"downloadUrl", "expiresInSeconds"}`` pointing at a presigned S3 object,
+    because a 6+ MB ontology would exceed the API Gateway / Lambda response
+    limit (#143). Follow that URL out-of-band. A raw-body fallback keeps the demo
+    working against an ontology-engine that still inlines.
+
+    Raises ``httpx.HTTPError`` (incl. ``HTTPStatusError``) like the direct call it
+    replaces, so existing call-site error handling still applies.
+    """
+    resp = httpx.get(f"{CATALOG_URL}/ontologies/{encoded_id}/download", timeout=timeout)
+    resp.raise_for_status()
+    download_url = None
+    try:
+        payload = resp.json()
+    except Exception:
+        payload = None
+    if isinstance(payload, dict):
+        download_url = payload.get("downloadUrl") or payload.get("download_url")
+    if not download_url:
+        return resp.text
+    obj = httpx.get(download_url, timeout=timeout)
+    obj.raise_for_status()
+    return obj.text
+
+
 def _list_ontologies(**params) -> list[dict]:
     """GET /ontologies/ and return the rows, unwrapping the response envelope.
 
@@ -672,9 +700,7 @@ def benchmark_against_golden(report: dict, datasource_ids: list[str]):
     # ── Fetch induced ontology Turtle ────────────────────────
     encoded_id = quote(ontology_id, safe="")
     try:
-        r = httpx.get(f"{CATALOG_URL}/ontologies/{encoded_id}/download", timeout=30)
-        r.raise_for_status()
-        induced_turtle = r.text
+        induced_turtle = _download_ontology_turtle(encoded_id)
     except httpx.HTTPError as e:
         console.print(f"  [red]Couldn't download induced ontology {ontology_id}: {e}[/]")
         console.print()
@@ -1050,17 +1076,19 @@ def export_ontology():
     onto = ontologies[idx]
     encoded_id = quote(onto["ontologyId"], safe="")
     try:
-        resp = httpx.get(f"{CATALOG_URL}/ontologies/{encoded_id}/download", timeout=30)
+        turtle = _download_ontology_turtle(encoded_id)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            console.print(f"  [yellow]No file uploaded for ontology {onto['id']}.[/]")
+        else:
+            console.print(f"  [red]Error downloading ontology: {e}[/]")
+        return
     except httpx.HTTPError as e:
         console.print(f"  [red]Network error downloading ontology: {e}[/]")
         return
-    if resp.status_code == 404:
-        console.print(f"  [yellow]No file uploaded for ontology {onto['id']}.[/]")
-        return
-    resp.raise_for_status()
 
     console.print()
-    console.print(Panel(resp.text, title=f"[bold]{onto['title']}[/] — Turtle", border_style="green"))
+    console.print(Panel(turtle, title=f"[bold]{onto['title']}[/] — Turtle", border_style="green"))
     console.print()
 
 
