@@ -13,7 +13,7 @@ vi.mock("oidc-client-ts", () => {
     signinSilent: vi.fn(),
     getUser: vi.fn(),
     clearStaleState: vi.fn(),
-    removeUser: vi.fn(),
+    removeUser: vi.fn(() => Promise.resolve()),
     signoutRedirect: vi.fn(),
     metadataService: {
       getRevocationEndpoint: vi.fn(),
@@ -112,15 +112,17 @@ describe("OIDCProvider", () => {
   });
 
   describe("getIdToken", () => {
-    it("returns token when user has valid token", async () => {
+    it("returns token without refreshing when the ID token is still valid", async () => {
       mockUM.getUser.mockResolvedValue(
         mockUser({
           id_token: "my-token",
           expires_at: Date.now() / 1000 + 3600,
+          profile: { exp: Date.now() / 1000 + 3600 } as User["profile"],
         }),
       );
       const token = await provider.getIdToken();
       expect(token).toBe("my-token");
+      expect(mockUM.signinSilent).not.toHaveBeenCalled();
     });
 
     it("uses cached user from UserLoaded event instead of storage", async () => {
@@ -146,10 +148,15 @@ describe("OIDCProvider", () => {
       expect(mockUM.getUser).not.toHaveBeenCalled();
     });
 
-    it("refreshes token when expiring within 120s", async () => {
+    it("refreshes when the ID token is expired even if the access token is still valid", async () => {
+      // Gates on the ID token's own exp (profile.exp), NOT expires_at (the
+      // access-token lifetime): a still-valid access token must not suppress
+      // renewal of an expired ID token — that skew was the "403s, no refresh
+      // request" report.
       const expiringUser = mockUser({
         id_token: "old-token",
-        expires_at: Date.now() / 1000 + 60, // 60s left — within 120s threshold
+        expires_at: Date.now() / 1000 + 3600, // access token still valid
+        profile: { exp: Date.now() / 1000 - 1 } as User["profile"], // ID token expired
       });
       const refreshedUser = mockUser({ id_token: "new-token" });
       mockUM.getUser.mockResolvedValue(expiringUser);
@@ -164,7 +171,7 @@ describe("OIDCProvider", () => {
       mockUM.getUser.mockResolvedValue(
         mockUser({
           id_token: "tok",
-          expires_at: Date.now() / 1000 + 10,
+          profile: { exp: Date.now() / 1000 - 1 } as User["profile"],
         }),
       );
       mockUM.signinSilent.mockRejectedValue(new Error("network"));
@@ -172,6 +179,10 @@ describe("OIDCProvider", () => {
       await expect(provider.getIdToken()).rejects.toThrow(
         "Token refresh failed. Please sign in again.",
       );
+      // #136: the ad-hoc renewal path must drop the user so `UserUnloaded`
+      // fires and the Auth gate flips to unauthenticated — otherwise the UI
+      // keeps showing "signed in" while every call throws.
+      expect(mockUM.removeUser).toHaveBeenCalled();
     });
 
     it("throws when id_token is empty", async () => {
@@ -218,10 +229,10 @@ describe("OIDCProvider", () => {
       expect(token).toBe("my-access-token");
     });
 
-    it("refreshes token when expiring within 120s", async () => {
+    it("refreshes when the access token is expired", async () => {
       const expiringUser = mockUser({
         access_token: "old-at",
-        expires_at: Date.now() / 1000 + 60,
+        expires_at: Date.now() / 1000 - 1,
       });
       const refreshedUser = mockUser({ access_token: "new-at" });
       mockUM.getUser.mockResolvedValue(expiringUser);
@@ -234,13 +245,15 @@ describe("OIDCProvider", () => {
 
     it("throws when silent refresh fails", async () => {
       mockUM.getUser.mockResolvedValue(
-        mockUser({ access_token: "at", expires_at: Date.now() / 1000 + 10 }),
+        mockUser({ access_token: "at", expires_at: Date.now() / 1000 - 1 }),
       );
       mockUM.signinSilent.mockRejectedValue(new Error("network"));
 
       await expect(provider.getAccessToken()).rejects.toThrow(
         "Token refresh failed. Please sign in again.",
       );
+      // #136: drop the user on ad-hoc renewal failure (see getIdToken).
+      expect(mockUM.removeUser).toHaveBeenCalled();
     });
 
     it("throws when access_token is empty", async () => {

@@ -335,6 +335,13 @@ export class StorageStack extends SCLStack {
         //    to inline through the 6 MB API Gateway / Lambda response limit.
         // Without the matching method in allowedMethods, S3 omits the
         // Access-Control-Allow-Origin header and the browser fetch fails.
+        // allowedHeaders must be "*": the browser preflights the presigned
+        // fetch and S3 only echoes Access-Control-Allow-Origin when every
+        // requested header is allowed. Restricting to Content-Type makes the
+        // proposal-artifact GET fail as an opaque "CORS error" in the UI even
+        // though the object itself is reachable (reproduced on a v0.3.1
+        // ap-northeast-1 deploy loading an induction proposal). exposedHeaders
+        // lets the fetch read ETag/Content-Length/Content-Type off the response.
         cors: [
           {
             allowedOrigins: [props.allowedOrigin ?? "*"],
@@ -343,7 +350,8 @@ export class StorageStack extends SCLStack {
               s3.HttpMethods.HEAD,
               s3.HttpMethods.PUT,
             ],
-            allowedHeaders: ["Content-Type"],
+            allowedHeaders: ["*"],
+            exposedHeaders: ["ETag", "Content-Length", "Content-Type"],
             maxAge: 3600,
           },
         ],

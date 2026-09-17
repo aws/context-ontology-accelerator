@@ -26,7 +26,8 @@ solely from a count of validated names.
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+import os
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,24 @@ MAX_ENUM_DISTINCT = 25
 # (long, multi-word) from a genuine enum (short code/label like "RETURNED").
 _MAX_ENUM_AVG_VALUE_LEN = 40  # avg chars across sampled values
 _MAX_ENUM_AVG_WORDS = 3  # avg whitespace-separated tokens per value
+
+# Session-level statement_timeout (ms) applied before the cardinality probe.
+# Bounds the COUNT / COUNT(DISTINCT …) query that was previously unbounded, so a
+# single wide column can no longer consume the entire 15-minute Lambda budget.
+# Configurable via env var; a malformed value logs a warning and falls back to the
+# default — never crashes cold start and never silently disables the bound.
+_DEFAULT_PROBE_TIMEOUT_MS = 30_000  # 30 s — enough for healthy tables, fast-fail for pathological ones
+try:
+    PROBE_TIMEOUT_MS = int(os.environ.get("PROBE_TIMEOUT_MS", str(_DEFAULT_PROBE_TIMEOUT_MS)))
+    if PROBE_TIMEOUT_MS <= 0:
+        raise ValueError("non-positive")
+except (ValueError, TypeError):
+    logger.warning(
+        "Invalid PROBE_TIMEOUT_MS=%r; expected a positive integer. Using default %d ms.",
+        os.environ.get("PROBE_TIMEOUT_MS"),
+        _DEFAULT_PROBE_TIMEOUT_MS,
+    )
+    PROBE_TIMEOUT_MS = _DEFAULT_PROBE_TIMEOUT_MS
 
 
 def values_look_categorical(values: list[str]) -> bool:
@@ -85,6 +104,21 @@ def _run(conn: Any, sql: str, params: tuple[Any, ...] | Mapping[str, Any] = ()) 
     try:
         cursor.execute(sql, params)
         return cursor.fetchall() or []
+    except Exception:
+        # Postgres-family engines abort the whole transaction on any statement
+        # error (SQLSTATE 25P02) and reject every later statement on the same
+        # connection until a rollback. discover_metadata() reuses ONE
+        # (autocommit=False) connection across the whole pass, and the _safe_*
+        # helpers swallow-and-log by design — so without this rollback a single
+        # incidental catalog-query error poisons the connection and every
+        # subsequent query fails with a misleading 25P02 (issue #129). Roll back
+        # at this single choke point so it covers every dialect. Guard the
+        # rollback itself so it can never mask the original error.
+        try:
+            conn.rollback()
+        except Exception:
+            logger.warning("jdbc_run_rollback_failed", exc_info=True)
+        raise
     finally:
         cursor.close()
 
@@ -219,6 +253,16 @@ class Dialect:
         """
         return ""
 
+    def probe_timeout_statements(self) -> Sequence[str]:
+        """SQL statements to execute on the connection before the cardinality probe.
+
+        Returns a (possibly empty) sequence of SET commands that apply a
+        session-level statement timeout bounding the ``COUNT``/``COUNT(DISTINCT)``
+        probe. The default returns *empty* — dialects that support session-level
+        timeouts override this (Postgres, Redshift).
+        """
+        return ()
+
 
 class InformationSchemaDialect(Dialect):
     """ANSI ``information_schema`` implementation shared by most engines."""
@@ -351,11 +395,20 @@ class InformationSchemaDialect(Dialect):
                 # labels, e.g. a low-cardinality "comment" column).
                 if values and values_look_categorical(values):
                     result[col] = values
-            except Exception:
+            except Exception as exc:
                 # Best-effort: never abort discovery for a per-column sampling
-                # error (missing perms, odd type, etc.). Log at debug so a
-                # column that silently yields no values is diagnosable.
-                logger.debug("distinct_values failed for column %r in %s.%s", col, schema, table, exc_info=True)
+                # error (missing perms, odd type, etc.). Timeout-specific events
+                # get a distinct structured log so skipped columns are visible in
+                # operational dashboards rather than silent.
+                exc_msg = str(exc).lower()
+                if "timeout" in exc_msg or "cancel" in exc_msg:
+                    logger.warning(
+                        "distinct_probe_timeout",
+                        extra={"schema": schema, "table": table, "column": col},
+                        exc_info=True,
+                    )
+                else:
+                    logger.debug("distinct_values failed for column %r in %s.%s", col, schema, table, exc_info=True)
                 continue
         return result
 
@@ -384,6 +437,15 @@ class PostgresDialect(InformationSchemaDialect):
         import pg8000  # noqa: PLC0415
 
         return pg8000.connect(host=host, port=port, user=user, password=password, database=database, ssl_context=True)
+
+    def probe_timeout_statements(self) -> Sequence[str]:
+        """Session-level ``statement_timeout`` bounding the cardinality probe.
+
+        ``SET statement_timeout`` is session-scoped (not transaction-local), so
+        it also covers the ``SELECT DISTINCT`` sampling query that follows the
+        probe. Syntax is identical for PostgreSQL and Redshift.
+        """
+        return (f"SET statement_timeout = {PROBE_TIMEOUT_MS}",)
 
     def fetch_descriptions(self, conn: Any, schema: str, tables: list[str]) -> Descriptions:
         """Pull table / column comments from pg_catalog.pg_description.
@@ -513,6 +575,42 @@ class RedshiftDialect(PostgresDialect):
             fk.setdefault(fk_table, []).append((fk_col, ref_table, ref_col))
 
         return pk, fk
+
+    def fetch_columns(self, conn: Any, schema: str, tables: list[str]) -> list[ColumnRow]:
+        """Fetch columns, recovering Redshift late-binding views that information_schema misses.
+
+        Redshift late-binding views (``CREATE VIEW ... WITH NO SCHEMA BINDING`` —
+        the default output for many dbt models) never populate
+        ``information_schema.columns``: the column list is resolved at query time,
+        so the inherited query returns zero rows for them with no error, and the
+        view shows up with 0 columns (issue #134). Any requested table that comes
+        back with no columns is retried through ``pg_get_late_binding_view_cols()``,
+        Redshift's own introspection for these views.
+
+        The fallback is scoped to the zero-column tables only: that function is a
+        full-catalog scan, so it is never run when information_schema already
+        answered for every table. It carries no nullability, so recovered columns
+        default to nullable — the safe assumption when nullability is unknown.
+        """
+        rows = super().fetch_columns(conn, schema, tables)
+        covered = {table_name for (table_name, _c, _dt, _n) in rows}
+        missing = [t for t in tables if t not in covered]
+        if not missing:
+            return rows
+
+        placeholders = ", ".join(["%s"] * len(missing))
+        late_rows = _run(
+            conn,
+            "SELECT viewname, columnname, columntype "
+            "FROM pg_get_late_binding_view_cols() "
+            "AS cols(schemaname name, viewname name, columnname name, columntype varchar, columnnum int) "
+            f"WHERE schemaname = %s AND viewname IN ({placeholders}) "
+            "ORDER BY viewname, columnnum",
+            (schema, *missing),
+        )
+        # pg_get_late_binding_view_cols has no is_nullable -> default nullable=True.
+        rows.extend((v, c, dt or "unknown", True) for (v, c, dt) in late_rows)
+        return rows
 
 
 class MySqlDialect(InformationSchemaDialect):

@@ -33,6 +33,8 @@ import {
   useApproveSource,
   useRejectSource,
   useGetSourceScanJob,
+  useListSourceScanJobs,
+  useKeepRescanRemoval,
 } from "@api-hooks";
 import {
   ReviewDecision,
@@ -40,7 +42,7 @@ import {
   ReviewStatus,
   SourceStatus,
 } from "@coa/control-plane-client";
-import type { TableSummary } from "@coa/control-plane-client";
+import type { TableSummary, ScanJobEntry } from "@coa/control-plane-client";
 import { useControlPlaneClient } from "@components/ControlPlaneClientProvider";
 import { ButtonWithHint } from "@components/ButtonWithHint";
 import { sourceStatusType, sourceStatusLabel } from "@utils/source-status";
@@ -133,6 +135,9 @@ export const SourceDetail: React.FC = () => {
   }>();
   const navigate = useNavigate();
   const [showDeleteModal, setShowDeleteModal] = useState(false);
+  // Shown instead of starting the re-scan when a re-scan review is already
+  // open, since starting a new one discards that review's decisions and edits.
+  const [showRescanConfirm, setShowRescanConfirm] = useState(false);
   const [flash, setFlash] = useState<
     { id: string; type: "success" | "error"; content: string }[]
   >([]);
@@ -181,6 +186,9 @@ export const SourceDetail: React.FC = () => {
   const queryClient = useQueryClient();
   const [selectedTables, setSelectedTables] = useState<TableSummary[]>([]);
   const [isBatchReviewing, setIsBatchReviewing] = useState(false);
+  // Re-scan review: keep (decline) a table the re-scan flagged for deletion.
+  const keepMutation = useKeepRescanRemoval(namespaceId ?? "", sourceId ?? "");
+  const [keepingTableId, setKeepingTableId] = useState<string | null>(null);
 
   // Refetch tables list when source transitions out of APPROVING/REJECTING
   const prevStatusRef = useRef(source?.status);
@@ -289,6 +297,19 @@ export const SourceDetail: React.FC = () => {
   const isActive = ACTIVE_STATUSES.has(source.status ?? "");
   const status = source.status ?? "";
 
+  // Re-scan entry points mirror the backend's allowed statuses (RescanSource):
+  // DATABASE from SCAN_FAILED (recovery), APPROVED / RESCAN_REVIEW (schema-drift
+  // re-scan of a live source); DOCUMENTS from COMPLETED (re-ingest) or
+  // SCAN_FAILED (retry). Enabling APPROVED is what makes the drift re-scan
+  // review flow reachable from the UI.
+  const canRescan = isDatabase
+    ? status === SourceStatus.SCAN_FAILED ||
+      status === SourceStatus.APPROVED ||
+      status === SourceStatus.RESCAN_REVIEW
+    : isDocuments
+      ? status === SourceStatus.COMPLETED || status === SourceStatus.SCAN_FAILED
+      : status === SourceStatus.SCAN_FAILED;
+
   // Type-specific detail objects
   const dbDetails = source.databaseDetails;
   const docDetails = source.documentDetails;
@@ -394,6 +415,28 @@ export const SourceDetail: React.FC = () => {
   const isTransient =
     status === SourceStatus.APPROVING || status === SourceStatus.REJECTING;
 
+  const handleKeepTable = (tableId: string) => {
+    setKeepingTableId(tableId);
+    keepMutation.mutate(
+      { tableId },
+      {
+        onSuccess: () =>
+          setFlash([
+            {
+              id: String(Date.now()),
+              type: "success",
+              content: `Keeping "${tableId}". Approving the re-scan will no longer delete it.`,
+            },
+          ]),
+        onError: (e) =>
+          setFlash([
+            { id: String(Date.now()), type: "error", content: e.message },
+          ]),
+        onSettled: () => setKeepingTableId(null),
+      },
+    );
+  };
+
   return (
     <SpaceBetween size="l">
       {flash.length > 0 && (
@@ -411,10 +454,36 @@ export const SourceDetail: React.FC = () => {
         variant="h1"
         actions={
           <SpaceBetween direction="horizontal" size="xs">
+            <Button
+              iconName="refresh"
+              ariaLabel="Refresh"
+              onClick={() => {
+                // RESCAN_REVIEW is terminal, so the source stops polling the
+                // moment the review opens, and the tables list and per-table diff
+                // never poll at all. Re-pull all three so a change made elsewhere
+                // (another steward's keep, a late-finishing worker) appears
+                // without a full-page reload.
+                queryClient.invalidateQueries({
+                  queryKey: ["source", namespaceId ?? "", sourceId ?? ""],
+                });
+                queryClient.invalidateQueries({
+                  queryKey: ["sourceTables", namespaceId ?? "", sourceId ?? ""],
+                });
+                queryClient.invalidateQueries({
+                  queryKey: ["sourceTable", namespaceId ?? "", sourceId ?? ""],
+                });
+              }}
+            >
+              Refresh
+            </Button>
             {isDatabase && (
               <>
                 <ButtonWithHint
-                  hint="Marks all pending tables and columns in this source as rejected. Already-approved or already-rejected items are not affected."
+                  hint={
+                    status === SourceStatus.RESCAN_REVIEW
+                      ? "Discards this re-scan: restores changed tables to their last approved version, removes newly-added tables, and returns the source to Approved."
+                      : "Marks all pending tables and columns in this source as rejected. Already-approved or already-rejected items are not affected."
+                  }
                   onClick={handleRejectAll}
                   loading={rejectMutation.isPending}
                   disabled={
@@ -427,9 +496,11 @@ export const SourceDetail: React.FC = () => {
                 </ButtonWithHint>
                 <ButtonWithHint
                   hint={
-                    status === SourceStatus.APPROVAL_FAILED
-                      ? "Retries approving all pending tables and columns in this source. Already-rejected items are not affected."
-                      : "Approves all pending tables and columns in this source, making them queryable. Already-rejected items are not affected."
+                    status === SourceStatus.RESCAN_REVIEW
+                      ? "Approves the re-scan's changes and deletes the tables and columns it found were removed from the source. Already-rejected items are not affected."
+                      : status === SourceStatus.APPROVAL_FAILED
+                        ? "Retries approving all pending tables and columns in this source. Already-rejected items are not affected."
+                        : "Approves all pending tables and columns in this source, making them queryable. Already-rejected items are not affected."
                   }
                   variant="primary"
                   onClick={handleApproveAll}
@@ -453,9 +524,17 @@ export const SourceDetail: React.FC = () => {
               Delete
             </Button>
             <Button
-              onClick={() => rescan()}
+              onClick={() => {
+                // An open re-scan review is the only state a re-scan destroys
+                // work in, so it is the only one that asks first.
+                if (status === SourceStatus.RESCAN_REVIEW) {
+                  setShowRescanConfirm(true);
+                  return;
+                }
+                rescan({});
+              }}
               loading={isRescanning}
-              disabled={status !== SourceStatus.SCAN_FAILED}
+              disabled={!canRescan}
             >
               Re-scan
             </Button>
@@ -548,6 +627,18 @@ export const SourceDetail: React.FC = () => {
         </Alert>
       )}
 
+      {isDatabase && status === SourceStatus.RESCAN_REVIEW && (
+        <Alert type="info" header="Re-scan ready for review">
+          This source was re-scanned. New and changed tables and columns are
+          marked <b>Pending review</b> — edit and approve them just like a first
+          scan. Items the re-scan no longer found in the source are marked{" "}
+          <b>Pending deletion</b>; approving the source deletes them. If a
+          removal looks wrong (for example a partial scan or a changed
+          include/exclude filter), use <b>Keep</b> to retain the table or
+          column.
+        </Alert>
+      )}
+
       {/* ── DATABASE layout — matches DataSourceDetail ── */}
       {isDatabase && (
         <>
@@ -627,6 +718,7 @@ export const SourceDetail: React.FC = () => {
                         {
                           id: "name",
                           header: "Table",
+                          sortingField: "tableId",
                           cell: (item: TableSummary) => (
                             <Link
                               onFollow={(e) => {
@@ -643,11 +735,18 @@ export const SourceDetail: React.FC = () => {
                         {
                           id: "database",
                           header: "Database",
+                          sortingField: "database",
                           cell: (item: TableSummary) => item.database,
                         },
                         {
                           id: "columns",
                           header: "Columns",
+                          // No scalar field for the approved/total ratio; sort by
+                          // total column count.
+                          sortingComparator: (
+                            a: TableSummary,
+                            b: TableSummary,
+                          ) => (a.columnCount ?? 0) - (b.columnCount ?? 0),
                           cell: (item: TableSummary) => {
                             const total = item.columnCount ?? 0;
                             const approved = item.columnsApproved ?? 0;
@@ -664,6 +763,7 @@ export const SourceDetail: React.FC = () => {
                         {
                           id: "enriched",
                           header: "Enriched",
+                          sortingField: "enrichmentSource",
                           cell: (item: TableSummary) =>
                             item.enrichmentSource ? (
                               <Badge color="blue">
@@ -692,9 +792,39 @@ export const SourceDetail: React.FC = () => {
                                   ? "Rejected"
                                   : "Pending review";
                             return (
-                              <StatusIndicator type={type}>
-                                {label}
-                              </StatusIndicator>
+                              <SpaceBetween size="xxs">
+                                <StatusIndicator type={type}>
+                                  {label}
+                                </StatusIndicator>
+                                {item.added && <Badge color="green">New</Badge>}
+                                {item.pendingDeletion && (
+                                  <SpaceBetween
+                                    direction="horizontal"
+                                    size="xs"
+                                  >
+                                    <Badge color="red">Pending deletion</Badge>
+                                    <Button
+                                      variant="inline-link"
+                                      loading={keepingTableId === item.tableId}
+                                      disabled={keepMutation.isPending}
+                                      onClick={() =>
+                                        handleKeepTable(item.tableId ?? "")
+                                      }
+                                    >
+                                      Keep
+                                    </Button>
+                                  </SpaceBetween>
+                                )}
+                                {(item.columnsPendingDeletion ?? 0) > 0 && (
+                                  <Badge color="red">
+                                    {`${item.columnsPendingDeletion} column${
+                                      item.columnsPendingDeletion === 1
+                                        ? ""
+                                        : "s"
+                                    } pending deletion`}
+                                  </Badge>
+                                )}
+                              </SpaceBetween>
                             );
                           },
                         },
@@ -1119,19 +1249,62 @@ export const SourceDetail: React.FC = () => {
           </SpaceBetween>
         </Modal>
       )}
+
+      {showRescanConfirm && (
+        <Modal
+          visible
+          onDismiss={() => setShowRescanConfirm(false)}
+          header="Discard the open re-scan review?"
+          footer={
+            <Box float="right">
+              <SpaceBetween direction="horizontal" size="xs">
+                <Button
+                  variant="link"
+                  onClick={() => setShowRescanConfirm(false)}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  variant="primary"
+                  loading={isRescanning}
+                  onClick={() => {
+                    setShowRescanConfirm(false);
+                    rescan({ confirmDiscardOpenReview: true });
+                  }}
+                >
+                  Discard and re-scan
+                </Button>
+              </SpaceBetween>
+            </Box>
+          }
+        >
+          <SpaceBetween size="m">
+            <Box>
+              <b>{source.name}</b> has a re-scan waiting for your review. A new
+              re-scan compares the database against the last version you
+              approved, so anything you already approved, rejected, or edited
+              inside this review is discarded.
+            </Box>
+            <Alert type="info">
+              Your approved tables and columns are not affected. To keep the
+              decisions you have made in this review instead, cancel and finish
+              reviewing it first.
+            </Alert>
+          </SpaceBetween>
+        </Modal>
+      )}
     </SpaceBetween>
   );
 };
 
 // ── Scan history (database sources) ──────────────────────────────────────────
 //
-// The detail record carries enough fields (createdAt / updatedAt / lastScanAt
-// plus the current status) to reconstruct a lightweight scan-history view
-// without a dedicated audit-log table. This mirrors the activity tab in
-// coa-ui (see ../../../../coa-ui/app/src/pages/SourceDetail.tsx) and
-// gives stewards a chronological summary of what the platform did to the
-// source. When a real event store lands later we can swap the derived rows
-// for paginated audit entries without changing the public component shape.
+// Rows come from the ListSourceScanJobs event store: discovery/enrichment scan
+// rows plus steward approve/reject (REVIEW) events, newest first. When the store
+// is empty or the call errors we fall back to a lightweight view derived from
+// the detail record (createdAt / updatedAt / lastScanAt + current status) so the
+// tab never regresses to blank. The public ScanHistoryEntry shape and the
+// Time/Status/Details columns are unchanged.
 
 interface ScanHistoryEntry {
   id: string;
@@ -1147,7 +1320,99 @@ function toIso(value: Date | string | undefined): string | undefined {
   return value instanceof Date ? value.toISOString() : value;
 }
 
+// Map one ListSourceScanJobs SCAN row to a history entry. A row with no
+// explicit eventType is treated as a SCAN (legacy rows predate review events).
+function scanEntryToRow(entry: ScanJobEntry, index: number): ScanHistoryEntry {
+  const at = toIso(entry.at) ?? "";
+  const id = `scan-${at}-${index}`;
+  const tables = entry.tablesDiscovered ?? 0;
+  const status = entry.status ?? "";
+  if (status === "FAILED") {
+    return {
+      id,
+      at,
+      kind: "scan",
+      type: "error",
+      label: "Scan failed",
+      detail: entry.errorMessage
+        ? `Error: ${entry.errorMessage}`
+        : "The scan did not complete. Use Re-scan to try again.",
+    };
+  }
+  if (
+    status === "IN_PROGRESS" ||
+    status === "DISCOVERING" ||
+    status === "ENRICHING"
+  ) {
+    return {
+      id,
+      at,
+      kind: "scan",
+      type: "in-progress",
+      label: "Scan in progress",
+      detail: "The scan or enrichment pipeline is still running.",
+    };
+  }
+  if (status === "CANCELLED") {
+    return {
+      id,
+      at,
+      kind: "scan",
+      type: "stopped",
+      label: "Scan cancelled",
+      detail: "The scan was cancelled.",
+    };
+  }
+  return {
+    id,
+    at,
+    kind: "scan",
+    type: "success",
+    label: "Scan completed",
+    detail: `Scanned ${tables} table${tables === 1 ? "" : "s"}.`,
+  };
+}
+
+// Map one ListSourceScanJobs REVIEW row (an approve/reject decision) to a
+// history entry. The label distinguishes an initial approve/reject from a
+// re-scan resolution; a *_FAILED terminal status renders as an error.
+function reviewEntryToRow(
+  entry: ScanJobEntry,
+  index: number,
+): ScanHistoryEntry {
+  const at = toIso(entry.at) ?? "";
+  const id = `review-${at}-${index}`;
+  const approved = entry.decision === "APPROVED";
+  const isRescan = entry.isRescan === true;
+  const failed = (entry.status ?? "").endsWith("_FAILED");
+  const label = isRescan
+    ? approved
+      ? "Re-scan approved"
+      : "Re-scan rejected"
+    : approved
+      ? "Source approved"
+      : "Source rejected";
+  const count = entry.tablesApproved ?? 0;
+  let detail: string;
+  if (approved) {
+    detail = `${count} table${count === 1 ? "" : "s"} approved.`;
+  } else if (isRescan) {
+    detail = "Re-scan discarded; the previously approved tables were kept.";
+  } else {
+    detail = "Source rejected; no tables were published.";
+  }
+  return {
+    id,
+    at,
+    kind: "review",
+    type: failed ? "error" : "success",
+    label,
+    detail,
+  };
+}
+
 function buildScanHistory(args: {
+  scanJobs?: ScanJobEntry[];
   createdAt?: Date | string;
   updatedAt?: Date | string;
   lastScanAt?: Date | string;
@@ -1163,6 +1428,33 @@ function buildScanHistory(args: {
   const createdAt = toIso(args.createdAt);
   const updatedAt = toIso(args.updatedAt);
   const lastScanAt = toIso(args.lastScanAt);
+
+  // Preferred path: build rows from the real event store when it has any.
+  if (args.scanJobs && args.scanJobs.length > 0) {
+    const rows: ScanHistoryEntry[] = [];
+    if (createdAt) {
+      rows.push({
+        id: `created-${createdAt}`,
+        at: createdAt,
+        kind: "registered",
+        type: "info",
+        label: "Source registered",
+        detail: "Source created and queued for initial scan.",
+      });
+    }
+    args.scanJobs.forEach((entry, i) => {
+      rows.push(
+        entry.eventType === "REVIEW"
+          ? reviewEntryToRow(entry, i)
+          : scanEntryToRow(entry, i),
+      );
+    });
+    // Most recent first so stewards see the latest state at the top.
+    return rows.sort((a, b) => (a.at < b.at ? 1 : -1));
+  }
+
+  // Fallback: reconstruct a lightweight view from the detail record so the tab
+  // never regresses to blank when the store is empty or the call errored.
   const events: ScanHistoryEntry[] = [];
 
   if (createdAt) {
@@ -1269,9 +1561,16 @@ interface ScanHistoryTableProps {
 }
 
 const ScanHistoryTable: React.FC<ScanHistoryTableProps> = (props) => {
+  // Real event store: scan + review rows, newest first.
+  const { data: scanJobs } = useListSourceScanJobs(
+    props.namespaceId,
+    props.sourceId,
+  );
+
   // Fetch the scan job for its errorMessage when the scan failed, and for its
   // per-table failure count when it succeeded — a scan that completed can still
-  // have dropped tables, and only the scan job records that.
+  // have dropped tables, and only the scan job records that. It also feeds the
+  // derived fallback used when the event store is empty or the list call errored.
   const { data: scanJob } = useGetSourceScanJob(
     props.namespaceId,
     props.sourceId,
@@ -1282,6 +1581,7 @@ const ScanHistoryTable: React.FC<ScanHistoryTableProps> = (props) => {
   const events = React.useMemo(
     () =>
       buildScanHistory({
+        scanJobs: scanJobs?.items,
         createdAt: props.createdAt,
         updatedAt: props.updatedAt,
         lastScanAt: props.lastScanAt,
@@ -1292,6 +1592,7 @@ const ScanHistoryTable: React.FC<ScanHistoryTableProps> = (props) => {
         tablesFailed,
       }),
     [
+      scanJobs?.items,
       props.createdAt,
       props.updatedAt,
       props.lastScanAt,

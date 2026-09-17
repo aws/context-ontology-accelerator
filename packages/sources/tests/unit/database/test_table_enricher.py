@@ -27,6 +27,7 @@ from coa_sources.database.enrichment.table_enricher import (
     _apply_foreign_keys,
     _apply_result,
     _apply_table_metadata,
+    _has_pending,
     _prepare_table_context,
     _resolve_guardrail_id,
     _write_enriched_assets,
@@ -186,7 +187,12 @@ class TestRun:
 
         result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock())
 
-        assert result == {"tables_enriched": 0, "tables_failed": 0, "tables_skipped_unchanged": 0}
+        assert result == {
+            "tables_enriched": 0,
+            "tables_failed": 0,
+            "tables_skipped_unchanged": 0,
+            "failed_table_ids": [],
+        }
         mock_write.assert_not_called()
 
 
@@ -589,6 +595,37 @@ class TestGuardrailBlockedPath:
         assert result["tables_enriched"] == 1
         assert result["tables_failed"] == 1
 
+    @patch("coa_sources.database.enrichment.table_enricher._write_enriched_assets")
+    @patch("coa_sources.database.enrichment.table_enricher.read_assets_for_datasource")
+    @patch("coa_sources.database.enrichment.table_enricher.BedrockClient")
+    def test_guardrail_blocked_returns_failed_table_ids(
+        self, mock_client_cls: MagicMock, mock_read: MagicMock, mock_write: MagicMock
+    ) -> None:
+        """The aggregate count is not enough — run must name the failed tables so
+        the caller can record which ones came back blank."""
+        mock_client_cls.return_value.invoke.side_effect = GuardrailBlockedError("content blocked")
+        mock_read.return_value = [_make_table("t1", database="public")]
+
+        result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock())
+
+        assert result["tables_failed"] == 1
+        # table_id == f"{database}.{name}"
+        assert result["failed_table_ids"] == ["public.t1"]
+
+    @patch("coa_sources.database.enrichment.table_enricher._write_enriched_assets")
+    @patch("coa_sources.database.enrichment.table_enricher.read_assets_for_datasource")
+    @patch("coa_sources.database.enrichment.table_enricher.BedrockClient")
+    def test_all_succeed_returns_empty_failed_table_ids(
+        self, mock_client_cls: MagicMock, mock_read: MagicMock, mock_write: MagicMock
+    ) -> None:
+        mock_client_cls.return_value.invoke.return_value = _mock_invocation_result()
+        mock_read.return_value = [_make_table("t1")]
+
+        result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock())
+
+        assert result["tables_failed"] == 0
+        assert result["failed_table_ids"] == []
+
 
 class TestProtectedDescriptionPreserve:
     """Verify authoritative descriptions are not overwritten by AI."""
@@ -781,7 +818,9 @@ class TestWriteEnrichedAssets:
     def test_skips_when_asset_not_found(self, mock_smus_cls: MagicMock) -> None:
         mock_client = MagicMock()
         mock_smus_cls.return_value = mock_client
-        mock_client.search_assets.return_value = MagicMock(items=[])
+        # find_asset_by_name returns None only for a genuinely absent asset;
+        # a ranking miss no longer masquerades as one.
+        mock_client.find_asset_by_name.return_value = None
 
         table = _make_table("orders")
 
@@ -796,7 +835,7 @@ class TestWriteEnrichedAssets:
         asset_mock = MagicMock()
         asset_mock.configure_mock(name="ds-123:sales.orders")
         asset_mock.asset_id = "asset-001"
-        mock_client.search_assets.return_value = MagicMock(items=[asset_mock])
+        mock_client.find_asset_by_name.return_value = asset_mock
         mock_client.create_asset_revision.side_effect = Exception("DZ error")
 
         table = _make_table("orders", database="sales")
@@ -1118,3 +1157,120 @@ class TestPromptDescriptionContract:
 
     def test_system_prompt_marks_table_description_required(self) -> None:
         assert '"table.description" is REQUIRED' in SYSTEM_PROMPT
+
+
+class TestReScanPreservesReviewedItems:
+    """On a re-scan, enrichment regenerates only PENDING items and leaves
+    already-reviewed (APPROVED / REJECTED) items exactly as the steward left
+    them — including AI-generated ones (which the protected-source rules do NOT
+    cover)."""
+
+    def test_approved_ai_column_not_regenerated(self) -> None:
+        table = _make_table(num_columns=2)
+        table.columns[0].business_metadata = BusinessMetadata(
+            description="Approved AI description",
+            synonyms=["kept"],
+            enrichment_source=EnrichmentSource.AI_GENERATED,
+            review_status=ReviewStatus.APPROVED,
+            confidence=0.9,
+        )
+        column_results = [
+            {
+                "name": "col_0",
+                "description": "AI wants to replace",
+                "synonyms": ["x"],
+                "glossary_terms": [],
+                "tags": [],
+            },
+            {"name": "col_1", "description": "fresh", "synonyms": [], "glossary_terms": [], "tags": []},
+        ]
+        _apply_column_metadata(table, column_results)
+
+        # Approved AI column preserved verbatim (content + status).
+        assert table.columns[0].business_metadata.description == "Approved AI description"
+        assert table.columns[0].business_metadata.synonyms == ["kept"]
+        assert table.columns[0].business_metadata.review_status == ReviewStatus.APPROVED
+        # A PENDING column is still regenerated.
+        assert table.columns[1].business_metadata.description == "fresh"
+        assert table.columns[1].business_metadata.review_status == ReviewStatus.PENDING_REVIEW
+
+    def test_rejected_ai_column_not_resurrected(self) -> None:
+        table = _make_table(num_columns=1)
+        table.columns[0].business_metadata = BusinessMetadata(
+            description="rejected text",
+            enrichment_source=EnrichmentSource.AI_GENERATED,
+            review_status=ReviewStatus.REJECTED,
+        )
+        _apply_column_metadata(
+            table, [{"name": "col_0", "description": "AI", "synonyms": [], "glossary_terms": [], "tags": []}]
+        )
+        assert table.columns[0].business_metadata.review_status == ReviewStatus.REJECTED
+        assert table.columns[0].business_metadata.description == "rejected text"
+
+    def test_approved_ai_table_description_not_regenerated(self) -> None:
+        table = _make_table()
+        table.business_metadata = BusinessMetadata(
+            description="Approved AI table desc",
+            enrichment_source=EnrichmentSource.AI_GENERATED,
+            review_status=ReviewStatus.APPROVED,
+        )
+        _apply_table_metadata(
+            table, {"table": {"description": "regenerated", "synonyms": ["x"], "glossary_terms": [], "tags": []}}
+        )
+        assert table.business_metadata.description == "Approved AI table desc"
+        assert table.business_metadata.review_status == ReviewStatus.APPROVED
+        assert table.business_metadata.enrichment_source == EnrichmentSource.AI_GENERATED
+
+    def test_has_pending_true_for_freshly_discovered_table(self) -> None:
+        # Default table + columns are PENDING_REVIEW (first-scan shape).
+        assert _has_pending(_make_table()) is True
+
+    def test_has_pending_false_when_table_and_all_columns_terminal(self) -> None:
+        table = _make_table(num_columns=2)
+        table.business_metadata = BusinessMetadata(description="d", review_status=ReviewStatus.APPROVED)
+        for col in table.columns:
+            col.business_metadata = BusinessMetadata(description="d", review_status=ReviewStatus.APPROVED)
+        assert _has_pending(table) is False
+
+    def test_has_pending_true_when_any_column_pending(self) -> None:
+        table = _make_table(num_columns=2)
+        table.business_metadata = BusinessMetadata(description="d", review_status=ReviewStatus.APPROVED)
+        table.columns[0].business_metadata = BusinessMetadata(review_status=ReviewStatus.APPROVED)
+        table.columns[1].business_metadata = BusinessMetadata(review_status=ReviewStatus.PENDING_REVIEW)
+        assert _has_pending(table) is True
+
+    @patch("coa_sources.database.enrichment.table_enricher._write_enriched_assets")
+    @patch("coa_sources.database.enrichment.table_enricher.read_assets_for_datasource")
+    @patch("coa_sources.database.enrichment.table_enricher.BedrockClient")
+    def test_run_skips_fully_approved_table(
+        self, mock_client_cls: MagicMock, mock_read: MagicMock, mock_write: MagicMock
+    ) -> None:
+        """A re-scan reads every asset, but a fully-approved (unchanged) table is
+        left untouched — only the table with PENDING items is enriched."""
+        approved = _make_table("approved", num_columns=1)
+        approved.business_metadata = BusinessMetadata(
+            description="steward-approved",
+            enrichment_source=EnrichmentSource.AI_GENERATED,
+            review_status=ReviewStatus.APPROVED,
+        )
+        approved.columns[0].business_metadata = BusinessMetadata(
+            description="approved col",
+            enrichment_source=EnrichmentSource.AI_GENERATED,
+            review_status=ReviewStatus.APPROVED,
+        )
+        pending = _make_table("pending", num_columns=1)  # default: PENDING everywhere
+
+        mock_client_cls.return_value.invoke.return_value = _mock_invocation_result()
+        mock_read.return_value = [approved, pending]
+
+        result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock())
+
+        assert result["tables_enriched"] == 1
+        assert result["tables_skipped_unchanged"] == 1
+        # The approved table was never re-generated.
+        assert approved.business_metadata.description == "steward-approved"
+        assert approved.business_metadata.review_status == ReviewStatus.APPROVED
+        assert approved.columns[0].business_metadata.review_status == ReviewStatus.APPROVED
+        # Only the pending table is written back.
+        written = mock_write.call_args[0][0]
+        assert [t.name for t in written] == ["pending"]

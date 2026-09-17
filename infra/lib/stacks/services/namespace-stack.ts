@@ -771,12 +771,18 @@ export class NamespaceStack extends SCLStack {
     );
 
     // Read-time VKG health resolution (GetNamespace -> resolve_vkg_health)
-    // calls ecs:DescribeServices on the VKG cluster. Scoped to that cluster
-    // via the ecs:cluster condition, mirroring the deletion pipeline grant.
+    // calls ecs:DescribeServices, then ecs:ListTasks + ecs:DescribeTasks to
+    // read the container's functional-probe healthStatus (a running task is not
+    // necessarily able to translate — #170). All scoped to the VKG cluster via
+    // the ecs:cluster condition, mirroring the deletion pipeline grant.
     if (props.vkgClusterArn) {
       namespaceApiFn.addToRolePolicy(
         new iam.PolicyStatement({
-          actions: ["ecs:DescribeServices"],
+          actions: [
+            "ecs:DescribeServices",
+            "ecs:ListTasks",
+            "ecs:DescribeTasks",
+          ],
           resources: ["*"],
           conditions: { ArnLike: { "ecs:cluster": props.vkgClusterArn } },
         }),

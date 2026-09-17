@@ -17,6 +17,8 @@ vi.mock("@api-hooks", () => ({
   useApproveSource: () => ({ mutate: vi.fn(), isPending: false, error: null }),
   useRejectSource: () => ({ mutate: vi.fn(), isPending: false, error: null }),
   useGetSourceScanJob: () => ({ data: undefined }),
+  useListSourceScanJobs: () => ({ data: undefined }),
+  useKeepRescanRemoval: () => ({ mutate: vi.fn(), isPending: false }),
 }));
 
 vi.mock("@coa/control-plane-client", () => ({

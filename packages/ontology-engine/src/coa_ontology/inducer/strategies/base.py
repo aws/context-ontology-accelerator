@@ -11,7 +11,7 @@ import re
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 
-from coa_common import sql_ident
+from coa_common import sql_ident, sql_qualified_table
 from coa_common.bedrock_metrics import CostTracker
 from coa_common.constants import VOCAB_URI
 from rdflib import RDF, XSD, BNode, Graph, Literal, Namespace, URIRef
@@ -684,7 +684,13 @@ class InductionStrategy(ABC):
             _annotate_triples_map(g, tmap, table)
             lt = BNode()
             g.add((tmap, RR.logicalTable, lt))
-            g.add((lt, RR.tableName, Literal(sql_ident(table.name))))
+            # Qualify rr:tableName with the source schema so it matches the
+            # schema-qualified table in the H2 validation DB. Two same-named
+            # tables from different schemas therefore reference distinct H2
+            # tables instead of colliding (#149 cause A). sql_qualified_table
+            # falls back to a bare quoted name when the table has no schema, so
+            # single-schema deployments are byte-identical to before.
+            g.add((lt, RR.tableName, Literal(sql_qualified_table(table.name, table.sourceSchema))))
 
             pk_cols = []
             if table.tableConstraints:

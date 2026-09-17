@@ -937,6 +937,7 @@ dependencies = [
 [package.dev-dependencies]
 integ = [
     { name = "pytest-xdist" },
+    { name = "rdflib" },
     { name = "requests" },
 ]
 
@@ -951,6 +952,7 @@ requires-dist = [
 [package.metadata.requires-dev]
 integ = [
     { name = "pytest-xdist", specifier = ">=3.0" },
+    { name = "rdflib", specifier = ">=7.0" },
     { name = "requests", specifier = ">=2.34.2" },
 ]
 

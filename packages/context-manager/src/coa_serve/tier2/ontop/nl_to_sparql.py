@@ -276,6 +276,42 @@ _SYSTEM_PROMPT = (
     "- If the question asks for a count or aggregate, SELECT only the aggregate result.\n"
     "- If the question asks for a specific field (name, date, amount), "
     "SELECT only that field.\n\n"
+    "═══════════════════════════════════════════════════════════════\n"
+    "DETERMINISM RULES — MANDATORY (identical question ⇒ identical query)\n"
+    "═══════════════════════════════════════════════════════════════\n\n"
+    "The SAME question must always produce the SAME query shape. Ambiguity is\n"
+    "resolved by these fixed rules, NOT by free choice — otherwise the same\n"
+    "question silently returns different answers on different runs.\n\n"
+    "1. LIMIT — decide explicitly, never implicitly:\n"
+    '   - A superlative singular ("the most", "the top", "the highest", "which X\n'
+    '     has the most") means the SINGLE best row → add `LIMIT 1`.\n'
+    '   - A ranking or plural ("rank", "list", "which colours", "all", "by\n'
+    '     count") means ALL rows ordered → NO LIMIT (use ORDER BY instead).\n'
+    "   - When neither is signalled, DEFAULT to NO LIMIT and return all rows.\n"
+    "   - Never omit LIMIT on a singular-superlative question and never add\n"
+    "     LIMIT on a ranking question.\n\n"
+    "2. COUNT vs COUNT(DISTINCT) — decide explicitly:\n"
+    "   - Use `COUNT(DISTINCT ?x)` when counting how many UNIQUE entities/values\n"
+    '     ("how many colours", "number of distinct brands", "unique products").\n'
+    "   - ALWAYS use `COUNT(DISTINCT ?e)` when ?e is an ENTITY variable (one bound\n"
+    "     via `?e a :Class`) — counting a typed entity with a plain COUNT counts\n"
+    "     join-multiplied rows and inflates on 1-to-many data, so the same question\n"
+    "     returns a different number between runs. This is enforced by the validator.\n"
+    "   - Use plain `COUNT(?x)` only when counting ROWS/occurrences including\n"
+    '     duplicates ("how many product listings", "number of rows").\n'
+    "   - When in doubt, prefer `COUNT(DISTINCT ?x)` — entity counts are the\n"
+    "     common intent and duplicates otherwise inflate the answer silently.\n\n"
+    "3. PROJECTION ALIAS — deterministic, stable names:\n"
+    "   - Every projected column MUST have an explicit alias via `AS ?name`.\n"
+    "   - Name the alias after the THING, not the run: an entity by its concept\n"
+    "     (`?colorName`, `?brandName`, `?materialName`), an aggregate by\n"
+    "     metric+subject in lowerCamelCase (`?productCount`, `?totalRevenue`,\n"
+    "     `?avgPrice`). NEVER a bare `?count`, `?value`, `?result`, `?n`.\n"
+    "   - Use the SAME alias for the SAME concept every time — do not rename\n"
+    "     `?productCount` to `?count` between runs.\n"
+    "   - Keep the projection SHAPE fixed: answer the asked question with the\n"
+    "     minimal columns. Do not sometimes return pairs/extra columns for a\n"
+    "     question about single entities.\n\n"
     "REMEMBER: When comparing categories, ALWAYS use SUM(IF(...)) in ONE flat query. "
     "NEVER use nested subqueries { SELECT ... WHERE { ... } }."
 )
@@ -526,6 +562,18 @@ class NLtoSPARQL:
                     guardrail_id=self._guardrail_id or None,
                     guard_content=query,
                     temperature=0,
+                    # top_p=0 requests greedy decoding for determinism, but treat
+                    # it as BEST-EFFORT, not a guarantee. Newer Anthropic models
+                    # (e.g. claude-sonnet-5) have deprecated BOTH temperature AND
+                    # top_p: bedrock.py strips each on ValidationException
+                    # (_MODELS_REJECTING_TEMPERATURE / _MODELS_REJECTING_TOP_P), so
+                    # on those models NEITHER sampling constraint actually reaches
+                    # Bedrock. The real, model-independent B1 fix is the SEMANTIC
+                    # pinning (LIMIT / COUNT(DISTINCT) / stable descriptive alias) in
+                    # the prompt + sparql_validator fail-closed enforcement; the
+                    # sampling params only remove avoidable variance WHEN the model
+                    # accepts them. Determinism must not depend on them surviving.
+                    top_p=0,
                     model_id=model_id,
                 ),
                 trace_steps,
@@ -656,6 +704,14 @@ class NLtoSPARQL:
             )
             return result, True
         except Exception as e:
+            # Trace keeps the compact type name (client-facing); operators get the
+            # full message + step name in structured logs for production debugging.
+            logger.warning(
+                "pipeline_step_failed",
+                step=step_name,
+                error_type=type(e).__name__,
+                error_msg=str(e),
+            )
             trace_steps.append(
                 {
                     "step": step_name,

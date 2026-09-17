@@ -53,6 +53,22 @@ def handler(event: dict, context: object) -> None:
             # Pass bare sourceId (without DS# prefix) for sources-table status updates.
             if "sourceId" in body:
                 execution_input["sourceId"] = body["sourceId"]
+            # Re-scan marker, normalized to a string and ALWAYS present: the
+            # enrichment ECS step reads it as an env var and the state machine
+            # maps it via JsonPath.stringAt, both of which need a string that
+            # exists on every execution. Absent/falsy in the message => "false"
+            # (a first scan / a SCAN_FAILED redo); the approved-source drift
+            # re-scan sends isRescan=true.
+            execution_input["isRescan"] = "true" if body.get("isRescan") else "false"
+            # Forwarded alongside isRescan and normalized the same way. True ONLY
+            # when the source was already in RESCAN_REVIEW (a prior re-scan still
+            # open and un-approved). Discovery reads it to decide whether to
+            # reconstruct the approved baseline from the S3 backup blob (open
+            # review) or treat the live assets as the approved baseline
+            # (re-scan from APPROVED, where any leftover backup is stale and must
+            # be ignored). The discovery Lambda receives the full execution input,
+            # so this reaches it without a state-machine change.
+            execution_input["hadOpenRescan"] = "true" if body.get("hadOpenRescan") else "false"
             execution_name = body["scanJobId"].replace("#", "-").replace("SCAN-", "")[:80]
 
             logger.info(

@@ -479,7 +479,7 @@ class TestInvokeFunction:
         main_mod._config = config
         main_mod.RESOLVE_TIMEOUT_S = 0.01
 
-        async def slow_resolve(request):
+        async def slow_resolve(request, **kwargs):
             await asyncio.sleep(1)
 
         mock_orch = MagicMock()
@@ -663,7 +663,7 @@ class TestStreamingSSEMode:
         main_mod._config = config
         mock_orch = MagicMock()
 
-        async def mock_resolve(request, trace=None, on_token=None, conversation_history=None):
+        async def mock_resolve(request, trace=None, on_token=None, conversation_history=None, deadline=None):
             """Simulate orchestrator resolve with trace callback."""
             if trace:
                 trace.record(step="t2.sql", status="done", duration_ms=50)

@@ -68,6 +68,15 @@ export interface Proposal {
    * proposal that still carries the list inline in ``metadata.matches``. Fetch
    * directly from S3 (not via apiClient). */
   matches_url?: string | null;
+  /** Presigned S3 GET URL for the SHACL constraint config
+   * (``metadata.constraint_config``). Served out-of-band for the same reason as
+   * the Turtle and matches: the config is one entry per class with one entry per
+   * constrained property, so a wide schema can exceed the 6 MB response limit.
+   * ``null`` when there is no offloaded constraints object — either a proposal
+   * with no constraints, or a legacy proposal that still carries the config
+   * inline in ``metadata.constraint_config``. Fetch directly from S3 (not via
+   * apiClient). The S3 body is the config object itself, not an envelope. */
+  constraints_url?: string | null;
   /** Reason from the most recent failed accept attempt, naming the pipeline
    * step that failed (ingest / embeddings_searchable / reconcile_counts /
    * s3_persist). Set together with status === "accept_failed"; cleared on the
@@ -710,14 +719,18 @@ export async function downloadOntology(
   namespace: string,
   ontologyId: string,
 ): Promise<string> {
-  if (!apiClient.getText) {
-    throw new Error("This client does not support text downloads.");
-  }
-  return apiClient.getText(
+  // The endpoint no longer inlines the Turtle (a 6+ MB ontology would exceed the
+  // API Gateway / Lambda response limit and 502). It returns a presigned S3 URL
+  // we fetch directly, mirroring the proposal artifact path (#143).
+  const { downloadUrl } = await apiClient.get<{ downloadUrl: string }>(
     `/namespaces/${encodeURIComponent(namespace)}/ontologies/${encodeURIComponent(
       ontologyId,
     )}/download`,
   );
+  if (!downloadUrl) {
+    throw new Error("Download response did not include a download URL.");
+  }
+  return fetchTurtleFromUrl(downloadUrl);
 }
 
 // ─── Validation (ontology-level, not proposal-level) ───────────────────

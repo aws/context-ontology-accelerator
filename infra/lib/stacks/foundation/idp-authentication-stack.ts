@@ -226,9 +226,13 @@ export class IdpAuthenticationStack extends SCLStack {
       customAttributes: props?.cognitoCustomAttributes,
     });
 
+    // Hoisted into a named constant because it is also published to SSM below,
+    // for the web stack's CSP. Keep it a plain synth-time string (prefix +
+    // account, both resolved) so the consumer can interpolate it into an origin.
+    const cognitoDomainPrefix = `${this.prefixed("auth")}-${this.account}`;
     const domain = this.userPool.addDomain("CognitoDomain", {
       cognitoDomain: {
-        domainPrefix: `${this.prefixed("auth")}-${this.account}`,
+        domainPrefix: cognitoDomainPrefix,
       },
     });
 
@@ -343,6 +347,22 @@ export class IdpAuthenticationStack extends SCLStack {
     new ssm.StringParameter(this, "SsmAuthIssuer", {
       parameterName: `${ssmPrefix}/issuer`,
       stringValue: this.issuerUrl,
+    });
+    // Hosted-UI domain PREFIX (not the full URL). The browser's OAuth token
+    // exchange, refresh-token revocation, and silent-renew iframe all go to
+    // `<prefix>.auth.<region>.amazoncognito.com`, which is a different host from
+    // the issuer above — so the web stack's Content-Security-Policy has to
+    // allowlist it or every sign-in is blocked by the browser (issue #130).
+    //
+    // Published here rather than re-derived in the web stack so the naming rule
+    // lives in exactly one place: a drifting copy would not fail a deploy, it
+    // would silently block login. The prefix rather than `domain.baseUrl()`
+    // because the consumer reads it with `valueForStringParameter` and gets a
+    // CFN dynamic reference — an unresolved token cannot be parsed into an
+    // origin at synth, but it can be interpolated into one.
+    new ssm.StringParameter(this, "SsmCognitoDomainPrefix", {
+      parameterName: `${ssmPrefix}/cognito-domain-prefix`,
+      stringValue: cognitoDomainPrefix,
     });
     new ssm.StringParameter(this, "SsmGroupTokenName", {
       parameterName: `${ssmPrefix}/authentication-group-token-name`,

@@ -10,6 +10,8 @@ cleanly to JSON for DataZone form storage and API responses.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from enum import Enum, StrEnum
 from typing import Any
@@ -206,3 +208,25 @@ def to_dict(obj: Any) -> Any:
     if isinstance(obj, Enum):
         return obj.value
     return obj
+
+
+def compute_schema_hash(columns: list[Column]) -> str:
+    """Deterministic 16-char hash of a table's column schema.
+
+    Covers column name, data type, partition-key flag, and nullability — the
+    technical shape a re-scan must detect drift in, deliberately ignoring
+    descriptions/comments. Nullability matters because ``NOT NULL`` drives
+    induced ``owl:minCardinality 1``; it is a no-op for connectors that cannot
+    report it (Glue hardcodes ``nullable=True``), so including it never
+    false-triggers there and catches real drift where it is reported (JDBC).
+    Used two ways, which MUST agree:
+      * connectors stamp ``Table.technical_metadata_hash`` at discovery time;
+      * re-scan change detection recomputes a stored table's hash from its
+        persisted columns and compares it to the freshly discovered hash.
+    Because both call this one function, the two hashes are comparable.
+    """
+    normalized = sorted(
+        [{"n": c.name, "t": c.data_type, "p": c.is_partition_key, "u": c.nullable} for c in columns],
+        key=lambda x: str(x["n"]),
+    )
+    return hashlib.sha256(json.dumps(normalized, sort_keys=True).encode()).hexdigest()[:16]

@@ -33,8 +33,84 @@ for the full request/response schema.
 Options:
 - `execute: false` — return the generated SQL without executing it
 - `tierOverride` — force a specific resolution tier (1, 2, or 3)
+- `strategy` — choose which Tier-2 engine answers a structured query (see below)
 - `maxResults` — limit result rows
 - `includeSupporting` — include supporting context in the response
+- `timeoutMs` — cap the server-side resolution budget for this request. Only ever
+  *lowers* the budget below the transport ceiling (a value above the ceiling is
+  clamped); non-positive/invalid values are ignored.
+
+> **⚠️ REST has a hard 29-second timeout.** The REST endpoint runs behind API
+> Gateway, whose integration timeout is a fixed **29 s** (`timeoutInMillis: 29000`)
+> that **cannot be raised**. A query that needs longer than 29 s server-side does
+> not return over REST — it responds with:
+>
+> ```json
+> { "error": "rest_deadline_exceeded", "limitMs": 29000,
+>   "message": "Query exceeded the 29s REST timeout ... use the streaming query endpoint ..." }
+> ```
+>
+> This is expected for long-running work — most commonly **Tier 3** knowledge
+> synthesis, which routinely takes 20–90 s. The work may still be completing
+> server-side; the error means only that it cannot be delivered within the REST
+> budget, **not** that the service is down or the query is malformed. For those
+> queries, use the **streaming endpoint** (below), which has a much larger budget.
+> Fast structured lookups (Tier 1 / Tier 2 single-shot) fit comfortably inside 29 s
+> and are well suited to REST.
+
+### Streaming (recommended for interactive query)
+
+For interactive use — and for any query that may take more than a few seconds
+(Tier 3 synthesis, multi-step retrieval) — use the **streaming** path rather than
+the synchronous REST endpoint. It POSTs to the AgentCore Runtime `/invocations`
+endpoint with SSE (Server-Sent Events) and carries a much larger resolution budget
+(**170 s** by default, `resolve_timeout_s`), so it is not subject to the 29 s API
+Gateway ceiling. It also streams resolution steps, generated SQL, and results as
+they are produced instead of blocking for a single response.
+
+This is the path the [Playground](#playground-web-app) uses, and the recommended
+default for building interactive clients. Reserve the synchronous REST endpoint for
+short, scriptable calls where a single blocking request is simpler and the work
+reliably fits inside 29 s.
+
+#### Selecting a Tier-2 engine — `strategy`
+
+Tier 2 can answer a structured question two ways: through the **Ontop/VKG** semantic
+path (SPARQL compiled against your R2RML mappings) or through **NL→SQL**. By default
+it tries NL→SQL and falls back to Ontop. Setting `strategy` pins the choice, which is
+how you compare engines or require the semantic path.
+
+| Value | Behaviour |
+|---|---|
+| `nl_to_sql_first` | NL→SQL, falling back to Ontop. **The default when `strategy` is omitted.** |
+| `ontop_first` | Ontop, falling back to NL→SQL |
+| `ontop` | Ontop only — no fallback |
+| `nl_to_sql` | NL→SQL only — no fallback |
+| `best` | Run both in parallel, return the higher-confidence answer |
+| `deep-reasoning` | The bounded tool-use agent only; never reached as a fallback |
+
+```json
+{ "query": "how many products are there", "options": { "strategy": "ontop" } }
+```
+
+Notes:
+
+- **Optional.** Omitting it behaves exactly as before this option existed.
+- **Ignored unless the query resolves at Tier 2.** A question answered by a Tier-1
+  metric or Tier-3 retrieval is unaffected.
+- **An explicit value is never overridden** by automatic tier gating or per-query
+  Tier-2 pruning — pinning an engine is treated as intent.
+- **Orthogonal to `mode`.** `mode` decides whether the whole Tier 1→2→3 cascade is
+  replaced by the Tier-3 reasoning loop; `strategy` decides which engine answers
+  *within* Tier 2. Both were called "agentic" before the rebrand, so they are easy to
+  confuse. `deep-reasoning` appears in both because it is the same engine reached two
+  ways: `mode="deep-reasoning"` replaces the cascade and returns a prose answer, while
+  `strategy="deep-reasoning"` keeps Tier-1 metric routing and returns the agent's
+  answer in Tier-2 row shape.
+- An unrecognised value returns **400** listing the valid ones, rather than silently
+  falling back to the default.
+- `ontop` requires the namespace to have an accepted ontology with published R2RML
+  mappings; without them the pinned engine fails rather than falling back.
 
 ### MCP (Model Context Protocol)
 
@@ -46,6 +122,13 @@ For AI agents (Claude, Amazon Q, etc.), Context Ontology Accelerator exposes an 
 - Translating natural language to SPARQL
 - Retrieving semantically similar document chunks
 - Traversing the semantic graph for entity relationships
+
+The `query` tool accepts the same optional `strategy` values as the REST API, with
+identical semantics. They are published in the tool's JSON schema as an enum, so an
+agent discovers the valid values without extra prompting, and an invalid one is
+rejected by schema validation before the tool runs. This is what lets an agent
+deliberately select the Ontop/VKG semantic path rather than reaching it only as a
+fallback.
 
 See the [Agent Access Guide](agent-access.md) for authentication setup and the MCP server's README (`packages/mcp-server/README.md` in the repository) for MCP client configuration.
 
@@ -183,6 +266,11 @@ shape (single- vs cross-source); see the [Sources Guide](sources.md#direct-sql-v
 - **Graph traversal**: walks the Neptune knowledge graph for connected concepts
 - **Synthesis**: combines retrieved context into a natural language answer using Bedrock
 
+> **Latency note.** Tier 3 synthesis is an iterative retrieve-and-reason loop and
+> routinely runs **20–90 s** end to end — longer than the 29 s REST ceiling. Query
+> Tier 3 over the [streaming endpoint](#streaming-recommended-for-interactive-query),
+> not the synchronous REST endpoint, or it will return `rest_deadline_exceeded`.
+
 ## Access Control on Queries
 
 Authorization runs at **two** points, so that surfaces which never generate SQL are
@@ -239,5 +327,5 @@ See these operations in the [API Reference](#/api-reference) for their full requ
 | 403 Access Denied | No role grant for this namespace | Grant the user a role via Permissions |
 | Empty results | No metrics/ontology defined | Connect sources, define metrics, or induce ontology first |
 | SQL Firewall denied | User's grant restricts access to referenced tables | Update the user's table allowlist |
-| 504 Timeout | Query resolution exceeded 29s | Simplify the question or check Lambda cold starts |
+| 504 Timeout / `rest_deadline_exceeded` | Query exceeded the hard 29 s REST (API Gateway) ceiling — common for Tier 3 synthesis (20–90 s) | Use the [streaming endpoint](#streaming-recommended-for-interactive-query) (170 s budget), lower scope via `tierOverride`, or simplify the question. Not a connectivity failure — the query may still be completing server-side. |
 | "No tier produced results" | Question doesn't match any resolution strategy | Rephrase, or ensure relevant data is modeled |

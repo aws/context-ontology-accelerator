@@ -798,3 +798,166 @@ class TestSweep:
         mock_ecs.update_service.assert_not_called()
         metrics = [c.kwargs["MetricData"][0]["MetricName"] for c in index.cloudwatch.put_metric_data.call_args_list]
         assert "ReloadFailed" in metrics
+
+    @patch.dict(
+        os.environ,
+        {**ENV, "VKG_TASK_CPU": "2048", "VKG_TASK_MEMORY": "4096", "VKG_ONTOP_JAVA_ARGS": "-Xmx3072m -Xms1024m"},
+    )
+    @patch("index.ecs")
+    @patch("index.sd")
+    @patch("index.ssm")
+    def test_task_sizing_env_threaded_into_task_definition(self, mock_ssm, mock_sd, mock_ecs):
+        """#149 cause B/C: reload reads VKG_TASK_CPU/MEMORY/ONTOP_JAVA_ARGS and
+
+        threads them into the registered task def, so a reloaded task matches the
+        CDK-provisioned initial one instead of the old hardcoded 512/1024 with a
+        dead JAVA_OPTS. Guards against a regression that would silently
+        under-provision and never apply the heap.
+        """
+        mock_ssm.get_parameter.return_value = {
+            "Parameter": {"Value": "111.dkr.ecr.us-west-2.amazonaws.com/scl:vkg-NEW"}
+        }
+        mock_ecs.describe_services.return_value = {"services": [{"taskDefinition": "arn:td:old"}]}
+        mock_ecs.describe_task_definition.return_value = {
+            "taskDefinition": {"containerDefinitions": [{"image": "111.dkr.ecr.us-west-2.amazonaws.com/scl:vkg-OLD"}]}
+        }
+        mock_ecs.register_task_definition.return_value = {"taskDefinition": {"taskDefinitionArn": "arn:td:ns-rev2"}}
+        mock_ecs.update_service.return_value = {"service": {"deployments": [{"id": "deploy-1"}]}}
+
+        import importlib
+
+        import index
+
+        importlib.reload(index)
+        index.ecs = mock_ecs
+        index.sd = mock_sd
+        index.ssm = mock_ssm
+
+        result = index.handler(_make_event(), None)
+        assert result["status"] == "reload_triggered"
+        td_kwargs = mock_ecs.register_task_definition.call_args.kwargs
+        assert td_kwargs["cpu"] == "2048"
+        assert td_kwargs["memory"] == "4096"
+        env = {e["name"]: e["value"] for e in td_kwargs["containerDefinitions"][0]["environment"]}
+        assert env["ONTOP_JAVA_ARGS"] == "-Xmx3072m -Xms1024m"
+        # The dead variable must NOT be emitted — that was the #149 cause C no-op.
+        assert "JAVA_OPTS" not in env
+
+    @patch.dict(os.environ, ENV)
+    @patch("index.ecs")
+    @patch("index.sd")
+    @patch("index.ssm")
+    def test_task_sizing_defaults_match_cdk_when_env_unset(self, mock_ssm, mock_sd, mock_ecs):
+        """With the sizing env unset, the reload falls back to defaults that match
+
+        the CDK stack (cpu=1024/memory=2048, -Xmx1536m -Xms512m), so an
+        un-parameterised reload is still safe rather than the old 512/1024.
+        """
+        mock_ssm.get_parameter.return_value = {
+            "Parameter": {"Value": "111.dkr.ecr.us-west-2.amazonaws.com/scl:vkg-NEW"}
+        }
+        mock_ecs.describe_services.return_value = {"services": [{"taskDefinition": "arn:td:old"}]}
+        mock_ecs.describe_task_definition.return_value = {
+            "taskDefinition": {"containerDefinitions": [{"image": "111.dkr.ecr.us-west-2.amazonaws.com/scl:vkg-OLD"}]}
+        }
+        mock_ecs.register_task_definition.return_value = {"taskDefinition": {"taskDefinitionArn": "arn:td:ns-rev2"}}
+        mock_ecs.update_service.return_value = {"service": {"deployments": [{"id": "deploy-1"}]}}
+
+        import importlib
+
+        import index
+
+        importlib.reload(index)
+        index.ecs = mock_ecs
+        index.sd = mock_sd
+        index.ssm = mock_ssm
+
+        result = index.handler(_make_event(), None)
+        assert result["status"] == "reload_triggered"
+        td_kwargs = mock_ecs.register_task_definition.call_args.kwargs
+        assert td_kwargs["cpu"] == "1024"
+        assert td_kwargs["memory"] == "2048"
+        env = {e["name"]: e["value"] for e in td_kwargs["containerDefinitions"][0]["environment"]}
+        assert env["ONTOP_JAVA_ARGS"] == "-Xmx1536m -Xms512m"
+
+    @patch.dict(os.environ, {**ENV, "VKG_TASK_MEMORY": "8192"}, clear=False)
+    @patch("index.ecs")
+    @patch("index.sd")
+    @patch("index.ssm")
+    def test_heap_derived_from_task_memory_when_java_args_unset(self, mock_ssm, mock_sd, mock_ecs):
+        """When VKG_ONTOP_JAVA_ARGS is unset, the heap is derived from
+        VKG_TASK_MEMORY (max heap ~=75%, initial ~=25%) so bumping memory alone
+        scales the heap in step rather than leaving a stale hardcoded -Xmx.
+        """
+        # Ensure no explicit heap override leaks in from a broader ENV.
+        os.environ.pop("VKG_ONTOP_JAVA_ARGS", None)
+        mock_ssm.get_parameter.return_value = {
+            "Parameter": {"Value": "111.dkr.ecr.us-west-2.amazonaws.com/scl:vkg-NEW"}
+        }
+        mock_ecs.describe_services.return_value = {"services": [{"taskDefinition": "arn:td:old"}]}
+        mock_ecs.describe_task_definition.return_value = {
+            "taskDefinition": {"containerDefinitions": [{"image": "111.dkr.ecr.us-west-2.amazonaws.com/scl:vkg-OLD"}]}
+        }
+        mock_ecs.register_task_definition.return_value = {"taskDefinition": {"taskDefinitionArn": "arn:td:ns-rev2"}}
+        mock_ecs.update_service.return_value = {"service": {"deployments": [{"id": "deploy-1"}]}}
+
+        import importlib
+
+        import index
+
+        importlib.reload(index)
+        index.ecs = mock_ecs
+        index.sd = mock_sd
+        index.ssm = mock_ssm
+
+        result = index.handler(_make_event(), None)
+        assert result["status"] == "reload_triggered"
+        td_kwargs = mock_ecs.register_task_definition.call_args.kwargs
+        assert td_kwargs["memory"] == "8192"
+        env = {e["name"]: e["value"] for e in td_kwargs["containerDefinitions"][0]["environment"]}
+        # 8192 * 3//4 = 6144, 8192 // 4 = 2048
+        assert env["ONTOP_JAVA_ARGS"] == "-Xmx6144m -Xms2048m"
+
+    @patch.dict(os.environ, ENV)
+    @patch("index.ecs")
+    @patch("index.sd")
+    @patch("index.ssm")
+    def test_register_task_definition_failure_fails_cleanly_without_creating_service(self, mock_ssm, mock_sd, mock_ecs):
+        """If register_task_definition raises during a provision, the handler
+
+        returns failed and never calls create_service, rather than letting the
+        exception propagate and orphan the just-created Cloud Map entry.
+        """
+        mock_ecs.exceptions.ServiceNotFoundException = type("ServiceNotFoundException", (Exception,), {})
+        mock_ecs.exceptions.ServiceNotActiveException = type("ServiceNotActiveException", (Exception,), {})
+        mock_ecs.exceptions.InvalidParameterException = type("InvalidParameterException", (Exception,), {})
+        same_image = "111.dkr.ecr.us-west-2.amazonaws.com/scl:vkg-abc"
+        mock_ssm.get_parameter.return_value = {"Parameter": {"Value": same_image}}
+        # Same image so the reload path takes the unchanged branch (no task-def
+        # registration there); update_service then raises ServiceNotFound so the
+        # handler routes to the provision path, where _register_task_definition
+        # is called and we force it to fail.
+        mock_ecs.describe_services.return_value = {"services": [{"taskDefinition": "arn:td:old"}]}
+        mock_ecs.describe_task_definition.return_value = {
+            "taskDefinition": {"containerDefinitions": [{"image": same_image}]}
+        }
+        mock_ecs.update_service.side_effect = mock_ecs.exceptions.ServiceNotFoundException("not found")
+        mock_sd.create_service.return_value = {"Service": {"Arn": "arn:sd:svc"}}
+        mock_sd.exceptions.ServiceAlreadyExists = type("ServiceAlreadyExists", (Exception,), {})
+        mock_ecs.register_task_definition.side_effect = RuntimeError("ThrottlingException")
+
+        import importlib
+
+        import index
+
+        importlib.reload(index)
+        index.ecs = mock_ecs
+        index.sd = mock_sd
+        index.ssm = mock_ssm
+
+        result = index.handler(_make_event(), None)
+        assert result["status"] == "failed"
+        assert "register_task_definition failed" in result["reason"]
+        mock_ecs.create_service.assert_not_called()
+        metrics = [c.kwargs["MetricData"][0]["MetricName"] for c in index.cloudwatch.put_metric_data.call_args_list]
+        assert "ReloadFailed" in metrics

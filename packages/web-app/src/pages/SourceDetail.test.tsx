@@ -11,6 +11,7 @@ import { SourceDetail } from "./SourceDetail";
 // that batch review issues one call per selected table with the right input.
 const sendMock = vi.hoisted(() => vi.fn());
 const invalidateQueriesMock = vi.hoisted(() => vi.fn());
+const keepMutateMock = vi.hoisted(() => vi.fn());
 const listSourceTablesMock = vi.hoisted(() =>
   vi.fn(() => ({
     data: { items: TABLES, skippedAssets: 0 },
@@ -62,6 +63,8 @@ vi.mock("@api-hooks", () => ({
   useApproveSource: () => ({ mutate: vi.fn(), isPending: false, error: null }),
   useRejectSource: () => ({ mutate: vi.fn(), isPending: false, error: null }),
   useGetSourceScanJob: () => ({ data: undefined }),
+  useListSourceScanJobs: () => ({ data: undefined }),
+  useKeepRescanRemoval: () => ({ mutate: keepMutateMock, isPending: false }),
 }));
 
 // ReviewSourceTableCommand is mocked as a simple input-carrying class so the
@@ -261,5 +264,125 @@ describe("SourceDetail skipped assets warning", () => {
     expect(
       screen.getByText(/1 table could not be loaded due to a data issue/i),
     ).toBeInTheDocument();
+  });
+});
+
+describe("SourceDetail re-scan pending-deletion surfacing", () => {
+  beforeEach(() => {
+    keepMutateMock.mockReset();
+    listSourceTablesMock.mockReturnValue({
+      data: {
+        items: [
+          {
+            tableId: "sales.orders",
+            name: "orders",
+            database: "sales",
+            reviewStatus: "PENDING_REVIEW",
+            columnCount: 3,
+            columnsApproved: 0,
+            // The re-scan no longer found this table in the source.
+            pendingDeletion: true,
+          },
+          {
+            tableId: "sales.customers",
+            name: "customers",
+            database: "sales",
+            reviewStatus: "PENDING_REVIEW",
+            columnCount: 2,
+            columnsApproved: 0,
+          },
+        ],
+        skippedAssets: 0,
+      },
+      isLoading: false,
+    });
+  });
+
+  it("flags a re-scan-removed table with a Pending deletion badge and a Keep button", () => {
+    render(<SourceDetail />, { wrapper });
+    // Exactly the flagged table surfaces the badge + Keep control.
+    expect(screen.getByText(/pending deletion/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^keep$/i })).toBeInTheDocument();
+  });
+
+  it("keeps the flagged table (by id) when Keep is clicked", async () => {
+    render(<SourceDetail />, { wrapper });
+    const keep = screen.getByRole("button", { name: /^keep$/i });
+    await act(async () => {
+      keep.click();
+    });
+    expect(keepMutateMock).toHaveBeenCalledWith(
+      { tableId: "sales.orders" },
+      expect.anything(),
+    );
+  });
+});
+
+describe("SourceDetail re-scan added-table surfacing", () => {
+  it("flags a re-scan-added table with a New badge", () => {
+    listSourceTablesMock.mockReturnValue({
+      data: {
+        items: [
+          {
+            tableId: "sales.orders",
+            name: "orders",
+            database: "sales",
+            reviewStatus: "PENDING_REVIEW",
+            columnCount: 3,
+            columnsApproved: 0,
+            // The re-scan created this table fresh (net-new since last scan).
+            added: true,
+          },
+        ],
+        skippedAssets: 0,
+      },
+      isLoading: false,
+    });
+    render(<SourceDetail />, { wrapper });
+    expect(screen.getByText(/^new$/i)).toBeInTheDocument();
+  });
+
+  it("shows no New badge when no table is added", () => {
+    listSourceTablesMock.mockReturnValue({
+      data: { items: TABLES, skippedAssets: 0 },
+      isLoading: false,
+    });
+    render(<SourceDetail />, { wrapper });
+    expect(screen.queryByText(/^new$/i)).not.toBeInTheDocument();
+  });
+});
+
+describe("SourceDetail column-level pending-deletion surfacing", () => {
+  beforeEach(() => {
+    listSourceTablesMock.mockReturnValue({
+      data: {
+        items: [
+          {
+            tableId: "sales.orders",
+            name: "orders",
+            database: "sales",
+            reviewStatus: "PENDING_REVIEW",
+            // Honest denominator: 3 merged columns (one retained pending
+            // deletion), 1 approved.
+            columnCount: 3,
+            columnsApproved: 1,
+            columnsPendingDeletion: 1,
+          },
+        ],
+        skippedAssets: 0,
+      },
+      isLoading: false,
+    });
+  });
+
+  it("surfaces a column-level pending-deletion badge in the Review status column", () => {
+    render(<SourceDetail />, { wrapper });
+    expect(screen.getByText(/1 column pending deletion/i)).toBeInTheDocument();
+  });
+
+  it("shows the honest X/Y denominator in the Columns cell", () => {
+    render(<SourceDetail />, { wrapper });
+    // Denominator counts the retained pending-deletion column → 1/3, not 1/2.
+    expect(screen.getByText("1/3")).toBeInTheDocument();
   });
 });

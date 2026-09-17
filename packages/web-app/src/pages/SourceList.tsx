@@ -80,13 +80,14 @@ const COLUMN_DISPLAY_OPTIONS: CollectionPreferencesProps.VisibleContentOptionsGr
         { id: "status", label: "Status" },
         { id: "sourceType", label: "Type" },
         { id: "createdAt", label: "Created" },
+        { id: "updatedAt", label: "Last updated" },
       ],
     },
   ];
 
 const DEFAULT_PREFERENCES: CollectionPreferencesProps.Preferences = {
   pageSize: 20,
-  visibleContent: ["name", "status", "sourceType", "createdAt"],
+  visibleContent: ["name", "status", "sourceType", "createdAt", "updatedAt"],
   wrapLines: false,
   stripedRows: true,
 };
@@ -252,6 +253,12 @@ export const SourceList: React.FC = () => {
       header: "Created",
       sortingField: "createdAt",
       cell: (item: SourceSummary) => formatTimestamp(item.createdAt),
+    },
+    {
+      id: "updatedAt",
+      header: "Last updated",
+      sortingField: "updatedAt",
+      cell: (item: SourceSummary) => formatTimestamp(item.updatedAt),
     },
   ].filter((col) => col.id === "name" || visibleContent.has(col.id));
 

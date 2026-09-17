@@ -19,6 +19,11 @@ vi.mock("@api-hooks", () => ({
   useApproveSource: () => ({ mutate: vi.fn(), isPending: false, error: null }),
   useRejectSource: () => ({ mutate: vi.fn(), isPending: false, error: null }),
   useGetSourceScanJob: mockGetSourceScanJob,
+  // Re-scan review hooks the page calls unconditionally. Not exercised by these
+  // Athena/degraded-scan cases, but the mock must expose every hook the
+  // component imports or the render throws before reaching the assertion.
+  useListSourceScanJobs: () => ({ data: undefined }),
+  useKeepRescanRemoval: () => ({ mutate: vi.fn(), isPending: false }),
 }));
 
 vi.mock("@coa/control-plane-client", () => ({

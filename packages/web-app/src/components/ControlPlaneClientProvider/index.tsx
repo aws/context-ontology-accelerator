@@ -40,7 +40,21 @@ export const ControlPlaneClientProvider: React.FC<PropsWithChildren> = ({
       token: async () => {
         const token = await provider.getIdToken();
         if (!token) throw new Error("Failed to retrieve authentication token");
-        return { token };
+        // Return the token's own expiry. The smithy httpBearerAuth client wraps
+        // this provider in memoizeIdentityProvider, which only re-invokes it
+        // when the cached identity reports it is expiring. WITHOUT an
+        // `expiration`, the SDK treats the token as non-expiring and caches the
+        // first one for the client's lifetime — so getIdToken()'s refresh never
+        // runs here and every request keeps sending the initial ID token until
+        // it expires (403 "Signature has expired"; only a page reload recovered
+        // it). Sourced from the ID token's `exp` claim because that is the token
+        // sent as the bearer. See issue #136.
+        const user = await provider.getUser();
+        const expiration =
+          user?.profile?.exp !== undefined
+            ? new Date(user.profile.exp * 1000)
+            : undefined;
+        return { token, expiration };
       },
     });
   }, [apiEndpoint, oidcConfig]);

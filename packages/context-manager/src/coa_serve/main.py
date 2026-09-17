@@ -69,6 +69,7 @@ from .tier3.synthesizer import Synthesizer
 
 if TYPE_CHECKING:
     from .clients.sources_registry import SourcesRegistry
+    from .deadline import Deadline
 from .tier3.vector_retriever import VectorRetriever
 from .trace import TraceCollector
 
@@ -85,7 +86,33 @@ _sources_registry: SourcesRegistry | None = None
 _nl_to_sparql: NLtoSPARQL | None = None
 _init_lock = asyncio.Lock()
 
+# Hard upper bound on the per-request transport budget: max(10, min(env, 300)).
+# The 300s cap is a deliberate ceiling — even a misconfigured RESOLVE_TIMEOUT_S
+# env cannot let a request run unbounded (e.g. toward a Lambda/runtime ceiling),
+# and a caller's options.timeoutMs can only NARROW this via Deadline.from_budget,
+# never widen it. Floor of 10s keeps a pathological low env from starving requests.
 RESOLVE_TIMEOUT_S = max(10, min(int(os.environ.get("RESOLVE_TIMEOUT_S", "120")), 300))
+
+
+def _build_deadline(request) -> Deadline:
+    """Build the request-scoped deadline (A0) for a query.
+
+    The transport budget is ``RESOLVE_TIMEOUT_S`` — set per-transport by the
+    deploying stack (REST/data-layer path vs the longer AgentCore/Playground
+    path). The caller may narrow it via ``options.timeoutMs`` but never widen it.
+
+    ``options.timeoutMs`` is read here — this is what makes the long-declared but
+    previously-inert Smithy field actually govern the request budget (closes the
+    accept-and-ignore contract defect).
+    """
+    from .deadline import Deadline
+
+    caller_timeout_ms = None
+    options = getattr(request, "options", None) or {}
+    if isinstance(options, dict):
+        caller_timeout_ms = options.get("timeoutMs")
+    return Deadline.from_budget(RESOLVE_TIMEOUT_S, caller_timeout_ms)
+
 
 # Namespace format constraint — mirrors InvokeRequest.namespace so the 400/404
 # split is consistent whether validation happens in the pre-gate below or the
@@ -650,7 +677,7 @@ async def _handle_blocking_query(request, request_id: str):
     resolve_start = time.perf_counter()
     try:
         response = await asyncio.wait_for(
-            _orchestrator.resolve(request),
+            _orchestrator.resolve(request, deadline=_build_deadline(request)),
             timeout=RESOLVE_TIMEOUT_S,
         )
     except TimeoutError:
@@ -724,6 +751,7 @@ async def _handle_streaming_query(payload: dict, request, request_id: str, sessi
                     trace=trace,
                     on_token=on_token,
                     conversation_history=conversation_history,
+                    deadline=_build_deadline(request),
                 ),
                 timeout=RESOLVE_TIMEOUT_S,
             )

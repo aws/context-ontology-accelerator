@@ -23,7 +23,6 @@ table names from configuration are NEVER string-interpolated into the SQL text.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import re
@@ -42,6 +41,7 @@ from coa_common.domain_models import (
     ReviewStatus,
     Table,
     TechnicalMetadata,
+    compute_schema_hash,
 )
 
 from .base import ConnectionCheck, ConnectionTestResult
@@ -399,7 +399,7 @@ class JdbcConnector:
                     primary_key=pks.get(table_name, PrimaryKey()),
                     foreign_keys=fks.get(table_name, []),
                     columns=cols,
-                    technical_metadata_hash=_compute_schema_hash(cols),
+                    technical_metadata_hash=compute_schema_hash(cols),
                 )
             )
         return tables
@@ -454,6 +454,12 @@ class JdbcConnector:
         sampling failure leaves ``distinct_values`` empty and never aborts
         discovery. Only string/categorical columns are sampled (see
         ``_SAMPLEABLE_TYPE_PREFIXES``); high-cardinality columns get ``[]``.
+
+        Before sampling, applies any session-level timeout statements the
+        dialect provides (e.g. ``SET statement_timeout``) so that a single
+        pathological column cannot consume the Lambda budget. If those
+        statements cannot be applied, sampling is SKIPPED rather than run
+        unbounded (GH-131).
         """
         candidates = [
             c.name
@@ -462,6 +468,29 @@ class JdbcConnector:
         ]
         if not candidates:
             return
+
+        # Apply the probe timeout bound BEFORE issuing any cardinality queries.
+        # Fail CLOSED: when a dialect declares timeout statements it is telling us
+        # its probe needs bounding, so if we cannot apply that bound we skip
+        # sampling entirely rather than issuing the unbounded COUNT(DISTINCT …)
+        # this guard exists to prevent (GH-131). Sampling is best-effort
+        # enrichment — losing enum detection for one table is strictly cheaper
+        # than burning the whole 15-minute discovery Lambda on one wide column.
+        for stmt in dialect.probe_timeout_statements():
+            try:
+                cursor = conn.cursor()
+                try:
+                    cursor.execute(stmt)
+                finally:
+                    cursor.close()
+            except Exception:
+                logger.warning(
+                    "probe_timeout_setup_failed",
+                    extra={"schema": schema_name, "table": table_name, "statement": stmt},
+                    exc_info=True,
+                )
+                return
+
         try:
             sampled = dialect.fetch_distinct_values(
                 conn, schema_name, table_name, candidates, max_distinct=max_distinct
@@ -606,12 +635,3 @@ class JdbcConnector:
                 session_name=f"coa-jdbc-{namespace_id}",
             )
         return boto3.Session(region_name=region)
-
-
-def _compute_schema_hash(columns: list[Column]) -> str:
-    """Deterministic 16-char hash of column schema for re-scan change detection."""
-    normalized = sorted(
-        [{"n": c.name, "t": c.data_type, "p": c.is_partition_key} for c in columns],
-        key=lambda x: str(x["n"]),
-    )
-    return hashlib.sha256(json.dumps(normalized, sort_keys=True).encode()).hexdigest()[:16]

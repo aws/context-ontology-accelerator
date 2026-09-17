@@ -168,6 +168,52 @@ class TestTriplesMapStructure:
         assert table_name is not None
         assert str(table_name) == '"products"'
 
+    def test_table_name_qualified_with_source_schema(self, strategy):
+        """#149 A: when a table carries sourceSchema, rr:tableName is emitted as
+        the schema-qualified `"schema"."table"` so it matches the qualified H2
+        table and two same-named tables from different schemas stay distinct."""
+        tables = [
+            CatalogTable(
+                id="1",
+                name="products",
+                fullyQualifiedName="store.products",
+                sourceSchema="store",
+                columns=[CatalogColumn(name="sku", dataType="VARCHAR")],
+                tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["sku"])],
+            )
+        ]
+        g = _build(strategy, tables)
+        ns = Namespace(PREFIX)
+        lt = g.value(ns.TriplesMap_Products, RR.logicalTable)
+        table_name = g.value(lt, RR.tableName)
+        assert str(table_name) == '"store"."products"'
+
+    def test_two_same_named_tables_distinct_qualified_table_names(self, strategy):
+        """#149 A: two tables named the same in different schemas must produce
+        two TriplesMaps with DIFFERENT rr:tableName values (the collision that
+        silently dropped one at the H2 layer)."""
+        tables = [
+            CatalogTable(
+                id="1",
+                name="events_daily",
+                fullyQualifiedName="sales.events_daily",
+                sourceSchema="sales",
+                columns=[CatalogColumn(name="sale_id", dataType="INT")],
+                tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["sale_id"])],
+            ),
+            CatalogTable(
+                id="2",
+                name="events_daily",
+                fullyQualifiedName="ops.events_daily",
+                sourceSchema="ops",
+                columns=[CatalogColumn(name="op_id", dataType="INT")],
+                tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["op_id"])],
+            ),
+        ]
+        g = _build(strategy, tables)
+        table_names = {str(tn) for tn in g.objects(None, RR.tableName)}
+        assert table_names == {'"sales"."events_daily"', '"ops"."events_daily"'}
+
     def test_triples_map_has_subject_map(self, strategy):
         """R2RML §2.2: Every TriplesMap MUST have exactly one rr:subjectMap."""
         tables = [

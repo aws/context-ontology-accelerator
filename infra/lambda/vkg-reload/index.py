@@ -295,6 +295,30 @@ def _register_task_definition(ns, prefix, container_image):
     ontology_bucket = os.environ.get("ONTOLOGY_BUCKET", "")
     region = os.environ.get("AWS_REGION", "us-west-2")
 
+    # Task sizing and heap are read from the environment so this reload path and
+    # the CDK-provisioned initial service stay in sync from a single source of
+    # truth (VkgStack sets these on the reload Lambda). Previously this path
+    # hardcoded cpu=512/memory=1024 while the CDK service defaulted to 1024/2048,
+    # so per-namespace reloads silently ran under-provisioned and the OWL2QL
+    # translation pass could never finish (#149 cause B). Defaults below match
+    # the CDK stack defaults so behaviour is safe even if the env is unset.
+    task_cpu = os.environ.get("VKG_TASK_CPU", "1024")
+    task_memory = os.environ.get("VKG_TASK_MEMORY", "2048")
+    # The Ontop launcher reads ONTOP_JAVA_ARGS (NOT JAVA_OPTS). Setting JAVA_OPTS
+    # was a silent no-op (#149 cause C). When VKG_ONTOP_JAVA_ARGS is not set
+    # explicitly, derive the heap from task memory (max heap ~= 75% of task
+    # memory, initial heap ~= 25%) so bumping VKG_TASK_MEMORY alone scales the
+    # heap in step rather than leaving a stale hardcoded -Xmx.
+    ontop_java_args = os.environ.get("VKG_ONTOP_JAVA_ARGS", "")
+    if not ontop_java_args:
+        try:
+            mem_mib = int(task_memory)
+        except (TypeError, ValueError):
+            mem_mib = 2048
+        xmx = max(512, mem_mib * 3 // 4)
+        xms = max(256, mem_mib // 4)
+        ontop_java_args = f"-Xmx{xmx}m -Xms{xms}m"
+
     family = f"{prefix}-vkg-{ns}" if prefix else f"vkg-{ns}"
     td_resp = ecs.register_task_definition(
         family=family,
@@ -302,8 +326,8 @@ def _register_task_definition(ns, prefix, container_image):
         executionRoleArn=execution_role_arn,
         networkMode="awsvpc",
         requiresCompatibilities=["FARGATE"],
-        cpu="512",
-        memory="1024",
+        cpu=task_cpu,
+        memory=task_memory,
         runtimePlatform={"cpuArchitecture": "ARM64", "operatingSystemFamily": "LINUX"},
         containerDefinitions=[
             {
@@ -316,7 +340,7 @@ def _register_task_definition(ns, prefix, container_image):
                     {"name": "NAMESPACE", "value": ns},
                     {"name": "NAMESPACE_ID", "value": ns},
                     {"name": "ENDPOINT_PORT", "value": "8080"},
-                    {"name": "JAVA_OPTS", "value": "-Xmx768m -Xms256m"},
+                    {"name": "ONTOP_JAVA_ARGS", "value": ontop_java_args},
                 ],
                 "portMappings": [{"containerPort": 8080, "protocol": "tcp"}],
                 "healthCheck": {
@@ -362,7 +386,24 @@ def _provision_and_deploy(ns, service_name, cluster, prefix, version, container_
         return {"status": "failed", "reason": "cannot resolve container image"}
 
     registry_arn = _ensure_cloud_map(ns, cloud_map_ns_id)
-    task_def_arn = _register_task_definition(ns, prefix, container_image)
+    try:
+        task_def_arn = _register_task_definition(ns, prefix, container_image)
+    except Exception as e:
+        # The Cloud Map entry was just created (line above); without a task def
+        # the service can never be created, leaving it orphaned. Log with the
+        # dangling registry so an operator can reconcile, then fail the reload.
+        print(
+            json.dumps(
+                {
+                    "action": "register_task_definition_failed",
+                    "namespace": ns,
+                    "registry_arn": registry_arn,
+                    "error": str(e),
+                }
+            )
+        )
+        _emit_metric("ReloadFailed", ns)
+        return {"status": "failed", "reason": f"register_task_definition failed: {e}"}
 
     try:
         ecs.create_service(
