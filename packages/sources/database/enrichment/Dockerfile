@@ -24,9 +24,15 @@ RUN pip install --no-cache-dir /tmp/common/ && rm -rf /tmp/common/
 COPY smithy-generated/control-plane-python-server/ /tmp/server/
 RUN pip install --no-cache-dir /tmp/server/ && rm -rf /tmp/server/
 
-# Install the database package (includes all dependencies)
+# Install the database package, then remediate scanner findings in the SAME final layer:
+# upgrade pip + setuptools (CVE-2025-47273; build toolchain, not a declared dep), and
+# REMOVE msgpack — an orphan that nothing imports or declares (verified via grep +
+# pipdeptree --reverse), pulled in transiently and left behind. `pip uninstall -y` is a
+# no-op exit 0 if it is absent, so this stays safe.
 COPY packages/sources/ /tmp/sources/
-RUN pip install --no-cache-dir /tmp/sources/ && rm -rf /tmp/sources/
+RUN pip install --no-cache-dir /tmp/sources/ && rm -rf /tmp/sources/ && \
+    pip install --no-cache-dir --upgrade pip "setuptools>=78.1.1" && \
+    pip uninstall -y msgpack
 
 USER 1000
 ENTRYPOINT ["python", "-m", "coa_sources.database.pipeline.enrichment_handler"]
