@@ -32,9 +32,18 @@ RUN pip install --no-cache-dir /tmp/common/ && rm -rf /tmp/common/
 COPY smithy-generated/control-plane-python-server/ /tmp/control-plane-server/
 RUN pip install --no-cache-dir /tmp/control-plane-server/ && rm -rf /tmp/control-plane-server/
 
-# Install ontology-engine dependencies
+# Install ontology-engine dependencies, then remediate the two packages scanners flag
+# as HIGH, in the SAME final layer (a separate RUN would leave the old versions in a
+# lower layer that scanners still attribute to the image):
+#   - setuptools (CVE-2025-47273): build toolchain, not a declared dependency — bump it.
+#   - msgpack: an ORPHAN — nothing in first-party code or any installed package imports
+#     or declares it (verified via grep + pipdeptree --reverse); it is pulled in
+#     transiently during resolution and left behind. Remove it outright rather than ship
+#     a patched-but-dead package (`pip uninstall -y` is a no-op exit 0 if it is absent).
 COPY packages/ontology-engine/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir --upgrade pip "setuptools>=78.1.1" && \
+    pip uninstall -y msgpack
 
 # Strip the unused Pellet reasoner that owlready2 vendors. Tier-1 validation uses
 # HermiT only (sync_reasoner_hermit, see validation/validators/tier1.py); Pellet

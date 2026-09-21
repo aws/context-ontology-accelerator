@@ -1,6 +1,10 @@
 # Pin to digest to prevent supply-chain attacks via tag mutation.
-# public.ecr.aws/lambda/python:3.12 as of 2026-05-13
-FROM --platform=linux/amd64 public.ecr.aws/lambda/python:3.12@sha256:3abb572d57e4988765dbd78b72027d2979024a9b46db52cdf67d53b10987577f
+# The AWS Lambda base freezes its dnf repos to the base's build-time snapshot, so an
+# in-image `dnf upgrade` is a no-op — patch currency comes ONLY from re-resolving this
+# digest to a newer base that AWS has rebuilt. Digest re-resolved from the
+# public.ecr.aws/lambda/python:3.12 tag on 2026-09-17 to clear the AL2023 expat /
+# openssl / libtiff HIGH CVEs Trivy/Inspector flagged against the prior 2026-05-13 base.
+FROM --platform=linux/amd64 public.ecr.aws/lambda/python:3.12@sha256:f2c8de27d3a2904086d1e3db5b68e4ed9cff0f34ceab70437dc6b73a1dc4dae4
 
 # System deps: poppler for PDF text extraction, file-libs for libmagic (file type detection)
 RUN dnf install -y poppler-utils file-libs && dnf clean all
@@ -38,7 +42,13 @@ RUN pip install --no-cache-dir --root-user-action=ignore \
 COPY smithy-generated/control-plane-python-server/ /tmp/server/
 RUN pip install --no-cache-dir --root-user-action=ignore /tmp/server/ && rm -rf /tmp/server/
 COPY packages/sources/ /tmp/sources/
-RUN pip install --no-cache-dir --root-user-action=ignore /tmp/sources/ && rm -rf /tmp/sources/
+# Install the documents package, then upgrade pip to clear its own advisories.
+# Unlike the Debian service images, setuptools/msgpack are NOT bumped here: this
+# Lambda base already ships setuptools 81.x (past the CVE-2025-47273 fix), msgpack is
+# not installed, and a later-layer setuptools upgrade only adds a lower-layer scanner
+# artifact without improving the deployable image.
+RUN pip install --no-cache-dir --root-user-action=ignore /tmp/sources/ && rm -rf /tmp/sources/ && \
+    pip install --no-cache-dir --root-user-action=ignore --upgrade pip
 
 # numba's @njit(cache=True) needs a writable cache dir (/tmp is writable on Lambda)
 ENV NUMBA_CACHE_DIR=/tmp/numba_cache
