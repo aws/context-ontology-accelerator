@@ -17,6 +17,8 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 #   SCL_API_DOMAIN, SCL_API_CERT_ARN (API region), SCL_HOSTED_ZONE_ID
 # Database scan enrichment timeout (minutes; raise for very large sources):
 #   SCL_DB_SCAN_ENRICHMENT_TIMEOUT_MINUTES=180 make deploy-dev
+# Tier-1 curated metric SQL timeout (seconds; default 35):
+#   SCL_TIER1_METRIC_TIMEOUT_SECONDS=75 make deploy-dev
 # Lambda reserved concurrency (default 5; set 0 to disable reserving on
 # accounts whose Lambda concurrent-executions quota is the reduced default 10):
 #   SCL_LAMBDA_RESERVED_CONCURRENCY=0 make deploy-dev
@@ -33,31 +35,16 @@ CONTEXT="--context env=$ENV"
 [ -n "${SCL_API_CERT_ARN:-}" ]  && CONTEXT="$CONTEXT --context api_cert_arn=$SCL_API_CERT_ARN"
 [ -n "${SCL_HOSTED_ZONE_ID:-}" ] && CONTEXT="$CONTEXT --context hosted_zone_id=$SCL_HOSTED_ZONE_ID"
 [ -n "${SCL_DB_SCAN_ENRICHMENT_TIMEOUT_MINUTES:-}" ] && CONTEXT="$CONTEXT --context dbScanEnrichmentTimeoutMinutes=$SCL_DB_SCAN_ENRICHMENT_TIMEOUT_MINUTES"
+[ -n "${SCL_TIER1_METRIC_TIMEOUT_SECONDS:-}" ] && CONTEXT="$CONTEXT --context tier1_metric_timeout_s=$SCL_TIER1_METRIC_TIMEOUT_SECONDS"
 [ -n "${SCL_LAMBDA_RESERVED_CONCURRENCY:-}" ] && CONTEXT="$CONTEXT --context lambda_reserved_concurrency=$SCL_LAMBDA_RESERVED_CONCURRENCY"
 [ -n "${SCL_SMUS_ADMIN_ARNS:-}" ] && CONTEXT="$CONTEXT --context smus_admin_principal_arns=$SCL_SMUS_ADMIN_ARNS"
 
 # ── Preflight: SMUS admin principal ──────────────────────────────────────
 # NamespaceStack falls back to arn:aws:iam::<account>:role/Admin when
-# SCL_SMUS_ADMIN_ARNS is unset. That role is an Amazon-internal account
-# convention, not something AWS or this project creates, so on any other
-# account the fallback fails deploy several stacks deep (DomainLoginRole
-# CREATE_FAILED, then an orphaned DataZone domain on retry). Check it here,
-# with real credentials, before CDK ever runs.
-if [ -z "${SCL_SMUS_ADMIN_ARNS:-}" ]; then
-  ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo "")
-  ADMIN_ROLE_EXISTS=""
-  if [ -n "$ACCOUNT_ID" ]; then
-    ADMIN_ROLE_EXISTS=$(aws iam get-role --role-name Admin --query "Role.RoleName" --output text 2>/dev/null || echo "")
-  fi
-  if [ -z "$ADMIN_ROLE_EXISTS" ]; then
-    echo "ERROR: No SMUS admin principal configured, and this account has no IAM role named 'Admin' to fall back to." >&2
-    echo "Set SCL_SMUS_ADMIN_ARNS to the IAM role/user ARN(s) that human admins federate into," >&2
-    echo "e.g. for an IAM Identity Center account, your permission set's federated role:" >&2
-    echo "  SCL_SMUS_ADMIN_ARNS=arn:aws:iam::${ACCOUNT_ID:-<account>}:role/aws-reserved/sso.amazonaws.com/<region>/AWSReservedSSO_AdministratorAccess_<suffix> make deploy-dev" >&2
-    exit 1
-  fi
-  echo "No SCL_SMUS_ADMIN_ARNS set — falling back to this account's existing 'Admin' role."
-fi
+# SCL_SMUS_ADMIN_ARNS is unset. Validate the fallback before CDK runs while
+# preserving the difference between missing credentials, access denial, service
+# failure, and a confirmed NoSuchEntity result.
+"$REPO_ROOT/scripts/check-smus-admin-principal.sh"
 
 # ── Resolve VPC peering context from test-databases stack (if deployed) ──
 # Prefix default matches the CDK app (see DEFAULT_RESOURCE_PREFIX).

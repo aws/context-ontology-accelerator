@@ -467,51 +467,8 @@ list SchemaPropertyList {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// Shared Shapes — Metrics (for ListMetrics)
+// Shared Shapes — Query strategy
 // ══════════════════════════════════════════════════════════════════════════════
-/// A queryable metric with its identifier, name, description, dimensions,
-/// synonyms, and backing data source.
-structure MetricSummary {
-    /// Identifier of the metric.
-    @required
-    metricId: String
-
-    /// Human-readable name of the metric.
-    @required
-    name: String
-
-    /// Description of the metric.
-    description: String
-
-    /// Dimensions the metric can be sliced by.
-    dimensions: DimensionInfoList
-
-    /// Alternative names for the metric.
-    synonyms: StringList
-
-    /// Identifier of the data source backing the metric.
-    dataSourceId: String
-}
-
-/// A dimension a metric can be sliced by, with its name and type (e.g. time,
-/// category).
-structure DimensionInfo {
-    /// Name of the dimension.
-    @required
-    name: String
-
-    /// Type of the dimension (e.g. time, category).
-    type: String
-}
-
-list DimensionInfoList {
-    member: DimensionInfo
-}
-
-list MetricSummaryList {
-    member: MetricSummary
-}
-
 /// Which Tier-2 engine answers a structured query. Absent = the serve default
 /// (``nl_to_sql_first``).
 ///
@@ -746,45 +703,6 @@ operation GraphTraverse {
         ValidationError
         NamespaceNotFoundError
         OntologyNotPublishedError
-    ]
-}
-
-// ── ListMetrics (read-through from metric store) ─────────────────────────────
-/// List the metrics available for querying in the namespace, with their
-/// dimensions and synonyms. Read-through from the metric store.
-@readonly
-@http(method: "GET", uri: "/namespaces/{namespaceId}/metrics")
-operation ServeListMetrics {
-    input := {
-        @required
-        @httpLabel
-        namespaceId: Uuid
-
-        /// Filter metrics by status.
-        @httpQuery("status")
-        status: String
-
-        /// Maximum number of metrics to return per page.
-        @httpQuery("maxResults")
-        maxResults: Integer
-
-        /// Pagination token from a previous response.
-        @httpQuery("nextToken")
-        nextToken: String
-    }
-
-    output := {
-        /// The metrics available in the namespace.
-        @required
-        metrics: MetricSummaryList
-
-        /// Pagination token for retrieving the next page, if any.
-        nextToken: String
-    }
-
-    errors: [
-        ValidationError
-        NamespaceNotFoundError
     ]
 }
 

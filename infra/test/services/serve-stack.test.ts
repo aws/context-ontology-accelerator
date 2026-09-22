@@ -764,6 +764,26 @@ describe("ServeStack - deep-reasoning budget variables", () => {
   });
 });
 
+describe("ServeStack - Tier-1 metric timeout", () => {
+  it("passes the explicit default to the runtime", () => {
+    createStack().hasResourceProperties("AWS::BedrockAgentCore::Runtime", {
+      EnvironmentVariables: Match.objectLike({
+        TIER1_METRIC_TIMEOUT_S: "35",
+      }),
+    });
+  });
+
+  it("honours the tier1_metric_timeout_s CDK context override", () => {
+    createStack({
+      tier1_metric_timeout_s: "75",
+    }).hasResourceProperties("AWS::BedrockAgentCore::Runtime", {
+      EnvironmentVariables: Match.objectLike({
+        TIER1_METRIC_TIMEOUT_S: "75",
+      }),
+    });
+  });
+});
+
 describe("ServeStack - credential-secret namespace binding", () => {
   // JDBC credential secrets are granted to the serve runtime per secret, by a
   // resource policy whose StringLike condition matches the namespace as a whole

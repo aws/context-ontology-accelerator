@@ -7,6 +7,7 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import structlog
 from coa_serve.clients.base import QueryResult
 from coa_serve.exceptions import AccessDeniedError, NoResultError
 from coa_serve.models import InvokeRequest, InvokeResponse
@@ -52,6 +53,7 @@ def _make_orchestrator(
     return_parts=False,
     vector_client=None,
     oss_ontology_index=None,
+    tier1_metric_timeout_s=35,
 ):
     """Build orchestrator with mocked strategy tier.
 
@@ -128,6 +130,7 @@ def _make_orchestrator(
         tier2_skip_evaluator=tier2_skip_evaluator,
         vector_client=vector_client,
         oss_ontology_index=oss_ontology_index,
+        tier1_metric_timeout_s=tier1_metric_timeout_s,
     )
     if return_parts:
         return orch, {
@@ -350,6 +353,40 @@ class TestOrchestratorTier1:
         assert response.result.confidence.score == 1.0
         assert response.result.result_rows == [{"total": 42000}]
         assert response.result.query_used == "SELECT sum(amount) FROM orders"
+        assert orch._query_executor.execute.call_args.kwargs["timeout_seconds"] == 35
+
+    @pytest.mark.asyncio
+    async def test_tier1_configured_timeout_is_forwarded(self):
+        orch = _make_orchestrator(metric_found=True, tier1_metric_timeout_s=75)
+        await orch.resolve(InvokeRequest(query="What is revenue?", namespace="demo"))
+
+        assert orch._query_executor.execute.call_args.kwargs["timeout_seconds"] == 75
+
+    @pytest.mark.asyncio
+    async def test_tier1_timeout_is_clamped_to_request_deadline(self):
+        deadline = MagicMock()
+        deadline.remaining_s.return_value = 7.9
+        orch = _make_orchestrator(metric_found=True, tier1_metric_timeout_s=75)
+        await orch.resolve(
+            InvokeRequest(query="What is revenue?", namespace="demo"),
+            deadline=deadline,
+        )
+
+        assert orch._query_executor.execute.call_args.kwargs["timeout_seconds"] == 7
+
+    @pytest.mark.asyncio
+    async def test_tier1_skips_execution_when_request_deadline_is_exhausted(self):
+        deadline = MagicMock()
+        deadline.remaining_s.return_value = 0.9
+        orch = _make_orchestrator(metric_found=True)
+        response = await orch.resolve(
+            InvokeRequest(query="What is revenue?", namespace="demo"),
+            deadline=deadline,
+        )
+
+        assert response.result.tier == 2
+        orch._query_executor.execute.assert_not_awaited()
+        deadline.remaining_s.assert_called_once_with()
 
     @pytest.mark.asyncio
     async def test_multi_metric_bypasses_tier1(self):
@@ -598,10 +635,12 @@ class TestOrchestratorTier1:
         orch._query_executor.execute.side_effect = RuntimeError('relation "orders" does not exist')
 
         request = InvokeRequest(query="What is revenue?", namespace="demo")
-        with pytest.raises(DataSourceUnavailableError) as exc_info:
+        with structlog.testing.capture_logs() as logs, pytest.raises(DataSourceUnavailableError) as exc_info:
             await orch.resolve(request)
         assert "revenue" in exc_info.value.message
         assert exc_info.value.status_code == 502
+        failure = next(log for log in logs if log["event"] == "tier1_execute_failed")
+        assert failure["timeout_seconds"] == 35
 
     @pytest.mark.asyncio
     async def test_cross_namespace_sql_reference_raises_access_denied(self):
@@ -966,6 +1005,7 @@ class TestTraceCompletenessTier1:
         assert step.status == "success"
         assert step.detail  # non-empty
         assert step.detail["rowCount"] == 1  # row_count=1 from the mock
+        assert step.detail["timeoutSeconds"] == 35
         assert step.tool_used
 
 

@@ -33,6 +33,7 @@ import { Paths, fromRoot } from "../../paths";
 import { bundlePython } from "../../utils/python-bundling";
 import {
   readOpenApiSpec,
+  mergeOpenApiPaths,
   injectLambdaProxyIntegrations,
   fillAuthorizerParameters,
   PathLambdaMap,
@@ -320,26 +321,15 @@ export class ApiStack extends SCLStack {
     // ── Build unified OpenAPI spec ─────────────────────────────────
     // The API Gateway serves two Smithy services (control-plane + data-layer)
     // via one REST API. Merge their generated specs at deploy time.
-    // Method-level merge ensures paths shared by both specs (e.g. /metrics)
-    // retain all methods from both.
+    // The merge is per method, so a path may take methods from both specs; it
+    // throws if both define the SAME path+method (see mergeOpenApiPaths).
     const spec = readOpenApiSpec(Paths.controlPlaneOpenApiSpec, {
       CorsOrigin: props.allowedOrigin,
     });
     const dataLayerSpec = readOpenApiSpec(Paths.dataLayerOpenApiSpec, {
       CorsOrigin: props.allowedOrigin,
     });
-    const dataLayerPaths: Record<
-      string,
-      Record<string, unknown>
-    > = dataLayerSpec.paths ?? {};
-    for (const [path, methods] of Object.entries(dataLayerPaths)) {
-      if (spec.paths?.[path]) {
-        spec.paths[path] = { ...spec.paths[path], ...methods };
-      } else {
-        spec.paths = spec.paths ?? {};
-        spec.paths[path] = methods;
-      }
-    }
+    mergeOpenApiPaths(spec, dataLayerSpec);
     if (dataLayerSpec.components?.schemas) {
       spec.components = spec.components ?? {};
       spec.components.schemas = {

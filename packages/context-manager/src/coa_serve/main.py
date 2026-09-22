@@ -387,6 +387,7 @@ async def _ensure_initialized():
             oss_ontology_index=oss_ontology_index,
             agentic_retriever=agentic_retriever,
             tier3_deep_reasoning_default=(config.tier3_strategy == "deep-reasoning"),
+            tier1_metric_timeout_s=config.tier1_metric_timeout_s,
         )
         _config = config
         logger.info(

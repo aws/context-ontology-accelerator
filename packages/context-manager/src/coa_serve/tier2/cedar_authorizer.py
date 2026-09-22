@@ -43,6 +43,7 @@ from typing import Any, Protocol, runtime_checkable
 
 import structlog
 from coa_authorization.policy_evaluator import evaluate, load_seed_policies
+from coa_common import sync_boto_config
 from coa_common.dao import DynamoDBDAO
 
 logger = structlog.get_logger(__name__)
@@ -132,7 +133,10 @@ class _DdbPolicyLoader:
     """
 
     def __init__(self, table_name: str, region: str):
-        self._dao = DynamoDBDAO(table_name, region=region)
+        # Authorization is on the synchronous customer request path. Opt into
+        # the fail-fast profile instead of inheriting the DAO's background
+        # 30-second/three-attempt default.
+        self._dao = DynamoDBDAO(table_name, region=region, config=sync_boto_config())
         self._cache: dict[frozenset[str], tuple[float, str]] = {}
 
     def policies_for_roles(self, role_ids: set[str]) -> str | None:
