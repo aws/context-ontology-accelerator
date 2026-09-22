@@ -34,7 +34,9 @@ RUN pip install --no-cache-dir uv && \
     sed -i '/\[tool.uv.sources\]/,$ d' pyproject.toml && \
     sed -i '/\[tool.uv.sources\]/,$ d' /tmp/mcp-server/pyproject.toml && \
     uv pip install --system --no-cache . /tmp/mcp-server/ && \
-    rm -rf /tmp/mcp-server/
+    rm -rf /tmp/mcp-server/ && \
+    pip install --no-cache-dir --upgrade pip "setuptools>=78.1.1" && \
+    pip uninstall -y msgpack
 
 EXPOSE 8080
 

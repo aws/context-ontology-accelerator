@@ -83,8 +83,11 @@ _SCHEMA_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
 _firewall = SQLFirewall()
 
 
-def _resolve_search_path(item: dict[str, Any], config: dict[str, Any]) -> str:
+def _resolve_search_path(item: dict[str, Any], config: dict[str, Any], engine_type: str) -> str:
     """Resolve the search_path schema(s) for a JDBC source (PostgreSQL/Redshift).
+
+    Engines without a search_path concept receive an empty value and do not
+    apply PostgreSQL identifier rules to their metadata.
 
     Priority:
       1. ``discoveredSchemas`` (authoritative — the schemas the scan found and
@@ -94,14 +97,25 @@ def _resolve_search_path(item: dict[str, Any], config: dict[str, Any]) -> str:
          plain identifier (a glob is rejected downstream and skipped).
       3. ``public`` — default.
 
-    Only valid identifiers are kept; anything else is dropped. Engines without a
-    search_path concept (MySQL/SQL Server) ignore the returned value.
+    Every discovered schema must be a valid identifier. Reject corrupted or
+    partially valid metadata instead of silently changing the authoritative
+    search path.
     """
-    discovered = item.get("discoveredSchemas") or []
-    valid = [s for s in discovered if isinstance(s, str) and _SCHEMA_IDENTIFIER_PATTERN.match(s)]
-    if valid:
-        return ", ".join(valid)
-    return config.get("schemaFilter") or config.get("schemaName") or "public"
+    if engine_type not in {"POSTGRESQL", "REDSHIFT"}:
+        return ""
+
+    discovered = item.get("discoveredSchemas")
+    if discovered is not None and not isinstance(discovered, list):
+        raise ValueError("discoveredSchemas must be a list of schema identifiers")
+    discovered = discovered or []
+    if discovered:
+        if any(not isinstance(schema, str) or not _SCHEMA_IDENTIFIER_PATTERN.match(schema) for schema in discovered):
+            raise ValueError("discoveredSchemas contains an invalid schema identifier")
+        return ", ".join(discovered)
+    fallback = config.get("schemaFilter") or config.get("schemaName") or "public"
+    if not isinstance(fallback, str):
+        raise ValueError("configured schema must be a string")
+    return fallback
 
 
 class SourceDBQueryExecutor:
@@ -350,6 +364,7 @@ class SourceDBQueryExecutor:
         if not _SECRET_ARN_PATTERN.match(secret_arn):
             raise ValueError(f"Invalid secret ARN format for {namespace}/{data_source_id}")
 
+        schema = _resolve_search_path(item, config, engine_type)
         secret_response = await loop.run_in_executor(
             _EXECUTOR,
             lambda arn=secret_arn: self._secrets.get_secret_value(SecretId=arn),
@@ -363,7 +378,7 @@ class SourceDBQueryExecutor:
                 host=host,
                 port=int(port),
                 database=database,
-                schema=_resolve_search_path(item, config),
+                schema=schema,
                 engine_type=engine_type,
             )
         except (json.JSONDecodeError, KeyError, ValueError):

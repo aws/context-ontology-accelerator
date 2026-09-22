@@ -31,15 +31,10 @@ else
   err "Node not found. Install via 'mise install' (see .mise.toml) or https://mise.run"
 fi
 
-if command -v java >/dev/null 2>&1; then
-  JAVA_VER=$(java -version 2>&1 | head -1 | awk -F '"' '{print $2}' | cut -d. -f1)
-  if [ "$JAVA_VER" -ge 17 ]; then
-    ok "Java $JAVA_VER found"
-  else
-    err "Java 17+ required (found $JAVA_VER). Run: mise install"
-  fi
+if JAVA_CHECK="$("$REPO_ROOT/scripts/check-java-version.sh")"; then
+  ok "$JAVA_CHECK"
 else
-  err "Java not found — required for Smithy code generation. Run: mise install"
+  err "$JAVA_CHECK"
 fi
 
 if command -v pnpm >/dev/null 2>&1; then

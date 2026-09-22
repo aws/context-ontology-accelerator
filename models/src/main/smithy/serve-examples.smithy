@@ -117,29 +117,6 @@ apply GraphTraverse @examples([
     }
 ])
 
-apply ServeListMetrics @examples([
-    {
-        title: "List queryable metrics"
-        input: { namespaceId: "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d", status: "ACTIVE", maxResults: 20 }
-        output: {
-            metrics: [
-                {
-                    metricId: "m-revenue"
-                    name: "total_revenue"
-                    description: "Sum of net revenue across orders"
-                    dimensions: [
-                        {
-                            name: "period"
-                            type: "time"
-                        }
-                    ]
-                    synonyms: ["revenue", "sales"]
-                }
-            ]
-        }
-    }
-])
-
 apply DescribeSchema @examples([
     {
         title: "Describe the queryable schema"

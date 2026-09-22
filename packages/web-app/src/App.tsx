@@ -1,12 +1,14 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { Routes, Route, useNavigate, useLocation } from "react-router-dom";
 import AppLayout from "@cloudscape-design/components/app-layout-toolbar";
 import Flashbar from "@cloudscape-design/components/flashbar";
 import SideNavigation from "@cloudscape-design/components/side-navigation";
-import TopNavigation from "@cloudscape-design/components/top-navigation";
+import TopNavigation, {
+  type TopNavigationProps,
+} from "@cloudscape-design/components/top-navigation";
 import SplitPanel from "@cloudscape-design/components/split-panel";
 import {
   applyMode,
@@ -246,6 +248,135 @@ function AppShell() {
   const effectiveCrumbs =
     breadcrumbItems.length > 0 ? breadcrumbItems : routeDefaultCrumbs;
 
+  // Cloudscape's TopNavigation re-measures itself (and can loop into React's
+  // "maximum update depth" guard) whenever the `utilities` prop changes
+  // identity. Keep the array stable across AppShell re-renders.
+  const topNavUtilities: TopNavigationProps["utilities"] = useMemo(
+    () => [
+      // The namespace switcher only makes sense once the user has
+      // navigated _into_ a namespace-scoped section. On the namespace
+      // list and create routes there is no "current" namespace, and
+      // surfacing the dropdown there confuses users into thinking
+      // they are viewing a namespace nested inside another. Hide it
+      // there to match the side-nav, which is also empty on those
+      // routes.
+      ...(isNamespaceListRoute
+        ? []
+        : [
+            {
+              type: "menu-dropdown" as const,
+              text: `Namespace: ${isLoading ? "Loading…" : (current?.displayName ?? current?.name ?? "—")}`,
+              ariaLabel: "Namespace switcher",
+              title: "Namespace",
+              onItemClick: ({ detail }: { detail: { id: string } }) =>
+                setNamespace(detail.id),
+              items:
+                namespaces.length > 0
+                  ? [...namespaces]
+                      .sort((a, b) =>
+                        (a.displayName ?? a.name ?? "").localeCompare(
+                          b.displayName ?? b.name ?? "",
+                          undefined,
+                          { sensitivity: "base" },
+                        ),
+                      )
+                      .map((n) => ({
+                        id: n.namespaceId!,
+                        text: n.displayName ?? n.name ?? "",
+                      }))
+                  : [
+                      {
+                        id: "none",
+                        text: "No namespaces — create one first",
+                        disabled: true,
+                      },
+                    ],
+            },
+          ]),
+      {
+        type: "button",
+        iconSvg: React.createElement(
+          "svg",
+          { viewBox: "0 0 16 16", xmlns: "http://www.w3.org/2000/svg" },
+          React.createElement("circle", {
+            cx: 8,
+            cy: 8,
+            r: 5.5,
+            fill: "none",
+            stroke: "currentColor",
+            strokeWidth: 1.5,
+          }),
+          React.createElement("path", {
+            d: "M8 2.5v11A5.5 5.5 0 0 1 8 2.5z",
+            fill: "currentColor",
+          }),
+        ),
+        ariaLabel: darkMode ? "Switch to light mode" : "Switch to dark mode",
+        title: darkMode ? "Light mode" : "Dark mode",
+        onClick: () => {
+          const next = !darkMode;
+          setDarkMode(next);
+          applyMode(next ? Mode.Dark : Mode.Light);
+        },
+      },
+      {
+        type: "menu-dropdown",
+        iconName: "settings",
+        ariaLabel: "Settings",
+        title: "Settings",
+        onItemClick: ({ detail }) => {
+          if (detail.id === "theme") {
+            setDarkMode((prev) => !prev);
+          } else if (detail.id === "density") {
+            setDensityCompact((prev) => !prev);
+          }
+        },
+        items: [
+          {
+            id: "density",
+            text: densityCompact
+              ? "Switch to comfortable density"
+              : "Switch to compact density",
+          },
+          {
+            id: "theme",
+            text: darkMode ? "Switch to light mode" : "Switch to dark mode",
+          },
+        ],
+      },
+      {
+        type: "menu-dropdown",
+        text: user?.email || "",
+        iconName: "user-profile",
+        ariaLabel: "User menu",
+        items: [
+          { id: "profile", text: "Profile" },
+          { id: "signout", text: "Sign out" },
+        ],
+        onItemClick: ({ detail }) => {
+          if (detail.id === "profile") {
+            navigate("/profile");
+          } else if (detail.id === "signout") {
+            logout().catch((err) => console.error("Logout failed:", err));
+          }
+        },
+      },
+    ],
+    [
+      isNamespaceListRoute,
+      isLoading,
+      current?.displayName,
+      current?.name,
+      namespaces,
+      setNamespace,
+      darkMode,
+      densityCompact,
+      user?.email,
+      navigate,
+      logout,
+    ],
+  );
+
   return (
     <>
       <div id="top-nav" style={{ position: "sticky", top: 0, zIndex: 1001 }}>
@@ -259,120 +390,7 @@ function AppShell() {
               navigate("/");
             },
           }}
-          utilities={[
-            // The namespace switcher only makes sense once the user has
-            // navigated _into_ a namespace-scoped section. On the namespace
-            // list and create routes there is no "current" namespace, and
-            // surfacing the dropdown there confuses users into thinking
-            // they are viewing a namespace nested inside another. Hide it
-            // there to match the side-nav, which is also empty on those
-            // routes.
-            ...(isNamespaceListRoute
-              ? []
-              : [
-                  {
-                    type: "menu-dropdown" as const,
-                    text: `Namespace: ${isLoading ? "Loading…" : (current?.displayName ?? current?.name ?? "—")}`,
-                    ariaLabel: "Namespace switcher",
-                    title: "Namespace",
-                    onItemClick: ({ detail }: { detail: { id: string } }) =>
-                      setNamespace(detail.id),
-                    items:
-                      namespaces.length > 0
-                        ? [...namespaces]
-                            .sort((a, b) =>
-                              (a.displayName ?? a.name ?? "").localeCompare(
-                                b.displayName ?? b.name ?? "",
-                                undefined,
-                                { sensitivity: "base" },
-                              ),
-                            )
-                            .map((n) => ({
-                              id: n.namespaceId!,
-                              text: n.displayName ?? n.name ?? "",
-                            }))
-                        : [
-                            {
-                              id: "none",
-                              text: "No namespaces — create one first",
-                              disabled: true,
-                            },
-                          ],
-                  },
-                ]),
-            {
-              type: "button",
-              iconSvg: React.createElement(
-                "svg",
-                { viewBox: "0 0 16 16", xmlns: "http://www.w3.org/2000/svg" },
-                React.createElement("circle", {
-                  cx: 8,
-                  cy: 8,
-                  r: 5.5,
-                  fill: "none",
-                  stroke: "currentColor",
-                  strokeWidth: 1.5,
-                }),
-                React.createElement("path", {
-                  d: "M8 2.5v11A5.5 5.5 0 0 1 8 2.5z",
-                  fill: "currentColor",
-                }),
-              ),
-              ariaLabel: darkMode
-                ? "Switch to light mode"
-                : "Switch to dark mode",
-              title: darkMode ? "Light mode" : "Dark mode",
-              onClick: () => {
-                const next = !darkMode;
-                setDarkMode(next);
-                applyMode(next ? Mode.Dark : Mode.Light);
-              },
-            },
-            {
-              type: "menu-dropdown",
-              iconName: "settings",
-              ariaLabel: "Settings",
-              title: "Settings",
-              onItemClick: ({ detail }) => {
-                if (detail.id === "theme") {
-                  setDarkMode((prev) => !prev);
-                } else if (detail.id === "density") {
-                  setDensityCompact((prev) => !prev);
-                }
-              },
-              items: [
-                {
-                  id: "density",
-                  text: densityCompact
-                    ? "Switch to comfortable density"
-                    : "Switch to compact density",
-                },
-                {
-                  id: "theme",
-                  text: darkMode
-                    ? "Switch to light mode"
-                    : "Switch to dark mode",
-                },
-              ],
-            },
-            {
-              type: "menu-dropdown",
-              text: user?.email || "",
-              iconName: "user-profile",
-              ariaLabel: "User menu",
-              items: [
-                { id: "profile", text: "Profile" },
-                { id: "signout", text: "Sign out" },
-              ],
-              onItemClick: ({ detail }) => {
-                if (detail.id === "profile") {
-                  navigate("/profile");
-                } else if (detail.id === "signout") {
-                  logout().catch((err) => console.error("Logout failed:", err));
-                }
-              },
-            },
-          ]}
+          utilities={topNavUtilities}
         />
       </div>
       <AppLayout

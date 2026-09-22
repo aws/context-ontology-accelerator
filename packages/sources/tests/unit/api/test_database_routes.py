@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import os
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, call, create_autospec, patch
 
 import pytest
 from botocore.exceptions import ClientError
@@ -3600,10 +3600,20 @@ def _mock_single_asset_load(
     asset = MagicMock()
     asset.name = asset_name
     asset.asset_id = f"asset-{table_id}"
-    smus_mock.find_asset_by_name.return_value = asset
-    smus_mock.search_assets.return_value = MagicMock(items=[asset], next_token=None)
-    smus_mock.get_asset_forms.return_value = {
-        "formsOutput": [{"formName": "CoaTableMetadata", "content": form_content}]
+    catalog = smus_mock.__dict__.setdefault("_coa_test_table_catalog", {})
+    catalog[asset_name] = (asset, form_content)
+    smus_mock.find_asset_by_name.side_effect = lambda *, name, **_: catalog[name][0] if name in catalog else None
+    smus_mock.search_assets.return_value = MagicMock(
+        items=[catalog_item[0] for catalog_item in catalog.values()],
+        next_token=None,
+    )
+    smus_mock.get_asset_forms.side_effect = lambda *, asset_id: {
+        "formsOutput": [
+            {
+                "formName": "CoaTableMetadata",
+                "content": next(content for found, content in catalog.values() if found.asset_id == asset_id),
+            }
+        ]
     }
     smus_mock.create_asset_revision.return_value = MagicMock(asset_id=asset.asset_id)
 
@@ -3619,13 +3629,14 @@ def _review_env():
     """
     mock_ns_dao = MagicMock()
     mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
-    mock_smus = MagicMock()
+    mock_smus = create_autospec(_dr.SMUSClient, instance=True)
     mock_dao = MagicMock()
     mock_dao.get.return_value = {
         "PK": f"NS#{_NAMESPACE_ID}",
         "SK": f"SRC#{_SOURCE_ID}",
         "sourceType": "DATABASE",
         "status": "PENDING_REVIEW",
+        "discoveredSchemas": ["crm", "sales"],
     }
     with (
         patch(f"{_DR}._SMUS_DOMAIN_ID", "domain-id"),
@@ -4820,18 +4831,52 @@ class TestUpdateTableKeys:
 
     def test_unchanged_foreign_key_kept_only_edited_one_marked_steward(self, _review_env):
         _mock_single_asset_load(_review_env["smus"], table_id=self._TABLE_ID, form_content=self._form_with_keys())
+        _mock_single_asset_load(
+            _review_env["smus"],
+            table_id="sales.customers",
+            form_content=_serialize_table(table_name="customers", columns=[{"name": "id"}]),
+        )
         # Re-send the existing FK unchanged plus one new FK (simulates the UI
         # sending the full list when only adding one).
         body = {
             "foreignKeys": [
                 {"column": "col_a", "targetTable": "customers", "targetColumn": "id"},
-                {"column": "col_b", "targetTable": "orders", "targetColumn": "id"},
+                {"column": "col_b", "targetTable": "orders", "targetColumn": "col_a"},
             ]
         }
         status, _ = _parse(_dr._handle_update_table_keys(self._event(body), _NAMESPACE_ID, _SOURCE_ID, self._TABLE_ID))
         assert status == 200
         by_col = {fk.column: fk.source for fk in self._written_table(_review_env).foreign_keys}
         assert by_col == {"col_a": "DETERMINISTIC", "col_b": "STEWARD_SPECIFIED"}
+
+    def test_unchanged_ambiguous_bare_foreign_key_does_not_block_primary_key_edit(self, _review_env):
+        smus = _review_env["smus"]
+        _mock_single_asset_load(smus, table_id=self._TABLE_ID, form_content=self._form_with_keys())
+        for database in ("sales", "crm"):
+            _mock_single_asset_load(
+                smus,
+                table_id=f"{database}.customers",
+                form_content=_serialize_table(
+                    table_name="customers",
+                    database=database,
+                    columns=[{"name": "id"}],
+                ),
+            )
+        body = {
+            "primaryKey": {"columns": ["col_b"]},
+            "foreignKeys": [{"column": "col_a", "targetTable": "customers", "targetColumn": "id"}],
+        }
+
+        status, _ = _parse(_dr._handle_update_table_keys(self._event(body), _NAMESPACE_ID, _SOURCE_ID, self._TABLE_ID))
+
+        assert status == 200
+        table = self._written_table(_review_env)
+        assert table.primary_key.columns == ["col_b"]
+        assert table.foreign_keys[0].source == "DETERMINISTIC"
+        smus.search_assets.assert_not_called()
+        assert [call.kwargs["name"] for call in smus.find_asset_by_name.call_args_list] == [
+            f"DS#{_SOURCE_ID}:{self._TABLE_ID}"
+        ]
 
     def test_unknown_primary_key_column_returns_400(self, _review_env):
         _mock_single_asset_load(_review_env["smus"], table_id=self._TABLE_ID, form_content=_serialize_table())
@@ -4845,6 +4890,11 @@ class TestUpdateTableKeys:
 
     def test_set_foreign_keys_marks_steward_specified(self, _review_env):
         _mock_single_asset_load(_review_env["smus"], table_id=self._TABLE_ID, form_content=_serialize_table())
+        _mock_single_asset_load(
+            _review_env["smus"],
+            table_id="sales.customers",
+            form_content=_serialize_table(table_name="customers", columns=[{"name": "id"}]),
+        )
         body = {"foreignKeys": [{"column": "col_a", "targetTable": "customers", "targetColumn": "id"}]}
         status, _ = _parse(_dr._handle_update_table_keys(self._event(body), _NAMESPACE_ID, _SOURCE_ID, self._TABLE_ID))
         assert status == 200
@@ -4865,6 +4915,180 @@ class TestUpdateTableKeys:
         body = {"foreignKeys": [{"column": "col_a"}]}
         status, _ = _parse(_dr._handle_update_table_keys(self._event(body), _NAMESPACE_ID, _SOURCE_ID, self._TABLE_ID))
         assert status == 400
+
+    @pytest.mark.parametrize(
+        "foreign_key",
+        [
+            {"column": ["col_a"], "targetTable": "customers"},
+            {"column": "col_a", "targetTable": ["customers"]},
+            {"column": "col_a", "targetTable": "customers", "targetColumn": ["id"]},
+        ],
+    )
+    def test_foreign_key_non_string_fields_return_400(self, _review_env, foreign_key):
+        _mock_single_asset_load(_review_env["smus"], table_id=self._TABLE_ID, form_content=_serialize_table())
+        status, _ = _parse(
+            _dr._handle_update_table_keys(
+                self._event({"foreignKeys": [foreign_key]}),
+                _NAMESPACE_ID,
+                _SOURCE_ID,
+                self._TABLE_ID,
+            )
+        )
+        assert status == 400
+        _review_env["smus"].create_asset_revision.assert_not_called()
+
+    def test_foreign_key_unknown_target_table_returns_400(self, _review_env):
+        _mock_single_asset_load(_review_env["smus"], table_id=self._TABLE_ID, form_content=_serialize_table())
+        body = {"foreignKeys": [{"column": "col_a", "targetTable": "sales.missing_table", "targetColumn": "id"}]}
+        status, response = _parse(
+            _dr._handle_update_table_keys(self._event(body), _NAMESPACE_ID, _SOURCE_ID, self._TABLE_ID)
+        )
+        assert status == 400
+        assert "sales.missing_table" in response["error"]
+        _review_env["smus"].create_asset_revision.assert_not_called()
+
+    def test_foreign_key_unknown_target_column_returns_400(self, _review_env):
+        _mock_single_asset_load(_review_env["smus"], table_id=self._TABLE_ID, form_content=_serialize_table())
+        _mock_single_asset_load(
+            _review_env["smus"],
+            table_id="sales.customers",
+            form_content=_serialize_table(table_name="customers", columns=[{"name": "id"}]),
+        )
+        body = {
+            "foreignKeys": [
+                {
+                    "column": "col_a",
+                    "targetTable": "sales.customers",
+                    "targetColumn": "missing_column",
+                }
+            ]
+        }
+        status, response = _parse(
+            _dr._handle_update_table_keys(self._event(body), _NAMESPACE_ID, _SOURCE_ID, self._TABLE_ID)
+        )
+        assert status == 400
+        assert "missing_column" in response["error"]
+        _review_env["smus"].create_asset_revision.assert_not_called()
+
+    def test_foreign_key_ambiguous_bare_target_returns_400(self, _review_env):
+        _mock_single_asset_load(_review_env["smus"], table_id=self._TABLE_ID, form_content=_serialize_table())
+        for database in ("sales", "crm"):
+            _mock_single_asset_load(
+                _review_env["smus"],
+                table_id=f"{database}.customers",
+                form_content=_serialize_table(
+                    table_name="customers",
+                    database=database,
+                    columns=[{"name": "id"}],
+                ),
+            )
+        body = {"foreignKeys": [{"column": "col_a", "targetTable": "customers", "targetColumn": "id"}]}
+        status, response = _parse(
+            _dr._handle_update_table_keys(self._event(body), _NAMESPACE_ID, _SOURCE_ID, self._TABLE_ID)
+        )
+        assert status == 400
+        assert "Ambiguous" in response["error"]
+        _review_env["smus"].create_asset_revision.assert_not_called()
+
+    def test_foreign_key_unique_bare_target_in_other_database_is_valid(self, _review_env):
+        _mock_single_asset_load(_review_env["smus"], table_id=self._TABLE_ID, form_content=_serialize_table())
+        _mock_single_asset_load(
+            _review_env["smus"],
+            table_id="crm.customers",
+            form_content=_serialize_table(
+                table_name="customers",
+                database="crm",
+                columns=[{"name": "id"}],
+            ),
+        )
+        body = {"foreignKeys": [{"column": "col_a", "targetTable": "customers", "targetColumn": "id"}]}
+        status, _ = _parse(_dr._handle_update_table_keys(self._event(body), _NAMESPACE_ID, _SOURCE_ID, self._TABLE_ID))
+        assert status == 200
+        assert self._written_table(_review_env).foreign_keys[0].target_table == "customers"
+
+    def test_foreign_key_bare_target_uses_schema_index_and_reuses_matched_asset(self, _review_env):
+        smus = _review_env["smus"]
+        _mock_single_asset_load(smus, table_id=self._TABLE_ID, form_content=_serialize_table())
+        _mock_single_asset_load(
+            smus,
+            table_id="crm.customers",
+            form_content=_serialize_table(
+                table_name="customers",
+                database="crm",
+                columns=[{"name": "id"}],
+            ),
+        )
+
+        body = {"foreignKeys": [{"column": "col_a", "targetTable": "customers", "targetColumn": "id"}]}
+        status, _ = _parse(_dr._handle_update_table_keys(self._event(body), _NAMESPACE_ID, _SOURCE_ID, self._TABLE_ID))
+
+        assert status == 200
+        smus.search_assets.assert_not_called()
+        names = [call.kwargs["name"] for call in smus.find_asset_by_name.call_args_list]
+        assert names == [
+            f"DS#{_SOURCE_ID}:{self._TABLE_ID}",
+            f"DS#{_SOURCE_ID}:crm.customers",
+            f"DS#{_SOURCE_ID}:sales.customers",
+        ]
+        assert names.count(f"DS#{_SOURCE_ID}:crm.customers") == 1
+        assert smus.get_asset_forms.call_count == 2
+
+    def test_foreign_key_bare_target_catalog_failure_returns_500(self, _review_env):
+        smus = _review_env["smus"]
+        _mock_single_asset_load(smus, table_id=self._TABLE_ID, form_content=_serialize_table())
+        catalog = smus.__dict__["_coa_test_table_catalog"]
+
+        def _find_asset(*, name, **_):
+            if name.endswith(":crm.customers"):
+                raise RuntimeError("catalog unavailable")
+            return catalog[name][0] if name in catalog else None
+
+        smus.find_asset_by_name.side_effect = _find_asset
+
+        body = {"foreignKeys": [{"column": "col_a", "targetTable": "customers", "targetColumn": "id"}]}
+        status, _ = _parse(_dr._handle_update_table_keys(self._event(body), _NAMESPACE_ID, _SOURCE_ID, self._TABLE_ID))
+
+        assert status == 500
+        smus.create_asset_revision.assert_not_called()
+
+    def test_foreign_key_bare_target_without_schema_index_returns_500(self, _review_env):
+        smus = _review_env["smus"]
+        _review_env["dao"].get.return_value.pop("discoveredSchemas")
+        _mock_single_asset_load(smus, table_id=self._TABLE_ID, form_content=_serialize_table())
+
+        body = {"foreignKeys": [{"column": "col_a", "targetTable": "customers", "targetColumn": "id"}]}
+        status, response = _parse(
+            _dr._handle_update_table_keys(self._event(body), _NAMESPACE_ID, _SOURCE_ID, self._TABLE_ID)
+        )
+
+        assert status == 500
+        assert "schema index" in response["error"]
+        smus.create_asset_revision.assert_not_called()
+
+    def test_foreign_key_qualified_target_lookup_failure_returns_500(self, _review_env):
+        smus = _review_env["smus"]
+        _mock_single_asset_load(smus, table_id=self._TABLE_ID, form_content=_serialize_table())
+        catalog = smus.__dict__["_coa_test_table_catalog"]
+
+        def _find_asset(*, name, **_):
+            if name == f"DS#{_SOURCE_ID}:sales.customers":
+                raise RuntimeError("catalog unavailable")
+            return catalog[name][0] if name in catalog else None
+
+        smus.find_asset_by_name.side_effect = _find_asset
+        body = {
+            "foreignKeys": [
+                {
+                    "column": "col_a",
+                    "targetTable": "sales.customers",
+                    "targetColumn": "id",
+                }
+            ]
+        }
+        status, _ = _parse(_dr._handle_update_table_keys(self._event(body), _NAMESPACE_ID, _SOURCE_ID, self._TABLE_ID))
+
+        assert status == 500
+        smus.create_asset_revision.assert_not_called()
 
 
 # ===================================================================

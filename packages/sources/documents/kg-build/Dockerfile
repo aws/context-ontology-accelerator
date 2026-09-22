@@ -33,9 +33,15 @@ RUN pip install --no-cache-dir /tmp/server/ && rm -rf /tmp/server/
 COPY packages/sources/documents/kg-build/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install the documents package
+# Install the documents package, then remediate scanner findings in the SAME final layer:
+# upgrade pip + setuptools (CVE-2025-47273; build toolchain, not a declared dep;
+# unconstrained — does not touch the boto3/botocore cap above), and REMOVE msgpack — an
+# orphan that nothing imports or declares (verified via grep + pipdeptree --reverse),
+# pulled in transiently and left behind. `pip uninstall -y` is a no-op exit 0 if absent.
 COPY packages/sources/ /tmp/sources/
-RUN pip install --no-cache-dir /tmp/sources/ && rm -rf /tmp/sources/
+RUN pip install --no-cache-dir /tmp/sources/ && rm -rf /tmp/sources/ && \
+    pip install --no-cache-dir --upgrade pip "setuptools>=78.1.1" && \
+    pip uninstall -y msgpack
 
 USER appuser
 CMD ["python", "-m", "coa_sources.documents.kg_build.graph_build"]

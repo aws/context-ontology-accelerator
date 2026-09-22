@@ -21,7 +21,6 @@ with patch.dict(
         "AWS_REGION": "us-east-1",
         "ALLOWED_ORIGIN": "https://app.example.com",
         "ONTOLOGY_PROXY_LAMBDA_ARN": "arn:aws:lambda:us-east-1:123456789012:function:test-ontology-proxy",
-        "METRIC_SERVICE_LAMBDA_ARN": "arn:aws:lambda:us-east-1:123456789012:function:test-metric-service",
     },
 ):
     from coa_data_layer import handler as handler_module
@@ -151,7 +150,6 @@ class TestCorsHeaders:
             "AGENTCORE_RUNTIME_ARN": "arn:test",
             "AWS_REGION": "us-east-1",
             "ONTOLOGY_PROXY_LAMBDA_ARN": "arn:aws:lambda:us-east-1:123456789012:function:test-ontology-proxy",
-            "METRIC_SERVICE_LAMBDA_ARN": "arn:aws:lambda:us-east-1:123456789012:function:test-metric-service",
         }
         with patch.dict("os.environ", env, clear=True):
             import importlib
@@ -827,176 +825,6 @@ class TestDescribeSchema:
         assert "arn:aws:iam" not in body_text
         assert "handler.py" not in body_text
         assert "RuntimeError" not in body_text
-
-
-@pytest.mark.unit
-class TestListMetrics:
-    """GET /namespaces/{ns}/metrics proxies to the metric-service Lambda.
-
-    Same rationale as DescribeSchema: pure catalog read, no tier orchestration,
-    both surfaces (UI/data-layer and MCP ``discovery.list_metrics``) must return
-    the same body for the same input.
-    """
-
-    def _fake_proxy_response(self, body: dict, status: int = 200) -> dict:
-        """Shape a synthetic Lambda invoke response with an API GW proxy body."""
-        return {
-            "StatusCode": 200,
-            "Payload": io.BytesIO(
-                json.dumps(
-                    {
-                        "statusCode": status,
-                        "body": json.dumps(body),
-                        "headers": {},
-                    }
-                ).encode("utf-8")
-            ),
-        }
-
-    def test_returns_metrics_from_service(self):
-        proxy_body = {
-            "metrics": [
-                {"metricId": "m1", "name": "Revenue", "description": "Total revenue"},
-                {"metricId": "m2", "name": "Churn", "description": "Monthly churn"},
-            ],
-            "nextToken": None,
-        }
-        mock_client = MagicMock()
-        mock_client.invoke.return_value = self._fake_proxy_response(proxy_body)
-        with patch.object(handler_module, "_get_lambda_client", return_value=mock_client):
-            event = _api_event("GET", "/namespaces/{namespaceId}/metrics", body=None)
-            result = handler(event, None)
-        assert result["statusCode"] == 200
-        body = json.loads(result["body"])
-        assert body["metrics"] == proxy_body["metrics"]
-        assert body["nextToken"] is None
-
-    def test_forwards_camelcase_query_params_verbatim(self):
-        """The metric-service Lambda expects the Smithy camelCase names —
-        ``maxResults`` and ``nextToken`` — passed through unchanged.
-
-        ``status`` is intentionally NOT forwarded: the Smithy contract
-        declares it but the metric-service backend does not filter on it
-        today, so forwarding would make an unfiltered response look filtered.
-        This test sends ``status`` in the incoming request and pins that
-        it does not reach the backend, so a future revert of the drop
-        surfaces here rather than as a silent-wrong-answer bug (MR !939
-        comment ``b6dea1de``).
-        """
-        mock_client = MagicMock()
-        mock_client.invoke.return_value = self._fake_proxy_response({"metrics": [], "nextToken": None})
-        with patch.object(handler_module, "_get_lambda_client", return_value=mock_client):
-            event = _api_event("GET", "/namespaces/{namespaceId}/metrics", body=None)
-            event["queryStringParameters"] = {
-                "maxResults": "50",
-                "nextToken": "opaque-cursor",
-                "status": "ACTIVE",
-            }
-            handler(event, None)
-        forwarded = json.loads(mock_client.invoke.call_args.kwargs["Payload"].decode())
-        assert forwarded["queryStringParameters"] == {
-            "maxResults": "50",
-            "nextToken": "opaque-cursor",
-        }
-        assert forwarded["resource"] == "/namespaces/{namespaceId}/metrics"
-
-    def test_bearer_token_forwarded(self):
-        mock_client = MagicMock()
-        mock_client.invoke.return_value = self._fake_proxy_response({"metrics": [], "nextToken": None})
-        with patch.object(handler_module, "_get_lambda_client", return_value=mock_client):
-            event = _api_event("GET", "/namespaces/{namespaceId}/metrics", body=None)
-            event["headers"] = {"Authorization": "Bearer forwarded-token"}
-            handler(event, None)
-        forwarded = json.loads(mock_client.invoke.call_args.kwargs["Payload"].decode())
-        assert forwarded["headers"]["Authorization"] == "Bearer forwarded-token"
-
-    def test_missing_env_var_returns_501(self):
-        with patch.object(handler_module, "METRIC_SERVICE_LAMBDA_ARN", ""):
-            event = _api_event("GET", "/namespaces/{namespaceId}/metrics", body=None)
-            result = handler(event, None)
-        assert result["statusCode"] == 501
-        assert "METRIC_SERVICE_LAMBDA_ARN" in result["body"]
-
-    def test_proxy_error_status_propagates(self):
-        proxy_body = {"message": "namespace not found"}
-        mock_client = MagicMock()
-        mock_client.invoke.return_value = self._fake_proxy_response(proxy_body, status=404)
-        with patch.object(handler_module, "_get_lambda_client", return_value=mock_client):
-            event = _api_event("GET", "/namespaces/{namespaceId}/metrics", body=None)
-            result = handler(event, None)
-        assert result["statusCode"] == 404
-        assert "namespace not found" in result["body"]
-
-    def test_client_error_on_invoke_maps_to_502(self):
-        """boto3 ClientError (throttle / permissions / timeout) becomes a 502
-        with a stable, metric-specific message — must NOT be misdiagnosed as a
-        Context Manager failure by the router's generic exception path."""
-        mock_client = MagicMock()
-        mock_client.invoke.side_effect = ClientError(
-            {"Error": {"Code": "ThrottlingException", "Message": "Rate exceeded"}},
-            "Invoke",
-        )
-        with patch.object(handler_module, "_get_lambda_client", return_value=mock_client):
-            event = _api_event("GET", "/namespaces/{namespaceId}/metrics", body=None)
-            result = handler(event, None)
-        assert result["statusCode"] == 502
-        assert "Failed to invoke metric-service Lambda" in result["body"]
-        assert "Context Manager" not in result["body"]
-
-    def test_malformed_envelope_json_returns_502(self):
-        mock_client = MagicMock()
-        mock_client.invoke.return_value = {
-            "StatusCode": 200,
-            "Payload": io.BytesIO(b"not-valid-json{{{"),
-        }
-        with patch.object(handler_module, "_get_lambda_client", return_value=mock_client):
-            event = _api_event("GET", "/namespaces/{namespaceId}/metrics", body=None)
-            result = handler(event, None)
-        assert result["statusCode"] == 502
-        assert "Metric service returned invalid JSON" in result["body"]
-
-    def test_function_error_does_not_leak_lambda_internals(self):
-        """FunctionError payloads can carry ARNs / tracebacks / stack frames.
-        Only a generic message may surface; details go to server-side logs."""
-        secret_payload = (
-            b'{"errorMessage": "Traceback... at /var/task/handler.py: '
-            b'arn:aws:iam::123456789012:role/internal-role", "errorType": "RuntimeError"}'
-        )
-        mock_client = MagicMock()
-        mock_client.invoke.return_value = {
-            "StatusCode": 200,
-            "FunctionError": "Unhandled",
-            "Payload": io.BytesIO(secret_payload),
-        }
-        with patch.object(handler_module, "_get_lambda_client", return_value=mock_client):
-            event = _api_event("GET", "/namespaces/{namespaceId}/metrics", body=None)
-            result = handler(event, None)
-        assert result["statusCode"] == 502
-        body_text = result["body"]
-        assert "Metric service backend failed" in body_text
-        assert "Traceback" not in body_text
-        assert "arn:aws:iam" not in body_text
-        assert "handler.py" not in body_text
-        assert "RuntimeError" not in body_text
-
-    def test_response_does_not_leak_extra_fields(self):
-        """The Smithy output is ``metrics`` + ``nextToken`` only. A future
-        backend change must not add fields to the customer response by accident
-        (the metric-service Lambda echoes ``namespace`` today — same case as
-        DescribeSchema)."""
-        proxy_body = {
-            "metrics": [{"metricId": "m1", "name": "Revenue"}],
-            "nextToken": "cursor-2",
-            "namespace": "9142f178-...",  # echoed today
-            "internal_debug": "should never surface",
-        }
-        mock_client = MagicMock()
-        mock_client.invoke.return_value = self._fake_proxy_response(proxy_body)
-        with patch.object(handler_module, "_get_lambda_client", return_value=mock_client):
-            event = _api_event("GET", "/namespaces/{namespaceId}/metrics", body=None)
-            result = handler(event, None)
-        body = json.loads(result["body"])
-        assert set(body.keys()) == {"metrics", "nextToken"}
 
 
 @pytest.mark.unit

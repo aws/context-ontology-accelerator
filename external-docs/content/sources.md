@@ -312,7 +312,11 @@ and a `databaseSource.jdbcConfiguration` body — see **CreateSource** in the
 
 Host, port, and database name are validated to prevent JDBC parameter injection:
 
-- **host** — alphanumeric + `.` `-` `_`, max 253 chars
+- **host** — conventional DNS hostname (alphanumeric + `.` `-`) or IPv4
+  address, max 253 chars. For Snowflake only, the account identifier in the
+  first hostname label may also contain internal `_` characters (for example,
+  `my_account.snowflakecomputing.com`); suffix labels keep the conventional DNS
+  rules
 - **port** — integer 1–65535
 - **database** — alphanumeric + `_` `-`, max 128 chars
 

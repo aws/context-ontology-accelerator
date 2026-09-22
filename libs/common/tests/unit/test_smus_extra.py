@@ -400,7 +400,11 @@ class TestFindAssetByName:
     A top-1 relevance search is not an exact lookup: DataZone scores every
     searchable attribute, so a full asset name such as ``DS#<id>:<db>.<table>``
     contributes terms shared by every asset of that source and the exact match
-    is not reliably ranked first. These cover the resulting behaviours.
+    is not reliably ranked first. An ``EQ`` filter on ``name`` looks like the
+    fix but isn't one either: DataZone's ``Search`` API rejects ``EQ`` against
+    a string attribute (confirmed live), so this pages the token search and
+    verifies every candidate by exact equality instead. These cover the
+    resulting behaviours.
     """
 
     @patch("coa_common.metadata_store.smus.boto3")
@@ -416,6 +420,7 @@ class TestFindAssetByName:
 
         _, kwargs = dz.search.call_args
         assert kwargs["searchIn"] == [{"attribute": "name"}]
+        assert "filters" not in kwargs
 
     @patch("coa_common.metadata_store.smus.boto3")
     def test_finds_the_exact_match_when_it_is_not_the_first_hit(self, mock_boto3):
