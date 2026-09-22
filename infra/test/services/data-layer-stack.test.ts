@@ -83,23 +83,11 @@ describe("DataLayerStack", () => {
     );
   });
 
-  it("wires the metric-service Lambda ARN into the API Lambda env", () => {
-    template.hasResourceProperties(
-      "AWS::Lambda::Function",
-      Match.objectLike({
-        Environment: {
-          Variables: Match.objectLike({
-            METRIC_SERVICE_LAMBDA_ARN: Match.anyValue(),
-          }),
-        },
-      }),
-    );
-  });
-
-  it("grants lambda:InvokeFunction on both discovery-backend ARNs", () => {
-    // A single policy statement grants invoke on both ARNs (ontology-proxy +
-    // metric-service). Assert the statement exists AND that its Resource list
-    // has exactly 2 entries — dropping either one → 502 for that surface.
+  it("grants lambda:InvokeFunction only on the ontology-proxy ARN", () => {
+    // DescribeSchema is the only direct-through discovery handler left, so the
+    // invoke grant must target exactly one ARN. The metric catalog is served by
+    // the metric-service Lambda via its own API Gateway route (control-plane's
+    // ListMetrics), so a second target here would be unused privilege.
     const policies = template.findResources("AWS::IAM::Policy");
     const invokeStatements = Object.values(policies)
       .flatMap((p: any) => p.Properties.PolicyDocument.Statement)
@@ -108,12 +96,10 @@ describe("DataLayerStack", () => {
         return actions.includes("lambda:InvokeFunction");
       });
     expect(invokeStatements.length).toBeGreaterThanOrEqual(1);
-    // The invoke statement lives on the api-fn's role and targets both
-    // backend ARNs — collect every resource across all matching statements.
     const targets = invokeStatements.flatMap((s: any) =>
       Array.isArray(s.Resource) ? s.Resource : [s.Resource],
     );
-    expect(targets.length).toBe(2);
+    expect(targets.length).toBe(1);
   });
 
   it("publishes the API Lambda ARN via SSM for the ApiStack to import", () => {

@@ -18,7 +18,6 @@ service DataLayerService {
         TranslateSPARQL
         KBSearch
         GraphTraverse
-        ServeListMetrics
         DescribeSchema
     ]
     errors: [

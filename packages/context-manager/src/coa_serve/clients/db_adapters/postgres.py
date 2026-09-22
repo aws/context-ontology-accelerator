@@ -153,6 +153,17 @@ class PostgresAdapter(EngineAdapter):
         timeout_ms: int,
         schema: str,
     ) -> tuple[list[dict[str, Any]], list[str]]:
+        search_path: str | None = None
+        if schema:
+            schemas = [token.strip() for token in schema.split(",")]
+            if any(not token or not _SCHEMA_IDENTIFIER_PATTERN.match(token) for token in schemas):
+                logger.warning("search_path_schema_invalid_rejected")
+                raise ValueError("search_path contains an invalid schema identifier")
+            # Source resolution already chose the authoritative ordered search
+            # path. Appending ``public`` here would change that contract and
+            # duplicate it when it is already present.
+            search_path = ", ".join(schemas)
+
         async with engine.begin() as db:
             # SET LOCAL cannot be parameterized; timeout_ms validated to 1..300000.
             await db.execute(text(f"SET LOCAL statement_timeout = {timeout_ms}"))
@@ -160,16 +171,16 @@ class PostgresAdapter(EngineAdapter):
             # on connection startup, so set it per-transaction here. SET search_path
             # cannot be parameterized, so validate each identifier before interpolation
             # (schema comes from source config, but we never trust it blindly).
-            if schema:
-                valid = [s for tok in schema.split(",") if (s := tok.strip()) and _SCHEMA_IDENTIFIER_PATTERN.match(s)]
-                if not valid:
-                    logger.warning("search_path_schema_invalid_skipped", schema=schema)
-                else:
-                    search_path = ", ".join([*valid, "public"])
-                    try:
-                        await db.execute(text(f"SET search_path TO {search_path}"))
-                    except SQLAlchemyError as exc:
-                        logger.error("search_path_set_failed", schema=schema, error=str(exc))
+            if search_path:
+                try:
+                    await db.execute(text(f"SET search_path TO {search_path}"))
+                except SQLAlchemyError as exc:
+                    logger.error("search_path_set_failed", schema=schema, error=str(exc))
+                    # PostgreSQL marks the transaction aborted after a failed
+                    # SET. Continuing with the customer query in this same
+                    # transaction can only fail (and masks the real cause), so
+                    # let the context manager roll it back.
+                    raise
             result = await db.execute(text(sql), params or {})
             rows_raw = result.fetchall()
             columns = list(result.keys())

@@ -1218,6 +1218,30 @@ describe("SourcesStack", () => {
   });
 
   describe("Database Connector Lambda (DbConnectorFn)", () => {
+    it("attaches the shared Lambda SG and the dedicated Snowflake OCSP SG", () => {
+      const functions = Object.values(
+        template.findResources("AWS::Lambda::Function"),
+      ) as any[];
+      const fn = functions.find((candidate: any) =>
+        String(candidate.Properties?.FunctionName ?? "").endsWith(
+          "sources-db-connector",
+        ),
+      );
+
+      expect(fn).toBeDefined();
+      expect(fn.Properties.VpcConfig.SecurityGroupIds).toHaveLength(2);
+      expect(
+        JSON.stringify(fn.Properties.VpcConfig.SecurityGroupIds),
+      ).toContain("DiscoveryOcspSG");
+      for (const candidate of functions.filter(
+        (item) => item !== fn && item.Properties?.VpcConfig,
+      )) {
+        expect(
+          JSON.stringify(candidate.Properties.VpcConfig.SecurityGroupIds),
+        ).not.toContain("DiscoveryOcspSG");
+      }
+    });
+
     it("has CONSUMER_QUERY_ROLE_ARN environment variable (from SSM)", () => {
       template.hasResourceProperties("AWS::Lambda::Function", {
         FunctionName: Match.stringLikeRegexp(".*sources-db-connector$"),

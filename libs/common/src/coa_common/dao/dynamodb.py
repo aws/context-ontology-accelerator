@@ -11,6 +11,7 @@ from typing import Any
 
 import boto3
 from boto3.dynamodb.conditions import ConditionBase, Key  # noqa: F401 — re-exported for callers
+from botocore.config import Config
 from botocore.exceptions import ClientError
 
 from coa_common.aws_config import async_boto_config
@@ -31,17 +32,26 @@ class DynamoDBDAO(DatastoreDAO):
         The DynamoDB table name.
     region:
         AWS region. **Required**.
+    config:
+        Optional botocore client configuration. Background callers retain the
+        shared async profile when omitted; synchronous request paths can supply
+        the fail-fast profile explicitly.
     """
 
-    def __init__(self, table_name: str, *, region: str) -> None:
+    def __init__(self, table_name: str, *, region: str, config: Config | None = None) -> None:
         """Bind the DAO to a DynamoDB table resource.
 
         Args:
             table_name: The DynamoDB table name.
             region: AWS region hosting the table.
+            config: Optional botocore timeout/retry configuration.
         """
         self._table_name = table_name
-        self._resource = boto3.resource("dynamodb", region_name=region, config=async_boto_config())
+        self._resource = boto3.resource(
+            "dynamodb",
+            region_name=region,
+            config=config if config is not None else async_boto_config(),
+        )
         self._table = self._resource.Table(table_name)
 
     # ------------------------------------------------------------------

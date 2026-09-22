@@ -40,6 +40,7 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 from coa_common.aws_config import is_throttling_error
 
+from coa_sources.database.connectors.dialects import DISCOVERY_ENGINES
 from coa_sources.database.metrics import emit_metric
 
 logger = logging.getLogger(__name__)
@@ -96,11 +97,12 @@ _CATALOG_NAME_MAX = 41
 # it has to be deleted and recreated.
 _CASING_FILTER_UNSUPPORTED_ENGINES = frozenset({"REDSHIFT", "SNOWFLAKE", "ORACLE"})
 
-_HOST_RE = re.compile(
-    r"^(?=.{1,253}$)"
-    r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*"
-    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$"
-)
+_DNS_HOST_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+# Snowflake account identifiers occupy the first host label and may contain
+# internal underscores; the service and PrivateLink suffix remains DNS-shaped.
+_SNOWFLAKE_ACCOUNT_HOST_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9])?"
+_HOST_RE = re.compile(rf"^(?=.{{1,253}}$)(?:{_DNS_HOST_LABEL}\.)*{_DNS_HOST_LABEL}$")
+_SNOWFLAKE_HOST_RE = re.compile(rf"^(?=.{{1,253}}$){_SNOWFLAKE_ACCOUNT_HOST_LABEL}(?:\.{_DNS_HOST_LABEL})*$")
 _IPV4_RE = re.compile(r"^(\d{1,3}\.){3}\d{1,3}$")
 _DATABASE_RE = re.compile(r"^[A-Za-z0-9_\-]{1,128}$")
 _IAM_ROLE_ARN_RE = re.compile(r"^arn:(aws|aws-us-gov|aws-cn):iam::\d+:role/.+$")
@@ -196,14 +198,26 @@ def build_catalog_name(resource_prefix: str, datasource_id: str) -> str:
     return name[:_CATALOG_NAME_MAX]
 
 
-def _validate_connection_inputs(*, host: str, port: int, database: str) -> None:
+def _validate_connection_inputs(*, engine: str, host: str, port: int, database: str) -> None:
+    normalized_engine = engine.upper() if isinstance(engine, str) else engine
+    if normalized_engine not in DISCOVERY_ENGINES:
+        allowed = ", ".join(sorted(DISCOVERY_ENGINES))
+        raise ValueError(f"engine must be one of {allowed}: {engine!r}")
     if not isinstance(host, str) or not host:
         raise ValueError("host must be a non-empty string")
     if _IPV4_RE.match(host):
         if not all(0 <= int(o) <= 255 for o in host.split(".")):
             raise ValueError(f"invalid IPv4 host: {host!r}")
-    elif not _HOST_RE.match(host):
-        raise ValueError(f"host must be a valid hostname or IPv4 address: {host!r}")
+    else:
+        is_snowflake = normalized_engine == "SNOWFLAKE"
+        host_pattern = _SNOWFLAKE_HOST_RE if is_snowflake else _HOST_RE
+        if not host_pattern.match(host):
+            if not is_snowflake and "_" in host:
+                raise ValueError(
+                    f"host must be a valid hostname or IPv4 address: {host!r} "
+                    "(underscores are only permitted in Snowflake account hostnames)"
+                )
+            raise ValueError(f"host must be a valid hostname or IPv4 address: {host!r}")
     if not isinstance(port, int) or isinstance(port, bool) or not (1 <= port <= 65535):
         raise ValueError(f"port must be an integer in 1-65535: {port!r}")
     if not isinstance(database, str) or not _DATABASE_RE.match(database):
@@ -236,7 +250,7 @@ def provision_federated_catalog(
         raise RuntimeError("FEDERATED_CATALOG_ROLE_ARN is not configured")
 
     try:
-        _validate_connection_inputs(host=host, port=port, database=database_name)
+        _validate_connection_inputs(engine=engine, host=host, port=port, database=database_name)
     except ValueError as exc:
         raise RuntimeError(f"Invalid JDBC connection parameters: {exc}") from exc
 

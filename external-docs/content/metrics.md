@@ -175,6 +175,12 @@ Ossie rename:
 2. Upload a YAML/JSON file conforming to the OSI schema
 3. Context Ontology Accelerator validates and creates all metrics in batch
 
+Each imported metric must reference a data source in the same namespace whose
+status is `APPROVED` or `COMPLETED`. When `source_table` is present and the
+approved catalog can enumerate tables, the table must also exist in that data
+source. Metrics with missing, unapproved, or provably invalid source references
+are recorded as import errors and are not persisted.
+
 ## How Metrics Are Used in Queries
 
 When a user asks a question that names a metric, the query engine:

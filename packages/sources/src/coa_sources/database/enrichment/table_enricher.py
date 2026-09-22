@@ -11,7 +11,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import boto3
-from coa_common.bedrock import GuardrailBlockedError
+from coa_common.bedrock import BedrockTruncationError, GuardrailBlockedError
 from coa_common.config import resolve_region
 from coa_common.datazone_forms import build_forms_input
 from coa_common.domain_models import (
@@ -187,6 +187,17 @@ def run(
                 failed_tables.add(table.table_id)
                 logger.warning("Guardrail blocked table %s (batch %d)", table.table_id, batch_idx)
                 emitter.emit_bedrock_invocation_error(stage="Pass1", exc=GuardrailBlockedError("blocked"))
+            except BedrockTruncationError as exc:
+                failed_tables.add(table.table_id)
+                logger.warning(
+                    "Bedrock truncated table %s (batch %d): model=%s output_tokens=%d requested_max_tokens=%d",
+                    table.table_id,
+                    batch_idx,
+                    exc.model_id,
+                    exc.output_tokens,
+                    exc.max_tokens,
+                )
+                emitter.emit_bedrock_invocation_error(stage="Pass1", exc=exc)
             except Exception as exc:
                 failed_tables.add(table.table_id)
                 logger.exception("Failed to enrich table %s (batch %d)", table.table_id, batch_idx)

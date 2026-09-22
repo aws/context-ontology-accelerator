@@ -9,8 +9,17 @@ import json
 from unittest.mock import MagicMock, patch
 
 import pytest
+from coa_metrics.source_status import PERMISSIVE_ENV, SourceValidationUnavailableError
 
 pytestmark = pytest.mark.unit
+
+
+@pytest.fixture(autouse=True)
+def _permissive_source_lookup(monkeypatch: pytest.MonkeyPatch):
+    """Keep unrelated worker tests independent from deployed source metadata."""
+    monkeypatch.setenv(PERMISSIVE_ENV, "true")
+    yield
+
 
 # ── import_job_store tests ──────────────────────────────────────────────
 
@@ -439,6 +448,175 @@ class TestImportWorker:
         assert kwargs["metrics_created"] == 2
         assert kwargs["metrics_updated"] == 0
         mock_complete.assert_called_once_with("ns-1", "j-1", status="COMPLETED")
+
+    @patch("coa_metrics.api.import_worker._osi_metric_to_definition")
+    @patch("coa_metrics.api.import_worker._get_neptune")
+    @patch("coa_metrics.api.import_worker.update_job_progress")
+    @patch("coa_metrics.api.import_worker.parse_osi_yaml")
+    @patch("coa_metrics.api.import_worker._get_s3")
+    @patch("coa_metrics.api.import_worker.complete_job")
+    @patch("coa_metrics.api.import_worker.get_job")
+    def test_unapproved_source_is_recorded_and_not_persisted(
+        self, mock_get_job, mock_complete, mock_s3, mock_parse, mock_update, mock_neptune, mock_to_def
+    ):
+        from coa_metrics.api.import_worker import _process_chunk
+
+        mock_get_job.return_value = {"status": "IN_PROGRESS"}
+        body = MagicMock()
+        body.read.return_value = b"yaml"
+        mock_s3.return_value.get_object.return_value = {"Body": body}
+        doc = MagicMock(datasets=[], metrics=[MagicMock(name="blocked_metric")])
+        mock_parse.return_value = MagicMock(success=True, document=doc)
+        mock_to_def.return_value = MagicMock(
+            name="blocked_metric",
+            data_source_id="ds-pending",
+            source_table="orders",
+            ontology_concepts=[],
+        )
+
+        with (
+            patch(
+                "coa_metrics.api.import_worker.check_source_approved",
+                return_value="Data source 'ds-pending' has status 'PENDING'",
+            ) as mock_approved,
+            patch("coa_metrics.api.import_worker.check_source_table_exists") as mock_table,
+        ):
+            _process_chunk(self._msg())
+
+        mock_approved.assert_called_once_with("ns-1", "ds-pending")
+        mock_table.assert_not_called()
+        mock_neptune.return_value.get_metric.assert_not_called()
+        mock_neptune.return_value.create_metric.assert_not_called()
+        kwargs = mock_update.call_args.kwargs
+        assert kwargs["metrics_processed"] == 1
+        assert kwargs["metrics_created"] == 0
+        assert "PENDING" in kwargs["errors"][0]
+        mock_complete.assert_called_once_with("ns-1", "j-1", status="COMPLETED")
+
+    @patch("coa_metrics.api.import_worker._osi_metric_to_definition")
+    @patch("coa_metrics.api.import_worker._get_neptune")
+    @patch("coa_metrics.api.import_worker.update_job_progress")
+    @patch("coa_metrics.api.import_worker.parse_osi_yaml")
+    @patch("coa_metrics.api.import_worker._get_s3")
+    @patch("coa_metrics.api.import_worker.complete_job")
+    @patch("coa_metrics.api.import_worker.get_job")
+    def test_source_table_is_checked_before_persistence(
+        self, mock_get_job, mock_complete, mock_s3, mock_parse, mock_update, mock_neptune, mock_to_def
+    ):
+        from coa_metrics.api.import_worker import _process_chunk
+
+        mock_get_job.return_value = {"status": "IN_PROGRESS"}
+        body = MagicMock()
+        body.read.return_value = b"yaml"
+        mock_s3.return_value.get_object.return_value = {"Body": body}
+        doc = MagicMock(datasets=[], metrics=[MagicMock(name="bad_table_metric")])
+        mock_parse.return_value = MagicMock(success=True, document=doc)
+        mock_to_def.return_value = MagicMock(
+            name="bad_table_metric",
+            data_source_id="ds-approved",
+            source_table="missing_table",
+            ontology_concepts=[],
+        )
+
+        with (
+            patch("coa_metrics.api.import_worker.check_source_approved", return_value=None),
+            patch(
+                "coa_metrics.api.import_worker.check_source_table_exists",
+                return_value="Source table 'missing_table' not found",
+            ) as mock_table,
+        ):
+            _process_chunk(self._msg())
+
+        mock_table.assert_called_once_with("ns-1", "ds-approved", "missing_table")
+        mock_neptune.return_value.create_metric.assert_not_called()
+        kwargs = mock_update.call_args.kwargs
+        assert kwargs["metrics_created"] == 0
+        assert "missing_table" in kwargs["errors"][0]
+        mock_complete.assert_called_once_with("ns-1", "j-1", status="COMPLETED")
+
+    @patch("coa_metrics.api.import_worker._osi_metric_to_definition")
+    @patch("coa_metrics.api.import_worker._get_neptune")
+    @patch("coa_metrics.api.import_worker.update_job_progress")
+    @patch("coa_metrics.api.import_worker.parse_osi_yaml")
+    @patch("coa_metrics.api.import_worker._get_s3")
+    @patch("coa_metrics.api.import_worker.complete_job")
+    @patch("coa_metrics.api.import_worker.get_job")
+    def test_duplicate_source_references_are_validated_once_per_chunk(
+        self, mock_get_job, mock_complete, mock_s3, mock_parse, mock_update, mock_neptune, mock_to_def
+    ):
+        from coa_metrics.api.import_worker import _process_chunk
+
+        mock_get_job.return_value = {"status": "IN_PROGRESS"}
+        body = MagicMock()
+        body.read.return_value = b"yaml"
+        mock_s3.return_value.get_object.return_value = {"Body": body}
+        doc = MagicMock(datasets=[], metrics=[MagicMock(name="one"), MagicMock(name="two")])
+        mock_parse.return_value = MagicMock(success=True, document=doc)
+        mock_neptune.return_value.get_metric.return_value = None
+        mock_to_def.side_effect = [
+            MagicMock(
+                name="one",
+                data_source_id="ds-approved",
+                source_table="Orders",
+                ontology_concepts=[],
+            ),
+            MagicMock(
+                name="two",
+                data_source_id="ds-approved",
+                source_table="orders",
+                ontology_concepts=[],
+            ),
+        ]
+
+        with (
+            patch("coa_metrics.api.import_worker.check_source_approved", return_value=None) as mock_approved,
+            patch("coa_metrics.api.import_worker.check_source_table_exists", return_value=None) as mock_table,
+        ):
+            _process_chunk(self._msg())
+
+        mock_approved.assert_called_once_with("ns-1", "ds-approved")
+        mock_table.assert_called_once_with("ns-1", "ds-approved", "Orders")
+        assert mock_neptune.return_value.create_metric.call_count == 2
+        mock_complete.assert_called_once_with("ns-1", "j-1", status="COMPLETED")
+
+    @patch("coa_metrics.api.import_worker._osi_metric_to_definition")
+    @patch("coa_metrics.api.import_worker._get_neptune")
+    @patch("coa_metrics.api.import_worker.update_job_progress")
+    @patch("coa_metrics.api.import_worker.parse_osi_yaml")
+    @patch("coa_metrics.api.import_worker._get_s3")
+    @patch("coa_metrics.api.import_worker.complete_job")
+    @patch("coa_metrics.api.import_worker.get_job")
+    def test_source_validation_outage_fails_job_and_records_progress(
+        self, mock_get_job, mock_complete, mock_s3, mock_parse, mock_update, mock_neptune, mock_to_def
+    ):
+        from coa_metrics.api.import_worker import _process_chunk
+
+        mock_get_job.return_value = {"status": "IN_PROGRESS"}
+        body = MagicMock()
+        body.read.return_value = b"yaml"
+        mock_s3.return_value.get_object.return_value = {"Body": body}
+        doc = MagicMock(datasets=[], metrics=[MagicMock(name="metric")])
+        mock_parse.return_value = MagicMock(success=True, document=doc)
+        mock_to_def.return_value = MagicMock(
+            name="metric",
+            data_source_id="ds-approved",
+            source_table="orders",
+            ontology_concepts=[],
+        )
+
+        with patch(
+            "coa_metrics.api.import_worker.check_source_approved",
+            side_effect=SourceValidationUnavailableError("sources table unavailable"),
+        ):
+            _process_chunk(self._msg())
+
+        mock_neptune.return_value.get_metric.assert_not_called()
+        mock_neptune.return_value.create_metric.assert_not_called()
+        kwargs = mock_update.call_args.kwargs
+        assert kwargs["metrics_processed"] == 1
+        assert kwargs["metrics_created"] == 0
+        assert "sources table unavailable" in kwargs["errors"][0]
+        mock_complete.assert_called_once_with("ns-1", "j-1", status="FAILED")
 
     @patch("coa_metrics.api.import_worker._osi_metric_to_definition")
     @patch("coa_metrics.api.import_worker._get_sqs")

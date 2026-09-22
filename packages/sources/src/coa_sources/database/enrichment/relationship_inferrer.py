@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 from collections import Counter
 
+from coa_common.bedrock import BedrockTruncationError
 from coa_common.domain_models import EnrichmentSource, ForeignKey, Table
 
 from coa_sources.database.enrichment.bedrock_client import BedrockClient
@@ -129,6 +130,16 @@ def _infer_batch(tables: list[Table], client: BedrockClient, emitter: Enrichment
             input_tokens=invocation.input_tokens,
             output_tokens=invocation.output_tokens,
         )
+    except BedrockTruncationError as exc:
+        logger.warning(
+            "Pass 2 batch truncated (%d tables): model=%s output_tokens=%d requested_max_tokens=%d",
+            len(tables),
+            exc.model_id,
+            exc.output_tokens,
+            exc.max_tokens,
+        )
+        emitter.emit_bedrock_invocation_error(stage="Pass2", exc=exc)
+        return []
     except Exception as exc:
         logger.warning("Pass 2 batch failed (%d tables)", len(tables), exc_info=True)
         emitter.emit_bedrock_invocation_error(stage="Pass2", exc=exc)

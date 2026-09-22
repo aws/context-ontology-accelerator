@@ -35,7 +35,11 @@ from coa_metrics.api.import_osi import _get_lookup, _osi_metric_to_definition
 from coa_metrics.dataset_resolver import resolve_datasets
 from coa_metrics.neptune_client import MetricNeptuneClient
 from coa_metrics.osi_parser import parse_osi_yaml
-from coa_metrics.source_status import SourceValidationUnavailableError
+from coa_metrics.source_status import (
+    SourceValidationUnavailableError,
+    check_source_approved,
+    check_source_table_exists,
+)
 
 setup_logging(os.environ.get("LOG_LEVEL", "INFO"))
 logger = structlog.get_logger(__name__)
@@ -157,10 +161,32 @@ def _process_chunk(msg: dict[str, Any]) -> None:
     updated = 0
     errors: list[str] = []
     warnings: list[str] = []
+    source_approval_results: dict[str, str | None] = {}
+    source_table_results: dict[tuple[str, str], str | None] = {}
 
-    for osi_metric in chunk:
+    for processed, osi_metric in enumerate(chunk, start=1):
         try:
             metric_def = _osi_metric_to_definition(osi_metric, parse_result.document, "import-worker")
+            # Every non-empty import is dispatched to this worker
+            # (import_osi.SYNC_THRESHOLD == 0), so the worker must enforce the
+            # same source contract as create/update and the dormant synchronous
+            # import path. Otherwise OSI import can persist a metric for a
+            # missing or unapproved source.
+            data_source_id = metric_def.data_source_id
+            if data_source_id not in source_approval_results:
+                source_approval_results[data_source_id] = check_source_approved(namespace_id, data_source_id)
+            source_error = source_approval_results[data_source_id]
+            if source_error is None:
+                source_table_key = (data_source_id, metric_def.source_table.lower())
+                if source_table_key not in source_table_results:
+                    source_table_results[source_table_key] = check_source_table_exists(
+                        namespace_id,
+                        data_source_id,
+                        metric_def.source_table,
+                    )
+                source_error = source_table_results[source_table_key]
+            if source_error:
+                raise ValueError(source_error)
             if metric_def.ontology_concepts:
                 metric_def.ontology_concepts = neptune.resolve_class_uris(namespace_id, metric_def.ontology_concepts)
             existing = neptune.get_metric(namespace_id, metric_def.name)
@@ -170,6 +196,29 @@ def _process_chunk(msg: dict[str, Any]) -> None:
             else:
                 neptune.create_metric(namespace_id, metric_def)
                 created += 1
+        except SourceValidationUnavailableError as exc:
+            metric_name = getattr(osi_metric, "name", "unknown")
+            errors.append(f"{metric_name}: {exc}")
+            logger.error(
+                "source_validation_unavailable",
+                job_id=job_id,
+                name=metric_name,
+                error=str(exc),
+            )
+            # Preserve the counts and errors from any metrics already handled in
+            # this chunk before failing the job. Returning without this update
+            # would leave the durable job record inconsistent with Neptune.
+            update_job_progress(
+                namespace_id,
+                job_id,
+                metrics_processed=processed,
+                metrics_created=created,
+                metrics_updated=updated,
+                errors=errors,
+                warnings=warnings or None,
+            )
+            complete_job(namespace_id, job_id, status="FAILED")
+            return
         except Exception as exc:
             metric_name = getattr(osi_metric, "name", "unknown")
             errors.append(f"{metric_name}: {exc}")

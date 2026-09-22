@@ -327,6 +327,30 @@ make deploy-dev
 !!! warning "Multi-region deployments"
     S3 buckets and IAM roles are globally scoped, not region-isolated. Deploying the same `SCL_PREFIX` + `env` to a second region **will collide** with an existing deployment. Use a distinct `SCL_PREFIX` per region (e.g., `coa-w2` for `us-west-2`) — do not rely on region alone to disambiguate.
 
+#### Tier-1 metric execution timeout
+
+Tier 1 executes the curated SQL attached to a matched metric. Each statement has
+an explicit **35-second** timeout by default, rather than inheriting a database
+client's shorter method default. Increase it when valid metric queries over a
+large warehouse consistently time out:
+
+```bash
+# Allow a Tier-1 metric statement up to 75 seconds (default is 35)
+SCL_TIER1_METRIC_TIMEOUT_SECONDS=75 make deploy-dev
+```
+
+The value must be an integer from **1 through 300 seconds**. Invalid values fall
+back to 35 seconds and emit a configuration warning. The effective timeout can
+still be lower: COA clamps it to the remaining outer request deadline and skips
+the SQL call when less than one second remains, so this setting cannot keep a
+query alive after its request expires.
+
+`scripts/deploy.sh` maps the variable above to the CDK context parameter
+`tier1_metric_timeout_s`. For a direct CDK deployment, pass
+`--context tier1_metric_timeout_s=75` or set that key in `infra/cdk.json`. The
+Serve runtime receives the resulting value as `TIER1_METRIC_TIMEOUT_S`; this
+runtime variable is normally managed by the stack rather than set manually.
+
 #### Database scan enrichment timeout
 
 A database source scan runs an enrichment step (an ECS Fargate task that calls Bedrock once per discovered table). It is bounded by a deadline; when the deadline is hit the scan fails cleanly to `SCAN_FAILED` so the source can be deleted or re-scanned, rather than being stranded mid-scan. The default deadline is **120 minutes**, sized to comfortably cover a large source (roughly 2,000 tables at ~30–35 s per table with ten tables enriched in parallel).
