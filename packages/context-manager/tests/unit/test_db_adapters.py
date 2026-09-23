@@ -247,14 +247,14 @@ class TestPostgresAdapter:
         executed = self._capture_engine()
         await PostgresAdapter().run(executed.engine, "SELECT 1", None, 10, schema="analytics")
         assert any("SET LOCAL statement_timeout = 10000" in s for s in executed.sql)
-        assert any("SET search_path TO analytics, public" in s for s in executed.sql)
+        assert "SET search_path TO analytics" in executed.sql
 
     async def test_run_multi_schema_search_path(self):
         from coa_serve.clients.db_adapters.postgres import PostgresAdapter
 
         executed = self._capture_engine()
         await PostgresAdapter().run(executed.engine, "SELECT 1", None, 10, schema="public, sales")
-        assert any("SET search_path TO public, sales, public" in s for s in executed.sql)
+        assert "SET search_path TO public, sales" in executed.sql
 
     async def test_run_skips_search_path_when_no_schema(self):
         from coa_serve.clients.db_adapters.postgres import PostgresAdapter
@@ -267,31 +267,91 @@ class TestPostgresAdapter:
         from coa_serve.clients.db_adapters.postgres import PostgresAdapter
 
         executed = self._capture_engine()
-        await PostgresAdapter().run(executed.engine, "SELECT 1", None, 10, schema="public; DROP TABLE users --")
-        assert not any("search_path" in s for s in executed.sql)
+        with pytest.raises(ValueError, match="invalid schema identifier"):
+            await PostgresAdapter().run(
+                executed.engine,
+                "SELECT customer_data FROM orders",
+                None,
+                10,
+                schema="public; DROP TABLE users --",
+            )
+        executed.engine.begin.assert_not_called()
+        assert not any("SELECT customer_data FROM orders" in sql for sql in executed.sql)
         assert not any("DROP TABLE" in s for s in executed.sql)
 
-    async def test_run_search_path_failure_is_logged_not_raised(self):
+    @pytest.mark.parametrize("schema", ["analytics, bad-name", "analytics,,public"])
+    async def test_run_rejects_entire_search_path_when_any_schema_is_invalid(self, schema):
+        from coa_serve.clients.db_adapters.postgres import PostgresAdapter
+
+        executed = self._capture_engine()
+        with pytest.raises(ValueError, match="invalid schema identifier"):
+            await PostgresAdapter().run(
+                executed.engine,
+                "SELECT customer_data FROM orders",
+                None,
+                10,
+                schema=schema,
+            )
+        executed.engine.begin.assert_not_called()
+        assert executed.sql == []
+
+    async def test_run_search_path_failure_is_raised_before_customer_query(self):
         from coa_serve.clients.db_adapters.postgres import PostgresAdapter
         from sqlalchemy.exc import ProgrammingError
 
         executed = self._capture_engine(
-            fail_on="search_path", exc=ProgrammingError("SET failed", {}, Exception("boom"))
+            fail_on="search_path",
+            exc=ProgrammingError("SET failed", {}, Exception("boom")),
+            fail_once=True,
         )
-        rows, columns = await PostgresAdapter().run(executed.engine, "SELECT 1", None, 10, schema="analytics")
+        with pytest.raises(ProgrammingError, match="SET failed"):
+            await PostgresAdapter().run(
+                executed.engine,
+                "SELECT customer_data FROM orders",
+                None,
+                10,
+                schema="analytics",
+            )
+        assert not any("SELECT customer_data FROM orders" in sql for sql in executed.sql)
+        executed.begin_ctx.__aexit__.assert_awaited_once()
+        assert executed.begin_ctx.__aexit__.await_args.args[0] is ProgrammingError
+
+        rows, columns = await PostgresAdapter().run(
+            executed.engine,
+            "SELECT customer_data FROM orders",
+            None,
+            10,
+            schema="analytics",
+        )
         assert rows == []
+        assert columns == []
+        assert executed.engine.begin.call_count == 2
+        assert sum("SELECT customer_data FROM orders" in sql for sql in executed.sql) == 1
 
     @staticmethod
-    def _capture_engine(fail_on: str | None = None, exc: Exception | None = None):
+    def _capture_engine(
+        fail_on: str | None = None,
+        exc: Exception | None = None,
+        *,
+        fail_once: bool = False,
+    ):
         class _Capture:
             def __init__(self):
                 self.sql: list[str] = []
+                self.failures_remaining = 1 if fail_once else None
                 conn = AsyncMock()
 
                 async def _exec(stmt, *args, **kwargs):
                     s = str(stmt)
                     self.sql.append(s)
-                    if fail_on and fail_on in s and exc is not None:
+                    if (
+                        fail_on
+                        and fail_on in s
+                        and exc is not None
+                        and (self.failures_remaining is None or self.failures_remaining > 0)
+                    ):
+                        if self.failures_remaining is not None:
+                            self.failures_remaining -= 1
                         raise exc
                     result = MagicMock()
                     result.fetchall.return_value = []
@@ -305,6 +365,7 @@ class TestPostgresAdapter:
                 begin_ctx.__aexit__.return_value = False
                 engine.begin.return_value = begin_ctx
                 self.engine = engine
+                self.begin_ctx = begin_ctx
 
         return _Capture()
 

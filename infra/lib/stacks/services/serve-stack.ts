@@ -582,6 +582,12 @@ export class ServeStack extends SCLStack {
           // or serve aborts a session the deep-reasoning budget still considers live.
           RESOLVE_TIMEOUT_S:
             (this.node.tryGetContext("resolve_timeout_s") as string) ?? "170",
+          // Tier-1 curated metrics execute synchronously. Keep their SQL budget
+          // explicit and operator-configurable instead of inheriting the
+          // CompositeQueryExecutor's 10-second method default.
+          TIER1_METRIC_TIMEOUT_S:
+            (this.node.tryGetContext("tier1_metric_timeout_s") as string) ??
+            "35",
           ALLOW_NO_GUARDRAIL: this.envName !== "prod" ? "true" : "false",
           // Same base as the writers (metric-service NDB_GRAPH_URI_BASE,
           // ontology-engine neptune_db_graph). Serve reads these graphs, so a

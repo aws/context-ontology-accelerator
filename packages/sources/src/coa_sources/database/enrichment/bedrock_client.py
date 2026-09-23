@@ -7,7 +7,14 @@ from coa_common.bedrock import (
     DEFAULT_MODEL_ID,
     BedrockClient,
     BedrockInvocationResult,
+    BedrockTruncationError,
     GuardrailBlockedError,
 )
 
-__all__ = ["BedrockClient", "BedrockInvocationResult", "DEFAULT_MODEL_ID", "GuardrailBlockedError"]
+__all__ = [
+    "BedrockClient",
+    "BedrockInvocationResult",
+    "BedrockTruncationError",
+    "DEFAULT_MODEL_ID",
+    "GuardrailBlockedError",
+]

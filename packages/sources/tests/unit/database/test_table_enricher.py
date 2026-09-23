@@ -9,7 +9,7 @@ import logging
 from unittest.mock import MagicMock, patch
 
 from botocore.exceptions import ClientError, ReadTimeoutError
-from coa_common.bedrock import BedrockInvocationResult, GuardrailBlockedError
+from coa_common.bedrock import BedrockInvocationResult, BedrockTruncationError, GuardrailBlockedError
 from coa_common.domain_models import (
     BusinessMetadata,
     Column,
@@ -625,6 +625,29 @@ class TestGuardrailBlockedPath:
 
         assert result["tables_failed"] == 0
         assert result["failed_table_ids"] == []
+
+
+class TestBedrockTruncationPath:
+    """Verify output-budget exhaustion stays distinguishable from invalid JSON."""
+
+    @patch("coa_sources.database.enrichment.table_enricher._write_enriched_assets")
+    @patch("coa_sources.database.enrichment.table_enricher.read_assets_for_datasource")
+    @patch("coa_sources.database.enrichment.table_enricher.BedrockClient")
+    def test_truncation_marks_table_failed_and_preserves_typed_error(
+        self, mock_client_cls: MagicMock, mock_read: MagicMock, mock_write: MagicMock
+    ) -> None:
+        truncation = BedrockTruncationError(model_id="test-model", output_tokens=4096, max_tokens=4096)
+        mock_client_cls.return_value.invoke.side_effect = truncation
+        mock_read.return_value = [_make_table("t1")]
+        mock_emitter = MagicMock()
+
+        result = run("ds-123", "ns-456", "dom-789", "full", emitter=mock_emitter)
+
+        assert result["tables_enriched"] == 0
+        assert result["tables_failed"] == 1
+        call_kwargs = mock_emitter.emit_bedrock_invocation_error.call_args.kwargs
+        assert call_kwargs["stage"] == "Pass1"
+        assert call_kwargs["exc"] is truncation
 
 
 class TestProtectedDescriptionPreserve:

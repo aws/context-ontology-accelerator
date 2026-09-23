@@ -585,9 +585,33 @@ Both names are available on the source detail object:
 
 JDBC URL components (`host`, `port`, `database_name`) are validated before any AWS call to prevent JDBC parameter injection (e.g., a database name like `mydb;trustServerCertificate=true` on SQL Server). Validation rules:
 
-- **host** — RFC 1123 hostname/IP, alphanumerics + `.` `-` `_`, max 253 chars.
+- **host** — conventional DNS hostname (alphanumerics + `.` `-`) or IPv4,
+  max 253 chars. For Snowflake only, the account identifier in the first
+  hostname label may also contain internal `_` characters (for example,
+  `my_account.snowflakecomputing.com`); suffix labels retain conventional DNS
+  rules.
 - **port** — integer in `[1, 65535]`.
 - **database** — alphanumerics + `_` `-`, max 128 chars.
+
+### Direct PostgreSQL/Redshift search path
+
+PostgreSQL and Redshift sources use the direct JDBC query path for single-source
+queries. After each successful scan, the source record's `discoveredSchemas`
+field contains every schema that passed the configured include/exclude filters.
+Serve uses that complete list, in its stored order, as the transaction's exact
+`search_path`.
+
+`public` is not appended implicitly. If queries must resolve objects in
+`public`, include that schema in the scan scope so it appears in
+`discoveredSchemas`. Before fetching credentials or opening a transaction,
+serve validates every schema as an unquoted PostgreSQL identifier. Invalid or
+malformed metadata fails the request rather than silently dropping a schema.
+A database error from `SET search_path` also fails the request and rolls the
+transaction back before customer SQL runs.
+
+For a source that has not completed a scan, serve falls back to a single plain
+identifier from `schemaFilter` (or the legacy `schemaName` field), then to
+`public`. MySQL and SQL Server do not use this PostgreSQL search-path behavior.
 
 ### Troubleshooting
 

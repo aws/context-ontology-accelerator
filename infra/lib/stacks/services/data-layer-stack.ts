@@ -53,15 +53,6 @@ export class DataLayerStack extends SCLStack {
       `${ssmPrefix}/ontology-engine/api-fn-arn`,
     );
 
-    // Metric-service Lambda ARN — data-layer's ServeListMetrics proxies
-    // straight to it (the CM never sees the request). Same source MCP's
-    // discovery.list_metrics uses, so both surfaces return the same metric
-    // catalog for the same input (``/namespaces/{namespaceId}/metrics``).
-    const metricServiceLambdaArn = ssm.StringParameter.valueForStringParameter(
-      this,
-      `${ssmPrefix}/metric/api-fn-arn`,
-    );
-
     // ── Lambda code bundle ─────────────────────────────────────────
     // The handler imports from ``coa_common`` (constants + smithy_shapes).
     // Importing any ``coa_common`` submodule runs its package ``__init__``,
@@ -90,7 +81,6 @@ export class DataLayerStack extends SCLStack {
       environment: {
         AGENTCORE_RUNTIME_ARN: runtimeArn,
         ONTOLOGY_PROXY_LAMBDA_ARN: ontologyProxyLambdaArn,
-        METRIC_SERVICE_LAMBDA_ARN: metricServiceLambdaArn,
         ALLOWED_ORIGIN: props.allowedOrigin ?? "*",
       },
     });
@@ -105,14 +95,13 @@ export class DataLayerStack extends SCLStack {
       }),
     );
 
-    // ── IAM: invoke the discovery Lambdas direct-through (bypass CM) ──
-    // Schema queries hit the ontology-api-proxy; metric-catalog queries hit
-    // the metric-service. Both are pure reads with no tier orchestration, so
-    // they skip the Context Manager entirely.
+    // ── IAM: invoke the discovery Lambda direct-through (bypass CM) ──
+    // Schema queries hit the ontology-api-proxy. It is a pure read with no
+    // tier orchestration, so it skips the Context Manager entirely.
     this.apiFn.addToRolePolicy(
       new iam.PolicyStatement({
         actions: ["lambda:InvokeFunction"],
-        resources: [ontologyProxyLambdaArn, metricServiceLambdaArn],
+        resources: [ontologyProxyLambdaArn],
       }),
     );
 

@@ -186,7 +186,7 @@ npm run format   # ESLint --fix + Prettier --write
 | Data fetching       | TanStack React Query v5                      |
 | Auth                | `oidc-client-ts` (Authorization Code + PKCE) |
 | Testing             | Vitest + Testing Library + happy-dom         |
-| Graph visualization | React Flow (@xyflow/react)                   |
+| Graph visualization | React Flow (@xyflow/react) + d3-force for force-directed layout |
 
 ## Architecture
 

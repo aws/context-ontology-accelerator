@@ -508,16 +508,14 @@ async function deploy(): Promise<void> {
   // ApiStack reads /ontology-engine/api-fn-arn via SSM (CFN dynamic ref).
   api.addDependency(ontology);
 
-  // DataLayerStack reads /{prefix}/ontology-engine/api-fn-arn and
-  // /{prefix}/metric/api-fn-arn via SSM (CFN dynamic refs) for its
-  // direct-invoke DescribeSchema and ListMetrics handlers — the same source
-  // MCP's discovery tools read. CDK cannot infer dependency ordering from
-  // ``valueForStringParameter``, so declare it explicitly. Without these,
+  // DataLayerStack reads /{prefix}/ontology-engine/api-fn-arn via SSM (CFN
+  // dynamic refs) for its direct-invoke DescribeSchema handler — the same
+  // source MCP's discovery tools read. CDK cannot infer dependency ordering
+  // from ``valueForStringParameter``, so declare it explicitly. Without this,
   // a fresh-account ``cdk deploy --all`` can resolve dataLayer before the
-  // parent stacks publish their ARNs, silently baking a dummy value into
-  // the Lambda env and 502ing schema/metric-catalog calls until a redeploy.
+  // parent stack publishes its ARN, silently baking a dummy value into
+  // the Lambda env and 502ing schema calls until a redeploy.
   dataLayer.addDependency(ontology);
-  dataLayer.addDependency(metricService);
 
   // TODO: Re-enable other service stacks as they are implemented
   // const controlPlane = new ControlPlaneStack(app, `${stackPrefix}-control-plane`);

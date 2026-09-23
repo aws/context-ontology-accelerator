@@ -25,6 +25,53 @@ export function readOpenApiSpec(
 }
 
 /**
+ * Merges the `paths` of an overlay OpenAPI spec into `base`, mutating `base`.
+ *
+ * One REST API fronts two Smithy services, so their generated specs are
+ * combined at synth time. The merge is per method, which lets each spec
+ * contribute a different method on a shared path.
+ *
+ * A path+method defined by BOTH specs is a modelling error, not a conflict to
+ * resolve silently. API Gateway takes one integration per path, so a plain
+ * object spread would publish the losing operation's contract (its query
+ * parameters and response schema) in front of the winning operation's handler —
+ * an API whose documentation contradicts its behaviour, with a green build.
+ * Fail `cdk synth` instead.
+ *
+ * Scoped to `paths` deliberately: `components.schemas` legitimately overlaps,
+ * because shapes shared via `common.smithy` (e.g. `ValidationError`) are
+ * emitted identically into both specs.
+ */
+export function mergeOpenApiPaths(
+  base: Record<string, any>,
+  overlay: Record<string, any>,
+): Record<string, any> {
+  base.paths = base.paths ?? {};
+
+  for (const [apiPath, methods] of Object.entries<any>(overlay.paths ?? {})) {
+    const existing = base.paths[apiPath];
+    if (!existing) {
+      base.paths[apiPath] = methods;
+      continue;
+    }
+
+    const clashes = Object.keys(methods).filter((method) => method in existing);
+    if (clashes.length > 0) {
+      throw new Error(
+        `OpenAPI merge conflict on "${apiPath}": [${clashes.join(", ")}] ` +
+          `defined by both specs. A path+method resolves to a single API Gateway ` +
+          `integration, so give the duplicate operation its own path or remove it ` +
+          `from its service.`,
+      );
+    }
+
+    base.paths[apiPath] = { ...existing, ...methods };
+  }
+
+  return base;
+}
+
+/**
  * Mapping of API path to the Lambda ARN(s) that handle it.
  *
  * - A string value routes all HTTP methods to that Lambda.

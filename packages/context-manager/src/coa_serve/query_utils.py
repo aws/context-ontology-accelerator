@@ -310,6 +310,43 @@ def _iter_word_runs(query: str) -> Iterator[tuple[list[str], str | None]]:
         yield current, current_script
 
 
+def iter_word_tokens(text: str) -> Iterator[str]:
+    """Yield ``text``'s word tokens: grapheme-preserving runs split at script transitions.
+
+    The segmentation is :func:`_iter_word_runs`'s — Latin/digit runs keep their
+    internal connectors (``-``/``_``), and scripts written without spaces yield
+    one run per script stretch (a Han run, then a Hiragana run, ...). This is the
+    shared tokenizer for callers that need to test individual question words
+    against a closed word list (Tier-1's residual gate) rather than build search
+    terms. Unlike :func:`build_query_search_plan` it applies no grapheme floors,
+    no stop-word filtering, and does NOT drop hiragana runs: for a residual gate,
+    dropping a run hides a qualifier — the unsafe direction (a hiragana time word
+    like ``きのう`` must survive to trip the gate).
+
+    Default-ignorable code points are stripped first, exactly as in
+    :func:`build_query_search_plan`, so an invisible character cannot split a
+    word into two tokens neither of which matches a stop-word list.
+    """
+    text = _DEFAULT_IGNORABLE_RE.sub("", text)
+    for clusters, _script in _iter_word_runs(text):
+        yield "".join(clusters)
+
+
+def is_unspaced_script_letter(character: str) -> bool:
+    r"""Return whether ``character`` is a letter of a script without reliable spaces.
+
+    True for letters of the scripts eligible for reverse containment (see
+    :data:`_CONTAINER_LETTER`): scripts that omit word spaces entirely
+    (Han/Kana/Thai/Lao/Khmer/Myanmar) or attach particles, case endings, or
+    articles directly to the word (Hangul, Devanagari, Bengali, Arabic, Hebrew,
+    Cyrillic, ...). For these, a regex ``\b`` boundary asserts a transition that
+    natural text never provides (``総売上は`` has no ``\b`` between the metric
+    name and the particle), so word-boundary matching must be disabled at that
+    edge. False for Latin/Greek letters, digits, and everything else.
+    """
+    return bool(character) and bool(_CONTAINER_LETTER_RE.match(character[0]))
+
+
 def _uses_non_latin_floor(clusters: list[str]) -> bool:
     """Return whether a run is a non-Latin word eligible for the 2-cluster floor."""
     has_letter = False

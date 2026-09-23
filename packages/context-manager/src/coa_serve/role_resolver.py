@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import structlog
-from coa_common import build_principal_keys, resolve_region
+from coa_common import build_principal_keys, resolve_region, sync_boto_config
 from coa_common.dao import DynamoDBDAO, QueryParams
 
 # Re-export for callers that historically imported this from coa_serve. The
@@ -101,7 +101,10 @@ def resolve_profile(
     if not _RRM_TABLE:
         return result
 
-    dao = DynamoDBDAO(_RRM_TABLE, region=_AWS_REGION)
+    # Authorization is on the synchronous serve invoke() request path. Opt into
+    # the fail-fast profile instead of inheriting the DAO's background
+    # 30-second/three-attempt default (matches the Cedar policy loader's #1092 fix).
+    dao = DynamoDBDAO(_RRM_TABLE, region=_AWS_REGION, config=sync_boto_config())
 
     principal_keys = build_principal_keys(user_id=user_id, email=email, groups=groups)
 

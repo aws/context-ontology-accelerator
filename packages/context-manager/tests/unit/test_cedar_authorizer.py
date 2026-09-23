@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import pytest
+import structlog
 from coa_serve.tier2.cedar_authorizer import (
     NullCedarAuthorizer,
     RealCedarAuthorizer,
@@ -147,9 +148,10 @@ class TestDdbPolicyLoader:
         items = items or {}
 
         class _FakeDao:
-            def __init__(self, table_name, *, region):
+            def __init__(self, table_name, *, region, config=None):
                 self.table_name = table_name
                 self.region = region
+                self.config = config
 
             def get(self, key, *, projection=None):
                 if get_raises is not None:
@@ -158,6 +160,11 @@ class TestDdbPolicyLoader:
 
         monkeypatch.setattr(mod, "DynamoDBDAO", _FakeDao)
         return mod._DdbPolicyLoader("roles-table", "us-east-1")
+
+    def test_uses_sync_timeout_profile(self, monkeypatch):
+        loader = self._loader_with(monkeypatch)
+        assert loader._dao.config.read_timeout == 8
+        assert loader._dao.config.retries["max_attempts"] == 2
 
     def test_global_wins_over_namespace_template(self, monkeypatch):
         # Both PKs hold a policy for the role; GLOBAL is consulted first and
@@ -188,7 +195,12 @@ class TestDdbPolicyLoader:
         # A non-NotFound ClientError (DAO re-raises it) is caught → None → seeds.
         # This preserves the fail-SAFE-to-seeds contract through the DAO swap.
         loader = self._loader_with(monkeypatch, get_raises=RuntimeError("throttled"))
-        assert loader.policies_for_roles({"data-analyst"}) is None
+        with structlog.testing.capture_logs() as logs:
+            assert loader.policies_for_roles({"data-analyst"}) is None
+
+        warning = next(log for log in logs if log["event"] == "cedar_ddb_policy_load_failed")
+        assert warning["error"] == "RuntimeError"
+        assert warning["fallback"] == "seed-policies"
 
     def test_ttl_cache_avoids_second_read(self, monkeypatch):
         loader = self._loader_with(
