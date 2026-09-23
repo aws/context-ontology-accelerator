@@ -20,6 +20,7 @@ from coa_common.aws_user_agent import USER_AGENT_EXTRA, install_user_agent
 from coa_common.bedrock import (
     BedrockClient,
     BedrockInvocationResult,
+    BedrockTruncationError,
     GuardrailBlockedError,
     InputTooLargeError,
 )
@@ -125,6 +126,7 @@ __all__ = [
     "BedrockEmbedder",
     "make_llama_index_embedding",
     "BedrockInvocationResult",
+    "BedrockTruncationError",
     "GuardrailBlockedError",
     "GuardrailScreener",
     "GuardrailScreenerError",

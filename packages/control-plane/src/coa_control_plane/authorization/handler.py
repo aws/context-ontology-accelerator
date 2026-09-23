@@ -24,7 +24,7 @@ from typing import Any
 
 import structlog
 from coa_authorization.policy_evaluator import evaluate
-from coa_common import sanitize_principal_key
+from coa_common import sanitize_principal_key, sync_boto_config
 from coa_common.auth import (
     TokenAuthorizer,
     TokenValidationResult,
@@ -136,7 +136,11 @@ def _get_cache_invalidation_dao() -> DynamoDBDAO | None:
     table = os.environ.get("CACHE_INVALIDATION_TABLE_NAME")
     if not table:
         return None
-    _cache_invalidation_dao = DynamoDBDAO(table, region=os.environ["AWS_REGION"])
+    # The Lambda authorizer runs on every gated request (result caching is
+    # disabled). Fail fast instead of inheriting the DAO's background
+    # 30-second/three-attempt default (matches the Cedar policy loader's
+    # #1092 fix) — a DynamoDB brownout here must not stall the authorizer.
+    _cache_invalidation_dao = DynamoDBDAO(table, region=os.environ["AWS_REGION"], config=sync_boto_config())
     return _cache_invalidation_dao
 
 
@@ -189,7 +193,8 @@ def _get_namespaces_dao() -> DynamoDBDAO:
         raise RuntimeError(
             "NAMESPACES_TABLE_NAME and AWS_REGION must be configured to evaluate the ARCHIVED namespace mutation guard"
         )
-    _namespaces_dao = DynamoDBDAO(table, region=region)
+    # Same synchronous-authorizer rationale as _get_cache_invalidation_dao above.
+    _namespaces_dao = DynamoDBDAO(table, region=region, config=sync_boto_config())
     return _namespaces_dao
 
 
@@ -782,7 +787,9 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
     resource_roles: list[dict[str, str]] = []
 
     if rrm_table:
-        rrm_dao = DynamoDBDAO(rrm_table, region=region)
+        # Role resolution runs on every gated request. Fail fast instead of
+        # inheriting the DAO's background 30-second/three-attempt default.
+        rrm_dao = DynamoDBDAO(rrm_table, region=region, config=sync_boto_config())
         try:
             global_roles, resource_roles = _resolve_roles(principal_id, result.groups, rrm_dao)
         except Exception:
@@ -823,7 +830,9 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
             # exist. (Configuration/DynamoDB errors raise above and fail closed.)
 
     if roles_table:
-        roles_dao = DynamoDBDAO(roles_table, region=region)
+        # Cedar evaluation runs on every gated request. Same fail-fast
+        # rationale as rrm_dao above.
+        roles_dao = DynamoDBDAO(roles_table, region=region, config=sync_boto_config())
 
         try:
             is_allowed = _evaluate_cedar(

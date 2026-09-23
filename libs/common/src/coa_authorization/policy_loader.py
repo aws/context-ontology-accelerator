@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
+from coa_common.aws_config import sync_boto_config
 from coa_common.dao import DynamoDBDAO
 
 # Partition keys where role definitions live in the Roles table.
@@ -41,7 +42,11 @@ def load_policies_for_roles(
     Returns:
         Concatenated Cedar policy text (newline-separated), or empty string.
     """
-    dao = DynamoDBDAO(table_name, region=region)
+    # Both known callers (the control-plane authorizer Lambda and the MCP
+    # server grant resolver) are on a synchronous request path. Fail fast
+    # instead of inheriting the DAO's background 30-second/three-attempt
+    # default (matches the Cedar policy loader's #1092 fix).
+    dao = DynamoDBDAO(table_name, region=region, config=sync_boto_config())
     policies = ""
 
     for role_id in role_ids:

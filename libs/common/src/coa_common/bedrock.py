@@ -102,6 +102,22 @@ class GuardrailBlockedError(Exception):
     """Raised when a Bedrock Guardrail blocks the LLM response."""
 
 
+class BedrockTruncationError(ValueError):
+    """Raised when Bedrock exhausts the requested output-token budget."""
+
+    def __init__(self, *, model_id: str, output_tokens: int, max_tokens: int) -> None:
+        """Capture the safe diagnostics needed to identify budget exhaustion."""
+        self.model_id = model_id
+        self.stop_reason = "max_tokens"
+        self.output_tokens = output_tokens
+        self.max_tokens = max_tokens
+        super().__init__(
+            "Bedrock response truncated: "
+            f"model={model_id} stop_reason={self.stop_reason} "
+            f"output_tokens={output_tokens} requested_max_tokens={max_tokens}"
+        )
+
+
 class InputTooLargeError(ValueError):
     """Raised when the combined prompt exceeds the configured input-size cap."""
 
@@ -218,6 +234,25 @@ class BedrockClient:
             usage = response.get("usage", {})
             input_tokens = usage.get("inputTokens", 0)
             output_tokens = usage.get("outputTokens", 0)
+
+            # ``max_tokens`` means any text/content envelope is expected to be
+            # incomplete. Classify it before indexing the envelope or parsing
+            # JSON so even a response that ends between content blocks retains
+            # the actionable truncation contract.
+            if stop_reason == "max_tokens":
+                logger.warning(
+                    "Bedrock response truncated: model=%s stop_reason=%s output_tokens=%s requested_max_tokens=%s",
+                    self._model_id,
+                    stop_reason,
+                    output_tokens,
+                    max_tokens,
+                )
+                raise BedrockTruncationError(
+                    model_id=self._model_id,
+                    output_tokens=output_tokens,
+                    max_tokens=max_tokens,
+                )
+
             output_message = response["output"]["message"]
             content_blocks = output_message.get("content", [])
             logger.info(
@@ -294,7 +329,7 @@ class BedrockClient:
                 output_tokens=output_tokens,
                 latency_ms=latency_ms,
             )
-        except GuardrailBlockedError:
+        except (GuardrailBlockedError, BedrockTruncationError):
             raise
         except (KeyError, IndexError, json.JSONDecodeError) as e:
             logger.error("Failed to parse Bedrock response: %s", e)

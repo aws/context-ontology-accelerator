@@ -1,0 +1,54 @@
+/* Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+   SPDX-License-Identifier: Apache-2.0 */
+
+/* Ontology graph (OntologyGraphFlow) — motion and hover feedback. */
+
+.coa-graph-node {
+  transition:
+    transform 120ms ease-out,
+    box-shadow 120ms ease-out,
+    opacity 150ms ease-out;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.25);
+}
+
+.react-flow__node:hover .coa-graph-node,
+.react-flow__node.selected .coa-graph-node {
+  transform: scale(1.08);
+  box-shadow:
+    0 0 0 4px rgba(255, 255, 255, 0.55),
+    0 6px 16px rgba(15, 23, 42, 0.35);
+  z-index: 1;
+}
+
+.react-flow__node.dragging .coa-graph-node {
+  cursor: grabbing;
+  transform: scale(1.12);
+}
+
+/* Edges fade rather than pop when a node is hovered. */
+.react-flow__edge-path {
+  transition:
+    opacity 150ms ease-out,
+    stroke-width 150ms ease-out;
+}
+
+/* Edge label boxes: keep them crisp and readable over the dark canvas. */
+.react-flow__edge-textbg {
+  filter: drop-shadow(0 1px 1px rgba(15, 23, 42, 0.3));
+}
+
+/* HTML edge labels (force layout): WebVOWL-style opaque boxes. */
+.coa-graph-edge-label {
+  position: absolute;
+  pointer-events: none;
+  background: #ffffff;
+  color: #0f172a;
+  border: 1px solid #cbd5e1;
+  border-radius: 3px;
+  padding: 1px 5px;
+  font:
+    500 10px/1.3 system-ui,
+    sans-serif;
+  white-space: nowrap;
+  transition: opacity 150ms ease-out;
+}

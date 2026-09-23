@@ -162,6 +162,32 @@ class TestLoadConfig:
         with pytest.raises(FrozenInstanceError):
             config.guardrail_id = "new-value"
 
+    @patch("coa_serve.config.boto3")
+    def test_tier1_metric_timeout_defaults_to_35_seconds(self, mock_boto3):
+        mock_ssm = MagicMock()
+        mock_ssm.get_parameter.return_value = {"Parameter": {"Value": "gr-test"}}
+        mock_boto3.client.return_value = mock_ssm
+
+        assert load_config().tier1_metric_timeout_s == 35
+
+    @patch.dict("os.environ", {"TIER1_METRIC_TIMEOUT_S": "75"})
+    @patch("coa_serve.config.boto3")
+    def test_tier1_metric_timeout_env_override(self, mock_boto3):
+        mock_ssm = MagicMock()
+        mock_ssm.get_parameter.return_value = {"Parameter": {"Value": "gr-test"}}
+        mock_boto3.client.return_value = mock_ssm
+
+        assert load_config().tier1_metric_timeout_s == 75
+
+    @patch.dict("os.environ", {"TIER1_METRIC_TIMEOUT_S": "999"})
+    @patch("coa_serve.config.boto3")
+    def test_tier1_metric_timeout_out_of_range_falls_back(self, mock_boto3):
+        mock_ssm = MagicMock()
+        mock_ssm.get_parameter.return_value = {"Parameter": {"Value": "gr-test"}}
+        mock_boto3.client.return_value = mock_ssm
+
+        assert load_config().tier1_metric_timeout_s == 35
+
 
 @pytest.mark.unit
 class TestDeepReasoningBudgetConfig:

@@ -26,6 +26,28 @@ function connectorEgress(template: Template): any[] {
   return connector.Properties.SecurityGroupEgress ?? [];
 }
 
+/** Egress rules of the shared Lambda security group. */
+function lambdaEgress(template: Template): any[] {
+  const sgs = template.findResources("AWS::EC2::SecurityGroup");
+  const lambda = (Object.values(sgs) as any[]).find((sg) =>
+    (sg.Properties.GroupDescription as string).startsWith("Lambda functions"),
+  );
+  expect(lambda).toBeDefined();
+  return lambda.Properties.SecurityGroupEgress ?? [];
+}
+
+/** Egress rules dedicated to direct-discovery Snowflake OCSP. */
+function discoveryOcspEgress(template: Template): any[] {
+  const sgs = template.findResources("AWS::EC2::SecurityGroup");
+  const discovery = (Object.values(sgs) as any[]).find((sg) =>
+    (sg.Properties.GroupDescription as string).startsWith(
+      "Snowflake discovery OCSP",
+    ),
+  );
+  expect(discovery).toBeDefined();
+  return discovery.Properties.SecurityGroupEgress ?? [];
+}
+
 function buildStackWithEnv(context: Record<string, string> = {}): Template {
   const app = new cdk.App({ context });
   const stack = new NetworkStack(app, "TestNetwork", { env: TEST_ENV });
@@ -209,25 +231,40 @@ describe("NetworkStack", () => {
       }
     });
 
-    it("Connector SG allows port 80 for OCSP by default", () => {
-      // Only the Snowflake driver performs internet OCSP, and it is HTTP-only.
-      // Without this rule every connect burns 5-30s per responder before failing
-      // open, which is a live risk against the discovery Lambda's 900s timeout.
-      const egress = connectorEgress(buildStack());
+    it("Connector and direct-discovery SGs allow port 80 for Snowflake OCSP by default", () => {
+      const template = buildStack();
+      for (const egress of [
+        connectorEgress(template),
+        discoveryOcspEgress(template),
+      ]) {
+        expect(
+          egress.some((r: any) => r.FromPort === 80 && r.ToPort === 80),
+        ).toBe(true);
+        expect(
+          egress.some(
+            (r: any) => r.IpProtocol === "-1" && r.CidrIp === "0.0.0.0/0",
+          ),
+        ).toBe(false);
+      }
       expect(
-        egress.some((r: any) => r.FromPort === 80 && r.ToPort === 80),
-      ).toBe(true);
+        lambdaEgress(template).some(
+          (r: any) => r.FromPort === 80 && r.ToPort === 80,
+        ),
+      ).toBe(false);
     });
 
-    it("Connector SG drops the OCSP rule when connector_ocsp_egress=false", () => {
+    it("Connector and direct-discovery SGs drop OCSP when connector_ocsp_egress=false", () => {
       // A deployment with no Snowflake source has no use for port 80 egress.
-      const egress = connectorEgress(
-        buildStack({ connector_ocsp_egress: "false" }),
-      );
-      expect(
-        egress.some((r: any) => r.FromPort === 80 && r.ToPort === 80),
-      ).toBe(false);
-      // The rest of the connector's egress is untouched.
+      const template = buildStack({ connector_ocsp_egress: "false" });
+      for (const egress of [
+        connectorEgress(template),
+        discoveryOcspEgress(template),
+      ]) {
+        expect(
+          egress.some((r: any) => r.FromPort === 80 && r.ToPort === 80),
+        ).toBe(false);
+      }
+      const egress = connectorEgress(template);
       expect(
         egress.some((r: any) => r.FromPort === 443 && r.ToPort === 443),
       ).toBe(true);
@@ -256,6 +293,20 @@ describe("NetworkStack", () => {
           ).toBe(true);
         }
       }
+    });
+
+    it("connector_egress_cidrs also scopes direct-discovery OCSP egress", () => {
+      const egress = discoveryOcspEgress(
+        buildStack({
+          connector_egress_cidrs: "10.20.0.0/16,192.0.2.10/32",
+        }),
+      ).filter((r: any) => r.FromPort === 80 && r.ToPort === 80);
+
+      expect(egress).toHaveLength(2);
+      expect(egress.map((r: any) => r.CidrIp).sort()).toEqual(
+        ["10.20.0.0/16", "192.0.2.10/32"].sort(),
+      );
+      expect(egress.some((r: any) => r.CidrIp === "0.0.0.0/0")).toBe(false);
     });
   });
 

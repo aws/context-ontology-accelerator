@@ -14,6 +14,7 @@ from coa_common.bedrock import (
     FALLBACK_CHAT_MODEL_ID,
     BedrockClient,
     BedrockInvocationResult,
+    BedrockTruncationError,
     GuardrailBlockedError,
     InputTooLargeError,
     extract_text_blocks,
@@ -174,6 +175,42 @@ class TestBedrockClient:
         client = BedrockClient(region="us-east-1")
         with pytest.raises(ValueError, match="Invalid Bedrock response format"):
             client.invoke("system", "user")
+
+    @patch("coa_common.bedrock.boto3")
+    def test_invoke_reports_max_tokens_as_truncation_before_json_parsing(self, mock_boto3):
+        mock_client = MagicMock()
+        mock_boto3.client.return_value = mock_client
+
+        mock_client.converse.return_value = {
+            "output": {"message": {"content": [{"text": '{"tables": [{"name": "orders"'}]}},
+            "stopReason": "max_tokens",
+            "usage": {"inputTokens": 100, "outputTokens": 512},
+        }
+
+        client = BedrockClient(region="us-east-1", model_id="test-model")
+        with pytest.raises(BedrockTruncationError) as raised:
+            client.invoke("system", "user", max_tokens=512)
+
+        exc = raised.value
+        assert exc.model_id == "test-model"
+        assert exc.stop_reason == "max_tokens"
+        assert exc.output_tokens == 512
+        assert exc.max_tokens == 512
+        assert "Invalid Bedrock response format" not in str(exc)
+        assert "requested_max_tokens=512" in str(exc)
+
+    @patch("coa_common.bedrock.boto3")
+    def test_invoke_reports_max_tokens_even_when_output_envelope_is_incomplete(self, mock_boto3):
+        mock_client = MagicMock()
+        mock_boto3.client.return_value = mock_client
+        mock_client.converse.return_value = {
+            "stopReason": "max_tokens",
+            "usage": {"inputTokens": 100, "outputTokens": 512},
+        }
+
+        client = BedrockClient(region="us-east-1", model_id="test-model")
+        with pytest.raises(BedrockTruncationError, match="stop_reason=max_tokens"):
+            client.invoke("system", "user", max_tokens=512)
 
     @patch("coa_common.bedrock.boto3")
     def test_invoke_raises_on_empty_content(self, mock_boto3):

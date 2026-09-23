@@ -1,7 +1,7 @@
 # Document processing — [pdf,docx] extras pull in all transitive deps
 # (unstructured-inference, spacy, pi-heif, etc.) needed at import time.
 # We use strategy="fast" at runtime to skip ML model inference.
-unstructured[pdf,docx]>=0.27.5
+unstructured[pdf,docx]>=0.27.6
 
 # Scanned PDF detection + page rendering for Textract.
 # pillow is used directly to encode rendered pages as PNG (bitmap.to_pil()).

@@ -3,7 +3,7 @@
 # Pin to digest to prevent supply-chain attacks via tag mutation. The pin is for
 # supply-chain integrity only, NOT patch currency — see the apt-get upgrade below.
 # python:3.12-slim, digest resolved from the tag on 2026-09-01 (linux/arm64).
-FROM --platform=linux/arm64 public.ecr.aws/docker/library/python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea
+FROM --platform=linux/arm64 public.ecr.aws/docker/library/python:3.12-slim@sha256:2f17fc044b579bab302c2e8054d3a686e2cb9a83de48e70534b94cd8ebbe06a9
 
 WORKDIR /app
 
@@ -34,7 +34,9 @@ RUN pip install --no-cache-dir uv && \
     sed -i '/\[tool.uv.sources\]/,$ d' pyproject.toml && \
     sed -i '/\[tool.uv.sources\]/,$ d' /tmp/mcp-server/pyproject.toml && \
     uv pip install --system --no-cache . /tmp/mcp-server/ && \
-    rm -rf /tmp/mcp-server/
+    rm -rf /tmp/mcp-server/ && \
+    pip install --no-cache-dir --upgrade pip "setuptools>=78.1.1" && \
+    pip uninstall -y msgpack
 
 EXPOSE 8080
 
