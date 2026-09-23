@@ -8,13 +8,13 @@ from __future__ import annotations
 import pytest
 from coa_serve.tier1 import stopwords
 from coa_serve.tier1.metric_resolver import _RESIDUAL_STOP_WORDS
-from coa_serve.tier1.stopwords import en, ko
+from coa_serve.tier1.stopwords import en, ja, ko
 
 
 @pytest.mark.unit
 class TestMergedSet:
     def test_merge_is_the_union_of_all_language_modules(self):
-        expected = frozenset(w for g in (*en.GROUPS, *ko.GROUPS) for w in g.split())
+        expected = frozenset(w for g in (*en.GROUPS, *ko.GROUPS, *ja.GROUPS) for w in g.split())
         assert expected == stopwords.RESIDUAL_STOP_WORDS
 
     def test_resolver_consumes_the_merged_set(self):
@@ -23,6 +23,7 @@ class TestMergedSet:
     def test_every_language_contributes(self):
         assert "please" in stopwords.RESIDUAL_STOP_WORDS  # en
         assert "알려줘" in stopwords.RESIDUAL_STOP_WORDS  # ko
+        assert "いくら" in stopwords.RESIDUAL_STOP_WORDS  # ja
 
     def test_groups_are_nonempty(self):
         for group in stopwords.RESIDUAL_STOP_WORD_GROUPS:
@@ -53,4 +54,15 @@ class TestCurationPolicy:
         ["평균", "누적", "순", "오늘", "어제", "지난주", "지난달", "올해", "작년"],
     )
     def test_korean_qualifier_words_are_absent(self, word):
+        assert word not in stopwords.RESIDUAL_STOP_WORDS
+
+    @pytest.mark.parametrize(
+        "word",
+        # 平均/純 change which aggregate is asked for; the rest are time
+        # windows. きのう also guards the hiragana DP decomposition: it must
+        # fail decomposition and survive as residual, so it may never be
+        # stop-listed.
+        ["平均", "純", "今日", "昨日", "先月", "きのう"],
+    )
+    def test_japanese_qualifier_words_are_absent(self, word):
         assert word not in stopwords.RESIDUAL_STOP_WORDS

@@ -121,6 +121,7 @@ class Orchestrator:
         oss_ontology_index: str | None = None,
         agentic_retriever: AgenticRetriever | None = None,
         tier3_deep_reasoning_default: bool = False,
+        tier1_metric_timeout_s: int = 35,
     ):
         """Wire the per-tier resolvers and optional gating/skip helpers.
 
@@ -145,6 +146,7 @@ class Orchestrator:
             tier3_deep_reasoning_default: Whether deep reasoning is the deployment
                 default for Tier 3 (set when
                 config.tier3_strategy=="deep-reasoning").
+            tier1_metric_timeout_s: Configured Tier-1 statement timeout (1..300).
         """
         self._metric_resolver = metric_resolver
         self._knowledge_retriever = knowledge_retriever
@@ -180,6 +182,9 @@ class Orchestrator:
         # existing hand-rolled / lexical KnowledgeRetriever — purely additive.
         self._agentic_retriever = agentic_retriever
         self._tier3_deep_reasoning_default = tier3_deep_reasoning_default
+        if not 1 <= tier1_metric_timeout_s <= 300:
+            raise ValueError("tier1_metric_timeout_s must be in the range 1..300")
+        self._tier1_metric_timeout_s = tier1_metric_timeout_s
 
     async def resolve(
         self,
@@ -283,7 +288,15 @@ class Orchestrator:
 
         # ── Tier 1: Metric Resolver ──────────────────────────────────
         if self._should_run_tier1(tier_override, start_tier, gating):
-            result = await self._run_tier1(query, namespace, profile, options, trace, model_id=model_id_override)
+            result = await self._run_tier1(
+                query,
+                namespace,
+                profile,
+                options,
+                trace,
+                model_id=model_id_override,
+                deadline=deadline,
+            )
             if result:
                 return result
             metric_definitions = self._metric_resolver.list_all(namespace) or None
@@ -777,6 +790,7 @@ class Orchestrator:
         options: dict,
         trace: TraceCollector,
         model_id: str | None = None,
+        deadline: Deadline | None = None,
     ) -> InvokeResponse | None:
         t1_start = time.perf_counter()
         metric_match = await self._metric_resolver.match(query, namespace)
@@ -985,9 +999,39 @@ class Orchestrator:
             )
 
             exec_start = time.perf_counter()
+            remaining_s = deadline.remaining_s() if deadline is not None else None
+            if remaining_s is not None and remaining_s < 1:
+                trace.record(
+                    StepId.T1_EXECUTE,
+                    "skipped",
+                    0,
+                    detail={
+                        "reason": "request deadline exhausted",
+                        "remainingSeconds": round(remaining_s, 3),
+                    },
+                    tool_used="sql-engine",
+                )
+                logger.info(
+                    "tier1_execute_skipped_deadline",
+                    namespace=namespace,
+                    remaining_seconds=round(remaining_s, 3),
+                )
+                return None
+            timeout_seconds = self._tier1_metric_timeout_s
+            if remaining_s is not None:
+                timeout_seconds = min(
+                    timeout_seconds,
+                    # All concrete executors require a positive integer. The
+                    # <1s branch above skips execution, and max(1, ...) keeps
+                    # that invariant explicit if the boundary logic changes.
+                    max(1, int(remaining_s)),
+                )
             try:
                 result = await self._query_executor.execute(
-                    fw_result.authorized_sql, data_source_id=metric_match.data_source_id, namespace=namespace
+                    fw_result.authorized_sql,
+                    data_source_id=metric_match.data_source_id,
+                    namespace=namespace,
+                    timeout_seconds=timeout_seconds,
                 )
             except Exception as e:
                 exec_ms = int((time.perf_counter() - exec_start) * 1000)
@@ -995,7 +1039,11 @@ class Orchestrator:
                     StepId.T1_EXECUTE,
                     "error",
                     exec_ms,
-                    detail={"error": type(e).__name__, "message": str(e)[:120]},
+                    detail={
+                        "error": type(e).__name__,
+                        "message": str(e)[:120],
+                        "timeoutSeconds": timeout_seconds,
+                    },
                     tool_used="sql-engine",
                 )
                 logger.warning(
@@ -1004,6 +1052,7 @@ class Orchestrator:
                     metric=metric_match.metric_name,
                     error=type(e).__name__,
                     detail=str(e)[:200],
+                    timeout_seconds=timeout_seconds,
                 )
                 # A cross-namespace SQL reference is a policy denial, not a data-source
                 # outage: surface it as 403 with its (non-sensitive) policy reason.
@@ -1027,6 +1076,7 @@ class Orchestrator:
                     "rowCount": result.row_count,
                     "table": metric_match.data_source_id or "unknown",
                     "truncated": result.truncated,
+                    "timeoutSeconds": timeout_seconds,
                     # (A2) executing engine — athena | redshift | jdbc.
                     "engine": result.engine or "unknown",
                 },

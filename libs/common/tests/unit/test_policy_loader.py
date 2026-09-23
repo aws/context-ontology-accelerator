@@ -93,4 +93,21 @@ class TestLoadPoliciesForRoles:
 
         load_policies_for_roles(["r"], table_name="my-roles", region="eu-west-1")
 
-        mock_dao_cls.assert_called_once_with("my-roles", region="eu-west-1")
+        mock_dao_cls.assert_called_once()
+        assert mock_dao_cls.call_args.args == ("my-roles",)
+        assert mock_dao_cls.call_args.kwargs["region"] == "eu-west-1"
+
+    @patch("coa_authorization.policy_loader.DynamoDBDAO")
+    def test_uses_sync_timeout_profile(self, mock_dao_cls):
+        # Both known callers (control-plane authorizer, MCP grant resolver) are
+        # on a synchronous request path — the DAO must fail fast, not inherit
+        # the DAO's background 30-second/three-attempt default.
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = None
+        mock_dao_cls.return_value = mock_dao
+
+        load_policies_for_roles(["r"], table_name="roles", region="us-east-1")
+
+        config = mock_dao_cls.call_args.kwargs["config"]
+        assert config.read_timeout == 8
+        assert config.retries["max_attempts"] == 2

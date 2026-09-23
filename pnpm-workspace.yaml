@@ -17,6 +17,14 @@ allowBuilds:
 # config. Do not re-nest them.
 blockExoticSubdeps: true
 trustPolicy: no-downgrade
+# These exact versions predate the policy activation and are pinned by the
+# committed lockfile. pnpm 11+ audits frozen lockfiles and reports them as trust
+# downgrades because their registry evidence is weaker than an earlier publish.
+# Keep the exceptions version-scoped so upgrades are evaluated normally.
+trustPolicyExclude:
+  - pnpm@10.34.5
+  - semver@6.3.1
+  - undici-types@6.21.0
 
 # Quarantine newly-published packages for 7 days before allowing install.
 # The unit is MINUTES as a number (7 * 24 * 60). A duration string like "7 days" is

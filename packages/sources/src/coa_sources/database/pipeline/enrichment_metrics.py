@@ -14,6 +14,7 @@ import json
 import logging
 
 from botocore.exceptions import ClientError
+from coa_common.bedrock import BedrockTruncationError
 
 from coa_sources.database.metrics import emit_metric
 
@@ -129,6 +130,8 @@ class EnrichmentMetricEmitter:
 
 def _classify_bedrock_error(exc: Exception) -> str:
     """Classify a Bedrock error into a metric ErrorType dimension value."""
+    if isinstance(exc, BedrockTruncationError):
+        return "Truncated"
     if isinstance(exc, ClientError):
         code = exc.response.get("Error", {}).get("Code", "")
         if code in _THROTTLE_CODES:

@@ -18,6 +18,7 @@ import asyncio
 import contextlib
 import difflib
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, TypedDict
 
@@ -25,7 +26,7 @@ import sqlglot
 import structlog
 from coa_common.constants import URN_PREFIX as _URN_PREFIX
 
-from coa_serve.query_utils import get_graph_uri_template
+from coa_serve.query_utils import get_graph_uri_template, is_unspaced_script_letter, iter_word_tokens
 from coa_serve.tier1.stopwords import RESIDUAL_STOP_WORDS
 
 if TYPE_CHECKING:
@@ -118,6 +119,24 @@ _METRIC_QUERY_MAX_RESULTS = 5000
 # is not mistaken for a placeholder); the ``{}`` form is unambiguous.
 _PLACEHOLDER_RE = re.compile(r"(?<!:):([a-zA-Z_][a-zA-Z0-9_]*)|\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
 
+
+def _fold(text: str) -> str:
+    """NFKC-normalize and lowercase ``text`` for metric-index matching.
+
+    Japanese input routinely mixes full- and half-width forms (``ＫＰＩ``,
+    ``ｋＷｈ``, full-width digits); NFKC folds these onto the code points the
+    stored names use. Unlike ``normalize_label_match_text`` — which must stay
+    NFKC-free because it is compared against RDF labels persisted verbatim —
+    both sides here (the in-memory index at build time, the query at match
+    time) pass through this same function, so compatibility normalization is
+    symmetric and cannot un-match a stored spelling.
+
+    ``lower()`` (not ``casefold()``) deliberately, to stay consistent with the
+    dimension path's lower/casefold invariant (see ``substitute_dimensions``).
+    """
+    return unicodedata.normalize("NFKC", text).lower()
+
+
 # ── Residual-qualifier detection ─────────────────────────────────────────────
 #
 # A Tier-1 match is a whole-question substring search: a metric whose synonym is
@@ -143,13 +162,63 @@ _PLACEHOLDER_RE = re.compile(r"(?<!:):([a-zA-Z_][a-zA-Z0-9_]*)|\{([a-zA-Z_][a-zA
 # listed) and the guide for adding a language.
 _RESIDUAL_STOP_WORDS = RESIDUAL_STOP_WORDS
 
-# Punctuation that never carries a qualifier. Tokenising on word characters alone
-# would silently drop a hyphenated or possessive qualifier, so we split on
-# non-word runs and keep every word-ish token.
-# Hangul syllables are included: an ASCII-only pattern produces zero residual
-# tokens for Korean questions, so every Korean question sailed through the
-# gate as if it had no unconsumed qualifiers (GitHub issue #95).
-_RESIDUAL_TOKEN_RE = re.compile(r"[a-z0-9_%$\uac00-\ud7a3]+")
+# Tokenization for the residual gate is the shared script-run segmentation
+# (``iter_word_tokens``): Latin/digit runs keep hyphenated/possessive qualifiers
+# intact, and unsegmented scripts yield one run per script stretch, so a Japanese
+# particle (hiragana) separates from the content word (kanji/katakana) it
+# follows. Tokenizing on ``[a-z0-9_]`` alone made every non-ASCII qualifier
+# invisible: the gate saw an empty residual and Tier-1 answered the UNFILTERED
+# question at confidence 1.0 — the exact silent-wrong-answer this gate exists to
+# prevent, reintroduced for every non-English question (GitHub issue #95; the
+# Hangul-range widening that first fixed Korean is subsumed by the script runs).
+
+# The hiragana block (U+3041–U+309F). NOT the katakana prolonged-sound mark:
+# katakana runs are content words and must never enter the decomposition below.
+_HIRAGANA_RUN_RE = re.compile(r"[\u3041-\u309f]+")
+
+# Ceiling on the hiragana run the decomposition below will attempt. The DP is
+# O(n²) over a token the caller controls (`serve.smithy` puts no @length on the
+# query), so an unbounded run is a CPU sink on one serve worker. A constant, not
+# a tuned bound: no polite-form scaffolding run comes anywhere near it
+# (「についてはどのくらいになっていますでしょうか」 is 22). Raise it if a real
+# scaffolding run ever exceeds it; an over-long run survives as residual and
+# trips the gate — the safe direction.
+_MAX_SCAFFOLDING_RUN = 64
+
+
+def _is_stop_scaffolding(token: str) -> bool:
+    """Return whether a residual ``token`` is question scaffolding.
+
+    Exact stop-word membership first. A HIRAGANA-ONLY token additionally passes
+    when it can be segmented entirely into stop-word pieces: contiguous hiragana
+    fuses into ONE word run under script-run tokenization (「はいくらですか」 is
+    a single token = は+いくら+ですか), so exact membership alone would demote
+    every politely-phrased Japanese question to Tier 2.
+
+    Restricted to hiragana-only tokens on purpose. Hiragana carries Japanese
+    grammar; the qualifier classes this gate exists to catch — dimension values,
+    entity names, time windows, aggregate modifiers — are written with kanji,
+    katakana, Latin, or digits, which this decomposition never touches. A
+    hiragana content word that is NOT fully composed of listed
+    particles/copula fragments (きのう, いま, すべて) still fails the
+    decomposition and trips the gate — the safe direction.
+    """
+    if token in _RESIDUAL_STOP_WORDS:
+        return True
+    if not _HIRAGANA_RUN_RE.fullmatch(token):
+        return False
+    if len(token) > _MAX_SCAFFOLDING_RUN:
+        return False
+    # DP over prefix positions: reachable[i] ⇔ token[:i] splits into stop words.
+    reachable = [True] + [False] * len(token)
+    for i in range(len(token)):
+        if not reachable[i]:
+            continue
+        for j in range(i + 1, len(token) + 1):
+            if token[i:j] in _RESIDUAL_STOP_WORDS:
+                reachable[j] = True
+    return reachable[len(token)]
+
 
 _FUZZY_MATCH_THRESHOLD = 0.88
 """Minimum SequenceMatcher ratio for a fuzzy metric near-miss to be accepted.
@@ -231,7 +300,7 @@ def merge_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
     return merged
 
 
-def residual_tokens(query: str, matched_spans: list[tuple[int, int]]) -> list[str]:
+def residual_tokens(folded_query: str, matched_spans: list[tuple[int, int]]) -> list[str]:
     """Return the query tokens left unconsumed by the metric match.
 
     Removes the character ranges the metric name/synonym matched on, then drops
@@ -241,24 +310,26 @@ def residual_tokens(query: str, matched_spans: list[tuple[int, int]]) -> list[st
     quarter"), or an entity that may not exist at all.
 
     Args:
-        query: The raw natural-language question.
-        matched_spans: ``(start, end)`` character offsets, into the LOWERCASED
-            query, of each name/synonym span that matched.
+        folded_query: The natural-language question, already passed through
+            :func:`_fold` (NFKC + lowercase). Folding must happen exactly once,
+            by the caller: NFKC can change string length, so the spans and the
+            text they index must come from the same folded string.
+        matched_spans: ``(start, end)`` character offsets, into ``folded_query``,
+            of each name/synonym span that matched.
 
     Returns:
         The unconsumed, non-stop-word tokens in query order. Empty means the
         match consumed the whole question and Tier-1 can answer it in full.
     """
-    lowered = query.lower()
     # Blank the matched spans rather than slicing them out, so the surviving
     # tokens keep their original boundaries (a span removal by concatenation
     # could fuse two neighbouring words into a spurious token).
-    chars = list(lowered)
+    chars = list(folded_query)
     for start, end in matched_spans:
         for i in range(max(0, start), min(len(chars), end)):
             chars[i] = " "
     remainder = "".join(chars)
-    return [t for t in _RESIDUAL_TOKEN_RE.findall(remainder) if t not in _RESIDUAL_STOP_WORDS]
+    return [t for t in iter_word_tokens(remainder) if not _is_stop_scaffolding(t)]
 
 
 def _metric_list_sparql(graph_uri_template: str = "") -> str:
@@ -479,9 +550,14 @@ class MetricResolver:
             )
 
             by_id[metric_id] = defn
-            by_name.setdefault(name.lower(), []).append(defn)
+            by_name.setdefault(_fold(name), []).append(defn)
             for syn in defn.synonyms:
-                by_synonym.setdefault(syn.lower(), []).append(defn)
+                # An empty synonym would compile to a bare `\b\b` pattern, which
+                # matches at every word boundary — i.e. EVERY query resolves to
+                # this metric. Skip it at index time.
+                if not syn:
+                    continue
+                by_synonym.setdefault(_fold(syn), []).append(defn)
 
             ns_key = defn.namespace.lower()
             by_namespace.setdefault(ns_key, []).append(defn)
@@ -490,7 +566,15 @@ class MetricResolver:
         # Replace underscores with flexible whitespace/underscore pattern for matching
         def _name_pattern(name: str) -> re.Pattern:
             escaped = re.escape(name).replace("_", r"[\s_]")
-            return re.compile(rf"\b{escaped}\b")
+            # `\b` is Unicode-aware, so it cannot separate a Latin-edged alias
+            # from adjacent CJK text: both sides are `\w` in 「月間kwh使用量」.
+            # For Latin/digit/underscore edges, reject only a neighbour from that
+            # same identifier alphabet. A CJK neighbour is a valid boundary.
+            # Unspaced-script edges need no assertion; their over-matches are
+            # handled by the residual/multi-match gates.
+            left = "" if is_unspaced_script_letter(name[:1]) else r"(?<![a-z0-9_])"
+            right = "" if is_unspaced_script_letter(name[-1:]) else r"(?![a-z0-9_])"
+            return re.compile(rf"{left}{escaped}{right}")
 
         # Build patterns for all metrics with each name/synonym
         name_patterns: dict[str, list[tuple[re.Pattern, MetricDefinition]]] = {}
@@ -511,7 +595,7 @@ class MetricResolver:
         Returns MetricMatch with match_count indicating how many distinct
         metrics were matched. match_count > 1 means multi-metric query.
         """
-        query_lower = query.lower()
+        query_lower = _fold(query)
         ns_lower = namespace.lower()
 
         matched_metrics: dict[str, tuple[MetricDefinition, str]] = {}
@@ -551,7 +635,7 @@ class MetricResolver:
         defn, source = matched_metrics[first_id]
 
         spans = matched_spans.get(first_id, [])
-        residual = residual_tokens(query, spans)
+        residual = residual_tokens(query_lower, spans)
         # Merged, so overlapping aliases don't repeat their shared text.
         matched_text = " ".join(query_lower[s:e] for s, e in merge_spans(spans))
 
@@ -584,7 +668,7 @@ class MetricResolver:
         """
         ns_lower = namespace.lower()
         snapshot = self._snapshot
-        q_tokens = re.findall(r"[a-z0-9_]+", query.lower())
+        q_tokens = list(iter_word_tokens(_fold(query)))
         if not q_tokens:
             return MetricMatch(found=False, match_count=0)
 
@@ -636,7 +720,7 @@ class MetricResolver:
             for target in (defn.name, *defn.synonyms):
                 if not target:
                     continue
-                ratio, token_range = _score(target.lower())
+                ratio, token_range = _score(_fold(target))
                 if ratio > best_ratio:
                     best_ratio, best_defn, best_target, best_range = ratio, defn, target, token_range
 
@@ -647,7 +731,7 @@ class MetricResolver:
         # UNFILTERED SQL, so an unconsumed qualifier is just as wrong here. Token
         # ranges (not char spans) because fuzzy matches windows, not literals.
         consumed = set(range(*best_range))
-        residual = [t for i, t in enumerate(q_tokens) if i not in consumed and t not in _RESIDUAL_STOP_WORDS]
+        residual = [t for i, t in enumerate(q_tokens) if i not in consumed and not _is_stop_scaffolding(t)]
 
         logger.info(
             "metric_resolver_fuzzy_match",

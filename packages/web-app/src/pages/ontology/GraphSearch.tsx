@@ -25,7 +25,6 @@ import {
   searchEntities,
   getClass,
   getObjectProperty,
-  getDatatypeProperty,
   getOntologyOverview,
   listOntologies,
   type GraphSearchHit,
@@ -43,6 +42,7 @@ import {
 } from "@components/BreadcrumbProvider";
 import {
   OntologyGraphFlow,
+  type GraphAttribute,
   type GraphNodeData,
 } from "../../components/graph/OntologyGraphFlow";
 
@@ -116,7 +116,10 @@ type GraphEdge = {
 };
 type GraphData = { nodes: GraphNode[]; edges: GraphEdge[] };
 
-const VALID_KINDS = new Set(["class", "object-property", "datatype-property"]);
+// Kinds rendered as graph NODES. Datatype properties (attributes) are
+// deliberately excluded — they appear only on hover (see the attribute overlay
+// in OntologyGraphFlow), never as standalone nodes here.
+const VALID_KINDS = new Set(["class", "object-property"]);
 
 /** Narrow an arbitrary backend kind string to the node-kind union. */
 export function toKind(kind: string | undefined): GraphNode["kind"] {
@@ -175,6 +178,7 @@ export function parentUrisOf(vertex: GraphVertex | undefined): string[] {
 export function buildGraphData(
   visibleUris: Set<string>,
   details: Map<string, GraphVertex>,
+  attributesByClass?: Map<string, GraphAttribute[]>,
 ): GraphData {
   const nodes: GraphNode[] = [];
   for (const uri of visibleUris) {
@@ -189,6 +193,7 @@ export function buildGraphData(
       uri,
       hasChildren,
       expanded,
+      attributes: attributesByClass?.get(uri),
     });
   }
 
@@ -711,8 +716,6 @@ async function fetchVertexByKind(
     if (kind === "class") return await getClass(apiClient, namespace, uri);
     if (kind === "object-property")
       return await getObjectProperty(apiClient, namespace, uri);
-    if (kind === "datatype-property")
-      return await getDatatypeProperty(apiClient, namespace, uri);
   } catch {
     // Best-effort: a single neighbour failing must not abort the search.
   }
@@ -771,9 +774,15 @@ export function GraphSearchPage() {
     new Map(),
   );
 
+  // Attributes (datatype properties) grouped by class IRI, from the ontology
+  // overviews the seed fetches — this is what the graph's hover overlay reads.
+  const [attrByClass, setAttrByClass] = useState<Map<string, GraphAttribute[]>>(
+    new Map(),
+  );
+
   const graphData = useMemo(
-    () => buildGraphData(visibleUris, detailsMap),
-    [visibleUris, detailsMap],
+    () => buildGraphData(visibleUris, detailsMap, attrByClass),
+    [visibleUris, detailsMap, attrByClass],
   );
 
   // Size the graph row to fill exactly the viewport, with no page scrollbar and
@@ -903,10 +912,23 @@ export function GraphSearchPage() {
   // The "loaded once" latch is a ref (only read as a guard, never rendered), so
   // setting it never re-runs the effect — that self-invalidation was the earlier
   // spinner deadlock. Reset on namespace change so a fresh namespace re-seeds.
+  // Graph-view ontology scope: "All ontologies" (default, seed everything) or a
+  // single ontology (seed just that one). Separate from the List view's filter,
+  // and declared here so the seed effect below can depend on it.
+  const [graphOntologyFilter, setGraphOntologyFilter] =
+    useState(ALL_ONTOLOGIES_VALUE);
+  const graphOntologyId =
+    graphOntologyFilter === ALL_ONTOLOGIES_VALUE
+      ? undefined
+      : graphOntologyFilter;
+
+  // Attributes (datatype properties) grouped by class IRI, from the ontology
+  // overviews the seed fetches — this is what the graph's hover overlay reads.
+
   const graphRootsLoadedRef = useRef(false);
   useEffect(() => {
     graphRootsLoadedRef.current = false;
-  }, [namespaceId]);
+  }, [namespaceId, graphOntologyId]);
   useEffect(() => {
     if (
       view !== "graph" ||
@@ -920,9 +942,11 @@ export function GraphSearchPage() {
     graphRootsLoadedRef.current = true;
     setLoading(true);
 
-    // Every ontology in the namespace registry (complete — not derived from a
-    // capped class fetch), so the seed covers all of them.
-    const ontologyIds = [...ontologyById.keys()];
+    // The ontologies to seed: the one picked in the graph filter, or every
+    // ontology in the registry when "All ontologies" is selected.
+    const ontologyIds = graphOntologyId
+      ? [graphOntologyId]
+      : [...ontologyById.keys()];
 
     Promise.all(
       ontologyIds.map((id) =>
@@ -944,6 +968,22 @@ export function GraphSearchPage() {
           })),
         );
         const byId = new Map(results.map(({ id, ov }) => [id, ov]));
+
+        // Group each ontology's datatype properties by their domain class, so
+        // the graph can reveal them on hover (see buildGraphData / the overlay).
+        const attrs = new Map<string, GraphAttribute[]>();
+        for (const { ov } of results) {
+          for (const dp of ov?.datatypeProperties ?? []) {
+            if (!dp.domain) continue;
+            const list = attrs.get(dp.domain) ?? [];
+            list.push({
+              label: dp.label ?? localName(dp.uri),
+              range: dp.range ? localName(dp.range) : undefined,
+            });
+            attrs.set(dp.domain, list);
+          }
+        }
+        setAttrByClass(attrs);
         // Walk the plan (induced/smallest first) rather than the registry
         // order, so the relationship budget inside buildTaxonomyVertices is
         // also spent induced-first instead of on whichever ontology the
@@ -1007,7 +1047,7 @@ export function GraphSearchPage() {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [view, hasSearched, namespaceId, ontologyById]);
+  }, [view, hasSearched, namespaceId, ontologyById, graphOntologyId]);
 
   // Load the ontology registry once to resolve names + induced flag for the
   // List view's per-ontology grouping. Best-effort: on failure the list falls
@@ -1038,12 +1078,26 @@ export function GraphSearchPage() {
     try {
       const results = await searchEntities(apiClient, namespaceId, q, {
         limit: 50,
+        // Honour the graph-view ontology dropdown: "All ontologies" leaves this
+        // undefined (search everywhere); a specific pick restricts the matches.
+        // Neighbour expansion below stays cross-ontology on purpose, so a
+        // grounded class still shows its foundational links.
+        ontology_id: graphOntologyId,
       });
 
       if (!results.length) {
         // No matches: clear only what the GRAPH shows. detailsMap is a shared
         // vertex cache the List view reads descriptions from — don't wipe it,
         // or every list row loses its description until a full reload.
+        setVisibleUris(new Set());
+        setTotalRoots(0);
+        return;
+      }
+
+      // Only class / object-property matches become graph nodes; datatype
+      // properties (attributes) are shown on hover, not as standalone nodes.
+      const graphResults = results.filter((h) => VALID_KINDS.has(h.kind));
+      if (graphResults.length === 0) {
         setVisibleUris(new Set());
         setTotalRoots(0);
         return;
@@ -1056,19 +1110,12 @@ export function GraphSearchPage() {
       const details = new Map<string, GraphVertex>(detailsMap);
       const searchUris = new Set<string>();
       await Promise.all(
-        results.map(async (hit) => {
+        graphResults.map(async (hit) => {
           try {
-            let vertex: GraphVertex;
-            if (hit.kind === "class")
-              vertex = await getClass(apiClient, namespaceId, hit.uri);
-            else if (hit.kind === "object-property")
-              vertex = await getObjectProperty(apiClient, namespaceId, hit.uri);
-            else
-              vertex = await getDatatypeProperty(
-                apiClient,
-                namespaceId,
-                hit.uri,
-              );
+            const vertex =
+              hit.kind === "class"
+                ? await getClass(apiClient, namespaceId, hit.uri)
+                : await getObjectProperty(apiClient, namespaceId, hit.uri);
             details.set(hit.uri, vertex);
             searchUris.add(hit.uri);
           } catch {
@@ -1130,6 +1177,31 @@ export function GraphSearchPage() {
       setLoading(false);
     }
   };
+
+  // Reset the graph search: clear the query and fall back to the seed graph
+  // (scoped to the current dropdown). Re-arms the seed latch so it re-runs.
+  const handleClearSearch = () => {
+    setQuery("");
+    setSelectedVertex(null);
+    setError(null);
+    graphRootsLoadedRef.current = false;
+    setHasSearched(false);
+  };
+
+  // Re-run the active search when the graph ontology scope changes, so the
+  // dropdown re-filters results live instead of only on the next manual Search.
+  // Skips the initial mount; only fires while a search is showing.
+  const scopeChangeArmedRef = useRef(false);
+  useEffect(() => {
+    if (!scopeChangeArmedRef.current) {
+      scopeChangeArmedRef.current = true;
+      return;
+    }
+    if (hasSearched) void handleSearch();
+    // handleSearch is re-created each render but reads current state; keying on
+    // the scope alone is intentional (avoid re-running on unrelated renders).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [graphOntologyId]);
 
   const handleNodeSelect = (nodeData: GraphNodeData | null) => {
     if (!nodeData || !nodeData.id) {
@@ -1613,6 +1685,32 @@ export function GraphSearchPage() {
                   Search
                 </Button>
               )}
+              {view === "graph" && hasSearched && (
+                <Button
+                  variant="normal"
+                  iconName="close"
+                  onClick={handleClearSearch}
+                >
+                  Clear
+                </Button>
+              )}
+              {view === "graph" && (
+                <Select
+                  selectedOption={
+                    ontologyFilterOptions.find(
+                      (o) => o.value === graphOntologyFilter,
+                    ) ?? ontologyFilterOptions[0]
+                  }
+                  onChange={({ detail }) =>
+                    setGraphOntologyFilter(
+                      detail.selectedOption.value ?? ALL_ONTOLOGIES_VALUE,
+                    )
+                  }
+                  options={ontologyFilterOptions}
+                  ariaLabel="Show one ontology or all"
+                  expandToViewport
+                />
+              )}
             </SpaceBetween>
             {error && <StatusIndicator type="error">{error}</StatusIndicator>}
           </SpaceBetween>
@@ -1664,6 +1762,7 @@ export function GraphSearchPage() {
               <OntologyGraphFlow
                 nodes={graphData.nodes}
                 edges={graphData.edges}
+                layout="force"
                 onNodeSelect={handleNodeSelect}
                 onNodeExpand={handleNodeExpand}
               />

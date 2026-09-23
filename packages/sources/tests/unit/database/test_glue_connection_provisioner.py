@@ -210,9 +210,101 @@ class TestProvisionFederatedCatalog:
             provision_federated_catalog,
         )
 
-        for bad in ({"host": "x?y&"}, {"port": 70000}, {"database_name": "d;DROP"}):
+        for bad in (
+            {"engine": "UNSUPPORTED"},
+            {"engine": 1},
+            {"host": "x?y&"},
+            {"port": 70000},
+            {"database_name": "d;DROP"},
+        ):
             with pytest.raises(RuntimeError):
                 provision_federated_catalog(**{**self._KWARGS, **bad})
+        _mocks["glue"].create_connection.assert_not_called()
+
+    @pytest.mark.parametrize("host", ["localhost", "database1"])
+    def test_non_snowflake_accepts_single_label_hostname(self, _mocks, host):
+        from coa_sources.database.connectors.glue_connection_provisioner import (
+            provision_federated_catalog,
+        )
+
+        provision_federated_catalog(**{**self._KWARGS, "host": host})
+
+        connection = _mocks["glue"].create_connection.call_args.kwargs["ConnectionInput"]
+        assert connection["ConnectionProperties"]["HOST"] == host
+
+    @pytest.mark.parametrize(
+        "host",
+        [
+            "my_account.snowflakecomputing.com",
+            "acme-marketing_test_account.snowflakecomputing.com",
+            "acme-account.privatelink.snowflakecomputing.com",
+            "mydb_instance",
+            "192.0.2.10",
+        ],
+    )
+    def test_snowflake_accepts_documented_account_hosts_and_ipv4(self, _mocks, host):
+        from coa_sources.database.connectors.glue_connection_provisioner import (
+            provision_federated_catalog,
+        )
+
+        provision_federated_catalog(
+            **{
+                **self._KWARGS,
+                "engine": "SNOWFLAKE",
+                "host": host,
+                "port": 443,
+                "warehouse": "COMPUTE_WH",
+            }
+        )
+
+        connection = _mocks["glue"].create_connection.call_args.kwargs["ConnectionInput"]
+        assert connection["ConnectionProperties"]["HOST"] == host
+
+    def test_non_snowflake_still_rejects_underscore_hostname(self, _mocks):
+        from coa_sources.database.connectors.glue_connection_provisioner import (
+            provision_federated_catalog,
+        )
+
+        with pytest.raises(RuntimeError, match="only permitted in Snowflake account hostnames"):
+            provision_federated_catalog(
+                **{
+                    **self._KWARGS,
+                    "engine": "POSTGRESQL",
+                    "host": "db_account.example.com",
+                }
+            )
+        _mocks["glue"].create_connection.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "host",
+        [
+            "https://my_account.snowflakecomputing.com",
+            "my_account.snowflakecomputing.com:443",
+            "my_account.snowflakecomputing.com/path",
+            "my account.snowflakecomputing.com",
+            "my_account..snowflakecomputing.com",
+            "my_account_.snowflakecomputing.com",
+            "my_account.snow_flakecomputing.com",
+            "my_account._privatelink.snowflakecomputing.com",
+            f"{'a' * 62}_a.snowflakecomputing.com",
+            "999.999.1.1",
+        ],
+    )
+    def test_snowflake_rejects_malformed_hosts(self, _mocks, host):
+        from coa_sources.database.connectors.glue_connection_provisioner import (
+            provision_federated_catalog,
+        )
+
+        with pytest.raises(RuntimeError):
+            provision_federated_catalog(
+                **{
+                    **self._KWARGS,
+                    "engine": "SNOWFLAKE",
+                    "host": host,
+                    "port": 443,
+                    "warehouse": "COMPUTE_WH",
+                }
+            )
         _mocks["glue"].create_connection.assert_not_called()
 
     def test_grants_lf_iam_allowed_principals_on_schema(self, _mocks):
