@@ -83,6 +83,26 @@ class TestListPlatformRoles:
             assert role["scope"] == "PLATFORM"
 
     @patch("coa_control_plane.roles.list_platform_roles_handler.DynamoDBDAO")
+    def test_default_baseline_policy_is_not_advertised_as_a_role(self, mock_dao_cls):
+        """#988: the seeded ``default`` policy bundle shares the GLOBAL partition
+        but is not grantable; it must not appear in the platform-role picker."""
+        mock_dao = MagicMock()
+        mock_dao_cls.return_value = mock_dao
+        mock_dao.query.return_value = PaginatedResult(
+            items=[
+                {"PK": "GLOBAL", "SK": "ROLE#default", "name": "Default", "isBuiltIn": True, "scope": "GLOBAL"},
+                {"PK": "GLOBAL", "SK": "ROLE#platform-admin", "name": "Platform Admin", "isBuiltIn": True},
+                {"PK": "GLOBAL", "SK": "ROLE#platform-viewer", "name": "Platform Viewer", "isBuiltIn": True},
+            ],
+            last_evaluated_key=None,
+        )
+
+        resp = handler({"httpMethod": "GET", "path": "/roles"}, None)
+        assert resp["statusCode"] == 200
+        body = json.loads(resp["body"])
+        assert [r["roleId"] for r in body["roles"]] == ["platform-admin", "platform-viewer"]
+
+    @patch("coa_control_plane.roles.list_platform_roles_handler.DynamoDBDAO")
     def test_returns_empty_when_no_roles(self, mock_dao_cls):
         mock_dao = MagicMock()
         mock_dao_cls.return_value = mock_dao
