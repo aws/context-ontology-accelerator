@@ -137,6 +137,38 @@ def _fold(text: str) -> str:
     return unicodedata.normalize("NFKC", text).lower()
 
 
+def declared_dimensions(sql_template: str, declared: list[str] | None = None) -> list[str]:
+    """Return a metric's declared dimensions, derived from its template placeholders.
+
+    ``substitute_dimensions`` only binds a placeholder whose name is in the
+    metric's declared ``dimensions`` — but nothing in the product populates that
+    list: the CreateMetric/UpdateMetric contract has no dimensions field, the
+    Neptune publisher writes none, and ``_bindings_to_seed`` never reads any. So
+    every API-authored parameterized template (``WHERE region = {region}``)
+    resolved with ``allowed == []`` and failed closed on BOTH branches — with no
+    value ("requires dimensions with no values") and with one ("not a declared
+    dimension") — making parameterized Tier-1 metrics unreachable, while the
+    orchestrator fell through to Tier-2/3 and answered the caller's filtered
+    question with the UNFILTERED figure.
+
+    The placeholders ARE the declaration: a metric author who writes ``{region}``
+    in the template has declared a ``region`` dimension. Derive the list from the
+    template (first-appearance order, case-insensitive dedup consistent with the
+    lower() lookup in ``substitute_dimensions``) and union it with anything a
+    seed explicitly declared, so an explicit declaration is never dropped and a
+    template placeholder is never undeclared.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    from_template = [(m.group(1) or m.group(2)) for m in _PLACEHOLDER_RE.finditer(sql_template or "")]
+    for dim in list(declared or []) + from_template:
+        key = dim.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(dim)
+    return out
+
+
 # ── Residual-qualifier detection ─────────────────────────────────────────────
 #
 # A Tier-1 match is a whole-question substring search: a metric whose synonym is
@@ -536,13 +568,17 @@ class MetricResolver:
             if not metric_id or not name:
                 continue
 
+            sql_template = item.get("sql_template", "")
             defn = MetricDefinition(
                 metric_id=metric_id,
                 name=name,
                 display_name=item.get("display_name", ""),
                 description=item.get("description", ""),
-                sql_template=item.get("sql_template", ""),
-                dimensions=item.get("dimensions", []),
+                sql_template=sql_template,
+                # Placeholders in the template are the metric's dimension
+                # declaration (see ``declared_dimensions``); nothing upstream
+                # (contract, publisher, Neptune bindings) declares them otherwise.
+                dimensions=declared_dimensions(sql_template, item.get("dimensions", [])),
                 synonyms=item.get("synonyms", []),
                 namespace=item.get("namespace", ""),
                 data_source_id=item.get("data_source_id", ""),
