@@ -180,4 +180,30 @@ ind:LossPayment a owl:Class ;
     expect(lp?.data.isGrounded).toBe(false);
     expect(lp?.data.groundedTo).toBeUndefined();
   });
+
+  it("groups datatype properties as attributes on their domain class", () => {
+    const ttl = `
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix ind: <http://ex.org/ind#> .
+
+ind:Loan a owl:Class .
+ind:loan_amount a owl:DatatypeProperty .
+ind:loan_amount rdfs:domain ind:Loan .
+ind:loan_amount rdfs:range xsd:long .
+ind:loan_amount rdfs:label "amount" .
+ind:loan_status a owl:DatatypeProperty .
+ind:loan_status rdfs:domain ind:Loan .
+ind:loan_status rdfs:label "status" .
+`;
+    const { nodes } = turtleToGraph(ttl);
+    const loan = nodes.find((n) => n.id === "http://ex.org/ind#Loan");
+    expect(loan?.data.attributes).toEqual([
+      { label: "amount", range: "long" },
+      { label: "status", range: undefined },
+    ]);
+    // Attributes are NOT emitted as their own nodes.
+    expect(nodes).toHaveLength(1);
+  });
 });

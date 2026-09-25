@@ -175,6 +175,29 @@ class TestSourceDBQueryExecutor:
         assert creds.database == "mydb"
 
     @patch("coa_serve.clients.source_db.boto3")
+    async def test_resolve_credentials_validates_search_path_before_secret_fetch(self, mock_source_boto3, _reg):
+        from coa_serve.clients.source_db import SourceDBQueryExecutor
+
+        executor = SourceDBQueryExecutor(data_sources_table="coa-dev-sources")
+        executor._sources.get_source = AsyncMock(
+            return_value={
+                "discoveredSchemas": "public",
+                "configuration": {
+                    "engine": "POSTGRESQL",
+                    "host": "db.example.com",
+                    "port": 5432,
+                    "databaseName": "mydb",
+                    "credentialSecretArn": ("arn:aws:secretsmanager:us-east-1:123456789012:secret:coa/creds-abc"),
+                },
+            }
+        )
+
+        with pytest.raises(ValueError, match="list of schema identifiers"):
+            await executor._resolve_credentials("my-ns", "ds-uuid")
+
+        executor._secrets.get_secret_value.assert_not_called()
+
+    @patch("coa_serve.clients.source_db.boto3")
     async def test_resolve_credentials_defaults_port_per_engine(self, mock_source_boto3, _reg):
         """When the config omits ``port``, the engine adapter's default_port is used.
 
@@ -559,17 +582,33 @@ class TestSourceDBQueryExecutor:
         """_resolve_search_path uses discoveredSchemas (authoritative) over the glob."""
         from coa_serve.clients.source_db import _resolve_search_path
 
-        assert _resolve_search_path({"discoveredSchemas": ["dw"]}, {"schemaFilter": "d?"}) == "dw"
-        assert _resolve_search_path({"discoveredSchemas": ["public", "sales"]}, {}) == "public, sales"
+        assert _resolve_search_path({"discoveredSchemas": ["dw"]}, {"schemaFilter": "d?"}, "POSTGRESQL") == "dw"
+        assert _resolve_search_path({"discoveredSchemas": ["public", "sales"]}, {}, "REDSHIFT") == "public, sales"
 
     def test_resolve_search_path_falls_back_to_filter_then_public(self, _reg):
         from coa_serve.clients.source_db import _resolve_search_path
 
-        assert _resolve_search_path({}, {"schemaFilter": "dw"}) == "dw"
-        assert _resolve_search_path({}, {}) == "public"
+        assert _resolve_search_path({}, {"schemaFilter": "dw"}, "POSTGRESQL") == "dw"
+        assert _resolve_search_path({}, {}, "REDSHIFT") == "public"
 
-    def test_resolve_search_path_drops_invalid_discovered(self, _reg):
-        """Non-identifier discovered entries (defensive) are dropped."""
+    @pytest.mark.parametrize("engine_type", ["MYSQL", "SQLSERVER"])
+    def test_resolve_search_path_is_empty_for_other_engines(self, _reg, engine_type):
         from coa_serve.clients.source_db import _resolve_search_path
 
-        assert _resolve_search_path({"discoveredSchemas": ["bad;name"]}, {"schemaFilter": "dw"}) == "dw"
+        assert _resolve_search_path({"discoveredSchemas": "sales-db"}, {"schemaName": "sales-db"}, engine_type) == ""
+
+    @pytest.mark.parametrize(
+        "discovered",
+        [
+            "public",
+            ["bad;name"],
+            ["public", "bad-name"],
+            ["public", 42],
+        ],
+    )
+    def test_resolve_search_path_rejects_invalid_discovered(self, _reg, discovered):
+        """Corrupt metadata cannot silently change the authoritative search path."""
+        from coa_serve.clients.source_db import _resolve_search_path
+
+        with pytest.raises(ValueError, match="list of schema identifiers|invalid schema identifier"):
+            _resolve_search_path({"discoveredSchemas": discovered}, {"schemaFilter": "dw"}, "POSTGRESQL")

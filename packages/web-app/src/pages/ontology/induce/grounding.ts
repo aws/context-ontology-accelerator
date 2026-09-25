@@ -255,11 +255,17 @@ export function normalizeNameKey(name: string): string {
  * Peel the layers in order:
  *   1. Strip the outer Turtle string delimiters (``"…"``).
  *   2. Turtle-unescape the content (``\"`` → ``"``, ``\\`` → ``\``).
- *   3. Strip the SQL-delimiter double quotes (un-doubling embedded ``""``).
+ *   3. Split into SQL identifier segments — the mapping schema-qualifies a table
+ *      name that two datasources share (``"public"."customers"``) — dropping the
+ *      SQL delimiters and un-doubling embedded ``""`` as it goes.
  *
- * A plain (un-delimited) value such as ``"policies"`` returns ``policies``.
+ * :func:`unquoteSqlIdent` then keeps the trailing segment, because every
+ * consumer that JOINS on this value joins on the bare name a ConceptMatch
+ * carries; :func:`qualifiedSqlIdent` keeps the whole path, for display.
+ *
+ * A plain (un-delimited) value such as ``"policies"`` yields ``["policies"]``.
  */
-export function unquoteSqlIdent(turtleLiteral: string): string {
+function sqlIdentSegments(turtleLiteral: string): string[] {
   // 1. Outer Turtle delimiters.
   let s = turtleLiteral;
   if (s.length >= 2 && s.startsWith('"') && s.endsWith('"')) {
@@ -267,12 +273,66 @@ export function unquoteSqlIdent(turtleLiteral: string): string {
   }
   // 2. Turtle escapes.
   s = s.replace(/\\(.)/g, "$1");
-  // 3. SQL delimiter quotes.
-  if (s.length >= 2 && s.startsWith('"') && s.endsWith('"')) {
-    s = s.slice(1, -1).replace(/""/g, '"');
+  // 3. Split on the dots BETWEEN delimited identifiers only. A table
+  // legitimately named ``q1.results`` is ONE delimited identifier, so splitting
+  // on every dot would report its schema as ``q1``. Mirrors
+  // ``coa_common.constants.split_sql_ident_path`` on the producing side.
+  const segments: string[] = [];
+  let buf = "";
+  let inQuotes = false;
+  for (let i = 0; i < s.length; i += 1) {
+    const ch = s[i];
+    if (ch === '"') {
+      if (inQuotes && s[i + 1] === '"') {
+        buf += '"';
+        i += 1;
+        continue;
+      }
+      inQuotes = !inQuotes;
+      continue;
+    }
+    if (ch === "." && !inQuotes) {
+      segments.push(buf);
+      buf = "";
+      continue;
+    }
+    buf += ch;
   }
-  return s;
+  segments.push(buf);
+  return segments;
 }
+
+/** The bare table name: the trailing SQL identifier segment. */
+export function unquoteSqlIdent(turtleLiteral: string): string {
+  const segments = sqlIdentSegments(turtleLiteral);
+  return segments[segments.length - 1];
+}
+
+/**
+ * The table name as written in the mapping, dots and all, for DISPLAY.
+ *
+ * The bare form is what the ConceptMatch join needs, but it is not what the user
+ * should read: when two datasources both expose ``customers`` the mapping
+ * qualifies both, and labelling the two class panels "Mapping: customers" and
+ * "Mapping: customers" re-fuses in the UI the two tables the mapping just took
+ * care to separate.
+ */
+export function qualifiedSqlIdent(turtleLiteral: string): string {
+  return sqlIdentSegments(turtleLiteral).join(".");
+}
+
+/**
+ * The TriplesMap local name embedded in an IRI, used as the join key.
+ *
+ * The dot is part of the name, not a delimiter: the RIGOR strategy mints
+ * ``TriplesMap_{schema}.{table}`` for a table whose bare name another datasource
+ * shares (``inducer/strategies/base.py:subject_template_names``). A ``\w+``
+ * class stops at the dot, so both twins keyed on ``public`` and the second
+ * overwrote the first — re-fusing in the UI exactly the two tables the mapping
+ * separated. ``/`` is excluded, which is what keeps a
+ * ``TriplesMap_X/POM_Y/ObjectMap`` IRI resolving to ``X``.
+ */
+const TRIPLES_MAP_ID = /TriplesMap_([\w.]+)/;
 
 /**
  * TriplesMap-id join over the whole R2RML. Returns ``classLocalName →
@@ -296,7 +356,7 @@ export function classToTableFromR2rml(
   // different serialized blocks.
   let currentTriplesMap: string | null = null;
   for (const line of r2rmlTurtle.split("\n")) {
-    const idMatch = line.match(/TriplesMap_(\w+)/);
+    const idMatch = line.match(TRIPLES_MAP_ID);
     if (idMatch) currentTriplesMap = idMatch[1];
 
     const classMatch = line.match(/rr:class\s+([^\s;,.\]]+)/);
@@ -452,7 +512,7 @@ export function parseR2rmlByClass(
 
   const firstToken = (text: string): string => text.trim().split(/\s/)[0] ?? "";
   const tmIdOf = (text: string): string | null =>
-    text.match(/TriplesMap_(\w+)/)?.[1] ?? null;
+    text.match(TRIPLES_MAP_ID)?.[1] ?? null;
   const pomIdOf = (text: string): string | null =>
     text.match(/POM_(\w+)/)?.[1] ?? null;
 
@@ -471,7 +531,10 @@ export function parseR2rmlByClass(
     const subjectIsObjectMap = /\/ObjectMap>?$/.test(subj);
 
     const tableMatch = text.match(/rr:tableName\s+("(?:\\.|[^"\\])*")/);
-    if (tableMatch) mapToTable.set(mapKey, unquoteSqlIdent(tableMatch[1]));
+    // Qualified here, bare in ``classToTableFromR2rml``: this value is only ever
+    // DISPLAYED ("Mapping: {sourceTable}"), while that one is joined against a
+    // ConceptMatch's bare table name.
+    if (tableMatch) mapToTable.set(mapKey, qualifiedSqlIdent(tableMatch[1]));
 
     const classMatch = text.match(/rr:class\s+([^\s;,.\]]+)/);
     if (classMatch) mapToClass.set(mapKey, classLocalName(classMatch[1]));

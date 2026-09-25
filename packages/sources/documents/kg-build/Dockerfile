@@ -3,7 +3,7 @@
 # Pin to digest to prevent supply-chain attacks via tag mutation. The pin is for
 # supply-chain integrity only, NOT patch currency — see the apt-get upgrade below.
 # python:3.12-slim, digest resolved from the tag on 2026-09-01.
-FROM --platform=linux/amd64 public.ecr.aws/docker/library/python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea
+FROM --platform=linux/amd64 public.ecr.aws/docker/library/python:3.12-slim@sha256:2f17fc044b579bab302c2e8054d3a686e2cb9a83de48e70534b94cd8ebbe06a9
 
 WORKDIR /app
 
@@ -33,9 +33,15 @@ RUN pip install --no-cache-dir /tmp/server/ && rm -rf /tmp/server/
 COPY packages/sources/documents/kg-build/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install the documents package
+# Install the documents package, then remediate scanner findings in the SAME final layer:
+# upgrade pip + setuptools (CVE-2025-47273; build toolchain, not a declared dep;
+# unconstrained — does not touch the boto3/botocore cap above), and REMOVE msgpack — an
+# orphan that nothing imports or declares (verified via grep + pipdeptree --reverse),
+# pulled in transiently and left behind. `pip uninstall -y` is a no-op exit 0 if absent.
 COPY packages/sources/ /tmp/sources/
-RUN pip install --no-cache-dir /tmp/sources/ && rm -rf /tmp/sources/
+RUN pip install --no-cache-dir /tmp/sources/ && rm -rf /tmp/sources/ && \
+    pip install --no-cache-dir --upgrade pip "setuptools>=78.1.1" && \
+    pip uninstall -y msgpack
 
 USER appuser
 CMD ["python", "-m", "coa_sources.documents.kg_build.graph_build"]

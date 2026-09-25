@@ -50,6 +50,7 @@ a configured deployment, never at import time).
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -274,6 +275,7 @@ def build_agentic_retriever(
     vector_retriever: VectorRetriever | None = None,
     embed_client: LLMClient | None = None,
     structured_query_tier: Any | None = None,
+    guardrail_id_provider: Callable[[], str] | None = None,
 ) -> AgenticRetriever:
     """Compose the :class:`AgenticRetriever` from the registry and its collaborators.
 
@@ -304,6 +306,10 @@ def build_agentic_retriever(
             ``clients.llm``.
         structured_query_tier: Optional Tier-2 structured-query tier forwarded to
             :func:`build_tool_registry` to enable the structured (SQL/SPARQL) tools.
+        guardrail_id_provider: Optional callable returning the guardrail id LIVE on
+            each call; forwarded to the :class:`Synthesizer` and
+            :class:`DecompositionPlanner` so an operator's SSM guardrail change
+            reaches the warm agentic path without a redeploy.
 
     Returns:
         The composed :class:`AgenticRetriever`.
@@ -324,8 +330,17 @@ def build_agentic_retriever(
     # The agentic path synthesizes over EVERY chunk its multi-step session gathered
     # (no MAX_PROMPT_CHUNKS truncation), so the synthesizer sees the full context —
     # graph traversals + the final semantic search — not just the first few chunks.
-    synthesizer = Synthesizer(clients.llm, config.guardrail_id, max_prompt_chunks=None)
-    decomposer = DecompositionPlanner(clients.llm, guardrail_id=config.guardrail_id or None)
+    synthesizer = Synthesizer(
+        clients.llm,
+        config.guardrail_id,
+        guardrail_id_provider=guardrail_id_provider,
+        max_prompt_chunks=None,
+    )
+    decomposer = DecompositionPlanner(
+        clients.llm,
+        guardrail_id=config.guardrail_id or None,
+        guardrail_id_provider=guardrail_id_provider,
+    )
     controller = ReasoningController(
         step_planner,
         per_tool_timeout_s=budget.per_tool_timeout_s,

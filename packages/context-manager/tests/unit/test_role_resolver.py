@@ -61,6 +61,27 @@ class TestResolveProfileNoTable:
 
 
 @pytest.mark.unit
+class TestResolveProfileDaoConfig:
+    def test_uses_sync_timeout_profile(self):
+        """resolve_profile is on the synchronous serve invoke() request path.
+
+        It must fail fast rather than inherit the DAO's background
+        30-second/three-attempt default (matches the Cedar policy loader's
+        #1092 fix).
+        """
+        dao_cls = MagicMock(return_value=_mock_dao({}))
+        with (
+            patch.object(role_resolver, "_RRM_TABLE", "rrm"),
+            patch.object(role_resolver, "DynamoDBDAO", dao_cls),
+        ):
+            resolve_profile("alice@x.com", [], namespace=_NS)
+
+        config = dao_cls.call_args.kwargs["config"]
+        assert config.read_timeout == 8
+        assert config.retries["max_attempts"] == 2
+
+
+@pytest.mark.unit
 class TestResolveProfileRoles:
     def test_resolves_global_and_resource_roles(self):
         items = {

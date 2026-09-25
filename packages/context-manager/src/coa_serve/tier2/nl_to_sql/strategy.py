@@ -33,13 +33,14 @@ import structlog
 from coa_common import ontology_vector_index_name
 
 from ...clients.base import GraphClient, QueryExecutor
-from ...exceptions import AccessDeniedError
+from ...exceptions import AccessDeniedError, AmbiguousReferenceError
 from ...identity import display_principal
 from ...step_ids import StepId
 from ..sql_firewall import FirewallResult, SQLFirewall, UnsafeSQLError
 from ..strategy import StrategyContext, StrategyOption, StrategyResult, capped_max_rows
+from ..table_qualifier import PreparedSQL, SourceLookup, prepare_execution_sql
 from ..tools import OntologyGraphTool
-from .sql_generator import SQLGenerator
+from .sql_generator import NLtoSQLResult, SQLGenerator, sql_table_routing, table_sources_need_preparation
 
 logger = structlog.get_logger(__name__)
 
@@ -141,6 +142,7 @@ class NLtoSQLStrategy:
         oss_ontology_index: str = "",
         max_shots: int | None = None,
         graph_client: GraphClient | None = None,
+        sources_registry: SourceLookup | None = None,
     ):
         """Wire the SQL generator, firewall, executor, and ontology index.
 
@@ -155,12 +157,20 @@ class NLtoSQLStrategy:
                 expansion (``SERVE_NL2SQL_GRAPH_EXPAND`` /
                 ``options.flatGraphExpand``). Unused unless one of those is on, so
                 passing it is inert on the default path.
+            sources_registry: Optional registry used ONLY to look up each
+                datasource's Athena catalog/schema when a generated statement spans
+                more than one source (see :mod:`..table_qualifier`). Without it, a
+                cross-source statement keeps its previous behaviour. Typed as the
+                narrow :class:`~..table_qualifier.SourceLookup` Protocol so a
+                wiring mistake fails type-check rather than surfacing as a runtime
+                AttributeError on the first cross-source statement.
         """
         self._sql_generator = sql_generator
         self._firewall = firewall
         self._query_executor = query_executor
         self._oss_ontology_index = oss_ontology_index
         self._graph_client = graph_client
+        self._sources = sources_registry
         self._max_shots = max_shots if max_shots is not None else _resolve_max_shots()
 
     def _exec_timeout_seconds(self, context: StrategyContext) -> int:
@@ -331,10 +341,34 @@ class NLtoSQLStrategy:
             if fw_result is None:
                 return None  # unsafe SQL — abandon the strategy
 
+            # Cross-source qualification, per shot: a corrected statement may
+            # reference a different set of tables than the first one. Runs AFTER
+            # the firewall for the same reason as the VKG path — Cedar sees
+            # extract_tables() output verbatim (see ..table_qualifier). A
+            # single-source statement is returned untouched, so the direct-JDBC
+            # fast path is unaffected.
+            prepared = await self._prepare_sql(fw_result.authorized_sql, nl_to_sql_result, namespace)
+            if prepared.error:
+                # A reference that cannot be attributed to ONE physical table — the
+                # same bare name in two sources/schemas. Refuse the query with a
+                # client-visible ambiguity error instead of returning None: a bare
+                # None is masked downstream as an incidental miss (NoResult), which
+                # hides a mis-route behind a generic "no data". Raising a terminal
+                # ServeError surfaces the explicit reason ("...is ambiguous...") to
+                # the caller and tells them how to proceed (qualify the reference or
+                # pass a source). Not retried (a correction shot hits the same
+                # ambiguity) and not executed (it could read a different source's
+                # table than the one authorized) — the same fail-closed treatment as
+                # unsafe SQL, but reported rather than silently skipped.
+                trace.record(StepId.T2_SQL_EXECUTE, "error", 0, detail=prepared.error)
+                logger.warning("nl_to_sql_ambiguous_reference", namespace=namespace, error=prepared.error)
+                raise AmbiguousReferenceError(prepared.error)
+            exec_sql = prepared.sql
+
             exec_start = time.perf_counter()
             try:
                 exec_result = await self._query_executor.execute(
-                    fw_result.authorized_sql,
+                    exec_sql,
                     namespace=namespace,
                     data_source_id=data_source_id,
                     max_rows=capped_max_rows(options),
@@ -342,7 +376,8 @@ class NLtoSQLStrategy:
                 )
                 exec_ms = int((time.perf_counter() - exec_start) * 1000)
                 result = StrategyResult(
-                    sql=fw_result.authorized_sql,
+                    # The SQL that actually ran (qualified when cross-source).
+                    sql=exec_sql,
                     rows=exec_result.rows,
                     columns=exec_result.columns,
                     confidence=confidence,
@@ -516,6 +551,31 @@ class NLtoSQLStrategy:
         # or a verified/exhausted empty — returns inside the loop). Return any
         # clean empty result we saw; otherwise None so the next strategy can try.
         return empty_fallback
+
+    async def _prepare_sql(self, sql: str, nl_result: NLtoSQLResult, namespace: str) -> PreparedSQL:
+        """Make ``sql`` executable, qualifying to ``catalog.schema.table`` if cross-source.
+
+        Delegates to the shared :func:`~..table_qualifier.prepare_execution_sql`
+        so this path and the VKG path cannot diverge on how they rewrite or on how
+        they react to an unattributable reference. Returns ``sql`` unchanged for a
+        single-source statement, when no registry is wired, or when the rewrite
+        cannot be completed.
+
+        An ambiguity error IS reachable from here: when the retrieval hits
+        attribute one bare name to two classes (e.g. a source exposing
+        ``customers`` in two schemas), ``sql_table_routing`` emits an ambiguity
+        marker and ``prepare_execution_sql`` refuses the query rather than run it
+        against a guessed schema.
+        """
+        # Cheap short-circuit that skips three sqlglot parses (routing extraction,
+        # restore, qualify) on the common single-source path. Preparation is a
+        # no-op UNLESS the hits span two real sources or mark a name ambiguous —
+        # ``table_sources_need_preparation`` distinguishes those from the single
+        # unambiguous source that needs nothing done.
+        if not table_sources_need_preparation(nl_result.table_sources):
+            return PreparedSQL(sql=sql)
+        routing = sql_table_routing(sql, nl_result.table_sources)
+        return await prepare_execution_sql(sql, routing, self._sources, namespace=namespace)
 
     def _firewall_check(self, sql: str, profile: dict, namespace: str, trace) -> FirewallResult | None:
         """Run the SQL firewall + Cedar gate for one candidate statement.

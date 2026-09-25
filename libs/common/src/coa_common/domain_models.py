@@ -86,13 +86,35 @@ class PrimaryKey:
 
 @dataclass
 class ForeignKey:
-    """Foreign key relationship between tables."""
+    """Foreign key relationship between tables.
+
+    ``review_status`` gives inferred relationships the same infer -> review -> use
+    governance descriptions already have (issue #1088). Semantics of the value:
+      * ``""`` (empty) — unspecified. Deterministic/steward FKs, and any FK stored
+        before this field existed, carry no explicit status; they are treated as
+        authoritative/grandfathered by downstream gating so existing ontologies do
+        not regress.
+      * ``PENDING_REVIEW`` — an AI-inferred relationship awaiting a steward. NOT
+        materialised into the ontology until approved.
+      * ``APPROVED`` / ``REJECTED`` — the steward's decision.
+
+    ``target_datasource_id`` is set when the target table lives in a DIFFERENT
+    source than this FK's table (a cross-source relationship). Empty for the
+    within-source case, so single-source behaviour is byte-identical to before.
+
+    ``provenance`` is a short human-readable note of what the relationship was
+    inferred from (e.g. a column-name match, or a phrase in the table/column
+    description), shown to the steward at review time.
+    """
 
     column: str = ""
     target_table: str = ""
     target_column: str = ""
     source: str = ""  # EnrichmentSource value
     confidence: float = 0.0
+    review_status: str = ""  # ReviewStatus value; "" == unspecified/grandfathered
+    target_datasource_id: str = ""  # set only for cross-source relationships
+    provenance: str = ""  # what the relationship was inferred from (for review)
 
 
 # ── Column ────────────────────────────────────────────────────────────

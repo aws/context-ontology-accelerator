@@ -30,7 +30,7 @@ import structlog
 from botocore.exceptions import ClientError
 from coa_common.dao import QueryParams
 from coa_common.domain_models import Table
-from coa_common.metadata_store import SMUSClient
+from coa_common.metadata_store import AssetResult, SMUSClient
 from coa_common.response import api_response, iso_to_epoch
 from coa_common.s3 import get_s3_client, read_file_bytes, upload_json
 from coa_control_plane_server.models.custom_connector_configuration import CustomConnectorConfiguration
@@ -308,7 +308,8 @@ def _resolve_query_engine(glue_config: Any, jdbc_config: Any) -> QueryEngine:
     """Preferred single-source execution engine for the source.
 
     ``JDBC`` (direct, low-latency) only when a direct dialect is implemented for
-    the engine (today PostgreSQL/Redshift). ``REDSHIFT`` when a Glue/Iceberg
+    the engine (today PostgreSQL, Redshift, MySQL, and SQL Server —
+    ``connectors/jdbc.py:DIRECT_QUERY_ENGINES``). ``REDSHIFT`` when a Glue/Iceberg
     source opts in to Redshift Serverless (`awsdatacatalog` auto-mount) via
     ``GlueConfiguration.executionEngine`` — else Glue defaults to Athena. JDBC
     engines without a direct path also go through Athena — so serve never routes
@@ -547,8 +548,9 @@ def _create_database_source(db_req: Any, namespace_id: str) -> dict[str, Any]:
             else (_resolve_glue_athena_catalog(glue_config) if glue_config else _DEFAULT_ATHENA_CATALOG)
         ),
         # Preferred single-source execution engine. Direct JDBC only when a
-        # direct dialect exists for the engine (PostgreSQL/Redshift today),
-        # otherwise Athena.
+        # direct dialect exists for the engine (PostgreSQL, Redshift, MySQL, and
+        # SQL Server today — connectors/jdbc.py:DIRECT_QUERY_ENGINES), otherwise
+        # Athena.
         "queryEngine": _resolve_query_engine(glue_config, jdbc_config),
         "region": (glue_config.region if glue_config else _AWS_REGION),
         "queryable": False,
@@ -606,6 +608,36 @@ def _create_database_source(db_req: Any, namespace_id: str) -> dict[str, Any]:
     # not persisted — keeps the record honest and avoids a dead column.
     if glue_config and item["queryEngine"] == QueryEngine.REDSHIFT and getattr(glue_config, "redshift_workgroup", None):
         item["redshiftWorkgroup"] = glue_config.redshift_workgroup
+
+    # Ownership-verified marker for a native Glue source sitting in a DISTINCT
+    # Ownership-verified marker for a native Glue source sitting in a DISTINCT
+    # (non-root) Athena catalog. `athenaCatalog` is derived from the caller's
+    # `catalogId`, which is a caller-supplied, form-only-validated value; the
+    # binding that makes it trustworthy is `assert_namespace_may_catalog` above,
+    # which ran (and 403'd on failure) before we got here, keyed on `catalogId`.
+    # Serve's `sql_namespace_scope` promotes `(athenaCatalog, database)` into its
+    # authorization oracle, so it must authorize the nested catalog ONLY when that
+    # ownership check actually covered the value being authorized.
+    #
+    # Gate the marker to the catalog the ownership check SAW: `athenaCatalog` is
+    # `_resolve_glue_athena_catalog(glue_config)`, which returns
+    # `athena_data_catalog_name` FIRST when the caller set it — a SEPARATE field
+    # `assert_namespace_may_catalog` (keyed on `catalog_id`/`database_name`) never
+    # validated. Trusting that branch would let a caller who owns `catalogId` A but
+    # declares `athenaDataCatalogName = "B"` get the marker recorded for B. So only
+    # set the marker when `athenaCatalog` was DERIVED FROM the checked `catalog_id`
+    # (i.e. `athenaDataCatalogName` was not supplied). A caller-declared
+    # `athenaDataCatalogName` gets no marker and is not authorized 3-part until it,
+    # too, is ownership-checked — the fail-closed direction. Root `AwsDataCatalog`
+    # needs no marker (never a nested catalog).
+    _declared_catalog_name = getattr(glue_config, "athena_data_catalog_name", None) if glue_config else None
+    if (
+        glue_config
+        and item["athenaCatalog"]
+        and item["athenaCatalog"] != _DEFAULT_ATHENA_CATALOG
+        and not _declared_catalog_name
+    ):
+        item["athenaCatalogOwnershipVerified"] = True
 
     try:
         _get_dao().put(item)
@@ -1203,6 +1235,9 @@ def _handle_get_table(namespace_id: str, source_id: str, table_id: str) -> dict[
                 targetColumn=fk.target_column or None,
                 source=fk.source or None,
                 confidence=fk.confidence or None,
+                reviewStatus=fk.review_status or None,
+                targetDatasourceId=fk.target_datasource_id or None,
+                provenance=fk.provenance or None,
             ).to_dict()
             for fk in table.foreign_keys
         ] or None
@@ -1334,12 +1369,10 @@ def _load_single_asset(
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """Search-and-load a single table asset by exact name match.
 
-    Performs at most 2 DataZone API calls (search + get_asset_forms),
+    Performs 2 DataZone API calls (exact-name search + get_asset_forms),
     independent of the total table count for the source. Returns
     (asset_dict, None) or (None, error_response).
     """
-    from coa_common.datazone_forms import FORM_TYPE_NAME, deserialize_form
-
     ds_key = f"DS#{source_id}"
     asset_name = f"{ds_key}:{table_id}"
     try:
@@ -1350,6 +1383,18 @@ def _load_single_asset(
 
     if asset is None:
         return None, api_response(404, {"error": f"Table '{table_id}' not found"})
+
+    return _load_asset_metadata(client, source_id, table_id, asset)
+
+
+def _load_asset_metadata(
+    client: SMUSClient,
+    source_id: str,
+    table_id: str,
+    asset: AssetResult,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Load and deserialize a table when its exact catalog asset is known."""
+    from coa_common.datazone_forms import FORM_TYPE_NAME, deserialize_form
 
     try:
         detail = client.get_asset_forms(asset_id=asset.asset_id)
@@ -1369,6 +1414,50 @@ def _load_single_asset(
         return {"asset_id": asset.asset_id, "asset_name": asset.name, "table": table}, None
 
     return None, api_response(500, {"error": "Asset is missing CoaTableMetadata form"})
+
+
+def _find_source_table_assets_by_name(
+    client: SMUSClient,
+    project_id: str,
+    source_id: str,
+    table_name: str,
+    schemas: list[str],
+) -> tuple[dict[str, AssetResult] | None, dict[str, Any] | None]:
+    """Return source-local assets matching one bare table name.
+
+    Foreign-key targets are source-local: the request carries no target source
+    identifier, and persisting a reference outside this source would make the
+    relationship impossible to validate or resolve later. The source record's
+    discovered schema list is the complete namespace for its canonical
+    ``schema.table`` IDs, so probe each possible full asset name with an exact
+    DataZone filter. This proves uniqueness without catalog-wide token-search
+    pagination and retains the matched asset for metadata loading.
+    """
+    if not schemas:
+        logger.warning("find_fk_target_tables_missing_schema_index", source_id=source_id, project_id=project_id)
+        return None, api_response(500, {"error": "Source schema index is unavailable"})
+
+    matching_assets: dict[str, AssetResult] = {}
+    try:
+        for schema in sorted(set(schemas)):
+            table_id = f"{schema}.{table_name}"
+            asset = client.find_asset_by_name(project_id=project_id, name=f"DS#{source_id}:{table_id}")
+            if asset is not None:
+                matching_assets[table_id] = asset
+                # Once two exact matches exist, the bare name is known to be
+                # ambiguous; no remaining schema can change that conclusion.
+                if len(matching_assets) > 1:
+                    return matching_assets, None
+    except Exception:
+        logger.exception(
+            "find_fk_target_tables_failed",
+            source_id=source_id,
+            project_id=project_id,
+            table_name=table_name,
+        )
+        return None, api_response(500, {"error": "Failed to validate foreign key target tables"})
+
+    return matching_assets, None
 
 
 def _decision_to_status(decision: str) -> str:
@@ -1491,39 +1580,50 @@ _REVIEWABLE_STATES: frozenset[str] = frozenset(
 )
 
 
-def _assert_source_reviewable(namespace_id: str, source_id: str) -> dict[str, Any] | None:
-    """Return a 409 response if the source is in a non-reviewable state.
+def _reviewable_source_or_error(
+    namespace_id: str, source_id: str
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Load a reviewable source or return its validation error.
 
     Prevents per-table/column review/edit operations from racing with bulk
     approve/reject workers (or from running before discovery/enrichment is
-    complete). One DDB read per call. Returns ``None`` when the operation
-    may proceed.
+    complete). The schema list is included so key edits can resolve bare
+    foreign-key targets without a second DynamoDB read.
     """
     try:
         item = _get_dao().get(
             {"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"},
-            projection=["status", "sourceType"],
+            projection=["status", "sourceType", "discoveredSchemas"],
         )
     except ClientError:
         logger.exception("assert_reviewable_get_failed", source_id=source_id)
-        return api_response(500, {"error": "Internal server error"})
+        return None, api_response(500, {"error": "Internal server error"})
 
     if not item:
-        return api_response(404, {"error": f"Source '{source_id}' not found"})
+        return None, api_response(404, {"error": f"Source '{source_id}' not found"})
     if item.get("sourceType") != SourceType.DATABASE:
-        return api_response(400, {"error": "Review operations only apply to DATABASE sources"})
+        return None, api_response(400, {"error": "Review operations only apply to DATABASE sources"})
 
     status = item.get("status")
     if status not in _REVIEWABLE_STATES:
-        return api_response(
-            409,
-            {
-                "error": (
-                    f"Source is in '{status}' state; review operations require one of: {sorted(_REVIEWABLE_STATES)}"
-                )
-            },
+        return (
+            None,
+            api_response(
+                409,
+                {
+                    "error": (
+                        f"Source is in '{status}' state; review operations require one of: {sorted(_REVIEWABLE_STATES)}"
+                    )
+                },
+            ),
         )
-    return None
+    return item, None
+
+
+def _assert_source_reviewable(namespace_id: str, source_id: str) -> dict[str, Any] | None:
+    """Return an error response if the source is not reviewable."""
+    _, err = _reviewable_source_or_error(namespace_id, source_id)
+    return err
 
 
 def _terminal_edit_block(review_status: str, kind: str) -> dict[str, Any] | None:
@@ -1800,11 +1900,14 @@ def _handle_update_table_keys(
     source = STEWARD_SPECIFIED, overriding deterministic or AI-inferred keys.
     Keys that are unchanged keep their original provenance, so editing one key
     never re-stamps the others. An omitted field is left unchanged; an empty
-    list clears it. Key columns are validated against the table's own columns.
-    Does NOT change reviewStatus.
+    list clears it. Local key columns are validated against the edited table;
+    foreign-key targets and target columns are validated against tables in the
+    same source. Does NOT change reviewStatus.
     """
+    import dataclasses
+
     from coa_common.datazone_forms import build_forms_input
-    from coa_common.domain_models import EnrichmentSource, ForeignKey, PrimaryKey
+    from coa_common.domain_models import EnrichmentSource, ForeignKey, PrimaryKey, ReviewStatus
 
     try:
         body: dict[str, Any] = json.loads(event.get("body") or "{}")
@@ -1816,9 +1919,11 @@ def _handle_update_table_keys(
     if pk_in is None and fks_in is None:
         return api_response(400, {"error": "primaryKey or foreignKeys is required"})
 
-    err = _assert_source_reviewable(namespace_id, source_id)
+    source, err = _reviewable_source_or_error(namespace_id, source_id)
     if err:
         return err
+    if source is None:
+        return api_response(500, {"error": "Internal server error"})
     client, err = _smus_or_500()
     if err:
         return err
@@ -1857,22 +1962,143 @@ def _handle_update_table_keys(
     if fks_in is not None:
         if not isinstance(fks_in, list):
             return api_response(400, {"error": "foreignKeys must be a list"})
-        # Index existing FKs so unchanged rows retain their original provenance.
-        existing_fk_by_key = {(fk.column, fk.target_table, fk.target_column or ""): fk for fk in table.foreign_keys}
-        new_fks: list[ForeignKey] = []
+        parsed_fks: list[tuple[str, str, str, str]] = []
         for fk in fks_in:
             col = fk.get("column") if isinstance(fk, dict) else None
             target = fk.get("targetTable") if isinstance(fk, dict) else None
-            if not col or not target:
+            if not isinstance(col, str) or not col or not isinstance(target, str) or not target:
                 return api_response(400, {"error": "Each foreign key requires column and targetTable"})
+            target_column = fk.get("targetColumn")
+            if target_column is not None and not isinstance(target_column, str):
+                return api_response(400, {"error": "foreignKeys.targetColumn must be a string"})
+            tcol = target_column or ""
+            # Optional steward review decision on an inferred relationship (#1088):
+            # APPROVED / REJECTED (or "" to leave unchanged). Approving flips the
+            # gate so the relationship reaches the ontology; rejecting withholds it.
+            # PENDING_REVIEW is deliberately NOT settable here: it is the state the
+            # inference pipeline assigns when it proposes a relationship, not a
+            # decision a steward makes — a steward can only decide (approve/reject).
+            review_status = fk.get("reviewStatus") or "" if isinstance(fk, dict) else ""
+            if review_status and review_status not in (ReviewStatus.APPROVED, ReviewStatus.REJECTED):
+                return api_response(400, {"error": f"Invalid foreign key reviewStatus: {review_status!r}"})
+            parsed_fks.append((col, target, tcol, review_status))
+
+        # Existing rows are already persisted catalog state. The UI re-sends
+        # the complete FK list even when the steward edits only a primary key
+        # or adds one relationship, so revalidating unchanged legacy rows can
+        # make an unrelated edit impossible. Validate only new or changed rows.
+        existing_fk_by_key = {(fk.column, fk.target_table, fk.target_column or ""): fk for fk in table.foreign_keys}
+        target_table_cache: dict[str, Any] = {table.table_id: table}
+        resolved_target_ids: dict[str, str] = {}
+        resolved_target_assets: dict[str, AssetResult] = {}
+        new_fks: list[ForeignKey] = []
+        for col, target, tcol, review_status in parsed_fks:
+            existing = existing_fk_by_key.get((col, target, tcol))
+            if existing is not None:
+                # Review action (#1088): a steward APPROVE/REJECT flips review_status
+                # on the existing inferred relationship while preserving its source,
+                # target_datasource_id and provenance. No status change -> untouched.
+                if review_status and review_status != existing.review_status:
+                    # A cross-source relationship must point at a source in THIS
+                    # namespace. The inference pipeline only ever creates in-namespace
+                    # targets, but approving is the moment the edge becomes real in
+                    # the ontology, so refuse a stray/cross-namespace target here
+                    # rather than materialise a join the namespace cannot see.
+                    if review_status == ReviewStatus.APPROVED and existing.target_datasource_id:
+                        tgt_ds = existing.target_datasource_id.removeprefix("DS#")
+                        if _get_dao().get({"PK": f"NS#{namespace_id}", "SK": f"SRC#{tgt_ds}"}) is None:
+                            return api_response(
+                                400,
+                                {
+                                    "error": (
+                                        f"Cross-source foreign key on '{col}' targets datasource "
+                                        f"'{existing.target_datasource_id}', which is not in this namespace"
+                                    )
+                                },
+                            )
+                    new_fks.append(dataclasses.replace(existing, review_status=review_status))
+                else:
+                    new_fks.append(existing)
+                continue
             if col not in valid_cols:
                 return api_response(400, {"error": f"Unknown foreign key column: {col}"})
-            tcol = fk.get("targetColumn") or ""
-            existing = existing_fk_by_key.get((col, target, tcol))
+
+            target_table_id = resolved_target_ids.get(target)
+            target_table = target_table_cache.get(target_table_id) if target_table_id else None
+            if target_table_id is None:
+                if "." in target:
+                    # A qualified target is already a canonical table ID.
+                    target_table_id = target
+                else:
+                    # Bare targets are a legacy/UI format. They are safe to
+                    # persist only when the name is unique across the source;
+                    # downstream resolvers apply the same rule and cannot
+                    # recover a guessed database from a stored bare name.
+                    schemas = source.get("discoveredSchemas")
+                    if not isinstance(schemas, list) or not all(isinstance(schema, str) for schema in schemas):
+                        return api_response(500, {"error": "Source schema index is unavailable"})
+                    matching_assets, find_err = _find_source_table_assets_by_name(
+                        client,
+                        project_id,
+                        source_id,
+                        target,
+                        schemas,
+                    )
+                    if find_err:
+                        return find_err
+                    if matching_assets is None:
+                        return api_response(500, {"error": "Failed to validate foreign key target tables"})
+                    # The edited table was loaded by exact name and is known
+                    # to exist even if the search index is briefly stale.
+                    if table.table_id.rsplit(".", 1)[-1] == target:
+                        matching_assets.setdefault(
+                            table.table_id,
+                            AssetResult(
+                                asset_id=asset["asset_id"],
+                                name=asset["asset_name"],
+                                project_id=project_id,
+                            ),
+                        )
+                    matches = sorted(matching_assets)
+                    if not matches:
+                        return api_response(400, {"error": f"Unknown foreign key target table: {target}"})
+                    if len(matches) > 1:
+                        return api_response(
+                            400,
+                            {
+                                "error": (
+                                    f"Ambiguous foreign key target table '{target}'; use its database.table identifier"
+                                )
+                            },
+                        )
+                    target_table_id = matches[0]
+                    resolved_target_assets[target] = matching_assets[target_table_id]
+                target_table = target_table_cache.get(target_table_id)
+
+            if target_table is None:
+                resolved_asset = resolved_target_assets.get(target)
+                if resolved_asset is None:
+                    target_asset, target_err = _load_single_asset(client, project_id, source_id, target_table_id)
+                else:
+                    target_asset, target_err = _load_asset_metadata(client, source_id, target_table_id, resolved_asset)
+                if target_err:
+                    if target_err.get("statusCode") == 404:
+                        return api_response(400, {"error": f"Unknown foreign key target table: {target}"})
+                    return target_err
+                if target_asset is None:
+                    return api_response(500, {"error": "Failed to load foreign key target table"})
+                target_table = target_asset["table"]
+                target_table_cache[target_table_id] = target_table
+
+            resolved_target_ids[target] = target_table_id
+
+            if tcol and tcol not in {column.name for column in target_table.columns}:
+                return api_response(
+                    400,
+                    {"error": f"Unknown target column '{tcol}' on foreign key target table '{target}'"},
+                )
             new_fks.append(
-                existing
-                if existing is not None
-                else ForeignKey(
+                ForeignKey(
                     column=col, target_table=target, target_column=tcol, source=EnrichmentSource.STEWARD_SPECIFIED
                 )
             )

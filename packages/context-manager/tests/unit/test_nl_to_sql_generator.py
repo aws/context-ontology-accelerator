@@ -17,10 +17,14 @@ from coa_serve.tier2.nl_to_sql.sql_generator import (
     _extract_confidence,
     _extract_sql,
     _extract_table_names,
+    _hit_table_source_map,
     _resolve_data_source_from_hits,
     _resolve_data_source_from_sql,
     build_fk_adjacency,
+    sql_table_routing,
+    table_sources_need_preparation,
 )
+from coa_serve.tier2.table_qualifier import AMBIGUOUS_KEY
 
 
 @pytest.fixture
@@ -596,6 +600,88 @@ class TestResolveDataSourceFromSql:
             VectorHit(id="3", text="Table: orders | o", score=0.7, metadata={"data_source_id": "pg-src"}),
         ]
         assert _resolve_data_source_from_sql("SELECT * FROM orders", hits) == "pg-src"
+
+
+@pytest.mark.unit
+class TestHitTableSourceMap:
+    """`_hit_table_source_map` — within-source same-name detection."""
+
+    def test_single_class_maps_to_its_source(self):
+        hits = [
+            VectorHit(id="c1", text="Table: orders | o", score=0.9, metadata={"data_source_id": "pg", "uri": "u1"}),
+        ]
+        assert _hit_table_source_map(hits) == {"orders": "pg"}
+
+    def test_same_name_two_sources_is_ambiguous(self):
+        hits = [
+            VectorHit(id="c1", text="Table: customers | c", score=0.9, metadata={"data_source_id": "pg", "uri": "u1"}),
+            VectorHit(id="c2", text="Table: customers | c", score=0.8, metadata={"data_source_id": "gl", "uri": "u2"}),
+        ]
+        assert _hit_table_source_map(hits) == {"customers": "__ambiguous__"}
+
+    def test_same_name_two_schemas_one_source_is_ambiguous(self):
+        # The silent-wrong-answer case: two classes (distinct URIs) under ONE
+        # source, both named `customers`. Keying on source id alone missed this.
+        hits = [
+            VectorHit(
+                id="c1",
+                text="Table: customers | c",
+                score=0.9,
+                metadata={"data_source_id": "pg", "uri": "sales/customers"},
+            ),
+            VectorHit(
+                id="c2",
+                text="Table: customers | c",
+                score=0.8,
+                metadata={"data_source_id": "pg", "uri": "analytics/customers"},
+            ),
+        ]
+        assert _hit_table_source_map(hits) == {"customers": "__ambiguous__"}
+
+    def test_same_class_retrieved_twice_is_not_ambiguous(self):
+        # Two hits, ONE class (same uri): not a collision.
+        hits = [
+            VectorHit(id="c1a", text="Table: orders | o", score=0.9, metadata={"data_source_id": "pg", "uri": "u1"}),
+            VectorHit(id="c1b", text="Table: orders | o", score=0.7, metadata={"data_source_id": "pg", "uri": "u1"}),
+        ]
+        assert _hit_table_source_map(hits) == {"orders": "pg"}
+
+    def test_hit_without_source_is_ignored(self):
+        hits = [VectorHit(id="c1", text="Table: orders | o", score=0.9, metadata={"uri": "u1"})]
+        assert _hit_table_source_map(hits) == {}
+
+
+@pytest.mark.unit
+class TestSqlTableRoutingAmbiguity:
+    """`sql_table_routing` emits an ambiguity marker so the query is refused."""
+
+    def test_ambiguous_referenced_table_gets_marker(self):
+        table_sources = {"customers": "__ambiguous__", "orders": "pg"}
+        routing = sql_table_routing("SELECT * FROM customers JOIN orders ON TRUE", table_sources)
+        assert routing["customers"] == {AMBIGUOUS_KEY: "customers"}
+        assert routing["orders"] == {"datasourceId": "pg"}
+
+    def test_unreferenced_ambiguous_table_is_absent(self):
+        table_sources = {"customers": "__ambiguous__", "orders": "pg"}
+        routing = sql_table_routing("SELECT * FROM orders", table_sources)
+        assert "customers" not in routing
+
+
+@pytest.mark.unit
+class TestTableSourcesNeedPreparation:
+    def test_single_unambiguous_source_skips(self):
+        assert table_sources_need_preparation({"orders": "pg", "items": "pg"}) is False
+
+    def test_two_real_sources_prepares(self):
+        assert table_sources_need_preparation({"orders": "pg", "customers": "gl"}) is True
+
+    def test_ambiguous_marker_prepares_even_single_source(self):
+        # One real source + an ambiguous name: a plain distinct-sources<2 check
+        # skipped this and left the wrong-answer path open.
+        assert table_sources_need_preparation({"customers": "__ambiguous__", "orders": "pg"}) is True
+
+    def test_empty_skips(self):
+        assert table_sources_need_preparation({}) is False
 
 
 @pytest.mark.unit

@@ -5,13 +5,14 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from coa_serve.deadline import Deadline
-from coa_serve.exceptions import AccessDeniedError
+from coa_serve.exceptions import AccessDeniedError, AmbiguousReferenceError
 from coa_serve.tier2.nl_to_sql.strategy import NLtoSQLStrategy
 from coa_serve.tier2.strategy import MAX_RESULT_ROWS, StrategyContext, StrategyOption, StrategyResult
+from coa_serve.tier2.table_qualifier import PreparedSQL
 from coa_serve.trace import TraceCollector
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -25,6 +26,7 @@ def _make_nl_to_sql_result(
     retrieved_tables: list[str] | None = None,
     expanded_tables: list[str] | None = None,
     data_source_id: str = "ds-1",
+    table_sources: dict[str, str] | None = None,
 ):
     """Build a mock NLtoSQLResult."""
     result = MagicMock()
@@ -36,6 +38,9 @@ def _make_nl_to_sql_result(
     result.trace_steps = []
     result.data_source_id = data_source_id
     result.ddl_context = "CREATE TABLE orders (id int);"
+    # Explicit, not a MagicMock attribute: cross-source qualification reads this
+    # per shot, and an auto-created mock would fabricate table->source entries.
+    result.table_sources = table_sources or {}
     return result
 
 
@@ -551,6 +556,170 @@ class TestNLtoSQLStrategyResolve:
 
         generate_kwargs = sql_generator.generate.call_args[1]
         assert len(generate_kwargs["evidence"]) == 500
+
+
+@pytest.mark.unit
+class TestNLtoSQLCrossSourceQualification:
+    """Cross-source qualification on the NL→SQL path: qualify SQL that spans two sources.
+
+    The generator authors BARE table names (its prompt examples are bare), so a
+    statement joining two sources hits Athena's single pinned (Catalog, Database)
+    context and fails TABLE_NOT_FOUND. Qualification happens in the strategy —
+    after the firewall, per shot — because a corrected statement may reference a
+    different set of tables.
+    """
+
+    _SQL = "SELECT a.id FROM claims a JOIN policies b ON a.id = b.claim_id"
+
+    def _registry(self, sources):
+        reg = AsyncMock()
+        reg.get_source.side_effect = lambda namespace, data_source_id: sources.get(data_source_id, {})
+        return reg
+
+    def _strategy(self, sql_generator, firewall, query_executor, registry):
+        return NLtoSQLStrategy(
+            sql_generator=sql_generator,
+            firewall=firewall,
+            query_executor=query_executor,
+            oss_ontology_index="test-index",
+            sources_registry=registry,
+        )
+
+    @pytest.mark.asyncio
+    async def test_cross_source_sql_is_qualified(self):
+        sql_generator, firewall, query_executor = AsyncMock(), MagicMock(), AsyncMock()
+        sql_generator.generate.return_value = _make_nl_to_sql_result(
+            sql=self._SQL,
+            # Retrieval mixed two sources; the generated SQL touches both.
+            table_sources={"claims": "ds-pg", "policies": "ds-glue"},
+            data_source_id="",
+        )
+        firewall.evaluate.return_value = _make_firewall_result(authorized_sql=self._SQL)
+        query_executor.execute.return_value = _make_exec_result()
+        registry = self._registry(
+            {
+                "ds-pg": {"athenaDataCatalogName": "pg_cat", "discoveredSchemas": ["public"]},
+                "ds-glue": {"glueDatabaseName": "insurance"},
+            }
+        )
+        strategy = self._strategy(sql_generator, firewall, query_executor, registry)
+
+        result = await strategy.resolve("cross-source question", "ns1", _make_context())
+
+        executed = query_executor.execute.call_args.args[0].replace('"', "")
+        assert "pg_cat.public.claims" in executed
+        assert "awsdatacatalog.insurance.policies" in executed
+        # The reported SQL is the SQL that actually ran.
+        assert result.sql == query_executor.execute.call_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_single_source_sql_unchanged(self):
+        """A single-source statement must stay bare so it keeps the JDBC fast path."""
+        sql_generator, firewall, query_executor = AsyncMock(), MagicMock(), AsyncMock()
+        sql_generator.generate.return_value = _make_nl_to_sql_result(
+            sql=self._SQL,
+            table_sources={"claims": "ds-pg", "policies": "ds-pg"},
+        )
+        firewall.evaluate.return_value = _make_firewall_result(authorized_sql=self._SQL)
+        query_executor.execute.return_value = _make_exec_result()
+        registry = self._registry({"ds-pg": {"athenaDataCatalogName": "pg_cat", "discoveredSchemas": ["public"]}})
+        strategy = self._strategy(sql_generator, firewall, query_executor, registry)
+
+        await strategy.resolve("single-source question", "ns1", _make_context())
+
+        assert query_executor.execute.call_args.args[0] == self._SQL
+        registry.get_source.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_table_name_is_refused_not_executed(self):
+        """A table name owned by two classes → refuse the query, never guess.
+
+        Executing bare would run against whichever schema the executor defaulted
+        to and return a wrong answer as success — the silent-wrong-answer path.
+        The strategy raises a terminal ``AmbiguousReferenceError`` (surfaced to the
+        client as an explicit 400) rather than executing or silently skipping.
+        """
+        sql_generator, firewall, query_executor = AsyncMock(), MagicMock(), AsyncMock()
+        sql = "SELECT a.id FROM customers a JOIN policies b ON a.id = b.claim_id"
+        sql_generator.generate.return_value = _make_nl_to_sql_result(
+            sql=sql,
+            # _hit_table_source_map marks a name claimed by two classes ambiguous
+            # (here two schemas of one source, or two sources — same marker).
+            table_sources={"customers": "__ambiguous__", "policies": "ds-glue"},
+            data_source_id="",
+        )
+        firewall.evaluate.return_value = _make_firewall_result(authorized_sql=sql)
+        query_executor.execute.return_value = _make_exec_result()
+        registry = self._registry({"ds-glue": {"glueDatabaseName": "insurance"}})
+        strategy = self._strategy(sql_generator, firewall, query_executor, registry)
+
+        with pytest.raises(AmbiguousReferenceError):
+            await strategy.resolve("ambiguous question", "ns1", _make_context())
+
+        query_executor.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_firewall_sees_the_unqualified_sql(self):
+        """The rewrite MUST run downstream of authorization, on this path too.
+
+        Cedar receives ``SQLFirewall.extract_tables()`` output verbatim, so
+        qualifying first would change the strings a table-scoped policy matches on.
+        The VKG path has the same assertion; keeping both makes the ordering
+        executable rather than a comment in one module.
+        """
+        sql_generator, firewall, query_executor = AsyncMock(), MagicMock(), AsyncMock()
+        sql_generator.generate.return_value = _make_nl_to_sql_result(
+            sql=self._SQL,
+            table_sources={"claims": "ds-pg", "policies": "ds-glue"},
+            data_source_id="",
+        )
+        firewall.evaluate.return_value = _make_firewall_result(authorized_sql=self._SQL)
+        query_executor.execute.return_value = _make_exec_result()
+        registry = self._registry(
+            {
+                "ds-pg": {"athenaDataCatalogName": "pg_cat", "discoveredSchemas": ["public"]},
+                "ds-glue": {"glueDatabaseName": "insurance"},
+            }
+        )
+        strategy = self._strategy(sql_generator, firewall, query_executor, registry)
+
+        await strategy.resolve("cross-source question", "ns1", _make_context())
+
+        assert firewall.evaluate.call_args.args[0] == self._SQL
+        assert query_executor.execute.call_args.args[0] != self._SQL
+
+    @pytest.mark.asyncio
+    async def test_unattributable_reference_abandons_the_strategy(self):
+        """Fail closed, matching the VKG path.
+
+        This path previously executed the unqualified statement instead, on the
+        theory that ``sql_table_routing`` can never produce an ambiguous name —
+        true today, but a property of a different module that nothing enforced.
+        Executing risks reading a different source's table than the one authorized,
+        and a correction shot would hit the same ambiguity, so the strategy raises a
+        terminal ``AmbiguousReferenceError`` (surfaced to the client) rather than
+        executing or silently skipping.
+        """
+        sql_generator, firewall, query_executor = AsyncMock(), MagicMock(), AsyncMock()
+        sql_generator.generate.return_value = _make_nl_to_sql_result(
+            sql=self._SQL,
+            table_sources={"claims": "ds-pg", "policies": "ds-glue"},
+            data_source_id="",
+        )
+        firewall.evaluate.return_value = _make_firewall_result(authorized_sql=self._SQL)
+        query_executor.execute.return_value = _make_exec_result()
+        strategy = self._strategy(sql_generator, firewall, query_executor, self._registry({}))
+
+        with (
+            patch(
+                "coa_serve.tier2.nl_to_sql.strategy.prepare_execution_sql",
+                AsyncMock(return_value=PreparedSQL(sql=self._SQL, error="table 'claims' is ambiguous")),
+            ),
+            pytest.raises(AmbiguousReferenceError),
+        ):
+            await strategy.resolve("cross-source question", "ns1", _make_context())
+
+        query_executor.execute.assert_not_called()
 
 
 def _make_context_with_deadline(budget_s: float) -> StrategyContext:

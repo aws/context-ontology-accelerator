@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+from coa_common.bedrock import BedrockTruncationError
 from coa_common.domain_models import (
     Column,
     EnrichmentSource,
@@ -302,6 +303,19 @@ class TestLargeSchemaChunking:
 
 class TestInferBatchErrorPaths:
     """Verify _infer_batch handles errors and non-list responses."""
+
+    def test_truncation_returns_empty_and_preserves_typed_error(self, caplog) -> None:
+        truncation = BedrockTruncationError(model_id="test-model", output_tokens=8192, max_tokens=8192)
+        mock_client = MagicMock()
+        mock_client.invoke.side_effect = truncation
+        mock_emitter = MagicMock()
+
+        result = infer_relationships([_make_table("t1")], mock_client, emitter=mock_emitter)
+
+        assert result == []
+        mock_emitter.emit_bedrock_invocation_error.assert_called_once_with(stage="Pass2", exc=truncation)
+        assert "Pass 2 batch truncated" in caplog.text
+        assert "requested_max_tokens=8192" in caplog.text
 
     def test_bedrock_exception_returns_empty_and_emits_error(self) -> None:
         mock_client = MagicMock()

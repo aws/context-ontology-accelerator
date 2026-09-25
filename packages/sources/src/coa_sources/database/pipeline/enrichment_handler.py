@@ -198,6 +198,35 @@ def handler() -> None:
             update_fields={"status": terminal_status},
             condition="attribute_exists(PK)",
         )
+
+        # Cross-source relationship detection (#1088). Now that this source is
+        # enriched, look for relationships between it and the namespace's OTHER
+        # enriched sources (the single-source Pass 2 above cannot see across a
+        # source boundary). Best-effort and NON-FATAL: this source's own tables
+        # are already written and terminal, so a failure here must not flip it to
+        # SCAN_FAILED. Idempotent — re-running as each new source lands re-scans
+        # the namespace and de-duplicates. run_for_namespace serialises the pass
+        # with a per-namespace lock, so if two sources finish enrichment at once
+        # only one pass runs and the other skips.
+        try:
+            from coa_sources.database.enrichment.cross_source_orchestrator import run_for_namespace
+
+            cross = run_for_namespace(
+                namespace_id,
+                project_id,
+                domain_id,
+                region=region,
+                sources_table=os.environ["SOURCES_TABLE"],
+                emitter=emitter,
+                # Only pair THIS source with the others: relationships among the
+                # already-enriched sources were inferred when each of them landed.
+                focus_datasource_id=datasource_id,
+            )
+            emitter.emit_metric("CrossSourceRelationshipsWritten", cross["relationships_written"], "Count")
+            logger.info("Cross-source relationship detection: %s", cross)
+        except Exception:
+            emitter.emit_metric("CrossSourceDetectionFailed", 1, "Count")
+            logger.exception("Cross-source relationship detection failed (non-fatal) for namespace %s", namespace_id)
     except Exception as exc:
         logger.exception("Enrichment failed for datasource %s", datasource_id)
         from datetime import UTC, datetime

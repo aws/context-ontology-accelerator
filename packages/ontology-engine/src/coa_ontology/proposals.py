@@ -36,8 +36,7 @@ from typing import Any
 
 from botocore.exceptions import ClientError
 from coa_common import sql_ident as _sql_ident
-from coa_common import sql_qualified_table as _sql_qualified_table
-from coa_common.constants import EVENT_SOURCE_PREFIX, VOCAB_URI
+from coa_common.constants import EVENT_SOURCE_PREFIX, VOCAB_URI, split_sql_ident_path
 from coa_control_plane_server.models.proposal_status import ProposalStatus
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -201,7 +200,38 @@ def _ontology_short_id(ontology_id: str) -> str:
     return safe_id.split("_")[-1] if "_" in safe_id else safe_id
 
 
-def _generate_schema_sql(namespace: str, ontology_id: str) -> str | None:
+def _mapping_table_names(r2rml_turtle: str | None) -> set[str] | None:
+    """The ``rr:tableName`` literals the mapping being persisted actually declares.
+
+    ``None`` means "unknown" — no mapping was supplied, or it did not parse — and
+    the caller then falls back to deriving names from the catalog alone.
+
+    Returns:
+        The set of logical-table literals, or ``None`` when they cannot be read.
+    """
+    if not r2rml_turtle:
+        return None
+    from rdflib import Graph, Namespace
+
+    rr = Namespace("http://www.w3.org/ns/r2rml#")
+    try:
+        graph = Graph().parse(data=r2rml_turtle, format="turtle")
+    except Exception as e:  # noqa: BLE001 - degrade to catalog-derived names
+        _log.warning(
+            "schema.sql: could not parse the R2RML mapping to read its logical table names "
+            "(%s); falling back to catalog-derived names, which may not match",
+            type(e).__name__,
+        )
+        return None
+    return {str(o) for o in graph.objects(None, rr.tableName)}
+
+
+def _generate_schema_sql(
+    namespace: str,
+    ontology_id: str,
+    r2rml_turtle: str | None = None,
+    extra_datasource_ids: list[str] | None = None,
+) -> str | None:
     """Generate H2 DDL from datasource catalog metadata.
 
     Returns the schema.sql text, or ``None`` when there is nothing to describe
@@ -209,6 +239,25 @@ def _generate_schema_sql(namespace: str, ontology_id: str) -> str | None:
     an unstructured ontology). Identifiers are emitted verbatim (SQL-delimited)
     so they match the source datasource; no canonical→original column map is
     needed.
+
+    ``r2rml_turtle`` is the mapping being persisted alongside this DDL. It is what
+    makes the two agree: the logical-table names in a mapping depend on WHICH
+    tables were in the run that produced it (a bare ``customers`` while one source
+    exposed that name, ``"public__2f77729f"."customers"`` once two did), and the
+    table set re-derived here is the union over ALL accepted proposals — a
+    different set, so a re-derivation can name a table differently from the
+    mapping that is about to be stored beside it. Ontop rejects a mapping naming a
+    table its validation schema does not declare, and that failure is
+    namespace-wide, not per-table. Passing the mapping makes the DDL a function of
+    it (see :func:`_tables_to_h2_ddl`) instead of a parallel guess.
+
+    ``extra_datasource_ids`` are unioned with the datasource ids gathered from the
+    accepted-proposal scan. The scan (``list_proposals(status="accepted")``) is
+    eventually consistent, and this can run inside the very accept that flipped its
+    own proposal to ``accepted`` moments earlier — so on a merge the scan may not
+    yet see it and would drop that source's tables. Passing the in-flight accept's
+    own ids here closes that read-after-write gap; they union with, never replace,
+    the scan, so re-accepts stay idempotent.
 
     Raises :class:`SchemaSqlGenerationError` on a genuine failure so the caller
     can tell it apart from the ``None`` empty state.
@@ -218,6 +267,7 @@ def _generate_schema_sql(namespace: str, ontology_id: str) -> str | None:
     try:
         from coa_ontology.induce_catalog import _catalog_to_tables, _fetch_catalog_from_smus
         from coa_ontology.inducer.services.data_catalog import CatalogTable
+        from coa_ontology.inducer.strategies.base import schema_from_fqn
 
         # Collect datasource IDs from accepted proposals for this ontology
         accepted = dynamo_store.list_proposals(
@@ -228,6 +278,18 @@ def _generate_schema_sql(namespace: str, ontology_id: str) -> str | None:
             meta = p.get("metadata") or {}
             for ds_id in meta.get("datasource_ids") or []:
                 ds_ids.add(ds_id)
+
+        # Union the CURRENT accept's datasource ids. ``list_proposals`` is an
+        # eventually-consistent DynamoDB scan, and this runs inside the same accept
+        # that just flipped its own proposal to ``accepted`` a few steps earlier —
+        # so the scan can miss that proposal and drop its source's tables from the
+        # DDL, even though the merged mapping (accumulated from Neptune) still names
+        # them. That mismatch makes ``_tables_to_h2_ddl`` fail closed, leaving a
+        # stale schema.sql and breaking every Tier-2 query in the namespace. Adding
+        # the in-flight ids here closes the read-after-write gap deterministically;
+        # they union with (never replace) the scan, so a re-accept is idempotent.
+        for ds_id in extra_datasource_ids or []:
+            ds_ids.add(ds_id)
 
         # Legitimate empty state: an ontology with no structured datasources
         # (e.g. unstructured) has no tables to describe. Not an error.
@@ -255,13 +317,25 @@ def _generate_schema_sql(namespace: str, ontology_id: str) -> str | None:
 
                 catalog = _fetch_catalog(config["data_catalog_url"], ds_id)
             for tbl_dict in _catalog_to_tables(catalog):
+                # Stamp datasource identity exactly as the induction and
+                # infer-constraints paths do (induce_catalog._run_induction,
+                # _fetch_catalog_tables). Without it every table here shares a
+                # datasourceId of None, so two sources' same-named tables collapse
+                # to one identity and the H2 DDL disagrees with the mapping's
+                # logical names — Ontop then rejects the mapping at VKG load.
+                tbl_dict["datasourceId"] = ds_id
+                # schema_from_fqn, not fqn.split(".")[0]: the schema is the segment
+                # NEAREST the table, so a 3-part catalog.database.table would
+                # otherwise stamp the CATALOG name here, and this value becomes
+                # coa:sourceSchema — the schema serve puts in the executed SQL.
+                tbl_dict["sourceSchema"] = schema_from_fqn(tbl_dict.get("fullyQualifiedName")) or None
                 all_tables.append(CatalogTable(**tbl_dict))
 
         # Legitimate empty state: datasources resolved but exposed no tables.
         if not all_tables:
             return None
 
-        return _tables_to_h2_ddl(all_tables)
+        return _tables_to_h2_ddl(all_tables, _mapping_table_names(r2rml_turtle))
 
     except Exception as e:
         # Genuine failure — do NOT mask as the ``None`` empty state (#457).
@@ -305,47 +379,127 @@ _CATALOG_TO_H2 = {
 }
 
 
-def _tables_to_h2_ddl(tables: list) -> str:
+def _align_to_mapping(
+    logical_names: dict[str, str],
+    tables: list,
+    mapping_table_names: set[str] | None,
+) -> dict[str, str]:
+    """Replace each catalog-derived logical name with the one the MAPPING declares.
+
+    :func:`logical_table_names` is set-dependent by design — a bare name is
+    qualified only while another table in the same run shares it — so two callers
+    working from different table sets legitimately disagree. The mapping wins,
+    because Ontop validates the mapping against this schema and not the reverse; a
+    name only this schema knows about describes a table nothing asks for, while a
+    name only the mapping knows about fails VKG load for the whole namespace.
+
+    Three candidates per table, most specific first: the derived name, the bare
+    name (the mapping was accepted while this name was unique), and — for the
+    reverse skew, where the mapping qualified a name this run does not have to —
+    the mapping's own unique literal ending in this table's name.
+
+    Args:
+        logical_names: Identity -> catalog-derived ``rr:tableName`` literal.
+        tables: Tables the DDL will describe.
+        mapping_table_names: Literals the mapping declares, or ``None`` if unknown.
+
+    Returns:
+        Identity -> the literal to emit, aligned to the mapping where possible.
+    """
+    from coa_ontology.inducer.strategies.base import table_identity
+
+    if not mapping_table_names:
+        return logical_names
+    # Mapping literals grouped by their bare table segment, for the reverse skew.
+    by_bare: dict[str, list[str]] = {}
+    for literal in mapping_table_names:
+        by_bare.setdefault(split_sql_ident_path(literal)[-1], []).append(literal)
+
+    aligned: dict[str, str] = {}
+    for table in tables:
+        identity = table_identity(table)
+        derived = logical_names.get(identity) or _sql_ident(table.name)
+        candidates = [derived, _sql_ident(table.name)]
+        same_bare = by_bare.get(table.name, [])
+        if len(same_bare) == 1:
+            candidates.append(same_bare[0])
+        chosen = next((c for c in candidates if c in mapping_table_names), None)
+        if chosen is None:
+            _log.warning(
+                "schema.sql: table %s is not named by the mapping being stored beside it "
+                "(mapping declares %s); emitting the catalog-derived name %s",
+                table.name,
+                sorted(same_bare) or "no matching logical table",
+                derived,
+            )
+            chosen = derived
+        elif chosen != derived:
+            # WARNING, not info: chosen != derived means the STORED mapping names
+            # this table differently from what the current catalog would derive —
+            # i.e. a persisted rr:tableName whose shape differs from today's rule.
+            # That is the exact signal an operator needs when diagnosing a
+            # namespace accepted under an older qualification rule (see the
+            # byte-identical-relative-to-pre-#149 note in the MR). (_align_to_mapping
+            # has no namespace/ontology_id in scope; the caller logs those around
+            # generation.)
+            _log.warning(
+                "schema.sql: mapping's stored logical name %s for table %s differs from the "
+                "catalog-derived name %s — persisted mapping shape differs from the current rule",
+                chosen,
+                table.name,
+                derived,
+            )
+        aligned[identity] = chosen
+    return aligned
+
+
+def _tables_to_h2_ddl(tables: list, mapping_table_names: set[str] | None = None) -> str:
     """Convert CatalogTable list to H2-compatible CREATE TABLE statements.
 
     Table and column names are emitted verbatim as SQL-delimited (double-quoted)
-    identifiers. Tables are qualified with their source schema (``"schema"."table"``)
-    via :func:`sql_qualified_table` so two same-named tables from different
-    schemas stay distinct — without the qualifier the second ``CREATE TABLE IF
-    NOT EXISTS`` is silently dropped and the discarded table's TriplesMap then
-    references columns that do not exist, so Ontop fails to load the mapping
-    (#149 cause A). The R2RML writer emits the identical qualified ``rr:tableName``
-    so the identifiers match what Ontop validates against this schema. No
-    canonicalization or uppercasing is applied.
+    identifiers via :func:`sql_ident`. Double-quoting lets H2 accept any source
+    name — spaces, parens, percent signs, hyphens, mixed case, reserved words —
+    so the identifiers exactly match the source datasource (and therefore the
+    R2RML ``rr:tableName`` / ``rr:column`` values that Ontop validates against
+    this schema). No canonicalization or uppercasing is applied.
+
+    A table whose bare name is shared by two datasources is created inside its own
+    H2 schema, matching the qualified ``rr:tableName`` the mapping emits for it
+    (:func:`logical_table_names`). Without that, ``CREATE TABLE IF NOT EXISTS``
+    silently skipped the second same-named table and Ontop validated BOTH
+    TriplesMaps against the first table's columns. Table names that are
+    unique in the run are emitted bare, exactly as before.
+
+    Args:
+        tables: Tables to describe.
+        mapping_table_names: ``rr:tableName`` literals from the mapping this schema
+            will validate, when known. Supplying them makes the DDL a function of
+            the mapping rather than a second, independently-derived guess at the
+            same names — see :func:`_align_to_mapping`.
+
+    Returns:
+        The H2 DDL text.
     """
+    from coa_ontology.inducer.strategies.base import logical_table_names, table_identity
+
+    logical_names = _align_to_mapping(logical_table_names(tables), tables, mapping_table_names)
     lines = ["-- Auto-generated schema for Ontop H2 validation (from datasource catalog)"]
-
-    # Emit CREATE SCHEMA for every distinct source schema so qualified table
-    # names resolve. H2 requires the schema to exist before a qualified CREATE
-    # TABLE references it.
-    schemas = sorted({t.sourceSchema for t in tables if getattr(t, "sourceSchema", None)})
-    for schema in schemas:
-        lines.append(f"CREATE SCHEMA IF NOT EXISTS {_sql_ident(schema)};")
-
-    # Detect a bare-name collision that qualification resolves — a same-named
-    # table in two schemas. Warn loudly: a silent IF NOT EXISTS drop is exactly
-    # the #149 failure mode, and even with qualification an operator should know
-    # the catalog carries a name clash.
-    seen_bare: dict[str, str | None] = {}
-    for t in tables:
-        schema = getattr(t, "sourceSchema", None)
-        if t.name in seen_bare and seen_bare[t.name] != schema:
-            _log.warning(
-                "H2 DDL: table name %r appears in multiple schemas (%r, %r); "
-                "qualifying with schema to keep them distinct",
-                t.name,
-                seen_bare[t.name],
-                schema,
-            )
-        seen_bare[t.name] = schema
-
-    for table in sorted(tables, key=lambda t: (getattr(t, "sourceSchema", None) or "", t.name)):
-        schema = getattr(table, "sourceSchema", None)
+    # H2 rejects a qualified CREATE TABLE whose schema does not exist yet, so every
+    # schema a qualified name references is declared up front. The schema is taken
+    # from the parsed identifier path, not by splitting on the last dot: a table
+    # genuinely named ``q1.results`` is ONE identifier (``"q1.results"``), and
+    # splitting it textually emitted ``CREATE SCHEMA IF NOT EXISTS "q1;`` —
+    # unbalanced quotes that make the entire schema.sql a syntax error, so Ontop
+    # validates the mapping against nothing at all.
+    schemas = sorted(
+        {parts[0] for parts in (split_sql_ident_path(n) for n in logical_names.values()) if len(parts) > 1}
+    )
+    lines += [f"CREATE SCHEMA IF NOT EXISTS {_sql_ident(s)};" for s in schemas]
+    # Identity breaks the tie: two same-named tables would otherwise be ordered by
+    # the arrival order of a set() of datasource ids, so the emitted DDL differed
+    # run to run for no reason.
+    emitted: dict[str, list[str]] = {}
+    for table in sorted(tables, key=lambda t: (t.name, table_identity(t))):
         col_defs = []
         pk_cols = []
         if table.tableConstraints:
@@ -361,8 +515,67 @@ def _tables_to_h2_ddl(tables: list) -> str:
         if pk_cols:
             pk_quoted = ", ".join(_sql_ident(c) for c in pk_cols)
             col_defs.append(f"PRIMARY KEY ({pk_quoted})")
-        qualified = _sql_qualified_table(table.name, schema)
-        lines.append(f"CREATE TABLE IF NOT EXISTS {qualified} ({', '.join(col_defs)});")
+        logical = logical_names.get(table_identity(table)) or _sql_ident(table.name)
+        # One CREATE per logical name. Two tables can legitimately share one — the
+        # mapping itself declares one logical table for both when their bare name
+        # was unique in each of the runs that produced them — and H2 makes the
+        # repeat a silent no-op, so emitting it would look like two declarations
+        # while behaving as one. Say so instead: the second table's columns are NOT
+        # what Ontop will validate against.
+        if logical in emitted:
+            if emitted[logical] != col_defs:
+                _log.warning(
+                    "schema.sql: table %s shares the logical name %s with an earlier table but has "
+                    "different columns; Ontop will validate BOTH mappings against the first (%s)",
+                    table.name,
+                    logical,
+                    emitted[logical],
+                )
+            else:
+                _log.info("schema.sql: table %s duplicates the logical name %s; declared once", table.name, logical)
+            continue
+        emitted[logical] = col_defs
+        lines.append(f"CREATE TABLE IF NOT EXISTS {logical} ({', '.join(col_defs)});")
+    # Coverage guard: the merged mapping is the concatenation of every accepted
+    # proposal's STORED r2rml (see _persist_induced_to_s3), so it can declare more
+    # rr:tableName literals than there are physical tables in the current catalog —
+    # e.g. a namespace holding one proposal accepted while a name was qualified and
+    # another accepted while it was bare. Ontop validates the mapping against THIS
+    # schema, so any literal without a CREATE fails VKG load for the WHOLE namespace,
+    # not just that table. Emit a CREATE for every still-undeclared literal, reusing
+    # the column defs of the table whose bare name matches (IF NOT EXISTS makes an
+    # extra declaration free); raise if a literal names a table we cannot describe,
+    # so the failure is loud at generation time rather than silent at VKG load.
+    if mapping_table_names:
+        cols_by_bare: dict[str, list[str]] = {}
+        for logical, col_defs in emitted.items():
+            cols_by_bare.setdefault(split_sql_ident_path(logical)[-1], col_defs)
+        undeclared = sorted(set(mapping_table_names) - set(emitted))
+        uncoverable: list[str] = []
+        extra_schemas: list[str] = []
+        extra_tables: list[str] = []
+        for literal in undeclared:
+            parts = split_sql_ident_path(literal)
+            literal_cols = cols_by_bare.get(parts[-1])
+            if literal_cols is None:
+                uncoverable.append(literal)
+                continue
+            if len(parts) > 1 and parts[0] not in schemas:
+                extra_schemas.append(parts[0])
+            extra_tables.append(f"CREATE TABLE IF NOT EXISTS {literal} ({', '.join(literal_cols)});")
+            emitted[literal] = literal_cols
+        if uncoverable:
+            raise SchemaSqlGenerationError(
+                "mapping declares rr:tableName literal(s) with no matching physical table, "
+                f"so schema.sql cannot cover them and Ontop would reject the namespace: {uncoverable}"
+            )
+        for s in sorted(set(extra_schemas)):
+            # Insert schema declarations after the initial comment + existing schema
+            # block so a qualified extra literal has its schema created first.
+            decl = f"CREATE SCHEMA IF NOT EXISTS {_sql_ident(s)};"
+            if decl not in lines:
+                lines.insert(1, decl)
+        lines += extra_tables
     return "\n".join(lines)
 
 
@@ -511,7 +724,9 @@ def _remove_rdf_list(g, node) -> None:
         _remove_rdf_list(g, rest_val)
 
 
-def _persist_induced_to_s3(ontology_id: str, namespace: str, graph_uri: str) -> None:
+def _persist_induced_to_s3(
+    ontology_id: str, namespace: str, graph_uri: str, current_datasource_ids: list[str] | None = None
+) -> None:
     """Persist the full induced ontology + accumulated R2RML to S3.
 
     Called after each proposal accept. Fetches the current full state:
@@ -637,7 +852,9 @@ def _persist_induced_to_s3(ontology_id: str, namespace: str, graph_uri: str) -> 
         #    rest of the VKG payload is already written. (Failing the whole accept
         #    on this is coupled to the accept-flow ordering rework — #467.)
         try:
-            schema_sql = _generate_schema_sql(namespace, ontology_id)
+            schema_sql = _generate_schema_sql(
+                namespace, ontology_id, r2rml_turtle, extra_datasource_ids=current_datasource_ids
+            )
         except SchemaSqlGenerationError as e:
             schema_sql = None
             _log.error(
@@ -1172,11 +1389,26 @@ def _run_accept_proposal(
         # masking a real failure as the "nothing to describe" None — without
         # schema.sql Ontop cannot validate the R2RML and Tier-2 SQL breaks at
         # query time, so a structured ontology must not be accepted without one.
+        # The current proposal's own datasource ids, read by primary key (unlike
+        # the eventually-consistent scan inside _generate_schema_sql, a keyed fetch
+        # always sees this accept's just-written row) so this source's tables are
+        # guaranteed present in schema.sql even on a merge where the scan has not
+        # yet caught up. Metadata only — no S3 turtle/matches hydration needed.
+        _current = dynamo_store.get_proposal_by_id(
+            proposal_id,
+            namespace=namespace,
+            hydrate_turtle=False,
+            hydrate_matches=False,
+            hydrate_constraints=False,
+        )
+        _current_ds_ids = ((_current or {}).get("metadata") or {}).get("datasource_ids") or []
         _run_accept_step(
             "s3_persist",
             proposal_id,
             namespace,
-            lambda: _persist_induced_to_s3(target_ontology_id, namespace, result.get("graph_uri", "")),
+            lambda: _persist_induced_to_s3(
+                target_ontology_id, namespace, result.get("graph_uri", ""), current_datasource_ids=_current_ds_ids
+            ),
         )
 
         # ── Step: notify VKG to reload — NON-FATAL by design (#467) ────────
@@ -1709,6 +1941,7 @@ def _apply_grounding_overrides(proposal_id: str, overrides: dict[str, str | None
     from coa_ontology.inducer.schemas import ConceptMatch
     from coa_ontology.inducer.services.data_catalog import CatalogTable
     from coa_ontology.inducer.services.grounding import classify_score_tier
+    from coa_ontology.inducer.strategies.base import schema_from_fqn
     from coa_ontology.inducer.strategies.table_to_ontology import TableToOntologyStrategy
 
     meta = item.get("metadata") or {}
@@ -1816,8 +2049,14 @@ def _apply_grounding_overrides(proposal_id: str, overrides: dict[str, str | None
                 catalog = _fetch_catalog(config["data_catalog_url"], ds_id)
             for tbl_dict in _catalog_to_tables(catalog):
                 tbl_dict["datasourceId"] = ds_id
-                fqn = tbl_dict.get("fullyQualifiedName", "")
-                tbl_dict["sourceSchema"] = fqn.split(".")[0] if "." in fqn else None
+                # schema_from_fqn, not fqn.split(".")[0]: the schema is the segment
+                # NEAREST the table. A 3-part catalog.database.table FQN would else
+                # stamp the CATALOG here — and this value is coa:sourceSchema, which
+                # must MATCH the schema _generate_schema_sql derives (also via
+                # schema_from_fqn) or the R2RML mapping and the H2 validation schema
+                # qualify a shared-name table on different segments and Ontop rejects
+                # the mapping at VKG load.
+                tbl_dict["sourceSchema"] = schema_from_fqn(tbl_dict.get("fullyQualifiedName")) or None
                 all_tables.append(CatalogTable(**tbl_dict))
         except Exception as e:
             _log.warning("Failed to fetch catalog for %s: %s", ds_id, e)

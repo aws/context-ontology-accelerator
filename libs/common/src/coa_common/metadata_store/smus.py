@@ -351,6 +351,7 @@ class SMUSClient(MetadataStoreClient):
         next_token: str | None = None,
         search_in_attributes: list[str] | None = None,
         include_forms: bool = False,
+        filters: dict[str, Any] | None = None,
     ) -> SearchResult:
         """Full-text search assets within a project.
 
@@ -367,6 +368,8 @@ class SMUSClient(MetadataStoreClient):
                 ``additionalAttributes=["FORMS"]``. Each returned
                 :class:`AssetResult` will have its ``forms_output``
                 populated from the response (or ``None`` when absent).
+            filters: Optional DataZone search filter clause. Use an ``EQ``
+                filter on ``name`` for an exact asset-name lookup.
 
         Returns:
             Matching assets plus the next pagination token, if any.
@@ -384,6 +387,8 @@ class SMUSClient(MetadataStoreClient):
             }
             if search_in_attributes:
                 kwargs["searchIn"] = [{"attribute": a} for a in search_in_attributes]
+            if filters:
+                kwargs["filters"] = filters
             if next_token:
                 kwargs["nextToken"] = next_token
             if include_forms:
@@ -415,27 +420,21 @@ class SMUSClient(MetadataStoreClient):
     def find_asset_by_name(self, *, project_id: str, name: str, max_pages: int = 20) -> AssetResult | None:
         """Look an asset up by its exact name, or ``None`` when it does not exist.
 
-        Use this instead of ``search_assets(search_text=<asset name>,
-        max_results=1)``. That shape looks like an exact lookup and is not one:
-        search matches every searchable attribute, so a full asset name such as
-        ``DS#<sourceId>:<db>.<table>`` tokenises into terms that are identical
-        across every asset of the same source, leaving only the table name to
-        discriminate. Ranking is then decided by scoring noise and the exact
-        match is not reliably first, so a top-1 lookup returns a *sibling* table
-        and the caller concludes the asset does not exist.
+        DataZone's ``searchText`` is token based, so a full asset name such as
+        ``DS#<sourceId>:<db>.orders`` can also match ``order_items`` and require
+        many pages before the exact asset appears.
 
-        Two things this does about that:
-
-        * ``searchIn=[{"attribute": "name"}]`` stops the other attributes
-          (description, synonyms, glossary terms, ids) from contributing to the
-          score, which removes the ranking lottery.
-        * It pages instead of trusting one page, because restricting the
-          attribute is still not an exact match — a name is tokenised, so
-          ``…:orders`` also matches ``order_items`` — and the wanted asset can
-          sit behind a page boundary.
-
-        The exact-equality check is therefore kept, and only an exact name is
-        ever returned.
+        The obvious alternative — an ``EQ`` filter on the ``name`` attribute —
+        does not work here: DataZone's ``Search`` API rejects ``EQ`` against a
+        string attribute with ``ValidationException: Operator 'EQ' requires
+        'intValue' (numeric), not 'value' (string)`` (confirmed live against
+        this project's domain; ``TEXT_SEARCH`` filters and quoted phrases both
+        fail too, since the tokenizer splits on ``#``/``:``, which every asset
+        name here contains). There is no reliable server-side exact-match
+        primitive exposed for this attribute, so this pages the token search
+        instead and verifies every candidate by exact string equality — the
+        ranking noise only matters for which page a match lands on, not
+        whether it is genuinely the one asked for.
 
         Args:
             project_id: Owning project to scope the search to.

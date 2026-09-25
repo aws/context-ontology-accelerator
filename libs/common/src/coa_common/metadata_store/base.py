@@ -127,6 +127,8 @@ class MetadataStoreClient(ABC):
         max_results: int = 50,
         next_token: str | None = None,
         include_forms: bool = False,
+        search_in_attributes: list[str] | None = None,
+        filters: dict[str, Any] | None = None,
     ) -> SearchResult:
         """Search for assets within a project.
 
@@ -134,6 +136,12 @@ class MetadataStoreClient(ABC):
         backend inline each asset's form data so that callers can avoid a
         per-asset ``get_asset_forms`` round-trip.  The form data is populated
         in :pyattr:`AssetResult.forms_output` only when requested.
+
+        *search_in_attributes* narrows which asset attributes the backend
+        matches *search_text* against, and *filters* applies backend-side
+        equality filters. Both let a caller ask an exact question instead of
+        paging a broad result set — see the foreign-key target resolution in
+        ``coa_sources``.
 
         Raises:
             MetadataStoreError: on failure.

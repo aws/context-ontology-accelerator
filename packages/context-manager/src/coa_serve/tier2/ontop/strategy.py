@@ -135,7 +135,11 @@ class OntopStrategy:
             # missing-value sentinel, not a version — normalize it away (#986).
             vkg_version = tier2_result.vkg_result.ontology_version if tier2_result.vkg_result else ""
             return StrategyResult(
-                sql=tier2_result.vkg_result.sql if tier2_result.vkg_result else "",
+                # Report the statement that RAN, not Ontop's raw translate output.
+                # After the cross-source fix they differ whenever the query spans sources: the executed
+                # form is catalog-qualified, the raw form has bare names that resolve
+                # nowhere. Fall back to the raw SQL only if execution never set it.
+                sql=tier2_result.executed_sql or (tier2_result.vkg_result.sql if tier2_result.vkg_result else ""),
                 rows=tier2_result.query_result.rows,
                 columns=tier2_result.query_result.columns,
                 confidence=sparql_result.confidence,

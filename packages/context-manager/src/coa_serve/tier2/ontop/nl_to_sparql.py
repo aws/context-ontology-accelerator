@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
@@ -382,6 +383,8 @@ class NLtoSPARQL:
         graph_uri_template: str | None = None,
         metric_resolver=None,
         few_shot_loader=None,
+        *,
+        guardrail_id_provider: Callable[[], str] | None = None,
     ):
         """Assemble the T-Box builder, validator, and few-shot loader for translation.
 
@@ -389,6 +392,9 @@ class NLtoSPARQL:
             graph_client: Graph client used for T-Box assembly and URI validation.
             llm_client: LLM client that performs the NL-to-SPARQL translation.
             guardrail_id: Optional Bedrock guardrail applied during translation.
+            guardrail_id_provider: Optional callable returning the guardrail id
+                LIVE on each call; when supplied it takes precedence over
+                ``guardrail_id`` at the translation call site.
             timeout_s: Overall translation timeout in seconds.
             graph_uri_template: Optional named-graph URI template for the namespace.
             metric_resolver: Optional Tier-1 resolver enriching the prompt with
@@ -401,12 +407,25 @@ class NLtoSPARQL:
         self._tbox_builder = TBoxContextBuilder(graph_client, graph_uri_template, metric_resolver=metric_resolver)
         self._llm = llm_client
         self._guardrail_id = guardrail_id
+        self._guardrail_id_provider = guardrail_id_provider
         self._validator = SPARQLValidator(graph_client, graph_uri_template)
         self._timeout_s = timeout_s
         # optional few-shot example loader — when present, namespace-scoped
         # examples from S3 are injected into the prompt, replacing the generic
         # hardcoded examples. None / no file → generic examples (graceful fallback).
         self._few_shot_loader = few_shot_loader
+
+    def _effective_guardrail_id(self) -> str | None:
+        """Resolve the guardrail id LIVE via the provider when injected.
+
+        Falls back to the construction-time ``guardrail_id`` otherwise. Returns
+        ``None`` for an empty id to match the call-site's existing
+        ``self._guardrail_id or None`` convention.
+        """
+        if self._guardrail_id_provider is not None:
+            gid = self._guardrail_id_provider()
+            return gid or None
+        return self._guardrail_id or None
 
     async def translate(
         self,
@@ -559,7 +578,7 @@ class NLtoSPARQL:
                 self._llm.converse(
                     prompt=user_prompt,
                     system=_SYSTEM_PROMPT,
-                    guardrail_id=self._guardrail_id or None,
+                    guardrail_id=self._effective_guardrail_id(),
                     guard_content=query,
                     temperature=0,
                     # top_p=0 requests greedy decoding for determinism, but treat

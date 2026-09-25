@@ -37,6 +37,7 @@ from .exceptions import (
     QueryTranslationError,
     ServeError,
 )
+from .guardrail_config import GuardrailConfigProvider, build_guardrail_config_provider
 from .identity import extract_jwt_identity, resolve_principal, resolve_user_id
 from .models import InvokeRequest, TraceStep
 from .orchestrator import Orchestrator
@@ -79,6 +80,7 @@ logger = structlog.get_logger(__name__)
 app = BedrockAgentCoreApp()
 
 _config: ServiceConfig | None = None
+_guardrail_provider: GuardrailConfigProvider | None = None
 _orchestrator: Orchestrator | None = None
 _session_manager: SessionManager | None = None
 _session_metadata: SessionMetadataStore | None = None
@@ -123,13 +125,31 @@ _NAMESPACE_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$")
 
 async def _ensure_initialized():
     """Initialize config and orchestrator on first request."""
-    global _config, _orchestrator, _session_manager, _session_metadata, _sources_registry, _nl_to_sparql
+    global _config, _guardrail_provider, _orchestrator, _session_manager
+    global _session_metadata, _sources_registry, _nl_to_sparql
     if _orchestrator is not None:
         return
     async with _init_lock:
         if _orchestrator is not None:
             return
         config = await asyncio.to_thread(load_config)
+
+        # Live guardrail config: the guardrail SSM parameters are the only serve
+        # config that can change under a running container (an operator edits
+        # <prefix>/bedrock/guardrail-id with no redeploy). Reading them through a
+        # short-TTL provider on the hot path — rather than capturing the value
+        # frozen in ``config`` at startup — is what lets an operator change reach
+        # a warm, session-pinned instance within the TTL instead of only after
+        # the microVM cycles. Prime it off the request thread so the
+        # first SSM read does not block the event loop.
+        guardrail_provider = build_guardrail_config_provider()
+        # prime() does the first SSM read off the request thread. If it raises
+        # (transient SSM blip at startup), _orchestrator stays None and the
+        # _init_lock releases, so the NEXT request re-enters _ensure_initialized
+        # and retries the whole init — this is a retry-on-next-request, not a
+        # permanent-until-microVM-cycles failure.
+        await asyncio.to_thread(guardrail_provider.prime)
+        _guardrail_provider = guardrail_provider
 
         # Session manager (optional — requires MEMORY_ID)
         if config.memory_id:
@@ -231,6 +251,7 @@ async def _ensure_initialized():
             graph_client=neptune_client,
             llm_client=bedrock_client,
             guardrail_id=config.guardrail_id,
+            guardrail_id_provider=guardrail_provider.guardrail_id,
             # enrich Tier-2 metric context with full Neptune metric defs.
             metric_resolver=metric_resolver,
             few_shot_loader=few_shot_loader,
@@ -238,7 +259,10 @@ async def _ensure_initialized():
         _nl_to_sparql = nl_to_sparql
         firewall = SQLFirewall()
         vkg_translator = VKGTranslator(
-            vkg_endpoint=config.vkg_endpoint, firewall=firewall, query_executor=query_executor
+            vkg_endpoint=config.vkg_endpoint,
+            firewall=firewall,
+            query_executor=query_executor,
+            sources_registry=sources_registry,
         )
         vector_retriever = VectorRetriever(vector_client=opensearch_client)
         graph_traverser = GraphTraverser(graph_client=neptune_client)
@@ -259,12 +283,18 @@ async def _ensure_initialized():
                 # PutMetricData grant needed on the serve runtime role.
                 component=COMPONENT_SERVE_RETRIEVAL,
                 metrics_transport="emf",
+                # Read the retrieval guardrail id/version LIVE so an operator's SSM
+                # change reaches this warm screener without a redeploy,
+                # mirroring the input-guardrail consumers above.
+                guardrail_id_provider=guardrail_provider.retrieval_guardrail_id,
+                guardrail_version_provider=guardrail_provider.retrieval_guardrail_version,
             )
             logger.info("chunk_screener_enabled", guardrail_id=config.retrieval_guardrail_id)
 
         synthesizer = Synthesizer(
             bedrock_client=bedrock_client,
             guardrail_id=config.guardrail_id,
+            guardrail_id_provider=guardrail_provider.guardrail_id,
             chunk_screener=chunk_screener,
         )
 
@@ -285,6 +315,7 @@ async def _ensure_initialized():
             llm_client=bedrock_client,
             vector_client=opensearch_client,
             guardrail_id=config.guardrail_id,
+            guardrail_id_provider=guardrail_provider.guardrail_id,
         )
 
         # Tier 2 strategies
@@ -304,6 +335,7 @@ async def _ensure_initialized():
             # (SERVE_NL2SQL_GRAPH_EXPAND deployment-wide, options.flatGraphExpand per
             # request); with both off the client is simply never used.
             graph_client=neptune_client,
+            sources_registry=sources_registry,
         )
         # Bounded tool-use agent (iterative schema discovery → generate → execute →
         # self-correct). OPT-IN only: it runs solely when a request pins
@@ -348,9 +380,17 @@ async def _ensure_initialized():
                 llm=bedrock_client,
                 query_executor=query_executor,
             )
-            step_planner = BedrockStepPlanner(bedrock_client, guardrail_id=config.guardrail_id or None)
+            step_planner = BedrockStepPlanner(
+                bedrock_client,
+                guardrail_id=config.guardrail_id or None,
+                guardrail_id_provider=guardrail_provider.guardrail_id,
+            )
             agentic_retriever = build_agentic_retriever(
-                config, agentic_clients, step_planner, structured_query_tier=structured_query_tier
+                config,
+                agentic_clients,
+                step_planner,
+                structured_query_tier=structured_query_tier,
+                guardrail_id_provider=guardrail_provider.guardrail_id,
             )
         except Exception as exc:
             logger.warning("agentic_retriever_unavailable", error=type(exc).__name__, error_msg=str(exc)[:200])
@@ -387,6 +427,7 @@ async def _ensure_initialized():
             oss_ontology_index=oss_ontology_index,
             agentic_retriever=agentic_retriever,
             tier3_deep_reasoning_default=(config.tier3_strategy == "deep-reasoning"),
+            tier1_metric_timeout_s=config.tier1_metric_timeout_s,
         )
         _config = config
         logger.info(
@@ -706,6 +747,17 @@ async def _handle_blocking_query(request, request_id: str):
     except NoResultError as e:
         total_ms = int((time.perf_counter() - resolve_start) * 1000)
         logger.info("orchestrator_no_result", request_id=request_id, tier=e.tier)
+        d = e.to_dict(request_id)
+        d["metadata"] = {"totalMs": total_ms}
+        yield d
+        return
+    except ServeError as e:
+        # Any other typed serve error (e.g. an ambiguous-reference refusal) carries
+        # its own status code and a client-safe message — surface it verbatim rather
+        # than collapsing it to a generic 500. Mirrors the streaming path's
+        # `except ServeError` branch so the two transports return the same shape.
+        total_ms = int((time.perf_counter() - resolve_start) * 1000)
+        logger.warning("orchestrator_serve_error", request_id=request_id, error_type=e.error_type, message=e.message)
         d = e.to_dict(request_id)
         d["metadata"] = {"totalMs": total_ms}
         yield d

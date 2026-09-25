@@ -65,8 +65,16 @@ _ontop_port = int(os.environ.get("ONTOP_PORT", "8081"))
 _listen_port = int(os.environ.get("ENDPOINT_PORT", "8080"))
 
 # Table-to-datasource routing map, loaded from R2RML annotations at startup.
-# Maps uppercase table name → {"datasourceId": ..., "sourceSchema": ...}
+# Maps a table reference ("claims" or "public.claims", original + uppercase) →
+# {"datasourceId": ..., "sourceSchema": ...}
 _table_routing: dict[str, dict[str, str]] = {}
+
+# Routing-entry key marking a reference that more than one table answers to. Its
+# value is the comma-separated candidate refs, and such an entry deliberately
+# carries NO datasourceId — serve refuses to execute a query touching it rather
+# than picking a candidate. Mirrored by ``table_qualifier.AMBIGUOUS_KEY`` in the
+# context-manager, which is the only consumer.
+AMBIGUOUS_KEY = "ambiguousWith"
 
 # Cached health state (refreshed by background thread)
 _health_status = {"healthy": False, "last_check": 0.0, "reason": "starting up"}
@@ -128,6 +136,11 @@ def _load_table_routing(mappings_path: str) -> dict[str, dict[str, str]]:
         g.parse(mappings_path, format="turtle")
 
         routing: dict[str, dict[str, str]] = {}
+        # Bare names claimed by more than one table. Routing such a name would
+        # silently resolve to whichever TriplesMap rdflib yielded last, so the key
+        # gets the ambiguity marker instead and the serve-side qualifier fails
+        # loudly on a bare reference rather than routing to the wrong catalog.
+        bare_owners: dict[str, set[str]] = {}
         for tmap in g.subjects(predicate=None, object=RR.TriplesMap):
             ds_id = str(next(g.objects(tmap, SCL.datasourceId), "")) or None
             schema = str(next(g.objects(tmap, SCL.sourceSchema), "")) or None
@@ -141,20 +154,34 @@ def _load_table_routing(mappings_path: str) -> dict[str, dict[str, str]]:
                     if schema:
                         entry["sourceSchema"] = schema
                     if entry:
-                        # rr:tableName may now be schema-qualified
-                        # (`"schema"."table"`) to disambiguate same-named tables
-                        # across schemas (#149 cause A). Parse it into its parts
-                        # and register keys for every form _resolve_routing may
-                        # look up: bare table, and schema.table — each also
-                        # uppercased so lookups match regardless of whether
-                        # sqlglot preserves or normalizes case.
+                        # rr:tableName may be schema-qualified (`"schema"."table"`)
+                        # to disambiguate same-named tables across schemas/datasources.
+                        # Parse per-segment (via _split_sql_qualified, which honours
+                        # quoted dots), then register the QUALIFIED ref and, when
+                        # unambiguous, the bare name too — each also uppercased so
+                        # lookups match regardless of sqlglot case handling.
                         parts = [p.strip('"') for p in _split_sql_qualified(table_name)]
                         bare = parts[-1]
-                        for key in {bare, bare.upper()}:
+                        ref = ".".join(parts)
+                        for key in {ref, ref.upper()}:
                             routing[key] = entry
-                        if len(parts) > 1:
-                            qualified = ".".join(parts)
-                            for key in {qualified, qualified.upper()}:
+                        # Ambiguity is measured on the QUALIFIED refs answering to a
+                        # bare name, not on their datasource ids: two schemas of one
+                        # datasource collide on the bare name just as two datasources do.
+                        owners = bare_owners.setdefault(bare.upper(), set())
+                        owners.add(ref.upper())
+                        if len(owners) > 1:
+                            # Publish the ambiguity itself: the marker names the
+                            # candidates and carries no datasourceId, so serve refuses
+                            # the query rather than routing a bare reference to the
+                            # wrong catalog. Withholding the bare key instead would
+                            # read to serve as "nothing to route" and silently run
+                            # against the default context.
+                            marker = {AMBIGUOUS_KEY: ",".join(sorted(owners))}
+                            for key in {bare, bare.upper()}:
+                                routing[key] = marker
+                        else:
+                            for key in {bare, bare.upper()}:
                                 routing[key] = entry
         logger.info("Loaded datasource routing for %d tables from %s", len(routing), mappings_path)
         return routing
@@ -550,6 +577,16 @@ def _resolve_routing(source_table_refs: list[str]) -> dict[str, dict[str, str]]:
     Returns a dict mapping each table ref to its routing metadata
     (datasourceId, sourceSchema) from the R2RML annotations loaded at startup.
     Only includes entries for tables that have routing info.
+
+    When a referenced table's bare name is one that MORE THAN ONE table answers to
+    (an ambiguity marker was recorded for the bare name at load time), the sibling
+    candidates' entries are included too — even though the query referenced only
+    one of them. A bare name shared across datasources cannot be resolved by the
+    query context's single default catalog, so the serve-side qualifier must know
+    the name is shared to add the catalog; it can only see that if the routing it
+    receives carries the other owners. Including the siblings is what lets a
+    single-source query over a shared name be catalog-qualified rather than run
+    unqualified against a guessed context.
     """
     if not _table_routing:
         return {}
@@ -565,6 +602,24 @@ def _resolve_routing(source_table_refs: list[str]) -> dict[str, dict[str, str]]:
             bare_table = ref.rsplit(".", 1)[-1].upper()
             if bare_table in _table_routing:
                 routing[ref] = _table_routing[bare_table]
+        # If this reference is SCHEMA-QUALIFIED and its bare name is shared (an
+        # ambiguity marker was recorded for the bare name at load time), surface the
+        # sibling candidates so a downstream consumer can see the name spans
+        # datasources and add the catalog. This applies ONLY to a qualified ref: it
+        # names one physical table unambiguously, but the bare name it shares still
+        # needs the catalog to stay context-independent. A BARE ref is deliberately
+        # left with the marker alone (below / via the exact-match path) so it is
+        # refused, not silently qualified against a guessed candidate.
+        if "." not in ref:
+            continue
+        bare_upper = ref.rsplit(".", 1)[-1].upper()
+        marker = _table_routing.get(bare_upper)
+        if isinstance(marker, dict) and AMBIGUOUS_KEY in marker:
+            for candidate in marker[AMBIGUOUS_KEY].split(","):
+                candidate = candidate.strip()
+                entry = _table_routing.get(candidate) or _table_routing.get(candidate.upper())
+                if isinstance(entry, dict) and entry.get("datasourceId") and candidate not in routing:
+                    routing[candidate] = entry
     return routing
 
 

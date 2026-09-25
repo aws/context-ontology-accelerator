@@ -24,6 +24,9 @@ from coa_ontology.inducer.strategies.base import composite_fk_anchors as _compos
 from coa_ontology.inducer.strategies.base import composite_fk_columns as _composite_fk_columns
 from coa_ontology.inducer.strategies.base import pascal_names_for as _pascal_names_for
 from coa_ontology.inducer.strategies.base import reference_index as _reference_index
+from coa_ontology.inducer.strategies.base import (
+    resolve_fk_target_identity as _resolve_fk_target_identity,
+)
 from coa_ontology.inducer.strategies.base import table_identity as _table_identity
 from coa_ontology.inducer.strategies.base import to_camel as _to_camel
 from coa_ontology.inducer.strategies.base import to_pascal as _to_pascal
@@ -193,8 +196,11 @@ def generate_config_from_db(tables, uri_prefix: str) -> ConstraintConfig:
             target_class: str | None = None
             if is_fk:
                 fk_target_name = fk_map[col.name]
-                qualified = f"{table.sourceSchema}.{fk_target_name}" if table.sourceSchema else None
-                target_id = (qualified and ref_index.get(qualified)) or ref_index.get(fk_target_name)
+                # Same resolution order as the ontology and R2RML builders (own
+                # datasource + own database, then any datasource with that database,
+                # then bare) so the shape targets the class those two artifacts agree
+                # on even when two sources share a database name.
+                target_id = _resolve_fk_target_identity(table, fk_target_name, ref_index)
                 if target_id in pascal_by_id:
                     target_class = f"{ns_str}{pascal_by_id[target_id]}"
                 elif fk_target_name not in ambiguous_names:

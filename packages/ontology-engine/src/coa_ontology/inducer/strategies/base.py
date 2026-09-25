@@ -9,9 +9,9 @@ import hashlib
 import logging
 import re
 from abc import ABC, abstractmethod
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 
-from coa_common import sql_ident, sql_qualified_table
+from coa_common import sql_ident
 from coa_common.bedrock_metrics import CostTracker
 from coa_common.constants import VOCAB_URI
 from rdflib import RDF, XSD, BNode, Graph, Literal, Namespace, URIRef
@@ -158,6 +158,12 @@ def to_camel(s: str) -> str:
     return p[0].lower() + p[1:] if p else p
 
 
+# Separates the datasource id from the qualified name inside a table identity.
+# Two colons cannot appear in a Glue/OMD database or table name, so an identity
+# never round-trips ambiguously into its parts.
+_IDENTITY_SEP = "::"
+
+
 def _name_discriminator(identity: str) -> str:
     """Return a short deterministic suffix distinguishing ``identity`` from its peers.
 
@@ -178,11 +184,42 @@ def table_identity(table: CatalogTable) -> str:
     ``analytics.customers`` are two tables that must stay two classes, two
     TriplesMaps, and two sets of properties. Keying anything on ``name`` fuses them.
 
-    The qualified name is the identity; the bare name still supplies the *display*
-    form the PascalCase local name is derived from, so a table whose name is unique
-    mints exactly the IRI it minted before.
+    The qualified name is not enough on its own either. ``fullyQualifiedName`` is
+    built as ``{database}.{table}`` with no datasource component, so two sources
+    that share a DATABASE name collide identically — and ``public`` is the default
+    schema of every PostgreSQL source, making "two Postgres sources, both
+    ``public.customers``" the ordinary case rather than an exotic one. Those two
+    tables produced ONE identity, hence one class, one TriplesMap carrying two
+    ``coa:datasourceId`` values, and one logical table; half the data was
+    unreachable and nothing reported it. The datasource id therefore prefixes the
+    identity whenever the table carries one.
+
+    A table whose name is unique still mints exactly the IRI it minted before: the
+    identity only feeds :func:`pascal_names_for`'s collision handling (which
+    discriminator, which member keeps the bare form), never the name of a table
+    that has no collision to resolve.
     """
-    return table.fullyQualifiedName or table.name
+    fqn = table.fullyQualifiedName or table.name
+    return f"{table.datasourceId}{_IDENTITY_SEP}{fqn}" if table.datasourceId else fqn
+
+
+def same_datasource_target_identity(referrer: CatalogTable, target_name: str) -> str:
+    """The identity an FK target would have if it sits beside ``referrer``.
+
+    ``referredColumns`` names a target table with no database or datasource
+    qualifier, and an FK practically never crosses either — so the first reading to
+    try is "the same-named table in my own datasource and database". This builds the
+    :func:`table_identity` such a table would have, keeping the identity format in
+    one place rather than re-spelling it at every FK call site.
+
+    Without this probe, adding a second source that happens to share a database name
+    would make EVERY FK in both sources ambiguous (two identities answering to one
+    ``schema.table`` form) and degrade them all to literals — a silent loss of every
+    join in the ontology, caused only by the neighbouring source's existence.
+    """
+    schema = table_schema_prefix(referrer)
+    fqn = f"{schema}.{target_name}" if schema else target_name
+    return f"{referrer.datasourceId}{_IDENTITY_SEP}{fqn}" if referrer.datasourceId else fqn
 
 
 def pascal_names_for(tables: Iterable[CatalogTable]) -> dict[str, str]:
@@ -286,9 +323,16 @@ def reference_index(tables: Iterable[CatalogTable]) -> dict[str, str]:
 
     Keys, in the order callers should try them:
 
-    - ``"{sourceSchema}.{name}"`` — prefer the referrer's own database. An FK
-      almost never crosses databases, so this is the reading that matches the SQL
-      the mapping will be compiled into.
+    - the referrer-scoped identity from :func:`same_datasource_target_identity` —
+      the same-named table in the referrer's OWN datasource and database. An FK
+      crosses neither, so this is the reading that matches the SQL the mapping will
+      be compiled into, and it is the only form that stays unambiguous when a second
+      datasource shares a database name.
+    - ``"{sourceSchema}.{name}"`` — the same database in ANY datasource. Present
+      only while one identity answers to it; two sources sharing a database name
+      make this form ambiguous exactly as a bare name can be, and it is then
+      omitted (it used to be written unconditionally, so the last table parsed won
+      and FKs resolved into a neighbouring datasource).
     - ``"{name}"`` — only when that bare name is unambiguous across the whole run.
       An ambiguous bare name is deliberately ABSENT, so a lookup on it misses.
       Note that a miss here does NOT by itself make the caller safe: the bare
@@ -301,21 +345,30 @@ def reference_index(tables: Iterable[CatalogTable]) -> dict[str, str]:
     - the identity itself, so an already-qualified reference resolves too.
     """
     index: dict[str, str] = {}
-    by_name: dict[str, list[str]] = {}
+    # Every non-identity form is collected first and only published when a single
+    # identity claims it. Writing as we go would silently let the last table parsed
+    # own a shared form.
+    by_form: dict[str, list[str]] = {}
+
+    def claim(form: str, identity: str) -> None:
+        claimants = by_form.setdefault(form, [])
+        if identity not in claimants:
+            claimants.append(identity)
+
     for table in tables:
         identity = table_identity(table)
         index[identity] = identity
-        if table.sourceSchema:
-            index[f"{table.sourceSchema}.{table.name}"] = identity
-        if identity not in by_name.get(table.name, []):
-            by_name.setdefault(table.name, []).append(identity)
-    for name, identities in by_name.items():
+        schema = table_schema_prefix(table)
+        if schema:
+            claim(f"{schema}.{table.name}", identity)
+        claim(table.name, identity)
+    for form, identities in by_form.items():
         if len(identities) == 1:
-            index.setdefault(name, identities[0])
+            index.setdefault(form, identities[0])
         else:
             log.warning(
                 "fk_target_table_name_is_ambiguous",
-                extra={"table": name, "candidates": sorted(identities)},
+                extra={"table": form, "candidates": sorted(identities)},
             )
     return index
 
@@ -347,6 +400,222 @@ def ambiguous_target_names(tables: Iterable[CatalogTable]) -> set[str]:
     for table in tables:
         by_name.setdefault(table.name, set()).add(table_identity(table))
     return {name for name, identities in by_name.items() if len(identities) > 1}
+
+
+def schema_from_fqn(fqn: str | None) -> str:
+    """Return the SQL schema segment of a fully-qualified table name, or ``""``.
+
+    ``fullyQualifiedName`` arrives in two shapes — ``database.table`` from
+    ``_catalog_to_tables`` and occasionally ``catalog.database.table`` — and only
+    the segment NEAREST the table is a SQL schema. Taking the head instead puts
+    the catalog name in the schema position, which is not merely a cosmetic
+    difference: the value flows to ``coa:sourceSchema`` and from there into the
+    schema slot of the SQL serve executes, naming a schema the source does not
+    have. The 2-part case is identical either way, which is why head-vs-tail
+    diverged unnoticed.
+
+    One rule, used by both the routing stamp (``proposals.py``) and
+    :func:`table_schema_prefix`, so the mapping and the routing entry cannot
+    describe a table's schema differently.
+    """
+    if not fqn or "." not in fqn:
+        return ""
+    return fqn.rsplit(".", 1)[0].rsplit(".", 1)[-1]
+
+
+def table_schema_prefix(table: CatalogTable) -> str:
+    """Return the schema/database qualifier for ``table``, or ``""`` when unknown.
+
+    ``sourceSchema`` is the authoritative value, but not every construction path
+    sets it: ``_generate_schema_sql`` builds ``CatalogTable`` straight from
+    ``_catalog_to_tables`` output, which fills ``fullyQualifiedName`` but not
+    ``sourceSchema``. Falling back to the fqn's qualification tail
+    (:func:`schema_from_fqn`) keeps the H2 schema and the R2RML mapping in
+    agreement — if they disagreed about a table's schema, Ontop would fail to
+    validate the mapping it was handed.
+    """
+    return table.sourceSchema or schema_from_fqn(table.fullyQualifiedName)
+
+
+def resolve_fk_target_identity(
+    referrer: CatalogTable,
+    target_name: str,
+    ref_index: Mapping[str, str],
+) -> str | None:
+    """Resolve an FK's bare target name to a table identity, or ``None`` if unresolved.
+
+    Four artifacts have to agree on which table an FK points at — the mapping's
+    ``rr:parentTriplesMap`` (:meth:`InductionStrategy.build_r2rml`), the ontology's
+    ``rdfs:range`` (``table_to_ontology``), the RIGOR mapping's subject token
+    (``rigor_ontology``) and the SHACL shape's ``sh:class``
+    (``validation.shapes.config``). Each of the four spelled the same three-probe
+    lookup out by hand, so the resolution order could drift between them, and a
+    drift means the shape asserts a class-typed reference against a column the
+    mapping emits as a literal: a violation on every row.
+
+    Probe order, most specific first:
+
+    1. the referrer's OWN datasource and database
+       (:func:`same_datasource_target_identity`) — an FK crosses neither, and this
+       is the only form that stays unambiguous when a second datasource shares a
+       database name.
+    2. the same database in ANY datasource. Uses :func:`table_schema_prefix`, the
+       same derivation :func:`reference_index` keys this form on. Reading
+       ``sourceSchema`` directly (as the four copies did) skips the probe entirely
+       for a table carrying only a ``fullyQualifiedName``, so a resolvable target
+       fell through to the bare probe.
+    3. the bare name, which :func:`reference_index` publishes only while one table
+       answers to it.
+
+    A ``None`` return does NOT mean "outside the run" — callers must still consult
+    :func:`ambiguous_target_names` to tell an ambiguous in-run target (degrade to a
+    literal) from an out-of-run one (the bare form is safe).
+    """
+    scoped = same_datasource_target_identity(referrer, target_name)
+    if scoped in ref_index:
+        return ref_index[scoped]
+    schema = table_schema_prefix(referrer)
+    if schema and f"{schema}.{target_name}" in ref_index:
+        return ref_index[f"{schema}.{target_name}"]
+    return ref_index.get(target_name)
+
+
+def disambiguated_refs(tables: Iterable[CatalogTable]) -> dict[str, tuple[str, str]]:
+    """Map each table IDENTITY to the ``(schema, name)`` pair that addresses it alone.
+
+    A ``schema`` of ``""`` means "the bare name already addresses exactly one table
+    in this run" — the overwhelmingly common case, and the one that must keep
+    emitting byte-identical artifacts.
+
+    Single source of truth for both places a table has to be named uniquely: the
+    ``rr:tableName`` literal (:func:`logical_table_names`) and the subject IRI
+    template. If those two disagreed, one mapping would name a table the H2
+    validation schema does not declare and Ontop would reject the whole mapping at
+    VKG load — every Tier-2 query in the namespace, not only the cross-source ones.
+
+    Three cases, in order:
+
+    1. Unique bare name -> ``("", name)``. Unchanged output, no migration.
+    2. Shared bare name, distinct schemas -> ``(schema, name)``. This is the
+       cross-datasource collision case: ``public.customers`` and ``crm.customers`` become distinguishable in
+       the mapping, the routing map, and the H2 schema at once.
+    3. Shared bare name AND shared schema — two datasources both exposing
+       ``public.customers``, the default for two PostgreSQL sources. No real
+       qualifier separates these, so the schema segment gets a deterministic
+       discriminator (``public__1a2b3c4d``). That is safe ONLY because serve
+       overwrites the schema from the routing entry's ``coa:sourceSchema`` when it
+       qualifies (``table_qualifier.qualify_cross_source_sql``), so the *executed*
+       SQL carries the real schema while the *logical* name stays unique. It is
+       therefore gated on ``table.sourceSchema`` being set — the value that reaches
+       routing. Without it the synthetic schema would leak into executed SQL and
+       name a schema that does not exist, so the collision is left unresolved and
+       logged instead.
+    """
+    tables = list(tables)
+    shared_names = ambiguous_target_names(tables)
+    # Which (schema, name) pairs are themselves shared — case 3 above.
+    pair_owners: dict[tuple[str, str], set[str]] = {}
+    for table in tables:
+        pair = (table_schema_prefix(table), table.name)
+        pair_owners.setdefault(pair, set()).add(table_identity(table))
+
+    refs: dict[str, tuple[str, str]] = {}
+    for table in tables:
+        identity = table_identity(table)
+        if table.name not in shared_names:
+            refs[identity] = ("", table.name)
+            continue
+        schema = table_schema_prefix(table)
+        if not schema:
+            log.warning(
+                "logical_table_name_collision_unqualifiable",
+                extra={"table": table.name, "identity": identity, "reason": "no_schema"},
+            )
+            refs[identity] = ("", table.name)
+            continue
+        if len(pair_owners[(schema, table.name)]) > 1:
+            if not table.sourceSchema:
+                log.warning(
+                    "logical_table_name_collision_unqualifiable",
+                    extra={"table": table.name, "identity": identity, "reason": "schema_not_routable"},
+                )
+                refs[identity] = ("", table.name)
+                continue
+            log.warning(
+                "logical_table_name_needs_datasource_discriminator",
+                extra={"table": table.name, "identity": identity, "schema": schema},
+            )
+            schema = f"{schema}__{_name_discriminator(identity)}"
+        else:
+            # Case 2: a bare name shared across datasources, but each owner has a
+            # DISTINCT schema — the ordinary qualification path. main logged the
+            # equivalent "table name appears in multiple schemas" signal (in
+            # proposals._tables_to_h2_ddl, since deleted); without a replacement an
+            # operator diagnosing a namespace whose persisted rr:tableName changed
+            # shape has nothing to go on. Log the qualification so the shape change
+            # is diagnosable.
+            log.warning(
+                "logical_table_name_qualified_on_collision",
+                extra={"table": table.name, "identity": identity, "schema": schema},
+            )
+        refs[identity] = (schema, table.name)
+    return refs
+
+
+def subject_template_names(tables: Iterable[CatalogTable]) -> dict[str, str]:
+    """Map each table IDENTITY to the path token its instance IRIs are minted under.
+
+    The subject template is ``{prefix}{token}/{pk}``, so the token has to be unique
+    per table for the same reason the class IRI does: two tables sharing it mint the
+    SAME individual for the same primary-key value, fusing two real-world entities
+    into one. A SPARQL query joining on the subject then matches rows across
+    datasources that have nothing to do with each other.
+
+    Unique names yield the bare ``table.name`` exactly as before — instance IRIs are
+    part of a namespace's published surface, so only a table that actually collides
+    changes form.
+    """
+    return {
+        identity: f"{schema}.{name}" if schema else name
+        for identity, (schema, name) in disambiguated_refs(tables).items()
+    }
+
+
+def logical_table_names(tables: Iterable[CatalogTable]) -> dict[str, str]:
+    """Map each table IDENTITY to the ``rr:tableName`` literal to emit for it.
+
+    A bare ``rr:tableName`` is unambiguous only while the run contains one table
+    of that name. When two datasources both expose ``customers``, the bare form
+    collapses them everywhere downstream at once: both TriplesMaps declare the
+    same logical table, the VKG routing map (keyed on the emitted name) keeps
+    only the last one, and the H2 validation schema — ``CREATE TABLE IF NOT
+    EXISTS`` — silently skips the second, so Ontop reasons over the FIRST
+    table's column set and can emit SQL naming columns that exist only in the
+    other source. Cross-source qualification at query time cannot recover from
+    that; the information is already gone.
+
+    So a table whose bare name is shared gets ``"schema"."table"``, which is
+    unique per source and is what the routing map, the H2 schema and the
+    generated SQL all then key on.
+
+    Only the SHARED names are qualified. A table with a unique name keeps the
+    exact bare literal it emitted before, so every already-accepted mapping,
+    schema.sql and routing map stays byte-identical and no namespace needs
+    re-inducing to keep working. Which pair addresses a table uniquely — and what
+    happens when the schema does not separate them either — is decided once in
+    :func:`disambiguated_refs`; this only wraps the result as SQL-delimited
+    identifiers.
+
+    Args:
+        tables: Tables in the induction run.
+
+    Returns:
+        Identity -> the SQL-delimited literal for ``rr:tableName``.
+    """
+    return {
+        identity: f"{sql_ident(schema)}.{sql_ident(name)}" if schema else sql_ident(name)
+        for identity, (schema, name) in disambiguated_refs(tables).items()
+    }
 
 
 def composite_fk_is_usable(tc: CatalogConstraint) -> bool:
@@ -644,6 +913,12 @@ class InductionStrategy(ABC):
         # below — see ambiguous_target_names for why that fallback is a wrong join
         # rather than a missing one.
         ambiguous_names = ambiguous_target_names(tables)
+        # The rr:tableName literal per table: bare as before, schema-qualified
+        # only for a name two datasources share.
+        logical_names = logical_table_names(tables)
+        # The path token instance IRIs are minted under. Same disambiguation, so two
+        # same-named tables cannot mint one individual per PK value.
+        subject_names = subject_template_names(tables)
         tmap_by_id: dict[str, URIRef] = {}
         for table in tables:
             identity = table_identity(table)
@@ -655,8 +930,7 @@ class InductionStrategy(ABC):
             Returns ``None`` when the target cannot be resolved to a single table,
             so the caller emits a datatype literal instead of a join.
             """
-            qualified = f"{referrer.sourceSchema}.{target_name}" if referrer.sourceSchema else None
-            target_id = (qualified and ref_index.get(qualified)) or ref_index.get(target_name)
+            target_id = resolve_fk_target_identity(referrer, target_name, ref_index)
             if target_id is not None and target_id in tmap_by_id:
                 return tmap_by_id[target_id]
             if target_name in ambiguous_names:
@@ -684,13 +958,7 @@ class InductionStrategy(ABC):
             _annotate_triples_map(g, tmap, table)
             lt = BNode()
             g.add((tmap, RR.logicalTable, lt))
-            # Qualify rr:tableName with the source schema so it matches the
-            # schema-qualified table in the H2 validation DB. Two same-named
-            # tables from different schemas therefore reference distinct H2
-            # tables instead of colliding (#149 cause A). sql_qualified_table
-            # falls back to a bare quoted name when the table has no schema, so
-            # single-schema deployments are byte-identical to before.
-            g.add((lt, RR.tableName, Literal(sql_qualified_table(table.name, table.sourceSchema))))
+            g.add((lt, RR.tableName, Literal(logical_names[identity])))
 
             pk_cols = []
             if table.tableConstraints:
@@ -710,7 +978,7 @@ class InductionStrategy(ABC):
                 pk_id = "{ID}"
             subj = URIRef(f"{tmap}/SubjectMap")
             g.add((tmap, RR.subjectMap, subj))
-            template = f"{ontology_uri_prefix}{table.name}/{pk_id}"
+            template = f"{ontology_uri_prefix}{subject_names[identity]}/{pk_id}"
             g.add((subj, RR.template, Literal(template)))
             g.add((subj, RR["class"], table_cls))
 

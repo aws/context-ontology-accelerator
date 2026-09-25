@@ -8,10 +8,12 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import sqlglot
 from coa_common.constants import RESOURCE_PREFIX
 from coa_serve.clients.athena import AthenaQueryError, AthenaQueryExecutor
 from coa_serve.clients.sources_registry import SQLNamespaceScope
 from coa_serve.tier2.sql_firewall import UnsafeSQLError
+from coa_serve.tier2.table_qualifier import real_tables
 
 
 @pytest.mark.unit
@@ -300,6 +302,127 @@ class TestFederationFailureExplanation:
 
 
 @pytest.mark.unit
+class TestFullyQualifiedSQLSkipsCatalogResolution:
+    """Cross-catalog SQL must reach Athena verbatim.
+
+    A statement whose every table carries its own catalog is context-independent
+    (verified live: it succeeds with a nonexistent context Database and with no
+    context at all). Resolving ONE catalog for it is meaningless, and
+    ``_rewrite_table_names_for_federation`` — which strips one source's schema
+    prefix — would corrupt the names it was never meant to see.
+    """
+
+    def _mock_athena(self, mock_boto):
+        mock_athena = MagicMock()
+        mock_boto.return_value = mock_athena
+        mock_athena.start_query_execution.return_value = {"QueryExecutionId": "qid-xcat"}
+        mock_athena.get_query_execution.return_value = {"QueryExecution": {"Status": {"State": "SUCCEEDED"}}}
+        mock_athena.get_query_results.return_value = {
+            "ResultSet": {
+                "ResultSetMetadata": {"ColumnInfo": [{"Name": "cnt"}]},
+                "Rows": [{"Data": [{"VarCharValue": "cnt"}]}, {"Data": [{"VarCharValue": "7"}]}],
+            }
+        }
+        return mock_athena
+
+    @staticmethod
+    async def _qualified_sql() -> str:
+        """The cross-catalog statement as the QUALIFIER actually writes it.
+
+        Composed rather than hand-authored on purpose: this class asserts that the
+        executor leaves such SQL alone, and a hand-written literal only proves it
+        leaves *that literal* alone. If ``qualify_cross_source_sql`` ever changed the
+        form it emits (quoting, part order, alias placement), a hand-written fixture
+        would keep passing while production SQL took the rewrite path again — the
+        exact seam this fix lives in.
+        """
+        from unittest.mock import AsyncMock
+
+        from coa_serve.tier2.table_qualifier import qualify_cross_source_sql
+
+        sources = {
+            "src-pg": {"athenaDataCatalogName": "pg_cat", "discoveredSchemas": ["public"]},
+            "src-glue": {"glueDatabaseName": "insurance"},
+        }
+        registry = AsyncMock()
+        registry.get_source.side_effect = lambda namespace, data_source_id: sources.get(data_source_id, {})
+        routing = {
+            "claims": {"datasourceId": "src-pg", "sourceSchema": "public"},
+            "policies": {"datasourceId": "src-glue", "sourceSchema": "insurance"},
+        }
+        return await qualify_cross_source_sql(
+            "SELECT COUNT(*) AS cnt FROM claims a JOIN policies b ON a.id = b.claim_id",
+            routing,
+            registry,
+            namespace="ns-123",
+        )
+
+    async def test_cross_catalog_sql_is_not_rewritten(self):
+        sql = await self._qualified_sql()
+        # Guard the fixture itself: if the qualifier stopped producing 3-part names
+        # the assertions below would be vacuous rather than failing.
+        assert '"pg_cat"."public".claims' in sql and '"awsdatacatalog"."insurance".policies' in sql, sql
+        with patch("boto3.client") as mock_boto, patch("boto3.resource") as mock_res:
+            mock_athena = self._mock_athena(mock_boto)
+            mock_table = MagicMock()
+            mock_res.return_value.Table.return_value = mock_table
+            mock_table.get_item.return_value = {"Item": None}
+            executor = AthenaQueryExecutor(region="us-east-1", sources_table="coa-sources")
+
+        # Namespace-scope authorization (a security control added after the cross-source fix)
+        # runs on ANY qualified reference, including this fully-qualified cross-source
+        # statement — it MUST NOT be skipped just because the SQL is self-routing, or
+        # a qualified reference could reach a catalog outside the namespace. Grant a
+        # scope covering exactly the two refs the qualifier wrote so authorization
+        # passes and the invariant below (no rewrite) is what is under test.
+        executor._sources.sql_namespace_scope = AsyncMock(
+            return_value=SQLNamespaceScope(
+                native_databases=frozenset({"insurance"}),
+                federated_catalog_schemas=frozenset({("pg_cat", "public")}),
+            )
+        )
+
+        await executor.execute(sql, namespace="ns-123")
+
+        sent = mock_athena.start_query_execution.call_args[1]["QueryString"]
+        # Verbatim: every table reference the qualifier wrote survives untouched.
+        for table in real_tables(sqlglot.parse_one(sql, dialect="trino")):
+            assert table.sql(dialect="trino") in sent, f"{table.sql(dialect='trino')} was rewritten. sent={sent!r}"
+        # No catalog RESOLUTION was needed to route it: the source-metadata table is
+        # never queried to pick a single (catalog, database) for the statement.
+        # (sql_namespace_scope above is authorization, not routing, and is mocked.)
+        mock_table.query.assert_not_called()
+
+    async def test_bare_sql_still_resolves_a_catalog(self):
+        """The unqualified path is untouched — it still consults the registry."""
+        import json
+
+        with patch("boto3.client") as mock_boto, patch("boto3.resource") as mock_res:
+            mock_athena = self._mock_athena(mock_boto)
+            mock_table = MagicMock()
+            mock_res.return_value.Table.return_value = mock_table
+            mock_table.query.return_value = {
+                "Items": [
+                    {
+                        "sourceType": "DATABASE",
+                        "athenaDataCatalogName": "scldevds_abc123",
+                        "discoveredSchemas": ["public"],
+                        "queryable": True,
+                        "configuration": json.dumps({}),
+                    }
+                ]
+            }
+            mock_table.get_item.return_value = {"Item": None}
+            executor = AthenaQueryExecutor(region="us-east-1", sources_table="coa-sources")
+
+        await executor.execute("SELECT COUNT(*) AS cnt FROM claims", namespace="ns-123")
+
+        ctx = mock_athena.start_query_execution.call_args[1]["QueryExecutionContext"]
+        assert ctx["Catalog"] == "scldevds_abc123"
+        assert ctx["Database"] == "public"
+
+
+@pytest.mark.unit
 class TestFederatedCatalogResolution:
     """Test that federated catalog sources route correctly."""
 
@@ -466,6 +589,112 @@ class TestAthenaDatabaseResolution:
 
         call_kwargs = mock_athena.start_query_execution.call_args[1]
         assert call_kwargs["QueryExecutionContext"]["Database"] == "bird_test_db_catalog"
+
+    async def test_empty_id_multi_database_source_bare_sql_refuses(self):
+        """With an empty data_source_id and >=2 DATABASE sources, a bare
+        (unqualified) statement must be REFUSED, not silently pinned to the first
+        DATABASE source (which ran same-named tables against the wrong database)."""
+        with patch("boto3.client") as mock_boto, patch("boto3.resource") as mock_res:
+            mock_athena = MagicMock()
+            mock_boto.return_value = mock_athena
+            mock_table = MagicMock()
+            mock_res.return_value.Table.return_value = mock_table
+            # Three DATABASE sources sharing a `customers` table — the same-name shape.
+            mock_table.query.return_value = {
+                "Items": [
+                    {"sourceType": "DATABASE", "glueDatabaseName": "analytics", "queryable": True},
+                    {"sourceType": "DATABASE", "glueDatabaseName": "sales", "queryable": True},
+                    {"sourceType": "DATABASE", "glueDatabaseName": "billing", "queryable": True},
+                ]
+            }
+            mock_table.get_item.return_value = {"Item": None}
+            executor = AthenaQueryExecutor(region="us-east-1", sources_table="coa-sources")
+
+        with pytest.raises(AthenaQueryError, match="ambiguous source"):
+            await executor.execute("SELECT COUNT(*) FROM customers", namespace="ns-tri", data_source_id="")
+        # Never dispatched to Athena — refused before start_query_execution.
+        mock_athena.start_query_execution.assert_not_called()
+
+    async def test_empty_id_single_database_source_bare_sql_still_pins(self):
+        """No regression: with exactly ONE DATABASE source, an empty id + bare SQL
+        still resolves to that sole source (the legitimate single-source case)."""
+        import json
+
+        with patch("boto3.client") as mock_boto, patch("boto3.resource") as mock_res:
+            mock_athena = MagicMock()
+            mock_boto.return_value = mock_athena
+            mock_table = MagicMock()
+            mock_res.return_value.Table.return_value = mock_table
+            mock_table.query.return_value = {
+                "Items": [
+                    {
+                        "sourceType": "DATABASE",
+                        "glueDatabaseName": "only_db",
+                        "queryable": True,
+                        "configuration": json.dumps({}),
+                    }
+                ]
+            }
+            mock_table.get_item.return_value = {"Item": None}
+            mock_athena.start_query_execution.return_value = {"QueryExecutionId": "qid-solo"}
+            mock_athena.get_query_execution.return_value = {"QueryExecution": {"Status": {"State": "SUCCEEDED"}}}
+            mock_athena.get_query_results.return_value = {
+                "ResultSet": {
+                    "ResultSetMetadata": {"ColumnInfo": [{"Name": "c"}]},
+                    "Rows": [{"Data": [{"VarCharValue": "c"}]}],
+                }
+            }
+            executor = AthenaQueryExecutor(region="us-east-1", sources_table="coa-sources")
+
+        await executor.execute("SELECT COUNT(*) AS c FROM customers", namespace="ns-solo", data_source_id="")
+        ctx = mock_athena.start_query_execution.call_args[1]["QueryExecutionContext"]
+        assert ctx["Database"] == "only_db"
+
+    async def test_empty_id_multi_source_but_fully_qualified_sql_does_not_raise(self):
+        """No regression: with an empty data_source_id and >=2 DATABASE
+        sources, a FULLY catalog-qualified statement must still run (via the
+        neutral-context path) — the same-name refusal applies ONLY to bare SQL, since
+        qualified names are context-independent and route themselves."""
+        with patch("boto3.client") as mock_boto, patch("boto3.resource") as mock_res:
+            mock_athena = MagicMock()
+            mock_boto.return_value = mock_athena
+            mock_table = MagicMock()
+            mock_res.return_value.Table.return_value = mock_table
+            # >=2 DATABASE sources — the same ambiguous namespace as the refuse test.
+            mock_table.query.return_value = {
+                "Items": [
+                    {"sourceType": "DATABASE", "glueDatabaseName": "analytics", "queryable": True},
+                    {"sourceType": "DATABASE", "glueDatabaseName": "billing", "queryable": True},
+                ]
+            }
+            mock_table.get_item.return_value = {"Item": None}
+            mock_athena.start_query_execution.return_value = {"QueryExecutionId": "qid-q"}
+            mock_athena.get_query_execution.return_value = {"QueryExecution": {"Status": {"State": "SUCCEEDED"}}}
+            mock_athena.get_query_results.return_value = {
+                "ResultSet": {
+                    "ResultSetMetadata": {"ColumnInfo": [{"Name": "c"}]},
+                    "Rows": [{"Data": [{"VarCharValue": "c"}]}],
+                }
+            }
+            executor = AthenaQueryExecutor(region="us-east-1", sources_table="coa-sources")
+            # sql_namespace_scope covers the two qualified refs so authorization passes.
+            executor._sources.sql_namespace_scope = AsyncMock(
+                return_value=SQLNamespaceScope(
+                    native_databases=frozenset({"analytics", "billing"}),
+                    federated_catalog_schemas=frozenset(),
+                )
+            )
+
+        # Fully qualified across two databases of AwsDataCatalog, empty id → must NOT raise.
+        await executor.execute(
+            'SELECT COUNT(*) AS c FROM "awsdatacatalog"."analytics".customers a '
+            'JOIN "awsdatacatalog"."billing".invoices b ON a.id = b.cid',
+            namespace="ns-tri",
+            data_source_id="",
+        )
+        # Neutral context: no single database pinned.
+        ctx = mock_athena.start_query_execution.call_args[1]["QueryExecutionContext"]
+        assert ctx["Database"] == executor._default_database
 
     async def test_falls_back_to_env_var_when_ddb_empty(self):
         """When DDB lookup returns nothing, falls back to ATHENA_DATABASE env var."""

@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import structlog
 
-from ..exceptions import AccessDeniedError
+from ..exceptions import AccessDeniedError, AmbiguousReferenceError
 from ..step_ids import StepId
 from ..trace import TraceCollector
 
@@ -336,7 +336,12 @@ class StructuredQueryTier:
                     error=type(e).__name__,
                     message=str(e)[:200],
                 )
-                if isinstance(e, AccessDeniedError):
+                if isinstance(e, (AccessDeniedError, AmbiguousReferenceError)):
+                    # Terminal outcomes, not strategy misses: a policy denial (403)
+                    # or an ambiguous-reference refusal (400) is a decision about the
+                    # query itself. Re-raise so the orchestrator surfaces it to the
+                    # client rather than silently falling through to the next
+                    # strategy (which would mask the refusal as an eventual miss).
                     raise
                 # Record a visible step so the trace explains why this strategy
                 # was abandoned and the next one tried (avoids silent transitions
@@ -375,9 +380,14 @@ class StructuredQueryTier:
             return_exceptions=True,
         )
 
-        # Re-raise terminal exceptions (AccessDenied, cancellation, system exit)
+        # Re-raise terminal exceptions (AccessDenied, ambiguous-reference refusal,
+        # cancellation, system exit). A policy denial (403) or an ambiguous-reference
+        # refusal (400) is a decision about the query, not a strategy miss, so it must
+        # reach the client rather than be dropped in favour of another strategy.
         for r in results:
-            if isinstance(r, (AccessDeniedError, asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+            if isinstance(
+                r, (AccessDeniedError, AmbiguousReferenceError, asyncio.CancelledError, KeyboardInterrupt, SystemExit)
+            ):
                 raise r
             if isinstance(r, BaseException) and not isinstance(r, Exception):
                 raise r

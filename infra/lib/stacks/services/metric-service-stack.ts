@@ -125,7 +125,7 @@ export class MetricServiceStack extends SCLStack {
       bucketName: cdk.Lazy.string({
         produce: () => `${this.prefixed("metric-osi")}-${this.account}`,
       }),
-      versioned: false,
+      versioned: true,
       encryption: s3.BucketEncryption.S3_MANAGED,
       serverAccessLogsBucket: osiAccessLogs.bucket,
       serverAccessLogsPrefix: "metric-osi/",
@@ -143,8 +143,10 @@ export class MetricServiceStack extends SCLStack {
       ],
       lifecycleRules: [
         {
-          // Auto-delete uploaded/exported files after 24 hours
-          expiration: cdk.Duration.days(1),
+          // Keep pinned sources and checkpoints beyond the 4-day source queue
+          // and 14-day DLQ recovery windows.
+          expiration: cdk.Duration.days(30),
+          noncurrentVersionExpiration: cdk.Duration.days(30),
         },
       ],
     });
@@ -319,6 +321,9 @@ export class MetricServiceStack extends SCLStack {
     const importDlq = new sqs.Queue(this, "ImportDLQ", {
       queueName: this.prefixed("metric-import-dlq"),
       retentionPeriod: cdk.Duration.days(14),
+      // Lambda's SQS guidance requires at least 6x the 30-second
+      // recovery timeout to avoid concurrent delivery while throttled.
+      visibilityTimeout: cdk.Duration.minutes(3),
       encryption: sqs.QueueEncryption.SQS_MANAGED,
     });
 
@@ -329,7 +334,7 @@ export class MetricServiceStack extends SCLStack {
       encryption: sqs.QueueEncryption.SQS_MANAGED,
       deadLetterQueue: {
         queue: importDlq,
-        maxReceiveCount: 3,
+        maxReceiveCount: 6,
       },
     });
 
@@ -354,6 +359,9 @@ export class MetricServiceStack extends SCLStack {
         OSI_BUCKET_NAME: osiBucket.bucketName,
         IMPORT_QUEUE_URL: importQueue.queueUrl,
         IMPORT_JOBS_TABLE: importJobsTable.tableName,
+        // Longer than the 15-minute worker timeout, so a timed-out owner
+        // cannot overlap Neptune writes with a retrying delivery.
+        IMPORT_OFFSET_LEASE_SECONDS: "960",
         // SMUS catalog access — dataset resolution during async import.
         // Without these the worker's data source lookup can never initialize,
         // which previously silently degraded to the permissive (accept-all)
@@ -372,10 +380,56 @@ export class MetricServiceStack extends SCLStack {
       }),
     );
 
+    // DLQ recovery deliberately stays outside the VPC: it only accesses SQS
+    // and DynamoDB, and must not share the worker's ENI cold-start failure mode.
+    const importDlqRecoveryFn = new lambda.Function(
+      this,
+      "ImportDlqRecoveryFn",
+      {
+        functionName: this.prefixed("metric-import-dlq-recovery"),
+        runtime: lambda.Runtime.PYTHON_3_12,
+        handler: "coa_metrics.api.import_dlq_handler.handler",
+        code: lambdaCode,
+        timeout: cdk.Duration.seconds(30),
+        memorySize: 256,
+        environment: {
+          IMPORT_QUEUE_URL: importQueue.queueUrl,
+          IMPORT_JOBS_TABLE: importJobsTable.tableName,
+          IMPORT_REDRIVE_DELAY_SECONDS: "60",
+        },
+      },
+    );
+    importDlqRecoveryFn.addEventSource(
+      new lambdaEventSources.SqsEventSource(importDlq, {
+        batchSize: 1,
+      }),
+    );
+
     // ── IAM: Worker permissions ────────────────────────────────────
     importJobsTable.grantReadWriteData(importWorkerFn);
     importQueue.grantSendMessages(importWorkerFn);
-    osiBucket.grantRead(importWorkerFn);
+    // Read only namespace-scoped import sources and checkpoints. The broader
+    // imports prefix is retained for in-flight legacy jobs whose source keys
+    // predate the dedicated imports/jobs sub-prefix.
+    importWorkerFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["s3:GetObject", "s3:GetObjectVersion"],
+        resources: [`${osiBucket.bucketArn}/*/imports/*`],
+      }),
+    );
+    importWorkerFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["s3:PutObject"],
+        resources: [`${osiBucket.bucketArn}/*/imports/checkpoints/*`],
+      }),
+    );
+    importDlqRecoveryFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["dynamodb:GetItem", "dynamodb:UpdateItem"],
+        resources: [importJobsTable.tableArn],
+      }),
+    );
+    importQueue.grantSendMessages(importDlqRecoveryFn);
 
     // SMUS catalog access — same grants as the API Lambda
     sourcesTable.grantReadData(importWorkerFn);
@@ -438,6 +492,7 @@ export class MetricServiceStack extends SCLStack {
     })
       .monitorLambda(this.metricApiFn)
       .monitorLambda(importWorkerFn)
+      .monitorLambda(importDlqRecoveryFn)
       .monitorQueueWithDlq(importQueue, importDlq)
       .monitorTable(importJobsTable);
 

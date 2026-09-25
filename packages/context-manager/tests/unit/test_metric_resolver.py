@@ -343,11 +343,15 @@ class TestResidualQualifierDetection:
         assert result.residual == ""
 
     async def test_residual_survives_punctuation_and_hyphens(self):
-        """Tokenising must not silently drop a hyphenated qualifier."""
+        """Tokenising must not silently drop a hyphenated qualifier.
+
+        The shared word-run tokenizer keeps internal connectors, so the
+        hyphenated qualifier survives as ONE token ("west-coast"), not two.
+        """
         resolver = _make_resolver()
 
         result = resolver.exact_name_synonym_match("revenue for west-coast stores", "finance")
-        assert result.residual == "west coast stores"
+        assert result.residual == "west-coast stores"
 
 
 @pytest.mark.unit
@@ -1082,11 +1086,14 @@ class TestResidualTokensKorean:
     bypass for them (GitHub issue #95)."""
 
     def _res(self, q, syn):
-        from coa_serve.tier1.metric_resolver import residual_tokens
+        from coa_serve.tier1.metric_resolver import _fold, residual_tokens
 
-        i = q.lower().find(syn.lower())
+        # Same single-fold contract the resolver uses: spans are computed on the
+        # folded string and applied to the folded string.
+        folded_q, folded_syn = _fold(q), _fold(syn)
+        i = folded_q.find(folded_syn)
         assert i >= 0
-        return residual_tokens(q.lower(), [(i, i + len(syn))])
+        return residual_tokens(folded_q, [(i, i + len(folded_syn))])
 
     def test_unknown_game_name_survives_as_residual(self):
         assert self._res("실버윙 어제 매출 알려줘", "어제 매출") == ["실버윙"]
@@ -1101,4 +1108,211 @@ class TestResidualTokensKorean:
 
     def test_condition_qualifier_survives(self):
         res = self._res("누적 결제 100만원 이상 유저의 어제 매출 알려줘", "어제 매출")
-        assert "누적" in res and "100만원" in res
+        # Script-run segmentation splits the digit run from the Hangul run, so
+        # the amount qualifier survives as two tokens ("100", "만원") rather
+        # than one — either way it trips the gate, which is what matters.
+        assert "누적" in res and "100" in res and "만원" in res
+
+
+# ── Non-ASCII matching (#928, Tier-1 half) ───────────────────────────────────
+
+SEED_METRICS_NON_ASCII = [
+    {
+        "metric_id": "m-gen-capacity",
+        "name": "total_generation_capacity",
+        "display_name": "総発電容量",
+        "description": "全発電所の定格出力の合計 (MW)",
+        "sql_template": "SELECT SUM(capacity_mw) FROM power_plant",
+        "dimensions": [],
+        "synonyms": ["総発電容量", "発電容量"],
+        "namespace": "energy",
+        "data_source_id": "ds-plants",
+        "columns": ["total_generation_capacity"],
+    },
+    {
+        "metric_id": "m-kwh-usage",
+        "name": "kwh_usage",
+        "display_name": "kWh使用量",
+        "description": "月次電力使用量の合計",
+        "sql_template": "SELECT SUM(electricity_kwh) FROM energy_reading",
+        "dimensions": [],
+        "synonyms": ["kwh使用量"],
+        "namespace": "energy",
+        "data_source_id": "ds-readings",
+        "columns": ["kwh_usage"],
+    },
+    {
+        "metric_id": "m-sales-kr",
+        "name": "total_sales_kr",
+        "display_name": "총매출",
+        "description": "Total sales (Korean label)",
+        "sql_template": "SELECT SUM(amount) FROM sales",
+        "dimensions": [],
+        "synonyms": ["총매출"],
+        "namespace": "sales-kr",
+        "data_source_id": "ds-sales",
+        "columns": ["total_sales_kr"],
+    },
+]
+
+
+@pytest.mark.unit
+class TestNonAsciiMatching:
+    """Tier-1 matching for scripts without space-marked word boundaries (#928).
+
+    Three previously-broken pieces, exercised together: the exact matcher's
+    ``\\b`` (which no unsegmented text can satisfy), the residual gate's ASCII
+    tokenizer (which made every non-ASCII qualifier invisible — the
+    silent-wrong-answer direction), and the fuzzy matcher's ASCII tokenizer
+    (which saw zero tokens and never ran).
+    """
+
+    def _resolver(self) -> MetricResolver:
+        return MetricResolver(seed=SEED_METRICS_NON_ASCII)
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "総発電容量は？",  # bare question, particle attached
+            "総発電容量",  # the name alone
+            "総発電容量を教えて",  # polite ask (を + 教/えて scaffolding)
+            "総発電容量を教えてください",  # ください merges into the hiragana run
+            "総発電容量の合計は？",  # aggregate restater (合計 ≙ "total")
+            "総発電容量はいくらですか",  # interrogative-quantity + copula
+        ],
+    )
+    async def test_fully_consumed_japanese_question_has_no_residual(self, query):
+        """A bare Japanese metric question resolves at Tier-1 despite the particle.
+
+        ``\\b総発電容量\\b`` can never match inside 「総発電容量は？」 — kanji and
+        the following hiragana particle are both ``\\w`` — so before the
+        edge-aware boundary fix these were all Tier-1 misses.
+        """
+        resolver = self._resolver()
+
+        result = resolver.exact_name_synonym_match(query, "energy")
+        assert result.found, f"expected a Tier-1 hit for {query!r}"
+        assert result.residual == "", f"unexpected residual for {query!r}: {result.residual!r}"
+
+    @pytest.mark.parametrize(
+        ("query", "expected"),
+        [
+            # A filter the metric's fixed SQL cannot apply.
+            ("東京地域の総発電容量は？", "東京地域"),
+            # Time windows are inexpressible in a fixed template — 昨日/先月 must
+            # NOT become stop-words (mirror of "today"/"current" in English).
+            ("昨日の総発電容量", "昨日"),
+            ("先月の総発電容量は？", "先月"),
+            # Aggregate modifiers change WHICH aggregate is asked for (mirror of
+            # "average"): a SUM metric must not answer 平均 with the sum.
+            ("総発電容量の平均", "平均"),
+        ],
+    )
+    async def test_japanese_qualifier_is_reported_as_residual(self, query, expected):
+        """The old ASCII tokenizer saw NO tokens here → empty residual → the
+        unfiltered SQL answered the narrower question at confidence 1.0."""
+        resolver = self._resolver()
+
+        result = resolver.exact_name_synonym_match(query, "energy")
+        assert result.found
+        assert result.residual == expected, f"{query!r} must leave {expected!r} as residual"
+
+    async def test_oversized_hiragana_run_is_not_decomposed(self):
+        """A hiragana run past the ceiling skips the O(n²) DP and trips the gate.
+
+        Reachable by a caller: ``<metric name> + <long hiragana run>`` exact-matches,
+        the name span is blanked, and the run is left as one residual token. The
+        run here is built from stop-word pieces only, so WITHOUT the ceiling the
+        decomposition would succeed and swallow it; with the ceiling it survives
+        as residual — the safe direction — and the caller pays no quadratic CPU.
+        """
+        from coa_serve.tier1.metric_resolver import _MAX_SCAFFOLDING_RUN, _is_stop_scaffolding
+
+        piece = "ですか"
+        assert _is_stop_scaffolding(piece), "precondition: the piece alone is scaffolding"
+        run = piece * (_MAX_SCAFFOLDING_RUN // len(piece) + 1)
+        assert len(run) > _MAX_SCAFFOLDING_RUN
+        assert not _is_stop_scaffolding(run)
+
+        resolver = self._resolver()
+        result = resolver.exact_name_synonym_match(f"総発電容量{run}", "energy")
+        assert result.found
+        assert result.residual == run
+
+    async def test_fullwidth_input_is_nfkc_folded(self):
+        """Full-width Latin (ＫＷＨ) folds onto the stored half-width spelling."""
+        resolver = self._resolver()
+
+        result = resolver.exact_name_synonym_match("ＫＷＨ使用量は？", "energy")
+        assert result.found
+        assert result.metric_name == "kwh_usage"
+        assert result.residual == ""
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "月間kwh使用量は？",
+            "年度のkwh使用量",
+        ],
+    )
+    async def test_latin_edged_synonym_matches_when_cjk_text_is_adjacent(self, query):
+        """CJK next to a Latin edge is a boundary, even though both are ``\\w``."""
+        resolver = self._resolver()
+
+        result = resolver.exact_name_synonym_match(query, "energy")
+        assert result.found
+        assert result.metric_name == "kwh_usage"
+        assert result.match_source == "synonym"
+
+    async def test_latin_edged_synonym_still_rejects_latin_identifier_gluing(self):
+        """The CJK-boundary fix must not turn a Latin prefix into a hit."""
+        resolver = self._resolver()
+
+        result = resolver.exact_name_synonym_match("monthlykwh使用量", "energy")
+        assert not result.found
+
+    async def test_korean_particle_attachment_matches_and_gates(self):
+        """Hangul attaches particles directly (총매출은) — the match must land.
+
+        The particle 은 is NOT on the (Japanese) stop-word list, so it survives
+        as residual and demotes to Tier 2: a needless hop, but the safe
+        direction, and exactly how an unlisted English word behaves.
+        """
+        resolver = self._resolver()
+
+        result = resolver.exact_name_synonym_match("총매출은?", "sales-kr")
+        assert result.found
+        assert result.metric_name == "total_sales_kr"
+        assert result.residual == "은"
+
+    async def test_japanese_fuzzy_near_miss(self):
+        """A one-character truncation fuzzy-matches (was: zero tokens, no fuzzy)."""
+        resolver = self._resolver()
+
+        result = resolver.fuzzy_match("総発電容", "energy")
+        assert result.found
+        assert result.match_source == "fuzzy"
+        assert result.metric_name == "total_generation_capacity"
+        assert result.match_confidence < 1.0
+
+    async def test_empty_synonym_never_indexed(self):
+        """An empty synonym would compile to `\\b\\b` and match EVERY query."""
+        seed = [
+            {
+                "metric_id": "m-x",
+                "name": "some_metric",
+                "sql_template": "SELECT 1",
+                "synonyms": [""],
+                "namespace": "ns",
+            }
+        ]
+        resolver = MetricResolver(seed=seed)
+
+        result = resolver.exact_name_synonym_match("completely unrelated question", "ns")
+        assert not result.found
+
+    async def test_matched_text_shows_the_folded_consumed_span(self):
+        resolver = self._resolver()
+
+        result = resolver.exact_name_synonym_match("東京の総発電容量は？", "energy")
+        assert result.matched_text == "総発電容量"

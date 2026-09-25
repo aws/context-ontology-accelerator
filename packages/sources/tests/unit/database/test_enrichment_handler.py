@@ -79,6 +79,33 @@ class TestEnrichmentHandlerStatus:
         # Second call: PENDING_REVIEW
         assert update_calls[1][1]["update_fields"]["status"] == SourceStatus.PENDING_REVIEW
 
+    @patch(
+        "coa_sources.database.enrichment.cross_source_orchestrator.run_for_namespace",
+        side_effect=RuntimeError("cross-source blew up"),
+    )
+    @patch(
+        f"{ENRICHER_MODULE}.run", return_value={"tables_enriched": 5, "tables_failed": 0, "tables_skipped_unchanged": 0}
+    )
+    @patch("coa_common.dao.DynamoDBDAO")
+    def test_cross_source_detection_failure_is_non_fatal(self, mock_dao_cls, mock_run, mock_xsrc):
+        # #1088: the cross-source pass is best-effort. If it raises, this source's
+        # enrichment must still complete (terminal PENDING_REVIEW, never
+        # SCAN_FAILED) and the failure must be observable via a metric.
+        mock_dao = _build_dao(source_item={"sourceId": "ds-123"})
+        mock_dao_cls.return_value = mock_dao
+
+        from coa_sources.database.pipeline import enrichment_handler as mod
+
+        with patch.object(mod.EnrichmentMetricEmitter, "emit_metric") as emit:
+            mod.handler()  # must NOT raise
+
+        statuses = [c[1]["update_fields"]["status"] for c in mock_dao.update.call_args_list]
+        assert SourceStatus.PENDING_REVIEW in statuses
+        assert SourceStatus.SCAN_FAILED not in statuses
+        mock_xsrc.assert_called_once()
+        emitted = {c.args[0] for c in emit.call_args_list}
+        assert "CrossSourceDetectionFailed" in emitted
+
     @patch(f"{ENRICHER_MODULE}.run")
     @patch("coa_common.dao.DynamoDBDAO")
     def test_skips_enrichment_when_disabled_and_sets_pending_review(self, mock_dao_cls, mock_run):

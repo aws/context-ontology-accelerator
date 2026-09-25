@@ -3,7 +3,7 @@
 
 """Control Plane package."""
 
-__version__ = "0.3.2"
+__version__ = "0.3.3"
 
 from coa_control_plane.metadata_store import (
     AssetResult,

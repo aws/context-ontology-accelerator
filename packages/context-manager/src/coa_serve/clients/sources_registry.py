@@ -312,6 +312,20 @@ class SourcesRegistry:
         db_sources = [item for item in items if item.get("sourceType") == _SOURCE_TYPE_DATABASE]
         return db_sources[0] if len(db_sources) == 1 else None
 
+    async def database_source_count(self, namespace: str) -> int:
+        """Number of DATABASE sources registered to ``namespace``.
+
+        Lets a caller tell a single-source namespace (where pinning the sole
+        DATABASE source is sound) apart from a multi-source one (where pinning the
+        FIRST source silently mis-routes same-named tables). Reuses the
+        cached ``_query_sources`` round-trip. Returns 0 when the inventory is
+        unavailable, which the caller must treat as "cannot confirm single-source".
+        """
+        items = await self._query_sources(namespace)
+        if items is None:
+            return 0
+        return sum(1 for item in items if item.get("sourceType") == _SOURCE_TYPE_DATABASE)
+
     async def sql_namespace_scope(self, namespace: str) -> SQLNamespaceScope | None:
         """Return the physical SQL objects registered to ``namespace``.
 
@@ -343,6 +357,42 @@ class SourcesRegistry:
             database = str(
                 item.get("athenaDatabase") or item.get("glueDatabaseName") or config.get("databaseName") or ""
             ).lower()
+
+            # A native Glue source can sit in a DISTINCT (non-root) Athena catalog,
+            # declared at create and recorded in ``athenaCatalog`` (NOT the
+            # system-managed ``athenaDataCatalogName``, which is unset for Glue).
+            # The executor addresses it as ``<athenaCatalog>.<database>.<table>``
+            # (AthenaQueryExecutor._resolve_catalog_and_database's glue_nested path),
+            # so the qualifier attributes that catalog to its tables. It must be
+            # authorized under that catalog, not folded into AwsDataCatalog — else a
+            # correctly-qualified cross-catalog reference is denied. Key it by the
+            # Glue DATABASE (the schema part of the three-part name), matching the
+            # executor. A root ``athenaCatalog`` means "no nested catalog" and stays
+            # on the native-database path below.
+            glue_catalog = str(item.get("athenaCatalog") or "").lower()
+            if glue_catalog and glue_catalog != "awsdatacatalog":
+                # Authorize the nested catalog ONLY when source-create recorded that
+                # its ownership was verified (assert_namespace_may_catalog ran at
+                # POST /sources). `athenaCatalog` itself is derived from a
+                # caller-supplied `catalogId` and a legacy or seeded row can carry a
+                # name it never owned, so trusting the raw field would let a
+                # declared-but-unowned catalog become an authorization grant. A row
+                # without the marker (legacy, or a source onboarded before this
+                # field existed) is NOT authorized 3-part here; it falls through to
+                # the native-database path and must be re-onboarded to regain nested
+                # addressing — the fail-closed direction.
+                if item.get("athenaCatalogOwnershipVerified") is True:
+                    if _IDENTIFIER_PATTERN.fullmatch(glue_catalog) and _IDENTIFIER_PATTERN.fullmatch(database):
+                        federated_catalog_schemas.add((glue_catalog, database))
+                    continue
+                logger.warning(
+                    "sql_namespace_scope_unverified_catalog_skipped",
+                    namespace=namespace,
+                    athena_catalog=glue_catalog,
+                )
+                # Fall through: keep the source addressable via its native database
+                # under the default catalog rather than dropping it entirely.
+
             if _IDENTIFIER_PATTERN.fullmatch(database):
                 native_databases.add(database)
 

@@ -107,6 +107,34 @@ class TestGetOsiUploadUrl:
 # ── Import with S3 key tests ───────────────────────────────────────────
 
 
+@pytest.mark.parametrize(
+    "s3_key",
+    [
+        "test-ns/imports/./metrics.yaml",
+        "test-ns/imports/../metrics.yaml",
+        "test-ns/imports//metrics.yaml",
+        "test-ns/imports/%2e%2e/metrics.yaml",
+    ],
+)
+def test_import_s3_key_scope_accepts_exact_prefix_with_opaque_suffix(s3_key: str) -> None:
+    from coa_metrics.api.import_s3_key import is_import_s3_key_for_namespace
+
+    assert is_import_s3_key_for_namespace(s3_key, "test-ns")
+
+
+@pytest.mark.parametrize(
+    "s3_key",
+    [
+        "other-ns/imports/metrics.yaml",
+        "test-ns/imports-evil/metrics.yaml",
+    ],
+)
+def test_import_s3_key_scope_rejects_foreign_and_lookalike_prefixes(s3_key: str) -> None:
+    from coa_metrics.api.import_s3_key import is_import_s3_key_for_namespace
+
+    assert not is_import_s3_key_for_namespace(s3_key, "test-ns")
+
+
 class TestImportFromS3:
     """Tests for import_osi handler with s3Key parameter."""
 
@@ -158,6 +186,40 @@ class TestImportFromS3:
         assert resp["statusCode"] == 200
         body = json.loads(resp["body"])
         assert body["metricsCreated"] == 1
+        mock_s3.return_value.get_object.assert_called_once_with(
+            Bucket="test-bucket",
+            Key="test-ns/imports/abc/file.yaml",
+        )
+
+    @patch("coa_metrics.api.import_osi._read_from_s3")
+    def test_foreign_namespace_s3_key_returns_400_before_io(self, mock_read_from_s3: MagicMock) -> None:
+        from coa_metrics.api.import_osi import handler
+        from coa_metrics.api.import_s3_key import IMPORT_S3_KEY_SCOPE_ERROR
+
+        resp = handler(
+            self._make_event(body={"s3Key": "other-ns/imports/abc/missing.yaml"}),
+            None,
+        )
+
+        assert resp["statusCode"] == 400
+        assert json.loads(resp["body"])["message"] == IMPORT_S3_KEY_SCOPE_ERROR
+        mock_read_from_s3.assert_not_called()
+
+    @pytest.mark.parametrize("s3_key", [None, 42, [], {}])
+    @patch("coa_metrics.api.import_osi._read_from_s3")
+    def test_non_string_s3_key_returns_400_before_io(
+        self,
+        mock_read_from_s3: MagicMock,
+        s3_key: object,
+    ) -> None:
+        from coa_metrics.api.import_osi import handler
+        from coa_metrics.api.import_s3_key import IMPORT_S3_KEY_SCOPE_ERROR
+
+        resp = handler(self._make_event(body={"s3Key": s3_key}), None)
+
+        assert resp["statusCode"] == 400
+        assert json.loads(resp["body"])["message"] == IMPORT_S3_KEY_SCOPE_ERROR
+        mock_read_from_s3.assert_not_called()
 
     def test_content_and_s3key_mutually_exclusive(self) -> None:
         from coa_metrics.api.import_osi import handler

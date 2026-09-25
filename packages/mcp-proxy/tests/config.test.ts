@@ -6,8 +6,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // Mock the SSM client before importing the module under test.
 const sendMock = vi.fn();
 vi.mock("@aws-sdk/client-ssm", () => ({
-  SSMClient: vi.fn(() => ({ send: sendMock })),
-  GetParameterCommand: vi.fn((input: unknown) => ({ input })),
+  SSMClient: vi.fn(function () {
+    return { send: sendMock };
+  }),
+  GetParameterCommand: vi.fn(function (input: unknown) {
+    return { input };
+  }),
 }));
 
 import { resolveConfig } from "../src/config.js";

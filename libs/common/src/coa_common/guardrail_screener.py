@@ -22,6 +22,7 @@ import asyncio
 import os
 import random
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -111,6 +112,14 @@ class GuardrailScreener:
         metrics_transport: ``"put"`` (PutMetricData) or ``"emf"`` (stdout EMF).
             Defaults to ``"put"`` because the primary caller is the kg-build ECS
             Fargate task, which publishes its other custom metrics the same way.
+        guardrail_id_provider: Optional callable returning the guardrail id LIVE
+            on each screening call. When supplied it takes precedence over
+            ``guardrail_id`` so an operator's SSM retrieval-guardrail change
+            reaches a long-lived (serve) screener without a redeploy.
+            Short-lived callers (ingestion Fargate tasks) omit it and keep the
+            static ``guardrail_id``.
+        guardrail_version_provider: Optional callable returning the guardrail
+            version LIVE; paired with ``guardrail_id_provider``.
     """
 
     def __init__(
@@ -120,10 +129,15 @@ class GuardrailScreener:
         region: str | None = None,
         component: str = COMPONENT_KG_BUILD,
         metrics_transport: Literal["put", "emf"] = "put",
+        *,
+        guardrail_id_provider: Callable[[], str] | None = None,
+        guardrail_version_provider: Callable[[], str] | None = None,
     ) -> None:
         """Store guardrail coordinates and defer client creation until first use (see class Args)."""
         self._guardrail_id = guardrail_id
         self._guardrail_version = guardrail_version or os.environ.get("BEDROCK_GUARDRAIL_VERSION", "DRAFT")
+        self._guardrail_id_provider = guardrail_id_provider
+        self._guardrail_version_provider = guardrail_version_provider
         # resolve_region (AWS_REGION → AWS_DEFAULT_REGION → us-east-1) rather than a
         # bespoke getenv: this region reaches both ApplyGuardrail and the guardrail
         # decision metrics, so a wrong value screens against — and files metrics in —
@@ -132,6 +146,23 @@ class GuardrailScreener:
         self._component = component
         self._metrics_transport = metrics_transport
         self._client: Any = None
+
+    def _effective_guardrail_id(self) -> str:
+        """Resolve the guardrail id LIVE via the provider when injected.
+
+        Falls back to the construction-time ``guardrail_id`` when no provider is
+        wired (the ingestion path). An empty live value falls back to the static
+        id rather than calling ApplyGuardrail with an empty identifier.
+        """
+        if self._guardrail_id_provider is not None:
+            return self._guardrail_id_provider() or self._guardrail_id
+        return self._guardrail_id
+
+    def _effective_guardrail_version(self) -> str:
+        """Resolve the guardrail version LIVE via the provider when injected."""
+        if self._guardrail_version_provider is not None:
+            return self._guardrail_version_provider() or self._guardrail_version
+        return self._guardrail_version
 
     def _get_client(self):
         if self._client is None:
@@ -201,8 +232,8 @@ class GuardrailScreener:
             try:
                 client = self._get_client()
                 return client.apply_guardrail(
-                    guardrailIdentifier=self._guardrail_id,
-                    guardrailVersion=self._guardrail_version,
+                    guardrailIdentifier=self._effective_guardrail_id(),
+                    guardrailVersion=self._effective_guardrail_version(),
                     source=source,
                     content=content,
                     outputScope="FULL",

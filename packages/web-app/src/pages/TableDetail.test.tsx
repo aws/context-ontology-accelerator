@@ -9,6 +9,7 @@ import { TableDetail } from "./TableDetail";
 
 const mockUseGetSource = vi.fn();
 const mockUseGetSourceTable = vi.fn();
+const mockUpdateKeysMutate = vi.fn();
 
 vi.mock("@api-hooks", () => ({
   useGetSourceTable: () => mockUseGetSourceTable(),
@@ -18,7 +19,7 @@ vi.mock("@api-hooks", () => ({
   useUpdateSourceTableMetadata: () => ({ mutate: vi.fn(), isPending: false }),
   useUpdateSourceColumnMetadata: () => ({ mutate: vi.fn(), isPending: false }),
   useUpdateSourceTableKeys: () => ({
-    mutate: vi.fn(),
+    mutate: mockUpdateKeysMutate,
     isPending: false,
     reset: vi.fn(),
     error: null,
@@ -101,6 +102,7 @@ const wrapper = ({ children }: { children: React.ReactNode }) => (
 );
 
 beforeEach(() => {
+  mockUpdateKeysMutate.mockReset();
   mockUseGetSourceTable.mockReset();
   mockUseGetSourceTable.mockReturnValue({
     data: baseTableData,
@@ -143,6 +145,45 @@ describe("TableDetail keys & relationships", () => {
     expect(
       screen.getByRole("button", { name: /add foreign key/i }),
     ).toBeInTheDocument();
+  });
+
+  it("surfaces a pending cross-source relationship and approves it (#1088)", () => {
+    mockUseGetSourceTable.mockReturnValue({
+      data: {
+        ...baseTableData,
+        foreignKeys: [
+          {
+            column: "customer_id",
+            targetTable: "customers",
+            targetColumn: "id",
+            source: "AI_INFERRED",
+            confidence: 0.9,
+            reviewStatus: "PENDING_REVIEW",
+            targetDatasourceId: "DS#crm",
+            provenance: "maps a customer via account_xref",
+          },
+        ],
+      },
+      isLoading: false,
+      error: null,
+    });
+    render(<TableDetail />, { wrapper });
+
+    // Review state, cross-source chip, and provenance are all shown.
+    expect(screen.getByText("PENDING_REVIEW")).toBeInTheDocument();
+    expect(screen.getByText("cross-source")).toBeInTheDocument();
+    expect(
+      screen.getByText("maps a customer via account_xref"),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+
+    expect(mockUpdateKeysMutate).toHaveBeenCalledTimes(1);
+    const [payload] = mockUpdateKeysMutate.mock.calls[0];
+    const fk = payload.foreignKeys.find(
+      (f: { column: string }) => f.column === "customer_id",
+    );
+    expect(fk.reviewStatus).toBe("APPROVED");
   });
 });
 

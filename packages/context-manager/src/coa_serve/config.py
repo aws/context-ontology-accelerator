@@ -85,6 +85,9 @@ class ServiceConfig:
     session_metadata_table: str
     retrieval_guardrail_id: str = ""
     retrieval_guardrail_version: str = "DRAFT"
+    # Tier-1 curated metric SQL budget. Explicitly threaded to the executor so
+    # this request path never inherits the protocol's 10-second method default.
+    tier1_metric_timeout_s: int = 35
     # Standard-mode Tier-3 engine. "lexical-baseline" + topic_beam is the default
     # because topic_beam is the strongest single-shot strategy on the SEC-10-Q
     # benchmark (45.13% strict vs 34.36% for hand-rolled, 195 questions).
@@ -232,11 +235,13 @@ def load_config() -> ServiceConfig:
         )
         guardrail_id = ""
         retrieval_guardrail_id = ""
+    tier1_metric_timeout_s = _parse_int_in_range("TIER1_METRIC_TIMEOUT_S", 35, 1, 300)
     logger.info(
         "config_loaded",
         guardrail_configured=bool(guardrail_id),
         retrieval_guardrail_configured=bool(retrieval_guardrail_id),
         guardrails_disabled=guardrails_disabled,
+        tier1_metric_timeout_s=tier1_metric_timeout_s,
         environment=environment,
     )
 
@@ -319,6 +324,7 @@ def load_config() -> ServiceConfig:
         metric_definitions_table=os.environ.get("METRIC_DEFINITIONS_TABLE", ""),
         memory_id=os.environ.get("MEMORY_ID", ""),
         session_metadata_table=os.environ.get("SESSION_METADATA_TABLE", ""),
+        tier1_metric_timeout_s=tier1_metric_timeout_s,
         tier3_strategy=tier3_strategy,
         lexical_retriever_strategy=lexical_retriever_strategy,
         deep_reasoning_time_budget_s=deep_reasoning_time_budget_s,
@@ -361,3 +367,31 @@ def _get_ssm_parameter(name: str, *, required: bool = False) -> str:
             raise ConfigurationError(f"Failed to load SSM parameter {name}: {e}") from e
         logger.error("ssm_parameter_unexpected_error", name=name, error=str(e))
         return ""
+
+
+def _read_ssm_parameter_strict(name: str, *, required: bool = False) -> str:
+    """Fetch an SSM parameter, raising on any error except a missing parameter.
+
+    Unlike :func:`_get_ssm_parameter` (which swallows every failure to ``""``),
+    this maps only ``ParameterNotFound`` to ``""`` (the parameter is legitimately
+    unset) and re-raises everything else — throttling, IAM/permission, network.
+
+    The distinction matters for the live guardrail provider: it must be able to
+    tell "the operator unset this" (adopt ``""`` → guardrail off) apart from "the
+    read failed" (retain last-known-good, never silently flip the guardrail off).
+    The SDK's own transient-retry (``sync_boto_config`` ``max_attempts``) still
+    runs first, so only errors that survive retry propagate here.
+
+    The ``required`` keyword is accepted for call-signature parity with
+    :func:`_get_ssm_parameter` (the guardrail provider passes ``required=False``);
+    it does not change behavior — a missing parameter always maps to ``""`` here.
+    """
+    region = resolve_region()
+    ssm = boto3.client("ssm", region_name=region, config=sync_boto_config())
+    try:
+        return ssm.get_parameter(Name=name)["Parameter"]["Value"]
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ParameterNotFound":
+            logger.warning("ssm_parameter_not_found", name=name)
+            return ""
+        raise

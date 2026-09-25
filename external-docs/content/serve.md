@@ -319,6 +319,20 @@ this is automatic and requires no configuration:
 The choice is derived from the source's `queryEngine` (set at onboarding) and the query
 shape (single- vs cross-source); see the [Sources Guide](sources.md#direct-sql-vs-athena-federated).
 
+On the federated path, every table in a cross-source query is rewritten to its full
+`catalog.schema.table` name before execution. Athena's per-query catalog/database
+context supplies defaults for *unqualified* names only, so it can name just one
+source at a time; the three-part form is context-independent and is what lets one
+statement reach two sources at once.
+
+One case cannot be rewritten: if two of a namespace's sources expose a table with the
+**same name** and the query names it bare, there is no way to tell which source is
+meant, and the query fails with an explicit error rather than silently reading the
+wrong table. Re-inducing the namespace fixes it — the regenerated mappings carry
+schema-qualified names (`"public"."customers"`) for any name two sources share, and
+queries then resolve normally. Namespaces with no such collision are unaffected and
+need no re-induction.
+
 ### Tier 3 — Knowledge Retrieval
 
 **When**: The question requires unstructured knowledge or graph traversal

@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -30,6 +32,7 @@ from botocore.exceptions import ClientError
 from coa_common.logging import setup_logging
 from coa_common.response import api_response, get_caller_identity
 
+from coa_metrics.api.import_s3_key import IMPORT_S3_KEY_SCOPE_ERROR, is_import_s3_key_for_namespace
 from coa_metrics.data_source_lookup_factory import build_data_source_lookup
 from coa_metrics.dataset_resolver import resolve_datasets
 from coa_metrics.lookups import ColumnMetadata, DataSourceLookup
@@ -183,13 +186,24 @@ def _read_from_s3(s3_key: str) -> str:
     return content
 
 
-def _write_to_s3(content: str, namespace: str) -> str:
-    """Write inline OSI content to S3 for async processing. Returns the S3 key."""
+@dataclass(frozen=True)
+class StagedImportSource:
+    """A version-pinned source object for an asynchronous import job."""
+
+    key: str
+    version_id: str
+
+
+def _write_to_s3(content: str, namespace: str) -> StagedImportSource:
+    """Stage exact async input under a unique versioned key."""
     timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    s3_key = f"{namespace}/imports/{timestamp}-inline.yaml"
-    _get_s3_client().put_object(Bucket=_get_bucket(), Key=s3_key, Body=content.encode("utf-8"))
-    logger.info("s3_inline_written", s3_key=s3_key, size_bytes=len(content))
-    return s3_key
+    s3_key = f"{namespace}/imports/jobs/{timestamp}-{uuid.uuid4()}.yaml"
+    result = _get_s3_client().put_object(Bucket=_get_bucket(), Key=s3_key, Body=content.encode("utf-8"))
+    version_id = result.get("VersionId") if isinstance(result, dict) else None
+    if not isinstance(version_id, str) or not version_id.strip():
+        raise RuntimeError("versioned S3 staging write did not return VersionId")
+    logger.info("s3_inline_written", s3_key=s3_key, version_id=version_id, size_bytes=len(content))
+    return StagedImportSource(key=s3_key, version_id=version_id)
 
 
 # ── Handler ─────────────────────────────────────────────────────────────
@@ -212,12 +226,16 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
 
     # Resolve content: either inline or from S3
     content = body.get("content", "")
-    s3_key = body.get("s3Key", "")
+    raw_s3_key: object = body.get("s3Key", "")
+    has_s3_key = "s3Key" in body and raw_s3_key != ""
 
-    if content and s3_key:
+    if content and has_s3_key:
         return api_response(400, {"message": "'content' and 's3Key' are mutually exclusive"})
 
-    if s3_key:
+    if has_s3_key:
+        if not is_import_s3_key_for_namespace(raw_s3_key, namespace):
+            return api_response(400, {"message": IMPORT_S3_KEY_SCOPE_ERROR})
+        s3_key = raw_s3_key
         # Read content from S3
         try:
             content = _read_from_s3(s3_key)
@@ -231,6 +249,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             logger.exception("s3_read_failed", s3_key=s3_key)
             return api_response(500, {"message": "Failed to read OSI YAML from S3"})
     elif content:
+        s3_key = ""
         # Enforce inline size limit (5MB)
         max_inline_bytes = 5 * 1024 * 1024
         if len(content.encode("utf-8")) > max_inline_bytes:
@@ -254,18 +273,22 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     # Async decision: if metric count exceeds threshold, process via SQS worker
     metric_count = len(document.metrics) if document.metrics else 0
     if metric_count > SYNC_THRESHOLD and _IMPORT_QUEUE_URL:
-        if not s3_key:
-            try:
-                s3_key = _write_to_s3(content, namespace)
-            except Exception:
-                logger.exception("s3_write_for_async_failed", namespace=namespace)
-                return api_response(500, {"message": "Failed to stage content for async import"})
+        # Re-stage the exact bytes under a unique key even when the request used
+        # S3. This binds every new job to a version returned by the bucket and
+        # prevents a caller from changing the source between chunks or retries.
+        try:
+            staged_source = _write_to_s3(content, namespace)
+        except Exception:
+            logger.exception("s3_write_for_async_failed", namespace=namespace)
+            return api_response(500, {"message": "Failed to stage content for async import"})
+        s3_key = staged_source.key
         from coa_metrics.api.import_job_store import complete_job, create_job
 
         job = create_job(
             namespace_id=namespace,
             s3_key=s3_key,
             metrics_total=metric_count,
+            source_version_id=staged_source.version_id,
         )
         try:
             _get_sqs().send_message(
@@ -279,6 +302,10 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
                         "chunkSize": 50,
                     }
                 ),
+                MessageAttributes={
+                    "namespaceId": {"DataType": "String", "StringValue": namespace},
+                    "jobId": {"DataType": "String", "StringValue": job["jobId"]},
+                },
             )
         except Exception:
             logger.exception("import_enqueue_failed", namespace=namespace, job_id=job["jobId"])
@@ -385,6 +412,9 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             if existing is not None:
                 neptune.update_metric(namespace, metric_def.name, metric_def)
                 metrics_updated += 1
+                author = getattr(existing, "defined_by", "")
+                author_detail = f" authored by {author.strip()}" if isinstance(author, str) and author.strip() else ""
+                warnings.append(f"Metric '{metric_def.name}' overwritten (had existing metadata{author_detail})")
                 logger.info("metric_updated_via_import", name=metric_def.name, namespace=namespace)
             else:
                 neptune.create_metric(namespace, metric_def)

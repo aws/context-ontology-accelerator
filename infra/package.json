@@ -1,6 +1,6 @@
 {
   "name": "coa-infra",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "SemanticContext CDK Infrastructure (TypeScript)",
   "private": true,
   "scripts": {
@@ -24,7 +24,7 @@
     "@types/jest": "^29.5.0",
     "@types/node": "^22.0.0",
     "aws-cdk": "^2.1127.0",
-    "esbuild": "^0.28.0",
+    "esbuild": "^0.28.2",
     "jest": "^29.7.0",
     "prettier": "^3.4.0",
     "ts-jest": "^29.2.0",

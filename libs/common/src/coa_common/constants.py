@@ -502,17 +502,56 @@ def sql_qualified_table(name: str, schema: str | None = None) -> str:
     ``sql_qualified_table("orders", "sales")`` -> ``'"sales"."orders"'`` and
     ``sql_qualified_table("orders")`` -> ``'"orders"'``.
 
-    Qualifying the table with its source schema keeps two same-named tables from
-    different schemas distinct in the H2 validation database and in the R2RML
-    ``rr:tableName`` that Ontop validates against it. Without the qualifier the
-    ``CREATE TABLE IF NOT EXISTS`` for the second table is silently dropped and
-    its TriplesMap then references columns that do not exist, so the mapping
-    fails to load (COA #149 cause A). Both emit sites (schema.sql DDL and the
-    R2RML writer) MUST use this same form so the identifiers match exactly.
+    SUPERSEDED for the inducer path. It once UNCONDITIONALLY schema-qualified
+    every ``rr:tableName`` / H2 table (cause A of the cross-catalog defect), but that forced every
+    already-accepted single-source mapping to re-induce. The inducer now qualifies
+    ONLY on a genuine collision via
+    ``inducer/strategies/base.py:disambiguated_refs`` / ``logical_table_names`` (a
+    unique name stays bare), so this helper has no remaining inducer caller. It is
+    retained only as a generic identifier utility; do NOT reintroduce
+    unconditional qualification from it. For any qualification that must AGREE with
+    the mapping, go through ``logical_table_names`` instead.
     """
     if schema:
         return f"{sql_ident(schema)}.{sql_ident(name)}"
     return sql_ident(name)
+
+
+def split_sql_ident_path(literal: str) -> list[str]:
+    """Split a possibly-quoted, possibly-qualified SQL name into its bare segments.
+
+    The inverse of :func:`sql_ident` applied to each dotted segment, so
+    ``'"public"."customers"'`` yields ``["public", "customers"]`` and a
+    round-trip through ``".".join(sql_ident(p) for p in ...)`` is identity.
+
+    Splitting on ``.`` textually is NOT the inverse, and the difference is not
+    cosmetic: a table legitimately named ``q1.results`` is emitted as the single
+    identifier ``"q1.results"``, and a textual split turns it into the schema
+    ``"q1`` and the table ``results"`` — unbalanced quotes that make the whole
+    generated DDL a syntax error rather than one bad table. Only an unquoted dot
+    separates segments here, and ``""`` inside a quoted segment is one literal
+    quote character.
+    """
+    parts: list[str] = []
+    buf: list[str] = []
+    in_quotes = False
+    i = 0
+    while i < len(literal):
+        char = literal[i]
+        if char == '"':
+            if in_quotes and literal[i + 1 : i + 2] == '"':
+                buf.append('"')
+                i += 2
+                continue
+            in_quotes = not in_quotes
+        elif char == "." and not in_quotes:
+            parts.append("".join(buf))
+            buf = []
+        else:
+            buf.append(char)
+        i += 1
+    parts.append("".join(buf))
+    return parts
 
 
 def ontology_vector_index_name(prefix: str, namespace_id: str, default_namespace: str = "default") -> str:

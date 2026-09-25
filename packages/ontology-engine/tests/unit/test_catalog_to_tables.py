@@ -91,3 +91,35 @@ def test_distinct_values_propagate_to_columns():
     # Columns without sampling get an empty list, never a missing key.
     other = next(c for c in out[0]["columns"] if c["name"] == "claim_amount_identifier")
     assert other["distinctValues"] == []
+
+
+def test_fk_governance_fields_propagate_to_constraint():
+    # #1088: reviewStatus + targetDatasourceId must reach CatalogConstraint so the
+    # induction gate can withhold unapproved FKs and cross-source targets resolve.
+    catalog = {
+        "databases": [
+            {
+                "name": "bench",
+                "tables": [
+                    {
+                        "name": "loss_payment",
+                        "foreignKeys": [
+                            {
+                                "column": "cust_id",
+                                "targetTable": "customers",
+                                "targetColumn": "id",
+                                "source": "AI_INFERRED",
+                                "reviewStatus": "PENDING_REVIEW",
+                                "targetDatasourceId": "DS#2",
+                            }
+                        ],
+                        "columns": [{"name": "cust_id", "type": "INT"}],
+                    }
+                ],
+            }
+        ]
+    }
+    out = _catalog_to_tables(catalog)
+    fk = next(c for c in out[0]["tableConstraints"] if c["constraintType"] == "FOREIGN_KEY")
+    assert fk["reviewStatus"] == "PENDING_REVIEW"
+    assert fk["targetDatasourceId"] == "DS#2"

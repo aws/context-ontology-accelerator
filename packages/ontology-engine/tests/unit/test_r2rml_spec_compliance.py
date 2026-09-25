@@ -168,10 +168,13 @@ class TestTriplesMapStructure:
         assert table_name is not None
         assert str(table_name) == '"products"'
 
-    def test_table_name_qualified_with_source_schema(self, strategy):
-        """#149 A: when a table carries sourceSchema, rr:tableName is emitted as
-        the schema-qualified `"schema"."table"` so it matches the qualified H2
-        table and two same-named tables from different schemas stay distinct."""
+    def test_table_name_bare_when_unique_qualified_only_on_collision(self, strategy):
+        """rr:tableName is BARE for a table whose name is unique in the run,
+        so already-accepted single-source mappings stay byte-identical. Schema
+        qualification is applied ONLY on a genuine cross-datasource name collision
+        (see test_two_same_named_tables_distinct_qualified_table_names) — it
+        supersedes #149's unconditional qualification, which qualified even a
+        unique name and would have forced every namespace to re-induce."""
         tables = [
             CatalogTable(
                 id="1",
@@ -186,7 +189,7 @@ class TestTriplesMapStructure:
         ns = Namespace(PREFIX)
         lt = g.value(ns.TriplesMap_Products, RR.logicalTable)
         table_name = g.value(lt, RR.tableName)
-        assert str(table_name) == '"store"."products"'
+        assert str(table_name) == '"products"'
 
     def test_two_same_named_tables_distinct_qualified_table_names(self, strategy):
         """#149 A: two tables named the same in different schemas must produce

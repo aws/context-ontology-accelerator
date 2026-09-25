@@ -221,6 +221,16 @@ class RedshiftDataAPIExecutor:
                 default_catalog=_AWS_DATA_CATALOG,
             )
         except NamespaceSQLScopeError as exc:
+            # Log the rejected reference + authorized scope so a distinct-catalog
+            # denial is diagnosable from CloudWatch (client message stays generic).
+            logger.warning(
+                "namespace_scope_denied",
+                namespace=namespace,
+                reason=str(exc),
+                default_catalog=_AWS_DATA_CATALOG,
+                native_databases=sorted(scope.native_databases),
+                federated_catalog_schemas=sorted(f"{c}.{d}" for c, d in scope.federated_catalog_schemas),
+            )
             raise RedshiftQueryError("Access denied: SQL reference is outside the requested namespace") from exc
 
     def _prepare_sql(self, sql: str, glue_database: str, max_rows: int) -> str:

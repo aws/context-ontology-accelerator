@@ -27,9 +27,6 @@ export {
   CONNECTOR_SPILL_KEY_GLOB
 } from "./constants";
 export type { RuntimeConfig } from "./types";
-export {
-  NamespaceStatus,
-  NAMESPACE_ID_PREFIX,
-} from "./namespace";
+export { NAMESPACE_ID_PREFIX } from "./namespace";
 export { PrincipalType, ResourceType } from "./authnz";
 export type { ResourceRoleMapping } from "./authnz";

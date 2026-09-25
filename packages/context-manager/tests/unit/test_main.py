@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
+import ast
 import importlib.util
+import inspect
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1138,3 +1140,44 @@ class TestResolvePrincipal:
 
         _, groups = resolve_principal({"groups": ["ok", 7, None, "  ", "also-ok"]}, "", "", [])
         assert groups == ["ok", "also-ok"]
+
+
+class TestTier2QualifierWiring:
+    """Both Tier-2 strategies must be handed the sources registry.
+
+    ``sources_registry`` is an OPTIONAL constructor argument on both strategies (it
+    has to be — the unit suites construct them without one), and its absence is
+    silent: ``qualify_cross_source_sql`` simply cannot resolve a catalog and leaves
+    the SQL bare, which is exactly the pre-fix behaviour. So dropping the keyword
+    from ``main.py`` would un-fix the cross-source qualifier in production with every unit test still
+    green. Asserted statically over the source rather than by running
+    ``_ensure_initialized`` (which would need Neptune, OpenSearch, Bedrock, DynamoDB
+    and an event loop stood up) — the wiring is a syntactic property of that
+    function, so the cheap check is the honest one.
+    """
+
+    @staticmethod
+    def _kwargs_per_call(class_name: str) -> list[set[str]]:
+        import coa_serve.main as main_mod
+
+        tree = ast.parse(inspect.getsource(main_mod))
+        return [
+            {kw.arg for kw in node.keywords if kw.arg}
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and getattr(node.func, "id", None) == class_name
+        ]
+
+    @pytest.mark.parametrize("strategy_class", ["VKGTranslator", "NLtoSQLStrategy"])
+    def test_every_construction_passes_the_sources_registry(self, strategy_class):
+        calls = self._kwargs_per_call(strategy_class)
+        assert calls, (
+            f"{strategy_class} is no longer constructed in coa_serve.main — if it moved, move this "
+            f"wiring assertion with it rather than deleting it."
+        )
+        for kwargs in calls:
+            assert "sources_registry" in kwargs, (
+                f"{strategy_class}(...) in coa_serve.main omits sources_registry, so cross-source SQL "
+                f"silently stays unqualified and the cross-source defect returns in production "
+                f"(table_qualifier needs the "
+                f"registry to resolve each table's Athena catalog). Got kwargs={sorted(kwargs)}."
+            )

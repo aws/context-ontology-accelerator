@@ -17,10 +17,12 @@ from itertools import batched
 
 import httpx
 from coa_common.bedrock_metrics import CostTracker
+from coa_common.domain_models import EnrichmentSource, ReviewStatus
 from opensearchpy.exceptions import OpenSearchException
 from rdflib import OWL, RDF, RDFS, XSD, BNode, Graph, Literal, Namespace, URIRef
 from rdflib.namespace import SKOS
 
+from coa_ontology.datasource_ids import bare_datasource_id
 from coa_ontology.inducer.schemas import ConceptMatch
 from coa_ontology.inducer.services.data_catalog import CatalogTable, parse_referred_column
 from coa_ontology.inducer.services.grounding import GroundingRerankError
@@ -33,10 +35,45 @@ from coa_ontology.inducer.strategies.base import (
     composite_fk_columns,
     pascal_names_for,
     reference_index,
+    resolve_fk_target_identity,
     table_identity,
 )
 
 log = logging.getLogger(__name__)
+
+# FK sources that are authoritative and materialise regardless of review state:
+# pulled from the source system, a 3rd-party catalog, or a human steward.
+_AUTHORITATIVE_FK_SOURCES: frozenset[str] = frozenset(
+    {
+        EnrichmentSource.DETERMINISTIC,
+        EnrichmentSource.CATALOG_EXISTING,
+        EnrichmentSource.STEWARD_SPECIFIED,
+        EnrichmentSource.STEWARD_EDITED,
+    }
+)
+
+
+def _fk_edge_allowed(source: str | None, review_status: str | None) -> bool:
+    """Whether a foreign key may be materialised as an ``owl:ObjectProperty`` (#1088).
+
+    "Use only approved relationships downstream." An FK becomes an ontology edge
+    only when it is authoritative, or explicitly APPROVED, or grandfathered:
+
+      * authoritative source (deterministic / catalog / steward) -> always emit;
+      * ``review_status`` empty/None -> emit. FKs stored before the review field
+        existed, and every catalog source that does not populate it, carry no
+        status; emitting preserves pre-#1088 behaviour so existing ontologies do
+        not lose edges on re-induction;
+      * ``APPROVED`` -> emit;
+      * ``PENDING_REVIEW`` / ``REJECTED`` -> do NOT emit — the column degrades to a
+        plain datatype property until a steward approves the relationship.
+    """
+    if source in _AUTHORITATIVE_FK_SOURCES:
+        return True
+    if not review_status:
+        return True
+    return review_status == ReviewStatus.APPROVED
+
 
 # Tables per fusion batch when INDUCER_TABLE_BATCH_SIZE is unset.
 DEFAULT_TABLE_BATCH_SIZE = 500
@@ -307,21 +344,49 @@ class TableToOntologyStrategy(InductionStrategy):
         camel_by_id = {i: p[0].lower() + p[1:] if p else p for i, p in pascal_by_id.items()}
         ref_index = reference_index(tables)
         ambiguous_names = ambiguous_target_names(tables)
+        # (bare name, datasourceId) -> table identity. Lets a cross-source FK
+        # (#1088) resolve its target even when the bare name is ambiguous across
+        # the unioned datasources (e.g. a "customers" table in two sources): the
+        # relationship's targetDatasourceId picks the right one.
+        #
+        # Both sides are normalised to the BARE id. The FK's targetDatasourceId is
+        # written by the sources pipeline as a `DS#`-prefixed id, while
+        # CatalogTable.datasourceId carries whatever id was passed to /induce
+        # (typically bare) — a raw comparison would never match and the lookup
+        # would fall through to the ambiguous bare-name path, silently dropping
+        # the edge this feature exists to emit.
+        target_by_name_ds = {
+            (t.name, bare_datasource_id(t.datasourceId)): table_identity(t) for t in tables if t.datasourceId
+        }
 
         def table_prop(table: CatalogTable, column_name: str) -> URIRef:
             """Mint the property IRI for ``table.column_name``."""
             local = camel_by_id.get(table_identity(table), _to_camel(table.name))
             return ns[f"{local}_{_to_camel(column_name)}"]
 
-        def parent_class(target_name: str, referrer: CatalogTable) -> URIRef | None:
+        def parent_class(
+            target_name: str, referrer: CatalogTable, target_datasource_id: str | None = None
+        ) -> URIRef | None:
             """Resolve an FK target table name to its class IRI.
 
             Returns ``None`` when the bare name is ambiguous across the run, so the
             caller declares a datatype property instead of an object property —
             the same degradation build_r2rml applies to its parentTriplesMap.
+
+            A cross-source relationship (#1088) carries ``target_datasource_id``:
+            when present it resolves the target to the table in THAT datasource
+            first, so a name shared across sources still maps to the right class.
+            Otherwise the resolution order mirrors base.build_r2rml._parent_tmap
+            (via ``resolve_fk_target_identity``) so the ontology's object-property
+            range and the mapping's parentTriplesMap always name the same target:
+            own datasource + own database first, then the same database in any
+            datasource, then the bare name.
             """
-            qualified = f"{referrer.sourceSchema}.{target_name}" if referrer.sourceSchema else None
-            target_id = (qualified and ref_index.get(qualified)) or ref_index.get(target_name)
+            if target_datasource_id:
+                tid = target_by_name_ds.get((target_name, bare_datasource_id(target_datasource_id)))
+                if tid is not None and tid in pascal_by_id:
+                    return ns[pascal_by_id[tid]]
+            target_id = resolve_fk_target_identity(referrer, target_name, ref_index)
             if target_id is not None and target_id in pascal_by_id:
                 return ns[pascal_by_id[target_id]]
             if target_name in ambiguous_names:
@@ -418,25 +483,49 @@ class TableToOntologyStrategy(InductionStrategy):
                 fk_target = None
                 fk_target_col = None
                 fk_provenance: str | None = None
+                fk_target_ds: str | None = None
                 if table.tableConstraints and col.name not in absorbed_fk_columns:
                     anchored = composite_anchors.get(col.name)
+                    fk_review_status: str | None = None
                     if anchored is not None and anchored.referredColumns:
                         is_fk = True
                         fk_target, fk_target_col = parse_referred_column(anchored.referredColumns[0])
                         fk_provenance = anchored.relationshipType
+                        fk_review_status = anchored.reviewStatus
+                        fk_target_ds = anchored.targetDatasourceId
                     else:
                         for tc in table.tableConstraints:
                             if tc.constraintType == "FOREIGN_KEY" and col.name in tc.columns and tc.referredColumns:
                                 is_fk = True
                                 fk_target, fk_target_col = parse_referred_column(tc.referredColumns[0])
                                 fk_provenance = tc.relationshipType
+                                fk_review_status = tc.reviewStatus
+                                fk_target_ds = tc.targetDatasourceId
                                 break
+                    # Governance gate (#1088): a PENDING/REJECTED inferred FK is not
+                    # materialised — demote it to a plain datatype property (the
+                    # column still exists; only the relationship edge is withheld
+                    # until a steward approves it). Authoritative and grandfathered
+                    # FKs pass through unchanged.
+                    if is_fk and not _fk_edge_allowed(fk_provenance, fk_review_status):
+                        log.info(
+                            "fk_edge_withheld_pending_review table=%s column=%s target=%s source=%s status=%s",
+                            table.name,
+                            col.name,
+                            fk_target,
+                            fk_provenance,
+                            fk_review_status,
+                        )
+                        is_fk = False
+                        fk_target = None
+                        fk_target_col = None
+                        fk_provenance = None
 
                 # In-run tables use the shared (collision-resolved) name; a target
                 # outside this run falls back to the bare form. An ambiguous bare
                 # name resolves to None and the column becomes a datatype property,
                 # matching build_r2rml's rr:datatype for the same column.
-                parent_cls = parent_class(fk_target, table) if is_fk and fk_target else None
+                parent_cls = parent_class(fk_target, table, fk_target_ds) if is_fk and fk_target else None
                 if parent_cls is not None:
                     if (table.name, fk_target) in pk_sharing_confirmed:
                         g.add((table_cls, RDFS.subClassOf, parent_cls))

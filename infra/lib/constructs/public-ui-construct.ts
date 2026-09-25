@@ -103,6 +103,12 @@ export function buildContentSecurityPolicy(
     ? [
         `https://*.s3.${runtimeConfig.region}.amazonaws.com`,
         `https://s3.${runtimeConfig.region}.amazonaws.com`,
+        // us-east-1 (and some boto3/botocore versions) presign S3 URLs against
+        // the legacy global host `<bucket>.s3.amazonaws.com`, which has no
+        // region segment and so matches neither regional form above. Allowlist
+        // it too, or the browser blocks the presigned proposal fetch (issue #211).
+        `https://*.s3.amazonaws.com`,
+        `https://s3.amazonaws.com`,
       ]
     : [];
 

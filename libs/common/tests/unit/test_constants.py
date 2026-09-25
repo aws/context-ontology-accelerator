@@ -19,6 +19,7 @@ from coa_common.constants import (
     ontology_artifact_s3_key,
     ontology_vector_index_name,
     parse_namespace_tag,
+    split_sql_ident_path,
     sql_ident,
     sql_qualified_table,
     to_graphrag_tenant_id,
@@ -195,6 +196,42 @@ class TestSqlQualifiedTable:
 
     def test_preserves_special_characters(self):
         assert sql_qualified_table("events daily", "raw-zone") == '"raw-zone"."events daily"'
+
+
+class TestSplitSqlIdentPath:
+    """The inverse of :func:`sql_ident` per dotted segment.
+
+    A textual ``.rsplit(".")`` is the tempting alternative and it is wrong on
+    exactly the names that matter: it turns the single identifier ``"q1.results"``
+    into two unbalanced halves, which in generated DDL is a whole-file syntax
+    error rather than one bad table.
+    """
+
+    def test_qualified_name_splits_into_segments(self):
+        assert split_sql_ident_path('"public"."customers"') == ["public", "customers"]
+
+    def test_dot_inside_one_identifier_is_not_a_separator(self):
+        assert split_sql_ident_path('"q1.results"') == ["q1.results"]
+
+    def test_doubled_quotes_are_one_literal_quote(self):
+        assert split_sql_ident_path('"a""b"') == ['a"b']
+
+    def test_unquoted_name_still_splits(self):
+        assert split_sql_ident_path("public.customers") == ["public", "customers"]
+
+    @pytest.mark.parametrize(
+        "segments",
+        [
+            ["customers"],
+            ["public", "customers"],
+            ["q1.results"],
+            ['a"b', "c.d"],
+            ["public__2f77729f", "customers"],
+        ],
+    )
+    def test_round_trips_through_sql_ident(self, segments):
+        literal = ".".join(sql_ident(s) for s in segments)
+        assert split_sql_ident_path(literal) == segments
 
 
 class TestIndexNameHelpers:
