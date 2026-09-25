@@ -25,6 +25,7 @@ import {
   CONNECTOR_SPILL_KMS_TAG_VALUE,
   CONNECTOR_TAG_KEY,
   CONNECTOR_TAG_VALUE,
+  DEFAULT_BEDROCK_LLM_MODEL_ID,
   DEFAULT_BEDROCK_MODEL_ID,
   DEFAULT_GRAPH_URI_BASE,
 } from "../../constants";
@@ -69,7 +70,7 @@ export interface ServeStackProps extends cdk.StackProps {
   readonly agentCoreAzNames?: string[];
 
   /** Bedrock LLM model ID for query resolution (NL-to-SPARQL, synthesis).
-   *  Defaults to us.anthropic.claude-sonnet-5 at runtime when omitted. */
+   *  Defaults to DEFAULT_BEDROCK_LLM_MODEL_ID when omitted. */
   readonly bedrockLlmModelId?: string;
 
   /** Bedrock embedding model ID for query embedding + the graphrag lexical
@@ -613,9 +614,9 @@ export class ServeStack extends SCLStack {
             }
             return optIn ? "true" : "false";
           })(),
-          ...(props.bedrockLlmModelId && {
-            BEDROCK_MODEL_ID: props.bedrockLlmModelId,
-          }),
+          // Always emitted so the effective query model is visible in the template.
+          BEDROCK_MODEL_ID:
+            props.bedrockLlmModelId ?? DEFAULT_BEDROCK_LLM_MODEL_ID,
           // Query embedding + graphrag lexical retriever MUST use the same model
           // doc-kg-build ingested with. Config-resolved (#94) so a non-US deploy
           // can set a region-appropriate model; shared ts-shared constant is the
