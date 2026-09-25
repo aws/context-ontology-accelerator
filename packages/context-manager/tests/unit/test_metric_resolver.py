@@ -27,6 +27,7 @@ from coa_serve.tier1.metric_resolver import (
     _PLACEHOLDER_RE,
     MetricDefinition,
     MetricResolver,
+    declared_dimensions,
 )
 
 from .conftest import SEED_METRICS_ALL
@@ -773,6 +774,99 @@ class TestDimensionSubstitution:
             # And the regex really does admit it, so the set above cannot drift
             # away from what the pattern accepts without failing here.
             assert _PLACEHOLDER_RE.fullmatch(f"{{{'x' + char}}}") is not None
+
+
+@pytest.mark.unit
+class TestDeclaredDimensionsFromTemplate:
+    """Template placeholders ARE the metric's dimension declaration.
+
+    No product path (CreateMetric contract, Neptune publisher, ``_bindings_to_seed``)
+    ever populated ``dimensions``, so every API-authored parameterized metric had
+    ``allowed == []`` and ``substitute_dimensions`` failed closed on both branches
+    — the metric was unreachable and Tier-1 fell through to an UNFILTERED Tier-2/3
+    answer. Deriving the declaration from the template closes that gap.
+    """
+
+    def test_brace_and_colon_placeholders_are_declared(self):
+        assert declared_dimensions("SELECT COUNT(*) FROM c WHERE region = {region}") == ["region"]
+        assert declared_dimensions("SELECT COUNT(*) FROM c WHERE region = :region") == ["region"]
+
+    def test_first_appearance_order_and_case_insensitive_dedup(self):
+        sql = "SELECT 1 FROM t WHERE a = :region AND b = {Segment} AND c = :REGION"
+        assert declared_dimensions(sql) == ["region", "Segment"]
+
+    def test_explicit_declaration_is_kept_and_unioned(self):
+        # An explicitly declared dimension (static seed) is never dropped, and a
+        # placeholder absent from the declaration is still added.
+        sql = "SELECT 1 FROM t WHERE region = :region"
+        assert declared_dimensions(sql, ["channel"]) == ["channel", "region"]
+        assert declared_dimensions(sql, ["Region"]) == ["Region"]
+
+    def test_no_placeholders_and_postgres_cast_declare_nothing(self):
+        assert declared_dimensions("SELECT SUM(amount) FROM revenue") == []
+        assert declared_dimensions("SELECT CAST(x AS text)::text FROM t") == []
+        assert declared_dimensions("", None) == []
+
+    def test_seeded_parameterized_metric_is_substitutable(self):
+        """Seed WITHOUT a dimensions key (the shape every real loader produces)."""
+        resolver = _make_resolver(
+            seed=[
+                {
+                    "metric_id": "sales:customers_in_region",
+                    "name": "customers_in_region",
+                    "sql_template": "SELECT COUNT(*) AS value FROM customers WHERE region = {region}",
+                    "namespace": "sales",
+                    "data_source_id": "ds-1",
+                }
+            ]
+        )
+        defn = resolver._snapshot.by_id["sales:customers_in_region"]
+        assert defn.dimensions == ["region"]
+        assert (
+            MetricResolver.substitute_dimensions(defn.sql_template, {"region": "APAC"}, defn.dimensions)
+            == "SELECT COUNT(*) AS value FROM customers WHERE region = 'APAC'"
+        )
+        # Fail-closed guarantees are preserved: no value / unknown supplied filter still raise.
+        with pytest.raises(ValueError, match="requires dimensions with no values"):
+            MetricResolver.substitute_dimensions(defn.sql_template, {}, defn.dimensions)
+        with pytest.raises(ValueError, match="no placeholder for supplied dimensions"):
+            MetricResolver.substitute_dimensions(defn.sql_template, {"region": "APAC", "tier": 1}, defn.dimensions)
+
+    async def test_neptune_loaded_parameterized_metric_resolves_and_substitutes(self):
+        """End-to-end through ``_bindings_to_seed`` -> index -> resolve -> substitute:
+        the exact live failure on coa-dev (v0.3.1/v0.3.2) — an API-published metric
+        ``WHERE region = {region}`` queried with ``options.dimensions=[{region: APAC}]``
+        raised "Dimension 'region' is not a declared dimension of this metric"."""
+        from unittest.mock import AsyncMock
+
+        mock_neptune = AsyncMock()
+        mock_neptune.query.return_value = [
+            {
+                "name": "customers_in_region",
+                "description": "Customers in a region",
+                "expressionDialects": (
+                    '[{"dialect":"TRINO","expression":'
+                    '"SELECT COUNT(*) AS value FROM customers WHERE region = {region}"}]'
+                ),
+                "dataSourceId": "ds-1",
+                "namespace": "sales",
+            },
+        ]
+        resolver = MetricResolver(neptune_client=mock_neptune)
+        await resolver.start()
+
+        match = await resolver.match("customers in region", namespace="sales")
+        assert match.found
+        assert match.dimensions == ["region"]
+        assert (
+            MetricResolver.substitute_dimensions(match.sql_template, {"region": "APAC"}, match.dimensions)
+            == "SELECT COUNT(*) AS value FROM customers WHERE region = 'APAC'"
+        )
+        # The literal-quoting guarantee is now reachable: a breakout attempt stays a literal.
+        assert (
+            MetricResolver.substitute_dimensions(match.sql_template, {"region": "x' OR 1=1 --"}, match.dimensions)
+            == "SELECT COUNT(*) AS value FROM customers WHERE region = 'x'' OR 1=1 --'"
+        )
 
 
 @pytest.mark.unit
