@@ -22,7 +22,7 @@ from typing import Any
 import structlog
 from botocore.exceptions import ClientError
 from coa_common import sanitize_principal_key
-from coa_common.authnz_types import PrincipalType, ResourceType
+from coa_common.authnz_types import NON_ASSIGNABLE_ROLE_IDS, PrincipalType, ResourceType
 from coa_common.dao import DynamoDBDAO
 from coa_common.logging import setup_logging
 from coa_common.response import api_response, get_caller_identity
@@ -89,6 +89,13 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
 
     if len(role) > _MAX_ROLE_LEN:
         return api_response(400, {"message": f"role exceeds maximum length of {_MAX_ROLE_LEN}"})
+
+    if role in NON_ASSIGNABLE_ROLE_IDS:
+        # ``default`` exists under PK=GLOBAL as the baseline policy bundle, so
+        # the existence check below would accept it; granting it hands the
+        # principal a GLOBAL role row that filtering code treats as
+        # cross-namespace (#988).
+        return api_response(400, {"message": f"Role '{role}' is not assignable"})
 
     if any(delim in principal_id for delim in _KEY_DELIMITERS):
         return api_response(400, {"message": "principalId may not contain reserved delimiter characters (#, |, ::)"})
