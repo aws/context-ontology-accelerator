@@ -31,7 +31,16 @@ from rdflib.namespace import SKOS
 
 from coa_ontology.inducer.schemas import ConceptMatch
 from coa_ontology.inducer.services.data_catalog import CatalogTable, parse_referred_column
-from coa_ontology.inducer.strategies.base import InductionStrategy
+from coa_ontology.inducer.strategies.base import (
+    InductionStrategy,
+    ambiguous_target_names,
+    logical_table_names,
+    pascal_names_for,
+    reference_index,
+    resolve_fk_target_identity,
+    subject_template_names,
+    table_identity,
+)
 
 log = logging.getLogger(__name__)
 
@@ -173,6 +182,16 @@ class RigorOntologyStrategy(InductionStrategy):
         ordered_tables = self._order_by_fk(tables)
         log.info("RIGOR: processing %d tables in FK order", len(ordered_tables))
 
+        # Collision-free class local names, keyed by table IDENTITY (not bare
+        # name). Two datasources sharing a table name — e.g. two PostgreSQL
+        # sources both exposing ``public.customers`` — would otherwise be told to
+        # declare the SAME ``ind:Customers`` class, fusing two real entities onto
+        # one IRI. ``pascal_names_for`` hands the second table a
+        # discriminated name (``Customers_1a2b3c4d``) so the LLM mints distinct
+        # classes and build_r2rml can tell them apart. A table whose name is unique
+        # keeps the exact bare PascalCase it minted before.
+        pascal_by_id = pascal_names_for(tables)
+
         # Growing core ontology (Turtle fragments accumulated for prompt context)
         core_ontology_fragments: list[str] = []
 
@@ -186,7 +205,7 @@ class RigorOntologyStrategy(InductionStrategy):
         merged_graph = self._new_graph(ontology_uri_prefix, "RIGOR Induced Ontology")
 
         for table in ordered_tables:
-            table_class_name = _to_pascal(table.name)
+            table_class_name = pascal_by_id[table_identity(table)]
 
             # Step 1: RAG retrieval (classes + properties from existing store)
             existing_context = self._retrieve_ontology_context(table, pipeline)
@@ -797,11 +816,25 @@ class RigorOntologyStrategy(InductionStrategy):
         g.bind("ind", ns)
         g.bind("xsd", XSD)
 
+        # Identity-keyed disambiguation, shared with base.py so this strategy's
+        # mapping agrees with the H2 validation schema (proposals._tables_to_h2_ddl)
+        # on every table's logical name. Without it, a name two datasources share
+        # would carry a bare rr:tableName here while the H2 schema declared it
+        # schema-qualified, and Ontop would reject the whole mapping at VKG load.
+        # For a namespace with no collision every value below is byte-
+        # identical to what this strategy emitted before.
+        pascal_by_id = pascal_names_for(tables)
+        logical_names = logical_table_names(tables)
+        subject_names = subject_template_names(tables)
+        ref_index = reference_index(tables)
+        ambiguous_names = ambiguous_target_names(tables)
+
         # Build lookup indices from the proposal graph
-        class_by_table = self._index_classes_by_table(
+        class_by_identity = self._index_classes_by_table(
             proposal_graph,
             ontology_uri_prefix,
             tables,
+            pascal_by_id,
         )
         prov_base = ontology_uri_prefix.rstrip("#").rstrip("/") + "/provenance"
 
@@ -809,7 +842,8 @@ class RigorOntologyStrategy(InductionStrategy):
             if table.name not in novel_tables:
                 continue
 
-            table_cls = class_by_table.get(table.name)
+            identity = table_identity(table)
+            table_cls = class_by_identity.get(identity)
             if table_cls is None:
                 log.warning(
                     "RIGOR R2RML: no generated class found for table '%s'; skipping R2RML mapping for this table",
@@ -817,18 +851,22 @@ class RigorOntologyStrategy(InductionStrategy):
                 )
                 continue
 
-            tmap = ns[f"TriplesMap_{table.name}"]
+            # TriplesMap IRI, rr:tableName and subject template all key on the
+            # identity's disambiguated token so two same-named tables no longer
+            # fuse onto one TriplesMap (invalid R2RML — two rr:tableName on one map)
+            # or mint the same individual per PK value.
+            tmap = ns[f"TriplesMap_{subject_names[identity]}"]
             g.add((tmap, RDF.type, RR.TriplesMap))
             _annotate_triples_map(g, tmap, table)
             lt = BNode()
             g.add((tmap, RR.logicalTable, lt))
-            g.add((lt, RR.tableName, Literal(sql_ident(table.name))))
+            g.add((lt, RR.tableName, Literal(logical_names[identity])))
 
             pk_col = self._primary_key_col(table)
             pk_id = sql_ident(pk_col) if pk_col else '"ID"'
             subj = URIRef(f"{tmap}/SubjectMap")
             g.add((tmap, RR.subjectMap, subj))
-            g.add((subj, RR.template, Literal(f"{ontology_uri_prefix}{table.name}/{{{pk_id}}}")))
+            g.add((subj, RR.template, Literal(f"{ontology_uri_prefix}{subject_names[identity]}/{{{pk_id}}}")))
             g.add((subj, RR["class"], table_cls))
 
             # Pre-compute the property-by-column map for this class
@@ -864,11 +902,19 @@ class RigorOntologyStrategy(InductionStrategy):
                     OWL.ObjectProperty,
                 ) in proposal_graph
 
+                # Resolve the FK target to the SUBJECT token its own TriplesMap
+                # mints instance IRIs under, so the reference lands on the right
+                # (possibly disambiguated) target. An ambiguous bare target — two
+                # in-run tables answering to the name, neither picked by the
+                # referrer's own schema — degrades to a datatype literal rather than
+                # a join to an arbitrary same-named table, exactly as base.py does.
+                target_token = self._fk_target_token(fk_target, table, ref_index, subject_names, ambiguous_names)
+
                 col_id = sql_ident(col.name)
-                if is_object_property and fk_target:
+                if is_object_property and target_token is not None:
                     # Build an IRI template referencing the target table
                     g.add((om, RR.termType, RR.IRI))
-                    g.add((om, RR.template, Literal(f"{ontology_uri_prefix}{fk_target}/{{{col_id}}}")))
+                    g.add((om, RR.template, Literal(f"{ontology_uri_prefix}{target_token}/{{{col_id}}}")))
                 else:
                     g.add((om, RR.column, Literal(col_id)))
                     # Use the property's rdfs:range if it's an xsd type;
@@ -888,18 +934,31 @@ class RigorOntologyStrategy(InductionStrategy):
         graph: Graph,
         ontology_uri_prefix: str,
         tables: list[CatalogTable],
+        pascal_by_id: dict[str, str],
     ) -> dict[str, URIRef]:
-        """Map each table name to the IRI of its generated owl:Class.
+        """Map each table IDENTITY to the IRI of its generated owl:Class.
+
+        Keyed by :func:`table_identity`, not by bare name, so two datasources
+        sharing a table name resolve to two distinct classes.
 
         Strategies in priority order:
           1. prov:wasDerivedFrom contains ``/provenance/<table_name>``
              (exact suffix match). This is the canonical marker RIGOR's
              prompt instructs the LLM to emit.
           2. rdfs:label equals the table name (case-insensitive).
-          3. Local name of the class IRI equals the PascalCase
-             conversion of the table name.
+          3. Local name of the class IRI equals the collision-free PascalCase
+             name the LLM was told to declare (``pascal_by_id``).
+
+        For a table whose bare name is shared by another table in the run, only
+        strategy 3 can tell the two apart: both twins carry the same
+        ``prov:wasDerivedFrom`` provenance path and the same ``rdfs:label`` (both
+        derived from the shared bare name), so strategies 1 and 2 would re-fuse
+        them onto whichever class matched first. The disambiguated local name from
+        ``pascal_by_id`` is the only discriminator, so shared-name tables are
+        resolved by strategy 3 alone.
         """
         PROV = Namespace("http://www.w3.org/ns/prov#")
+        shared_names = ambiguous_target_names(tables)
 
         # Collect all generated classes
         gen_classes: list[URIRef] = [
@@ -910,33 +969,107 @@ class RigorOntologyStrategy(InductionStrategy):
 
         result: dict[str, URIRef] = {}
         for table in tables:
-            # Strategy 1: provenance match
-            for cls in gen_classes:
-                provs = [str(o) for o in graph.objects(cls, PROV.wasDerivedFrom)]
-                if any(p.rstrip("/").endswith(f"/provenance/{table.name}") for p in provs):
-                    result[table.name] = cls
-                    break
-            if table.name in result:
-                continue
+            identity = table_identity(table)
+            expected_local = pascal_by_id[identity]
 
-            # Strategy 2: label match (case-insensitive)
-            table_name_lower = table.name.lower()
-            for cls in gen_classes:
-                label = graph.value(cls, RDFS.label)
-                if label is not None and str(label).strip().lower() == table_name_lower:
-                    result[table.name] = cls
-                    break
-            if table.name in result:
-                continue
+            # Provenance and label are shared between same-named twins, so they can
+            # only re-fuse a collision. Skip straight to the disambiguated
+            # local-name match for a shared bare name.
+            if table.name not in shared_names:
+                # Strategy 1: provenance match
+                for cls in gen_classes:
+                    provs = [str(o) for o in graph.objects(cls, PROV.wasDerivedFrom)]
+                    if any(p.rstrip("/").endswith(f"/provenance/{table.name}") for p in provs):
+                        result[identity] = cls
+                        break
+                if identity in result:
+                    continue
 
-            # Strategy 3: local-name match against PascalCase(table)
-            expected_local = _to_pascal(table.name)
+                # Strategy 2: label match (case-insensitive)
+                table_name_lower = table.name.lower()
+                for cls in gen_classes:
+                    label = graph.value(cls, RDFS.label)
+                    if label is not None and str(label).strip().lower() == table_name_lower:
+                        result[identity] = cls
+                        break
+                if identity in result:
+                    continue
+
+            # Strategy 3: local-name match against the collision-free class name
             for cls in gen_classes:
                 if _iri_local_name(str(cls)) == expected_local:
-                    result[table.name] = cls
+                    result[identity] = cls
                     break
 
+        # Deterministic fallback for shared-name tables strategy 3 could not
+        # resolve. When the LLM did not emit the exact discriminated PascalCase
+        # local name it was told to, the shared-name table would otherwise be
+        # absent from ``result`` -> build_r2rml drops its TriplesMap entirely and
+        # its rows become unreachable (strictly worse than fusing to one class).
+        # Instead, pair each still-unresolved same-named table against a
+        # still-unclaimed generated class in a STABLE order (sorted table_identity
+        # vs sorted class IRI), so every table gets a TriplesMap. This may
+        # mis-assign under a non-compliant LLM response, but it is deterministic
+        # and never silently drops a table.
+        claimed = set(result.values())
+        for name in sorted(shared_names):
+            unresolved = sorted(
+                (t for t in tables if t.name == name and table_identity(t) not in result),
+                key=table_identity,
+            )
+            if not unresolved:
+                continue
+            spare = sorted(
+                (c for c in gen_classes if c not in claimed),
+                key=str,
+            )
+            for table, cls in zip(unresolved, spare, strict=False):
+                identity = table_identity(table)
+                result[identity] = cls
+                claimed.add(cls)
+                log.warning(
+                    "rigor: shared-name table %s (%s) did not match a discriminated "
+                    "class local name; paired deterministically to %s",
+                    table.name,
+                    identity,
+                    str(cls),
+                )
+
         return result
+
+    @staticmethod
+    def _fk_target_token(
+        target_name: str | None,
+        referrer: CatalogTable,
+        ref_index: dict[str, str],
+        subject_names: dict[str, str],
+        ambiguous_names: set[str],
+    ) -> str | None:
+        """Resolve an FK target name to the subject-IRI token of its TriplesMap.
+
+        Mirrors :func:`base._parent_tmap`'s resolution order: the referrer's own
+        datasource and database first, then the same database in any datasource,
+        then the bare name when it is unambiguous across the run. Returns ``None``
+        when two in-run tables answer to the name and the referrer's own schema
+        does not pick one — the caller then emits a datatype literal instead of a
+        join to an arbitrary same-named table.
+
+        A target genuinely outside this induction run keeps its bare name (it has
+        no TriplesMap here to collide with), so a mapping that referenced an
+        out-of-run table stays byte-identical.
+        """
+        if not target_name:
+            return None
+        target_id = resolve_fk_target_identity(referrer, target_name, ref_index)
+        if target_id is not None and target_id in subject_names:
+            return subject_names[target_id]
+        if target_name in ambiguous_names:
+            log.warning(
+                "RIGOR R2RML: FK target %r is ambiguous across the run; emitting a literal instead of a join",
+                target_name,
+            )
+            return None
+        return target_name
 
     def _index_properties_by_column(
         self,

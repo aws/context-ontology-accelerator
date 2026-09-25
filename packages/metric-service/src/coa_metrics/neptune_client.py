@@ -24,7 +24,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlparse
 
 import boto3
 import botocore.auth
@@ -92,13 +92,34 @@ def _metric_uri(namespace: str, name: str) -> str:
 _IRI_FORBIDDEN = re.compile(r'[\s<>"{}|\\^`]')
 
 
+class InvalidMetricDefinitionError(ValueError):
+    """A metric cannot be represented safely as deterministic SPARQL."""
+
+
 def _iri(s: str) -> str:
     """Render a string as a SPARQL IRI reference <uri> with injection protection."""
     if not isinstance(s, str) or not s:
-        raise ValueError("IRI must be a non-empty string")
+        raise InvalidMetricDefinitionError("IRI must be a non-empty string")
     if _IRI_FORBIDDEN.search(s):
-        raise ValueError(f"URI contains characters forbidden in IRI references: {s!r}")
+        raise InvalidMetricDefinitionError(f"URI contains characters forbidden in IRI references: {s!r}")
     return f"<{s}>"
+
+
+def _resolved_class_uri(value: object, binding_type: object) -> str:
+    """Validate one Neptune URI binding against the metric write-path contract."""
+    if binding_type != "uri" or not isinstance(value, str):
+        raise ValueError("ontology resolver class binding must contain a URI value")
+    parsed = urlparse(value)
+    is_http_uri = parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+    urn_parts = parsed.path.split(":", 1) if parsed.scheme == "urn" else []
+    is_urn = len(urn_parts) == 2 and all(urn_parts)
+    if not is_http_uri and not is_urn:
+        raise ValueError("ontology resolver returned an unsupported class URI")
+    try:
+        _iri(value)
+    except InvalidMetricDefinitionError as exc:
+        raise ValueError("ontology resolver returned a malformed class URI") from exc
+    return value
 
 
 def _esc(s: str) -> str:
@@ -278,6 +299,7 @@ class MetricNeptuneClient:
             if not concept:
                 continue
             if concept.startswith(("http://", "https://", "urn:")):
+                _iri(concept)
                 resolved.append(concept)
             else:
                 to_resolve.append(concept)
@@ -285,7 +307,9 @@ class MetricNeptuneClient:
         if not to_resolve:
             return resolved
 
-        # Batch resolution via VALUES clause
+        # Batch resolution via VALUES clause. Query/response failures must
+        # propagate so callers do not checkpoint a definition with silently
+        # dropped ontology links during a Neptune outage.
         ns_prefix = f"{_resolve_graph_base()}/{namespace}/"
         values = " ".join(f'"{_esc(label)}"' for label in to_resolve)
         query = f"""
@@ -298,29 +322,36 @@ class MetricNeptuneClient:
           FILTER(STRSTARTS(STR(?g), "{_esc(ns_prefix)}"))
         }}
         """
-        try:
-            result = _sparql_query(query)
-            bindings = result.get("results", {}).get("bindings", [])
-            found: dict[str, str] = {}
-            for b in bindings:
-                label = b["label"]["value"]
-                if label not in found:
-                    found[label] = b["cls"]["value"]
-            for label in to_resolve:
-                if label in found:
-                    resolved.append(found[label])
-                else:
-                    logger.warning("ontology_concept_not_found", concept=label, namespace=namespace)
-        except Exception as exc:
-            logger.warning("ontology_concept_resolve_failed", error=str(exc))
+        result = _sparql_query(query)
+        bindings = result["results"]["bindings"]
+        if not isinstance(bindings, list):
+            raise ValueError("ontology concept query bindings must be a list")
+        found: dict[str, str] = {}
+        for binding in bindings:
+            label = binding["label"]["value"]
+            class_binding = binding["cls"]
+            if not isinstance(class_binding, dict):
+                raise ValueError("ontology resolver class binding must be an object")
+            class_uri = _resolved_class_uri(class_binding.get("value"), class_binding.get("type"))
+            if label not in found:
+                found[label] = class_uri
+        for label in to_resolve:
+            if label in found:
+                resolved.append(found[label])
+            else:
+                logger.warning("ontology_concept_not_found", concept=label, namespace=namespace)
 
         return resolved
 
+    def validate_metric_definition(self, namespace: str, metric: MetricDefinition) -> None:
+        """Validate the complete local write shape without performing Neptune I/O."""
+        self._build_triples(namespace, metric)
+
     def create_metric(self, namespace: str, metric: MetricDefinition) -> None:
         """Write metric triples to Neptune via INSERT DATA."""
-        self._ensure_base_vocabulary(namespace)
         graph = _named_graph(namespace)
         triples = self._build_triples(namespace, metric)
+        self._ensure_base_vocabulary(namespace)
         sparql = f"INSERT DATA {{ GRAPH {_iri(graph)} {{\n  {chr(10).join(triples)}\n}} }}"
         _sparql_update(sparql)
         logger.info("Metric created", namespace=namespace, name=metric.name)

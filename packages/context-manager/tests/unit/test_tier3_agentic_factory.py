@@ -290,6 +290,31 @@ class TestBuildAgenticRetriever:
         # The composed registry still always carries the ontology tool.
         assert ONTOLOGY_TOOL in retriever._registry.names()
 
+    def test_threads_guardrail_provider_into_synthesizer_and_decomposer(self, monkeypatch):
+        """The injected provider must reach BOTH agentic-built consumers.
+
+        Guards the silent-drift seam — a future refactor could drop the provider
+        arg and the agentic path would silently revert to a frozen guardrail. We
+        assert each composed consumer resolves the provider's LIVE value, and that
+        flipping it is reflected without reconstruction.
+        """
+        monkeypatch.setenv("ENVIRONMENT", "local")
+        config = make_config(neptune_endpoint="", opensearch_endpoint="", guardrail_id="gr-startup")
+        clients = make_clients()
+
+        current = {"gid": "gr-old"}
+        retriever = build_agentic_retriever(
+            config, clients, FakeStepPlanner(), guardrail_id_provider=lambda: current["gid"]
+        )
+
+        # Both agentic-path consumers must read through the provider, not the frozen id.
+        assert retriever._synthesizer._effective_guardrail_id() == "gr-old"
+        assert retriever._decomposer._effective_guardrail_id() == "gr-old"
+
+        current["gid"] = "gr-new"
+        assert retriever._synthesizer._effective_guardrail_id() == "gr-new"
+        assert retriever._decomposer._effective_guardrail_id() == "gr-new"
+
 
 # ── lazy-import invariant (Req 12.3) ───────────────────────────────
 

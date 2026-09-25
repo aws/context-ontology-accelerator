@@ -15,7 +15,7 @@ let capturedConfig:
   | undefined;
 
 vi.mock("@coa/control-plane-client", () => ({
-  ControlPlaneServiceClient: vi.fn().mockImplementation((config) => {
+  ControlPlaneServiceClient: vi.fn().mockImplementation(function (config) {
     capturedConfig = config;
     return { config };
   }),

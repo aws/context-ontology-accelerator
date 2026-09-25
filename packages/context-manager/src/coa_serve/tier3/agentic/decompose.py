@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -98,12 +99,26 @@ class DecompositionPlanner:
         planner_client: LLMClient,
         *,
         guardrail_id: str | None = None,
+        guardrail_id_provider: Callable[[], str] | None = None,
         max_query_chars: int = _MAX_QUERY_CHARS,
     ) -> None:
         """Bind the planner LLM client and optional guardrail / query-length bound."""
         self._planner = planner_client
         self._guardrail_id = guardrail_id or None
+        self._guardrail_id_provider = guardrail_id_provider
         self._max_query_chars = max_query_chars
+
+    def _effective_guardrail_id(self) -> str | None:
+        """Resolve the guardrail id LIVE via the provider when injected.
+
+        Falls back to the construction-time ``guardrail_id`` (already normalized
+        to ``None`` when empty) otherwise. Returns ``None`` for an empty provider
+        value to preserve the disabled-guardrail semantics of the call site.
+        """
+        if self._guardrail_id_provider is not None:
+            gid = self._guardrail_id_provider()
+            return gid or None
+        return self._guardrail_id
 
     async def decompose(self, query: str, trace: TraceCollector | None = None) -> list[SubQuestion]:
         """Decompose ``query`` into one or more Sub_Questions (Req 13.1-13.3).
@@ -130,7 +145,7 @@ class DecompositionPlanner:
             result = await self._planner.converse(
                 prompt=prompt,
                 system=_SYSTEM_INSTRUCTION,
-                guardrail_id=self._guardrail_id,
+                guardrail_id=self._effective_guardrail_id(),
                 guard_content=f"Question: {prompt}",
                 temperature=0.0,
             )

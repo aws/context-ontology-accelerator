@@ -421,6 +421,7 @@ class SQLFirewall:
         native_databases: frozenset[str],
         federated_catalog_schemas: frozenset[tuple[str, str]],
         default_catalog: str,
+        schema_only: bool = False,
     ) -> bool:
         """Authorize qualified table references against one namespace's sources.
 
@@ -441,6 +442,14 @@ class SQLFirewall:
         cte_names = {cte.alias_or_name.lower() for cte in parsed.find_all(sqlglot.exp.CTE)}
         checked = False
         default_catalog_lc = (default_catalog or "AwsDataCatalog").lower()
+        # On the direct-JDBC route the catalog is supplied by the JDBC CONNECTION,
+        # not by an Athena DataCatalog, so a bare "schema.table" (the form a
+        # single-source metric emits) legitimately carries no Athena catalog and
+        # must be authorized on its SCHEMA alone — against the union of every schema
+        # the namespace owns under any authorized catalog. Pinning it to
+        # awsdatacatalog/native_databases (the Athena rule) would wrongly deny a
+        # federated JDBC source whose schema lives in federated_catalog_schemas.
+        schema_scope = set(native_databases) | {schema for _cat, schema in federated_catalog_schemas}
 
         for table in parsed.find_all(sqlglot.exp.Table):
             if not table.name or (not table.db and table.name.lower() in cte_names):
@@ -454,13 +463,28 @@ class SQLFirewall:
             if database == "information_schema":
                 raise NamespaceSQLScopeError("SQL reference is not available in the requested namespace")
 
-            effective_catalog = catalog or default_catalog_lc
-            if effective_catalog == "awsdatacatalog":
-                allowed = bool(database) and database in native_databases
+            if schema_only and not catalog:
+                # JDBC route, unqualified catalog: authorize on schema membership in
+                # ANY authorized catalog. A 3-part name still carries an explicit
+                # catalog and falls through to the strict catalog-pinned check below.
+                allowed = bool(database) and database in schema_scope
             else:
-                allowed = bool(database) and (effective_catalog, database) in federated_catalog_schemas
+                effective_catalog = catalog or default_catalog_lc
+                if effective_catalog == "awsdatacatalog":
+                    allowed = bool(database) and database in native_databases
+                else:
+                    allowed = bool(database) and (effective_catalog, database) in federated_catalog_schemas
             if not allowed:
-                raise NamespaceSQLScopeError("SQL reference is not available in the requested namespace")
+                # Name the specific rejected reference so a denial is diagnosable
+                # from the caller's log (the caller records the authorized scope
+                # alongside it). This is a policy statement about the query, not
+                # sensitive data, so it is safe to carry in the internal message.
+                rejected = (
+                    f'"{database}"."{table.name.lower()}"'
+                    if schema_only and not catalog
+                    else f'"{catalog or default_catalog_lc}"."{database}"."{table.name.lower()}"'
+                )
+                raise NamespaceSQLScopeError(f"SQL reference is not available in the requested namespace: {rejected}")
 
         return checked
 

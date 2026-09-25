@@ -221,6 +221,30 @@ const FK_COLUMN_DEFS: TableProps.ColumnDefinition<ForeignKeyOutput>[] = [
   },
   { id: "source", header: "Source", cell: (fk) => sourceBadge(fk.source) },
   {
+    id: "review",
+    header: "Review",
+    // Inferred relationships (#1088) carry a review state; authoritative keys
+    // (deterministic/steward) do not and render "—". Cross-source relationships
+    // also show a chip and their inference provenance so a steward can judge.
+    cell: (fk) => {
+      if (fk.source !== "AI_INFERRED" || !fk.reviewStatus) return "—";
+      const type = REVIEW_STATUS_TYPE[fk.reviewStatus] ?? "warning";
+      return (
+        <SpaceBetween size="xxs">
+          <StatusIndicator type={type}>{fk.reviewStatus}</StatusIndicator>
+          {fk.targetDatasourceId ? (
+            <Badge color="blue">cross-source</Badge>
+          ) : null}
+          {fk.provenance ? (
+            <Box fontSize="body-s" color="text-status-inactive">
+              {fk.provenance}
+            </Box>
+          ) : null}
+        </SpaceBetween>
+      );
+    },
+  },
+  {
     id: "confidence",
     header: "Confidence",
     cell: (fk) => confidenceCell(fk.confidence),
@@ -853,6 +877,66 @@ export const TableDetail: React.FC = () => {
     });
   }
 
+  // Approve/reject one inferred relationship (#1088). Re-sends the full FK list
+  // (so unrelated keys are preserved) with only the target's reviewStatus
+  // changed; the backend keeps its source/targetDatasourceId/provenance.
+  function reviewRelationship(target: ForeignKeyOutput, decision: string) {
+    if (!tableId) return;
+    const foreignKeys = (data?.foreignKeys ?? []).map((fk) => ({
+      column: fk.column ?? "",
+      targetTable: fk.targetTable ?? "",
+      targetColumn: fk.targetColumn ?? undefined,
+      ...(fk.column === target.column &&
+      fk.targetTable === target.targetTable &&
+      (fk.targetColumn ?? "") === (target.targetColumn ?? "")
+        ? { reviewStatus: decision }
+        : {}),
+    }));
+    updateKeysMutation.mutate(
+      { foreignKeys },
+      {
+        onSuccess: () =>
+          notify(
+            "success",
+            decision === ReviewStatus.APPROVED
+              ? "Relationship approved."
+              : "Relationship rejected.",
+          ),
+        onError: (e) => notify("error", extractErrorMessage(e)),
+      },
+    );
+  }
+
+  // Base FK columns plus a per-row Approve/Reject action for pending inferred
+  // relationships (authoritative and already-decided keys show no action).
+  const fkColumnDefs: TableProps.ColumnDefinition<ForeignKeyOutput>[] = [
+    ...FK_COLUMN_DEFS,
+    {
+      id: "actions",
+      header: "Actions",
+      cell: (fk) =>
+        fk.source === "AI_INFERRED" &&
+        fk.reviewStatus === ReviewStatus.PENDING_REVIEW ? (
+          <SpaceBetween direction="horizontal" size="xs">
+            <Button
+              variant="inline-link"
+              loading={updateKeysMutation.isPending}
+              onClick={() => reviewRelationship(fk, ReviewStatus.APPROVED)}
+            >
+              Approve
+            </Button>
+            <Button
+              variant="inline-link"
+              disabled={updateKeysMutation.isPending}
+              onClick={() => reviewRelationship(fk, ReviewStatus.REJECTED)}
+            >
+              Reject
+            </Button>
+          </SpaceBetween>
+        ) : null,
+    },
+  ];
+
   return (
     <SpaceBetween size="m">
       {flash.length > 0 && (
@@ -1027,13 +1111,13 @@ export const TableDetail: React.FC = () => {
             variant="embedded"
             items={data.foreignKeys ?? []}
             trackBy="column"
-            columnDefinitions={FK_COLUMN_DEFS}
+            columnDefinitions={fkColumnDefs}
             header={
               <Header
                 variant="h3"
                 counter={`(${data.foreignKeys?.length ?? 0})`}
               >
-                Foreign keys
+                Foreign keys &amp; relationships
               </Header>
             }
             empty={

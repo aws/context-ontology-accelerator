@@ -30,6 +30,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 from coa_ontology import dynamo_store
+from coa_ontology.datasource_ids import bare_datasource_id, is_valid_datasource_id
 from coa_ontology.inducer.strategies import get_strategy
 
 if TYPE_CHECKING:
@@ -241,8 +242,14 @@ class WorkbenchInductionRequest(BaseModel):
 
 
 def _fetch_catalog(data_catalog_url: str, datasource_id: str) -> dict:
+    bare_id = bare_datasource_id(datasource_id)
+    # Validate before interpolating into the URL path — the id is our own metadata,
+    # but a malformed value must fail loudly rather than become a path-traversal /
+    # injection vector in the catalog request.
+    if not is_valid_datasource_id(bare_id):
+        raise ValueError(f"invalid datasource id for catalog fetch: {datasource_id!r}")
     with httpx.Client(timeout=30) as client:
-        resp = client.get(f"{data_catalog_url}/api/v1/catalogs/{datasource_id}")
+        resp = client.get(f"{data_catalog_url}/api/v1/catalogs/{bare_id}")
         resp.raise_for_status()
         return resp.json()
 
@@ -307,11 +314,18 @@ def _fetch_catalog_from_smus(config: dict, datasource_id: str, namespace: str) -
     except NamespaceMissingProjectError as e:
         raise HTTPException(409, str(e)) from e
 
+    # The sources pipeline keys datasources as ``DS#{uuid}`` / ``SRC#{uuid}`` while
+    # an induction request (and the ``datasource_ids`` stored on accepted proposals)
+    # carries the bare uuid. The catalog match must not depend on which spelling
+    # reached it, or a schema.sql re-fetch keyed on the bare uuid silently returns
+    # no tables for a sources-pipeline datasource — its ``rr:tableName`` literals
+    # then have no CREATE and the whole schema.sql generation fails closed.
+    bare_id = bare_datasource_id(datasource_id)
     result = read_approved_catalog(
         domain_id=config["smus_domain_id"],
         project_id=project_id,
         namespace_id=resolved_ns_id,
-        data_source_ids=[datasource_id],
+        data_source_ids=[bare_id],
         datasources_table=(
             config.get("sources_table")
             or os.environ.get("SOURCES_TABLE", "")
@@ -321,7 +335,10 @@ def _fetch_catalog_from_smus(config: dict, datasource_id: str, namespace: str) -
         region=region,
     )
     for source in result.get("sources", []):
-        if source.get("datasourceId") == datasource_id:
+        # `bare_id` must be non-empty: an empty id would spuriously match a source
+        # whose datasourceId is also empty/absent.
+        src_bare = bare_datasource_id(str(source.get("datasourceId", "")))
+        if bare_id and src_bare == bare_id:
             return source
     return {"databases": []}
 
@@ -388,6 +405,11 @@ def _catalog_to_tables(catalog: dict) -> list[dict]:
                     "columns": [fk["column"]],
                     "referredColumns": [f"{fk['targetTable']}.{fk['targetColumn']}"],
                     "relationshipType": fk.get("source") or None,
+                    # Governance (#1088): the approved-only induction gate reads
+                    # reviewStatus; targetDatasourceId lets a cross-source FK
+                    # resolve its parent class in the other source's tables.
+                    "reviewStatus": fk.get("reviewStatus") or None,
+                    "targetDatasourceId": fk.get("targetDatasourceId") or None,
                 }
                 for fk in tbl.get("foreignKeys", [])
             ]
@@ -709,11 +731,19 @@ def _run_induction(
                 else:
                     catalog = _fetch_catalog(config["data_catalog_url"], ds_id)
                 tbl_dicts = _catalog_to_tables(catalog)
+                from coa_ontology.inducer.strategies.base import schema_from_fqn
+
                 for tbl_dict in tbl_dicts:
                     tbl_dict["datasourceId"] = ds_id
-                    # sourceSchema = database name from catalog (maps to PostgreSQL schema / Athena database)
+                    # sourceSchema is the segment NEAREST the table (schema_from_fqn),
+                    # NOT fqn.split(".")[0]: a 3-part catalog.database.table FQN would
+                    # else stamp the CATALOG here. This value becomes coa:sourceSchema
+                    # and must match what proposals._generate_schema_sql derives (also
+                    # schema_from_fqn), or a shared-name table's R2RML mapping and its
+                    # H2 validation schema qualify on different segments and Ontop
+                    # rejects the mapping at VKG load.
                     fqn = tbl_dict.get("fullyQualifiedName", "")
-                    tbl_dict["sourceSchema"] = fqn.split(".")[0] if "." in fqn else None
+                    tbl_dict["sourceSchema"] = schema_from_fqn(fqn) or None
                     all_tables.append(catalog_table_cls(**tbl_dict))
                 datasource_details.append(
                     {

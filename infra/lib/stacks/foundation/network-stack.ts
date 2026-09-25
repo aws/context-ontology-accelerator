@@ -58,6 +58,9 @@ export class NetworkStack extends SCLStack {
   /** Security group for Lambda functions. */
   public readonly lambdaSecurityGroup: ec2.SecurityGroup;
 
+  /** Port-80 egress used only by direct Snowflake discovery for OCSP. */
+  public readonly discoveryOcspSecurityGroup: ec2.SecurityGroup;
+
   /** Security group for the AOSS VPC endpoint (port 443). */
   public readonly aossSecurityGroup: ec2.SecurityGroup;
   /** EC2 Interface VPC Endpoint ID for AOSS (NextGen *.on.aws private DNS). */
@@ -267,6 +270,31 @@ export class NetworkStack extends SCLStack {
       "Neptune Gremlin/SPARQL",
     );
 
+    // Internet-bound connector traffic can be narrowed to fixed NAT/proxy or
+    // source ranges. The same peers must govern Snowflake OCSP from both the
+    // managed connector and the direct-discovery Lambda so the two execution
+    // paths cannot drift.
+    const connectorEgressCidrs = this.ctxList("connector_egress_cidrs");
+    const connectorEgressPeers: ec2.IPeer[] = connectorEgressCidrs.length
+      ? connectorEgressCidrs.map((cidr) => ec2.Peer.ipv4(cidr))
+      : [ec2.Peer.anyIpv4()];
+    const egressScope = connectorEgressCidrs.length
+      ? connectorEgressCidrs.join(",")
+      : "anywhere";
+    const addConfiguredOcspEgress = (
+      securityGroup: ec2.SecurityGroup,
+      workload: string,
+    ): void => {
+      if (this.ctxString("connector_ocsp_egress") === "false") return;
+      for (const peer of connectorEgressPeers) {
+        securityGroup.addEgressRule(
+          peer,
+          ec2.Port.tcp(80),
+          `Snowflake OCSP for ${workload} to ${egressScope}`,
+        );
+      }
+    };
+
     // Lambda - egress restricted to least privilege. Same rationale as
     // the ECS SG: 443 for AWS service APIs, 8182 for Neptune clients
     // (metric-service, etc.). No broad outbound.
@@ -304,6 +332,23 @@ export class NetworkStack extends SCLStack {
         `Source database ${port} (direct JDBC discovery)`,
       );
     }
+    // Keep HTTP egress off the shared Lambda SG: most platform functions never
+    // call an OCSP responder. SourcesStack attaches this dedicated SG only to
+    // sources-db-connector, which is the Lambda that loads the Snowflake driver.
+    this.discoveryOcspSecurityGroup = new ec2.SecurityGroup(
+      this,
+      "DiscoveryOcspSG",
+      {
+        vpc: this.vpc,
+        securityGroupName: this.prefixed("discovery-ocsp-sg"),
+        description: "Snowflake discovery OCSP egress security group",
+        allowAllOutbound: false,
+      },
+    );
+    addConfiguredOcspEgress(
+      this.discoveryOcspSecurityGroup,
+      "direct discovery",
+    );
 
     // Neptune ingress — scoped to the ECS + Lambda SGs (least privilege),
     // replacing the previous VPC-CIDR-wide rule.
@@ -385,13 +430,6 @@ export class NetworkStack extends SCLStack {
     // to the DB ports, OCSP 80 and 443 alike rather than special-casing one
     // port. Cross-network JDBC (peering/TGW/PrivateLink) is already scoped to
     // its configured CIDRs by the JdbcConnectivity construct.
-    const connectorEgressCidrs = this.ctxList("connector_egress_cidrs");
-    const connectorEgressPeers: ec2.IPeer[] = connectorEgressCidrs.length
-      ? connectorEgressCidrs.map((cidr) => ec2.Peer.ipv4(cidr))
-      : [ec2.Peer.anyIpv4()];
-    const egressScope = connectorEgressCidrs.length
-      ? connectorEgressCidrs.join(",")
-      : "anywhere";
     for (const peer of connectorEgressPeers) {
       for (const port of [5432, 3306, 1433, 5439, 1521]) {
         this.connectorSecurityGroup.addEgressRule(
@@ -414,15 +452,7 @@ export class NetworkStack extends SCLStack {
     // rule entirely with `-c connector_ocsp_egress=false`; the cost of doing so
     // while Snowflake IS in use is soft-fail revocation checking plus the
     // latency above, so it is on by default.
-    if (this.ctxString("connector_ocsp_egress") !== "false") {
-      for (const peer of connectorEgressPeers) {
-        this.connectorSecurityGroup.addEgressRule(
-          peer,
-          ec2.Port.tcp(80),
-          `OCSP certificate revocation (HTTP-only protocol) to ${egressScope}`,
-        );
-      }
-    }
+    addConfiguredOcspEgress(this.connectorSecurityGroup, "managed connector");
     for (const peer of connectorEgressPeers) {
       this.connectorSecurityGroup.addEgressRule(
         peer,

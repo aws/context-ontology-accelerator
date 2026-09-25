@@ -145,6 +145,11 @@ def _table_to_induction_format(table: Table) -> dict[str, Any]:
                 "targetColumn": fk.target_column,
                 "source": fk.source,
                 "confidence": fk.confidence,
+                # Governance (#1088): carried through so the inducer can gate on
+                # approval and resolve a cross-source target's datasource.
+                "reviewStatus": fk.review_status,
+                "targetDatasourceId": fk.target_datasource_id,
+                "provenance": fk.provenance,
             }
             for fk in table.foreign_keys
         ],

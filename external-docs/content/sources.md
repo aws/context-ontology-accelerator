@@ -125,6 +125,14 @@ configure it:
   source) run through the Athena federated catalog provisioned at onboarding. This is
   always the fallback, so a query that can't take the direct path still resolves.
 
+On the federated path each table is rewritten to its full `catalog.schema.table` name,
+since Athena's query context can name only one source at a time. The one case this
+can't cover is two sources in the same namespace exposing a table with the **same
+name**: a bare reference to it is genuinely ambiguous, so the query fails with an
+explicit error instead of guessing. Re-induce the namespace to resolve it — the
+regenerated mappings schema-qualify any name two sources share. Namespaces without
+such a collision need no re-induction.
+
 Both paths are read-only and go through the same SQL firewall. `queryEngine` is a
 system-set, read-only field — there is no API or configuration knob for it.
 
@@ -312,7 +320,11 @@ and a `databaseSource.jdbcConfiguration` body — see **CreateSource** in the
 
 Host, port, and database name are validated to prevent JDBC parameter injection:
 
-- **host** — alphanumeric + `.` `-` `_`, max 253 chars
+- **host** — conventional DNS hostname (alphanumeric + `.` `-`) or IPv4
+  address, max 253 chars. For Snowflake only, the account identifier in the
+  first hostname label may also contain internal `_` characters (for example,
+  `my_account.snowflakecomputing.com`); suffix labels keep the conventional DNS
+  rules
 - **port** — integer 1–65535
 - **database** — alphanumeric + `_` `-`, max 128 chars
 

@@ -27,7 +27,13 @@ def _make_sparql_result(*, valid: bool = True, sparql: str = "SELECT ?x WHERE { 
     return result
 
 
-def _make_tier2_result(*, error: str | None = None, firewall_denied: bool = False, has_query_result: bool = True):
+def _make_tier2_result(
+    *,
+    error: str | None = None,
+    firewall_denied: bool = False,
+    has_query_result: bool = True,
+    executed_sql: str | None = None,
+):
     """Build a mock Tier2Result from vkg_translator.resolve."""
     result = MagicMock()
     result.error = error
@@ -47,11 +53,15 @@ def _make_tier2_result(*, error: str | None = None, firewall_denied: bool = Fals
     fw.reason = "policy violation" if firewall_denied else None
     result.firewall_result = fw
 
-    # VKG result
+    # VKG result — Ontop's RAW translate output (bare table names).
     vkg = MagicMock()
     vkg.sql = "SELECT col FROM tbl"
     vkg.ontology_version = "2026-09-12T08:15:00Z"
     result.vkg_result = vkg
+    # The statement the executor actually ran. ``None`` models a pipeline that never
+    # reached execution; an explicit MagicMock default would make every assertion on
+    # ``StrategyResult.sql`` pass vacuously.
+    result.executed_sql = executed_sql
 
     # Query result
     if has_query_result and not error:
@@ -153,6 +163,38 @@ class TestOntopStrategyResolve:
 
         assert result is not None
         assert result.ontology_version == ""
+
+    @pytest.mark.asyncio
+    async def test_reported_sql_is_the_qualified_statement_that_executed(self, strategy, nl_to_sparql, vkg_translator):
+        """Follow-up caught live on coa-dev: the ontop path reported Ontop's raw
+        translate output as ``queryUsed`` while executing the catalog-qualified rewrite.
+        The cross-source query succeeded, yet the SQL surfaced to the caller had bare
+        table names that resolve under no ``QueryExecutionContext`` — indistinguishable,
+        from the outside, from the fix not having fired at all.
+        """
+        qualified = 'SELECT col FROM "awsdatacatalog"."sales"."tbl"'
+        nl_to_sparql.translate.return_value = _make_sparql_result()
+        vkg_translator.resolve.return_value = _make_tier2_result(executed_sql=qualified)
+
+        result = await strategy.resolve("How many orders?", "ns1", _make_context())
+
+        assert result is not None
+        assert result.sql == qualified
+
+    @pytest.mark.asyncio
+    async def test_reported_sql_falls_back_to_translate_output_when_never_executed(
+        self, strategy, nl_to_sparql, vkg_translator
+    ):
+        """A translator that returns rows without recording ``executed_sql`` (older
+        shape / no qualification step) must still report SQL rather than an empty
+        string — the fallback keeps the debug field populated."""
+        nl_to_sparql.translate.return_value = _make_sparql_result()
+        vkg_translator.resolve.return_value = _make_tier2_result(executed_sql=None)
+
+        result = await strategy.resolve("How many orders?", "ns1", _make_context())
+
+        assert result is not None
+        assert result.sql == "SELECT col FROM tbl"
 
     @pytest.mark.asyncio
     async def test_sparql_translation_substeps_replayed(self, strategy, nl_to_sparql, vkg_translator):

@@ -144,6 +144,11 @@ def deserialize_form(payload: dict[str, Any], *, data_source_id: str = "") -> Ta
                 target_column=fk.get("target_column", ""),
                 source=fk.get("source", ""),
                 confidence=float(fk.get("confidence", 0.0)),
+                # Defaults keep FKs stored before these fields existed valid:
+                # a missing reviewStatus deserialises to "" (grandfathered).
+                review_status=fk.get("review_status", ""),
+                target_datasource_id=fk.get("target_datasource_id", ""),
+                provenance=fk.get("provenance", ""),
             )
             for fk in foreign_keys_raw
             if isinstance(fk, dict)

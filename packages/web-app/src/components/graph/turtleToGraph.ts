@@ -142,6 +142,22 @@ export function turtleToGraph(turtle: string): TurtleGraphData {
   }
 
   const nodes: TurtleGraphNode[] = [];
+  // Attributes (datatype properties) grouped by their domain class, so the
+  // graph can reveal a class's attributes on hover without making 800+
+  // permanent nodes. Each entry is { label, range } in declaration order.
+  const attributesByClass: Record<
+    string,
+    Array<{ label: string; range?: string }>
+  > = {};
+  for (const prop of datatypeProps) {
+    const domain = propDomain[prop];
+    if (!domain || !classes.has(domain)) continue;
+    (attributesByClass[domain] ??= []).push({
+      label: labels[prop] ?? localName(prop),
+      range: propRange[prop] ? localName(propRange[prop]) : undefined,
+    });
+  }
+
   for (const iri of classes) {
     nodes.push({
       id: iri,
@@ -155,6 +171,7 @@ export function turtleToGraph(turtle: string): TurtleGraphData {
         pkColumns: pkColumns[iri]?.map(localName),
         isGrounded: !!groundedTo[iri],
         groundedTo: groundedTo[iri] ? localName(groundedTo[iri]) : undefined,
+        attributes: attributesByClass[iri] ?? [],
       },
     });
   }

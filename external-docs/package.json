@@ -1,7 +1,7 @@
 {
   "name": "ontology-accelerator-docs",
   "private": true,
-  "version": "0.3.2",
+  "version": "0.3.3",
   "type": "module",
   "scripts": {
     "dev": "vite --port 5175",
@@ -19,7 +19,8 @@
   },
   "pnpm": {
     "overrides": {
-      "postcss": "8.5.22"
+      "postcss": "8.5.23",
+      "@ai-sdk/provider-utils": "4.0.33"
     }
   },
   "devDependencies": {

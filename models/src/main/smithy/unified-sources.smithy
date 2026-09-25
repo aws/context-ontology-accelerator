@@ -374,6 +374,19 @@ structure ForeignKeyOutput {
 
     /// Inference confidence (0.0-1.0) for AI-inferred keys.
     confidence: Float
+
+    /// Steward review state for an inferred relationship (#1088): PENDING_REVIEW,
+    /// APPROVED, or REJECTED. Empty for authoritative keys (deterministic/steward)
+    /// and keys predating review. Only APPROVED/authoritative keys reach the ontology.
+    reviewStatus: String
+
+    /// Datasource id of the target table when the relationship crosses a source
+    /// boundary (#1088). Empty for a within-source key.
+    targetDatasourceId: String
+
+    /// Human-readable note of what an inferred relationship was inferred from,
+    /// shown to the steward at review time (#1088).
+    provenance: String
 }
 
 list ForeignKeyList {
@@ -555,6 +568,20 @@ structure ForeignKeyInput {
 
     /// Referenced column in the target table.
     targetColumn: String
+
+    /// Origin of the key. Preserved on a steward review so an approved inferred
+    /// relationship keeps its AI_INFERRED provenance (#1088).
+    source: String
+
+    /// Steward review decision for an inferred relationship (#1088): APPROVED or
+    /// REJECTED. Omitted for a plain steward-authored edit (treated as approved).
+    reviewStatus: String
+
+    /// Datasource id of the target table for a cross-source relationship (#1088).
+    targetDatasourceId: String
+
+    /// Provenance note, preserved across a review round-trip (#1088).
+    provenance: String
 }
 
 list ForeignKeyInputList {

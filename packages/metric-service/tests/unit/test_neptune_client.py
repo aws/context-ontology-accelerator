@@ -431,7 +431,7 @@ class TestResolveClassUris:
                 "bindings": [
                     {
                         "label": {"value": "Order"},
-                        "cls": {"value": f"{GRAPH_BASE_URI}/namespace/ns/ontology/x/Order"},
+                        "cls": {"type": "uri", "value": f"{GRAPH_BASE_URI}/namespace/ns/ontology/x/Order"},
                     },
                 ]
             }
@@ -439,6 +439,40 @@ class TestResolveClassUris:
         result = client.resolve_class_uris("ns", ["Order"])
         mock_query.assert_called_once()
         assert result == [f"{GRAPH_BASE_URI}/namespace/ns/ontology/x/Order"]
+
+    @pytest.mark.parametrize(
+        "class_binding",
+        [
+            {"type": "uri", "value": "not-an-absolute-iri"},
+            {"type": "uri", "value": "ftp://example.org/Order"},
+            {"type": "literal", "value": "http://example.org/Order"},
+            {"type": "uri", "value": 123},
+            {"type": "uri", "value": "http://example.org/not a valid iri"},
+        ],
+        ids=["relative", "unsupported-scheme", "wrong-binding-type", "non-string", "unsafe"],
+    )
+    @patch("coa_metrics.neptune_client._sparql_query")
+    def test_resolve_rejects_malformed_neptune_uri_as_protocol_error(
+        self,
+        mock_query: patch,
+        client: MetricNeptuneClient,
+        class_binding: dict[str, object],
+    ) -> None:
+        mock_query.return_value = {
+            "results": {
+                "bindings": [
+                    {
+                        "label": {"value": "Order"},
+                        "cls": class_binding,
+                    },
+                ]
+            }
+        }
+
+        with pytest.raises(ValueError, match="ontology resolver") as raised:
+            client.resolve_class_uris("ns", ["Order"])
+
+        assert raised.value.__class__ is ValueError
 
     @patch("coa_metrics.neptune_client._sparql_query")
     def test_resolve_drops_unresolvable(self, mock_query: patch, client: MetricNeptuneClient) -> None:
@@ -449,7 +483,9 @@ class TestResolveClassUris:
     @patch("coa_metrics.neptune_client._sparql_query")
     def test_resolve_mixes_iris_and_labels(self, mock_query: patch, client: MetricNeptuneClient) -> None:
         mock_query.return_value = {
-            "results": {"bindings": [{"label": {"value": "Order"}, "cls": {"value": "http://example.org/Order"}}]}
+            "results": {
+                "bindings": [{"label": {"value": "Order"}, "cls": {"type": "uri", "value": "http://example.org/Order"}}]
+            }
         }
         result = client.resolve_class_uris("ns", ["http://full.uri/X", "Order"])
         assert result == ["http://full.uri/X", "http://example.org/Order"]

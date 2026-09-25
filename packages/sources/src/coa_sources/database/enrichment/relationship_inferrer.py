@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 from collections import Counter
 
+from coa_common.bedrock import BedrockTruncationError
 from coa_common.domain_models import EnrichmentSource, ForeignKey, Table
 
 from coa_sources.database.enrichment.bedrock_client import BedrockClient
@@ -117,18 +118,46 @@ def infer_relationships(tables: list[Table], client: BedrockClient, emitter: Enr
     return _deduplicate(all_candidates)
 
 
+def _infer_batch_raw(
+    system_prompt: str,
+    user_prompt: str,
+    client: BedrockClient,
+    emitter: EnrichmentMetricEmitter,
+    *,
+    stage: str,
+    max_tokens: int = 8192,
+) -> object:
+    """Invoke Bedrock once and return the parsed result, emitting success metrics.
+
+    Shared by the within-source Pass 2 and the cross-source pass so the Bedrock
+    call + metric emission live in one place. Raises on error (the caller decides
+    how to degrade and which error metric to emit).
+    """
+    invocation = client.invoke(system_prompt, user_prompt, max_tokens=max_tokens)
+    emitter.emit_bedrock_invocation_metrics(
+        stage=stage,
+        latency_ms=invocation.latency_ms,
+        input_tokens=invocation.input_tokens,
+        output_tokens=invocation.output_tokens,
+    )
+    return invocation.result
+
+
 def _infer_batch(tables: list[Table], client: BedrockClient, emitter: EnrichmentMetricEmitter) -> list[dict]:
     """Single Bedrock call for one batch of tables."""
     user_prompt = build_relationship_prompt(tables)
     try:
-        invocation = client.invoke(RELATIONSHIP_SYSTEM_PROMPT, user_prompt, max_tokens=8192)
-        result = invocation.result
-        emitter.emit_bedrock_invocation_metrics(
-            stage="Pass2",
-            latency_ms=invocation.latency_ms,
-            input_tokens=invocation.input_tokens,
-            output_tokens=invocation.output_tokens,
+        result = _infer_batch_raw(RELATIONSHIP_SYSTEM_PROMPT, user_prompt, client, emitter, stage="Pass2")
+    except BedrockTruncationError as exc:
+        logger.warning(
+            "Pass 2 batch truncated (%d tables): model=%s output_tokens=%d requested_max_tokens=%d",
+            len(tables),
+            exc.model_id,
+            exc.output_tokens,
+            exc.max_tokens,
         )
+        emitter.emit_bedrock_invocation_error(stage="Pass2", exc=exc)
+        return []
     except Exception as exc:
         logger.warning("Pass 2 batch failed (%d tables)", len(tables), exc_info=True)
         emitter.emit_bedrock_invocation_error(stage="Pass2", exc=exc)

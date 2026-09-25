@@ -57,6 +57,29 @@ describe("buildContentSecurityPolicy", () => {
     );
   });
 
+  it("also allows the legacy global S3 host in connect-src (us-east-1 presigns it)", () => {
+    // Regression for issue #211: boto3 presigns S3 URLs for a us-east-1 bucket
+    // using the legacy global virtual-hosted host `<bucket>.s3.amazonaws.com`
+    // (no region segment), NOT the regional `s3.us-east-1.amazonaws.com`. The
+    // region-only allowlist above never matches it, so the browser refuses the
+    // presigned proposal fetch with "Failed to fetch" and the proposal detail
+    // page shows "Could not load proposal". The global host must be allowlisted
+    // alongside the regional forms. Both the virtual-hosted wildcard and the
+    // path-style host are included, mirroring the regional pair.
+    const csp = parse(
+      buildContentSecurityPolicy({
+        ...baseConfig,
+        apiEndpoint: "https://api.example.cloudfront.net/prod",
+      }),
+    );
+    expect(csp["connect-src"]).toEqual(
+      expect.arrayContaining([
+        "https://*.s3.amazonaws.com",
+        "https://s3.amazonaws.com",
+      ]),
+    );
+  });
+
   it("blocks inline/cross-origin scripts with script-src 'self'", () => {
     const csp = parse(buildContentSecurityPolicy(baseConfig));
     expect(csp["script-src"]).toEqual(["'self'"]);

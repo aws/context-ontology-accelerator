@@ -18,7 +18,9 @@ vi.mock("@components/ControlPlaneClientProvider", () => ({
 }));
 
 vi.mock("@coa/control-plane-client", () => ({
-  GetIngestStatusCommand: vi.fn().mockImplementation((input) => ({ input })),
+  GetIngestStatusCommand: vi.fn().mockImplementation(function (input) {
+    return { input };
+  }),
 }));
 
 // ---------------------------------------------------------------------------

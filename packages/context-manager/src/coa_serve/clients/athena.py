@@ -30,6 +30,7 @@ from coa_common import resolve_region, sync_boto_config
 
 from ..query_utils import validate_namespace
 from ..tier2.sql_firewall import NamespaceSQLScopeError, SQLFirewall
+from ..tier2.table_qualifier import is_fully_catalog_qualified_ast
 from .base import QueryResult, instrumented
 from .sources_registry import SourcesRegistry
 
@@ -187,25 +188,48 @@ class AthenaQueryExecutor:
         # inject a dialect-aware LIMIT into the SQL itself (not just the
         # result-fetch cap) so large scans don't execute fully on the Athena side.
         # Mirrors the JDBC path's sqlglot LIMIT injection (source_db._inject_limit).
-        sql = self._inject_limit(sql, max_rows)
+        #
+        # Parsed once and shared with the qualification check below: both need the
+        # AST, and injecting a LIMIT cannot change the qualification answer (a
+        # LIMIT clause adds no table references), so the pre-injection AST is the
+        # right input for both. Re-parsing the same statement costs ~1.7 ms per KB,
+        # synchronously, on every Tier-2 query.
+        parsed = self._try_parse(sql)
+        sql = self._inject_limit(sql, max_rows, parsed)
 
         # Applied to every dialect-Trino query, not just federated ones: the alias
         # collision is a property of the SQL Ontop generates, not of the catalog
         # it runs against.
         sql = self._disambiguate_table_aliases(sql)
 
-        context = await self._resolve_catalog_and_database(namespace, data_source_id, database)
-        resolved_catalog, resolved_db = context.catalog, context.database
-        await self._authorize_qualified_references(sql, namespace, resolved_catalog)
-        if resolved_catalog and context.rewrite_crawled_names:
-            original_sql = sql
-            sql = self._rewrite_table_names_for_federation(sql, resolved_db)
-            logger.info(
-                "athena_federation_resolved",
-                catalog=resolved_catalog,
-                database=resolved_db,
-                rewritten=sql != original_sql,
-            )
+        # SQL whose every table reference already carries a catalog is
+        # self-describing: Athena resolves each name against its own qualifier and
+        # ignores the QueryExecutionContext entirely (verified — a qualified query
+        # succeeds with a context Database that does not exist, and with no
+        # context at all). Resolving a single catalog for it would be meaningless,
+        # and _rewrite_table_names_for_federation — which strips ONE source's
+        # schema prefix — would corrupt the names it did not expect. So skip both.
+        # Unparseable SQL is treated as unqualified, as before.
+        if parsed is not None and is_fully_catalog_qualified_ast(parsed):
+            logger.info("athena_qualified_sql_neutral_context", namespace=namespace)
+            resolved_catalog, resolved_db = "", self._default_database
+            # Still fail-closed on out-of-namespace references: fully-qualified SQL
+            # is exactly what _authorize_qualified_references guards against, so it
+            # MUST run here too. No single default catalog applies, so pass "".
+            await self._authorize_qualified_references(sql, namespace, resolved_catalog)
+        else:
+            context = await self._resolve_catalog_and_database(namespace, data_source_id, database)
+            resolved_catalog, resolved_db = context.catalog, context.database
+            await self._authorize_qualified_references(sql, namespace, resolved_catalog)
+            if resolved_catalog and context.rewrite_crawled_names:
+                original_sql = sql
+                sql = self._rewrite_table_names_for_federation(sql, resolved_db)
+                logger.info(
+                    "athena_federation_resolved",
+                    catalog=resolved_catalog,
+                    database=resolved_db,
+                    rewritten=sql != original_sql,
+                )
         workgroup = self._fixed_workgroup or await self._resolve_workgroup(namespace)
         query_id = await self._start_query(sql, resolved_db, workgroup, catalog=resolved_catalog)
         try:
@@ -267,6 +291,18 @@ class AthenaQueryExecutor:
                 default_catalog=default_catalog,
             )
         except NamespaceSQLScopeError as exc:
+            # Log the rejected reference AND the scope that was authorized, so a
+            # distinct-catalog denial is diagnosable from CloudWatch (the client
+            # message stays generic). Common cause: a native Glue source in a
+            # non-root catalog whose (catalog, database) is not in scope.
+            logger.warning(
+                "namespace_scope_denied",
+                namespace=namespace,
+                reason=str(exc),
+                default_catalog=default_catalog,
+                native_databases=sorted(scope.native_databases),
+                federated_catalog_schemas=sorted(f"{c}.{d}" for c, d in scope.federated_catalog_schemas),
+            )
             raise AthenaQueryError("Access denied: SQL reference is outside the requested namespace") from exc
 
     async def _start_query(self, sql: str, database: str, workgroup: str, catalog: str = "") -> str:
@@ -373,7 +409,18 @@ class AthenaQueryExecutor:
         return rows, columns, bool(next_token) or truncated
 
     @staticmethod
-    def _inject_limit(sql: str, max_rows: int) -> str:
+    def _try_parse(sql: str) -> sqlglot.exp.Expression | None:
+        """Parse ``sql`` for the Trino dialect, or None when it will not parse.
+
+        One shared parse for the callers in :meth:`execute` that each need the AST.
+        """
+        try:
+            return sqlglot.parse_one(sql, dialect="trino")
+        except Exception:
+            return None
+
+    @staticmethod
+    def _inject_limit(sql: str, max_rows: int, parsed: sqlglot.exp.Expression | None = None) -> str:
         """Inject/cap the OUTER-query LIMIT for the Trino/Athena dialect.
 
         the JDBC path injects LIMIT via sqlglot; the Athena path
@@ -391,10 +438,17 @@ class AthenaQueryExecutor:
         - Outer integer LIMIT ≤ max_rows → unchanged.
         Falls back to a textual append if parsing fails or the parsed root is
         not a simple SELECT we can reason about (never raises).
+
+        Args:
+            sql: Statement to cap.
+            max_rows: Row cap for the outer LIMIT.
+            parsed: Pre-parsed AST for ``sql``, when the caller already has one.
+                Mutated in place, as the internally-parsed tree would be. Pass
+                None (the default) to parse here.
         """
-        try:
-            parsed = sqlglot.parse_one(sql, dialect="trino")
-        except Exception:
+        if parsed is None:
+            parsed = AthenaQueryExecutor._try_parse(sql)
+        if parsed is None:
             return _append_limit(sql, max_rows)
 
         # Only the OUTER query's own limit — args.get("limit"), not find() which
@@ -602,6 +656,10 @@ class AthenaQueryExecutor:
         database name.
 
         Skips sources where queryable is explicitly False.
+
+        ``table_qualifier.catalog_for_source`` / ``schema_for_source`` mirror this
+        branching for the cross-source path, which must name the SAME catalog and
+        schema per source; keep the three in step.
         """
         if explicit_database:
             return _CatalogContext(catalog="", database=explicit_database)
@@ -610,8 +668,30 @@ class AthenaQueryExecutor:
             return _CatalogContext(catalog="", database=self._default_database)
 
         if not data_source_id or data_source_id == "default":
-            # Fallback: no routing info available — scan DDB for any DATABASE source.
-            # Works for single-source namespaces; ambiguous for multi-source.
+            # No explicit routing id. Pinning "any DATABASE source" is sound ONLY
+            # when the namespace has exactly one — with two or more, the first-seen
+            # source silently answers for same-named tables that belong to a
+            # DIFFERENT source, running the query against the wrong physical
+            # database. So resolve the SOLE database source when there
+            # is one, and otherwise refuse rather than guess.
+            #
+            # Fully-qualified SQL never reaches this branch — execute() routes it
+            # to the neutral-context path above — so a legitimately cross-source
+            # statement is unaffected; only a BARE statement with no routing id and
+            # an ambiguous (>=2) namespace is refused here.
+            db_count = await self._sources.database_source_count(namespace)
+            if db_count >= 2:
+                logger.warning(
+                    "ambiguous_database_source_no_id",
+                    namespace=namespace,
+                    database_source_count=db_count,
+                )
+                raise AthenaQueryError(
+                    f"ambiguous source: the namespace has {db_count} DATABASE sources and no "
+                    "data_source_id was resolved for an unqualified statement. Qualify each table as "
+                    '"catalog"."schema"."table" or pass an explicit data_source_id so it does not run '
+                    "against the wrong source."
+                )
             source = await self._sources.find_database_source(namespace)
         else:
             # Targeted lookup by source ID (from VKG datasourceRouting or caller).

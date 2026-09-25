@@ -36,7 +36,9 @@ vi.mock("oidc-client-ts", () => {
     },
   };
   return {
-    UserManager: vi.fn(() => mockUserManager),
+    UserManager: vi.fn(function () {
+      return mockUserManager;
+    }),
     WebStorageStateStore: vi.fn(),
   };
 });

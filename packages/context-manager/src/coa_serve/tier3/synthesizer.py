@@ -144,6 +144,7 @@ class Synthesizer:
         bedrock_client: LLMClient,
         guardrail_id: str,
         *,
+        guardrail_id_provider: Callable[[], str] | None = None,
         chunk_screener=None,
         max_prompt_chunks: int | None = MAX_PROMPT_CHUNKS,
     ):
@@ -153,6 +154,11 @@ class Synthesizer:
             bedrock_client: LLM client used for synthesis.
             guardrail_id: Bedrock guardrail id; required in non-local environments
                 unless ``ALLOW_NO_GUARDRAIL=true``.
+            guardrail_id_provider: Optional callable returning the guardrail id
+                LIVE on each call; when supplied it takes precedence over
+                ``guardrail_id`` at the synthesis call sites so an operator's SSM
+                change reaches warm instances. Startup validation still
+                reflects ``guardrail_id``.
             chunk_screener: Optional screener applied to chunks at query time.
             max_prompt_chunks: Cap on how many chunks are rendered into the
                 synthesis prompt. The hand-rolled / lexical paths keep the default
@@ -166,6 +172,7 @@ class Synthesizer:
         """
         self._bedrock = bedrock_client
         self._guardrail_id = guardrail_id
+        self._guardrail_id_provider = guardrail_id_provider
         self._chunk_screener = chunk_screener  # Optional GuardrailScreener for query-time screening
         self._max_prompt_chunks = max_prompt_chunks
         if not guardrail_id:
@@ -179,10 +186,29 @@ class Synthesizer:
                 "synthesizer_no_guardrail", msg="Content filtering disabled — guardrail_id is empty", environment=env
             )
 
+    def _effective_guardrail_id(self) -> str | None:
+        """Resolve the guardrail id LIVE via the provider when injected.
+
+        Falls back to the construction-time ``guardrail_id`` when no provider is
+        wired. Returns ``None`` for an empty id to match the call-site's existing
+        ``self._guardrail_id or None`` convention.
+        """
+        if self._guardrail_id_provider is not None:
+            gid = self._guardrail_id_provider()
+            return gid or None
+        return self._guardrail_id or None
+
     @property
     def has_guardrail(self) -> bool:
-        """Whether a Bedrock guardrail is configured (and therefore runs at synthesis)."""
-        return bool(self._guardrail_id)
+        """Whether a Bedrock guardrail is configured LIVE (and therefore runs at synthesis).
+
+        Reads through :meth:`_effective_guardrail_id` so this tracks the live
+        provider value, not the frozen construction-time id. The
+        ``knowledge_retriever`` gates emission of the ``t3.guardrail`` trace step
+        on this (only record "ran and passed" when a guardrail actually ran), so
+        it must reflect the same effective id the synthesis converse used.
+        """
+        return bool(self._effective_guardrail_id())
 
     async def synthesize(
         self,
@@ -236,7 +262,7 @@ class Synthesizer:
         result = await self._bedrock.converse(
             prompt=prompt,
             system=system_instruction,
-            guardrail_id=self._guardrail_id or None,
+            guardrail_id=self._effective_guardrail_id(),
             guard_content=guard_content,
             model_id=model_id,
             max_tokens=_synth_max_tokens(),
@@ -322,7 +348,7 @@ class Synthesizer:
             async for token in self._bedrock.converse_stream(
                 prompt=prompt,
                 system=system_instruction,
-                guardrail_id=self._guardrail_id or None,
+                guardrail_id=self._effective_guardrail_id(),
                 guard_content=guard_content,
                 model_id=model_id,
                 max_tokens=_synth_max_tokens(),
@@ -380,7 +406,7 @@ class Synthesizer:
             result = await self._bedrock.converse(
                 prompt=prompt,
                 system=system_instruction,
-                guardrail_id=self._guardrail_id or None,
+                guardrail_id=self._effective_guardrail_id(),
                 guard_content=guard_content,
                 model_id=model_id,
                 max_tokens=_synth_max_tokens(),

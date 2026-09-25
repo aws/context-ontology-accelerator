@@ -1,6 +1,6 @@
 [project]
 name = "coa-sources"
-version = "0.3.2"
+version = "0.3.3"
 description = "Unified Sources for Context Ontology Accelerator"
 requires-python = ">=3.12"
 

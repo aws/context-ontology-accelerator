@@ -19,7 +19,9 @@ vi.mock("@components/ControlPlaneClientProvider", () => ({
 }));
 
 vi.mock("@coa/control-plane-client", () => ({
-  ListSourcesCommand: vi.fn().mockImplementation((input) => ({ input })),
+  ListSourcesCommand: vi.fn().mockImplementation(function (input) {
+    return { input };
+  }),
   SourceType: { DATABASE: "DATABASE", DOCUMENTS: "DOCUMENTS" },
 }));
 

@@ -417,6 +417,103 @@ ex:CustomerMap a rr:TriplesMap ;
     assert routing["CUSTOMER"]["sourceSchema"] == "public"
 
 
+def _write_two_source_mappings(tmp_path, name_a: str, name_b: str):
+    """Two TriplesMaps in two datasources, with the given rr:tableName VALUES.
+
+    The values are SQL-delimited identifiers, so their double quotes are escaped
+    for Turtle here — the mapping the inducer writes carries exactly this form.
+    """
+    table_a = '"{}"'.format(name_a.replace('"', '\\"'))
+    table_b = '"{}"'.format(name_b.replace('"', '\\"'))
+    ttl = tmp_path / "mappings.ttl"
+    ttl.write_text(
+        f"""
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix coa: <http://coa.amazon.com/vocab/coa#> .
+@prefix ex: <http://example.com/> .
+
+ex:PgMap a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName {table_a} ] ;
+    coa:datasourceId "ds-pg" ;
+    coa:sourceSchema "public" .
+
+ex:CrmMap a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName {table_b} ] ;
+    coa:datasourceId "ds-crm" ;
+    coa:sourceSchema "crm" .
+""",
+        encoding="utf-8",
+    )
+    return translate_server._load_table_routing(str(ttl))
+
+
+def test_load_table_routing_keys_qualified_table_names(tmp_path):
+    """A schema-qualified rr:tableName is keyed as ``schema.table``.
+
+    Quotes are stripped PER SEGMENT — a whole-string strip would leave the inner
+    quotes in place and the key would never match a SQL reference.
+    """
+    routing = _write_two_source_mappings(tmp_path, '"public"."customers"', '"crm"."customers"')
+    assert routing["public.customers"]["datasourceId"] == "ds-pg"
+    assert routing["CRM.CUSTOMERS"]["datasourceId"] == "ds-crm"
+
+
+def test_load_table_routing_publishes_the_ambiguity_of_a_shared_bare_key(tmp_path):
+    """Both sources answer to bare ``customers``, so the bare key names the
+    candidates instead of resolving to whichever TriplesMap was parsed last.
+
+    Withholding the key entirely (the first fix) made the reference
+    indistinguishable from a table the mapping never declared, and serve reads
+    "absent from the routing map" as "nothing to route" — so it executed the
+    query against whatever catalog the query context happened to default to.
+    The marker carries no ``datasourceId``: there is no right answer to give.
+    """
+    routing = _write_two_source_mappings(tmp_path, '"public"."customers"', '"crm"."customers"')
+    marker = {translate_server.AMBIGUOUS_KEY: "CRM.CUSTOMERS,PUBLIC.CUSTOMERS"}
+    assert routing["customers"] == marker
+    assert routing["CUSTOMERS"] == marker
+    # The qualified keys are unaffected — they are not ambiguous.
+    assert routing["public.customers"]["datasourceId"] == "ds-pg"
+    assert routing["crm.customers"]["datasourceId"] == "ds-crm"
+
+
+def test_resolve_routing_returns_the_ambiguity_marker_for_a_bare_reference(tmp_path):
+    """SQL that says bare ``customers`` gets the marker back, so serve can refuse.
+    Returning nothing would look identical to a table outside the mapping."""
+    translate_server._table_routing = _write_two_source_mappings(tmp_path, '"public"."customers"', '"crm"."customers"')
+    assert translate_server._resolve_routing(["customers"]) == {
+        "customers": {translate_server.AMBIGUOUS_KEY: "CRM.CUSTOMERS,PUBLIC.CUSTOMERS"}
+    }
+
+
+def test_resolve_routing_qualified_shared_name_surfaces_siblings(tmp_path):
+    """A SCHEMA-QUALIFIED reference to a name shared across datasources routes to
+    its own source AND carries the sibling candidates.
+
+    The qualified ref names one physical table unambiguously (so it is not
+    refused), but the bare name it shares still needs the CATALOG to stay
+    context-independent — a caller pinned to the other same-named source's context
+    would otherwise resolve the bare name against the wrong catalog. Serve can only
+    add that catalog if the routing it receives shows the name spans datasources,
+    which is what including the siblings does. Contrast the bare-reference case
+    above, which is refused, not qualified."""
+    translate_server._table_routing = _write_two_source_mappings(tmp_path, '"public"."customers"', '"crm"."customers"')
+    result = translate_server._resolve_routing(["public.customers"])
+    # The referenced table routes to its own source...
+    assert result["public.customers"] == {"datasourceId": "ds-pg", "sourceSchema": "public"}
+    # ...and the sibling is surfaced so serve sees the name spans two datasources.
+    assert result["CRM.CUSTOMERS"] == {"datasourceId": "ds-crm", "sourceSchema": "crm"}
+    assert {v.get("datasourceId") for v in result.values()} == {"ds-pg", "ds-crm"}
+
+
+def test_load_table_routing_keeps_bare_key_when_unambiguous(tmp_path):
+    """A qualified name whose bare form is unique still resolves bare, so SQL that
+    omits the schema (or a legacy consumer) keeps working."""
+    routing = _write_two_source_mappings(tmp_path, '"public"."customers"', '"crm"."orders"')
+    assert routing["customers"]["datasourceId"] == "ds-pg"
+    assert routing["orders"]["datasourceId"] == "ds-crm"
+
+
 def test_load_table_routing_unparseable_file_returns_empty(tmp_path):
     bad = tmp_path / "bad.ttl"
     bad.write_text("this is not valid turtle @@@", encoding="utf-8")

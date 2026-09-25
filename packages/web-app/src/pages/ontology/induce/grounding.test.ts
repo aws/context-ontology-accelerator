@@ -9,6 +9,7 @@ import {
   parseConceptMatches,
   parseConceptMatchesEnvelope,
   normalizeNameKey,
+  qualifiedSqlIdent,
   unquoteSqlIdent,
   type ConceptMatch,
 } from "./grounding";
@@ -90,13 +91,77 @@ describe("unquoteSqlIdent", () => {
   it("returns a plain (un-delimited) value unchanged", () => {
     expect(unquoteSqlIdent('"claims"')).toBe("claims");
   });
+  it("drops the schema qualifier a shared table name carries", () => {
+    // The mapping emits "public"."customers" when two datasources both expose
+    // `customers`; consumers here join on the bare name (#965).
+    expect(unquoteSqlIdent('"\\"public\\".\\"customers\\""')).toBe("customers");
+  });
+  it("keeps a dot that is part of the table name itself", () => {
+    expect(unquoteSqlIdent('"\\"q1.results\\""')).toBe("q1.results");
+  });
+  it("un-doubles an embedded quote", () => {
+    // SQL escapes a quote inside a delimited identifier by doubling it, so
+    // `say"hi` is emitted as `"say""hi"` — one segment, not two.
+    expect(unquoteSqlIdent('"\\"say\\"\\"hi\\""')).toBe('say"hi');
+  });
+  it("keeps only the table of a 3-part name", () => {
+    expect(unquoteSqlIdent('"\\"cat\\".\\"public\\".\\"customers\\""')).toBe(
+      "customers",
+    );
+  });
 });
+
+describe("qualifiedSqlIdent", () => {
+  // The bare name is what the ConceptMatch join needs; the qualified one is what
+  // the class panel shows, so two twins don't both read "Mapping: customers".
+  it("keeps the schema a shared table name carries", () => {
+    expect(qualifiedSqlIdent('"\\"public\\".\\"customers\\""')).toBe(
+      "public.customers",
+    );
+  });
+  it("leaves an unqualified name exactly as it was", () => {
+    expect(qualifiedSqlIdent('"\\"clinical_trial\\""')).toBe("clinical_trial");
+  });
+  it("does not invent a schema for a dot inside the table name", () => {
+    expect(qualifiedSqlIdent('"\\"q1.results\\""')).toBe("q1.results");
+  });
+});
+
+// The RIGOR strategy keys its TriplesMap IRI on ``{schema}.{table}``, so both
+// tables of a schema whose bare names collide with another datasource's carry the
+// SAME leading segment. A ``\w+`` join key stopped at the dot, keyed both on
+// ``public``, and the second silently overwrote the first (#965).
+const RIGOR_QUALIFIED_R2RML = `
+@prefix ind: <http://ex.org/ind#> .
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+
+ind:TriplesMap_public.customers a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "\\"public\\".\\"customers\\"" ] ;
+    rr:subjectMap <http://ex.org/ind#TriplesMap_public.customers/SubjectMap> .
+
+<http://ex.org/ind#TriplesMap_public.customers/SubjectMap> rr:class ind:Customers ;
+    rr:template "http://ex.org/ind#Customers/{id}" .
+
+ind:TriplesMap_public.orders a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "\\"public\\".\\"orders\\"" ] ;
+    rr:subjectMap <http://ex.org/ind#TriplesMap_public.orders/SubjectMap> .
+
+<http://ex.org/ind#TriplesMap_public.orders/SubjectMap> rr:class ind:Orders ;
+    rr:template "http://ex.org/ind#Orders/{id}" .
+`;
 
 describe("classToTableFromR2rml (TriplesMap-id join)", () => {
   it("maps class local names to their real table names across split blocks", () => {
     const m = classToTableFromR2rml(REAL_R2RML);
     expect(m.get("ClinicalTrial")).toBe("clinical_trial");
     expect(m.get("Sponsor")).toBe("sponsor");
+  });
+
+  it("keeps two dotted TriplesMap ids sharing a schema apart", () => {
+    const m = classToTableFromR2rml(RIGOR_QUALIFIED_R2RML);
+    // Bare, because this map is joined against a ConceptMatch's table name.
+    expect(m.get("Customers")).toBe("customers");
+    expect(m.get("Orders")).toBe("orders");
   });
 });
 
@@ -124,6 +189,14 @@ describe("parseR2rmlByClass (TriplesMap-id + POM-id join)", () => {
       "name",
       "sponsor_id",
     ]);
+  });
+
+  it("shows the qualified table so two twins are distinguishable", () => {
+    // "Mapping: customers" on both panels would re-fuse in the UI the two tables
+    // the mapping went out of its way to separate.
+    const byClass = parseR2rmlByClass(RIGOR_QUALIFIED_R2RML);
+    expect(byClass.get("Customers")?.sourceTable).toBe("public.customers");
+    expect(byClass.get("Orders")?.sourceTable).toBe("public.orders");
   });
 
   it("handles the compact inline single-statement form", () => {

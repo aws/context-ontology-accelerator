@@ -88,6 +88,27 @@ class QueryTranslationError(ServeError):
     error_type = "QueryTranslationError"
 
 
+class AmbiguousReferenceError(ServeError):
+    """A query names a table that more than one source or schema answers to — HTTP 400.
+
+    A bare (unqualified) reference whose name exists in two or more of the
+    namespace's sources cannot be attributed to one physical table. Guessing one
+    can return a wrong answer as success (the same name in two databases), so the
+    query is refused rather than run against a guessed source.
+
+    Like :class:`NamespaceScopeDeniedError`, this is a *policy* statement about the
+    query — not sensitive data — so its message IS surfaced to the caller: it names
+    the offending reference and the candidates, and tells the caller how to
+    proceed (qualify the reference, or pass an explicit source). It is a terminal
+    outcome, not a strategy miss: the tier runner must let it propagate to the
+    client instead of falling through to the next strategy, exactly as it does for
+    :class:`AccessDeniedError`.
+    """
+
+    status_code = 400
+    error_type = "AmbiguousReferenceError"
+
+
 class DataSourceUnavailableError(ServeError):
     """Backend data source (OpenSearch, Neptune, Bedrock) unreachable — HTTP 502."""
 

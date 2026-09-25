@@ -395,3 +395,92 @@ class TestGuardrailScreenerDecisionMetrics:
             results = self._screen(response).screen_texts(["poison"])
 
         assert not results[0].passed
+
+
+class TestGuardrailScreenerLiveProvider:
+    """The retrieval guardrail id/version must be read LIVE on each call.
+
+    A long-lived serve screener is constructed once but must reflect an
+    operator's SSM retrieval-guardrail change on its NEXT screening call, with no
+    reconstruction — the retrieval-surface analogue of the input-guardrail fix.
+    The ingestion path passes no provider and must keep using the static value.
+    """
+
+    @staticmethod
+    def _pass_response() -> dict:
+        return {"action": "NONE", "outputs": [{"text": "safe"}], "assessments": []}
+
+    def test_no_provider_uses_static_id_and_version(self):
+        """Back-compat: ingestion path (no provider) calls ApplyGuardrail with the static values."""
+        mock_client = MagicMock()
+        mock_client.apply_guardrail.return_value = self._pass_response()
+        screener = GuardrailScreener(guardrail_id="gr-static", guardrail_version="7", region="us-east-1")
+        screener._client = mock_client
+
+        screener.screen_texts(["hello"])
+
+        kwargs = mock_client.apply_guardrail.call_args.kwargs
+        assert kwargs["guardrailIdentifier"] == "gr-static"
+        assert kwargs["guardrailVersion"] == "7"
+
+    def test_provider_value_reaches_apply_guardrail_call(self):
+        """When a provider is wired, its LIVE value is what ApplyGuardrail receives."""
+        mock_client = MagicMock()
+        mock_client.apply_guardrail.return_value = self._pass_response()
+        screener = GuardrailScreener(
+            guardrail_id="gr-startup",
+            guardrail_version="DRAFT",
+            region="us-east-1",
+            guardrail_id_provider=lambda: "gr-live",
+            guardrail_version_provider=lambda: "3",
+        )
+        screener._client = mock_client
+
+        screener.screen_texts(["hello"])
+
+        kwargs = mock_client.apply_guardrail.call_args.kwargs
+        assert kwargs["guardrailIdentifier"] == "gr-live"
+        assert kwargs["guardrailVersion"] == "3"
+
+    def test_same_instance_reflects_provider_change_without_reconstruction(self):
+        """Live-reload: one warm screener follows an SSM flip mid-life."""
+        mock_client = MagicMock()
+        mock_client.apply_guardrail.return_value = self._pass_response()
+        current = {"id": "gr-old", "ver": "1"}
+        screener = GuardrailScreener(
+            guardrail_id="gr-old",
+            guardrail_version="1",
+            region="us-east-1",
+            guardrail_id_provider=lambda: current["id"],
+            guardrail_version_provider=lambda: current["ver"],
+        )
+        screener._client = mock_client
+
+        screener.screen_texts(["hello"])
+        assert mock_client.apply_guardrail.call_args.kwargs["guardrailIdentifier"] == "gr-old"
+
+        # Operator flips the retrieval guardrail in SSM; SAME instance, next call reflects it.
+        current["id"] = "gr-new"
+        current["ver"] = "2"
+        screener.screen_texts(["hello"])
+        assert mock_client.apply_guardrail.call_args.kwargs["guardrailIdentifier"] == "gr-new"
+        assert mock_client.apply_guardrail.call_args.kwargs["guardrailVersion"] == "2"
+
+    def test_empty_live_value_falls_back_to_static_id(self):
+        """A transiently-empty provider value must not call ApplyGuardrail with an empty id."""
+        mock_client = MagicMock()
+        mock_client.apply_guardrail.return_value = self._pass_response()
+        screener = GuardrailScreener(
+            guardrail_id="gr-static",
+            guardrail_version="9",
+            region="us-east-1",
+            guardrail_id_provider=lambda: "",
+            guardrail_version_provider=lambda: "",
+        )
+        screener._client = mock_client
+
+        screener.screen_texts(["hello"])
+
+        kwargs = mock_client.apply_guardrail.call_args.kwargs
+        assert kwargs["guardrailIdentifier"] == "gr-static"
+        assert kwargs["guardrailVersion"] == "9"

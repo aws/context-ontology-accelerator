@@ -32,6 +32,11 @@ class CatalogConstraint(BaseModel):
     columns: list[str]
     referredColumns: list[str] | None = None
     relationshipType: str | None = None
+    # Governance (#1088). Optional/defaulted so any catalog source that does not
+    # populate them (HTTP data-catalog, fixtures, pre-existing payloads) parses
+    # unchanged and is treated as authoritative/grandfathered by the gate.
+    reviewStatus: str | None = None
+    targetDatasourceId: str | None = None
 
 
 def parse_referred_column(ref: str) -> tuple[str, str | None]:

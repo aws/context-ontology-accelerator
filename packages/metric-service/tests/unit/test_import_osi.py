@@ -120,7 +120,7 @@ class TestImportOsiHandler:
         mock_lookup.return_value = lookup
 
         neptune = MagicMock()
-        neptune.get_metric.return_value = MagicMock()  # Metric exists
+        neptune.get_metric.return_value = MagicMock(defined_by="steward@example.com")
         mock_neptune.return_value = neptune
 
         opensearch = MagicMock()
@@ -133,6 +133,9 @@ class TestImportOsiHandler:
         body = json.loads(response["body"])
         assert body["metricsCreated"] == 0
         assert body["metricsUpdated"] == 1
+        assert body["warnings"] == [
+            "Metric 'simple_count' overwritten (had existing metadata authored by steward@example.com)"
+        ]
 
         neptune.update_metric.assert_called_once()
 

@@ -150,7 +150,19 @@ class AgenticStrategy:
         self._graph_client = graph_client
 
     async def resolve(self, query: str, namespace: str, context: StrategyContext) -> StrategyResult | None:
-        """Run the bounded tool-use agent; return a StrategyResult or None on miss."""
+        """Run the bounded tool-use agent; return a StrategyResult or None on miss.
+
+        Scope: this opt-in ``deep-reasoning`` path is SINGLE-SOURCE. It executes
+        through ``SqlExecutionService`` and does NOT run
+        ``table_qualifier.prepare_execution_sql``, so it does not rewrite bare table
+        names to ``catalog.schema.table``. A genuinely cross-source query on this
+        path therefore reproduces the cross-source failure (bare names -> Athena TABLE_NOT_FOUND). It is
+        never the default or a fallback (StructuredQueryTier engages it only when a
+        request pins ``options.strategy="deep-reasoning"``), and the qualifier-backed
+        ``ontop`` and ``nl_to_sql`` strategies cover cross-source. Threading
+        qualification through the agentic tool loop + SqlExecutionService is a
+        separate change; until then, treat deep-reasoning as single-source-only.
+        """
         if not self._query_executor:
             context.trace.record(StepId.T2_SQL_EXECUTE, "skipped", 0, detail="no query_executor configured")
             return None

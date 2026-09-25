@@ -8,6 +8,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 import pytest
+from botocore.config import Config
 from botocore.exceptions import ClientError
 from coa_common.dao import DynamoDBDAO, PaginatedResult, QueryParams
 from coa_common.dao.base import DatastoreDAO
@@ -23,6 +24,30 @@ class TestDatastoreDAOABC:
     def test_cannot_instantiate(self):
         with pytest.raises(TypeError):
             DatastoreDAO()  # type: ignore[abstract]
+
+
+class TestDynamoDBDAOConfig:
+    def test_defaults_to_async_config(self):
+        sentinel = MagicMock()
+        with (
+            patch("coa_common.dao.dynamodb.async_boto_config", return_value=sentinel) as config_factory,
+            patch("coa_common.dao.dynamodb.boto3.resource") as resource,
+        ):
+            DynamoDBDAO("test-table", region="us-east-1")
+
+        config_factory.assert_called_once_with()
+        assert resource.call_args.kwargs["config"] is sentinel
+
+    def test_passes_supplied_config_to_boto3(self):
+        config = Config(read_timeout=7, retries={"mode": "standard", "max_attempts": 1})
+        with (
+            patch("coa_common.dao.dynamodb.async_boto_config") as config_factory,
+            patch("coa_common.dao.dynamodb.boto3.resource") as resource,
+        ):
+            DynamoDBDAO("test-table", region="us-east-1", config=config)
+
+        config_factory.assert_not_called()
+        assert resource.call_args.kwargs["config"] is config
 
 
 @pytest.fixture()

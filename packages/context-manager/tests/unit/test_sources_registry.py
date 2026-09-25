@@ -148,6 +148,35 @@ class TestSourcesRegistry:
         assert result is None
 
     @pytest.mark.asyncio
+    async def test_database_source_count_zero(self):
+        """No DATABASE source → 0 (caller must treat as 'cannot confirm single-source')."""
+        registry = self._make_registry_with_query([{"sourceType": "S3", "sourceId": "s3-1"}])
+        assert await registry.database_source_count("ns-1") == 0
+
+    @pytest.mark.asyncio
+    async def test_database_source_count_single(self):
+        """Exactly one DATABASE source → 1 (the safe-to-pin single-source case)."""
+        registry = self._make_registry_with_query(
+            [
+                {"sourceType": "DATABASE", "sourceId": "db-1"},
+                {"sourceType": "S3", "sourceId": "s3-1"},
+            ]
+        )
+        assert await registry.database_source_count("ns-1") == 1
+
+    @pytest.mark.asyncio
+    async def test_database_source_count_multiple(self):
+        """Two or more DATABASE sources → the count (the ambiguous multi-source case)."""
+        registry = self._make_registry_with_query(
+            [
+                {"sourceType": "DATABASE", "sourceId": "db-1"},
+                {"sourceType": "DATABASE", "sourceId": "db-2"},
+                {"sourceType": "DATABASE", "sourceId": "db-3"},
+            ]
+        )
+        assert await registry.database_source_count("ns-1") == 3
+
+    @pytest.mark.asyncio
     async def test_find_sole_database_source_filters_non_database(self):
         registry = self._make_registry_with_query(
             [
@@ -206,6 +235,129 @@ class TestSourcesRegistry:
         assert scope is not None
         assert scope.native_databases == frozenset({"tenant_a_glue"})
         assert scope.federated_catalog_schemas == frozenset({("sclds_a", "sales"), ("sclds_a", "analytics")})
+
+    @pytest.mark.asyncio
+    async def test_sql_namespace_scope_native_glue_source_in_distinct_catalog(self):
+        """A native Glue source declaring a distinct (non-root) ``athenaCatalog`` is
+        authorized under THAT catalog keyed by its Glue database — matching how the
+        executor addresses ``<athenaCatalog>.<database>.<table>`` — so a correctly
+        qualified cross-catalog reference is not denied. A root ``athenaCatalog`` stays
+        on the native-database path.
+        """
+        registry = self._make_registry_with_query(
+            [
+                {
+                    "sourceType": "DATABASE",
+                    "athenaDatabase": "orders_db",
+                    "athenaCatalog": "AwsDataCatalog",
+                    "queryable": True,
+                },
+                {
+                    "sourceType": "DATABASE",
+                    "athenaDatabase": "customers_db",
+                    "athenaCatalog": "coa_integ_xcat_abc123",
+                    "athenaCatalogOwnershipVerified": True,
+                    "queryable": True,
+                },
+            ]
+        )
+
+        scope = await registry.sql_namespace_scope("ns-x")
+
+        assert scope is not None
+        # The root-catalog source stays native; the distinct-catalog source is keyed
+        # by (catalog, database) under federated_catalog_schemas.
+        assert scope.native_databases == frozenset({"orders_db"})
+        assert scope.federated_catalog_schemas == frozenset({("coa_integ_xcat_abc123", "customers_db")})
+
+    @pytest.mark.asyncio
+    async def test_sql_namespace_scope_unverified_catalog_not_authorized(self):
+        """A distinct ``athenaCatalog`` WITHOUT the ownership-verified marker
+        (a legacy or seeded row) must NOT be promoted into the authorization
+        oracle — ``athenaCatalog`` is derived from a caller-supplied ``catalogId``
+        and only ``assert_namespace_may_catalog`` at create makes it trustworthy.
+        The source falls through to its native database instead of being dropped."""
+        registry = self._make_registry_with_query(
+            [
+                {
+                    "sourceType": "DATABASE",
+                    "athenaDatabase": "customers_db",
+                    "athenaCatalog": "someone_elses_catalog",
+                    # no athenaCatalogOwnershipVerified marker
+                    "queryable": True,
+                },
+            ]
+        )
+
+        scope = await registry.sql_namespace_scope("ns-x")
+
+        assert scope is not None
+        # NOT added under the unowned catalog...
+        assert scope.federated_catalog_schemas == frozenset()
+        # ...but still addressable via its native database (additive fall-through).
+        assert scope.native_databases == frozenset({"customers_db"})
+
+    @pytest.mark.asyncio
+    async def test_sql_namespace_scope_verified_marker_required_exact_true(self):
+        """The marker gate is strict: a truthy-but-not-True value (e.g. a stray
+        string) does not authorize the nested catalog."""
+        registry = self._make_registry_with_query(
+            [
+                {
+                    "sourceType": "DATABASE",
+                    "athenaDatabase": "customers_db",
+                    "athenaCatalog": "coa_integ_xcat_abc123",
+                    "athenaCatalogOwnershipVerified": "yes",  # not the boolean True
+                    "queryable": True,
+                },
+            ]
+        )
+
+        scope = await registry.sql_namespace_scope("ns-x")
+
+        assert scope is not None
+        assert scope.federated_catalog_schemas == frozenset()
+        assert scope.native_databases == frozenset({"customers_db"})
+
+    @pytest.mark.asyncio
+    async def test_marker_contract_serve_reads_exact_field_written_by_create_path(self):
+        """CROSS-PACKAGE CONTRACT (F5): serve authorizes a nested catalog ONLY via the
+        field ``athenaCatalogOwnershipVerified``, which is the exact attribute the
+        sources create-path writes (packages/sources/.../database_routes.py:
+        ``item["athenaCatalogOwnershipVerified"] = True``; asserted on the write side by
+        packages/sources/.../test_database_routes.py::
+        ``test_create_glue_source_records_the_declared_catalog_without_system_authority``).
+
+        This test pins the READ side of that contract: a row carrying exactly that
+        field+value is authorized, and the SAME row with the field renamed is NOT — so
+        a rename on either side (write or read) turns one of the paired tests red. It
+        deliberately does not import coa_sources (its package init has a circular import
+        under the serve test env); the paired sources test guards the write side.
+        """
+        _MARKER = "athenaCatalogOwnershipVerified"  # the one contract string
+        base_row = {
+            "sourceType": "DATABASE",
+            "athenaDatabase": "customers_db",
+            "athenaCatalog": "coa_ds_owned_cat",
+            "queryable": True,
+        }
+        # With the exact marker field=True → authorized.
+        reg_ok = self._make_registry_with_query([{**base_row, _MARKER: True}])
+        scope_ok = await reg_ok.sql_namespace_scope("ns-x")
+        assert scope_ok is not None
+        assert ("coa_ds_owned_cat", "customers_db") in scope_ok.federated_catalog_schemas, (
+            f"serve must authorize a nested catalog when the row carries {_MARKER}=True"
+        )
+        # Same row, marker under any OTHER field name → NOT authorized (proves serve
+        # keys on this exact field, so a write-side rename would break authorization).
+        reg_renamed = self._make_registry_with_query([{**base_row, "athenaCatalogVerified_RENAMED": True}])
+        scope_renamed = await reg_renamed.sql_namespace_scope("ns-x")
+        assert scope_renamed is not None
+        assert scope_renamed.federated_catalog_schemas == frozenset(), (
+            f"serve authorized a nested catalog WITHOUT {_MARKER} — it is not keying on the contract field, "
+            "so a create-path that wrote the marker under a different name would be silently trusted"
+        )
+        assert scope_renamed.native_databases == frozenset({"customers_db"})
 
     @pytest.mark.asyncio
     async def test_find_sole_database_source_not_available(self):

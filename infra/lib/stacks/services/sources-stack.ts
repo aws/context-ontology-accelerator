@@ -484,7 +484,10 @@ export class SourcesStack extends SCLStack {
       memorySize: 1024,
       vpc,
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
-      securityGroups: [lambdaSecurityGroup],
+      securityGroups: [
+        lambdaSecurityGroup,
+        props.network.discoveryOcspSecurityGroup,
+      ],
       deadLetterQueue: dbConnectorDlq,
       environment: {
         SOURCES_TABLE: this.sourcesTable.tableName,

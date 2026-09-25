@@ -40,6 +40,9 @@ import {
 import { useApiClient } from "@components/ApiClientProvider";
 import {
   OntologyGraphFlow,
+  type GraphAttribute,
+  type GraphEdgeData,
+  type GraphEdgeKind,
   type GraphNodeData,
 } from "@components/graph/OntologyGraphFlow";
 import { turtleToGraph } from "@components/graph/turtleToGraph";
@@ -125,6 +128,37 @@ export function nodeKindFromData(
     return "grounded";
   }
   return "class";
+}
+
+/**
+ * Narrow the untyped ``data.attributes`` from turtleToGraph into GraphAttribute[]
+ * without a type assertion. Silently drops anything malformed.
+ */
+export function toGraphAttributes(
+  value: unknown,
+): GraphAttribute[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const out: GraphAttribute[] = [];
+  for (const item of value) {
+    if (item && typeof item === "object" && "label" in item) {
+      const label = item.label;
+      if (typeof label !== "string") continue;
+      const range =
+        "range" in item && typeof item.range === "string"
+          ? item.range
+          : undefined;
+      out.push({ label, range });
+    }
+  }
+  return out;
+}
+
+export function edgeKindFromData(
+  data: Record<string, unknown> | undefined,
+): GraphEdgeKind {
+  const kind = data?.kind;
+  if (kind === "subClassOf" || kind === "suggestedSubClassOf") return kind;
+  return "objectProperty";
 }
 
 /** A single class entry inside an inferred ConstraintConfig. */
@@ -695,19 +729,21 @@ export function ProposalDetailPage() {
             : (n.id.split(/[#/]/).pop() ?? n.id),
         kind: nodeKindFromData(data),
         uri: n.id,
+        attributes: toGraphAttributes(data.attributes),
       };
     });
     // ``graphData`` is derived from ``editedTurtle`` upstream, so it is the only
     // dependency (isGrounded already lives on each node's data).
   }, [graphData]);
 
-  const flowEdges = useMemo(() => {
+  const flowEdges: GraphEdgeData[] = useMemo(() => {
     if (!graphData) return [];
     return graphData.edges.map((e) => ({
       id: e.id,
       source: e.source,
       target: e.target,
       label: e.label,
+      kind: edgeKindFromData(e.data),
     }));
   }, [graphData]);
 
@@ -1415,7 +1451,7 @@ export function ProposalDetailPage() {
               headerDescription={
                 classCount > MAX_GRAPH_CLASSES
                   ? undefined
-                  : "Hollow purple arrows show subclass relationships. Click a class to inspect inherited properties."
+                  : "Each cluster is a group of related classes; dashed purple arrows show subclass relationships. Click a class to inspect it, zoom in to read relationship names."
               }
             >
               {classCount > MAX_GRAPH_CLASSES ? (
@@ -1425,10 +1461,11 @@ export function ProposalDetailPage() {
                   Use the table and Turtle editor below to review and edit.
                 </Alert>
               ) : (
-                <div style={{ height: 480, position: "relative" }}>
+                <div style={{ height: 560, position: "relative" }}>
                   <OntologyGraphFlow
                     nodes={flowNodes}
                     edges={flowEdges}
+                    layout="force"
                     onNodeSelect={(d) => setSelectedClass(d?.id ?? null)}
                   />
                 </div>

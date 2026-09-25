@@ -33,7 +33,7 @@ import sqlglot
 import sqlglot.errors
 import structlog
 
-from ..tier2.sql_firewall import SQLFirewall
+from ..tier2.sql_firewall import NamespaceSQLScopeError, SQLFirewall
 from .base import QueryExecutor, QueryResult
 from .db_adapters import get_adapter, is_direct_query_engine
 
@@ -203,6 +203,15 @@ class CompositeQueryExecutor:
                 data_source_id=resolved_source_id,
                 target_dialect=target_dialect,
             )
+            # Namespace-scope authorization for the direct-JDBC route. The Athena
+            # and Redshift executors each run this check internally, but the
+            # direct-JDBC executor (source_db.execute) does not — it only enforces
+            # SELECT-only + dangerous-function rules. Without this, a statement that
+            # the router sends to JDBC (a 2-part schema.table, or a mixed
+            # bare/qualified join) could reference a schema OUTSIDE the namespace's
+            # authorized scope and execute unauthorized on the source credential.
+            # Checked on the pre-transpile Trino SQL, which carries the qualifiers.
+            await self._authorize_qualified_references(sql, namespace)
             return await self._source_db.execute(  # type: ignore[union-attr]
                 transpiled_sql,
                 namespace=namespace,
@@ -218,7 +227,22 @@ class CompositeQueryExecutor:
         # target source is confirmed Redshift-capable — otherwise falls through to
         # Athena (deployed default). Uses the same data_source_id the Athena path
         # would; the Redshift executor rewrites to `awsdatacatalog` 3-part names.
-        if self._redshift is not None:
+        #
+        # Guard (mirrors the sole-JDBC guard above): SQL spanning MORE THAN ONE
+        # catalog cannot run on Redshift. Redshift reaches Glue via Spectrum
+        # (`awsdatacatalog` only) and cannot address an Athena federated connector
+        # catalog at all, so a cross-catalog statement must go to Athena — even
+        # when the namespace's sole DATABASE source is Redshift-routed (possible
+        # when the query's other source is Glue/S3, which is not a DATABASE source).
+        catalogs, has_bare_table = self._catalog_analysis(sql)
+        # Keep off Redshift anything it cannot address: >=2 distinct catalogs (a
+        # federated Athena catalog is unreachable via Spectrum, which sees only
+        # awsdatacatalog), AND a bare table mixed with a catalog-qualified one —
+        # that mix is ambiguous exactly as it is for the JDBC path
+        # (_select_jdbc_candidate), so it must fall through to Athena rather than
+        # run on Redshift against a guessed catalog. Both go to Athena federation.
+        redshift_addressable = len(catalogs) < 2 and not (has_bare_table and catalogs)
+        if self._redshift is not None and redshift_addressable:
             redshift_source_id = await self._resolve_redshift_source(namespace, data_source_id)
             if redshift_source_id:
                 logger.info("composite_dispatch", route="redshift_serverless", data_source_id=redshift_source_id)
@@ -243,29 +267,87 @@ class CompositeQueryExecutor:
             timeout_seconds=timeout_seconds,
         )
 
+    async def _authorize_qualified_references(self, sql: str, namespace: str) -> None:
+        """Deny qualified references outside ``namespace`` before the JDBC route runs.
+
+        Mirrors ``AthenaQueryExecutor._authorize_qualified_references`` /
+        ``RedshiftDataQueryExecutor._authorize_qualified_references`` so all three
+        executor routes enforce the same namespace-scope boundary. Bare-table SQL
+        stays on the source-resolved context and needs no extra lookup; any
+        dot-qualified reference can escape that context, so it is fail-closed on an
+        unavailable source inventory. Default catalog is ``awsdatacatalog`` — the
+        same normalization the Redshift route uses — because a direct-JDBC single
+        source carries one implicit catalog.
+        """
+        if self._sources is None:
+            return
+        if not any("." in ref for ref in self._firewall.extract_tables(sql)):
+            return
+        scope = await self._sources.sql_namespace_scope(namespace)
+        if scope is None:
+            raise NamespaceSQLScopeError("Unable to verify SQL references for the requested namespace")
+        try:
+            self._firewall.validate_namespace_sql_scope(
+                sql,
+                native_databases=scope.native_databases,
+                federated_catalog_schemas=scope.federated_catalog_schemas,
+                default_catalog="awsdatacatalog",
+                # The direct-JDBC connection supplies the catalog, so a bare
+                # "schema.table" (the single-source metric form) is authorized on
+                # its schema against ANY authorized catalog — not pinned to
+                # awsdatacatalog, which would deny a federated JDBC source whose
+                # schema lives under its own nested catalog. An explicit 3-part
+                # name is still checked catalog-strict.
+                schema_only=True,
+            )
+        except NamespaceSQLScopeError as exc:
+            logger.warning(
+                "namespace_scope_denied",
+                route="jdbc_direct",
+                namespace=namespace,
+                reason=str(exc),
+                native_databases=sorted(scope.native_databases),
+                federated_catalog_schemas=sorted(f"{c}.{d}" for c, d in scope.federated_catalog_schemas),
+            )
+            raise
+
     def _select_jdbc_candidate(self, sql: str, data_source_id: str) -> bool:
         """Return True if ``sql`` is a single-source candidate for the JDBC path.
 
         True when:
         1. an explicit, resolvable ``data_source_id`` is supplied (the JDBC
-           executor needs it to locate credentials);
-        2. One of:
-           a) EVERY referenced table is qualified to the SAME single catalog
-              (no bare/unqualified table references) — unambiguous catalog routing;
-           b) ALL tables are bare/unqualified — when an explicit data_source_id is
-              provided, bare tables are unambiguous (they belong to that source).
-              This is the NL-to-SQL path: retrieval-based resolution provides the
-              source externally.
+           executor needs it to locate credentials); AND
+        2. the statement does not span more than one catalog and carries no bare
+           reference that could belong to a different source. Concretely, with an
+           explicit source, ALL of these route to JDBC:
+           a) every table qualified to the SAME single catalog (3-part,
+              one catalog) — unambiguous catalog routing;
+           b) every table two-part ``schema.table`` — one implicit (default)
+              catalog, possibly several schemas of the one source; this is the
+              form the schema-restore pass emits for a single-source query and it
+              MUST stay on JDBC (its whole reason to exist);
+           c) all tables bare — bare tables belong to the explicit source (the
+              NL-to-SQL path, where retrieval provides the source externally);
+           d) any mix of the above that still resolves to ≤1 catalog and no bare
+              table alongside a catalog-qualified one.
 
-        Mixed (some qualified to a catalog + some bare) remains ambiguous and
-        routes to Athena federation.
+        Only genuinely ambiguous SQL — two or more distinct catalogs, or a bare
+        table mixed with catalog-qualified ones — routes to Athena federation.
         """
         if not data_source_id or data_source_id == "default":
             return False
         catalogs, has_bare_table = self._catalog_analysis(sql)
-        # All tables qualified to exactly one catalog — unambiguous.
-        # All tables bare + explicit source — unambiguous (single-source routing).
-        return (len(catalogs) == 1 and not has_bare_table) or (len(catalogs) == 0 and has_bare_table)
+        # ≥2 distinct catalogs is genuinely cross-catalog → Athena.
+        if len(catalogs) >= 2:
+            return False
+        # A bare table is unambiguous ONLY when nothing is catalog-qualified
+        # (all-bare, single source). Bare mixed with a catalog is ambiguous.
+        if has_bare_table:
+            return len(catalogs) == 0
+        # No bare tables and ≤1 catalog: single-source, JDBC-eligible. This is the
+        # 3-part-single-catalog case AND the 2-part schema.table case (catalogs is
+        # empty for the latter, which must NOT disqualify it — see the cross-source review).
+        return True
 
     async def _fetch_jdbc_source(self, namespace: str, data_source_id: str) -> dict[str, Any] | None:
         """Return the source record IFF it is direct-JDBC capable AND queryable, else None.
@@ -273,7 +355,8 @@ class CompositeQueryExecutor:
         Source records set ``sourceType=DATABASE`` for BOTH Glue-federated and
         direct-JDBC sources — so sourceType does NOT discriminate. The authoritative
         signal is ``queryEngine`` (set by the control plane's _resolve_query_engine:
-        ``JDBC`` only when a direct dialect exists — PostgreSQL/Redshift today —
+        ``JDBC`` only when a direct dialect exists — PostgreSQL, Redshift, MySQL,
+        and SQL Server today (``jdbc.py:DIRECT_QUERY_ENGINES``) —
         else ``ATHENA``). We additionally require ``queryable is True`` (a JDBC
         source is only queryable after federation provisioning). A Glue/S3 source,
         an Athena-engine source, or a not-yet-queryable source → None (Athena).
@@ -430,18 +513,28 @@ class CompositeQueryExecutor:
         """Return (distinct catalog prefixes, any-bare-table-present) for ``sql``.
 
         Reuses the firewall's AST table extraction (qualified ``catalog.db.table``
-        / ``db.table`` names) — never re-parses. A bare table name (no dotted
-        prefix) cannot be attributed to a catalog, so its presence makes routing
-        ambiguous and forces the Athena path.
+        / ``db.table`` / bare ``table`` names) — never re-parses.
+
+        Only a THREE-part ``catalog.schema.table`` name carries a catalog: its
+        first segment is the Athena catalog and is counted. A TWO-part
+        ``schema.table`` name does NOT — its first segment is a schema and the
+        catalog is the pinned default, so counting it as a catalog would make a
+        single-source, multi-schema query look cross-catalog and misroute it off
+        the direct-JDBC path onto Athena federation (which is exactly what the
+        two-part form exists to avoid). A bare one-part name cannot be attributed
+        to a catalog, so its presence makes catalog routing ambiguous and forces
+        the Athena path. A two-part name is therefore neither: it counts toward no
+        catalog and is not bare.
         """
         catalogs: set[str] = set()
         has_bare_table = False
         for qualified in self._firewall.extract_tables(sql):
             parts = qualified.split(".")
-            if len(parts) >= 2:
+            if len(parts) >= 3:
                 catalogs.add(parts[0])
-            else:
+            elif len(parts) == 1:
                 has_bare_table = True
+            # len(parts) == 2 → schema.table, single implicit catalog: neither.
         return catalogs, has_bare_table
 
     async def resolve_target_dialect(self, namespace: str, data_source_id: str = "") -> str:

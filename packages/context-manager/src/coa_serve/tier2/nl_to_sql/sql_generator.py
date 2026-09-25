@@ -20,7 +20,7 @@ from __future__ import annotations
 import os
 import re
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
@@ -28,6 +28,7 @@ import structlog
 
 from ...clients.base import ConverseResult, LLMClient, VectorClient, VectorHit
 from ..sql_firewall import SQLFirewall
+from ..table_qualifier import AMBIGUOUS_KEY
 
 logger = structlog.get_logger(__name__)
 
@@ -291,6 +292,11 @@ class NLtoSQLResult:
     # self-correction retry can regenerate against the SAME retrieved schema
     # without re-embedding/re-retrieving (see SQLGenerator.correct).
     ddl_context: str = ""
+    # Bare table name -> data_source_id for every retrieved class (see
+    # _hit_table_source_map). Carried so the strategy can qualify CROSS-SOURCE
+    # SQL per shot — including corrected SQL, whose table set may differ — without
+    # holding on to the retrieval hits. Pass it through ``sql_table_routing``.
+    table_sources: dict[str, str] = field(default_factory=dict)
 
 
 class SQLGenerator:
@@ -312,6 +318,8 @@ class SQLGenerator:
         max_tables: int = DEFAULT_MAX_TABLES,
         dialect: str = "athena",
         guardrail_id: str | None = None,
+        *,
+        guardrail_id_provider: Callable[[], str] | None = None,
     ):
         """Configure the LLM/vector clients, FK graph, and generation limits.
 
@@ -326,6 +334,9 @@ class SQLGenerator:
                 the guardrail is applied to the SQL-generation ``converse``
                 call and scoped to the user's question via ``guard_content``
                 (see ``_generate_sql``). ``None`` disables content filtering.
+            guardrail_id_provider: Optional callable returning the guardrail id
+                LIVE on each call; when supplied it takes precedence over
+                ``guardrail_id`` at the generation call site.
         """
         self._llm = llm_client
         self._vector = vector_client
@@ -334,6 +345,20 @@ class SQLGenerator:
         self._max_tables = max_tables
         self._system_prompt = _build_system_prompt(dialect)
         self._guardrail_id = guardrail_id
+        self._guardrail_id_provider = guardrail_id_provider
+
+    def _effective_guardrail_id(self) -> str | None:
+        """Resolve the guardrail id LIVE via the provider when injected.
+
+        Falls back to the construction-time ``guardrail_id`` otherwise. The
+        stored id is already ``str | None``; an empty provider value collapses to
+        ``None`` (equivalent to the disabled state for a non-empty id, the raw
+        value is passed through unchanged).
+        """
+        if self._guardrail_id_provider is not None:
+            gid = self._guardrail_id_provider()
+            return gid or None
+        return self._guardrail_id
 
     @property
     def llm(self) -> LLMClient:
@@ -611,6 +636,7 @@ class SQLGenerator:
             trace_steps=trace,
             data_source_id=resolved_source,
             ddl_context=ddl_context,
+            table_sources=_hit_table_source_map(hits),
         )
 
     async def generate_from_context(
@@ -792,7 +818,7 @@ class SQLGenerator:
             max_tokens=max_tokens,
             temperature=0,
             model_id=model_id,
-            guardrail_id=self._guardrail_id,
+            guardrail_id=self._effective_guardrail_id(),
             # Sent unconditionally: this is the ONLY channel for the user's
             # untrusted question. With a guardrail configured, Bedrock scopes
             # the prompt-attack check to just this block. Without one, the
@@ -934,14 +960,22 @@ def _hit_table_source_map(hits: list[VectorHit]) -> dict[str, str]:
     generated SQL statement can be attributed to a source by the tables it
     actually references.
 
-    Collision handling: if the SAME bare table name appears under DIFFERENT
-    sources (e.g. a ``customers`` table in both a Postgres and a Glue source —
-    plausible since retrieval deliberately mixes sources), the name is marked
-    ``_AMBIGUOUS_SOURCE`` rather than silently keeping the first-seen source.
-    ``_resolve_data_source_from_sql`` treats an ambiguous table as unresolvable
-    so it never pins — and mis-routes to — the wrong physical source.
+    Collision handling: a bare table name claimed by more than one DISTINCT class
+    (by class IRI) is marked ``_AMBIGUOUS_SOURCE`` — not just when the two classes
+    come from different sources, but also when one source exposes two same-named
+    tables in different schemas (``sales.customers`` and ``analytics.customers``).
+    Keying the collision on the source id alone missed that second case: both
+    classes carry the same ``data_source_id``, so the name resolved to that one
+    source and the query silently ran against whichever schema the executor
+    defaulted to — returning a wrong answer as success. The class IRI
+    distinguishes them, and ``_resolve_data_source_from_sql`` /
+    ``sql_table_routing`` both treat an ambiguous table as unroutable so the query
+    is refused rather than mis-routed. Two hits for the SAME class (same IRI, e.g.
+    retrieved via different expansions) are not a collision.
     """
-    mapping: dict[str, str] = {}
+    # name -> {class identity: data_source_id}. A name with two identities is
+    # ambiguous regardless of whether their source ids agree.
+    by_name: dict[str, dict[str, str]] = {}
     for hit in hits:
         ds_id = hit.data_source_id
         if not ds_id:
@@ -949,11 +983,17 @@ def _hit_table_source_map(hits: list[VectorHit]) -> dict[str, str]:
         name = _table_name_from_class_text(hit.text or "")
         if not name:
             continue
-        existing = mapping.get(name)
-        if existing is None:
-            mapping[name] = ds_id
-        elif existing != ds_id:
+        # The class IRI is the stable per-class identity; fall back to the doc id
+        # and then the name so a hit missing both is still counted once.
+        identity = hit.metadata.get("uri") or hit.id or name
+        by_name.setdefault(name, {})[identity] = ds_id
+
+    mapping: dict[str, str] = {}
+    for name, by_identity in by_name.items():
+        if len(by_identity) > 1:
             mapping[name] = _AMBIGUOUS_SOURCE
+        else:
+            mapping[name] = next(iter(by_identity.values()))
     return mapping
 
 
@@ -1021,6 +1061,58 @@ def _context_tables(hits: list[VectorHit], expanded_tables: list[str]) -> list[s
     """
     hit_map = _hit_map(hits)
     return [table for table in expanded_tables if hit_map.get(table)]
+
+
+def table_sources_need_preparation(table_sources: dict[str, str]) -> bool:
+    """True when ``table_sources`` may require schema restoration or qualification.
+
+    The strategy short-circuits ``prepare_execution_sql`` — three sqlglot parses —
+    on the common single-source path. That is only safe when preparation would be
+    a no-op: it is NOT when the hits span two or more real sources (cross-source
+    qualification is needed) OR mark any name ambiguous (the query must be REFUSED,
+    not run against a guessed schema). An ambiguous marker alone yields
+    fewer than two distinct real sources, so a plain ``distinct sources < 2`` check
+    skipped it and the wrong-answer path stayed open.
+    """
+    values = table_sources.values()
+    real = {v for v in values if v != _AMBIGUOUS_SOURCE}
+    return len(real) >= 2 or _AMBIGUOUS_SOURCE in values
+
+
+def sql_table_routing(sql: str, table_sources: dict[str, str]) -> dict[str, dict[str, str]]:
+    """Build a ``datasourceRouting``-shaped map for the tables ``sql`` references.
+
+    Same shape as the VKG translate response's ``datasourceRouting``, so the
+    NL->SQL path can reuse ``table_qualifier.qualify_cross_source_sql``. Scoped to
+    the tables the generated SQL ACTUALLY references, not every retrieved class:
+    retrieval deliberately mixes sources, so an all-hits map would report a
+    cross-source query where the SQL touches only one — and qualifying a
+    single-source query would push it off the direct-JDBC fast path onto Athena.
+
+    An ambiguous table — a bare name ``_hit_table_source_map`` attributed to more
+    than one class — gets an ``AMBIGUOUS_KEY`` marker (candidate named, no
+    ``datasourceId``), mirroring the VKG mapping's marker for a shared name. That
+    is what makes ``prepare_execution_sql`` REFUSE a query touching it rather than
+    run it against a guessed schema and return a wrong answer as success.
+    Dropping the name instead — as an earlier version did — left it
+    indistinguishable from a table outside the map, i.e. nothing to route, so the
+    query executed unqualified. Attributed entries carry no ``sourceSchema``
+    (retrieval hits have none), so the qualifier falls back to the per-source
+    schema.
+    """
+    routing: dict[str, dict[str, str]] = {}
+    if not table_sources:
+        return routing
+    for qualified in SQLFirewall.extract_tables(sql):
+        bare = qualified.split(".")[-1].strip().lower()
+        ds_id = table_sources.get(bare)
+        if not ds_id:
+            continue
+        if ds_id == _AMBIGUOUS_SOURCE:
+            routing[bare] = {AMBIGUOUS_KEY: bare}
+            continue
+        routing[bare] = {"datasourceId": ds_id}
+    return routing
 
 
 def _build_raw_context(hits: list[VectorHit], expanded_tables: list[str]) -> str:

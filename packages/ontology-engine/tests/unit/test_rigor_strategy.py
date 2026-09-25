@@ -1374,6 +1374,176 @@ class TestBuildR2rmlRigorOverride:
         assert (subj, RR["class"], ns.PurchaseOrder) in r
 
 
+class TestBuildR2rmlRigorCrossSourceCollision:
+    """RIGOR must not fuse two datasources' same-named tables.
+
+    Before the identity model, both ``public.customers`` tables were told to
+    declare the same ``ind:Customers`` class and shared one ``TriplesMap_customers``
+    IRI, one ``rr:tableName`` and one subject template — half the data unreachable,
+    plus a mapping whose bare ``rr:tableName`` disagreed with the schema-qualified
+    H2 validation schema, so Ontop rejected the whole namespace.
+    """
+
+    def _colliding_tables(self):
+        def mk(ds, schema, extra_col):
+            return CatalogTable(
+                id=f"{ds}:{schema}.customers",
+                name="customers",
+                fullyQualifiedName=f"{schema}.customers",
+                datasourceId=ds,
+                sourceSchema=schema,
+                columns=[
+                    CatalogColumn(name="id", dataType="BIGINT", constraint="PRIMARY_KEY"),
+                    CatalogColumn(name=extra_col, dataType="VARCHAR"),
+                ],
+                tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["id"])],
+            )
+
+        # Two PostgreSQL sources, both public.customers — the default schema for
+        # every Postgres source, so this is the ordinary two-source case.
+        return [mk("ds-pg1", "public", "name"), mk("ds-pg2", "public", "email")]
+
+    def _proposal_graph(self, prefix, tables):
+        """A proposal graph the LLM would emit given the disambiguated class names."""
+        from coa_ontology.inducer.strategies.base import pascal_names_for, table_identity
+
+        g = Graph()
+        ns = Namespace(prefix)
+        pascal = pascal_names_for(tables)
+        for t in tables:
+            cls = ns[pascal[table_identity(t)]]
+            g.add((cls, RDF.type, OWL.Class))
+            g.add((cls, RDFS.label, Literal(t.name)))
+            for col in t.columns:
+                prop = ns[f"{pascal[table_identity(t)]}_{col.name}"]
+                g.add((prop, RDF.type, OWL.DatatypeProperty))
+                g.add((prop, RDFS.domain, cls))
+                g.add((prop, RDFS.label, Literal(col.name)))
+        return g
+
+    def test_collision_yields_two_distinct_triplesmaps(self):
+        from coa_ontology.inducer.strategies.base import RR
+
+        prefix = "http://ex.org/ind#"
+        tables = self._colliding_tables()
+        proposal = self._proposal_graph(prefix, tables)
+        g = RigorOntologyStrategy().build_r2rml(prefix, tables, {"customers"}, proposal)
+
+        tmaps = set(g.subjects(RDF.type, RR.TriplesMap))
+        assert len(tmaps) == 2, "two same-named tables must not fuse onto one TriplesMap"
+        # Each TriplesMap has exactly one logical table with exactly one tableName.
+        for tm in tmaps:
+            lts = list(g.objects(tm, RR.logicalTable))
+            assert len(lts) == 1
+            assert len(list(g.objects(lts[0], RR.tableName))) == 1
+
+    def test_collision_tablenames_match_h2_schema(self):
+        """Asserted against the DDL TEXT, not against ``logical_table_names``.
+
+        Comparing the mapping's names to that helper's return value would pass even
+        if the helper itself were wrong, because both sides call it. The invariant
+        that actually matters is that Ontop, handed this mapping and this schema.sql,
+        finds every ``rr:tableName`` declared — so the check is: does the generated
+        DDL contain a CREATE for each emitted logical name, and a CREATE SCHEMA for
+        each schema those names reference (H2 rejects a qualified CREATE TABLE whose
+        schema does not exist).
+        """
+        from coa_ontology.inducer.strategies.base import RR
+        from coa_ontology.proposals import _tables_to_h2_ddl
+
+        prefix = "http://ex.org/ind#"
+        tables = self._colliding_tables()
+        proposal = self._proposal_graph(prefix, tables)
+        g = RigorOntologyStrategy().build_r2rml(prefix, tables, {"customers"}, proposal)
+
+        emitted = {str(g.value(lt, RR.tableName)) for lt in g.objects(None, RR.logicalTable)}
+        assert len(emitted) == 2, "the two logical tables must be distinct"
+        # The DDL is generated FROM the mapping's names, exactly as the accept path
+        # does it (proposals._generate_schema_sql passes _mapping_table_names).
+        ddl = _tables_to_h2_ddl(tables, mapping_table_names=emitted)
+        for name in emitted:
+            assert f"CREATE TABLE IF NOT EXISTS {name} (" in ddl, (
+                f"the mapping declares logical table {name} but schema.sql does not create it — "
+                f"Ontop rejects the whole namespace at VKG load. ddl=\n{ddl}"
+            )
+            # Split on the quote-dot-quote BOUNDARY, not on any dot: a table named
+            # ``q1.results`` is one delimited identifier and has no schema.
+            boundary = '"."'
+            schema = f'{name.split(boundary)[0]}"' if boundary in name else ""
+            if schema:
+                assert f"CREATE SCHEMA IF NOT EXISTS {schema};" in ddl, (
+                    f"schema.sql creates {name} without declaring schema {schema}; H2 fails the DDL. ddl=\n{ddl}"
+                )
+        # Both tables declared, so neither set of columns is silently dropped: the
+        # second table's own column is present, which is what fusion destroyed.
+        assert '"email"' in ddl and '"name"' in ddl, ddl
+
+    def test_collision_classes_and_subjects_unfused(self):
+        from coa_ontology.inducer.strategies.base import RR
+
+        prefix = "http://ex.org/ind#"
+        tables = self._colliding_tables()
+        proposal = self._proposal_graph(prefix, tables)
+        g = RigorOntologyStrategy().build_r2rml(prefix, tables, {"customers"}, proposal)
+
+        subj_maps = list(g.objects(None, RR.subjectMap))
+        classes = {g.value(sm, RR["class"]) for sm in subj_maps}
+        templates = {str(g.value(sm, RR.template)) for sm in subj_maps}
+        assert len(classes) == 2, "each table must map to its own class"
+        assert len(templates) == 2, "each table must mint instance IRIs under its own token"
+
+    def test_shared_name_llm_miss_does_not_drop_table(self):
+        """F10: for a shared bare name, class resolution uses strategy 3 (the
+        discriminated PascalCase local name) ALONE. If the LLM did not emit that
+        exact name, the table was absent from the class index and build_r2rml
+        dropped its TriplesMap entirely — its rows unreachable, strictly worse than
+        fusing to one class. A deterministic fallback must pair the same-named
+        tables against the generated classes so BOTH still get a TriplesMap."""
+        from coa_ontology.inducer.strategies.base import RR
+
+        prefix = "http://ex.org/ind#"
+        tables = self._colliding_tables()
+
+        # Non-compliant LLM response: BOTH classes named a bare "Customers" variant
+        # (with distinct properties), not the discriminated names strategy 3
+        # expects. This is the miss that dropped a table.
+        g = Graph()
+        ns = Namespace(prefix)
+        for suffix, col in (("", "name"), ("_2", "email")):
+            cls = ns[f"Customers{suffix}"]
+            g.add((cls, RDF.type, OWL.Class))
+            g.add((cls, RDFS.label, Literal("customers")))
+            prop = ns[f"Customers{suffix}_{col}"]
+            g.add((prop, RDF.type, OWL.DatatypeProperty))
+            g.add((prop, RDFS.domain, cls))
+        result = RigorOntologyStrategy().build_r2rml(prefix, tables, {"customers"}, g)
+
+        tmaps = set(result.subjects(RDF.type, RR.TriplesMap))
+        assert len(tmaps) == 2, "an LLM class-name miss must not drop a same-named table's TriplesMap"
+
+    def test_unique_name_output_unchanged(self):
+        """A single-source table with a unique name keeps its bare artifacts."""
+        from coa_ontology.inducer.strategies.base import RR
+
+        prefix = "http://ex.org/ind#"
+        table = CatalogTable(
+            id="ds-pg:public.orders",
+            name="orders",
+            fullyQualifiedName="public.orders",
+            datasourceId="ds-pg",
+            sourceSchema="public",
+            columns=[CatalogColumn(name="id", dataType="BIGINT", constraint="PRIMARY_KEY")],
+            tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["id"])],
+        )
+        proposal = self._proposal_graph(prefix, [table])
+        g = RigorOntologyStrategy().build_r2rml(prefix, [table], {"orders"}, proposal)
+        ns = Namespace(prefix)
+        # Bare TriplesMap IRI and bare rr:tableName, exactly as before the fix.
+        assert (ns.TriplesMap_orders, RDF.type, RR.TriplesMap) in g
+        lt = g.value(ns.TriplesMap_orders, RR.logicalTable)
+        assert str(g.value(lt, RR.tableName)) == '"orders"'
+
+
 class TestNovelGraphSelfConsistency:
     """Tests that the novel graph returned by _check_novelty is self-consistent:
     referenced classes are declared, and no dangling blank-node references

@@ -157,6 +157,55 @@ class TestCacheInvalidation:
         assert len(_roles_cache) == 1
 
 
+class TestSyncTimeoutProfile:
+    """The Lambda authorizer runs on every gated request (result caching is
+    disabled), so every DynamoDBDAO it builds must fail fast rather than
+    inherit the DAO's background 30-second/three-attempt default (matches
+    the Cedar policy loader's #1092 fix).
+    """
+
+    @patch("coa_control_plane.authorization.handler.DynamoDBDAO")
+    def test_cache_invalidation_dao_uses_sync_timeout_profile(self, mock_dao_cls, env_vars):
+        from coa_control_plane.authorization.handler import _get_cache_invalidation_dao
+
+        _get_cache_invalidation_dao()
+
+        config = mock_dao_cls.call_args.kwargs["config"]
+        assert config.read_timeout == 8
+        assert config.retries["max_attempts"] == 2
+
+    @patch("coa_control_plane.authorization.handler.DynamoDBDAO")
+    def test_namespaces_dao_uses_sync_timeout_profile(self, mock_dao_cls, env_vars):
+        from coa_control_plane.authorization.handler import _get_namespaces_dao
+
+        _get_namespaces_dao()
+
+        config = mock_dao_cls.call_args.kwargs["config"]
+        assert config.read_timeout == 8
+        assert config.retries["max_attempts"] == 2
+
+    @patch("coa_control_plane.authorization.handler._check_cache_version")
+    @patch("coa_control_plane.authorization.handler._evaluate_cedar", return_value=True)
+    @patch("coa_control_plane.authorization.handler._resolve_roles", return_value=(["ADMIN"], []))
+    @patch("coa_control_plane.authorization.handler.DynamoDBDAO")
+    def test_rrm_and_roles_daos_use_sync_timeout_profile(
+        self, mock_dao_cls, mock_resolve, mock_cedar, mock_cache_check, env_vars, valid_result, apigw_event
+    ):
+        from coa_control_plane.authorization.handler import handler
+
+        with patch("coa_control_plane.authorization.handler._get_token_authorizer") as mock_get_auth:
+            mock_authorizer = MagicMock()
+            mock_authorizer.validate.return_value = valid_result
+            mock_get_auth.return_value = mock_authorizer
+
+            handler(apigw_event, None)
+
+        for call in mock_dao_cls.call_args_list:
+            config = call.kwargs["config"]
+            assert config.read_timeout == 8
+            assert config.retries["max_attempts"] == 2
+
+
 class TestRolesCaching:
     """Tests for _resolve_roles cache behavior.
 

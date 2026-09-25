@@ -33,12 +33,15 @@ real constraint and produces a confident wrong answer.
 Adding a new language
 ---------------------
 
-1. **Tokenizer first.** Add the script's character range to
-   ``_RESIDUAL_TOKEN_RE`` in ``metric_resolver``; without it the gate cannot
-   see the language at all. Caveat: the residual mechanism assumes
-   whitespace-separated tokens. Korean qualifies (particles attach to the
-   preceding word); Japanese, Chinese, or Thai would need word segmentation
-   first, which is a larger change than a regex update.
+1. **Tokenizer first.** The gate tokenizes with the shared script-run
+   segmentation (``iter_word_tokens`` in ``query_utils``); make sure it
+   yields usable tokens for the script, or the gate cannot see the language
+   at all. Korean works as whitespace-delimited chunks (particles attach to
+   the preceding word). Japanese works as script runs — a hiragana particle
+   separates from the kanji/katakana content word it follows — with unspaced
+   hiragana fusions handled by the decomposition in
+   ``metric_resolver._is_stop_scaffolding``. Chinese or Thai would need real
+   word segmentation first, which is a larger change.
 2. **Curate the stop words** in a new module here (request verbs, question
    words, counters that restate the metric's own aggregate, connectives), and
    add it to the merge below.
@@ -58,10 +61,11 @@ Adding a new language
 from __future__ import annotations
 
 from .en import GROUPS as _EN_GROUPS
+from .ja import GROUPS as _JA_GROUPS
 from .ko import GROUPS as _KO_GROUPS
 
-RESIDUAL_STOP_WORD_GROUPS: tuple[str, ...] = (*_EN_GROUPS, *_KO_GROUPS)
-"""All languages' scaffolding groups, in a stable order (en, ko)."""
+RESIDUAL_STOP_WORD_GROUPS: tuple[str, ...] = (*_EN_GROUPS, *_KO_GROUPS, *_JA_GROUPS)
+"""All languages' scaffolding groups, in a stable order (en, ko, ja)."""
 
 RESIDUAL_STOP_WORDS: frozenset[str] = frozenset(word for group in RESIDUAL_STOP_WORD_GROUPS for word in group.split())
 """The merged stop-word set the residual gate consumes."""

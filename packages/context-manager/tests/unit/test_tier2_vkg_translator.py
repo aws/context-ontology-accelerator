@@ -36,12 +36,13 @@ def _make_vkg_client(sql="SELECT 1", tables=None, error=None, projection=None):
     return client
 
 
-def _make_translator(vkg_client=None, firewall=None, executor=None):
+def _make_translator(vkg_client=None, firewall=None, executor=None, sources_registry=None):
     """Create a VKGTranslator with a mocked VKG client seeded for test namespaces."""
     translator = VKGTranslator(
         vkg_endpoint=_TEST_VKG_ENDPOINT,
         firewall=firewall or _make_firewall(),
         query_executor=executor or _make_executor(),
+        sources_registry=sources_registry,
     )
     if vkg_client:
         translator._clients["demo"] = vkg_client
@@ -59,7 +60,7 @@ def _make_firewall(denied=False, reason=None):
     return fw
 
 
-def _make_executor(rows=None, error=None):
+def _make_executor(rows=None, error=None, engine=""):
     executor = AsyncMock()
     if error:
         executor.execute.side_effect = error
@@ -74,6 +75,7 @@ def _make_executor(rows=None, error=None):
             row_count=len(effective_rows),
             truncated=False,
             duration_ms=30,
+            engine=engine,
         )
     return executor
 
@@ -94,6 +96,24 @@ class TestVKGTranslatorSuccess:
         assert result.vkg_result is not None
         assert result.vkg_result.sql == "SELECT id, amount FROM orders"
         assert len(result.trace_steps) == 4  # vkg_translate + authorize + firewall + execute
+
+    async def test_execute_trace_step_records_engine(self):
+        """The ontop QUERY_EXECUTE trace step must carry detail.engine (athena |
+        redshift | jdbc). Without it the integration-level Redshift-dispatch guard
+        cannot verify which engine ran on the ontop path — it silently no-ops. The
+        nl_to_sql path already records engine; this keeps the two strategies in
+        step."""
+        vkg = _make_vkg_client(sql="SELECT id, amount FROM orders")
+        fw = _make_firewall()
+        executor = _make_executor(engine="athena")
+
+        translator = _make_translator(vkg_client=vkg, firewall=fw, executor=executor)
+        result = await translator.resolve("SELECT ?o WHERE { ?o a :Order }", namespace="demo")
+
+        exec_steps = [s for s in result.trace_steps if s.step == Tier2Step.QUERY_EXECUTE]
+        assert exec_steps, "no QUERY_EXECUTE trace step recorded"
+        detail = exec_steps[0].detail or {}
+        assert detail.get("engine") == "athena", f"execute step must record detail.engine; got {detail!r}"
 
     async def test_trace_steps_recorded(self):
         translator = _make_translator(
@@ -339,6 +359,250 @@ class TestVKGTranslatorDataSourceInference:
         assert translator._infer_data_source(single) == "mydb"
         # multiple/ambiguous catalogs -> "" (cross-source signal)
         assert translator._infer_data_source(multi) == ""
+
+
+@pytest.mark.unit
+class TestVKGTranslatorCrossSourceQualification:
+    """Cross-source SQL must be catalog-qualified before execution.
+
+    Bare table names execute against Athena's single pinned (Catalog, Database)
+    pair, so every table outside that pair fails TABLE_NOT_FOUND. The translator
+    rewrites such SQL to catalog.schema.table AFTER authorization.
+    """
+
+    _SQL = "SELECT a.id FROM claims a JOIN policies b ON a.id = b.claim_id"
+
+    def _firewall(self):
+        fw = MagicMock(spec=SQLFirewall)
+        fw.evaluate.return_value = FirewallResult(denied=False, authorized_sql=self._SQL, reason=None)
+        return fw
+
+    def _vkg(self, routing):
+        client = AsyncMock(spec=VKGClient)
+        client.translate.return_value = VKGResult(
+            sql=self._SQL,
+            dialect="trino",
+            ontology_version="v1",
+            source_table_refs=list(routing),
+            datasource_routing=routing,
+        )
+        return client
+
+    def _registry(self, sources):
+        reg = AsyncMock()
+        reg.get_source.side_effect = lambda namespace, data_source_id: sources.get(data_source_id, {})
+        return reg
+
+    async def test_firewall_sees_the_unqualified_sql(self):
+        """The rewrite MUST run downstream of authorization.
+
+        The firewall normalises table names to their bare component for the
+        allowlist/denylist, so prefixes do not affect those — but Cedar receives
+        ``SQLFirewall.extract_tables()`` output verbatim. Qualifying first would
+        silently change the strings a table-scoped policy matches on, which is an
+        authorization change disguised as a formatting change. Asserting the
+        firewall's actual argument makes the ordering executable rather than a
+        comment.
+        """
+        routing = {
+            "claims": {"datasourceId": "ds-pg", "sourceSchema": "public"},
+            "policies": {"datasourceId": "ds-glue", "sourceSchema": "insurance"},
+        }
+        fw = self._firewall()
+        executor = _make_executor()
+        translator = _make_translator(
+            vkg_client=self._vkg(routing),
+            firewall=fw,
+            executor=executor,
+            sources_registry=self._registry(
+                {
+                    "ds-pg": {"athenaDataCatalogName": "pg_cat"},
+                    "ds-glue": {"glueDatabaseName": "insurance"},
+                }
+            ),
+        )
+        await translator.resolve("SELECT ?s WHERE { ?s ?p ?o }", namespace="demo")
+
+        assert fw.evaluate.call_args.args[0] == self._SQL
+        # ...and the executor got the rewritten form, so the two really did differ.
+        assert executor.execute.call_args.args[0] != self._SQL
+
+    async def test_cross_source_sql_is_qualified_before_execute(self):
+        routing = {
+            "claims": {"datasourceId": "ds-pg", "sourceSchema": "public"},
+            "policies": {"datasourceId": "ds-glue", "sourceSchema": "insurance"},
+        }
+        executor = _make_executor()
+        translator = _make_translator(
+            vkg_client=self._vkg(routing),
+            firewall=self._firewall(),
+            executor=executor,
+            sources_registry=self._registry(
+                {
+                    "ds-pg": {"athenaDataCatalogName": "pg_cat"},
+                    "ds-glue": {"glueDatabaseName": "insurance"},
+                }
+            ),
+        )
+        await translator.resolve("SELECT ?s WHERE { ?s ?p ?o }", namespace="demo")
+
+        executed = executor.execute.call_args.args[0].replace('"', "")
+        assert "pg_cat.public.claims" in executed
+        assert "awsdatacatalog.insurance.policies" in executed
+        # Cross-source → no single source pinned; the qualified names route it.
+        assert executor.execute.call_args.kwargs["data_source_id"] == ""
+
+    async def test_reported_executed_sql_is_the_statement_the_executor_ran(self):
+        """``queryUsed`` must show the statement that RAN, not Ontop's translate output.
+
+        These diverge exactly when cross-source qualification applies. Reporting the raw form hands the
+        operator SQL whose bare names resolve under no ``QueryExecutionContext`` — it
+        cannot be copied into the Athena console, and it reads as evidence the fix
+        never fired. Asserting against ``executor.execute``'s own argument (rather than
+        a literal) keeps the two from drifting apart again.
+        """
+        routing = {
+            "claims": {"datasourceId": "ds-pg", "sourceSchema": "public"},
+            "policies": {"datasourceId": "ds-glue", "sourceSchema": "insurance"},
+        }
+        executor = _make_executor()
+        translator = _make_translator(
+            vkg_client=self._vkg(routing),
+            firewall=self._firewall(),
+            executor=executor,
+            sources_registry=self._registry(
+                {
+                    "ds-pg": {"athenaDataCatalogName": "pg_cat"},
+                    "ds-glue": {"glueDatabaseName": "insurance"},
+                }
+            ),
+        )
+        result = await translator.resolve("SELECT ?s WHERE { ?s ?p ?o }", namespace="demo")
+
+        assert result.executed_sql == executor.execute.call_args.args[0]
+        assert result.executed_sql != self._SQL, "executed_sql still holds the un-qualified translate output"
+
+    async def test_single_source_sql_reaches_executor_verbatim(self):
+        """No regression on the path that already works."""
+        routing = {
+            "claims": {"datasourceId": "ds-pg", "sourceSchema": "public"},
+            "policies": {"datasourceId": "ds-pg", "sourceSchema": "public"},
+        }
+        executor = _make_executor()
+        translator = _make_translator(
+            vkg_client=self._vkg(routing),
+            firewall=self._firewall(),
+            executor=executor,
+            sources_registry=self._registry({"ds-pg": {"athenaDataCatalogName": "pg_cat"}}),
+        )
+        await translator.resolve("SELECT ?s WHERE { ?s ?p ?o }", namespace="demo")
+
+        assert executor.execute.call_args.args[0] == self._SQL
+        assert executor.execute.call_args.kwargs["data_source_id"] == "ds-pg"
+
+    async def test_single_source_synthetic_schema_is_restored_before_execute(self):
+        """A SINGLE-source query over a shared table name still needs a rewrite.
+
+        When two datasources both expose ``public.customers``, the inducer mints a
+        synthetic schema token for the mapping and the H2 validation schema so the
+        two logical tables stay distinct. That token names nothing in the real
+        database. A one-table query never spans sources, so it never reaches the
+        cross-source qualifier — restoration therefore runs unconditionally, or the
+        mapping change breaks every single-source query over the shared table.
+        """
+        routing = {"public__2f77729f.customers": {"datasourceId": "ds-pg", "sourceSchema": "public"}}
+        translated = 'SELECT id FROM "public__2f77729f"."customers"'
+        fw = MagicMock(spec=SQLFirewall)
+        fw.evaluate.return_value = FirewallResult(denied=False, authorized_sql=translated, reason=None)
+        executor = _make_executor()
+        translator = _make_translator(
+            vkg_client=self._vkg(routing),
+            firewall=fw,
+            executor=executor,
+            sources_registry=self._registry({"ds-pg": {"athenaDataCatalogName": "pg_cat"}}),
+        )
+        await translator.resolve("SELECT ?s WHERE { ?s ?p ?o }", namespace="demo")
+
+        executed = executor.execute.call_args.args[0]
+        assert '"public"."customers"' in executed
+        assert "public__2f77729f" not in executed
+        # Single-source: still pinned to its own source, no catalog added.
+        assert executor.execute.call_args.kwargs["data_source_id"] == "ds-pg"
+
+    async def test_colliding_table_name_fails_loudly_without_executing(self):
+        """A BARE reference to a name two sources own cannot be attributed — never guess.
+
+        The SQL must actually name the ambiguous table: ambiguity is judged per
+        reference, not per routing map, so a query that happens to avoid the shared
+        name is still qualified normally.
+        """
+        routing = {
+            "public.customers": {"datasourceId": "ds-pg", "sourceSchema": "public"},
+            "crm.customers": {"datasourceId": "ds-glue", "sourceSchema": "crm"},
+        }
+        fw = MagicMock(spec=SQLFirewall)
+        fw.evaluate.return_value = FirewallResult(denied=False, authorized_sql="SELECT 1 FROM customers", reason=None)
+        executor = _make_executor()
+        translator = _make_translator(
+            vkg_client=self._vkg(routing),
+            firewall=fw,
+            executor=executor,
+            sources_registry=self._registry(
+                {
+                    "ds-pg": {"athenaDataCatalogName": "pg_cat"},
+                    "ds-glue": {"glueDatabaseName": "crm"},
+                }
+            ),
+        )
+        result = await translator.resolve("SELECT ?s WHERE { ?s ?p ?o }", namespace="demo")
+
+        assert result.error == "query_qualification_error"
+        executor.execute.assert_not_called()
+
+    async def test_colliding_table_name_resolves_when_the_sql_carries_the_schema(self):
+        """Same two-source collision, but each reference says which schema it means.
+
+        This is the shape a re-induced namespace produces (the mapping emits
+        ``"schema"."table"`` for a shared name), and it must execute rather than
+        raise — otherwise the fix would make every such query fail.
+        """
+        routing = {
+            "public.customers": {"datasourceId": "ds-pg", "sourceSchema": "public"},
+            "crm.customers": {"datasourceId": "ds-glue", "sourceSchema": "crm"},
+        }
+        sql = "SELECT a.id FROM public.customers a JOIN crm.customers b ON a.id = b.id"
+        fw = MagicMock(spec=SQLFirewall)
+        fw.evaluate.return_value = FirewallResult(denied=False, authorized_sql=sql, reason=None)
+        executor = _make_executor()
+        translator = _make_translator(
+            vkg_client=self._vkg(routing),
+            firewall=fw,
+            executor=executor,
+            sources_registry=self._registry(
+                {
+                    "ds-pg": {"athenaDataCatalogName": "pg_cat"},
+                    "ds-glue": {"glueDatabaseName": "crm"},
+                }
+            ),
+        )
+        result = await translator.resolve("SELECT ?s WHERE { ?s ?p ?o }", namespace="demo")
+
+        assert result.error is None
+        executed = executor.execute.call_args.args[0].replace('"', "")
+        assert "pg_cat.public.customers" in executed
+        assert "awsdatacatalog.crm.customers" in executed
+
+    async def test_no_registry_keeps_previous_behaviour(self):
+        """Without a registry wired, the pipeline behaves exactly as before."""
+        routing = {
+            "claims": {"datasourceId": "ds-pg", "sourceSchema": "public"},
+            "policies": {"datasourceId": "ds-glue", "sourceSchema": "insurance"},
+        }
+        executor = _make_executor()
+        translator = _make_translator(vkg_client=self._vkg(routing), firewall=self._firewall(), executor=executor)
+        await translator.resolve("SELECT ?s WHERE { ?s ?p ?o }", namespace="demo")
+
+        assert executor.execute.call_args.args[0] == self._SQL
 
 
 @pytest.mark.unit

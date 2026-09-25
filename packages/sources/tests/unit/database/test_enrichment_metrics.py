@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import pytest
 from botocore.exceptions import ClientError
+from coa_common.bedrock import BedrockTruncationError
 from coa_sources.database.pipeline.enrichment_metrics import (
     BedrockTokenUsageCounter,
     EnrichmentContext,
@@ -110,6 +111,10 @@ class TestBedrockTokenUsageCounter:
 
 
 class TestClassifyBedrockError:
+    def test_truncation_error(self) -> None:
+        exc = BedrockTruncationError(model_id="test-model", output_tokens=512, max_tokens=512)
+        assert _classify_bedrock_error(exc) == "Truncated"
+
     def test_throttling_exception(self) -> None:
         exc = ClientError({"Error": {"Code": "ThrottlingException", "Message": "slow"}}, "InvokeModel")
         assert _classify_bedrock_error(exc) == "Throttling"
@@ -208,6 +213,23 @@ class TestEnrichmentMetricEmitter:
             NamespaceId="ns-123",
             Stage="Pass1",
             ErrorType="Throttling",
+        )
+
+    @patch("coa_sources.database.pipeline.enrichment_metrics.emit_metric")
+    def test_emit_bedrock_invocation_error_truncation(self, mock_emit) -> None:
+        emitter = self._make_emitter()
+        exc = BedrockTruncationError(model_id="test-model", output_tokens=512, max_tokens=512)
+
+        emitter.emit_bedrock_invocation_error(stage="Pass2", exc=exc)
+
+        mock_emit.assert_called_once_with(
+            "BedrockInvocationErrors",
+            1,
+            "Count",
+            Engine="postgresql",
+            NamespaceId="ns-123",
+            Stage="Pass2",
+            ErrorType="Truncated",
         )
 
     @patch("coa_sources.database.pipeline.enrichment_metrics.emit_metric")

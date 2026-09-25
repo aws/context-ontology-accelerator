@@ -127,6 +127,39 @@ class TestDeserializeForm:
         assert restored.foreign_keys[0].target_table == "customers"
         assert restored.technical_metadata.format == "parquet"
 
+    def test_roundtrip_preserves_fk_governance_fields(self):
+        # #1088: inferred relationships carry review_status, target_datasource_id
+        # (cross-source), and provenance through serialize -> deserialize.
+        table = Table(
+            name="orders",
+            database="sales",
+            foreign_keys=[
+                ForeignKey(
+                    column="cust_id",
+                    target_table="customers",
+                    target_column="id",
+                    source="AI_INFERRED",
+                    confidence=0.7,
+                    review_status="PENDING_REVIEW",
+                    target_datasource_id="ds-2",
+                    provenance="column-name match: cust_id -> customers.id",
+                )
+            ],
+        )
+        fk = deserialize_form(serialize_form(table)).foreign_keys[0]
+        assert fk.review_status == "PENDING_REVIEW"
+        assert fk.target_datasource_id == "ds-2"
+        assert fk.provenance == "column-name match: cust_id -> customers.id"
+
+    def test_legacy_fk_without_governance_fields_defaults_empty(self):
+        # An FK persisted before these fields existed has none of the keys; it
+        # must deserialize to "" (grandfathered), not raise.
+        payload = {"foreignKeys": json.dumps([{"column": "c", "target_table": "t", "source": "AI_INFERRED"}])}
+        fk = deserialize_form(payload).foreign_keys[0]
+        assert fk.review_status == ""
+        assert fk.target_datasource_id == ""
+        assert fk.provenance == ""
+
     def test_columns_deserialized_with_business_metadata(self):
         restored = deserialize_form(serialize_form(_rich_table()))
         cust = next(c for c in restored.columns if c.name == "cust_id")

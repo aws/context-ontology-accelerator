@@ -33,6 +33,7 @@ from ...clients.base import QueryExecutor, QueryResult
 from ...clients.vkg import SparqlProjection, VKGClient, VKGResult
 from ...identity import display_principal
 from ..sql_firewall import FirewallResult, SQLFirewall
+from ..table_qualifier import SourceLookup, distinct_datasources, prepare_execution_sql
 
 logger = structlog.get_logger(__name__)
 
@@ -77,6 +78,14 @@ class Tier2Result:
     firewall_result: FirewallResult | None = None
     trace_steps: list[TraceStep] = field(default_factory=list)
     error: str | None = None
+    #: The statement actually handed to the executor — i.e. ``vkg_result.sql`` after
+    #: the firewall's rewrite AND cross-source qualification. Distinct from
+    #: ``vkg_result.sql``, which is Ontop's raw translate output. Reporting the raw
+    #: form as ``queryUsed`` is actively misleading after the cross-source fix: a cross-source
+    #: statement's bare table names cannot resolve under any single
+    #: ``QueryExecutionContext``, so the SQL shown to an operator is one that
+    #: provably does not run. ``None`` when the pipeline never reached execution.
+    executed_sql: str | None = None
 
 
 class VKGTranslator:
@@ -92,6 +101,7 @@ class VKGTranslator:
         vkg_endpoint: str,
         firewall: SQLFirewall,
         query_executor: QueryExecutor,
+        sources_registry: SourceLookup | None = None,
     ):
         """Configure the VKG endpoint, firewall, and query executor.
 
@@ -99,10 +109,19 @@ class VKGTranslator:
             vkg_endpoint: Base URL of the VKG service (rewritten per namespace).
             firewall: SQLFirewall enforcing safety and authorization on compiled SQL.
             query_executor: Executor that runs the authorized SQL.
+            sources_registry: Optional registry used ONLY to look up the Athena
+                catalog name of each datasource when a query spans more than one
+                (see :mod:`..table_qualifier`). With no registry wired, a
+                cross-source query keeps its previous behaviour. Typed as the
+                narrow :class:`~..table_qualifier.SourceLookup` Protocol rather
+                than left bare, so a wiring mistake in ``dependencies.py`` fails
+                type-check instead of surfacing as a runtime AttributeError on
+                the first cross-source query.
         """
         self._vkg_endpoint = vkg_endpoint
         self._firewall = firewall
         self._executor = query_executor
+        self._sources = sources_registry
         self._clients: dict[str, VKGClient] = {}
 
     _MAX_CACHED_CLIENTS = 64
@@ -249,6 +268,41 @@ class VKGTranslator:
         # heuristics only when routing metadata is unavailable.
         resolved_source = self._resolve_data_source(data_source_id, vkg_result)
         authorized_sql = fw_result.authorized_sql
+
+        # Make the authorized SQL executable: restore any synthetic schema token
+        # the mapping used to keep two sources' same-named tables apart, then
+        # qualify to catalog.schema.table if the query spans sources.
+        #
+        # Runs AFTER authorization by design: the firewall's allowlist/denylist
+        # keys are bare table names (unaffected by prefixes), but Cedar sees
+        # extract_tables() output verbatim, so rewriting earlier would change the
+        # strings a table-scoped policy matches on. A single-source query needing
+        # no schema restoration is returned untouched.
+        prepared = await prepare_execution_sql(
+            authorized_sql,
+            vkg_result.datasource_routing,
+            self._sources,
+            namespace=namespace,
+        )
+        if prepared.error:
+            logger.warning("tier2_qualification_failed", namespace=namespace, error=prepared.error)
+            trace.append(
+                TraceStep(
+                    step=Tier2Step.QUERY_EXECUTE,
+                    status=Tier2Status.ERROR,
+                    duration_ms=0,
+                    detail={"error": prepared.error},
+                )
+            )
+            return Tier2Result(
+                query_result=None,
+                vkg_result=vkg_result,
+                firewall_result=fw_result,
+                trace_steps=trace,
+                error="query_qualification_error",
+            )
+        authorized_sql = prepared.sql
+
         start = time.perf_counter()
         try:
             query_result = await self._executor.execute(
@@ -258,6 +312,12 @@ class VKGTranslator:
                 max_rows=max_rows,
                 timeout_seconds=timeout_seconds,
             )
+            # Capture the executing engine BEFORE projection: _project_to_sparql may
+            # return a fresh QueryResult that does not carry it forward. Surfaced on
+            # the execute step (athena | redshift | jdbc) so the Redshift-dispatch
+            # guard is observable from the trace on the ontop path too — the
+            # nl_to_sql path already records it.
+            executed_engine = getattr(query_result, "engine", "") or "unknown"
             # Project raw SQL result to SPARQL solution (if projection metadata available)
             if vkg_result.projection:
                 query_result = self._project_to_sparql(query_result, vkg_result.projection)
@@ -266,7 +326,11 @@ class VKGTranslator:
                     step=Tier2Step.QUERY_EXECUTE,
                     status=Tier2Status.OK,
                     duration_ms=int((time.perf_counter() - start) * 1000),
-                    detail={"row_count": query_result.row_count, "truncated": query_result.truncated},
+                    detail={
+                        "row_count": query_result.row_count,
+                        "truncated": query_result.truncated,
+                        "engine": executed_engine,
+                    },
                 )
             )
         except Exception as e:
@@ -292,6 +356,7 @@ class VKGTranslator:
             vkg_result=vkg_result,
             firewall_result=fw_result,
             trace_steps=trace,
+            executed_sql=authorized_sql,
         )
 
     def _resolve_data_source(self, explicit_id: str, vkg_result: VKGResult) -> str:
@@ -320,10 +385,15 @@ class VKGTranslator:
         The returned source ID is used by the Athena client to fetch the
         source record from DDB (athenaDataCatalogName, discoveredSchemas)
         for catalog/schema resolution.
+
+        A MULTI-source query still returns "" here, but that no longer means
+        "pick an arbitrary source": ``resolve()`` qualifies such SQL to
+        ``catalog.schema.table`` first, after which the executor's catalog
+        resolution is irrelevant (qualified names override the Athena
+        ``QueryExecutionContext``). "" is now "no single source applies".
         """
         if vkg_result.datasource_routing:
-            ds_ids = {v.get("datasourceId", "") for v in vkg_result.datasource_routing.values()}
-            ds_ids.discard("")
+            ds_ids = distinct_datasources(vkg_result.datasource_routing)
             if len(ds_ids) == 1:
                 resolved = ds_ids.pop()
                 logger.info(
