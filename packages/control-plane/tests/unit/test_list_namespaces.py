@@ -269,6 +269,25 @@ class TestScopedUser:
         assert body["namespaces"][0]["namespaceId"] == "11111111-1111-1111-1111-111111111111"
 
     @patch("coa_control_plane.namespace.list_handler.DynamoDBDAO")
+    def test_unknown_global_role_does_not_bypass_namespace_filter(self, mock_dao_cls):
+        """Only built-in cross-namespace roles may trigger a full table scan."""
+        mock_ns_dao = MagicMock()
+        mock_mappings_dao = MagicMock()
+        mock_dao_cls.side_effect = [mock_ns_dao, mock_mappings_dao]
+
+        mock_mappings_dao.query_all.return_value = [
+            {"resourceType": "Namespace", "resourceId": NS_ITEM["namespaceId"], "role": "data-analyst"}
+        ]
+        mock_ns_dao.batch_get.return_value = [NS_ITEM]
+
+        resp = handler(_event(global_roles="user-admin"), None)
+
+        assert resp["statusCode"] == 200
+        body = json.loads(resp["body"])
+        assert [ns["namespaceId"] for ns in body["namespaces"]] == [NS_ITEM["namespaceId"]]
+        mock_ns_dao.scan.assert_not_called()
+
+    @patch("coa_control_plane.namespace.list_handler.DynamoDBDAO")
     def test_no_roles_returns_empty(self, mock_dao_cls):
         mock_ns_dao = MagicMock()
         mock_mappings_dao = MagicMock()
