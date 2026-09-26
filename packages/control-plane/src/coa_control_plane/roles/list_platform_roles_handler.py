@@ -12,6 +12,7 @@ import os
 from typing import Any
 
 import structlog
+from coa_common.authnz_types import NON_ASSIGNABLE_ROLE_IDS
 from coa_common.dao import DynamoDBDAO, QueryParams
 from coa_common.logging import setup_logging
 from coa_common.response import api_response
@@ -61,7 +62,14 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
             )
         )
 
-        roles = [_to_summary(item) for item in result.items]
+        # The GLOBAL partition also holds the ``default`` baseline policy bundle,
+        # which is applied to every principal and must not be offered as a
+        # grantable role (#988).
+        roles = [
+            _to_summary(item)
+            for item in result.items
+            if item.get("SK", "").removeprefix(_ROLE_SK_PREFIX) not in NON_ASSIGNABLE_ROLE_IDS
+        ]
         return api_response(200, {"roles": [r.model_dump(by_alias=True, exclude_none=True) for r in roles]})
     except Exception:
         logger.exception("list_platform_roles_error")

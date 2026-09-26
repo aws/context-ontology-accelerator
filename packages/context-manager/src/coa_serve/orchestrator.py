@@ -29,7 +29,7 @@ from .model_validation import validate_model_id as _validate_model_id
 from .models import InvokeRequest, InvokeResponse
 from .response_assembler import ResponseAssembler
 from .step_ids import StepId
-from .tier1.metric_resolver import MetricMatch, MetricResolver
+from .tier1.metric_resolver import DeclinedMetricContext, MetricMatch, MetricResolver
 from .tier2.skip import Tier2SkipDecision
 from .tier2.sql_firewall import FirewallResult, SQLFirewall
 from .tier2.strategy import (
@@ -253,6 +253,10 @@ class Orchestrator:
 
         tier2_sparql: str | None = None
         metric_definitions: list[dict] | None = None
+        # The governed definition Tier-1 matched but declined, if its
+        # residual-qualifier gate fired. Threaded into Tier 2 so the authored formula
+        # survives the decline instead of being discarded with the match.
+        declined_metric: DeclinedMetricContext | None = None
 
         # ── Deep-reasoning mode owns the whole request ───────────────
         # Mode is an execution policy, not a tier: an explicit
@@ -288,7 +292,7 @@ class Orchestrator:
 
         # ── Tier 1: Metric Resolver ──────────────────────────────────
         if self._should_run_tier1(tier_override, start_tier, gating):
-            result = await self._run_tier1(
+            result, declined_metric = await self._run_tier1(
                 query,
                 namespace,
                 profile,
@@ -320,6 +324,7 @@ class Orchestrator:
                 tier_override=tier_override,
                 model_id=model_id_override,
                 deadline=deadline,
+                declined_metric=declined_metric,
             )
             if strategy_result:
                 return strategy_result
@@ -659,11 +664,16 @@ class Orchestrator:
         tier_override: int | None,
         model_id: str | None = None,
         deadline: Deadline | None = None,
+        declined_metric: DeclinedMetricContext | None = None,
     ) -> tuple[InvokeResponse | None, str | None]:
         """Run Tier 2 strategies and return (response, sparql_for_tier3_grounding).
 
         Called only when a strategy applies, so ``strategy_selection`` is always a
         real StrategyOption (never a skip sentinel).
+
+        ``declined_metric`` carries the governed definition Tier-1 matched but
+        declined, so the SQL writer extends the authored formula rather than
+        composing a replacement for it.
         """
         context = StrategyContext(
             embedding=embedding,
@@ -672,6 +682,7 @@ class Orchestrator:
             trace=trace,
             model_id=model_id,
             deadline=deadline,
+            declined_metric=declined_metric,
         )
 
         result = await self._structured_query_tier.resolve(query, namespace, context, option=strategy_selection)
@@ -791,7 +802,15 @@ class Orchestrator:
         trace: TraceCollector,
         model_id: str | None = None,
         deadline: Deadline | None = None,
-    ) -> InvokeResponse | None:
+    ) -> tuple[InvokeResponse | None, DeclinedMetricContext | None]:
+        """Run Tier 1 and return ``(response, declined_metric_context)``.
+
+        The second element is populated ONLY when the residual-qualifier gate
+        declined an otherwise-good match. It carries the authored formula onward so
+        Tier 2 extends the governed definition instead of reinventing it; every
+        other outcome — a clean hit, a miss, a multi-metric bypass, an execution
+        failure — returns ``None`` for it.
+        """
         t1_start = time.perf_counter()
         metric_match = await self._metric_resolver.match(query, namespace)
         t1_ms = int((time.perf_counter() - t1_start) * 1000)
@@ -807,7 +826,17 @@ class Orchestrator:
                 t1_ms,
                 detail=f"{metric_match.match_count} metrics",
             )
-            return None
+            return None, None
+
+        # Grant-profile authorization runs HERE, before the residual-qualifier
+        # gate — so a metric the principal may not use is denied whether the
+        # question was clean (executed) OR carried a residual (declined). Without
+        # this ordering the declined path would forward a denied metric's formula
+        # and description into the Tier-2 prompt, letting a principal use a metric
+        # `allowedMetrics` forbids just by appending a qualifier. Enforced once,
+        # for both exits.
+        if metric_match.found:
+            self._enforce_allowed_metrics(metric_match, profile, namespace, trace, t1_ms)
 
         # a match that leaves part of the question unconsumed is a
         # PARTIAL match: Tier-1 executes the metric's SQL verbatim and cannot
@@ -818,6 +847,7 @@ class Orchestrator:
         # declined question never records a Tier-1 hit.
         unhandled = self._unhandled_qualifier(metric_match, options) if metric_match.found else ""
         if unhandled:
+            declined = DeclinedMetricContext.from_match(metric_match, unhandled)
             trace.record(
                 StepId.T1_METRIC_MATCH,
                 "residual_qualifier_bypass",
@@ -833,6 +863,14 @@ class Orchestrator:
                     # diagnosable from the trace alone (e.g. an over-broad synonym
                     # consuming less of the question than its author expected).
                     "matchedText": metric_match.matched_text,
+                    # Declining is not total: the authored formula is handed to Tier 2
+                    # as authoritative context instead of being discarded. Surfaced
+                    # here so "did Tier 2 get the definition?" is answerable from the
+                    # trace alone, without reading Tier-2's prompt. Keyed on
+                    # ``prompt_block`` (not raw ``sql_template``) so it is False
+                    # exactly when nothing is forwarded — a template-less metric
+                    # yields an empty block, and the flag must not claim otherwise.
+                    "governedDefinitionForwarded": bool(declined.prompt_block),
                 },
             )
             logger.info(
@@ -842,8 +880,9 @@ class Orchestrator:
                 match_source=metric_match.match_source,
                 matched_text=metric_match.matched_text,
                 unhandled=unhandled,
+                governed_definition_forwarded=bool(declined.prompt_block),
             )
-            return None
+            return None, declined
 
         if metric_match.found:
             trace.record(
@@ -857,45 +896,9 @@ class Orchestrator:
                 },
             )
 
-            # enforce allowedMetrics grant-profile restriction before
-            # execution. Fail closed: if a profile DECLARES allowedMetrics, the
-            # matched metric must be in that list (by metric_id or metric_name).
-            #
-            # ``is not None``, not truthiness: an ABSENT allowedMetrics means "no
-            # metric constraint" (sparse opt-in), but an explicitly EMPTY one means
-            # "no metrics permitted". Collapsing the two would make a deny-all
-            # grant fail OPEN — the same empty-vs-absent bug fixed for
-            # tableAllowlist in sql_firewall.py.
-            allowed_metrics = profile.get("allowedMetrics")
-            if allowed_metrics is not None and (
-                metric_match.metric_id not in allowed_metrics and metric_match.metric_name not in allowed_metrics
-            ):
-                principal_id = profile.get("userId", "unknown")
-                # Trace details are rendered verbatim in the rationale panel
-                # ("Access denied for principal X"), so they carry the display
-                # label; the log below keeps the sub, which is the stable
-                # correlation key across requests.
-                principal_label = display_principal(profile) or "unknown"
-                reason = f"Metric '{metric_match.metric_name}' not in principal's allowedMetrics"
-                trace.record(
-                    StepId.T1_AUTHORIZE,
-                    "denied",
-                    t1_ms,
-                    detail={"principal": principal_label, "decision": "deny", "reason": reason},
-                    tool_used="grant-profile",
-                )
-                logger.warning(
-                    "tier1_allowed_metrics_denied",
-                    namespace=namespace,
-                    metric_name=metric_match.metric_name,
-                    metric_id=metric_match.metric_id,
-                    principal=principal_id,
-                )
-                raise AccessDeniedError(reason)
-
             if not self._query_executor or not metric_match.sql_template:
                 trace.record(StepId.T1_EXECUTE, "skipped", 0, detail="no executor or sql_template")
-                return None
+                return None, None
 
             # substitute caller-supplied dimension values into the metric
             # SQL template via parameterized (sqlglot-literal) binding — NOT string
@@ -919,7 +922,7 @@ class Orchestrator:
                     detail=f"dimensions must be a mapping, got {type(dimensions).__name__}",
                 )
                 logger.warning("tier1_dimensions_malformed", dimensions_type=type(dimensions).__name__)
-                return None
+                return None, None
             if dimensions or "{" in metric_sql or ":" in metric_sql:
                 try:
                     metric_sql = self._metric_resolver.substitute_dimensions(
@@ -928,7 +931,7 @@ class Orchestrator:
                 except ValueError as e:
                     trace.record(StepId.T1_METRIC_MATCH, "dimension_substitution_failed", t1_ms, detail=str(e)[:120])
                     logger.info("tier1_dimension_substitution_failed", error=str(e))
-                    return None
+                    return None, None
 
             # Log the pre-substitution template (placeholders, not values) to
             # avoid leaking caller-supplied dimension values (potential PII) into
@@ -961,7 +964,7 @@ class Orchestrator:
                 logger.warning(
                     "tier1_firewall_error", namespace=namespace, metric=metric_match.metric_name, error=str(e)[:200]
                 )
-                return None
+                return None, None
 
             fw_ms = int((time.perf_counter() - fw_start) * 1000)
             # Display label — these details are rendered in the rationale panel.
@@ -1016,7 +1019,7 @@ class Orchestrator:
                     namespace=namespace,
                     remaining_seconds=round(remaining_s, 3),
                 )
-                return None
+                return None, None
             timeout_seconds = self._tier1_metric_timeout_s
             if remaining_s is not None:
                 timeout_seconds = min(
@@ -1098,10 +1101,58 @@ class Orchestrator:
                     match_source=metric_match.match_source,
                     model_id=model_id,
                 )
-            )
+            ), None
 
         trace.record(StepId.T1_METRIC_MATCH, "miss", t1_ms, detail={"query_length": len(query)})
-        return None
+        return None, None
+
+    def _enforce_allowed_metrics(
+        self,
+        metric_match: MetricMatch,
+        profile: dict,
+        namespace: str,
+        trace: TraceCollector,
+        t1_ms: int,
+    ) -> None:
+        """Enforce the principal's ``allowedMetrics`` grant, raising on a deny.
+
+        Runs for BOTH Tier-1 exits — an executed match and a residual-declined one
+        — so a metric the principal may not use is denied uniformly. If it only
+        guarded execution, the declined path would forward a forbidden metric's
+        formula/description into the Tier-2 prompt (an authorization bypass a caller
+        could trigger simply by appending a qualifier).
+
+        Fail closed: ``is not None`` (not truthiness) — an ABSENT ``allowedMetrics``
+        means "no metric constraint" (sparse opt-in), but an explicitly EMPTY one
+        means "no metrics permitted". Collapsing the two would make a deny-all grant
+        fail OPEN — the same empty-vs-absent bug fixed for tableAllowlist in
+        sql_firewall.py.
+        """
+        allowed_metrics = profile.get("allowedMetrics")
+        if allowed_metrics is not None and (
+            metric_match.metric_id not in allowed_metrics and metric_match.metric_name not in allowed_metrics
+        ):
+            principal_id = profile.get("userId", "unknown")
+            # Trace details are rendered verbatim in the rationale panel ("Access
+            # denied for principal X"), so they carry the display label; the log
+            # below keeps the sub, which is the stable correlation key across requests.
+            principal_label = display_principal(profile) or "unknown"
+            reason = f"Metric '{metric_match.metric_name}' not in principal's allowedMetrics"
+            trace.record(
+                StepId.T1_AUTHORIZE,
+                "denied",
+                t1_ms,
+                detail={"principal": principal_label, "decision": "deny", "reason": reason},
+                tool_used="grant-profile",
+            )
+            logger.warning(
+                "tier1_allowed_metrics_denied",
+                namespace=namespace,
+                metric_name=metric_match.metric_name,
+                metric_id=metric_match.metric_id,
+                principal=principal_id,
+            )
+            raise AccessDeniedError(reason)
 
     def _collect_metric_context(self, trace: TraceCollector) -> list[dict] | None:
         # Placeholder: intended to harvest metric definitions surfaced during a

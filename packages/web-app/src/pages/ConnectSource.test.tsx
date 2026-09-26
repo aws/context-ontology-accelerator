@@ -9,6 +9,9 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { ConnectSource } from "./ConnectSource";
 
+// Wizard tests drive Cloudscape through userEvent and run near vitest's 5s default under CI load.
+vi.setConfig({ testTimeout: 15000 });
+
 // ---------------------------------------------------------------------------
 // Mocks
 // ---------------------------------------------------------------------------

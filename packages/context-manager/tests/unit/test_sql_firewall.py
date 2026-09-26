@@ -720,7 +720,7 @@ class TestNamespaceSQLScope:
         with pytest.raises(NamespaceSQLScopeError, match="not available in the requested namespace"):
             self._validate("SELECT * FROM information_schema.tables")
 
-    def _validate_jdbc(self, sql: str) -> bool:
+    def _validate_jdbc(self, sql: str, selected_source_schemas: frozenset[str] | None = None) -> bool:
         """Direct-JDBC route: catalog supplied by the connection, so schema_only."""
         return SQLFirewall.validate_namespace_sql_scope(
             sql,
@@ -728,6 +728,9 @@ class TestNamespaceSQLScope:
             federated_catalog_schemas=self._FEDERATED,
             default_catalog="awsdatacatalog",
             schema_only=True,
+            selected_source_schemas=(
+                selected_source_schemas if selected_source_schemas is not None else frozenset({"tenant_a_db", "sales"})
+            ),
         )
 
     def test_jdbc_two_part_federated_schema_is_allowed(self):
@@ -736,9 +739,29 @@ class TestNamespaceSQLScope:
         from the connection, not Athena. The federated JDBC source's schema lives in
         federated_catalog_schemas under its OWN nested catalog (``sclds_a``), not in
         native_databases — so the Athena rule (pin to awsdatacatalog/native) wrongly
-        denied it (502 NamespaceSQLScopeError). schema_only authorizes on the schema
-        against ANY authorized catalog."""
+        denied it (502 NamespaceSQLScopeError). schema_only authorizes the schema
+        from the selected source without applying an Athena catalog pin."""
         assert self._validate_jdbc("SELECT COUNT(*) FROM sales.orders")
+
+    def test_jdbc_two_part_schema_is_bound_to_executing_source(self):
+        """A namespace sibling's schema is not authorized on source A's connection."""
+        namespace_native = frozenset()
+        namespace_federated = frozenset({("source_a", "public"), ("source_b", "secret")})
+
+        def validate(sql: str, selected_source_schemas: frozenset[str]) -> bool:
+            return SQLFirewall.validate_namespace_sql_scope(
+                sql,
+                native_databases=namespace_native,
+                federated_catalog_schemas=namespace_federated,
+                default_catalog="awsdatacatalog",
+                schema_only=True,
+                selected_source_schemas=selected_source_schemas,
+            )
+
+        assert validate("SELECT * FROM public.customers", frozenset({"public"}))
+        assert validate("SELECT * FROM secret.salaries", frozenset({"secret"}))
+        with pytest.raises(NamespaceSQLScopeError):
+            validate("SELECT * FROM secret.salaries", frozenset({"public"}))
 
     def test_jdbc_two_part_native_schema_is_allowed(self):
         assert self._validate_jdbc("SELECT COUNT(*) FROM tenant_a_db.customers")

@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from coa_serve.deadline import Deadline
 from coa_serve.exceptions import AccessDeniedError, AmbiguousReferenceError
+from coa_serve.tier1.metric_resolver import DeclinedMetricContext
 from coa_serve.tier2.nl_to_sql.strategy import NLtoSQLStrategy
 from coa_serve.tier2.strategy import MAX_RESULT_ROWS, StrategyContext, StrategyOption, StrategyResult
 from coa_serve.tier2.table_qualifier import PreparedSQL
@@ -97,6 +98,111 @@ class TestNLtoSQLStrategyResolve:
             query_executor=query_executor,
             oss_ontology_index="test-index",
         )
+
+    @pytest.mark.asyncio
+    async def test_declined_metric_becomes_governed_metric_argument(
+        self, strategy, sql_generator, firewall, query_executor
+    ):
+        """The strategy is the seam between the declined match and the SQL writer. If
+        it drops ``context.declined_metric``, the formula never reaches the prompt no
+        matter how well the orchestrator threaded it."""
+        sql_generator.generate.return_value = _make_nl_to_sql_result()
+        firewall.evaluate.return_value = _make_firewall_result()
+        query_executor.execute.return_value = _make_exec_result()
+        context = _make_context()
+        context.declined_metric = DeclinedMetricContext(
+            metric_id="demo:open_claim_count",
+            metric_name="open_claim_count",
+            sql_template="SELECT count(*) FROM claims WHERE claim_status_code = 'OPEN'",
+            unhandled_qualifier="anycompany",
+        )
+
+        await strategy.resolve("How many open claims does AnyCompany have?", "ns", context)
+
+        governed = sql_generator.generate.call_args.kwargs["governed_metric"]
+        assert "claim_status_code = 'OPEN'" in governed
+        assert "'anycompany'" in governed
+
+    @pytest.mark.asyncio
+    async def test_no_declined_metric_passes_empty_governed_metric(
+        self, strategy, sql_generator, firewall, query_executor
+    ):
+        """The common path must pass an empty string, not None — the generator
+        concatenates it into the prompt."""
+        sql_generator.generate.return_value = _make_nl_to_sql_result()
+        firewall.evaluate.return_value = _make_firewall_result()
+        query_executor.execute.return_value = _make_exec_result()
+
+        await strategy.resolve("who are our customers?", "ns", _make_context())
+
+        assert sql_generator.generate.call_args.kwargs["governed_metric"] == ""
+
+    @pytest.mark.asyncio
+    async def test_templateless_declined_metric_forwards_nothing(
+        self, strategy, sql_generator, firewall, query_executor
+    ):
+        """End-to-end guard for comment 1: a declined metric with no formula must not
+        put a block in the writer's prompt, even though context.declined_metric is
+        non-None."""
+        sql_generator.generate.return_value = _make_nl_to_sql_result()
+        firewall.evaluate.return_value = _make_firewall_result()
+        query_executor.execute.return_value = _make_exec_result()
+        context = _make_context()
+        context.declined_metric = DeclinedMetricContext(
+            metric_id="demo:revenue",
+            metric_name="revenue",
+            sql_template="",  # matched by name, no formula
+            unhandled_qualifier="last quarter",
+        )
+
+        await strategy.resolve("what was revenue last quarter?", "ns", context)
+
+        assert sql_generator.generate.call_args.kwargs["governed_metric"] == ""
+
+    @pytest.mark.asyncio
+    async def test_governed_metric_suppressed_when_source_contradicts_resolved(
+        self, strategy, sql_generator, firewall, query_executor
+    ):
+        """A metric authored against one source must NOT be forwarded when the request
+        pins a different source: preserving a formula whose tables aren't in the
+        resolved schema burns the correction shot or steers wrong-source SQL."""
+        sql_generator.generate.return_value = _make_nl_to_sql_result()
+        firewall.evaluate.return_value = _make_firewall_result()
+        query_executor.execute.return_value = _make_exec_result()
+        context = _make_context()  # options pins dataSourceId="ds-1"
+        context.declined_metric = DeclinedMetricContext(
+            metric_id="demo:open_claim_count",
+            metric_name="open_claim_count",
+            sql_template="SELECT count(*) FROM claims",
+            unhandled_qualifier="anycompany",
+            data_source_id="ds-claims",  # DIFFERENT from the pinned ds-1
+        )
+
+        await strategy.resolve("How many open claims does AnyCompany have?", "ns", context)
+
+        assert sql_generator.generate.call_args.kwargs["governed_metric"] == ""
+
+    @pytest.mark.asyncio
+    async def test_governed_metric_forwarded_when_source_agrees(
+        self, strategy, sql_generator, firewall, query_executor
+    ):
+        """Control: when the metric's source matches the resolved one, the block is
+        still forwarded — the mismatch gate must not suppress the happy path."""
+        sql_generator.generate.return_value = _make_nl_to_sql_result()
+        firewall.evaluate.return_value = _make_firewall_result()
+        query_executor.execute.return_value = _make_exec_result()
+        context = _make_context()  # options pins dataSourceId="ds-1"
+        context.declined_metric = DeclinedMetricContext(
+            metric_id="demo:open_claim_count",
+            metric_name="open_claim_count",
+            sql_template="SELECT count(*) FROM claims",
+            unhandled_qualifier="anycompany",
+            data_source_id="ds-1",  # SAME as the pinned source
+        )
+
+        await strategy.resolve("How many open claims does AnyCompany have?", "ns", context)
+
+        assert "claims" in sql_generator.generate.call_args.kwargs["governed_metric"]
 
     @pytest.mark.asyncio
     async def test_success_path_returns_strategy_result(self, strategy, sql_generator, firewall, query_executor):
@@ -720,6 +826,67 @@ class TestNLtoSQLCrossSourceQualification:
             await strategy.resolve("cross-source question", "ns1", _make_context())
 
         query_executor.execute.assert_not_called()
+
+    # ── Fail-closed on incomplete metadata (#1141) ───────────────────────────
+    # These drive the REAL ``prepare_execution_sql`` / ``qualify_cross_source_sql``
+    # (no patching), so they prove the NL->SQL flow turns each qualification
+    # failure into a refusal. Before #1141 each case returned the statement bare
+    # and the executor ran it in Athena's single pinned context.
+
+    def _cross_source_mocks(self):
+        sql_generator, firewall, query_executor = AsyncMock(), MagicMock(), AsyncMock()
+        sql_generator.generate.return_value = _make_nl_to_sql_result(
+            sql=self._SQL,
+            table_sources={"claims": "ds-pg", "policies": "ds-glue"},
+            data_source_id="",
+        )
+        firewall.evaluate.return_value = _make_firewall_result(authorized_sql=self._SQL)
+        query_executor.execute.return_value = _make_exec_result()
+        return sql_generator, firewall, query_executor
+
+    @pytest.mark.asyncio
+    async def test_no_registry_fails_closed_without_executing(self):
+        sql_generator, firewall, query_executor = self._cross_source_mocks()
+        strategy = self._strategy(sql_generator, firewall, query_executor, None)
+
+        with pytest.raises(AmbiguousReferenceError, match="sources registry is unavailable"):
+            await strategy.resolve("cross-source question", "ns1", _make_context())
+
+        query_executor.execute.assert_not_awaited()
+        # Terminal: a correction shot would hit the same missing metadata.
+        sql_generator.correct.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_datasource_missing_from_registry_fails_closed_without_executing(self):
+        sql_generator, firewall, query_executor = self._cross_source_mocks()
+        # ds-glue is routed but has no registry record.
+        registry = self._registry({"ds-pg": {"athenaDataCatalogName": "pg_cat", "discoveredSchemas": ["public"]}})
+        strategy = self._strategy(sql_generator, firewall, query_executor, registry)
+
+        with pytest.raises(AmbiguousReferenceError, match="datasource 'ds-glue' was not found"):
+            await strategy.resolve("cross-source question", "ns1", _make_context())
+
+        query_executor.execute.assert_not_awaited()
+        sql_generator.correct.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_missing_schema_metadata_fails_closed_without_executing(self):
+        sql_generator, firewall, query_executor = self._cross_source_mocks()
+        # A federated source with no discoveredSchemas: schema_for_source returns
+        # "" and the retrieval hits carry no per-table schema.
+        registry = self._registry(
+            {
+                "ds-pg": {"athenaDataCatalogName": "pg_cat"},
+                "ds-glue": {"glueDatabaseName": "insurance"},
+            }
+        )
+        strategy = self._strategy(sql_generator, firewall, query_executor, registry)
+
+        with pytest.raises(AmbiguousReferenceError, match="'claims' has no source schema metadata"):
+            await strategy.resolve("cross-source question", "ns1", _make_context())
+
+        query_executor.execute.assert_not_awaited()
+        sql_generator.correct.assert_not_called()
 
 
 def _make_context_with_deadline(budget_s: float) -> StrategyContext:
