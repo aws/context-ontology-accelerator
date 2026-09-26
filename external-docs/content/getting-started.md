@@ -67,6 +67,8 @@ All stacks use context-driven configuration via `CoaStack` base class:
 | `api_throttle_rate_limit`  | `50`               | API Gateway stage requests-per-second rate limit               |
 | `api_throttle_burst_limit` | `100`              | API Gateway stage burst capacity                               |
 | `lambda_reserved_concurrency` | `5`             | Reserved concurrency for the VKG-reload and doc-preprocessing Lambdas; `0` disables reserving (needed on reduced Lambda-quota accounts) |
+| `serve_nl2sql_graph_expand` | (unset — on)    | Tier-2 flat NL→SQL ontology foreign-key expansion; `false` turns it off. See [Deploying](deploying.md#tier-2-nlsql-ontology-foreign-key-expansion) |
+| `serve_nl2sql_graph_expand_max_tables` | (unset — `8`) | How many walked tables the expansion may append to the NL→SQL prompt; `0` appends none |
 
 Resource naming follows `{prefix}-{env}-{name}` (e.g. `coa-dev-neptune`).
 

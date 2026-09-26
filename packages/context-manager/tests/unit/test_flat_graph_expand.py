@@ -276,11 +276,18 @@ class TestGenerateWithExpansion:
 
     async def test_a_failing_walk_degrades_to_retrieval_only(self, mock_llm, mock_vector):
         expander = MagicMock()
-        expander.expand_from = AsyncMock(side_effect=TimeoutError("neptune slow"))
-        result, prompt = await self._generate(mock_llm, mock_vector, graph_expander=expander)
+        expander.expand_from = AsyncMock(side_effect=RuntimeError("neptune refused"))
+        with structlog.testing.capture_logs() as logs:
+            result, prompt = await self._generate(mock_llm, mock_vector, graph_expander=expander)
         assert result.sql == "SELECT 1"  # the question is still answered
         assert "Table: orders" in prompt
         assert [s for s in result.trace_steps if s["step"] == "graph_expand_ontology"][0]["status"] == "error"
+        # A silent degradation on a default-on lever is indistinguishable from a
+        # namespace with no FK edges, so the failure has to name itself — and name
+        # the exception, since "neptune refused" and a bad seed IRI are different
+        # problems.
+        entry = next(log for log in logs if log["event"] == "nl_to_sql_graph_expand_failed")
+        assert "RuntimeError" in entry["error"] and "neptune refused" in entry["error"]
 
     async def test_the_context_log_counts_the_walked_table(self, mock_llm, mock_vector):
         # `context_tables` is documented as what the writer saw, and a walked table
@@ -319,17 +326,38 @@ class TestGenerateWithExpansion:
 @pytest.mark.unit
 class TestGraphExpandFlag:
     def test_per_request_option(self):
-        assert _graph_expand_enabled({"flatGraphExpand": True}) is True
-        assert _graph_expand_enabled({"flatGraphExpand": "on"}) is True
-        assert _graph_expand_enabled({"flatGraphExpand": "false"}) is False
-        assert _graph_expand_enabled({}) is False
-        assert _graph_expand_enabled(None) is False
+        with patch.dict(os.environ, {}, clear=True):
+            assert _graph_expand_enabled({"flatGraphExpand": True}) is True
+            assert _graph_expand_enabled({"flatGraphExpand": "on"}) is True
+            assert _graph_expand_enabled({"flatGraphExpand": "false"}) is False
+            assert _graph_expand_enabled({"flatGraphExpand": False}) is False
+
+    def test_on_when_nothing_says_otherwise(self):
+        """The default. A control arm must now opt OUT, not merely omit the option."""
+        with patch.dict(os.environ, {}, clear=True):
+            assert _graph_expand_enabled({}) is True
+            assert _graph_expand_enabled(None) is True
 
     def test_deployment_wide_env(self):
         with patch.dict(os.environ, {"SERVE_NL2SQL_GRAPH_EXPAND": "true"}):
             assert _graph_expand_enabled({}) is True
         with patch.dict(os.environ, {"SERVE_NL2SQL_GRAPH_EXPAND": "no"}):
             assert _graph_expand_enabled({}) is False
+
+    def test_a_request_overrides_the_deployment_in_both_directions(self):
+        """Both directions, because paired A/B runs need each arm pinned per request."""
+        with patch.dict(os.environ, {"SERVE_NL2SQL_GRAPH_EXPAND": "false"}):
+            assert _graph_expand_enabled({"flatGraphExpand": True}) is True
+        with patch.dict(os.environ, {"SERVE_NL2SQL_GRAPH_EXPAND": "true"}):
+            assert _graph_expand_enabled({"flatGraphExpand": False}) is False
+
+    def test_an_unrecognised_value_defers_instead_of_disabling(self):
+        # A typo must not silently mean "off" at either layer — it falls through to
+        # the next one, and only an explicit falsy value turns the walk off.
+        with patch.dict(os.environ, {"SERVE_NL2SQL_GRAPH_EXPAND": "maybe"}):
+            assert _graph_expand_enabled({}) is True
+        with patch.dict(os.environ, {"SERVE_NL2SQL_GRAPH_EXPAND": "false"}):
+            assert _graph_expand_enabled({"flatGraphExpand": "maybe"}) is False
 
 
 # ── the appended-table budget ─────────────────────────────────────────────────
@@ -344,11 +372,12 @@ class TestGraphExpandMaxTables:
     the override, not the query.
     """
 
-    def test_default_is_about_double_the_retrieved_block(self):
-        with patch.dict(os.environ, {}, clear=True):
-            assert _resolve_graph_expand_max_tables() == 15
-        # The stated basis for 15: retrieval's own table count, so the appended block
+    def test_the_default_is_the_value_the_walk_was_measured_at(self):
+        # 8 is what every benchmark cell behind default-on ran at, and it is also
+        # about the retrieved block's own table count, so the appended block
         # supplements the retrieved one instead of drowning it.
+        with patch.dict(os.environ, {}, clear=True):
+            assert _resolve_graph_expand_max_tables() == 8
         assert DEFAULT_RETRIEVAL_K == 7
 
     def test_env_override(self):
@@ -362,9 +391,29 @@ class TestGraphExpandMaxTables:
     def test_a_bad_value_costs_the_override_not_the_query(self):
         # Anything unparseable degrades to the default; a negative clamps to the
         # floor. Neither raises out of a request path.
-        for bad, expected in (("", 15), ("eight", 15), ("15.5", 15), ("-3", 0)):
+        for bad, expected in (("", 8), ("eight", 8), ("8.5", 8), ("-3", 0)):
             with patch.dict(os.environ, {"SERVE_NL2SQL_GRAPH_EXPAND_MAX_TABLES": bad}):
                 assert _resolve_graph_expand_max_tables() == expected, bad
+
+    def test_an_ignored_override_says_so(self):
+        # Falling back to the default is the safe behaviour, but doing it quietly
+        # means an operator who mistyped the cap reads the default's results as
+        # their own setting's. Both events carry the value that was rejected.
+        with (
+            patch.dict(os.environ, {"SERVE_NL2SQL_GRAPH_EXPAND_MAX_TABLES": "eight"}),
+            structlog.testing.capture_logs() as logs,
+        ):
+            _resolve_graph_expand_max_tables()
+        invalid = next(log for log in logs if log["event"] == "nl_to_sql_graph_expand_max_tables_invalid")
+        assert invalid["value"] == "eight" and invalid["using"] == 8
+
+        with (
+            patch.dict(os.environ, {"SERVE_NL2SQL_GRAPH_EXPAND_MAX_TABLES": "-3"}),
+            structlog.testing.capture_logs() as logs,
+        ):
+            _resolve_graph_expand_max_tables()
+        clamped = next(log for log in logs if log["event"] == "nl_to_sql_graph_expand_max_tables_clamped")
+        assert clamped["requested"] == -3 and clamped["using"] == 0
 
     def test_the_upper_bound_belongs_to_the_graph_tool(self):
         # Deliberately NOT clamped here: duplicating MAX_NODE_LIMIT would put the
@@ -421,10 +470,13 @@ class TestStrategyPassesExpander:
         )
         return generator.generate.await_args.kwargs["graph_expander"]
 
-    async def test_expander_only_when_the_option_is_on(self):
-        assert await self._resolve({}, graph_client=_MockGraph()) is None
-        expander = await self._resolve({"flatGraphExpand": True}, graph_client=_MockGraph())
-        assert isinstance(expander, OntologyGraphTool)
+    async def test_the_expander_reaches_the_generator_by_default(self):
+        for options in ({}, {"flatGraphExpand": True}):
+            expander = await self._resolve(options, graph_client=_MockGraph())
+            assert isinstance(expander, OntologyGraphTool), options
+
+    async def test_opting_out_withholds_the_expander(self):
+        assert await self._resolve({"flatGraphExpand": False}, graph_client=_MockGraph()) is None
 
     async def test_the_expander_is_scoped_to_the_requests_namespace(self):
         # The tool binds its namespace at construction, so a request-scoped instance
