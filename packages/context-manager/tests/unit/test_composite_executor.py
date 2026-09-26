@@ -42,6 +42,7 @@ def _jdbc_registry(engine: str = "POSTGRESQL"):
         "queryEngine": "JDBC",
         "queryable": True,
         "credentialSecretArn": "arn:secret",
+        "discoveredSchemas": ["mydb", "public", "sales", "crm", "orders", "customers"],
     }
     if engine:
         record["configuration"] = json.dumps({"engine": engine})
@@ -280,6 +281,7 @@ class TestJdbcRouteNamespaceScopeAuthorization:
         from coa_serve.clients.sources_registry import SourcesRegistry, SQLNamespaceScope
 
         reg = _jdbc_registry()  # base record for routing + dialect
+        reg.get_source.return_value["discoveredSchemas"] = list(databases)
         reg.sql_namespace_scope.return_value = SQLNamespaceScope(
             native_databases=frozenset(databases),
             federated_catalog_schemas=frozenset(),

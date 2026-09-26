@@ -30,6 +30,7 @@ from ..trace import TraceCollector
 
 if TYPE_CHECKING:
     from ..deadline import Deadline
+    from ..tier1.metric_resolver import DeclinedMetricContext
 
 logger = structlog.get_logger(__name__)
 
@@ -118,6 +119,11 @@ class StrategyContext:
     # then fall back to their fixed internal timeouts (pre-A0 behaviour), so an
     # unwired call site degrades safely instead of erroring.
     deadline: Deadline | None = None
+    # The governed metric Tier-1 matched but declined to execute, when its
+    # residual-qualifier gate fired. None on every other path (no match, a clean
+    # Tier-1 hit, or a caller that starts at Tier 2). Carries the authored formula
+    # forward so Tier 2 extends the business's definition instead of reinventing it.
+    declined_metric: DeclinedMetricContext | None = None
 
 
 # ── Protocol ─────────────────────────────────────────────────────────────
@@ -368,6 +374,10 @@ class StructuredQueryTier:
                 trace=TraceCollector(),
                 model_id=context.model_id,
                 deadline=context.deadline,
+                # Frozen dataclass, so the shared reference carries no race — and it
+                # must be copied here or the parallel path silently loses the
+                # governed definition the sequential path gets.
+                declined_metric=context.declined_metric,
             )
             for _ in strategies
         ]

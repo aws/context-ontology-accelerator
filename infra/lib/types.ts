@@ -126,7 +126,7 @@ export interface SsmConfig {
   readonly customDomain?: string;
 
   /** Bedrock LLM model ID for query resolution (NL-to-SPARQL, synthesis).
-   *  Defaults to us.anthropic.claude-sonnet-5 at runtime when omitted. */
+   *  Defaults to DEFAULT_BEDROCK_LLM_MODEL_ID when omitted. */
   readonly bedrockLlmModelId?: string;
 
   /** Bedrock embedding model ID used by every embedding producer and consumer

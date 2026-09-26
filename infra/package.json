@@ -1,6 +1,6 @@
 {
   "name": "coa-infra",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "SemanticContext CDK Infrastructure (TypeScript)",
   "private": true,
   "scripts": {
@@ -33,7 +33,7 @@
   },
   "dependencies": {
     "@coa/shared": "workspace:*",
-    "aws-cdk-lib": "^2.260.0",
+    "aws-cdk-lib": "^2.270.0",
     "cdk-monitoring-constructs": "10.2.0",
     "constructs": "^10.0.0"
   }
