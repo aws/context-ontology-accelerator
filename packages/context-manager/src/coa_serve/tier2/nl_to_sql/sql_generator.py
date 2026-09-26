@@ -390,6 +390,7 @@ class SQLGenerator:
         model_id: str | None = None,
         dialect: str | None = None,
         graph_expander: GraphExpander | None = None,
+        governed_metric: str = "",
     ) -> NLtoSQLResult:
         """Run the NL-to-SQL pipeline: retrieve → expand → generate SQL.
 
@@ -412,6 +413,10 @@ class SQLGenerator:
                 to the schema context with their columns. ``None`` — the default and
                 the only value on the unflagged path — skips the walk entirely, so
                 the prompt is byte-identical to the retrieval-only baseline.
+            governed_metric: Optional rendered governed-metric definition that
+                Tier-1 matched but declined (see
+                ``DeclinedMetricContext.prompt_block``). Empty — the default —
+                leaves the prompt byte-identical to the pre-change baseline.
         """
         trace: list[dict[str, Any]] = []
 
@@ -609,7 +614,7 @@ class SQLGenerator:
         start = time.perf_counter()
         try:
             sql, confidence = await self._generate_sql(
-                question, ddl_context, evidence, model_id=model_id, dialect=dialect
+                question, ddl_context, evidence, model_id=model_id, dialect=dialect, governed_metric=governed_metric
             )
             trace.append({"step": "generate_sql", "status": "ok", "ms": _ms(start), "confidence": confidence})
         except Exception as e:
@@ -648,6 +653,7 @@ class SQLGenerator:
         model_id: str | None = None,
         dialect: str | None = None,
         feedback: str = "",
+        governed_metric: str = "",
     ) -> tuple[str, float]:
         """Generate SQL from an ALREADY-ASSEMBLED schema context.
 
@@ -663,12 +669,20 @@ class SQLGenerator:
             model_id: Optional per-call LLM model override.
             dialect: Optional per-call SQL dialect override.
             feedback: Optional prior-attempt SQL + observation to revise from.
+            governed_metric: Optional rendered governed-metric definition that
+                Tier-1 matched but declined.
 
         Returns:
             Tuple of (sql_string, confidence_score).
         """
         return await self._generate_sql(
-            question, ddl_context, evidence, model_id=model_id, dialect=dialect, feedback=feedback
+            question,
+            ddl_context,
+            evidence,
+            model_id=model_id,
+            dialect=dialect,
+            feedback=feedback,
+            governed_metric=governed_metric,
         )
 
     async def correct(
@@ -679,6 +693,7 @@ class SQLGenerator:
         execution_error: str,
         evidence: str = "",
         model_id: str | None = None,
+        governed_metric: str = "",
     ) -> tuple[str, float]:
         """LLM-driven repair of a SQL statement that failed to execute.
 
@@ -693,6 +708,12 @@ class SQLGenerator:
         Reuses the caller's retrieved ``ddl_context`` so no re-embed/re-retrieval
         happens on the retry — only one extra LLM call plus one extra execution.
 
+        ``governed_metric`` carries the same first-party definition block the
+        first shot got (see ``DeclinedMetricContext.prompt_block``). It MUST be
+        forwarded here too: without it the correction re-derives the metric from
+        the schema, discarding the governed formula on exactly the retry the writer
+        most needs it — the point of #1116.
+
         Returns (corrected_sql, confidence).
         """
         evidence_block = (
@@ -703,8 +724,14 @@ class SQLGenerator:
             if evidence
             else ""
         )
+        # Same first-party placement as _generate_sql: ahead of the untrusted
+        # evidence block, so the authored definition survives the correction shot.
+        governed_metric_block = (
+            f"\n## Governed metric (first-party, authoritative)\n{governed_metric}\n" if governed_metric else ""
+        )
         prompt = (
             f"## Database Schema (relevant tables)\n```sql\n{ddl_context}\n```\n"
+            f"{governed_metric_block}"
             f"{evidence_block}"
             f"\n## Question\n{question}\n\n"
             f"## Previous attempt (FAILED)\n```sql\n{failed_sql}\n```\n"
@@ -753,6 +780,7 @@ class SQLGenerator:
         model_id: str | None = None,
         dialect: str | None = None,
         feedback: str = "",
+        governed_metric: str = "",
     ) -> tuple[str, float]:
         """Call LLM to generate SQL from question and DDL context.
 
@@ -766,6 +794,13 @@ class SQLGenerator:
                 strategy re-generates after a failed/empty run, this carries the
                 previous query and what executing it returned, so the writer
                 REVISES it instead of re-emitting byte-identical SQL at temp 0.
+            governed_metric: Optional authored metric definition that Tier-1
+                matched but declined to execute (see
+                ``DeclinedMetricContext.prompt_block``). FIRST-PARTY and
+                authoritative — deliberately NOT routed through ``evidence``,
+                which is labelled untrusted user input and truncated to 500
+                chars. Given, the writer extends the governed formula instead of
+                reinventing one.
 
         Returns:
             Tuple of (sql_string, confidence_score).
@@ -777,6 +812,12 @@ class SQLGenerator:
             )
             if evidence
             else ""
+        )
+        # Placed BEFORE the untrusted evidence block so the authored definition is
+        # the first context the writer reads, and so the two trust levels stay
+        # visibly separate in the prompt.
+        governed_metric_block = (
+            f"\n## Governed metric (first-party, authoritative)\n{governed_metric}\n" if governed_metric else ""
         )
         feedback_block = (
             (
@@ -801,6 +842,7 @@ class SQLGenerator:
         # guardrail can only score the guardContent copy.
         prompt = (
             f"## Database Schema (relevant tables)\n```sql\n{ddl_context}\n```\n"
+            f"{governed_metric_block}"
             f"{evidence_block}"
             f"{feedback_block}\n"
             "Return the SQL in a ```sql code block.\n"

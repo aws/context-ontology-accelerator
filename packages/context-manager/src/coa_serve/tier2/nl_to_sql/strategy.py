@@ -28,6 +28,7 @@ from __future__ import annotations
 import os
 import re
 import time
+from typing import TYPE_CHECKING
 
 import structlog
 from coa_common import ontology_vector_index_name
@@ -42,7 +43,45 @@ from ..table_qualifier import PreparedSQL, SourceLookup, prepare_execution_sql
 from ..tools import OntologyGraphTool
 from .sql_generator import NLtoSQLResult, SQLGenerator, sql_table_routing, table_sources_need_preparation
 
+if TYPE_CHECKING:
+    from ...tier1.metric_resolver import DeclinedMetricContext
+
 logger = structlog.get_logger(__name__)
+
+
+def _governed_metric_block(declined: DeclinedMetricContext | None, resolved_source_id: str) -> str:
+    """The governed-metric block to forward to the SQL writer, or ``""`` when it must not be.
+
+    Two suppressions, both the same principle — never ship a block we can't stand behind:
+
+    - **No formula.** ``prompt_block`` already returns ``""`` for a template-less
+      metric, so a metric that matched by name but carries no SQL forwards nothing.
+    - **Source contradiction.** The metric's formula is authored against
+      ``declined.data_source_id``; Tier 2 resolves its own execution source
+      independently (request pin, else k-NN retrieval). When the two are both known
+      and DIFFER, "preserve this formula" is actively harmful — the resolved
+      source's schema may not contain the formula's tables (wrong-source SQL, or a
+      burned correction shot), and the formula's Trino dialect may not match the
+      resolved source's. Dropping the block is better than instructing the writer
+      to preserve a formula it cannot satisfy. When the resolved source is unknown
+      (unpinned, before retrieval) we cannot prove a contradiction, so we forward
+      best-effort — the downstream firewall + executor still enforce scope.
+    """
+    if declined is None:
+        return ""
+    block = declined.prompt_block
+    if not block:
+        return ""
+    if declined.data_source_id and resolved_source_id and declined.data_source_id != resolved_source_id:
+        logger.info(
+            "governed_metric_suppressed_source_mismatch",
+            metric=declined.metric_name,
+            metric_source=declined.data_source_id,
+            resolved_source=resolved_source_id,
+        )
+        return ""
+    return block
+
 
 # Total NL→SQL attempts per query, INCLUDING the first shot. 2 = one generate +
 # one execution-error-driven correction. 1 disables self-correction (pure
@@ -276,6 +315,12 @@ class NLtoSQLStrategy:
             model_id=context.model_id,
             dialect=dialect,
             graph_expander=graph_expander,
+            # Forward the declined governed definition — but only when it is safe to
+            # (a real formula, and a source that does not contradict the one resolved
+            # here). ``data_source_id`` at this point is the request pin (empty when
+            # unpinned, so pre-retrieval we forward best-effort). Empty on every
+            # non-declining path, keeping the prompt byte-identical to the baseline.
+            governed_metric=_governed_metric_block(context.declined_metric, data_source_id),
         )
 
         t_ms = int((time.perf_counter() - t_start) * 1000)
@@ -516,6 +561,12 @@ class NLtoSQLStrategy:
                     execution_error=last_error,
                     evidence=evidence,
                     model_id=context.model_id,
+                    # Forward on the retry too — but now the source is KNOWN
+                    # (``data_source_id`` here is the resolved source, not just the
+                    # pin), so the mismatch suppression actually bites: a formula
+                    # authored against a different source is dropped rather than
+                    # fed into the correction, which would otherwise burn the shot.
+                    governed_metric=_governed_metric_block(context.declined_metric, data_source_id),
                 )
                 correct_ms = int((time.perf_counter() - correct_start) * 1000)
                 if not sql:
@@ -558,8 +609,10 @@ class NLtoSQLStrategy:
         Delegates to the shared :func:`~..table_qualifier.prepare_execution_sql`
         so this path and the VKG path cannot diverge on how they rewrite or on how
         they react to an unattributable reference. Returns ``sql`` unchanged for a
-        single-source statement, when no registry is wired, or when the rewrite
-        cannot be completed.
+        single-source statement. When a cross-source rewrite is required but cannot
+        be completed (no registry, an unknown datasource, a missing schema, ...),
+        the result carries ``error`` and the caller refuses the query instead of
+        executing it bare.
 
         An ambiguity error IS reachable from here: when the retrieval hits
         attribute one bare name to two classes (e.g. a source exposing

@@ -143,12 +143,14 @@ Inbound queries are dispatched through a tiered resolution system:
 
 | Tier | Strategy | Relative Latency | Trigger |
 |------|----------|------------------|---------|
-| Tier 1 | Deterministic metric lookup | Fast | Exact metric name/synonym match, simple query |
+| Tier 1 | Deterministic metric lookup | Fast | Exact metric name/synonym match **that accounts for the whole question** |
 | Tier 2 | Ontology-guided NL-to-SPARQL | Medium | Vector search finds ontology classes/properties |
 | Tier 2.5 | Ontology-grounded direct LLM SQL generation | Medium | Tier-2 result confidence below `TIER2_CONFIDENCE_THRESHOLD` (default 0.6) |
 | Tier 3 | LLM-powered synthesis | Slow | Complex, multi-metric, or ambiguous queries |
 
 Routing is automatic based on complexity signals (compare, trend, top N, breakdown) and semantic matching scores. Use `tierOverride` in the request `options` field to force a specific tier (1, 2, 2.5, or 3). Tier-2.5-generated SQL passes through the same SQL firewall (terminal 403 on deny) and the same composite executor as Tiers 1 and 2.
+
+A Tier-1 match that leaves part of the question unconsumed (a filter, grouping, time window — or any other leftover token) is a **partial** match: Tier 1 runs metric SQL verbatim, so answering would return the broader aggregate. Tier 1 declines these to Tier 2, but forwards the matched metric's formula, description and dimensions plus the unhandled span as authoritative context, so Tier 2 extends the governed definition instead of re-deriving it. See [Residual-qualifier gate](docs/query-routing.md#residual-qualifier-gate) and [Forwarding a declined definition to Tier 2](docs/query-routing.md#forwarding-a-declined-definition-to-tier-2).
 
 ### Tier-2 strategy selection (`options.strategy`)
 

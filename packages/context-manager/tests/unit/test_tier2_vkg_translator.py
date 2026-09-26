@@ -592,17 +592,18 @@ class TestVKGTranslatorCrossSourceQualification:
         assert "pg_cat.public.customers" in executed
         assert "awsdatacatalog.crm.customers" in executed
 
-    async def test_no_registry_keeps_previous_behaviour(self):
-        """Without a registry wired, the pipeline behaves exactly as before."""
+    async def test_no_registry_fails_closed_without_executing(self):
+        """Detected cross-source SQL without registry metadata must not execute bare."""
         routing = {
             "claims": {"datasourceId": "ds-pg", "sourceSchema": "public"},
             "policies": {"datasourceId": "ds-glue", "sourceSchema": "insurance"},
         }
         executor = _make_executor()
         translator = _make_translator(vkg_client=self._vkg(routing), firewall=self._firewall(), executor=executor)
-        await translator.resolve("SELECT ?s WHERE { ?s ?p ?o }", namespace="demo")
+        result = await translator.resolve("SELECT ?s WHERE { ?s ?p ?o }", namespace="demo")
 
-        assert executor.execute.call_args.args[0] == self._SQL
+        assert result.error == "query_qualification_error"
+        executor.execute.assert_not_awaited()
 
 
 @pytest.mark.unit

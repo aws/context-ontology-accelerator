@@ -15,6 +15,56 @@ This guide walks you through deploying Context Ontology Accelerator into your AW
 | Java | 17+ | Smithy code generation |
 | Docker | — | Container image builds |
 
+### ARM64 container builds on x86_64 hosts
+
+Several CDK assets are built explicitly for `linux/arm64`: the Context Manager
+(Serve), MCP, and VKG images. A native ARM64 machine needs no emulation. An
+x86_64 Linux host must have binfmt/QEMU registered before Docker can execute
+ARM64 build steps; otherwise the build commonly stops with `exec format error`.
+
+Docker Desktop includes multi-platform emulation on supported installations.
+Verify the active Docker builder before deploying:
+
+```bash
+docker buildx inspect --bootstrap
+docker run --rm --platform linux/arm64 alpine uname -m
+```
+
+The builder's platform list should include `linux/arm64`, and the second command
+should print `aarch64`. If Docker Engine on Linux does not have ARM64 emulation,
+follow [Docker's QEMU setup guidance](https://docs.docker.com/build/building/multi-platform/#qemu).
+The [tonistiigi/binfmt installer](https://github.com/tonistiigi/binfmt#installing-emulators)
+accepts an architecture-specific install so the host only registers the
+emulator needed here:
+
+```bash
+docker run --privileged --rm tonistiigi/binfmt --install arm64
+
+# Verify again before make deploy-dev
+docker run --rm --platform linux/arm64 alpine uname -m
+```
+
+!!! warning "binfmt installation is privileged"
+    Registering binfmt modifies the host kernel configuration and the command
+    above runs a privileged container. Follow your organization's host-security
+    policy. Where privileged setup is not allowed, use a native ARM64 builder or
+    supply prebuilt ARM64 ECR images instead of building the assets locally.
+    `context_manager_image_uri` supplies the shared Context Manager image used
+    by the Serve and MCP stacks. VKG requires `vkg_image_uri` together with
+    `ecr_repository_arn` and `ecr_repository_name`.
+
+If a build still fails:
+
+1. Check whether `CDK_DOCKER` selects Docker, Finch, or another engine. Register
+   emulation in the same engine that CDK will use.
+2. When Docker is active, re-run `docker buildx inspect --bootstrap` and confirm
+   `linux/arm64` is listed.
+3. Run the Docker Alpine verification command above. An `exec format error` there is a
+   host/emulation problem, before CDK or application code is involved.
+4. On a remote or custom builder, inspect the selected builder with
+   `docker buildx ls`; registration on the local default engine does not
+   configure a different builder automatically.
+
 ## AWS Account Setup
 
 Context Ontology Accelerator deploys into a single AWS account and region. Ensure the deploying principal has `AdministratorAccess` or equivalent permissions for the initial deployment.

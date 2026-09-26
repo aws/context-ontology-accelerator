@@ -28,12 +28,21 @@
     <junit.version>5.10.2</junit.version>
     <surefire.version>3.2.5</surefire.version>
     <shade.version>3.5.1</shade.version>
+    <jackson.version>2.18.9</jackson.version>
   </properties>
 
   <!-- Versions live here so a connector's pom names dependencies without pinning them,
        and the SDK is bumped in one place for the toolkit and every connector at once. -->
   <dependencyManagement>
     <dependencies>
+      <!-- Overrides the Jackson the Athena SDK pulls in transitively. -->
+      <dependency>
+        <groupId>com.fasterxml.jackson</groupId>
+        <artifactId>jackson-bom</artifactId>
+        <version>${jackson.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
       <dependency>
         <groupId>dev.coa</groupId>
         <artifactId>coa-connector-toolkit</artifactId>
