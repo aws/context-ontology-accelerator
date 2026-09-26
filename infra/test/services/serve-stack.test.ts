@@ -8,6 +8,7 @@ import * as lambda from "aws-cdk-lib/aws-lambda";
 import { Template, Match } from "aws-cdk-lib/assertions";
 import { ServeStack } from "../../lib/stacks/services/serve-stack";
 import {
+  DEFAULT_BEDROCK_LLM_MODEL_ID,
   DEFAULT_RESOURCE_PREFIX,
   DEFAULT_ENV,
   DEFAULT_GRAPH_URI_BASE,
@@ -660,6 +661,16 @@ describe("ServeStack - custom Athena federation connector IAM", () => {
         s.Condition?.StringEquals?.["kms:ViaService"] === undefined,
     );
     expect(unguarded).toEqual([]);
+  });
+});
+
+describe("ServeStack - query LLM model", () => {
+  it("emits BEDROCK_MODEL_ID with the shared default when bedrockLlmModelId is unset", () => {
+    createStack().hasResourceProperties("AWS::BedrockAgentCore::Runtime", {
+      EnvironmentVariables: Match.objectLike({
+        BEDROCK_MODEL_ID: DEFAULT_BEDROCK_LLM_MODEL_ID,
+      }),
+    });
   });
 });
 

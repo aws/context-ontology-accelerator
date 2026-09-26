@@ -15,6 +15,56 @@ This guide walks you through deploying Context Ontology Accelerator into your AW
 | Java | 17+ | Smithy code generation |
 | Docker | — | Container image builds |
 
+### ARM64 container builds on x86_64 hosts
+
+Several CDK assets are built explicitly for `linux/arm64`: the Context Manager
+(Serve), MCP, and VKG images. A native ARM64 machine needs no emulation. An
+x86_64 Linux host must have binfmt/QEMU registered before Docker can execute
+ARM64 build steps; otherwise the build commonly stops with `exec format error`.
+
+Docker Desktop includes multi-platform emulation on supported installations.
+Verify the active Docker builder before deploying:
+
+```bash
+docker buildx inspect --bootstrap
+docker run --rm --platform linux/arm64 alpine uname -m
+```
+
+The builder's platform list should include `linux/arm64`, and the second command
+should print `aarch64`. If Docker Engine on Linux does not have ARM64 emulation,
+follow [Docker's QEMU setup guidance](https://docs.docker.com/build/building/multi-platform/#qemu).
+The [tonistiigi/binfmt installer](https://github.com/tonistiigi/binfmt#installing-emulators)
+accepts an architecture-specific install so the host only registers the
+emulator needed here:
+
+```bash
+docker run --privileged --rm tonistiigi/binfmt --install arm64
+
+# Verify again before make deploy-dev
+docker run --rm --platform linux/arm64 alpine uname -m
+```
+
+!!! warning "binfmt installation is privileged"
+    Registering binfmt modifies the host kernel configuration and the command
+    above runs a privileged container. Follow your organization's host-security
+    policy. Where privileged setup is not allowed, use a native ARM64 builder or
+    supply prebuilt ARM64 ECR images instead of building the assets locally.
+    `context_manager_image_uri` supplies the shared Context Manager image used
+    by the Serve and MCP stacks. VKG requires `vkg_image_uri` together with
+    `ecr_repository_arn` and `ecr_repository_name`.
+
+If a build still fails:
+
+1. Check whether `CDK_DOCKER` selects Docker, Finch, or another engine. Register
+   emulation in the same engine that CDK will use.
+2. When Docker is active, re-run `docker buildx inspect --bootstrap` and confirm
+   `linux/arm64` is listed.
+3. Run the Docker Alpine verification command above. An `exec format error` there is a
+   host/emulation problem, before CDK or application code is involved.
+4. On a remote or custom builder, inspect the selected builder with
+   `docker buildx ls`; registration on the local default engine does not
+   configure a different builder automatically.
+
 ## AWS Account Setup
 
 Context Ontology Accelerator deploys into a single AWS account and region. Ensure the deploying principal has `AdministratorAccess` or equivalent permissions for the initial deployment.
@@ -381,6 +431,27 @@ SCL_LAMBDA_RESERVED_CONCURRENCY=0 make deploy-dev
 ```
 
 The value must be a non-negative integer; CDK fails synth otherwise. `0` (or unset via context) omits the reservation entirely — the functions then draw from the shared unreserved pool with no dedicated guarantee or cap, which is fine for a single-tenant evaluation. On a direct `cdk deploy`, pass it as context instead — `--context lambda_reserved_concurrency=0`, or set it in the `context` block of `infra/cdk.json`.
+
+#### Tier-2 NL→SQL ontology foreign-key expansion
+
+When Tier 2 answers a question with flat NL→SQL, it first retrieves the tables that best match the question. It then follows the ontology's foreign keys one step out from those tables and adds the tables it reaches, with their columns and join keys, to the prompt. This lets the model write a join to a table the search did not rank. It is **on by default** and needs the ontology graph (Neptune); a deployment without one skips it and uses the retrieved tables alone. If the graph query fails, the question is still answered from the retrieved tables.
+
+Two settings control it:
+
+```bash
+# Turn the expansion off for the whole deployment (default: on)
+SCL_NL2SQL_GRAPH_EXPAND=false make deploy-dev
+
+# Let it append up to 12 walked tables (default is 8)
+SCL_NL2SQL_GRAPH_EXPAND_MAX_TABLES=12 make deploy-dev
+```
+
+- **`serve_nl2sql_graph_expand`** — `false`/`0`/`off`/`no` turns it off; `true`/`1`/`on`/`yes` turns it on explicitly. Any other value is ignored and the default (on) applies.
+- **`serve_nl2sql_graph_expand_max_tables`** — how many walked tables may be added. `0` adds none. A value that is not a whole number falls back to 8, and a negative one is treated as `0`; both log a warning. The graph tool caps the walk at 200 tables whatever you set. Raise it when the table a join needs is often missing from the prompt and the prompt has room.
+
+Leaving either setting unset leaves the runtime's default in charge; the stack only sets the Serve runtime variable (`SERVE_NL2SQL_GRAPH_EXPAND` / `SERVE_NL2SQL_GRAPH_EXPAND_MAX_TABLES`) when you pass a value. Changing either one is a stack update, not an image rebuild. A single request can also override the deployment setting with `options.flatGraphExpand` (`true` or `false`). An A/B test that compares the expansion on and off must pass `flatGraphExpand: false` for the "off" arm; leaving the option out now means on.
+
+`scripts/deploy.sh` maps the variables above to the CDK context parameters `serve_nl2sql_graph_expand` and `serve_nl2sql_graph_expand_max_tables`. On a direct `cdk deploy`, pass them as context instead — `--context serve_nl2sql_graph_expand=false` — or set them in the `context` block of `infra/cdk.json`.
 
 ### VKG Task Sizing
 

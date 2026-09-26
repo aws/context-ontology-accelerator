@@ -28,6 +28,7 @@ from __future__ import annotations
 import os
 import re
 import time
+from typing import TYPE_CHECKING
 
 import structlog
 from coa_common import ontology_vector_index_name
@@ -42,7 +43,45 @@ from ..table_qualifier import PreparedSQL, SourceLookup, prepare_execution_sql
 from ..tools import OntologyGraphTool
 from .sql_generator import NLtoSQLResult, SQLGenerator, sql_table_routing, table_sources_need_preparation
 
+if TYPE_CHECKING:
+    from ...tier1.metric_resolver import DeclinedMetricContext
+
 logger = structlog.get_logger(__name__)
+
+
+def _governed_metric_block(declined: DeclinedMetricContext | None, resolved_source_id: str) -> str:
+    """The governed-metric block to forward to the SQL writer, or ``""`` when it must not be.
+
+    Two suppressions, both the same principle — never ship a block we can't stand behind:
+
+    - **No formula.** ``prompt_block`` already returns ``""`` for a template-less
+      metric, so a metric that matched by name but carries no SQL forwards nothing.
+    - **Source contradiction.** The metric's formula is authored against
+      ``declined.data_source_id``; Tier 2 resolves its own execution source
+      independently (request pin, else k-NN retrieval). When the two are both known
+      and DIFFER, "preserve this formula" is actively harmful — the resolved
+      source's schema may not contain the formula's tables (wrong-source SQL, or a
+      burned correction shot), and the formula's Trino dialect may not match the
+      resolved source's. Dropping the block is better than instructing the writer
+      to preserve a formula it cannot satisfy. When the resolved source is unknown
+      (unpinned, before retrieval) we cannot prove a contradiction, so we forward
+      best-effort — the downstream firewall + executor still enforce scope.
+    """
+    if declined is None:
+        return ""
+    block = declined.prompt_block
+    if not block:
+        return ""
+    if declined.data_source_id and resolved_source_id and declined.data_source_id != resolved_source_id:
+        logger.info(
+            "governed_metric_suppressed_source_mismatch",
+            metric=declined.metric_name,
+            metric_source=declined.data_source_id,
+            resolved_source=resolved_source_id,
+        )
+        return ""
+    return block
+
 
 # Total NL→SQL attempts per query, INCLUDING the first shot. 2 = one generate +
 # one execution-error-driven correction. 1 disables self-correction (pure
@@ -81,6 +120,37 @@ _MIN_EXEC_TIMEOUT_S = 5.0
 _CORRECTION_MARGIN_S = 2.0
 
 
+_TRUTHY = ("1", "true", "on", "yes")
+_FALSY = ("0", "false", "off", "no")
+
+# Expansion is ON unless something turns it off. It shipped off in !999 and was
+# flipped once the third repeat of each cell landed: execution accuracy is up in
+# 6 of 6 Spider 2.0 arm x seed contrasts (+2.2 to +7.4pp; 810 paired questions,
+# 67 win / 35 loss, exact p=0.002; question-clustered bootstrap CI +1.1 to +7.0pp,
+# excluding zero), and retrieval full-hit is up in 8 of 9 repeats across all three
+# cells (+6 to +20.8pp). BIRD's execution accuracy is a three-repeat wash
+# (+0.2pp, p=0.78) at +11.9pp full-hit, so the flip is a gain where it helps and
+# neutral where it does not — which is what makes ON the better default rather
+# than merely the better average.
+_GRAPH_EXPAND_DEFAULT = True
+
+
+def _tri_state(raw: object) -> bool | None:
+    """``True``/``False`` for a recognised flag value, ``None`` for anything else.
+
+    ``None`` means "this layer said nothing" — unset, empty, or a typo — and the
+    next layer decides. Distinguishing it from ``False`` is what lets a caller turn
+    the walk OFF against a deployment that has it on; treating an unrecognised
+    value as ``False`` would have silently overridden the default instead.
+    """
+    text = str(raw).strip().lower()
+    if text in _TRUTHY:
+        return True
+    if text in _FALSY:
+        return False
+    return None
+
+
 def _graph_expand_enabled(options: dict | None = None) -> bool:
     """True when ontology-graph expansion of the retrieved tables is on.
 
@@ -91,15 +161,22 @@ def _graph_expand_enabled(options: dict | None = None) -> bool:
     not call, this fires on every generation, so the measured effect is the graph's,
     not the model's tool adherence.
 
-    Two toggles, matching the agentic flags: env ``SERVE_NL2SQL_GRAPH_EXPAND``
-    (deployment-wide, off) and per-request ``options.flatGraphExpand``. The
-    per-request form is what lets expansion-on and expansion-off run PAIRED against
-    ONE image; without it the two arms need two deployments and the delta is
-    confounded with everything else that differed between them.
+    Three layers, most specific first: per-request ``options.flatGraphExpand``, then
+    deployment-wide ``SERVE_NL2SQL_GRAPH_EXPAND``, then ``_GRAPH_EXPAND_DEFAULT``
+    (on). Both explicit layers can say OFF as well as ON — the per-request form is
+    what lets expansion-on and expansion-off run PAIRED against ONE image, and now
+    that the default is on, an A/B's control arm must pass
+    ``flatGraphExpand: false`` rather than omit the option, or it measures the
+    treatment twice.
     """
-    if options and str(options.get("flatGraphExpand", "")).strip().lower() in ("1", "true", "on", "yes"):
-        return True
-    return os.environ.get("SERVE_NL2SQL_GRAPH_EXPAND", "").strip().lower() in ("1", "true", "on", "yes")
+    if options is not None:
+        per_request = _tri_state(options.get("flatGraphExpand", ""))
+        if per_request is not None:
+            return per_request
+    deployment = _tri_state(os.environ.get("SERVE_NL2SQL_GRAPH_EXPAND", ""))
+    if deployment is not None:
+        return deployment
+    return _GRAPH_EXPAND_DEFAULT
 
 
 def _user_supplied_literal_in_sql(sql: str, query: str) -> bool:
@@ -153,10 +230,11 @@ class NLtoSQLStrategy:
             oss_ontology_index: OpenSearch ontology index used for class retrieval.
             max_shots: Maximum generation+execution attempts (1 = no self-correction).
                 Defaults to the NL_TO_SQL_MAX_SHOTS env var or 2.
-            graph_client: Optional SPARQL client backing the opt-in ontology-graph
-                expansion (``SERVE_NL2SQL_GRAPH_EXPAND`` /
-                ``options.flatGraphExpand``). Unused unless one of those is on, so
-                passing it is inert on the default path.
+            graph_client: SPARQL client backing the ontology-graph expansion, which
+                is on by default (``SERVE_NL2SQL_GRAPH_EXPAND`` /
+                ``options.flatGraphExpand`` turn it off). None disables the walk
+                entirely — the generator then runs on retrieval alone, so a
+                deployment with no graph wired degrades rather than fails.
             sources_registry: Optional registry used ONLY to look up each
                 datasource's Athena catalog/schema when a generated statement spans
                 more than one source (see :mod:`..table_qualifier`). Without it, a
@@ -276,6 +354,12 @@ class NLtoSQLStrategy:
             model_id=context.model_id,
             dialect=dialect,
             graph_expander=graph_expander,
+            # Forward the declined governed definition — but only when it is safe to
+            # (a real formula, and a source that does not contradict the one resolved
+            # here). ``data_source_id`` at this point is the request pin (empty when
+            # unpinned, so pre-retrieval we forward best-effort). Empty on every
+            # non-declining path, keeping the prompt byte-identical to the baseline.
+            governed_metric=_governed_metric_block(context.declined_metric, data_source_id),
         )
 
         t_ms = int((time.perf_counter() - t_start) * 1000)
@@ -516,6 +600,12 @@ class NLtoSQLStrategy:
                     execution_error=last_error,
                     evidence=evidence,
                     model_id=context.model_id,
+                    # Forward on the retry too — but now the source is KNOWN
+                    # (``data_source_id`` here is the resolved source, not just the
+                    # pin), so the mismatch suppression actually bites: a formula
+                    # authored against a different source is dropped rather than
+                    # fed into the correction, which would otherwise burn the shot.
+                    governed_metric=_governed_metric_block(context.declined_metric, data_source_id),
                 )
                 correct_ms = int((time.perf_counter() - correct_start) * 1000)
                 if not sql:
@@ -558,8 +648,10 @@ class NLtoSQLStrategy:
         Delegates to the shared :func:`~..table_qualifier.prepare_execution_sql`
         so this path and the VKG path cannot diverge on how they rewrite or on how
         they react to an unattributable reference. Returns ``sql`` unchanged for a
-        single-source statement, when no registry is wired, or when the rewrite
-        cannot be completed.
+        single-source statement. When a cross-source rewrite is required but cannot
+        be completed (no registry, an unknown datasource, a missing schema, ...),
+        the result carries ``error`` and the caller refuses the query instead of
+        executing it bare.
 
         An ambiguity error IS reachable from here: when the retrieval hits
         attribute one bare name to two classes (e.g. a source exposing
