@@ -4,9 +4,9 @@
 """List Namespaces Lambda handler.
 
 Returns namespaces visible to the authenticated user:
-- Users with a GLOBAL role see all namespaces.
-- Users without a global role see only namespaces where they have a
-  scoped role assignment in the ResourceRoleMappings table.
+- Users with a built-in cross-namespace role see all namespaces.
+- Users without one see only namespaces where they have a scoped role
+  assignment in the ResourceRoleMappings table.
 """
 
 from __future__ import annotations
@@ -33,6 +33,9 @@ logger = structlog.get_logger(__name__)
 # DynamoDB key constants
 _NS_PK_PREFIX = "NS#"
 _METADATA_SK = "METADATA"
+# Fail closed for stale/mis-seeded GLOBAL grants: only roles whose built-in
+# contract is cross-namespace may bypass per-principal namespace filtering.
+_CROSS_NAMESPACE_ROLES = frozenset({"platform-admin", "platform-viewer"})
 
 
 # ── Pydantic input models ─────────────────────────────────────────
@@ -82,8 +85,9 @@ class AuthorizerContext(BaseModel):
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG001
     """List namespaces visible to the authenticated caller.
 
-    Callers with a global role see every namespace; others see only namespaces
-    where they hold a scoped role assignment. Rejects non-GET methods.
+    Callers with a built-in cross-namespace role see every namespace; others
+    see only namespaces where they hold a scoped role assignment. Rejects
+    non-GET methods.
 
     Args:
         event: API Gateway proxy event with authorizer-populated caller
@@ -115,7 +119,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
         return api_response(400, {"message": str(exc.errors()[0]["msg"]) if hasattr(exc, "errors") else str(exc)})
 
     try:
-        if auth.global_roles:
+        if _CROSS_NAMESPACE_ROLES.intersection(auth.global_roles):
             items, out_token = _list_all(ns_dao, params.max_results, params.next_token)
         else:
             items, out_token = _list_for_user(

@@ -14,7 +14,14 @@ export interface EvidenceItemProps {
 
 export const EvidenceItem: React.FC<EvidenceItemProps> = ({ item }) => {
   const [expanded, setExpanded] = useState(false);
-  const label = item.sourceDoc ?? item.label ?? "Unknown source";
+  const label =
+    [
+      item.sourceDocumentName,
+      item.sourceDoc,
+      item.label,
+      item.sourceDocumentId,
+    ].find((value) => typeof value === "string" && value.trim()) ??
+    "Unknown source";
   const text = item.text ?? "";
   const preview = text.length > 200 ? `${text.slice(0, 200)}…` : text;
 

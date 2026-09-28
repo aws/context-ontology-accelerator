@@ -7,8 +7,13 @@ import * as ec2 from "aws-cdk-lib/aws-ec2";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import { Template, Match } from "aws-cdk-lib/assertions";
 import type { Construct } from "constructs";
-import { ApiStack } from "../../lib/stacks/services/api-stack";
+import {
+  ApiStack,
+  INTENTIONALLY_STUBBED,
+} from "../../lib/stacks/services/api-stack";
 import { DEFAULT_RESOURCE_PREFIX, DEFAULT_ENV } from "../../lib/constants";
+import { Paths } from "../../lib/paths";
+import { readOpenApiSpec } from "../../lib/utils/api-utils";
 
 // Avoid running pip install / hashing the monorepo root during synth.
 jest.mock("../../lib/utils/python-bundling", () => ({
@@ -469,5 +474,107 @@ describe("ApiStack GET /health", () => {
     expect(
       params["method.response.header.Access-Control-Allow-Origin"],
     ).toBe("'https://app.example.com'");
+  });
+});
+
+describe("ApiStack 501-stub guard", () => {
+  // The paths the stack itself declares as deliberately unimplemented,
+  // asserted against the exported INTENTIONALLY_STUBBED below so this list
+  // can't silently drift from the guard it's meant to describe.
+  const ALLOWED_STUBS = [
+    "/health",
+    "/namespaces/{namespaceId}/ontologies/{ontologyId}/upload",
+  ];
+
+  it("keeps ALLOWED_STUBS in sync with the stack's own allowlist", () => {
+    expect(new Set(ALLOWED_STUBS)).toEqual(INTENTIONALLY_STUBBED);
+  });
+
+  const specPaths = (): string[] => {
+    const cp = readOpenApiSpec(Paths.controlPlaneOpenApiSpec, {
+      CorsOrigin: "*",
+    });
+    const dl = readOpenApiSpec(Paths.dataLayerOpenApiSpec, { CorsOrigin: "*" });
+    return [
+      ...new Set([
+        ...Object.keys(cp.paths ?? {}),
+        ...Object.keys(dl.paths ?? {}),
+      ]),
+    ];
+  };
+
+  const synth = (ssmPathHandlers?: Record<string, string>) => {
+    const app = new cdk.App({ context: TEST_CONTEXT });
+    const depStack = new cdk.Stack(app, "DepStack", {
+      env: { account: "123456789012", region: "us-east-1" },
+    });
+    const vpc = new ec2.Vpc(depStack, "Vpc");
+    const mkTable = (id: string) => mkTestTable(depStack, id);
+    return () =>
+      new ApiStack(app, "TestApiStubGuard", {
+        env: { account: "123456789012", region: "us-east-1" },
+        allowedOrigin: "*",
+        vpc,
+        rolesTable: mkTable("Roles"),
+        resourceRoleMappingsTable: mkTable("RRM"),
+        cacheInvalidationTable: mkTable("Cache"),
+        ssmPathHandlers,
+      });
+  };
+
+  const fullWiring = (omit: string[] = []): Record<string, string> =>
+    Object.fromEntries(
+      specPaths()
+        .filter((p) => !ALLOWED_STUBS.includes(p) && !omit.includes(p))
+        .map((p) => [p, "/coa/dev/some/api-fn-arn"]),
+    );
+
+  it("accepts wiring that covers every path except the declared stubs", () => {
+    expect(synth(fullWiring())).not.toThrow();
+  });
+
+  it("fails synth when a wired-up operation has no handler entry", () => {
+    // This is the same failure shape that let a fully implemented route ship
+    // behind the 501 stub: the Smithy operation exists, but app.ts omits its
+    // handler mapping.
+    const sourcesPath = "/namespaces/{namespaceId}/sources";
+    expect(specPaths()).toContain(sourcesPath);
+    expect(synth(fullWiring([sourcesPath]))).toThrow(
+      /would fall through to the 501 stub.*namespaces\/\{namespaceId\}\/sources/s,
+    );
+  });
+
+  it("fails synth when a path is wired but still listed in INTENTIONALLY_STUBBED", () => {
+    // The mirror-image mistake: a backend lands for a path that's still on the
+    // allowlist, so the "unwired" guard never sees it and the stale entry goes
+    // unnoticed. This must fail synth too, not just the reverse case above.
+    const healthPath = "/health";
+    expect(ALLOWED_STUBS).toContain(healthPath);
+    const wiring = {
+      ...fullWiring(),
+      [healthPath]: "/coa/dev/some/api-fn-arn",
+    };
+    expect(synth(wiring)).toThrow(
+      /still listed in INTENTIONALLY_STUBBED.*\/health/s,
+    );
+  });
+
+  it("fails synth when the DescribeSchema wiring is dropped", () => {
+    // /schema sat in INTENTIONALLY_STUBBED as "no backend yet" after the backend
+    // had landed (app.ts routes it to data-layer/api-fn-arn). An allowlist entry
+    // for a wired path is invisible: the guard simply stops covering it. Pinning
+    // the path here means losing the app.ts entry is a synth failure again.
+    const schemaPath = "/namespaces/{namespaceId}/schema";
+    expect(specPaths()).toContain(schemaPath);
+    expect(ALLOWED_STUBS).not.toContain(schemaPath);
+    expect(synth(fullWiring([schemaPath]))).toThrow(
+      /would fall through to the 501 stub.*namespaces\/\{namespaceId\}\/schema/s,
+    );
+  });
+
+  it("stays quiet when no wiring was supplied at all", () => {
+    // Most tests in this file construct the stack to assert on the authorizer or
+    // the WAF and pass no handlers. For them every path stubs, which is correct.
+    expect(synth()).not.toThrow();
   });
 });

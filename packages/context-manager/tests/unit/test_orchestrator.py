@@ -839,6 +839,164 @@ class TestTier1ResidualQualifierGate:
         assert step is not None
         assert step.status == "miss"
 
+    @pytest.mark.asyncio
+    async def test_declined_metric_formula_reaches_tier2(self):
+        """The gate is right to decline, but declining must not be TOTAL: if the
+        authored formula is dropped, Tier 2 reinvents the metric. The governed SQL
+        must arrive in the Tier-2 context."""
+        orch, parts = _make_orchestrator(metric_found=True, return_parts=True)
+        orch._metric_resolver.match.return_value = _qualified_match(
+            "using the operational recency-based definition",
+            metric_name="active_customer",
+            sql_template="SELECT count(*) FROM customers WHERE last_seen > now() - interval '90 days'",
+            description="Customers active by operational recency.",
+            dimensions=["region"],
+        )
+        request = InvokeRequest(
+            query="How many active customers do we have (using the operational recency-based definition)?",
+            namespace="demo",
+        )
+
+        await orch.resolve(request)
+
+        context = parts["strategy_resolve"].await_args.args[2]
+        assert context.declined_metric is not None, "Tier 2 received no governed definition"
+        assert context.declined_metric.metric_name == "active_customer"
+        assert "interval '90 days'" in context.declined_metric.sql_template
+        assert context.declined_metric.unhandled_qualifier == "using the operational recency-based definition"
+        assert context.declined_metric.description == "Customers active by operational recency."
+        assert context.declined_metric.dimensions == ("region",)
+
+    @pytest.mark.asyncio
+    async def test_namespace_name_residual_forwards_the_governed_definition(self):
+        """The tenant's own name survives as residual and trips the gate. We
+        deliberately do NOT strip it — the gate has no schema and cannot tell a filter
+        from a dataset name. Instead Tier 2 gets the governed formula plus the
+        unhandled token and decides, so the answer stops diverging from the governed
+        definition by way of a reinvented query."""
+        orch, parts = _make_orchestrator(metric_found=True, return_parts=True)
+        orch._metric_resolver.match.return_value = _qualified_match(
+            "anycompany",
+            metric_name="open_claim_count",
+            sql_template="SELECT count(*) FROM claims WHERE claim_status_code = 'OPEN'",
+        )
+        request = InvokeRequest(query="How many open claims does AnyCompany have?", namespace="demo")
+
+        response = await orch.resolve(request)
+
+        # The gate still fires — unchanged, deliberate.
+        step = _find_step(response.result.trace, "t1.metric_match")
+        assert step is not None
+        assert step.status == "residual_qualifier_bypass"
+        assert step.detail["unhandledQualifier"] == "anycompany"
+        # …but the governed definition is no longer lost.
+        context = parts["strategy_resolve"].await_args.args[2]
+        assert context.declined_metric is not None
+        assert "claim_status_code = 'OPEN'" in context.declined_metric.sql_template
+        assert context.declined_metric.unhandled_qualifier == "anycompany"
+
+    @pytest.mark.asyncio
+    async def test_trace_reports_the_definition_was_forwarded(self):
+        """ "Did Tier 2 actually get the definition?" must be answerable from the
+        trace alone, not by reading Tier-2's prompt."""
+        orch = _make_orchestrator(metric_found=True)
+        orch._metric_resolver.match.return_value = _qualified_match("last quarter")
+
+        response = await orch.resolve(InvokeRequest(query="What is revenue last quarter?", namespace="demo"))
+
+        step = _find_step(response.result.trace, "t1.metric_match")
+        assert step is not None
+        assert step.detail["governedDefinitionForwarded"] is True
+
+    @pytest.mark.asyncio
+    async def test_metric_without_a_template_reports_nothing_forwarded(self):
+        """A metric authored with no SQL has no formula to forward; the trace must
+        say so rather than claiming a definition reached Tier 2."""
+        orch = _make_orchestrator(metric_found=True)
+        orch._metric_resolver.match.return_value = _qualified_match("last quarter", sql_template="")
+
+        response = await orch.resolve(InvokeRequest(query="What is revenue last quarter?", namespace="demo"))
+
+        step = _find_step(response.result.trace, "t1.metric_match")
+        assert step is not None
+        assert step.detail["governedDefinitionForwarded"] is False
+
+    @pytest.mark.asyncio
+    async def test_tier1_miss_forwards_no_governed_definition(self):
+        """Only a DECLINED match carries a definition forward. A plain miss must not,
+        or Tier 2 would be handed a formula for a metric the question never named."""
+        orch, parts = _make_orchestrator(metric_found=False, return_parts=True)
+        orch._metric_resolver.match.return_value = MetricMatch(found=False)
+
+        await orch.resolve(InvokeRequest(query="who are our customers?", namespace="demo"))
+
+        context = parts["strategy_resolve"].await_args.args[2]
+        assert context.declined_metric is None
+
+    @pytest.mark.asyncio
+    async def test_multi_metric_bypass_forwards_no_governed_definition(self):
+        """An ambiguous multi-metric question has no single authored definition to
+        forward — picking the first would be arbitrary."""
+        orch, parts = _make_orchestrator(metric_found=True, return_parts=True)
+        orch._metric_resolver.match.return_value = _qualified_match("compare last year", match_count=2)
+
+        await orch.resolve(InvokeRequest(query="compare revenue and cost last year", namespace="demo"))
+
+        context = parts["strategy_resolve"].await_args.args[2]
+        assert context.declined_metric is None
+
+    @pytest.mark.asyncio
+    async def test_declined_unauthorized_metric_is_denied_not_forwarded(self):
+        """SECURITY REGRESSION (#1116 review): the residual-decline path must run the
+        allowedMetrics grant check too. A principal denied a metric could otherwise
+        append a qualifier, trip the gate, and have the forbidden metric's formula +
+        description forwarded into the Tier-2 prompt — using a metric they may not
+        access. The decline must instead raise AccessDeniedError, exactly as the
+        clean-question path does, and Tier 2 must never be reached."""
+        orch, parts = _make_orchestrator(metric_found=True, return_parts=True)
+        orch._metric_resolver.match.return_value = _qualified_match(
+            "for the gold tier",
+            metric_name="revenue",
+            metric_id="demo:revenue",
+            sql_template="SELECT sum(amount) FROM orders",
+        )
+        request = InvokeRequest(
+            query="What was revenue for the gold tier?",
+            namespace="demo",
+            profile={
+                "userId": "alice@example.com",
+                "allowedMetrics": ["demo:cost"],  # revenue NOT permitted
+            },
+        )
+
+        with pytest.raises(AccessDeniedError) as exc_info:
+            await orch.resolve(request)
+
+        assert "revenue" in exc_info.value.reason.lower()
+        # The forbidden definition must NOT have reached Tier 2.
+        parts["strategy_resolve"].assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_declined_authorized_metric_still_forwards(self):
+        """Control for the security test: when the metric IS permitted, the declined
+        definition is still forwarded — the grant check hoist must not break the
+        happy path."""
+        orch, parts = _make_orchestrator(metric_found=True, return_parts=True)
+        orch._metric_resolver.match.return_value = _qualified_match(
+            "for the gold tier", metric_name="revenue", metric_id="demo:revenue"
+        )
+        request = InvokeRequest(
+            query="What was revenue for the gold tier?",
+            namespace="demo",
+            profile={"userId": "alice@example.com", "allowedMetrics": ["demo:revenue"]},
+        )
+
+        await orch.resolve(request)
+
+        context = parts["strategy_resolve"].await_args.args[2]
+        assert context.declined_metric is not None
+        assert context.declined_metric.metric_name == "revenue"
+
 
 # ── Tier 3 Fallback ─────────────────────────────────────────────────────
 

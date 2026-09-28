@@ -422,6 +422,7 @@ class SQLFirewall:
         federated_catalog_schemas: frozenset[tuple[str, str]],
         default_catalog: str,
         schema_only: bool = False,
+        selected_source_schemas: frozenset[str] = frozenset(),
     ) -> bool:
         """Authorize qualified table references against one namespace's sources.
 
@@ -442,14 +443,11 @@ class SQLFirewall:
         cte_names = {cte.alias_or_name.lower() for cte in parsed.find_all(sqlglot.exp.CTE)}
         checked = False
         default_catalog_lc = (default_catalog or "AwsDataCatalog").lower()
-        # On the direct-JDBC route the catalog is supplied by the JDBC CONNECTION,
-        # not by an Athena DataCatalog, so a bare "schema.table" (the form a
-        # single-source metric emits) legitimately carries no Athena catalog and
-        # must be authorized on its SCHEMA alone — against the union of every schema
-        # the namespace owns under any authorized catalog. Pinning it to
-        # awsdatacatalog/native_databases (the Athena rule) would wrongly deny a
-        # federated JDBC source whose schema lives in federated_catalog_schemas.
-        schema_scope = set(native_databases) | {schema for _cat, schema in federated_catalog_schemas}
+        # A direct-JDBC two-part name is resolved by the selected connection, so
+        # it must be authorized against that source's schemas — not the union of
+        # schemas registered to other sources in the namespace. Three-part names
+        # still use the namespace-wide catalog-pinned checks below.
+        selected_source_schema_scope = {schema.lower() for schema in selected_source_schemas}
 
         for table in parsed.find_all(sqlglot.exp.Table):
             if not table.name or (not table.db and table.name.lower() in cte_names):
@@ -464,10 +462,9 @@ class SQLFirewall:
                 raise NamespaceSQLScopeError("SQL reference is not available in the requested namespace")
 
             if schema_only and not catalog:
-                # JDBC route, unqualified catalog: authorize on schema membership in
-                # ANY authorized catalog. A 3-part name still carries an explicit
-                # catalog and falls through to the strict catalog-pinned check below.
-                allowed = bool(database) and database in schema_scope
+                # JDBC route, unqualified catalog: the selected connection supplies
+                # the catalog, so authorize only schemas registered to that source.
+                allowed = bool(database) and database in selected_source_schema_scope
             else:
                 effective_catalog = catalog or default_catalog_lc
                 if effective_catalog == "awsdatacatalog":

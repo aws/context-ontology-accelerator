@@ -13,6 +13,7 @@ import type {
 } from "@app-types/playground";
 import { normalizeResponse } from "./normalize-response";
 import { STEP_LABELS, humanizeStepId } from "@components/Chat/step-labels";
+import { normalizeGraphContext } from "@utils/graph-context";
 
 // ── Actions ───────────────────────────────────────────────────────────
 
@@ -219,10 +220,12 @@ function historyMessagesToChatMessages(
       return base;
     }
     const meta = msg.metadata;
+    const { graphContext: rawGraphContext, ...canonicalMeta } = meta ?? {};
+    const graphContext = normalizeGraphContext(rawGraphContext);
     return {
       ...base,
       replyToId: lastUserId,
-      requestId: meta?.requestId,
+      requestId: canonicalMeta.requestId,
       response: {
         result: {
           tier: 0,
@@ -230,11 +233,12 @@ function historyMessagesToChatMessages(
           trace: [],
           partial: false,
           synthesizedAnswer: msg.content,
-          ...meta,
+          ...canonicalMeta,
+          ...(graphContext && { graphContext }),
         },
-        requestId: meta?.requestId,
+        requestId: canonicalMeta.requestId,
       },
-      liveTraceSteps: meta?.trace,
+      liveTraceSteps: canonicalMeta.trace,
     };
   });
 }

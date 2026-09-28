@@ -331,9 +331,10 @@ async def _ensure_initialized():
             firewall=firewall,
             query_executor=query_executor,
             oss_ontology_index=oss_ontology_index,
-            # Backs the opt-in ontology-graph expansion of the retrieved tables
-            # (SERVE_NL2SQL_GRAPH_EXPAND deployment-wide, options.flatGraphExpand per
-            # request); with both off the client is simply never used.
+            # Backs the ontology-graph expansion of the retrieved tables, which is ON
+            # by default (SERVE_NL2SQL_GRAPH_EXPAND turns it off deployment-wide,
+            # options.flatGraphExpand per request); passing None here leaves the flat
+            # path on retrieval alone rather than failing.
             graph_client=neptune_client,
             sources_registry=sources_registry,
         )
