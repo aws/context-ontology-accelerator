@@ -211,7 +211,13 @@ class CompositeQueryExecutor:
             # bare/qualified join) could reference a schema OUTSIDE the namespace's
             # authorized scope and execute unauthorized on the source credential.
             # Checked on the pre-transpile Trino SQL, which carries the qualifiers.
-            await self._authorize_qualified_references(sql, namespace)
+            discovered_schemas = jdbc_source.get("discoveredSchemas")
+            selected_source_schemas = frozenset(
+                str(schema).lower()
+                for schema in (discovered_schemas if isinstance(discovered_schemas, list) else [])
+                if isinstance(schema, str)
+            )
+            await self._authorize_qualified_references(sql, namespace, selected_source_schemas)
             return await self._source_db.execute(  # type: ignore[union-attr]
                 transpiled_sql,
                 namespace=namespace,
@@ -267,7 +273,12 @@ class CompositeQueryExecutor:
             timeout_seconds=timeout_seconds,
         )
 
-    async def _authorize_qualified_references(self, sql: str, namespace: str) -> None:
+    async def _authorize_qualified_references(
+        self,
+        sql: str,
+        namespace: str,
+        selected_source_schemas: frozenset[str],
+    ) -> None:
         """Deny qualified references outside ``namespace`` before the JDBC route runs.
 
         Mirrors ``AthenaQueryExecutor._authorize_qualified_references`` /
@@ -293,12 +304,11 @@ class CompositeQueryExecutor:
                 federated_catalog_schemas=scope.federated_catalog_schemas,
                 default_catalog="awsdatacatalog",
                 # The direct-JDBC connection supplies the catalog, so a bare
-                # "schema.table" (the single-source metric form) is authorized on
-                # its schema against ANY authorized catalog — not pinned to
-                # awsdatacatalog, which would deny a federated JDBC source whose
-                # schema lives under its own nested catalog. An explicit 3-part
-                # name is still checked catalog-strict.
+                # "schema.table" is authorized only when that schema belongs to
+                # the selected source whose credentials will execute the query.
+                # An explicit 3-part name is still checked catalog-strict.
                 schema_only=True,
+                selected_source_schemas=selected_source_schemas,
             )
         except NamespaceSQLScopeError as exc:
             logger.warning(

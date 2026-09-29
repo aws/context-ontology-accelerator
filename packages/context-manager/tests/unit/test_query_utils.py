@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import pytest
 from coa_serve.query_utils import (
+    _MAX_INLINED_GRAPHS,
     DEFAULT_GRAPH_URI_TEMPLATE,
     MAX_QUERY_CODEPOINTS,
     MAX_SEARCH_TOKEN_CODEPOINTS,
@@ -17,6 +18,7 @@ from coa_serve.query_utils import (
     build_query_search_plan,
     extract_query_entities,
     get_graph_uri_template,
+    graph_scoped_body,
     namespace_graph_prefix,
     object_properties_sparql,
     validate_namespace,
@@ -525,6 +527,120 @@ class TestNamespaceGraphPrefix:
 
 
 @pytest.mark.unit
+class TestGraphScopedBody:
+    """How the graphs are NAMED, not just which ones — see ``graph_scoped_body``.
+
+    A ``VALUES ?g { <a> <b> }`` binding and a ``GRAPH <a>``/``GRAPH <b>`` UNION
+    select the same quads, so no result-level test can tell them apart. They are
+    not interchangeable to the planner: the constant form is pushed into the index
+    scan, the VALUES form is a materialised sequence joined afterwards. Measured
+    end to end on one deployed build, an idle cluster, parallelism 1: the
+    one-graph namespace (where a single VALUES row folds to a constant anyway) ran
+    the join-path query in 10ms, while the two-graph namespace ReadTimeout at
+    16.5s on three separate queries — two of which carry no binding other than the
+    graph. Hence these assertions are about query TEXT.
+    """
+
+    _PREFIX = "https://g.local/ns/"
+    _A = "https://g.local/ns/induced"
+    _B = "https://g.local/ns/curated"
+
+    def test_one_graph_is_named_as_a_constant(self):
+        sparql = graph_scoped_body("?s ?p ?o .", self._PREFIX, [self._A])
+
+        assert f"GRAPH <{self._A}> {{" in sparql
+        assert "VALUES ?g" not in sparql
+        assert "STRSTARTS" not in sparql
+
+    def test_several_graphs_become_a_union_of_constants_not_a_values_join(self):
+        sparql = graph_scoped_body("?s ?p ?o .", self._PREFIX, [self._A, self._B])
+
+        assert f"GRAPH <{self._A}> {{" in sparql
+        assert f"GRAPH <{self._B}> {{" in sparql
+        assert "UNION" in sparql
+        assert "VALUES ?g" not in sparql
+        assert "STRSTARTS" not in sparql
+
+    def test_the_union_branches_are_group_graph_patterns(self):
+        """``A UNION B`` is a syntax error unless both operands are braced."""
+        sparql = graph_scoped_body("?s ?p ?o .", self._PREFIX, [self._A, self._B])
+
+        left, _, right = sparql.partition("UNION")
+        for side in (left, right):
+            assert side.count("{") == side.count("}"), side
+
+    def test_an_implausible_graph_count_degrades_to_the_prefix_filter(self):
+        """Inlining repeats the body per graph, and a body may carry 175 IRIs.
+
+        Namespaces publish one graph per ontology, so this bound is a guard, and
+        the fallback is the form main shipped: slow, never broken.
+        """
+        many = [f"{self._PREFIX}g{i}" for i in range(_MAX_INLINED_GRAPHS + 1)]
+
+        sparql = graph_scoped_body("?s ?p ?o .", self._PREFIX, many)
+
+        assert f'FILTER(STRSTARTS(STR(?g), "{self._PREFIX}"))' in sparql
+        assert "GRAPH ?g" in sparql
+        assert f"GRAPH <{many[0]}>" not in sparql
+
+    def test_the_implausible_graph_count_is_the_one_fallback_that_warns(self):
+        """Resolution SUCCEEDED and we still fell back — the invisible case.
+
+        The resolver's own cap (tbox_context._MAX_GRAPHS, 50) is well above this
+        one, so a 9..50-graph namespace pays the cluster-wide scan while every
+        other log line says its graphs resolved fine. That is exactly the shape of
+        silent degradation this change exists to remove, so it warns.
+        """
+        many = [f"{self._PREFIX}g{i}" for i in range(_MAX_INLINED_GRAPHS + 1)]
+
+        with patch("coa_serve.query_utils.logger") as log:
+            graph_scoped_body("?s ?p ?o .", self._PREFIX, many)
+
+        log.warning.assert_called_once()
+        event, kwargs = log.warning.call_args[0][0], log.warning.call_args[1]
+        assert event == "graph_scope_not_inlined"
+        assert kwargs["graphs"] == _MAX_INLINED_GRAPHS + 1
+        assert kwargs["max_inlined"] == _MAX_INLINED_GRAPHS
+
+    def test_an_unsafe_iri_is_dropped_rather_than_interpolated(self):
+        """The guard sits at the interpolation point, not only at resolution.
+
+        Resolvers apply the same test, but ``graph_iris`` also reaches here through
+        a plain dataclass field (``TBoxContext.graph_iris``) and through
+        ``_retry_vkg``'s ``Any``-typed reuse parameter, neither of which
+        re-validates. A closing angle bracket would otherwise escape the
+        ``GRAPH <...>`` term.
+        """
+        hostile = f"{self._PREFIX}g> }} ?s ?p ?o }} #"
+
+        with patch("coa_serve.query_utils.logger") as log:
+            sparql = graph_scoped_body("?s ?p ?o .", self._PREFIX, [self._A, hostile])
+
+        assert f"GRAPH <{self._A}>" in sparql
+        assert hostile not in sparql
+        assert "UNION" not in sparql, "one graph survived, so there is nothing to union"
+        assert log.warning.call_args[0][0] == "graph_scope_unsafe_iri_dropped"
+
+    def test_dropping_every_iri_degrades_to_the_prefix_filter(self):
+        with patch("coa_serve.query_utils.logger"):
+            sparql = graph_scoped_body("?s ?p ?o .", self._PREFIX, ["not an iri"])
+
+        assert f'FILTER(STRSTARTS(STR(?g), "{self._PREFIX}"))' in sparql
+
+    def test_unresolved_graphs_degrade_to_the_prefix_filter(self):
+        for unresolved in ([], None):
+            with patch("coa_serve.query_utils.logger") as log:
+                sparql = graph_scoped_body("?s ?p ?o .", self._PREFIX, unresolved)
+
+            assert f'FILTER(STRSTARTS(STR(?g), "{self._PREFIX}"))' in sparql
+            assert "GRAPH ?g" in sparql
+            # Silent here on purpose: the caller that failed to resolve has
+            # already logged tbox_graph_resolve_failed with the exception, so a
+            # second line per query would be noise, not signal.
+            log.warning.assert_not_called()
+
+
+@pytest.mark.unit
 class TestObjectPropertiesSparql:
     """One FK-edge query shared by the T-Box builder and the traversal tool."""
 
@@ -555,3 +671,25 @@ class TestObjectPropertiesSparql:
 
         assert "?domain a owl:Class" not in sparql
         assert "?range a owl:Class" not in sparql
+
+    def test_domain_anchor_is_opt_in_and_precedes_the_edge_scan(self):
+        """Graph scoping alone left this query timing out at 16.5s on the
+        412-class namespace, because ``?domain rdfs:label ?domainLabel`` with
+        ``?domain`` unbound is a scan of every label in the graph. Anchoring
+        ``?domain`` is what makes the label joins per-edge."""
+        anchored = object_properties_sparql(
+            "https://g.local/ns/",
+            limit=10,
+            domain_iris=["https://g.local/o#A", "https://g.local/o#B"],
+        )
+
+        assert "VALUES ?domain { <https://g.local/o#A> <https://g.local/o#B> }" in anchored
+        # Before the edge scan, or the planner still starts from every ObjectProperty.
+        assert anchored.index("VALUES ?domain") < anchored.index("?op a owl:ObjectProperty")
+
+    def test_no_domain_anchor_keeps_the_whole_fk_graph(self):
+        """The traversal tool walks edges the prompt never mentions, so it must
+        keep passing nothing here and get every edge."""
+        for empty in (None, []):
+            sparql = object_properties_sparql("https://g.local/ns/", limit=10, domain_iris=empty)
+            assert "VALUES ?domain" not in sparql

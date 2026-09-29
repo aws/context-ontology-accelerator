@@ -153,11 +153,10 @@ Selecting it on each surface:
 
 Behaviour notes:
 
-- **Precedence.** An explicit request value wins over the deployment default
-  (`TIER3_STRATEGY`, which ships as standard). `mode: "standard"` is an explicit
-  opt-out even on a deployment whose default is deep reasoning. An explicit
-  `tierOverride` wins over `mode` — it is a direct instruction about which tier
-  to run.
+- **Precedence.** An explicit request value wins over the execution policy
+  derived from `TIER3_STRATEGY`. `mode: "standard"` is an explicit opt-out even
+  when the deployment default is `deep-reasoning`. An explicit `tierOverride`
+  wins over `mode` — it is a direct instruction about which tier to run.
 - **Validation.** The only accepted values are `standard` and `deep-reasoning`
   (plus the pre-rename spelling `agentic`, kept for compatibility). Any other
   value is rejected with **400** naming the valid ones, rather than silently
@@ -172,6 +171,22 @@ Behaviour notes:
 - Deterministic *always-run-both* joint retrieval (structured + document in one
   guaranteed pass, rather than at the planner's discretion) is roadmap work,
   tracked as issue #417.
+
+#### Which Tier-3 path consults the published ontology?
+
+`mode` is a **request execution policy** (`standard` or `deep-reasoning`).
+`TIER3_STRATEGY` supplies the **deployment default** when `mode` is omitted:
+`lexical-baseline` and `hand-rolled` keep the Standard cascade and select its
+Tier-3 fallback, while `deep-reasoning` makes the reasoning loop own the request
+before the cascade. These are separate controls: `standard` is not a valid
+`TIER3_STRATEGY` value.
+
+| `TIER3_STRATEGY` / path | Routing and evidence | Published RDF/OWL ontology use | Cost / latency shape | How it is selected |
+|---|---|---|---|---|
+| `lexical-baseline` (**default**) | The Standard cascade runs. If it reaches Tier 3, graphrag reads the document lexical graph in Neptune and its OpenSearch indexes; `LEXICAL_RETRIEVER_STRATEGY` defaults to `topic_beam` | **No formal ontology.** It does not read OWL classes, domain/range, or the namespace's published ontology graph. It does read concept-like nodes in the lexical KG itself — `topic_beam` navigates Source → Chunk → Topic → Statement → Fact → Entity — but those Topic/Entity nodes are extracted from documents at ingestion, not the accepted, formally-typed ontology | One configured lexical retrieval followed by answer synthesis | CDK context `-c tier3_strategy=lexical-baseline` (the default). Under Standard execution, request `retrieverStrategy` selects the graphrag strategy; otherwise `-c lexical_retriever_strategy=...` supplies its deployment default |
+| `hand-rolled` | The Standard cascade runs. At Tier 3, OpenSearch document-vector retrieval runs in parallel with `GraphTraverser` over the namespace-scoped published RDF graphs | **Yes.** Traversal is seeded from matched ontology concept URIs when available, then follows the published graph; otherwise it falls back to a label search in that graph | Parallel vector + graph retrieval followed by answer synthesis | CDK context `-c tier3_strategy=hand-rolled`, with no request `retrieverStrategy` |
+| `deep-reasoning` | Without `tierOverride`, a bounded planner/tool loop owns the request before the Standard cascade and can call structured-query, document, graph-traversal, and ontology-lookup tools | **Available and normally resolved first.** The planner is instructed to call ontology lookup before entity traversal, but the request trace remains the authority for whether lookup succeeded | Multiple model/tool calls; highest and most variable latency/cost | CDK context `-c tier3_strategy=deep-reasoning`, or request `mode: "deep-reasoning"` |
+
 
 ### MCP (Model Context Protocol)
 
@@ -274,12 +289,46 @@ and can express the predicate:
 | *"Compare total revenue to last year, broken down by month"* | Tier 2 — comparison + grouping |
 | *"What was total revenue last quarter?"* | Tier 2 — time window |
 | *"What was average revenue?"* | Tier 2 — asks for a different aggregate than the metric computes |
+| *"How many open claims does AnyCompany have?"* | Tier 2 — your own namespace name is left over too; Tier 1 won't guess whether it filters the data |
 | *"Hello. What was total revenue? Thanks!"* | Tier 1 — greetings and sign-offs are padding, not qualifiers |
 
 The rationale panel names what was left over (*"Matched total_revenue but 'gold
 loyalty tier' can't be applied to it; routing to structured query"*), and the trace
 records it as a `residual_qualifier_bypass` on the `t1.metric_match` step, so a
 re-routed question is never silently indistinguishable from a Tier-1 hit.
+
+##### Tier 2 still gets your governed definition
+
+Declining is not discarding. When Tier 1 steps aside, it hands Tier 2 the metric it
+matched — the **formula, its description, its declared dimensions, and the exact part
+of your question Tier 1 could not apply** — as authoritative context. Tier 2 then
+extends your authored definition rather than composing a replacement for it from the
+schema alone.
+
+This matters because the alternative is worse than it looks: without the definition,
+Tier 2 re-derives the metric from scratch, so the same business concept can come back
+as a different expression on different runs, and the number can drift from the one
+your metric defines. Passing the formula forward keeps the governed definition as the
+starting point even on questions Tier 1 cannot answer itself.
+
+The `t1.metric_match` trace step reports this as `governedDefinitionForwarded: true`,
+so you can confirm the definition was passed on rather than inferring it from the
+answer. It is `false` only when the matched metric has no SQL template to forward.
+
+Two consequences worth knowing:
+
+- **Your own company or dataset name is a qualifier like any other.** If your
+  namespace is `AnyCompany` and you ask *"How many open claims does AnyCompany
+  have?"*, `anycompany` is left over, so Tier 1 declines. Tier 1 deliberately does not
+  guess whether that word filters your data or merely names it — it has no schema to
+  check against. Tier 2 does, and receives the word alongside the governed formula, so
+  it decides. To get the deterministic Tier-1 answer, drop the name (*"How many open
+  claims do we have?"*) or pin the tier.
+- **A definition-naming phrase is forwarded too.** *"How many active customers do we
+  have (using the operational recency-based definition)?"* leaves the parenthetical
+  unconsumed, so Tier 1 declines — but Tier 2 gets the `active_customer` formula,
+  including the recency rule it encodes, rather than inventing its own notion of
+  "active".
 
 Two ways to still get the deterministic Tier-1 answer:
 

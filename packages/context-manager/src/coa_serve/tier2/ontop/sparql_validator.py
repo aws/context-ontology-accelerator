@@ -21,7 +21,12 @@ from coa_common.constants import URN_PREFIX as _URN_PREFIX
 from rdflib.plugins.sparql import prepareQuery
 
 from ...clients.base import GraphClient
-from ...query_utils import get_graph_uri_template, namespace_graph_prefix, validate_namespace
+from ...query_utils import (
+    get_graph_uri_template,
+    graph_scoped_body,
+    namespace_graph_prefix,
+    validate_namespace,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -64,7 +69,7 @@ class SPARQLValidator:
         self._graph = graph_client
         self._graph_uri_template = get_graph_uri_template(graph_uri_template)
 
-    async def validate(self, sparql: str, namespace: str) -> ValidationResult:
+    async def validate(self, sparql: str, namespace: str, graph_iris: list[str] | None = None) -> ValidationResult:
         """Four-stage validation: syntax, URI existence, domain/range, determinism.
 
         Stages run in order: syntax → URI existence → domain/range (fail-open)
@@ -73,6 +78,13 @@ class SPARQLValidator:
         Args:
             sparql: The SPARQL query to validate.
             namespace: Namespace for URI existence checking in Neptune.
+            graph_iris: The namespace's named graphs, if the caller already resolved
+                them (``TBoxContext.graph_iris``). Scopes stages 2 and 3 to those
+                graphs instead of matching in every graph on the cluster; omitting
+                them keeps the prefix-filter form. Because the resolved set is a
+                SUBSET of the prefix-matching one, a rejection is always re-checked
+                unscoped before it is returned, so the verdict is unchanged either
+                way -- see :meth:`_validate_uris`.
 
         Returns:
             ValidationResult indicating whether the SPARQL is valid.
@@ -87,7 +99,7 @@ class SPARQLValidator:
 
         # Stage 2: URI existence check
         validate_namespace(namespace)
-        uri_result = await self._validate_uris(sparql, namespace)
+        uri_result = await self._validate_uris(sparql, namespace, graph_iris=graph_iris)
         if not uri_result.valid:
             return uri_result
 
@@ -97,7 +109,7 @@ class SPARQLValidator:
         # only a CLEAR, evidenced mismatch fails; any uncertainty (no triples to
         # check, Neptune error, ambiguous typing) passes through unchanged so we
         # never over-block a legitimate query.
-        dr_result = await self._validate_domain_range(sparql, namespace)
+        dr_result = await self._validate_domain_range(sparql, namespace, graph_iris=graph_iris)
         if not dr_result.valid:
             return dr_result
 
@@ -344,8 +356,17 @@ class SPARQLValidator:
             logger.debug("sparql_syntax_error", sparql_length=len(sparql))
             return ValidationResult(valid=False, error="SPARQL syntax error")
 
-    async def _validate_uris(self, sparql: str, namespace: str) -> ValidationResult:
-        """Verify that URIs in the SPARQL exist in the namespace's published graph."""
+    async def _validate_uris(
+        self, sparql: str, namespace: str, graph_iris: list[str] | None = None
+    ) -> ValidationResult:
+        """Verify that URIs in the SPARQL exist in the namespace's published graph.
+
+        ``graph_iris`` scopes the check to the namespace's graphs. Those are resolved
+        by an ``owl:Ontology``-anchored query, so they are a SUBSET of the graphs
+        under the namespace prefix: a subject that lives only in an unmarked graph is
+        missing from the scoped count but present in the namespace. A shortfall is
+        therefore confirmed against the full prefix before it becomes a rejection.
+        """
         try:
             # GovernedMetric IRIs use the urn:coa:{ns}:metric:{name}
             # scheme — validate them by PATTERN (they aren't http subjects in the
@@ -374,13 +395,22 @@ class SPARQLValidator:
             # Single round-trip batch check: count URIs that exist as subjects
             values_clause = " ".join(f"(<{uri}>)" for uri in safe_uris)
             graph_uri_prefix = namespace_graph_prefix(self._graph_uri_template, namespace)
-            count_sparql = (
-                f"SELECT (COUNT(DISTINCT ?s) AS ?found) WHERE {{"
-                f" GRAPH ?g {{ VALUES (?s) {{ {values_clause} }} ?s ?p ?o }}"
-                f' FILTER(STRSTARTS(STR(?g), "{graph_uri_prefix}")) }}'
-            )
-            results = await self._graph.query(count_sparql)
-            found = int(results[0]["found"]) if results else 0
+            # COUNT(DISTINCT ?s) is what makes this safe to scope: a subject in two
+            # of the namespace's graphs still counts once, so the threshold below is
+            # unaffected by the query form.
+            body = f"VALUES (?s) {{ {values_clause} }} ?s ?p ?o"
+            found = await self._count_subjects(body, graph_uri_prefix, graph_iris)
+            if found < len(safe_uris) and graph_iris:
+                unscoped = await self._count_subjects(body, graph_uri_prefix, None)
+                if unscoped > found:
+                    logger.warning(
+                        "graph_scope_recheck_saved_uri_check",
+                        namespace=namespace,
+                        graphs=len(graph_iris),
+                        scoped_found=found,
+                        unscoped_found=unscoped,
+                    )
+                found = unscoped
 
             if found < len(safe_uris):
                 logger.warning(
@@ -388,6 +418,7 @@ class SPARQLValidator:
                     namespace=namespace,
                     expected=len(safe_uris),
                     found=found,
+                    graphs=len(graph_iris or []),
                     uris=safe_uris[:5],
                 )
                 return ValidationResult(valid=False, error="URI not found in ontology")
@@ -396,6 +427,16 @@ class SPARQLValidator:
         except Exception as e:
             logger.debug("uri_validation_error", error=str(e))
             return ValidationResult(valid=False, error="URI validation failed")
+
+    async def _count_subjects(self, body: str, graph_uri_prefix: str, graph_iris: list[str] | None) -> int:
+        """Count distinct subjects matching ``body``, scoped to ``graph_iris`` if given."""
+        scoped = graph_scoped_body(body, graph_uri_prefix, graph_iris)
+        rows = await self._graph.query(f"SELECT (COUNT(DISTINCT ?s) AS ?found) WHERE {{ {scoped} }}")
+        return int(rows[0]["found"]) if rows else 0
+
+    async def _ask_scoped(self, body: str, graph_uri_prefix: str, graph_iris: list[str] | None) -> bool:
+        """ASK ``body``, scoped to ``graph_iris`` if given."""
+        return await self._graph.ask(f"ASK {{ {graph_scoped_body(body, graph_uri_prefix, graph_iris)} }}")
 
     _STANDARD_PREFIXES = (
         "http://www.w3.org/",
@@ -414,7 +455,9 @@ class SPARQLValidator:
         all_uris = re.findall(r"<(http[^>]+)>", sparql)
         return [u for u in all_uris if not u.startswith(self._STANDARD_PREFIXES) and not u.endswith(("#", "/"))]
 
-    async def _validate_domain_range(self, sparql: str, namespace: str) -> ValidationResult:
+    async def _validate_domain_range(
+        self, sparql: str, namespace: str, graph_iris: list[str] | None = None
+    ) -> ValidationResult:
         """Conservative property-domain and property-range compatibility check.
 
         For each triple ``?v a <Class>`` paired with ``?v <prop> ?o`` in the
@@ -439,7 +482,7 @@ class SPARQLValidator:
             if not (_SAFE_URI_RE.match(class_uri) and _SAFE_URI_RE.match(prop_uri)):
                 continue
             try:
-                compatible = await self._is_domain_compatible(class_uri, prop_uri, namespace)
+                compatible = await self._is_domain_compatible(class_uri, prop_uri, namespace, graph_iris)
             except Exception as e:
                 logger.debug("domain_range_check_skipped", error=str(e))
                 continue  # fail-open on any error
@@ -457,7 +500,7 @@ class SPARQLValidator:
             if not (_SAFE_URI_RE.match(prop_uri) and _SAFE_URI_RE.match(literal_type)):
                 continue
             try:
-                compatible = await self._is_range_compatible(prop_uri, literal_type, namespace)
+                compatible = await self._is_range_compatible(prop_uri, literal_type, namespace, graph_iris)
             except Exception as e:
                 logger.debug("range_check_skipped", error=str(e))
                 continue
@@ -551,7 +594,9 @@ class SPARQLValidator:
 
         return pairs
 
-    async def _is_domain_compatible(self, class_uri: str, prop_uri: str, namespace: str) -> bool | None:
+    async def _is_domain_compatible(
+        self, class_uri: str, prop_uri: str, namespace: str, graph_iris: list[str] | None = None
+    ) -> bool | None:
         """Return False on a clear domain mismatch, True if compatible, None if unknown.
 
         Asks Neptune: does ``prop`` declare an ``rdfs:domain`` that is NOT
@@ -562,17 +607,15 @@ class SPARQLValidator:
         """
         graph_uri_prefix = namespace_graph_prefix(self._graph_uri_template, namespace)
         # Does the property have ANY declared domain compatible with class?
-        compat_sparql = (
-            f"ASK {{ GRAPH ?g {{ <{prop_uri}> rdfs:domain ?d . <{class_uri}> rdfs:subClassOf* ?d . }}"
-            f' FILTER(STRSTARTS(STR(?g), "{graph_uri_prefix}")) }}'
-        )
-        if await self._graph.ask(compat_sparql):
+        compat = f"<{prop_uri}> rdfs:domain ?d . <{class_uri}> rdfs:subClassOf* ?d ."
+        if await self._ask_scoped(compat, graph_uri_prefix, graph_iris):
             return True
         # No compatible domain found — does it declare a domain at all?
-        has_domain_sparql = (
-            f'ASK {{ GRAPH ?g {{ <{prop_uri}> rdfs:domain ?d . }} FILTER(STRSTARTS(STR(?g), "{graph_uri_prefix}")) }}'
-        )
-        if await self._graph.ask(has_domain_sparql):
+        if await self._ask_scoped(f"<{prop_uri}> rdfs:domain ?d .", graph_uri_prefix, graph_iris):
+            if graph_iris:
+                # A compatible domain published in an unmarked graph would read as a
+                # mismatch; confirm over the full prefix before rejecting.
+                return await self._is_domain_compatible(class_uri, prop_uri, namespace, None)
             return False  # declares a domain, but none compatible with class → mismatch
         return None  # no declared domain → cannot judge → pass
 
@@ -587,7 +630,9 @@ class SPARQLValidator:
         f"{_XSD}int": {f"{_XSD}short", f"{_XSD}byte"},
     }
 
-    async def _is_range_compatible(self, prop_uri: str, literal_type: str, namespace: str) -> bool | None:
+    async def _is_range_compatible(
+        self, prop_uri: str, literal_type: str, namespace: str, graph_iris: list[str] | None = None
+    ) -> bool | None:
         """Return False on a clear range mismatch, True if compatible, None if unknown.
 
         Asks Neptune: does ``prop`` declare an ``rdfs:range`` that is incompatible
@@ -597,26 +642,19 @@ class SPARQLValidator:
         """
         graph_uri_prefix = namespace_graph_prefix(self._graph_uri_template, namespace)
         # Does the property declare a range that exactly matches the literal type?
-        compat_sparql = (
-            f"ASK {{ GRAPH ?g {{ <{prop_uri}> rdfs:range <{literal_type}> . }}"
-            f' FILTER(STRSTARTS(STR(?g), "{graph_uri_prefix}")) }}'
-        )
-        if await self._graph.ask(compat_sparql):
+        if await self._ask_scoped(f"<{prop_uri}> rdfs:range <{literal_type}> .", graph_uri_prefix, graph_iris):
             return True
         # No exact match — does it declare a range at all?
-        has_range_sparql = (
-            f'ASK {{ GRAPH ?g {{ <{prop_uri}> rdfs:range ?r . }} FILTER(STRSTARTS(STR(?g), "{graph_uri_prefix}")) }}'
-        )
-        if not await self._graph.ask(has_range_sparql):
+        if not await self._ask_scoped(f"<{prop_uri}> rdfs:range ?r .", graph_uri_prefix, graph_iris):
             return None  # no declared range → pass
         # Range is declared but doesn't match exactly — check XSD subtype compatibility.
         # If the declared range accepts literal_type as a subtype, it's compatible.
         for supertype, subtypes in self._XSD_SUBTYPES.items():
-            if literal_type in subtypes:
-                check = (
-                    f"ASK {{ GRAPH ?g {{ <{prop_uri}> rdfs:range <{supertype}> . }}"
-                    f' FILTER(STRSTARTS(STR(?g), "{graph_uri_prefix}")) }}'
-                )
-                if await self._graph.ask(check):
-                    return True
+            if literal_type in subtypes and await self._ask_scoped(
+                f"<{prop_uri}> rdfs:range <{supertype}> .", graph_uri_prefix, graph_iris
+            ):
+                return True
+        if graph_iris:
+            # Same reason as the domain check: confirm over the full prefix.
+            return await self._is_range_compatible(prop_uri, literal_type, namespace, None)
         return False  # declares a range, but not compatible with literal type

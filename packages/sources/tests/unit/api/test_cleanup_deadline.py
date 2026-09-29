@@ -31,7 +31,7 @@ import coa_sources.api.sources_handler as _sh  # noqa: E402
 
 _SH = "coa_sources.api.sources_handler"
 _NAMESPACE_ID = "550e8400-e29b-41d4-a716-446655440000"
-_SOURCE_ID = "src-deadline-test"
+_SOURCE_ID = "11111111-2222-4333-8444-555555555555"
 
 
 def _current_sh():
@@ -142,7 +142,7 @@ class TestDatazoneAssetsSearchDeadline:
                 return_value=mock_client,
             ),
         ):
-            removed = _current_sh()._delete_source_datazone_assets(
+            removed, complete = _current_sh()._delete_source_datazone_assets(
                 _NAMESPACE_ID,
                 _SOURCE_ID,
                 context=_fake_context(1),
@@ -152,6 +152,8 @@ class TestDatazoneAssetsSearchDeadline:
         assert mock_client.search_assets.call_count == 0
         assert mock_client.delete_asset.call_count == 0
         assert removed == 0
+        # Stopped before enumerating anything — cleanup is not complete.
+        assert complete is False
 
     def test_search_stops_between_pages_not_mid_page(self):
         """When the deadline trips between page 1 and page 2, page 1's assets
@@ -189,7 +191,7 @@ class TestDatazoneAssetsSearchDeadline:
                 return_value=mock_client,
             ),
         ):
-            removed = _current_sh()._delete_source_datazone_assets(
+            removed, complete = _current_sh()._delete_source_datazone_assets(
                 _NAMESPACE_ID,
                 _SOURCE_ID,
                 context=_fake_context(30_000),
@@ -199,6 +201,8 @@ class TestDatazoneAssetsSearchDeadline:
         assert mock_client.search_assets.call_count == 1
         # Delete loop also bails (monotonic is way past deadline)
         assert removed == 0
+        # Search stopped before the cursor was exhausted — incomplete.
+        assert complete is False
 
     def test_generous_time_completes_all_search_and_delete(self):
         """With plenty of remaining time, all pages are fetched and all assets deleted."""
@@ -220,13 +224,14 @@ class TestDatazoneAssetsSearchDeadline:
                 return_value=mock_client,
             ),
         ):
-            removed = _current_sh()._delete_source_datazone_assets(
+            removed, complete = _current_sh()._delete_source_datazone_assets(
                 _NAMESPACE_ID,
                 _SOURCE_ID,
                 context=ctx,
             )
 
         assert removed == 5
+        assert complete is True
         assert mock_client.search_assets.call_count == 1
         assert mock_client.delete_asset.call_count == 5
 
@@ -269,7 +274,7 @@ class TestDatazoneAssetsDeleteDeadline:
                 return_value=mock_client,
             ),
         ):
-            removed = _current_sh()._delete_source_datazone_assets(
+            removed, complete = _current_sh()._delete_source_datazone_assets(
                 _NAMESPACE_ID,
                 _SOURCE_ID,
                 context=_fake_context(30_000),
@@ -279,6 +284,8 @@ class TestDatazoneAssetsDeleteDeadline:
         assert mock_client.search_assets.call_count == 1
         assert removed == 1
         assert mock_client.delete_asset.call_count == 1
+        # Delete loop stopped before finishing — incomplete, row must be kept.
+        assert complete is False
 
 
 # ===================================================================
@@ -298,7 +305,7 @@ class TestContextThreading:
 
         def _capturing_delete(ns, sid, context=None):
             captured_ctx["value"] = context
-            return 0
+            return 0, True
 
         event = {
             "httpMethod": "DELETE",

@@ -284,7 +284,8 @@ def schema_for_source(source: dict[str, Any]) -> str:
     into a qualified one, a qualified reference then runs through
     ``_authorize_qualified_references`` and would be DENIED rather than merely
     failing at Athena. Returning ``""`` makes the caller take its documented
-    ``qualification_incomplete_no_schema`` abandon path and leave the SQL bare.
+    ``qualification_incomplete_no_schema`` path, which raises
+    ``QualificationError`` so the statement is refused rather than executed bare.
     """
     if source.get("athenaDataCatalogName"):
         discovered = [str(s) for s in source.get("discoveredSchemas") or []]
@@ -444,12 +445,13 @@ async def prepare_execution_sql(
     :func:`~..nl_to_sql.sql_generator.sql_table_routing`, which emits the same
     marker for a name its retrieval hits attribute to two classes.
 
-    Every OTHER incompleteness — a reference no routing entry attributes, a source
-    that is not queryable, a malformed catalog name — leaves the statement
-    UNCHANGED rather than half-rewritten, so it executes bare and fails loudly at
-    Athena (``TABLE_NOT_FOUND``) exactly as before. That is NOT fail-closed; it is
-    the all-or-nothing contract of :func:`qualify_cross_source_sql`, which never
-    produces a partial rewrite.
+    Every OTHER incompleteness in a statement that requires cross-source
+    qualification — an unattributed reference, a missing registry/source/schema,
+    a malformed identifier, or an unprovable render round-trip — becomes a
+    ``PreparedSQL.error``. Returning bare SQL for those cases is unsafe because
+    Athena's default context can resolve a same-named table and return a wrong
+    successful result. Single-target statements and already fully catalog-qualified
+    statements remain unchanged.
 
     :func:`ambiguous_reference` runs FIRST, before either rewrite, because an
     ambiguously-routed table contributes no datasource id — so it would otherwise
@@ -489,36 +491,31 @@ async def qualify_cross_source_sql(
       the only form that can name two catalogs at once. This is the original
       cross-source rewrite, unchanged and verified live.
 
-    Returns ``sql`` UNCHANGED — no rewrite attempted — whenever qualification is
-    unnecessary or cannot be done completely:
+    Returns ``sql`` unchanged only when qualification is unnecessary or already
+    complete:
 
-    - fewer than two distinct ``(datasource, schema)`` targets, i.e. one
-      ``(catalog, database)`` context can serve the whole statement (the
-      single-target path already works, and is left bit-for-bit untouched so this
-      can never regress it). A single source spanning two schemas is two targets
-      and DOES qualify — see :func:`distinct_source_targets`;
-    - no sources registry wired;
-    - any table reference that routing cannot attribute to a source;
-    - a source that is not queryable, or whose catalog/schema name is malformed.
+    - fewer than two distinct ``(datasource, schema)`` targets and no table name
+      shared across datasources, so one execution context can serve the statement;
+    - every real table reference already carries its catalog;
+    - a known non-queryable source, whose downstream Lake Formation denial remains
+      authoritative.
 
-    A partial rewrite is deliberately not produced: it would leave SQL that is
-    neither context-resolvable nor self-describing, which is strictly worse than
-    today's loud ``TABLE_NOT_FOUND``. Every reference is therefore attributed
-    before any node is mutated.
+    Once qualification is required, missing or malformed routing/source metadata
+    raises ``QualificationError``. A partial rewrite is never produced, and the
+    caller converts the error into ``PreparedSQL.error`` so the SQL is not executed.
 
-    Registry reads happen AFTER attribution and concurrently, so the two abandon
-    paths cost no I/O at all and the latency added is one round trip rather than
-    one per datasource.
+    Registry reads happen after attribution and concurrently, so an unrouted-table
+    rejection costs no I/O and complete requests add one round trip rather than one
+    per datasource.
 
     Raises:
-        QualificationError: when a BARE table reference in ``sql`` answers to more
-            than one ``(datasource, schema)`` pair. Such a reference cannot be
-            attributed to one physical table, and guessing would read the wrong
-            one. A reference that carries its schema is attributable and does NOT
-            raise, which is what makes a mapping produced after this fix
-            (schema-qualified ``rr:tableName`` for shared names) executable. See
-            :func:`_match_routing`.
+        QualificationError: if a required cross-source rewrite cannot safely and
+            completely attribute, resolve, validate, or render every real table
+            reference.
     """
+    if is_fully_catalog_qualified(sql, dialect):
+        return sql
+
     targets = distinct_source_targets(table_routing)
     # A bare name owned by two datasources needs its catalog even in a statement
     # that references only ONE of the same-named tables: the context's single
@@ -529,10 +526,6 @@ async def qualify_cross_source_sql(
     cross_source_shared = bare_names_shared_across_datasources(table_routing)
     if len(targets) < 2 and not cross_source_shared:
         return sql
-    if sources is None:
-        logger.warning("qualification_skipped_no_registry", target_count=len(targets))
-        return sql
-
     try:
         parsed = sqlglot.parse_one(sql, dialect=dialect)
     except sqlglot.errors.SqlglotError as exc:
@@ -540,7 +533,9 @@ async def qualify_cross_source_sql(
         # statement, so logging it would write user-influenced filter values
         # (names, account numbers) into CloudWatch.
         logger.warning("qualification_parse_failed", error=type(exc).__name__, sql_len=len(sql))
-        return sql
+        raise QualificationError(
+            f"cross-source SQL could not be parsed for qualification ({type(exc).__name__})"
+        ) from exc
 
     lookup, ambiguous_bare = _routing_index(table_routing)
 
@@ -556,7 +551,7 @@ async def qualify_cross_source_sql(
                 table=table.name,
                 routed_tables=sorted(lookup),
             )
-            return sql
+            raise QualificationError(f"cross-source table {table.name!r} has no datasource routing metadata")
         schema = entry.get("sourceSchema", "") or (table.db or "")
         plan.append((table, entry.get("datasourceId", ""), schema))
 
@@ -567,6 +562,10 @@ async def qualify_cross_source_sql(
         logger.warning("qualification_no_table_references", target_count=len(targets))
         return sql
 
+    if sources is None:
+        logger.warning("qualification_failed_no_registry", target_count=len(targets))
+        raise QualificationError("cross-source SQL cannot be qualified because the sources registry is unavailable")
+
     # Pass 2 — one registry read per datasource the statement ACTUALLY
     # references, issued concurrently so the tail is one round trip, not N.
     referenced = sorted({ds_id for _, ds_id, _ in plan})
@@ -576,7 +575,7 @@ async def qualify_cross_source_sql(
     for ds_id, source in zip(referenced, records, strict=True):
         if not source:
             logger.warning("qualification_source_not_found", namespace=namespace, datasource_id=ds_id)
-            return sql
+            raise QualificationError(f"cross-source datasource {ds_id!r} was not found")
         if source.get("queryable") is False:
             # Leave the SQL UNQUALIFIED for a non-queryable source. The actual
             # Lake Formation gate is enforced by Athena at execution time, not by
@@ -599,7 +598,7 @@ async def qualify_cross_source_sql(
         schema = schema or source_schemas.get(ds_id, "")
         if not schema:
             logger.warning("qualification_incomplete_no_schema", table=table.name, datasource_id=ds_id)
-            return sql
+            raise QualificationError(f"cross-source table {table.name!r} has no source schema metadata")
         catalog = catalogs[ds_id]
         if not _IDENTIFIER_PATTERN.match(catalog) or not _IDENTIFIER_PATTERN.match(schema):
             logger.warning(
@@ -608,7 +607,7 @@ async def qualify_cross_source_sql(
                 datasource_id=ds_id,
                 table=table.name,
             )
-            return sql
+            raise QualificationError(f"cross-source routing for table {table.name!r} has an invalid catalog or schema")
         resolved.append((table, catalog, schema))
 
     # A statement confined to ONE datasource that merely spans two of its schemas
@@ -661,7 +660,7 @@ async def qualify_cross_source_sql(
             before=len(resolved),
             after=(len(after) if after is not None else -1),
         )
-        return sql
+        raise QualificationError("cross-source SQL qualification could not preserve every table reference")
     logger.info(
         "cross_source_sql_qualified",
         namespace=namespace,

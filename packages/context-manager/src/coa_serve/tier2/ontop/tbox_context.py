@@ -10,7 +10,9 @@ vector search hits produced during routing.
 
 from __future__ import annotations
 
+import asyncio
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -23,6 +25,8 @@ from ...query_utils import (
     build_query_search_plan,
     escape_sparql_string_literal,
     get_graph_uri_template,
+    graph_scoped_body,
+    named_graphs_sparql,
     namespace_graph_prefix,
     normalize_label_match_text,
     object_properties_sparql,
@@ -42,6 +46,14 @@ _MAX_DISTINCT_VALUES_IN_PROMPT = 12
 
 # Maximum URIs per SPARQL VALUES clause (Neptune query complexity limit)
 _MAX_SPARQL_VALUES_URIS = 50
+# Cap for the join-path query's ?domain anchor (``domain_iris`` in
+# object_properties_sparql). Deliberately NOT _MAX_SPARQL_VALUES_URIS: there the
+# VALUES set is the result set being asked about, so truncating returns fewer rows
+# of the same kind, whereas here it is a FILTER over classes already chosen for the
+# prompt — truncating silently deletes the join paths of every class past the cut.
+# Sized to never bind (the full-context path caps at 200 classes, the vector path
+# yields ~10); it exists only to bound the query string.
+_MAX_DOMAIN_ANCHOR_URIS = 250
 # Maximum results per SPARQL query
 _SPARQL_RESULT_LIMIT = 2000
 # Cap on FK join paths folded into the prompt. Lower than _SPARQL_RESULT_LIMIT
@@ -166,6 +178,24 @@ _TOKENS_PER_PROPERTY = 30
 _TOKENS_PER_OBJECT_PROPERTY = 25
 _TOKENS_PER_METRIC = 40
 
+# ── Named-graph scoping (query cost) ─────────────────────────────────────────
+# Resolve the namespace's graph IRIs once per build and thread them into every
+# fetch, so each query is priced by the namespace instead of by the whole cluster.
+# Failure returns ``[]`` and the prefix-filter fallback keeps working — slow, not
+# broken. See ``query_utils.graph_scoped_body`` for the query forms and why the
+# constant-``GRAPH <iri>`` one is load-bearing on multi-graph namespaces.
+_MAX_GRAPHS = 50
+# 10s, not 5s: this is the FIRST Neptune query of a build, so on a cold container it
+# pays connection setup and credential signing too, and 5s lost that race half the
+# time (BIRD-Interact resolved 5 of 10 builds to ``graphs=0``, 5 to ``graphs=2``, on
+# an unchanged namespace). Warm, it returns in ~10ms. Losing is asymmetric: the
+# fallback is the cluster-wide scan this exists to avoid.
+_GRAPH_RESOLVE_TIMEOUT_S = 10.0
+# The builder is process-lived, so unlike the request-scoped traversal tool the
+# cache must expire or a namespace that publishes a new graph is queried against a
+# stale IRI list for the life of the process.
+_GRAPH_IRI_CACHE_TTL_S = 300.0
+
 
 _SAFE_URI_RE = re.compile(r"^https?://[^\s<>\"{}|\\^`]+$")
 
@@ -212,6 +242,11 @@ class TBoxContext:
     metrics: list[MetricContext] = field(default_factory=list)
     glossary: list[AiContextTerm] = field(default_factory=list)  # aiContext terms
     token_estimate: int = 0
+    # Not prompt content — nothing formats this. Carried out of the build so
+    # ``SPARQLValidator``, which runs afterwards on the same namespace, can scope its
+    # own queries without re-resolving. Empty means resolution failed or was skipped,
+    # which ``graph_scoped_body`` reads as "use the prefix filter".
+    graph_iris: list[str] = field(default_factory=list)
 
 
 class TBoxContextBuilder:
@@ -238,6 +273,52 @@ class TBoxContextBuilder:
         # definition (description/dimensions/formula) instead of only the sparse
         # vector-hit metadata. Optional + duck-typed to avoid a hard import cycle.
         self._metric_resolver = metric_resolver
+        # namespace -> (resolved_at_monotonic, graph IRIs). See _MAX_GRAPHS above.
+        self._graph_iri_cache: dict[str, tuple[float, list[str]]] = {}
+
+    async def _resolve_graph_iris(self, namespace: str, graph_uri_prefix: str) -> list[str]:
+        """Resolve the namespace's named-graph IRIs so the fetches below can bind ``?g``.
+
+        Best-effort by design: a failure, a timeout, or a namespace whose graphs
+        carry no ``owl:Ontology`` anchor all return ``[]``, which leaves
+        :func:`~coa_serve.query_utils.graph_scoped_body` on its prefix-filter
+        form. Cached per namespace with a TTL (see ``_GRAPH_IRI_CACHE_TTL_S``)
+        because this builder outlives the request.
+
+        ONLY A SUCCESSFUL RESOLUTION IS CACHED, including a successful empty one.
+        Caching a *failure* would turn one transient timeout into 300s of cluster-wide
+        scans for every request this container serves — and those scans are what
+        overload the graph in the first place, a feedback loop that was observed
+        answering a whole BIRD-Interact cell with no ontology at all. Re-querying
+        costs one cheap query; the loop costs the run.
+        """
+        cached = self._graph_iri_cache.get(namespace)
+        if cached and (time.monotonic() - cached[0]) < _GRAPH_IRI_CACHE_TTL_S:
+            return cached[1]
+        try:
+            rows = await asyncio.wait_for(
+                self._graph.query(named_graphs_sparql(graph_uri_prefix, limit=_MAX_GRAPHS)),
+                timeout=_GRAPH_RESOLVE_TIMEOUT_S,
+            )
+            iris = [r["g"] for r in rows if r.get("g") and _is_safe_sparql_uri(r["g"])]
+        except Exception as e:
+            # warning, not info: every query in this build now runs the cluster-wide
+            # scan this resolution exists to remove.
+            logger.warning(
+                "tbox_graph_resolve_failed",
+                namespace=namespace,
+                error=f"{type(e).__name__}: {str(e)[:120]}",
+                detail=(
+                    "falling back to the prefix filter (cluster-wide scan) for THIS request only — "
+                    "deliberately not cached, see the docstring"
+                ),
+            )
+            return []
+        self._graph_iri_cache[namespace] = (time.monotonic(), iris)
+        # info, not debug: the only signal that the graphs were bound rather than
+        # fallen back — a silent fallback surfaces only as a 16s ReadTimeout later.
+        logger.info("tbox_graphs_resolved", namespace=namespace, graphs=len(iris))
+        return iris
 
     async def build(
         self,
@@ -264,12 +345,23 @@ class TBoxContextBuilder:
         # Build metric context from metric hits
         metrics = self._build_metric_context(metric_hits)
 
+        # Bind the namespace's named graphs ONCE for every Neptune query below
+        # (see the _MAX_GRAPHS block at module top). Resolved here rather than in
+        # each fetch so the cost is one query per build, and passed explicitly so
+        # a fetch called directly (tests, future callers) still scopes itself via
+        # the prefix-filter fallback.
+        graph_iris: list[str] = []
+        if self._graph_uri_template:
+            prefix = namespace_graph_prefix(self._graph_uri_template, namespace)
+            if _is_safe_sparql_uri(prefix):
+                graph_iris = await self._resolve_graph_iris(namespace, prefix)
+
         # BRIDGE: probe ONCE whether this namespace has any coa:isMapped marker
         # (see the LEGACY-NAMESPACE BRIDGE block at module top). ``mapped`` then
         # selects the strict gate (has markers) or the pre-filter fallback (none).
         # Pre-bridge, this probe did not exist and every fetch below was
         # unconditionally gated — to remove, delete this call and pass nothing.
-        mapped = await self._namespace_has_mapped_markers(namespace)
+        mapped = await self._namespace_has_mapped_markers(namespace, graph_iris=graph_iris)
         if not mapped:
             logger.info(
                 "tbox_ismapped_bridge_fallback",
@@ -287,20 +379,24 @@ class TBoxContextBuilder:
         # Strategy: For small namespaces (< threshold classes), fetch ALL classes
         # and properties to ensure complete context. This avoids vector-search
         # misses that cause InternalError on valid queries.
-        full_context = await self._try_full_namespace_context(namespace, mapped)
+        full_context = await self._try_full_namespace_context(namespace, mapped, graph_iris=graph_iris)
         if full_context is not None:
             classes, properties = full_context
         elif ontology_hits:
-            classes, properties = await self._fetch_ontology_context(ontology_hits, namespace, mapped)
+            classes, properties = await self._fetch_ontology_context(
+                ontology_hits, namespace, mapped, graph_iris=graph_iris
+            )
         elif query:
             # Fallback: use query entities to fetch context
-            classes, properties = await self._fetch_by_entities(query, namespace, mapped)
+            classes, properties = await self._fetch_by_entities(query, namespace, mapped, graph_iris=graph_iris)
 
         # Fetch ObjectProperties (FK join paths) only when multiple classes are
         # present — single-class queries don't need join paths, saving a Neptune roundtrip.
         object_properties: list[dict[str, Any]] = []
         if len(classes) > 1:
-            object_properties = await self._fetch_object_properties(namespace, mapped)
+            object_properties = await self._fetch_object_properties(
+                namespace, mapped, graph_iris=graph_iris, class_uris=[c["uri"] for c in classes if c.get("uri")]
+            )
 
         # fetch :aiContext glossary (synonyms/instructions) for the hit
         # nodes so business terms map to ontology URIs. Best-effort — never blocks
@@ -317,7 +413,7 @@ class TBoxContextBuilder:
         # mapped URIs (no extra Neptune round-trip — the sets are already in hand).
         mapped_uris = {c["uri"] for c in classes} | {p["uri"] for p in properties}
         glossary_hits = [h for h in vector_hits if getattr(h, "uri", "") in mapped_uris or h.type == "metric"]
-        glossary = await self._fetch_ai_context(glossary_hits, namespace)
+        glossary = await self._fetch_ai_context(glossary_hits, namespace, graph_iris=graph_iris)
 
         context = TBoxContext(
             classes=classes,
@@ -326,6 +422,7 @@ class TBoxContextBuilder:
             metrics=metrics,
             glossary=glossary,
             token_estimate=self._estimate_tokens(classes, properties, metrics, object_properties),
+            graph_iris=graph_iris,
         )
 
         if context.token_estimate > max_tokens:
@@ -368,7 +465,7 @@ class TBoxContextBuilder:
             logger.warning("tbox_context_no_mapped_classes", namespace=namespace, detail=detail)
         return context
 
-    async def _namespace_has_mapped_markers(self, namespace: str) -> bool:
+    async def _namespace_has_mapped_markers(self, namespace: str, graph_iris: list[str] | None = None) -> bool:
         """Probe whether the namespace has ANY ``coa:isMapped true`` marker.
 
         The legacy-namespace bridge: returns True when at least one mapped class
@@ -393,10 +490,7 @@ class TBoxContextBuilder:
 
         ask_sparql = f"""
         ASK {{
-          GRAPH ?g {{
-            ?c <{_IS_MAPPED_IRI}> true .
-          }}
-          FILTER(STRSTARTS(STR(?g), "{graph_uri_prefix}"))
+{graph_scoped_body(f"            ?c <{_IS_MAPPED_IRI}> true .", graph_uri_prefix, graph_iris)}
         }}
         """
         try:
@@ -410,6 +504,7 @@ class TBoxContextBuilder:
         self,
         namespace: str,
         mapped: bool = True,
+        graph_iris: list[str] | None = None,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]] | None:
         """For small namespaces, fetch ALL classes and properties.
 
@@ -436,14 +531,12 @@ class TBoxContextBuilder:
         # to remove, drop this line and substitute ``_IS_MAPPED_PATTERN`` for every
         # ``{gate}`` and ``_MAPPED_PARENT_PATTERN`` for every ``{_parent_pattern(mapped)}``.
         gate = _class_gate(mapped)
+        count_body = f"""            ?class a owl:Class .
+            {gate}"""
         count_sparql = f"""
         SELECT (COUNT(DISTINCT ?class) AS ?cnt)
         WHERE {{
-          GRAPH ?g {{
-            ?class a owl:Class .
-            {gate}
-          }}
-          FILTER(STRSTARTS(STR(?g), "{graph_uri_prefix}"))
+{graph_scoped_body(count_body, graph_uri_prefix, graph_iris)}
         }}
         """
         try:
@@ -481,16 +574,14 @@ class TBoxContextBuilder:
         # (bounded by the ≤200 threshold, so it can never hit the row cap); only
         # the secondary property list can still truncate, which merely drops some
         # column hints (the class is still present + answerable) and is logged.
+        classes_body = f"""            ?class a owl:Class .
+            {gate}
+            ?class rdfs:label ?label .
+            {_parent_pattern(mapped)}"""
         classes_sparql = f"""
         SELECT DISTINCT ?class ?label ?parentClass
         WHERE {{
-          GRAPH ?g {{
-            ?class a owl:Class .
-            {gate}
-            ?class rdfs:label ?label .
-            {_parent_pattern(mapped)}
-          }}
-          FILTER(STRSTARTS(STR(?g), "{graph_uri_prefix}"))
+{graph_scoped_body(classes_body, graph_uri_prefix, graph_iris)}
         }} LIMIT {_SPARQL_RESULT_LIMIT}
         """
         # Datatype properties of mapped classes. ``?class`` is gated on isMapped
@@ -502,19 +593,17 @@ class TBoxContextBuilder:
         # ``_fetch_object_properties`` (mapped-gated on both ends). The optional
         # ``?distinctValue`` carries per-column allowed-values (categorical enum
         # samples) into NL→SQL/SPARQL generation.
-        props_sparql = f"""
-        SELECT ?class ?property ?range ?propLabel ?distinctValue
-        WHERE {{
-          GRAPH ?g {{
-            ?class a owl:Class .
+        props_body = f"""            ?class a owl:Class .
             {gate}
             ?property a owl:DatatypeProperty .
             ?property rdfs:domain ?class .
             ?property rdfs:label ?propLabel .
             ?property rdfs:range ?range .
-            OPTIONAL {{ ?property <{_SCL_DISTINCT_VALUES}> ?distinctValue . }}
-          }}
-          FILTER(STRSTARTS(STR(?g), "{graph_uri_prefix}"))
+            OPTIONAL {{ ?property <{_SCL_DISTINCT_VALUES}> ?distinctValue . }}"""
+        props_sparql = f"""
+        SELECT ?class ?property ?range ?propLabel ?distinctValue
+        WHERE {{
+{graph_scoped_body(props_body, graph_uri_prefix, graph_iris)}
         }} LIMIT {_SPARQL_RESULT_LIMIT}
         """
 
@@ -546,8 +635,21 @@ class TBoxContextBuilder:
             logger.warning("full_context_fetch_failed", namespace=namespace, error=str(e))
             return None
 
-    async def _fetch_object_properties(self, namespace: str, mapped: bool = True) -> list[dict[str, Any]]:
-        """Fetch ObjectProperties (FK join paths) for the namespace."""
+    async def _fetch_object_properties(
+        self,
+        namespace: str,
+        mapped: bool = True,
+        graph_iris: list[str] | None = None,
+        class_uris: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Fetch ObjectProperties (FK join paths) for the namespace.
+
+        ``class_uris`` are the classes already selected into this T-Box. Anchoring
+        the query to them is both the performance fix (see ``domain_iris`` in
+        ``object_properties_sparql``) and the relevant scope: a join path whose
+        domain class never reaches the prompt names a class the writer cannot
+        reference, so it spends LIMIT budget without adding a usable join.
+        """
         if not self._graph_uri_template:
             return []
 
@@ -572,10 +674,17 @@ class TBoxContextBuilder:
         # because the Tier-2 FK-traversal tool reads the same edges; keeping one
         # definition means a fix there (label handling, scoping, performance)
         # reaches both callers instead of one.
+        #
+        # ``graph_iris`` is the whole reason Spider-2-sized namespaces produced no
+        # join paths: unbound, this is the most expensive query the builder issues
+        # (two label lookups per edge, cluster-wide) and it was the first to
+        # ReadTimeout. See the _MAX_GRAPHS block at module top.
         sparql = object_properties_sparql(
             graph_uri_prefix,
             limit=_OBJECT_PROPERTY_LIMIT,
             mapped_gate_iri=_IS_MAPPED_IRI if mapped else None,
+            graph_iris=graph_iris,
+            domain_iris=[u for u in (class_uris or []) if _is_safe_sparql_uri(u)][:_MAX_DOMAIN_ANCHOR_URIS],
         )
         try:
             results = await self._graph.query(sparql)
@@ -602,6 +711,7 @@ class TBoxContextBuilder:
         ontology_hits: list[VectorHit],
         namespace: str,
         mapped: bool = True,
+        graph_iris: list[str] | None = None,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """Fetch full class/property definitions from Neptune for ontology vector hits."""
         validate_namespace(namespace)
@@ -683,10 +793,7 @@ class TBoxContextBuilder:
         sparql = f"""
         SELECT ?class ?property ?range ?label ?propLabel ?parentClass ?distinctValue
         WHERE {{
-          GRAPH ?g {{
-            {" UNION ".join(union_clauses)}
-          }}
-          FILTER(STRSTARTS(STR(?g), "{graph_uri_prefix}"))
+{graph_scoped_body(" UNION ".join(union_clauses), graph_uri_prefix, graph_iris)}
         }} LIMIT {_SPARQL_RESULT_LIMIT}
         """
 
@@ -703,6 +810,7 @@ class TBoxContextBuilder:
         query: str,
         namespace: str,
         mapped: bool = True,
+        graph_iris: list[str] | None = None,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """Fallback: fetch ontology context by matching NL query entities against class labels."""
         validate_namespace(namespace)
@@ -752,17 +860,15 @@ class TBoxContextBuilder:
         # handful of short forward terms did, and a multilingual namespace carries
         # one label per language per class. DISTINCT plus the bounded class list
         # keeps the class query one row per (class, label, parent).
-        classes_sparql = f"""
-        SELECT DISTINCT ?class ?label ?parentClass
-        WHERE {{
-          GRAPH ?g {{
-            ?class a owl:Class .
+        entity_classes_body = f"""            ?class a owl:Class .
             {_class_gate(mapped)}
             ?class rdfs:label ?label .
             FILTER({filters})
-            {_parent_pattern(mapped)}
-          }}
-          FILTER(STRSTARTS(STR(?g), "{graph_uri_prefix}"))
+            {_parent_pattern(mapped)}"""
+        classes_sparql = f"""
+        SELECT DISTINCT ?class ?label ?parentClass
+        WHERE {{
+{graph_scoped_body(entity_classes_body, graph_uri_prefix, graph_iris)}
         }} LIMIT {_SPARQL_RESULT_LIMIT}
         """
 
@@ -814,18 +920,16 @@ class TBoxContextBuilder:
         # so this query cannot introduce a class the gate above rejected. Bounded
         # by the same VALUES cap the vector-hit path uses.
         class_values = " ".join(f"(<{uri}>)" for uri in matched_uris[:_MAX_SPARQL_VALUES_URIS])
-        props_sparql = f"""
-        SELECT ?class ?property ?range ?propLabel ?distinctValue
-        WHERE {{
-          GRAPH ?g {{
-            VALUES (?class) {{ {class_values} }}
+        entity_props_body = f"""            VALUES (?class) {{ {class_values} }}
             ?property a owl:DatatypeProperty .
             ?property rdfs:domain ?class .
             ?property rdfs:label ?propLabel .
             ?property rdfs:range ?range .
-            OPTIONAL {{ ?property <{_SCL_DISTINCT_VALUES}> ?distinctValue . }}
-          }}
-          FILTER(STRSTARTS(STR(?g), "{graph_uri_prefix}"))
+            OPTIONAL {{ ?property <{_SCL_DISTINCT_VALUES}> ?distinctValue . }}"""
+        props_sparql = f"""
+        SELECT ?class ?property ?range ?propLabel ?distinctValue
+        WHERE {{
+{graph_scoped_body(entity_props_body, graph_uri_prefix, graph_iris)}
         }} LIMIT {_SPARQL_RESULT_LIMIT}
         """
 
@@ -849,7 +953,9 @@ class TBoxContextBuilder:
         # parent before property rows (which carry no label) are folded in.
         return self._parse_results(class_results + prop_results)
 
-    async def _fetch_ai_context(self, vector_hits: list[VectorHit], namespace: str) -> list[AiContextTerm]:
+    async def _fetch_ai_context(
+        self, vector_hits: list[VectorHit], namespace: str, graph_iris: list[str] | None = None
+    ) -> list[AiContextTerm]:
         """Fetch :aiContext JSON literals from Neptune for the hit nodes.
 
         ``:aiContext`` carries business synonyms + instructions authored per
@@ -876,15 +982,13 @@ class TBoxContextBuilder:
             return []
 
         values_clause = " ".join(f"(<{u}>)" for u in uris)
+        aicontext_body = f"""            VALUES (?s) {{ {values_clause} }}
+            ?s <urn:{URN_PREFIX}:vocab#aiContext> ?aiContext .
+            OPTIONAL {{ ?s rdfs:label ?label . }}"""
         sparql = f"""
         SELECT ?s ?label ?aiContext
         WHERE {{
-          GRAPH ?g {{
-            VALUES (?s) {{ {values_clause} }}
-            ?s <urn:{URN_PREFIX}:vocab#aiContext> ?aiContext .
-            OPTIONAL {{ ?s rdfs:label ?label . }}
-          }}
-          FILTER(STRSTARTS(STR(?g), "{graph_uri_prefix}"))
+{graph_scoped_body(aicontext_body, graph_uri_prefix, graph_iris)}
         }} LIMIT {_SPARQL_RESULT_LIMIT}
         """
         try:
@@ -1025,30 +1129,105 @@ class TBoxContextBuilder:
         )
 
     def _truncate(self, context: TBoxContext, max_tokens: int) -> TBoxContext:
-        """Proportionally trim context to fit within the token budget.
+        """Trim context to the token budget, spending the budget on classes first.
 
-        Lists are ordered by relevance (vector search cosine similarity),
-        so slicing from the front preserves the most important items.
+        Priority is metrics > classes > (properties, object properties): a class
+        missing from the prompt cannot be queried at all, whereas a class that
+        arrives with only some of its column hints or join paths is still
+        answerable. So classes are charged before either hint list and cut only
+        when they alone overrun.
+
+        This replaces a single proportional ratio applied to all four lists. That
+        ratio was set by whichever list dominates the estimate — datatype
+        properties, at ~10 per class — so property volume alone silently removed
+        mapped classes: on a 75-class namespace the class list arrived at 60.
+        Nothing here is ordered by relevance (the full-namespace path runs no
+        vector search and Neptune returns rows unordered), so a prefix slice drops
+        classes arbitrarily rather than cheaply. For the same reason the surviving
+        property budget is spread ROUND-ROBIN across domain classes: a flat slice
+        in Neptune's row order can hand one class forty columns and the next none,
+        which reads to the LLM as a class with no queryable columns.
+
+        Both cuts floor at zero: ``max_tokens`` below what the metrics alone cost
+        drives the remaining budget negative, and a negative slice index keeps the
+        TAIL of a list instead of emptying it.
         """
-        ratio = max_tokens / max(context.token_estimate, 1)
-        max_classes = max(int(len(context.classes) * ratio), 1)
-        max_props = int(len(context.properties) * ratio)
-        max_obj_props = int(len(context.object_properties) * ratio)
-        max_metrics = max(int(len(context.metrics) * ratio), 1)
-        truncated_classes = context.classes[:max_classes]
-        truncated_props = context.properties[:max_props]
-        truncated_obj_props = context.object_properties[:max_obj_props]
-        truncated_metrics = context.metrics[:max_metrics]
-        return TBoxContext(
-            classes=truncated_classes,
-            properties=truncated_props,
-            object_properties=truncated_obj_props,
-            metrics=truncated_metrics,
-            glossary=context.glossary,  # glossary is small; keep it intact on truncation
-            token_estimate=self._estimate_tokens(
-                truncated_classes, truncated_props, truncated_metrics, truncated_obj_props
-            ),
+        classes = context.classes
+        metrics = context.metrics
+        budget = max_tokens - (len(metrics) * _TOKENS_PER_METRIC)
+        max_classes = max(budget // _TOKENS_PER_CLASS, 1)
+        if len(classes) > max_classes:
+            # Only reachable when the class list alone overruns the budget, i.e.
+            # a namespace far past _FULL_CONTEXT_CLASS_THRESHOLD. Never silent:
+            # everything downstream (validation, compilation) will fail on a
+            # class the prompt never showed.
+            logger.warning(
+                "tbox_classes_truncated",
+                classes=len(classes),
+                kept=max_classes,
+                max_tokens=max_tokens,
+                detail="token budget cannot hold the mapped class list; dropped classes are unqueryable",
+            )
+            classes = classes[:max_classes]
+        budget -= len(classes) * _TOKENS_PER_CLASS
+
+        # Split what is left between the two hint lists in their original
+        # proportion, so neither is starved by the other's volume.
+        hint_tokens = (len(context.properties) * _TOKENS_PER_PROPERTY) + (
+            len(context.object_properties) * _TOKENS_PER_OBJECT_PROPERTY
         )
+        ratio = (budget / hint_tokens) if hint_tokens > 0 else 0.0
+        # Clamp BOTH ends. The upper clamp is the ordinary "budget is roomier
+        # than the lists" case; the lower one matters because ``budget`` can be
+        # negative when the metrics alone exceed max_tokens, and int(len * -x) is
+        # a negative slice index — ``object_properties[:-2]`` keeps all but two
+        # rather than none.
+        ratio = min(max(ratio, 0.0), 1.0)
+        properties = self._spread_properties(context.properties, int(len(context.properties) * ratio))
+        object_properties = context.object_properties[: int(len(context.object_properties) * ratio)]
+        return TBoxContext(
+            classes=classes,
+            properties=properties,
+            object_properties=object_properties,
+            metrics=metrics,
+            glossary=context.glossary,  # glossary is small; keep it intact on truncation
+            token_estimate=self._estimate_tokens(classes, properties, metrics, object_properties),
+            graph_iris=context.graph_iris,  # a prompt budget does not change which graphs exist
+        )
+
+    @staticmethod
+    def _spread_properties(properties: list[dict[str, Any]], keep: int) -> list[dict[str, Any]]:
+        """Keep ``keep`` properties spread evenly across their domain classes.
+
+        One round per pass over the classes in first-appearance order, so every
+        class keeps its first column hint before any class keeps its second. The
+        output is regrouped by class afterwards, because ``format_for_prompt``
+        renders properties per class and interleaved rows would read as noise.
+        """
+        if keep >= len(properties):
+            return properties
+        if keep <= 0:
+            return []
+        by_domain: dict[str, list[dict[str, Any]]] = {}
+        for prop in properties:
+            by_domain.setdefault(str(prop.get("domain", "")), []).append(prop)
+        kept: dict[str, list[dict[str, Any]]] = {domain: [] for domain in by_domain}
+        remaining = keep
+        depth = 0
+        while remaining > 0:
+            progressed = False
+            for domain, props in by_domain.items():
+                if depth >= len(props):
+                    continue
+                kept[domain].append(props[depth])
+                progressed = True
+                remaining -= 1
+                if remaining == 0:
+                    break
+            if not progressed:
+                break
+            depth += 1
+        return [prop for domain in by_domain for prop in kept[domain]]
 
     def format_for_prompt(self, context: TBoxContext, namespace: str) -> str:
         """Format TBoxContext as text for inclusion in an LLM prompt.

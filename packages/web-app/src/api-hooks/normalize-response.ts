@@ -6,6 +6,7 @@
  * PlaygroundResponse with safe defaults for all required fields.
  */
 import type { PlaygroundResponse, TraceStep } from "@app-types/playground";
+import { normalizeGraphContext } from "@utils/graph-context";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -54,6 +55,7 @@ export function normalizeResponse(raw: unknown): PlaygroundResponse | null {
 
   const partial =
     typeof rawResult.partial === "boolean" ? rawResult.partial : false;
+  const graphContext = normalizeGraphContext(rawResult.graphContext);
 
   const result = {
     tier,
@@ -76,10 +78,7 @@ export function normalizeResponse(raw: unknown): PlaygroundResponse | null {
       supportingContent:
         rawResult.supportingContent as PlaygroundResponse["result"]["supportingContent"],
     }),
-    ...(isRecord(rawResult.graphContext) && {
-      graphContext:
-        rawResult.graphContext as PlaygroundResponse["result"]["graphContext"],
-    }),
+    ...(graphContext && { graphContext }),
     ...(Array.isArray(rawResult.dataSources) && {
       dataSources: rawResult.dataSources as string[],
     }),

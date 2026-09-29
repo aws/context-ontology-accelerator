@@ -5,6 +5,7 @@ import * as cdk from "aws-cdk-lib";
 import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import * as ec2 from "aws-cdk-lib/aws-ec2";
 import * as ecr from "aws-cdk-lib/aws-ecr";
+import { Platform } from "aws-cdk-lib/aws-ecr-assets";
 import * as ecs from "aws-cdk-lib/aws-ecs";
 import * as events from "aws-cdk-lib/aws-events";
 import * as targets from "aws-cdk-lib/aws-events-targets";
@@ -1138,6 +1139,14 @@ export class SourcesStack extends SCLStack {
           )
         : ecs.ContainerImage.fromAsset(Paths.root, {
             file: "packages/sources/database/enrichment/Dockerfile",
+            // Pin to amd64 to match this image's design: the Dockerfile is
+            // `FROM --platform=linux/amd64`, CI builds it `--custom-platform
+            // linux/amd64`, and the Fargate task def is x86_64. Without this
+            // explicit pin, a Docker build on an arm64 host (Apple Silicon)
+            // silently produces an arm64 image the x86_64 task cannot exec
+            // ("exec format error"). The pin makes the arch independent of the
+            // build host's Docker default.
+            platform: Platform.LINUX_AMD64,
           });
 
     dbEnrichmentTaskDef.addContainer("DbEnrichmentContainer", {
@@ -1714,6 +1723,97 @@ export class SourcesStack extends SCLStack {
     // (Granted later, after sourcesApiFn is constructed.)
 
     // ================================================================
+    // Source Deletion Worker — unbounded teardown off the request path
+    // ================================================================
+    // A database source's teardown includes one DataZone delete_asset per
+    // discovered table, so it scales with source size and cannot fit the
+    // 30-second sources-api timeout. The API does the bounded part (catalog /
+    // federation deregistration, whose only handle is the row), flips the source
+    // to DELETING and enqueues here; this worker deletes the row LAST so an
+    // incomplete cleanup stays retryable instead of orphaning assets.
+    const sourceDeleteDlq = new sqs.Queue(this, "SourceDeleteDLQ", {
+      queueName: this.prefixed("sources-delete-dlq"),
+      retentionPeriod: cdk.Duration.days(14),
+      encryption: sqs.QueueEncryption.SQS_MANAGED,
+      enforceSSL: true,
+    });
+    const sourceDeleteQueue = new sqs.Queue(this, "SourceDeleteQueue", {
+      queueName: this.prefixed("sources-delete-queue"),
+      // Must exceed the worker timeout or SQS redelivers a message that is still
+      // being processed, duplicating cleanup mid-flight.
+      visibilityTimeout: cdk.Duration.minutes(16),
+      encryption: sqs.QueueEncryption.SQS_MANAGED,
+      enforceSSL: true,
+      deadLetterQueue: { maxReceiveCount: 3, queue: sourceDeleteDlq },
+    });
+
+    const sourceDeleteWorkerFn = new lambda.Function(
+      this,
+      "SourceDeleteWorkerFn",
+      {
+        functionName: this.prefixed("sources-delete-worker"),
+        runtime: lambda.Runtime.PYTHON_3_12,
+        architecture: lambda.Architecture.ARM_64,
+        // Points straight at the module — the cleanup logic is imported from
+        // sources_handler, so there is nothing for a shim to add.
+        handler: "coa_sources.api.source_deletion_worker.handler",
+        code: bundlePython({
+          srcDirs: [
+            fromRoot("packages/sources/src"),
+            Paths.commonLib,
+            Paths.smithyGeneratedControlPlanePythonServer,
+          ],
+          requirementsFile: fromRoot("packages/sources/requirements.txt"),
+          architecture: "arm64",
+        }),
+        // The whole point: 15 minutes instead of the API's 30 seconds.
+        timeout: cdk.Duration.minutes(15),
+        memorySize: 512,
+        vpc,
+        vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+        securityGroups: [lambdaSecurityGroup],
+        environment: {
+          SOURCES_TABLE: this.sourcesTable.tableName,
+          NAMESPACES_TABLE: namespacesTableName,
+          SOURCE_SCAN_JOBS_TABLE: this.sourceScanJobsTable.tableName,
+          SMUS_DOMAIN_ID: domainId,
+          PROJECT_ACCESS_ROLE_ARN: projectAccessRoleArn,
+          // The DataZone cleanup budget defaults to 240s (tuned for the 30s
+          // sources-api). Without raising it here the worker would cap cleanup at
+          // 240s despite its 15-min timeout — leaving a large source's assets
+          // half-deleted and, since the row is only dropped on a COMPLETE
+          // cleanup, the source stuck retrying. Give the budget almost the whole
+          // envelope (840s, ~60s margin under the 900s timeout) so the worker can
+          // actually finish an 860-table teardown.
+          DATAZONE_CLEANUP_BUDGET_S: "840",
+        },
+      },
+    );
+
+    sourceDeleteWorkerFn.addEventSource(
+      new lambdaEventSources.SqsEventSource(sourceDeleteQueue, {
+        batchSize: 1,
+        // Deletes fan out to many DataZone calls; cap concurrency to protect
+        // account-wide DataZone rate limits, as the bulk-review worker does.
+        maxConcurrency: 5,
+        // The handler returns batchItemFailures so one source's failure redrives
+        // only its own message.
+        reportBatchItemFailures: true,
+      }),
+    );
+
+    // Worker IAM — least-privilege:
+    // - Read+write the sources table (DELETE_FAILED transitions, row delete,
+    //   platform catalog-claim release)
+    // - Read namespaces table (resolve dataZoneProjectId)
+    // - Read+write scan jobs (delete this source's scan-job records)
+    // - Assume the shared project access role for DataZone delete_asset
+    this.sourcesTable.grantReadWriteData(sourceDeleteWorkerFn);
+    namespacesTable.grantReadData(sourceDeleteWorkerFn);
+    this.sourceScanJobsTable.grantReadWriteData(sourceDeleteWorkerFn);
+    projectAccessRole.grantAssumeRole(sourceDeleteWorkerFn.role!);
+
+    // ================================================================
     // Documents Pipeline — Preprocessing Lambda + KgBuild ECS + SFN
     // ================================================================
 
@@ -1874,6 +1974,11 @@ export class SourcesStack extends SCLStack {
           )
         : ecs.ContainerImage.fromAsset(Paths.root, {
             file: "packages/sources/documents/kg-build/Dockerfile",
+            // Pin to amd64 (see DbEnrichment note): Dockerfile is
+            // `FROM --platform=linux/amd64`, CI builds `--custom-platform
+            // linux/amd64`, task def is x86_64. Prevents an arm64 build host
+            // from producing an unrunnable arm64 image.
+            platform: Platform.LINUX_AMD64,
           });
 
     const batchInferenceRole = new iam.Role(this, "SourcesBatchInferenceRole", {
@@ -2648,6 +2753,9 @@ export class SourcesStack extends SCLStack {
         SCAN_QUEUE_URL: dbScanQueue.queueUrl,
         INGESTION_QUEUE_URL: docIngestionQueue.queueUrl,
         REVIEW_QUEUE_URL: bulkReviewQueue.queueUrl,
+        // Database-source deletes hand their unbounded DataZone teardown here.
+        // Unset would make the API finish inline instead (its old behaviour).
+        SOURCE_DELETE_QUEUE_URL: sourceDeleteQueue.queueUrl,
         BUCKET_NAME: sourcesBucket.bucketName,
         DELETION_STATE_MACHINE_ARN: docDeletionStateMachine.stateMachineArn,
         ALLOWED_ORIGIN: allowedOrigin,
@@ -2705,6 +2813,7 @@ export class SourcesStack extends SCLStack {
     dbScanQueue.grantSendMessages(sourcesApiFn);
     docIngestionQueue.grantSendMessages(sourcesApiFn);
     bulkReviewQueue.grantSendMessages(sourcesApiFn);
+    sourceDeleteQueue.grantSendMessages(sourcesApiFn);
     docDeletionStateMachine.grantStartExecution(sourcesApiFn);
     projectAccessRole.grantAssumeRole(sourcesApiFn.role!);
 
@@ -2877,12 +2986,16 @@ export class SourcesStack extends SCLStack {
       .monitorLambda(docCleanupFn)
       .monitorLambda(docTriggerFn)
       .monitorLambda(federationProvisionerFn)
+      .monitorLambda(sourceDeleteWorkerFn)
       .monitorStateMachine(dbScanStateMachine)
       .monitorStateMachine(docIngestionStateMachine)
       .monitorStateMachine(docDeletionStateMachine)
       .monitorQueueWithDlq(dbScanQueue, dbScanDlq)
       .monitorQueueWithDlq(bulkReviewQueue, bulkReviewDlq)
-      .monitorQueueWithDlq(docIngestionQueue, docIngestionDlq);
+      .monitorQueueWithDlq(docIngestionQueue, docIngestionDlq)
+      // A message on the delete DLQ is an orphaned source teardown (assets left
+      // behind, source stuck DELETING/DELETE_FAILED) — page on it like the others.
+      .monitorQueueWithDlq(sourceDeleteQueue, sourceDeleteDlq);
 
     // ================================================================
     // CloudWatch Dashboard — Structured Scan & Enrichment Pipeline

@@ -222,6 +222,52 @@ describe("playgroundReducer", () => {
       expect(assistantMsg.response!.result.tier).toBe(1);
     });
 
+    it("normalizes a restored legacy top-level graph entity array", () => {
+      const action: PlaygroundAction = {
+        type: "RESTORE_HISTORY",
+        messages: [
+          { role: "user", content: "show graph evidence" },
+          {
+            role: "assistant",
+            content: "Restored graph answer",
+            metadata: {
+              graphContext: [
+                {
+                  uri: "e:legacy",
+                  label: "Legacy entity",
+                  relationships: [
+                    {
+                      predicate: "RELATED_TO",
+                      target_uri: "e:target",
+                      target_label: "Target",
+                    },
+                  ],
+                },
+              ],
+            },
+          },
+        ],
+      };
+
+      const state = playgroundReducer(INITIAL_STATE, action);
+
+      expect(state.messages[1].response!.result.graphContext).toEqual({
+        entities: [
+          {
+            uri: "e:legacy",
+            label: "Legacy entity",
+            relationships: [
+              {
+                predicate: "RELATED_TO",
+                target_uri: "e:target",
+                target_label: "Target",
+              },
+            ],
+          },
+        ],
+      });
+    });
+
     it("does not show raw array string as content for table results", () => {
       const action: PlaygroundAction = {
         type: "RESTORE_HISTORY",

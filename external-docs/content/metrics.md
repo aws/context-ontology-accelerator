@@ -47,7 +47,9 @@ Current constraints to factor into the decision:
 - Natural-language qualifiers (a time window, a filter, a grouping) make a
   question fall through to Tier 2 unless supplied via `options.dimensions` or an
   explicit `options.tierOverride: 1` — see
-  [How Metrics Are Used in Queries](#how-metrics-are-used-in-queries).
+  [How Metrics Are Used in Queries](#how-metrics-are-used-in-queries). Your
+  definition is still forwarded to Tier 2 in that case, so the fall-through
+  builds on it rather than replacing it.
 - Registering the ontology or the document does **not** replace the metric: the
   ontology provides shared vocabulary, documents provide explanation and
   evidence; only the metric gives the calculation a governed, named, always-
@@ -201,6 +203,19 @@ metric path are `options.dimensions` (bind the filter as a parameter) and
 `options.tierOverride: 1` (explicit instruction). See
 [Questions carrying a qualifier fall through to Tier 2](serve.md#questions-carrying-a-qualifier-fall-through-to-tier-2)
 in the Serve guide for the full routing rules.
+
+**Declining is not discarding.** When Tier 1 steps aside, Tier 2 receives your
+metric's expression, description and declared dimensions as authoritative
+context, along with the part of the question Tier 1 could not apply. Tier 2
+extends your definition instead of re-deriving the calculation from the schema,
+so a question that falls through still starts from the governed formula — the
+point of authoring it centrally. The `t1.metric_match` trace step reports
+`governedDefinitionForwarded: true` when this happened.
+
+This is also why the **description** field is worth writing properly: it is the
+only place the *meaning* of the metric travels, and Tier 2 reads it alongside the
+SQL when extending your definition. An expression alone does not say that
+`active_customer` means operational recency rather than account status.
 
 ## Managing Metrics
 

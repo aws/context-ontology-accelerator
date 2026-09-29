@@ -219,36 +219,49 @@ export const RationalePanel: React.FC<RationalePanelProps> = ({
           variant="footer"
         >
           <SpaceBetween size="s">
-            {result.supportingContent.map((item, idx) => (
-              <Box key={idx} padding={{ vertical: "xs" }}>
-                <SpaceBetween size="xxs">
-                  {item.sourceDoc && (
-                    <Box variant="span" fontWeight="bold" fontSize="body-s">
-                      {item.sourceDoc}
-                    </Box>
-                  )}
-                  {item.text && (
-                    <Box
-                      variant="span"
-                      fontSize="body-s"
-                      color="text-body-secondary"
-                    >
-                      {item.text.slice(0, 200)}
-                      {item.text.length > 200 ? "…" : ""}
-                    </Box>
-                  )}
-                  {item.relevanceScore != null && (
-                    <Box
-                      variant="span"
-                      fontSize="body-s"
-                      color="text-body-secondary"
-                    >
-                      Relevance: {Math.round(item.relevanceScore * 100)}%
-                    </Box>
-                  )}
-                </SpaceBetween>
-              </Box>
-            ))}
+            {result.supportingContent.map((item, idx) => {
+              const sourceLabel =
+                [
+                  item.sourceDocumentName,
+                  item.sourceDoc,
+                  item.label,
+                  item.sourceDocumentId,
+                ].find((value) => typeof value === "string" && value.trim()) ??
+                undefined;
+              return (
+                <Box
+                  key={item.chunkId ?? `evidence-${idx}`}
+                  padding={{ vertical: "xs" }}
+                >
+                  <SpaceBetween size="xxs">
+                    {sourceLabel && (
+                      <Box variant="span" fontWeight="bold" fontSize="body-s">
+                        {sourceLabel}
+                      </Box>
+                    )}
+                    {item.text && (
+                      <Box
+                        variant="span"
+                        fontSize="body-s"
+                        color="text-body-secondary"
+                      >
+                        {item.text.slice(0, 200)}
+                        {item.text.length > 200 ? "…" : ""}
+                      </Box>
+                    )}
+                    {item.relevanceScore != null && (
+                      <Box
+                        variant="span"
+                        fontSize="body-s"
+                        color="text-body-secondary"
+                      >
+                        Relevance: {Math.round(item.relevanceScore * 100)}%
+                      </Box>
+                    )}
+                  </SpaceBetween>
+                </Box>
+              );
+            })}
           </SpaceBetween>
         </ExpandableSection>
       )}

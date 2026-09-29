@@ -22,6 +22,10 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # Lambda reserved concurrency (default 5; set 0 to disable reserving on
 # accounts whose Lambda concurrent-executions quota is the reduced default 10):
 #   SCL_LAMBDA_RESERVED_CONCURRENCY=0 make deploy-dev
+# Tier-2 flat NL→SQL ontology FK expansion (on by default; false turns it off)
+# and how many walked tables it may append (default 8):
+#   SCL_NL2SQL_GRAPH_EXPAND=false make deploy-dev
+#   SCL_NL2SQL_GRAPH_EXPAND_MAX_TABLES=12 make deploy-dev
 # SMUS admin principal(s) — required, comma-separated IAM role/user ARN(s)
 # that human admins federate into (e.g. your IAM Identity Center
 # permission-set role): SCL_SMUS_ADMIN_ARNS=arn:aws:iam::123456789012:role/... make deploy-dev
@@ -37,6 +41,8 @@ CONTEXT="--context env=$ENV"
 [ -n "${SCL_DB_SCAN_ENRICHMENT_TIMEOUT_MINUTES:-}" ] && CONTEXT="$CONTEXT --context dbScanEnrichmentTimeoutMinutes=$SCL_DB_SCAN_ENRICHMENT_TIMEOUT_MINUTES"
 [ -n "${SCL_TIER1_METRIC_TIMEOUT_SECONDS:-}" ] && CONTEXT="$CONTEXT --context tier1_metric_timeout_s=$SCL_TIER1_METRIC_TIMEOUT_SECONDS"
 [ -n "${SCL_LAMBDA_RESERVED_CONCURRENCY:-}" ] && CONTEXT="$CONTEXT --context lambda_reserved_concurrency=$SCL_LAMBDA_RESERVED_CONCURRENCY"
+[ -n "${SCL_NL2SQL_GRAPH_EXPAND:-}" ] && CONTEXT="$CONTEXT --context serve_nl2sql_graph_expand=$SCL_NL2SQL_GRAPH_EXPAND"
+[ -n "${SCL_NL2SQL_GRAPH_EXPAND_MAX_TABLES:-}" ] && CONTEXT="$CONTEXT --context serve_nl2sql_graph_expand_max_tables=$SCL_NL2SQL_GRAPH_EXPAND_MAX_TABLES"
 [ -n "${SCL_SMUS_ADMIN_ARNS:-}" ] && CONTEXT="$CONTEXT --context smus_admin_principal_arns=$SCL_SMUS_ADMIN_ARNS"
 
 # ── Preflight: SMUS admin principal ──────────────────────────────────────

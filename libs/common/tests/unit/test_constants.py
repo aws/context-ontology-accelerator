@@ -27,6 +27,7 @@ from coa_common.constants import (
     validate_namespace_id,
     validate_namespace_name,
     validate_s3_prefix,
+    validate_source_id,
 )
 
 pytestmark = pytest.mark.unit
@@ -124,6 +125,19 @@ class TestValidateNamespaceId:
     def test_invalid_raises(self, value: str):
         with pytest.raises(ValueError, match="Must be a UUID v4"):
             validate_namespace_id(value)
+
+
+class TestValidateSourceId:
+    @pytest.mark.parametrize(
+        "value", ["6ba7b810-9dad-41d1-80b4-00c04fd430c8", "11111111-2222-4333-8444-555555555555", "src-001"]
+    )
+    def test_valid_ids_pass(self, value: str):
+        validate_source_id(value)
+
+    @pytest.mark.parametrize("value", ["", "has space", "a:b", "a%2f", "../etc", "a.b", "a/b"])
+    def test_invalid_raises(self, value: str):
+        with pytest.raises(ValueError, match="alphanumeric characters"):
+            validate_source_id(value)
 
 
 class TestValidateNamespaceName:

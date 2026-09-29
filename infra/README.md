@@ -106,7 +106,25 @@ const api = new ApiStack(app, `${stackPrefix}-api`, {
 });
 ```
 
-Any Smithy-defined path **not** in `pathHandlers` automatically falls through to a 501 "Not Implemented" stub Lambda. The custom authorizer protects all routes unless explicitly listed in `unsecuredPaths`.
+Any Smithy-defined path **not** in `pathHandlers` or `ssmPathHandlers`
+automatically falls through to a 501 "Not Implemented" stub Lambda. The custom
+authorizer protects all routes unless explicitly listed in `unsecuredPaths`.
+
+When handler wiring is supplied, `ApiStack` fails synth if an undeclared path
+would reach that stub:
+
+```text
+API paths would fall through to the 501 stub: <paths>.
+Add an ssmPathHandlers entry in infra/bin/app.ts, or list the path in
+INTENTIONALLY_STUBBED if it is deliberately unimplemented.
+```
+
+Resolve the error by wiring the path to its Lambda in `pathHandlers` or
+`ssmPathHandlers`. Add a path to `INTENTIONALLY_STUBBED` in
+`lib/stacks/services/api-stack.ts` only when the Smithy operation intentionally
+has no backend yet. The allowlist is temporary: remove its entry in the same
+change that lands the backend wiring, so a completed operation cannot continue
+returning 501 unnoticed.
 
 ### 5. Deploy and verify
 

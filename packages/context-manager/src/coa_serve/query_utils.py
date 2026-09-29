@@ -538,34 +538,85 @@ def namespace_graph_prefix(template: str, namespace: str) -> str:
 SPARQL_PREFIXES = "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\nPREFIX owl: <http://www.w3.org/2002/07/owl#>\n"
 
 
+# Above this many resolved graphs we stop inlining and fall back to the prefix
+# filter, because the inlined form repeats ``body`` once per graph and a body may
+# already carry a 175-IRI ``VALUES ?domain`` anchor. Namespaces publish one graph
+# per ontology (1 on Spider 2.0, 2 on BIRD-Interact), so this is a guard against a
+# pathological layout, not a working limit.
+_MAX_INLINED_GRAPHS = 8
+
+# Graph IRIs are interpolated into ``GRAPH <...>``, so they are guarded at the
+# point of interpolation and not only where they are resolved: the resolvers apply
+# the same test, but ``graph_iris`` reaches here through plain dataclass fields and
+# an ``Any``-typed reuse parameter, neither of which re-validates.
+_SAFE_GRAPH_IRI_RE = regex.compile(r"^https?://[^\s<>\"{}|\\^`]+$")
+
+
 def graph_scoped_body(body: str, graph_uri_prefix: str, graph_iris: list[str] | None = None) -> str:
     """Scope a triple-pattern body to one namespace's named graphs.
 
-    Prefers binding ``?g`` to the concrete graph IRIs (``VALUES``), which lets
-    Neptune serve the patterns from the quad index for those graphs only. The bare
-    ``GRAPH ?g`` + ``STRSTARTS`` form matches in EVERY graph on the cluster and
-    filters afterwards, so its cost is set by the whole store rather than by the
-    namespace: with ~30 ingested namespaces the FK-edge query stopped fitting in
-    its timeout (pinning Neptune's CPU at 99%) and, because a failed load is never
-    cached, traversal then errored on every call.
+    Scoping matters because the bare ``GRAPH ?g`` + ``STRSTARTS`` form matches in
+    EVERY graph on the cluster and filters afterwards, so its cost is set by the
+    whole store rather than by the namespace: with ~30 ingested namespaces the
+    FK-edge query stopped fitting in its timeout (pinning Neptune's CPU at 99%)
+    and, because a failed load is never cached, traversal then errored on every
+    call.
+
+    SCOPES WITH A CONSTANT ``GRAPH <iri>`` PER GRAPH, NOT ``VALUES ?g`` — do not
+    "simplify" it back. Both name the same graphs, but only the constant form is
+    pushed into the index scan; a multi-row ``VALUES ?g`` is a materialised solution
+    sequence joined against the patterns. That is invisible on a one-graph namespace
+    where the row folds to a constant, which is why the ``VALUES`` form measured as a
+    large win on Spider 2.0 (1 graph: 16.5s ReadTimeout to 10ms) and then, on the same
+    build and an idle cluster, regressed BIRD-Interact (2 graphs) from 1.05s to three
+    16.5s ReadTimeouts.
 
     Falls back to the prefix filter when the caller could not resolve the graphs,
     so an unexpected graph layout degrades to slow rather than to no traversal.
 
     Args:
-        body: The triple patterns to place inside ``GRAPH ?g { … }``.
+        body: The triple patterns to place inside the ``GRAPH`` block. Repeated
+            once per graph when several resolve, so ``?g`` must not be projected
+            or referenced by the caller — no current caller does.
         graph_uri_prefix: Prefix from :func:`namespace_graph_prefix`, used by the
             fallback filter.
-        graph_iris: The namespace's resolved named-graph IRIs, if known. Callers
-            must have validated them as safe IRI refs.
+        graph_iris: The namespace's resolved named-graph IRIs, if known. Anything
+            that is not a safe IRI ref is dropped here rather than interpolated —
+            callers resolve these from the store, so the guard belongs at the point
+            of interpolation as well as at the point of resolution.
 
     Returns:
-        The ``GRAPH``-wrapped body, with either a ``VALUES`` binding or a
-        ``STRSTARTS`` filter doing the scoping.
+        The ``GRAPH``-wrapped body: one constant-graph block, a ``UNION`` of them,
+        or the ``STRSTARTS``-filtered ``GRAPH ?g`` fallback.
     """
     if graph_iris:
-        values = " ".join(f"<{g}>" for g in graph_iris)
-        return f"VALUES ?g {{ {values} }}\n          GRAPH ?g {{\n{body}\n          }}"
+        safe = [g for g in graph_iris if _SAFE_GRAPH_IRI_RE.match(g)]
+        if len(safe) != len(graph_iris):
+            logger.warning(
+                "graph_scope_unsafe_iri_dropped",
+                dropped=len(graph_iris) - len(safe),
+                detail="graph IRI is not safe for angle-bracket interpolation; excluded from the scoped query",
+            )
+        graph_iris = safe
+    if graph_iris and len(graph_iris) <= _MAX_INLINED_GRAPHS:
+        blocks = [f"          GRAPH <{g}> {{\n{body}\n          }}" for g in graph_iris]
+        if len(blocks) == 1:
+            return blocks[0]
+        # UNION operands must be group graph patterns, hence the extra braces.
+        return "\n          UNION\n".join(f"          {{\n{b}\n          }}" for b in blocks)
+    if graph_iris:
+        # Resolution SUCCEEDED and we are still falling back, which is the one
+        # degraded case that would otherwise be invisible: the resolver's own cap
+        # (tbox_context._MAX_GRAPHS, 50) is well above this one, so a 9..50-graph
+        # namespace pays the cluster-wide scan while every log line says the
+        # graphs resolved fine. Warn rather than silently degrade — the same
+        # reason class truncation warns.
+        logger.warning(
+            "graph_scope_not_inlined",
+            graphs=len(graph_iris),
+            max_inlined=_MAX_INLINED_GRAPHS,
+            detail="graph IRIs resolved but exceed the inlining cap; falling back to the cluster-wide prefix filter",
+        )
     return f'          GRAPH ?g {{\n{body}\n          }}\n          FILTER(STRSTARTS(STR(?g), "{graph_uri_prefix}"))'
 
 
@@ -598,6 +649,7 @@ def object_properties_sparql(
     mapped_gate_iri: str | None = None,
     with_comment: bool = False,
     graph_iris: list[str] | None = None,
+    domain_iris: list[str] | None = None,
 ) -> str:
     """Build the namespace-scoped ``owl:ObjectProperty`` (FK join path) query.
 
@@ -626,6 +678,15 @@ def object_properties_sparql(
             (see :func:`named_graphs_sparql`). Binding them keeps this query's cost
             proportional to the namespace instead of to the whole cluster; omitting
             them falls back to the prefix filter (see :func:`graph_scoped_body`).
+        domain_iris: When given, restrict ``?domain`` to these class IRIs. Graph
+            scoping alone is not enough on a 400-class namespace: with
+            ``?domain``/``?range`` unbound, ``?domain rdfs:label ?domainLabel`` scans
+            every label in the graph, and this query was the last one still hitting a
+            16.5s ReadTimeout. Anchoring ``?domain`` makes both label joins per-edge.
+            NARROWS THE RESULT SET, one-sided on purpose: an edge is kept only if its
+            DOMAIN is anchored, so an edge from an unanchored class into an anchored
+            one is dropped. Callers that need the whole FK graph (the traversal tool)
+            omit it.
 
     Returns:
         A SPARQL SELECT binding ``?op ?opLabel ?domain ?domainLabel ?range
@@ -636,7 +697,12 @@ def object_properties_sparql(
         gate = f"?domain <{mapped_gate_iri}> true .\n            ?range <{mapped_gate_iri}> true ."
     comment_select = " ?comment" if with_comment else ""
     comment_pattern = "\n            OPTIONAL { ?op rdfs:comment ?comment }" if with_comment else ""
-    body = f"""            ?op a owl:ObjectProperty .
+    # Anchor first so the planner starts from the bound set rather than from
+    # ?op a owl:ObjectProperty (every edge in the graph).
+    domain_values = ""
+    if domain_iris:
+        domain_values = "VALUES ?domain { " + " ".join(f"<{iri}>" for iri in domain_iris) + " }\n            "
+    body = f"""            {domain_values}?op a owl:ObjectProperty .
             ?op rdfs:domain ?domain .
             ?op rdfs:range ?range .
             {gate}

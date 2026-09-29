@@ -15,6 +15,56 @@ This guide walks you through deploying Context Ontology Accelerator into your AW
 | Java | 17+ | Smithy code generation |
 | Docker | — | Container image builds |
 
+### ARM64 container builds on x86_64 hosts
+
+Several CDK assets are built explicitly for `linux/arm64`: the Context Manager
+(Serve), MCP, and VKG images. A native ARM64 machine needs no emulation. An
+x86_64 Linux host must have binfmt/QEMU registered before Docker can execute
+ARM64 build steps; otherwise the build commonly stops with `exec format error`.
+
+Docker Desktop includes multi-platform emulation on supported installations.
+Verify the active Docker builder before deploying:
+
+```bash
+docker buildx inspect --bootstrap
+docker run --rm --platform linux/arm64 alpine uname -m
+```
+
+The builder's platform list should include `linux/arm64`, and the second command
+should print `aarch64`. If Docker Engine on Linux does not have ARM64 emulation,
+follow [Docker's QEMU setup guidance](https://docs.docker.com/build/building/multi-platform/#qemu).
+The [tonistiigi/binfmt installer](https://github.com/tonistiigi/binfmt#installing-emulators)
+accepts an architecture-specific install so the host only registers the
+emulator needed here:
+
+```bash
+docker run --privileged --rm tonistiigi/binfmt --install arm64
+
+# Verify again before make deploy-dev
+docker run --rm --platform linux/arm64 alpine uname -m
+```
+
+!!! warning "binfmt installation is privileged"
+    Registering binfmt modifies the host kernel configuration and the command
+    above runs a privileged container. Follow your organization's host-security
+    policy. Where privileged setup is not allowed, use a native ARM64 builder or
+    supply prebuilt ARM64 ECR images instead of building the assets locally.
+    `context_manager_image_uri` supplies the shared Context Manager image used
+    by the Serve and MCP stacks. VKG requires `vkg_image_uri` together with
+    `ecr_repository_arn` and `ecr_repository_name`.
+
+If a build still fails:
+
+1. Check whether `CDK_DOCKER` selects Docker, Finch, or another engine. Register
+   emulation in the same engine that CDK will use.
+2. When Docker is active, re-run `docker buildx inspect --bootstrap` and confirm
+   `linux/arm64` is listed.
+3. Run the Docker Alpine verification command above. An `exec format error` there is a
+   host/emulation problem, before CDK or application code is involved.
+4. On a remote or custom builder, inspect the selected builder with
+   `docker buildx ls`; registration on the local default engine does not
+   configure a different builder automatically.
+
 ## AWS Account Setup
 
 Context Ontology Accelerator deploys into a single AWS account and region. Ensure the deploying principal has `AdministratorAccess` or equivalent permissions for the initial deployment.
@@ -364,6 +414,35 @@ SCL_DB_SCAN_ENRICHMENT_TIMEOUT_MINUTES=180 make deploy-dev
 
 The value is minutes and must be a positive number; CDK fails synth otherwise. On a direct `cdk deploy` (rather than the `make`/`deploy.sh` path) pass it as CDK context instead — `--context dbScanEnrichmentTimeoutMinutes=180`, or set it in the `context` block of `infra/cdk.json`. The Step Functions state-machine ceiling is derived automatically as this value plus two minutes, so the per-task deadline always trips first and routes the source to `SCAN_FAILED`.
 
+#### Whole-request budget
+
+Every `/query` request shares one wall clock across all tiers and strategies, defaulting to **170 seconds**. It is the outer bound that each per-stage timeout — including the translation budget below — sits inside, so raising a stage above it buys nothing.
+
+```bash
+# Allow up to 240 seconds per request (default is 170)
+cdk deploy --context resolve_timeout_s=240
+```
+
+The value is seconds and is clamped to 10–300, so passing a larger number does not widen the budget. It is one setting on one runtime: REST, MCP and streaming callers all get the same figure, and it does not lift the transport-level 29-second REST ceiling described below. Raise it when questions on wide namespaces are cut off mid-answer rather than answered wrongly — and note that on the default `nl_to_sql_first` strategy the stages share this budget in order, so time an earlier stage spends is taken off the ones after it.
+
+#### NL→SPARQL translation budget
+
+The Tier-2 **Ontop route** (`strategy` = `ontop`, `ontop_first`, or the second half of the default `nl_to_sql_first`) answers a question by translating it to SPARQL over the namespace's ontology and letting Ontop compile that to SQL. One wall clock covers the whole translation — T-Box assembly, the LLM call, SPARQL validation, and every validate-and-retry attempt — and it defaults to **60 seconds**.
+
+Raise it when a trace shows `translation_timed_out`, which happens on wide namespaces where a complete T-Box makes a long prompt. Measured over 727 translations on a 175-class namespace: p50 **29.1 s**, p90 **44.7 s**, and **6.9%** already hitting the 60 s limit.
+
+```bash
+# Allow up to 120 seconds per translation (default is 60)
+cdk deploy --context serve_vkg_translation_timeout_s=120
+```
+
+The value is seconds, clamped to 10–600; out-of-range values are clamped and logged, and an unparseable one keeps the default. Unset leaves the shipped 60 s, so upgrading moves nothing. It can also go in the `context` block of `infra/cdk.json`.
+
+!!! warning "This route does not fit inside the 29-second REST timeout"
+    A *median* translation already exceeds the whole REST budget, so raising this value does not make the Ontop route work over `POST /query` — the REST path's own timeout is pinned at 29 s in the data-layer handler, is not settable from `infra/`, and severs the socket first, which surfaces as the `504` in [Serve → Troubleshooting](serve.md#troubleshooting). Reach this route over the SSE-streaming Playground or the MCP server instead — neither sits behind API Gateway. See [Serve → Query Interfaces](serve.md#query-interfaces).
+
+Three further ceilings sit above this knob and it cannot raise any of them: `resolve_timeout_s` (the whole-request budget above); roughly **half** of that if the request retries, because a rejected first SPARQL re-enters translation with a fresh budget; and **90 s** under `strategy="best"`, where each Tier-2 strategy is wrapped in its own timeout. On the default `nl_to_sql_first` strategy this route runs *second*, so whatever it spends is taken off Tier 3 within the same request. Raise it well past 60 s only for callers that pin `options.strategy` to `ontop` or `ontop_first`, or raise `resolve_timeout_s` in step.
+
 #### Lambda reserved concurrency
 
 Two Lambdas — the VKG reloader and the document preprocessor — reserve concurrent executions (default **5** each) to bound their blast radius. On an account whose **Lambda concurrent-executions quota** (`L-B99A9384`) is at the reduced default of **10** — which AWS applies to some new accounts — reserving *any* concurrency is rejected, because it would drop unreserved capacity below Lambda's account-wide minimum of 10. The deploy runs for ~30 minutes and then fails and rolls back on `coa-dev-vkg` (and `coa-dev-sources` after it) with:
@@ -381,6 +460,27 @@ SCL_LAMBDA_RESERVED_CONCURRENCY=0 make deploy-dev
 ```
 
 The value must be a non-negative integer; CDK fails synth otherwise. `0` (or unset via context) omits the reservation entirely — the functions then draw from the shared unreserved pool with no dedicated guarantee or cap, which is fine for a single-tenant evaluation. On a direct `cdk deploy`, pass it as context instead — `--context lambda_reserved_concurrency=0`, or set it in the `context` block of `infra/cdk.json`.
+
+#### Tier-2 NL→SQL ontology foreign-key expansion
+
+When Tier 2 answers a question with flat NL→SQL, it first retrieves the tables that best match the question. It then follows the ontology's foreign keys one step out from those tables and adds the tables it reaches, with their columns and join keys, to the prompt. This lets the model write a join to a table the search did not rank. It is **on by default** and needs the ontology graph (Neptune); a deployment without one skips it and uses the retrieved tables alone. If the graph query fails, the question is still answered from the retrieved tables.
+
+Two settings control it:
+
+```bash
+# Turn the expansion off for the whole deployment (default: on)
+SCL_NL2SQL_GRAPH_EXPAND=false make deploy-dev
+
+# Let it append up to 12 walked tables (default is 8)
+SCL_NL2SQL_GRAPH_EXPAND_MAX_TABLES=12 make deploy-dev
+```
+
+- **`serve_nl2sql_graph_expand`** — `false`/`0`/`off`/`no` turns it off; `true`/`1`/`on`/`yes` turns it on explicitly. Any other value is ignored and the default (on) applies.
+- **`serve_nl2sql_graph_expand_max_tables`** — how many walked tables may be added. `0` adds none. A value that is not a whole number falls back to 8, and a negative one is treated as `0`; both log a warning. The graph tool caps the walk at 200 tables whatever you set. Raise it when the table a join needs is often missing from the prompt and the prompt has room.
+
+Leaving either setting unset leaves the runtime's default in charge; the stack only sets the Serve runtime variable (`SERVE_NL2SQL_GRAPH_EXPAND` / `SERVE_NL2SQL_GRAPH_EXPAND_MAX_TABLES`) when you pass a value. Changing either one is a stack update, not an image rebuild. A single request can also override the deployment setting with `options.flatGraphExpand` (`true` or `false`). An A/B test that compares the expansion on and off must pass `flatGraphExpand: false` for the "off" arm; leaving the option out now means on.
+
+`scripts/deploy.sh` maps the variables above to the CDK context parameters `serve_nl2sql_graph_expand` and `serve_nl2sql_graph_expand_max_tables`. On a direct `cdk deploy`, pass them as context instead — `--context serve_nl2sql_graph_expand=false` — or set them in the `context` block of `infra/cdk.json`.
 
 ### VKG Task Sizing
 
@@ -454,7 +554,9 @@ when tuning a large or pathological source.
 | `BULK_REVIEW_PAGE_BUDGET` | `worker.py` default | Per-invocation table budget for the bulk-review worker (default `1000`); when a source has more tables, the worker processes one page, re-enqueues a continuation, and resumes across chained invocations rather than silently capping. |
 | `BULK_REVIEW_WALL_CLOCK_BUDGET_S` | `worker.py` default | Per-invocation wall-clock budget in seconds (default `240`), a second guard under the 5-minute Lambda timeout that stops the worker after the current search page and continues in a fresh invocation when neared. |
 | `REVIEW_QUEUE_URL` | `sources-stack.ts` | SQS review-queue URL the bulk-review worker re-enqueues page continuations to, wiring its own self-continuation. |
-| `DATAZONE_CLEANUP_BUDGET_S` | `sources_handler.py` default | **Upper clamp** (not an absolute deadline) on DataZone asset cleanup during source delete, in seconds (default `240`). The effective deadline is `min(this value, remaining Lambda time − 2s safety margin)`, so it can shorten the window but never extend past the real timeout. On expiry the delete returns partial-completion counts and the namespace-deletion sweep finishes the remainder, instead of the Lambda being killed mid-request. A malformed value falls back to `240`. |
+| `DATAZONE_CLEANUP_BUDGET_S` | `sources_handler.py` default; `sources-stack.ts` on the delete worker | **Upper clamp** (not an absolute deadline) on DataZone asset cleanup during source delete, in seconds (default `240`; the `sources-delete-worker` sets `840`). The effective deadline is `min(this value, remaining Lambda time − 2s safety margin)`, so it can shorten the window but never extend past the real timeout. On expiry the source row is kept and the delete is retried (worker redrive, or a repeat `DELETE` on a `DELETE_FAILED` source) instead of being dropped with assets left behind. A malformed value falls back to `240`. |
+| `SOURCE_DELETE_QUEUE_URL` | `sources-stack.ts` | SQS queue the `sources-api` hands database-source deletes to. When set, `DELETE` of a database source returns `202` + `DELETING` and `sources-delete-worker` (15-min timeout) finishes the teardown; when unset, the delete runs inline and returns `200`. |
+| `PROBE_MAX_ROWS` | `dialects.py` default | Maximum rows the column-cardinality probe reads per column (default `100000`), on every engine including the Glue/Athena sampler. Complements `PROBE_TIMEOUT_MS`: that bounds how long a probe runs, this bounds how much it reads. Past the cap, counts describe a prefix of the table in scan order, so a rare value beyond it is missed. Must be a positive integer; a malformed value falls back to the default. |
 | `PROBE_TIMEOUT_MS` | `dialects.py` default | Session-level `statement_timeout` (milliseconds, default `30000`) applied on Postgres/Redshift connections before the column-cardinality probe used for enum detection. Bounds the `COUNT(*) / COUNT(DISTINCT …)` probe and the sampling query that follows it, so one wide or high-cardinality column cannot consume the whole 15-minute `sources-db-connector` budget. Must be a positive integer; a malformed or non-positive value logs a warning and falls back to the default rather than removing the bound. Set it **lower** to fail faster on pathological columns, **higher** only if legitimately large tables are being skipped — too high defeats the protection, and a timed-out column is simply treated as "not an enum" (logged as `distinct_probe_timeout`). |
 
 **Migration note for `DATAZONE_CLEANUP_BUDGET_S`.** Before the GH-137 fix this was
@@ -804,6 +906,18 @@ DOMAIN_ID=$(aws datazone list-domains --query "items[?name=='<PREFIX>-<ENV>-smus
 aws datazone delete-domain --identifier "$DOMAIN_ID" --skip-deletion-check
 # wait for status DELETED, then delete the ROLLBACK_COMPLETE stack and redeploy
 ```
+
+### A database source is stuck in `DELETING`
+
+**Cause:** the `sources-delete-worker` message ran out of attempts (`maxReceiveCount=3`) and moved to `sources-delete-dlq`, which raises the DLQ alarm. Repeated cleanup failures cause this, and so does account-level Lambda throttling: throttled deliveries still count as attempts. While a source reads `DELETING`, a repeat `DELETE` returns `409`.
+
+**Fix:** check the worker's logs for `source_delete_worker_failed` / `source_delete_incomplete`. If throttling caused it, raise the account's Lambda concurrency quota. Then redrive the DLQ; every deletion step is idempotent:
+
+```bash
+aws sqs start-message-move-task --source-arn <sources-delete-dlq ARN>
+```
+
+A source that reads `DELETE_FAILED` can instead be retried with another `DELETE`.
 
 ### AgentCore ENI wait can take hours
 

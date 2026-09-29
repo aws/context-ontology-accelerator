@@ -175,8 +175,16 @@ export const SourceDetail: React.FC = () => {
   const source = data?.body;
   const isDatabase = source?.sourceType === "DATABASE";
 
-  // Tables — only fetched for DATABASE sources via the new sources-api tables endpoint
-  const { data: tablesData, isLoading: tablesLoading } = useListSourceTables(
+  // Tables — only fetched for DATABASE sources via the new sources-api tables endpoint.
+  // Pages render as they arrive; `tablesLoadingMore` means the list on screen is
+  // a valid prefix, not the whole source, so the counts are marked provisional.
+  const {
+    data: tablesData,
+    isLoading: tablesLoading,
+    isLoadingMore: tablesLoadingMore,
+    isError: tablesError,
+    error: tablesErrorObj,
+  } = useListSourceTables(
     namespaceId ?? "",
     isDatabase ? (sourceId ?? "") : "",
   );
@@ -692,9 +700,19 @@ export const SourceDetail: React.FC = () => {
             tabs={[
               {
                 id: "tables",
-                label: `Tables (${tables.length})`,
+                label: `Tables (${tables.length}${tablesLoadingMore ? "+" : ""})`,
                 content: (
                   <SpaceBetween size="m">
+                    {tablesError && (
+                      <Alert type="error" header="Failed to load tables">
+                        {tablesErrorObj instanceof Error
+                          ? tablesErrorObj.message
+                          : "The table list could not be retrieved."}{" "}
+                        {(tablesData?.items?.length ?? 0) > 0
+                          ? "The list below is partial."
+                          : ""}
+                      </Alert>
+                    )}
                     {(tablesData?.skippedAssets ?? 0) > 0 && (
                       <Alert type="warning">
                         {tablesData?.skippedAssets === 1
@@ -870,7 +888,15 @@ export const SourceDetail: React.FC = () => {
                       header={
                         <Header
                           variant="h2"
-                          counter={`(${tables.length})`}
+                          counter={`(${tables.length}${tablesLoadingMore ? "+" : ""})`}
+                          // Text, not just a spinner: a partial list that looks
+                          // complete is worse than a slow one, and screen-reader
+                          // users get no signal from a loading glyph alone.
+                          description={
+                            tablesLoadingMore
+                              ? "Still loading tables — the list below is incomplete."
+                              : undefined
+                          }
                           actions={
                             <SpaceBetween direction="horizontal" size="xs">
                               <Button

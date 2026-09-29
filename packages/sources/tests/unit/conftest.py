@@ -37,6 +37,18 @@ os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "testing")
 os.environ.setdefault("AWS_SECURITY_TOKEN", "testing")
 os.environ.setdefault("AWS_SESSION_TOKEN", "testing")
 
+# ``sources_handler`` captures ``SOURCES_TABLE`` at IMPORT time (module-level
+# ``_SOURCES_TABLE``), so whichever test module imports it FIRST decides whether
+# the DAO can be built at all — every later `_get_dao()` raises "SOURCES_TABLE env
+# var not set" if that first import saw no value. test_sources_handler.py used to
+# be that module and set the var itself, which held only because it happened to
+# sort before the other importers. Any new module importing the handler earlier,
+# directly or transitively, silently broke ~14 of its tests. Setting it here —
+# before pytest imports any test module — removes the ordering dependence, the
+# same reasoning as the AWS_REGION block above. The value matches the table
+# test_sources_handler.py creates in moto.
+os.environ.setdefault("SOURCES_TABLE", "test-sources")
+
 # Imported after the env block above: the module reads AWS_REGION at import time.
 from coa_sources.database import glue_ownership  # noqa: E402
 

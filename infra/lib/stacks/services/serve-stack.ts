@@ -25,6 +25,7 @@ import {
   CONNECTOR_SPILL_KMS_TAG_VALUE,
   CONNECTOR_TAG_KEY,
   CONNECTOR_TAG_VALUE,
+  DEFAULT_BEDROCK_LLM_MODEL_ID,
   DEFAULT_BEDROCK_MODEL_ID,
   DEFAULT_GRAPH_URI_BASE,
 } from "../../constants";
@@ -69,7 +70,7 @@ export interface ServeStackProps extends cdk.StackProps {
   readonly agentCoreAzNames?: string[];
 
   /** Bedrock LLM model ID for query resolution (NL-to-SPARQL, synthesis).
-   *  Defaults to us.anthropic.claude-sonnet-5 at runtime when omitted. */
+   *  Defaults to DEFAULT_BEDROCK_LLM_MODEL_ID when omitted. */
   readonly bedrockLlmModelId?: string;
 
   /** Bedrock embedding model ID for query embedding + the graphrag lexical
@@ -559,6 +560,29 @@ export class ServeStack extends SCLStack {
               return raw;
             })(),
           }),
+          // Tier-2 flat NL→SQL: append the tables one induced FK hop out from the
+          // retrieved ones. On in the code default, so this key exists to turn it
+          // OFF (`-c serve_nl2sql_graph_expand=false`) or to pin it explicitly —
+          // an operator should not need an image rebuild to disable a retrieval
+          // lever that misbehaves on their schema. Left absent, the runtime's own
+          // default applies and the variable is not set at all, so the code stays
+          // the single source of truth for what "default" means.
+          ...(this.node.tryGetContext("serve_nl2sql_graph_expand") !==
+            undefined && {
+            SERVE_NL2SQL_GRAPH_EXPAND: String(
+              this.node.tryGetContext("serve_nl2sql_graph_expand"),
+            ),
+          }),
+          // Companion budget: how many walked tables may be appended (default 8 in
+          // code — the value the walk was benchmarked at). Raise when the missing
+          // join table is plausibly further down the FK ordering.
+          ...(this.node.tryGetContext(
+            "serve_nl2sql_graph_expand_max_tables",
+          ) !== undefined && {
+            SERVE_NL2SQL_GRAPH_EXPAND_MAX_TABLES: String(
+              this.node.tryGetContext("serve_nl2sql_graph_expand_max_tables"),
+            ),
+          }),
           // Deep-reasoning Tier-3 budgets. The 30s code default squeezes later tools
           // below their runtime (graphrag strategy calls take 10-40s); much above this
           // the AgentCore endpoint returns an empty envelope. MUST stay under
@@ -588,6 +612,26 @@ export class ServeStack extends SCLStack {
           TIER1_METRIC_TIMEOUT_S:
             (this.node.tryGetContext("tier1_metric_timeout_s") as string) ??
             "35",
+          // Whole-translation budget for the NL->SPARQL->SQL route (T-Box build, LLM
+          // call, validation and every validate-and-retry attempt), clamped 10..600 in
+          // nl_to_sparql. Unset => the shipped 60s, so no deployment moves. Raising it
+          // matters on wide namespaces, where 60s was the binding constraint rather
+          // than a backstop: over 727 translations p50 29.1s, p90 44.7s, max 59.6s,
+          // 6.9% already returning translation_timed_out.
+          //
+          // Outer budgets bound this one and it cannot raise them: RESOLVE_TIMEOUT_S
+          // above, half of it if the request retries translation, 90s under
+          // strategy="best", and ~29s over REST. See
+          // nl_to_sparql._resolve_translation_timeout_s.
+          //
+          // Presence-checked with !== undefined, not truthiness, so an explicit "0" is
+          // still passed through and clamped-with-a-warning rather than dropped here.
+          ...(this.node.tryGetContext("serve_vkg_translation_timeout_s") !==
+            undefined && {
+            SERVE_VKG_TRANSLATION_TIMEOUT_S: String(
+              this.node.tryGetContext("serve_vkg_translation_timeout_s"),
+            ),
+          }),
           ALLOW_NO_GUARDRAIL: this.envName !== "prod" ? "true" : "false",
           // Same base as the writers (metric-service NDB_GRAPH_URI_BASE,
           // ontology-engine neptune_db_graph). Serve reads these graphs, so a
@@ -613,9 +657,9 @@ export class ServeStack extends SCLStack {
             }
             return optIn ? "true" : "false";
           })(),
-          ...(props.bedrockLlmModelId && {
-            BEDROCK_MODEL_ID: props.bedrockLlmModelId,
-          }),
+          // Always emitted so the effective query model is visible in the template.
+          BEDROCK_MODEL_ID:
+            props.bedrockLlmModelId ?? DEFAULT_BEDROCK_LLM_MODEL_ID,
           // Query embedding + graphrag lexical retriever MUST use the same model
           // doc-kg-build ingested with. Config-resolved (#94) so a non-US deploy
           // can set a region-appropriate model; shared ts-shared constant is the

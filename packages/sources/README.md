@@ -189,7 +189,7 @@ Scan job history for sources.
 | `GET` | `/namespaces/{namespaceId}/sources` | List all sources (paginated, newest first) |
 | `POST` | `/namespaces/{namespaceId}/sources` | Create a DATABASE or DOCUMENTS source |
 | `GET` | `/namespaces/{namespaceId}/sources/{sourceId}` | Get source detail |
-| `DELETE` | `/namespaces/{namespaceId}/sources/{sourceId}` | Delete a source |
+| `DELETE` | `/namespaces/{namespaceId}/sources/{sourceId}` | Delete a source. Returns `202` + `DELETING` when the teardown runs asynchronously; poll `GetSource` until it returns `404` (row removed) or `DELETE_FAILED` |
 | `POST` | `/namespaces/{namespaceId}/sources/{sourceId}/rescan` | Re-trigger scan or ingestion |
 | `POST` | `/namespaces/{namespaceId}/sources/upload-urls` | Get pre-signed S3 upload URLs |
 | `GET` | `/namespaces/{namespaceId}/sources/{sourceId}/tables` | List DataZone tables (DATABASE only) |
@@ -407,6 +407,7 @@ Frontend polls `GET /sources/{sourceId}` and inspects the `status` field. Termin
 | `FEDERATION_PROVISIONER_ROLE_ARN` | No | ARN of the federation provisioner role holding Lake Formation data-lake-admin privileges. The handler assumes it to tear down a JDBC source's Glue federated catalog on deletion. When unset, federated-resource cleanup is skipped. |
 | `RESOURCE_PREFIX` | Yes, for `CUSTOM_CONNECTOR` | Deployment resource prefix (e.g. `scl-dev-`), used to derive the per-source Athena data-catalog name. **Load-bearing:** unset, `derive_catalog_name` falls back to a hard-coded `coa-dev-`, and every `CreateDataCatalog` then fails `AccessDenied` against the prefix-scoped IAM policy — which reads as a policy defect rather than a naming one. |
 | `ALLOWED_ORIGIN` | No | CORS allowed origin (default: `*`) |
+| `SOURCE_DELETE_QUEUE_URL` | No | SQS URL of the database-source delete queue (consumed by `sources-delete-worker`). Set: database `DELETE` returns `202` + `DELETING`. Unset: the delete runs inline and returns `200`. |
 
 ## Environment Variables (Database Pipeline)
 

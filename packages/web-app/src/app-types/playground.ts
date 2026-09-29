@@ -20,6 +20,7 @@ export interface HistoryMessage {
     resultRows?: Record<string, unknown>[];
     sparqlGenerated?: string;
     guardrailBlocked?: boolean;
+    graphContext?: GraphContextItem | GraphContextEntity[];
     metadata?: {
       modelId?: string;
       namespace?: string;
@@ -117,21 +118,49 @@ export interface QueryResult {
 export interface SupportingContentItem {
   chunkId?: string;
   text?: string;
+  sourceDocumentId?: string;
+  sourceDocumentName?: string;
+  // Legacy Tier-3 fields retained for rendering older responses.
   sourceDoc?: string;
   label?: string;
   relevanceScore?: number;
   [key: string]: unknown;
 }
 
-export interface GraphContextItem {
-  uri?: string;
-  label?: string;
+export interface GraphContextEntity {
+  uri: string;
+  label: string;
   type?: string;
-  relationships?: Array<{
-    predicate: string;
-    target: string;
-    targetLabel?: string;
-  }>;
+  properties?: Record<string, unknown>;
+  /** Legacy restored-session shape; new responses use top-level relationships. */
+  relationships?: LegacyGraphContextRelationship[];
+}
+
+export interface GraphContextRelationship {
+  sourceUri: string;
+  predicateUri: string;
+  targetUri: string;
+  predicateLabel?: string;
+}
+
+export interface LegacyGraphContextRelationship {
+  sourceUri?: string;
+  source_uri?: string;
+  predicateUri?: string;
+  predicate_uri?: string;
+  predicateLabel?: string;
+  predicate_label?: string;
+  predicate?: string;
+  targetUri?: string;
+  target_uri?: string;
+  target?: string;
+  targetLabel?: string;
+  target_label?: string;
+}
+
+export interface GraphContextItem {
+  entities?: GraphContextEntity[];
+  relationships?: GraphContextRelationship[];
   [key: string]: unknown;
 }
 
@@ -161,7 +190,7 @@ export interface StepEvent extends StreamingEventBase {
   type: "step";
   payload: {
     stepName: string;
-    status: "success" | "error" | "skipped" | "miss";
+    status: "success" | "error" | "skipped" | "miss" | "degraded";
     durationMs: number;
     detail?: string;
     toolUsed?: string;

@@ -40,6 +40,17 @@ import {
   MethodLambdaMap,
 } from "../../utils/api-utils";
 
+/**
+ * Smithy spec paths deliberately excluded from the 501-stub guard in
+ * `ApiStack`'s constructor. Exported so the test suite can assert its own
+ * allowlist actually matches this one, instead of relying on a comment to
+ * keep them in sync — an allowlist that drifts silently defeats the guard.
+ */
+export const INTENTIONALLY_STUBBED = new Set([
+  "/health", // unsecured liveness probe answered by the stub itself
+  "/namespaces/{namespaceId}/ontologies/{ontologyId}/upload", // superseded by upload-url + ingest-from-s3
+]);
+
 export interface ApiStackProps extends cdk.StackProps {
   /**
    * CORS allowed origin for the API (e.g. `https://d2xw5y8g9akfew.cloudfront.net`).
@@ -359,8 +370,57 @@ export class ApiStack extends SCLStack {
     }
 
     const pathLambdaMap: PathLambdaMap = {};
+    const stubbed: string[] = [];
+    const wiredButAllowlisted: string[] = [];
     for (const apiPath of Object.keys(spec.paths ?? {})) {
-      pathLambdaMap[apiPath] = handlers[apiPath] ?? stubFn.functionArn;
+      const handler = handlers[apiPath];
+      if (handler === undefined) {
+        stubbed.push(apiPath);
+      } else if (INTENTIONALLY_STUBBED.has(apiPath)) {
+        wiredButAllowlisted.push(apiPath);
+      }
+      pathLambdaMap[apiPath] = handler ?? stubFn.functionArn;
+    }
+
+    // A spec path with no ssmPathHandlers entry silently becomes a 501 stub. That
+    // is the right behaviour for an operation with no backend yet, but it is also
+    // how a finished feature ships dead: POST .../sources/{sourceId}/stop had a
+    // handler, IAM grants, a UI button and unit tests, and still returned 501 in
+    // every environment because this map had no key for it. Nothing failed —
+    // there was nothing that could fail.
+    //
+    // So the set of stubbed paths is pinned (INTENTIONALLY_STUBBED, module-level
+    // above). Adding an operation to the Smithy model without wiring it now
+    // breaks synth, and the fix is either a handler entry or an explicit line
+    // there saying it is deliberately unimplemented.
+    //
+    // The mirror-image mistake — leaving a path in INTENTIONALLY_STUBBED after
+    // its backend actually lands — is just as silent: the guard below only
+    // checks *unwired* paths, so a wired-but-still-allowlisted path stops being
+    // covered by the "did I forget to remove this?" symptom entirely. Catch it
+    // here too: wiring a path that's still on the allowlist is itself the bug.
+    // Only meaningful when handler wiring was actually supplied. Both maps are
+    // optional props, and tests that construct this stack to assert on the
+    // authorizer or the WAF pass neither — for them every path stubs, which is
+    // correct, not a misconfiguration.
+    const wiringSupplied =
+      Object.keys(props.ssmPathHandlers ?? {}).length > 0 ||
+      Object.keys(props.pathHandlers ?? {}).length > 0;
+    const unexpected = wiringSupplied
+      ? stubbed.filter((p) => !INTENTIONALLY_STUBBED.has(p))
+      : [];
+    if (unexpected.length > 0) {
+      throw new Error(
+        `API paths would fall through to the 501 stub: ${unexpected.join(", ")}. ` +
+          "Add an ssmPathHandlers entry in infra/bin/app.ts, or list the path in " +
+          "INTENTIONALLY_STUBBED if it is deliberately unimplemented.",
+      );
+    }
+    if (wiringSupplied && wiredButAllowlisted.length > 0) {
+      throw new Error(
+        `API paths are wired to a handler but still listed in INTENTIONALLY_STUBBED: ${wiredButAllowlisted.join(", ")}. ` +
+          "Remove the allowlist entry now that the backend has landed.",
+      );
     }
 
     injectLambdaProxyIntegrations(spec, {
