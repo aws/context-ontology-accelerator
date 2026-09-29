@@ -26,7 +26,7 @@ os.environ.setdefault("BUCKET_NAME", "test-bucket")
 os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
 
 _NAMESPACE_ID = "550e8400-e29b-41d4-a716-446655440000"
-_SOURCE_ID = "src-001"
+_SOURCE_ID = "11111111-2222-4333-8444-555555555555"
 
 import coa_sources.api.sources_handler as _sh  # noqa: E402
 
@@ -188,7 +188,7 @@ class TestHandleDelete:
         helpers should patch them again locally to override.
         """
         with (
-            patch(f"{_SH}._delete_source_datazone_assets", return_value=0) as mock_assets,
+            patch(f"{_SH}._delete_source_datazone_assets", return_value=(0, True)) as mock_assets,
             patch(f"{_SH}._delete_source_scan_jobs", return_value=0) as mock_scans,
         ):
             yield mock_assets, mock_scans
@@ -557,7 +557,7 @@ class TestHandleDelete:
 
         with (
             patch(f"{_SH}._get_dao", return_value=mock_dao),
-            patch(f"{_SH}._delete_source_datazone_assets", return_value=3) as mock_assets,
+            patch(f"{_SH}._delete_source_datazone_assets", return_value=(3, True)) as mock_assets,
             patch(f"{_SH}._delete_source_scan_jobs", return_value=2) as mock_scans,
         ):
             status, body = _parse(_current_sh()._handle_delete(_NAMESPACE_ID, _SOURCE_ID))
@@ -568,10 +568,11 @@ class TestHandleDelete:
         mock_scans.assert_called_once_with(_SOURCE_ID)
         mock_dao.delete.assert_called_once()
 
-    def test_delete_database_source_proceeds_when_datazone_cleanup_fails(self):
-        """DataZone asset cleanup failures are logged but must not block
-        the DDB delete — they are best-effort and the namespace-level
-        cleanup will sweep any leftovers."""
+    def test_delete_database_source_keeps_row_when_datazone_cleanup_raises(self):
+        """A DataZone cleanup that RAISES must NOT delete the row: the row is the
+        only handle on any surviving assets, so dropping it would orphan them.
+        The delete fails (500) so it stays retryable, rather than reporting a
+        success that silently leaked assets."""
         mock_dao = MagicMock()
         mock_dao.get.return_value = _db_source_item("APPROVED")
 
@@ -583,11 +584,28 @@ class TestHandleDelete:
             ),
             patch(f"{_SH}._delete_source_scan_jobs", return_value=0),
         ):
-            status, body = _parse(_current_sh()._handle_delete(_NAMESPACE_ID, _SOURCE_ID))
+            status, _body = _parse(_current_sh()._handle_delete(_NAMESPACE_ID, _SOURCE_ID))
 
-        assert status == 200
-        assert body["status"] == "DELETED"
-        mock_dao.delete.assert_called_once()
+        assert status == 500
+        mock_dao.delete.assert_not_called()
+
+    def test_delete_database_source_keeps_row_when_datazone_cleanup_incomplete(self):
+        """A DataZone cleanup that returns complete=False (deadline/pagination/
+        per-asset failure) also keeps the row and fails the delete, so the
+        surviving assets are retried instead of orphaned."""
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = _db_source_item("APPROVED")
+
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            # Deleted some, but did not finish.
+            patch(f"{_SH}._delete_source_datazone_assets", return_value=(5, False)),
+            patch(f"{_SH}._delete_source_scan_jobs", return_value=0),
+        ):
+            status, _body = _parse(_current_sh()._handle_delete(_NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 500
+        mock_dao.delete.assert_not_called()
 
     def test_delete_database_source_proceeds_when_scan_job_cleanup_fails(self):
         """Scan-job cleanup failures are logged but must not block the DDB
@@ -597,7 +615,7 @@ class TestHandleDelete:
 
         with (
             patch(f"{_SH}._get_dao", return_value=mock_dao),
-            patch(f"{_SH}._delete_source_datazone_assets", return_value=0),
+            patch(f"{_SH}._delete_source_datazone_assets", return_value=(0, True)),
             patch(
                 f"{_SH}._delete_source_scan_jobs",
                 side_effect=RuntimeError("DDB throttled"),
@@ -712,10 +730,12 @@ class TestHandleDelete:
 class TestDeleteSourceDatazoneAssets:
     def test_returns_zero_when_no_smus_domain(self):
         with patch(f"{_SH}._SMUS_DOMAIN_ID", ""):
-            result = _current_sh()._delete_source_datazone_assets(_NAMESPACE_ID, _SOURCE_ID)
+            result, complete = _current_sh()._delete_source_datazone_assets(_NAMESPACE_ID, _SOURCE_ID)
         assert result == 0
+        # No domain configured → nothing to clean → complete.
+        assert complete is True
 
-    def test_returns_zero_when_namespace_has_no_project_id(self):
+    def test_incomplete_when_namespace_has_no_project_id(self):
         with (
             patch(f"{_SH}._SMUS_DOMAIN_ID", "dz-domain-1"),
             patch(
@@ -723,8 +743,11 @@ class TestDeleteSourceDatazoneAssets:
                 return_value=None,
             ),
         ):
-            result = _current_sh()._delete_source_datazone_assets(_NAMESPACE_ID, _SOURCE_ID)
+            result, complete = _current_sh()._delete_source_datazone_assets(_NAMESPACE_ID, _SOURCE_ID)
         assert result == 0
+        # Domain configured but project unresolved → assets may exist and are
+        # unreachable → NOT complete, so the caller keeps the row.
+        assert complete is False
 
     def test_deletes_only_assets_with_matching_prefix(self):
         """search_assets is fuzzy; only assets whose name starts with
@@ -758,9 +781,10 @@ class TestDeleteSourceDatazoneAssets:
                 return_value=mock_client,
             ),
         ):
-            removed = _current_sh()._delete_source_datazone_assets(_NAMESPACE_ID, _SOURCE_ID)
+            removed, complete = _current_sh()._delete_source_datazone_assets(_NAMESPACE_ID, _SOURCE_ID)
 
         assert removed == 2
+        assert complete is True
         assert mock_client.search_assets.call_count == 2
         deleted_ids = [c.kwargs["asset_id"] for c in mock_client.delete_asset.call_args_list]
         assert deleted_ids == ["a1", "b2"]
@@ -789,11 +813,13 @@ class TestDeleteSourceDatazoneAssets:
                 return_value=mock_client,
             ),
         ):
-            removed = _current_sh()._delete_source_datazone_assets(_NAMESPACE_ID, _SOURCE_ID)
+            removed, complete = _current_sh()._delete_source_datazone_assets(_NAMESPACE_ID, _SOURCE_ID)
 
         # b succeeded, a failed → 1 removed
         assert removed == 1
         assert mock_client.delete_asset.call_count == 2
+        # A per-asset delete failed → that asset may still exist → NOT complete.
+        assert complete is False
 
     def test_collects_all_pages_before_deleting(self):
         """Regression: deleting assets must not perturb search pagination.
@@ -841,10 +867,11 @@ class TestDeleteSourceDatazoneAssets:
                 return_value=mock_client,
             ),
         ):
-            removed = _current_sh()._delete_source_datazone_assets(_NAMESPACE_ID, _SOURCE_ID)
+            removed, complete = _current_sh()._delete_source_datazone_assets(_NAMESPACE_ID, _SOURCE_ID)
 
         # All 75 across both pages must be deleted — none orphaned.
         assert removed == 75
+        assert complete is True
         assert mock_client.search_assets.call_count == 2
         assert mock_client.delete_asset.call_count == 75
 
@@ -877,12 +904,14 @@ class TestDeleteSourceDatazoneAssets:
                 return_value=mock_client,
             ),
         ):
-            removed = _current_sh()._delete_source_datazone_assets(_NAMESPACE_ID, _SOURCE_ID)
+            removed, complete = _current_sh()._delete_source_datazone_assets(_NAMESPACE_ID, _SOURCE_ID)
 
         # Budget=0 → deadline already past → search and delete both skipped.
         assert removed == 0
         assert mock_client.search_assets.call_count == 0
         assert mock_client.delete_asset.call_count == 0
+        # Stopped on the budget before doing anything → NOT complete.
+        assert complete is False
 
     @staticmethod
     def _run_with_client(mock_client):
@@ -905,9 +934,10 @@ class TestDeleteSourceDatazoneAssets:
         mock_client = MagicMock()
         mock_client.search_assets.return_value = MagicMock(items=[], next_token=None)
 
-        removed = self._run_with_client(mock_client)
+        removed, complete = self._run_with_client(mock_client)
 
         assert removed == 0
+        assert complete is True
         assert mock_client.search_assets.call_count == 1
         assert mock_client.delete_asset.call_count == 0
 
@@ -922,9 +952,10 @@ class TestDeleteSourceDatazoneAssets:
         mock_client = MagicMock()
         mock_client.search_assets.return_value = MagicMock(items=items, next_token=None)
 
-        removed = self._run_with_client(mock_client)
+        removed, complete = self._run_with_client(mock_client)
 
         assert removed == 3
+        assert complete is True
         assert mock_client.search_assets.call_count == 1
         assert mock_client.delete_asset.call_count == 3
 
@@ -945,13 +976,16 @@ class TestDeleteSourceDatazoneAssets:
         mock_client = MagicMock()
         mock_client.search_assets.side_effect = _page
 
-        removed = self._run_with_client(mock_client)
+        removed, complete = self._run_with_client(mock_client)
 
         # Bounded by the 100-page guard (the loop's else-branch logs the limit).
         assert mock_client.search_assets.call_count == 100
         # 100 collected asset ids → 100 delete attempts.
         assert mock_client.delete_asset.call_count == 100
         assert removed == 100
+        # Hit the pagination cap without exhausting the cursor → NOT complete,
+        # so the caller keeps the row and retries the rest.
+        assert complete is False
 
     def test_search_assets_exception_propagates(self):
         """An exception from search_assets (collection phase) is not swallowed.
@@ -1027,7 +1061,7 @@ class TestHandleDeleteCounter:
     @pytest.fixture(autouse=True)
     def _mock_database_cleanup_helpers(self):
         with (
-            patch(f"{_SH}._delete_source_datazone_assets", return_value=0),
+            patch(f"{_SH}._delete_source_datazone_assets", return_value=(0, True)),
             patch(f"{_SH}._delete_source_scan_jobs", return_value=0),
         ):
             yield
@@ -1489,7 +1523,17 @@ class TestHandlerRouting:
         mock_dao = MagicMock()
         mock_dao.get.return_value = _db_source_item("APPROVED")
 
-        with patch(f"{_SH}._get_dao", return_value=mock_dao):
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            # This is a routing test — stub the cleanup tail so the outcome is
+            # deterministic (a complete cleanup) rather than depending on live
+            # DataZone/DDB access. The cleanup contract itself is covered by
+            # test_async_source_deletion.py.
+            patch(f"{_SH}._delete_source_datazone_assets", return_value=(0, True)),
+            patch(f"{_SH}._delete_source_scan_jobs", return_value=0),
+            patch(f"{_SH}.adjust_namespace_source_count"),
+            patch(f"{_SH}.release_platform_catalog"),
+        ):
             event = _make_event(
                 "DELETE",
                 "/namespaces/{namespaceId}/sources/{sourceId}",

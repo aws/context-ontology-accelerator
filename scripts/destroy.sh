@@ -170,7 +170,7 @@ if [ ${#AGENTCORE_SG_IDS[@]} -eq 0 ]; then
   while IFS= read -r SG_ID; do
     [ -n "$SG_ID" ] && AGENTCORE_SG_IDS+=("$SG_ID")
   done < <(aws ec2 describe-security-groups --region "$REGION" \
-    --filters "Name=group-name,Values=*AgentCoreSG*,*McpSG*" \
+    --filters "Name=group-name,Values=${STACK_PREFIX}-*AgentCoreSG*,${STACK_PREFIX}-*McpSG*" \
     --query 'SecurityGroups[].GroupId' --output text 2>/dev/null | tr '\t' '\n')
 fi
 

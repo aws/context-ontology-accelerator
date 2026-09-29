@@ -53,10 +53,32 @@ class TestProbeTimeoutStatements:
 
         assert SqlServerDialect().probe_timeout_statements() == ()
 
-    def test_snowflake_emits_nothing(self):
-        from coa_sources.database.connectors.dialects import SnowflakeDialect
+    def test_snowflake_emits_session_timeout(self):
+        """GH-219: Snowflake now bounds the probe via STATEMENT_TIMEOUT_IN_SECONDS."""
+        from coa_sources.database.connectors.dialects import PROBE_TIMEOUT_MS, SnowflakeDialect
 
-        assert SnowflakeDialect().probe_timeout_statements() == ()
+        stmts = SnowflakeDialect().probe_timeout_statements()
+        assert len(stmts) == 1
+        assert stmts[0].startswith("ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = ")
+        secs = int(stmts[0].split("=")[1].strip())
+        # Seconds, floored to at least 1 (Snowflake reads 0 as "no timeout").
+        assert secs == max(1, PROBE_TIMEOUT_MS // 1000)
+        assert secs >= 1
+
+    def test_snowflake_timeout_floors_to_one_second(self):
+        """A sub-second PROBE_TIMEOUT_MS must not floor to 0 (Snowflake: 0 = no timeout)."""
+        import importlib
+
+        import coa_sources.database.connectors.dialects as mod
+
+        with patch.dict(os.environ, {"PROBE_TIMEOUT_MS": "500"}):
+            importlib.reload(mod)
+            try:
+                stmts = mod.SnowflakeDialect().probe_timeout_statements()
+                assert stmts[0].endswith("= 1"), f"expected floor to 1s, got {stmts[0]!r}"
+            finally:
+                os.environ.pop("PROBE_TIMEOUT_MS", None)
+                importlib.reload(mod)
 
     def test_oracle_emits_nothing(self):
         from coa_sources.database.connectors.dialects import OracleDialect

@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from coa_serve.exceptions import AccessDeniedError, NoResultError
 from coa_serve.orchestrator import Orchestrator
+from coa_serve.tier1.metric_resolver import DeclinedMetricContext
 from coa_serve.tier2.strategy import (
     LEGACY_STRATEGY_ALIASES,
     StrategyContext,
@@ -725,6 +726,29 @@ class TestOrchestratorWithStrategy:
 
 @pytest.mark.unit
 class TestModelIdPropagation:
+    @pytest.mark.asyncio
+    async def test_parallel_context_preserves_declined_metric(self):
+        """The parallel path rebuilds StrategyContext field-by-field, so a new field
+        is silently dropped unless copied. Without this, a namespace running
+        strategies in parallel loses the governed definition the sequential path
+        gets."""
+        s1 = _make_strategy("a", result=_make_result("a", confidence=0.6))
+        s2 = _make_strategy("b", result=_make_result("b", confidence=0.9))
+        tier = StructuredQueryTier(strategies=[s1, s2])
+
+        declined = DeclinedMetricContext(
+            metric_id="demo:revenue",
+            metric_name="revenue",
+            sql_template="SELECT sum(amount) FROM orders",
+            unhandled_qualifier="last quarter",
+        )
+        ctx = StrategyContext(trace=TraceCollector(), declined_metric=declined)
+        await tier.resolve("query", "ns", ctx, option="best")
+
+        for strategy in [s1, s2]:
+            call_ctx = strategy.resolve.call_args.args[2]
+            assert call_ctx.declined_metric is declined
+
     @pytest.mark.asyncio
     async def test_parallel_context_preserves_model_id(self):
         """Verify _resolve_parallel copies model_id into per-strategy contexts."""

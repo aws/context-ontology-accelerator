@@ -1986,4 +1986,88 @@ describe("SourcesStack", () => {
       expect(definitions).toContain("$.discoveryResult.Payload.reviewNeeded");
     });
   });
+
+  describe("Source Deletion Worker (async database-source delete)", () => {
+    it("gives the delete queue a visibility timeout above the worker timeout", () => {
+      // 16 min > the worker's 15 min. Lower would let SQS redeliver a message
+      // whose cleanup is still running, duplicating the teardown mid-flight.
+      template.hasResourceProperties("AWS::SQS::Queue", {
+        QueueName: Match.stringLikeRegexp(".*sources-delete-queue$"),
+        VisibilityTimeout: 960,
+        SqsManagedSseEnabled: true,
+      });
+    });
+
+    it("creates a DLQ with 14-day retention and a 3-attempt redrive policy", () => {
+      template.hasResourceProperties("AWS::SQS::Queue", {
+        QueueName: Match.stringLikeRegexp(".*sources-delete-dlq$"),
+        MessageRetentionPeriod: 14 * 24 * 60 * 60,
+        SqsManagedSseEnabled: true,
+      });
+      template.hasResourceProperties("AWS::SQS::Queue", {
+        QueueName: Match.stringLikeRegexp(".*sources-delete-queue$"),
+        RedrivePolicy: Match.objectLike({ maxReceiveCount: 3 }),
+      });
+    });
+
+    it("creates the worker with the 15-minute timeout the API cannot give it, ARM64, in VPC", () => {
+      // The reason the worker exists: sources-api is capped at 30s and DataZone
+      // asset teardown scales with table count.
+      template.hasResourceProperties("AWS::Lambda::Function", {
+        FunctionName: Match.stringLikeRegexp(".*sources-delete-worker$"),
+        Runtime: "python3.12",
+        Architectures: ["arm64"],
+        Timeout: 900,
+        Handler: "coa_sources.api.source_deletion_worker.handler",
+        VpcConfig: Match.objectLike({
+          SubnetIds: Match.anyValue(),
+          SecurityGroupIds: Match.anyValue(),
+        }),
+      });
+    });
+
+    it("reports partial batch failures so one stuck source does not redrive its siblings", () => {
+      template.hasResourceProperties("AWS::Lambda::EventSourceMapping", {
+        FunctionResponseTypes: ["ReportBatchItemFailures"],
+        BatchSize: 1,
+      });
+    });
+
+    it("gives the API the queue URL so it hands off instead of deleting inline", () => {
+      template.hasResourceProperties("AWS::Lambda::Function", {
+        FunctionName: Match.stringLikeRegexp(".*sources-api$"),
+        Environment: Match.objectLike({
+          Variables: Match.objectLike({
+            SOURCE_DELETE_QUEUE_URL: Match.anyValue(),
+          }),
+        }),
+      });
+    });
+
+    it("gives the worker every table its cleanup touches", () => {
+      template.hasResourceProperties("AWS::Lambda::Function", {
+        FunctionName: Match.stringLikeRegexp(".*sources-delete-worker$"),
+        Environment: Match.objectLike({
+          Variables: Match.objectLike({
+            SOURCES_TABLE: Match.anyValue(),
+            SOURCE_SCAN_JOBS_TABLE: Match.anyValue(),
+            NAMESPACES_TABLE: Match.anyValue(),
+            PROJECT_ACCESS_ROLE_ARN: Match.anyValue(),
+          }),
+        }),
+      });
+    });
+
+    it("alarms the delete queue + DLQ so an orphaned teardown pages, not accumulates silently", () => {
+      // monitorQueueWithDlq adds a DLQ max-size alarm dimensioned by the DLQ
+      // QueueName. Assert at least one CloudWatch alarm references the
+      // sources-delete-dlq — without it a failed async delete piles into the DLQ
+      // for 14 days with no signal.
+      const alarms = template.findResources("AWS::CloudWatch::Alarm");
+      const referencesDeleteDlq = Object.values(alarms).some((alarm) =>
+        JSON.stringify(alarm).includes("sources-delete-dlq"),
+      );
+      expect(referencesDeleteDlq).toBe(true);
+    });
+  });
 });

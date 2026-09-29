@@ -191,9 +191,9 @@ export const DEFAULT_BEDROCK_INDUCTION_MODEL_ID =
  * Default Bedrock model ID for the serve query LLM (Tier-2/Tier-3 reasoning,
  * NL-to-SQL/SPARQL, synthesis). Configured per deployment via the
  * `bedrockLlmModelId` SSM config key; when that key is absent ServeStack sets
- * no `BEDROCK_MODEL_ID` and the runtime falls back to the literal in
- * `coa_serve/config.py` / `coa_serve/clients/bedrock.py` — this constant MUST
- * match those literals (`infra/test/model-id-defaults.test.ts` pins it). It
+ * `BEDROCK_MODEL_ID` to this value. It MUST match the runtime fallback literals
+ * in `coa_serve/config.py` / `coa_serve/clients/bedrock.py`
+ * (`infra/test/model-id-defaults.test.ts` pins it). It
  * exists so synth-time region validation can reason about the *effective*
  * model id for a deployment that has no config at all (#1020).
  */

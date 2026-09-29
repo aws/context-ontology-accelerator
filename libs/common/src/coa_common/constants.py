@@ -369,6 +369,25 @@ def validate_namespace_id(value: str, name: str = "namespaceId") -> None:
         raise ValueError(f"Invalid {name}: {value!r}. Must be a UUID v4 (e.g. '550e8400-e29b-41d4-a716-446655440000').")
 
 
+def validate_source_id(value: str, name: str = "sourceId") -> None:
+    """Raise ``ValueError`` if *value* is not a safe source ID.
+
+    Source IDs are server-generated ``uuid.uuid4()`` values (see
+    ``coa_sources.api.database_routes._create_database_source`` /
+    ``document_routes``). Validating at the API boundary is defense-in-depth: it
+    keeps a malformed path parameter from flowing into DynamoDB keys, a DataZone
+    search prefix, a derived catalog name, or an STS ``RoleSessionName`` (whose
+    charset is constrained), and keeps CloudTrail attribution well-formed.
+
+    Uses the shared safe-id character class (alphanumeric, hyphen, underscore)
+    rather than a strict UUID v4 match — that rejects every unsafe character
+    that could break the downstream sinks (whitespace, ``:``, ``%``, ``.``,
+    ``/``, path traversal) while still accepting the server-minted UUIDs. Reuses
+    ``validate_id`` so the class stays single-sourced.
+    """
+    validate_id(value, name)
+
+
 def validate_namespace_name(value: str) -> None:
     """Raise ``ValueError`` if *value* is not a valid namespace name.
 

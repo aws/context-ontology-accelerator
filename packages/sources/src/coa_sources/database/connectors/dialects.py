@@ -49,23 +49,93 @@ MAX_ENUM_DISTINCT = 25
 _MAX_ENUM_AVG_VALUE_LEN = 40  # avg chars across sampled values
 _MAX_ENUM_AVG_WORDS = 3  # avg whitespace-separated tokens per value
 
+# Two independent bounds on the cardinality probe, declared together because
+# neither is sufficient alone: PROBE_TIMEOUT_MS caps how LONG one statement may
+# run, PROBE_MAX_ROWS caps how MUCH it may read. Both are configurable; a
+# malformed value logs a warning and falls back to the default — never crashes
+# cold start and never silently disables the bound.
+_DEFAULT_PROBE_TIMEOUT_MS = 30_000  # 30 s — enough for healthy tables, fast-fail for pathological ones
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    """Positive int from the environment, falling back to *default* on bad input.
+
+    Non-numeric, zero and negative all fall back and warn. Zero in particular
+    must NOT be honoured: for a timeout it would mean "expire immediately" and
+    for a row cap "read nothing", and for either the operator's intent is far
+    more likely a typo than a deliberate request to break sampling. Never raises,
+    so a misconfigured value cannot fail Lambda cold start.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except (ValueError, TypeError):
+        value = 0
+    if value <= 0:
+        logger.warning("Invalid %s=%r; expected a positive integer. Using default %d.", name, raw, default)
+        return default
+    return value
+
+
 # Session-level statement_timeout (ms) applied before the cardinality probe.
 # Bounds the COUNT / COUNT(DISTINCT …) query that was previously unbounded, so a
 # single wide column can no longer consume the entire 15-minute Lambda budget.
-# Configurable via env var; a malformed value logs a warning and falls back to the
-# default — never crashes cold start and never silently disables the bound.
-_DEFAULT_PROBE_TIMEOUT_MS = 30_000  # 30 s — enough for healthy tables, fast-fail for pathological ones
-try:
-    PROBE_TIMEOUT_MS = int(os.environ.get("PROBE_TIMEOUT_MS", str(_DEFAULT_PROBE_TIMEOUT_MS)))
-    if PROBE_TIMEOUT_MS <= 0:
-        raise ValueError("non-positive")
-except (ValueError, TypeError):
-    logger.warning(
-        "Invalid PROBE_TIMEOUT_MS=%r; expected a positive integer. Using default %d ms.",
-        os.environ.get("PROBE_TIMEOUT_MS"),
-        _DEFAULT_PROBE_TIMEOUT_MS,
+PROBE_TIMEOUT_MS = _positive_int_env("PROBE_TIMEOUT_MS", _DEFAULT_PROBE_TIMEOUT_MS)
+
+# Max rows the cardinality probe may READ per column. The statement timeout above
+# bounds how long a probe may run; this bounds how much work it may do at all,
+# which is the difference between "a slow column is cut off" and "every column
+# costs O(cap) regardless of table size". Needed because a timeout only fires
+# once per statement: a table with 50 string columns could still spend 50 × the
+# timeout, and the engine-independent way to stop that is to stop scanning.
+_DEFAULT_PROBE_MAX_ROWS = 100_000
+PROBE_MAX_ROWS = _positive_int_env("PROBE_MAX_ROWS", _DEFAULT_PROBE_MAX_ROWS)
+
+
+def probe_gate_sql(q_col: str, q_from: str, where: str, *, row_cap: int, top_n: bool = False) -> str:
+    """``COUNT(*)``/``COUNT(DISTINCT …)`` over at most *row_cap* rows.
+
+    The counts come from a row-capped subquery rather than the whole table, so
+    the probe's cost is bounded by the cap instead of by table size. Past the cap
+    both numbers describe a prefix of the table, not all of it — see
+    :func:`probe_values_sql` for why that stays self-consistent.
+
+    The prefix is whatever order the engine scans in (no ``ORDER BY``, which
+    would reintroduce a full sort). For enum detection that is acceptable: the
+    question is "does this column hold a small set of repeated labels", and a
+    100k-row sample answers it. The cost is that a rare value beyond the cap is
+    invisible, so a near-enum column can read as an enum.
+
+    *top_n* selects ``SELECT TOP n`` for engines without ``LIMIT`` (SQL Server).
+    """
+    inner = (
+        f"SELECT TOP {row_cap} {q_col} AS probe_col FROM {q_from} {where}"
+        if top_n
+        else f"SELECT {q_col} AS probe_col FROM {q_from} {where} LIMIT {row_cap}"
     )
-    PROBE_TIMEOUT_MS = _DEFAULT_PROBE_TIMEOUT_MS
+    return f"SELECT COUNT(*), COUNT(DISTINCT probe_col) FROM ({inner}) probe_sample"
+
+
+def probe_values_sql(q_col: str, q_from: str, where: str, *, row_cap: int, limit: int, top_n: bool = False) -> str:
+    """Up to *limit* distinct values, read from the same capped prefix as the gate.
+
+    The cap is applied here too, and that is the point: if the gate measured a
+    100k-row prefix but this query scanned the whole table, a column the gate
+    called low-cardinality could return values the gate never saw — and the
+    expensive full scan the cap exists to prevent would happen anyway, one
+    statement later. Both queries read the same prefix, so the values are always
+    the ones the gate's counts describe.
+    """
+    inner = (
+        f"SELECT TOP {row_cap} {q_col} AS probe_col FROM {q_from} {where}"
+        if top_n
+        else f"SELECT {q_col} AS probe_col FROM {q_from} {where} LIMIT {row_cap}"
+    )
+    outer_limit = f"TOP {limit} " if top_n else ""
+    tail = "" if top_n else f" LIMIT {limit}"
+    return f"SELECT DISTINCT {outer_limit}probe_col FROM ({inner}) probe_sample{tail}"
 
 
 def values_look_categorical(values: list[str]) -> bool:
@@ -253,6 +323,12 @@ class Dialect:
         """
         return ""
 
+    # Does this engine spell row limits as ``SELECT TOP n`` instead of ``LIMIT n``?
+    # Consulted by probe_gate_sql / probe_values_sql. SQL Server sets this True;
+    # everything else here (Postgres, Redshift, MySQL, Snowflake, Trino/Athena)
+    # takes the ANSI ``LIMIT`` form.
+    row_limit_uses_top = False
+
     def probe_timeout_statements(self) -> Sequence[str]:
         """SQL statements to execute on the connection before the cardinality probe.
 
@@ -373,21 +449,30 @@ class InformationSchemaDialect(Dialect):
                 q_table = f"{q}{table.replace(q, q + q)}{q}"
                 q_col = f"{q}{col.replace(q, q + q)}{q}"
                 where = f"WHERE {q_col} IS NOT NULL AND {q_col} != ''"
+                q_from = f"{q_schema}.{q_table}"
                 count_rows = _run(
                     conn,
-                    f"SELECT COUNT(*), COUNT(DISTINCT {q_col}) FROM {q_schema}.{q_table} {where}",
+                    probe_gate_sql(q_col, q_from, where, row_cap=PROBE_MAX_ROWS, top_n=self.row_limit_uses_top),
                 )
                 if not count_rows:
                     continue
                 total, distinct = int(count_rows[0][0] or 0), int(count_rows[0][1] or 0)
                 # Enum-like: bounded distinct set with average per-value repetition.
                 # Excludes unique-identifier columns (distinct ≈ total) regardless
-                # of table size.
+                # of table size. Both numbers describe the capped prefix, so the
+                # ratio test is unchanged in meaning — it just runs on a sample.
                 if not (1 <= distinct <= max_distinct and total >= MIN_REPETITION_FACTOR * distinct):
                     continue
                 rows = _run(
                     conn,
-                    self._limited_distinct_sql(q_col, q_schema, q_table, where, max_distinct),
+                    probe_values_sql(
+                        q_col,
+                        q_from,
+                        where,
+                        row_cap=PROBE_MAX_ROWS,
+                        limit=max_distinct,
+                        top_n=self.row_limit_uses_top,
+                    ),
                 )
                 values = [str(r[0])[:100] for r in rows if r[0] is not None]
                 # VALUE-SHAPE backstop: drop free-text columns that pass the
@@ -411,14 +496,6 @@ class InformationSchemaDialect(Dialect):
                     logger.debug("distinct_values failed for column %r in %s.%s", col, schema, table, exc_info=True)
                 continue
         return result
-
-    def _limited_distinct_sql(self, q_col: str, q_schema: str, q_table: str, where: str, limit: int) -> str:
-        """Build a row-limited ``SELECT DISTINCT`` query.
-
-        Overridden per dialect for engines whose row-limit syntax is not the
-        ANSI ``LIMIT`` form.
-        """
-        return f"SELECT DISTINCT {q_col} FROM {q_schema}.{q_table} {where} LIMIT {limit}"
 
 
 class PostgresDialect(InformationSchemaDialect):
@@ -707,9 +784,8 @@ class SqlServerDialect(InformationSchemaDialect):
 
         return pytds.connect(server=host, port=port, database=database, user=user, password=password)
 
-    def _limited_distinct_sql(self, q_col: str, q_schema: str, q_table: str, where: str, limit: int) -> str:
-        # SQL Server has no LIMIT clause — row-limiting uses SELECT TOP N.
-        return f"SELECT DISTINCT TOP {limit} {q_col} FROM {q_schema}.{q_table} {where}"
+    # SQL Server has no LIMIT clause — row-limiting uses SELECT TOP N.
+    row_limit_uses_top = True
 
     def fetch_descriptions(self, conn: Any, schema: str, tables: list[str]) -> Descriptions:
         """SQL Server descriptions live in sys.extended_properties (MS_Description).
@@ -792,6 +868,24 @@ class SnowflakeDialect(InformationSchemaDialect):
             warehouse=options.get("warehouse"),
             role=options.get("role"),
         )
+
+    def probe_timeout_statements(self) -> Sequence[str]:
+        """Session-level statement timeout bounding the cardinality probe (GH-219).
+
+        Snowflake's equivalent of Postgres' ``statement_timeout`` is the session
+        parameter ``STATEMENT_TIMEOUT_IN_SECONDS`` (a SECONDS value, not ms), so
+        a single hung probe query is cut off rather than running toward the
+        Lambda's 15-minute limit. Without this override Snowflake inherited the
+        base no-op — GH-131 only bounded the Postgres family, which is exactly
+        the gap GH-219 reports (a 99-table Snowflake source timing out).
+
+        ``max(1, …)``: ``PROBE_TIMEOUT_MS`` under 1000 ms floors to 0 s, and
+        Snowflake reads 0 as *no timeout* — the opposite of the intent — so we
+        clamp to a 1-second minimum. ``ALTER SESSION`` is a privilege a regular
+        user has; where the account/warehouse sets a lower value that one wins,
+        which is the safe direction.
+        """
+        return (f"ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = {max(1, PROBE_TIMEOUT_MS // 1000)}",)
 
     def fetch_descriptions(self, conn: Any, schema: str, tables: list[str]) -> Descriptions:
         """Snowflake exposes COMMENT directly on INFORMATION_SCHEMA views."""
