@@ -86,8 +86,12 @@ read_param() {
     --query Parameter.Value --output text 2>/dev/null || true
 }
 
-SERVE_PARAM="${SSM_PREFIX}/serve/runtime-role-arn"
-DISCOVERY_PARAM="${SSM_PREFIX}/sources/db-connector-role-arn"
+# Both paths carry ${ENV}: these two values become the connector's invoke resource policy
+# plus s3:GetObject on its spill prefix and kms:Decrypt on its spill key, so an env-less
+# name in a shared account would let a sibling environment's platform deploy hand its serve
+# role a read on this environment's spilled query results.
+SERVE_PARAM="${SSM_PREFIX}/${ENV}/serve/runtime-role-arn"
+DISCOVERY_PARAM="${SSM_PREFIX}/${ENV}/sources/db-connector-role-arn"
 SERVE_ROLE_ARN="$(read_param "$SERVE_PARAM")"
 DISCOVERY_ROLE_ARN="$(read_param "$DISCOVERY_PARAM")"
 

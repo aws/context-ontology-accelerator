@@ -39,7 +39,7 @@ def vector_retriever(mock_opensearch):
 class TestVectorRetriever:
     async def test_search_returns_chunks(self, vector_retriever, mock_opensearch):
         embedding = [0.1] * 1024
-        results = await vector_retriever.search(embedding, "insurance")
+        results = await vector_retriever.search(embedding, "550e8400-e29b-41d4-a716-446655440000")
 
         mock_opensearch.search.assert_awaited_once()
         assert len(results) == 1
@@ -50,7 +50,7 @@ class TestVectorRetriever:
 
     async def test_search_uses_chunk_index(self, mock_opensearch):
         retriever = VectorRetriever(mock_opensearch)
-        await retriever.search([0.1] * 10, "my-namespace")
+        await retriever.search([0.1] * 10, "550e8400-e29b-41d4-a716-446655440000")
 
         call_kwargs = mock_opensearch.search.call_args
         # The index should be chunk_{sha256_prefix}
@@ -60,19 +60,19 @@ class TestVectorRetriever:
         os_client = AsyncMock()
         os_client.search.return_value = []
         retriever = VectorRetriever(os_client)
-        results = await retriever.search([0.1] * 10, "ns")
+        results = await retriever.search([0.1] * 10, "550e8400-e29b-41d4-a716-446655440000")
         assert results == []
 
     async def test_search_passes_top_k(self, mock_opensearch):
         retriever = VectorRetriever(mock_opensearch)
-        await retriever.search([0.1] * 10, "ns", top_k=5)
+        await retriever.search([0.1] * 10, "550e8400-e29b-41d4-a716-446655440000", top_k=5)
 
         call_kwargs = mock_opensearch.search.call_args
         assert call_kwargs.kwargs["top_k"] == 5
 
     async def test_search_default_top_k(self, mock_opensearch):
         retriever = VectorRetriever(mock_opensearch)
-        await retriever.search([0.1] * 10, "ns")
+        await retriever.search([0.1] * 10, "550e8400-e29b-41d4-a716-446655440000")
 
         call_kwargs = mock_opensearch.search.call_args
         assert call_kwargs.kwargs["top_k"] == 20
@@ -88,7 +88,7 @@ class TestVectorRetriever:
             ),
         ]
         retriever = VectorRetriever(os_client)
-        results = await retriever.search([0.1] * 10, "ns")
+        results = await retriever.search([0.1] * 10, "550e8400-e29b-41d4-a716-446655440000")
 
         assert len(results) == 1
         assert results[0].source_doc == ""
@@ -100,7 +100,7 @@ class TestVectorRetriever:
             VectorHit(id=f"c{i}", text=f"Chunk {i}", score=0.9 - i * 0.01, metadata={}) for i in range(5)
         ]
         retriever = VectorRetriever(os_client)
-        results = await retriever.search([0.1] * 10, "ns")
+        results = await retriever.search([0.1] * 10, "550e8400-e29b-41d4-a716-446655440000")
 
         assert len(results) == 5
         scores = [r.relevance_score for r in results]

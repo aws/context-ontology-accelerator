@@ -3,6 +3,7 @@
 package dev.coa.databricks.jdbc;
 
 import com.amazonaws.athena.connector.credentials.CredentialsProvider;
+import com.amazonaws.athena.connector.lambda.exceptions.AthenaConnectorException;
 import com.amazonaws.athena.connectors.jdbc.connection.JdbcConnectionFactory;
 import dev.coa.connector.metrics.ConnectorMetrics;
 import dev.coa.databricks.DatabricksMetadataHandler;
@@ -38,11 +39,11 @@ import java.util.Properties;
  *   <tr><th>Property</th><th>Default</th><th>Here</th><th>Why</th></tr>
  *   <tr><td>{@code TemporarilyUnavailableRetry}</td><td>1</td><td>0</td>
  *       <td>A stopped warehouse makes the driver retry for up to
- *           {@code TemporarilyUnavailableRetryTimeout} = 900 s, outliving the connector's 120 s
- *           timeout, so the query dies with a timeout instead of a diagnosis having burnt two billed
- *           minutes. Off gives one attempt and one clear error, and Athena's own retry then finds a
- *           warehouse further along resuming.</td></tr>
- *   <tr><td>{@code socketTimeout}</td><td>900 s</td><td>90 s</td>
+ *           {@code TemporarilyUnavailableRetryTimeout} = 900 s, outliving even the connector's 600 s
+ *           timeout, so the query dies with a timeout instead of a diagnosis. Off gives one attempt and
+ *           one clear error, and Athena's own retry then finds a warehouse further along
+ *           resuming.</td></tr>
+ *   <tr><td>{@code socketTimeout}</td><td>900 s</td><td>540 s</td>
  *       <td>Same reason: a socket timeout above the invocation timeout can never fire.</td></tr>
  *   <tr><td>{@code EnableTelemetry}</td><td>1</td><td>0</td>
  *       <td>The driver reports usage to Databricks. A connector deployed into a customer's account
@@ -69,8 +70,8 @@ public final class DatabricksConnectionFactory implements JdbcConnectionFactory
     /** Driver class, from the open-source driver's {@code META-INF/services/java.sql.Driver}. */
     static final String DRIVER_CLASS = "com.databricks.client.jdbc.Driver";
 
-    /** Seconds a socket read may block. Below the connector's 120 s invocation timeout. */
-    private static final String SOCKET_TIMEOUT_SECONDS = "90";
+    /** Seconds a socket read may block. Below the connector's 600 s invocation timeout. */
+    private static final String SOCKET_TIMEOUT_SECONDS = "540";
 
     /** Seconds the driver may spend retrying a throttled request. */
     private static final String RATE_LIMIT_RETRY_TIMEOUT_SECONDS = "15";
@@ -104,19 +105,24 @@ public final class DatabricksConnectionFactory implements JdbcConnectionFactory
      */
     public Connection open()
     {
-        // Resolved before the connection attempt and in its own try, because two non-Databricks faults
+        // Resolved before the connection attempt and in its own try, because three non-Databricks faults
         // live in this one call:
         //
         //   - an unusable secret SHAPE, an IllegalArgumentException whose message already names the
         //     secret and the two accepted shapes. Rethrown untouched;
-        //   - a secret that cannot be READ, for want of secretsmanager:GetSecretValue or of kms:Decrypt
-        //     on the customer-managed key. That is what a first deployment usually hits, and going
-        //     through classify() would blame the warehouse for it.
+        //   - a credential failure the reader has already classified, which in coa-managed mode says
+        //     whether the assume or the read failed and whose policy to look at. Rethrown untouched too:
+        //     re-wrapping it would replace CONNECTOR_CREDENTIAL_ASSUME_DENIED with
+        //     CONNECTOR_CREDENTIAL_UNREADABLE and send the operator to the connector's own role, which in
+        //     that mode holds no Secrets Manager grant to fix;
+        //   - a secret that cannot be READ with the connector's own role, for want of
+        //     secretsmanager:GetSecretValue or of kms:Decrypt on the customer-managed key. That is what a
+        //     first deployment usually hits, and going through classify() would blame the warehouse.
         Properties properties;
         try {
             properties = properties();
         }
-        catch (IllegalArgumentException cause) {
+        catch (IllegalArgumentException | AthenaConnectorException cause) {
             throw cause;
         }
         catch (RuntimeException cause) {
@@ -227,7 +233,7 @@ public final class DatabricksConnectionFactory implements JdbcConnectionFactory
         // Makes setAutoCommit, commit and rollback no-ops.
         //
         // The inherited read loop calls both, for Databricks. The guard in
-        // JdbcRecordHandler.readWithConstraint (2025.15.1) is NEGATED:
+        // JdbcRecordHandler.readWithConstraint (2026.33.1) is NEGATED:
         //
         //     // clickhouse does not support disabling auto-commit
         //     if (!CLICKHOUSE_DB.equalsIgnoreCase(databaseProductName)) {

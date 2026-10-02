@@ -13,8 +13,9 @@ import java.util.List;
  * Turns {@code information_schema} rows into a {@link CoaTable}: where a Unity Catalog constraint
  * becomes a comment tag. Pure and static, so every rule here is assertable without a warehouse.
  *
- * <p>The toolkit does the encoding. Declared keys reach COA inside column comments, since the
- * federation protocol has no field for a key, and getting that wrong fails silently in two places: a
+ * <p>The toolkit does the encoding. Declared keys and nullability reach COA inside column comments,
+ * since the
+ * federation protocol has no field for either, and getting that wrong fails silently in two places: a
  * mis-spelled tag is stored as literal prose, and Athena reads comments from the Arrow <b>schema's</b>
  * metadata map rather than a field's, so a comment on a field is delivered and ignored. This class
  * expresses intent through {@link CoaColumn#primaryKey()} and
@@ -29,7 +30,7 @@ import java.util.List;
  * <p>The customer's comment is stripped and then neutralised, in that order.
  * {@link CommentTags#strip(String)} clears the channel, since a tag a data engineer wrote in Databricks
  * is indistinguishable from a generated one by the time COA sees it.
- * {@link CommentTags#neutralise(String)} then removes what the toolkit's encoder would refuse, which is
+ * {@link CommentTags#neutralise(String)} then disarms what the toolkit's encoder would refuse, which is
  * a broader set, and the encoder refuses by throwing.
  */
 public final class TableAssembler
@@ -79,17 +80,26 @@ public final class TableAssembler
         String stripped = CommentTags.strip(definition.comment());
         String prose = CommentTags.neutralise(stripped);
         if (!prose.equals(stripped)) {
-            // The comment is malformed in a way its author will never be told about, and this is the
-            // only place that is observable. The text itself is not logged: it is a customer's, and it
-            // is already in their catalog.
-            LOGGER.warn("Neutralised a malformed constraint tag in the comment on {}.{};"
-                            + " forwarding the remaining prose", tableName, definition.name());
+            // Two causes reach here: a tag COA cannot act on (an @fk( that never closes or whose operand
+            // names no TABLE.COLUMN), or a near miss that became live once an earlier tag was stripped, as
+            // the @pk in "@notnull@pk" does. Neither loses a character — the token is disarmed in place.
+            //
+            // The text itself is not logged: it is a customer's, and it is already in their catalog.
+            LOGGER.warn("Disarmed a tag-shaped token in the comment on {}.{} that survived stripping —"
+                            + " either a tag COA cannot act on, or one that became live once an earlier"
+                            + " tag was removed; forwarding the whole comment", tableName,
+                    definition.name());
         }
         if (!prose.isEmpty()) {
             column.describedAs(prose);
         }
         if (keys.isPrimaryKeyMember(definition.name())) {
             column.primaryKey();
+        }
+        // Only for a column Unity Catalog declared NOT NULL: absence of the tag is how COA reads "nobody
+        // said", which is also why there is no @nullable to emit for the YES case.
+        if (definition.isNotNull()) {
+            column.notNull();
         }
         // One tag per participating child column, each naming its own parent, never one tag listing two:
         // COA stores a composite key as N single-column records.

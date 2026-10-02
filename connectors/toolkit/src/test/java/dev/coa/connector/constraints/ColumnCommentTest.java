@@ -53,6 +53,49 @@ class ColumnCommentTest
     }
 
     @Test
+    void notNullTagFollowsProse()
+    {
+        assertEquals("Customer's legal name @notnull",
+                ColumnComment.of("Customer's legal name").notNull().build());
+    }
+
+    @Test
+    void theTagOrderIsProseThenPrimaryKeyThenNotNullThenForeignKeys()
+    {
+        // The operand-free tags come first so the @fk list stays last and contiguous, and @notnull goes
+        // AFTER @pk so a primary-key-only column's comment is byte-identical to what was emitted before
+        // @notnull existed.
+        assertEquals("Order this line belongs to @pk @notnull @fk(orders.order_id)",
+                ColumnComment.of("Order this line belongs to")
+                        .primaryKey()
+                        .notNull()
+                        .foreignKey("orders", "order_id")
+                        .build());
+        assertEquals("Order this line belongs to @pk @notnull @fk(orders.order_id)",
+                ColumnComment.of("Order this line belongs to")
+                        .foreignKey("orders", "order_id")
+                        .notNull()
+                        .primaryKey()
+                        .build());
+    }
+
+    @Test
+    void repeatedNotNullEmitsOneTag()
+    {
+        assertEquals("Key @notnull", ColumnComment.of("Key").notNull().notNull().build());
+    }
+
+    @Test
+    void thereIsNoNullableTagBecauseAbsenceAlreadyMeansUnknown()
+    {
+        // Connectors deployed before the tag existed emit no tag and COA defaults a column to nullable, so
+        // a spelling that made absence mean "nullable" would reinterpret their columns as asserted rather
+        // than unstated.
+        assertEquals("Customer's legal name",
+                ColumnComment.of("Customer's legal name").build());
+    }
+
+    @Test
     void tagOnlyCommentHasNoLeadingSpace()
     {
         assertEquals("@pk", ColumnComment.of(null).primaryKey().build());
@@ -163,6 +206,20 @@ class ColumnCommentTest
         assertThrows(IllegalArgumentException.class, () -> ColumnComment.of("see @pk for details"));
         assertThrows(IllegalArgumentException.class, () -> ColumnComment.of("ends with @pk"));
         assertThrows(IllegalArgumentException.class, () -> ColumnComment.of("see @fk(orders.id)"));
+        // @pk's pattern does not match @notnull, so the newer tag needs a guard of its own.
+        assertThrows(IllegalArgumentException.class, () -> ColumnComment.of("see @notnull for details"));
+        assertThrows(IllegalArgumentException.class, () -> ColumnComment.of("ends with @notnull"));
+    }
+
+    @Test
+    void proseThatMerelyResemblesTheNotNullTagIsAccepted()
+    {
+        // COA reports and keeps these, so refusing them here would refuse text COA would have stored.
+        assertEquals("see @NOTNULL", ColumnComment.of("see @NOTNULL").build());
+        assertEquals("see @notnullable", ColumnComment.of("see @notnullable").build());
+        assertEquals("see @notnull=x", ColumnComment.of("see @notnull=x").build());
+        assertEquals("owner bob@notnull.example.com",
+                ColumnComment.of("owner bob@notnull.example.com").build());
     }
 
     @Test

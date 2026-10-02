@@ -242,7 +242,7 @@ class TestLexicalPathEndToEnd:
         orch, _lexical, synthesizer = _build_lexical_orchestrator()
         request = InvokeRequest(
             query="What was Apple's revenue?",
-            namespace="demo",
+            namespace="550e8400-e29b-41d4-a716-446655440000",
             options={"tierOverride": 3},
         )
 
@@ -278,7 +278,7 @@ class TestLexicalPathEndToEnd:
         orch, _lexical, _synth = _build_lexical_orchestrator(deployment_strategy="chunk_based_semantic")
         request = InvokeRequest(
             query="What was Apple's revenue?",
-            namespace="demo",
+            namespace="550e8400-e29b-41d4-a716-446655440000",
             options={"tierOverride": 3, "retrieverStrategy": "traversal"},
         )
 
@@ -287,7 +287,7 @@ class TestLexicalPathEndToEnd:
 
         # Response metadata attributes the resolved strategy.
         assert response.result.metadata["retrieverStrategy"] == "traversal"
-        assert response.result.metadata["namespace"] == "demo"
+        assert response.result.metadata["namespace"] == "550e8400-e29b-41d4-a716-446655440000"
 
         # The lexical trace step detail records the same strategy.
         lexical_steps = [s for s in _trace_steps(response) if s.step == "lexical_baseline_retrieve"]
@@ -299,7 +299,7 @@ class TestLexicalPathEndToEnd:
         orch, _lexical, _synth = _build_lexical_orchestrator(deployment_strategy="entity_based")
         request = InvokeRequest(
             query="What was Apple's revenue?",
-            namespace="demo",
+            namespace="550e8400-e29b-41d4-a716-446655440000",
             options={"tierOverride": 3},
         )
 
@@ -317,7 +317,7 @@ class TestLexicalPathEndToEnd:
         orch, _lexical, synthesizer = _build_lexical_orchestrator()
         request = InvokeRequest(
             query="A query with no matches",
-            namespace="demo",
+            namespace="550e8400-e29b-41d4-a716-446655440000",
             options={"tierOverride": 3},
         )
 
@@ -339,7 +339,11 @@ class TestLexicalPathEndToEnd:
         # (the toolkit factory is invoked once), proving the per-(tenant, strategy)
         # cache survives across the full resolve path.
         orch, lexical, _synth = _build_lexical_orchestrator()
-        request = InvokeRequest(query="q", namespace="demo", options={"tierOverride": 3})
+        request = InvokeRequest(
+            query="q",
+            namespace="550e8400-e29b-41d4-a716-446655440000",
+            options={"tierOverride": 3},
+        )
 
         with fake_toolkit_engine(_populated_nodes()) as mock_engine_cls:
             await orch.resolve(request)
@@ -367,7 +371,7 @@ class TestHandRolledParityEndToEnd:
         # because no lexical backend is configured.
         request = InvokeRequest(
             query="explain claims",
-            namespace="demo",
+            namespace="550e8400-e29b-41d4-a716-446655440000",
             options={"tierOverride": 3, "retrieverStrategy": "traversal"},
         )
 
@@ -402,12 +406,12 @@ class TestHandRolledParityEndToEnd:
 
         req_with = InvokeRequest(
             query="explain claims",
-            namespace="demo",
+            namespace="550e8400-e29b-41d4-a716-446655440000",
             options={"tierOverride": 3, "retrieverStrategy": "traversal"},
         )
         req_without = InvokeRequest(
             query="explain claims",
-            namespace="demo",
+            namespace="550e8400-e29b-41d4-a716-446655440000",
             options={"tierOverride": 3},
         )
 
@@ -439,7 +443,7 @@ class TestTimeoutDegradationEndToEnd:
         orch, _lexical, synthesizer = _build_lexical_orchestrator(timeout_s=0.05)
         request = InvokeRequest(
             query="slow query",
-            namespace="demo",
+            namespace="550e8400-e29b-41d4-a716-446655440000",
             options={"tierOverride": 3},
         )
 

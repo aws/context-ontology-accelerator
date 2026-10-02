@@ -14,7 +14,7 @@ emits, as tags that discovery parses out, strips, and turns into the same
 Grammar (case-sensitive; one comment may carry human text plus one or more tags)::
 
     comment   := (human_text | tag)*
-    tag       := "@pk" | "@fk" "(" reference ")"
+    tag       := "@pk" | "@notnull" | "@fk" "(" reference ")"
     reference := segment ("." segment)*        ; the last two are TABLE.COLUMN
     segment   := pad (quoted | unquoted) pad
     quoted    := '"' (not_a_quote | '""')* '"' ; may contain "." and ")"
@@ -24,6 +24,12 @@ Grammar (case-sensitive; one comment may carry human text plus one or more tags)
 Semantics:
   * ``@pk`` marks the column as a member of the table's primary key. A composite
     PK is the set of ``@pk`` columns in ``DESCRIBE`` order → one ``PrimaryKey``.
+  * ``@notnull`` marks the column as non-nullable. Operand-free, like ``@pk``, and it
+    tags the EXCEPTION rather than the rule: absence must keep meaning *unknown*,
+    because every connector deployed to date emits no such tag. A ``@nullable``
+    spelling would instead reinterpret every already-deployed connector's columns.
+    Read only by the review UI's Nullable column; induction reads only a declared
+    primary key for ``NOT_NULL``.
   * ``@fk(orders.customer_id)`` on the child column → one single-column
     ``ForeignKey``. Quote the segments that need it, and only those:
     ``@fk("my orders"."customer id")``.
@@ -92,9 +98,10 @@ match these, since the encoder helper generates against them):
     that abuts the closing bracket therefore abuts the text before the tag:
     ``"Parent @fk(orders.id)See notes"`` cleans to ``"ParentSee notes"``.
   * **Case, and other near misses.** Recognition is case-sensitive, per the
-    grammar. ``@PK``, ``@fk`` with no operand, ``@pk=customer_id`` and
-    ``@pk(customer_id)`` (``@pk`` takes no operand, bracketed or otherwise) are
-    near misses, not tags. So is ``@fk=orders.order_id``: the ``@fk=`` spelling
+    grammar. ``@PK``, ``@fk`` with no operand, ``@pk=customer_id``,
+    ``@pk(customer_id)`` (``@pk`` takes no operand, bracketed or otherwise),
+    ``@notnull=true`` and ``@notnull(x)`` are near misses, not tags. So is
+    ``@fk=orders.order_id``: the ``@fk=`` spelling
     was **retired** in favour of the bracketed operand, and because it is a
     plausible thing for an author to write from memory it is diagnosed
     (``fk_equals_spelling_retired``) rather than read as prose.
@@ -201,11 +208,14 @@ _UNQUOTED_SEGMENT = re.compile(r"[A-Za-z0-9_$\-]+")
 # in the human text ("a @pk b" → "a b"). The lookbehind demands a left boundary:
 # without it an address in prose ("owner bob@pk.example.com") reads as a "@pk"
 # tag, silently declaring a primary key nobody asked for and corrupting the
-# description. The name group is greedy, so "@pkey"/"@pk_id"/"@fkeys" land in the
-# group as typos to report rather than matching a tag; the case-insensitive name
-# lets wrong-case near misses ("@PK") be recognised as mistakes instead of read as
-# prose.
-_TAG_HEAD = re.compile(r"\s*(?<![A-Za-z0-9_$])@(?P<name>(?i:pk|fk)[A-Za-z0-9_]*)")
+# description. The name group is greedy, so "@pkey"/"@pk_id"/"@fkeys"/"@notnulls"
+# land in the group as typos to report rather than matching a tag; the
+# case-insensitive name lets wrong-case near misses ("@PK", "@NOTNULL") be recognised
+# as mistakes instead of read as prose.
+#
+# "notnull" is spelled out in the alternation rather than reached by a looser name class,
+# so a word that merely starts the same way ("@note") stays prose as it was before.
+_TAG_HEAD = re.compile(r"\s*(?<![A-Za-z0-9_$])@(?P<name>(?i:pk|fk|notnull)[A-Za-z0-9_]*)")
 
 
 @dataclass(frozen=True)
@@ -226,6 +236,8 @@ class ParsedComment:
             the comment held nothing but tags. A tag the parser could not act on
             is left here verbatim, so the author can see the mistake.
         is_pk_member: Whether the column carried ``@pk``.
+        is_not_null: Whether the column carried ``@notnull``. ``False`` also means
+            "nobody said", and is treated as nullable downstream.
         foreign_keys: Valid ``@fk(...)`` targets in the order they appeared,
             duplicates removed (a repeated tag cannot mean two keys). Dedup
             compares the DECODED ``(table, column)`` pair, not the tag text, so
@@ -237,6 +249,8 @@ class ParsedComment:
     description: str
     is_pk_member: bool
     foreign_keys: tuple[ParsedFk, ...]
+    # Defaulted, not positional, so existing construction sites keep their meaning.
+    is_not_null: bool = False
 
 
 @dataclass(frozen=True)
@@ -277,6 +291,7 @@ def parse_comment(raw: str | None) -> ParsedComment:
     comment: str = raw
     foreign_keys: list[ParsedFk] = []
     is_pk_member = False
+    is_not_null = False
 
     def _leave_in_place(head: re.Match[str], event: str, reason: str, *, tag_end: int, resume: int) -> tuple[int, str]:
         """Report a tag-shaped token the parser could not act on.
@@ -312,7 +327,7 @@ def parse_comment(raw: str | None) -> ParsedComment:
             the head's start to that index)``. The replacement is ``""`` for a
             tag the parser acted on and the span verbatim for anything else.
         """
-        nonlocal is_pk_member
+        nonlocal is_pk_member, is_not_null
         name = head.group("name")
         # "=" and "(" are the only characters that turn a bare name into a
         # near-miss rather than a tag, so one character of lookahead classifies.
@@ -328,6 +343,21 @@ def parse_comment(raw: str | None) -> ParsedComment:
                     resume=head.end(),
                 )
             is_pk_member = True
+            return head.end(), ""
+
+        # The "@pk" arm, character for character, including its refusal of the "=" and
+        # "(" markers: that refusal is what leaves "@notnull=true" and "@notnull(x)" in
+        # the description as literal text, which is the author's only feedback channel.
+        if name == "notnull":
+            if marker in ("=", "("):
+                return _leave_in_place(
+                    head,
+                    "constraint_tag_unrecognised",
+                    "notnull_takes_no_operand",
+                    tag_end=head.end() + 1,
+                    resume=head.end(),
+                )
+            is_not_null = True
             return head.end(), ""
 
         if name == "fk":
@@ -397,6 +427,7 @@ def parse_comment(raw: str | None) -> ParsedComment:
         description="".join(kept).strip(),
         is_pk_member=is_pk_member,
         foreign_keys=tuple(foreign_keys),
+        is_not_null=is_not_null,
     )
 
 

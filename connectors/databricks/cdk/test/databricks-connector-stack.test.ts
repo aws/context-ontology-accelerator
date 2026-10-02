@@ -1,131 +1,69 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
+//
+// The customer-deployed connector: one workspace, one warehouse, one catalog, one credential. A
+// stage-1 customer already deployed this shape and it must keep synthesising the same stack from the
+// same variables, so this suite passing unchanged IS the compatibility assertion. COA's own
+// deployment is covered by managed-databricks-connector-stack.test.ts.
 import * as fs from "fs";
 import * as path from "path";
-import * as cdk from "aws-cdk-lib";
-import { Match, Template } from "aws-cdk-lib/assertions";
-import { CONNECTOR_TAG_KEY, CONNECTOR_TAG_VALUE, CONNECTOR_SPILL_KMS_TAG_KEY } from "coa-connector-cdk";
+import { Match } from "aws-cdk-lib/assertions";
 import {
-  CONNECTOR_ENV_VARS,
-  OPTIONAL_CONNECTOR_ENV_VARS,
-  REQUIRED_CONNECTOR_ENV_VARS,
+  CONNECTOR_SPILL_KMS_TAG_KEY,
+  CONNECTOR_TAG_KEY,
+  CONNECTOR_TAG_VALUE,
+} from "coa-connector-cdk";
+import {
+  CONFIG_SOURCE_ENV_VAR,
   DEFAULT_JAR_PATH,
-  DatabricksConnectorStack,
-  DatabricksConnectorStackProps,
   HANDLER,
+  MANAGED_FUNCTION_NAME_SEGMENT,
   MEMORY_SIZE_MB,
   TIMEOUT_SECONDS,
+} from "../lib/constants";
+import {
+  OPTIONAL_CONNECTOR_ENV_VARS,
+  REQUIRED_CONNECTOR_ENV_VARS,
   UNPINNED_DATABASE_OUTPUT,
-} from "../lib/databricks-connector-stack";
+} from "../lib/single-target";
+import {
+  DISCOVERY_ROLE,
+  ENVIRONMENT_ALARM_COUNT,
+  ENVIRONMENT_CONNECTOR_ALARM_COUNT,
+  RESOURCE_PREFIX,
+  SECRET_ARN,
+  SERVE_ROLE,
+  alarmsIn,
+  connectorAlarmsIn,
+  connectorEnvironment,
+  externalKmsResources,
+  synth,
+  useConnectorEnv,
+} from "./helpers";
 
-// A stand-in for the fat JAR, so the tests do not require `mvn package` to have run. CDK stages a
-// `.jar` as an archive asset without inspecting its contents.
-const FAKE_JAR = path.join(__dirname, "..", "cdk.out", "test-fixture.jar");
-
-const SERVE_ROLE = "arn:aws:iam::999988887777:role/scl-dev-serve-role";
-const DISCOVERY_ROLE = "arn:aws:iam::999988887777:role/scl-dev-sources-db-connector";
-const SECRET_ARN =
-  "arn:aws:secretsmanager:us-east-1:123456789012:secret:databricks-connector-pat-AbCdEf";
-
-const TOUCHED = [
-  ...CONNECTOR_ENV_VARS,
-  "DATABRICKS_MAX_ROWS_PER_TABLE",
-  "DATABRICKS_ADVERTISE_PUSHDOWN",
-  "CREDENTIAL_KMS_KEY_ARN",
-  "FUNCTION_NAME_PREFIX",
-  "ALARM_TOPIC_ARN",
-];
-let saved: Record<string, string | undefined>;
-
-beforeAll(() => {
-  fs.mkdirSync(path.dirname(FAKE_JAR), { recursive: true });
-  fs.writeFileSync(FAKE_JAR, "not really a jar");
-});
-
-beforeEach(() => {
-  saved = {};
-  for (const name of TOUCHED) {
-    saved[name] = process.env[name];
-    delete process.env[name];
-  }
-  process.env.DATABRICKS_WORKSPACE_HOSTNAME = "dbc-a1b2345c-d6e7.cloud.databricks.com";
-  process.env.DATABRICKS_HTTP_PATH = "/sql/1.0/warehouses/a1b234c567d8e9fa";
-  process.env.DATABRICKS_CATALOG = "workspace";
-  process.env.DATABRICKS_SCHEMA = "coa_dbx_test";
-  process.env.CREDENTIAL_SECRET_ARN = SECRET_ARN;
-});
-
-afterEach(() => {
-  for (const name of TOUCHED) {
-    if (saved[name] === undefined) {
-      delete process.env[name];
-    } else {
-      process.env[name] = saved[name];
-    }
-  }
-});
-
-function synth(props: Partial<DatabricksConnectorStackProps> = {}): Template {
-  const app = new cdk.App();
-  const stack = new DatabricksConnectorStack(app, "databricks-coa-connector", {
-    env: { account: "123456789012", region: "us-east-1" },
-    jarPath: FAKE_JAR,
-    queryRoleArns: [SERVE_ROLE, DISCOVERY_ROLE],
-    ...props,
-  });
-  return Template.fromStack(stack);
-}
-
-/**
- * Every literal KMS ARN the function's identity policy names. The spill key is not one: its Resource is an
- * `Fn::GetAtt` rather than a string, because this stack creates it.
- */
-function externalKmsResources(template: Template): string[] {
-  const policies = Object.values(template.findResources("AWS::IAM::Policy"));
-  const found: string[] = [];
-  for (const policy of policies) {
-    const statements = policy.Properties?.PolicyDocument?.Statement ?? [];
-    for (const statement of statements) {
-      const resource = statement.Resource;
-      if (typeof resource === "string" && resource.startsWith("arn:aws:kms:")) {
-        found.push(resource);
-      }
-    }
-  }
-  return found;
-}
-
-/** The connector function's environment variables. */
-function connectorEnvironment(template: Template): Record<string, unknown> {
-  const functions = template.findResources("AWS::Lambda::Function");
-  const variables = Object.values(functions)
-    .map((resource) => resource.Properties?.Environment?.Variables)
-    .find((vars) => vars?.spill_prefix !== undefined);
-  expect(variables).toBeDefined();
-  return variables as Record<string, unknown>;
-}
+useConnectorEnv();
 
 describe("the connector Lambda", () => {
   it("deploys with this connector's handler under a name that cannot collide", () => {
     synth().hasResourceProperties("AWS::Lambda::Function", {
       Handler: HANDLER,
       FunctionName: "databricks-coa-connector",
-      Runtime: "java17",
+      Runtime: "java21",
     });
   });
 
-  it("is sized 3008 MB and 120 s, not the construct's defaults", () => {
-    // The construct defaults to 1024 MB and 90 s. Federation cannot express aggregation, so a GROUP BY
-    // reads every predicate-matching row out of the warehouse through this function.
+  it("is sized 3008 MB and 600 s, above the construct's memory default", () => {
+    // The construct defaults to 1024 MB. Federation cannot express aggregation, so a GROUP BY reads
+    // every predicate-matching row out of the warehouse through this function.
     synth().hasResourceProperties("AWS::Lambda::Function", {
       MemorySize: MEMORY_SIZE_MB,
       Timeout: TIMEOUT_SECONDS,
     });
     expect(MEMORY_SIZE_MB).toBe(3008);
-    expect(TIMEOUT_SECONDS).toBe(120);
+    expect(TIMEOUT_SECONDS).toBe(600);
   });
 
-  it("carries the --add-opens flag Arrow needs on Java 17", () => {
+  it("carries the --add-opens flag Arrow needs on Java 17 and later", () => {
     // Without it, metadata calls succeed and every read fails with "Failed to initialize MemoryUtil". The
     // construct sets it; this asserts that setting the connector's own variables did not displace it.
     expect(connectorEnvironment(synth()).JAVA_TOOL_OPTIONS).toBe(
@@ -194,6 +132,12 @@ describe("the connector's environment", () => {
     expect(variables.CREDENTIAL_SECRET_ARN).toBe(SECRET_ARN);
   });
 
+  it("sets no config source, so the jar's own default keeps this deployment in environment mode", () => {
+    // Must stay this way: an already-deployed stage-1 stack pulling a newer jar has to behave exactly
+    // as before. Only COA's own entry point sets the variable.
+    expect(connectorEnvironment(synth())[CONFIG_SOURCE_ENV_VAR]).toBeUndefined();
+  });
+
   describe("DATABRICKS_SCHEMA is optional", () => {
     it("omits the variable entirely when unset, rather than setting it empty", () => {
       // Absent, not empty. An empty Lambda environment variable reads in the console as a value someone
@@ -238,42 +182,13 @@ describe("the connector's environment", () => {
     }
   });
 
-  it("advertises no push-down by default", () => {
-    // An advertisement is a guarantee Athena holds the connector to, so silence is the safe default.
-    expect(connectorEnvironment(synth()).DATABRICKS_ADVERTISE_PUSHDOWN).toBeUndefined();
-  });
-
-  it("passes a push-down opt-in through when it is set", () => {
-    process.env.DATABRICKS_ADVERTISE_PUSHDOWN = "filter,limit";
-    expect(connectorEnvironment(synth()).DATABRICKS_ADVERTISE_PUSHDOWN).toBe("filter,limit");
-  });
-
-  it("normalises the push-down opt-in's spacing and case", () => {
-    process.env.DATABRICKS_ADVERTISE_PUSHDOWN = " FILTER , limit ,topn";
-    expect(connectorEnvironment(synth()).DATABRICKS_ADVERTISE_PUSHDOWN).toBe("filter,limit,topn");
-  });
-
-  it("rejects an unrecognised push-down name at synth rather than ignoring it at run time", () => {
-    // PushdownCapabilities ignores an unknown name rather than refusing to start over a typo in a tuning
-    // knob, so `filtr,limit` would deploy clean, advertise only `limit`, and leave the operator reading a
-    // full-scan bill with no signal.
-    process.env.DATABRICKS_ADVERTISE_PUSHDOWN = "filtr,limit";
-    expect(() => synth()).toThrow(/"filtr"/);
-    expect(() => synth()).toThrow(/filter, limit, topn/);
-  });
-
-  it("rejects the complex push-down name specifically, since it cannot work", () => {
-    process.env.DATABRICKS_ADVERTISE_PUSHDOWN = "complex";
-    expect(() => synth()).toThrow(/Complex-expression push-down is deliberately not offered/);
-  });
-
-  it("rejects a push-down opt-in that names nothing", () => {
-    process.env.DATABRICKS_ADVERTISE_PUSHDOWN = " , ,";
-    expect(() => synth()).toThrow(/names nothing/);
-  });
-
   it("sets no row ceiling by default, so the connector's own default stands", () => {
     expect(connectorEnvironment(synth()).DATABRICKS_MAX_ROWS_PER_TABLE).toBeUndefined();
+  });
+
+  it("passes a configured row ceiling through", () => {
+    process.env.DATABRICKS_MAX_ROWS_PER_TABLE = "50000";
+    expect(connectorEnvironment(synth()).DATABRICKS_MAX_ROWS_PER_TABLE).toBe("50000");
   });
 
   it("rejects a non-integer row ceiling at synth rather than at run time", () => {
@@ -371,6 +286,12 @@ describe("spill", () => {
   it("encrypts each block client-side as well", () => {
     expect(connectorEnvironment(synth()).disable_spill_encryption).toBe("false");
   });
+
+  it("destroys the bucket and key on a destroy, whatever the deployment", () => {
+    // A customer-deployed connector's spill bucket belongs to whoever deployed it. Only COA's own
+    // deployment retains, and only in prod.
+    synth().hasResource("AWS::S3::Bucket", { DeletionPolicy: "Delete" });
+  });
 });
 
 describe("COA's two roles", () => {
@@ -390,6 +311,71 @@ describe("COA's two roles", () => {
 
   it("registers no Athena data catalog: that belongs to the querying account", () => {
     synth().resourceCountIs("AWS::Athena::DataCatalog", 0);
+  });
+});
+
+describe("the VPC", () => {
+  it("stays outside any VPC by default, as a stage-1 deployment did", () => {
+    const template = synth();
+    const [fn] = Object.values(template.findResources("AWS::Lambda::Function")).filter(
+      (resource) => resource.Properties?.Handler === HANDLER,
+    );
+    expect(fn.Properties.VpcConfig).toBeUndefined();
+    template.resourceCountIs("AWS::EC2::SecurityGroup", 0);
+  });
+
+  it("attaches to the customer's VPC and security groups when the variables are set", () => {
+    process.env.CONNECTOR_VPC_ID = "vpc-0c1c2c3c4c5c6c7c8";
+    process.env.CONNECTOR_SUBNET_IDS = "subnet-0c1c2c3c4c5c6c7c9";
+    process.env.CONNECTOR_SECURITY_GROUP_IDS = "sg-0c1c2c3c4c5c6c7ca";
+    synth().hasResourceProperties("AWS::Lambda::Function", {
+      Handler: HANDLER,
+      VpcConfig: {
+        SubnetIds: ["subnet-0c1c2c3c4c5c6c7c9"],
+        SecurityGroupIds: ["sg-0c1c2c3c4c5c6c7ca"],
+      },
+    });
+  });
+});
+
+describe("the reserved managed function-name prefix", () => {
+  it("refuses a prefix ending in the reserved segment, which would take COA's stack over", () => {
+    // No variable check can see this one, and it does not collide: bin/app.ts derives the STACK name
+    // from the same prefix, so this UPDATES COA's managed stack in place and keeps its function ARN.
+    // Every Athena catalog COA registered embeds that ARN and would keep invoking this function, now
+    // in single-endpoint mode where the catalog name is ignored.
+    process.env.FUNCTION_NAME_PREFIX = `${RESOURCE_PREFIX}${MANAGED_FUNCTION_NAME_SEGMENT}`;
+
+    expect(() => synth()).toThrow(/reserved "managed-" segment/);
+    // "Pick another prefix" alone reads as a naming quibble rather than a cross-namespace read.
+    expect(() => synth()).toThrow(/UPDATE COA's managed connector in place/);
+    expect(() => synth()).toThrow(/another's rows/);
+  });
+
+  it("allows a customer prefix that merely contains the segment elsewhere", () => {
+    // Checked on the ENDING, because only a prefix ending in the reserved segment derives the same
+    // function name a managed deployment does.
+    process.env.FUNCTION_NAME_PREFIX = `${RESOURCE_PREFIX}managed-eu-`;
+    expect(() => synth()).not.toThrow();
+  });
+});
+
+describe("what only COA's own deployment has", () => {
+  it("creates NO SSM parameter", () => {
+    // A customer-deployed connector has no COA to hand anything to, and writing into COA's parameter
+    // tree from a customer's account is not a permission it has or should ask for.
+    const template = synth();
+    template.resourceCountIs("AWS::SSM::Parameter", 0);
+    expect(Object.keys(template.findOutputs("*"))).not.toContain("ConnectorRoleArn");
+  });
+
+  it("pins no role name", () => {
+    // A customer-deployed connector's role is named in no trust policy, and pinning it would replace
+    // the role in every stage-1 deployment on the next deploy for no gain.
+    const named = Object.values(synth().findResources("AWS::IAM::Role")).filter(
+      (role) => typeof role.Properties?.RoleName === "string",
+    );
+    expect(named).toEqual([]);
   });
 });
 
@@ -454,9 +440,7 @@ describe("connector alarms", () => {
   const ALARM_TOPIC = "arn:aws:sns:us-east-1:123456789012:coa-connector-alarms";
 
   it("alarms on all four metrics the connector emits, plus the three Lambda ones", () => {
-    // Seven, not three: each of the four below is a *caught* failure, so the invocation succeeds and
-    // appears in neither the Lambda error rate nor its duration.
-    synth().resourceCountIs("AWS::CloudWatch::Alarm", 7);
+    synth().resourceCountIs("AWS::CloudWatch::Alarm", ENVIRONMENT_ALARM_COUNT);
   });
 
   it.each([
@@ -471,6 +455,15 @@ describe("connector alarms", () => {
       Threshold: threshold,
       ComparisonOperator: "GreaterThanThreshold",
       Dimensions: [{ Name: "Connector", Value: "databricks" }],
+    });
+  });
+
+  it("describes a configuration failure in this mode's terms", () => {
+    // The one alarm whose cause differs between the two stacks: here it is a missing variable, there an
+    // absent or repointed parameter.
+    synth().hasResourceProperties("AWS::CloudWatch::Alarm", {
+      AlarmName: "databricks-coa-connector-config-resolution-failures",
+      AlarmDescription: Match.stringLikeRegexp(".*four required DATABRICKS_\\* variables.*"),
     });
   });
 
@@ -495,30 +488,29 @@ describe("connector alarms", () => {
   });
 
   it("does not dimension on Catalog, which would stop matching once a second source is registered", () => {
-    const alarms = synth().findResources("AWS::CloudWatch::Alarm");
-    const connectorAlarms = Object.values(alarms).filter(
-      (alarm) => alarm.Properties?.Namespace === "COA/Connectors",
-    );
+    const connectorAlarms = connectorAlarmsIn(synth());
 
-    expect(connectorAlarms).toHaveLength(4);
+    // Guards the loop below against passing on an empty list.
+    expect(connectorAlarms).toHaveLength(ENVIRONMENT_CONNECTOR_ALARM_COUNT);
     for (const alarm of connectorAlarms) {
-      expect(alarm.Properties.Dimensions).toEqual([
+      expect(alarm.Properties?.Dimensions).toEqual([
         { Name: "Connector", Value: "databricks" },
       ]);
     }
   });
 
   it("notifies nobody without ALARM_TOPIC_ARN, and every alarm with it", () => {
-    for (const alarm of Object.values(synth().findResources("AWS::CloudWatch::Alarm"))) {
-      expect(alarm.Properties.AlarmActions).toBeUndefined();
+    for (const alarm of alarmsIn(synth())) {
+      expect(alarm.Properties?.AlarmActions).toBeUndefined();
     }
 
     process.env.ALARM_TOPIC_ARN = ALARM_TOPIC;
-    const withTopic = Object.values(synth().findResources("AWS::CloudWatch::Alarm"));
+    const withTopic = alarmsIn(synth());
 
-    expect(withTopic).toHaveLength(7);
+    // Guards the loop below against passing on an empty list.
+    expect(withTopic).toHaveLength(ENVIRONMENT_ALARM_COUNT);
     for (const alarm of withTopic) {
-      expect(alarm.Properties.AlarmActions).toEqual([ALARM_TOPIC]);
+      expect(alarm.Properties?.AlarmActions).toEqual([ALARM_TOPIC]);
     }
   });
 

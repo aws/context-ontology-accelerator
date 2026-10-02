@@ -17,62 +17,38 @@ from itertools import batched
 
 import httpx
 from coa_common.bedrock_metrics import CostTracker
-from coa_common.domain_models import EnrichmentSource, ReviewStatus
 from opensearchpy.exceptions import OpenSearchException
 from rdflib import OWL, RDF, RDFS, XSD, BNode, Graph, Literal, Namespace, URIRef
 from rdflib.namespace import SKOS
 
-from coa_ontology.datasource_ids import bare_datasource_id
 from coa_ontology.inducer.schemas import ConceptMatch
 from coa_ontology.inducer.services.data_catalog import CatalogTable, parse_referred_column
 from coa_ontology.inducer.services.grounding import GroundingRerankError
 from coa_ontology.inducer.services.subtype_detection import detect_pk_sharing_subtypes
 from coa_ontology.inducer.strategies.base import (
+    AUTHORITATIVE_FK_SOURCES,
     SCL,
     InductionStrategy,
     ambiguous_target_names,
     composite_fk_anchors,
     composite_fk_columns,
+    fk_edge_allowed,
+    fk_property_local_name,
+    fk_property_qualifiers,
     pascal_names_for,
     reference_index,
     resolve_fk_target_identity,
+    simple_fk_constraints,
     table_identity,
 )
 
 log = logging.getLogger(__name__)
 
-# FK sources that are authoritative and materialise regardless of review state:
-# pulled from the source system, a 3rd-party catalog, or a human steward.
-_AUTHORITATIVE_FK_SOURCES: frozenset[str] = frozenset(
-    {
-        EnrichmentSource.DETERMINISTIC,
-        EnrichmentSource.CATALOG_EXISTING,
-        EnrichmentSource.STEWARD_SPECIFIED,
-        EnrichmentSource.STEWARD_EDITED,
-    }
-)
-
-
-def _fk_edge_allowed(source: str | None, review_status: str | None) -> bool:
-    """Whether a foreign key may be materialised as an ``owl:ObjectProperty`` (#1088).
-
-    "Use only approved relationships downstream." An FK becomes an ontology edge
-    only when it is authoritative, or explicitly APPROVED, or grandfathered:
-
-      * authoritative source (deterministic / catalog / steward) -> always emit;
-      * ``review_status`` empty/None -> emit. FKs stored before the review field
-        existed, and every catalog source that does not populate it, carry no
-        status; emitting preserves pre-#1088 behaviour so existing ontologies do
-        not lose edges on re-induction;
-      * ``APPROVED`` -> emit;
-      * ``PENDING_REVIEW`` / ``REJECTED`` -> do NOT emit — the column degrades to a
-        plain datatype property until a steward approves the relationship.
-    """
-    if source in _AUTHORITATIVE_FK_SOURCES:
-        return True
-    if not review_status:
-        return True
-    return review_status == ReviewStatus.APPROVED
+# The review gate and the authoritative-source set live in ``base`` so the
+# ontology, the R2RML mapping and the SHACL shapes apply the SAME rule (#1088).
+# Re-exported under the historical private names for existing callers/tests.
+_AUTHORITATIVE_FK_SOURCES = AUTHORITATIVE_FK_SOURCES
+_fk_edge_allowed = fk_edge_allowed
 
 
 # Tables per fusion batch when INDUCER_TABLE_BATCH_SIZE is unset.
@@ -103,6 +79,14 @@ def _to_pascal(s: str) -> str:
 def _to_camel(s: str) -> str:
     p = _to_pascal(s)
     return p[0].lower() + p[1:] if p else p
+
+
+def _local_name_of(class_iri: URIRef) -> str:
+    """Local (PascalCase) name of a class IRI — the ``#Fragment`` or last path segment."""
+    text = str(class_iri)
+    if "#" in text:
+        return text.rsplit("#", 1)[1]
+    return text.rstrip("/").rsplit("/", 1)[-1]
 
 
 def _xsd_for(data_type: str, column_name: str = "") -> URIRef:
@@ -344,20 +328,6 @@ class TableToOntologyStrategy(InductionStrategy):
         camel_by_id = {i: p[0].lower() + p[1:] if p else p for i, p in pascal_by_id.items()}
         ref_index = reference_index(tables)
         ambiguous_names = ambiguous_target_names(tables)
-        # (bare name, datasourceId) -> table identity. Lets a cross-source FK
-        # (#1088) resolve its target even when the bare name is ambiguous across
-        # the unioned datasources (e.g. a "customers" table in two sources): the
-        # relationship's targetDatasourceId picks the right one.
-        #
-        # Both sides are normalised to the BARE id. The FK's targetDatasourceId is
-        # written by the sources pipeline as a `DS#`-prefixed id, while
-        # CatalogTable.datasourceId carries whatever id was passed to /induce
-        # (typically bare) — a raw comparison would never match and the lookup
-        # would fall through to the ambiguous bare-name path, silently dropping
-        # the edge this feature exists to emit.
-        target_by_name_ds = {
-            (t.name, bare_datasource_id(t.datasourceId)): table_identity(t) for t in tables if t.datasourceId
-        }
 
         def table_prop(table: CatalogTable, column_name: str) -> URIRef:
             """Mint the property IRI for ``table.column_name``."""
@@ -373,20 +343,15 @@ class TableToOntologyStrategy(InductionStrategy):
             caller declares a datatype property instead of an object property —
             the same degradation build_r2rml applies to its parentTriplesMap.
 
-            A cross-source relationship (#1088) carries ``target_datasource_id``:
-            when present it resolves the target to the table in THAT datasource
-            first, so a name shared across sources still maps to the right class.
-            Otherwise the resolution order mirrors base.build_r2rml._parent_tmap
-            (via ``resolve_fk_target_identity``) so the ontology's object-property
-            range and the mapping's parentTriplesMap always name the same target:
-            own datasource + own database first, then the same database in any
-            datasource, then the bare name.
+            Resolution goes through ``resolve_fk_target_identity``, the resolver
+            base.build_r2rml._parent_tmap, the RIGOR writer and the SHACL config
+            use, so the ontology's object-property range and the mapping's
+            parentTriplesMap always name the same target. A cross-source
+            relationship (#1088) carries ``target_datasource_id`` (``DS#``-prefixed
+            or bare); the resolver keeps it inside THAT datasource, and several
+            same-named tables there resolve to nothing rather than to one of them.
             """
-            if target_datasource_id:
-                tid = target_by_name_ds.get((target_name, bare_datasource_id(target_datasource_id)))
-                if tid is not None and tid in pascal_by_id:
-                    return ns[pascal_by_id[tid]]
-            target_id = resolve_fk_target_identity(referrer, target_name, ref_index)
+            target_id = resolve_fk_target_identity(referrer, target_name, ref_index, target_datasource_id)
             if target_id is not None and target_id in pascal_by_id:
                 return ns[pascal_by_id[target_id]]
             if target_name in ambiguous_names:
@@ -478,77 +443,99 @@ class TableToOntologyStrategy(InductionStrategy):
             composite_anchors = composite_fk_anchors(table)
 
             for col in table.columns:
-                prop_uri = table_prop(table, col.name)
-                is_fk = False
-                fk_target = None
-                fk_target_col = None
-                fk_provenance: str | None = None
-                fk_target_ds: str | None = None
+                base_prop = table_prop(table, col.name)
+                # Relationships this column carries, as (property IRI, target class,
+                # target name, target column, provenance). Empty -> datatype property.
+                relationships: list[tuple[URIRef, URIRef, str, str | None, str | None]] = []
                 if table.tableConstraints and col.name not in absorbed_fk_columns:
                     anchored = composite_anchors.get(col.name)
-                    fk_review_status: str | None = None
                     if anchored is not None and anchored.referredColumns:
-                        is_fk = True
-                        fk_target, fk_target_col = parse_referred_column(anchored.referredColumns[0])
-                        fk_provenance = anchored.relationshipType
-                        fk_review_status = anchored.reviewStatus
-                        fk_target_ds = anchored.targetDatasourceId
+                        # Composite FK: one relationship, carried by its anchor column
+                        # under the plain property name (unchanged behaviour).
+                        if fk_edge_allowed(anchored.relationshipType, anchored.reviewStatus):
+                            t_name, t_col = parse_referred_column(anchored.referredColumns[0])
+                            parent = parent_class(t_name, table, anchored.targetDatasourceId)
+                            if parent is not None:
+                                relationships.append((base_prop, parent, t_name, t_col, anchored.relationshipType))
+                        else:
+                            log.info(
+                                "fk_edge_withheld_pending_review table=%s column=%s target=%s source=%s status=%s",
+                                table.name,
+                                col.name,
+                                anchored.referredColumns[0],
+                                anchored.relationshipType,
+                                anchored.reviewStatus,
+                            )
                     else:
+                        # Simple FKs: EVERY gate-passing one (#1088 follow-up). A column
+                        # may reference several tables — the local parent and one or
+                        # more cross-source targets — and each approved relationship
+                        # must reach the ontology. simple_fk_constraints applies the
+                        # gate before selection, so a PENDING one can no longer hide
+                        # an APPROVED one. Withheld FKs are logged for the operator.
+                        eligible = simple_fk_constraints(table, col.name)
                         for tc in table.tableConstraints:
-                            if tc.constraintType == "FOREIGN_KEY" and col.name in tc.columns and tc.referredColumns:
-                                is_fk = True
-                                fk_target, fk_target_col = parse_referred_column(tc.referredColumns[0])
-                                fk_provenance = tc.relationshipType
-                                fk_review_status = tc.reviewStatus
-                                fk_target_ds = tc.targetDatasourceId
-                                break
-                    # Governance gate (#1088): a PENDING/REJECTED inferred FK is not
-                    # materialised — demote it to a plain datatype property (the
-                    # column still exists; only the relationship edge is withheld
-                    # until a steward approves it). Authoritative and grandfathered
-                    # FKs pass through unchanged.
-                    if is_fk and not _fk_edge_allowed(fk_provenance, fk_review_status):
-                        log.info(
-                            "fk_edge_withheld_pending_review table=%s column=%s target=%s source=%s status=%s",
-                            table.name,
-                            col.name,
-                            fk_target,
-                            fk_provenance,
-                            fk_review_status,
-                        )
-                        is_fk = False
-                        fk_target = None
-                        fk_target_col = None
-                        fk_provenance = None
+                            if (
+                                tc.constraintType == "FOREIGN_KEY"
+                                and tc.referredColumns
+                                and len(tc.columns or []) == 1
+                                and tc.columns[0] == col.name
+                                and not fk_edge_allowed(tc.relationshipType, tc.reviewStatus)
+                            ):
+                                log.info(
+                                    "fk_edge_withheld_pending_review table=%s column=%s target=%s source=%s status=%s",
+                                    table.name,
+                                    col.name,
+                                    tc.referredColumns[0],
+                                    tc.relationshipType,
+                                    tc.reviewStatus,
+                                )
+                        resolved: list[tuple[URIRef, str, str | None, str | None, str | None]] = []
+                        for tc in eligible:
+                            t_name, t_col = parse_referred_column(tc.referredColumns[0])  # type: ignore[index]
+                            # In-run tables use the shared (collision-resolved) name; a
+                            # target outside this run falls back to the bare form. An
+                            # ambiguous bare name resolves to None and THAT relationship
+                            # degrades, matching build_r2rml's rr:datatype for it.
+                            parent = parent_class(t_name, table, tc.targetDatasourceId)
+                            if parent is not None:
+                                resolved.append((parent, t_name, t_col, tc.relationshipType, tc.targetDatasourceId))
+                        # Per-FK qualifiers: identical rule as R2RML + SHACL so the
+                        # three artifacts mint the same property names.
+                        entries = [(_local_name_of(parent), t_col, tds) for parent, _, t_col, _, tds in resolved]
+                        qualifiers = fk_property_qualifiers(entries)
+                        for (parent, t_name, t_col, prov, _), qualifier in zip(resolved, qualifiers, strict=True):
+                            local = fk_property_local_name(
+                                camel_by_id.get(table_identity(table), _to_camel(table.name))
+                                + f"_{_to_camel(col.name)}",
+                                qualifier,
+                            )
+                            relationships.append((ns[local], parent, t_name, t_col, prov))
 
-                # In-run tables use the shared (collision-resolved) name; a target
-                # outside this run falls back to the bare form. An ambiguous bare
-                # name resolves to None and the column becomes a datatype property,
-                # matching build_r2rml's rr:datatype for the same column.
-                parent_cls = parent_class(fk_target, table, fk_target_ds) if is_fk and fk_target else None
-                if parent_cls is not None:
-                    if (table.name, fk_target) in pk_sharing_confirmed:
-                        g.add((table_cls, RDFS.subClassOf, parent_cls))
-                        g.add((table_cls, SCL.subClassProvenance, Literal("PK_SHARING")))
-                        # Do NOT ``continue`` here: for the PK-sharing pattern the
-                        # child's FK column IS its PK column, so it appears in the
-                        # child's own owl:hasKey list. Skipping the property
-                        # declaration below would leave owl:hasKey referencing an
-                        # undeclared property (OWL-DL structural inconsistency —
-                        # fails Tier-1/OoPS/reasoner). Fall through so the key
-                        # column still gets its owl:ObjectProperty declaration,
-                        # rdfs:label, and cardinality axioms.
-                    if (table.name, fk_target) in pk_sharing_suggested:
-                        g.add((table_cls, SCL.suggestedSubClassOf, parent_cls))
-                        g.add((table_cls, SCL.suggestionReason, Literal("PK_SHARING_SINGLE_CHILD")))
-                    g.add((prop_uri, RDF.type, OWL.ObjectProperty))
-                    g.add((prop_uri, RDFS.domain, table_cls))
-                    g.add((prop_uri, RDFS.range, parent_cls))
-                    if fk_provenance:
-                        g.add((prop_uri, SCL.fkProvenance, Literal(fk_provenance)))
-                    fk_comment = f"Foreign key: {table.name}.{col.name} references {fk_target}.{fk_target_col or 'id'}"
-                    g.add((prop_uri, RDFS.comment, Literal(fk_comment)))
+                minted: list[URIRef] = []
+                if relationships:
+                    for prop_uri, parent_cls, fk_target, fk_target_col, fk_provenance in relationships:
+                        if (table.name, fk_target) in pk_sharing_confirmed:
+                            g.add((table_cls, RDFS.subClassOf, parent_cls))
+                            g.add((table_cls, SCL.subClassProvenance, Literal("PK_SHARING")))
+                            # Do NOT skip the property: for the PK-sharing pattern the
+                            # child's FK column IS its PK column and appears in the child's
+                            # own owl:hasKey list, which must reference a declared property.
+                        if (table.name, fk_target) in pk_sharing_suggested:
+                            g.add((table_cls, SCL.suggestedSubClassOf, parent_cls))
+                            g.add((table_cls, SCL.suggestionReason, Literal("PK_SHARING_SINGLE_CHILD")))
+                        g.add((prop_uri, RDF.type, OWL.ObjectProperty))
+                        g.add((prop_uri, RDFS.domain, table_cls))
+                        g.add((prop_uri, RDFS.range, parent_cls))
+                        if fk_provenance:
+                            g.add((prop_uri, SCL.fkProvenance, Literal(fk_provenance)))
+                        fk_comment = (
+                            f"Foreign key: {table.name}.{col.name} references {fk_target}.{fk_target_col or 'id'}"
+                        )
+                        g.add((prop_uri, RDFS.comment, Literal(fk_comment)))
+                        minted.append(prop_uri)
                 else:
+                    prop_uri = base_prop
                     g.add((prop_uri, RDF.type, OWL.DatatypeProperty))
                     g.add((prop_uri, RDFS.domain, table_cls))
                     g.add((prop_uri, RDFS.range, _xsd_for(col.dataType, col.name)))
@@ -567,29 +554,13 @@ class TableToOntologyStrategy(InductionStrategy):
                             )
                         )
                         g.add((prop_uri, RDFS.comment, Literal(note)))
+                    if col.description:
+                        g.add((prop_uri, RDFS.comment, Literal(col.description)))
+                    minted.append(prop_uri)
 
-                g.add((prop_uri, RDFS.label, Literal(col.name)))
-                if col.description and not (is_fk and fk_target):
-                    g.add((prop_uri, RDFS.comment, Literal(col.description)))
-                # Column synonyms → skos:altLabel (persisted in the graph).
-                for syn in col.synonyms:
-                    g.add((prop_uri, SKOS.altLabel, Literal(syn)))
-                # Sampled distinct values (low-cardinality categorical columns) →
-                # coa:distinctValues, one literal per value. Read by the ingest text
-                # builder (_class_text_for) so serve's NL→SQL context can hint the
-                # LLM with correct enum literals for WHERE clauses.
-                for val in getattr(col, "distinctValues", []) or []:
-                    g.add((prop_uri, SCL.distinctValues, Literal(val)))
-
-                # Column-level alignment: if this column matched a foundational property
-                cm = match_map.get((table.name, col.name))
-                if cm and cm.match_type in ("exact", "high_confidence") and cm.matched_class_uri:
-                    matched_prop = URIRef(cm.matched_class_uri)
-                    g.add((prop_uri, OWL.equivalentProperty, matched_prop))
-                    if cm.similarity is not None:
-                        g.add((prop_uri, match_confidence, Literal(cm.similarity, datatype=XSD.float)))
-
-                # Cardinality restrictions from column constraints
+                # Column-level facts apply to EVERY property minted for the column:
+                # a multi-relationship column has several properties, and each must
+                # be labelled, searchable and constrained like the column it maps.
                 is_not_null = col.constraint in ("NOT_NULL", "PRIMARY_KEY")
                 is_unique = col.constraint in ("UNIQUE", "PRIMARY_KEY")
                 if not is_unique and table.tableConstraints:
@@ -597,16 +568,36 @@ class TableToOntologyStrategy(InductionStrategy):
                         if tc.constraintType == "UNIQUE" and col.name in tc.columns and len(tc.columns) == 1:
                             is_unique = True
                             break
+                cm = match_map.get((table.name, col.name))
+                for prop_uri in minted:
+                    g.add((prop_uri, RDFS.label, Literal(col.name)))
+                    # Column synonyms -> skos:altLabel (persisted in the graph).
+                    for syn in col.synonyms:
+                        g.add((prop_uri, SKOS.altLabel, Literal(syn)))
+                    # Sampled distinct values (low-cardinality categorical columns) ->
+                    # coa:distinctValues, one literal per value. Read by the ingest text
+                    # builder (_class_text_for) so serve's NL->SQL context can hint the
+                    # LLM with correct enum literals for WHERE clauses.
+                    for val in getattr(col, "distinctValues", []) or []:
+                        g.add((prop_uri, SCL.distinctValues, Literal(val)))
 
-                if is_not_null and is_unique:
-                    restriction = self._cardinality_restriction(g, prop_uri, OWL.cardinality, 1)
-                    g.add((table_cls, RDFS.subClassOf, restriction))
-                elif is_not_null:
-                    restriction = self._cardinality_restriction(g, prop_uri, OWL.minCardinality, 1)
-                    g.add((table_cls, RDFS.subClassOf, restriction))
-                elif is_unique:
-                    restriction = self._cardinality_restriction(g, prop_uri, OWL.maxCardinality, 1)
-                    g.add((table_cls, RDFS.subClassOf, restriction))
+                    # Column-level alignment: if this column matched a foundational property
+                    if cm and cm.match_type in ("exact", "high_confidence") and cm.matched_class_uri:
+                        matched_prop = URIRef(cm.matched_class_uri)
+                        g.add((prop_uri, OWL.equivalentProperty, matched_prop))
+                        if cm.similarity is not None:
+                            g.add((prop_uri, match_confidence, Literal(cm.similarity, datatype=XSD.float)))
+
+                    # Cardinality restrictions from column constraints
+                    if is_not_null and is_unique:
+                        restriction = self._cardinality_restriction(g, prop_uri, OWL.cardinality, 1)
+                        g.add((table_cls, RDFS.subClassOf, restriction))
+                    elif is_not_null:
+                        restriction = self._cardinality_restriction(g, prop_uri, OWL.minCardinality, 1)
+                        g.add((table_cls, RDFS.subClassOf, restriction))
+                    elif is_unique:
+                        restriction = self._cardinality_restriction(g, prop_uri, OWL.maxCardinality, 1)
+                        g.add((table_cls, RDFS.subClassOf, restriction))
 
         # Do NOT emit owl:imports: Ontop network-resolves it at VKG load and fails
         # every query on a non-dereferenceable foundational URI (Ontop #337).

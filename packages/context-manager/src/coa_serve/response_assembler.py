@@ -54,6 +54,7 @@ class ResponseAssembler:
         strategy: str | None = None,
         model_id: str | None = None,
         ontology_version: str | None = None,
+        include_debug_info: bool = False,
     ) -> QueryResult:
         """Build a Tier-2 QueryResult from an NL-to-SQL resolution.
 
@@ -71,6 +72,12 @@ class ResponseAssembler:
             model_id: Optional per-call model id override.
             ontology_version: Version of the ontology the query ran against,
                 when the caller can name one (#986).
+            include_debug_info: When False (default), the generated SQL is
+                withheld from ``query_used``. Executed SQL / SPARQL exposes
+                internal schema (table + column names, joins). Callers opt in
+                via ``options.includeDebugInfo=true``. Withheld by default so
+                the field cannot leak internal schema (table names, column
+                names, joins) to a caller who did not opt in.
 
         Returns:
             A QueryResult tagged as Tier 2.
@@ -85,7 +92,7 @@ class ResponseAssembler:
             tier=2,
             confidence=ConfidenceScore(score=confidence, rationale="LLM-generated SQL from ontology retrieval"),
             result_rows=rows,
-            query_used=sql_used,
+            query_used=sql_used if include_debug_info else None,
             trace=trace.steps,
             ontology_version=ontology_version,
             metadata=metadata,
@@ -105,6 +112,7 @@ class ResponseAssembler:
         match_source: str = "name",
         model_id: str | None = None,
         ontology_version: str | None = None,
+        include_debug_info: bool = False,
     ) -> QueryResult:
         """Build a Tier-1 QueryResult from a pre-defined metric resolution.
 
@@ -121,6 +129,10 @@ class ResponseAssembler:
             model_id: Optional per-call model id override.
             ontology_version: Version of the ontology the query ran against,
                 when the caller can name one (#986).
+            include_debug_info: When False (default), the executed metric SQL
+                is withheld from ``query_used`` — it exposes internal schema
+                (table + column names). Opt in via
+                ``options.includeDebugInfo=true``.
 
         Returns:
             A QueryResult tagged as Tier 1; confidence is 1.0 for exact matches
@@ -129,7 +141,6 @@ class ResponseAssembler:
         # an EXACT name/synonym match is deterministic (confidence 1.0);
         # a FUZZY near-miss carries the matcher's similarity ratio (< 1.0) so the
         # response honestly signals it was an approximate resolution.
-        # TODO: gate query_used on caller's includeDebugInfo option
         if match_source == "fuzzy":
             rationale = f"Fuzzy metric near-match: {metric_name} (similarity {match_confidence:.2f})"
             score = min(1.0, max(0.0, match_confidence))
@@ -142,7 +153,7 @@ class ResponseAssembler:
             tier=1,
             confidence=ConfidenceScore(score=score, rationale=rationale),
             result_rows=rows,
-            query_used=sql_used,
+            query_used=sql_used if include_debug_info else None,
             trace=trace.steps,
             ontology_version=ontology_version,
             metadata=metadata,
@@ -198,6 +209,7 @@ class ResponseAssembler:
         truncated: bool = False,
         strategy: str | None = None,
         model_id: str | None = None,
+        include_debug_info: bool = False,
     ) -> QueryResult:
         """Build a Tier-2 QueryResult from a VKG (NL-to-SPARQL) resolution.
 
@@ -219,6 +231,10 @@ class ResponseAssembler:
             truncated: Whether the result set was capped.
             strategy: Optional Tier-2 strategy label recorded in metadata.
             model_id: Optional per-call model id override.
+            include_debug_info: When False (default), the compiled SQL and
+                generated SPARQL are withheld from ``query_used`` /
+                ``sparql_generated`` — both expose internal schema (tables,
+                columns, joins). Opt in via ``options.includeDebugInfo=true``.
 
         Returns:
             A QueryResult tagged as Tier 2 with calibrated confidence.
@@ -235,13 +251,12 @@ class ResponseAssembler:
         if row_count is None and rows is not None:
             row_count = len(rows)
 
-        # TODO: gate query_used and sparql_generated on caller's includeDebugInfo option
         return QueryResult(
             tier=2,
             confidence=self._calibrate_tier2(confidence, row_count, truncated),
             result_rows=rows,
-            query_used=sql_used,
-            sparql_generated=sparql,
+            query_used=sql_used if include_debug_info else None,
+            sparql_generated=sparql if include_debug_info else None,
             trace=trace.steps,
             ontology_version=ontology_version,
             data_sources=data_sources,

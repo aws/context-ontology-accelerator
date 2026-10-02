@@ -135,8 +135,18 @@ class TestSmusCatalogDataSourceLookup:
 
         assert lookup.table_exists("ds-1", "customers") is False
         mock_asset.assert_not_called()
-        # Both forms are enumerable so the caller's guard still sees the catalog.
-        assert lookup.known_tables("ds-1") == {"sales.customers", "marketing.customers", "customers"}
+        # Raw qualified names keep the catalog non-empty without inventing a
+        # bare name that would bypass ambiguity checks.
+        assert lookup.known_tables("ds-1") == {"sales.customers", "marketing.customers"}
+
+    @patch("coa_metrics.lookups.read_table_for_asset")
+    @patch("coa_metrics.lookups.read_asset_names_for_datasource")
+    def test_legacy_bare_name_is_ambiguous_with_qualified_sibling(self, mock_names, mock_asset):
+        mock_names.return_value = {"orders": "asset-legacy", "archive.orders": "asset-archive"}
+        lookup = _lookup()
+
+        assert lookup.table_exists("ds-1", "orders") is False
+        mock_asset.assert_not_called()
 
     @patch("coa_metrics.lookups.read_table_for_asset")
     @patch("coa_metrics.lookups.read_asset_names_for_datasource")

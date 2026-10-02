@@ -388,12 +388,14 @@ class TestOntologyConceptResolution:
         mock_neptune.create_metric.assert_called_once()
 
 
-# ── SQL validation: soft/hard split (#161) ──────────────────────────────
+# ── SQL persistence validation (#617 / #1050) ──────────────────────────
 
 
-class TestSqlValidationSoftHardSplit:
-    """#161: SQL that merely parses badly (or is a fragment) publishes with a
-    soft warning; only DML/DDL is a hard 400."""
+class TestSqlPersistenceValidation:
+    """#617/#1050: a non-SELECT fragment or unparseable SQL is a hard 400 at
+    onboarding — the serve-time firewall enforces the same SELECT-only rule, so
+    such a metric must not be persisted. (This supersedes #161, which had made
+    fragments/parse errors soft warnings; only DML/DDL remains a separate 400.)"""
 
     def _publishing_neptune(self, mock_neptune_factory: MagicMock) -> MagicMock:
         mock_neptune = MagicMock()
@@ -406,46 +408,75 @@ class TestSqlValidationSoftHardSplit:
         body = json.loads(resp["body"])
         return " ".join(w["message"] for w in body.get("warnings", []))
 
-    # ── SOFT: fragments and parse errors now publish ─────────────────────
+    # ── HARD: fragments and parse errors are rejected at onboarding ──────
 
     @pytest.mark.parametrize("fragment", ["COUNT(*)", "SUM(orders.total_amount)", "AVG(price)"])
+    @patch("coa_metrics.api.create_metric._validate_soft")
     @patch("coa_metrics.api.create_metric._get_opensearch")
     @patch("coa_metrics.api.create_metric._get_neptune")
-    def test_fragment_expression_publishes_with_warning(
-        self, mock_neptune_factory: MagicMock, mock_oss: MagicMock, fragment: str
+    def test_fragment_expression_returns_400(
+        self,
+        mock_neptune_factory: MagicMock,
+        mock_oss: MagicMock,
+        mock_validate_soft: MagicMock,
+        fragment: str,
     ) -> None:
-        """A fragment no longer blocks publish (was 400). The serve resolver
-        does not wrap fragments — it just fails to match Tier 1."""
+        """A fragment is rejected (#617/#1050): the serve firewall only executes
+        full SELECTs, so a persisted fragment fails at query time. Must 400 and
+        not persist."""
         mock_neptune = self._publishing_neptune(mock_neptune_factory)
         body = _valid_body()
         body["expression"] = {"dialects": [{"dialect": "TRINO", "expression": fragment}]}
         resp = handler(_make_event(body=body), None)
 
-        assert resp["statusCode"] == 201
-        mock_neptune.create_metric.assert_called_once()
-        assert "full SELECT statement" in self._warning_messages(resp)
+        assert resp["statusCode"] == 400
+        payload = json.loads(resp["body"])
+        assert "full SELECT statement" in payload["message"]
+        mock_neptune.create_metric.assert_not_called()
+        mock_validate_soft.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "invalid_sql",
+        [
+            "SELECT *",
+            "SELECT dblink_exec('conn', 'DELETE FROM orders')",
+        ],
+    )
+    @patch("coa_metrics.api.create_metric._validate_soft")
+    @patch("coa_metrics.api.create_metric._get_opensearch")
+    @patch("coa_metrics.api.create_metric._get_neptune")
+    def test_non_executable_or_forbidden_select_returns_400(
+        self,
+        mock_neptune_factory: MagicMock,
+        mock_oss: MagicMock,
+        mock_validate_soft: MagicMock,
+        invalid_sql: str,
+    ) -> None:
+        mock_neptune = self._publishing_neptune(mock_neptune_factory)
+        body = _valid_body()
+        body["expression"] = {"dialects": [{"dialect": "POSTGRESQL", "expression": invalid_sql}]}
+
+        resp = handler(_make_event(body=body), None)
+
+        assert resp["statusCode"] == 400
+        mock_neptune.create_metric.assert_not_called()
+        mock_validate_soft.assert_not_called()
 
     @patch("coa_metrics.api.create_metric._get_opensearch")
     @patch("coa_metrics.api.create_metric._get_neptune")
-    def test_unparseable_expression_publishes_with_warning(
-        self, mock_neptune_factory: MagicMock, mock_oss: MagicMock
-    ) -> None:
-        """A syntactically-broken expression publishes (was 400) — #161's
-        core rule. The serve firewall is fail-closed, so this is not a
-        safety regression."""
+    def test_unparseable_expression_returns_400(self, mock_neptune_factory: MagicMock, mock_oss: MagicMock) -> None:
+        """A syntactically-broken expression is an ERROR check → hard 400
+        (#617/#1050), not a soft warning."""
         mock_neptune = self._publishing_neptune(mock_neptune_factory)
         body = _valid_body()
         body["expression"] = {"dialects": [{"dialect": "TRINO", "expression": "SELECT FROM WHERE ((("}]}
         resp = handler(_make_event(body=body), None)
 
-        assert resp["statusCode"] == 201
-        mock_neptune.create_metric.assert_called_once()
-        warnings = json.loads(resp["body"])["warnings"]
-        syntax = [w for w in warnings if w["field"] == "sql_syntax"]
-        assert len(syntax) == 1, warnings
-        assert syntax[0]["severity"] == "ERROR"
-        assert "SQL syntax error" in syntax[0]["message"]
-        assert "TRINO" in syntax[0]["message"]
+        assert resp["statusCode"] == 400
+        payload = json.loads(resp["body"])
+        assert "could not be parsed" in payload["message"]
+        assert "TRINO" in payload["message"]
+        mock_neptune.create_metric.assert_not_called()
 
     @patch("coa_metrics.api.create_metric._get_opensearch")
     @patch("coa_metrics.api.create_metric._get_neptune")
@@ -568,3 +599,57 @@ class TestSourceTableEnforcement:
         resp = handler(_make_event(body=_valid_body()), None)
         assert resp["statusCode"] == 201
         mock_neptune.create_metric.assert_called_once()
+
+    @patch("coa_metrics.api.create_metric._validate_soft")
+    @patch("coa_metrics.api.create_metric.check_source_table_exists")
+    @patch("coa_metrics.api.create_metric._get_opensearch")
+    @patch("coa_metrics.api.create_metric._get_neptune")
+    def test_error_severity_table_reference_still_publishes(
+        self,
+        mock_neptune_factory: MagicMock,
+        mock_oss: MagicMock,
+        mock_check: MagicMock,
+        mock_validate_soft: MagicMock,
+    ) -> None:
+        """!1133 (Kun's review): the validator can tag table_reference ERROR on
+        provable absence, but that metadata check has its own dedicated gate
+        (check_source_table_exists, using a different lookup). When the dedicated
+        gate says publish (None), an ERROR-severity table_reference finding must
+        NOT independently 400 — onboarding blocks only on sql_syntax/sql_shape
+        (BLOCKING_CHECKS). Regression guard for the old severity-based filter."""
+        mock_neptune = MagicMock()
+        mock_neptune.get_metric.return_value = None
+        mock_neptune_factory.return_value = mock_neptune
+        mock_check.return_value = None  # dedicated gate can't prove absence → publish
+        mock_validate_soft.return_value = [
+            {"field": "table_reference", "message": "Source table 'orders' not found", "severity": "ERROR"}
+        ]
+        resp = handler(_make_event(body=_valid_body()), None)
+        assert resp["statusCode"] == 201, resp
+        mock_neptune.create_metric.assert_called_once()
+        # the ERROR-severity metadata finding is still surfaced (non-blocking)
+        body = json.loads(resp["body"])
+        assert any(w["field"] == "table_reference" for w in body.get("warnings", []))
+
+    @patch("coa_metrics.api.create_metric._validate_soft")
+    @patch("coa_metrics.api.create_metric.check_source_table_exists")
+    @patch("coa_metrics.api.create_metric._get_neptune")
+    def test_sql_shape_error_still_blocks(
+        self,
+        mock_neptune_factory: MagicMock,
+        mock_check: MagicMock,
+        mock_validate_soft: MagicMock,
+    ) -> None:
+        """Complement to the above: a sql_shape ERROR (a BLOCKING_CHECK) must
+        still 400 and not persist, so the narrower filter did not disable the
+        onboarding gate #617/#1050 added."""
+        mock_neptune = MagicMock()
+        mock_neptune.get_metric.return_value = None
+        mock_neptune_factory.return_value = mock_neptune
+        mock_check.return_value = None
+        mock_validate_soft.return_value = [
+            {"field": "sql_shape", "message": "expression must be a full SELECT statement", "severity": "ERROR"}
+        ]
+        resp = handler(_make_event(body=_valid_body()), None)
+        assert resp["statusCode"] == 400, resp
+        mock_neptune.create_metric.assert_not_called()

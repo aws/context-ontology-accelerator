@@ -30,14 +30,16 @@ from rdflib import OWL, RDF, RDFS, XSD, BNode, Graph, Literal, Namespace, URIRef
 from rdflib.namespace import SKOS
 
 from coa_ontology.inducer.schemas import ConceptMatch
-from coa_ontology.inducer.services.data_catalog import CatalogTable, parse_referred_column
+from coa_ontology.inducer.services.data_catalog import CatalogConstraint, CatalogTable, parse_referred_column
 from coa_ontology.inducer.strategies.base import (
     InductionStrategy,
     ambiguous_target_names,
+    fk_edge_allowed,
     logical_table_names,
     pascal_names_for,
     reference_index,
     resolve_fk_target_identity,
+    simple_fk_constraints,
     subject_template_names,
     table_identity,
 )
@@ -83,7 +85,13 @@ def _iri_local_name(iri: str) -> str:
 
 
 def _format_schema_context(table: CatalogTable) -> str:
-    """Format the full schema context for a table (columns + constraints)."""
+    """Format the full schema context for a table (columns + constraints).
+
+    Foreign-key constraints run through :func:`fk_edge_allowed` first so the
+    LLM only sees relationships the review gate permits. A PENDING or REJECTED
+    inferred FK never reaches the prompt, so the LLM cannot propose a live
+    relationship on top of it.
+    """
     lines = [f"Table: {table.name}"]
     if table.description:
         lines.append(f"Description: {table.description}")
@@ -98,6 +106,9 @@ def _format_schema_context(table: CatalogTable) -> str:
     if table.tableConstraints:
         lines.append("Constraints:")
         for tc in table.tableConstraints:
+            if tc.constraintType == "FOREIGN_KEY" and not fk_edge_allowed(tc.relationshipType, tc.reviewStatus):
+                # PENDING_REVIEW / REJECTED inferred FK — withhold from the LLM.
+                continue
             ref = f" REFERENCES {tc.referredColumns}" if tc.referredColumns else ""
             lines.append(f"  - {tc.constraintType}({', '.join(tc.columns)}){ref}")
     return "\n".join(lines)
@@ -895,6 +906,8 @@ class RigorOntologyStrategy(InductionStrategy):
                 g.add((pom, RR.objectMap, om))
 
                 fk_target, _ = self._fk_info(col.name, table)
+                fk_constraint = self._fk_constraint(col.name, table)
+                fk_target_datasource_id = fk_constraint.targetDatasourceId if fk_constraint else None
                 # Determine whether the generated property is an ObjectProperty
                 is_object_property = (
                     prop_uri,
@@ -908,7 +921,14 @@ class RigorOntologyStrategy(InductionStrategy):
                 # in-run tables answering to the name, neither picked by the
                 # referrer's own schema — degrades to a datatype literal rather than
                 # a join to an arbitrary same-named table, exactly as base.py does.
-                target_token = self._fk_target_token(fk_target, table, ref_index, subject_names, ambiguous_names)
+                target_token = self._fk_target_token(
+                    fk_target,
+                    table,
+                    ref_index,
+                    subject_names,
+                    ambiguous_names,
+                    fk_target_datasource_id,
+                )
 
                 col_id = sql_ident(col.name)
                 if is_object_property and target_token is not None:
@@ -1044,6 +1064,7 @@ class RigorOntologyStrategy(InductionStrategy):
         ref_index: dict[str, str],
         subject_names: dict[str, str],
         ambiguous_names: set[str],
+        target_datasource_id: str | None = None,
     ) -> str | None:
         """Resolve an FK target name to the subject-IRI token of its TriplesMap.
 
@@ -1054,13 +1075,22 @@ class RigorOntologyStrategy(InductionStrategy):
         does not pick one — the caller then emits a datatype literal instead of a
         join to an arbitrary same-named table.
 
+        ``target_datasource_id`` (an approved cross-source FK, #1140) goes to the
+        same :func:`resolve_fk_target_identity` call the other three artifacts
+        make, so the template names the table the ontology's range does.
+
         A target genuinely outside this induction run keeps its bare name (it has
         no TriplesMap here to collide with), so a mapping that referenced an
         out-of-run table stays byte-identical.
         """
         if not target_name:
             return None
-        target_id = resolve_fk_target_identity(referrer, target_name, ref_index)
+        target_id = resolve_fk_target_identity(
+            referrer,
+            target_name,
+            ref_index,
+            target_datasource_id,
+        )
         if target_id is not None and target_id in subject_names:
             return subject_names[target_id]
         if target_name in ambiguous_names:
@@ -1156,10 +1186,30 @@ class RigorOntologyStrategy(InductionStrategy):
 
     @staticmethod
     def _fk_info(col_name: str, table: CatalogTable) -> tuple[str | None, str | None]:
-        """Return (target_table, target_pk) if col_name is an FK; else (None, None)."""
-        if not table.tableConstraints:
+        """Return (target_table, target_pk) if col_name is an FK; else (None, None).
+
+        Runs through :func:`simple_fk_constraints` so the review gate applies
+        (PENDING / REJECTED inferred FKs are withheld — the same rule the
+        default table-to-ontology strategy applies) and the shared dedup +
+        empty-target-column filters run. Rigor is single-FK-per-column by
+        design, so the first survivor is used; multi-FK support in this
+        strategy is out of scope. When a column has multiple approved FKs,
+        only the first reaches the mapping and the others are dropped —
+        matching the strategy's historical first-wins shape, but only among
+        gated FKs.
+        """
+        tc = RigorOntologyStrategy._fk_constraint(col_name, table)
+        if tc is None:
             return None, None
-        for tc in table.tableConstraints:
-            if tc.constraintType == "FOREIGN_KEY" and col_name in tc.columns and tc.referredColumns:
-                return parse_referred_column(tc.referredColumns[0])
-        return None, None
+        return parse_referred_column(tc.referredColumns[0])  # type: ignore[index]
+
+    @staticmethod
+    def _fk_constraint(col_name: str, table: CatalogTable) -> CatalogConstraint | None:
+        """The single gate-passing FK constraint :meth:`_fk_info` reads, or ``None``.
+
+        Exposed so the mapping can also read the constraint's ``targetDatasourceId``
+        (#1140) without changing :meth:`_fk_info`'s ``(table, column)`` shape.
+        """
+        for tc in simple_fk_constraints(table, col_name):
+            return tc
+        return None

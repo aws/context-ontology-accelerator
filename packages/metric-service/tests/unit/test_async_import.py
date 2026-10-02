@@ -9,6 +9,13 @@ import json
 from unittest.mock import MagicMock, patch
 
 import pytest
+from coa_metrics.osi_parser import (
+    MAX_SQL_EXPRESSION_LENGTH,
+    OsiCustomExtension,
+    OsiDialectExpression,
+    OsiDocument,
+    OsiMetric,
+)
 from coa_metrics.source_status import PERMISSIVE_ENV, SourceValidationUnavailableError
 
 pytestmark = pytest.mark.unit
@@ -1983,6 +1990,106 @@ class TestImportWorker:
         )
         mock_complete.assert_not_called()
         mock_sqs.assert_not_called()
+
+    def _run_shape_gate_chunk(self, mock_get_job, mock_s3, mock_parse, mock_claim, expression: str):
+        """Drive _process_chunk for a single metric whose SQL fails the shape gate.
+
+        Exercises the real offset-plan flow: the shape/size contract is enforced
+        inside _osi_metric_to_definition, so we do NOT mock the converter — we feed
+        a real OSI document and let _build_offset_plan turn the ValueError into a
+        durable ERROR plan entry.
+        """
+        from coa_metrics.api.import_job_store import OffsetClaim, OffsetClaimState
+        from coa_metrics.api.import_worker import _process_chunk
+
+        mock_get_job.return_value = self._active_job(1)
+        body = MagicMock()
+        body.read.return_value = b"yaml"
+        mock_s3.return_value.get_object.return_value = {"Body": body}
+        metric = OsiMetric(
+            name="fragment_metric",
+            description="Invalid metric",
+            expression=[OsiDialectExpression(dialect="ANSI_SQL", expression=expression)],
+            custom_extensions=OsiCustomExtension(data_source_id="ds-1", source_table="orders"),
+        )
+        document = OsiDocument(metrics=[metric])
+        mock_parse.return_value = MagicMock(success=True, document=document)
+        mock_claim.return_value = OffsetClaim(OffsetClaimState.ACQUIRED, "claim-token")
+
+        _process_chunk(self._msg())
+
+    @patch("coa_metrics.api.import_worker._get_neptune")
+    @patch("coa_metrics.api.import_worker.finalize_job_offset", return_value=True)
+    @patch("coa_metrics.api.import_worker.claim_job_offset")
+    @patch("coa_metrics.api.import_worker.parse_osi_yaml")
+    @patch("coa_metrics.api.import_worker._get_s3")
+    @patch("coa_metrics.api.import_worker.complete_job")
+    @patch("coa_metrics.api.import_worker.get_job")
+    def test_non_select_expression_is_recorded_and_not_persisted(
+        self,
+        mock_get_job,
+        mock_complete,
+        mock_s3,
+        mock_parse,
+        mock_claim,
+        mock_finalize,
+        mock_neptune,
+        mock_store_job_offset_plan,
+    ):
+        from coa_metrics.api.import_job_store import MetricDisposition
+
+        self._run_shape_gate_chunk(mock_get_job, mock_s3, mock_parse, mock_claim, "COUNT(*)")
+
+        # The fragment never reaches Neptune: it is recorded as a durable ERROR
+        # in the plan and skipped when the plan is applied.
+        mock_neptune.return_value.get_metric.assert_not_called()
+        mock_neptune.return_value.create_metric.assert_not_called()
+        plan = mock_store_job_offset_plan.call_args.kwargs["plan"]
+        assert plan.entries[0].disposition == MetricDisposition.ERROR
+        assert "full SELECT statement" in plan.entries[0].error
+        kwargs = mock_finalize.call_args.kwargs
+        assert kwargs["metrics_processed"] == 1
+        assert kwargs["metrics_created"] == 0
+        assert kwargs["metrics_updated"] == 0
+        assert "full SELECT statement" in kwargs["errors"][0]
+        assert kwargs["mark_job_completed"] is True
+        mock_complete.assert_not_called()
+
+    @patch("coa_metrics.api.import_worker._get_neptune")
+    @patch("coa_metrics.api.import_worker.finalize_job_offset", return_value=True)
+    @patch("coa_metrics.api.import_worker.claim_job_offset")
+    @patch("coa_metrics.api.import_worker.parse_osi_yaml")
+    @patch("coa_metrics.api.import_worker._get_s3")
+    @patch("coa_metrics.api.import_worker.complete_job")
+    @patch("coa_metrics.api.import_worker.get_job")
+    def test_oversized_expression_is_recorded_and_not_persisted(
+        self,
+        mock_get_job,
+        mock_complete,
+        mock_s3,
+        mock_parse,
+        mock_claim,
+        mock_finalize,
+        mock_neptune,
+        mock_store_job_offset_plan,
+    ):
+        from coa_metrics.api.import_job_store import MetricDisposition
+
+        oversized = "SELECT 1 FROM orders WHERE " + ("x" * MAX_SQL_EXPRESSION_LENGTH)
+        self._run_shape_gate_chunk(mock_get_job, mock_s3, mock_parse, mock_claim, oversized)
+
+        # The oversize bound is enforced before analysis, so nothing is persisted.
+        mock_neptune.return_value.get_metric.assert_not_called()
+        mock_neptune.return_value.create_metric.assert_not_called()
+        plan = mock_store_job_offset_plan.call_args.kwargs["plan"]
+        assert plan.entries[0].disposition == MetricDisposition.ERROR
+        assert f"at most {MAX_SQL_EXPRESSION_LENGTH} characters" in plan.entries[0].error
+        kwargs = mock_finalize.call_args.kwargs
+        assert kwargs["metrics_processed"] == 1
+        assert kwargs["metrics_created"] == 0
+        assert f"at most {MAX_SQL_EXPRESSION_LENGTH} characters" in kwargs["errors"][0]
+        assert kwargs["mark_job_completed"] is True
+        mock_complete.assert_not_called()
 
     @patch("coa_metrics.api.import_worker._osi_metric_to_definition")
     @patch("coa_metrics.api.import_worker._get_neptune")

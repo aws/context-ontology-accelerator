@@ -9,8 +9,17 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import sqlglot
-from coa_common.constants import RESOURCE_PREFIX
-from coa_serve.clients.athena import AthenaQueryError, AthenaQueryExecutor
+from coa_common.constants import (
+    CONNECTOR_BACKED_SUB_TYPES,
+    DATABASE_SUB_TYPES,
+    RESOURCE_PREFIX,
+    DatabaseSubType,
+)
+from coa_serve.clients.athena import (
+    _CATALOG_PATH_LABELS,
+    AthenaQueryError,
+    AthenaQueryExecutor,
+)
 from coa_serve.clients.sources_registry import SQLNamespaceScope
 from coa_serve.tier2.sql_firewall import UnsafeSQLError
 from coa_serve.tier2.table_qualifier import real_tables
@@ -870,38 +879,61 @@ class TestInjectLimitTrailingComment:
         assert AthenaQueryExecutor._inject_limit(sql, 100) == sql
 
 
+def _wire_source_row(mock_boto, mock_res, item):
+    """Point a mocked Athena client and sources table at one DDB source row."""
+    import json
+
+    mock_athena = MagicMock()
+    mock_boto.return_value = mock_athena
+    mock_table = MagicMock()
+    mock_res.return_value.Table.return_value = mock_table
+    mock_table.query.return_value = {"Items": [{"configuration": json.dumps({}), **item}]}
+    mock_table.get_item.return_value = {"Item": {"athenaWorkgroupName": f"{RESOURCE_PREFIX}-dev-ns-123"}}
+    mock_athena.start_query_execution.return_value = {"QueryExecutionId": "qid-conn"}
+    mock_athena.get_query_execution.return_value = {"QueryExecution": {"Status": {"State": "SUCCEEDED"}}}
+    mock_athena.get_query_results.return_value = {
+        "ResultSet": {
+            "ResultSetMetadata": {"ColumnInfo": [{"Name": "cnt"}]},
+            "Rows": [{"Data": [{"VarCharValue": "cnt"}]}, {"Data": [{"VarCharValue": "7"}]}],
+        }
+    }
+    return mock_athena
+
+
+def _executor_for_source_row(item, scope=None):
+    """Build an executor over a namespace holding one source row; return it and the client.
+
+    Returns the Athena mock rather than its call kwargs, so a caller can assert
+    ``start_query_execution`` was NOT called. ``scope`` pins
+    ``SourcesRegistry.sql_namespace_scope``.
+    """
+    with patch("boto3.client") as mock_boto, patch("boto3.resource") as mock_res:
+        mock_athena = _wire_source_row(mock_boto, mock_res, item)
+        executor = AthenaQueryExecutor(region="us-east-1", sources_table="coa-sources")
+        executor._sources._table_name = "coa-sources"
+    if scope is not None:
+        executor._sources.sql_namespace_scope = AsyncMock(return_value=scope)
+    return executor, mock_athena
+
+
+async def _start_query_kwargs(item, sql="SELECT COUNT(*) FROM orders"):
+    """Run ``sql`` against a namespace holding one source row; return Athena's kwargs.
+
+    Shared by the custom-connector and Databricks resolution suites so neither can
+    drift from the other on how the source record reaches the executor.
+    """
+    executor, mock_athena = _executor_for_source_row(item)
+    await executor.execute(sql, namespace="ns-123")
+    return mock_athena.start_query_execution.call_args[1]
+
+
 @pytest.mark.unit
 class TestCustomConnectorCatalogResolution:
     """A custom-connector source resolves its own Lambda-backed catalog, and must
     NOT be put through the Glue-crawler name rewrite."""
 
-    @staticmethod
-    def _wire(mock_boto, mock_res, item):
-        import json
-
-        mock_athena = MagicMock()
-        mock_boto.return_value = mock_athena
-        mock_table = MagicMock()
-        mock_res.return_value.Table.return_value = mock_table
-        mock_table.query.return_value = {"Items": [{"configuration": json.dumps({}), **item}]}
-        mock_table.get_item.return_value = {"Item": {"athenaWorkgroupName": f"{RESOURCE_PREFIX}-dev-ns-123"}}
-        mock_athena.start_query_execution.return_value = {"QueryExecutionId": "qid-conn"}
-        mock_athena.get_query_execution.return_value = {"QueryExecution": {"Status": {"State": "SUCCEEDED"}}}
-        mock_athena.get_query_results.return_value = {
-            "ResultSet": {
-                "ResultSetMetadata": {"ColumnInfo": [{"Name": "cnt"}]},
-                "Rows": [{"Data": [{"VarCharValue": "cnt"}]}, {"Data": [{"VarCharValue": "7"}]}],
-            }
-        }
-        return mock_athena
-
     async def _execute(self, item, sql="SELECT COUNT(*) FROM orders"):
-        with patch("boto3.client") as mock_boto, patch("boto3.resource") as mock_res:
-            mock_athena = self._wire(mock_boto, mock_res, item)
-            executor = AthenaQueryExecutor(region="us-east-1", sources_table="coa-sources")
-            executor._sources._table_name = "coa-sources"
-        await executor.execute(sql, namespace="ns-123")
-        return mock_athena.start_query_execution.call_args[1]
+        return await _start_query_kwargs(item, sql)
 
     async def test_uses_the_lambda_catalog_and_discovered_database(self):
         kwargs = await self._execute(
@@ -933,6 +965,22 @@ class TestCustomConnectorCatalogResolution:
             sql="SELECT COUNT(*) FROM widgets_orders",
         )
         assert "widgets_orders" in kwargs["QueryString"]
+
+    # The strip keeps whatever FOLLOWS the first occurrence of `{database}_`, so a
+    # database name in the MIDDLE of a table name is corrupted too.
+    async def test_does_not_rewrite_a_table_name_containing_the_database_in_the_middle(self):
+        kwargs = await self._execute(
+            {
+                "sourceType": "DATABASE",
+                "sourceSubType": "CUSTOM_CONNECTOR",
+                "athenaDataCatalogName": "coadevds_abc123",
+                "athenaDatabase": "widgets",
+                "discoveredSchemas": ["widgets"],
+                "queryable": True,
+            },
+            sql="SELECT COUNT(*) FROM daily_widgets_orders",
+        )
+        assert "daily_widgets_orders" in kwargs["QueryString"]
 
     # A federated JDBC source still gets the rewrite it exists for.
     async def test_a_federated_jdbc_source_is_still_rewritten(self):
@@ -1017,6 +1065,296 @@ class TestCustomConnectorCatalogResolution:
 
 
 @pytest.mark.unit
+class TestDatabricksCatalogResolution:
+    """A Databricks SQL Warehouse source must be resolved exactly as a custom connector is.
+
+    Mirrors every case in ``TestCustomConnectorCatalogResolution``. An exact
+    ``sourceSubType == "CUSTOM_CONNECTOR"`` gate fails OPEN here: the rewrite runs and
+    silently corrupts table names before they reach the connector.
+    """
+
+    _SUB_TYPE = "DATABRICKS_SQL_WAREHOUSE"
+
+    async def _execute(self, item, sql="SELECT COUNT(*) FROM orders"):
+        return await _start_query_kwargs(item, sql)
+
+    async def test_databricks_uses_the_lambda_catalog_and_discovered_database(self):
+        kwargs = await self._execute(
+            {
+                "sourceType": "DATABASE",
+                "sourceSubType": self._SUB_TYPE,
+                "athenaDataCatalogName": "coadevds_dbx123",
+                "athenaDatabase": "sales",
+                "discoveredSchemas": ["sales"],
+                "queryable": True,
+            }
+        )
+        assert kwargs["QueryExecutionContext"]["Catalog"] == "coadevds_dbx123"
+        assert kwargs["QueryExecutionContext"]["Database"] == "sales"
+
+    # `sales_orders` CONTAINS its own schema name, so the rewrite would strip `sales_`
+    # and send `orders` — a Unity Catalog table the warehouse does not have.
+    async def test_databricks_table_name_containing_its_schema_name_is_not_rewritten(self):
+        kwargs = await self._execute(
+            {
+                "sourceType": "DATABASE",
+                "sourceSubType": self._SUB_TYPE,
+                "athenaDataCatalogName": "coadevds_dbx123",
+                "athenaDatabase": "sales",
+                "discoveredSchemas": ["sales"],
+                "queryable": True,
+            },
+            sql="SELECT COUNT(*) FROM sales_orders",
+        )
+        assert "sales_orders" in kwargs["QueryString"]
+        assert '"orders"' not in kwargs["QueryString"]
+
+    # `daily_sales_orders` and `sales_orders` both collapse to `orders`, which is how
+    # two distinct tables become one wrong answer.
+    async def test_databricks_table_name_with_its_schema_name_in_the_middle_is_not_rewritten(self):
+        kwargs = await self._execute(
+            {
+                "sourceType": "DATABASE",
+                "sourceSubType": self._SUB_TYPE,
+                "athenaDataCatalogName": "coadevds_dbx123",
+                "athenaDatabase": "sales",
+                "discoveredSchemas": ["sales"],
+                "queryable": True,
+            },
+            sql="SELECT COUNT(*) FROM daily_sales_orders",
+        )
+        assert "daily_sales_orders" in kwargs["QueryString"]
+        assert '"orders"' not in kwargs["QueryString"]
+
+    async def test_databricks_falls_back_to_the_configured_database_when_none_were_discovered(self):
+        kwargs = await self._execute(
+            {
+                "sourceType": "DATABASE",
+                "sourceSubType": self._SUB_TYPE,
+                "athenaDataCatalogName": "coadevds_dbx123",
+                "athenaDatabase": "sales",
+                "queryable": True,
+            }
+        )
+        assert kwargs["QueryExecutionContext"]["Database"] == "sales"
+
+    # Taking the `athenaCatalog` fallback must not drag the rewrite along with it.
+    async def test_a_databricks_source_without_the_system_attribute_resolves_and_is_not_rewritten(self):
+        kwargs = await self._execute(
+            {
+                "sourceType": "DATABASE",
+                "sourceSubType": self._SUB_TYPE,
+                "athenaCatalog": "coadevds_dbx123",
+                "athenaDatabase": "sales",
+                "discoveredSchemas": ["sales"],
+                "queryable": True,
+            },
+            sql="SELECT COUNT(*) FROM sales_orders",
+        )
+        assert kwargs["QueryExecutionContext"]["Catalog"] == "coadevds_dbx123"
+        assert kwargs["QueryExecutionContext"]["Database"] == "sales"
+        assert "sales_orders" in kwargs["QueryString"]
+
+    # `public` is the default schema of the engines the federated-JDBC path serves, and
+    # is not a name a SQL Warehouse answers to.
+    async def test_databricks_falls_back_to_its_configured_database_not_public(self):
+        kwargs = await self._execute(
+            {
+                "sourceType": "DATABASE",
+                "sourceSubType": self._SUB_TYPE,
+                "athenaDataCatalogName": "coadevds_dbx123",
+                "configuration": '{"databaseName": "coa_dbx_test"}',
+                "queryable": True,
+            }
+        )
+        assert kwargs["QueryExecutionContext"]["Database"] == "coa_dbx_test"
+
+    async def test_databricks_source_that_is_not_queryable_is_skipped(self):
+        kwargs = await self._execute(
+            {
+                "sourceType": "DATABASE",
+                "sourceSubType": self._SUB_TYPE,
+                "athenaDataCatalogName": "coadevds_dbx123",
+                "athenaDatabase": "sales",
+                "discoveredSchemas": ["sales"],
+                "queryable": False,
+            }
+        )
+        assert kwargs["QueryExecutionContext"].get("Catalog") in (None, "AwsDataCatalog")
+
+    # The log is the only place this resolution is observable in a deployment, so the
+    # two connector-backed sub-types must not share a label.
+    async def test_the_resolution_log_names_the_sub_type(self):
+        with patch("coa_serve.clients.athena.logger") as mock_logger:
+            await self._execute(
+                {
+                    "sourceType": "DATABASE",
+                    "sourceSubType": self._SUB_TYPE,
+                    "athenaDataCatalogName": "coadevds_dbx123",
+                    "discoveredSchemas": ["sales"],
+                    "queryable": True,
+                }
+            )
+        paths = [c.kwargs.get("path") for c in mock_logger.info.call_args_list if c.args[:1] == ("catalog_resolution",)]
+        assert paths == ["databricks_sql_warehouse"]
+
+    async def test_a_custom_connector_still_logs_its_own_label(self):
+        with patch("coa_serve.clients.athena.logger") as mock_logger:
+            await self._execute(
+                {
+                    "sourceType": "DATABASE",
+                    "sourceSubType": "CUSTOM_CONNECTOR",
+                    "athenaDataCatalogName": "coadevds_abc123",
+                    "discoveredSchemas": ["widgets"],
+                    "queryable": True,
+                }
+            )
+        paths = [c.kwargs.get("path") for c in mock_logger.info.call_args_list if c.args[:1] == ("catalog_resolution",)]
+        assert paths == ["custom_connector"]
+
+
+@pytest.mark.unit
+class TestDatabricksQualifiedReferenceScope:
+    """The POSITIVE half of the namespace-qualifier check, through the executor.
+
+    Without it, "denied" would satisfy every scope test in the suite: what is asserted is
+    that given the pair a scanned Databricks source contributes, a correctly-qualified
+    query reaches Athena.
+    """
+
+    _SOURCE_ROW = {
+        "sourceType": "DATABASE",
+        "sourceSubType": "DATABRICKS_SQL_WAREHOUSE",
+        "athenaDataCatalogName": "coadevds_dbx1",
+        "athenaDatabase": "coa_dbx_test",
+        "discoveredSchemas": ["coa_dbx_test"],
+        "queryable": True,
+    }
+    _QUALIFIED_SQL = "SELECT COUNT(*) FROM coadevds_dbx1.coa_dbx_test.sales_orders"
+
+    async def test_a_qualified_query_within_the_namespace_scope_is_allowed(self):
+        executor, mock_athena = _executor_for_source_row(
+            self._SOURCE_ROW,
+            scope=SQLNamespaceScope(
+                native_databases=frozenset(),
+                federated_catalog_schemas=frozenset({("coadevds_dbx1", "coa_dbx_test")}),
+            ),
+        )
+
+        await executor.execute(self._QUALIFIED_SQL, namespace="ns-123")
+
+        mock_athena.start_query_execution.assert_called_once()
+        submitted = mock_athena.start_query_execution.call_args[1]["QueryString"]
+        # The qualifier survives to Athena, and the table name is not stripped on the
+        # way (the rewrite is off for this sub-type).
+        assert "coadevds_dbx1" in submitted
+        assert "sales_orders" in submitted
+
+    async def test_the_same_query_is_denied_when_the_pair_is_missing_from_the_scope(self):
+        """The scope pair is what allows it, not the sub-type and not the catalog name:
+        same SQL and source row, with only ``discoveredSchemas``' contribution removed.
+        """
+        executor, mock_athena = _executor_for_source_row(
+            self._SOURCE_ROW,
+            scope=SQLNamespaceScope(native_databases=frozenset(), federated_catalog_schemas=frozenset()),
+        )
+
+        with pytest.raises(AthenaQueryError, match="outside the requested namespace"):
+            await executor.execute(self._QUALIFIED_SQL, namespace="ns-123")
+
+        mock_athena.start_query_execution.assert_not_called()
+
+    async def test_a_foreign_databricks_catalog_is_denied(self):
+        """A Lambda-backed catalog is the first per-tenant catalog an injected qualifier
+        could usefully target, and the first that resolves a credential."""
+        executor, mock_athena = _executor_for_source_row(
+            self._SOURCE_ROW,
+            scope=SQLNamespaceScope(
+                native_databases=frozenset(),
+                federated_catalog_schemas=frozenset({("coadevds_dbx1", "coa_dbx_test")}),
+            ),
+        )
+
+        with pytest.raises(AthenaQueryError, match="outside the requested namespace"):
+            await executor.execute("SELECT COUNT(*) FROM coadevds_dbx2.other_tenant.sales_orders", namespace="ns-123")
+
+        mock_athena.start_query_execution.assert_not_called()
+
+
+@pytest.mark.unit
+class TestLegacySystemCatalogGlueRows:
+    """A native Glue row carrying the SYSTEM catalog attribute — a legacy shape.
+
+    `POST /sources` used to copy the caller's `glueConfiguration.athenaDataCatalogName`
+    into the top-level attribute and no longer does, so rows written before that change
+    still carry one.
+
+    Such a row reaches serve's federated arm with `caller_declared` False, so it is the one
+    shape that keying the configured-database fallback on the connector-backed set alone
+    would change: with a zero-table scan it would start resolving `public`, which names
+    nothing in its catalog.
+    """
+
+    async def _execute(self, item, sql="SELECT COUNT(*) FROM orders"):
+        return await _start_query_kwargs(item, sql)
+
+    async def test_a_zero_table_scan_keeps_its_configured_glue_database(self):
+        kwargs = await self._execute(
+            {
+                "sourceType": "DATABASE",
+                "sourceSubType": "GLUE_DATABASE",
+                "athenaDataCatalogName": "legacy_seeded_catalog",
+                "athenaDatabase": "sales",
+                "queryable": True,
+            }
+        )
+        assert kwargs["QueryExecutionContext"]["Catalog"] == "legacy_seeded_catalog"
+        assert kwargs["QueryExecutionContext"]["Database"] == "sales"
+
+    async def test_a_zero_table_scan_falls_back_to_the_configuration_blob(self):
+        """Same row without `athenaDatabase` — the Glue database is read from the blob."""
+        kwargs = await self._execute(
+            {
+                "sourceType": "DATABASE",
+                "sourceSubType": "GLUE_DATABASE",
+                "athenaDataCatalogName": "legacy_seeded_catalog",
+                "configuration": '{"databaseName": "sales"}',
+                "queryable": True,
+            }
+        )
+        assert kwargs["QueryExecutionContext"]["Database"] == "sales"
+
+    async def test_a_row_with_no_sub_type_at_all_keeps_its_configured_database(self):
+        """A row predating the `sourceSubType` attribute must not be reclassified as
+        federated JDBC and sent to `public`."""
+        kwargs = await self._execute(
+            {
+                "sourceType": "DATABASE",
+                "athenaDataCatalogName": "legacy_seeded_catalog",
+                "athenaDatabase": "sales",
+                "queryable": True,
+            }
+        )
+        assert kwargs["QueryExecutionContext"]["Database"] == "sales"
+
+    async def test_an_unrecognised_sub_type_falls_to_the_federated_default(self):
+        """A sub-type that does not exist yet cannot be assumed to record a database its
+        own catalog answers to, so it takes the federated-JDBC default rather than having
+        its configured value guessed at.
+        """
+        kwargs = await self._execute(
+            {
+                "sourceType": "DATABASE",
+                "sourceSubType": "SOME_FUTURE_WAREHOUSE",
+                "athenaDataCatalogName": "coadevds_future1",
+                "athenaDatabase": "whatever",
+                "queryable": True,
+            }
+        )
+        assert kwargs["QueryExecutionContext"]["Database"] == "public"
+
+
+@pytest.mark.unit
 class TestNestedGlueCatalogResolution:
     """A native Glue source whose database lives in a non-root catalog is addressed
     through that nested catalog, read from `athenaCatalog`.
@@ -1027,10 +1365,8 @@ class TestNestedGlueCatalogResolution:
     `database_routes._create_database_source`).
     """
 
-    # Same DDB/Athena wiring as the custom-connector class; re-wrapped as a
-    # staticmethod because reading it off the other class yields the plain function.
-    _execute = TestCustomConnectorCatalogResolution._execute
-    _wire = staticmethod(TestCustomConnectorCatalogResolution._wire)
+    async def _execute(self, item, sql="SELECT COUNT(*) FROM orders"):
+        return await _start_query_kwargs(item, sql)
 
     async def test_uses_the_declared_nested_catalog(self):
         kwargs = await self._execute(
@@ -1122,3 +1458,18 @@ class TestNestedGlueCatalogResolution:
             sql="SELECT COUNT(*) FROM BIRD_SALES_ORDERS",
         )
         assert '"orders"' in kwargs["QueryString"]
+
+
+@pytest.mark.unit
+def test_every_database_sub_type_but_native_glue_has_a_catalog_resolution_label():
+    """A sub-type missing from ``_CATALOG_PATH_LABELS`` logs as ``glue_nested`` via the
+    ``.get`` default with nothing raised, so this is the only tripwire possible.
+    ``glue_nested`` is right for exactly two shapes: a native Glue source in a nested
+    catalog, and a row with no ``sourceSubType``.
+    """
+    unlabelled = DATABASE_SUB_TYPES - set(_CATALOG_PATH_LABELS) - {DatabaseSubType.GLUE_DATABASE.value}
+    assert not unlabelled, (
+        f"DATABASE sub-type(s) {sorted(unlabelled)} have no catalog_resolution label and would log as "
+        "'glue_nested'. Add each to _CATALOG_PATH_LABELS in coa_serve.clients.athena."
+    )
+    assert set(_CATALOG_PATH_LABELS) >= CONNECTOR_BACKED_SUB_TYPES

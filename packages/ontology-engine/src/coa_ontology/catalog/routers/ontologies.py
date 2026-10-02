@@ -875,9 +875,19 @@ def upload_ontology_file(
     except IngestConflictError as e:
         # Race between the pre-check above and the ingest call — the
         # registry row appeared in between. Same 409 response.
-        raise HTTPException(409, f"{e}") from e
+        # Message stays opaque: the raw exception can carry Neptune/OpenSearch
+        # backend detail; log the full chain server-side instead.
+        log.exception("ontology_ingest_conflict")
+        raise HTTPException(
+            409,
+            "Registry conflict — an ingest for this ontology is already in progress or exists",
+        ) from e
     except IngestStoreError as e:
-        raise HTTPException(502, f"{e}") from e
+        # IngestStoreError wraps Neptune / OpenSearch / httpx failures whose
+        # str() embeds cluster URLs, VPC endpoint hostnames and TLS detail —
+        # keep server-side, return an opaque 502 to the caller.
+        log.exception("ontology_ingest_store_failed")
+        raise HTTPException(502, "Ontology ingest failed") from e
 
     return _to_response(result["registry"])
 

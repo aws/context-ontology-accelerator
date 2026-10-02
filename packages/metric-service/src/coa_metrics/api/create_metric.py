@@ -45,7 +45,12 @@ from coa_metrics.source_status import (
     check_source_approved,
     check_source_table_exists,
 )
-from coa_metrics.validator import check_data_modifying
+from coa_metrics.validator import (
+    BLOCKING_CHECKS,
+    check_data_modifying,
+    check_select_shape,
+    check_tier1_execution_shape,
+)
 
 setup_logging(os.environ.get("LOG_LEVEL", "INFO"))
 logger = structlog.get_logger(__name__)
@@ -127,8 +132,19 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     if existing is not None:
         return api_response(409, {"message": f"Metric '{metric.name}' already exists in namespace '{namespace}'"})
 
-    # Soft validation warnings (non-blocking)
-    warnings = _validate_soft(request, namespace)
+    # Validation findings. Only the SQL syntax + shape checks (1/1b) gate
+    # onboarding: the serve-time SQL firewall enforces the same SELECT-only rule,
+    # so a metric that fails them would be persisted only to fail at query time
+    # (#617/#1050). Block by check name (BLOCKING_CHECKS), not severity — the
+    # metadata checks (2-6) can also be ERROR-severity (e.g. table_reference on
+    # provable absence) but have their own dedicated gate (check_source_table_exists
+    # above) and must stay non-blocking here (Kun's review, !1133). Note
+    # _validate_soft surfaces the check name under the "field" key.
+    findings = _validate_soft(request, namespace)
+    blocking = [f for f in findings if f.get("field") in BLOCKING_CHECKS]
+    if blocking:
+        return api_response(400, {"message": blocking[0]["message"], "errors": blocking})
+    warnings = [f for f in findings if f.get("field") not in BLOCKING_CHECKS]
 
     # Resolve ontology concept names to full URIs (best-effort)
     if metric.ontology_concepts:
@@ -198,13 +214,22 @@ def _build_metric_definition(request: CreateMetricRequestContent, caller: str) -
         dialect_name = d.dialect.upper()
         if dialect_name not in VALID_SQL_DIALECTS:
             raise ValueError(invalid_dialect_message(d.dialect))
-        # Safety check: DML/DDL is the only hard block. A fragment or a parse
-        # error publishes with a soft warning (see _validate_soft) — the serve
-        # firewall independently rejects both at execution.
+        # Persistence must not depend on best-effort advisory validation.
+        # validate_soft includes catalog/ontology lookups and intentionally
+        # fails open when those are unavailable; enforce the pure SQL
+        # invariants here so an executable-shape error cannot be discarded
+        # together with an unrelated lookup failure.
         dml_error = check_data_modifying(d.expression, dialect_name)
         if dml_error:
             raise ValueError(dml_error)
+        shape_error = check_select_shape(d.expression, dialect_name)
+        if shape_error:
+            raise ValueError(shape_error)
         dialects.append(MetricDialect(dialect=dialect_name, expression=d.expression))
+
+    tier1_error = check_tier1_execution_shape([{"dialect": d.dialect, "expression": d.expression} for d in dialects])
+    if tier1_error:
+        raise ValueError(tier1_error)
 
     ai_context = None
     if request.ai_context:

@@ -4,6 +4,7 @@ packages:
   - "packages/mcp-proxy"
   - "infra"
   - "tests/cdk"
+  - "benchmarks/dashboard"
   - "smithy-generated/control-plane-typescript-client"
   - "smithy-generated/data-layer-typescript-client"
 allowBuilds:
@@ -66,3 +67,5 @@ overrides:
   browserslist: 4.28.8
   baseline-browser-mapping: 2.11.19
   "@babel/core": 7.29.7
+  # nx@22.7.7 pins smol-toml 1.6.1; 1.7.1 carries the CVE fix (same major).
+  "smol-toml@1.6.1": 1.7.1

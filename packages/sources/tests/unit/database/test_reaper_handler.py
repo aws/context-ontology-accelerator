@@ -13,10 +13,12 @@ the in-machine error chain having already run.
 from __future__ import annotations
 
 import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 from coa_control_plane_server.models.source_status import SourceStatus
+
+from tests.unit.conftest import dao_double  # noqa: E402
 
 MODULE = "coa_sources.database.pipeline.reaper_handler"
 
@@ -68,7 +70,7 @@ class TestReaperHandler:
         """A source still in an active status (ENRICHING) is driven to SCAN_FAILED."""
         from coa_sources.database.pipeline.reaper_handler import handler
 
-        dao = MagicMock()
+        dao = dao_double()
         dao.get.return_value = {"status": SourceStatus.ENRICHING}
         mock_get_dao.return_value = dao
 
@@ -88,7 +90,7 @@ class TestReaperHandler:
         """A source already in a terminal status is left untouched (idempotent)."""
         from coa_sources.database.pipeline.reaper_handler import handler
 
-        dao = MagicMock()
+        dao = dao_double()
         dao.get.return_value = {"status": SourceStatus.COMPLETED}
         mock_get_dao.return_value = dao
 
@@ -101,7 +103,7 @@ class TestReaperHandler:
         """A missing source row (already deleted) is a no-op, never a raise."""
         from coa_sources.database.pipeline.reaper_handler import handler
 
-        dao = MagicMock()
+        dao = dao_double()
         dao.get.return_value = None
         mock_get_dao.return_value = dao
 
@@ -115,7 +117,7 @@ class TestReaperHandler:
         a single bad event cannot poison the rule for subsequent ones."""
         from coa_sources.database.pipeline.reaper_handler import handler
 
-        dao = MagicMock()
+        dao = dao_double()
         mock_get_dao.return_value = dao
 
         handler(_event(status="TIMED_OUT", input_payload="{not valid json"), None)
@@ -128,7 +130,7 @@ class TestReaperHandler:
         """A missing detail.input is a no-op (nothing to reap), never a raise."""
         from coa_sources.database.pipeline.reaper_handler import handler
 
-        dao = MagicMock()
+        dao = dao_double()
         mock_get_dao.return_value = dao
 
         handler(_event(status="TIMED_OUT", input_payload=None), None)
@@ -141,7 +143,7 @@ class TestReaperHandler:
         """Parseable input that lacks namespaceId/sourceId is a no-op, never a raise."""
         from coa_sources.database.pipeline.reaper_handler import handler
 
-        dao = MagicMock()
+        dao = dao_double()
         mock_get_dao.return_value = dao
 
         handler(_event(status="FAILED", input_payload=json.dumps({"scanType": "full"})), None)
@@ -156,7 +158,7 @@ class TestReaperHandler:
         no-op, never an AttributeError — it must not reach the .get() lookups."""
         from coa_sources.database.pipeline.reaper_handler import handler
 
-        dao = MagicMock()
+        dao = dao_double()
         mock_get_dao.return_value = dao
 
         handler(_event(status="TIMED_OUT", input_payload=payload), None)
@@ -171,7 +173,7 @@ class TestReaperHandler:
         from botocore.exceptions import ClientError
         from coa_sources.database.pipeline.reaper_handler import handler
 
-        dao = MagicMock()
+        dao = dao_double()
         dao.get.side_effect = ClientError(
             {"Error": {"Code": "ThrottlingException", "Message": "slow down"}},
             "GetItem",

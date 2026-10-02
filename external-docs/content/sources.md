@@ -42,7 +42,8 @@ flowchart LR
 | JDBC | `JDBC_DATABASE` | SQL Server | Direct SQL or Athena federated |
 | JDBC | `JDBC_DATABASE` | Oracle | Athena federated only |
 | JDBC | `JDBC_DATABASE` | Snowflake | Athena federated only |
-| Custom connector | `CUSTOM_CONNECTOR` | Databricks SQL Warehouse — a ready-made connector ships in `connectors/databricks/` | Athena only (Lambda-backed catalog) |
+| Databricks | `DATABRICKS_SQL_WAREHOUSE` | Databricks SQL Warehouse — nothing to deploy, the connector is operated for you | Athena only (Lambda-backed catalog) |
+| Custom connector | `CUSTOM_CONNECTOR` | Databricks SQL Warehouse, deployed and operated by you from `connectors/databricks/` | Athena only (Lambda-backed catalog) |
 | Custom connector | `CUSTOM_CONNECTOR` | Any other source you can wrap in an Athena Query Federation SDK connector Lambda | Athena only (Lambda-backed catalog) |
 
 !!! tip "Sources with no native support"
@@ -79,15 +80,21 @@ comment placement and tag encoding for you, and a CDK construct that emits the r
 prefix and resource policies. [Custom Connector Sources](custom-connector-sources.md) is the
 contract that guide builds against.
 
-#### Databricks SQL Warehouse
+### Databricks SQL Warehouse
 
-A ready-made connector for Databricks SQL Warehouse ships with COA — you deploy it and register a
-`CUSTOM_CONNECTOR` source against it, rather than writing one yourself.
+Databricks has a source sub-type of its own, `DATABRICKS_SQL_WAREHOUSE`, and **nothing to
+deploy**: COA operates the connector, and onboarding is a form plus one IAM role. One source
+exposes one Unity Catalog schema. See
+[Databricks SQL Warehouse Sources](databricks-sources.md) for the Unity Catalog grants, both
+IAM policies, the authentication modes, and the cost and governance disclosures this route
+requires. That is the route to use.
 
-**Its runbook is `connectors/databricks/README.md` in your COA checkout**, not a page on this site:
-it covers deployment, creating the credential secret, the three Unity Catalog grants, registering
-the source, and the alarms the stack creates. Start from its *Quick start*. Four things to know
-before you plan around it:
+The same connector can also be **deployed and operated by you** and registered as a
+`CUSTOM_CONNECTOR` source — the shape earlier releases shipped. It remains supported and is not
+being withdrawn; if you already run it, you need do nothing. Its runbook is
+`connectors/databricks/README.md` in your COA checkout, not a page on this site: it covers
+deployment, creating the credential secret, the Unity Catalog grants, registering the source, and
+the alarms the stack creates. Four things to know before you plan around that route:
 
 - **One deployment serves one warehouse**, exposing one Unity Catalog catalog and either one
   pinned schema or every schema in that catalog. A second warehouse needs a second deployment.
@@ -96,7 +103,7 @@ before you plan around it:
   declared rather than from inference. Two limits: a table that declares no constraints
   contributes no keys, and a foreign key whose parent table lies outside the exposed schema is
   dropped. You encode nothing yourself — the connector handles the
-  [key-passing format](custom-connector-sources.md#declaring-primary-and-foreign-keys-in-column-comments)
+  [key-passing format](custom-connector-sources.md#declaring-keys-and-nullability-in-column-comments)
   custom connectors use, and removes any such tag already present in a Unity Catalog column
   comment so it cannot assert a key the warehouse never declared.
 - **Aggregations are computed in Athena, not in the warehouse.** Athena federation pushes
@@ -109,6 +116,13 @@ before you plan around it:
 - **Authentication is a personal access token or OAuth machine-to-machine**, chosen by the
   shape of the Secrets Manager secret you point it at: `{"token": …}` for a token,
   `{"client_id": …, "client_secret": …}` for OAuth. A secret carrying both is rejected.
+
+The last three of those are properties of reaching a warehouse through Athena federation at all,
+so they hold for the `DATABRICKS_SQL_WAREHOUSE` sub-type too — including the cost consequence,
+which [Databricks SQL Warehouse Sources](databricks-sources.md#cost-you-should-know-before-the-bill)
+states in full. What differs between the two routes is who deploys and pays for the connector,
+and how the credential is reached: the managed sub-type reads it through a role you own rather
+than granting the connector a direct read.
 
 ### Direct SQL vs Athena federated
 
@@ -488,6 +502,36 @@ on the tables that still need attention (`Pending review`) without scrolling
 past already-reviewed tables. The filter maps to the `reviewStatus` query
 parameter on **ListSourceTables** in the [API Reference](#/api-reference).
 
+### Partial enrichment (wide tables)
+
+Tables wider than 80 columns are enriched in parallel 50-column batches. If some
+batches succeed and at least one fails (e.g. a guardrail blocks one column's
+content, or a batch times out / fails to parse), the table is **still written
+back with the metadata that did succeed** — its description and the columns from
+the batches that completed — rather than being discarded. Only the failed
+batch's columns are left un-enriched. Such a table is a **partially enriched**
+table.
+
+How to tell a partial table apart from a fully-enriched or fully-failed one:
+
+- **Operational metric:** the enrichment job emits the CloudWatch metric
+  `TablesPartiallyEnriched` (count, per `Engine`/`NamespaceId` dimensions), and
+  the handler emits `TablesPartial`. A non-zero value means one or more wide
+  tables completed with some columns missing enrichment — expected occasionally
+  under guardrails, worth investigating if it spikes.
+- **Which tables:** the scan-job record carries an `enrichmentPartialTables`
+  field listing the affected `db.table` ids. The enrichment result also returns
+  `tables_partial` (count) and `partial_table_ids` (list) — see the
+  `table_enricher.run()` return contract.
+- **Steward action:** open each listed table in review; the columns from failed
+  batches will have no AI description and can be edited by hand or left for a
+  re-scan. A partial table is counted under **enriched** (not **failed**), so it
+  still enters review normally — the metric/field is the signal that its
+  metadata is incomplete.
+
+Fully-failed tables (no batch succeeded) are counted under **failed** and listed
+in `failed_table_ids` instead.
+
 ### List and Get Table Detail
 
 List all tables via `GET .../sources/{sourceId}/tables`, or get a single
@@ -501,9 +545,30 @@ table's full detail (technical + AI-enriched metadata, `reviewStatus`,
 `{ "decision": "REJECTED" }` — see **ReviewSourceTable** in the
 [API Reference](#/api-reference) for the full request/response shape.
 
-**Cascade behavior:**
-- **Approving** a table cascades to its `PENDING_REVIEW` columns. Columns you've explicitly `REJECTED` are preserved — they won't be flipped by a table-level approve.
-- **Rejecting** a table cascades to ALL non-rejected columns (including previously approved ones).
+**Cascade behavior** (columns and inferred relationships alike — an
+AI-inferred cross-source foreign key carries its own `reviewStatus`, and
+`PENDING_REVIEW` relationships are withheld from the ontology until approved):
+
+- **Approving** a table approves its columns **and** its inferred
+  relationships — including any that were previously `REJECTED`. Approving
+  the table means "approve this table and everything under it." If you want
+  a specific column or relationship left out, reject it AFTER the table
+  approve (per-column: `PUT .../columns/{columnName}/review`; per-relationship:
+  `PATCH .../tables/{tableId}/keys` with `reviewStatus: REJECTED` on that FK).
+- **Rejecting** a table rejects ALL of its columns and inferred relationships,
+  including previously approved ones.
+
+!!! note "Per-table approve vs. bulk source approve"
+    **Per-table approve** re-approves EVERY child of the table (columns and
+    inferred relationships), REJECTED or not. Use it when you want the whole
+    table live; if you later want a specific column or relationship out,
+    reject it afterwards.
+
+    **Bulk source approve** is the safer default: it only touches
+    `PENDING_REVIEW` children and preserves any explicit approvals or
+    rejections you already made. Use it when the source has many tables and
+    you have already made per-column / per-relationship decisions on the ones
+    that matter.
 
 ### Approve/Reject a Column
 
@@ -517,7 +582,7 @@ For sources with many tables, `POST .../sources/{sourceId}/approve` or
 `.../reject` bulk-processes all tables. Both return `202 Accepted` (see
 **ApproveSource** / **RejectSource** in the [API Reference](#/api-reference)):
 
-- **Approve:** the source enters `APPROVING` status while a background worker processes all tables. Poll the source status until it reaches `APPROVED`. Only `PENDING_REVIEW` tables and columns are touched — anything already explicitly approved or rejected is preserved.
+- **Approve:** the source enters `APPROVING` status while a background worker processes all tables. Poll the source status until it reaches `APPROVED`. Only `PENDING_REVIEW` tables, columns **and inferred relationships** (cross-source foreign keys) are touched — anything already explicitly approved or rejected is preserved. Approved relationships materialise as ontology edges on the next induction. To keep a specific relationship out of the ontology, reject it per-relationship via `PATCH .../tables/{tableId}/keys` (with `reviewStatus: REJECTED` on that FK) — bulk source approve leaves per-relationship rejects alone. If a cross-source pass on a newly-onboarded source proposes new relationships on a table whose parent source is already `APPROVED`, the tables list badges the count so a steward can drill in and review them per-table or per-relationship.
 - **Reject:** after completion, the source returns to `PENDING_REVIEW` (not `APPROVED`), allowing further review.
 
 ## Editing Metadata as a Steward
@@ -555,6 +620,11 @@ Edits follow a priority system. Higher-priority sources are never overwritten by
 
 !!! note
     Editing metadata does NOT change the review status. To approve after editing, make a separate `PUT /review` call. This is intentional — the "edit + approve" UX is two distinct actions.
+
+Edits reach the ontology on the next induction; accepting that proposal into
+an existing ontology **replaces** the previous description and synonyms rather
+than adding to them — see
+[Curating an ontology: re-induce and re-accept](ontologies.md#curating-an-ontology-re-induce-and-re-accept).
 
 ## Triggering Re-scans
 
@@ -758,7 +828,7 @@ guide (`connectors/README.md`) covers each in more depth.
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| Tables are discovered but no primary or foreign keys arrive | The discovery role has no `lambda:InvokeFunction` on the connector, so `DESCRIBE` — the only thing that reads the key tags — never ran | Grant the role named by `/{prefix}/sources/db-connector-role-arn`. Queries work without it, which is why this looks like a metadata problem rather than a permissions one |
+| Tables are discovered but no primary or foreign keys arrive | The discovery role has no `lambda:InvokeFunction` on the connector, so `DESCRIBE` — the only thing that reads the key tags — never ran | Grant the role named by `/{prefix}/{envName}/sources/db-connector-role-arn`. Queries work without it, which is why this looks like a metadata problem rather than a permissions one |
 | `DESCRIBE` returns names and types with no comment column | The connector put comments on the Arrow *field* rather than in the schema's metadata, where Athena reads them | Build the schema with the toolkit's `TableSchema`, which makes the working placement the only one expressible |
 | A large result returns **zero rows** with status `SUCCEEDED` | The connector could not write its spill: no `spill_bucket`, the wrong prefix, or no `s3:PutObject` under it | Check the Lambda's `spill_bucket` and that `spill_prefix` is `connectors/<id>/spills`; confirm objects appear there during a query |
 | `AccessDenied`, but only on large results | Spill is read with the *querying* role's credentials, not the connector's | Grant the serve and discovery roles `s3:GetObject` under the spill prefix and `kms:Decrypt` on the spill key |

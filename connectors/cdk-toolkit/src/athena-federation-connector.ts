@@ -1,9 +1,11 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 import * as fs from "fs";
+import * as path from "path";
 import * as cdk from "aws-cdk-lib";
 import * as cloudwatch from "aws-cdk-lib/aws-cloudwatch";
 import * as cloudwatchActions from "aws-cdk-lib/aws-cloudwatch-actions";
+import * as ec2 from "aws-cdk-lib/aws-ec2";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as kms from "aws-cdk-lib/aws-kms";
 import * as lambda from "aws-cdk-lib/aws-lambda";
@@ -22,39 +24,43 @@ import {
 /**
  * The key prefix a connector spills under: `connectors/{connectorId}/spills`.
  *
- * <p>Derived, not a setting. It is both what COA's spill-read grant matches and what this stack
- * grants the connector write access to, so the two cannot disagree — and disagreement is expensive:
- * <b>a connector that cannot write its spill returns `SUCCEEDED` with zero rows, not an error.</b>
- *
- * <p>Named after COA's layout rather than a conventional segment like `athena-federation-spill`,
- * which every published connector uses — a grant on that would reach spill data in unrelated
- * buckets. The id segment also lets COA grant per connector rather than by one wildcard.
+ * Not settable. COA's spill-read grant matches this exact shape, and the per-connector segment keeps one
+ * connector's read grant off another's spilled rows.
  */
 export function spillPrefixFor(connectorId: string): string {
   return `connectors/${connectorId}/spills`;
 }
 
 /**
- * Suffix every connector's Lambda name carries. A convention only — it grants nothing, since COA
- * scopes invoke on the {@link CONNECTOR_TAG_KEY} tag with a wildcard function name.
+ * Suffix every connector's Lambda name carries. A convention only: COA scopes invoke on the
+ * {@link CONNECTOR_TAG_KEY} tag with a wildcard function name.
  */
 export const CONNECTOR_FUNCTION_SUFFIX = "-coa-connector";
 
 /** Lambda's own limit on a function name. */
 const MAX_FUNCTION_NAME_LENGTH = 64;
 
+/** Default invocation timeout: room for a warehouse resume ahead of a large read. */
+const DEFAULT_TIMEOUT = cdk.Duration.minutes(10);
+
 /**
- * The intersection of what Lambda accepts in a function name and what CloudFormation accepts in a
- * stack name, because one call names both. Lambda alone would allow underscores and a leading digit;
- * CloudFormation would reject the stack after the jar had already been built and staged.
+ * Ceiling on the duration alarm's threshold, whatever the timeout.
+ *
+ * The threshold is normally 80% of the timeout, which stops detecting anything actionable once the
+ * timeout is minutes long: a connector 8 minutes into one protocol step has already lost the query.
+ */
+const MAX_DURATION_ALARM_THRESHOLD = cdk.Duration.seconds(60);
+
+/**
+ * What both Lambda and CloudFormation accept, because one call names the function and the stack.
+ * Lambda alone would allow underscores and a leading digit, and CloudFormation would then reject the
+ * stack after the jar had been built and staged.
  */
 const FUNCTION_NAME_PATTERN = /^[A-Za-z][A-Za-z0-9-]*$/;
 
 /**
- * The connector's Lambda name: `{prefix}{connectorId}{@link CONNECTOR_FUNCTION_SUFFIX}`.
- *
- * <p>Exported so an app names its stack with the same call. They must not drift: a second
- * deployment reusing the first's stack name replaces that connector rather than adding one.
+ * The connector's Lambda name: `{prefix}{connectorId}{@link CONNECTOR_FUNCTION_SUFFIX}`. An app names its
+ * stack with the same call, so a redeploy replaces the connector rather than adding one.
  *
  * @throws Error if the result cannot name both a Lambda and a CloudFormation stack.
  */
@@ -80,6 +86,12 @@ export function connectorFunctionName(
   return name;
 }
 
+/** Whether the construct creates an optional piece of a connector or leaves it out. */
+export enum Provisioning {
+  CREATE = "create",
+  NONE = "none",
+}
+
 /** Environment variables this construct sets itself; a caller may not also set them. */
 export const RESERVED_ENVIRONMENT_KEYS = [
   "JAVA_TOOL_OPTIONS",
@@ -89,6 +101,23 @@ export const RESERVED_ENVIRONMENT_KEYS = [
 ] as const;
 
 /** Properties for {@link AthenaFederationConnector}. */
+/**
+ * Where a VPC-attached connector runs. Grouped so a VPC cannot be given without its subnets.
+ */
+export interface ConnectorNetwork {
+  readonly vpc: ec2.IVpc;
+
+  /** Private subnets with egress. A Lambda in a public subnet gets no internet access at all. */
+  readonly subnets: ec2.ISubnet[];
+
+  /**
+   * Defaults to one security group created for the function, with HTTPS egress only: enough for
+   * the AWS APIs a connector calls and for an HTTPS-speaking source. A source on another port
+   * needs a group of your own.
+   */
+  readonly securityGroups?: ec2.ISecurityGroup[];
+}
+
 export interface AthenaFederationConnectorProps {
   /**
    * The connector's id — its folder name under `connectors/`. Every unique resource name derives
@@ -97,11 +126,9 @@ export interface AthenaFederationConnectorProps {
   readonly connectorId: string;
 
   /**
-   * Tells two deployments of the *same* connector apart when they share an account. A prefix rather
-   * than a settable name so the suffix convention survives; permissions do not depend on either.
-   *
-   * <p>Give the stack the same prefix — a second deployment reusing the first's stack name replaces
-   * it. {@link connectorFunctionName} derives both from one call.
+   * Tells two deployments of the *same* connector apart when they share an account. Give the stack
+   * the same prefix, through {@link connectorFunctionName}: a second deployment reusing the first's
+   * stack name replaces it.
    */
   readonly functionNamePrefix?: string;
 
@@ -112,47 +139,68 @@ export interface AthenaFederationConnectorProps {
   readonly jarPath: string;
 
   /**
-   * ARNs of every COA role that reaches this connector through Athena — normally two: **serve**,
-   * which runs the queries, and **discovery**, which runs `DESCRIBE` and so reads the `@pk` /
-   * `@fk` tags. Omit discovery and `SELECT` works while no declared key ever reaches COA.
-   *
-   * <p>Each gets `lambda:InvokeFunction` and spill read as **resource** policies, which is what
-   * makes the connector usable cross-account — that side is the only one this stack owns.
-   *
-   * <p>All principals get the same grant. `DESCRIBE` cannot spill, so discovery does not strictly
-   * need spill read, but a metadata-only grant breaks silently the moment discovery samples rows.
-   *
-   * <p>Empty deploys a connector nobody external can invoke; useful only for probing.
+   * ARNs of every COA role that reaches this connector through Athena: serve, which runs the queries, and
+   * discovery, which runs `DESCRIBE`. Each gets `lambda:InvokeFunction` plus spill read.
    */
   readonly queryRoleArns?: readonly string[];
 
-  /** Lambda runtime. Defaults to `java17`. */
+  /**
+   * Pins the execution role's name, for a connector whose role is named in someone else's trust
+   * policy: a generated name changes on any replacement, breaking every policy naming the old ARN at
+   * once with no repair from this side. At most 64 characters, IAM's limit.
+   */
+  readonly roleName?: string;
+
+  /**
+   * Lambda runtime. Defaults to `java21`, the oldest Java runtime still on Amazon Linux 2023.
+   * `java17` is the AL2 variant, and AL2 is past end of life.
+   */
   readonly runtime?: lambda.Runtime;
 
-  /** Invocation timeout. Defaults to 90 seconds. */
+  /**
+   * Instruction-set architecture. Defaults to `arm64`, which every Lambda COA's own `infra` deploys
+   * uses and which is cheaper per GB-second at the same memory.
+   *
+   * Safe for a pure-Java connector, and this one is: the fat jar's only native code is the Databricks
+   * driver's bundled lz4, which ships `linux/aarch64` alongside `linux/amd64`. Set `X86_64` if you add
+   * a dependency carrying an amd64-only native — the failure is an `UnsatisfiedLinkError` at the first
+   * invocation that reaches it, not at deploy.
+   */
+  readonly architecture?: lambda.Architecture;
+
+  /**
+   * Attaches the function to a VPC. Unset, it runs outside any VPC.
+   *
+   * Attached, the function reaches only what the subnets route to, so they need NAT or VPC endpoints
+   * for every service it calls: the source itself, S3 and KMS for spill, and whatever else the
+   * connector reads. A missing route shows up as the first query timing out, never at deploy.
+   */
+  readonly network?: ConnectorNetwork;
+
+  /** Invocation timeout. Defaults to 10 minutes. */
   readonly timeout?: cdk.Duration;
 
   /** Memory. Defaults to 1024 MB — enough to buffer a block before it spills. */
   readonly memorySize?: number;
 
   /**
-   * Whether the connector gets a spill bucket. Defaults to `"create"`.
+   * Whether the connector gets a spill bucket. Defaults to {@link Provisioning.CREATE}.
    *
-   * <p>`"none"` sets no `spill_bucket` — legitimate for a source that cannot exceed 6 MB, but know
-   * the failure mode: metadata and inline responses keep working, and a response needing to spill
-   * has been observed returning `SUCCEEDED` with **zero rows**, no exception, nothing logged.
-   *
-   * <p>Whether you can rule that out depends on the connector, not the data volume: one advertising
-   * no `LIMIT` push-down makes Athena request whole tables, so even `LIMIT 1000` can spill.
-   *
-   * <p>No option to share a bucket: one connector's read grant would cover another's spilled rows.
+   * Under {@link Provisioning.NONE} a response over Athena's 6 MB limit fails silently: the query returns
+   * `SUCCEEDED` with zero rows and nothing is logged.
    */
-  readonly spill?: "create" | "none";
+  readonly spill?: Provisioning;
 
   /**
-   * Connector-specific environment variables, from the connector's own stack — which is what keeps
-   * this construct free of any one connector's settings.
+   * What `cdk destroy` does to the spill bucket and its key. Defaults to
+   * {@link cdk.RemovalPolicy.DESTROY}, which also empties the bucket.
+   *
+   * `RETAIN` for production: a destroy takes the CMK and up to a day of spill with it, silently, and
+   * neither comes back.
    */
+  readonly spillRemovalPolicy?: cdk.RemovalPolicy;
+
+  /** Connector-specific environment variables, from the connector's own stack. */
   readonly environment?: Record<string, string>;
 
   /** Lambda description. */
@@ -160,20 +208,15 @@ export interface AthenaFederationConnectorProps {
 
   /**
    * Whether the connector gets the three Lambda health alarms — throttles, error rate, and duration
-   * against its own timeout. Defaults to `"create"`.
+   * against its own timeout. Defaults to {@link Provisioning.CREATE}.
    *
-   * <p>`"none"` for a deployment whose operator watches the function some other way. Note what is
-   * lost: one connector is shared by every source pointed at it, so a throttle is not one source
-   * degrading but all of them at once, and nothing else in COA can see that.
+   * {@link Provisioning.NONE} for a deployment whose operator watches the function some other way.
    */
-  readonly alarms?: "create" | "none";
+  readonly alarms?: Provisioning;
 
   /**
-   * SNS topic every alarm on this connector notifies. Optional, and **an alarm without it notifies
-   * nobody** — it changes state in the console and that is all.
-   *
-   * <p>Left optional rather than created here because the topic is where an alarm meets a rota, and
-   * this construct has no way to know whose. Supply one before treating the connector as operated.
+   * SNS topic every alarm on this connector notifies. **An alarm without one notifies nobody** — it
+   * changes state in the console and that is all.
    */
   readonly alarmTopicArn?: string;
 }
@@ -182,23 +225,14 @@ export interface AthenaFederationConnectorProps {
  * One Athena Query Federation connector: a Lambda and, by default, its own spill bucket and the
  * customer-managed key encrypting it.
  *
- * <p>COA's IAM is scoped to four things a deployment must get exactly right — a tag on the function,
- * the spill key prefix, a tagged customer-managed key, and three resource policies. Their failure
- * timing is asymmetric, which is the argument for a construct over a runbook: the
- * {@code coa:connector} tag denies the first scan, loudly, while the spill three fail only above
- * 6 MB, where a misconfigured connector looks healthy. A document can be half-followed; a template
- * that always emits all four cannot.
- *
- * <p>Each connector gets its own spill bucket, or none — never a shared one, since one connector's
- * read grant would cover another's spilled rows. The key is created here rather than accepted
- * because COA's key policy is scoped to a tag, and `aws/s3` can neither be tagged nor have its
- * policy edited.
+ * A construct rather than a runbook because the pieces COA's IAM is scoped to fail at different times: a
+ * missing `coa:connector` tag denies the first scan loudly, a missing spill grant only above 6 MB.
  */
 export class AthenaFederationConnector extends Construct {
   /** The connector Lambda. Register this ARN as an Athena `LAMBDA` data catalog. */
   public readonly connectorFunction: lambda.Function;
 
-  /** The connector's own spill bucket, unless `spill: "none"` was chosen. */
+  /** The connector's own spill bucket, unless {@link Provisioning.NONE} was chosen. */
   public readonly spillBucket?: s3.Bucket;
 
   /** The customer-managed key encrypting {@link spillBucket}, created alongside it. */
@@ -211,11 +245,9 @@ export class AthenaFederationConnector extends Construct {
   public readonly alarmTopic?: sns.ITopic;
 
   /**
-   * The function's name as a literal string.
-   *
-   * <p>Not the same as `connectorFunction.functionName`, which is a CloudFormation token even when the
-   * name was supplied — using that one in an alarm name yields an `Fn::Join` in the template, which
-   * resolves correctly but cannot be read by anyone looking for the alarm.
+   * The function's name as a literal string, unlike `connectorFunction.functionName`, which is a
+   * CloudFormation token even when the name was supplied. Using that one in an alarm name yields an
+   * `Fn::Join` that resolves correctly and cannot be read by anyone looking for the alarm.
    */
   public readonly functionName: string;
 
@@ -233,9 +265,6 @@ export class AthenaFederationConnector extends Construct {
       );
     }
 
-    // The spill prefix is fixed because COA's spill-read policy matches its shape. The name's
-    // suffix is only a convention — invoke is scoped on the coa:connector tag applied below.
-    // See spillPrefixFor and CONNECTOR_FUNCTION_SUFFIX.
     const functionName = connectorFunctionName(
       props.connectorId,
       props.functionNamePrefix,
@@ -243,12 +272,15 @@ export class AthenaFederationConnector extends Construct {
     const spillPrefix = spillPrefixFor(props.connectorId);
     this.functionName = functionName;
 
-    if ((props.spill ?? "create") === "create") {
+    // autoDeleteObjects follows this policy below — S3's L2 refuses RETAIN with auto-delete.
+    const spillRemovalPolicy = props.spillRemovalPolicy ?? cdk.RemovalPolicy.DESTROY;
+
+    if ((props.spill ?? Provisioning.CREATE) === Provisioning.CREATE) {
       // Customer-managed because COA's key policy is scoped to a tag. SSE-KMS is required.
       this.spillKey = new kms.Key(this, "SpillKey", {
         description: `Spill encryption for the "${props.connectorId}" COA connector`,
         enableKeyRotation: true,
-        removalPolicy: cdk.RemovalPolicy.DESTROY,
+        removalPolicy: spillRemovalPolicy,
       });
       cdk.Tags.of(this.spillKey).add(CONNECTOR_SPILL_KMS_TAG_KEY, CONNECTOR_TAG_VALUE);
 
@@ -264,21 +296,19 @@ export class AthenaFederationConnector extends Construct {
         lifecycleRules: [
           { id: "expire-spill", expiration: cdk.Duration.days(1), enabled: true },
         ],
-        // Retaining it would leave a bucket behind on every `cdk destroy`.
-        removalPolicy: cdk.RemovalPolicy.DESTROY,
-        autoDeleteObjects: true,
+        removalPolicy: spillRemovalPolicy,
+        autoDeleteObjects: spillRemovalPolicy === cdk.RemovalPolicy.DESTROY,
       });
     }
 
     const environment: Record<string, string> = {
-      // MANDATORY on Java 17+. Arrow reaches into java.nio internals, and without this
-      // metadata calls succeed while every read fails with "Failed to initialize
-      // MemoryUtil" — which presents as "discovery works, queries are broken".
+      // MANDATORY on Java 17+. Arrow reaches into java.nio internals, and without this metadata
+      // calls succeed while every read fails with "Failed to initialize MemoryUtil" — which
+      // presents as "discovery works, queries are broken".
       JAVA_TOOL_OPTIONS: "--add-opens=java.base/java.nio=ALL-UNNAMED",
       spill_prefix: spillPrefix,
-      // Explicit rather than left to the SDK's default. The key is generated per query and rides
-      // on the Split, so it costs no KMS calls and needs no grant — client-side encryption of the
-      // block, independent of the bucket's SSE-KMS above.
+      // Client-side encryption of each block, independent of the bucket's SSE-KMS above: the key is
+      // generated per query and rides on the Split, so it costs no KMS calls and needs no grant.
       disable_spill_encryption: "false",
     };
     if (this.spillBucket !== undefined) {
@@ -297,24 +327,43 @@ export class AthenaFederationConnector extends Construct {
       environment[key] = value;
     }
 
+    // Lambda counts a deployment package's EXTRACTED size against its 250 MB limit and does not
+    // extract a nested jar, so the fat jar ships as `lib/<jar>`: on the Java runtime's classpath,
+    // counted at its own size. A fresh temp directory each time, because the asset hash is over
+    // directory contents and a reused one would carry a previous build's jar in as a second copy.
+    const packageDir = cdk.FileSystem.mkdtemp("coa-connector-");
+    fs.mkdirSync(path.join(packageDir, "lib"));
+    fs.copyFileSync(
+      props.jarPath,
+      path.join(packageDir, "lib", path.basename(props.jarPath)),
+      fs.constants.COPYFILE_FICLONE,
+    );
+
+    const network = props.network;
+    const securityGroups =
+      network === undefined
+        ? undefined
+        : (network.securityGroups ?? [this.httpsOnlySecurityGroup(network.vpc)]);
+
     this.connectorFunction = new lambda.Function(this, "Function", {
       functionName,
-      runtime: props.runtime ?? lambda.Runtime.JAVA_17,
+      vpc: network?.vpc,
+      vpcSubnets: network === undefined ? undefined : { subnets: network.subnets },
+      securityGroups,
+      runtime: props.runtime ?? lambda.Runtime.JAVA_21,
+      architecture: props.architecture ?? lambda.Architecture.ARM_64,
       handler: props.handler,
-      // fromAsset on a .jar uploads the archive as-is to the CDK asset bucket; the JAR is
-      // far too large to inline into the template.
-      code: lambda.Code.fromAsset(props.jarPath),
-      timeout: props.timeout ?? cdk.Duration.seconds(90),
+      code: lambda.Code.fromAsset(packageDir),
+      timeout: props.timeout ?? DEFAULT_TIMEOUT,
       memorySize: props.memorySize ?? 1024,
       environment,
-      // An explicit log group rather than `logRetention`, which is deprecated and provisions
-      // a custom-resource Lambda to set retention after the fact.
+      // An explicit log group rather than `logRetention`, which is deprecated and provisions a
+      // custom-resource Lambda to set retention after the fact.
       logGroup: new logs.LogGroup(this, "LogGroup", {
-        // Named where anyone would look. Left to CDK it gets a generated name, and every
-        // "check the connector's CloudWatch logs" instruction leads nowhere — which matters most
-        // on exactly the paths that fail without an error.
+        // Named where anyone would look: left to CDK it gets a generated name, and every "check the
+        // connector's CloudWatch logs" instruction leads nowhere.
         logGroupName: `/aws/lambda/${functionName}`,
-        retention: logs.RetentionDays.ONE_WEEK,
+        retention: logs.RetentionDays.ONE_MONTH,
         removalPolicy: cdk.RemovalPolicy.DESTROY,
       }),
       description:
@@ -322,13 +371,16 @@ export class AthenaFederationConnector extends Construct {
         `Athena Query Federation connector "${props.connectorId}"`,
     });
 
+    if (props.roleName !== undefined) {
+      this.pinRoleName(props.roleName, functionName);
+    }
+
     // The control that fails fast: COA's invoke policy matches this tag, so without it nothing
     // can invoke the function and the first scan is denied.
     cdk.Tags.of(this.connectorFunction).add(CONNECTOR_TAG_KEY, CONNECTOR_TAG_VALUE);
 
     if (this.spillBucket !== undefined && this.spillKey !== undefined) {
-      // Scoped to the prefix; grantReadWrite on a KMS bucket also grants this role the key access
-      // it needs to write.
+      // grantReadWrite on a KMS bucket also grants the key access this role needs to write.
       this.spillBucket.grantReadWrite(this.connectorFunction, `${spillPrefix}/*`);
       // Named explicitly too: it is the grant COA's contract calls for, and a reader will look for
       // it rather than infer it from grantReadWrite's side effects.
@@ -340,8 +392,8 @@ export class AthenaFederationConnector extends Construct {
           resources: ["*"],
         }),
       );
-      // The SDK's SpillLocationVerifier calls HeadBucket before returning splits, which needs s3:ListBucket — a
-      // bucket-level call grantReadWrite's object pattern does not cover on every CDK version.
+      // The SDK's SpillLocationVerifier calls HeadBucket before returning splits, which needs
+      // s3:ListBucket — a bucket-level call grantReadWrite's object pattern does not always cover.
       this.connectorFunction.addToRolePolicy(
         new iam.PolicyStatement({
           sid: "SpillBucketLocate",
@@ -356,22 +408,14 @@ export class AthenaFederationConnector extends Construct {
     if (props.alarmTopicArn !== undefined) {
       this.alarmTopic = sns.Topic.fromTopicArn(this, "AlarmTopic", props.alarmTopicArn);
     }
-    if ((props.alarms ?? "create") === "create") {
-      this.createLambdaAlarms(props.timeout ?? cdk.Duration.seconds(90));
+    if ((props.alarms ?? Provisioning.CREATE) === Provisioning.CREATE) {
+      this.createLambdaAlarms(props.timeout ?? DEFAULT_TIMEOUT);
     }
 
     new cdk.CfnOutput(this, "ConnectorFunctionArn", {
       value: this.connectorFunction.functionArn,
       description:
         "Register this ARN as an Athena LAMBDA data catalog in the querying account",
-    });
-    // A command, not an AWS::Athena::DataCatalog: the catalog belongs to whichever account runs
-    // the queries, which is usually not this one. Underscores because catalog names reject hyphens.
-    new cdk.CfnOutput(this, "RegisterCatalogCommand", {
-      value:
-        `aws athena create-data-catalog --name ${props.connectorId.replace(/-/g, "_")} ` +
-        `--type LAMBDA --parameters function=${this.connectorFunction.functionArn}`,
-      description: "Run this in the account that will query the connector",
     });
     new cdk.CfnOutput(this, "SpillBucketName", {
       value:
@@ -382,15 +426,43 @@ export class AthenaFederationConnector extends Construct {
   }
 
   /**
+   * Renames the role this construct's Lambda L2 created. The L2 only accepts a whole role through
+   * `role`, and a role passed that way gets none of the managed policies the L2 attaches to its own.
+   */
+  private httpsOnlySecurityGroup(vpc: ec2.IVpc): ec2.SecurityGroup {
+    const group = new ec2.SecurityGroup(this, "SecurityGroup", {
+      vpc,
+      description: "Athena federation connector - HTTPS egress only",
+      allowAllOutbound: false,
+    });
+    group.addEgressRule(
+      ec2.Peer.anyIpv4(),
+      ec2.Port.tcp(443),
+      "HTTPS: the source and the AWS APIs the connector calls",
+    );
+    return group;
+  }
+
+  private pinRoleName(roleName: string, functionName: string): void {
+    const cfnRole = this.connectorFunction.role?.node.defaultChild;
+    if (!(cfnRole instanceof iam.CfnRole)) {
+      throw new Error(
+        `Cannot pin the execution role name of "${functionName}" to "${roleName}": its role was not ` +
+          `created by this construct. Drop roleName, or name the role you passed in.`,
+      );
+    }
+    cfnRole.roleName = roleName;
+  }
+
+  /**
    * One of the connector's own EMF metrics, dimensioned to this connector.
    *
-   * <p>Use this rather than building a {@link cloudwatch.Metric} by hand: the namespace and the
-   * dimension name have to match what the jar emits, and a mismatch is invisible — the alarm sits in
-   * `INSUFFICIENT_DATA` forever rather than failing.
+   * Use this rather than a hand-built {@link cloudwatch.Metric}: the namespace and the dimension
+   * name have to match what the jar emits, and a mismatch leaves the alarm in `INSUFFICIENT_DATA`
+   * for ever rather than failing.
    *
-   * @param catalog restricts the metric to one Athena catalog. Omit for the fleet-wide view, which is
-   *                the only one available for metrics emitted below the request — a connect failure,
-   *                for instance, has no catalog on it.
+   * @param catalog restricts the metric to one Athena catalog. Omit for the fleet-wide view, the
+   *                only one available for metrics emitted below the request.
    */
   public connectorMetric(
     metricName: string,
@@ -411,9 +483,8 @@ export class AthenaFederationConnector extends Construct {
   /**
    * Adds an alarm, wired to {@link alarmTopic} if there is one and recorded in {@link alarms}.
    *
-   * <p>Exists so a connector's own stack cannot add an alarm that notifies nobody while the three
-   * created here do — the topic is held by this construct, and forgetting to attach it produces an
-   * alarm that looks configured and pages no one.
+   * The topic is held by this construct, so a connector's own stack cannot add an alarm that looks
+   * configured and pages nobody.
    */
   public addAlarm(id: string, props: cloudwatch.AlarmProps): cloudwatch.Alarm {
     const alarm = new cloudwatch.Alarm(this, id, props);
@@ -427,9 +498,8 @@ export class AthenaFederationConnector extends Construct {
   /**
    * The three alarms that apply to any connector, whatever it talks to.
    *
-   * <p>Thresholds are deliberately not tunable. Each is anchored to something structural — zero, one
-   * percent, or a fraction of this function's own timeout — rather than to a workload, so there is
-   * nothing for a caller to know better.
+   * Thresholds are deliberately not tunable: each is anchored to something structural — zero, one
+   * percent, or a fraction of this function's own timeout — rather than to a workload.
    */
   private createLambdaAlarms(timeout: cdk.Duration): void {
     const period = cdk.Duration.minutes(5);
@@ -471,15 +541,20 @@ export class AthenaFederationConnector extends Construct {
       treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
     });
 
-    // Against this function's own timeout rather than a fixed number of seconds, because the timeout
-    // is a per-connector decision and a timed-out invocation is the worst diagnosis available: it
-    // names no table, suggests no action, and Athena retries it.
-    const warningMillis = Math.round(timeout.toMilliseconds() * 0.8);
+    // Against this function's own timeout rather than a fixed number of seconds, because a timed-out
+    // invocation is the worst diagnosis available: it names no table, suggests no action, and Athena
+    // retries it. Capped, so a timeout sized for a warehouse resume does not push the threshold past
+    // the point where an alert is still worth acting on.
+    const warningMillis = Math.min(
+      Math.round(timeout.toMilliseconds() * 0.8),
+      MAX_DURATION_ALARM_THRESHOLD.toMilliseconds(),
+    );
     this.addAlarm("DurationAlarm", {
       alarmName: `${this.functionName}-duration-p99`,
       alarmDescription:
-        `p99 invocation duration is within 20% of the ${timeout.toSeconds()}s timeout. Past it, ` +
-        "queries fail as timeouts that name nothing and are retried at full cost.",
+        `p99 invocation duration is over ${Math.round(warningMillis / 1000)}s, against a ` +
+        `${timeout.toSeconds()}s timeout. Past the timeout, queries fail as timeouts that name ` +
+        "nothing and are retried at full cost.",
       metric: this.connectorFunction.metricDuration({ period, statistic: "p99" }),
       threshold: warningMillis,
       comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
@@ -490,22 +565,15 @@ export class AthenaFederationConnector extends Construct {
 
   /**
    * Lets COA's querying principals reach this connector. Three resource policies per principal,
-   * because a cross-account principal needs an allow from both sides and this stack owns one:
+   * because a cross-account principal needs an allow from both sides and this stack owns one: the
+   * Lambda's, so Athena can invoke as that principal; the bucket's `s3:GetObject` under the spill
+   * prefix, since spill objects are read with the *querying* role's credentials; and the key's
+   * `kms:Decrypt`, since the bucket is SSE-KMS.
    *
-   * <ul>
-   *   <li>the Lambda's, so Athena can invoke as that principal. Both roles need it — granting only
-   *       discovery lets registration and induction pass, then fails the first query;</li>
-   *   <li>the bucket's, `s3:GetObject` under the spill prefix, since spill objects are read with the
-   *       <i>querying</i> role's credentials;</li>
-   *   <li>the key's, `kms:Decrypt`, since the bucket is SSE-KMS.</li>
-   * </ul>
-   *
-   * <p>The key condition is `kms:ViaService`, not `aws:CalledVia`: under bucket-level SSE-KMS the
-   * immediate KMS caller is S3, not Athena, so `aws:CalledVia` would depend on undocumented
-   * behaviour and fail closed on every spilled query.
-   *
-   * <p>Written explicitly rather than via `bucket.grantRead()`, which on a KMS bucket also calls
-   * `grantDecrypt()` and would add an <b>unconditioned</b> `kms:Decrypt`, defeating that condition.
+   * The key condition is `kms:ViaService`, because under bucket-level SSE-KMS the immediate KMS
+   * caller is S3 and `aws:CalledVia` would depend on undocumented behaviour. The statements are
+   * written out by hand because `bucket.grantRead()` on a KMS bucket also calls `grantDecrypt()`,
+   * adding an **unconditioned** `kms:Decrypt` that defeats the condition.
    */
   private grantQueryAccess(
     queryRoleArns: readonly string[],
@@ -513,13 +581,8 @@ export class AthenaFederationConnector extends Construct {
   ): void {
     const viaS3 = `s3.${cdk.Stack.of(this).region}.amazonaws.com`;
 
-    // Deduplicated here, not only in env.ts: one role may do both COA jobs, and grantInvoke derives
-    // its construct id from the principal, so the same ARN twice fails synth with a duplicate-id
-    // error rather than anything that names the cause.
-    // Sorted as well as deduplicated. A Set iterates in insertion order, so this is not about
-    // determinism within a run — it is so the index in the Sids below does not depend on the order
-    // an operator happened to list the ARNs in, which would otherwise rewrite the bucket and key
-    // policies on a no-op deploy.
+    // Deduped (grantInvoke's construct id derives from the principal) and sorted (the Sid indexes
+    // below must not depend on the order the ARNs arrived in).
     const unique = [...new Set(queryRoleArns)].sort();
 
     unique.forEach((roleArn, index) => {

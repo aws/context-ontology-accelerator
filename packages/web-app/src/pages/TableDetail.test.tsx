@@ -10,13 +10,17 @@ import { TableDetail } from "./TableDetail";
 const mockUseGetSource = vi.fn();
 const mockUseGetSourceTable = vi.fn();
 const mockUpdateKeysMutate = vi.fn();
+const mockUpdateTableMetaMutate = vi.fn();
 
 vi.mock("@api-hooks", () => ({
   useGetSourceTable: () => mockUseGetSourceTable(),
   useGetSource: () => mockUseGetSource(),
   useReviewSourceTable: () => ({ mutate: vi.fn(), isPending: false }),
   useReviewSourceColumn: () => ({ mutate: vi.fn(), isPending: false }),
-  useUpdateSourceTableMetadata: () => ({ mutate: vi.fn(), isPending: false }),
+  useUpdateSourceTableMetadata: () => ({
+    mutate: mockUpdateTableMetaMutate,
+    isPending: false,
+  }),
   useUpdateSourceColumnMetadata: () => ({ mutate: vi.fn(), isPending: false }),
   useUpdateSourceTableKeys: () => ({
     mutate: mockUpdateKeysMutate,
@@ -103,6 +107,7 @@ const wrapper = ({ children }: { children: React.ReactNode }) => (
 
 beforeEach(() => {
   mockUpdateKeysMutate.mockReset();
+  mockUpdateTableMetaMutate.mockReset();
   mockUseGetSourceTable.mockReset();
   mockUseGetSourceTable.mockReturnValue({
     data: baseTableData,
@@ -184,6 +189,43 @@ describe("TableDetail keys & relationships", () => {
       (f: { column: string }) => f.column === "customer_id",
     );
     expect(fk.reviewStatus).toBe("APPROVED");
+  });
+
+  it("keeps a long inference note to one line with the full text on demand", () => {
+    const long =
+      "entitlement.tenant_id description states it maps to a customer via account_xref; " +
+      "mart_customer_360 is the customer master keyed by ba_no, making it the target for resolution.";
+    mockUseGetSourceTable.mockReturnValue({
+      data: {
+        ...baseTableData,
+        foreignKeys: [
+          {
+            column: "customer_id",
+            targetTable: "customers",
+            targetColumn: "id",
+            source: "AI_INFERRED",
+            confidence: 0.7,
+            reviewStatus: "PENDING_REVIEW",
+            targetDatasourceId: "DS#crm",
+            provenance: long,
+          },
+        ],
+      },
+      isLoading: false,
+      error: null,
+    });
+    render(<TableDetail />, { wrapper });
+
+    // The paragraph is NOT rendered inline — only a clipped one-liner is.
+    expect(screen.queryByText(long)).not.toBeInTheDocument();
+    const clipped = screen.getByText(
+      /^entitlement\.tenant_id description states.*…$/,
+    );
+    expect(clipped.textContent!.length).toBeLessThan(long.length);
+
+    // The full note is one click away.
+    fireEvent.click(clipped);
+    expect(screen.getByText(long)).toBeInTheDocument();
   });
 });
 
@@ -437,5 +479,98 @@ describe("TableDetail re-scan diff (old vs new)", () => {
     expect(statusRow?.textContent).toContain("Pending deletion");
     expect(statusRow?.textContent).toContain("Keep");
     expect(statusRow?.textContent).not.toContain("Removed");
+  });
+});
+
+describe("TableDetail synonyms editor (steward-curation supersede)", () => {
+  it("pre-fills stored synonyms, 'Clear all' empties them, and Save sends an empty list", () => {
+    mockUseGetSourceTable.mockReturnValue({
+      data: {
+        ...baseTableData,
+        businessMetadata: {
+          description: "AI: order records",
+          enrichmentSource: "AI_GENERATED",
+          synonyms: ["orders_table", "order_dimension"],
+        },
+      },
+      isLoading: false,
+      error: null,
+    });
+    render(<TableDetail />, { wrapper });
+    // Open the table editor — the table-level "Edit" in the metadata header is
+    // the first "Edit" button; the per-column rows each have their own.
+    fireEvent.click(screen.getAllByRole("button", { name: /^edit$/i })[0]);
+    expect(screen.getByText("Edit table: orders")).toBeInTheDocument();
+
+    // AI-generated synonyms are pre-filled as tokens.
+    expect(screen.getByText("orders_table")).toBeInTheDocument();
+    expect(screen.getByText("order_dimension")).toBeInTheDocument();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /clear all synonyms/i }),
+    );
+    expect(screen.queryByText("orders_table")).not.toBeInTheDocument();
+    expect(screen.queryByText("order_dimension")).not.toBeInTheDocument();
+    // Nothing left to clear: the affordance goes away.
+    expect(
+      screen.queryByRole("button", { name: /clear all synonyms/i }),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    expect(mockUpdateTableMetaMutate).toHaveBeenCalledTimes(1);
+    const [payload] = mockUpdateTableMetaMutate.mock.calls[0];
+    expect(payload.overrides.synonyms).toEqual([]);
+    expect(payload.overrides.description).toBe("AI: order records");
+  });
+
+  it("does not offer 'Clear all' when there are no synonyms", () => {
+    render(<TableDetail />, { wrapper });
+    fireEvent.click(screen.getAllByRole("button", { name: /^edit$/i })[0]);
+    expect(screen.getByText("Edit table: orders")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /clear all synonyms/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("moves keyboard focus to the synonyms input when 'Clear all' unmounts itself", async () => {
+    // `Clear all` is conditional on `items.length > 0`, so clicking it
+    // removes the button — a keyboard user with focus on the button would
+    // lose their place. The component should move focus to the synonyms
+    // input, which stays mounted and is the natural next thing to
+    // interact with.
+    mockUseGetSourceTable.mockReturnValue({
+      data: {
+        ...baseTableData,
+        businessMetadata: {
+          description: "AI: order records",
+          enrichmentSource: "AI_GENERATED",
+          synonyms: ["orders_table"],
+        },
+      },
+      isLoading: false,
+      error: null,
+    });
+    render(<TableDetail />, { wrapper });
+    fireEvent.click(screen.getAllByRole("button", { name: /^edit$/i })[0]);
+    // The table-level SynonymsField uses this placeholder;
+    // Cloudscape's <Input> renders as an ordinary <input> element.
+    const inputBefore = document.querySelector(
+      'input[placeholder="e.g. customers_table"]',
+    ) as HTMLInputElement | null;
+    expect(inputBefore).not.toBeNull();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /clear all synonyms/i }),
+    );
+
+    // Wait for the requestAnimationFrame in handleClear to run
+    // (rAF fires synchronously via jsdom's polyfill in tests).
+    await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+
+    const inputAfter = document.querySelector(
+      'input[placeholder="e.g. customers_table"]',
+    ) as HTMLInputElement | null;
+    expect(inputAfter).not.toBeNull();
+    expect(document.activeElement).toBe(inputAfter);
   });
 });

@@ -237,7 +237,9 @@ class TestTestConnection:
         result = connector.test_connection(base_config)
 
         assert result.success
-        mock_boto3.client.assert_called_with("sts", region_name="us-east-1")
+        # config=None is the discovery path's default; only a synchronous customer-path
+        # caller passes the fail-fast preset.
+        mock_boto3.client.assert_called_with("sts", region_name="us-east-1", config=None)
         # The session name reaches the data owner's CloudTrail, so it names the
         # requesting namespace rather than a fixed connector string.
         mock_sts.assume_role.assert_called_once_with(

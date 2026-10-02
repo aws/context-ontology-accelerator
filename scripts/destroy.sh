@@ -84,7 +84,11 @@ CONTEXT="--context env=$ENV"
 CFN_LIVE_STATUSES="CREATE_COMPLETE UPDATE_COMPLETE UPDATE_ROLLBACK_COMPLETE ROLLBACK_COMPLETE \
 CREATE_FAILED UPDATE_FAILED DELETE_FAILED ROLLBACK_FAILED UPDATE_ROLLBACK_FAILED \
 IMPORT_COMPLETE IMPORT_ROLLBACK_COMPLETE IMPORT_ROLLBACK_FAILED"
-CONNECTOR_DELETE_WAIT_MAX_SECONDS="${SCL_CONNECTOR_DELETE_WAIT_MAX_SECONDS:-600}"
+# 30 minutes, longer than the other budgets, because the COA-operated Databricks connector is
+# VPC-attached: its security group cannot be deleted until Lambda releases the function's ENIs,
+# which can take up to 20 minutes. Giving up sooner leaves the group behind, and step 7 then fails
+# to delete the VPC it sits in.
+CONNECTOR_DELETE_WAIT_MAX_SECONDS="${SCL_CONNECTOR_DELETE_WAIT_MAX_SECONDS:-1800}"
 
 ENI_WAIT_MAX_SECONDS="${SCL_ENI_WAIT_MAX_SECONDS:-600}"
 ENI_POLL_INTERVAL_SECONDS=15
@@ -170,7 +174,7 @@ if [ ${#AGENTCORE_SG_IDS[@]} -eq 0 ]; then
   while IFS= read -r SG_ID; do
     [ -n "$SG_ID" ] && AGENTCORE_SG_IDS+=("$SG_ID")
   done < <(aws ec2 describe-security-groups --region "$REGION" \
-    --filters "Name=group-name,Values=*AgentCoreSG*,*McpSG*" \
+    --filters "Name=group-name,Values=${STACK_PREFIX}-*AgentCoreSG*,${STACK_PREFIX}-*McpSG*" \
     --query 'SecurityGroups[].GroupId' --output text 2>/dev/null | tr '\t' '\n')
 fi
 

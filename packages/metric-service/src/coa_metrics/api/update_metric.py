@@ -41,7 +41,12 @@ from coa_metrics.source_status import (
     check_source_approved,
     check_source_table_exists,
 )
-from coa_metrics.validator import check_data_modifying
+from coa_metrics.validator import (
+    BLOCKING_CHECKS,
+    check_data_modifying,
+    check_select_shape,
+    check_tier1_execution_shape,
+)
 
 setup_logging(os.environ.get("LOG_LEVEL", "INFO"))
 logger = structlog.get_logger(__name__)
@@ -120,8 +125,17 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     if source_error:
         return api_response(400, {"message": source_error})
 
-    # Soft validation warnings
-    warnings = _validate_soft(request, namespace)
+    # Validation findings — block only on the SQL syntax + shape checks
+    # (BLOCKING_CHECKS), matching create and the serve firewall (#617/#1050).
+    # Block by check name, not severity, so an ERROR-severity metadata check
+    # (e.g. table_reference on provable absence) does not 400 here — it has its
+    # own dedicated gate (check_source_table_exists) (Kun's review, !1133).
+    # _validate_soft surfaces the check name under the "field" key.
+    findings = _validate_soft(request, namespace)
+    blocking = [f for f in findings if f.get("field") in BLOCKING_CHECKS]
+    if blocking:
+        return api_response(400, {"message": blocking[0]["message"], "errors": blocking})
+    warnings = [f for f in findings if f.get("field") not in BLOCKING_CHECKS]
 
     # Resolve ontology concept names to full URIs (best-effort)
     if metric.ontology_concepts:
@@ -186,13 +200,19 @@ def _build_updated_metric(
         dialect_name = d.dialect.upper()
         if dialect_name not in VALID_SQL_DIALECTS:
             raise ValueError(invalid_dialect_message(d.dialect))
-        # Safety check: DML/DDL is the only hard block. A fragment or a parse
-        # error publishes with a soft warning (see _validate_soft) — the serve
-        # firewall independently rejects both at execution.
+        # Keep the persistence invariant independent from best-effort
+        # catalog/ontology validation; see create_metric._build_metric_definition.
         dml_error = check_data_modifying(d.expression, dialect_name)
         if dml_error:
             raise ValueError(dml_error)
+        shape_error = check_select_shape(d.expression, dialect_name)
+        if shape_error:
+            raise ValueError(shape_error)
         dialects.append(MetricDialect(dialect=dialect_name, expression=d.expression))
+
+    tier1_error = check_tier1_execution_shape([{"dialect": d.dialect, "expression": d.expression} for d in dialects])
+    if tier1_error:
+        raise ValueError(tier1_error)
 
     ai_context = None
     if request.ai_context:

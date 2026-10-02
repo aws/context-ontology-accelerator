@@ -54,6 +54,44 @@ describe("GuardrailStack", () => {
     });
   });
 
+  test("primary guardrail denies out-of-scope topics", () => {
+    template.hasResourceProperties("AWS::Bedrock::Guardrail", {
+      Name: `${DEFAULT_RESOURCE_PREFIX}-${DEFAULT_ENV}-guardrail`,
+      TopicPolicyConfig: {
+        TopicsConfig: [
+          { Name: "System internals disclosure", Type: "DENY" },
+          { Name: "Malicious code generation", Type: "DENY" },
+        ],
+      },
+    });
+  });
+
+  test("primary guardrail enables contextual grounding + relevance checks", () => {
+    template.hasResourceProperties("AWS::Bedrock::Guardrail", {
+      Name: `${DEFAULT_RESOURCE_PREFIX}-${DEFAULT_ENV}-guardrail`,
+      ContextualGroundingPolicyConfig: {
+        FiltersConfig: [
+          { Type: "GROUNDING", Threshold: 0.7 },
+          { Type: "RELEVANCE", Threshold: 0.7 },
+        ],
+      },
+    });
+  });
+
+  test("denied-topic definitions and examples fit Bedrock's limits", () => {
+    const guardrails = template.findResources("AWS::Bedrock::Guardrail");
+    const topics = Object.values(guardrails).flatMap(
+      (r) => r.Properties?.TopicPolicyConfig?.TopicsConfig ?? [],
+    ) as { Name: string; Definition: string; Examples: string[] }[];
+    expect(topics.length).toBeGreaterThan(0);
+    for (const t of topics) {
+      expect(t.Name).toMatch(/^[0-9a-zA-Z\-_ !?.]{1,100}$/);
+      expect(t.Definition.length).toBeLessThanOrEqual(200);
+      expect(t.Examples.length).toBeLessThanOrEqual(5);
+      for (const ex of t.Examples) expect(ex.length).toBeLessThanOrEqual(100);
+    }
+  });
+
   test("provisions exactly two guardrails", () => {
     template.resourceCountIs("AWS::Bedrock::Guardrail", 2);
   });
@@ -70,6 +108,12 @@ describe("GuardrailStack", () => {
     // document containing a name and strip named entities from the KG.
     expect(
       retrieval?.Properties?.SensitiveInformationPolicyConfig,
+    ).toBeUndefined();
+    // Denied topics would quarantine ingested security docs; grounding needs a
+    // model response, which document screening doesn't have.
+    expect(retrieval?.Properties?.TopicPolicyConfig).toBeUndefined();
+    expect(
+      retrieval?.Properties?.ContextualGroundingPolicyConfig,
     ).toBeUndefined();
     // It must still screen for prompt injection.
     const filters =

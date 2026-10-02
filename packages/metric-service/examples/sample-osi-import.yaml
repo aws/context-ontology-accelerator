@@ -12,6 +12,16 @@
 #   synonyms: list of alternative names
 #   instructions: free-text guidance for AI agents
 #   examples: list of example queries/questions
+#
+# COA-specific metadata travels in the OSI-standard `custom_extensions` list,
+# under `vendor_name: COA`. Vendor-prefixed top-level keys such as `x_coa:` are
+# NOT part of the OSI spec and are ignored by the importer.
+#   data_source_id:    onboarded data source the metric is bound to (required)
+#   source_table:      table the expression is evaluated against (required)
+#   unit:              display unit (e.g. USD)
+#   return_type:       scalar type of the result (e.g. decimal, integer)
+#   time_dimension:    default time grain — one of day, week, month, quarter, year
+#   ontology_concepts: ontology classes this metric governs (drives Check 6)
 
 osi_spec_version: "1.0"
 
@@ -33,9 +43,9 @@ metrics:
     expression:
       dialects:
         - dialect: ANSI_SQL
-          expression: "SUM(CASE WHEN status = 'completed' THEN amount ELSE 0 END)"
+          expression: "SELECT SUM(CASE WHEN status = 'completed' THEN amount ELSE 0 END) FROM public.orders"
         - dialect: SNOWFLAKE
-          expression: "SUM(IFF(status = 'completed', amount, 0))"
+          expression: "SELECT SUM(IFF(status = 'completed', amount, 0)) FROM public.orders"
     ai_context:
       synonyms:
         - "total sales"
@@ -45,48 +55,54 @@ metrics:
       examples:
         - "What was our total revenue last quarter?"
         - "Show me revenue by region"
-    x_coa:
-      data_source_id: ds-warehouse-prod
-      source_table: public.orders
-      unit: USD
-      return_type: decimal
-      time_dimension: order_date
-      ontology_concepts:
-        - Revenue
-        - FinancialMetric
+    custom_extensions:
+      - vendor_name: COA
+        data:
+          data_source_id: ds-warehouse-prod
+          source_table: public.orders
+          unit: USD
+          return_type: decimal
+          time_dimension: month
+          ontology_concepts:
+            - Revenue
+            - FinancialMetric
 
   - name: active_customers
     description: "Count of customers with at least one order in the last 90 days"
     expression:
       dialects:
         - dialect: ANSI_SQL
-          expression: "COUNT(DISTINCT customer_id) FILTER (WHERE order_date >= CURRENT_DATE - INTERVAL '90 days')"
+          expression: "SELECT COUNT(DISTINCT customer_id) FROM public.customers WHERE last_order_date >= CURRENT_DATE - INTERVAL '90 days'"
     ai_context:
       synonyms:
         - "engaged customers"
         - "active users"
       instructions: "Use for questions about customer engagement, active user counts, or retention."
-    x_coa:
-      data_source_id: ds-warehouse-prod
-      source_table: public.customers
-      return_type: integer
-      ontology_concepts:
-        - CustomerEngagement
+    custom_extensions:
+      - vendor_name: COA
+        data:
+          data_source_id: ds-warehouse-prod
+          source_table: public.customers
+          return_type: integer
+          ontology_concepts:
+            - CustomerEngagement
 
   - name: avg_order_value
     description: "Average order value for completed orders"
     expression:
       dialects:
         - dialect: ANSI_SQL
-          expression: "AVG(amount) FILTER (WHERE status = 'completed')"
+          expression: "SELECT AVG(amount) FILTER (WHERE status = 'completed') FROM public.orders"
         - dialect: DATABRICKS
-          expression: "AVG(CASE WHEN status = 'completed' THEN amount END)"
+          expression: "SELECT AVG(CASE WHEN status = 'completed' THEN amount END) FROM public.orders"
     ai_context:
       synonyms:
         - "AOV"
         - "average basket size"
-    x_coa:
-      data_source_id: ds-warehouse-prod
-      source_table: public.orders
-      unit: USD
-      return_type: decimal
+    custom_extensions:
+      - vendor_name: COA
+        data:
+          data_source_id: ds-warehouse-prod
+          source_table: public.orders
+          unit: USD
+          return_type: decimal

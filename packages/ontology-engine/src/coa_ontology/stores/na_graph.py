@@ -170,6 +170,19 @@ class NeptuneAnalyticsGraphStore(GraphStore):
             namespace=self._namespace,
         )
 
+    # Annotation supersession -------------------------------------------
+    def supersede_annotations(self, ontology_uri, subject_uris, predicates):
+        """Nothing to do on this backend.
+
+        NA is a property graph: :meth:`store_class` / :meth:`store_property`
+        ``SET`` the node's ``comment`` on every write, so a re-accepted proposal
+        already overwrites the previous description. There is no
+        per-value altLabel triple to clear either — :meth:`load_turtle` is a
+        no-op here. Returns ``0`` for protocol parity with the NDB backend.
+        """
+        _ = (ontology_uri, subject_uris, predicates)
+        return 0
+
     # Bulk Turtle ingest -----------------------------------------------
     def load_turtle(self, ontology_uri, turtle, graph_uri=None):
         """Neptune Analytics does not expose a Turtle bulk-load endpoint.

@@ -213,8 +213,10 @@ class OntologyGraphTool:
         # arguments, not a different query: no mapped-gate (traversal may cross into a
         # class Ontop cannot resolve, since it returns facts rather than authoring
         # SQL), a higher limit, ``?comment`` for the FK provenance string, and the
-        # resolved named graphs (the T-Box builder has not adopted the probe yet, so
-        # it keeps the prefix-filter form the shared builder still supports).
+        # resolved named graphs (the T-Box builder now resolves them too, so both
+        # callers are on the scoped form). NOT anchored on ``domain_iris``: this
+        # caller wants the whole FK graph to walk, so it is unaffected by the
+        # one-sided ?domain narrowing described in ``object_properties_sparql``.
         graphs = await self._resolve_graph_iris(prefix)
         sparql = object_properties_sparql(prefix, limit=_EDGE_QUERY_LIMIT, with_comment=True, graph_iris=graphs)
         rows = await self._query(sparql, what="fk_edges")

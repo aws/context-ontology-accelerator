@@ -171,11 +171,11 @@ class InformationSchemaSqlTest
     }
 
     @Test
-    void columnsDoesNotSelectIsNullable()
+    void columnsSelectsIsNullableBecauseTheTagChannelCanNowCarryIt()
     {
-        // Nullability is out of scope: COA's parser strips a tag only when it recognises one, so an
-        // unrecognised @notnull ends up in the stored description as literal text.
-        assertFalse(InformationSchemaSql.columns("main").contains("is_nullable"),
+        // Free: is_nullable is a column of the row this statement already reads, so carrying the fact costs
+        // no extra statement.
+        assertTrue(InformationSchemaSql.columns("main").contains("is_nullable"),
                 InformationSchemaSql.columns("main"));
     }
 

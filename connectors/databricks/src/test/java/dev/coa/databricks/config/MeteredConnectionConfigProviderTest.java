@@ -9,6 +9,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -86,6 +87,53 @@ class MeteredConnectionConfigProviderTest
         assertTrue(emitted.get(0).contains(ConnectorMetrics.CONFIG_RESOLUTION_FAILURES));
         assertTrue(emitted.get(0).contains("[[\"Connector\"]]"),
                 "expected only the fleet dimension set: " + emitted.get(0));
+    }
+
+    @Test
+    void aCatalogNameThatIsNotOneIsCountedWithoutBecomingADimension()
+    {
+        // The count happens before the delegate validates, so the name is whatever the caller sent, and a
+        // principal holding lambda:InvokeFunction can post any string. Not an injection — the JSON is
+        // escaped — but each distinct name would mint a custom CloudWatch metric at about $0.30 a month, so
+        // the dimension is dropped and the count kept.
+        ConnectionConfigProvider failing = catalog -> {
+            throw new IllegalArgumentException("no such source");
+        };
+
+        for (String hostile : new String[] {
+            "../deployment/function-arn", "a b", "a\nb", "a\"b", "'; DROP", "x".repeat(400), "-"}) {
+            emitted.clear();
+            assertThrows(IllegalArgumentException.class,
+                    () -> new MeteredConnectionConfigProvider(failing, metrics).configFor(hostile));
+
+            assertEquals(1, emitted.size(), "the failure has to stay counted: " + hostile);
+            assertTrue(emitted.get(0).contains(ConnectorMetrics.CONFIG_RESOLUTION_FAILURES),
+                    emitted.get(0));
+            assertTrue(emitted.get(0).contains("[[\"Connector\"]]"),
+                    "expected the fleet dimension set alone for " + hostile + ": " + emitted.get(0));
+            assertFalse(emitted.get(0).contains("\"Catalog\""),
+                    "an unvalidated name must not become a dimension: " + emitted.get(0));
+        }
+    }
+
+    @Test
+    void aCatalogNameCoaCouldHaveDerivedStillBecomesADimension()
+    {
+        // The other side of it: the check must not cost the dimension for a real name — `<prefix>ds_<digest>`
+        // for COA, whatever the operator registered for stage-1, letters, digits and underscores either way.
+        ConnectionConfigProvider failing = catalog -> {
+            throw new IllegalArgumentException("no such source");
+        };
+
+        for (String legitimate : new String[] {
+            "coadevds_144a95d84d98c87d", "databricks", "databricks_sales", "_x", "A1"}) {
+            emitted.clear();
+            assertThrows(IllegalArgumentException.class,
+                    () -> new MeteredConnectionConfigProvider(failing, metrics).configFor(legitimate));
+
+            assertTrue(emitted.get(0).contains("\"Catalog\":\"" + legitimate + "\""),
+                    "the runbook distinguishes one catalog from fleet-wide: " + emitted.get(0));
+        }
     }
 
     @Test

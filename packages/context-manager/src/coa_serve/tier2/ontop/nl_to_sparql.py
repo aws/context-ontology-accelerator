@@ -16,6 +16,7 @@ Returns TranslationResult with the generated SPARQL, confidence, and validity.
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import time
 from collections.abc import Callable
@@ -32,7 +33,43 @@ from .types import VectorHit
 
 logger = structlog.get_logger(__name__)
 
+# Wall clock for the WHOLE translation: T-Box build, the LLM call, validation, and
+# every validate-and-retry attempt. Overridable because on a wide namespace 60s is
+# the binding constraint, not a backstop: over 727 BIRD-Interact translations p50 was
+# 29.1s, p90 44.7s, max 59.6s, with 6.9% already returning ``translation_timed_out``.
 _DEFAULT_TIMEOUT_S = 60.0
+_MIN_TIMEOUT_S = 10.0
+_MAX_TIMEOUT_S = 600.0
+
+
+def _resolve_translation_timeout_s() -> float:
+    """Overall translation budget (``SERVE_VKG_TRANSLATION_TIMEOUT_S``), in seconds.
+
+    Clamped to ``[10, 600]`` and never raises: a bad value degrades to the default
+    rather than taking the route down. Unset leaves behaviour exactly as shipped.
+
+    600 is the clamp, not the reachable ceiling — outer budgets bound it and none is
+    lowered into this clamp, because a caller driving the route directly (the
+    benchmark harness does) is under none of them: ``RESOLVE_TIMEOUT_S`` (170s
+    deployed, ≤300s in ``main.py``), half of it when ``OntopStrategy._retry_vkg``
+    re-enters :meth:`translate` with a fresh budget, ``_PARALLEL_STRATEGY_TIMEOUT_S``
+    (90s) under ``strategy="best"``, and ~29s over REST where the data-layer handler
+    severs the socket. ``external-docs/content/deploying.md`` has the deployment view.
+    """
+    raw = os.environ.get("SERVE_VKG_TRANSLATION_TIMEOUT_S")
+    if raw is None:
+        return _DEFAULT_TIMEOUT_S
+    try:
+        requested = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("vkg_translation_timeout_invalid", value=raw, using=_DEFAULT_TIMEOUT_S)
+        return _DEFAULT_TIMEOUT_S
+
+    resolved = max(_MIN_TIMEOUT_S, min(_MAX_TIMEOUT_S, requested))
+    if resolved != requested:
+        logger.warning("vkg_translation_timeout_clamped", requested=requested, using=resolved)
+    return resolved
+
 
 _SYSTEM_PROMPT = (
     "You are a SPARQL query generator for the Ontop Virtual Knowledge Graph (VKG) engine. "
@@ -379,7 +416,7 @@ class NLtoSPARQL:
         graph_client: GraphClient,
         llm_client: LLMClient,
         guardrail_id: str = "",
-        timeout_s: float = _DEFAULT_TIMEOUT_S,
+        timeout_s: float | None = None,
         graph_uri_template: str | None = None,
         metric_resolver=None,
         few_shot_loader=None,
@@ -395,7 +432,10 @@ class NLtoSPARQL:
             guardrail_id_provider: Optional callable returning the guardrail id
                 LIVE on each call; when supplied it takes precedence over
                 ``guardrail_id`` at the translation call site.
-            timeout_s: Overall translation timeout in seconds.
+            timeout_s: Overall translation timeout in seconds. ``None`` resolves
+                it from ``SERVE_VKG_TRANSLATION_TIMEOUT_S``, defaulting to
+                :data:`_DEFAULT_TIMEOUT_S`. Resolved per instance rather than at
+                import, so a caller may still pass an explicit budget.
             graph_uri_template: Optional named-graph URI template for the namespace.
             metric_resolver: Optional Tier-1 resolver enriching the prompt with
                 full metric definitions.
@@ -409,7 +449,7 @@ class NLtoSPARQL:
         self._guardrail_id = guardrail_id
         self._guardrail_id_provider = guardrail_id_provider
         self._validator = SPARQLValidator(graph_client, graph_uri_template)
-        self._timeout_s = timeout_s
+        self._timeout_s = _resolve_translation_timeout_s() if timeout_s is None else timeout_s
         # optional few-shot example loader — when present, namespace-scoped
         # examples from S3 are injected into the prompt, replacing the generic
         # hardcoded examples. None / no file → generic examples (graceful fallback).
@@ -638,10 +678,14 @@ class NLtoSPARQL:
                 attempt=attempt + 1,
             )
 
-            # Step 3: Validate SPARQL
+            # Step 3: Validate SPARQL, reusing the graphs the T-Box build resolved —
+            # the validator's checks are the only ones re-paid on every retry attempt.
             validation, ok = await self._traced_step(
                 PipelineStep.VALIDATION,
-                self._validator.validate(sparql, namespace),
+                # getattr, not attribute access: the reuse branch above accepts a
+                # caller-supplied context (``_retry_vkg`` types it ``Any``), so a
+                # stand-in without the field must degrade to the prefix filter.
+                self._validator.validate(sparql, namespace, graph_iris=getattr(tbox, "graph_iris", None)),
                 trace_steps,
                 start,
             )

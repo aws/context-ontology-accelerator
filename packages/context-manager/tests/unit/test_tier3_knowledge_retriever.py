@@ -88,7 +88,7 @@ class TestKnowledgeRetrieverFullFlow:
         retriever = KnowledgeRetriever(vector_retriever, graph_traverser, synthesizer)
         result = await retriever.resolve(
             "What is the claims processing SLA?",
-            "insurance",
+            "550e8400-e29b-41d4-a716-446655440000",
             embedding=[0.1] * 1024,
         )
 
@@ -101,7 +101,7 @@ class TestKnowledgeRetrieverFullFlow:
 
     async def test_trace_steps_present(self, vector_retriever, graph_traverser, synthesizer):
         retriever = KnowledgeRetriever(vector_retriever, graph_traverser, synthesizer)
-        result = await retriever.resolve("SLA?", "insurance", embedding=[0.1] * 10)
+        result = await retriever.resolve("SLA?", "550e8400-e29b-41d4-a716-446655440000", embedding=[0.1] * 10)
 
         step_names = [s["step"] for s in result.trace_steps]
         assert "t3.vector_search" in step_names
@@ -113,7 +113,7 @@ class TestKnowledgeRetrieverFullFlow:
     ):
         """A t3.guardrail step is emitted so the UI can render 'passed' — not 'n/a'."""
         retriever = KnowledgeRetriever(vector_retriever, graph_traverser, synthesizer)
-        result = await retriever.resolve("SLA?", "insurance", embedding=[0.1] * 10)
+        result = await retriever.resolve("SLA?", "550e8400-e29b-41d4-a716-446655440000", embedding=[0.1] * 10)
 
         guardrail_step = next(s for s in result.trace_steps if s["step"] == "t3.guardrail")
         assert guardrail_step["status"] == "success"
@@ -130,7 +130,7 @@ class TestKnowledgeRetrieverFullFlow:
             os.environ.pop("ALLOW_NO_GUARDRAIL", None)
 
         retriever = KnowledgeRetriever(vector_retriever, graph_traverser, synthesizer_no_guard)
-        result = await retriever.resolve("SLA?", "insurance", embedding=[0.1] * 10)
+        result = await retriever.resolve("SLA?", "550e8400-e29b-41d4-a716-446655440000", embedding=[0.1] * 10)
 
         assert not any(s["step"] == "t3.guardrail" for s in result.trace_steps)
 
@@ -140,7 +140,7 @@ class TestKnowledgeRetrieverFullFlow:
         synthesizer_blocked = Synthesizer(mock_bedrock, guardrail_id="gr-test-123")
         retriever = KnowledgeRetriever(vector_retriever, graph_traverser, synthesizer_blocked)
 
-        result = await retriever.resolve("SLA?", "insurance", embedding=[0.1] * 10)
+        result = await retriever.resolve("SLA?", "550e8400-e29b-41d4-a716-446655440000", embedding=[0.1] * 10)
 
         guardrail_step = next(s for s in result.trace_steps if s["step"] == "t3.guardrail")
         assert guardrail_step["status"] == "denied"
@@ -156,7 +156,7 @@ class TestKnowledgeRetrieverFullFlow:
 
         result = await retriever.resolve(
             "SLA?",
-            "insurance",
+            "550e8400-e29b-41d4-a716-446655440000",
             retriever_strategy=RetrieverStrategy.CHUNK_BASED_SEMANTIC,
         )
 
@@ -165,7 +165,7 @@ class TestKnowledgeRetrieverFullFlow:
 
     async def test_per_leg_timing(self, vector_retriever, graph_traverser, synthesizer):
         retriever = KnowledgeRetriever(vector_retriever, graph_traverser, synthesizer)
-        result = await retriever.resolve("SLA?", "insurance", embedding=[0.1] * 10)
+        result = await retriever.resolve("SLA?", "550e8400-e29b-41d4-a716-446655440000", embedding=[0.1] * 10)
 
         vec_step = next(s for s in result.trace_steps if s["step"] == "t3.vector_search")
         graph_step = next(s for s in result.trace_steps if s["step"] == "t3.graph_traverse")
@@ -187,7 +187,7 @@ class TestKnowledgeRetrieverGraphBranch:
 
         result = await retriever.resolve(
             "契約と請求の関係は？",
-            "insurance",
+            "550e8400-e29b-41d4-a716-446655440000",
             embedding=[0.1] * 10,
             entity_uris=["http://ex.org/Claim", "http://ex.org/Policy"],
         )
@@ -202,7 +202,11 @@ class TestKnowledgeRetrieverGraphBranch:
         graph_traverser.traverse_from_uris = AsyncMock(return_value=[])
         retriever = KnowledgeRetriever(vector_retriever, graph_traverser, synthesizer)
 
-        result = await retriever.resolve("What is the SLA?", "insurance", embedding=[0.1] * 10)
+        result = await retriever.resolve(
+            "What is the SLA?",
+            "550e8400-e29b-41d4-a716-446655440000",
+            embedding=[0.1] * 10,
+        )
 
         graph_traverser.traverse.assert_awaited_once()
         graph_traverser.traverse_from_uris.assert_not_awaited()
@@ -214,7 +218,11 @@ class TestKnowledgeRetrieverGraphBranch:
 class TestKnowledgeRetrieverTraversalStrategy:
     async def test_keyword_strategy_without_uris(self, vector_retriever, graph_traverser, synthesizer):
         retriever = KnowledgeRetriever(vector_retriever, graph_traverser, synthesizer)
-        result = await retriever.resolve("What about claims?", "insurance", embedding=[0.1] * 10)
+        result = await retriever.resolve(
+            "What about claims?",
+            "550e8400-e29b-41d4-a716-446655440000",
+            embedding=[0.1] * 10,
+        )
         graph_step = next(s for s in result.trace_steps if s["step"] == "t3.graph_traverse")
         assert graph_step["graphSeedMode"] == "keyword"
 
@@ -223,7 +231,7 @@ class TestKnowledgeRetrieverTraversalStrategy:
         retriever = KnowledgeRetriever(vector_retriever, graph_traverser, synthesizer)
         result = await retriever.resolve(
             "What about claims?",
-            "insurance",
+            "550e8400-e29b-41d4-a716-446655440000",
             embedding=[0.1] * 10,
             entity_uris=["http://ex.org/Claim"],
         )
@@ -235,7 +243,7 @@ class TestKnowledgeRetrieverTraversalStrategy:
 class TestKnowledgeRetrieverNoEmbedding:
     async def test_skips_vector_search_without_embedding(self, vector_retriever, graph_traverser, synthesizer):
         retriever = KnowledgeRetriever(vector_retriever, graph_traverser, synthesizer)
-        result = await retriever.resolve("test query", "ns")
+        result = await retriever.resolve("test query", "550e8400-e29b-41d4-a716-446655440000")
 
         vec_step = next(s for s in result.trace_steps if s["step"] == "t3.vector_search")
         assert vec_step["status"] == "skipped"
@@ -246,7 +254,7 @@ class TestKnowledgeRetrieverNoEmbedding:
 
     async def test_no_embedding_still_synthesizes(self, vector_retriever, graph_traverser, synthesizer):
         retriever = KnowledgeRetriever(vector_retriever, graph_traverser, synthesizer)
-        result = await retriever.resolve("test", "ns")
+        result = await retriever.resolve("test", "550e8400-e29b-41d4-a716-446655440000")
         assert result.synthesized_answer is not None
 
 
@@ -271,7 +279,7 @@ class TestKnowledgeRetrieverCatalogSummary:
 
     async def test_no_catalog_summary_no_trace(self, vector_retriever, graph_traverser, synthesizer):
         retriever = KnowledgeRetriever(vector_retriever, graph_traverser, synthesizer)
-        result = await retriever.resolve("test", "ns", embedding=[0.1] * 10)
+        result = await retriever.resolve("test", "550e8400-e29b-41d4-a716-446655440000", embedding=[0.1] * 10)
 
         step_names = [s["step"] for s in result.trace_steps]
         assert "t3.catalog_context" not in step_names
@@ -285,7 +293,7 @@ class TestKnowledgeRetrieverPartialFailure:
         vector_retriever = VectorRetriever(failing_os)
 
         retriever = KnowledgeRetriever(vector_retriever, graph_traverser, synthesizer)
-        result = await retriever.resolve("test query", "ns", embedding=[0.1] * 10)
+        result = await retriever.resolve("test query", "550e8400-e29b-41d4-a716-446655440000", embedding=[0.1] * 10)
 
         assert result.synthesized_answer is not None
         vec_step = next(s for s in result.trace_steps if s["step"] == "t3.vector_search")
@@ -301,7 +309,7 @@ class TestKnowledgeRetrieverPartialFailure:
         )
 
         retriever = KnowledgeRetriever(vector_retriever, graph_traverser, synthesizer)
-        result = await retriever.resolve("test query", "ns", embedding=[0.1] * 10)
+        result = await retriever.resolve("test query", "550e8400-e29b-41d4-a716-446655440000", embedding=[0.1] * 10)
 
         assert result.synthesized_answer is not None
         graph_step = next(s for s in result.trace_steps if s["step"] == "t3.graph_traverse")
@@ -321,7 +329,7 @@ class TestKnowledgeRetrieverPartialFailure:
         )
 
         retriever = KnowledgeRetriever(vector_retriever, graph_traverser, synthesizer)
-        result = await retriever.resolve("test", "ns", embedding=[0.1] * 10)
+        result = await retriever.resolve("test", "550e8400-e29b-41d4-a716-446655440000", embedding=[0.1] * 10)
 
         assert result.synthesized_answer is not None
         assert result.supporting_content == ()
@@ -334,7 +342,7 @@ class TestKnowledgeRetrieverPartialFailure:
 
         retriever = KnowledgeRetriever(vector_retriever, graph_traverser, synth)
         with pytest.raises(Exception, match="Bedrock throttled"):
-            await retriever.resolve("test query", "ns", embedding=[0.1] * 10)
+            await retriever.resolve("test query", "550e8400-e29b-41d4-a716-446655440000", embedding=[0.1] * 10)
 
 
 @pytest.mark.unit
@@ -343,14 +351,14 @@ class TestKnowledgeRetrieverDegradedSources:
 
     async def test_no_degradation_when_all_succeed(self, vector_retriever, graph_traverser, synthesizer):
         retriever = KnowledgeRetriever(vector_retriever, graph_traverser, synthesizer)
-        result = await retriever.resolve("SLA?", "ns", embedding=[0.1] * 10)
+        result = await retriever.resolve("SLA?", "550e8400-e29b-41d4-a716-446655440000", embedding=[0.1] * 10)
         assert result.degraded_sources == ()
 
     async def test_vector_error_recorded_as_degraded(self, graph_traverser, synthesizer):
         failing_os = AsyncMock()
         failing_os.search.side_effect = Exception("OpenSearch unavailable")
         retriever = KnowledgeRetriever(VectorRetriever(failing_os), graph_traverser, synthesizer)
-        result = await retriever.resolve("test", "ns", embedding=[0.1] * 10)
+        result = await retriever.resolve("test", "550e8400-e29b-41d4-a716-446655440000", embedding=[0.1] * 10)
 
         assert len(result.degraded_sources) == 1
         deg = result.degraded_sources[0]
@@ -374,7 +382,7 @@ class TestKnowledgeRetrieverDegradedSources:
         slow_os = AsyncMock()
         slow_os.search.side_effect = _slow_search
         retriever = KnowledgeRetriever(VectorRetriever(slow_os), graph_traverser, synthesizer)
-        result = await retriever.resolve("test", "ns", embedding=[0.1] * 10)
+        result = await retriever.resolve("test", "550e8400-e29b-41d4-a716-446655440000", embedding=[0.1] * 10)
 
         assert result.synthesized_answer is not None  # still synthesizes
         timeouts = [d for d in result.degraded_sources if d["reason"] == "timeout"]
@@ -400,7 +408,7 @@ class TestKnowledgeRetrieverDegradedSources:
         slow_os = AsyncMock()
         slow_os.search.side_effect = _slow_search
         retriever = KnowledgeRetriever(VectorRetriever(slow_os), graph_traverser, synthesizer)
-        result = await retriever.resolve("test", "ns", embedding=[0.1] * 10)
+        result = await retriever.resolve("test", "550e8400-e29b-41d4-a716-446655440000", embedding=[0.1] * 10)
 
         timeouts = [d for d in result.degraded_sources if d["reason"] == "timeout"]
         assert [t["source"] for t in timeouts] == ["t3.vector_search"]
@@ -436,13 +444,13 @@ class TestKnowledgeRetrieverTruncation:
         synth = Synthesizer(mock_bedrock, guardrail_id="gr-123")
         retriever = KnowledgeRetriever(vec, graph, synth)
 
-        result = await retriever.resolve("test", "ns", embedding=[0.1] * 10)
+        result = await retriever.resolve("test", "550e8400-e29b-41d4-a716-446655440000", embedding=[0.1] * 10)
         assert result.supporting_content_truncated is True
         assert len(result.supporting_content) == 5
 
     async def test_supporting_content_not_truncated(self, vector_retriever, graph_traverser, synthesizer):
         retriever = KnowledgeRetriever(vector_retriever, graph_traverser, synthesizer)
-        result = await retriever.resolve("claims", "insurance", embedding=[0.1] * 10)
+        result = await retriever.resolve("claims", "550e8400-e29b-41d4-a716-446655440000", embedding=[0.1] * 10)
         assert result.supporting_content_truncated is False
         assert len(result.supporting_content) == 1
 
@@ -489,7 +497,7 @@ class TestTier3ToolUsed:
         from coa_serve.trace import TraceCollector
 
         trace = TraceCollector()
-        await retriever.resolve("test", "ns", embedding=[0.1] * 10, trace=trace)
+        await retriever.resolve("test", "550e8400-e29b-41d4-a716-446655440000", embedding=[0.1] * 10, trace=trace)
 
         by_step = {ts.step: ts for ts in trace.steps}
         assert by_step["t3.vector_search"].tool_used == "opensearch"

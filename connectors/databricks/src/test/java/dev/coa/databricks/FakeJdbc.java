@@ -84,6 +84,8 @@ public final class FakeJdbc
             switch (method.getName()) {
                 case "prepareStatement":
                     return preparedStatement((String) args[0]);
+                case "getMetaData":
+                    return databaseMetaData();
                 case "close":
                     connectionsClosed++;
                     return null;
@@ -129,6 +131,30 @@ public final class FakeJdbc
     public int connectionsClosed()
     {
         return connectionsClosed;
+    }
+
+    /**
+     * Just enough {@link java.sql.DatabaseMetaData} for {@code athena-jdbc}'s inherited read loop, which
+     * asks for {@code getDatabaseProductName()} before it does anything else — it compares the answer to
+     * {@code "clickhouse"} to decide whether to disable auto-commit.
+     *
+     * <p>The product name is the driver's own, not a Databricks constant, so it is spelled here as the
+     * driver spells it. Anything but {@code "clickhouse"} takes the same branch, so nothing depends on
+     * the exact value; what depends on this existing at all is that a read can be driven through the real
+     * loop rather than stopping at the first metadata call.
+     */
+    private java.sql.DatabaseMetaData databaseMetaData()
+    {
+        return proxy(java.sql.DatabaseMetaData.class, (proxy, method, args) -> {
+            switch (method.getName()) {
+                case "getDatabaseProductName":
+                    return "SparkSQL";
+                case "getDatabaseProductVersion":
+                    return "3.5.0";
+                default:
+                    return unsupported(method);
+            }
+        });
     }
 
     private PreparedStatement preparedStatement(String sql)

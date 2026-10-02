@@ -331,9 +331,10 @@ async def _ensure_initialized():
             firewall=firewall,
             query_executor=query_executor,
             oss_ontology_index=oss_ontology_index,
-            # Backs the opt-in ontology-graph expansion of the retrieved tables
-            # (SERVE_NL2SQL_GRAPH_EXPAND deployment-wide, options.flatGraphExpand per
-            # request); with both off the client is simply never used.
+            # Backs the ontology-graph expansion of the retrieved tables, which is ON
+            # by default (SERVE_NL2SQL_GRAPH_EXPAND turns it off deployment-wide,
+            # options.flatGraphExpand per request); passing None here leaves the flat
+            # path on retrieval alone rather than failing.
             graph_client=neptune_client,
             sources_registry=sources_registry,
         )
@@ -815,6 +816,17 @@ async def _handle_streaming_query(payload: dict, request, request_id: str, sessi
             await trace.flush()
             emitter.done()
             return response
+        except AccessDeniedError:
+            # Authorization denials must not leak the trace steps that led
+            # to the denial — a T1_FIREWALL step's detail names the
+            # restricted tables in the deny reason and would otherwise
+            # reach any authenticated caller via SSE before the 403.
+            # `discard()` cancels pending step-emit tasks without delivering.
+            # This is what keeps the trace stream from leaking restricted
+            # table names to a caller who was just denied.
+            trace.discard()
+            emitter.close()
+            raise
         except Exception:
             await trace.flush()
             emitter.close()

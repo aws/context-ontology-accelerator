@@ -16,6 +16,9 @@ const mockUseListSourceTables = vi.fn();
 const mockUseApproveSource = vi.fn();
 const mockUseRejectSource = vi.fn();
 const mockUseGetSourceScanJob = vi.fn();
+const mockUseListSourceScanJobs = vi.fn();
+const mockUsePutSourceRescanSchedule = vi.fn();
+const mockUsePutSourceEventRescan = vi.fn();
 
 vi.mock("@api-hooks", () => ({
   useGetSource: (...args: unknown[]) => mockUseGetSource(...args),
@@ -26,6 +29,12 @@ vi.mock("@api-hooks", () => ({
   useRejectSource: (...args: unknown[]) => mockUseRejectSource(...args),
   useGetSourceScanJob: (...args: unknown[]) => mockUseGetSourceScanJob(...args),
   useKeepRescanRemoval: () => ({ mutate: vi.fn(), isPending: false }),
+  useListSourceScanJobs: (...args: unknown[]) =>
+    mockUseListSourceScanJobs(...args),
+  usePutSourceRescanSchedule: (...args: unknown[]) =>
+    mockUsePutSourceRescanSchedule(...args),
+  usePutSourceEventRescan: (...args: unknown[]) =>
+    mockUsePutSourceEventRescan(...args),
 }));
 
 // Pin only the enum values the page reads. Avoids loading the full smithy
@@ -134,6 +143,21 @@ function setupBaseMocks(
   mockUseApproveSource.mockReturnValue({ mutate: vi.fn(), isPending: false });
   mockUseRejectSource.mockReturnValue({ mutate: vi.fn(), isPending: false });
   mockUseGetSourceScanJob.mockReturnValue({ data: undefined });
+  mockUseListSourceScanJobs.mockReturnValue({
+    data: { items: [] },
+    isLoading: false,
+  });
+  mockUsePutSourceRescanSchedule.mockReturnValue({
+    mutate: vi.fn(),
+    isPending: false,
+    error: null,
+    isSuccess: false,
+  });
+  mockUsePutSourceEventRescan.mockReturnValue({
+    mutate: vi.fn(),
+    isPending: false,
+    error: null,
+  });
 }
 
 describe("SourceDetail", () => {
@@ -160,6 +184,76 @@ describe("SourceDetail", () => {
     renderDetail();
     const rescan = screen.getByRole("button", { name: /re-scan/i });
     expect(rescan).not.toBeDisabled();
+  });
+
+  it("shows what triggered each scan in the Scan history tab", () => {
+    // Per-job diff counts are not asserted: the shipped history has no per-job
+    // delta, which is ADR open question 2 rather than a display change.
+    setupBaseMocks({ status: "PENDING_REVIEW", tablesDiscovered: 12 });
+    mockUseListSourceScanJobs.mockReturnValue({
+      data: {
+        items: [
+          {
+            at: "2026-03-02T00:00:00Z",
+            eventType: "SCAN",
+            status: "COMPLETED",
+            scanType: "full",
+            triggerType: "MANUAL",
+            tablesDiscovered: 12,
+          },
+        ],
+      },
+      isLoading: false,
+    });
+    renderDetail();
+
+    fireEvent.click(screen.getByRole("tab", { name: /scan history/i }));
+
+    expect(screen.getByText("MANUAL")).toBeInTheDocument();
+    expect(screen.getByText("Scanned 12 tables.")).toBeInTheDocument();
+  });
+
+  it("saves a recurring rescan schedule from the Settings tab", () => {
+    setupBaseMocks({ status: "APPROVED", tablesDiscovered: 5 });
+    const mutate = vi.fn();
+    mockUsePutSourceRescanSchedule.mockReturnValue({
+      mutate,
+      isPending: false,
+      error: null,
+      isSuccess: false,
+    });
+    renderDetail();
+
+    fireEvent.click(screen.getByRole("tab", { name: /settings/i }));
+    // Enable the schedule (click the toggle's label) — the cadence fields
+    // appear once enabled.
+    fireEvent.click(screen.getByText(/enable scheduled rescans/i));
+    expect(screen.getByText("Schedule expression")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /save schedule/i }));
+
+    expect(mutate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        enabled: true,
+        scheduleExpression: "rate(1 day)",
+      }),
+    );
+  });
+
+  it("toggles event-driven rescans for a Glue source", () => {
+    setupBaseMocks({ status: "APPROVED", tablesDiscovered: 5 });
+    const eventMutate = vi.fn();
+    mockUsePutSourceEventRescan.mockReturnValue({
+      mutate: eventMutate,
+      isPending: false,
+      error: null,
+    });
+    renderDetail();
+
+    fireEvent.click(screen.getByRole("tab", { name: /settings/i }));
+    fireEvent.click(screen.getByText(/re-scan on glue catalog changes/i));
+
+    expect(eventMutate).toHaveBeenCalledWith(true);
   });
 
   it("disables Approve source and Reject source when no tables are scanned", () => {

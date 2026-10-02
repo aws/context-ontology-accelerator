@@ -282,6 +282,9 @@ class TestProvisionFederatedCatalogThrottles:
 
         mock_glue = MagicMock()
         mock_glue.exceptions.AlreadyExistsException = _GlueAlreadyExists
+        # Report the connection READY so the provisioner's readiness poll
+        # (20 x 5 s) returns at once instead of waiting out its full budget.
+        mock_glue.get_connection.return_value = {"Connection": {"Status": "READY"}}
         mock_lf = MagicMock()
         throttle = _client_error("ThrottlingException")
         # register_resource lives on the LF client; the other two on the glue client.

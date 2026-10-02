@@ -340,7 +340,7 @@ class VKGTranslator:
                     step=Tier2Step.QUERY_EXECUTE,
                     status=Tier2Status.ERROR,
                     duration_ms=int((time.perf_counter() - start) * 1000),
-                    detail={"error": f"{type(e).__name__}: {str(e)}"},
+                    detail={"error": type(e).__name__},
                 )
             )
             return Tier2Result(

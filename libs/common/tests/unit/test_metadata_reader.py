@@ -17,6 +17,7 @@ from coa_common.metadata_store.reader import (
     _qualified_name_from_asset,
     read_asset_names_for_datasource,
     read_assets_for_datasource,
+    read_table_for_asset,
 )
 
 pytestmark = pytest.mark.unit
@@ -152,6 +153,17 @@ class TestParseAsset:
         assert result is not None
         assert result.name == "customers"
         assert result.data_source_id == "ds-1"
+
+
+class TestReadTableForAsset:
+    @patch("coa_common.metadata_store.reader._client")
+    def test_form_fetch_failure_propagates(self, mock_client):
+        client = MagicMock()
+        client.get_asset_forms.side_effect = RuntimeError("datazone down")
+        mock_client.return_value = client
+
+        with pytest.raises(RuntimeError, match="datazone down"):
+            read_table_for_asset("dom-1", "a1", "DS#ds-1:orders", "ds-1")
 
 
 class TestReadAssetNamesForDatasource:

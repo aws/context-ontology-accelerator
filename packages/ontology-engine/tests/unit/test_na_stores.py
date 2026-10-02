@@ -31,6 +31,7 @@ class TestNeptuneAnalyticsVectorStore:
             m.list_searchable_entity_uris = MagicMock(return_value=[])
             m.search_nearest = MagicMock(return_value=[])
             m.delete_embeddings_for_ontology = MagicMock(return_value={})
+            m.delete_embeddings_for_entities = MagicMock(return_value=2)
             m.health_check = MagicMock(return_value={"status": "healthy"})
             self.mock = m
             yield
@@ -104,6 +105,37 @@ class TestNeptuneAnalyticsVectorStore:
         store = self._make_store(namespace="ns1")
         store.delete_embeddings_for_ontology("onto1")
         self.mock.delete_embeddings_for_ontology.assert_called_once_with("onto1", namespace="ns1")
+
+    def test_delete_embeddings_for_entities_scopes_by_ontology_id(self):
+        # The whole point of the ontology_id filter: a shared IRI in a sibling
+        # ontology under the same namespace must not have its embedding taken
+        # down alongside the intended one. The wrapper must pass ontology_id
+        # through to na_store so the openCypher can filter on `e.ontology_id`.
+        store = self._make_store(namespace="ns1")
+        n = store.delete_embeddings_for_entities(
+            ["http://ex.com/A", "http://ex.com/B"],
+            ontology_id="http://ex.com/onto1",
+        )
+        assert n == 2
+        self.mock.delete_embeddings_for_entities.assert_called_once_with(
+            ["http://ex.com/A", "http://ex.com/B"],
+            ontology_id="http://ex.com/onto1",
+            namespace="ns1",
+        )
+
+    def test_delete_embeddings_for_entities_without_ontology_id_is_noop(self):
+        # Fail-closed: rather than issue an unscoped delete that could wipe a
+        # sibling ontology's embedding, refuse and return 0. Verifies the
+        # wrapper never reaches na_store when ontology_id is empty.
+        store = self._make_store(namespace="ns1")
+        assert store.delete_embeddings_for_entities(["http://ex.com/A"], ontology_id="") == 0
+        self.mock.delete_embeddings_for_entities.assert_not_called()
+
+    def test_delete_embeddings_for_entities_without_uris_is_noop(self):
+        # Symmetric fail-closed for the other input.
+        store = self._make_store(namespace="ns1")
+        assert store.delete_embeddings_for_entities([], ontology_id="http://ex.com/onto1") == 0
+        self.mock.delete_embeddings_for_entities.assert_not_called()
 
     def test_health_check_delegates(self):
         store = self._make_store()

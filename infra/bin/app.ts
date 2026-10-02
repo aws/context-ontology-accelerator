@@ -314,6 +314,8 @@ async function deploy(): Promise<void> {
       // entry here the route falls back to the not-implemented stub (501).
       "/namespaces/{namespaceId}/sources/{sourceId}/scan": `/${prefix}/sources/api-fn-arn`,
       "/namespaces/{namespaceId}/sources/{sourceId}/scan/{jobId}": `/${prefix}/sources/api-fn-arn`,
+      "/namespaces/{namespaceId}/sources/{sourceId}/rescan-schedule": `/${prefix}/sources/api-fn-arn`,
+      "/namespaces/{namespaceId}/sources/{sourceId}/event-rescan": `/${prefix}/sources/api-fn-arn`,
       "/namespaces/{namespaceId}/sources/{sourceId}/metadata": `/${prefix}/sources/api-fn-arn`,
       "/namespaces/{namespaceId}/sources/upload-urls": `/${prefix}/sources/api-fn-arn`,
       "/roles": `/${prefix}/namespace/platform-roles-api-fn-arn`,
@@ -424,7 +426,7 @@ async function deploy(): Promise<void> {
   });
   sources.addDependency(smusDomain); // needs SSM params from namespace stack
   sources.addDependency(storage); // needs Neptune/OpenSearch endpoints
-  sources.addDependency(serve); // needs /serve/runtime-role-arn SSM param (LF consumer grant)
+  sources.addDependency(serve); // needs /{env}/serve/runtime-role-arn SSM param (LF consumer grant)
 
   api.addDependency(sources);
   api.addDependency(metricService);

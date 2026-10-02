@@ -19,8 +19,8 @@ import java.util.Objects;
  *
  * <p>Athena's federation protocol cannot express aggregation, so a {@code GROUP BY} against this
  * connector reads every predicate-matching row out of the warehouse for Athena to aggregate. That is a
- * permanent property of this route. At 3008 MB and a 120 s timeout there is a point past which the
- * invocation does not return, and a timeout is the worst available diagnosis: it names no table,
+ * permanent property of this route. At 3008 MB there is a point past which the invocation does not
+ * return, and a timeout is the worst available diagnosis: it names no table,
  * suggests no action, and Athena retries it, paying for the read again. So the connector stops first
  * and says which table, how many rows, and what to do. The default ceiling is two million rows
  * ({@link Settings#DEFAULT_MAX_ROWS_PER_TABLE}).

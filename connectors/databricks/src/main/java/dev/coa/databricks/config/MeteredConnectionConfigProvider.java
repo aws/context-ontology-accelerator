@@ -39,8 +39,35 @@ public final class MeteredConnectionConfigProvider implements ConnectionConfigPr
             // RuntimeException, not IllegalArgumentException: the interface documents the latter, but a
             // provider that reads a remote store can fail in its own ways and every one of them is a
             // resolution failure to whoever is holding the alarm.
-            metrics.count(ConnectorMetrics.CONFIG_RESOLUTION_FAILURES, athenaCatalogName);
+            metrics.count(ConnectorMetrics.CONFIG_RESOLUTION_FAILURES, dimension(athenaCatalogName));
             throw failure;
         }
+    }
+
+    /**
+     * The catalog name as a metric dimension, or {@code null} for a name that is not one.
+     *
+     * <p>This runs <b>before</b> the delegate has validated anything, which is why the name cannot be
+     * trusted here. A principal holding {@code lambda:InvokeFunction} directly can post a request naming
+     * anything, and each distinct value would mint a custom CloudWatch metric at about $0.30 a month. Not
+     * an injection — {@code ConnectorMetrics} escapes the JSON — just unbounded cardinality, billed.
+     *
+     * <p>So an unrecognised name loses the {@code Catalog} dimension and keeps the count, that way round
+     * because the dimension is for triage and the count is the alarm. {@code ConnectorMetrics} already
+     * emits the fleet-only dimension set for a null name, as it does at cold start.
+     *
+     * <p>The rule is {@link ManagedSource#isAthenaCatalogName}, shared with the provider that builds a
+     * parameter path from the same string, rather than a looser pattern invented here.
+     */
+    private static String dimension(String athenaCatalogName)
+    {
+        return ManagedSource.isAthenaCatalogName(athenaCatalogName) ? athenaCatalogName : null;
+    }
+
+    /** {@inheritDoc} Delegated: metering says nothing about where configuration comes from. */
+    @Override
+    public String describe()
+    {
+        return delegate.describe();
     }
 }

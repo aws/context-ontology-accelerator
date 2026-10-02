@@ -111,6 +111,7 @@ def _lookup(vertex_uri: str, namespace: str, kind: str) -> GraphVertex:
         labels=record.get("labels", []),
         comments=record.get("comments", []),
         alt_labels=record.get("alt_labels", []),
+        superseded=record.get("superseded", {}),
         graph_uris=record.get("graph_uris", []),
         is_mapped=record.get("is_mapped", False),
         edges=record.get("edges", []),

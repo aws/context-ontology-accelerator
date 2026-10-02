@@ -16,12 +16,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 from opensearchpy.exceptions import ConnectionError as OSConnectionError
 from opensearchpy.exceptions import ConnectionTimeout, NotFoundError, RequestError, TransportError
-from opensearchpy.helpers.errors import BulkIndexError
 
 pytestmark = pytest.mark.unit
 
 from coa_common.opensearch import (
     AossVectorClient,
+    IncompatibleEngineError,
     build_index_mapping,
     bulk_with_retry,
     is_transient,
@@ -31,20 +31,228 @@ from coa_common.opensearch import client as client_mod
 from coa_common.opensearch import retry as retry_mod
 
 
+def _faiss_mapping(index: str = "idx") -> dict:
+    """A get_mapping response whose embedding resolved to Faiss (filter-capable)."""
+    return {index: {"mappings": {"properties": {"embedding": {"type": "knn_vector", "method": {"engine": "faiss"}}}}}}
+
+
 @pytest.fixture(autouse=True)
 def _no_sleep():
     with patch.object(retry_mod.time, "sleep", return_value=None):
         yield
 
 
+# ── ensure_index engine verification & fallback (#174) ───────────────────
+
+
+def _direct_client_with_indices(indices_mock) -> AossVectorClient:
+    """A direct client whose signed _client.indices is the given mock."""
+    c = AossVectorClient(endpoint="https://x.aoss.us-west-2.on.aws", region="us-west-2", dimensions=4)
+    fake = MagicMock()
+    fake.indices = indices_mock
+    c._client = fake
+    return c
+
+
+class TestEnsureIndexEngineVerification:
+    """ensure_index must (1) try explicit Faiss first, (2) fall back to
+    method-less if the service rejects the method block, and (3) read the
+    mapping back and RAISE if the resolved engine can't serve filtered k-NN.
+    """
+
+    def test_creates_explicit_faiss_and_accepts_faiss_engine(self):
+        idx = MagicMock()
+        idx.exists.return_value = False
+        idx.get_mapping.return_value = _faiss_mapping("idx")
+        c = _direct_client_with_indices(idx)
+        assert c.ensure_index("idx") == "idx"
+        # Created with an explicit Faiss/HNSW method block.
+        body = idx.create.call_args.kwargs["body"]
+        assert body["mappings"]["properties"]["embedding"]["method"]["engine"] == "faiss"
+        idx.get_mapping.assert_called_once()  # engine was verified
+
+    def test_falls_back_to_method_less_when_explicit_rejected(self):
+        idx = MagicMock()
+        idx.exists.return_value = False
+        # First create (explicit method) rejected; second (method-less) succeeds.
+        reject = RequestError(400, "illegal_argument_exception", {})
+        idx.create.side_effect = [reject, None]
+        # Service auto-resolved to faiss on the method-less create.
+        idx.get_mapping.return_value = _faiss_mapping("idx")
+        c = _direct_client_with_indices(idx)
+        assert c.ensure_index("idx") == "idx"
+        assert idx.create.call_count == 2
+        first_body = idx.create.call_args_list[0].kwargs["body"]
+        second_body = idx.create.call_args_list[1].kwargs["body"]
+        assert "method" in first_body["mappings"]["properties"]["embedding"]
+        assert "method" not in second_body["mappings"]["properties"]["embedding"]
+
+    def test_raises_when_resolved_engine_is_nmslib(self):
+        idx = MagicMock()
+        idx.exists.return_value = False
+        idx.get_mapping.return_value = {
+            "idx": {"mappings": {"properties": {"embedding": {"type": "knn_vector", "method": {"engine": "nmslib"}}}}}
+        }
+        c = _direct_client_with_indices(idx)
+        with pytest.raises(IncompatibleEngineError, match="nmslib"):
+            c.ensure_index("idx")
+
+    def test_raises_when_no_engine_reported_on_explicit_path(self):
+        """DEFAULT path: we sent an explicit Faiss method, so get_mapping MUST
+        echo a filter-capable engine. Silence (no method block) is fatal — the
+        create did not apply what we asked for."""
+        idx = MagicMock()
+        idx.exists.return_value = False
+        # Explicit create "succeeded" but the mapping reports no method/engine.
+        idx.get_mapping.return_value = {
+            "idx": {"mappings": {"properties": {"embedding": {"type": "knn_vector", "dimension": 4}}}}
+        }
+        c = _direct_client_with_indices(idx)
+        with pytest.raises(IncompatibleEngineError, match="no ANN engine"):
+            c.ensure_index("idx")
+
+    def test_tolerates_no_engine_reported_on_methodless_fallback(self):
+        """FALLBACK path (F1): when the service REJECTED the explicit method and
+        we created method-less, an UNREPORTED engine in get_mapping is tolerated
+        (the service does not always echo a server-resolved default). Raising
+        here would false-reject a valid Faiss index on the exact generation the
+        fallback exists to serve — filter-capability is confirmed by the live
+        integ test, not by this mapping read."""
+        idx = MagicMock()
+        idx.exists.return_value = False
+        reject = RequestError(400, "illegal_argument_exception", {})
+        idx.create.side_effect = [reject, None]  # explicit rejected, method-less ok
+        # Method-less create resolved to (presumably) faiss but echoes no engine.
+        idx.get_mapping.return_value = {
+            "idx": {"mappings": {"properties": {"embedding": {"type": "knn_vector", "dimension": 4}}}}
+        }
+        c = _direct_client_with_indices(idx)
+        assert c.ensure_index("idx") == "idx"  # tolerated, not raised
+        assert idx.create.call_count == 2
+        # Collection is now classified method-less-only.
+        assert c._explicit_method_supported is False
+
+    def test_nmslib_still_fatal_on_methodless_fallback(self):
+        """FALLBACK path: an UNREPORTED engine is tolerated, but a REPORTED
+        NMSLIB is still fatal — that is a known-broken index, not ambiguity."""
+        idx = MagicMock()
+        idx.exists.return_value = False
+        reject = RequestError(400, "illegal_argument_exception", {})
+        idx.create.side_effect = [reject, None]
+        idx.get_mapping.return_value = {
+            "idx": {"mappings": {"properties": {"embedding": {"method": {"engine": "nmslib"}}}}}
+        }
+        c = _direct_client_with_indices(idx)
+        with pytest.raises(IncompatibleEngineError, match="nmslib"):
+            c.ensure_index("idx")
+
+    def test_collection_classification_is_cached_across_indexes(self):
+        """LONG-TERM design: the explicit-vs-method-less classification is probed
+        ONCE and cached, so later indexes take the known path with no re-probe
+        and no per-index guessing."""
+        idx = MagicMock()
+        idx.exists.return_value = False
+        # Collection rejects explicit method: first index probes (2 creates:
+        # explicit-reject then method-less); the cache flips to method-less-only.
+        reject = RequestError(400, "illegal_argument_exception", {})
+        idx.create.side_effect = [reject, None, None]  # idx-a: reject+methodless; idx-b: methodless
+        idx.get_mapping.return_value = _faiss_mapping("idx-a")
+        c = _direct_client_with_indices(idx)
+
+        c.ensure_index("idx-a")
+        assert c._explicit_method_supported is False
+        assert idx.create.call_count == 2  # explicit(reject) + method-less
+
+        idx.get_mapping.return_value = _faiss_mapping("idx-b")
+        c.ensure_index("idx-b")
+        # Second index went STRAIGHT to method-less — no wasted explicit probe.
+        assert idx.create.call_count == 3
+        last_body = idx.create.call_args_list[-1].kwargs["body"]
+        assert "method" not in last_body["mappings"]["properties"]["embedding"]
+
+    def test_verifies_engine_on_preexisting_index(self):
+        """A pre-existing index (exists=True, no create) is still engine-verified
+        — it could have been created before this check existed."""
+        idx = MagicMock()
+        idx.exists.return_value = True
+        idx.get_mapping.return_value = {
+            "idx": {"mappings": {"properties": {"embedding": {"method": {"engine": "nmslib"}}}}}
+        }
+        c = _direct_client_with_indices(idx)
+        with pytest.raises(IncompatibleEngineError):
+            c.ensure_index("idx")
+        idx.create.assert_not_called()
+
+    def test_preexisting_index_with_unreported_engine_is_tolerated_on_fresh_client(self):
+        """A pre-existing index on a FRESH process (no collection classification
+        yet) must not be held to the explicit-method rule. We did not create it,
+        so an unreported engine is not evidence of a broken create. Regression:
+        the readiness probe and proposal-accept ingest both rejected every
+        existing index after a container restart."""
+        idx = MagicMock()
+        idx.exists.return_value = True
+        idx.get_mapping.return_value = {
+            "idx": {"mappings": {"properties": {"embedding": {"type": "knn_vector", "dimension": 4}}}}
+        }
+        c = _direct_client_with_indices(idx)
+        assert c._explicit_method_supported is None
+        assert c.ensure_index("idx") == "idx"
+        idx.create.assert_not_called()
+
+    def test_preexisting_index_lenient_even_when_collection_accepts_explicit(self):
+        """A collection classified explicit-capable (an earlier create here
+        succeeded with the method block) can still hold indexes created
+        method-less by older code. How a pre-existing index was created is
+        unknown, so it gets the lenient check either way."""
+        idx = MagicMock()
+        idx.exists.return_value = True
+        idx.get_mapping.return_value = {
+            "idx": {"mappings": {"properties": {"embedding": {"type": "knn_vector", "dimension": 4}}}}
+        }
+        c = _direct_client_with_indices(idx)
+        c._explicit_method_supported = True
+        assert c.ensure_index("idx") == "idx"
+        idx.create.assert_not_called()
+
+    def test_non_method_request_error_propagates_without_fallback(self):
+        """A create 400 that is NOT about the method block must propagate, not
+        silently fall back to method-less."""
+        idx = MagicMock()
+        idx.exists.return_value = False
+        idx.create.side_effect = RequestError(400, "mapper_exception_something_else", {})
+        c = _direct_client_with_indices(idx)
+        with pytest.raises(RequestError):
+            c.ensure_index("idx")
+        assert idx.create.call_count == 1  # no method-less retry
+
+    def test_lucene_engine_is_accepted(self):
+        idx = MagicMock()
+        idx.exists.return_value = False
+        idx.get_mapping.return_value = {
+            "idx": {"mappings": {"properties": {"embedding": {"method": {"engine": "lucene"}}}}}
+        }
+        c = _direct_client_with_indices(idx)
+        assert c.ensure_index("idx") == "idx"
+
+
 # ── Canonical mapping ────────────────────────────────────────────────────
 
 
 class TestBuildIndexMapping:
-    def test_embedding_is_method_less_knn_vector(self):
+    def test_embedding_defaults_to_explicit_faiss_hnsw(self):
+        # Default (method=True): explicit Faiss/HNSW so creation does not depend
+        # on the service's observed-unstable method-less default engine (#174).
         m = build_index_mapping(1024)["mappings"]["properties"]
-        assert m["embedding"] == {"type": "knn_vector", "dimension": 1024}
-        assert "method" not in m["embedding"]  # NEXTGEN rejects method.engine
+        assert m["embedding"]["type"] == "knn_vector"
+        assert m["embedding"]["dimension"] == 1024
+        assert m["embedding"]["method"] == {"name": "hnsw", "engine": "faiss", "space_type": "l2"}
+
+    def test_embedding_method_less_when_requested(self):
+        # Fallback path used by ensure_index when the service rejects an
+        # explicit method.engine at creation.
+        m = build_index_mapping(768, method=False)["mappings"]["properties"]
+        assert m["embedding"] == {"type": "knn_vector", "dimension": 768}
+        assert "method" not in m["embedding"]
 
     def test_filterable_fields_are_keyword(self):
         m = build_index_mapping(768)["mappings"]["properties"]
@@ -130,8 +338,16 @@ class TestOssRetry:
 
 
 class TestBulkWithRetry:
-    def _err(self, items):
-        return BulkIndexError(f"{len(items)} failed", items)
+    """bulk_with_retry now inspects helpers.bulk's (ok_count, errors) return
+    (raise_on_error=False) rather than catching BulkIndexError, so an exhausted
+    per-item 429 that opensearch-py silently drops is still visible as an error
+    entry. It re-submits only transient failures and RAISES PartialIndexError if
+    any doc fails to land — a partial write is never reported as success (#173).
+    """
+
+    def _ok_errors(self, error_items):
+        """Shape a (success_count, errors) return like helpers.bulk gives."""
+        return (0, error_items)
 
     def test_resubmits_only_transiently_failed(self):
         client = MagicMock()
@@ -139,21 +355,50 @@ class TestBulkWithRetry:
             {"_op_type": "index", "_index": "i", "entity_uri": "a"},
             {"_op_type": "index", "_index": "i", "entity_uri": "b"},
         ]
-        failed = self._err([{"index": {"status": 500, "data": {"entity_uri": "b"}}}])
-        with patch.object(retry_mod, "bulk", side_effect=[failed, None]) as mock_bulk:
-            bulk_with_retry(client, actions)
+        # First call: 'b' fails transiently (500). Second call: clean.
+        first = self._ok_errors([{"index": {"status": 500, "data": {"entity_uri": "b"}}}])
+        second = (1, [])
+        with patch.object(retry_mod, "bulk", side_effect=[first, second]) as mock_bulk:
+            bulk_with_retry(client, actions)  # returns cleanly — everything landed
         assert mock_bulk.call_count == 2
+        # Only the failed doc is re-submitted, rebuilt into an index action.
         assert mock_bulk.call_args_list[1].args[1] == [{"_op_type": "index", "_index": "i", "entity_uri": "b"}]
 
-    def test_terminal_item_reraises(self):
+    def test_terminal_item_raises_partial_index_error(self):
         client = MagicMock()
         actions = [{"_op_type": "index", "_index": "i", "entity_uri": "a"}]
-        failed = self._err([{"index": {"status": 400, "data": {"entity_uri": "a"}}}])
+        # A non-transient 400 can never be fixed by retrying → raise immediately.
+        errs = self._ok_errors([{"index": {"status": 400, "data": {"entity_uri": "a"}}}])
         with (
-            patch.object(retry_mod, "bulk", side_effect=failed) as mock_bulk,
-            pytest.raises(BulkIndexError),
+            patch.object(retry_mod, "bulk", return_value=errs) as mock_bulk,
+            pytest.raises(retry_mod.PartialIndexError) as ei,
         ):
             bulk_with_retry(client, actions)
+        assert mock_bulk.call_count == 1  # no retry on a terminal failure
+        assert ei.value.failed == 1 and ei.value.submitted == 1
+
+    def test_transient_exhaustion_raises_partial_index_error(self):
+        """The core #173 fix: docs that keep failing transiently until retries
+        are exhausted must RAISE, not return cleanly — otherwise the caller
+        reports a full write while docs were silently dropped."""
+        client = MagicMock()
+        actions = [{"_op_type": "index", "_index": "i", "entity_uri": "a"}]
+        # Always returns the same transient (429) error → never converges.
+        errs = self._ok_errors([{"index": {"status": 429, "data": {"entity_uri": "a"}}}])
+        with (
+            patch.object(retry_mod, "bulk", return_value=errs) as mock_bulk,
+            pytest.raises(retry_mod.PartialIndexError) as ei,
+        ):
+            bulk_with_retry(client, actions)
+        # Attempts = initial + OSS_MAX_RETRIES re-submits.
+        assert mock_bulk.call_count == retry_mod.OSS_MAX_RETRIES + 1
+        assert ei.value.failed == 1
+
+    def test_clean_write_returns_without_raising(self):
+        client = MagicMock()
+        actions = [{"_op_type": "index", "_index": "i", "entity_uri": "a"}]
+        with patch.object(retry_mod, "bulk", return_value=(1, [])) as mock_bulk:
+            bulk_with_retry(client, actions)  # no error
         assert mock_bulk.call_count == 1
 
     def test_empty_is_noop(self):
@@ -284,6 +529,40 @@ class TestDeleteByTerm:
         assert deleted == 4  # every matching doc was issued a delete (2 + 0 + 2)
         assert fake.delete.call_count == 4
 
+    def test_list_of_values_uses_one_terms_query_and_one_verify_loop(self):
+        # #1118: retiring the stale embeddings of N subjects on re-accept must
+        # not pay the refresh-lag verify wait N times — one `terms` query, one
+        # count gate, for the whole set.
+        c, fake = _delete_client(search_pages=[["a", "b"]], count_seq=[0])
+        with patch.object(client_mod.time, "sleep"):
+            deleted = c.delete_by_term("idx", "entity_uri", ["http://x/A", "http://x/B", "http://x/A"])
+        assert deleted == 2
+        bodies = [call.kwargs.get("body") or call.args[1] for call in fake.search.call_args_list]
+        page_q = next(b["query"] for b in bodies if b.get("size", 0) > 0)
+        assert page_q == {"terms": {"entity_uri": ["http://x/A", "http://x/B"]}}  # deduped, order kept
+        count_q = next(b["query"] for b in bodies if b.get("size") == 0)
+        assert "terms" in str(count_q)
+        # Exactly one delete pass + one count: the verify loop ran once for the set.
+        assert len(bodies) == 2
+
+    def test_empty_list_of_values_is_a_noop(self):
+        c, fake = _delete_client(search_pages=[], count_seq=[])
+        assert c.delete_by_term("idx", "entity_uri", []) == 0
+        fake.search.assert_not_called()
+
+    def test_list_that_is_empty_after_dropping_blanks_is_a_noop(self):
+        c, fake = _delete_client(search_pages=[], count_seq=[])
+        assert c.delete_by_term("idx", "entity_uri", ["", "", ""]) == 0
+        fake.search.assert_not_called()
+
+    def test_blanks_and_nones_are_dropped_from_the_terms_clause(self):
+        c, fake = _delete_client(search_pages=[["a"]], count_seq=[0])
+        with patch.object(client_mod.time, "sleep"):
+            assert c.delete_by_term("idx", "entity_uri", [None, "http://x/A", "", None]) == 1  # type: ignore[list-item]
+        bodies = [call.kwargs.get("body") or call.args[1] for call in fake.search.call_args_list]
+        page_q = next(b["query"] for b in bodies if b.get("size", 0) > 0)
+        assert page_q == {"terms": {"entity_uri": ["http://x/A"]}}
+
     def test_swallows_per_doc_delete_errors(self):
         c, fake = _delete_client(search_pages=[["1", "2"]], count_seq=[0])
         fake.delete.side_effect = [None, RuntimeError("gone")]
@@ -338,6 +617,8 @@ class TestSignedClientAuth:
             patch.object(client_mod, "AWSV4SignerAuth") as mock_auth,
             patch.object(client_mod, "OpenSearch") as mock_os,
         ):
+            mock_os.return_value.indices.exists.return_value = False
+            mock_os.return_value.indices.get_mapping.return_value = _faiss_mapping("idx")
             c = AossVectorClient(endpoint="https://x.aoss.us-west-2.on.aws", region="us-west-2", dimensions=4)
             c.ensure_index("idx")  # forces the signed client to be built
             args = mock_auth.call_args.args
@@ -376,6 +657,8 @@ class TestSignedClientPoolSize:
             patch.object(client_mod, "AWSV4SignerAuth"),
             patch.object(client_mod, "OpenSearch") as mock_os,
         ):
+            mock_os.return_value.indices.exists.return_value = False
+            mock_os.return_value.indices.get_mapping.return_value = _faiss_mapping("idx")
             c = AossVectorClient(endpoint="https://x.aoss.us-west-2.on.aws", region="us-west-2", dimensions=4)
             c.ensure_index("idx")  # forces the signed client to be built
             return mock_os.call_args.kwargs["pool_maxsize"]

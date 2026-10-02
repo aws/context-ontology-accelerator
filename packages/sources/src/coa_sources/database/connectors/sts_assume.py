@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 
 import boto3
+from botocore.config import Config
 from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
@@ -28,27 +29,51 @@ logger = logging.getLogger(__name__)
 MAX_SESSION_NAME_LEN = 64
 
 
+class DatasourceAssumeError(ValueError):
+    """``sts:AssumeRole`` on a customer-supplied datasource role was refused.
+
+    A ``ValueError`` subclass because that is what this module raised before, and callers
+    catch it. ``code`` carries STS's own error code as an attribute so a caller can branch
+    on it: the message deliberately omits the role ARN, and recovering the code by splitting
+    that message makes the branch depend on the wording.
+    """
+
+    def __init__(self, code: str) -> None:
+        """Build the caller-safe message from *code* and keep the code readable."""
+        super().__init__(f"Failed to assume role: {code}")
+        self.code = code
+
+
 def assume_datasource_session(
     role_arn: str,
     external_id: str,
     region: str,
     session_name: str,
+    config: Config | None = None,
 ) -> boto3.Session:
     """Assume *role_arn* with *external_id* and return a session for it.
 
-    Raises ``ValueError`` when either is empty. Callers must not fall back to an
-    unconditioned assume: an assume with no ExternalId carries no evidence of
-    which namespace requested it, which is the whole control.
+    Raises ``ValueError`` when either is empty, and
+    :class:`DatasourceAssumeError` (a ``ValueError``) carrying STS's error code in
+    ``code`` when STS refuses. Callers must not fall back to an unconditioned assume: an
+    assume with no ExternalId carries no evidence of which namespace requested it, which
+    is the whole control.
 
     *session_name* is truncated to the STS limit and lands in the data owner's
     CloudTrail, so callers should encode the requesting namespace in it.
+
+    *config* defaults to botocore's own, which suits the async discovery callers.
+    A caller on a synchronous customer path should pass ``sync_boto_config()``:
+    the default read timeout outlives API Gateway's 29 s, so a slow STS would be
+    reported to the customer as a gateway timeout rather than as a retryable
+    failure naming the call.
     """
     if not role_arn:
         raise ValueError("role_arn is required to assume a cross-account datasource role")
     if not external_id:
         raise ValueError("external_id is required to assume a cross-account datasource role")
 
-    sts = boto3.client("sts", region_name=region)
+    sts = boto3.client("sts", region_name=region, config=config)
     try:
         creds = sts.assume_role(
             RoleArn=role_arn,
@@ -61,7 +86,7 @@ def assume_datasource_session(
             "datasource_assume_role_failed",
             extra={"role_arn": role_arn, "session_name": session_name},
         )
-        raise ValueError(f"Failed to assume role: {e.response['Error']['Code']}") from e
+        raise DatasourceAssumeError(e.response["Error"]["Code"]) from e
 
     logger.info(
         "datasource_assume_role_ok",

@@ -24,11 +24,17 @@ os.environ.setdefault("INGESTION_QUEUE_URL", "https://sqs.us-east-1.amazonaws.co
 os.environ.setdefault("DELETION_STATE_MACHINE_ARN", "arn:aws:states:us-east-1:123:stateMachine/delete")
 os.environ.setdefault("BUCKET_NAME", "test-bucket")
 os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
+# CDK sets this on every Lambda that derives a name from it, and the accessor refuses to
+# default: the catalog name and the sts:ExternalId both come from it, and a default would
+# have a misdeployed component publish another deployment's values.
+os.environ.setdefault("RESOURCE_PREFIX", "coa-dev-")
 
 _NAMESPACE_ID = "550e8400-e29b-41d4-a716-446655440000"
-_SOURCE_ID = "src-001"
+_SOURCE_ID = "11111111-2222-4333-8444-555555555555"
 
 import coa_sources.api.sources_handler as _sh  # noqa: E402
+
+from tests.unit.conftest import dao_double  # noqa: E402
 
 _SH = "coa_sources.api.sources_handler"
 
@@ -132,7 +138,7 @@ def reset_lazy_clients():
 @pytest.mark.unit
 class TestHandleGet:
     def test_get_source_happy_path_database(self):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = _db_source_item()
 
         with patch(f"{_SH}._get_dao", return_value=mock_dao):
@@ -143,7 +149,7 @@ class TestHandleGet:
         assert body["sourceType"] == "DATABASE"
 
     def test_get_source_happy_path_documents(self):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = _doc_source_item()
 
         with patch(f"{_SH}._get_dao", return_value=mock_dao):
@@ -153,7 +159,7 @@ class TestHandleGet:
         assert body["sourceType"] == "DOCUMENTS"
 
     def test_get_source_not_found_returns_404(self):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = None
 
         with patch(f"{_SH}._get_dao", return_value=mock_dao):
@@ -165,7 +171,7 @@ class TestHandleGet:
     def test_get_source_ddb_error_returns_500(self):
         from botocore.exceptions import ClientError
 
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.side_effect = ClientError({"Error": {"Code": "InternalError"}}, "GetItem")
 
         with patch(f"{_SH}._get_dao", return_value=mock_dao):
@@ -188,13 +194,13 @@ class TestHandleDelete:
         helpers should patch them again locally to override.
         """
         with (
-            patch(f"{_SH}._delete_source_datazone_assets", return_value=0) as mock_assets,
+            patch(f"{_SH}._delete_source_datazone_assets", return_value=(0, True)) as mock_assets,
             patch(f"{_SH}._delete_source_scan_jobs", return_value=0) as mock_scans,
         ):
             yield mock_assets, mock_scans
 
     def test_delete_database_source_happy_path(self):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = _db_source_item("APPROVED")
 
         with patch(f"{_SH}._get_dao", return_value=mock_dao):
@@ -213,7 +219,7 @@ class TestHandleDelete:
         item["glueConnectionName"] = _PROVISIONED_FED_NAME
         item["athenaDataCatalogName"] = _PROVISIONED_FED_NAME
 
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = item
         mock_sts = MagicMock()
         mock_sts.assume_role.return_value = {
@@ -237,9 +243,52 @@ class TestHandleDelete:
             athena_catalog_name=_PROVISIONED_FED_NAME,
             session=mock_session.return_value,
         )
-        # The source row, plus the release of the catalog-ownership claim that
-        # named it — a JDBC/custom-connector source deletes both.
-        assert [c.args[0]["SK"] for c in mock_dao.delete.call_args_list] == [f"SRC#{_SOURCE_ID}", "CLAIM"]
+        # The claim, THEN the row: the claim has to go while the row is still there, or
+        # the derived name is left owned by a source that no longer exists.
+        assert [c.args[0]["SK"] for c in mock_dao.delete.call_args_list] == ["CLAIM", f"SRC#{_SOURCE_ID}"]
+
+    def test_delete_tears_down_a_legacy_row_that_carries_no_sub_type(self):
+        """An ABSENT ``sourceSubType`` is a live row shape, and it is the one an inverted
+        guard drops.
+
+        The guard was ``sub_type != CUSTOM_CONNECTOR``, which ``""`` satisfied; the
+        positive membership it became satisfies no absent value. A legacy JDBC row whose
+        federation step provisioned a Glue catalog and connection carries both stored names
+        equal to the derived one, so skipping this block deletes the row and returns 200
+        having leaked the Glue catalog, the Glue connection and the Lake Formation
+        registration — with nothing left able to find them, because the row was the only
+        handle. Exactly the failure the inversion was written to close, through the other
+        door.
+        """
+        item = _db_source_item("APPROVED")
+        item.pop("sourceSubType")
+        item["glueConnectionName"] = _PROVISIONED_FED_NAME
+        item["athenaDataCatalogName"] = _PROVISIONED_FED_NAME
+
+        mock_dao = dao_double()
+        mock_dao.get.return_value = item
+        mock_sts = MagicMock()
+        mock_sts.assume_role.return_value = {
+            "Credentials": {"AccessKeyId": "k", "SecretAccessKey": "s", "SessionToken": "t"}
+        }
+
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._FEDERATION_PROVISIONER_ROLE_ARN", "arn:aws:iam::123:role/fed"),
+            patch(f"{_SH}._get_sts", return_value=mock_sts),
+            patch(f"{_SH}.boto3.Session") as mock_session,
+            patch(f"{_SH}.cleanup_federated_resources") as mock_cleanup,
+        ):
+            status, _ = _parse(_current_sh()._handle_delete(_NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 200
+        mock_cleanup.assert_called_once_with(
+            glue_connection_name=_PROVISIONED_FED_NAME,
+            athena_catalog_name=_PROVISIONED_FED_NAME,
+            session=mock_session.return_value,
+        )
+        # No sub-type means no claim was ever written, so only the row is deleted.
+        assert [c.args[0]["SK"] for c in mock_dao.delete.call_args_list] == [f"SRC#{_SOURCE_ID}"]
 
     def test_delete_database_source_skips_teardown_of_a_name_it_did_not_provision(self):
         """A steward can seed any value into athenaDataCatalogName, because
@@ -255,7 +304,7 @@ class TestHandleDelete:
         item = _db_source_item("APPROVED")
         item["athenaDataCatalogName"] = _FOREIGN_FED_NAME
 
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = item
         mock_sts = MagicMock()
 
@@ -284,7 +333,7 @@ class TestHandleDelete:
         item["sourceSubType"] = "JDBC_DATABASE"
         item["glueConnectionName"] = _FOREIGN_FED_NAME
 
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = item
         mock_sts = MagicMock()
 
@@ -299,9 +348,9 @@ class TestHandleDelete:
         assert status == 200
         mock_cleanup.assert_not_called()
         mock_sts.assume_role.assert_not_called()
-        # The source row, plus the release of the catalog-ownership claim that
-        # named it — a JDBC/custom-connector source deletes both.
-        assert [c.args[0]["SK"] for c in mock_dao.delete.call_args_list] == [f"SRC#{_SOURCE_ID}", "CLAIM"]
+        # The claim, THEN the row: the claim has to go while the row is still there, or
+        # the derived name is left owned by a source that no longer exists.
+        assert [c.args[0]["SK"] for c in mock_dao.delete.call_args_list] == ["CLAIM", f"SRC#{_SOURCE_ID}"]
 
     def test_delete_database_source_tears_down_only_the_name_that_matches(self):
         """A row carrying one provisioned name and one seeded name must tear down the
@@ -312,7 +361,7 @@ class TestHandleDelete:
         item["glueConnectionName"] = _PROVISIONED_FED_NAME
         item["athenaDataCatalogName"] = _FOREIGN_FED_NAME
 
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = item
         mock_sts = MagicMock()
         mock_sts.assume_role.return_value = {
@@ -341,7 +390,7 @@ class TestHandleDelete:
         item = _db_source_item("APPROVED")
         item["athenaDataCatalogName"] = _FOREIGN_FED_NAME
 
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = item
 
         with (
@@ -366,7 +415,7 @@ class TestHandleDelete:
         """Most DATABASE sources carry neither federated name — a native Glue source
         never has one. Warning on those would put a line on every such delete and
         train readers to ignore the one that matters."""
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = _db_source_item("APPROVED")  # no federated names
 
         with (
@@ -382,7 +431,7 @@ class TestHandleDelete:
     def test_delete_database_source_skips_athena_cleanup_when_no_refs(self):
         """Sources without Athena federation (S3/Iceberg, or never scanned)
         should not assume the role or run cleanup at all."""
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = _db_source_item("APPROVED")  # no glueConnectionName
         mock_sts = MagicMock()
 
@@ -404,7 +453,7 @@ class TestHandleDelete:
         item = _db_source_item("APPROVED")
         item["glueConnectionName"] = _PROVISIONED_FED_NAME
 
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = item
         mock_sts = MagicMock()
         mock_sts.assume_role.side_effect = RuntimeError("AssumeRole denied")
@@ -425,7 +474,7 @@ class TestHandleDelete:
         item = _db_source_item("APPROVED")
         item["glueConnectionName"] = _PROVISIONED_FED_NAME
 
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = item
         mock_sts = MagicMock()
         mock_sts.assume_role.return_value = {}  # no Credentials
@@ -452,7 +501,7 @@ class TestHandleDelete:
         # a catalog belonging to something else.
         item["athenaDataCatalogName"] = _FOREIGN_FED_NAME
 
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = item
         mock_sts = MagicMock()
 
@@ -473,9 +522,8 @@ class TestHandleDelete:
         # catalog — reporting success while leaking the registration.
         mock_cleanup.assert_not_called()
         mock_sts.assume_role.assert_not_called()
-        # The source row, plus the release of the catalog-ownership claim that
-        # named it — the claim record must not outlive the catalog it describes.
-        assert [c.args[0]["SK"] for c in mock_dao.delete.call_args_list] == [f"SRC#{_SOURCE_ID}", "CLAIM"]
+        # The claim, then the row: the claim must not outlive what it describes.
+        assert [c.args[0]["SK"] for c in mock_dao.delete.call_args_list] == ["CLAIM", f"SRC#{_SOURCE_ID}"]
 
     def test_delete_custom_connector_source_derives_the_catalog_name_from_the_source_id(self):
         """The source id is the ONLY input to the name, which is what makes the row's
@@ -485,7 +533,7 @@ class TestHandleDelete:
         item = _db_source_item("APPROVED")
         item["sourceSubType"] = "CUSTOM_CONNECTOR"
 
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = item
 
         with (
@@ -508,7 +556,7 @@ class TestHandleDelete:
         item["sourceSubType"] = "CUSTOM_CONNECTOR"
         item["athenaDataCatalogName"] = _PROVISIONED_FED_NAME
 
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = item
 
         with (
@@ -528,7 +576,7 @@ class TestHandleDelete:
         item["glueConnectionName"] = _PROVISIONED_FED_NAME
         item["athenaDataCatalogName"] = _PROVISIONED_FED_NAME
 
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = item
         mock_sts = MagicMock()
         mock_sts.assume_role.return_value = {
@@ -552,12 +600,12 @@ class TestHandleDelete:
     def test_delete_database_source_cleans_up_datazone_assets_and_scan_jobs(self):
         """DATABASE delete must invoke DataZone asset cleanup and scan-job
         cleanup before deleting the sources-table row."""
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = _db_source_item("APPROVED")
 
         with (
             patch(f"{_SH}._get_dao", return_value=mock_dao),
-            patch(f"{_SH}._delete_source_datazone_assets", return_value=3) as mock_assets,
+            patch(f"{_SH}._delete_source_datazone_assets", return_value=(3, True)) as mock_assets,
             patch(f"{_SH}._delete_source_scan_jobs", return_value=2) as mock_scans,
         ):
             status, body = _parse(_current_sh()._handle_delete(_NAMESPACE_ID, _SOURCE_ID))
@@ -568,11 +616,12 @@ class TestHandleDelete:
         mock_scans.assert_called_once_with(_SOURCE_ID)
         mock_dao.delete.assert_called_once()
 
-    def test_delete_database_source_proceeds_when_datazone_cleanup_fails(self):
-        """DataZone asset cleanup failures are logged but must not block
-        the DDB delete — they are best-effort and the namespace-level
-        cleanup will sweep any leftovers."""
-        mock_dao = MagicMock()
+    def test_delete_database_source_keeps_row_when_datazone_cleanup_raises(self):
+        """A DataZone cleanup that RAISES must NOT delete the row: the row is the
+        only handle on any surviving assets, so dropping it would orphan them.
+        The delete fails (500) so it stays retryable, rather than reporting a
+        success that silently leaked assets."""
+        mock_dao = dao_double()
         mock_dao.get.return_value = _db_source_item("APPROVED")
 
         with (
@@ -583,21 +632,38 @@ class TestHandleDelete:
             ),
             patch(f"{_SH}._delete_source_scan_jobs", return_value=0),
         ):
-            status, body = _parse(_current_sh()._handle_delete(_NAMESPACE_ID, _SOURCE_ID))
+            status, _body = _parse(_current_sh()._handle_delete(_NAMESPACE_ID, _SOURCE_ID))
 
-        assert status == 200
-        assert body["status"] == "DELETED"
-        mock_dao.delete.assert_called_once()
+        assert status == 500
+        mock_dao.delete.assert_not_called()
 
-    def test_delete_database_source_proceeds_when_scan_job_cleanup_fails(self):
-        """Scan-job cleanup failures are logged but must not block the DDB
-        delete; the rows are cleaned up by namespace-level deletion."""
-        mock_dao = MagicMock()
+    def test_delete_database_source_keeps_row_when_datazone_cleanup_incomplete(self):
+        """A DataZone cleanup that returns complete=False (deadline/pagination/
+        per-asset failure) also keeps the row and fails the delete, so the
+        surviving assets are retried instead of orphaned."""
+        mock_dao = dao_double()
         mock_dao.get.return_value = _db_source_item("APPROVED")
 
         with (
             patch(f"{_SH}._get_dao", return_value=mock_dao),
-            patch(f"{_SH}._delete_source_datazone_assets", return_value=0),
+            # Deleted some, but did not finish.
+            patch(f"{_SH}._delete_source_datazone_assets", return_value=(5, False)),
+            patch(f"{_SH}._delete_source_scan_jobs", return_value=0),
+        ):
+            status, _body = _parse(_current_sh()._handle_delete(_NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 500
+        mock_dao.delete.assert_not_called()
+
+    def test_delete_database_source_proceeds_when_scan_job_cleanup_fails(self):
+        """Scan-job cleanup failures are logged but must not block the DDB
+        delete; the rows are cleaned up by namespace-level deletion."""
+        mock_dao = dao_double()
+        mock_dao.get.return_value = _db_source_item("APPROVED")
+
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._delete_source_datazone_assets", return_value=(0, True)),
             patch(
                 f"{_SH}._delete_source_scan_jobs",
                 side_effect=RuntimeError("DDB throttled"),
@@ -610,7 +676,7 @@ class TestHandleDelete:
         mock_dao.delete.assert_called_once()
 
     def test_delete_document_source_happy_path(self):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = _doc_source_item("COMPLETED")
         mock_sfn = MagicMock()
 
@@ -626,7 +692,7 @@ class TestHandleDelete:
         mock_sfn.start_execution.assert_called_once()
 
     def test_delete_source_not_found_returns_404(self):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = None
 
         with patch(f"{_SH}._get_dao", return_value=mock_dao):
@@ -635,7 +701,7 @@ class TestHandleDelete:
         assert status == 404
 
     def test_delete_document_already_deleting_returns_202(self):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = _doc_source_item("DELETING")
 
         with patch(f"{_SH}._get_dao", return_value=mock_dao):
@@ -645,7 +711,7 @@ class TestHandleDelete:
         assert body["status"] == "DELETING"
 
     def test_delete_document_active_status_returns_409(self):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = _doc_source_item("REGISTERED")
 
         with patch(f"{_SH}._get_dao", return_value=mock_dao):
@@ -654,7 +720,7 @@ class TestHandleDelete:
         assert status == 409
 
     def test_delete_database_active_status_returns_409(self):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = _db_source_item("SCANNING")
 
         with patch(f"{_SH}._get_dao", return_value=mock_dao):
@@ -665,7 +731,7 @@ class TestHandleDelete:
     def test_delete_ddb_error_returns_500(self):
         from botocore.exceptions import ClientError
 
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.side_effect = ClientError({"Error": {"Code": "InternalError"}}, "GetItem")
 
         with patch(f"{_SH}._get_dao", return_value=mock_dao):
@@ -676,7 +742,7 @@ class TestHandleDelete:
     def test_delete_document_sfn_fails_returns_500(self):
         from botocore.exceptions import ClientError
 
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = _doc_source_item("COMPLETED")
         mock_sfn = MagicMock()
         mock_sfn.start_execution.side_effect = ClientError({"Error": {"Code": "SFNError"}}, "StartExecution")
@@ -693,7 +759,7 @@ class TestHandleDelete:
     def test_delete_database_ddb_delete_fails_returns_500(self):
         from botocore.exceptions import ClientError
 
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = _db_source_item("APPROVED")
         mock_dao.delete.side_effect = ClientError({"Error": {"Code": "InternalError"}}, "DeleteItem")
 
@@ -712,10 +778,12 @@ class TestHandleDelete:
 class TestDeleteSourceDatazoneAssets:
     def test_returns_zero_when_no_smus_domain(self):
         with patch(f"{_SH}._SMUS_DOMAIN_ID", ""):
-            result = _current_sh()._delete_source_datazone_assets(_NAMESPACE_ID, _SOURCE_ID)
+            result, complete = _current_sh()._delete_source_datazone_assets(_NAMESPACE_ID, _SOURCE_ID)
         assert result == 0
+        # No domain configured → nothing to clean → complete.
+        assert complete is True
 
-    def test_returns_zero_when_namespace_has_no_project_id(self):
+    def test_incomplete_when_namespace_has_no_project_id(self):
         with (
             patch(f"{_SH}._SMUS_DOMAIN_ID", "dz-domain-1"),
             patch(
@@ -723,8 +791,11 @@ class TestDeleteSourceDatazoneAssets:
                 return_value=None,
             ),
         ):
-            result = _current_sh()._delete_source_datazone_assets(_NAMESPACE_ID, _SOURCE_ID)
+            result, complete = _current_sh()._delete_source_datazone_assets(_NAMESPACE_ID, _SOURCE_ID)
         assert result == 0
+        # Domain configured but project unresolved → assets may exist and are
+        # unreachable → NOT complete, so the caller keeps the row.
+        assert complete is False
 
     def test_deletes_only_assets_with_matching_prefix(self):
         """search_assets is fuzzy; only assets whose name starts with
@@ -758,9 +829,10 @@ class TestDeleteSourceDatazoneAssets:
                 return_value=mock_client,
             ),
         ):
-            removed = _current_sh()._delete_source_datazone_assets(_NAMESPACE_ID, _SOURCE_ID)
+            removed, complete = _current_sh()._delete_source_datazone_assets(_NAMESPACE_ID, _SOURCE_ID)
 
         assert removed == 2
+        assert complete is True
         assert mock_client.search_assets.call_count == 2
         deleted_ids = [c.kwargs["asset_id"] for c in mock_client.delete_asset.call_args_list]
         assert deleted_ids == ["a1", "b2"]
@@ -789,11 +861,13 @@ class TestDeleteSourceDatazoneAssets:
                 return_value=mock_client,
             ),
         ):
-            removed = _current_sh()._delete_source_datazone_assets(_NAMESPACE_ID, _SOURCE_ID)
+            removed, complete = _current_sh()._delete_source_datazone_assets(_NAMESPACE_ID, _SOURCE_ID)
 
         # b succeeded, a failed → 1 removed
         assert removed == 1
         assert mock_client.delete_asset.call_count == 2
+        # A per-asset delete failed → that asset may still exist → NOT complete.
+        assert complete is False
 
     def test_collects_all_pages_before_deleting(self):
         """Regression: deleting assets must not perturb search pagination.
@@ -841,10 +915,11 @@ class TestDeleteSourceDatazoneAssets:
                 return_value=mock_client,
             ),
         ):
-            removed = _current_sh()._delete_source_datazone_assets(_NAMESPACE_ID, _SOURCE_ID)
+            removed, complete = _current_sh()._delete_source_datazone_assets(_NAMESPACE_ID, _SOURCE_ID)
 
         # All 75 across both pages must be deleted — none orphaned.
         assert removed == 75
+        assert complete is True
         assert mock_client.search_assets.call_count == 2
         assert mock_client.delete_asset.call_count == 75
 
@@ -877,12 +952,14 @@ class TestDeleteSourceDatazoneAssets:
                 return_value=mock_client,
             ),
         ):
-            removed = _current_sh()._delete_source_datazone_assets(_NAMESPACE_ID, _SOURCE_ID)
+            removed, complete = _current_sh()._delete_source_datazone_assets(_NAMESPACE_ID, _SOURCE_ID)
 
         # Budget=0 → deadline already past → search and delete both skipped.
         assert removed == 0
         assert mock_client.search_assets.call_count == 0
         assert mock_client.delete_asset.call_count == 0
+        # Stopped on the budget before doing anything → NOT complete.
+        assert complete is False
 
     @staticmethod
     def _run_with_client(mock_client):
@@ -905,9 +982,10 @@ class TestDeleteSourceDatazoneAssets:
         mock_client = MagicMock()
         mock_client.search_assets.return_value = MagicMock(items=[], next_token=None)
 
-        removed = self._run_with_client(mock_client)
+        removed, complete = self._run_with_client(mock_client)
 
         assert removed == 0
+        assert complete is True
         assert mock_client.search_assets.call_count == 1
         assert mock_client.delete_asset.call_count == 0
 
@@ -922,9 +1000,10 @@ class TestDeleteSourceDatazoneAssets:
         mock_client = MagicMock()
         mock_client.search_assets.return_value = MagicMock(items=items, next_token=None)
 
-        removed = self._run_with_client(mock_client)
+        removed, complete = self._run_with_client(mock_client)
 
         assert removed == 3
+        assert complete is True
         assert mock_client.search_assets.call_count == 1
         assert mock_client.delete_asset.call_count == 3
 
@@ -945,13 +1024,16 @@ class TestDeleteSourceDatazoneAssets:
         mock_client = MagicMock()
         mock_client.search_assets.side_effect = _page
 
-        removed = self._run_with_client(mock_client)
+        removed, complete = self._run_with_client(mock_client)
 
         # Bounded by the 100-page guard (the loop's else-branch logs the limit).
         assert mock_client.search_assets.call_count == 100
         # 100 collected asset ids → 100 delete attempts.
         assert mock_client.delete_asset.call_count == 100
         assert removed == 100
+        # Hit the pagination cap without exhausting the cursor → NOT complete,
+        # so the caller keeps the row and retries the rest.
+        assert complete is False
 
     def test_search_assets_exception_propagates(self):
         """An exception from search_assets (collection phase) is not swallowed.
@@ -983,7 +1065,7 @@ class TestDeleteSourceScanJobs:
             items=[{"PK": f"SRC#{_SOURCE_ID}", "SK": "2026-01-03T00:00:00Z"}],
             last_evaluated_key=None,
         )
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.query.side_effect = [page_one, page_two]
 
         with patch(f"{_SH}._get_scan_dao", return_value=mock_dao):
@@ -997,7 +1079,7 @@ class TestDeleteSourceScanJobs:
         assert all(k["PK"] == f"SRC#{_SOURCE_ID}" for k in deleted_keys)
 
     def test_no_rows_skips_batch_delete(self):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.query.return_value = MagicMock(items=[], last_evaluated_key=None)
 
         with patch(f"{_SH}._get_scan_dao", return_value=mock_dao):
@@ -1027,13 +1109,13 @@ class TestHandleDeleteCounter:
     @pytest.fixture(autouse=True)
     def _mock_database_cleanup_helpers(self):
         with (
-            patch(f"{_SH}._delete_source_datazone_assets", return_value=0),
+            patch(f"{_SH}._delete_source_datazone_assets", return_value=(0, True)),
             patch(f"{_SH}._delete_source_scan_jobs", return_value=0),
         ):
             yield
 
     def test_delete_database_source_decrements_count(self):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = _db_source_item("APPROVED")
 
         with (
@@ -1047,7 +1129,7 @@ class TestHandleDeleteCounter:
         mock_counter.assert_called_once_with(_NAMESPACE_ID, SourceType.DATABASE, -1)
 
     def test_delete_document_source_decrements_count(self):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = _doc_source_item("COMPLETED")
 
         with (
@@ -1061,7 +1143,7 @@ class TestHandleDeleteCounter:
         mock_counter.assert_called_once_with(_NAMESPACE_ID, SourceType.DOCUMENTS, -1)
 
     def test_delete_missing_source_does_not_touch_count(self):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = None
 
         with (
@@ -1077,7 +1159,7 @@ class TestHandleDeleteCounter:
         """A document source already transitioning to DELETING returns 202
         early without decrementing again, so concurrent deletes can't drive
         the counter below the true total."""
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = _doc_source_item("DELETING")
 
         with (
@@ -1098,7 +1180,7 @@ class TestHandleDeleteCounter:
         item = _db_source_item("APPROVED")
         item["glueConnectionName"] = _PROVISIONED_FED_NAME
 
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = item
         mock_sts = MagicMock()
         mock_sts.assume_role.side_effect = RuntimeError("AssumeRole denied")
@@ -1129,7 +1211,7 @@ class TestHandleRescan:
         # failure. isRescan stays false so discovery does not take the merge
         # path (there is nothing curated to preserve on a scan-failed source).
         mock_dao.get.return_value = _db_source_item("SCAN_FAILED")
-        mock_scan_dao = MagicMock()
+        mock_scan_dao = dao_double()
         mock_sqs = MagicMock()
 
         with (
@@ -1177,6 +1259,27 @@ class TestHandleRescan:
         # open, so the backup blob is the approved pre-image). From APPROVED the
         # live assets ARE the baseline and any leftover backup must be ignored.
         assert body_json["hadOpenRescan"] is (entry_status == "RESCAN_REVIEW")
+
+    def test_rescan_approved_connector_backed_source_is_allowed(self):
+        # The drift re-scan gate reads sourceType and status only, so it covers every
+        # DATABASE sub-type. The customer documentation states as much, so a sub-type
+        # exclusion added here would make that statement wrong silently.
+        item = _db_source_item("APPROVED")
+        item["sourceSubType"] = "DATABRICKS_SQL_WAREHOUSE"
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = item
+        mock_sqs = MagicMock()
+
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._get_scan_dao", return_value=MagicMock()),
+            patch(f"{_SH}._get_sqs", return_value=mock_sqs),
+            patch(f"{_SH}._SCAN_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/scan-queue"),
+        ):
+            status, _body = _parse(_current_sh()._handle_rescan({}, _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 202
+        assert json.loads(mock_sqs.send_message.call_args[1]["MessageBody"])["isRescan"] is True
 
     def test_rescan_with_open_review_needs_confirmation(self):
         # Re-scanning a source that already has an open re-scan review throws
@@ -1274,7 +1377,7 @@ class TestHandleRescan:
         assert body["error"] == "Invalid JSON body"
 
     def test_rescan_document_source_happy_path(self):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = _doc_source_item("SCAN_FAILED")
         mock_sqs = MagicMock()
 
@@ -1289,7 +1392,7 @@ class TestHandleRescan:
         mock_sqs.send_message.assert_called_once()
 
     def test_rescan_source_not_found_returns_404(self):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = None
 
         with patch(f"{_SH}._get_dao", return_value=mock_dao):
@@ -1326,7 +1429,7 @@ class TestHandleRescan:
 
     def test_rescan_document_completed_is_allowed(self):
         """Documents can re-scan from COMPLETED (re-ingest) unlike DATABASE sources."""
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = _doc_source_item("COMPLETED")
         mock_sqs = MagicMock()
 
@@ -1345,7 +1448,7 @@ class TestHandleRescan:
         ["REGISTERED", "SCANNING"],
     )
     def test_rescan_document_rejects_active_statuses(self, status):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = _doc_source_item(status)
 
         with patch(f"{_SH}._get_dao", return_value=mock_dao):
@@ -1356,7 +1459,7 @@ class TestHandleRescan:
     def test_rescan_ddb_error_returns_500(self):
         from botocore.exceptions import ClientError
 
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.side_effect = ClientError({"Error": {"Code": "InternalError"}}, "GetItem")
 
         with patch(f"{_SH}._get_dao", return_value=mock_dao):
@@ -1367,7 +1470,7 @@ class TestHandleRescan:
     def test_rescan_document_sqs_fails_returns_500(self):
         from botocore.exceptions import ClientError
 
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = _doc_source_item("SCAN_FAILED")
         mock_sqs = MagicMock()
         mock_sqs.send_message.side_effect = ClientError({"Error": {"Code": "SQSError"}}, "SendMessage")
@@ -1385,7 +1488,7 @@ class TestHandleRescan:
         item = _doc_source_item("SCAN_FAILED")
         item.pop("tenantId")
 
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = item
 
         with patch(f"{_SH}._get_dao", return_value=mock_dao):
@@ -1402,7 +1505,7 @@ class TestHandleRescan:
 @pytest.mark.unit
 class TestHandleCreate:
     def test_create_invalid_json_returns_400(self):
-        mock_ns_dao = MagicMock()
+        mock_ns_dao = dao_double()
 
         with patch(f"{_SH}._get_ns_dao", return_value=mock_ns_dao):
             event = _make_event("POST", "/namespaces/{namespaceId}/sources", body=None)
@@ -1412,7 +1515,7 @@ class TestHandleCreate:
         assert status == 400
 
     def test_create_namespace_not_found_returns_404(self):
-        mock_ns_dao = MagicMock()
+        mock_ns_dao = dao_double()
         mock_ns_dao.get.return_value = None
 
         with patch(f"{_SH}._get_ns_dao", return_value=mock_ns_dao):
@@ -1436,7 +1539,7 @@ class TestHandleCreate:
         assert status == 404
 
     def test_create_database_missing_database_source_returns_400(self):
-        mock_ns_dao = MagicMock()
+        mock_ns_dao = dao_double()
         mock_ns_dao.get.return_value = {"PK": f"NS#{_NAMESPACE_ID}"}
 
         with patch(f"{_SH}._get_ns_dao", return_value=mock_ns_dao):
@@ -1450,7 +1553,7 @@ class TestHandleCreate:
         assert status == 400
 
     def test_create_documents_missing_document_source_returns_400(self):
-        mock_ns_dao = MagicMock()
+        mock_ns_dao = dao_double()
         mock_ns_dao.get.return_value = {"PK": f"NS#{_NAMESPACE_ID}"}
 
         with patch(f"{_SH}._get_ns_dao", return_value=mock_ns_dao):
@@ -1472,7 +1575,7 @@ class TestHandleCreate:
 @pytest.mark.unit
 class TestHandlerRouting:
     def test_handler_routes_get_source(self):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = _db_source_item()
 
         with patch(f"{_SH}._get_dao", return_value=mock_dao):
@@ -1486,10 +1589,20 @@ class TestHandlerRouting:
         assert status == 200
 
     def test_handler_routes_delete_source(self):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = _db_source_item("APPROVED")
 
-        with patch(f"{_SH}._get_dao", return_value=mock_dao):
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            # This is a routing test — stub the cleanup tail so the outcome is
+            # deterministic (a complete cleanup) rather than depending on live
+            # DataZone/DDB access. The cleanup contract itself is covered by
+            # test_async_source_deletion.py.
+            patch(f"{_SH}._delete_source_datazone_assets", return_value=(0, True)),
+            patch(f"{_SH}._delete_source_scan_jobs", return_value=0),
+            patch(f"{_SH}.adjust_namespace_source_count"),
+            patch(f"{_SH}.release_platform_catalog"),
+        ):
             event = _make_event(
                 "DELETE",
                 "/namespaces/{namespaceId}/sources/{sourceId}",
@@ -1500,10 +1613,10 @@ class TestHandlerRouting:
         assert status == 200
 
     def test_handler_routes_rescan(self):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         # Re-scan now requires the source to be in SCAN_FAILED.
         mock_dao.get.return_value = _db_source_item("SCAN_FAILED")
-        mock_scan_dao = MagicMock()
+        mock_scan_dao = dao_double()
         mock_sqs = MagicMock()
 
         with (
@@ -1545,9 +1658,9 @@ class TestHandlerRouting:
         assert status == 404
 
     def test_handler_get_scan_job_route(self):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = _db_source_item()
-        mock_scan_dao = MagicMock()
+        mock_scan_dao = dao_double()
         mock_scan_dao.get.return_value = {
             "status": "COMPLETED",
             "scanType": "full",
@@ -1569,7 +1682,7 @@ class TestHandlerRouting:
         assert status == 200
 
     def test_handler_update_metadata_route(self):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = _db_source_item()
 
         _DR = "coa_sources.api.database_routes"
@@ -1708,3 +1821,278 @@ class TestPathParameterDecoding:
 
         assert status == 200
         handler_mock.assert_called_once_with(_NAMESPACE_ID, _SOURCE_ID, "sales.discount%50")
+
+
+@pytest.mark.unit
+class TestScheduledRescan:
+    """EventBridge Scheduler invokes the API Lambda to fire a SCHEDULED rescan (#683 R7)."""
+
+    def test_scheduled_event_triggers_rescan_with_scheduled_trigger(self):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = _db_source_item("APPROVED")
+        mock_scan_dao = MagicMock()
+        mock_sqs = MagicMock()
+
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._get_scan_dao", return_value=mock_scan_dao),
+            patch(f"{_SH}._get_sqs", return_value=mock_sqs),
+            patch(f"{_SH}._SCAN_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/scan-queue"),
+        ):
+            resp = _current_sh().handler(
+                {"scheduledRescan": True, "namespaceId": _NAMESPACE_ID, "sourceId": _SOURCE_ID},
+                None,
+            )
+
+        assert resp["ok"] is True
+        assert resp["statusCode"] == 202
+        # The scan job is stamped with the SCHEDULED trigger, not MANUAL.
+        put_item = mock_scan_dao.put.call_args[0][0]
+        assert put_item["triggerType"] == "SCHEDULED"
+        mock_sqs.send_message.assert_called_once()
+
+    def test_scheduled_event_missing_ids_fails_the_invocation(self):
+        """A payload with no ids means the schedule itself is malformed. Scheduler
+        reads any returned value as success, so returning would let a dead
+        schedule tick forever; raising is what surfaces it to the retry policy
+        and DLQ. The raise has to escape handler()'s catch-all to count."""
+        with pytest.raises(ValueError, match="namespaceId and sourceId"):
+            _current_sh().handler({"scheduledRescan": True}, None)
+
+    def test_declined_rescan_is_reported_without_failing_the_invocation(self):
+        """A 409 for an open review is the designed outcome, not a broken
+        schedule, so it must not make Scheduler retry."""
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = _db_source_item("RESCAN_REVIEW")
+        mock_scan_dao = MagicMock()
+        mock_sqs = MagicMock()
+
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._get_scan_dao", return_value=mock_scan_dao),
+            patch(f"{_SH}._get_sqs", return_value=mock_sqs),
+            patch(f"{_SH}._SCAN_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/scan-queue"),
+        ):
+            resp = _current_sh().handler(
+                {"scheduledRescan": True, "namespaceId": _NAMESPACE_ID, "sourceId": _SOURCE_ID},
+                None,
+            )
+
+        assert resp["ok"] is False
+        assert resp["statusCode"] == 409
+        mock_sqs.send_message.assert_not_called()
+
+
+@pytest.mark.unit
+class TestEventRescanCooldown:
+    """EVENT rescans coalesce upstream-change bursts via a cooldown (#683 R8)."""
+
+    def test_debounced_when_recently_scanned(self):
+        from datetime import UTC, datetime
+
+        from coa_control_plane_server.models.scan_trigger import ScanTrigger
+
+        item = _db_source_item("APPROVED")
+        item["lastScanAt"] = datetime.now(UTC).isoformat()
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = item
+        mock_scan_dao = MagicMock()
+        mock_sqs = MagicMock()
+
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._get_scan_dao", return_value=mock_scan_dao),
+            patch(f"{_SH}._get_sqs", return_value=mock_sqs),
+            patch(f"{_SH}._EVENT_RESCAN_COOLDOWN_S", 300),
+        ):
+            status, body = _parse(
+                _current_sh()._handle_rescan({}, _NAMESPACE_ID, _SOURCE_ID, trigger=ScanTrigger.EVENT)
+            )
+
+        assert status == 200
+        assert body.get("debounced") is True
+        mock_scan_dao.put.assert_not_called()
+        mock_sqs.send_message.assert_not_called()
+
+    def test_proceeds_when_no_recent_scan(self):
+        from coa_control_plane_server.models.scan_trigger import ScanTrigger
+
+        item = _db_source_item("APPROVED")
+        item.pop("lastScanAt", None)
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = item
+        mock_scan_dao = MagicMock()
+        mock_sqs = MagicMock()
+
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._get_scan_dao", return_value=mock_scan_dao),
+            patch(f"{_SH}._get_sqs", return_value=mock_sqs),
+            patch(f"{_SH}._SCAN_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/scan-queue"),
+        ):
+            status, _ = _parse(_current_sh()._handle_rescan({}, _NAMESPACE_ID, _SOURCE_ID, trigger=ScanTrigger.EVENT))
+
+        assert status == 202
+        put_item = mock_scan_dao.put.call_args[0][0]
+        assert put_item["triggerType"] == "EVENT"
+
+
+@pytest.mark.unit
+class TestRescanStatusTransition:
+    """The SCANNING transition is the lock that serialises concurrent triggers."""
+
+    def test_losing_the_status_race_returns_409_without_enqueuing(self):
+        """Two triggers can both read an allowed status. The conditional update
+        is what stops both starting a scan, which would otherwise have each take
+        the live assets as its baseline and race on one backup key."""
+        from botocore.exceptions import ClientError
+
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = _db_source_item("APPROVED")
+        mock_dao.update.side_effect = ClientError({"Error": {"Code": "ConditionalCheckFailedException"}}, "UpdateItem")
+        mock_scan_dao = MagicMock()
+        mock_sqs = MagicMock()
+
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._get_scan_dao", return_value=mock_scan_dao),
+            patch(f"{_SH}._get_sqs", return_value=mock_sqs),
+            patch(f"{_SH}._SCAN_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/scan-queue"),
+        ):
+            status, body = _parse(_current_sh()._handle_rescan({}, _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 409
+        assert body["sourceId"] == _SOURCE_ID
+        mock_sqs.send_message.assert_not_called()
+
+    def test_status_update_is_conditional_on_the_status_just_read(self):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = _db_source_item("APPROVED")
+        mock_scan_dao = MagicMock()
+
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._get_scan_dao", return_value=mock_scan_dao),
+            patch(f"{_SH}._get_sqs", return_value=MagicMock()),
+            patch(f"{_SH}._SCAN_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/scan-queue"),
+        ):
+            status, _ = _parse(_current_sh()._handle_rescan({}, _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 202
+        kwargs = mock_dao.update.call_args[1]
+        assert kwargs["condition"] == "#st = :prev"
+        assert kwargs["condition_values"] == {":prev": "APPROVED"}
+
+    def test_failed_enqueue_releases_the_source_instead_of_wedging_it(self):
+        """No state machine started, so the reaper cannot recover this. Left in
+        SCANNING the source would refuse every retry as an active scan."""
+        from botocore.exceptions import ClientError
+
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = _db_source_item("APPROVED")
+        mock_scan_dao = MagicMock()
+        mock_sqs = MagicMock()
+        mock_sqs.send_message.side_effect = ClientError({"Error": {"Code": "ServiceUnavailable"}}, "SendMessage")
+
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._get_scan_dao", return_value=mock_scan_dao),
+            patch(f"{_SH}._get_sqs", return_value=mock_sqs),
+            patch(f"{_SH}._SCAN_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/scan-queue"),
+        ):
+            status, _ = _parse(_current_sh()._handle_rescan({}, _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 500
+        restores = [c for c in mock_dao.update.call_args_list if c[0][1].get("status") == "APPROVED"]
+        assert len(restores) == 1
+        # "FAILED" is the scan-JOB vocabulary: it is what the state machine writes
+        # and the only value the console renders as a failure. SCAN_FAILED is the
+        # source row's, and falls through to the default branch as "Scan completed".
+        closed = [c[0][1] for c in mock_scan_dao.update.call_args_list if "status" in c[0][1]]
+        assert closed and closed[0]["status"] == "FAILED"
+        assert not any(c.get("status") == "SCAN_FAILED" for c in closed)
+
+    def test_lock_loser_writes_no_scan_job_row(self):
+        """The pre-check is not a lock, so the loser must be turned away before it
+        writes anything. A row written first would stay IN_PROGRESS for good: the
+        loser never enqueues, so no state machine starts and no reaper reconciles it."""
+        from botocore.exceptions import ClientError
+
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = _db_source_item("APPROVED")
+        mock_dao.update.side_effect = ClientError({"Error": {"Code": "ConditionalCheckFailedException"}}, "UpdateItem")
+        mock_scan_dao = MagicMock()
+
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._get_scan_dao", return_value=mock_scan_dao),
+            patch(f"{_SH}._get_sqs", return_value=MagicMock()),
+            patch(f"{_SH}._SCAN_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/scan-queue"),
+        ):
+            status, _ = _parse(_current_sh()._handle_rescan({}, _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 409
+        mock_scan_dao.put.assert_not_called()
+
+    def test_failed_scan_job_write_releases_the_lock(self):
+        """The lock is taken first now, so whatever fails after it must hand the
+        source back rather than strand it in SCANNING."""
+        from botocore.exceptions import ClientError
+
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = _db_source_item("APPROVED")
+        mock_scan_dao = MagicMock()
+        mock_scan_dao.put.side_effect = ClientError({"Error": {"Code": "ThrottlingException"}}, "PutItem")
+
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._get_scan_dao", return_value=mock_scan_dao),
+            patch(f"{_SH}._get_sqs", return_value=MagicMock()),
+            patch(f"{_SH}._SCAN_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/scan-queue"),
+        ):
+            status, _ = _parse(_current_sh()._handle_rescan({}, _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 500
+        assert any(c[0][1].get("status") == "APPROVED" for c in mock_dao.update.call_args_list)
+
+    def test_lock_is_taken_before_the_scan_job_row_is_written(self):
+        """Ordering is the fix, so assert the order and not just the outcome."""
+        calls: list[str] = []
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = _db_source_item("APPROVED")
+        mock_dao.update.side_effect = lambda *a, **k: calls.append("lock")
+        mock_scan_dao = MagicMock()
+        mock_scan_dao.put.side_effect = lambda *a, **k: calls.append("put")
+
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._get_scan_dao", return_value=mock_scan_dao),
+            patch(f"{_SH}._get_sqs", return_value=MagicMock()),
+            patch(f"{_SH}._SCAN_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/scan-queue"),
+        ):
+            status, _ = _parse(_current_sh()._handle_rescan({}, _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 202
+        assert calls[:2] == ["lock", "put"]
+
+    def test_scan_job_key_has_sub_second_precision(self):
+        """Two triggers in the same second would otherwise write the same row."""
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = _db_source_item("APPROVED")
+        mock_scan_dao = MagicMock()
+
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._get_scan_dao", return_value=mock_scan_dao),
+            patch(f"{_SH}._get_sqs", return_value=MagicMock()),
+            patch(f"{_SH}._SCAN_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/scan-queue"),
+        ):
+            _, body = _parse(_current_sh()._handle_rescan({}, _NAMESPACE_ID, _SOURCE_ID))
+
+        sk = mock_scan_dao.put.call_args[0][0]["SK"]
+        assert "." in sk and sk.endswith("Z")
+        assert body["scanJobId"] == sk
+        # Still an ISO timestamp, so the history's epoch conversion keeps working.
+        from coa_common.response import iso_to_epoch
+
+        assert isinstance(iso_to_epoch(sk), int)

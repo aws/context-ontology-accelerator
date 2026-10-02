@@ -4,7 +4,9 @@
 import { Duration } from "aws-cdk-lib";
 import * as apigateway from "aws-cdk-lib/aws-apigateway";
 import {
+  AlarmStatusWidget,
   ComparisonOperator,
+  type IAlarm,
   Metric,
   Stats,
   TreatMissingData,
@@ -81,6 +83,20 @@ export class SclMonitoring extends Construct {
         Warning: { maxErrorCount: LAMBDA_MAX_THROTTLES },
       },
     });
+    return this;
+  }
+
+  /**
+   * Puts an alarm the stack built itself onto this facade's dashboard.
+   *
+   * For a detection whose metric is not one of the facade's shapes — a log metric filter, say. It
+   * adds a status widget only: the alarm, its threshold and its action are the caller's, so nothing
+   * here creates a second alarm on the same metric.
+   */
+  showAlarm(alarm: IAlarm, title: string): this {
+    this.facade.addWidget(
+      new AlarmStatusWidget({ alarms: [alarm], title, width: 6, height: 3 }),
+    );
     return this;
   }
 

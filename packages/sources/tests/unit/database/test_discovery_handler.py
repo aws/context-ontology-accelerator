@@ -24,6 +24,8 @@ from coa_sources.database.connectors.base import (
 )
 from coa_sources.database.errors import PermanentScanError, TransientScanError
 
+from tests.unit.conftest import dao_double
+
 MODULE = "coa_sources.database.pipeline.discovery_handler"
 
 
@@ -73,10 +75,10 @@ class TestDiscoveryHandler:
         }
         mock_get_ds.return_value = mock_ds_dao
 
-        mock_scan_dao = MagicMock()
+        mock_scan_dao = dao_double()
         mock_get_scan.return_value = mock_scan_dao
 
-        mock_ns_dao = MagicMock()
+        mock_ns_dao = dao_double()
         mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
         mock_get_ns.return_value = mock_ns_dao
 
@@ -388,7 +390,7 @@ class TestDiscoveryHandler:
             "configuration": {"databaseName": "db", "catalogId": "123456789012", "region": "us-east-1"},
         }
         mock_get_ds.return_value = mock_ds_dao
-        mock_scan_dao = MagicMock()
+        mock_scan_dao = dao_double()
         mock_get_scan.return_value = mock_scan_dao
         mock_get_ns.return_value = MagicMock(get=MagicMock(return_value={"dataZoneProjectId": "proj-1"}))
 
@@ -1171,10 +1173,10 @@ class TestDiscoveryHandlerStatusLifecycle:
         }
         mock_get_ds.return_value = mock_ds_dao
 
-        mock_scan_dao = MagicMock()
+        mock_scan_dao = dao_double()
         mock_get_scan.return_value = mock_scan_dao
 
-        mock_ns_dao = MagicMock()
+        mock_ns_dao = dao_double()
         mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-1"}
         mock_get_ns.return_value = mock_ns_dao
 
@@ -1211,7 +1213,7 @@ class TestDiscoveryHandlerStatusLifecycle:
             "configuration": {"databaseName": "db", "catalogId": "123456789012", "region": "us-east-1"},
         }
         mock_get_ds.return_value = mock_ds_dao
-        mock_scan_dao = MagicMock()
+        mock_scan_dao = dao_double()
         mock_get_scan.return_value = mock_scan_dao
         mock_get_ns.return_value = MagicMock(get=MagicMock(return_value={"dataZoneProjectId": "proj-1"}))
 
@@ -1253,7 +1255,7 @@ class TestDiscoveryHandlerStatusLifecycle:
         mock_ds_dao.get.return_value = None  # Will cause ValueError
         mock_get_ds.return_value = mock_ds_dao
 
-        mock_scan_dao = MagicMock()
+        mock_scan_dao = dao_double()
         mock_get_scan.return_value = mock_scan_dao
 
         with pytest.raises(PermanentScanError):
@@ -1335,7 +1337,7 @@ class TestCustomConnectorDiscovery:
         ds_dao = MagicMock()
         ds_dao.get.return_value = item
         mock_get_ds.return_value = ds_dao
-        scan_dao = MagicMock()
+        scan_dao = dao_double()
         mock_get_scan.return_value = scan_dao
         mock_get_ns.return_value = MagicMock(get=MagicMock(return_value={"dataZoneProjectId": "proj-123"}))
         mock_write.return_value = {"assets_created": 1}
@@ -1500,6 +1502,122 @@ class TestCustomConnectorDiscovery:
 
 
 @pytest.mark.unit
+class TestDiscoveredSchemasIsNotClobberedByAnEmptyScan:
+    """A connector-backed source is ONE known schema, written on the record at create.
+
+    A scan that found no tables must not erase it: serve's namespace-qualifier check builds
+    ``federated_catalog_schemas`` from this list, so an empty list has every
+    catalog-qualified reference DENIED with no fallback and no repair path — configuration
+    update refuses the Databricks sub-type and re-scan 409s outside SCAN_FAILED.
+
+    Zero tables is not exotic here: an over-narrow ``tableFilter`` does it, and so does a
+    credential with BROWSE but not SELECT.
+    """
+
+    _EVENT = {"datasourceId": "DS#ds-1", "scanJobId": "SCAN#s", "namespaceId": "ns-1", "scanType": "full"}
+
+    @staticmethod
+    def _wire(mock_get_ds, mock_get_scan, mock_get_ns, mock_write, mock_get_connector, metadata, item):
+        ds_dao = MagicMock()
+        ds_dao.get.return_value = item
+        mock_get_ds.return_value = ds_dao
+        mock_get_scan.return_value = dao_double()
+        mock_get_ns.return_value = MagicMock(get=MagicMock(return_value={"dataZoneProjectId": "proj-123"}))
+        mock_write.return_value = {"assets_created": 0}
+        connector = MagicMock()
+        connector.test_connection.return_value = ConnectionTestResult(success=True, message="OK", checks=[])
+        connector.discover_metadata.return_value = metadata
+        mock_get_connector.return_value = connector
+        return ds_dao
+
+    @pytest.mark.parametrize("sub_type", ["CUSTOM_CONNECTOR", "DATABRICKS_SQL_WAREHOUSE"])
+    @patch(f"{MODULE}.write_to_datazone")
+    @patch(f"{MODULE}._get_ns_dao")
+    @patch(f"{MODULE}._get_scan_dao")
+    @patch(f"{MODULE}._get_ds_dao")
+    @patch(f"{MODULE}.get_connector")
+    def test_a_zero_table_scan_leaves_the_create_time_value_alone(
+        self, mock_get_connector, mock_get_ds, mock_get_scan, mock_get_ns, mock_write, sub_type
+    ):
+        item = {
+            "sourceSubType": sub_type,
+            "athenaDataCatalogName": "coadevds_abc123",
+            "discoveredSchemas": ["sales"],
+            "configuration": {"databaseName": "sales", "tableFilter": "matches_nothing_*"},
+        }
+        ds_dao = self._wire(
+            mock_get_ds,
+            mock_get_scan,
+            mock_get_ns,
+            mock_write,
+            mock_get_connector,
+            DiscoveredMetadata(tables=[], failed_tables=["sales.orders"]),
+            item,
+        )
+        from coa_sources.database.pipeline.discovery_handler import handler
+
+        handler(self._EVENT, None)
+        fields = ds_dao.update.call_args.kwargs["update_fields"]
+        # Left out of the update entirely, rather than written as the stored value.
+        assert "discoveredSchemas" not in fields, fields
+        assert fields["tablesDiscovered"] == 0
+
+    @patch(f"{MODULE}.write_to_datazone")
+    @patch(f"{MODULE}._get_ns_dao")
+    @patch(f"{MODULE}._get_scan_dao")
+    @patch(f"{MODULE}._get_ds_dao")
+    @patch(f"{MODULE}.get_connector")
+    def test_a_scan_that_found_tables_still_writes_what_it_found(
+        self, mock_get_connector, mock_get_ds, mock_get_scan, mock_get_ns, mock_write
+    ):
+        """The suppression is scoped to the empty case, so a scan with results stays
+        authoritative — including one reporting a schema the record did not carry."""
+        item = {
+            "sourceSubType": "DATABRICKS_SQL_WAREHOUSE",
+            "athenaDataCatalogName": "coadevds_abc123",
+            "discoveredSchemas": ["stale"],
+            "configuration": {"databaseName": "sales"},
+        }
+        ds_dao = self._wire(
+            mock_get_ds,
+            mock_get_scan,
+            mock_get_ns,
+            mock_write,
+            mock_get_connector,
+            DiscoveredMetadata(tables=[Table(name="o", database="sales", columns=[Column(name="c", data_type="int")])]),
+            item,
+        )
+        from coa_sources.database.pipeline.discovery_handler import handler
+
+        handler(self._EVENT, None)
+        assert ds_dao.update.call_args.kwargs["update_fields"]["discoveredSchemas"] == ["sales"]
+
+    @patch(f"{MODULE}.write_to_datazone")
+    @patch(f"{MODULE}._get_ns_dao")
+    @patch(f"{MODULE}._get_scan_dao")
+    @patch(f"{MODULE}._get_ds_dao")
+    @patch(f"{MODULE}.get_connector")
+    def test_a_federated_jdbc_source_still_has_its_empty_scan_recorded(
+        self, mock_get_connector, mock_get_ds, mock_get_scan, mock_get_ns, mock_write
+    ):
+        """For federated JDBC the discovered set is authoritative — schemas can come and
+        go, and the federation step grants Lake Formation against exactly this list — so
+        suppressing an empty write there would mask a real drift."""
+        item = {
+            "sourceSubType": "JDBC_DATABASE",
+            "discoveredSchemas": ["public"],
+            "configuration": {"databaseName": "app", "credentialSecretArn": ""},
+        }
+        ds_dao = self._wire(
+            mock_get_ds, mock_get_scan, mock_get_ns, mock_write, mock_get_connector, DiscoveredMetadata(tables=[]), item
+        )
+        from coa_sources.database.pipeline.discovery_handler import handler
+
+        handler(self._EVENT, None)
+        assert ds_dao.update.call_args.kwargs["update_fields"]["discoveredSchemas"] == []
+
+
+@pytest.mark.unit
 class TestScanTimeNamespaceBinding:
     """Discovery re-checks the STORED credential-secret ARN before connecting.
 
@@ -1508,6 +1626,9 @@ class TestScanTimeNamespaceBinding:
     registration-time check validates the ARN a caller supplies, so it cannot
     cover a row written before the binding rule existed, or a secret re-tagged
     after the source was registered — both are caught here.
+
+    ``DATABRICKS_SQL_WAREHOUSE`` is exempt, and the exemption is asserted rather
+    than assumed: nothing on this role's path reads that secret.
     """
 
     _EVENT = {"datasourceId": "DS#ds-1", "scanJobId": "SCAN#s", "namespaceId": "ns-1", "scanType": "full"}
@@ -1519,11 +1640,20 @@ class TestScanTimeNamespaceBinding:
         "credentialSecretArn": "arn:aws:secretsmanager:us-east-1:123456789012:secret:s-AbCdEf",
     }
 
-    def _dao(self, mock_get_ds, config):
-        dao = MagicMock()
-        dao.get.return_value = {"sourceSubType": "JDBC_DATABASE", "configuration": config}
+    def _dao(self, mock_get_ds, config, sub_type: str = "JDBC_DATABASE"):
+        dao = dao_double()
+        dao.get.return_value = {"sourceSubType": sub_type, "configuration": config}
         mock_get_ds.return_value = dao
         return dao
+
+    def _scan(self, mock_get_ns, mock_get_connector):
+        """Stub the rest of a successful scan so the binding call is the only variable."""
+        mock_get_ns.return_value.get.return_value = {"dataZoneProjectId": "proj-1"}
+        connector = MagicMock()
+        connector.test_connection.return_value = ConnectionTestResult(success=True, message="OK", checks=[])
+        connector.discover_metadata.return_value = DiscoveredMetadata(tables=[])
+        mock_get_connector.return_value = connector
+        return connector
 
     @patch(f"{MODULE}.require_secret_namespace_binding")
     @patch(f"{MODULE}.get_connector")
@@ -1536,11 +1666,7 @@ class TestScanTimeNamespaceBinding:
         from coa_sources.database.pipeline.discovery_handler import handler
 
         self._dao(mock_get_ds, self._JDBC_CONFIG)
-        mock_get_ns.return_value.get.return_value = {"dataZoneProjectId": "proj-1"}
-        connector = MagicMock()
-        connector.test_connection.return_value = ConnectionTestResult(success=True, message="OK", checks=[])
-        connector.discover_metadata.return_value = DiscoveredMetadata(tables=[])
-        mock_get_connector.return_value = connector
+        self._scan(mock_get_ns, mock_get_connector)
 
         with patch(f"{MODULE}.write_to_datazone", return_value={"assets_created": 0, "assets_revised": 0}):
             handler(self._EVENT, None)
@@ -1592,13 +1718,37 @@ class TestScanTimeNamespaceBinding:
         from coa_sources.database.pipeline.discovery_handler import handler
 
         self._dao(mock_get_ds, {"databaseName": "analytics_db", "catalogId": "123456789012"})
-        mock_get_ns.return_value.get.return_value = {"dataZoneProjectId": "proj-1"}
-        connector = MagicMock()
-        connector.test_connection.return_value = ConnectionTestResult(success=True, message="OK", checks=[])
-        connector.discover_metadata.return_value = DiscoveredMetadata(tables=[])
-        mock_get_connector.return_value = connector
+        self._scan(mock_get_ns, mock_get_connector)
 
         with patch(f"{MODULE}.write_to_datazone", return_value={"assets_created": 0, "assets_revised": 0}):
             handler(self._EVENT, None)
 
         mock_require.assert_called_once_with(None, "ns-1", "DS#ds-1")
+
+    @patch(f"{MODULE}.require_secret_namespace_binding")
+    @patch(f"{MODULE}.get_connector")
+    @patch(f"{MODULE}._get_ns_dao")
+    @patch(f"{MODULE}._get_scan_dao")
+    @patch(f"{MODULE}._get_ds_dao")
+    def test_a_databricks_warehouse_scan_does_not_check_the_secrets_namespace_tag(
+        self, mock_get_ds, mock_get_scan, mock_get_ns, mock_get_connector, mock_require
+    ):
+        """This execution role never reads that secret: the connector assumes the
+        customer's role and reads the credential as that session."""
+        from coa_sources.database.pipeline.discovery_handler import handler
+
+        self._dao(
+            mock_get_ds,
+            {"databaseName": "sales", "credentialSecretArn": self._JDBC_CONFIG["credentialSecretArn"]},
+            sub_type="DATABRICKS_SQL_WAREHOUSE",
+        )
+        self._scan(mock_get_ns, mock_get_connector)
+
+        with patch(f"{MODULE}.write_to_datazone", return_value={"assets_created": 0, "assets_revised": 0}):
+            handler(self._EVENT, None)
+
+        # Not consulted at all: a cross-account secret would pass the check anyway, so
+        # asserting only that the scan succeeded would pass with the call still there.
+        mock_require.assert_not_called()
+        # And the scan really did run, or the assertion above is vacuous.
+        mock_get_connector.assert_called_once()

@@ -38,7 +38,7 @@ import logging
 import os
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -110,6 +110,32 @@ _DEFINITION_PREDICATES = (
     URIRef("http://purl.obolibrary.org/obo/IAO_0000115"),
 )
 
+# Annotation predicates an append-mode re-ingest SUPERSEDES rather than
+# accumulates. A proposal re-induced after steward curation carries the
+# authored description/synonyms only, but the earlier accepted proposal's
+# AI-generated ``rdfs:comment`` / ``skos:altLabel`` were already live in the
+# same named graph — and RDF set semantics only dedup IDENTICAL literals, so
+# both generations ended up on the class and the model had to pick one.
+#
+# Each live predicate maps to the HISTORY predicate its displaced values move
+# to: the previous generation stays inspectable on the subject (``GET
+# /graph/class`` surfaces it as ``superseded``) without being live content that
+# serve/embeddings read. The rule is deliberately field-scoped: descriptions
+# and alternative labels are authored-wins; relationship axioms
+# (``rdfs:range``, ``rdfs:subClassOf``, ``owl:ObjectProperty``, R2RML) are NOT
+# here, so inferred join paths survive a re-accept — an accuracy benchmark
+# showed those beating the authored-only set.
+_COA = Namespace(VOCAB_URI)
+SUPERSEDED_COMMENT = _COA.supersededComment
+SUPERSEDED_DEFINITION = _COA.supersededDefinition
+SUPERSEDED_ALT_LABEL = _COA.supersededAltLabel
+_SUPERSEDED_ANNOTATION_PREDICATES: dict[URIRef, URIRef] = {
+    RDFS.comment: SUPERSEDED_COMMENT,
+    SKOS.definition: SUPERSEDED_DEFINITION,
+    URIRef("http://purl.obolibrary.org/obo/IAO_0000115"): SUPERSEDED_DEFINITION,
+    SKOS.altLabel: SUPERSEDED_ALT_LABEL,
+}
+
 
 def _definitions(graph: Graph, subject) -> list[str]:
     """Collect definition/description literals for a subject, deduplicated and order-stable.
@@ -124,6 +150,86 @@ def _definitions(graph: Graph, subject) -> list[str]:
             if text and text not in seen:
                 seen.append(text)
     return seen
+
+
+def _supersede_incoming_embeddings(
+    vector_store: VectorStore,
+    namespace: str,
+    ontology_id: str,
+    subjects: Iterable[Any],
+) -> int:
+    """Retire the stale embeddings of ``subjects`` before an append re-embeds them.
+
+    Delegates to :meth:`VectorStore.delete_embeddings_for_entities`; backends
+    without the method (older adapters, test doubles) are treated as having
+    nothing to retire. A backend failure raises :class:`IngestStoreError`. This
+    runs as the FIRST write of an append, before the graph is touched, so a
+    failure here aborts with nothing to roll back; continuing instead would
+    leave the index disagreeing with the graph (stale AI text still searchable)
+    — the exact state this step exists to prevent.
+
+    The delete is scoped by ``ontology_id`` in addition to ``entity_uri``. A
+    single namespace index can carry embeddings for multiple ontologies
+    (foundational reloads with ``allow_append=True``, explicit-target merges),
+    and the same IRI can appear in more than one; an unscoped delete would
+    take the sibling ontology's embedding down with the current one and
+    re-create it under the wrong owner.
+    """
+    delete = getattr(vector_store, "delete_embeddings_for_entities", None)
+    uris = [str(s) for s in subjects]
+    if delete is None or not uris or not ontology_id:
+        return 0
+    try:
+        removed = int(delete(uris, ontology_id=ontology_id, namespace=namespace) or 0)
+    except Exception as e:
+        raise IngestStoreError(f"embedding supersession failed: {e}") from e
+    log.info(
+        "ingest: append retired %d stale embeddings across %d subjects (namespace=%s ontology_id=%s)",
+        removed,
+        len(uris),
+        namespace,
+        ontology_id,
+    )
+    return removed
+
+
+def _supersede_incoming_annotations(graph_store: GraphStore, ontology_id: str, subjects: Iterable[Any]) -> int:
+    """Clear the live descriptions/alt-labels of ``subjects`` before an append writes them anew.
+
+    Delegates to :meth:`GraphStore.supersede_annotations`; backends without the
+    method (older adapters, test doubles) are treated as having nothing to
+    supersede. A backend failure is raised as :class:`IngestStoreError` rather
+    than swallowed: quietly falling back to the additive behaviour would
+    reintroduce the very defect this step exists to remove.
+
+    Ordering note: step 4a (``_supersede_incoming_embeddings``) runs before
+    this, so a failure here leaves the stale embeddings already retired. The
+    incoming classes are then without a live description or embedding until
+    a re-accept converges — an availability gap, not data loss, and the
+    accepted proposal enters ``accept_failed`` which is re-acceptable.
+    """
+    supersede = getattr(graph_store, "supersede_annotations", None)
+    subject_uris = [str(s) for s in subjects]
+    if supersede is None or not subject_uris:
+        return 0
+    try:
+        removed = int(
+            supersede(
+                ontology_uri=ontology_id,
+                subject_uris=subject_uris,
+                predicates={str(p): str(h) for p, h in _SUPERSEDED_ANNOTATION_PREDICATES.items()},
+            )
+            or 0
+        )
+    except Exception as e:
+        raise IngestStoreError(f"annotation supersession failed: {e}") from e
+    log.info(
+        "ingest: append superseded %d live annotation triples across %d subjects (ontology_id=%s)",
+        removed,
+        len(subject_uris),
+        ontology_id,
+    )
+    return removed
 
 
 # Formats we can parse with rdflib, keyed by the ``format`` field that
@@ -327,6 +433,12 @@ def ingest_ontology(
           naturally additive — SPARQL ``INSERT DATA`` and GSP
           ``POST`` merge triples. Identical triples dedup via RDF
           set semantics.
+        * Descriptions and alternative labels are the exception: for the
+          subjects present in the incoming payload, their live
+          ``rdfs:comment`` / ``skos:definition`` / ``skos:altLabel`` are
+          removed first (``supersede_annotations``) so the incoming
+          values REPLACE them. Other subjects and all relationship
+          axioms remain additive.
         * The registry row's ``source_proposals`` list grows with
           every append, and class/property/axiom/embedding counts
           accumulate via DynamoDB ``ADD``. Counts are cumulative
@@ -350,6 +462,10 @@ def ingest_ontology(
           "embeddings": {...},
           "registry": {...},             # current registry row after the write
           "appended": bool,              # True if this was an append
+          "superseded_annotation_count": int,  # live comment/altLabel triples
+                                         # replaced on append; 0 on create
+          "superseded_embedding_count": int,   # stale embeddings of the incoming
+                                         # subjects retired on append; 0 on create
         }
     """
     md = metadata or IngestMetadata()
@@ -468,6 +584,39 @@ def ingest_ontology(
     # Append only when a REAL (non-stub) row exists — never treat our own stub as
     # an append target (that would skip create_ontology + accumulate onto zeros).
     appending = bool(existing) and allow_append and not existing_is_stub
+
+    # ── 4a. Retire stale embeddings on append ─────────────────────────────
+    # FIRST write of the append, deliberately: the vector store is the least
+    # reliable dependency here, so it is the one to fail on while NOTHING has
+    # been written to the graph. Ordering this after the graph supersession (as
+    # a first cut did) meant a vector-store outage left the graph carrying the
+    # steward's text while the index still served the AI text's embedding —
+    # exactly the graph/index disagreement this step exists to prevent. The
+    # embeddings being retired are those of the subjects this payload
+    # re-defines (re-embedded in step 7); the earlier accept indexed the AI
+    # description, and AOSS has no
+    # client-supplied _id, so delete-then-add is the only way to REPLACE rather
+    # than accumulate (closes the #594/#824 duplication caveat for re-accept).
+    # Same scoping as 4b: exactly the incoming subjects; co-merged proposals'
+    # embeddings are untouched. Skipped on a fresh ingest — nothing to retire.
+    superseded_embedding_count = 0
+    if appending:
+        superseded_embedding_count = _supersede_incoming_embeddings(
+            vector_store, namespace, ontology_id, classes | obj_props | dt_props
+        )
+
+    # ── 4b. Supersede annotations on append ───────────────────────────────
+    # Every write below is additive (INSERT DATA / GSP POST), so before them
+    # drop the LIVE descriptions and alt-labels of exactly the subjects this
+    # payload is about to (re)define. The incoming values then replace the
+    # earlier generation instead of standing beside it. Scoped to the incoming
+    # subjects only, so a co-merged proposal's classes in the same ontology are
+    # untouched; and to annotation predicates only, so relationship axioms
+    # survive (see _SUPERSEDED_ANNOTATION_PREDICATES). Skipped on a fresh
+    # ingest — there is nothing live to supersede.
+    superseded_count = 0
+    if appending:
+        superseded_count = _supersede_incoming_annotations(graph_store, ontology_id, classes | obj_props | dt_props)
 
     # ── 5. Catalog projection ───────────────────────────────────────────
     _s1 = time.perf_counter()
@@ -740,6 +889,8 @@ def ingest_ontology(
         # 0 (with a non-empty ontology) means the namespace is dark to the
         # structured-query path — callers/tests can assert on this.
         "mapped_class_count": mapped_class_count,
+        "superseded_annotation_count": superseded_count,
+        "superseded_embedding_count": superseded_embedding_count,
         "property_count": len(obj_props) + len(dt_props),
         "axiom_count": len(g),
         "turtle_load": load_result,
@@ -795,8 +946,20 @@ def wait_for_embeddings_searchable(
     errors are swallowed: a failed heartbeat must not abort a healthy wait.
 
     Never raises — a probe error is treated as "no progress this iteration"
-    and retried, and a stall is logged but does not fail the caller (the
-    embeddings are durably written; only their search visibility lagged).
+    and retried until the stall deadline. Returns ``False`` on a genuine stall.
+
+    IMPORTANT — a ``False`` return means LOSS, not benign lag. This wait runs
+    only AFTER :func:`_accumulate_embeddings` has confirmed the vector store
+    acknowledged every write (``bulk_with_retry`` raises on any doc that fails
+    to land — see #173). So the docs are known-acknowledged before we start
+    polling; if after ``stall_timeout_s`` of no forward progress some URIs are
+    STILL not searchable, that is an index that will not converge (a dropped
+    write that slipped past acknowledgement, or an index-health problem), NOT a
+    write that simply hasn't happened yet. Callers on a correctness-critical
+    path (proposal accept) MUST treat ``False`` as fatal rather than "lagged"
+    (see :func:`_run_accept_proposal`). The bool return is retained because
+    non-critical callers legitimately proceed on a slow index, but the meaning
+    of ``False`` is "did not converge", not "fine, just slow".
     ``expected_uris`` is the exact list returned under ``embeddings.entity_uris``
     by :func:`ingest_ontology`.
     """
@@ -841,9 +1004,11 @@ def wait_for_embeddings_searchable(
             log.warning("ingest: embedding readiness probe failed (attempt %d): %s", attempt, e)
 
         if time.perf_counter() >= stall_deadline:
-            log.warning(
-                "ingest: embedding sync stalled for %s — no progress for %.0fs, "
-                "%d of %d still missing (durably written; search visibility lagged)",
+            log.error(
+                "ingest: embedding sync did NOT converge for %s — no progress for %.0fs, "
+                "%d of %d still not searchable. The writes were acknowledged, so this is a "
+                "convergence/loss failure, not benign lag; correctness-critical callers treat "
+                "this as fatal.",
                 ontology_id,
                 stall_timeout_s,
                 len(missing),
@@ -1225,7 +1390,29 @@ def _accumulate_embeddings(
             if ds_id:
                 item["data_source_id"] = ds_id
             items.append(item)
-        vector_store.store_embeddings_batch(items)
+        # store_embeddings_batch returns the docs the store confirms it wrote.
+        # With bulk_with_retry now raising PartialIndexError on any doc that
+        # fails to land (see #173), a partial write reaches the except-block
+        # below rather than being reported as success. We derive count and
+        # entity_uris from the STORE'S RETURN VALUE, not len(items): the two
+        # must be structurally coupled so "count" can never again be the
+        # submission count while fewer docs actually indexed.
+        stored = vector_store.store_embeddings_batch(items)
+        # Prefer the store's acknowledged docs as authoritative. A store that
+        # returns a list of docs tells us exactly what landed; anything else
+        # (None/legacy, or a scalar count) is not a per-doc acknowledgement, so
+        # we fall back to the submitted items (the write either fully succeeded
+        # — bulk_with_retry raises otherwise — or the store isn't list-returning).
+        acked = stored if isinstance(stored, list) else items
+        # A store that acknowledges FEWER docs than submitted, without raising,
+        # is still a partial write — surface it loudly rather than silently
+        # under-reporting (belt-and-suspenders alongside PartialIndexError).
+        if len(acked) < len(items):
+            raise RuntimeError(
+                f"vector store acknowledged {len(acked)} of {len(items)} embeddings for {ontology_id} "
+                f"(partial write); refusing to report success"
+            )
+        acked_uris = [d.get("entity_uri") for d in acked if isinstance(d, dict) and d.get("entity_uri")]
 
         # Best-effort: some vector-store implementations expose the target
         # index name via a helper; most do not. We infer it from the
@@ -1240,15 +1427,16 @@ def _accumulate_embeddings(
                 index_name = None
         return {
             "status": "ok",
-            "count": len(items),
+            "count": len(acked),
             "classes": sum(1 for e in entries if e[1] == "class"),
             "properties": sum(1 for e in entries if e[1] == "property"),
             "model_id": bedrock.model_id,
             "index": index_name,
-            # Exact list of entity URIs written to the vector index in this
-            # call. Callers (notably proposal-accept) use it to block until
-            # every one is searchable, closing the AOSS consistency window.
-            "entity_uris": [it["entity_uri"] for it in items],
+            # Exact list of entity URIs the store ACKNOWLEDGED writing to the
+            # vector index in this call (not merely submitted). Callers (notably
+            # proposal-accept) use it to block until every one is searchable,
+            # closing the AOSS consistency window.
+            "entity_uris": acked_uris,
         }
     except Exception as e:
         log.exception("embedding accumulation failed for %s", ontology_id)

@@ -17,6 +17,8 @@ import java.util.Map;
 
 import static dev.coa.databricks.FakeJdbc.row;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -289,9 +291,27 @@ class InformationSchemaReaderTest
         Map<String, String> comments = readerOver(jdbc).describeTable("orders")
                 .toTableSchema().toArrowSchema().getCustomMetadata();
 
-        assertEquals("Region code. Parent key part 1. @pk", comments.get("region_code"));
-        assertEquals("Order number within region. Parent key part 2. @pk", comments.get("order_num"));
+        assertEquals("Region code. Parent key part 1. @pk @notnull", comments.get("region_code"));
+        assertEquals("Order number within region. Parent key part 2. @pk @notnull",
+                comments.get("order_num"));
         assertEquals("Order total in account currency", comments.get("order_total"));
+    }
+
+    @Test
+    void nullabilityTravelsAsANotNullTagAndOnlyWhenTheCatalogSaidSo()
+    {
+        // All three states are in the fixture: NO earns a tag, YES earns none — absence is what COA reads as
+        // "nobody said" — and an unrecognised spelling earns none either, since guessing would assert a
+        // constraint Unity Catalog never declared.
+        FakeJdbc jdbc = new FakeJdbc(InformationSchemaReaderTest::ordersRows);
+        Map<String, String> comments = readerOver(jdbc).describeTable("orders")
+                .toTableSchema().toArrowSchema().getCustomMetadata();
+
+        assertTrue(comments.get("region_code").contains("@notnull"), comments.get("region_code"));
+        assertFalse(comments.get("order_total").contains("@notnull"), comments.get("order_total"));
+        assertNull(comments.get("CustomerName"),
+                "an unrecognised is_nullable must produce no comment at all for a column with no prose,"
+                        + " rather than a bare tag: " + comments.get("CustomerName"));
     }
 
     @Test
@@ -333,7 +353,8 @@ class InformationSchemaReaderTest
         FakeJdbc jdbc = new FakeJdbc(sql -> {
             if (sql.contains(".columns")) {
                 return Collections.singletonList(row(
-                        "column_name", "federated_id", "full_data_type", "bigint", "comment", null));
+                        "column_name", "federated_id", "full_data_type", "bigint",
+                        "is_nullable", "YES", "comment", null));
             }
             if (sql.contains("'FOREIGN KEY'")) {
                 return Collections.singletonList(row(
@@ -358,7 +379,7 @@ class InformationSchemaReaderTest
         FakeJdbc jdbc = new FakeJdbc(sql -> {
             if (sql.contains(".columns")) {
                 return Collections.singletonList(row(
-                        "column_name", "parent_id", "full_data_type", "bigint", "comment", null));
+                        "column_name", "parent_id", "full_data_type", "bigint", "is_nullable", "YES", "comment", null));
             }
             if (sql.contains("'FOREIGN KEY'")) {
                 return Collections.singletonList(row(
@@ -381,12 +402,12 @@ class InformationSchemaReaderTest
         // refuses it by throwing, and IllegalArgumentException is not an SQLException, so without
         // neutralise() this one comment fails the table's DESCRIBE permanently and unclassified.
         FakeJdbc jdbc = new FakeJdbc(sql -> sql.contains(".columns")
-                ? Collections.singletonList(row("column_name", "note", "full_data_type", "string",
+                ? Collections.singletonList(row("column_name", "note", "full_data_type", "string", "is_nullable", "YES",
                         "comment", "Line total @fk(orders.order_id"))
                 : Collections.emptyList());
 
         CoaTable table = readerOver(jdbc).describeTable("malformed_comments");
-        assertEquals("Line total orders.order_id",
+        assertEquals("Line total _@fk(orders.order_id",
                 table.toTableSchema().toArrowSchema().getCustomMetadata().get("note"));
     }
 
@@ -419,7 +440,8 @@ class InformationSchemaReaderTest
     {
         FakeJdbc jdbc = new FakeJdbc(sql -> sql.contains(".columns")
                 ? Collections.singletonList(
-                        row("column_name", "value", "full_data_type", "string", "comment", "Just prose"))
+                        row("column_name", "value", "full_data_type", "string",
+                                "is_nullable", "YES", "comment", "Just prose"))
                 : Collections.emptyList());
         Map<String, String> comments = readerOver(jdbc).describeTable("mixedcasetable")
                 .toTableSchema().toArrowSchema().getCustomMetadata();
@@ -448,7 +470,7 @@ class InformationSchemaReaderTest
             }
             if (sql.contains(".columns")) {
                 return Collections.singletonList(row(
-                        "column_name", "id", "full_data_type", "bigint", "comment", null));
+                        "column_name", "id", "full_data_type", "bigint", "is_nullable", "YES", "comment", null));
             }
             return Collections.emptyList();
         });
@@ -471,7 +493,7 @@ class InformationSchemaReaderTest
                 }
                 if (sql.contains(".columns")) {
                     return Collections.singletonList(row(
-                            "column_name", "id", "full_data_type", "bigint", "comment", null));
+                            "column_name", "id", "full_data_type", "bigint", "is_nullable", "YES", "comment", null));
                 }
                 return Collections.emptyList();
             });
@@ -591,11 +613,11 @@ class InformationSchemaReaderTest
         }
         if (sql.contains(".columns")) {
             return Arrays.asList(
-                    row("column_name", "child_id", "full_data_type", "bigint",
+                    row("column_name", "child_id", "full_data_type", "bigint", "is_nullable", "YES",
                             "comment", "Child surrogate key."),
-                    row("column_name", "parent_id", "full_data_type", "bigint",
+                    row("column_name", "parent_id", "full_data_type", "bigint", "is_nullable", "YES",
                             "comment", "References a parent in another schema."),
-                    row("column_name", "order_num", "full_data_type", "bigint",
+                    row("column_name", "order_num", "full_data_type", "bigint", "is_nullable", "YES",
                             "comment", "Also references orders, in this schema."));
         }
         if (sql.contains("'PRIMARY KEY'")) {
@@ -622,13 +644,15 @@ class InformationSchemaReaderTest
         }
         if (sql.contains(".columns")) {
             return Arrays.asList(
-                    row("column_name", "region_code", "full_data_type", "string",
+                    // The key columns are NOT NULL as a declared primary key's are, the total is nullable,
+                    // and CustomerName's is_nullable is a spelling Databricks does not use.
+                    row("column_name", "region_code", "full_data_type", "string", "is_nullable", "NO",
                             "comment", "Region code. Parent key part 1."),
-                    row("column_name", "order_num", "full_data_type", "bigint",
+                    row("column_name", "order_num", "full_data_type", "bigint", "is_nullable", "NO",
                             "comment", "Order number within region. Parent key part 2."),
-                    row("column_name", "order_total", "full_data_type", "decimal(10,2)",
+                    row("column_name", "order_total", "full_data_type", "decimal(10,2)", "is_nullable", "YES",
                             "comment", "Order total in account currency"),
-                    row("column_name", "CustomerName", "full_data_type", "string",
+                    row("column_name", "CustomerName", "full_data_type", "string", "is_nullable", "true",
                             "comment", null));
         }
         if (sql.contains("'PRIMARY KEY'")) {
@@ -647,13 +671,13 @@ class InformationSchemaReaderTest
         }
         if (sql.contains(".columns")) {
             return Arrays.asList(
-                    row("column_name", "line_id", "full_data_type", "bigint",
+                    row("column_name", "line_id", "full_data_type", "bigint", "is_nullable", "YES",
                             "comment", "Line surrogate key."),
-                    row("column_name", "order_region", "full_data_type", "string",
+                    row("column_name", "order_region", "full_data_type", "string", "is_nullable", "YES",
                             "comment", "Parent region."),
-                    row("column_name", "order_id", "full_data_type", "bigint",
+                    row("column_name", "order_id", "full_data_type", "bigint", "is_nullable", "YES",
                             "comment", "Parent order number."),
-                    row("column_name", "sku", "full_data_type", "string",
+                    row("column_name", "sku", "full_data_type", "string", "is_nullable", "YES",
                             "comment", "Contact bob@pk.example.com about this @pk column"));
         }
         if (sql.contains("'PRIMARY KEY'")) {

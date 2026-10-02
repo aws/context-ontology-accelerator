@@ -32,6 +32,7 @@ class TestAssembleTier1:
             sql_used="SELECT sum(r) FROM t",
             trace=trace,
             namespace="demo",
+            include_debug_info=True,  # gate on; verify query_used populates
         )
         assert result.tier == 1
         assert result.confidence.score == 1.0
@@ -133,6 +134,7 @@ class TestAssembleTier2:
             data_sources=["table_a"],
             trace=trace,
             namespace="demo",
+            include_debug_info=True,  # gate on; verify both fields populate
         )
         assert result.tier == 2
         assert result.confidence.score == 0.9
@@ -140,6 +142,52 @@ class TestAssembleTier2:
         assert result.query_used == "SELECT id FROM t"
         assert result.ontology_version == "v2"
         assert result.data_sources == ["table_a"]
+
+    def test_debug_info_gate_defaults_off_and_withholds_query_and_sparql(self, assembler, trace):
+        """query_used / sparql_generated must be None by default (info-disclosure gate).
+
+        Regression test — the executed SQL / generated SPARQL
+        expose internal schema and only reach the caller when the caller opts in
+        via options.includeDebugInfo=true.
+        """
+        # Tier 1 default → no query_used
+        t1 = assembler.assemble_tier1(
+            rows=[],
+            columns=[],
+            metric_name="m",
+            sql_used="SELECT * FROM sensitive_table",
+            trace=trace,
+            namespace="ns",
+        )
+        assert t1.query_used is None
+
+        # Tier 2 default → no query_used and no sparql_generated
+        t2 = assembler.assemble_tier2(
+            rows=[],
+            columns=[],
+            sql_used="SELECT * FROM t",
+            sparql="SELECT ?x WHERE { ?x a :T }",
+            confidence=0.5,
+            ontology_version=None,
+            data_sources=None,
+            trace=trace,
+            namespace="ns",
+        )
+        assert t2.query_used is None
+        assert t2.sparql_generated is None
+
+        # NL-to-SQL default → no query_used
+        nl = assembler.assemble_nl_to_sql(
+            rows=[],
+            columns=[],
+            sql_used="SELECT * FROM t",
+            confidence=0.5,
+            retrieved_tables=[],
+            expanded_tables=[],
+            trace=trace,
+            namespace="ns",
+        )
+        assert nl.query_used is None
 
     def test_tier2_handles_none_rows(self, assembler, trace):
         result = assembler.assemble_tier2(

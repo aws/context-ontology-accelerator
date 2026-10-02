@@ -522,7 +522,10 @@ class TestUploadEndpoint:
             files={"file": ("onto.ttl", TURTLE.encode("utf-8"), "text/turtle")},
         )
         assert resp.status_code == 502
-        assert "GSP 503" in resp.json()["detail"]
+        # Opaque client-facing message — the raw backend exception ("GSP 503")
+        # stays server-side via log.exception (public-mirror hygiene).
+        assert "GSP 503" not in resp.json()["detail"]
+        assert resp.json()["detail"] == "Ontology ingest failed"
         # delete_ontology was called to undo the partial catalog projection.
         mock_graph.delete_ontology.assert_called()
         # No embeddings upserted

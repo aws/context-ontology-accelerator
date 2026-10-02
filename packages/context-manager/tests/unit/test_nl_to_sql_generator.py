@@ -194,6 +194,81 @@ class TestSQLGeneratorGenerate:
         assert "year 2012 means 201201-201212" in prompt
 
     @pytest.mark.asyncio
+    async def test_governed_metric_reaches_the_prompt(self, generator, mock_llm):
+        """The whole point of forwarding the declined metric is that the SQL writer
+        SEES the authored formula. Threading it into the context object is not enough
+        — assert it lands in the prompt text."""
+        await generator.generate(
+            "q",
+            namespace="ns",
+            governed_metric=(
+                "GOVERNED METRIC DEFINITION — 'open_claim_count'.\nDefinition SQL: SELECT count(*) FROM claims"
+            ),
+        )
+        prompt = mock_llm.converse.call_args.args[0]
+        assert "SELECT count(*) FROM claims" in prompt
+        assert "open_claim_count" in prompt
+
+    @pytest.mark.asyncio
+    async def test_governed_metric_is_not_labelled_untrusted(self, generator, mock_llm):
+        """An authored metric is FIRST-PARTY. It must not be routed through the
+        untrusted ``<user_context>`` channel, whose label tells the model to discount
+        it and whose 500-char cap would truncate a real formula."""
+        await generator.generate("q", namespace="ns", governed_metric="Definition SQL: SELECT 1")
+        prompt = mock_llm.converse.call_args.args[0]
+        assert "Definition SQL: SELECT 1" in prompt
+        assert "<user_context>Definition SQL" not in prompt
+        assert "first-party, authoritative" in prompt
+
+    @pytest.mark.asyncio
+    async def test_governed_metric_absent_leaves_prompt_unchanged(self, generator, mock_llm):
+        """Regression guard: every path that did not decline a metric must produce a
+        byte-identical prompt to the pre-change baseline."""
+        await generator.generate("q", namespace="ns")
+        baseline = mock_llm.converse.call_args.args[0]
+
+        await generator.generate("q", namespace="ns", governed_metric="")
+        assert mock_llm.converse.call_args.args[0] == baseline
+        assert "Governed metric" not in baseline
+
+    @pytest.mark.asyncio
+    async def test_governed_metric_not_truncated(self, generator, mock_llm):
+        """A real metric formula can exceed the untrusted channel's 500-char cap; the
+        governed block must carry it whole or the writer extends a partial formula."""
+        long_sql = "SELECT count(*) FROM claims WHERE " + " AND ".join(f"col_{i} = {i}" for i in range(120))
+        await generator.generate("q", namespace="ns", governed_metric=f"Definition SQL: {long_sql}")
+        prompt = mock_llm.converse.call_args.args[0]
+        assert len(long_sql) > 500
+        assert long_sql in prompt
+
+    @pytest.mark.asyncio
+    async def test_correct_forwards_governed_metric(self, generator, mock_llm):
+        """#1116 review: the self-correction retry must carry the governed definition
+        too. Without it, a first-shot SQL that failed to execute gets re-derived from
+        the schema on the retry, discarding the authored formula on exactly the shot
+        that most needs it."""
+        await generator.correct(
+            "q",
+            "ddl",
+            failed_sql="SELECT bad FROM t",
+            execution_error="column bad does not exist",
+            governed_metric=(
+                "GOVERNED METRIC DEFINITION — 'open_claim_count'.\nDefinition SQL: SELECT count(*) FROM claims"
+            ),
+        )
+        prompt = mock_llm.converse.call_args.args[0]
+        assert "SELECT count(*) FROM claims" in prompt
+        assert "first-party, authoritative" in prompt
+
+    @pytest.mark.asyncio
+    async def test_correct_without_governed_metric_is_unchanged(self, generator, mock_llm):
+        """Regression guard: the common correction path (no declined metric) must not
+        gain a governed block."""
+        await generator.correct("q", "ddl", failed_sql="SELECT 1", execution_error="boom")
+        prompt = mock_llm.converse.call_args.args[0]
+        assert "Governed metric" not in prompt
+
+    @pytest.mark.asyncio
     async def test_user_question_not_embedded_in_prompt_text(self, generator, mock_llm):
         """Prompt injection isolation: the user's untrusted question MUST NOT
         appear in the prompt text — it reaches the model only via

@@ -489,6 +489,7 @@ class TestTBoxGlossaryMappedGate:
         graph_client.ask = AsyncMock(return_value=True)  # has markers → strict gate
         graph_client.query = AsyncMock(
             side_effect=[
+                [],  # named-graph resolution: none found → prefix-filter fallback
                 [{"cnt": "500"}],  # full-context count over threshold → skip full path
                 [{"class": mapped_uri, "label": "Employee"}],  # _fetch_ontology_context
                 [],  # _fetch_ai_context result
@@ -510,6 +511,7 @@ class TestTBoxGlossaryMappedGate:
         metric_uri = "https://example.org/o#revenue_metric"
         graph_client.query = AsyncMock(
             side_effect=[
+                [],  # named-graph resolution: none found → prefix-filter fallback
                 [{"cnt": "500"}],  # skip full path
                 [],  # _fetch_by_entities (no ontology hits, query present)
                 [],  # _fetch_ai_context
@@ -573,6 +575,7 @@ class TestIsMappedLegacyBridge:
         graph_client.ask = AsyncMock(return_value=False)  # probe: NO isMapped markers
         graph_client.query = AsyncMock(
             side_effect=[
+                [],  # named-graph resolution: none found → prefix-filter fallback
                 [{"cnt": "3"}],  # full-context count (gate dropped → counts all)
                 [{"class": unmapped, "label": "LegacyClass", "parentClass": None}],  # classes
                 [],  # props
@@ -583,7 +586,7 @@ class TestIsMappedLegacyBridge:
         # The unmapped class is present — pre-filter behavior restored.
         assert any(c["uri"] == unmapped for c in ctx.classes)
         # And the classes query must NOT carry the isMapped gate.
-        classes_sparql = graph_client.query.call_args_list[1][0][0]
+        classes_sparql = graph_client.query.call_args_list[2][0][0]
         assert f"<{self._IS_MAPPED_IRI}> true" not in classes_sparql
 
     async def test_mapped_namespace_keeps_gate(self, tbox_builder, graph_client):
@@ -591,6 +594,7 @@ class TestIsMappedLegacyBridge:
         graph_client.ask = AsyncMock(return_value=True)  # probe: has markers
         graph_client.query = AsyncMock(
             side_effect=[
+                [],  # named-graph resolution: none found → prefix-filter fallback
                 [{"cnt": "2"}],  # count
                 [{"class": "https://example.org/o#Emp", "label": "Emp", "parentClass": None}],
                 [],  # props
@@ -598,7 +602,7 @@ class TestIsMappedLegacyBridge:
             ]
         )
         await tbox_builder.build([_hit("https://example.org/o#Emp")], "mapped-ns", query="employees")
-        classes_sparql = graph_client.query.call_args_list[1][0][0]
+        classes_sparql = graph_client.query.call_args_list[2][0][0]
         assert f"<{self._IS_MAPPED_IRI}> true" in classes_sparql
 
     async def test_probe_failure_defaults_to_gate(self, tbox_builder, graph_client):
@@ -641,6 +645,7 @@ class TestIsMappedLegacyBridge:
         graph_client.ask = AsyncMock(side_effect=RuntimeError("neptune down"))
         graph_client.query = AsyncMock(
             side_effect=[
+                [],  # named-graph resolution: none found → prefix-filter fallback
                 [{"cnt": "2"}],  # count
                 [{"class": "https://example.org/o#Emp", "label": "Emp", "parentClass": None}],
                 [],  # props
@@ -648,5 +653,338 @@ class TestIsMappedLegacyBridge:
             ]
         )
         await tbox_builder.build([_hit("https://example.org/o#Emp")], "ns-x", query="employees")
-        classes_sparql = graph_client.query.call_args_list[1][0][0]
+        classes_sparql = graph_client.query.call_args_list[2][0][0]
         assert f"<{self._IS_MAPPED_IRI}> true" in classes_sparql  # gate present despite probe failure
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+class TestTBoxGraphBinding:
+    """The T-Box builder binds ``?g`` to the namespace's graphs.
+
+    Every query here used to be the bare ``GRAPH ?g`` + ``STRSTARTS`` form, which
+    matches in EVERY graph on the cluster and filters afterwards, so its cost was
+    set by the whole store rather than by the namespace. On a Spider-2-sized
+    cluster the builder's object-property (join-path) query timed out outright —
+    leaving the SPARQL writer with no join paths and, on the widest namespaces,
+    no T-Box at all.
+
+    The assertions below check for constant ``GRAPH <iri>`` blocks and the ABSENCE
+    of ``VALUES ?g``. That is not stylistic: the traversal tool's earlier
+    ``VALUES``-bound form names the same graphs but is a materialised solution
+    sequence joined against the patterns, so Neptune stops using ``?g`` to select
+    quads — invisible on a one-graph namespace, a three-way ReadTimeout on a
+    two-graph one. Both callers now emit the constant form.
+    """
+
+    _EMP = "https://example.org/o#Emp"
+
+    @staticmethod
+    def _build_sequence(graphs: list[dict]) -> list[list[dict]]:
+        """build()'s query sequence: resolve, count, classes, props, aiContext."""
+        return [
+            graphs,
+            [{"cnt": "2"}],
+            [{"class": TestTBoxGraphBinding._EMP, "label": "Emp", "parentClass": None}],
+            [],
+            [],
+        ]
+
+    async def test_resolved_graphs_are_named_in_every_query(self, tbox_builder, graph_client):
+        graph_iri = "https://ontology-workbench.local/ns-x/induced"
+        graph_client.ask = AsyncMock(return_value=True)
+        graph_client.query = AsyncMock(side_effect=self._build_sequence([{"g": graph_iri}]))
+
+        await tbox_builder.build([_hit(self._EMP)], "ns-x", query="employees")
+
+        # The resolution query itself is necessarily prefix-filtered — it is the
+        # one that discovers the graphs — so skip it and check its beneficiaries.
+        scoped = [c[0][0] for c in graph_client.query.call_args_list[1:]]
+        assert scoped, "build() issued no scoped queries"
+        for sparql in scoped:
+            assert f"GRAPH <{graph_iri}> {{" in sparql
+            assert "VALUES ?g" not in sparql
+            assert "STRSTARTS(STR(?g)" not in sparql
+
+    async def test_unresolved_graphs_fall_back_to_prefix_filter(self, tbox_builder, graph_client):
+        """An unexpected graph layout must degrade to SLOW, never to no T-Box."""
+        graph_client.ask = AsyncMock(return_value=True)
+        graph_client.query = AsyncMock(side_effect=self._build_sequence([]))
+
+        ctx = await tbox_builder.build([_hit(self._EMP)], "ns-x", query="employees")
+
+        assert any(c["uri"] == self._EMP for c in ctx.classes)
+        for call in graph_client.query.call_args_list[1:]:
+            assert "STRSTARTS(STR(?g)" in call[0][0]
+            assert "VALUES ?g" not in call[0][0]
+
+    async def test_resolution_failure_falls_back_and_still_builds(self, tbox_builder, graph_client):
+        """A raising resolution is caught: the build continues on the fallback."""
+        seq = self._build_sequence([])
+        seq[0] = RuntimeError("neptune down")
+        graph_client.ask = AsyncMock(return_value=True)
+        graph_client.query = AsyncMock(side_effect=seq)
+
+        ctx = await tbox_builder.build([_hit(self._EMP)], "ns-x", query="employees")
+
+        assert any(c["uri"] == self._EMP for c in ctx.classes)
+        assert "STRSTARTS(STR(?g)" in graph_client.query.call_args_list[1][0][0]
+
+    async def test_unsafe_graph_iris_are_dropped(self, tbox_builder, graph_client):
+        """A graph IRI that cannot be safely interpolated is not interpolated."""
+        safe = "https://ontology-workbench.local/ns-x/induced"
+        graph_client.ask = AsyncMock(return_value=True)
+        graph_client.query = AsyncMock(
+            side_effect=self._build_sequence(
+                [{"g": safe}, {"g": "https://ontology-workbench.local/ns-x/a> } INJECTED {"}, {"g": ""}]
+            )
+        )
+
+        await tbox_builder.build([_hit(self._EMP)], "ns-x", query="employees")
+
+        classes_sparql = graph_client.query.call_args_list[2][0][0]
+        assert f"GRAPH <{safe}> {{" in classes_sparql
+        assert "INJECTED" not in classes_sparql
+
+    async def test_graphs_resolved_once_per_namespace(self, tbox_builder, graph_client):
+        """The builder is process-lived, so resolution is cached, not per query.
+
+        Two builds for one namespace must issue ONE resolution query; a second
+        namespace must not reuse the first one's graphs.
+        """
+        graph_a = "https://ontology-workbench.local/ns-a/induced"
+        graph_b = "https://ontology-workbench.local/ns-b/induced"
+        graph_client.ask = AsyncMock(return_value=True)
+        graph_client.query = AsyncMock(
+            side_effect=[
+                *self._build_sequence([{"g": graph_a}]),
+                *self._build_sequence([])[1:],  # second build on ns-a: NO resolution
+                *self._build_sequence([{"g": graph_b}]),
+            ]
+        )
+
+        await tbox_builder.build([_hit(self._EMP)], "ns-a", query="employees")
+        await tbox_builder.build([_hit(self._EMP)], "ns-a", query="employees again")
+        await tbox_builder.build([_hit(self._EMP)], "ns-b", query="employees")
+
+        resolutions = [c[0][0] for c in graph_client.query.call_args_list if "owl:Ontology" in c[0][0]]
+        assert len(resolutions) == 2  # once for ns-a, once for ns-b
+        # The cached ns-a graphs did not leak into ns-b's queries.
+        last_classes = graph_client.query.call_args_list[-2][0][0]
+        assert graph_b in last_classes
+        assert graph_a not in last_classes
+
+    async def test_a_failed_resolution_is_not_cached(self, tbox_builder, graph_client):
+        """Caching a FAILURE is self-amplifying, so only success is cached.
+
+        The fallback is a cluster-wide scan, and cluster-wide scans are what
+        overload the graph — so a container that caches one transient 5s timeout
+        spends the whole TTL generating the load that causes the next timeout.
+        Observed collapsing a BIRD-Interact cell: ``graphs=0``, then ReadTimeouts
+        on the join-path and aiContext queries, then ``classes=0`` — requests
+        answered with no ontology at all. The retry costs one cheap query.
+        """
+        graph_iri = "https://ontology-workbench.local/ns-a/induced"
+        failing = self._build_sequence([])
+        failing[0] = RuntimeError("neptune busy")
+        graph_client.ask = AsyncMock(return_value=True)
+        graph_client.query = AsyncMock(side_effect=[*failing, *self._build_sequence([{"g": graph_iri}])])
+
+        await tbox_builder.build([_hit(self._EMP)], "ns-a", query="employees")
+        await tbox_builder.build([_hit(self._EMP)], "ns-a", query="employees again")
+
+        resolutions = [c[0][0] for c in graph_client.query.call_args_list if "owl:Ontology" in c[0][0]]
+        assert len(resolutions) == 2, "the failure was cached — the second build did not retry"
+        # And the retry's result is actually used, not just fetched.
+        assert f"GRAPH <{graph_iri}> {{" in graph_client.query.call_args_list[-1][0][0]
+
+    async def test_a_stale_cache_entry_is_re_resolved_after_ttl(self, tbox_builder, graph_client, monkeypatch):
+        """Past the TTL, a namespace is re-resolved — the branch that catches a
+        newly-published graph. Cache-hit and failure-not-cached are covered
+        elsewhere; this is the expiry path between them.
+        """
+        import coa_serve.tier2.ontop.tbox_context as tb
+
+        graph_iri = "https://ontology-workbench.local/ns-a/induced"
+        clock = {"t": 1_000.0}
+        monkeypatch.setattr(tb.time, "monotonic", lambda: clock["t"])
+        graph_client.ask = AsyncMock(return_value=True)
+        graph_client.query = AsyncMock(
+            side_effect=[*self._build_sequence([{"g": graph_iri}]), *self._build_sequence([{"g": graph_iri}])]
+        )
+
+        await tbox_builder.build([_hit(self._EMP)], "ns-a", query="employees")
+        clock["t"] += tb._GRAPH_IRI_CACHE_TTL_S + 1  # let the entry lapse
+        await tbox_builder.build([_hit(self._EMP)], "ns-a", query="employees again")
+
+        resolutions = [c[0][0] for c in graph_client.query.call_args_list if "owl:Ontology" in c[0][0]]
+        assert len(resolutions) == 2, "the stale entry was not re-resolved after the TTL"
+
+    async def test_resolved_graphs_are_carried_out_on_the_context(self, tbox_builder, graph_client):
+        """The build's own queries are not the only ones that need the graphs.
+
+        ``SPARQLValidator`` runs AFTER this build, on the same namespace, and its
+        checks are the only graph queries re-paid on every validate-and-retry
+        attempt. It cannot resolve them itself without a second resolution query,
+        so the build hands them over.
+        """
+        graph_iri = "https://ontology-workbench.local/ns-x/induced"
+        graph_client.ask = AsyncMock(return_value=True)
+        graph_client.query = AsyncMock(side_effect=self._build_sequence([{"g": graph_iri}]))
+
+        ctx = await tbox_builder.build([_hit(self._EMP)], "ns-x", query="employees")
+
+        assert ctx.graph_iris == [graph_iri]
+
+    async def test_unresolved_graphs_leave_the_context_empty(self, tbox_builder, graph_client):
+        """Empty is the input ``graph_scoped_body`` reads as "use the prefix filter"."""
+        graph_client.ask = AsyncMock(return_value=True)
+        graph_client.query = AsyncMock(side_effect=self._build_sequence([]))
+
+        ctx = await tbox_builder.build([_hit(self._EMP)], "ns-x", query="employees")
+
+        assert ctx.graph_iris == []
+
+    async def test_truncation_preserves_the_graphs(self, tbox_builder):
+        """A prompt budget does not change which graphs exist."""
+        from coa_serve.tier2.ontop.tbox_context import TBoxContext
+
+        graph_iri = "https://ontology-workbench.local/ns-x/induced"
+        ctx = TBoxContext(
+            classes=[{"uri": f"{self._EMP}{i}", "label": f"Emp{i}", "parent": None} for i in range(200)],
+            properties=[
+                {"uri": f"https://example.org/o#p{i}", "label": f"p{i}", "domain": self._EMP, "range": "xsd:string"}
+                for i in range(2000)
+            ],
+            graph_iris=[graph_iri],
+        )
+
+        trimmed = tbox_builder._truncate(ctx, max_tokens=500)
+
+        assert len(trimmed.classes) < len(ctx.classes) or len(trimmed.properties) < len(ctx.properties)
+        assert trimmed.graph_iris == [graph_iri]
+
+
+@pytest.mark.unit
+class TestObjectPropertyDomainAnchor:
+    """The join-path query is anchored to the classes already in the T-Box.
+
+    Binding ``?g`` was necessary but not sufficient: measured on the deployed
+    412-class Spider 2.0 namespace at parallelism 1, the graph-scoped query still
+    ReadTimeout at 16.6s, because ``?domain rdfs:label ?domainLabel`` with
+    ``?domain`` unbound scans every label in the graph. The builder already knows
+    which classes reached the prompt, and a join path leaving a class the writer
+    never sees is unusable — so anchoring is both the fix and the right scope.
+    """
+
+    _EMP = "https://example.org/o#Emp"
+    _DEPT = "https://example.org/o#Dept"
+
+    @classmethod
+    def _sequence(cls) -> list[list[dict]]:
+        """resolve, count, classes (TWO, so join paths are fetched), props, OP, aiContext."""
+        return [
+            [{"g": "https://ontology-workbench.local/ns-x/induced"}],
+            [{"cnt": "2"}],
+            [
+                {"class": cls._EMP, "label": "Emp", "parentClass": None},
+                {"class": cls._DEPT, "label": "Dept", "parentClass": None},
+            ],
+            [],
+            [],
+            [],
+        ]
+
+    @staticmethod
+    def _op_query(graph_client) -> str:
+        matches = [c[0][0] for c in graph_client.query.call_args_list if "owl:ObjectProperty" in c[0][0]]
+        assert len(matches) == 1, f"expected one join-path query, got {len(matches)}"
+        return matches[0]
+
+    async def test_selected_classes_anchor_the_query(self, tbox_builder, graph_client):
+        graph_client.ask = AsyncMock(return_value=True)
+        graph_client.query = AsyncMock(side_effect=self._sequence())
+
+        await tbox_builder.build([_hit(self._EMP), _hit(self._DEPT)], "ns-x", query="employees by dept")
+
+        sparql = self._op_query(graph_client)
+        assert f"VALUES ?domain {{ <{self._EMP}> <{self._DEPT}> }}" in sparql
+        # Still graph-scoped: the anchor is in addition to, not instead of, the graph.
+        assert "GRAPH <" in sparql
+
+    async def test_join_paths_still_reach_the_context(self, tbox_builder, graph_client):
+        """The anchor must not filter out the edges between the anchored classes."""
+        seq = self._sequence()
+        seq[4] = [
+            {
+                "op": "https://example.org/o#worksIn",
+                "opLabel": "works_in",
+                "domain": self._EMP,
+                "domainLabel": "Emp",
+                "range": self._DEPT,
+                "rangeLabel": "Dept",
+            }
+        ]
+        graph_client.ask = AsyncMock(return_value=True)
+        graph_client.query = AsyncMock(side_effect=seq)
+
+        ctx = await tbox_builder.build([_hit(self._EMP), _hit(self._DEPT)], "ns-x", query="employees by dept")
+
+        assert [op["label"] for op in ctx.object_properties] == ["works_in"]
+
+    async def test_unsafe_class_uris_are_dropped_not_interpolated(self, tbox_builder, graph_client):
+        """Class URIs come from Neptune, but they land inside SPARQL text."""
+        seq = self._sequence()
+        seq[2] = [
+            {"class": self._EMP, "label": "Emp", "parentClass": None},
+            {"class": "https://x#A> } INJECTED { <y", "label": "Bad", "parentClass": None},
+        ]
+        graph_client.ask = AsyncMock(return_value=True)
+        graph_client.query = AsyncMock(side_effect=seq)
+
+        await tbox_builder.build([_hit(self._EMP)], "ns-x", query="employees")
+
+        sparql = self._op_query(graph_client)
+        assert "INJECTED" not in sparql
+        assert f"VALUES ?domain {{ <{self._EMP}> }}" in sparql
+
+    async def test_a_full_context_tbox_anchors_every_class_not_the_first_fifty(self, tbox_builder, graph_client):
+        """The anchor must cover the WHOLE class list the writer will be shown.
+
+        This anchor is a filter over classes already chosen for the prompt, not a
+        result set being asked about, so capping it at the generic
+        ``_MAX_SPARQL_VALUES_URIS`` (50) does not return fewer rows of the same
+        kind — it deletes the join paths of every class past the cut. The
+        full-context path routinely exceeds 50: BIRD-Interact's namespace builds a
+        175-class T-Box, so 125 classes would reach the writer with no way to join
+        them, which is worse than the unanchored query the anchor replaced.
+        """
+        classes = [{"class": f"https://example.org/o#C{i}", "label": f"c{i}", "parentClass": None} for i in range(175)]
+        seq = self._sequence()
+        seq[2] = classes
+        graph_client.ask = AsyncMock(return_value=True)
+        graph_client.query = AsyncMock(side_effect=seq)
+
+        await tbox_builder.build([], "ns-x", query="anything")
+
+        sparql = self._op_query(graph_client)
+        for row in classes:
+            assert f"<{row['class']}>" in sparql, f"{row['label']} lost its join paths to the anchor cap"
+
+
+@pytest.mark.unit
+class TestIsSafeSparqlUri:
+    """`_is_safe_sparql_uri` backs the angle-bracket-interpolation guard used in
+    ~9 places in tbox_context, so its rejection behaviour is worth pinning."""
+
+    def test_rejects_a_trailing_newline(self):
+        from coa_serve.tier2.ontop.tbox_context import _is_safe_sparql_uri
+
+        # `\Z`, not `$`: `$` would match before the trailing newline and pass.
+        assert _is_safe_sparql_uri("https://ontology-workbench.local/ns-x/induced")
+        assert not _is_safe_sparql_uri("https://ontology-workbench.local/ns-x/induced\n")
+
+    def test_rejects_an_angle_bracket_breakout(self):
+        from coa_serve.tier2.ontop.tbox_context import _is_safe_sparql_uri
+
+        assert not _is_safe_sparql_uri("https://g.local/o> } INJECT {")

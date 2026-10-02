@@ -59,7 +59,8 @@ the source (or its namespace) deletes the catalog.
 - [ ] Connector Lambda **tagged `coa:connector = true`** (required — see below)
 - [ ] `spill_prefix` on the connector set to **`connectors/<connectorId>/spills`**
 - [ ] Spill bucket encrypted with **SSE-KMS** using a customer-managed key **tagged `coa:connector-spill = true`**
-- [ ] Column comments emitted as **Arrow schema metadata keyed by column name**, with `@pk`/`@fk` tags where you have declared keys
+- [ ] Column comments emitted as **Arrow schema metadata keyed by column name**, with `@pk`/`@fk`/`@notnull` tags where you have declared keys and non-nullable columns
+- [ ] Existing column comments checked for the literal text `@notnull` — it is now a tag, not prose (see below)
 - [ ] Three resource policies written (connector Lambda, spill bucket, spill KMS key)
 - [ ] The name of the one database inside your catalog this source will expose
 
@@ -74,18 +75,24 @@ for a Lambda-backed catalog.
 
 | Your connector emits | Discovered metadata | What AI enrichment then does |
 |---|---|---|
-| Column comments carrying `@pk`/`@fk` tags | Deterministic column descriptions **and** declared primary/foreign keys | Nothing for those fields — AI-generated metadata never overwrites deterministic metadata |
-| Column comments, no tags | Deterministic column descriptions; no declared keys | Infers relationships from column naming |
-| Names and types only | Names and types | Generates every description; infers primary keys from naming and relationships from column overlap |
+| Column comments carrying `@pk`/`@fk`/`@notnull` tags | Deterministic column descriptions, declared primary/foreign keys **and** per-column nullability | Nothing for those fields — AI-generated metadata never overwrites deterministic metadata |
+| Column comments, no tags | Deterministic column descriptions; no declared keys; every column reported nullable | Infers relationships from column naming |
+| Names and types only | Names and types; every column reported nullable | Generates every description; infers primary keys from naming and relationships from column overlap |
 
-Two limits apply no matter how cooperative the connector is:
+One limit applies no matter how cooperative the connector is:
 
-- **Nullability is never captured.** Neither Athena's `Column` type nor
-  `DESCRIBE` carries it. This has no ontology impact — nullability is not mapped
-  into the induced model.
 - **Table-level descriptions are always AI-generated.** Only the bare `DESCRIBE`
   form works against a federated catalog (`EXTENDED` and `FORMATTED` are
   rejected), and the bare form returns column rows only.
+
+And one thing your connector has to state, because the protocol will not:
+
+- **Nullability is not carried by the protocol** — neither Athena's `Column` type
+  nor `DESCRIBE` has a field for it — so a column is reported **nullable unless
+  your comment says otherwise** with `@notnull`. Absence means "nobody said", not
+  "nullable", but it displays as nullable in the review UI either way. Nullability
+  does not reach the induced ontology (only a declared primary key drives
+  `NOT_NULL`), so this is about what a steward sees when reviewing your source.
 
 !!! warning "Comments must be Arrow schema metadata keyed by column name"
     Athena reads comments from the Arrow **schema's** own metadata map, keyed by
@@ -95,30 +102,67 @@ Two limits apply no matter how cooperative the connector is:
     reaches Athena intact, and is then ignored. A connector whose comments are on
     the fields looks identical to a connector that emits no comments at all:
     `DESCRIBE` returns name and type with no comment column, every description is
-    AI-generated, and every `@pk`/`@fk` tag is lost with the comment that carried
-    it. The toolkit's `TableSchema` builds every field with an empty metadata map,
+    AI-generated, and every `@pk`/`@fk`/`@notnull` tag is lost with the comment that
+    carried it. The toolkit's `TableSchema` builds every field with an empty metadata map,
     so the working placement is the only one it can express.
 
-### Declaring primary and foreign keys in column comments
+### Declaring keys and nullability in column comments
 
-The Athena federation protocol has **no field for key constraints anywhere**, so
-a connector cannot report declared keys the way a JDBC source does from
-`information_schema`. Declared keys therefore travel **inside the column
-comments** as tags, which discovery parses out, strips, and turns into the same
-primary-key and foreign-key records the JDBC path produces.
+The Athena federation protocol has **no field for key constraints anywhere**, and
+none for nullability either, so a connector cannot report declared keys the way a
+JDBC source does from `information_schema`. Both therefore travel **inside the
+column comments** as tags, which discovery parses out, strips, and turns into the
+same primary-key, foreign-key and nullability records the JDBC path produces.
+
+!!! warning "`@notnull` is new, and it changes what an existing comment means"
+    Earlier releases recognised `@pk` and `@fk(...)` only. **`@notnull` is now a tag
+    on this source type**, which means a column comment containing the literal
+    lowercase text `@notnull` no longer survives into the stored description: the
+    text is stripped and the column is recorded **non-nullable**. That applies to
+    prose as much as to a deliberate tag — a comment reading
+    `Required, so it is @notnull in the source system` is stored as
+    `Required, so it is in the source system` and marks the column non-nullable.
+
+    Before re-scanning an existing source, search your connector's column comments
+    for `@notnull`. There is nothing to change if none contains it, which is the
+    normal case: no connector emitted the tag before it existed.
+
+    **The audit query.** Athena exposes a Lambda catalog's column comments through
+    `information_schema.columns`, which is a second reader of the same schema
+    metadata `DESCRIBE` returns. So you can audit every table of a connector in one
+    query, run against an Athena `LAMBDA` catalog you register over your connector in
+    **your own** account:
+
+    ```sql
+    SELECT table_schema, table_name, column_name, comment
+    FROM   "<your-catalog>".information_schema.columns
+    WHERE  comment LIKE '%@notnull%'
+    ORDER  BY table_schema, table_name, column_name;
+    ```
+
+    Empty result, nothing to do. Every row it returns is a comment to read: some
+    will be deliberate tags, and any that reads as prose needs rewording before the
+    scan strips it and marks that column non-nullable. `LIKE` is case-sensitive in
+    Athena, so the query deliberately returns the near misses too. They record
+    nothing, and seeing them is how you tell an intended tag from a typo. Swap
+    `@notnull` for `@pk` or `@fk` to audit those the same way.
+
+    Only that exact lowercase spelling with no operand is a tag. `@NOTNULL`,
+    `@notnulls`, `@notnull=true` and `@notnull(x)` are near misses and stay in the
+    text, and the left-boundary rule below keeps `bob@notnull.example.com` prose.
 
 !!! note "This section is for connector authors"
     Everything below is what *your encoder* must produce. If you are onboarding a
     Databricks SQL Warehouse, `connectors/databricks/` already does it: it reads
     Unity Catalog's `information_schema` and emits these tags for you, so there
-    is nothing here for you to write. It also **strips** any `@pk`/`@fk` tag it
-    finds in a Unity Catalog column comment — a comment is editable by anyone
-    holding `MODIFY`, and an honoured hand-written tag could assert a key the
-    warehouse never declared.
+    is nothing here for you to write. It also **strips** any `@pk`/`@fk`/`@notnull`
+    tag it finds in a Unity Catalog column comment — a comment is editable by anyone
+    holding `MODIFY`, and an honoured hand-written tag could assert a key or a
+    constraint the warehouse never declared.
 
 ```text
 comment   := (human_text | tag)*
-tag       := "@pk" | "@fk" "(" reference ")"
+tag       := "@pk" | "@notnull" | "@fk" "(" reference ")"
 reference := segment ("." segment)*        ; the last two are TABLE.COLUMN
 segment   := pad (quoted | unquoted) pad   ; entirely one or the other
 quoted    := '"' (not_a_quote | '""')* '"' ; may contain "." and ")"
@@ -132,6 +176,12 @@ The rules your encoder must follow:
   member of the table's primary key; a composite primary key is the set of those
   columns, ordered as `DESCRIBE` returns them. `@pk(id)` and `@pk=id` are
   near misses, not tags.
+- **`@notnull` takes no operand either**, and it tags the exception rather than
+  the rule: a column carrying it is recorded non-nullable, and a column without it
+  is recorded nullable. There is deliberately no `@nullable` spelling, because
+  absence would then be ambiguous between "nullable" and "nobody said" — and every
+  connector written before the tag existed emits neither. `@notnull=true` and
+  `@notnull(x)` are near misses, not tags.
 - **`@fk(parent_table.parent_column)` goes on the child column.** The child
   column is never named in the tag — it is the column whose comment carries it —
   so the child name never needs quoting.
@@ -159,7 +209,10 @@ The rules your encoder must follow:
   `@fk("orders"."Order Date")` stores the column as `Order Date`. A case or
   spelling mismatch does not error — it reads as a target outside the scan.
 - **A tag must not follow an identifier character**, so `owner bob@pk.example.com`
-  is prose rather than a primary-key declaration.
+  is prose rather than a primary-key declaration, and so is
+  `bob@notnull.example.com`. This is a boundary rule only — a tag *surrounded by
+  whitespace anywhere in the comment* is a tag, including in the middle of a
+  sentence.
 - **Understood tags are stripped from the stored description.** A tag the parser
   cannot act on is left in the description **verbatim**.
 
@@ -169,15 +222,22 @@ The rules your encoder must follow:
     column description: `@fk(orders)` (no column), `@fk(orders.)` (empty
     column), `@fk(orders.order id)` (space in a bare segment),
     `@fk(orders.order_id, nullable)` (prose left inside the brackets),
-    `@fk=orders.order_id` (retired spelling — use the bracketed operand), and
-    `@PK` (wrong case) all read as text and record no key. Review a scanned
-    source's column descriptions for stray `@pk`/`@fk` text before approving it.
+    `@fk=orders.order_id` (retired spelling — use the bracketed operand),
+    `@PK` (wrong case) and `@notnull=true` all read as text and record nothing.
+    Review a scanned source's column descriptions for stray `@pk`/`@fk`/`@notnull`
+    text before approving it — and, for `@notnull`, check the reverse too: a
+    description that has *lost* the word `@notnull` and a column that has become
+    non-nullable is the tag being honoured where prose was intended.
 
 Worked example — the comment your connector emits, and what is stored:
 
-| Comment emitted | Stored description | Key recorded |
+| Comment emitted | Stored description | Recorded |
 |---|---|---|
 | `Customer identifier @pk` | `Customer identifier` | primary-key member |
+| `Customer identifier @pk @notnull` | `Customer identifier` | primary-key member, non-nullable |
+| `Email address @notnull` | `Email address` | non-nullable; no key |
+| `Required, so it is @notnull in the source` | `Required, so it is in the source` | non-nullable — the tag is honoured in prose |
+| `Set @notnull=true upstream` | `Set @notnull=true upstream` | none — near miss, left verbatim |
 | `Parent order @fk(orders.order_id)` | `Parent order` | FK → `orders.order_id` |
 | `Country of the sales region @fk(regions.country)` | `Country of the sales region` | FK → `regions.country` |
 | `Zone within the country @fk(regions.zone)` | `Zone within the country` | FK → `regions.zone` — with the row above, the composite FK to `regions(country, zone)` |
@@ -260,18 +320,23 @@ response can never spill.
 
 ### Resolve the two principal ARNs
 
-Both are stable per deployment and published in SSM. Run these in
-`<accelerator-account>`:
+Both are stable per deployment and published in SSM, under a path carrying the
+resource prefix **and** the environment name, so each environment publishes its own
+pair. Run these in `<accelerator-account>`:
 
 ```bash
 # Discovery — the scan pipeline's connector Lambda execution role
-aws ssm get-parameter --name "/{prefix}/sources/db-connector-role-arn" \
+aws ssm get-parameter --name "/{prefix}/{envName}/sources/db-connector-role-arn" \
   --query 'Parameter.Value' --output text
 
 # Serve — the runtime role that executes queries through Athena
-aws ssm get-parameter --name "/{prefix}/serve/runtime-role-arn" \
+aws ssm get-parameter --name "/{prefix}/{envName}/serve/runtime-role-arn" \
   --query 'Parameter.Value' --output text
 ```
+
+Use the environment name the accelerator was deployed with, e.g. `/coa/dev/…`. A
+lookup that omits the segment returns nothing rather than a sibling environment's
+value.
 
 ### 1. Connector Lambda resource policy
 
@@ -515,7 +580,7 @@ discovered the hard way:
 | Add `--add-opens=java.base/java.nio=ALL-UNNAMED` to the Lambda's Java options on **JDK 17 and later** | Strong encapsulation denies Arrow's memory module reflective access to `java.nio` | **Metadata calls succeed and every read fails** — it presents as "discovery works, queries are broken" rather than as a build problem |
 | Emit **timezone-aware** timestamps | The protocol rejects naive timestamps | The connector is rejected with an unsupported Arrow type error |
 | Write **only** the columns present in the request | Athena projects the schema before calling the record handler | A null-vector error — and because unprojected queries pass, it surfaces late |
-| Attach comments as **Arrow schema metadata keyed by column name** | Athena reads the schema's own metadata map; a comment attached to an Arrow `Field` is delivered intact and then ignored | Comments never reach the ontology; `@pk`/`@fk` tags are lost with them |
+| Attach comments as **Arrow schema metadata keyed by column name** | Athena reads the schema's own metadata map; a comment attached to an Arrow `Field` is delivered intact and then ignored | Comments never reach the ontology; `@pk`/`@fk`/`@notnull` tags are lost with them |
 
 Two more worth knowing: response field order is positional for the list-tables
 response (the wrong order is rejected with a field-mismatch error), and the Arrow
@@ -530,7 +595,8 @@ schema travels as a bare base64 string of Arrow IPC bytes rather than as JSON.
 | Discovery succeeds; every query fails | Missing `--add-opens` on JDK 17+, or the record handler writes columns the request did not project | Fix and redeploy the connector — no re-scan needed, the query path reads no stored metadata |
 | Queries succeed until one fails `AccessDenied` | The spilled read is not authorized: `spill_prefix` is not `connectors/<connectorId>/spills`; the bucket is not SSE-KMS; its key lacks the `coa:connector-spill` tag; or the bucket/key policy does not name the querying roles | Set `spill_prefix`; encrypt the bucket with a tagged customer-managed key; add the bucket and key policies |
 | Column descriptions are all AI-generated although your connector emits comments | Comments were attached to the Arrow fields instead of the schema's metadata map, where Athena reads them | Emit each comment as `SchemaBuilder.addMetadata(columnName, comment)`; re-create the source to re-discover |
-| A `@pk`/`@fk` tag appears verbatim in a stored column description | The tag is malformed; the parser leaves what it cannot act on in the text | Correct the tag against the grammar above, then re-create the source |
+| A `@pk`/`@fk`/`@notnull` tag appears verbatim in a stored column description | The tag is malformed; the parser leaves what it cannot act on in the text | Correct the tag against the grammar above, then re-create the source |
+| A column became non-nullable and its description lost the word `@notnull` | `@notnull` is a tag now, and the comment used it as prose | Reword the comment so it does not contain the literal lowercase `@notnull`, then re-create the source |
 | Tables you expected are missing | `tableFilter`/`tableExcludeFilter` excluded them, or they live in a different database inside the catalog | Adjust the filters, or onboard the other database as its own source |
 | Only some of the connector's databases appear | Expected — a source is scoped to exactly one database | Onboard the connector once per database |
 
@@ -544,7 +610,8 @@ schema travels as a bare base64 string of Arrow IPC bytes rather than as JSON.
 ## Quick checklist
 
 - [ ] Connector Lambda deployed in `<connector-account>`, in this deployment's region, and referenced by full ARN
-- [ ] Comments attached as Arrow schema metadata keyed by column name, not to the Arrow fields; `@pk`/`@fk` tags encoded for declared keys
+- [ ] Comments attached as Arrow schema metadata keyed by column name, not to the Arrow fields; `@pk`/`@fk`/`@notnull` tags encoded for declared keys and non-nullable columns
+- [ ] No existing comment carries the literal lowercase `@notnull` as prose
 - [ ] `--add-opens=java.base/java.nio=ALL-UNNAMED` set on JDK 17+; `with-arrow` classifier; JAR deployed from S3; timestamps timezone-aware; record handler honours the request's projection
 - [ ] Connector Lambda tagged `coa:connector = true`
 - [ ] `spill_prefix` set to `connectors/<connectorId>/spills`

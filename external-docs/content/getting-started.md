@@ -67,6 +67,8 @@ All stacks use context-driven configuration via `CoaStack` base class:
 | `api_throttle_rate_limit`  | `50`               | API Gateway stage requests-per-second rate limit               |
 | `api_throttle_burst_limit` | `100`              | API Gateway stage burst capacity                               |
 | `lambda_reserved_concurrency` | `5`             | Reserved concurrency for the VKG-reload and doc-preprocessing Lambdas; `0` disables reserving (needed on reduced Lambda-quota accounts) |
+| `serve_nl2sql_graph_expand` | (unset — on)    | Tier-2 flat NL→SQL ontology foreign-key expansion; `false` turns it off. See [Deploying](deploying.md#tier-2-nlsql-ontology-foreign-key-expansion) |
+| `serve_nl2sql_graph_expand_max_tables` | (unset — `8`) | How many walked tables the expansion may append to the NL→SQL prompt; `0` appends none |
 
 Resource naming follows `{prefix}-{env}-{name}` (e.g. `coa-dev-neptune`).
 
@@ -90,9 +92,18 @@ NextGen, which manages replicas internally.
 
 The tradeoff at minimum 0: compute scales down after a period of inactivity and
 takes roughly ten seconds to return, and at very low OCU the NextGen circuit
-breaker sheds load with HTTP 429s under an ingestion burst. That is usually the
-right trade for dev and sandbox environments, and usually the wrong one for an
-environment serving interactive queries or running large scans.
+breaker sheds load with HTTP 429s under an ingestion burst. When indexing
+capacity is throttled this way, individual documents in a bulk embedding write
+can be rejected. COA's bulk writer re-submits the throttled documents with
+capped backoff and, if any still fail to land after its retries are exhausted,
+**fails the ingest loudly** (`PartialIndexError`) rather than reporting a write
+that only partially indexed — and a proposal accept whose embeddings do not
+become searchable is failed (not silently published) so it can be retried. That
+is the correct, safe behaviour, but it means an ingest-heavy workload against a
+scaled-to-zero collection can see accepts fail under throttling. So minimum 0 is
+usually the right trade for dev and sandbox environments, and usually the wrong
+one for an environment that ingests large ontologies or serves interactive
+queries — use a non-zero floor (e.g. `2`) there.
 
 #### First-time deployment
 

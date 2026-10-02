@@ -19,6 +19,7 @@ const mdFileToPageId: Record<string, PageId> = {
   'index.md': 'sources',
   'cross-account-sources.md': 'cross-account-sources',
   'custom-connector-sources.md': 'custom-connector-sources',
+  'databricks-sources.md': 'databricks-sources',
   'ontologies.md': 'ontologies',
   'metrics.md': 'metrics',
   'serve.md': 'serve',

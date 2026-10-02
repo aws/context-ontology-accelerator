@@ -395,6 +395,79 @@ class TestGuardrailIntegration:
         result = client.invoke("sys", "usr")
         assert result.result == {"description": "Contact {EMAIL} for info"}
 
+    @patch("coa_common.bedrock.logger")
+    @patch("coa_common.bedrock.boto3")
+    def test_guardrail_intervened_without_block_logs_masking_warning(self, mock_boto3, mock_logger):
+        """A masking (ANONYMIZE) intervention must leave an observable log line.
+
+        Regression for the dead-code bug: the masking warning sat AFTER a
+        ``raise`` inside ``if blocked:``, so it was unreachable AND wrongly nested
+        — an intervention that masked values (but did not block) produced no log
+        at all. The warning now sits in its own ``if intervened:`` branch after
+        the blocked ``raise``, so an unblocked intervention is logged.
+        """
+        mock_client = MagicMock()
+        mock_boto3.client.return_value = mock_client
+
+        mock_client.converse.return_value = {
+            "output": {"message": {"content": [{"text": '{"description": "Contact {EMAIL}"}'}]}},
+            "stopReason": "guardrail_intervened",
+            "usage": {"inputTokens": 10, "outputTokens": 5},
+            "trace": {
+                "guardrail": {
+                    "outputAssessments": {
+                        "gr-123": [
+                            {
+                                "sensitiveInformationPolicy": {
+                                    "piiEntities": [{"action": "ANONYMIZED", "type": "EMAIL"}]
+                                }
+                            },
+                        ]
+                    }
+                }
+            },
+        }
+
+        client = BedrockClient(region="us-east-1", guardrail_id="gr-123")
+        client.invoke("sys", "usr")
+
+        masking_logs = [
+            c for c in mock_logger.warning.call_args_list if "intervened without blocking" in str(c.args[0])
+        ]
+        assert len(masking_logs) == 1, "masking intervention must log exactly one warning"
+
+    @patch("coa_common.bedrock.logger")
+    @patch("coa_common.bedrock.boto3")
+    def test_guardrail_blocked_does_not_log_masking_warning(self, mock_boto3, mock_logger):
+        """A BLOCK raises and must not ALSO emit the masking-intervention warning
+        (the two branches are mutually exclusive: blocked raises before intervened)."""
+        mock_client = MagicMock()
+        mock_boto3.client.return_value = mock_client
+
+        mock_client.converse.return_value = {
+            "output": {"message": {"content": [{"text": "I cannot help with that."}]}},
+            "stopReason": "guardrail_intervened",
+            "usage": {"inputTokens": 10, "outputTokens": 5},
+            "trace": {
+                "guardrail": {
+                    "outputAssessments": {
+                        "gr-123": [
+                            {"contentPolicy": {"filters": [{"action": "BLOCKED", "type": "VIOLENCE"}]}},
+                        ]
+                    }
+                }
+            },
+        }
+
+        client = BedrockClient(region="us-east-1", guardrail_id="gr-123")
+        with pytest.raises(GuardrailBlockedError):
+            client.invoke("sys", "usr")
+
+        masking_logs = [
+            c for c in mock_logger.warning.call_args_list if "intervened without blocking" in str(c.args[0])
+        ]
+        assert masking_logs == [], "a blocked response must not log the masking-intervention warning"
+
     @patch("coa_common.bedrock.boto3")
     def test_custom_guardrail_version(self, mock_boto3):
         mock_client = MagicMock()

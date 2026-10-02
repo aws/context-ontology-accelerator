@@ -16,12 +16,16 @@ import KeyValuePairs from "@cloudscape-design/components/key-value-pairs";
 import Link from "@cloudscape-design/components/link";
 import Modal from "@cloudscape-design/components/modal";
 import Pagination from "@cloudscape-design/components/pagination";
+import ProgressBar from "@cloudscape-design/components/progress-bar";
 import SpaceBetween from "@cloudscape-design/components/space-between";
 import Spinner from "@cloudscape-design/components/spinner";
 import StatusIndicator from "@cloudscape-design/components/status-indicator";
 import Table from "@cloudscape-design/components/table";
 import Tabs from "@cloudscape-design/components/tabs";
 import Select from "@cloudscape-design/components/select";
+import Toggle from "@cloudscape-design/components/toggle";
+import FormField from "@cloudscape-design/components/form-field";
+import Input from "@cloudscape-design/components/input";
 import TextFilter from "@cloudscape-design/components/text-filter";
 import type { StatusIndicatorProps } from "@cloudscape-design/components/status-indicator";
 import { useCollection } from "@cloudscape-design/collection-hooks";
@@ -35,6 +39,8 @@ import {
   useGetSourceScanJob,
   useListSourceScanJobs,
   useKeepRescanRemoval,
+  usePutSourceRescanSchedule,
+  usePutSourceEventRescan,
 } from "@api-hooks";
 import {
   ReviewDecision,
@@ -42,14 +48,22 @@ import {
   ReviewStatus,
   SourceStatus,
 } from "@coa/control-plane-client";
-import type { TableSummary, ScanJobEntry } from "@coa/control-plane-client";
+import type {
+  EventRescanConfig,
+  RescanSchedule,
+  ScanJobEntry,
+  TableSummary,
+} from "@coa/control-plane-client";
 import { useControlPlaneClient } from "@components/ControlPlaneClientProvider";
 import { ButtonWithHint } from "@components/ButtonWithHint";
 import { sourceStatusType, sourceStatusLabel } from "@utils/source-status";
 import { formatTimestamp } from "@utils/helpers";
+import { tableDetailPath } from "@utils/routes";
 
 const TABLES_PAGE_SIZE = 25;
 const METADATA_FRESHNESS_THRESHOLD_DAYS = 30;
+// Matches the enricher's publish throttle; polling faster only re-reads the same row.
+const SCAN_PROGRESS_POLL_MS = 5000;
 
 // ── Status helpers ────────────────────────────────────────────────────────────
 
@@ -69,13 +83,18 @@ const DATABASE_SUBTYPE_LABELS: Record<string, string> = {
   GLUE_DATABASE: "Glue database",
   JDBC_DATABASE: "JDBC database",
   CUSTOM_CONNECTOR: "Custom connector",
+  DATABRICKS_SQL_WAREHOUSE: "Databricks SQL Warehouse",
 };
 
 // ── Degraded-scan annotation ──────────────────────────────────────────────────
 //
-// Discovery for the CUSTOM_CONNECTOR sub-type reads one table at a time (a
-// DESCRIBE per table), so a single unreadable table is dropped while the scan
-// as a whole still SUCCEEDS. The scan job then reports `tablesFailed` — the
+// Discovery for the connector-backed sub-types — CUSTOM_CONNECTOR and
+// DATABRICKS_SQL_WAREHOUSE — reads one table at a time (a DESCRIBE per table),
+// so a single unreadable table is dropped while the scan as a whole still
+// SUCCEEDS. On a Databricks source that is the common case rather than the
+// exotic one: Unity Catalog privilege-filters results, so a table listed under
+// BROWSE but not SELECT-able is listed and then not readable.
+// The scan job then reports `tablesFailed` — the
 // count of listed-but-unreadable tables, absent rather than zero when the scan
 // was clean, so its presence alone marks the scan degraded — and
 // `failedTables`, the affected tables as `database.table`.
@@ -114,6 +133,24 @@ function readDegradedScan(scanJob: unknown): DegradedScan | undefined {
       ? listed.filter((entry): entry is string => typeof entry === "string")
       : [],
   };
+}
+
+interface ScanProgress {
+  processed: number;
+  total: number;
+  percent: number;
+}
+
+// Read defensively for the same reason as readDegradedScan: the handler builds
+// this response as a raw dict, so a missed int() coercion arrives as a string.
+function readScanProgress(scanJob: unknown): ScanProgress | undefined {
+  if (!isRecord(scanJob)) return undefined;
+  const total = scanJob.tablesTotal;
+  if (typeof total !== "number" || total <= 0) return undefined;
+  const raw = scanJob.tablesProcessed;
+  // Clamped: tablesTotal can come from an older scan while this one is early.
+  const processed = Math.min(typeof raw === "number" ? raw : 0, total);
+  return { processed, total, percent: Math.round((processed / total) * 100) };
 }
 
 const ValueWithLabel: React.FC<{
@@ -175,8 +212,16 @@ export const SourceDetail: React.FC = () => {
   const source = data?.body;
   const isDatabase = source?.sourceType === "DATABASE";
 
-  // Tables — only fetched for DATABASE sources via the new sources-api tables endpoint
-  const { data: tablesData, isLoading: tablesLoading } = useListSourceTables(
+  // Tables — only fetched for DATABASE sources via the new sources-api tables endpoint.
+  // Pages render as they arrive; `tablesLoadingMore` means the list on screen is
+  // a valid prefix, not the whole source, so the counts are marked provisional.
+  const {
+    data: tablesData,
+    isLoading: tablesLoading,
+    isLoadingMore: tablesLoadingMore,
+    isError: tablesError,
+    error: tablesErrorObj,
+  } = useListSourceTables(
     namespaceId ?? "",
     isDatabase ? (sourceId ?? "") : "",
   );
@@ -209,10 +254,13 @@ export const SourceDetail: React.FC = () => {
   // Scan-job record for the most recent scan of a database source. Fetched for
   // every scan, not just failed ones: a scan can succeed and still have dropped
   // individual tables, and that count lives only on the scan job.
+  // Polled while enriching, which is where per-table progress advances.
+  const isEnriching = source?.status === SourceStatus.ENRICHING;
   const { data: scanJobData } = useGetSourceScanJob(
     namespaceId ?? "",
     sourceId ?? "",
     isDatabase ? (source?.databaseDetails?.lastScanJobId ?? "") : "",
+    isEnriching ? SCAN_PROGRESS_POLL_MS : undefined,
   );
 
   // useCollection must be called unconditionally (Rules of Hooks) — before any early returns.
@@ -316,6 +364,10 @@ export const SourceDetail: React.FC = () => {
 
   // Present only when the last scan succeeded but lost individual tables.
   const degradedScan = readDegradedScan(scanJobData);
+
+  // Only while enriching: before that, lastScanJobId still points at the
+  // previous (finished) job, whose counts would render as a full bar.
+  const scanProgress = readScanProgress(isEnriching ? scanJobData : undefined);
 
   const preprocessingIssues = Array.isArray(docDetails?.preprocessingIssues)
     ? docDetails.preprocessingIssues
@@ -591,6 +643,15 @@ export const SourceDetail: React.FC = () => {
           </Alert>
         )}
 
+      {isDatabase && scanProgress && (
+        <ProgressBar
+          value={scanProgress.percent}
+          label="Enrichment progress"
+          description={`${scanProgress.processed} of ${scanProgress.total} tables processed`}
+          additionalInfo="Tables already reviewed count as processed without being regenerated."
+        />
+      )}
+
       {isDatabase && degradedScan && (
         <Alert
           type="warning"
@@ -692,9 +753,19 @@ export const SourceDetail: React.FC = () => {
             tabs={[
               {
                 id: "tables",
-                label: `Tables (${tables.length})`,
+                label: `Tables (${tables.length}${tablesLoadingMore ? "+" : ""})`,
                 content: (
                   <SpaceBetween size="m">
+                    {tablesError && (
+                      <Alert type="error" header="Failed to load tables">
+                        {tablesErrorObj instanceof Error
+                          ? tablesErrorObj.message
+                          : "The table list could not be retrieved."}{" "}
+                        {(tablesData?.items?.length ?? 0) > 0
+                          ? "The list below is partial."
+                          : ""}
+                      </Alert>
+                    )}
                     {(tablesData?.skippedAssets ?? 0) > 0 && (
                       <Alert type="warning">
                         {tablesData?.skippedAssets === 1
@@ -724,7 +795,11 @@ export const SourceDetail: React.FC = () => {
                               onFollow={(e) => {
                                 e.preventDefault();
                                 navigate(
-                                  `/namespaces/${namespaceId}/sources/${sourceId}/tables/${item.tableId}`,
+                                  tableDetailPath(
+                                    namespaceId!,
+                                    sourceId!,
+                                    item.tableId!,
+                                  ),
                                 );
                               }}
                             >
@@ -824,6 +899,13 @@ export const SourceDetail: React.FC = () => {
                                     } pending deletion`}
                                   </Badge>
                                 )}
+                                {(item.pendingRelationships ?? 0) > 0 && (
+                                  <Badge color="blue">
+                                    {`${item.pendingRelationships} relationship${
+                                      item.pendingRelationships === 1 ? "" : "s"
+                                    } pending review`}
+                                  </Badge>
+                                )}
                               </SpaceBetween>
                             );
                           },
@@ -870,7 +952,15 @@ export const SourceDetail: React.FC = () => {
                       header={
                         <Header
                           variant="h2"
-                          counter={`(${tables.length})`}
+                          counter={`(${tables.length}${tablesLoadingMore ? "+" : ""})`}
+                          // Text, not just a spinner: a partial list that looks
+                          // complete is worse than a slow one, and screen-reader
+                          // users get no signal from a loading glyph alone.
+                          description={
+                            tablesLoadingMore
+                              ? "Still loading tables — the list below is incomplete."
+                              : undefined
+                          }
                           actions={
                             <SpaceBetween direction="horizontal" size="xs">
                               <Button
@@ -939,130 +1029,206 @@ export const SourceDetail: React.FC = () => {
                 id: "settings",
                 label: "Settings",
                 content: (
-                  <Container
-                    header={<Header variant="h2">Connection settings</Header>}
-                  >
-                    {dbDetails?.glueConfiguration && (
-                      <KeyValuePairs
-                        columns={2}
-                        items={[
-                          {
-                            label: "Catalog ID",
-                            value: String(
-                              dbDetails.glueConfiguration.catalogId ?? "—",
-                            ),
-                          },
-                          {
-                            label: "Region",
-                            value: String(
-                              dbDetails.glueConfiguration.region ?? "—",
-                            ),
-                          },
-                          {
-                            label: "Database",
-                            value: String(
-                              dbDetails.glueConfiguration.databaseName ?? "—",
-                            ),
-                          },
-                          {
-                            label: "Table filter",
-                            value: String(
-                              dbDetails.glueConfiguration.tableFilter ??
-                                "(none)",
-                            ),
-                          },
-                        ]}
-                      />
-                    )}
-                    {dbDetails?.jdbcConfiguration && (
-                      <KeyValuePairs
-                        columns={2}
-                        items={[
-                          {
-                            label: "Engine",
-                            value: String(
-                              dbDetails.jdbcConfiguration.engine ?? "—",
-                            ),
-                          },
-                          {
-                            label: "Host",
-                            value: String(
-                              dbDetails.jdbcConfiguration.host ?? "—",
-                            ),
-                          },
-                          {
-                            label: "Port",
-                            value: String(
-                              dbDetails.jdbcConfiguration.port ?? "—",
-                            ),
-                          },
-                          {
-                            label: "Database",
-                            value: String(
-                              dbDetails.jdbcConfiguration.databaseName ?? "—",
-                            ),
-                          },
-                          {
-                            label: "Schema filter",
-                            value: String(
-                              dbDetails.jdbcConfiguration.schemaFilter ??
-                                "(none)",
-                            ),
-                          },
-                          {
-                            label: "Table filter",
-                            value: String(
-                              dbDetails.jdbcConfiguration.tableFilter ??
-                                "(none)",
-                            ),
-                          },
-                          {
-                            label: "Auth",
-                            value: "Secrets Manager",
-                          },
-                        ]}
-                      />
-                    )}
-                    {dbDetails?.customConnectorConfiguration && (
-                      <KeyValuePairs
-                        columns={2}
-                        items={[
-                          {
-                            // One ARN, because CustomConnectorConfiguration models one: the
-                            // connector Lambda serves both the metadata and record
-                            // paths. Athena's split metadata/record pair is not
-                            // offered anywhere — see that Smithy shape for why.
-                            label: "Connector function ARN",
-                            value: String(
-                              dbDetails.customConnectorConfiguration
-                                .connectorFunctionArn ?? "—",
-                            ),
-                          },
-                          {
-                            label: "Database",
-                            value: String(
-                              dbDetails.customConnectorConfiguration
-                                .databaseName ?? "—",
-                            ),
-                          },
-                          {
-                            label: "Table filter",
-                            value: String(
-                              dbDetails.customConnectorConfiguration
-                                .tableFilter ?? "(none)",
-                            ),
-                          },
-                          {
-                            label: "Table exclude filter",
-                            value: String(
-                              dbDetails.customConnectorConfiguration
-                                .tableExcludeFilter ?? "(none)",
-                            ),
-                          },
-                        ]}
-                      />
-                    )}
-                  </Container>
+                  <SpaceBetween size="l">
+                    <Container
+                      header={<Header variant="h2">Connection settings</Header>}
+                    >
+                      {dbDetails?.glueConfiguration && (
+                        <KeyValuePairs
+                          columns={2}
+                          items={[
+                            {
+                              label: "Catalog ID",
+                              value: String(
+                                dbDetails.glueConfiguration.catalogId ?? "—",
+                              ),
+                            },
+                            {
+                              label: "Region",
+                              value: String(
+                                dbDetails.glueConfiguration.region ?? "—",
+                              ),
+                            },
+                            {
+                              label: "Database",
+                              value: String(
+                                dbDetails.glueConfiguration.databaseName ?? "—",
+                              ),
+                            },
+                            {
+                              label: "Table filter",
+                              value: String(
+                                dbDetails.glueConfiguration.tableFilter ??
+                                  "(none)",
+                              ),
+                            },
+                          ]}
+                        />
+                      )}
+                      {dbDetails?.jdbcConfiguration && (
+                        <KeyValuePairs
+                          columns={2}
+                          items={[
+                            {
+                              label: "Engine",
+                              value: String(
+                                dbDetails.jdbcConfiguration.engine ?? "—",
+                              ),
+                            },
+                            {
+                              label: "Host",
+                              value: String(
+                                dbDetails.jdbcConfiguration.host ?? "—",
+                              ),
+                            },
+                            {
+                              label: "Port",
+                              value: String(
+                                dbDetails.jdbcConfiguration.port ?? "—",
+                              ),
+                            },
+                            {
+                              label: "Database",
+                              value: String(
+                                dbDetails.jdbcConfiguration.databaseName ?? "—",
+                              ),
+                            },
+                            {
+                              label: "Schema filter",
+                              value: String(
+                                dbDetails.jdbcConfiguration.schemaFilter ??
+                                  "(none)",
+                              ),
+                            },
+                            {
+                              label: "Table filter",
+                              value: String(
+                                dbDetails.jdbcConfiguration.tableFilter ??
+                                  "(none)",
+                              ),
+                            },
+                            {
+                              label: "Auth",
+                              value: "Secrets Manager",
+                            },
+                          ]}
+                        />
+                      )}
+                      {dbDetails?.customConnectorConfiguration && (
+                        <KeyValuePairs
+                          columns={2}
+                          items={[
+                            {
+                              // One ARN, because CustomConnectorConfiguration models one: the
+                              // connector Lambda serves both the metadata and record
+                              // paths. Athena's split metadata/record pair is not
+                              // offered anywhere — see that Smithy shape for why.
+                              label: "Connector function ARN",
+                              value: String(
+                                dbDetails.customConnectorConfiguration
+                                  .connectorFunctionArn ?? "—",
+                              ),
+                            },
+                            {
+                              label: "Database",
+                              value: String(
+                                dbDetails.customConnectorConfiguration
+                                  .databaseName ?? "—",
+                              ),
+                            },
+                            {
+                              label: "Table filter",
+                              value: String(
+                                dbDetails.customConnectorConfiguration
+                                  .tableFilter ?? "(none)",
+                              ),
+                            },
+                            {
+                              label: "Table exclude filter",
+                              value: String(
+                                dbDetails.customConnectorConfiguration
+                                  .tableExcludeFilter ?? "(none)",
+                              ),
+                            },
+                          ]}
+                        />
+                      )}
+                      {dbDetails?.databricksSqlWarehouseConfiguration && (
+                        <KeyValuePairs
+                          columns={2}
+                          items={[
+                            {
+                              label: "Workspace hostname",
+                              value: String(
+                                dbDetails.databricksSqlWarehouseConfiguration
+                                  .workspaceHostname ?? "—",
+                              ),
+                            },
+                            {
+                              label: "HTTP path",
+                              value: String(
+                                dbDetails.databricksSqlWarehouseConfiguration
+                                  .httpPath ?? "—",
+                              ),
+                            },
+                            {
+                              label: "Unity Catalog catalog",
+                              value: String(
+                                dbDetails.databricksSqlWarehouseConfiguration
+                                  .databricksCatalog ?? "—",
+                              ),
+                            },
+                            {
+                              label: "Unity Catalog schema",
+                              value: String(
+                                dbDetails.databricksSqlWarehouseConfiguration
+                                  .databaseName ?? "—",
+                              ),
+                            },
+                            // Role before secret: the credential is read only as a session
+                            // assumed from the role. Neither ARN is itself a secret.
+                            {
+                              label:
+                                "Credential access role (assumed to read the secret)",
+                              value: String(
+                                dbDetails.databricksSqlWarehouseConfiguration
+                                  .crossAccountRoleArn ?? "—",
+                              ),
+                            },
+                            {
+                              label:
+                                "Credential secret (read through that role)",
+                              value: String(
+                                dbDetails.databricksSqlWarehouseConfiguration
+                                  .credentialSecretArn ?? "—",
+                              ),
+                            },
+                            {
+                              label: "Table filter",
+                              value: String(
+                                dbDetails.databricksSqlWarehouseConfiguration
+                                  .tableFilter ?? "(none)",
+                              ),
+                            },
+                            {
+                              label: "Table exclude filter",
+                              value: String(
+                                dbDetails.databricksSqlWarehouseConfiguration
+                                  .tableExcludeFilter ?? "(none)",
+                              ),
+                            },
+                          ]}
+                        />
+                      )}
+                    </Container>
+                    <RescanScheduleControl
+                      namespaceId={namespaceId ?? ""}
+                      sourceId={sourceId ?? ""}
+                      isGlue={source.sourceSubType === "GLUE_DATABASE"}
+                      schedule={dbDetails?.rescanSchedule}
+                      eventRescan={dbDetails?.eventRescan}
+                    />
+                  </SpaceBetween>
                 ),
               },
             ]}
@@ -1313,6 +1479,8 @@ interface ScanHistoryEntry {
   type: StatusIndicatorProps["type"];
   label: string;
   detail: string;
+  /** INITIAL / MANUAL / SCHEDULED / EVENT. Absent on review and legacy rows. */
+  trigger?: string;
 }
 
 function toIso(value: Date | string | undefined): string | undefined {
@@ -1327,11 +1495,13 @@ function scanEntryToRow(entry: ScanJobEntry, index: number): ScanHistoryEntry {
   const id = `scan-${at}-${index}`;
   const tables = entry.tablesDiscovered ?? 0;
   const status = entry.status ?? "";
+  const trigger = entry.triggerType ?? undefined;
   if (status === "FAILED") {
     return {
       id,
       at,
       kind: "scan",
+      trigger,
       type: "error",
       label: "Scan failed",
       detail: entry.errorMessage
@@ -1348,6 +1518,7 @@ function scanEntryToRow(entry: ScanJobEntry, index: number): ScanHistoryEntry {
       id,
       at,
       kind: "scan",
+      trigger,
       type: "in-progress",
       label: "Scan in progress",
       detail: "The scan or enrichment pipeline is still running.",
@@ -1358,6 +1529,7 @@ function scanEntryToRow(entry: ScanJobEntry, index: number): ScanHistoryEntry {
       id,
       at,
       kind: "scan",
+      trigger,
       type: "stopped",
       label: "Scan cancelled",
       detail: "The scan was cancelled.",
@@ -1367,6 +1539,7 @@ function scanEntryToRow(entry: ScanJobEntry, index: number): ScanHistoryEntry {
     id,
     at,
     kind: "scan",
+    trigger,
     type: "success",
     label: "Scan completed",
     detail: `Scanned ${tables} table${tables === 1 ? "" : "s"}.`,
@@ -1626,6 +1799,12 @@ const ScanHistoryTable: React.FC<ScanHistoryTableProps> = (props) => {
           minWidth: 200,
         },
         {
+          id: "trigger",
+          header: "Trigger",
+          cell: (e) => e.trigger ?? "-",
+          minWidth: 120,
+        },
+        {
           id: "detail",
           header: "Details",
           cell: (e) => e.detail,
@@ -1642,5 +1821,161 @@ const ScanHistoryTable: React.FC<ScanHistoryTableProps> = (props) => {
         </Box>
       }
     />
+  );
+};
+
+interface RescanScheduleControlProps {
+  namespaceId: string;
+  sourceId: string;
+  isGlue: boolean;
+  schedule?: RescanSchedule;
+  eventRescan?: EventRescanConfig;
+}
+
+/**
+ * Configure a recurring rescan cadence (EventBridge Scheduler). When enabled,
+ * the source is automatically re-scanned on the given schedule; the schema-diff
+ * keeps it non-destructive.
+ */
+const RescanScheduleControl: React.FC<RescanScheduleControlProps> = ({
+  namespaceId,
+  sourceId,
+  isGlue,
+  schedule,
+  eventRescan,
+}) => {
+  const [enabled, setEnabled] = useState<boolean>(schedule?.enabled ?? false);
+  const [expression, setExpression] = useState<string>(
+    schedule?.scheduleExpression ?? "rate(1 day)",
+  );
+  const [timezone, setTimezone] = useState<string>(schedule?.timezone ?? "UTC");
+  const { mutate, isPending, error, isSuccess } = usePutSourceRescanSchedule(
+    namespaceId,
+    sourceId,
+  );
+
+  const [eventEnabled, setEventEnabled] = useState<boolean>(
+    eventRescan?.enabled ?? false,
+  );
+  const {
+    mutate: setEventRescan,
+    isPending: eventPending,
+    error: eventError,
+  } = usePutSourceEventRescan(namespaceId, sourceId);
+  // Set by every edit below. useGetSource polls every 10s, so a sync that
+  // ignored this would overwrite an expression the user is still typing.
+  const [dirty, setDirty] = useState(false);
+
+  useEffect(() => {
+    if (dirty) return;
+    setEnabled(schedule?.enabled ?? false);
+    setExpression(schedule?.scheduleExpression ?? "rate(1 day)");
+    setTimezone(schedule?.timezone ?? "UTC");
+  }, [
+    dirty,
+    schedule?.enabled,
+    schedule?.scheduleExpression,
+    schedule?.timezone,
+  ]);
+
+  // Hand ownership back to the server value once the save lands.
+  useEffect(() => {
+    if (isSuccess) setDirty(false);
+  }, [isSuccess]);
+
+  // No save button on this one, so it only needs holding still in flight.
+  useEffect(() => {
+    if (!eventPending) setEventEnabled(eventRescan?.enabled ?? false);
+  }, [eventPending, eventRescan?.enabled]);
+
+  const save = () =>
+    mutate({
+      enabled,
+      scheduleExpression: enabled ? expression : undefined,
+      timezone: enabled ? timezone : undefined,
+    });
+
+  return (
+    <Container
+      header={
+        <Header
+          variant="h2"
+          description="Automatically re-scan this source on a recurring cadence to pick up upstream schema changes. Unchanged tables keep their enrichment and review status."
+        >
+          Automatic rescans
+        </Header>
+      }
+    >
+      <SpaceBetween size="m">
+        {error && <Alert type="error">{error.message}</Alert>}
+        {isSuccess && <Alert type="success">Rescan schedule saved.</Alert>}
+        <Toggle
+          checked={enabled}
+          onChange={({ detail }) => {
+            setEnabled(detail.checked);
+            setDirty(true);
+          }}
+        >
+          Enable scheduled rescans
+        </Toggle>
+        {enabled && (
+          <>
+            <FormField
+              label="Schedule expression"
+              description="EventBridge expression, e.g. rate(1 day) or cron(0 3 * * ? *)."
+            >
+              <Input
+                value={expression}
+                onChange={({ detail }) => {
+                  setExpression(detail.value);
+                  setDirty(true);
+                }}
+                placeholder="rate(1 day)"
+              />
+            </FormField>
+            <FormField
+              label="Timezone"
+              description="IANA timezone for cron evaluation (e.g. America/New_York)."
+            >
+              <Input
+                value={timezone}
+                onChange={({ detail }) => {
+                  setTimezone(detail.value);
+                  setDirty(true);
+                }}
+                placeholder="UTC"
+              />
+            </FormField>
+          </>
+        )}
+        <Box>
+          <Button variant="primary" loading={isPending} onClick={save}>
+            Save schedule
+          </Button>
+        </Box>
+        {isGlue && eventError && (
+          <Alert type="error" header="Could not change event-driven rescans">
+            {eventError.message}
+          </Alert>
+        )}
+        {isGlue && (
+          <FormField
+            label="Event-driven rescans"
+            description="Re-scan automatically when this source's Glue Data Catalog changes (new/changed tables). Bursts are coalesced."
+          >
+            <Toggle
+              checked={eventEnabled}
+              disabled={eventPending}
+              onChange={({ detail }) => {
+                setEventEnabled(detail.checked);
+                setEventRescan(detail.checked);
+              }}
+            >
+              Re-scan on Glue catalog changes
+            </Toggle>
+          </FormField>
+        )}
+      </SpaceBetween>
+    </Container>
   );
 };

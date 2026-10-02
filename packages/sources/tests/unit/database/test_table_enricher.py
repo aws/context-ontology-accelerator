@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from unittest.mock import MagicMock, patch
 
 from botocore.exceptions import ClientError, ReadTimeoutError
@@ -161,6 +162,45 @@ class TestRun:
     @patch("coa_sources.database.enrichment.table_enricher._write_enriched_assets")
     @patch("coa_sources.database.enrichment.table_enricher.read_assets_for_datasource")
     @patch("coa_sources.database.enrichment.table_enricher.BedrockClient")
+    def test_run_count_partition_invariant_holds(
+        self, mock_client_cls: MagicMock, mock_read: MagicMock, mock_write: MagicMock
+    ) -> None:
+        """Classification is a real partition: enriched/failed disjoint, partial ⊆ enriched.
+
+        Guards the observable result contract, not a derived-count tautology
+        (``enriched + failed + skipped == total`` is always true because skipped is
+        computed by subtraction). Asserts the independently-tracked facts instead:
+        the failed set does not overlap the enriched count, enriched + failed does
+        not exceed the total, and partial is a subset of enriched.
+        """
+
+        # t1 enriches, t2 raises → one enriched, one failed, zero skipped.
+        def _invoke_side_effect(*args: object, **kwargs: object) -> object:
+            call = mock_client_cls.return_value.invoke.call_count
+            if call == 1:
+                return _mock_invocation_result()
+            raise Exception("Bedrock error")
+
+        mock_client_cls.return_value.invoke.side_effect = _invoke_side_effect
+        tables = [_make_table("t1"), _make_table("t2")]
+        mock_read.return_value = tables
+
+        result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock())
+
+        total = len(tables)
+        enriched = result["tables_enriched"]
+        failed = result["tables_failed"]
+        # enriched + failed cannot exceed the discovered tables (no double-count).
+        assert enriched + failed <= total
+        # Exactly this batch: one enriched, one failed, none skipped.
+        assert (enriched, failed, result["tables_skipped_unchanged"]) == (1, 1, 0)
+        # partial ids are a subset of the enriched tables, never a fourth bucket.
+        assert set(result["partial_table_ids"]) <= ({t.table_id for t in tables} - set(result["failed_table_ids"]))
+        assert result["tables_partial"] <= enriched
+
+    @patch("coa_sources.database.enrichment.table_enricher._write_enriched_assets")
+    @patch("coa_sources.database.enrichment.table_enricher.read_assets_for_datasource")
+    @patch("coa_sources.database.enrichment.table_enricher.BedrockClient")
     def test_run_emits_throttle_metric_on_terminal_throttle(
         self, mock_client_cls: MagicMock, mock_read: MagicMock, mock_write: MagicMock
     ) -> None:
@@ -194,6 +234,100 @@ class TestRun:
             "failed_table_ids": [],
         }
         mock_write.assert_not_called()
+
+
+class TestRunProgress:
+    """Progress is published as (tables_processed, tables_total) while the run advances."""
+
+    @staticmethod
+    def _reviewed(name: str) -> Table:
+        """A table with nothing left to review, so enrichment skips it."""
+        table = _make_table(name)
+        table.business_metadata.review_status = ReviewStatus.APPROVED
+        for col in table.columns:
+            col.business_metadata.review_status = ReviewStatus.APPROVED
+        return table
+
+    @patch("coa_sources.database.enrichment.table_enricher._write_enriched_assets")
+    @patch("coa_sources.database.enrichment.table_enricher.read_assets_for_datasource")
+    @patch("coa_sources.database.enrichment.table_enricher.BedrockClient")
+    def test_final_publish_reaches_total(
+        self, mock_client_cls: MagicMock, mock_read: MagicMock, mock_write: MagicMock
+    ) -> None:
+        mock_client_cls.return_value.invoke.return_value = _mock_invocation_result()
+        mock_read.return_value = [_make_table("t1"), _make_table("t2")]
+        calls: list[tuple[int, int]] = []
+
+        run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock(), progress=lambda p, t: calls.append((p, t)))
+
+        # The throttle suppresses the per-table publishes in a sub-second run, so
+        # what is left is the forced pair either side of the work.
+        assert calls == [(0, 2), (2, 2)]
+
+    @patch("coa_sources.database.enrichment.table_enricher._write_enriched_assets")
+    @patch("coa_sources.database.enrichment.table_enricher.read_assets_for_datasource")
+    @patch("coa_sources.database.enrichment.table_enricher.BedrockClient")
+    def test_reviewed_tables_are_processed_before_any_bedrock_call(
+        self, mock_client_cls: MagicMock, mock_read: MagicMock, mock_write: MagicMock
+    ) -> None:
+        mock_client_cls.return_value.invoke.return_value = _mock_invocation_result()
+        mock_read.return_value = [self._reviewed("done"), _make_table("pending")]
+        calls: list[tuple[int, int]] = []
+
+        run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock(), progress=lambda p, t: calls.append((p, t)))
+
+        # 1/2 up front: a skipped table was inspected and found unchanged. Without
+        # it the bar would sit near zero through a rescan that changed almost nothing.
+        assert calls == [(1, 2), (2, 2)]
+
+    @patch("coa_sources.database.enrichment.table_enricher._write_enriched_assets")
+    @patch("coa_sources.database.enrichment.table_enricher.read_assets_for_datasource")
+    @patch("coa_sources.database.enrichment.table_enricher.BedrockClient")
+    def test_publishes_per_table_once_the_throttle_elapses(
+        self, mock_client_cls: MagicMock, mock_read: MagicMock, mock_write: MagicMock, monkeypatch
+    ) -> None:
+        monkeypatch.setattr("coa_sources.database.enrichment.table_enricher.PROGRESS_PUBLISH_INTERVAL_SEC", 0.0)
+        mock_client_cls.return_value.invoke.return_value = _mock_invocation_result()
+        mock_read.return_value = [_make_table("t1"), _make_table("t2")]
+        calls: list[tuple[int, int]] = []
+
+        run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock(), progress=lambda p, t: calls.append((p, t)))
+
+        assert calls == [(0, 2), (1, 2), (2, 2), (2, 2)]
+
+    @patch("coa_sources.database.enrichment.table_enricher._write_enriched_assets")
+    @patch("coa_sources.database.enrichment.table_enricher.read_assets_for_datasource")
+    @patch("coa_sources.database.enrichment.table_enricher.BedrockClient")
+    def test_failed_table_still_counts_as_processed(
+        self, mock_client_cls: MagicMock, mock_read: MagicMock, mock_write: MagicMock
+    ) -> None:
+        mock_client_cls.return_value.invoke.side_effect = Exception("Bedrock error")
+        mock_read.return_value = [_make_table("t1")]
+        calls: list[tuple[int, int]] = []
+
+        result = run(
+            "ds-123", "ns-456", "dom-789", "full", emitter=MagicMock(), progress=lambda p, t: calls.append((p, t))
+        )
+
+        # Its work ran and errored, so the bar completes rather than stalling at 0.
+        assert result["tables_failed"] == 1
+        assert calls[-1] == (1, 1)
+
+    @patch("coa_sources.database.enrichment.table_enricher._write_enriched_assets")
+    @patch("coa_sources.database.enrichment.table_enricher.read_assets_for_datasource")
+    @patch("coa_sources.database.enrichment.table_enricher.BedrockClient")
+    def test_publish_failure_does_not_fail_the_run(
+        self, mock_client_cls: MagicMock, mock_read: MagicMock, mock_write: MagicMock
+    ) -> None:
+        mock_client_cls.return_value.invoke.return_value = _mock_invocation_result()
+        mock_read.return_value = [_make_table("t1")]
+
+        def explode(processed: int, total: int) -> None:
+            raise RuntimeError("ddb unavailable")
+
+        result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock(), progress=explode)
+
+        assert result["tables_enriched"] == 1
 
 
 class TestDeterministicConstraintSkip:
@@ -867,12 +1001,71 @@ class TestWriteEnrichedAssets:
 
 
 class TestIncompleteBatchDetection:
-    """Verify partial batch failure marks table as failed."""
+    """A wide table whose column batches PARTIALLY fail must keep the
+    batches that SUCCEEDED (description + those columns), not discard the whole
+    table. Before the fix, one failed batch erased the entire table's enrichment
+    and counted it as tables_failed with zero enriched — silent data loss."""
 
     @patch("coa_sources.database.enrichment.table_enricher._write_enriched_assets")
     @patch("coa_sources.database.enrichment.table_enricher.read_assets_for_datasource")
     @patch("coa_sources.database.enrichment.table_enricher.BedrockClient")
-    def test_partial_batch_failure_marks_table_failed(
+    def test_partial_batch_failure_preserves_succeeded_batches(
+        self, mock_client_cls: MagicMock, mock_read: MagicMock, mock_write: MagicMock
+    ) -> None:
+        # 120 columns -> 3 batches of 50/50/20. Fail the SECOND batch (index 1),
+        # so batch 0 (which carries the table description + PK) and batch 2 survive.
+        # Batches run concurrently in a ThreadPoolExecutor, so key the failure on
+        # the batch's CONTENT (a column unique to batch 1), NOT call order — a
+        # call counter is non-deterministic across the pool and makes this flaky.
+        def mock_invoke(_system, user_prompt, *args, **kwargs):
+            # col_50 is the first column of batch 1 (cols 50-99); it appears in no
+            # other batch's prompt, so this fails exactly the middle batch.
+            if re.search(r"\bcol_50\b", user_prompt):
+                raise Exception("Batch 1 failed")
+            return _mock_invocation_result()
+
+        mock_client_cls.return_value.invoke.side_effect = mock_invoke
+        table = _make_table("big", database="public", num_columns=120)
+        mock_read.return_value = [table]
+
+        result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock())
+
+        # The table is KEPT (enriched), flagged partial, and NOT counted as failed.
+        assert result["tables_enriched"] == 1
+        assert result["tables_failed"] == 0
+        assert result["tables_partial"] == 1
+        assert result["failed_table_ids"] == []
+        assert result["partial_table_ids"] == ["public.big"]
+        # The surviving description (from batch 0) was actually applied + written.
+        mock_write.assert_called_once()
+        written_tables = mock_write.call_args[0][0]
+        assert len(written_tables) == 1
+        assert written_tables[0].business_metadata.description == "Customer orders table"
+
+    @patch("coa_sources.database.enrichment.table_enricher._write_enriched_assets")
+    @patch("coa_sources.database.enrichment.table_enricher.read_assets_for_datasource")
+    @patch("coa_sources.database.enrichment.table_enricher.BedrockClient")
+    def test_all_batches_fail_marks_table_failed(
+        self, mock_client_cls: MagicMock, mock_read: MagicMock, mock_write: MagicMock
+    ) -> None:
+        # If EVERY batch of a wide table fails there is nothing to keep — the
+        # table is fully failed, not partial.
+        mock_client_cls.return_value.invoke.side_effect = Exception("all batches fail")
+        table = _make_table("big", database="public", num_columns=120)
+        mock_read.return_value = [table]
+
+        result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock())
+
+        assert result["tables_enriched"] == 0
+        assert result["tables_failed"] == 1
+        assert result["tables_partial"] == 0
+        assert result["failed_table_ids"] == ["public.big"]
+        assert result["partial_table_ids"] == []
+
+    @patch("coa_sources.database.enrichment.table_enricher._write_enriched_assets")
+    @patch("coa_sources.database.enrichment.table_enricher.read_assets_for_datasource")
+    @patch("coa_sources.database.enrichment.table_enricher.BedrockClient")
+    def test_partial_enrichment_emits_metric_and_logs(
         self, mock_client_cls: MagicMock, mock_read: MagicMock, mock_write: MagicMock
     ) -> None:
         call_count = [0]
@@ -880,17 +1073,86 @@ class TestIncompleteBatchDetection:
         def mock_invoke(*args, **kwargs):
             call_count[0] += 1
             if call_count[0] == 2:
-                raise Exception("Batch 2 failed")
+                raise GuardrailBlockedError("blocked")
             return _mock_invocation_result()
 
         mock_client_cls.return_value.invoke.side_effect = mock_invoke
-        table = _make_table("big", num_columns=120)
+        table = _make_table("big", database="public", num_columns=120)
+        mock_read.return_value = [table]
+        mock_emitter = MagicMock()
+
+        result = run("ds-123", "ns-456", "dom-789", "full", emitter=mock_emitter)
+
+        assert result["tables_partial"] == 1
+        # The partial count is surfaced as its own metric (mirrors TablesMissingDescription).
+        metric_calls = {c[0][0]: c[0][1] for c in mock_emitter.emit_metric.call_args_list}
+        assert metric_calls.get("TablesPartiallyEnriched") == 1
+
+    @patch("coa_sources.database.enrichment.table_enricher._write_enriched_assets")
+    @patch("coa_sources.database.enrichment.table_enricher.read_assets_for_datasource")
+    @patch("coa_sources.database.enrichment.table_enricher.BedrockClient")
+    def test_fully_succeeded_table_is_not_partial(
+        self, mock_client_cls: MagicMock, mock_read: MagicMock, mock_write: MagicMock
+    ) -> None:
+        # A wide table where every batch succeeds must NOT be flagged partial.
+        mock_client_cls.return_value.invoke.return_value = _mock_invocation_result()
+        table = _make_table("big", database="public", num_columns=120)
         mock_read.return_value = [table]
 
         result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock())
 
-        assert result["tables_failed"] == 1
-        assert result["tables_enriched"] == 0
+        assert result["tables_enriched"] == 1
+        assert result["tables_partial"] == 0
+        assert result["partial_table_ids"] == []
+
+    @patch("coa_sources.database.enrichment.table_enricher._write_enriched_assets")
+    @patch("coa_sources.database.enrichment.table_enricher.read_assets_for_datasource")
+    @patch("coa_sources.database.enrichment.table_enricher.BedrockClient")
+    def test_batch_zero_failure_keeps_columns_and_does_not_blank_description(
+        self, mock_client_cls: MagicMock, mock_read: MagicMock, mock_write: MagicMock
+    ) -> None:
+        # The subtlest branch: batch 0 (which carries the table description + PK)
+        # is the one that fails, while later batches succeed. The table must still
+        # be kept (partial) with the surviving COLUMN metadata applied, and its
+        # PRE-EXISTING description must be left untouched, NOT blanked.
+        table = _make_table("big", database="public", num_columns=120)
+        table.business_metadata = BusinessMetadata(
+            description="Pre-existing steward description",
+            synonyms=[],
+            glossary_terms=[],
+            tags=[],
+            enrichment_source=EnrichmentSource.STEWARD_EDITED,
+            review_status=ReviewStatus.APPROVED,
+        )
+
+        def mock_invoke(_system, user_prompt, *args, **kwargs):
+            # Batch 0 carries col_0 and is the ONLY batch whose prompt lacks
+            # col_50 / col_100 (the leading columns of batches 1 and 2). Fail on
+            # batch 0's content, not call order — the ThreadPoolExecutor does not
+            # guarantee batch 0 is invoked first.
+            is_batch_zero = re.search(r"\bcol_0\b", user_prompt) and not re.search(
+                r"\bcol_50\b|\bcol_100\b", user_prompt
+            )
+            if is_batch_zero:  # batch 0 fails
+                raise GuardrailBlockedError("batch 0 blocked")
+            return _mock_invocation_result()
+
+        mock_client_cls.return_value.invoke.side_effect = mock_invoke
+        mock_read.return_value = [table]
+
+        result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock())
+
+        assert result["tables_enriched"] == 1
+        assert result["tables_failed"] == 0
+        assert result["tables_partial"] == 1
+        assert result["partial_table_ids"] == ["public.big"]
+        # Batch 0 (metadata) failed, so the AI description was never applied —
+        # the pre-existing steward description survives, not blanked.
+        mock_write.assert_called_once()
+        written = mock_write.call_args[0][0][0]
+        assert written.business_metadata.description == "Pre-existing steward description"
+        # Columns from the surviving later batches were still applied.
+        assert any(c.business_metadata and c.business_metadata.description for c in written.columns)
 
 
 class TestPass2FailureFallback:

@@ -5,10 +5,12 @@ import * as os from "os";
 import * as path from "path";
 import * as cdk from "aws-cdk-lib";
 import { Match, Template } from "aws-cdk-lib/assertions";
+import * as lambda from "aws-cdk-lib/aws-lambda";
 import {
   AthenaFederationConnector,
   AthenaFederationConnectorProps,
   CONNECTOR_FUNCTION_SUFFIX,
+  Provisioning,
 } from "../src/athena-federation-connector";
 import {
   CONNECTOR_SPILL_KMS_TAG_KEY,
@@ -16,8 +18,8 @@ import {
   CONNECTOR_TAG_VALUE,
 } from "../src/coa-contract";
 
-// A stand-in for the fat JAR, so the tests do not require `mvn package` to have run.
-// CDK stages a `.jar` as an archive asset without inspecting its contents.
+// A stand-in for the fat JAR, so the tests do not require `mvn package` to have run. The construct
+// copies it into the package layout without inspecting its contents.
 const FAKE_JAR = path.join(__dirname, "..", "cdk.out", "test-fixture.jar");
 
 const SERVE_ROLE =
@@ -93,12 +95,46 @@ describe("connector Lambda", () => {
     });
   });
 
-  it("runs on a supported Java runtime with room to buffer a block", () => {
-    synth().hasResourceProperties("AWS::Lambda::Function", {
-      Runtime: "java17",
-      MemorySize: 1024,
-      Timeout: 90,
+  it("nests the JAR under lib/, which is what keeps it under Lambda's size limit", () => {
+    // Lambda counts the package's extracted size and does not extract a nested jar. Flattened, the
+    // connector's classes expand past the 250 MB limit on a current federation SDK, and the failure
+    // is a deploy CloudFormation rejects rather than anything a template assertion would catch.
+    const app = new cdk.App();
+    const stack = new cdk.Stack(app, "AssetStack", {
+      env: { account: "123456789012", region: "eu-central-1" },
     });
+    new AthenaFederationConnector(stack, "Connector", {
+      connectorId: "example",
+      handler: "dev.coa.example.ExampleCompositeHandler",
+      jarPath: FAKE_JAR,
+      queryRoleArns: [SERVE_ROLE],
+    });
+    const assembly = app.synth();
+    const staged = fs
+      .readdirSync(assembly.directory)
+      .filter((entry) => entry.startsWith("asset."))
+      .map((entry) =>
+        path.join(assembly.directory, entry, "lib", path.basename(FAKE_JAR)),
+      );
+    expect(staged.filter((jar) => fs.existsSync(jar))).toHaveLength(1);
+  });
+
+  it("runs on a supported Java runtime with room to buffer a block", () => {
+    // java21, not java17: java17 is the Amazon Linux 2 variant and AL2 is past end of life.
+    // arm64 matches every Lambda `infra` deploys, and the jar carries no amd64-only native.
+    synth().hasResourceProperties("AWS::Lambda::Function", {
+      Runtime: "java21",
+      Architectures: ["arm64"],
+      MemorySize: 1024,
+      Timeout: 600,
+    });
+  });
+
+  it("takes an x86_64 override, for a fork whose jar carries an amd64-only native", () => {
+    synth({ architecture: lambda.Architecture.X86_64 }).hasResourceProperties(
+      "AWS::Lambda::Function",
+      { Architectures: ["x86_64"] },
+    );
   });
 
   it("refuses a missing JAR with the command that builds it", () => {
@@ -248,11 +284,11 @@ describe("spill bucket", () => {
     });
   });
 
-  it('creates no bucket with spill: "none", and sets no spill_bucket', () => {
+  it("creates no bucket under Provisioning.NONE, and sets no spill_bucket", () => {
     // Legitimate for a source that cannot exceed 6 MB, and it fails on the first response
     // that would have spilled — so what matters is that nothing half-configured is left
     // behind: no bucket, no grant, and no spill_bucket pointing at nothing.
-    const template = synth({ spill: "none" });
+    const template = synth({ spill: Provisioning.NONE });
     template.resourceCountIs("AWS::S3::Bucket", 0);
     template.resourceCountIs("AWS::S3::BucketPolicy", 0);
     const functions = template.findResources("AWS::Lambda::Function");
@@ -263,9 +299,9 @@ describe("spill bucket", () => {
     expect(variables?.disable_spill_encryption).toBe("false");
   });
 
-  it('still lets the serve role invoke the connector with spill: "none"', () => {
+  it("still lets the serve role invoke the connector under Provisioning.NONE", () => {
     // The invoke grant is unrelated to spill; only the bucket grants disappear.
-    synth({ spill: "none" }).hasResourceProperties("AWS::Lambda::Permission", {
+    synth({ spill: Provisioning.NONE }).hasResourceProperties("AWS::Lambda::Permission", {
       Action: "lambda:InvokeFunction",
       Principal: SERVE_ROLE,
     });
@@ -410,8 +446,8 @@ describe("the controls COA's IAM matches on", () => {
     });
   });
 
-  it('creates neither key nor bucket with spill: "none"', () => {
-    const template = synth({ spill: "none" });
+  it("creates neither key nor bucket under Provisioning.NONE", () => {
+    const template = synth({ spill: Provisioning.NONE });
     template.resourceCountIs("AWS::KMS::Key", 0);
     template.resourceCountIs("AWS::S3::Bucket", 0);
   });
@@ -437,17 +473,25 @@ describe("operational alarms", () => {
   });
 
   it("alarms on duration against the connector's own timeout, not a fixed number", () => {
-    // 80% of 200s. A per-connector timeout means a shared absolute threshold would be wrong for one
+    // 80% of 60s. A per-connector timeout means a shared absolute threshold would be wrong for one
     // of any two connectors.
-    synth({ timeout: cdk.Duration.seconds(200) }).hasResourceProperties(
+    synth({ timeout: cdk.Duration.seconds(60) }).hasResourceProperties(
       "AWS::CloudWatch::Alarm",
       {
         AlarmName: `example${CONNECTOR_FUNCTION_SUFFIX}-duration-p99`,
         MetricName: "Duration",
         ExtendedStatistic: "p99",
-        Threshold: 160000,
+        Threshold: 48000,
       },
     );
+  });
+
+  it("caps the duration threshold, so a timeout sized for a resume still alarms usefully", () => {
+    // 80% of the default 600s would be 8 minutes, by which point the query is already lost.
+    synth().hasResourceProperties("AWS::CloudWatch::Alarm", {
+      AlarmName: `example${CONNECTOR_FUNCTION_SUFFIX}-duration-p99`,
+      Threshold: 60000,
+    });
   });
 
   it("treats missing data as not breaching, so an idle connector does not alarm", () => {
@@ -460,7 +504,7 @@ describe("operational alarms", () => {
   });
 
   it("creates no alarms when asked not to", () => {
-    synth({ alarms: "none" }).resourceCountIs("AWS::CloudWatch::Alarm", 0);
+    synth({ alarms: Provisioning.NONE }).resourceCountIs("AWS::CloudWatch::Alarm", 0);
   });
 
   it("notifies nobody unless a topic is given", () => {

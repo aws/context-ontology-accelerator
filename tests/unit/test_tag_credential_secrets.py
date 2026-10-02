@@ -217,17 +217,42 @@ def _ddb_item(sub_type, namespace_id, config, name="s"):
     return raw
 
 
-def test_scan_collects_only_jdbc_sources_with_a_secret(monkeypatch):
+def test_scan_collects_only_credential_holding_sources_with_a_secret(monkeypatch):
     a = _arn("keep")
     items = [
         _ddb_item("JDBC_DATABASE", NS_A, {"credentialSecretArn": a}),
         _ddb_item("GLUE_DATABASE", NS_A, {"databaseName": "d"}),  # wrong sub-type
+        _ddb_item("CUSTOM_CONNECTOR", NS_A, {"databaseName": "d"}),  # holds no credential
         _ddb_item("JDBC_DATABASE", NS_A, {"host": "h"}),  # no secret
         _ddb_item("JDBC_DATABASE", NS_A, None),  # no configuration
         _ddb_item("JDBC_DATABASE", NS_A, "{not json"),  # unparsable blob
     ]
     monkeypatch.setattr(tcs.boto3, "client", lambda *a_, **k: _paginator(items))
-    assert list(tcs._iter_jdbc_sources("t", "us-east-1")) == [(NS_A, "s", a)]
+    assert list(tcs._iter_credential_sources("t", "us-east-1")) == [(NS_A, "s", a)]
+
+
+def test_scan_collects_a_databricks_source_too(monkeypatch):
+    """A Databricks source's secret is under the same binding rule as a JDBC one.
+
+    Its secrets are bound at registration, so this is repair rather than migration
+    — but a tag edited out of band leaves the source unscannable in exactly the same
+    way, and a sub-type filter that skipped it would mean the only tool for that
+    could not see the source at all.
+    """
+    a = _arn("dbx")
+    items = [
+        _ddb_item(
+            "DATABRICKS_SQL_WAREHOUSE",
+            NS_A,
+            {
+                "workspaceHostname": "dbc-a1b2345c-d6e7.cloud.databricks.com",
+                "httpPath": "/sql/1.0/warehouses/a1b234c567d8e9fa",
+                "credentialSecretArn": a,
+            },
+        ),
+    ]
+    monkeypatch.setattr(tcs.boto3, "client", lambda *a_, **k: _paginator(items))
+    assert list(tcs._iter_credential_sources("t", "us-east-1")) == [(NS_A, "s", a)]
 
 
 def test_scan_groups_one_secret_used_by_two_namespaces(monkeypatch):
@@ -253,4 +278,4 @@ def test_scan_tolerates_a_map_shaped_configuration(monkeypatch):
     raw = _ddb_item("JDBC_DATABASE", NS_A, {"credentialSecretArn": a})
     raw["configuration"] = {"M": {"credentialSecretArn": {"S": a}}}
     monkeypatch.setattr(tcs.boto3, "client", lambda *a_, **k: _paginator([raw]))
-    assert list(tcs._iter_jdbc_sources("t", "us-east-1")) == [(NS_A, "s", a)]
+    assert list(tcs._iter_credential_sources("t", "us-east-1")) == [(NS_A, "s", a)]

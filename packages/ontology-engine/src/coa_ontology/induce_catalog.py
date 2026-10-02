@@ -26,6 +26,7 @@ from coa_common.bedrock_metrics import (
     emit_induction_heartbeat_metrics,
     emit_induction_job_metrics,
 )
+from coa_common.constants import DATABASE_SUB_TYPES
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
@@ -1601,9 +1602,12 @@ def count_active_jobs(namespace: str) -> dict[str, int]:
 def list_datasources(request: Request, namespace: str):
     """List available DATABASE sources from the unified sources table for the namespace.
 
-    Only DATABASE sources (GLUE_DATABASE, JDBC_DATABASE, CUSTOM_CONNECTOR) are
-    relevant for ontology induction — document sources don't have structured
-    table metadata.
+    Only DATABASE sub-types carry structured table metadata, so only they can be induced
+    from — the filter is ``coa_common.constants.DATABASE_SUB_TYPES``, derived from the
+    mirror of the Smithy enum rather than re-listed here. A sub-type missing from it fails
+    CLOSED: its source simply never appears in the workbench's datasource list, with no
+    error raised anywhere.
+
     Uses the new sources table key schema: PK=NS#{namespaceId}, SK=SRC#{sourceId}.
     """
     import boto3
@@ -1637,11 +1641,7 @@ def list_datasources(request: Request, namespace: str):
         source_sub_type = it.get("sourceSubType", "")
 
         # Only include DATABASE sources — documents don't have structured table metadata
-        if source_type != "DATABASE" or source_sub_type not in (
-            "GLUE_DATABASE",
-            "JDBC_DATABASE",
-            "CUSTOM_CONNECTOR",
-        ):
+        if source_type != "DATABASE" or source_sub_type not in DATABASE_SUB_TYPES:
             continue
 
         result.append(

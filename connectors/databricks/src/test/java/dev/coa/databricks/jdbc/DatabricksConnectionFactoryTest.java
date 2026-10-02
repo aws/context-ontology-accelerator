@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 package dev.coa.databricks.jdbc;
 
+import com.amazonaws.athena.connector.lambda.exceptions.AthenaConnectorException;
 import dev.coa.databricks.config.ConnectionConfig;
 import dev.coa.databricks.config.CredentialSource;
 import org.junit.jupiter.api.Test;
@@ -11,17 +12,27 @@ import java.util.Properties;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * The JDBC URL and the connection properties: the injection boundary, and four driver defaults that are
- * wrong for a Lambda. No connection is opened; the factory's constructor touches nothing, and
- * {@code properties()} is package-private so this can be asserted without a warehouse.
+ * wrong for a Lambda. The factory's constructor touches nothing and {@code properties()} is
+ * package-private, so this can be asserted without a warehouse. The two {@code open()} cases fail while
+ * resolving the credential, which is before the driver is loaded.
  */
 class DatabricksConnectionFactoryTest
 {
     private static final String HOST = "dbc-a1b2345c-d6e7.cloud.databricks.com";
     private static final String HTTP_PATH = "/sql/1.0/warehouses/a1b234c567d8e9fa";
+
+    /**
+     * The invocation timeout the CDK app deploys, restated because the jar cannot read it. If
+     * {@code TIMEOUT_SECONDS} in the app moves down, this test is what catches the driver timeouts left
+     * above it, where they can never fire.
+     */
+    private static final int INVOCATION_TIMEOUT_SECONDS = 600;
 
     private static ConnectionConfig config()
     {
@@ -37,7 +48,7 @@ class DatabricksConnectionFactoryTest
 
     private static DatabricksConnectionFactory factory(String secretJson)
     {
-        return new DatabricksConnectionFactory(config(), new CredentialSource(arn -> secretJson));
+        return new DatabricksConnectionFactory(config(), new CredentialSource(config -> secretJson));
     }
 
     @Test
@@ -83,7 +94,7 @@ class DatabricksConnectionFactoryTest
                 .build();
 
         Properties properties = new DatabricksConnectionFactory(
-                unpinned, new CredentialSource(arn -> "{\"token\":\"t\"}")).properties();
+                unpinned, new CredentialSource(config -> "{\"token\":\"t\"}")).properties();
 
         assertEquals("main", properties.getProperty("ConnCatalog"),
                 "the catalog is still pinned — it cannot travel in a request");
@@ -114,9 +125,10 @@ class DatabricksConnectionFactoryTest
     void timeoutsSitBelowTheInvocationTimeout()
     {
         Properties properties = factory("{\"token\":\"t\"}").properties();
-        assertTrue(Integer.parseInt(properties.getProperty("socketTimeout")) < 120,
-                "socketTimeout must be below the 120 s invocation timeout, or it can never fire");
-        assertTrue(Integer.parseInt(properties.getProperty("RateLimitRetryTimeout")) < 120,
+        assertTrue(Integer.parseInt(properties.getProperty("socketTimeout")) < INVOCATION_TIMEOUT_SECONDS,
+                "socketTimeout must be below the invocation timeout, or it can never fire");
+        assertTrue(Integer.parseInt(properties.getProperty("RateLimitRetryTimeout"))
+                        < INVOCATION_TIMEOUT_SECONDS,
                 "RateLimitRetryTimeout must be below the invocation timeout");
     }
 
@@ -157,5 +169,42 @@ class DatabricksConnectionFactoryTest
         // Nothing should hold a Properties object carrying a credential for longer than a connect.
         DatabricksConnectionFactory factory = factory("{\"token\":\"t\"}");
         assertFalse(factory.properties() == factory.properties());
+    }
+
+    @Test
+    void aCredentialFailureTheReaderAlreadyClassifiedTravelsOutUnchanged()
+    {
+        // In coa-managed mode AssumedRoleCredentialSource has already said which of the assume and the read
+        // failed and whose policy to look at. Re-wrapping it here would relabel an assume denial as
+        // CONNECTOR_CREDENTIAL_UNREADABLE and send the operator to the connector's own role, which in that
+        // mode holds no Secrets Manager grant to widen.
+        AthenaConnectorException classified = DatabricksErrors.credentialAssumeDenied(
+                "arn:aws:iam::222233334444:role/coa-dev-datasource-access-sales", "coa-dev-ns-1",
+                new IllegalStateException("AccessDenied"));
+        DatabricksConnectionFactory factory = new DatabricksConnectionFactory(
+                config(), new CredentialSource(config -> {
+                    throw classified;
+                }));
+
+        assertSame(classified, assertThrows(AthenaConnectorException.class, factory::open));
+    }
+
+    @Test
+    void anUnclassifiedSecretsManagerFailureStillNamesTheSecretAndTheIamToCheck()
+    {
+        // The environment-mode arm: the raw SDK exception reaches here, and a missing
+        // secretsmanager:GetSecretValue or kms:Decrypt is what a first deployment hits.
+        DatabricksConnectionFactory factory = new DatabricksConnectionFactory(
+                config(), new CredentialSource(config -> {
+                    throw new IllegalStateException("AccessDeniedException from Secrets Manager");
+                }));
+
+        AthenaConnectorException failure =
+                assertThrows(AthenaConnectorException.class, factory::open);
+
+        assertTrue(failure.getMessage().startsWith(DatabricksErrors.CREDENTIAL_UNREADABLE_PREFIX),
+                failure.getMessage());
+        assertTrue(failure.getMessage().contains("dbx-AbCdEf"), failure.getMessage());
+        assertTrue(failure.getMessage().contains("kms:Decrypt"), failure.getMessage());
     }
 }

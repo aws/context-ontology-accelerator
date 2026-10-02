@@ -271,6 +271,12 @@ describe("SourceList", () => {
               sourceType: "DATABASE",
               sourceSubType: "CUSTOM_CONNECTOR",
             }),
+            makeSource({
+              sourceId: "s6",
+              name: "f",
+              sourceType: "DATABASE",
+              sourceSubType: "DATABRICKS_SQL_WAREHOUSE",
+            }),
           ]),
         ],
       },
@@ -283,6 +289,7 @@ describe("SourceList", () => {
     expect(screen.getByText("Documents · Upload")).toBeInTheDocument();
     // Must be a human label, not the raw enum ("Database · CUSTOM_CONNECTOR").
     expect(screen.getByText("Database · Custom connector")).toBeInTheDocument();
+    expect(screen.getByText("Database · Databricks")).toBeInTheDocument();
   });
 
   it("shows item count in header", () => {

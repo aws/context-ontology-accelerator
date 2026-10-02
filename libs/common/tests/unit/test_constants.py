@@ -27,6 +27,7 @@ from coa_common.constants import (
     validate_namespace_id,
     validate_namespace_name,
     validate_s3_prefix,
+    validate_source_id,
 )
 
 pytestmark = pytest.mark.unit
@@ -104,6 +105,33 @@ class TestToGraphragTenantId:
         assert len(result) == 25
         assert re.fullmatch(r"[0-9a-f]{25}", result)
 
+    def test_empty_returns_empty(self):
+        """Empty input is preserved — some callers use it to signal 'no scoping'."""
+        assert to_graphrag_tenant_id("") == ""
+        assert to_graphrag_tenant_id("", "any-doc-source") == ""
+
+    @pytest.mark.parametrize(
+        "hostile_ns",
+        [
+            "550e8400`e29b-41d4-a716-446655440000",  # backtick — the openCypher label breakout
+            "550e8400-e29b-41d4-a716-446655440000; DROP",  # semicolon + injected clause
+            "550e8400-e29b-41d4-a716-446655440000 UNION",  # whitespace + injected clause
+            "550e8400-e29b-41d4-a716-446655440000'--",  # quote + comment
+            "not-a-uuid-at-all",  # dashes strip to "notauuidatall" — non-hex
+            "550e8400-e29b-41d4-XXXX-446655440000",  # non-hex chars in the middle
+            "550e8400\\`e29b-41d4-a716-446655440000",  # escaped backtick
+        ],
+    )
+    def test_rejects_non_hex_after_hyphen_strip(self, hostile_ns: str):
+        """Anything that could break out of the openCypher backtick-quoted label
+        at the ``NeptuneDatabaseLexicalStore._label`` sink is rejected upstream.
+
+        Regression for the openCypher-injection class of bug where the
+        hyphen-strip transformation preserved cypher metacharacters.
+        """
+        with pytest.raises(ValueError, match="hex UUID"):
+            to_graphrag_tenant_id(hostile_ns)
+
 
 class TestValidateId:
     @pytest.mark.parametrize("value", ["abc", "abc-123", "a_b", "ABC_123-x"])
@@ -124,6 +152,19 @@ class TestValidateNamespaceId:
     def test_invalid_raises(self, value: str):
         with pytest.raises(ValueError, match="Must be a UUID v4"):
             validate_namespace_id(value)
+
+
+class TestValidateSourceId:
+    @pytest.mark.parametrize(
+        "value", ["6ba7b810-9dad-41d1-80b4-00c04fd430c8", "11111111-2222-4333-8444-555555555555", "src-001"]
+    )
+    def test_valid_ids_pass(self, value: str):
+        validate_source_id(value)
+
+    @pytest.mark.parametrize("value", ["", "has space", "a:b", "a%2f", "../etc", "a.b", "a/b"])
+    def test_invalid_raises(self, value: str):
+        with pytest.raises(ValueError, match="alphanumeric characters"):
+            validate_source_id(value)
 
 
 class TestValidateNamespaceName:
@@ -365,6 +406,21 @@ class TestDatasourceExternalId:
         dev = datasource_external_id(ns)
         monkeypatch.setenv("RESOURCE_PREFIX", "coa-prod-")
         assert datasource_external_id(ns) != dev
+
+    @pytest.mark.parametrize("value", [None, "", "   "])
+    def test_an_unset_prefix_raises_rather_than_inventing_a_dev_default(self, monkeypatch, value):
+        """There is no safe default. This value is published to the customer and pasted into
+        their trust policy, so a component missing ``RESOURCE_PREFIX`` would have them commit
+        a different deployment's ExternalId — and the mismatch only shows up at the first
+        query, long after the policy was written. The Java connector refuses to construct
+        without the prefix; this is the same refusal.
+        """
+        if value is None:
+            monkeypatch.delenv("RESOURCE_PREFIX", raising=False)
+        else:
+            monkeypatch.setenv("RESOURCE_PREFIX", value)
+        with pytest.raises(RuntimeError, match="RESOURCE_PREFIX"):
+            datasource_external_id("550e8400-e29b-41d4-a716-446655440000")
 
     def test_reads_prefix_per_call_not_at_import(self, monkeypatch):
         """The value is read live so a redeploy under a new prefix takes effect."""

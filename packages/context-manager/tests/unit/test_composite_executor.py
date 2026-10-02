@@ -42,6 +42,7 @@ def _jdbc_registry(engine: str = "POSTGRESQL"):
         "queryEngine": "JDBC",
         "queryable": True,
         "credentialSecretArn": "arn:secret",
+        "discoveredSchemas": ["mydb", "public", "sales", "crm", "orders", "customers"],
     }
     if engine:
         record["configuration"] = json.dumps({"engine": engine})
@@ -60,6 +61,37 @@ def _jdbc_registry(engine: str = "POSTGRESQL"):
         native_databases=frozenset({"mydb", "public", "sales", "crm", "orders", "customers"}),
         federated_catalog_schemas=frozenset({("mydb", "public"), ("mydb", "sales"), ("mydb", "crm")}),
     )
+    return reg
+
+
+def _databricks_registry(queryable=True):
+    """Registry mock returning a REAL-shaped Databricks SQL Warehouse source record.
+
+    Note what is NOT in the ``configuration`` blob: an ``engine`` member. A Databricks
+    source is reached through a federation connector Lambda, so it resolves
+    ``queryEngine=ATHENA`` and there is no direct-JDBC dialect for it.
+    """
+    import json
+
+    reg = AsyncMock()
+    reg.get_source.return_value = {
+        "sourceType": "DATABASE",
+        "sourceSubType": "DATABRICKS_SQL_WAREHOUSE",
+        "queryEngine": "ATHENA",
+        "queryable": queryable,
+        "athenaDataCatalogName": "coadevds_dbx1",
+        "athenaDatabase": "coa_dbx_test",
+        "discoveredSchemas": ["coa_dbx_test"],
+        "configuration": json.dumps(
+            {
+                "workspaceHostname": "dbc-1234.cloud.databricks.com",
+                "httpPath": "/sql/1.0/warehouses/abc123",
+                "databricksCatalog": "workspace",
+                "databaseName": "coa_dbx_test",
+            }
+        ),
+    }
+    reg.parse_configuration = SourcesRegistry.parse_configuration
     return reg
 
 
@@ -265,6 +297,70 @@ class TestCompositeDispatch:
         athena.execute.assert_awaited_once()
         jdbc.execute.assert_not_awaited()
 
+    async def test_databricks_source_routes_athena_not_jdbc(self):
+        """A Databricks source takes the federation route, by design rather than by
+        accident: it resolves queryEngine=ATHENA, which is what _fetch_jdbc_source
+        gates on, so route selection needed no change for this sub-type at all."""
+        athena = _make_executor("athena")
+        jdbc = _make_executor("jdbc")
+        comp = CompositeQueryExecutor(
+            athena_executor=athena, source_db_executor=jdbc, sources_registry=_databricks_registry()
+        )
+        await comp.execute("SELECT id FROM coadevds_dbx1.coa_dbx_test.orders", namespace="ns", data_source_id="dbx")
+        athena.execute.assert_awaited_once()
+        jdbc.execute.assert_not_awaited()
+
+    async def test_databricks_source_never_routes_redshift(self):
+        """Redshift routing is an explicit queryEngine=REDSHIFT opt-in; a Databricks
+        source must not be diverted onto it just because a Redshift executor is wired."""
+        athena = _make_executor("athena")
+        redshift = _make_executor("redshift")
+        comp = CompositeQueryExecutor(
+            athena_executor=athena,
+            source_db_executor=None,
+            redshift_executor=redshift,
+            sources_registry=_databricks_registry(),
+        )
+        await comp.execute("SELECT id FROM coadevds_dbx1.coa_dbx_test.orders", namespace="ns", data_source_id="dbx")
+        athena.execute.assert_awaited_once()
+        redshift.execute.assert_not_awaited()
+
+    async def test_databricks_bare_table_sole_source_still_routes_athena(self):
+        """The sole-source fallback resolves a source id for bare-table SQL, but it
+        requires queryEngine=JDBC — so a namespace whose only source is Databricks
+        stays on Athena rather than being handed to the direct-JDBC executor."""
+        athena = _make_executor("athena")
+        jdbc = _make_executor("jdbc")
+        reg = _databricks_registry()
+        reg.find_sole_database_source = AsyncMock(return_value=reg.get_source.return_value)
+        comp = CompositeQueryExecutor(athena_executor=athena, source_db_executor=jdbc, sources_registry=reg)
+        await comp.execute("SELECT id FROM orders", namespace="ns", data_source_id="")
+        athena.execute.assert_awaited_once()
+        jdbc.execute.assert_not_awaited()
+
+    async def test_engine_gate_order_is_what_keeps_a_databricks_source_off_direct_jdbc(self):
+        """Pins the ORDER of the two direct-route guards, which is load bearing.
+
+        ``_engine_has_direct_route`` reads ``configuration.engine`` and defaults an
+        ABSENT one to POSTGRESQL — the behaviour a legacy direct-JDBC record whose
+        config predates the ``engine`` key depends on. A Databricks configuration has
+        no ``engine`` member either, so asked in isolation this returns True for one.
+        It is never asked: ``_fetch_jdbc_source`` returns None for anything that is not
+        ``queryEngine=JDBC``, and the route requires BOTH. Tightening the default to
+        False would reroute those legacy sources to Athena, so the guard order — not
+        the default — is the control, and this test is what keeps it from being
+        reordered.
+        """
+        comp = CompositeQueryExecutor(
+            athena_executor=_make_executor("athena"),
+            source_db_executor=_make_executor("jdbc"),
+            sources_registry=_databricks_registry(),
+        )
+        databricks_record = await comp._sources.get_source("ns", "dbx")
+
+        assert comp._engine_has_direct_route(databricks_record) is True
+        assert await comp._fetch_jdbc_source("ns", "dbx") is None
+
 
 @pytest.mark.unit
 class TestJdbcRouteNamespaceScopeAuthorization:
@@ -280,6 +376,7 @@ class TestJdbcRouteNamespaceScopeAuthorization:
         from coa_serve.clients.sources_registry import SourcesRegistry, SQLNamespaceScope
 
         reg = _jdbc_registry()  # base record for routing + dialect
+        reg.get_source.return_value["discoveredSchemas"] = list(databases)
         reg.sql_namespace_scope.return_value = SQLNamespaceScope(
             native_databases=frozenset(databases),
             federated_catalog_schemas=frozenset(),
@@ -935,6 +1032,26 @@ class TestResolveTargetDialect:
         )
         athena.execute.assert_awaited_once()
         redshift.execute.assert_not_awaited()
+
+    async def test_databricks_source_returns_athena(self):
+        """NL→SQL must generate Trino/Athena SQL for a Databricks source: the statement
+        is executed by Athena and translated to Databricks SQL by the connector's query
+        builder, not by us. Generating in a Databricks dialect would be rejected by
+        Athena before the connector ever saw it."""
+        comp = CompositeQueryExecutor(
+            athena_executor=_make_executor("athena"),
+            sources_registry=_databricks_registry(),
+        )
+        dialect = await comp.resolve_target_dialect("ns", data_source_id="dbx")
+        assert dialect == "athena"
+
+    async def test_databricks_sole_source_returns_athena(self):
+        """Same on the sole-source path, which resolves without an explicit id."""
+        reg = _databricks_registry()
+        reg.find_sole_database_source = AsyncMock(return_value=reg.get_source.return_value)
+        comp = CompositeQueryExecutor(athena_executor=_make_executor("athena"), sources_registry=reg)
+        dialect = await comp.resolve_target_dialect("ns", data_source_id="")
+        assert dialect == "athena"
 
 
 @pytest.mark.unit

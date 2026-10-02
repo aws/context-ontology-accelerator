@@ -4,6 +4,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as cdk from "aws-cdk-lib";
 import { Match, Template } from "aws-cdk-lib/assertions";
+import { Provisioning } from "coa-connector-cdk";
 import {
   CONNECTOR_DATABASE,
   CONNECTOR_TABLES,
@@ -177,8 +178,8 @@ describe("outputs the integration tests read", () => {
     expect(CONNECTOR_TABLES).toHaveLength(5);
   });
 
-  it('reports spill resources as absent rather than omitting them with spill: "none"', () => {
-    const template = synth({ spill: "none" });
+  it("reports spill resources as absent rather than omitting them under Provisioning.NONE", () => {
+    const template = synth({ spill: Provisioning.NONE });
     template.hasOutput("SpillBucket", { Value: "<none>" });
     template.hasOutput("SpillKeyArn", { Value: "<none>" });
   });

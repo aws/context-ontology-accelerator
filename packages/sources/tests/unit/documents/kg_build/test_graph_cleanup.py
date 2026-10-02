@@ -87,10 +87,20 @@ def _evict_graph_cleanup():
 
 @pytest.fixture()
 def mod():
+    """Fresh graph_cleanup whose AOSS index probe reports every index as present.
+
+    ``main()`` probes AOSS for each embedding index before deleting. Unpatched,
+    that probe calls the fake endpoint in ``_BASE_ENV`` and retries every
+    connection failure as transient, so each test stalled for minutes. Tests of
+    the probe itself patch ``AossVectorClient`` again inside the test.
+    """
     _evict_graph_cleanup()
     from coa_sources.documents.kg_build import graph_cleanup
 
-    return graph_cleanup
+    avc = MagicMock()
+    avc.return_value.raw_client.return_value.indices.exists.return_value = True
+    with patch.object(graph_cleanup, "AossVectorClient", avc):
+        yield graph_cleanup
 
 
 def _make_store_mocks(mock_gsf, mock_vsf):

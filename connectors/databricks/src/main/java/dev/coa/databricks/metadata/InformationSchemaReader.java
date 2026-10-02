@@ -42,7 +42,11 @@ public final class InformationSchemaReader
     private final Supplier<Connection> connections;
     private final int queryTimeoutSeconds;
 
-    /** Seconds a metadata statement may run. Below the connector's 120 s invocation timeout. */
+    /**
+     * Seconds a metadata statement may run. Far below the connector's 600 s invocation timeout on
+     * purpose: these statements answer in milliseconds, and discovery is a per-table fan-out where a
+     * stuck {@code DESCRIBE} should fail fast rather than hold an invocation for minutes.
+     */
     public static final int DEFAULT_QUERY_TIMEOUT_SECONDS = 60;
 
     /**
@@ -279,7 +283,8 @@ public final class InformationSchemaReader
                 columns.add(new ColumnDefinition(
                         rows.getString("column_name"),
                         rows.getString("full_data_type"),
-                        rows.getString("comment")));
+                        rows.getString("comment"),
+                        ColumnDefinition.Nullability.of(rows.getString("is_nullable"))));
             }
         }
         return columns;

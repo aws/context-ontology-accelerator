@@ -8,7 +8,9 @@ the Athena data catalog itself, in its own account.
 What it gives COA that a generic connector does not: **declared primary and foreign keys**. It reads
 Unity Catalog's own `information_schema` and emits each declared key as a `@pk` / `@fk` comment tag,
 so relationships in the ontology come from what your data engineers declared rather than from
-guessing at column-name overlap.
+guessing at column-name overlap. It carries **nullability** the same way, as a `@notnull` tag on each
+column Unity Catalog declares `NOT NULL` — the review UI renders a Nullable column, and the sub-types
+that cannot discover the fact show "Yes" against every column whether or not it is true.
 
 > Read [`connectors/README.md`](../README.md) first if you have not. It explains what a connector is,
 > the eleven non-obvious constraints of the federation SDK, and the spill mechanism — none of which is
@@ -21,7 +23,8 @@ guessing at column-name overlap.
 ## Contents
 
 **Runbook:** [Quick start](#quick-start) · [What one deployment covers](#what-one-deployment-covers) ·
-[Configuration](#configuration) · [Creating the credential secret](#creating-the-credential-secret) ·
+[Configuration](#configuration) · [COA-operated mode](#coa-operated-mode-coa-managed) ·
+[Creating the credential secret](#creating-the-credential-secret) ·
 [Unity Catalog grants](#unity-catalog-grants) · [Deploy](#deploy) ·
 [Register it in COA](#register-it-in-coa)
 
@@ -137,7 +140,8 @@ coordinates are Lambda environment variables. Changing the warehouse, the schema
 
 ## Configuration
 
-**Four** required environment variables on the function, and four optional ones.
+**Four** required environment variables on the function, and two optional ones. Three more are read by
+the CDK app at deploy time only; they have their own table below.
 
 Validation is deliberately not uniform, and the difference is worth knowing before you debug a value
 that appears to be ignored:
@@ -145,11 +149,11 @@ that appears to be ignored:
 - The four coordinates below, **and** the optional `DATABRICKS_SCHEMA`, are validated on read.
   A bad one fails Lambda initialisation with a message naming the variable, so a misconfiguration
   surfaces on the first invocation of a cold container rather than as a per-query error.
-- `DATABRICKS_MAX_ROWS_PER_TABLE` and `DATABRICKS_ADVERTISE_PUSHDOWN` **fall back silently instead.**
-  `Settings` treats an unusable value as absent on purpose: a typo in an operational knob should not
-  present as "the connector is broken". The CDK app therefore rejects both at synth, so a value set
-  through `pnpm run deploy` *is* checked — but a value set straight onto the function is not, and a
-  non-integer row ceiling leaves the operator believing they raised it.
+- `DATABRICKS_MAX_ROWS_PER_TABLE` **falls back silently instead.** `Settings` treats an unusable value
+  as absent on purpose: a typo in an operational knob should not present as "the connector is broken".
+  The CDK app therefore rejects it at synth, so a value set through `pnpm run deploy` *is* checked. A
+  value set straight onto the function is not, and a non-integer row ceiling leaves the operator
+  believing they raised it.
 
 | Variable | Required | Example | Notes |
 | --- | --- | --- | --- |
@@ -159,27 +163,207 @@ that appears to be ignored:
 | `CREDENTIAL_SECRET_ARN` | yes | `arn:aws:secretsmanager:...:secret:dbx-AbCdEf` | A pointer. **Never the credential itself** |
 | `DATABRICKS_SCHEMA` | no | `sales` | Pins the connector to one UC schema; unset, it serves every schema in the catalog. Lower-cased on read; also the Athena schema name. See [Pinning to one schema](#pinning-to-one-schema) |
 | `DATABRICKS_MAX_ROWS_PER_TABLE` | no | `2000000` | Row ceiling. Falls back silently. See [Limits](#limits) |
-| `DATABRICKS_ADVERTISE_PUSHDOWN` | no | *(unset)* | Falls back silently. See [Push-down](DESIGN.md#push-down-what-is-and-is-not-advertised). Unset is correct unless you have measured |
+
+Push-down is not configurable. The connector always advertises filter, limit and top-N, which are
+exactly the three its query builder implements, and the cold-start log line reports the set it
+advertised. Advertising is not what causes push-down; [Push-down](DESIGN.md#push-down-what-is-and-is-not-advertised)
+has the measurement.
 
 ### Deploy-time variables, not function ones
 
 These are read by the CDK app at synth and are **never passed into the function's environment**.
-Setting either directly on the Lambda has no effect at all.
+Setting any of them directly on the Lambda has no effect at all.
 
 | Variable | Required | Example | What it does |
 | --- | --- | --- | --- |
 | `CREDENTIAL_KMS_KEY_ARN` | no | `arn:aws:kms:...:key/...` | Only when the credential secret uses a customer-managed key. Grants the function's execution role `kms:Decrypt` on that key (`databricks-connector-stack.ts`). The **other half** of that grant is a statement in the key's own policy, which is the key owner's to write and which this stack cannot write |
-| `FUNCTION_NAME_PREFIX` | no | `sales-` | Prefixes the stack and the function name, so a second copy of this connector can share an account with the first. **Concatenated verbatim** — include your own separator, or `sales` yields `salesdatabricks-coa-connector`. Letters, digits and hyphens only; no underscores, since the same string names a CloudFormation stack |
+| `FUNCTION_NAME_PREFIX` | no | `sales-` | Prefixes the stack and the function name, so a second copy of this connector can share an account with the first. **Concatenated verbatim** — include your own separator, or `sales` yields `salesdatabricks-coa-connector`. Letters, digits and hyphens only; no underscores, since the same string names a CloudFormation stack. Must not end in `-managed-`, which synth refuses; `coa-managed` mode ignores this variable altogether |
 | `ALARM_TOPIC_ARN` | no | `arn:aws:sns:...:coa-connector-alarms` | Where the seven alarms below notify. **Without it the alarms are still created and notify nobody** — they change state in the console and that is all. See [Monitoring](#monitoring) |
+| `CONNECTOR_VPC_ID` | no | `vpc-0a1b2c3d4e5f60718` | Runs the function in this VPC. Unset, it runs outside any VPC. Needs `CONNECTOR_SUBNET_IDS`; see [Running in your VPC](#running-in-your-vpc) |
+| `CONNECTOR_SUBNET_IDS` | with the VPC | `subnet-0a1…,subnet-0b2…` | Comma-separated **private subnets with egress**. Set without `CONNECTOR_VPC_ID`, synth refuses it |
+| `CONNECTOR_SECURITY_GROUP_IDS` | no | `sg-0a1b2c3d4e5f60733` | Comma-separated. Unset, the stack creates one group with HTTPS egress only, which is all this connector needs |
 
 `SERVE_ROLE_ARN`, `DISCOVERY_ROLE_ARN` and `AWS_REGION` are shared by every connector in this folder
 and are documented in [`connectors/README.md`](../README.md#deployment-facts-come-from-the-environment).
+
+### Running in your VPC
+
+Set `CONNECTOR_VPC_ID` and `CONNECTOR_SUBNET_IDS` and the function runs in your VPC. It then reaches
+only what those subnets route to, so they need a path to each of:
+
+- **The workspace hostname**, on 443: through a NAT gateway, or through a Databricks PrivateLink
+  endpoint in the VPC. A PrivateLink-only workspace is reachable **only** this way.
+- **Secrets Manager**, **KMS** (the spill key, and the secret's key if it is customer-managed) and
+  **S3** (spill), through NAT or VPC endpoints. Logs and metrics need no route: Lambda ships the
+  function's output itself, and the metrics travel in it.
+
+A missing route does not fail the deploy. It shows up as the first query timing out. The security
+group the stack creates allows HTTPS out to anywhere; pass your own in `CONNECTOR_SECURITY_GROUP_IDS`
+to narrow it.
 
 **Catalog and schema must be bare SQL identifiers** — a letter or underscore, then letters, digits or
 underscores — and both are **lower-cased on read**, because Unity Catalog stores catalog, schema and
 table names lower-cased. A catalog or schema whose real name needs quoting is refused rather than
 half-supported; [`DESIGN.md`](DESIGN.md#why-identifiers-must-be-bare-and-lower-case) has the reason and
 the measurements. Note that UC does **not** fold **column** names, which is a separate trap.
+
+## COA-operated mode (`coa-managed`)
+
+**Everything above describes the mode you deploy.** The same jar and the same CDK app have a second
+mode, which **COA deploys and operates itself** — one Lambda serving *every* Databricks source in a COA
+environment, resolving each source's workspace, warehouse, catalog, schema and credential per request
+from a Parameter Store parameter keyed on the Athena catalog name Athena sends on every call.
+
+You do not deploy that one. It is here so the two cannot drift apart, and so this file records the one
+thing it takes from you: **a name.**
+
+| | `environment` (this document, the default) | `coa-managed` (COA's own) |
+| --- | --- | --- |
+| Deployed by | you, into your account | COA, by `scripts/deploy-managed-databricks-connector.sh` |
+| Selected by | `pnpm run deploy`, with `DATABRICKS_CONFIG_SOURCE` unset | `pnpm run deploy`, with `DATABRICKS_CONFIG_SOURCE=coa-managed` in the environment or `.env` |
+| Endpoint | the four variables above | the SSM parameter for the invoked Athena catalog |
+| Credential | `GetSecretValue` on the function's own role | `sts:AssumeRole` on a customer-owned role, then read as that session |
+| Onboarded as | a `CUSTOM_CONNECTOR` source | a `DATABRICKS_SQL_WAREHOUSE` source |
+
+**Mode selection is `DATABRICKS_CONFIG_SOURCE`, read once by `bin/app.ts` at synth.** Unset selects
+`environment`, as in the jar, so a stage-1 deployment is unchanged; `coa-managed` selects the multiplexed
+stack; anything else is refused rather than defaulted. The chosen branch then builds one stack class from
+one set of variables — the single-endpoint stack reads the four coordinates above and sets no `COA_*`
+variable, the multiplexed one reads two scalars and no coordinate — and the app passes the same value to
+the Lambda, so synth and runtime cannot disagree about the mode. The jar refuses both modes' variables
+set together, whatever the CDK did.
+
+**The jar still reads `DATABRICKS_CONFIG_SOURCE` at run time**, where the managed stack sets it to
+`coa-managed` and the single-endpoint stack leaves it unset. It defaults to `environment` on purpose: an
+already-deployed stack that picks up a newer jar changes behaviour in no way at all.
+
+**The jar refuses a mixed environment at initialisation**, which is the half that inspects what a
+deployed function actually carries rather than what a synth was asked for. It is the guard that survives
+a variable added by hand in the console or by a deployment tool other than these two apps:
+
+- `DATABRICKS_CONFIG_SOURCE=coa-managed` alongside any of `DATABRICKS_WORKSPACE_HOSTNAME`,
+  `DATABRICKS_HTTP_PATH`, `DATABRICKS_CATALOG`, `DATABRICKS_SCHEMA` or `CREDENTIAL_SECRET_ARN`. With
+  those present the connector ignores the Athena catalog name entirely, so every namespace's catalog
+  resolves the one workspace and the one credential the function was given, and namespace A's query
+  returns namespace B's rows with nothing erroring. The per-request catalog check cannot see it, because
+  in that mode nothing is bound to a catalog to check against.
+- the reverse direction: `COA_CONFIG_SSM_PREFIX`, `COA_DEPLOYMENT_ID` or `COA_RESOURCE_PREFIX` present
+  without the mode. Two messages, written so you can tell which direction you are in. One names the
+  single-endpoint variables it found, the other says what the silent failure would have been.
+- `coa-managed` missing any of those three. None has a safe default: guessing one would either resolve
+  another environment's configuration or present an `sts:ExternalId` no trust policy names.
+
+`CREDENTIAL_KMS_KEY_ARN` is absent from that list because it is a deploy-time input to the CDK app and
+never reaches the function's environment, so the jar has nothing to check.
+
+Every one of those refusals happens at **initialisation**. A deployment describing both shapes fails once
+and loudly on the first invocation of a cold container, rather than intermittently at query time.
+
+One synth-time check remains in the single-endpoint app, and it is about a *name* rather than about the
+mode. The next section has it.
+
+### `-managed-` is a reserved name segment
+
+COA's own deployment derives its function name prefix as `{prefix}-{envName}-managed-` from the two
+scalars below, so its function is `coa-dev-managed-databricks-coa-connector` and its stack has the same
+name. `FUNCTION_NAME_PREFIX` is ignored entirely in that mode, which is why the reserved segment can
+never be edited out of a managed deployment. **Do not use a `FUNCTION_NAME_PREFIX` ending in
+`-managed-`.**
+
+Why it matters more than a naming convention normally would: `athena:CreateDataCatalog` stores the
+handler ARN and never re-resolves it, so every Athena catalog COA creates for a Databricks source embeds
+that function's ARN, permanently.
+
+**And it is not a collision.** The stack name comes from the same prefix, so a deploy of *this* mode
+under the managed prefix does not clash with COA's stack — CloudFormation **updates** it, in place,
+keeping the function ARN. Every catalog COA has already registered then keeps invoking that function,
+now in single-endpoint mode, where the catalog name is ignored and every namespace resolves the one
+workspace and the one credential your deploy supplied: one namespace's question is answered from
+another namespace's data. Nothing is repairable by renaming afterwards, because the catalogs cannot be
+repointed.
+
+So **`cdk synth` refuses it**: `environment` mode with a `FUNCTION_NAME_PREFIX` ending in `-managed-`
+fails at synth, with no override, and the message explains the above. An earlier version of this
+section said "nothing enforces this, and nothing can" — that was wrong, and wrong in the dangerous
+direction. `FUNCTION_NAME_PREFIX` has no default, so the normal case — leaving it unset, giving
+`databricks-coa-connector` — is unaffected, and a prefix that merely *contains* the segment
+(`acme-managed-eu-`) is fine: only ending in it produces COA's function name.
+
+### What the managed deployment reads, and what it publishes
+
+**The managed deploy takes two scalars and derives everything else.** Both are exported by
+`scripts/deploy-managed-databricks-connector.sh` from its prefix variable and its environment argument,
+and synth fails before the jar is staged if either is missing. The script also exports
+`CONNECTOR_VPC_ID` and `CONNECTOR_SUBNET_IDS`, read from COA's `/{prefix}/{envName}/network/` parameters,
+so the connector always runs in the VPC of the environment it serves. In this mode the VPC is required,
+and `CONNECTOR_SECURITY_GROUP_IDS` is ignored: the stack always creates its own HTTPS-only group.
+
+| Variable | Example | What it is |
+| --- | --- | --- |
+| `COA_PREFIX` | `coa` | COA's resource prefix token |
+| `COA_ENV_NAME` | `dev` | The COA environment this connector serves. **Spell a production environment exactly `prod`:** that literal is what makes the spill bucket and its CMK `RETAIN` on a `cdk destroy`, matching how `infra` decides the same thing. `production` or `prd` gets `DESTROY`, and a teardown then takes the key and up to a day of spill with it. There is no default: a deploy that sets neither this nor `COA_PREFIX` fails at synth naming both |
+
+They stay two rather than one composed token because recovering them from a single `coa-dev-2-` is
+ambiguous between `(coa, dev-2)` and `(coa-dev, 2)`, and the environment name may contain hyphens.
+`FUNCTION_NAME_PREFIX` is not read here at all.
+
+Everything the function carries follows from those two, which is what makes it impossible for two of
+these values to name different environments:
+
+| Function variable | Value | What the connector does with it |
+| --- | --- | --- |
+| `DATABRICKS_CONFIG_SOURCE` | `coa-managed` | Selects the multiplexed configuration path |
+| `COA_CONFIG_SSM_PREFIX` | `/{prefix}/{envName}/connectors/databricks/sources` | Per-source parameter prefix; the connector appends `/<athenaCatalogName>` and reads that parameter per request. The environment segment is what stops a dev registration resolving prod's connector |
+| `COA_DEPLOYMENT_ID` | `{prefix}-{envName}` | Checked against every parameter's own `deploymentId`, because environments share an account. The sources API derives it the same way when it writes one |
+| `COA_RESOURCE_PREFIX` | `{prefix}-{envName}-` | Bounds the roles the connector may assume, and derives each namespace's `sts:ExternalId` |
+
+Setting any of those four yourself is not a supported input, and it is also not how the connector is
+deployed: the managed branch writes all four from the two scalars. The jar still checks them, because a
+variable can be edited onto a deployed function by hand.
+
+The same two scalars give the function name, the stack name, the execution role name and both published
+parameter paths. In this mode only, the app publishes **two** facts that nothing else can derive:
+
+| Parameter | Value | Read by |
+| --- | --- | --- |
+| `/{prefix}/{envName}/connectors/databricks/deployment/function-arn` | the connector Lambda's ARN | COA's source registration, at every source create. It fails the create if this is absent, so a source of this sub-type cannot exist without a connector behind it |
+| `/{prefix}/{envName}/connectors/databricks/deployment/role-arn` | the connector's **execution role** ARN | a person, once per credential owner. It is the principal each source's credential-access role must **trust** — see [Credential custody](#coa-operated-mode-coa-managed) |
+
+Both are also `CfnOutput`s — `ConnectorFunctionArn` and `ConnectorRoleArn` — and
+`scripts/deploy-managed-databricks-connector.sh` prints the role ARN in its closing message, because
+whoever ran the deploy is the person who then has to send it to each credential owner.
+
+**The role ARN is published so it is read rather than assembled.** The name is pinned — it has to be,
+because every customer's trust policy names this ARN — so the value is derivable; publishing it means
+onboarding copies one string instead of reconstructing it from the prefix and the environment.
+Deriving it meant resolving the function ARN and then running `aws lambda get-function-configuration
+--query Role` on it — two calls and a guess, in the one step whose failure mode is `AccessDenied` on
+every query with nothing in it to say which of the four possible causes it was.
+
+CloudFormation writes both, so a second managed connector in one environment fails on "already exists"
+rather than silently repointing whoever reads them next — and it is the **deploy** role that holds
+`ssm:PutParameter`, never the connector's runtime role.
+
+**The two query roles come from environment-scoped parameters.** `SERVE_ROLE_ARN` and
+`DISCOVERY_ROLE_ARN` are read from `/{prefix}/{envName}/serve/runtime-role-arn` and
+`/{prefix}/{envName}/sources/db-connector-role-arn`, so a `dev` and a `prod` platform deploy under one
+prefix in one account publish their own pair and neither overwrites the other. That matters because
+those ARNs become this connector's Lambda resource policy, its spill-bucket read grant and its
+spill-key decrypt grant: a value resolved from a sibling environment would grant that environment's
+serve role a read on this one's spilled query results, and leave this one's discovery role unable to
+run a single `DESCRIBE`.
+
+The deploy script resolves both before synth and refuses to continue when either is absent, reporting
+COA as not deployed in that environment. A reader left on an unscoped path finds nothing, which is the
+behaviour to want: it fails loudly rather than silently resolving a sibling environment's value.
+
+The connector's role in this mode holds **`ssm:GetParameter` on the `sources/` subtree and
+`sts:AssumeRole` on `{RESOURCE_PREFIX}datasource-access-*`, and nothing on Secrets Manager or KMS**
+beyond its own spill key. It holds no read on the `deployment/` subtree above and no SSM write anywhere:
+the two subtrees are siblings rather than one prefix precisely so that the thing reading `sources/`
+cannot rewrite what `deployment/` publishes — including the role ARN a customer's trust policy names. Two more alarms come with it — `-config-throttles` and
+`-credential-assume-failures`, nine in total — because only this mode can breach them; see
+[Monitoring](#monitoring).
 
 ## Creating the credential secret
 
@@ -273,8 +457,8 @@ an under-privileged principal yields a *successful* scan of a *subset* of the sc
 from a schema that is genuinely that small. If a scan finds fewer tables than you expect, check the
 grants before looking anywhere else.
 
-`SELECT` on the schema covers tables added later. Granting per table means re-granting, and this
-connector has no re-scan path.
+`SELECT` on the schema covers tables added later. Granting per table means re-granting before every
+re-scan that should pick a new table up.
 
 ## Deploy
 
@@ -320,15 +504,19 @@ connector answers `SELECT` perfectly while no declared key is ever found.
 
 ### What the stack creates
 
-- The Lambda — **3008 MB, 120 s**, deliberately above the construct's 1024 MB / 90 s defaults.
+- The Lambda — **3008 MB, 600 s, `arm64`**, above the construct's 1024 MB memory default and on its
+  default architecture. The jar is pure Java apart from the Databricks driver's bundled lz4, which
+  ships `linux/aarch64`; a fork that adds an amd64-only native must pass `architecture: X86_64`.
+  Outside any VPC unless `CONNECTOR_VPC_ID` is set, and then with its own HTTPS-only security group
+  unless you name yours.
 - Its **log group**, `/aws/lambda/<function-name>` — so
   `/aws/lambda/databricks-coa-connector` by default, and
   `/aws/lambda/<FUNCTION_NAME_PREFIX>databricks-coa-connector` with a prefix set. Named explicitly
   rather than left to CDK, because every "check the connector's logs" instruction below depends on it
-  being where you would look. **Retention is 7 days**, which is short enough to matter: a scan whose
-  behaviour you want to explain a fortnight later has no log left, and the connector's logs are the
-  only record of a dropped foreign key or a neutralised malformed tag. Raise it in the construct, or
-  export the lines you care about, before investigating anything historical.
+  being where you would look. **Retention is one month**, matching every log group `infra` creates.
+  The connector's logs are the only record of a dropped foreign key or a neutralised malformed tag, so
+  for anything you need to explain beyond that window, export the lines rather than raise the
+  retention after the fact.
 - Its own spill bucket, and its own KMS key tagged `coa:connector-spill=true`.
 - The `coa:connector` tag on the function — which is what COA's invoke policy matches on, not the name.
 - Read access to the one credential secret, and `kms:Decrypt` on its key if `CREDENTIAL_KMS_KEY_ARN`
@@ -414,30 +602,21 @@ Optional, and worth doing before you hand anything to COA: register an Athena da
 in the account you want to query from, purely so you can run the `DESCRIBE` self-check yourself. **This
 is not a COA prerequisite** — COA neither reads nor needs this catalog.
 
-The stack prints a command for it:
+Register it against the function ARN from the stack's `ConnectorFunctionArn` output:
 
 ```bash
 aws athena create-data-catalog --name databricks --type LAMBDA \
   --parameters function=arn:aws:lambda:<region>:111122223333:function:databricks-coa-connector
 ```
 
-Three things about that output are worth knowing before you paste it:
-
-- **The output key is mangled.** It is declared on the construct, and CDK prefixes a
-  construct-declared output with the construct's path and a hash — so the key in the deploy log is
-  `ConnectorRegisterCatalogCommandDF9B53BE`, not `RegisterCatalogCommand`. Grep the deploy output for
-  `create-data-catalog`.
-- **The name is derived from `connectorId` alone**, so it is always `--name databricks`. It knows
-  nothing about `FUNCTION_NAME_PREFIX`, the catalog or the schema — it will not say
-  `databricks_sales`.
-- **So two copies print the identical command.** The second `create-data-catalog` collides, because
-  catalog names are account-global. Rename the second by hand.
+Catalog names are account-global, so a second deployment needs a different name from the first.
 
 Then the check itself — the one thing that fails silently:
 
 ```sql
 DESCRIBE databricks.sales.orders;
--- the comment column must show your prose plus @pk / @fk(...) where Unity Catalog declares keys
+-- the comment column must show your prose plus @pk / @fk(...) where Unity Catalog declares keys,
+-- and @notnull on each column Unity Catalog declares NOT NULL
 ```
 
 Catalog names are account-global and cannot contain hyphens, so pick one per connector and per
@@ -508,10 +687,19 @@ What bounds it:
 6. **One split per table.** A single invocation streams a whole table, so the constraint is invocation
    duration rather than contention. Splitting on a numeric or date column would parallelise this; it
    is not implemented.
-7. **No nullability.** Athena's `Column` type has no field for it and `DESCRIBE` returns name, type and
-   comment, so it cannot reach COA on this route. The comment channel is not an alternative: COA's
-   parser strips a tag only when it recognises one, so an unrecognised `@notnull` would be left in the
-   stored description as literal text — visibly worse than absence. Columns arrive nullable.
+7. **Nullability, but only in one direction.** Athena's `Column` type has no field for it and `DESCRIBE`
+   returns name, type and comment, so it cannot reach COA through the protocol — it travels the same
+   comment channel the declared keys do, as a `@notnull` tag, which COA's parser now understands. It
+   costs no extra query: `is_nullable` is a column of the `information_schema.columns` row this
+   connector already reads for types and comments.
+
+   **A column declared `NOT NULL` gets the tag; every other column gets nothing**, and there is
+   deliberately no `@nullable`. Absence has to keep meaning *unknown*, because every connector deployed
+   before the tag existed emits none and COA defaults a column to nullable — a spelling that made
+   absence mean "nullable" would reinterpret their columns as asserted rather than unstated. So a
+   nullable column and a column whose `is_nullable` this connector could not read are indistinguishable
+   downstream, on purpose. Databricks answers `YES` or `NO`; anything else is treated as unknown rather
+   than guessed at in either direction.
 8. **No table-level comments.** Nothing in Athena surfaces one for a `LAMBDA` catalog. Column comments
    do arrive.
 9. **No Lake Formation.** A Lambda-backed Athena catalog is not a Glue Data Catalog object, so there is
@@ -604,8 +792,9 @@ unzip -p target/databricks-connector-1.0.0.jar META-INF/services/org.slf4j.spi.S
 # -> org.slf4j.simple.SimpleServiceProvider, and nothing else
 ```
 
-The deployment package is **83 MB zipped / 212.6 MB unzipped**, against Lambda's 250 MB unzipped
-limit — 85%, about 37 MB of headroom. Re-measure after any dependency bump: the failure mode is a
+The jar is **139.5 MB**, expanding to 357.8 MB. Lambda's 250 MB limit is on the *extracted* deployment
+package, and the CDK construct ships this jar nested at `lib/<jar>`, which Lambda does not extract — so
+139.5 MB is what counts, 53% of the limit. Re-measure after any dependency bump: the failure mode is a
 deploy CloudFormation rejects, not a build that fails.
 
 ## Monitoring
@@ -625,10 +814,10 @@ looks perfectly healthy.
 
 | Alarm | Fires when | First action |
 | --- | --- | --- |
-| `-config-resolution-failures` | Any failure in 15 min | The connector could not read its own configuration. Compare the four required variables against the cold-start log line, which names the host, catalog and schema it actually resolved |
+| `-config-resolution-failures` | Any failure in 15 min | The connector could not read its own configuration. Compare the four required variables against the cold-start log line, which names the host, catalog and schema it actually resolved. In [COA-operated mode](#coa-operated-mode-coa-managed) that line names the mode, the parameter path and the deployment id instead — there is no single endpoint to name at cold start — and each source's own host, catalog and schema are logged once, when a request first resolves them |
 | `-warehouse-connect-failures` | More than 5 in 5 min | Tell the three cases apart: a stopped warehouse recovers on resume; `DATABRICKS_AUTHENTICATION_FAILED` in the log means the credential expired or rotated — see [Creating the credential secret](#creating-the-credential-secret); anything else is network. Five rather than one because a warehouse scaled to zero refuses the first connections of every resume |
 | `-table-ceiling-exceeded` | Any breach | A query was refused by `DATABRICKS_MAX_ROWS_PER_TABLE`. The log names the table. Narrow the predicate or set `tableExcludeFilter` on the source; raising the ceiling means raising memory and timeout with it. See [The aggregation caveat](#the-aggregation-caveat) |
-| `-rows-returned-p95` | p95 rows per read is within 20% of the ceiling, twice running | The only one here that fires before anything has failed: the next slightly wider question breaches the ceiling. A push-down regression and an aggregate-heavy workload look identical from Athena's side, so check `DATABRICKS_ADVERTISE_PUSHDOWN` before concluding the workload changed |
+| `-rows-returned-p95` | p95 rows per read is within 20% of the ceiling, twice running | The only one here that fires before anything has failed: the next slightly wider question breaches the ceiling. A push-down regression and an aggregate-heavy workload look identical from Athena's side, so read the `pushdown=` set on the cold-start log line before concluding the workload changed: it reports what the deployed jar advertised, and an empty or short set means the capability map moved rather than the questions |
 
 The other three are the function's own — throttles above zero, error rate above 1%, and p99 duration
 within 20% of the 120 s timeout. The throttle one matters more than it looks: **one connector serves
@@ -637,6 +826,14 @@ nothing on COA's side can see that.
 
 Alarm names are `<function-name>-<suffix>`, so they carry `FUNCTION_NAME_PREFIX` and two deployments in
 one account do not collide.
+
+**Nine in [COA-operated mode](#coa-operated-mode-coa-managed)**, which adds `-config-throttles`
+(Parameter Store throttled a configuration read — raise the account's throughput setting; distinct from
+a missing parameter) and `-credential-assume-failures` (`sts:AssumeRole` on a source's credential-access
+role failed, so its owner's trust policy or its ExternalId condition changed). Neither can fire in the
+mode this document describes. Both are fleet-wide and **undimensioned by catalog on purpose**: naming a
+catalog would make the alarm stop matching the day a second source is registered, and for the assume
+failure that is exactly the day it matters most.
 
 **Not covered, deliberately.** There is no metric for a credential the connector cannot *read* — an IAM
 or KMS fault, reported as `CONNECTOR_CREDENTIAL_UNREADABLE`. It fails every invocation from the first
@@ -650,18 +847,19 @@ Start from the symptom. See [`connectors/README.md`](../README.md#when-it-goes-w
 common to every connector.
 
 The connector's own logs are in **`/aws/lambda/<function-name>`** — `databricks-coa-connector` unless
-you set `FUNCTION_NAME_PREFIX` — and are kept for **7 days**. Several rows below tell you to grep them,
-so check the age of what you are investigating first: past a week there is nothing to grep.
+you set `FUNCTION_NAME_PREFIX` — and are kept for **one month**. Several rows below tell you to grep
+them, so check the age of what you are investigating first: past a month there is nothing to grep.
 
-Every error the connector raises starts with one of six stable prefixes. **Three of them do not name
-Databricks, and that is deliberate** — a `CONNECTOR_` prefix means the problem is in this account or in
-this connector, and looking at the warehouse will waste your time.
+Every error the connector raises starts with one of seven stable prefixes. **Four of them do not name
+Databricks, and that is deliberate** — a `CONNECTOR_` prefix means the problem is in this account, in
+somebody's IAM policy, or in this connector, and looking at the warehouse will waste your time.
 
 | Symptom | Look at |
 | --- | --- |
 | `DATABRICKS_WAREHOUSE_NOT_RUNNING` | Expected on the first query after an auto-stop. Retry; serverless resumes in seconds. If it persists, the warehouse is stopped rather than starting |
 | `DATABRICKS_AUTHENTICATION_FAILED` | Databricks rejected a credential it *received*. The secret's value, and then the three Unity Catalog grants — the message names both because the second is the more common cause |
-| `CONNECTOR_CREDENTIAL_UNREADABLE` | The connector could not *read* the secret, which is an IAM problem here rather than a Databricks one. `secretsmanager:GetSecretValue` on the secret, and for a customer-managed key `kms:Decrypt` on **both** the function's role and the key's own policy. The CDK app grants the role half from `CREDENTIAL_KMS_KEY_ARN`; the key policy is the key owner's. This is the most likely first-deploy failure |
+| `CONNECTOR_CREDENTIAL_UNREADABLE` | The connector could not *read* the secret, which is an IAM problem here rather than a Databricks one. `secretsmanager:GetSecretValue` on the secret, and for a customer-managed key `kms:Decrypt` on **both** the function's role and the key's own policy. The CDK app grants the role half from `CREDENTIAL_KMS_KEY_ARN`; the key policy is the key owner's. This is the most likely first-deploy failure. In [COA-operated mode](#coa-operated-mode-coa-managed) the same prefix names the *customer's* role instead, and says so: the assume worked, so it is that role's **permission** policy or the secret's key policy that is short, and there is nothing to grant on COA's side |
+| `CONNECTOR_CREDENTIAL_ASSUME_DENIED` | [COA-operated mode](#coa-operated-mode-coa-managed) only. `sts:AssumeRole` on the source's `crossAccountRoleArn` failed, so the credential behind it was never reached. The role's **trust** policy, in the role's own account: it must name the connector's execution role and condition `sts:ExternalId` on exactly the value the message quotes — which is what the COA UI publishes for that namespace, and a mismatch of one character reads as a plain `AccessDenied`. Check the role's name begins with the deployment's reserved `datasource-access-` prefix too, since COA's own assume grant is scoped to it. Counted separately from a configuration failure because COA neither owns nor can repair either policy |
 | `CONNECTOR_INTERNAL_ERROR` | A fault that did not come from Databricks: a bug here, a missing IAM grant, a packaging problem. The connector's own log group, not the warehouse |
 | `DATABRICKS_REQUEST_FAILED` | Databricks refused the request for a reason that is neither of the two above — a missing table, a syntax error, a permission on one object. The driver's own message is quoted at the end |
 | `DATABRICKS_TABLE_TOO_LARGE` | Expected for a table past the row ceiling. Narrow the query's predicate, or raise `DATABRICKS_MAX_ROWS_PER_TABLE` together with memory and timeout |

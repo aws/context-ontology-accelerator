@@ -35,9 +35,23 @@ _SOURCE_ID = "src-db-001"
 import coa_sources.api.sources_handler  # noqa: F401, I001
 import coa_sources.api.database_routes as _dr  # noqa: E402, I001
 from coa_sources.database import glue_ownership as _go  # noqa: E402, I001
+from tests.unit.conftest import dao_double  # noqa: E402
 
 _DR = "coa_sources.api.database_routes"
 _SH = "coa_sources.api.sources_handler"
+
+
+@pytest.fixture(autouse=True)
+def _no_rescan_backup_bucket():
+    """Pin ``_BUCKET_NAME`` to the value this module sees when run on its own.
+
+    ``database_routes`` reads ``BUCKET_NAME`` at import, and other test modules set
+    it at import time. When one of them is imported first, ``_removed_sets`` stops
+    short-circuiting and reads the source row through an unmocked DAO. Tests of the
+    rescan backup patch ``_BUCKET_NAME`` themselves.
+    """
+    with patch(f"{_DR}._BUCKET_NAME", ""):
+        yield
 
 
 def _source_puts(mock_dao) -> list[dict]:
@@ -122,6 +136,7 @@ def _make_glue_db_req(athena_data_catalog_name=None, execution_engine=None, reds
     req.glue_configuration.redshift_workgroup = redshift_workgroup
     req.jdbc_configuration = None
     req.custom_connector_configuration = None
+    req.databricks_sql_warehouse_configuration = None
     req.metadata_enrichment_enabled = None
     return req
 
@@ -134,6 +149,7 @@ def _make_jdbc_db_req(engine="POSTGRESQL"):
     req.jdbc_configuration.to_dict.return_value = {"jdbcUrl": "jdbc:mysql://host/db"}
     req.glue_configuration = None
     req.custom_connector_configuration = None
+    req.databricks_sql_warehouse_configuration = None
     req.metadata_enrichment_enabled = None
     return req
 
@@ -146,8 +162,8 @@ def _make_jdbc_db_req(engine="POSTGRESQL"):
 @pytest.mark.unit
 class TestCreateDatabaseSource:
     def test_create_glue_source_happy_path(self):
-        mock_dao = MagicMock()
-        mock_scan_dao = MagicMock()
+        mock_dao = dao_double()
+        mock_scan_dao = dao_double()
         mock_sqs = MagicMock()
 
         with (
@@ -163,6 +179,8 @@ class TestCreateDatabaseSource:
         assert "scanJobId" in body
         assert len(_source_puts(mock_dao)) == 1
         mock_sqs.send_message.assert_called_once()
+        # The first scan is INITIAL, so the history can name its trigger too.
+        assert mock_scan_dao.put.call_args[0][0]["triggerType"] == "INITIAL"
 
     def test_create_glue_source_records_the_declared_catalog_without_system_authority(self):
         """A caller's nested catalog must reach the query layer via `athenaCatalog`
@@ -174,7 +192,7 @@ class TestCreateDatabaseSource:
         caller's value there once let a steward name another namespace's federated
         catalog and have their own delete tear it down.
         """
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
 
         with (
             patch(f"{_DR}._get_dao", return_value=mock_dao),
@@ -197,7 +215,7 @@ class TestCreateDatabaseSource:
         assert "athenaCatalogOwnershipVerified" not in put_item
 
     def test_create_glue_source_persists_query_metadata(self):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         with (
             patch(f"{_DR}._get_dao", return_value=mock_dao),
             patch(f"{_DR}._get_scan_dao", return_value=MagicMock()),
@@ -215,7 +233,7 @@ class TestCreateDatabaseSource:
         assert "athenaCatalogOwnershipVerified" not in put_item
 
     def test_glue_nested_catalog_id_resolves_to_nested_catalog_name(self):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         req = _make_glue_db_req()
         req.glue_configuration.catalog_id = "999999999999:salescat"
         with (
@@ -231,7 +249,7 @@ class TestCreateDatabaseSource:
         assert put_item["athenaCatalogOwnershipVerified"] is True
 
     def test_glue_explicit_athena_catalog_name_wins(self):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         req = _make_glue_db_req(athena_data_catalog_name="explicit_cat")
         req.glue_configuration.catalog_id = "999999999999:ignored"
         with (
@@ -248,7 +266,7 @@ class TestCreateDatabaseSource:
         assert "athenaCatalogOwnershipVerified" not in put_item
 
     def test_create_jdbc_source_persists_query_metadata(self):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         with (
             patch(f"{_DR}._get_dao", return_value=mock_dao),
             patch(f"{_DR}._get_scan_dao", return_value=MagicMock()),
@@ -267,7 +285,7 @@ class TestCreateDatabaseSource:
     def test_create_jdbc_source_mysql_uses_direct_jdbc(self):
         # MySQL now has a direct-JDBC serve adapter (aiomysql), so it routes to
         # the direct path rather than Athena federation.
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         with (
             patch(f"{_DR}._get_dao", return_value=mock_dao),
             patch(f"{_DR}._get_scan_dao", return_value=MagicMock()),
@@ -279,7 +297,7 @@ class TestCreateDatabaseSource:
 
     def test_create_jdbc_source_sqlserver_uses_direct_jdbc(self):
         # SQL Server now has a direct-JDBC serve adapter (python-tds).
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         with (
             patch(f"{_DR}._get_dao", return_value=mock_dao),
             patch(f"{_DR}._get_scan_dao", return_value=MagicMock()),
@@ -292,7 +310,7 @@ class TestCreateDatabaseSource:
     def test_create_jdbc_source_without_direct_dialect_uses_athena(self):
         # An engine with no direct dialect yet (e.g. Snowflake) must fall back to
         # Athena, not claim a direct JDBC path that isn't implemented.
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         with (
             patch(f"{_DR}._get_dao", return_value=mock_dao),
             patch(f"{_DR}._get_scan_dao", return_value=MagicMock()),
@@ -303,7 +321,7 @@ class TestCreateDatabaseSource:
         assert _source_put(mock_dao)["queryEngine"] == "ATHENA"
 
     def test_create_glue_source_omits_catalog_name_when_absent(self):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
 
         with (
             patch(f"{_DR}._get_dao", return_value=mock_dao),
@@ -319,7 +337,7 @@ class TestCreateDatabaseSource:
     def test_glue_source_defaults_to_athena_engine(self):
         """A Glue source with no executionEngine keeps queryEngine=ATHENA and
         persists no redshiftWorkgroup (default, unchanged behaviour)."""
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         with (
             patch(f"{_DR}._get_dao", return_value=mock_dao),
             patch(f"{_DR}._get_scan_dao", return_value=MagicMock()),
@@ -332,7 +350,7 @@ class TestCreateDatabaseSource:
 
     def test_glue_redshift_engine_sets_query_engine_and_persists_workgroup(self):
         """executionEngine=REDSHIFT → queryEngine=REDSHIFT + redshiftWorkgroup persisted."""
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         req = _make_glue_db_req(execution_engine="REDSHIFT", redshift_workgroup="my-wg")
         with (
             patch(f"{_DR}._get_dao", return_value=mock_dao),
@@ -347,7 +365,7 @@ class TestCreateDatabaseSource:
     def test_glue_redshift_engine_object_value_is_unwrapped(self):
         """executionEngine may arrive as an enum-like object with a .value —
         the resolver must read .value, not str(obj)."""
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         engine_obj = MagicMock()
         engine_obj.value = "REDSHIFT"
         req = _make_glue_db_req(execution_engine=engine_obj, redshift_workgroup="wg2")
@@ -362,7 +380,7 @@ class TestCreateDatabaseSource:
     def test_glue_redshift_engine_without_workgroup_rejected(self):
         """A Redshift-engine Glue source with no workgroup is a 400 — the backend
         cannot infer which Serverless workgroup to use."""
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         req = _make_glue_db_req(execution_engine="REDSHIFT", redshift_workgroup=None)
         with (
             patch(f"{_DR}._get_dao", return_value=mock_dao),
@@ -378,7 +396,7 @@ class TestCreateDatabaseSource:
         """An ATHENA (default) Glue source that happens to carry a workgroup does
         NOT persist it — the workgroup is only meaningful (and stored) for the
         REDSHIFT execution path."""
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         req = _make_glue_db_req(execution_engine="ATHENA", redshift_workgroup="stray")
         with (
             patch(f"{_DR}._get_dao", return_value=mock_dao),
@@ -393,7 +411,7 @@ class TestCreateDatabaseSource:
     def test_jdbc_redshift_source_unaffected_by_glue_engine_logic(self):
         """A native Redshift JDBC source still resolves to queryEngine=JDBC — the
         new Glue executionEngine branch must not touch the JDBC path."""
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         with (
             patch(f"{_DR}._get_dao", return_value=mock_dao),
             patch(f"{_DR}._get_scan_dao", return_value=MagicMock()),
@@ -405,8 +423,8 @@ class TestCreateDatabaseSource:
         assert "redshiftWorkgroup" not in put_item
 
     def test_create_jdbc_source_happy_path(self):
-        mock_dao = MagicMock()
-        mock_scan_dao = MagicMock()
+        mock_dao = dao_double()
+        mock_scan_dao = dao_double()
         mock_sqs = MagicMock()
 
         with (
@@ -426,7 +444,7 @@ class TestCreateDatabaseSource:
         """When the caller does not specify the enrichment toggle, the field
         is absent from the persisted item — readers treat this as 'enabled'
         (the historical default). Round-trips never persist a synthetic value."""
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         with (
             patch(f"{_DR}._get_dao", return_value=mock_dao),
             patch(f"{_DR}._get_scan_dao", return_value=MagicMock()),
@@ -437,7 +455,7 @@ class TestCreateDatabaseSource:
         assert "metadataEnrichmentEnabled" not in _source_put(mock_dao)
 
     def test_create_persists_metadata_enrichment_disabled(self):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         req = _make_glue_db_req()
         req.metadata_enrichment_enabled = False
         with (
@@ -450,7 +468,7 @@ class TestCreateDatabaseSource:
         assert _source_put(mock_dao)["metadataEnrichmentEnabled"] is False
 
     def test_create_persists_metadata_enrichment_enabled_explicitly(self):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         req = _make_jdbc_db_req()
         req.metadata_enrichment_enabled = True
         with (
@@ -479,9 +497,9 @@ class TestCreateDatabaseSource:
     def test_create_ddb_put_fails_returns_500(self):
         from botocore.exceptions import ClientError
 
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.put.side_effect = ClientError({"Error": {"Code": "InternalError"}}, "PutItem")
-        mock_scan_dao = MagicMock()
+        mock_scan_dao = dao_double()
 
         with (
             patch(f"{_DR}._get_dao", return_value=mock_dao),
@@ -494,8 +512,8 @@ class TestCreateDatabaseSource:
     def test_create_sqs_fails_returns_500(self):
         from botocore.exceptions import ClientError
 
-        mock_dao = MagicMock()
-        mock_scan_dao = MagicMock()
+        mock_dao = dao_double()
+        mock_scan_dao = dao_double()
         mock_sqs = MagicMock()
         mock_sqs.send_message.side_effect = ClientError({"Error": {"Code": "SQSError"}}, "SendMessage")
 
@@ -514,8 +532,8 @@ class TestCreateDatabaseSource:
         assert not any(c.args and c.args[1].get("status") == "SCAN_FAILED" for c in mock_dao.update.call_args_list)
 
     def test_create_no_scan_queue_url_skips_sqs(self):
-        mock_dao = MagicMock()
-        mock_scan_dao = MagicMock()
+        mock_dao = dao_double()
+        mock_scan_dao = dao_double()
 
         with (
             patch(f"{_DR}._get_dao", return_value=mock_dao),
@@ -527,8 +545,8 @@ class TestCreateDatabaseSource:
         assert status == 202
 
     def test_create_stores_source_type_database(self):
-        mock_dao = MagicMock()
-        mock_scan_dao = MagicMock()
+        mock_dao = dao_double()
+        mock_scan_dao = dao_double()
         mock_sqs = MagicMock()
 
         with (
@@ -564,6 +582,7 @@ def _make_athena_db_req(
         "connectorFunctionArn": metadata_arn,
         "databaseName": database_name,
     }
+    req.databricks_sql_warehouse_configuration = None
     req.metadata_enrichment_enabled = None
     return req
 
@@ -576,7 +595,7 @@ class TestCreateCustomConnectorSource:
     a catalog nobody has a record of cannot be found again."""
 
     def _create(self, req, *, register=None, delete=None, sqs=None, dao=None):
-        mock_dao = dao or MagicMock()
+        mock_dao = dao or dao_double()
         with (
             patch(f"{_DR}._get_dao", return_value=mock_dao),
             patch(f"{_DR}._get_scan_dao", return_value=MagicMock()),
@@ -634,7 +653,7 @@ class TestCreateCustomConnectorSource:
     # finds the catalog through the source record.
     def test_registers_the_catalog_after_the_dynamodb_put(self):
         order: list[str] = []
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         # The catalog claim is written between the two and is not what this
         # orders, so record only the source row. `**_` because the claim write
         # passes `auto_timestamp=False` (it must stay out of the ByNamespace GSI).
@@ -691,7 +710,7 @@ class TestCreateCustomConnectorSource:
     def test_marks_the_source_recoverable_when_the_rollback_delete_fails(self):
         from coa_sources.database.connectors.athena_catalog import AthenaCatalogError
 
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.delete.side_effect = ClientError({"Error": {"Code": "ThrottlingException"}}, "DeleteItem")
         status, _, _, _, _ = self._create(
             _make_athena_db_req(),
@@ -802,7 +821,7 @@ class TestExternalIdIsNotCallerControlled:
         return json.loads(item["configuration"])
 
     def test_create_drops_caller_supplied_external_id(self):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         req = _make_glue_db_req()
         req.glue_configuration.to_dict.return_value = {
             "databaseName": "mydb",
@@ -826,7 +845,7 @@ class TestExternalIdIsNotCallerControlled:
 
     def test_create_keeps_other_config_fields(self):
         """The strip must be surgical — nothing else may be dropped."""
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         req = _make_glue_db_req()
         req.glue_configuration.to_dict.return_value = {
             "databaseName": "mydb",
@@ -857,7 +876,7 @@ class TestExternalIdIsNotCallerControlled:
     # immutable after create (`_apply_glue_configuration_update`), so changing it
     # here would return 400 and test that guard instead of the externalId strip.
     def test_update_drops_caller_supplied_external_id(self):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = {
             "PK": f"NS#{_NAMESPACE_ID}",
             "SK": f"SRC#{_SOURCE_ID}",
@@ -891,7 +910,7 @@ class TestExternalIdIsNotCallerControlled:
         Its trust policy still pins that value, so dropping it here would break
         the source's next scan. The caller's value is still ignored.
         """
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = {
             "PK": f"NS#{_NAMESPACE_ID}",
             "SK": f"SRC#{_SOURCE_ID}",
@@ -926,7 +945,7 @@ class TestExternalIdIsNotCallerControlled:
         otherwise updating one of those sources silently drops its pinned
         ExternalId and its next scan fails on AccessDenied.
         """
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = {
             "PK": f"NS#{_NAMESPACE_ID}",
             "SK": f"SRC#{_SOURCE_ID}",
@@ -966,7 +985,7 @@ class TestCreateDatabaseSourceCounter:
     """
 
     def test_create_increments_namespace_source_count(self):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
 
         with (
             patch(f"{_DR}._get_dao", return_value=mock_dao),
@@ -983,7 +1002,7 @@ class TestCreateDatabaseSourceCounter:
         """If the scan message cannot be enqueued the source row is deleted to
         avoid an orphaned record; the counter must be decremented to match so
         it does not drift above the true source total."""
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_sqs = MagicMock()
         mock_sqs.send_message.side_effect = ClientError({"Error": {"Code": "ServiceUnavailable"}}, "SendMessage")
 
@@ -1007,7 +1026,7 @@ class TestCreateDatabaseSourceCounter:
     def test_create_does_not_double_count_when_ddb_put_fails(self):
         """If the source row never persists (DDB put fails) the counter must
         not be touched at all — there is nothing to count."""
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.put.side_effect = ClientError({"Error": {"Code": "ProvisionedThroughputExceeded"}}, "PutItem")
 
         with (
@@ -1030,9 +1049,9 @@ class TestCreateDatabaseSourceCounter:
 @pytest.mark.unit
 class TestHandleGetScanJob:
     def test_get_scan_job_happy_path(self):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = {"PK": f"NS#{_NAMESPACE_ID}", "SK": f"SRC#{_SOURCE_ID}"}
-        mock_scan_dao = MagicMock()
+        mock_scan_dao = dao_double()
         mock_scan_dao.get.return_value = {
             "PK": f"SRC#{_SOURCE_ID}",
             "SK": "2026-01-01T00:00:00Z",
@@ -1052,6 +1071,80 @@ class TestHandleGetScanJob:
         assert status == 200
         assert body["status"] == "COMPLETED"
         assert body["tablesDiscovered"] == 5
+
+    def test_get_scan_job_reports_progress_from_the_scan_job_row(self):
+        from decimal import Decimal
+
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {"PK": f"NS#{_NAMESPACE_ID}", "SK": f"SRC#{_SOURCE_ID}"}
+        mock_scan_dao = MagicMock()
+        mock_scan_dao.get.return_value = {
+            "PK": f"SRC#{_SOURCE_ID}",
+            "SK": "2026-01-01T00:00:00Z",
+            "status": "IN_PROGRESS",
+            "tablesProcessed": Decimal("4"),
+            "tablesTotal": Decimal("9"),
+        }
+
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}._get_scan_dao", return_value=mock_scan_dao),
+        ):
+            status, body = _parse(_dr._handle_get_scan_job(_NAMESPACE_ID, _SOURCE_ID, "2026-01-01T00:00:00Z"))
+
+        assert status == 200
+        # Ints, not the JSON strings an uncoerced Decimal would serialise to.
+        assert body["tablesProcessed"] == 4
+        assert body["tablesTotal"] == 9
+
+    def test_get_scan_job_total_falls_back_to_this_scans_discovery_count(self):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {
+            "PK": f"NS#{_NAMESPACE_ID}",
+            "SK": f"SRC#{_SOURCE_ID}",
+            "tablesDiscovered": 2,
+        }
+        mock_scan_dao = MagicMock()
+        mock_scan_dao.get.return_value = {
+            "PK": f"SRC#{_SOURCE_ID}",
+            "SK": "2026-01-01T00:00:00Z",
+            "status": "IN_PROGRESS",
+            "tablesDiscovered": 9,
+        }
+
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}._get_scan_dao", return_value=mock_scan_dao),
+        ):
+            status, body = _parse(_dr._handle_get_scan_job(_NAMESPACE_ID, _SOURCE_ID, "2026-01-01T00:00:00Z"))
+
+        # Discovery has finished enumerating, so prefer its count over the
+        # source row's, which still holds the previous scan's total.
+        assert body["tablesTotal"] == 9
+
+    def test_get_scan_job_total_falls_back_to_the_previous_scans_count(self):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {
+            "PK": f"NS#{_NAMESPACE_ID}",
+            "SK": f"SRC#{_SOURCE_ID}",
+            "tablesDiscovered": 2,
+        }
+        mock_scan_dao = MagicMock()
+        mock_scan_dao.get.return_value = {
+            "PK": f"SRC#{_SOURCE_ID}",
+            "SK": "2026-01-01T00:00:00Z",
+            "status": "IN_PROGRESS",
+        }
+
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}._get_scan_dao", return_value=mock_scan_dao),
+        ):
+            status, body = _parse(_dr._handle_get_scan_job(_NAMESPACE_ID, _SOURCE_ID, "2026-01-01T00:00:00Z"))
+
+        # Mid-discovery: neither count exists on this row yet.
+        assert body["tablesTotal"] == 2
+        assert "tablesProcessed" not in body
 
     def test_get_scan_job_surfaces_enrichment_partial_failure(self):
         # A scan that enriched some tables but had per-table failures records
@@ -1100,9 +1193,9 @@ class TestHandleGetScanJob:
         assert "enrichmentFailedTables" not in body
 
     def test_get_scan_job_source_not_found(self):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = None
-        mock_scan_dao = MagicMock()
+        mock_scan_dao = dao_double()
 
         with (
             patch(f"{_DR}._get_dao", return_value=mock_dao),
@@ -1113,9 +1206,9 @@ class TestHandleGetScanJob:
         assert status == 404
 
     def test_get_scan_job_job_not_found(self):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = {"PK": f"NS#{_NAMESPACE_ID}", "SK": f"SRC#{_SOURCE_ID}"}
-        mock_scan_dao = MagicMock()
+        mock_scan_dao = dao_double()
         mock_scan_dao.get.return_value = None
 
         with (
@@ -1129,9 +1222,9 @@ class TestHandleGetScanJob:
     def test_get_scan_job_ddb_error_returns_500(self):
         from botocore.exceptions import ClientError
 
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.side_effect = ClientError({"Error": {"Code": "InternalError"}}, "GetItem")
-        mock_scan_dao = MagicMock()
+        mock_scan_dao = dao_double()
 
         with (
             patch(f"{_DR}._get_dao", return_value=mock_dao),
@@ -1144,9 +1237,9 @@ class TestHandleGetScanJob:
     def test_get_scan_job_scan_dao_error_returns_500(self):
         from botocore.exceptions import ClientError
 
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = {"PK": f"NS#{_NAMESPACE_ID}", "SK": f"SRC#{_SOURCE_ID}"}
-        mock_scan_dao = MagicMock()
+        mock_scan_dao = dao_double()
         mock_scan_dao.get.side_effect = ClientError({"Error": {"Code": "InternalError"}}, "GetItem")
 
         with (
@@ -1161,9 +1254,9 @@ class TestHandleGetScanJob:
         # ISO-8601 job IDs contain colons that arrive percent-encoded in the
         # path (e.g. "2026-01-01T00%3A00%3A00Z"). The handler must unquote()
         # before looking up the scan-jobs row by SK.
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = {"PK": f"NS#{_NAMESPACE_ID}", "SK": f"SRC#{_SOURCE_ID}"}
-        mock_scan_dao = MagicMock()
+        mock_scan_dao = dao_double()
         mock_scan_dao.get.return_value = {
             "PK": f"SRC#{_SOURCE_ID}",
             "SK": "2026-01-01T00:00:00Z",
@@ -1186,9 +1279,9 @@ class TestHandleGetScanJob:
     def test_get_scan_job_handles_already_decoded_timestamp(self):
         # unquote() on an already-decoded string is a no-op — a plain ISO
         # timestamp (no percent-encoding) must still resolve correctly.
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = {"PK": f"NS#{_NAMESPACE_ID}", "SK": f"SRC#{_SOURCE_ID}"}
-        mock_scan_dao = MagicMock()
+        mock_scan_dao = dao_double()
         mock_scan_dao.get.return_value = {
             "PK": f"SRC#{_SOURCE_ID}",
             "SK": "2026-01-01T00:00:00Z",
@@ -1231,7 +1324,7 @@ class TestUpdateCustomConnectorConfiguration:
         }
 
     def _update(self, body, item=None):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = item or self._item()
         with patch(f"{_DR}._get_dao", return_value=mock_dao):
             status, resp = _parse(_dr._handle_update_metadata({"body": json.dumps(body)}, _NAMESPACE_ID, _SOURCE_ID))
@@ -1344,8 +1437,8 @@ class TestCreateGlueSourceOwnership:
     """
 
     def _create(self, req, *, allowed: bool):
-        mock_dao = MagicMock()
-        mock_scan_dao = MagicMock()
+        mock_dao = dao_double()
+        mock_scan_dao = dao_double()
         error = _go.GlueOwnershipError("Glue database 'mydb' is not registered to namespace")
         with (
             patch(f"{_DR}._get_dao", return_value=mock_dao),
@@ -1389,7 +1482,7 @@ class TestCreateGlueSourceOwnership:
     def test_jdbc_sources_are_not_subject_to_the_glue_check(self):
         """The check is about a caller-named Glue database. A JDBC source names a
         host and credentials it must already hold, and gets a catalog of its own."""
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         with (
             patch(f"{_DR}._get_dao", return_value=mock_dao),
             patch(f"{_DR}._get_scan_dao", return_value=MagicMock()),
@@ -1402,7 +1495,7 @@ class TestCreateGlueSourceOwnership:
 
     def test_a_jdbc_source_claims_the_catalog_it_will_be_given(self):
         """The claim is what stops another namespace naming this catalog later."""
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         with (
             patch(f"{_DR}._get_dao", return_value=mock_dao),
             patch(f"{_DR}._get_scan_dao", return_value=MagicMock()),
@@ -1417,7 +1510,7 @@ class TestCreateGlueSourceOwnership:
 
     def test_a_glue_source_claims_nothing(self):
         """It is given no catalog, so there is nothing for it to own."""
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         with (
             patch(f"{_DR}._get_dao", return_value=mock_dao),
             patch(f"{_DR}._get_scan_dao", return_value=MagicMock()),
@@ -1449,7 +1542,7 @@ class TestUpdateGlueConfiguration:
         }
 
     def _update(self, config, item=None):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = item or self._item()
         with patch(f"{_DR}._get_dao", return_value=mock_dao):
             status, resp = _parse(
@@ -1509,9 +1602,9 @@ class TestScanJobDegradationSignal:
     _SOURCE = {"PK": f"NS#{_NAMESPACE_ID}", "SK": f"SRC#{_SOURCE_ID}", "sourceType": "DATABASE"}
 
     def _get(self, scan_item):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = dict(self._SOURCE)
-        mock_scan_dao = MagicMock()
+        mock_scan_dao = dao_double()
         mock_scan_dao.get.return_value = scan_item
         with (
             patch(f"{_DR}._get_dao", return_value=mock_dao),
@@ -1582,7 +1675,7 @@ class TestHandleUpdateMetadata:
         }
 
     def test_update_name_happy_path(self):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = self._db_item()
 
         with patch(f"{_DR}._get_dao", return_value=mock_dao):
@@ -1593,7 +1686,7 @@ class TestHandleUpdateMetadata:
         mock_dao.update.assert_called_once()
 
     def test_update_metadata_enrichment_enabled(self):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = self._db_item()
 
         with patch(f"{_DR}._get_dao", return_value=mock_dao):
@@ -1609,7 +1702,7 @@ class TestHandleUpdateMetadata:
         assert update_fields["metadataEnrichmentEnabled"] is False
 
     def test_update_glue_config(self):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = self._db_item()
 
         with patch(f"{_DR}._get_dao", return_value=mock_dao):
@@ -1629,7 +1722,7 @@ class TestHandleUpdateMetadata:
         assert status == 200
 
     def test_update_jdbc_config(self):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = self._db_item()
 
         with patch(f"{_DR}._get_dao", return_value=mock_dao):
@@ -1653,7 +1746,7 @@ class TestHandleUpdateMetadata:
         # The credential-secret → namespace binding must run on the update path,
         # not only at create — otherwise a source could be repointed at a secret
         # bound to another namespace after creation.
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = self._db_item()
         spy = MagicMock(return_value=None)
         with (
@@ -1679,7 +1772,7 @@ class TestHandleUpdateMetadata:
 
     def test_update_jdbc_config_rejected_when_binding_fails(self):
         # A binding failure blocks the update and must not write to DynamoDB.
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = self._db_item()
         from coa_common.response import api_response
 
@@ -1718,7 +1811,7 @@ class TestHandleUpdateMetadata:
         discovery deliver that namespace's database credentials to it. The binding
         check still passes there — the secret is unchanged; the destination moved.
         """
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         item = self._db_item()
         item["sourceSubType"] = "JDBC_DATABASE"
         item["configuration"] = json.dumps(
@@ -1757,7 +1850,7 @@ class TestHandleUpdateMetadata:
         # Swapping the secret is caught here as well as by the binding check, so a
         # secret that happens to be tagged for this namespace still cannot be
         # substituted for the one the source was registered with.
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         item = self._db_item()
         item["sourceSubType"] = "JDBC_DATABASE"
         item["configuration"] = json.dumps(
@@ -1797,7 +1890,7 @@ class TestHandleUpdateMetadata:
     def test_update_jdbc_may_echo_immutable_fields_to_edit_a_filter(self):
         # Rejecting only CHANGES keeps a whole-blob PUT usable: the client resends
         # host/port/secret unchanged in order to edit schemaFilter.
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         item = self._db_item()
         item["sourceSubType"] = "JDBC_DATABASE"
         item["configuration"] = json.dumps(
@@ -1833,7 +1926,7 @@ class TestHandleUpdateMetadata:
         mock_dao.update.assert_called_once()
 
     def test_update_both_configs_returns_400(self):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = self._db_item()
 
         with patch(f"{_DR}._get_dao", return_value=mock_dao):
@@ -1851,7 +1944,7 @@ class TestHandleUpdateMetadata:
         assert status == 400
 
     def test_update_source_not_found_returns_404(self):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = None
 
         with patch(f"{_DR}._get_dao", return_value=mock_dao):
@@ -1861,7 +1954,7 @@ class TestHandleUpdateMetadata:
         assert status == 404
 
     def test_update_non_database_source_returns_400(self):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         item = self._db_item()
         item["sourceType"] = "DOCUMENTS"
         mock_dao.get.return_value = item
@@ -1874,7 +1967,7 @@ class TestHandleUpdateMetadata:
         assert "DATABASE" in body["error"]
 
     def test_update_blank_name_returns_400(self):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = self._db_item()
 
         with patch(f"{_DR}._get_dao", return_value=mock_dao):
@@ -1886,7 +1979,7 @@ class TestHandleUpdateMetadata:
     def test_update_ddb_error_returns_500(self):
         from botocore.exceptions import ClientError
 
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = self._db_item()
         mock_dao.update.side_effect = ClientError({"Error": {"Code": "InternalError"}}, "UpdateItem")
 
@@ -1897,7 +1990,7 @@ class TestHandleUpdateMetadata:
         assert status == 500
 
     def test_update_no_updatable_fields_returns_400(self):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = self._db_item()
 
         with patch(f"{_DR}._get_dao", return_value=mock_dao):
@@ -1923,7 +2016,7 @@ class TestHandleListTables:
         assert status == 500
 
     def test_list_tables_namespace_not_found_returns_404(self):
-        mock_ns_dao = MagicMock()
+        mock_ns_dao = dao_double()
         mock_ns_dao.get.return_value = None
 
         with (
@@ -1953,7 +2046,7 @@ class TestHandleListTables:
     def test_list_tables_happy_path(self):
         from coa_common.datazone_forms import FORM_TYPE_NAME
 
-        mock_ns_dao = MagicMock()
+        mock_ns_dao = dao_double()
         mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
 
         forms_list = [
@@ -2048,13 +2141,129 @@ class TestHandleListTables:
         assert item["columnsApproved"] == 1
         assert item["columnsPendingDeletion"] == 1
 
+    def test_list_tables_surfaces_pending_relationships_count(self):
+        """Cross-source inference on a later-onboarded source can propose new
+        PENDING_REVIEW foreign keys on a table whose parent source is already
+        APPROVED. Bulk source approve doesn't re-enter APPROVED, so the count
+        is what the tables list uses to badge the table and prompt a per-table
+        or per-relationship review."""
+        from coa_common.datazone_forms import FORM_TYPE_NAME
+
+        mock_ns_dao = MagicMock()
+        mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
+
+        mock_asset = MagicMock()
+        mock_asset.name = f"DS#{_SOURCE_ID}:mydb.orders"
+        mock_asset.asset_id = "asset-001"
+
+        mock_smus = MagicMock()
+        mock_smus.search_assets.return_value = MagicMock(items=[mock_asset], next_token=None)
+        mock_smus.get_asset_forms.return_value = {
+            "formsOutput": [
+                {
+                    "formName": FORM_TYPE_NAME,
+                    "content": json.dumps(
+                        {
+                            "databaseName": "mydb",
+                            "tableName": "orders",
+                            "reviewStatus": "APPROVED",
+                            "columns": [
+                                {"name": "customer_id", "business_metadata": {"review_status": "APPROVED"}},
+                            ],
+                            "foreignKeys": [
+                                # Local FK stored during discovery — no review_status.
+                                {
+                                    "column": "customer_id",
+                                    "target_table": "customers",
+                                    "target_column": "id",
+                                    "source": "DETERMINISTIC",
+                                },
+                                # PENDING cross-source FK from a later cross-source pass.
+                                {
+                                    "column": "customer_id",
+                                    "target_table": "crm_customers",
+                                    "target_column": "id",
+                                    "source": "AI_INFERRED",
+                                    "review_status": "PENDING_REVIEW",
+                                    "target_datasource_id": "DS#crm-src",
+                                },
+                                # A REJECTED FK doesn't count as pending.
+                                {
+                                    "column": "customer_id",
+                                    "target_table": "legacy_customers",
+                                    "target_column": "id",
+                                    "source": "AI_INFERRED",
+                                    "review_status": "REJECTED",
+                                    "target_datasource_id": "DS#legacy",
+                                },
+                            ],
+                        }
+                    ),
+                }
+            ]
+        }
+
+        with (
+            patch(f"{_DR}._SMUS_DOMAIN_ID", "domain-id"),
+            patch(f"{_DR}._get_ns_dao", return_value=mock_ns_dao),
+            patch(f"{_DR}._get_smus_client", return_value=mock_smus),
+            patch(f"{_DR}._removed_sets", return_value=(set(), {}, set())),
+        ):
+            status, body = _parse(_dr._handle_list_tables(self._make_list_event(), _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 200
+        item = body["items"][0]
+        assert item["pendingRelationships"] == 1
+
+    def test_list_tables_omits_pending_relationships_when_zero(self):
+        """The field is absent (not zero) to keep response bodies small."""
+        from coa_common.datazone_forms import FORM_TYPE_NAME
+
+        mock_ns_dao = MagicMock()
+        mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
+
+        mock_asset = MagicMock()
+        mock_asset.name = f"DS#{_SOURCE_ID}:mydb.orders"
+        mock_asset.asset_id = "asset-001"
+
+        mock_smus = MagicMock()
+        mock_smus.search_assets.return_value = MagicMock(items=[mock_asset], next_token=None)
+        mock_smus.get_asset_forms.return_value = {
+            "formsOutput": [
+                {
+                    "formName": FORM_TYPE_NAME,
+                    "content": json.dumps(
+                        {
+                            "databaseName": "mydb",
+                            "tableName": "orders",
+                            "reviewStatus": "APPROVED",
+                            "columns": [],
+                            "foreignKeys": [],
+                        }
+                    ),
+                }
+            ]
+        }
+
+        with (
+            patch(f"{_DR}._SMUS_DOMAIN_ID", "domain-id"),
+            patch(f"{_DR}._get_ns_dao", return_value=mock_ns_dao),
+            patch(f"{_DR}._get_smus_client", return_value=mock_smus),
+            patch(f"{_DR}._removed_sets", return_value=(set(), {}, set())),
+        ):
+            status, body = _parse(_dr._handle_list_tables(self._make_list_event(), _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 200
+        item = body["items"][0]
+        assert "pendingRelationships" not in item
+
     def test_list_tables_get_asset_forms_failure_logs_warning_and_marks_degraded(self):
         """When inline forms are absent and the get_asset_forms fallback raises,
         the asset is skipped with a warning log and the response includes
         a skippedAssets count."""
         from coa_common.datazone_forms import FORM_TYPE_NAME
 
-        mock_ns_dao = MagicMock()
+        mock_ns_dao = dao_double()
         mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
 
         mock_asset_ok = MagicMock()
@@ -2122,7 +2331,7 @@ class TestHandleListTables:
         and the response includes a 'degraded' indicator."""
         from coa_common.datazone_forms import FORM_TYPE_NAME
 
-        mock_ns_dao = MagicMock()
+        mock_ns_dao = dao_double()
         mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
 
         mock_asset = MagicMock()
@@ -2166,7 +2375,7 @@ class TestHandleListTables:
         skippedAssets accurately reflects the total count."""
         from coa_common.datazone_forms import FORM_TYPE_NAME
 
-        mock_ns_dao = MagicMock()
+        mock_ns_dao = dao_double()
         mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
 
         # Asset 1: inline forms absent, fallback get_asset_forms will raise
@@ -2226,7 +2435,7 @@ class TestHandleListTables:
         JSON, the asset is skipped and counted in skippedAssets."""
         from coa_common.datazone_forms import FORM_TYPE_NAME
 
-        mock_ns_dao = MagicMock()
+        mock_ns_dao = dao_double()
         mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
 
         mock_asset = MagicMock()
@@ -2275,7 +2484,7 @@ class TestHandleListTables:
         'degraded' or 'skippedAssets' fields."""
         from coa_common.datazone_forms import FORM_TYPE_NAME
 
-        mock_ns_dao = MagicMock()
+        mock_ns_dao = dao_double()
         mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
 
         forms_list = [
@@ -2316,7 +2525,7 @@ class TestHandleListTables:
         assert "skippedAssets" not in body
 
     def test_list_tables_search_fails_returns_500(self):
-        mock_ns_dao = MagicMock()
+        mock_ns_dao = dao_double()
         mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
 
         mock_smus = MagicMock()
@@ -2334,7 +2543,7 @@ class TestHandleListTables:
     def test_list_tables_with_next_token(self):
         from coa_common.datazone_forms import FORM_TYPE_NAME
 
-        mock_ns_dao = MagicMock()
+        mock_ns_dao = dao_double()
         mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
 
         forms_list = [
@@ -2376,7 +2585,7 @@ class TestHandleListTables:
     def test_list_tables_filters_by_review_status(self):
         from coa_common.datazone_forms import FORM_TYPE_NAME
 
-        mock_ns_dao = MagicMock()
+        mock_ns_dao = dao_double()
         mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
 
         mock_asset = MagicMock()
@@ -2781,7 +2990,7 @@ class TestHandleGetTable:
         assert status == 500
 
     def test_get_table_returns_column_confidence(self):
-        mock_ns_dao = MagicMock()
+        mock_ns_dao = dao_double()
         mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
         mock_smus = MagicMock()
         _mock_single_asset_load(
@@ -2799,7 +3008,7 @@ class TestHandleGetTable:
         assert body["columns"][0]["businessMetadata"]["confidence"] == 0.88
 
     def test_get_table_namespace_not_found_returns_404(self):
-        mock_ns_dao = MagicMock()
+        mock_ns_dao = dao_double()
         mock_ns_dao.get.return_value = None
 
         with (
@@ -2811,7 +3020,7 @@ class TestHandleGetTable:
         assert status == 404
 
     def test_get_table_asset_not_found_returns_404(self):
-        mock_ns_dao = MagicMock()
+        mock_ns_dao = dao_double()
         mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
 
         mock_result = MagicMock()
@@ -2830,7 +3039,7 @@ class TestHandleGetTable:
         assert status == 404
 
     def test_get_table_search_fails_returns_500(self):
-        mock_ns_dao = MagicMock()
+        mock_ns_dao = dao_double()
         mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
 
         mock_smus = MagicMock()
@@ -2846,7 +3055,7 @@ class TestHandleGetTable:
         assert status == 500
 
     def test_get_table_forms_fetch_fails_returns_500(self):
-        mock_ns_dao = MagicMock()
+        mock_ns_dao = dao_double()
         mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
 
         mock_asset = MagicMock()
@@ -3645,10 +3854,10 @@ def _review_env():
     to exercise the guard (e.g. APPROVING source) should override
     ``_review_env["dao"].get.return_value`` themselves.
     """
-    mock_ns_dao = MagicMock()
+    mock_ns_dao = dao_double()
     mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
     mock_smus = create_autospec(_dr.SMUSClient, instance=True)
-    mock_dao = MagicMock()
+    mock_dao = dao_double()
     mock_dao.get.return_value = {
         "PK": f"NS#{_NAMESPACE_ID}",
         "SK": f"SRC#{_SOURCE_ID}",
@@ -3931,10 +4140,12 @@ class TestReviewTable:
         # acceptance-rate metric, so assert on the name rather than call count.)
         assert "ApprovalCounterUpdateFailed" in [c.args[0] for c in mock_emit.call_args_list if c.args]
 
-    def test_approve_is_noop_on_columns_when_all_terminal(self, _review_env):
-        # With the precondition that all columns must already be terminal,
-        # approving the table preserves each column's prior decision and only
-        # flips the table itself.
+    def test_approve_re_approves_rejected_columns(self, _review_env):
+        # An explicit per-table approve takes its columns with it, including a
+        # REJECTED one — this is what makes approve -> reject -> approve leave the
+        # table and its children in sync (a table-level reject had cascaded
+        # REJECTED onto every column). Bulk approve keeps preserving rejections;
+        # that is covered in coa_common's review_logic tests.
         from coa_common.datazone_forms import deserialize_form
 
         _mock_single_asset_load(
@@ -3957,7 +4168,7 @@ class TestReviewTable:
         forms_input = _review_env["smus"].create_asset_revision.call_args.kwargs["forms_input"]
         written = deserialize_form(json.loads(forms_input[0]["content"]), data_source_id=_SOURCE_ID)
         col_status = {c.name: c.business_metadata.review_status for c in written.columns}
-        assert col_status == {"col_a": "REJECTED", "col_b": "APPROVED", "col_c": "APPROVED"}
+        assert col_status == {"col_a": "APPROVED", "col_b": "APPROVED", "col_c": "APPROVED"}
 
     def test_reject_cascades_to_all_non_rejected_columns(self, _review_env):
         from coa_common.datazone_forms import deserialize_form
@@ -4204,7 +4415,7 @@ class TestUpdateColumnMetadata:
 @pytest.fixture
 def _bulk_env():
     """Patch dependencies for bulk approve/reject handlers."""
-    mock_dao = MagicMock()
+    mock_dao = dao_double()
     mock_sqs = MagicMock()
     with (
         patch(f"{_DR}._REVIEW_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/review-queue"),
@@ -4338,7 +4549,7 @@ class TestApproveSource:
         assert status == 202
 
     def test_review_queue_url_unset_returns_500(self):
-        mock_dao = MagicMock()
+        mock_dao = dao_double()
         mock_dao.get.return_value = {
             "PK": f"NS#{_NAMESPACE_ID}",
             "SK": f"SRC#{_SOURCE_ID}",
@@ -4886,12 +5097,39 @@ class TestUpdateTableKeys:
         )
         return json.dumps(form)
 
+    def _register_cross_source_target(self, _review_env, *, columns):
+        smus = _review_env["smus"]
+        target_asset_name = "DS#other:sales.customers"
+        target_asset = MagicMock()
+        target_asset.name = target_asset_name
+        target_asset.asset_id = "asset-other-sales.customers"
+        target_form = _serialize_table(table_name="customers", columns=columns)
+        smus.__dict__["_coa_test_table_catalog"][target_asset_name] = (target_asset, target_form)
+
+        source_record = _review_env["dao"].get.return_value
+
+        def _get(key, **_):
+            if key.get("SK") == f"SRC#{_SOURCE_ID}":
+                return source_record
+            if key.get("SK") == "SRC#other":
+                return {
+                    "PK": f"NS#{_NAMESPACE_ID}",
+                    "SK": "SRC#other",
+                    "sourceType": "DATABASE",
+                    "status": "APPROVED",
+                    "discoveredSchemas": ["sales"],
+                }
+            return None
+
+        _review_env["dao"].get.side_effect = _get
+
     def test_approve_inferred_relationship_preserves_provenance(self, _review_env):
         # #1088: approving flips review_status to APPROVED while keeping the FK's
         # AI_INFERRED source, cross-source target_datasource_id, and provenance.
         _mock_single_asset_load(
             _review_env["smus"], table_id=self._TABLE_ID, form_content=self._form_with_inferred_fk()
         )
+        self._register_cross_source_target(_review_env, columns=[{"name": "id"}])
         body = {
             "foreignKeys": [
                 {"column": "col_a", "targetTable": "customers", "targetColumn": "id", "reviewStatus": "APPROVED"}
@@ -4904,6 +5142,25 @@ class TestUpdateTableKeys:
         assert fk.source == "AI_INFERRED"  # provenance preserved, not restamped
         assert fk.target_datasource_id == "DS#other"
         assert fk.provenance == "cross-source name match"
+
+    def test_approve_inferred_relationship_with_unknown_target_column_returns_400(self, _review_env):
+        _mock_single_asset_load(
+            _review_env["smus"], table_id=self._TABLE_ID, form_content=self._form_with_inferred_fk()
+        )
+        self._register_cross_source_target(_review_env, columns=[{"name": "customer_id"}])
+        body = {
+            "foreignKeys": [
+                {"column": "col_a", "targetTable": "customers", "targetColumn": "id", "reviewStatus": "APPROVED"}
+            ]
+        }
+
+        status, response = _parse(
+            _dr._handle_update_table_keys(self._event(body), _NAMESPACE_ID, _SOURCE_ID, self._TABLE_ID)
+        )
+
+        assert status == 400
+        assert "id" in response["error"]
+        _review_env["smus"].create_asset_revision.assert_not_called()
 
     def test_approve_cross_source_relationship_outside_namespace_returns_400(self, _review_env):
         # #1088: approving materialises the edge, so a target datasource that is
@@ -5288,3 +5545,462 @@ class TestHandleListScanJobs:
         ):
             status, _ = _parse(_dr._handle_list_scan_jobs(_NAMESPACE_ID, _SOURCE_ID))
         assert status == 500
+
+
+@pytest.mark.unit
+class TestHandlePutRescanSchedule:
+    """Recurring rescan schedule config (#683 R7)."""
+
+    def _enable_event(self, expr: str = "rate(1 day)", tz: str = "UTC") -> dict:
+        return {"body": json.dumps({"enabled": True, "scheduleExpression": expr, "timezone": tz})}
+
+    def test_enable_creates_schedule_and_persists(self):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {"sourceType": "DATABASE"}
+        mock_scheduler = MagicMock()
+
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}._get_scheduler", return_value=mock_scheduler),
+            patch(f"{_DR}._RESCAN_SCHEDULE_GROUP", "grp"),
+            patch(f"{_DR}._RESCAN_TARGET_ARN", "arn:aws:lambda:us-east-1:1:function:sources-api"),
+            patch(f"{_DR}._RESCAN_SCHEDULE_ROLE_ARN", "arn:aws:iam::1:role/sched"),
+        ):
+            status, body = _parse(_dr._handle_put_rescan_schedule(self._enable_event(), _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 200
+        assert body["rescanSchedule"] == {
+            "enabled": True,
+            "scheduleExpression": "rate(1 day)",
+            "timezone": "UTC",
+        }
+        mock_scheduler.create_schedule.assert_called_once()
+        # Target payload routes a scheduled rescan back to the API Lambda.
+        target_input = json.loads(mock_scheduler.create_schedule.call_args[1]["Target"]["Input"])
+        assert target_input == {
+            "scheduledRescan": True,
+            "namespaceId": _NAMESPACE_ID,
+            "sourceId": _SOURCE_ID,
+        }
+        # Cadence persisted on the source record.
+        persisted = mock_dao.update.call_args[0][1]["rescanSchedule"]
+        assert persisted["scheduleExpression"] == "rate(1 day)"
+
+    def test_enable_conflict_falls_back_to_update(self):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {"sourceType": "DATABASE"}
+        mock_scheduler = MagicMock()
+        mock_scheduler.create_schedule.side_effect = ClientError(
+            {"Error": {"Code": "ConflictException"}}, "CreateSchedule"
+        )
+
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}._get_scheduler", return_value=mock_scheduler),
+            patch(f"{_DR}._RESCAN_SCHEDULE_GROUP", "grp"),
+            patch(f"{_DR}._RESCAN_TARGET_ARN", "arn:lambda"),
+            patch(f"{_DR}._RESCAN_SCHEDULE_ROLE_ARN", "arn:role"),
+        ):
+            status, _ = _parse(_dr._handle_put_rescan_schedule(self._enable_event(), _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 200
+        mock_scheduler.update_schedule.assert_called_once()
+
+    def test_disable_deletes_schedule_and_persists(self):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {"sourceType": "DATABASE"}
+        mock_scheduler = MagicMock()
+        event = {"body": json.dumps({"enabled": False})}
+
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}._get_scheduler", return_value=mock_scheduler),
+            patch(f"{_DR}._RESCAN_SCHEDULE_GROUP", "grp"),
+        ):
+            status, body = _parse(_dr._handle_put_rescan_schedule(event, _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 200
+        assert body["rescanSchedule"] == {"enabled": False}
+        mock_scheduler.delete_schedule.assert_called_once()
+        mock_scheduler.create_schedule.assert_not_called()
+
+    def test_enable_without_expression_returns_400(self):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {"sourceType": "DATABASE"}
+        event = {"body": json.dumps({"enabled": True})}
+
+        with patch(f"{_DR}._get_dao", return_value=mock_dao):
+            status, _ = _parse(_dr._handle_put_rescan_schedule(event, _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 400
+
+    def test_rejects_non_database_source(self):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {"sourceType": "DOCUMENTS"}
+
+        with patch(f"{_DR}._get_dao", return_value=mock_dao):
+            status, _ = _parse(_dr._handle_put_rescan_schedule(self._enable_event(), _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 400
+
+    def test_enable_when_not_configured_returns_500(self):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {"sourceType": "DATABASE"}
+
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}._RESCAN_SCHEDULE_GROUP", ""),
+            patch(f"{_DR}._RESCAN_TARGET_ARN", ""),
+            patch(f"{_DR}._RESCAN_SCHEDULE_ROLE_ARN", ""),
+        ):
+            status, _ = _parse(_dr._handle_put_rescan_schedule(self._enable_event(), _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 500
+
+    def test_source_not_found_returns_404(self):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = None
+
+        with patch(f"{_DR}._get_dao", return_value=mock_dao):
+            status, _ = _parse(_dr._handle_put_rescan_schedule(self._enable_event(), _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 404
+
+    @pytest.mark.parametrize("expr", ["rate(1 minute)", "rate(30 minutes)", "rate(59 minutes)"])
+    def test_rejects_a_cadence_faster_than_the_floor(self, expr):
+        """Every tick is a full discovery plus enrichment, so an unbounded
+        cadence bills one Bedrock pass per table per tick. EventBridge only
+        syntax-checks the expression, so the floor has to be enforced here."""
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {"sourceType": "DATABASE"}
+        mock_scheduler = MagicMock()
+
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}._get_scheduler", return_value=mock_scheduler),
+        ):
+            status, body = _parse(_dr._handle_put_rescan_schedule(self._enable_event(expr), _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 400
+        assert "at most every 3600s" in body["error"]
+        # Rejected before anything reaches EventBridge.
+        mock_scheduler.create_schedule.assert_not_called()
+
+    @pytest.mark.parametrize("expr", ["rate(1 hour)", "rate(6 hours)", "rate(1 day)", "cron(0 3 * * ? *)"])
+    def test_accepts_a_cadence_at_or_above_the_floor(self, expr):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {"sourceType": "DATABASE"}
+
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}._get_scheduler", return_value=MagicMock()),
+            patch(f"{_DR}._RESCAN_SCHEDULE_GROUP", "grp"),
+            patch(f"{_DR}._RESCAN_TARGET_ARN", "arn:lambda"),
+            patch(f"{_DR}._RESCAN_SCHEDULE_ROLE_ARN", "arn:role"),
+        ):
+            status, _ = _parse(_dr._handle_put_rescan_schedule(self._enable_event(expr), _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 200
+
+    @pytest.mark.parametrize(
+        "expr",
+        [
+            "cron(0/5 * * * ? *)",
+            "cron(* * * * ? *)",
+            "cron(0,30 * * * ? *)",
+            "cron(0-10 * * * ? *)",
+        ],
+    )
+    def test_rejects_cron_that_can_fire_sub_hourly(self, expr):
+        """A cron expression cannot be reduced to an interval in general, so the
+        minute field must be a single literal. That bounds it at hourly and
+        rejects the steps, lists, ranges and wildcards that fire faster."""
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {"sourceType": "DATABASE"}
+        mock_scheduler = MagicMock()
+
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}._get_scheduler", return_value=mock_scheduler),
+        ):
+            status, body = _parse(_dr._handle_put_rescan_schedule(self._enable_event(expr), _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 400
+        assert "minute field" in body["error"]
+        mock_scheduler.create_schedule.assert_not_called()
+
+    def test_rejects_one_time_at_expression(self):
+        """A one-time schedule fires once and then sits there dead."""
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {"sourceType": "DATABASE"}
+
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}._get_scheduler", return_value=MagicMock()),
+        ):
+            event = self._enable_event("at(2026-01-01T00:00:00)")
+            status, body = _parse(_dr._handle_put_rescan_schedule(event, _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 400
+        assert "one-time" in body["error"]
+
+    def test_rolls_back_the_schedule_when_the_record_write_fails(self):
+        """The schedule is live by then. Leaving it would re-scan the source on a
+        cadence its record does not carry, so nothing would surface it and only
+        source deletion would reap it."""
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {"sourceType": "DATABASE"}
+        mock_dao.update.side_effect = ClientError({"Error": {"Code": "ThrottlingException"}}, "UpdateItem")
+        mock_scheduler = MagicMock()
+
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}._get_scheduler", return_value=mock_scheduler),
+            patch(f"{_DR}._RESCAN_SCHEDULE_GROUP", "grp"),
+            patch(f"{_DR}._RESCAN_TARGET_ARN", "arn:lambda"),
+            patch(f"{_DR}._RESCAN_SCHEDULE_ROLE_ARN", "arn:role"),
+        ):
+            status, _ = _parse(_dr._handle_put_rescan_schedule(self._enable_event(), _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 500
+        mock_scheduler.create_schedule.assert_called_once()
+        mock_scheduler.delete_schedule.assert_called_once()
+
+    def test_disable_does_not_recreate_the_schedule_when_the_write_fails(self):
+        """The disable path already deleted it; failing forward is the safe
+        direction, and recreating it would resume unwanted rescans."""
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {"sourceType": "DATABASE"}
+        mock_dao.update.side_effect = ClientError({"Error": {"Code": "ThrottlingException"}}, "UpdateItem")
+        mock_scheduler = MagicMock()
+
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}._get_scheduler", return_value=mock_scheduler),
+            patch(f"{_DR}._RESCAN_SCHEDULE_GROUP", "grp"),
+        ):
+            status, _ = _parse(
+                _dr._handle_put_rescan_schedule({"body": json.dumps({"enabled": False})}, _NAMESPACE_ID, _SOURCE_ID)
+            )
+
+        assert status == 500
+        mock_scheduler.create_schedule.assert_not_called()
+        # Exactly the one delete from the disable itself, no rollback on top.
+        assert mock_scheduler.delete_schedule.call_count == 1
+
+
+@pytest.mark.unit
+class TestHandlePutEventRescan:
+    """Event-driven rescan config (#683 R8)."""
+
+    def _glue_item(self) -> dict:
+        return {
+            "sourceType": "DATABASE",
+            "sourceSubType": "GLUE_DATABASE",
+            "configuration": json.dumps({"databaseName": "analytics_db", "catalogId": "1"}),
+        }
+
+    def test_enable_creates_rule_and_persists(self):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = self._glue_item()
+        mock_events = MagicMock()
+
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}._get_events", return_value=mock_events),
+            patch(f"{_DR}._GLUE_EVENT_QUEUE_ARN", "arn:aws:sqs:us-east-1:1:glue-q"),
+            patch(f"{_DR}._GLUE_EVENT_RULE_PREFIX", "coa-dev-glue-rescan"),
+        ):
+            event = {"body": json.dumps({"enabled": True})}
+            status, body = _parse(_dr._handle_put_event_rescan(event, _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 200
+        assert body["eventRescan"] == {"enabled": True}
+        mock_events.put_rule.assert_called_once()
+        # Rule pattern targets the source's Glue database.
+        pattern = json.loads(mock_events.put_rule.call_args[1]["EventPattern"])
+        assert pattern["source"] == ["aws.glue"]
+        assert pattern["detail"]["databaseName"] == ["analytics_db"]
+        allowed = pattern["detail"]["typeOfChange"]
+        assert set(allowed) == {
+            "CreateTable",
+            "DeleteTable",
+            "BatchDeleteTable",
+            "UpdateTable",
+            "CreateDatabase",
+            "DeleteDatabase",
+        }
+        # Partition ops are data, not schema, so they must never re-scan.
+        for partition_op in (
+            "CreatePartition",
+            "BatchCreatePartition",
+            "UpdatePartition",
+            "DeletePartition",
+            "BatchUpdatePartition",
+            "BatchDeletePartition",
+        ):
+            assert partition_op not in allowed
+        # Target routes a constant EVENT payload to the queue.
+        target = mock_events.put_targets.call_args[1]["Targets"][0]
+        assert target["Arn"] == "arn:aws:sqs:us-east-1:1:glue-q"
+        tmpl = json.loads(target["InputTransformer"]["InputTemplate"])
+        assert tmpl == {"namespaceId": _NAMESPACE_ID, "sourceId": _SOURCE_ID, "trigger": "EVENT"}
+
+    def test_disable_deletes_rule_and_persists(self):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = self._glue_item()
+        mock_events = MagicMock()
+
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}._get_events", return_value=mock_events),
+            patch(f"{_DR}._GLUE_EVENT_RULE_PREFIX", "coa-dev-glue-rescan"),
+        ):
+            event = {"body": json.dumps({"enabled": False})}
+            status, body = _parse(_dr._handle_put_event_rescan(event, _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 200
+        assert body["eventRescan"] == {"enabled": False}
+        mock_events.delete_rule.assert_called_once()
+        mock_events.put_rule.assert_not_called()
+
+    def test_rejects_jdbc_source(self):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {"sourceType": "DATABASE", "sourceSubType": "JDBC_DATABASE"}
+
+        with patch(f"{_DR}._get_dao", return_value=mock_dao):
+            event = {"body": json.dumps({"enabled": True})}
+            status, _ = _parse(_dr._handle_put_event_rescan(event, _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 400
+
+    def test_rejects_documents_source(self):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {"sourceType": "DOCUMENTS"}
+
+        with patch(f"{_DR}._get_dao", return_value=mock_dao):
+            event = {"body": json.dumps({"enabled": True})}
+            status, _ = _parse(_dr._handle_put_event_rescan(event, _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 400
+
+    def test_enable_when_not_configured_returns_500(self):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = self._glue_item()
+
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}._GLUE_EVENT_QUEUE_ARN", ""),
+            patch(f"{_DR}._GLUE_EVENT_RULE_PREFIX", ""),
+        ):
+            event = {"body": json.dumps({"enabled": True})}
+            status, _ = _parse(_dr._handle_put_event_rescan(event, _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 500
+
+    def test_source_not_found_returns_404(self):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = None
+
+        with patch(f"{_DR}._get_dao", return_value=mock_dao):
+            event = {"body": json.dumps({"enabled": True})}
+            status, _ = _parse(_dr._handle_put_event_rescan(event, _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 404
+
+    def test_rolls_back_the_rule_when_the_record_write_fails(self):
+        """The rule is live by then, so leaving it would keep firing while the
+        record and the console both read OFF."""
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = self._glue_item()
+        mock_dao.update.side_effect = ClientError({"Error": {"Code": "ThrottlingException"}}, "UpdateItem")
+        mock_events = MagicMock()
+
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}._get_events", return_value=mock_events),
+            patch(f"{_DR}._GLUE_EVENT_QUEUE_ARN", "arn:aws:sqs:us-east-1:1:glue-q"),
+            patch(f"{_DR}._GLUE_EVENT_RULE_PREFIX", "coa-dev-glue-rescan"),
+        ):
+            event = {"body": json.dumps({"enabled": True})}
+            status, _ = _parse(_dr._handle_put_event_rescan(event, _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 500
+        mock_events.put_rule.assert_called_once()
+        mock_events.delete_rule.assert_called_once()
+
+    def test_disable_does_not_recreate_the_rule_when_the_write_fails(self):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = self._glue_item()
+        mock_dao.update.side_effect = ClientError({"Error": {"Code": "ThrottlingException"}}, "UpdateItem")
+        mock_events = MagicMock()
+
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}._get_events", return_value=mock_events),
+            patch(f"{_DR}._GLUE_EVENT_QUEUE_ARN", "arn:aws:sqs:us-east-1:1:glue-q"),
+            patch(f"{_DR}._GLUE_EVENT_RULE_PREFIX", "coa-dev-glue-rescan"),
+        ):
+            event = {"body": json.dumps({"enabled": False})}
+            status, _ = _parse(_dr._handle_put_event_rescan(event, _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 500
+        mock_events.put_rule.assert_not_called()
+        assert mock_events.delete_rule.call_count == 1
+
+    @pytest.mark.parametrize(
+        ("config", "needle"),
+        [
+            ({"databaseName": "db", "catalogId": "1", "region": "eu-west-1"}, "must be in us-east-1"),
+            ({"databaseName": "db", "catalogId": "999999999999"}, "must be in account 1"),
+            (
+                {"databaseName": "db", "catalogId": "1", "crossAccountRoleArn": "arn:aws:iam::999:role/x"},
+                "cross-account",
+            ),
+        ],
+    )
+    def test_rejects_a_catalog_this_bus_cannot_observe(self, config, needle):
+        """Glue publishes to the default bus in its own account and region, so a
+        remote catalog would never deliver while the API reported success."""
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {
+            "sourceType": "DATABASE",
+            "sourceSubType": "GLUE_DATABASE",
+            "configuration": json.dumps(config),
+        }
+        mock_events = MagicMock()
+
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}._get_events", return_value=mock_events),
+            patch(f"{_DR}._AWS_REGION", "us-east-1"),
+            patch(f"{_DR}._GLUE_EVENT_QUEUE_ARN", "arn:aws:sqs:us-east-1:1:glue-q"),
+            patch(f"{_DR}._GLUE_EVENT_RULE_PREFIX", "coa-dev-glue-rescan"),
+        ):
+            event = {"body": json.dumps({"enabled": True})}
+            status, body = _parse(_dr._handle_put_event_rescan(event, _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 400
+        assert needle in body["error"]
+        mock_events.put_rule.assert_not_called()
+
+    def test_disable_is_allowed_for_a_remote_catalog(self):
+        """Turning it off must always work, including to clean up a rule created
+        before this check existed."""
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {
+            "sourceType": "DATABASE",
+            "sourceSubType": "GLUE_DATABASE",
+            "configuration": json.dumps({"databaseName": "db", "catalogId": "1", "region": "eu-west-1"}),
+        }
+
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}._get_events", return_value=MagicMock()),
+            patch(f"{_DR}._AWS_REGION", "us-east-1"),
+            patch(f"{_DR}._GLUE_EVENT_QUEUE_ARN", "arn:aws:sqs:us-east-1:1:glue-q"),
+        ):
+            event = {"body": json.dumps({"enabled": False})}
+            status, _ = _parse(_dr._handle_put_event_rescan(event, _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 200

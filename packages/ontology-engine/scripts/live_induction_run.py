@@ -186,12 +186,50 @@ def sparql_update(u: str) -> None:
 # ── Direct in-process orchestration (the code the API routes call) ─────
 
 
-def run_induction_direct(ontology_uri: str, datasource_ids: list[str], label: str) -> str:
+# Grounding-capable strategies. Must be a subset of the induction STRATEGIES
+# registry (coa_ontology.inducer.strategies) — the harness only drives the
+# structured ``table_to_ontology`` pipeline. ``rigor_ontology`` is registered but
+# deliberately ``del``\\ s the grounding scope, so it never grounds and is
+# excluded. (``unstructured_lexical_graph`` is a separate dispatch path, not in
+# STRATEGIES and not driven here, so it is intentionally not listed.)
+_GROUNDING_CAPABLE_STRATEGIES = frozenset({"table_to_ontology"})
+
+
+def _grounding_gate_should_fail(grounding_keys, strategy, grounding_used) -> bool:
+    """Return True when a grounding-capable run was ASKED to ground but didn't (#175).
+
+    The reported #175 defect was a green run that never actually grounded (empty
+    scope → recall returns [] for every table, logs "empty grounding scope", run
+    still reports success). This is the fail-loud predicate: grounding was
+    requested (non-empty ``grounding_keys``) under a grounding-capable
+    ``strategy``, yet ``grounding_used`` (report.grounding_ontologies_used) is
+    empty. An all-novel run (no keys) and a ``rigor_ontology`` run (scope deleted
+    by design) are both legitimate and never trip this gate.
+    """
+    return bool(grounding_keys) and strategy in _GROUNDING_CAPABLE_STRATEGIES and not grounding_used
+
+
+def run_induction_direct(
+    ontology_uri: str,
+    datasource_ids: list[str],
+    label: str,
+    grounding_ontology_ids: list[str] | None = None,
+    strategy: str | None = None,
+    grounding_mode: str | None = None,
+) -> str:
     """Call the exact same code ``POST /induce/`` would, synchronously.
 
     ``_run_induction`` is normally launched on a background Thread by
     the FastAPI handler; here we call it inline so the debugger can step
     through every line.
+
+    ``grounding_ontology_ids`` (curated catalog keys and/or already-resolved
+    URIs) are passed through unchanged — ``_run_induction`` resolves + loads
+    them via ``_load_grounding_ontologies`` exactly as the API path does, then
+    hands them to the strategy. Grounding is only exercised on a
+    grounding-capable strategy (``table_to_ontology`` / the unstructured
+    lexical graph); ``rigor_ontology`` deletes the scope by design, so pass a
+    grounding-capable ``strategy`` when grounding is intended (#175).
     """
     from coa_ontology import induce_catalog
     from coa_ontology.bedrock_embeddings import BedrockEmbeddingClient
@@ -239,13 +277,21 @@ def run_induction_direct(ontology_uri: str, datasource_ids: list[str], label: st
     }
 
     # Build the induction request the same shape the router does.
+    # Grounding is only meaningful on a grounding-capable strategy: the default
+    # is now ``table_to_ontology`` (the production structured strategy that
+    # actually grounds), NOT ``rigor_ontology`` — which does ``del
+    # grounding_ontology_ids`` and would silently ignore any scope (#175).
+    resolved_strategy = strategy or os.environ.get("INDUCTION_STRATEGY", "table_to_ontology")
+    resolved_grounding_mode = grounding_mode or os.environ.get("INDUCTION_GROUNDING_MODE", "ENHANCED")
     body = induce_catalog.WorkbenchInductionRequest(
         datasource_ids=datasource_ids,
         ontology_uri_prefix=ontology_uri,
         namespace=os.environ.get("INDUCTION_NAMESPACE", "default"),
         label=label,
         confidence_threshold=0.80,
-        strategy=os.environ.get("INDUCTION_STRATEGY", "rigor_ontology"),
+        strategy=resolved_strategy,
+        grounding_ontology_ids=grounding_ontology_ids or None,
+        grounding_mode=resolved_grounding_mode,
     )
     job_id = str(uuid.uuid4())
 
@@ -285,8 +331,86 @@ def run_induction_direct(ontology_uri: str, datasource_ids: list[str], label: st
     return job_id
 
 
+# Accept is ASYNC: ``accept_proposal`` returns HTTP 202 with an
+# ``AcceptProposalResponse`` (``proposal_id`` + ``status``) the instant a
+# background worker starts, and ``status`` is ``"accepting"`` — NOT
+# ``"accepted"``. The worker later flips the proposal's DDB row to the
+# terminal ``accepted`` (success) or ``accept_failed`` (with ``accept_error``
+# naming the failed step) state. The bundled harness previously subscripted
+# the response (``a["status"]``) — a ``TypeError`` on a pydantic model — and
+# asserted ``status == "accepted"`` synchronously, so it never completed
+# against the release it ships with (issue #175). The fix polls the proposal
+# to a terminal state, exactly as any real client must.
+def _positive_int_env(name: str, default: int, *, maximum: int) -> int:
+    """Parse a positive-int env var, failing loudly on bad input (issue #175 fail-loud)."""
+    raw = os.environ.get(name, str(default))
+    try:
+        value = int(raw)
+    except ValueError as e:
+        raise RuntimeError(f"{name} must be a valid integer, got {raw!r}") from e
+    if value <= 0:
+        raise RuntimeError(f"{name} must be a positive integer, got {value}")
+    return min(value, maximum)
+
+
+_ACCEPT_POLL_TIMEOUT_S = _positive_int_env("INDUCTION_ACCEPT_POLL_TIMEOUT_S", 300, maximum=3600)
+_ACCEPT_POLL_INTERVAL_S = 2
+
+
+def _poll_proposal_terminal(proposal_id: str, namespace: str) -> dict:
+    """Poll ``GET /proposals/{id}`` until the accept reaches a terminal state.
+
+    Returns the terminal proposal record. Raises ``TimeoutError`` if the
+    proposal is still ``accepting`` / ``embeddings_sync`` after the timeout,
+    and ``RuntimeError`` if it lands ``accept_failed`` (surfacing
+    ``accept_error`` so a failed accept reads as a failure, not a success).
+    """
+    from coa_control_plane_server.models.proposal_status import ProposalStatus
+    from coa_ontology import dynamo_store
+    from coa_ontology.proposals import (
+        _ACCEPT_IN_PROGRESS_STATUSES,
+        PROPOSAL_STATUS_ACCEPT_FAILED,
+    )
+
+    deadline = time.time() + _ACCEPT_POLL_TIMEOUT_S
+    last_status = None
+    while True:
+        item = dynamo_store.get_proposal_by_id(proposal_id, namespace=namespace)
+        if not item:
+            raise RuntimeError(f"proposal {proposal_id} disappeared while polling accept")
+        status = item.get("status")
+        if status is None:
+            raise RuntimeError(f"proposal {proposal_id} has no status field: {item!r}")
+        if status != last_status:
+            print(f"    accept poll: status={status}", flush=True)
+            last_status = status
+        if status == ProposalStatus.ACCEPTED.value:
+            return item
+        if status == PROPOSAL_STATUS_ACCEPT_FAILED:
+            raise RuntimeError(f"accept failed for {proposal_id}: {item.get('accept_error') or '(no accept_error)'}")
+        if status not in _ACCEPT_IN_PROGRESS_STATUSES:
+            # Any other non-terminal status is unexpected during accept.
+            raise RuntimeError(f"unexpected proposal status during accept: {status!r}")
+        if time.time() >= deadline:
+            raise TimeoutError(f"accept for {proposal_id} still {status!r} after {_ACCEPT_POLL_TIMEOUT_S}s")
+        time.sleep(_ACCEPT_POLL_INTERVAL_S)
+
+
 def accept_proposal_direct(proposal_id: str, namespace: str = "default") -> dict:
-    """Call :func:`app.proposals.accept_proposal` in-process.
+    """Accept a proposal in-process and BLOCK until it reaches a terminal state.
+
+    Calls :func:`app.proposals.accept_proposal` (which returns 202 +
+    ``status="accepting"`` and spawns a background worker), then polls the
+    proposal to the terminal ``accepted`` state. Returns a normalized dict:
+
+        {"proposal_id", "status", "ontology_id", "graph_uri",
+         "already_accepted": bool, "proposal": <terminal proposal record>}
+
+    ``already_accepted`` is True when the proposal was ALREADY ``accepted``
+    before this call (``accept_proposal`` short-circuits and returns
+    ``status="accepted"`` immediately with no new worker) — that is the
+    idempotent re-accept signal (there is no ``"already_accepted"`` status in
+    the API; #175 asserted one that never existed).
 
     When ``INDUCTION_TARGET_ONTOLOGY_ID`` is set in the environment, every
     proposal accept is merged under that single target ontology (using
@@ -294,6 +418,7 @@ def accept_proposal_direct(proposal_id: str, namespace: str = "default") -> dict
     uses its own embedded ``ontology_id`` — the original per-proposal
     behaviour.
     """
+    from coa_control_plane_server.models.proposal_status import ProposalStatus
     from coa_ontology.proposals import AcceptProposalRequest, accept_proposal
 
     raw_target = os.environ.get("INDUCTION_TARGET_ONTOLOGY_ID")
@@ -303,7 +428,48 @@ def accept_proposal_direct(proposal_id: str, namespace: str = "default") -> dict
     else:
         target = None
     body = AcceptProposalRequest(ontology_id=target) if target else None
-    return accept_proposal(proposal_id, body=body, namespace=namespace)
+
+    resp = accept_proposal(proposal_id, body=body, namespace=namespace)
+    # 202 fast-path idempotency: an already-accepted proposal returns
+    # status="accepted" WITHOUT starting a worker (proposals.accept_proposal
+    # short-circuit). Anything else is "accepting" → poll to terminal.
+    already_accepted = resp.status == ProposalStatus.ACCEPTED.value
+    if not already_accepted and resp.status != ProposalStatus.ACCEPTING.value:
+        raise RuntimeError(f"expected 202 accept status 'accepting', got {resp.status!r}")
+    item = _poll_proposal_terminal(proposal_id, namespace=namespace)
+
+    from coa_ontology.stores.neptune_db_graph import _ontology_graph_uri
+
+    ontology_id = item.get("ontology_id") or (target or "")
+
+    # Embedding count for the OSS-visibility poll (§_verify_opensearch_neptune).
+    # The async accept worker no longer returns an in-process ingest result, so
+    # read the authoritative deduped count off the ontology registry row that
+    # the worker wrote. 0/absent → the poll's target is 0 (passes on first
+    # visible doc) rather than asserting a count we can't know.
+    # NOTE (weakened check): on the absent-row path this degrades the downstream
+    # OSS-visibility poll to "pass on the first visible doc" — it cannot assert
+    # the true ingested count. This is the same absent→benign-default class #175
+    # was about; if registry-row propagation becomes reliably synchronous here,
+    # tighten this to require the row and assert its count.
+    embedding_count = 0
+    if ontology_id:
+        from coa_ontology import dynamo_store
+
+        for row in dynamo_store.list_ontologies_registry(namespace=namespace) or []:
+            if str(row.get("ontology_id")) == str(ontology_id):
+                embedding_count = int(row.get("embedding_count") or 0)
+                break
+
+    return {
+        "proposal_id": proposal_id,
+        "status": item.get("status"),
+        "ontology_id": ontology_id,
+        "graph_uri": _ontology_graph_uri(ontology_id, namespace) if ontology_id else "",
+        "embeddings": {"count": embedding_count},
+        "already_accepted": already_accepted,
+        "proposal": item,
+    }
 
 
 def datetime_utcnow_iso() -> str:
@@ -568,24 +734,54 @@ def _run_one_iteration(idx: int, total: int, datasource_id: str, label: str) -> 
     print(f"  ontology_uri: {ontology_uri}")
     print("═" * 60)
 
+    # Grounding scope for this run. Curated catalog keys and/or resolved URIs,
+    # comma-separated in INDUCTION_GROUNDING_KEYS (e.g. "fibo-agreements").
+    # Empty → a pure all-novel induction (no grounding requested), which is a
+    # legitimate mode; the fail-loud gate below only fires when grounding WAS
+    # requested but produced nothing.
+    grounding_keys = [k.strip() for k in os.environ.get("INDUCTION_GROUNDING_KEYS", "").split(",") if k.strip()]
+    strategy = os.environ.get("INDUCTION_STRATEGY", "table_to_ontology")
+
     # ── induction (synchronous, in-process) ─────────────────────────
     with Step(f"{tag} induction pipeline"):
         job_id = run_induction_direct(
             ontology_uri=ontology_uri,
             datasource_ids=[datasource_id],
             label=label,
+            grounding_ontology_ids=grounding_keys or None,
+            strategy=strategy,
         )
 
     from coa_ontology import induce_catalog
 
     job = induce_catalog._jobs[job_id]
     report = job.report
+    grounding_used = list(getattr(report, "grounding_ontologies_used", []) or [])
     print(f"  job_id={job_id}")
     print(
         f"  tables={report.tables_processed}  "
         f"columns={report.columns_processed}  "
-        f"novel_classes={report.novel_classes_created}"
+        f"novel_classes={report.novel_classes_created}  "
+        f"grounded_to={grounding_used}"
     )
+
+    # ── FAIL LOUD: grounding requested but never took effect (#175) ──
+    # The reported #175 defect was that the harness "passed" while grounding
+    # was never attempted (empty scope → grounding recall returns [] for every
+    # table, logs "empty grounding scope", run still reports success). Guard it:
+    # when a grounding-capable strategy was asked to ground against a non-empty
+    # scope, at least one class must have grounded to a loaded ontology, else the
+    # run must NOT be green. Note the gate cannot distinguish "scope failed to
+    # load/resolve" from "scope loaded but the reranker matched nothing" — both
+    # trip it, and both are runs that did not actually ground.
+    if _grounding_gate_should_fail(grounding_keys, strategy, grounding_used):
+        raise RuntimeError(
+            f"{tag} grounding was requested (scope={grounding_keys}, strategy={strategy}) "
+            f"but report.grounding_ontologies_used is empty — either the grounding scope "
+            f"failed to resolve/load, or it loaded but nothing matched. Refusing to report "
+            f"success on a run that never actually grounded (issue #175). Check the "
+            f"foundational loader logs for the scope keys."
+        )
 
     proposal_id = report.induced_ontology_id
 
@@ -604,24 +800,27 @@ def _run_one_iteration(idx: int, total: int, datasource_id: str, label: str) -> 
     if r2rml:
         print(f"\n── proposal R2RML ({len(r2rml)} bytes) ──\n{r2rml}")
 
-    # ── accept directly ─────────────────────────────────────────────
+    # ── accept directly (ASYNC: polls to terminal 'accepted') ───────
     with Step(f"{tag} accept_proposal({proposal_id})"):
         a = accept_proposal_direct(proposal_id, namespace=ns)
     print(f"  response: {a}")
-    assert a["status"] == "accepted", a
+    # accept_proposal_direct polls to a terminal state, so status is the
+    # authoritative terminal 'accepted' here (it raises on accept_failed /
+    # timeout). #175: the API never returns 'accepted' synchronously.
+    if a["status"] != "accepted":
+        raise RuntimeError(f"first accept did not reach terminal 'accepted': {a}")
+    if a["already_accepted"]:
+        raise RuntimeError("first accept should not report already-accepted")
     # The accepted ontology_id is the TARGET when INDUCTION_TARGET_ONTOLOGY_ID
-    # is set, else the proposal's own ontology_id. Either way the accept
-    # response tells us authoritatively which ontology was touched.
+    # is set, else the proposal's own ontology_id.
     target_ontology = a["ontology_id"]
     raw_target = os.environ.get("INDUCTION_TARGET_ONTOLOGY_ID")
     expected_target = f"https://live-test.coa.amazon.com/{ns}/{raw_target}" if raw_target else ontology_uri
     assert target_ontology == expected_target, (target_ontology, expected_target)
-    # Neptune DB returns "ok" (GSP load); NA returns "skipped" (no Turtle load).
-    assert a["turtle_load"]["status"] in ("ok", "skipped")
 
-    # The named graph URI is the one the accept response reported. That
-    # matches either the proposal's own ontology_uri (default) or the
-    # merge target (when INDUCTION_TARGET_ONTOLOGY_ID is set).
+    # The named graph URI reported by accept_proposal_direct (derived from the
+    # terminal ontology_id) — matches either the proposal's own ontology_uri
+    # (default) or the merge target (when INDUCTION_TARGET_ONTOLOGY_ID is set).
     from coa_ontology.stores.neptune_db_graph import _ontology_graph_uri
 
     verify_graph = a.get("graph_uri") or _ontology_graph_uri(target_ontology, ns)
@@ -637,10 +836,18 @@ def _run_one_iteration(idx: int, total: int, datasource_id: str, label: str) -> 
         n_triples = expected = visible = 0
 
     # ── idempotent re-accept ────────────────────────────────────────
+    # A second accept of an already-accepted proposal short-circuits in the
+    # 202 handler and returns status='accepted' WITHOUT a new worker. There is
+    # no 'already_accepted' status in the API (#175 asserted one that never
+    # existed) — the idempotency signal is accept_proposal_direct's
+    # already_accepted flag.
     with Step(f"{tag} re-accept (should short-circuit)"):
         a2 = accept_proposal_direct(proposal_id, namespace=ns)
         print(f"  {a2}")
-        assert a2["status"] == "already_accepted"
+        if a2["status"] != "accepted":
+            raise RuntimeError(f"re-accept did not report terminal 'accepted': {a2}")
+        if not a2["already_accepted"]:
+            raise RuntimeError("re-accept of an accepted proposal must report already-accepted")
 
     # ── NEW ENTITIES DISCOVERED (parse the proposal graph) ──────────
     entities = _analyze_new_entities(turtle, ontology_uri)
@@ -960,7 +1167,7 @@ def main() -> int:
     print("  Live induction + ingest run (direct, no FastAPI)")
     print("  account:       (set via AWS_PROFILE / AWS credentials)")
     print(f"  backend:       {os.environ['WORKBENCH_BACKEND']}")
-    print(f"  strategy:      {os.environ.get('INDUCTION_STRATEGY', 'rigor_ontology')}")
+    print(f"  strategy:      {os.environ.get('INDUCTION_STRATEGY', 'table_to_ontology')}")
     print(f"  namespace:     {os.environ.get('INDUCTION_NAMESPACE', 'default')}")
     print(f"  llm_model:     {os.environ.get('LLM_MODEL_ID', '(default)')}")
     if BACKEND == "opensearch_neptune":

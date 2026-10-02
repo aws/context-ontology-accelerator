@@ -329,6 +329,25 @@ describe("NetworkStack", () => {
       const outputs = template.findOutputs("VpcId");
       expect(Object.keys(outputs).length).toBe(1);
     });
+
+    // Read by scripts/deploy-managed-databricks-connector.sh, which attaches the COA-operated
+    // connector to this VPC. The env segment keeps two environments in one account apart.
+    it("publishes the VPC ID and private subnet IDs under the environment's SSM path", () => {
+      const template = buildStack({ resource_prefix: "scl", env: "beta" });
+      template.hasResourceProperties("AWS::SSM::Parameter", {
+        Name: "/scl/beta/network/vpc-id",
+        Value: { Ref: Match.stringLikeRegexp("Vpc") },
+      });
+      const subnets = template.findResources("AWS::SSM::Parameter", {
+        Properties: { Name: "/scl/beta/network/private-subnet-ids" },
+      });
+      const [param] = Object.values(subnets) as any[];
+      expect(param).toBeDefined();
+      // Both private subnets and no public one: a Lambda in a public subnet gets no egress.
+      const joined = JSON.stringify(param.Properties.Value);
+      expect(joined.match(/PrivateSubnet/g)).toHaveLength(2);
+      expect(joined).not.toMatch(/PublicSubnet/);
+    });
   });
 
   describe("Cross-network JDBC connectivity", () => {

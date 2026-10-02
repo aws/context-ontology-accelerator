@@ -220,8 +220,60 @@ export class StorageStack extends SCLStack {
     );
 
     const maxOcu = Number(this.node.tryGetContext("aoss_max_ocu") ?? 96);
-    // NEXTGEN valid min OCU values: 0, 2, 4, 8, 16, or multiples of 16
+    // NEXTGEN valid min OCU values: 0, 2, 4, 8, 16, or multiples of 16.
     const minOcu = Number(this.node.tryGetContext("aoss_min_ocu") ?? 2);
+
+    // Validate min/max OCU explicitly rather than passing an arbitrary
+    // `-c aoss_min_ocu=<n>` straight through to CloudFormation. Two failure
+    // modes this guards against (see #173):
+    //   1. An out-of-range value (e.g. 3, 6, or negative) is only rejected
+    //      LATER by CloudFormation with an opaque error, after a slow stack
+    //      update.
+    //   2. minOcu=0 is a VALID value but has a correctness consequence: it lets
+    //      the collection scale indexing capacity to zero, so under load the
+    //      NEXTGEN circuit breaker sheds bulk writes with 429s. That is exactly
+    //      the condition that produced the #173 silent partial-index. It is
+    //      permitted (useful for cost in dev) but must be a DELIBERATE choice —
+    //      we emit a loud synth-time warning so nobody sets it unaware that
+    //      ingest can now be throttled into partial writes (the runtime path
+    //      fails loud rather than silently after the #173 fix, but 0 makes it
+    //      fire far more often).
+    //
+    // NEXTGEN valid OCU values (both min and max): 0, 2, 4, 8, 16, or a
+    // multiple of 16, up to a maximum of 1696 (per AWS collection-group
+    // capacity limits). max additionally cannot be 0 (it is a ceiling).
+    const MAX_OCU_LIMIT = 1696;
+    const BASE_VALID_OCU = new Set([0, 2, 4, 8, 16]);
+    const isValidOcuValue = (v: number) =>
+      Number.isInteger(v) &&
+      v >= 0 &&
+      v <= MAX_OCU_LIMIT &&
+      (BASE_VALID_OCU.has(v) || (v > 16 && v % 16 === 0));
+    if (!isValidOcuValue(minOcu)) {
+      throw new Error(
+        `aoss_min_ocu=${this.node.tryGetContext("aoss_min_ocu")} is invalid. ` +
+          `NEXTGEN min OCU must be 0, 2, 4, 8, 16, or a multiple of 16, up to ${MAX_OCU_LIMIT}.`,
+      );
+    }
+    if (!isValidOcuValue(maxOcu) || maxOcu < 2) {
+      throw new Error(
+        `aoss_max_ocu=${this.node.tryGetContext("aoss_max_ocu")} is invalid. ` +
+          `NEXTGEN max OCU must be 2, 4, 8, 16, or a multiple of 16, up to ${MAX_OCU_LIMIT}.`,
+      );
+    }
+    if (minOcu > maxOcu) {
+      throw new Error(
+        `aoss_min_ocu (${minOcu}) cannot exceed aoss_max_ocu (${maxOcu}).`,
+      );
+    }
+    if (minOcu === 0) {
+      cdk.Annotations.of(this).addWarning(
+        `AOSS min OCU is 0: indexing capacity can scale to zero, so under load the ` +
+          `NEXTGEN circuit breaker sheds bulk writes with HTTP 429. Ingest re-submits and ` +
+          `now fails LOUD on unrecoverable partial writes (see #173), but 0 makes throttling ` +
+          `far more likely. Use a non-zero floor (e.g. 2) for ingest-heavy environments.`,
+      );
+    }
 
     // NEXTGEN collection groups require standbyReplicas=ENABLED.
     // AWS rejects DISABLED for NEXTGEN generation (replicas managed internally).

@@ -22,11 +22,15 @@ from coa_ontology.inducer.services.data_catalog import parse_referred_column
 from coa_ontology.inducer.strategies.base import ambiguous_target_names as _ambiguous_target_names
 from coa_ontology.inducer.strategies.base import composite_fk_anchors as _composite_fk_anchors
 from coa_ontology.inducer.strategies.base import composite_fk_columns as _composite_fk_columns
+from coa_ontology.inducer.strategies.base import fk_edge_allowed as _fk_edge_allowed
+from coa_ontology.inducer.strategies.base import fk_property_local_name as _fk_property_local_name
+from coa_ontology.inducer.strategies.base import fk_property_qualifiers as _fk_property_qualifiers
 from coa_ontology.inducer.strategies.base import pascal_names_for as _pascal_names_for
 from coa_ontology.inducer.strategies.base import reference_index as _reference_index
 from coa_ontology.inducer.strategies.base import (
     resolve_fk_target_identity as _resolve_fk_target_identity,
 )
+from coa_ontology.inducer.strategies.base import simple_fk_constraints as _simple_fk_constraints
 from coa_ontology.inducer.strategies.base import table_identity as _table_identity
 from coa_ontology.inducer.strategies.base import to_camel as _to_camel
 from coa_ontology.inducer.strategies.base import to_pascal as _to_pascal
@@ -120,7 +124,12 @@ def generate_config_from_db(tables, uri_prefix: str) -> ConstraintConfig:
 
         pk_cols: set[str] = set()
         unique_cols: set[str] = set()
-        fk_map: dict[str, str] = {}
+        # column -> the FK targets it carries: (target table name, target datasource id).
+        # EVERY gate-passing single-column FK (#1088 follow-up), through the same
+        # selection the ontology and the mapping use, so the shape asserts
+        # sh:class on exactly the properties those two artifacts made references —
+        # and nothing on a withheld (pending/rejected) relationship.
+        fk_targets: dict[str, list[tuple[str, str | None, str | None]]] = {}
 
         if table.tableConstraints:
             for tc in table.tableConstraints:
@@ -128,19 +137,6 @@ def generate_config_from_db(tables, uri_prefix: str) -> ConstraintConfig:
                     pk_cols.update(tc.columns)
                 elif tc.constraintType == "UNIQUE" and tc.columns and len(tc.columns) == 1:
                     unique_cols.update(tc.columns)
-                elif tc.constraintType == "FOREIGN_KEY" and tc.columns and tc.referredColumns:
-                    fk_target, _ = parse_referred_column(tc.referredColumns[0])
-                    # Single-column FKs only. A composite FK is handled below, via
-                    # the same anchor/absorbed split the mapping and ontology use:
-                    # putting every one of its columns here gave the absorbed ones a
-                    # REFERENCE constraint, which compiles to sh:nodeKind sh:IRI +
-                    # sh:class — while the mapping emits an rr:datatype literal for
-                    # the same column and the ontology declares it an
-                    # owl:DatatypeProperty. The shape would then assert a class-typed
-                    # reference against data that is literal by design: a violation
-                    # on every row of every composite-FK child table.
-                    if len(tc.columns) == 1:
-                        fk_map[tc.columns[0]] = fk_target
 
             # Composite FKs: only the anchor column carries the relationship (the
             # mapping emits one Referencing Object Map per anchor, R2RML §7.5).
@@ -153,81 +149,111 @@ def generate_config_from_db(tables, uri_prefix: str) -> ConstraintConfig:
                 # have referredColumns; the guard is for the type checker.
                 if not tc.referredColumns:
                     continue
-                fk_target, _ = parse_referred_column(tc.referredColumns[0])
-                fk_map[anchor_col] = fk_target
-            for absorbed_col in absorbed:
-                fk_map.pop(absorbed_col, None)
+                if not _fk_edge_allowed(tc.relationshipType, tc.reviewStatus):
+                    continue
+                fk_target, fk_target_col = parse_referred_column(tc.referredColumns[0])
+                fk_targets[anchor_col] = [(fk_target, tc.targetDatasourceId, fk_target_col)]
+            for col in table.columns:
+                if col.name in absorbed or col.name in fk_targets:
+                    continue
+                simple = _simple_fk_constraints(table, col.name)
+                if simple:
+                    fk_targets[col.name] = [
+                        (
+                            parse_referred_column(tc.referredColumns[0])[0],  # type: ignore[index]
+                            tc.targetDatasourceId,
+                            parse_referred_column(tc.referredColumns[0])[1],  # type: ignore[index]
+                        )
+                        for tc in simple
+                    ]
 
         for col in table.columns:
-            prop_path = f"{ns_str}{camel_by_id[identity]}_{_to_camel(col.name)}"
+            base_local = f"{camel_by_id[identity]}_{_to_camel(col.name)}"
             is_pk = col.name in pk_cols
             is_not_null = col.constraint in ("NOT_NULL", "PRIMARY_KEY") or is_pk
             is_unique = col.constraint in ("UNIQUE", "PRIMARY_KEY") or col.name in unique_cols or is_pk
-            is_fk = col.name in fk_map
 
-            if is_not_null:
-                constraints.append(
-                    PropertyConstraint(
-                        property_path=prop_path,
-                        property_name=col.name,
-                        constraint_type=ConstraintType.REQUIRED,
-                        source=ConstraintSource.DB_CONSTRAINT,
-                        description=f"{col.name} is required" + (" (primary key)" if is_pk else " (NOT NULL)"),
-                    )
-                )
-
-            if is_unique:
-                constraints.append(
-                    PropertyConstraint(
-                        property_path=prop_path,
-                        property_name=col.name,
-                        constraint_type=ConstraintType.UNIQUE,
-                        source=ConstraintSource.DB_CONSTRAINT,
-                        description=f"{col.name} must be unique" + (" (primary key)" if is_pk else ""),
-                    )
-                )
-
-            # Resolve the FK target through the shared index so the shape targets
+            # Resolve each FK target through the shared index so the shape targets
             # the same class the ontology declared and the mapping joins to. An
-            # ambiguous bare name resolves to nothing: the ontology declares a
-            # datatype property and the mapping emits rr:datatype for that column,
-            # so a REFERENCE shape (sh:nodeKind sh:IRI + sh:class) would violate on
-            # every row. Such a column falls through to the datatype constraint.
-            target_class: str | None = None
-            if is_fk:
-                fk_target_name = fk_map[col.name]
-                # Same resolution order as the ontology and R2RML builders (own
-                # datasource + own database, then any datasource with that database,
-                # then bare) so the shape targets the class those two artifacts agree
-                # on even when two sources share a database name.
-                target_id = _resolve_fk_target_identity(table, fk_target_name, ref_index)
+            # ambiguous bare name resolves to nothing and THAT relationship is
+            # dropped here exactly as the other two artifacts drop it; when none
+            # resolve the column falls through to the datatype constraint.
+            resolved: list[
+                tuple[str, str, str, str | None, str | None]
+            ] = []  # (class IRI, target local, target name, target column, target ds)
+            for fk_target_name, target_ds, target_col in fk_targets.get(col.name, []):
+                target_local: str | None = None
+                # The relationship's targetDatasourceId goes to the SAME resolver the
+                # ontology and the mapping use, so sh:class names the table they do
+                # (and nothing when several same-named tables sit in that datasource).
+                target_id = _resolve_fk_target_identity(table, fk_target_name, ref_index, target_ds)
                 if target_id in pascal_by_id:
-                    target_class = f"{ns_str}{pascal_by_id[target_id]}"
+                    target_local = pascal_by_id[target_id]
                 elif fk_target_name not in ambiguous_names:
-                    target_class = f"{ns_str}{_to_pascal(fk_target_name)}"
-            if target_class is not None:
-                constraints.append(
-                    PropertyConstraint(
-                        property_path=prop_path,
-                        property_name=col.name,
-                        constraint_type=ConstraintType.REFERENCE,
-                        params={"target_class": target_class},
-                        source=ConstraintSource.DB_CONSTRAINT,
-                        description=f"{col.name} must reference a valid {fk_map[col.name]}",
+                    target_local = _to_pascal(fk_target_name)
+                if target_local is not None:
+                    resolved.append((f"{ns_str}{target_local}", target_local, fk_target_name, target_col, target_ds))
+
+            # One property per relationship (qualified only when the column carries
+            # several) — the same names the ontology mints and the mapping predicates.
+            qualifiers = _fk_property_qualifiers(
+                [(local, target_col, target_ds) for _, local, _, target_col, target_ds in resolved]
+            )
+            properties: list[tuple[str, str | None, str | None]] = (
+                [
+                    (f"{ns_str}{_fk_property_local_name(base_local, qualifier)}", cls, name)
+                    for (cls, _, name, _, _), qualifier in zip(resolved, qualifiers, strict=True)
+                ]
+                if resolved
+                else [(f"{ns_str}{base_local}", None, None)]
+            )
+
+            for prop_path, ref_class, ref_name in properties:
+                if is_not_null:
+                    constraints.append(
+                        PropertyConstraint(
+                            property_path=prop_path,
+                            property_name=col.name,
+                            constraint_type=ConstraintType.REQUIRED,
+                            source=ConstraintSource.DB_CONSTRAINT,
+                            description=f"{col.name} is required" + (" (primary key)" if is_pk else " (NOT NULL)"),
+                        )
                     )
-                )
-            else:
-                xsd_type = str(_xsd_for(col.dataType))
-                constraints.append(
-                    PropertyConstraint(
-                        property_path=prop_path,
-                        property_name=col.name,
-                        constraint_type=ConstraintType.DATATYPE,
-                        params={"xsd_type": xsd_type},
-                        source=ConstraintSource.DB_CONSTRAINT,
-                        description=f"{col.name} must be {col.dataType}",
+
+                if is_unique:
+                    constraints.append(
+                        PropertyConstraint(
+                            property_path=prop_path,
+                            property_name=col.name,
+                            constraint_type=ConstraintType.UNIQUE,
+                            source=ConstraintSource.DB_CONSTRAINT,
+                            description=f"{col.name} must be unique" + (" (primary key)" if is_pk else ""),
+                        )
                     )
-                )
+
+                if ref_class is not None:
+                    constraints.append(
+                        PropertyConstraint(
+                            property_path=prop_path,
+                            property_name=col.name,
+                            constraint_type=ConstraintType.REFERENCE,
+                            params={"target_class": ref_class},
+                            source=ConstraintSource.DB_CONSTRAINT,
+                            description=f"{col.name} must reference a valid {ref_name}",
+                        )
+                    )
+                else:
+                    xsd_type = str(_xsd_for(col.dataType))
+                    constraints.append(
+                        PropertyConstraint(
+                            property_path=prop_path,
+                            property_name=col.name,
+                            constraint_type=ConstraintType.DATATYPE,
+                            params={"xsd_type": xsd_type},
+                            source=ConstraintSource.DB_CONSTRAINT,
+                            description=f"{col.name} must be {col.dataType}",
+                        )
+                    )
 
         if constraints:
             classes.append(ClassConstraints(class_uri=class_uri, class_name=table.name, constraints=constraints))

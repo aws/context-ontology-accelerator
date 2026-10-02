@@ -437,7 +437,11 @@ class TestIngestSurfacesEntityUris:
             g.add((c, RDFS.label, Literal(c.split("/")[-1])))
 
         vec = MagicMock()
-        vec.store_embeddings_batch.return_value = []
+        # #173: _accumulate_embeddings now derives entity_uris/count from the
+        # store's ACKNOWLEDGED docs, not len(submitted). Echo back a doc per
+        # submitted item so the store confirms what it wrote (an empty return
+        # would now correctly be treated as a 0-of-N partial write).
+        vec.store_embeddings_batch.side_effect = lambda items: [dict(it) for it in items]
         vec._index_for_namespace = lambda ns: f"idx-{ns}"
 
         fake_bedrock = MagicMock()

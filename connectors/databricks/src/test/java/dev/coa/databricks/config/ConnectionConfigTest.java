@@ -358,4 +358,66 @@ class ConnectionConfigTest
         assertTrue(!rendered.contains(SECRET), "toString must not carry the secret ARN: " + rendered);
         assertTrue(!rendered.contains(HTTP_PATH), "toString must not carry the HTTP path: " + rendered);
     }
+
+    private static ManagedSource source(String athenaCatalog, String namespaceId)
+    {
+        return ManagedSource.builder()
+                .athenaCatalogName(athenaCatalog)
+                .sourceId("src-abc123")
+                .namespaceId(namespaceId)
+                .crossAccountRoleArn(
+                        "arn:aws:iam::222233334444:role/coa-dev-datasource-access-sales")
+                .build();
+    }
+
+    @Test
+    void anEnvironmentModeConfigurationCarriesNoManagedBlock()
+    {
+        // Absent rather than empty, which is what lets the credential path be selected on this rather than
+        // on a mode flag threaded separately.
+        ConnectionConfig config = valid().build();
+
+        assertFalse(config.isCoaManaged());
+        assertNull(config.managedSource());
+        assertNull(config.sourceId());
+    }
+
+    @Test
+    void aManagedConfigurationExposesItsSourceAndNamespace()
+    {
+        ConnectionConfig config = valid().managedSource(source("coadevds_a", "ns-1")).build();
+
+        assertTrue(config.isCoaManaged());
+        assertEquals("src-abc123", config.sourceId());
+        assertEquals("ns-1", config.managedSource().namespaceId());
+    }
+
+    @Test
+    void withSchemaCarriesTheManagedBlockThrough()
+    {
+        // A pinned copy losing it would lose the role the credential is behind and the catalog name the
+        // configuration cache re-checks against, the second of which fails open rather than closed.
+        ConnectionConfig pinned = valid().managedSource(source("coadevds_a", "ns-1"))
+                .build()
+                .withSchema("finance");
+
+        assertTrue(pinned.isCoaManaged());
+        assertEquals("coadevds_a", pinned.managedSource().athenaCatalogName());
+        assertEquals("finance", pinned.schema());
+    }
+
+    @Test
+    void twoConfigurationsDifferingOnlyInTheirSourceAreNotEqual()
+    {
+        // The schema-list cache keys on this class, and two catalogs that happen to name the same warehouse
+        // and secret still belong to different namespaces.
+        ConnectionConfig a = valid().managedSource(source("coadevds_a", "ns-1")).build();
+        ConnectionConfig b = valid().managedSource(source("coadevds_b", "ns-2")).build();
+
+        assertNotEquals(a, b);
+        assertNotEquals(a, valid().build());
+        assertEquals(a, valid().managedSource(source("coadevds_a", "ns-1")).build());
+        assertEquals(a.hashCode(),
+                valid().managedSource(source("coadevds_a", "ns-1")).build().hashCode());
+    }
 }

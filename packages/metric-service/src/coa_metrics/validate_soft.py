@@ -4,10 +4,11 @@
 """Soft validation — shared by create and update handlers.
 
 Runs Checks 1-6 from the Metric Onboarding Service LLD §5.1.
-Hard errors (Check 1 syntax failures) are returned as warnings here
-since the create/update flow has already validated the request structure.
-Lookups are initialized best-effort — if unavailable, the metric is still
-accepted (only SQL syntax blocks creation).
+SQL findings are returned for diagnostic parity with the explicit validate
+endpoint. Persistence handlers independently enforce syntax, read-only
+semantics, and executable statement shape before calling this best-effort
+advisory path. Catalog and ontology lookup failures therefore cannot discard
+the deterministic SQL checks.
 """
 
 from __future__ import annotations

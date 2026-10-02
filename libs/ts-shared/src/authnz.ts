@@ -11,6 +11,26 @@ export enum PrincipalType {
   GROUP = "Group",
 }
 
+/**
+ * URL-encode a principal identifier for use in a DynamoDB principal key.
+ *
+ * Must stay byte-identical to `sanitize_principal_key` in
+ * `libs/common/src/coa_common/principal_keys.py`, because every reader encodes
+ * before querying the PrincipalIndex GSI: a key written under a different
+ * encoding is silently unresolvable rather than an error. `encodeURIComponent`
+ * alone is not equivalent, it leaves `!'()*` raw and escapes `@` where Python
+ * does the opposite.
+ */
+export function sanitizePrincipalKey(value: string): string {
+  const normalized = value.includes("@") ? value.trim().toLowerCase() : value;
+  return encodeURIComponent(normalized)
+    .replace(
+      /[!'()*]/g,
+      (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`,
+    )
+    .replace(/%40/g, "@");
+}
+
 /** Type of resource a role can be scoped to. */
 export enum ResourceType {
   NAMESPACE = "Namespace",

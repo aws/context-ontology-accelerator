@@ -30,6 +30,8 @@ export { useRescanSource } from "./use-rescan-source";
 export { useListSourceTables } from "./use-list-source-tables";
 export { useGetSourceScanJob } from "./use-get-source-scan-job";
 export { useListSourceScanJobs } from "./use-list-source-scan-jobs";
+export { usePutSourceRescanSchedule } from "./use-put-source-rescan-schedule";
+export { usePutSourceEventRescan } from "./use-put-source-event-rescan";
 export { useUpdateSourceMetadata } from "./use-update-source-metadata";
 export { useApproveSource } from "./use-approve-source";
 export { useRejectSource } from "./use-reject-source";

@@ -325,6 +325,7 @@ export class MetricServiceStack extends SCLStack {
       // recovery timeout to avoid concurrent delivery while throttled.
       visibilityTimeout: cdk.Duration.minutes(3),
       encryption: sqs.QueueEncryption.SQS_MANAGED,
+      enforceSSL: true,
     });
 
     const importQueue = new sqs.Queue(this, "ImportQueue", {
@@ -332,6 +333,7 @@ export class MetricServiceStack extends SCLStack {
       visibilityTimeout: cdk.Duration.minutes(15),
       retentionPeriod: cdk.Duration.days(4),
       encryption: sqs.QueueEncryption.SQS_MANAGED,
+      enforceSSL: true,
       deadLetterQueue: {
         queue: importDlq,
         maxReceiveCount: 6,

@@ -43,8 +43,15 @@ def _stringify_config_value(v: object) -> object:
     array and ECS env-var values must be strings, so: bools -> lower-case
     ``"true"``/``"false"``, lists -> JSON (``preferred_entity_classifications``
     and ``preferred_topics``; the container json.loads them back at boot),
-    ints -> ``str``. Anything already a string (or an unexpected type) passes
-    through unchanged.
+    ints -> ``str``, whole-number floats -> their integer string. Anything
+    already a string (or an unexpected type) passes through unchanged.
+
+    Floats reach here on the rescan path: the stored extraction config is
+    round-tripped through the Smithy ``ExtractionConfig`` model, which types
+    ``chunkSize``/``chunkOverlap`` as numbers, so ``0`` comes back as ``0.0``. A
+    float passed through unchanged makes the SFN ECS override fail ("must be a
+    STRING"), and ``"0.0"`` would break the container's ``int(os.environ[...])``,
+    so whole-number floats are rendered without the fractional part.
 
     NOTE: bool is checked before int because ``isinstance(True, int)`` is True.
     """
@@ -54,6 +61,8 @@ def _stringify_config_value(v: object) -> object:
         return json.dumps(v)
     if isinstance(v, int):
         return str(v)
+    if isinstance(v, float):
+        return str(int(v)) if v.is_integer() else str(v)
     return v
 
 

@@ -20,6 +20,7 @@ const SECTIONS: NavSection[] = [
     { id: 'sources', label: 'Sources' },
     { id: 'cross-account-sources', label: 'Cross-Account Sources' },
     { id: 'custom-connector-sources', label: 'Custom Connectors' },
+    { id: 'databricks-sources', label: 'Databricks Sources' },
   ]},
   { stage: 'Model', items: [
     { id: 'ontologies', label: 'Ontologies' },

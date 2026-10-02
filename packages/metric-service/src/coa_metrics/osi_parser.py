@@ -35,6 +35,11 @@ logger = structlog.get_logger(__name__)
 
 OSI_SPEC_VERSION = "1.0"
 OSI_VENDOR_NAME = "COA"
+# Keep OSI imports aligned with the Smithy SqlExpression contract. Unlike the
+# generated create/update request models, OSI values are parsed into local
+# dataclasses and therefore need the same bound enforced explicitly before SQL
+# parsing or safety analysis.
+MAX_SQL_EXPRESSION_LENGTH = 10_000
 
 # ── Dialect Mapping ─────────────────────────────────────────────────────
 
@@ -173,9 +178,42 @@ class OsiDocument:
 # ── Parser ──────────────────────────────────────────────────────────────
 
 
+def _opt_str(mapping: dict[str, Any], key: str) -> str:
+    """Read an optional scalar as a string, treating an explicit YAML ``null`` as absent.
+
+    ``str(mapping.get(key, ""))`` turns ``key: null`` into the truthy string ``"None"``,
+    which then sails past every downstream emptiness check.
+    """
+    value = mapping.get(key)
+    return "" if value is None else str(value)
+
+
+def _opt_str_list(mapping: dict[str, Any], key: str) -> list[str]:
+    """Read an optional list of scalars, treating ``null`` or a non-list as empty.
+
+    ``mapping.get(key, [])`` returns ``None`` for an explicit ``key: null`` and
+    iterating that raises ``TypeError``. A bare scalar is wrapped rather than
+    iterated character-by-character.
+    """
+    value = mapping.get(key)
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        value = [value]
+    return [str(item) for item in value if item]
+
+
 @dataclass
 class ParseError:
     """A single parse error with location context."""
+
+    path: str
+    message: str
+
+
+@dataclass
+class ParseWarning:
+    """A non-fatal parse finding — the document is usable but something was ignored."""
 
     path: str
     message: str
@@ -187,10 +225,11 @@ class ParseResult:
 
     document: OsiDocument | None
     errors: list[ParseError]
+    warnings: list[ParseWarning] = field(default_factory=list)
 
     @property
     def success(self) -> bool:
-        """Whether parsing produced a document with no errors."""
+        """Whether parsing produced a document with no errors (warnings do not block)."""
         return self.document is not None and len(self.errors) == 0
 
 
@@ -204,6 +243,7 @@ def parse_osi_yaml(content: str) -> ParseResult:
         ParseResult with the parsed document or errors.
     """
     errors: list[ParseError] = []
+    warnings: list[ParseWarning] = []
 
     # Parse YAML
     try:
@@ -236,10 +276,10 @@ def parse_osi_yaml(content: str) -> ParseResult:
     datasets = _parse_datasets(raw.get("datasets", []), errors)
 
     # Parse metrics
-    metrics = _parse_metrics(raw.get("metrics", []), errors)
+    metrics = _parse_metrics(raw.get("metrics", []), errors, warnings)
 
     if errors:
-        return ParseResult(document=None, errors=errors)
+        return ParseResult(document=None, errors=errors, warnings=warnings)
 
     return ParseResult(
         document=OsiDocument(
@@ -248,6 +288,7 @@ def parse_osi_yaml(content: str) -> ParseResult:
             metrics=metrics,
         ),
         errors=[],
+        warnings=warnings,
     )
 
 
@@ -275,17 +316,17 @@ def _parse_datasets(raw_datasets: Any, errors: list[ParseError]) -> list[OsiData
         datasets.append(
             OsiDataset(
                 name=str(name),
-                source=str(ds.get("source", "")),
-                data_source_id=str(ds.get("data_source_id", "")),
-                description=str(ds.get("description", "")),
-                synonyms=[str(s) for s in ds.get("synonyms", []) if s],
+                source=_opt_str(ds, "source"),
+                data_source_id=_opt_str(ds, "data_source_id"),
+                description=_opt_str(ds, "description"),
+                synonyms=_opt_str_list(ds, "synonyms"),
             )
         )
 
     return datasets
 
 
-def _parse_metrics(raw_metrics: Any, errors: list[ParseError]) -> list[OsiMetric]:
+def _parse_metrics(raw_metrics: Any, errors: list[ParseError], warnings: list[ParseWarning]) -> list[OsiMetric]:
     """Parse the metrics section of an OSI document."""
     if not raw_metrics:
         errors.append(ParseError(path="$.metrics", message="At least one metric is required"))
@@ -302,15 +343,40 @@ def _parse_metrics(raw_metrics: Any, errors: list[ParseError]) -> list[OsiMetric
             errors.append(ParseError(path=path, message="Metric entry must be a mapping"))
             continue
 
-        metric = _parse_single_metric(m, path, errors)
+        metric = _parse_single_metric(m, path, errors, warnings)
         if metric:
             metrics.append(metric)
 
     return metrics
 
 
-def _parse_single_metric(raw: dict[str, Any], path: str, errors: list[ParseError]) -> OsiMetric | None:
+def _warn_vendor_prefixed_keys(raw: dict[str, Any], path: str, warnings: list[ParseWarning]) -> None:
+    """Flag `x_*` keys on a metric — they are not OSI v1.0 and are otherwise dropped silently.
+
+    The shipped samples once carried COA metadata (data_source_id, source_table, unit,
+    return_type, time_dimension, ontology_concepts) under `x_coa:`. Nothing reads that
+    key, so the metric imported with its ontology binding stripped and Check 6 had
+    nothing to validate. Surface it so the author can move the block to the
+    spec-defined `custom_extensions` list.
+    """
+    for key in raw:
+        if not (isinstance(key, str) and key.lower().startswith("x_")):
+            continue
+        message = (
+            f"Vendor-prefixed key '{key}' is not part of OSI v1.0 and was ignored. "
+            f"Put {OSI_VENDOR_NAME} metadata under custom_extensions: "
+            f"[{{vendor_name: {OSI_VENDOR_NAME}, data: {{...}}}}]"
+        )
+        warnings.append(ParseWarning(path=f"{path}.{key}", message=message))
+        logger.warning("osi_vendor_key_ignored", path=path, key=key, metric=str(raw.get("name", "")))
+
+
+def _parse_single_metric(
+    raw: dict[str, Any], path: str, errors: list[ParseError], warnings: list[ParseWarning]
+) -> OsiMetric | None:
     """Parse a single metric entry."""
+    _warn_vendor_prefixed_keys(raw, path, warnings)
+
     name = raw.get("name", "")
     if not name:
         errors.append(ParseError(path=f"{path}.name", message="Metric 'name' is required"))
@@ -346,8 +412,17 @@ def _parse_single_metric(raw: dict[str, Any], path: str, errors: list[ParseError
         if not expr:
             errors.append(ParseError(path=f"{d_path}.expression", message="'expression' is required"))
             continue
+        expression = str(expr)
+        if len(expression) > MAX_SQL_EXPRESSION_LENGTH:
+            errors.append(
+                ParseError(
+                    path=f"{d_path}.expression",
+                    message=f"'expression' must be at most {MAX_SQL_EXPRESSION_LENGTH} characters",
+                )
+            )
+            continue
 
-        dialect_expressions.append(OsiDialectExpression(dialect=str(dialect), expression=str(expr)))
+        dialect_expressions.append(OsiDialectExpression(dialect=str(dialect), expression=expression))
 
     if not dialect_expressions:
         return None
@@ -373,9 +448,9 @@ def _parse_ai_context(raw: Any) -> OsiAiContext | None:
         return OsiAiContext(instructions=raw)
     if isinstance(raw, dict):
         return OsiAiContext(
-            synonyms=[str(s) for s in raw.get("synonyms", []) if s],
-            instructions=str(raw.get("instructions", "")),
-            examples=[str(e) for e in raw.get("examples", []) if e],
+            synonyms=_opt_str_list(raw, "synonyms"),
+            instructions=_opt_str(raw, "instructions"),
+            examples=_opt_str_list(raw, "examples"),
         )
     return None
 
@@ -397,14 +472,14 @@ def _parse_custom_extensions(raw_extensions: Any, path: str) -> OsiCustomExtensi
             if not isinstance(data, dict):
                 continue
             return OsiCustomExtension(
-                data_source_id=str(data.get("data_source_id", "")),
-                source_table=str(data.get("source_table", "")),
-                unit=str(data.get("unit", "")),
-                return_type=str(data.get("return_type", "")),
-                time_dimension=str(data.get("time_dimension", "")),
-                ontology_concepts=[str(c) for c in data.get("ontology_concepts", []) if c],
-                defined_by=str(data.get("defined_by", "")),
-                effective_from=str(data.get("effective_from", "")),
+                data_source_id=_opt_str(data, "data_source_id"),
+                source_table=_opt_str(data, "source_table"),
+                unit=_opt_str(data, "unit"),
+                return_type=_opt_str(data, "return_type"),
+                time_dimension=_opt_str(data, "time_dimension"),
+                ontology_concepts=_opt_str_list(data, "ontology_concepts"),
+                defined_by=_opt_str(data, "defined_by"),
+                effective_from=_opt_str(data, "effective_from"),
             )
 
     return None

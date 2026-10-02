@@ -12,7 +12,9 @@ Required env vars (set by MetricServiceStack):
   PROJECT_ACCESS_ROLE_ARN — role assumed by the catalog reader for DataZone
 
 Returns None when config is missing or the namespace has no provisioned
-DataZone project — callers skip Checks 2-5 gracefully.
+DataZone project — callers skip Checks 2-5 gracefully. Registry read failures
+propagate so enforcement callers can return an operational error instead of
+silently accepting unverified references.
 """
 
 from __future__ import annotations
@@ -31,8 +33,9 @@ logger = structlog.get_logger(__name__)
 def _resolve_project_id(namespace_id: str, namespaces_table: str, region: str) -> str | None:
     """Resolve the DataZone project ID for a namespace.
 
-    Uses DynamoDBDAO from common library. Returns None on any failure
-    so validation degrades gracefully.
+    Uses DynamoDBDAO from common library. A missing row or project ID is a
+    legitimate unprovisioned namespace and returns None. DynamoDB failures
+    propagate so callers can distinguish an outage from that state.
     """
     try:
         dao = DynamoDBDAO(namespaces_table, region=region)
@@ -45,10 +48,10 @@ def _resolve_project_id(namespace_id: str, namespaces_table: str, region: str) -
             error_code=error_code,
             error=str(exc),
         )
-        return None
+        raise
     except Exception as exc:
         logger.warning("namespace_lookup_failed", namespace=namespace_id, error=str(exc))
-        return None
+        raise
 
     if not item:
         logger.warning("namespace_not_found", namespace=namespace_id, table=namespaces_table)

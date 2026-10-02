@@ -44,6 +44,7 @@ import {
   ControlPlaneServiceServiceException,
   SourceType,
 } from "@coa/control-plane-client";
+import "./pages.css";
 
 /** Read-only display of the ExternalId a cross-account role's trust policy must pin.
  *
@@ -55,14 +56,27 @@ import {
 function CrossAccountExternalIdField({
   externalId,
   isLoading,
+  loadFailed,
 }: {
   readonly externalId: string | undefined;
   readonly isLoading: boolean;
+  /** The namespace request failed, as opposed to a namespace that loaded but
+   *  carries no ExternalId. Only the first is worth reloading the page for. */
+  readonly loadFailed: boolean;
 }): React.JSX.Element {
+  // errorText rather than a Box: it renders in an assertive live region, so the
+  // unavailable state reaches a screen reader even though nothing here is focusable.
+  let errorText: string | undefined;
+  if (!externalId && !isLoading) {
+    errorText = loadFailed
+      ? "Unavailable — the namespace could not be loaded. Reload the page to retrieve it."
+      : "Unavailable — this namespace carries no External ID, so the role's trust policy cannot be bound to it. Report this to the operator of this deployment.";
+  }
   return (
     <FormField
       label="External ID (add to the role's trust policy)"
       description="Context Ontology Accelerator presents this value when assuming the role above. Add it as an sts:ExternalId condition on that role's trust policy — without the condition the role is assumable on behalf of any namespace in this deployment."
+      errorText={errorText}
     >
       {externalId ? (
         <CopyToClipboard
@@ -73,13 +87,9 @@ function CrossAccountExternalIdField({
           textToCopy={externalId}
           variant="inline"
         />
-      ) : (
-        <Box color="text-status-inactive">
-          {isLoading
-            ? "Loading…"
-            : "Unavailable — reload the page to retrieve it."}
-        </Box>
-      )}
+      ) : isLoading ? (
+        <Box color="text-status-inactive">Loading…</Box>
+      ) : null}
     </FormField>
   );
 }
@@ -123,11 +133,12 @@ import { S3_ARN_RE, validateS3Prefix } from "@utils/helpers";
 
 // ── Source type options ───────────────────────────────────────────────────────
 
-// Four-way selection shown in step 1
+// Five-way selection shown in step 1
 type SourceKind =
   | "GLUE_DATABASE"
   | "JDBC_DATABASE"
   | "CUSTOM_CONNECTOR"
+  | "DATABRICKS_SQL_WAREHOUSE"
   | "DOCUMENTS";
 
 /** Narrow a Tiles selection to a SourceKind. Cloudscape hands back a plain
@@ -137,6 +148,7 @@ function isSourceKind(value: string): value is SourceKind {
     value === "GLUE_DATABASE" ||
     value === "JDBC_DATABASE" ||
     value === "CUSTOM_CONNECTOR" ||
+    value === "DATABRICKS_SQL_WAREHOUSE" ||
     value === "DOCUMENTS"
   );
 }
@@ -146,6 +158,9 @@ const SOURCE_KIND_LABELS: Record<SourceKind, string> = {
   GLUE_DATABASE: "Glue database",
   JDBC_DATABASE: "JDBC database",
   CUSTOM_CONNECTOR: "Custom connector",
+  // The sub-type covers a SQL Warehouse only — not Databricks jobs, Delta
+  // Sharing or a cluster endpoint.
+  DATABRICKS_SQL_WAREHOUSE: "Databricks SQL Warehouse",
   DOCUMENTS: "Documents",
 };
 
@@ -265,6 +280,18 @@ interface Model {
   customConnectorDatabaseName: string;
   customConnectorTableFilter: string;
   customConnectorTableExcludeFilter: string;
+  // Databricks: this platform deploys the connector Lambda, so there is no function
+  // ARN — only the warehouse, the credential secret, and the role that reads it.
+  databricksName: string;
+  databricksWorkspaceHostname: string;
+  databricksHttpPath: string;
+  databricksCatalog: string;
+  // `databaseName` on the wire, one Unity Catalog schema per source.
+  databricksSchemaName: string;
+  databricksSecretArn: string;
+  databricksCrossAccountRoleArn: string;
+  databricksTableFilter: string;
+  databricksTableExcludeFilter: string;
   // Shared database enrichment toggle — when false, the backend skips the
   // AI metadata enrichment step entirely and only persists discovered
   // technical metadata for steward review.
@@ -415,6 +442,15 @@ const initialModel: Model = {
   customConnectorDatabaseName: "",
   customConnectorTableFilter: "",
   customConnectorTableExcludeFilter: "",
+  databricksName: "",
+  databricksWorkspaceHostname: "",
+  databricksHttpPath: "",
+  databricksCatalog: "",
+  databricksSchemaName: "",
+  databricksSecretArn: "",
+  databricksCrossAccountRoleArn: "",
+  databricksTableFilter: "",
+  databricksTableExcludeFilter: "",
   metadataEnrichmentEnabled: true,
   docUploadName: "",
   docUploadFiles: [],
@@ -451,6 +487,84 @@ function validateCrossAccountRoleArn(arn: string): string | undefined {
   return undefined;
 }
 
+/** Recover the deployment's resource prefix from the namespace's ExternalId.
+ *
+ * The platform derives that ExternalId as `{RESOURCE_PREFIX}{namespaceId}`, so
+ * stripping the namespace id off the end leaves the literal string a
+ * datasource-access role's name must start with. Nothing else the API returns
+ * carries it, so deriving it here is what lets the form name the required prefix
+ * rather than leaving the real rule to a server error.
+ *
+ * Returns `undefined` whenever the derivation cannot be trusted — still loading,
+ * no ExternalId, or a value not ending with the namespace id. Callers fall back
+ * to the shape check: a prefix that could not be derived must not block a submit.
+ */
+function deriveResourcePrefix(
+  externalId: string | undefined,
+  namespaceId: string | undefined,
+): string | undefined {
+  if (!externalId || !namespaceId) return undefined;
+  if (!externalId.endsWith(namespaceId)) return undefined;
+  const prefix = externalId.slice(0, externalId.length - namespaceId.length);
+  return prefix || undefined;
+}
+
+/** The role-name segment the platform's assume grant is scoped to. */
+const DATASOURCE_ACCESS_SEGMENT = "datasource-access-";
+
+/** Word the role-name rule for the customer: the deployment's real prefix when
+ *  it could be derived, prose when it could not. Shared by every form that states
+ *  the rule, because the API enforces the reserved-name check only on the
+ *  Databricks path — a Glue or JDBC steward who takes a hardcoded
+ *  `{prefix}-datasource-access-*` literally passes the form and fails at first
+ *  scan with an opaque AccessDenied. */
+function requiredRoleNamePrefix(resourcePrefix: string | undefined): string {
+  return resourcePrefix
+    ? `'${resourcePrefix}${DATASOURCE_ACCESS_SEGMENT}'`
+    : `this deployment's resource prefix followed by '${DATASOURCE_ACCESS_SEGMENT}'`;
+}
+
+/**
+ * Same shape check, but for a form where the role ARN is `@required`, and
+ * against the deployment's real prefix when it could be derived.
+ *
+ * A Databricks source has no direct-read fallback — the connector reaches the
+ * credential only by assuming this role — so an empty value is an error here
+ * rather than "no cross-account access requested", as it means on the other forms.
+ */
+function validateRequiredCrossAccountRoleArn(
+  arn: string,
+  resourcePrefix: string | undefined,
+): string | undefined {
+  const trimmed = arn.trim();
+  if (!trimmed)
+    return `Credential access role ARN is required, and the role's name must start with ${requiredRoleNamePrefix(resourcePrefix)} — the assume grant is scoped to that prefix.`;
+
+  const shapeError = validateCrossAccountRoleArn(trimmed);
+  if (shapeError) return shapeError;
+  // Without a derived prefix the shape check is all the form can assert; the API
+  // applies the exact rule either way.
+  if (!resourcePrefix) return undefined;
+
+  const roleName = trimmed.slice(trimmed.lastIndexOf("/") + 1);
+  const requiredStart = `${resourcePrefix}${DATASOURCE_ACCESS_SEGMENT}`;
+  if (!roleName.startsWith(requiredStart)) {
+    return `Role name must start with '${requiredStart}'. This deployment's sts:AssumeRole grant is scoped to that prefix, so a role named anything else is denied however it is configured. The role's account is unconstrained.`;
+  }
+  return undefined;
+}
+
+// Mirror the Smithy patterns: these values reach a `;`-delimited JDBC property list
+// or interpolated information_schema SQL, and the server is patterned accordingly.
+const DATABRICKS_WORKSPACE_HOSTNAME_RE =
+  /^[a-z0-9][a-z0-9.-]*\.(cloud\.databricks\.com|azuredatabricks\.net|gcp\.databricks\.com)$/;
+const DATABRICKS_HTTP_PATH_RE =
+  /^\/sql\/1\.0\/(warehouses|endpoints)\/[a-zA-Z0-9]+$/;
+// Unity Catalog catalog and schema are both plain SQL identifiers.
+const DATABRICKS_IDENTIFIER_RE = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
+const SECRET_ARN_RE =
+  /^arn:(aws|aws-us-gov):secretsmanager:[a-z0-9-]+:\d{12}:secret:.+$/;
+
 /**
  * Validate a connector Lambda function ARN.
  * Mirrors the LambdaFunctionArn shape the backend accepts: a full ARN,
@@ -486,6 +600,13 @@ interface ValidationErrors {
   customConnectorName?: string;
   customConnectorFunctionArn?: string;
   customConnectorDatabaseName?: string;
+  databricksName?: string;
+  databricksWorkspaceHostname?: string;
+  databricksHttpPath?: string;
+  databricksCatalog?: string;
+  databricksSchemaName?: string;
+  databricksSecretArn?: string;
+  databricksCrossAccountRoleArn?: string;
   docUploadName?: string;
   docFiles?: string;
   docS3Name?: string;
@@ -505,6 +626,8 @@ function sourceNameFor(model: Model, docTab: "upload" | "s3"): string {
       return model.jdbcName;
     case "CUSTOM_CONNECTOR":
       return model.customConnectorName;
+    case "DATABRICKS_SQL_WAREHOUSE":
+      return model.databricksName;
     case "DOCUMENTS":
       return docTab === "upload" ? model.docUploadName : model.docS3Name;
   }
@@ -513,6 +636,8 @@ function sourceNameFor(model: Model, docTab: "upload" | "s3"): string {
 function validateStep2(
   model: Model,
   docTab: "upload" | "s3",
+  // Only the Databricks arm uses it; Glue and JDBC keep a shape-only check.
+  resourcePrefix?: string,
 ): ValidationErrors {
   const errs: ValidationErrors = {};
   if (model.sourceKind === "GLUE_DATABASE") {
@@ -555,6 +680,42 @@ function validateStep2(
     }
     if (!model.customConnectorDatabaseName.trim())
       errs.customConnectorDatabaseName = "Database name is required.";
+  } else if (model.sourceKind === "DATABRICKS_SQL_WAREHOUSE") {
+    if (!model.databricksName.trim()) errs.databricksName = "Name is required.";
+    if (!model.databricksWorkspaceHostname.trim())
+      errs.databricksWorkspaceHostname = "Workspace hostname is required.";
+    else if (
+      !DATABRICKS_WORKSPACE_HOSTNAME_RE.test(
+        model.databricksWorkspaceHostname.trim(),
+      )
+    )
+      errs.databricksWorkspaceHostname =
+        "Must be a lowercase Databricks workspace host ending in cloud.databricks.com, azuredatabricks.net, or gcp.databricks.com.";
+    if (!model.databricksHttpPath.trim())
+      errs.databricksHttpPath = "HTTP path is required.";
+    else if (!DATABRICKS_HTTP_PATH_RE.test(model.databricksHttpPath.trim()))
+      errs.databricksHttpPath =
+        "Must be the warehouse's HTTP path: /sql/1.0/warehouses/ID (or /sql/1.0/endpoints/ID).";
+    if (!model.databricksCatalog.trim())
+      errs.databricksCatalog = "Unity Catalog catalog is required.";
+    else if (!DATABRICKS_IDENTIFIER_RE.test(model.databricksCatalog.trim()))
+      errs.databricksCatalog =
+        "Must be a SQL identifier: a letter or underscore, then letters, digits, or underscores.";
+    if (!model.databricksSchemaName.trim())
+      errs.databricksSchemaName = "Unity Catalog schema is required.";
+    else if (!DATABRICKS_IDENTIFIER_RE.test(model.databricksSchemaName.trim()))
+      errs.databricksSchemaName =
+        "Must be a SQL identifier: a letter or underscore, then letters, digits, or underscores.";
+    if (!model.databricksSecretArn.trim())
+      errs.databricksSecretArn = "Credential secret ARN is required.";
+    else if (!SECRET_ARN_RE.test(model.databricksSecretArn.trim()))
+      errs.databricksSecretArn =
+        "Must be a Secrets Manager secret ARN: arn:aws:secretsmanager:REGION:ACCOUNT:secret:NAME";
+    const roleErr = validateRequiredCrossAccountRoleArn(
+      model.databricksCrossAccountRoleArn,
+      resourcePrefix,
+    );
+    if (roleErr) errs.databricksCrossAccountRoleArn = roleErr;
   } else {
     // DOCUMENTS
     if (docTab === "upload") {
@@ -609,10 +770,16 @@ export const ConnectSource: React.FC = () => {
   const { namespaceId } = useParams<{ namespaceId: string }>();
   // The ExternalId shown for cross-account roles is derived server-side from the
   // namespace, so it comes from the namespace detail rather than being typed in.
-  const { data: namespaceData, isLoading: namespaceLoading } = useGetNamespace(
-    namespaceId ?? "",
-  );
+  const {
+    data: namespaceData,
+    isLoading: namespaceLoading,
+    isError: namespaceLoadFailed,
+  } = useGetNamespace(namespaceId ?? "");
   const datasourceExternalId = namespaceData?.namespace?.datasourceExternalId;
+  const resourcePrefix = useMemo(
+    () => deriveResourcePrefix(datasourceExternalId, namespaceId),
+    [datasourceExternalId, namespaceId],
+  );
   const navigate = useNavigate();
 
   const [model, setModel] = useState<Model>(initialModel);
@@ -629,7 +796,8 @@ export const ConnectSource: React.FC = () => {
   const isDatabase =
     model.sourceKind === "GLUE_DATABASE" ||
     model.sourceKind === "JDBC_DATABASE" ||
-    model.sourceKind === "CUSTOM_CONNECTOR";
+    model.sourceKind === "CUSTOM_CONNECTOR" ||
+    model.sourceKind === "DATABRICKS_SQL_WAREHOUSE";
 
   // ── Mutations ──────────────────────────────────────────────────────
   const {
@@ -680,7 +848,7 @@ export const ConnectSource: React.FC = () => {
 
   // ── Submit ─────────────────────────────────────────────────────────
   const handleSubmit = async () => {
-    const step2Errs = validateStep2(model, docTab);
+    const step2Errs = validateStep2(model, docTab, resourcePrefix);
     if (step2Errs.step1) {
       setShowErrors({ 0: true, 1: true });
       setActiveStepIndex(1);
@@ -780,6 +948,33 @@ export const ConnectSource: React.FC = () => {
       return;
     }
 
+    if (model.sourceKind === "DATABRICKS_SQL_WAREHOUSE") {
+      createSource({
+        namespaceId: namespaceId!,
+        body: {
+          sourceType: SourceType.DATABASE,
+          databaseSource: {
+            name: model.databricksName.trim(),
+            metadataEnrichmentEnabled: model.metadataEnrichmentEnabled,
+            // One configuration only: the backend rejects a payload carrying more
+            // than one, since the configuration present selects the sub-type.
+            databricksSqlWarehouseConfiguration: {
+              workspaceHostname: model.databricksWorkspaceHostname.trim(),
+              httpPath: model.databricksHttpPath.trim(),
+              databricksCatalog: model.databricksCatalog.trim(),
+              databaseName: model.databricksSchemaName.trim(),
+              credentialSecretArn: model.databricksSecretArn.trim(),
+              crossAccountRoleArn: model.databricksCrossAccountRoleArn.trim(),
+              tableFilter: model.databricksTableFilter.trim() || undefined,
+              tableExcludeFilter:
+                model.databricksTableExcludeFilter.trim() || undefined,
+            },
+          },
+        },
+      });
+      return;
+    }
+
     // DOCUMENTS — s3 mode
     if (docTab === "s3") {
       createSource({
@@ -803,6 +998,12 @@ export const ConnectSource: React.FC = () => {
     // DOCUMENTS — upload mode
     setUploadError(null);
     setUploadProgress(0);
+    // Which call threw decides which alert reports the failure, so record it.
+    // The error's class decides nothing here: the upload-URL request throws the
+    // same service exception the create call does, and that mutation's error
+    // state is never rendered, so a failure there cleared the progress bar and
+    // showed nothing at all.
+    let createStarted = false;
     try {
       const result = await getUploadUrls({
         files: model.docUploadFiles.map((f) => ({
@@ -837,6 +1038,7 @@ export const ConnectSource: React.FC = () => {
         setUploadProgress(Math.round((completed / uploadUrls.length) * 90));
       }
       setUploadProgress(95);
+      createStarted = true;
       await createSourceAsync({
         namespaceId: namespaceId!,
         body: {
@@ -850,9 +1052,10 @@ export const ConnectSource: React.FC = () => {
       });
     } catch (err) {
       setUploadProgress(null);
-      // If the error is from createSourceAsync (a ControlPlaneServiceServiceException),
-      // createError on the mutation already shows it — don't also set uploadError.
-      if (!(err instanceof ControlPlaneServiceServiceException)) {
+      // The create call has its own alert on this step, fed by createError, which
+      // is how every other source kind on this page reports a failed create.
+      // Everything before it reports here, so one failure always yields one message.
+      if (!createStarted) {
         setUploadError(
           extractErrorMessage(err, "Upload failed. Please try again."),
         );
@@ -862,8 +1065,8 @@ export const ConnectSource: React.FC = () => {
 
   // ── Steps ──────────────────────────────────────────────────────────
   const step2Errs = useMemo(
-    () => (showErrors[1] ? validateStep2(model, docTab) : {}),
-    [showErrors, model, docTab],
+    () => (showErrors[1] ? validateStep2(model, docTab, resourcePrefix) : {}),
+    [showErrors, model, docTab, resourcePrefix],
   );
 
   const steps: WizardProps.Step[] = useMemo(() => {
@@ -896,6 +1099,12 @@ export const ConnectSource: React.FC = () => {
                 label: SOURCE_KIND_LABELS.CUSTOM_CONNECTOR,
                 description:
                   "Bring your own data source: register an Athena Query Federation SDK connector you built and deployed as a Lambda in your own AWS account. Schema and rows are read through Athena against that connector.",
+              },
+              {
+                value: "DATABRICKS_SQL_WAREHOUSE",
+                label: SOURCE_KIND_LABELS.DATABRICKS_SQL_WAREHOUSE,
+                description:
+                  "Connect one Unity Catalog schema on a Databricks SQL Warehouse. Nothing to deploy — Context Ontology Accelerator operates the connector; you supply the warehouse, the credential secret, and the role that reads it.",
               },
               {
                 value: "DOCUMENTS",
@@ -1089,7 +1298,7 @@ export const ConnectSource: React.FC = () => {
                 )}
                 <FormField
                   label="Cross-account role ARN"
-                  description="Optional. For a Glue catalog in another account, the IAM role Context Ontology Accelerator assumes to read catalog metadata. Must be named {prefix}-datasource-access-*, and its trust policy must require the External ID below."
+                  description={`Optional. For a Glue catalog in another account, the IAM role Context Ontology Accelerator assumes to read catalog metadata. Its name must start with ${requiredRoleNamePrefix(resourcePrefix)}, and its trust policy must require the External ID below.`}
                   errorText={step2Errs.glueCrossAccountRoleArn}
                 >
                   <Input
@@ -1103,6 +1312,7 @@ export const ConnectSource: React.FC = () => {
                 <CrossAccountExternalIdField
                   externalId={datasourceExternalId}
                   isLoading={namespaceLoading}
+                  loadFailed={namespaceLoadFailed}
                 />
               </SpaceBetween>
             </ExpandableSection>
@@ -1328,7 +1538,7 @@ export const ConnectSource: React.FC = () => {
                 )}
                 <FormField
                   label="Cross-account role ARN"
-                  description="Optional. For a credential secret in another account, the IAM role Context Ontology Accelerator assumes to read it. Must be named {prefix}-datasource-access-*, and its trust policy must require the External ID below."
+                  description={`Optional. For a credential secret in another account, the IAM role Context Ontology Accelerator assumes to read it. Its name must start with ${requiredRoleNamePrefix(resourcePrefix)}, and its trust policy must require the External ID below.`}
                   errorText={step2Errs.jdbcCrossAccountRoleArn}
                 >
                   <Input
@@ -1342,6 +1552,7 @@ export const ConnectSource: React.FC = () => {
                 <CrossAccountExternalIdField
                   externalId={datasourceExternalId}
                   isLoading={namespaceLoading}
+                  loadFailed={namespaceLoadFailed}
                 />
               </SpaceBetween>
             </ExpandableSection>
@@ -1450,6 +1661,206 @@ export const ConnectSource: React.FC = () => {
                         "customConnectorTableExcludeFilter",
                         detail.value,
                       )
+                    }
+                    placeholder="tmp_*|staging_*"
+                  />
+                </FormField>
+              </SpaceBetween>
+            </ExpandableSection>
+          </SpaceBetween>
+        ),
+      };
+    } else if (model.sourceKind === "DATABRICKS_SQL_WAREHOUSE") {
+      step2 = {
+        title: "Configure connection",
+        description:
+          "Name the warehouse to read and the credential Context Ontology Accelerator may read it with.",
+        errorText: step2Errs.step1,
+        content: (
+          <SpaceBetween size="l">
+            <Container header={<Header variant="h2">Source details</Header>}>
+              <FormField
+                label={
+                  <>
+                    Source name{" "}
+                    <Box variant="span" color="text-status-error">
+                      *
+                    </Box>
+                  </>
+                }
+                description="A unique name for this source within the namespace."
+                errorText={step2Errs.databricksName}
+              >
+                <Input
+                  value={model.databricksName}
+                  onChange={({ detail }) =>
+                    setField("databricksName", detail.value)
+                  }
+                  placeholder="My Databricks Warehouse"
+                />
+              </FormField>
+            </Container>
+            <Container header={<Header variant="h2">SQL Warehouse</Header>}>
+              <SpaceBetween size="l">
+                <FormField
+                  label={
+                    <>
+                      Workspace hostname{" "}
+                      <Box variant="span" color="text-status-error">
+                        *
+                      </Box>
+                    </>
+                  }
+                  description="The workspace's server hostname, without a scheme or path. AWS, Azure, and GCP workspaces are all accepted."
+                  constraintText="A PrivateLink-only workspace is not reachable: the connector runs outside your VPC."
+                  errorText={step2Errs.databricksWorkspaceHostname}
+                >
+                  <Input
+                    value={model.databricksWorkspaceHostname}
+                    onChange={({ detail }) =>
+                      setField("databricksWorkspaceHostname", detail.value)
+                    }
+                    placeholder="dbc-a1b2345c-d6e7.cloud.databricks.com"
+                  />
+                </FormField>
+                <FormField
+                  label={
+                    <>
+                      HTTP path{" "}
+                      <Box variant="span" color="text-status-error">
+                        *
+                      </Box>
+                    </>
+                  }
+                  description="Copy it from the warehouse's Connection details tab. The Databricks analogue of a port — it selects which warehouse this source queries."
+                  constraintText="Keep the warehouse running, or make its auto-stop window match how often you expect questions: a stopped warehouse turns the first query into a resume, seconds on serverless and minutes on classic or pro."
+                  errorText={step2Errs.databricksHttpPath}
+                >
+                  <Input
+                    value={model.databricksHttpPath}
+                    onChange={({ detail }) =>
+                      setField("databricksHttpPath", detail.value)
+                    }
+                    placeholder="/sql/1.0/warehouses/abc123def456"
+                  />
+                </FormField>
+                <FormField
+                  label={
+                    <>
+                      Unity Catalog catalog{" "}
+                      <Box variant="span" color="text-status-error">
+                        *
+                      </Box>
+                    </>
+                  }
+                  errorText={step2Errs.databricksCatalog}
+                >
+                  <Input
+                    value={model.databricksCatalog}
+                    onChange={({ detail }) =>
+                      setField("databricksCatalog", detail.value)
+                    }
+                    placeholder="main"
+                  />
+                </FormField>
+                <FormField
+                  label={
+                    <>
+                      Unity Catalog schema{" "}
+                      <Box variant="span" color="text-status-error">
+                        *
+                      </Box>
+                    </>
+                  }
+                  description="The single schema this source exposes. A catalog with several schemas is onboarded once per schema."
+                  constraintText="Every table must be SELECT-able by this credential. Visibility in information_schema comes from BROWSE or USE SCHEMA, so a table that is discovered is not necessarily one that can be read — and it would fail only when a question reaches it."
+                  errorText={step2Errs.databricksSchemaName}
+                >
+                  <Input
+                    value={model.databricksSchemaName}
+                    onChange={({ detail }) =>
+                      setField("databricksSchemaName", detail.value)
+                    }
+                    placeholder="sales"
+                  />
+                </FormField>
+              </SpaceBetween>
+            </Container>
+            <Container header={<Header variant="h2">Credential access</Header>}>
+              <SpaceBetween size="l">
+                <FormField
+                  label={
+                    <>
+                      Credential secret ARN{" "}
+                      <Box variant="span" color="text-status-error">
+                        *
+                      </Box>
+                    </>
+                  }
+                  description={`AWS Secrets Manager secret holding the Databricks credential, in this deployment's Region. Its JSON shape selects the authentication mode: {"token": "…"} for a personal access token, {"client_id": "…", "client_secret": "…"} for OAuth machine-to-machine.`}
+                  constraintText="Machine-to-machine is the recommendation: a personal access token carries a user's identity and expires on a schedule you may not control."
+                  errorText={step2Errs.databricksSecretArn}
+                >
+                  <Input
+                    value={model.databricksSecretArn}
+                    onChange={({ detail }) =>
+                      setField("databricksSecretArn", detail.value)
+                    }
+                    placeholder="arn:aws:secretsmanager:us-east-1:123456789012:secret:databricks-abc123"
+                  />
+                </FormField>
+                <FormField
+                  label={
+                    <>
+                      Credential access role ARN{" "}
+                      <Box variant="span" color="text-status-error">
+                        *
+                      </Box>
+                    </>
+                  }
+                  description={`Required. The IAM role Context Ontology Accelerator assumes to read the secret above — it holds no Secrets Manager permission of its own, so there is no fallback. The role's name must start with ${requiredRoleNamePrefix(resourcePrefix)}, and its trust policy must require the External ID below. Any AWS account, including this one.`}
+                  errorText={step2Errs.databricksCrossAccountRoleArn}
+                >
+                  <Input
+                    value={model.databricksCrossAccountRoleArn}
+                    onChange={({ detail }) =>
+                      setField("databricksCrossAccountRoleArn", detail.value)
+                    }
+                    placeholder="arn:aws:iam::222222222222:role/coa-dev-datasource-access-databricks"
+                  />
+                </FormField>
+                <CrossAccountExternalIdField
+                  externalId={datasourceExternalId}
+                  isLoading={namespaceLoading}
+                  loadFailed={namespaceLoadFailed}
+                />
+              </SpaceBetween>
+            </Container>
+            <ExpandableSection
+              headerText="Advanced configuration"
+              variant="container"
+            >
+              <SpaceBetween size="l">
+                <FormField
+                  label="Table filter"
+                  description="Optional glob(s) (* ? [seq]) to include specific tables. Separate multiple with | or ,."
+                >
+                  <Input
+                    value={model.databricksTableFilter}
+                    onChange={({ detail }) =>
+                      setField("databricksTableFilter", detail.value)
+                    }
+                    placeholder="orders|customers"
+                  />
+                </FormField>
+                <FormField
+                  label="Table exclude filter"
+                  description="Optional glob(s) (* ? [seq]) to exclude specific tables. Applied after the include filter. Separate multiple with | or ,."
+                >
+                  <Input
+                    value={model.databricksTableExcludeFilter}
+                    onChange={({ detail }) =>
+                      setField("databricksTableExcludeFilter", detail.value)
                     }
                     placeholder="tmp_*|staging_*"
                   />
@@ -1973,6 +2384,40 @@ export const ConnectSource: React.FC = () => {
               />
             </Container>
           )}
+          {model.sourceKind === "DATABRICKS_SQL_WAREHOUSE" && (
+            <Container header={<Header variant="h2">Connection</Header>}>
+              <KeyValuePairs
+                columns={2}
+                items={[
+                  {
+                    label: "Workspace hostname",
+                    value: model.databricksWorkspaceHostname,
+                  },
+                  { label: "HTTP path", value: model.databricksHttpPath },
+                  {
+                    label: "Unity Catalog catalog",
+                    value: model.databricksCatalog,
+                  },
+                  {
+                    label: "Unity Catalog schema",
+                    value: model.databricksSchemaName,
+                  },
+                  {
+                    label: "Credential secret ARN",
+                    value: model.databricksSecretArn,
+                  },
+                  {
+                    label: "Credential access role ARN",
+                    value: model.databricksCrossAccountRoleArn,
+                  },
+                  {
+                    label: "Table filter",
+                    value: model.databricksTableFilter || "(none)",
+                  },
+                ]}
+              />
+            </Container>
+          )}
           {model.sourceKind === "DOCUMENTS" && (
             <Container header={<Header variant="h2">Source</Header>}>
               <KeyValuePairs
@@ -2025,7 +2470,11 @@ export const ConnectSource: React.FC = () => {
           )}
           {createError && (
             <Alert type="error" header="Failed to connect source">
-              {extractErrorMessage(createError)}
+              {/* Registration errors are newline-formatted numbered lists naming the
+                  exact sts:ExternalId — render them as written, not on one line. */}
+              <div className="coa-preserve-newlines">
+                {extractErrorMessage(createError)}
+              </div>
             </Alert>
           )}
         </SpaceBetween>
@@ -2046,6 +2495,10 @@ export const ConnectSource: React.FC = () => {
     addPrefix,
     removePrefix,
     updatePrefix,
+    resourcePrefix,
+    datasourceExternalId,
+    namespaceLoading,
+    namespaceLoadFailed,
   ]);
 
   return (
@@ -2056,7 +2509,7 @@ export const ConnectSource: React.FC = () => {
         const requested = detail.requestedStepIndex;
         if (requested > activeStepIndex) {
           if (activeStepIndex === 1) {
-            const errs = validateStep2(model, docTab);
+            const errs = validateStep2(model, docTab, resourcePrefix);
             if (errs.step1) {
               setShowErrors((p) => ({ ...p, 1: true }));
               return;

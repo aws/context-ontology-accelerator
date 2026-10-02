@@ -6,7 +6,17 @@
 from __future__ import annotations
 
 import pytest
-from coa_serve.tier2.ontop.sparql_validator import SPARQLValidator
+from coa_serve.tier2.ontop.sparql_validator import _SAFE_URI_RE, SPARQLValidator
+
+
+@pytest.mark.unit
+class TestSafeUriRegex:
+    def test_rejects_a_trailing_newline(self):
+        """`\\Z`, not `$`: `$` matches before a trailing newline, which would let a
+        newline-bearing IRI reach SPARQL interpolation. A clean IRI still passes."""
+        assert _SAFE_URI_RE.match("https://example.org/ontology")
+        assert not _SAFE_URI_RE.match("https://example.org/ontology\n")
+        assert not _SAFE_URI_RE.match("https://example.org/o\ninjected")
 
 
 @pytest.fixture

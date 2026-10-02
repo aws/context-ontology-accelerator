@@ -50,7 +50,7 @@ from fastapi.testclient import TestClient
 # ── Test constants ──────────────────────────────────────────────────────
 
 
-_NS = "test-ns"
+_NS = "550e8400-e29b-41d4-a716-446655440001"
 _NAME = "test-onto"
 _GRAPH_ARN = "arn:aws:neptune-graph:us-east-1:000000000000:graph/g-test"
 _ONTOLOGY_URI_PREFIX = f"{GRAPH_BASE_URI}/namespace/{_NS}/ontology/{_NAME}"

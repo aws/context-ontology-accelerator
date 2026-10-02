@@ -1,7 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import React, { useCallback, useMemo, useState } from "react";
+import React, { useCallback, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import Alert from "@cloudscape-design/components/alert";
 import AttributeEditor from "@cloudscape-design/components/attribute-editor";
@@ -14,7 +14,7 @@ import Flashbar from "@cloudscape-design/components/flashbar";
 import FormField from "@cloudscape-design/components/form-field";
 import Header from "@cloudscape-design/components/header";
 import Icon from "@cloudscape-design/components/icon";
-import Input from "@cloudscape-design/components/input";
+import Input, { InputProps } from "@cloudscape-design/components/input";
 import KeyValuePairs from "@cloudscape-design/components/key-value-pairs";
 import Modal from "@cloudscape-design/components/modal";
 import Multiselect from "@cloudscape-design/components/multiselect";
@@ -204,6 +204,38 @@ function AiEnrichedHint() {
   );
 }
 
+/** One-line inference note with the full text on demand.
+ *
+ * A column can carry several inferred relationships and each is a yes/no call;
+ * the note must be readable at a glance (0.3.3 feedback). The backend already
+ * shortens it to a clause; this keeps the row to one line regardless and puts
+ * the full text one click away rather than inline. */
+const REVIEW_NOTE_INLINE_CHARS = 90;
+
+function ReviewNote({ note }: { note: string }) {
+  const short =
+    note.length > REVIEW_NOTE_INLINE_CHARS
+      ? `${note.slice(0, REVIEW_NOTE_INLINE_CHARS).trimEnd()}…`
+      : note;
+  const body = (
+    <Box fontSize="body-s" color="text-status-inactive">
+      {short}
+    </Box>
+  );
+  if (short === note) return body;
+  return (
+    <Popover
+      dismissButton={false}
+      position="top"
+      size="large"
+      triggerType="text"
+      content={note}
+    >
+      {body}
+    </Popover>
+  );
+}
+
 const FK_COLUMN_DEFS: TableProps.ColumnDefinition<ForeignKeyOutput>[] = [
   {
     id: "column",
@@ -235,11 +267,7 @@ const FK_COLUMN_DEFS: TableProps.ColumnDefinition<ForeignKeyOutput>[] = [
           {fk.targetDatasourceId ? (
             <Badge color="blue">cross-source</Badge>
           ) : null}
-          {fk.provenance ? (
-            <Box fontSize="body-s" color="text-status-inactive">
-              {fk.provenance}
-            </Box>
-          ) : null}
+          {fk.provenance ? <ReviewNote note={fk.provenance} /> : null}
         </SpaceBetween>
       );
     },
@@ -1275,14 +1303,81 @@ function useTokenField(initial: string[]) {
     setItems(items.filter((_, i) => i !== index));
   }
 
+  function clear() {
+    setItems([]);
+  }
+
   return {
     items,
     input,
     setInput,
     add,
     remove,
+    clear,
     values: items.map((t) => t.label),
   };
+}
+
+/** Synonyms field shared by the table and column editors.
+ *
+ * The list is pre-filled with whatever is stored, which for an enriched source
+ * is the AI-generated guesses (steward-curation supersede: `enrichmentSource` only describes the
+ * description, so we cannot tell an AI synonym from an authored one per item).
+ * A steward who only adds terms would otherwise re-submit the AI ones too and
+ * the ontology would keep them as live `skos:altLabel`s. "Clear all" lets them
+ * start from an empty, authored list; PATCH replaces the whole list, and the
+ * next re-induction + accept supersedes the previous generation in the graph. */
+function SynonymsField({
+  field,
+  placeholder,
+}: {
+  field: ReturnType<typeof useTokenField>;
+  placeholder: string;
+}) {
+  // `Clear all` unmounts itself when it clears the list (the button is
+  // conditional on `items.length > 0`). Without moving focus, keyboard users
+  // lose their place. After clear() runs, transfer focus to the synonyms
+  // input — the natural next thing to interact with, and it stays mounted.
+  const inputRef = useRef<InputProps.Ref>(null);
+  const handleClear = () => {
+    field.clear();
+    // Defer so the render that drops the button has settled before focus moves.
+    requestAnimationFrame(() => inputRef.current?.focus());
+  };
+  return (
+    <FormField
+      label="Synonyms"
+      description="Press Enter to add. Pre-filled terms may be AI-generated; saving replaces the whole list."
+      secondaryControl={
+        field.items.length > 0 ? (
+          <Button
+            variant="link"
+            iconName="remove"
+            onClick={handleClear}
+            ariaLabel="Clear all synonyms"
+          >
+            Clear all
+          </Button>
+        ) : undefined
+      }
+    >
+      <SpaceBetween size="xs">
+        <Input
+          ref={inputRef}
+          value={field.input}
+          onChange={({ detail }) => field.setInput(detail.value)}
+          onKeyDown={({ detail }) => {
+            if (detail.key === "Enter") field.add();
+          }}
+          placeholder={placeholder}
+        />
+        <TokenGroup
+          items={field.items}
+          onDismiss={({ detail }) => field.remove(detail.itemIndex)}
+        />
+      </SpaceBetween>
+    </FormField>
+  );
 }
 
 // --- Edit Table Modal ---
@@ -1354,22 +1449,7 @@ function EditTableModal({
             rows={3}
           />
         </FormField>
-        <FormField label="Synonyms" description="Press Enter to add.">
-          <SpaceBetween size="xs">
-            <Input
-              value={synonyms.input}
-              onChange={({ detail }) => synonyms.setInput(detail.value)}
-              onKeyDown={({ detail }) => {
-                if (detail.key === "Enter") synonyms.add();
-              }}
-              placeholder="e.g. customers_table"
-            />
-            <TokenGroup
-              items={synonyms.items}
-              onDismiss={({ detail }) => synonyms.remove(detail.itemIndex)}
-            />
-          </SpaceBetween>
-        </FormField>
+        <SynonymsField field={synonyms} placeholder="e.g. customers_table" />
         <FormField label="Glossary terms" description="Press Enter to add.">
           <SpaceBetween size="xs">
             <Input
@@ -1472,22 +1552,7 @@ function EditColumnModal({
             rows={3}
           />
         </FormField>
-        <FormField label="Synonyms" description="Press Enter to add.">
-          <SpaceBetween size="xs">
-            <Input
-              value={synonyms.input}
-              onChange={({ detail }) => synonyms.setInput(detail.value)}
-              onKeyDown={({ detail }) => {
-                if (detail.key === "Enter") synonyms.add();
-              }}
-              placeholder="e.g. customer_id"
-            />
-            <TokenGroup
-              items={synonyms.items}
-              onDismiss={({ detail }) => synonyms.remove(detail.itemIndex)}
-            />
-          </SpaceBetween>
-        </FormField>
+        <SynonymsField field={synonyms} placeholder="e.g. customer_id" />
         <FormField label="Glossary terms" description="Press Enter to add.">
           <SpaceBetween size="xs">
             <Input

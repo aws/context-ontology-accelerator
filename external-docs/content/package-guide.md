@@ -285,3 +285,68 @@ make build
 | Component | Description                           |
 | --------- | -------------------------------------- |
 | `web-app` | React + Cloudscape management console |
+
+## Error Reference
+
+`libs/common` exports the shared AOSS vector-client exceptions from
+`coa_common.opensearch` (both listed in that package's `__all__`). Both exist
+so an AOSS write or index that cannot be trusted fails **loudly** instead of
+silently reporting success — catch them where you want to retry or surface a
+deploy/ingest failure rather than let corrupt state through.
+
+| Exception               | Type           | Raised by                                | When |
+| ----------------------- | -------------- | ---------------------------------------- | ---- |
+| `PartialIndexError`     | `Exception`    | `bulk_with_retry(...)`                    | A bulk embedding write did not durably index every document — transient (429/5xx) per-item failures that survive `OSS_MAX_RETRIES` re-submits, **or** any non-transient (terminal 4xx) per-item error. |
+| `IncompatibleEngineError` | `RuntimeError` | `AossVectorClient.ensure_index(...)`    | A vector index resolved to an ANN engine that cannot serve filtered k-NN (i.e. not Faiss/Lucene), or the created index's mapping could not be read back / did not echo a filter-capable engine. |
+
+### `PartialIndexError`
+
+Raised by `bulk_with_retry` when, after transient-fault retries are exhausted,
+one or more documents still failed to index — or when any document failed with
+a terminal status. This is the correctness contract behind
+[#173](https://github.com/aws/context-ontology-accelerator/issues/173): at
+`aoss_min_ocu=0` the NEXTGEN circuit breaker sheds bulk-write load with HTTP
+429s, and `opensearch-py`'s own per-item retry can exhaust and **drop** those
+docs from the success stream without raising, so a naive caller reports "N
+written" when far fewer landed. Surfacing the shortfall as a raise turns silent
+data loss into a visible failure.
+
+It carries the shortfall for callers/tests to inspect:
+
+- `failed` (`int`) — number of documents that never durably indexed.
+- `submitted` (`int`) — number of documents handed to this bulk write.
+- `errors` (`list[dict]`) — the per-item error dicts (`opensearch-py` bulk error shape).
+
+Representative messages:
+
+```
+OSS bulk: <N> doc(s) failed with a terminal (non-retryable) status out of <M> submitted
+OSS bulk: <N> doc(s) still failing transiently after <OSS_MAX_RETRIES> re-submit(s); index is incomplete
+```
+
+`OSS_MAX_RETRIES` (default `6`) and `OSS_MAX_BACKOFF_S` (default `30`) are
+env-tunable and also exported from `coa_common.opensearch`.
+
+### `IncompatibleEngineError`
+
+Raised by `AossVectorClient.ensure_index` after it reads the created index's
+mapping back, when the `embedding` field's resolved ANN engine is not
+filter-capable. Filtered k-NN requires **Faiss** (HNSW) or **Lucene**; **NMSLIB
+does not support filters**. This turns the
+[#174](https://github.com/aws/context-ontology-accelerator/issues/174) failure —
+silently getting an NMSLIB index and only discovering it when a filtered query
+returns HTTP 400 — into a loud, creation-time failure. The resolved engine is
+always logged at INFO.
+
+Representative messages:
+
+```
+index '<name>' resolved to ANN engine '<engine>', which cannot serve filtered k-NN
+  (need one of ['faiss', 'lucene']). Filtered vector search would fail with
+  'Engine [<ENGINE>] does not support filters'. See #174.
+
+index '<name>' was created with an explicit filter-capable method but its mapping
+  reports no ANN engine; refusing to trust an unverifiable index. See #174.
+
+could not read back mapping for index '<name>' to verify its ANN engine: <cause>
+```

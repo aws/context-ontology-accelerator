@@ -41,12 +41,18 @@ def _mocks():
     # tests don't spin on the poll loop.
     mock_glue.get_connection.return_value = {"Connection": {"Status": "READY"}}
     mock_lf = MagicMock()
+    # The subnet -> AvailabilityZone lookup builds its own EC2 client; unpatched it
+    # calls real EC2 and the provisioner swallows the failure.
+    mock_ec2 = MagicMock()
+    mock_ec2.describe_subnets.return_value = {"Subnets": [{"AvailabilityZone": "us-east-1a"}]}
     with (
         patch(f"{MODULE}._get_glue", return_value=mock_glue),
         patch(f"{MODULE}._get_lakeformation", return_value=mock_lf),
         patch(f"{MODULE}._get_account_id", return_value="123456789012"),
+        patch(f"{MODULE}.boto3") as mock_boto3,
     ):
-        yield {"glue": mock_glue, "lf": mock_lf}
+        mock_boto3.client.return_value = mock_ec2
+        yield {"glue": mock_glue, "lf": mock_lf, "ec2": mock_ec2}
 
 
 @pytest.mark.unit
@@ -193,17 +199,28 @@ class TestProvisionFederatedCatalog:
             provision_federated_catalog,
         )
 
-        mock_ec2 = MagicMock()
-        mock_ec2.describe_subnets.return_value = {"Subnets": [{"AvailabilityZone": "us-east-1a"}]}
-        with patch(f"{MODULE}.boto3") as mock_boto3:
-            mock_boto3.client.return_value = mock_ec2
-            provision_federated_catalog(**self._KWARGS)
+        # A zone the fixture's default does not return, so this proves the lookup.
+        _mocks["ec2"].describe_subnets.return_value = {"Subnets": [{"AvailabilityZone": "us-east-1c"}]}
+        provision_federated_catalog(**self._KWARGS)
 
+        _mocks["ec2"].describe_subnets.assert_called_once_with(SubnetIds=["subnet-abc"])
         ci = _mocks["glue"].create_connection.call_args[1]["ConnectionInput"]
         reqs = ci["PhysicalConnectionRequirements"]
-        assert reqs["AvailabilityZone"] == "us-east-1a"
+        assert reqs["AvailabilityZone"] == "us-east-1c"
         assert reqs["SubnetId"] == "subnet-abc"
         assert reqs["SecurityGroupIdList"] == ["sg-123"]
+
+    def test_availability_zone_omitted_when_subnet_lookup_fails(self, _mocks):
+        from coa_sources.database.connectors.glue_connection_provisioner import (
+            provision_federated_catalog,
+        )
+
+        _mocks["ec2"].describe_subnets.side_effect = RuntimeError("DescribeSubnets denied")
+        provision_federated_catalog(**self._KWARGS)
+
+        reqs = _mocks["glue"].create_connection.call_args[1]["ConnectionInput"]["PhysicalConnectionRequirements"]
+        assert "AvailabilityZone" not in reqs
+        assert reqs["SubnetId"] == "subnet-abc"
 
     def test_invalid_inputs_rejected_before_aws(self, _mocks):
         from coa_sources.database.connectors.glue_connection_provisioner import (

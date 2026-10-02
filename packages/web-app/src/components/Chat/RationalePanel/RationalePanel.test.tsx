@@ -62,7 +62,8 @@ describe("RationalePanel", () => {
             {
               chunkId: "chunk-1",
               text: "Loss ratio is calculated as claims paid divided by premium earned.",
-              sourceDoc: "underwriting-guide.pdf",
+              sourceDocumentId: "aws:tenant:source:underwriting-guide",
+              sourceDocumentName: "underwriting-guide.pdf",
               relevanceScore: 0.88,
             },
           ],
@@ -143,6 +144,38 @@ describe("RationalePanel", () => {
     it("renders supporting content section", () => {
       renderPanel({ message });
       expect(screen.getByText("Supporting content (1)")).toBeInTheDocument();
+      expect(screen.getByText("underwriting-guide.pdf")).toBeInTheDocument();
+    });
+
+    it("renders the legacy sourceDoc fallback for older Tier-3 responses", () => {
+      const legacyMessage: ChatMessage = {
+        id: "msg-legacy-evidence",
+        role: "assistant",
+        content: "Legacy evidence",
+        timestamp: new Date("2026-01-01T12:00:00Z"),
+        response: {
+          requestId: "req-legacy-evidence",
+          result: {
+            tier: 3,
+            confidence: { score: 0.8, rationale: "Legacy response" },
+            trace: [],
+            partial: false,
+            supportingContent: [
+              {
+                chunkId: "legacy-chunk",
+                text: "Legacy evidence text",
+                sourceDocumentId: "aws:tenant:source:legacy-guide",
+                sourceDocumentName: "",
+                sourceDoc: "legacy-guide.pdf",
+                relevanceScore: 0.8,
+              },
+            ],
+          },
+        },
+      };
+
+      renderPanel({ message: legacyMessage });
+      expect(screen.getByText("legacy-guide.pdf")).toBeInTheDocument();
     });
 
     it("renders execution plan with step names", () => {

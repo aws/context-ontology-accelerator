@@ -124,6 +124,102 @@ class TestSQLFirewallValidate:
         with pytest.raises(UnsafeSQLError, match="Function not allowed"):
             fw.validate("SELECT pg_sleep(10)")
 
+    @pytest.mark.parametrize(
+        ("dialect", "sql"),
+        [
+            ("postgres", "SELECT setval('seq', 1)"),
+            ("postgres", "SELECT nextval('seq')"),
+            ("postgres", "SELECT pg_advisory_lock(1)"),
+            ("postgres", "SELECT pg_logical_emit_message(true, 'coa', 'x') FROM orders LIMIT 1"),
+            ("postgres", "SELECT pg_notify('channel', 'payload')"),
+            ("mysql", "SELECT SLEEP(10)"),
+            ("mysql", "SELECT BENCHMARK(1000000, MD5('x'))"),
+            ("mysql", "SELECT LOAD_FILE('/etc/passwd')"),
+            ("mysql", "SELECT GET_LOCK('resource', 10)"),
+            ("postgres", "SELECT lo_create(12345) FROM orders LIMIT 1"),
+            ("postgres", "SELECT lo_from_bytea(12345, 'payload') FROM orders LIMIT 1"),
+            ("postgres", "SELECT lo_put(12345, 0, 'payload') FROM orders LIMIT 1"),
+            ("tsql", "SELECT * FROM OPENDATASOURCE('SQLNCLI', 'Server=x').db.dbo.orders"),
+        ],
+    )
+    def test_rejects_dialect_specific_side_effect_function(self, dialect: str, sql: str):
+        fw = SQLFirewall()
+        with pytest.raises(UnsafeSQLError, match="Function not allowed"):
+            fw.validate(sql, dialect=dialect)
+
+    def test_rejects_locking_select(self):
+        fw = SQLFirewall()
+        with pytest.raises(UnsafeSQLError, match="Unsafe operation 'Lock'"):
+            fw.validate("SELECT * FROM orders FOR UPDATE", dialect="postgres")
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT * FROM orders WITH (TABLOCKX)",
+            "SELECT * FROM orders (TABLOCKX)",
+            "SELECT * FROM orders TABLOCKX",
+            "SELECT * FROM orders WITH (SERIALIZABLE)",
+            "SELECT * FROM orders WITH (REPEATABLEREAD)",
+            "SELECT * FROM orders WITH (READCOMMITTEDLOCK)",
+            "SELECT * FROM orders /* outer /* inner */ AS */ TABLOCKX",
+            "SELECT * FROM [orders]] AS] TABLOCKX",
+            'SELECT * FROM dbo.fn(CAST(x AS "type\\") + safe) TABLOCKX',
+            "SELECT NEXT VALUE FOR dbo.seq FROM orders",
+        ],
+    )
+    def test_rejects_tsql_lock_or_sequence_side_effect(self, sql: str):
+        fw = SQLFirewall()
+        with pytest.raises(UnsafeSQLError, match="Unsafe operation"):
+            fw.validate(sql, dialect="tsql")
+
+    def test_accepts_tsql_read_only_nolock_hint(self):
+        SQLFirewall().validate("SELECT * FROM orders WITH (NOLOCK)", dialect="tsql")
+        SQLFirewall().validate("SELECT * FROM orders (NOLOCK)", dialect="tsql")
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT * FROM orders AS TABLOCKX",
+            "SELECT * FROM orders AS [TABLOCKX]",
+            "SELECT * FROM orders [SERIALIZABLE]",
+            "SELECT * FROM orders AS /* alias */ TABLOCKX",
+        ],
+    )
+    def test_accepts_explicit_tsql_alias_named_like_hint(self, sql: str):
+        SQLFirewall().validate(sql, dialect="tsql")
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT * FROM dbo.order_rows(@TABLOCKX)",
+            "SELECT * FROM dbo.order_rows('TABLOCKX')",
+            "SELECT * FROM dbo.order_rows([TABLOCKX])",
+        ],
+    )
+    def test_accepts_tsql_table_valued_function_arguments_named_like_hint(self, sql: str):
+        SQLFirewall().validate(sql, dialect="tsql")
+
+    def test_comment_as_does_not_hide_bare_tsql_hint(self):
+        with pytest.raises(UnsafeSQLError, match="LegacyTableHint"):
+            SQLFirewall().validate("SELECT * FROM orders -- AS\nTABLOCKX", dialect="tsql")
+
+    def test_rejects_mysql_executable_comment_but_accepts_string_literal(self):
+        fw = SQLFirewall()
+        with pytest.raises(UnsafeSQLError, match="executable comments"):
+            fw.validate("SELECT /*!50000 SLEEP(10), */ 1", dialect="mysql")
+        with pytest.raises(UnsafeSQLError, match="executable comments"):
+            fw.validate(
+                "SELECT `metric\\` /*!50000 , SLEEP(10) */ FROM `orders`",
+                dialect="mysql",
+            )
+        fw.validate("SELECT '/*!50000 SLEEP(10) */'", dialect="mysql")
+
+    @pytest.mark.parametrize("sql", ["SELECT", "SELECT *", "WITH x AS (SELECT 1) SELECT"])
+    def test_rejects_incomplete_select_shape(self, sql: str):
+        fw = SQLFirewall()
+        with pytest.raises(UnsafeSQLError, match="SELECT"):
+            fw.validate(sql)
+
     def test_accepts_union(self):
         fw = SQLFirewall()
         fw.validate("SELECT id FROM orders UNION ALL SELECT id FROM returns")
@@ -720,7 +816,7 @@ class TestNamespaceSQLScope:
         with pytest.raises(NamespaceSQLScopeError, match="not available in the requested namespace"):
             self._validate("SELECT * FROM information_schema.tables")
 
-    def _validate_jdbc(self, sql: str) -> bool:
+    def _validate_jdbc(self, sql: str, selected_source_schemas: frozenset[str] | None = None) -> bool:
         """Direct-JDBC route: catalog supplied by the connection, so schema_only."""
         return SQLFirewall.validate_namespace_sql_scope(
             sql,
@@ -728,6 +824,9 @@ class TestNamespaceSQLScope:
             federated_catalog_schemas=self._FEDERATED,
             default_catalog="awsdatacatalog",
             schema_only=True,
+            selected_source_schemas=(
+                selected_source_schemas if selected_source_schemas is not None else frozenset({"tenant_a_db", "sales"})
+            ),
         )
 
     def test_jdbc_two_part_federated_schema_is_allowed(self):
@@ -736,9 +835,29 @@ class TestNamespaceSQLScope:
         from the connection, not Athena. The federated JDBC source's schema lives in
         federated_catalog_schemas under its OWN nested catalog (``sclds_a``), not in
         native_databases — so the Athena rule (pin to awsdatacatalog/native) wrongly
-        denied it (502 NamespaceSQLScopeError). schema_only authorizes on the schema
-        against ANY authorized catalog."""
+        denied it (502 NamespaceSQLScopeError). schema_only authorizes the schema
+        from the selected source without applying an Athena catalog pin."""
         assert self._validate_jdbc("SELECT COUNT(*) FROM sales.orders")
+
+    def test_jdbc_two_part_schema_is_bound_to_executing_source(self):
+        """A namespace sibling's schema is not authorized on source A's connection."""
+        namespace_native = frozenset()
+        namespace_federated = frozenset({("source_a", "public"), ("source_b", "secret")})
+
+        def validate(sql: str, selected_source_schemas: frozenset[str]) -> bool:
+            return SQLFirewall.validate_namespace_sql_scope(
+                sql,
+                native_databases=namespace_native,
+                federated_catalog_schemas=namespace_federated,
+                default_catalog="awsdatacatalog",
+                schema_only=True,
+                selected_source_schemas=selected_source_schemas,
+            )
+
+        assert validate("SELECT * FROM public.customers", frozenset({"public"}))
+        assert validate("SELECT * FROM secret.salaries", frozenset({"secret"}))
+        with pytest.raises(NamespaceSQLScopeError):
+            validate("SELECT * FROM secret.salaries", frozenset({"public"}))
 
     def test_jdbc_two_part_native_schema_is_allowed(self):
         assert self._validate_jdbc("SELECT COUNT(*) FROM tenant_a_db.customers")

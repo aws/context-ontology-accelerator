@@ -110,6 +110,58 @@ class TestListDatasourcesFiltering:
         assert len(result) == 1
         assert result[0]["datasourceId"] == "conn1"
 
+    def test_includes_databricks_sql_warehouse_source(self):
+        """Missing this sub-type fails CLOSED: the source never appears in the workbench's
+        datasource list, so it can never be induced, with no error raised anywhere."""
+        from coa_ontology.induce_catalog import list_datasources
+
+        request, mock_resource = _make_request(
+            [
+                {
+                    "PK": "NS#ns1",
+                    "SK": "SRC#dbx1",
+                    "name": "acme-databricks",
+                    "status": "APPROVED",
+                    "sourceType": "DATABASE",
+                    "sourceSubType": "DATABRICKS_SQL_WAREHOUSE",
+                    "tablesDiscovered": 6,
+                    "tablesApproved": 6,
+                    "namespaceId": "ns1",
+                },
+            ]
+        )
+
+        with patch("boto3.resource", return_value=mock_resource):
+            result = list_datasources(request, "ns1")
+
+        assert len(result) == 1
+        assert result[0]["datasourceId"] == "dbx1"
+
+    def test_excludes_an_unknown_database_sub_type(self):
+        """An unrecognised DATABASE sub-type is dropped rather than induced on a guess."""
+        from coa_ontology.induce_catalog import list_datasources
+
+        request, mock_resource = _make_request(
+            [
+                {
+                    "PK": "NS#ns1",
+                    "SK": "SRC#future1",
+                    "name": "not-yet-supported",
+                    "status": "APPROVED",
+                    "sourceType": "DATABASE",
+                    "sourceSubType": "SOME_FUTURE_WAREHOUSE",
+                    "tablesDiscovered": 1,
+                    "tablesApproved": 1,
+                    "namespaceId": "ns1",
+                },
+            ]
+        )
+
+        with patch("boto3.resource", return_value=mock_resource):
+            result = list_datasources(request, "ns1")
+
+        assert result == []
+
     def test_excludes_document_s3_source(self):
         from coa_ontology.induce_catalog import list_datasources
 

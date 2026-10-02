@@ -27,15 +27,12 @@ import { useTokenBuffer } from "./use-token-buffer";
 /**
  * Build the request's `options` object, omitting it entirely when nothing is set.
  *
- * Written as one helper rather than two conditional spreads because
+ * One helper rather than two conditional spreads, because
  * `...(mode && { options: { mode } })` followed by the same for `strategy` would
  * have the second overwrite the first — both assign the whole `options` key.
- * Omitting the object when empty keeps the request identical to before for a
- * caller that sets neither.
  *
- * Exported for test: a silent regression here would drop `mode` as well as
- * `strategy`, and the Playground page test mocks this whole hook, so there is no
- * other coverage of the request shape.
+ * Exported for test: the Playground page test mocks this whole hook, so there is
+ * no other coverage of the request shape.
  */
 export function buildOptions(
   mode?: ExecutionMode,

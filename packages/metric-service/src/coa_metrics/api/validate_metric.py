@@ -7,8 +7,9 @@ POST /namespaces/{namespaceId}/metrics/validate → 200 OK
 
 Runs all validation checks (1-6) against a metric definition supplied in the
 request body, without persisting it ("validate before create"). Returns
-advisory warnings. This mirrors the validation that runs implicitly on
-create (POST /metrics) and update (PUT /metrics/{name}).
+the complete validation report. This mirrors the SQL, source approval, and
+source-table gates that run implicitly on create (POST /metrics) and update
+(PUT /metrics/{name}).
 """
 
 from __future__ import annotations
@@ -28,6 +29,11 @@ from pydantic import ValidationError
 from coa_metrics.api.validation_errors import format_validation_error
 from coa_metrics.data_source_lookup_factory import build_data_source_lookup
 from coa_metrics.lookups import DataSourceLookup, NeptuneOntologyLookup
+from coa_metrics.source_status import (
+    SourceValidationUnavailableError,
+    check_source_approved,
+    check_source_table_exists,
+)
 from coa_metrics.validator import validate_metric
 
 setup_logging(os.environ.get("LOG_LEVEL", "INFO"))
@@ -106,6 +112,49 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         "ontologyConcepts": request.ontology_concepts or [],
     }
 
+    # Deterministic SQL findings take precedence over source-catalog outages,
+    # matching create/update, which reject SQL before performing external
+    # source validation. Running without lookups exercises only the pure SQL
+    # contract (plus explicit "not verified" advisories); if SQL already fails,
+    # return that actionable 200 report without replacing it with an unrelated
+    # 503 from the source gate.
+    try:
+        deterministic_result = validate_metric(
+            metric_body=metric_body,
+            data_sources_lookup=None,
+            ontology_lookup=None,
+            namespace=namespace,
+        )
+    except Exception as exc:
+        logger.exception("validation_failed", error=str(exc))
+        return api_response(500, {"message": "Internal error during validation"})
+
+    if deterministic_result.errors:
+        warnings = [
+            {"field": err.get("check", "sql_syntax"), "message": err["message"], "severity": "ERROR"}
+            for err in deterministic_result.errors
+        ] + [
+            {"field": warn.get("check", "validation"), "message": warn["message"], "severity": "INFO"}
+            for warn in deterministic_result.warnings
+        ]
+        return api_response(200, {"warnings": warnings})
+
+    # Use the same source acceptance gates as create/update so validate-before-
+    # create predicts the write verdict. Keep returning 200 for ordinary
+    # validation failures so callers receive the complete report; an operational
+    # inability to perform the gate remains a 503, matching the write endpoints.
+    try:
+        source_error = check_source_approved(namespace, request.data_source_id)
+        source_field = "dataSourceId"
+        if source_error is None:
+            source_error = check_source_table_exists(namespace, request.data_source_id, request.source_table)
+            source_field = "sourceTable"
+    except SourceValidationUnavailableError as exc:
+        logger.error("source_validation_unavailable", namespace=namespace, error=str(exc))
+        return api_response(503, {"message": "Data source validation is unavailable — try again later"})
+
+    source_findings = [{"field": source_field, "message": source_error, "severity": "ERROR"}] if source_error else []
+
     # Run validation
     try:
         result = validate_metric(
@@ -118,14 +167,20 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         logger.exception("validation_failed", error=str(exc))
         return api_response(500, {"message": "Internal error during validation"})
 
-    # The contract exposes a single advisory `warnings` list (WarningSeverity:
-    # WARNING | INFO). Blocking syntax errors map to WARNING, soft findings to INFO.
-    warnings = [
-        {"field": err.get("check", "sql_syntax"), "message": err["message"], "severity": "WARNING"}
-        for err in result.errors
-    ] + [
-        {"field": warn.get("check", "validation"), "message": warn["message"], "severity": "INFO"}
-        for warn in result.warnings
-    ]
+    # Blocking findings surface as ERROR so a "validate before create" call
+    # predicts write acceptance: SQL syntax/shape matches the persistence gate,
+    # and a provably absent declared sourceTable matches the dedicated source
+    # gate. Advisory metadata and ontology findings stay INFO.
+    warnings = (
+        source_findings
+        + [
+            {"field": err.get("check", "sql_syntax"), "message": err["message"], "severity": "ERROR"}
+            for err in result.errors
+        ]
+        + [
+            {"field": warn.get("check", "validation"), "message": warn["message"], "severity": "INFO"}
+            for warn in result.warnings
+        ]
+    )
 
     return api_response(200, {"warnings": warnings})

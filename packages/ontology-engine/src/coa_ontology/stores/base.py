@@ -17,6 +17,7 @@ Two golden rules:
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
@@ -140,6 +141,31 @@ class VectorStore(Protocol):
         """Drop all embeddings for an ontology. Returns deleted count."""
         ...
 
+    def delete_embeddings_for_entities(
+        self,
+        entity_uris: Iterable[str],
+        ontology_id: str,
+        namespace: str | None = None,
+    ) -> int:
+        """Drop every embedding whose ``entity_uri`` is in ``entity_uris`` within a single ontology.
+
+        Returns the deleted count.
+
+        Used by append-mode ingest right before it re-embeds the subjects of an
+        incoming proposal: a class whose description a steward replaced must not
+        keep a stale embedding of the AI text in the index beside the new one,
+        or recall keeps surfacing the superseded phrasing.
+
+        The ``ontology_id`` scoping is load-bearing. A single namespace index
+        can carry embeddings for multiple ontologies (foundational reloads with
+        ``allow_append=True``, explicit-target merges), and different ontologies
+        can carry the same IRI — an unscoped delete would take the OTHER
+        ontology's embedding with it and re-create it under the wrong owner.
+        Scoped to the given entities within the given ontology only; every
+        other subject in the shared namespace index is untouched.
+        """
+        ...
+
     def delete_index(self, namespace: str | None = None) -> bool:
         """Delete the entire vector index for a namespace. Returns True if it existed."""
         ...
@@ -230,6 +256,31 @@ class GraphStore(Protocol):
 
         Returns:
             The stored property as a dict.
+        """
+        ...
+
+    # Annotation supersession (append-mode re-ingest) ------------------
+    def supersede_annotations(
+        self,
+        ontology_uri: str,
+        subject_uris: Iterable[str],
+        predicates: Mapping[str, str | None],
+    ) -> int:
+        """Retire the existing ``predicates`` values of ``subject_uris`` in one ontology graph.
+
+        Called by append-mode ingest immediately before the incoming payload is
+        written, so the incoming values for those (subject, predicate) pairs
+        REPLACE what is live instead of accumulating beside it — a steward's
+        re-induced description must not sit next to the earlier AI-generated
+        one. ``predicates`` maps each annotation predicate to the history
+        predicate its displaced values are moved to, or ``None`` to drop them;
+        the previous generation stays inspectable without being live content.
+        Scoped strictly to the given subjects — other subjects in the same
+        graph (e.g. co-merged proposals) are untouched.
+
+        Returns the number of live triples retired, or ``0`` when the backend
+        has nothing to supersede (property-graph backends whose ``store_class``
+        / ``store_property`` already overwrite return ``0`` without I/O).
         """
         ...
 

@@ -249,4 +249,56 @@ describe("StorageStack", () => {
       ).toBe(1);
     });
   });
+
+  describe("OCU capacity validation", () => {
+    // NEXTGEN valid OCU values (both min and max): 0, 2, 4, 8, 16, or a
+    // multiple of 16, up to 1696. max additionally cannot be 0.
+    function buildWithOcu(min?: unknown, max?: unknown): () => void {
+      return () => {
+        const app = new cdk.App({
+          context: {
+            ...(min !== undefined ? { aoss_min_ocu: min } : {}),
+            ...(max !== undefined ? { aoss_max_ocu: max } : {}),
+          },
+        });
+        const network = new NetworkStack(app, "TestNetwork", { env: TEST_ENV });
+        const storage = new StorageStack(app, "TestStorage", {
+          network,
+          env: TEST_ENV,
+        });
+        Template.fromStack(storage);
+      };
+    }
+
+    it("accepts valid NEXTGEN values (0, 2, 16, multiple of 16)", () => {
+      expect(buildWithOcu(0, 2)).not.toThrow();
+      expect(buildWithOcu(16, 96)).not.toThrow();
+      expect(buildWithOcu(32, 48)).not.toThrow();
+    });
+
+    it("rejects a min OCU that is not a NEXTGEN valid value", () => {
+      expect(buildWithOcu(3, 96)).toThrow(/min OCU must be/);
+      expect(buildWithOcu(6, 96)).toThrow(/min OCU must be/);
+    });
+
+    it("rejects a max OCU that is not a NEXTGEN valid value (not just odd)", () => {
+      // 6, 10, 12 are even but NOT NEXTGEN-valid; the old `% 2` check wrongly allowed them.
+      expect(buildWithOcu(2, 6)).toThrow(/max OCU must be/);
+      expect(buildWithOcu(2, 10)).toThrow(/max OCU must be/);
+      expect(buildWithOcu(2, 12)).toThrow(/max OCU must be/);
+    });
+
+    it("rejects max OCU of 0 (ceiling cannot be zero)", () => {
+      expect(buildWithOcu(0, 0)).toThrow(/max OCU must be/);
+    });
+
+    it("rejects values above the 1696 NEXTGEN ceiling", () => {
+      expect(buildWithOcu(2, 1712)).toThrow(/max OCU must be/);
+      expect(buildWithOcu(1712, 1712)).toThrow(/min OCU must be/);
+    });
+
+    it("rejects min OCU greater than max OCU", () => {
+      expect(buildWithOcu(16, 8)).toThrow(/cannot exceed/);
+    });
+  });
 });

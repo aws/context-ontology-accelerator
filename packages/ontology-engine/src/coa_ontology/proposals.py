@@ -1277,25 +1277,30 @@ def _run_accept_proposal(
             ),
         )
 
-        # ── Step: wait until embeddings are searchable — NON-FATAL ─────────
+        # ── Step: wait until embeddings are searchable — FATAL ─────────────
         # AOSS is eventually consistent; a later induction grounding on this
         # ontology (or a serve request) could miss just-written embeddings.
         # Surface as ``embeddings_sync`` so a poller shows "Syncing embeddings…".
         #
-        # fatal=False is explicit rather than incidental: wait_for_embeddings_
-        # searchable NEVER raises — it returns False on a stalled index — so this
-        # step could not fail an accept no matter what was declared here. Saying
-        # fatal=False makes the pipeline honest about that. It is also the right
-        # policy: the embeddings are durably written and only their search
-        # visibility lagged, so failing the accept would strand a correct
-        # ontology. A stall is checkpointed ``skipped`` and logged.
+        # fatal=True (was False): with the #173 write-path fixes, the embeddings
+        # are KNOWN-ACKNOWLEDGED by the vector store before this wait runs
+        # (bulk_with_retry raises on any doc that fails to land). So a stall here
+        # is no longer "durably written, visibility just lagged" — it means the
+        # index did NOT converge on writes we were told succeeded, i.e. loss or
+        # an unhealthy index. Accepting anyway would publish an ontology whose
+        # embeddings are not fully retrievable — exactly the silent-degradation
+        # #173 reports. We therefore RAISE on a non-convergence so the accept
+        # lands accept_failed / embeddings_searchable and can be re-accepted,
+        # rather than being checkpointed ``skipped`` and reported as success.
+        #
+        # The no-progress-deadline + on_progress heartbeat still protect a
+        # large-but-healthy sync: the deadline resets on every advance, so only a
+        # genuinely wedged index trips it.
         embedded_uris = (result.get("embeddings") or {}).get("entity_uris", [])
         dynamo_store.update_proposal(proposal_id, namespace=namespace, status=PROPOSAL_STATUS_EMBEDDINGS_SYNC)
-        _run_accept_step(
-            "embeddings_searchable",
-            proposal_id,
-            namespace,
-            lambda: wait_for_embeddings_searchable(
+
+        def _wait_embeddings_searchable_or_raise() -> None:
+            ok = wait_for_embeddings_searchable(
                 vector_store=vector_store,
                 ontology_id=result.get("ontology_id", target_ontology_id),
                 namespace=namespace,
@@ -1310,8 +1315,22 @@ def _run_accept_proposal(
                 on_progress=lambda done, total: _checkpoint_accept_step(
                     proposal_id, namespace, "embeddings_searchable", f"syncing {done}/{total}"
                 ),
-            ),
-            fatal=False,
+            )
+            if not ok:
+                # Raise so _run_accept_step (fatal=True) fails the accept, rather
+                # than returning False and being checkpointed a non-fatal "skipped".
+                raise RuntimeError(
+                    f"embeddings for {result.get('ontology_id', target_ontology_id)} did not become "
+                    f"searchable (index did not converge on acknowledged writes); failing accept so it "
+                    f"can be retried rather than publishing a partially-retrievable ontology"
+                )
+
+        _run_accept_step(
+            "embeddings_searchable",
+            proposal_id,
+            namespace,
+            _wait_embeddings_searchable_or_raise,
+            fatal=True,
         )
 
         # ── Cache Turtle to local disk (non-fatal, not a pipeline step) ───

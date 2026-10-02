@@ -1,18 +1,11 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-/**
- * The strings COA's IAM policies match on. Every one is load-bearing.
- *
- * <p>Stated here rather than imported, so a copied-out connector still builds. <b>Nothing verifies
- * that these match the policies COA enforces</b> — the risk is accepted knowingly, and recorded here
- * for whoever changes either side.
- *
- * <p>Failure timing is asymmetric. {@link CONNECTOR_TAG_KEY} fails immediately: COA's invoke policy
- * is scoped to it, so a missing tag denies the first scan. The spill three fail only once a response
- * exceeds Athena's 6 MB limit — and a connector that cannot write spill has been observed returning
- * `SUCCEEDED` with zero rows rather than an error.
- */
+// The strings COA's IAM policies match on; changing any one breaks a grant. Stated here rather than
+// imported so a copied-out connector still builds, and nothing verifies they match the policies COA
+// enforces. A missing CONNECTOR_TAG_KEY denies the first scan, while the spill three fail only once
+// a response exceeds Athena's 6 MB limit, where a connector that cannot write spill has been
+// observed returning SUCCEEDED with zero rows rather than an error.
 
 /** Tag COA's invoke policy matches on. Without it the function cannot be invoked at all. */
 export const CONNECTOR_TAG_KEY = "coa:connector";
@@ -27,16 +20,19 @@ export const CONNECTOR_TAG_VALUE = "true";
 export const CONNECTOR_SPILL_KEY_GLOB = "connectors/*/spills/*";
 
 /**
- * Where a COA operator reads the two role ARNs, in COA's account.
+ * The SSM paths in COA's account that publish the two role ARNs. Whoever deploys a connector reads them
+ * with `aws ssm get-parameter` and passes the values in; the connector's own stack cannot read them,
+ * because it usually runs in another account and SSM parameters are not readable across accounts.
  *
- * <p>Documented, not read: a connector usually runs in another account and SSM parameters are not
- * readable across accounts, so the values arrive as environment variables instead.
+ * Both paths carry the COA environment name, so a second COA environment in the same account and prefix
+ * cannot overwrite these values. A script still reading the older `/{prefix}/serve/runtime-role-arn`
+ * finds nothing.
  */
 export const COA_ROLE_SSM_PARAMS = {
-  /** Runs queries. `/{prefix}/serve/runtime-role-arn`. */
-  serve: "/{prefix}/serve/runtime-role-arn",
-  /** Runs `DESCRIBE` during a scan. `/{prefix}/sources/db-connector-role-arn`. */
-  discovery: "/{prefix}/sources/db-connector-role-arn",
+  /** Runs queries. `/{prefix}/{envName}/serve/runtime-role-arn`. */
+  serve: "/{prefix}/{envName}/serve/runtime-role-arn",
+  /** Runs `DESCRIBE` during a scan. `/{prefix}/{envName}/sources/db-connector-role-arn`. */
+  discovery: "/{prefix}/{envName}/sources/db-connector-role-arn",
 } as const;
 
 /**
@@ -63,6 +59,16 @@ export const CATALOG_DIMENSION = "Catalog";
 export const ConnectorMetricName = {
   /** Configuration could not be resolved for the catalog a request arrived under. */
   configResolutionFailures: "ConnectorConfigResolutionFailures",
+  /**
+   * The configuration store throttled the connector. Distinct from a resolution failure: the
+   * configuration is fine and the first action is a rate limit rather than a fix.
+   */
+  configThrottles: "ConnectorConfigThrottles",
+  /**
+   * `sts:AssumeRole` on the customer-owned role guarding a credential failed. Distinct again,
+   * because the cause is a policy COA neither owns nor can repair.
+   */
+  credentialAssumeFailures: "ConnectorCredentialAssumeFailures",
   /** A connection to the upstream data source could not be opened. */
   warehouseConnectFailures: "ConnectorWarehouseConnectFailures",
   /** Rows returned by one table read. */

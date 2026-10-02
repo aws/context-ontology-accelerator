@@ -15,6 +15,56 @@ This guide walks you through deploying Context Ontology Accelerator into your AW
 | Java | 17+ | Smithy code generation |
 | Docker | — | Container image builds |
 
+### ARM64 container builds on x86_64 hosts
+
+Several CDK assets are built explicitly for `linux/arm64`: the Context Manager
+(Serve), MCP, and VKG images. A native ARM64 machine needs no emulation. An
+x86_64 Linux host must have binfmt/QEMU registered before Docker can execute
+ARM64 build steps; otherwise the build commonly stops with `exec format error`.
+
+Docker Desktop includes multi-platform emulation on supported installations.
+Verify the active Docker builder before deploying:
+
+```bash
+docker buildx inspect --bootstrap
+docker run --rm --platform linux/arm64 alpine uname -m
+```
+
+The builder's platform list should include `linux/arm64`, and the second command
+should print `aarch64`. If Docker Engine on Linux does not have ARM64 emulation,
+follow [Docker's QEMU setup guidance](https://docs.docker.com/build/building/multi-platform/#qemu).
+The [tonistiigi/binfmt installer](https://github.com/tonistiigi/binfmt#installing-emulators)
+accepts an architecture-specific install so the host only registers the
+emulator needed here:
+
+```bash
+docker run --privileged --rm tonistiigi/binfmt --install arm64
+
+# Verify again before make deploy-dev
+docker run --rm --platform linux/arm64 alpine uname -m
+```
+
+!!! warning "binfmt installation is privileged"
+    Registering binfmt modifies the host kernel configuration and the command
+    above runs a privileged container. Follow your organization's host-security
+    policy. Where privileged setup is not allowed, use a native ARM64 builder or
+    supply prebuilt ARM64 ECR images instead of building the assets locally.
+    `context_manager_image_uri` supplies the shared Context Manager image used
+    by the Serve and MCP stacks. VKG requires `vkg_image_uri` together with
+    `ecr_repository_arn` and `ecr_repository_name`.
+
+If a build still fails:
+
+1. Check whether `CDK_DOCKER` selects Docker, Finch, or another engine. Register
+   emulation in the same engine that CDK will use.
+2. When Docker is active, re-run `docker buildx inspect --bootstrap` and confirm
+   `linux/arm64` is listed.
+3. Run the Docker Alpine verification command above. An `exec format error` there is a
+   host/emulation problem, before CDK or application code is involved.
+4. On a remote or custom builder, inspect the selected builder with
+   `docker buildx ls`; registration on the local default engine does not
+   configure a different builder automatically.
+
 ## AWS Account Setup
 
 Context Ontology Accelerator deploys into a single AWS account and region. Ensure the deploying principal has `AdministratorAccess` or equivalent permissions for the initial deployment.
@@ -290,6 +340,52 @@ Total fresh deploy: **~1.5 hours** for CDK/CloudFormation provisioning of all 16
 !!! warning "First-time setup adds significant time"
     The ~1.5 hour figure above is CDK/CloudFormation provisioning time only. On a fresh machine or first-time deploy, budget additional time on top of that for: installing `mise`-managed toolchains, `uv sync`/`pnpm install`, Smithy/Gradle codegen (`make generate` — first run downloads Gradle wrappers, openapi-generator, and builds TypeScript clients from scratch), Docker image builds, and CDK bootstrap. Subsequent deploys after initial setup are faster since dependencies and generated artifacts are cached, though CloudFormation provisioning time for a fresh set of stacks remains similar.
 
+### The Databricks SQL Warehouse connector
+
+`DATABRICKS_SQL_WAREHOUSE` sources are served by **one connector Lambda that Context Ontology Accelerator operates**, deployed from its own CDK app rather than as one of the 16 stacks above. It is not optional and it is not per source: **a `DATABRICKS_SQL_WAREHOUSE` source cannot be registered at all until it exists.** Source creation resolves the connector's function ARN from an SSM parameter the connector's own stack publishes, and fails the create with a `400` naming the missing connector if that parameter is absent — so a deployment that skips this step advertises a source sub-type nothing can serve, and the first person to hit it is whoever tries to onboard a warehouse.
+
+`make deploy-dev` deploys it for you, as a second step after the platform stacks:
+
+```bash
+make deploy-dev          # platform stacks, then the connector
+```
+
+To deploy or redeploy just the connector against an already-deployed environment:
+
+```bash
+make deploy-databricks-connector
+```
+
+Both run `scripts/deploy-managed-databricks-connector.sh`, which installs the `connectors/` workspace, builds the connector's fat JAR with Maven, and deploys its stack.
+
+!!! important "The order is platform first, then connector — and it cannot be reversed"
+    The two deployments each read something the other publishes, in one direction only:
+
+    - The connector's stack **reads Context Ontology Accelerator's serve and discovery role ARNs from SSM** (`/<prefix>/<env>/serve/runtime-role-arn` and `/<prefix>/<env>/sources/db-connector-role-arn`) to grant them `lambda:InvokeFunction`, spill-bucket reads and `kms:Decrypt` on its spill key. Those parameters are written by the platform stacks, so the connector cannot synthesize before they exist.
+    - It also **reads the platform's VPC and private subnets** (`/<prefix>/<env>/network/vpc-id` and `/<prefix>/<env>/network/private-subnet-ids`) and runs the connector function there, with a security group of its own that allows HTTPS out and nothing else. It reaches the Databricks workspace through the VPC's NAT gateway.
+    - The connector then **publishes its own function ARN and execution-role ARN back into the platform's parameter tree**, under `/<prefix>/<env>/connectors/databricks/deployment/`. The sources API reads the function ARN on every source create.
+
+    Run the connector first and the script exits with `COA does not appear to be deployed in this account/<region> under prefix '<prefix>'`, naming the missing parameters. It does not guess.
+
+    Pass the same `SCL_PREFIX` and region you deployed the platform with. The script defaults to `coa` to match the CDK app; a mismatch reads a different deployment's parameters and reports the platform as absent.
+
+The function's name carries a reserved `-managed-` segment (`<prefix>-<env>-managed-…`) and **can never change**: `athena:CreateDataCatalog` stores the handler ARN and never re-resolves it, so every Athena data catalog created for a Databricks source embeds this function's ARN. Renaming it orphans every catalog already created, with no in-place repair. The connector's managed CDK app derives that prefix from the resource prefix and the environment name and **ignores `FUNCTION_NAME_PREFIX` entirely**, so there is no value an operator can set that moves the name. A customer-deployed Databricks connector must not use a `-managed-` prefix either, and its own app refuses one at synth.
+
+The script prints the connector's **execution-role ARN** at the end. That is the one value a human has to carry out of the deploy: each Databricks source's credential owner must name it in their IAM role's trust policy before their role can be assumed, and the platform cannot supply it on their behalf. It is also durable in SSM at `/<prefix>/<env>/connectors/databricks/deployment/role-arn`, which is what to re-read months later. See [Databricks SQL Warehouse Sources](databricks-sources.md).
+
+In CI, `ci/mainline.yml` models the same ordering with a **blocking** `deploy-managed-databricks-connector` job that depends on the platform deploy and that the integration-test jobs depend on in turn — so a half-applied release is red in the pipeline rather than latent until someone registers a source.
+
+#### Before the parameter-integrity alarm counts as coverage
+
+Each source's connection facts live in an SSM parameter the connector reads at query time, and repointing one silently points a source at another source's credential. The detection for that is the `UnexpectedConnectorParameterWrite` metric and the `<prefix>-<env>-databricks-unexpected-parameter-write` alarm, described in full under [Connector Parameter Integrity](#connector-parameter-integrity-cloudtrail-prerequisite) below. **Two things have to be true before it is worth relying on, and only one of them is a deployment step:**
+
+1. **Confirm the account has a CloudTrail trail logging management events.** `ssm:PutParameter` is a management event, and EventBridge only delivers it where such a trail exists. This deployment creates none, so it inherits whatever the account already has — and most enterprise accounts already qualify. See [The prerequisite: a CloudTrail trail logging management events](#the-prerequisite-a-cloudtrail-trail-logging-management-events) for the three commands that check it. Without a qualifying trail the rules match nothing and the alarm is **blind rather than quiet**.
+2. **The alarm notifies nobody.** Alarm actions are unwired across this deployment: the alarm-action strategy in `infra/bin/app.ts` is left undefined, so every alarm the stacks create — this one included — evaluates and changes state without sending anything to SNS, chat or a ticket. It is also on no dashboard. So the alarm is discoverable only by someone opening the CloudWatch alarms console and looking, which nobody does unprompted.
+
+Until an alarm action is wired, treat the audit log group `/aws/events/<prefix>-<env>-databricks-parameter-writes` (retained one year, and it records **every** write under the path, legitimate ones included) as the actual detection surface, and put a periodic review of it on someone's list. The narrow SSM write scope on the sources-API role remains the primary control either way.
+
+With a trail in place the rest of the chain needs nothing from you: a write under the per-source path by a non-allowlisted role reaches the audit log group within seconds, and the alarm goes to `ALARM` about a minute later.
+
 ### Configuration Options
 
 Override defaults via environment variables:
@@ -364,6 +460,35 @@ SCL_DB_SCAN_ENRICHMENT_TIMEOUT_MINUTES=180 make deploy-dev
 
 The value is minutes and must be a positive number; CDK fails synth otherwise. On a direct `cdk deploy` (rather than the `make`/`deploy.sh` path) pass it as CDK context instead — `--context dbScanEnrichmentTimeoutMinutes=180`, or set it in the `context` block of `infra/cdk.json`. The Step Functions state-machine ceiling is derived automatically as this value plus two minutes, so the per-task deadline always trips first and routes the source to `SCAN_FAILED`.
 
+#### Whole-request budget
+
+Every `/query` request shares one wall clock across all tiers and strategies, defaulting to **170 seconds**. It is the outer bound that each per-stage timeout — including the translation budget below — sits inside, so raising a stage above it buys nothing.
+
+```bash
+# Allow up to 240 seconds per request (default is 170)
+cdk deploy --context resolve_timeout_s=240
+```
+
+The value is seconds and is clamped to 10–300, so passing a larger number does not widen the budget. It is one setting on one runtime: REST, MCP and streaming callers all get the same figure, and it does not lift the transport-level 29-second REST ceiling described below. Raise it when questions on wide namespaces are cut off mid-answer rather than answered wrongly — and note that on the default `nl_to_sql_first` strategy the stages share this budget in order, so time an earlier stage spends is taken off the ones after it.
+
+#### NL→SPARQL translation budget
+
+The Tier-2 **Ontop route** (`strategy` = `ontop`, `ontop_first`, or the second half of the default `nl_to_sql_first`) answers a question by translating it to SPARQL over the namespace's ontology and letting Ontop compile that to SQL. One wall clock covers the whole translation — T-Box assembly, the LLM call, SPARQL validation, and every validate-and-retry attempt — and it defaults to **60 seconds**.
+
+Raise it when a trace shows `translation_timed_out`, which happens on wide namespaces where a complete T-Box makes a long prompt. Measured over 727 translations on a 175-class namespace: p50 **29.1 s**, p90 **44.7 s**, and **6.9%** already hitting the 60 s limit.
+
+```bash
+# Allow up to 120 seconds per translation (default is 60)
+cdk deploy --context serve_vkg_translation_timeout_s=120
+```
+
+The value is seconds, clamped to 10–600; out-of-range values are clamped and logged, and an unparseable one keeps the default. Unset leaves the shipped 60 s, so upgrading moves nothing. It can also go in the `context` block of `infra/cdk.json`.
+
+!!! warning "This route does not fit inside the 29-second REST timeout"
+    A *median* translation already exceeds the whole REST budget, so raising this value does not make the Ontop route work over `POST /query` — the REST path's own timeout is pinned at 29 s in the data-layer handler, is not settable from `infra/`, and severs the socket first, which surfaces as the `504` in [Serve → Troubleshooting](serve.md#troubleshooting). Reach this route over the SSE-streaming Playground or the MCP server instead — neither sits behind API Gateway. See [Serve → Query Interfaces](serve.md#query-interfaces).
+
+Three further ceilings sit above this knob and it cannot raise any of them: `resolve_timeout_s` (the whole-request budget above); roughly **half** of that if the request retries, because a rejected first SPARQL re-enters translation with a fresh budget; and **90 s** under `strategy="best"`, where each Tier-2 strategy is wrapped in its own timeout. On the default `nl_to_sql_first` strategy this route runs *second*, so whatever it spends is taken off Tier 3 within the same request. Raise it well past 60 s only for callers that pin `options.strategy` to `ontop` or `ontop_first`, or raise `resolve_timeout_s` in step.
+
 #### Lambda reserved concurrency
 
 Two Lambdas — the VKG reloader and the document preprocessor — reserve concurrent executions (default **5** each) to bound their blast radius. On an account whose **Lambda concurrent-executions quota** (`L-B99A9384`) is at the reduced default of **10** — which AWS applies to some new accounts — reserving *any* concurrency is rejected, because it would drop unreserved capacity below Lambda's account-wide minimum of 10. The deploy runs for ~30 minutes and then fails and rolls back on `coa-dev-vkg` (and `coa-dev-sources` after it) with:
@@ -381,6 +506,27 @@ SCL_LAMBDA_RESERVED_CONCURRENCY=0 make deploy-dev
 ```
 
 The value must be a non-negative integer; CDK fails synth otherwise. `0` (or unset via context) omits the reservation entirely — the functions then draw from the shared unreserved pool with no dedicated guarantee or cap, which is fine for a single-tenant evaluation. On a direct `cdk deploy`, pass it as context instead — `--context lambda_reserved_concurrency=0`, or set it in the `context` block of `infra/cdk.json`.
+
+#### Tier-2 NL→SQL ontology foreign-key expansion
+
+When Tier 2 answers a question with flat NL→SQL, it first retrieves the tables that best match the question. It then follows the ontology's foreign keys one step out from those tables and adds the tables it reaches, with their columns and join keys, to the prompt. This lets the model write a join to a table the search did not rank. It is **on by default** and needs the ontology graph (Neptune); a deployment without one skips it and uses the retrieved tables alone. If the graph query fails, the question is still answered from the retrieved tables.
+
+Two settings control it:
+
+```bash
+# Turn the expansion off for the whole deployment (default: on)
+SCL_NL2SQL_GRAPH_EXPAND=false make deploy-dev
+
+# Let it append up to 12 walked tables (default is 8)
+SCL_NL2SQL_GRAPH_EXPAND_MAX_TABLES=12 make deploy-dev
+```
+
+- **`serve_nl2sql_graph_expand`** — `false`/`0`/`off`/`no` turns it off; `true`/`1`/`on`/`yes` turns it on explicitly. Any other value is ignored and the default (on) applies.
+- **`serve_nl2sql_graph_expand_max_tables`** — how many walked tables may be added. `0` adds none. A value that is not a whole number falls back to 8, and a negative one is treated as `0`; both log a warning. The graph tool caps the walk at 200 tables whatever you set. Raise it when the table a join needs is often missing from the prompt and the prompt has room.
+
+Leaving either setting unset leaves the runtime's default in charge; the stack only sets the Serve runtime variable (`SERVE_NL2SQL_GRAPH_EXPAND` / `SERVE_NL2SQL_GRAPH_EXPAND_MAX_TABLES`) when you pass a value. Changing either one is a stack update, not an image rebuild. A single request can also override the deployment setting with `options.flatGraphExpand` (`true` or `false`). An A/B test that compares the expansion on and off must pass `flatGraphExpand: false` for the "off" arm; leaving the option out now means on.
+
+`scripts/deploy.sh` maps the variables above to the CDK context parameters `serve_nl2sql_graph_expand` and `serve_nl2sql_graph_expand_max_tables`. On a direct `cdk deploy`, pass them as context instead — `--context serve_nl2sql_graph_expand=false` — or set them in the `context` block of `infra/cdk.json`.
 
 ### VKG Task Sizing
 
@@ -454,8 +600,13 @@ when tuning a large or pathological source.
 | `BULK_REVIEW_PAGE_BUDGET` | `worker.py` default | Per-invocation table budget for the bulk-review worker (default `1000`); when a source has more tables, the worker processes one page, re-enqueues a continuation, and resumes across chained invocations rather than silently capping. |
 | `BULK_REVIEW_WALL_CLOCK_BUDGET_S` | `worker.py` default | Per-invocation wall-clock budget in seconds (default `240`), a second guard under the 5-minute Lambda timeout that stops the worker after the current search page and continues in a fresh invocation when neared. |
 | `REVIEW_QUEUE_URL` | `sources-stack.ts` | SQS review-queue URL the bulk-review worker re-enqueues page continuations to, wiring its own self-continuation. |
-| `DATAZONE_CLEANUP_BUDGET_S` | `sources_handler.py` default | **Upper clamp** (not an absolute deadline) on DataZone asset cleanup during source delete, in seconds (default `240`). The effective deadline is `min(this value, remaining Lambda time − 2s safety margin)`, so it can shorten the window but never extend past the real timeout. On expiry the delete returns partial-completion counts and the namespace-deletion sweep finishes the remainder, instead of the Lambda being killed mid-request. A malformed value falls back to `240`. |
+| `DATAZONE_CLEANUP_BUDGET_S` | `sources_handler.py` default; `sources-stack.ts` on the delete worker | **Upper clamp** (not an absolute deadline) on DataZone asset cleanup during source delete, in seconds (default `240`; the `sources-delete-worker` sets `840`). The effective deadline is `min(this value, remaining Lambda time − 2s safety margin)`, so it can shorten the window but never extend past the real timeout. On expiry the source row is kept and the delete is retried (worker redrive, or a repeat `DELETE` on a `DELETE_FAILED` source) instead of being dropped with assets left behind. A malformed value falls back to `240`. |
+| `SOURCE_DELETE_QUEUE_URL` | `sources-stack.ts` | SQS queue the `sources-api` hands database-source deletes to. When set, `DELETE` of a database source returns `202` + `DELETING` and `sources-delete-worker` (15-min timeout) finishes the teardown; when unset, the delete runs inline and returns `200`. |
+| `PROBE_MAX_ROWS` | `dialects.py` default | Maximum rows the column-cardinality probe reads per column (default `100000`), on every engine including the Glue/Athena sampler. Complements `PROBE_TIMEOUT_MS`: that bounds how long a probe runs, this bounds how much it reads. Past the cap, counts describe a prefix of the table in scan order, so a rare value beyond it is missed. Must be a positive integer; a malformed value falls back to the default. |
 | `PROBE_TIMEOUT_MS` | `dialects.py` default | Session-level `statement_timeout` (milliseconds, default `30000`) applied on Postgres/Redshift connections before the column-cardinality probe used for enum detection. Bounds the `COUNT(*) / COUNT(DISTINCT …)` probe and the sampling query that follows it, so one wide or high-cardinality column cannot consume the whole 15-minute `sources-db-connector` budget. Must be a positive integer; a malformed or non-positive value logs a warning and falls back to the default rather than removing the bound. Set it **lower** to fail faster on pathological columns, **higher** only if legitimately large tables are being skipped — too high defeats the protection, and a timed-out column is simply treated as "not an enum" (logged as `distinct_probe_timeout`). |
+| `RESOURCE_PREFIX` | `sources-stack.ts`, `namespace-stack.ts` | The deployment's full `{prefix}-{env}-` resource prefix, e.g. `coa-dev-`. **Mandatory, with no default.** Three customer-visible values are derived from it: each namespace's `sts:ExternalId`, the reserved `{prefix}-{env}-datasource-access-` role-name prefix a cross-account role must sit inside, and the per-source Athena data-catalog name a query resolves. A Lambda missing it now **raises**, so a source create returns `500` and `GET /namespaces/{namespaceId}` (which returns `datasourceExternalId` for the connect form) fails rather than answering with a value derived from an invented `coa-dev-` prefix. That default was the worse outcome: the source registered normally and the mismatch surfaced at the first query, after the customer had already written the wrong ExternalId into their trust policy. CDK sets it on every Lambda that needs it, so an unset value means a misdeployed component rather than a tuning choice. |
+| `DATABRICKS_CONFIG_SSM_PREFIX` | `sources-stack.ts` | Parameter-path prefix the sources API writes one SSM parameter per `DATABRICKS_SQL_WAREHOUSE` source under, named after that source's derived Athena catalog name, e.g. `/coa/dev/connectors/databricks/sources`. The connector reads the same path per request for the catalog it was invoked under. Carries the environment segment, because a dev registration writing under a path a prod connector reads would point a prod catalog at a dev source. |
+| `DATABRICKS_CONNECTOR_ARN_SSM_PARAM` | `sources-stack.ts` | The parameter **name** the sources API resolves the managed connector's function ARN from, e.g. `/coa/dev/connectors/databricks/deployment/function-arn`. A name rather than a value, because the connector is deployed from its own CDK app and its function ARN does not exist when this stack synthesizes. The API reads it per source create and fails the create with a `400` when it is absent, which is what makes a half-applied release loud at submit rather than latent until the first query. |
 
 **Migration note for `DATAZONE_CLEANUP_BUDGET_S`.** Before the GH-137 fix this was
 an absolute wall-clock deadline that bounded only the delete loop, and its `240`
@@ -713,6 +864,162 @@ fields @timestamp, component, filter_type, latency_ms
 > dashboard is empty, confirm you are looking at the region the stack deployed
 > to, not `us-east-1`.
 
+## Connector Parameter Integrity — CloudTrail Prerequisite
+
+Each `DATABRICKS_SQL_WAREHOUSE` source's connection facts — its warehouse, its
+Unity Catalog catalog and schema, its credential secret ARN and the role that
+reads it — are held in an SSM parameter that the connector reads at query time,
+under `/<prefix>/<env>/connectors/databricks/sources/`. **Repointing one of those
+parameters points a source at another source's credential with its Athena catalog
+name unchanged.**
+
+That is why this deployment ships a detection for writes under that path, and why
+the detection has a prerequisite you must confirm yourself.
+
+### Why no other signal can see a repoint
+
+A repointed parameter **resolves successfully**: the connector reads it, assumes
+the role named in it, opens a session to the warehouse named in it, and returns
+rows. Nothing errors, so no failure metric moves —
+`ConnectorConfigResolutionFailures` is silent by construction. The primary control
+is the narrow write scope on the sources-API role, which is the only platform
+principal that writes there; `UnexpectedConnectorParameterWrite` is the secondary
+control, and it is the **only** detection.
+
+### The prerequisite: a CloudTrail trail logging management events
+
+`ssm:PutParameter` is a **management event**. EventBridge only delivers it as
+`AWS API Call via CloudTrail` in an account and region where a trail is logging
+management events. **This deployment creates no trail** — a trail is account-wide
+and needs its own bucket, encryption and retention decisions, so it belongs to the
+account's own baseline rather than to a service stack.
+
+So **check whether the account already has one** rather than assuming it does not.
+Most enterprise accounts do: organization trails are common and typically log
+management events in every region, which is exactly what this needs. For those readers the commands below are
+verification rather than work. Where no qualifying trail exists the EventBridge
+rules match nothing: the alarm stays silent not because nothing happened but
+because **nothing is being observed**, and the write scope is then the only
+control.
+
+```bash
+# Is there a trail at all, and is it on?
+aws cloudtrail describe-trails \
+  --query 'trailList[].{Name:Name,Home:HomeRegion,Multi:IsMultiRegionTrail,Org:IsOrganizationTrail}'
+
+aws cloudtrail get-trail-status --name <trail-name-or-arn> \
+  --query 'IsLogging'
+
+# Does it log MANAGEMENT events? Data-events-only trails do not help here.
+aws cloudtrail get-event-selectors --trail-name <trail-name-or-arn>
+```
+
+Look for `IsLogging: true` and `IncludeManagementEvents: true` (in
+`EventSelectors`, or `AdvancedEventSelectors` with no `readOnly`/`eventCategory`
+exclusion that would drop `Write` management events) on a trail covering this
+deployment's region.
+
+The alarm carries this caveat in its own description, so someone paging on it can
+tell **quiet** from **blind** without reading this page.
+
+### What the deployment creates
+
+Names carry both the prefix and the environment, as every platform resource does — on a
+default `dev` deployment `<prefix>-<env>-` reads `coa-dev-`.
+
+| Resource | Name | Purpose |
+|---|---|---|
+| EventBridge rule | `<prefix>-<env>-databricks-parameter-writes` | `PutParameter` / `DeleteParameter` under the per-source path |
+| EventBridge rule | `<prefix>-<env>-databricks-parameter-batch-deletes` | `DeleteParameters` (plural), a distinct event name carrying a list |
+| Log group | `/aws/events/<prefix>-<env>-databricks-parameter-writes` | The audit record, retained **one year** |
+| Metric filter → metric | `UnexpectedConnectorParameterWrite` in `COA/Sources` | Fires for a writer outside the allowlist |
+| Alarm | `<prefix>-<env>-databricks-unexpected-parameter-write` | Threshold 1, missing data treated as not breaching |
+
+**Every write under the path is logged, legitimate ones included** — the allowlist
+is applied at the metric filter, not at the rule. That is deliberate: the log group
+is then the complete audit record, which is what makes the comparison below
+possible. (It also closes a gap: an event-pattern allowlist cannot exclude a
+principal whose `sessionContext` is *absent* — an IAM user or a root call — which
+is the most suspicious caller of the set. CloudWatch Logs filter syntax can express
+`NOT EXISTS`, so the allowlist lives there.)
+
+### When the alarm fires
+
+A legitimate write and a repoint are identical apart from two fields. Before
+dismissing it:
+
+1. Read the parameter named in the log event.
+2. Compare its `credentialSecretArn` and `namespaceId` against the source record
+   (`GET /namespaces/{namespaceId}/sources/{sourceId}`).
+3. If either differs from what the source was registered with, treat it as a
+   credential repoint: the source is answering questions using another source's
+   credential. Delete the source rather than trying to correct the parameter — its
+   connection facts cannot be edited in place.
+
+CloudWatch Logs Insights over the audit group, to see who wrote what:
+
+```
+fields @timestamp, detail.userIdentity.sessionContext.sessionIssuer.userName as writer,
+       detail.eventName as event, detail.requestParameters.name as parameter
+| sort @timestamp desc
+```
+
+## OpenSearch Serverless (OCU) capacity configuration
+
+The vector store is a NEXTGEN OpenSearch Serverless collection group whose
+indexing/search capacity floor and ceiling are set from two CDK context values,
+`aoss_min_ocu` and `aoss_max_ocu` (both in OCUs). The storage stack
+(`infra/lib/stacks/foundation/storage-stack.ts`) **validates these at synth
+time** rather than passing an arbitrary `-c` value straight through to
+CloudFormation — an out-of-range value would otherwise only be rejected later
+by CloudFormation with an opaque error after a slow stack update.
+
+| Context value  | Default | Validation rule |
+| -------------- | ------- | --------------- |
+| `aoss_min_ocu` | `2`     | Must be an integer that is `0`, `2`, `4`, `8`, `16`, or a multiple of `16`, up to `1696`. |
+| `aoss_max_ocu` | `96`    | Must be an integer that is `2`, `4`, `8`, `16`, or a multiple of `16`, up to `1696`. |
+| (relationship) | —       | `aoss_min_ocu` must not exceed `aoss_max_ocu`. |
+
+If a value fails validation, `cdk synth`/`deploy` **fails immediately** with one
+of these errors (the offending value is echoed back):
+
+```
+aoss_min_ocu=<v> is invalid. NEXTGEN min OCU must be 0, 2, 4, 8, 16, or a multiple of 16, up to 1696.
+aoss_max_ocu=<v> is invalid. NEXTGEN max OCU must be 2, 4, 8, 16, or a multiple of 16, up to 1696.
+aoss_min_ocu (<min>) cannot exceed aoss_max_ocu (<max>).
+```
+
+`aoss_min_ocu=0` is a **valid** value (NEXTGEN scale-to-zero) but has a
+correctness consequence, so it is permitted with a loud synth-time **warning**
+rather than an error:
+
+```
+AOSS min OCU is 0: indexing capacity can scale to zero, so under load the
+NEXTGEN circuit breaker sheds bulk writes with HTTP 429. Ingest re-submits and
+now fails LOUD on unrecoverable partial writes (see #173), but 0 makes throttling
+far more likely. Use a non-zero floor (e.g. 2) for ingest-heavy environments.
+```
+
+The `#173` reference is the silent partial-index failure this guard exists to
+prevent: at a zero OCU floor the circuit breaker sheds bulk-write load with
+429s, which is exactly the throttling that could drop embedding documents. The
+runtime ingest path now fails loud (`PartialIndexError`) rather than silently on
+an unrecoverable partial write, but a zero floor makes throttling fire far more
+often, so keep a non-zero floor for ingest-heavy environments.
+
+Standby replicas are fixed at `ENABLED` and must not be changed — AWS rejects
+`standbyReplicas: DISABLED` for NEXTGEN, which manages replicas internally.
+
+Example — opt a dev collection into scale-to-zero:
+
+```bash
+cdk deploy -c aoss_min_ocu=0
+```
+
+For the operator-facing scale-to-zero cost/latency tradeoff (cold-start return
+time and how it interacts with ingest), see the `aoss_min_ocu` section in
+[Getting Started](getting-started.md#opensearch-serverless-capacity-and-scale-to-zero).
+
 ## Updating
 
 To deploy updates after pulling new code:
@@ -804,6 +1111,18 @@ DOMAIN_ID=$(aws datazone list-domains --query "items[?name=='<PREFIX>-<ENV>-smus
 aws datazone delete-domain --identifier "$DOMAIN_ID" --skip-deletion-check
 # wait for status DELETED, then delete the ROLLBACK_COMPLETE stack and redeploy
 ```
+
+### A database source is stuck in `DELETING`
+
+**Cause:** the `sources-delete-worker` message ran out of attempts (`maxReceiveCount=3`) and moved to `sources-delete-dlq`, which raises the DLQ alarm. Repeated cleanup failures cause this, and so does account-level Lambda throttling: throttled deliveries still count as attempts. While a source reads `DELETING`, a repeat `DELETE` returns `409`.
+
+**Fix:** check the worker's logs for `source_delete_worker_failed` / `source_delete_incomplete`. If throttling caused it, raise the account's Lambda concurrency quota. Then redrive the DLQ; every deletion step is idempotent:
+
+```bash
+aws sqs start-message-move-task --source-arn <sources-delete-dlq ARN>
+```
+
+A source that reads `DELETE_FAILED` can instead be retried with another `DELETE`.
 
 ### AgentCore ENI wait can take hours
 

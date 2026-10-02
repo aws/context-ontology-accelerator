@@ -2,44 +2,66 @@
 // SPDX-License-Identifier: Apache-2.0
 package dev.coa.databricks;
 
+import dev.coa.databricks.config.ConfigSource;
+
 import java.util.Map;
 
 /**
- * The connector's two operational settings, and how they are read.
+ * The connector's operational settings, and how they are read.
  *
- * <p>Separate from {@link dev.coa.databricks.config.ConnectionConfig}, which says where the warehouse
- * is. These say how the connector behaves against it, they have working defaults, and an unusable value
- * falls back rather than failing initialisation: a typo in an operational knob should not present as
- * "the connector is broken". Names are matched case-insensitively, by comparison rather than by trying
- * a few spellings.
+ * <p>Separate from {@link dev.coa.databricks.config.ConnectionConfig}, which says where the warehouse is.
+ * These have working defaults, and an unusable value falls back rather than failing initialisation: a typo
+ * in an operational knob should not present as "the connector is broken".
+ *
+ * <p><b>{@link #CONFIG_SOURCE_VAR} is the exception.</b> It decides whether the connector resolves one
+ * endpoint or one per tenant, so a typo falling back to the default would serve one tenant's warehouse and
+ * credential under every tenant's catalog name. {@link dev.coa.databricks.config.ConfigSource#of}
+ * therefore throws where the row ceiling shrugs.
  */
 public final class Settings
 {
     /**
+     * Where the connector reads a source's connection facts, and therefore how it reaches the
+     * credential. Unset or blank means {@code environment}. See
+     * {@link dev.coa.databricks.config.ConfigSource}.
+     */
+    public static final String CONFIG_SOURCE_VAR = "DATABRICKS_CONFIG_SOURCE";
+
+    /**
      * Rows one table may return before the connector fails with an error naming it. A ceiling exists
      * because federation cannot express aggregation: a {@code GROUP BY} reads every predicate-matching
-     * row out of the warehouse for Athena to aggregate. At 3008 MB and a 120 s timeout, a table well
-     * past this ceiling times out, and a timeout says nothing about which table was too big.
+     * row out of the warehouse for Athena to aggregate. At 3008 MB, a table well past this ceiling
+     * exhausts the invocation, and neither an out-of-memory nor a timeout says which table was too big.
      */
     public static final String MAX_ROWS_PER_TABLE_VAR = "DATABRICKS_MAX_ROWS_PER_TABLE";
 
     /** Default for {@link #MAX_ROWS_PER_TABLE_VAR}. */
     public static final long DEFAULT_MAX_ROWS_PER_TABLE = 2_000_000L;
 
-    /**
-     * Opt-in, comma-separated, for the push-down optimisations this connector advertises. Unset
-     * advertises nothing, which is the safe default and the shipped one.
-     *
-     * <p>Do not set this because the code supports the optimisation. An advertisement is a guarantee:
-     * Athena stops applying an optimisation it believes the connector honours, so a predicate form the
-     * driver rejects becomes a query-time failure and a {@code LIMIT} the record path ignores becomes a
-     * wrong row count with no error. Set it only for values whose effect you have seen in your own
-     * warehouse's query history.
-     */
-    public static final String PUSHDOWN_VAR = "DATABRICKS_ADVERTISE_PUSHDOWN";
-
     private Settings()
     {
+    }
+
+    /**
+     * The configuration mode, read case-insensitively like the others.
+     *
+     * @throws IllegalArgumentException on a value that is neither mode, naming both.
+     */
+    public static ConfigSource configSource(Map<String, String> environment)
+    {
+        return ConfigSource.of(lookUp(environment, CONFIG_SOURCE_VAR));
+    }
+
+    /**
+     * Whether {@code name} is set to a non-blank value, for the mode switch's mutual-exclusion check.
+     *
+     * <p>Blank counts as unset, because CDK, a console and a shell disagree about whether an unset
+     * variable arrives absent or empty — so a stack writing {@code DATABRICKS_CATALOG=""} must not be read
+     * as presenting the single-target shape.
+     */
+    public static boolean isSet(Map<String, String> environment, String name)
+    {
+        return lookUp(environment, name) != null;
     }
 
     /** The row ceiling: the configured value when it is a positive long, the default otherwise. */
@@ -58,18 +80,21 @@ public final class Settings
         }
     }
 
-    /** The raw {@link #PUSHDOWN_VAR} value, or {@code ""} when unset. */
-    public static String advertisedPushdown(Map<String, String> environment)
-    {
-        String raw = lookUp(environment, PUSHDOWN_VAR);
-        return (raw == null) ? "" : raw.trim();
-    }
-
     /**
      * The value of {@code name}, matched case-insensitively, or null when unset or blank. A scan rather
      * than a few exact lookups, because an exact/lower/upper triple misses a mixed-case name.
+     *
+     * <p>Public because the mode switch reads two variables that are neither operational settings nor
+     * connection coordinates, and reading them by any other route would apply a different
+     * case-sensitivity rule to them than to everything else this connector reads.
+     *
+     * <p><b>The CDK app's own {@code optionalEnv} is case-SENSITIVE, and the asymmetry is deliberate
+     * rather than an oversight.</b> The two read different things: that one reads a deployer's shell, where
+     * a variable is typed by hand and a case-insensitive match would silently accept
+     * {@code databricks_catalog} as a synonym it never documented; this one reads the Lambda's own
+     * environment, which CDK writes in full and in one case.
      */
-    private static String lookUp(Map<String, String> environment, String name)
+    public static String lookUp(Map<String, String> environment, String name)
     {
         if (environment == null) {
             return null;

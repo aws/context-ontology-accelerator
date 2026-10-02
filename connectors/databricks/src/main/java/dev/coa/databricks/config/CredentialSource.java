@@ -3,37 +3,47 @@
 package dev.coa.databricks.config;
 
 import java.util.Objects;
-import java.util.concurrent.ThreadLocalRandom;
-import java.util.function.Function;
 
 /**
- * Reads a credential secret and caches the parsed result per container, so a rotated credential takes
- * effect without waiting for containers to recycle.
+ * Reads a credential secret and caches the parsed result per container on a jittered TTL, so a rotated
+ * credential takes effect without waiting for containers to recycle.
  *
- * <p>Takes a reader rather than a Secrets Manager client. The federation SDK's {@code MetadataHandler}
- * and {@code RecordHandler} already hold a caching client and expose it as {@code getSecret(name)}, so
- * passing that method in reuses one client, one set of credentials and one retry policy, and lets this
- * class be exercised with a lambda instead of an AWS mock. Constructing a
- * {@code SecretsManagerClient} here would put a network client in a unit test's constructor.
+ * <p>Takes a {@link SecretReader} rather than a Secrets Manager client, which makes the two
+ * credential-custody modes a constructor argument rather than a branch: {@link SecretsManagerReader} uses
+ * the connector's own role, {@link AssumedRoleCredentialSource} assumes a customer-owned role first.
  *
- * <p>The TTL is jittered. Discovery is a per-table {@code DESCRIBE} fan-out, so a schema's worth of
- * containers can expire their caches in the same second and stampede Secrets Manager. A random ±20%
- * spread on each deadline breaks the alignment for one call to a thread-local random.
+ * <p>Keyed by namespace, role and secret rather than single-slot, because one container serves several
+ * Athena catalogs. {@link #keyFor} says why all three.
  *
- * <p>Thread-safe: the cached value is only replaced wholesale, and a benign race re-reads the secret.
+ * <p>Thread-safe. A benign race re-reads one secret and discards the loser.
  */
 public final class CredentialSource
 {
     /** Default cache lifetime, before jitter. */
     public static final long DEFAULT_TTL_MILLIS = 5L * 60L * 1000L;
 
-    private final Function<String, String> secretReader;
-    private final long ttlMillis;
+    /**
+     * Reads the credential secret's value for one resolved configuration.
+     *
+     * <p>Takes the whole {@link ConnectionConfig} rather than a secret ARN, because in
+     * {@code coa-managed} mode the read needs the customer-owned role and the namespace as well, and
+     * both live on the configuration. An implementation returns the secret string exactly as
+     * {@code GetSecretValue} does; parsing is {@link DatabricksCredential}'s.
+     */
+    @FunctionalInterface
+    public interface SecretReader
+    {
+        /** @throws RuntimeException if the secret cannot be reached; the caller classifies it. */
+        String read(ConnectionConfig config);
+    }
 
-    private volatile Cached cached;
+    private final SecretReader secretReader;
 
-    /** @param secretReader reads a secret's value by ARN or name, normally {@code this::getSecret}. */
-    public CredentialSource(Function<String, String> secretReader)
+    /** Keyed by namespace, role and secret — see {@link #keyFor}. */
+    private final ExpiringCache<String, DatabricksCredential> byKey;
+
+    /** @param secretReader reads a secret's value for a configuration. */
+    public CredentialSource(SecretReader secretReader)
     {
         this(secretReader, DEFAULT_TTL_MILLIS);
     }
@@ -42,59 +52,51 @@ public final class CredentialSource
      * @param ttlMillis cache lifetime before jitter. Zero disables caching, which is what a test
      *                  asserting the reader was called wants.
      */
-    public CredentialSource(Function<String, String> secretReader, long ttlMillis)
+    public CredentialSource(SecretReader secretReader, long ttlMillis)
     {
         this.secretReader = Objects.requireNonNull(secretReader, "secretReader");
-        if (ttlMillis < 0) {
-            throw new IllegalArgumentException("ttlMillis must not be negative");
-        }
-        this.ttlMillis = ttlMillis;
+        this.byKey = new ExpiringCache<>(ttlMillis);
     }
 
     /**
-     * The parsed credential, from cache when it is still fresh and the ARN has not changed.
+     * The parsed credential, from cache when it is still fresh.
      *
-     * @throws IllegalArgumentException if the secret is unreadable or is not a supported shape.
+     * <p>No catch here on purpose. Unreadable and unusable leave as different types, each already
+     * classified one layer out: {@link DatabricksCredential#fromSecretJson} names the secret and the
+     * accepted shapes, {@link AssumedRoleCredentialSource} separates assume-denied from
+     * readable-but-not-through-this-role, and {@code DatabricksConnectionFactory.open()} turns a raw
+     * Secrets Manager exception into {@code CONNECTOR_CREDENTIAL_UNREADABLE}. A catch here could only
+     * restate one of them.
+     *
+     * @throws IllegalArgumentException if the secret is not a supported shape.
      */
     public DatabricksCredential credentialFor(ConnectionConfig config)
     {
-        String arn = config.credentialSecretArn();
-        Cached snapshot = cached;
-        if (snapshot != null && snapshot.isFreshFor(arn)) {
-            return snapshot.credential;
-        }
-        DatabricksCredential credential =
-                DatabricksCredential.fromSecretJson(secretReader.apply(arn), arn);
-        cached = new Cached(arn, credential, System.currentTimeMillis() + jittered(ttlMillis));
-        return credential;
+        return byKey.get(keyFor(config), () -> DatabricksCredential.fromSecretJson(
+                secretReader.read(config), config.credentialSecretArn()));
     }
 
-    /** {@code ttl} scattered by up to ±20%, so caches across containers do not align. */
-    private static long jittered(long ttl)
+    /**
+     * The cache key: namespace, the role the secret is reached through, then the secret, newline-separated
+     * so no combination of values can concatenate into another combination's key.
+     *
+     * <p>The namespace is in the key even though nothing can currently exercise it. A hit short-circuits
+     * {@link SecretReader#read}, where the assume presents the ExternalId binding a read to one tenant, so
+     * a key omitting the namespace would let two namespaces sharing a role and secret serve each other's
+     * cached credential with no assume made. What makes that unreachable today is upstream: the sources
+     * API's role claim refuses a {@code crossAccountRoleArn} another namespace already claimed. Different
+     * service, different language, so neither side may be weakened because the other covers it.
+     */
+    private static String keyFor(ConnectionConfig config)
     {
-        if (ttl == 0) {
-            return 0;
+        if (!config.isCoaManaged()) {
+            // One endpoint, one secret, one deployment-wide role: there is no tenant to discriminate on,
+            // and no assume to short-circuit.
+            return "\n\n" + config.credentialSecretArn();
         }
-        long spread = Math.max(1L, ttl / 5L);
-        return ttl - spread + ThreadLocalRandom.current().nextLong(2L * spread);
+        ManagedSource source = config.managedSource();
+        return source.namespaceId() + '\n' + source.crossAccountRoleArn() + '\n'
+                + config.credentialSecretArn();
     }
 
-    private static final class Cached
-    {
-        private final String secretArn;
-        private final DatabricksCredential credential;
-        private final long expiresAtMillis;
-
-        private Cached(String secretArn, DatabricksCredential credential, long expiresAtMillis)
-        {
-            this.secretArn = secretArn;
-            this.credential = credential;
-            this.expiresAtMillis = expiresAtMillis;
-        }
-
-        private boolean isFreshFor(String arn)
-        {
-            return secretArn.equals(arn) && System.currentTimeMillis() < expiresAtMillis;
-        }
-    }
 }

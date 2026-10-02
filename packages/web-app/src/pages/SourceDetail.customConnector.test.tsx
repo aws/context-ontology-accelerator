@@ -24,6 +24,8 @@ vi.mock("@api-hooks", () => ({
   // component imports or the render throws before reaching the assertion.
   useListSourceScanJobs: () => ({ data: undefined }),
   useKeepRescanRemoval: () => ({ mutate: vi.fn(), isPending: false }),
+  usePutSourceRescanSchedule: () => ({ mutate: vi.fn(), isPending: false }),
+  usePutSourceEventRescan: () => ({ mutate: vi.fn(), isPending: false }),
 }));
 
 vi.mock("@coa/control-plane-client", () => ({

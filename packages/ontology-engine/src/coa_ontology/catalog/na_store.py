@@ -952,6 +952,38 @@ def get_vector(node_id: str) -> list[float]:
     return rows[0]["embedding"] if rows else []
 
 
+def delete_embeddings_for_entities(
+    entity_uris: list[str],
+    ontology_id: str,
+    namespace: str | None = None,
+) -> int:
+    """Delete the Embedding nodes for a set of entity URIs within a namespace + ontology.
+
+    Args:
+        entity_uris: The entities whose embeddings to delete.
+        ontology_id: Scope the delete to embeddings owned by this ontology only.
+            Shared IRIs across ontologies (foundational reloads,
+            explicit-target merges) share the same ``entity_uri`` under a
+            different ``ontology_id``; without this scope the delete takes
+            the sibling ontology's embedding down with it.
+        namespace: The namespace to delete within.
+
+    Returns:
+        The number of Embedding nodes deleted.
+    """
+    if not entity_uris or not ontology_id:
+        return 0
+    ns = _ns(namespace)
+    res = _oc_query(
+        "MATCH (e:Embedding) "
+        "WHERE e.entity_uri IN $uris AND e.namespace = $ns AND e.ontology_id = $oid "
+        "DETACH DELETE e RETURN count(e) AS c",
+        {"uris": list(entity_uris), "ns": ns, "oid": ontology_id},
+    )
+    rows = res.get("results", [])
+    return int(rows[0].get("c", 0)) if rows else 0
+
+
 def delete_embeddings_for_ontology(ontology_id: str, namespace: str | None = None) -> int:
     """Delete all Embedding nodes for an ontology within a namespace.
 

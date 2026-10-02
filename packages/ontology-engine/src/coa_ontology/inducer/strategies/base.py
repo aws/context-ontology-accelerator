@@ -14,8 +14,10 @@ from collections.abc import Iterable, Mapping
 from coa_common import sql_ident
 from coa_common.bedrock_metrics import CostTracker
 from coa_common.constants import VOCAB_URI
+from coa_common.domain_models import EnrichmentSource, ReviewStatus
 from rdflib import RDF, XSD, BNode, Graph, Literal, Namespace, URIRef
 
+from coa_ontology.datasource_ids import bare_datasource_id
 from coa_ontology.inducer.schemas import ConceptMatch
 from coa_ontology.inducer.services.data_catalog import (
     CatalogConstraint,
@@ -441,29 +443,41 @@ def resolve_fk_target_identity(
     referrer: CatalogTable,
     target_name: str,
     ref_index: Mapping[str, str],
+    target_datasource_id: str | None = None,
 ) -> str | None:
-    """Resolve an FK's bare target name to a table identity, or ``None`` if unresolved.
+    """Resolve an FK's target to a table identity, or ``None`` if unresolved.
 
-    Four artifacts have to agree on which table an FK points at — the mapping's
+    Four artifacts have to agree on which table an FK points at: the mapping's
     ``rr:parentTriplesMap`` (:meth:`InductionStrategy.build_r2rml`), the ontology's
     ``rdfs:range`` (``table_to_ontology``), the RIGOR mapping's subject token
     (``rigor_ontology``) and the SHACL shape's ``sh:class``
-    (``validation.shapes.config``). Each of the four spelled the same three-probe
-    lookup out by hand, so the resolution order could drift between them, and a
-    drift means the shape asserts a class-typed reference against a column the
-    mapping emits as a literal: a violation on every row.
+    (``validation.shapes.config``). This is the ONLY place any of them resolves
+    one. A writer with its own lookup drifts from the others, and a drift means
+    the shape asserts a class-typed reference against a column the mapping emits
+    as a literal, or the join and the range name different tables.
 
-    Probe order, most specific first:
+    With ``target_datasource_id`` (an approved cross-source relationship, #1140),
+    resolution stays inside that datasource. The sources pipeline may prefix the
+    id with ``DS#`` while ``CatalogTable.datasourceId`` is bare, so both sides go
+    through :func:`bare_datasource_id`.
+
+    * Exactly one same-named table in the hinted datasource -> that table.
+    * Several (``A::public.customers`` and ``A::crm.customers``) -> ``None`` with a
+      warning. Nothing identifies the parent, and the probes below would look in
+      the referrer's own datasource, which the hint rules out. The name is then in
+      :func:`ambiguous_target_names`, so every artifact degrades to a literal.
+    * None in the run -> the unhinted probes below, unchanged from before the hint
+      existed (#1150's tests pin this). All four artifacts take this branch
+      together, so they still agree; a warning names the table it fell back to.
+
+    Probe order without a usable hint, most specific first:
 
     1. the referrer's OWN datasource and database
        (:func:`same_datasource_target_identity`) — an FK crosses neither, and this
        is the only form that stays unambiguous when a second datasource shares a
        database name.
-    2. the same database in ANY datasource. Uses :func:`table_schema_prefix`, the
-       same derivation :func:`reference_index` keys this form on. Reading
-       ``sourceSchema`` directly (as the four copies did) skips the probe entirely
-       for a table carrying only a ``fullyQualifiedName``, so a resolvable target
-       fell through to the bare probe.
+    2. the same database in ANY datasource, via :func:`table_schema_prefix` (the
+       derivation :func:`reference_index` keys this form on).
     3. the bare name, which :func:`reference_index` publishes only while one table
        answers to it.
 
@@ -471,6 +485,53 @@ def resolve_fk_target_identity(
     :func:`ambiguous_target_names` to tell an ambiguous in-run target (degrade to a
     literal) from an out-of-run one (the bare form is safe).
     """
+    if target_datasource_id:
+        wanted_ds = bare_datasource_id(target_datasource_id)
+        candidates = sorted(
+            {
+                identity
+                for identity in ref_index.values()
+                if _IDENTITY_SEP in identity
+                and bare_datasource_id(identity.split(_IDENTITY_SEP, 1)[0]) == wanted_ds
+                and identity.split(_IDENTITY_SEP, 1)[1].rsplit(".", 1)[-1] == target_name
+            }
+        )
+        if len(candidates) == 1:
+            return candidates[0]
+        if candidates:
+            # Never resolve outside the hinted datasource, and never pick one of
+            # several matches inside it.
+            log.warning(
+                "fk_target_ambiguous_in_hinted_datasource",
+                extra={
+                    "referrer": referrer.name,
+                    "target": target_name,
+                    "target_datasource_id": target_datasource_id,
+                    "candidates": candidates,
+                },
+            )
+            return None
+
+    resolved = _resolve_fk_target_by_probes(referrer, target_name, ref_index)
+    if target_datasource_id and resolved is not None:
+        log.warning(
+            "fk_target_datasource_hint_unmatched",
+            extra={
+                "referrer": referrer.name,
+                "target": target_name,
+                "target_datasource_id": target_datasource_id,
+                "resolved": resolved,
+            },
+        )
+    return resolved
+
+
+def _resolve_fk_target_by_probes(
+    referrer: CatalogTable,
+    target_name: str,
+    ref_index: Mapping[str, str],
+) -> str | None:
+    """The unhinted probe order of :func:`resolve_fk_target_identity`."""
     scoped = same_datasource_target_identity(referrer, target_name)
     if scoped in ref_index:
         return ref_index[scoped]
@@ -783,12 +844,187 @@ def composite_fk_anchors(table: CatalogTable) -> dict[str, CatalogConstraint]:
     return anchors
 
 
+# FK sources that are authoritative and materialise regardless of review state:
+# pulled from the source system, a 3rd-party catalog, or a human steward.
+AUTHORITATIVE_FK_SOURCES: frozenset[str] = frozenset(
+    {
+        EnrichmentSource.DETERMINISTIC,
+        EnrichmentSource.CATALOG_EXISTING,
+        EnrichmentSource.STEWARD_SPECIFIED,
+        EnrichmentSource.STEWARD_EDITED,
+    }
+)
+
+
+def fk_edge_allowed(source: str | None, review_status: str | None) -> bool:
+    """Whether a foreign key may become a relationship in ANY induced artifact (#1088).
+
+    "Use only approved relationships downstream." Shared by the ontology
+    (``owl:ObjectProperty``), the mapping (``rr:parentTriplesMap`` join), and the
+    SHACL shape (``sh:class``): a relationship the ontology withholds must not be a
+    join Ontop performs, or a class the shape asserts. An FK passes when it is
+    authoritative, or explicitly APPROVED, or grandfathered:
+
+      * authoritative source (deterministic / catalog / steward) -> allowed;
+      * ``review_status`` empty/None -> allowed. FKs stored before the review
+        field existed, and every catalog source that does not populate it, carry
+        no status; allowing them preserves pre-#1088 behaviour so existing
+        ontologies do not lose edges on re-induction;
+      * ``APPROVED`` -> allowed;
+      * ``PENDING_REVIEW`` / ``REJECTED`` -> NOT allowed — the column degrades to
+        a plain datatype property / literal until a steward approves it.
+    """
+    if source in AUTHORITATIVE_FK_SOURCES:
+        return True
+    if not review_status:
+        return True
+    return review_status == ReviewStatus.APPROVED
+
+
+def simple_fk_constraints(table: CatalogTable, column_name: str) -> list[CatalogConstraint]:
+    """Every single-column FK on ``column_name`` that is allowed to become a relationship.
+
+    A column can legitimately reference several tables — the shape cross-source
+    inference creates on purpose: ``invoice.ba_no`` -> the local
+    ``billing_account`` AND the ``account_xref`` crosswalk AND the
+    ``mart_customer_360`` dimension, all correct. Every consumer used to take
+    the FIRST ``FOREIGN_KEY`` constraint on a column and ``break``, so the extra
+    relationships (the cross-source ones, since local FKs are stored first) were
+    silently dropped even after a steward approved them. Worse, the review gate
+    ran AFTER that first-wins pick, so a PENDING relationship sorting first
+    demoted the column and took an APPROVED one down with it.
+
+    This is the single selection every artifact must use so they emit the same
+    set: gate first (:func:`fk_edge_allowed`), then ALL survivors, in constraint
+    order, deduplicated on ``(target table, target column, target datasource)``.
+    Composite FKs are not in scope here — they are handled per anchor by
+    :func:`composite_fk_anchors`.
+
+    Two follow-on filters run here so ontology / R2RML / SHACL never disagree:
+
+    * The dedup key includes ``targetDatasourceId`` so two same-named target
+      tables in different datasources both survive — a local FK to
+      ``customers.id`` and an approved cross-source FK to ``customers.id`` in
+      another datasource are distinct relationships and would collapse into
+      one under a bare ``(table, column)`` key.
+    * Entries whose ``referredColumns`` carry no target column are dropped
+      here rather than in R2RML alone; without a target column there is no
+      valid ``rr:joinCondition`` (R2RML §7.5), and the ontology / SHACL used
+      to count them and drift.
+    """
+    out: list[CatalogConstraint] = []
+    seen: set[tuple[str, str | None, str]] = set()
+    for tc in table.tableConstraints or []:
+        if tc.constraintType != "FOREIGN_KEY" or not tc.referredColumns or len(tc.columns or []) != 1:
+            continue
+        if tc.columns[0] != column_name:
+            continue
+        if not fk_edge_allowed(tc.relationshipType, tc.reviewStatus):
+            continue
+        target_name, target_col = parse_referred_column(tc.referredColumns[0])
+        if not target_col:
+            continue
+        key = (target_name, target_col, bare_datasource_id(tc.targetDatasourceId or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(tc)
+    return out
+
+
+def fk_property_qualifiers(
+    entries: list[tuple[str, str | None, str | None]],
+) -> list[str | None]:
+    """One qualifier per entry — ``None`` means "plain name", else appended as ``__{qualifier}``.
+
+    Applied identically by ontology / R2RML / SHACL so the three artifacts
+    emit the SAME property names.
+
+    Rules:
+
+    * A column with one FK → the sole entry is ``None`` (plain name).
+    * A column with several FKs → each entry is qualified so the resulting
+      property names are unique, but preserving name STABILITY for the local
+      FK so existing ontologies / mappings / shapes / embeddings keep their
+      IRIs on re-induction:
+
+      - If exactly ONE entry has ``target_datasource_id`` unset (the local /
+        authoritative FK), that entry stays plain. Every other entry is
+        qualified by its target class local name.
+      - Otherwise (zero locals, or ≥2 locals) every entry is qualified.
+      - Ties on the target-class qualifier (same target class, different
+        target column — e.g. ``customers.id`` and ``customers.legacy_id``)
+        are broken by appending ``_{target_column_camel}``.
+
+    ``entries`` — one tuple per resolved FK, in the order the artifacts
+    iterate them: ``(target_class_pascal, target_column, target_datasource_id)``.
+    """
+    n = len(entries)
+    if n <= 1:
+        return [None] * n
+
+    local_indices = [i for i, (_, _, tds) in enumerate(entries) if not tds]
+    plain_index = local_indices[0] if len(local_indices) == 1 else -1
+
+    base_quals: list[str | None] = [None if i == plain_index else entries[i][0] for i in range(n)]
+    # Break ties on the target-class qualifier by appending the target column.
+    tallies: dict[str, int] = {}
+    for q in base_quals:
+        if q is not None:
+            tallies[q] = tallies.get(q, 0) + 1
+    out: list[str | None] = []
+    for i, q in enumerate(base_quals):
+        if q is None or tallies.get(q, 0) <= 1:
+            out.append(q)
+            continue
+        _, target_col, _ = entries[i]
+        out.append(f"{q}_{to_camel(target_col)}" if target_col else q)
+    return out
+
+
+def fk_property_local_name(base_local: str, qualifier: str | None) -> str:
+    """Local name of the property carrying one FK of a column.
+
+    A column with ONE relationship keeps the plain ``{table}_{column}`` name
+    every existing ontology, mapping, shape and embedding already uses. Other
+    relationships on a multi-FK column carry a target qualifier as
+    ``{table}_{column}__{qualifier}`` (two underscores — a single one would
+    collide with a column literally named ``column_Target``). The qualifier is
+    computed once by :func:`fk_property_qualifiers` and threaded through here
+    so ontology / R2RML / SHACL mint the property IRI identically.
+    """
+    return f"{base_local}__{qualifier}" if qualifier else base_local
+
+
 def _annotate_triples_map(g: Graph, tmap: URIRef, table: CatalogTable) -> None:
     """Annotate a TriplesMap with datasource provenance (coa:datasourceId, coa:sourceSchema).
 
     These annotations are ignored by Ontop (custom predicates are transparent
     to R2RML processors) but are parsed by the VKG translation layer to route
     queries to the correct data source at execution time.
+
+    NO CATALOG ANNOTATION, DELIBERATELY. The cross-source-join work (#965) needs a
+    catalog qualifier per table, and it is tempting to bake one in here. It is not
+    baked in, for three reasons:
+
+    * ``coa:datasourceId`` already resolves it. Serve looks the source record up by
+      that id and reads ``athenaDataCatalogName`` live
+      (``coa_serve.clients.athena._resolve_catalog_and_database``), which is the
+      whole of what a connector-backed source needs to be self-qualifying — its
+      catalog plus its single required schema.
+    * A catalog name is a MUTABLE control-plane fact. R2RML is an immutable
+      artifact of an accepted proposal, so a copy of it here goes stale on
+      re-registration — and a stale catalog name in a qualification pass is a
+      qualifier pointing at a catalog this namespace no longer owns, the failure the
+      namespace-scope check exists to refuse.
+    * It is not reachable from this layer today: the induction catalog is assembled
+      by ``coa_common.metadata_store.catalog_reader.read_approved_catalog``, which
+      surfaces the datasource id, the source type and the databases — never the
+      source's Athena catalog or its sub-type.
+
+    ``rr:tableName`` carries no catalog for the same reason and a stronger one: changing
+    what it contains changes what Ontop loads, for every sub-type at once. It carries at
+    most a schema, and only for a name two tables share (:func:`logical_table_names`).
     """
     if table.datasourceId:
         g.add((tmap, SCL.datasourceId, Literal(table.datasourceId)))
@@ -924,13 +1160,17 @@ class InductionStrategy(ABC):
             identity = table_identity(table)
             tmap_by_id[identity] = ns[f"TriplesMap_{pascal_by_id[identity]}"]
 
-        def _parent_tmap(target_name: str, referrer: CatalogTable) -> URIRef | None:
+        def _parent_tmap(
+            target_name: str, referrer: CatalogTable, target_datasource_id: str | None = None
+        ) -> URIRef | None:
             """Resolve an FK target table name to its TriplesMap IRI.
 
             Returns ``None`` when the target cannot be resolved to a single table,
-            so the caller emits a datatype literal instead of a join.
+            so the caller emits a datatype literal instead of a join. A
+            cross-source FK carries ``target_datasource_id``;
+            :func:`resolve_fk_target_identity` keeps it inside THAT datasource.
             """
-            target_id = resolve_fk_target_identity(referrer, target_name, ref_index)
+            target_id = resolve_fk_target_identity(referrer, target_name, ref_index, target_datasource_id)
             if target_id is not None and target_id in tmap_by_id:
                 return tmap_by_id[target_id]
             if target_name in ambiguous_names:
@@ -948,6 +1188,18 @@ class InductionStrategy(ABC):
             # a table we did not process has no TriplesMap in this mapping, so
             # there is nothing for it to collide with.
             return ns[f"TriplesMap_{to_pascal(target_name)}"]
+
+        def _pom(tmap: URIRef, col_name: str, suffix: str = "") -> tuple[URIRef, URIRef]:
+            """Mint a predicate-object map + object map for a column.
+
+            ``suffix`` qualifies one of several maps on the same column (a column
+            carrying more than one relationship gets one map per target).
+            """
+            pom = URIRef(f"{tmap}/POM_{to_pascal(col_name)}{suffix}")
+            g.add((tmap, RR.predicateObjectMap, pom))
+            om = URIRef(f"{pom}/ObjectMap")
+            g.add((pom, RR.objectMap, om))
+            return pom, om
 
         for table in tables:
             identity = table_identity(table)
@@ -1024,20 +1276,15 @@ class InductionStrategy(ABC):
                     g.add((om, RR.datatype, xsd_for_column(col.dataType, col.name)))
                     continue
 
-                pom = URIRef(f"{tmap}/POM_{to_pascal(col.name)}")
-                g.add((tmap, RR.predicateObjectMap, pom))
-
-                prop_uri = ns[f"{camel_by_id[identity]}_{to_camel(col.name)}"]
-                g.add((pom, RR.predicate, prop_uri))
-
-                om = URIRef(f"{pom}/ObjectMap")
-                g.add((pom, RR.objectMap, om))
+                base_local = f"{camel_by_id[identity]}_{to_camel(col.name)}"
 
                 # This column anchors a composite FK when the shared anchor table
                 # says so — never by re-deriving it here.
                 composite_fk = composite_anchors.get(col.name)
 
                 if composite_fk is not None and composite_fk.referredColumns:
+                    pom, om = _pom(tmap, col.name)
+                    g.add((pom, RR.predicate, ns[base_local]))
                     # Composite FK: emit a single Referencing Object Map for the
                     # entire relationship, with one joinCondition per column pair.
                     #
@@ -1051,7 +1298,11 @@ class InductionStrategy(ABC):
                     # this mapping's rr:datatype — the very mismatch the composite-FK
                     # fix set out to remove.
                     fk_target, _ = parse_referred_column(composite_fk.referredColumns[0])
-                    parent_tmap = _parent_tmap(fk_target, table)
+                    parent_tmap = _parent_tmap(
+                        fk_target,
+                        table,
+                        composite_fk.targetDatasourceId,
+                    )
                     if parent_tmap is None:
                         # Ambiguous target: no join to emit. Anchor the column as a
                         # literal so the mapping stays valid, matching what the
@@ -1074,6 +1325,8 @@ class InductionStrategy(ABC):
                     continue
 
                 if col.name in malformed_composite_columns:
+                    pom, om = _pom(tmap, col.name)
+                    g.add((pom, RR.predicate, ns[base_local]))
                     # columns/referredColumns disagree in length, or the targets span
                     # several tables: no join can be derived, so the column degrades
                     # to a literal. composite_fk_columns reports these as
@@ -1088,38 +1341,43 @@ class InductionStrategy(ABC):
                     g.add((om, RR.datatype, xsd_for_column(col.dataType, col.name)))
                     continue
 
-                # Check for simple (single-column) FK
-                is_fk = False
-                simple_fk_target: str | None = None
-                fk_parent_col: str | None = None
-                if table.tableConstraints:
-                    for tc in table.tableConstraints:
-                        if (
-                            tc.constraintType == "FOREIGN_KEY"
-                            and len(tc.columns) == 1
-                            and col.name in tc.columns
-                            and tc.referredColumns
-                        ):
-                            is_fk = True
-                            simple_fk_target, fk_parent_col = parse_referred_column(tc.referredColumns[0])
-                            break
+                # Simple (single-column) FKs — EVERY gate-passing one (#1088 follow-up),
+                # through the same selection the ontology uses (simple_fk_constraints),
+                # so the set of joins here equals the set of owl:ObjectProperty edges
+                # there. This is also where the review gate reaches the mapping: a
+                # PENDING/REJECTED inferred FK used to become a live Ontop join while
+                # the ontology withheld its edge.
+                resolved: list[tuple[URIRef, str, str | None]] = []  # (parent TriplesMap, parent column, target ds)
+                for tc in simple_fk_constraints(table, col.name):
+                    fk_target, fk_parent_col = parse_referred_column(tc.referredColumns[0])  # type: ignore[index]
+                    parent_tmap = _parent_tmap(fk_target, table, tc.targetDatasourceId)
+                    if parent_tmap is None:
+                        continue  # ambiguous target: this relationship degrades (ontology does the same)
+                    resolved.append((parent_tmap, fk_parent_col, tc.targetDatasourceId))  # type: ignore[arg-type]
 
-                simple_parent_tmap = (
-                    _parent_tmap(simple_fk_target, table) if is_fk and simple_fk_target and fk_parent_col else None
-                )
-                if simple_parent_tmap is not None and fk_parent_col:
-                    # Simple FK: Referencing Object Map with single joinCondition.
-                    # fk_parent_col is required — without it we cannot emit a valid
-                    # joinCondition and a bare parentTriplesMap would produce a
-                    # Cartesian product in Ontop (R2RML §7.5). An ambiguous target
-                    # yields None and falls through to the datatype branch.
-                    g.add((om, RR.parentTriplesMap, simple_parent_tmap))
-                    jc = BNode()
-                    g.add((om, RR.joinCondition, jc))
-                    g.add((jc, RR.child, Literal(sql_ident(col.name))))
-                    g.add((jc, RR.parent, Literal(sql_ident(fk_parent_col))))
+                if resolved:
+                    # Per-FK qualifiers computed once; identical rule in ontology + SHACL.
+                    entries: list[tuple[str, str | None, str | None]] = [
+                        (str(pt).rsplit("TriplesMap_", 1)[-1], fk_parent_col, tds)
+                        for pt, fk_parent_col, tds in resolved
+                    ]
+                    qualifiers = fk_property_qualifiers(entries)
+                    for (parent_tmap, fk_parent_col, _), qualifier in zip(resolved, qualifiers, strict=True):
+                        # Property/POM names must match the ontology's: plain for a
+                        # single relationship, qualified per fk_property_qualifiers
+                        # otherwise.
+                        pom_suffix = f"__{qualifier}" if qualifier else ""
+                        pom, om = _pom(tmap, col.name, pom_suffix)
+                        g.add((pom, RR.predicate, ns[fk_property_local_name(base_local, qualifier)]))
+                        g.add((om, RR.parentTriplesMap, parent_tmap))
+                        jc = BNode()
+                        g.add((om, RR.joinCondition, jc))
+                        g.add((jc, RR.child, Literal(sql_ident(col.name))))
+                        g.add((jc, RR.parent, Literal(sql_ident(fk_parent_col))))
                 else:
-                    # Non-FK: datatype ObjectMap
+                    # Non-FK (or every FK withheld/unresolvable): datatype ObjectMap
+                    pom, om = _pom(tmap, col.name)
+                    g.add((pom, RR.predicate, ns[base_local]))
                     g.add((om, RR.column, Literal(sql_ident(col.name))))
                     dt = xsd_for_column(col.dataType, col.name)
                     g.add((om, RR.datatype, dt))

@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlparse
@@ -49,6 +50,9 @@ NDB_REGION = os.getenv("NDB_REGION", os.getenv("AWS_REGION", "us-east-1"))
 NDB_IAM_AUTH = os.getenv("NDB_IAM_AUTH", "true").lower() == "true"
 NDB_TIMEOUT = float(os.getenv("NDB_TIMEOUT", "30"))
 DEFAULT_NAMESPACE = os.getenv("DYNAMODB_DEFAULT_NAMESPACE", "default")
+# Subjects per DELETE when superseding annotations on append; a re-induced
+# proposal can carry hundreds of classes + properties.
+_SUPERSEDE_CHUNK = 200
 
 
 # ── Named graph URI scheme ──────────────────────────────────────────────
@@ -832,6 +836,84 @@ class NeptuneDBGraphStore(GraphStore):
 
     # ── Bulk Turtle ingest ────────────────────────────────────────────
 
+    def supersede_annotations(
+        self,
+        ontology_uri: str,
+        subject_uris: Iterable[str],
+        predicates: Mapping[str, str | None],
+    ) -> int:
+        """Retire the live ``predicates`` values of ``subject_uris`` in this ontology's graph.
+
+        ``predicates`` maps each annotation predicate to the HISTORY predicate its
+        displaced values move to (``coa:supersededComment`` etc.), or ``None`` to
+        drop them outright. One ``DELETE/INSERT`` per chunk of subjects,
+        constrained by ``VALUES`` on both the subject and the ``(predicate,
+        history)`` pair, so nothing outside the named (subject, predicate) pairs
+        — in particular the relationship axioms (``rdfs:range``,
+        ``rdfs:subClassOf``, R2RML) and every other subject in the graph — can be
+        touched. Neptune's SPARQL UPDATE response carries no affected-row count,
+        so the count is taken with a ``SELECT COUNT`` first; it is the log signal
+        that supersession fired (or found nothing to do).
+        """
+        subjects = [s for s in dict.fromkeys(subject_uris) if _is_storable_iri(s)]
+        kept = {p: h for p, h in predicates.items() if h}
+        dropped = [p for p, h in predicates.items() if not h]
+        if not subjects or not predicates:
+            return 0
+        graph_uri = self._graph_for(ontology_uri)
+        removed = 0
+        # ponytail: VALUES-chunked so a large re-induced proposal (hundreds of
+        # classes + properties) stays under Neptune's request size comfortably.
+        for chunk_no, i in enumerate(range(0, len(subjects), _SUPERSEDE_CHUNK)):
+            subj_values = " ".join(_iri(s) for s in subjects[i : i + _SUPERSEDE_CHUNK])
+            all_preds = " ".join(_iri(p) for p in predicates)
+            count_pattern = f"VALUES ?s {{ {subj_values} }} VALUES ?p {{ {all_preds} }} ?s ?p ?o ."
+            try:
+                count_res = _sparql_query(
+                    f"SELECT (COUNT(*) AS ?n) WHERE {{ GRAPH {_iri(graph_uri)} {{ {count_pattern} }} }}"
+                )
+            except Exception as e:
+                raise RuntimeError(f"supersede count failed (chunk {chunk_no}, {len(subjects)} subjects): {e}") from e
+            bindings = count_res.get("results", {}).get("bindings", [])
+            n = int(bindings[0]["n"]["value"]) if bindings else 0
+            if n == 0:
+                continue
+            # Move: the displaced literal is re-attached under its history
+            # predicate so the earlier generation stays inspectable.
+            # One statement per (live, history) pair with both predicates
+            # inlined — the same shape update_ontology uses. Cost: one small
+            # update per annotation predicate (4) per subject chunk.
+            for live_pred, hist_pred in kept.items():
+                try:
+                    _sparql_update(
+                        f"WITH {_iri(graph_uri)} "
+                        f"DELETE {{ ?s {_iri(live_pred)} ?o }} INSERT {{ ?s {_iri(hist_pred)} ?o }} "
+                        f"WHERE {{ VALUES ?s {{ {subj_values} }} ?s {_iri(live_pred)} ?o . }}"
+                    )
+                except Exception as e:
+                    raise RuntimeError(
+                        f"supersede move failed (chunk {chunk_no}, predicate {live_pred} -> {hist_pred}): {e}"
+                    ) from e
+            if dropped:
+                drop_values = " ".join(_iri(p) for p in dropped)
+                try:
+                    _sparql_update(
+                        f"WITH {_iri(graph_uri)} DELETE {{ ?s ?p ?o }} "
+                        f"WHERE {{ VALUES ?s {{ {subj_values} }} VALUES ?p {{ {drop_values} }} ?s ?p ?o . }}"
+                    )
+                except Exception as e:
+                    raise RuntimeError(f"supersede drop failed (chunk {chunk_no}, predicates {dropped}): {e}") from e
+            removed += n
+        log.info(
+            "supersede_annotations: retired %d triples (subjects=%d predicates=%d kept_as_history=%d graph=%s)",
+            removed,
+            len(subjects),
+            len(predicates),
+            len(kept),
+            graph_uri,
+        )
+        return removed
+
     def load_turtle(
         self,
         ontology_uri: str,
@@ -912,6 +994,7 @@ class NeptuneDBGraphStore(GraphStore):
         labels: list[str] = []
         comments: list[str] = []
         alt_labels: list[str] = []
+        superseded: dict[str, list[str]] = {}
         edges: list[dict] = []
         graph_uris: set[str] = set()
         neighbor_uris: set[str] = set()
@@ -922,6 +1005,15 @@ class NeptuneDBGraphStore(GraphStore):
         rdfs_comment = RDFS + "comment"
         skos_alt_label = _SKOS + "altLabel"
         scl_is_mapped = _SCL + "isMapped"
+        # History predicates: the previous generation of a description /
+        # alt-label retired by an append-mode re-accept. Surfaced separately so
+        # the class detail can show "what this used to say" without them being
+        # mistaken for live content or for graph edges.
+        history_preds = {
+            _SCL + "supersededComment": "comments",
+            _SCL + "supersededDefinition": "definitions",
+            _SCL + "supersededAltLabel": "altLabels",
+        }
 
         for b in bindings:
             g_val = b.get("g", {}).get("value")
@@ -944,6 +1036,10 @@ class NeptuneDBGraphStore(GraphStore):
             elif p == skos_alt_label and o_type == "literal":
                 if o_value not in alt_labels:
                     alt_labels.append(o_value)
+            elif p in history_preds and o_type == "literal":
+                bucket = superseded.setdefault(history_preds[p], [])
+                if o_value not in bucket:
+                    bucket.append(o_value)
             elif p == scl_is_mapped:
                 # Tier-2 R2RML-answerability marker (written by store_class as
                 # ``"true"^^xsd:boolean``). Surfaced as a first-class boolean so
@@ -1067,6 +1163,7 @@ class NeptuneDBGraphStore(GraphStore):
             "labels": labels,
             "comments": comments,
             "alt_labels": alt_labels,
+            "superseded": superseded,
             "is_mapped": is_mapped,
             "edges": out_edges,
         }

@@ -228,12 +228,8 @@ class TestQualifyCrossSourceSQL:
         assert "pg_cat.public.claims" in _unquoted(out)
         assert "awsdatacatalog.insurance.policies" in _unquoted(out)
 
-    async def test_federated_no_discovered_schemas_abandons_not_public(self):
-        """F8: a cross-source statement whose federated source has neither a
-        per-table sourceSchema nor discoveredSchemas must ABANDON (SQL unchanged),
-        NOT qualify to an invented 'public' that sql_namespace_scope can never
-        authorize (which would turn a soft miss into a denial). The rewrite is
-        all-or-nothing, so the whole statement is left bare."""
+    async def test_federated_no_discovered_schemas_fails_closed_not_public(self):
+        """A missing federated schema must error, never invent ``public`` or run bare."""
         routing = _routing(("claims", "src-pg", ""), ("policies", "src-glue", "insurance"))
         reg = _registry(
             {
@@ -241,9 +237,8 @@ class TestQualifyCrossSourceSQL:
                 "src-glue": {"glueDatabaseName": "insurance"},
             }
         )
-        out = await qualify_cross_source_sql(_CROSS_SOURCE_SQL, routing, reg, namespace="ns")
-        assert "public" not in _unquoted(out)
-        assert out == _CROSS_SOURCE_SQL
+        with pytest.raises(QualificationError, match="claims.*source schema"):
+            await qualify_cross_source_sql(_CROSS_SOURCE_SQL, routing, reg, namespace="ns")
 
     async def test_render_preserves_table_multiset(self):
         """F7: make the all-or-nothing invariant executable. A cross-source rewrite
@@ -328,12 +323,13 @@ class TestQualifyCrossSourceSQL:
         await qualify_cross_source_sql(_CROSS_SOURCE_SQL, routing, reg, namespace="ns")
         assert {c.args[1] for c in reg.get_source.await_args_list} == {"src-pg", "src-glue"}
 
-    async def test_unrouted_table_costs_no_registry_reads(self):
-        """Attribution happens before I/O, so the abandon path is free."""
+    async def test_unrouted_table_fails_before_registry_reads(self):
+        """Attribution fails closed before any registry I/O."""
         routing = _routing(("claims", "src-pg", "public"), ("policies", "src-glue", "insurance"))
         reg = _registry({"src-pg": {"athenaDataCatalogName": "pg_cat"}, "src-glue": _GLUE})
         sql = "SELECT 1 FROM claims JOIN policies ON TRUE JOIN mystery ON TRUE"
-        assert await qualify_cross_source_sql(sql, routing, reg, namespace="ns") == sql
+        with pytest.raises(QualificationError, match="mystery.*routing metadata"):
+            await qualify_cross_source_sql(sql, routing, reg, namespace="ns")
         reg.get_source.assert_not_awaited()
 
     async def test_qualified_routing_key_matches_schema_dot_table(self):
@@ -358,30 +354,31 @@ class TestQualifyCrossSourceSQL:
         assert "pg_cat.public.claims" in _unquoted(out)
         assert "awsdatacatalog.insurance.policies" in _unquoted(out)
 
-    async def test_unresolvable_schema_leaves_sql_unchanged(self):
-        """No schema anywhere → no partial rewrite (worse than a loud failure)."""
+    async def test_unresolvable_schema_fails_closed(self):
+        """No schema anywhere means the cross-source statement must not execute."""
         routing = {"claims": {"datasourceId": "src-pg"}, "policies": {"datasourceId": "src-glue"}}
-        # Neither record carries a schema the Glue-native branch would use (no
-        # sourceSchema, no athenaDatabase, no glueDatabaseName).
         reg = _registry({"src-pg": {"queryable": True}, "src-glue": {"queryable": True}})
-        out = await qualify_cross_source_sql(_CROSS_SOURCE_SQL, routing, reg, namespace="ns")
-        assert out == _CROSS_SOURCE_SQL
+        with pytest.raises(QualificationError, match="source schema"):
+            await qualify_cross_source_sql(_CROSS_SOURCE_SQL, routing, reg, namespace="ns")
 
-    async def test_unrouted_table_abandons_whole_rewrite(self):
-        """A partially-qualified statement is neither resolvable nor self-describing."""
+    async def test_unrouted_table_rejects_whole_rewrite(self):
+        """An unattributable table rejects the statement rather than running it bare."""
         routing = _routing(("claims", "src-pg", "public"), ("policies", "src-glue", "insurance"))
         reg = _registry({"src-pg": {"athenaDataCatalogName": "pg_cat"}, "src-glue": _GLUE})
         sql = "SELECT 1 FROM claims JOIN policies ON TRUE JOIN mystery ON TRUE"
-        assert await qualify_cross_source_sql(sql, routing, reg, namespace="ns") == sql
+        with pytest.raises(QualificationError, match="mystery.*routing metadata"):
+            await qualify_cross_source_sql(sql, routing, reg, namespace="ns")
 
-    async def test_no_registry_leaves_sql_unchanged(self):
+    async def test_no_registry_fails_closed(self):
         routing = _routing(("claims", "src-pg", "public"), ("policies", "src-glue", "insurance"))
-        assert await qualify_cross_source_sql(_CROSS_SOURCE_SQL, routing, None, namespace="ns") == _CROSS_SOURCE_SQL
+        with pytest.raises(QualificationError, match="sources registry"):
+            await qualify_cross_source_sql(_CROSS_SOURCE_SQL, routing, None, namespace="ns")
 
-    async def test_missing_source_record_leaves_sql_unchanged(self):
+    async def test_missing_source_record_fails_closed(self):
         routing = _routing(("claims", "src-pg", "public"), ("policies", "src-gone", "insurance"))
         reg = _registry({"src-pg": {"athenaDataCatalogName": "pg_cat"}})
-        assert await qualify_cross_source_sql(_CROSS_SOURCE_SQL, routing, reg, namespace="ns") == _CROSS_SOURCE_SQL
+        with pytest.raises(QualificationError, match="src-gone.*not found"):
+            await qualify_cross_source_sql(_CROSS_SOURCE_SQL, routing, reg, namespace="ns")
 
     async def test_non_queryable_source_leaves_sql_unchanged(self):
         """A cross-source query must not become a way around the queryable gate.
@@ -400,8 +397,8 @@ class TestQualifyCrossSourceSQL:
         )
         assert await qualify_cross_source_sql(_CROSS_SOURCE_SQL, routing, reg, namespace="ns") == _CROSS_SOURCE_SQL
 
-    async def test_malformed_catalog_name_leaves_sql_unchanged(self):
-        """A name that is not a plain identifier is not written into SQL at all."""
+    async def test_malformed_catalog_name_fails_closed(self):
+        """A malformed catalog name must not fall through to bare execution."""
         routing = _routing(("claims", "src-pg", "public"), ("policies", "src-glue", "insurance"))
         reg = _registry(
             {
@@ -409,7 +406,8 @@ class TestQualifyCrossSourceSQL:
                 "src-glue": _GLUE,
             }
         )
-        assert await qualify_cross_source_sql(_CROSS_SOURCE_SQL, routing, reg, namespace="ns") == _CROSS_SOURCE_SQL
+        with pytest.raises(QualificationError, match="invalid catalog or schema"):
+            await qualify_cross_source_sql(_CROSS_SOURCE_SQL, routing, reg, namespace="ns")
 
     async def test_statement_with_only_ctes_is_not_reported_as_qualified(self):
         """No real table references → no rewrite, and no 'qualified' log line.
@@ -520,15 +518,18 @@ class TestQualifyCrossSourceSQL:
         assert "JOIN customers AS c" in out  # the CTE reference stays bare
         assert is_fully_catalog_qualified(out)
 
-    async def test_parse_failure_leaves_sql_unchanged(self):
+    async def test_parse_failure_fails_closed(self):
         """sqlglot is lenient, so the failure is forced rather than hoped for."""
         routing = _routing(("claims", "src-pg", "public"), ("policies", "src-glue", "insurance"))
         reg = _registry({"src-pg": _GLUE, "src-glue": _GLUE})
-        with patch(
-            "coa_serve.tier2.table_qualifier.sqlglot.parse_one",
-            side_effect=sqlglot.errors.ParseError("boom"),
+        with (
+            patch(
+                "coa_serve.tier2.table_qualifier.sqlglot.parse_one",
+                side_effect=sqlglot.errors.ParseError("boom"),
+            ),
+            pytest.raises(QualificationError, match="could not be parsed"),
         ):
-            assert await qualify_cross_source_sql(_CROSS_SOURCE_SQL, routing, reg, namespace="ns") == _CROSS_SOURCE_SQL
+            await qualify_cross_source_sql(_CROSS_SOURCE_SQL, routing, reg, namespace="ns")
 
     async def test_parse_failure_does_not_log_the_statement(self):
         """sqlglot error text embeds a window of the SQL, literals included."""
@@ -541,6 +542,7 @@ class TestQualifyCrossSourceSQL:
                 side_effect=sqlglot.errors.ParseError(secret),
             ),
             patch("coa_serve.tier2.table_qualifier.logger") as log,
+            pytest.raises(QualificationError),
         ):
             await qualify_cross_source_sql(secret, routing, reg, namespace="ns")
         assert log.warning.call_args.kwargs["error"] == "ParseError"
@@ -661,6 +663,34 @@ class TestPrepareExecutionSQL:
         prepared = await prepare_execution_sql("SELECT 1 FROM customers", routing, reg, namespace="ns")
         assert prepared.error is not None
         assert "customers" in prepared.error
+
+    async def test_missing_routing_for_cross_source_table_fails_closed(self):
+        """A cross-source query must not execute bare when one table is unrouted.
+
+        The namespace has a customers table in each source. The translated query
+        selects source A's customers and joins source B's payments table, but the
+        routing entry for payments is missing. Returning the input SQL here lets
+        Athena's default context resolve payments to any same-named local table and
+        can turn the metadata defect into a wrong successful answer.
+        """
+        routing = _routing(
+            ("a.customers", "source-a", "a"),
+            ("b.customers", "source-b", "b"),
+        )
+        sql = "SELECT c.id FROM a.customers c JOIN payments p ON c.id = p.customer_id"
+        reg = _registry(
+            {
+                "source-a": {"athenaDataCatalogName": "catalog-a"},
+                "source-b": {"athenaDataCatalogName": "catalog-b"},
+            }
+        )
+
+        prepared = await prepare_execution_sql(sql, routing, reg, namespace="ns")
+
+        assert prepared.sql == sql
+        assert prepared.error is not None
+        assert "payments" in prepared.error
+        reg.get_source.assert_not_awaited()
 
     async def test_single_source_statement_passes_through(self):
         routing = _routing(("claims", "src-1", "public"))

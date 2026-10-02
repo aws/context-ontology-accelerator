@@ -143,4 +143,69 @@ describe("AuthnzStack", () => {
       expect(streamed).toHaveLength(2);
     });
   });
+
+  describe("seeded group → role mappings", () => {
+    const GROUP = "Platform Admins";
+    const ENCODED = "Platform%20Admins";
+
+    function seededItem(group: string): Record<string, { S: string }> {
+      const app = new cdk.App();
+      const stack = new AuthnzStack(app, "TestAuthnzSeed", {
+        claimsMappings: [
+          { groupValue: group, mappedRoles: ["platform-admin"] },
+        ],
+      });
+      const resources = Template.fromStack(stack).findResources("Custom::AWS");
+      const seeds = Object.values(resources).filter((r: any) =>
+        JSON.stringify(r.Properties.Update ?? "").includes("principalKey"),
+      );
+      expect(seeds).toHaveLength(1);
+      // TableName is a CFN token, so Update renders as an Fn::Join rather than
+      // a plain string; splice the literal chunks back together to recover it.
+      const update = (seeds[0] as any).Properties.Update;
+      const payload =
+        typeof update === "string"
+          ? update
+          : (update["Fn::Join"][1] as unknown[])
+              .map((part) => (typeof part === "string" ? part : "TOKEN"))
+              .join("");
+      return JSON.parse(payload).parameters.Item;
+    }
+
+    // The authorizer encodes group names before querying the PrincipalIndex
+    // GSI, so a raw key written here resolves to zero roles and denies access.
+    it("writes principalKey in the encoded form readers query with", () => {
+      expect(seededItem(GROUP).principalKey.S).toBe(`Group::${ENCODED}`);
+    });
+
+    it("writes PK in the encoded form", () => {
+      expect(seededItem(GROUP).PK.S).toBe(`Platform::GLOBAL#Group::${ENCODED}`);
+    });
+
+    it("writes principalRoleKey in the encoded form", () => {
+      expect(seededItem(GROUP).principalRoleKey.S).toBe(
+        `Group::${ENCODED}#ROLE#platform-admin`,
+      );
+    });
+
+    // principalId is display metadata, not a key, and the Python writers keep
+    // it raw; encoding it here would make the UI show percent escapes.
+    it("leaves principalId raw", () => {
+      expect(seededItem(GROUP).principalId.S).toBe(GROUP);
+    });
+
+    it("leaves already-safe group names untouched", () => {
+      const item = seededItem("platform-admins");
+      expect(item.principalKey.S).toBe("Group::platform-admins");
+      expect(item.principalId.S).toBe("platform-admins");
+    });
+
+    it("seeds nothing when no claims mappings are configured", () => {
+      const resources = buildTemplate().findResources("Custom::AWS");
+      const seeds = Object.values(resources).filter((r: any) =>
+        JSON.stringify(r.Properties.Update ?? "").includes("principalKey"),
+      );
+      expect(seeds).toHaveLength(0);
+    });
+  });
 });

@@ -149,6 +149,102 @@ class TestFormatSchemaContext:
         assert "Table: t1" in out
         assert "Description:" not in out
 
+    def test_review_gate_hides_pending_and_rejected_fks_from_prompt(self):
+        # Prompt must not offer PENDING_REVIEW or REJECTED inferred FKs to
+        # the LLM — otherwise rigor would propose a live relationship for
+        # something the review gate would withhold in every other artifact.
+        t = CatalogTable(
+            id="db.orders",
+            name="orders",
+            fullyQualifiedName="db.orders",
+            columns=[CatalogColumn(name="customer_id", dataType="BIGINT")],
+            tableConstraints=[
+                CatalogConstraint(
+                    constraintType="FOREIGN_KEY",
+                    columns=["customer_id"],
+                    referredColumns=["customers.id"],
+                    relationshipType="DETERMINISTIC",  # authoritative — surfaced
+                ),
+                CatalogConstraint(
+                    constraintType="FOREIGN_KEY",
+                    columns=["customer_id"],
+                    referredColumns=["crm_customers.id"],
+                    relationshipType="AI_INFERRED",
+                    reviewStatus="PENDING_REVIEW",  # gated — not surfaced
+                ),
+                CatalogConstraint(
+                    constraintType="FOREIGN_KEY",
+                    columns=["customer_id"],
+                    referredColumns=["legacy_customers.id"],
+                    relationshipType="AI_INFERRED",
+                    reviewStatus="REJECTED",  # gated — not surfaced
+                ),
+            ],
+        )
+        out = _format_schema_context(t)
+        # Authoritative FK survives.
+        assert "customers.id" in out
+        # PENDING and REJECTED FKs are hidden from the LLM.
+        assert "crm_customers.id" not in out
+        assert "legacy_customers.id" not in out
+
+
+class TestFkInfoAppliesReviewGate:
+    def test_only_gate_passing_fks_reach_the_mapping(self):
+        # _fk_info drives which column becomes an rr:parentTriplesMap join
+        # in build_r2rml. Before the fix a PENDING/REJECTED FK sorting first
+        # became a live Ontop join. Now the gate applies here too.
+        from coa_ontology.inducer.strategies.rigor_ontology import RigorOntologyStrategy
+
+        t = CatalogTable(
+            id="db.orders",
+            name="orders",
+            fullyQualifiedName="db.orders",
+            columns=[CatalogColumn(name="customer_id", dataType="BIGINT")],
+            tableConstraints=[
+                # PENDING listed first — under the old first-wins would have
+                # been chosen as the FK target.
+                CatalogConstraint(
+                    constraintType="FOREIGN_KEY",
+                    columns=["customer_id"],
+                    referredColumns=["pending_customers.id"],
+                    relationshipType="AI_INFERRED",
+                    reviewStatus="PENDING_REVIEW",
+                ),
+                CatalogConstraint(
+                    constraintType="FOREIGN_KEY",
+                    columns=["customer_id"],
+                    referredColumns=["customers.id"],
+                    relationshipType="DETERMINISTIC",
+                ),
+            ],
+        )
+        target, col = RigorOntologyStrategy._fk_info("customer_id", t)
+        assert target == "customers"
+        assert col == "id"
+
+    def test_all_rejected_yields_no_fk(self):
+        from coa_ontology.inducer.strategies.rigor_ontology import RigorOntologyStrategy
+
+        t = CatalogTable(
+            id="db.orders",
+            name="orders",
+            fullyQualifiedName="db.orders",
+            columns=[CatalogColumn(name="customer_id", dataType="BIGINT")],
+            tableConstraints=[
+                CatalogConstraint(
+                    constraintType="FOREIGN_KEY",
+                    columns=["customer_id"],
+                    referredColumns=["customers.id"],
+                    relationshipType="AI_INFERRED",
+                    reviewStatus="REJECTED",
+                ),
+            ],
+        )
+        target, col = RigorOntologyStrategy._fk_info("customer_id", t)
+        assert target is None
+        assert col is None
+
 
 # ── Strategy registry ───────────────────────────────────────────────────
 

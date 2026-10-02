@@ -218,6 +218,7 @@ class TestPostgresAdapter:
         connect_args = kwargs["connect_args"]
         assert isinstance(connect_args["ssl"], ssl.SSLContext)
         assert connect_args["server_settings"]["search_path"] == "public"
+        assert connect_args["server_settings"]["default_transaction_read_only"] == "on"
         # Bounded connect + capped pool (no unbounded overflow) + pre-ping.
         assert connect_args["timeout"] >= 1
         assert kwargs["max_overflow"] == 0
@@ -240,6 +241,10 @@ class TestPostgresAdapter:
         await RedshiftAdapter().open_connection(_make_pg_creds(engine_type="REDSHIFT", port=5439))
         url = mock_create_engine.call_args.args[0]
         assert url.drivername == _REDSHIFT_ASYNCPG_DRIVER
+        assert (
+            "default_transaction_read_only"
+            not in mock_create_engine.call_args.kwargs["connect_args"]["server_settings"]
+        )
 
     async def test_run_sets_search_path_and_timeout(self):
         from coa_serve.clients.db_adapters.postgres import PostgresAdapter
