@@ -80,6 +80,8 @@ use com.amazon.semanticcontext.unifiedsources#KeepRescanRemoval
 use com.amazon.semanticcontext.unifiedsources#ListSourceScanJobs
 use com.amazon.semanticcontext.unifiedsources#ListSourceTables
 use com.amazon.semanticcontext.unifiedsources#ListSources
+use com.amazon.semanticcontext.unifiedsources#PutSourceEventRescan
+use com.amazon.semanticcontext.unifiedsources#PutSourceRescanSchedule
 use com.amazon.semanticcontext.unifiedsources#RejectSource
 use com.amazon.semanticcontext.unifiedsources#RescanSource
 use com.amazon.semanticcontext.unifiedsources#ReviewSourceColumn
@@ -165,6 +167,8 @@ service ControlPlaneService {
         // Re-scan: decline a flagged removal so approve keeps the table/column
         KeepRescanRemoval
         GetSourceScanJob
+        PutSourceRescanSchedule
+        PutSourceEventRescan
         UpdateSourceMetadata
         // ── Metric service ──────────────────────────────────────────────
         CreateMetric

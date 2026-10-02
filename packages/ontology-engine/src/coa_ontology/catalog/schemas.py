@@ -243,5 +243,11 @@ class EmbeddingQuery(BaseModel):
         import re
 
         if not re.match(r"^[a-zA-Z0-9_\-.:/# ]+$", v):
-            raise ValueError(f"Invalid characters in value: {v!r}")
+            # Never interpolate ``v`` into the message — Pydantic uses this
+            # text verbatim as the 422 response's ``msg``, and echoing an
+            # attacker-supplied value there is the leak we're rejecting the
+            # value to prevent. The handler at ``coa_ontology.main`` masks
+            # ``msg`` for ``value_error``/``assertion_error`` types as a
+            # safety net; this is the belt to that suspenders.
+            raise ValueError("value contains characters outside [a-zA-Z0-9_.-:/# ]")
         return v

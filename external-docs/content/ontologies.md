@@ -80,6 +80,51 @@ request/response schemas.
 | **Validate** | Run consistency + quality checks on a proposal before accepting, including datatype checks (see "Validating and repairing datatype issues" below) |
 | **Delete** | Remove an ontology's graph triples, vector embeddings, and registry entry from the namespace (see "Deleting ontologies" below) |
 
+## Curating an ontology: re-induce and re-accept
+
+Induction reads whatever the catalog says about a table or column at the time
+it runs — including any description or synonyms a steward has written (see
+[Editing Metadata as a Steward](sources.md#editing-metadata-as-a-steward)). To
+get curated text into an accepted ontology, **re-induce the source and accept
+the new proposal into the same ontology**. Accepting a proposal into an
+ontology that already exists is an *append*: the new proposal is merged into
+the existing graph.
+
+What happens to the class or property you curated:
+
+| Surface | On re-accept |
+|---------|--------------|
+| Description (`rdfs:comment`), synonyms (`skos:altLabel`) | **Replaced.** Only the text in the new proposal is live. The previous text is not deleted — it is kept as history on the vertex (`superseded` on `GET /graph/class`), where you can see what the class used to say. |
+| Relationships (`owl:ObjectProperty`, `rdfs:subClassOf`, mappings) | **Kept.** Inferred join paths survive a re-accept; only the text is superseded. |
+| Other classes and properties in the same ontology | **Untouched.** Only the classes and properties present in the new proposal are affected. Class identity is the IRI, minted from the table name — so a class whose IRI does not appear in the new proposal is left alone. Two sources that each have a table with the same name resolve to the same IRI; the later accept replaces the earlier text on that class (last writer wins). A renamed table becomes a new class and the old one stays live. |
+| Semantic search | The embeddings of the replaced text are retired with it, so search stops returning the old phrasing. |
+
+This means a curated description **wins** over the AI-generated one it
+replaces: the model that answers questions sees one definition, not two.
+
+!!! tip "Starting from a clean synonym list"
+    The metadata editor pre-fills the synonyms that are already stored, which
+    for an enriched source are the AI's suggestions. If you only *add* terms,
+    the suggestions are saved too. Use **Clear all** in the synonyms field to
+    start from an empty, authored list — saving replaces the whole list.
+
+!!! warning "Curate before you approve the source"
+    Today a metadata edit made *after* the source is approved is saved and
+    shown, but does not reach the next induction. Edit descriptions and
+    synonyms while the source is still in review, then approve, then induce.
+    Propagating post-approval edits is tracked separately.
+
+## Re-scanning and re-induction
+
+Connected database sources can be **re-scanned** to pick up schema changes, and a re-scan goes through steward review before it is approved. An induction reflects the source schema **at the time it was induced**, so once a source is re-scanned and re-approved, an earlier induction can fall out of date.
+
+The namespace **Ontology** page shows a warning naming any approved database source whose newest induction predates its latest approved re-scan. There are two cases:
+
+- **The accepted ontology is stale** — the loaded ontology was induced before the re-scan. Re-inducing today **merges** into the existing ontology (append-only): it does not remove tables dropped at the source. Descriptions and synonyms are replaced (see "Curating an ontology: re-induce and re-accept" above), but a changed label (`rdfs:label`) is added next to the old one. For a clean rebuild, **delete the affected induction and induce again**. Editing an induction in place is not available yet.
+- **A pending induction predates the re-scan** — a proposal is awaiting review, but the source was re-scanned after that induction was triggered, so the proposal was built on the older schema. **Re-run the induction on the current source, then accept the new proposal** rather than the out-of-date one.
+
+The warning clears once the source's newest induction is newer than its newest approved re-scan — that is, after you re-induce (it clears even while the new proposal is still pending review). A source that was never induced is never flagged.
+
 ## Induction Job Status and Troubleshooting
 
 Induction runs **asynchronously**. When you trigger it (via **Start induction** or the **StartInduction** operation), Context Ontology Accelerator returns a job that moves through several in-progress stages before reaching one of two terminal states:

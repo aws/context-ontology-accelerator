@@ -295,10 +295,14 @@ class BedrockClient:
                 )
                 raise GuardrailBlockedError(f"Guardrail {self._guardrail_id} blocked the response")
 
+            if intervened:
                 # Intervened without blocking — the response is still usable but
                 # matched values were substituted with placeholders (e.g.
                 # "{NAME}"). Note this masks values, it does not drop fields, so
-                # it cannot by itself explain a wholly missing output field.
+                # it cannot by itself explain a wholly missing output field. This
+                # branch is reachable only because it now sits AFTER the blocked
+                # `raise`, not nested under `if blocked:` — a masking intervention
+                # must leave an observable log line, not pass silently.
                 logger.warning(
                     "Guardrail intervened without blocking (values masked): model=%s guardrail=%s",
                     self._model_id,

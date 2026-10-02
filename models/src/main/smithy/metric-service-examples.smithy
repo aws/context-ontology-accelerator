@@ -19,7 +19,7 @@ apply CreateMetric @examples([
                 dialects: [
                     {
                         dialect: "POSTGRESQL"
-                        expression: "SUM(net_amount)"
+                        expression: "SELECT SUM(net_amount) FROM public.orders"
                     }
                 ]
             }
@@ -39,7 +39,7 @@ apply CreateMetric @examples([
                     dialects: [
                         {
                             dialect: "POSTGRESQL"
-                            expression: "SUM(net_amount)"
+                            expression: "SELECT SUM(net_amount) FROM public.orders"
                         }
                     ]
                 }
@@ -70,7 +70,7 @@ apply GetMetric @examples([
                     dialects: [
                         {
                             dialect: "POSTGRESQL"
-                            expression: "SUM(net_amount)"
+                            expression: "SELECT SUM(net_amount) FROM public.orders"
                         }
                     ]
                 }
@@ -101,7 +101,7 @@ apply ListMetrics @examples([
                         dialects: [
                             {
                                 dialect: "POSTGRESQL"
-                                expression: "SUM(net_amount)"
+                                expression: "SELECT SUM(net_amount) FROM public.orders"
                             }
                         ]
                     }
@@ -128,11 +128,11 @@ apply UpdateMetric @examples([
                 dialects: [
                     {
                         dialect: "POSTGRESQL"
-                        expression: "SUM(net_amount)"
+                        expression: "SELECT SUM(net_amount) FROM public.orders"
                     }
                     {
                         dialect: "TRINO"
-                        expression: "SUM(net_amount)"
+                        expression: "SELECT SUM(net_amount) FROM public.orders"
                     }
                 ]
             }
@@ -152,11 +152,11 @@ apply UpdateMetric @examples([
                     dialects: [
                         {
                             dialect: "POSTGRESQL"
-                            expression: "SUM(net_amount)"
+                            expression: "SELECT SUM(net_amount) FROM public.orders"
                         }
                         {
                             dialect: "TRINO"
-                            expression: "SUM(net_amount)"
+                            expression: "SELECT SUM(net_amount) FROM public.orders"
                         }
                     ]
                 }
@@ -192,7 +192,7 @@ apply ValidateMetric @examples([
                 dialects: [
                     {
                         dialect: "POSTGRESQL"
-                        expression: "AVG(net_amount)"
+                        expression: "SELECT AVG(net_amount) FROM public.orders"
                     }
                 ]
             }
@@ -231,14 +231,8 @@ apply BulkDeleteMetrics @examples([
 apply ImportOsi @examples([
     {
         title: "Import metrics from inline OSI YAML"
-        input: { namespaceId: "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d", content: "version: 1\nmetrics:\n  - name: total_revenue\n    expression: SUM(net_amount)\n" }
-        output: {
-            datasetsResolved: 1
-            metricsCreated: 3
-            metricsUpdated: 1
-            warnings: ["Metric 'legacy_gmv' skipped: no matching data source."]
-            status: "COMPLETED"
-        }
+        input: { namespaceId: "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d", content: "osi_spec_version: '1.0'\nmetrics:\n- name: total_revenue\n  description: Total revenue from closed orders\n  expression:\n    dialects:\n    - dialect: ANSI_SQL\n      expression: SELECT SUM(net_amount) FROM public.orders\n  custom_extensions:\n  - vendor_name: COA\n    data:\n      data_source_id: warehouse-pg-01\n      source_table: public.orders\n" }
+        output: { datasetsResolved: 0, metricsCreated: 0, metricsUpdated: 0, jobId: "01HZY8K3M4N5P6Q7R8S9T0V1W2", status: "IN_PROGRESS" }
     }
 ])
 
@@ -273,8 +267,8 @@ apply ExportOsi @examples([
         input: {
             namespaceId: "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"
             format: "inline"
-            names: ["total_revenue", "avg_order_value"]
+            names: ["total_revenue"]
         }
-        output: { content: "version: 1\nmetrics:\n  - name: total_revenue\n    expression: SUM(net_amount)\n  - name: avg_order_value\n    expression: AVG(net_amount)\n" }
+        output: { content: "osi_spec_version: '1.0'\ndatasets:\n- name: orders\n  source: public.orders\n  data_source_id: warehouse-pg-01\nmetrics:\n- name: total_revenue\n  description: Total revenue from closed orders\n  expression:\n    dialects:\n    - dialect: ANSI_SQL\n      expression: SELECT SUM(net_amount) FROM public.orders\n  custom_extensions:\n  - vendor_name: COA\n    data:\n      data_source_id: warehouse-pg-01\n      source_table: public.orders\n" }
     }
 ])

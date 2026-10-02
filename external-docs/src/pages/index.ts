@@ -10,6 +10,7 @@ import cedarPolicies from '@docs/cedar-policy-authoring.md?raw'
 import sources from '@docs/sources.md?raw'
 import crossAccountSources from '@docs/cross-account-sources.md?raw'
 import customConnectorSources from '@docs/custom-connector-sources.md?raw'
+import databricksSources from '@docs/databricks-sources.md?raw'
 import ontologies from '@docs/ontologies.md?raw'
 import metrics from '@docs/metrics.md?raw'
 import serve from '@docs/serve.md?raw'
@@ -27,6 +28,7 @@ export type PageId =
   | 'sources'
   | 'cross-account-sources'
   | 'custom-connector-sources'
+  | 'databricks-sources'
   | 'ontologies'
   | 'metrics'
   | 'serve'
@@ -44,6 +46,7 @@ export const pages: Record<PageId, string> = {
   sources,
   'cross-account-sources': crossAccountSources,
   'custom-connector-sources': customConnectorSources,
+  'databricks-sources': databricksSources,
   ontologies,
   metrics,
   serve,

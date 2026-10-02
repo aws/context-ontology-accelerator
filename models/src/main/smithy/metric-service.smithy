@@ -80,6 +80,11 @@ enum TimeGrain {
 
 /// Severity level attached to a validation warning.
 enum WarningSeverity {
+    /// Blocking issue: the metric is rejected at create/update. This includes
+    /// SQL accepted by neither the persistence gate nor serve-time firewall,
+    /// an unapproved source, and a provably absent declared source table.
+    ERROR
+
     /// Warning-level issue; non-fatal but should be reviewed.
     WARNING
 
@@ -422,7 +427,8 @@ operation DeleteMetric {
 // ──────────────────────────────────────────────
 // ValidateMetric
 // ──────────────────────────────────────────────
-/// Validate a metric definition without persisting it, returning any warnings.
+/// Validate a metric definition without persisting it. ERROR findings predict
+/// create/update rejection; INFO findings are advisory.
 @http(method: "POST", uri: "/namespaces/{namespaceId}/metrics/validate")
 operation ValidateMetric {
     input := {
@@ -468,9 +474,10 @@ operation ValidateMetric {
     ]
 }
 
-/// Result of validating a metric definition, listing any warnings.
+/// Result of validating a metric definition, listing blocking and advisory findings.
 structure ValidateMetricOutput {
-    /// Non-fatal validation warnings raised during validation.
+    /// Validation findings. Severity ERROR predicts create/update rejection;
+    /// INFO is advisory.
     @required
     warnings: ValidationWarningList
 }

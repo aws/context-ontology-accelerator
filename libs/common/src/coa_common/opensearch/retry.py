@@ -25,9 +25,41 @@ from opensearchpy import OpenSearch
 from opensearchpy.exceptions import ConnectionError as OSConnectionError
 from opensearchpy.exceptions import ConnectionTimeout, TransportError
 from opensearchpy.helpers import bulk
-from opensearchpy.helpers.errors import BulkIndexError
 
 log = logging.getLogger(__name__)
+
+
+class PartialIndexError(Exception):
+    """A bulk write did not durably index every action.
+
+    Raised by :func:`bulk_with_retry` when, after transient-fault retries are
+    exhausted, one or more documents still failed to index — OR when any
+    document failed with a NON-transient (terminal) status. Carries the count
+    and per-item errors so the caller can fail loud instead of silently
+    reporting a write that only partially landed.
+
+    This is the correctness contract #173 relies on: at min-OCU 0 the NEXTGEN
+    circuit breaker sheds bulk-write load with 429s; opensearch-py's own
+    per-item retry can exhaust and DROP those docs from the success stream
+    without surfacing an error, so a naive caller reports "N written" when far
+    fewer landed. Surfacing the shortfall as a raise turns silent data loss
+    into a visible failure.
+    """
+
+    def __init__(self, message: str, *, failed: int, submitted: int, errors: list[dict]):
+        """Record the shortfall so callers/tests can assert on it.
+
+        Args:
+            message: Human-readable summary.
+            failed: Number of documents that never durably indexed.
+            submitted: Number of documents handed to this bulk write.
+            errors: The per-item error dicts (opensearch-py bulk error shape).
+        """
+        super().__init__(message)
+        self.failed = failed
+        self.submitted = submitted
+        self.errors = errors
+
 
 # 429 (throttle / circuit-breaker) + retryable 5xx. 4xx (400/403/404/409) are
 # terminal and propagate immediately.
@@ -113,50 +145,99 @@ def oss_retry[T](op: str, fn: Callable[[], T]) -> T:
 
 
 def bulk_with_retry(client: OpenSearch, actions: list[dict]) -> None:
-    """Bulk-index ``actions``, retrying items that fail with a transient status.
+    """Bulk-index ``actions``, retrying transient per-item failures, then verify.
 
-    ``helpers.bulk``'s own ``max_retries`` only re-sends items that return 429;
-    a per-item 5xx (AOSS "Internal error occurred while processing request")
-    raises ``BulkIndexError`` immediately with no retry. Whole-request wrapping
-    (:func:`oss_retry`) can't help either — the HTTP request itself returned 200,
-    the failure is per-document. So on ``BulkIndexError`` we inspect each item's
-    status and re-submit ONLY the transiently-failed actions (retrying the whole
-    batch would duplicate the succeeded docs, since AOSS auto-assigns ``_id``).
+    Contract: this returns ONLY when every action durably indexed. Any residual
+    failure — transient errors that survive :data:`OSS_MAX_RETRIES` re-submits,
+    or a NON-transient (terminal 4xx) per-item error — raises
+    :class:`PartialIndexError` carrying the shortfall. It never returns cleanly
+    with docs still un-indexed.
+
+    Why not rely on ``BulkIndexError`` (the previous design): opensearch-py's
+    ``helpers.bulk`` handles per-item 429s with its own internal retry, and when
+    those retries exhaust it can DROP the item from the success stream WITHOUT
+    raising ``BulkIndexError`` (the HTTP request returned 200; the failure is
+    per-document and got swallowed). Under min-OCU-0 circuit-breaker load
+    shedding that produced the #173 symptom: "101 written" reported while far
+    fewer were searchable, with no error to the caller.
+
+    So we call ``bulk`` with ``raise_on_error=False`` and inspect the returned
+    ``(ok_count, errors)`` DIRECTLY — the errors list is authoritative, whether
+    or not a ``BulkIndexError`` would have been raised. We re-submit ONLY the
+    transiently-failed docs (re-sending the whole batch would duplicate the
+    succeeded ones, since AOSS auto-assigns ``_id``), and on exhaustion raise.
     """
     if not actions:
         return
     pending = actions
     attempt = 0
     while True:
-        try:
-            bulk(client, pending, chunk_size=10, max_retries=3, initial_backoff=2, max_backoff=30)
+        # raise_on_error=False → returns (success_count, errors) instead of
+        # raising, so an exhausted per-item 429 that opensearch-py would
+        # otherwise silently drop is visible to us as an error entry.
+        # max_retries here is opensearch-py's own inner 429 retry; our outer
+        # loop adds the capped-exponential re-submit over OSS_RETRY_STATUS.
+        _ok, errors = bulk(
+            client,
+            pending,
+            chunk_size=10,
+            max_retries=3,
+            initial_backoff=2,
+            max_backoff=30,
+            raise_on_error=False,
+            stats_only=False,
+        )
+        if not errors:
             return
-        except BulkIndexError as exc:
-            # exc.errors is a list of per-item result dicts, e.g.
-            # [{"index": {"status": 500, "error": {...}, "data": {...}}}].
-            retryable_data: list[dict] = []
-            for item in exc.errors:
-                (op_result,) = item.values()  # single-key dict keyed by op type
-                status = op_result.get("status")
-                data = op_result.get("data")
-                if status in OSS_RETRY_STATUS and data is not None:
-                    retryable_data.append(data)
-            # Nothing transient, or retries exhausted → surface the real error.
-            if not retryable_data or attempt >= OSS_MAX_RETRIES:
-                raise
-            backoff = _backoff(attempt)
-            log.warning(
-                "OSS bulk: %d/%d docs failed transiently; retry %d/%d in %.1fs",
-                len(retryable_data),
-                len(pending),
-                attempt + 1,
-                OSS_MAX_RETRIES,
-                backoff,
+
+        # errors is a list of per-item result dicts, e.g.
+        # [{"index": {"status": 500, "error": {...}, "data": {...}}}].
+        retryable_data: list[dict] = []
+        terminal: list[dict] = []
+        for item in errors:
+            (op_result,) = item.values()  # single-key dict keyed by op type
+            status = op_result.get("status")
+            data = op_result.get("data")
+            if status in OSS_RETRY_STATUS and data is not None:
+                retryable_data.append(data)
+            else:
+                terminal.append(item)
+
+        # A terminal (non-transient) per-item failure can never be fixed by
+        # retrying — surface it immediately rather than looping.
+        if terminal:
+            raise PartialIndexError(
+                f"OSS bulk: {len(terminal)} doc(s) failed with a terminal (non-retryable) status "
+                f"out of {len(pending)} submitted",
+                failed=len(terminal),
+                submitted=len(pending),
+                errors=errors,
             )
-            time.sleep(backoff)
-            # Re-submit only the failed docs. ``data`` is the source document; it
-            # carries neither _index nor _op_type, so rebuild the action envelope
-            # from the original actions (all share the same index within a batch).
-            index = pending[0]["_index"]
-            pending = [{"_op_type": "index", "_index": index, **d} for d in retryable_data]
-            attempt += 1
+
+        # Only transient failures remain. If we're out of re-submit budget, the
+        # docs did NOT land — fail loud instead of returning a partial write.
+        if attempt >= OSS_MAX_RETRIES:
+            raise PartialIndexError(
+                f"OSS bulk: {len(retryable_data)} doc(s) still failing transiently after "
+                f"{OSS_MAX_RETRIES} re-submit(s); index is incomplete",
+                failed=len(retryable_data),
+                submitted=len(pending),
+                errors=errors,
+            )
+
+        backoff = _backoff(attempt)
+        log.warning(
+            "OSS bulk: %d of %d docs failed transiently on this attempt; re-submit %d/%d in %.1fs",
+            len(retryable_data),
+            len(pending),
+            attempt + 1,
+            OSS_MAX_RETRIES,
+            backoff,
+        )
+        time.sleep(backoff)
+        # Re-submit only the failed docs. ``data`` is the source document; it
+        # carries neither _index nor _op_type, so rebuild the action envelope
+        # from the original actions (all share the same index within a batch).
+        index = pending[0]["_index"]
+        pending = [{"_op_type": "index", "_index": index, **d} for d in retryable_data]
+        attempt += 1

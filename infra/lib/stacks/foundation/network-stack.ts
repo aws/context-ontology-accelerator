@@ -4,9 +4,11 @@
 import * as cdk from "aws-cdk-lib";
 import * as ec2 from "aws-cdk-lib/aws-ec2";
 import * as servicediscovery from "aws-cdk-lib/aws-servicediscovery";
+import * as ssm from "aws-cdk-lib/aws-ssm";
 import { Construct } from "constructs";
 
 import { SCLStack } from "../../constructs";
+import { resolveContext } from "../../context";
 import {
   JdbcConnectivity,
   type PeeringConfig,
@@ -472,6 +474,29 @@ export class NetworkStack extends SCLStack {
     new cdk.CfnOutput(this, "VpcId", {
       value: this.vpc.vpcId,
       description: "SemanticContext VPC ID",
+    });
+
+    // For CDK apps outside this one that attach compute to this VPC, today the COA-operated
+    // Databricks connector. Its deploy script reads both and passes them in as variables:
+    // SSM parameters are the cross-app contract here, and an SSM StringList read inside the
+    // other stack would be a list token of unknown length, which Vpc.fromVpcAttributes cannot
+    // map to subnets.
+    const { ssmPrefix, envName } = resolveContext(this.node);
+    new ssm.StringParameter(this, "SsmVpcId", {
+      parameterName: `${ssmPrefix}/${envName}/network/vpc-id`,
+      stringValue: this.vpc.vpcId,
+      description: "SemanticContext VPC ID",
+    });
+    new ssm.StringParameter(this, "SsmPrivateSubnetIds", {
+      parameterName: `${ssmPrefix}/${envName}/network/private-subnet-ids`,
+      stringValue: cdk.Fn.join(
+        ",",
+        this.vpc.selectSubnets({
+          subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS,
+        }).subnetIds,
+      ),
+      description:
+        "SemanticContext private subnet IDs (with egress), comma-separated",
     });
 
     new cdk.CfnOutput(this, "ServiceNamespaceArn", {

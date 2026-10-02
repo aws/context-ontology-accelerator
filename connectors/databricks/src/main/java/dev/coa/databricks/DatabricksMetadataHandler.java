@@ -13,9 +13,9 @@ import dev.coa.connector.metadata.CoaTable;
 import dev.coa.connector.metrics.ConnectorMetrics;
 import dev.coa.databricks.config.ConnectionConfig;
 import dev.coa.databricks.config.ConnectionConfigProvider;
+import dev.coa.databricks.config.ConnectionConfigProviders;
 import dev.coa.databricks.config.CredentialSource;
-import dev.coa.databricks.config.EnvironmentConnectionConfigProvider;
-import dev.coa.databricks.config.MeteredConnectionConfigProvider;
+import dev.coa.databricks.config.ExpiringCache;
 import dev.coa.databricks.jdbc.DatabricksConnectionFactory;
 import dev.coa.databricks.metadata.InformationSchemaReader;
 import org.slf4j.Logger;
@@ -26,9 +26,6 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.Function;
 import java.util.function.Supplier;
 
@@ -36,28 +33,32 @@ import java.util.function.Supplier;
  * The metadata half: one Athena schema, its tables, and each table's columns, comments and declared
  * keys.
  *
- * <p>This extends the COA toolkit's {@link CoaMetadataHandler} while
- * {@link DatabricksRecordHandler} extends {@code athena-jdbc}'s record handler, since a Java class
- * cannot do both. What the toolkit supplies here is the comment builder, the {@code @pk}/{@code @fk}
- * encoder, and the Arrow-schema placement that makes a comment reach Athena at all.
+ * <p>This extends the COA toolkit's {@link CoaMetadataHandler} while {@link DatabricksRecordHandler}
+ * extends {@code athena-jdbc}'s record handler, since a Java class cannot do both. The toolkit supplies the
+ * comment builder, the {@code @pk}/{@code @notnull}/{@code @fk} encoder, and the Arrow-schema placement
+ * that makes a comment reach Athena at all.
  *
- * <p>Unity Catalog addresses {@code catalog.schema.table}, and an Athena federated catalog has one
- * level left below the registered catalog name. This connector spends it on the Unity Catalog schema
- * and takes the catalog itself from {@code DATABRICKS_CATALOG}. Which schemas it advertises depends on
- * {@code DATABRICKS_SCHEMA}: set, exactly that one, and every other name is refused, which is a
- * containment boundary independent of the credential's Unity Catalog grants; unset, every schema in the
- * catalog that Athena can address, enumerated from {@code information_schema}, with those grants the
- * only boundary. What it advertises and what it serves are the same set either way — see
- * {@link #servable}. The record half enumerates nothing, since it reads the schema off the request, but
- * it enforces the pin as well, so the boundary does not depend on Athena having called
+ * <p>A {@link ConnectionConfigProvider} resolves the configuration for the Athena catalog name each request
+ * arrives under, so every method here resolves per request. The cold-start log line asks the provider to
+ * {@link ConnectionConfigProvider#describe()} itself, because a cold start happens before any catalog name
+ * exists and naming an endpoint would mean picking a tenant's at random.
+ *
+ * <p>Unity Catalog addresses {@code catalog.schema.table}, and an Athena federated catalog has one level
+ * left below the registered catalog name. This connector spends it on the Unity Catalog schema and takes
+ * the catalog from the resolved configuration. A schema-pinned configuration (always, for a COA-managed
+ * source; otherwise {@code DATABRICKS_SCHEMA}) exposes that one schema and refuses every other name, a
+ * containment boundary independent of the credential's Unity Catalog grants. Unpinned, it enumerates the
+ * catalog's addressable schemas from {@code information_schema} and those grants are the only boundary.
+ * What it advertises and what it serves are the same set either way, see {@link #servable}. The record half
+ * enumerates nothing but enforces the pin as well, so the boundary does not depend on Athena having called
  * {@code GetTable} first.
  *
- * <p>{@link #doGetSplits} emits a split with no properties. The toolkit's default puts the table name
- * on it under the key {@code "table"}, and {@code athena-jdbc}'s query builder reads every split
- * property as a partition value: it drops those names from the projection, skips their constraints, and
- * feeds the split's value to the extractor instead of the result set. A Databricks table with a column
- * named {@code table} would return the literal string {@code orders} in it for every row, silently. The
- * table name is already on the request.
+ * <p>{@link #doGetSplits} emits a split with no properties. The toolkit's default puts the table name on it
+ * under the key {@code "table"}, and {@code athena-jdbc}'s query builder reads every split property as a
+ * partition value: it drops those names from the projection, skips their constraints, and feeds the split's
+ * value to the extractor instead of the result set. A Databricks table with a column named {@code table}
+ * would silently return the literal string {@code orders} in it for every row. The table name is already on
+ * the request.
  */
 public class DatabricksMetadataHandler extends CoaMetadataHandler
 {
@@ -72,9 +73,6 @@ public class DatabricksMetadataHandler extends CoaMetadataHandler
     public static final String SOURCE_TYPE = "databricks";
 
     private final ConnectionConfigProvider configs;
-    private final Map<String, java.util.List<
-            com.amazonaws.athena.connector.lambda.metadata.optimizations.OptimizationSubType>>
-            capabilities;
 
     /**
      * Opens connections for a configuration. The module's containment boundary runs through
@@ -85,10 +83,16 @@ public class DatabricksMetadataHandler extends CoaMetadataHandler
     private final Function<ConnectionConfig, Supplier<Connection>> connections;
 
     /** The advertised schema list per configuration, for an unpinned connector. */
-    private final ServableSchemas servableSchemas;
+    private final ExpiringCache<ConnectionConfig, List<String>> servableSchemas;
 
     /**
-     * Lambda entry point's constructor.
+     * The container's credential cache, shared with the record half: one container, one cache, one assumed
+     * session per role, and one {@code GetSecretValue} per source per TTL window.
+     */
+    private final CredentialSource credentials;
+
+    /**
+     * A metadata-only Lambda's entry point, which resolves everything from the environment itself.
      *
      * @throws IllegalArgumentException if the environment is missing or invalid, naming the variable.
      *                                 Thrown during initialisation so a misconfigured connector fails
@@ -96,57 +100,48 @@ public class DatabricksMetadataHandler extends CoaMetadataHandler
      */
     public DatabricksMetadataHandler(Map<String, String> configOptions)
     {
-        this(configOptions,
-                new MeteredConnectionConfigProvider(
-                        new EnvironmentConnectionConfigProvider(configOptions),
-                        new ConnectorMetrics(SOURCE_TYPE)));
+        this(configOptions, ConnectionConfigProviders.fromEnvironment(configOptions));
     }
 
     /**
-     * @param configs resolves the endpoint. A parameter so a later phase can supply an SSM-backed
-     *                implementation without touching this class.
+     * @param wiring the provider and the credential path the environment described, from one read of the
+     *               mode. Taken as a pair so nothing here can combine a provider with a credential path
+     *               the mode did not choose, and so both halves of a container share one of each cache.
      */
     public DatabricksMetadataHandler(Map<String, String> configOptions,
-                                     ConnectionConfigProvider configs)
+                                     ConnectionConfigProviders.Wiring wiring)
     {
-        this(configOptions, configs, null, CredentialSource.DEFAULT_TTL_MILLIS);
+        this(configOptions, wiring.provider(), wiring.credentials(), null,
+                CredentialSource.DEFAULT_TTL_MILLIS);
     }
 
     /**
      * The constructor a test uses.
      *
      * @param connections            opens connections for a resolved configuration, or null for the real
-     *                               one. Null rather than an overload taking the real value, because the
-     *                               real one needs {@code this::getSecret} — the federation SDK's own
-     *                               caching Secrets Manager client — which no caller can reference before
-     *                               this constructor has run.
+     *                               one, which needs {@code this.credentials}.
      * @param schemaCacheTtlMillis   how long an unpinned connector may reuse an enumerated schema list.
      *                               Zero disables the cache, which is what a test asserting the
      *                               enumeration happened wants.
      */
     DatabricksMetadataHandler(Map<String, String> configOptions,
                               ConnectionConfigProvider configs,
+                              CredentialSource credentials,
                               Function<ConnectionConfig, Supplier<Connection>> connections,
                               long schemaCacheTtlMillis)
     {
         super(SOURCE_TYPE, configOptions);
         this.configs = configs;
-        this.capabilities = PushdownCapabilities.from(Settings.advertisedPushdown(configOptions));
-        CredentialSource credentials = new CredentialSource(this::getSecret);
+        this.credentials = credentials;
         this.connections = (connections != null)
                 ? connections
-                : config -> new DatabricksConnectionFactory(config, credentials)::open;
-        this.servableSchemas = new ServableSchemas(schemaCacheTtlMillis);
+                : config -> new DatabricksConnectionFactory(config, this.credentials)::open;
+        this.servableSchemas = new ExpiringCache<>(schemaCacheTtlMillis);
 
-        // A cold start happens before any catalog name exists, so this is one of the two sites that
-        // passes null, and a multiplexed provider has to tolerate it.
-        ConnectionConfig config = configs.configFor(null);
-        // Enough to tell an operator which endpoint this container serves, and nothing that identifies
-        // a credential, a warehouse or a predicate.
-        LOGGER.info("Databricks connector ready: host={} catalog={} schema={} pushdown={}",
-                config.workspaceHostname(), config.catalog(),
-                config.isSchemaPinned() ? config.schema() : "<every schema in the catalog>",
-                capabilities.isEmpty() ? "none" : capabilities.keySet());
+        // Asked of the provider rather than resolved here: a cold start happens before any catalog name
+        // exists, and in coa-managed mode naming an endpoint would mean picking a tenant's at random.
+        LOGGER.info("Databricks connector ready: {} pushdown={}", configs.describe(),
+                PushdownCapabilities.ADVERTISED.keySet());
     }
 
     /**
@@ -177,8 +172,8 @@ public class DatabricksMetadataHandler extends CoaMetadataHandler
     }
 
     /**
-     * One table's columns, types, prose and declared keys. The toolkit turns the keys into
-     * {@code @pk}/{@code @fk} tags and puts them where Athena reads them.
+     * One table's columns, types, prose, nullability and declared keys. The toolkit turns those into
+     * {@code @pk}/{@code @notnull}/{@code @fk} tags and puts them where Athena reads them.
      */
     @Override
     protected CoaTable describeTable(String catalog, String database, String tableName)
@@ -202,14 +197,15 @@ public class DatabricksMetadataHandler extends CoaMetadataHandler
     /**
      * {@inheritDoc}
      *
-     * <p>The SDK's default is an empty map, so this decides whether Athena pushes anything at all. It
-     * ships returning empty; {@link PushdownCapabilities} says why.
+     * <p>The map is what lets Athena stop re-applying a predicate, a limit or a top-N it has already sent.
+     * {@link PushdownCapabilities} carries the measurement behind each of the three.
      */
     @Override
     public GetDataSourceCapabilitiesResponse doGetDataSourceCapabilities(
             BlockAllocator allocator, GetDataSourceCapabilitiesRequest request)
     {
-        return new GetDataSourceCapabilitiesResponse(request.getCatalogName(), capabilities);
+        return new GetDataSourceCapabilitiesResponse(request.getCatalogName(),
+                PushdownCapabilities.ADVERTISED);
     }
 
     /**
@@ -232,12 +228,9 @@ public class DatabricksMetadataHandler extends CoaMetadataHandler
         if (config.isSchemaPinned()) {
             if (!config.schema().equals(database)) {
                 throw new IllegalArgumentException(
-                        "Unknown schema: \"" + database + "\". This connector is pinned to \""
-                                + config.schema() + "\" by " + ConnectionConfig.SCHEMA_VAR
-                                + ", so it serves that schema and no other. Unset "
-                                + ConnectionConfig.SCHEMA_VAR + " to serve every schema in catalog \""
-                                + config.catalog() + "\", or deploy a second connector for \""
-                                + database + "\".");
+                        "Unknown schema: \"" + database + "\". This connector serves \""
+                                + config.schema() + "\" for this Athena catalog and no other schema. "
+                                + widenThePin(config, database));
             }
             return schemaScopedReader(config);
         }
@@ -272,10 +265,32 @@ public class DatabricksMetadataHandler extends CoaMetadataHandler
     }
 
     /**
+     * How to make {@code database} readable, which differs by mode.
+     *
+     * <p>Naming {@link ConnectionConfig#SCHEMA_VAR} is the actionable answer for a stage-1 deployment,
+     * where it is set and unsetting it is one of the two fixes. It is the wrong answer for a COA-managed
+     * source: that variable is absent from such a deployment by construction — the mode switch refuses to
+     * start if it is present alongside the others — so pointing an operator at it sends them looking for
+     * something that is not there, and the real fix is a second source record.
+     */
+    private static String widenThePin(ConnectionConfig config, String database)
+    {
+        if (config.isCoaManaged()) {
+            return "A COA-managed source is exactly one Unity Catalog schema, so this is not a"
+                    + " deployment setting to change: register a second source for \"" + database
+                    + "\" in catalog \"" + config.catalog() + "\" if it should be readable too.";
+        }
+        return "Unset " + ConnectionConfig.SCHEMA_VAR + " to serve every schema in catalog \""
+                + config.catalog() + "\", or deploy a second connector for \"" + database + "\".";
+    }
+
+    /**
      * The schemas an unpinned connector advertises for {@code config}, which are exactly the ones it
      * will serve.
      *
-     * <p>Cached per container. This is read on every {@code ListTables} and {@code GetTable} as well as
+     * <p>Cached per container, keyed on the configuration rather than the Athena catalog name: a
+     * multiplexed provider hands out a different configuration per catalog, and two of them must not
+     * share a list. This is read on every {@code ListTables} and {@code GetTable} as well as
      * on {@code ListSchemas}, and discovery is a per-table {@code GetTable} fan-out, so without the
      * cache a 200-table schema pays 201 metastore-wide {@code information_schema.schemata} scans and
      * 201 extra connections for one enumeration that does not change between them.
@@ -348,66 +363,4 @@ public class DatabricksMetadataHandler extends CoaMetadataHandler
         return "\"" + String.join("\", \"", schemas) + "\"";
     }
 
-    /**
-     * One enumerated schema list per configuration, held for a jittered TTL.
-     *
-     * <p>Keyed on the {@link ConnectionConfig}, not on the Athena catalog name: a multiplexed provider
-     * hands out a different configuration per catalog, and two of them must not share a list. Bounded by
-     * the number of distinct configurations a container serves, which is one unless a multiplexed
-     * provider is wired in.
-     *
-     * <p>The TTL matches {@link CredentialSource}'s, and is jittered for the same reason: a schema's
-     * worth of containers filling their caches in the same second would arrive at the warehouse
-     * together.
-     */
-    private static final class ServableSchemas
-    {
-        private final long ttlMillis;
-        private final ConcurrentMap<ConnectionConfig, Snapshot> byConfig = new ConcurrentHashMap<>();
-
-        private ServableSchemas(long ttlMillis)
-        {
-            if (ttlMillis < 0) {
-                throw new IllegalArgumentException("ttlMillis must not be negative");
-            }
-            this.ttlMillis = ttlMillis;
-        }
-
-        /** The cached list for {@code config}, or {@code discover}'s answer, cached. */
-        private List<String> get(ConnectionConfig config, Supplier<List<String>> discover)
-        {
-            long now = System.currentTimeMillis();
-            Snapshot snapshot = byConfig.get(config);
-            if (snapshot != null && now < snapshot.expiresAtMillis) {
-                return snapshot.schemas;
-            }
-            // Not computeIfAbsent: that holds a bin lock across the warehouse round-trip, and a benign
-            // race here costs one duplicate enumeration.
-            List<String> schemas = discover.get();
-            byConfig.put(config, new Snapshot(schemas, now + jittered(ttlMillis)));
-            return schemas;
-        }
-
-        /** {@code ttl} scattered by up to ±20%. Zero stays zero, which disables the cache. */
-        private static long jittered(long ttl)
-        {
-            if (ttl == 0) {
-                return 0;
-            }
-            long spread = Math.max(1L, ttl / 5L);
-            return ttl - spread + ThreadLocalRandom.current().nextLong(2L * spread);
-        }
-
-        private static final class Snapshot
-        {
-            private final List<String> schemas;
-            private final long expiresAtMillis;
-
-            private Snapshot(List<String> schemas, long expiresAtMillis)
-            {
-                this.schemas = schemas;
-                this.expiresAtMillis = expiresAtMillis;
-            }
-        }
-    }
 }

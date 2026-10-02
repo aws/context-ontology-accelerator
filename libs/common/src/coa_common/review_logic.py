@@ -17,13 +17,18 @@ single atomic DataZone asset revision (``build_forms_input(table)``), so a
 parent table never reaches a terminal status while one of its child columns
 is still ``PENDING_REVIEW``.
 
-Cascade rules (apply to BOTH ``bulk=False`` and ``bulk=True``)
---------------------------------------------------------------
-  APPROVE (conservative on columns):
-    Only ``PENDING_REVIEW`` columns flip to ``APPROVED``. ``REJECTED`` columns
-    are preserved (an approved table may legitimately contain rejected
-    columns). The table flips to ``APPROVED`` only once every column is
-    terminal (always true after the cascade with the current 3-value enum).
+Cascade rules
+-------------
+  APPROVE:
+    ``PENDING_REVIEW`` columns flip to ``APPROVED`` in both modes. ``REJECTED``
+    columns are preserved by a *bulk* approve (an approved table may
+    legitimately contain deliberately rejected columns) but re-approved by a
+    *per-asset* approve of the table: a table-level REJECT cascades REJECTED
+    onto every child, so treating those as deliberate on the next approve
+    stranded them — approve -> reject -> approve left an APPROVED table over
+    all-REJECTED columns and relationships. The table flips to ``APPROVED``
+    only once every column is terminal (always true after the cascade with
+    the current 3-value enum).
 
   REJECT (aggressive on columns):
     Every non-``REJECTED`` column flips to ``REJECTED`` — this clobbers prior
@@ -79,6 +84,45 @@ from __future__ import annotations
 from coa_common.domain_models import Table
 
 
+def _cascade_to_relationships(table: Table, decision: str, *, bulk: bool) -> bool:
+    """Apply ``decision`` to the table's reviewable (inferred) foreign keys.
+
+    Inferred relationships (#1088) carry their own ``review_status`` and are
+    withheld from the ontology while ``PENDING_REVIEW``. Before this, approving a
+    source/table cascaded to columns only, so the normal scan -> approve -> induce
+    path silently produced an ontology with none of its cross-source
+    relationships in it. Same rule as columns, in both modes:
+
+      * bulk APPROVE is a default — flips only ``PENDING_REVIEW`` -> ``APPROVED``
+        and preserves an explicit ``REJECTED`` (a steward can reject a
+        relationship, then bulk-approve the source, and keep that rejection);
+      * per-asset APPROVE of the table re-approves ``REJECTED`` ones too — see
+        :func:`apply_decision_to_table` for why;
+      * REJECT is aggressive — every non-``REJECTED`` reviewable FK -> ``REJECTED``.
+
+    FKs with an empty ``review_status`` (deterministic, steward-specified,
+    pre-#1088) are authoritative and untouched.
+    """
+    from coa_control_plane_server.models.review_decision import ReviewDecision
+    from coa_control_plane_server.models.review_status import ReviewStatus
+
+    changed = False
+    for fk in table.foreign_keys or []:
+        if not fk.review_status:
+            continue
+        if decision == ReviewDecision.APPROVED:
+            flip = fk.review_status == ReviewStatus.PENDING_REVIEW or (
+                not bulk and fk.review_status == ReviewStatus.REJECTED
+            )
+            if flip:
+                fk.review_status = ReviewStatus.APPROVED
+                changed = True
+        elif fk.review_status != ReviewStatus.REJECTED:
+            fk.review_status = ReviewStatus.REJECTED
+            changed = True
+    return changed
+
+
 def apply_decision_to_table(table: Table, decision: str, *, bulk: bool = False) -> bool:
     """Apply a review decision to a Table object in-place.
 
@@ -87,8 +131,10 @@ def apply_decision_to_table(table: Table, decision: str, *, bulk: bool = False) 
         decision: A ``ReviewDecision`` value — ``"APPROVED"`` or ``"REJECTED"``.
         bulk: If ``True``, preserve all explicit prior decisions (used by
             the bulk approve/reject worker). If ``False``, the per-asset
-            mode flips the table status unconditionally and cascades only
-            to PENDING columns. See the module docstring for full semantics.
+            mode flips the table status unconditionally and cascades to
+            PENDING *and* REJECTED children (an explicit approve of the table
+            re-approves what a table-level reject cascaded). See the module
+            docstring for full semantics.
 
     Returns:
         ``True`` if the table or any of its columns changed status,
@@ -127,13 +173,23 @@ def apply_decision_to_table(table: Table, decision: str, *, bulk: bool = False) 
                 if col.business_metadata.review_status == ReviewStatus.PENDING_REVIEW:
                     col.business_metadata.review_status = ReviewStatus.APPROVED
                     changed = True
-            return changed
+            return _cascade_to_relationships(table, decision, bulk=True) or changed
 
-        # 1) Children first: only PENDING_REVIEW columns flip to APPROVED.
-        #    REJECTED columns are preserved (an approved table may contain
-        #    rejected columns).
+        # 1) Children first. PENDING_REVIEW columns always flip to APPROVED.
+        #    REJECTED columns are preserved by a BULK approve (an approved table
+        #    may contain deliberately rejected columns) but re-approved by an
+        #    explicit PER-ASSET approve of the table. Without that, the sequence
+        #    approve -> reject -> approve stranded every child: the table-level
+        #    REJECT had cascaded REJECTED onto each column (and FK), and the
+        #    re-approve then treated that fallout as a deliberate per-column
+        #    decision and kept it — an APPROVED table over all-REJECTED children,
+        #    with none of them reaching the ontology. Approving the table by hand
+        #    is read as "approve this table", children included; a steward who
+        #    wants one column out re-rejects it afterwards, exactly as they would
+        #    have to after the (already aggressive) table-level reject.
         for col in table.columns:
-            if col.business_metadata.review_status == ReviewStatus.PENDING_REVIEW:
+            st = col.business_metadata.review_status
+            if st == ReviewStatus.PENDING_REVIEW or (not bulk and st == ReviewStatus.REJECTED):
                 col.business_metadata.review_status = ReviewStatus.APPROVED
                 changed = True
 
@@ -146,6 +202,9 @@ def apply_decision_to_table(table: Table, decision: str, *, bulk: bool = False) 
         ):
             table.business_metadata.review_status = ReviewStatus.APPROVED
             changed = True
+
+        # 3) Inferred relationships follow the same rule as columns.
+        changed = _cascade_to_relationships(table, decision, bulk=bulk) or changed
     else:
         # REJECT is aggressive in BOTH modes (per-asset and bulk): an explicit
         # reject of the table rejects everything under it.
@@ -160,5 +219,8 @@ def apply_decision_to_table(table: Table, decision: str, *, bulk: bool = False) 
         if table_status != ReviewStatus.REJECTED:
             table.business_metadata.review_status = ReviewStatus.REJECTED
             changed = True
+
+        # 3) A rejected table's inferred relationships are rejected with it.
+        changed = _cascade_to_relationships(table, decision, bulk=bulk) or changed
 
     return changed

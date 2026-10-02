@@ -5,23 +5,76 @@ package dev.coa.databricks.metadata;
 import java.util.Objects;
 
 /**
- * One row of {@code information_schema.columns}: a column's name, its declared type, and the comment a
- * data engineer wrote on it.
+ * One row of {@code information_schema.columns}: a column's name, its declared type, whether it is
+ * declared {@code NOT NULL}, and the comment a data engineer wrote on it.
  *
  * <p>Raw. The comment is what Unity Catalog holds, tags and all; stripping happens in
  * {@link TableAssembler}, so a test can tell "the connector read the comment" from "the connector
  * cleaned it".
  *
- * <p>Nullability is not carried. Athena's {@code Column} type has no field for it and {@code DESCRIBE}
- * returns name, type and comment, so it cannot reach COA on this route. The comment channel is no help
- * either: COA's parser strips a tag only when it recognises one, so an unrecognised {@code @notnull}
- * would end up in the stored description as literal text.
+ * <p><b>Nullability travels the comment channel, as the declared keys do.</b> Athena's {@code Column}
+ * type has no field for it and {@code DESCRIBE} returns name, type and comment, so it reaches COA
+ * through the {@code @notnull} tag or not at all.
+ *
+ * <p>Three states, not two ({@link Nullability}): "unknown" is not "nullable", and the distinction is
+ * what keeps the tag additive — absence means nobody said.
  */
 public final class ColumnDefinition
 {
+    /**
+     * What {@code information_schema.columns.is_nullable} said about a column.
+     *
+     * <p>{@link #UNKNOWN} exists because a value this connector does not recognise must not be guessed
+     * at in either direction: guessing {@code NOT_NULL} asserts a constraint the source never declared,
+     * and guessing {@code NULLABLE} is indistinguishable from unknown to COA anyway, so the honest
+     * answer is to emit no tag.
+     */
+    public enum Nullability
+    {
+        /** {@code is_nullable = 'NO'} — declared {@code NOT NULL}, so the tag is emitted. */
+        NOT_NULL,
+
+        /** {@code is_nullable = 'YES'} — no tag, which is also COA's default. */
+        NULLABLE,
+
+        /** Absent, null, or a spelling this connector does not recognise. No tag. */
+        UNKNOWN;
+
+        /**
+         * Reads one {@code is_nullable} value. Databricks returns {@code 'YES'} or {@code 'NO'},
+         * measured; anything else — including null, blank, and the {@code true}/{@code false} spelling
+         * some other engines use — is {@link #UNKNOWN} rather than an error.
+         */
+        public static Nullability of(String isNullable)
+        {
+            if (isNullable == null) {
+                return UNKNOWN;
+            }
+            String value = isNullable.trim();
+            if ("NO".equalsIgnoreCase(value)) {
+                return NOT_NULL;
+            }
+            if ("YES".equalsIgnoreCase(value)) {
+                return NULLABLE;
+            }
+            return UNKNOWN;
+        }
+    }
+
     private final String name;
     private final String fullDataType;
     private final String comment;
+    private final Nullability nullability;
+
+    /**
+     * A column whose nullability was not read. Kept because most of this connector's own tests are
+     * about types, comments and keys, and because a caller that has no {@code is_nullable} to hand
+     * should say so rather than pick a side.
+     */
+    public ColumnDefinition(String name, String fullDataType, String comment)
+    {
+        this(name, fullDataType, comment, Nullability.UNKNOWN);
+    }
 
     /**
      * @param name         the column name, exactly as {@code information_schema.columns} spells it.
@@ -33,9 +86,11 @@ public final class ColumnDefinition
      *                     column with no error anywhere.
      * @param fullDataType the value of {@code full_data_type}, e.g. {@code decimal(10,2)}.
      * @param comment      the column comment, or null when it has none. Kept verbatim.
+     * @param nullability  what {@code is_nullable} said. Null is treated as
+     *                     {@link Nullability#UNKNOWN}.
      * @throws IllegalArgumentException if the name or the type is null or blank.
      */
-    public ColumnDefinition(String name, String fullDataType, String comment)
+    public ColumnDefinition(String name, String fullDataType, String comment, Nullability nullability)
     {
         if (name == null || name.trim().isEmpty()) {
             throw new IllegalArgumentException("Column name must not be null or blank");
@@ -47,6 +102,7 @@ public final class ColumnDefinition
         this.name = name;
         this.fullDataType = fullDataType;
         this.comment = comment;
+        this.nullability = (nullability == null) ? Nullability.UNKNOWN : nullability;
     }
 
     public String name()
@@ -66,10 +122,25 @@ public final class ColumnDefinition
         return comment;
     }
 
+    /** What {@code is_nullable} said. Never null. */
+    public Nullability nullability()
+    {
+        return nullability;
+    }
+
+    /**
+     * Whether this column earns a {@code @notnull} tag. {@link Nullability#UNKNOWN} must emit nothing,
+     * since absence of the tag is how COA reads "nobody said".
+     */
+    public boolean isNotNull()
+    {
+        return nullability == Nullability.NOT_NULL;
+    }
+
     @Override
     public String toString()
     {
-        return "ColumnDefinition{" + name + " " + fullDataType + "}";
+        return "ColumnDefinition{" + name + " " + fullDataType + " " + nullability + "}";
     }
 
     @Override
@@ -84,12 +155,13 @@ public final class ColumnDefinition
         ColumnDefinition that = (ColumnDefinition) other;
         return name.equals(that.name)
                 && fullDataType.equals(that.fullDataType)
-                && Objects.equals(comment, that.comment);
+                && Objects.equals(comment, that.comment)
+                && nullability == that.nullability;
     }
 
     @Override
     public int hashCode()
     {
-        return Objects.hash(name, fullDataType, comment);
+        return Objects.hash(name, fullDataType, comment, nullability);
     }
 }

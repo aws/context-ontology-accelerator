@@ -208,23 +208,16 @@ def _handle_query(namespace: str, event: dict) -> dict:
     # REST caller: it ran only as an automatic fallback, so no caller could
     # select it deliberately.
     #
-    # Validated rather than forwarded blind. Nothing else checks it: the handler does
-    # not validate the body against the generated Smithy model, and API Gateway has
-    # no RequestValidator, so the ``QueryStrategy`` enum is a codegen/doc artifact at
-    # this boundary. An unrecognised value would reach serve, fall out of
-    # ``Orchestrator._EXPLICIT_STRATEGY_OPTIONS`` and silently resolve to
-    # DEFAULT_STRATEGY — the caller would get the cheap fallback chain believing it
-    # had pinned an engine. A 400 naming the valid values is far kinder than a
-    # plausible-looking wrong answer.
+    # Validated rather than forwarded blind, because nothing else checks it: the handler
+    # does not validate the body against the generated Smithy model and API Gateway has no
+    # RequestValidator, so an unrecognised value would reach serve, fall out of
+    # ``Orchestrator._EXPLICIT_STRATEGY_OPTIONS`` and silently resolve to DEFAULT_STRATEGY
+    # — the caller getting the cheap fallback chain believing it had pinned an engine.
     #
-    # The isinstance check is load-bearing, not defensive noise: ``body`` is
-    # caller-controlled, and ``["ontop"] not in QUERY_STRATEGIES`` raises TypeError on
-    # an unhashable value (list, dict). That would escape to the top-level
-    # ``except Exception`` and surface as **502 "Context Manager invocation failed"* —
-    # an upstream-failure code for a client mistake, on a request that never left this
-    # function. Serve's ``normalize_strategy_option`` guards the same hazard for the
-    # same field ("options is caller-controlled, so an unhashable value must not raise
-    # here"); this is the edge-side equivalent.
+    # The isinstance check is load-bearing: ``body`` is caller-controlled, and
+    # ``["ontop"] not in QUERY_STRATEGIES`` raises TypeError on an unhashable value, which
+    # would escape to the top-level ``except Exception`` and surface as 502 "Context
+    # Manager invocation failed" — an upstream-failure code for a client mistake.
     strategy = body.get("strategy")
     if strategy is not None:
         if not isinstance(strategy, str) or strategy not in QUERY_STRATEGIES:
@@ -276,6 +269,8 @@ def _handle_query(namespace: str, event: dict) -> dict:
             )
     if body.get("includeSupporting") is not None:
         payload["options"]["includeSupporting"] = body["includeSupporting"]
+    if body.get("includeDebugInfo") is not None:
+        payload["options"]["includeDebugInfo"] = body["includeDebugInfo"]
     if body.get("maxResults") is not None:
         payload["options"]["maxResults"] = body["maxResults"]
 

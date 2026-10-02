@@ -8,6 +8,12 @@ requires admin in the owner's account.
 > `{prefix}` is the deployment prefix `{project}-{env}` (e.g. `accelerator-dev`).
 > `<accelerator-account>` is the account where Context Ontology Accelerator is deployed; `<owner-account>`
 > holds the data source.
+>
+> **SSM parameter paths spell the two parts separately**, as `/{prefix}/{envName}/…`,
+> where `{prefix}` there is the project token alone and `{envName}` is the
+> environment: the deployment prefixed `accelerator-dev` publishes
+> `/accelerator/dev/serve/runtime-role-arn`. A lookup that joins them into one
+> segment returns nothing.
 
 There are three independent concerns. Set up only the ones your source needs:
 
@@ -50,7 +56,7 @@ roles in the Context Ontology Accelerator account must be able to read it:
   account:
 
   ```bash
-  aws ssm get-parameter --name "/{prefix}/serve/runtime-role-arn" \
+  aws ssm get-parameter --name "/{prefix}/{envName}/serve/runtime-role-arn" \
     --query 'Parameter.Value' --output text
   ```
 
@@ -117,10 +123,18 @@ If you use `crossAccountRoleArn`, that role's trust policy must allow the
 
 !!! important "The trust policy must require an ExternalId"
     Every cross-account assume presents an **ExternalId derived from the namespace
-    the source belongs to**: `{prefix}-{env}-{namespaceId}`. The value is computed
-    server-side and is **not** accepted from the API request — that is what stops a
-    caller who can create sources in one namespace from pointing a source at a role
-    onboarded for a different namespace and reading its data.
+    the source belongs to**: `{prefix}-{namespaceId}`, where `{prefix}` is this
+    page's `{project}-{env}` deployment prefix — so a dev deployment's value can
+    never satisfy a prod trust policy. The value is computed server-side and is
+    **not** accepted from the API request — that is what stops a caller who can
+    create sources in one namespace from pointing a source at a role onboarded for
+    a different namespace and reading its data.
+
+    **Copy the value rather than assembling it.** The Connect Source form displays
+    it beside the cross-account role field, and `GET /namespaces/{namespaceId}`
+    returns it as `datasourceExternalId`. Both are the platform's own derivation;
+    a hand-built value that differs by one character fails every assume with
+    `AccessDenied` and nothing to point at.
 
     Condition your trust policy on that exact value. An assume with no ExternalId
     is denied by the platform's own IAM policy, so a role whose trust policy omits
@@ -132,31 +146,49 @@ If you use `crossAccountRoleArn`, that role's trust policy must allow the
       "Effect": "Allow",
       "Principal": {
         "AWS": [
-          "arn:aws:iam::<coa-account>:role/{prefix}-{env}-sources-db-connector",
-          "arn:aws:iam::<coa-account>:role/{prefix}-{env}-sources-db-enrichment-agent"
+          "arn:aws:iam::<coa-account>:role/{prefix}-sources-db-connector",
+          "arn:aws:iam::<coa-account>:role/{prefix}-sources-db-enrichment-agent"
         ]
       },
       "Action": "sts:AssumeRole",
       "Condition": {
-        "StringEquals": { "sts:ExternalId": "{prefix}-{env}-{namespaceId}" }
+        "StringEquals": { "sts:ExternalId": "<datasourceExternalId>" }
       }
     }
     ```
 
-    `tests/cdk/lib/datasource-access-role.ts` builds this for you — pass
-    `-c namespace_id=<namespaceId>` and it derives the same value.
+    **The principals above are the JDBC and Glue ones.** A
+    `DATABRICKS_SQL_WAREHOUSE` source is reached by neither, and needs a different
+    **pair**: the **sources API** role, which validates the wiring once at
+    registration, and the **connector's** execution role, which reads the
+    credential on every request. Naming only one of those fails — omit the sources
+    API role and the create itself is refused. See
+    [Databricks SQL Warehouse Sources](databricks-sources.md#resolve-the-two-principals-your-trust-policy-must-name)
+    for how to resolve both ARNs, and both policies in full.
 
     **Existing sources:** a source onboarded before this control keeps using the
     `externalId` stored on its record, so nothing breaks. New sources ignore any
     `externalId` in the request. To migrate one, update the trust policy to the
-    derived value above and re-register the source.
+    namespace's `datasourceExternalId` and re-register the source.
 
-!!! note "Role naming convention is a web-app-only guardrail"
-    The example above sends `crossAccountRoleArn`. The role name must
-    contain `{prefix}-datasource-access-` (e.g. `{prefix}-datasource-access-{customer}`).
-    This is enforced in the Connect Source form, not by the API — the backing
-    control is the platform's `sts:AssumeRole` policy, which only matches
-    `*-datasource-access-*` names.
+!!! important "The role naming convention is a real control, not just a form check"
+    The example above sends `crossAccountRoleArn`. The role name must **start
+    with** `{prefix}-datasource-access-` (e.g.
+    `{prefix}-datasource-access-{customer}`), because the platform's own
+    `sts:AssumeRole` policy is scoped to that name prefix and matches nothing else. A correctly-configured role under any other
+    name is denied by that policy. The Connect Source form checks the name so the
+    failure is legible at submit rather than arriving as an opaque `AccessDenied`
+    at the first scan — the form is the earlier warning, not the control.
+
+    The role's **account** is not constrained, and the deployment account is
+    allowed: the platform is deployed into your account, so for a single-account
+    deployment the role naturally lives there.
+
+    The role's **partition** is constrained to `aws`, the commercial one. The same
+    `sts:AssumeRole` policy is written `arn:aws:iam::*:role/{prefix}-datasource-access-*`,
+    so an `aws-cn` or `aws-us-gov` role ARN can only be denied by it. A
+    `DATABRICKS_SQL_WAREHOUSE` source refuses such an ARN at submit, with the
+    partition named, rather than registering it and failing every query afterwards.
 
 ---
 
@@ -295,7 +327,7 @@ aws lakeformation grant-permissions \
 Resolve the serve runtime role ARN from SSM in the Context Ontology Accelerator account:
 
 ```bash
-aws ssm get-parameter --name "/{prefix}/serve/runtime-role-arn" \
+aws ssm get-parameter --name "/{prefix}/{envName}/serve/runtime-role-arn" \
   --query 'Parameter.Value' --output text
 ```
 
@@ -372,7 +404,7 @@ explicit owner-side grants above.
 **Cross-account JDBC**
 
 - [ ] Private network path established; DB SG opens engine port to `{prefix}-connector-sg`
-- [ ] Secret resource policy grants `{prefix}-sources-db-connector` + `{prefix}-federated-catalog-role` + the serve runtime role (`/{prefix}/serve/runtime-role-arn` in SSM)
+- [ ] Secret resource policy grants `{prefix}-sources-db-connector` + `{prefix}-federated-catalog-role` + the serve runtime role (`/{prefix}/{envName}/serve/runtime-role-arn` in SSM)
 - [ ] KMS key policy grants `kms:Decrypt` to those three roles (CMK-encrypted secrets only)
 - [ ] Source registered with owner-account `credentialSecretArn`
 

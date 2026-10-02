@@ -30,17 +30,26 @@ Two design points that are easy to get wrong:
   ``InvalidRequestException`` (400) — there is no ``AlreadyExistsException`` — so
   a duplicate name arrives as a 400 that no error code distinguishes from a
   malformed request.
+
+* **The idempotency check stops discriminating when the handler ARN is shared.** It
+  compares catalog type plus the *set of handler ARNs*, so where one connector Lambda
+  serves every source of a sub-type that comparison is trivially true and a name
+  collision reads as a retried create (``False``) instead of raising
+  ``AthenaCatalogConflictError``. Such callers pass ``require_absent=True`` plus a
+  ``source_id`` for the ``coa:sourceId`` tag delete verifies against. Both are opt-in,
+  so ``CUSTOM_CONNECTOR``'s per-source ARN keeps its existing behaviour.
+* Tagging needs ``athena:TagResource`` on create and ``athena:ListTagsForResource``
+  to read back, because ``GetDataCatalog`` returns no tags at all.
 """
 
 from __future__ import annotations
-
-import os
 
 import boto3
 import structlog
 from botocore.exceptions import BotoCoreError, ClientError
 from coa_common import resolve_region
 from coa_common.aws_config import sync_boto_config
+from coa_common.constants import require_resource_prefix
 
 from coa_sources.database.connectors.glue_connection_provisioner import build_catalog_name
 
@@ -63,7 +72,14 @@ _PARAM_COMPOSITE_FUNCTION = "function"
 _PARAM_METADATA_FUNCTION = "metadata-function"
 _PARAM_RECORD_FUNCTION = "record-function"
 
+# Tag recording which source a catalog was created for, so a delete can verify the
+# catalog it is about to remove. Brand-fixed rather than derived from RESOURCE_PREFIX,
+# matching the literal ``coa:connector`` tag in `coa-contract.ts`: a prefix-derived key
+# would make every catalog written under an earlier prefix unverifiable after a rename.
+SOURCE_ID_TAG_KEY = "coa:sourceId"
+
 _athena_client = None
+_account_id: str | None = None
 
 
 def _athena():
@@ -95,9 +111,13 @@ def derive_catalog_name(source_id: str) -> str:
     Deterministic, so every caller — create, delete, discovery, serve — arrives at
     the same name from the source record alone, with nothing extra persisted for
     them to disagree about.
+
+    Raises:
+        RuntimeError: ``RESOURCE_PREFIX`` is unset. The prefix reaches the name, so a
+            default registers the source under a catalog nothing else in this deployment
+            resolves, and the first query is where that shows up.
     """
-    resource_prefix = os.environ.get("RESOURCE_PREFIX", "coa-dev-")
-    return build_catalog_name(resource_prefix, source_id.removeprefix("DS#"))
+    return build_catalog_name(require_resource_prefix(), source_id.removeprefix("DS#"))
 
 
 def build_catalog_parameters(connector_function_arn: str) -> dict[str, str]:
@@ -149,6 +169,8 @@ def register_lambda_catalog(
     catalog_name: str,
     connector_function_arn: str,
     client=None,
+    require_absent: bool = False,
+    source_id: str = "",
 ) -> bool:
     """Register (or confirm) a LAMBDA-type Athena data catalog.
 
@@ -157,10 +179,18 @@ def register_lambda_catalog(
         connector_function_arn: The connector Lambda, serving both the metadata and
             record paths (Athena's composite form).
         client: Athena client override, for tests.
+        require_absent: Treat ANY existing catalog of that name as a conflict rather
+            than comparing handler ARNs. Set it wherever the handler ARN is **shared**
+            across sources, which makes the ARN comparison trivially true and would
+            report a real collision as a retried create.
+        source_id: Source this catalog is being created for. When given, the catalog is
+            tagged ``coa:sourceId`` so :func:`catalog_source_id` can verify ownership at
+            delete time. Needs ``athena:TagResource``.
 
     Returns:
         ``True`` when this call created the catalog, ``False`` when an equivalent
-        registration already existed (a retried create).
+        registration already existed (a retried create). Never ``False`` under
+        ``require_absent``.
 
     Raises:
         AthenaCatalogConflictError: a catalog of that name exists and does not
@@ -181,7 +211,7 @@ def register_lambda_catalog(
     if existing is not None:
         existing_type = existing.get("Type", "")
         existing_arns = _handler_arns(existing.get("Parameters") or {})
-        if existing_type == CATALOG_TYPE_LAMBDA and existing_arns == _handler_arns(parameters):
+        if not require_absent and existing_type == CATALOG_TYPE_LAMBDA and existing_arns == _handler_arns(parameters):
             logger.info("athena_data_catalog_already_registered", catalog_name=catalog_name)
             return False
         # Type is part of the comparison because a GLUE-type catalog carries no
@@ -197,12 +227,69 @@ def register_lambda_catalog(
             Name=catalog_name,
             Type=CATALOG_TYPE_LAMBDA,
             Parameters=parameters,
+            **({"Tags": [{"Key": SOURCE_ID_TAG_KEY, "Value": source_id}]} if source_id else {}),
         )
     except (ClientError, BotoCoreError) as exc:
         raise AthenaCatalogError(f"Failed to register Athena data catalog {catalog_name!r}: {exc}") from exc
 
     logger.info("athena_data_catalog_registered", catalog_name=catalog_name, parameter_keys=sorted(parameters))
     return True
+
+
+def _partition(region: str) -> str:
+    if region.startswith("us-gov-"):
+        return "aws-us-gov"
+    if region.startswith("cn-"):
+        return "aws-cn"
+    return "aws"
+
+
+def _deployment_account(client=None) -> str:
+    """This deployment's account id (cached STS lookup)."""
+    global _account_id  # noqa: PLW0603
+    if _account_id is None:
+        sts = client or boto3.client("sts", region_name=AWS_REGION, config=sync_boto_config())
+        _account_id = sts.get_caller_identity()["Account"]
+    return _account_id
+
+
+def catalog_arn(catalog_name: str, sts_client=None) -> str:
+    """ARN of a data catalog, which is what the tagging APIs address it by.
+
+    ``GetDataCatalog`` takes a name and returns no tags; ``ListTagsForResource`` takes an
+    ARN, so reading a catalog's tags needs the account id too.
+    """
+    account = _deployment_account(sts_client)
+    return f"arn:{_partition(AWS_REGION)}:athena:{AWS_REGION}:{account}:datacatalog/{catalog_name}"
+
+
+def catalog_source_id(catalog_name: str, *, client=None, sts_client=None) -> str | None:
+    """Source id a catalog is tagged with, or ``None`` when it carries no such tag.
+
+    ``None`` and a *different* source id are not the same answer: no tag means the catalog
+    predates tagging (or came from the ``CUSTOM_CONNECTOR`` path, which does not tag) and
+    a delete should proceed, while a different id means the name resolves to somebody
+    else's catalog and a delete must refuse.
+
+    Raises:
+        AthenaCatalogError: the tags could not be read. Deliberately not swallowed into
+            ``None``: a permissions or throttling fault read as "untagged" would turn the
+            verification off exactly when it is least trustworthy.
+    """
+    athena = client or _athena()
+    try:
+        arn = catalog_arn(catalog_name, sts_client)
+        tags = athena.list_tags_for_resource(ResourceARN=arn).get("Tags") or []
+    except ClientError as exc:
+        if _is_not_found(exc):
+            return None
+        raise AthenaCatalogError(f"Failed to read tags for Athena data catalog {catalog_name!r}: {exc}") from exc
+    except BotoCoreError as exc:
+        raise AthenaCatalogError(f"Failed to read tags for Athena data catalog {catalog_name!r}: {exc}") from exc
+    for tag in tags:
+        if tag.get("Key") == SOURCE_ID_TAG_KEY:
+            return tag.get("Value") or None
+    return None
 
 
 def delete_lambda_catalog(*, catalog_name: str, client=None) -> None:

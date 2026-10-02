@@ -7,6 +7,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
@@ -21,6 +23,20 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class ConnectorMetricsTest
 {
     private static final ObjectMapper MAPPER = new ObjectMapper();
+
+    /**
+     * The CDK toolkit's copy of the metric contract, relative to this module's directory. Restated there
+     * rather than imported from here because the two modules are meant to be copied together.
+     */
+    private static final String CDK_CONTRACT_PATH = "../cdk-toolkit/src/coa-contract.ts";
+
+    private static final List<String> ALL_METRIC_NAMES = Arrays.asList(
+            ConnectorMetrics.CONFIG_RESOLUTION_FAILURES,
+            ConnectorMetrics.CONFIG_THROTTLES,
+            ConnectorMetrics.CREDENTIAL_ASSUME_FAILURES,
+            ConnectorMetrics.WAREHOUSE_CONNECT_FAILURES,
+            ConnectorMetrics.ROWS_RETURNED,
+            ConnectorMetrics.TABLE_CEILING_EXCEEDED);
 
     private final List<String> emitted = new ArrayList<>();
     private final ConnectorMetrics metrics = new ConnectorMetrics("databricks", emitted::add);
@@ -50,8 +66,9 @@ class ConnectorMetricsTest
 
         JsonNode dimensions = directive.get("Dimensions");
         assertEquals(2, dimensions.size(), "per-catalog and fleet-wide sets");
-        assertEquals("[\"Connector\",\"Catalog\"]", dimensions.get(0).toString());
-        assertEquals("[\"Connector\"]", dimensions.get(1).toString());
+        // The parsed structure, not the array's toString, which would assert Jackson's serialisation too.
+        assertEquals(Arrays.asList("Connector", "Catalog"), namesIn(dimensions.get(0)));
+        assertEquals(Collections.singletonList("Connector"), namesIn(dimensions.get(1)));
 
         // Every dimension named in the directive must also exist as a top-level property, or the whole
         // document is discarded.
@@ -69,7 +86,7 @@ class ConnectorMetricsTest
         JsonNode dimensions = metricDirective(doc).get("Dimensions");
 
         assertEquals(1, dimensions.size());
-        assertEquals("[\"Connector\"]", dimensions.get(0).toString());
+        assertEquals(Collections.singletonList("Connector"), namesIn(dimensions.get(0)));
         assertFalse(doc.has("Catalog"), "an \"unknown\" bucket would merge unrelated deployments");
     }
 
@@ -148,6 +165,104 @@ class ConnectorMetricsTest
         new ConnectorMetrics(null, emitted::add).count(ConnectorMetrics.ROWS_RETURNED, "c");
 
         assertEquals("unknown", only().get("Connector").asText());
+    }
+
+    @Test
+    void everyMetricNameIsExactlyTheStringTheAlarmsMatchOn()
+    {
+        // LITERALS, deliberately: each name is half of a contract duplicated in `ConnectorMetricName` in
+        // connectors/cdk-toolkit/src/coa-contract.ts, which the CDK app builds an alarm from. A disagreement
+        // is silent — the alarm sits in INSUFFICIENT_DATA for ever rather than firing or erroring — and
+        // asserting `document()` against the constant that wrote it cannot catch a rename of the value.
+        assertEquals("ConnectorConfigResolutionFailures", ConnectorMetrics.CONFIG_RESOLUTION_FAILURES);
+        assertEquals("ConnectorConfigThrottles", ConnectorMetrics.CONFIG_THROTTLES);
+        assertEquals("ConnectorCredentialAssumeFailures", ConnectorMetrics.CREDENTIAL_ASSUME_FAILURES);
+        assertEquals("ConnectorWarehouseConnectFailures", ConnectorMetrics.WAREHOUSE_CONNECT_FAILURES);
+        assertEquals("ConnectorRowsReturned", ConnectorMetrics.ROWS_RETURNED);
+        assertEquals("ConnectorTableCeilingExceeded", ConnectorMetrics.TABLE_CEILING_EXCEEDED);
+        // `CONNECTOR_METRIC_NAMESPACE` in coa-contract.ts has to equal this or every alarm watches an empty
+        // namespace.
+        assertEquals("COA/Connectors", ConnectorMetrics.NAMESPACE);
+    }
+
+    @Test
+    void everyMetricNameAlsoAppearsInTheCdkToolkitsCopyOfTheContract()
+    {
+        // Reads the OTHER language's source as text on purpose. A jar and a CDK app cannot share a constant,
+        // so each suite pinning its own literals catches a rename only against ITSELF; this catches one
+        // across the boundary. DO NOT "fix" this into an import — that is the coupling the boundary exists
+        // to prevent, and it would make a copied-out connector unbuildable.
+        java.io.File contract = new java.io.File(CDK_CONTRACT_PATH);
+        // A visible skip rather than a silent pass: the toolkit is documented as copyable on its own.
+        org.junit.jupiter.api.Assumptions.assumeTrue(contract.isFile(),
+                "no " + CDK_CONTRACT_PATH + " — the CDK half of the metric contract is not in this tree,"
+                        + " so there is nothing to compare the Java names against");
+
+        String source;
+        try {
+            source = new String(java.nio.file.Files.readAllBytes(contract.toPath()),
+                    java.nio.charset.StandardCharsets.UTF_8);
+        }
+        catch (java.io.IOException cause) {
+            throw new IllegalStateException("could not read " + CDK_CONTRACT_PATH, cause);
+        }
+
+        for (String name : ALL_METRIC_NAMES) {
+            assertTrue(source.contains('"' + name + '"'),
+                    "metric \"" + name + "\" is emitted by this connector but does not appear in "
+                            + CDK_CONTRACT_PATH + ", so no CDK app can alarm on it. Add it to"
+                            + " ConnectorMetricName there, or rename it back here. A metric whose alarm"
+                            + " watches a different name never fires and never errors — it sits in"
+                            + " INSUFFICIENT_DATA for ever.");
+        }
+        // An alarm in the wrong namespace finds no data.
+        assertTrue(source.contains('"' + ConnectorMetrics.NAMESPACE + '"'),
+                "namespace \"" + ConnectorMetrics.NAMESPACE + "\" does not appear in "
+                        + CDK_CONTRACT_PATH);
+    }
+
+    @Test
+    void everyMetricNameIsDistinctAndCarriesTheConnectorPrefix()
+    {
+        // A name colliding with another silently merges two alarms' data, and a name shaped unlike its
+        // neighbours is the one a copy-paste into the CDK app drops the prefix from.
+        assertEquals(ALL_METRIC_NAMES.size(), new java.util.HashSet<>(ALL_METRIC_NAMES).size(),
+                "two metrics share a name: " + ALL_METRIC_NAMES);
+        for (String name : ALL_METRIC_NAMES) {
+            assertTrue(name.startsWith("Connector"), name);
+        }
+    }
+
+    @Test
+    void anAssumeFailureCarriesBothDimensionSets() throws Exception
+    {
+        // A single catalog means one customer changed a policy; fleet-wide means the connector's own role or
+        // deployment moved. The shipped alarm is on the undimensioned set, since naming a catalog would make
+        // it stop matching the day a second source is registered.
+        metrics.count(ConnectorMetrics.CREDENTIAL_ASSUME_FAILURES, "acme_dbx");
+
+        JsonNode doc = only();
+        JsonNode dimensions = metricDirective(doc).get("Dimensions");
+        assertEquals(2, dimensions.size());
+        assertEquals(Arrays.asList("Connector", "Catalog"), namesIn(dimensions.get(0)));
+        assertEquals(Collections.singletonList("Connector"), namesIn(dimensions.get(1)));
+        // Every dimension named in the directive must exist as a top-level property, or CloudWatch
+        // discards the whole document.
+        for (JsonNode set : dimensions) {
+            for (String dimension : namesIn(set)) {
+                assertTrue(doc.hasNonNull(dimension),
+                        "dimension " + dimension + " is declared but has no value: " + doc);
+            }
+        }
+    }
+
+    private static List<String> namesIn(JsonNode dimensionSet)
+    {
+        List<String> names = new ArrayList<>();
+        for (JsonNode name : dimensionSet) {
+            names.add(name.asText());
+        }
+        return names;
     }
 
     @Test

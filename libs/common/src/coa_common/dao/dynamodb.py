@@ -298,7 +298,7 @@ class DynamoDBDAO(DatastoreDAO):
 
         Args:
             params: Query parameters (key condition, expression bindings, index,
-                sort direction, limit, and pagination cursor).
+                sort direction, limit, pagination cursor, and read consistency).
 
         Returns:
             A page of matching items plus the ``LastEvaluatedKey`` cursor, if any.

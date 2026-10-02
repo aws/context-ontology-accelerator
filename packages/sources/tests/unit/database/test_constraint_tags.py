@@ -537,3 +537,84 @@ class TestAssembleConstraints:
 
     def test_no_columns_yields_no_constraints(self):
         assert assemble_constraints([]) == (None, [])
+
+
+class TestNotNullTag:
+    """``@notnull`` — operand-free like ``@pk``, and additive by construction.
+
+    Absence must keep meaning *unknown* (and so nullable), because every connector deployed
+    before this tag existed emits none. The tests below assert both that the tag works and
+    that its absence changes nothing.
+    """
+
+    def test_notnull_tag_is_detected_and_stripped(self):
+        parsed = parse_comment("Customer identifier @notnull")
+        assert parsed.description == "Customer identifier"
+        assert parsed.is_not_null is True
+
+    def test_absence_means_nullable_not_unknown_shaped_as_false(self):
+        # The backward-compatibility guarantee: no tag becomes nullable=True downstream,
+        # exactly what the discovery path hardcoded before this tag existed.
+        assert parse_comment("Customer identifier").is_not_null is False
+        assert parse_comment("").is_not_null is False
+        assert parse_comment(None).is_not_null is False
+
+    def test_notnull_combines_with_the_other_tags(self):
+        parsed = parse_comment("Parent order @pk @notnull @fk(orders.order_id)")
+        assert parsed.description == "Parent order"
+        assert parsed.is_pk_member is True
+        assert parsed.is_not_null is True
+        assert parsed.foreign_keys == (ParsedFk(target_table="orders", target_column="order_id"),)
+
+    def test_a_tag_only_comment_cleans_to_empty(self):
+        parsed = parse_comment("@notnull")
+        assert parsed.description == ""
+        assert parsed.is_not_null is True
+
+    def test_wrong_case_is_a_near_miss_and_is_left_in_place(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            parsed = parse_comment("Customer identifier @NOTNULL")
+        assert parsed.is_not_null is False
+        assert parsed.description == "Customer identifier @NOTNULL"
+        assert "constraint_tag_unrecognised" in caplog.text
+
+    def test_an_operand_makes_it_a_near_miss(self, caplog):
+        # The leftover text is the author's only observable feedback channel.
+        for tag in ("@notnull=true", "@notnull(customer_id)"):
+            with caplog.at_level(logging.WARNING):
+                caplog.clear()
+                parsed = parse_comment(f"Key {tag}")
+            assert parsed.is_not_null is False, tag
+            assert parsed.description == f"Key {tag}", tag
+            assert [record.message for record in caplog.records] == ["constraint_tag_unrecognised"], tag
+            assert [record.reason for record in caplog.records] == ["notnull_takes_no_operand"], tag
+
+    def test_a_longer_word_starting_the_same_way_is_not_a_tag(self, caplog):
+        # "@notnullable" is a plausible typo for the REJECTED spelling, so it is reported
+        # rather than acted on. "@note" stays prose, which is what keeps the change
+        # additive for comments already in the field.
+        with caplog.at_level(logging.WARNING):
+            parsed = parse_comment("Value @notnullable")
+        assert parsed.is_not_null is False
+        assert parsed.description == "Value @notnullable"
+        assert "constraint_tag_unrecognised" in caplog.text
+
+        with caplog.at_level(logging.WARNING):
+            caplog.clear()
+            parsed = parse_comment("See @note and @notes")
+        assert parsed.is_not_null is False
+        assert parsed.description == "See @note and @notes"
+        assert caplog.records == []
+
+    def test_an_email_address_in_prose_is_not_a_tag(self):
+        # The left-boundary rule: reading an address as a tag would both mark the column
+        # non-nullable and mangle the description.
+        parsed = parse_comment("Owner bob@notnull.example.com")
+        assert parsed.is_not_null is False
+        assert parsed.description == "Owner bob@notnull.example.com"
+
+    def test_strip_is_iff_understood(self):
+        # The property the grammar rests on: text is removed only when the parser acted on
+        # it.
+        assert parse_comment("A @notnull B").description == "A B"
+        assert parse_comment("A @notnull=1 B").description == "A @notnull=1 B"

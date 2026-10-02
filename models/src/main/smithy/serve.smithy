@@ -545,6 +545,15 @@ operation Query {
         /// Whether to include supporting content in the response.
         includeSupporting: Boolean
 
+        /// When true, include the generated SQL (`queryUsed`) and SPARQL
+        /// (`sparqlGenerated`) in the response for debugging and observability.
+        /// Defaults to false; when unset or false, both fields are omitted.
+        ///
+        /// **Security:** these fields expose internal schema (table and column
+        /// names, joins). Only enable for trusted callers, admin-tier users, or
+        /// development environments.
+        includeDebugInfo: Boolean
+
         /// Maximum number of result rows to return.
         maxResults: Integer
     }

@@ -351,7 +351,7 @@ class TestGraphScoping:
     lets the quad index serve them directly.
     """
 
-    async def test_resolved_graphs_are_bound_instead_of_filtered(self):
+    async def test_resolved_graphs_are_named_instead_of_filtered(self):
         graph = _MockGraph(graph_rows=_GRAPHS)
         tool = _tool(graph, catalog=_catalog({"orders": _iri("Shop_Orders")}))
         r = await tool.explore_graph("orders", hops=1)
@@ -360,8 +360,11 @@ class TestGraphScoping:
         walked = [c for c in graph.calls if "?ont a owl:Ontology" not in c]
         assert walked  # the FK + column queries
         for sparql in walked:
-            assert "VALUES ?g {" in sparql
-            assert all(f"<{g}>" in sparql for g in _GRAPHS)
+            # Constant ``GRAPH <iri>`` per graph, never a ``VALUES ?g`` join: the
+            # planner can only push the graph into the index scan when it is a
+            # constant. See ``query_utils.graph_scoped_body``.
+            assert all(f"GRAPH <{g}> {{" in sparql for g in _GRAPHS)
+            assert "VALUES ?g" not in sparql
             assert "STRSTARTS" not in sparql
 
     async def test_the_probe_runs_once_per_request(self):

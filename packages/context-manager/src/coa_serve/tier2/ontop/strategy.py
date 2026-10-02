@@ -309,7 +309,7 @@ class OntopStrategy:
         except Exception as e:
             retry_ms = int((time.perf_counter() - retry_start) * 1000)
             logger.warning("tier2_vkg_retry_failed", error=str(e))
-            trace.record(StepId.T2_VKG_RETRY, "failed", retry_ms, detail={"error": str(e)[:100]})
+            trace.record(StepId.T2_VKG_RETRY, "failed", retry_ms, detail={"error": type(e).__name__})
             return None
 
     async def _fetch_vector_hits(self, embedding: list[float], namespace: str) -> list | None:

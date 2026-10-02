@@ -207,6 +207,27 @@ class NeptuneAnalyticsVectorStore(VectorStore):
         """
         return na_store.delete_embeddings_for_ontology(ontology_id, namespace=self._resolve_ns(namespace))
 
+    def delete_embeddings_for_entities(
+        self,
+        entity_uris,
+        ontology_id: str,
+        namespace=None,
+    ) -> int:
+        """Delete the Embedding nodes of the given entities within a single ontology.
+
+        Filters by ``ontology_id`` in addition to ``entity_uri`` so that shared
+        IRIs across ontologies (foundational reloads, explicit-target merges)
+        can't take a sibling ontology's embedding down with the current one.
+        """
+        uris = [u for u in dict.fromkeys(entity_uris) if u]
+        if not uris or not ontology_id:
+            return 0
+        return na_store.delete_embeddings_for_entities(
+            uris,
+            ontology_id=ontology_id,
+            namespace=self._resolve_ns(namespace),
+        )
+
     def delete_index(self, namespace=None) -> bool:
         """Return False — NA has no separate vector index to delete.
 

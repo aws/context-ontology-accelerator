@@ -192,16 +192,21 @@ class SmusCatalogDataSourceLookup(DataSourceLookup):
 
         The index is keyed on the database-qualified name so same-named tables in
         different databases stay distinct (see ``_qualified_name_from_asset``). An
-        exact match on the given name wins; a bare name resolves only when exactly
-        ONE database has a table by that name. An ambiguous bare name (two
-        databases, same table) returns ``None`` rather than guessing — the caller
-        must qualify it — and is logged so the ambiguity is diagnosable.
+        qualified name resolves only by exact match. A bare name resolves only
+        when exactly ONE raw catalog entry has that name, whether the entry is
+        itself bare or database-qualified. A mixed legacy catalog such as
+        ``orders`` plus ``archive.orders`` is therefore ambiguous rather than
+        letting the exact bare entry win. Ambiguity returns ``None`` and is logged
+        so the caller can require qualification.
         """
         names = self._names_by_source.get(data_source_id, {})
         key = table_name.lower()
-        if key in names:
-            return names[key]
-        candidates = [asset_id for qualified, asset_id in names.items() if qualified.rsplit(".", 1)[-1] == key]
+        if "." in key:
+            return names.get(key)
+
+        candidates = [
+            asset_id for qualified, asset_id in names.items() if qualified == key or qualified.rsplit(".", 1)[-1] == key
+        ]
         if len(candidates) == 1:
             return candidates[0]
         if len(candidates) > 1:
@@ -219,10 +224,11 @@ class SmusCatalogDataSourceLookup(DataSourceLookup):
         ``None`` covers the source having no such asset, the asset's form being
         missing/unparseable, or the table not being steward-approved. A *transient*
         read failure is handled separately — it is not cached as absence and flips
-        catalog_available() to False (see below) so callers stay fail-open (#161).
-        The approval check is what keeps this equivalent to the previous
-        approved-catalog index — the name index alone cannot see review status, so
-        the ONE candidate's form is fetched to check it. One call, not one per table.
+        catalog_available() to False (see below) so callers can distinguish an
+        outage from a definitive rejection. The approval check is what keeps this
+        equivalent to the previous approved-catalog index — the name index alone
+        cannot see review status, so the ONE candidate's form is fetched to check
+        it. One call, not one per table.
         """
         key = (data_source_id, table_name.lower())
         if key in self._table_cache:
@@ -246,10 +252,10 @@ class SmusCatalogDataSourceLookup(DataSourceLookup):
             )
             # A transient read failure is NOT provable absence (#161): don't cache
             # it, and flip the source to unavailable so catalog_available() returns
-            # False. Callers then degrade to the soft table_reference warning
-            # instead of a hard 400, and a later lookup retries the fetch. This
-            # keeps the name-index and per-asset reads failing together, as the old
-            # single whole-catalog read did.
+            # False. Callers can then return an operational error rather than a
+            # definitive table rejection, and a later lookup retries the fetch.
+            # This keeps the name-index and per-asset reads failing together, as
+            # the old single whole-catalog read did.
             self._names_load_failed[data_source_id] = True
             return None
 
@@ -368,20 +374,19 @@ class SmusCatalogDataSourceLookup(DataSourceLookup):
 
         Note:
             Counts every table asset, approved or not — the previous
-            implementation counted approved ones only. The sole caller
-            (``check_source_table_exists``) uses this as a non-empty guard for "the
-            catalog knows at least one table", i.e. to decide whether a table's
-            absence is *provable*. Counting unapproved tables makes that guard more
-            conservative, which is the safe direction: it can only turn a hard 400
-            into the pre-existing soft warning, never the reverse.
+            implementation counted approved ones only. Callers use this raw
+            inventory to distinguish an empty/not-yet-populated catalog from a
+            catalog that can definitively resolve or reject a name. Approval is
+            always checked separately through :meth:`table_exists`.
 
-            Returns both the database-qualified names (``sales.customers``) and
-            their bare forms (``customers``), so the caller's dual-form membership
-            check matches a ``sourceTable`` declared either way.
+            Returns the names exactly as indexed by the catalog. Do not synthesize
+            bare names from qualified names: doing so makes ``sales.orders`` appear
+            present when the only asset is ``archive.orders``. Callers that accept
+            bare names must resolve them through :meth:`table_exists`, which rejects
+            ambiguous matches and checks the selected asset's approval status.
         """
         self._ensure_names_loaded(data_source_id)
-        qualified = set(self._names_by_source.get(data_source_id, {}))
-        return qualified | {name.rsplit(".", 1)[-1] for name in qualified}
+        return set(self._names_by_source.get(data_source_id, {}))
 
     def get_table_columns(self, data_source_id: str, table_name: str) -> list[ColumnMetadata] | None:
         """Return the approved column metadata for a table.

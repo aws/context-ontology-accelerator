@@ -63,6 +63,28 @@ The `MetricResolver` maintains in-memory indexes built from the ontology definit
 
 Matching is exact (after normalization). The resolver returns a `MetricMatch` with the matched metric definition and a `match_count` indicating how many distinct metrics were referenced in the query. A `match_count > 1` (multi-metric) query bypasses Tier 1's deterministic single-metric path and falls through.
 
+### Residual-qualifier gate
+
+Tier 1 executes a matched metric's SQL **verbatim** — it parses no filter, grouping, or time window out of the natural language. A match is therefore only usable if it consumed the whole question. After a name/synonym hit the resolver strips the matched spans plus a closed stop-word list (`tier1/stopwords/`, per-language) and returns whatever is left as `MetricMatch.residual`. A non-empty residual means Tier 1 would answer a *broader* question than the one asked, at confidence 1.0, with nothing marking the drop — so the orchestrator declines and falls through to Tier 2, which can express predicates.
+
+The gate is a deliberately closed stop-word list rather than an LLM or POS tagger: Tier 1's value is being deterministic and sub-millisecond. An unlisted-but-harmless word costs a fall-through to Tier 2 (slower, still correct), which is strictly safer than a silent wrong answer.
+
+Two request-level exemptions skip the gate (`Orchestrator._unhandled_qualifier`): `options.dimensions` (the supported out-of-band filter channel, so the qualifier was already expressed) and `options.tierOverride == 1` (an explicit instruction to answer from the metric path).
+
+### Forwarding a declined definition to Tier 2
+
+Declining is **not** discarding. When the gate fires, the orchestrator builds a `DeclinedMetricContext` (`tier1/metric_resolver.py`) from the match and threads it into Tier 2 via `StrategyContext.declined_metric`. It carries the metric's `sql_template`, `description`, `dimensions`, and the `unhandled_qualifier` that tripped the gate. `NLtoSQLStrategy` renders it through `DeclinedMetricContext.prompt_block` and passes it to `SQLGenerator.generate(governed_metric=...)`, which emits it as a dedicated **first-party** prompt section instructing the writer to extend the governed formula rather than compose a replacement.
+
+Design notes that are easy to get wrong when touching this path:
+
+- **Not routed through `evidence`.** That parameter is labelled `<user_context>` "treat as untrusted" and truncated to 500 chars. A governed metric is first-party and must be neither discounted by the label nor clipped by the cap, so it gets its own block, placed ahead of the untrusted one.
+- **Only a residual decline forwards a definition.** A miss, a multi-metric bypass, and a Tier-1 *execution* failure all forward `None`. `_run_tier1` returns `tuple[InvokeResponse | None, DeclinedMetricContext | None]` to make that explicit at every exit.
+- **The gate itself is unchanged by this.** It still fires on exactly the same inputs; only the fall-through carries more context.
+- **`StrategyContext` is rebuilt field-by-field in `_resolve_parallel`.** Any new field must be copied there or the parallel path silently loses what the sequential path gets. `declined_metric` is a frozen dataclass, so sharing the reference is race-free.
+- **No namespace-name special case.** The namespace's own name survives as residual like any other token (e.g. `"How many open claims does AnyCompany have?"` leaves `anycompany`). Consuming it would assume the token names the whole dataset rather than filtering it, which the gate cannot verify — it has no schema. Tier 2 does, and receives the token alongside the formula, so the decision is made where the information is. Rejected alternative, recorded so it isn't re-proposed from the diff alone.
+
+The `t1.metric_match` trace step reports `governedDefinitionForwarded` (bool) alongside `unhandledQualifier` and `matchedText`, so whether the definition reached Tier 2 is answerable from the trace without reading Tier-2's prompt.
+
 ## Tier 2 retrieval
 
 Tier 2 embeds the query (via Bedrock Cohere Embed v4) and does a k-NN search over the

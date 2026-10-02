@@ -193,4 +193,33 @@ class CoaTableTest
 
         assertEquals("Order @pk", commentsOf(table).get("order_id"));
     }
+
+    @Test
+    void aNotNullColumnBecomesANotNullTagAndOneWithNothingSaidGetsNone()
+    {
+        CoaTable orders = CoaTable.named("orders")
+                .column(CoaColumn.of("order_id", BIGINT)
+                        .describedAs("Surrogate key for the order")
+                        .primaryKey()
+                        .notNull())
+                .column(CoaColumn.of("note", VARCHAR).describedAs("Free text"))
+                .build();
+
+        assertEquals("Surrogate key for the order @pk @notnull",
+                commentsOf(orders).get("order_id"));
+        // Absence is how COA reads "nobody said", which keeps this additive for connectors already deployed.
+        assertEquals("Free text", commentsOf(orders).get("note"));
+    }
+
+    @Test
+    void notNullSurvivesTheSnapshotTheTableTakes()
+    {
+        // A new field on CoaColumn that copy() forgets is invisible in every other test here and shows up as
+        // a tag that goes missing under exactly the caching the snapshot exists for.
+        CoaColumn column = CoaColumn.of("order_id", BIGINT).describedAs("Order").notNull();
+        CoaTable table = CoaTable.named("order_lines").column(column).build();
+
+        assertTrue(table.columns().get(0).isNotNull());
+        assertEquals("Order @notnull", commentsOf(table).get("order_id"));
+    }
 }

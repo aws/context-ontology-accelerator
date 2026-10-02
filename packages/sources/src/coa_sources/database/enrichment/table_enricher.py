@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from collections import defaultdict
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import boto3
@@ -37,6 +39,8 @@ AWS_REGION = resolve_region()
 COLUMN_BATCH_SIZE = 50
 COLUMN_BATCH_THRESHOLD = 80
 MAX_WORKERS = 10
+# Throttle: a per-table publish would be one write per table on a 5000-table source.
+PROGRESS_PUBLISH_INTERVAL_SEC = 5.0
 TABLE_TIMEOUT_SEC = int(os.getenv("ENRICHMENT_TABLE_TIMEOUT_SEC", "90"))
 GUARDRAIL_SSM_PARAM = os.getenv("GUARDRAIL_SSM_PARAM", "")
 
@@ -113,7 +117,12 @@ def _has_pending(table: Table) -> bool:
 
 
 def run(
-    datasource_id: str, namespace_id: str, domain_id: str, scan_type: str, emitter: EnrichmentMetricEmitter
+    datasource_id: str,
+    namespace_id: str,
+    domain_id: str,
+    scan_type: str,
+    emitter: EnrichmentMetricEmitter,
+    progress: Callable[[int, int], None] | None = None,
 ) -> dict:
     """Enrich all tables for a data source via Bedrock LLM calls.
 
@@ -121,8 +130,27 @@ def run(
     peers to a shared thread pool capped at MAX_WORKERS. This avoids deadlocks
     and ensures column batches for large tables run in parallel.
 
+    ``progress`` is called with (tables_processed, tables_total) as the run
+    advances; the caller persists it.
+
     Returns:
-        Dict with counts: tables_enriched, tables_failed, tables_skipped_unchanged.
+        Dict describing the run outcome:
+          - tables_enriched (int): tables written back with AI metadata. INCLUDES
+            partially-enriched tables (see tables_partial) — they are a subset,
+            not a separate bucket.
+          - tables_failed (int): tables written back with NO enrichment (every
+            Bedrock call for the table errored — guardrail block or parse/timeout).
+          - tables_skipped_unchanged (int): tables left as-is (nothing pending, or
+            a re-scan the steward already approved).
+          - tables_partial (int): SUBSET of tables_enriched where a wide table
+            (> COLUMN_BATCH_THRESHOLD columns) had >=1 column batch fail but >=1
+            succeed. The surviving description + columns are kept; only the failed
+            batch's columns are missing. Flagged so a steward can tell an
+            incomplete table from a fully-enriched one.
+          - failed_table_ids (list[str]): sorted "db.table" ids counted in
+            tables_failed.
+          - partial_table_ids (list[str]): sorted "db.table" ids counted in
+            tables_partial.
     """
     tables = read_assets_for_datasource(domain_id, namespace_id, datasource_id)
     if not tables:
@@ -154,6 +182,26 @@ def run(
                 batch_count += 1
             table_batch_counts[table.table_id] = batch_count
 
+    # Skipped tables were inspected and found unchanged, so they are already done.
+    total = len(tables)
+    processed = total - len(table_batch_counts)
+    last_publish = 0.0
+
+    def publish(*, force: bool = False) -> None:
+        nonlocal last_publish
+        if progress is None:
+            return
+        now = time.monotonic()
+        if not force and now - last_publish < PROGRESS_PUBLISH_INTERVAL_SEC:
+            return
+        last_publish = now
+        try:
+            progress(processed, total)
+        except Exception:
+            logger.warning("progress_publish_failed", exc_info=True)
+
+    publish(force=True)
+
     # EXECUTE: submit all Bedrock calls to shared pool
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {
@@ -172,23 +220,36 @@ def run(
         # COLLECT: gather results grouped by table
         table_results: dict[str, list[tuple[int, dict]]] = {}
         table_usage: dict[str, dict] = defaultdict(lambda: {"latency_ms": 0.0, "input_tokens": 0, "output_tokens": 0})
-        failed_tables: set[str] = set()
+        # Tables that had at least one column batch fail (guardrail block or
+        # parse/timeout). A table here is NOT discarded — the results from its
+        # batches that DID succeed are still applied (see APPLY below). It is
+        # only used to classify the table's terminal status (partial vs full).
+        failed_batch_tables: set[str] = set()
+        batches_returned: dict[str, int] = defaultdict(int)
 
         for future in as_completed(futures):
             table, batch_idx = futures[future]
             try:
                 parsed, latency_ms, input_tokens, output_tokens = future.result()
-                if table.table_id not in failed_tables:
-                    table_results.setdefault(table.table_id, []).append((batch_idx, parsed))
+                # Always keep a succeeded batch's result, even if a SIBLING batch
+                # of the same wide table failed. Discarding it here is exactly the
+                # Data-loss bug: one failed batch erased the whole table's
+                # enrichment (description + every succeeded batch's columns).
+                table_results.setdefault(table.table_id, []).append((batch_idx, parsed))
                 table_usage[table.table_id]["latency_ms"] += latency_ms
                 table_usage[table.table_id]["input_tokens"] += input_tokens
                 table_usage[table.table_id]["output_tokens"] += output_tokens
             except GuardrailBlockedError:
-                failed_tables.add(table.table_id)
+                failed_batch_tables.add(table.table_id)
                 logger.warning("Guardrail blocked table %s (batch %d)", table.table_id, batch_idx)
                 emitter.emit_bedrock_invocation_error(stage="Pass1", exc=GuardrailBlockedError("blocked"))
             except BedrockTruncationError as exc:
-                failed_tables.add(table.table_id)
+                # A truncated batch is a FAILED batch (not a discard-the-table
+                # event): register it in failed_batch_tables so a wide table's
+                # surviving sibling batches are still applied.
+                # A single-batch table whose only batch truncates has no surviving
+                # results and is reclassified as fully failed in the APPLY phase.
+                failed_batch_tables.add(table.table_id)
                 logger.warning(
                     "Bedrock truncated table %s (batch %d): model=%s output_tokens=%d requested_max_tokens=%d",
                     table.table_id,
@@ -199,33 +260,62 @@ def run(
                 )
                 emitter.emit_bedrock_invocation_error(stage="Pass1", exc=exc)
             except Exception as exc:
-                failed_tables.add(table.table_id)
+                failed_batch_tables.add(table.table_id)
                 logger.exception("Failed to enrich table %s (batch %d)", table.table_id, batch_idx)
                 emitter.emit_bedrock_invocation_error(stage="Pass1", exc=exc)
 
-    # APPLY: process results for fully-succeeded tables
+            # Counted on return, not on success: a failed table's work did run.
+            batches_returned[table.table_id] += 1
+            if batches_returned[table.table_id] == table_batch_counts[table.table_id]:
+                processed += 1
+                publish()
+
+    publish(force=True)
+
+    # APPLY: write back everything a table produced.
+    #   * fully succeeded  -> all expected batches returned          -> enriched
+    #   * partially failed -> >=1 batch failed but >=1 succeeded     -> enriched (partial),
+    #                         keeping the description + the columns from the
+    #                         batches that DID succeed
+    #   * fully failed     -> every batch failed (no results at all) -> failed
     succeeded_tables: list[Table] = []
+    partial_tables: set[str] = set()
+    failed_tables: set[str] = set()
     table_map = {t.table_id: t for t in tables}
 
-    for table_id, results in table_results.items():
-        if table_id in failed_tables:
-            continue
-        if len(results) < table_batch_counts[table_id]:
+    # A table with a failed batch but NO surviving results at all is fully failed.
+    for table_id in failed_batch_tables:
+        if not table_results.get(table_id):
             failed_tables.add(table_id)
-            continue
+
+    for table_id, results in table_results.items():
+        expected = table_batch_counts[table_id]
+        is_partial = len(results) < expected or table_id in failed_batch_tables
         table = table_map[table_id]
         results.sort(key=lambda x: x[0])
-        _apply_table_metadata(table, results[0][1])
-        _apply_primary_key(table, results[0][1])
+        result_by_idx = dict(results)
+        # Table-level metadata (description, PK) lives ONLY in batch 0's result.
+        # Apply it when batch 0 survived; otherwise leave the existing table
+        # description untouched rather than blanking it.
+        if 0 in result_by_idx:
+            _apply_table_metadata(table, result_by_idx[0])
+            _apply_primary_key(table, result_by_idx[0])
         all_column_results: list[dict] = []
         for _, result in results:
             all_column_results.extend(result.get("columns", []))
         _apply_column_metadata(table, all_column_results)
         succeeded_tables.append(table)
+        if is_partial:
+            partial_tables.add(table_id)
 
     # Structured log per table for offline analysis
     for table_id, usage in table_usage.items():
-        status = "failed" if table_id in failed_tables else "success"
+        if table_id in failed_tables:
+            status = "failed"
+        elif table_id in partial_tables:
+            status = "partial"
+        else:
+            status = "success"
         logger.info(
             "table_enrichment_complete: %s",
             {
@@ -253,7 +343,45 @@ def run(
 
     enriched = len(succeeded_tables)
     failed = len(failed_tables)
+    partial = len(partial_tables)
+
+    # Invariant: every discovered table lands in exactly one of enriched / failed /
+    # skipped_unchanged (partial is a SUBSET of enriched, not a fourth bucket).
+    # These checks are on INDEPENDENTLY-tracked sets — not on a derived value — so
+    # a real classification drift trips them (a tautology on the derived count
+    # could not). Assert the two sets are disjoint, the enriched+failed total does
+    # not exceed the discovered tables, and partial is contained in enriched.
+    succeeded_ids = {t.table_id for t in succeeded_tables}
+    assert succeeded_ids.isdisjoint(failed_tables), (
+        f"table classified as both enriched and failed: {sorted(succeeded_ids & failed_tables)}"
+    )
+    assert enriched + failed <= len(tables), (
+        f"enrichment count partition broken: enriched={enriched} + failed={failed} "
+        f"> total={len(tables)} (double-counted table)"
+    )
+    assert partial_tables <= succeeded_ids, (
+        f"partial tables not a subset of enriched: {sorted(partial_tables - succeeded_ids)}"
+    )
+
+    # skipped_unchanged is the remainder: tables that had nothing pending to enrich.
+    # The asserts above guarantee this is non-negative and correctly partitioned.
     skipped_unchanged = len(tables) - enriched - failed
+
+    # Observability for the partial-enrichment case: a wide table where one
+    # or more column batches failed but others succeeded is now written back with
+    # the surviving description + columns (counted under `enriched`), rather than
+    # discarded. Surface HOW MANY landed incomplete and WHICH ones, so a steward
+    # can tell a partially-enriched table from a fully-enriched one at review time
+    # — mirrors the failed_table_ids diagnostic the caller already records.
+    emitter.emit_metric("TablesPartiallyEnriched", partial, "Count")
+    if partial:
+        logger.warning(
+            "%d of %d enriched table(s) are PARTIAL — at least one column batch failed; "
+            "kept the description + columns from the batches that succeeded: %s",
+            partial,
+            enriched,
+            sorted(partial_tables),
+        )
 
     # Alarm surface for the silent-failure mode this pass is prone to: the LLM
     # returns well-formed JSON with synonyms/tags but no table description, so
@@ -271,8 +399,9 @@ def run(
     _write_enriched_assets(succeeded_tables, domain_id, namespace_id)
 
     logger.info(
-        "Enrichment complete: enriched=%d failed=%d skipped_unchanged=%d",
+        "Enrichment complete: enriched=%d (partial=%d) failed=%d skipped_unchanged=%d",
         enriched,
+        partial,
         failed,
         skipped_unchanged,
     )
@@ -280,11 +409,19 @@ def run(
         "tables_enriched": enriched,
         "tables_failed": failed,
         "tables_skipped_unchanged": skipped_unchanged,
+        # Count of tables written back with PARTIAL enrichment (>=1 column batch
+        # failed but >=1 succeeded). These are a SUBSET of tables_enriched, not a
+        # separate bucket — the surviving metadata was applied. Kept distinct so
+        # the caller can flag them for steward review.
+        "tables_partial": partial,
         # The db.table ids that errored (guardrail block or parse/timeout) and
         # were written back WITHOUT enrichment. The aggregate `failed` count
         # alone hides which tables regressed; the caller records these names so
         # a steward can see them at review time.
         "failed_table_ids": sorted(failed_tables),
+        # The db.table ids enriched only PARTIALLY (subset of tables_enriched);
+        # surfaced so a steward knows the table's metadata is incomplete.
+        "partial_table_ids": sorted(partial_tables),
     }
 
 

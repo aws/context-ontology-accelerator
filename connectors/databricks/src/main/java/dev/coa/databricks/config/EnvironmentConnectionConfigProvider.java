@@ -44,6 +44,22 @@ public final class EnvironmentConnectionConfigProvider implements ConnectionConf
     }
 
     /**
+     * {@inheritDoc}
+     *
+     * <p>No secret ARN and no HTTP path: the latter identifies one specific warehouse and adds nothing
+     * here.
+     */
+    @Override
+    public String describe()
+    {
+        return "mode=" + ConfigSource.ENVIRONMENT.wireName()
+                + " host=" + config.workspaceHostname()
+                + " catalog=" + config.catalog()
+                + " schema=" + (config.isSchemaPinned()
+                        ? config.schema() : "<every schema in the catalog>");
+    }
+
+    /**
      * The value of {@code name}, matched case-insensitively. A scan rather than an exact/lower/upper
      * triple, which would resolve {@code databricks_catalog} and {@code DATABRICKS_CATALOG} but not
      * {@code Databricks_Catalog}. An exact hit short-circuits, so the normal case is one map lookup.

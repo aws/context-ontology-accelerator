@@ -1,0 +1,11 @@
+/* Shared page-level styles. Component-scoped rules stay next to their
+   component (see components/Chat/chat.css). */
+
+/* Preserve newlines in text the server formatted deliberately — registration
+   errors are numbered lists carrying the exact value to paste into a trust
+   policy, and HTML collapses them into one run-on line without this. The wrap
+   rule keeps a long ARN inside the container instead of overflowing it. */
+.coa-preserve-newlines {
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+}

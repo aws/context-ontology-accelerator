@@ -179,6 +179,21 @@ class TestGetClass:
         assert resp.status_code == 200
         assert resp.json()["is_mapped"] is True
 
+    def test_superseded_history_propagates(self, _patch_build_stores):
+        """The store's `superseded` history buckets must reach the API model —
+        the router maps fields explicitly, so a missing line here silently drops them
+        (which is exactly what the live E2E caught)."""
+        history = {"comments": ["AI: old text"], "altLabels": ["cust_master"]}
+        _patch_build_stores.mock_graph.get_vertex.return_value = {**SAMPLE_CLASS_VERTEX, "superseded": history}
+        resp = client.get("/graph/class/", params={"uri": "https://example.org/onto#Claim", "namespace": "default"})
+        assert resp.status_code == 200
+        assert resp.json()["superseded"] == history
+
+    def test_superseded_defaults_empty_when_absent(self, _patch_build_stores):
+        _patch_build_stores.mock_graph.get_vertex.return_value = SAMPLE_CLASS_VERTEX
+        resp = client.get("/graph/class/", params={"uri": "https://example.org/onto#Claim", "namespace": "default"})
+        assert resp.json()["superseded"] == {}
+
     def test_404_when_vertex_not_found(self, _patch_build_stores):
         _patch_build_stores.mock_graph.get_vertex.return_value = None
         resp = client.get("/graph/class/", params={"uri": "https://example.org/onto#Missing", "namespace": "default"})

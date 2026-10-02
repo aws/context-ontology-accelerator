@@ -25,7 +25,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import boto3
@@ -91,17 +91,91 @@ _TEXT_FIELDS = (
 )
 
 
-def build_index_mapping(dims: int) -> dict:
+# Engines that support filtered k-NN. NMSLIB does NOT — a method-less index
+# that resolves to NMSLIB fails every filtered query with
+# "Engine [NMSLIB] does not support filters" (see #174).
+_FILTER_CAPABLE_ENGINES = frozenset({"faiss", "lucene"})
+
+# Explicit Faiss/HNSW method block. Requested by default so index creation does
+# not depend on the server's (observed-unstable) method-less default engine.
+_FAISS_HNSW_METHOD = {"name": "hnsw", "engine": "faiss", "space_type": "l2"}
+
+
+class IncompatibleEngineError(RuntimeError):
+    """A vector index resolved to an ANN engine that cannot serve filtered k-NN.
+
+    Raised by :meth:`AossVectorClient.ensure_index` after reading back the
+    created index's mapping, when the ``embedding`` field's resolved engine is
+    not in :data:`_FILTER_CAPABLE_ENGINES`. This turns the #174 failure —
+    silently getting an NMSLIB index and only discovering it when a filtered
+    query 400s — into a loud, deploy-time failure.
+    """
+
+
+def build_index_mapping(dims: int, *, method: bool = True) -> dict:
     """Canonical vector-index mapping — the single source of truth.
 
-    ``embedding`` is a **method-less** ``knn_vector`` (NEXTGEN auto-resolves to
-    Faiss/HNSW; an explicit ``method.engine`` is rejected). All filterable fields
-    are ``keyword`` so server-side ``term``/``exists`` filters match exactly.
+    ``embedding`` is a ``knn_vector``. By default (``method=True``) it carries
+    an explicit Faiss/HNSW ``method`` block, because the service's method-less
+    default engine is NOT stable and has been observed to resolve to NMSLIB
+    (which cannot serve filtered k-NN — see #174). ``method=False`` emits the
+    legacy method-less mapping, used as a fallback by :meth:`ensure_index` when
+    the service rejects an explicit ``method.engine`` at creation.
+
+    All filterable fields are ``keyword`` so server-side ``term``/``exists``
+    filters match exactly.
     """
     props: dict[str, Any] = {f: {"type": "keyword"} for f in _KEYWORD_FIELDS}
     props.update({f: {"type": "text"} for f in _TEXT_FIELDS})
-    props["embedding"] = {"type": "knn_vector", "dimension": dims}
+    embedding: dict[str, Any] = {"type": "knn_vector", "dimension": dims}
+    if method:
+        embedding["method"] = dict(_FAISS_HNSW_METHOD)
+    props["embedding"] = embedding
     return {"settings": {"index": {"knn": True}}, "mappings": {"properties": props}}
+
+
+def _rejects_explicit_method(e: Exception) -> bool:
+    """True if a create RequestError means "explicit knn_vector method not allowed".
+
+    Some NEXTGEN AOSS generations reject an explicit ``method.engine`` block at
+    index creation (observed live as HTTP 400 ``illegal_argument_exception`` /
+    "Field parameter 'engine' is not supported"; see #174). We detect it by the
+    error code and message rather than status alone, so a genuine 400 for some
+    OTHER reason still propagates instead of silently falling back.
+    """
+    code = (getattr(e, "error", "") or "").lower()
+    msg = str(getattr(e, "info", "") or "").lower() + " " + str(e).lower()
+    if "illegal_argument_exception" in code or "mapper_parsing_exception" in code:
+        return True
+    return any(
+        s in msg
+        for s in (
+            "engine' is not supported",
+            "engine] is not supported",
+            "does not support parameter",
+            "unknown parameter [method]",
+            "unsupported parameter",
+            "parameter 'engine'",
+        )
+    )
+
+
+def _resolved_engine(mapping: dict, index: str) -> str | None:
+    """Extract the resolved ANN engine for ``embedding`` from a get_mapping response.
+
+    ``indices.get_mapping`` returns ``{index: {"mappings": {"properties":
+    {"embedding": {"method": {"engine": ...}}}}}``. Faiss/Lucene report the
+    engine under ``method.engine``; a method-less NMSLIB index may report no
+    ``method`` block at all. Returns the lowercased engine string, or None when
+    no engine is present in the mapping.
+    """
+    try:
+        props = mapping[index]["mappings"]["properties"]
+        emb = props["embedding"]
+        engine = emb.get("method", {}).get("engine")
+        return engine.lower() if isinstance(engine, str) else None
+    except (KeyError, AttributeError, TypeError):
+        return None
 
 
 # Transport for the proxy path: given (action, index, body) returns the raw
@@ -215,6 +289,20 @@ class AossVectorClient:
         self._transport = transport
         self._client: _RetryingClient | None = None
         self._ensured_indices: set[str] = set()
+        # Engine strategy, classified ONCE per collection then cached (#174 long-term):
+        #   None  = not yet probed
+        #   True  = this collection accepts an explicit knn_vector method.engine
+        #           (the normal NEXTGEN case) → always create explicit Faiss/HNSW,
+        #           and get_mapping MUST echo a filter-capable engine.
+        #   False = this collection REJECTS an explicit method at create time →
+        #           create method-less and let the service resolve the engine;
+        #           an unreported engine in get_mapping is then tolerated (the
+        #           service does not always echo a server-resolved default) while
+        #           a reported non-filtering engine (NMSLIB) is still fatal.
+        # Caching the classification removes the per-index guessing that caused
+        # the F1 false-reject risk: after the first ensure_index, every later
+        # index takes the known-good path deterministically.
+        self._explicit_method_supported: bool | None = None
 
     # ── transport ──────────────────────────────────────────────────────
 
@@ -266,22 +354,159 @@ class AossVectorClient:
     # ── index admin (direct only) ──────────────────────────────────────
 
     def ensure_index(self, index: str) -> str:
-        """Create ``index`` with the canonical mapping if it doesn't exist."""
+        """Create ``index`` with the canonical mapping if it doesn't exist, engine-verified.
+
+        Creation strategy (see #174 — the resolved ANN engine is a server-side
+        default that has been observed unstable across accounts/dates):
+
+        1. Try create with an EXPLICIT Faiss/HNSW ``method`` block.
+        2. If the service rejects the explicit ``method`` at creation (some
+           NEXTGEN generations return ``illegal_argument_exception`` /
+           "Field parameter 'engine' is not supported"), retry create
+           METHOD-LESS and let the service resolve the engine.
+        3. Either way, read the mapping back and VERIFY the resolved engine is
+           filter-capable (Faiss/Lucene). If it resolved to a non-filtering
+           engine (NMSLIB), raise :class:`IncompatibleEngineError` NOW — so an
+           index that cannot serve a filtered query is caught at creation, not
+           at first query. The resolved engine is always logged at INFO.
+        """
         if index in self._ensured_indices:
             return index
         c = self._c()
+        # Strict verification (an unreported engine is fatal) applies ONLY to an
+        # index THIS call created with an explicit method — the one case where we
+        # know what was asked for. A pre-existing index was created by another
+        # process or by code that predates the explicit method, so how it was
+        # created is unknown: method-less creation is valid and on some
+        # collections never echoes an engine in get_mapping. Treating it as
+        # explicit (the previous default, and the cached flag on a collection
+        # that accepts explicit methods) rejected every pre-existing index on a
+        # fresh process — failing the readiness probe and proposal-accept ingest.
+        created_with_explicit_method = False
         if not c.indices.exists(index=index):
-            try:
-                c.indices.create(index=index, body=build_index_mapping(self.dimensions))
-                log.info("created OpenSearch index %s (dims=%d)", index, self.dimensions)
-            except RequestError as e:
-                # Race: another caller created it between exists() and create().
-                if e.error == "resource_already_exists_exception":
-                    log.debug("index %s already exists (concurrent create)", index)
-                else:
-                    raise
+            created_with_explicit_method = self._create_with_engine_fallback(c, index)
+        # Verify the resolved engine regardless of who created it — a
+        # pre-existing index created before this check could be NMSLIB, and a
+        # REPORTED non-filtering engine is fatal on every path.
+        self._verify_filter_capable_engine(c, index, explicit_method=created_with_explicit_method)
         self._ensured_indices.add(index)
         return index
+
+    def _create_with_engine_fallback(self, c: Any, index: str) -> bool:
+        """Create ``index`` explicit-Faiss-first, method-less on rejection.
+
+        Returns True if the index was created (or is being verified) via the
+        EXPLICIT-method path, False if it went via the METHOD-LESS fallback —
+        the caller uses this to choose engine-verification strictness.
+
+        The explicit/method-less classification is cached on the instance
+        (``_explicit_method_supported``) after the first create, so every later
+        index on the same collection takes the known-good path with no re-probe
+        and no per-index guessing. A concurrent-create race
+        (``resource_already_exists_exception``) does not change the cache; it
+        reports the strategy this collection is known/assumed to use.
+        """
+        # If we already classified this collection, go straight to the known path.
+        if self._explicit_method_supported is False:
+            try:
+                c.indices.create(index=index, body=build_index_mapping(self.dimensions, method=False))
+                log.info("created OpenSearch index %s (dims=%d, method=less/server-resolved)", index, self.dimensions)
+            except RequestError as e:
+                if e.error == "resource_already_exists_exception":
+                    return False
+                raise
+            return False
+
+        try:
+            c.indices.create(index=index, body=build_index_mapping(self.dimensions, method=True))
+            log.info("created OpenSearch index %s (dims=%d, method=explicit-faiss/hnsw)", index, self.dimensions)
+            self._explicit_method_supported = True
+            return True
+        except RequestError as e:
+            if e.error == "resource_already_exists_exception":
+                # Race: keep whatever classification we have (default: explicit).
+                return self._explicit_method_supported is not False
+            # Some NEXTGEN generations reject an explicit method.engine at
+            # creation. Classify the collection as method-less-only, fall back,
+            # and let the service resolve the engine (which
+            # _verify_filter_capable_engine then checks, tolerating an
+            # unreported engine on this path).
+            if _rejects_explicit_method(e):
+                log.warning(
+                    "OpenSearch rejected explicit knn_vector method on %s (%s); "
+                    "classifying collection as method-less and verifying the resolved engine",
+                    index,
+                    getattr(e, "error", e),
+                )
+                self._explicit_method_supported = False
+                try:
+                    c.indices.create(index=index, body=build_index_mapping(self.dimensions, method=False))
+                    log.info(
+                        "created OpenSearch index %s (dims=%d, method=less/server-resolved)",
+                        index,
+                        self.dimensions,
+                    )
+                    return False
+                except RequestError as e2:
+                    if e2.error == "resource_already_exists_exception":
+                        return False
+                    raise
+            raise
+
+    def _verify_filter_capable_engine(self, c: Any, index: str, *, explicit_method: bool = True) -> None:
+        """Read the index mapping back and raise if the ANN engine can't filter.
+
+        Filter-capable engines are Faiss/Lucene; NMSLIB cannot serve filtered
+        k-NN. Logs the resolved engine at INFO so a deployment can finally read
+        which engine its indices got (#174 — "nothing reported the engine").
+
+        Path-aware strictness (resolves F1):
+
+        - ``explicit_method=True`` (default/normal path): we asked for Faiss, so
+          the mapping MUST confirm a filter-capable engine. A reported NMSLIB
+          OR an UNREPORTED engine is fatal — if the service accepted our explicit
+          method it must echo it back; silence means something is wrong.
+        - ``explicit_method=False`` (method-less fallback path): the service
+          resolves the engine and does NOT always echo a server-resolved default
+          in get_mapping. A reported NMSLIB is still fatal, but an UNREPORTED
+          (None) engine is TOLERATED with a WARNING — raising here would
+          false-reject a valid Faiss index on the exact generation the fallback
+          exists to serve. The residual "unreported-but-secretly-NMSLIB" risk is
+          caught by the live filtered-kNN integration test, not by inference.
+        """
+        try:
+            mapping = c.indices.get_mapping(index=index)
+        except Exception as e:  # noqa: BLE001 — verification failure must not be silently ignored
+            # A verification read failure is itself a signal — do not proceed as
+            # if the engine were fine. Re-raise so the caller sees it.
+            raise IncompatibleEngineError(
+                f"could not read back mapping for index {index!r} to verify its ANN engine: {e}"
+            ) from e
+        engine = _resolved_engine(mapping, index)
+        log.info("OpenSearch index %s resolved ANN engine: %s", index, engine or "<none reported>")
+
+        if engine is not None and engine not in _FILTER_CAPABLE_ENGINES:
+            # A reported non-filtering engine (NMSLIB) is fatal on BOTH paths.
+            raise IncompatibleEngineError(
+                f"index {index!r} resolved to ANN engine {engine!r}, which cannot serve filtered k-NN "
+                f"(need one of {sorted(_FILTER_CAPABLE_ENGINES)}). Filtered vector search would fail with "
+                f"'Engine [{engine.upper()}] does not support filters'. See #174."
+            )
+        if engine is None:
+            if explicit_method:
+                # We sent an explicit filter-capable method; the service must echo
+                # it. Silence means the create did not apply what we asked for.
+                raise IncompatibleEngineError(
+                    f"index {index!r} was created with an explicit filter-capable method but its mapping "
+                    f"reports no ANN engine; refusing to trust an unverifiable index. See #174."
+                )
+            # Method-less fallback: tolerate an unreported engine (see docstring).
+            log.warning(
+                "OpenSearch index %s reports no ANN engine after method-less creation; "
+                "trusting the service default. Filter-capability is confirmed by the live "
+                "filtered-kNN integration test, not by this mapping read. See #174.",
+                index,
+            )
 
     def delete_index(self, index: str) -> bool:
         """Delete ``index``. Returns True if it existed."""
@@ -306,8 +531,27 @@ class AossVectorClient:
         actions = [{"_op_type": "index", "_index": index, **d} for d in docs]
         bulk_with_retry(self._c().raw, actions)
 
-    def delete_by_term(self, index: str, field: str, value: str, page: int = 500) -> int:
-        """Delete every doc where ``field == value``, verifying the term reaches zero.
+    def delete_by_term(
+        self,
+        index: str,
+        field: str,
+        value: str | Sequence[str],
+        page: int = 500,
+        and_filters: list[dict] | None = None,
+    ) -> int:
+        """Delete every doc where ``field == value`` (or ``field IN values``), verifying the match reaches zero.
+
+        ``value`` may be a single string or a sequence of strings; the latter
+        runs ONE ``terms`` query and one verify loop for the whole set, instead
+        of paying the refresh-lag wait once per value (append-mode ingest retires
+        the stale embeddings of every subject in the incoming proposal at once).
+
+        ``and_filters`` optionally narrows the delete with additional AND clauses
+        (``{"term": {...}}``, ``{"terms": {...}}``, etc.) — used by the embedding
+        retirement path to scope by ``ontology_id`` so that shared IRIs in a
+        different ontology are not touched. When set, the term/terms query is
+        wrapped in a ``bool.must`` alongside the extra filters; when omitted the
+        query is the bare term/terms as before.
 
         AOSS has no ``_delete_by_query`` on VECTORSEARCH, so we search for
         matching docs and delete each by its auto-assigned ``_id``. AOSS
@@ -326,7 +570,25 @@ class AossVectorClient:
         docs deleted.
         """
         c = self._c()
-        term = [{"term": {field: value}}]
+        if isinstance(value, str):
+            primary: dict = {"term": {field: value}}
+        else:
+            # Dedup and drop empties/None: a `terms` clause of [""] is a valid
+            # query that matches nothing, but an all-empty input is a caller bug
+            # and should cost no round-trip.
+            values = [v for v in dict.fromkeys(value) if v]
+            if not values:
+                return 0
+            primary = {"terms": {field: values}}
+
+        if and_filters:
+            query = {"bool": {"must": [primary, *and_filters]}}
+            # For `count()`, wrap in the same shape so the terminal check
+            # matches exactly what we deleted.
+            count_filters = [query]
+        else:
+            query = primary
+            count_filters = [primary]
         deleted = 0
         stall_deadline = time.perf_counter() + _DELETE_VERIFY_STALL_TIMEOUT_S
 
@@ -337,7 +599,7 @@ class AossVectorClient:
             #    the delete path, since doing so resurrected empty shells.
             resp = self._search(
                 index,
-                {"size": page, "_source": False, "query": {"term": {field: value}}},
+                {"size": page, "_source": False, "query": query},
             )
             hits = _hits(resp)
             deleted_this_pass = 0
@@ -355,7 +617,7 @@ class AossVectorClient:
             #    done (0); any other (transient) count error → -1 so the stall
             #    timer governs whether we keep retrying.
             try:
-                remaining = self.count(index, filters=term)
+                remaining = self.count(index, filters=count_filters)
             except Exception as e:  # noqa: BLE001
                 remaining = 0 if _is_index_not_found(e) else -1
 
@@ -374,7 +636,7 @@ class AossVectorClient:
                     "delete_by_term(%s=%s) stalled — deleted %d, ~%s still matching after %.0fs "
                     "no-progress; giving up this pass (caller will retry / verify)",
                     field,
-                    value,
+                    value if isinstance(value, str) else f"<{len(primary['terms'][field])} values>",
                     deleted,
                     remaining if remaining >= 0 else "unknown",
                     _DELETE_VERIFY_STALL_TIMEOUT_S,

@@ -40,7 +40,24 @@
       The shade filter below keeps only the classes this connector actually extends.
     -->
     <athena.jdbc.version>${athena.federation.sdk.version}</athena.jdbc.version>
-    <slf4j.version>2.0.17</slf4j.version>
+    <slf4j.version>2.0.18</slf4j.version>
+    <!--
+      AWS SDK v2, pinned to exactly what the federation SDK already brings in transitively, so
+      MOVE IT WITH THE SDK VERSION - verify with
+
+        mvn dependency:tree -pl databricks -Dincludes=software.amazon.awssdk
+
+      which must report one version for every artifact. A second version in this jar is worse
+      than a duplicate dependency: every module shares package names, so the shade plugin keeps
+      whichever copy it saw first per path and the result is one SDK assembled from two
+      releases. That builds green and passes the unit suite, then the deployed function throws
+      NoClassDefFoundError on the first invocation for a core class the newer service modules
+      expect - which is how this was caught on the 2026.33.1 bump.
+
+      `sts` is already transitive at this version and is named below only so this module does
+      not depend on a transitive; `ssm` is genuinely new.
+    -->
+    <aws.sdk.version>2.46.17</aws.sdk.version>
   </properties>
 
   <dependencies>
@@ -80,12 +97,64 @@
       <version>${slf4j.version}</version>
     </dependency>
 
-    <!-- Reads the credential secret's JSON. Already on the SDK's classpath; named here so
-         this module does not depend on a transitive. -->
+    <!-- Reads the credential secret's JSON, and the coa-managed mode's configuration
+         parameter. Already on the SDK's classpath; named here so this module does not depend
+         on a transitive, and at the SDK's own version for the reason ${aws.sdk.version} gives:
+         a direct declaration wins over the transitive, so a stale one puts the SDK's classes
+         next to a Jackson they were not compiled against. -->
     <dependency>
       <groupId>com.fasterxml.jackson.core</groupId>
       <artifactId>jackson-databind</artifactId>
-      <version>2.18.9</version>
+      <version>${jackson.version}</version>
+    </dependency>
+
+    <!--
+      coa-managed mode only, and both are load-bearing there rather than convenient: the
+      connector reads each source's connection facts from one Parameter Store parameter per
+      Athena catalog, and reaches that source's credential by assuming a CUSTOMER-owned role
+      with a derived ExternalId. It holds no Secrets Manager or KMS permission of its own in
+      that mode, so sts:AssumeRole is the whole credential path and there is no fallback.
+
+      Both are pinned to ${aws.sdk.version} - see that property. `sts` is already on the
+      classpath transitively via the federation SDK, so declaring it adds nothing to the jar;
+      `ssm` is the only genuinely new artifact here, and the jar was re-measured after adding
+      it (see the size budget in the shade filter below).
+    -->
+    <dependency>
+      <groupId>software.amazon.awssdk</groupId>
+      <artifactId>sts</artifactId>
+      <version>${aws.sdk.version}</version>
+      <exclusions>
+        <exclusion>
+          <groupId>software.amazon.awssdk</groupId>
+          <artifactId>netty-nio-client</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
+
+    <dependency>
+      <groupId>software.amazon.awssdk</groupId>
+      <artifactId>ssm</artifactId>
+      <version>${aws.sdk.version}</version>
+      <!--
+        The async HTTP client and its eleven Netty artifacts, excluded. An AWS SDK service
+        module declares BOTH http clients at runtime scope, and the federation SDK already
+        supplies `apache-client`, which is what a SYNCHRONOUS client resolves - and every
+        client this connector builds is synchronous. Left in, Netty is ~5 MB of jar for code
+        nothing loads.
+        The failure mode if an async client is ever wanted here is loud and immediate:
+        "Unable to load an HTTP implementation from any provider in the chain".
+
+        The federation SDK reaches the same place a different way: it declares apache-client
+        directly and its service modules arrive without Netty, which is why `sts` above needed
+        no exclusion until it was declared here rather than inherited.
+      -->
+      <exclusions>
+        <exclusion>
+          <groupId>software.amazon.awssdk</groupId>
+          <artifactId>netty-nio-client</artifactId>
+        </exclusion>
+      </exclusions>
     </dependency>
 
     <dependency>
@@ -128,27 +197,49 @@
                   </excludes>
                 </filter>
                 <!--
-                  athena-jdbc ships as a 46 MB uber jar: 39 classes we want, and 29,400
-                  files that are its own shaded copy of the federation SDK, Arrow, the AWS
-                  SDK, Netty, log4j-core, Bouncy Castle and HikariCP. Unfiltered, every one
-                  of those competes by path with the artifact that legitimately provides it
-                  and the shade plugin keeps whichever it saw first. Take the 39 classes.
+                  athena-jdbc ships as a 95 MB uber jar: 39 entries we want, and 57,400 files
+                  that are its own shaded copy of the federation SDK, Arrow, the AWS SDK,
+                  Netty, log4j-core, Bouncy Castle and HikariCP. Unfiltered, every one of
+                  those competes by path with the artifact that legitimately provides it and
+                  the shade plugin keeps whichever it saw first. Take the 39.
 
                   This filter is also what keeps the connector's LOGGING working. That uber
                   jar bundles log4j-slf4j2-impl, service file included, so without the filter
                   the fat jar would carry TWO SLF4J providers and simplelogger.properties
                   would stop controlling levels - silently, and the SDK's predicate-carrying
                   request logs are what those levels exist to quieten. Loosen this and check
-                  META-INF/services/org.slf4j.spi.SLF4JServiceProvider in the built jar.
+                  META-INF/services/org.slf4j.spi.SLF4JServiceProvider in the built jar: it
+                  must hold one line, org.slf4j.simple.SimpleServiceProvider.
 
-                  SIZE BUDGET, measured after this filter: 83 MB zipped, 212.6 MB unzipped,
-                  against Lambda's 250 MB unzipped limit for a function's code - 85%, so
-                  about 37 MB of headroom. The zipped figure exceeds the 50 MB direct-upload
-                  limit, which does not bind: CDK ships the jar as an S3 asset. Any
-                  dependency bump should re-measure, because the failure mode is a deploy
-                  that CloudFormation rejects rather than a build that fails:
+                  SIZE BUDGET, measured on a clean build: 139.5 MB of jar, expanding to
+                  357.8 MB across 84,643 files. Lambda's limit is 250 MB EXTRACTED, so the
+                  expanded figure would bind - except the CDK construct ships this jar nested
+                  as `lib/<jar>` inside the asset and Lambda does not extract a nested jar, so
+                  what counts is the 139.5 MB, 53% of the limit. Re-measure on any dependency
+                  bump, because the failure mode is a deploy CloudFormation rejects rather
+                  than a build that fails, and `clean` first - a stale toolkit jar in the
+                  reactor makes the number lie:
 
-                    unzip -l target/databricks-connector-1.0.0.jar | tail -2
+                    mvn -q clean package -pl databricks -am
+                    ls -l target/databricks-connector-1.0.0.jar
+
+                  The deployed function's CodeSize is NOT this number: that field reports the
+                  zipped package, 77.7 MB when this jar was 88.8 MB.
+
+                  WHERE THE WEIGHT IS, uncompressed, if headroom ever runs short: Calcite
+                  (27.1 MB) and Substrait (14.4 MB), which the federation SDK added in
+                  2025.37.1 and this connector's own push-down path does not use, then the AWS
+                  SDK service modules - glue 32.8, ssm 21.6, s3 13.0, lambda 11.5, dynamodb
+                  8.9, athena 6.1, kms 5.3, secretsmanager 2.4, sts 1.6. `glue` arrives
+                  through the federation SDK for two classes of its error model; `lambda` and
+                  `dynamodb` are on no path this connector takes. Filtering a service module
+                  is more delicate than filtering athena-jdbc above, because a generated
+                  client references a marshaller class per operation and the failure is a
+                  NoClassDefFoundError on the first call rather than at build time - so it
+                  needs a deployed smoke test of every operation the connector makes, not just
+                  a green unit suite. The jar grew 88.8 -> 139.5 MB across the 2025.15.1 ->
+                  2026.33.1 bump; at that rate the counted figure reaches the limit in about
+                  two to three years, and a container image, limit 10 GB, is the exit.
                 -->
                 <filter>
                   <artifact>com.amazonaws:athena-jdbc</artifact>

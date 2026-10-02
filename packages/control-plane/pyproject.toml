@@ -1,6 +1,6 @@
 [project]
 name = "coa-control-plane"
-version = "0.3.3"
+version = "0.3.4"
 description = "Control Plane for Context Ontology Accelerator"
 requires-python = ">=3.12"
 

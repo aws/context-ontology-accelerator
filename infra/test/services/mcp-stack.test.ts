@@ -271,4 +271,31 @@ describe("McpStack", () => {
       Name: "/coa/mcp/runtime-role-arn",
     });
   });
+
+  // Deliberately NOT narrowed: the role reads across the whole `${ssmPrefix}` tree
+  // (`/issuer`, `/userpool-client-id`, the Context Manager runtime ARN), so scoping
+  // it to a subtree presents as a runtime AccessDenied that reads as a config error.
+  // Accepted residual: the Databricks connector parameters are readable here too,
+  // a metadata side channel over non-secret values.
+  it("keeps its broad ssm:GetParameter on the whole prefix tree", () => {
+    const reads = Object.values(template.findResources("AWS::IAM::Policy"))
+      .flatMap(
+        (p: any) =>
+          p.Properties.PolicyDocument.Statement as Record<string, unknown>[],
+      )
+      .filter((st) => {
+        const actions = Array.isArray(st.Action) ? st.Action : [st.Action];
+        return st.Effect === "Allow" && actions.includes("ssm:GetParameter");
+      });
+    expect(
+      reads.some((st) => {
+        const resources = Array.isArray(st.Resource)
+          ? st.Resource
+          : [st.Resource];
+        return resources.includes(
+          "arn:aws:ssm:us-east-1:123456789012:parameter/coa/*",
+        );
+      }),
+    ).toBe(true);
+  });
 });

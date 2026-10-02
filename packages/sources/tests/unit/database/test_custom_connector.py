@@ -479,3 +479,134 @@ class TestTestConnection:
         result = CustomConnector(runner=runner).test_connection(_config(database_name="my database"))
         assert result.success is False
         assert runner.statements == []
+
+
+class TestNullabilityFromTheCommentChannel:
+    """``nullable`` is tag-driven, and defaults to ``True`` when no tag is present.
+
+    Athena's ``Column`` type has no nullability field and ``DESCRIBE`` returns only name,
+    type and comment, so the comment channel is the only one that can carry it.
+    """
+
+    def test_a_notnull_tag_makes_the_column_not_nullable(self):
+        runner = FakeRunner(tables=["t"], describes={"t": [_packed("c", "int", "Surrogate key @notnull")]})
+        column = CustomConnector(runner=runner).discover_metadata(_config()).tables[0].columns[0]
+        assert column.nullable is False
+        # And the tag is stripped from what the steward reads.
+        assert column.business_metadata.description == "Surrogate key"
+
+    def test_a_column_with_no_tag_is_still_nullable(self):
+        """Every connector deployed to date emits no such tag, so absence has to keep
+        meaning nullable — the value this path hardcoded before the tag existed."""
+        runner = FakeRunner(
+            tables=["customers"],
+            describes={"customers": [_packed("customer_id", "bigint", "Surrogate key"), _packed("email", "varchar")]},
+        )
+        table = CustomConnector(runner=runner).discover_metadata(_config()).tables[0]
+        assert [c.nullable for c in table.columns] == [True, True]
+        # Nothing else about the table moved.
+        assert table.name == "customers"
+        assert table.database == _DATABASE
+        assert table.columns[0].business_metadata.description == "Surrogate key"
+        assert table.columns[1].business_metadata.description == ""
+
+    def test_a_malformed_notnull_tag_leaves_the_column_nullable(self):
+        runner = FakeRunner(tables=["t"], describes={"t": [_packed("c", "int", "Key @notnull=true")]})
+        column = CustomConnector(runner=runner).discover_metadata(_config()).tables[0].columns[0]
+        assert column.nullable is True
+        # Left in the description verbatim, which is the author's only feedback channel.
+        assert column.business_metadata.description == "Key @notnull=true"
+
+    def test_notnull_is_independent_of_the_primary_key(self):
+        """Same channel, different meanings: ``@pk`` drives the ontology's NOT_NULL, while
+        ``@notnull`` drives only what the review UI renders."""
+        runner = FakeRunner(
+            tables=["t"],
+            describes={
+                "t": [
+                    _packed("a", "int", "@pk"),
+                    _packed("b", "int", "@notnull"),
+                    _packed("c", "int", "@pk @notnull"),
+                ]
+            },
+        )
+        table = CustomConnector(runner=runner).discover_metadata(_config()).tables[0]
+        assert [c.nullable for c in table.columns] == [True, False, False]
+        assert table.primary_key.columns == ["a", "c"]
+
+
+class TestDatabricksReusesThisConnector:
+    """``CustomConnector`` keys on the derived Athena catalog name and the database name
+    rather than on the sub-type, so one registry entry is the whole of the Databricks
+    sub-type's discovery wiring.
+    """
+
+    def test_the_sub_type_maps_to_the_same_connector(self):
+        assert CONNECTOR_REGISTRY["DATABRICKS_SQL_WAREHOUSE"] is CustomConnector
+        assert isinstance(get_connector("DATABRICKS_SQL_WAREHOUSE"), CustomConnector)
+
+    def test_the_missing_config_error_names_the_sub_type_being_scanned(self):
+        """One connector serves two sub-types, so the message reads the sub-type off the
+        record rather than hardcoding either."""
+        runner = FakeRunner()
+        with pytest.raises(ValueError, match="DATABRICKS_SQL_WAREHOUSE"):
+            CustomConnector(runner=runner).discover_metadata(
+                _config(database_name="", source_sub_type="DATABRICKS_SQL_WAREHOUSE")
+            )
+        with pytest.raises(ValueError, match="CUSTOM_CONNECTOR"):
+            CustomConnector(runner=runner).discover_metadata(
+                _config(database_name="", source_sub_type="CUSTOM_CONNECTOR")
+            )
+
+    def test_a_row_with_no_sub_type_still_gets_a_usable_message(self):
+        runner = FakeRunner()
+        with pytest.raises(ValueError, match="connector-backed"):
+            CustomConnector(runner=runner).discover_metadata(_config(database_name=""))
+
+
+class TestTheScanTimeConnectorPrerequisite:
+    """Registration fails the create when no connector is deployed, so a source can only
+    fail here if the connector — or, for a managed one, its configuration parameter — went
+    away afterwards.
+
+    What is asserted is that the failure NAMES the missing thing, and that the message
+    differs by sub-type because the likely cause does: a customer-deployed connector is
+    most often a missing resource policy, while a COA-operated one is not theirs to fix.
+    """
+
+    def test_a_databricks_source_is_told_the_fault_is_operator_side(self):
+        runner = FakeRunner(databases_error=_statement_error())
+        result = CustomConnector(runner=runner).test_connection(_config(source_sub_type="DATABRICKS_SQL_WAREHOUSE"))
+        assert result.success is False
+        assert "operator-side" in result.message
+        # The two things that can actually be gone, named.
+        assert "connector configuration parameter is missing" in result.message
+        assert "stack is deployed" in result.message
+        # And NOT the advice that belongs to the other sub-type: a resource policy on a
+        # Lambda this deployment owns is not the reader's to change.
+        assert "resource policy" not in result.message
+
+    def test_a_custom_connector_source_still_gets_the_invoke_grant_advice(self):
+        """Unchanged for the sub-type it was written for — the message is chosen, not
+        replaced."""
+        runner = FakeRunner(databases_error=_statement_error())
+        result = CustomConnector(runner=runner).test_connection(_config(source_sub_type="CUSTOM_CONNECTOR"))
+        assert result.success is False
+        assert "resource policy" in result.message
+        assert "operator-side" not in result.message
+
+    def test_a_row_with_no_sub_type_keeps_the_original_advice(self):
+        """The absent-sub-type row shape again: it must keep the behaviour it had rather
+        than falling into the newer branch."""
+        runner = FakeRunner(databases_error=_statement_error())
+        result = CustomConnector(runner=runner).test_connection(_config())
+        assert "resource policy" in result.message
+
+    def test_the_underlying_athena_error_is_still_reported(self):
+        """The hint replaces neither the catalog name nor Athena's own words — an operator
+        needs both to tell "function gone" from "function threw"."""
+        runner = FakeRunner(databases_error=_statement_error())
+        result = CustomConnector(runner=runner).test_connection(_config(source_sub_type="DATABRICKS_SQL_WAREHOUSE"))
+        assert _CATALOG in result.message
+        assert "connector exploded" in result.message
+        assert [c.check for c in result.checks] == ["catalog_access"]

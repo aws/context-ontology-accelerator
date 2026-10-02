@@ -128,10 +128,27 @@ class TestCheckSourceTableExists:
     can't-tell → fall through to today's soft warning.
     """
 
-    def _lookup(self, *, available: bool = True, tables: set[str] | None = None) -> MagicMock:
+    def _lookup(
+        self,
+        *,
+        available: bool = True,
+        tables: set[str] | None = None,
+        approved_tables: set[str] | None = None,
+    ) -> MagicMock:
         lookup = MagicMock()
         lookup.catalog_available.return_value = available
-        lookup.known_tables.return_value = tables if tables is not None else set()
+        known = {table.lower() for table in (tables or set())}
+        approved = known if approved_tables is None else {table.lower() for table in approved_tables}
+        lookup.known_tables.return_value = known
+
+        def table_exists(_data_source_id: str, table_name: str) -> bool:
+            requested = table_name.lower()
+            if "." in requested:
+                return requested in approved
+            candidates = {name for name in approved if name == requested or name.rsplit(".", 1)[-1] == requested}
+            return len(candidates) == 1
+
+        lookup.table_exists.side_effect = table_exists
         return lookup
 
     def _patch_build(self, lookup):
@@ -201,6 +218,49 @@ class TestCheckSourceTableExists:
         monkeypatch.delenv(PERMISSIVE_ENV, raising=False)
         with self._patch_build(self._lookup(tables={"public.orders"})):
             assert check_source_table_exists("ns-1", "ds-1", "public.orders") is None
+
+    def test_unapproved_table_is_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv(PERMISSIVE_ENV, raising=False)
+        lookup = self._lookup(tables={"sales.orders"}, approved_tables=set())
+        with self._patch_build(lookup):
+            error = check_source_table_exists("ns-1", "ds-1", "sales.orders")
+        assert error is not None
+        assert "sales.orders" in error
+
+    def test_qualified_name_does_not_match_another_database(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv(PERMISSIVE_ENV, raising=False)
+        with self._patch_build(self._lookup(tables={"archive.orders"})):
+            error = check_source_table_exists("ns-1", "ds-1", "sales.orders")
+        assert error is not None
+        assert "sales.orders" in error
+
+    def test_ambiguous_bare_name_is_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv(PERMISSIVE_ENV, raising=False)
+        lookup = self._lookup(tables={"sales.orders", "archive.orders"})
+        with self._patch_build(lookup):
+            error = check_source_table_exists("ns-1", "ds-1", "orders")
+        assert error is not None
+        assert "orders" in error
+
+    @pytest.mark.parametrize("declared", ["orders", "sales.orders"])
+    def test_legacy_bare_name_does_not_override_qualified_ambiguity(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        declared: str,
+    ) -> None:
+        monkeypatch.delenv(PERMISSIVE_ENV, raising=False)
+        lookup = self._lookup(tables={"orders", "archive.orders"})
+        with self._patch_build(lookup):
+            error = check_source_table_exists("ns-1", "ds-1", declared)
+        assert error is not None
+        assert declared in error
+
+    def test_asset_read_failure_after_name_lookup_returns_503(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv(PERMISSIVE_ENV, raising=False)
+        lookup = self._lookup(tables={"sales.orders"}, approved_tables=set())
+        lookup.catalog_available.side_effect = [True, False]
+        with self._patch_build(lookup), pytest.raises(SourceValidationUnavailableError):
+            check_source_table_exists("ns-1", "ds-1", "sales.orders")
 
     def test_lookup_build_error_fails_closed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(PERMISSIVE_ENV, raising=False)

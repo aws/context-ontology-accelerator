@@ -607,6 +607,8 @@ CONTROL_PLANE_ROUTES: list[tuple[str, str, str]] = [
     ("POST", "/namespaces/{namespaceId}/sources/upload-urls", "manageSource"),
     ("DELETE", "/namespaces/{namespaceId}/sources/{sourceId}", "manageSource"),
     ("POST", "/namespaces/{namespaceId}/sources/{sourceId}/rescan", "manageSource"),
+    ("PUT", "/namespaces/{namespaceId}/sources/{sourceId}/rescan-schedule", "manageSource"),
+    ("PUT", "/namespaces/{namespaceId}/sources/{sourceId}/event-rescan", "manageSource"),
     ("PUT", "/namespaces/{namespaceId}/sources/{sourceId}/metadata", "manageSource"),
     ("POST", "/namespaces/{namespaceId}/sources/{sourceId}/approve", "manageSource"),
     ("POST", "/namespaces/{namespaceId}/sources/{sourceId}/reject", "manageSource"),
@@ -701,6 +703,21 @@ class TestMapRequestToCedar:
 
         action, rtype, rid = _map_request_to_cedar("GET", "/unknown/route", {})
         assert (action, rtype, rid) == ("denyAll", "Namespace", "*")
+
+    @pytest.mark.parametrize("route", ["rescan-schedule", "event-rescan"])
+    def test_automated_rescan_triggers_are_mutating_source_writes(self, route):
+        """Unmapped, these fell through to denyAll: stewards were denied, and
+        because denyAll is not in _MUTATING_ACTIONS the namespace-status check
+        was skipped too, so a schedule could target an ARCHIVED namespace."""
+        from coa_control_plane.authorization.handler import _MUTATING_ACTIONS, _map_request_to_cedar
+
+        params = {"namespaceId": "ns-1", "sourceId": "src-1"}
+        mapped = _map_request_to_cedar("PUT", f"/namespaces/{{namespaceId}}/sources/{{sourceId}}/{route}", params)
+        manual = _map_request_to_cedar("POST", "/namespaces/{namespaceId}/sources/{sourceId}/rescan", params)
+
+        assert mapped == manual
+        assert mapped[0] == "manageSource"
+        assert mapped[0] in _MUTATING_ACTIONS
 
     def test_source_create_is_manage_not_edit_namespace(self):
         """Regression: source writes must map to a Cedar action that exists in

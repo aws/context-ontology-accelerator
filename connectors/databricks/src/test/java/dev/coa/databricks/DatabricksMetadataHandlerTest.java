@@ -12,7 +12,7 @@ import com.amazonaws.athena.connector.lambda.metadata.ListTablesRequest;
 import com.amazonaws.athena.connector.lambda.metadata.ListTablesResponse;
 import com.amazonaws.athena.connector.lambda.security.FederatedIdentity;
 import dev.coa.databricks.config.ConnectionConfig;
-import dev.coa.databricks.config.ConnectionConfigProvider;
+import dev.coa.databricks.config.ConnectionConfigProviders;
 import dev.coa.databricks.config.CredentialSource;
 import org.junit.jupiter.api.Test;
 
@@ -50,55 +50,25 @@ class DatabricksMetadataHandlerTest
 {
     private static final FederatedIdentity IDENTITY = new FederatedIdentity(
             "arn:aws:iam::123456789012:role/query", "123456789012",
-            Collections.emptyMap(), Collections.emptyList());
+            Collections.emptyMap(), Collections.emptyList(), Collections.emptyMap());
 
     private static final String SECRET =
             "arn:aws:secretsmanager:us-east-1:111122223333:secret:dbx-AbCdEf";
 
-    /** A provider mapping Athena catalog names to distinct endpoints, as a multiplexed one would. */
-    private static final class MultiplexedProvider implements ConnectionConfigProvider
+    /**
+     * A credential reader that returns a usable token. Every test here either stubs the connections or
+     * fails before one opens, so nothing reads it; the handler takes it because production pairs it with
+     * the provider in one place.
+     */
+    private static CredentialSource credentials()
     {
-        private final Map<String, ConnectionConfig> byCatalog = new HashMap<>();
-        private final List<String> asked = new ArrayList<>();
-
-        MultiplexedProvider add(String athenaCatalog, String ucCatalog, String schema)
-        {
-            byCatalog.put(athenaCatalog, ConnectionConfig.builder()
-                    .workspaceHostname("dbc-a1b2345c-d6e7.cloud.databricks.com")
-                    .httpPath("/sql/1.0/warehouses/a1b234c567d8e9fa")
-                    .catalog(ucCatalog)
-                    .schema(schema)
-                    .credentialSecretArn(SECRET)
-                    .build());
-            return this;
-        }
-
-        /** The same, with {@code DATABRICKS_SCHEMA} unset: the enumerate-then-scope mode. */
-        MultiplexedProvider addUnpinned(String athenaCatalog, String ucCatalog)
-        {
-            return add(athenaCatalog, ucCatalog, null);
-        }
-
-        @Override
-        public ConnectionConfig configFor(String athenaCatalogName)
-        {
-            asked.add(athenaCatalogName);
-            if (athenaCatalogName == null) {
-                // The cold-start call, which has no request context. A multiplexed provider has to tolerate
-                // it, and any endpoint is enough for the constructor's log line.
-                return byCatalog.values().iterator().next();
-            }
-            ConnectionConfig config = byCatalog.get(athenaCatalogName);
-            if (config == null) {
-                throw new IllegalArgumentException("no endpoint for catalog " + athenaCatalogName);
-            }
-            return config;
-        }
+        return new CredentialSource(config -> "{\"token\": \"dapi-example\"}");
     }
 
     private static DatabricksMetadataHandler handlerOver(MultiplexedProvider provider)
     {
-        return new DatabricksMetadataHandler(Collections.emptyMap(), provider);
+        return new DatabricksMetadataHandler(Collections.emptyMap(), provider, credentials(), null,
+                CredentialSource.DEFAULT_TTL_MILLIS);
     }
 
     private static DatabricksMetadataHandler handlerOver(MultiplexedProvider provider, FakeJdbc jdbc)
@@ -110,7 +80,7 @@ class DatabricksMetadataHandlerTest
     private static DatabricksMetadataHandler handlerOver(MultiplexedProvider provider, FakeJdbc jdbc,
                                                          long schemaCacheTtlMillis)
     {
-        return new DatabricksMetadataHandler(Collections.emptyMap(), provider,
+        return new DatabricksMetadataHandler(Collections.emptyMap(), provider, credentials(),
                 config -> jdbc::connection, schemaCacheTtlMillis);
     }
 
@@ -139,7 +109,7 @@ class DatabricksMetadataHandlerTest
         }
         if (sql.startsWith("SELECT column_name, full_data_type")) {
             return Collections.singletonList(
-                    row("column_name", "id", "full_data_type", "bigint", "comment", null));
+                    row("column_name", "id", "full_data_type", "bigint", "is_nullable", "YES", "comment", null));
         }
         // The two constraint reads. A table with no declared keys is the common case.
         return Collections.emptyList();
@@ -446,6 +416,63 @@ class DatabricksMetadataHandlerTest
         getTable(handler, "warehouse_a", "sales", "orders");
 
         assertEquals(jdbc.connectionsOpened(), jdbc.connectionsClosed());
+    }
+
+    @Test
+    void anEnvironmentModeDeploymentServesItsOnePinnedSchemaThroughTheSamePath()
+    {
+        // Every other test in this file goes through the multiplexed fake, so without this the real
+        // EnvironmentConnectionConfigProvider is never wired into a handler anywhere in the Java suite —
+        // and a deployed single-endpoint stack pulling a newer jar has to behave no differently.
+        Map<String, String> stageOne = new HashMap<>();
+        stageOne.put(ConnectionConfig.WORKSPACE_HOSTNAME_VAR, "dbc-a1b2345c-d6e7.cloud.databricks.com");
+        stageOne.put(ConnectionConfig.HTTP_PATH_VAR, "/sql/1.0/warehouses/a1b234c567d8e9fa");
+        stageOne.put(ConnectionConfig.CATALOG_VAR, "main");
+        stageOne.put(ConnectionConfig.SCHEMA_VAR, "sales");
+        stageOne.put(ConnectionConfig.CREDENTIAL_SECRET_ARN_VAR, SECRET);
+
+        FakeJdbc jdbc = fakeWarehouse();
+        // fromEnvironment rather than the provider directly: that factory is what a real cold start calls,
+        // so this covers the mode defaulting to `environment` and the mutual-exclusion check too.
+        DatabricksMetadataHandler handler = new DatabricksMetadataHandler(stageOne,
+                ConnectionConfigProviders.fromEnvironment(stageOne).provider(), credentials(),
+                config -> jdbc::connection, CredentialSource.DEFAULT_TTL_MILLIS);
+
+        // Any Athena catalog name resolves the one endpoint, which is this mode's whole difference — and
+        // the pinned schema is the answer without asking the warehouse.
+        assertEquals(Collections.singletonList("sales"),
+                new ArrayList<>(listSchemas(handler, "some_registered_catalog").getSchemas()));
+        assertTrue(jdbc.statementsContaining(".schemata").isEmpty(),
+                "a pinned connector does not enumerate");
+        assertEquals("orders",
+                getTable(handler, "some_registered_catalog", "sales", "orders")
+                        .getTableName().getTableName());
+        assertEquals(Arrays.asList("main", "sales", "orders"),
+                jdbc.statementsContaining("SELECT column_name, full_data_type").get(0).parameters());
+    }
+
+    @Test
+    void anEnvironmentModeDeploymentStillRefusesASchemaOutsideItsPin()
+    {
+        Map<String, String> stageOne = new HashMap<>();
+        stageOne.put(ConnectionConfig.WORKSPACE_HOSTNAME_VAR, "dbc-a1b2345c-d6e7.cloud.databricks.com");
+        stageOne.put(ConnectionConfig.HTTP_PATH_VAR, "/sql/1.0/warehouses/a1b234c567d8e9fa");
+        stageOne.put(ConnectionConfig.CATALOG_VAR, "main");
+        stageOne.put(ConnectionConfig.SCHEMA_VAR, "sales");
+        stageOne.put(ConnectionConfig.CREDENTIAL_SECRET_ARN_VAR, SECRET);
+
+        FakeJdbc jdbc = fakeWarehouse();
+        DatabricksMetadataHandler handler = new DatabricksMetadataHandler(stageOne,
+                ConnectionConfigProviders.fromEnvironment(stageOne).provider(), credentials(),
+                config -> jdbc::connection, CredentialSource.DEFAULT_TTL_MILLIS);
+
+        IllegalArgumentException refused = assertThrows(IllegalArgumentException.class,
+                () -> listTables(handler, "some_registered_catalog", "finance"));
+
+        // Set by the deployer, so naming it is the actionable part — unlike the managed case, where the
+        // variable is absent from the deployment by construction.
+        assertTrue(refused.getMessage().contains(ConnectionConfig.SCHEMA_VAR), refused.getMessage());
+        assertEquals(0, jdbc.connectionsOpened());
     }
 
     // ── the gate itself, without a handler around it ─────────────────────────

@@ -6,16 +6,19 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 from coa_metrics.api.import_osi import _osi_metric_to_definition, handler
 from coa_metrics.osi_parser import (
+    MAX_SQL_EXPRESSION_LENGTH,
     OsiAiContext,
     OsiCustomExtension,
     OsiDialectExpression,
     OsiDocument,
     OsiMetric,
+    parse_osi_yaml,
 )
 from coa_metrics.source_status import PERMISSIVE_ENV
 
@@ -77,6 +80,21 @@ def _make_event(content: str, namespace: str = "test-ns") -> dict:
         "body": json.dumps({"content": content}),
         "requestContext": {"authorizer": {"email": "test@example.com"}},
     }
+
+
+def test_shipped_sample_parses_and_converts_every_metric() -> None:
+    """The documented sample must be executable, not merely valid YAML."""
+    sample_path = Path(__file__).parents[2] / "examples" / "sample-osi-import.yaml"
+    result = parse_osi_yaml(sample_path.read_text())
+
+    assert result.success, result.errors
+    assert result.document is not None
+    definitions = [
+        _osi_metric_to_definition(metric, result.document, "sample-test") for metric in result.document.metrics
+    ]
+    assert len(definitions) == 3
+    assert {definition.data_source_id for definition in definitions} == {"ds-warehouse-prod"}
+    assert {definition.source_table for definition in definitions} == {"public.orders", "public.customers"}
 
 
 # ── Handler Tests ───────────────────────────────────────────────────────
@@ -166,6 +184,25 @@ class TestImportOsiHandler:
         assert response["statusCode"] == 400
         body = json.loads(response["body"])
         assert "parse errors" in body["message"]
+
+    def test_oversized_expression_returns_400_before_import(self) -> None:
+        expression = "SELECT 1 FROM orders WHERE " + ("x" * MAX_SQL_EXPRESSION_LENGTH)
+        content = f"""\
+osi_spec_version: "1.0"
+metrics:
+  - name: oversized
+    description: "oversized expression"
+    expression:
+      dialects:
+        - dialect: ANSI_SQL
+          expression: "{expression}"
+"""
+
+        response = handler(_make_event(content), None)
+
+        assert response["statusCode"] == 400
+        body = json.loads(response["body"])
+        assert f"at most {MAX_SQL_EXPRESSION_LENGTH} characters" in " ".join(body["errors"])
 
     @patch("coa_metrics.api.import_osi._get_lookup")
     def test_unresolved_dataset_returns_400(self, mock_lookup) -> None:
@@ -261,6 +298,51 @@ class TestOsiMetricToDefinition:
 
         assert result.expression_dialects[0].dialect == "bigquery"
 
+    def test_sqlglot_supported_external_dialect_uses_its_real_parser(self) -> None:
+        """Lenient OSI dialect preservation must not imply generic SQL parsing.
+
+        TSQL is outside COA's internal enum but is understood by sqlglot. Its
+        SELECT TOP/bracket syntax is validated in TSQL while the explicit TRINO
+        variant is the expression Tier 1 executes.
+        """
+        osi_metric = OsiMetric(
+            name="tsql-metric",
+            description="external dialect",
+            expression=[
+                OsiDialectExpression(
+                    dialect="TSQL",
+                    expression="SELECT TOP 10 [value] FROM [orders]",
+                ),
+                OsiDialectExpression(
+                    dialect="TRINO",
+                    expression="SELECT value FROM orders LIMIT 10",
+                ),
+            ],
+            custom_extensions=OsiCustomExtension(data_source_id="ds-1", source_table="orders"),
+        )
+        doc = OsiDocument(metrics=[osi_metric])
+
+        result = _osi_metric_to_definition(osi_metric, doc, "user")
+
+        assert [d.dialect for d in result.expression_dialects] == ["tsql", "TRINO"]
+
+    def test_external_dialect_only_expression_rejected_when_tier1_cannot_execute_it(self) -> None:
+        osi_metric = OsiMetric(
+            name="tsql-only-metric",
+            description="external dialect without a Trino execution variant",
+            expression=[
+                OsiDialectExpression(
+                    dialect="TSQL",
+                    expression="SELECT TOP 10 [value] FROM [orders]",
+                )
+            ],
+            custom_extensions=OsiCustomExtension(data_source_id="ds-1", source_table="orders"),
+        )
+        doc = OsiDocument(metrics=[osi_metric])
+
+        with pytest.raises(ValueError, match="Tier 1.*TRINO"):
+            _osi_metric_to_definition(osi_metric, doc, "user")
+
     def test_raises_without_data_source_id(self) -> None:
         osi_metric = OsiMetric(
             name="bad",
@@ -344,12 +426,11 @@ class TestAiContextMapping:
         assert result.ai_context.instructions == instructions
 
 
-# ── SQL validation on import: soft/hard split (#161) ────────────────────
+# ── SQL validation on import (#617 / #1050) ─────────────────────────────
 
 
-class TestImportSqlValidationSoftHardSplit:
-    """#161: only DML/DDL is rejected per-metric at import time; a fragment
-    imports successfully (its soft warning is surfaced by validation)."""
+class TestImportSqlValidation:
+    """All metric-persistence paths enforce the serve firewall's SELECT shape."""
 
     def _doc_for(self, expression: str) -> tuple[OsiMetric, OsiDocument]:
         osi_metric = OsiMetric(
@@ -360,16 +441,27 @@ class TestImportSqlValidationSoftHardSplit:
         )
         return osi_metric, OsiDocument(metrics=[osi_metric])
 
-    def test_fragment_expression_imports(self) -> None:
-        """A fragment no longer aborts the import (was ValueError)."""
+    def test_fragment_expression_raises(self) -> None:
         osi_metric, doc = self._doc_for("COUNT(*)")
-        result = _osi_metric_to_definition(osi_metric, doc, "user")
-        assert result.expression_dialects[0].expression == "COUNT(*)"
+        with pytest.raises(ValueError, match="full SELECT statement"):
+            _osi_metric_to_definition(osi_metric, doc, "user")
 
-    def test_unparseable_expression_imports(self) -> None:
+    def test_unparseable_expression_raises(self) -> None:
         osi_metric, doc = self._doc_for("SELECT FROM WHERE (((")
-        result = _osi_metric_to_definition(osi_metric, doc, "user")
-        assert result.expression_dialects[0].expression == "SELECT FROM WHERE ((("
+        with pytest.raises(ValueError, match="could not be parsed"):
+            _osi_metric_to_definition(osi_metric, doc, "user")
+
+    @pytest.mark.parametrize(
+        ("sql", "message"),
+        [
+            ("SELECT *", "without a FROM"),
+            ("SELECT pg_read_file('/etc/passwd')", "forbidden function"),
+        ],
+    )
+    def test_non_executable_or_forbidden_select_raises(self, sql: str, message: str) -> None:
+        osi_metric, doc = self._doc_for(sql)
+        with pytest.raises(ValueError, match=message):
+            _osi_metric_to_definition(osi_metric, doc, "user")
 
     @pytest.mark.parametrize(
         "sql",
@@ -382,6 +474,11 @@ class TestImportSqlValidationSoftHardSplit:
     def test_data_modifying_expression_raises(self, sql: str) -> None:
         osi_metric, doc = self._doc_for(sql)
         with pytest.raises(ValueError, match="data-modifying"):
+            _osi_metric_to_definition(osi_metric, doc, "user")
+
+    def test_oversized_expression_raises_before_sql_analysis(self) -> None:
+        osi_metric, doc = self._doc_for("SELECT 1 FROM orders WHERE " + ("x" * MAX_SQL_EXPRESSION_LENGTH))
+        with pytest.raises(ValueError, match=f"at most {MAX_SQL_EXPRESSION_LENGTH} characters"):
             _osi_metric_to_definition(osi_metric, doc, "user")
 
 
@@ -631,3 +728,85 @@ class TestGetLookupFailClosed:
             lookup = _get_lookup("ns-permissive")
         assert isinstance(lookup, _PermissiveLookup)
         assert lookup.data_source_exists("anything") is True
+
+
+# ── Vendor Block Shape Warnings ─────────────────────────────────────────
+
+OSI_LEGACY_X_COA_SINGLE_DATASET = """\
+osi_spec_version: "1.0"
+datasets:
+  - name: orders_db
+    data_source_id: ds-abc123
+metrics:
+  - name: total_revenue
+    description: "Revenue"
+    expression:
+      dialects:
+        - dialect: ANSI_SQL
+          expression: "SELECT SUM(amount) FROM orders"
+    x_coa:
+      data_source_id: ds-abc123
+      source_table: orders
+      unit: USD
+      ontology_concepts:
+        - Revenue
+"""
+
+
+class TestVendorBlockShapeWarnings:
+    """An ``x_coa:`` block is not OSI and nothing reads it. With a single dataset the
+    import still succeeds — data_source_id comes from the dataset and source_table
+    silently defaults to the metric name — but unit/return_type/time_dimension/
+    ontology_concepts are gone, so Check 6 has nothing to validate. The response must
+    say so rather than returning a clean 200.
+    """
+
+    @staticmethod
+    def _warnings(response: dict) -> list[str]:
+        return json.loads(response["body"]).get("warnings", [])
+
+    @patch("coa_metrics.api.import_osi._get_opensearch")
+    @patch("coa_metrics.api.import_osi._get_neptune")
+    @patch("coa_metrics.api.import_osi._get_lookup")
+    def test_x_coa_block_surfaces_parser_and_default_warnings(self, mock_lookup, mock_neptune, mock_opensearch) -> None:
+        lookup = MagicMock()
+        lookup.data_source_exists.return_value = True
+        mock_lookup.return_value = lookup
+        neptune = MagicMock()
+        neptune.get_metric.return_value = None
+        mock_neptune.return_value = neptune
+        mock_opensearch.return_value = MagicMock()
+
+        response = handler(_make_event(OSI_LEGACY_X_COA_SINGLE_DATASET), None)
+
+        assert response["statusCode"] == 200
+        body = json.loads(response["body"])
+        assert body["metricsCreated"] == 1  # still imports — warnings never block
+
+        warnings = self._warnings(response)
+        assert any("$.metrics[0].x_coa" in w and "custom_extensions" in w for w in warnings), warnings
+        assert any("no source_table in custom_extensions" in w and "'total_revenue'" in w for w in warnings), warnings
+
+        # And the metric that landed is the stripped one the warnings describe.
+        created = neptune.create_metric.call_args.args
+        metric_def = next(a for a in created if hasattr(a, "source_table"))
+        assert metric_def.source_table == "total_revenue"
+        assert metric_def.unit is None
+        assert metric_def.ontology_concepts == []
+
+    @patch("coa_metrics.api.import_osi._get_opensearch")
+    @patch("coa_metrics.api.import_osi._get_neptune")
+    @patch("coa_metrics.api.import_osi._get_lookup")
+    def test_spec_shape_import_has_no_shape_warnings(self, mock_lookup, mock_neptune, mock_opensearch) -> None:
+        lookup = MagicMock()
+        lookup.data_source_exists.return_value = True
+        mock_lookup.return_value = lookup
+        neptune = MagicMock()
+        neptune.get_metric.return_value = None
+        mock_neptune.return_value = neptune
+        mock_opensearch.return_value = MagicMock()
+
+        response = handler(_make_event(VALID_OSI_CONTENT), None)
+
+        assert response["statusCode"] == 200
+        assert not any("not part of OSI" in w or "no source_table" in w for w in self._warnings(response))

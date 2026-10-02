@@ -34,6 +34,10 @@ def env_vars(monkeypatch):
     monkeypatch.setenv("NAMESPACES_TABLE", "test-namespaces")
     monkeypatch.setenv("AWS_REGION", "us-east-1")
     monkeypatch.setenv("ALLOWED_ORIGIN", "*")
+    # This response publishes the sts:ExternalId a customer pastes into a trust policy, and
+    # its derivation refuses to default the prefix rather than publish another deployment's
+    # value. CDK sets it on this Lambda.
+    monkeypatch.setenv("RESOURCE_PREFIX", "coa-dev-")
 
 
 @pytest.fixture(autouse=True)

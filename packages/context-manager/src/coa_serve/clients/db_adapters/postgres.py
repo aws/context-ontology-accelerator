@@ -95,6 +95,14 @@ class PostgresAdapter(EngineAdapter):
             port=creds.port,
             database=creds.database,
         )
+        server_settings = {"search_path": creds.schema}
+        if self.engine_type == "POSTGRESQL":
+            # Defense in depth beyond the SQL firewall's finite function
+            # denylist. PostgreSQL enforces this default for every transaction
+            # opened on the pooled connection, including writes hidden inside
+            # SQL or user-defined functions. Redshift uses its own transaction
+            # syntax and retains the firewall + least-privilege credential gate.
+            server_settings["default_transaction_read_only"] = "on"
         return create_async_engine(
             url,
             pool_size=_POOL_SIZE,
@@ -120,7 +128,7 @@ class PostgresAdapter(EngineAdapter):
                 # can't hang the connect; pool_timeout only bounds waiting for a
                 # free pooled slot, not the underlying connect.
                 "timeout": _CONNECT_TIMEOUT_S,
-                "server_settings": {"search_path": creds.schema},
+                "server_settings": server_settings,
             },
         )
 

@@ -71,7 +71,7 @@ class TestBaselineLexicalRetrieverInit:
             patch("graphrag_toolkit.lexical_graph.storage.VectorStoreFactory") as mock_vsf,
             patch("graphrag_toolkit.lexical_graph.LexicalGraphQueryEngine"),
         ):
-            retriever._get_engine("test-namespace", DEFAULT_SPEC)
+            retriever._get_engine("550e8400-e29b-41d4-a716-446655440000", DEFAULT_SPEC)
 
             mock_gsf.for_graph_store.assert_called_once_with("neptune-graph://g-mytest")
             # index_names must include "topic": TopicBeamSearch seeds from
@@ -100,8 +100,8 @@ class TestBaselineLexicalRetrieverInit:
             patch("graphrag_toolkit.lexical_graph.storage.VectorStoreFactory"),
             patch("graphrag_toolkit.lexical_graph.LexicalGraphQueryEngine") as mock_engine,
         ):
-            engine1 = retriever._get_engine("same-namespace", DEFAULT_SPEC)
-            engine2 = retriever._get_engine("same-namespace", DEFAULT_SPEC)
+            engine1 = retriever._get_engine("550e8400-e29b-41d4-a716-446655440000", DEFAULT_SPEC)
+            engine2 = retriever._get_engine("550e8400-e29b-41d4-a716-446655440000", DEFAULT_SPEC)
 
             assert engine1 is engine2
             mock_engine.for_traversal_based_search.assert_called_once()
@@ -156,7 +156,7 @@ class TestBaselineLexicalRetrieverRetrieve:
         }
 
         with patch.object(retriever, "_retrieve_sync", return_value=[mock_node]):
-            result = await retriever.retrieve("What is Apple revenue?", "test-ns")
+            result = await retriever.retrieve("What is Apple revenue?", "550e8400-e29b-41d4-a716-446655440000")
 
         assert isinstance(result, BaselineResult)
         assert len(result.chunks) == 1
@@ -189,7 +189,7 @@ class TestBaselineLexicalRetrieverRetrieve:
             return []
 
         with patch.object(retriever, "_retrieve_sync", side_effect=slow_sync):
-            result = await retriever.retrieve("test query", "test-ns")
+            result = await retriever.retrieve("test query", "550e8400-e29b-41d4-a716-446655440000")
 
         # Degraded result: empty, no raise.
         assert isinstance(result, BaselineResult)
@@ -271,7 +271,7 @@ class TestBaselineLexicalRetrieverRetrieve:
             )
 
         with patch.object(retriever, "_retrieve_sync", side_effect=RuntimeError("connection failed")):
-            result = await retriever.retrieve("test query", "test-ns")
+            result = await retriever.retrieve("test query", "550e8400-e29b-41d4-a716-446655440000")
 
         assert len(result.chunks) == 0
         assert result.trace_steps[0]["status"] == "error"
@@ -472,8 +472,8 @@ class TestGetEngineTenantAndCaching:
             patch("graphrag_toolkit.lexical_graph.storage.VectorStoreFactory"),
             patch("graphrag_toolkit.lexical_graph.LexicalGraphQueryEngine") as mock_engine,
         ):
-            engine1 = retriever._get_engine("same-namespace", strategy)
-            engine2 = retriever._get_engine("same-namespace", strategy)
+            engine1 = retriever._get_engine("550e8400-e29b-41d4-a716-446655440000", strategy)
+            engine2 = retriever._get_engine("550e8400-e29b-41d4-a716-446655440000", strategy)
 
         assert engine1 is engine2
         mock_engine.for_traversal_based_search.assert_called_once()
@@ -499,11 +499,11 @@ class TestGetEngineTenantAndCaching:
                 "override-engine",
             ]
 
-            engine_default = retriever._get_engine("same-namespace", default_strategy)
-            engine_override = retriever._get_engine("same-namespace", override_strategy)
+            engine_default = retriever._get_engine("550e8400-e29b-41d4-a716-446655440000", default_strategy)
+            engine_override = retriever._get_engine("550e8400-e29b-41d4-a716-446655440000", override_strategy)
             # Re-request the default: must return the originally cached engine,
             # i.e. the override did not overwrite or collide with it.
-            engine_default_again = retriever._get_engine("same-namespace", default_strategy)
+            engine_default_again = retriever._get_engine("550e8400-e29b-41d4-a716-446655440000", default_strategy)
 
         assert engine_default == "default-engine"
         assert engine_override == "override-engine"
@@ -525,8 +525,8 @@ class TestGetEngineTenantAndCaching:
         ):
             mock_engine.for_traversal_based_search.side_effect = ["engine-a", "engine-b"]
 
-            engine_a = retriever._get_engine("namespace-a", strategy)
-            engine_b = retriever._get_engine("namespace-b", strategy)
+            engine_a = retriever._get_engine("aaaaaaaa-1111-4222-8333-444444444444", strategy)
+            engine_b = retriever._get_engine("bbbbbbbb-2222-4333-8444-555555555555", strategy)
 
         assert engine_a != engine_b
         assert mock_engine.for_traversal_based_search.call_count == 2
@@ -1028,14 +1028,14 @@ class TestKnowledgeRetrieverWithLexical:
         # A resolved strategy engages the lexical path (request- or deployment-driven).
         result = await retriever.resolve(
             "What is Apple revenue?",
-            "test-ns",
+            "550e8400-e29b-41d4-a716-446655440000",
             retriever_strategy=RetrieverStrategy.CHUNK_BASED_SEMANTIC,
         )
 
         # Lexical retriever was called with the resolved StrategySpec.
         mock_lexical.retrieve.assert_called_once_with(
             "What is Apple revenue?",
-            "test-ns",
+            "550e8400-e29b-41d4-a716-446655440000",
             strategy=STRATEGY_REGISTRY[RetrieverStrategy.CHUNK_BASED_SEMANTIC],
         )
         # Vector and graph were NOT called
@@ -1069,7 +1069,7 @@ class TestKnowledgeRetrieverWithLexical:
         )
 
         # No retriever_strategy → hand-rolled path even though lexical is present.
-        await retriever.resolve("test query", "test-ns", embedding=[0.1] * 1024)
+        await retriever.resolve("test query", "550e8400-e29b-41d4-a716-446655440000", embedding=[0.1] * 1024)
 
         mock_lexical.retrieve.assert_not_called()
         mock_vector.search.assert_called_once()
@@ -1091,7 +1091,7 @@ class TestKnowledgeRetrieverWithLexical:
             lexical_retriever=None,  # hand-rolled mode
         )
 
-        await retriever.resolve("test query", "test-ns", embedding=[0.1] * 1024)
+        await retriever.resolve("test query", "550e8400-e29b-41d4-a716-446655440000", embedding=[0.1] * 1024)
 
         # Vector and graph WERE called (hand-rolled path)
         mock_vector.search.assert_called_once()
@@ -1111,7 +1111,9 @@ class TestKnowledgeRetrieverWithLexical:
             lexical_retriever=mock_lexical,
         )
 
-        result = await retriever.resolve("test", "ns", retriever_strategy=RetrieverStrategy.CHUNK_BASED_SEMANTIC)
+        result = await retriever.resolve(
+            "test", "550e8400-e29b-41d4-a716-446655440000", retriever_strategy=RetrieverStrategy.CHUNK_BASED_SEMANTIC
+        )
 
         step_names = [s["step"] if isinstance(s, dict) else s.step for s in result.trace_steps]
         assert "lexical_baseline_retrieve" in step_names

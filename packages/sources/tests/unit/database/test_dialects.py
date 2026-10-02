@@ -23,16 +23,29 @@ from coa_sources.database.connectors.dialects import (
 
 
 class _Cursor:
-    """Mock DB-API cursor that returns canned rows based on the executed SQL."""
+    """Mock DB-API cursor that returns canned rows based on the executed SQL.
 
-    def __init__(self, responder):
+    ``describer`` is optional and only used by dialects that read results by
+    column name via ``cursor.description`` (e.g. Snowflake's SHOW-command
+    constraint discovery). When supplied, it maps ``sql.lower()`` to the list of
+    output column names, which is exposed as a DB-API ``description`` (7-tuples
+    per column, name first). When omitted, ``description`` stays ``None`` so
+    positional-row consumers are unaffected.
+    """
+
+    def __init__(self, responder, describer=None):
         self._responder = responder
+        self._describer = describer
         self.calls: list[tuple[str, tuple]] = []
         self._rows: list = []
+        self.description = None
 
     def execute(self, sql, params=()):
         self.calls.append((sql, params))
         self._rows = self._responder(sql.lower(), params)
+        if self._describer is not None:
+            names = self._describer(sql.lower())
+            self.description = [(n, None, None, None, None, None, None) for n in names] if names is not None else None
 
     def fetchall(self):
         return self._rows
@@ -42,8 +55,8 @@ class _Cursor:
 
 
 class _Conn:
-    def __init__(self, responder):
-        self.cursor_obj = _Cursor(responder)
+    def __init__(self, responder, describer=None):
+        self.cursor_obj = _Cursor(responder, describer)
 
     def cursor(self):
         return self.cursor_obj
@@ -264,6 +277,178 @@ class TestMySqlDialect:
         assert fk == {"orders": [("customer_id", "customers", "id")]}
         # MySQL has no constraint_column_usage view — must not be referenced.
         assert not any("constraint_column_usage" in s for s in captured)
+
+
+@pytest.mark.unit
+class TestSnowflakeDialect:
+    # Column headers as Snowflake actually returns them for these SHOW commands
+    # (confirmed against a live account, TPCDS_SF10TCL).
+    _PK_COLS = [
+        "created_on",
+        "database_name",
+        "schema_name",
+        "table_name",
+        "column_name",
+        "key_sequence",
+        "constraint_name",
+        "rely",
+        "comment",
+    ]
+    _FK_COLS = [
+        "created_on",
+        "pk_database_name",
+        "pk_schema_name",
+        "pk_table_name",
+        "pk_column_name",
+        "fk_database_name",
+        "fk_schema_name",
+        "fk_table_name",
+        "fk_column_name",
+        "key_sequence",
+        "update_rule",
+        "delete_rule",
+        "fk_name",
+        "pk_name",
+        "deferrability",
+        "rely",
+        "comment",
+    ]
+
+    def _describer(self, sql):
+        if "show primary keys" in sql:
+            return self._PK_COLS
+        if "show imported keys" in sql:
+            return self._FK_COLS
+        return None
+
+    def test_fetch_constraints_uses_show_commands_not_key_column_usage(self):
+        # Snowflake's INFORMATION_SCHEMA has no KEY_COLUMN_USAGE, so the inherited
+        # ANSI query raises and constraint discovery silently yields empty (#191).
+        # Constraints must come from SHOW PRIMARY KEYS / SHOW IMPORTED KEYS, read
+        # by column name. Uses a composite PK (CATALOG_RETURNS has a 2-column PK).
+        def responder(sql, p):
+            if "show primary keys" in sql:
+                return [
+                    ("2025", "DB", "TPCDS", "CATALOG_RETURNS", "CR_ITEM_SK", 1, "c", "true", ""),
+                    ("2025", "DB", "TPCDS", "CATALOG_RETURNS", "CR_ORDER_NUMBER", 2, "c", "true", ""),
+                ]
+            if "show imported keys" in sql:
+                return [
+                    (
+                        "2025",
+                        "DB",
+                        "TPCDS",
+                        "CALL_CENTER",
+                        "CC_CALL_CENTER_SK",
+                        "DB",
+                        "TPCDS",
+                        "CATALOG_RETURNS",
+                        "CR_CALL_CENTER_SK",
+                        1,
+                        "NO ACTION",
+                        "NO ACTION",
+                        "fk",
+                        "pk",
+                        "NOT DEFERRABLE",
+                        "true",
+                        "",
+                    ),
+                ]
+            return []
+
+        conn = _Conn(responder, self._describer)
+        pk, fk = SnowflakeDialect().fetch_constraints(conn, "TPCDS", ["CATALOG_RETURNS"])
+
+        assert pk == {"CATALOG_RETURNS": ["CR_ITEM_SK", "CR_ORDER_NUMBER"]}
+        assert fk == {"CATALOG_RETURNS": [("CR_CALL_CENTER_SK", "CALL_CENTER", "CC_CALL_CENTER_SK")]}
+        # Must use SHOW commands, never the non-existent ANSI view (#191).
+        assert any("show primary keys" in s.lower() for s, _ in conn.cursor_obj.calls)
+        assert any("show imported keys" in s.lower() for s, _ in conn.cursor_obj.calls)
+        assert all("key_column_usage" not in s.lower() for s, _ in conn.cursor_obj.calls)
+
+    def test_fetch_constraints_filters_to_requested_tables(self):
+        # SHOW ... IN SCHEMA returns every key in the schema; only the requested
+        # tables' constraints are kept.
+        def responder(sql, p):
+            if "show primary keys" in sql:
+                return [
+                    ("2025", "DB", "TPCDS", "CATALOG_RETURNS", "CR_ITEM_SK", 1, "c", "true", ""),
+                    ("2025", "DB", "TPCDS", "STORE_SALES", "SS_ITEM_SK", 1, "c", "true", ""),
+                ]
+            return []
+
+        conn = _Conn(responder, self._describer)
+        pk, fk = SnowflakeDialect().fetch_constraints(conn, "TPCDS", ["CATALOG_RETURNS"])
+
+        assert pk == {"CATALOG_RETURNS": ["CR_ITEM_SK"]}
+        assert "STORE_SALES" not in pk
+
+    def test_fetch_constraints_preserves_caller_casing_and_quotes_identifiers(self):
+        # SHOW output is uppercase, but the returned dict must be keyed by the
+        # caller's ORIGINAL casing (jdbc._discover_schema reads it back by the
+        # names it passed) — so a lowercase request yields lowercase keys. And the
+        # schema/database identifiers must be double-quoted (doubling to escape),
+        # so a name with special characters builds valid SQL rather than a
+        # malformed SHOW ... IN SCHEMA.
+        class _DbConn(_Conn):
+            database = 'my"db'  # embedded quote must be doubled when quoting
+
+        def responder(sql, p):
+            if "show primary keys" in sql:
+                return [
+                    ("2025", "DB", "odd schema", "CATALOG_RETURNS", "CR_ITEM_SK", 1, "c", "true", ""),
+                ]
+            return []
+
+        conn = _DbConn(responder, self._describer)
+        pk, fk = SnowflakeDialect().fetch_constraints(conn, "odd schema", ["catalog_returns"])
+
+        # Returned key matches the caller's lowercase input, not SHOW's uppercase.
+        assert pk == {"catalog_returns": ["CR_ITEM_SK"]}
+        # Schema and database are quoted, with the embedded quote doubled.
+        show_sql = next(s for s, _ in conn.cursor_obj.calls if "show primary keys" in s.lower())
+        assert '"my""db"."odd schema"' in show_sql
+
+    def test_fetch_constraints_empty_tables_no_query(self):
+        conn = _Conn(lambda sql, p: [], self._describer)
+        assert SnowflakeDialect().fetch_constraints(conn, "TPCDS", []) == ({}, {})
+        assert conn.cursor_obj.calls == []
+
+    def test_fetch_constraints_pk_failure_is_isolated_from_fk(self):
+        # Per-side best-effort: if PK discovery fails, FK discovery still runs
+        # (and vice versa), mirroring the swallow-and-continue contract.
+        def responder(sql, p):
+            if "show primary keys" in sql:
+                raise RuntimeError("boom")
+            if "show imported keys" in sql:
+                return [
+                    (
+                        "2025",
+                        "DB",
+                        "TPCDS",
+                        "CALL_CENTER",
+                        "CC_CALL_CENTER_SK",
+                        "DB",
+                        "TPCDS",
+                        "CATALOG_RETURNS",
+                        "CR_CALL_CENTER_SK",
+                        1,
+                        "NO ACTION",
+                        "NO ACTION",
+                        "fk",
+                        "pk",
+                        "NOT DEFERRABLE",
+                        "true",
+                        "",
+                    ),
+                ]
+            return []
+
+        conn = _Conn(responder, self._describer)
+        pk, fk = SnowflakeDialect().fetch_constraints(conn, "TPCDS", ["CATALOG_RETURNS"])
+
+        assert pk == {}
+        assert fk == {"CATALOG_RETURNS": [("CR_CALL_CENTER_SK", "CALL_CENTER", "CC_CALL_CENTER_SK")]}
 
 
 @pytest.mark.unit

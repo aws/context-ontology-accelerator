@@ -1,6 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import * as cdk from "aws-cdk-lib";
 import { buildContentSecurityPolicy } from "../../lib/constructs/public-ui-construct";
 import type { RuntimeConfig } from "@coa/shared";
 
@@ -89,8 +90,60 @@ describe("buildContentSecurityPolicy", () => {
     const csp = parse(buildContentSecurityPolicy(baseConfig));
     expect(csp["frame-ancestors"]).toEqual(["'none'"]);
     expect(csp["object-src"]).toEqual(["'none'"]);
-    expect(csp["base-uri"]).toEqual(["'self'"]);
-    expect(csp["default-src"]).toEqual(["'self'"]);
+    expect(csp["base-uri"]).toEqual(["'none'"]);
+    expect(csp["default-src"]).toEqual(["'none'"]);
+    expect(csp["form-action"]).toEqual(["'none'"]);
+    expect(csp["upgrade-insecure-requests"]).toEqual([]);
+  });
+
+  describe("cross-stack (token) API endpoint", () => {
+    // In the real app the API URL is `api.api.url`, a cross-stack token that
+    // `new URL()` cannot parse. That used to drop the API origin and fall back
+    // to a blanket `https:` in connect-src.
+    const API_URL = "https://kusm5j4qz5.execute-api.us-west-2.amazonaws.com/prod/";
+
+    /** Evaluate the few CFN intrinsics the CSP can contain, as CloudFormation would. */
+    function evaluate(node: unknown, params: Record<string, string>): string {
+      if (typeof node === "string") return node;
+      const n = node as Record<string, unknown>;
+      if ("Ref" in n) return params[n.Ref as string];
+      if ("Fn::Join" in n) {
+        const [sep, parts] = n["Fn::Join"] as [string, unknown[]];
+        return parts.map((p) => evaluate(p, params)).join(sep);
+      }
+      if ("Fn::Select" in n) {
+        const [idx, list] = n["Fn::Select"] as [number, unknown];
+        const l = list as Record<string, unknown>;
+        const [sep, src] = l["Fn::Split"] as [string, unknown];
+        return evaluate(src, params).split(sep)[idx];
+      }
+      throw new Error(`unexpected intrinsic ${JSON.stringify(node)}`);
+    }
+
+    function synthCsp(): string {
+      const stack = new cdk.Stack(new cdk.App(), "CspTokenTest");
+      const url = new cdk.CfnParameter(stack, "ApiUrl").valueAsString;
+      expect(cdk.Token.isUnresolved(url)).toBe(true);
+      const csp = buildContentSecurityPolicy({ ...baseConfig, apiEndpoint: url });
+      return evaluate(stack.resolve(csp), { ApiUrl: API_URL });
+    }
+
+    it("allowlists the real API origin instead of falling back to https:", () => {
+      const csp = parse(synthCsp());
+      expect(csp["connect-src"]).toContain(
+        "https://kusm5j4qz5.execute-api.us-west-2.amazonaws.com",
+      );
+      expect(csp["connect-src"]).not.toContain("https:");
+    });
+  });
+
+  it("declares every fetch directive the SPA relies on, since default-src is 'none'", () => {
+    // With default-src 'none', a missing directive silently blocks that
+    // resource type. Pin the set the SPA actually loads.
+    const csp = parse(buildContentSecurityPolicy(baseConfig));
+    for (const d of ["script-src", "style-src", "img-src", "font-src", "connect-src", "frame-src"]) {
+      expect(csp[d]).toEqual(expect.arrayContaining(["'self'"]));
+    }
   });
 
   it("scopes connect-src to the specific API/authority origins when known", () => {

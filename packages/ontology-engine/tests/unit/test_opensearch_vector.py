@@ -211,6 +211,71 @@ class TestDeletesAndHealth:
         assert store.delete_embeddings_for_ontology("ont-1") == 2
         client.delete_by_term.assert_called_once_with("idx-ns1", "ontology_id", "ont-1")
 
+    def test_delete_embeddings_for_entities_uses_one_terms_delete(self):
+        # Append-mode ingest: all incoming subjects in ONE delete_by_term call
+        # (list form -> a single `terms` query + one verify loop), deduped,
+        # empties skipped, AND-scoped by ontology_id so a shared IRI in a
+        # different ontology is not deleted.
+        client = MagicMock()
+        client.delete_by_term.return_value = 5
+        store = _store_with_client(client)
+        n = store.delete_embeddings_for_entities(
+            ["http://x/A", "http://x/B", "http://x/A", ""],
+            ontology_id="http://x/ont",
+            namespace="ns1",
+        )
+        assert n == 5
+        client.delete_by_term.assert_called_once_with(
+            "idx-ns1",
+            "entity_uri",
+            ["http://x/A", "http://x/B"],
+            and_filters=[{"term": {"ontology_id": "http://x/ont"}}],
+        )
+
+    def test_delete_embeddings_for_entities_empty_is_noop(self):
+        client = MagicMock()
+        store = _store_with_client(client)
+        assert store.delete_embeddings_for_entities([], ontology_id="http://x/ont", namespace="ns1") == 0
+        client.delete_by_term.assert_not_called()
+
+    def test_delete_embeddings_for_entities_without_ontology_id_is_noop(self):
+        """Cross-ontology safety: refuse to delete without an ontology scope.
+
+        A single namespace index carries embeddings for multiple ontologies
+        (foundational reloads, explicit-target merges), so an unscoped delete
+        would silently take a sibling ontology's embedding with it. If a
+        caller ever hands in an empty ``ontology_id``, delete nothing.
+        """
+        client = MagicMock()
+        store = _store_with_client(client)
+        assert store.delete_embeddings_for_entities(["http://x/A"], ontology_id="", namespace="ns1") == 0
+        client.delete_by_term.assert_not_called()
+
+    def test_delete_embeddings_for_entities_scopes_to_ontology_at_the_aoss_query(self):
+        """Regression: without the ``ontology_id`` clause, the AOSS query was
+        just ``terms entity_uri IN uris`` — a shared IRI in a different
+        ontology (foundational reload, explicit-target merge) got its
+        embedding deleted alongside the intended one and re-created under
+        the wrong owner. The fix wraps the terms clause in a ``bool.must``
+        with a ``term ontology_id`` filter. This test asserts the query
+        shape carrying that filter.
+        """
+        client = MagicMock()
+        client.delete_by_term.return_value = 3
+        store = _store_with_client(client)
+        store.delete_embeddings_for_entities(
+            ["http://x/Shared"],
+            ontology_id="http://x/ont-A",
+            namespace="ns1",
+        )
+        # The client received the terms clause AND the ontology_id term as a
+        # separate AND filter — not merged into the terms list, not implicit.
+        _args, kwargs = client.delete_by_term.call_args
+        assert kwargs.get("and_filters") == [{"term": {"ontology_id": "http://x/ont-A"}}], (
+            f"delete_by_term was called without the ontology_id AND-filter "
+            f"— a shared IRI would be deleted across ontologies. Got kwargs={kwargs}"
+        )
+
     def test_delete_index_delegates(self):
         client = MagicMock()
         client.delete_index.return_value = True

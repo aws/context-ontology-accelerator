@@ -5,8 +5,11 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from coa_metrics.osi_parser import (
+    MAX_SQL_EXPRESSION_LENGTH,
     OsiAiContext,
     OsiCustomExtension,
     OsiDataset,
@@ -239,6 +242,28 @@ metrics:
         result = parse_osi_yaml(yaml_content)
         assert not result.success
         assert any("dialect expression is required" in e.message for e in result.errors)
+
+    def test_parse_rejects_expression_above_smithy_limit(self) -> None:
+        expression = "SELECT 1 FROM orders WHERE " + ("x" * MAX_SQL_EXPRESSION_LENGTH)
+        yaml_content = f"""\
+osi_spec_version: "1.0"
+metrics:
+  - name: oversized
+    description: "oversized expression"
+    expression:
+      dialects:
+        - dialect: ANSI_SQL
+          expression: "{expression}"
+"""
+
+        result = parse_osi_yaml(yaml_content)
+
+        assert not result.success
+        assert any(
+            error.path == "$.metrics[0].expression.dialects[0].expression"
+            and f"at most {MAX_SQL_EXPRESSION_LENGTH} characters" in error.message
+            for error in result.errors
+        )
 
     def test_parse_empty_metrics_list(self) -> None:
         yaml_content = """\
@@ -522,3 +547,205 @@ metrics:
         assert "synonyms:" in yaml_str
         assert "- total sales" in yaml_str
         assert "instructions: Use for revenue. Do not use for forecasting." in yaml_str
+
+
+# ── Vendor Extension Shape ──────────────────────────────────────────────
+
+_EXAMPLES_DIR = Path(__file__).resolve().parents[2] / "examples"
+
+
+class TestShippedExamplesCarryCustomExtensions:
+    """The shipped example YAMLs must use the spec-defined ``custom_extensions`` shape.
+
+    They once carried COA metadata under ``x_coa:``, which nothing reads. Importing
+    them parsed cleanly but dropped unit, return_type, time_dimension and
+    ontology_concepts for every metric — and with no ontology_concepts, Check 6 had
+    nothing to validate and raised nothing. These tests pin the samples to the
+    shape the parser (and the exporter) actually speak.
+    """
+
+    @pytest.mark.parametrize("example", sorted(p.name for p in _EXAMPLES_DIR.glob("*.yaml")))
+    def test_every_metric_has_populated_extension(self, example: str) -> None:
+        result = parse_osi_yaml((_EXAMPLES_DIR / example).read_text())
+
+        assert result.success, [f"{e.path}: {e.message}" for e in result.errors]
+        assert result.warnings == [], [f"{w.path}: {w.message}" for w in result.warnings]
+        assert result.document is not None
+        assert result.document.metrics, f"{example} defines no metrics"
+
+        for metric in result.document.metrics:
+            ext = metric.custom_extensions
+            assert ext is not None, f"{example}: metric '{metric.name}' has no COA custom_extensions"
+            assert ext.data_source_id, f"{example}: metric '{metric.name}' lacks data_source_id"
+            assert ext.source_table, f"{example}: metric '{metric.name}' lacks source_table"
+
+    def test_examples_dir_is_not_empty(self) -> None:
+        # Guard against the parametrized test above silently passing with zero cases.
+        assert list(_EXAMPLES_DIR.glob("*.yaml"))
+
+    def test_sample_import_keeps_ontology_binding(self) -> None:
+        """The headline sample must round-trip the fields the x_coa bug dropped."""
+        result = parse_osi_yaml((_EXAMPLES_DIR / "sample-osi-import.yaml").read_text())
+        assert result.success
+        assert result.document is not None
+        by_name = {m.name: m for m in result.document.metrics}
+
+        revenue = by_name["total_revenue"].custom_extensions
+        assert revenue is not None
+        assert revenue.unit == "USD"
+        assert revenue.return_type == "decimal"
+        assert revenue.time_dimension == "month"
+        assert revenue.ontology_concepts == ["Revenue", "FinancialMetric"]
+
+
+class TestVendorPrefixedKeysWarn:
+    """``x_*`` keys are not OSI v1.0; the parser must say so instead of dropping them silently."""
+
+    _LEGACY_X_COA = """\
+osi_spec_version: "1.0"
+metrics:
+  - name: total_revenue
+    description: "Revenue"
+    expression:
+      dialects:
+        - dialect: ANSI_SQL
+          expression: "SUM(amount)"
+    x_coa:
+      data_source_id: ds-abc123
+      source_table: orders
+      unit: USD
+      ontology_concepts:
+        - Revenue
+"""
+
+    def test_x_coa_block_is_ignored_with_a_warning(self) -> None:
+        result = parse_osi_yaml(self._LEGACY_X_COA)
+
+        # Still a successful parse — warnings never block an import.
+        assert result.success
+        assert result.document is not None
+        assert result.document.metrics[0].custom_extensions is None
+
+        assert len(result.warnings) == 1
+        warning = result.warnings[0]
+        assert warning.path == "$.metrics[0].x_coa"
+        assert "not part of OSI v1.0" in warning.message
+        assert "custom_extensions" in warning.message
+        assert "vendor_name: COA" in warning.message
+
+    def test_any_x_prefixed_key_warns_case_insensitively(self) -> None:
+        content = self._LEGACY_X_COA.replace("x_coa:", "X_Other_Vendor:")
+        result = parse_osi_yaml(content)
+
+        assert result.success
+        assert [w.path for w in result.warnings] == ["$.metrics[0].X_Other_Vendor"]
+
+    def test_spec_shape_produces_no_warnings(self) -> None:
+        content = """\
+osi_spec_version: "1.0"
+metrics:
+  - name: total_revenue
+    description: "Revenue"
+    expression:
+      dialects:
+        - dialect: ANSI_SQL
+          expression: "SUM(amount)"
+    custom_extensions:
+      - vendor_name: COA
+        data:
+          data_source_id: ds-abc123
+          source_table: orders
+"""
+        result = parse_osi_yaml(content)
+        assert result.success
+        assert result.warnings == []
+
+    def test_warnings_survive_alongside_errors(self) -> None:
+        # A metric with an x_ key AND a missing description: the error wins (no
+        # document), but the warning is still reported so both get fixed at once.
+        content = self._LEGACY_X_COA.replace('    description: "Revenue"\n', "")
+        result = parse_osi_yaml(content)
+
+        assert not result.success
+        assert any(e.path == "$.metrics[0].description" for e in result.errors)
+        assert [w.path for w in result.warnings] == ["$.metrics[0].x_coa"]
+
+
+class TestExplicitNullsAreTreatedAsAbsent:
+    """YAML ``key: null`` must behave like a missing key — not crash, not become ``"None"``."""
+
+    _NULLS_EVERYWHERE = """\
+osi_spec_version: "1.0"
+datasets:
+  - name: orders
+    source: null
+    description: null
+    synonyms: null
+metrics:
+  - name: total_revenue
+    description: "Revenue"
+    expression:
+      dialects:
+        - dialect: ANSI_SQL
+          expression: "SUM(amount)"
+    ai_context:
+      synonyms: null
+      instructions: null
+      examples: null
+    custom_extensions:
+      - vendor_name: COA
+        data:
+          data_source_id: ds-abc123
+          source_table: orders
+          unit: null
+          return_type: null
+          time_dimension: null
+          ontology_concepts: null
+          defined_by: null
+          effective_from: null
+"""
+
+    def test_null_lists_do_not_crash_and_null_strings_are_empty(self) -> None:
+        result = parse_osi_yaml(self._NULLS_EVERYWHERE)
+
+        assert result.success, [f"{e.path}: {e.message}" for e in result.errors]
+        assert result.document is not None
+
+        ds = result.document.datasets[0]
+        assert ds.source == ""
+        assert ds.description == ""
+        assert ds.synonyms == []
+
+        metric = result.document.metrics[0]
+        assert metric.ai_context is not None
+        assert metric.ai_context.synonyms == []
+        assert metric.ai_context.instructions == ""
+        assert metric.ai_context.examples == []
+
+        ext = metric.custom_extensions
+        assert ext is not None
+        assert ext.data_source_id == "ds-abc123"
+        assert ext.source_table == "orders"
+        # Every nulled scalar is "" — never the string "None".
+        assert (ext.unit, ext.return_type, ext.time_dimension, ext.defined_by, ext.effective_from) == ("",) * 5
+        assert ext.ontology_concepts == []
+
+    def test_scalar_where_list_expected_is_wrapped_not_iterated(self) -> None:
+        content = self._NULLS_EVERYWHERE.replace("ontology_concepts: null", "ontology_concepts: Revenue")
+        result = parse_osi_yaml(content)
+        assert result.success
+        assert result.document is not None
+        ext = result.document.metrics[0].custom_extensions
+        assert ext is not None
+        assert ext.ontology_concepts == ["Revenue"]  # not ["R", "e", "v", ...]
+
+    def test_null_entries_inside_a_list_are_dropped(self) -> None:
+        content = self._NULLS_EVERYWHERE.replace(
+            "ontology_concepts: null", "ontology_concepts:\n            - Revenue\n            - null\n            - ''"
+        )
+        result = parse_osi_yaml(content)
+        assert result.success
+        assert result.document is not None
+        ext = result.document.metrics[0].custom_extensions
+        assert ext is not None
+        assert ext.ontology_concepts == ["Revenue"]

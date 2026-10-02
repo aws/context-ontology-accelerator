@@ -19,9 +19,11 @@ from __future__ import annotations
 import pytest
 from botocore.exceptions import ClientError, EndpointConnectionError
 from coa_sources.database.connectors.athena_catalog import (
+    SOURCE_ID_TAG_KEY,
     AthenaCatalogConflictError,
     AthenaCatalogError,
     build_catalog_parameters,
+    catalog_source_id,
     delete_lambda_catalog,
     derive_catalog_name,
     register_lambda_catalog,
@@ -47,6 +49,9 @@ class FakeAthena:
         self.delete_error: Exception | None = None
         self.created: list[dict] = []
         self.deleted: list[str] = []
+        self.tags: list[dict] = []
+        self.tags_error: Exception | None = None
+        self.tagged_arns: list[str] = []
 
     def get_data_catalog(self, Name):  # noqa: N803 - boto3 casing
         if self.get_error is not None:
@@ -66,6 +71,30 @@ class FakeAthena:
             raise self.delete_error
         self.deleted.append(Name)
         return {}
+
+    def list_tags_for_resource(self, ResourceARN):  # noqa: N803 - boto3 casing
+        if self.tags_error is not None:
+            raise self.tags_error
+        self.tagged_arns.append(ResourceARN)
+        return {"Tags": self.tags}
+
+
+class _RecordingAthena(FakeAthena):
+    """``FakeAthena`` whose ``GetDataCatalog`` shows what was created through it.
+
+    The base double fixes ``existing`` at construction, so it cannot show a second
+    ``register_lambda_catalog`` call the catalog the first one made — which is the whole
+    subject of a two-registration test.
+    """
+
+    def create_data_catalog(self, **kwargs):
+        result = super().create_data_catalog(**kwargs)
+        self.existing = {
+            "Name": kwargs["Name"],
+            "Type": kwargs["Type"],
+            "Parameters": kwargs["Parameters"],
+        }
+        return result
 
 
 class TestDeriveCatalogName:
@@ -238,3 +267,108 @@ class TestDeleteLambdaCatalog:
         client.delete_error = error
         with pytest.raises(AthenaCatalogError):
             delete_lambda_catalog(catalog_name="cat1", client=client)
+
+
+class FakeSts:
+    """Minimal STS double: the catalog ARN needs the deployment's account id, and
+    ``GetDataCatalog`` returns no tags at all — so reading them needs an ARN."""
+
+    def get_caller_identity(self):
+        return {"Account": "111122223333"}
+
+
+class TestRequireAbsent:
+    """``require_absent`` exists because the ownership check stops discriminating once
+    one connector Lambda serves every source of a sub-type.
+
+    That check compares catalog type plus the SET of handler ARNs. With a shared ARN it
+    is trivially true for every such catalog, so a real name collision comes back as
+    ``False`` ("a retried create") and the source silently shares another source's
+    catalog. Opt-in rather than a behaviour change, because ``CUSTOM_CONNECTOR``'s
+    per-source ARN still discriminates and its retried creates must keep converging.
+    """
+
+    def test_an_identical_registration_is_a_conflict_under_require_absent(self):
+        client = FakeAthena(existing={"Type": "LAMBDA", "Parameters": {"function": _META_ARN}})
+        with pytest.raises(AthenaCatalogConflictError):
+            register_lambda_catalog(
+                catalog_name="cat1", connector_function_arn=_META_ARN, client=client, require_absent=True
+            )
+        assert client.created == []
+
+    def test_the_same_registration_is_still_idempotent_without_it(self):
+        client = FakeAthena(existing={"Type": "LAMBDA", "Parameters": {"function": _META_ARN}})
+        assert register_lambda_catalog(catalog_name="cat1", connector_function_arn=_META_ARN, client=client) is False
+
+    def test_a_second_registration_on_the_same_derived_name_is_a_conflict(self, monkeypatch):
+        """Two Databricks registrations landing on one derived catalog name: the second has
+        to raise, not report a retried create.
+
+        Both share one connector Lambda, so the handler-ARN comparison says "equivalent" for
+        the catalog the first registration created. Without ``require_absent`` the second
+        source would come back ``False`` and quietly serve from the first source's catalog,
+        whose Parameter Store entry names the first source's credential.
+
+        Sequential rather than threaded on purpose: ``register_lambda_catalog`` is
+        get-then-create, so what a concurrent pair does is exactly what the second of two
+        calls does once the first has committed.
+        """
+        monkeypatch.setenv("RESOURCE_PREFIX", "coa-dev-")
+        client = _RecordingAthena()
+        name = derive_catalog_name("abc-123")
+        assert (
+            register_lambda_catalog(
+                catalog_name=name, connector_function_arn=_META_ARN, client=client, require_absent=True
+            )
+            is True
+        )
+        with pytest.raises(AthenaCatalogConflictError, match="already exists"):
+            register_lambda_catalog(
+                catalog_name=name, connector_function_arn=_META_ARN, client=client, require_absent=True
+            )
+        assert len(client.created) == 1
+
+
+class TestSourceIdTag:
+    """The tag is what delete verifies in place of the handler-ARN comparison."""
+
+    def test_the_catalog_is_tagged_with_the_source_id_when_one_is_given(self):
+        client = FakeAthena()
+        register_lambda_catalog(catalog_name="cat1", connector_function_arn=_META_ARN, client=client, source_id="src-1")
+        assert client.created[0]["Tags"] == [{"Key": SOURCE_ID_TAG_KEY, "Value": "src-1"}]
+
+    def test_no_tags_are_sent_when_no_source_id_is_given(self):
+        """CUSTOM_CONNECTOR's behaviour, unchanged: sending a ``Tags`` key it never sent
+        before would need ``athena:TagResource`` on a role that may not hold it yet, and
+        would fail every create on a partially deployed stack."""
+        client = FakeAthena()
+        register_lambda_catalog(catalog_name="cat1", connector_function_arn=_META_ARN, client=client)
+        assert "Tags" not in client.created[0]
+
+    def test_reads_the_tag_back_by_arn(self):
+        client = FakeAthena()
+        client.tags = [{"Key": "other", "Value": "x"}, {"Key": SOURCE_ID_TAG_KEY, "Value": "src-1"}]
+        assert catalog_source_id("cat1", client=client, sts_client=FakeSts()) == "src-1"
+        assert client.tagged_arns == ["arn:aws:athena:us-east-1:111122223333:datacatalog/cat1"]
+
+    def test_an_untagged_catalog_reads_as_none(self):
+        """``None`` and a DIFFERENT source id are not the same answer: no tag means the
+        catalog predates tagging (or came from the CUSTOM_CONNECTOR path, which does not
+        tag) and a delete should proceed."""
+        client = FakeAthena()
+        client.tags = [{"Key": "other", "Value": "x"}]
+        assert catalog_source_id("cat1", client=client, sts_client=FakeSts()) is None
+
+    def test_an_absent_catalog_reads_as_none(self):
+        client = FakeAthena()
+        client.tags_error = _client_error("ResourceNotFoundException", op="ListTagsForResource")
+        assert catalog_source_id("cat1", client=client, sts_client=FakeSts()) is None
+
+    def test_an_unreadable_tag_set_raises_rather_than_reading_as_untagged(self):
+        """Swallowing this into ``None`` would switch the verification off exactly when
+        it is least trustworthy — a missing permission or a throttle is not evidence that
+        the catalog is untagged."""
+        client = FakeAthena()
+        client.tags_error = _client_error("AccessDeniedException", op="ListTagsForResource")
+        with pytest.raises(AthenaCatalogError):
+            catalog_source_id("cat1", client=client, sts_client=FakeSts())

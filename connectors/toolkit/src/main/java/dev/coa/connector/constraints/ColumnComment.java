@@ -7,7 +7,6 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
-import java.util.regex.Pattern;
 
 /**
  * Builds the column-comment string that carries declared key constraints to COA.
@@ -25,6 +24,7 @@ import java.util.regex.Pattern;
  *
  * <pre>
  *   &#64;pk                             this column is a member of the table's primary key
+ *   &#64;notnull                        this column is declared NOT NULL
  *   &#64;fk(parent_table.parent_column) this column references that parent column
  * </pre>
  *
@@ -52,6 +52,13 @@ import java.util.regex.Pattern;
  *   <li><b>Duplicate targets collapse</b>, matching COA, which dedups by resolved target.</li>
  * </ul>
  *
+ * <h2>Nullability is the exception, not the rule</h2>
+ *
+ * {@code @notnull} tags a column the source declares {@code NOT NULL}, and there is deliberately no
+ * {@code @nullable} counterpart: absence has to keep meaning <i>unknown</i>, since every connector
+ * deployed before this tag existed emits none and COA defaults a column to nullable. Emit it only from
+ * something the source actually declared.
+ *
  * <p>A malformed tag is <b>left in the stored description verbatim</b> — COA's warning goes to its
  * own logs, which the connector author cannot see, so surviving text is the only feedback that
  * reaches them. This class validates and throws instead. For the same reason {@link #of(String)}
@@ -59,30 +66,27 @@ import java.util.regex.Pattern;
  * resembles one is safe: recognition is case-sensitive and needs a non-identifier character in
  * front, so {@code @PK}, {@code @pkey} and {@code bob@pk.example.com} are left alone.
  *
- * <p>Deliberately dependency-free — no Athena SDK, no Arrow, no logging — so it can be copied as a
- * single file. Not thread-safe; build one per column.
+ * <p>Deliberately dependency-free — no Athena SDK, no Arrow, no logging — so it can be copied out with
+ * {@link ConstraintTags}. Not thread-safe; build one per column.
  */
 public final class ColumnComment
 {
     /** Marks the column as a member of its table's primary key. Takes no operand. */
     private static final String PK_TAG = "@pk";
 
-    /** Characters an identifier segment may contain without needing quotes. */
-    private static final Pattern BARE_SEGMENT = Pattern.compile("[A-Za-z0-9_$-]+");
-
     /**
-     * A live {@code @pk} in prose: exact case, a non-identifier character in front, and
-     * NOT followed by {@code =} or {@code (} (those spellings are near misses that COA
-     * reports and leaves alone, so they cannot corrupt a description).
+     * Marks the column as declared {@code NOT NULL}. Takes no operand, like {@link #PK_TAG}.
+     *
+     * <p>Public because it is the spelling a connector author checks against when their source's own
+     * nullability column is not a simple yes/no, and because these same eight characters have to be
+     * matched by COA's parser on the other side of the wire.
      */
-    private static final Pattern LIVE_PK_IN_PROSE = Pattern.compile("(?<![A-Za-z0-9_$])@pk(?![A-Za-z0-9_=(])");
-
-    /** A live {@code @fk(} in prose. The bracket is what makes COA read an operand. */
-    private static final Pattern LIVE_FK_IN_PROSE = Pattern.compile("(?<![A-Za-z0-9_$])@fk\\(");
+    public static final String NOT_NULL_TAG = "@notnull";
 
     private final String description;
     private final List<Reference> foreignKeys = new ArrayList<>();
     private boolean primaryKeyMember;
+    private boolean notNull;
 
     private ColumnComment(String description)
     {
@@ -97,20 +101,27 @@ public final class ColumnComment
      *                    whitespace included); only the finished comment is trimmed.
      * @return a new builder.
      * @throws IllegalArgumentException if the prose contains a tag COA would act on
-     *                                  ({@code @pk}, or {@code @fk(}) — declare it with
-     *                                  {@link #primaryKey()} / {@link #foreignKey(String,
+     *                                  ({@code @pk}, {@code @notnull}, or {@code @fk(}) —
+     *                                  declare it with {@link #primaryKey()} /
+     *                                  {@link #notNull()} / {@link #foreignKey(String,
      *                                  String)} instead of writing it by hand, or reword
      *                                  the prose.
      */
     public static ColumnComment of(String description)
     {
         String prose = (description == null) ? "" : description;
-        if (LIVE_PK_IN_PROSE.matcher(prose).find()) {
+        if (ConstraintTags.PRIMARY_KEY.matcher(prose).find()) {
             throw new IllegalArgumentException(
                     "Column prose contains a live @pk tag, which COA would strip and act on: \"" + prose
                             + "\". Call primaryKey() instead of writing the tag into the prose.");
         }
-        if (LIVE_FK_IN_PROSE.matcher(prose).find()) {
+        if (ConstraintTags.NOT_NULL.matcher(prose).find()) {
+            throw new IllegalArgumentException(
+                    "Column prose contains a live " + NOT_NULL_TAG + " tag, which COA would strip and"
+                            + " act on: \"" + prose + "\". Call notNull() instead of writing the tag"
+                            + " into the prose.");
+        }
+        if (ConstraintTags.FOREIGN_KEY_OPEN.matcher(prose).find()) {
             throw new IllegalArgumentException(
                     "Column prose contains a live @fk( tag, which COA would strip and act on: \"" + prose
                             + "\". Call foreignKey(...) instead of writing the tag into the prose.");
@@ -130,6 +141,20 @@ public final class ColumnComment
     public ColumnComment primaryKey()
     {
         this.primaryKeyMember = true;
+        return this;
+    }
+
+    /**
+     * Declares this column {@code NOT NULL} in the source.
+     *
+     * <p>Call it only for a column the source says so about. Not calling it means "nobody said", not
+     * "nullable", and there is no tag that means the latter. Calling it more than once emits one tag.
+     *
+     * @return this builder.
+     */
+    public ColumnComment notNull()
+    {
+        this.notNull = true;
         return this;
     }
 
@@ -168,12 +193,13 @@ public final class ColumnComment
     }
 
     /**
-     * Renders the comment: the prose, then {@code @pk}, then one {@code @fk(...)} per
-     * declared reference in declaration order, single-space separated and trimmed.
+     * Renders the comment: the prose, then {@code @pk}, then {@code @notnull}, then one
+     * {@code @fk(...)} per declared reference in declaration order, single-space separated and
+     * trimmed.
      *
-     * <p>COA consumes the whitespace in front of a tag when it strips it, so the prose it
-     * stores is exactly what was passed to {@link #of(String)} (trimmed) — which is what
-     * lets a test assert the prose survives.
+     * <p>The order is fixed and pinned by a test: the operand-free tags come first so the {@code @fk}
+     * list stays last and contiguous, and {@code @notnull} goes <b>after</b> {@code @pk} so a comment for
+     * a primary-key-only column is byte-identical to what this class emitted before the tag existed.
      *
      * @return the comment string. Put it in the Arrow <b>schema's</b> metadata keyed by this
      *         column's name — {@code SchemaBuilder.addMetadata(columnName, comment)}. <b>Never on
@@ -186,6 +212,9 @@ public final class ColumnComment
         StringBuilder out = new StringBuilder(description);
         if (primaryKeyMember) {
             appendTag(out, PK_TAG);
+        }
+        if (notNull) {
+            appendTag(out, NOT_NULL_TAG);
         }
         for (Reference reference : foreignKeys) {
             appendTag(out, "@fk(" + reference.render() + ")");
@@ -227,7 +256,7 @@ public final class ColumnComment
         if (identifier == null || identifier.isEmpty()) {
             throw new IllegalArgumentException("Reference segment must not be null or empty");
         }
-        if (BARE_SEGMENT.matcher(identifier).matches()) {
+        if (ConstraintTags.OPERAND_SEGMENT.matcher(identifier).matches()) {
             return identifier;
         }
         return '"' + identifier.replace("\"", "\"\"") + '"';

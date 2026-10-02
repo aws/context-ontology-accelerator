@@ -22,10 +22,14 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
+import re
 import uuid
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import unquote
 
+import boto3
 import structlog
 from botocore.exceptions import ClientError
 from coa_common.dao import QueryParams
@@ -34,10 +38,12 @@ from coa_common.metadata_store import AssetResult, SMUSClient
 from coa_common.response import api_response, iso_to_epoch
 from coa_common.s3 import get_s3_client, read_file_bytes, upload_json
 from coa_control_plane_server.models.custom_connector_configuration import CustomConnectorConfiguration
+from coa_control_plane_server.models.databricks_sql_warehouse_configuration import DatabricksSqlWarehouseConfiguration
 from coa_control_plane_server.models.glue_configuration import GlueConfiguration
 from coa_control_plane_server.models.glue_execution_engine import GlueExecutionEngine
 from coa_control_plane_server.models.jdbc_configuration import JdbcConfiguration
 from coa_control_plane_server.models.query_engine import QueryEngine
+from coa_control_plane_server.models.scan_trigger import ScanTrigger
 from coa_control_plane_server.models.source_status import SourceStatus
 from coa_control_plane_server.models.source_sub_type import SourceSubType
 from coa_control_plane_server.models.source_type import SourceType
@@ -51,6 +57,24 @@ from coa_sources.database.connectors.athena_catalog import (
     register_lambda_catalog,
 )
 from coa_sources.database.connectors.jdbc import DIRECT_QUERY_ENGINES
+from coa_sources.database.databricks import (
+    DatabricksConfigError,
+    DatabricksConfigExistsError,
+    DatabricksConnectorConfig,
+    DatabricksConnectorUnavailableError,
+    arn_has_inner_whitespace,
+    config_parameter_name,
+    delete_config_parameter,
+    deployment_id,
+    normalise_arn,
+    reserved_role_name_prefix,
+    resolve_connector_function_arn,
+    role_arn_is_connector_assumable,
+    role_name_is_reserved,
+    secret_arn_is_connector_readable,
+    validate_credential_wiring,
+    write_config_parameter,
+)
 from coa_sources.database.glue_ownership import (
     GlueOwnershipError,
     assert_namespace_may_catalog,
@@ -111,6 +135,19 @@ def _resolve_project_id(namespace_id: str) -> str | None:
 # Athena's account-default Glue Data Catalog name.
 _DEFAULT_ATHENA_CATALOG = "AwsDataCatalog"
 
+# The mutually-exclusive configuration members of CreateDatabaseSourceInput.
+#
+# Adding an entry here is HALF a change: the sub-type resolution in
+# `_create_database_source` ends in an `else` assigning GLUE_DATABASE, so a member
+# accepted here but unrecognised there is persisted as a Glue source, with the stored
+# blob and the sourceSubType silently disagreeing.
+_CONFIG_MEMBERS = (
+    "glueConfiguration",
+    "jdbcConfiguration",
+    "customConnectorConfiguration",
+    "databricksSqlWarehouseConfiguration",
+)
+
 
 def _resolve_glue_athena_catalog(glue_config: Any) -> str:
     """Resolve the Athena QueryExecutionContext.Catalog for a Glue source.
@@ -145,6 +182,21 @@ def _optional_int(value: Any) -> int | None:
     except (TypeError, ValueError):
         logger.warning("non_numeric_dynamodb_number_ignored", value=repr(value))
         return None
+
+
+def _scan_total(scan_item: dict[str, Any], source_item: dict[str, Any]) -> Any:
+    """Denominator for scan progress, most authoritative first.
+
+    Only ``tablesTotal`` is guaranteed to match ``tablesProcessed``, but it
+    lands with enrichment and this scan's ``tablesDiscovered`` only once
+    discovery finishes, so the previous scan's count carries the bar until then.
+    """
+    candidates = (
+        scan_item.get("tablesTotal"),
+        scan_item.get("tablesDiscovered"),
+        source_item.get("tablesDiscovered"),
+    )
+    return next((n for n in candidates if n is not None), None)
 
 
 def _arn_region(arn: str) -> str:
@@ -304,6 +356,171 @@ def _validate_custom_connector_configuration(custom_connector_config: Any) -> di
     return None
 
 
+# ---------------------------------------------------------------------------
+# Databricks SQL Warehouse registration
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _ValidatedDatabricks:
+    """What a passing validation hands the create path.
+
+    The two ARNs come back **normalised**, and the create path must use these rather than
+    the request's own values: the stored blob and the connector's parameter have to agree
+    about one spelling, and the Java side trims where the Smithy validator does not.
+    """
+
+    connector_function_arn: str
+    role_arn: str
+    secret_arn: str
+
+
+def _validate_databricks_configuration(
+    databricks_config: Any,
+    namespace_id: str,
+    source_id: str,
+) -> tuple[dict[str, Any] | None, _ValidatedDatabricks | None]:
+    """Validate everything about a Databricks source before anything is persisted.
+
+    ARN normalisation comes first: Python's ``$`` matches before a trailing newline, so
+    an ARN carrying one passes the generated Smithy validator, and the connector then
+    trims it where COA does not. Both are stripped before the prefix check reads one, and
+    whitespace surviving the strip is refused.
+
+    The field patterns are re-run here even though the generated model already carries
+    them, because they are the only things standing between a customer-typed string and a
+    ``;``-delimited JDBC property list plus generated ``information_schema`` SQL inside
+    the connector, and this function is reachable from any caller of the module.
+
+    Neither ARN's account is compared against the deployment's: COA is deployed *into*
+    the customer's account, so a role in the deployment account is the common topology.
+
+    Returns ``(error_response, validated)``; ``validated`` is ``None`` on any refusal.
+    """
+    try:
+        DatabricksSqlWarehouseConfiguration.model_validate(databricks_config.to_dict())
+    except PydanticValidationError as exc:
+        first = exc.errors()[0]
+        field = ".".join(str(part) for part in first.get("loc", ())) or "databricksSqlWarehouseConfiguration"
+        error = api_response(400, {"error": f"Invalid databricksSqlWarehouseConfiguration.{field}: {first['msg']}"})
+        return error, None
+
+    # Normalised before the prefix check reads one, so nothing downstream ever sees
+    # two spellings of one role.
+    role_arn = normalise_arn(databricks_config.cross_account_role_arn)
+    secret_arn = normalise_arn(databricks_config.credential_secret_arn)
+    for field, arn in (("crossAccountRoleArn", role_arn), ("credentialSecretArn", secret_arn)):
+        if arn_has_inner_whitespace(arn):
+            error = api_response(
+                400,
+                {
+                    "error": (
+                        f"databricksSqlWarehouseConfiguration.{field} contains whitespace, which no "
+                        f"ARN does. Surrounding whitespace is trimmed; whitespace inside the value "
+                        f"means it is not the ARN you meant."
+                    )
+                },
+            )
+            return error, None
+
+    # Two refusals in one pattern, both narrower than the shared `IamRoleArn` shape.
+    # Checked before the prefix rule so the message names the actual problem.
+    if not role_arn_is_connector_assumable(role_arn):
+        error = api_response(
+            400,
+            {
+                "error": (
+                    "databricksSqlWarehouseConfiguration.crossAccountRoleArn is not a shape this "
+                    "deployment can assume. The partition must be 'aws': this deployment's "
+                    "sts:AssumeRole grant is written arn:aws:iam::*:role/..., so an aws-cn or "
+                    "aws-us-gov role would register and then have every assume denied by our own "
+                    "policy, with a message pointing at your trust policy instead. And the role's "
+                    "path and name may contain only letters, digits and +=,.@_/- , because the "
+                    "connector re-validates this value on every request — a source registered with "
+                    "any other spelling would scan and then answer nothing."
+                )
+            },
+        )
+        return error, None
+
+    if not role_name_is_reserved(role_arn):
+        error = api_response(
+            400,
+            {
+                "error": (
+                    f"databricksSqlWarehouseConfiguration.crossAccountRoleArn must name a role whose "
+                    f"resource path begins '{reserved_role_name_prefix()}'. This deployment's "
+                    f"sts:AssumeRole grant is scoped to that prefix, so a correctly configured role "
+                    f"under any other name is denied with an error naming nothing useful. Note the "
+                    f"grant matches everything after 'role/', so a role under an IAM PATH does not "
+                    f"match however its trailing name is spelled. The role's ACCOUNT is "
+                    f"unconstrained — the deployment account is fine."
+                )
+            },
+        )
+        return error, None
+
+    secret_region = _arn_region(secret_arn)
+    if secret_region != _AWS_REGION:
+        error = api_response(
+            400,
+            {
+                "error": (
+                    f"databricksSqlWarehouseConfiguration.credentialSecretArn must be in region "
+                    f"'{_AWS_REGION}' (got '{secret_region or 'none'}'). Athena does not support "
+                    f"cross-Region federated queries, and secrets are region-scoped. The secret's "
+                    f"ACCOUNT is unconstrained; only its region is."
+                )
+            },
+        )
+        return error, None
+
+    # As above: narrower than the shared `SecretArn` shape, which the JDBC and Glue
+    # sub-types also use, so narrowing that shape instead would retroactively invalidate
+    # their registered sources.
+    if not secret_arn_is_connector_readable(secret_arn):
+        error = api_response(
+            400,
+            {
+                "error": (
+                    "databricksSqlWarehouseConfiguration.credentialSecretArn is not a shape the "
+                    "connector accepts: the secret name may contain only letters, digits and "
+                    "/_+=.@- . A source registered with any other spelling would scan and then "
+                    "answer nothing, because the connector re-validates this value on every request."
+                )
+            },
+        )
+        return error, None
+
+    # No secret namespace-tag check and no role-ARN claim here, unlike the JDBC path: the
+    # role's own trust policy answers "which namespace may use this credential", because
+    # COA never reads the secret with its own identity and `validate_credential_wiring`
+    # refuses a role whose trust policy does not require this namespace's sts:ExternalId.
+    wiring = validate_credential_wiring(
+        role_arn=role_arn,
+        secret_arn=secret_arn,
+        namespace_id=namespace_id,
+        source_id=source_id,
+    )
+    if not wiring.ok:
+        return api_response(503 if wiring.retryable else 400, {"error": wiring.message}), None
+
+    try:
+        connector_function_arn = resolve_connector_function_arn()
+    except DatabricksConnectorUnavailableError as exc:
+        logger.warning("databricks_connector_not_deployed", namespace_id=namespace_id, source_id=source_id)
+        return api_response(400, {"error": str(exc)}), None
+    except DatabricksConfigError:
+        logger.exception("databricks_connector_arn_lookup_failed", source_id=source_id)
+        return api_response(503, {"error": "Could not resolve the Databricks connector; retry."}), None
+
+    return None, _ValidatedDatabricks(
+        connector_function_arn=connector_function_arn,
+        role_arn=role_arn,
+        secret_arn=secret_arn,
+    )
+
+
 def _resolve_query_engine(glue_config: Any, jdbc_config: Any) -> QueryEngine:
     """Preferred single-source execution engine for the source.
 
@@ -315,11 +532,11 @@ def _resolve_query_engine(glue_config: Any, jdbc_config: Any) -> QueryEngine:
     engines without a direct path also go through Athena — so serve never routes
     to a path that doesn't exist.
 
-    A custom-connector (``CUSTOM_CONNECTOR``) source passes neither config and
-    falls through to ``ATHENA``, which is correct and the only option: there is no
-    direct adapter for an arbitrary customer connector, and serve's own gate
-    (``_fetch_jdbc_source`` requires ``queryEngine == "JDBC"``) keeps it off the
-    direct route without a route-selection change.
+    The connector-backed sub-types (``CUSTOM_CONNECTOR``,
+    ``DATABRICKS_SQL_WAREHOUSE``) pass neither config and fall through to ``ATHENA``,
+    which is correct and the only option: there is no direct adapter for either, and
+    serve's own gate (``_fetch_jdbc_source`` requires ``queryEngine == "JDBC"``) keeps
+    them off the direct route without a route-selection change.
     """
     if jdbc_config is not None:
         engine = getattr(jdbc_config.engine, "value", jdbc_config.engine) or ""
@@ -334,7 +551,29 @@ def _resolve_query_engine(glue_config: Any, jdbc_config: Any) -> QueryEngine:
     return QueryEngine.ATHENA
 
 
-def _rollback_unscanned_source(namespace_id: str, source_id: str, catalog_name: str = "") -> bool:
+def _mark_source_scan_failed(namespace_id: str, source_id: str, message: str) -> None:
+    """Move a source row to ``SCAN_FAILED``, which is deletable and re-scannable.
+
+    Best-effort: every caller is already returning a 500.
+    """
+    with contextlib.suppress(ClientError):
+        _get_dao().update(
+            key={"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"},
+            update_fields={
+                "status": SourceStatus.SCAN_FAILED,
+                "errorMessage": message,
+                "updatedAt": _now_iso(),
+            },
+        )
+
+
+def _rollback_unscanned_source(
+    namespace_id: str,
+    source_id: str,
+    catalog_name: str = "",
+    *,
+    parameter_name: str = "",
+) -> bool:
     """Remove a source row whose scan never started; mark it recoverable if that fails.
 
     The row is written with ``status=REGISTERED``, which is one of
@@ -353,11 +592,36 @@ def _rollback_unscanned_source(namespace_id: str, source_id: str, catalog_name: 
     it describes; leaving it would be harmless (the name derives from the source id,
     so nothing else can ever be given it) but misleading in an audit.
 
+    ``parameter_name`` is the configuration parameter a ``DATABRICKS_SQL_WAREHOUSE``
+    create can have written by the time it fails. Nothing else would ever clean one up,
+    so if it cannot be removed the row STAYS as the record that it exists, left
+    ``SCAN_FAILED`` so the customer's own delete is the retry.
+
+    Order matters, and is the same order the delete path uses: parameter, then claim,
+    then the row. None of the three may outlive the record.
+
     Returns:
-        Whether the row was actually removed. The caller uses this to keep the
-        namespace source count honest: a row that survives was never counted, but
-        its eventual delete will decrement.
+        Whether the row was actually removed — ``False`` when the parameter could not
+        be removed, or when the row's own delete failed. The scan-enqueue caller has
+        incremented the namespace source count by the time it calls this and decrements
+        only on ``True``, so a surviving row stays counted.
     """
+    if parameter_name:
+        try:
+            delete_config_parameter(parameter_name=parameter_name)
+        except DatabricksConfigError:
+            logger.exception(
+                "rollback_databricks_parameter_delete_failed",
+                source_id=source_id,
+                parameter_name=parameter_name,
+            )
+            _mark_source_scan_failed(
+                namespace_id,
+                source_id,
+                "Source creation failed and its connector configuration could not be removed; "
+                "delete the source to retry.",
+            )
+            return False
     if catalog_name:
         try:
             release_platform_catalog(_get_dao(), catalog_name=catalog_name)
@@ -369,19 +633,15 @@ def _rollback_unscanned_source(namespace_id: str, source_id: str, catalog_name: 
             logger.warning("rollback_claim_release_failed", source_id=source_id, catalog_name=catalog_name)
     try:
         _get_dao().delete({"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"})
-        return True
     except ClientError:
         logger.exception("rollback_source_delete_failed", source_id=source_id)
-    with contextlib.suppress(ClientError):
-        _get_dao().update(
-            key={"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"},
-            update_fields={
-                "status": SourceStatus.SCAN_FAILED,
-                "errorMessage": "Source creation failed before the scan started; delete and re-create it.",
-                "updatedAt": _now_iso(),
-            },
+        _mark_source_scan_failed(
+            namespace_id,
+            source_id,
+            "Source creation failed before the scan started; delete and re-create it.",
         )
-    return False
+        return False
+    return True
 
 
 def _strip_external_id(config_dict: dict[str, Any], existing_config: Any = None) -> dict[str, Any]:
@@ -422,11 +682,12 @@ def _create_database_source(db_req: Any, namespace_id: str) -> dict[str, Any]:
     glue_config = db_req.glue_configuration
     jdbc_config = db_req.jdbc_configuration
     custom_connector_config = db_req.custom_connector_configuration
-    supplied = [c for c in (glue_config, jdbc_config, custom_connector_config) if c is not None]
+    databricks_config = db_req.databricks_sql_warehouse_configuration
+    supplied = [c for c in (glue_config, jdbc_config, custom_connector_config, databricks_config) if c is not None]
     if not supplied:
         return api_response(
             400,
-            {"error": "glueConfiguration, jdbcConfiguration or customConnectorConfiguration is required"},
+            {"error": f"One of {', '.join(_CONFIG_MEMBERS)} is required"},
         )
     # The config member is what selects the sub-type, so more than one is
     # ambiguous rather than additive — silently preferring one would persist a
@@ -434,7 +695,7 @@ def _create_database_source(db_req: Any, namespace_id: str) -> dict[str, Any]:
     if len(supplied) > 1:
         return api_response(
             400,
-            {"error": "Provide exactly one of glueConfiguration, jdbcConfiguration or customConnectorConfiguration"},
+            {"error": f"Provide exactly one of {', '.join(_CONFIG_MEMBERS)}"},
         )
 
     if custom_connector_config is not None:
@@ -496,16 +757,44 @@ def _create_database_source(db_req: Any, namespace_id: str) -> dict[str, Any]:
             )
             return api_response(403, {"error": str(exc)})
 
+    # Extended together with _CONFIG_MEMBERS, never separately: the trailing `else` makes
+    # an unrecognised member a Glue source rather than an error.
     if jdbc_config:
         sub_type = SourceSubType.JDBC_DATABASE
     elif custom_connector_config:
         sub_type = SourceSubType.CUSTOM_CONNECTOR
+    elif databricks_config:
+        sub_type = SourceSubType.DATABRICKS_SQL_WAREHOUSE
     else:
         sub_type = SourceSubType.GLUE_DATABASE
     source_id = str(uuid.uuid4())
     now = _now_iso()
 
+    # Everything a Databricks source can be refused for is decided here, before the
+    # record exists.
+    databricks_validated: _ValidatedDatabricks | None = None
+    if databricks_config is not None:
+        error, databricks_validated = _validate_databricks_configuration(databricks_config, namespace_id, source_id)
+        if error:
+            return error
+
     config_dict = _strip_external_id(supplied[0].to_dict())
+
+    # Lowercase the two Unity Catalog identifiers and write back the NORMALISED ARNs,
+    # in the STORED BLOB as well as in the parameter written from it.
+    #
+    # `information_schema` stores identifiers lowercase and the connector compares against
+    # what Databricks reports, so the customer-typed identifiers are lowercased here. The
+    # normalised ARNs go back into the blob because the parameter is built from it below.
+    databricks_catalog = ""
+    databricks_schema = ""
+    if databricks_config is not None and databricks_validated is not None:
+        databricks_catalog = (config_dict.get("databricksCatalog") or "").lower()
+        databricks_schema = (config_dict.get("databaseName") or "").lower()
+        config_dict["databricksCatalog"] = databricks_catalog
+        config_dict["databaseName"] = databricks_schema
+        config_dict["crossAccountRoleArn"] = databricks_validated.role_arn
+        config_dict["credentialSecretArn"] = databricks_validated.secret_arn
 
     # We derive the Athena data-catalog name rather than letting the caller name
     # it: catalog names are account+region-global, so a caller-chosen name would
@@ -519,8 +808,9 @@ def _create_database_source(db_req: Any, namespace_id: str) -> dict[str, Any]:
     # be written ahead of the resource rather than racing it. Derived once and
     # narrowed, rather than twice: the Athena attributes below are for the
     # custom-connector catalog only, while the claim covers both.
-    provisioned_catalog_name = derive_catalog_name(source_id) if (custom_connector_config or jdbc_config) else ""
-    athena_catalog_name = provisioned_catalog_name if custom_connector_config else ""
+    connector_backed = bool(custom_connector_config or databricks_config)
+    provisioned_catalog_name = derive_catalog_name(source_id) if (connector_backed or jdbc_config) else ""
+    athena_catalog_name = provisioned_catalog_name if connector_backed else ""
 
     item: dict[str, Any] = {
         "PK": f"NS#{namespace_id}",
@@ -544,7 +834,7 @@ def _create_database_source(db_req: Any, namespace_id: str) -> dict[str, Any]:
         # post-discovery federation step).
         "athenaCatalog": (
             athena_catalog_name
-            if custom_connector_config
+            if connector_backed
             else (_resolve_glue_athena_catalog(glue_config) if glue_config else _DEFAULT_ATHENA_CATALOG)
         ),
         # Preferred single-source execution engine. Direct JDBC only when a
@@ -570,8 +860,10 @@ def _create_database_source(db_req: Any, namespace_id: str) -> dict[str, Any]:
     # report it. That also gives serve the right namespace when a scan discovers
     # zero tables — otherwise it would fall back to a hardcoded default that has
     # nothing to do with this connector.
-    if custom_connector_config:
-        item["athenaDatabase"] = custom_connector_config.database_name
+    if connector_backed:
+        item["athenaDatabase"] = (
+            databricks_schema if databricks_config is not None else custom_connector_config.database_name
+        )
         # Serve routes on the PRESENCE of this attribute, so it is what makes the
         # source addressable at all. Written before the scan because `queryable`
         # is False until discovery succeeds, and serve skips a not-queryable
@@ -579,6 +871,13 @@ def _create_database_source(db_req: Any, namespace_id: str) -> dict[str, Any]:
         # rather than refusing it, which is pre-existing behaviour shared by every
         # sub-type, so this attribute is not what gates the pre-scan window.
         item["athenaDataCatalogName"] = athena_catalog_name
+    if databricks_config is not None:
+        # NEITHER of these is optional for this sub-type: the namespace-qualifier check
+        # builds `federated_catalog_schemas` from `discoveredSchemas`, so a record carrying
+        # a catalog but no schemas has every qualified query against it DENIED rather than
+        # merely unresolved. Written at create because a source is exactly one Unity Catalog
+        # schema and that is known now; discovery overwrites it with the same value.
+        item["discoveredSchemas"] = [databricks_schema]
     # Persist the metadata enrichment toggle whenever the caller specifies it
     # (true or false). Records that omit the field — legacy records, or
     # programmatic callers that don't set it — fall back to "enabled" at read
@@ -667,23 +966,35 @@ def _create_database_source(db_req: Any, namespace_id: str) -> dict[str, Any]:
                 catalog_name=provisioned_catalog_name,
             )
 
-    # Register the Athena data catalog for a custom-connector source.
+    # Register the Athena data catalog for a connector-backed source.
     #
-    # AFTER the DynamoDB put, deliberately: every delete path — source delete,
-    # namespace-deletion cascade, the rollback below — keys off the source record,
-    # so a catalog registered before the record would be orphaned with nothing
-    # left able to find it. Registering after means the worst case is a recorded
-    # source with no catalog, which the rollback here removes and a retry
-    # re-creates cleanly.
+    # AFTER the DynamoDB put, deliberately: every delete path keys off the source
+    # record, so a catalog registered first would be orphaned with nothing able to
+    # find it. The worst case this way is a recorded source with no catalog, which
+    # the rollback removes and a retry re-creates.
     #
-    # It has to happen at onboarding rather than in the scan pipeline: discovery
-    # for this sub-type runs Athena SQL against the catalog, so the catalog must
-    # already exist when the pipeline's first (discovery) step runs.
-    if custom_connector_config:
+    # At onboarding rather than in the scan pipeline, because discovery for this
+    # sub-type runs Athena SQL against the catalog.
+    if connector_backed:
         try:
             register_lambda_catalog(
                 catalog_name=athena_catalog_name,
-                connector_function_arn=custom_connector_config.connector_function_arn,
+                connector_function_arn=(
+                    databricks_validated.connector_function_arn
+                    if databricks_validated is not None
+                    else custom_connector_config.connector_function_arn
+                ),
+                # A Databricks catalog is bound to the ONE connector this deployment
+                # operates, so `register_lambda_catalog`'s ownership check — catalog type
+                # plus the set of handler ARNs — is trivially true for every such catalog,
+                # and a real collision would return False ("a retried create") instead of
+                # raising. Requiring ABSENCE restores the discrimination the shared ARN
+                # removed; delete verifies the `coa:sourceId` tag instead.
+                #
+                # CUSTOM_CONNECTOR keeps the ARN comparison: its ARN is per-source, so it
+                # still discriminates, and its retried creates must keep converging.
+                require_absent=databricks_config is not None,
+                source_id=source_id if databricks_config is not None else "",
             )
         except AthenaCatalogError as exc:
             logger.exception(
@@ -702,11 +1013,88 @@ def _create_database_source(db_req: Any, namespace_id: str) -> dict[str, Any]:
             if not isinstance(exc, AthenaCatalogConflictError):
                 with contextlib.suppress(AthenaCatalogError):
                     delete_lambda_catalog(catalog_name=athena_catalog_name)
-            _rollback_unscanned_source(namespace_id, source_id, provisioned_catalog_name)
+            _rollback_unscanned_source(
+                namespace_id,
+                source_id,
+                provisioned_catalog_name,
+            )
             return api_response(
                 500,
                 {"error": "Failed to register the Athena data catalog for the connector. Please retry."},
             )
+
+    # The connector's per-source configuration: how it learns which workspace and
+    # credential the catalog it was invoked under stands for.
+    #
+    # LAST of the create's side effects because it is the only one whose absence is
+    # harmless: a catalog with no parameter fails every request loudly, whereas a
+    # parameter with no catalog answers nothing and still points at a credential.
+    databricks_parameter_name = ""
+    if databricks_config is not None:
+        try:
+            databricks_parameter_name = write_config_parameter(
+                catalog_name=athena_catalog_name,
+                config=DatabricksConnectorConfig(
+                    source_id=source_id,
+                    # The REQUESTING namespace, written server-side: the connector derives
+                    # its assume's ExternalId from this value.
+                    namespace_id=namespace_id,
+                    # The Java connector derives its own by the same rule and refuses a
+                    # parameter that disagrees, so the two change together.
+                    deployment_id=deployment_id(),
+                    workspace_hostname=config_dict["workspaceHostname"],
+                    http_path=config_dict["httpPath"],
+                    databricks_catalog=databricks_catalog,
+                    database_name=databricks_schema,
+                    credential_secret_arn=config_dict["credentialSecretArn"],
+                    cross_account_role_arn=config_dict["crossAccountRoleArn"],
+                ),
+            )
+        except DatabricksConfigError as exc:
+            logger.exception(
+                "databricks_config_parameter_write_failed",
+                source_id=source_id,
+                catalog_name=athena_catalog_name,
+            )
+            # The row is about to go, so the catalog must come down too or it is orphaned
+            # with nothing able to find it. Unlike the registration failure above there is
+            # no conflict case: the parameter write never touches the catalog.
+            with contextlib.suppress(AthenaCatalogError):
+                delete_lambda_catalog(catalog_name=athena_catalog_name)
+            # A COLLISION means the parameter belongs to something else, so this call wrote
+            # nothing and deleting it would remove a parameter this create did not write.
+            collided = isinstance(exc, DatabricksConfigExistsError)
+            # The name is derived here rather than read from `databricks_parameter_name`,
+            # which is still empty: that assignment is the statement that raised.
+            # `PutParameter` can commit server-side and then have its response time out, so
+            # a parameter holding the role and secret ARNs can outlive a create that
+            # reported failure, and nothing else would ever remove it.
+            #
+            # NOT on a collision, for the same reason a conflicting catalog is not deleted:
+            # `DatabricksConfigExistsError` means this create did not write that parameter,
+            # so deleting it would destroy another source's live credential pointer.
+            rollback_parameter_name = ""
+            if not collided:
+                # `config_parameter_name` raises only when the path prefix is unset, and in
+                # that case `write_config_parameter` raised before reaching `PutParameter`,
+                # so "" is correct. Letting it escape would skip the rollback entirely and
+                # leave the record and the catalog behind.
+                with contextlib.suppress(DatabricksConfigError):
+                    rollback_parameter_name = config_parameter_name(athena_catalog_name)
+            _rollback_unscanned_source(
+                namespace_id,
+                source_id,
+                provisioned_catalog_name,
+                parameter_name=rollback_parameter_name,
+            )
+            if collided:
+                message = (
+                    "A connector configuration already exists for this source's catalog name; "
+                    "the source was not created."
+                )
+            else:
+                message = "Failed to write the connector configuration. Please retry."
+            return api_response(500, {"error": message})
 
     # Increment the namespace sourceCount. Best-effort: counter drift
     # is undesirable but must never block source creation.
@@ -723,6 +1111,7 @@ def _create_database_source(db_req: Any, namespace_id: str) -> dict[str, Any]:
                 "namespaceId": namespace_id,
                 "status": "IN_PROGRESS",
                 "scanType": "full",
+                "triggerType": ScanTrigger.INITIAL,
                 "startedAt": now,
                 "createdAt": now,
             }
@@ -762,7 +1151,7 @@ def _create_database_source(db_req: Any, namespace_id: str) -> dict[str, Any]:
             # or it is orphaned for good. Best-effort: a failure is logged and the
             # 500 still returned, because failing the rollback must not turn a
             # retryable create failure into an unretryable one.
-            if custom_connector_config:
+            if connector_backed:
                 try:
                     delete_lambda_catalog(catalog_name=athena_catalog_name)
                 except AthenaCatalogError:
@@ -771,7 +1160,12 @@ def _create_database_source(db_req: Any, namespace_id: str) -> dict[str, Any]:
                         source_id=source_id,
                         catalog_name=athena_catalog_name,
                     )
-            source_deleted = _rollback_unscanned_source(namespace_id, source_id, provisioned_catalog_name)
+            source_deleted = _rollback_unscanned_source(
+                namespace_id,
+                source_id,
+                provisioned_catalog_name,
+                parameter_name=databricks_parameter_name,
+            )
             # Only adjust the counter if the source row was actually removed, else
             # we'd drift the count. adjust_* is itself best-effort, so the 500 below
             # is always returned.
@@ -1126,6 +1520,20 @@ def _handle_list_tables(event: dict[str, Any], namespace_id: str, source_id: str
         columns_pending_deletion = sum(
             1 for c in columns_raw if isinstance(c, dict) and c.get("name") in removed_for_table
         )
+        # Cross-source inference from a later-onboarded source can propose new
+        # relationships on this table AFTER the source was approved. Bulk approve
+        # doesn't re-enter APPROVED, so those PENDING FKs would be invisible
+        # without a per-table drill-in. Surface a count so the UI can badge the
+        # table; the steward reviews per-relationship (PATCH /keys) or clicks
+        # per-table Approve to settle them.
+        fks_field = payload.get("foreignKeys", "[]")
+        try:
+            fks_raw = json.loads(fks_field) if isinstance(fks_field, str) else (fks_field or [])
+        except (json.JSONDecodeError, ValueError):
+            fks_raw = []
+        pending_relationships = sum(
+            1 for fk in fks_raw if isinstance(fk, dict) and fk.get("review_status") == ReviewStatus.PENDING_REVIEW
+        )
         summary = TableSummary(
             tableId=table_id,
             name=payload.get("tableName", ""),
@@ -1133,6 +1541,7 @@ def _handle_list_tables(event: dict[str, Any], namespace_id: str, source_id: str
             columnCount=len(columns_raw),
             columnsApproved=columns_approved,
             columnsPendingDeletion=columns_pending_deletion or None,
+            pendingRelationships=pending_relationships or None,
             # A fully-removed table is retained (deleted only on approve) with
             # its old status (often APPROVED); report it as PENDING_REVIEW so it
             # shows in the pending filter/count. A column-losing table already
@@ -1458,6 +1867,74 @@ def _find_source_table_assets_by_name(
         return None, api_response(500, {"error": "Failed to validate foreign key target tables"})
 
     return matching_assets, None
+
+
+def _resolve_fk_target_table(
+    client: SMUSClient,
+    project_id: str,
+    target_source_id: str,
+    target_source: dict[str, Any],
+    target: str,
+    *,
+    current_source_id: str,
+    current_table: Table,
+    current_asset: dict[str, Any],
+) -> tuple[Table | None, dict[str, Any] | None]:
+    """Resolve one FK target table in its owning source, including legacy bare names."""
+    if "." in target:
+        target_table_id = target
+        if target_source_id == current_source_id and target_table_id == current_table.table_id:
+            return current_table, None
+        target_asset, target_err = _load_single_asset(client, project_id, target_source_id, target_table_id)
+    else:
+        schemas = target_source.get("discoveredSchemas")
+        if not isinstance(schemas, list) or not all(isinstance(schema, str) for schema in schemas):
+            return None, api_response(500, {"error": "Source schema index is unavailable"})
+        matching_assets, find_err = _find_source_table_assets_by_name(
+            client,
+            project_id,
+            target_source_id,
+            target,
+            schemas,
+        )
+        if find_err:
+            return None, find_err
+        if matching_assets is None:
+            return None, api_response(500, {"error": "Failed to validate foreign key target tables"})
+        if target_source_id == current_source_id and current_table.table_id.rsplit(".", 1)[-1] == target:
+            matching_assets.setdefault(
+                current_table.table_id,
+                AssetResult(
+                    asset_id=current_asset["asset_id"],
+                    name=current_asset["asset_name"],
+                    project_id=project_id,
+                ),
+            )
+        matches = sorted(matching_assets)
+        if not matches:
+            return None, api_response(400, {"error": f"Unknown foreign key target table: {target}"})
+        if len(matches) > 1:
+            return None, api_response(
+                400,
+                {"error": f"Ambiguous foreign key target table '{target}'; use its database.table identifier"},
+            )
+        target_table_id = matches[0]
+        if target_source_id == current_source_id and target_table_id == current_table.table_id:
+            return current_table, None
+        target_asset, target_err = _load_asset_metadata(
+            client,
+            target_source_id,
+            target_table_id,
+            matching_assets[target_table_id],
+        )
+
+    if target_err:
+        if target_err.get("statusCode") == 404:
+            return None, api_response(400, {"error": f"Unknown foreign key target table: {target}"})
+        return None, target_err
+    if target_asset is None:
+        return None, api_response(500, {"error": "Failed to load foreign key target table"})
+    return target_asset["table"], None
 
 
 def _decision_to_status(decision: str) -> str:
@@ -1988,9 +2465,39 @@ def _handle_update_table_keys(
         # or adds one relationship, so revalidating unchanged legacy rows can
         # make an unrelated edit impossible. Validate only new or changed rows.
         existing_fk_by_key = {(fk.column, fk.target_table, fk.target_column or ""): fk for fk in table.foreign_keys}
-        target_table_cache: dict[str, Any] = {table.table_id: table}
-        resolved_target_ids: dict[str, str] = {}
-        resolved_target_assets: dict[str, AssetResult] = {}
+        target_table_cache: dict[tuple[str, str], Table] = {(source_id, table.table_id): table}
+
+        def _target_validation_error(
+            target_source_id: str,
+            target_source: dict[str, Any],
+            target: str,
+            target_column: str,
+        ) -> dict[str, Any] | None:
+            cache_key = (target_source_id, target)
+            target_table = target_table_cache.get(cache_key)
+            if target_table is None:
+                target_table, target_err = _resolve_fk_target_table(
+                    client,
+                    project_id,
+                    target_source_id,
+                    target_source,
+                    target,
+                    current_source_id=source_id,
+                    current_table=table,
+                    current_asset=asset,
+                )
+                if target_err:
+                    return target_err
+                if target_table is None:
+                    return api_response(500, {"error": "Failed to load foreign key target table"})
+                target_table_cache[cache_key] = target_table
+            if target_column and target_column not in {column.name for column in target_table.columns}:
+                return api_response(
+                    400,
+                    {"error": f"Unknown target column '{target_column}' on foreign key target table '{target}'"},
+                )
+            return None
+
         new_fks: list[ForeignKey] = []
         for col, target, tcol, review_status in parsed_fks:
             existing = existing_fk_by_key.get((col, target, tcol))
@@ -1999,23 +2506,30 @@ def _handle_update_table_keys(
                 # on the existing inferred relationship while preserving its source,
                 # target_datasource_id and provenance. No status change -> untouched.
                 if review_status and review_status != existing.review_status:
-                    # A cross-source relationship must point at a source in THIS
-                    # namespace. The inference pipeline only ever creates in-namespace
-                    # targets, but approving is the moment the edge becomes real in
-                    # the ontology, so refuse a stray/cross-namespace target here
-                    # rather than materialise a join the namespace cannot see.
-                    if review_status == ReviewStatus.APPROVED and existing.target_datasource_id:
-                        tgt_ds = existing.target_datasource_id.removeprefix("DS#")
-                        if _get_dao().get({"PK": f"NS#{namespace_id}", "SK": f"SRC#{tgt_ds}"}) is None:
-                            return api_response(
-                                400,
-                                {
-                                    "error": (
-                                        f"Cross-source foreign key on '{col}' targets datasource "
-                                        f"'{existing.target_datasource_id}', which is not in this namespace"
-                                    )
-                                },
+                    if review_status == ReviewStatus.APPROVED:
+                        target_source_id = source_id
+                        target_source = source
+                        # A cross-source relationship must point at a source in THIS
+                        # namespace. Approval is when the edge becomes ontology-visible,
+                        # so validate both its source membership and target schema now.
+                        if existing.target_datasource_id:
+                            target_source_id = existing.target_datasource_id.removeprefix("DS#")
+                            target_source = _get_dao().get(
+                                {"PK": f"NS#{namespace_id}", "SK": f"SRC#{target_source_id}"}
                             )
+                            if target_source is None:
+                                return api_response(
+                                    400,
+                                    {
+                                        "error": (
+                                            f"Cross-source foreign key on '{col}' targets datasource "
+                                            f"'{existing.target_datasource_id}', which is not in this namespace"
+                                        )
+                                    },
+                                )
+                        target_err = _target_validation_error(target_source_id, target_source, target, tcol)
+                        if target_err:
+                            return target_err
                     new_fks.append(dataclasses.replace(existing, review_status=review_status))
                 else:
                     new_fks.append(existing)
@@ -2023,80 +2537,9 @@ def _handle_update_table_keys(
             if col not in valid_cols:
                 return api_response(400, {"error": f"Unknown foreign key column: {col}"})
 
-            target_table_id = resolved_target_ids.get(target)
-            target_table = target_table_cache.get(target_table_id) if target_table_id else None
-            if target_table_id is None:
-                if "." in target:
-                    # A qualified target is already a canonical table ID.
-                    target_table_id = target
-                else:
-                    # Bare targets are a legacy/UI format. They are safe to
-                    # persist only when the name is unique across the source;
-                    # downstream resolvers apply the same rule and cannot
-                    # recover a guessed database from a stored bare name.
-                    schemas = source.get("discoveredSchemas")
-                    if not isinstance(schemas, list) or not all(isinstance(schema, str) for schema in schemas):
-                        return api_response(500, {"error": "Source schema index is unavailable"})
-                    matching_assets, find_err = _find_source_table_assets_by_name(
-                        client,
-                        project_id,
-                        source_id,
-                        target,
-                        schemas,
-                    )
-                    if find_err:
-                        return find_err
-                    if matching_assets is None:
-                        return api_response(500, {"error": "Failed to validate foreign key target tables"})
-                    # The edited table was loaded by exact name and is known
-                    # to exist even if the search index is briefly stale.
-                    if table.table_id.rsplit(".", 1)[-1] == target:
-                        matching_assets.setdefault(
-                            table.table_id,
-                            AssetResult(
-                                asset_id=asset["asset_id"],
-                                name=asset["asset_name"],
-                                project_id=project_id,
-                            ),
-                        )
-                    matches = sorted(matching_assets)
-                    if not matches:
-                        return api_response(400, {"error": f"Unknown foreign key target table: {target}"})
-                    if len(matches) > 1:
-                        return api_response(
-                            400,
-                            {
-                                "error": (
-                                    f"Ambiguous foreign key target table '{target}'; use its database.table identifier"
-                                )
-                            },
-                        )
-                    target_table_id = matches[0]
-                    resolved_target_assets[target] = matching_assets[target_table_id]
-                target_table = target_table_cache.get(target_table_id)
-
-            if target_table is None:
-                resolved_asset = resolved_target_assets.get(target)
-                if resolved_asset is None:
-                    target_asset, target_err = _load_single_asset(client, project_id, source_id, target_table_id)
-                else:
-                    target_asset, target_err = _load_asset_metadata(client, source_id, target_table_id, resolved_asset)
-                if target_err:
-                    if target_err.get("statusCode") == 404:
-                        return api_response(400, {"error": f"Unknown foreign key target table: {target}"})
-                    return target_err
-                if target_asset is None:
-                    return api_response(500, {"error": "Failed to load foreign key target table"})
-                target_table = target_asset["table"]
-                target_table_cache[target_table_id] = target_table
-
-            resolved_target_ids[target] = target_table_id
-
-            if tcol and tcol not in {column.name for column in target_table.columns}:
-                return api_response(
-                    400,
-                    {"error": f"Unknown target column '{tcol}' on foreign key target table '{target}'"},
-                )
+            target_err = _target_validation_error(source_id, source, target, tcol)
+            if target_err:
+                return target_err
             new_fks.append(
                 ForeignKey(
                     column=col, target_table=target, target_column=tcol, source=EnrichmentSource.STEWARD_SPECIFIED
@@ -2532,6 +2975,8 @@ def _handle_get_scan_job(namespace_id: str, source_id: str, job_id: str) -> dict
         # them. See _item_to_summary, which gets this right via the same int() call.
         "tablesDiscovered": _optional_int(scan_item.get("tablesDiscovered")),
         "columnsDiscovered": _optional_int(scan_item.get("columnsDiscovered")),
+        "tablesProcessed": _optional_int(scan_item.get("tablesProcessed")),
+        "tablesTotal": _optional_int(_scan_total(scan_item, source_item)),
         "startedAt": iso_to_epoch(scan_item.get("startedAt")),
         "completedAt": iso_to_epoch(scan_item.get("completedAt")),
         "errorMessage": scan_item.get("errorMessage"),
@@ -2569,6 +3014,7 @@ def _scan_job_to_entry(item: dict[str, Any]) -> dict[str, Any]:
         "eventType": item.get("eventType") or "SCAN",
         "status": item.get("status"),
         "scanType": item.get("scanType"),
+        "triggerType": item.get("triggerType"),
         "tablesDiscovered": item.get("tablesDiscovered"),
         "tablesApproved": item.get("tablesApproved"),
         "completedAt": iso_to_epoch(item.get("completedAt")),
@@ -2615,6 +3061,402 @@ def _handle_list_scan_jobs(namespace_id: str, source_id: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# RESCAN SCHEDULE (recurring rescan via EventBridge Scheduler)
+# ---------------------------------------------------------------------------
+
+# EventBridge Scheduler wiring, injected by the sources stack. The schedule
+# targets the Sources API Lambda itself with a synthetic {"scheduledRescan":
+# true, ...} payload (handled in sources_handler.handler), so there is no
+# separate invoker function.
+_RESCAN_SCHEDULE_GROUP: str = os.environ.get("RESCAN_SCHEDULE_GROUP", "")
+_RESCAN_TARGET_ARN: str = os.environ.get("RESCAN_TARGET_ARN", "")
+_RESCAN_SCHEDULE_ROLE_ARN: str = os.environ.get("RESCAN_SCHEDULE_ROLE_ARN", "")
+# Floor on how often a source may re-scan itself. EventBridge only syntax-checks
+# the expression, and every tick is a full discovery plus enrichment, so an
+# unbounded cadence bills one Bedrock pass per table per tick.
+try:
+    _MIN_RESCAN_INTERVAL_S: int = int(os.environ.get("MIN_RESCAN_INTERVAL_S", "3600"))
+except (ValueError, TypeError):
+    _MIN_RESCAN_INTERVAL_S = 3600
+
+_RATE_UNIT_SECONDS: dict[str, int] = {"minute": 60, "hour": 3600, "day": 86400}
+_RATE_RE = re.compile(r"^rate\(\s*(\d+)\s+(minute|minutes|hour|hours|day|days)\s*\)$", re.IGNORECASE)
+_CRON_RE = re.compile(r"^cron\((.+)\)$", re.IGNORECASE)
+
+_scheduler = None
+
+
+def _get_scheduler():
+    global _scheduler
+    if _scheduler is None:
+        _scheduler = boto3.client("scheduler", region_name=_AWS_REGION)
+    return _scheduler
+
+
+def _schedule_name(source_id: str) -> str:
+    """Deterministic EventBridge schedule name for a source (<=64 chars)."""
+    return f"rescan-{source_id}"[:64]
+
+
+def _scheduling_configured() -> bool:
+    return bool(_RESCAN_SCHEDULE_GROUP and _RESCAN_TARGET_ARN and _RESCAN_SCHEDULE_ROLE_ARN)
+
+
+def _schedule_expression_error(expression: str) -> str | None:
+    """Reject a cadence that would re-scan faster than the floor, else None.
+
+    ``rate()`` is parsed and measured. ``cron()`` cannot be reduced to an
+    interval in general, so instead its minute field must be a single literal,
+    which caps it at hourly and rejects the steps, lists, ranges and wildcards
+    that fire sub-hourly. ``at()`` fires once and would leave a dead schedule
+    behind, so it is not a cadence at all.
+
+    Syntax is still EventBridge's job; this only bounds the frequency.
+    """
+    expr = (expression or "").strip()
+    if expr.lower().startswith("at("):
+        return "one-time at() schedules are not supported; use rate() or cron()"
+
+    rate = _RATE_RE.match(expr)
+    if rate:
+        every = int(rate.group(1)) * _RATE_UNIT_SECONDS[rate.group(2).rstrip("s").lower()]
+        if every < _MIN_RESCAN_INTERVAL_S:
+            return f"rescans may run at most every {_MIN_RESCAN_INTERVAL_S}s; this expression asks for every {every}s"
+        return None
+
+    cron = _CRON_RE.match(expr)
+    if cron:
+        minute = (cron.group(1).strip().split() or [""])[0]
+        if not minute.isdigit():
+            return f"cron minute field must be a single value so the cadence can be bounded; got '{minute}'"
+        # A literal minute bounds it at hourly, which is the strongest bound
+        # available without a full cron interval analysis.
+        if _MIN_RESCAN_INTERVAL_S > 3600:
+            return f"cron cannot be bounded below {_MIN_RESCAN_INTERVAL_S}s; use rate() for a longer cadence"
+        return None
+
+    return "scheduleExpression must be a rate() or cron() expression"
+
+
+def _upsert_rescan_schedule(namespace_id: str, source_id: str, expression: str, timezone: str) -> None:
+    """Create or update the source's EventBridge schedule (idempotent)."""
+    params: dict[str, Any] = {
+        "Name": _schedule_name(source_id),
+        "GroupName": _RESCAN_SCHEDULE_GROUP,
+        "ScheduleExpression": expression,
+        "ScheduleExpressionTimezone": timezone,
+        "FlexibleTimeWindow": {"Mode": "OFF"},
+        "State": "ENABLED",
+        "Target": {
+            "Arn": _RESCAN_TARGET_ARN,
+            "RoleArn": _RESCAN_SCHEDULE_ROLE_ARN,
+            "Input": json.dumps({"scheduledRescan": True, "namespaceId": namespace_id, "sourceId": source_id}),
+        },
+    }
+    scheduler = _get_scheduler()
+    try:
+        scheduler.create_schedule(**params)
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ConflictException":
+            scheduler.update_schedule(**params)
+        else:
+            raise
+
+
+def _delete_rescan_schedule(source_id: str) -> None:
+    """Best-effort delete of a source's rescan schedule (no-op when absent)."""
+    if not _RESCAN_SCHEDULE_GROUP:
+        return
+    try:
+        _get_scheduler().delete_schedule(Name=_schedule_name(source_id), GroupName=_RESCAN_SCHEDULE_GROUP)
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") != "ResourceNotFoundException":
+            logger.warning("rescan_schedule_delete_failed", source_id=source_id, exc_info=True)
+
+
+def _handle_put_rescan_schedule(event: dict[str, Any], namespace_id: str, source_id: str) -> dict[str, Any]:
+    """PUT /namespaces/{namespaceId}/sources/{sourceId}/rescan-schedule.
+
+    Configure or disable a recurring rescan. enabled=true creates/updates an
+    EventBridge schedule that fires a SCHEDULED rescan on the given cadence;
+    enabled=false removes it. The cadence is persisted on the source record.
+    """
+    try:
+        raw: dict[str, Any] = json.loads(event.get("body") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return api_response(400, {"error": "Invalid JSON body"})
+
+    enabled = bool(raw.get("enabled"))
+    expression = raw.get("scheduleExpression")
+    timezone = raw.get("timezone") or "UTC"
+
+    try:
+        item = _get_dao().get({"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"})
+    except ClientError:
+        logger.exception("ddb_get_failed", source_id=source_id)
+        return api_response(500, {"error": "Internal server error"})
+    if not item:
+        return api_response(404, {"error": f"Source '{source_id}' not found"})
+    if item.get("sourceType") != SourceType.DATABASE:
+        return api_response(400, {"error": "Rescan schedules are only supported for DATABASE sources"})
+
+    if enabled:
+        if not expression:
+            return api_response(400, {"error": "scheduleExpression is required when enabled=true"})
+        cadence_error = _schedule_expression_error(str(expression))
+        if cadence_error:
+            return api_response(400, {"error": f"Invalid schedule: {cadence_error}"})
+        if not _scheduling_configured():
+            logger.error("rescan_scheduling_not_configured", source_id=source_id)
+            return api_response(500, {"error": "Rescan scheduling is not configured"})
+        try:
+            _upsert_rescan_schedule(namespace_id, source_id, expression, timezone)
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code == "ValidationException":
+                msg = exc.response.get("Error", {}).get("Message", "invalid schedule expression")
+                return api_response(400, {"error": f"Invalid schedule: {msg}"})
+            logger.exception("rescan_schedule_upsert_failed", source_id=source_id)
+            return api_response(500, {"error": "Failed to configure schedule"})
+        schedule: dict[str, Any] = {"enabled": True, "scheduleExpression": expression, "timezone": timezone}
+    else:
+        _delete_rescan_schedule(source_id)
+        schedule = {"enabled": False}
+
+    try:
+        _get_dao().update(
+            {"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"},
+            {"rescanSchedule": schedule, "updatedAt": _now_iso()},
+            condition="attribute_exists(PK)",
+        )
+    except ClientError:
+        logger.exception("ddb_update_schedule_failed", source_id=source_id)
+        if enabled:
+            # The schedule is already live. Leaving it would re-scan the source on
+            # a cadence its record does not carry, so nothing would show it in the
+            # console and only source deletion would reap it.
+            logger.warning("rescan_schedule_rolled_back", source_id=source_id)
+            _delete_rescan_schedule(source_id)
+        return api_response(500, {"error": "Internal server error"})
+
+    return api_response(200, {"sourceId": source_id, "rescanSchedule": schedule})
+
+
+# ---------------------------------------------------------------------------
+# EVENT-DRIVEN RESCAN (Glue Data Catalog changes via EventBridge)
+# ---------------------------------------------------------------------------
+
+# Per-source EventBridge rules match the source's Glue Data Catalog changes and
+# route them to the Glue-event SQS queue (queue policy allows EventBridge), which
+# a consumer Lambda drains into EVENT rescans. Injected by the sources stack.
+_GLUE_EVENT_QUEUE_ARN: str = os.environ.get("GLUE_EVENT_QUEUE_ARN", "")
+_GLUE_EVENT_RULE_PREFIX: str = os.environ.get("GLUE_EVENT_RULE_PREFIX", "")
+
+# Glue typeOfChange values worth a re-scan. Partition operations are excluded:
+# partition values are data, not schema (partition KEYS change via UpdateTable),
+# so including them would re-scan a partitioned table every cooldown window.
+_GLUE_RESCAN_TYPES_OF_CHANGE: tuple[str, ...] = (
+    "CreateTable",
+    "DeleteTable",
+    "BatchDeleteTable",
+    "UpdateTable",
+    "CreateDatabase",
+    "DeleteDatabase",
+)
+
+_events = None
+
+
+def _get_events():
+    global _events
+    if _events is None:
+        _events = boto3.client("events", region_name=_AWS_REGION)
+    return _events
+
+
+def _event_rule_name(source_id: str) -> str:
+    """Deterministic EventBridge rule name for a source (<=64 chars)."""
+    return f"{_GLUE_EVENT_RULE_PREFIX}-{source_id}"[:64]
+
+
+def _event_config_ready() -> bool:
+    return bool(_GLUE_EVENT_QUEUE_ARN and _GLUE_EVENT_RULE_PREFIX)
+
+
+def _glue_database_name(item: dict[str, Any]) -> str | None:
+    """Resolve the Glue database name from a source record's stored config."""
+    return _glue_config(item).get("databaseName") or None
+
+
+def _glue_config(item: dict[str, Any]) -> dict[str, Any]:
+    """The source's Glue configuration, whichever key and shape it is stored under."""
+    for key in ("configuration", "glueConfiguration"):
+        raw = item.get(key)
+        if not raw:
+            continue
+        cfg = raw
+        if isinstance(raw, str):
+            try:
+                cfg = json.loads(raw)
+            except (json.JSONDecodeError, ValueError):
+                continue
+        if isinstance(cfg, dict) and cfg.get("databaseName"):
+            return cfg
+    return {}
+
+
+def _own_account_id() -> str:
+    """This deployment's account, taken from an injected ARN to avoid an STS call."""
+    for arn in (_GLUE_EVENT_QUEUE_ARN, _RESCAN_TARGET_ARN):
+        parts = (arn or "").split(":")
+        if len(parts) > 4 and parts[4]:
+            return parts[4]
+    return ""
+
+
+def _event_rescan_scope_error(item: dict[str, Any]) -> str | None:
+    """Reject a Glue catalog this deployment's event bus cannot observe.
+
+    Glue publishes catalog changes to the default bus in its own account and
+    region, and the rule is created on ours, so a remote catalog silently never
+    delivers while the API reports success.
+    """
+    cfg = _glue_config(item)
+    region = str(cfg.get("region") or "").strip()
+    if region and region != _AWS_REGION:
+        return f"the Glue catalog must be in {_AWS_REGION}; this source uses {region}"
+    if cfg.get("crossAccountRoleArn"):
+        return "cross-account Glue catalogs are not supported"
+    catalog_account = str(cfg.get("catalogId") or "").split(":")[0].strip()
+    own = _own_account_id()
+    if catalog_account and own and catalog_account != own:
+        return f"the Glue catalog must be in account {own}; this source uses {catalog_account}"
+    return None
+
+
+def _enable_event_rule(namespace_id: str, source_id: str, database_name: str) -> None:
+    """Create/update the EventBridge rule that routes Glue changes to the queue."""
+    events = _get_events()
+    name = _event_rule_name(source_id)
+    pattern = json.dumps(
+        {
+            "source": ["aws.glue"],
+            "detail-type": [
+                "Glue Data Catalog Database State Change",
+                "Glue Data Catalog Table State Change",
+            ],
+            "detail": {
+                "databaseName": [database_name],
+                "typeOfChange": list(_GLUE_RESCAN_TYPES_OF_CHANGE),
+            },
+        }
+    )
+    events.put_rule(
+        Name=name,
+        EventPattern=pattern,
+        State="ENABLED",
+        Description=f"Event-driven rescan for source {source_id}",
+    )
+    events.put_targets(
+        Rule=name,
+        Targets=[
+            {
+                "Id": "glue-event-queue",
+                "Arn": _GLUE_EVENT_QUEUE_ARN,
+                # Constant payload: the consumer only needs to know which source
+                # to rescan, not the Glue event detail.
+                "InputTransformer": {
+                    "InputPathsMap": {},
+                    "InputTemplate": json.dumps(
+                        {"namespaceId": namespace_id, "sourceId": source_id, "trigger": "EVENT"}
+                    ),
+                },
+            }
+        ],
+    )
+
+
+def _disable_event_rule(source_id: str) -> None:
+    """Best-effort delete of a source's Glue-event rule (no-op when absent)."""
+    if not _GLUE_EVENT_RULE_PREFIX:
+        return
+    events = _get_events()
+    name = _event_rule_name(source_id)
+    with contextlib.suppress(ClientError):
+        events.remove_targets(Rule=name, Ids=["glue-event-queue"])
+    try:
+        events.delete_rule(Name=name)
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") != "ResourceNotFoundException":
+            logger.warning("event_rule_delete_failed", source_id=source_id, exc_info=True)
+
+
+def _handle_put_event_rescan(event: dict[str, Any], namespace_id: str, source_id: str) -> dict[str, Any]:
+    """PUT /namespaces/{namespaceId}/sources/{sourceId}/event-rescan.
+
+    Enable/disable event-driven rescans for a Glue source. enabled=true creates
+    an EventBridge rule matching the source's Glue Data Catalog changes;
+    enabled=false removes it. The config is persisted on the source record.
+    """
+    try:
+        raw: dict[str, Any] = json.loads(event.get("body") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return api_response(400, {"error": "Invalid JSON body"})
+
+    enabled = bool(raw.get("enabled"))
+
+    try:
+        item = _get_dao().get({"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"})
+    except ClientError:
+        logger.exception("ddb_get_failed", source_id=source_id)
+        return api_response(500, {"error": "Internal server error"})
+    if not item:
+        return api_response(404, {"error": f"Source '{source_id}' not found"})
+    if item.get("sourceType") != SourceType.DATABASE:
+        return api_response(400, {"error": "Event-driven rescans are only supported for DATABASE sources"})
+    if item.get("sourceSubType") != SourceSubType.GLUE_DATABASE:
+        # JDBC engines have no upstream change-event feed.
+        return api_response(400, {"error": "Event-driven rescans are only supported for Glue Data Catalog sources"})
+
+    if enabled:
+        if not _event_config_ready():
+            logger.error("event_rescan_not_configured", source_id=source_id)
+            return api_response(500, {"error": "Event-driven rescans are not configured"})
+        scope_error = _event_rescan_scope_error(item)
+        if scope_error:
+            return api_response(400, {"error": f"Event-driven rescans unavailable: {scope_error}"})
+        database_name = _glue_database_name(item)
+        if not database_name:
+            return api_response(500, {"error": "Could not resolve the source's Glue database name"})
+        try:
+            _enable_event_rule(namespace_id, source_id, database_name)
+        except ClientError:
+            logger.exception("event_rule_upsert_failed", source_id=source_id)
+            return api_response(500, {"error": "Failed to configure event-driven rescans"})
+        config: dict[str, Any] = {"enabled": True}
+    else:
+        _disable_event_rule(source_id)
+        config = {"enabled": False}
+
+    try:
+        _get_dao().update(
+            {"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"},
+            {"eventRescan": config, "updatedAt": _now_iso()},
+            condition="attribute_exists(PK)",
+        )
+    except ClientError:
+        logger.exception("ddb_update_event_rescan_failed", source_id=source_id)
+        if enabled:
+            # The rule is live by now, so leaving it means it keeps firing while
+            # the record and the console both read OFF.
+            logger.warning("event_rule_rolled_back", source_id=source_id)
+            _disable_event_rule(source_id)
+        return api_response(500, {"error": "Internal server error"})
+
+    return api_response(200, {"sourceId": source_id, "eventRescan": config})
+
+
+# ---------------------------------------------------------------------------
 # UPDATE METADATA
 # ---------------------------------------------------------------------------
 
@@ -2626,13 +3468,20 @@ def _validate_configuration_blob(config_key: str, blob: Any) -> dict[str, Any] |
     rather than trusting the caller is what keeps a stored blob loadable by the GET
     path, which reconstructs it through the same model.
     """
+    # `databricksSqlWarehouseConfiguration` is absent deliberately — see
+    # `config_key_for_sub_type` in `_handle_update_metadata`, where the 400 comes from.
     models = {
         "glueConfiguration": GlueConfiguration,
         "jdbcConfiguration": JdbcConfiguration,
         "customConnectorConfiguration": CustomConnectorConfiguration,
     }
+    model = models.get(config_key)
+    if model is None:
+        # Reachable only for a legacy row with no sourceSubType, where the caller's key is
+        # taken as authoritative. A 400 rather than a KeyError.
+        return api_response(400, {"error": f"Configuration updates are not supported for '{config_key}'."})
     try:
-        models[config_key].model_validate(blob)
+        model.model_validate(blob)
     except PydanticValidationError as exc:
         return api_response(400, {"error": f"Invalid {config_key}: {exc.errors()[0]['msg']}"})
     return None
@@ -2818,12 +3667,23 @@ def _handle_update_metadata(event: dict[str, Any], namespace_id: str, source_id:
     # CUSTOM_CONNECTOR row (or vice versa) leaves a record whose blob and sub-type
     # disagree, and GET then 500s on the mismatched required members rather than
     # mislabelling anything.
+    #
+    # DATABRICKS_SQL_WAREHOUSE is deliberately ABSENT, so it falls into the
+    # recognised-but-unmapped arm below and returns a 400. Its connection facts are
+    # written TWICE at create — once on this record and once into the connector's SSM
+    # parameter, which is what the connector actually reads — and write-once is what makes
+    # that duplication safe. An update path that does not write both transactionally
+    # leaves the two able to disagree, with the parameter's copy silently winning every
+    # query. Correcting a wrong HTTP path or a rotated secret ARN means delete and
+    # re-create.
     config_key_for_sub_type = {
         SourceSubType.GLUE_DATABASE.value: "glueConfiguration",
         SourceSubType.JDBC_DATABASE.value: "jdbcConfiguration",
         SourceSubType.CUSTOM_CONNECTOR.value: "customConnectorConfiguration",
     }
-    supplied_config_keys = [k for k in config_key_for_sub_type.values() if body.get(k)]
+    # ALL the create-input members, not just the mapped ones: a body carrying an unmapped
+    # member would otherwise fall through this block and return 200 while changing nothing.
+    supplied_config_keys = [k for k in _CONFIG_MEMBERS if body.get(k)]
     if len(supplied_config_keys) > 1:
         return api_response(
             400,

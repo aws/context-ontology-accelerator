@@ -26,6 +26,7 @@ Two differences from the within-source pass, both driven by #1088:
 from __future__ import annotations
 
 import logging
+import re
 from collections import Counter
 
 from coa_common.bedrock import BedrockTruncationError
@@ -54,7 +55,7 @@ Respond ONLY with raw JSON — a JSON array of objects with this exact structure
     "target_table": "ds2.customers",
     "target_column": "id",
     "confidence": 0.9,
-    "rationale": "orders.customer_id matches the customers primary key in ds2"
+    "rationale": "customer_id matches the customers primary key"
   }
 ]
 
@@ -68,7 +69,16 @@ that names the link (e.g. "maps to a customer via account_xref") is strong evide
 EXACT "dsN.table" labels shown.
 - confidence is 0.0-1.0 based on how strongly names/types/descriptions agree.
 - Prefer the target's primary key / id column unless a description says otherwise.
+- rationale is ONE short clause (max 20 words) a reviewer can read at a glance: \
+name the evidence (matching key, description text, shared id space). Do NOT use \
+the dsN aliases in it — refer to tables and columns by name only.
 - If no cross-source relationships can be inferred, return an empty array []."""
+
+# Reviewer-facing note budget. The UI shows the note inline next to a yes/no
+# decision, and a column can carry several relationships; a paragraph per row
+# made review unworkable (0.3.3 feedback). The prompt asks for a clause; this is
+# the guarantee when the model doesn't comply.
+_NOTE_MAX_CHARS = 160
 
 
 def _source_aliases(tables: list[Table]) -> dict[str, str]:
@@ -264,6 +274,34 @@ def _has_equivalent_cross_source_fk(table: Table, candidate: dict, target_name: 
     )
 
 
+_ALIAS_RE = re.compile(r"\b(ds\d+)\.")
+_ALIAS_BARE_RE = re.compile(r"\b(ds\d+)\b")
+
+
+def _review_note(rationale: str, alias_to_database: dict[str, str], fallback: str) -> str:
+    """Turn the model's rationale into the one-line note a steward sees.
+
+    * ``dsN`` aliases are an internal prompt device that maps to nothing in the
+      UI; rewrite ``ds2.customers`` -> ``crm_salesforce.customers`` and a bare
+      ``ds2`` -> ``crm_salesforce`` using the databases the aliases stood for.
+    * Collapse whitespace; keep the first sentence when there are several — the
+      model tends to restate the same evidence — and cap at ``_NOTE_MAX_CHARS``
+      on a word boundary.
+    * Empty rationale -> ``fallback`` (the structural "a.b -> c" form).
+    """
+    text = " ".join((rationale or "").split())
+    if not text:
+        return fallback
+    text = _ALIAS_RE.sub(lambda m: f"{alias_to_database.get(m.group(1), m.group(1))}.", text)
+    text = _ALIAS_BARE_RE.sub(lambda m: alias_to_database.get(m.group(1), m.group(1)), text)
+    # First sentence only (a period followed by a space and a capital / quote).
+    first = re.split(r"(?<=[.!?])\s+(?=[A-Z\"'])", text, maxsplit=1)[0]
+    if len(first) > _NOTE_MAX_CHARS:
+        cut = first[: _NOTE_MAX_CHARS - 1].rsplit(" ", 1)[0]
+        first = cut.rstrip(" ,;:") + "…"
+    return first
+
+
 def apply_cross_source_relationships(tables: list[Table], candidates: list[dict]) -> int:
     """Write cross-source FK candidates onto the child tables as PENDING_REVIEW.
 
@@ -279,6 +317,12 @@ def apply_cross_source_relationships(tables: list[Table], candidates: list[dict]
     alias_by_ds = _source_aliases(tables)
     labels = _labels(tables, alias_by_ds)
     table_by_label = {labels[id(t)]: t for t in tables}
+    # dsN -> the database name a reviewer actually sees (for the review note).
+    alias_to_database: dict[str, str] = {}
+    for t in tables:
+        alias = alias_by_ds.get(t.data_source_id)
+        if alias and t.database:
+            alias_to_database.setdefault(alias, t.database)
 
     applied = 0
     skipped = 0
@@ -300,9 +344,10 @@ def apply_cross_source_relationships(tables: list[Table], candidates: list[dict]
         if _has_equivalent_cross_source_fk(src, cand, tgt.name, tgt.data_source_id):
             skipped += 1
             continue
-        rationale = (cand.get("rationale") or "").strip()
-        provenance = rationale or (
-            f"cross-source inference: {cand['source_table']}.{cand['column']} -> {cand['target_table']}"
+        provenance = _review_note(
+            cand.get("rationale") or "",
+            alias_to_database,
+            f"inferred: {src.database}.{src.name}.{cand['column']} -> {tgt.database}.{tgt.name}",
         )
         src.foreign_keys.append(
             ForeignKey(

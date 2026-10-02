@@ -8,6 +8,7 @@ import * as lambda from "aws-cdk-lib/aws-lambda";
 import { Template, Match } from "aws-cdk-lib/assertions";
 import { ServeStack } from "../../lib/stacks/services/serve-stack";
 import {
+  DEFAULT_BEDROCK_LLM_MODEL_ID,
   DEFAULT_RESOURCE_PREFIX,
   DEFAULT_ENV,
   DEFAULT_GRAPH_URI_BASE,
@@ -26,7 +27,7 @@ const BASE_CONTEXT = {
   "aws:cdk:bundling-stacks": [],
 };
 
-function createStack(contextOverrides: Record<string, string> = {}): Template {
+function createStack(contextOverrides: Record<string, unknown> = {}): Template {
   const app = new cdk.App({
     context: { ...BASE_CONTEXT, ...contextOverrides },
   });
@@ -663,6 +664,16 @@ describe("ServeStack - custom Athena federation connector IAM", () => {
   });
 });
 
+describe("ServeStack - query LLM model", () => {
+  it("emits BEDROCK_MODEL_ID with the shared default when bedrockLlmModelId is unset", () => {
+    createStack().hasResourceProperties("AWS::BedrockAgentCore::Runtime", {
+      EnvironmentVariables: Match.objectLike({
+        BEDROCK_MODEL_ID: DEFAULT_BEDROCK_LLM_MODEL_ID,
+      }),
+    });
+  });
+});
+
 describe("ServeStack - guardrail off switch", () => {
   it("sets no SERVE_GUARDRAILS_DISABLED variable unless the context key is passed", () => {
     // The switch removes the prompt-attack boundary, so the default deployment
@@ -867,5 +878,69 @@ describe("ServeStack - GRAPH_URI_TEMPLATE reader/writer alignment", () => {
     expect(() =>
       createStack({ graph_uri_template: "https://x.example/{namespace}" }),
     ).toThrow(/DEFAULT_GRAPH_URI_BASE/);
+  });
+});
+
+
+describe("ServeStack - SERVE_VKG_TRANSLATION_TIMEOUT_S wiring", () => {
+  const envOf = (template: Template): Record<string, unknown> => {
+    const runtimes = template.findResources("AWS::BedrockAgentCore::Runtime");
+    return Object.values(runtimes)[0].Properties.EnvironmentVariables;
+  };
+
+  it("omits the var when the context key is unset", () => {
+    expect(envOf(createStack())).not.toHaveProperty(
+      "SERVE_VKG_TRANSLATION_TIMEOUT_S",
+    );
+  });
+
+  it("passes an explicit 0 through as a string (presence-checked, not truthy)", () => {
+    // The load-bearing case: a numeric 0 in cdk.json context is falsy in JS, so a
+    // truthiness check would drop it. serve-stack uses `!== undefined`, so it must
+    // survive as "0" and be clamped downstream rather than silently ignored.
+    expect(envOf(createStack({ serve_vkg_translation_timeout_s: 0 }))).toMatchObject(
+      { SERVE_VKG_TRANSLATION_TIMEOUT_S: "0" },
+    );
+  });
+
+  it("passes a set value through verbatim", () => {
+    expect(
+      envOf(createStack({ serve_vkg_translation_timeout_s: 120 })),
+    ).toMatchObject({ SERVE_VKG_TRANSLATION_TIMEOUT_S: "120" });
+  });
+});
+
+describe("ServeStack - parameter read is deliberately broad", () => {
+  // Asserted so a well-meaning tightening cannot break serve silently. The serve
+  // runtime legitimately reads across the whole `${ssmPrefix}` tree — `/issuer`,
+  // `/userpool-client-id`, `/serve/*`, `/opensearch/*` — and scoping it to a subtree
+  // presents as a runtime AccessDenied that reads as a config error.
+  //
+  // The consequence, accepted rather than fixed: the Databricks connector parameters
+  // are readable here too, making them a metadata side channel for workspace host,
+  // credential-secret ARN and role ARN. Nothing in that payload is secret, and the
+  // ExternalId's property that matters is that COA derives it server-side, not that it
+  // is secret. Closing it needs an explicit Deny here and on the MCP role.
+  it("keeps ssm:GetParameter on the whole prefix tree, not a connectors subtree", () => {
+    const template = createStack();
+    const reads = Object.values(template.findResources("AWS::IAM::Policy"))
+      .flatMap(
+        (p: any) =>
+          p.Properties.PolicyDocument.Statement as Record<string, unknown>[],
+      )
+      .filter((st) => {
+        const actions = Array.isArray(st.Action) ? st.Action : [st.Action];
+        return st.Effect === "Allow" && actions.includes("ssm:GetParameter");
+      });
+    expect(
+      reads.some((st) => {
+        const resources = Array.isArray(st.Resource)
+          ? st.Resource
+          : [st.Resource];
+        return resources.includes(
+          "arn:aws:ssm:us-east-1:123456789012:parameter/coa/*",
+        );
+      }),
+    ).toBe(true);
   });
 });

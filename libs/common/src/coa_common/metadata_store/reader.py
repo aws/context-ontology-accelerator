@@ -160,17 +160,34 @@ def read_table_for_asset(domain_id: str, asset_id: str, asset_name: str, data_so
     """Full ``Table`` for ONE asset — the per-asset cost, paid only when needed.
 
     ``None`` when the asset has no metadata form or its form cannot be parsed,
-    matching :func:`read_assets_for_datasource`'s per-asset behaviour.
+    matching :func:`read_assets_for_datasource`'s per-asset behaviour. Transport
+    and service failures propagate so a caller does not cache an outage as
+    definitive absence.
     """
-    return _parse_asset(_client(domain_id, "catalog-asset-reader"), asset_id, asset_name, data_source_id)
+    return _parse_asset(
+        _client(domain_id, "catalog-asset-reader"),
+        asset_id,
+        asset_name,
+        data_source_id,
+        raise_on_fetch_error=True,
+    )
 
 
-def _parse_asset(client: SMUSClient, asset_id: str, asset_name: str, data_source_id: str) -> Table | None:
+def _parse_asset(
+    client: SMUSClient,
+    asset_id: str,
+    asset_name: str,
+    data_source_id: str,
+    *,
+    raise_on_fetch_error: bool = False,
+) -> Table | None:
     """Parse a DataZone asset into a Table object by reading its form."""
     try:
         detail = client.get_asset_forms(asset_id=asset_id)
     except Exception:
         logger.debug("Failed to get asset %s", asset_id, exc_info=True)
+        if raise_on_fetch_error:
+            raise
         return None
 
     forms = detail.get("formsOutput", [])

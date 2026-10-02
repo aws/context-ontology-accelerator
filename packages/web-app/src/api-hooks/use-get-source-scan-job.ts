@@ -10,6 +10,7 @@ export function useGetSourceScanJob(
   namespaceId: string,
   sourceId: string,
   jobId: string,
+  refetchInterval?: number,
 ) {
   const client = useControlPlaneClient();
 
@@ -20,5 +21,6 @@ export function useGetSourceScanJob(
         new GetSourceScanJobCommand({ namespaceId, sourceId, jobId }),
       ),
     enabled: !!namespaceId && !!sourceId && !!jobId,
+    refetchInterval,
   });
 }

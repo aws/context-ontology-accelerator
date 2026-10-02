@@ -82,6 +82,17 @@ class GraphVertex(BaseModel):
             "enrichment and emitted onto the induced class/property."
         ),
     )
+    superseded: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description=(
+            "Previous generations of this vertex's annotations, retired when a "
+            "re-induced proposal was accepted into the same ontology. Keys "
+            "are ``comments`` / ``definitions`` / ``altLabels``; values are the "
+            "literals that used to be live (typically the AI-generated text a "
+            "steward's curation replaced). Read from the ``coa:superseded*`` "
+            "history predicates; NOT live content and excluded from ``edges``."
+        ),
+    )
     graph_uris: list[str] = Field(
         default_factory=list,
         description=(

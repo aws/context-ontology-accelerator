@@ -34,6 +34,7 @@ const SOURCE_SUBTYPE_LABELS: Record<string, string> = {
   GLUE_DATABASE: "Glue",
   JDBC_DATABASE: "JDBC",
   CUSTOM_CONNECTOR: "Custom connector",
+  DATABRICKS_SQL_WAREHOUSE: "Databricks",
   S3: "S3",
   LOCAL_UPLOAD: "Upload",
 };

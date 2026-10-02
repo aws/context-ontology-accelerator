@@ -7,33 +7,32 @@ import java.util.Objects;
 import java.util.regex.Pattern;
 
 /**
- * Where one Databricks SQL Warehouse is, which Unity Catalog schema (if any) this connector is
- * pinned to, and which secret holds the credential. Immutable, validated on construction. Build one
- * through {@link #builder()}; each setter validates immediately, so a failure names the field that is
- * wrong rather than the first of several at build time.
+ * Where one Databricks SQL Warehouse is, which Unity Catalog schema (if any) this connector is pinned to,
+ * and which secret holds the credential. Immutable, built through {@link #builder()}; each setter
+ * validates immediately, so a failure names the offending field.
  *
- * <p>The catalog is required and the schema is not. An Athena federated catalog has one namespace
- * level below the registered catalog name and this connector spends it on the Unity Catalog schema, so
- * the UC catalog cannot travel in a request while the schema always does. Leaving {@link #SCHEMA_VAR}
- * unset lets one connector serve every schema in its catalog; setting it is a containment boundary
- * ({@link #isSchemaPinned()}).
+ * <p>The catalog is required, the schema is not. An Athena federated catalog has one namespace level below
+ * the registered catalog name and this connector spends it on the Unity Catalog schema, so the UC catalog
+ * cannot travel in a request while the schema always does. Unset, {@link #SCHEMA_VAR} serves every schema
+ * in the catalog; set, it is a containment boundary ({@link #isSchemaPinned()}).
  *
- * <p>Every field is patterned, and that is a security control. The hostname and HTTP path reach a JDBC
- * property list, and the catalog name is interpolated into {@code information_schema} SQL. The
- * Databricks JDBC URL is a {@code ;}-delimited property list, so a value containing {@code ;} sets
- * driver properties: {@code SSL=0} downgrades TLS, {@code ProxyHost} redirects an authenticated
- * session, {@code LogPath} writes connection details to disk. The first defence is that connection
- * material only travels in a {@link java.util.Properties} object
- * ({@link dev.coa.databricks.jdbc.DatabricksConnectionFactory}); these patterns are the second. Every
- * one bars {@code ;} and every quote character, and the four identifier-shaped fields also bar
- * {@code =}. The secret ARN cannot: {@code =} is legal in a secret name, and that value reaches only
+ * <p>Every field is patterned, and that is a security control. The Databricks JDBC URL is a
+ * {@code ;}-delimited property list, so a value containing {@code ;} sets driver properties
+ * ({@code SSL=0} downgrades TLS, {@code ProxyHost} redirects an authenticated session, {@code LogPath}
+ * writes connection details to disk), and the catalog name is interpolated into
+ * {@code information_schema} SQL. Connection material travels only in a {@link java.util.Properties}
+ * object ({@link dev.coa.databricks.jdbc.DatabricksConnectionFactory}); these patterns are the second
+ * layer. All bar {@code ;} and every quote character, and the four identifier-shaped fields also bar
+ * {@code =}. The secret ARN cannot, since {@code =} is legal in a secret name and that value reaches only
  * {@code GetSecretValue}.
  *
- * <p>Two values are folded before validation. The hostname is lower-cased because DNS is
- * case-insensitive and the pattern is not. The catalog and schema are lower-cased because
- * {@code information_schema} stores identifiers that way and this connector compares against literals
- * rather than wrapping columns in {@code LOWER()}; the folded schema is also the Athena schema name
- * this connector advertises, so the two agree.
+ * <p>{@link #managedSource()} is present only when the configuration came from a COA-managed source
+ * parameter rather than the connector's own environment. It carries the source and namespace ids and the
+ * customer-owned role the credential is behind, and is what {@link #isCoaManaged()} answers on.
+ *
+ * <p>The hostname is lower-cased because DNS is case-insensitive and the pattern is not. The catalog and
+ * schema are lower-cased because {@code information_schema} stores identifiers that way; the folded schema
+ * is also the Athena schema name advertised, so the two agree.
  */
 public final class ConnectionConfig
 {
@@ -99,6 +98,7 @@ public final class ConnectionConfig
     private final String catalog;
     private final String schema;
     private final String credentialSecretArn;
+    private final ManagedSource managedSource;
 
     private ConnectionConfig(Builder builder)
     {
@@ -110,6 +110,9 @@ public final class ConnectionConfig
         this.schema = builder.schema;
         this.credentialSecretArn =
                 require(builder.credentialSecretArn, CREDENTIAL_SECRET_ARN_VAR, builder.origin);
+        // Not require()d either: absent is what a deployment reading its endpoint from the environment
+        // looks like, and it has no source, namespace or role to name.
+        this.managedSource = builder.managedSource;
     }
 
     public static Builder builder()
@@ -214,6 +217,9 @@ public final class ConnectionConfig
                 .catalog(catalog)
                 .schema(value)
                 .credentialSecretArn(credentialSecretArn)
+                // Carried through, or the pinned copy would lose the role the credential is behind and
+                // the catalog name the cache re-checks against.
+                .managedSource(managedSource)
                 .build();
     }
 
@@ -221,6 +227,36 @@ public final class ConnectionConfig
     public String credentialSecretArn()
     {
         return credentialSecretArn;
+    }
+
+    /**
+     * The COA source this configuration belongs to and the role that guards its credential, or
+     * {@code null} in {@code environment} mode where none of that exists. Check
+     * {@link #isCoaManaged()} before dereferencing.
+     */
+    public ManagedSource managedSource()
+    {
+        return managedSource;
+    }
+
+    /**
+     * Whether this configuration came from a COA-managed source parameter rather than from the
+     * connector's own environment. In that mode the credential is reached by assuming a customer-owned
+     * role ({@link AssumedRoleCredentialSource}) and the connector holds no Secrets Manager permission
+     * of its own.
+     */
+    public boolean isCoaManaged()
+    {
+        return managedSource != null;
+    }
+
+    /**
+     * The COA source id, or {@code null} in {@code environment} mode. A convenience for a log line,
+     * which should not have to know whether a mode has a managed block.
+     */
+    public String sourceId()
+    {
+        return (managedSource == null) ? null : managedSource.sourceId();
     }
 
     /**
@@ -232,7 +268,8 @@ public final class ConnectionConfig
     {
         return "ConnectionConfig{workspaceHostname=" + workspaceHostname
                 + ", catalog=" + catalog
-                + ", schema=" + (isSchemaPinned() ? schema : "<every schema in the catalog>") + "}";
+                + ", schema=" + (isSchemaPinned() ? schema : "<every schema in the catalog>")
+                + (isCoaManaged() ? ", " + managedSource : "") + "}";
     }
 
     @Override
@@ -250,13 +287,17 @@ public final class ConnectionConfig
                 && catalog.equals(that.catalog)
                 // Objects.equals, not schema.equals: schema is null on an unpinned config.
                 && Objects.equals(schema, that.schema)
-                && credentialSecretArn.equals(that.credentialSecretArn);
+                && credentialSecretArn.equals(that.credentialSecretArn)
+                // Part of identity: two catalogs that happen to name the same warehouse and secret still
+                // belong to different sources.
+                && Objects.equals(managedSource, that.managedSource);
     }
 
     @Override
     public int hashCode()
     {
-        return Objects.hash(workspaceHostname, httpPath, catalog, schema, credentialSecretArn);
+        return Objects.hash(workspaceHostname, httpPath, catalog, schema, credentialSecretArn,
+                managedSource);
     }
 
     private static String require(String value, String label, String origin)
@@ -305,6 +346,7 @@ public final class ConnectionConfig
         private String catalog;
         private String schema;
         private String credentialSecretArn;
+        private ManagedSource managedSource;
 
         private Builder()
         {
@@ -378,6 +420,16 @@ public final class ConnectionConfig
         {
             this.credentialSecretArn =
                     check(trimToNull(value), SECRET_ARN, CREDENTIAL_SECRET_ARN_VAR, 2048);
+            return this;
+        }
+
+        /**
+         * The COA source this configuration belongs to. <b>Optional:</b> null is what
+         * {@code environment} mode looks like. Already validated by {@link ManagedSource}'s own builder.
+         */
+        public Builder managedSource(ManagedSource value)
+        {
+            this.managedSource = value;
             return this;
         }
 

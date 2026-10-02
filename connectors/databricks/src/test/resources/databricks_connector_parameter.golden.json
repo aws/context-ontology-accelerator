@@ -1,0 +1,11 @@
+{
+  "sourceId": "src-abc123",
+  "namespaceId": "550e8400-e29b-41d4-a716-446655440000",
+  "deploymentId": "coa-dev",
+  "workspaceHostname": "dbc-a1b2345c-d6e7.cloud.databricks.com",
+  "httpPath": "/sql/1.0/warehouses/a1b234c567d8e9fa",
+  "databricksCatalog": "main",
+  "databaseName": "sales",
+  "credentialSecretArn": "arn:aws:secretsmanager:us-east-1:222233334444:secret:dbx-sp-AbCdEf",
+  "crossAccountRoleArn": "arn:aws:iam::222233334444:role/coa-dev-datasource-access-dbx"
+}

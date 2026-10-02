@@ -28,6 +28,9 @@ CONNECTOR_REGISTRY: dict[str, type[MetadataConnector]] = {
     SourceSubType.GLUE_DATABASE: GlueCatalogConnector,
     SourceSubType.JDBC_DATABASE: JdbcConnector,
     SourceSubType.CUSTOM_CONNECTOR: CustomConnector,
+    # `CustomConnector` keys on the derived Athena catalog name and the database name
+    # rather than on the sub-type, so it already discovers a Databricks source correctly.
+    SourceSubType.DATABRICKS_SQL_WAREHOUSE: CustomConnector,
 }
 
 

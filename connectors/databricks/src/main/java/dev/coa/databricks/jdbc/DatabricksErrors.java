@@ -125,6 +125,14 @@ public final class DatabricksErrors
      */
     public static final String CREDENTIAL_UNREADABLE_PREFIX = "CONNECTOR_CREDENTIAL_UNREADABLE";
 
+    /**
+     * Prefix for a customer-owned role the connector could not <b>assume</b>, as against
+     * {@link #CREDENTIAL_UNREADABLE_PREFIX}, which is a role that was assumed and then could not read
+     * the secret. Its own prefix and its own metric because the fix is the role's <b>trust</b> policy or
+     * the ExternalId condition on it, and COA neither owns nor can repair either.
+     */
+    public static final String CREDENTIAL_ASSUME_DENIED_PREFIX = "CONNECTOR_CREDENTIAL_ASSUME_DENIED";
+
     /** Package prefix of every class the Databricks JDBC driver throws from. */
     private static final String DRIVER_PACKAGE = "com.databricks.";
 
@@ -226,6 +234,67 @@ public final class DatabricksErrors
                         + " that key, granted on BOTH the role and the key's own policy. The CDK app"
                         + " grants the role half from CREDENTIAL_KMS_KEY_ARN; the key policy is the key"
                         + " owner's."
+                        + (detail == null ? "" : " Cause: " + cause.getClass().getSimpleName()
+                                + ": " + detail),
+                ErrorDetails.builder()
+                        .errorCode(FederationSourceErrorCode.ACCESS_DENIED_EXCEPTION.toString())
+                        .build());
+    }
+
+    /**
+     * Reports a secret that could not be read <b>through an assumed role</b>: the assume worked, so the
+     * trust policy is right, and it is the role's permission policy or the secret's key policy that is
+     * short.
+     *
+     * <p>Shares {@link #CREDENTIAL_UNREADABLE_PREFIX} with the direct-read case — the same event to an
+     * alarm — while the advice differs: in this mode the connector holds no Secrets Manager grant of its
+     * own, so pointing an operator at the function's role sends them to a policy that grants nothing.
+     *
+     * @param roleArn the customer-owned role the secret was read as.
+     */
+    public static AthenaConnectorException credentialUnreadableThroughRole(
+            String secretArn, String roleArn, Throwable cause)
+    {
+        String detail = redact(rootMessage(cause));
+        return new AthenaConnectorException(
+                CREDENTIAL_UNREADABLE_PREFIX + ": assumed " + roleArn + " successfully, but could not"
+                        + " read the credential from " + secretArn + " as that session. The trust"
+                        + " policy is therefore fine and the role's PERMISSION policy is not: it needs"
+                        + " secretsmanager:GetSecretValue on that one secret, plus kms:Decrypt on the"
+                        + " secret's key if that key is customer-managed — which AWS requires whenever"
+                        + " the secret and the role are in different accounts, because the AWS-managed"
+                        + " aws/secretsmanager key cannot be read from outside its own account by any"
+                        + " policy. This connector holds no Secrets Manager or KMS permission of its"
+                        + " own, so there is nothing to grant on COA's side."
+                        + (detail == null ? "" : " Cause: " + cause.getClass().getSimpleName()
+                                + ": " + detail),
+                ErrorDetails.builder()
+                        .errorCode(FederationSourceErrorCode.ACCESS_DENIED_EXCEPTION.toString())
+                        .build());
+    }
+
+    /**
+     * Reports a customer-owned role the connector could not assume.
+     *
+     * @param externalId the ExternalId that was presented. Safe to echo: an anti-confusion token derived
+     *                   from the deployment prefix and namespace id, not a secret — and the commonest
+     *                   cause is a trust policy conditioned on a different value, so the two strings side
+     *                   by side are the whole diagnosis.
+     */
+    public static AthenaConnectorException credentialAssumeDenied(
+            String roleArn, String externalId, Throwable cause)
+    {
+        String detail = redact(rootMessage(cause));
+        return new AthenaConnectorException(
+                CREDENTIAL_ASSUME_DENIED_PREFIX + ": could not assume " + roleArn + ", so the"
+                        + " credential behind it was never reached. This is a policy in the role's own"
+                        + " account, not a Databricks problem and not a grant COA can make. Check that"
+                        + " the role's trust policy names this connector's execution role and"
+                        + " conditions sts:ExternalId on exactly \"" + externalId + "\" — that value is"
+                        + " what the COA UI publishes for the namespace, and a mismatch of one"
+                        + " character reads as a plain AccessDenied. Check too that the role's name"
+                        + " begins with the deployment's reserved datasource-access prefix, since the"
+                        + " connector's own assume grant is scoped to it."
                         + (detail == null ? "" : " Cause: " + cause.getClass().getSimpleName()
                                 + ": " + detail),
                 ErrorDetails.builder()

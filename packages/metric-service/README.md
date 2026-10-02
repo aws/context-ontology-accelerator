@@ -241,18 +241,18 @@ See [`examples/sample-osi-import.yaml`](examples/sample-osi-import.yaml) for a c
 
 Validation distinguishes two severities:
 
-- **ERROR** — blocks metric creation. Only **Check 1 (SQL syntax)** is an
-  error. A metric with a syntax error in any dialect cannot be created.
-- **WARNING** — non-blocking. Checks 2–6 surface issues (missing tables,
-  unknown columns, type mismatches, unlinked ontology concepts) but the
-  metric is still published.
+- **ERROR** — predicts a create/update rejection. SQL syntax, executable
+  SELECT shape, Tier 1 Trino compatibility, source approval, and provable
+  source-table absence are blocking.
+- **WARNING/INFO** — non-blocking metadata findings such as unknown columns,
+  type mismatches, and unlinked ontology concepts.
 
 ### The 6 Checks
 
 | # | Check | Severity | What it verifies |
 |---|-------|----------|------------------|
-| 1 | SQL syntax | **ERROR** | Each dialect expression parses with `sqlglot` for the declared dialect. |
-| 2 | Table references | WARNING | Every table referenced in the SQL exists for the metric's `dataSourceId`. |
+| 1 | SQL syntax and execution shape | **ERROR** | Each dialect parses as a complete read-only SELECT; Tier 1's selected expression also parses as Trino SQL. |
+| 2 | Table references | ERROR or WARNING | The declared `sourceTable` is ERROR when absence is provable; other unresolved references remain advisory. |
 | 3 | Column references | WARNING | Referenced columns exist in their tables (and types are resolvable). |
 | 4 | Dimension columns | WARNING | Columns used in `GROUP BY` exist in the referenced tables. |
 | 5 | Filter compatibility | WARNING | Columns in `WHERE` exist and their type is compatible with the operator. |
@@ -260,11 +260,18 @@ Validation distinguishes two severities:
 
 ### Graceful Degradation
 
-Validation never crashes metric creation. Checks are skipped when their backing dependency is unavailable:
+Advisory validation degrades when its backing dependency is unavailable, while
+the source acceptance gate fails closed when a configured catalog cannot be
+read:
 
-- **Checks 2–5** are skipped when `DATA_SOURCES_TABLE` is unset or DynamoDB is unreachable.
+- **Source approval** fails closed with 503 when `DATA_SOURCES_TABLE` is unset
+  or its DynamoDB record cannot be read.
+- **Check 2** returns an advisory "not verified" finding when catalog metadata
+  is not configured or does not yet enumerate approved assets; a configured
+  catalog read failure returns 503.
+- **Checks 3–5** are skipped when table/column metadata is unavailable.
 - **Check 6** is skipped when Neptune is unreachable.
-- If `sqlglot` cannot be imported, soft validation is skipped entirely.
+- SQL safety and executable shape are always enforced before persistence.
 
 Ontology concept identifiers are validated against a strict CURIE/IRI
 allowlist before any SPARQL query is constructed (defense-in-depth against
@@ -272,7 +279,9 @@ SPARQL injection).
 
 ### Validate Endpoint
 
-`POST /namespaces/{ns}/metrics/validate` runs all 6 checks against a metric definition supplied in the request body **without persisting it** (dry-run). Useful for "validate before create" UX workflows and re-validation after schema/ontology changes.
+`POST /namespaces/{ns}/metrics/validate` runs the SQL, source acceptance, and
+metadata checks against a metric definition **without persisting it** (dry-run).
+ERROR findings predict create/update rejection; INFO findings are advisory.
 
 **Request body** matches the create metric schema (name, description, expression, dataSourceId, sourceTable, ontologyConcepts).
 
@@ -288,8 +297,10 @@ SPARQL injection).
 ### Validation on Create / Update
 
 `POST /metrics` and `PUT /metrics/{name}` run the same checks implicitly.
-Check 1 (syntax) is enforced as a hard error (400); Checks 2–6 are returned as
-non-blocking `warnings` on the `201`/`200` response body.
+SQL syntax/read-only/executable-shape failures, an unapproved source, and a
+provably absent declared source table are hard errors (400). Other findings
+from Checks 2–6 are returned as non-blocking `warnings` on the `201`/`200`
+response body.
 
 ## Environment Variables
 
@@ -300,7 +311,7 @@ non-blocking `warnings` on the `201`/`200` response body.
 | `NEPTUNE_ENDPOINT` | Yes | Neptune SPARQL endpoint (SigV4 auth) |
 | `NDB_GRAPH_URI_BASE` | No | Base URL for per-namespace graph URIs. Must match ontology-engine config. Default: `https://ontology-workbench.local` |
 | `OPENSEARCH_ENDPOINT` | Yes | OpenSearch Serverless collection endpoint |
-| `DATA_SOURCES_TABLE` | No | DynamoDB table for source/table/column metadata (Checks 2–5). Skipped when unset |
+| `DATA_SOURCES_TABLE` | No | DynamoDB table for source approval and table/column metadata. Source acceptance fails closed when unavailable; advisory Checks 2–5 degrade as described above |
 | `OSI_BUCKET_NAME` | Yes | S3 bucket for OSI file staging (upload + async read) |
 | `IMPORT_QUEUE_URL` | Yes | SQS URL for async import messages |
 | `IMPORT_JOBS_TABLE` | Yes | DynamoDB table for import job tracking |
@@ -406,7 +417,7 @@ Auth uses SigV4 (`aoss` service) via `opensearch-py` + `requests_aws4auth`.
 | Symptom | Likely Cause | Fix |
 |---------|--------------|-----|
 | Create returns 409 | Metric with that name already exists in the namespace | Use PUT to update, or delete first |
-| Validation warnings but metric still created | Expected — only Check 1 (syntax) blocks creation; Checks 2–6 are advisory | Review warnings and fix at your pace |
+| Validation warnings but metric still created | The finding is advisory; SQL safety/shape, source approval, and provably absent `sourceTable` findings are hard errors instead | Review the advisory metadata or ontology finding and fix it at your pace |
 | Import returns 202 but job stays `IN_PROGRESS` | Worker Lambda errored or continuation message was lost | Check the import worker CloudWatch logs; check the DLQ |
 | Import job `FAILED` immediately | OSI YAML parse error or dataset resolution failure | Check the `errors` field on the job; verify datasets reference valid `data_source_id` values |
 | Neptune timeout on list/get | Large namespace or Neptune instance under-provisioned | Check Neptune CloudWatch metrics; consider increasing instance size |

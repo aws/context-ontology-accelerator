@@ -356,3 +356,41 @@ apply ListSourceScanJobs @examples([
         }
     }
 ])
+
+apply PutSourceRescanSchedule @examples([
+    {
+        title: "Enable a nightly rescan"
+        input: { namespaceId: "3f2504e0-4f89-41d3-9a0c-0305e82c3301", sourceId: "src-7f3a9c1e", enabled: true, scheduleExpression: "cron(0 3 * * ? *)", timezone: "America/New_York" }
+        output: {
+            sourceId: "src-7f3a9c1e"
+            rescanSchedule: { enabled: true, scheduleExpression: "cron(0 3 * * ? *)", timezone: "America/New_York" }
+        }
+    }
+    {
+        title: "Disable the recurring rescan"
+        input: { namespaceId: "3f2504e0-4f89-41d3-9a0c-0305e82c3301", sourceId: "src-7f3a9c1e", enabled: false }
+        output: {
+            sourceId: "src-7f3a9c1e"
+            rescanSchedule: { enabled: false }
+        }
+    }
+])
+
+apply PutSourceEventRescan @examples([
+    {
+        title: "Enable event-driven rescans"
+        input: { namespaceId: "3f2504e0-4f89-41d3-9a0c-0305e82c3301", sourceId: "src-7f3a9c1e", enabled: true }
+        output: {
+            sourceId: "src-7f3a9c1e"
+            eventRescan: { enabled: true }
+        }
+    }
+    {
+        title: "Disable event-driven rescans"
+        input: { namespaceId: "3f2504e0-4f89-41d3-9a0c-0305e82c3301", sourceId: "src-7f3a9c1e", enabled: false }
+        output: {
+            sourceId: "src-7f3a9c1e"
+            eventRescan: { enabled: false }
+        }
+    }
+])

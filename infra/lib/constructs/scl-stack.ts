@@ -4,6 +4,10 @@
 import * as cdk from "aws-cdk-lib";
 import { Construct } from "constructs";
 import { resolveContext, prefixed } from "../context";
+import {
+  RESERVED_DATASOURCE_ROLE_SEGMENT,
+  ReservedRoleNamePrefix,
+} from "../aspects/reserved-role-prefix";
 
 /**
  * Base stack for all SemanticContext CloudFormation stacks.
@@ -43,6 +47,16 @@ export class SCLStack extends cdk.Stack {
     cdk.Tags.of(this).add("Environment", envName);
 
     this.envName = envName;
+
+    // Attached in the base class, not at the grant site: the reserved
+    // `{prefix}-{env}-datasource-access-*` name bounds which roles COA will
+    // assume, and a role created in any stack lands inside that bound.
+    // Inheritance means a stack added later cannot forget the check.
+    cdk.Aspects.of(this).add(
+      new ReservedRoleNamePrefix(
+        prefixed(this.node, RESERVED_DATASOURCE_ROLE_SEGMENT),
+      ),
+    );
   }
 
   /** Return a consistently prefixed resource name. */

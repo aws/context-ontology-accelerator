@@ -28,5 +28,5 @@ export {
 } from "./constants";
 export type { RuntimeConfig } from "./types";
 export { NAMESPACE_ID_PREFIX } from "./namespace";
-export { PrincipalType, ResourceType } from "./authnz";
+export { PrincipalType, ResourceType, sanitizePrincipalKey } from "./authnz";
 export type { ResourceRoleMapping } from "./authnz";

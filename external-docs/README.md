@@ -44,6 +44,7 @@ pandoc \
   content/cedar-policy-authoring.md \
   content/cross-account-sources.md \
   content/custom-connector-sources.md \
+  content/databricks-sources.md \
   content/package-guide.md \
   content/smithy-codegen.md \
   --toc --toc-depth=2 --pdf-engine=lualatex \

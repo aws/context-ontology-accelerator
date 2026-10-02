@@ -43,6 +43,7 @@ from coa_common.constants import (
     SOURCE_ACTIVE_STATUSES,
     to_graphrag_tenant_id,
     validate_namespace_id,
+    validate_source_id,
 )
 from coa_common.dao import DynamoDBDAO
 from coa_common.dao.base import QueryParams
@@ -51,6 +52,7 @@ from coa_common.response import api_response, iso_to_epoch
 from coa_control_plane_server.models.create_source_input import CreateSourceInput
 from coa_control_plane_server.models.extraction_config import ExtractionConfig
 from coa_control_plane_server.models.get_source_output import GetSourceOutput
+from coa_control_plane_server.models.scan_trigger import ScanTrigger
 from coa_control_plane_server.models.source_status import SourceStatus
 from coa_control_plane_server.models.source_sub_type import SourceSubType
 from coa_control_plane_server.models.source_summary import SourceSummary
@@ -59,13 +61,24 @@ from pydantic import ValidationError
 
 from coa_sources.database.connectors.athena_catalog import (
     AthenaCatalogError,
+    catalog_source_id,
     delete_lambda_catalog,
     derive_catalog_name,
 )
 from coa_sources.database.connectors.glue_connection_provisioner import (
     cleanup_federated_resources,
 )
+from coa_sources.database.databricks import (
+    DatabricksConfigError,
+    config_parameter_name,
+    delete_config_parameter,
+)
 from coa_sources.database.glue_ownership import release_platform_catalog
+from coa_sources.database.sub_types import (
+    CONNECTOR_BACKED_SUB_TYPES,
+    FEDERATED_TEARDOWN_SUB_TYPES,
+    PLATFORM_CATALOG_CLAIM_SUB_TYPES,
+)
 from coa_sources.utils import merge_extraction_config
 
 from .namespace_counters import adjust_namespace_source_count
@@ -84,6 +97,10 @@ _INGESTION_QUEUE_URL: str = os.environ.get("INGESTION_QUEUE_URL", "")
 _REVIEW_QUEUE_URL: str = os.environ.get("REVIEW_QUEUE_URL", "")
 _BUCKET_NAME: str = os.environ.get("BUCKET_NAME", "")
 _DELETION_STATE_MACHINE_ARN: str = os.environ.get("DELETION_STATE_MACHINE_ARN", "")
+
+# Queue feeding the database-source deletion worker. Empty means "not wired" and
+# the delete finishes inline instead — see the fallback in ``_handle_delete``.
+_SOURCE_DELETE_QUEUE_URL: str = os.environ.get("SOURCE_DELETE_QUEUE_URL", "")
 _NAMESPACES_TABLE: str = os.environ.get("NAMESPACES_TABLE", "")
 _AWS_REGION: str = resolve_region()
 _SMUS_DOMAIN_ID: str = os.environ.get("SMUS_DOMAIN_ID", "")
@@ -102,6 +119,14 @@ try:
     _DATAZONE_CLEANUP_BUDGET_S: int = int(os.environ.get("DATAZONE_CLEANUP_BUDGET_S", "240"))
 except (ValueError, TypeError):
     _DATAZONE_CLEANUP_BUDGET_S = 240
+# Cooldown (seconds) for EVENT-triggered rescans: an upstream change burst can
+# fire many Glue events in quick succession, so an EVENT rescan is skipped when
+# the source was scanned within this window. Manual/scheduled rescans ignore it.
+# Guarded like the budget above: a bad value must not crash cold start.
+try:
+    _EVENT_RESCAN_COOLDOWN_S: int = int(os.environ.get("EVENT_RESCAN_COOLDOWN_S", "300"))
+except (ValueError, TypeError):
+    _EVENT_RESCAN_COOLDOWN_S = 300
 
 _DEFAULT_MAX_RESULTS = 100
 _MAX_RESULTS_LIMIT = 100
@@ -128,6 +153,7 @@ _DETAIL_CONFIG_KEYS: dict[str, str] = {
     SourceSubType.GLUE_DATABASE.value: "glueConfiguration",
     SourceSubType.JDBC_DATABASE.value: "jdbcConfiguration",
     SourceSubType.CUSTOM_CONNECTOR.value: "customConnectorConfiguration",
+    SourceSubType.DATABRICKS_SQL_WAREHOUSE.value: "databricksSqlWarehouseConfiguration",
 }
 
 # How a row this map does not cover is read: as Glue, which is how every
@@ -268,6 +294,21 @@ def _now_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _within_event_cooldown(item: dict[str, Any]) -> bool:
+    """True when the source was scanned within the EVENT-rescan cooldown window.
+
+    Used to coalesce bursts of upstream change events into a single rescan.
+    """
+    last = item.get("lastScanAt")
+    if not last:
+        return False
+    try:
+        last_dt = datetime.fromisoformat(str(last).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return (datetime.now(UTC) - last_dt).total_seconds() < _EVENT_RESCAN_COOLDOWN_S
+
+
 def _source_id_from_item(item: dict[str, Any]) -> str:
     sk = item.get("SK", "")
     return sk.removeprefix("SRC#") if sk.startswith("SRC#") else sk
@@ -337,6 +378,10 @@ def _build_database_detail(item: dict[str, Any]) -> dict[str, Any] | None:
         db["glueConfiguration"].setdefault("executionEngine", "REDSHIFT")
     if item.get("lastScanAt"):
         db["lastScanAt"] = iso_to_epoch(item["lastScanAt"])
+    if item.get("rescanSchedule"):
+        db["rescanSchedule"] = item["rescanSchedule"]
+    if item.get("eventRescan"):
+        db["eventRescan"] = item["eventRescan"]
     return db or None
 
 
@@ -504,12 +549,16 @@ def _item_to_detail(item: dict[str, Any], metrics: dict[str, Any] | None = None)
 
 from .database_routes import (  # noqa: E402
     _create_database_source,
+    _delete_rescan_schedule,
+    _disable_event_rule,
     _handle_approve_source,
     _handle_get_scan_job,
     _handle_get_table,
     _handle_keep_rescan_removal,
     _handle_list_scan_jobs,
     _handle_list_tables,
+    _handle_put_event_rescan,
+    _handle_put_rescan_schedule,
     _handle_reject_source,
     _handle_review_column,
     _handle_review_table,
@@ -587,6 +636,20 @@ def _handle_list(event: dict[str, Any], namespace_id: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _validation_message(exc: ValidationError) -> str:
+    """The first validation error, prefixed with the field it is about.
+
+    Pydantic's own message for a pattern failure is the bare regular expression, which
+    does not say which of a request's fields it rejected.
+    """
+    errors = exc.errors()
+    if not errors:
+        return str(exc)
+    first = errors[0]
+    field = ".".join(str(part) for part in first.get("loc", ()))
+    return f"Invalid {field}: {first['msg']}" if field else first["msg"]
+
+
 def _handle_create(event: dict[str, Any], namespace_id: str) -> dict[str, Any]:
     try:
         raw: dict[str, Any] = json.loads(event.get("body") or "{}")
@@ -597,8 +660,7 @@ def _handle_create(event: dict[str, Any], namespace_id: str) -> dict[str, Any]:
     try:
         req = CreateSourceInput.model_validate(raw)
     except ValidationError as exc:
-        msg = exc.errors()[0]["msg"] if exc.errors() else str(exc)
-        return api_response(400, {"error": msg})
+        return api_response(400, {"error": _validation_message(exc)})
 
     # Verify namespace exists
     ns_item = _get_ns_dao().get({"PK": f"NS#{namespace_id}", "SK": "METADATA"})
@@ -652,7 +714,7 @@ def _delete_source_datazone_assets(
     namespace_id: str,
     source_id: str,
     context: Any = None,
-) -> int:
+) -> tuple[int, bool]:
     """Remove all DataZone (SageMaker Unified Studio Catalog) assets for a source.
 
     Assets created by the discovery/enrichment pipeline are named
@@ -670,8 +732,14 @@ def _delete_source_datazone_assets(
     Lambda has little time left, even the pagination must stop early so the
     caller can return a partial-completion response rather than timing out.
 
-    Returns the number of assets deleted. Raises if the SMUS client cannot
-    be built or if the underlying domain/project is missing.
+    Returns ``(removed, complete)``: the number of assets deleted, and whether
+    cleanup ran to completion. ``complete`` is ``False`` when the search stopped
+    early on the deadline, the pagination cap was hit, the delete loop stopped
+    early on the deadline, or any individual ``delete_asset`` failed — in every
+    such case assets may remain, and the caller (``finish_database_source_deletion``)
+    must NOT delete the source row, so the delete can be retried instead of
+    orphaning them. Raises if the SMUS client cannot be built or if the
+    underlying domain/project is missing (that is a hard error, not a partial).
     """
     # Imported lazily to avoid module-load-time SMUS client construction
     # (the SMUS client touches AWS config and slows cold starts otherwise).
@@ -679,7 +747,8 @@ def _delete_source_datazone_assets(
 
     if not _SMUS_DOMAIN_ID:
         logger.info("datazone_asset_cleanup_skipped_no_domain", source_id=source_id)
-        return 0
+        # No domain configured: nothing to clean, so nothing is left behind.
+        return 0, True
 
     project_id = _resolve_project_id(namespace_id)
     if not project_id:
@@ -688,7 +757,10 @@ def _delete_source_datazone_assets(
             namespace_id=namespace_id,
             source_id=source_id,
         )
-        return 0
+        # Domain IS configured but the project could not be resolved — assets may
+        # exist and we cannot reach them. Report incomplete so the row survives
+        # and the delete is retried rather than orphaning them.
+        return 0, False
 
     client = _get_smus_client()
     ds_key = f"DS#{source_id}"
@@ -730,6 +802,9 @@ def _delete_source_datazone_assets(
         if not next_token:
             break
     else:
+        # Loop ran the full max_pages without exhausting the cursor: there are
+        # more assets than we enumerated, so cleanup cannot be complete.
+        search_stopped_early = True
         logger.warning("datazone_asset_cleanup_pagination_limit", source_id=source_id, max_pages=max_pages)
 
     # Visibility into the collection phase — a low count here vs. expected
@@ -747,8 +822,11 @@ def _delete_source_datazone_assets(
     # derived deadline: if we're near timeout, stop early and let the
     # namespace-deletion sweep finish the rest.
     removed = 0
+    delete_stopped_early = False
+    delete_failures = 0
     for idx, asset_id in enumerate(asset_ids):
         if time.monotonic() > deadline:
+            delete_stopped_early = True
             logger.warning(
                 "datazone_asset_cleanup_budget_exceeded",
                 source_id=source_id,
@@ -762,7 +840,9 @@ def _delete_source_datazone_assets(
             removed += 1
         except ClientError as exc:
             # Surface the DataZone error code to aid triage (throttling,
-            # access-denied, already-deleted). Best-effort: keep deleting.
+            # access-denied, already-deleted). Best-effort: keep deleting, but
+            # count the miss so the caller knows the asset may still be there.
+            delete_failures += 1
             logger.exception(
                 "datazone_asset_delete_failed",
                 asset_id=asset_id,
@@ -772,6 +852,7 @@ def _delete_source_datazone_assets(
         except BotoCoreError:
             # Connection/timeout/credential-resolution failures from the SDK
             # layer (no response payload). Still best-effort: keep deleting.
+            delete_failures += 1
             logger.exception(
                 "datazone_asset_delete_failed",
                 asset_id=asset_id,
@@ -782,13 +863,18 @@ def _delete_source_datazone_assets(
             # the rest of the cleanup. This loop is best-effort by design (the
             # caller in _handle_delete already treats the whole call as such);
             # narrowing further would abort cleanup of every remaining asset.
+            delete_failures += 1
             logger.exception(
                 "datazone_asset_delete_unexpected_error",
                 asset_id=asset_id,
                 source_id=source_id,
             )
 
-    return removed
+    # Complete only if we enumerated every page, deleted every collected asset
+    # within the deadline, and no individual delete failed. Any of those means
+    # an asset may still exist, so the caller must keep the row and retry.
+    complete = not search_stopped_early and not delete_stopped_early and delete_failures == 0
+    return removed, complete
 
 
 def _delete_source_scan_jobs(source_id: str) -> int:
@@ -825,6 +911,74 @@ def _delete_source_scan_jobs(source_id: str) -> int:
     return len(keys)
 
 
+# Statuses in which a prior delete attempt has ALREADY counted the source out of
+# the namespace total. The count is decremented once, when the source first
+# leaves the active set for DELETING; a DELETE retried after DELETE_FAILED (or a
+# race that already flipped it to DELETING) re-enters _handle_delete and must not
+# decrement again, or the namespace sourceCount drifts one low per retry.
+_ALREADY_DECREMENTED_STATUSES = frozenset({SourceStatus.DELETING, SourceStatus.DELETE_FAILED})
+
+# Guard for the flip to DELETING. A status check alone passes on a missing item, so
+# a row deleted by a concurrent worker would be upserted back as a key-only ghost.
+# Explicit names/values rather than an Attr: boto3 renders Attr placeholders as
+# :v0.., which silently overwrite the DAO's own SET placeholders of the same name.
+_TO_DELETING_GUARD: dict[str, Any] = {
+    "condition": "attribute_exists(PK) AND #st <> :deleting",
+    "condition_names": {"#st": "status"},
+    "condition_values": {":deleting": SourceStatus.DELETING},
+}
+
+
+def _verify_catalog_belongs_to_source(source_id: str, catalog_name: str) -> dict[str, Any] | None:
+    """Refuse a catalog delete when the catalog names a different source.
+
+    ``delete_lambda_catalog`` deletes by name with no ownership check, and the
+    registration-time check it relies on stopped discriminating once one connector Lambda
+    came to serve every source of a sub-type: that check compares the set of handler ARNs,
+    which is identical for every such catalog. The ``coa:sourceId`` tag written at create
+    is the replacement, and this is where it is read.
+
+    An UNTAGGED catalog proceeds — it was either registered by the ``CUSTOM_CONNECTOR``
+    path, which does not tag, or it predates tagging, and refusing it would make every
+    pre-tagging source undeletable.
+
+    Returns an error response, or ``None`` when the delete may proceed.
+    """
+    try:
+        tagged = catalog_source_id(catalog_name)
+    except AthenaCatalogError:
+        # Not swallowed into "untagged": a throttle or a missing
+        # athena:ListTagsForResource read as "no tag" would switch the verification
+        # off exactly when it is least trustworthy.
+        #
+        # The availability cost is not small: a MISSING athena:ListTagsForResource grant
+        # makes every Databricks source undeletable, and since the namespace-deletion cascade
+        # accepts only 200/202/404, it blocks namespace deletion too. Deliberate — loud and
+        # fail-closed beats a delete that stops verifying which catalog it removes — but it
+        # makes the grant a hard dependency, so check the sources-API role first.
+        logger.exception("athena_data_catalog_tag_read_failed", source_id=source_id, catalog_name=catalog_name)
+        return api_response(
+            500,
+            {"error": "Could not verify the Athena data catalog before removing it; deletion not completed"},
+        )
+    if tagged and tagged != source_id:
+        logger.error(
+            "athena_data_catalog_owned_by_another_source",
+            source_id=source_id,
+            catalog_name=catalog_name,
+            tagged_source_id=tagged,
+        )
+        return api_response(
+            500,
+            {
+                "error": (
+                    "The Athena data catalog for this source is registered to a different source; refusing to remove it"
+                )
+            },
+        )
+    return None
+
+
 def _handle_delete(namespace_id: str, source_id: str, context: Any = None) -> dict[str, Any]:
     try:
         item = _get_dao().get({"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"})
@@ -857,7 +1011,7 @@ def _handle_delete(namespace_id: str, source_id: str, context: Any = None) -> di
             _get_dao().update(
                 {"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"},
                 {"status": SourceStatus.DELETING, "updatedAt": now},
-                condition=Attr("status").ne(SourceStatus.DELETING),
+                **_TO_DELETING_GUARD,
             )
         except ClientError as exc:
             if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
@@ -900,7 +1054,10 @@ def _handle_delete(namespace_id: str, source_id: str, context: Any = None) -> di
         # transitions to DELETING. The actual S3 / KG cleanup is asynchronous,
         # but from the user's perspective the source is gone. The counter
         # decrement is best-effort — see ``adjust_namespace_source_count``.
-        adjust_namespace_source_count(namespace_id, SourceType.DOCUMENTS, -1)
+        # Skip it when the source was already counted out by a prior attempt
+        # (retry after DELETE_FAILED), so a retried delete does not drift the count.
+        if current_status not in _ALREADY_DECREMENTED_STATUSES:
+            adjust_namespace_source_count(namespace_id, SourceType.DOCUMENTS, -1)
 
         return api_response(202, {"sourceId": source_id, "status": SourceStatus.DELETING})
 
@@ -926,21 +1083,57 @@ def _handle_delete(namespace_id: str, source_id: str, context: Any = None) -> di
         # what makes it impossible for a stored value to redirect a delete.
         expected_name = derive_catalog_name(source_id)
 
-        # A custom-connector source owns a top-level LAMBDA-type Athena data
+        # A connector-backed source owns a top-level LAMBDA-type Athena data
         # catalog, which is a plain athena:DeleteDataCatalog on this role — no
         # Glue object, no Lake Formation grants, and so nothing to assume the
         # federation provisioner's admin role for.
         #
-        # This must run BEFORE the federated-teardown block below, and that block
-        # must exclude this sub-type: a Lambda catalog also populates
-        # `athenaDataCatalogName`, so it would otherwise match, assume the
-        # LF-admin role, and call glue.delete_catalog — a no-op for a Lambda
-        # catalog — reporting success while leaking the registration.
+        # This must run BEFORE the federated-teardown block below, and that block must
+        # exclude these sub-types: a Lambda catalog also populates `athenaDataCatalogName`,
+        # so it would otherwise assume the LF-admin role and call glue.delete_catalog — a
+        # no-op for a Lambda catalog — reporting success while leaking the registration.
         #
-        # Fails the delete (HTTP 500) rather than proceeding, for the same reason
-        # the federated teardown does: the source row is the only handle on the
-        # catalog, so dropping the row after a failed teardown orphans it.
-        if sub_type == SourceSubType.CUSTOM_CONNECTOR:
+        # Fails the delete (HTTP 500) rather than proceeding: the source row is the only
+        # handle on the catalog, so dropping the row after a failed teardown orphans it.
+        #
+        # Catalog FIRST, since it is what Athena resolves a query through, then the
+        # configuration parameter, so nothing left resolvable outlives it.
+        #
+        # But the parameter's NAME is resolved before either, while nothing has been
+        # destroyed: it comes from an environment variable, and discovered absent after the
+        # catalog is gone it is unrecoverable — the parameter is orphaned holding the role
+        # and secret ARNs, and the idempotent catalog delete makes every retry reach the
+        # same raise, leaving the row undeletable and the namespace cascade blocked. A
+        # CHANGED prefix is not detectable at all, so do not change it on a live
+        # environment.
+        databricks_parameter_name = ""
+        if sub_type == SourceSubType.DATABRICKS_SQL_WAREHOUSE:
+            try:
+                databricks_parameter_name = config_parameter_name(expected_name)
+            except DatabricksConfigError:
+                logger.exception(
+                    "databricks_config_parameter_name_unresolved",
+                    source_id=source_id,
+                    catalog_name=expected_name,
+                )
+                return api_response(
+                    500,
+                    {
+                        "error": (
+                            "Cannot determine this source's connector configuration parameter, so "
+                            "deleting it would leave one behind; deletion not attempted"
+                        )
+                    },
+                )
+
+        if sub_type in CONNECTOR_BACKED_SUB_TYPES:
+            # Scoped to the sub-type whose CREATE writes the tag. For CUSTOM_CONNECTOR it
+            # would spend a ListTagsForResource to learn nothing, and would turn a missing
+            # athena:ListTagsForResource grant into a 500 on every existing source's delete.
+            if sub_type == SourceSubType.DATABRICKS_SQL_WAREHOUSE:
+                error = _verify_catalog_belongs_to_source(source_id, expected_name)
+                if error:
+                    return error
             try:
                 delete_lambda_catalog(catalog_name=expected_name)
             except AthenaCatalogError:
@@ -952,6 +1145,28 @@ def _handle_delete(namespace_id: str, source_id: str, context: Any = None) -> di
                 return api_response(
                     500,
                     {"error": "Failed to remove the Athena data catalog; deletion not completed"},
+                )
+
+        # The connector configuration parameter, removed after the catalog and before the
+        # record. A failure answers 500 rather than proceeding: nothing else would clean up
+        # an orphaned parameter, and it keeps resolving a credential for a catalog name that
+        # could be re-registered. The row is the record that it exists, so it stays until
+        # the parameter is gone.
+        #
+        # No credential-revoke step is missing: COA holds no grant on the customer's secret,
+        # so a second source sharing the same role and secret is unaffected.
+        if databricks_parameter_name:
+            try:
+                delete_config_parameter(parameter_name=databricks_parameter_name)
+            except DatabricksConfigError:
+                logger.exception(
+                    "databricks_config_parameter_delete_failed",
+                    source_id=source_id,
+                    catalog_name=expected_name,
+                )
+                return api_response(
+                    500,
+                    {"error": "Failed to remove the connector configuration; deletion not completed"},
                 )
 
         # Teardown of any Glue federated catalog / connection provisioned for
@@ -999,8 +1214,21 @@ def _handle_delete(namespace_id: str, source_id: str, context: Any = None) -> di
             )
         glue_conn = stored_conn if stored_conn == expected_name else None
         athena_cat = stored_cat if stored_cat == expected_name else None
+        # A POSITIVE membership test, so the next sub-type added fails closed. The old
+        # `!= CUSTOM_CONNECTOR` form admitted every future sub-type, and a Lambda-backed
+        # catalog matching here assumes the Lake-Formation-admin role and calls
+        # glue.delete_catalog — a no-op against a Lambda catalog, reporting success while
+        # leaking the registration.
+        #
+        # `or not sub_type` covers a live row shape: rows predate the attribute, and a
+        # legacy JDBC row whose federation step provisioned a Glue catalog and connection
+        # would otherwise return 200 having leaked the catalog, the connection and the Lake
+        # Formation registration, with the row that was their only handle removed.
+        #
+        # Tested separately rather than by putting `""` in the set, so `""` does not become
+        # a recognised sub-type everywhere else the set is used.
         if (
-            sub_type != SourceSubType.CUSTOM_CONNECTOR
+            (sub_type in FEDERATED_TEARDOWN_SUB_TYPES or not sub_type)
             and (glue_conn or athena_cat)
             and _FEDERATION_PROVISIONER_ROLE_ARN
         ):
@@ -1038,53 +1266,173 @@ def _handle_delete(namespace_id: str, source_id: str, context: Any = None) -> di
                     {"error": "Failed to clean up federated query resources; deletion not completed"},
                 )
 
-        # Best-effort cleanup of DataZone (SageMaker Unified Studio Catalog)
-        # assets created during the discovery/enrichment pipeline. Each
-        # discovered table is registered as an asset named "DS#{sourceId}:..."
-        # in the namespace's DataZone project (see metadata_writer.py).
-        # Failures are logged but do not block the DDB delete; the assets
-        # would otherwise also be cleaned up at namespace deletion time.
-        try:
-            removed = _delete_source_datazone_assets(namespace_id, source_id, context)
-            logger.info("datazone_assets_deleted", source_id=source_id, count=removed)
-        except Exception:
-            logger.exception(
-                "datazone_asset_cleanup_failed",
-                source_id=source_id,
-                namespace_id=namespace_id,
-            )
+        # Before the handoff, not in the worker: the source sits DELETING for as
+        # long as teardown takes, and a trigger firing then rescans a dying source.
+        _delete_rescan_schedule(source_id)
+        _disable_event_rule(source_id)
 
-        # Best-effort cleanup of all scan-job records for this source.
-        # Schema: PK=SRC#{sourceId}, SK=<ISO timestamp>. These are otherwise
-        # orphaned in source-scan-jobs until namespace deletion sweeps the
-        # ByNamespace GSI.
-        try:
-            removed_jobs = _delete_source_scan_jobs(source_id)
-            logger.info("scan_jobs_deleted", source_id=source_id, count=removed_jobs)
-        except Exception:
-            logger.exception("scan_job_cleanup_failed", source_id=source_id)
+        # Everything above had to happen synchronously: it either fails the
+        # request (catalog/federation teardown, whose only handle is the row we
+        # are about to drop) or decides whether deletion may proceed at all. What
+        # remains is unbounded — one DataZone delete_asset per discovered table —
+        # so it does NOT belong in a 30-second request. Hand it to the deletion
+        # worker and answer 202, mirroring how the DOCUMENTS branch above hands
+        # its unbounded S3/KG teardown to a state machine.
+        if _SOURCE_DELETE_QUEUE_URL:
+            now = _now_iso()
+            try:
+                _get_dao().update(
+                    {"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"},
+                    {"status": SourceStatus.DELETING, "updatedAt": now},
+                    **_TO_DELETING_GUARD,
+                )
+            except ClientError as exc:
+                if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                    # Already handed off by an earlier call — idempotent.
+                    return api_response(202, {"sourceId": source_id, "status": SourceStatus.DELETING})
+                logger.exception("ddb_update_failed", source_id=source_id)
+                return api_response(500, {"error": "Internal server error"})
 
-        try:
-            _get_dao().delete({"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"})
-        except ClientError:
-            logger.exception("ddb_delete_failed", source_id=source_id)
+            try:
+                _get_sqs().send_message(
+                    QueueUrl=_SOURCE_DELETE_QUEUE_URL,
+                    MessageBody=json.dumps(
+                        {
+                            "namespace_id": namespace_id,
+                            "source_id": source_id,
+                            "sub_type": sub_type,
+                            "catalog_name": expected_name,
+                        }
+                    ),
+                )
+            except ClientError:
+                # The row stays DELETING with no worker coming, which is a lie.
+                # Mark it DELETE_FAILED so the source is visibly stuck and can be
+                # retried, rather than silently frozen mid-delete.
+                logger.exception("source_delete_enqueue_failed", source_id=source_id)
+                try:
+                    _get_dao().update(
+                        {"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"},
+                        {
+                            "status": SourceStatus.DELETE_FAILED,
+                            "errorMessage": "Failed to start deletion cleanup",
+                        },
+                    )
+                except ClientError:
+                    logger.exception("ddb_update_delete_failed_status_failed", source_id=source_id)
+                return api_response(500, {"error": "Internal server error"})
+
+            # Decrement as soon as the source enters DELETING: from the user's
+            # point of view it is gone. Matches the DOCUMENTS branch. Skip it on a
+            # retry of an already-counted-out source (DELETE_FAILED) so the count
+            # does not drift one low per retry.
+            if current_status not in _ALREADY_DECREMENTED_STATUSES:
+                adjust_namespace_source_count(namespace_id, SourceType.DATABASE, -1)
+            return api_response(202, {"sourceId": source_id, "status": SourceStatus.DELETING})
+
+        # No queue configured (local runs, or a deployment where the worker is not
+        # wired yet): finish inline, exactly as before. Same tolerance the
+        # DOCUMENTS branch shows an unset state-machine ARN — a missing async
+        # target must not mean deletion stops working.
+        if not finish_database_source_deletion(namespace_id, source_id, sub_type, expected_name, context):
             return api_response(500, {"error": "Internal server error"})
-
-        # Release the namespace's claim on the catalog name this source was given,
-        # now that both the catalog and the source row are gone. The name is
-        # derived from the source id, so it can never be re-minted for a different
-        # source — the release exists so the record does not outlive what it
-        # describes, not to free the name. Best-effort: a surviving claim only
-        # keeps a catalog that no longer exists attributed to this namespace.
-        if sub_type in (SourceSubType.JDBC_DATABASE, SourceSubType.CUSTOM_CONNECTOR):
-            with contextlib.suppress(ClientError):
-                release_platform_catalog(_get_dao(), catalog_name=expected_name)
-
-        # Decrement the namespace sourceCount after the row is gone.
-        # Best-effort — see ``adjust_namespace_source_count``.
-        adjust_namespace_source_count(namespace_id, SourceType.DATABASE, -1)
-
+        # Skip the decrement if a prior attempt already counted this source out
+        # (e.g. an async attempt that reached DELETE_FAILED before the queue was
+        # unwired and this retry fell to the inline path).
+        if current_status not in _ALREADY_DECREMENTED_STATUSES:
+            adjust_namespace_source_count(namespace_id, SourceType.DATABASE, -1)
         return api_response(200, {"sourceId": source_id, "status": SourceStatus.DELETED})
+
+
+def finish_database_source_deletion(
+    namespace_id: str,
+    source_id: str,
+    sub_type: str,
+    catalog_name: str,
+    context: Any = None,
+) -> bool:
+    """Run the unbounded tail of a database-source delete. Returns success.
+
+    Shared by the synchronous fallback in :func:`_handle_delete` and by the
+    deletion worker, so the two can never drift — the worker exists to give this
+    work a 15-minute envelope instead of a 30-second one, not to reimplement it.
+
+    Ordering matters: assets and scan jobs first, the row last. The row is the
+    only handle on this source, so dropping it before its dependents are gone
+    turns a retryable partial delete into permanent orphans (the pre-worker
+    behaviour, where the row was deleted regardless of how far cleanup got).
+
+    Asset and scan-job cleanup stay best-effort in the sense that a raised
+    error is caught — but a DataZone cleanup that reports itself INCOMPLETE
+    (deadline hit, pagination cap, or a per-asset delete failure) is NOT treated
+    as done: the row is kept and ``False`` is returned so the caller (the SQS
+    worker, or the API 500 path) retries rather than orphaning the survivors.
+    This is the whole point of the worker — deleting the row after a truncated
+    cleanup is exactly the bug it exists to prevent. A DDB row-delete failure
+    also fails the call, because the caller must be able to tell "finished" from
+    "still there".
+    """
+    assets_complete = True
+    try:
+        removed, assets_complete = _delete_source_datazone_assets(namespace_id, source_id, context)
+        logger.info(
+            "datazone_assets_deleted",
+            source_id=source_id,
+            count=removed,
+            complete=assets_complete,
+        )
+    except Exception:
+        # A raised error means we cannot know how much was cleaned — treat it as
+        # incomplete so the row is kept and the delete retried.
+        assets_complete = False
+        logger.exception(
+            "datazone_asset_cleanup_failed",
+            source_id=source_id,
+            namespace_id=namespace_id,
+        )
+
+    # Schema: PK=SRC#{sourceId}, SK=<ISO timestamp>. Otherwise orphaned in
+    # source-scan-jobs until namespace deletion sweeps the ByNamespace GSI.
+    try:
+        removed_jobs = _delete_source_scan_jobs(source_id)
+        logger.info("scan_jobs_deleted", source_id=source_id, count=removed_jobs)
+    except Exception:
+        logger.exception("scan_job_cleanup_failed", source_id=source_id)
+
+    # Keep the row if DataZone cleanup did not finish: the row is the only handle
+    # on the surviving assets, so dropping it now would orphan them permanently.
+    # Returning False leaves the source DELETING/DELETE_FAILED and retryable
+    # (the SQS worker redrives; the API sync path returns 500). Scan-job cleanup
+    # failing does NOT block — those are swept at namespace deletion off the
+    # ByNamespace GSI, independent of the row.
+    if not assets_complete:
+        logger.warning(
+            "source_delete_row_retained_assets_incomplete",
+            source_id=source_id,
+            namespace_id=namespace_id,
+        )
+        return False
+
+    # Release the namespace's claim on the catalog name this source was given,
+    # BEFORE the row goes, so the derived name is re-derivable rather than left
+    # owned by a source that no longer exists. The name is derived from the source
+    # id, so it can never be re-minted for a different source — the release exists
+    # so the record does not outlive what it describes. Best-effort: a surviving
+    # claim only keeps a catalog that no longer exists attributed to this namespace.
+    #
+    # Keyed on the set of sub-types whose CREATE claims a name. The branch used to
+    # cover only two of the three, which left the third's name permanently owned.
+    if sub_type in PLATFORM_CATALOG_CLAIM_SUB_TYPES:
+        with contextlib.suppress(ClientError):
+            release_platform_catalog(_get_dao(), catalog_name=catalog_name)
+
+    try:
+        _get_dao().delete({"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"})
+    except ClientError:
+        logger.exception("ddb_delete_failed", source_id=source_id)
+        return False
+
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1092,7 +1440,17 @@ def _handle_delete(namespace_id: str, source_id: str, context: Any = None) -> di
 # ---------------------------------------------------------------------------
 
 
-def _handle_rescan(event: dict[str, Any], namespace_id: str, source_id: str) -> dict[str, Any]:
+def _handle_rescan(
+    event: dict[str, Any],
+    namespace_id: str,
+    source_id: str,
+    trigger: str = ScanTrigger.MANUAL,
+) -> dict[str, Any]:
+    """Single entry point for every re-scan trigger (manual, scheduled, event).
+
+    ``trigger`` is recorded on the scan-job row and is always a caller-supplied
+    constant, never request data.
+    """
     from coa_control_plane_server.models.rescan_source_request_content import RescanSourceRequestContent
 
     # The body carries only the discard-open-review acknowledgement. It is
@@ -1104,8 +1462,7 @@ def _handle_rescan(event: dict[str, Any], namespace_id: str, source_id: str) -> 
     try:
         req = RescanSourceRequestContent.model_validate(raw)
     except ValidationError as exc:
-        msg = exc.errors()[0]["msg"] if exc.errors() else str(exc)
-        return api_response(400, {"error": msg})
+        return api_response(400, {"error": _validation_message(exc)})
 
     try:
         item = _get_dao().get({"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"})
@@ -1261,7 +1618,50 @@ def _handle_rescan(event: dict[str, Any], namespace_id: str, source_id: str) -> 
                     "status": current_status,
                 },
             )
-        scan_job_sk = now
+
+        # One upstream change emits many Glue events; collapse the burst.
+        if trigger == ScanTrigger.EVENT and _within_event_cooldown(item):
+            logger.info("event_rescan_debounced", source_id=source_id, last_scan_at=item.get("lastScanAt"))
+            return api_response(200, {"sourceId": source_id, "status": current_status, "debounced": True})
+        # Take the lock BEFORE writing anything: a conditional update on the status
+        # just read. The pre-check above is not a lock, so two triggers can both
+        # clear it and only this decides the winner. Writing the scan-job row first
+        # would leave the loser's row IN_PROGRESS for good, since it never enqueues
+        # and the reaper only reconciles sources that started a state machine.
+        try:
+            _get_dao().update(
+                {"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"},
+                {"status": SourceStatus.SCANNING, "updatedAt": now},
+                condition="#st = :prev",
+                condition_names={"#st": "status"},
+                condition_values={":prev": current_status},
+            )
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                logger.info("rescan_lost_status_race", source_id=source_id, expected=current_status)
+                return api_response(
+                    409,
+                    {
+                        "error": f"Source '{source_id}' has an active scan.",
+                        "sourceId": source_id,
+                        "status": current_status,
+                    },
+                )
+            logger.exception("ddb_update_status_failed", source_id=source_id)
+            return api_response(500, {"error": "Internal server error"})
+
+        def _release_lock() -> None:
+            """Hand the source back, so a failure here does not strand it in SCANNING."""
+            _get_dao().update(
+                {"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"},
+                {"status": current_status, "updatedAt": _now_iso()},
+                condition="attribute_exists(PK)",
+                raise_on_error=False,
+            )
+
+        # Microseconds, not seconds: two triggers in the same second would
+        # otherwise write the same row.
+        scan_job_sk = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
         try:
             _get_scan_dao().put(
                 {
@@ -1271,22 +1671,14 @@ def _handle_rescan(event: dict[str, Any], namespace_id: str, source_id: str) -> 
                     "namespaceId": namespace_id,
                     "status": "IN_PROGRESS",
                     "scanType": "full",
+                    "triggerType": trigger,
                     "startedAt": now,
                     "createdAt": now,
                 }
             )
         except ClientError:
             logger.exception("ddb_put_scan_job_failed", source_id=source_id)
-            return api_response(500, {"error": "Internal server error"})
-
-        # Update source status to SCANNING so callers see the active state immediately
-        try:
-            _get_dao().update(
-                {"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"},
-                {"status": SourceStatus.SCANNING, "updatedAt": now},
-            )
-        except ClientError:
-            logger.exception("ddb_update_status_failed", source_id=source_id)
+            _release_lock()
             return api_response(500, {"error": "Internal server error"})
 
         try:
@@ -1319,6 +1711,18 @@ def _handle_rescan(event: dict[str, Any], namespace_id: str, source_id: str) -> 
             )
         except ClientError:
             logger.exception("sqs_send_failed", source_id=source_id)
+            # Nothing will ever run this scan, and no state machine started, so the
+            # reaper cannot help either. Without this the source sits in SCANNING
+            # and every retry is refused as an active scan.
+            _release_lock()
+            # "FAILED" is the scan-JOB vocabulary (what the state machine writes and
+            # what the console renders as a failure). SCAN_FAILED is the source row's.
+            _get_scan_dao().update(
+                {"PK": f"SRC#{source_id}", "SK": scan_job_sk},
+                {"status": "FAILED", "errorMessage": "Could not enqueue the scan"},
+                condition="attribute_exists(PK)",
+                raise_on_error=False,
+            )
             return api_response(500, {"error": "Internal server error"})
 
         return api_response(202, {"sourceId": source_id, "scanJobId": scan_job_sk, "status": "IN_PROGRESS"})
@@ -1345,11 +1749,53 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     Returns:
         API Gateway proxy response dict with status code and JSON body.
     """
+    # EventBridge Scheduler invokes this same Lambda with a synthetic payload
+    # (not an API Gateway event) to fire a recurring rescan. Deliberately outside
+    # the catch-all below: Scheduler reads any returned value as success, so the
+    # 500-shaped dict would hide a broken schedule that keeps ticking forever.
+    if event.get("scheduledRescan"):
+        return _handle_scheduled_rescan(event)
+
     try:
         return _route(event, context)
     except Exception:
         logger.exception("unhandled_error")
         return api_response(500, {"error": "Internal server error"})
+
+
+def _handle_scheduled_rescan(event: dict[str, Any]) -> dict[str, Any]:
+    """Handle an EventBridge Scheduler invocation: fire a SCHEDULED rescan.
+
+    The schedule payload carries the namespace and source ids. This reuses the
+    same rescan path as the API (bookkeeping, status transition, enqueue) with
+    the trigger stamped SCHEDULED. A rejected rescan (e.g. an active scan) is
+    logged and swallowed — the next scheduled tick will retry.
+
+    Raises:
+        ValueError: when the payload carries no ids, which means the schedule
+            itself is malformed rather than the rescan being declined. Raising
+            is what marks the invocation failed so Scheduler's retry policy and
+            DLQ see it; returning would let a dead schedule tick indefinitely.
+    """
+    namespace_id = event.get("namespaceId", "")
+    source_id = event.get("sourceId", "")
+    if not namespace_id or not source_id:
+        logger.error("scheduled_rescan_missing_ids", event_keys=sorted(event.keys()))
+        raise ValueError("scheduled rescan payload requires namespaceId and sourceId")
+
+    logger.info("scheduled_rescan_triggered", namespace_id=namespace_id, source_id=source_id)
+    # Empty event so confirmDiscardOpenReview stays false: a scheduled tick must
+    # not discard a steward's open review.
+    response = _handle_rescan({}, namespace_id, source_id, trigger=ScanTrigger.SCHEDULED)
+    status_code = response.get("statusCode")
+    if status_code not in (200, 202):
+        logger.warning(
+            "scheduled_rescan_not_started",
+            namespace_id=namespace_id,
+            source_id=source_id,
+            status_code=status_code,
+        )
+    return {"ok": status_code in (200, 202), "statusCode": status_code}
 
 
 def _route(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
@@ -1377,6 +1823,18 @@ def _route(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
         validate_namespace_id(namespace_id, "namespaceId")
     except ValueError as exc:
         return api_response(400, {"error": str(exc)})
+
+    # Validate the sourceId once, here, whenever the route carries one — every
+    # {sourceId} route below builds DDB keys, a DataZone search prefix, a derived
+    # catalog name and an STS session name from it. A single guard at the entry
+    # point is the whole surface; per-route re-validation would be N copies of
+    # the same check. Absent is fine (collection routes have no sourceId); a
+    # PRESENT but malformed value is rejected 400 rather than flowed downstream.
+    if path_params.get("sourceId"):
+        try:
+            validate_source_id(path_params["sourceId"], "sourceId")
+        except ValueError as exc:
+            return api_response(400, {"error": str(exc)})
 
     if resource == "/namespaces/{namespaceId}/sources":
         if http_method == "GET":
@@ -1489,6 +1947,18 @@ def _route(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
         if not source_id or not job_id:
             return api_response(400, {"error": "sourceId and jobId are required"})
         return _handle_get_scan_job(namespace_id, source_id, job_id)
+
+    if resource == "/namespaces/{namespaceId}/sources/{sourceId}/rescan-schedule" and http_method == "PUT":
+        source_id = path_params.get("sourceId", "")
+        if not source_id:
+            return api_response(400, {"error": "sourceId is required"})
+        return _handle_put_rescan_schedule(event, namespace_id, source_id)
+
+    if resource == "/namespaces/{namespaceId}/sources/{sourceId}/event-rescan" and http_method == "PUT":
+        source_id = path_params.get("sourceId", "")
+        if not source_id:
+            return api_response(400, {"error": "sourceId is required"})
+        return _handle_put_event_rescan(event, namespace_id, source_id)
 
     if resource == "/namespaces/{namespaceId}/sources/{sourceId}/metadata" and http_method == "PUT":
         source_id = path_params.get("sourceId", "")

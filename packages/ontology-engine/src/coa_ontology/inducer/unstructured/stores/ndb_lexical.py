@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 
 import boto3
@@ -38,6 +39,14 @@ from coa_ontology.inducer.unstructured.stores.protocol import (
 
 log = logging.getLogger(__name__)
 
+# Defense-in-depth: `_label` interpolates ``self._tenant_id`` into a
+# backtick-quoted openCypher label. If a non-hex character (backtick, quote,
+# semicolon, whitespace, …) ever reaches this constructor, the label
+# terminates and arbitrary cypher can be injected against the Neptune
+# cluster. The primary check happens at :func:`to_graphrag_tenant_id`; this
+# is the sink-side belt to that suspenders.
+_TENANT_ID_HEX_RE = re.compile(r"^[0-9a-f]+$", re.IGNORECASE)
+
 
 class NeptuneDatabaseLexicalStore:
     """LexicalGraphStore backed by a Neptune DB cluster (openCypher via neptunedata API).
@@ -47,6 +56,7 @@ class NeptuneDatabaseLexicalStore:
         port: Neptune port (default 8182).
         region: AWS region for SigV4 signing.
         tenant_id: Tenant ID suffix for multi-tenant label scoping (e.g. "389030abe759468eb64ae200f").
+            Must be hex-only or empty; non-hex input raises ``ValueError``.
     """
 
     def __init__(self, endpoint: str, port: int = 8182, region: str = "us-east-1", tenant_id: str = "") -> None:
@@ -56,8 +66,15 @@ class NeptuneDatabaseLexicalStore:
             endpoint: Neptune DB cluster endpoint.
             port: Neptune port.
             region: AWS region for SigV4 signing.
-            tenant_id: Tenant ID suffix for multi-tenant label scoping.
+            tenant_id: Tenant ID suffix for multi-tenant label scoping. Must
+                be hex-only (post-hyphen-strip form of a UUID) or empty.
+
+        Raises:
+            ValueError: If ``tenant_id`` is non-empty and contains any
+                character outside ``[0-9a-fA-F]``.
         """
+        if tenant_id and not _TENANT_ID_HEX_RE.match(tenant_id):
+            raise ValueError(f"tenant_id must be hex-only or empty; got {tenant_id!r}")
         self._endpoint = endpoint
         self._port = port
         self._region = region

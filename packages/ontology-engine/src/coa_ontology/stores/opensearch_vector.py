@@ -332,6 +332,36 @@ class OpenSearchVectorStore(VectorStore):
         idx = self._read_index(namespace)
         return self._aoss().delete_by_term(idx, "ontology_id", ontology_id)
 
+    def delete_embeddings_for_entities(
+        self,
+        entity_uris,
+        ontology_id: str,
+        namespace=None,
+    ) -> int:
+        """Delete the embeddings of the given entities within a single ontology.
+
+        Compound filter: ``entity_uri IN uris AND ontology_id == ontology_id``.
+        A namespace index can carry embeddings for multiple ontologies (shared
+        IRIs from foundational reloads or explicit-target merges), so the
+        ``ontology_id`` clause is required to avoid taking a sibling ontology's
+        embedding down with the current one.
+
+        One ``bool``-wrapped ``terms``+``term`` query + one verified delete loop
+        for the whole set (see ``AossVectorClient.delete_by_term``) — NOT one
+        round-trip per entity, so a re-accepted proposal with hundreds of
+        classes/properties pays the AOSS refresh-lag wait once.
+        """
+        uris = [u for u in dict.fromkeys(entity_uris) if u]
+        if not uris or not ontology_id:
+            return 0
+        idx = self._read_index(namespace)
+        return self._aoss().delete_by_term(
+            idx,
+            "entity_uri",
+            uris,
+            and_filters=[{"term": {"ontology_id": ontology_id}}],
+        )
+
     def delete_index(self, namespace: str | None = None) -> bool:
         """Delete the entire AOSS index for a namespace. Returns True if it existed."""
         idx = _index_for_namespace(self._resolve_ns(namespace))

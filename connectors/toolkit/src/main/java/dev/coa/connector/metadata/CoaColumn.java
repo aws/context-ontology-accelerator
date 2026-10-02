@@ -33,6 +33,7 @@ public final class CoaColumn
     private final List<ColumnComment.Reference> foreignKeys = new ArrayList<>();
     private String description = "";
     private boolean primaryKeyMember;
+    private boolean notNull;
 
     private CoaColumn(String name, ArrowType type)
     {
@@ -64,6 +65,7 @@ public final class CoaColumn
         CoaColumn copy = new CoaColumn(name, type);
         copy.description = description;
         copy.primaryKeyMember = primaryKeyMember;
+        copy.notNull = notNull;
         copy.foreignKeys.addAll(foreignKeys);
         return copy;
     }
@@ -71,8 +73,9 @@ public final class CoaColumn
     /**
      * The column's prose description. Null is treated as none.
      *
-     * @throws IllegalArgumentException if the text carries a live {@code @pk} or {@code @fk(} tag,
-     *                                 which COA would strip and act on — declare the key instead.
+     * @throws IllegalArgumentException if the text carries a live {@code @pk}, {@code @notnull} or
+     *                                 {@code @fk(} tag, which COA would strip and act on — declare it
+     *                                 instead.
      */
     public CoaColumn describedAs(String text)
     {
@@ -89,6 +92,18 @@ public final class CoaColumn
     public CoaColumn primaryKey()
     {
         this.primaryKeyMember = true;
+        return this;
+    }
+
+    /**
+     * Declares this column {@code NOT NULL} in the source.
+     *
+     * <p>Only for a column the source declares so. Leaving it unset means "nobody said"; there is no way
+     * to assert "nullable".
+     */
+    public CoaColumn notNull()
+    {
+        this.notNull = true;
         return this;
     }
 
@@ -138,6 +153,15 @@ public final class CoaColumn
         return primaryKeyMember;
     }
 
+    /**
+     * @return whether this column was declared {@code NOT NULL}. False also covers "the source did not
+     *         say", which is why there is no {@code isNullable()} to pair with it.
+     */
+    public boolean isNotNull()
+    {
+        return notNull;
+    }
+
     /** @return the parents this column references, in declaration order. */
     public List<ColumnComment.Reference> foreignKeys()
     {
@@ -154,6 +178,9 @@ public final class CoaColumn
         ColumnComment comment = ColumnComment.of(description);
         if (primaryKeyMember) {
             comment.primaryKey();
+        }
+        if (notNull) {
+            comment.notNull();
         }
         for (ColumnComment.Reference parent : foreignKeys) {
             comment.foreignKey(parent);

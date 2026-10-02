@@ -233,6 +233,16 @@ class TestStringifyConfigValue:
         assert index._stringify_config_value(1024) == "1024"
         assert index._stringify_config_value(0) == "0"
 
+    def test_whole_number_float_stringified_as_int(self):
+        # Rescan round-trips the stored config through the Smithy model, so
+        # chunk_size/chunk_overlap arrive as floats; ECS env values must be
+        # strings and the container parses them with int().
+        assert index._stringify_config_value(0.0) == "0"
+        assert index._stringify_config_value(1024.0) == "1024"
+
+    def test_fractional_float_stringified(self):
+        assert index._stringify_config_value(0.5) == "0.5"
+
     def test_string_and_other_passthrough(self):
         assert index._stringify_config_value("already") == "already"
         assert index._stringify_config_value(None) is None

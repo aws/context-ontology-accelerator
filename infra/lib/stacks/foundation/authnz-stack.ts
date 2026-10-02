@@ -12,7 +12,12 @@ import { SCLStack } from "../../constructs/scl-stack";
 import { DynamoDBTable } from "../../constructs/dynamodb-table";
 import { Paths } from "../../paths";
 import { ClaimMapping } from "../../types";
-import { PrincipalType, ResourceType, TABLE_NAMES } from "@coa/shared";
+import {
+  PrincipalType,
+  ResourceType,
+  TABLE_NAMES,
+  sanitizePrincipalKey,
+} from "@coa/shared";
 
 export interface AuthnzStackProps extends cdk.StackProps {
   /** Group → role claim mappings to seed into ResourceRoleMappings. */
@@ -115,6 +120,9 @@ export class AuthnzStack extends SCLStack {
     for (const mapping of props?.claimsMappings ?? []) {
       for (const roleId of mapping.mappedRoles) {
         const group = mapping.groupValue;
+        // Key attributes carry the encoded form; principalId stays raw, and the
+        // construct/physical ids stay raw to avoid logical-id churn on upgrade.
+        const groupKey = sanitizePrincipalKey(group);
         new cr.AwsCustomResource(this, `SeedGroupMapping-${group}-${roleId}`, {
           onUpdate: {
             service: "DynamoDB",
@@ -123,7 +131,7 @@ export class AuthnzStack extends SCLStack {
               TableName: rrm.table.tableName,
               Item: {
                 PK: {
-                  S: `${ResourceType.PLATFORM}::GLOBAL#${PrincipalType.GROUP}::${group}`,
+                  S: `${ResourceType.PLATFORM}::GLOBAL#${PrincipalType.GROUP}::${groupKey}`,
                 },
                 SK: { S: `ROLE#${roleId}` },
                 resourceType: { S: ResourceType.PLATFORM },
@@ -131,13 +139,13 @@ export class AuthnzStack extends SCLStack {
                 principalType: { S: PrincipalType.GROUP },
                 principalId: { S: group },
                 role: { S: roleId },
-                principalKey: { S: `${PrincipalType.GROUP}::${group}` },
+                principalKey: { S: `${PrincipalType.GROUP}::${groupKey}` },
                 resourceRoleKey: {
                   S: `${ResourceType.PLATFORM}::GLOBAL#ROLE#${roleId}`,
                 },
                 namespaceKey: { S: "NS#GLOBAL" },
                 principalRoleKey: {
-                  S: `${PrincipalType.GROUP}::${group}#ROLE#${roleId}`,
+                  S: `${PrincipalType.GROUP}::${groupKey}#ROLE#${roleId}`,
                 },
                 grantedBy: { S: "system" },
                 grantedAt: { S: new Date().toISOString() },

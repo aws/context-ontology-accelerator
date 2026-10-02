@@ -38,8 +38,9 @@ Each connector is a folder whose **name is its id**: its stack and Lambda derive
 two connectors deployed into one account cannot collide.
 
 **Each connector owns its CDK app.** The toolkits are libraries, not a framework: you compose
-`AthenaFederationConnector` inside a stack you control, and add whatever else your source needs — a VPC,
-an RDS proxy, a secret, a KMS key — without asking permission from any code here. A shared app
+`AthenaFederationConnector` inside a stack you control, and add whatever else your source needs — an
+RDS proxy, a secret, a KMS key — without asking permission from any code here. A VPC is the one thing
+the construct takes itself, as its `network` prop, because the function has to be attached to it. A shared app
 driven by a config file could only ever deploy the resources somebody anticipated.
 
 ## What a connector is
@@ -93,9 +94,8 @@ pnpm run deploy
    body.
 
 6. Optionally register your *own* Athena catalog, in your own account, to run step 7's self-check
-   there. The stack prints a `create-data-catalog` command for this — see
-   [Register a catalog to check the connector yourself](#register-a-catalog-to-check-the-connector-yourself),
-   and read the caveats there before pasting it.
+   there — see
+   [Register a catalog to check the connector yourself](#register-a-catalog-to-check-the-connector-yourself).
 
 7. Confirm the keys arrived, which is the one thing that fails silently:
 
@@ -113,10 +113,10 @@ files outright:
 
 - **`CoaMetadataHandler`** — subclass this instead of the SDK's `MetadataHandler`. Three methods
   instead of five, none of them mentioning an Athena type.
-- **`CoaTable` / `CoaColumn`** — describe your source: names, Arrow types, prose, and which columns
-  take part in a key. Declared as *intent*, not as tag syntax.
-- **`ColumnComment`** — encodes the `@pk` / `@fk` tags. Dependency-free. The base class calls it for
-  you; you need it only if you are not using the base class.
+- **`CoaTable` / `CoaColumn`** — describe your source: names, Arrow types, prose, which columns take
+  part in a key, and which are declared `NOT NULL`. Declared as *intent*, not as tag syntax.
+- **`ColumnComment`** — encodes the `@pk` / `@notnull` / `@fk` tags. Dependency-free. The base class
+  calls it for you; you need it only if you are not using the base class.
 - **`TableSchema`** — puts a column comment where Athena actually reads it. Likewise.
 
 The bottom two exist because the thing they encapsulate fails silently when hand-written; the top
@@ -128,7 +128,7 @@ CoaColumn      declared intent   .describedAs("...").primaryKey().foreignKey("or
    |
 CoaTable       assembly          columns in declaration order — which is the key's column order
    |
-ColumnComment  encoding          prose + "@pk @fk(orders.order_id)", with the quoting rules applied
+ColumnComment  encoding          prose + "@pk @notnull @fk(orders.order_id)", quoting rules applied
    |
 TableSchema    placement         that string into the SCHEMA's metadata, keyed by column name
    |
@@ -178,11 +178,12 @@ The tables' shapes — columns, prose and declared keys — are in
 
 The federation protocol has **no field anywhere** for primary or foreign keys:
 `GetTableResponse` carries an Arrow `Schema`, and an Arrow schema describes names and
-types only. So declared keys travel inside the column comments the connector already
-emits, as two tags COA parses out and strips:
+types only. So declared keys and nullability travel inside the column comments the connector
+already emits, as three tags COA parses out and strips:
 
 ```
 @pk                             this column is a member of the table's primary key
+@notnull                        this column is declared NOT NULL
 @fk(parent_table.parent_column) this column references that parent column
 ```
 
@@ -221,7 +222,15 @@ It applies the rules you would otherwise have to remember:
 - **Duplicate targets collapse**, matching COA, which dedups on the decoded pair.
 - **Prose already containing a live tag is refused** at build time. COA would strip it
   and declare a key nobody asked for. Prose that merely *resembles* a tag is fine and is
-  left alone by both sides: `@PK`, `@pkey`, `owner bob@pk.example.com`, `@pk=x`, `@pk(x)`.
+  left alone by both sides: `@PK`, `@pkey`, `owner bob@pk.example.com`, `@pk=x`, `@pk(x)`,
+  `@notnullable`.
+- **`.notNull()` tags the exception, and there is no `@nullable` to pair with it.** Call it only for a
+  column your source declares `NOT NULL`. Not calling it means *unknown*, which is what COA assumes for
+  every connector that emits no such tag — so a column whose nullability you cannot determine gets
+  nothing, and that is the correct answer rather than a gap. There is no way to assert "nullable",
+  because making absence mean that would reinterpret every already-deployed connector's columns.
+- **The emitted order is fixed**: prose, `@pk`, `@notnull`, then one `@fk(...)` per declared reference in
+  declaration order. It does not depend on the order you call the intent methods in.
 
 ### Subclass `CoaMetadataHandler`
 
@@ -331,6 +340,117 @@ mvn -q -B package -pl example -am        # the toolkit and one connector
 pnpm install                          # the CDK toolkit and every connector's app
 ```
 
+## Upgrading a connector written against an earlier release
+
+Three changes break a connector built against the previous release. Two are compile-time and one is a
+deployment-package change. None of them alters what a working connector does once it is through them.
+
+### The metadata SPI takes a leading catalog parameter
+
+`CoaMetadataHandler`'s three abstract methods now receive the Athena catalog name of the request being
+served. Add the parameter to your three overrides; a single-source connector then ignores the value.
+
+Before:
+
+```java
+@Override
+protected List<String> listDatabases() { ... }
+
+@Override
+protected List<String> listTables(String database) { ... }
+
+@Override
+protected CoaTable describeTable(String database, String tableName) { ... }
+```
+
+After:
+
+```java
+@Override
+protected List<String> listDatabases(String catalog) { ... }
+
+@Override
+protected List<String> listTables(String catalog, String database) { ... }
+
+@Override
+protected CoaTable describeTable(String catalog, String database, String tableName) { ... }
+```
+
+No no-catalog overload is kept, so every stale override is caught by the compiler: it no longer
+implements the abstract method and the class does not build. That is deliberate. Keeping one would let
+a connector compile against a signature the base class has stopped calling.
+
+If your handler reached the catalog name by overriding one of the `doXxx` methods purely to stash
+`request.getCatalogName()` in a field, delete the field and those overrides with it. The parameter is
+what replaces them, and the field was mutable handler state that happened to be correct only because
+the Lambda runtime serialises invocations per container.
+
+### The federation SDK moves to 2026.33.1, from 2025.15.1
+
+In order, because step 3's failure is invisible until the function is deployed:
+
+1. **Bump `athena.federation.sdk.version` in `connectors/pom.xml`.** The toolkit and every connector
+   inherit it from there, so it is one edit.
+2. **If your connector depends on `athena-jdbc`, keep it at the same version as the SDK.** That
+   artifact is published as a shaded uber jar carrying its own copy of the SDK and Arrow, so a skew
+   puts two SDK builds in one fat jar and the shade plugin keeps whichever it saw first per path.
+   `databricks/pom.xml` holds it equal with a property rather than a literal.
+3. **Move every direct declaration of the AWS SDK, Jackson and SLF4J to what the new SDK brings**:
+   `software.amazon.awssdk:*` to **2.46.17**, `com.fasterxml.jackson.core:jackson-databind` to
+   **2.22.1**, `org.slf4j:*` to **2.0.18**. A direct declaration wins over the SDK's transitive one,
+   so a stale pin is not overridden for you. It also builds green and passes its unit suite, and the
+   deployed function then fails *every* invocation with a `NoClassDefFoundError` on an AWS SDK core
+   class the newer service modules expect. Verify one version per artifact before you deploy:
+
+   ```bash
+   mvn dependency:tree -pl <id> -Dincludes=software.amazon.awssdk
+   ```
+
+   If you declare none of the three, there is nothing to do here.
+4. **Fix the three API signature changes.** Most call sites are in tests.
+
+   | What changed | What to write |
+   | ------------ | ------------- |
+   | `FederatedIdentity` takes a fifth `configOptions` argument | `new FederatedIdentity(arn, account, Collections.emptyMap(), Collections.emptyList(), Collections.emptyMap())` |
+   | `Constraints` takes `configOptions` and a `QueryPlan` after the row limit | `new Constraints(summary, expressions, orderBy, limit, Collections.emptyMap(), null)` |
+   | `FederationRequestHandler.getCredentialProvider()` became a `public default` delegating to an overload that consults `getDatabaseConnectionSecret()` | Delete a `protected` override of it. It no longer compiles, and for a `DatabaseConnectionConfig` naming no secret the default already returns null, which is what such an override was for |
+
+5. **If your connector declares its own shade `<filters>`, restate the aggregator's global excludes
+   inside it.** Maven replaces a list rather than appending to it, so a child block silently drops
+   the parent's, and the parent's is what keeps signature files out of the fat jar.
+6. **Re-measure the jar.** The bump takes the Databricks connector from 88.8 MB to 139.5 MB. The
+   failure mode for an oversized package is a deploy CloudFormation rejects rather than a build that
+   fails, so the number is worth knowing before the deploy. Build with `clean` first: a stale toolkit
+   jar left in the reactor makes it read low.
+
+### Your jar now ships nested inside the deployment package
+
+`AthenaFederationConnector` places the fat jar at `lib/<jar>` inside the Lambda deployment package,
+where the package used to be the jar itself. Lambda's 250 MB limit counts *extracted* bytes and it does
+not extract a nested jar, so what binds is the jar's own size. For the Databricks connector that is
+139.5 MB against the 357.8 MB its 84,643 files expand to, which is what makes a current federation SDK
+deployable at all.
+
+The Java runtime's classpath already covers every jar in `lib/`, so handler classes, resources and
+`META-INF/services` files resolve exactly as before. What changes is the filesystem: **your jar's
+entries are no longer unpacked under `/var/task`.** A handler that opens a bundled file by path finds
+nothing there:
+
+```java
+// Silently broken by the new layout: nothing is unpacked at this path any more.
+new File("/var/task/reference-data.json");
+```
+
+Read bundled files from the classpath instead, which works in either layout:
+
+```java
+try (InputStream in = getClass().getResourceAsStream("/reference-data.json")) { ... }
+```
+
+`/var/task/lib/<jar>` does exist, so a handler that genuinely needs the jar as a file can find it
+there. Prefer the classpath read: the jar's filename carries your connector's version and changes on
+every release.
+
 ## Deploy
 
 Each connector's CDK app is standalone: its own `cdk.json`, its own `bin/app.ts`, its own
@@ -358,6 +478,14 @@ name plus a conventional suffix — so deploying a second connector cannot resha
 Deploying the *same* connector twice into one account needs `FUNCTION_NAME_PREFIX` to tell them
 apart; it prefixes both names.
 
+**The `-managed-` segment is reserved: never put it in a `FUNCTION_NAME_PREFIX` you set.** COA's
+own managed deployment of the Databricks connector uses `${prefix}-${envName}-managed-`, and a
+name collision there is not a retryable failure — every Athena data catalog embeds the handler ARN
+it was created with, so the two deployments cannot be untangled after the fact: the same stack
+name means COA's deploy reshapes *your* stack, and a different stack name with the same function
+name fails COA's deploy outright. Leaving the prefix unset is the normal case and collides with
+nothing.
+
 Then onboard it in COA by the function's ARN, and optionally
 [register a catalog of your own](#register-a-catalog-to-check-the-connector-yourself) in the account
 you want to query from.
@@ -374,7 +502,7 @@ exports the variables instead, and **exported values win over the file**.
 | `SERVE_ROLE_ARN`                | yes      | Accelerator role that runs queries; comma-separate |
 | `DISCOVERY_ROLE_ARN`            | yes      | Accelerator role that runs `DESCRIBE`              |
 | `AWS_REGION`                    | yes      | Target region; **export it** — see the note below   |
-| `FUNCTION_NAME_PREFIX`          | no       | Prefixes Lambda and stack names; resolves conflicts |
+| `FUNCTION_NAME_PREFIX`          | no       | Prefixes Lambda and stack names; resolves conflicts. Must not contain `-managed-` — reserved for COA's own deployment |
 | `EXAMPLE_BULK_ROWS`                | no       | Example only: size its spill fixture               |
 | `EXAMPLE_BULK_ROW_BYTES`           | no       | Example only: payload width                        |
 
@@ -393,11 +521,13 @@ Read both from SSM in COA's own account, where they are authoritative — the ro
 generated, so do not try to guess them:
 
 ```bash
-aws ssm get-parameter --name /{prefix}/serve/runtime-role-arn        --query Parameter.Value --output text
-aws ssm get-parameter --name /{prefix}/sources/db-connector-role-arn --query Parameter.Value --output text
+aws ssm get-parameter --name /{prefix}/{envName}/serve/runtime-role-arn        --query Parameter.Value --output text
+aws ssm get-parameter --name /{prefix}/{envName}/sources/db-connector-role-arn --query Parameter.Value --output text
 ```
 
-`{prefix}` is the resource prefix COA was deployed with. Paste the results into `.env`, or
+`{prefix}` is the resource prefix COA was deployed with and `{envName}` is the COA environment those
+roles belong to, so a `dev` and a `prod` deployment under one prefix publish their own pair:
+`/coa/dev/serve/runtime-role-arn` and `/coa/prod/serve/runtime-role-arn`. Paste the results into `.env`, or
 export them: SSM parameters are not readable across accounts, and a connector usually runs in a
 different account from COA.
 
@@ -449,24 +579,16 @@ connector from **your own** account, which is how you confirm the `@pk` / `@fk` 
 handing anything to COA.
 
 The stack deliberately does **not** create an `AWS::Athena::DataCatalog`, for the same reason: the
-catalog belongs to whichever account runs the queries. It outputs the command instead:
+catalog belongs to whichever account runs the queries. Register one yourself, naming the connector's
+function ARN from the `ConnectorFunctionArn` output:
 
 ```bash
 aws athena create-data-catalog --name example --type LAMBDA \
   --parameters function=arn:aws:lambda:<region>:<acct>:function:example-coa-connector
 ```
 
-Three things about that output are worth knowing before you paste it:
-
-- **The output key is mangled.** It is declared on the construct, and CDK prefixes a
-  construct-declared output with the construct's path and a hash — so the key in the deploy log is
-  `ConnectorRegisterCatalogCommandDF9B53BE`, not `RegisterCatalogCommand`. Grep the deploy output for
-  `create-data-catalog` rather than for the name.
-- **The catalog name comes from `connectorId` alone**, with hyphens replaced by underscores. It does
-  not know about `FUNCTION_NAME_PREFIX`, the database, or anything else.
-- **So two deployments of the same connector print the identical command.** Deploy `example` twice
-  with different `FUNCTION_NAME_PREFIX` values and both say `--name example`; the second
-  `create-data-catalog` collides, because catalog names are account-global. Rename the second by hand.
+Catalog names are account-global, so a second deployment of the same connector needs a different
+name from the first.
 
 Then, in Athena:
 
@@ -489,8 +611,10 @@ the rest default.
 | `jarPath`                     | — (required)              | The fat jar; missing is a synth-time error     |
 | `queryRoleArns`               | `[]`                      | Principals granted invoke and spill read       |
 | `functionNamePrefix`          | none                      | Resolves name conflicts; keeps the suffix      |
-| `runtime`                     | `JAVA_17`                 | Any Java runtime                               |
-| `timeout`                     | 90 seconds                | Invocation timeout                             |
+| `runtime`                     | `JAVA_21`                 | Any Java runtime                               |
+| `architecture`                | `ARM_64`                  | `X86_64` if your jar has an amd64-only native  |
+| `network`                     | none (no VPC)             | VPC, subnets, optional security groups         |
+| `timeout`                     | 10 minutes                | Invocation timeout                             |
 | `memorySize`                  | 1024 MB                   | Enough to buffer a block before it spills      |
 | `spill`                       | `"create"`                | `"none"` deploys no bucket — see Spill         |
 | `environment`                 | `{}`                      | Connector-specific variables — see below       |
@@ -541,7 +665,7 @@ aws s3 cp example/target/example-connector-1.0.0.jar s3://<your-bucket>/connecto
 
 # 2. Create the Lambda
 aws lambda create-function \
-  --function-name example-coa-connector --runtime java17 \
+  --function-name example-coa-connector --runtime java21 \
   --role <lambda-exec-role-arn> \
   --handler dev.coa.example.ExampleCompositeHandler \
   --code S3Bucket=<your-bucket>,S3Key=connector.jar \
@@ -608,6 +732,14 @@ registrations.
    dependencies are the toolkit and JUnit, and the shade plugin needs no configuration of its
    own. Add the module to `connectors/pom.xml`.
 
+   **Add an SLF4J binding if you want logs.** `example/pom.xml` ships without one, so nothing
+   in the example — or in the federation SDK, which logs through SLF4J — writes anything: every
+   `logger.*` call is discarded and SLF4J prints its "no providers were found" notice on each
+   cold start. Nothing fails, which is why it is easy to miss until the first invocation you need
+   to debug. `connectors/databricks/pom.xml` shows the fix: `org.slf4j:slf4j-simple`, plus a shade
+   filter excluding the driver's own bundled binding so two providers cannot both be on the
+   classpath.
+
 3. **Handlers** — extend `CoaMetadataHandler` and the SDK's `RecordHandler`, wire them into a
    `CompositeHandler`. Describe your tables with `CoaTable` / `CoaColumn`; the toolkit turns the
    declared keys into comments and places them for you.
@@ -630,8 +762,10 @@ registrations.
    });
    ```
 
-   It is an ordinary stack, so **add whatever else your source needs right here** — a VPC, an
-   RDS proxy, a secret, a KMS key, a cache table — and grant the connector access to it. The
+   It is an ordinary stack, so **add whatever else your source needs right here** — an RDS
+   proxy, a secret, a KMS key, a cache table — and grant the connector access to it. For a VPC,
+   pass `network: connectorNetworkFromEnv(this)` and the connector reads `CONNECTOR_VPC_ID`,
+   `CONNECTOR_SUBNET_IDS` and `CONNECTOR_SECURITY_GROUP_IDS`, as the Databricks connector does. The
    `pnpm-workspace.yaml` glob `*/cdk` picks the app up with no edit — but only on the next
    install, so run `pnpm install` again at `connectors/`, or your new app has no `node_modules`
    and `pnpm test` fails with `jest: command not found`.
@@ -676,13 +810,16 @@ connector's spilled rows, and spilled rows are query results — so the isolatio
 data-access boundary, not tidiness. It also keeps the bucket policy legible: exactly the
 principals allowed to query *this* connector appear on it.
 
-`spill: "none"` opts out entirely: no bucket, no `spill_bucket`. Legitimate for a source whose
+`spill: Provisioning.NONE` opts out entirely: no bucket, no `spill_bucket`. Legitimate for a source whose
 responses cannot exceed 6 MB, and **it fails in a shape worse than an error.** Metadata calls
 and every inline response keep working; a response that needs to spill has been observed coming
 back as a `SUCCEEDED` query with **zero rows** — no exception, nothing in the connector's log.
-A query that silently answers "no rows" is harder to notice than one that fails. Whether you can rule that out depends on your
-connector rather than your data volume: one that advertises no `LIMIT` push-down makes Athena
-request whole tables and apply the `LIMIT` itself, so even `SELECT ... LIMIT 1000` can spill.
+A query that silently answers "no rows" is harder to notice than one that fails. It depends on your
+connector rather than your data volume, but not on its capability map: Athena populates
+`Constraints.getLimit()` whether or not a connector advertises `LIMIT` push-down, so a connector that
+*ignores* it requests whole tables and even `SELECT ... LIMIT 1000` can spill. Read the limit and apply
+it; advertising it only tells Athena it need not re-apply the limit itself. Measured — see the Databricks
+connector's [push-down section](databricks/DESIGN.md#push-down-what-is-and-is-not-advertised).
 
 The bucket has block-public-access, enforced SSL, SSE-KMS with its own customer-managed key, no versioning, and a
 one-day expiry rule. One day because spill data is scratch — anything older than the query
@@ -788,7 +925,10 @@ sits below the 6 MB response cap; 32 MiB is over any value Athena has been obser
 2. **Arrow is not a transitive SDK dependency.** Use the `with-arrow` artifact classifier —
    the aggregator `pom.xml` pins it, and the toolkit depends on it, so a connector inherits it
    transitively. It produces the fat jar, which is why it ships as an S3 asset rather than a direct
-   Lambda upload.
+   Lambda upload. The construct nests that jar at `lib/<jar>` inside the deployment package, because
+   Lambda's 250 MB limit counts *extracted* bytes and it does not extract a nested jar. Classes and
+   resources load from the classpath as usual; only a handler that read its own files from
+   `/var/task` directly would notice.
 3. **Athena projects the schema.** `RecordHandler.readWithConstraint` must write *only* the
    columns present in `request.getSchema()`. Writing an absent column throws
    `NullPointerException` inside `BlockUtils.setValue` ("vector is null"). Unprojected
@@ -870,3 +1010,4 @@ empty. Start from the symptom.
 | `Unsupported Arrow Type`, or an NPE in `BlockUtils.setValue` | The Java value does not match the declared Arrow type — see *What a record handler must write*. |
 | Catalog resolves, but no table ever returns rows | The connector is deployed in a different region from the catalog. |
 | A tag reaches COA verbatim, e.g. `@fk(orders.order_id)` shown as prose | The tag was malformed, and COA logged that to its own logs. Build tags with `ColumnComment`, never by hand. |
+| CloudWatch has no connector logs, only a "no SLF4J providers were found" line | No SLF4J binding on the classpath, which is how `example/pom.xml` ships. Add `slf4j-simple` — see *Adding your own connector*, step 2. |

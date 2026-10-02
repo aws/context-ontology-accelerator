@@ -17,8 +17,19 @@ Run after 'make test' to see per-package coverage at a glance:
 import glob
 import json
 import os
-import xml.etree.ElementTree as ET
 from datetime import datetime
+
+# XXE hardening: defusedxml refuses entity declarations. Coverage XMLs are
+# test-suite output rather than attacker input, but the same parser is what
+# tier3.py uses, and the finding filed both sites together — no reason to keep
+# a divergent import here. `defusedxml` is a workspace transitive dep via
+# ontology-engine (uv sync installs it into the workspace .venv).
+try:
+    from defusedxml import ElementTree as ET
+except ImportError as exc:  # pragma: no cover
+    raise SystemExit(
+        "defusedxml is required. Run `uv sync` from the repo root."
+    ) from exc
 
 rows = []
 

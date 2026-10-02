@@ -376,6 +376,117 @@ class TestSourcesRegistry:
             result = await registry.find_sole_database_source("ns-1")
         assert result is None
 
+    @pytest.mark.asyncio
+    async def test_sql_namespace_scope_includes_a_scanned_databricks_source(self):
+        """A scanned Databricks source must be IN the scope, or every qualified query
+        against it is denied.
+
+        The negative test passes trivially when a sub-type is absent from the scope map,
+        so this positive assertion is the one that proves the integration.
+        """
+        registry = self._make_registry_with_query(
+            [
+                {
+                    "sourceType": "DATABASE",
+                    "sourceSubType": "DATABRICKS_SQL_WAREHOUSE",
+                    "athenaDataCatalogName": "coadevds_dbx1",
+                    "discoveredSchemas": ["coa_dbx_test"],
+                    "queryable": True,
+                },
+            ]
+        )
+
+        scope = await registry.sql_namespace_scope("ns-dbx")
+
+        assert scope is not None
+        assert ("coadevds_dbx1", "coa_dbx_test") in scope.federated_catalog_schemas
+        # A leak into the native-Glue set would authorize a bare `AwsDataCatalog.<db>`
+        # reference the source does not own.
+        assert scope.native_databases == frozenset()
+
+    @pytest.mark.asyncio
+    async def test_sql_namespace_scope_lowercases_a_databricks_catalog_and_schema(self):
+        """Both halves are lower-cased before comparison, so a mixed-case Unity
+        Catalog schema still matches the qualifier the executors check."""
+        registry = self._make_registry_with_query(
+            [
+                {
+                    "sourceType": "DATABASE",
+                    "sourceSubType": "DATABRICKS_SQL_WAREHOUSE",
+                    "athenaDataCatalogName": "CoaDevDS_DBX1",
+                    "discoveredSchemas": ["Coa_DBX_Test"],
+                    "queryable": True,
+                },
+            ]
+        )
+
+        scope = await registry.sql_namespace_scope("ns-dbx")
+
+        assert scope is not None
+        assert scope.federated_catalog_schemas == frozenset({("coadevds_dbx1", "coa_dbx_test")})
+
+    @pytest.mark.asyncio
+    async def test_sql_namespace_scope_excludes_a_databricks_source_with_no_discovered_schemas(self):
+        """The scope is built from catalog x schema, so an empty ``discoveredSchemas``
+        contributes no pair and every qualified reference is refused, with the source
+        otherwise looking healthy. Reachable when the connector's ``listTables`` returns a
+        table with an empty schema.
+        """
+        registry = self._make_registry_with_query(
+            [
+                {
+                    "sourceType": "DATABASE",
+                    "sourceSubType": "DATABRICKS_SQL_WAREHOUSE",
+                    "athenaDataCatalogName": "coadevds_dbx1",
+                    "discoveredSchemas": [],
+                    "queryable": True,
+                },
+            ]
+        )
+
+        scope = await registry.sql_namespace_scope("ns-dbx")
+
+        assert scope is not None
+        assert scope.federated_catalog_schemas == frozenset()
+        # The catalog is present, so the source is federated-addressed or not at all.
+        assert scope.native_databases == frozenset()
+
+    @pytest.mark.asyncio
+    async def test_sql_namespace_scope_excludes_a_not_yet_queryable_databricks_source(self):
+        """`queryable` is False from create until discovery succeeds, and a source in
+        that window owns no catalog reference yet."""
+        registry = self._make_registry_with_query(
+            [
+                {
+                    "sourceType": "DATABASE",
+                    "sourceSubType": "DATABRICKS_SQL_WAREHOUSE",
+                    "athenaDataCatalogName": "coadevds_dbx1",
+                    "discoveredSchemas": ["coa_dbx_test"],
+                    "queryable": False,
+                },
+            ]
+        )
+
+        scope = await registry.sql_namespace_scope("ns-dbx")
+
+        assert scope is not None
+        assert scope.federated_catalog_schemas == frozenset()
+
+    @pytest.mark.asyncio
+    async def test_sql_namespace_scope_stays_none_on_an_incomplete_inventory(self):
+        """The executors treat None as a DENY, because allowing on uncertainty reopens the
+        cross-namespace catalog escape."""
+        with patch("boto3.resource") as mock_resource:
+            mock_table = MagicMock()
+            mock_table.query.return_value = {
+                "Items": [{"sourceType": "DATABASE", "athenaDataCatalogName": "coadevds_dbx1"}],
+                "LastEvaluatedKey": {"PK": "NS#ns-dbx", "SK": "SRC#truncated"},
+            }
+            mock_resource.return_value.Table.return_value = mock_table
+            registry = SourcesRegistry(table_name="test-sources", region="us-west-2")
+
+        assert await registry.sql_namespace_scope("ns-dbx") is None
+
 
 @pytest.mark.unit
 class TestSourceComposition:

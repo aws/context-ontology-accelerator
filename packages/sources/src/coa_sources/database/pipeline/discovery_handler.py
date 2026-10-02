@@ -58,6 +58,7 @@ from coa_sources.database.metrics import emit_metric
 from coa_sources.database.rescan import diff_tables, merged_write_set, reconstruct_approved_baseline
 from coa_sources.database.rescan_backup import backup_s3_key, build_rescan_backup
 from coa_sources.database.secret_binding import require_secret_namespace_binding
+from coa_sources.database.sub_types import CONNECTOR_BACKED_SUB_TYPES
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("LOG_LEVEL", "INFO"))
@@ -215,7 +216,13 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         # Raises on refusal: the scan fails and the source goes SCAN_FAILED, which
         # is the signal the operator needs (add this namespace to the secret's tag,
         # then re-scan). Cross-account secrets are skipped — see secret_binding.
-        require_secret_namespace_binding(config.get("credentialSecretArn"), namespace_id, datasource_id)
+        #
+        # Skipped for DATABRICKS_SQL_WAREHOUSE: this role never reads that secret.
+        # Discovery reaches the warehouse through Athena and the connector, which assumes
+        # the customer's role and reads the credential as that session, so the role's own
+        # permission policy is what binds the secret.
+        if source_type != SourceSubType.DATABRICKS_SQL_WAREHOUSE:
+            require_secret_namespace_binding(config.get("credentialSecretArn"), namespace_id, datasource_id)
 
         # Athena federation for JDBC sources is provisioned by a separate,
         # dedicated Step Functions step (FederationProvisionerFn) — kept out of
@@ -397,14 +404,43 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         # (captured above), and an approve keeps them.
         from datetime import datetime
 
+        discovered_schemas = sorted({t.database for t in metadata.tables if t.database})
         source_update: dict[str, Any] = {
             "tablesDiscovered": len(metadata.tables),
             # Distinct schemas (Athena databases for federated JDBC catalogs);
             # used by the federation step to scope Lake Formation grants.
-            "discoveredSchemas": sorted({t.database for t in metadata.tables if t.database}),
+            "discoveredSchemas": discovered_schemas,
             "lastScanAt": datetime.now(UTC).isoformat(),
             "lastScanJobId": scan_job_sk,
         }
+        # A connector-backed source is ONE known schema, written on the record at create,
+        # and a scan that found no tables must not erase it: serve's namespace-qualifier
+        # check builds `federated_catalog_schemas` from this list, so an empty list has
+        # every catalog-qualified reference to the source DENIED with no fallback, and
+        # repairing it needs a drift re-scan plus a steward review.
+        #
+        # Zero tables is not exotic here: an over-narrow `tableFilter` does it, and so does
+        # a credential with BROWSE but not SELECT, where every DESCRIBE lands in
+        # `failed_tables` and the scan still succeeds.
+        #
+        # Scoped to the connector-backed set rather than applied to every sub-type: for
+        # federated JDBC the discovered set is the authoritative one (schemas really can
+        # come and go between scans, and the federation step grants against exactly this
+        # list), so suppressing an empty write there would mask a real drift.
+        if (
+            source_type in CONNECTOR_BACKED_SUB_TYPES
+            and not discovered_schemas
+            and (item.get("discoveredSchemas") or [])
+        ):
+            logger.warning(
+                "discovered_schemas_write_suppressed_empty",
+                extra={
+                    "datasource_id": datasource_id,
+                    "retained": item.get("discoveredSchemas"),
+                    "failed_table_count": len(metadata.failed_tables),
+                },
+            )
+            source_update.pop("discoveredSchemas")
         # Native Glue sources are queryable via AwsDataCatalog as soon as
         # they're scanned. JDBC sources become queryable only after the
         # federation step provisions the catalog, so that handler sets
@@ -538,6 +574,10 @@ def _discover(
         "role": config.get("role"),
         "data_source_id": datasource_id,
         "namespace_id": namespace_id,
+        # Carried only so `CustomConnector`, which serves CUSTOM_CONNECTOR and
+        # DATABRICKS_SQL_WAREHOUSE alike, can name the right one in an error message.
+        # Nothing branches on it.
+        "source_sub_type": item.get("sourceSubType", ""),
     }
 
     # Re-check the Glue target's namespace ownership here, not only at

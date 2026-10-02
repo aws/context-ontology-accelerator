@@ -1833,6 +1833,116 @@ class TestProvenanceAnnotations:
         assert g.value(ns.TriplesMap_T, SCL.datasourceId) is None
         assert g.value(ns.TriplesMap_T, SCL.sourceSchema) is None
 
+    def test_a_connector_backed_source_carries_the_pair_that_resolves_its_catalog(self, strategy):
+        """The provenance a serve-side qualification pass needs is the datasource id plus
+        the schema, NOT a catalog name baked into the mapping.
+
+        Serve resolves the Athena catalog from the source record at query time. A copy of
+        that name here would freeze a mutable control-plane fact into an immutable accepted
+        artifact, going stale on re-registration — and a stale qualifier names a catalog the
+        namespace may no longer own.
+        """
+        tables = [
+            CatalogTable(
+                id="1",
+                name="sales_orders",
+                fullyQualifiedName="coa_dbx_test.sales_orders",
+                columns=[CatalogColumn(name="id", dataType="INT")],
+                tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["id"])],
+                datasourceId="dbx-source-1",
+                sourceSchema="coa_dbx_test",
+            )
+        ]
+        g = _build(strategy, tables)
+        ns = Namespace(PREFIX)
+        tmap = ns.TriplesMap_SalesOrders
+
+        assert str(g.value(tmap, SCL.datasourceId)) == "dbx-source-1"
+        assert str(g.value(tmap, SCL.sourceSchema)) == "coa_dbx_test"
+
+    def test_the_annotation_vocabulary_on_a_triples_map_is_exactly_two_terms(self, strategy):
+        """No sub-type addition may widen what a TriplesMap carries.
+
+        Enumerates the whole predicate set, so a new annotation cannot be introduced without
+        this failing. Every namespace's ingest and NL→SQL routing read this graph, so a
+        silently added term changes an artifact every existing namespace already has.
+        """
+        tables = [
+            CatalogTable(
+                id="1",
+                name="orders",
+                fullyQualifiedName="public.orders",
+                columns=[CatalogColumn(name="id", dataType="INT")],
+                tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["id"])],
+                datasourceId="jdbc-source-1",
+                sourceSchema="public",
+            )
+        ]
+        g = _build(strategy, tables)
+        ns = Namespace(PREFIX)
+
+        predicates = set(g.predicates(subject=ns.TriplesMap_Orders))
+        assert predicates == {
+            RDF.type,
+            RR.logicalTable,
+            RR.subjectMap,
+            RR.predicateObjectMap,
+            SCL.datasourceId,
+            SCL.sourceSchema,
+        }
+
+    def test_table_name_carries_the_real_table_name_for_a_connector_backed_source(self, strategy):
+        """``rr:tableName`` carries the name the source actually has, never a rewritten one.
+
+        Ontop loads the VKG from this value, so the table part must be the source's own
+        name. A connector-backed source is the one where that cannot be repaired
+        downstream: serve applies its Glue-crawled-name rewrite to every OTHER sub-type, and
+        skips these (``CONNECTOR_BACKED_SUB_TYPES``), so whatever lands here is what reaches
+        the connector. The `{schema}_{table}` crawler shape in particular must not appear.
+
+        A unique name is emitted bare, per :func:`logical_table_names`; the shared-name case
+        below covers the qualified form.
+        """
+        tables = [
+            CatalogTable(
+                id="1",
+                name="sales_orders",
+                fullyQualifiedName="coa_dbx_test.sales_orders",
+                columns=[CatalogColumn(name="id", dataType="INT")],
+                tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["id"])],
+                datasourceId="dbx-source-1",
+                sourceSchema="coa_dbx_test",
+            )
+        ]
+        g = _build(strategy, tables)
+        lt = g.value(Namespace(PREFIX).TriplesMap_SalesOrders, RR.logicalTable)
+
+        table_name = str(g.value(lt, RR.tableName))
+        assert table_name == '"sales_orders"'
+        assert "coa_dbx_test_sales_orders" not in table_name
+
+    def test_a_shared_table_name_is_qualified_with_the_real_schema_and_name(self, strategy):
+        """When a second source exposes a table of the same name, the connector-backed one is
+        qualified as ``"schema"."table"`` — still the real schema and the real table name,
+        so the qualified form is no more a rewrite than the bare one."""
+        tables = [
+            CatalogTable(
+                id=str(i),
+                name="sales_orders",
+                fullyQualifiedName=f"{schema}.sales_orders",
+                columns=[CatalogColumn(name="id", dataType="INT")],
+                tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["id"])],
+                datasourceId=source,
+                sourceSchema=schema,
+            )
+            for i, (source, schema) in enumerate((("dbx-source-1", "coa_dbx_test"), ("pg-source-1", "public")), 1)
+        ]
+        g = _build(strategy, tables)
+
+        emitted = {str(name) for name in g.objects(None, RR.tableName)}
+        assert '"coa_dbx_test"."sales_orders"' in emitted
+        assert not any("coa_dbx_test_sales_orders" in name for name in emitted)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 9: Predicate Naming Convention
@@ -2023,8 +2133,16 @@ class TestEdgeCases:
         lt = g.value(ns.TriplesMap_Useractivity, RR.logicalTable)
         assert str(g.value(lt, RR.tableName)) == '"UserActivity"'
 
-    def test_multiple_fk_constraints_on_same_column_first_wins(self, strategy):
-        """If multiple FK constraints reference the same column, first one wins."""
+    def test_multiple_fk_constraints_on_same_column_emit_one_join_each(self, strategy):
+        """A column carrying several FKs gets one Referencing Object Map PER target.
+
+        Previously the first constraint won and the rest were silently dropped —
+        which, once cross-source inference started producing columns that
+        legitimately reference several tables (a local parent AND a crosswalk),
+        meant approved relationships never reached the mapping (#1088 follow-up).
+        With more than one relationship the POM and predicate are target-qualified
+        so they cannot collide; a single-FK column keeps the plain names.
+        """
         tables = [
             CatalogTable(
                 id="1",
@@ -2047,9 +2165,17 @@ class TestEdgeCases:
         ]
         g = _build(strategy, tables)
         ns = Namespace(PREFIX)
-        # First FK constraint wins — parentTriplesMap points to table_a
-        parent = _object_map_parent_tmap(g, ns["TriplesMap_Refs/POM_TargetId"])
-        assert parent == ns.TriplesMap_TableA
+        pom_a = ns["TriplesMap_Refs/POM_TargetId__TableA"]
+        pom_b = ns["TriplesMap_Refs/POM_TargetId__TableB"]
+        assert _object_map_parent_tmap(g, pom_a) == ns.TriplesMap_TableA
+        assert _object_map_parent_tmap(g, pom_b) == ns.TriplesMap_TableB
+        assert _object_map_join_conditions(g, pom_a) == [('"target_id"', '"id"')]
+        assert _object_map_join_conditions(g, pom_b) == [('"target_id"', '"id"')]
+        # Predicates are qualified to match the ontology's per-target properties.
+        assert g.value(pom_a, RR.predicate) == ns.refs_targetId__TableA
+        assert g.value(pom_b, RR.predicate) == ns.refs_targetId__TableB
+        # The unqualified map is NOT emitted for a multi-FK column.
+        assert (ns["TriplesMap_Refs/POM_TargetId"], RR.objectMap, None) not in g
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

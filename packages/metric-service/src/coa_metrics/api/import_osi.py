@@ -48,6 +48,7 @@ from coa_metrics.neptune_client import (
 )
 from coa_metrics.opensearch_client import MetricOpenSearchClient
 from coa_metrics.osi_parser import (
+    MAX_SQL_EXPRESSION_LENGTH,
     OsiMetric,
     osi_dialect_to_internal,
     parse_osi_yaml,
@@ -58,7 +59,7 @@ from coa_metrics.source_status import (
     check_source_table_exists,
     permissive_lookup_enabled,
 )
-from coa_metrics.validator import check_data_modifying
+from coa_metrics.validator import check_data_modifying, check_select_shape, check_tier1_execution_shape
 
 setup_logging(os.environ.get("LOG_LEVEL", "INFO"))
 logger = structlog.get_logger(__name__)
@@ -328,7 +329,9 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             },
         )
 
-    warnings: list[str] = []
+    # Non-fatal parser findings (e.g. an ignored `x_coa:` block) ride along in the
+    # response so an author sees why a metric landed without its COA metadata.
+    warnings: list[str] = [f"{w.path}: {w.message}" for w in parse_result.warnings]
 
     # Step 2: Resolve datasets (fail-closed when the lookup is unavailable, #564).
     # The lookup is only needed when a datasets block is present — documents
@@ -372,6 +375,12 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         except ValueError as exc:
             warnings.append(f"Metric '{osi_metric.name}': skipped — {exc}")
             continue
+
+        if not (osi_metric.custom_extensions and osi_metric.custom_extensions.source_table):
+            warnings.append(
+                f"Metric '{osi_metric.name}': no source_table in custom_extensions — "
+                f"defaulted to the metric name '{metric_def.source_table}'"
+            )
 
         # Enforce an APPROVED source (#564) and the declared sourceTable (#161)
         # — create/update enforce both, so import must too or it is a bypass.
@@ -475,20 +484,30 @@ def _osi_metric_to_definition(
     # Map dialects
     dialects: list[MetricDialect] = []
     for expr in osi_metric.expression:
+        if len(expr.expression) > MAX_SQL_EXPRESSION_LENGTH:
+            raise ValueError(f"SQL expression must be at most {MAX_SQL_EXPRESSION_LENGTH} characters")
         try:
             internal_dialect = osi_dialect_to_internal(expr.dialect)
         except ValueError:
             # Unknown dialect — use as-is (lowercase)
             internal_dialect = expr.dialect.lower()
-        # Safety check: DML/DDL is the only hard block on import.
-        # Fragments and unparseable SQL import with a soft warning.
+        # Import is another metric-persistence path, including the async worker
+        # that reuses this converter. Enforce the same SQL contract as
+        # CreateMetric/UpdateMetric so OSI cannot bypass onboarding.
         dml_error = check_data_modifying(expr.expression, internal_dialect)
         if dml_error:
             raise ValueError(dml_error)
+        shape_error = check_select_shape(expr.expression, internal_dialect)
+        if shape_error:
+            raise ValueError(shape_error)
         dialects.append(MetricDialect(dialect=internal_dialect, expression=expr.expression))
 
     if not dialects:
         raise ValueError("No valid dialect expressions")
+
+    tier1_error = check_tier1_execution_shape([{"dialect": d.dialect, "expression": d.expression} for d in dialects])
+    if tier1_error:
+        raise ValueError(tier1_error)
 
     # Extract data source and table from custom extensions or dataset resolution
     data_source_id = ""
@@ -515,8 +534,10 @@ def _osi_metric_to_definition(
         raise ValueError("No data_source_id in custom_extensions and cannot infer from datasets")
 
     if not source_table:
-        # Default source_table to metric name if not specified
+        # Default source_table to metric name if not specified. Logged because this
+        # is the path an ignored vendor block (e.g. `x_coa:`) silently lands on.
         source_table = osi_metric.name
+        logger.warning("osi_source_table_defaulted", metric=osi_metric.name, source_table=source_table)
 
     # Map ai_context directly — OSI ai_context is a structured object matching our MetricAiContext
     ai_context = None

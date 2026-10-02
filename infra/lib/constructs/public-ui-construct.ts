@@ -21,10 +21,10 @@ import { RuntimeConfig, RUNTIME_CONFIG_FILENAME } from "@coa/shared";
  * that chunk, so no inline scripts are needed.
  *
  * `connect-src`/`frame-src` are scoped to the app's real endpoints — API
- * and OIDC authority — when those are known at deploy time. Before
- * the API endpoint is wired (first deploy, runtime-config not yet patched)
- * we fall back to scheme-level allowances (`https:`) so the app still
- * functions; a subsequent deploy tightens them automatically. `frame-src`
+ * and OIDC authority. The API URL is usually a cross-stack token at synth; its
+ * origin is derived in CloudFormation so it is still allowlisted explicitly.
+ * Only when no API endpoint is configured at all do we fall back to a
+ * scheme-level `https:` so the app still functions. `frame-src`
  * includes the OIDC authority for silent-token-renew iframes.
  *
  * `style-src` retains `'unsafe-inline'` because Cloudscape/emotion inject
@@ -44,6 +44,14 @@ export function buildContentSecurityPolicy(
 
   const originOf = (url?: string): string | undefined => {
     if (!url) return undefined;
+    // A cross-stack value (e.g. the API Gateway URL from the api stack) is an
+    // unresolved token at synth, so `new URL()` throws on it. Returning
+    // undefined there silently dropped the API origin and fell back to a
+    // blanket `https:` in connect-src. Build the origin in CloudFormation
+    // instead: `https://<host>/<stage>/` split on "/" puts the host at index 2.
+    if (cdk.Token.isUnresolved(url)) {
+      return `https://${cdk.Fn.select(2, cdk.Fn.split("/", url))}`;
+    }
     try {
       return new URL(url).origin;
     } catch {
@@ -128,14 +136,19 @@ export function buildContentSecurityPolicy(
   if (cognitoOrigin) frame.add(cognitoOrigin); // OIDC iframe against the IdP
   if (cognitoHostedUiOrigin) frame.add(cognitoHostedUiOrigin); // silent-renew iframe
 
-  // API endpoint not yet wired → permit scheme-level so the app still works;
-  // a re-deploy tightens these to the specific origins above.
+  // No API endpoint configured at all → permit scheme-level so the app still
+  // works. A cross-stack (token) endpoint is resolved above and never lands here.
   if (!apiOrigin) {
     connect.add("https:");
   }
 
+  // `default-src 'none'`: every fetch directive the SPA uses is declared
+  // explicitly below, so the fallback only catches types it never loads
+  // (media, manifest, …). `form-action 'none'`: the SPA never performs a
+  // native form submission — forms are handled in JS and OIDC uses redirects,
+  // not form_post. `base-uri 'none'`: index.html has no <base> element.
   return [
-    "default-src 'self'",
+    "default-src 'none'",
     "script-src 'self'",
     "style-src 'self' 'unsafe-inline'",
     "img-src 'self' data:",
@@ -143,9 +156,10 @@ export function buildContentSecurityPolicy(
     `connect-src ${[...connect].join(" ")}`,
     `frame-src ${[...frame].join(" ")}`,
     "object-src 'none'",
-    "base-uri 'self'",
+    "base-uri 'none'",
     "frame-ancestors 'none'",
-    "form-action 'self'",
+    "form-action 'none'",
+    "upgrade-insecure-requests",
   ].join("; ");
 }
 

@@ -573,3 +573,37 @@ class TestCountEntitiesStore:
         assert "CONTAINS" in captured["query"]  # text filter shared
         assert "LIMIT" not in captured["query"]
         assert "OFFSET" not in captured["query"]
+
+
+class TestGetVertexSupersededHistory:
+    """coa:superseded* history literals are surfaced under ``superseded``,
+    never as live ``comments``/``alt_labels`` and never as ``edges``."""
+
+    def test_history_predicates_bucketed_not_live_not_edges(self):
+        graph_uri = f"{ndb._namespace_graph_prefix(NS)}/x"
+        q1 = _results(
+            [
+                _binding(g=(graph_uri, "uri"), p=(_RDF + "type", "uri"), o=(_OWL + "Class", "uri")),
+                _binding(g=(graph_uri, "uri"), p=(_RDFS + "comment", "uri"), o=("Steward text.", "literal")),
+                _binding(g=(graph_uri, "uri"), p=(_SCL + "supersededComment", "uri"), o=("AI text.", "literal")),
+                _binding(g=(graph_uri, "uri"), p=(_SCL + "supersededAltLabel", "uri"), o=("cust_master", "literal")),
+                _binding(g=(graph_uri, "uri"), p=(_SCL + "supersededAltLabel", "uri"), o=("cust_master", "literal")),
+            ]
+        )
+        calls = [q1, _results([]), _results([]), _results([])]
+        store = NeptuneDBGraphStore(endpoint="https://fake:8182", namespace=NS)
+        with patch.object(ndb, "_sparql_query", side_effect=lambda q: calls.pop(0) if calls else _results([])):
+            record = store.get_vertex(PUB, namespace=NS)
+        assert record["comments"] == ["Steward text."]
+        assert record["alt_labels"] == []
+        assert record["superseded"] == {"comments": ["AI text."], "altLabels": ["cust_master"]}  # deduped
+        assert not any("superseded" in e["p"] for e in record["edges"])
+
+    def test_no_history_gives_empty_dict(self):
+        graph_uri = f"{ndb._namespace_graph_prefix(NS)}/x"
+        q1 = _results([_binding(g=(graph_uri, "uri"), p=(_RDF + "type", "uri"), o=(_OWL + "Class", "uri"))])
+        calls = [q1, _results([]), _results([]), _results([])]
+        store = NeptuneDBGraphStore(endpoint="https://fake:8182", namespace=NS)
+        with patch.object(ndb, "_sparql_query", side_effect=lambda q: calls.pop(0) if calls else _results([])):
+            record = store.get_vertex(PUB, namespace=NS)
+        assert record["superseded"] == {}

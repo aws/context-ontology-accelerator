@@ -1,9 +1,11 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import * as fs from "fs";
+import * as path from "path";
 import * as cdk from "aws-cdk-lib";
 import * as lambda from "aws-cdk-lib/aws-lambda";
-import { Template, Match } from "aws-cdk-lib/assertions";
+import { Annotations, Template, Match } from "aws-cdk-lib/assertions";
 import { NetworkStack } from "../../lib/stacks/foundation/network-stack";
 import { StorageStack } from "../../lib/stacks/foundation/storage-stack";
 import { SourcesStack } from "../../lib/stacks/services/sources-stack";
@@ -298,8 +300,10 @@ describe("SourcesStack", () => {
         Action: string | string[];
         Resource: string | string[];
       }
-      const toArr = (x: string | string[]): string[] => (Array.isArray(x) ? x : [x]);
-      const glue = (suffix: string) => `arn:aws:glue:us-east-1:123456789012:${suffix}`;
+      const toArr = (x: string | string[]): string[] =>
+        Array.isArray(x) ? x : [x];
+      const glue = (suffix: string) =>
+        `arn:aws:glue:us-east-1:123456789012:${suffix}`;
 
       // Both roles' Glue metadata-read statements, targeted by Sid rather than by
       // filtering on catalog/* (which would pass even if one role lost the grant,
@@ -315,7 +319,9 @@ describe("SourcesStack", () => {
       for (const stmt of [discovery, enrichment]) {
         const actions = toArr(stmt.Action);
         const resources = toArr(stmt.Resource);
-        expect(actions).toEqual(expect.arrayContaining(["glue:GetCatalog", "glue:GetCatalogs"]));
+        expect(actions).toEqual(
+          expect.arrayContaining(["glue:GetCatalog", "glue:GetCatalogs"]),
+        );
         expect(resources).toEqual(
           expect.arrayContaining([
             glue("catalog"),
@@ -740,8 +746,11 @@ describe("SourcesStack", () => {
         ),
         Environment: {
           Variables: Match.objectLike({
+            // The env segment is part of the path: the runtime read, the policy naming
+            // the parameter ARN and the deploy-time reference all have to resolve the
+            // same parameter, and only this environment's.
             CONSUMER_QUERY_ROLE_SSM_PARAM: Match.stringLikeRegexp(
-              ".*/serve/runtime-role-arn$",
+              ".*/dev/serve/runtime-role-arn$",
             ),
           }),
         },
@@ -906,9 +915,14 @@ describe("SourcesStack", () => {
         });
     };
 
-    it("grants assume on customer datasource-access roles in both consumers", () => {
-      // The discovery Lambda and the enrichment task each get their own grant.
-      expect(assumeStatements().length).toBe(2);
+    it("grants assume on customer datasource-access roles in all three consumers", () => {
+      // The discovery Lambda, the enrichment task, and the sources API each get
+      // their own grant. The sources API's is the newest: it validates the
+      // customer's credential-access role at source-create, so a broken trust
+      // policy is reported at submit rather than at first scan. The Databricks
+      // connector holds the same shape from its own CDK app, which this template
+      // does not contain (it is deployed separately, on purpose).
+      expect(assumeStatements().length).toBe(3);
     });
 
     it("requires an ExternalId on every datasource assume grant", () => {
@@ -919,6 +933,37 @@ describe("SourcesStack", () => {
           Null: { "sts:ExternalId": "false" },
         });
       }
+    });
+
+    // All three are produced by one helper precisely so they cannot drift; this is
+    // what asserts the helper did not quietly stop being one shape. Account
+    // wildcard included: the customer's credential-access role may live in any
+    // account, this deployment's own included, so the reserved NAME prefix plus
+    // the target's trust policy is the whole bound.
+    it("gives all three the identical account-agnostic reserved-prefix scope", () => {
+      const resources = assumeStatements().map((st) => st.Resource);
+      expect(resources).toEqual([
+        "arn:aws:iam::*:role/coa-dev-datasource-access-*",
+        "arn:aws:iam::*:role/coa-dev-datasource-access-*",
+        "arn:aws:iam::*:role/coa-dev-datasource-access-*",
+      ]);
+      for (const resource of resources) {
+        // No `123456789012` anywhere in the ARN: an account restriction here would
+        // refuse the deliberate cross-account topology.
+        expect(String(resource)).not.toContain(TEST_ENV.account);
+      }
+    });
+
+    it("keeps the Sids the deployed policies shipped with", () => {
+      expect(
+        assumeStatements()
+          .map((st) => st.Sid)
+          .sort(),
+      ).toEqual([
+        "AssumeRoleCoaManaged",
+        "AssumeRoleCustomerProvided",
+        "AssumeRoleDatasourceAccessValidation",
+      ]);
     });
 
     it("gives the discovery Lambda the prefix it derives the ExternalId from", () => {
@@ -932,6 +977,561 @@ describe("SourcesStack", () => {
           }),
         },
       });
+    });
+  });
+
+  describe("Databricks sub-type — sources-API config parameters", () => {
+    /** IAM statements attached to the sources-API Lambda's role. */
+    const sourcesApiStatements = (): Record<string, unknown>[] => {
+      const fn = Object.values(
+        template.findResources("AWS::Lambda::Function"),
+      ).find((f) =>
+        String(f.Properties?.FunctionName ?? "").endsWith("sources-api"),
+      );
+      expect(fn).toBeDefined();
+      const roleId: string = fn!.Properties.Role["Fn::GetAtt"][0];
+      return Object.values(template.findResources("AWS::IAM::Policy"))
+        .filter((p) =>
+          p.Properties.Roles?.some((r: { Ref?: string }) => r.Ref === roleId),
+        )
+        .flatMap(
+          (p) =>
+            p.Properties.PolicyDocument.Statement as Record<string, unknown>[],
+        );
+    };
+
+    const statementWithSid = (sid: string): Record<string, unknown> => {
+      const found = sourcesApiStatements().find((st) => st.Sid === sid);
+      expect(found).toBeDefined();
+      return found!;
+    };
+
+    /**
+     * Whether an IAM resource pattern would authorise `arn`. The assertions below are
+     * NEGATIVE, and a substring check would pass for a pattern that matches by
+     * wildcard rather than by literal, so expand `*`/`?` the way IAM does.
+     */
+    const iamResourceMatches = (pattern: string, arn: string): boolean =>
+      new RegExp(
+        `^${pattern
+          .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+          .replace(/\*/g, ".*")
+          .replace(/\?/g, ".")}$`,
+      ).test(arn);
+
+    const SSM_ARN = "arn:aws:ssm:us-east-1:123456789012:parameter";
+    const SOURCES_PREFIX = "/coa/dev/connectors/databricks/sources";
+    const DEPLOYMENT_PARAM =
+      "/coa/dev/connectors/databricks/deployment/function-arn";
+
+    // `ssmPrefix` is `/${prefix}` with NO environment segment, while physical
+    // names are `{prefix}-{env}-{name}`, and environments share an account. Both
+    // paths therefore have to insert `dev` explicitly. Asserted as exact strings
+    // rather than a regex, because the failure mode of getting this wrong is not a
+    // broken deploy — it is a dev registration creating a catalog that points at
+    // prod's connector, and a dev role able to repoint a prod source's credential.
+    it("passes the per-source parameter prefix, environment segment included", () => {
+      template.hasResourceProperties("AWS::Lambda::Function", {
+        FunctionName: Match.stringLikeRegexp("sources-api$"),
+        Environment: {
+          Variables: Match.objectLike({
+            DATABRICKS_CONFIG_SSM_PREFIX: SOURCES_PREFIX,
+          }),
+        },
+      });
+      expect(SOURCES_PREFIX).not.toBe("/coa/connectors/databricks/sources");
+    });
+
+    it("passes the connector-ARN parameter NAME, not the ARN itself", () => {
+      template.hasResourceProperties("AWS::Lambda::Function", {
+        FunctionName: Match.stringLikeRegexp("sources-api$"),
+        Environment: {
+          Variables: Match.objectLike({
+            DATABRICKS_CONNECTOR_ARN_SSM_PARAM: DEPLOYMENT_PARAM,
+          }),
+        },
+      });
+      // The connector is deployed from its own CDK app, so `infra` cannot see its
+      // ARN at synth — and passing the name instead is what keeps the ARN out of
+      // this template. A value here would mean someone resolved it at synth.
+      expect(DEPLOYMENT_PARAM).not.toContain("arn:aws:lambda");
+    });
+
+    // Net-new: this role held no SSM write at all. Integrity is the property —
+    // the parameter tells the shared connector which secret and which warehouse
+    // to use, so repointing one repoints a source at another source's credential
+    // with the catalog name unchanged.
+    it("grants exactly the two write actions the runtime calls, and no more", () => {
+      const stmt = statementWithSid("DatabricksSourceConfigWrite");
+      expect(stmt.Effect).toBe("Allow");
+      // An exact list rather than `arrayWith`, so a write action cannot reappear on
+      // the one path where integrity is the whole point without a test saying why.
+      // `ssm:DeleteParameters` (plural) is a distinct action covering the batch API
+      // and nothing calls it; `ssm:AddTagsToResource` is absent because nothing tags
+      // this parameter — `GetParameter` returns no tags, so the ids live in its body.
+      expect(stmt.Action).toEqual(["ssm:PutParameter", "ssm:DeleteParameter"]);
+      // The SSM ARN quirk, asserted literally: the resource is `parameter`
+      // immediately followed by the parameter NAME, which already begins with `/`.
+      // `parameter/${ssmPrefix}/...` is a different path and matches nothing.
+      expect(stmt.Resource).toBe(`${SSM_ARN}${SOURCES_PREFIX}/*`);
+    });
+
+    // The two subtrees are separated so the sources API cannot overwrite the ARN it
+    // later reads, which holds only if neither scope covers the other's path.
+    it("cannot write the deployment subtree it reads from", () => {
+      const write = String(
+        statementWithSid("DatabricksSourceConfigWrite").Resource,
+      );
+      expect(iamResourceMatches(write, `${SSM_ARN}${DEPLOYMENT_PARAM}`)).toBe(
+        false,
+      );
+      // Guard the guard: the same helper must match what the scope IS for, or a
+      // typo in the pattern would make the negative assertion vacuous.
+      expect(
+        iamResourceMatches(
+          write,
+          `${SSM_ARN}${SOURCES_PREFIX}/coadevds_abc123`,
+        ),
+      ).toBe(true);
+    });
+
+    it("reads exactly one parameter, and not the per-source subtree it writes", () => {
+      const stmt = statementWithSid("ReadDatabricksConnectorArnParam");
+      expect(stmt.Effect).toBe("Allow");
+      expect(stmt.Action).toBe("ssm:GetParameter");
+      // One parameter, no trailing wildcard.
+      expect(stmt.Resource).toBe(`${SSM_ARN}${DEPLOYMENT_PARAM}`);
+      const read = String(stmt.Resource);
+      expect(
+        iamResourceMatches(read, `${SSM_ARN}${SOURCES_PREFIX}/coadevds_abc123`),
+      ).toBe(false);
+      expect(iamResourceMatches(read, `${SSM_ARN}${DEPLOYMENT_PARAM}`)).toBe(
+        true,
+      );
+    });
+
+    // `GetDataCatalog` returns no tags, and with one shared handler ARN
+    // `register_lambda_catalog`'s ownership check (catalog type + handler-ARN set)
+    // is trivially true for every Databricks catalog. The `coa:sourceId` tag is
+    // what is left to tell two of them apart at delete, so both the write and the
+    // read of it are required — and scoped to the catalogs this deployment names.
+    it("grants catalog tagging and tag reads on this deployment's catalogs only", () => {
+      const stmt = statementWithSid("AthenaDataCatalogTagging");
+      expect(stmt.Action).toEqual([
+        "athena:TagResource",
+        "athena:ListTagsForResource",
+      ]);
+      expect(stmt.Resource).toBe(
+        "arn:aws:athena:us-east-1:123456789012:datacatalog/coadevds_*",
+      );
+    });
+
+    // Already shipped and covering what the new create-time validation needs:
+    // in-account, region-wildcard, DescribeSecret only (never GetSecretValue).
+    // Asserted here so a narrowing does not silently break the Databricks
+    // secret-binding check, which calls DescribeSecret in the secret's own region.
+    it("keeps the shipped secret-binding read, in-account and region-wildcard", () => {
+      const stmt = statementWithSid("DescribeSecretForNamespaceBinding");
+      expect(stmt.Action).toBe("secretsmanager:DescribeSecret");
+      expect(stmt.Resource).toBe(
+        "arn:aws:secretsmanager:*:123456789012:secret:*",
+      );
+    });
+
+    // `infra` gains NO connector resources — the connector keeps its own CDK app and
+    // its own deploy job, and the two exchange ARNs through SSM.
+    it("creates no connector Lambda, spill bucket or connector-ARN parameter", () => {
+      const rendered = JSON.stringify(template.toJSON());
+      expect(rendered).not.toContain("databricks-connector");
+      // The connector's own stack is the sole writer under `deployment/`; a
+      // parameter here would mean `infra` had started writing it.
+      const params = Object.values(
+        template.findResources("AWS::SSM::Parameter"),
+      ).map((p) => String(p.Properties?.Name ?? ""));
+      expect(params).not.toContain(DEPLOYMENT_PARAM);
+      for (const name of params) {
+        expect(name).not.toContain("/connectors/databricks/");
+      }
+    });
+
+    /**
+     * The stringly-typed half of the handoff, tripwired.
+     *
+     * These two path suffixes are composed INDEPENDENTLY in two pnpm workspaces —
+     * here, and in `connectors/databricks/cdk/lib/constants.ts`
+     * (`CONFIG_SSM_PREFIX_SUFFIX`, `FUNCTION_ARN_PARAMETER_SUFFIX`) — and each
+     * suite pins its own literal. So renaming one leaves the other green while
+     * the sources API writes where the connector does not read, and the first
+     * symptom is a real source create failing to resolve its configuration.
+     *
+     * A TEXT-level check on purpose: `connectors/` is a separate workspace so those
+     * apps stay copyable-out and buildable on their own, and an import here would
+     * reintroduce the cross-workspace coupling — including the `aws-cdk-lib`
+     * version-equality invariant that measurably broke it — so do NOT "fix" this
+     * into an import.
+     */
+    it("agrees with the connector app on both path suffixes", () => {
+      // Both LEAVES, not just the `deployment/` subtree: asserting the subtree alone
+      // leaves the `function-arn` leaf free to be renamed on one side and stay green.
+      const SHARED_SUFFIXES = [
+        "/connectors/databricks/sources",
+        "/connectors/databricks/deployment/",
+        "/connectors/databricks/deployment/function-arn",
+      ];
+      const CONNECTOR_STACK = path.join(
+        "connectors",
+        "databricks",
+        "cdk",
+        "lib",
+        "constants.ts",
+      );
+      const source = fs.readFileSync(
+        path.join(__dirname, "..", "..", "..", CONNECTOR_STACK),
+        "utf8",
+      );
+
+      // The two sides, checked independently against the same literals, so a
+      // failure says WHICH side moved rather than just that they disagree.
+      const infraSide = [SOURCES_PREFIX, DEPLOYMENT_PARAM].join("\n");
+      const drifted = SHARED_SUFFIXES.flatMap((suffix) =>
+        [
+          { file: CONNECTOR_STACK, present: source.includes(suffix) },
+          {
+            file: path.join(
+              "infra",
+              "lib",
+              "stacks",
+              "services",
+              "sources-stack.ts",
+            ),
+            present: infraSide.includes(suffix),
+          },
+        ]
+          .filter(({ present }) => !present)
+          .map(({ file }) => ({
+            suffix,
+            absentFrom: file,
+            mustAgreeWith: SHARED_SUFFIXES,
+            why:
+              "The sources API writes `sources/` and reads `deployment/`; the connector " +
+              "composes the same two paths independently in a separate pnpm workspace. " +
+              "Renaming one side leaves the other green and fails only at a real source create.",
+          })),
+      );
+
+      expect(drifted).toEqual([]);
+    });
+  });
+
+  describe("UnexpectedConnectorParameterWrite", () => {
+    const PATH_PREFIX = "/coa/dev/connectors/databricks/sources/";
+
+    const rules = () =>
+      Object.values(template.findResources("AWS::Events::Rule")).filter((r) =>
+        String(r.Properties?.Name ?? "").includes("databricks-parameter"),
+      );
+
+    const ruleNamed = (name: string): Record<string, unknown> => {
+      const found = rules().find((r) => r.Properties.Name === name);
+      expect(found).toBeDefined();
+      return found!.Properties;
+    };
+
+    // The only detection for this threat: a repointed parameter resolves
+    // successfully, so no runtime metric can see it.
+    it("watches all three write APIs across the two rules", () => {
+      const eventNames = rules().flatMap(
+        (r) => r.Properties.EventPattern.detail.eventName as string[],
+      );
+      // `DeleteParameters` is a distinct CloudTrail event name as well as a distinct
+      // IAM action; omitting it would let the batch form escape the detection.
+      expect(eventNames.sort()).toEqual([
+        "DeleteParameter",
+        "DeleteParameters",
+        "PutParameter",
+      ]);
+    });
+
+    it("prefix-matches the singular request shape on the env-scoped path", () => {
+      const pattern = ruleNamed("coa-dev-databricks-parameter-writes");
+      expect(pattern).toMatchObject({
+        EventPattern: {
+          source: ["aws.ssm"],
+          "detail-type": ["AWS API Call via CloudTrail"],
+          detail: {
+            eventSource: ["ssm.amazonaws.com"],
+            eventName: ["PutParameter", "DeleteParameter"],
+            requestParameters: { name: [{ prefix: PATH_PREFIX }] },
+          },
+        },
+      });
+    });
+
+    // The batch form carries `names` (a LIST), not `name`. A single pattern naming
+    // both keys under `requestParameters` would require both and so match nothing,
+    // which is why this is a second rule rather than one with `$or`.
+    it("covers the batch shape, which uses names as a list", () => {
+      const pattern = ruleNamed("coa-dev-databricks-parameter-batch-deletes");
+      expect(pattern).toMatchObject({
+        EventPattern: {
+          detail: {
+            eventName: ["DeleteParameters"],
+            requestParameters: { names: [{ prefix: PATH_PREFIX }] },
+          },
+        },
+      });
+      // And emphatically NOT the singular key, which would never match a batch call.
+      const detail = pattern.EventPattern as {
+        detail: { requestParameters: Record<string, unknown> };
+      };
+      expect(detail.detail.requestParameters.name).toBeUndefined();
+    });
+
+    it("sends both rules to one audit log group", () => {
+      const logGroup = Object.entries(
+        template.findResources("AWS::Logs::LogGroup"),
+      ).find(([, g]) =>
+        String(g.Properties?.LogGroupName ?? "").includes(
+          "databricks-parameter-writes",
+        ),
+      );
+      expect(logGroup).toBeDefined();
+      // A year, not a month: the record an investigation reads to decide whether a
+      // write was a repoint has to outlive the incident.
+      expect(logGroup![1].Properties.RetentionInDays).toBe(365);
+
+      const targets = rules().flatMap(
+        (r) => r.Properties.Targets as Array<{ Arn: unknown }>,
+      );
+      expect(targets).toHaveLength(2);
+      for (const target of targets) {
+        expect(JSON.stringify(target.Arn)).toContain(logGroup![0]);
+      }
+    });
+
+    // The allowlist lives in the metric filter, not the event pattern, and this is
+    // the reason: `anything-but` in an EventBridge pattern does NOT match an ABSENT
+    // key, so a writer with no sessionContext (an IAM user, a root call) would have
+    // been silently exempted — the most suspicious principal of the set.
+    const filterPattern = (): string => {
+      const filter = Object.values(
+        template.findResources("AWS::Logs::MetricFilter"),
+      ).find((f) =>
+        JSON.stringify(f.Properties?.FilterPattern ?? "").includes(
+          "sessionIssuer",
+        ),
+      );
+      expect(filter).toBeDefined();
+      return JSON.stringify(filter!.Properties.FilterPattern);
+    };
+
+    it("exempts the sources-API role by token, not by a hard-coded name", () => {
+      const apiFn = Object.values(
+        template.findResources("AWS::Lambda::Function"),
+      ).find((fn) =>
+        String(fn.Properties?.FunctionName ?? "").endsWith("sources-api"),
+      );
+      const apiRoleId: string = apiFn!.Properties.Role["Fn::GetAtt"][0];
+      // A Ref to the role resolves to its NAME at deploy time. A literal would be
+      // wrong the first time the role is replaced.
+      expect(filterPattern()).toContain(apiRoleId);
+    });
+
+    it("exempts the CDK CloudFormation execution role", () => {
+      expect(filterPattern()).toContain("cdk-hnb659fds-cfn-exec-role-");
+    });
+
+    it("treats an absent sessionIssuer as unexpected, not as exempt", () => {
+      // Load-bearing: a comparison against a missing field is false, so without the
+      // NOT EXISTS clause the `!=` terms alone would exempt every principal that has
+      // no assumed-role session.
+      const pattern = filterPattern();
+      expect(pattern).toContain(
+        "$.detail.userIdentity.sessionContext.sessionIssuer.userName NOT EXISTS",
+      );
+      // Disjunctive with the allowlist, so either condition alarms.
+      expect(pattern).toContain("||");
+    });
+
+    it("alarms on the metric the filter emits", () => {
+      template.hasResourceProperties("AWS::CloudWatch::Alarm", {
+        AlarmName: "coa-dev-databricks-unexpected-parameter-write",
+        Namespace: "COA/Sources",
+        MetricName: "UnexpectedConnectorParameterWrite",
+        Threshold: 1,
+        ComparisonOperator: "GreaterThanOrEqualToThreshold",
+        // A write is a discrete event, so "no data" is the normal state.
+        TreatMissingData: "notBreaching",
+      });
+    });
+
+    // So an operator reading the alarm knows what its silence means.
+    it("says in its own description that no trail means no detection", () => {
+      const alarm = Object.values(
+        template.findResources("AWS::CloudWatch::Alarm"),
+      ).find(
+        (a) =>
+          a.Properties?.AlarmName ===
+          "coa-dev-databricks-unexpected-parameter-write",
+      );
+      const description = String(alarm!.Properties.AlarmDescription);
+      expect(description).toContain("CloudTrail trail");
+      expect(description).toContain("this stack does not create");
+      expect(description).toContain("only");
+      // The runbook action, so the alarm is actionable without a second lookup.
+      expect(description).toContain("credentialSecretArn");
+    });
+
+    // Notifying nobody is a deliberate round-one seam (see the next test), but being on
+    // no dashboard as well left the one alarm whose threat has no other signal visible
+    // only to whoever thought to open the CloudWatch console.
+    it("shows the alarm on the stack's OE dashboard, since it notifies nobody", () => {
+      const [alarmId] = Object.entries(
+        template.findResources("AWS::CloudWatch::Alarm"),
+      ).find(
+        ([, a]) =>
+          a.Properties?.AlarmName ===
+          "coa-dev-databricks-unexpected-parameter-write",
+      )!;
+      const dashboard = Object.values(
+        template.findResources("AWS::CloudWatch::Dashboard", {
+          Properties: { DashboardName: "coa-dev-sources" },
+        }),
+      );
+      expect(dashboard).toHaveLength(1);
+      // The widget carries the alarm's ARN, so the body names its logical id.
+      expect(JSON.stringify(dashboard[0].Properties.DashboardBody)).toContain(
+        alarmId,
+      );
+    });
+
+    it("carries no alarm action when the deployment supplies none", () => {
+      // `alarmAction` is undefined in bin/app.ts (round one). The detection must
+      // record and alarm anyway rather than being blocked on a notification channel.
+      const alarm = Object.values(
+        template.findResources("AWS::CloudWatch::Alarm"),
+      ).find(
+        (a) =>
+          a.Properties?.AlarmName ===
+          "coa-dev-databricks-unexpected-parameter-write",
+      );
+      expect(alarm!.Properties.AlarmActions).toBeUndefined();
+    });
+
+    it("wires the action through the moment one is supplied", () => {
+      const app = new cdk.App({ context: TEST_CONTEXT });
+      const network = new NetworkStack(app, "TestNetwork", { env: TEST_ENV });
+      const storage = new StorageStack(app, "TestStorage", {
+        network,
+        env: TEST_ENV,
+      });
+      const actioned = Template.fromStack(
+        new SourcesStack(app, "TestSources", {
+          network,
+          storage,
+          env: TEST_ENV,
+          alarmAction: {
+            addAlarmActions: ({ alarm }) => {
+              alarm.addAlarmAction({
+                bind: () => ({
+                  alarmActionArn:
+                    "arn:aws:sns:us-east-1:123456789012:stub-topic",
+                }),
+              });
+            },
+          },
+        }),
+      );
+      const alarm = Object.values(
+        actioned.findResources("AWS::CloudWatch::Alarm"),
+      ).find(
+        (a) =>
+          a.Properties?.AlarmName ===
+          "coa-dev-databricks-unexpected-parameter-write",
+      );
+      expect(alarm!.Properties.AlarmActions).toEqual([
+        "arn:aws:sns:us-east-1:123456789012:stub-topic",
+      ]);
+    });
+  });
+
+  describe("Discovery Athena workgroup", () => {
+    // Both Athena clients omit `WorkGroup` when the variable is empty, which lands
+    // every SHOW/DESCRIBE in the account's `primary` workgroup — shared, so
+    // neither attributable nor independently limitable. The Databricks sub-type
+    // makes discovery a per-table fan-out against a COA-operated connector, so the
+    // cost and the concurrency become COA's.
+    it("creates one deployment-scoped workgroup, not one per namespace", () => {
+      const workgroups = Object.values(
+        template.findResources("AWS::Athena::WorkGroup"),
+      );
+      expect(workgroups).toHaveLength(1);
+      expect(workgroups[0].Properties.Name).toBe("coa-dev-sources-discovery");
+      expect(
+        workgroups[0].Properties.WorkGroupConfiguration
+          .PublishCloudWatchMetricsEnabled,
+      ).toBe(true);
+      // Not enforced: both clients pass `ResultConfiguration` explicitly, and
+      // enforcing would override a location the caller chose per statement.
+      expect(
+        workgroups[0].Properties.WorkGroupConfiguration
+          .EnforceWorkGroupConfiguration,
+      ).toBe(false);
+    });
+
+    it("pins the discovery Lambda to it", () => {
+      template.hasResourceProperties("AWS::Lambda::Function", {
+        FunctionName: Match.stringLikeRegexp("sources-db-connector$"),
+        Environment: {
+          Variables: Match.objectLike({
+            ATHENA_WORKGROUP: "coa-dev-sources-discovery",
+          }),
+        },
+      });
+    });
+
+    // ATHENA_WORKGROUP is the workgroup's NAME, not a CloudFormation reference, so
+    // nothing orders the two without this.
+    it("orders the workgroup before the function that names it", () => {
+      const fnId = Object.entries(
+        template.findResources("AWS::Lambda::Function"),
+      ).find(([, f]) =>
+        String(f.Properties?.FunctionName ?? "").endsWith(
+          "sources-db-connector",
+        ),
+      )![0];
+      const wgId = Object.keys(
+        template.findResources("AWS::Athena::WorkGroup"),
+      )[0];
+      expect(template.toJSON().Resources[fnId].DependsOn as string[]).toContain(
+        wgId,
+      );
+    });
+
+    // The discovery role's shipped Athena statement is already `workgroup/*`, so
+    // pinning a workgroup needs no policy change. Asserted so a later narrowing to
+    // a named workgroup does not silently lose enum sampling.
+    it("needs no policy change — the Athena scope is already workgroup/*", () => {
+      const fn = Object.values(
+        template.findResources("AWS::Lambda::Function"),
+      ).find((f) =>
+        String(f.Properties?.FunctionName ?? "").endsWith(
+          "sources-db-connector",
+        ),
+      );
+      const roleId: string = fn!.Properties.Role["Fn::GetAtt"][0];
+      const stmt = Object.values(template.findResources("AWS::IAM::Policy"))
+        .filter((p) =>
+          p.Properties.Roles?.some((r: { Ref?: string }) => r.Ref === roleId),
+        )
+        .flatMap(
+          (p) =>
+            p.Properties.PolicyDocument.Statement as Record<string, unknown>[],
+        )
+        .find((st) => st.Sid === "AthenaEnumSampling");
+      expect(stmt!.Resource).toBe(
+        "arn:aws:athena:us-east-1:123456789012:workgroup/*",
+      );
     });
   });
 
@@ -1103,6 +1703,94 @@ describe("SourcesStack", () => {
         Type: "String",
         Description: "Source scan jobs DynamoDB table name",
       });
+    });
+
+    // A Databricks source's credential-access role must trust TWO platform principals:
+    // the connector's execution role, which reads the credential on every request, and
+    // this one, which assumes the role once at registration to `DescribeSecret`. A
+    // trust policy naming only the first deploys fine and then refuses the source
+    // create with an `AccessDenied` naming no principal.
+    it("publishes the sources-API execution ROLE arn, not just the function arn", () => {
+      template.hasResourceProperties("AWS::SSM::Parameter", {
+        Type: "String",
+        Name: "/coa/sources/api-role-arn",
+        // GetAtt, never an ARN assembled by hand from the pinned name: the account
+        // and partition come from the deployment.
+        Value: { "Fn::GetAtt": [Match.anyValue(), "Arn"] },
+      });
+    });
+
+    it("resolves that ARN from the sources-API function's own role", () => {
+      // Guards against the parameter existing but pointing at some other role — the
+      // failure mode a shape-only assertion would miss, and the one that produces a
+      // trust policy naming a principal that never calls.
+      const apiFn = Object.values(
+        template.findResources("AWS::Lambda::Function"),
+      ).find((fn) =>
+        String(fn.Properties?.FunctionName ?? "").endsWith("sources-api"),
+      );
+      const apiRoleId: string = apiFn!.Properties.Role["Fn::GetAtt"][0];
+      const param = Object.values(
+        template.findResources("AWS::SSM::Parameter"),
+      ).find((p) => p.Properties?.Name === "/coa/sources/api-role-arn");
+      expect(param).toBeDefined();
+      expect(param!.Properties.Value["Fn::GetAtt"][0]).toBe(apiRoleId);
+    });
+
+    /** The sources-API function's own execution role, as the template renders it. */
+    const apiRole = (): Record<string, unknown> => {
+      const apiFn = Object.values(
+        template.findResources("AWS::Lambda::Function"),
+      ).find((fn) =>
+        String(fn.Properties?.FunctionName ?? "").endsWith("sources-api"),
+      );
+      const apiRoleId: string = apiFn!.Properties.Role["Fn::GetAtt"][0];
+      const role = template.findResources("AWS::IAM::Role")[apiRoleId];
+      expect(role).toBeDefined();
+      return role.Properties;
+    };
+
+    // The ARN above is copied by hand into every Databricks source's credential-access
+    // role, and CloudFormation replaces a role on a RoleName or Path change — so a
+    // generated name would move the ARN under every customer at once.
+    it("pins the sources-API role's NAME, so the published ARN cannot move", () => {
+      expect(apiRole().RoleName).toBe("coa-dev-sources-api-role");
+    });
+
+    it("keeps that name inside IAM's 64 and outside the reserved datasource-access prefix", () => {
+      // A pinned name is a name that can be chosen wrongly: inside
+      // `coa-dev-datasource-access-` the reserved-prefix aspect refuses the synth, and
+      // over 64 IAM refuses the deploy. `{prefix}-{env}` is capped at 27 by this
+      // stack's longest prefixed role name, so 16 more characters has ample room.
+      const name = String(apiRole().RoleName);
+      expect(name.length).toBeLessThanOrEqual(64);
+      expect(name.startsWith("coa-dev-datasource-access-")).toBe(false);
+    });
+
+    // Env-LESS, matching `db-enrichment-role-arn` and `federation-provisioner-role-arn`,
+    // its two remaining siblings — pinned here so the choice is a decision on record
+    // rather than an accident. See the comment at the parameter for why the shared-name
+    // debt is fail-closed for these three.
+    //
+    // `db-connector-role-arn` left this set: it and serve's runtime role are read by a
+    // connector stack deployed from a separate CDK app, where they become IAM grants, so
+    // there the shared name fails OPEN. A future change env-scoping the rest of the
+    // platform's parameters starts by moving the three names below.
+    it("keeps the remaining role parameters on one env-less convention", () => {
+      const names = Object.values(template.findResources("AWS::SSM::Parameter"))
+        .map((p) => String(p.Properties?.Name ?? ""))
+        .filter((name) => name.endsWith("-role-arn"))
+        .sort();
+      expect(names).toEqual([
+        "/coa/dev/sources/db-connector-role-arn",
+        "/coa/sources/api-role-arn",
+        "/coa/sources/db-enrichment-role-arn",
+        "/coa/sources/federation-provisioner-role-arn",
+      ]);
+      for (const name of names) {
+        if (name.endsWith("/db-connector-role-arn")) continue;
+        expect(name).not.toContain("/dev/");
+      }
     });
   });
 
@@ -1859,9 +2547,7 @@ describe("SourcesStack", () => {
       const out: any[] = [];
       for (const [id, res] of Object.entries(policies)) {
         if (!id.includes("PreProcessing")) continue;
-        out.push(
-          ...((res as any).Properties?.PolicyDocument?.Statement ?? []),
-        );
+        out.push(...((res as any).Properties?.PolicyDocument?.Statement ?? []));
       }
       return out;
     };
@@ -1898,7 +2584,8 @@ describe("SourcesStack", () => {
       let sawCustomerObjectRead = false;
       for (const [id, res] of Object.entries(policies)) {
         if (!id.includes("SourcesApi")) continue;
-        for (const st of (res as any).Properties?.PolicyDocument?.Statement ?? []) {
+        for (const st of (res as any).Properties?.PolicyDocument?.Statement ??
+          []) {
           if (st.Effect !== "Allow") continue;
           const acts = Array.isArray(st.Action) ? st.Action : [st.Action];
           if (acts.includes("s3:GetBucketTagging")) sawTagRead = true;
@@ -1919,7 +2606,8 @@ describe("SourcesStack", () => {
       let deny: any;
       for (const [id, res] of Object.entries(policies)) {
         if (!id.includes("PreProcessing")) continue;
-        for (const st of (res as any).Properties?.PolicyDocument?.Statement ?? []) {
+        for (const st of (res as any).Properties?.PolicyDocument?.Statement ??
+          []) {
           if (st.Sid === "DenyPlatformOwnedBuckets") deny = st;
         }
       }
@@ -1968,6 +2656,27 @@ describe("SourcesStack", () => {
     });
   });
 
+  describe("Recurring rescan scheduling", () => {
+    it("creates a dedicated EventBridge schedule group", () => {
+      template.hasResourceProperties("AWS::Scheduler::ScheduleGroup", {
+        Name: Match.stringLikeRegexp("sources-rescan"),
+      });
+    });
+
+    it("creates a scheduler execution role assumed by scheduler.amazonaws.com", () => {
+      template.hasResourceProperties("AWS::IAM::Role", {
+        AssumeRolePolicyDocument: {
+          Statement: Match.arrayWith([
+            Match.objectLike({
+              Action: "sts:AssumeRole",
+              Principal: { Service: "scheduler.amazonaws.com" },
+            }),
+          ]),
+        },
+      });
+    });
+  });
+
   describe("Scan pipeline (Step Functions)", () => {
     it("passes the no-drift reviewNeeded signal into the enrichment task env", () => {
       // The enrichment ECS task reads RESCAN_REVIEW_NEEDED to choose the terminal
@@ -1985,5 +2694,424 @@ describe("SourcesStack", () => {
       expect(definitions).toContain("RESCAN_REVIEW_NEEDED");
       expect(definitions).toContain("$.discoveryResult.Payload.reviewNeeded");
     });
+  });
+
+  describe("Recurring rescan scheduling IAM", () => {
+    it("grants the API Lambda scoped schedule-management + PassRole permissions", () => {
+      template.hasResourceProperties("AWS::IAM::Policy", {
+        PolicyDocument: {
+          Statement: Match.arrayWith([
+            Match.objectLike({
+              Sid: "ManageRescanSchedules",
+              Action: Match.arrayWith([
+                "scheduler:CreateSchedule",
+                "scheduler:UpdateSchedule",
+                "scheduler:DeleteSchedule",
+                "scheduler:GetSchedule",
+              ]),
+            }),
+            Match.objectLike({
+              Sid: "PassRescanSchedulerRole",
+              Action: "iam:PassRole",
+              Condition: {
+                StringEquals: {
+                  "iam:PassedToService": "scheduler.amazonaws.com",
+                },
+              },
+            }),
+          ]),
+        },
+      });
+    });
+
+    it("wires the schedule env vars onto the Sources API Lambda", () => {
+      template.hasResourceProperties("AWS::Lambda::Function", {
+        FunctionName: Match.stringLikeRegexp("sources-api$"),
+        Environment: {
+          Variables: Match.objectLike({
+            RESCAN_SCHEDULE_GROUP: Match.anyValue(),
+            RESCAN_TARGET_ARN: Match.anyValue(),
+            RESCAN_SCHEDULE_ROLE_ARN: Match.anyValue(),
+          }),
+        },
+      });
+    });
+  });
+
+  describe("Event-driven rescan (Glue changes)", () => {
+    it("creates the Glue-event queue and DLQ, both encrypted at rest", () => {
+      template.hasResourceProperties("AWS::SQS::Queue", {
+        QueueName: Match.stringLikeRegexp("sources-glue-event-queue"),
+        SqsManagedSseEnabled: true,
+      });
+      template.hasResourceProperties("AWS::SQS::Queue", {
+        QueueName: Match.stringLikeRegexp("sources-glue-event-dlq"),
+        SqsManagedSseEnabled: true,
+      });
+    });
+
+    it("allows EventBridge to send to the queue, scoped to this account", () => {
+      template.hasResourceProperties("AWS::SQS::QueuePolicy", {
+        PolicyDocument: {
+          Statement: Match.arrayWith([
+            Match.objectLike({
+              Sid: "AllowEventBridgeSend",
+              Action: "sqs:SendMessage",
+              Principal: { Service: "events.amazonaws.com" },
+              Condition: {
+                StringEquals: { "aws:SourceAccount": Match.anyValue() },
+              },
+            }),
+          ]),
+        },
+      });
+    });
+
+    it("creates the consumer Lambda with an SQS event source", () => {
+      template.hasResourceProperties("AWS::Lambda::Function", {
+        FunctionName: Match.stringLikeRegexp("sources-glue-event-rescan$"),
+        Handler: "coa_sources.database.glue_event_rescan_handler.handler",
+      });
+    });
+
+    // The handler returns per-message failures. Without this the whole batch is
+    // treated as succeeded, so one bad message is deleted along with the nine
+    // good ones and the DLQ never sees it.
+    it("reports partial batch failures so a single bad message is retried alone", () => {
+      template.hasResourceProperties("AWS::Lambda::EventSourceMapping", {
+        FunctionResponseTypes: ["ReportBatchItemFailures"],
+        BatchSize: 10,
+      });
+    });
+
+    // Each message can start a scan, so unbounded fan-out races the status lock.
+    it("caps consumer concurrency like the other scan-triggering queues", () => {
+      template.hasResourceProperties("AWS::Lambda::EventSourceMapping", {
+        FunctionResponseTypes: ["ReportBatchItemFailures"],
+        ScalingConfig: { MaximumConcurrency: 5 },
+      });
+    });
+
+    // Every other queue and Lambda in the stack is monitored; these were not.
+    it("alarms on the consumer and its DLQ", () => {
+      const names = Object.values(
+        template.findResources("AWS::CloudWatch::Alarm"),
+      ).map((a) =>
+        String(
+          (a as { Properties?: { AlarmName?: string } }).Properties
+            ?.AlarmName ?? "",
+        ),
+      );
+      for (const needle of [
+        "glue-event-rescan-Fault-Count",
+        "glue-event-rescan-Throttled-Count",
+        "glue-event-dlq-DLQ-Queue-Message-Count",
+      ]) {
+        expect(names.some((n) => n.includes(needle))).toBe(true);
+      }
+    });
+
+    // 6x the consumer's 30s timeout, so a redrive cannot race a still-running
+    // invocation.
+    it("sets the queue visibility timeout to 6x the consumer timeout", () => {
+      template.hasResourceProperties("AWS::SQS::Queue", {
+        QueueName: Match.stringLikeRegexp("sources-glue-event-queue"),
+        VisibilityTimeout: 180,
+      });
+    });
+
+    // Without it the scan ran and then api_response raised, so every event
+    // re-scan logged a failure while having succeeded. Found on a live deploy.
+    it("gives the consumer Lambda ALLOWED_ORIGIN so api_response can build a response", () => {
+      template.hasResourceProperties("AWS::Lambda::Function", {
+        FunctionName: Match.stringLikeRegexp("sources-glue-event-rescan$"),
+        Environment: {
+          Variables: Match.objectLike({ ALLOWED_ORIGIN: Match.anyValue() }),
+        },
+      });
+    });
+
+    it("grants the API Lambda scoped Glue-event rule management", () => {
+      template.hasResourceProperties("AWS::IAM::Policy", {
+        PolicyDocument: {
+          Statement: Match.arrayWith([
+            Match.objectLike({
+              Sid: "ManageGlueEventRules",
+              Action: Match.arrayWith([
+                "events:PutRule",
+                "events:PutTargets",
+                "events:DeleteRule",
+                "events:RemoveTargets",
+                "events:DescribeRule",
+              ]),
+            }),
+          ]),
+        },
+      });
+    });
+
+    it("wires the Glue-event env vars onto the Sources API Lambda", () => {
+      template.hasResourceProperties("AWS::Lambda::Function", {
+        FunctionName: Match.stringLikeRegexp("sources-api$"),
+        Environment: {
+          Variables: Match.objectLike({
+            GLUE_EVENT_QUEUE_ARN: Match.anyValue(),
+            GLUE_EVENT_RULE_PREFIX: Match.anyValue(),
+          }),
+        },
+      });
+    });
+  });
+
+  describe("Source Deletion Worker (async database-source delete)", () => {
+    it("gives the delete queue a visibility timeout above the worker timeout", () => {
+      // 16 min > the worker's 15 min. Lower would let SQS redeliver a message
+      // whose cleanup is still running, duplicating the teardown mid-flight.
+      template.hasResourceProperties("AWS::SQS::Queue", {
+        QueueName: Match.stringLikeRegexp(".*sources-delete-queue$"),
+        VisibilityTimeout: 960,
+        SqsManagedSseEnabled: true,
+      });
+    });
+
+    it("creates a DLQ with 14-day retention and a 3-attempt redrive policy", () => {
+      template.hasResourceProperties("AWS::SQS::Queue", {
+        QueueName: Match.stringLikeRegexp(".*sources-delete-dlq$"),
+        MessageRetentionPeriod: 14 * 24 * 60 * 60,
+        SqsManagedSseEnabled: true,
+      });
+      template.hasResourceProperties("AWS::SQS::Queue", {
+        QueueName: Match.stringLikeRegexp(".*sources-delete-queue$"),
+        RedrivePolicy: Match.objectLike({ maxReceiveCount: 3 }),
+      });
+    });
+
+    it("creates the worker with the 15-minute timeout the API cannot give it, ARM64, in VPC", () => {
+      // The reason the worker exists: sources-api is capped at 30s and DataZone
+      // asset teardown scales with table count.
+      template.hasResourceProperties("AWS::Lambda::Function", {
+        FunctionName: Match.stringLikeRegexp(".*sources-delete-worker$"),
+        Runtime: "python3.12",
+        Architectures: ["arm64"],
+        Timeout: 900,
+        Handler: "coa_sources.api.source_deletion_worker.handler",
+        VpcConfig: Match.objectLike({
+          SubnetIds: Match.anyValue(),
+          SecurityGroupIds: Match.anyValue(),
+        }),
+      });
+    });
+
+    it("reports partial batch failures so one stuck source does not redrive its siblings", () => {
+      template.hasResourceProperties("AWS::Lambda::EventSourceMapping", {
+        FunctionResponseTypes: ["ReportBatchItemFailures"],
+        BatchSize: 1,
+      });
+    });
+
+    it("gives the API the queue URL so it hands off instead of deleting inline", () => {
+      template.hasResourceProperties("AWS::Lambda::Function", {
+        FunctionName: Match.stringLikeRegexp(".*sources-api$"),
+        Environment: Match.objectLike({
+          Variables: Match.objectLike({
+            SOURCE_DELETE_QUEUE_URL: Match.anyValue(),
+          }),
+        }),
+      });
+    });
+
+    it("gives the worker every table its cleanup touches", () => {
+      template.hasResourceProperties("AWS::Lambda::Function", {
+        FunctionName: Match.stringLikeRegexp(".*sources-delete-worker$"),
+        Environment: Match.objectLike({
+          Variables: Match.objectLike({
+            SOURCES_TABLE: Match.anyValue(),
+            SOURCE_SCAN_JOBS_TABLE: Match.anyValue(),
+            NAMESPACES_TABLE: Match.anyValue(),
+            PROJECT_ACCESS_ROLE_ARN: Match.anyValue(),
+          }),
+        }),
+      });
+    });
+
+    it("alarms the delete queue + DLQ so an orphaned teardown pages, not accumulates silently", () => {
+      // monitorQueueWithDlq adds a DLQ max-size alarm dimensioned by the DLQ
+      // QueueName. Assert at least one CloudWatch alarm references the
+      // sources-delete-dlq — without it a failed async delete piles into the DLQ
+      // for 14 days with no signal.
+      const alarms = template.findResources("AWS::CloudWatch::Alarm");
+      const referencesDeleteDlq = Object.values(alarms).some((alarm) =>
+        JSON.stringify(alarm).includes("sources-delete-dlq"),
+      );
+      expect(referencesDeleteDlq).toBe(true);
+    });
+  });
+  /**
+   * The reserved `{prefix}-{env}-datasource-access-*` name is the WHOLE bound on
+   * which roles COA will assume — the three grants above carry no account
+   * restriction on purpose — so a COA-internal role named under it would be
+   * assumable by the discovery role, the enrichment task, the sources API and the
+   * Databricks connector alike.
+   *
+   * The mechanism that enforces it app-wide lives in
+   * `infra/test/aspects/reserved-role-prefix.test.ts`; this is the same property
+   * read off the real synthesised template, which is where a regression appears.
+   */
+  describe("No COA-internal role falls under the reserved prefix", () => {
+    it("names no role in this template under coa-dev-datasource-access-", () => {
+      const roles = Object.values(template.findResources("AWS::IAM::Role")).map(
+        (r) =>
+          `${String(r.Properties?.Path ?? "/")}${String(r.Properties?.RoleName ?? "")}`.replace(
+            /^\//,
+            "",
+          ),
+      );
+      expect(roles.length).toBeGreaterThan(0);
+      for (const role of roles) {
+        expect(role.startsWith("coa-dev-datasource-access-")).toBe(false);
+      }
+    });
+  });
+});
+
+/**
+ * Catalog-name uniqueness is a security invariant for the Databricks sub-type: one
+ * connector Lambda serves every Databricks source and resolves which warehouse and
+ * which credential secret to use from the Athena catalog name it was invoked under,
+ * so two sources aliasing to one name alias to one credential.
+ *
+ * `build_catalog_name` truncates to 41 characters AFTER concatenation, so the digest
+ * is what gets cut — only 2 hex digits survive at a 36-character sanitised prefix
+ * and none at 38. Its own unit tests cannot catch this, because the prefix is a
+ * DEPLOYMENT parameter rather than an input, which is why the check is at synth.
+ */
+describe("Athena catalog-name prefix budget", () => {
+  /** Synthesise the sources stack under a given prefix/env, returning its warnings. */
+  const synth = (context: Record<string, unknown>): string[] => {
+    const app = new cdk.App({ context: { ...TEST_CONTEXT, ...context } });
+    const network = new NetworkStack(app, "TestNetwork", { env: TEST_ENV });
+    const storage = new StorageStack(app, "TestStorage", {
+      network,
+      env: TEST_ENV,
+    });
+    const stack = new SourcesStack(app, "TestSources", {
+      network,
+      storage,
+      env: TEST_ENV,
+    });
+    // Annotations land as construct metadata; `Annotations.fromStack` is the
+    // assertion-library view of them and is what distinguishes "warned" from
+    // "threw" — the whole point of the two thresholds below.
+    return Annotations.fromStack(stack)
+      .findWarning("*", Match.anyValue())
+      .map((w) => String(w.entry.data));
+  };
+
+  const digestWarnings = (context: Record<string, unknown>): string[] =>
+    synth(context).filter((message) =>
+      message.includes("Sanitised resource prefix"),
+    );
+
+  it("is silent for the default prefix", () => {
+    // `coa` + `dev` sanitises to `coadev` — 6 characters, whole digest intact.
+    expect(digestWarnings({})).toEqual([]);
+  });
+
+  // 22, not 19. `build_catalog_name` prepends its second `ds_` only when the name would
+  // not start with a letter, and `safe_prefix` is `[a-z0-9]*`, so the 6-character
+  // overhead applies only to a DIGIT-leading prefix. For a letter-leading one the
+  // overhead is 3 and the whole digest survives to 22.
+  it("is silent at 22 sanitised characters when the prefix starts with a letter", () => {
+    // 19 + len("dev") = 22 → 41 - 3 - 22 = 16.
+    expect(
+      digestWarnings({ resource_prefix: "abcdefghijklmnopqrs", env: "dev" }),
+    ).toEqual([]);
+  });
+
+  it("warns at 23 when the prefix starts with a letter", () => {
+    const warnings = digestWarnings({
+      resource_prefix: "abcdefghijklmnopqrst",
+      env: "dev",
+    });
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("15 of 16 characters survive");
+    expect(warnings[0]).toContain("starts with a letter");
+  });
+
+  // The digit-leading branch, where the second `ds_` really is prepended. Reachable:
+  // `safe_prefix` keeps digits, and S3 and IAM both accept a digit-leading name.
+  it("is silent at 19 but warns at 20 when the prefix starts with a digit", () => {
+    // 16 + len("dev") = 19 → 41 - 6 - 19 = 16.
+    expect(
+      digestWarnings({ resource_prefix: "9bcdefghijklmnop", env: "dev" }),
+    ).toEqual([]);
+
+    // 17 + len("dev") = 20 → 41 - 6 - 20 = 15.
+    const warnings = digestWarnings({
+      resource_prefix: "9bcdefghijklmnopq",
+      env: "dev",
+    });
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('"9bcdefghijklmnopqdev" is 20 characters');
+    expect(warnings[0]).toContain(
+      'starts with a digit, so build_catalog_name prepends a second "ds_"',
+    );
+    expect(warnings[0]).toContain(
+      "at most 19 keep the whole 16-character digest",
+    );
+    expect(warnings[0]).toContain("15 of 16 characters survive");
+    expect(warnings[0]).toContain("alias to one credential");
+    expect(warnings[0]).toContain(
+      'RESOURCE_PREFIX is "9bcdefghijklmnopq-dev-"',
+    );
+  });
+
+  /**
+   * Why there is no hard-failure case to test: the collision-prone range cannot be
+   * reached. The longest prefixed name in this stack is a 35-character `iam.Role` and
+   * IAM caps a role name at 64, which bounds `len(prefix) + len(env)` at 27, so the
+   * digest keeps at least 8 characters even in the digit-leading branch. These cases
+   * pin that ceiling from both sides: shorten that role name and the last one starts
+   * passing, which is when this reasoning needs revisiting.
+   */
+  it("keeps 11 digest characters at the longest deployable letter-leading prefix", () => {
+    // 24 + len("dev") = 27 sanitised, the maximum this stack's own names allow.
+    const warnings = digestWarnings({
+      resource_prefix: "a".repeat(24),
+      env: "dev",
+    });
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("11 of 16 characters survive");
+  });
+
+  it("keeps 8 digest characters in the worst deployable case, digit-leading", () => {
+    const warnings = digestWarnings({
+      resource_prefix: `9${"a".repeat(23)}`,
+      env: "dev",
+    });
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("8 of 16 characters survive");
+  });
+
+  it("fails on IAM's role-name limit, not on this check, one character longer", () => {
+    // 28 sanitised would keep only 10 (letter-leading) or 7 (digit-leading) digest
+    // characters — but the deployment cannot synthesise at all, and the error names the
+    // role rather than the prefix budget. This is also why `mycompany-analytics` +
+    // `production` (28) was never a deployment this check could have bricked.
+    expect(() =>
+      synth({ resource_prefix: "a".repeat(25), env: "dev" }),
+    ).toThrow(/Invalid roleName/);
+  });
+
+  it("counts the sanitised length, not the raw prefix", () => {
+    // `[^a-z0-9]` goes before the budget applies, exactly as `build_catalog_name`
+    // does. RESOURCE_PREFIX here is `a-b-c-d-e-f-g-h-i-j-prod-`, 25 raw characters
+    // but only 14 sanitised — so a check written against the raw string would warn
+    // about a prefix that is entirely fine. (Case folding is not exercised: an
+    // uppercase prefix never reaches this check, because S3 rejects the bucket name
+    // first.)
+    expect(
+      digestWarnings({ resource_prefix: "a-b-c-d-e-f-g-h-i-j", env: "prod" }),
+    ).toEqual([]);
   });
 });

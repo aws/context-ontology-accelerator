@@ -83,6 +83,7 @@ class TestNLtoSPARQLTranslation:
         # "no declared domain" -> fail-open pass.
         graph_client = AsyncMock()
         graph_client.query.side_effect = [
+            [],  # named-graph resolution: none found -> prefix-filter fallback
             # Full-context count query (returns >threshold to skip full-context path)
             [{"cnt": {"value": "500"}}],
             # T-Box query (from vector hits)
@@ -167,6 +168,39 @@ class TestNLtoSPARQLTranslation:
         ctx_steps = [s for s in result.trace_steps if s["step"] == PipelineStep.CONTEXT_ASSEMBLY]
         assert ctx_steps and "reused" in ctx_steps[0]["detail"]
 
+    async def test_validator_inherits_the_tbox_graphs(self):
+        """The validator's checks are the only graph queries re-paid per attempt.
+
+        The T-Box build already resolved the namespace's graphs, so handing them
+        to the validator scopes its queries for free. Unscoped they match in every
+        graph on the cluster and filter afterwards — three attempts' worth, twice
+        over once ``OntopStrategy._retry_vkg`` re-enters translation.
+        """
+        from coa_serve.tier2.ontop.tbox_context import TBoxContext
+
+        graph_iri = "https://test.local/demo/induced"
+        graph_client = AsyncMock()
+        graph_client.query.return_value = [{"found": "2"}]  # URI existence only
+        graph_client.ask.return_value = False  # no declared domain -> fail-open
+        llm_client = _make_llm_client(_VALID_SPARQL_RESPONSE)
+        translator = NLtoSPARQL(
+            graph_client=graph_client, llm_client=llm_client, graph_uri_template="https://test.local/{namespace}"
+        )
+
+        prebuilt = TBoxContext(
+            classes=[{"uri": "http://example.org/ontology#Order", "label": "Order", "parent": None}],
+            properties=[],
+            graph_iris=[graph_iri],
+        )
+        result = await translator.translate(
+            "How many orders?", "demo", vector_hits=[_ontology_hit()], tbox_context=prebuilt
+        )
+
+        assert result.valid is True
+        existence_query = graph_client.query.call_args[0][0]
+        assert f"GRAPH <{graph_iri}>" in existence_query
+        assert "STRSTARTS" not in existence_query
+
     async def test_empty_llm_response(self):
         graph_client = _make_graph_client()
         llm_client = _make_llm_client("")
@@ -211,6 +245,7 @@ class TestNLtoSPARQLTranslation:
     async def test_validation_failure(self):
         graph_client = AsyncMock()
         graph_client.query.side_effect = [
+            [],  # named-graph resolution: none found -> prefix-filter fallback
             # Full-context count query (skip full context)
             [{"cnt": {"value": "500"}}],
             # T-Box query returns results
@@ -272,6 +307,7 @@ class TestNLtoSPARQLTranslation:
     async def test_trace_steps_recorded(self):
         graph_client = AsyncMock()
         graph_client.query.side_effect = [
+            [],  # named-graph resolution: none found -> prefix-filter fallback
             # Full-context count query (skip full context)
             [{"cnt": {"value": "500"}}],
             # T-Box query
@@ -401,6 +437,7 @@ class TestValidationRetryLoop:
 
         graph_client = AsyncMock()
         graph_client.query.side_effect = [
+            [],  # named-graph resolution: none found -> prefix-filter fallback
             # Full-context count query
             [{"cnt": {"value": "500"}}],
             # T-Box query (1 class → OP skipped)
@@ -448,6 +485,7 @@ class TestValidationRetryLoop:
 
         graph_client = AsyncMock()
         graph_client.query.side_effect = [
+            [],  # named-graph resolution: none found -> prefix-filter fallback
             [{"cnt": {"value": "500"}}],
             [
                 {
@@ -488,6 +526,7 @@ class TestValidationRetryLoop:
 
         graph_client = AsyncMock()
         graph_client.query.side_effect = [
+            [],  # named-graph resolution: none found -> prefix-filter fallback
             [{"cnt": {"value": "500"}}],
             [
                 {
@@ -546,6 +585,7 @@ class TestValidationRetryLoop:
 
         graph_client = AsyncMock()
         graph_client.query.side_effect = [
+            [],  # named-graph resolution: none found -> prefix-filter fallback
             [{"cnt": {"value": "500"}}],
             [
                 {
@@ -594,6 +634,7 @@ class TestValidationRetryLoop:
 
         graph_client = AsyncMock()
         graph_client.query.side_effect = [
+            [],  # named-graph resolution: none found -> prefix-filter fallback
             [{"cnt": {"value": "500"}}],
             [
                 {
@@ -640,6 +681,7 @@ class TestValidationRetryLoop:
         query = "How many orders?"
         graph_client = AsyncMock()
         graph_client.query.side_effect = [
+            [],  # named-graph resolution: none found -> prefix-filter fallback
             [{"cnt": {"value": "500"}}],
             [
                 {

@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import * as cdk from "aws-cdk-lib";
+import * as athena from "aws-cdk-lib/aws-athena";
 import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import * as ec2 from "aws-cdk-lib/aws-ec2";
 import * as ecr from "aws-cdk-lib/aws-ecr";
+import { Platform } from "aws-cdk-lib/aws-ecr-assets";
 import * as ecs from "aws-cdk-lib/aws-ecs";
 import * as events from "aws-cdk-lib/aws-events";
 import * as targets from "aws-cdk-lib/aws-events-targets";
@@ -13,6 +15,7 @@ import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as lambdaEventSources from "aws-cdk-lib/aws-lambda-event-sources";
 import * as logs from "aws-cdk-lib/aws-logs";
 import * as s3 from "aws-cdk-lib/aws-s3";
+import * as scheduler from "aws-cdk-lib/aws-scheduler";
 import * as sfn from "aws-cdk-lib/aws-stepfunctions";
 import * as tasks from "aws-cdk-lib/aws-stepfunctions-tasks";
 import * as sqs from "aws-cdk-lib/aws-sqs";
@@ -21,6 +24,7 @@ import * as opensearchserverless from "aws-cdk-lib/aws-opensearchserverless";
 import * as cloudwatch from "aws-cdk-lib/aws-cloudwatch";
 import { Construct } from "constructs";
 
+import { RESERVED_DATASOURCE_ROLE_SEGMENT } from "../../aspects/reserved-role-prefix";
 import { SCLStack } from "../../constructs/scl-stack";
 import { AccessLogsBucket } from "../../constructs";
 import { DynamoDBTable } from "../../constructs/dynamodb-table";
@@ -91,7 +95,36 @@ export class SourcesStack extends SCLStack {
     super(scope, id, props);
     this.addComponentTag("sources");
 
-    const { ssmPrefix } = resolveContext(this.node);
+    const { ssmPrefix, envName } = resolveContext(this.node);
+    // Parameter-Store home for the Databricks sub-type, split into two subtrees
+    // with a different writer each. `sources/` holds one parameter per source, which
+    // the shared connector resolves from the catalog name it was invoked under.
+    // `deployment/` holds the connector's own function ARN, written by the
+    // connector's own CDK app and read by the sources API at source-create.
+    //
+    // Split deliberately: a single prefix would let the sources API overwrite the
+    // ARN it later reads. Nothing here may be widened to `…/connectors/databricks/*`.
+    //
+    // `${envName}` is explicit because `ssmPrefix` is `/${prefix}` with NO environment
+    // segment while physical names are `{prefix}-{env}-{name}`, and environments share
+    // an account. Without it a dev registration would resolve PROD's connector ARN and
+    // create a catalog pointing at prod's connector.
+    // CloudWatch namespace for this service's custom metrics. Declared here rather
+    // than beside the dashboard because the parameter-write detection below emits into
+    // it too, and both must name the same namespace.
+    const sourcesNamespace = "COA/Sources";
+    const databricksSsmRoot = `${ssmPrefix}/${envName}/connectors/databricks`;
+    const databricksSourcesConfigPrefix = `${databricksSsmRoot}/sources`;
+    const databricksConnectorArnParamName = `${databricksSsmRoot}/deployment/function-arn`;
+    // Serve's runtime role ARN, written by the serve stack. Env-scoped for the reason
+    // given at the writer: its value becomes a resource policy in a connector stack
+    // deployed from a separate CDK app, so a sibling environment overwriting it grants
+    // that environment's serve role a read on this one's spilled query results.
+    //
+    // Spelled once because three sites below consume it and they must agree: a runtime
+    // read in the federation provisioner's environment, the policy naming the parameter
+    // ARN literally, and a deploy-time dynamic reference into the connector Lambda.
+    const serveRuntimeRoleArnParam = `${ssmPrefix}/${envName}/serve/runtime-role-arn`;
     // Tag key binding a credential secret to the namespaces entitled to it.
     // Derived once here so every IAM condition below and the runtime env var
     // (RESOURCE_TAG_PREFIX) cannot drift from each other.
@@ -227,6 +260,7 @@ export class SourcesStack extends SCLStack {
       }),
       versioned: true,
       encryption: s3.BucketEncryption.S3_MANAGED,
+      enforceSSL: true,
       serverAccessLogsBucket: sourcesAccessLogs.bucket,
       serverAccessLogsPrefix: "sources-data/",
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
@@ -276,16 +310,86 @@ export class SourcesStack extends SCLStack {
     const dbConnectorDlq = new sqs.Queue(this, "DbConnectorDLQ", {
       queueName: this.prefixed("sources-db-connector-dlq"),
       retentionPeriod: cdk.Duration.days(14),
+      encryption: sqs.QueueEncryption.SQS_MANAGED,
+      enforceSSL: true,
     });
 
     // Federated connections/catalogs are named `{sanitizedPrefix}ds_{hash}` by
     // the provisioner (prefix lowercased, non-alphanumerics stripped), so scope
     // IAM to that exact pattern — `this.prefixed("*")` (e.g. `coa-dev-*`) would
     // NOT match `scldevds_*`.
-    const fedResourcePrefix =
-      this.prefixed("")
-        .toLowerCase()
-        .replace(/[^a-z0-9]/g, "") + "ds_";
+    //
+    // Sanitised exactly as `glue_connection_provisioner.build_catalog_name`
+    // does — `[^a-z0-9]` removed after `.lower()` — so the IAM scope below and
+    // the length assertion that follows are computed from one value that cannot
+    // disagree with the runtime's.
+    const safeResourcePrefix = this.prefixed("")
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, "");
+    const fedResourcePrefix = `${safeResourcePrefix}ds_`;
+
+    // Catalog-name uniqueness is a SECURITY invariant for the Databricks sub-type,
+    // not a cosmetic one: one connector Lambda serves every Databricks source, and it
+    // resolves which warehouse and which credential secret to use from the Athena
+    // catalog name it was invoked under. Two sources aliasing to one catalog name
+    // therefore alias to one credential.
+    //
+    // `build_catalog_name` builds `{safe_prefix}ds_{16-hex}` and truncates to
+    // `_CATALOG_NAME_MAX` = 41 AFTER concatenation, so the DIGEST is what gets cut. It
+    // prepends a second `ds_` only when the result does not start with a letter — and
+    // since `safe_prefix` is `[a-z0-9]*`, that means only when the prefix starts with a
+    // DIGIT. So the digest kept is min(16, 38 - S) for a letter-leading prefix and
+    // min(16, 35 - S) for a digit-leading one, and `safeResourcePrefix` is a synth-time
+    // string, so the figure below is this deployment's rather than the worst case.
+    //
+    // 41 is self-imposed by `_CATALOG_NAME_MAX` in
+    // `packages/sources/.../glue_connection_provisioner.py` — Athena itself allows 127.
+    // Nothing ties the two constants together, so a change to either must change both.
+    //
+    // A WARNING, not a throw, because the collision-prone range cannot be entered: the
+    // longest prefixed physical name in this stack is an `iam.Role`, IAM caps a role name
+    // at 64 characters, so len(prefix) + len(env) <= 27 and the digest keeps at least
+    // 8 characters even in the digit-leading branch. A deployment long enough to lose the
+    // digest outright fails synth on `InvalidRoleName` first, naming the role.
+    //
+    // And a collision that did occur would be caught loudly: registration creates the
+    // catalog with `require_absent=True` and writes the parameter with `Overwrite=False`,
+    // so the SECOND source's create fails instead of inheriting the first's credential.
+    // Those two runtime controls are what hold — `scripts/deploy.sh` pipes synth to
+    // `/dev/null`, so this annotation reaches CI rather than an operator deploying.
+    const CATALOG_NAME_MAX = 41;
+    const DIGEST_LEN = 16;
+    // 3 for `build_catalog_name`'s own `ds_`, plus 3 more for the second one it
+    // prepends when the name would not start with a letter.
+    const prefixOverhead = /^[0-9]/.test(safeResourcePrefix) ? 6 : 3;
+    const digestCharsKept = Math.min(
+      DIGEST_LEN,
+      Math.max(
+        0,
+        CATALOG_NAME_MAX - prefixOverhead - safeResourcePrefix.length,
+      ),
+    );
+    if (digestCharsKept < DIGEST_LEN) {
+      cdk.Annotations.of(this).addWarningV2(
+        "coa:SourcesStack.catalogNameDigestTruncated",
+        `Sanitised resource prefix "${safeResourcePrefix}" is ` +
+          `${safeResourcePrefix.length} characters and starts with a ` +
+          `${prefixOverhead === 6 ? 'digit, so build_catalog_name prepends a second "ds_"' : "letter"}` +
+          `; at most ${CATALOG_NAME_MAX - prefixOverhead - DIGEST_LEN} keep the whole ` +
+          `${DIGEST_LEN}-character digest for this deployment. Athena ` +
+          `data-catalog names are truncated to ${CATALOG_NAME_MAX} characters AFTER ` +
+          `concatenation, so the digest is what gets cut: ${digestCharsKept} of ` +
+          `${DIGEST_LEN} characters survive here. The catalog name is what the shared ` +
+          `Databricks connector resolves a warehouse and a credential secret from, so ` +
+          `two sources aliasing to one name alias to one credential — a security ` +
+          `invariant, not a cosmetic limit. Registration still refuses an aliased name ` +
+          `rather than mis-resolving it (require_absent + Overwrite=False), and ` +
+          `existing sources are unaffected because the derivation has not changed; ` +
+          `this deployment simply has less collision margin than the design intends. ` +
+          `RESOURCE_PREFIX is "${this.prefixed("")}" — shorten resource_prefix or env ` +
+          `to restore it.`,
+      );
+    }
 
     // Glue Data Catalog / Lake Formation role for managed federated catalogs.
     // Set as ROLE_ARN on each federated Glue connection and used by Lake
@@ -465,6 +569,50 @@ export class SourcesStack extends SCLStack {
       }),
     );
 
+    // ── Discovery Athena workgroup ───────────────────────────────────
+    // Discovery runs `SHOW DATABASES` / `SHOW TABLES` / `DESCRIBE` and enum
+    // sampling through Athena. Both clients omit `WorkGroup` when
+    // `ATHENA_WORKGROUP` is empty, which lands every statement in the account's
+    // `primary` workgroup — shared with anything else in the account, and so
+    // neither attributable nor independently limitable.
+    //
+    // ONE workgroup for the deployment, not one per namespace: discovery runs under a
+    // single shared execution role serving every namespace, so there is no
+    // per-namespace workgroup it could pin, which is why the Athena clients omit the
+    // key rather than guess a name.
+    //
+    // Worth having now because the Databricks sub-type makes discovery a per-table
+    // fan-out against a COA-operated connector Lambda: the cost and the concurrency
+    // both become COA's, and a workgroup is where they become visible.
+    // `BytesScannedCutoffPerQuery` is deliberately NOT set — enum sampling issues
+    // `SELECT DISTINCT`, so a cutoff sized for `DESCRIBE` would fail sampling that is
+    // non-fatal today.
+    const discoveryWorkgroupName = this.prefixed("sources-discovery");
+    const discoveryWorkgroup = new athena.CfnWorkGroup(
+      this,
+      "SourcesDiscoveryWorkGroup",
+      {
+        name: discoveryWorkgroupName,
+        description:
+          "Metadata discovery and enum sampling for COA data sources (SHOW/DESCRIBE/SELECT DISTINCT)",
+        // A workgroup holds no data, only query history and settings, so a
+        // recursive delete costs nothing and keeps a stack teardown from failing
+        // on history the deployment itself created.
+        recursiveDeleteOption: true,
+        workGroupConfiguration: {
+          publishCloudWatchMetricsEnabled: true,
+          // Not enforced: both Athena clients pass `ResultConfiguration`
+          // explicitly (derived from ATHENA_SPILL_BUCKET), and enforcing here
+          // would override a location the caller chose per statement. This is the
+          // fallback for a caller that passes none.
+          enforceWorkGroupConfiguration: false,
+          resultConfiguration: {
+            outputLocation: `s3://${props.storage.athenaSpillBucket.bucketName}/discovery/`,
+          },
+        },
+      },
+    );
+
     const dbConnectorFn = new lambda.Function(this, "DbConnectorFn", {
       functionName: this.prefixed("sources-db-connector"),
       runtime: lambda.Runtime.PYTHON_3_12,
@@ -514,6 +662,11 @@ export class SourcesStack extends SCLStack {
         // (SELECT DISTINCT via Athena → coa:distinctValues). When unset the
         // sampler is a no-op; the JDBC sampling path is unaffected.
         ATHENA_SPILL_BUCKET: props.storage.athenaSpillBucket.bucketName,
+        // Pin both Athena clients (athena_statement, athena_sampler) to the
+        // deployment's discovery workgroup instead of letting them fall through to
+        // `primary`. See the workgroup above for why one deployment-scoped
+        // workgroup rather than per namespace.
+        ATHENA_WORKGROUP: discoveryWorkgroupName,
         // Two consumers, both needing the `{prefix}-{env}-` form:
         //  - the ExternalId this deployment presents when assuming a customer
         //    datasource-access role (discovery_handler._external_id);
@@ -528,6 +681,11 @@ export class SourcesStack extends SCLStack {
         BUCKET_NAME: sourcesBucket.bucketName,
       },
     });
+
+    // ATHENA_WORKGROUP above is the workgroup's NAME, not a CloudFormation
+    // reference, so nothing orders the two. Explicit, or a first scan racing a
+    // fresh deploy gets `WorkGroup ... is not found`.
+    dbConnectorFn.node.addDependency(discoveryWorkgroup);
 
     this.sourcesTable.grantReadWriteData(dbConnectorFn);
     this.sourceScanJobsTable.grantReadWriteData(dbConnectorFn);
@@ -753,8 +911,10 @@ export class SourcesStack extends SCLStack {
           ATHENA_SPILL_BUCKET: props.storage.athenaSpillBucket.bucketName,
           FEDERATED_CATALOG_ROLE_ARN: federatedCatalogRole.roleArn,
           // SSM param holding the consumer query principal (serve runtime role)
-          // ARN; resolved at runtime to grant LF SELECT on the federated catalog.
-          CONSUMER_QUERY_ROLE_SSM_PARAM: `${ssmPrefix}/serve/runtime-role-arn`,
+          // ARN; resolved at RUNTIME, per request, to grant LF SELECT on the federated
+          // catalog. Env-scoped, so it moves together with the deploy-time resolution
+          // below and with the policy naming the parameter ARN.
+          CONSUMER_QUERY_ROLE_SSM_PARAM: serveRuntimeRoleArnParam,
           // BARE prefix — keys the namespace tag this handler conditions the
           // serve-side secret resource policy on. Same value as `nsTagKey`.
           RESOURCE_TAG_PREFIX: resolveContext(this.node).prefix,
@@ -889,7 +1049,7 @@ export class SourcesStack extends SCLStack {
         sid: "ReadConsumerQueryRoleParam",
         actions: ["ssm:GetParameter"],
         resources: [
-          `arn:aws:ssm:${this.region}:${this.account}:parameter${ssmPrefix}/serve/runtime-role-arn`,
+          `arn:aws:ssm:${this.region}:${this.account}:parameter${serveRuntimeRoleArnParam}`,
         ],
       }),
     );
@@ -1010,7 +1170,7 @@ export class SourcesStack extends SCLStack {
     // in app.ts so the SSM param exists at deploy time.
     const serveRuntimeRoleArn = ssm.StringParameter.valueForStringParameter(
       this,
-      `${ssmPrefix}/serve/runtime-role-arn`,
+      serveRuntimeRoleArnParam,
     );
     dbConnectorFn.addEnvironment(
       "CONSUMER_QUERY_ROLE_ARN",
@@ -1079,23 +1239,12 @@ export class SourcesStack extends SCLStack {
         resources: [`arn:aws:secretsmanager:*:${this.account}:secret:*`],
       }),
     );
-    // STS: assume Context Ontology Accelerator-managed roles + customer-provided cross-account roles.
+    // STS: assume Context Ontology Accelerator-managed roles + customer-provided
+    // cross-account roles. Shape (and the reasons for it) in
+    // `assumeDatasourceAccessRoleStatement`; the enrichment task and the sources
+    // API hold the identical grant.
     dbConnectorFn.addToRolePolicy(
-      new iam.PolicyStatement({
-        sid: "AssumeRoleCoaManaged",
-        actions: ["sts:AssumeRole"],
-        resources: [
-          `arn:aws:iam::*:role/${this.prefixed("datasource-access-")}*`,
-        ],
-        // Deny any cross-account assume that presents no ExternalId. The role
-        // ARN is caller-supplied, so the ExternalId (derived from the requesting
-        // namespace) is what binds the assume to the namespace that asked for it.
-        // Belt-and-braces: the connectors always send one, this makes a
-        // regression fail closed at IAM instead of silently widening access.
-        conditions: {
-          Null: { "sts:ExternalId": "false" },
-        },
-      }),
+      this.assumeDatasourceAccessRoleStatement("AssumeRoleCoaManaged"),
     );
 
     // ── Enrichment Agent ECS Task ────────────────────────────────────
@@ -1138,6 +1287,14 @@ export class SourcesStack extends SCLStack {
           )
         : ecs.ContainerImage.fromAsset(Paths.root, {
             file: "packages/sources/database/enrichment/Dockerfile",
+            // Pin to amd64 to match this image's design: the Dockerfile is
+            // `FROM --platform=linux/amd64`, CI builds it `--custom-platform
+            // linux/amd64`, and the Fargate task def is x86_64. Without this
+            // explicit pin, a Docker build on an arm64 host (Apple Silicon)
+            // silently produces an arm64 image the x86_64 task cannot exec
+            // ("exec format error"). The pin makes the arch independent of the
+            // build host's Docker default.
+            platform: Platform.LINUX_AMD64,
           });
 
     dbEnrichmentTaskDef.addContainer("DbEnrichmentContainer", {
@@ -1232,22 +1389,10 @@ export class SourcesStack extends SCLStack {
         },
       }),
     );
+    // Same grant as the discovery role — the enrichment task reaches source
+    // credentials through the same connector code.
     dbEnrichmentTaskDef.taskRole.addToPrincipalPolicy(
-      new iam.PolicyStatement({
-        sid: "AssumeRoleCustomerProvided",
-        actions: ["sts:AssumeRole"],
-        resources: [
-          `arn:aws:iam::*:role/${this.prefixed("datasource-access-")}*`,
-        ],
-        // Deny any cross-account assume that presents no ExternalId. The role
-        // ARN is caller-supplied, so the ExternalId (derived from the requesting
-        // namespace) is what binds the assume to the namespace that asked for it.
-        // Belt-and-braces: the connectors always send one, this makes a
-        // regression fail closed at IAM instead of silently widening access.
-        conditions: {
-          Null: { "sts:ExternalId": "false" },
-        },
-      }),
+      this.assumeDatasourceAccessRoleStatement("AssumeRoleCustomerProvided"),
     );
     dbEnrichmentTaskDef.taskRole.addToPrincipalPolicy(
       new iam.PolicyStatement({
@@ -1578,11 +1723,13 @@ export class SourcesStack extends SCLStack {
       queueName: this.prefixed("sources-db-scan-dlq"),
       retentionPeriod: cdk.Duration.days(14),
       encryption: sqs.QueueEncryption.SQS_MANAGED,
+      enforceSSL: true,
     });
     const dbScanQueue = new sqs.Queue(this, "DbScanQueue", {
       queueName: this.prefixed("sources-db-scan-queue"),
       visibilityTimeout: cdk.Duration.seconds(90),
       encryption: sqs.QueueEncryption.SQS_MANAGED,
+      enforceSSL: true,
       deadLetterQueue: { maxReceiveCount: 3, queue: dbScanDlq },
     });
 
@@ -1624,6 +1771,7 @@ export class SourcesStack extends SCLStack {
       queueName: this.prefixed("sources-bulk-review-dlq"),
       retentionPeriod: cdk.Duration.days(14),
       encryption: sqs.QueueEncryption.SQS_MANAGED,
+      enforceSSL: true,
     });
     const bulkReviewQueue = new sqs.Queue(this, "BulkReviewQueue", {
       queueName: this.prefixed("sources-bulk-review-queue"),
@@ -1712,6 +1860,97 @@ export class SourcesStack extends SCLStack {
 
     // The API Lambda needs to push to the bulk review queue.
     // (Granted later, after sourcesApiFn is constructed.)
+
+    // ================================================================
+    // Source Deletion Worker — unbounded teardown off the request path
+    // ================================================================
+    // A database source's teardown includes one DataZone delete_asset per
+    // discovered table, so it scales with source size and cannot fit the
+    // 30-second sources-api timeout. The API does the bounded part (catalog /
+    // federation deregistration, whose only handle is the row), flips the source
+    // to DELETING and enqueues here; this worker deletes the row LAST so an
+    // incomplete cleanup stays retryable instead of orphaning assets.
+    const sourceDeleteDlq = new sqs.Queue(this, "SourceDeleteDLQ", {
+      queueName: this.prefixed("sources-delete-dlq"),
+      retentionPeriod: cdk.Duration.days(14),
+      encryption: sqs.QueueEncryption.SQS_MANAGED,
+      enforceSSL: true,
+    });
+    const sourceDeleteQueue = new sqs.Queue(this, "SourceDeleteQueue", {
+      queueName: this.prefixed("sources-delete-queue"),
+      // Must exceed the worker timeout or SQS redelivers a message that is still
+      // being processed, duplicating cleanup mid-flight.
+      visibilityTimeout: cdk.Duration.minutes(16),
+      encryption: sqs.QueueEncryption.SQS_MANAGED,
+      enforceSSL: true,
+      deadLetterQueue: { maxReceiveCount: 3, queue: sourceDeleteDlq },
+    });
+
+    const sourceDeleteWorkerFn = new lambda.Function(
+      this,
+      "SourceDeleteWorkerFn",
+      {
+        functionName: this.prefixed("sources-delete-worker"),
+        runtime: lambda.Runtime.PYTHON_3_12,
+        architecture: lambda.Architecture.ARM_64,
+        // Points straight at the module — the cleanup logic is imported from
+        // sources_handler, so there is nothing for a shim to add.
+        handler: "coa_sources.api.source_deletion_worker.handler",
+        code: bundlePython({
+          srcDirs: [
+            fromRoot("packages/sources/src"),
+            Paths.commonLib,
+            Paths.smithyGeneratedControlPlanePythonServer,
+          ],
+          requirementsFile: fromRoot("packages/sources/requirements.txt"),
+          architecture: "arm64",
+        }),
+        // The whole point: 15 minutes instead of the API's 30 seconds.
+        timeout: cdk.Duration.minutes(15),
+        memorySize: 512,
+        vpc,
+        vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+        securityGroups: [lambdaSecurityGroup],
+        environment: {
+          SOURCES_TABLE: this.sourcesTable.tableName,
+          NAMESPACES_TABLE: namespacesTableName,
+          SOURCE_SCAN_JOBS_TABLE: this.sourceScanJobsTable.tableName,
+          SMUS_DOMAIN_ID: domainId,
+          PROJECT_ACCESS_ROLE_ARN: projectAccessRoleArn,
+          // The DataZone cleanup budget defaults to 240s (tuned for the 30s
+          // sources-api). Without raising it here the worker would cap cleanup at
+          // 240s despite its 15-min timeout — leaving a large source's assets
+          // half-deleted and, since the row is only dropped on a COMPLETE
+          // cleanup, the source stuck retrying. Give the budget almost the whole
+          // envelope (840s, ~60s margin under the 900s timeout) so the worker can
+          // actually finish an 860-table teardown.
+          DATAZONE_CLEANUP_BUDGET_S: "840",
+        },
+      },
+    );
+
+    sourceDeleteWorkerFn.addEventSource(
+      new lambdaEventSources.SqsEventSource(sourceDeleteQueue, {
+        batchSize: 1,
+        // Deletes fan out to many DataZone calls; cap concurrency to protect
+        // account-wide DataZone rate limits, as the bulk-review worker does.
+        maxConcurrency: 5,
+        // The handler returns batchItemFailures so one source's failure redrives
+        // only its own message.
+        reportBatchItemFailures: true,
+      }),
+    );
+
+    // Worker IAM — least-privilege:
+    // - Read+write the sources table (DELETE_FAILED transitions, row delete,
+    //   platform catalog-claim release)
+    // - Read namespaces table (resolve dataZoneProjectId)
+    // - Read+write scan jobs (delete this source's scan-job records)
+    // - Assume the shared project access role for DataZone delete_asset
+    this.sourcesTable.grantReadWriteData(sourceDeleteWorkerFn);
+    namespacesTable.grantReadData(sourceDeleteWorkerFn);
+    this.sourceScanJobsTable.grantReadWriteData(sourceDeleteWorkerFn);
+    projectAccessRole.grantAssumeRole(sourceDeleteWorkerFn.role!);
 
     // ================================================================
     // Documents Pipeline — Preprocessing Lambda + KgBuild ECS + SFN
@@ -1874,6 +2113,11 @@ export class SourcesStack extends SCLStack {
           )
         : ecs.ContainerImage.fromAsset(Paths.root, {
             file: "packages/sources/documents/kg-build/Dockerfile",
+            // Pin to amd64 (see DbEnrichment note): Dockerfile is
+            // `FROM --platform=linux/amd64`, CI builds `--custom-platform
+            // linux/amd64`, task def is x86_64. Prevents an arm64 build host
+            // from producing an unrunnable arm64 image.
+            platform: Platform.LINUX_AMD64,
           });
 
     const batchInferenceRole = new iam.Role(this, "SourcesBatchInferenceRole", {
@@ -2567,10 +2811,14 @@ export class SourcesStack extends SCLStack {
     const docIngestionDlq = new sqs.Queue(this, "SourcesDocIngestionDLQ", {
       queueName: this.prefixed("sources-doc-ingestion-dlq"),
       retentionPeriod: cdk.Duration.days(14),
+      encryption: sqs.QueueEncryption.SQS_MANAGED,
+      enforceSSL: true,
     });
     const docIngestionQueue = new sqs.Queue(this, "SourcesDocIngestionQueue", {
       queueName: this.prefixed("sources-doc-ingestion-queue"),
       visibilityTimeout: cdk.Duration.seconds(900),
+      encryption: sqs.QueueEncryption.SQS_MANAGED,
+      enforceSSL: true,
       deadLetterQueue: { maxReceiveCount: 3, queue: docIngestionDlq },
     });
 
@@ -2648,6 +2896,9 @@ export class SourcesStack extends SCLStack {
         SCAN_QUEUE_URL: dbScanQueue.queueUrl,
         INGESTION_QUEUE_URL: docIngestionQueue.queueUrl,
         REVIEW_QUEUE_URL: bulkReviewQueue.queueUrl,
+        // Database-source deletes hand their unbounded DataZone teardown here.
+        // Unset would make the API finish inline instead (its old behaviour).
+        SOURCE_DELETE_QUEUE_URL: sourceDeleteQueue.queueUrl,
         BUCKET_NAME: sourcesBucket.bucketName,
         DELETION_STATE_MACHINE_ARN: docDeletionStateMachine.stateMachineArn,
         ALLOWED_ORIGIN: allowedOrigin,
@@ -2667,6 +2918,21 @@ export class SourcesStack extends SCLStack {
         // environment in the key (`coa-prod:namespace`), hiding a dev-tagged
         // resource from prod.
         RESOURCE_TAG_PREFIX: resolveContext(this.node).prefix,
+        // Parameter-path PREFIX the API writes one parameter per Databricks
+        // source under, named after the derived Athena catalog name. The shared
+        // connector resolves the same name from the catalog it was invoked under.
+        // Carries the environment for the reason above the constant.
+        DATABRICKS_CONFIG_SSM_PREFIX: databricksSourcesConfigPrefix,
+        // The parameter NAME, not its value. The Databricks connector is deployed
+        // from its own CDK app, so its function ARN does not exist at this stack's
+        // synth; the API resolves it per source-create and fails the create when it
+        // is absent, which is what makes a half-applied release loud at submit
+        // rather than latent until first query.
+        //
+        // No environment-name variable alongside these two: the API derives its
+        // `deploymentId` from RESOURCE_PREFIX above by stripping the trailing
+        // hyphen, and both parameter paths arrive whole.
+        DATABRICKS_CONNECTOR_ARN_SSM_PARAM: databricksConnectorArnParamName,
       },
     });
 
@@ -2705,6 +2971,7 @@ export class SourcesStack extends SCLStack {
     dbScanQueue.grantSendMessages(sourcesApiFn);
     docIngestionQueue.grantSendMessages(sourcesApiFn);
     bulkReviewQueue.grantSendMessages(sourcesApiFn);
+    sourceDeleteQueue.grantSendMessages(sourcesApiFn);
     docDeletionStateMachine.grantStartExecution(sourcesApiFn);
     projectAccessRole.grantAssumeRole(sourcesApiFn.role!);
 
@@ -2788,6 +3055,279 @@ export class SourcesStack extends SCLStack {
       }),
     );
 
+    // Tag the data catalog with `coa:sourceId` at create, and read the tags back at
+    // delete. Not decoration — it is the ownership check for this catalog class.
+    //
+    // `register_lambda_catalog` establishes ownership by comparing catalog type plus
+    // the SET OF HANDLER ARNS, which discriminated correctly while every source had
+    // its own connector Lambda. The Databricks sub-type shares ONE handler ARN across
+    // every source, so that comparison is trivially true for any Databricks catalog,
+    // and `delete_lambda_catalog` deletes by name with no ownership check at all — so
+    // one source's teardown could remove another's catalog. The tag is the only thing
+    // left that distinguishes them, and `GetDataCatalog` does not return tags, hence
+    // `ListTagsForResource` as a separate call.
+    sourcesApiFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: "AthenaDataCatalogTagging",
+        actions: ["athena:TagResource", "athena:ListTagsForResource"],
+        resources: [
+          `arn:aws:athena:${this.region}:${this.account}:datacatalog/${fedResourcePrefix}*`,
+        ],
+      }),
+    );
+
+    // Per-source Databricks configuration: the ONLY write scope on this subtree in
+    // the deployment. Integrity, not confidentiality, is the property — the
+    // parameter holds coordinates and a secret ARN, no credential, but it tells the
+    // shared connector which secret and which warehouse to use, so repointing one
+    // repoints a source at another source's credential with the catalog name
+    // unchanged.
+    //
+    // TWO actions, and both omissions are deliberate. NOT `DeleteParameters`
+    // (plural), a distinct IAM action covering the batch API: nothing calls it, and
+    // granting it as headroom would be an unused write action on the one path where
+    // integrity is the whole point. NOT `AddTagsToResource`: the parameter is not
+    // tagged, because `GetParameter` does not return tags, so the source, namespace
+    // and deployment ids live in the parameter's BODY instead — and delete needs no
+    // tag to verify ownership, the name being a pure function of the source id with
+    // `Overwrite=False` making the sole writer the sole deleter.
+    //
+    // Scoped to `…/sources/*` and NOT to `…/databricks/*`: widening it by one
+    // segment would let this role overwrite the connector ARN under `deployment/`
+    // that it later reads to build the catalog, which is precisely the integrity
+    // problem the two subtrees were split to avoid. Note the SSM ARN shape — the
+    // resource is `parameter` immediately followed by a name that already begins
+    // with `/`, so `parameter/${ssmPrefix}/...` matches nothing.
+    //
+    // THIS SCOPE IS THE PRIMARY CONTROL, not a backstop, because a repointed
+    // parameter resolves SUCCESSFULLY: nothing at runtime distinguishes a repointed
+    // source from a healthy one. `UnexpectedConnectorParameterWrite` further down
+    // detects the write, but it needs a CloudTrail trail logging management events in
+    // this account and region, and this repo creates none.
+    sourcesApiFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: "DatabricksSourceConfigWrite",
+        actions: ["ssm:PutParameter", "ssm:DeleteParameter"],
+        resources: [
+          `arn:aws:ssm:${this.region}:${this.account}:parameter${databricksSourcesConfigPrefix}/*`,
+        ],
+      }),
+    );
+
+    // Resolve the Databricks connector's function ARN at source-create, so
+    // `athena:CreateDataCatalog` can point the catalog at it. One parameter, read
+    // only — the connector's own CloudFormation stack is the sole writer under
+    // `deployment/`, and this role must not reach it, per the split above.
+    // Symmetrically, this statement must not reach `sources/`: it is the read half
+    // of a pair whose whole point is that neither half covers the other's subtree.
+    sourcesApiFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: "ReadDatabricksConnectorArnParam",
+        actions: ["ssm:GetParameter"],
+        resources: [
+          `arn:aws:ssm:${this.region}:${this.account}:parameter${databricksConnectorArnParamName}`,
+        ],
+      }),
+    );
+
+    // Validate the customer's credential-access role at source-create by assuming it,
+    // so a misconfigured trust policy fails at submit with a specific message instead
+    // of arriving as an opaque AccessDenied at first scan. See
+    // `assumeDatasourceAccessRoleStatement` for why there is no account restriction.
+    sourcesApiFn.addToRolePolicy(
+      this.assumeDatasourceAccessRoleStatement(
+        "AssumeRoleDatasourceAccessValidation",
+      ),
+    );
+
+    // Narrowed once, here, because two things downstream need the ROLE rather than the
+    // function: the parameter published for a customer's trust policy, and the
+    // write-audit allowlist below. Both are security-relevant enough that failing the
+    // synth beats carrying a placeholder.
+    const sourcesApiRole = sourcesApiFn.role;
+    if (!sourcesApiRole) {
+      throw new Error(
+        "SourcesApiFn has no execution role, so neither the principal a customer's " +
+          "datasource-access role must trust nor the parameter-write allowlist can be " +
+          "derived.",
+      );
+    }
+
+    // PINNED, because a Databricks source's credential-access role names this ARN by hand in its
+    // trust policy. CloudFormation replaces a role on a RoleName or Path change — so a construct-id
+    // rename or a stack delete/recreate would hand every customer in the fleet a stale principal at
+    // once, and the only symptom is `AccessDenied` at the next source create.
+    //
+    // L1 rather than a role of our own passed to `lambda.Function`: the L2 attaches
+    // AWSLambdaBasicExecutionRole and AWSLambdaVPCAccessExecutionRole only to the role it creates
+    // itself, so supplying one would silently drop both from a VPC-bound function.
+    const cfnSourcesApiRole = sourcesApiRole.node.defaultChild;
+    if (!(cfnSourcesApiRole instanceof iam.CfnRole)) {
+      throw new Error(
+        "SourcesApiFn's execution role was not created by this stack, so its name cannot be " +
+          "pinned — and a customer's trust policy names it. Pin it where the role is created.",
+      );
+    }
+    cfnSourcesApiRole.roleName = this.prefixed("sources-api-role");
+
+    // ================================================================
+    // UnexpectedConnectorParameterWrite — the only detection for a repoint
+    // ================================================================
+    //
+    // The sole detection for its threat, for a structural reason: a repointed
+    // parameter resolves SUCCESSFULLY, so `ConnectorConfigResolutionFailures` is
+    // silent by construction and the narrow write scope above is otherwise the only
+    // control.
+    //
+    // PREREQUISITE: a CloudTrail trail logging management events in this account and
+    // region. `ssm:PutParameter` is a management event, and EventBridge only receives
+    // it as `AWS API Call via CloudTrail` where such a trail exists. This repo creates
+    // none — a trail is account-wide and needs its own bucket, encryption and
+    // retention decisions, so it belongs to the account's baseline. In an account
+    // without one this rule matches nothing, which is what the alarm description says,
+    // so an operator can tell "quiet" from "blind".
+    //
+    // TWO rules rather than one, because `DeleteParameters` (plural) is a distinct
+    // CloudTrail event name AND carries a different request shape: `names`, a LIST,
+    // where the singular forms carry `name`. A single pattern naming both keys under
+    // `requestParameters` would require both to be present and so match nothing.
+    const parameterAuditLogGroup = new logs.LogGroup(
+      this,
+      "DatabricksParameterAuditLogGroup",
+      {
+        // `/aws/events/` prefix: the conventional home for EventBridge log targets,
+        // and what keeps the delivery resource policy narrow.
+        logGroupName: `/aws/events/${this.prefixed("databricks-parameter-writes")}`,
+        // A year, not a month: this is the audit record an investigation reads to
+        // decide whether a write was a repoint, so it has to outlive the incident.
+        retention: logs.RetentionDays.ONE_YEAR,
+        removalPolicy:
+          this.envName === "prod"
+            ? cdk.RemovalPolicy.RETAIN
+            : cdk.RemovalPolicy.DESTROY,
+      },
+    );
+
+    // EVERY write under the path is logged, legitimate ones included: the allowlist is
+    // applied by the metric filter below, not by the rule. `anything-but` in an event
+    // pattern does NOT match an ABSENT key, so a writer with no `sessionContext` (an
+    // IAM user, or a root call) — the most suspicious principal of the set — would be
+    // silently exempted by a pattern-level allowlist. CloudWatch Logs filter syntax can
+    // say `NOT EXISTS`, so the allowlist goes where absence is expressible.
+    const parameterWritePathPrefix = `${databricksSourcesConfigPrefix}/`;
+    const parameterAuditTarget = new targets.CloudWatchLogGroup(
+      parameterAuditLogGroup,
+    );
+    const parameterWriteRuleDescription =
+      "Records every write under the Databricks per-source config path for " +
+      "UnexpectedConnectorParameterWrite. Requires a CloudTrail trail logging " +
+      "management events in this account and region; this stack creates none.";
+
+    new events.Rule(this, "DatabricksParameterWriteRule", {
+      ruleName: this.prefixed("databricks-parameter-writes"),
+      description: parameterWriteRuleDescription,
+      eventPattern: {
+        source: ["aws.ssm"],
+        detailType: ["AWS API Call via CloudTrail"],
+        detail: {
+          eventSource: ["ssm.amazonaws.com"],
+          eventName: ["PutParameter", "DeleteParameter"],
+          requestParameters: {
+            name: events.Match.prefix(parameterWritePathPrefix),
+          },
+        },
+      },
+      targets: [parameterAuditTarget],
+    });
+
+    // The batch form, which would otherwise escape the rule entirely: a different
+    // event name and `names` as a list. EventBridge content filters match if ANY
+    // element of a list matches, so one prefix matcher covers a batch that mixes
+    // paths — the interesting case, since a batch delete touching one parameter
+    // under this path is exactly what a repoint's cleanup would look like.
+    new events.Rule(this, "DatabricksParameterBatchDeleteRule", {
+      ruleName: this.prefixed("databricks-parameter-batch-deletes"),
+      description: parameterWriteRuleDescription,
+      eventPattern: {
+        source: ["aws.ssm"],
+        detailType: ["AWS API Call via CloudTrail"],
+        detail: {
+          eventSource: ["ssm.amazonaws.com"],
+          eventName: ["DeleteParameters"],
+          requestParameters: {
+            names: events.Match.prefix(parameterWritePathPrefix),
+          },
+        },
+      },
+      targets: [parameterAuditTarget],
+    });
+
+    // An allowlist rather than a single expected principal: the sources-API role, which
+    // writes here in normal operation, plus the CDK CloudFormation execution role so a
+    // future stack-managed parameter under this path does not alarm on every deploy.
+    // The qualifier is overridable, since it is not guaranteed to be the default.
+    //
+    // `NOT EXISTS` first, and it is the load-bearing clause: a principal with no
+    // `sessionContext` — an IAM user, a root call — is NOT covered by the `!=` terms,
+    // because a comparison against an absent field is false. Without it the filter
+    // would exempt exactly the callers least likely to be legitimate.
+    const cfnExecRoleName =
+      (this.node.tryGetContext("cdk_cfn_exec_role_name") as
+        | string
+        | undefined) ??
+      `cdk-${cdk.DefaultStackSynthesizer.DEFAULT_QUALIFIER}-cfn-exec-role-${this.account}-${this.region}`;
+    const issuerField =
+      "$.detail.userIdentity.sessionContext.sessionIssuer.userName";
+    const unexpectedWriteMetric = new logs.MetricFilter(
+      this,
+      "DatabricksUnexpectedParameterWriteFilter",
+      {
+        logGroup: parameterAuditLogGroup,
+        metricNamespace: sourcesNamespace,
+        metricName: "UnexpectedConnectorParameterWrite",
+        metricValue: "1",
+        filterPattern: logs.FilterPattern.literal(
+          `{ (${issuerField} NOT EXISTS) ` +
+            `|| ((${issuerField} != "${sourcesApiRole.roleName}") ` +
+            `&& (${issuerField} != "${cfnExecRoleName}")) }`,
+        ),
+      },
+    ).metric({ statistic: "Sum", period: cdk.Duration.minutes(5) });
+
+    const unexpectedWriteAlarm = new cloudwatch.Alarm(
+      this,
+      "DatabricksUnexpectedParameterWriteAlarm",
+      {
+        alarmName: this.prefixed("databricks-unexpected-parameter-write"),
+        alarmDescription:
+          "A principal outside the allowlist wrote or deleted a Databricks per-source " +
+          "config parameter. Treat as a potential cross-source credential repoint: " +
+          "compare the parameter's credentialSecretArn and namespaceId " +
+          "against the source record before dismissing. A repoint resolves " +
+          "SUCCESSFULLY, so no other metric can see it. NOTE: this alarm depends on a " +
+          "CloudTrail trail logging management events in this account and region, " +
+          "which this stack does not create — in an account without one it never " +
+          "fires and the parameter write scope on the sources-API role is the only " +
+          "control.",
+        metric: unexpectedWriteMetric,
+        threshold: 1,
+        comparisonOperator:
+          cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+        evaluationPeriods: 1,
+        // A write is a discrete event, so "no data" is the normal state and must not
+        // read as a breach.
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      },
+    );
+    // Records and alarms today; notifies the moment a deployment supplies an action.
+    // `alarmAction` is undefined in `bin/app.ts` (round one), and blocking a detection
+    // on a notification channel that does not exist yet would leave the gap open.
+    if (props.alarmAction) {
+      props.alarmAction.addAlarmActions({
+        alarm: unexpectedWriteAlarm,
+        action: props.alarmAction,
+      });
+    }
     // Explicit TransactWriteItems grant (grantReadWriteData covers it but be explicit for audit)
     sourcesApiFn.addToRolePolicy(
       new iam.PolicyStatement({
@@ -2859,6 +3399,185 @@ export class SourcesStack extends SCLStack {
       }),
     );
 
+    // ── Recurring rescan schedules (EventBridge Scheduler) ───────────
+    // Each scheduled source gets a schedule in this group that fires a
+    // SCHEDULED rescan by invoking this same Sources API Lambda with a
+    // synthetic {"scheduledRescan": true, ...} payload (no separate invoker
+    // function). A scoped execution role lets the scheduler invoke the Lambda;
+    // the API Lambda itself manages the per-source schedules at runtime.
+    const rescanScheduleGroupName = this.prefixed("sources-rescan");
+    new scheduler.CfnScheduleGroup(this, "RescanScheduleGroup", {
+      name: rescanScheduleGroupName,
+    });
+
+    const rescanSchedulerRole = new iam.Role(this, "RescanSchedulerRole", {
+      roleName: this.prefixed("sources-rescan-scheduler"),
+      assumedBy: new iam.ServicePrincipal("scheduler.amazonaws.com"),
+      description:
+        "Assumed by EventBridge Scheduler to invoke the Sources API Lambda for recurring rescans.",
+    });
+    sourcesApiFn.grantInvoke(rescanSchedulerRole);
+
+    // The API Lambda creates/updates/deletes the per-source schedules within
+    // the group and passes the scheduler role to them (least privilege: scoped
+    // to this group's schedules and to passing only the scheduler role).
+    sourcesApiFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: "ManageRescanSchedules",
+        actions: [
+          "scheduler:CreateSchedule",
+          "scheduler:UpdateSchedule",
+          "scheduler:DeleteSchedule",
+          "scheduler:GetSchedule",
+        ],
+        resources: [
+          this.formatArn({
+            service: "scheduler",
+            resource: "schedule",
+            resourceName: `${rescanScheduleGroupName}/*`,
+            arnFormat: cdk.ArnFormat.SLASH_RESOURCE_NAME,
+          }),
+        ],
+      }),
+    );
+    sourcesApiFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: "PassRescanSchedulerRole",
+        actions: ["iam:PassRole"],
+        resources: [rescanSchedulerRole.roleArn],
+        conditions: {
+          StringEquals: { "iam:PassedToService": "scheduler.amazonaws.com" },
+        },
+      }),
+    );
+
+    sourcesApiFn.addEnvironment(
+      "RESCAN_SCHEDULE_GROUP",
+      rescanScheduleGroupName,
+    );
+    // Construct the target ARN from the known function name rather than
+    // sourcesApiFn.functionArn — a Lambda cannot reference its own ARN in its
+    // own environment (CloudFormation circular dependency).
+    sourcesApiFn.addEnvironment(
+      "RESCAN_TARGET_ARN",
+      this.formatArn({
+        service: "lambda",
+        resource: "function",
+        resourceName: this.prefixed("sources-api"),
+        arnFormat: cdk.ArnFormat.COLON_RESOURCE_NAME,
+      }),
+    );
+    sourcesApiFn.addEnvironment(
+      "RESCAN_SCHEDULE_ROLE_ARN",
+      rescanSchedulerRole.roleArn,
+    );
+
+    // ── Event-driven rescans (Glue Data Catalog changes) ─────────────
+    // Per-source EventBridge rules (created at runtime by the API Lambda) match
+    // a source's Glue catalog changes and route them to this SQS queue; a
+    // consumer Lambda drains it into EVENT rescans. SQS-as-target avoids
+    // per-rule Lambda permission churn — the queue policy grants EventBridge.
+    const glueEventDlq = new sqs.Queue(this, "GlueEventDlq", {
+      queueName: this.prefixed("sources-glue-event-dlq"),
+      enforceSSL: true,
+      encryption: sqs.QueueEncryption.SQS_MANAGED,
+      retentionPeriod: cdk.Duration.days(14),
+    });
+    const glueEventQueue = new sqs.Queue(this, "GlueEventQueue", {
+      queueName: this.prefixed("sources-glue-event-queue"),
+      enforceSSL: true,
+      encryption: sqs.QueueEncryption.SQS_MANAGED,
+      // 6x the consumer's 30s timeout, per AWS guidance: leaves retry headroom
+      // so a redrive cannot race a still-running invocation.
+      visibilityTimeout: cdk.Duration.seconds(180),
+      deadLetterQueue: { queue: glueEventDlq, maxReceiveCount: 5 },
+    });
+    // Allow EventBridge rules in THIS account to deliver to the queue.
+    glueEventQueue.addToResourcePolicy(
+      new iam.PolicyStatement({
+        sid: "AllowEventBridgeSend",
+        effect: iam.Effect.ALLOW,
+        principals: [new iam.ServicePrincipal("events.amazonaws.com")],
+        actions: ["sqs:SendMessage"],
+        resources: [glueEventQueue.queueArn],
+        conditions: { StringEquals: { "aws:SourceAccount": this.account } },
+      }),
+    );
+
+    const glueEventRescanFn = new lambda.Function(this, "GlueEventRescanFn", {
+      functionName: this.prefixed("sources-glue-event-rescan"),
+      runtime: lambda.Runtime.PYTHON_3_12,
+      architecture: lambda.Architecture.ARM_64,
+      handler: "coa_sources.database.glue_event_rescan_handler.handler",
+      code: bundlePython({
+        srcDirs: [
+          fromRoot("packages/sources/src"),
+          Paths.commonLib,
+          Paths.smithyGeneratedControlPlanePythonServer,
+        ],
+        requirementsFile: fromRoot("packages/sources/requirements.txt"),
+        architecture: "arm64",
+      }),
+      timeout: cdk.Duration.seconds(30),
+      memorySize: 256,
+      vpc,
+      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+      securityGroups: [lambdaSecurityGroup],
+      environment: {
+        SOURCES_TABLE: this.sourcesTable.tableName,
+        SOURCE_SCAN_JOBS_TABLE: this.sourceScanJobsTable.tableName,
+        SCAN_QUEUE_URL: dbScanQueue.queueUrl,
+        // The re-scan entry point returns an API-shaped response, and
+        // api_response raises without this. No HTTP caller here.
+        ALLOWED_ORIGIN: allowedOrigin,
+      },
+    });
+    this.sourcesTable.grantReadWriteData(glueEventRescanFn);
+    this.sourceScanJobsTable.grantReadWriteData(glueEventRescanFn);
+    dbScanQueue.grantSendMessages(glueEventRescanFn);
+    glueEventRescanFn.addEventSource(
+      new lambdaEventSources.SqsEventSource(glueEventQueue, {
+        batchSize: 10,
+        // The handler reports per-message failures. Without this, one bad
+        // message in a batch of ten is deleted along with the nine good ones
+        // and the DLQ never sees it.
+        reportBatchItemFailures: true,
+        // Matches the other scan-triggering queues. Each message can start a
+        // scan, so unbounded fan-out here races the rescan status lock.
+        maxConcurrency: 5,
+      }),
+    );
+
+    // The API Lambda manages per-source Glue-event rules (scoped to the rule
+    // name prefix). SQS delivery is authorized by the queue policy above, so no
+    // target role / PassRole is needed.
+    const glueEventRulePrefix = this.prefixed("glue-rescan");
+    sourcesApiFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: "ManageGlueEventRules",
+        actions: [
+          "events:PutRule",
+          "events:PutTargets",
+          "events:DeleteRule",
+          "events:RemoveTargets",
+          "events:DescribeRule",
+        ],
+        resources: [
+          this.formatArn({
+            service: "events",
+            resource: "rule",
+            resourceName: `${glueEventRulePrefix}-*`,
+            arnFormat: cdk.ArnFormat.SLASH_RESOURCE_NAME,
+          }),
+        ],
+      }),
+    );
+    sourcesApiFn.addEnvironment(
+      "GLUE_EVENT_QUEUE_ARN",
+      glueEventQueue.queueArn,
+    );
+    sourcesApiFn.addEnvironment("GLUE_EVENT_RULE_PREFIX", glueEventRulePrefix);
+
     this.sourcesApiFnArn = sourcesApiFn.functionArn;
 
     // ================================================================
@@ -2877,12 +3596,25 @@ export class SourcesStack extends SCLStack {
       .monitorLambda(docCleanupFn)
       .monitorLambda(docTriggerFn)
       .monitorLambda(federationProvisionerFn)
+      .monitorLambda(sourceDeleteWorkerFn)
       .monitorStateMachine(dbScanStateMachine)
       .monitorStateMachine(docIngestionStateMachine)
       .monitorStateMachine(docDeletionStateMachine)
+      .monitorLambda(glueEventRescanFn)
       .monitorQueueWithDlq(dbScanQueue, dbScanDlq)
       .monitorQueueWithDlq(bulkReviewQueue, bulkReviewDlq)
-      .monitorQueueWithDlq(docIngestionQueue, docIngestionDlq);
+      .monitorQueueWithDlq(docIngestionQueue, docIngestionDlq)
+      .monitorQueueWithDlq(glueEventQueue, glueEventDlq)
+      // A message on the delete DLQ is an orphaned source teardown (assets left
+      // behind, source stuck DELETING/DELETE_FAILED) — page on it like the others.
+      .monitorQueueWithDlq(sourceDeleteQueue, sourceDeleteDlq)
+      // The repoint detection is built from a log metric filter rather than a facade
+      // shape, so without this it appears on no dashboard — and it is the one alarm
+      // whose threat resolves SUCCESSFULLY and has no other signal.
+      .showAlarm(
+        unexpectedWriteAlarm,
+        "Databricks per-source config writes outside the allowlist (needs a CloudTrail trail)",
+      );
 
     // ================================================================
     // CloudWatch Dashboard — Structured Scan & Enrichment Pipeline
@@ -2898,7 +3630,6 @@ export class SourcesStack extends SCLStack {
     // every custom-metric widget uses a SEARCH() MathExpression that
     // auto-discovers the live dimensions. `usingMetrics` is intentionally
     // empty for SEARCH exprs.
-    const sourcesNamespace = "COA/Sources";
     const sourcesPeriod = cdk.Duration.minutes(5);
     const sourcesRegion = cdk.Aws.REGION;
 
@@ -3247,8 +3978,34 @@ export class SourcesStack extends SCLStack {
       description:
         "Sources document ingestion Step Functions state machine ARN",
     });
+    // The SECOND platform principal a Databricks source's credential-access role must
+    // trust. Two roles reach that customer role: the connector's execution role, on
+    // every request, published by the connector's own stack under
+    // `deployment/role-arn`; and THIS role, exactly once at registration, to
+    // `DescribeSecret` and prove the wiring works before a source is accepted. A trust
+    // policy naming only the connector role deploys fine and then refuses the create.
+    //
+    // ENV-LESS, matching the enrichment role below rather than the env-scoped connector
+    // subtree and the discovery role beneath it, so two environments in one account share
+    // the name and the last platform deploy wins. Pre-existing debt shared by every
+    // parameter this stack writes, and here it fails CLOSED both ways: a stale value
+    // publishes the wrong principal, so the create fails at submit, and the wrongly-trusted
+    // principal cannot use the trust anyway, since every `sts:AssumeRole` grant here is
+    // scoped to this deployment's `{prefix}-{env}-datasource-access-*`.
+    new ssm.StringParameter(this, "SsmSourcesApiRoleArn", {
+      parameterName: `${ssmPrefix}/sources/api-role-arn`,
+      stringValue: sourcesApiRole.roleArn,
+      description:
+        "Sources API Lambda execution role ARN — the registration-time principal a datasource-access role must trust",
+    });
+    // ENV-SCOPED, for the same reason as serve's runtime role: the pair is read by a
+    // connector stack deployed from a separate CDK app, where both ARNs become a
+    // lambda:InvokeFunction resource policy plus spill-bucket read and spill-key decrypt
+    // grants. A sibling environment overwriting this one leaves THIS environment's
+    // discovery role unable to run a single DESCRIBE, which presents as a source that
+    // scans tables and discovers no declared keys.
     new ssm.StringParameter(this, "SsmSourcesDbConnectorRoleArn", {
-      parameterName: `${ssmPrefix}/sources/db-connector-role-arn`,
+      parameterName: `${ssmPrefix}/${envName}/sources/db-connector-role-arn`,
       stringValue: dbConnectorFn.role!.roleArn,
       description: "Sources database connector Lambda execution role ARN",
     });
@@ -3278,6 +4035,43 @@ export class SourcesStack extends SCLStack {
     });
     new cdk.CfnOutput(this, "SourcesDbScanStateMachineArn", {
       value: dbScanStateMachine.stateMachineArn,
+    });
+  }
+
+  /**
+   * The one `sts:AssumeRole` grant shape every consumer of a customer-owned
+   * credential-access role holds — the discovery Lambda, the enrichment task and the
+   * sources API here, plus the Databricks connector from its own CDK app. Factored
+   * because registration and query have to agree on the bound.
+   *
+   * Two properties are load-bearing:
+   *
+   *   - **No account restriction.** The customer's credential-access role may live in
+   *     any account, including this deployment's own. What bounds COA instead is the
+   *     reserved NAME prefix — kept reserved by `ReservedRoleNamePrefix`, which fails
+   *     the synth if a COA-internal role is named under it — plus the target role's
+   *     own trust policy.
+   *   - **`Null: {"sts:ExternalId": "false"}`.** The role ARN is caller-supplied at
+   *     source-create, so the ExternalId — derived server-side from the requesting
+   *     namespace, never accepted from the request — is what binds an assume to the
+   *     namespace entitled to it. Denying an assume that presents none means a
+   *     regression fails closed instead of silently widening access.
+   *
+   * @param sid retained per call site so the deployed policies keep the Sids they
+   *   shipped with.
+   */
+  private assumeDatasourceAccessRoleStatement(
+    sid: string,
+  ): iam.PolicyStatement {
+    return new iam.PolicyStatement({
+      sid,
+      actions: ["sts:AssumeRole"],
+      resources: [
+        `arn:aws:iam::*:role/${this.prefixed(RESERVED_DATASOURCE_ROLE_SEGMENT)}*`,
+      ],
+      conditions: {
+        Null: { "sts:ExternalId": "false" },
+      },
     });
   }
 }

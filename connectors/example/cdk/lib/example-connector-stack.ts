@@ -4,6 +4,7 @@ import * as path from "path";
 import * as cdk from "aws-cdk-lib";
 import {
   AthenaFederationConnector,
+  Provisioning,
   functionNamePrefix,
   optionalIntEnv,
   queryRoleArns,
@@ -60,10 +61,10 @@ export interface ExampleConnectorStackProps extends cdk.StackProps {
   readonly functionNamePrefix?: string;
 
   /**
-   * Defaults to `"create"`. `"none"` suits only a source that cannot exceed 6 MB — which this
-   * fixture deliberately can.
+   * Defaults to {@link Provisioning.CREATE}. {@link Provisioning.NONE} suits only a source that
+   * cannot exceed 6 MB — which this fixture deliberately can.
    */
-  readonly spill?: "create" | "none";
+  readonly spill?: Provisioning;
 }
 
 /**
@@ -132,7 +133,7 @@ export class ExampleConnectorStack extends cdk.Stack {
       value: CONNECTOR_TABLES.join(","),
       description: "Tables in that database, comma-separated",
     });
-    // Marked absent rather than omitted under spill: "none", so a test never has to tell "key
+    // Marked absent rather than omitted under Provisioning.NONE, so a test never has to tell "key
     // missing" from "no bucket".
     new cdk.CfnOutput(this, "SpillBucket", {
       value: this.connector.spillBucket?.bucketName ?? "<none>",

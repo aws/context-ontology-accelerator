@@ -54,7 +54,8 @@ class DatabricksQueryBuilderTest
     private static Constraints noConstraints()
     {
         return new Constraints(Collections.emptyMap(), Collections.emptyList(),
-                Collections.emptyList(), Constraints.DEFAULT_NO_LIMIT);
+                Collections.emptyList(), Constraints.DEFAULT_NO_LIMIT,
+                Collections.emptyMap(), null);
     }
 
     private static String sqlFor(Constraints constraints) throws SQLException
@@ -113,7 +114,7 @@ class DatabricksQueryBuilderTest
     throws SQLException
     {
         Constraints withLimit = new Constraints(Collections.emptyMap(), Collections.emptyList(),
-                Collections.emptyList(), 25L);
+                Collections.emptyList(), 25L, Collections.emptyMap(), null);
         assertTrue(sqlFor(withLimit).endsWith(" LIMIT 25"), sqlFor(withLimit));
     }
 
@@ -131,7 +132,7 @@ class DatabricksQueryBuilderTest
         Constraints topN = new Constraints(Collections.emptyMap(), Collections.emptyList(),
                 Collections.singletonList(
                         new OrderByField("order_num", OrderByField.Direction.DESC_NULLS_LAST)),
-                10L);
+                10L, Collections.emptyMap(), null);
         String sql = sqlFor(topN);
         assertTrue(sql.contains("ORDER BY `order_num` DESC NULLS LAST"), sql);
         assertTrue(sql.endsWith(" LIMIT 10"), sql);
@@ -146,7 +147,8 @@ class DatabricksQueryBuilderTest
             summary.put("region_code", SortedRangeSet.of(
                     Range.equal(allocator, Types.MinorType.VARCHAR.getType(), "emea")));
             Constraints constraints = new Constraints(summary, Collections.emptyList(),
-                    Collections.emptyList(), Constraints.DEFAULT_NO_LIMIT);
+                    Collections.emptyList(), Constraints.DEFAULT_NO_LIMIT,
+                    Collections.emptyMap(), null);
 
             String sql = sqlFor(constraints);
             // A "?" and never a literal, which is what makes the predicate path immune to injection
@@ -165,7 +167,8 @@ class DatabricksQueryBuilderTest
             summary.put("order_num", SortedRangeSet.of(Range.range(
                     allocator, Types.MinorType.BIGINT.getType(), 10L, true, 20L, false)));
             Constraints constraints = new Constraints(summary, Collections.emptyList(),
-                    Collections.emptyList(), Constraints.DEFAULT_NO_LIMIT);
+                    Collections.emptyList(), Constraints.DEFAULT_NO_LIMIT,
+                    Collections.emptyMap(), null);
 
             String sql = sqlFor(constraints);
             assertTrue(sql.contains("`order_num` >= ?"), sql);
@@ -183,7 +186,8 @@ class DatabricksQueryBuilderTest
                     Range.equal(allocator, Types.MinorType.VARCHAR.getType(), "emea"),
                     Range.equal(allocator, Types.MinorType.VARCHAR.getType(), "amer")));
             Constraints constraints = new Constraints(summary, Collections.emptyList(),
-                    Collections.emptyList(), Constraints.DEFAULT_NO_LIMIT);
+                    Collections.emptyList(), Constraints.DEFAULT_NO_LIMIT,
+                    Collections.emptyMap(), null);
 
             String sql = sqlFor(constraints);
             assertTrue(sql.contains("`region_code` IN (?,?)"), sql);

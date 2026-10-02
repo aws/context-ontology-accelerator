@@ -79,6 +79,35 @@ function inferOntologyFormat(name: string): "turtle" | "rdf+xml" | "json-ld" {
   return "turtle";
 }
 
+/** Parse an ISO string or epoch (seconds or milliseconds) into epoch
+ *  milliseconds; null when unparseable. Tolerant because scan-history `at` and
+ *  proposal `created_at` can reach the raw client in different shapes. */
+function toEpochMs(v: unknown): number | null {
+  if (typeof v === "number") return v < 1e12 ? v * 1000 : v;
+  if (typeof v === "string") {
+    const t = Date.parse(v);
+    return Number.isNaN(t) ? null : t;
+  }
+  return null;
+}
+
+/** Newest resolved-re-scan time (epoch ms) in a source's scan history — the
+ *  latest REVIEW row flagged isRescan — or null if there is none. */
+function latestRescanMs(
+  items:
+    | Array<{ eventType?: string; isRescan?: boolean; at?: unknown }>
+    | undefined,
+): number | null {
+  let max: number | null = null;
+  for (const e of items ?? []) {
+    if (e.eventType === "REVIEW" && e.isRescan === true) {
+      const ms = toEpochMs(e.at);
+      if (ms !== null && (max === null || ms > max)) max = ms;
+    }
+  }
+  return max;
+}
+
 export function OntologyPage() {
   const { namespaceId } = useParams<{ namespaceId: string }>();
   const [activeTab, setActiveTab] = useState("proposals");
@@ -102,6 +131,20 @@ export function OntologyPage() {
     MultiselectProps.Option[]
   >([]);
   const [datasourceError, setDatasourceError] = useState<string | null>(null);
+  // Names of APPROVED database sources whose ACCEPTED induction is out of date:
+  // the source was re-scanned and re-approved after its latest accepted
+  // induction. Drives the "stale induction" warning, which lists them.
+  const [staleInducedSourceNames, setStaleInducedSourceNames] = useState<
+    string[]
+  >([]);
+  // Names of APPROVED database sources whose newest induction is a PENDING
+  // proposal that predates the source's re-scan — the proposal awaiting review
+  // was built on the older source. Drives the "pending induction is stale"
+  // warning. A source is in at most one of these two lists (routed by whichever
+  // its newest induction is).
+  const [stalePendingSourceNames, setStalePendingSourceNames] = useState<
+    string[]
+  >([]);
   const [strategy, setStrategy] = useState("table_to_ontology");
   const [groundingMode, setGroundingMode] = useState("ENHANCED");
   const [confidenceThreshold, setConfidenceThreshold] = useState(0.8);
@@ -177,15 +220,126 @@ export function OntologyPage() {
                 .join(" · "),
             })),
         );
+        // A source's induction is STALE when the source was re-scanned and
+        // re-approved AFTER its newest induction. We look at the newest
+        // induction of ANY status (accepted OR pending):
+        //   induction time = newest created_at of an "induction" proposal
+        //     (status accepted or pending) whose metadata.datasource_ids
+        //     includes the source.
+        //   re-scan time   = newest scan-history REVIEW row with isRescan.
+        // If the newest induction postdates the re-scan the source is current —
+        // this is how a fresh re-induction, even one still pending review,
+        // clears the banner. If the re-scan postdates it the source is stale,
+        // and we route it by that newest induction's status: an accepted
+        // induction is an out-of-date ontology; a pending one is a proposal
+        // built on the older source. Best-effort — one proposals fetch plus one
+        // scan-history fetch per approved source (no per-source re-scan marker
+        // exists); failures are ignored.
+        const approvedDbSources = (data.items || []).filter(
+          (s) => s.status === "APPROVED",
+        );
+        if (approvedDbSources.length === 0) {
+          if (!cancelled) {
+            setStaleInducedSourceNames([]);
+            setStalePendingSourceNames([]);
+          }
+        } else {
+          Promise.all([
+            // No status filter: we need accepted AND pending inductions.
+            listProposals(apiClient, namespaceId ?? "").catch(
+              (): Proposal[] => [],
+            ),
+            Promise.all(
+              approvedDbSources.map((s) =>
+                apiClient
+                  .get<{
+                    items?: Array<{
+                      eventType?: string;
+                      isRescan?: boolean;
+                      at?: unknown;
+                    }>;
+                  }>(`/namespaces/${namespaceId}/sources/${s.sourceId}/scan`)
+                  .then((h) => ({
+                    sourceId: s.sourceId,
+                    name: s.name,
+                    rescanMs: latestRescanMs(h.items),
+                  }))
+                  .catch(() => ({
+                    sourceId: s.sourceId,
+                    name: s.name,
+                    rescanMs: null,
+                  })),
+              ),
+            ),
+          ])
+            .then(([proposals, rescans]) => {
+              if (cancelled) return;
+              // Newest induction per source id: its time (epoch ms) and the
+              // status of that newest proposal (accepted or pending).
+              const induction = new Map<
+                string,
+                { ms: number; status: string }
+              >();
+              for (const p of proposals) {
+                if (p.proposal_type !== "induction") continue;
+                if (p.status !== "accepted" && p.status !== "pending") continue;
+                const ms = toEpochMs(p.created_at);
+                if (ms === null) continue;
+                const raw = p.metadata?.["datasource_ids"];
+                const ids = Array.isArray(raw)
+                  ? raw.filter((x): x is string => typeof x === "string")
+                  : [];
+                for (const id of ids) {
+                  const prev = induction.get(id);
+                  if (prev === undefined || ms > prev.ms)
+                    induction.set(id, { ms, status: p.status });
+                }
+              }
+              // A source is stale when its newest re-scan postdates its newest
+              // induction. Route the name by that induction's status: accepted =>
+              // out-of-date ontology; pending => proposal built on the old source.
+              const acceptedStale: string[] = [];
+              const pendingStale: string[] = [];
+              for (const { sourceId, name, rescanMs } of rescans) {
+                if (rescanMs === null) continue;
+                const ind = induction.get(sourceId);
+                if (ind === undefined || rescanMs <= ind.ms) continue;
+                const label = name || sourceId;
+                if (ind.status === "accepted") acceptedStale.push(label);
+                else pendingStale.push(label);
+              }
+              setStaleInducedSourceNames(acceptedStale);
+              setStalePendingSourceNames(pendingStale);
+            })
+            .catch((err) => {
+              // Fail open if the proposals/scan fetches or the staleness
+              // computation throw: clear the banners rather than leave the nested
+              // promise's rejection unhandled. Log first (advisory feature, but
+              // silence would make a vanished banner undebuggable), then clear.
+              console.error("Failed to compute source staleness", {
+                error: err,
+              });
+              if (cancelled) return;
+              setStaleInducedSourceNames([]);
+              setStalePendingSourceNames([]);
+            });
+        }
       })
       .catch((e: Error) => {
         if (cancelled) return;
         setDatasourceError(e.message || "Failed to load data sources");
+        // Reset the stale-source lists so a banner from a previous namespace
+        // doesn't linger when this namespace's source fetch fails.
+        setStaleInducedSourceNames([]);
+        setStalePendingSourceNames([]);
       });
     return () => {
       cancelled = true;
     };
-  }, [namespaceId, apiClient]);
+    // lockRefreshKey + pollingJobStatus mirror the induction-lock effect so the
+    // staleness banners recompute after a trigger/accept (and the lock-key
+    // bump), clearing in place once the user re-induces — not only on remount.
+  }, [namespaceId, apiClient, lockRefreshKey, pollingJobStatus]);
 
   // Lazy-fetch the foundational ontology catalog and all loaded ontologies
   // when the Induce modal opens. The grounding multiselect shows only
@@ -422,6 +576,43 @@ export function OntologyPage() {
       >
         Induction
       </Header>
+      {staleInducedSourceNames.length > 0 && (
+        <Alert
+          type="warning"
+          header="A re-scanned source has an out-of-date induction"
+        >
+          <SpaceBetween size="xs">
+            <Box variant="p">
+              Re-scanned and re-approved since their last induction:{" "}
+              <b>{staleInducedSourceNames.join(", ")}</b>. That induction no
+              longer matches the current source.
+            </Box>
+            <Box variant="p">
+              Right now, re-inducing only merges into the existing ontology
+              (append-only): it won&apos;t remove tables dropped at the source
+              and can duplicate edited labels. For a clean rebuild today, delete
+              the affected induction below and induce again. Editing an
+              induction in place isn&apos;t available yet.
+            </Box>
+          </SpaceBetween>
+        </Alert>
+      )}
+      {stalePendingSourceNames.length > 0 && (
+        <Alert type="warning" header="A pending induction predates a re-scan">
+          <SpaceBetween size="xs">
+            <Box variant="p">
+              You have a pending induction for:{" "}
+              <b>{stalePendingSourceNames.join(", ")}</b>. The source was
+              re-scanned and re-approved after you triggered that induction.
+            </Box>
+            <Box variant="p">
+              The pending proposal was built on the older source, so accepting
+              it won&apos;t include the re-scan&apos;s changes. Re-run the
+              induction on the current source, then accept the new proposal.
+            </Box>
+          </SpaceBetween>
+        </Alert>
+      )}
       {(pollingJobId || pollingJobError) && (
         <Alert
           type={pollingJobError ? "error" : "info"}

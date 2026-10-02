@@ -38,7 +38,7 @@ class CoaMetadataHandlerTest
 {
     private static final FederatedIdentity IDENTITY = new FederatedIdentity(
             "arn:aws:iam::123456789012:role/query", "123456789012",
-            Collections.emptyMap(), Collections.emptyList());
+            Collections.emptyMap(), Collections.emptyList(), Collections.emptyMap());
 
     /** Records the catalog name each SPI method was handed. */
     private static final class RecordingHandler extends CoaMetadataHandler

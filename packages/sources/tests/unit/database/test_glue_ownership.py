@@ -29,6 +29,8 @@ from coa_common.constants import namespace_tag_key  # noqa: E402
 _TAG_KEY = namespace_tag_key()
 from coa_sources.database import glue_ownership as go  # noqa: E402
 
+from tests.unit.conftest import dao_double  # noqa: E402
+
 pytestmark = pytest.mark.real_glue_ownership
 
 # Real UUIDs: the shared `parse_namespace_tag` validates every entry as a namespace
@@ -57,7 +59,7 @@ def _glue_with_tags(tags: dict[str, str]) -> MagicMock:
 
 
 def _dao_with_claim(namespace_id: str | None) -> MagicMock:
-    dao = MagicMock()
+    dao = dao_double()
     dao.get.return_value = {"namespaceId": namespace_id} if namespace_id else None
     return dao
 
@@ -321,7 +323,7 @@ class TestPlatformCatalogs:
             _check(_dao_with_claim(None), MagicMock(), namespace_id=_NS, catalog_id=self._catalog_id())
 
     def test_claim_round_trip(self):
-        dao = MagicMock()
+        dao = dao_double()
         go.claim_platform_catalog(dao, catalog_name="scldevds_abc", namespace_id=_NS, source_id="src-1")
         item = dao.put.call_args.args[0]
         assert item["PK"] == "GLUECAT#scldevds_abc"

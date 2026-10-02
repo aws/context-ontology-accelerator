@@ -57,7 +57,7 @@ class TestBuildDataSourceLookup:
 
 
 class TestResolveProjectId:
-    """Tests for _resolve_project_id degradation behavior."""
+    """Tests for unprovisioned namespaces versus registry failures."""
 
     @patch("coa_metrics.data_source_lookup_factory.DynamoDBDAO")
     def test_returns_project_id_when_present(self, mock_dao_cls):
@@ -91,7 +91,7 @@ class TestResolveProjectId:
         assert _resolve_project_id("ns-1", "ns-tbl", "us-east-1") is None
 
     @patch("coa_metrics.data_source_lookup_factory.DynamoDBDAO")
-    def test_client_error_returns_none(self, mock_dao_cls):
+    def test_client_error_propagates(self, mock_dao_cls):
         from coa_metrics.data_source_lookup_factory import _resolve_project_id
 
         dao = MagicMock()
@@ -100,14 +100,16 @@ class TestResolveProjectId:
         )
         mock_dao_cls.return_value = dao
 
-        assert _resolve_project_id("ns-1", "ns-tbl", "us-east-1") is None
+        with pytest.raises(ClientError):
+            _resolve_project_id("ns-1", "ns-tbl", "us-east-1")
 
     @patch("coa_metrics.data_source_lookup_factory.DynamoDBDAO")
-    def test_unexpected_exception_returns_none(self, mock_dao_cls):
+    def test_unexpected_exception_propagates(self, mock_dao_cls):
         from coa_metrics.data_source_lookup_factory import _resolve_project_id
 
         dao = MagicMock()
         dao.get.side_effect = RuntimeError("boom")
         mock_dao_cls.return_value = dao
 
-        assert _resolve_project_id("ns-1", "ns-tbl", "us-east-1") is None
+        with pytest.raises(RuntimeError, match="boom"):
+            _resolve_project_id("ns-1", "ns-tbl", "us-east-1")

@@ -14,6 +14,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -162,7 +163,9 @@ class TableAssemblerTest
                 column("note", "string", "Line total @fk(orders.order_id")),
                 DeclaredKeys.none());
 
-        assertEquals("Line total orders.order_id",
+        // Disarmed in place rather than excised: every character survives, and the leading underscore is
+        // what makes the token prose to COA's parser and to the toolkit's encoder.
+        assertEquals("Line total _@fk(orders.order_id",
                 table.toTableSchema().toArrowSchema().getCustomMetadata().get("note"));
     }
 
@@ -187,10 +190,93 @@ class TableAssemblerTest
         assertEquals("Near misses: @PK @pkey @pk=x @pk(x) and bob@pk.example.com",
                 comments.get("pk_near_miss"));
         assertEquals("No bracket so no tag: @fk", comments.get("bare_fk"));
-        // And nothing tag-shaped the encoder would refuse survives.
+        // Asserted by handing each comment back to the encoder rather than by searching for "@fk(", which a
+        // DISARMED tag still contains and which the encoder accepts because it is no longer live.
         for (String comment : comments.values()) {
-            assertTrue(!comment.contains("@fk("), comment);
+            dev.coa.connector.constraints.ColumnComment.of(comment);
         }
+    }
+
+    @Test
+    void aNotNullColumnEmitsTheTagAndANullableOneEmitsNone()
+    {
+        CoaTable table = TableAssembler.assemble("orders", Arrays.asList(
+                new ColumnDefinition("order_id", "bigint", "Surrogate key",
+                        ColumnDefinition.Nullability.NOT_NULL),
+                new ColumnDefinition("note", "string", "Free text",
+                        ColumnDefinition.Nullability.NULLABLE)),
+                DeclaredKeys.none());
+
+        Map<String, String> comments = table.toTableSchema().toArrowSchema().getCustomMetadata();
+        assertEquals("Surrogate key @notnull", comments.get("order_id"));
+        // Absence is what COA reads as "nobody said", so inventing a tag for the YES case would reinterpret
+        // every column of every connector already deployed.
+        assertEquals("Free text", comments.get("note"));
+    }
+
+    @Test
+    void anUnknownNullabilityEmitsNoTag()
+    {
+        // Databricks answers YES or NO. Anything else must produce no tag: guessing NOT NULL asserts a
+        // constraint Unity Catalog never declared, and guessing nullable says nothing anyway.
+        for (String isNullable : new String[] {null, "", "  ", "true", "false", "MAYBE", "1"}) {
+            CoaTable table = TableAssembler.assemble("orders", Collections.singletonList(
+                    new ColumnDefinition("note", "string", "Free text",
+                            ColumnDefinition.Nullability.of(isNullable))),
+                    DeclaredKeys.none());
+            assertEquals("Free text",
+                    table.toTableSchema().toArrowSchema().getCustomMetadata().get("note"),
+                    "is_nullable=" + isNullable);
+        }
+    }
+
+    @Test
+    void nullabilityIsReadCaseInsensitivelyButOnlyForTheTwoSpellingsDatabricksUses()
+    {
+        assertEquals(ColumnDefinition.Nullability.NOT_NULL, ColumnDefinition.Nullability.of("NO"));
+        assertEquals(ColumnDefinition.Nullability.NOT_NULL, ColumnDefinition.Nullability.of(" no "));
+        assertEquals(ColumnDefinition.Nullability.NULLABLE, ColumnDefinition.Nullability.of("YES"));
+        assertEquals(ColumnDefinition.Nullability.NULLABLE, ColumnDefinition.Nullability.of("yes"));
+        assertEquals(ColumnDefinition.Nullability.UNKNOWN, ColumnDefinition.Nullability.of("N"));
+        assertEquals(ColumnDefinition.Nullability.UNKNOWN, ColumnDefinition.Nullability.of(null));
+    }
+
+    @Test
+    void aColumnDefinitionWithNoNullabilityGivenIsUnknownRatherThanNullable()
+    {
+        // The three-argument constructor is for callers with no is_nullable to hand, and must not pick a
+        // side on their behalf.
+        assertEquals(ColumnDefinition.Nullability.UNKNOWN,
+                new ColumnDefinition("note", "string", null).nullability());
+        assertFalse(new ColumnDefinition("note", "string", null).isNotNull());
+    }
+
+    @Test
+    void aCustomerAuthoredNotNullTagIsStrippedBeforeTheConnectorsOwnIsAdded()
+    {
+        // The comment claims NOT NULL and information_schema says nullable; what reaches COA has to be
+        // information_schema's answer, which here means no tag at all.
+        CoaTable table = TableAssembler.assemble("orders", Collections.singletonList(
+                new ColumnDefinition("note", "string", "Never empty @notnull",
+                        ColumnDefinition.Nullability.NULLABLE)),
+                DeclaredKeys.none());
+
+        assertEquals("Never empty",
+                table.toTableSchema().toArrowSchema().getCustomMetadata().get("note"));
+    }
+
+    @Test
+    void aCustomerAuthoredNotNullTagIsNotDoubledWhenTheColumnReallyIsNotNull()
+    {
+        // The customer happens to be right, and the tag still comes from information_schema rather than from
+        // their text, so exactly one appears.
+        CoaTable table = TableAssembler.assemble("orders", Collections.singletonList(
+                new ColumnDefinition("order_id", "bigint", "Key @notnull",
+                        ColumnDefinition.Nullability.NOT_NULL)),
+                DeclaredKeys.none());
+
+        assertEquals("Key @notnull",
+                table.toTableSchema().toArrowSchema().getCustomMetadata().get("order_id"));
     }
 
     @Test

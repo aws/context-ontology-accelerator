@@ -26,6 +26,7 @@ from coa_metrics.validator import (
     OntologyLookup,
     check_data_modifying,
     check_select_shape,
+    check_tier1_execution_shape,
     validate_metric,
 )
 
@@ -201,9 +202,11 @@ class TestCheck1SqlSyntax:
             "sourceTable": "t",
             "ontologyConcepts": [],
         }
-        # Empty string — no SQL to parse, should not error
+        # The generated API model also rejects this, and the direct validator
+        # must stay fail-closed if called independently.
         result = validate_metric(metric)
-        assert result.valid
+        assert not result.valid
+        assert any("empty SQL expression" in error["message"] for error in result.errors)
 
     def test_all_supported_dialects(self) -> None:
         for dialect in ["trino", "postgresql", "redshift", "snowflake", "mysql", "databricks"]:
@@ -233,6 +236,134 @@ class TestCheckSelectShape:
     def test_union_passes(self) -> None:
         sql = "SELECT id FROM a UNION SELECT id FROM b"
         assert check_select_shape(sql, "TRINO") is None
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT",
+            "SELECT *",
+            "WITH x AS (SELECT 1) SELECT",
+        ],
+    )
+    def test_incomplete_select_rejected(self, sql: str) -> None:
+        error = check_select_shape(sql, "POSTGRESQL")
+        assert error is not None
+        assert "SELECT" in error
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT dblink_exec('conn', 'DELETE FROM orders')",
+            "SELECT pg_read_file('/etc/passwd')",
+            "SELECT pg_sleep(10)",
+            "SELECT lo_import('/tmp/payload')",
+            "SELECT lo_create(12345) FROM orders LIMIT 1",
+            "SELECT lo_from_bytea(12345, 'payload') FROM orders LIMIT 1",
+            "SELECT lo_put(12345, 0, 'payload') FROM orders LIMIT 1",
+        ],
+    )
+    def test_dangerous_function_rejected(self, sql: str) -> None:
+        error = check_select_shape(sql, "POSTGRESQL")
+        assert error is not None
+        assert "forbidden function" in error
+
+    @pytest.mark.parametrize(
+        ("dialect", "sql"),
+        [
+            ("POSTGRESQL", "SELECT setval('seq', 1)"),
+            ("POSTGRESQL", "SELECT nextval('seq')"),
+            ("POSTGRESQL", "SELECT pg_advisory_lock(1)"),
+            ("POSTGRESQL", "SELECT pg_logical_emit_message(true, 'coa', 'x') FROM orders LIMIT 1"),
+            ("POSTGRESQL", "SELECT pg_notify('channel', 'payload')"),
+            ("MYSQL", "SELECT SLEEP(10)"),
+            ("MYSQL", "SELECT BENCHMARK(1000000, MD5('x'))"),
+            ("MYSQL", "SELECT LOAD_FILE('/etc/passwd')"),
+            ("MYSQL", "SELECT GET_LOCK('resource', 10)"),
+            ("TSQL", "SELECT * FROM OPENDATASOURCE('SQLNCLI', 'Server=x').db.dbo.orders"),
+        ],
+    )
+    def test_dialect_specific_side_effect_function_rejected(self, dialect: str, sql: str) -> None:
+        error = check_select_shape(sql, dialect)
+        assert error is not None
+        assert "forbidden function" in error
+
+    def test_locking_select_rejected(self) -> None:
+        error = check_select_shape("SELECT * FROM orders FOR UPDATE", "POSTGRESQL")
+        assert error is not None
+        assert "unsafe operation (Lock)" in error
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT * FROM orders WITH (TABLOCKX)",
+            "SELECT * FROM orders (TABLOCKX)",
+            "SELECT * FROM orders TABLOCKX",
+            "SELECT * FROM orders WITH (SERIALIZABLE)",
+            "SELECT * FROM orders WITH (REPEATABLEREAD)",
+            "SELECT * FROM orders WITH (READCOMMITTEDLOCK)",
+            "SELECT * FROM orders /* outer /* inner */ AS */ TABLOCKX",
+            "SELECT * FROM [orders]] AS] TABLOCKX",
+            'SELECT * FROM dbo.fn(CAST(x AS "type\\") + safe) TABLOCKX',
+            "SELECT NEXT VALUE FOR dbo.seq FROM orders",
+        ],
+    )
+    def test_tsql_lock_or_sequence_side_effect_rejected(self, sql: str) -> None:
+        error = check_select_shape(sql, "TSQL")
+        assert error is not None
+        assert "unsafe operation" in error
+
+    def test_tsql_read_only_nolock_hint_still_passes(self) -> None:
+        assert check_select_shape("SELECT * FROM orders WITH (NOLOCK)", "TSQL") is None
+        assert check_select_shape("SELECT * FROM orders (NOLOCK)", "TSQL") is None
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT * FROM orders AS TABLOCKX",
+            "SELECT * FROM orders AS [TABLOCKX]",
+            "SELECT * FROM orders [SERIALIZABLE]",
+            "SELECT * FROM orders AS /* alias */ TABLOCKX",
+        ],
+    )
+    def test_explicit_tsql_alias_named_like_hint_still_passes(self, sql: str) -> None:
+        assert check_select_shape(sql, "TSQL") is None
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT * FROM dbo.order_rows(@TABLOCKX)",
+            "SELECT * FROM dbo.order_rows('TABLOCKX')",
+            "SELECT * FROM dbo.order_rows([TABLOCKX])",
+        ],
+    )
+    def test_tsql_table_valued_function_arguments_named_like_hint_pass(self, sql: str) -> None:
+        assert check_select_shape(sql, "TSQL") is None
+
+    def test_comment_as_does_not_hide_bare_tsql_hint(self) -> None:
+        sql = "SELECT * FROM orders -- AS\nTABLOCKX"
+        assert check_select_shape(sql, "TSQL") is not None
+
+    def test_mysql_executable_comment_rejected_but_string_literal_passes(self) -> None:
+        assert check_select_shape("SELECT /*!50000 SLEEP(10), */ 1", "MYSQL") is not None
+        assert (
+            check_select_shape(
+                "SELECT `metric\\` /*!50000 , SLEEP(10) */ FROM `orders`",
+                "MYSQL",
+            )
+            is not None
+        )
+        assert check_select_shape("SELECT '/*!50000 SLEEP(10) */'", "MYSQL") is None
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT 1",
+            "SELECT COUNT(*)",
+            "SELECT * FROM orders",
+        ],
+    )
+    def test_executable_select_without_or_with_from_passes(self, sql: str) -> None:
+        assert check_select_shape(sql, "POSTGRESQL") is None
 
     def test_count_fragment_rejected(self) -> None:
         error = check_select_shape("COUNT(*)", "TRINO")
@@ -275,17 +406,38 @@ class TestCheckSelectShape:
         assert check_select_shape(sql, "POSTGRESQL") is None
 
 
-# ── check_data_modifying: the hard block (#161) ──────────────────────────
+# ── Tier 1 execution contract ──────────────────────────────────────────
+
+
+class TestTier1ExecutionShape:
+    def test_prefers_trino_expression_for_execution_validation(self) -> None:
+        dialects = [
+            {"dialect": "TSQL", "expression": "SELECT TOP 10 [value] FROM [orders]"},
+            {"dialect": "TRINO", "expression": "SELECT value FROM orders LIMIT 10"},
+        ]
+
+        assert check_tier1_execution_shape(dialects) is None
+
+    def test_non_trino_fallback_must_parse_as_trino(self) -> None:
+        error = check_tier1_execution_shape([{"dialect": "TSQL", "expression": "SELECT TOP 10 [value] FROM [orders]"}])
+
+        assert error is not None
+        assert "Tier 1" in error
+        assert "TRINO" in error
+
+    def test_trino_compatible_first_fallback_passes(self) -> None:
+        dialects = [{"dialect": "POSTGRESQL", "expression": "SELECT SUM(amount) FROM orders"}]
+
+        assert check_tier1_execution_shape(dialects) is None
+
+
+# ── check_data_modifying: read-only enforcement (#161) ──────────────────
 
 
 class TestCheckDataModifying:
-    """#161: only DML/DDL is a hard block. A parse error or a non-SELECT
-    fragment is allowed through (it becomes a soft warning) because the serve
-    side independently blocks DML at execution and simply fails Tier-1 on a
-    fragment without crashing.
-    """
+    """DML/DDL is this helper's concern; statement shape is checked separately."""
 
-    # ── Allowed: fragments and parse errors are NOT the hard block ──────
+    # ── Delegated: shape validation handles fragments and parse errors ───
 
     @pytest.mark.parametrize("sql", ["COUNT(*)", "SUM(orders.total_amount)", "AVG(price)"])
     def test_fragment_is_allowed(self, sql: str) -> None:
@@ -538,10 +690,12 @@ class TestCheck2TableReferences:
         table_warnings = [w for w in result.warnings if w["check"] == "table_reference"]
         assert any("missing_table" in w["message"] for w in table_warnings)
 
-    def test_no_lookup_skips_table_check(self, valid_metric: dict) -> None:
+    def test_no_lookup_reports_unverified_table(self, valid_metric: dict) -> None:
         result = validate_metric(valid_metric, data_sources_lookup=None)
         table_warnings = [w for w in result.warnings if w["check"] == "table_reference"]
-        assert len(table_warnings) == 0
+        assert len(table_warnings) == 1
+        assert "was not verified" in table_warnings[0]["message"]
+        assert table_warnings[0]["details"]["verification"] == "unavailable"
 
 
 class TestSourceTableProvableAbsence:
@@ -579,12 +733,79 @@ class TestSourceTableProvableAbsence:
         assert len(errors) == 1
         assert "no_such_table" in errors[0]["message"]
 
+    def test_provable_absence_is_error_when_source_table_is_also_in_sql(self) -> None:
+        """The extracted-table loop must not hide declared sourceTable severity.
+
+        This is the common validate-before-create shape: SQL names the same table
+        as sourceTable. The dedicated create/update gate rejects a provably
+        absent sourceTable, so validate must report ERROR too.
+        """
+        lookup = self._enumerating_lookup(tables={"orders", "customers"})
+        metric = self._metric("no_such_table")
+        metric["expression"]["dialects"][0]["expression"] = "SELECT SUM(amount) FROM no_such_table"
+
+        result = validate_metric(metric, data_sources_lookup=lookup)
+
+        assert not result.valid
+        errors = [e for e in result.errors if e["check"] == "table_reference"]
+        assert len(errors) == 1
+        assert errors[0]["details"]["table"] == "no_such_table"
+
     def test_present_source_table_passes(self) -> None:
         lookup = self._enumerating_lookup(tables={"orders"})
         result = validate_metric(self._metric("Orders"), data_sources_lookup=lookup)
 
         assert result.valid
         assert not [e for e in result.errors if e["check"] == "table_reference"]
+
+    def test_schema_qualified_source_matches_known_bare_name(self) -> None:
+        lookup = self._enumerating_lookup(tables={"orders", "customers"})
+        result = validate_metric(self._metric("public.orders"), data_sources_lookup=lookup)
+
+        assert result.valid
+        assert not [e for e in result.errors if e["check"] == "table_reference"]
+
+    def test_schema_qualified_sql_uses_exact_catalog_name(self) -> None:
+        """Do not collapse a qualified reference to an ambiguous bare name."""
+
+        class _QualifiedLookup(MockDataSourceLookup):
+            def table_exists(self, data_source_id: str, table_name: str) -> bool:
+                return table_name.lower() == "sales.orders"
+
+            def catalog_available(self, data_source_id: str) -> bool:
+                return True
+
+            def known_tables(self, data_source_id: str) -> set[str]:
+                return {"sales.orders", "archive.orders"}
+
+        metric = self._metric("sales.orders")
+        metric["expression"]["dialects"][0]["expression"] = "SELECT SUM(amount) FROM sales.orders"
+
+        result = validate_metric(metric, data_sources_lookup=_QualifiedLookup(sources={"ds-abc123"}))
+
+        assert result.valid
+        assert not [w for w in result.warnings if w["check"] == "table_reference"]
+
+    def test_known_but_unresolved_source_stays_warning(self) -> None:
+        """Mirror create/update when an asset name is known but its approved
+        form is unresolved (unapproved or an ambiguous bare name)."""
+
+        class _UnresolvedKnownLookup(MockDataSourceLookup):
+            def table_exists(self, data_source_id: str, table_name: str) -> bool:
+                return False
+
+            def catalog_available(self, data_source_id: str) -> bool:
+                return True
+
+            def known_tables(self, data_source_id: str) -> set[str]:
+                return {"sales.orders", "archive.orders", "orders"}
+
+        lookup = _UnresolvedKnownLookup(sources={"ds-abc123"})
+        result = validate_metric(self._metric("orders"), data_sources_lookup=lookup)
+
+        assert result.valid
+        assert not [e for e in result.errors if e["check"] == "table_reference"]
+        assert [w for w in result.warnings if w["check"] == "table_reference"]
 
     def test_empty_catalog_stays_warning(self) -> None:
         """A COMPLETED source with no approved assets enumerates nothing —
@@ -914,11 +1135,13 @@ class TestCombinedValidation:
         assert len(check_types) >= 2  # At least table + ontology or column + ontology
 
     def test_validation_without_any_lookups(self, valid_metric: dict) -> None:
-        """Validation with no lookups only runs Check 1 (syntax)."""
+        """Validation without a catalog reports that metadata was not verified."""
         result = validate_metric(valid_metric)
         assert result.valid
         assert len(result.errors) == 0
-        assert len(result.warnings) == 0
+        assert len(result.warnings) == 1
+        assert result.warnings[0]["check"] == "table_reference"
+        assert result.warnings[0]["details"]["verification"] == "unavailable"
 
 
 # ── Concrete lookup resilience ──────────────────────────────────────────

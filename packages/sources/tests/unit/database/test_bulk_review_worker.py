@@ -35,6 +35,20 @@ from coa_common.domain_models import (  # noqa: E402
 )
 from coa_common.review_logic import apply_decision_to_table  # noqa: E402
 
+
+@pytest.fixture(autouse=True)
+def _no_rescan_backup_bucket():
+    """Pin ``_BUCKET_NAME`` to the value this module sees when run on its own.
+
+    ``worker`` reads ``BUCKET_NAME`` at import, and other test modules set it at
+    import time. When one of them is imported first, ``_delete_backup`` calls a
+    real S3 ``delete_object`` and swallows the failure. Tests of the backup blob
+    patch ``_BUCKET_NAME`` themselves.
+    """
+    with patch.object(worker, "_BUCKET_NAME", ""):
+        yield
+
+
 _NAMESPACE_ID = "550e8400-e29b-41d4-a716-446655440000"
 _SOURCE_ID = "src-db-001"
 
@@ -158,15 +172,22 @@ class TestParseMessage:
 
 @pytest.mark.unit
 class TestApplyDecisionToTable:
-    def test_pending_to_approved_flips_table_when_all_columns_terminal(self):
-        # Per-asset APPROVE now requires all columns to be terminal first.
+    def test_bulk_approve_flips_table_and_preserves_rejected_columns(self):
+        # This is the worker's mode: bulk approve is a default and keeps a
+        # deliberate per-column rejection.
         table = _make_table(status="PENDING_REVIEW", columns=[("c1", "APPROVED"), ("c2", "REJECTED")])
-        changed = apply_decision_to_table(table, "APPROVED")
+        changed = apply_decision_to_table(table, "APPROVED", bulk=True)
         assert changed is True
         assert table.business_metadata.review_status == "APPROVED"
-        # Terminal column decisions are preserved
         assert table.columns[0].business_metadata.review_status == "APPROVED"
         assert table.columns[1].business_metadata.review_status == "REJECTED"
+
+    def test_per_asset_approve_re_approves_rejected_columns(self):
+        # The per-table PUT .../review path re-approves what a table-level reject
+        # cascaded, so approve -> reject -> approve does not strand children.
+        table = _make_table(status="PENDING_REVIEW", columns=[("c1", "APPROVED"), ("c2", "REJECTED")])
+        apply_decision_to_table(table, "APPROVED", bulk=False)
+        assert [c.business_metadata.review_status for c in table.columns] == ["APPROVED", "APPROVED"]
 
     def test_approve_cascades_pending_columns(self):
         table = _make_table(status="PENDING_REVIEW", columns=[("c1", "PENDING_REVIEW"), ("c2", "APPROVED")])
@@ -175,12 +196,12 @@ class TestApplyDecisionToTable:
         statuses = {c.name: c.business_metadata.review_status for c in table.columns}
         assert statuses == {"c1": "APPROVED", "c2": "APPROVED"}
 
-    def test_approve_preserves_terminal_column_decisions(self):
+    def test_bulk_approve_preserves_terminal_column_decisions(self):
         table = _make_table(
             status="PENDING_REVIEW",
             columns=[("c1", "APPROVED"), ("c2", "REJECTED"), ("c3", "APPROVED")],
         )
-        apply_decision_to_table(table, "APPROVED")
+        apply_decision_to_table(table, "APPROVED", bulk=True)
         statuses = {c.name: c.business_metadata.review_status for c in table.columns}
         assert statuses == {"c1": "APPROVED", "c2": "REJECTED", "c3": "APPROVED"}
 

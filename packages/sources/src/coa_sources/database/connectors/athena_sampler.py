@@ -27,7 +27,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import boto3
 
-from .dialects import MAX_ENUM_DISTINCT, MIN_REPETITION_FACTOR, values_look_categorical
+from .dialects import (
+    MAX_ENUM_DISTINCT,
+    MIN_REPETITION_FACTOR,
+    PROBE_MAX_ROWS,
+    probe_gate_sql,
+    probe_values_sql,
+    values_look_categorical,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -208,8 +215,11 @@ class AthenaSampler:
         q_col = _quote_ident(col)
         where = f"WHERE {q_col} IS NOT NULL AND CAST({q_col} AS VARCHAR) <> ''"
 
-        # Gate query: total non-null rows + distinct count.
-        rows = self._run(f"SELECT COUNT(*), COUNT(DISTINCT {q_col}) FROM {q_table} {where}")
+        # Gate query: total non-null rows + distinct count, over a capped prefix.
+        # Shares probe_gate_sql with the JDBC dialects so Glue-backed sources get
+        # the same bound as direct connections — the two paths ran the same
+        # heuristic with separately written SQL, and only one of them was bounded.
+        rows = self._run(probe_gate_sql(q_col, q_table, where, row_cap=PROBE_MAX_ROWS))
         if not rows or not rows[0]:
             return []
         total = _to_int(rows[0][0])
@@ -219,7 +229,7 @@ class AthenaSampler:
         if not (1 <= distinct <= max_distinct and total >= MIN_REPETITION_FACTOR * distinct):
             return []
 
-        value_rows = self._run(f"SELECT DISTINCT {q_col} FROM {q_table} {where} LIMIT {max_distinct}")
+        value_rows = self._run(probe_values_sql(q_col, q_table, where, row_cap=PROBE_MAX_ROWS, limit=max_distinct))
         values = [str(r[0])[:100] for r in value_rows if r and r[0] is not None]
         # Value-shape backstop: drop low-cardinality free-text (long/multi-word).
         return values if values_look_categorical(values) else []

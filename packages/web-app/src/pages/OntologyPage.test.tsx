@@ -9,6 +9,7 @@ import {
   waitFor,
   cleanup,
   within,
+  act,
 } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { describe, it, expect, vi, beforeEach } from "vitest";
@@ -833,5 +834,263 @@ describe("Induction in-flight visibility + trigger lock (issue I-3f1f50cc)", () 
       const btn = screen.getByText("Start induction").closest("button");
       expect(btn).toHaveAttribute("aria-disabled", "true");
     });
+  });
+});
+
+describe("Ontology page — re-scanned-source warning", () => {
+  beforeEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+    listOntologies.mockResolvedValue([]);
+    listFoundationalOntologies.mockResolvedValue({ items: [] });
+    listProposals.mockResolvedValue([]);
+  });
+
+  const WARNING = /A re-scanned source has an out-of-date induction/;
+  const PENDING_WARNING = /A pending induction predates a re-scan/;
+
+  // One APPROVED database source (src-1) whose scan history has a resolved
+  // re-scan (REVIEW row with isRescan) at `rescanAt`. Other fetches stay empty.
+  function mockSourceRescannedAt(rescanAt: string) {
+    mockApiGet.mockImplementation((url: unknown) => {
+      const path = String(url);
+      if (path.includes("sourceType=DATABASE")) {
+        return Promise.resolve({
+          items: [{ sourceId: "src-1", name: "Orders DB", status: "APPROVED" }],
+        });
+      }
+      if (path.includes("/sources/src-1/scan")) {
+        return Promise.resolve({
+          items: [{ eventType: "REVIEW", isRescan: true, at: rescanAt }],
+        });
+      }
+      return Promise.resolve({ items: [] });
+    });
+  }
+
+  function inductionProposal(
+    sourceId: string,
+    createdAt: string,
+    status = "accepted",
+  ) {
+    return {
+      proposal_id: `p-${status}-${createdAt}`,
+      proposal_type: "induction",
+      status,
+      created_at: createdAt,
+      metadata: { datasource_ids: [sourceId] },
+    };
+  }
+
+  async function awaitScanFetched() {
+    await waitFor(() =>
+      expect(mockApiGet).toHaveBeenCalledWith(
+        expect.stringContaining("/sources/src-1/scan"),
+      ),
+    );
+    await waitFor(() => expect(listProposals).toHaveBeenCalled());
+    // The banner state is set inside a Promise.all(...).then(...) that resolves
+    // several microtasks after the scan fetch is issued (and listProposals is
+    // also called by a separate effect, so the wait above does not sync this
+    // chain). A macrotask boundary drains all pending microtasks, so after this
+    // the staleness callback has run and re-rendered — otherwise a "does NOT
+    // warn" assertion could run first and pass vacuously.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+  }
+
+  it("warns when the source was re-scanned after its latest induction", async () => {
+    mockSourceRescannedAt("2026-06-01T00:00:00Z");
+    listProposals.mockResolvedValue([
+      inductionProposal("src-1", "2026-01-01T00:00:00Z"), // induction is older
+    ]);
+    renderPage();
+    await screen.findByText(WARNING);
+    // The banner names the stale source.
+    await screen.findByText(/Orders DB/);
+  });
+
+  it("lists every stale source when multiple were re-scanned after induction", async () => {
+    mockApiGet.mockImplementation((url: unknown) => {
+      const path = String(url);
+      if (path.includes("sourceType=DATABASE")) {
+        return Promise.resolve({
+          items: [
+            { sourceId: "src-1", name: "Orders DB", status: "APPROVED" },
+            { sourceId: "src-2", name: "Payments DB", status: "APPROVED" },
+          ],
+        });
+      }
+      if (
+        path.includes("/sources/src-1/scan") ||
+        path.includes("/sources/src-2/scan")
+      ) {
+        return Promise.resolve({
+          items: [
+            { eventType: "REVIEW", isRescan: true, at: "2026-06-01T00:00:00Z" },
+          ],
+        });
+      }
+      return Promise.resolve({ items: [] });
+    });
+    listProposals.mockResolvedValue([
+      inductionProposal("src-1", "2026-01-01T00:00:00Z"), // both older
+      inductionProposal("src-2", "2026-01-01T00:00:00Z"),
+    ]);
+    renderPage();
+    // Both stale sources appear together, comma-joined, in one banner.
+    await screen.findByText(/Orders DB, Payments DB/);
+  });
+
+  it("does NOT warn when the source was re-induced after the re-scan", async () => {
+    mockSourceRescannedAt("2026-06-01T00:00:00Z");
+    listProposals.mockResolvedValue([
+      inductionProposal("src-1", "2026-06-02T00:00:00Z"), // induction is newer
+    ]);
+    renderPage();
+    await awaitScanFetched();
+    expect(screen.queryByText(WARNING)).toBeNull();
+  });
+
+  it("does NOT warn when the re-scanned source has no induction", async () => {
+    mockSourceRescannedAt("2026-06-01T00:00:00Z");
+    listProposals.mockResolvedValue([]); // nothing induced this source
+    renderPage();
+    await awaitScanFetched();
+    expect(screen.queryByText(WARNING)).toBeNull();
+  });
+
+  it("does NOT warn when the source has no resolved re-scan", async () => {
+    mockApiGet.mockImplementation((url: unknown) => {
+      const path = String(url);
+      if (path.includes("sourceType=DATABASE")) {
+        return Promise.resolve({
+          items: [{ sourceId: "src-1", name: "Orders DB", status: "APPROVED" }],
+        });
+      }
+      if (path.includes("/sources/src-1/scan")) {
+        return Promise.resolve({
+          items: [
+            { eventType: "SCAN" },
+            { eventType: "REVIEW", isRescan: false },
+          ],
+        });
+      }
+      return Promise.resolve({ items: [] });
+    });
+    listProposals.mockResolvedValue([
+      inductionProposal("src-1", "2026-01-01T00:00:00Z"),
+    ]);
+    renderPage();
+    await awaitScanFetched();
+    expect(screen.queryByText(WARNING)).toBeNull();
+  });
+
+  it("warns (pending) when a PENDING induction predates the re-scan", async () => {
+    mockSourceRescannedAt("2026-06-01T00:00:00Z");
+    listProposals.mockResolvedValue([
+      inductionProposal("src-1", "2026-01-01T00:00:00Z", "pending"), // older
+    ]);
+    renderPage();
+    await screen.findByText(PENDING_WARNING);
+    // The banner names the source, and it is the pending message — not the
+    // accepted-induction one.
+    await screen.findByText(/Orders DB/);
+    expect(screen.queryByText(WARNING)).toBeNull();
+  });
+
+  it("does NOT warn when a PENDING induction postdates the re-scan", async () => {
+    mockSourceRescannedAt("2026-06-01T00:00:00Z");
+    listProposals.mockResolvedValue([
+      inductionProposal("src-1", "2026-06-02T00:00:00Z", "pending"), // newer
+    ]);
+    renderPage();
+    await awaitScanFetched();
+    expect(screen.queryByText(PENDING_WARNING)).toBeNull();
+    expect(screen.queryByText(WARNING)).toBeNull();
+  });
+
+  it("does NOT warn when a newer PENDING re-induction follows a stale accepted one", async () => {
+    mockSourceRescannedAt("2026-06-01T00:00:00Z");
+    listProposals.mockResolvedValue([
+      inductionProposal("src-1", "2026-01-01T00:00:00Z", "accepted"), // stale
+      inductionProposal("src-1", "2026-06-02T00:00:00Z", "pending"), // fresh
+    ]);
+    renderPage();
+    await awaitScanFetched();
+    expect(screen.queryByText(WARNING)).toBeNull();
+    expect(screen.queryByText(PENDING_WARNING)).toBeNull();
+  });
+
+  it("does NOT warn when the only induction is for a different datasource", async () => {
+    mockSourceRescannedAt("2026-06-01T00:00:00Z");
+    listProposals.mockResolvedValue([
+      inductionProposal("other-src", "2026-01-01T00:00:00Z"), // not src-1
+    ]);
+    renderPage();
+    await awaitScanFetched();
+    expect(screen.queryByText(WARNING)).toBeNull();
+    expect(screen.queryByText(PENDING_WARNING)).toBeNull();
+  });
+
+  it("treats a numeric epoch-seconds re-scan time as stale vs an older induction", async () => {
+    // Real scan histories deliver `at` as epoch SECONDS (a number), not ISO.
+    const rescanEpochSeconds = Math.floor(
+      Date.parse("2026-06-01T00:00:00Z") / 1000,
+    );
+    mockApiGet.mockImplementation((url: unknown) => {
+      const path = String(url);
+      if (path.includes("sourceType=DATABASE")) {
+        return Promise.resolve({
+          items: [{ sourceId: "src-1", name: "Orders DB", status: "APPROVED" }],
+        });
+      }
+      if (path.includes("/sources/src-1/scan")) {
+        return Promise.resolve({
+          items: [
+            { eventType: "REVIEW", isRescan: true, at: rescanEpochSeconds },
+          ],
+        });
+      }
+      return Promise.resolve({ items: [] });
+    });
+    listProposals.mockResolvedValue([
+      inductionProposal("src-1", "2026-01-01T00:00:00Z"), // older than re-scan
+    ]);
+    renderPage();
+    await screen.findByText(WARNING);
+  });
+
+  it("shows both banners when one source is accepted-stale and another pending-stale", async () => {
+    mockApiGet.mockImplementation((url: unknown) => {
+      const path = String(url);
+      if (path.includes("sourceType=DATABASE")) {
+        return Promise.resolve({
+          items: [
+            { sourceId: "src-1", name: "Orders DB", status: "APPROVED" },
+            { sourceId: "src-2", name: "Payments DB", status: "APPROVED" },
+          ],
+        });
+      }
+      if (
+        path.includes("/sources/src-1/scan") ||
+        path.includes("/sources/src-2/scan")
+      ) {
+        return Promise.resolve({
+          items: [
+            { eventType: "REVIEW", isRescan: true, at: "2026-06-01T00:00:00Z" },
+          ],
+        });
+      }
+      return Promise.resolve({ items: [] });
+    });
+    listProposals.mockResolvedValue([
+      inductionProposal("src-1", "2026-01-01T00:00:00Z", "accepted"),
+      inductionProposal("src-2", "2026-01-01T00:00:00Z", "pending"),
+    ]);
+    renderPage();
+    await screen.findByText(WARNING);
+    await screen.findByText(PENDING_WARNING);
   });
 });

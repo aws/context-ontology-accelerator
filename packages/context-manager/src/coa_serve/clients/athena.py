@@ -27,6 +27,7 @@ import boto3
 import sqlglot
 import structlog
 from coa_common import resolve_region, sync_boto_config
+from coa_common.constants import CONNECTOR_BACKED_SUB_TYPES, DatabaseSubType
 
 from ..query_utils import validate_namespace
 from ..tier2.sql_firewall import NamespaceSQLScopeError, SQLFirewall
@@ -57,14 +58,42 @@ _POLL_BACKOFF = 2.0
 _DEFAULT_TIMEOUT = 120
 
 
-# Sub-type of a source backed by a customer-authored Athena federation connector.
-# Compared as a string rather than importing the control-plane enum: serve does not
-# depend on that package, and the value is the DynamoDB attribute's own contract.
-_CUSTOM_CONNECTOR_SUB_TYPE = "CUSTOM_CONNECTOR"
+# Sub-type strings as recorded in a source row's ``sourceSubType`` attribute. Derived
+# from ``coa_common.constants``, which mirrors the Smithy enum for consumers — serve
+# among them — that do not depend on the generated control-plane package.
+_CUSTOM_CONNECTOR_SUB_TYPE = DatabaseSubType.CUSTOM_CONNECTOR.value
+_DATABRICKS_SUB_TYPE = DatabaseSubType.DATABRICKS_SQL_WAREHOUSE.value
+_JDBC_SUB_TYPE = DatabaseSubType.JDBC_DATABASE.value
 
-# Sub-type of a source reached through a managed Glue federated catalog. Compared
-# as a string for the same reason as above.
-_JDBC_SUB_TYPE = "JDBC_DATABASE"
+# Only reached below by a LEGACY row: `POST /sources` used to copy the caller's
+# `glueConfiguration.athenaDataCatalogName` into the top-level system attribute and no
+# longer does.
+_GLUE_SUB_TYPE = DatabaseSubType.GLUE_DATABASE.value
+
+# Sub-types whose recorded database is a real database inside their own catalog, so the
+# configured value is the right thing to send as Athena's `Database`. The one exclusion is
+# federated JDBC, whose `databaseName` is its database while its federated catalog is keyed
+# by SCHEMA — `postgres` would be sent where `public` belongs.
+#
+# Written as a positive membership rather than as an exclusion of JDBC, and the membership
+# is the full set of values that can reach here, NOT just the connector-backed ones:
+# narrowing it would change behaviour for a legacy Glue row whose scan found zero tables,
+# which resolved its configured Glue database and would start resolving `public`. A row
+# with no `sourceSubType` is also a legacy row and keeps the same treatment.
+#
+# So the only value this refuses that the old JDBC exclusion admitted is a sub-type that
+# does not exist yet, which is the hardening.
+_OWN_DATABASE_SUB_TYPES = CONNECTOR_BACKED_SUB_TYPES | {_GLUE_SUB_TYPE}
+
+# Log label per sub-type for the ``catalog_resolution`` event. A sub-type absent here
+# logs as `glue_nested` via the ``.get`` default below with nothing raised, which is
+# right ONLY for native Glue in a nested catalog and for a row whose attribute is
+# missing — hence the tripwire in ``tests/unit/test_athena_executor.py``.
+_CATALOG_PATH_LABELS = {
+    _CUSTOM_CONNECTOR_SUB_TYPE: "custom_connector",
+    _DATABRICKS_SUB_TYPE: "databricks_sql_warehouse",
+    _JDBC_SUB_TYPE: "federated",
+}
 
 # Athena's name for the account's root Glue Data Catalog, and the value it assumes
 # when QueryExecutionContext.Catalog is omitted. A source recording this as its
@@ -85,8 +114,9 @@ class _CatalogContext:
 
     True for the federated-JDBC path, whose R2RML names come from a Glue crawler
     and carry a ``{schema}_`` prefix the connector does not know. False for a
-    custom connector, where the same substring strip would corrupt a legitimate
-    table name that happens to start with its database name.
+    connector-backed source (``CONNECTOR_BACKED_SUB_TYPES``), where the same
+    substring strip would corrupt a legitimate table name that happens to start
+    with its database name.
     """
 
 
@@ -610,11 +640,12 @@ class AthenaQueryExecutor:
         the actual PG table name (income). When VKG provides physical names
         via datasourceRouting, this becomes a no-op.
 
-        Only called for federated JDBC sources. Custom-connector sources are
-        excluded (see ``_CatalogContext.rewrite_crawled_names``) because for them
-        this is not a no-op but a corruption: a real table named ``sales_orders``
-        in database ``sales`` would be rewritten to ``orders``, a name its
-        connector has never heard of.
+        Only called for federated JDBC sources. Connector-backed sources — every
+        sub-type in ``CONNECTOR_BACKED_SUB_TYPES`` — are excluded (see
+        ``_CatalogContext.rewrite_crawled_names``) because for them this is not a
+        no-op but a corruption: a real table named ``sales_orders`` in database
+        ``sales`` would be rewritten to ``orders``, a name its connector has never
+        heard of.
         """
         if not schema:
             return sql
@@ -736,39 +767,43 @@ class AthenaQueryExecutor:
                 caller_declared = True
         if federated_catalog:
             sub_type = source.get("sourceSubType") or ""
-            is_custom_connector = sub_type == _CUSTOM_CONNECTOR_SUB_TYPE
-            is_jdbc = sub_type == _JDBC_SUB_TYPE
+            is_connector_backed = sub_type in CONNECTOR_BACKED_SUB_TYPES
+            # Whether this source resolves its own database, as opposed to being
+            # keyed by a Glue-crawled schema. Keyed POSITIVELY on the kinds that do
+            # (see `_OWN_DATABASE_SUB_TYPES`) rather than on "is not federated JDBC",
+            # so the `public` fallback below is reached by NAMING the federated-JDBC
+            # path — it is that path's engines' default schema, not a general default.
+            #
+            # `not sub_type` keeps a legacy row that predates the attribute on its
+            # historical resolution: it is a Glue or JDBC source, and for a JDBC one
+            # the outcome is unchanged either way, since a row with no sub-type took
+            # this arm before this set existed.
+            resolves_own_database = sub_type in _OWN_DATABASE_SUB_TYPES or caller_declared or not sub_type
             discovered = source.get("discoveredSchemas") or []
             if discovered:
                 schema = discovered[0]
                 schema_source = "discoveredSchemas"
-            elif not is_jdbc and (
+            elif resolves_own_database and (
                 configured_database := (
                     source.get("athenaDatabase") or self._sources.parse_configuration(source).get("databaseName", "")
                 )
             ):
-                # A custom-connector source, and a Glue source in a nested catalog,
+                # A connector-backed source, and a Glue source in a nested catalog,
                 # are each scoped to exactly one database and record it at
-                # onboarding, so use that rather than a hardcoded default that has
-                # nothing to do with either. Reachable when a scan discovered zero
-                # tables (an over-narrow table filter, or a connector exposing
-                # none).
-                #
-                # Excluded for federated JDBC, where the configured value is the
-                # wrong kind of name: a JDBC source's `databaseName` is its
-                # database, while the federated catalog is keyed by SCHEMA, so
-                # `postgres` would be sent where `public` belongs.
+                # onboarding, so use that rather than a default that has nothing to
+                # do with either. Reachable when a scan discovered zero tables.
                 schema = configured_database
                 schema_source = "configuredDatabase"
             else:
                 # `public` is the default schema of the engines the federated-JDBC
-                # path serves (PostgreSQL, Redshift). It is not a name the other two
-                # kinds would answer to, which is why they resolve above.
+                # path serves (PostgreSQL, Redshift). It is not a name a
+                # connector-backed source or a nested Glue catalog would answer to,
+                # which is why they resolve above.
                 schema = "public"
                 schema_source = "default"
             logger.info(
                 "catalog_resolution",
-                path=("custom_connector" if is_custom_connector else "federated" if is_jdbc else "glue_nested"),
+                path=_CATALOG_PATH_LABELS.get(sub_type, "glue_nested"),
                 catalog=federated_catalog,
                 schema=schema,
                 schema_source=schema_source,
@@ -779,10 +814,12 @@ class AthenaQueryExecutor:
                 database=schema,
                 # The crawled-name rewrite exists for R2RML names produced by a
                 # Glue crawler on the federated-JDBC path. It substring-strips a
-                # `{schema}_` prefix from every table name, which for a custom
-                # connector is not a no-op but a corruption: a genuine table named
-                # `sales_orders` in database `sales` would be rewritten to
-                # `orders`, a table its connector has never heard of.
+                # `{schema}_` prefix from every table name, which for a
+                # connector-backed source is not a no-op but a corruption: a genuine
+                # table named `sales_orders` in database `sales` would be rewritten
+                # to `orders`, a table its connector has never heard of. The gate is SET
+                # MEMBERSHIP because an exact comparison against one sub-type silently
+                # corrupts every other connector-backed one.
                 #
                 # A caller-declared nested catalog is excluded for exactly that
                 # reason. It is a NATIVE Glue source: its R2RML is generated from
@@ -792,7 +829,7 @@ class AthenaQueryExecutor:
                 # name. Excluding it also keeps this flag's value unchanged for
                 # every row that reaches here via `athenaDataCatalogName`, which is
                 # every row that predates the caller-declared path.
-                rewrite_crawled_names=not is_custom_connector and not caller_declared,
+                rewrite_crawled_names=not is_connector_backed and not caller_declared,
             )
 
         # Glue-native path: use athenaCatalog/athenaDatabase if available

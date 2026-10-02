@@ -2,9 +2,9 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Migrate existing JDBC credential secrets onto the ``<prefix>:namespace`` binding.
+"""Migrate existing credential secrets onto the ``<prefix>:namespace`` binding.
 
-A JDBC source's credential secret must carry a ``<prefix>:namespace`` tag whose
+A credential secret must carry a ``<prefix>:namespace`` tag whose
 value lists the namespace that owns the source (see ``coa_common.constants`` for
 the key derivation and the strict value format). That is enforced at
 registration, on update, and — since the scan-time re-check — on **every scan**.
@@ -12,7 +12,12 @@ So a secret that predates the rule does not merely block edits: the source's nex
 scan fails until its namespace is listed. This script closes that gap for an
 existing deployment.
 
-It reads the sources table, resolves each JDBC source's credential secret, and
+Both sub-types that hold a credential secret are covered. ``DATABRICKS_SQL_WAREHOUSE``
+is here for repair rather than migration — its secrets are bound at registration,
+so none predates the rule — but a tag edited out of band leaves the source
+unscannable in exactly the same way.
+
+It reads the sources table, resolves each source's credential secret, and
 reports what the binding requires. ``--apply`` then writes the tag. It is
 idempotent: a second run over a migrated deployment reports everything ``ok`` and
 changes nothing.
@@ -104,7 +109,9 @@ from coa_common.constants import (  # noqa: E402
     parse_namespace_tag,
 )
 
-JDBC_SUB_TYPE = "JDBC_DATABASE"
+# Sub-types whose configuration carries a `credentialSecretArn` governed by the
+# namespace binding.
+CREDENTIAL_SUB_TYPES = frozenset({"JDBC_DATABASE", "DATABRICKS_SQL_WAREHOUSE"})
 
 # Secrets Manager caps a tag VALUE at 256 characters.
 TAG_VALUE_MAX = 256
@@ -116,7 +123,7 @@ _STATUS_ORDER = (*_BLOCKING, "needs-tag", "cross-account", "ok")
 
 @dataclass
 class SecretRef:
-    """One credential secret and every JDBC source that points at it."""
+    """One credential secret and every source that points at it."""
 
     arn: str
     namespaces: set[str] = field(default_factory=set)
@@ -140,8 +147,8 @@ class SecretRef:
         return self.arn.split(":secret:")[-1] or self.arn
 
 
-def _iter_jdbc_sources(table: str, region: str):
-    """Yield ``(namespaceId, sourceName, credentialSecretArn)`` for every JDBC source.
+def _iter_credential_sources(table: str, region: str):
+    """Yield ``(namespaceId, sourceName, credentialSecretArn)`` per credential-holding source.
 
     A full table scan is right here: this runs once per deployment as a migration,
     the table holds sources (tens to low thousands), and there is no index on
@@ -159,7 +166,7 @@ def _iter_jdbc_sources(table: str, region: str):
     for page in ddb.get_paginator("scan").paginate(TableName=table):
         for raw in page.get("Items", []):
             item = {k: deserializer.deserialize(v) for k, v in raw.items()}
-            if item.get("sourceSubType") != JDBC_SUB_TYPE:
+            if item.get("sourceSubType") not in CREDENTIAL_SUB_TYPES:
                 continue
             config: Any = item.get("configuration") or "{}"
             if isinstance(config, str):
@@ -178,7 +185,7 @@ def _iter_jdbc_sources(table: str, region: str):
 
 def _collect(table: str, region: str) -> dict[str, SecretRef]:
     refs: dict[str, SecretRef] = {}
-    for namespace_id, name, arn in _iter_jdbc_sources(table, region):
+    for namespace_id, name, arn in _iter_credential_sources(table, region):
         ref = refs.setdefault(arn, SecretRef(arn=arn))
         ref.namespaces.add(namespace_id)
         ref.sources.append((namespace_id, name))
@@ -267,7 +274,7 @@ def _report(refs: dict[str, SecretRef], applied: bool, tag_key: str) -> None:
     for ref in refs.values():
         by_status[ref.status].append(ref)
 
-    print(f"\n{len(refs)} credential secret(s) referenced by JDBC sources; tag key {tag_key!r}\n")
+    print(f"\n{len(refs)} credential secret(s) referenced by database sources; tag key {tag_key!r}\n")
     for status in _STATUS_ORDER:
         rows = sorted(by_status.get(status, []), key=lambda r: r.short)
         if not rows:
@@ -326,7 +333,7 @@ def main() -> int:
 
     refs = _collect(args.table, args.region)
     if not refs:
-        print("\nNo JDBC sources with a credential secret — nothing to migrate.\n")
+        print("\nNo sources with a credential secret — nothing to migrate.\n")
         return 0
 
     _classify(refs, account, args.region, tag_key)

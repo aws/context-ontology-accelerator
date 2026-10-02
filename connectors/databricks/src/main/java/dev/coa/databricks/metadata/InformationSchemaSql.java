@@ -92,13 +92,17 @@ public final class InformationSchemaSql
                 + " AND table_name = ?";
     }
 
-    /** One table's columns, types and comments. */
+    /** One table's columns, types, nullability and comments. */
     // full_data_type, not data_type: the latter drops a decimal's precision and scale, turning
     // DECIMAL(38,9) into a default-scaled decimal and changing every value in the column.
+    //
+    // is_nullable rides along because it is the only route the fact has: Athena's Column type has no
+    // nullability field and DESCRIBE returns name, type and comment, so it reaches COA as a @notnull tag
+    // inside the comment or not at all. Databricks answers 'YES' or 'NO'.
     public static String columns(String catalog)
     {
         // ordinal_position is 0-based here. Only sorting on it, so that's fine.
-        return "SELECT column_name, full_data_type, comment"
+        return "SELECT column_name, full_data_type, is_nullable, comment"
                 + " FROM " + informationSchema(catalog) + ".columns"
                 + " WHERE table_catalog = ?"
                 + " AND table_schema = ?"

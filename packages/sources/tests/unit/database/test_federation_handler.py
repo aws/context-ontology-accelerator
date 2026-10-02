@@ -15,6 +15,8 @@ import coa_sources.database.pipeline.federation_handler  # noqa: F401
 import pytest
 from coa_sources.database import glue_ownership as _go
 
+from tests.unit.conftest import dao_double  # noqa: E402
+
 MODULE = "coa_sources.database.pipeline.federation_handler"
 PROVISIONER = "coa_sources.database.connectors.glue_connection_provisioner"
 
@@ -67,7 +69,7 @@ _JDBC_ITEM = {
 
 
 def _patch_dao(item):
-    dao = MagicMock()
+    dao = dao_double()
     dao.get.return_value = item
     return patch(f"{MODULE}._get_dao", return_value=dao), dao
 
@@ -240,6 +242,7 @@ class TestFederationHandler:
             ctx,
             patch(f"{MODULE}.provision_federated_catalog") as prov,
             patch(f"{MODULE}._consumer_role_arn", return_value="arn:aws:iam::123:role/consumer"),
+            patch(f"{MODULE}._grant_secret_read_to_consumer"),
             patch(f"{MODULE}.grant_consumer_select", return_value=False) as grant,
         ):
             prov.return_value = {"glueConnectionName": "c", "athenaDataCatalogName": "cat"}
@@ -320,6 +323,7 @@ class TestFederationHandler:
             ctx,
             patch(f"{MODULE}.provision_federated_catalog") as prov,
             patch(f"{MODULE}._consumer_role_arn", return_value="arn:aws:iam::123:role/consumer"),
+            patch(f"{MODULE}._grant_secret_read_to_consumer"),
             patch(f"{MODULE}.grant_iam_allowed_principals", return_value=True) as iam_grant,
             patch(f"{MODULE}.grant_consumer_select", return_value=True) as grant,
         ):
@@ -367,7 +371,7 @@ class TestCustomConnectorBranch:
         ctx, dao = _patch_dao(dict(self._ITEM))
         with ctx:
             out = handler(_EVENT)
-        assert out == {"provisioned": False, "reason": "custom-connector", "queryable": True}
+        assert out == {"provisioned": False, "reason": "connector-backed", "queryable": True}
         assert dao.update.call_args.kwargs["update_fields"] == {"queryable": True}
         # Guards against a concurrently-deleted row being resurrected.
         assert dao.update.call_args.kwargs["condition"] == "attribute_exists(PK)"
@@ -401,6 +405,63 @@ class TestCustomConnectorBranch:
         # re-scan retries.
         with ctx, pytest.raises(RuntimeError):
             handler(_EVENT)
+
+
+class TestDatabricksBranch:
+    """The same branch as CUSTOM_CONNECTOR, reached through the shared set.
+
+    This is one of the two switches that FAILED OPEN. Adding the sub-type to
+    ``_HANDLED_SUB_TYPES`` only silences the tripwire below; the write that flips
+    ``queryable`` was a separate exact-equality comparison, and anything else fell
+    through to a ``not JDBC_DATABASE`` no-op returning ``not-jdbc``. Create persists
+    ``queryable: False`` and discovery writes it only for GLUE_DATABASE — so a source
+    that missed this branch would scan cleanly, resolve no catalog at serve, and be
+    skipped by ``sql_namespace_scope``, which also silently defeats the namespace-scope
+    requirement this sub-type depends on.
+    """
+
+    _ITEM = {"sourceSubType": "DATABRICKS_SQL_WAREHOUSE", "athenaDataCatalogName": "coadevds_abc123"}
+
+    def test_marks_the_source_queryable(self):
+        from coa_sources.database.pipeline.federation_handler import handler
+
+        ctx, dao = _patch_dao(dict(self._ITEM))
+        with ctx:
+            out = handler(_EVENT)
+        assert out == {"provisioned": False, "reason": "connector-backed", "queryable": True}
+        assert dao.update.call_args.kwargs["update_fields"] == {"queryable": True}
+
+    def test_makes_no_grant_of_any_kind(self):
+        """Not because there is nothing to grant on — there is a credential — but
+        because COA never holds a grant on it. The connector assumes the CUSTOMER's role
+        at request time, so there is nothing to grant here and nothing to revoke at
+        delete."""
+        from coa_sources.database.pipeline.federation_handler import handler
+
+        ctx, _ = _patch_dao(dict(self._ITEM))
+        with (
+            ctx,
+            patch(f"{MODULE}.provision_federated_catalog") as prov,
+            patch(f"{MODULE}.grant_consumer_select") as grant,
+            patch(f"{MODULE}.grant_consumer_select_native") as grant_native,
+            patch(f"{MODULE}.grant_iam_allowed_principals") as iam_grant,
+            patch(f"{MODULE}._grant_secret_read_to_consumer") as secret_grant,
+        ):
+            handler(_EVENT)
+        prov.assert_not_called()
+        grant.assert_not_called()
+        grant_native.assert_not_called()
+        iam_grant.assert_not_called()
+        secret_grant.assert_not_called()
+
+    def test_does_not_fall_through_to_the_not_jdbc_no_op(self):
+        from coa_sources.database.pipeline.federation_handler import handler
+
+        ctx, dao = _patch_dao(dict(self._ITEM))
+        with ctx:
+            out = handler(_EVENT)
+        assert out["reason"] != "not-jdbc"
+        dao.update.assert_called_once()
 
 
 class TestUnhandledSubType:

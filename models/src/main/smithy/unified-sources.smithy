@@ -101,6 +101,35 @@ string FilterPattern
 @length(min: 20, max: 2048)
 string SecretArn
 
+/// Databricks workspace hostname. Mirrors ConnectionConfig.WORKSPACE_HOSTNAME in
+/// the connector's Java, which already accepts all three clouds. Patterned rather
+/// than left a free string because the value reaches a `;`-delimited JDBC property
+/// list, where a `;` would inject driver properties (SSL=0, ProxyHost, LogPath).
+@pattern("^[a-z0-9][a-z0-9.-]*\\.(cloud\\.databricks\\.com|azuredatabricks\\.net|gcp\\.databricks\\.com)$")
+@length(min: 1, max: 512)
+string DatabricksWorkspaceHostname
+
+/// SQL Warehouse HTTP path — the Databricks analogue of a port. Both spellings
+/// Databricks issues are accepted; `endpoints` is the older form.
+@pattern("^/sql/1\\.0/(warehouses|endpoints)/[a-zA-Z0-9]+$")
+@length(min: 1, max: 256)
+string DatabricksHttpPath
+
+/// Unity Catalog catalog name. An identifier, because the connector interpolates
+/// it into `information_schema` SQL.
+@pattern("^[a-zA-Z_][a-zA-Z0-9_]*$")
+@length(min: 1, max: 255)
+string DatabricksCatalogName
+
+/// Unity Catalog schema name. NOT DatabaseName, which is @length-only: this value
+/// is interpolated into the connector's information_schema SQL, must be
+/// addressable unquoted through both of Athena's parsers (SHOW/DESCRIBE accept
+/// backticks and reject double quotes; SELECT the reverse), and is a candidate for
+/// the driver's ConnSchema property — so it must be an identifier.
+@pattern("^[a-zA-Z_][a-zA-Z0-9_]*$")
+@length(min: 1, max: 255)
+string DatabricksSchemaName
+
 /// AWS Lambda function ARN, optionally qualified with a version number, an
 /// alias, or `$LATEST`. Format:
 /// arn:{partition}:lambda:{region}:{account-id}:function:{name}[:{qualifier}]
@@ -297,6 +326,81 @@ structure CustomConnectorConfiguration {
     /// serving several databases is onboarded once per database.
     @required
     databaseName: DatabaseName
+
+    /// Include-filter applied to table names within databaseName. Omit to
+    /// discover every table.
+    tableFilter: FilterPattern
+
+    /// Exclude-filter applied to table names within databaseName, evaluated
+    /// after tableFilter.
+    tableExcludeFilter: FilterPattern
+}
+
+/// Databricks SQL Warehouse source — the DATABRICKS_SQL_WAREHOUSE sub-type.
+/// Discovery and queries both run through Athena against a connector Lambda this
+/// service deploys, which resolves this configuration from the Athena catalog
+/// name it is invoked under. Nothing here is deployed by the customer.
+///
+/// Its own shape rather than an extra DatabaseEngine on JdbcConfiguration, whose
+/// @required `host`/`port` have no meaning for a warehouse addressed by an HTTP
+/// path and which has no place for the Unity Catalog catalog.
+structure DatabricksSqlWarehouseConfiguration {
+    /// Databricks workspace host, e.g. `dbc-a1b2345c-d6e7.cloud.databricks.com`.
+    /// A PrivateLink-only workspace is not reachable: the connector runs outside
+    /// any customer VPC.
+    @required
+    workspaceHostname: DatabricksWorkspaceHostname
+
+    /// SQL Warehouse HTTP path. The Databricks analogue of a port.
+    @required
+    httpPath: DatabricksHttpPath
+
+    /// Unity Catalog catalog pinned for this source. Lowercased at registration:
+    /// `information_schema` stores identifiers lowercase.
+    @required
+    databricksCatalog: DatabricksCatalogName
+
+    /// Unity Catalog schema this source exposes. Exactly one per source — the same
+    /// one-database-per-source model GlueConfiguration and
+    /// CustomConnectorConfiguration use. Lowercased at registration.
+    @required
+    databaseName: DatabricksSchemaName
+
+    /// Secret holding {"token": ...} for a personal access token, or
+    /// {"client_id": ..., "client_secret": ...} for OAuth machine-to-machine. The
+    /// shape selects the auth mode, so a customer cannot declare one mode and
+    /// store the other. Reachable only through crossAccountRoleArn, so its ACCOUNT
+    /// is unconstrained; it must be readable by that role and live in the
+    /// deployment region (Athena does not support cross-Region federated queries).
+    ///
+    /// Note an AWS constraint this service can neither impose nor relax: a secret
+    /// in a different account from the role must be encrypted with a
+    /// CUSTOMER-MANAGED key, because `aws/secretsmanager` cannot be shared across
+    /// accounts by any policy.
+    @required
+    credentialSecretArn: SecretArn
+
+    /// Customer-owned IAM role the connector assumes to read
+    /// credentialSecretArn. Same member name, type and meaning as on
+    /// JdbcConfiguration and GlueConfiguration, and @required here rather than
+    /// optional: the connector holds no Secrets Manager permission of its own, so
+    /// there is no direct-read fallback.
+    ///
+    /// Its trust policy must name the connector role and condition on
+    /// NamespaceDetail$datasourceExternalId; its permission policy grants
+    /// GetSecretValue on that one secret, plus kms:Decrypt if the secret uses a
+    /// customer-managed key.
+    ///
+    /// The role MUST be named {RESOURCE_PREFIX}datasource-access-*, because this
+    /// deployment's assume grant is scoped to that prefix, so registration rejects
+    /// any other name explicitly rather than letting it fail as an opaque
+    /// AccessDenied at first scan. Its ACCOUNT is unconstrained.
+    ///
+    /// There is no externalId member: a caller-supplied ExternalId is the
+    /// vulnerability it was meant to close, so the value is derived from the
+    /// namespace.
+    @required
+    crossAccountRoleArn: IamRoleArn
 
     /// Include-filter applied to table names within databaseName. Omit to
     /// discover every table.
@@ -617,6 +721,17 @@ structure TableSummary {
     /// in the Review status column.
     columnsPendingDeletion: Integer
 
+    /// Number of inferred foreign keys on this table with
+    /// ``reviewStatus=PENDING_REVIEW`` — relationships that a cross-source
+    /// inference pass has proposed and a steward has not yet decided on.
+    /// Non-zero on tables whose parent source is already ``APPROVED``
+    /// signals that the source's Approve button has already been clicked
+    /// but a later cross-source pass has since found new relationships to
+    /// review; the steward can drill in per-table and use per-relationship
+    /// review (``PATCH /keys``) or per-table Approve to settle them.
+    /// Absent when zero to keep response bodies small.
+    pendingRelationships: Integer
+
     @required
     reviewStatus: ReviewStatus
 
@@ -836,6 +951,14 @@ enum SourceSubType {
     /// Athena data catalog and queried through Athena
     CUSTOM_CONNECTOR
 
+    /// Structured: a Databricks SQL Warehouse, reached through the connector
+    /// this service deploys and operates itself. Like CUSTOM_CONNECTOR it is a
+    /// Lambda-backed Athena data catalog, but the connector is ours rather than
+    /// the customer's: one Lambda per deployment serves every such source,
+    /// selecting each source's workspace and credential from the Athena catalog
+    /// name it is invoked under.
+    DATABRICKS_SQL_WAREHOUSE
+
     /// Unstructured: S3 bucket prefix
     S3
 
@@ -910,6 +1033,22 @@ enum SourceStatus {
 
     /// Deletion failed
     DELETE_FAILED
+}
+
+/// What triggered a scan job. INITIAL is the first scan on connect; MANUAL is a
+/// user-initiated rescan; SCHEDULED and EVENT are automated rescans.
+enum ScanTrigger {
+    /// First scan, run when the source was connected.
+    INITIAL
+
+    /// User-initiated rescan (UI or API).
+    MANUAL
+
+    /// Rescan fired by a configured recurring schedule.
+    SCHEDULED
+
+    /// Rescan fired by a matched upstream event rule.
+    EVENT
 }
 
 /// Status of a database scan job execution.
@@ -999,8 +1138,8 @@ structure CreateSourceInput {
 }
 
 /// Database source creation fields.
-/// Exactly one of glueConfiguration, jdbcConfiguration or customConnectorConfiguration
-/// must be provided — it selects the sub-type.
+/// Exactly one of glueConfiguration, jdbcConfiguration, customConnectorConfiguration
+/// or databricksSqlWarehouseConfiguration must be provided — it selects the sub-type.
 structure CreateDatabaseSourceInput {
     @required
     name: DisplayName
@@ -1014,6 +1153,10 @@ structure CreateDatabaseSourceInput {
     /// Custom Athena federation connector config. Required for the
     /// CUSTOM_CONNECTOR sub-type.
     customConnectorConfiguration: CustomConnectorConfiguration
+
+    /// Databricks SQL Warehouse config. Required for the
+    /// DATABRICKS_SQL_WAREHOUSE sub-type.
+    databricksSqlWarehouseConfiguration: DatabricksSqlWarehouseConfiguration
 
     /// Enable AI-powered business metadata enrichment (descriptions,
     /// synonyms, glossary terms, tags). Defaults to true. When false the
@@ -1118,6 +1261,9 @@ structure DatabaseSourceDetail {
     /// Populated for the CUSTOM_CONNECTOR sub-type; absent otherwise.
     customConnectorConfiguration: CustomConnectorConfiguration
 
+    /// Populated for the DATABRICKS_SQL_WAREHOUSE sub-type; absent otherwise.
+    databricksSqlWarehouseConfiguration: DatabricksSqlWarehouseConfiguration
+
     /// Whether AI-powered business metadata enrichment runs for this source.
     /// Set at creation time and persisted with the source record. When false
     /// the scan pipeline skips the enrichment step and the source transitions
@@ -1171,10 +1317,51 @@ structure DatabaseSourceDetail {
     /// - CUSTOM_CONNECTOR: a LAMBDA-type Athena catalog bound to the customer's
     ///   connector Lambda. It is a TOP-LEVEL catalog, not nested, so query it as
     ///   `<athenaDataCatalogName>.<databaseName>.<table>`.
+    /// - DATABRICKS_SQL_WAREHOUSE: also a TOP-LEVEL LAMBDA-type catalog, addressed
+    ///   the same way, but bound to the ONE connector Lambda this deployment
+    ///   operates — every such catalog in the environment shares that handler ARN,
+    ///   and the catalog name is what selects the source's workspace and
+    ///   credential. `databaseName` is the Unity Catalog schema.
     ///
     /// Run the query inside the namespace's Athena workgroup (see
     /// NamespaceDetail.athenaWorkgroupName).
     athenaDataCatalogName: String
+
+    /// Recurring rescan schedule for this source, if configured. Absent when no
+    /// schedule has been set.
+    rescanSchedule: RescanSchedule
+
+    /// Event-driven rescan configuration for this source, if configured. Absent
+    /// when event-driven rescans have never been set.
+    eventRescan: EventRescanConfig
+}
+
+/// Event-driven rescan configuration for a DATABASE source. When enabled (Glue
+/// sources only), upstream Glue Data Catalog changes to the source's database
+/// automatically trigger an EVENT-trigger rescan; the schema-diff keeps it
+/// non-destructive and repeated events are coalesced.
+structure EventRescanConfig {
+    /// Whether event-driven rescans are currently active.
+    @required
+    enabled: Boolean
+}
+
+/// A recurring rescan cadence for a DATABASE source, backed by an EventBridge
+/// schedule. When enabled, the source is automatically re-scanned on the given
+/// cadence (a SCHEDULED-trigger rescan); the schema-diff keeps it
+/// non-destructive.
+structure RescanSchedule {
+    /// Whether the recurring rescan is currently active.
+    @required
+    enabled: Boolean
+
+    /// EventBridge schedule expression, e.g. "rate(1 day)" or
+    /// "cron(0 3 * * ? *)". Required when enabled.
+    scheduleExpression: String
+
+    /// IANA timezone the cron expression is evaluated in (e.g.
+    /// "America/New_York"). Defaults to UTC when omitted.
+    timezone: String
 }
 
 /// Type-specific detail for DOCUMENTS sources.
@@ -1385,6 +1572,14 @@ operation UpdateSourceMetadata {
 
         customConnectorConfiguration: CustomConnectorConfiguration
 
+        // No databricksSqlWarehouseConfiguration, deliberately. A Databricks
+        // source's connection facts are written TWICE at create — on the record
+        // and into the connector's SSM parameter, which is what the connector
+        // reads — so accepting an edit here would need the two writes to be
+        // transactional or leave the copies able to disagree, with the
+        // parameter's winning silently. Correcting a wrong HTTP path or a
+        // rotated secret ARN therefore means delete and re-create.
+        //
         /// Whether AI-powered metadata enrichment runs for this source.
         metadataEnrichmentEnabled: Boolean
     }
@@ -1911,6 +2106,14 @@ structure GetSourceScanJobOutput {
     /// Number of tables discovered by the scan.
     tablesDiscovered: Integer
 
+    /// Tables processed so far, counting both unchanged-on-inspection and
+    /// enriched. Published as the job advances, so it lags by a few seconds.
+    tablesProcessed: Integer
+
+    /// Denominator for `tablesProcessed`. Falls back to the previous scan's
+    /// table count until this scan's discovery has finished enumerating.
+    tablesTotal: Integer
+
     /// Number of tables added since the previous scan.
     tablesAdded: Integer
 
@@ -1981,10 +2184,87 @@ structure ListSourceScanJobsOutput {
     items: ScanJobEntryList
 }
 
+/// Configure (or disable) the recurring rescan schedule for a DATABASE source.
+/// Setting enabled=true with a scheduleExpression creates or updates an
+/// EventBridge schedule that fires a SCHEDULED rescan on that cadence; setting
+/// enabled=false removes it.
+@http(method: "PUT", uri: "/namespaces/{namespaceId}/sources/{sourceId}/rescan-schedule")
+@idempotent
+operation PutSourceRescanSchedule {
+    input := {
+        @required
+        @httpLabel
+        namespaceId: Uuid
+
+        /// Identifier of the source to schedule rescans for.
+        @required
+        @httpLabel
+        sourceId: String
+
+        /// Whether the recurring rescan should be active.
+        @required
+        enabled: Boolean
+
+        /// EventBridge schedule expression (e.g. "rate(1 day)" or
+        /// "cron(0 3 * * ? *)"). Required when enabled=true.
+        ///
+        /// The cadence is floored, because every tick is a full discovery plus
+        /// enrichment pass. A `rate()` below the floor is rejected with 400, a
+        /// `cron()` must name a single minute so it cannot fire sub-hourly, and
+        /// one-time `at()` expressions are not accepted.
+        scheduleExpression: String
+
+        /// IANA timezone for cron evaluation. Defaults to UTC.
+        timezone: String
+    }
+
+    output := {
+        /// Identifier of the source.
+        @required
+        sourceId: String
+
+        /// The resulting schedule configuration.
+        @required
+        rescanSchedule: RescanSchedule
+    }
+}
+
 /// A single scan-history entry: either a scan of the source or a steward
 /// review decision.
 list ScanJobEntryList {
     member: ScanJobEntry
+}
+
+/// Enable or disable event-driven rescans for a DATABASE source (Glue only).
+/// When enabled, an EventBridge rule matching the source's Glue Data Catalog
+/// changes fires an EVENT rescan; disabling removes the rule.
+@http(method: "PUT", uri: "/namespaces/{namespaceId}/sources/{sourceId}/event-rescan")
+@idempotent
+operation PutSourceEventRescan {
+    input := {
+        @required
+        @httpLabel
+        namespaceId: Uuid
+
+        /// Identifier of the source to configure.
+        @required
+        @httpLabel
+        sourceId: String
+
+        /// Whether event-driven rescans should be active.
+        @required
+        enabled: Boolean
+    }
+
+    output := {
+        /// Identifier of the source.
+        @required
+        sourceId: String
+
+        /// The resulting event-driven rescan configuration.
+        @required
+        eventRescan: EventRescanConfig
+    }
 }
 
 /// One row in a source's scan history.
@@ -2006,6 +2286,11 @@ structure ScanJobEntry {
 
     /// For a SCAN row: whether it was a full or incremental (re-scan) run.
     scanType: String
+
+    /// What triggered a SCAN row: the first scan on connect, a user-initiated
+    /// re-scan, or an automated one from a schedule or a matched event. Absent
+    /// on rows written before triggers were recorded.
+    triggerType: ScanTrigger
 
     /// Number of tables discovered by the scan (SCAN rows).
     tablesDiscovered: Integer

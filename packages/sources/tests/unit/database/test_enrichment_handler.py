@@ -26,6 +26,22 @@ def env_vars(monkeypatch):
     monkeypatch.setenv("AWS_REGION", "us-east-1")
 
 
+@pytest.fixture(autouse=True)
+def stub_cross_source_pass():
+    """Keep the cross-source pass out of handler lifecycle tests.
+
+    The handler runs it after every successful enrichment. Unpatched it builds its
+    own DAO, and against a MagicMock DAO its pagination loop never ends because
+    ``last_evaluated_key`` is always truthy. Tests of the pass itself patch it
+    again inside the test.
+    """
+    with patch(
+        "coa_sources.database.enrichment.cross_source_orchestrator.run_for_namespace",
+        return_value={"sources": 0, "relationships_written": 0, "tables_updated": 0},
+    ):
+        yield
+
+
 _UNSET = object()
 
 
@@ -389,6 +405,110 @@ class TestEnrichmentMetricEmission:
         assert duration_calls[0][0][2] == "Milliseconds"
 
 
+class TestEnrichmentPartialTables:
+    """A table enriched only PARTIALLY (>=1 column batch failed, >=1
+    succeeded) is written back with its surviving metadata and counted under
+    tables_enriched. The handler must emit the TablesPartial metric and record
+    which tables are incomplete on the scan-job row for steward review."""
+
+    @pytest.fixture(autouse=True)
+    def _skip_cross_source_pass(self):
+        # These tests assert on the handler's partial-enrichment bookkeeping
+        # (metric + scan-job row), driven by the mocked table_enricher.run
+        # return value. The best-effort #1088 cross-source pass that runs
+        # afterwards is out of scope here; left live against a MagicMock DAO its
+        # lock is acquired and its source-pagination loop spins forever on a
+        # truthy MagicMock last_evaluated_key. Stub it out (the dedicated
+        # cross-source tests cover it) so these stay fast and deterministic.
+        with patch(
+            "coa_sources.database.enrichment.cross_source_orchestrator.run_for_namespace",
+            return_value={"sources": 0, "relationships_written": 0, "tables_updated": 0},
+        ):
+            yield
+
+    _PARTIAL_RESULT = {
+        "tables_enriched": 2,
+        "tables_failed": 0,
+        "tables_skipped_unchanged": 0,
+        "tables_partial": 1,
+        "failed_table_ids": [],
+        "partial_table_ids": ["public.big"],
+    }
+
+    @patch(f"{ENRICHER_MODULE}.run", return_value=_PARTIAL_RESULT)
+    @patch("coa_sources.database.pipeline.enrichment_metrics.emit_metric")
+    @patch("coa_common.dao.DynamoDBDAO")
+    def test_partial_emits_tables_partial_metric(self, mock_dao_cls, mock_emit, mock_run):
+        source_item = {"sourceId": "ds-123", "configuration": '{"engine": "POSTGRESQL"}'}
+        mock_dao = _build_dao(source_item=source_item)
+        mock_dao_cls.return_value = mock_dao
+
+        from coa_sources.database.pipeline.enrichment_handler import handler
+
+        handler()
+
+        partial_calls = [call for call in mock_emit.call_args_list if call[0][0] == "TablesPartial"]
+        assert len(partial_calls) == 1
+        assert partial_calls[0][0][1] == 1  # value
+
+    @patch(f"{ENRICHER_MODULE}.run", return_value=_PARTIAL_RESULT)
+    @patch("coa_sources.database.pipeline.enrichment_metrics.emit_metric")
+    @patch("coa_common.dao.DynamoDBDAO")
+    def test_partial_records_incomplete_tables_on_scan_job(self, mock_dao_cls, mock_emit, mock_run):
+        source_item = {"sourceId": "ds-123", "configuration": '{"engine": "POSTGRESQL"}'}
+        mock_dao = _build_dao(source_item=source_item)
+        mock_dao_cls.return_value = mock_dao
+
+        from coa_sources.database.pipeline.enrichment_handler import handler
+
+        handler()
+
+        # The scan-job row gets a diagnostic write naming the partially-enriched
+        # tables, done best-effort (condition + raise_on_error=False).
+        partial_writes = [
+            call
+            for call in mock_dao.update.call_args_list
+            if "enrichmentPartialTables" in call[1].get("update_fields", {})
+        ]
+        assert len(partial_writes) == 1
+        assert partial_writes[0][1]["update_fields"]["enrichmentPartialTables"] == ["public.big"]
+        assert partial_writes[0][1].get("raise_on_error") is False
+        assert partial_writes[0][1].get("condition") == "attribute_exists(PK)"
+
+    @patch(
+        f"{ENRICHER_MODULE}.run",
+        return_value={
+            "tables_enriched": 2,
+            "tables_failed": 0,
+            "tables_skipped_unchanged": 0,
+            "tables_partial": 0,
+            "failed_table_ids": [],
+            "partial_table_ids": [],
+        },
+    )
+    @patch("coa_sources.database.pipeline.enrichment_metrics.emit_metric")
+    @patch("coa_common.dao.DynamoDBDAO")
+    def test_no_partial_write_when_none_partial(self, mock_dao_cls, mock_emit, mock_run):
+        source_item = {"sourceId": "ds-123", "configuration": '{"engine": "POSTGRESQL"}'}
+        mock_dao = _build_dao(source_item=source_item)
+        mock_dao_cls.return_value = mock_dao
+
+        from coa_sources.database.pipeline.enrichment_handler import handler
+
+        handler()
+
+        partial_writes = [
+            call
+            for call in mock_dao.update.call_args_list
+            if "enrichmentPartialTables" in call[1].get("update_fields", {})
+        ]
+        assert partial_writes == []
+        # Metric is still emitted (value 0) so the dashboard series is continuous.
+        partial_metric = [call for call in mock_emit.call_args_list if call[0][0] == "TablesPartial"]
+        assert len(partial_metric) == 1
+        assert partial_metric[0][0][1] == 0
+
+
 class TestEnrichmentHandlerReScanStatus:
     """On a re-scan (IS_RESCAN=true) the terminal source status is RESCAN_REVIEW
     instead of PENDING_REVIEW, on both the enriched and enrichment-disabled paths."""
@@ -593,3 +713,45 @@ class TestEnrichmentPartialFailureRecording:
 
         # No failures → no diagnostic marker written anywhere.
         assert not any("enrichmentPartialFailure" in c[1]["update_fields"] for c in mock_dao.update.call_args_list)
+
+
+class TestEnrichmentProgressPublishing:
+    """The handler hands the enricher a callback that persists progress on the
+    scan-job row, so the console can show tables-processed over total."""
+
+    @patch("coa_common.dao.DynamoDBDAO")
+    def test_progress_callback_writes_counts_to_scan_job_row(self, mock_dao_cls):
+        mock_dao = _build_dao(source_item={"sourceId": "ds-123"})
+        mock_dao_cls.return_value = mock_dao
+
+        def fake_run(**kwargs):
+            kwargs["progress"](3, 7)
+            return {"tables_enriched": 7, "tables_failed": 0, "tables_skipped_unchanged": 0, "failed_table_ids": []}
+
+        from coa_sources.database.pipeline.enrichment_handler import handler
+
+        with patch(f"{ENRICHER_MODULE}.run", side_effect=fake_run):
+            handler()
+
+        writes = [c for c in mock_dao.update.call_args_list if "tablesProcessed" in c[1]["update_fields"]]
+        assert len(writes) == 1
+        assert writes[0][1]["key"] == {"PK": "SRC#ds-123", "SK": "SCAN#scan-456"}
+        assert writes[0][1]["update_fields"] == {"tablesProcessed": 3, "tablesTotal": 7}
+        # A progress write must never fail the enrichment it is reporting on.
+        assert writes[0][1]["condition"] == "attribute_exists(PK)"
+        assert writes[0][1]["raise_on_error"] is False
+
+    @patch(
+        f"{ENRICHER_MODULE}.run",
+        return_value={"tables_enriched": 1, "tables_failed": 0, "tables_skipped_unchanged": 0, "failed_table_ids": []},
+    )
+    @patch("coa_common.dao.DynamoDBDAO")
+    def test_enricher_is_given_a_progress_callback(self, mock_dao_cls, mock_run):
+        mock_dao = _build_dao(source_item={"sourceId": "ds-123"})
+        mock_dao_cls.return_value = mock_dao
+
+        from coa_sources.database.pipeline.enrichment_handler import handler
+
+        handler()
+
+        assert callable(mock_run.call_args[1]["progress"])

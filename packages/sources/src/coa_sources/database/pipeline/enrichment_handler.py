@@ -130,6 +130,16 @@ def handler() -> None:
 
     ctx = EnrichmentContext(source_item=source_item, namespace_id=namespace_id)
     emitter = EnrichmentMetricEmitter(ctx)
+    scan_dao = DynamoDBDAO(os.environ["SOURCE_SCAN_JOBS_TABLE"], region=region)
+
+    def publish_progress(processed: int, total: int) -> None:
+        # raise_on_error=False: a progress write must never fail the enrichment.
+        scan_dao.update(
+            key=scan_job_key,
+            update_fields={"tablesProcessed": processed, "tablesTotal": total},
+            condition="attribute_exists(PK)",
+            raise_on_error=False,
+        )
 
     try:
         from coa_sources.database.enrichment.table_enricher import run as enrich_tables
@@ -141,12 +151,14 @@ def handler() -> None:
             domain_id=domain_id,
             scan_type=scan_type,
             emitter=emitter,
+            progress=publish_progress,
         )
         enrich_duration_ms = (time.monotonic() - enrich_start) * 1000
 
         emitter.emit_metric("EnrichmentJobDurationMs", enrich_duration_ms, "Milliseconds")
         emitter.emit_metric("TablesEnriched", result["tables_enriched"], "Count")
         emitter.emit_metric("TablesFailed", result["tables_failed"], "Count")
+        emitter.emit_metric("TablesPartial", result.get("tables_partial", 0), "Count")
         emitter.emit_metric("TablesSkippedUnchanged", result["tables_skipped_unchanged"], "Count")
         emitter.emit_enrichment_estimated_cost()
 
@@ -177,7 +189,6 @@ def handler() -> None:
                 result["tables_enriched"] + result["tables_failed"],
                 failed_table_ids,
             )
-            scan_dao = DynamoDBDAO(os.environ["SOURCE_SCAN_JOBS_TABLE"], region=region)
             # Best-effort diagnostic write: a concurrently-deleted scan-job row
             # must not crash an otherwise-successful enrichment (that would flip
             # the source to SCAN_FAILED and mask the tables that DID enrich).
@@ -186,6 +197,31 @@ def handler() -> None:
                 update_fields={
                     "enrichmentPartialFailure": True,
                     "enrichmentFailedTables": failed_table_ids,
+                },
+                condition="attribute_exists(PK)",
+                raise_on_error=False,
+            )
+
+        # Tables enriched only PARTIALLY (a wide table where one column batch was
+        # guardrail-blocked / failed to parse, but other batches succeeded) are
+        # now written back WITH the surviving description + columns rather than
+        # discarded. They land in tables_enriched, so record which ones are
+        # incomplete on the scan-job row and log them, so a steward reviewing the
+        # source can tell a partially-enriched table from a fully-enriched one.
+        partial_table_ids = result.get("partial_table_ids", [])
+        if result.get("tables_partial"):
+            logger.warning(
+                "Enrichment partial success: %d table(s) enriched with only some column "
+                "batches (a batch was guardrail-blocked or failed to parse); surviving "
+                "metadata was kept and written back: %s",
+                result["tables_partial"],
+                partial_table_ids,
+            )
+            partial_scan_dao = DynamoDBDAO(os.environ["SOURCE_SCAN_JOBS_TABLE"], region=region)
+            partial_scan_dao.update(
+                key=scan_job_key,
+                update_fields={
+                    "enrichmentPartialTables": partial_table_ids,
                 },
                 condition="attribute_exists(PK)",
                 raise_on_error=False,
@@ -245,7 +281,6 @@ def handler() -> None:
             condition="attribute_exists(PK)",
             raise_on_error=False,
         )
-        scan_dao = DynamoDBDAO(os.environ["SOURCE_SCAN_JOBS_TABLE"], region=region)
         scan_dao.update(
             key=scan_job_key,
             update_fields={"errorMessage": str(exc)},
@@ -255,9 +290,10 @@ def handler() -> None:
         raise RuntimeError(str(exc)) from exc
 
     logger.info(
-        "Enrichment complete: datasource=%s enriched=%d failed=%d",
+        "Enrichment complete: datasource=%s enriched=%d partial=%d failed=%d",
         datasource_id,
         result["tables_enriched"],
+        result.get("tables_partial", 0),
         result["tables_failed"],
     )
 

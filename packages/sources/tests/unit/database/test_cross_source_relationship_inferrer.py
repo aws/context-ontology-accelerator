@@ -16,6 +16,8 @@ from coa_common.domain_models import (
     Table,
 )
 from coa_sources.database.enrichment.cross_source_relationship_inferrer import (
+    _NOTE_MAX_CHARS,
+    _review_note,
     apply_cross_source_relationships,
     build_cross_source_prompt,
     infer_cross_source_relationships,
@@ -125,7 +127,7 @@ class TestApplyCrossSource:
     def test_synthesized_provenance_when_no_rationale(self):
         tables = _two_source_union()
         apply_cross_source_relationships(tables, [self._cand(rationale="")])
-        assert tables[0].foreign_keys[0].provenance.startswith("cross-source inference:")
+        assert tables[0].foreign_keys[0].provenance.startswith("inferred: ")
 
 
 class TestInferShortCircuit:
@@ -220,3 +222,64 @@ class TestPairwiseInference:
         client = MagicMock()
         infer_cross_source_relationships(self._four_sources(), client, MagicMock(), focus_datasource_id="DS#99")
         client.invoke.assert_not_called()
+
+
+class TestReviewNote:
+    """0.3.3 feedback: the note is read inline next to a yes/no call — one line, no
+    internal aliases."""
+
+    ALIASES = {"ds1": "billing_zuora", "ds2": "crm_salesforce"}
+
+    def test_rewrites_prompt_aliases_to_database_names(self):
+        note = _review_note(
+            "`ds2.entitlement.tenant_id` description says it maps to a customer; ds1 is the customer master.",
+            self.ALIASES,
+            "fb",
+        )
+        assert "ds1" not in note and "ds2" not in note
+        assert "crm_salesforce.entitlement.tenant_id" in note
+        assert "billing_zuora is the customer master" in note
+
+    def test_keeps_first_sentence_only(self):
+        note = _review_note(
+            "tenant_id matches the customer master key. While account_xref is not in the schema, "
+            "mart_customer_360 is keyed by ba_no, making it the target.",
+            self.ALIASES,
+            "fb",
+        )
+        assert note == "tenant_id matches the customer master key."
+
+    def test_caps_long_single_sentence_on_a_word_boundary(self):
+        note = _review_note("word " * 80, self.ALIASES, "fb")
+        assert len(note) <= _NOTE_MAX_CHARS
+        assert note.endswith("…")
+        assert not note[:-1].endswith(" ")
+
+    def test_collapses_whitespace(self):
+        assert _review_note("a  b\n\n c", self.ALIASES, "fb") == "a b c"
+
+    def test_empty_rationale_uses_structural_fallback(self):
+        assert _review_note("   ", self.ALIASES, "inferred: x.a -> y.b") == "inferred: x.a -> y.b"
+
+    def test_unknown_alias_left_as_is(self):
+        assert _review_note("ds9.t matches", self.ALIASES, "fb") == "ds9.t matches"
+
+    def test_apply_stores_the_short_note_not_the_paragraph(self):
+        tables = [_table("account_xref", "DS#1", ["customer_id"]), _table("customers", "DS#2", ["id"])]
+        long = "ds1.account_xref.customer_id matches ds2.customers.id. " + "Restating the same evidence. " * 10
+        apply_cross_source_relationships(
+            tables,
+            [
+                {
+                    "source_table": "ds1.account_xref",
+                    "column": "customer_id",
+                    "target_table": "ds2.customers",
+                    "target_column": "id",
+                    "confidence": 0.9,
+                    "rationale": long,
+                }
+            ],
+        )
+        fk = tables[0].foreign_keys[0]
+        assert "ds1" not in fk.provenance and "ds2" not in fk.provenance
+        assert fk.provenance == "db.account_xref.customer_id matches db.customers.id."

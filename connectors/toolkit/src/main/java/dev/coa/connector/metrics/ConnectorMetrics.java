@@ -35,6 +35,22 @@ public final class ConnectorMetrics
     public static final String CONFIG_RESOLUTION_FAILURES = "ConnectorConfigResolutionFailures";
 
     /**
+     * The configuration store throttled the connector. Counted separately from
+     * {@link #CONFIG_RESOLUTION_FAILURES} because nothing is wrong with the configuration: Parameter
+     * Store's default {@code GetParameter} throughput is 40 transactions per second per account and
+     * region, and discovery is a per-table fan-out. The first action is a rate limit.
+     */
+    public static final String CONFIG_THROTTLES = "ConnectorConfigThrottles";
+
+    /**
+     * {@code sts:AssumeRole} on the customer-owned role that guards a credential failed. Its own metric
+     * rather than a configuration failure, because the cause is a trust policy or a permission policy
+     * <b>COA does not own and cannot repair</b> — one catalog means one customer changed a policy,
+     * fleet-wide means the connector's own role or deployment moved.
+     */
+    public static final String CREDENTIAL_ASSUME_FAILURES = "ConnectorCredentialAssumeFailures";
+
+    /**
      * A connection to the upstream data source could not be opened. Distinguishes a source that is
      * unreachable or refusing credentials from a query that failed for its own reasons — the two are
      * indistinguishable in Athena's error, which reports only that the connector failed.

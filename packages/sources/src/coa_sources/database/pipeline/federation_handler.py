@@ -48,6 +48,7 @@ from coa_sources.database.glue_ownership import (
     assert_namespace_may_catalog,
 )
 from coa_sources.database.secret_binding import require_secret_namespace_binding
+from coa_sources.database.sub_types import CONNECTOR_BACKED_SUB_TYPES
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("LOG_LEVEL", "INFO"))
@@ -69,12 +70,19 @@ _dao: DynamoDBDAO | None = None
 _ssm = None
 
 # DATABASE sub-types this handler has an explicit branch for.
-_HANDLED_SUB_TYPES = frozenset(
-    {
-        SourceSubType.GLUE_DATABASE.value,
-        SourceSubType.JDBC_DATABASE.value,
-        SourceSubType.CUSTOM_CONNECTOR.value,
-    }
+#
+# Built from CONNECTOR_BACKED_SUB_TYPES because this set and the `queryable` write below
+# are TWO branches that must move together: adding a sub-type here alone only silences
+# the tripwire at the bottom of `handler`, and a sub-type in this set but not in that
+# comparison scans cleanly and then silently answers nothing.
+_HANDLED_SUB_TYPES = (
+    frozenset(
+        {
+            SourceSubType.GLUE_DATABASE.value,
+            SourceSubType.JDBC_DATABASE.value,
+        }
+    )
+    | CONNECTOR_BACKED_SUB_TYPES
 )
 # DOCUMENTS sub-types never reach this pipeline, so a row carrying one is a
 # mis-stored record. The right treatment there is the long-standing no-op, not a
@@ -319,14 +327,20 @@ def handler(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
         )
         return {"provisioned": False, "reason": "glue-native", "queryable": granted}
 
-    # Custom-connector sources need no provisioning here: the Lambda-backed Athena
-    # data catalog was registered at source-create, because this sub-type's
-    # discovery queries it and discovery runs BEFORE this step. All that remains
-    # is to mark the source queryable, which discovery having succeeded is the
-    # evidence for — the SHOW/DESCRIBE statements it ran are proof the catalog
-    # resolves and the connector answers. There is no Glue object and no Lake
-    # Formation grant to make, so nothing gates this beyond the write itself.
-    if sub_type == SourceSubType.CUSTOM_CONNECTOR:
+    # Connector-backed sources need no provisioning here: the Lambda-backed Athena data
+    # catalog was registered at source-create, since this sub-type's discovery queries it
+    # and discovery runs BEFORE this step. All that remains is to mark the source
+    # queryable, and discovery having succeeded is the evidence for it.
+    #
+    # Keyed on the SET, not on an exact CUSTOM_CONNECTOR comparison, because this is the
+    # branch that fails open when a sub-type is missed: it would fall through to the
+    # `not JDBC_DATABASE` no-op below, which writes nothing, and create persists
+    # `queryable: False` — so the source would scan cleanly and then answer nothing.
+    #
+    # DATABRICKS_SQL_WAREHOUSE needs no grant step either, for a different reason from
+    # CUSTOM_CONNECTOR's: the connector assumes the CUSTOMER's role at request time, so
+    # COA holds no grant on the credential to make or revoke.
+    if sub_type in CONNECTOR_BACKED_SUB_TYPES:
         # Raises on failure, matching the JDBC path: leaving queryable False after
         # a successful discovery would present as a source that scanned fine and
         # silently answers nothing. Nothing needs rolling back — the catalog
@@ -336,8 +350,11 @@ def handler(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
             update_fields={"queryable": True},
             condition="attribute_exists(PK)",
         )
-        logger.info("custom_connector_marked_queryable", extra={"datasource_id": datasource_id})
-        return {"provisioned": False, "reason": "custom-connector", "queryable": True}
+        logger.info(
+            "connector_backed_source_marked_queryable",
+            extra={"datasource_id": datasource_id, "sub_type": sub_type},
+        )
+        return {"provisioned": False, "reason": "connector-backed", "queryable": True}
 
     if sub_type != SourceSubType.JDBC_DATABASE:
         # An ABSENT sub-type is the benign case and must stay a no-op: a source

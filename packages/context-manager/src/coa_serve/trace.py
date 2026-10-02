@@ -115,6 +115,28 @@ class TraceCollector:
             if isinstance(r, Exception):
                 logger.warning("trace_emit_failed", error=type(r).__name__, message=str(r))
 
+    def discard(self) -> None:
+        """Cancel pending on_record callback tasks without delivering them.
+
+        Use on error paths where the trace steps recorded so far MUST NOT
+        reach the client — chiefly, authorization denials (``AccessDeniedError``)
+        where a T1_FIREWALL step's detail names the restricted tables in
+        the deny reason. Calling ``flush()`` on that path emits those step
+        events to the SSE stream before the 403 error event and lets any
+        authenticated caller enumerate restricted table names.
+
+        Best-effort: a task already past ``create_task`` scheduling and
+        actually executing may still complete. Under a single-threaded
+        event loop, tasks scheduled via ``loop.create_task`` do not run
+        until the current coroutine yields, so the common case (record
+        step → raise AccessDeniedError → discard) cancels before delivery.
+        (See the trace-flush-on-denial hardening in ``main.py::_run_resolve``.)
+        """
+        for task in self._pending_tasks:
+            if not task.done():
+                task.cancel()
+        self._pending_tasks.clear()
+
     def _fire_callback(self, ts: TraceStep) -> None:
         """Fire the on_record callback as a tracked background task."""
         if not self._on_record:

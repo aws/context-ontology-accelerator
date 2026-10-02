@@ -2,7 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { render, screen, act, waitFor } from "@testing-library/react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import {
+  MemoryRouter,
+  Route,
+  Routes,
+  useLocation,
+  useParams,
+} from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { SourceDetail } from "./SourceDetail";
@@ -104,6 +110,16 @@ vi.mock("@tanstack/react-query", async (importOriginal) => {
   };
 });
 
+const TableRouteProbe = () => {
+  const location = useLocation();
+  const { tableId } = useParams<{ tableId: string }>();
+  return (
+    <div data-testid="table-route" data-path={location.pathname}>
+      {tableId}
+    </div>
+  );
+};
+
 const wrapper = ({ children }: { children: React.ReactNode }) => (
   <QueryClientProvider client={new QueryClient()}>
     <MemoryRouter initialEntries={["/namespaces/ns-1/sources/src-1"]}>
@@ -111,6 +127,10 @@ const wrapper = ({ children }: { children: React.ReactNode }) => (
         <Route
           path="/namespaces/:namespaceId/sources/:sourceId"
           element={children}
+        />
+        <Route
+          path="/namespaces/:namespaceId/sources/:dataSourceId/tables/:tableId"
+          element={<TableRouteProbe />}
         />
       </Routes>
     </MemoryRouter>
@@ -124,6 +144,44 @@ const selectAllTables = async () => {
     checkboxes[0]!.click();
   });
 };
+
+describe("SourceDetail table navigation", () => {
+  beforeEach(() => {
+    sendMock.mockReset();
+    invalidateQueriesMock.mockReset();
+  });
+
+  // These are the identifier classes reported by #1090.
+  it.each([
+    ["sales#2026", "sales%232026"],
+    ["sales%2026", "sales%252026"],
+    ["sales 2026", "sales%202026"],
+    ["売上明細", "%E5%A3%B2%E4%B8%8A%E6%98%8E%E7%B4%B0"],
+  ])(
+    "preserves the table identifier %s through the encoded route",
+    async (tableId, encoded) => {
+      listSourceTablesMock.mockReturnValue({
+        data: {
+          items: [{ ...TABLES[0], tableId }],
+          skippedAssets: 0,
+        },
+        isLoading: false,
+      });
+      render(<SourceDetail />, { wrapper });
+
+      await act(async () => {
+        screen.getByRole("button", { name: tableId }).click();
+      });
+
+      const route = await screen.findByTestId("table-route");
+      expect(route).toHaveTextContent(tableId);
+      expect(route).toHaveAttribute(
+        "data-path",
+        `/namespaces/ns-1/sources/src-1/tables/${encoded}`,
+      );
+    },
+  );
+});
 
 describe("SourceDetail batch review", () => {
   beforeEach(() => {

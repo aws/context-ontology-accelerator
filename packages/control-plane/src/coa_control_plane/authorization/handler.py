@@ -487,6 +487,14 @@ _PATH_MAPPING: dict[str, dict[str, tuple[str, str]]] = {
     "/namespaces/{namespaceId}/sources/{sourceId}/rescan": {
         "POST": ("manageSource", "Source"),
     },
+    # Automated re-scan triggers: enabling either is a standing instruction to
+    # re-scan, so same authority as doing it by hand.
+    "/namespaces/{namespaceId}/sources/{sourceId}/rescan-schedule": {
+        "PUT": ("manageSource", "Source"),
+    },
+    "/namespaces/{namespaceId}/sources/{sourceId}/event-rescan": {
+        "PUT": ("manageSource", "Source"),
+    },
     "/namespaces/{namespaceId}/sources/{sourceId}/metadata": {
         "PUT": ("manageSource", "Source"),
     },

@@ -4,6 +4,22 @@
 import { normalizeResponse } from "./normalize-response";
 
 describe("normalizeResponse", () => {
+  it("normalizes a legacy top-level graph entity array", () => {
+    const normalized = normalizeResponse({
+      result: {
+        tier: 3,
+        confidence: { score: 0.8, rationale: "Graph evidence" },
+        trace: [],
+        partial: false,
+        graphContext: [{ uri: "e:legacy", label: "Legacy entity" }],
+      },
+    });
+
+    expect(normalized?.result.graphContext).toEqual({
+      entities: [{ uri: "e:legacy", label: "Legacy entity" }],
+    });
+  });
+
   describe("returns null for unusable input", () => {
     it("returns null for undefined", () => {
       expect(normalizeResponse(undefined)).toBeNull();

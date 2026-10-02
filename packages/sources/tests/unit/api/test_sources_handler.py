@@ -426,6 +426,31 @@ class TestValidation:
         status, body = _parse_response(aws_env["handler"](event, None))
         assert status == 400
 
+    def test_create_validation_error_names_the_rejected_field(self, aws_env):
+        """A pattern failure names its field: Pydantic's own message is only the regex."""
+        event = _make_event("POST", _LIST_RESOURCE, path_params={"namespaceId": _NAMESPACE_ID})
+        event["body"] = json.dumps(
+            {
+                "sourceType": "DATABASE",
+                "databaseSource": {
+                    "name": "dbx",
+                    "databricksSqlWarehouseConfiguration": {
+                        "workspaceHostname": "evil.example.com",
+                        "httpPath": "/sql/1.0/warehouses/a1b2",
+                        "databricksCatalog": "main",
+                        "databaseName": "sales",
+                        "credentialSecretArn": "arn:aws:secretsmanager:us-east-1:111122223333:secret:x-AbCdEf",
+                        "crossAccountRoleArn": "arn:aws:iam::111122223333:role/coa-dev-datasource-access-a",
+                    },
+                },
+            }
+        )
+        status, body = _parse_response(aws_env["handler"](event, None))
+        assert status == 400
+        assert body["error"].startswith(
+            "Invalid databaseSource.databricksSqlWarehouseConfiguration.workspaceHostname: "
+        )
+
     def test_unknown_route(self, aws_env):
         """Unknown HTTP method/resource combination → 404."""
         event = _make_event("PATCH", _LIST_RESOURCE, path_params={"namespaceId": _NAMESPACE_ID})

@@ -48,14 +48,16 @@ metrics:
         - "What is the total loss reserve?"
         - "How much do we have in reserves?"
         - "Show me outstanding loss reserves"
-    x_coa:
-      data_source_id: f2f4304d-72e0-48ce-aa8a-20ec05fc15d6
-      source_table: pc_insurance.claim_amount
-      unit: USD
-      return_type: decimal
-      ontology_concepts:
-        - LossReserve
-        - ClaimAmount
+    custom_extensions:
+      - vendor_name: COA
+        data:
+          data_source_id: f2f4304d-72e0-48ce-aa8a-20ec05fc15d6
+          source_table: pc_insurance.claim_amount
+          unit: USD
+          return_type: decimal
+          ontology_concepts:
+            - LossReserve
+            - ClaimAmount
 
   - name: open_claims_count
     description: "Number of currently open insurance claims"
@@ -73,12 +75,14 @@ metrics:
         - "How many open claims do we have?"
         - "What is the number of active claims?"
         - "Show me pending claims count"
-    x_coa:
-      data_source_id: f2f4304d-72e0-48ce-aa8a-20ec05fc15d6
-      source_table: pc_insurance.claim
-      return_type: integer
-      ontology_concepts:
-        - Claim
+    custom_extensions:
+      - vendor_name: COA
+        data:
+          data_source_id: f2f4304d-72e0-48ce-aa8a-20ec05fc15d6
+          source_table: pc_insurance.claim
+          return_type: integer
+          ontology_concepts:
+            - Claim
 
   - name: total_premium
     description: "Total premium amount collected across all policies"
@@ -96,14 +100,16 @@ metrics:
         - "What is the total premium?"
         - "How much premium have we collected?"
         - "Show total premium revenue"
-    x_coa:
-      data_source_id: f2f4304d-72e0-48ce-aa8a-20ec05fc15d6
-      source_table: pc_insurance.policy_amount
-      unit: USD
-      return_type: decimal
-      ontology_concepts:
-        - Premium
-        - PolicyAmount
+    custom_extensions:
+      - vendor_name: COA
+        data:
+          data_source_id: f2f4304d-72e0-48ce-aa8a-20ec05fc15d6
+          source_table: pc_insurance.policy_amount
+          unit: USD
+          return_type: decimal
+          ontology_concepts:
+            - Premium
+            - PolicyAmount
 
   - name: catastrophe_claims_count
     description: "Number of claims linked to catastrophe events"
@@ -121,13 +127,15 @@ metrics:
         - "How many catastrophe claims do we have?"
         - "Show me CAT-related claims"
         - "Number of claims from natural disasters"
-    x_coa:
-      data_source_id: f2f4304d-72e0-48ce-aa8a-20ec05fc15d6
-      source_table: pc_insurance.claim
-      return_type: integer
-      ontology_concepts:
-        - Claim
-        - Catastrophe
+    custom_extensions:
+      - vendor_name: COA
+        data:
+          data_source_id: f2f4304d-72e0-48ce-aa8a-20ec05fc15d6
+          source_table: pc_insurance.claim
+          return_type: integer
+          ontology_concepts:
+            - Claim
+            - Catastrophe
 
   - name: total_loss_payments
     description: "Total loss payments made across all claims"
@@ -145,11 +153,13 @@ metrics:
         - "What is the total amount paid on claims?"
         - "How much have we paid in losses?"
         - "Show total loss payments"
-    x_coa:
-      data_source_id: f2f4304d-72e0-48ce-aa8a-20ec05fc15d6
-      source_table: pc_insurance.claim_amount
-      unit: USD
-      return_type: decimal
-      ontology_concepts:
-        - LossPayment
-        - ClaimAmount
+    custom_extensions:
+      - vendor_name: COA
+        data:
+          data_source_id: f2f4304d-72e0-48ce-aa8a-20ec05fc15d6
+          source_table: pc_insurance.claim_amount
+          unit: USD
+          return_type: decimal
+          ontology_concepts:
+            - LossPayment
+            - ClaimAmount

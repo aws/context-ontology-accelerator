@@ -14,7 +14,7 @@ Checks (per Metric Onboarding Service LLD §5.1):
   6. :governedMetricFor references a valid ontology class → WARNING
 
 Philosophy: "Author early, validate continuously"
-- Only Check 1 blocks metric creation (hard error)
+- SQL syntax, read-only semantics, and executable statement shape block writes
 - Checks 2-6 produce soft warnings — metric is still published
 - Re-scan impact detection triggers re-validation when schema changes
 """
@@ -28,6 +28,14 @@ from functools import cache
 from typing import Any
 
 import structlog
+from coa_common.sql_safety import (
+    contains_mysql_executable_comment,
+    dangerous_sql_ast_reason,
+    dangerous_sql_functions,
+    executable_select_shape_error,
+    is_trino_dialect,
+    select_tier1_sql_expression,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -40,6 +48,17 @@ class Severity(Enum):
 
     ERROR = "error"
     WARNING = "warning"
+
+
+# Onboarding-blocking checks (CreateMetric/UpdateMetric return 400 on these).
+# Scoped by check NAME rather than by ERROR severity: the SQL syntax + shape
+# checks (1/1b) mirror the serve-time SQL firewall's SELECT-only rule, so a
+# metric that fails them would persist only to fail at query time (#617/#1050).
+# Other checks can also be ERROR-severity — e.g. `table_reference` on provable
+# sourceTable absence (see below) — but those have their own dedicated gate
+# (check_source_table_exists) and must NOT block here, or create/update would
+# 400 in a case the contract says should publish (Kun's review, !1133).
+BLOCKING_CHECKS = frozenset({"sql_syntax", "sql_shape"})
 
 
 @dataclass
@@ -115,8 +134,25 @@ _DIALECT_MAP: dict[str, str] = {
 
 
 def _resolve_dialect(dialect: str) -> str | None:
-    """Resolve a dialect string to a sqlglot dialect name (case-insensitive)."""
-    return _DIALECT_MAP.get(dialect.lower())
+    """Resolve a dialect string to a sqlglot dialect name (case-insensitive).
+
+    Internal dialects use COA names (for example ``POSTGRESQL`` → ``postgres``),
+    while lenient OSI import can preserve a dialect outside the internal enum.
+    If sqlglot knows that preserved dialect, validate with its real parser
+    rather than silently falling back to the generic grammar.
+    """
+    normalized = dialect.strip().lower()
+    mapped = _DIALECT_MAP.get(normalized)
+    if mapped:
+        return mapped
+
+    import sqlglot
+
+    try:
+        sqlglot.Dialect.get_or_raise(normalized)
+    except ValueError:
+        return None
+    return normalized
 
 
 _COMMENT_PATTERN = re.compile(r"/\*.*?\*/|--[^\n]*", re.DOTALL)
@@ -156,8 +192,8 @@ _DATA_MODIFYING_MESSAGE = (
 # over-reach onto metric SQL — a read-only SELECT never parses to a Command.
 #
 # Aggregate fragments are deliberately absent: ``COUNT(*)``/``SUM(x)`` parse to
-# ``exp.Count``/``exp.Sum``, which are expressions, not statements, so they stay
-# on the soft path (#161).
+# ``exp.Count``/``exp.Sum``, which are expressions, not data-modifying
+# statements. ``check_select_shape`` rejects them separately.
 _DATA_MODIFYING_NODE_NAMES: tuple[str, ...] = (
     "Command",
     "Insert",
@@ -225,18 +261,10 @@ def _blocked_statement_segment(sql: str) -> bool:
 def check_data_modifying(sql: str, dialect: str = "") -> str | None:
     """Reject a metric expression that modifies data (issue #161).
 
-    This is the ONLY hard block applied to a metric expression at
-    create/update/import time. Per #161 ("SQL parses → SOFT warning, never
-    blocks publish"), a parse error or a non-SELECT fragment is deliberately
-    allowed through and surfaced as a soft warning instead:
-
-    - A **fragment** (e.g. ``COUNT(*)``) simply fails to match Tier 1 at serve
-      time — the resolver does not wrap it, so nothing crashes.
-    - A **parse error** is likewise not a safety problem; the serve-time SQL
-      firewall independently rejects anything it cannot analyze (fail-closed).
-
-    DML/DDL stays hard-blocked because it is a security boundary, caught two
-    ways so neither path alone has to be complete:
+    DML/DDL is a hard block because it is a security boundary. Statement
+    syntax and executable SELECT shape are validated separately by
+    ``check_select_shape``. Data-modifying operations are caught two ways so
+    neither path alone has to be complete:
 
     1. A pre-parse regex (``_BLOCKED_STATEMENTS``, comments stripped first) —
        catches DML that sqlglot cannot parse. Anchored at statement start, so
@@ -254,8 +282,9 @@ def check_data_modifying(sql: str, dialect: str = "") -> str | None:
         dialect: The metric dialect (e.g. POSTGRESQL); used for parsing.
 
     Returns:
-        None if the expression is read-only (or merely unparseable), otherwise
-        a human-actionable error message.
+        None if the expression contains no recognized data-modifying
+        operation, otherwise a human-actionable error message. Callers must
+        also run ``check_select_shape`` before persistence.
     """
     import sqlglot
 
@@ -271,15 +300,13 @@ def check_data_modifying(sql: str, dialect: str = "") -> str | None:
         if _blocked_statement_segment(sql):
             return _DATA_MODIFYING_MESSAGE.format(detail="statement type")
         # Unparseable AND no segment looks data-modifying → not provably
-        # data-modifying. Allowed here; surfaced as a soft warning by
-        # validate_metric, and fail-closed at serve time by the firewall.
+        # data-modifying. ``check_select_shape`` is responsible for rejecting
+        # the parser failure before persistence.
         #
         # SqlglotError (not just ParseError) because TokenError is a SIBLING of
         # ParseError, not a subclass — ``'; DROP TABLE users; --`` raises it.
         # RecursionError comes from the recursive-descent parser on deeply
-        # nested parens. Neither is a ValueError, so leaking either would reach
-        # create_metric/update_metric (which catch ValueError) as an unhandled
-        # 500 rather than this soft path.
+        # nested parens.
         return None
 
     data_modifying_nodes = _data_modifying_nodes()
@@ -304,11 +331,16 @@ def check_select_shape(sql: str, dialect: str = "") -> str | None:
     keep this in sync with the firewall so ``validate`` predicts serve-time
     acceptance.
 
-    Also mirrors the firewall's deep scan (``_DATA_MODIFYING_NODES``): a
-    data-modifying node nested anywhere in the AST — e.g.
-    ``WITH d AS (DELETE FROM orders RETURNING *) SELECT * FROM d`` — passes
-    the top-level shape check but is rejected by the firewall, so it must be
-    rejected here too for early feedback.
+    Also mirrors the firewall's deep scan and shared
+    :mod:`coa_common.sql_safety` policy: a data-modifying node, locking clause,
+    or dangerous function nested anywhere in the AST passes the top-level shape
+    check but is rejected by the firewall, so it must be rejected here too for
+    early feedback.
+
+    Finally, require every SELECT in the tree to be executable on its own:
+    it must have a projection, and a direct ``*`` projection must have a FROM
+    source. Constants and aggregates such as ``SELECT 1`` and
+    ``SELECT COUNT(*)`` remain valid without FROM.
 
     Args:
         sql: The metric SQL expression.
@@ -320,6 +352,9 @@ def check_select_shape(sql: str, dialect: str = "") -> str | None:
     """
     import sqlglot
 
+    if contains_mysql_executable_comment(sql, dialect):
+        return "MySQL executable comments are not allowed in metric SQL."
+
     safe_statement_types: tuple[type[sqlglot.exp.Expression], ...] = (
         sqlglot.exp.Select,
         sqlglot.exp.Union,
@@ -327,13 +362,14 @@ def check_select_shape(sql: str, dialect: str = "") -> str | None:
         sqlglot.exp.Except,
     )
 
+    resolved_dialect = _resolve_dialect(dialect)
     try:
-        parsed = sqlglot.parse_one(sql, read=_resolve_dialect(dialect))
+        parsed = sqlglot.parse_one(sql, read=resolved_dialect)
     except (sqlglot.errors.SqlglotError, RecursionError) as exc:
         # SqlglotError, not ParseError: TokenError is a sibling of ParseError,
-        # and RecursionError comes from deeply nested parens. This is the soft
-        # advisory path, so every failure mode becomes the same warning message
-        # rather than escaping to the caller.
+        # and RecursionError comes from deeply nested parens. Normalize every
+        # parser failure into a human-actionable message for both persistence
+        # handlers and the explicit validate endpoint.
         return f"SQL expression could not be parsed ({dialect}): {exc}"
 
     if not isinstance(parsed, safe_statement_types):
@@ -343,6 +379,10 @@ def check_select_shape(sql: str, dialect: str = "") -> str | None:
             f"executes SELECT statements; wrap the fragment, e.g. "
             f"'SELECT {sql.strip()} FROM <source_table>'."
         )
+
+    shape_error = executable_select_shape_error(parsed)
+    if shape_error:
+        return shape_error
 
     # Deep scan: data-modifying nodes must not appear anywhere in the AST,
     # even nested in CTEs/subqueries of an otherwise-safe SELECT. Shares
@@ -355,6 +395,38 @@ def check_select_shape(sql: str, dialect: str = "") -> str | None:
                 f"serve-time SQL firewall rejects these. Remove the "
                 f"data-modifying clause; metric expressions must be read-only."
             )
+        dangerous_reason = dangerous_sql_ast_reason(node, resolved_dialect or dialect, sql)
+        if dangerous_reason:
+            return (
+                f"Expression contains an unsafe operation ({dangerous_reason}) that can lock or mutate database state."
+            )
+
+    blocked_functions = dangerous_sql_functions(resolved_dialect or dialect)
+    for func in parsed.find_all(sqlglot.exp.Anonymous, sqlglot.exp.Func):
+        func_name = getattr(func, "name", "").lower()
+        if func_name in blocked_functions:
+            return (
+                f"Expression uses forbidden function '{func_name}' — the serve-time SQL firewall rejects this function."
+            )
+
+    return None
+
+
+def check_tier1_execution_shape(dialects: list[dict[str, Any]]) -> str | None:
+    """Validate the exact expression Tier 1 will execute as Trino SQL.
+
+    Each expression is also validated in its declared dialect, but the resolver
+    prefers TRINO and otherwise falls back to the first entry before sending it
+    to the Trino firewall/executor. This extra gate prevents dialect-valid SQL
+    (for example TSQL ``TOP``) from being persisted when Tier 1 cannot parse it.
+    """
+    selected = select_tier1_sql_expression(dialects)
+    if not selected:
+        return "Tier 1 selected an empty SQL expression."
+
+    error = check_select_shape(selected, "TRINO")
+    if error:
+        return f"Tier 1 executes the selected expression as TRINO SQL, but it is not executable: {error}"
     return None
 
 
@@ -457,6 +529,24 @@ def validate_metric(
                 )
             )
 
+    # Tier 1 selects TRINO when present, otherwise the first list entry, and
+    # always sends that selected expression through the Trino execution path.
+    # Declared-dialect validity alone therefore cannot predict runtime success.
+    trino_expression_already_checked = any(
+        is_trino_dialect(entry.get("dialect", "")) and bool(entry.get("expression")) for entry in dialects
+    )
+    if not trino_expression_already_checked:
+        tier1_error = check_tier1_execution_shape(dialects)
+        checks.append(
+            ValidationCheck(
+                check="sql_shape",
+                severity=Severity.ERROR,
+                passed=tier1_error is None,
+                message=tier1_error or "Tier 1 selected expression is executable as TRINO SQL",
+                details={"dialect": "TRINO", "executionPath": "tier1"},
+            )
+        )
+
     # ── Checks 2-5: OMS metadata validation (WARNING) ───────────────────
     # Only run if we have a lookup AND at least one successfully parsed SQL.
     if data_sources_lookup and data_source_id and parsed_dialects:
@@ -464,6 +554,23 @@ def validate_metric(
         checks.extend(_check_column_references(parsed_dialects, data_source_id, source_table, data_sources_lookup))
         checks.extend(_check_dimension_columns(parsed_dialects, data_source_id, source_table, data_sources_lookup))
         checks.extend(_check_filter_compatibility(parsed_dialects, data_source_id, source_table, data_sources_lookup))
+    elif data_source_id and source_table and parsed_dialects:
+        # An unconfigured namespace is not an outage and therefore cannot be a
+        # hard failure, but an empty report must not imply that sourceTable was
+        # verified. Surface the degraded check explicitly; validate maps this
+        # to INFO, while create/update return it as an advisory warning.
+        checks.append(
+            ValidationCheck(
+                check="table_reference",
+                severity=Severity.WARNING,
+                passed=False,
+                message=(
+                    f"Source table '{source_table}' was not verified because "
+                    "data source catalog metadata is not configured"
+                ),
+                details={"table": source_table, "dataSourceId": data_source_id, "verification": "unavailable"},
+            )
+        )
 
     # ── Check 6: Ontology class linkage (WARNING) ───────────────────────
     if ontology_lookup and ontology_concepts:
@@ -486,25 +593,49 @@ def _check_table_references(
 
     checks: list[ValidationCheck] = []
     tables_checked: set[str] = set()
+    source_table_lower = source_table.lower()
+    catalog_available = lookup.catalog_available(data_source_id)
+    known_tables = {table.lower() for table in lookup.known_tables(data_source_id)}
+
+    # Match the dedicated create/update sourceTable gate: a declaration can be
+    # qualified while the catalog exposes a bare name (or vice versa). A known
+    # name whose approved form cannot be resolved may still deserve a WARNING,
+    # but it is not a provably absent table and therefore must not become ERROR.
+    declared_source_known = source_table_lower in known_tables or source_table_lower.rsplit(".", 1)[-1] in known_tables
 
     for _dialect, stmts in parsed_dialects:
         for stmt in stmts:
             for table in stmt.find_all(exp.Table):
-                table_name = table.name
+                # DataZone indexes database-qualified names. ``Table.name``
+                # drops the qualifier, which turns an exact ``sales.orders``
+                # reference into the ambiguous bare ``orders`` when multiple
+                # databases expose that table name.
+                table_name = f"{table.db}.{table.name}" if table.db else table.name
                 if not table_name or table_name.lower() in tables_checked:
                     continue
                 tables_checked.add(table_name.lower())
 
                 exists = lookup.table_exists(data_source_id, table_name)
+                is_declared_source = bool(source_table) and table_name.lower() == source_table_lower
+                provable_source_absence = (
+                    is_declared_source
+                    and not exists
+                    and catalog_available
+                    and bool(known_tables)
+                    and not declared_source_known
+                )
                 checks.append(
                     ValidationCheck(
                         check="table_reference",
-                        severity=Severity.WARNING,
+                        severity=Severity.ERROR if provable_source_absence else Severity.WARNING,
                         passed=exists,
                         message=(
-                            f"Table '{table_name}' exists in data source"
+                            f"{'Source table' if is_declared_source else 'Table'} '{table_name}' exists in data source"
                             if exists
-                            else f"Table '{table_name}' not found in data source '{data_source_id}'"
+                            else (
+                                f"{'Source table' if is_declared_source else 'Table'} '{table_name}' "
+                                f"not found in data source '{data_source_id}'"
+                            )
                         ),
                         details={"table": table_name, "dataSourceId": data_source_id},
                     )
@@ -515,12 +646,11 @@ def _check_table_references(
     # source. Otherwise "missing" is indistinguishable from an unreadable or
     # not-yet-approved catalog, so it stays advisory. The loop above always stays
     # WARNING — find_all(exp.Table) also matches CTE/subquery aliases, which are
-    # not catalog tables.
+    # not catalog tables. The exact table that also equals the declared
+    # sourceTable is promoted above, because it is not an alias ambiguity.
     if source_table and source_table.lower() not in tables_checked:
         exists = lookup.table_exists(data_source_id, source_table)
-        provable_absence = (
-            not exists and lookup.catalog_available(data_source_id) and bool(lookup.known_tables(data_source_id))
-        )
+        provable_absence = not exists and catalog_available and bool(known_tables) and not declared_source_known
         checks.append(
             ValidationCheck(
                 check="table_reference",
