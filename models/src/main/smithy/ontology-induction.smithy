@@ -254,7 +254,10 @@ operation StartInduction {
         /// Defaults to ENHANCED when omitted.
         groundingMode: GroundingMode
 
-        /// Neptune Analytics graph ARN (required when strategy is unstructured_lexical_graph).
+        /// Caller-selected lexical sources are not supported. Providing this field
+        /// returns HTTP 422 with ``detail.code`` set to ``UNSUPPORTED_SOURCE``.
+        /// Omit it to use the deployment-configured lexical source.
+        @deprecated(message: "Caller-selected lexical sources are not supported; omit this field.", since: "2026-10-01")
         graphArn: String
     }
 
