@@ -9,16 +9,16 @@ Toolkit) so they run without any AWS infrastructure.
 
 from __future__ import annotations
 
+import importlib
 import json
 import sys
+import types
 from unittest.mock import MagicMock, patch
 
 import pytest
 from coa_common.constants import RESOURCE_PREFIX
 
 pytestmark = pytest.mark.unit
-
-import types
 
 from botocore.exceptions import ClientError
 from coa_control_plane_server.models.source_status import SourceStatus
@@ -39,6 +39,8 @@ def _stub_missing_modules() -> None:
         "llama_index.core.base.embeddings",
         "llama_index.core.base.embeddings.base",
         "llama_index.core.node_parser",
+        "llama_index.llms",
+        "llama_index.llms.bedrock_converse",
         "graphrag_toolkit",
         "graphrag_toolkit.lexical_graph",
         "graphrag_toolkit.lexical_graph.storage",
@@ -46,9 +48,16 @@ def _stub_missing_modules() -> None:
         "graphrag_toolkit.lexical_graph.indexing.build",
         "graphrag_toolkit.lexical_graph.indexing.extract",
         "graphrag_toolkit.lexical_graph.indexing.load",
+        "graphrag_toolkit.lexical_graph.utils",
+        "graphrag_toolkit.lexical_graph.utils.llm_cache",
         "graphrag_toolkit.lexical_graph.versioning",
     ]:
-        sys.modules.setdefault(dotted, types.ModuleType(dotted))
+        try:
+            importlib.import_module(dotted)
+        except ImportError:
+            module = types.ModuleType(dotted)
+            module.__coa_test_stub__ = True
+            sys.modules.setdefault(dotted, module)
 
     # make_llama_index_embedding (via coa_common) subclasses
     # BaseEmbedding at call time — provide a minimal stand-in so _setup_graphrag
@@ -100,6 +109,26 @@ def _stub_missing_modules() -> None:
     np = sys.modules["llama_index.core.node_parser"]
     if not hasattr(np, "SentenceSplitter"):
         np.SentenceSplitter = MagicMock()
+    # llm_cache's module constants are what the ProcessPool workers' Bedrock client is
+    # built from, so the patch rebinds them. Seed the toolkit's real defaults here —
+    # monkeypatch.setattr needs the attributes to exist, and a test that asserts the
+    # patch moved them off 60.0/2 is only meaningful if it starts there.
+    lcm = sys.modules["graphrag_toolkit.lexical_graph.utils.llm_cache"]
+    if not hasattr(lcm, "TIMEOUT"):
+        lcm.TIMEOUT = 60.0
+        lcm.MAX_ATTEMPTS = 2
+
+    # The extraction LLM is constructed as an instance so it can carry a timeout,
+    # which the toolkit's JSON config form silently drops. A stand-in that just
+    # records its kwargs lets the tests assert on what was passed.
+    bc = sys.modules["llama_index.llms.bedrock_converse"]
+    if not hasattr(bc, "BedrockConverse"):
+
+        class _StubBedrockConverse:
+            def __init__(self, **kwargs) -> None:
+                self.kwargs = kwargs
+
+        bc.BedrockConverse = _StubBedrockConverse
 
 
 _stub_missing_modules()
@@ -203,6 +232,29 @@ def _mock_ddb_access():
     return ddb
 
 
+def _llm_kwargs(llm) -> dict:
+    """The constructor arguments the extraction LLM was built with.
+
+    Two shapes are possible depending on what is installed. With
+    llama_index.llms.bedrock_converse stubbed (this module's default) the stand-in
+    records its kwargs. When the real package is importable — which happens as soon as
+    another test module in the same session imports it, since sys.modules is shared —
+    graph_build builds a real _PicklableBedrockConverse instead, and the same values
+    have to be read off the pydantic model. Reading the stub's dict only made these
+    tests pass or fail on collection order.
+    """
+    if hasattr(llm, "kwargs"):
+        return llm.kwargs
+    return {
+        "model": llm.model,
+        "max_tokens": llm.max_tokens,
+        "timeout": llm.timeout,
+        "max_retries": llm.max_retries,
+        "region_name": llm.region_name,
+        "botocore_config": llm.botocore_config,
+    }
+
+
 def _setup_graphrag_mocks(mock_gsf, mock_vsf, mock_idx_cls):
     mock_gs, mock_vs = MagicMock(), MagicMock()
     mock_gsf.for_graph_store.return_value.__enter__ = MagicMock(return_value=mock_gs)
@@ -220,6 +272,40 @@ def _setup_graphrag_mocks(mock_gsf, mock_vsf, mock_idx_cls):
 
 
 class TestEnvValidation:
+    @pytest.mark.parametrize(
+        ("name", "raw", "message"),
+        [
+            ("EXTRACTION_TIMEOUT_SECONDS", "not-a-number", "must be a number"),
+            ("EXTRACTION_TIMEOUT_SECONDS", "nan", "must be finite"),
+            ("EXTRACTION_TIMEOUT_SECONDS", "3601", "must be finite"),
+            ("EXTRACTION_CONNECT_TIMEOUT_SECONDS", "0", "must be finite"),
+            ("EXTRACTION_MAX_ATTEMPTS", "0", "must be in"),
+            ("EXTRACTION_MAX_ATTEMPTS", "many", "must be an integer"),
+            ("EXTRACTION_NUM_THREADS_PER_WORKER", "257", "must be in"),
+            ("EXTRACTION_NUM_THREADS_PER_WORKER", "4.5", "must be an integer"),
+        ],
+    )
+    def test_extraction_client_env_rejects_malformed_or_unsafe_values(
+        self, monkeypatch, mod_factory, name, raw, message
+    ):
+        monkeypatch.setenv(name, raw)
+
+        with pytest.raises(ValueError, match=message):
+            mod_factory()
+
+    def test_extraction_client_env_accepts_documented_bounds(self, monkeypatch, mod_factory):
+        monkeypatch.setenv("EXTRACTION_TIMEOUT_SECONDS", "3600")
+        monkeypatch.setenv("EXTRACTION_CONNECT_TIMEOUT_SECONDS", "0.1")
+        monkeypatch.setenv("EXTRACTION_MAX_ATTEMPTS", "20")
+        monkeypatch.setenv("EXTRACTION_NUM_THREADS_PER_WORKER", "256")
+
+        configured = mod_factory()
+
+        assert configured.EXTRACTION_TIMEOUT_SECONDS == 3600
+        assert configured.EXTRACTION_CONNECT_TIMEOUT_SECONDS == 0.1
+        assert configured.EXTRACTION_MAX_ATTEMPTS == 20
+        assert configured.EXTRACTION_NUM_THREADS_PER_WORKER == 256
+
     @pytest.mark.parametrize(
         "missing_var",
         [
@@ -805,21 +891,28 @@ class TestGraphRAGConfig:
     def test_extraction_llm_is_json_with_max_tokens(
         self, _cfg, mock_idx_cls, mock_gsf, mock_vsf, _ckpt, monkeypatch, mod
     ):
-        """extraction_llm must be a JSON config carrying max_tokens, not a bare ARN.
+        """extraction_llm must be an INSTANCE carrying max_tokens AND a timeout.
 
-        The toolkit's ``GraphRAGConfig.to_llm()`` hardcodes ``max_tokens=4096`` when
-        given a bare model string and only honours ``max_tokens`` from the JSON form.
-        At 4096 output tokens, extraction truncates mid-response on dense chunks and
-        that chunk's trailing entities/statements are silently lost.
+        Neither a bare ARN nor the JSON config form is enough. The toolkit's
+        ``GraphRAGConfig.to_llm()`` hardcodes ``max_tokens=4096`` for a bare string —
+        at which extraction truncates mid-response on dense chunks and that chunk's
+        trailing entities/statements are silently lost — and while the JSON form does
+        honour max_tokens, it reads only model/temperature/max_tokens/region_name/
+        profile_name and drops the timeout, leaving BedrockConverse's 60s default.
+        Under Sonnet 5 that default failed every retry of a 14-document run.
         """
         monkeypatch.setattr(mod, "BEDROCK_MODEL_ARN", "arn:aws:bedrock:us-east-1:1:inference-profile/m")
         _setup_graphrag_mocks(mock_gsf, mock_vsf, mock_idx_cls)
 
         mod._setup_graphrag("tenant-x")
 
-        assigned = json.loads(_cfg.extraction_llm)
+        assigned = _llm_kwargs(_cfg.extraction_llm)
         assert assigned["model"] == "arn:aws:bedrock:us-east-1:1:inference-profile/m"
         assert assigned["max_tokens"] == 16384
+        assert assigned["timeout"] == 300.0
+        # Region cannot be inherited from a session: the instance is pickled to
+        # ProcessPool workers, which rebuild the client from these fields alone.
+        assert assigned["region_name"] == mod.AWS_REGION
 
     @patch("graphrag_toolkit.lexical_graph.indexing.build.Checkpoint")
     @patch("graphrag_toolkit.lexical_graph.storage.VectorStoreFactory")
@@ -834,7 +927,153 @@ class TestGraphRAGConfig:
 
         mod._setup_graphrag("tenant-x")
 
-        assert json.loads(_cfg.extraction_llm)["max_tokens"] == 8192
+        assert _llm_kwargs(_cfg.extraction_llm)["max_tokens"] == 8192
+
+    @patch("graphrag_toolkit.lexical_graph.indexing.build.Checkpoint")
+    @patch("graphrag_toolkit.lexical_graph.storage.VectorStoreFactory")
+    @patch("graphrag_toolkit.lexical_graph.storage.GraphStoreFactory")
+    @patch("graphrag_toolkit.lexical_graph.LexicalGraphIndex")
+    @patch("graphrag_toolkit.lexical_graph.GraphRAGConfig")
+    def test_extraction_timeout_env_override(self, _cfg, mock_idx_cls, mock_gsf, mock_vsf, _ckpt, monkeypatch, mod):
+        """The timeout is tunable without a redeploy."""
+        monkeypatch.setattr(mod, "BEDROCK_MODEL_ARN", "arn:aws:bedrock:us-east-1:1:inference-profile/m")
+        monkeypatch.setattr(mod, "EXTRACTION_TIMEOUT_SECONDS", 900.0)
+        _setup_graphrag_mocks(mock_gsf, mock_vsf, mock_idx_cls)
+
+        mod._setup_graphrag("tenant-x")
+
+        assert _llm_kwargs(_cfg.extraction_llm)["timeout"] == 900.0
+
+
+class TestExtractionClientConfig:
+    """The botocore Config the extraction client is built with."""
+
+    @staticmethod
+    def _config_for(mod, _cfg, mock_gsf, mock_vsf, mock_idx_cls, monkeypatch, threads: int):
+        monkeypatch.setattr(mod, "BEDROCK_MODEL_ARN", "arn:aws:bedrock:us-east-1:1:inference-profile/m")
+        monkeypatch.setattr(mod, "EXTRACTION_NUM_THREADS_PER_WORKER", threads)
+        _setup_graphrag_mocks(mock_gsf, mock_vsf, mock_idx_cls)
+        mod._setup_graphrag("tenant-x")
+        return _llm_kwargs(_cfg.extraction_llm)["botocore_config"]
+
+    @pytest.mark.parametrize("threads", [16, 32])
+    @patch("graphrag_toolkit.lexical_graph.indexing.build.Checkpoint")
+    @patch("graphrag_toolkit.lexical_graph.storage.VectorStoreFactory")
+    @patch("graphrag_toolkit.lexical_graph.storage.GraphStoreFactory")
+    @patch("graphrag_toolkit.lexical_graph.LexicalGraphIndex")
+    @patch("graphrag_toolkit.lexical_graph.GraphRAGConfig")
+    def test_pool_is_never_smaller_than_the_per_process_fanout(
+        self, _cfg, mock_idx_cls, mock_gsf, mock_vsf, _ckpt, monkeypatch, mod, threads
+    ):
+        """Assert the invariant, not a literal: the pool tracks the fan-out.
+
+        botocore defaults to 10 connections while this task runs 16 async calls per
+        process, and urllib3's block=False means the excess neither queues nor warns —
+        so an undersized pool is invisible. Pinning the relationship rather than the
+        number keeps it correct if the fan-out is retuned.
+        """
+        cfg = self._config_for(mod, _cfg, mock_gsf, mock_vsf, mock_idx_cls, monkeypatch, threads)
+        assert cfg.max_pool_connections >= threads
+
+    @patch("graphrag_toolkit.lexical_graph.indexing.build.Checkpoint")
+    @patch("graphrag_toolkit.lexical_graph.storage.VectorStoreFactory")
+    @patch("graphrag_toolkit.lexical_graph.storage.GraphStoreFactory")
+    @patch("graphrag_toolkit.lexical_graph.LexicalGraphIndex")
+    @patch("graphrag_toolkit.lexical_graph.GraphRAGConfig")
+    def test_pool_keeps_a_floor_below_the_fanout(self, _cfg, mock_idx_cls, mock_gsf, mock_vsf, _ckpt, monkeypatch, mod):
+        """A small fan-out must not shrink the pool below botocore's own default."""
+        cfg = self._config_for(mod, _cfg, mock_gsf, mock_vsf, mock_idx_cls, monkeypatch, 2)
+        assert cfg.max_pool_connections == 10
+
+    @patch("graphrag_toolkit.lexical_graph.indexing.build.Checkpoint")
+    @patch("graphrag_toolkit.lexical_graph.storage.VectorStoreFactory")
+    @patch("graphrag_toolkit.lexical_graph.storage.GraphStoreFactory")
+    @patch("graphrag_toolkit.lexical_graph.LexicalGraphIndex")
+    @patch("graphrag_toolkit.lexical_graph.GraphRAGConfig")
+    def test_connect_timeout_is_not_the_read_timeout(
+        self, _cfg, mock_idx_cls, mock_gsf, mock_vsf, _ckpt, monkeypatch, mod
+    ):
+        """Collapsing the two makes an unreachable endpoint look like a slow model.
+
+        Both upstream paths set connect and read from one value; that is what made a
+        network fault indistinguishable from the model taking its time.
+        """
+        cfg = self._config_for(mod, _cfg, mock_gsf, mock_vsf, mock_idx_cls, monkeypatch, 16)
+        assert cfg.read_timeout == mod.EXTRACTION_TIMEOUT_SECONDS
+        assert cfg.connect_timeout < cfg.read_timeout
+
+    @patch("graphrag_toolkit.lexical_graph.indexing.build.Checkpoint")
+    @patch("graphrag_toolkit.lexical_graph.storage.VectorStoreFactory")
+    @patch("graphrag_toolkit.lexical_graph.storage.GraphStoreFactory")
+    @patch("graphrag_toolkit.lexical_graph.LexicalGraphIndex")
+    @patch("graphrag_toolkit.lexical_graph.GraphRAGConfig")
+    def test_retries_are_explicit_and_bounded(self, _cfg, mock_idx_cls, mock_gsf, mock_vsf, _ckpt, monkeypatch, mod):
+        """Supplying a Config means an omitted retries block silently reverts to legacy.
+
+        botocore rewrites ``max_attempts: N`` to ``total_max_attempts: N + 1`` when a
+        real Config is constructed, and leaves the key alone when the class is stubbed —
+        so assert the mode and the effective bound rather than the literal dict.
+        """
+        cfg = self._config_for(mod, _cfg, mock_gsf, mock_vsf, mock_idx_cls, monkeypatch, 16)
+        retries = cfg.retries
+        assert retries["mode"] == "standard", "an omitted mode falls back to botocore's legacy default"
+        attempts = retries.get("total_max_attempts", retries.get("max_attempts", 0) + 1)
+        assert attempts == mod.EXTRACTION_MAX_ATTEMPTS + 1
+        assert attempts < 10, "retrying a read timeout dozens of times is what burned 45 minutes"
+
+
+class TestLlmCacheClientPatch:
+    """The worker-side client config, which is the one extraction actually uses."""
+
+    def test_patch_overrides_the_toolkit_timeout_and_attempts(self, monkeypatch, mod):
+        """Asserting on our own BedrockConverse is not enough to know the timeout applies.
+
+        Pickling to a ProcessPool strips the LLM's client, and LLMCache.predict then
+        builds its own from llm_cache's module constants (TIMEOUT = 60.0,
+        MAX_ATTEMPTS = 2). A run configured for 300s died on ReadTimeoutError because
+        those two numbers, not ours, were in force. This asserts the constants the
+        worker reads, so a change that only reaches our object fails here.
+        """
+        import graphrag_toolkit.lexical_graph.utils.llm_cache as llm_cache
+
+        monkeypatch.setattr(llm_cache, "TIMEOUT", 60.0)
+        monkeypatch.setattr(llm_cache, "MAX_ATTEMPTS", 2)
+        monkeypatch.setattr(mod, "_graphrag_llm_client_patched", False)
+        monkeypatch.setattr(mod, "EXTRACTION_TIMEOUT_SECONDS", 300.0)
+        monkeypatch.setattr(mod, "EXTRACTION_MAX_ATTEMPTS", 5)
+
+        mod._patch_graphrag_llm_cache_client_config()
+
+        assert llm_cache.TIMEOUT == 300.0, "the toolkit default would still be 60s"
+        assert llm_cache.MAX_ATTEMPTS == 5
+
+    def test_patch_is_idempotent(self, monkeypatch, mod):
+        """_setup_graphrag can run more than once per process (separated mode)."""
+        import graphrag_toolkit.lexical_graph.utils.llm_cache as llm_cache
+
+        monkeypatch.setattr(mod, "_graphrag_llm_client_patched", False)
+        monkeypatch.setattr(mod, "EXTRACTION_TIMEOUT_SECONDS", 300.0)
+
+        mod._patch_graphrag_llm_cache_client_config()
+        monkeypatch.setattr(llm_cache, "TIMEOUT", 999.0)
+        mod._patch_graphrag_llm_cache_client_config()
+
+        assert llm_cache.TIMEOUT == 999.0, "second call should be a no-op, not a re-apply"
+
+    def test_setup_graphrag_applies_the_patch(self, monkeypatch, mod):
+        """The patch is useless if _setup_graphrag does not call it."""
+        called: list[bool] = []
+        monkeypatch.setattr(mod, "_patch_graphrag_llm_cache_client_config", lambda: called.append(True))
+        monkeypatch.setattr(mod, "BEDROCK_MODEL_ARN", "")
+        with (
+            patch("graphrag_toolkit.lexical_graph.GraphRAGConfig"),
+            patch("graphrag_toolkit.lexical_graph.LexicalGraphIndex"),
+            patch("graphrag_toolkit.lexical_graph.storage.GraphStoreFactory"),
+            patch("graphrag_toolkit.lexical_graph.storage.VectorStoreFactory"),
+        ):
+            mod._setup_graphrag("tenant-x")
+
+        assert called == [True]
 
 
 # ===================================================================
@@ -1145,11 +1384,18 @@ class TestMainFlow:
         mock_index, _, _ = _setup_graphrag_mocks(mock_gsf, mock_vsf, mock_idx_cls)
         mock_index.extract_and_build.side_effect = RuntimeError("fail")
 
-        with patch("llama_index.core.Document") as MockDoc:
+        # The backend health check opens a real OpenSearch client, so stub it:
+        # the exit code under test must come from the failed extraction, not from
+        # a health check that fails because the test has no backend.
+        with (
+            patch.object(mod, "_check_backend_health", return_value=True),
+            patch("llama_index.core.Document") as MockDoc,
+        ):
             MockDoc.side_effect = lambda **kw: MagicMock(**kw)
             with pytest.raises(SystemExit) as exc_info:
                 mod.main()
             assert exc_info.value.code == 1
+        mock_index.extract_and_build.assert_called_once()
 
 
 # ===================================================================
