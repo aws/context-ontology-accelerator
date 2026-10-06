@@ -465,6 +465,10 @@ field. Scan job detail (including the `errorMessage` field on failure) is
 available via `GET .../sources/{sourceId}/scan/{jobId}` — see
 **GetSource** / **GetSourceScanJob** in the [API Reference](#/api-reference).
 
+While a source is `ENRICHING`, the web UI shows a progress bar of tables
+processed out of the total. A table counts once enrichment has finished with it,
+even if it failed, and tables a re-scan found unchanged count immediately.
+
 ### Interpreting Errors
 
 | Status | Meaning | Action |
@@ -641,6 +645,20 @@ jobs, depending on the status the source is in when you call it:
 Calling re-scan on a database source in any other status returns a
 `409 Conflict` naming the statuses that are allowed.
 
+!!! tip "Automatic re-scans"
+    Instead of calling re-scan by hand, a database source can re-scan itself:
+
+    - **On a schedule** — `PUT .../sources/{sourceId}/rescan-schedule` with an
+      EventBridge `rate()` or `cron()` expression (see **PutSourceRescanSchedule**
+      in the [API Reference](#/api-reference)). Sub-hourly cadences are rejected.
+    - **On Glue catalog changes** — `PUT .../sources/{sourceId}/event-rescan`
+      (Glue sources only; see **PutSourceEventRescan**). Table and database
+      create, update, and delete trigger a re-scan. Partition changes do not, and
+      bursts of changes are coalesced into one re-scan.
+
+    Automatic re-scans end in `RESCAN_REVIEW` like a manual one, so nothing
+    changes until a steward approves it, and they never discard an open review.
+
 ### When to Re-scan
 
 - **After a scan fails** (`SCAN_FAILED`) and you have corrected the cause — bad
@@ -730,7 +748,8 @@ changes nothing.
 a single audit trail — see **ListSourceScanJobs** in the
 [API Reference](#/api-reference). It combines two kinds of event:
 
-- **Scans** — each discovery and enrichment run, including failures.
+- **Scans** — each discovery and enrichment run, including failures. Each row
+  shows its trigger: `INITIAL`, `MANUAL`, `SCHEDULED`, or `EVENT`.
 - **Review decisions** — approvals, rejections, and re-scan decisions.
 
 The web UI renders this on the source's **Scan history** tab. Use it to answer

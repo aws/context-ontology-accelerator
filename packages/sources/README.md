@@ -490,6 +490,10 @@ Consumes SQS messages from the bulk review queue and applies the review decision
 | `TENANT_ID` | Yes | Injected by Step Functions container override |
 | `STAGING_PREFIX` | Yes | Injected by Step Functions container override |
 | `EXTRACTION_MODE` | Yes | Injected by Step Functions container override |
+| `EXTRACTION_TIMEOUT_SECONDS` | No | Bedrock extraction read timeout in seconds (default: `300`; range: `1`–`3600`) |
+| `EXTRACTION_CONNECT_TIMEOUT_SECONDS` | No | Bedrock connection timeout in seconds (default: `10`; range: `0.1`–`300`) |
+| `EXTRACTION_MAX_ATTEMPTS` | No | Bounded extraction retry attempts (default: `5`; range: `1`–`20`) |
+| `EXTRACTION_NUM_THREADS_PER_WORKER` | No | Per-process extraction fan-out used to size the HTTP connection pool (default: `4`; range: `1`–`256`) |
 
 ### Ingestion Trigger Lambda (`sources-doc-ingestion-trigger`)
 

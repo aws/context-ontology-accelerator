@@ -218,7 +218,10 @@ class WorkbenchInductionRequest(BaseModel):
     grounding_mode: str = Field(
         default="ENHANCED", validation_alias=AliasChoices("grounding_mode", "groundingMode")
     )  # "NONE" | "STANDARD" | "ENHANCED"
-    graph_arn: str | None = None
+    graph_arn: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("graph_arn", "graphArn"),
+    )
 
     @field_validator("ontology_uri_prefix")
     @classmethod
@@ -1139,8 +1142,9 @@ def start_induction(body: WorkbenchInductionRequest, request: Request, namespace
         The pending :class:`JobResponse` for the newly started job.
 
     Raises:
-        HTTPException: 422 if the Neptune endpoint is unconfigured for an
-            unstructured run, or 409 if another induction/proposal is in flight.
+        HTTPException: 422 if the requested lexical source is unsupported or
+            the Neptune endpoint is unconfigured for an unstructured run; 409
+            if another induction/proposal is in flight.
     """
     # Dispatch to unstructured pipeline if strategy is unstructured_lexical_graph
     if getattr(body, "strategy", "") == "unstructured_lexical_graph":
@@ -1151,18 +1155,23 @@ def start_induction(body: WorkbenchInductionRequest, request: Request, namespace
             start_induction as start_unstructured,
         )
 
-        # graph_arn must satisfy UnstructuredInductionRequest's SSRF guard:
-        # EITHER a canonical Neptune Analytics ARN OR the literal "neptune-db"
-        # sentinel (which tells the unstructured worker to resolve the NDB
-        # endpoint from server-side config — see _build_lexical_store; the
-        # caller-supplied value is never used as an endpoint URL). If the caller
-        # passed an explicit NA ARN, forward it; otherwise use the "neptune-db"
-        # sentinel. Passing the raw NDB cluster URL here fails the regex → 500
-        # (regression once the SSRF pattern landed on the request schema).
-        explicit_arn = getattr(body, "graph_arn", None)
-        graph_arn = explicit_arn if explicit_arn and explicit_arn.startswith("arn:aws:neptune-graph:") else "neptune-db"
+        graph_arn = getattr(body, "graph_arn", None) or "neptune-db"
+        if graph_arn != "neptune-db":
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "UNSUPPORTED_SOURCE",
+                    "message": "The requested lexical graph source is not supported.",
+                },
+            )
         if graph_arn == "neptune-db" and not request.app.state.config.get("neptune_endpoint", ""):
-            raise HTTPException(422, "Neptune endpoint not configured for unstructured induction")
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "CONFIGURATION_ERROR",
+                    "message": "The lexical graph source is not configured.",
+                },
+            )
 
         unstructured_body = UnstructuredInductionRequest(
             graph_arn=graph_arn,
