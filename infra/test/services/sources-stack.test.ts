@@ -2934,6 +2934,15 @@ describe("SourcesStack", () => {
       });
     });
 
+    it("gives the worker RESOURCE_PREFIX so it derives catalog names itself instead of trusting the message", () => {
+      template.hasResourceProperties("AWS::Lambda::Function", {
+        FunctionName: Match.stringLikeRegexp(".*sources-delete-worker$"),
+        Environment: Match.objectLike({
+          Variables: Match.objectLike({ RESOURCE_PREFIX: "coa-dev-" }),
+        }),
+      });
+    });
+
     it("alarms the delete queue + DLQ so an orphaned teardown pages, not accumulates silently", () => {
       // monitorQueueWithDlq adds a DLQ max-size alarm dimensioned by the DLQ
       // QueueName. Assert at least one CloudWatch alarm references the

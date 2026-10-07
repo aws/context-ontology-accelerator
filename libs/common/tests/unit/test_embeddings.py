@@ -12,6 +12,10 @@ timeout, per-text sanitisation, and the retry↔subdivide layering.
 from __future__ import annotations
 
 import json
+import multiprocessing
+import pickle
+import subprocess
+import sys
 from unittest.mock import MagicMock
 
 import pytest
@@ -446,6 +450,51 @@ class TestLlamaIndexAdapter:
         adapter = make_llama_index_embedding(model_id="us.cohere.embed-v4:0", dimensions=1024)
         assert isinstance(adapter, BaseEmbedding)
         assert adapter.model_name == "us.cohere.embed-v4:0"
+
+
+class TestLlamaIndexAdapterAcrossProcesses:
+    """graphrag's KG build unpickles the adapter in workers started with the
+    ``spawn`` method. Those workers import ``coa_common.embeddings`` fresh and
+    never call the factory, so the class must resolve by name on its own."""
+
+    def test_module_getattr_fresh_interpreter_resolves_adapter_class(self):
+        code = (
+            "import coa_common.embeddings as m\n"
+            "cls = m.BedrockEmbedderLlamaIndex\n"
+            "assert cls.__module__ == 'coa_common.embeddings', cls.__module__\n"
+            "print(cls.__qualname__)\n"
+        )
+        proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120)
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == "BedrockEmbedderLlamaIndex"
+
+    @pytest.mark.parametrize("start_method", ["spawn", "forkserver"])
+    def test_adapter_unpickles_in_fresh_worker_process(self, start_method):
+        if start_method not in multiprocessing.get_all_start_methods():
+            pytest.skip(f"{start_method} start method not available on this platform")
+        adapter = make_llama_index_embedding(model_id="us.cohere.embed-v4:0", dimensions=1024)
+        payload = pickle.dumps(adapter)
+
+        # The child runs pickle.loads on the payload (the same step a graphrag
+        # worker runs) and sends the restored instance back.
+        ctx = multiprocessing.get_context(start_method)
+        with ctx.Pool(1) as pool:
+            restored = pool.apply(pickle.loads, (payload,))
+
+        assert type(restored).__qualname__ == "BedrockEmbedderLlamaIndex"
+        assert restored.embed_model_id == "us.cohere.embed-v4:0"
+        assert restored.embed_dimensions == 1024
+
+    def test_module_getattr_returns_cached_class(self):
+        assert embeddings.BedrockEmbedderLlamaIndex is embeddings.BedrockEmbedderLlamaIndex
+        adapter = make_llama_index_embedding(model_id="us.cohere.embed-v4:0", dimensions=1024)
+        assert type(adapter) is embeddings.BedrockEmbedderLlamaIndex
+
+    def test_module_getattr_unknown_name_raises_attribute_error(self):
+        missing = "NoSuchThing"
+        with pytest.raises(AttributeError, match="has no attribute 'NoSuchThing'"):
+            getattr(embeddings, missing)
+        assert not hasattr(embeddings, missing)
 
 
 class TestCostTracking:

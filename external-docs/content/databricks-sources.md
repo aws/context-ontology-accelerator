@@ -69,20 +69,35 @@ behind, reusable for the next one — and yours to clean up if there is no next 
 - [ ] A SQL Warehouse, running or with an auto-stop window you have chosen deliberately (see [Cost](#cost-you-should-know-before-the-bill))
 - [ ] The warehouse's **server hostname** and **HTTP path**, from its *Connection details* tab
 - [ ] The Unity Catalog **catalog** and the one **schema** this source will expose
-- [ ] Unity Catalog grants including **`SELECT` on every table** — visibility is not readability, see below
+- [ ] Unity Catalog grants including **`SELECT` on every table** and **`USE CATALOG` on `system`** — visibility is not readability, see below
 - [ ] A Secrets Manager secret in **this deployment's Region**, holding a personal access token or an OAuth client id and secret
 - [ ] An IAM role named **`{prefix}-datasource-access-*`** at the **root IAM path**, trusting **both** platform principals with the namespace's External ID, and permitted to `DescribeSecret` and `GetSecretValue` on that one secret
 - [ ] Not a PrivateLink-only workspace — the connector runs in the platform's VPC, which has no path to your workspace's private endpoint
 
 ## 1. Grant Unity Catalog access
 
-The credential needs three things, and the third is the one that gets missed:
+The credential needs these grants, and the third is the one that gets missed:
 
 ```sql
 GRANT USE CATALOG ON CATALOG main TO `coa-service-principal`;
 GRANT USE SCHEMA  ON SCHEMA main.sales TO `coa-service-principal`;
 GRANT SELECT      ON SCHEMA main.sales TO `coa-service-principal`;
+GRANT USE CATALOG ON CATALOG system TO `coa-service-principal`;
 ```
+
+!!! warning "`USE CATALOG` on `system` is also required"
+    Databricks resolves each catalog's `information_schema` through the `system`
+    catalog. Without this grant, every scan fails with `[INSUFFICIENT_PERMISSIONS]
+    ... User does not have USE CATALOG on Catalog 'system'` and discovers 0
+    tables, even though the three grants above are in place. Many workspaces
+    already allow this, so you may never hit it; grant it anyway.
+
+    The grant is traversal-only. It does not give access to `system.billing`,
+    `system.access`, `system.query` or any other system schema, which each need
+    their own enablement and `SELECT`. If a system schema already has a broad
+    `SELECT` (for example to `account users`), this grant exposes it to the
+    principal, so check the principal's effective permissions on `system` first:
+    `GET /api/2.1/unity-catalog/effective-permissions/catalog/system?principal=<application-id>`.
 
 !!! warning "`information_schema` visibility is not `SELECT`"
     A table visible with `BROWSE` or `USE SCHEMA` but not `SELECT`-able is
@@ -689,6 +704,7 @@ State these before onboarding at scale; none of them is a bug to wait out.
 | `400` on create saying the trust policy does not require the External ID | The role was assumable while presenting a value belonging to no namespace, so any namespace in the deployment could use it | Add `Condition StringEquals sts:ExternalId` to the statement naming the platform principals. To share the role between namespaces, list each one's External ID there |
 | `400` on create naming the Region | The secret is outside this deployment's Region | Replicate or re-create the secret in this Region |
 | `400` on create saying no connector is deployed | This environment has no Databricks connector — the create resolves its ARN from a deployment parameter | Ask the deployment owner to deploy the connector for this environment |
+| Scan fails with `[INSUFFICIENT_PERMISSIONS]` naming `USE CATALOG` on Catalog `'system'`, 0 tables discovered | The principal lacks `USE CATALOG` on the `system` catalog, which the per-catalog `information_schema` read needs | `GRANT USE CATALOG ON CATALOG system TO <principal>` (see [step 1](#1-grant-unity-catalog-access)), then re-scan |
 | Scan succeeds; fewer tables than expected | Unity Catalog privilege-filtered the listing, or a table filter excluded them | Grant `SELECT` on the schema; check `tableFilter` / `tableExcludeFilter` |
 | Scan reports metadata incomplete and names tables | Those tables were listed but not readable — usually `BROWSE` without `SELECT` | Grant `SELECT`, then re-scan the source to pick them up |
 | No declared keys reached the ontology | The estate declares none, or the runtime predates Databricks Runtime 13.3 LTS, or the parent table is outside the exposed schema | Declare them in Databricks, or accept inferred relationships and review them |
@@ -734,7 +750,7 @@ effort. That cost is exactly why "do nothing" stays supported.
 
 ## Quick checklist
 
-- [ ] `USE CATALOG`, `USE SCHEMA` and **`SELECT`** granted on the exposed schema
+- [ ] `USE CATALOG`, `USE SCHEMA` and **`SELECT`** granted on the exposed schema, plus `USE CATALOG` on the `system` catalog
 - [ ] Secret in this deployment's Region, holding `{"client_id","client_secret"}` (recommended) or `{"token"}`
 - [ ] Role named `{prefix}-datasource-access-*`, at the root IAM path (no `--path`), in any account
 - [ ] Trust policy names **both** the sources API role and the connector role, and conditions on `sts:ExternalId` = the namespace's `datasourceExternalId`
