@@ -68,8 +68,15 @@ class TestGenerateConfigFromDb:
                 )
             ],
         )
-        cfg = generate_config_from_db([t], _PREFIX)
-        ref = [c for c in cfg.classes[0].constraints if c.constraint_type == ConstraintType.REFERENCE]
+        # The FK target must be minted this run or it degrades to a literal.
+        customers = _tbl(
+            "customers",
+            [CatalogColumn(name="id", dataType="INT", constraint="PRIMARY_KEY")],
+            [CatalogConstraint(constraintType="PRIMARY_KEY", columns=["id"])],
+        )
+        cfg = generate_config_from_db([t, customers], _PREFIX)
+        orders_cls = next(c for c in cfg.classes if c.class_name == "orders")
+        ref = [c for c in orders_cls.constraints if c.constraint_type == ConstraintType.REFERENCE]
         assert len(ref) == 1
         assert ref[0].params["target_class"].endswith("Customers")
 

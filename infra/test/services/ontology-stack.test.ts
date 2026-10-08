@@ -268,6 +268,19 @@ describe("OntologyStack", () => {
     });
   });
 
+  test("api proxy DescribeTable is scoped to the sources table, not *", () => {
+    const statements = Object.values(
+      template.findResources("AWS::IAM::Policy"),
+    ).flatMap((p) => p.Properties.PolicyDocument.Statement);
+    const describe = statements.filter(
+      (s) => s.Action === "dynamodb:DescribeTable",
+    );
+    expect(describe).toHaveLength(1);
+    expect(describe[0].Sid).toBe("HealthCheckDescribeSourcesTable");
+    expect(describe[0].Resource).not.toBe("*");
+    expect(JSON.stringify(describe[0].Resource)).toContain(":table/");
+  });
+
   test("task role has Bedrock access", () => {
     template.hasResourceProperties("AWS::IAM::Policy", {
       PolicyDocument: Match.objectLike({

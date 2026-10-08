@@ -15,52 +15,71 @@ This guide walks you through deploying Context Ontology Accelerator into your AW
 | Java | 17+ | Smithy code generation |
 | Docker | — | Container image builds |
 
-### ARM64 container builds on x86_64 hosts
+### Cross-architecture container builds
 
-Several CDK assets are built explicitly for `linux/arm64`: the Context Manager
-(Serve), MCP, and VKG images. A native ARM64 machine needs no emulation. An
-x86_64 Linux host must have binfmt/QEMU registered before Docker can execute
-ARM64 build steps; otherwise the build commonly stops with `exec format error`.
+The CDK assets are built for two architectures, so every build host needs
+emulation for one of them:
+
+| Built for | Images |
+|---|---|
+| `linux/arm64` | Context Manager (Serve), MCP, VKG |
+| `linux/amd64` | Ontology engine, DB enrichment, document KG build |
+
+An x86_64 host needs ARM64 emulation; an ARM64 host (Apple Silicon, Graviton)
+needs amd64 emulation. Docker can only run a build's `RUN` steps for another
+architecture once binfmt/QEMU is registered for it; otherwise the build
+commonly stops with `exec format error`.
+The preflight check (`scripts/preflight-deploy.sh`) fails on an x86_64 Linux
+host where it finds no ARM64 emulation, before CDK starts building.
 
 Docker Desktop includes multi-platform emulation on supported installations.
 Verify the active Docker builder before deploying:
 
 ```bash
 docker buildx inspect --bootstrap
-docker run --rm --platform linux/arm64 alpine uname -m
+docker run --rm --platform linux/arm64 alpine uname -m   # x86_64 host: should print aarch64
+docker run --rm --platform linux/amd64 alpine uname -m   # ARM64 host: should print x86_64
 ```
 
-The builder's platform list should include `linux/arm64`, and the second command
-should print `aarch64`. If Docker Engine on Linux does not have ARM64 emulation,
-follow [Docker's QEMU setup guidance](https://docs.docker.com/build/building/multi-platform/#qemu).
+The builder's platform list should include both `linux/arm64` and
+`linux/amd64`. If Docker Engine on Linux is missing the emulator for the other
+architecture, follow [Docker's QEMU setup guidance](https://docs.docker.com/build/building/multi-platform/#qemu).
 The [tonistiigi/binfmt installer](https://github.com/tonistiigi/binfmt#installing-emulators)
 accepts an architecture-specific install so the host only registers the
-emulator needed here:
+emulator it needs:
 
 ```bash
+# x86_64 host
 docker run --privileged --rm tonistiigi/binfmt --install arm64
+# ARM64 host
+docker run --privileged --rm tonistiigi/binfmt --install amd64
 
 # Verify again before make deploy-dev
-docker run --rm --platform linux/arm64 alpine uname -m
+docker run --rm --platform linux/arm64 alpine uname -m   # x86_64 host
+docker run --rm --platform linux/amd64 alpine uname -m   # ARM64 host
 ```
 
 !!! warning "binfmt installation is privileged"
     Registering binfmt modifies the host kernel configuration and the command
     above runs a privileged container. Follow your organization's host-security
-    policy. Where privileged setup is not allowed, use a native ARM64 builder or
-    supply prebuilt ARM64 ECR images instead of building the assets locally.
-    `context_manager_image_uri` supplies the shared Context Manager image used
-    by the Serve and MCP stacks. VKG requires `vkg_image_uri` together with
-    `ecr_repository_arn` and `ecr_repository_name`.
+    policy. Where privileged setup is not allowed, supply prebuilt ECR images
+    for the other architecture instead of building those assets locally.
+    ARM64: `context_manager_image_uri` supplies the shared Context Manager
+    image used by the Serve and MCP stacks; VKG requires `vkg_image_uri`
+    together with `ecr_repository_arn` and `ecr_repository_name`. amd64:
+    `ontology_engine_image_uri`, `sources_db_enrichment_image_uri` and
+    `sources_kg_build_image_uri`, each also with `ecr_repository_arn` and
+    `ecr_repository_name`.
 
 If a build still fails:
 
 1. Check whether `CDK_DOCKER` selects Docker, Finch, or another engine. Register
    emulation in the same engine that CDK will use.
 2. When Docker is active, re-run `docker buildx inspect --bootstrap` and confirm
-   `linux/arm64` is listed.
-3. Run the Docker Alpine verification command above. An `exec format error` there is a
-   host/emulation problem, before CDK or application code is involved.
+   the other architecture (`linux/arm64` or `linux/amd64`) is listed.
+3. Run the Docker Alpine verification command above for that platform. An
+   `exec format error` there is a host/emulation problem, before CDK or
+   application code is involved.
 4. On a remote or custom builder, inspect the selected builder with
    `docker buildx ls`; registration on the local default engine does not
    configure a different builder automatically.
@@ -294,7 +313,7 @@ mise install
 make setup
 ```
 
-`make deploy-dev` re-checks required toolchain versions and re-runs Smithy codegen (`make generate`) automatically if `smithy-generated/` is missing or stale, so a manual re-run is only needed if you want generated artifacts refreshed without doing a full deploy.
+`make deploy-dev` re-checks required toolchain versions and re-runs Smithy codegen (`make generate`) automatically if `smithy-generated/` is missing or stale — stale meaning a Smithy model or the codegen configuration changed since it was last generated, as after a `git pull` that changes an API — so a manual re-run is only needed if you want generated artifacts refreshed without doing a full deploy.
 
 ## Deploy
 
@@ -304,7 +323,7 @@ make deploy-dev
 
 This runs `scripts/deploy.sh` which:
 
-1. **Preflight checks** — verifies toolchain versions (Node, Java, pnpm), Docker, regenerates Smithy artifacts if missing/stale, authenticates to ECR Public, checks VPC quota
+1. **Preflight checks** — verifies toolchain versions (Node, Java, pnpm), Docker (including ARM64 emulation on x86_64 hosts), regenerates Smithy artifacts if missing/stale, authenticates to ECR Public, checks VPC quota
 2. **Builds all packages** — compiles TypeScript, bundles Lambdas
 3. **Synthesizes CloudFormation** — generates templates from CDK
 4. **Deploys all stacks** — CDK handles ordering via dependency graph
@@ -460,6 +479,19 @@ SCL_DB_SCAN_ENRICHMENT_TIMEOUT_MINUTES=180 make deploy-dev
 
 The value is minutes and must be a positive number; CDK fails synth otherwise. On a direct `cdk deploy` (rather than the `make`/`deploy.sh` path) pass it as CDK context instead — `--context dbScanEnrichmentTimeoutMinutes=180`, or set it in the `context` block of `infra/cdk.json`. The Step Functions state-machine ceiling is derived automatically as this value plus two minutes, so the per-task deadline always trips first and routes the source to `SCAN_FAILED`.
 
+#### Neptune instance class
+
+The knowledge-graph store is a single provisioned Neptune instance. It defaults to **`db.r8g.large`** (2 vCPU / 16 GiB) — the smaller Graviton class that keeps a first-time or single-tenant deploy's cost down. Neptune sizing is driven by **query concurrency × per-query cost, not graph size**: it allocates two query threads per vCPU, so `large` serves four concurrent SPARQL queries. A `db.r8g.large` runs about **$174/month** on-demand; each step up (`xlarge`, `2xlarge`) doubles both the instance and the price.
+
+```bash
+# Deploy dev Neptune on the larger class (default is db.r8g.large)
+SCL_NEPTUNE_INSTANCE_CLASS=db.r8g.xlarge make deploy-dev
+```
+
+Raise it when SPARQL queries fail with `MemoryLimitExceededException` while CPU sits near 100% — Neptune runs its own memory manager, so query out-of-memory alongside a healthy-looking `FreeableMemory` is AWS's documented signal to add capacity, not a sign the graph is too big. This typically shows up under heavy concurrent load (e.g. a parallel benchmark run), not single-user traffic — a cache-resident graph that OOMs under concurrency often points at a pathological query shape worth fixing before paying for a permanently larger instance.
+
+Valid values are any Graviton (`db.r8g.*`) Neptune instance class offered in your region and AZ. On a direct `cdk deploy` pass it as context instead — `--context neptune_instance_class=db.r8g.xlarge`. Changing the class on a later deploy is an **in-place modify with a short reboot** of that instance (no data loss, since storage is separate), so dev can resize up or down freely; for a non-`dev` environment, do it in a maintenance window or behind a multi-AZ failover.
+
 #### Whole-request budget
 
 Every `/query` request shares one wall clock across all tiers and strategies, defaulting to **170 seconds**. It is the outer bound that each per-stage timeout — including the translation budget below — sits inside, so raising a stage above it buys nothing.
@@ -470,6 +502,31 @@ cdk deploy --context resolve_timeout_s=240
 ```
 
 The value is seconds and is clamped to 10–300, so passing a larger number does not widen the budget. It is one setting on one runtime: REST, MCP and streaming callers all get the same figure, and it does not lift the transport-level 29-second REST ceiling described below. Raise it when questions on wide namespaces are cut off mid-answer rather than answered wrongly — and note that on the default `nl_to_sql_first` strategy the stages share this budget in order, so time an earlier stage spends is taken off the ones after it.
+
+#### Deep-reasoning gather budget
+
+Tier-3 **deep reasoning** runs an agentic tool-use loop (graph traversal, vector search, NL→SQL, and the strategy retrievers) before it synthesizes an answer. The time it may spend *gathering* — before it must stop and synthesize from what it has — is bounded by a budget defaulting to **110 seconds**, sized to sit inside the whole-request budget above (`budget + a synthesis reserve < resolve_timeout_s`).
+
+Unlike the whole-request budget, hitting this one is **not** an error: the agent gracefully stops gathering and synthesizes from whatever context it collected, so an exhausted budget surfaces as a **wrong or incomplete answer**, not a timeout. Raise it when deep-reasoning answers degrade in quality because the agent is being cut off mid-gather — typically under concurrency, where each request's wall-clock stretches and the loop runs out of budget before its retrieval tools finish (observed symptom: retrieval tools handed a near-zero deadline and returning nothing).
+
+```bash
+# Allow up to 145 seconds of gathering before synthesis (default is 110)
+SCL_DEEP_REASONING_TIME_BUDGET_SECONDS=145 make deploy-dev
+```
+
+The value is seconds. It must stay below `resolve_timeout_s` minus the synthesis reserve (25 s), so when you raise it, raise `resolve_timeout_s` in step — the deploy wiring keeps the two together:
+
+```bash
+# Raise both so budget 145 + reserve 25 (=170) stays inside the 175 s request wall
+SCL_DEEP_REASONING_TIME_BUDGET_SECONDS=145 SCL_RESOLVE_TIMEOUT_SECONDS=175 make deploy-dev
+```
+
+`scripts/deploy.sh` maps these variables to the CDK context parameters
+`deep_reasoning_time_budget_s` and `resolve_timeout_s`. For a direct CDK
+deployment, pass `--context deep_reasoning_time_budget_s=145 --context resolve_timeout_s=175`
+or set those keys in `infra/cdk.json`. The Serve runtime receives them as
+`DEEP_REASONING_TIME_BUDGET_S` and `RESOLVE_TIMEOUT_S`; these runtime variables
+are normally managed by the stack rather than set manually.
 
 #### NL→SPARQL translation budget
 

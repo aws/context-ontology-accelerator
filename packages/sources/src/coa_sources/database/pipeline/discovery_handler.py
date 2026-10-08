@@ -379,6 +379,10 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         if metadata.failed_tables:
             scan_job_update["tablesFailed"] = len(metadata.failed_tables)
             scan_job_update["failedTables"] = metadata.failed_tables[:_MAX_REPORTED_FAILED_TABLES]
+        # A filter written as a regex matches nothing (filters are globs) and the
+        # scan still succeeds; record why so the steward can see it had no effect.
+        if metadata.filter_warnings:
+            scan_job_update["filterWarnings"] = metadata.filter_warnings
         _get_scan_dao().update(
             key=scan_job_key,
             update_fields=scan_job_update,

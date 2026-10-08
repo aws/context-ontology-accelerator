@@ -448,8 +448,8 @@ describe("ConnectSource — advanced configuration", () => {
     // Expand advanced and fill exclude filter
     await user.click(screen.getByText("Advanced configuration"));
     await user.type(
-      screen.getByPlaceholderText("tmp_.*|staging_.*"),
-      "tmp_.*|backup_.*",
+      screen.getByPlaceholderText("tmp_*|staging_*"),
+      "tmp_*|backup_*",
     );
 
     await clickNext(); // → enrichment
@@ -459,7 +459,7 @@ describe("ConnectSource — advanced configuration", () => {
     expect(mockCreate).toHaveBeenCalledTimes(1);
     const cfg =
       mockCreate.mock.calls[0][0].body.databaseSource.glueConfiguration;
-    expect(cfg.tableExcludeFilter).toBe("tmp_.*|backup_.*");
+    expect(cfg.tableExcludeFilter).toBe("tmp_*|backup_*");
   });
 
   it("does not offer engines withheld from the product", async () => {

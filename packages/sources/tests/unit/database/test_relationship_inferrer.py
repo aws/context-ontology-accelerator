@@ -562,3 +562,92 @@ class TestReScanIdempotency:
 
         assert count == 1
         assert len(orders.foreign_keys) == 2
+
+
+class TestUnrepresentableFkTarget:
+    """A column whose source-declared key was dropped at discovery stays protected.
+
+    Discovery drops ``SALES.ORDERS.CUSTOMER_ID -> CRM.CUSTOMERS`` when SALES has
+    its own CUSTOMERS (the pipeline would bind the key to the local table), and
+    records the declared target on the column. Without that key, nothing else
+    stopped Pass 2 from inferring ``CUSTOMER_ID -> CUSTOMERS``, the same wrong
+    link the drop removed.
+    """
+
+    @staticmethod
+    def _sales_tables() -> list[Table]:
+        orders = Table(
+            name="ORDERS",
+            database="SALES",
+            columns=[
+                Column(name="ID", data_type="NUMBER"),
+                Column(name="CUSTOMER_ID", data_type="NUMBER", unrepresentable_fk_target="DB.CRM.CUSTOMERS"),
+                Column(name="STORE_ID", data_type="NUMBER"),
+            ],
+        )
+        customers = Table(name="CUSTOMERS", database="SALES", columns=[Column(name="ID", data_type="NUMBER")])
+        stores = Table(name="STORES", database="SALES", columns=[Column(name="ID", data_type="NUMBER")])
+        return [orders, customers, stores]
+
+    @staticmethod
+    def _llm_stub(candidates: list[dict]) -> MagicMock:
+        from coa_common.bedrock import BedrockInvocationResult
+
+        client = MagicMock()
+        client.invoke.return_value = BedrockInvocationResult(
+            result=candidates, input_tokens=50, output_tokens=10, latency_ms=100.0
+        )
+        return client
+
+    _CUSTOMER_GUESS = {
+        "source_table": "ORDERS",
+        "column": "CUSTOMER_ID",
+        "target_table": "CUSTOMERS",
+        "target_column": "ID",
+        "confidence": 0.95,
+    }
+    _STORE_GUESS = {
+        "source_table": "ORDERS",
+        "column": "STORE_ID",
+        "target_table": "STORES",
+        "target_column": "ID",
+        "confidence": 0.9,
+    }
+
+    def test_apply_inferred_relationships_unrepresentable_fk_column_is_not_inferred(self) -> None:
+        tables = self._sales_tables()
+        client = self._llm_stub([self._CUSTOMER_GUESS])
+
+        candidates = infer_relationships(tables, client, emitter=MagicMock())
+        count = apply_inferred_relationships(tables, candidates)
+
+        assert candidates == [self._CUSTOMER_GUESS]  # the LLM did propose it
+        assert count == 0
+        assert all(not t.foreign_keys for t in tables)
+
+    def test_apply_inferred_relationships_unmarked_column_is_still_inferred(self) -> None:
+        tables = self._sales_tables()
+        client = self._llm_stub([self._CUSTOMER_GUESS, self._STORE_GUESS])
+
+        count = apply_inferred_relationships(tables, infer_relationships(tables, client, emitter=MagicMock()))
+
+        orders = tables[0]
+        assert count == 1
+        assert [(fk.column, fk.target_table, fk.source) for fk in orders.foreign_keys] == [
+            ("STORE_ID", "STORES", EnrichmentSource.AI_INFERRED)
+        ]
+
+    def test_apply_inferred_relationships_marker_survives_catalog_round_trip_is_not_inferred(self) -> None:
+        # Discovery and enrichment run as separate tasks: the inferrer sees the
+        # table as read back from the catalog form, not the discovery object.
+        import json
+
+        from coa_common.datazone_forms import build_forms_input, deserialize_form
+
+        stored = [deserialize_form(json.loads(build_forms_input(t)[0]["content"])) for t in self._sales_tables()]
+
+        count = apply_inferred_relationships(stored, [self._CUSTOMER_GUESS, self._STORE_GUESS])
+
+        orders = stored[0]
+        assert count == 1
+        assert [fk.column for fk in orders.foreign_keys] == ["STORE_ID"]

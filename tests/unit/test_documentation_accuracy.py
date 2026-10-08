@@ -117,3 +117,67 @@ def test_getting_started_package_guide_link_is_valid() -> None:
     package_guide_content = package_guide.read_text()
     assert "Adding a New Package" in package_guide_content
     assert "Implementing a Package" in package_guide_content
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_CROSS_ARCH_HEADING = "### Cross-architecture container builds"
+
+
+def _locally_built_platforms() -> dict[str, list[str]]:
+    """Map each `Platform.LINUX_*` pinned by a local image build to its Dockerfiles.
+
+    Covers both ways the stacks build an image: `ContainerImage.fromAsset(...)` and
+    `new DockerImageAsset(...)` (Serve and MCP use the latter).
+    """
+    platforms: dict[str, list[str]] = {}
+    build = r"(?:fromAsset\(|new DockerImageAsset\()(?:(?!\}\);).)*?Platform\.LINUX_(AMD64|ARM64)"
+    for ts in sorted((_REPO_ROOT / "infra" / "lib" / "stacks").rglob("*.ts")):
+        text = ts.read_text()
+        for match in re.finditer(build, text, re.DOTALL):
+            dockerfile = re.search(r'file:\s*"([^"]+)"', match.group(0))
+            platforms.setdefault(match.group(1).lower(), []).append(dockerfile.group(1) if dockerfile else ts.name)
+    return platforms
+
+
+def _cross_arch_section() -> str:
+    text = (_REPO_ROOT / "external-docs" / "content" / "deploying.md").read_text()
+    match = re.search(re.escape(_CROSS_ARCH_HEADING) + r"\n(.*?)(?=\n#{2,3} )", text, re.DOTALL)
+    assert match, f"deploying.md must keep a '{_CROSS_ARCH_HEADING}' section"
+    return match.group(1)
+
+
+def test_cross_arch_scan_sees_every_platform_pin_in_the_stacks() -> None:
+    """Every `Platform.LINUX_*` pin must belong to a build the scan recognizes.
+
+    Otherwise a new way of building an image would drop out of the doc check above.
+    """
+    stacks = sorted((_REPO_ROOT / "infra" / "lib" / "stacks").rglob("*.ts"))
+    pins = sum(len(re.findall(r"Platform\.LINUX_(?:AMD64|ARM64)", ts.read_text())) for ts in stacks)
+    found = sum(len(dockerfiles) for dockerfiles in _locally_built_platforms().values())
+    assert found == pins, f"scan found {found} of {pins} platform pins: {_locally_built_platforms()}"
+
+
+def test_deploying_cross_arch_section_covers_every_locally_built_platform() -> None:
+    """Each image architecture the stacks build locally must be named, with its binfmt install."""
+    platforms = _locally_built_platforms()
+    assert set(platforms) == {"amd64", "arm64"}, f"precondition: stacks build both architectures, got {platforms}"
+    section = _cross_arch_section()
+    for arch, dockerfiles in platforms.items():
+        assert f"linux/{arch}" in section, f"section never names linux/{arch}, built from {dockerfiles}"
+        assert f"tonistiigi/binfmt --install {arch}" in section, f"section never shows how to emulate {arch}"
+
+
+def test_deploying_cross_arch_section_does_not_say_a_native_host_needs_no_emulation() -> None:
+    """With images for both architectures, no build host can skip emulation."""
+    assert "needs no emulation" not in _cross_arch_section()
+
+
+def test_preflight_points_at_deploying_sections_that_exist() -> None:
+    """A preflight error that sends readers to a deploying.md section must name a real heading."""
+    script = (_REPO_ROOT / "scripts" / "preflight-deploy.sh").read_text()
+    pointers = re.findall(r"see external-docs/content/deploying\.md, '([^']+)'", script)
+    assert pointers, "precondition: preflight points readers at a deploying.md section"
+    deploying = (_REPO_ROOT / "external-docs" / "content" / "deploying.md").read_text()
+    headings = set(re.findall(r"^#{2,3} (.+)$", deploying, re.MULTILINE))
+    for pointer in pointers:
+        assert pointer in headings, f"preflight points at '{pointer}', which deploying.md has no heading for"

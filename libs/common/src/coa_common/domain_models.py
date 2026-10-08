@@ -142,6 +142,13 @@ class Column:
     best-effort). Empty when the column is high-cardinality, non-string, or
     sampling was skipped/unavailable. Used by the serve NL→SQL layer to hint
     the LLM with correct enum literals for WHERE clauses."""
+    unrepresentable_fk_target: str = ""
+    """The ``[database.]schema.table`` a foreign key declared on this column
+    really points at, set by discovery only when that key had to be dropped
+    because no discovered table can stand for its target (another database, or
+    another schema whose table name is shadowed by a scanned table). Empty for
+    every other column. The column's real target is known, so the within-source
+    relationship inferrer must not guess a different one for it."""
 
 
 # ── Technical Metadata ────────────────────────────────────────────────
@@ -211,6 +218,13 @@ class DiscoveredMetadata:
     AI-generated descriptions over the gap, a steward would otherwise review a
     silently incomplete ontology as if it were complete. The pipeline therefore
     records this as a scan-level signal rather than a log line."""
+    filter_warnings: list[str] = field(default_factory=list)
+    """Plain-language warnings about the source's schema/table filters.
+
+    Set when a filter that looks like a regular expression (filters are globs)
+    matched nothing, so the scan succeeded but the filter had no effect — e.g. an
+    exclude written as ``^(staging|tmp)$`` excluded nothing. The pipeline records
+    them on the scan job so the steward sees them at review."""
 
     @property
     def total_columns(self) -> int:

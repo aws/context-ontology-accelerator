@@ -1184,10 +1184,19 @@ class InductionStrategy(ABC):
                     extra={"referrer": referrer.name, "target": target_name},
                 )
                 return None
-            # Genuinely outside this induction run. The bare form is safe here:
-            # a table we did not process has no TriplesMap in this mapping, so
-            # there is nothing for it to collide with.
-            return ns[f"TriplesMap_{to_pascal(target_name)}"]
+            # Genuinely outside this induction run: the target table is not
+            # minted this run — rejected at review, dropped by a later filter, or
+            # missing after a partial re-sync. Emitting a bare
+            # TriplesMap_<Target> would be a dangling rr:parentTriplesMap: Ontop
+            # rejects the WHOLE mapping on load, failing every query in the
+            # namespace permanently. Degrade to a literal instead (drop the join),
+            # exactly as the ambiguous branch above does — cause-agnostic, keyed
+            # only on "is the target minted this run?".
+            log.warning(
+                "fk_target_out_of_run_degraded_to_literal",
+                extra={"referrer": referrer.name, "target": target_name},
+            )
+            return None
 
         def _pom(tmap: URIRef, col_name: str, suffix: str = "") -> tuple[URIRef, URIRef]:
             """Mint a predicate-object map + object map for a column.

@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -157,6 +157,11 @@ def values_look_categorical(values: list[str]) -> bool:
 ColumnRow = tuple[str, str, str, bool]
 # pk: {table: [cols]}; fk: {table: [(col, ref_table, ref_col)]}
 Constraints = tuple[dict[str, list[str]], dict[str, list[tuple[str, str, str]]]]
+# Foreign keys a dialect had to drop because no discovered table can stand for
+# their target: {table: {column: declared "[database.]schema.table" target}}.
+UnrepresentableFkTargets = dict[str, dict[str, str]]
+# (primary_keys, foreign_keys, unrepresentable_fk_targets)
+ConstraintDetails = tuple[dict[str, list[str]], dict[str, list[tuple[str, str, str]]], UnrepresentableFkTargets]
 # Source-existing descriptions discovered from the catalog.
 #   table_descriptions:  {table_name: description}
 #   column_descriptions: {table_name: {column_name: description}}
@@ -317,6 +322,18 @@ class Dialect:
             A ``(primary_keys, foreign_keys)`` pair keyed by table name.
         """
         return {}, {}
+
+    def fetch_constraint_details(self, conn: Any, schema: str, tables: list[str]) -> ConstraintDetails:
+        """Like :meth:`fetch_constraints`, plus the foreign keys that had to be dropped.
+
+        The third element maps ``{table: {column: declared target}}`` for each
+        foreign key the engine reported but the dialect could not represent
+        (its target is not a table discovery can identify). Discovery records it
+        on the column so relationship inference does not guess another target
+        for a column whose real target is known. Default: nothing dropped.
+        """
+        pk, fk = self.fetch_constraints(conn, schema, tables)
+        return pk, fk, {}
 
     def fetch_descriptions(self, conn: Any, schema: str, tables: list[str]) -> Descriptions:
         """Fetch source-catalog descriptions/comments for tables and columns.
@@ -857,6 +874,80 @@ class SqlServerDialect(InformationSchemaDialect):
         return table_desc, col_desc
 
 
+def _snowflake_table_resolver(tables: list[str]) -> Callable[[str], str | None]:
+    """Map a table name from Snowflake ``SHOW`` output back to the caller's spelling.
+
+    ``SHOW`` reports each identifier as stored: an unquoted name uppercased, a
+    quoted name exactly as written. So ``"orders"`` and ``ORDERS`` are two
+    different tables that can live in one schema, and an exact match must win.
+    The case-insensitive match is kept only as a fallback for a caller that
+    spells a name in another case, and only while exactly one requested table
+    answers to it; an ambiguous name resolves to nothing rather than to one of
+    the twins.
+    """
+    exact = set(tables)
+    by_folded: dict[str, list[str]] = {}
+    for name in tables:
+        by_folded.setdefault(name.upper(), []).append(name)
+
+    def resolve(name: str) -> str | None:
+        if name in exact:
+            return name
+        candidates = by_folded.get(name.upper(), [])
+        return candidates[0] if len(candidates) == 1 else None
+
+    return resolve
+
+
+def _snowflake_fk_target(row: Mapping[str, Any], local_tables: list[str]) -> str | None:
+    """The ``target_table`` to record for one ``SHOW IMPORTED KEYS`` row, or ``None`` to drop it.
+
+    A discovered table is identified as ``schema.table`` within one database, and
+    downstream consumers resolve a bare target inside the referencing table's own
+    schema. So:
+
+    * same database and schema: the bare referenced table name, as before.
+    * another schema of the same database: ``SCHEMA.TABLE``, the qualified form
+      the rest of the pipeline already uses for a target in another schema. If a
+      requested table in the scanned schema has the same name (compared without
+      case), the key is dropped instead: consumers that reduce a target to its
+      table name would bind it to that local table, which is a different table.
+    * another database: dropped. A source covers one database, so no table it
+      discovers can be the target.
+
+    Each drop is logged with the referenced location so the missing key can be
+    explained.
+    """
+    pk_database = row.get("pk_database_name")
+    pk_schema = row.get("pk_schema_name")
+    pk_table = row["pk_table_name"]
+    same_database = pk_database is None or pk_database == row.get("fk_database_name")
+    same_schema = pk_schema is None or pk_schema == row.get("fk_schema_name")
+    if same_database and same_schema:
+        return pk_table
+
+    reason = None
+    if not same_database:
+        reason = "target_in_other_database"
+    elif any(name.upper() == pk_table.upper() for name in local_tables):
+        reason = "target_name_shadowed_by_scanned_schema"
+    if reason is not None:
+        logger.warning(
+            "snowflake_fk_dropped",
+            extra={
+                "reason": reason,
+                "fk_schema": row.get("fk_schema_name"),
+                "fk_table": row.get("fk_table_name"),
+                "fk_column": row.get("fk_column_name"),
+                "target_database": pk_database,
+                "target_schema": pk_schema,
+                "target_table": pk_table,
+            },
+        )
+        return None
+    return f"{pk_schema}.{pk_table}"
+
+
 class SnowflakeDialect(InformationSchemaDialect):
     """Snowflake (via snowflake-connector-python).
 
@@ -970,14 +1061,28 @@ class SnowflakeDialect(InformationSchemaDialect):
         side is guarded independently: a failure logs a WARNING and yields empty
         for that side only, preserving the best-effort contract (a scan continues
         without deterministic constraints).
+
+        Tables are matched by their exact stored name first, so quoted-case twins
+        keep their own keys (see :func:`_snowflake_table_resolver`). A foreign key
+        whose target lives in another schema or database is qualified or dropped,
+        never reported as a same-named table of the scanned schema (see
+        :func:`_snowflake_fk_target`).
+        """
+        pk, fk, _ = self.fetch_constraint_details(conn, schema, tables)
+        return pk, fk
+
+    def fetch_constraint_details(self, conn: Any, schema: str, tables: list[str]) -> ConstraintDetails:
+        """:meth:`fetch_constraints` plus the foreign keys it dropped, by column.
+
+        Each dropped key's column maps to its declared target as
+        ``database.schema.table`` (see :meth:`Dialect.fetch_constraint_details`).
         """
         if not tables:
-            return {}, {}
-        # Match Snowflake's uppercased SHOW output for the lookup, but key the
-        # returned dicts by each caller's ORIGINAL table-name casing: the caller
-        # (jdbc._discover_schema) reads these dicts back with the same names it
-        # passed in, so a key that differs in case would silently miss.
-        table_map = {t.upper(): t for t in tables}
+            return {}, {}, {}
+        # Key the returned dicts by each caller's ORIGINAL table-name casing: the
+        # caller (jdbc._discover_schema) reads these dicts back with the same names
+        # it passed in, so a key that differs in case would silently miss.
+        resolve_table = _snowflake_table_resolver(tables)
 
         # Quote identifiers with the dialect's quote char (doubled to escape),
         # matching the defensive quoting in _limited_distinct_values. schema and
@@ -994,24 +1099,33 @@ class SnowflakeDialect(InformationSchemaDialect):
         try:
             rows = _run_mappings(conn, f"SHOW PRIMARY KEYS IN SCHEMA {qualified_schema}")
             for row in sorted(rows, key=lambda r: (r["table_name"], r["key_sequence"])):
-                original = table_map.get(row["table_name"].upper())
+                original = resolve_table(row["table_name"])
                 if original is not None:
                     pk.setdefault(original, []).append(row["column_name"])
         except Exception:
             logger.warning("snowflake_pk_discovery_failed", extra={"schema": qualified_schema}, exc_info=True)
 
         fk: dict[str, list[tuple[str, str, str]]] = {}
+        dropped: UnrepresentableFkTargets = {}
         try:
             rows = _run_mappings(conn, f"SHOW IMPORTED KEYS IN SCHEMA {qualified_schema}")
             for row in sorted(rows, key=lambda r: (r["fk_table_name"], r["key_sequence"])):
-                original = table_map.get(row["fk_table_name"].upper())
-                if original is not None:
-                    fk.setdefault(original, []).append(
-                        (row["fk_column_name"], row["pk_table_name"], row["pk_column_name"])
+                original = resolve_table(row["fk_table_name"])
+                if original is None:
+                    continue
+                target = _snowflake_fk_target(row, tables)
+                if target is not None:
+                    fk.setdefault(original, []).append((row["fk_column_name"], target, row["pk_column_name"]))
+                else:
+                    declared = ".".join(
+                        part
+                        for part in (row.get("pk_database_name"), row.get("pk_schema_name"), row["pk_table_name"])
+                        if part
                     )
+                    dropped.setdefault(original, {})[row["fk_column_name"]] = declared
         except Exception:
             logger.warning("snowflake_fk_discovery_failed", extra={"schema": qualified_schema}, exc_info=True)
-        return pk, fk
+        return pk, fk, dropped
 
 
 class OracleDialect(Dialect):

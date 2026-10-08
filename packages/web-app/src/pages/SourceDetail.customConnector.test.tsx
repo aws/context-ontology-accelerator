@@ -199,6 +199,38 @@ describe("SourceDetail — degraded scan annotation", () => {
     expect(screen.getByText(/2 of 40 shown/i)).toBeInTheDocument();
   });
 
+  it("shows the scan's filter warnings when a filter had no effect", () => {
+    setSource();
+    mockGetSourceScanJob.mockReturnValue({
+      data: {
+        status: "COMPLETED",
+        filterWarnings: [
+          "table_exclude_filter matched nothing, so it had no effect.",
+        ],
+      },
+    });
+    render(<SourceDetail />, { wrapper });
+
+    expect(
+      screen.getByText(/A filter had no effect on the last scan/i),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "table_exclude_filter matched nothing, so it had no effect.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("shows no filter warning when the scan reports none", () => {
+    setSource();
+    mockGetSourceScanJob.mockReturnValue({ data: { status: "COMPLETED" } });
+    render(<SourceDetail />, { wrapper });
+
+    expect(
+      screen.queryByText(/A filter had no effect/i),
+    ).not.toBeInTheDocument();
+  });
+
   it("uses the singular form for a single failed table", () => {
     setSource();
     mockGetSourceScanJob.mockReturnValue({

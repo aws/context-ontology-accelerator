@@ -500,7 +500,8 @@ class SQLFirewall:
         try:
             parsed = sqlglot.parse_one(sql)
         except sqlglot.errors.ParseError:
-            logger.warning("sql_firewall_parse_error", sql_preview=sql)
+            # SQL may carry caller-supplied literal values (potential PII); log length only.
+            logger.warning("sql_firewall_parse_error", sql_len=len(sql))
             return None
         if parsed is None:
             return None
@@ -568,7 +569,8 @@ class SQLFirewall:
         try:
             parsed = sqlglot.parse_one(sql, read="trino")
         except sqlglot.errors.ParseError:
-            logger.warning("sql_firewall_parse_error", sql_preview=sql)
+            # SQL may carry caller-supplied literal values (potential PII); log length only.
+            logger.warning("sql_firewall_parse_error", sql_len=len(sql))
             return []
 
         tables: list[str] = []

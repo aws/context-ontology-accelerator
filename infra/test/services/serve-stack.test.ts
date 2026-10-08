@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import * as cdk from "aws-cdk-lib";
+import * as fs from "fs";
+import * as path from "path";
 import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import * as ec2 from "aws-cdk-lib/aws-ec2";
 import * as lambda from "aws-cdk-lib/aws-lambda";
@@ -942,5 +944,46 @@ describe("ServeStack - parameter read is deliberately broad", () => {
         );
       }),
     ).toBe(true);
+  });
+});
+
+// The running coa-dev-context-manager image accreted Critical/High OS CVEs
+// (perl, openssl, glibc, pcre2, sqlite3) whenever a build predated the Debian
+// point releases that fix them. This image is also an arm64 OCI index, which
+// ECR BASIC scanning silently refuses — so regressions here go unnoticed until
+// a child manifest is scanned by digest. Two Dockerfile properties keep the
+// image patchable: a pinned base digest (supply-chain integrity + a
+// cache-busting bump lever) and a post-install `apt-get upgrade` (the only
+// mechanism pulling trixie-security point releases in). Mirrors ontology-stack.
+describe("context-manager Dockerfile CVE hygiene", () => {
+  const dockerfile = fs.readFileSync(
+    path.join(
+      __dirname,
+      "..",
+      "..",
+      "..",
+      "packages",
+      "context-manager",
+      "Dockerfile",
+    ),
+    "utf8",
+  );
+
+  test("pins the base image to a digest, not a mutable tag", () => {
+    const from = dockerfile.match(
+      /^FROM .*python:3\.12-slim(@sha256:[a-f0-9]{64})?/m,
+    );
+    expect(from).not.toBeNull();
+    expect(from?.[1]).toMatch(/@sha256:[a-f0-9]{64}/);
+    expect(dockerfile).not.toMatch(/python:3\.12-slim\s*$/m);
+  });
+
+  test("runs apt-get upgrade so OS security point releases are applied", () => {
+    expect(dockerfile).toMatch(/apt-get upgrade -y/);
+    expect(dockerfile).not.toMatch(/apt-get dist-upgrade/);
+  });
+
+  test("upgrades pip so its own advisories are picked up", () => {
+    expect(dockerfile).toMatch(/pip install[^\n]*--upgrade pip/);
   });
 });

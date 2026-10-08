@@ -185,10 +185,11 @@ class VKGTranslator:
             vkg_result = await vkg_client.translate(sparql, namespace=namespace)
             routing = vkg_result.datasource_routing or {}
             routing_sources = sorted({v.get("datasourceId", "") for v in routing.values()} - {""})
+            # No SQL text: the compiled SQL carries query-time literal values
+            # (potential PII). Length + routing are enough to trace the step.
             logger.info(
                 "vkg_translate_output",
                 sql_length=len(vkg_result.sql),
-                sql_preview=vkg_result.sql[:300],
                 routing_tables=len(vkg_result.datasource_routing),
                 routing_sources=routing_sources,
             )

@@ -949,23 +949,32 @@ class TestBuildR2rmlDefault:
         ) in g
 
     def test_fk_column_gets_referencing_object_map(self, strategy):
-        table = CatalogTable(
-            id="orders",
-            name="orders",
-            fullyQualifiedName="db.orders",
-            columns=[CatalogColumn(name="customer_id", dataType="BIGINT")],
-            tableConstraints=[
-                CatalogConstraint(
-                    constraintType="FOREIGN_KEY",
-                    columns=["customer_id"],
-                    referredColumns=["customers.id"],
-                ),
-            ],
-        )
+        tables = [
+            CatalogTable(
+                id="customers",
+                name="customers",
+                fullyQualifiedName="db.customers",
+                columns=[CatalogColumn(name="id", dataType="BIGINT")],
+                tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["id"])],
+            ),
+            CatalogTable(
+                id="orders",
+                name="orders",
+                fullyQualifiedName="db.orders",
+                columns=[CatalogColumn(name="customer_id", dataType="BIGINT")],
+                tableConstraints=[
+                    CatalogConstraint(
+                        constraintType="FOREIGN_KEY",
+                        columns=["customer_id"],
+                        referredColumns=["customers.id"],
+                    ),
+                ],
+            ),
+        ]
         g = strategy.build_r2rml(
             "http://ex.org/ind#",
-            [table],
-            {"orders"},
+            tables,
+            {"orders", "customers"},
             Graph(),
         )
         from coa_ontology.inducer.strategies.base import RR
@@ -1166,20 +1175,29 @@ class TestBuildR2rmlDefault:
     def test_fk_target_extracted_from_two_part_referredcolumns(self, strategy):
         """Bug 2a: referredColumns format is 'TargetTable.column' — parts[0] is the table name.
         induce_catalog.py always writes two-part format so this is the canonical path."""
-        table = CatalogTable(
-            id="t",
-            name="orders",
-            fullyQualifiedName="db.orders",
-            columns=[CatalogColumn(name="customer_id", dataType="INT")],
-            tableConstraints=[
-                CatalogConstraint(
-                    constraintType="FOREIGN_KEY",
-                    columns=["customer_id"],
-                    referredColumns=["customers.id"],
-                ),
-            ],
-        )
-        g = strategy.build_r2rml("http://ex.org/ind#", [table], {"orders"}, Graph())
+        tables = [
+            CatalogTable(
+                id="customers",
+                name="customers",
+                fullyQualifiedName="db.customers",
+                columns=[CatalogColumn(name="id", dataType="INT")],
+                tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["id"])],
+            ),
+            CatalogTable(
+                id="t",
+                name="orders",
+                fullyQualifiedName="db.orders",
+                columns=[CatalogColumn(name="customer_id", dataType="INT")],
+                tableConstraints=[
+                    CatalogConstraint(
+                        constraintType="FOREIGN_KEY",
+                        columns=["customer_id"],
+                        referredColumns=["customers.id"],
+                    ),
+                ],
+            ),
+        ]
+        g = strategy.build_r2rml("http://ex.org/ind#", tables, {"orders", "customers"}, Graph())
         from coa_ontology.inducer.strategies.base import RR
 
         om = URIRef("http://ex.org/ind#TriplesMap_Orders/POM_CustomerId/ObjectMap")
@@ -1360,6 +1378,16 @@ class TestBuildR2rmlRigorOverride:
                 URIRef(f"{prefix.rstrip('#/')}/provenance/orders"),
             )
         )
+        # Class for the in-run target 'customers' so the FK target resolves to a
+        # minted TriplesMap rather than degrading to a literal.
+        g.add((ns.Customer, RDF.type, OWL.Class))
+        g.add(
+            (
+                ns.Customer,
+                PROV.wasDerivedFrom,
+                URIRef(f"{prefix.rstrip('#/')}/provenance/customers"),
+            )
+        )
         # Object property for customer FK
         g.add((ns.placedBy, RDF.type, OWL.ObjectProperty))
         g.add((ns.placedBy, RDFS.domain, ns.Order))
@@ -1373,23 +1401,32 @@ class TestBuildR2rmlRigorOverride:
             )
         )
 
-        table = CatalogTable(
-            id="orders",
-            name="orders",
-            fullyQualifiedName="db.orders",
-            columns=[CatalogColumn(name="customer_id", dataType="BIGINT")],
-            tableConstraints=[
-                CatalogConstraint(
-                    constraintType="FOREIGN_KEY",
-                    columns=["customer_id"],
-                    referredColumns=["customers.id"],
-                ),
-            ],
-        )
+        tables = [
+            CatalogTable(
+                id="customers",
+                name="customers",
+                fullyQualifiedName="db.customers",
+                columns=[CatalogColumn(name="id", dataType="BIGINT")],
+                tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["id"])],
+            ),
+            CatalogTable(
+                id="orders",
+                name="orders",
+                fullyQualifiedName="db.orders",
+                columns=[CatalogColumn(name="customer_id", dataType="BIGINT")],
+                tableConstraints=[
+                    CatalogConstraint(
+                        constraintType="FOREIGN_KEY",
+                        columns=["customer_id"],
+                        referredColumns=["customers.id"],
+                    ),
+                ],
+            ),
+        ]
         r = RigorOntologyStrategy().build_r2rml(
             prefix,
-            [table],
-            {"orders"},
+            tables,
+            {"orders", "customers"},
             g,
         )
         from coa_ontology.inducer.strategies.base import RR
