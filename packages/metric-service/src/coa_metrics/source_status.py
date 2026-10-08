@@ -19,6 +19,7 @@ enforcement — a WARNING is logged whenever permissive mode is active.
 from __future__ import annotations
 
 import os
+import re
 
 import structlog
 from botocore.exceptions import BotoCoreError, ClientError
@@ -32,6 +33,11 @@ PERMISSIVE_ENV = "ALLOW_PERMISSIVE_SOURCE_LOOKUP"
 # Statuses a metric may reference — keep in sync with the UI filter in
 # packages/web-app/src/pages/MetricForm.tsx (APPROVED || COMPLETED).
 _ALLOWED_STATUSES = frozenset({SourceStatus.APPROVED.value, SourceStatus.COMPLETED.value})
+
+# Mirrors ``DataSourceId`` in models/src/main/smithy/metric-service.smithy.
+# Applied here too because OSI import builds metrics without the generated model.
+_DATA_SOURCE_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
+DATA_SOURCE_ID_FORMAT_MESSAGE = "dataSourceId must be 1-128 characters of letters, digits, '.', '_', or '-'"
 
 
 class SourceValidationUnavailableError(RuntimeError):
@@ -61,6 +67,9 @@ def check_source_approved(namespace: str, data_source_id: str) -> str | None:
     """
     if not data_source_id:
         return "dataSourceId is required"
+
+    if not _DATA_SOURCE_ID_RE.fullmatch(data_source_id):
+        return DATA_SOURCE_ID_FORMAT_MESSAGE
 
     if permissive_lookup_enabled():
         logger.warning(

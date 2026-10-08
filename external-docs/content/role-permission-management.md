@@ -107,7 +107,7 @@ Cedar (at query execution time by the SQL Firewall) — see the
 
 | Field | Type | Effect |
 |-------|------|--------|
-| `tableAllowlist` | `list[string]` | Only these tables can be queried. Any other table reference is denied. |
+| `tableAllowlist` | `list[string]` | Only these tables can be queried. Any other table reference is denied, and other tables' names are left out of the query trace and response metadata. |
 | `columnDenylist` | `map[string, list[string]]` | These columns cannot be projected. `SELECT *` on a restricted table is denied. |
 | `allowedMetrics` | `list[string]` | Only these metric IDs can be evaluated. |
 

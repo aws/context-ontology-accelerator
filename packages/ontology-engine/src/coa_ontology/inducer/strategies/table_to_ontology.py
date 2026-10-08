@@ -29,6 +29,7 @@ from coa_ontology.inducer.strategies.base import (
     AUTHORITATIVE_FK_SOURCES,
     SCL,
     InductionStrategy,
+    add_glossary_and_tags,
     ambiguous_target_names,
     composite_fk_anchors,
     composite_fk_columns,
@@ -49,6 +50,20 @@ log = logging.getLogger(__name__)
 # Re-exported under the historical private names for existing callers/tests.
 _AUTHORITATIVE_FK_SOURCES = AUTHORITATIVE_FK_SOURCES
 _fk_edge_allowed = fk_edge_allowed
+
+
+def _join_comment(generated: str, description: str | None) -> str:
+    """Combine a generated structural note with a column's approved description.
+
+    Returns the note alone when there is no description (so existing ontologies
+    are unchanged), otherwise ``"<description> (<note>)"``. The description leads
+    because both serve contexts cut long column comments at 100 characters, and
+    the steward's text is the part worth keeping.
+    """
+    text = (description or "").strip()
+    if not text:
+        return generated
+    return f"{text} ({generated})"
 
 
 # Tables per fusion batch when INDUCER_TABLE_BATCH_SIZE is unset.
@@ -358,8 +373,17 @@ class TableToOntologyStrategy(InductionStrategy):
                 # The bare form below is the min()-keeper's class IRI, so returning
                 # it would point rdfs:range at one arbitrary same-named table.
                 return None
-            # Genuinely outside this run: the bare form collides with nothing.
-            return ns[_to_pascal(target_name)]
+            # Genuinely outside this run: the target table is not minted
+            # this run. Declaring an owl:ObjectProperty with rdfs:range pointing at
+            # a bare ind:<Target> class that is never declared leaves the ontology
+            # referencing an absent class, and makes the mapping's degraded literal
+            # (base._parent_tmap) and this range disagree. Degrade to a datatype
+            # property, mirroring the ambiguous branch and the R2RML emitter.
+            log.warning(
+                "fk_target_out_of_run_degraded_to_literal",
+                extra={"referrer": referrer.name, "target": target_name},
+            )
+            return None
 
         for table in tables:
             tm = match_map.get((table.name, ""))
@@ -382,6 +406,7 @@ class TableToOntologyStrategy(InductionStrategy):
             # into the accept-time embedding text (ingest.py _class_text_for).
             for syn in table.synonyms:
                 g.add((table_cls, SKOS.altLabel, Literal(syn)))
+            add_glossary_and_tags(g, table_cls, table.glossaryTerms, table.tags)
 
             if is_grounded and tm and tm.matched_class_uri:
                 grounding_cls = URIRef(tm.matched_class_uri)
@@ -532,7 +557,14 @@ class TableToOntologyStrategy(InductionStrategy):
                         fk_comment = (
                             f"Foreign key: {table.name}.{col.name} references {fk_target}.{fk_target_col or 'id'}"
                         )
-                        g.add((prop_uri, RDFS.comment, Literal(fk_comment)))
+                        # ONE comment per property: the generated join note followed by
+                        # the column's approved description. A foreign-key column's
+                        # curated description previously never reached the ontology.
+                        # Kept as a single literal because readers take one comment
+                        # per property (the serve context, the FK-traversal tool's
+                        # per-row join), so two comments would be picked arbitrarily
+                        # or duplicate every edge.
+                        g.add((prop_uri, RDFS.comment, Literal(_join_comment(fk_comment, col.description))))
                         minted.append(prop_uri)
                 else:
                     prop_uri = base_prop
@@ -553,8 +585,11 @@ class TableToOntologyStrategy(InductionStrategy):
                                 "mapped as a literal because no join can be derived"
                             )
                         )
-                        g.add((prop_uri, RDFS.comment, Literal(note)))
-                    if col.description:
+                        # One comment (see the object-property branch above): the
+                        # composite-FK note and the approved description were two
+                        # literals, and the serve context kept whichever came first.
+                        g.add((prop_uri, RDFS.comment, Literal(_join_comment(note, col.description))))
+                    elif col.description:
                         g.add((prop_uri, RDFS.comment, Literal(col.description)))
                     minted.append(prop_uri)
 
@@ -574,6 +609,7 @@ class TableToOntologyStrategy(InductionStrategy):
                     # Column synonyms -> skos:altLabel (persisted in the graph).
                     for syn in col.synonyms:
                         g.add((prop_uri, SKOS.altLabel, Literal(syn)))
+                    add_glossary_and_tags(g, prop_uri, col.glossaryTerms, col.tags)
                     # Sampled distinct values (low-cardinality categorical columns) ->
                     # coa:distinctValues, one literal per value. Read by the ingest text
                     # builder (_class_text_for) so serve's NL->SQL context can hint the

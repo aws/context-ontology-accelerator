@@ -13,6 +13,17 @@ use com.amazon.semanticcontext.common#PaginatedOutput
 use com.amazon.semanticcontext.common#Uuid
 
 // ──────────────────────────────────────────────
+// Constrained primitives
+// ──────────────────────────────────────────────
+/// Principal identifier: an email, IdP subject, group name, or agent ID.
+/// Markup/quote characters (< > " ` \), control characters and the reserved key
+/// delimiters # and | are rejected; `::` is also rejected server-side.
+/// Keep in sync with PRINCIPAL_ID_RE in libs/common/src/coa_common/constants.py.
+@pattern("^[^<>\"`\\\\#|\\x00-\\x1F\\x7F]+$")
+@length(min: 1, max: 256)
+string PrincipalId
+
+// ──────────────────────────────────────────────
 // Enums
 // ──────────────────────────────────────────────
 /// The kind of principal a grant is bound to.
@@ -80,7 +91,7 @@ structure CreateGrantRequest {
 
     /// Identifier of the principal to bind to the role.
     @required
-    principalId: String
+    principalId: PrincipalId
 
     /// Name of the role to assign to the principal.
     @required
@@ -160,7 +171,7 @@ structure CreatePlatformGrantRequest {
 
     /// Identifier of the principal to bind to the platform role.
     @required
-    principalId: String
+    principalId: PrincipalId
 
     /// Name of the platform role to assign to the principal.
     @required

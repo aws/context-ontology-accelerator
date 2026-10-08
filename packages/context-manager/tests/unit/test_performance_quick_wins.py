@@ -763,15 +763,17 @@ class TestObjectPropertyContext:
             ],
             # aiContext (vector hit has URI)
             [],
+            # steward annotations for the selected class (#1167)
+            [],
         ]
         hit = RVectorHit(type="ontology_class", score=0.9, entity_id="e1", uri="http://ex.org/ont#Order")
         builder = TBoxContextBuilder(client, graph_uri_template="https://test.local/{namespace}")
         context = await builder.build([hit], "demo")
 
         assert context.object_properties == []
-        # 4 queries: named-graph resolution + count + tbox + aiContext
+        # 5 queries: named-graph resolution + count + tbox + aiContext + annotations
         # (OP skipped: only 1 class)
-        assert client.query.call_count == 4
+        assert client.query.call_count == 5
 
     def test_token_estimate_includes_object_properties(self):
         """_estimate_tokens should count object_properties in the budget."""

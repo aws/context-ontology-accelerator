@@ -26,7 +26,7 @@ from coa_common.bedrock_metrics import (
     emit_induction_heartbeat_metrics,
     emit_induction_job_metrics,
 )
-from coa_common.constants import DATABASE_SUB_TYPES
+from coa_common.constants import DATABASE_SUB_TYPES, validate_ontology_uri_prefix
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
@@ -218,7 +218,10 @@ class WorkbenchInductionRequest(BaseModel):
     grounding_mode: str = Field(
         default="ENHANCED", validation_alias=AliasChoices("grounding_mode", "groundingMode")
     )  # "NONE" | "STANDARD" | "ENHANCED"
-    graph_arn: str | None = None
+    graph_arn: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("graph_arn", "graphArn"),
+    )
 
     @field_validator("ontology_uri_prefix")
     @classmethod
@@ -235,9 +238,12 @@ class WorkbenchInductionRequest(BaseModel):
         EVERY class is marked unmapped → the whole namespace goes dark to Tier-2.
         The same value is also stored as the ontology_id / graph URI, so
         normalizing once here keeps all downstream consumers consistent.
+
+        The prefix is also charset-checked (``validate_ontology_uri_prefix``)
+        before normalizing, since it is minted into every induced IRI.
         """
-        v = v.strip()
-        if v and not v.endswith(("#", "/")):
+        v = validate_ontology_uri_prefix(v)
+        if not v.endswith(("#", "/")):
             v += "#"
         return v
 
@@ -369,8 +375,21 @@ def _fetch_catalog_from_fixture(datasource_id: str) -> dict:
     return {"databases": []}
 
 
+def _string_list(value: object) -> list[str]:
+    """Normalize a catalog list field to non-empty strings (``None`` → ``[]``)."""
+    if not isinstance(value, list):
+        return []
+    return [str(v).strip() for v in value if v is not None and str(v).strip()]
+
+
 def _catalog_to_tables(catalog: dict) -> list[dict]:
-    """Flatten catalog → databases → tables into CatalogTable-compatible dicts."""
+    """Flatten catalog → databases → tables into CatalogTable-compatible dicts.
+
+    Carries every steward-reviewed business-metadata field the catalog exposes
+    (description, synonyms, glossary terms, tags) so induction can emit all of
+    them into the ontology. Glossary terms and tags were previously dropped here,
+    which made their review on the source screen have no effect on any answer.
+    """
     tables = []
     for db in catalog.get("databases", []):
         db_name = db.get("name", "")
@@ -385,6 +404,8 @@ def _catalog_to_tables(catalog: dict) -> list[dict]:
                         "dataType": col.get("type", ""),
                         "description": cbm.get("description"),
                         "synonyms": cbm.get("synonyms", []),
+                        "glossaryTerms": _string_list(cbm.get("glossaryTerms")),
+                        "tags": _string_list(cbm.get("tags")),
                         # Sampled distinct values (low-cardinality categorical cols)
                         # flow into the induced ontology for serve NL→SQL enum hints.
                         "distinctValues": col.get("distinctValues", []),
@@ -440,6 +461,8 @@ def _catalog_to_tables(catalog: dict) -> list[dict]:
                     "sourceSchema": db_name or None,
                     "description": bm.get("description"),
                     "synonyms": bm.get("synonyms", []),
+                    "glossaryTerms": _string_list(bm.get("glossaryTerms")),
+                    "tags": _string_list(bm.get("tags")),
                     "columns": columns,
                     "tableConstraints": pk_constraints + fk_constraints or None,
                 }
@@ -1139,8 +1162,9 @@ def start_induction(body: WorkbenchInductionRequest, request: Request, namespace
         The pending :class:`JobResponse` for the newly started job.
 
     Raises:
-        HTTPException: 422 if the Neptune endpoint is unconfigured for an
-            unstructured run, or 409 if another induction/proposal is in flight.
+        HTTPException: 422 if the requested lexical source is unsupported or
+            the Neptune endpoint is unconfigured for an unstructured run; 409
+            if another induction/proposal is in flight.
     """
     # Dispatch to unstructured pipeline if strategy is unstructured_lexical_graph
     if getattr(body, "strategy", "") == "unstructured_lexical_graph":
@@ -1151,18 +1175,23 @@ def start_induction(body: WorkbenchInductionRequest, request: Request, namespace
             start_induction as start_unstructured,
         )
 
-        # graph_arn must satisfy UnstructuredInductionRequest's SSRF guard:
-        # EITHER a canonical Neptune Analytics ARN OR the literal "neptune-db"
-        # sentinel (which tells the unstructured worker to resolve the NDB
-        # endpoint from server-side config — see _build_lexical_store; the
-        # caller-supplied value is never used as an endpoint URL). If the caller
-        # passed an explicit NA ARN, forward it; otherwise use the "neptune-db"
-        # sentinel. Passing the raw NDB cluster URL here fails the regex → 500
-        # (regression once the SSRF pattern landed on the request schema).
-        explicit_arn = getattr(body, "graph_arn", None)
-        graph_arn = explicit_arn if explicit_arn and explicit_arn.startswith("arn:aws:neptune-graph:") else "neptune-db"
+        graph_arn = getattr(body, "graph_arn", None) or "neptune-db"
+        if graph_arn != "neptune-db":
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "UNSUPPORTED_SOURCE",
+                    "message": "The requested lexical graph source is not supported.",
+                },
+            )
         if graph_arn == "neptune-db" and not request.app.state.config.get("neptune_endpoint", ""):
-            raise HTTPException(422, "Neptune endpoint not configured for unstructured induction")
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "CONFIGURATION_ERROR",
+                    "message": "The lexical graph source is not configured.",
+                },
+            )
 
         unstructured_body = UnstructuredInductionRequest(
             graph_arn=graph_arn,
@@ -1203,23 +1232,14 @@ def start_induction(body: WorkbenchInductionRequest, request: Request, namespace
     # embeddings_sync) — the induction lock is only held for the duration of an
     # induction, so without the in-flight accept states a new induction can start
     # mid-merge and leave two competing structured proposals in the namespace.
+    #
+    # Layer 1 is checked AFTER layer 2's lock is acquired, not before. Checking
+    # first left a check-then-act gap: a trigger could see no proposal, the
+    # running worker could then write its pending proposal and release the
+    # lock, and the trigger would acquire it and start a duplicate run beside
+    # an unreviewed proposal. The worker writes its proposal before releasing,
+    # so once we hold the lock the proposal read is authoritative.
     from coa_ontology.proposals import PROPOSAL_STATUSES_BLOCKING_NEW_INDUCTION
-
-    pending: list[dict] = []
-    for _status in PROPOSAL_STATUSES_BLOCKING_NEW_INDUCTION:
-        pending = dynamo_store.list_proposals(namespace=namespace, status=_status, source_type="STRUCTURED")
-        if pending:
-            break
-    if pending:
-        raise HTTPException(
-            409,
-            {
-                "message": (
-                    "An in-flight proposal already exists. Accept or reject it before starting a new induction job."
-                ),
-                "proposal_id": pending[0]["proposal_id"],
-            },
-        )
 
     job_id = str(uuid.uuid4())
 
@@ -1243,7 +1263,24 @@ def start_induction(body: WorkbenchInductionRequest, request: Request, namespace
     # worker's finally only runs if the worker THREAD actually starts, so a
     # failure in put_job / create_proposal_stub / Thread.start() here would
     # otherwise leak the lock and wedge the namespace until the stale timeout.
+    # The same handler releases it when the block-until-reviewed 409 fires.
     try:
+        pending: list[dict] = []
+        for _status in PROPOSAL_STATUSES_BLOCKING_NEW_INDUCTION:
+            pending = dynamo_store.list_proposals(namespace=namespace, status=_status, source_type="STRUCTURED")
+            if pending:
+                break
+        if pending:
+            raise HTTPException(
+                409,
+                {
+                    "message": (
+                        "An in-flight proposal already exists. Accept or reject it before starting a new induction job."
+                    ),
+                    "proposal_id": pending[0]["proposal_id"],
+                },
+            )
+
         _jobs[job_id] = _schemas_mod.JobResponse(
             job_id=job_id,
             status=_schemas_mod.JobStatus.PENDING,

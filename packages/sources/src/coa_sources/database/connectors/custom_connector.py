@@ -59,7 +59,7 @@ from coa_sources.database.metrics import emit_metric
 from .athena_statement import AthenaStatementError, AthenaStatementRunner
 from .base import ConnectionCheck, ConnectionTestResult, MetadataConnector
 from .constraint_tags import ParsedComment, assemble_constraints, parse_comment
-from .filters import compile_filter
+from .filters import compile_filter, unmatched_regex_warning
 
 # structlog, not stdlib logging: these run in the sources-api and discovery
 # Lambdas, whose setup_logging() pins the stdlib root logger to WARNING and
@@ -322,10 +322,18 @@ class CustomConnector(MetadataConnector):
             listed=len(table_names),
             after_filters=len(kept),
         )
+        filter_warnings = [
+            w
+            for w in (
+                unmatched_regex_warning(config.get("table_filter"), "table_filter", table_names),
+                unmatched_regex_warning(config.get("table_exclude_filter"), "table_exclude_filter", table_names),
+            )
+            if w
+        ]
         if not kept:
             # Not an error: a filter that matches nothing, or an empty database,
             # is a configuration outcome the steward can see and correct.
-            return DiscoveredMetadata(tables=[])
+            return DiscoveredMetadata(tables=[], filter_warnings=filter_warnings)
 
         # Enforced HERE, before the fan-out, not only in discovery_handler. That
         # check runs on `metadata.tables` — i.e. after this method has already
@@ -360,7 +368,9 @@ class CustomConnector(MetadataConnector):
                 database=database,
                 failed_tables=failed,
             )
-        return DiscoveredMetadata(tables=tables, failed_tables=[f"{database}.{t}" for t in failed])
+        return DiscoveredMetadata(
+            tables=tables, failed_tables=[f"{database}.{t}" for t in failed], filter_warnings=filter_warnings
+        )
 
     # ── Statement helpers ────────────────────────────────────────────────
 

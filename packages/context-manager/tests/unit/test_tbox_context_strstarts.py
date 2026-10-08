@@ -493,14 +493,16 @@ class TestTBoxGlossaryMappedGate:
                 [{"cnt": "500"}],  # full-context count over threshold → skip full path
                 [{"class": mapped_uri, "label": "Employee"}],  # _fetch_ontology_context
                 [],  # _fetch_ai_context result
+                [],  # steward annotations (#1167)
             ]
         )
         hits = [_hit(mapped_uri), _hit(unmapped_uri)]
         await tbox_builder.build(hits, "ns-x", query="employees")
 
-        # The last query is the aiContext fetch — its VALUES clause must contain the
-        # mapped URI and NOT the unmapped one.
-        aicontext_sparql = graph_client.query.call_args_list[-1][0][0]
+        # The aiContext fetch's VALUES clause must contain the mapped URI and NOT
+        # the unmapped one. Found by content, not position, so adding a query to
+        # build() does not silently retarget this assertion.
+        aicontext_sparql = next(c[0][0] for c in graph_client.query.call_args_list if "aiContext" in c[0][0])
         assert "aiContext" in aicontext_sparql
         assert mapped_uri in aicontext_sparql
         assert unmapped_uri not in aicontext_sparql
@@ -681,11 +683,12 @@ class TestTBoxGraphBinding:
 
     @staticmethod
     def _build_sequence(graphs: list[dict]) -> list[list[dict]]:
-        """build()'s query sequence: resolve, count, classes, props, aiContext."""
+        """build()'s query sequence: resolve, count, classes, props, aiContext, annotations."""
         return [
             graphs,
             [{"cnt": "2"}],
             [{"class": TestTBoxGraphBinding._EMP, "label": "Emp", "parentClass": None}],
+            [],
             [],
             [],
         ]
@@ -769,8 +772,9 @@ class TestTBoxGraphBinding:
 
         resolutions = [c[0][0] for c in graph_client.query.call_args_list if "owl:Ontology" in c[0][0]]
         assert len(resolutions) == 2  # once for ns-a, once for ns-b
-        # The cached ns-a graphs did not leak into ns-b's queries.
-        last_classes = graph_client.query.call_args_list[-2][0][0]
+        # The cached ns-a graphs did not leak into ns-b's queries. The classes query
+        # is the last one selecting ?class rows (found by content, not position).
+        last_classes = [c[0][0] for c in graph_client.query.call_args_list if "SELECT DISTINCT ?class" in c[0][0]][-1]
         assert graph_b in last_classes
         assert graph_a not in last_classes
 

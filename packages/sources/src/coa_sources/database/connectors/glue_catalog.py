@@ -32,7 +32,7 @@ from coa_common.domain_models import (
 
 from . import lf_grant
 from .base import ConnectionCheck, ConnectionTestResult, MetadataConnector
-from .filters import compile_filter
+from .filters import compile_filter, unmatched_regex_warning
 from .sts_assume import assume_datasource_session
 
 logger = logging.getLogger(__name__)
@@ -211,9 +211,11 @@ class GlueCatalogConnector(MetadataConnector):
         if table_filter:
             paginate_kwargs["Expression"] = table_filter
 
+        listed: list[str] = []
         for page in paginator.paginate(**paginate_kwargs):
             for glue_table in page.get("TableList", []):
                 table_name = glue_table["Name"]
+                listed.append(table_name)
 
                 if exclude_re and exclude_re.match(table_name):
                     continue
@@ -239,7 +241,10 @@ class GlueCatalogConnector(MetadataConnector):
             sum(len(t.columns) for t in tables),
             database_name,
         )
-        return DiscoveredMetadata(tables=tables)
+        # The include filter is a Glue expression (regex), so only the glob-based
+        # exclude filter can carry the regex-syntax mistake worth flagging.
+        warning = unmatched_regex_warning(table_exclude_filter, "table_exclude_filter", listed)
+        return DiscoveredMetadata(tables=tables, filter_warnings=[warning] if warning else [])
 
     @staticmethod
     def _sample_enum_values(tables: list[Table], database_name: str, catalog_id: str, region: str) -> None:

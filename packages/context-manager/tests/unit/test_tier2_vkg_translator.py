@@ -133,6 +133,22 @@ class TestVKGTranslatorSuccess:
             assert step.status == Tier2Status.OK
             assert step.duration_ms >= 0
 
+    async def test_translate_output_log_omits_sql_text(self):
+        """CWE-532: the compiled SQL carries query-time literals (potential PII);
+        vkg_translate_output logs its length, never the text."""
+        import structlog.testing
+
+        sql = "SELECT id FROM customers WHERE email = 'alice@example.com'"
+        translator = _make_translator(
+            vkg_client=_make_vkg_client(sql=sql), firewall=_make_firewall(), executor=_make_executor()
+        )
+        with structlog.testing.capture_logs() as logs:
+            await translator.resolve("SELECT ?c WHERE { ?c a :Customer }", namespace="demo")
+        event = next(log for log in logs if log["event"] == "vkg_translate_output")
+        assert event["sql_length"] == len(sql)
+        assert "sql_preview" not in event
+        assert "alice@example.com" not in repr(logs)
+
 
 @pytest.mark.unit
 class TestVKGTranslatorErrors:

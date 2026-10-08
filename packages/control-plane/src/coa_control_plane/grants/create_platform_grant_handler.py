@@ -23,6 +23,7 @@ import structlog
 from botocore.exceptions import ClientError
 from coa_common import sanitize_principal_key
 from coa_common.authnz_types import NON_ASSIGNABLE_ROLE_IDS, PrincipalType, ResourceType
+from coa_common.constants import validate_principal_id
 from coa_common.dao import DynamoDBDAO
 from coa_common.logging import setup_logging
 from coa_common.response import api_response, get_caller_identity
@@ -34,12 +35,9 @@ logger = structlog.get_logger(__name__)
 
 _VALID_PRINCIPAL_TYPES = {e.value for e in PrincipalType}
 _ROLE_SK_PREFIX = "ROLE#"
-# Bounds on caller-supplied identifiers. They become DynamoDB key components,
-# so cap their length and reject the delimiter characters used in key
-# construction to prevent malformed/ambiguous keys and resource exhaustion.
-_MAX_PRINCIPAL_ID_LEN = 256
+# Bound on the caller-supplied role name, which becomes a DynamoDB key
+# component. principalId is bounded and charset-checked by validate_principal_id.
 _MAX_ROLE_LEN = 128
-_KEY_DELIMITERS = ("#", "|", "::")
 # Platform roles are stored under PK=GLOBAL in the roles table.
 _PLATFORM_ROLE_PK = "GLOBAL"
 # Synthetic resource id used for the cross-namespace platform scope. Matches
@@ -84,8 +82,10 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
     if principal_type not in _VALID_PRINCIPAL_TYPES:
         return api_response(400, {"message": f"Invalid principalType: {principal_type}"})
 
-    if len(principal_id) > _MAX_PRINCIPAL_ID_LEN:
-        return api_response(400, {"message": f"principalId exceeds maximum length of {_MAX_PRINCIPAL_ID_LEN}"})
+    try:
+        validate_principal_id(principal_id)
+    except ValueError as exc:
+        return api_response(400, {"message": str(exc)})
 
     if len(role) > _MAX_ROLE_LEN:
         return api_response(400, {"message": f"role exceeds maximum length of {_MAX_ROLE_LEN}"})
@@ -96,9 +96,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
         # principal a GLOBAL role row that filtering code treats as
         # cross-namespace (#988).
         return api_response(400, {"message": f"Role '{role}' is not assignable"})
-
-    if any(delim in principal_id for delim in _KEY_DELIMITERS):
-        return api_response(400, {"message": "principalId may not contain reserved delimiter characters (#, |, ::)"})
 
     region = os.environ.get("AWS_REGION")
     roles_table = os.environ.get("ROLES_TABLE")

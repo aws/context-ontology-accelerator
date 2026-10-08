@@ -17,8 +17,9 @@ use com.amazon.semanticcontext.metric#DataSourceId
 
 // ── Local constrained primitives ────────────────────────────────────
 /// Ontology URI prefix (IRI base for generated classes/properties).
+/// Keep in sync with ONTOLOGY_URI_PREFIX_RE in libs/common/src/coa_common/constants.py.
 @length(min: 10, max: 2048)
-@pattern("^https?://.+$")
+@pattern("^https?://[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*(?::(?:6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5][0-9]{4}|[1-9][0-9]{0,3}))?(?:/(?!\\.\\.?(?:[/#]|$))(?:[A-Za-z0-9._~-]|%[0-9A-Fa-f]{2})+)*/?#?$")
 string OntologyUriPrefix
 
 /// Induction strategy name.
@@ -254,7 +255,10 @@ operation StartInduction {
         /// Defaults to ENHANCED when omitted.
         groundingMode: GroundingMode
 
-        /// Neptune Analytics graph ARN (required when strategy is unstructured_lexical_graph).
+        /// Caller-selected lexical sources are not supported. Providing this field
+        /// returns HTTP 422 with ``detail.code`` set to ``UNSUPPORTED_SOURCE``.
+        /// Omit it to use the deployment-configured lexical source.
+        @deprecated(message: "Caller-selected lexical sources are not supported; omit this field.", since: "2026-10-01")
         graphArn: String
     }
 

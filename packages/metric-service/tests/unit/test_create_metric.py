@@ -15,7 +15,7 @@ from coa_control_plane_server.models.create_metric_request_content import (
     CreateMetricRequestContent,
 )
 from coa_metrics.api.create_metric import _validate_soft, handler
-from coa_metrics.source_status import PERMISSIVE_ENV
+from coa_metrics.source_status import DATA_SOURCE_ID_FORMAT_MESSAGE, PERMISSIVE_ENV
 from coa_metrics.validator import ValidationResult
 
 pytestmark = pytest.mark.unit
@@ -147,6 +147,26 @@ class TestValidation:
 
 
 # ── Conflict tests ──────────────────────────────────────────────────────
+
+
+class TestDataSourceIdFormat:
+    """dataSourceId is charset-checked before any source lookup or write."""
+
+    @pytest.mark.parametrize("data_source_id", ["<script>alert(1)</script>", "ds 1", "ds/../x", "x" * 129])
+    @patch("coa_metrics.api.create_metric._get_neptune")
+    def test_malformed_data_source_id_returns_400(self, mock_neptune: MagicMock, data_source_id: str) -> None:
+        body = {**_valid_body(), "dataSourceId": data_source_id}
+        resp = handler(_make_event(body=body), None)
+        assert resp["statusCode"] == 400
+        if len(data_source_id) <= 128:
+            assert json.loads(resp["body"])["message"] == DATA_SOURCE_ID_FORMAT_MESSAGE
+        mock_neptune.return_value.create_metric.assert_not_called()
+
+    @patch("coa_metrics.api.create_metric._get_neptune")
+    def test_pattern_failure_message_names_field(self, mock_neptune: MagicMock) -> None:
+        body = {**_valid_body(), "dataSourceId": "<script>"}
+        message = json.loads(handler(_make_event(body=body), None)["body"])["message"]
+        assert message == DATA_SOURCE_ID_FORMAT_MESSAGE
 
 
 class TestConflict:

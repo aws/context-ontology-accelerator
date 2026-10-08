@@ -49,6 +49,7 @@ from coa_common import DEFAULT_EMBED_MODEL_ID
 from coa_common.constants import VOCAB_URI
 from defusedxml.expatreader import DefusedExpatParser
 from rdflib import OWL, RDF, RDFS, Graph, Namespace, URIRef
+from rdflib.collection import Collection
 from rdflib.namespace import SKOS
 
 from coa_ontology import dynamo_store
@@ -129,11 +130,25 @@ _COA = Namespace(VOCAB_URI)
 SUPERSEDED_COMMENT = _COA.supersededComment
 SUPERSEDED_DEFINITION = _COA.supersededDefinition
 SUPERSEDED_ALT_LABEL = _COA.supersededAltLabel
+SUPERSEDED_GLOSSARY_TERM = _COA.supersededGlossaryTerm
+SUPERSEDED_TAG = _COA.supersededTag
+# Steward-reviewed glossary terms and tags (#1167) follow the same authored-wins
+# rule as descriptions and synonyms: a re-accept replaces them, so removing a
+# term during review actually removes it from the ontology.
+GLOSSARY_TERM = _COA.glossaryTerm
+TAG = _COA.tag
+# Per-column / per-relationship cap on each kind of steward term in the NL→SQL
+# class text: one column's long list would otherwise crowd every other column out
+# of the embedding and the prompt. Matches the Ontop context's per-term cap
+# (_MAX_TERMS_IN_PROMPT in the serve T-Box builder), so both paths show the same.
+_MAX_TERMS_PER_HINT = 5
 _SUPERSEDED_ANNOTATION_PREDICATES: dict[URIRef, URIRef] = {
     RDFS.comment: SUPERSEDED_COMMENT,
     SKOS.definition: SUPERSEDED_DEFINITION,
     URIRef("http://purl.obolibrary.org/obo/IAO_0000115"): SUPERSEDED_DEFINITION,
     SKOS.altLabel: SUPERSEDED_ALT_LABEL,
+    GLOSSARY_TERM: SUPERSEDED_GLOSSARY_TERM,
+    TAG: SUPERSEDED_TAG,
 }
 
 
@@ -1262,80 +1277,23 @@ def _accumulate_embeddings(
         # skos:altLabel carries source synonyms — include them so the embedding
         # captures alternative names the source curated.
         alt_labels = [str(o) for o in graph.objects(uri, SKOS.altLabel)]
+        # Glossary terms are retrieval vocabulary: a question phrased in a
+        # glossary term should find the class. Tags are not embedded: generic
+        # tags ("identifier", "financial") make unrelated terms look alike.
+        steward_terms = _literals(uri, GLOSSARY_TERM)
         label_text = " ".join(_split_camel(lbl) for lbl in labels) or _split_camel(_local_name(str(uri)))
         comment_text = " ".join(comments)
-        alt_text = " ".join(alt_labels)
+        alt_text = " ".join(alt_labels + steward_terms)
         return (label_text + " " + comment_text + " " + alt_text).strip()
 
     _SCL_NS = Namespace(VOCAB_URI)
 
-    def _class_text_for(cls_uri) -> tuple[str, str]:
-        """Build structured class text, returning ``(embed_text, context_text)``.
+    def _literals(subject, predicate) -> list[str]:
+        """Sorted, de-duplicated non-empty literal values (stable embedding text)."""
+        return sorted({str(o).strip() for o in graph.objects(subject, predicate) if str(o).strip()})
 
-        ``embed_text`` is EMBEDDED for retrieval (names/description/columns, no
-        sampled values — noise for recall). ``context_text`` is stored, not
-        embedded, for the serve NL→SQL prompt: same text plus each column's
-        ``allowed values: [...]``. The two are equal when no column is sampled.
-        """
-        name = str(graph.value(cls_uri, RDFS.label) or _local_name(str(cls_uri)))
-        description = str(graph.value(cls_uri, RDFS.comment) or "")
-        synonyms = [str(o) for o in graph.objects(cls_uri, SKOS.altLabel)]
-
-        obj_props_list = []
-        # (label, dtype, comment, distinct_values)
-        data_props_list: list[tuple[str, str, str, list[str]]] = []
-
-        for prop_uri in graph.subjects(RDFS.domain, cls_uri):
-            prop_label = str(graph.value(prop_uri, RDFS.label) or _local_name(str(prop_uri)))
-            prop_comment = str(graph.value(prop_uri, RDFS.comment) or "")
-            prop_range = graph.value(prop_uri, RDFS.range)
-
-            if (prop_uri, RDF.type, OWL.ObjectProperty) in graph:
-                range_label = (
-                    str(graph.value(prop_range, RDFS.label) or _local_name(str(prop_range))) if prop_range else ""
-                )
-                obj_props_list.append((prop_label, range_label, prop_comment))
-            elif (prop_uri, RDF.type, OWL.DatatypeProperty) in graph:
-                dtype = str(prop_range).split("#")[-1] if prop_range else "string"
-                distinct_vals = [str(o) for o in graph.objects(prop_uri, _SCL_NS.distinctValues)]
-                data_props_list.append((prop_label, dtype, prop_comment, distinct_vals))
-
-        if not data_props_list and not obj_props_list:
-            thin = _text_for(cls_uri)
-            return thin, thin
-
-        base_parts = [f"Table: {name}"]
-        if description:
-            base_parts.append(f"Description: {description}")
-        if synonyms:
-            base_parts.append(f"Synonyms: {', '.join(synonyms)}")
-        if obj_props_list:
-            rels = ", ".join(
-                f"{label}->{target}" + (f" ({comment})" if comment else "") for label, target, comment in obj_props_list
-            )
-            base_parts.append(f"Relationships: {rels}")
-
-        def _cols(*, rich: bool) -> str:
-            # rich=False → embedded vector: column names + comments only (type
-            # and sampled values are low-signal for retrieval).
-            # rich=True → generation context: adds type + allowed values so the
-            # LLM writes correct casts and WHERE literals.
-            return ", ".join(
-                (f"{label}:{dtype}" if rich else label)
-                + (f" ({comment[:100]})" if comment else "")
-                + (f" allowed values: [{', '.join(vals[:20])}]" if rich and vals else "")
-                for label, dtype, comment, vals in data_props_list
-            )
-
-        embed_parts = list(base_parts)
-        context_parts = list(base_parts)
-        if data_props_list:
-            embed_parts.append(f"Columns: {_cols(rich=False)}")
-            context_parts.append(f"Columns: {_cols(rich=True)}")
-
-        embed_text = " | ".join(embed_parts)
-        context_text = " | ".join(context_parts)
-        return embed_text, context_text
+    def _label_of(uri) -> str:
+        return str(graph.value(uri, RDFS.label) or _local_name(str(uri)))
 
     # class → datasource-id map is derived from the R2RML by the caller
     # (``ingest_ontology`` → ``_class_datasource_map_from_r2rml``) and passed in.
@@ -1345,6 +1303,133 @@ def _accumulate_embeddings(
     # induced class). A class present in the map is R2RML-mapped; its ds-id
     # string is written to ``data_source_id`` for the serve NL->SQL filter.
     ds_map = class_to_datasource or {}
+
+    def _mapped_parents(cls_uri) -> list[str]:
+        """Labels of this class's ``rdfs:subClassOf`` parents that are mapped tables.
+
+        Mirrors the Ontop context's mapped-parent gate: a grounded class's
+        foundational parent (FIBO, Schema.org) has no table behind it, and naming
+        it in a SQL prompt invites a query against a table that does not exist.
+        Restriction blank nodes (cardinality axioms) are not parents and are skipped.
+        """
+        return sorted(
+            _label_of(parent)
+            for parent in graph.objects(cls_uri, RDFS.subClassOf)
+            if isinstance(parent, URIRef) and str(parent) in ds_map and parent != cls_uri
+        )
+
+    def _primary_key(cls_uri) -> list[str]:
+        """Column names of the class's ``owl:hasKey`` — the key Ontop's mapping uses."""
+        key_list = graph.value(cls_uri, OWL.hasKey)
+        if key_list is None:
+            return []
+        return [_label_of(prop) for prop in Collection(graph, key_list)]
+
+    def _term_hints(subject) -> str:
+        """Bracketed synonyms / glossary terms / tags for one column or relationship."""
+        hints = []
+        for title, values in (
+            ("synonyms", _literals(subject, SKOS.altLabel)),
+            ("glossary", _literals(subject, GLOSSARY_TERM)),
+            ("tags", _literals(subject, TAG)),
+        ):
+            if values:
+                hints.append(f"{title}: {', '.join(values[:_MAX_TERMS_PER_HINT])}")
+        return f" [{'; '.join(hints)}]" if hints else ""
+
+    def _class_text_for(cls_uri) -> tuple[str, str]:
+        """Build structured class text, returning ``(embed_text, context_text)``.
+
+        ``embed_text`` is EMBEDDED for retrieval: names, description, synonyms,
+        relationships and columns with their comments, plus the table's glossary
+        terms. It deliberately stays close to its pre-#1167 shape: enrichment fills
+        synonyms, glossary terms and tags for nearly every column, and the vector
+        input is cut at 8000 characters, so per-column hints would push a wide
+        table's last columns out of the vector.
+
+        ``context_text`` is stored, not embedded, for the serve NL→SQL prompt. It
+        adds everything the Ontop context also carries: tags, the mapped parent
+        class, the primary key, per-column synonyms / glossary terms / tags, and
+        each column's type and ``allowed values: [...]``.
+        """
+        name = _label_of(cls_uri)
+        description = str(graph.value(cls_uri, RDFS.comment) or "")
+        synonyms = [str(o) for o in graph.objects(cls_uri, SKOS.altLabel)]
+        glossary_terms = _literals(cls_uri, GLOSSARY_TERM)
+        tags = _literals(cls_uri, TAG)
+        parents = _mapped_parents(cls_uri)
+        primary_key = _primary_key(cls_uri)
+
+        # (label, target, comment, hints)
+        obj_props_list: list[tuple[str, str, str, str]] = []
+        # (label, dtype, comment, distinct_values, hints)
+        data_props_list: list[tuple[str, str, str, list[str], str]] = []
+
+        for prop_uri in graph.subjects(RDFS.domain, cls_uri):
+            prop_label = _label_of(prop_uri)
+            prop_comment = str(graph.value(prop_uri, RDFS.comment) or "")
+            prop_range = graph.value(prop_uri, RDFS.range)
+
+            if (prop_uri, RDF.type, OWL.ObjectProperty) in graph:
+                range_label = _label_of(prop_range) if prop_range else ""
+                obj_props_list.append((prop_label, range_label, prop_comment, _term_hints(prop_uri)))
+            elif (prop_uri, RDF.type, OWL.DatatypeProperty) in graph:
+                dtype = str(prop_range).split("#")[-1] if prop_range else "string"
+                distinct_vals = [str(o) for o in graph.objects(prop_uri, _SCL_NS.distinctValues)]
+                data_props_list.append((prop_label, dtype, prop_comment, distinct_vals, _term_hints(prop_uri)))
+
+        if not data_props_list and not obj_props_list:
+            thin = _text_for(cls_uri)
+            return thin, thin
+
+        def _head(*, rich: bool) -> list[str]:
+            parts = [f"Table: {name}"]
+            if description:
+                parts.append(f"Description: {description}")
+            if synonyms:
+                parts.append(f"Synonyms: {', '.join(synonyms)}")
+            if glossary_terms:
+                parts.append(f"Glossary terms: {', '.join(glossary_terms)}")
+            if rich:
+                # The rest of what the Ontop context carries (#1167), so both
+                # serve paths answer from the same approved metadata.
+                if tags:
+                    parts.append(f"Tags: {', '.join(tags)}")
+                if parents:
+                    parts.append(f"Kind of: {', '.join(parents)}")
+                if primary_key:
+                    parts.append(f"Primary key: {', '.join(primary_key)}")
+            if obj_props_list:
+                rels = ", ".join(
+                    f"{label}->{target}" + (f" ({comment})" if comment else "") + (hints if rich else "")
+                    for label, target, comment, hints in obj_props_list
+                )
+                parts.append(f"Relationships: {rels}")
+            return parts
+
+        def _cols(*, rich: bool) -> str:
+            # rich=False → embedded vector: column names + comments (type, sampled
+            # values and per-column terms are low-signal for retrieval and would
+            # crowd columns out of the 8000-character input).
+            # rich=True → generation context: adds type, steward terms and allowed
+            # values so the LLM writes correct casts and WHERE literals.
+            return ", ".join(
+                (f"{label}:{dtype}" if rich else label)
+                + (f" ({comment[:100]})" if comment else "")
+                + (hints if rich else "")
+                + (f" allowed values: [{', '.join(vals[:20])}]" if rich and vals else "")
+                for label, dtype, comment, vals, hints in data_props_list
+            )
+
+        embed_parts = _head(rich=False)
+        context_parts = _head(rich=True)
+        if data_props_list:
+            embed_parts.append(f"Columns: {_cols(rich=False)}")
+            context_parts.append(f"Columns: {_cols(rich=True)}")
+
+        embed_text = " | ".join(embed_parts)
+        context_text = " | ".join(context_parts)
+        return embed_text, context_text
 
     # (uri, entity_type, embed_text, context_text, datasource_id)
     # embed_text is EMBEDDED (retrieval vector); context_text is STORED for the

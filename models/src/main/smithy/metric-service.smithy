@@ -29,6 +29,7 @@ string MetricName
 string SqlExpression
 
 /// Data source identifier reference.
+@pattern("^[A-Za-z0-9._-]+$")
 @length(min: 1, max: 128)
 string DataSourceId
 

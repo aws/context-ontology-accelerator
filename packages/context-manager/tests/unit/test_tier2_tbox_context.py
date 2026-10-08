@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from coa_serve.tier2.ontop.tbox_context import (
+    _ANNOTATION_BUDGET_SHARE,
     MetricContext,
     TBoxContext,
     TBoxContextBuilder,
@@ -122,8 +123,9 @@ class TestTBoxContextBuilder:
         # so it does not add to .query's count. The leading resolution query is what
         # binds every later query to this namespace's graphs instead of filtering a
         # cluster-wide scan; it is cached per namespace, so it is once per build at
-        # most, not once per query.
-        assert client.query.call_count == 4
+        # most, not once per query. The last query fetches the selected classes'
+        # steward annotations (descriptions, synonyms, glossary terms, tags).
+        assert client.query.call_count == 5
 
     async def test_build_empty_result_from_neptune(self):
         client = _make_graph_client([])
@@ -168,6 +170,35 @@ class TestTBoxContextBuilder:
 
         # Should be truncated
         assert context.token_estimate <= 500
+
+    async def test_truncation_leaves_room_for_steward_annotations(self):
+        """Truncation stops short of max_tokens so table annotations still fit (#1167 review)."""
+        client = _make_graph_client([])
+        builder = TBoxContextBuilder(client, graph_uri_template="https://test.local/{namespace}")
+        seen: list[int] = []
+        real = builder._truncate
+
+        def _spy(context, max_tokens):
+            seen.append(max_tokens)
+            return real(context, max_tokens)
+
+        builder._truncate = _spy
+        graph_results = [
+            {
+                "class": f"http://example.org/ontology#Class{i}",
+                "label": f"Class{i}",
+                "parentClass": None,
+                "property": f"http://example.org/ontology#prop{i}",
+                "propLabel": f"prop{i}",
+                "range": "xsd:string",
+            }
+            for i in range(100)
+        ]
+        client = _make_graph_client(graph_results)
+        builder._graph = client
+        hits = [_make_ontology_hit(f"http://example.org/ontology#Class{i}") for i in range(20)]
+        await builder.build(hits, "demo", max_tokens=1000)
+        assert seen == [int(1000 * (1 - _ANNOTATION_BUDGET_SHARE))]
 
     async def test_token_estimation(self):
         client = _make_graph_client([])

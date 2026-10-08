@@ -27,12 +27,15 @@ import boto3
 from coa_common import async_boto_config
 from coa_common.bedrock_metrics import CostTracker
 from rdflib import OWL, RDF, RDFS, XSD, BNode, Graph, Literal, Namespace, URIRef
+from rdflib.collection import Collection
 from rdflib.namespace import SKOS
+from rdflib.term import Node
 
 from coa_ontology.inducer.schemas import ConceptMatch
 from coa_ontology.inducer.services.data_catalog import CatalogConstraint, CatalogTable, parse_referred_column
 from coa_ontology.inducer.strategies.base import (
     InductionStrategy,
+    add_glossary_and_tags,
     ambiguous_target_names,
     fk_edge_allowed,
     logical_table_names,
@@ -95,6 +98,12 @@ def _format_schema_context(table: CatalogTable) -> str:
     lines = [f"Table: {table.name}"]
     if table.description:
         lines.append(f"Description: {table.description}")
+    if table.synonyms:
+        lines.append(f"Synonyms: {', '.join(table.synonyms)}")
+    if table.glossaryTerms:
+        lines.append(f"Glossary terms: {', '.join(table.glossaryTerms)}")
+    if table.tags:
+        lines.append(f"Tags: {', '.join(table.tags)}")
     lines.append("Columns:")
     for col in table.columns:
         parts = [f"  - {col.name} : {col.dataType}"]
@@ -102,6 +111,12 @@ def _format_schema_context(table: CatalogTable) -> str:
             parts.append(f"[{col.constraint}]")
         if col.description:
             parts.append(f"-- {col.description}")
+        if col.synonyms:
+            parts.append(f"(synonyms: {', '.join(col.synonyms)})")
+        if col.glossaryTerms:
+            parts.append(f"(glossary terms: {', '.join(col.glossaryTerms)})")
+        if col.tags:
+            parts.append(f"(tags: {', '.join(col.tags)})")
         lines.append(" ".join(parts))
     if table.tableConstraints:
         lines.append("Constraints:")
@@ -317,6 +332,11 @@ class RigorOntologyStrategy(InductionStrategy):
             uri_to_table,
         )
 
+        # Step 6: Carry the approved catalog metadata onto the terms the LLM
+        # generated, so a RIGOR ontology exposes the same steward-reviewed fields
+        # (description, synonyms, glossary terms, tags) as a table_to_ontology one.
+        self._stamp_catalog_metadata(novel_graph, ontology_uri_prefix, tables, pascal_by_id)
+
         if dropped_tables:
             log.warning(
                 "RIGOR: dropped %d/%d tables due to processing failures: %s",
@@ -328,6 +348,93 @@ class RigorOntologyStrategy(InductionStrategy):
         return novel_graph, novel_tables, matches, dropped_tables
 
     # ── Graph helpers ────────────────────────────────────────────────
+
+    @staticmethod
+    def _stamp_terms(
+        g: Graph,
+        subject: URIRef,
+        description: str | None,
+        synonyms: list[str],
+        glossary_terms: list[str],
+        tags: list[str],
+    ) -> None:
+        """Write one table's or column's approved metadata onto ``subject``.
+
+        An approved description REPLACES whatever ``rdfs:comment`` the LLM wrote:
+        two competing descriptions on one term is the failure #1118 removed, and
+        the approved text is the one a steward signed off. With no approved
+        description the LLM's comment is kept.
+        """
+        if description and description.strip():
+            g.remove((subject, RDFS.comment, None))
+            g.add((subject, RDFS.comment, Literal(description.strip())))
+        for syn in synonyms:
+            if syn and syn.strip():
+                g.add((subject, SKOS.altLabel, Literal(syn.strip())))
+        add_glossary_and_tags(g, subject, glossary_terms, tags)
+
+    def _stamp_catalog_metadata(
+        self,
+        graph: Graph,
+        ontology_uri_prefix: str,
+        tables: list[CatalogTable],
+        pascal_by_id: dict[str, str],
+    ) -> None:
+        """Stamp each table's and column's approved metadata onto its generated term.
+
+        Resolves terms the same way ``build_r2rml`` does (``_index_classes_by_table``
+        then ``_index_properties_by_column``), so a term is annotated exactly when
+        the mapping would map it. A table or column the LLM produced no term for is
+        skipped: there is nothing in the ontology to describe.
+        """
+        class_by_identity = self._index_classes_by_table(graph, ontology_uri_prefix, tables, pascal_by_id)
+        prov_base = ontology_uri_prefix.rstrip("#").rstrip("/") + "/provenance"
+        for table in tables:
+            cls = class_by_identity.get(table_identity(table))
+            if cls is None:
+                continue
+            self._stamp_terms(graph, cls, table.description, table.synonyms, table.glossaryTerms, table.tags)
+            prop_by_col = self._index_properties_by_column(graph, cls, prov_base, table)
+            for col in table.columns:
+                prop = prop_by_col.get(col.name)
+                if prop is not None:
+                    self._stamp_terms(graph, prop, col.description, col.synonyms, col.glossaryTerms, col.tags)
+            self._stamp_primary_key(graph, cls, table, prop_by_col)
+
+    @staticmethod
+    def _stamp_primary_key(
+        graph: Graph,
+        cls: URIRef,
+        table: CatalogTable,
+        prop_by_col: dict[str, URIRef],
+    ) -> None:
+        """Declare the catalog primary key as the class's ``owl:hasKey``.
+
+        ``table_to_ontology`` always emits it; RIGOR left it to the LLM. RIGOR's
+        R2RML keys rows on the catalog key, and the serve NL→SQL context reads the
+        key from ``owl:hasKey``, so the two must be the same key. The catalog key
+        therefore REPLACES any key the LLM declared, as an approved description
+        replaces the LLM's comment (``_stamp_terms``). Skipped, leaving the graph as
+        it is, when the table has no catalog key or any key column has no generated
+        property: a partial key would misstate what identifies a row.
+        """
+        pk_cols: list[str] = []
+        for tc in table.tableConstraints or []:
+            if tc.constraintType == "PRIMARY_KEY" and tc.columns:
+                pk_cols = list(tc.columns)
+                break
+        if not pk_cols:
+            return
+        if any(c not in prop_by_col for c in pk_cols):
+            return
+        for old in list(graph.objects(cls, OWL.hasKey)):
+            graph.remove((cls, OWL.hasKey, old))
+            # Drop the old key's RDF list cells too, so no orphan list remains.
+            Collection(graph, old).clear()
+        key_props: list[Node] = [prop_by_col[c] for c in pk_cols]
+        key_list = BNode()
+        Collection(graph, key_list, key_props)
+        graph.add((cls, OWL.hasKey, key_list))
 
     @staticmethod
     def _fix_dual_typed_properties(g: Graph) -> None:
@@ -1079,9 +1186,11 @@ class RigorOntologyStrategy(InductionStrategy):
         same :func:`resolve_fk_target_identity` call the other three artifacts
         make, so the template names the table the ontology's range does.
 
-        A target genuinely outside this induction run keeps its bare name (it has
-        no TriplesMap here to collide with), so a mapping that referenced an
-        out-of-run table stays byte-identical.
+        A target genuinely outside this induction run is NOT minted this
+        run, so it has no TriplesMap here to point an IRI template at. Returning
+        its bare name produced a dangling reference that made Ontop reject the
+        whole mapping on load; it now degrades to a literal (``None``) like the
+        ambiguous case and the other three emitters.
         """
         if not target_name:
             return None
@@ -1099,7 +1208,17 @@ class RigorOntologyStrategy(InductionStrategy):
                 target_name,
             )
             return None
-        return target_name
+        # Genuinely outside this induction run: the target table is not
+        # minted this run. An IRI-template ObjectMap pointing at a subject token
+        # whose TriplesMap is never declared is a dangling reference Ontop rejects
+        # on load, failing every query in the namespace. Degrade to a datatype
+        # literal (return None -> the caller emits rr:column), mirroring the
+        # ambiguous branch and the other three emitters.
+        log.warning(
+            "fk_target_out_of_run_degraded_to_literal",
+            extra={"referrer": referrer.name, "target": target_name},
+        )
+        return None
 
     def _index_properties_by_column(
         self,

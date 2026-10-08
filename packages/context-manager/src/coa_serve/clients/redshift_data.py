@@ -38,6 +38,7 @@ from typing import Any
 
 import boto3
 import sqlglot
+import sqlglot.errors
 import structlog
 from coa_common import resolve_region
 
@@ -245,8 +246,12 @@ class RedshiftDataAPIExecutor:
         """Transpile VKG's Trino-dialect SQL to Redshift. Falls back to the input on error."""
         try:
             return sqlglot.transpile(sql, read="trino", write="redshift", identify=False)[0]
-        except Exception as exc:
-            logger.warning("redshift_trino_transpile_failed", sql=sql, error=str(exc))
+        except sqlglot.errors.SqlglotError as exc:
+            # Catch transpilation failures only — a genuine bug (AttributeError,
+            # etc.) must surface, not be masked by the fall-back-to-input path.
+            # SQL may carry caller-supplied literal values (potential PII), and sqlglot
+            # error messages echo a snippet of it. Log length + error type only.
+            logger.warning("redshift_trino_transpile_failed", sql_len=len(sql), error_type=type(exc).__name__)
             return sql
 
     @staticmethod
@@ -272,8 +277,12 @@ class RedshiftDataAPIExecutor:
         """
         try:
             parsed = sqlglot.parse_one(sql, dialect="redshift")
-        except Exception as exc:
-            logger.warning("redshift_awsdatacatalog_rewrite_parse_failed", sql=sql, error=str(exc))
+        except sqlglot.errors.SqlglotError as exc:
+            # SQL may carry caller-supplied literal values (potential PII), and sqlglot
+            # error messages echo a snippet of it. Log length + error type only.
+            logger.warning(
+                "redshift_awsdatacatalog_rewrite_parse_failed", sql_len=len(sql), error_type=type(exc).__name__
+            )
             return sql
 
         # CTE aliases are query-local names, not Glue tables — collect them so a
@@ -298,8 +307,9 @@ class RedshiftDataAPIExecutor:
 
         try:
             return parsed.sql(dialect="redshift")
-        except Exception as exc:
-            logger.warning("redshift_awsdatacatalog_rewrite_render_failed", error=str(exc))
+        except sqlglot.errors.SqlglotError as exc:
+            # sqlglot error messages can echo SQL fragments (potential PII); log type only.
+            logger.warning("redshift_awsdatacatalog_rewrite_render_failed", error_type=type(exc).__name__)
             return sql
 
     @staticmethod

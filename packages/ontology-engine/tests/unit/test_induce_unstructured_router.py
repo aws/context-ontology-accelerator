@@ -255,6 +255,35 @@ class TestStartInduction:
 
         worker.assert_not_called()
 
+    @pytest.mark.parametrize("blocking_status", ["accept_failed", "accepting", "embeddings_sync"])
+    def test_accept_state_unstructured_proposal_returns_409(self, client, mock_dynamo, blocking_status):
+        """An unstructured proposal whose accept failed or is still merging
+        blocks a new run, same as on the structured side. Unstructured
+        proposals share the accept pipeline, so without these states a new
+        induction could start mid-merge or right after a failed accept."""
+        from coa_ontology.proposals import PROPOSAL_STATUSES_BLOCKING_NEW_INDUCTION
+
+        assert blocking_status in PROPOSAL_STATUSES_BLOCKING_NEW_INDUCTION
+
+        def _list(namespace, status, source_type):
+            return [{"proposal_id": f"{status}-prop", "namespace": namespace}] if status == blocking_status else []
+
+        mock_dynamo.list_proposals.side_effect = _list
+
+        with patch.object(induce_unstructured, "_run_unstructured_induction") as worker:
+            response = client.post(
+                f"/induce/unstructured/?namespace={_NS}",
+                json=_valid_request_body(),
+            )
+
+        assert response.status_code == 409
+        assert response.json()["detail"]["proposal_id"] == f"{blocking_status}-prop"
+        for c in mock_dynamo.list_proposals.call_args_list:
+            assert c.kwargs["source_type"] == "UNSTRUCTURED"
+        mock_dynamo.release_induction_lock.assert_called_once_with(_NS)
+        mock_dynamo.put_job.assert_not_called()
+        worker.assert_not_called()
+
     def test_pending_structured_proposal_does_not_block_unstructured_run(self, client, mock_dynamo):
         """Source-type isolation: a pending STRUCTURED proposal does NOT 409 (Req 5.8).
 
@@ -365,6 +394,31 @@ class TestStartInduction:
         # retry isn't blocked for an hour.
         mock_dynamo.acquire_induction_lock.assert_called_once()
         mock_dynamo.release_induction_lock.assert_called_once_with(_NS)
+        worker.assert_not_called()
+
+    def test_proposal_written_just_before_lock_acquire_still_blocks(self, client, mock_dynamo):
+        """Check-then-act race (AppSec finding V2298834428): the running worker
+        writes its pending proposal and releases the lock in the gap between a
+        new trigger's proposal check and its lock acquire. The proposal check
+        must run UNDER the lock so this trigger 409s instead of starting a
+        duplicate run, and the lock it took must be released again."""
+
+        def _acquire_after_worker_finished(namespace, job_id):
+            mock_dynamo.list_proposals.return_value = [{"proposal_id": "prev-run", "namespace": namespace}]
+
+        mock_dynamo.acquire_induction_lock.side_effect = _acquire_after_worker_finished
+
+        with patch.object(induce_unstructured, "_run_unstructured_induction") as worker:
+            response = client.post(
+                f"/induce/unstructured/?namespace={_NS}",
+                json=_valid_request_body(),
+            )
+
+        assert response.status_code == 409
+        assert response.json()["detail"]["proposal_id"] == "prev-run"
+        mock_dynamo.release_induction_lock.assert_called_once_with(_NS)
+        mock_dynamo.create_proposal_stub.assert_not_called()
+        mock_dynamo.put_job.assert_not_called()
         worker.assert_not_called()
 
     def test_missing_namespace_query_param_returns_422(self, client, mock_dynamo):

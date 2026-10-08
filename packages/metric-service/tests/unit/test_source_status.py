@@ -64,6 +64,18 @@ class TestCheckSourceApproved:
         monkeypatch.delenv(PERMISSIVE_ENV, raising=False)
         assert check_source_approved("ns-1", "") == "dataSourceId is required"
 
+    @pytest.mark.parametrize("data_source_id", ["<script>alert(1)</script>", "ds 1", "ds/../x", "SRC#ds-1", "x" * 129])
+    def test_malformed_data_source_id_rejected_before_lookup(
+        self, monkeypatch: pytest.MonkeyPatch, data_source_id: str
+    ) -> None:
+        # Enforced even in permissive mode: the format check never depends on the table.
+        monkeypatch.setenv(PERMISSIVE_ENV, "true")
+        with patch("coa_metrics.source_status.DynamoDBDAO") as dao_cls:
+            error = check_source_approved("ns-1", data_source_id)
+        assert error is not None
+        assert error.startswith("dataSourceId must be")
+        dao_cls.assert_not_called()
+
     def test_missing_table_config_fails_closed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("DATA_SOURCES_TABLE", raising=False)
         monkeypatch.delenv(PERMISSIVE_ENV, raising=False)

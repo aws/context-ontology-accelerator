@@ -537,7 +537,8 @@ structure GraphVertex {
 
     /// Previous generations of this vertex's annotations, retired when a
     /// re-induced proposal was accepted into the same ontology. Keys are
-    /// ``comments`` / ``definitions`` / ``altLabels``; values are the literals
+    /// ``comments`` / ``definitions`` / ``altLabels`` / ``glossaryTerms`` /
+    /// ``tags``; values are the literals
     /// that used to be live — typically the AI-generated text a steward's
     /// curation replaced. Read from the ``coa:superseded*`` history predicates.
     /// History only: NOT live content (serve and embeddings ignore it) and
@@ -549,7 +550,7 @@ structure GraphVertex {
 }
 
 /// Retired annotation literals keyed by kind (``comments`` / ``definitions`` /
-/// ``altLabels``). See ``GraphVertex.superseded``.
+/// ``altLabels`` / ``glossaryTerms`` / ``tags``). See ``GraphVertex.superseded``.
 map SupersededAnnotations {
     key: String
     value: StringList
