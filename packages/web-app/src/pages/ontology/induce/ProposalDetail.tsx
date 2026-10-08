@@ -348,7 +348,9 @@ function ValidationResults({
       <Alert type="info" header={`Validation ${job.status}…`}>
         <SpaceBetween direction="horizontal" size="xs">
           <Spinner />
-          <Box>Running HermiT reasoner + structural metrics + OoPS!</Box>
+          <Box>
+            Running HermiT reasoner + structural metrics + OoPS! (if enabled)
+          </Box>
         </SpaceBetween>
       </Alert>
     );
@@ -1124,7 +1126,7 @@ export function ProposalDetailPage() {
                   Cancel
                 </Button>
                 <ButtonWithHint
-                  hint="Read-only quality checks: reasoner consistency (HermiT), structural metrics, and design pitfalls (OoPS!). Doesn't change the proposal."
+                  hint="Read-only quality checks: reasoner consistency (HermiT), structural metrics, and design pitfalls (OoPS!, if enabled). Doesn't change the proposal."
                   onClick={validate}
                   loading={validating}
                   disabled={!editedTurtle}

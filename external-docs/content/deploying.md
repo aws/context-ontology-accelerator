@@ -434,7 +434,25 @@ SCL_API_DOMAIN=api.ontology.example.com \
 SCL_API_CERT_ARN=arn:aws:acm:us-west-2:123456789012:certificate/api-cert-id \
 SCL_HOSTED_ZONE_ID=Z0123456789ABCDEFGHIJ \
 make deploy-dev
+
+# Optional OoPS! ontology pitfall scan (off by default) — see the note below
+SCL_OOPS_ENDPOINT=https://oops.example.internal/rest make deploy-dev
 ```
+
+!!! warning "The OoPS! pitfall scan sends your ontology to the endpoint you configure"
+    Tier-3 ontology validation can run the OoPS! (OntOlogy Pitfall Scanner)
+    pitfall scanner. To do so it POSTs the whole serialised ontology to the configured endpoint:
+    class and property names, labels, comments, and other literal values such as
+    sampled distinct values. It is therefore **off by default** — with no endpoint
+    configured, validation makes no outbound request and reports one `info` finding,
+    `OOPS_NOT_CONFIGURED`, while the rest of Tier 3 runs as usual.
+
+    To enable it, set `SCL_OOPS_ENDPOINT` (or pass `-c oops_endpoint=<url>` to
+    `cdk deploy`); the deploy sets `OOPS_ENDPOINT` on the ontology-engine container.
+    The value must be an `https://` URL (synth fails otherwise). Point it at a
+    self-hosted OoPS! instance unless you are content for your schema to leave your
+    network. Releases before this one defaulted to the public OoPS! service;
+    deployments that relied on that must now set the endpoint explicitly.
 
 !!! note "Custom domain certificate regions"
     `SCL_UI_CERT_ARN` must be an ACM certificate in `us-east-1` (CloudFront requirement) regardless of your deploy region. `SCL_API_CERT_ARN` must be in the same region you're deploying to (API Gateway requirement). CDK validates both at synth time and fails fast with a clear error if either is in the wrong region.
@@ -663,6 +681,7 @@ when tuning a large or pathological source.
 
 | Variable | Set By | Purpose |
 |----------|--------|---------|
+| `OOPS_ENDPOINT` | `ontology-stack.ts`, from the `oops_endpoint` context | REST endpoint of the OoPS! pitfall scanner used by Tier-3 ontology validation. **Unset by default**, which turns the scan off (no outbound request). When set, the serialised ontology is sent to it — see *Configuration Options*. |
 | `SCL_MCP_MODE` | `mcp-stack.ts` | Switches the container entrypoint between Context Manager (default) and MCP Server. When set to `"true"`, the container starts in MCP mode. |
 | `BULK_REVIEW_PAGE_BUDGET` | `worker.py` default | Per-invocation table budget for the bulk-review worker (default `1000`); when a source has more tables, the worker processes one page, re-enqueues a continuation, and resumes across chained invocations rather than silently capping. |
 | `BULK_REVIEW_WALL_CLOCK_BUDGET_S` | `worker.py` default | Per-invocation wall-clock budget in seconds (default `240`), a second guard under the 5-minute Lambda timeout that stops the worker after the current search page and continues in a fresh invocation when neared. |
@@ -1356,6 +1375,7 @@ group most easily missed when scoping IAM permissions or regional availability.
 | **Amazon Redshift Data API** | Querying Redshift-backed sources | `packages/context-manager/.../clients/redshift_data.py` |
 | **AWS Secrets Manager** | Data-source credentials (e.g. JDBC) | `packages/sources`, `packages/context-manager` |
 | **AWS STS** | Role assumption and caller identity across services | Widely used (~10 modules) |
+| **OoPS! (third party, optional)** | Ontology pitfall scan in Tier-3 validation. Off unless `OOPS_ENDPOINT` is configured; when on, receives the serialised ontology | `packages/ontology-engine/.../validation/validators/tier3.py` |
 
 
 ### A.3 Quotas to check before deploying
