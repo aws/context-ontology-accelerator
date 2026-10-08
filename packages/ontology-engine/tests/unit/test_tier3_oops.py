@@ -6,7 +6,8 @@
 OoPSValidator posts serialized RDF to a remote OoPS! service and parses either
 an XML or JSON pitfall report. We mock ``httpx.Client`` so no network call is
 made and drive both response formats plus the failure paths, asserting the
-``ValidationFinding`` list produced.
+``ValidationFinding`` list produced. The scan is opt-in: with no
+``OOPS_ENDPOINT`` it must make no request at all.
 """
 
 from __future__ import annotations
@@ -15,7 +16,8 @@ from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
-from coa_ontology.validation.schemas import Severity
+from coa_ontology.validation.routers.validate import _VALIDATORS
+from coa_ontology.validation.schemas import Severity, ValidationTier
 from coa_ontology.validation.validators.tier3 import (
     CompetencyQuestionValidator,
     OoPSValidator,
@@ -25,6 +27,13 @@ from rdflib import OWL, RDF, RDFS, Graph, Literal, URIRef
 pytestmark = pytest.mark.unit
 
 EX = "http://example.org/"
+TEST_ENDPOINT = "https://oops.example.test/rest"
+
+
+@pytest.fixture(autouse=True)
+def _oops_endpoint(monkeypatch):
+    """Most tests exercise a configured scan; opt-out tests delete the variable."""
+    monkeypatch.setenv("OOPS_ENDPOINT", TEST_ENDPOINT)
 
 
 def _graph_with_one_class() -> Graph:
@@ -165,3 +174,44 @@ class TestCompetencyQuestionValidator:
         assert len(findings) == 2
         assert all(f.code == "CQ_NOT_EVALUATED" for f in findings)
         assert findings[0].details["question"] == "What agreements exist?"
+
+
+class TestOoPSOptIn:
+    @pytest.mark.parametrize("value", [None, "", "   "])
+    def test_no_endpoint_makes_no_request(self, monkeypatch, value):
+        if value is None:
+            monkeypatch.delenv("OOPS_ENDPOINT", raising=False)
+        else:
+            monkeypatch.setenv("OOPS_ENDPOINT", value)
+        with patch.object(httpx, "Client") as client_cls:
+            findings = OoPSValidator().validate(_graph_with_one_class())
+        client_cls.assert_not_called()
+        assert [f.code for f in findings] == ["OOPS_NOT_CONFIGURED"]
+        assert findings[0].severity == Severity.info
+        assert "OOPS_ENDPOINT" in findings[0].message
+
+    def test_configured_endpoint_is_read_at_call_time(self, monkeypatch):
+        monkeypatch.setenv("OOPS_ENDPOINT", "https://self-hosted.example.test/oops/rest")
+        resp = MagicMock()
+        resp.text = "<OOPSResponse></OOPSResponse>"
+        resp.raise_for_status = MagicMock()
+        client = _mock_httpx_client(resp)
+        with patch.object(httpx, "Client", return_value=client):
+            findings = OoPSValidator().validate(_graph_with_one_class())
+        assert client.post.call_args.args[0] == "https://self-hosted.example.test/oops/rest"
+        assert findings == []
+
+    def test_validate_router_default_tiers_send_nothing_without_endpoint(self, monkeypatch):
+        """The standalone validate router's Tier-3 list (shared with proposal validation) stays local."""
+        monkeypatch.delenv("OOPS_ENDPOINT", raising=False)
+        tier3 = _VALIDATORS[ValidationTier.tier3_review]
+        assert any(isinstance(v, OoPSValidator) for v in tier3)
+        findings = []
+        with patch.object(httpx, "Client") as client_cls:
+            for v in tier3:
+                findings.extend(v.validate(_graph_with_one_class(), competency_questions=["Q?"]))
+        client_cls.assert_not_called()
+        codes = [f.code for f in findings]
+        assert codes.count("OOPS_NOT_CONFIGURED") == 1
+        # The other Tier-3 validators still ran.
+        assert any(f.validator != "oops" for f in findings)
