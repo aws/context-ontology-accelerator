@@ -45,7 +45,7 @@ from ...config import env_with_legacy_name
 from ...exceptions import AccessDeniedError
 from ...sql_execution import SqlExecutionService
 from ...step_ids import StepId
-from ..sql_firewall import SQLFirewall
+from ..sql_firewall import SQLFirewall, tables_visible_to
 from ..strategy import (
     EMPTY_RESULT_CONFIDENCE_FLOOR,
     StrategyContext,
@@ -223,13 +223,17 @@ class AgenticStrategy:
             return None
 
         confidence = _reported_confidence(outcome.confidence)
+        # ``outcome.tables`` is every table the agent inspected, not only the ones
+        # its SQL read; keep names outside the grant's ``tableAllowlist`` out of
+        # the client-visible trace and response.
+        visible_tables = tables_visible_to(outcome.tables, context.profile)
         trace.record(
             StepId.T2_SQL_EXECUTE,
             "success",
             t_ms,
             detail={
                 "rowCount": outcome.row_count,
-                "tables": outcome.tables,
+                "tables": visible_tables,
                 "deepReasoning": True,
                 "confidence": confidence,
             },
@@ -244,7 +248,7 @@ class AgenticStrategy:
             trace_steps=[],
             row_count=outcome.row_count,
             truncated=False,
-            retrieved_tables=outcome.tables,
-            expanded_tables=outcome.tables,
+            retrieved_tables=visible_tables,
+            expanded_tables=visible_tables,
             data_source_id=outcome.data_source_id,
         )

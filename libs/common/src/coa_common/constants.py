@@ -447,6 +447,61 @@ def validate_s3_prefix(value: str, name: str) -> None:
         raise ValueError(f"Invalid {name}: {value!r}. Must be a relative path like 'healthcare/' or 'documents/2024/'.")
 
 
+# Grant principal IDs: emails, IdP ``sub`` UUIDs, group names, agent IDs.
+# IdP group names and emails are free-form (``R&D Team``, ``Sales (EMEA)``,
+# non-ASCII letters, ``o'brien@...``), so instead of an allowlist this rejects
+# the characters that carry markup or escape a quoted context (``<`` ``>``
+# ``"`` backtick ``\``), control characters, and the grant key / grant-id
+# delimiters ``#`` and ``|``. ``::`` is rejected separately because a single
+# ``:`` is legitimate. Keep in sync with ``PrincipalId`` in
+# models/src/main/smithy/grant.smithy.
+PRINCIPAL_ID_RE: re.Pattern[str] = re.compile(r'[^<>"`\\#|\x00-\x1F\x7F]{1,256}')
+
+# Ontology URI prefix: http(s), an RFC 1123 host, an optional port 1-65535, and
+# an optional path of non-empty segments (no ``.``/``..``) made of RFC 3986
+# unreserved characters or ``%HH`` escapes, ending in an optional ``/`` and/or
+# ``#``. Escapes are stored as-is and never decoded. Keep in sync with
+# ``OntologyUriPrefix`` in models/src/main/smithy/ontology-induction.smithy.
+ONTOLOGY_URI_PREFIX_RE: re.Pattern[str] = re.compile(
+    r"https?://[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*"
+    r"(?::(?:6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5][0-9]{4}|[1-9][0-9]{0,3}))?"
+    r"(?:/(?!\.\.?(?:[/#]|$))(?:[A-Za-z0-9._~-]|%[0-9A-Fa-f]{2})+)*/?#?"
+)
+MAX_ONTOLOGY_URI_PREFIX_LEN = 2048
+
+
+def validate_principal_id(value: object, name: str = "principalId") -> str:
+    """Return *value* if it is a well-formed grant principal ID, else raise ``ValueError``.
+
+    The raw value is deliberately not echoed in the error: principal IDs are
+    caller-supplied and the message is returned in the API response.
+    """
+    if not isinstance(value, str) or not PRINCIPAL_ID_RE.fullmatch(value) or "::" in value:
+        raise ValueError(
+            f"Invalid {name}: must be 1-256 characters and may not contain <, >, \", `, \\, #, |, '::', "
+            "or control characters."
+        )
+    return value
+
+
+def validate_ontology_uri_prefix(value: object, name: str = "ontology_uri_prefix") -> str:
+    """Return the stripped *value* if it is a safe http(s) IRI prefix, else raise ``ValueError``.
+
+    The prefix is minted into every induced class/property IRI and stored as the
+    ontology ID, so it must not carry markup, quotes, whitespace, query strings,
+    or userinfo.
+    """
+    if not isinstance(value, str):
+        raise ValueError(f"Invalid {name}: must be a string.")
+    value = value.strip()
+    if len(value) > MAX_ONTOLOGY_URI_PREFIX_LEN or not ONTOLOGY_URI_PREFIX_RE.fullmatch(value):
+        raise ValueError(
+            f"Invalid {name}: must be an http(s) URI such as 'https://example.com/ontology/sales#' "
+            "with a valid host and port and a path of letters, digits, ._~- or %HH escapes."
+        )
+    return value
+
+
 # ---------------------------------------------------------------------------
 # GraphRAG Toolkit tenant ID conversion
 # ---------------------------------------------------------------------------

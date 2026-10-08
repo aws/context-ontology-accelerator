@@ -23,6 +23,7 @@ from coa_control_plane_server.models.create_namespace_request_content import Cre
 from pydantic import ValidationError
 
 from .service import ConflictError, NamespaceService
+from .validation_errors import format_validation_error
 
 setup_logging(os.environ.get("LOG_LEVEL", "INFO"))
 logger = structlog.get_logger(__name__)
@@ -77,8 +78,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     try:
         request = CreateNamespaceRequestContent.model_validate(body)
     except ValidationError as exc:
-        msg = exc.errors()[0]["msg"] if exc.errors() else str(exc)
-        return api_response(400, {"message": msg})
+        return api_response(400, {"message": format_validation_error(exc)})
 
     try:
         ns = _get_service().create(request)

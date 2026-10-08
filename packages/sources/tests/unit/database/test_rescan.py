@@ -432,6 +432,20 @@ def test_merge_added_column_taken_as_scanned():
     assert by_name["shipped_at"].business_metadata.review_status == ReviewStatus.PENDING_REVIEW
 
 
+def test_merge_rescan_table_unrepresentable_fk_target_taken_from_fresh_scan():
+    # The marker is source-owned (it records a key the source declares), so the
+    # merged column carries what the re-scan found, set or cleared.
+    accepted = _tbl(columns=[_col("customer_id"), _col("store_id")])
+    accepted.columns[1].unrepresentable_fk_target = "db.crm.stores"
+    fresh = _tbl(columns=[_col("customer_id"), _col("store_id")])
+    fresh.columns[0].unrepresentable_fk_target = "db.crm.customers"
+    merged = merge_rescan_table(accepted, fresh, changed_column_names=set())
+    assert {c.name: c.unrepresentable_fk_target for c in merged.columns} == {
+        "customer_id": "db.crm.customers",
+        "store_id": "",
+    }
+
+
 def test_merge_removed_column_carried_over_untouched():
     accepted = _tbl(
         columns=[

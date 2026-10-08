@@ -3,7 +3,7 @@
 
 """Shared formatting for Pydantic ValidationError -> API 400 message.
 
-Two independent friction points, both surfaced by adding hints to Pydantic's
+Known friction points, all surfaced by adding hints to Pydantic's
 default (unhelpful) validation messages rather than changing the request
 models:
 
@@ -21,6 +21,9 @@ models:
   doesn't say what execution engines map to which dialect today. The
   generated ``dialect: SqlDialect`` enum rejects it BEFORE the handler-level
   ``VALID_SQL_DIALECTS`` check ever runs, so the hint has to live here too.
+- A ``dataSourceId`` outside the ``DataSourceId`` @pattern fails with the
+  generated "must validate the regular expression" text, which does not name
+  the field; it gets the same message ``check_source_approved`` returns.
 """
 
 from __future__ import annotations
@@ -28,6 +31,7 @@ from __future__ import annotations
 from pydantic import ValidationError
 
 from coa_metrics.constants import dialect_hint
+from coa_metrics.source_status import DATA_SOURCE_ID_FORMAT_MESSAGE
 
 _EXPRESSION_SHAPE_HINT = (
     'Expected shape: "expression": {"dialects": [{"dialect": <SqlDialect>, '
@@ -63,5 +67,9 @@ def format_validation_error(exc: ValidationError) -> str:
 
     if loc == ("expression",):
         return f"{msg}. {_EXPRESSION_SHAPE_HINT}"
+
+    # The generated @pattern error is the raw regex and does not name the field.
+    if loc == ("dataSourceId",) and first.get("type") == "value_error":
+        return DATA_SOURCE_ID_FORMAT_MESSAGE
 
     return msg

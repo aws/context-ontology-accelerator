@@ -92,41 +92,27 @@ def start_induction(body: UnstructuredInductionRequest, request: Request, namesp
     Enforces one in-flight unstructured proposal per namespace
     (Requirement 5.3). A pending STRUCTURED proposal does NOT block a
     new unstructured run and vice versa — the in-flight check is
-    explicitly scoped to ``source_type="UNSTRUCTURED"``.
+    explicitly scoped to ``source_type="UNSTRUCTURED"``. "In flight" is the
+    shared ``PROPOSAL_STATUSES_BLOCKING_NEW_INDUCTION`` set, the same one the
+    structured router uses: unreviewed work plus an accept that is merging.
 
     Returns HTTP 202 with a :class:`JobResponse`. The pipeline runs
     asynchronously in a daemon worker thread; clients poll
     ``GET /jobs/{job_id}`` to track status.
     """
-    pending = dynamo_store.list_proposals(
-        namespace=namespace,
-        status="pending",
-        source_type=SOURCE_TYPE,
-    )
-    if not pending:
-        pending = dynamo_store.list_proposals(
-            namespace=namespace,
-            status="updated",
-            source_type=SOURCE_TYPE,
-        )
-    if pending:
-        raise HTTPException(
-            409,
-            {
-                "message": (
-                    "An unstructured proposal is already in flight for this namespace. "
-                    "Accept or reject it before starting a new induction."
-                ),
-                "proposal_id": pending[0]["proposal_id"],
-            },
-        )
-
     job_id = str(uuid.uuid4())
 
     # In-flight lock (see the structured router for the full two-layer
-    # rationale): the pending/updated check above is block-until-reviewed; this
-    # conditional lock is what actually blocks a SECOND trigger while this run
-    # is still executing (no proposal row exists during the in-flight window).
+    # rationale): this conditional lock is what actually blocks a SECOND
+    # trigger while this run is still executing (no proposal row exists during
+    # the in-flight window). The block-until-reviewed proposal check runs
+    # AFTER it is acquired — see below.
+    #
+    # Unstructured proposals go through the same accept pipeline as structured
+    # ones (accepting -> embeddings_sync -> accepted | accept_failed), so they
+    # block on the same status set, defined once in proposals.py.
+    from coa_ontology.proposals import PROPOSAL_STATUSES_BLOCKING_NEW_INDUCTION
+
     try:
         dynamo_store.acquire_induction_lock(namespace, job_id)
     except dynamo_store.InductionLockHeldError as e:
@@ -145,7 +131,31 @@ def start_induction(body: UnstructuredInductionRequest, request: Request, namesp
     # worker's finally only runs if the worker THREAD actually starts, so a
     # failure in create_proposal_stub / put_job / Thread.start() here would
     # otherwise leak the lock and wedge the namespace until the stale timeout.
+    # The same handler releases it when the block-until-reviewed 409 fires.
     try:
+        # Block-until-reviewed: checked UNDER the lock, not before it. Checking
+        # first left a check-then-act gap — a trigger could see no proposal,
+        # the running worker could then write its pending proposal and release
+        # the lock, and the trigger would acquire it and start a duplicate run
+        # beside an unreviewed proposal. The worker writes its proposal before
+        # releasing, so once we hold the lock this read is authoritative.
+        pending: list[dict] = []
+        for _status in PROPOSAL_STATUSES_BLOCKING_NEW_INDUCTION:
+            pending = dynamo_store.list_proposals(namespace=namespace, status=_status, source_type=SOURCE_TYPE)
+            if pending:
+                break
+        if pending:
+            raise HTTPException(
+                409,
+                {
+                    "message": (
+                        "An unstructured proposal is already in flight for this namespace. "
+                        "Accept or reject it before starting a new induction."
+                    ),
+                    "proposal_id": pending[0]["proposal_id"],
+                },
+            )
+
         # In-progress PROPOSAL stub FIRST for immediate + refresh-safe
         # visibility (the worker upserts it into the real proposal at the end).
         # Ordered before put_job so a job row never exists without its stub.
@@ -522,7 +532,7 @@ def _run_unstructured_induction(
         _join_watchdog(watchdog, watchdog_stop, job_id, log)
         # Release the in-flight lock whether the run succeeded or failed — it
         # only guards the ACTIVE run. Block-until-reviewed is enforced by
-        # start_induction's pending/updated proposal check (the disjoint
+        # start_induction's blocking-proposal check (the disjoint
         # completed-but-unreviewed window). Best-effort; stale-takeover backstops.
         try:
             dynamo_store.release_induction_lock(ns)

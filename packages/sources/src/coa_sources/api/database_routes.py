@@ -2988,6 +2988,9 @@ def _handle_get_scan_job(namespace_id: str, source_id: str, job_id: str) -> dict
         # clean scan's response is unchanged.
         "tablesFailed": _optional_int(scan_item.get("tablesFailed")),
         "failedTables": scan_item.get("failedTables"),
+        # Filters that looked like a regex and matched nothing (filters are globs),
+        # so the scan succeeded without the intended filtering. Absent when none.
+        "filterWarnings": scan_item.get("filterWarnings"),
         # Enrichment can partially fail independently of discovery: individual
         # tables that error (guardrail block, parse/timeout) are written back
         # without enrichment while the scan still completes. These fields name

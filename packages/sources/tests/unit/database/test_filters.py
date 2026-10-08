@@ -10,7 +10,16 @@ either connector) to pin the contract and stop the two from drifting.
 
 from __future__ import annotations
 
-from coa_sources.database.connectors.filters import compile_filter, split_glob_list
+import pytest
+from coa_sources.database.connectors.filters import (
+    GLOB_SYNTAX_HINT,
+    compile_filter,
+    glob_suggestion,
+    looks_like_regex,
+    regex_hint,
+    split_glob_list,
+    unmatched_regex_warning,
+)
 
 
 class TestSplitGlobList:
@@ -81,3 +90,79 @@ class TestCompileFilter:
         assert rx is not None
         assert rx.match("orders[")
         assert not rx.match("orders")
+
+
+# ── #168: filters are globs; regex-looking input gets a hint, never a rejection ──
+
+
+_SCHEMAS = ["public", "target_schema", "analytics", "pg_catalog", "information_schema"]
+
+
+@pytest.mark.parametrize(
+    ("pattern", "matches"),
+    [
+        ("^target_schema$", []),
+        ("^(public|analytics)$", []),
+        ("target_.*", []),
+        ("target_schema", ["target_schema"]),
+        ("public|analytics", ["public", "analytics"]),
+        ("target_*", ["target_schema"]),
+        ("constructor*,results", []),
+    ],
+)
+def test_glob_matching_is_unchanged(pattern, matches):
+    """The reporter's table: matching itself does not change — only how it's explained."""
+    rx = compile_filter(pattern, "schema_filter")
+    assert [s for s in _SCHEMAS if rx.match(s)] == matches
+
+
+@pytest.mark.parametrize(
+    ("pattern", "is_regex"),
+    [
+        ("^target_schema$", True),
+        ("target_.*", True),
+        ("a|^b", True),
+        ("target_schema", False),
+        ("sales_*", False),
+        ("a$b", False),  # a $ inside a real identifier is not a regex sign
+        ("x(1)", False),  # parentheses can be part of a name
+        (None, False),
+    ],
+)
+def test_looks_like_regex_only_flags_unambiguous_signs(pattern, is_regex):
+    assert looks_like_regex(pattern) is is_regex
+
+
+@pytest.mark.parametrize(
+    ("pattern", "suggestion"),
+    [
+        ("^target_schema$", "target_schema"),
+        ("^(public|analytics)$", "public|analytics"),
+        ("target_.*", "target_*"),
+        ("^a$|^b$", "a|b"),
+        ("^x(y|z)+$", None),  # no obvious glob: don't guess
+        ("sales_*", None),
+    ],
+)
+def test_glob_suggestion(pattern, suggestion):
+    assert glob_suggestion(pattern) == suggestion
+
+
+def test_regex_hint_is_empty_for_globs_and_names_the_field_for_regexes():
+    assert regex_hint("sales_*", "schema_filter") == ""
+    hint = regex_hint("^target_schema$", "schema_filter")
+    assert "schema_filter" in hint and "Did you mean 'target_schema'?" in hint
+
+
+def test_unmatched_regex_warning_only_for_a_regex_that_had_no_effect():
+    assert unmatched_regex_warning("staging_*", "table_exclude_filter", ["a"]) is None  # glob: silent
+    # A name that really contains the characters is matched, so no warning.
+    assert unmatched_regex_warning("^a$", "table_exclude_filter", ["^a$"]) is None
+    assert unmatched_regex_warning(None, "table_exclude_filter", ["a"]) is None
+    warning = unmatched_regex_warning("^b$", "table_exclude_filter", ["a"])
+    assert warning and "had no effect" in warning and GLOB_SYNTAX_HINT in warning
+
+
+def test_unmatched_regex_warning_is_silent_for_an_empty_listing():
+    """An empty database or schema gave the filter nothing to match: not a mistake."""
+    assert unmatched_regex_warning("^b$", "table_exclude_filter", []) is None

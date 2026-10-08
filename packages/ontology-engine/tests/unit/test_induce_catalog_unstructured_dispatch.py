@@ -132,6 +132,15 @@ class TestWorkbenchRequestGroundingAliases:
         assert b.grounding_mode == "STANDARD"
         assert b.grounding_ontology_ids == ["b"]
 
+    def test_graph_arn_camel_case_binds(self):
+        b = WorkbenchInductionRequest.model_validate(
+            {
+                "ontology_uri_prefix": "http://x/o#",
+                "graphArn": "arn:aws:neptune-graph:us-east-1:123456789012:graph/g-test",
+            }
+        )
+        assert b.graph_arn == "arn:aws:neptune-graph:us-east-1:123456789012:graph/g-test"
+
     def test_default_when_omitted(self):
         b = WorkbenchInductionRequest(ontology_uri_prefix="http://x/o#")
         assert b.grounding_mode == "ENHANCED"

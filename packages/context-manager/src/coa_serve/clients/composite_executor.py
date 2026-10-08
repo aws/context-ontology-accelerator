@@ -176,7 +176,8 @@ class CompositeQueryExecutor:
                 #
                 # `sql` here is post-substitution (contains caller-supplied
                 # dimension values — potential PII). Log length only, not the
-                # statement; mirrors the orchestrator's SQL-log discipline.
+                # statement; mirrors the orchestrator's SQL-log discipline. The
+                # sqlglot error message echoes a SQL snippet, so log its type only.
                 #
                 # Do NOT forward the untranspiled Trino SQL to the JDBC engine:
                 # Trino-only constructs run with different (silently wrong) semantics
@@ -187,7 +188,7 @@ class CompositeQueryExecutor:
                     "jdbc_trino_transpile_failed_fallback_athena",
                     target_dialect=target_dialect,
                     sql_len=len(sql),
-                    error=str(exc),
+                    error_type=type(exc).__name__,
                 )
                 logger.info("composite_dispatch", route="athena_federation", data_source_id=data_source_id or "")
                 return await self._athena.execute(

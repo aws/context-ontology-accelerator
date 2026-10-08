@@ -189,6 +189,22 @@ class TestCreatePlatformGrant:
             )
             assert resp["statusCode"] == 400, bad_id
 
+    def test_non_string_principal_id_returns_400(self):
+        resp = create_handler(
+            _create_event({"principalType": "User", "principalId": 12345, "role": "platform-admin"}),
+            None,
+        )
+        assert resp["statusCode"] == 400
+
+    def test_principal_id_with_markup_returns_400(self):
+        resp = create_handler(
+            _create_event(
+                {"principalType": "User", "principalId": "<a onclick=prompt(1);>x</a>", "role": "platform-admin"}
+            ),
+            None,
+        )
+        assert resp["statusCode"] == 400
+
     def test_invalid_principal_type_returns_400(self):
         resp = create_handler(
             _create_event({"principalType": "Robot", "principalId": "a@b.com", "role": "platform-admin"}),

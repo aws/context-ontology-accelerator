@@ -1446,6 +1446,31 @@ class TestCustomConnectorDiscovery:
         fields = scan_dao.update.call_args.kwargs["update_fields"]
         assert "tablesFailed" not in fields
         assert "failedTables" not in fields
+        assert "filterWarnings" not in fields
+
+    @patch(f"{MODULE}.write_to_datazone")
+    @patch(f"{MODULE}._get_ns_dao")
+    @patch(f"{MODULE}._get_scan_dao")
+    @patch(f"{MODULE}._get_ds_dao")
+    @patch(f"{MODULE}.get_connector")
+    def test_records_filter_warnings_on_the_scan_job(
+        self, mock_get_connector, mock_get_ds, mock_get_scan, mock_get_ns, mock_write
+    ):
+        """A regex filter that matched nothing leaves the scan successful but unfiltered;
+        the reason must reach the scan job the steward sees (#168)."""
+        from coa_sources.database.pipeline.discovery_handler import handler
+
+        metadata = DiscoveredMetadata(
+            tables=[Table(name="ok", database="widgets", columns=[Column(name="c", data_type="int")])],
+            filter_warnings=["schema_exclude_filter matched nothing, so it had no effect."],
+        )
+        _, scan_dao, _ = self._wire(
+            mock_get_ds, mock_get_scan, mock_get_ns, mock_write, mock_get_connector, metadata, self._item()
+        )
+        handler(self._EVENT, None)
+
+        fields = scan_dao.update.call_args.kwargs["update_fields"]
+        assert fields["filterWarnings"] == ["schema_exclude_filter matched nothing, so it had no effect."]
 
     @patch(f"{MODULE}.write_to_datazone")
     @patch(f"{MODULE}._get_ns_dao")
@@ -1752,3 +1777,462 @@ class TestScanTimeNamespaceBinding:
         mock_require.assert_not_called()
         # And the scan really did run, or the assertion above is vacuous.
         mock_get_connector.assert_called_once()
+
+
+def _drift_rescan_setup(mock_get_connector, mock_get_ds, mock_get_scan, mock_get_ns, mock_write, mock_read_accepted):
+    """A re-scan whose fresh scan differs from the accepted assets (orders changed type)."""
+    mock_ds_dao = MagicMock()
+    mock_ds_dao.get.return_value = {
+        "sourceSubType": "GLUE_DATABASE",
+        "configuration": {"databaseName": "analytics_db", "catalogId": "123456789012", "region": "us-east-1"},
+    }
+    mock_get_ds.return_value = mock_ds_dao
+    mock_get_scan.return_value = MagicMock()
+    mock_get_ns.return_value = MagicMock(get=MagicMock(return_value={"dataZoneProjectId": "proj-1"}))
+    mock_write.return_value = {"assets_created": 0, "assets_revised": 1}
+    mock_read_accepted.return_value = [
+        Table(name="orders", database="analytics_db", columns=[Column(name="total", data_type="decimal")]),
+    ]
+    connector = MagicMock()
+    connector.test_connection.return_value = ConnectionTestResult(success=True, message="OK", checks=[])
+    connector.discover_metadata.return_value = DiscoveredMetadata(
+        tables=[Table(name="orders", database="analytics_db", columns=[Column(name="total", data_type="varchar")])]
+    )
+    mock_get_connector.return_value = connector
+    return mock_ds_dao
+
+
+_RESCAN_EVENT = {
+    "datasourceId": "DS#ds-1",
+    "scanJobId": "SCAN#s",
+    "scanJobSK": "2026-10-04T00:00:00.000000Z",
+    "namespaceId": "ns-1",
+    "scanType": "full",
+    "isRescan": True,
+}
+
+
+def _marker_writes(mock_ds_dao) -> list[dict]:
+    from coa_sources.database.rescan_backup import BACKUP_SCAN_JOB_FIELD
+
+    return [
+        c.kwargs["update_fields"]
+        for c in mock_ds_dao.update.call_args_list
+        if BACKUP_SCAN_JOB_FIELD in c.kwargs.get("update_fields", {})
+    ]
+
+
+@pytest.mark.unit
+class TestRescanBackupMarker:
+    """A re-scan records on the source row that it wrote its backup blob,
+    before the merge overwrites a live asset. If the run fails after that point the
+    live assets are an unreviewed merge, and the retry has to rebuild its baseline
+    from the blob, so the trigger reads this marker to send ``hadOpenRescan``."""
+
+    @patch(f"{MODULE}.BUCKET_NAME", "test-bucket")
+    @patch(f"{MODULE}.upload_json")
+    @patch(f"{MODULE}.get_s3_client")
+    @patch(f"{MODULE}.read_assets_for_datasource")
+    @patch(f"{MODULE}.write_to_datazone")
+    @patch(f"{MODULE}._get_ns_dao")
+    @patch(f"{MODULE}._get_scan_dao")
+    @patch(f"{MODULE}._get_ds_dao")
+    @patch(f"{MODULE}.get_connector")
+    def test_marker_is_written_after_the_backup_and_before_the_merge(
+        self,
+        mock_get_connector,
+        mock_get_ds,
+        mock_get_scan,
+        mock_get_ns,
+        mock_write,
+        mock_read_accepted,
+        mock_s3_client,
+        mock_upload,
+    ):
+        from coa_sources.database.pipeline.discovery_handler import handler
+        from coa_sources.database.rescan_backup import BACKUP_SCAN_JOB_FIELD
+
+        mock_ds_dao = _drift_rescan_setup(
+            mock_get_connector, mock_get_ds, mock_get_scan, mock_get_ns, mock_write, mock_read_accepted
+        )
+        order: list[str] = []
+        mock_upload.side_effect = lambda *a, **k: order.append("backup")
+        mock_write.side_effect = lambda **k: order.append("merge") or {"assets_created": 0}
+
+        def _update(**kwargs):
+            if BACKUP_SCAN_JOB_FIELD in kwargs.get("update_fields", {}):
+                order.append("marker")
+            return True
+
+        mock_ds_dao.update.side_effect = _update
+
+        handler(dict(_RESCAN_EVENT), None)
+
+        assert order == ["backup", "marker", "merge"]
+        assert _marker_writes(mock_ds_dao) == [{BACKUP_SCAN_JOB_FIELD: _RESCAN_EVENT["scanJobSK"]}]
+
+    @patch(f"{MODULE}.BUCKET_NAME", "test-bucket")
+    @patch(f"{MODULE}.upload_json")
+    @patch(f"{MODULE}.get_s3_client")
+    @patch(f"{MODULE}.read_assets_for_datasource")
+    @patch(f"{MODULE}.write_to_datazone")
+    @patch(f"{MODULE}._get_ns_dao")
+    @patch(f"{MODULE}._get_scan_dao")
+    @patch(f"{MODULE}._get_ds_dao")
+    @patch(f"{MODULE}.get_connector")
+    def test_no_drift_rescan_writes_no_marker(
+        self,
+        mock_get_connector,
+        mock_get_ds,
+        mock_get_scan,
+        mock_get_ns,
+        mock_write,
+        mock_read_accepted,
+        mock_s3_client,
+        mock_upload,
+    ):
+        # No drift writes no blob, and the merge then leaves every asset as it was,
+        # so a retry of this run can treat the live assets as the baseline.
+        from coa_sources.database.pipeline.discovery_handler import handler
+
+        mock_ds_dao = _drift_rescan_setup(
+            mock_get_connector, mock_get_ds, mock_get_scan, mock_get_ns, mock_write, mock_read_accepted
+        )
+        mock_get_connector.return_value.discover_metadata.return_value = DiscoveredMetadata(
+            tables=[Table(name="orders", database="analytics_db", columns=[Column(name="total", data_type="decimal")])]
+        )
+
+        handler(dict(_RESCAN_EVENT), None)
+
+        mock_upload.assert_not_called()
+        assert _marker_writes(mock_ds_dao) == []
+
+    @patch(f"{MODULE}.BUCKET_NAME", "test-bucket")
+    @patch(f"{MODULE}.upload_json")
+    @patch(f"{MODULE}.get_s3_client")
+    @patch(f"{MODULE}.read_assets_for_datasource")
+    @patch(f"{MODULE}.write_to_datazone")
+    @patch(f"{MODULE}._get_ns_dao")
+    @patch(f"{MODULE}._get_scan_dao")
+    @patch(f"{MODULE}._get_ds_dao")
+    @patch(f"{MODULE}.get_connector")
+    def test_marker_write_failure_fails_the_scan_before_the_merge(
+        self,
+        mock_get_connector,
+        mock_get_ds,
+        mock_get_scan,
+        mock_get_ns,
+        mock_write,
+        mock_read_accepted,
+        mock_s3_client,
+        mock_upload,
+    ):
+        # Without the marker a retry assumes the live assets are the baseline, which
+        # is only true if nothing was overwritten. So a failed marker write must stop
+        # the run before the merge.
+        from botocore.exceptions import ClientError
+        from coa_sources.database.pipeline.discovery_handler import handler
+        from coa_sources.database.rescan_backup import BACKUP_SCAN_JOB_FIELD
+
+        mock_ds_dao = _drift_rescan_setup(
+            mock_get_connector, mock_get_ds, mock_get_scan, mock_get_ns, mock_write, mock_read_accepted
+        )
+
+        def _update(**kwargs):
+            if BACKUP_SCAN_JOB_FIELD in kwargs.get("update_fields", {}):
+                raise ClientError({"Error": {"Code": "ProvisionedThroughputExceededException"}}, "UpdateItem")
+            return True
+
+        mock_ds_dao.update.side_effect = _update
+
+        with pytest.raises((TransientScanError, PermanentScanError)):
+            handler(dict(_RESCAN_EVENT), None)
+
+        mock_upload.assert_called_once()
+        mock_write.assert_not_called()
+
+    @patch(f"{MODULE}.BUCKET_NAME", "test-bucket")
+    @patch(f"{MODULE}._read_existing_backup")
+    @patch(f"{MODULE}.upload_json")
+    @patch(f"{MODULE}.get_s3_client")
+    @patch(f"{MODULE}.read_assets_for_datasource")
+    @patch(f"{MODULE}.write_to_datazone")
+    @patch(f"{MODULE}._get_ns_dao")
+    @patch(f"{MODULE}._get_scan_dao")
+    @patch(f"{MODULE}._get_ds_dao")
+    @patch(f"{MODULE}.get_connector")
+    def test_handler_step_functions_retry_of_own_run_rebuilds_baseline_from_backup(
+        self,
+        mock_get_connector,
+        mock_get_ds,
+        mock_get_scan,
+        mock_get_ns,
+        mock_write,
+        mock_read_accepted,
+        mock_s3_client,
+        mock_upload,
+        mock_read_backup,
+    ):
+        # A retry inside the same execution gets the first attempt's input, so
+        # hadOpenRescan is still false. The first attempt had written its backup
+        # (the marker names this run) and merged orders, so the live asset already
+        # matches the fresh scan. The retry must still diff against the backup.
+        from coa_common.datazone_forms import serialize_form
+        from coa_sources.database.pipeline.discovery_handler import handler
+        from coa_sources.database.rescan_backup import BACKUP_SCAN_JOB_FIELD
+
+        mock_ds_dao = _drift_rescan_setup(
+            mock_get_connector, mock_get_ds, mock_get_scan, mock_get_ns, mock_write, mock_read_accepted
+        )
+        mock_ds_dao.get.return_value[BACKUP_SCAN_JOB_FIELD] = _RESCAN_EVENT["scanJobSK"]
+        mock_read_accepted.return_value = [
+            Table(name="orders", database="analytics_db", columns=[Column(name="total", data_type="varchar")]),
+        ]
+        approved_orders = Table(
+            name="orders",
+            database="analytics_db",
+            business_metadata=BusinessMetadata(review_status=ReviewStatus.APPROVED),
+            columns=[Column(name="total", data_type="decimal")],
+        )
+        mock_read_backup.return_value = {
+            "version": 1,
+            "source_id": "ds-1",
+            "scan_job_sk": _RESCAN_EVENT["scanJobSK"],
+            "removed_tables": [],
+            "added_tables": [],
+            "removed_columns": {},
+            "modified_backup": {"analytics_db.orders": serialize_form(approved_orders)},
+        }
+
+        result = handler(dict(_RESCAN_EVENT), None)
+
+        mock_read_backup.assert_called_once_with("ds-1")
+        assert result["reviewNeeded"] == "true"
+
+    @patch(f"{MODULE}.BUCKET_NAME", "test-bucket")
+    @patch(f"{MODULE}._read_existing_backup")
+    @patch(f"{MODULE}.upload_json")
+    @patch(f"{MODULE}.get_s3_client")
+    @patch(f"{MODULE}.read_assets_for_datasource")
+    @patch(f"{MODULE}.write_to_datazone")
+    @patch(f"{MODULE}._get_ns_dao")
+    @patch(f"{MODULE}._get_scan_dao")
+    @patch(f"{MODULE}._get_ds_dao")
+    @patch(f"{MODULE}.get_connector")
+    def test_handler_marker_from_another_run_does_not_read_backup(
+        self,
+        mock_get_connector,
+        mock_get_ds,
+        mock_get_scan,
+        mock_get_ns,
+        mock_write,
+        mock_read_accepted,
+        mock_s3_client,
+        mock_upload,
+        mock_read_backup,
+    ):
+        # A marker naming an EARLIER run is not a retry of this one: with
+        # hadOpenRescan false the live assets are the baseline and no blob is read.
+        from coa_sources.database.pipeline.discovery_handler import handler
+        from coa_sources.database.rescan_backup import BACKUP_SCAN_JOB_FIELD
+
+        mock_ds_dao = _drift_rescan_setup(
+            mock_get_connector, mock_get_ds, mock_get_scan, mock_get_ns, mock_write, mock_read_accepted
+        )
+        mock_ds_dao.get.return_value[BACKUP_SCAN_JOB_FIELD] = "2026-09-01T00:00:00.000000Z"
+
+        handler(dict(_RESCAN_EVENT), None)
+
+        mock_read_backup.assert_not_called()
+
+
+def _open_rescan_backup(source_summary: dict | None) -> dict:
+    """An existing backup whose approved pre-image of orders has total as decimal."""
+    from coa_common.datazone_forms import serialize_form
+
+    approved_orders = Table(
+        name="orders",
+        database="analytics_db",
+        business_metadata=BusinessMetadata(review_status=ReviewStatus.APPROVED),
+        columns=[Column(name="total", data_type="decimal")],
+    )
+    backup = {
+        "version": 1,
+        "source_id": "ds-1",
+        "scan_job_sk": "2026-10-03T00:00:00.000000Z",
+        "removed_tables": [],
+        "added_tables": [],
+        "removed_columns": {},
+        "modified_backup": {"analytics_db.orders": serialize_form(approved_orders)},
+    }
+    if source_summary is not None:
+        backup["source_summary"] = source_summary
+    return backup
+
+
+@pytest.mark.unit
+class TestRescanBackupSummaryFromExistingBackup:
+    """When the baseline is rebuilt from an existing backup, the source row's counts
+    may already be the failed run's, so the new backup keeps the old backup's."""
+
+    _ROW_COUNTS = {
+        "tablesApproved": 7,
+        "tablesDiscovered": 10,
+        "lastScanAt": "2026-10-03T00:05:00+00:00",
+        "lastScanJobId": "2026-10-03T00:00:00.000000Z",
+    }
+
+    def _run(self, mocks, backup_summary):
+        (mock_get_connector, mock_get_ds, mock_get_scan, mock_get_ns, mock_write, mock_read_accepted) = mocks[:6]
+        mock_read_backup, mock_upload = mocks[6], mocks[7]
+        from coa_sources.database.pipeline.discovery_handler import handler
+
+        mock_ds_dao = _drift_rescan_setup(
+            mock_get_connector, mock_get_ds, mock_get_scan, mock_get_ns, mock_write, mock_read_accepted
+        )
+        mock_ds_dao.get.return_value.update(self._ROW_COUNTS)
+        mock_read_backup.return_value = _open_rescan_backup(backup_summary)
+        handler({**_RESCAN_EVENT, "hadOpenRescan": "true"}, None)
+        mock_upload.assert_called_once()
+        return mock_upload.call_args.args[3]["source_summary"]
+
+    @patch(f"{MODULE}.BUCKET_NAME", "test-bucket")
+    @patch(f"{MODULE}._read_existing_backup")
+    @patch(f"{MODULE}.upload_json")
+    @patch(f"{MODULE}.get_s3_client")
+    @patch(f"{MODULE}.read_assets_for_datasource")
+    @patch(f"{MODULE}.write_to_datazone")
+    @patch(f"{MODULE}._get_ns_dao")
+    @patch(f"{MODULE}._get_scan_dao")
+    @patch(f"{MODULE}._get_ds_dao")
+    @patch(f"{MODULE}.get_connector")
+    def test_handler_retry_with_existing_backup_keeps_backup_source_summary(
+        self, c, ds, scan, ns, write, live, s3, upload, read_backup
+    ):
+        approved_summary = {
+            "tablesApproved": 10,
+            "tablesDiscovered": 10,
+            "lastScanAt": "2026-09-01T00:05:00+00:00",
+            "lastScanJobId": "2026-09-01T00:00:00.000000Z",
+        }
+
+        summary = self._run((c, ds, scan, ns, write, live, read_backup, upload), approved_summary)
+
+        assert summary == approved_summary
+
+    @patch(f"{MODULE}.BUCKET_NAME", "test-bucket")
+    @patch(f"{MODULE}._read_existing_backup")
+    @patch(f"{MODULE}.upload_json")
+    @patch(f"{MODULE}.get_s3_client")
+    @patch(f"{MODULE}.read_assets_for_datasource")
+    @patch(f"{MODULE}.write_to_datazone")
+    @patch(f"{MODULE}._get_ns_dao")
+    @patch(f"{MODULE}._get_scan_dao")
+    @patch(f"{MODULE}._get_ds_dao")
+    @patch(f"{MODULE}.get_connector")
+    def test_handler_existing_backup_without_summary_falls_back_to_row_counts(
+        self, c, ds, scan, ns, write, live, s3, upload, read_backup
+    ):
+        # A backup with no summary still gives a reject something to restore.
+        summary = self._run((c, ds, scan, ns, write, live, read_backup, upload), None)
+
+        assert summary == self._ROW_COUNTS
+
+
+@pytest.mark.unit
+class TestRescanRestoresTablesBackToApproved:
+    """A table an earlier run merged that now diffs as unchanged against the
+    rebuilt baseline is written back to its approved version from the backup."""
+
+    @patch(f"{MODULE}.BUCKET_NAME", "test-bucket")
+    @patch(f"{MODULE}._read_existing_backup")
+    @patch(f"{MODULE}.upload_json")
+    @patch(f"{MODULE}.get_s3_client")
+    @patch(f"{MODULE}.read_assets_for_datasource")
+    @patch(f"{MODULE}.write_to_datazone")
+    @patch(f"{MODULE}._get_ns_dao")
+    @patch(f"{MODULE}._get_scan_dao")
+    @patch(f"{MODULE}._get_ds_dao")
+    @patch(f"{MODULE}.get_connector")
+    def test_handler_reverted_table_is_written_back_from_backup_and_needs_no_review(
+        self,
+        mock_get_connector,
+        mock_get_ds,
+        mock_get_scan,
+        mock_get_ns,
+        mock_write,
+        mock_read_accepted,
+        mock_s3_client,
+        mock_upload,
+        mock_read_backup,
+    ):
+        from coa_sources.database.pipeline.discovery_handler import handler
+        from coa_sources.database.rescan_backup import backup_s3_key
+
+        mock_ds_dao = _drift_rescan_setup(
+            mock_get_connector, mock_get_ds, mock_get_scan, mock_get_ns, mock_write, mock_read_accepted
+        )
+        # Live asset: the earlier run's merge (total became varchar).
+        mock_read_accepted.return_value = [
+            Table(name="orders", database="analytics_db", columns=[Column(name="total", data_type="varchar")]),
+        ]
+        # Fresh scan: back to the approved pre-image (decimal).
+        mock_get_connector.return_value.discover_metadata.return_value = DiscoveredMetadata(
+            tables=[Table(name="orders", database="analytics_db", columns=[Column(name="total", data_type="decimal")])]
+        )
+        mock_read_backup.return_value = _open_rescan_backup({"tablesApproved": 1})
+
+        result = handler({**_RESCAN_EVENT, "hadOpenRescan": "true"}, None)
+
+        (written,) = mock_write.call_args.kwargs["metadata"].tables
+        assert written.table_id == "analytics_db.orders"
+        assert written.columns[0].data_type == "decimal"
+        assert written.business_metadata.review_status == ReviewStatus.APPROVED
+        assert result["reviewNeeded"] == "false"
+        # Nothing to review, so no new backup, and the old one is deleted.
+        mock_upload.assert_not_called()
+        mock_s3_client.return_value.delete_object.assert_called_once_with(
+            Bucket="test-bucket", Key=backup_s3_key("ds-1")
+        )
+        # The restored table is approved again, so it counts.
+        source_updates = [
+            c.kwargs["update_fields"]
+            for c in mock_ds_dao.update.call_args_list
+            if "tablesApproved" in c.kwargs.get("update_fields", {})
+        ]
+        assert source_updates[-1]["tablesApproved"] == 1
+
+    @patch(f"{MODULE}.BUCKET_NAME", "test-bucket")
+    @patch(f"{MODULE}._read_existing_backup")
+    @patch(f"{MODULE}.upload_json")
+    @patch(f"{MODULE}.get_s3_client")
+    @patch(f"{MODULE}.read_assets_for_datasource")
+    @patch(f"{MODULE}.write_to_datazone")
+    @patch(f"{MODULE}._get_ns_dao")
+    @patch(f"{MODULE}._get_scan_dao")
+    @patch(f"{MODULE}._get_ds_dao")
+    @patch(f"{MODULE}.get_connector")
+    def test_handler_rescan_still_needing_review_keeps_new_backup(
+        self,
+        mock_get_connector,
+        mock_get_ds,
+        mock_get_scan,
+        mock_get_ns,
+        mock_write,
+        mock_read_accepted,
+        mock_s3_client,
+        mock_upload,
+        mock_read_backup,
+    ):
+        # With drift left to review, the new backup replaces the old one; nothing
+        # is deleted, or approve/reject would have no backup to read.
+        from coa_sources.database.pipeline.discovery_handler import handler
+
+        _drift_rescan_setup(mock_get_connector, mock_get_ds, mock_get_scan, mock_get_ns, mock_write, mock_read_accepted)
+        mock_read_backup.return_value = _open_rescan_backup({"tablesApproved": 1})
+
+        result = handler({**_RESCAN_EVENT, "hadOpenRescan": "true"}, None)
+
+        assert result["reviewNeeded"] == "true"
+        mock_upload.assert_called_once()
+        mock_s3_client.return_value.delete_object.assert_not_called()

@@ -36,7 +36,7 @@ import random
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import boto3
 from botocore.config import Config
@@ -436,7 +436,8 @@ def make_llama_index_embedding(
     adapter is therefore a MODULE-LEVEL class (not a closure) that reconstructs
     its :class:`BedrockEmbedder` from plain fields — a locally-defined class or a
     captured closure fails to pickle and graphrag silently drops the vector
-    store, breaking ingestion.
+    store, breaking ingestion. The class is built lazily; the module
+    ``__getattr__`` below makes its name resolvable in a freshly spawned worker.
     """
     cls = _bedrock_embedder_llama_index_cls()
     resolved_id = model_id or os.environ.get("BEDROCK_EMBED_MODEL_ID", DEFAULT_EMBED_MODEL_ID)
@@ -502,3 +503,26 @@ def _bedrock_embedder_llama_index_cls() -> Any:
     globals()["BedrockEmbedderLlamaIndex"] = BedrockEmbedderLlamaIndex
     _LLAMA_ADAPTER_CLS = BedrockEmbedderLlamaIndex
     return _LLAMA_ADAPTER_CLS
+
+
+# Names this module builds on first access instead of at import time.
+_LAZY_ATTRS = frozenset({"BedrockEmbedderLlamaIndex"})
+
+if not TYPE_CHECKING:
+    # Hidden from type checkers so a typo in an import is still reported as a
+    # missing attribute instead of silently typing as ``Any``.
+
+    def __getattr__(name: str) -> Any:
+        """Build the lazy LlamaIndex adapter class when it is looked up by name.
+
+        Pickle stores an adapter instance as ``coa_common.embeddings.BedrockEmbedderLlamaIndex``.
+        A worker started with the ``spawn`` or ``forkserver`` method imports this
+        module fresh and never calls :func:`make_llama_index_embedding`, so the
+        name would not exist there and unpickling would fail, killing the
+        worker pool. This hook (PEP 562; only consulted when normal lookup fails)
+        builds and caches the class on first access, which also keeps
+        ``llama_index`` out of the import path of services that never use it.
+        """
+        if name in _LAZY_ATTRS:
+            return _bedrock_embedder_llama_index_cls()
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

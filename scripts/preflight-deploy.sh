@@ -73,23 +73,63 @@ else
   warn "No container engine running (docker/finch) — local pip bundling must succeed"
 fi
 
-# ── 4. Smithy-generated OpenAPI specs ────────────────────────────────────
-OPENAPI_DIR="$REPO_ROOT/smithy-generated/openapi"
-SPEC_COUNT=0
-if [ -d "$OPENAPI_DIR" ]; then
-  SPEC_COUNT=$(find "$OPENAPI_DIR" -name "*.json" -size +100c 2>/dev/null | wc -l | tr -d ' ' || echo "0")
+# ── 3b. ARM64 image builds (vkg, serve, mcp) ──────────────────────────────
+# Those stacks pin Platform.LINUX_ARM64 for their image assets. On an x86_64
+# host without a qemu-aarch64 binfmt handler the engine pulls the arm64 base
+# image and the first RUN step dies with `exec /bin/sh: exec format error` —
+# ~20 minutes into the deploy, surfaced only as "Failed to build asset ...".
+# Checked offline (no test image pull). On Linux the kernel's binfmt registry
+# is authoritative for Docker and Finch alike. Elsewhere (Docker Desktop's VM)
+# fall back to buildx, counting only platforms a *running* node detected: a
+# trailing `*` (e.g. `linux/arm64*` on a stopped docker-container builder)
+# marks a platform someone configured, not one the host can execute.
+_arm64_binfmt_registered() {
+  for _bf in "${1:-/proc/sys/fs/binfmt_misc}"/qemu-aarch64*; do
+    [ -f "$_bf" ] && head -n 1 "$_bf" 2>/dev/null | grep -q '^enabled' && return 0
+  done
+  return 1
+}
+# Reads `buildx ls` output on stdin.
+_buildx_lists_runnable_arm64() {
+  grep -E '[[:space:]]running[[:space:]]' | grep -Eq 'linux/arm64(/v8)?([,[:space:]]|$)'
+}
+if [ -n "$CONTAINER_ENGINE" ]; then
+  HOST_ARCH="$(uname -m)"
+  HOST_OS="$(uname -s)"
+  if [ "$HOST_ARCH" = "aarch64" ] || [ "$HOST_ARCH" = "arm64" ]; then
+    ok "Host is $HOST_ARCH — arm64 image assets build natively"
+  elif [ "$HOST_OS" = "Linux" ] && _arm64_binfmt_registered; then
+    ok "arm64 emulation available on $HOST_ARCH host (qemu-aarch64 binfmt registered)"
+  elif "$CONTAINER_ENGINE" buildx ls 2>/dev/null | _buildx_lists_runnable_arm64; then
+    ok "arm64 emulation available on $HOST_ARCH host (buildx lists linux/arm64)"
+  elif [ "$HOST_OS" = "Linux" ]; then
+    err "Host is $HOST_ARCH and $CONTAINER_ENGINE cannot build linux/arm64 images (needed by the vkg, serve and mcp stacks). Register emulation: docker run --privileged --rm tonistiigi/binfmt --install arm64 — see external-docs/content/deploying.md, 'Cross-architecture container builds'"
+  else
+    warn "Could not confirm $CONTAINER_ENGINE can build linux/arm64 images on this $HOST_ARCH host. Verify with: $CONTAINER_ENGINE run --rm --platform linux/arm64 alpine uname -m (should print aarch64)"
+  fi
 fi
 
-if [ "$SPEC_COUNT" -gt 0 ]; then
-  ok "Smithy OpenAPI specs present ($SPEC_COUNT files)"
-else
-  warn "smithy-generated/openapi/ missing or empty — running 'make generate'..."
+# ── 4. Smithy-generated artifacts present AND current ────────────────────
+# smithy-generated/ is gitignored, so `git pull` leaves it at the previous
+# commit's output. Checking only that specs exist would ship handlers against a
+# stale generated model — e.g. a renamed enum member fails the Lambda at import.
+# Regenerate whenever any codegen input changed since the last generation.
+FINGERPRINT="$REPO_ROOT/scripts/smithy-fingerprint.sh"
+SMITHY_STATE="$("$FINGERPRINT" state "$REPO_ROOT")"
+case "$SMITHY_STATE" in
+  current) ok "Smithy generated artifacts are current with the models" ;;
+  missing) warn "smithy-generated/ is missing or empty — running 'make generate'..." ;;
+  unstamped) warn "smithy-generated/ predates input fingerprinting — regenerating once with 'make generate'..." ;;
+  stale) warn "smithy-generated/ is stale (Smithy models or codegen changed since it was generated) — running 'make generate'..." ;;
+  *) err "Could not determine the state of smithy-generated/ ($SMITHY_STATE)" ;;
+esac
+
+if [ "$SMITHY_STATE" = missing ] || [ "$SMITHY_STATE" = unstamped ] || [ "$SMITHY_STATE" = stale ]; then
   if (cd "$REPO_ROOT" && make generate); then
-    SPEC_COUNT=$(find "$OPENAPI_DIR" -name "*.json" -size +100c 2>/dev/null | wc -l | tr -d ' ' || echo "0")
-    if [ "$SPEC_COUNT" -gt 0 ]; then
-      ok "Smithy code generation complete ($SPEC_COUNT OpenAPI specs)"
+    if [ "$("$FINGERPRINT" state "$REPO_ROOT")" = current ]; then
+      ok "Smithy code generation complete"
     else
-      err "'make generate' ran but smithy-generated/openapi/ is still empty."
+      err "'make generate' ran but smithy-generated/ is still not current with the models."
     fi
   else
     err "'make generate' failed. Fix Smithy/Gradle errors above before deploying."
