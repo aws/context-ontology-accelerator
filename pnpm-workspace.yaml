@@ -48,10 +48,14 @@ overrides:
   # consumers — a build-time tool inside the Smithy-generated clients, not
   # something whose exact compiler version changes what ships.
   "downlevel-dts>typescript": 6.0.3
-  axios: 1.18.0
-  "brace-expansion@1.1.14": 1.1.18
-  "brace-expansion@2.1.0": 2.1.4
-  "brace-expansion@5.0.6": 5.0.9
+  # axios <1.20.0 — CVE (GHSA, HIGH). 1.20.0 is the patched floor; same major.
+  axios: 1.20.0
+  # brace-expansion ReDoS (GHSA, HIGH). Patched floors: v1 line >=1.1.20,
+  # v2 line >=2.1.4, v5 line >=5.0.11. Range-scoped so each major stays on its
+  # own line (a blanket pin would cross majors).
+  "brace-expansion@<1.1.20": 1.1.20
+  "brace-expansion@>=2.0.0 <2.1.4": 2.1.4
+  "brace-expansion@>=4.0.0 <5.0.11": 5.0.11
   fast-xml-builder: 1.1.7
   form-data: 4.0.6
   js-yaml: 3.15.2
@@ -67,5 +71,8 @@ overrides:
   browserslist: 4.28.8
   baseline-browser-mapping: 2.11.19
   "@babel/core": 7.29.7
-  # nx@22.7.7 pins smol-toml 1.6.1; 1.7.1 carries the CVE fix (same major).
+  # nx 22.7.x pins smol-toml 1.6.1; 1.7.1 carries the CVE fix (same major).
   "smol-toml@1.6.1": 1.7.1
+  # source-map-js <1.2.2 — event-loop DoS (GHSA-68fv-2mgg-jv7q, HIGH). Transitive
+  # via vite/postcss in web-app. 1.2.2 is the patched floor; same major.
+  "source-map-js@<1.2.2": 1.2.2

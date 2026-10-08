@@ -63,10 +63,25 @@ describe("StorageStack", () => {
       });
     });
 
-    it("creates a Neptune instance with r8g.large", () => {
+    it("creates a Neptune instance with r8g.large by default", () => {
       const { template } = buildStacks();
       template.hasResourceProperties("AWS::Neptune::DBInstance", {
         DBInstanceClass: "db.r8g.large",
+      });
+    });
+
+    it("honours the neptune_instance_class context override", () => {
+      const app = new cdk.App();
+      app.node.setContext("neptune_instance_class", "db.r8g.2xlarge");
+      const network = new NetworkStack(app, "TestNetworkNeptune", {
+        env: TEST_ENV,
+      });
+      const storage = new StorageStack(app, "TestStorageNeptune", {
+        network,
+        env: TEST_ENV,
+      });
+      Template.fromStack(storage).hasResourceProperties("AWS::Neptune::DBInstance", {
+        DBInstanceClass: "db.r8g.2xlarge",
       });
     });
 

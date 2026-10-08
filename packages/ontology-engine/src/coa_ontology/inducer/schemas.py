@@ -5,6 +5,8 @@
 
 from datetime import datetime
 
+from coa_common.constants import validate_ontology_uri_prefix
+
 # Import enums from Smithy-generated models (single source of truth for API contracts)
 from coa_control_plane_server.models.induction_job_status import (
     InductionJobStatus as JobStatus,
@@ -15,7 +17,7 @@ from coa_control_plane_server.models.induction_strategy import (  # noqa: F401
 from coa_control_plane_server.models.proposal_status import (  # noqa: F401
     ProposalStatus,
 )
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 
 class InductionRequest(BaseModel):
@@ -32,6 +34,11 @@ class InductionRequest(BaseModel):
     strategy: str = "table_to_ontology"  # "table_to_ontology" | "rigor_ontology" | "unstructured_lexical_graph"
     grounding_mode: str = "ENHANCED"  # "NONE" | "STANDARD" | "ENHANCED"
     graph_arn: str | None = None  # Neptune Analytics graph ARN (required for unstructured_lexical_graph)
+
+    @field_validator("ontology_uri_prefix")
+    @classmethod
+    def _validate_uri_prefix(cls, v: str) -> str:
+        return validate_ontology_uri_prefix(v)
 
 
 # JobStatus is re-exported from the Smithy-generated InductionJobStatus enum.

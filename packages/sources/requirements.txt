@@ -10,4 +10,4 @@ pg8000>=1.31.5
 pymysql>=1.2.0           # MySQL
 oracledb>=2.5.1          # Oracle (thin mode — no Oracle client needed)
 python-tds>=1.17.1       # SQL Server (import: pytds — pure Python, no ODBC)
-snowflake-connector-python>=3.18.1  # Snowflake (needs a warehouse in config; heavier bundle)
+snowflake-connector-python>=4.7.5  # Snowflake (needs a warehouse in config; heavier bundle)

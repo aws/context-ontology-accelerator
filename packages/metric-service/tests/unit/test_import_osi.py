@@ -599,6 +599,46 @@ class TestImportSourceTableEnforcement:
         neptune.create_metric.assert_not_called()
 
 
+OSI_WITH_MARKUP_DATA_SOURCE_ID = """\
+osi_spec_version: "1.0"
+metrics:
+  - name: markup_source_metric
+    description: "dataSourceId carries markup"
+    expression:
+      dialects:
+        - dialect: ANSI_SQL
+          expression: "SELECT COUNT(*) FROM orders"
+    custom_extensions:
+      - vendor_name: COA
+        data:
+          data_source_id: "<script>alert(1)</script>"
+          source_table: orders
+"""
+
+
+class TestImportDataSourceIdFormat:
+    """Import builds metrics without the generated request model, so the
+    dataSourceId charset check in check_source_approved is its only guard —
+    and it holds even with permissive source lookup enabled (autouse fixture).
+    """
+
+    @patch("coa_metrics.api.import_osi._get_opensearch")
+    @patch("coa_metrics.api.import_osi._get_neptune")
+    def test_markup_data_source_id_skips_metric(self, mock_neptune, mock_opensearch) -> None:
+        neptune = MagicMock()
+        neptune.get_metric.return_value = None
+        mock_neptune.return_value = neptune
+        mock_opensearch.return_value = MagicMock()
+
+        response = handler(_make_event(OSI_WITH_MARKUP_DATA_SOURCE_ID), None)
+
+        assert response["statusCode"] == 200
+        body = json.loads(response["body"])
+        assert body["metricsCreated"] == 0
+        assert any("dataSourceId must be" in w for w in body.get("warnings", []))
+        neptune.create_metric.assert_not_called()
+
+
 class TestImportSourceApprovalEnforcement:
     """check_source_approved is wired into create + update but was NOT wired into
     import — so a metric bound to a PENDING/REJECTED/FAILED source could be

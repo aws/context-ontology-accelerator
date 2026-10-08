@@ -30,7 +30,8 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from coa_common.constants import validate_ontology_uri_prefix
+from pydantic import BaseModel, Field, field_validator
 
 from coa_ontology.bedrock_embeddings import BedrockEmbeddingClient
 
@@ -109,6 +110,11 @@ class UnstructuredInductionRequest(BaseModel):
     # exists so the API contract is forward-compatible with the planned
     # entailment engine (parent spec Task 13).
     entailment_enabled: bool = False
+
+    @field_validator("ontology_uri_prefix")
+    @classmethod
+    def _validate_uri_prefix(cls, v: str) -> str:
+        return validate_ontology_uri_prefix(v)
 
 
 class UnstructuredInductionConfig(BaseModel):

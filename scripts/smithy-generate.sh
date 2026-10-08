@@ -13,6 +13,10 @@ GENERATED_DIR="$REPO_ROOT/smithy-generated"
 # openapi-generator version for Python server models
 OPENAPI_GENERATOR_VERSION="7.12.0"
 
+# Fingerprint the inputs BEFORE generating: the stamp written at the end then
+# describes exactly what this run read, even if a model is edited mid-run.
+INPUTS_HASH="$("$REPO_ROOT/scripts/smithy-fingerprint.sh" hash "$REPO_ROOT")"
+
 # ── Clean previous generated output ──────────────────────────────────────────
 echo ""
 echo "Cleaning previous generated output..."
@@ -206,6 +210,12 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["coa_data_layer_server"]
 PYPROJECT
+
+# ── Record what was generated from ───────────────────────────────────────────
+# Last step on purpose: with `set -e`, any failure above exits before this, so a
+# partial generation is never stamped as current and the next deploy re-runs it
+# (see the Smithy check in preflight-deploy.sh).
+echo "$INPUTS_HASH" > "$GENERATED_DIR/.inputs.sha256"
 
 echo ""
 echo "=== Code generation complete ==="

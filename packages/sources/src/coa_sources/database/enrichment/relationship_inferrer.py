@@ -197,7 +197,10 @@ def apply_inferred_relationships(tables: list[Table], candidates: list[dict]) ->
 
     Each candidate is written as a ForeignKey with source=AI_INFERRED.
     Priority enforcement: if a DETERMINISTIC or STEWARD_SPECIFIED FK already
-    exists for the same (table, column), the AI candidate is dropped.
+    exists for the same (table, column), the AI candidate is dropped. So is a
+    candidate on a column whose source-declared key was dropped at discovery
+    because its target can't be represented: the real target is known, so any
+    guess would point somewhere else.
 
     Returns the number of FKs applied.
     """
@@ -224,6 +227,9 @@ def apply_inferred_relationships(tables: list[Table], candidates: list[dict]) ->
             skipped += 1
             continue
         if _has_protected_fk(table, candidate["column"]):
+            skipped += 1
+            continue
+        if _has_unrepresentable_fk_target(table, candidate["column"]):
             skipped += 1
             continue
         # Idempotency: on an incremental re-scan, a previously-inferred FK is
@@ -260,6 +266,17 @@ _PROTECTED_FK_SOURCES: frozenset[str] = frozenset(
 def _has_protected_fk(table: Table, column: str) -> bool:
     """Check if a higher-priority FK already exists for this table+column."""
     return any(fk.column == column and fk.source in _PROTECTED_FK_SOURCES for fk in table.foreign_keys)
+
+
+def _has_unrepresentable_fk_target(table: Table, column: str) -> bool:
+    """True if the source declared a key on this column that discovery had to drop.
+
+    Discovery drops a key whose target no discovered table can stand for and
+    records the declared target on the column instead (see
+    ``Column.unrepresentable_fk_target``). That dropped key used to be what
+    ``_has_protected_fk`` saw; this keeps the column protected without it.
+    """
+    return any(c.name == column and c.unrepresentable_fk_target for c in table.columns)
 
 
 def _has_equivalent_inferred_fk(table: Table, candidate: dict) -> bool:

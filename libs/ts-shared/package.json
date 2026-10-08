@@ -1,6 +1,6 @@
 {
   "name": "@coa/shared",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "private": true,
   "description": "Shared TypeScript interfaces and constants for Context Ontology Accelerator",
   "main": "dist/index.js",

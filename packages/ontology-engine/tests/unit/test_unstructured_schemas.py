@@ -125,3 +125,12 @@ def test_description_mode_rejects_invalid_literal(invalid_mode: str):
         UnstructuredInductionRequest(description_mode=invalid_mode, **_VALID_KWARGS)
     # The error message should reference the offending field.
     assert "description_mode" in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "bad_prefix",
+    ["http://<script>alert(1)</script>", 'https://example.com/a"x', "https://example.com/o?q=1", "javascript:alert(1)"],
+)
+def test_ontology_uri_prefix_rejects_unsafe_values(bad_prefix: str):
+    with pytest.raises(ValidationError, match="ontology_uri_prefix"):
+        UnstructuredInductionRequest(**{**_VALID_KWARGS, "ontology_uri_prefix": bad_prefix})

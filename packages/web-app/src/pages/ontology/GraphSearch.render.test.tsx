@@ -4,7 +4,7 @@
 import React from "react";
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { Link, MemoryRouter, Route, Routes } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { GraphSearchPage } from "./GraphSearch";
@@ -133,7 +133,7 @@ vi.mock("@components/ApiClientProvider", () => ({
   useApiClient: () => stableApiClient,
 }));
 
-function renderPage() {
+function renderPage(outsideRoutes?: React.ReactNode) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
@@ -147,6 +147,7 @@ function renderPage() {
               element={<GraphSearchPage />}
             />
           </Routes>
+          {outsideRoutes}
         </BreadcrumbProvider>
       </MemoryRouter>
     </QueryClientProvider>,
@@ -483,6 +484,165 @@ describe("GraphSearchPage — List view paging across chunks", () => {
     );
   });
 
+  it("holds the class query until the default ontology filter is known", async () => {
+    // A late registry used to let the List view load (and page) UNFILTERED
+    // rows, then swap in the induced-ontology filter, which resets the page —
+    // discarding whatever page the user had already picked.
+    let releaseRegistry: (r: OntologyRecord[]) => void = () => {};
+    listOntologies.mockReturnValue(
+      new Promise<OntologyRecord[]>((res) => {
+        releaseRegistry = res;
+      }),
+    );
+    const { container } = renderPage();
+    const view = within(container);
+    await waitFor(() => expect(listOntologies).toHaveBeenCalled());
+    expect(searchEntitiesPaged).not.toHaveBeenCalled();
+    // The held query reads as loading, not as an empty namespace, and the
+    // filter can't be changed before the default lands on top of it.
+    expect(await view.findByText("Loading classes…")).toBeInTheDocument();
+    expect(
+      view.queryByText("No classes found in this namespace yet."),
+    ).toBeNull();
+    expect(
+      screen.getByRole("button", { name: /Restrict classes by ontology/i }),
+    ).toBeDisabled();
+
+    releaseRegistry(PAGED_RECORDS);
+    await view.findByText("C000");
+    expect(
+      screen.getByRole("button", { name: /Restrict classes by ontology/i }),
+    ).toBeEnabled();
+    expect(searchEntitiesPaged).toHaveBeenCalledWith(
+      expect.anything(),
+      "ns",
+      "*",
+      expect.objectContaining({ kind: "class", ontology_id: "o" }),
+    );
+    expect(
+      searchEntitiesPaged.mock.calls.some(
+        (c) =>
+          typeof c[3] === "object" &&
+          c[3] !== null &&
+          "ontology_id" in c[3] &&
+          c[3].ontology_id === undefined,
+      ),
+    ).toBe(false);
+  });
+
+  it("falls back to every ontology when the registry fails to load", async () => {
+    listOntologies.mockRejectedValue(new Error("registry down"));
+    const { container } = renderPage();
+    const view = within(container);
+    await view.findByText("C000");
+    expect(view.queryByText("Loading classes…")).toBeNull();
+    expect(searchEntitiesPaged).toHaveBeenCalledWith(
+      expect.anything(),
+      "ns",
+      "*",
+      expect.objectContaining({ kind: "class", ontology_id: undefined }),
+    );
+  });
+
+  it("queries every ontology when the registry has no induced ontology", async () => {
+    listOntologies.mockResolvedValue([
+      { ontologyId: "ref", title: "Reference", ontologyType: "reference" },
+    ] as OntologyRecord[]);
+    const { container } = renderPage();
+    const view = within(container);
+    await view.findByText("C000");
+    expect(searchEntitiesPaged).toHaveBeenCalledWith(
+      expect.anything(),
+      "ns",
+      "*",
+      expect.objectContaining({ kind: "class", ontology_id: undefined }),
+    );
+  });
+
+  it("drops the previous namespace's ontologies when the next registry fails", async () => {
+    listOntologies.mockImplementation((_c: unknown, ns: unknown) =>
+      ns === "ns"
+        ? Promise.resolve(PAGED_RECORDS)
+        : Promise.reject(new Error("registry down")),
+    );
+    const { container } = renderPage(
+      <Link to="/namespaces/ns2/ontology/graph">switch namespace</Link>,
+    );
+    const view = within(container);
+    await view.findByText("C000");
+
+    await userEvent.click(view.getByText("switch namespace"));
+    await waitFor(() =>
+      expect(searchEntitiesPaged).toHaveBeenCalledWith(
+        expect.anything(),
+        "ns2",
+        "*",
+        expect.objectContaining({ kind: "class", ontology_id: undefined }),
+      ),
+    );
+    expect(
+      searchEntitiesPaged.mock.calls.some(
+        (c) =>
+          c[1] === "ns2" &&
+          typeof c[3] === "object" &&
+          c[3] !== null &&
+          "ontology_id" in c[3] &&
+          c[3].ontology_id !== undefined,
+      ),
+    ).toBe(false);
+    const filterTrigger = screen.getByRole("button", {
+      name: /Restrict classes by ontology/i,
+    });
+    await userEvent.click(filterTrigger);
+    expect(screen.queryByText("Insurance")).toBeNull();
+  });
+
+  it("never sends the previous namespace's ontology filter after a namespace switch", async () => {
+    let releaseNextRegistry: (r: OntologyRecord[]) => void = () => {};
+    listOntologies.mockImplementation((_c: unknown, ns: unknown) =>
+      ns === "ns"
+        ? Promise.resolve(PAGED_RECORDS)
+        : new Promise<OntologyRecord[]>((res) => {
+            releaseNextRegistry = res;
+          }),
+    );
+    const { container } = renderPage(
+      <Link to="/namespaces/ns2/ontology/graph">switch namespace</Link>,
+    );
+    const view = within(container);
+    await view.findByText("C000");
+
+    await userEvent.click(view.getByText("switch namespace"));
+    await waitFor(() =>
+      expect(listOntologies).toHaveBeenCalledWith(expect.anything(), "ns2"),
+    );
+    expect(searchEntitiesPaged.mock.calls.some((c) => c[1] === "ns2")).toBe(
+      false,
+    );
+
+    releaseNextRegistry([
+      { ontologyId: "p", title: "Pricing", ontologyType: "induced" },
+    ] as OntologyRecord[]);
+    await waitFor(() =>
+      expect(searchEntitiesPaged).toHaveBeenCalledWith(
+        expect.anything(),
+        "ns2",
+        "*",
+        expect.objectContaining({ kind: "class", ontology_id: "p" }),
+      ),
+    );
+    expect(
+      searchEntitiesPaged.mock.calls.some(
+        (c) =>
+          c[1] === "ns2" &&
+          typeof c[3] === "object" &&
+          c[3] !== null &&
+          "ontology_id" in c[3] &&
+          c[3].ontology_id !== "p",
+      ),
+    ).toBe(false);
+  });
+
   it("shows a loading state, not a false empty, on a page whose chunk is still fetching", async () => {
     const { container } = renderPage();
     const view = within(container);
@@ -512,17 +672,9 @@ describe("GraphSearchPage — List view paging across chunks", () => {
     const { container } = renderPage();
     const view = within(container);
 
-    // Gate on the SECOND query phase before interacting. renderPage() first
-    // queries unfiltered; when listOntologies resolves the page defaults the
-    // filter to the induced ontology, and GraphSearch.tsx resets listPageIndex
-    // to 1 on every ontologyIdFilter change (correctly — a new filter's first
-    // chunk cannot back a deep page). A page-5 click landing before that reset
-    // is therefore discarded, taking the prefetch with it: the effect recomputes
-    // rowsNeeded from page 1 (40 rows) which the loaded 100 already cover, so no
-    // offset-100 fetch is ever issued and the poll below fails on a genuinely
-    // absent call rather than a slow one. Waiting for the filtered call removes
-    // the ordering entirely; re-finding the page button after it also waits for
-    // the restarted chunk-1 to land, since the changed query key drops the rows.
+    // The class query is held until listOntologies settles the default
+    // (induced) filter, so the first query is already the filtered one — see
+    // "holds the class query until the default ontology filter is known".
     await waitFor(() =>
       expect(searchEntitiesPaged).toHaveBeenCalledWith(
         expect.anything(),
@@ -575,14 +727,8 @@ describe("GraphSearchPage — List view paging across chunks", () => {
     searchEntitiesPaged.mockResolvedValue({ hits: [], total_count: 0 });
     const { container } = renderPage();
     const view = within(container);
-    // The page runs TWO query phases: an initial unfiltered load, then a
-    // re-query once listOntologies resolves and defaults the filter to the
-    // induced ontology. Between them the empty text legitimately blinks back to
-    // "Loading classes…". Wait for phase 2 to have been issued first, so the
-    // assertions below cannot sample the gap — the previous version asserted the
-    // empty text, then absence of loading, then re-asserted the empty text
-    // synchronously, and that last re-check failed (in ~94ms, nowhere near its
-    // timeout) whenever the phase-2 spinner had landed in between.
+    // The class query only starts once listOntologies has defaulted the filter
+    // to the induced ontology, so the filtered call is the first and only load.
     await waitFor(() =>
       expect(searchEntitiesPaged).toHaveBeenCalledWith(
         expect.anything(),

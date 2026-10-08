@@ -123,6 +123,44 @@ class TestValidation:
         resp = handler(_event({"name": "sales", "owner": "a@b.com", "description": []}), None)
         assert resp["statusCode"] == 400
 
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("owner", "alice@example.com<script>alert(1)</script>"),
+            ("owner", 'alice@example.com"onmouseover=1'),
+            ("owner", "alice..bob@example.com"),
+            ("owner", "a#b@example.com"),
+            ("owner", "a`b@example.com"),
+            ("owner", ".alice@example.com"),
+            ("owner", "alice.@example.com"),
+            ("displayName", "Sales<script>alert(1)</script>"),
+            ("displayName", "Sales\u0000Ops"),
+            ("description", "testing namespace<img src=x onerror=alert(1)>"),
+            ("description", "bell\u0007char"),
+        ],
+    )
+    def test_markup_and_control_chars_rejected(self, field, value):
+        body = {"name": "sales", "owner": "a@b.com", field: value}
+        resp = handler(_event(body), None)
+        assert resp["statusCode"] == 400
+        message = json.loads(resp["body"])["message"]
+        assert message.startswith(field)
+        assert "regular expression" not in message
+
+    @patch("coa_control_plane.namespace.create_handler._get_service")
+    def test_ordinary_punctuation_and_unicode_accepted(self, mock_get_svc):
+        mock_get_svc.return_value.create.return_value = NamespaceDetail.model_construct(
+            namespace_id="a1b2c3d4-e5f6-4890-abcd-ef1234567890", name="sales"
+        )
+        body = {
+            "name": "sales",
+            "owner": "o'brien.first+tag@sub.example.co.uk",
+            "displayName": "Sales & Finance (EMEA) — Ünïcode",
+            "description": "Line one: revenue, margin & churn.\nLine two\tindented.",
+        }
+        resp = handler(_event(body), None)
+        assert resp["statusCode"] == 201
+
 
 # ═══════════════════════════════════════════════════════════════════
 # Happy path

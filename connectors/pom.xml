@@ -32,7 +32,7 @@
          applies it to every Jackson module, the SDK's transitives included, so it has to
          move with athena.federation.sdk.version: a lower value downgrades the Jackson the
          SDK was compiled against, which compiles and then fails at run time. -->
-    <jackson.version>2.22.2</jackson.version>
+    <jackson.version>2.22.3</jackson.version>
   </properties>
 
   <!-- Versions live here so a connector's pom names dependencies without pinning them,

@@ -57,6 +57,16 @@ BACKUP_SCHEMA_VERSION = 1
 # page while approve still deleted them. The grant is the fix, not this set.
 S3_ABSENT_CODES = ("404", "NoSuchKey", "NotFound")
 
+# Source-row attribute that discovery sets to the scan job SK right after it
+# writes the backup blob, which is also the last step before a re-scan starts
+# overwriting live assets. If that re-scan then fails, the live assets are an
+# unreviewed merge and the blob holds the approved pre-image, the same state as
+# an open RESCAN_REVIEW. The re-scan trigger reads this to send a retry of the
+# failed re-scan with ``hadOpenRescan`` (``sources_handler._handle_rescan``),
+# and clears it when a new re-scan starts from APPROVED, where any blob left
+# over is stale.
+BACKUP_SCAN_JOB_FIELD = "rescanBackupScanJob"
+
 
 def backup_s3_key(source_id: str) -> str:
     """S3 key for a source's current re-scan backup blob.

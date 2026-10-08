@@ -2934,6 +2934,15 @@ describe("SourcesStack", () => {
       });
     });
 
+    it("gives the worker RESOURCE_PREFIX so it derives catalog names itself instead of trusting the message", () => {
+      template.hasResourceProperties("AWS::Lambda::Function", {
+        FunctionName: Match.stringLikeRegexp(".*sources-delete-worker$"),
+        Environment: Match.objectLike({
+          Variables: Match.objectLike({ RESOURCE_PREFIX: "coa-dev-" }),
+        }),
+      });
+    });
+
     it("alarms the delete queue + DLQ so an orphaned teardown pages, not accumulates silently", () => {
       // monitorQueueWithDlq adds a DLQ max-size alarm dimensioned by the DLQ
       // QueueName. Assert at least one CloudWatch alarm references the
@@ -3113,5 +3122,48 @@ describe("Athena catalog-name prefix budget", () => {
     expect(
       digestWarnings({ resource_prefix: "a-b-c-d-e-f-g-h-i-j", env: "prod" }),
     ).toEqual([]);
+  });
+});
+
+// The running coa-dev-kg-build image accreted Critical/High OS CVEs (perl,
+// openssl, glibc, pcre2, sqlite3) whenever a build predated the Debian point
+// releases that fix them. Two Dockerfile properties keep the image patchable:
+// a pinned base digest (supply-chain integrity + a cache-busting bump lever)
+// and a post-install `apt-get upgrade` (the only mechanism pulling
+// trixie-security point releases in). These guard against regression —
+// removing the upgrade line, or floating the base back onto a mutable tag, is
+// exactly how the CVEs came back. Mirrors ontology-stack's hygiene block.
+describe("kg-build Dockerfile CVE hygiene", () => {
+  const dockerfile = fs.readFileSync(
+    path.join(
+      __dirname,
+      "..",
+      "..",
+      "..",
+      "packages",
+      "sources",
+      "documents",
+      "kg-build",
+      "Dockerfile",
+    ),
+    "utf8",
+  );
+
+  test("pins the base image to a digest, not a mutable tag", () => {
+    const from = dockerfile.match(
+      /^FROM .*python:3\.12-slim(@sha256:[a-f0-9]{64})?/m,
+    );
+    expect(from).not.toBeNull();
+    expect(from?.[1]).toMatch(/@sha256:[a-f0-9]{64}/);
+    expect(dockerfile).not.toMatch(/python:3\.12-slim\s*$/m);
+  });
+
+  test("runs apt-get upgrade so OS security point releases are applied", () => {
+    expect(dockerfile).toMatch(/apt-get upgrade -y/);
+    expect(dockerfile).not.toMatch(/apt-get dist-upgrade/);
+  });
+
+  test("upgrades pip so its own advisories are picked up", () => {
+    expect(dockerfile).toMatch(/pip install[^\n]*--upgrade pip/);
   });
 });

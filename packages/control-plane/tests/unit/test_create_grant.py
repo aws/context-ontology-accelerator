@@ -243,6 +243,27 @@ class TestCreateGrant:
         )
         assert resp["statusCode"] == 400
 
+    @pytest.mark.parametrize(
+        "bad_id",
+        [
+            "<a onclick=prompt(1);>ClickMe</a>",
+            "alice@example.com<script>",
+            'alice"onmouseover=1',
+            "a#b@co.com",
+            "Namespace::x",
+            "x" * 257,
+        ],
+    )
+    @patch("coa_control_plane.grants.create_handler.DynamoDBDAO")
+    def test_malformed_principal_id_returns_400(self, mock_dao_cls, bad_id):
+        resp = handler(
+            _event(body={"principalType": "User", "principalId": bad_id, "role": "analyst"}),
+            None,
+        )
+        assert resp["statusCode"] == 400
+        assert json.loads(resp["body"])["message"].startswith("Invalid principalId")
+        mock_dao_cls.assert_not_called()
+
     def test_missing_body_returns_400(self):
         event = _event()
         event["body"] = None

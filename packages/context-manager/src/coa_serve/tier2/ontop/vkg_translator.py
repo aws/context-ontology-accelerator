@@ -32,7 +32,7 @@ import structlog
 from ...clients.base import QueryExecutor, QueryResult
 from ...clients.vkg import SparqlProjection, VKGClient, VKGResult
 from ...identity import display_principal
-from ..sql_firewall import FirewallResult, SQLFirewall
+from ..sql_firewall import FirewallResult, SQLFirewall, tables_visible_to
 from ..table_qualifier import SourceLookup, distinct_datasources, prepare_execution_sql
 
 logger = structlog.get_logger(__name__)
@@ -185,10 +185,11 @@ class VKGTranslator:
             vkg_result = await vkg_client.translate(sparql, namespace=namespace)
             routing = vkg_result.datasource_routing or {}
             routing_sources = sorted({v.get("datasourceId", "") for v in routing.values()} - {""})
+            # No SQL text: the compiled SQL carries query-time literal values
+            # (potential PII). Length + routing are enough to trace the step.
             logger.info(
                 "vkg_translate_output",
                 sql_length=len(vkg_result.sql),
-                sql_preview=vkg_result.sql[:300],
                 routing_tables=len(vkg_result.datasource_routing),
                 routing_sources=routing_sources,
             )
@@ -197,7 +198,13 @@ class VKGTranslator:
                     step=Tier2Step.VKG_COMPILE,
                     status=Tier2Status.OK,
                     duration_ms=int((time.perf_counter() - start) * 1000),
-                    detail={"dialect": vkg_result.dialect, "tables": vkg_result.source_table_refs},
+                    # Recorded before the firewall runs, and replayed into the
+                    # client-visible trace on non-deny error paths too, so list
+                    # only the tables the grant's ``tableAllowlist`` permits.
+                    detail={
+                        "dialect": vkg_result.dialect,
+                        "tables": tables_visible_to(vkg_result.source_table_refs, profile),
+                    },
                 )
             )
         except Exception as e:

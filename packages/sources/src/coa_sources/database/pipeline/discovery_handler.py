@@ -13,13 +13,16 @@ Input (from Step Functions):
         "namespaceId": "<namespace-id>",
         "scanType": "full" | "incremental",
         "isRescan": true   # optional; set only for a re-scan of an already-
-                           # approved source. When true, discovery MERGES onto
+                           # approved source (or a retry of one that failed).
+                           # When true, discovery MERGES onto
                            # the live assets (preserving curated metadata)
                            # instead of overwriting them. Absent/false on a
                            # first scan.
-        "hadOpenRescan": true  # optional; true only when the source was already
-                           # in RESCAN_REVIEW (a prior re-scan still open and
-                           # un-approved). Only then is the S3 backup blob the
+        "hadOpenRescan": true  # optional; true only when the live assets are an
+                           # un-approved merge: the source was already in
+                           # RESCAN_REVIEW (a prior re-scan still open), or this
+                           # retries a failed re-scan that had written its
+                           # backup. Only then is the S3 backup blob the
                            # approved pre-image to reconstruct the diff baseline
                            # from. When re-scanning from APPROVED (false/absent),
                            # the live assets ARE the approved baseline and any
@@ -56,7 +59,7 @@ from coa_sources.database.glue_ownership import (
 from coa_sources.database.metadata_writer import write_to_datazone
 from coa_sources.database.metrics import emit_metric
 from coa_sources.database.rescan import diff_tables, merged_write_set, reconstruct_approved_baseline
-from coa_sources.database.rescan_backup import backup_s3_key, build_rescan_backup
+from coa_sources.database.rescan_backup import BACKUP_SCAN_JOB_FIELD, backup_s3_key, build_rescan_backup
 from coa_sources.database.secret_binding import require_secret_namespace_binding
 from coa_sources.database.sub_types import CONNECTOR_BACKED_SUB_TYPES
 
@@ -146,6 +149,21 @@ def _read_existing_backup(source_id: str) -> dict[str, Any] | None:
         return None
 
 
+def _delete_existing_backup(source_id: str) -> None:
+    """Delete the re-scan backup blob a no-drift re-scan rebuilt its baseline from.
+
+    Best-effort, like the worker's delete on approve/reject: a missing key is a
+    no-op and any error is logged, not raised. A blob left behind is harmless to
+    the next re-scan from APPROVED, which ignores it.
+    """
+    if not BUCKET_NAME:
+        return
+    try:
+        get_s3_client().delete_object(Bucket=BUCKET_NAME, Key=backup_s3_key(source_id))
+    except Exception:
+        logger.warning("Could not delete the stale re-scan backup for %s", source_id)
+
+
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     """Lambda entry point for the Discovery step."""
     datasource_id = event["datasourceId"]  # "DS#<uuid>"
@@ -157,10 +175,11 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     # on a first scan). Drives the merge-onto-live-assets path below. The trigger
     # normalizes this to a string, so parse it as one (a bare bool works too).
     is_rescan = str(event.get("isRescan", "")).strip().lower() == "true"
-    # True ONLY when the source was already in RESCAN_REVIEW when this re-scan was
-    # triggered — i.e. a PRIOR re-scan is still open and un-approved, so the live
-    # assets are that interim merge and the S3 backup blob holds the approved
-    # pre-image. Gates the backup read below. Normalized as a string by the
+    # True ONLY when the live assets are an interim, un-approved merge and the S3
+    # backup blob holds the approved pre-image: the source was already in
+    # RESCAN_REVIEW when this re-scan was triggered (a PRIOR re-scan still open),
+    # or this retries a failed re-scan that had written its backup before failing.
+    # Gates the backup read below. Normalized as a string by the
     # trigger (a bare bool works too); defaults to false when absent.
     had_open_rescan = str(event.get("hadOpenRescan", "")).strip().lower() == "true"
 
@@ -184,6 +203,14 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         item = _get_ds_dao().get(source_key)
         if not item:
             raise ValueError(f"Data source not found: {datasource_id}")
+
+        # A Step Functions retry of this same run (discovery retries a transient
+        # failure within one execution, with the same input): an earlier attempt
+        # already wrote the backup and may have started the merge, so the live
+        # assets can be partly merged. The marker names the run that wrote the
+        # backup, so rebuild the baseline from the backup when it names this one.
+        if is_rescan and item.get(BACKUP_SCAN_JOB_FIELD) == scan_job_sk:
+            had_open_rescan = True
 
         # Mark source as SCANNING. Conditional update guards against
         # writing to a record that has been deleted concurrently (race vs.
@@ -258,6 +285,8 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         # Default True so a first scan (which ignores it) and any unset path stay
         # on the review side; set for real inside the re-scan branch below.
         rescan_review_needed = True
+        # The backup the baseline was rebuilt from, when there was one (re-scan only).
+        existing_backup: dict[str, Any] | None = None
         if is_rescan:
             # Re-scan of an already-approved source: MERGE onto the live assets
             # instead of blindly overwriting them. Curated metadata (steward
@@ -295,7 +324,29 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
                 len(diff.modified),
                 len(diff.unchanged),
             )
-            write_metadata = DiscoveredMetadata(tables=merged_write_set(diff, accepted, metadata.tables))
+            write_tables = merged_write_set(diff, accepted, metadata.tables)
+            # Tables an earlier run merged that now diff as unchanged (for example the
+            # upstream change was reverted before this run): merged_write_set skips
+            # unchanged tables, so their live asset would keep that run's merge. Put
+            # the approved version from the backup back. They are unchanged, so they
+            # count as approved below and do not make anything to review.
+            restore_ids: list[str] = []
+            if existing_backup:
+                accepted_by_id = {t.table_id: t for t in accepted}
+                unchanged_set = set(diff.unchanged)
+                restore_ids = sorted(
+                    tid
+                    for tid in (existing_backup.get("modified_backup") or {})
+                    if tid in unchanged_set and tid in accepted_by_id
+                )
+                write_tables += [accepted_by_id[tid] for tid in restore_ids]
+                if restore_ids:
+                    logger.info(
+                        "Re-scan restoring %d table(s) back to their approved version for %s",
+                        len(restore_ids),
+                        datasource_id,
+                    )
+            write_metadata = DiscoveredMetadata(tables=write_tables)
 
             # Recompute the approved count for the post-merge live state. The merge
             # resets every modified and added table to PENDING_REVIEW and leaves
@@ -340,7 +391,13 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
                         "BUCKET_NAME is not set; cannot write the re-scan backup that "
                         "approve/reject rollback depends on. Refusing to overwrite live assets."
                     )
-                prior_summary = {
+                # The counts a reject restores. When the baseline was rebuilt from an
+                # existing backup, the row's counts may already belong to the run that
+                # backup came from (a failed run rewrites lastScanAt / lastScanJobId,
+                # and one that got past discovery also lowered tablesApproved), so keep
+                # the backup's own, saved before that run changed anything. A backup
+                # without a summary falls back to the row.
+                prior_summary = dict((existing_backup or {}).get("source_summary") or {}) or {
                     k: item[k]
                     for k in ("tablesDiscovered", "discoveredSchemas", "lastScanAt", "lastScanJobId", "tablesApproved")
                     if k in item
@@ -356,6 +413,17 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
                 backup_key = backup_s3_key(source_id)
                 upload_json(get_s3_client(), BUCKET_NAME, backup_key, backup)
                 logger.info("Re-scan backup written to s3://%s/%s", BUCKET_NAME, backup_key)
+                # Recorded BEFORE the merge below touches a live asset. If this run
+                # fails from here on, the live assets are an unreviewed merge and the
+                # blob above is the approved pre-image, so a retry must rebuild its
+                # baseline from the blob (hadOpenRescan), not from the live assets.
+                # Raising here fails the scan before anything is overwritten,
+                # which leaves the live assets as the baseline the retry will assume.
+                _get_ds_dao().update(
+                    key=source_key,
+                    update_fields={BACKUP_SCAN_JOB_FIELD: scan_job_sk},
+                    condition="attribute_exists(PK)",
+                )
 
         write_result = write_to_datazone(
             domain_id=SMUS_DOMAIN_ID,
@@ -364,6 +432,12 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             data_source_id=datasource_id,
         )
 
+        # The baseline came from an existing backup and this run leaves nothing to
+        # review: no new backup replaced it, and the source goes back to APPROVED, so
+        # that backup is stale now. Delete it once the live assets hold the approved
+        # versions again, so it cannot drive a later baseline.
+        if is_rescan and existing_backup and not rescan_review_needed:
+            _delete_existing_backup(source_id)
         # Update scan job with discovery counts (the full fresh scan).
         scan_job_update: dict[str, Any] = {
             "tablesDiscovered": len(metadata.tables),
@@ -379,6 +453,10 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         if metadata.failed_tables:
             scan_job_update["tablesFailed"] = len(metadata.failed_tables)
             scan_job_update["failedTables"] = metadata.failed_tables[:_MAX_REPORTED_FAILED_TABLES]
+        # A filter written as a regex matches nothing (filters are globs) and the
+        # scan still succeeds; record why so the steward can see it had no effect.
+        if metadata.filter_warnings:
+            scan_job_update["filterWarnings"] = metadata.filter_warnings
         _get_scan_dao().update(
             key=scan_job_key,
             update_fields=scan_job_update,

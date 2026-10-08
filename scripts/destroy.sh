@@ -170,11 +170,19 @@ fi
 # Fall back to a name-based SG lookup if we couldn't resolve any via the
 # runtime API (e.g. runtime already gone but SG/ENIs are still draining
 # from a previous delete).
+#
+# The SGs carry no explicit name, so CloudFormation names them
+# "<stack name>-<logical id>-<suffix>", with the stacks named
+# "${STACK_PREFIX}-serve" / "${STACK_PREFIX}-mcp" (infra/bin/app.ts) and the
+# logical ids starting "AgentCoreSG" / "McpSG". Spell out the full stack name
+# before the logical id: ENV and SCL_PREFIX may contain dashes, so a looser
+# "${STACK_PREFIX}-*AgentCoreSG*" also matches a sibling deployment such as
+# env "dev-b" when tearing down "dev", and Step 2 then waits on its ENIs.
 if [ ${#AGENTCORE_SG_IDS[@]} -eq 0 ]; then
   while IFS= read -r SG_ID; do
     [ -n "$SG_ID" ] && AGENTCORE_SG_IDS+=("$SG_ID")
   done < <(aws ec2 describe-security-groups --region "$REGION" \
-    --filters "Name=group-name,Values=${STACK_PREFIX}-*AgentCoreSG*,${STACK_PREFIX}-*McpSG*" \
+    --filters "Name=group-name,Values=${STACK_PREFIX}-serve-AgentCoreSG*,${STACK_PREFIX}-mcp-McpSG*" \
     --query 'SecurityGroups[].GroupId' --output text 2>/dev/null | tr '\t' '\n')
 fi
 

@@ -1072,10 +1072,12 @@ export class OntologyStack extends SCLStack {
         ALLOWED_ORIGIN: props.allowedOrigin,
       },
     });
+    // System-health check describes only the sources table (SOURCES_TABLE).
     apiProxyFn.addToRolePolicy(
       new iam.PolicyStatement({
+        sid: "HealthCheckDescribeSourcesTable",
         actions: ["dynamodb:DescribeTable"],
-        resources: ["*"],
+        resources: [srcTable.tableArn],
       }),
     );
     apiProxyFn.addToRolePolicy(
@@ -1084,8 +1086,13 @@ export class OntologyStack extends SCLStack {
         resources: [props.neptuneClusterArn],
       }),
     );
+    // aoss:BatchGetCollection does not support resource-level permissions
+    // (AWS limitation — no resource type in the Service Authorization
+    // Reference), so it must use "*". It is a read-only control-plane call
+    // returning collection metadata (status, endpoints), never index data.
     apiProxyFn.addToRolePolicy(
       new iam.PolicyStatement({
+        sid: "HealthCheckBatchGetCollection",
         actions: ["aoss:BatchGetCollection"],
         resources: ["*"],
       }),

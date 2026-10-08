@@ -82,6 +82,72 @@ _TABLE_ALLOWLIST_KEY = "tableAllowlist"
 _COLUMN_DENYLIST_KEY = "columnDenylist"
 
 
+def _normalized_table_allowlist(allowlist_raw: list[Any] | tuple[Any, ...] | None) -> set[str] | None:
+    """Lower-cased ``tableAllowlist``, or None when the grant sets no table constraint.
+
+    The one place the allowlist is normalized, shared by :meth:`SQLFirewall.evaluate`
+    and :func:`tables_visible_to` so the SQL gate and the trace filter cannot
+    disagree about which tables a principal may see.
+
+    SQL identifiers are case-insensitive for unquoted names, so the allowlist must
+    not be bypassed by varying case (e.g. ``SELECT * FROM ORDERS``).
+
+    ``is not None``, not truthiness: an ABSENT allowlist means "no table
+    constraint", but an explicitly EMPTY one means "no tables permitted".
+    Collapsing the two made a deny-all grant fail OPEN — the empty list was
+    falsy, so the restriction was dropped and every table was allowed.
+
+    Raises:
+        TypeError: If a member cannot be converted (callers fail closed).
+    """
+    if allowlist_raw is None:
+        return None
+    return {str(t).lower() for t in allowlist_raw}
+
+
+def _bare_table_name(name: str) -> str:
+    """Last identifier component of a table name, unquoted and lower-cased.
+
+    Mirrors how :meth:`SQLFirewall._analyze_refs` keys a referenced table
+    (sqlglot's ``Table.name``, lower-cased), so ``db.Orders`` and ``"orders"``
+    both match an allowlist entry ``orders`` — exactly the tables the firewall
+    would let a query read.
+    """
+    last = str(name).strip().rsplit(".", 1)[-1]
+    return last.strip().strip('"`[]').lower()
+
+
+def tables_visible_to(tables: list[str] | None, profile: dict[str, Any] | None) -> list[str]:
+    """Drop the table names the principal's ``tableAllowlist`` does not permit.
+
+    Use on every table list that reaches the caller (trace step details, response
+    metadata). The firewall already stops SQL against a table outside the
+    allowlist; this keeps the NAMES of such tables — surfaced by retrieval or the
+    FK walk, never queried — out of what the caller sees.
+
+    No allowlist on the grant: the list is returned unchanged (as a new list). A
+    malformed allowlist: nothing is returned (fails closed, as the firewall
+    denies every query for such a grant).
+    """
+    names = list(tables or [])
+    allowlist_raw = (profile or {}).get(_TABLE_ALLOWLIST_KEY)
+    if allowlist_raw is None:
+        return names
+    if not isinstance(allowlist_raw, (list, tuple)):
+        logger.warning("trace_table_filter_malformed_allowlist", reason="expected list")
+        return []
+    try:
+        allowlist = _normalized_table_allowlist(allowlist_raw)
+    except TypeError:
+        logger.warning("trace_table_filter_malformed_allowlist", reason="non-iterable members")
+        return []
+    if allowlist is None:
+        return names
+    # A name that normalizes to nothing ("", ".", "db.") is not a table; never let
+    # it match an empty-string allowlist entry.
+    return [t for t in names if (bare := _bare_table_name(t)) and bare in allowlist]
+
+
 class UnsafeSQLError(ValueError):
     """Raised when SQL fails safety validation (non-SELECT, dangerous functions, etc.)."""
 
@@ -262,21 +328,10 @@ class SQLFirewall:
         if denylist_raw is not None and not isinstance(denylist_raw, dict):
             return self._deny("Invalid columnDenylist format: expected mapping")
 
-        # Normalize to lower-case for case-insensitive comparison. SQL identifiers
-        # are case-insensitive for unquoted names; the allowlist/denylist must
-        # not be bypassed by varying case (e.g. `SELECT * FROM ORDERS`).
-        #
-        # ``is not None``, not truthiness: an ABSENT allowlist means "no table
-        # constraint", but an explicitly EMPTY one means "no tables permitted".
-        # Collapsing the two made a deny-all grant fail OPEN — the empty list was
-        # falsy, so the restriction was dropped and the unrestricted path below
-        # allowed every table.
-        allowlist: set[str] | None = None
-        if allowlist_raw is not None:
-            try:
-                allowlist = {str(t).lower() for t in allowlist_raw}
-            except TypeError:
-                return self._deny("Invalid tableAllowlist format: non-iterable members")
+        try:
+            allowlist = _normalized_table_allowlist(allowlist_raw)
+        except TypeError:
+            return self._deny("Invalid tableAllowlist format: non-iterable members")
 
         denylist: dict[str, set[str]] = {}
         if denylist_raw:
@@ -500,7 +555,8 @@ class SQLFirewall:
         try:
             parsed = sqlglot.parse_one(sql)
         except sqlglot.errors.ParseError:
-            logger.warning("sql_firewall_parse_error", sql_preview=sql)
+            # SQL may carry caller-supplied literal values (potential PII); log length only.
+            logger.warning("sql_firewall_parse_error", sql_len=len(sql))
             return None
         if parsed is None:
             return None
@@ -568,7 +624,8 @@ class SQLFirewall:
         try:
             parsed = sqlglot.parse_one(sql, read="trino")
         except sqlglot.errors.ParseError:
-            logger.warning("sql_firewall_parse_error", sql_preview=sql)
+            # SQL may carry caller-supplied literal values (potential PII); log length only.
+            logger.warning("sql_firewall_parse_error", sql_len=len(sql))
             return []
 
         tables: list[str] = []

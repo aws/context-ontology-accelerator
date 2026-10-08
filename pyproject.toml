@@ -2,7 +2,7 @@
 name = "coa"
 # Single source of truth is the repo-root VERSION file. Do not edit by hand —
 # bump VERSION and run `make version` (verified by `make lint`).
-version = "0.3.4"
+version = "0.3.5"
 description = "Context Ontology Accelerator for AWS"
 requires-python = ">=3.12"
 license = {text = "Apache-2.0"}
@@ -22,6 +22,16 @@ dev = [
     # Real-PDF unit tests for the sources preprocessing module (parse + render)
     "pypdfium2>=4.30.0",
     "pillow>=10.4.0",
+]
+
+[tool.uv]
+# Pin transitive dependencies up to the patched floor for security advisories
+# that are only reachable through dev/test tooling (no direct declaration).
+#   werkzeug: pulled by moto (AWS mocking, dev group only). CVE-2026-102598
+#   (<3.1.9) — not in any runtime/deploy path, constrained here to clear the
+#   Dependabot HIGH alert without widening moto's own range.
+constraint-dependencies = [
+    "werkzeug>=3.1.9",
 ]
 
 [tool.uv.workspace]
