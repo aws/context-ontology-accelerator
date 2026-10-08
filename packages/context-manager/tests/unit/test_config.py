@@ -202,7 +202,7 @@ class TestDeepReasoningBudgetConfig:
         config = load_config()
 
         assert config.deep_reasoning_time_budget_s == 30
-        assert config.deep_reasoning_max_steps == 10
+        assert config.deep_reasoning_max_steps == 5
         assert config.deep_reasoning_per_tool_timeout_s == 30
         assert config.deep_reasoning_max_fanout == 5
         assert config.deep_reasoning_synthesis_reserve_s == 8
@@ -342,7 +342,7 @@ class TestDeepReasoningBudgetConfig:
         mock_boto3.client.return_value = mock_ssm
 
         config = load_config()
-        assert config.deep_reasoning_max_no_progress_steps == 3
+        assert config.deep_reasoning_max_no_progress_steps == 2
 
     @patch.dict("os.environ", {"DEEP_REASONING_MAX_NO_PROGRESS_STEPS": "5"})
     @patch("coa_serve.config.boto3")

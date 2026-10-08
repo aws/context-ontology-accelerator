@@ -83,7 +83,7 @@ request/response schemas.
 ## Curating an ontology: re-induce and re-accept
 
 Induction reads whatever the catalog says about a table or column at the time
-it runs — including any description or synonyms a steward has written (see
+it runs — including any description, synonyms, glossary terms and tags a steward has written (see
 [Editing Metadata as a Steward](sources.md#editing-metadata-as-a-steward)). To
 get curated text into an accepted ontology, **re-induce the source and accept
 the new proposal into the same ontology**. Accepting a proposal into an
@@ -94,7 +94,7 @@ What happens to the class or property you curated:
 
 | Surface | On re-accept |
 |---------|--------------|
-| Description (`rdfs:comment`), synonyms (`skos:altLabel`) | **Replaced.** Only the text in the new proposal is live. The previous text is not deleted — it is kept as history on the vertex (`superseded` on `GET /graph/class`), where you can see what the class used to say. |
+| Description (`rdfs:comment`), synonyms (`skos:altLabel`), glossary terms (`coa:glossaryTerm`), tags (`coa:tag`) | **Replaced.** Only the text in the new proposal is live. The previous text is not deleted — it is kept as history on the vertex (`superseded` on `GET /graph/class`), where you can see what the class used to say. |
 | Relationships (`owl:ObjectProperty`, `rdfs:subClassOf`, mappings) | **Kept.** Inferred join paths survive a re-accept; only the text is superseded. |
 | Other classes and properties in the same ontology | **Untouched.** Only the classes and properties present in the new proposal are affected. Class identity is the IRI, minted from the table name — so a class whose IRI does not appear in the new proposal is left alone. Two sources that each have a table with the same name resolve to the same IRI; the later accept replaces the earlier text on that class (last writer wins). A renamed table becomes a new class and the old one stays live. |
 | Semantic search | The embeddings of the replaced text are retired with it, so search stops returning the old phrasing. |

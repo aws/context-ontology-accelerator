@@ -18,7 +18,7 @@ from .clients.base import LLMClient, QueryExecutor, VectorClient
 from .exceptions import AccessDeniedError, DataSourceUnavailableError, NamespaceScopeDeniedError, NoResultError
 from .identity import display_principal
 from .mode import Mode, resolve_mode
-from .tier2.sql_firewall import NamespaceSQLScopeError
+from .tier2.sql_firewall import NamespaceSQLScopeError, tables_visible_to
 
 if TYPE_CHECKING:
     from .clients.sources_registry import SourceComposition, SourcesRegistry
@@ -790,8 +790,11 @@ class Orchestrator:
                     columns=result.columns,
                     sql_used=result.sql,
                     confidence=result.confidence,
-                    retrieved_tables=result.retrieved_tables,
-                    expanded_tables=result.expanded_tables,
+                    # Response metadata reaches the caller: list only the tables
+                    # the grant's ``tableAllowlist`` permits (the trace steps are
+                    # filtered the same way where they are recorded).
+                    retrieved_tables=tables_visible_to(result.retrieved_tables, profile),
+                    expanded_tables=tables_visible_to(result.expanded_tables, profile),
                     trace=trace,
                     namespace=namespace,
                     principal=display_principal(profile),

@@ -26,6 +26,8 @@ from coa_common.constants import (
     validate_id,
     validate_namespace_id,
     validate_namespace_name,
+    validate_ontology_uri_prefix,
+    validate_principal_id,
     validate_s3_prefix,
     validate_source_id,
 )
@@ -190,6 +192,113 @@ class TestValidateS3Prefix:
     def test_unsafe_prefixes_raise(self, value: str):
         with pytest.raises(ValueError, match="Invalid prefix"):
             validate_s3_prefix(value, "prefix")
+
+
+class TestValidatePrincipalId:
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "alice@example.com",
+            "first.last+tag@example.co.uk",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "platform-operators",
+            "Data Engineers",
+            "agent:orders-bot/v2",
+            # Free-form IdP identities that must keep working.
+            "o'brien@example.com",
+            "R&D Team",
+            "Sales (EMEA)",
+            "Ventes-Été",
+        ],
+    )
+    def test_valid_ids_pass(self, value: str):
+        assert validate_principal_id(value) == value
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "",
+            "<a onclick=prompt(1);>ClickMe</a>",
+            "alice@example.com<script>",
+            "a<b>c",
+            'alice"quote',
+            "alice`quote",
+            "back\\slash",
+            "a#b",
+            "a|b",
+            "Namespace::x",
+            "tab\tchar",
+            "x" * 257,
+            None,
+            123,
+        ],
+    )
+    def test_invalid_ids_raise_without_echo(self, value: object):
+        with pytest.raises(ValueError, match="Invalid principalId") as exc:
+            validate_principal_id(value)
+        if isinstance(value, str) and value:
+            assert value not in str(exc.value)
+
+
+class TestValidateOntologyUriPrefix:
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "http://x/o#",
+            "https://example.com/onto",
+            "https://example.com/ontology/retail#",
+            "http://test.org/",
+            "https://ontology.example.com:8443/sales/v1_2/~team/%20x#",
+            "https://example.com",
+            "https://a.b/v1.2/x",
+            "https://example.com:1/o#",
+            "https://example.com:65535/o#",
+        ],
+    )
+    def test_valid_prefixes_pass(self, value: str):
+        assert validate_ontology_uri_prefix(value) == value
+
+    def test_surrounding_whitespace_is_stripped(self):
+        assert validate_ontology_uri_prefix("  https://example.com/o#  ") == "https://example.com/o#"
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "http://<script>alert(1)</script>",
+            "https://example.com/onto<script>",
+            'https://example.com/a"onmouseover=1',
+            "https://example.com/a b",
+            "https://user:pass@example.com/o#",
+            "https://example.com/o?x=1",
+            "https://example.com/o#frag#",
+            "javascript:alert(1)",
+            "ftp://example.com/o#",
+            "https://" + "a" * 2048,
+            None,
+            "   ",
+            # Path: empty or dot segments.
+            "https://example.com///x#",
+            "https://example.com/../../etc#",
+            "https://example.com/a/./b#",
+            "https://example.com/..",
+            # Host: RFC 1123 labels only.
+            "https://example..com/o#",
+            "https://.example.com/o#",
+            "https://example.com./o#",
+            "https://-example.com/o#",
+            "https://example-.com/o#",
+            # Port: 1-65535.
+            "https://example.com:0/o#",
+            "https://example.com:65536/o#",
+            "https://example.com:99999/o#",
+            # Percent: well-formed %HH only.
+            "https://example.com/a%3",
+            "https://example.com/a%zz#",
+        ],
+    )
+    def test_unsafe_prefixes_raise(self, value: object):
+        with pytest.raises(ValueError, match="Invalid ontology_uri_prefix"):
+            validate_ontology_uri_prefix(value)
 
 
 class TestCanonicalCol:

@@ -12,7 +12,11 @@ import pytest
 from coa_metrics.api.delete_metric import handler as delete_handler
 from coa_metrics.api.update_metric import handler as update_handler
 from coa_metrics.neptune_client import MetricDefinition, MetricDialect
-from coa_metrics.source_status import PERMISSIVE_ENV, SourceValidationUnavailableError
+from coa_metrics.source_status import (
+    DATA_SOURCE_ID_FORMAT_MESSAGE,
+    PERMISSIVE_ENV,
+    SourceValidationUnavailableError,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -71,6 +75,19 @@ def _existing_metric() -> MetricDefinition:
 
 
 # ── Update tests ────────────────────────────────────────────────────────
+
+
+class TestUpdateDataSourceIdFormat:
+    @pytest.mark.parametrize("data_source_id", ["<script>alert(1)</script>", "ds 1", "x" * 129])
+    @patch("coa_metrics.api.update_metric._get_neptune")
+    def test_malformed_data_source_id_returns_400(self, mock_neptune: MagicMock, data_source_id: str) -> None:
+        mock_neptune.return_value.get_metric.return_value = _existing_metric()
+        body = {**_valid_update_body(), "dataSourceId": data_source_id}
+        resp = update_handler(_make_update_event(body=body), None)
+        assert resp["statusCode"] == 400
+        if len(data_source_id) <= 128:
+            assert json.loads(resp["body"])["message"] == DATA_SOURCE_ID_FORMAT_MESSAGE
+        mock_neptune.return_value.update_metric.assert_not_called()
 
 
 class TestUpdateMetric:

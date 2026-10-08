@@ -414,6 +414,7 @@ def merge_rescan_table(accepted: Table, fresh: Table, *, changed_column_names: s
                     changed=fcol.name in changed_column_names,
                 ),
                 distinct_values=list(fcol.distinct_values),
+                unrepresentable_fk_target=fcol.unrepresentable_fk_target,
             )
         )
 

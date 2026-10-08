@@ -107,6 +107,7 @@ def deserialize_form(payload: dict[str, Any], *, data_source_id: str = "") -> Ta
                 **{k: v for k, v in c.get("business_metadata", {}).items() if k in bm_fields}
             ),
             distinct_values=c.get("distinct_values", []),
+            unrepresentable_fk_target=c.get("unrepresentable_fk_target", ""),
         )
         for c in columns_raw
         if isinstance(c, dict) and "name" in c

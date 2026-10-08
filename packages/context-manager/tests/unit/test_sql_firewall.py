@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import pytest
+import structlog.testing
 from coa_serve.tier2.sql_firewall import FirewallResult, NamespaceSQLScopeError, SQLFirewall, UnsafeSQLError
 
 
@@ -873,3 +874,25 @@ class TestNamespaceSQLScope:
         schema_only only affects the unqualified-catalog case."""
         with pytest.raises(NamespaceSQLScopeError, match="not available in the requested namespace"):
             self._validate_jdbc("SELECT * FROM sclds_b.sales.customers")
+
+
+@pytest.mark.unit
+class TestParseErrorLogsOmitSql:
+    """CWE-532: a firewall parse failure must not log the SQL text, which can
+    carry caller-supplied literal values (potential PII)."""
+
+    _SQL = "SELECT * FROM orders WHERE email = 'alice@example.com' AND (("
+
+    def test_analyze_refs_parse_error_logs_length_not_sql(self):
+        with structlog.testing.capture_logs() as logs:
+            assert SQLFirewall._analyze_refs(self._SQL) is None
+        event = next(log for log in logs if log["event"] == "sql_firewall_parse_error")
+        assert event["sql_len"] == len(self._SQL)
+        assert "alice@example.com" not in repr(logs)
+
+    def test_extract_tables_parse_error_logs_length_not_sql(self):
+        with structlog.testing.capture_logs() as logs:
+            assert SQLFirewall.extract_tables(self._SQL) == []
+        event = next(log for log in logs if log["event"] == "sql_firewall_parse_error")
+        assert event["sql_len"] == len(self._SQL)
+        assert "alice@example.com" not in repr(logs)

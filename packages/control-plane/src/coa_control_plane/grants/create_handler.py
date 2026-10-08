@@ -17,7 +17,7 @@ import structlog
 from botocore.exceptions import ClientError
 from coa_common import sanitize_principal_key
 from coa_common.authnz_types import PrincipalType, ResourceType
-from coa_common.constants import validate_namespace_id
+from coa_common.constants import validate_namespace_id, validate_principal_id
 from coa_common.dao import DynamoDBDAO
 from coa_common.logging import setup_logging
 from coa_common.response import api_response, get_caller_identity
@@ -110,6 +110,11 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
 
     if principal_type not in _VALID_PRINCIPAL_TYPES:
         return api_response(400, {"message": f"Invalid principalType: {principal_type}"})
+
+    try:
+        validate_principal_id(principal_id)
+    except ValueError as exc:
+        return api_response(400, {"message": str(exc)})
 
     # Validate optional grant overrides — these fields are passed verbatim to
     # the SQL firewall via the principal's resolved profile, so the data shape

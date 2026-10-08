@@ -122,6 +122,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+// A filter that looked like a regular expression and matched nothing — filters
+// are globs — leaves the scan successful but unfiltered as intended. The scan
+// job carries the plain-language reasons as `filterWarnings`, absent when none.
+function readFilterWarnings(scanJob: unknown): string[] {
+  if (!isRecord(scanJob) || !Array.isArray(scanJob.filterWarnings)) return [];
+  return scanJob.filterWarnings.filter(
+    (entry): entry is string => typeof entry === "string",
+  );
+}
+
 function readDegradedScan(scanJob: unknown): DegradedScan | undefined {
   if (!isRecord(scanJob)) return undefined;
   const count = scanJob.tablesFailed;
@@ -364,6 +374,7 @@ export const SourceDetail: React.FC = () => {
 
   // Present only when the last scan succeeded but lost individual tables.
   const degradedScan = readDegradedScan(scanJobData);
+  const filterWarnings = readFilterWarnings(scanJobData);
 
   // Only while enriching: before that, lastScanJobId still points at the
   // previous (finished) job, whose counts would render as a full bar.
@@ -650,6 +661,18 @@ export const SourceDetail: React.FC = () => {
           description={`${scanProgress.processed} of ${scanProgress.total} tables processed`}
           additionalInfo="Tables already reviewed count as processed without being regenerated."
         />
+      )}
+
+      {isDatabase && filterWarnings.length > 0 && (
+        <Alert type="warning" header="A filter had no effect on the last scan">
+          <SpaceBetween size="xs">
+            {filterWarnings.map((warning) => (
+              <Box variant="p" key={warning}>
+                {warning}
+              </Box>
+            ))}
+          </SpaceBetween>
+        </Alert>
       )}
 
       {isDatabase && degradedScan && (

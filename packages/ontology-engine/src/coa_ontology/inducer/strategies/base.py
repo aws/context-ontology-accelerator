@@ -34,6 +34,39 @@ RR = Namespace("http://www.w3.org/ns/r2rml#")
 # SCL vocabulary for datasource provenance annotations on TriplesMaps
 SCL = Namespace(VOCAB_URI)
 
+# Steward-reviewed business metadata carried onto ontology terms (#1167). Both
+# are plain literals: the catalog stores glossary terms and tags as free-text
+# strings, not as IRIs of glossary concepts, so an object predicate such as
+# skos:related would assert a link to a concept that does not exist.
+GLOSSARY_TERM = SCL.glossaryTerm
+TAG = SCL.tag
+
+
+def add_glossary_and_tags(
+    g: Graph,
+    subject: URIRef,
+    glossary_terms: Iterable[str] | None,
+    tags: Iterable[str] | None,
+) -> None:
+    """Emit a table's or column's approved glossary terms and tags on ``subject``.
+
+    One literal per value, de-duplicated by the graph's set semantics. Empty and
+    whitespace-only values are skipped so a blank catalog entry cannot become an
+    empty annotation.
+
+    Args:
+        g: Graph to write into.
+        subject: Class (for a table) or property (for a column).
+        glossary_terms: Approved glossary terms, or ``None``.
+        tags: Approved tags, or ``None``.
+    """
+    for predicate, values in ((GLOSSARY_TERM, glossary_terms), (TAG, tags)):
+        for value in values or ():
+            text = value.strip() if isinstance(value, str) else ""
+            if text:
+                g.add((subject, predicate, Literal(text)))
+
+
 # SQL → XSD datatype mapping (shared across strategies)
 _SQL_TO_XSD = {
     "INT": XSD.integer,
@@ -1184,10 +1217,19 @@ class InductionStrategy(ABC):
                     extra={"referrer": referrer.name, "target": target_name},
                 )
                 return None
-            # Genuinely outside this induction run. The bare form is safe here:
-            # a table we did not process has no TriplesMap in this mapping, so
-            # there is nothing for it to collide with.
-            return ns[f"TriplesMap_{to_pascal(target_name)}"]
+            # Genuinely outside this induction run: the target table is not
+            # minted this run — rejected at review, dropped by a later filter, or
+            # missing after a partial re-sync. Emitting a bare
+            # TriplesMap_<Target> would be a dangling rr:parentTriplesMap: Ontop
+            # rejects the WHOLE mapping on load, failing every query in the
+            # namespace permanently. Degrade to a literal instead (drop the join),
+            # exactly as the ambiguous branch above does — cause-agnostic, keyed
+            # only on "is the target minted this run?".
+            log.warning(
+                "fk_target_out_of_run_degraded_to_literal",
+                extra={"referrer": referrer.name, "target": target_name},
+            )
+            return None
 
         def _pom(tmap: URIRef, col_name: str, suffix: str = "") -> tuple[URIRef, URIRef]:
             """Mint a predicate-object map + object map for a column.

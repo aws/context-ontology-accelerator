@@ -87,7 +87,7 @@ class GraphVertex(BaseModel):
         description=(
             "Previous generations of this vertex's annotations, retired when a "
             "re-induced proposal was accepted into the same ontology. Keys "
-            "are ``comments`` / ``definitions`` / ``altLabels``; values are the "
+            "are ``comments`` / ``definitions`` / ``altLabels`` / ``glossaryTerms`` / ``tags``; values are the "
             "literals that used to be live (typically the AI-generated text a "
             "steward's curation replaced). Read from the ``coa:superseded*`` "
             "history predicates; NOT live content and excluded from ``edges``."

@@ -453,6 +453,8 @@ class TestValidationRetryLoop:
             ],
             # aiContext glossary (vector hit has URI)
             [],
+            # steward annotations for the selected class (#1167)
+            [],
             # URI validation attempt 1 — fails (0 found)
             [{"found": "0"}],
             # URI validation attempt 2 — passes (2 found)

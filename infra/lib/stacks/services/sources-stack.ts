@@ -1917,6 +1917,10 @@ export class SourcesStack extends SCLStack {
           SOURCE_SCAN_JOBS_TABLE: this.sourceScanJobsTable.tableName,
           SMUS_DOMAIN_ID: domainId,
           PROJECT_ACCESS_ROLE_ARN: projectAccessRoleArn,
+          // The worker derives the source's catalog name from its id rather than
+          // trusting the queue message, the same derivation the API uses, and that
+          // derivation needs the same prefix the API is given.
+          RESOURCE_PREFIX: this.prefixed(""),
           // The DataZone cleanup budget defaults to 240s (tuned for the 30s
           // sources-api). Without raising it here the worker would cap cleanup at
           // 240s despite its 15-min timeout — leaving a large source's assets
@@ -2019,7 +2023,12 @@ export class SourcesStack extends SCLStack {
         // Wildcard required: customers provide their own bucket names, which are
         // not knowable at synth time. Authorization for these buckets is the
         // owner-set `{prefix}:namespace` tag, verified at source registration and
-        // again in the preprocessing handler.
+        // again in the preprocessing handler before any object is read. The tag
+        // is the owner's consent: setting it needs s3:PutBucketTagging on that
+        // bucket, which this role does not hold. Platform-owned buckets are
+        // additionally hard-denied below, and a cross-account bucket is only
+        // readable if its owner's bucket policy (or a role they let us assume)
+        // allows it.
         resources: ["*"],
       }),
     );

@@ -45,6 +45,7 @@ nothing here imports ``graphrag_toolkit``.
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -59,6 +60,43 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, no runtime import
     from ....clients.base import GraphClient
 
 logger = structlog.get_logger(__name__)
+
+# Backstop LIMIT on the cheap owl:Ontology graph-IRI resolve. A namespace holds
+# one graph per published ontology, so this is far above the real count; it only
+# bounds a pathological store. graph_scoped_body applies its own (lower) inlining
+# cap and falls back to the prefix filter above it, so this value never forces a
+# slow query — it only caps how many IRIs we fetch.
+_MAX_ONTOLOGY_GRAPHS = 50
+
+# Inner fast-fail cap on JUST the owl:Ontology graph-IRI resolve (seconds). The
+# resolve is a cheap optimisation that lets the type queries use a constant
+# ``GRAPH <iri>`` instead of a cluster-wide ``STRSTARTS`` scan; it must never
+# itself eat the whole lookup budget. Without this, a single hung resolve burns
+# the full outer ``_ontology_lookup_timeout_s`` and the lookup fails with NOTHING,
+# even though the prefix-filter fallback would have answered within budget. Giving
+# the resolve its own short timeout (so on hang it returns ``None`` and the type
+# queries run with the prefix filter) is exactly what Tier-2's ``graph_tools`` and
+# ``tbox_context`` resolvers do. Kept well under the outer cap so the fallback
+# queries still have budget left to run.
+_GRAPH_IRI_RESOLVE_TIMEOUT_S = 2.0
+
+
+def _ontology_lookup_timeout_s() -> float:
+    """Fast-fail budget for a single graph-backed ontology lookup (seconds).
+
+    The ontology lookup is ONE preparatory step inside the deep-reasoning loop,
+    not the whole answer, so it must fail fast rather than burn a large slice of
+    the shared time budget. The underlying graph client already retries a hung
+    SPARQL post (NEPTUNE_TIMEOUT read x retryhttp attempts), which can stack to
+    ~16s per lookup — long enough to swallow a full reasoning step. This caps the
+    lookup end-to-end so a slow/hung Neptune degrades the ontology to empty (the
+    soft-prior loop still runs) instead of starving the budget. Env-tunable;
+    defaults to a tight 6s and is floored at 1s so it can never be disabled.
+    """
+    try:
+        return max(1.0, float(os.environ.get("DEEP_REASONING_ONTOLOGY_TIMEOUT_S", "6")))
+    except (TypeError, ValueError):
+        return 6.0
 
 
 @dataclass(frozen=True)
@@ -147,27 +185,27 @@ _EDGE_TYPES_BODY = (
 _EDGE_TYPES_VARS: tuple[str, ...] = ("propLabel", "domainLabel", "rangeLabel")
 
 
-def _graph_wrapped_query(select: str, body: str, graph_uri_prefix: str) -> str:
+def _graph_wrapped_query(select: str, body: str, graph_uri_prefix: str, graph_iris: list[str] | None = None) -> str:
     """Build the NDB query: run ``body`` over the namespace's per-ontology graphs.
 
     Induced ontologies are loaded into ONE named graph PER ontology under a
     namespace prefix (``{base}/{namespace}/{encoded-ontology-id}``), NOT a single
-    ``:published`` graph. So — exactly like the serve-layer ``GraphTraverser`` —
-    this matches ``GRAPH ?g { ... }`` and filters ``STRSTARTS(STR(?g), <prefix>)``
-    to union every ontology graph in the namespace. (The earlier exact-match on a
-    hardcoded ``urn:orion:{ns}:published`` graph matched nothing, so the ontology
-    always resolved empty even after a successful accept.)
+    ``:published`` graph. When the namespace's graph IRIs are resolved
+    (``graph_iris``), the body is scoped to a constant ``GRAPH <iri>`` per graph —
+    pushed into the index scan — via :func:`graph_scoped_body`. When they are not
+    (resolution failed/empty, or more graphs than the inlining cap), it falls back
+    to ``GRAPH ?g { ... } FILTER(STRSTARTS(STR(?g), <prefix>))``, which matches in
+    EVERY graph on the cluster and filters afterwards — correct but cluster-wide,
+    so its cost scales with the whole store, not the namespace. The scoped form is
+    the same fix Tier-2's FK-edge query uses to stop pinning Neptune's CPU on a
+    many-namespace cluster. (The earlier exact-match on a hardcoded
+    ``urn:orion:{ns}:published`` graph matched nothing, so the ontology always
+    resolved empty even after a successful accept.)
     """
-    return (
-        f"{_ONTOLOGY_PREFIXES}\n\n"
-        f"{select}\n"
-        "WHERE {\n"
-        "    GRAPH ?g {\n"
-        f"{indent(body, ' ' * 8)}\n"
-        "    }\n"
-        f'    FILTER(STRSTARTS(STR(?g), "{graph_uri_prefix}"))\n'
-        "}\n"
-    )
+    from ....query_utils import graph_scoped_body
+
+    scoped = graph_scoped_body(indent(body, " " * 8), graph_uri_prefix, graph_iris)
+    return f"{_ONTOLOGY_PREFIXES}\n\n{select}\nWHERE {{\n{scoped}\n}}\n"
 
 
 def _default_graph_query(select: str, body: str) -> str:
@@ -272,9 +310,12 @@ class OntologyGraphSource:
         their bindings into the uniform :class:`Ontology` via the shared
         :func:`_build_ontology`. When no graph-URI template is configured the
         namespace has no queryable ontology graph, so this returns an empty
-        Ontology rather than issuing an unscoped query. Raises on a backend failure
-        (the GraphClient ``query`` contract raises), leaving failure handling and
-        trace recording to the Ontology_Lookup_Tool (Req 3.11).
+        Ontology rather than issuing an unscoped query. A lookup that exceeds the
+        fast-fail timeout (see :func:`_ontology_lookup_timeout_s`) RAISES
+        ``TimeoutError`` — a timeout is a lookup FAILURE, kept distinct from a
+        genuinely empty ontology (Req 3.10 empty vs 3.11 failed). Any other backend
+        failure also propagates (the GraphClient ``query`` contract raises), leaving
+        failure handling and trace recording to the Ontology_Lookup_Tool (Req 3.11).
         """
         from ....query_utils import namespace_graph_prefix
 
@@ -283,11 +324,75 @@ class OntologyGraphSource:
         # Validate before interpolating the namespace into the SPARQL prefix.
         validate_namespace(namespace)
         prefix = namespace_graph_prefix(self._graph_uri_template, namespace)
-        node_rows, edge_rows = await asyncio.gather(
-            self._graph.query(_graph_wrapped_query(_NODE_TYPES_SELECT, _NODE_TYPES_BODY, prefix)),
-            self._graph.query(_graph_wrapped_query(_EDGE_TYPES_SELECT, _EDGE_TYPES_BODY, prefix)),
-        )
+        # Fast-fail: a single ontology lookup must not consume a large slice of the
+        # shared reasoning budget if Neptune is slow/hung (the graph client's own
+        # read-timeout x retry can stack to ~16s). Cap the lookup end-to-end. On
+        # timeout we RAISE rather than return an empty Ontology: a timeout is a
+        # lookup FAILURE, not a namespace that genuinely has no ontology, and the
+        # two are distinct outcomes (Req 3.10 empty vs 3.11 failed). Returning empty
+        # here would mislead the planner ("this namespace has no ontology") and hide
+        # the timeout from a trace. OntologyLookupTool.invoke catches every exception
+        # and records a "failed (source=...)" result WITHOUT re-raising, so the
+        # fast-fail intent is preserved — the soft-prior traversal still runs — while
+        # the outcome is labelled correctly.
+        timeout_s = _ontology_lookup_timeout_s()
+        try:
+            node_rows, edge_rows = await asyncio.wait_for(
+                self._load_scoped(prefix),
+                timeout=timeout_s,
+            )
+        except TimeoutError:
+            logger.warning("ontology_graph_lookup_timeout", namespace=namespace, timeout_s=timeout_s)
+            raise
         return _build_ontology(node_rows, edge_rows)
+
+    async def _load_scoped(self, prefix: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Resolve the namespace's graph IRIs, then run the scoped type queries.
+
+        Resolve the named-graph IRIs first (a cheap owl:Ontology scan), then scope
+        the type queries to them with a constant ``GRAPH <iri>`` per graph instead
+        of a cluster-wide ``STRSTARTS`` prefix filter — the same fix Tier-2 uses to
+        stop the ontology scan pinning Neptune CPU as the cluster grows. A resolve
+        that fails/empties/exceeds the inlining cap degrades inside
+        :func:`_graph_wrapped_query` to the prefix filter, so this never fails the
+        lookup — it only makes the common (few-graph) case cheap. Kept as one
+        coroutine so the caller's fast-fail timeout bounds the WHOLE sequence
+        (resolve + both type queries), not just the type queries.
+        """
+        graph_iris = await self._resolve_graph_iris(prefix)
+        return await asyncio.gather(
+            self._graph.query(_graph_wrapped_query(_NODE_TYPES_SELECT, _NODE_TYPES_BODY, prefix, graph_iris)),
+            self._graph.query(_graph_wrapped_query(_EDGE_TYPES_SELECT, _EDGE_TYPES_BODY, prefix, graph_iris)),
+        )
+
+    async def _resolve_graph_iris(self, prefix: str) -> list[str] | None:
+        """Resolve the namespace's named-graph IRIs for constant-GRAPH scoping.
+
+        Returns the resolved IRIs, or ``None`` when resolution fails, times out, or
+        yields nothing — in which case :func:`_graph_wrapped_query` degrades to the
+        cluster-wide prefix filter (slow but correct). The resolve gets its OWN
+        short timeout (``_GRAPH_IRI_RESOLVE_TIMEOUT_S``, well under the outer
+        lookup cap), so a hung resolve cannot eat the whole lookup budget and leave
+        no time for the prefix-filter fallback — the same reason Tier-2's resolvers
+        bound their resolve. ``graph_scoped_body`` drops any unsafe IRI itself, so
+        no pre-filtering is needed here. Never raises: resolution is a cheap
+        optimisation, not a correctness dependency.
+        """
+        from ....query_utils import named_graphs_sparql
+
+        try:
+            rows = await asyncio.wait_for(
+                self._graph.query(named_graphs_sparql(prefix, limit=_MAX_ONTOLOGY_GRAPHS)),
+                timeout=_GRAPH_IRI_RESOLVE_TIMEOUT_S,
+            )
+        except TimeoutError:
+            logger.warning("ontology_graph_iri_resolve_timeout", timeout_s=_GRAPH_IRI_RESOLVE_TIMEOUT_S)
+            return None
+        except Exception as exc:  # noqa: BLE001 - resolution is best-effort; fall back to the prefix filter
+            logger.warning("ontology_graph_iri_resolve_failed", error=str(exc), error_type=type(exc).__name__)
+            return None
+        iris = [r["g"] for r in rows if r.get("g")]
+        return iris or None
 
 
 class OntologyFileSource:

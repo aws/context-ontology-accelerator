@@ -44,6 +44,43 @@ _SCL_DISTINCT_VALUES = f"{VOCAB_URI}distinctValues"
 # a handful of literals is enough for the LLM to anchor WHERE-clause values).
 _MAX_DISTINCT_VALUES_IN_PROMPT = 12
 
+# Steward-reviewed annotations carried into the prompt (#1167), so the NL→SPARQL
+# writer sees the same approved metadata the NL→SQL writer gets from the class
+# text: description (rdfs:comment), synonyms (skos:altLabel), glossary terms and
+# tags. Full IRIs because the graph client sends no PREFIX prolog and only
+# rdfs:/owl: are Neptune defaults.
+_RDFS_COMMENT = "http://www.w3.org/2000/01/rdf-schema#comment"
+_SKOS_ALT_LABEL = "http://www.w3.org/2004/02/skos/core#altLabel"
+_SCL_GLOSSARY_TERM = f"{VOCAB_URI}glossaryTerm"
+_SCL_TAG = f"{VOCAB_URI}tag"
+_ANNOTATION_KEYS = {
+    _RDFS_COMMENT: "description",
+    _SKOS_ALT_LABEL: "synonyms",
+    _SCL_GLOSSARY_TERM: "glossary_terms",
+    _SCL_TAG: "tags",
+}
+# Subjects per annotation query. The query asks for the annotations of exactly
+# the terms in the prompt (classes, then columns, then join paths), so rows per
+# subject are bounded: one description plus at most a few synonyms, glossary terms
+# and tags each (enrichment caps those at 5), i.e. <= ~16. 50 subjects therefore
+# stays far below _SPARQL_RESULT_LIMIT, and matches the VALUES cap.
+_ANNOTATION_SUBJECT_CHUNK = 50
+# Annotation queries in flight at once per build. The fetch is on the Tier-2
+# critical path and this builder has driven Neptune to timeouts before, so a large
+# prompt is fetched in a few waves rather than all at once.
+_ANNOTATION_MAX_CONCURRENCY = 4
+# Share of max_tokens kept free for annotations when the context has to be
+# truncated. Without it truncation fills the budget and large namespaces, where
+# business wording helps most, would get no annotations at all.
+_ANNOTATION_BUDGET_SHARE = 0.15
+# Prompt caps. Column descriptions match the NL→SQL context's 100-character cut;
+# class descriptions are capped only to bound a pathological catalog entry.
+_MAX_CLASS_DESCRIPTION_CHARS = 500
+_MAX_PROPERTY_DESCRIPTION_CHARS = 100
+_MAX_TERMS_IN_PROMPT = 5
+# ~4 characters per token, the same rough rate the per-element estimates assume.
+_CHARS_PER_TOKEN = 4
+
 # Maximum URIs per SPARQL VALUES clause (Neptune query complexity limit)
 _MAX_SPARQL_VALUES_URIS = 50
 # Cap for the join-path query's ?domain anchor (``domain_iris`` in
@@ -208,6 +245,24 @@ def _is_safe_sparql_uri(uri: str) -> bool:
 __all__ = ["TBoxContext", "TBoxContextBuilder", "DEFAULT_GRAPH_URI_TEMPLATE"]
 
 
+def _render_annotations(item: dict[str, Any], max_description: int) -> str:
+    """Render a term's steward-reviewed annotations as the prompt-line suffix (#1167).
+
+    The same fields the NL→SQL context carries, so both writers resolve business
+    wording the same way. Shared by ``format_for_prompt`` and the annotation budget
+    so the budget charges exactly what the prompt shows.
+    """
+    parts: list[str] = []
+    description = (item.get("description") or "").strip()
+    if description:
+        parts.append(f"description: {description[:max_description]}")
+    for key, title in (("synonyms", "synonyms"), ("glossary_terms", "glossary terms"), ("tags", "tags")):
+        values = item.get(key) or []
+        if values:
+            parts.append(f"{title}: {', '.join(values[:_MAX_TERMS_IN_PROMPT])}")
+    return f" | {' | '.join(parts)}" if parts else ""
+
+
 @dataclass
 class MetricContext:
     """A metric's context for the NL-to-SPARQL prompt."""
@@ -236,9 +291,12 @@ class AiContextTerm:
 class TBoxContext:
     """Ontology T-Box schema subset for LLM prompt inclusion."""
 
-    classes: list[dict[str, Any]]  # [{uri, label, parent}]
-    properties: list[dict[str, Any]]  # [{uri, label, domain, range}]
-    object_properties: list[dict[str, Any]] = field(default_factory=list)  # [{uri, label, domain, range_class}]
+    # Each class, property and object property may also carry the steward-reviewed
+    # annotations attached by ``_attach_annotations``: ``description`` (str),
+    # ``synonyms``, ``glossary_terms``, ``tags`` (list[str]).
+    classes: list[dict[str, Any]]  # [{uri, label, parent, ...annotations}]
+    properties: list[dict[str, Any]]  # [{uri, label, domain, range, ...annotations}]
+    object_properties: list[dict[str, Any]] = field(default_factory=list)  # [{uri, label, domain, range_class, ...}]
     metrics: list[MetricContext] = field(default_factory=list)
     glossary: list[AiContextTerm] = field(default_factory=list)  # aiContext terms
     token_estimate: int = 0
@@ -435,7 +493,13 @@ class TBoxContextBuilder:
         )
 
         if context.token_estimate > max_tokens:
-            context = self._truncate(context, max_tokens)
+            # Leave room for the steward annotations attached below; they are spent
+            # classes-first, so table-level wording survives in large namespaces.
+            context = self._truncate(context, int(max_tokens * (1 - _ANNOTATION_BUDGET_SHARE)))
+
+        # Annotations are fetched for what survived truncation only, so the query
+        # is bounded by the prompt rather than by the namespace.
+        await self._attach_annotations(context, namespace, max_tokens=max_tokens, graph_iris=graph_iris)
 
         logger.info(
             "tbox_context_built",
@@ -1084,6 +1148,151 @@ class TBoxContextBuilder:
         except Exception:
             return None
 
+    async def _fetch_annotations(
+        self,
+        subject_uris: list[str],
+        namespace: str,
+        graph_iris: list[str] | None = None,
+    ) -> dict[str, dict[str, list[str]]]:
+        """Fetch the steward-reviewed annotations of exactly ``subject_uris``.
+
+        ``subject_uris`` are the terms in the prompt, classes first, so if anything
+        is lost it is the least useful part. One query per
+        :data:`_ANNOTATION_SUBJECT_CHUNK` subjects, at most
+        :data:`_ANNOTATION_MAX_CONCURRENCY` in flight. Best-effort, like the
+        glossary fetch: a failed chunk only means those terms reach the prompt
+        without annotations.
+
+        Returns:
+            ``{subject_uri: {key: [values]}}`` with keys from :data:`_ANNOTATION_KEYS`.
+        """
+        if not self._graph_uri_template:
+            return {}
+        graph_uri_prefix = namespace_graph_prefix(self._graph_uri_template, namespace)
+        if not _is_safe_sparql_uri(graph_uri_prefix):
+            return {}
+        safe = [u for u in dict.fromkeys(subject_uris) if _is_safe_sparql_uri(u)]
+        if not safe:
+            return {}
+        predicate_values = " ".join(f"<{p}>" for p in _ANNOTATION_KEYS)
+        semaphore = asyncio.Semaphore(_ANNOTATION_MAX_CONCURRENCY)
+
+        async def _chunk(uris: list[str]) -> list[dict[str, Any]]:
+            values = " ".join(f"<{u}>" for u in uris)
+            body = f"""            VALUES ?s {{ {values} }}
+            VALUES ?p {{ {predicate_values} }}
+            ?s ?p ?o ."""
+            sparql = f"""
+        SELECT ?s ?p ?o
+        WHERE {{
+{graph_scoped_body(body, graph_uri_prefix, graph_iris)}
+        }} LIMIT {_SPARQL_RESULT_LIMIT}
+        """
+            async with semaphore:
+                try:
+                    rows = await self._graph.query(sparql)
+                except Exception as e:
+                    logger.warning("tbox_annotations_fetch_failed", namespace=namespace, error=str(e))
+                    return []
+            if len(rows) >= _SPARQL_RESULT_LIMIT:
+                logger.warning(
+                    "tbox_annotations_truncated",
+                    namespace=namespace,
+                    subjects=len(uris),
+                    limit=_SPARQL_RESULT_LIMIT,
+                    detail="annotation rows hit the cap; some descriptions/synonyms omitted",
+                )
+            return rows
+
+        started = time.perf_counter()
+        chunks = [safe[i : i + _ANNOTATION_SUBJECT_CHUNK] for i in range(0, len(safe), _ANNOTATION_SUBJECT_CHUNK)]
+        results = await asyncio.gather(*(_chunk(c) for c in chunks))
+        logger.info(
+            "tbox_annotations_fetched",
+            namespace=namespace,
+            subjects=len(safe),
+            queries=len(chunks),
+            rows=sum(len(r) for r in results),
+            duration_ms=round((time.perf_counter() - started) * 1000, 1),
+        )
+
+        annotations: dict[str, dict[str, list[str]]] = {}
+        for rows in results:
+            for row in rows:
+                subject, key, value = row.get("s"), _ANNOTATION_KEYS.get(row.get("p", "")), row.get("o")
+                # Collapse whitespace: the prompt is one term per line, so a
+                # newline inside a description would start a fake schema line.
+                text = " ".join(str(value).split()) if value is not None else ""
+                if not subject or not key or not text:
+                    continue
+                bucket = annotations.setdefault(subject, {}).setdefault(key, [])
+                if text not in bucket:
+                    bucket.append(text)
+        return annotations
+
+    async def _attach_annotations(
+        self,
+        context: TBoxContext,
+        namespace: str,
+        max_tokens: int,
+        graph_iris: list[str] | None = None,
+    ) -> None:
+        """Copy the fetched annotations onto the context's terms, within the token budget.
+
+        Runs after ``_truncate``, so it may only spend what the truncated context left
+        of ``max_tokens``. Spent in the truncation's own priority: classes, then
+        datatype properties, then join paths. A term whose annotations do not fit is
+        left as it was (still queryable, just without them). Values are sorted so the
+        prompt is stable across builds (Neptune returns rows unordered).
+        """
+        subjects = [
+            item["uri"]
+            for items in (context.classes, context.properties, context.object_properties)
+            for item in items
+            if item.get("uri")
+        ]
+        if not subjects:
+            return
+        annotations = await self._fetch_annotations(subjects, namespace, graph_iris=graph_iris)
+        if not annotations:
+            return
+        remaining = (max_tokens - context.token_estimate) * _CHARS_PER_TOKEN
+        groups = (
+            (context.classes, _MAX_CLASS_DESCRIPTION_CHARS),
+            (context.properties, _MAX_PROPERTY_DESCRIPTION_CHARS),
+            (context.object_properties, _MAX_PROPERTY_DESCRIPTION_CHARS),
+        )
+        added_chars = skipped = 0
+        for items, max_description in groups:
+            for item in items:
+                found = annotations.get(item.get("uri", ""))
+                if not found:
+                    continue
+                candidate: dict[str, Any] = {}
+                descriptions = sorted(found.get("description", []))
+                if descriptions:
+                    candidate["description"] = " ".join(descriptions)
+                for key in ("synonyms", "glossary_terms", "tags"):
+                    values = sorted(found.get(key, []))
+                    if values:
+                        candidate[key] = values
+                cost = len(_render_annotations(candidate, max_description))
+                if cost > remaining:
+                    skipped += 1
+                    continue
+                item.update(candidate)
+                remaining -= cost
+                added_chars += cost
+        context.token_estimate += added_chars // _CHARS_PER_TOKEN
+        if skipped:
+            logger.warning(
+                "tbox_annotations_over_budget",
+                namespace=namespace,
+                skipped_terms=skipped,
+                max_tokens=max_tokens,
+                detail="token budget exhausted; these terms reach the prompt without steward annotations",
+            )
+
     def _parse_results(self, results: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """Parse Neptune SPARQL results into classes and properties.
 
@@ -1271,6 +1480,7 @@ class TBoxContextBuilder:
                 line = f" {short} (label: {c['label']})"
                 if c.get("parent"):
                     line += f" subClassOf: {_shorten(c['parent'])}"
+                line += _render_annotations(c, _MAX_CLASS_DESCRIPTION_CHARS)
                 sections.append(line)
 
         if context.properties:
@@ -1286,6 +1496,7 @@ class TBoxContextBuilder:
                 if distinct_values:
                     shown = ", ".join(f'"{v}"' for v in distinct_values[:_MAX_DISTINCT_VALUES_IN_PROMPT])
                     line += f" allowed values: [{shown}]"
+                line += _render_annotations(p, _MAX_PROPERTY_DESCRIPTION_CHARS)
                 sections.append(line)
 
         if context.object_properties:
@@ -1299,7 +1510,10 @@ class TBoxContextBuilder:
                 label_hint = ""
                 if domain_label and range_label:
                     label_hint = f" ({domain_label} → {range_label})"
-                sections.append(f" {domain_short} → {range_short} via {op_short}{label_hint}")
+                sections.append(
+                    f" {domain_short} → {range_short} via {op_short}{label_hint}"
+                    + _render_annotations(op, _MAX_PROPERTY_DESCRIPTION_CHARS)
+                )
 
         if context.metrics:
             sections.append("\nMetrics:")

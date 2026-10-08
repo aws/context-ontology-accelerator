@@ -27,10 +27,12 @@ test: test-unit
 
 ## Per-package unit tests (Nx) plus the repo-level suite in tests/unit, which
 ## covers cross-package concerns (version sync, NOTICE generation, doc accuracy)
-## and belongs to no single Nx project.
+## and belongs to no single Nx project, and ci/tests, which pins internal CI and
+## integ-test contracts and is not published to the public mirror.
 test-unit:
 	pnpm nx run-many -t test
 	uv run pytest tests/unit -q
+	@if [ -d ci/tests ]; then uv run pytest ci/tests -q; fi
 	uv run pytest scripts/agents -q
 
 coverage:

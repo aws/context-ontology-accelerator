@@ -294,13 +294,41 @@ and a `databaseSource.jdbcConfiguration` body — see **CreateSource** in the
 | `databaseName` | Yes | Target database (alphanumeric + `_` `-`, max 128 chars) |
 | `credentialSecretArn` | Yes | Secrets Manager secret ARN with `username`/`password`. In-account secrets must carry a `<prefix>:namespace` tag listing this namespace — space-separate the UUIDs to share one secret across namespaces (see the credentials prerequisite above) **Set at creation only** |
 | `crossAccountRoleArn` | No | IAM role to assume for cross-account secret access. The web app's **Connect Source** form requires the role name to contain `{prefix}-datasource-access-` as a convention. The role's trust policy **must** condition on the namespace's `sts:ExternalId` — see [Cross-Account Data Sources](cross-account-sources.md) |
-| `schemaFilter` | No | Regex — only schemas matching this pattern are discovered |
-| `schemaExcludeFilter` | No | Regex — schemas matching this are excluded (after include filter) |
-| `tableFilter` | No | Regex — only tables matching this are discovered |
-| `tableExcludeFilter` | No | Regex — tables matching this are excluded |
+| `schemaFilter` | No | Glob filter — only schemas matching it are discovered; see [Filter syntax](#filter-syntax) |
+| `schemaExcludeFilter` | No | Glob filter — schemas matching it are excluded, in addition to the engine's system schemas (always excluded) |
+| `tableFilter` | No | Glob filter — only tables matching it are discovered |
+| `tableExcludeFilter` | No | Glob filter — tables matching it are excluded (after the include filter) |
 | `warehouse` | Snowflake only | Virtual warehouse used to run `INFORMATION_SCHEMA` discovery queries and required by federation. **Required for Snowflake** — omitting it fails the scan (`SCAN_FAILED`) at federation time |
 | `role` | No (Snowflake only) | Optional Snowflake RBAC role name for the discovery session — a Snowflake construct, **not** an AWS IAM role. Honored during discovery only; federation runs as the secret user's `DEFAULT_ROLE`, so grant that role least-privilege read access |
 | `metadataEnrichmentEnabled` | No | `true` (default) or `false` — skip AI enrichment |
+
+#### Filter syntax
+
+Schema and table filters are **shell globs, not regular expressions**. Each
+filter is one or more globs separated by `|` or `,`, and each glob must match
+the **whole** name:
+
+| Glob | Matches |
+|------|---------|
+| `*` | any characters |
+| `?` | exactly one character |
+| `[abc]` | one of `a`, `b`, `c` |
+
+For example `public|analytics` keeps those two schemas, `sales_*` every schema
+starting with `sales_`, and `constructor*,results` two families of tables. A
+regex such as `^target_schema$` or `target_.*` matches nothing — write
+`target_schema` or `target_*`. When a filter looks like a regex and matches
+nothing, the scan error (for an include filter) or a warning on the scan (for an
+exclude filter) says so and suggests the glob. The warning is the
+`filterWarnings` list on the scan job (`GET
+/namespaces/{namespaceId}/sources/{sourceId}/scan/{jobId}`), also shown on the
+source page; it is absent when there is nothing to report, and a filter written
+as a glob that simply matches nothing never produces one.
+
+The engine's system schemas (`pg_catalog`, `information_schema`, `mysql`,
+`sys`, … depending on the engine) are always excluded; `schemaExcludeFilter`
+adds to them. The one filter that is not a glob is a Glue Data Catalog source's
+`tableFilter`, which is passed to Glue as its native expression syntax.
 
 !!! warning "`engine`, `host`, `port` and `credentialSecretArn` cannot be changed after creation"
     Updating a source's `jdbcConfiguration` (`PUT .../sources/{sourceId}/metadata`)
@@ -417,8 +445,8 @@ and a `databaseSource.glueConfiguration` body — see **CreateSource** in the
 | `catalogId` | **Yes** | Glue Data Catalog ID: a 12-digit AWS account ID (root catalog), or `account:catalogName` for nested/federated/cross-account catalogs. Pattern-validated (`^\d{12}(:[a-zA-Z0-9_/-]+)?$`), 12–256 chars |
 | `region` | **Yes** | AWS region the catalog/database lives in |
 | `databaseName` | Yes | Glue database name |
-| `tableFilter` | No | Regex — only tables matching this are discovered |
-| `tableExcludeFilter` | No | Regex — tables matching this are excluded |
+| `tableFilter` | No | Glue expression (a regular expression, e.g. `orders.*`) passed to Glue `GetTables` — only tables matching it are discovered |
+| `tableExcludeFilter` | No | Glob filter — tables matching it are excluded; see [Filter syntax](#filter-syntax) |
 | `crossAccountRoleArn` | No | IAM role ARN the discovery connector assumes to read catalog metadata in a different account. The web app's **Connect Source** form requires the role name to contain `{prefix}-datasource-access-` as a convention. The role's trust policy **must** condition on the namespace's `sts:ExternalId` — see [Cross-Account Data Sources](cross-account-sources.md) |
 | `externalId` | No | **Deprecated — ignored.** The ExternalId is derived server-side from the namespace and cannot be set through the API; a value supplied here is discarded. Read the value to pin in your trust policy from `datasourceExternalId` on `GET /namespaces/{namespaceId}`. See [Cross-Account Data Sources](cross-account-sources.md) |
 | `athenaDataCatalogName` | No | Explicit Athena catalog name (overrides auto-resolution) |
@@ -464,6 +492,10 @@ Poll `GET /namespaces/{namespaceId}/sources/{sourceId}` and check the `status`
 field. Scan job detail (including the `errorMessage` field on failure) is
 available via `GET .../sources/{sourceId}/scan/{jobId}` — see
 **GetSource** / **GetSourceScanJob** in the [API Reference](#/api-reference).
+
+While a source is `ENRICHING`, the web UI shows a progress bar of tables
+processed out of the total. A table counts once enrichment has finished with it,
+even if it failed, and tables a re-scan found unchanged count immediately.
 
 ### Interpreting Errors
 
@@ -622,9 +654,35 @@ Edits follow a priority system. Higher-priority sources are never overwritten by
     Editing metadata does NOT change the review status. To approve after editing, make a separate `PUT /review` call. This is intentional — the "edit + approve" UX is two distinct actions.
 
 Edits reach the ontology on the next induction; accepting that proposal into
-an existing ontology **replaces** the previous description and synonyms rather
-than adding to them — see
+an existing ontology **replaces** the previous description, synonyms, glossary
+terms and tags rather than adding to them — see
 [Curating an ontology: re-induce and re-accept](ontologies.md#curating-an-ontology-re-induce-and-re-accept).
+
+### Where Each Reviewed Field Is Used
+
+Every field you approve on a table or column is carried into the induced
+ontology, and both ways Tier 2 answers a structured question — **NL→SQL** (the
+model writes SQL) and **Ontop** (the model writes SPARQL that Ontop turns into
+SQL) — receive the same approved metadata:
+
+| Field | In the ontology | Used to answer questions |
+|-------|-----------------|--------------------------|
+| Description | `rdfs:comment` on the class (table) or property (column) | Both paths, as context for the model |
+| Synonyms | `skos:altLabel` | Both paths; a table's synonyms are also matched when finding the tables a question is about |
+| Glossary terms | `coa:glossaryTerm` | Both paths; a table's glossary terms are also matched when finding the tables a question is about |
+| Tags | `coa:tag` | Both paths, as context for the model. Not used to find tables: broad tags such as "financial" would make unrelated tables look alike |
+| Primary key | `owl:hasKey` on the class | Both paths: Ontop's mapping keys rows on it, and NL→SQL is told which column identifies a row |
+| Relationships (foreign keys) | Object properties between classes | Both paths, as the join paths between tables |
+| Class hierarchy (from the proposal) | `rdfs:subClassOf` | Both paths, when the parent class is also a mapped table. A parent from a reference ontology (FIBO, Schema.org) is not shown to the SQL model, because it has no table behind it |
+
+A foreign-key column's description is kept on its relationship, ahead of the
+generated "Foreign key: …" note, so it is not lost when the column becomes a
+join.
+
+The Ontop prompt has a fixed size. In a namespace large enough to fill it, part
+of that size is kept for this metadata, spent on tables first, then columns, then
+join paths; anything that no longer fits is sent without its description,
+synonyms, glossary terms and tags, and is still queryable.
 
 ## Triggering Re-scans
 
@@ -640,6 +698,20 @@ jobs, depending on the status the source is in when you call it:
 
 Calling re-scan on a database source in any other status returns a
 `409 Conflict` naming the statuses that are allowed.
+
+!!! tip "Automatic re-scans"
+    Instead of calling re-scan by hand, a database source can re-scan itself:
+
+    - **On a schedule** — `PUT .../sources/{sourceId}/rescan-schedule` with an
+      EventBridge `rate()` or `cron()` expression (see **PutSourceRescanSchedule**
+      in the [API Reference](#/api-reference)). Sub-hourly cadences are rejected.
+    - **On Glue catalog changes** — `PUT .../sources/{sourceId}/event-rescan`
+      (Glue sources only; see **PutSourceEventRescan**). Table and database
+      create, update, and delete trigger a re-scan. Partition changes do not, and
+      bursts of changes are coalesced into one re-scan.
+
+    Automatic re-scans end in `RESCAN_REVIEW` like a manual one, so nothing
+    changes until a steward approves it, and they never discard an open review.
 
 ### When to Re-scan
 
@@ -730,7 +802,8 @@ changes nothing.
 a single audit trail — see **ListSourceScanJobs** in the
 [API Reference](#/api-reference). It combines two kinds of event:
 
-- **Scans** — each discovery and enrichment run, including failures.
+- **Scans** — each discovery and enrichment run, including failures. Each row
+  shows its trigger: `INITIAL`, `MANUAL`, `SCHEDULED`, or `EVENT`.
 - **Review decisions** — approvals, rejections, and re-scan decisions.
 
 The web UI renders this on the source's **Scan history** tab. Use it to answer
@@ -818,7 +891,7 @@ LIMIT 100;
 | `Unsupported database engine: <ENGINE>` on connect | The `engine` value is not one of the supported engines listed above | Use a supported engine, or register the database through the Glue Data Catalog instead |
 | Snowflake `SCAN_FAILED` right after discovery succeeds | No `warehouse` set — federation is rejected at connection creation (`WAREHOUSE are missing in the request object`) | Set `jdbcConfiguration.warehouse` to an active Snowflake virtual warehouse and re-scan |
 | Snowflake/Oracle scan succeeds but Athena queries return `TABLE_NOT_FOUND` on an empty catalog | Historical casing-filter bug (fixed) — the federated catalog resolved but exposed zero objects because Snowflake/Oracle fold unquoted identifiers to UPPERCASE | Fixed in current releases (the lowercase casing filter is no longer sent for Oracle/Snowflake). Delete and re-create the source if it was onboarded before the fix — the property is non-updatable |
-| `SCAN_FAILED` with `... exceeding the limit of N` | Source has more tables than `MAX_TABLES_PER_SOURCE` (default `10000`); discovery fails fast rather than hitting the Lambda timeout | Narrow the scan scope with `schemaFilter` / `schemaExcludeFilter` / `tableFilter` (e.g. exclude system schemas like `schemaExcludeFilter: "information_schema\|pg_catalog\|sys"`). If a larger source genuinely needs to be scanned in one pass, raise (or set `0` to disable) the `MAX_TABLES_PER_SOURCE` env var on the `sources-db-connector` Lambda. |
+| `SCAN_FAILED` with `... exceeding the limit of N` | Source has more tables than `MAX_TABLES_PER_SOURCE` (default `10000`); discovery fails fast rather than hitting the Lambda timeout | Narrow the scan scope with `schemaFilter` / `schemaExcludeFilter` / `tableFilter` (e.g. `schemaFilter: "sales_*"` or `tableExcludeFilter: "tmp_*,staging_*"`; system schemas are already excluded). If a larger source genuinely needs to be scanned in one pass, raise (or set `0` to disable) the `MAX_TABLES_PER_SOURCE` env var on the `sources-db-connector` Lambda. |
 | Scan times out on a very large Glue/Athena catalog | Enum sampling issues one Athena query per candidate column; the fan-out has to fit inside the scan Lambda timeout | Sampling queries run in parallel, capped by the `ATHENA_SAMPLING_CONCURRENCY` env var on the `sources-db-connector` Lambda (default `16`). Raise it if the account's Athena concurrent-DML quota allows more in-flight queries — that quota, not this setting, is the real ceiling. A non-numeric value falls back to `16`, and the effective concurrency is floored at `1`. |
 
 ### Custom connector issues

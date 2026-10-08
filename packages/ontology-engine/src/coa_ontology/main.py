@@ -45,6 +45,7 @@ from coa_ontology.proposals import router as proposals_router
 # ── Pluggable backends (vector + graph abstractions) ────────────────────
 from coa_ontology.stores import build_stores
 from coa_ontology.stores.adapters import StoreOntologyCatalogAdapter
+from coa_ontology.stores.neptune_db_graph import NeptuneMemoryLimitError
 
 # ── Validation ──────────────────────────────────────────────────────────
 from coa_ontology.validation.routers import validate
@@ -135,6 +136,20 @@ async def _validation_error_handler(_request: StarletteRequest, exc: RequestVali
 # stripping the ``input`` field. Adding a new custom-validator error type
 # upstream would be caught by ``test_custom_validator_msg_is_not_echoed``.
 _CUSTOM_VALIDATOR_ERROR_TYPES = frozenset({"value_error", "assertion_error"})
+
+
+@app.exception_handler(NeptuneMemoryLimitError)
+async def _neptune_memory_limit_handler(_request: StarletteRequest, _exc: NeptuneMemoryLimitError) -> JSONResponse:
+    """Surface a Neptune OOM that survived the store's retries as a retryable 503.
+
+    Without this it is an unhandled exception and the caller gets a bare 500,
+    indistinguishable from a real bug, so clients cannot know a retry is safe.
+    Only reached on routes that let the error propagate (e.g. ``/graph/search``).
+    """
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "Graph database is temporarily out of query memory; retry the request."},
+    )
 
 
 # ── Config ──────────────────────────────────────────────────────────────
