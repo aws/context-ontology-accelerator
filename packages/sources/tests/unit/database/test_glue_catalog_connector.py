@@ -266,6 +266,41 @@ class TestDiscoverMetadata:
         assert result.tables[0].name == "orders"
 
     @patch("coa_sources.database.connectors.glue_catalog.boto3")
+    def test_regex_table_exclude_that_matches_nothing_warns(self, mock_boto3, connector):
+        mock_client = MagicMock()
+        paginator = MagicMock()
+        paginator.paginate.return_value = [
+            {
+                "TableList": [
+                    {
+                        "Name": "orders",
+                        "StorageDescriptor": {"Columns": [], "Location": ""},
+                        "PartitionKeys": [],
+                    },
+                    {
+                        "Name": "orders_staging",
+                        "StorageDescriptor": {"Columns": [], "Location": ""},
+                        "PartitionKeys": [],
+                    },
+                ]
+            }
+        ]
+        mock_client.get_paginator.return_value = paginator
+        mock_boto3.client.return_value = mock_client
+
+        result = connector.discover_metadata(
+            {
+                "database_name": "db",
+                "table_exclude_filter": "^tmp_.*$",
+                "region": "us-east-1",
+            }
+        )
+
+        assert sorted(t.name for t in result.tables) == ["orders", "orders_staging"]
+        assert len(result.filter_warnings) == 1
+        assert "Did you mean 'tmp_*'?" in result.filter_warnings[0]
+
+    @patch("coa_sources.database.connectors.glue_catalog.boto3")
     def test_technical_metadata_hash_deterministic(self, mock_boto3, connector):
         """Same columns in different order produce the same hash."""
         mock_client = MagicMock()

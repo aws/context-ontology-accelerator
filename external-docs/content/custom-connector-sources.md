@@ -498,8 +498,8 @@ and a `databaseSource.customConnectorConfiguration` body — see **CreateSource*
 |-------|----------|-------------|
 | `connectorFunctionArn` | **Yes** | Full ARN of the connector Lambda. One Lambda serves both metadata and record requests (Athena calls this a composite handler). Its region must equal this deployment's region |
 | `databaseName` | **Yes** | The single database inside the connector's catalog this source exposes (1–256 chars) |
-| `tableFilter` | No | Regex — only tables matching this are discovered |
-| `tableExcludeFilter` | No | Regex — tables matching this are excluded (after the include filter) |
+| `tableFilter` | No | Glob filter — only tables matching it are discovered; see [Filter syntax](sources.md#filter-syntax) |
+| `tableExcludeFilter` | No | Glob filter — tables matching it are excluded (after the include filter) |
 
 `metadataEnrichmentEnabled` (`true` by default, `false` to skip AI enrichment)
 sits on `databaseSource` alongside `customConnectorConfiguration`, not inside it — the

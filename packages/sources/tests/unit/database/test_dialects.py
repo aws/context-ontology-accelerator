@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 from unittest.mock import MagicMock, patch
 
@@ -449,6 +450,196 @@ class TestSnowflakeDialect:
 
         assert pk == {}
         assert fk == {"CATALOG_RETURNS": [("CR_CALL_CENTER_SK", "CALL_CENTER", "CC_CALL_CENTER_SK")]}
+
+    @staticmethod
+    def _imported_key(pk_database, pk_schema, pk_table, pk_column, fk_table, fk_column, *, key_sequence=1):
+        """One SHOW IMPORTED KEYS row for a key declared on DB.SALES.<fk_table>."""
+        return (
+            "2025", pk_database, pk_schema, pk_table, pk_column, "DB", "SALES", fk_table, fk_column, key_sequence,
+            "NO ACTION", "NO ACTION", "fk", "pk", "NOT DEFERRABLE", "true", "",
+        )  # fmt: skip
+
+    def _fk_for(self, rows, tables):
+        def responder(sql, p):
+            if "show imported keys" in sql:
+                return rows
+            return []
+
+        _, fk = SnowflakeDialect().fetch_constraints(_Conn(responder, self._describer), "SALES", tables)
+        return fk
+
+    def test_fetch_constraints_same_schema_fk_keeps_bare_target(self):
+        rows = [self._imported_key("DB", "SALES", "CUSTOMERS", "ID", "ORDERS", "CUSTOMER_ID")]
+
+        fk = self._fk_for(rows, ["ORDERS", "CUSTOMERS"])
+
+        assert fk == {"ORDERS": [("CUSTOMER_ID", "CUSTOMERS", "ID")]}
+
+    def test_fetch_constraints_cross_schema_fk_shadowed_by_local_table_is_dropped(self, caplog):
+        # SALES.ORDERS.CUSTOMER_ID -> CRM.CUSTOMERS.ID while SALES has its own
+        # CUSTOMERS: recording the bare name would point the key at SALES.CUSTOMERS.
+        rows = [self._imported_key("DB", "CRM", "CUSTOMERS", "ID", "ORDERS", "CUSTOMER_ID")]
+
+        with caplog.at_level(logging.WARNING):
+            fk = self._fk_for(rows, ["ORDERS", "CUSTOMERS"])
+
+        assert fk == {}
+        dropped = [r for r in caplog.records if r.getMessage() == "snowflake_fk_dropped"]
+        assert len(dropped) == 1
+        assert dropped[0].reason == "target_name_shadowed_by_scanned_schema"
+        assert (dropped[0].target_schema, dropped[0].target_table) == ("CRM", "CUSTOMERS")
+
+    def test_fetch_constraints_cross_schema_fk_shadowed_case_insensitively_is_dropped(self):
+        # A quoted local "customers" still shadows CRM.CUSTOMERS for consumers
+        # that compare table names without case.
+        rows = [self._imported_key("DB", "CRM", "CUSTOMERS", "ID", "ORDERS", "CUSTOMER_ID")]
+
+        assert self._fk_for(rows, ["ORDERS", "customers"]) == {}
+
+    def test_fetch_constraints_cross_schema_fk_without_local_twin_is_schema_qualified(self):
+        rows = [self._imported_key("DB", "CRM", "CUSTOMERS", "ID", "ORDERS", "CUSTOMER_ID")]
+
+        fk = self._fk_for(rows, ["ORDERS"])
+
+        assert fk == {"ORDERS": [("CUSTOMER_ID", "CRM.CUSTOMERS", "ID")]}
+
+    def test_fetch_constraints_composite_cross_schema_fk_qualifies_every_column(self):
+        rows = [
+            self._imported_key("DB", "CRM", "ACCOUNTS", "REGION", "ORDERS", "ACCT_REGION", key_sequence=1),
+            self._imported_key("DB", "CRM", "ACCOUNTS", "ACCT_NO", "ORDERS", "ACCT_NO", key_sequence=2),
+        ]
+
+        fk = self._fk_for(rows, ["ORDERS"])
+
+        assert fk == {"ORDERS": [("ACCT_REGION", "CRM.ACCOUNTS", "REGION"), ("ACCT_NO", "CRM.ACCOUNTS", "ACCT_NO")]}
+
+    def test_fetch_constraints_cross_database_fk_is_dropped(self, caplog):
+        # Same schema NAME in another database is still another table; a source
+        # covers one database, so the key cannot be represented.
+        rows = [self._imported_key("OTHER_DB", "SALES", "CUSTOMERS", "ID", "ORDERS", "CUSTOMER_ID")]
+
+        with caplog.at_level(logging.WARNING):
+            fk = self._fk_for(rows, ["ORDERS"])
+
+        assert fk == {}
+        dropped = [r for r in caplog.records if r.getMessage() == "snowflake_fk_dropped"]
+        assert [r.reason for r in dropped] == ["target_in_other_database"]
+        assert dropped[0].target_database == "OTHER_DB"
+
+    def test_fetch_constraints_drop_keeps_other_keys_of_the_same_table(self):
+        rows = [
+            self._imported_key("DB", "CRM", "CUSTOMERS", "ID", "ORDERS", "CUSTOMER_ID"),
+            self._imported_key("DB", "SALES", "STORES", "ID", "ORDERS", "STORE_ID"),
+        ]
+
+        fk = self._fk_for(rows, ["ORDERS", "CUSTOMERS", "STORES"])
+
+        assert fk == {"ORDERS": [("STORE_ID", "STORES", "ID")]}
+
+    def test_fetch_constraints_quoted_case_twins_keep_their_own_keys(self):
+        # "orders" (quoted) and ORDERS are two tables; SHOW reports each as stored.
+        def responder(sql, p):
+            if "show primary keys" in sql:
+                return [
+                    ("2025", "DB", "SALES", "orders", "ORDER_ID", 1, "c", "true", ""),
+                    ("2025", "DB", "SALES", "ORDERS", "ID", 1, "c", "true", ""),
+                ]
+            if "show imported keys" in sql:
+                return [self._imported_key("DB", "SALES", "CUSTOMERS", "ID", "orders", "CUSTOMER_ID")]
+            return []
+
+        pk, fk = SnowflakeDialect().fetch_constraints(
+            _Conn(responder, self._describer), "SALES", ["orders", "ORDERS", "CUSTOMERS"]
+        )
+
+        assert pk == {"orders": ["ORDER_ID"], "ORDERS": ["ID"]}
+        assert fk == {"orders": [("CUSTOMER_ID", "CUSTOMERS", "ID")]}
+
+    def test_fetch_constraints_case_insensitive_match_ambiguous_resolves_nothing(self):
+        # The caller asked for two spellings that both fold to ORDERS; a SHOW row
+        # for a third spelling must not be attributed to either of them.
+        def responder(sql, p):
+            if "show primary keys" in sql:
+                return [("2025", "DB", "SALES", "Orders", "ID", 1, "c", "true", "")]
+            return []
+
+        pk, _ = SnowflakeDialect().fetch_constraints(_Conn(responder, self._describer), "SALES", ["orders", "ORDERS"])
+
+        assert pk == {}
+
+    def _details_for(self, rows, tables):
+        def responder(sql, p):
+            if "show imported keys" in sql:
+                return rows
+            return []
+
+        return SnowflakeDialect().fetch_constraint_details(_Conn(responder, self._describer), "SALES", tables)
+
+    def test_fetch_constraint_details_shadowed_cross_schema_fk_reports_declared_target(self):
+        rows = [
+            self._imported_key("DB", "CRM", "CUSTOMERS", "ID", "ORDERS", "CUSTOMER_ID"),
+            self._imported_key("DB", "SALES", "STORES", "ID", "ORDERS", "STORE_ID"),
+        ]
+
+        _, fk, dropped = self._details_for(rows, ["ORDERS", "CUSTOMERS", "STORES"])
+
+        assert fk == {"ORDERS": [("STORE_ID", "STORES", "ID")]}
+        assert dropped == {"ORDERS": {"CUSTOMER_ID": "DB.CRM.CUSTOMERS"}}
+
+    def test_fetch_constraint_details_cross_database_fk_reports_declared_target(self):
+        rows = [self._imported_key("OTHER_DB", "SALES", "CUSTOMERS", "ID", "ORDERS", "CUSTOMER_ID")]
+
+        _, fk, dropped = self._details_for(rows, ["ORDERS"])
+
+        assert fk == {}
+        assert dropped == {"ORDERS": {"CUSTOMER_ID": "OTHER_DB.SALES.CUSTOMERS"}}
+
+    def test_fetch_constraint_details_kept_keys_report_nothing_dropped(self):
+        rows = [
+            self._imported_key("DB", "SALES", "CUSTOMERS", "ID", "ORDERS", "CUSTOMER_ID"),
+            self._imported_key("DB", "CRM", "ACCOUNTS", "ID", "ORDERS", "ACCOUNT_ID"),
+        ]
+
+        _, fk, dropped = self._details_for(rows, ["ORDERS", "CUSTOMERS"])
+
+        assert fk == {"ORDERS": [("CUSTOMER_ID", "CUSTOMERS", "ID"), ("ACCOUNT_ID", "CRM.ACCOUNTS", "ID")]}
+        assert dropped == {}
+
+    def test_discover_schema_dropped_fk_marks_column_unrepresentable(self):
+        # Discovery output must carry the dropped key's real target on its column,
+        # so relationship inference later knows not to guess one.
+        from coa_sources.database.connectors.jdbc import JdbcConnector  # noqa: PLC0415
+
+        class _Dialect(SnowflakeDialect):
+            def list_tables(self, conn, schema):
+                return ["ORDERS", "CUSTOMERS"]
+
+            def fetch_columns(self, conn, schema, tables):
+                return [
+                    ("ORDERS", "ID", "NUMBER", False),
+                    ("ORDERS", "CUSTOMER_ID", "NUMBER", True),
+                    ("CUSTOMERS", "ID", "NUMBER", False),
+                ]
+
+        rows = [self._imported_key("DB", "CRM", "CUSTOMERS", "ID", "ORDERS", "CUSTOMER_ID")]
+
+        def responder(sql, p):
+            return rows if "show imported keys" in sql else []
+
+        tables = JdbcConnector._discover_schema(
+            _Conn(responder, self._describer),
+            _Dialect(),
+            schema_name="SALES",
+            table_include=None,
+            table_exclude=None,
+            data_source_id="ds",
+            namespace_id="ns",
+        )
+
+        orders = next(t for t in tables if t.name == "ORDERS")
+        assert orders.foreign_keys == []
+        markers = {c.name: c.unrepresentable_fk_target for c in orders.columns}
+        assert markers == {"ID": "", "CUSTOMER_ID": "DB.CRM.CUSTOMERS"}
 
 
 @pytest.mark.unit

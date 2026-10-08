@@ -411,11 +411,10 @@ class TestDiscoverMetadata:
         assert [t.table_id for t in result.tables] == ["public.t1"]
 
     @patch("coa_sources.database.connectors.jdbc.boto3")
-    def test_schema_exclude_filter_overrides_default(self, mock_boto3, connector, base_config):
+    def test_schema_exclude_filter_adds_to_system_defaults(self, mock_boto3, connector, base_config):
         self._patch_creds(mock_boto3)
-        # Caller-supplied exclude REPLACES the default system-schema exclude.
-        # A pattern matching 'staging' lets pg_catalog through (since the test
-        # would normally be excluded by default).
+        # A caller-supplied exclude ADDS to the default system-schema exclude: it
+        # used to replace it, so excluding 'staging' brought pg_catalog in (#168).
         base_config["schema_exclude_filter"] = "staging"
         conn = self._build_mock_conn(
             schemas=["public", "staging", "pg_catalog"],
@@ -431,8 +430,131 @@ class TestDiscoverMetadata:
         result = connector.discover_metadata(base_config)
 
         names = sorted(t.table_id for t in result.tables)
-        assert names == ["pg_catalog.c", "public.a"]
-        assert "staging.b" not in names
+        assert names == ["public.a"]
+        assert result.filter_warnings == []
+
+    def _three_schemas(self):
+        return self._build_mock_conn(
+            schemas=["public", "target_schema", "pg_catalog", "information_schema"],
+            tables_per_schema={"public": ["a"], "target_schema": ["b"], "pg_catalog": ["c"]},
+            columns_per_table={k: [("x", "text", "YES")] for k in ("a", "b", "c")},
+        )
+
+    @patch("coa_sources.database.connectors.jdbc.boto3")
+    def test_regex_schema_exclude_naming_system_schemas_still_excludes_them_and_warns(
+        self, mock_boto3, connector, base_config
+    ):
+        """The issue's exclude: system schemas stay out, and the no-op regex is reported."""
+        self._patch_creds(mock_boto3)
+        base_config["schema_exclude_filter"] = "^(pg_catalog|information_schema)$"
+        _mock_pg8000.connect.return_value = self._three_schemas()
+
+        result = connector.discover_metadata(base_config)
+
+        assert sorted(t.table_id for t in result.tables) == ["public.a", "target_schema.b"]
+        assert len(result.filter_warnings) == 1
+        warning = result.filter_warnings[0]
+        assert "schema_exclude_filter" in warning and "globs" in warning
+        assert "'pg_catalog|information_schema'" in warning  # the suggested glob
+
+    @patch("coa_sources.database.connectors.jdbc.boto3")
+    def test_exclude_warning_reuses_the_first_schema_listing(self, mock_boto3, connector, base_config):
+        """The warning check must not query the catalog a second time."""
+        self._patch_creds(mock_boto3)
+        base_config["schema_exclude_filter"] = "^(pg_catalog|information_schema)$"
+        conn = self._three_schemas()
+        _mock_pg8000.connect.return_value = conn
+        executed: list[str] = []
+        real_cursor = conn.cursor.side_effect
+
+        def _tracking_cursor():
+            cursor = real_cursor()
+            inner = cursor.execute.side_effect
+
+            def _execute(sql, params=()):
+                executed.append(sql.lower())
+                return inner(sql, params)
+
+            cursor.execute.side_effect = _execute
+            return cursor
+
+        conn.cursor.side_effect = _tracking_cursor
+        result = connector.discover_metadata(base_config)
+
+        assert len(result.filter_warnings) == 1
+        assert sum("from information_schema.schemata" in q for q in executed) == 1
+
+    @patch("coa_sources.database.connectors.jdbc.boto3")
+    def test_glob_exclude_that_matches_nothing_does_not_warn(self, mock_boto3, connector, base_config):
+        self._patch_creds(mock_boto3)
+        base_config["schema_exclude_filter"] = "staging_*"
+        _mock_pg8000.connect.return_value = self._three_schemas()
+
+        result = connector.discover_metadata(base_config)
+
+        assert sorted(t.table_id for t in result.tables) == ["public.a", "target_schema.b"]
+        assert result.filter_warnings == []
+
+    @patch("coa_sources.database.connectors.jdbc.boto3")
+    def test_regex_table_exclude_that_matches_nothing_warns(self, mock_boto3, connector, base_config):
+        self._patch_creds(mock_boto3)
+        base_config["table_exclude_filter"] = "^b$"
+        _mock_pg8000.connect.return_value = self._three_schemas()
+
+        result = connector.discover_metadata(base_config)
+
+        assert sorted(t.table_id for t in result.tables) == ["public.a", "target_schema.b"]
+        assert len(result.filter_warnings) == 1
+        assert "table_exclude_filter" in result.filter_warnings[0]
+        assert "Did you mean 'b'?" in result.filter_warnings[0]
+
+    def test_zero_match_schema_check_names_glob_syntax_and_suggests(self, connector):
+        """The SCAN_FAILED message for the issue's include filter says what syntax it expected."""
+        from coa_sources.database.connectors.dialects import get_dialect
+
+        dialect = MagicMock(wraps=get_dialect("POSTGRESQL"))
+        dialect.system_schema_pattern = get_dialect("POSTGRESQL").system_schema_pattern
+        dialect.connect.return_value = self._three_schemas()
+        dialect.list_schemas.return_value = ["public", "target_schema", "pg_catalog", "information_schema"]
+
+        check = connector._check_schema_access(
+            dialect=dialect,
+            host="h",
+            port=5432,
+            username="u",
+            password="p",
+            database_name="d",
+            options={},
+            schema_filter="^target_schema$",
+            schema_exclude_filter=None,
+        )
+
+        assert check.status == "failed"
+        assert "shell globs" in check.message
+        assert "Did you mean 'target_schema'?" in check.message
+
+    def test_schema_check_excludes_system_schemas_even_with_an_exclude_filter(self, connector):
+        from coa_sources.database.connectors.dialects import get_dialect
+
+        dialect = MagicMock(wraps=get_dialect("POSTGRESQL"))
+        dialect.system_schema_pattern = get_dialect("POSTGRESQL").system_schema_pattern
+        dialect.connect.return_value = MagicMock()
+        dialect.list_schemas.return_value = ["pg_catalog", "information_schema", "staging"]
+
+        check = connector._check_schema_access(
+            dialect=dialect,
+            host="h",
+            port=5432,
+            username="u",
+            password="p",
+            database_name="d",
+            options={},
+            schema_filter=None,
+            schema_exclude_filter="staging",
+        )
+
+        # Only system schemas and the excluded one exist, so nothing is left.
+        assert check.status == "failed"
 
     @patch("coa_sources.database.connectors.jdbc.boto3")
     def test_table_filter_and_exclude_apply(self, mock_boto3, connector, base_config):

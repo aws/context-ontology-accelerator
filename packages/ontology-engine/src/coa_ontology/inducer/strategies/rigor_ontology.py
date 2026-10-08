@@ -1079,9 +1079,11 @@ class RigorOntologyStrategy(InductionStrategy):
         same :func:`resolve_fk_target_identity` call the other three artifacts
         make, so the template names the table the ontology's range does.
 
-        A target genuinely outside this induction run keeps its bare name (it has
-        no TriplesMap here to collide with), so a mapping that referenced an
-        out-of-run table stays byte-identical.
+        A target genuinely outside this induction run is NOT minted this
+        run, so it has no TriplesMap here to point an IRI template at. Returning
+        its bare name produced a dangling reference that made Ontop reject the
+        whole mapping on load; it now degrades to a literal (``None``) like the
+        ambiguous case and the other three emitters.
         """
         if not target_name:
             return None
@@ -1099,7 +1101,17 @@ class RigorOntologyStrategy(InductionStrategy):
                 target_name,
             )
             return None
-        return target_name
+        # Genuinely outside this induction run: the target table is not
+        # minted this run. An IRI-template ObjectMap pointing at a subject token
+        # whose TriplesMap is never declared is a dangling reference Ontop rejects
+        # on load, failing every query in the namespace. Degrade to a datatype
+        # literal (return None -> the caller emits rr:column), mirroring the
+        # ambiguous branch and the other three emitters.
+        log.warning(
+            "fk_target_out_of_run_degraded_to_literal",
+            extra={"referrer": referrer.name, "target": target_name},
+        )
+        return None
 
     def _index_properties_by_column(
         self,

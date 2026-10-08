@@ -695,6 +695,30 @@ class TestJdbcRouteNamespaceScopeAuthorization:
         assert athena.calls[0]["sql"] == bad_sql
         assert result.rows == [{"engine": "athena"}]
 
+    async def test_jdbc_transpile_failure_log_omits_sql(self):
+        """CWE-532: the fallback warning must not carry the SQL —
+        neither directly nor via the sqlglot error message, which echoes a snippet."""
+        from unittest.mock import patch
+
+        import structlog.testing
+
+        comp = CompositeQueryExecutor(
+            athena_executor=_RealSignatureAthena(),
+            source_db_executor=_make_executor("jdbc"),
+            sources_registry=_jdbc_registry(),
+        )
+        sql = "SELECT * FROM mydb.public.t WHERE email = 'alice@example.com'"
+        err = sqlglot.errors.ParseError(f"Invalid expression. Line 1.\n  {sql}")
+        with (
+            patch("coa_serve.clients.composite_executor.sqlglot.transpile", side_effect=err),
+            structlog.testing.capture_logs() as logs,
+        ):
+            await comp.execute(sql, namespace="ns", data_source_id="mydb")
+        event = next(log for log in logs if log["event"] == "jdbc_trino_transpile_failed_fallback_athena")
+        assert event["sql_len"] == len(sql)
+        assert event["error_type"] == "ParseError"
+        assert "alice@example.com" not in repr(logs)
+
     async def test_jdbc_transpile_unexpected_error_propagates(self):
         """A non-sqlglot error during transpile (a real bug) must PROPAGATE, not be
         silently rerouted to Athena — the except is narrowed to SqlglotError."""

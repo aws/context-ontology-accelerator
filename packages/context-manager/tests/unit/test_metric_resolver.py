@@ -621,6 +621,103 @@ class TestNeptuneRefresh:
 
 
 @pytest.mark.unit
+class TestLazyNamespaceOnMiss:
+    """Lazy per-namespace fill on a cache miss (hourly refresh is the backstop)."""
+
+    @staticmethod
+    def _binding(name: str, ns: str) -> dict:
+        # Real Neptune path returns ?g (the graph URI); namespace is derived from it.
+        return {"name": name, "g": f"https://ontology-workbench.local/{ns}/urn%3Aont"}
+
+    async def test_miss_triggers_lazy_lookup_then_matches(self):
+        from unittest.mock import AsyncMock
+
+        mock_neptune = AsyncMock()
+        # Loaded (started) with NOTHING for 'insurance'; the metric appears in a
+        # later publish that the hourly refresh has not yet picked up.
+        mock_neptune.query.return_value = []
+        resolver = MetricResolver(neptune_client=mock_neptune)
+        await resolver.start()
+        assert resolver.loaded
+
+        # Now the metric exists in Neptune; a miss should lazily fetch + persist.
+        mock_neptune.query.return_value = [self._binding("total_claims", "insurance")]
+        m = await resolver.match("how many total_claims are there?", "insurance")
+        assert m.found
+        assert m.metric_name == "total_claims"
+        # Namespace was derived from ?g, not a pre-supplied key.
+        assert resolver._snapshot.by_id["insurance:total_claims"].namespace == "insurance"
+
+    async def test_lazy_lookup_persists_and_does_not_refetch_same_namespace(self):
+        from unittest.mock import AsyncMock
+
+        mock_neptune = AsyncMock()
+        mock_neptune.query.return_value = []
+        resolver = MetricResolver(neptune_client=mock_neptune)
+        await resolver.start()
+
+        mock_neptune.query.return_value = [self._binding("total_claims", "insurance")]
+        await resolver.match("total_claims", "insurance")
+        calls = mock_neptune.query.await_count
+
+        # Second request for the same namespace must hit the persisted cache,
+        # not Neptune again.
+        m2 = await resolver.match("total_claims", "insurance")
+        assert m2.found
+        assert mock_neptune.query.await_count == calls
+
+    async def test_genuine_miss_hits_neptune_at_most_once_per_namespace(self):
+        from unittest.mock import AsyncMock
+
+        mock_neptune = AsyncMock()
+        mock_neptune.query.return_value = []  # namespace legitimately has no metrics
+        resolver = MetricResolver(neptune_client=mock_neptune)
+        await resolver.start()
+        calls_after_start = mock_neptune.query.await_count
+
+        await resolver.match("no_such_metric", "emptyns")
+        after_first = mock_neptune.query.await_count
+        assert after_first == calls_after_start + 1  # one lazy lookup
+        # A second miss for the same namespace must NOT re-hit Neptune.
+        await resolver.match("still_nothing", "emptyns")
+        assert mock_neptune.query.await_count == after_first
+
+    async def test_full_refresh_clears_lazy_guard_so_namespace_can_refill(self):
+        from unittest.mock import AsyncMock
+
+        mock_neptune = AsyncMock()
+        mock_neptune.query.return_value = []
+        resolver = MetricResolver(neptune_client=mock_neptune)
+        await resolver.start()
+        await resolver.match("x", "emptyns")  # marks emptyns lazily-loaded
+        assert "emptyns" in resolver._lazy_loaded_namespaces
+
+        # The hourly full refresh (replace=True) resets the guard.
+        mock_neptune.query.return_value = []
+        await resolver._refresh_from_neptune()
+        assert "emptyns" not in resolver._lazy_loaded_namespaces
+
+    async def test_lazy_lookup_query_is_namespace_scoped_not_full_scan(self):
+        from unittest.mock import AsyncMock
+
+        mock_neptune = AsyncMock()
+        mock_neptune.query.return_value = []
+        resolver = MetricResolver(neptune_client=mock_neptune)
+        await resolver.start()
+        # Capture the SPARQL the lazy lookup sends.
+        await resolver.match("no_such_metric", "insurance")
+        lazy_sparql = mock_neptune.query.await_args.args[0]
+        # The FILTER must be scoped to this one namespace's graphs (prefix +
+        # "insurance/"), NOT the bare cluster-wide prefix the periodic refresh
+        # uses — otherwise a single miss scans every namespace (the load this
+        # change is meant to avoid).
+        assert 'STRSTARTS(STR(?g), "' in lazy_sparql
+        assert "insurance/" in lazy_sparql
+        # The periodic full refresh query stays broad (no per-namespace segment).
+        assert "insurance/" not in resolver._metric_list_sparql
+
+
+@pytest.mark.unit
 class TestFuzzyMatch:
     """fuzzy near-miss matching (typos/plurals/abbreviations)."""
 
@@ -983,22 +1080,18 @@ class TestMetricListSparql:
         assert "published" not in sparql
 
     def test_namespace_extracted_as_first_segment_after_prefix(self):
-        import re as _re
+        from coa_serve.tier1.metric_resolver import _namespace_from_graph_uri
 
-        from coa_serve.tier1.metric_resolver import _metric_list_sparql
-
-        sparql = _metric_list_sparql("https://ontology-workbench.local/{namespace}")
-        # Pull the REPLACE regex out of the generated SPARQL and apply it to a
-        # real metric graph URI: {base}/{ns-uuid}/{encoded ontology id}.
-        m = _re.search(r'REPLACE\(STR\(\?g\), "([^"]+)", "\$1"\)', sparql)
-        assert m, f"REPLACE pattern not found in:\n{sparql}"
-        # The regex is SPARQL-escaped (backslashes doubled for the string literal).
-        # Undo one layer of escaping to get the XPath regex for Python re.
-        ns_regex = m.group(1).replace("\\\\", "\\")
+        prefix = "https://ontology-workbench.local/"
         ns_uuid = "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
-        graph = f"https://ontology-workbench.local/{ns_uuid}/urn%3Acoa%3Avocab%23GovernedMetricsOntology"
-        extracted = _re.sub(ns_regex, r"\1", graph)
-        assert extracted == ns_uuid, f"expected {ns_uuid}, got {extracted}"
+        # Real metric graph URI: {base}/{ns-uuid}/{encoded ontology id}.
+        graph = f"{prefix}{ns_uuid}/urn%3Acoa%3Avocab%23GovernedMetricsOntology"
+        assert _namespace_from_graph_uri(graph, prefix) == ns_uuid
+
+    def test_namespace_extraction_returns_empty_when_prefix_absent(self):
+        from coa_serve.tier1.metric_resolver import _namespace_from_graph_uri
+
+        assert _namespace_from_graph_uri("https://other.host/ns/x", "https://ontology-workbench.local/") == ""
 
     def test_falls_back_to_default_template_when_unconfigured(self):
         from coa_serve.tier1.metric_resolver import (
@@ -1015,25 +1108,25 @@ class TestMetricListSparql:
         resolver = MetricResolver(seed=[])
         assert 'STRSTARTS(STR(?g), "https://graph.example/")' in resolver._metric_list_sparql
 
-    def test_prefix_xpath_metacharacters_are_escaped(self):
-        """Review (Kun): a graph prefix containing an XPath regex metacharacter
-        (e.g. `+`) must be escaped in the REPLACE pattern, otherwise namespace
-        capture is corrupted or Neptune fails to parse the regex."""
-        import re as _re
-
+    def test_sparql_has_no_per_row_replace_regex(self):
+        """The per-row REPLACE() regex was the Neptune OOM memory sink; namespace
+        is now derived client-side, so the query must carry no REPLACE()."""
         from coa_serve.tier1.metric_resolver import _metric_list_sparql
 
-        sparql = _metric_list_sparql("https://host/path+to/{namespace}")
-        m = _re.search(r'REPLACE\(STR\(\?g\), "([^"]+)", "\$1"\)', sparql)
-        assert m, f"REPLACE pattern not found in:\n{sparql}"
-        ns_regex = m.group(1)
-        # The '+' must be escaped (\+) in XPath regex, which becomes \\+ in SPARQL string.
-        assert "path\\\\+to" in ns_regex
-        # Undo SPARQL escaping for Python re validation
-        ns_regex_py = ns_regex.replace("\\\\", "\\")
+        sparql = _metric_list_sparql("https://ontology-workbench.local/{namespace}")
+        assert "REPLACE(" not in sparql
+        assert "?g WHERE" in sparql  # returns the raw graph URI instead
+
+    def test_namespace_extraction_handles_prefix_with_metacharacter(self):
+        """A prefix containing a would-be regex metacharacter (e.g. `+`) is a
+        plain string match client-side, so no escaping is needed and capture is
+        exact — the case the old XPath-regex escaping guarded against."""
+        from coa_serve.tier1.metric_resolver import _namespace_from_graph_uri
+
+        prefix = "https://host/path+to/"
         ns_uuid = "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
-        graph = f"https://host/path+to/{ns_uuid}/urn%3Acoa"
-        assert _re.sub(ns_regex_py, r"\1", graph) == ns_uuid
+        graph = f"{prefix}{ns_uuid}/urn%3Acoa"
+        assert _namespace_from_graph_uri(graph, prefix) == ns_uuid
 
 
 @pytest.mark.unit

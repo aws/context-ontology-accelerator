@@ -1446,6 +1446,31 @@ class TestCustomConnectorDiscovery:
         fields = scan_dao.update.call_args.kwargs["update_fields"]
         assert "tablesFailed" not in fields
         assert "failedTables" not in fields
+        assert "filterWarnings" not in fields
+
+    @patch(f"{MODULE}.write_to_datazone")
+    @patch(f"{MODULE}._get_ns_dao")
+    @patch(f"{MODULE}._get_scan_dao")
+    @patch(f"{MODULE}._get_ds_dao")
+    @patch(f"{MODULE}.get_connector")
+    def test_records_filter_warnings_on_the_scan_job(
+        self, mock_get_connector, mock_get_ds, mock_get_scan, mock_get_ns, mock_write
+    ):
+        """A regex filter that matched nothing leaves the scan successful but unfiltered;
+        the reason must reach the scan job the steward sees (#168)."""
+        from coa_sources.database.pipeline.discovery_handler import handler
+
+        metadata = DiscoveredMetadata(
+            tables=[Table(name="ok", database="widgets", columns=[Column(name="c", data_type="int")])],
+            filter_warnings=["schema_exclude_filter matched nothing, so it had no effect."],
+        )
+        _, scan_dao, _ = self._wire(
+            mock_get_ds, mock_get_scan, mock_get_ns, mock_write, mock_get_connector, metadata, self._item()
+        )
+        handler(self._EVENT, None)
+
+        fields = scan_dao.update.call_args.kwargs["update_fields"]
+        assert fields["filterWarnings"] == ["schema_exclude_filter matched nothing, so it had no effect."]
 
     @patch(f"{MODULE}.write_to_datazone")
     @patch(f"{MODULE}._get_ns_dao")

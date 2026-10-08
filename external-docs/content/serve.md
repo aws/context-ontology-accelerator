@@ -413,6 +413,8 @@ covered as well as those that do:
 2. **SQL Firewall (Tier 1/2 only)** — for queries that execute SQL, the firewall
    validates the statement and enforces per-user table allowlists and column
    denylists, then applies the Cedar namespace policy again as a final gate.
+   The same table allowlist filters the table names listed in the query trace
+   and response metadata, so a caller never sees tables outside their grant.
 3. **Metric allowlist** — restricts which metrics a user can resolve (if configured).
 
 The admission gate is what protects the paths that produce no SQL — Tier 3 document

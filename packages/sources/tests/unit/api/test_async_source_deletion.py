@@ -238,11 +238,28 @@ class TestFinishDatabaseSourceDeletionOrdering:
 
 
 class TestDeletionWorker:
+    @pytest.fixture(autouse=True)
+    def _prefix(self, monkeypatch):
+        # The worker derives the catalog name from the source id, as the API does.
+        monkeypatch.setenv("RESOURCE_PREFIX", "coa-dev-")
+
     def _record(self, body: dict | str, message_id="m1"):
         return {"messageId": message_id, "body": body if isinstance(body, str) else json.dumps(body)}
 
-    def test_successful_cleanup_reports_no_failures(self):
-        with patch(f"{_WK}.finish_database_source_deletion", return_value=True) as finish:
+    @staticmethod
+    def _dao(row: dict | None) -> MagicMock:
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = row
+        return mock_dao
+
+    def test_handler_deleting_source_finishes_with_row_sub_type_and_derived_catalog(self):
+        from coa_sources.database.connectors.athena_catalog import derive_catalog_name
+
+        mock_dao = self._dao(_db_source_item("DELETING"))
+        with (
+            patch(f"{_WK}.finish_database_source_deletion", return_value=True) as finish,
+            patch(f"{_WK}._get_dao", return_value=mock_dao),
+        ):
             out = _worker().handler(
                 {
                     "Records": [
@@ -260,10 +277,100 @@ class TestDeletionWorker:
             )
 
         assert out == {"batchItemFailures": []}
-        assert finish.call_args.args[:4] == (_NAMESPACE_ID, _SOURCE_ID, "JDBC_DATABASE", "cat")
+        # Sub-type from the row, catalog name derived from the id: the message's
+        # values ("JDBC_DATABASE", "cat") are not what the teardown uses.
+        assert finish.call_args.args[:4] == (
+            _NAMESPACE_ID,
+            _SOURCE_ID,
+            "GLUE_DATABASE",
+            derive_catalog_name(_SOURCE_ID),
+        )
+        mock_dao.get.assert_called_once_with({"PK": f"NS#{_NAMESPACE_ID}", "SK": f"SRC#{_SOURCE_ID}"})
 
-    def test_incomplete_cleanup_marks_failed_and_redrives_that_message(self):
+    def test_handler_delete_failed_source_is_retried(self):
+        mock_dao = self._dao(_db_source_item("DELETE_FAILED"))
+        with (
+            patch(f"{_WK}.finish_database_source_deletion", return_value=True) as finish,
+            patch(f"{_WK}._get_dao", return_value=mock_dao),
+        ):
+            out = _worker().handler(
+                {"Records": [self._record({"namespace_id": _NAMESPACE_ID, "source_id": _SOURCE_ID})]},
+                None,
+            )
+
+        assert out == {"batchItemFailures": []}
+        finish.assert_called_once()
+
+    @pytest.mark.parametrize("status", ["APPROVED", "PENDING_REVIEW", "SCANNING", "FAILED", ""])
+    def test_handler_source_not_in_a_delete_state_is_dropped_without_side_effects(self, status):
+        mock_dao = self._dao(_db_source_item(status))
+        with (
+            patch(f"{_WK}.finish_database_source_deletion") as finish,
+            patch(f"{_WK}._get_dao", return_value=mock_dao),
+        ):
+            out = _worker().handler(
+                {"Records": [self._record({"namespace_id": _NAMESPACE_ID, "source_id": _SOURCE_ID})]},
+                None,
+            )
+
+        # Dropped, not redriven: no accepted DELETE stands behind the message.
+        assert out == {"batchItemFailures": []}
+        finish.assert_not_called()
+        mock_dao.update.assert_not_called()
+        mock_dao.put.assert_not_called()
+        mock_dao.delete.assert_not_called()
+
+    def test_handler_missing_row_is_dropped_without_writing_or_deleting(self):
+        mock_dao = self._dao(None)
+        with (
+            patch(f"{_WK}.finish_database_source_deletion") as finish,
+            patch(f"{_WK}._get_dao", return_value=mock_dao),
+        ):
+            out = _worker().handler(
+                {"Records": [self._record({"namespace_id": _NAMESPACE_ID, "source_id": _SOURCE_ID})]},
+                None,
+            )
+
+        assert out == {"batchItemFailures": []}
+        finish.assert_not_called()
+        mock_dao.update.assert_not_called()
+        mock_dao.put.assert_not_called()
+        mock_dao.delete.assert_not_called()
+
+    def test_handler_row_read_error_redrives_without_acting(self):
         mock_dao = MagicMock()
+        mock_dao.get.side_effect = ClientError({"Error": {"Code": "ProvisionedThroughputExceededException"}}, "GetItem")
+        with (
+            patch(f"{_WK}.finish_database_source_deletion") as finish,
+            patch(f"{_WK}._get_dao", return_value=mock_dao),
+        ):
+            out = _worker().handler(
+                {"Records": [self._record({"namespace_id": _NAMESPACE_ID, "source_id": _SOURCE_ID})]},
+                None,
+            )
+
+        assert out == {"batchItemFailures": [{"itemIdentifier": "m1"}]}
+        finish.assert_not_called()
+        mock_dao.update.assert_not_called()
+
+    def test_handler_unset_resource_prefix_marks_failed_and_redrives(self, monkeypatch):
+        monkeypatch.delenv("RESOURCE_PREFIX", raising=False)
+        mock_dao = self._dao(_db_source_item("DELETING"))
+        with (
+            patch(f"{_WK}.finish_database_source_deletion") as finish,
+            patch(f"{_WK}._get_dao", return_value=mock_dao),
+        ):
+            out = _worker().handler(
+                {"Records": [self._record({"namespace_id": _NAMESPACE_ID, "source_id": _SOURCE_ID})]},
+                None,
+            )
+
+        assert out == {"batchItemFailures": [{"itemIdentifier": "m1"}]}
+        finish.assert_not_called()
+        assert mock_dao.update.call_args.args[1]["status"] == "DELETE_FAILED"
+
+    def test_handler_incomplete_cleanup_marks_failed_and_redrives_that_message(self):
+        mock_dao = self._dao(_db_source_item("DELETING"))
         with (
             patch(f"{_WK}.finish_database_source_deletion", return_value=False),
             patch(f"{_WK}._get_dao", return_value=mock_dao),
@@ -275,9 +382,11 @@ class TestDeletionWorker:
 
         assert out == {"batchItemFailures": [{"itemIdentifier": "m1"}]}
         assert mock_dao.update.call_args.args[1]["status"] == "DELETE_FAILED"
+        # Conditional on the row existing, so a vanished row is never recreated.
+        assert mock_dao.update.call_args.kwargs.get("condition") == "attribute_exists(PK)"
 
-    def test_a_raising_cleanup_is_reported_not_swallowed(self):
-        mock_dao = MagicMock()
+    def test_handler_raising_cleanup_is_reported_not_swallowed(self):
+        mock_dao = self._dao(_db_source_item("DELETING"))
         with (
             patch(f"{_WK}.finish_database_source_deletion", side_effect=RuntimeError("boom")),
             patch(f"{_WK}._get_dao", return_value=mock_dao),
@@ -289,7 +398,7 @@ class TestDeletionWorker:
 
         assert out == {"batchItemFailures": [{"itemIdentifier": "m1"}]}
 
-    def test_unusable_messages_are_failed_to_the_dlq(self):
+    def test_handler_unusable_messages_are_failed_to_the_dlq(self):
         # Neither can ever succeed, but omitting them from batchItemFailures would
         # make SQS delete them as successes; failing them sends them to the DLQ.
         with patch(f"{_WK}.finish_database_source_deletion") as finish:
@@ -306,7 +415,7 @@ class TestDeletionWorker:
         assert out == {"batchItemFailures": [{"itemIdentifier": "bad"}, {"itemIdentifier": "nons"}]}
         finish.assert_not_called()
 
-    def test_malformed_ids_are_failed_to_the_dlq_not_acted_on(self):
+    def test_handler_malformed_ids_are_failed_to_the_dlq_not_acted_on(self):
         # A body whose ids are not server-generated UUIDs must not flow into DDB
         # keys / DataZone / catalog names. It is failed to the DLQ, like an
         # unparseable body.
@@ -326,8 +435,8 @@ class TestDeletionWorker:
         assert out == {"batchItemFailures": [{"itemIdentifier": "badid"}]}
         finish.assert_not_called()
 
-    def test_one_failure_does_not_redrive_its_healthy_batch_siblings(self):
-        mock_dao = MagicMock()
+    def test_handler_one_failure_does_not_redrive_its_healthy_batch_siblings(self):
+        mock_dao = self._dao(_db_source_item("DELETING"))
         with (
             patch(f"{_WK}.finish_database_source_deletion", side_effect=[True, False]),
             patch(f"{_WK}._get_dao", return_value=mock_dao),
@@ -349,6 +458,127 @@ class TestDeletionWorker:
             )
 
         assert out == {"batchItemFailures": [{"itemIdentifier": "bad"}]}
+
+
+class TestDeletionWorkerEndToEnd:
+    """The worker with the real cleanup tail: only DataZone and scan jobs are mocked."""
+
+    _OTHER_SOURCE_ID = "99999999-2222-4333-8444-555555555555"
+
+    @pytest.fixture(autouse=True)
+    def _prefix(self, monkeypatch):
+        monkeypatch.setenv("RESOURCE_PREFIX", "coa-dev-")
+
+    def _run(self, row: dict | None, body: dict):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = row
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_WK}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._delete_source_datazone_assets", return_value=(3, True)) as assets,
+            patch(f"{_SH}._delete_source_scan_jobs", return_value=1) as jobs,
+            patch(f"{_SH}.release_platform_catalog") as release,
+        ):
+            out = _worker().handler({"Records": [{"messageId": "m1", "body": json.dumps(body)}]}, None)
+        return out, mock_dao, assets, jobs, release
+
+    def _jdbc_row(self, status: str) -> dict:
+        return {**_db_source_item(status), "sourceSubType": "JDBC_DATABASE"}
+
+    def test_handler_message_for_live_source_does_not_tear_it_down(self):
+        out, mock_dao, assets, jobs, release = self._run(
+            self._jdbc_row("APPROVED"),
+            {"namespace_id": _NAMESPACE_ID, "source_id": _SOURCE_ID, "sub_type": "JDBC_DATABASE", "catalog_name": ""},
+        )
+
+        assert out == {"batchItemFailures": []}
+        assert not assets.called, "DataZone assets of a live source were deleted"
+        assert not jobs.called
+        assert not release.called
+        mock_dao.delete.assert_not_called()
+        mock_dao.update.assert_not_called()
+
+    def test_handler_message_cannot_release_another_sources_catalog_claim(self):
+        from coa_sources.database.connectors.athena_catalog import derive_catalog_name
+
+        foreign = derive_catalog_name(self._OTHER_SOURCE_ID)
+        assert foreign != derive_catalog_name(_SOURCE_ID)
+        out, mock_dao, assets, _, release = self._run(
+            self._jdbc_row("DELETING"),
+            {
+                "namespace_id": _NAMESPACE_ID,
+                "source_id": _SOURCE_ID,
+                "sub_type": "JDBC_DATABASE",
+                "catalog_name": foreign,
+            },
+        )
+
+        assert out == {"batchItemFailures": []}
+        released = [c.kwargs.get("catalog_name") for c in release.call_args_list]
+        assert foreign not in released, "the claim on another source's catalog was released"
+        assert released == [derive_catalog_name(_SOURCE_ID)]
+        assert assets.called
+        mock_dao.delete.assert_called_once_with({"PK": f"NS#{_NAMESPACE_ID}", "SK": f"SRC#{_SOURCE_ID}"})
+
+    def test_handler_message_sub_type_does_not_override_row(self):
+        # A GLUE_DATABASE source claims no platform catalog; a message claiming
+        # JDBC_DATABASE must not make the worker release one.
+        out, _, assets, _, release = self._run(
+            _db_source_item("DELETING"),
+            {"namespace_id": _NAMESPACE_ID, "source_id": _SOURCE_ID, "sub_type": "JDBC_DATABASE", "catalog_name": "x"},
+        )
+
+        assert out == {"batchItemFailures": []}
+        assert assets.called
+        assert not release.called
+
+
+class TestMarkFailed:
+    def test_mark_failed_missing_row_writes_nothing_and_does_not_raise(self):
+        # Real DDB semantics: the condition keeps a phantom key-only row from appearing.
+        with mock_aws():
+            ddb = boto3.resource("dynamodb", region_name="us-east-1")
+            table = ddb.create_table(
+                TableName="sources",
+                KeySchema=[{"AttributeName": "PK", "KeyType": "HASH"}, {"AttributeName": "SK", "KeyType": "RANGE"}],
+                AttributeDefinitions=[
+                    {"AttributeName": "PK", "AttributeType": "S"},
+                    {"AttributeName": "SK", "AttributeType": "S"},
+                ],
+                BillingMode="PAY_PER_REQUEST",
+            )
+            dao = DynamoDBDAO("sources", region="us-east-1")
+            with patch(f"{_WK}._get_dao", return_value=dao):
+                _worker()._mark_failed(_NAMESPACE_ID, _SOURCE_ID, "reason")
+
+            assert table.scan()["Items"] == []
+
+    def test_mark_failed_existing_row_is_flagged_delete_failed(self):
+        with mock_aws():
+            ddb = boto3.resource("dynamodb", region_name="us-east-1")
+            table = ddb.create_table(
+                TableName="sources",
+                KeySchema=[{"AttributeName": "PK", "KeyType": "HASH"}, {"AttributeName": "SK", "KeyType": "RANGE"}],
+                AttributeDefinitions=[
+                    {"AttributeName": "PK", "AttributeType": "S"},
+                    {"AttributeName": "SK", "AttributeType": "S"},
+                ],
+                BillingMode="PAY_PER_REQUEST",
+            )
+            table.put_item(Item=_db_source_item("DELETING"))
+            dao = DynamoDBDAO("sources", region="us-east-1")
+            with patch(f"{_WK}._get_dao", return_value=dao):
+                _worker()._mark_failed(_NAMESPACE_ID, _SOURCE_ID, "reason")
+
+            item = table.get_item(Key={"PK": f"NS#{_NAMESPACE_ID}", "SK": f"SRC#{_SOURCE_ID}"})["Item"]
+            assert item["status"] == "DELETE_FAILED"
+            assert item["errorMessage"] == "reason"
+
+    def test_mark_failed_other_write_error_is_swallowed(self):
+        mock_dao = MagicMock()
+        mock_dao.update.side_effect = ClientError({"Error": {"Code": "AccessDeniedException"}}, "UpdateItem")
+        with patch(f"{_WK}._get_dao", return_value=mock_dao):
+            _worker()._mark_failed(_NAMESPACE_ID, _SOURCE_ID, "reason")
 
 
 class TestSourceCountNotDoubleDecrementedOnRetry:

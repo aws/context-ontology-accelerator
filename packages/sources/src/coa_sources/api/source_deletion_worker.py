@@ -19,6 +19,13 @@ the row LAST — so an incomplete cleanup leaves a retryable ``DELETING`` /
 Idempotent by construction: every step is a delete, and the shared
 ``finish_database_source_deletion`` tolerates already-absent assets, scan jobs
 and rows, so an SQS redelivery is safe.
+
+The message is a trigger, not an authority. Before acting, the worker reads the
+source row and proceeds only when an accepted ``DELETE`` has put it in a delete
+state (``DELETING``, or ``DELETE_FAILED`` on a retry). Everything the teardown
+works from comes from the row and the source id, never from the message body,
+so a message for a live source, a missing source, or naming another source's
+catalog does nothing.
 """
 
 from __future__ import annotations
@@ -35,8 +42,23 @@ from coa_sources.api.sources_handler import (
     _get_dao,
     finish_database_source_deletion,
 )
+from coa_sources.database.connectors.athena_catalog import derive_catalog_name
 
 logger = structlog.get_logger(__name__)
+
+# The statuses the API leaves a database source in once it has accepted a
+# DELETE and handed the tail to this worker: DELETING on the hand-off, and
+# DELETE_FAILED when the enqueue or an earlier worker attempt failed (the SQS
+# redrive then retries it). Any other status means no delete was accepted.
+_DELETE_STATUSES = frozenset({SourceStatus.DELETING, SourceStatus.DELETE_FAILED})
+
+# Guard for the DELETE_FAILED write: without it, an update for a source whose
+# row is already gone would create a key-only row that lists as a phantom.
+_ROW_EXISTS_GUARD: dict[str, Any] = {"condition": "attribute_exists(PK)"}
+
+
+def _source_key(namespace_id: str, source_id: str) -> dict[str, str]:
+    return {"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"}
 
 
 def _mark_failed(namespace_id: str, source_id: str, reason: str) -> None:
@@ -45,13 +67,20 @@ def _mark_failed(namespace_id: str, source_id: str, reason: str) -> None:
     Best-effort: if this write fails too the source stays ``DELETING``, which the
     SQS redrive will retry. Never raises — it runs on the failure path, and
     masking the original error with a bookkeeping error would lose the diagnosis.
+
+    Conditional on the row existing: if it is already gone there is nothing to
+    flag, and an unconditional update would write a phantom row back.
     """
     try:
         _get_dao().update(
-            {"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"},
+            _source_key(namespace_id, source_id),
             {"status": SourceStatus.DELETE_FAILED, "errorMessage": reason},
+            **_ROW_EXISTS_GUARD,
         )
-    except ClientError:
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            logger.info("delete_failed_status_skipped_row_gone", source_id=source_id)
+            return
         logger.exception("delete_failed_status_write_failed", source_id=source_id)
 
 
@@ -96,14 +125,44 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             failures.append({"itemIdentifier": message_id})
             continue
 
+        # Read the row before touching anything. A read error is retried via the
+        # redrive; nothing has been changed yet, so there is nothing to flag.
         try:
-            ok = finish_database_source_deletion(
-                namespace_id,
-                source_id,
-                body.get("sub_type", ""),
-                body.get("catalog_name", ""),
-                context,
+            item = _get_dao().get(_source_key(namespace_id, source_id))
+        except ClientError:
+            logger.exception("source_delete_row_read_failed", source_id=source_id, namespace_id=namespace_id)
+            failures.append({"itemIdentifier": message_id})
+            continue
+
+        status = (item or {}).get("status", "")
+        if not item or status not in _DELETE_STATUSES:
+            # No accepted DELETE behind this message: the source is gone (a
+            # redelivery after success) or still live. Drop it without side
+            # effects; reporting it as a failure would only redrive it.
+            logger.warning(
+                "source_delete_message_dropped_not_deleting",
+                message_id=message_id,
+                source_id=source_id,
+                namespace_id=namespace_id,
+                row_found=bool(item),
+                status=status or None,
             )
+            continue
+
+        # Sub-type from the row, catalog name derived from the source id the
+        # same way the API derives it. The message's own fields are ignored, so
+        # messages already queued keep working while their content is not trusted.
+        sub_type = item.get("sourceSubType", "")
+        try:
+            catalog_name = derive_catalog_name(source_id)
+        except RuntimeError:
+            logger.exception("source_delete_catalog_name_unresolved", source_id=source_id, namespace_id=namespace_id)
+            _mark_failed(namespace_id, source_id, "Deletion cleanup could not resolve the catalog name")
+            failures.append({"itemIdentifier": message_id})
+            continue
+
+        try:
+            ok = finish_database_source_deletion(namespace_id, source_id, sub_type, catalog_name, context)
         except Exception:
             logger.exception("source_delete_worker_failed", source_id=source_id, namespace_id=namespace_id)
             _mark_failed(namespace_id, source_id, "Deletion cleanup raised an unexpected error")

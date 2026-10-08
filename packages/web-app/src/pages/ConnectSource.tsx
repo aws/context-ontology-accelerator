@@ -1218,7 +1218,7 @@ export const ConnectSource: React.FC = () => {
               <SpaceBetween size="l">
                 <FormField
                   label="Table filter"
-                  description="Optional regex to include specific tables."
+                  description="Optional Glue expression (a regular expression, e.g. orders|customers) to include specific tables."
                 >
                   <Input
                     value={model.glueTableFilter}
@@ -1230,14 +1230,14 @@ export const ConnectSource: React.FC = () => {
                 </FormField>
                 <FormField
                   label="Table exclude filter"
-                  description="Optional regex to exclude specific tables."
+                  description="Optional glob(s) (* ? [seq]) to exclude specific tables. Applied after the include filter. Separate multiple with | or ,."
                 >
                   <Input
                     value={model.glueTableExcludeFilter}
                     onChange={({ detail }) =>
                       setField("glueTableExcludeFilter", detail.value)
                     }
-                    placeholder="tmp_.*|staging_.*"
+                    placeholder="tmp_*|staging_*"
                   />
                 </FormField>
                 <FormField
@@ -1472,7 +1472,7 @@ export const ConnectSource: React.FC = () => {
                 </FormField>
                 <FormField
                   label="Schema exclude filter"
-                  description="Optional glob(s) (* ? [seq]) to exclude specific schemas. Separate multiple with | or ,."
+                  description="Optional glob(s) (* ? [seq]) to exclude specific schemas, in addition to the engine's system schemas (always excluded). Separate multiple with | or ,."
                 >
                   <Input
                     value={model.dbSchemaExcludeFilter}

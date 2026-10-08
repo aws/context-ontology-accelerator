@@ -311,6 +311,16 @@ class TestFiltering:
         result = CustomConnector(runner=runner).discover_metadata(_config(table_filter="nope_*"))
         assert result.tables == []
         assert result.failed_tables == []
+        assert result.filter_warnings == []  # a glob that matches nothing is not a mistake
+
+    def test_a_regex_filter_matching_nothing_carries_a_glob_hint(self):
+        runner = FakeRunner(tables=["a", "b"])
+        result = CustomConnector(runner=runner).discover_metadata(_config(table_filter="^a$"))
+        assert result.tables == []
+        assert len(result.filter_warnings) == 1
+        assert "tableFilter" not in result.filter_warnings[0]  # named by config key
+        assert "table_filter" in result.filter_warnings[0]
+        assert "Did you mean 'a'?" in result.filter_warnings[0]
 
     def test_an_empty_database_yields_no_tables(self):
         runner = FakeRunner(tables=[])

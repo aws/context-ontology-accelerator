@@ -46,7 +46,7 @@ from coa_common.domain_models import (
 
 from .base import ConnectionCheck, ConnectionTestResult
 from .dialects import MAX_ENUM_DISTINCT, Dialect, get_dialect
-from .filters import compile_filter, split_glob_list
+from .filters import GLOB_SYNTAX_HINT, compile_filter, regex_hint, split_glob_list, unmatched_regex_warning
 from .sts_assume import assume_datasource_session
 
 logger = logging.getLogger(__name__)
@@ -211,9 +211,7 @@ class JdbcConnector:
 
         # Compile filter regexes up front so we fail fast on invalid input.
         schema_include = self._compile_filter(config.get("schema_filter"), "schema_filter")
-        schema_exclude = self._compile_filter(
-            config.get("schema_exclude_filter"), "schema_exclude_filter"
-        ) or re.compile(dialect.system_schema_pattern)
+        schema_exclude = self._schema_exclude(dialect, config.get("schema_exclude_filter"))
         table_include = self._compile_filter(config.get("table_filter"), "table_filter")
         table_exclude = self._compile_filter(config.get("table_exclude_filter"), "table_exclude_filter")
 
@@ -232,11 +230,27 @@ class JdbcConnector:
         except Exception as exc:
             raise RuntimeError(f"Failed to open database connection: {exc}") from exc
 
+        filter_warnings: list[str] = []
         try:
-            schemas = self._list_filtered_schemas(conn, dialect, schema_include, schema_exclude)
+            listed_schemas: list[str] = []
+            schemas = self._list_filtered_schemas(conn, dialect, schema_include, schema_exclude, listed=listed_schemas)
+            schema_exclude_filter = config.get("schema_exclude_filter")
+            if schema_exclude_filter:
+                # Only schemas the exclude could still remove count: the system
+                # schemas are excluded regardless, so a regex naming them (the
+                # issue's example) is reported as having had no effect of its own.
+                system = re.compile(dialect.system_schema_pattern)
+                warning = unmatched_regex_warning(
+                    schema_exclude_filter,
+                    "schema_exclude_filter",
+                    [n for n in listed_schemas if not system.match(n)],
+                )
+                if warning:
+                    filter_warnings.append(warning)
             data_source_id = config.get("data_source_id", "")
             namespace_id = config.get("namespace_id", "")
             tables: list[Table] = []
+            listed_tables: list[str] = []
             for schema_name in schemas:
                 tables.extend(
                     self._discover_schema(
@@ -247,8 +261,13 @@ class JdbcConnector:
                         table_exclude=table_exclude,
                         data_source_id=data_source_id,
                         namespace_id=namespace_id,
+                        listed=listed_tables,
                     )
                 )
+            for field_name in ("table_filter", "table_exclude_filter"):
+                warning = unmatched_regex_warning(config.get(field_name), field_name, listed_tables)
+                if warning:
+                    filter_warnings.append(warning)
         finally:
             try:
                 conn.close()
@@ -263,7 +282,7 @@ class JdbcConnector:
             database_name,
             len(schemas),
         )
-        return DiscoveredMetadata(tables=tables)
+        return DiscoveredMetadata(tables=tables, filter_warnings=filter_warnings)
 
     # ------------------------------------------------------------------
     # Discovery helpers
@@ -291,15 +310,38 @@ class JdbcConnector:
     _compile_filter = staticmethod(compile_filter)
 
     @staticmethod
+    def _schema_exclude(dialect: Dialect, user_filter: str | None) -> re.Pattern[str]:
+        """The schema exclusion: the user's filter IN ADDITION TO the engine's system schemas.
+
+        The system schemas (``pg_catalog``, ``information_schema`` …) are excluded
+        whether or not the user sets an exclude filter. They used to be replaced by
+        it, so excluding anything at all — even ``staging_*`` — brought the system
+        schemas into the scan.
+        """
+        system = re.compile(dialect.system_schema_pattern)
+        user = compile_filter(user_filter, "schema_exclude_filter")
+        if user is None:
+            return system
+        return re.compile(f"(?:{system.pattern})|(?:{user.pattern})")
+
+    @staticmethod
     def _list_filtered_schemas(
         conn: Any,
         dialect: Dialect,
         include: re.Pattern[str] | None,
         exclude: re.Pattern[str] | None,
+        listed: list[str] | None = None,
     ) -> list[str]:
-        """List schemas via the dialect and apply include/exclude filters."""
+        """List schemas via the dialect and apply include/exclude filters.
+
+        ``listed``, when given, collects every schema name listed (before
+        filtering), so the caller can check an exclude filter without a second
+        catalog query.
+        """
         schemas: list[str] = []
         for schema_name in dialect.list_schemas(conn):
+            if listed is not None:
+                listed.append(schema_name)
             if include is not None and not include.match(schema_name):
                 continue
             if exclude is not None and exclude.match(schema_name):
@@ -317,10 +359,17 @@ class JdbcConnector:
         table_exclude: re.Pattern[str] | None,
         data_source_id: str,
         namespace_id: str,
+        listed: list[str] | None = None,
     ) -> list[Table]:
-        """Discover tables + columns + constraints within a single schema."""
+        """Discover tables + columns + constraints within a single schema.
+
+        ``listed``, when given, collects every table name the schema lists (before
+        filtering), so the caller can tell whether a table filter matched anything.
+        """
         kept_table_names: list[str] = []
         for table_name in dialect.list_tables(conn, schema_name):
+            if listed is not None:
+                listed.append(table_name)
             if table_include is not None and not table_include.match(table_name):
                 continue
             if table_exclude is not None and table_exclude.match(table_name):
@@ -336,7 +385,13 @@ class JdbcConnector:
                 Column(name=col_name, data_type=data_type, nullable=nullable, is_partition_key=False)
             )
 
-        pks, fks = JdbcConnector._safe_constraints(dialect, conn, schema_name, kept_table_names)
+        pks, fks, unrepresentable_fks = JdbcConnector._safe_constraints(dialect, conn, schema_name, kept_table_names)
+        # A dropped key's column keeps a record of its real target, so Pass 2
+        # inference does not guess a different (wrong) one for it.
+        for table_name, targets in unrepresentable_fks.items():
+            for col in columns_by_table.get(table_name, []):
+                if col.name in targets:
+                    col.unrepresentable_fk_target = targets[col.name]
         table_desc, column_desc = JdbcConnector._safe_descriptions(dialect, conn, schema_name, kept_table_names)
         # Schema-level COMMENT — only PG/Redshift/Snowflake expose this; the
         # default Dialect implementation returns "". Used as the LLM
@@ -509,18 +564,21 @@ class JdbcConnector:
     @staticmethod
     def _safe_constraints(
         dialect: Dialect, conn: Any, schema_name: str, table_names: list[str]
-    ) -> tuple[dict[str, PrimaryKey], dict[str, list[ForeignKey]]]:
+    ) -> tuple[dict[str, PrimaryKey], dict[str, list[ForeignKey]], dict[str, dict[str, str]]]:
         """Fetch PK/FK via the dialect and map to domain models.
 
-        Constraints are tagged ``DETERMINISTIC`` (confidence 1.0). On any query
-        failure (e.g. an engine that doesn't expose constraint metadata) returns
-        empty dicts so discovery continues without deterministic constraints.
+        Constraints are tagged ``DETERMINISTIC`` (confidence 1.0). The third
+        element is the dialect's ``{table: {column: declared target}}`` of foreign
+        keys it had to drop (see ``Dialect.fetch_constraint_details``). On any
+        query failure (e.g. an engine that doesn't expose constraint metadata)
+        returns empty dicts so discovery continues without deterministic
+        constraints.
         """
         try:
-            pk_cols, fk_refs = dialect.fetch_constraints(conn, schema_name, table_names)
+            pk_cols, fk_refs, unrepresentable = dialect.fetch_constraint_details(conn, schema_name, table_names)
         except Exception:
             logger.warning("constraint_discovery_failed", extra={"schema": schema_name}, exc_info=True)
-            return {}, {}
+            return {}, {}, {}
 
         pks = {
             t: PrimaryKey(columns=cols, source=EnrichmentSource.DETERMINISTIC, confidence=1.0)
@@ -539,7 +597,7 @@ class JdbcConnector:
             ]
             for t, refs in fk_refs.items()
         }
-        return pks, fks
+        return pks, fks, unrepresentable
 
     def _check_schema_access(
         self,
@@ -565,9 +623,7 @@ class JdbcConnector:
             )
         try:
             include = self._compile_filter(schema_filter, "schema_filter")
-            exclude = self._compile_filter(schema_exclude_filter, "schema_exclude_filter") or re.compile(
-                dialect.system_schema_pattern
-            )
+            exclude = self._schema_exclude(dialect, schema_exclude_filter)
             schemas = self._list_filtered_schemas(conn, dialect, include, exclude)
         except ValueError as exc:
             return ConnectionCheck(check="schema_access", status="failed", message=str(exc))
@@ -581,7 +637,12 @@ class JdbcConnector:
             return ConnectionCheck(
                 check="schema_access",
                 status="failed",
-                message="No schemas matched the configured filters; refine schema_filter or schema_exclude_filter",
+                message=(
+                    "No schemas matched the configured filters; refine schema_filter or schema_exclude_filter. "
+                    + GLOB_SYNTAX_HINT
+                    + "."
+                    + regex_hint(schema_filter, "schema_filter")
+                ),
             )
         return ConnectionCheck(
             check="schema_access", status="ok", message=f"{len(schemas)} schema(s) match the filters"
