@@ -115,7 +115,17 @@ export class StorageStack extends SCLStack {
       "NeptunePrimaryInstance",
       {
         dbInstanceIdentifier: this.prefixed("neptune-primary"),
-        dbInstanceClass: "db.r8g.large",
+        // Overridable via `--context neptune_instance_class=...` (local:
+        // `SCL_NEPTUNE_INSTANCE_CLASS`). The default stays db.r8g.large so a
+        // first-time / single-tenant deploy pays the smaller instance; the
+        // dev benchmark environment passes `neptune_instance_class=db.r8g.xlarge`
+        // from the deploy-dev CI job, because the large (2 vCPU → 4 query
+        // threads) OOM'd on SPARQL (`MemoryLimitExceededException`) under the
+        // concurrent deep-reasoning / metric-resolver load the benchmark
+        // generates. Raise it per-environment via context rather than in code.
+        dbInstanceClass:
+          (this.node.tryGetContext("neptune_instance_class") as string) ??
+          "db.r8g.large",
         dbClusterIdentifier: neptuneCluster.dbClusterIdentifier!,
       },
     );

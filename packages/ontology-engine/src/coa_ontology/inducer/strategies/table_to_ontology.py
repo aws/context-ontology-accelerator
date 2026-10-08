@@ -358,8 +358,17 @@ class TableToOntologyStrategy(InductionStrategy):
                 # The bare form below is the min()-keeper's class IRI, so returning
                 # it would point rdfs:range at one arbitrary same-named table.
                 return None
-            # Genuinely outside this run: the bare form collides with nothing.
-            return ns[_to_pascal(target_name)]
+            # Genuinely outside this run: the target table is not minted
+            # this run. Declaring an owl:ObjectProperty with rdfs:range pointing at
+            # a bare ind:<Target> class that is never declared leaves the ontology
+            # referencing an absent class, and makes the mapping's degraded literal
+            # (base._parent_tmap) and this range disagree. Degrade to a datatype
+            # property, mirroring the ambiguous branch and the R2RML emitter.
+            log.warning(
+                "fk_target_out_of_run_degraded_to_literal",
+                extra={"referrer": referrer.name, "target": target_name},
+            )
+            return None
 
         for table in tables:
             tm = match_map.get((table.name, ""))

@@ -52,6 +52,15 @@ Environment variables:
                                graphrag-toolkit (default: INFO). DEBUG surfaces the
                                batch-write retry ladder but is very verbose.
     KG_HEARTBEAT_INTERVAL_SECONDS — liveness log interval (default: 60, 0 disables)
+    EXTRACTION_TIMEOUT_SECONDS — Bedrock extraction read timeout (default: 300;
+                                valid range: 1–3600 seconds).
+    EXTRACTION_CONNECT_TIMEOUT_SECONDS — Bedrock connection timeout (default: 10;
+                                valid range: 0.1–300 seconds).
+    EXTRACTION_MAX_ATTEMPTS  — extraction attempts after botocore normalization
+                                (default: 5; valid range: 1–20).
+    EXTRACTION_NUM_THREADS_PER_WORKER — per-process extraction fan-out used to
+                                size the HTTP connection pool (default: 4;
+                                valid range: 1–256).
 
 Notes:
   AOSS NEXTGEN rejects knn_vector mappings with a 'method.engine' key.
@@ -60,7 +69,9 @@ Notes:
 
 from __future__ import annotations
 
+import inspect
 import json
+import math
 import os
 import random
 import sys
@@ -223,11 +234,91 @@ BEDROCK_EMBED_DIMENSIONS = int(os.environ.get("BEDROCK_EMBED_DIMENSIONS", str(DE
 
 CHECKPOINT_DIR = "/tmp/graphrag-checkpoints"
 
+
+def _bounded_int_env(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    """Read a bounded integer environment variable or fail with its name and value."""
+    raw = os.environ.get(name, str(default)).strip()
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]; got {raw!r}") from exc
+    if not minimum <= value <= maximum:
+        raise ValueError(f"{name} must be in [{minimum}, {maximum}]; got {raw!r}")
+    return value
+
+
+def _bounded_float_env(name: str, default: float, *, minimum: float, maximum: float) -> float:
+    """Read a finite bounded float environment variable or fail explicitly."""
+    raw = os.environ.get(name, str(default)).strip()
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number in [{minimum}, {maximum}]; got {raw!r}") from exc
+    if not math.isfinite(value) or not minimum <= value <= maximum:
+        raise ValueError(f"{name} must be finite and in [{minimum}, {maximum}]; got {raw!r}")
+    return value
+
+
 # Max OUTPUT tokens for the extraction LLM. The toolkit defaults a bare model
 # string to 4096, which truncates extraction mid-response on dense chunks and
 # silently drops that chunk's trailing entities/statements. 16384 matches the
 # graphrag-toolkit benchmark harness. Env-overridable without a deploy.
 EXTRACTION_MAX_TOKENS = int(os.environ.get("EXTRACTION_MAX_TOKENS", "16384"))
+
+# Read timeout for a single extraction call, in seconds. BedrockConverse defaults
+# to 60, which was enough for Haiku 4.5 but not for Sonnet 5: a chunk that emits
+# anything near EXTRACTION_MAX_TOKENS takes longer than that to come back, and the
+# call dies with "Read timeout on endpoint URL". Because the toolkit retries 50
+# times and every attempt times out for the same reason, one slow chunk does not
+# degrade the run — it ends it. A whole 14-document run failed this way after 33
+# minutes of retrying, extracting nothing.
+#
+# 300 is ~20x the measured p50: Sonnet 5 returns a chunk-sized extraction in ~15s
+# on its own, and 64 concurrently (the fan-out this task runs) still peaked at ~27s
+# with no errors. So this is headroom for an outlier, not an estimate of normal
+# latency — it costs nothing when calls return promptly, and bounds a hung one.
+EXTRACTION_TIMEOUT_SECONDS = _bounded_float_env(
+    "EXTRACTION_TIMEOUT_SECONDS",
+    300,
+    minimum=1,
+    maximum=3600,
+)
+
+# Attempts per extraction call, including the first. The toolkit's own value is 2,
+# which is too few for the Bedrock throttling a long run does meet, but retrying is
+# only worth it for faults that clear: a read timeout under a 300s budget does not,
+# and retrying it 50x is how a single slow chunk burned 45 minutes before failing.
+# 5 covers a throttle window without turning one bad chunk into a long stall.
+EXTRACTION_MAX_ATTEMPTS = _bounded_int_env(
+    "EXTRACTION_MAX_ATTEMPTS",
+    5,
+    minimum=1,
+    maximum=20,
+)
+
+# Connect timeout, kept separate from the read timeout on purpose. BedrockConverse
+# and llm_cache both set connect and read to one value, so a 300s read budget also
+# means waiting 300s to discover an endpoint is simply unreachable — a security group,
+# NAT or VPC endpoint fault then looks exactly like the slow model we just spent a run
+# chasing. TCP+TLS to Bedrock completes well under a second or not at all.
+EXTRACTION_CONNECT_TIMEOUT_SECONDS = _bounded_float_env(
+    "EXTRACTION_CONNECT_TIMEOUT_SECONDS",
+    10,
+    minimum=0.1,
+    maximum=300,
+)
+
+# Mirrors the env var the toolkit itself reads (its own default is 4). Read here only
+# to size the connection pool to the fan-out; the toolkit still owns the concurrency.
+# This is the PER-PROCESS figure: extraction is ProcessPoolExecutor(NUM_WORKERS) and
+# inside each process an asyncio run_jobs(workers=THREADS_PER_WORKER), so the task runs
+# 4x16 calls at once but each process has its own client, and 16 is what one pool holds.
+EXTRACTION_NUM_THREADS_PER_WORKER = _bounded_int_env(
+    "EXTRACTION_NUM_THREADS_PER_WORKER",
+    4,
+    minimum=1,
+    maximum=256,
+)
 
 # Vector indexes to build: ``chunk`` + ``topic``, matching the graphrag-toolkit
 # benchmark harness (benchmarks/ingest_v5.py, INDEX_NAMES = ['chunk', 'topic']).
@@ -259,6 +350,88 @@ def _require_env(key: str) -> str:
         logger.error("Missing required environment variable", key=key)
         sys.exit(1)
     return value
+
+
+try:
+    from llama_index.llms.bedrock_converse import BedrockConverse as _BedrockConverse
+
+    _BEDROCK_CONVERSE_INIT_PARAMS = frozenset(inspect.signature(_BedrockConverse.__init__).parameters) - {"self"}
+
+    class _PicklableBedrockConverse(_BedrockConverse):  # type: ignore[valid-type,misc]
+        """BedrockConverse whose ``__setstate__`` actually reconstructs the boto3 client.
+
+        See :func:`_picklable_bedrock_converse_cls` for why this exists.
+        """
+
+        def __setstate__(self, state: dict) -> None:
+            """Re-init from the pickled fields ``__init__`` accepts, dropping the rest."""
+            if not isinstance(state, dict):
+                raise TypeError("BedrockConverse pickle state must be a mapping")
+            serialized_fields = state.get("__dict__")
+            if not isinstance(serialized_fields, dict):
+                raise TypeError("BedrockConverse pickle state must contain a '__dict__' mapping")
+            kwargs = {k: v for k, v in serialized_fields.items() if k in _BEDROCK_CONVERSE_INIT_PARAMS}
+            try:
+                self.__init__(**kwargs)  # type: ignore[misc]
+            except (TypeError, ValueError) as exc:
+                # Do not log values here: the accepted fields may include
+                # credentials or other deployment configuration.
+                accepted_fields = ", ".join(sorted(kwargs))
+                raise TypeError(
+                    f"Could not reconstruct BedrockConverse from accepted pickle fields: {accepted_fields or '<none>'}"
+                ) from exc
+
+    _picklable_bedrock_converse_class: type | None = _PicklableBedrockConverse
+except ImportError:  # pragma: no cover - unit tests stub this module out
+    # Only the kg-build image installs llama_index. Leaving the class undefined keeps
+    # importing graph_build possible everywhere else (and in tests that stub the
+    # module); _picklable_bedrock_converse_cls() then raises with the reason.
+    _picklable_bedrock_converse_class = None
+
+
+def _picklable_bedrock_converse_cls() -> type:
+    """A BedrockConverse subclass that keeps its boto3 client across a ProcessPool hop.
+
+    Upstream loses it. ``llama_index.core.schema.__getstate__`` drops the unpicklable
+    ``_client``, then ``__setstate__`` tries to rebuild by re-running ``__init__`` with
+    the whole pickled ``__dict__`` — which carries inherited LLM fields
+    (``rate_limiter``, ``query_wrapper_prompt``) that ``BedrockConverse.__init__`` does
+    not accept. It raises TypeError, falls back to a plain attribute restore, and the
+    worker ends up with an LLM that has no client at all.
+
+    Filtering the state to the parameters ``__init__`` accepts makes the re-init
+    succeed, so the worker rebuilds the client from OUR botocore_config. Measured
+    across a real ProcessPoolExecutor: upstream arrives with no client, this arrives
+    with pool=16 and read_timeout=300.
+
+    That matters because of what fills the gap otherwise: ``LLMCache.predict`` checks
+    ``if not hasattr(self.llm, '_client')`` and builds its own from llm_cache's module
+    constants (60s, 2 attempts, default pool). Keeping the client makes that fallback
+    dead code instead of the live path.
+
+    A subclass rather than a monkey-patch on ``__setstate__``: a module-level rebind
+    only reaches workers under ``fork``, and is silently lost under ``spawn`` /
+    ``forkserver`` because the child re-imports from source. Linux/CPython 3.12
+    defaults to fork today — but pickling runs under every start method, so this does
+    not depend on that staying true.
+
+    Pickle stores a class by module and qualified name and looks it up again on load, so
+    the class has to be reachable as a plain module attribute — and under ``spawn`` the
+    worker re-imports this module from source, so it has to exist by the end of import,
+    not on first call. That rules out both a function-local class ("Can't get local
+    object") and one cached lazily onto the module ("Can't get attribute ... on module").
+    Hence the module-level definition above, guarded so that stubbing
+    ``llama_index.llms.bedrock_converse`` in unit tests leaves it as None rather than
+    failing the import.
+
+    This function just hands back that class, or explains why it is missing.
+    """
+    if _picklable_bedrock_converse_class is None:  # pragma: no cover - import guard
+        raise RuntimeError(
+            "llama_index.llms.bedrock_converse was not importable at module load, "
+            "so the picklable extraction LLM class could not be defined"
+        )
+    return _picklable_bedrock_converse_class
 
 
 # ---------------------------------------------------------------------------
@@ -399,6 +572,71 @@ def _load_staged_documents(bucket: str, staging_prefix: str) -> tuple[list, int]
 # ---------------------------------------------------------------------------
 # GraphRAG setup
 # ---------------------------------------------------------------------------
+
+
+_graphrag_llm_client_patched = False
+
+
+def _patch_graphrag_llm_cache_client_config() -> None:
+    """Bound the toolkit's own fallback client, for when ours does not reach the worker.
+
+    Defence in depth behind ``_picklable_bedrock_converse_cls``, which is the primary
+    fix: with the client surviving the pickle hop, the branch patched here is dead
+    code. It stays because it is the branch that runs whenever the client does NOT
+    survive — a future toolkit version that rebuilds the LLM rather than reusing ours
+    would land straight back here, and the failure it produces is a 45-minute run that
+    extracts nothing rather than an error anyone can read.
+
+    Why that branch is so costly unpatched:
+
+    1. The build pipeline pickles the LLM out to ProcessPool workers. llama_index's
+       ``__getstate__`` drops the unpicklable ``_client`` private attribute (the
+       "Removing unpickleable private attribute _client" line in every run log),
+       and its ``__setstate__`` tries to rebuild by re-running ``__init__``, which
+       raises TypeError on ``rate_limiter`` and falls back to a plain restore. So
+       the worker holds an LLM with no client at all.
+    2. ``LLMCache.predict`` notices that (``if not hasattr(self.llm, '_client')``)
+       and builds one itself, from module constants in llm_cache.py:
+       ``TIMEOUT = 60.0`` and ``MAX_ATTEMPTS = 2``.
+
+    A 14-document run therefore died after 45 minutes on ReadTimeoutError with
+    ``timeout=300`` configured: the 300 was never used, and neither was
+    ``max_retries=50`` — the effective values were 60s and 2 attempts. Raising the
+    number on our own object again would change nothing, which is why this patches
+    the constants the worker actually reads.
+
+    60s was too short for headroom, not because the model is slow: Sonnet 5 answers
+    a chunk-sized extraction in ~15s p50, and 64 of those concurrently still peak at
+    ~27s with zero errors. Sizing from the measured p50 rather than from the old
+    value is the point of EXTRACTION_TIMEOUT_SECONDS.
+
+    Two limits worth knowing, neither of which applies to the primary fix. llm_cache
+    passes one TIMEOUT to both connect_timeout and read_timeout at all three of its
+    build sites, so on this path a raised read budget also raises the connect budget —
+    the client built in ``_setup_graphrag`` splits them via
+    EXTRACTION_CONNECT_TIMEOUT_SECONDS, this one cannot. And a module-level rebind only
+    reaches workers under ``fork``; under ``spawn``/``forkserver`` the child re-imports
+    and gets 60.0/2 back. Verified: fork gives the worker the patched values, spawn does
+    not. Linux/CPython 3.12 forks today, so this holds in the container and not on a
+    macOS dev box — another reason the subclass, which pickling carries under every
+    start method, is the mechanism to rely on.
+
+    Separate flag + narrow import so an ImportError here cannot disable the other
+    patches. Must run BEFORE graphrag is imported elsewhere, like its siblings.
+    """
+    global _graphrag_llm_client_patched
+    if _graphrag_llm_client_patched:
+        return
+    import graphrag_toolkit.lexical_graph.utils.llm_cache as _llm_cache
+
+    _llm_cache.TIMEOUT = EXTRACTION_TIMEOUT_SECONDS
+    _llm_cache.MAX_ATTEMPTS = EXTRACTION_MAX_ATTEMPTS
+    logger.info(
+        "Patched graphrag llm_cache client config",
+        timeout=EXTRACTION_TIMEOUT_SECONDS,
+        max_attempts=EXTRACTION_MAX_ATTEMPTS,
+    )
+    _graphrag_llm_client_patched = True
 
 
 _graphrag_aoss_patched = False
@@ -707,6 +945,10 @@ def _setup_graphrag(tenant_id: str):
     # bind their own references to it. Importing GraphRAGConfig triggers those loads.
     _patch_graphrag_toolkit_for_aoss_nextgen()
     _patch_graphrag_paginated_search_retry()
+    # Rebinds module constants that llm_cache reads at call time, so this one is not
+    # order-sensitive the way the others are — kept here so all the patches are in
+    # one place rather than split across the import.
+    _patch_graphrag_llm_cache_client_config()
 
     from graphrag_toolkit.lexical_graph import GraphRAGConfig
 
@@ -728,15 +970,81 @@ def _setup_graphrag(tenant_id: str):
     )
     GraphRAGConfig.embed_dimensions = BEDROCK_EMBED_DIMENSIONS
     if BEDROCK_MODEL_ARN:
-        # Pass the extraction LLM as a JSON config, not a bare model string. The
-        # toolkit's GraphRAGConfig.to_llm() builds BedrockConverse with a hardcoded
-        # max_tokens=4096 for a bare string, and only reads max_tokens from the JSON
-        # form (config.py to_llm). 4096 output tokens truncates extraction on dense
-        # chunks — the model stops mid-response and the trailing entities/statements
-        # for that chunk are silently lost. 16384 matches the graphrag-toolkit
-        # benchmark harness (benchmarks/ingest_v5.py) for the same reason.
-        # temperature is 0.0 either way; region/profile still come from GraphRAGConfig.
-        GraphRAGConfig.extraction_llm = json.dumps({"model": BEDROCK_MODEL_ARN, "max_tokens": EXTRACTION_MAX_TOKENS})
+        # Pass the extraction LLM as an INSTANCE, not a model string and not a JSON
+        # config. All three reach BedrockConverse, but only the instance carries a
+        # timeout: to_llm() (config.py) reads just model/temperature/max_tokens/
+        # region_name/profile_name out of the JSON form and drops everything else,
+        # leaving BedrockConverse's 60s default in place. That default is what ended
+        # a whole run under Sonnet 5 — see EXTRACTION_TIMEOUT_SECONDS. An instance is
+        # returned unchanged (``isinstance(llm, LLM)`` short-circuit), so every field
+        # here is the one that gets used.
+        #
+        # max_tokens: the toolkit hardcodes 4096 for a bare model string, which
+        # truncates extraction mid-response on dense chunks and silently drops that
+        # chunk's trailing entities/statements. 16384 matches the graphrag-toolkit
+        # benchmark harness (benchmarks/ingest_v5.py).
+        #
+        # max_retries bounds llama_index's own retry layer, which sits on top of
+        # botocore's. BedrockConverse wraps each converse call in a tenacity retry on
+        # ThrottlingException, InternalServerException, ServiceUnavailableException and
+        # ModelTimeoutException, up to max_retries calls, and each call is a botocore
+        # request with its own standard-mode retries (botocore_config below, which
+        # counts max_attempts as retries, so EXTRACTION_MAX_ATTEMPTS + 1 attempts). The
+        # two layers multiply for throttling and 5xx. A read timeout is retried by
+        # botocore only, because the tenacity layer does not catch ReadTimeoutError, so a
+        # persistently slow chunk costs at most (EXTRACTION_MAX_ATTEMPTS + 1) *
+        # EXTRACTION_TIMEOUT_SECONDS. Both layers take the same bound so it reads in one
+        # place.
+        #
+        # MUST stay picklable: the build pipeline fans out over a ProcessPoolExecutor
+        # and pickles this, same constraint as embed_model above. Pickling drops the
+        # private _client, and upstream does NOT get it back — which is what
+        # _picklable_bedrock_converse_cls fixes, so the worker rebuilds the client
+        # from the botocore_config below. _patch_graphrag_llm_cache_client_config
+        # bounds the fallback path for the case where it still does not survive;
+        # both are set to the same values so the two paths cannot drift.
+        #
+        # region_name must be explicit for the same reason: there is no surviving
+        # session for a worker to inherit it from.
+        #
+        # temperature is accepted and then discarded — llama_index strips it for the
+        # models in BEDROCK_NO_TEMP_MODELS, which includes claude-sonnet-5, and
+        # Bedrock rejects the field outright for those models. Left in place because
+        # it is correct for a model that does take it; if extraction moves to one,
+        # this is already right.
+        # Size the pool to the per-process fan-out, the same rule coa_common.embeddings
+        # and preprocessing/handler.py already follow. botocore defaults to 10 and
+        # urllib3 uses block=False, so with 16 threads the 6 excess calls neither queue
+        # nor warn — they open a throwaway connection that is closed on release.
+        # Measured at 64 concurrent: 26.6s wall on pool=10 vs 22.5s on pool=64, zero
+        # errors either way. Real, but ~18% throughput, not the timeout.
+        #
+        # retries mode is explicit because supplying botocore_config means an omitted
+        # `retries` reverts to botocore's legacy default. standard, not adaptive: an
+        # adaptive rate limiter is per-client and there are 4 clients in 4 processes
+        # that cannot see each other's throttle signal, and 64 concurrent measured zero
+        # throttles, so there is nothing to adapt to.
+        from botocore.config import Config
+
+        extraction_pool_size = max(EXTRACTION_NUM_THREADS_PER_WORKER, 10)
+
+        GraphRAGConfig.extraction_llm = _picklable_bedrock_converse_cls()(
+            model=BEDROCK_MODEL_ARN,
+            temperature=0.0,
+            max_tokens=EXTRACTION_MAX_TOKENS,
+            timeout=EXTRACTION_TIMEOUT_SECONDS,
+            max_retries=EXTRACTION_MAX_ATTEMPTS,
+            region_name=AWS_REGION,
+            botocore_config=Config(
+                max_pool_connections=extraction_pool_size,
+                connect_timeout=EXTRACTION_CONNECT_TIMEOUT_SECONDS,
+                read_timeout=EXTRACTION_TIMEOUT_SECONDS,
+                retries={"max_attempts": EXTRACTION_MAX_ATTEMPTS, "mode": "standard"},
+                # Supplying a Config replaces upstream's entirely, which would drop
+                # the marker it sets here.
+                user_agent_extra="x-client-framework:llama_index",
+            ),
+        )
     GraphRAGConfig.local_output_dir = CHECKPOINT_DIR
     if USE_BATCH_INFERENCE:
         GraphRAGConfig.extraction_batch_size = EXTRACTION_BATCH_SIZE
@@ -767,6 +1075,10 @@ def _setup_graphrag(tenant_id: str):
         delete_prev_versions=DELETE_PREV_VERSIONS,
         bedrock_model=BEDROCK_MODEL_ARN or "(toolkit default)",
         extraction_max_tokens=EXTRACTION_MAX_TOKENS,
+        extraction_timeout_seconds=EXTRACTION_TIMEOUT_SECONDS,
+        extraction_connect_timeout_seconds=EXTRACTION_CONNECT_TIMEOUT_SECONDS,
+        extraction_max_attempts=EXTRACTION_MAX_ATTEMPTS,
+        extraction_pool_size=max(EXTRACTION_NUM_THREADS_PER_WORKER, 10),
         chunk_size="256 (toolkit default)",
     )
     return graph_store_uri, vector_store_uri

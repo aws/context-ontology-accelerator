@@ -10,6 +10,7 @@ human-reviewable constraints and SHACL Turtle output. Three sources feed it:
   - user_added: manual NL rules typed by the user
 """
 
+import logging
 from enum import StrEnum
 
 from pydantic import BaseModel
@@ -33,10 +34,11 @@ from coa_ontology.inducer.strategies.base import (
 from coa_ontology.inducer.strategies.base import simple_fk_constraints as _simple_fk_constraints
 from coa_ontology.inducer.strategies.base import table_identity as _table_identity
 from coa_ontology.inducer.strategies.base import to_camel as _to_camel
-from coa_ontology.inducer.strategies.base import to_pascal as _to_pascal
 from coa_ontology.inducer.strategies.base import xsd_for as _xsd_for
 
 SH = Namespace("http://www.w3.org/ns/shacl#")
+
+_log = logging.getLogger(__name__)
 
 
 # ── Data models ───────────────────────────────────────────────────────────
@@ -189,8 +191,23 @@ def generate_config_from_db(tables, uri_prefix: str) -> ConstraintConfig:
                 target_id = _resolve_fk_target_identity(table, fk_target_name, ref_index, target_ds)
                 if target_id in pascal_by_id:
                     target_local = pascal_by_id[target_id]
-                elif fk_target_name not in ambiguous_names:
-                    target_local = _to_pascal(fk_target_name)
+                elif fk_target_name in ambiguous_names:
+                    # Ambiguous bare target: no single class to assert sh:class
+                    # against — the column falls through to the datatype
+                    # constraint, matching the ontology and the mapping.
+                    target_local = None
+                else:
+                    # Genuinely outside this run: the target table is not
+                    # minted this run. A sh:class pointing at a bare ind:<Target>
+                    # that is never declared asserts a class-typed reference the
+                    # mapping emits as a literal — a false-positive violation on
+                    # every row. Degrade to the datatype constraint, mirroring the
+                    # ontology's range and the R2RML parentTriplesMap.
+                    _log.warning(
+                        "fk_target_out_of_run_degraded_to_literal",
+                        extra={"referrer": table.name, "target": fk_target_name},
+                    )
+                    target_local = None
                 if target_local is not None:
                     resolved.append((f"{ns_str}{target_local}", target_local, fk_target_name, target_col, target_ds))
 

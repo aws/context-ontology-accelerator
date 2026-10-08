@@ -74,6 +74,7 @@ from coa_sources.database.databricks import (
     delete_config_parameter,
 )
 from coa_sources.database.glue_ownership import release_platform_catalog
+from coa_sources.database.rescan_backup import BACKUP_SCAN_JOB_FIELD
 from coa_sources.database.sub_types import (
     CONNECTOR_BACKED_SUB_TYPES,
     FEDERATED_TEARDOWN_SUB_TYPES,
@@ -307,6 +308,42 @@ def _within_event_cooldown(item: dict[str, Any]) -> bool:
     except ValueError:
         return False
     return (datetime.now(UTC) - last_dt).total_seconds() < _EVENT_RESCAN_COOLDOWN_S
+
+
+# Source-row attribute the re-scan trigger writes when it takes the scan lock:
+# the status the source was in before the scan it is starting, carried unchanged
+# through retries from SCAN_FAILED. See ``_rescan_origin``.
+_PRE_SCAN_STATUS_FIELD = "preScanStatus"
+
+
+def _rescan_origin(item: dict[str, Any]) -> str:
+    """Status a database source was in before the scans now being retried began.
+
+    For any status but SCAN_FAILED that is the current status. SCAN_FAILED alone
+    does not say what failed: a failed first scan leaves nothing curated, but a
+    failed re-scan of an approved source leaves its curated assets live, and
+    retrying that one as a first scan revises every asset with fresh, uncurated
+    metadata. So a SCAN_FAILED source answers with the origin the failed
+    run recorded, and a run that retries a SCAN_FAILED source records that same
+    origin again, so a chain of failed retries keeps it.
+
+    A row that failed before the origin was recorded falls back to
+    ``tablesApproved``. Only steward approvals raise it, a failed discovery leaves
+    it as it was, and a first scan starts it at 0, so a count above zero means a
+    re-scan of an approved source is what failed. That row cannot tell whether
+    the failed re-scan started from an open review, so it is treated as APPROVED.
+    """
+    status = str(item.get("status", ""))
+    if status != SourceStatus.SCAN_FAILED:
+        return status
+    recorded = item.get(_PRE_SCAN_STATUS_FIELD)
+    if recorded:
+        return str(recorded)
+    try:
+        tables_approved = int(item.get("tablesApproved") or 0)
+    except (TypeError, ValueError):
+        tables_approved = 0
+    return SourceStatus.APPROVED if tables_approved > 0 else SourceStatus.SCAN_FAILED
 
 
 def _source_id_from_item(item: dict[str, Any]) -> str:
@@ -1509,8 +1546,9 @@ def _handle_rescan(
     # overwrites that blob, so every review decision and edit made inside the
     # open window is dropped — see the merge path in
     # ``pipeline/discovery_handler.py``. Every other allowed status discards
-    # nothing: from APPROVED the live assets already ARE the baseline, and
-    # SCAN_FAILED has no review to lose. Checked before any write below, so a
+    # nothing: from APPROVED the live assets already ARE the baseline, and a
+    # SCAN_FAILED source has no open review (a retry of a failed re-scan keeps
+    # the merge path, see ``_rescan_origin``). Checked before any write below, so a
     # refused call leaves the source exactly as it was.
     if (
         source_type == SourceType.DATABASE
@@ -1535,11 +1573,23 @@ def _handle_rescan(
 
     # A re-scan of an already-approved (or previously drift-reviewed) source is
     # non-destructive: discovery merges onto the live assets and enrichment
-    # regenerates only PENDING items. The scan-failed recovery path is a first
-    # scan, so isRescan stays false there.
-    is_rescan = source_type == SourceType.DATABASE and current_status in (
+    # regenerates only PENDING items. A SCAN_FAILED source takes the same path
+    # when what failed was such a re-scan, and runs as a first scan only when
+    # what failed was a first scan.
+    scan_origin = _rescan_origin(item) if source_type == SourceType.DATABASE else current_status
+    is_rescan = source_type == SourceType.DATABASE and scan_origin in (
         SourceStatus.APPROVED,
         SourceStatus.RESCAN_REVIEW,
+    )
+    # Whether discovery must rebuild the approved baseline from the backup blob
+    # because the live assets are an unreviewed merge: a prior re-scan is still
+    # open in RESCAN_REVIEW, or the re-scan being retried had already written its
+    # backup when it failed (discovery records that on the row before it merges).
+    # A re-scan from APPROVED never reads the blob, so a leftover one is ignored.
+    had_open_rescan = scan_origin == SourceStatus.RESCAN_REVIEW or (
+        current_status == SourceStatus.SCAN_FAILED
+        and scan_origin == SourceStatus.APPROVED
+        and bool(item.get(BACKUP_SCAN_JOB_FIELD))
     )
 
     if source_type == SourceType.DOCUMENTS:
@@ -1628,10 +1678,17 @@ def _handle_rescan(
         # clear it and only this decides the winner. Writing the scan-job row first
         # would leave the loser's row IN_PROGRESS for good, since it never enqueues
         # and the reaper only reconciles sources that started a state machine.
+        #
+        # The same write records where this scan started, so a retry after it fails
+        # knows whether it is retrying a first scan or a re-scan (``_rescan_origin``).
+        # A re-scan starting from APPROVED also drops the backup marker: the live
+        # assets are the approved baseline then, so a blob from an earlier re-scan
+        # is stale and a retry of THIS run must not read it.
         try:
             _get_dao().update(
                 {"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"},
-                {"status": SourceStatus.SCANNING, "updatedAt": now},
+                {"status": SourceStatus.SCANNING, "updatedAt": now, _PRE_SCAN_STATUS_FIELD: scan_origin},
+                remove_fields=[BACKUP_SCAN_JOB_FIELD] if current_status == SourceStatus.APPROVED else None,
                 condition="#st = :prev",
                 condition_names={"#st": "status"},
                 condition_values={":prev": current_status},
@@ -1692,20 +1749,21 @@ def _handle_rescan(
                         "scanJobSK": scan_job_sk,
                         "namespaceId": namespace_id,
                         "scanType": "full",
-                        # Set only when re-scanning an already-approved (or drift-
-                        # review) source. Drives the merge-onto-live-assets path in
-                        # discovery and RESCAN_REVIEW routing in enrichment.
+                        # Set when re-scanning an already-approved (or drift-review)
+                        # source, including a retry of such a re-scan that failed.
+                        # Drives the merge-onto-live-assets path in discovery and
+                        # RESCAN_REVIEW routing in enrichment.
                         "isRescan": is_rescan,
-                        # True ONLY when the source was already in RESCAN_REVIEW,
-                        # i.e. a prior re-scan is still open and un-approved. Only
-                        # then are the live assets an interim merge and the S3
-                        # backup blob the approved pre-image discovery must
-                        # reconstruct from. When re-scanning from APPROVED the live
-                        # assets ARE the approved baseline; a leftover backup blob
-                        # (from before delete-on-resolve shipped, or a paged-approve
-                        # gap) is stale and must be ignored. Blob presence alone is
-                        # NOT proof of an open review — this flag is.
-                        "hadOpenRescan": current_status == SourceStatus.RESCAN_REVIEW,
+                        # True ONLY when the live assets are an interim, un-approved
+                        # merge: the source was already in RESCAN_REVIEW, or the
+                        # failed re-scan being retried had written its backup. Only
+                        # then is the S3 backup blob the approved pre-image discovery
+                        # must reconstruct from. When re-scanning from APPROVED the
+                        # live assets ARE the approved baseline; a leftover backup
+                        # blob (from before delete-on-resolve shipped, or a paged-
+                        # approve gap) is stale and must be ignored. Blob presence
+                        # alone is NOT proof of an open review — this flag is.
+                        "hadOpenRescan": had_open_rescan,
                     }
                 ),
             )

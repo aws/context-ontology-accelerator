@@ -15,6 +15,9 @@ import re
 from unittest.mock import MagicMock
 
 import pytest
+import sqlglot
+import sqlglot.errors
+import structlog.testing
 from coa_serve.clients.redshift_data import (
     RedshiftDataAPIExecutor,
     RedshiftQueryError,
@@ -98,6 +101,72 @@ class TestAwsDataCatalogRewrite:
         n = _norm(out)
         # Both real tables qualified; the CTE 't' reference is not.
         assert n.count("awsdatacatalog") == 2
+
+
+@pytest.mark.unit
+class TestFailureLogsOmitSql:
+    """CWE-532: failure logs must not carry the SQL text, which
+    can contain caller-supplied literal values (potential PII)."""
+
+    _SQL = "SELECT * FROM claims WHERE email = 'alice@example.com'"
+
+    @classmethod
+    def _boom(cls, *_args, **_kwargs):
+        # sqlglot error messages echo a snippet of the offending SQL.
+        raise sqlglot.errors.ParseError(f"Invalid expression. Line 1.\n  {cls._SQL}")
+
+    def test_transpile_failure_logs_length_not_sql(self, monkeypatch):
+        monkeypatch.setattr("coa_serve.clients.redshift_data.sqlglot.transpile", self._boom)
+        with structlog.testing.capture_logs() as logs:
+            assert RedshiftDataAPIExecutor._transpile_to_redshift(self._SQL) == self._SQL
+        event = next(log for log in logs if log["event"] == "redshift_trino_transpile_failed")
+        assert "sql" not in event
+        assert event["sql_len"] == len(self._SQL)
+        assert event["error_type"] == "ParseError"
+        assert "alice@example.com" not in repr(logs)
+
+    def test_rewrite_parse_failure_logs_length_not_sql(self, monkeypatch):
+        monkeypatch.setattr("coa_serve.clients.redshift_data.sqlglot.parse_one", self._boom)
+        with structlog.testing.capture_logs() as logs:
+            assert RedshiftDataAPIExecutor._qualify_awsdatacatalog(self._SQL, "db") == self._SQL
+        event = next(log for log in logs if log["event"] == "redshift_awsdatacatalog_rewrite_parse_failed")
+        assert "sql" not in event
+        assert event["sql_len"] == len(self._SQL)
+        assert event["error_type"] == "ParseError"
+        assert "alice@example.com" not in repr(logs)
+
+    def test_rewrite_render_failure_logs_type_not_message(self, monkeypatch):
+        monkeypatch.setattr(sqlglot.exp.Expression, "sql", self._boom)
+        with structlog.testing.capture_logs() as logs:
+            assert RedshiftDataAPIExecutor._qualify_awsdatacatalog(self._SQL, "db") == self._SQL
+        event = next(log for log in logs if log["event"] == "redshift_awsdatacatalog_rewrite_render_failed")
+        assert "error" not in event
+        assert event["error_type"] == "ParseError"
+        assert "alice@example.com" not in repr(logs)
+
+
+@pytest.mark.unit
+class TestNonSqlglotErrorsPropagate:
+    """Only sqlglot failures fall back to the input SQL; a genuine bug must surface."""
+
+    @staticmethod
+    def _bug(*_args, **_kwargs):
+        raise AttributeError("bug")
+
+    def test_transpile_non_sqlglot_error_propagates(self, monkeypatch):
+        monkeypatch.setattr("coa_serve.clients.redshift_data.sqlglot.transpile", self._bug)
+        with pytest.raises(AttributeError):
+            RedshiftDataAPIExecutor._transpile_to_redshift("SELECT id FROM claims")
+
+    def test_rewrite_parse_non_sqlglot_error_propagates(self, monkeypatch):
+        monkeypatch.setattr("coa_serve.clients.redshift_data.sqlglot.parse_one", self._bug)
+        with pytest.raises(AttributeError):
+            RedshiftDataAPIExecutor._qualify_awsdatacatalog("SELECT id FROM claims", "db")
+
+    def test_rewrite_render_non_sqlglot_error_propagates(self, monkeypatch):
+        monkeypatch.setattr(sqlglot.exp.Expression, "sql", self._bug)
+        with pytest.raises(AttributeError):
+            RedshiftDataAPIExecutor._qualify_awsdatacatalog("SELECT id FROM claims", "db")
 
 
 @pytest.mark.unit

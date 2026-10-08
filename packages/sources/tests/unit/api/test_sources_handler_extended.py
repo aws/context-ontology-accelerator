@@ -1207,9 +1207,10 @@ class TestHandleDeleteCounter:
 class TestHandleRescan:
     def test_rescan_database_source_happy_path(self):
         mock_dao = MagicMock()
-        # SCAN_FAILED is the recovery-path entry — a first scan retried after
-        # failure. isRescan stays false so discovery does not take the merge
-        # path (there is nothing curated to preserve on a scan-failed source).
+        # SCAN_FAILED with no recorded origin and nothing approved is a first scan
+        # retried after failure. isRescan stays false so discovery does not take the
+        # merge path (there is nothing curated to preserve). A retry of a failed
+        # RE-scan keeps the merge path: test_rescan_retry_of_failed_rescan.py.
         mock_dao.get.return_value = _db_source_item("SCAN_FAILED")
         mock_scan_dao = dao_double()
         mock_sqs = MagicMock()

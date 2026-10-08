@@ -21,16 +21,21 @@ use com.amazon.semanticcontext.common#ValidationError
 @length(min: 3, max: 64)
 string NamespaceName
 
-/// Display name for a namespace.
+/// Display name for a namespace. Angle brackets and control characters are rejected.
+@pattern("^[^<>\\x00-\\x1F\\x7F]+$")
 @length(min: 1, max: 256)
 string NamespaceDisplayName
 
-/// Namespace description.
+/// Namespace description. Angle brackets and control characters other than
+/// tab and newline are rejected.
+@pattern("^[^<>\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\\x7F]*$")
 @length(min: 1, max: 1024)
 string NamespaceDescription
 
-/// Owner email address.
-@pattern("^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$")
+/// Owner email address. The local part allows the RFC 5322 atext characters
+/// except # | and backtick (the owner also becomes a grant principalId).
+@pattern("^[A-Za-z0-9!$%&'*+/=?^_{}~-]+(\\.[A-Za-z0-9!$%&'*+/=?^_{}~-]+)*@[A-Za-z0-9-]+(\\.[A-Za-z0-9-]+)*\\.[A-Za-z]{2,63}$")
+@length(min: 6, max: 254)
 string OwnerEmail
 
 // ──────────────────────────────────────────────
@@ -275,10 +280,15 @@ operation UpdateNamespace {
         @httpLabel
         namespaceId: Uuid
 
-        /// New human-readable display name for the namespace.
+        /// New human-readable display name for the namespace. An empty string
+        /// clears it (the edit form sends "" for a cleared field).
+        @pattern("^[^<>\\x00-\\x1F\\x7F]*$")
+        @length(max: 256)
         displayName: String
 
-        /// New description for the namespace.
+        /// New description for the namespace. An empty string clears it.
+        @pattern("^[^<>\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\\x7F]*$")
+        @length(max: 1024)
         description: String
     }
 

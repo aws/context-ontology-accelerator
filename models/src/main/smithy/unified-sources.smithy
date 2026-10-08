@@ -92,7 +92,12 @@ integer Port
 @length(min: 1, max: 256)
 string DatabaseName
 
-/// Regex filter pattern for schema/table filtering.
+/// Schema/table filter: one or more shell globs, separated by `|` or `,`, each
+/// matched against the WHOLE name. `*` matches any characters, `?` one
+/// character, `[abc]` one of a set. Examples: `sales_*`, `public|analytics`,
+/// `constructor*,results`. Not a regular expression — `^`, `$` and `.*` are
+/// matched literally. The one exception is a Glue Data Catalog source's
+/// `tableFilter`, which is passed to Glue as its native expression syntax.
 @length(min: 1, max: 1024)
 string FilterPattern
 
@@ -219,8 +224,12 @@ structure JdbcConfiguration {
     @required
     databaseName: DatabaseName
 
+    /// Only schemas matching this glob filter are discovered.
     schemaFilter: FilterPattern
 
+    /// Schemas matching this glob filter are excluded, IN ADDITION TO the
+    /// engine's system schemas (e.g. `pg_catalog`, `information_schema`), which
+    /// are always excluded.
     schemaExcludeFilter: FilterPattern
 
     tableFilter: FilterPattern
@@ -262,8 +271,11 @@ structure GlueConfiguration {
     @required
     databaseName: DatabaseName
 
+    /// Passed to Glue `GetTables` as its native `Expression` (a regular
+    /// expression) — the one filter that is not a glob.
     tableFilter: FilterPattern
 
+    /// Tables matching this glob filter are excluded.
     tableExcludeFilter: FilterPattern
 
     crossAccountRoleArn: IamRoleArn
@@ -2149,6 +2161,16 @@ structure GetSourceScanJobOutput {
     /// A signal for diagnosis, not an inventory — `tablesFailed` is the exact
     /// figure and this list may be shorter than it.
     failedTables: FailedTableList
+
+    /// Warnings about the source's filters, absent when none. Set when a filter
+    /// that looks like a regular expression matched nothing — filters are globs,
+    /// so the scan succeeded without the intended filtering.
+    filterWarnings: FilterWarningList
+}
+
+/// Plain-language warnings about a source's schema/table filters.
+list FilterWarningList {
+    member: String
 }
 
 /// Qualified `database.table` names of tables a scan listed but could not read.

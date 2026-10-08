@@ -166,6 +166,27 @@ class TestDeserializeForm:
         assert cust.business_metadata.description == "customer ref"
         assert cust.distinct_values == ["1", "2"]
 
+    def test_deserialize_form_unrepresentable_fk_target_survives_roundtrip(self):
+        # Discovery records a dropped key's real target on its column; enrichment
+        # reads the table back from this form, so the marker must survive.
+        table = Table(
+            name="orders",
+            database="sales",
+            columns=[
+                Column(name="customer_id", data_type="int", unrepresentable_fk_target="db.crm.customers"),
+                Column(name="id", data_type="int"),
+            ],
+        )
+        restored = deserialize_form(serialize_form(table))
+        assert [(c.name, c.unrepresentable_fk_target) for c in restored.columns] == [
+            ("customer_id", "db.crm.customers"),
+            ("id", ""),
+        ]
+
+    def test_deserialize_form_legacy_column_without_marker_defaults_empty(self):
+        payload = {"columns": json.dumps([{"name": "c", "data_type": "int"}])}
+        assert deserialize_form(payload).columns[0].unrepresentable_fk_target == ""
+
     def test_data_source_id_override_takes_precedence(self):
         payload = serialize_form(_rich_table())
         restored = deserialize_form(payload, data_source_id="override-ds")

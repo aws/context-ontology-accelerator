@@ -2,8 +2,8 @@
 #   docker build -f packages/context-manager/Dockerfile .
 # Pin to digest to prevent supply-chain attacks via tag mutation. The pin is for
 # supply-chain integrity only, NOT patch currency — see the apt-get upgrade below.
-# python:3.12-slim, digest resolved from the tag on 2026-09-01 (linux/arm64).
-FROM --platform=linux/arm64 public.ecr.aws/docker/library/python:3.12-slim@sha256:f77ac9e44ae96ef2c90b8053ea08c31f8be030f824196b0ae4db6d462c84e51f
+# python:3.12-slim, digest resolved from the tag on 2026-10-06 (linux/arm64).
+FROM --platform=linux/arm64 public.ecr.aws/docker/library/python:3.12-slim@sha256:05cda9777409a9c3ffddd94a4c476b79f0769a0b4857f0c7ed9226b6800b0d6f
 
 WORKDIR /app
 

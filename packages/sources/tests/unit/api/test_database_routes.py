@@ -1625,6 +1625,12 @@ class TestScanJobDegradationSignal:
         assert body["tablesFailed"] == 2
         assert body["failedTables"] == ["widgets.bad", "widgets.worse"]
 
+    def test_reports_filter_warnings_and_omits_them_when_absent(self):
+        _, body = self._get({"status": "COMPLETED", "filterWarnings": ["table_filter matched nothing."]})
+        assert body["filterWarnings"] == ["table_filter matched nothing."]
+        _, clean = self._get({"status": "COMPLETED"})
+        assert "filterWarnings" not in clean
+
     # Decimal, not int, because that is what DynamoDB actually returns through
     # boto3's resource interface — and api_response serialises with
     # `default=str`, so an uncoerced Decimal ships as the JSON STRING "2". The

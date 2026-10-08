@@ -17,6 +17,8 @@ from coa_control_plane_server.models.update_namespace_request_content import (
 )
 from pydantic import ValidationError
 
+from .validation_errors import format_validation_error
+
 logger = structlog.get_logger(__name__)
 
 _ns_dao: DynamoDBDAO | None = None
@@ -48,8 +50,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     try:
         req = UpdateNamespaceRequestContent.model_validate(body)
     except ValidationError as exc:
-        msg = exc.errors()[0]["msg"] if exc.errors() else str(exc)
-        return api_response(400, {"message": msg})
+        return api_response(400, {"message": format_validation_error(exc)})
 
     # Verify namespace exists
     item = _get_ns_dao().get({"PK": f"NS#{namespace_id}", "SK": "METADATA"})

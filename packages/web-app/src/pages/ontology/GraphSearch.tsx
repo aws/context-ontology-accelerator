@@ -773,6 +773,17 @@ export function GraphSearchPage() {
   const [ontologyById, setOntologyById] = useState<Map<string, ListedOntology>>(
     new Map(),
   );
+  // The List view's ontology filter, defaulted from the registry (see
+  // defaultOntologyFilterValue), and the namespace whose registry load has
+  // settled. The class query waits for it: querying first loads and pages
+  // UNFILTERED rows, then the default filter swaps the result set and resets
+  // the page — discarding a page the user has already chosen. Keying on the
+  // namespace means a namespace switch is unsettled from its first render,
+  // before the load effect runs, so the old namespace's filter is never sent.
+  const [ontologyFilter, setOntologyFilter] = useState(ALL_ONTOLOGIES_VALUE);
+  const [registrySettledFor, setRegistrySettledFor] = useState<string>();
+  const ontologyRegistrySettled =
+    namespaceId !== undefined && registrySettledFor === namespaceId;
 
   // Attributes (datatype properties) grouped by class IRI, from the ontology
   // overviews the seed fetches — this is what the graph's hover overlay reads.
@@ -1049,19 +1060,32 @@ export function GraphSearchPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [view, hasSearched, namespaceId, ontologyById, graphOntologyId]);
 
-  // Load the ontology registry once to resolve names + induced flag for the
-  // List view's per-ontology grouping. Best-effort: on failure the list falls
-  // back to ontology_id local-names with no induced marker.
+  // Load the ontology registry once per namespace: it resolves names + the
+  // induced flag for the List view's per-ontology grouping, sets the default
+  // ontology filter, and settles the gate the class query waits on.
+  // Best-effort: on failure the list falls back to every ontology, shown by
+  // ontology_id local-names with no induced marker.
   useEffect(() => {
     if (!namespaceId) return;
     let cancelled = false;
+    // A reload — e.g. back to a namespace that settled earlier — holds the
+    // query and the filter control again until its own default lands.
+    setRegistrySettledFor(undefined);
     listOntologies(apiClient, namespaceId)
       .then((records) => {
         if (cancelled) return;
-        setOntologyById(new Map(records.map((r) => [r.ontologyId, r])));
+        const byId = new Map(records.map((r) => [r.ontologyId, r]));
+        setOntologyById(byId);
+        // Defaulted here, once per registry load. The filter control is
+        // disabled until then, so this never overwrites a user's choice.
+        setOntologyFilter(defaultOntologyFilterValue(byId));
+        setRegistrySettledFor(namespaceId);
       })
       .catch(() => {
-        // Best-effort: registry enriches ontology names in the List view.
+        if (cancelled) return;
+        setOntologyById(new Map());
+        setOntologyFilter(ALL_ONTOLOGIES_VALUE);
+        setRegistrySettledFor(namespaceId);
       });
     return () => {
       cancelled = true;
@@ -1420,19 +1444,6 @@ export function GraphSearchPage() {
     () => buildOntologyFilterOptions(ontologyById),
     [ontologyById],
   );
-  const [ontologyFilter, setOntologyFilter] = useState(ALL_ONTOLOGIES_VALUE);
-  // Apply the induced-first default once the registry has loaded. A ref latches
-  // it so a user's later choice of "All ontologies" isn't overwritten when the
-  // registry map identity changes.
-  const ontologyFilterDefaultedRef = useRef(false);
-  useEffect(() => {
-    ontologyFilterDefaultedRef.current = false;
-  }, [namespaceId]);
-  useEffect(() => {
-    if (ontologyFilterDefaultedRef.current || ontologyById.size === 0) return;
-    ontologyFilterDefaultedRef.current = true;
-    setOntologyFilter(defaultOntologyFilterValue(ontologyById));
-  }, [ontologyById]);
   const selectedOntologyOption =
     ontologyFilterOptions.find((o) => o.value === ontologyFilter) ??
     ontologyFilterOptions[0];
@@ -1453,7 +1464,7 @@ export function GraphSearchPage() {
     ontologyIdFilter,
     // Only the List view renders these rows; the Graph view has its own
     // sample/search path, so don't fetch a chunk + COUNT it won't use.
-    view === "list",
+    view === "list" && ontologyRegistrySettled,
   );
 
   // Flatten the loaded server pages into display rows, enriched with ontology
@@ -1534,7 +1545,8 @@ export function GraphSearchPage() {
   }, [classRows, listPageIndex]);
 
   const listLoading = isListPageLoading({
-    initialLoading: classesLoading,
+    // A query held for the default filter is loading, not an empty namespace.
+    initialLoading: classesLoading || !ontologyRegistrySettled,
     fetching: classesFetching,
     loadedCount: loadedHits.length,
     pageRowCount: pagedClasses.length,
@@ -1672,6 +1684,7 @@ export function GraphSearchPage() {
                     )
                   }
                   options={ontologyFilterOptions}
+                  disabled={!ontologyRegistrySettled}
                   ariaLabel="Restrict classes by ontology"
                   expandToViewport
                 />

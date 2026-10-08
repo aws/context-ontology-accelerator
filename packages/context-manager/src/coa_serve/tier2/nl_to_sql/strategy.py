@@ -37,7 +37,7 @@ from ...clients.base import GraphClient, QueryExecutor
 from ...exceptions import AccessDeniedError, AmbiguousReferenceError
 from ...identity import display_principal
 from ...step_ids import StepId
-from ..sql_firewall import FirewallResult, SQLFirewall, UnsafeSQLError
+from ..sql_firewall import FirewallResult, SQLFirewall, UnsafeSQLError, tables_visible_to
 from ..strategy import StrategyContext, StrategyOption, StrategyResult, capped_max_rows
 from ..table_qualifier import PreparedSQL, SourceLookup, prepare_execution_sql
 from ..tools import OntologyGraphTool
@@ -386,7 +386,10 @@ class NLtoSQLStrategy:
 
         # Consolidate sub-steps into single t2.sql.generate/success step (E10)
         confidence = nl_to_sql_result.confidence
-        tables = nl_to_sql_result.expanded_tables or nl_to_sql_result.retrieved_tables or []
+        # The trace reaches the caller (SSE and the response), so list only the
+        # tables the grant lets them see: retrieval and the FK walk can surface
+        # tables outside ``tableAllowlist`` that the SQL never touches.
+        tables = tables_visible_to(nl_to_sql_result.expanded_tables or nl_to_sql_result.retrieved_tables, profile)
         trace.record(
             StepId.T2_SQL_GENERATE,
             "success",
@@ -473,7 +476,9 @@ class NLtoSQLStrategy:
                     expanded_tables=nl_to_sql_result.expanded_tables,
                     data_source_id=nl_to_sql_result.data_source_id or "",
                 )
-                tables = nl_to_sql_result.expanded_tables or nl_to_sql_result.retrieved_tables or []
+                tables = tables_visible_to(
+                    nl_to_sql_result.expanded_tables or nl_to_sql_result.retrieved_tables, profile
+                )
 
                 # Decide whether a ZERO-row result is a legitimate, deterministic
                 # answer or a signal worth one corrective regeneration. A

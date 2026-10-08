@@ -58,13 +58,23 @@ class _FakeGraphClient:
     is targeted.
     """
 
-    def __init__(self, node_rows, edge_rows):
+    def __init__(self, node_rows, edge_rows, graph_iris=None):
         self._node_rows = node_rows
         self._edge_rows = edge_rows
+        # Named-graph IRIs returned by the owl:Ontology resolve query. Default to a
+        # single graph under the fixture prefix so the scoped (constant-GRAPH) path
+        # is the one exercised; pass [] to simulate a resolve that finds nothing
+        # (the source then falls back to the STRSTARTS prefix filter).
+        self._graph_iris = (
+            ["https://ontology-workbench.local/acme-namespace/onto-1"] if graph_iris is None else graph_iris
+        )
         self.queries: list[str] = []
 
     async def query(self, sparql: str):
         self.queries.append(sparql)
+        # The graph-IRI resolve query (binds ?g, anchored on owl:Ontology).
+        if "owl:Ontology" in sparql:
+            return [{"g": g} for g in self._graph_iris]
         if "?classLabel" in sparql:
             return list(self._node_rows)
         if "?propLabel" in sparql:
@@ -143,15 +153,31 @@ class TestOntologyGraphSource:
         assert onto.edge_types == EXPECTED_EDGE_TYPES
         assert onto.edge_map == EXPECTED_EDGE_MAP
 
-    async def test_queries_namespace_ontology_graphs_by_prefix(self):
-        """Queries the namespace's per-ontology graphs via GRAPH ?g + STRSTARTS on
-        the namespace prefix (matching GraphTraverser + the ontology write side),
-        NOT a hardcoded single :published graph (which nothing writes → empty)."""
+    async def test_scopes_queries_to_resolved_graph_iris(self):
+        """Scopes the type queries to the namespace's resolved graph IRIs with a
+        constant GRAPH <iri> (pushed into the index scan), NOT a cluster-wide
+        GRAPH ?g + STRSTARTS filter. One cheap owl:Ontology resolve runs first."""
         source, client = _graph_source_matching_fixture()
         await source.load("acme-namespace")
-        assert len(client.queries) == 2
-        for sparql in client.queries:
-            assert "GRAPH ?g" in sparql
+        # 3 queries: 1 graph-IRI resolve (owl:Ontology) + 2 scoped type queries.
+        assert len(client.queries) == 3
+        resolve = client.queries[0]
+        assert "owl:Ontology" in resolve
+        for sparql in client.queries[1:]:
+            assert "GRAPH <https://ontology-workbench.local/acme-namespace/onto-1>" in sparql
+            assert "GRAPH ?g" not in sparql  # scoped, not the cluster-wide form
+
+    async def test_falls_back_to_prefix_filter_when_resolve_finds_no_graphs(self):
+        """When the graph-IRI resolve yields nothing, degrade to the GRAPH ?g +
+        STRSTARTS prefix filter (slow but correct) rather than failing the lookup."""
+        node_rows = [{"classLabel": "Company"}]
+        edge_rows = [{"propLabel": "WORKS_FOR", "domainLabel": "Person", "rangeLabel": "Company"}]
+        client = _FakeGraphClient(node_rows, edge_rows, graph_iris=[])
+        source = OntologyGraphSource(client, graph_uri_template="https://ontology-workbench.local/{namespace}")
+        onto = await source.load("acme-namespace")
+        assert onto.node_types == ("Company",)
+        # resolve + 2 fallback type queries; the type queries use the prefix filter.
+        for sparql in client.queries[1:]:
             assert 'STRSTARTS(STR(?g), "https://ontology-workbench.local/acme-namespace/")' in sparql
 
     async def test_empty_ontology_when_no_graph_uri_template(self):
@@ -174,6 +200,92 @@ class TestOntologyGraphSource:
         onto = await source.load("ns")
         assert "RELATED_TO" in onto.edge_types
         assert all(edge != "RELATED_TO" for edge, _, _ in onto.edge_map)
+
+    async def test_slow_lookup_times_out_fast_and_raises(self, monkeypatch):
+        """A hung graph query must fail fast and RAISE, not report an empty ontology.
+
+        The lookup is one preparatory step inside the deep-reasoning loop; a slow
+        Neptune must NOT burn a large slice of the shared budget. With a tiny
+        timeout, a client that hangs past it raises ``TimeoutError`` quickly
+        (instead of blocking for the full client-level read-timeout x retry, ~16s
+        in production). A timeout is a lookup FAILURE, kept distinct from a
+        genuinely empty ontology (Req 3.10 empty vs 3.11 failed) — the tool, not
+        this source, degrades the failure to a non-fatal "failed" result so the
+        soft-prior traversal still runs while the trace shows the real outcome.
+        """
+        import asyncio as _asyncio
+        import time as _time
+
+        monkeypatch.setenv("DEEP_REASONING_ONTOLOGY_TIMEOUT_S", "0.05")
+
+        class _HangingGraphClient:
+            async def query(self, sparql: str):
+                await _asyncio.sleep(5)  # far longer than the 0.05s cap
+                return []
+
+        source = OntologyGraphSource(
+            _HangingGraphClient(), graph_uri_template="https://ontology-workbench.local/{namespace}"
+        )
+        start = _time.perf_counter()
+        with pytest.raises(TimeoutError):
+            await source.load("acme-namespace")
+        elapsed = _time.perf_counter() - start
+
+        assert elapsed < 2, f"lookup should fail fast, took {elapsed:.2f}s"
+
+    async def test_resolve_times_out_and_falls_back_to_prefix_filter(self, monkeypatch):
+        """A hung graph-IRI resolve degrades to the prefix filter WITHIN the budget.
+
+        The resolve is a cheap optimisation and gets its own short timeout so one
+        stuck resolve cannot eat the whole lookup budget and leave no time for the
+        fallback. When the resolve hangs, ``_resolve_graph_iris`` returns ``None``
+        and the two type queries run with the cluster-wide ``STRSTARTS`` prefix
+        filter — producing a real ontology instead of nothing.
+        """
+        import asyncio as _asyncio
+
+        # Keep the OUTER lookup budget generous so this test proves the INNER resolve
+        # timeout (not the outer one) is what triggers the fallback.
+        monkeypatch.setenv("DEEP_REASONING_ONTOLOGY_TIMEOUT_S", "6")
+        monkeypatch.setattr("coa_serve.tier3.agentic.ontology.source._GRAPH_IRI_RESOLVE_TIMEOUT_S", 0.05)
+
+        class _HangingResolveClient:
+            def __init__(self):
+                self.queries: list[str] = []
+
+            async def query(self, sparql: str):
+                self.queries.append(sparql)
+                if "owl:Ontology" in sparql:  # the resolve query — hang it
+                    await _asyncio.sleep(5)
+                    return []
+                if "?classLabel" in sparql:
+                    return [{"classLabel": "Company"}]
+                if "?propLabel" in sparql:
+                    return [{"propLabel": "WORKS_FOR", "domainLabel": "Person", "rangeLabel": "Company"}]
+                raise AssertionError(f"unexpected SPARQL: {sparql!r}")
+
+        client = _HangingResolveClient()
+        source = OntologyGraphSource(client, graph_uri_template="https://ontology-workbench.local/{namespace}")
+        onto = await source.load("acme-namespace")
+
+        # Fallback ran: the type queries resolved a real ontology despite the hung resolve.
+        assert "Company" in onto.node_types
+        assert "WORKS_FOR" in onto.edge_types
+        # The two type queries used the prefix filter (no constant GRAPH <iri> inlined).
+        type_queries = [q for q in client.queries if "owl:Ontology" not in q]
+        assert len(type_queries) == 2
+        assert all("STRSTARTS" in q for q in type_queries)
+
+    async def test_timeout_env_floored_at_one_second(self, monkeypatch):
+        """The fast-fail timeout can be tuned but never disabled (floored at 1s)."""
+        from coa_serve.tier3.agentic.ontology.source import _ontology_lookup_timeout_s
+
+        monkeypatch.setenv("DEEP_REASONING_ONTOLOGY_TIMEOUT_S", "0")
+        assert _ontology_lookup_timeout_s() == 1.0
+        monkeypatch.setenv("DEEP_REASONING_ONTOLOGY_TIMEOUT_S", "not-a-number")
+        assert _ontology_lookup_timeout_s() == 6.0
+        monkeypatch.delenv("DEEP_REASONING_ONTOLOGY_TIMEOUT_S", raising=False)
+        assert _ontology_lookup_timeout_s() == 6.0
 
 
 # ── Shape parity between the two sources (Req 3.6) ──────────────────
