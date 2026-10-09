@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from enum import Enum
 
 import structlog
 from coa_common.domain_models import ReviewStatus, Table
@@ -98,6 +99,16 @@ class DataSourceLookup:
             if col.name.lower() == column_name.lower():
                 return col.data_type
         return None
+
+
+class LookupNotProvided(Enum):
+    """Marker distinguishing omitted lookup injection from an explicit ``None``."""
+
+    TOKEN = 0
+
+
+LOOKUP_NOT_PROVIDED = LookupNotProvided.TOKEN
+LookupArgument = DataSourceLookup | None | LookupNotProvided
 
 
 class OntologyLookup:

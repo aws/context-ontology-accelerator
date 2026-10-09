@@ -5,6 +5,7 @@ import { describe, it, expect } from "vitest";
 import {
   buildClassMatchResolver,
   classToTableFromR2rml,
+  conceptMatchKey,
   parseR2rmlByClass,
   parseConceptMatches,
   parseConceptMatchesEnvelope,
@@ -150,6 +151,101 @@ ind:TriplesMap_public.orders a rr:TriplesMap ;
     rr:template "http://ex.org/ind#Orders/{id}" .
 `;
 
+// Backend-emitted R2RML for two datasources that both expose
+// ``public.accounts``. The class suffix is derived from the full table identity;
+// the exact join dimensions are carried separately as datasource/schema/table.
+const COLLIDING_TABLE_R2RML = `
+@prefix ind: <http://example.test/induced#> .
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix scl: <http://coa.amazon.com/vocab/coa#> .
+
+ind:TriplesMap_Accounts a rr:TriplesMap ;
+    scl:datasourceId "DS#finance" ;
+    scl:sourceSchema "public" ;
+    rr:logicalTable [ rr:tableName "\\"public__aad6897a\\".\\"accounts\\"" ] ;
+    rr:subjectMap <http://example.test/induced#TriplesMap_Accounts/SubjectMap> .
+
+ind:TriplesMap_Accounts_782870db a rr:TriplesMap ;
+    scl:datasourceId "DS#identity" ;
+    scl:sourceSchema "public" ;
+    rr:logicalTable [ rr:tableName "\\"public__782870db\\".\\"accounts\\"" ] ;
+    rr:subjectMap <http://example.test/induced#TriplesMap_Accounts_782870db/SubjectMap> .
+
+<http://example.test/induced#TriplesMap_Accounts/SubjectMap>
+    rr:class ind:Accounts .
+
+<http://example.test/induced#TriplesMap_Accounts_782870db/SubjectMap>
+    rr:class ind:Accounts_782870db .
+`;
+
+// Same datasource, same bare table name, distinct schemas. This backend output
+// has no explicit sourceSchema annotation, so the resolver must recover it from
+// the qualified rr:tableName.
+const QUALIFIED_TABLE_R2RML = `
+@prefix ind: <http://example.test/induced#> .
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix scl: <http://coa.amazon.com/vocab/coa#> .
+
+ind:TriplesMap_Accounts a rr:TriplesMap ;
+    scl:datasourceId "DS#shared" ;
+    rr:logicalTable [ rr:tableName "\\"finance\\".\\"accounts\\"" ] ;
+    rr:subjectMap <http://example.test/induced#TriplesMap_Accounts/SubjectMap> .
+
+ind:TriplesMap_Accounts_525ca243 a rr:TriplesMap ;
+    scl:datasourceId "DS#shared" ;
+    rr:logicalTable [ rr:tableName "\\"identity\\".\\"accounts\\"" ] ;
+    rr:subjectMap <http://example.test/induced#TriplesMap_Accounts_525ca243/SubjectMap> .
+
+<http://example.test/induced#TriplesMap_Accounts/SubjectMap>
+    rr:class ind:Accounts .
+
+<http://example.test/induced#TriplesMap_Accounts_525ca243/SubjectMap>
+    rr:class ind:Accounts_525ca243 .
+`;
+
+const DOTTED_TABLE_R2RML = `
+@prefix ind: <http://example.test/induced#> .
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix scl: <http://coa.amazon.com/vocab/coa#> .
+
+ind:TriplesMap_Q1Results a rr:TriplesMap ;
+    scl:datasourceId "DS#finance" ;
+    scl:sourceSchema "public.v1" ;
+    rr:logicalTable [ rr:tableName "\\"public__one\\".\\"q1.results\\"" ] ;
+    rr:subjectMap <http://example.test/induced#TriplesMap_Q1Results/SubjectMap> .
+
+ind:TriplesMap_Q1Results_two a rr:TriplesMap ;
+    scl:datasourceId "DS#identity" ;
+    scl:sourceSchema "public.v1" ;
+    rr:logicalTable [ rr:tableName "\\"public__two\\".\\"q1.results\\"" ] ;
+    rr:subjectMap <http://example.test/induced#TriplesMap_Q1Results_two/SubjectMap> .
+
+<http://example.test/induced#TriplesMap_Q1Results/SubjectMap>
+    rr:class ind:Q1Results .
+
+<http://example.test/induced#TriplesMap_Q1Results_two/SubjectMap>
+    rr:class ind:Q1Results_two .
+`;
+
+const LEGACY_COLLIDING_TABLE_R2RML = `
+@prefix ind: <http://example.test/induced#> .
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+
+ind:TriplesMap_Accounts a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "accounts" ] ;
+    rr:subjectMap <http://example.test/induced#TriplesMap_Accounts/SubjectMap> .
+
+ind:TriplesMap_Accounts_two a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "accounts" ] ;
+    rr:subjectMap <http://example.test/induced#TriplesMap_Accounts_two/SubjectMap> .
+
+<http://example.test/induced#TriplesMap_Accounts/SubjectMap>
+    rr:class ind:Accounts .
+
+<http://example.test/induced#TriplesMap_Accounts_two/SubjectMap>
+    rr:class ind:Accounts_two .
+`;
+
 describe("classToTableFromR2rml (TriplesMap-id join)", () => {
   it("maps class local names to their real table names across split blocks", () => {
     const m = classToTableFromR2rml(REAL_R2RML);
@@ -221,6 +317,7 @@ describe("parseR2rmlByClass (TriplesMap-id + POM-id join)", () => {
 describe("parseConceptMatchesEnvelope", () => {
   const one = {
     source_table: "orders",
+    source_table_identity: "DS#sales::warehouse.public.orders",
     source_column: "",
     matched_class_uri: "https://schema.org/Order",
     match_type: "high_confidence" as const,
@@ -231,6 +328,9 @@ describe("parseConceptMatchesEnvelope", () => {
     const parsed = parseConceptMatchesEnvelope({ matches: [one] });
     expect(parsed).toHaveLength(1);
     expect(parsed[0].source_table).toBe("orders");
+    expect(parsed[0].source_table_identity).toBe(
+      "DS#sales::warehouse.public.orders",
+    );
     expect(parsed[0].matched_class_uri).toBe("https://schema.org/Order");
   });
 
@@ -258,6 +358,31 @@ describe("parseConceptMatchesEnvelope", () => {
       match_type: "high_confidence" as const,
     }));
     expect(parseConceptMatchesEnvelope({ matches: many })).toHaveLength(75);
+  });
+});
+
+describe("conceptMatchKey", () => {
+  it("uses the stable identity when the match carries one", () => {
+    const [match] = parseConceptMatches([
+      {
+        source_table: "orders",
+        source_table_identity: "DS#sales::warehouse.public.orders",
+        source_column: "",
+        match_type: "novel",
+      },
+    ]);
+    expect(conceptMatchKey(match)).toBe("DS#sales::warehouse.public.orders");
+  });
+
+  it("keeps the bare table key for legacy matches", () => {
+    const [match] = parseConceptMatches([
+      {
+        source_table: "orders",
+        source_column: "",
+        match_type: "novel",
+      },
+    ]);
+    expect(conceptMatchKey(match)).toBe("orders");
   });
 });
 
@@ -322,5 +447,194 @@ describe("buildClassMatchResolver", () => {
   it("returns null for a class with no table match", () => {
     const resolve = buildClassMatchResolver(matches, REAL_R2RML);
     expect(resolve("ind:Unrelated")).toBeNull();
+  });
+
+  it("keeps same-named tables scoped to their datasource-qualified identity", () => {
+    const collidingMatches = parseConceptMatches([
+      {
+        source_table: "accounts",
+        source_table_identity: "DS#finance::finance.public.accounts",
+        source_column: "",
+        matched_class_uri: "https://example.test/FinancialAccount",
+        match_type: "high_confidence",
+      },
+      {
+        source_table: "accounts",
+        source_table_identity: "DS#identity::identity.public.accounts",
+        source_column: "",
+        matched_class_uri: "https://example.test/UserAccount",
+        match_type: "high_confidence",
+      },
+    ]);
+
+    const resolve = buildClassMatchResolver(
+      collidingMatches,
+      COLLIDING_TABLE_R2RML,
+    );
+    expect(resolve("ind:Accounts")?.matched_class_uri).toBe(
+      "https://example.test/FinancialAccount",
+    );
+    expect(resolve("ind:Accounts_782870db")?.matched_class_uri).toBe(
+      "https://example.test/UserAccount",
+    );
+  });
+
+  it("derives a missing source schema from the qualified logical table", () => {
+    const collidingMatches = parseConceptMatches([
+      {
+        source_table: "accounts",
+        source_table_identity: "DS#shared::finance.accounts",
+        source_column: "",
+        matched_class_uri: "https://example.test/FinancialAccount",
+        match_type: "high_confidence",
+      },
+      {
+        source_table: "accounts",
+        source_table_identity: "DS#shared::identity.accounts",
+        source_column: "",
+        matched_class_uri: "https://example.test/UserAccount",
+        match_type: "high_confidence",
+      },
+    ]);
+
+    const resolve = buildClassMatchResolver(
+      collidingMatches,
+      QUALIFIED_TABLE_R2RML,
+    );
+    expect(resolve("ind:Accounts")?.matched_class_uri).toBe(
+      "https://example.test/FinancialAccount",
+    );
+    expect(resolve("ind:Accounts_525ca243")?.matched_class_uri).toBe(
+      "https://example.test/UserAccount",
+    );
+  });
+
+  it("uses R2RML provenance before a normalized-name match", () => {
+    const identityOnly = parseConceptMatches([
+      {
+        source_table: "accounts",
+        source_table_identity: "DS#identity::identity.public.accounts",
+        source_column: "",
+        matched_class_uri: "https://example.test/UserAccount",
+        match_type: "high_confidence",
+      },
+    ]);
+
+    const resolve = buildClassMatchResolver(
+      identityOnly,
+      COLLIDING_TABLE_R2RML,
+    );
+    expect(resolve("ind:Accounts")).toBeNull();
+    expect(resolve("ind:Accounts_782870db")?.matched_class_uri).toBe(
+      "https://example.test/UserAccount",
+    );
+  });
+
+  it("does not use an unqualified identity for a schema-qualified class", () => {
+    const unqualified = parseConceptMatches([
+      {
+        source_table: "accounts",
+        source_table_identity: "DS#finance::accounts",
+        source_column: "",
+        matched_class_uri: "https://example.test/FinancialAccount",
+        match_type: "high_confidence",
+      },
+    ]);
+
+    const resolve = buildClassMatchResolver(unqualified, COLLIDING_TABLE_R2RML);
+    expect(resolve("ind:Accounts")).toBeNull();
+  });
+
+  it("does not bind an identity without a datasource to datasource-qualified R2RML", () => {
+    const unscoped = parseConceptMatches([
+      {
+        source_table: "accounts",
+        source_table_identity: "finance.public.accounts",
+        source_column: "",
+        matched_class_uri: "https://example.test/FinancialAccount",
+        match_type: "high_confidence",
+      },
+    ]);
+
+    const resolve = buildClassMatchResolver(unscoped, COLLIDING_TABLE_R2RML);
+    expect(resolve("ind:Accounts")).toBeNull();
+  });
+
+  it("returns null when legacy R2RML cannot disambiguate same-named tables", () => {
+    const collidingMatches = parseConceptMatches([
+      {
+        source_table: "accounts",
+        source_table_identity: "DS#finance::finance.public.accounts",
+        source_column: "",
+        matched_class_uri: "https://example.test/FinancialAccount",
+        match_type: "high_confidence",
+      },
+      {
+        source_table: "accounts",
+        source_table_identity: "DS#identity::identity.public.accounts",
+        source_column: "",
+        matched_class_uri: "https://example.test/UserAccount",
+        match_type: "high_confidence",
+      },
+    ]);
+
+    const resolve = buildClassMatchResolver(
+      collidingMatches,
+      LEGACY_COLLIDING_TABLE_R2RML,
+    );
+    expect(resolve("ind:Accounts")).toBeNull();
+    expect(resolve("ind:Accounts_two")).toBeNull();
+  });
+
+  it("uses a unique legacy match when R2RML supplies the table link", () => {
+    const legacyR2rml = `
+@prefix ind: <http://example.test/induced#> .
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+
+ind:TriplesMap_AccountsLedger a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "accounts" ] ;
+    rr:subjectMap <http://example.test/induced#TriplesMap_AccountsLedger/SubjectMap> .
+
+<http://example.test/induced#TriplesMap_AccountsLedger/SubjectMap>
+    rr:class ind:AccountsLedger .
+`;
+    const [legacyMatch] = parseConceptMatches([
+      {
+        source_table: "accounts",
+        source_column: "",
+        matched_class_uri: "https://example.test/Account",
+        match_type: "high_confidence",
+      },
+    ]);
+
+    const resolve = buildClassMatchResolver([legacyMatch], legacyR2rml);
+    expect(resolve("ind:AccountsLedger")).toBe(legacyMatch);
+  });
+
+  it("treats dots inside schema and table names as identity content", () => {
+    const matches = parseConceptMatches([
+      {
+        source_table: "q1.results",
+        source_table_identity: "DS#finance::finance.public.v1.q1.results",
+        source_column: "",
+        matched_class_uri: "https://example.test/FinancialResult",
+        match_type: "high_confidence",
+      },
+      {
+        source_table: "q1.results",
+        source_table_identity: "DS#identity::identity.public.v1.q1.results",
+        source_column: "",
+        matched_class_uri: "https://example.test/IdentityResult",
+        match_type: "high_confidence",
+      },
+    ]);
+
+    const resolve = buildClassMatchResolver(matches, DOTTED_TABLE_R2RML);
+    expect(resolve("ind:Q1Results")?.matched_class_uri).toBe(
+      "https://example.test/FinancialResult",
+    );
+    expect(resolve("ind:Q1Results_two")?.matched_class_uri).toBe(
+      "https://example.test/IdentityResult",
+    );
   });
 });
