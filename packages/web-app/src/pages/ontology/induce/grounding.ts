@@ -27,6 +27,7 @@ export interface MatchCandidate {
 
 export interface ConceptMatch {
   source_table: string;
+  source_table_identity?: string | null;
   source_column: string;
   matched_class_uri?: string | null;
   matched_ontology_id?: string | null;
@@ -68,6 +69,7 @@ function parseConceptMatch(value: unknown): ConceptMatch | null {
   if (!isRecord(value)) return null;
   const {
     source_table,
+    source_table_identity,
     source_column,
     matched_class_uri,
     matched_ontology_id,
@@ -87,6 +89,11 @@ function parseConceptMatch(value: unknown): ConceptMatch | null {
     : null;
   return {
     source_table,
+    source_table_identity:
+      typeof source_table_identity === "string" ||
+      source_table_identity === null
+        ? source_table_identity
+        : undefined,
     source_column: typeof source_column === "string" ? source_column : "",
     matched_class_uri:
       typeof matched_class_uri === "string" || matched_class_uri === null
@@ -108,6 +115,11 @@ function parseConceptMatch(value: unknown): ConceptMatch | null {
     reason: typeof reason === "string" || reason === null ? reason : undefined,
     candidates: parsedCandidates,
   };
+}
+
+/** Stable key for a grounding match, with a legacy bare-table fallback. */
+export function conceptMatchKey(match: ConceptMatch): string {
+  return match.source_table_identity || match.source_table;
 }
 
 /**
@@ -186,21 +198,6 @@ export function ontologyLabel(ontologyId: string | null | undefined): string {
   return ontologyId.split("/").slice(-2).join("/");
 }
 
-/**
- * Table-level matches only (a class row corresponds to a table, not a column).
- * Keyed by ``source_table`` for O(1) lookup from a class row.
- */
-export function tableMatchesByTable(
-  matches: ConceptMatch[],
-): Map<string, ConceptMatch> {
-  const map = new Map<string, ConceptMatch>();
-  for (const m of matches) {
-    if (m.source_column) continue; // column-level, not a table match
-    map.set(m.source_table, m);
-  }
-  return map;
-}
-
 // ─── Class-row → ConceptMatch resolution ────────────────────────────
 //
 // Grounding candidates are keyed per-TABLE (``ConceptMatch.source_table``,
@@ -214,13 +211,13 @@ export function tableMatchesByTable(
 // ``#TriplesMap_X/SubjectMap`` IRI and ``rr:tableName`` on the
 // ``rr:logicalTable`` blank node of ``#TriplesMap_X`` in SEPARATE
 // blank-line-delimited blocks, so they never co-occur. Two complementary,
-// layout-independent strategies replace it (tried in order):
-//   1. Primary — normalized-name match. Normalize BOTH the class local name
-//      and every ``source_table`` to a canonical key (strip non-alphanumerics,
-//      lowercase) and join on it. Independent of the R2RML entirely.
-//   2. Fallback — TriplesMap-id join over the WHOLE R2RML. Key both predicates
-//      by the ``TriplesMap_X`` id embedded in the subject IRI and join
-//      class→table→match. Exact; also disambiguates normalized-key collisions.
+// layout-independent strategies replace it:
+//   1. When R2RML provenance exists, a TriplesMap-id join over the WHOLE
+//      document resolves class→datasource/schema/table→match. This exact link
+//      must take precedence when same-named tables collide.
+//   2. Without R2RML provenance, normalize BOTH the class local name and every
+//      ``source_table`` to a canonical key (strip non-alphanumerics, lowercase)
+//      and join only when that key is unique.
 
 /**
  * Extract the class local name from a (possibly prefixed / full-IRI) subject.
@@ -345,10 +342,45 @@ export function classToTableFromR2rml(
   r2rmlTurtle: string | null | undefined,
 ): Map<string, string> {
   const result = new Map<string, string>();
+  for (const [cls, ref] of classToTableRefFromR2rml(r2rmlTurtle)) {
+    result.set(cls, ref.tableName);
+  }
+  return result;
+}
+
+interface R2rmlTableRef {
+  tableName: string;
+  datasourceId?: string;
+  sourceSchema?: string;
+}
+
+function turtleLiteralValue(literal: string): string {
+  const inner =
+    literal.length >= 2 && literal.startsWith('"') && literal.endsWith('"')
+      ? literal.slice(1, -1)
+      : literal;
+  return inner.replace(/\\(.)/g, "$1");
+}
+
+/**
+ * Resolve each class to the R2RML provenance that identifies its source table.
+ *
+ * ``rr:tableName`` alone is insufficient when two datasources both expose the
+ * same schema and table. The producer also annotates each TriplesMap with
+ * ``scl:datasourceId`` and ``scl:sourceSchema``; those values join against the
+ * stable identity without duplicating its hash-derived class naming here.
+ */
+function classToTableRefFromR2rml(
+  r2rmlTurtle: string | null | undefined,
+): Map<string, R2rmlTableRef> {
+  const result = new Map<string, R2rmlTableRef>();
   if (!r2rmlTurtle) return result;
 
   const triplesMapToClass = new Map<string, string>();
   const triplesMapToTable = new Map<string, string>();
+  const triplesMapToDatasource = new Map<string, string>();
+  const triplesMapToSchema = new Map<string, string>();
+  const triplesMapToLogicalSchema = new Map<string, string>();
 
   // Scan line by line, remembering the most recent ``TriplesMap_X`` id seen in
   // any IRI on the line; both ``rr:class`` and ``rr:tableName`` statements sit
@@ -368,13 +400,46 @@ export function classToTableFromR2rml(
     // quotes) then unescape + strip SQL-delimiter quotes.
     const tableMatch = line.match(/rr:tableName\s+("(?:\\.|[^"\\])*")/);
     if (tableMatch && currentTriplesMap) {
-      triplesMapToTable.set(currentTriplesMap, unquoteSqlIdent(tableMatch[1]));
+      const segments = sqlIdentSegments(tableMatch[1]);
+      triplesMapToTable.set(currentTriplesMap, segments[segments.length - 1]);
+      if (segments.length >= 2) {
+        triplesMapToLogicalSchema.set(
+          currentTriplesMap,
+          segments[segments.length - 2],
+        );
+      }
+    }
+
+    const datasourceMatch = line.match(
+      /(?:scl|coa):datasourceId\s+("(?:\\.|[^"\\])*")/,
+    );
+    if (datasourceMatch && currentTriplesMap) {
+      triplesMapToDatasource.set(
+        currentTriplesMap,
+        turtleLiteralValue(datasourceMatch[1]),
+      );
+    }
+
+    const schemaMatch = line.match(
+      /(?:scl|coa):sourceSchema\s+("(?:\\.|[^"\\])*")/,
+    );
+    if (schemaMatch && currentTriplesMap) {
+      triplesMapToSchema.set(
+        currentTriplesMap,
+        turtleLiteralValue(schemaMatch[1]),
+      );
     }
   }
 
   for (const [tmId, cls] of triplesMapToClass) {
     const table = triplesMapToTable.get(tmId);
-    if (table) result.set(cls, table);
+    if (!table) continue;
+    result.set(cls, {
+      tableName: table,
+      datasourceId: triplesMapToDatasource.get(tmId),
+      sourceSchema:
+        triplesMapToSchema.get(tmId) ?? triplesMapToLogicalSchema.get(tmId),
+    });
   }
   return result;
 }
@@ -606,54 +671,127 @@ export function parseR2rmlByClass(
 
 /**
  * Build a resolver ``classSubject → ConceptMatch | null`` for the review
- * table. Primary strategy is the R2RML-independent normalized-name match; the
- * TriplesMap-id R2RML join is the fallback for the rare cases the name
- * transform can't be inverted (e.g. characters ``to_pascal`` drops, or two
- * tables that normalize to the same key).
+ * table. R2RML provenance is authoritative when present; normalized-name
+ * matching is used only for classes without an R2RML table reference.
  *
  * Only table-level matches (empty ``source_column``) participate. Classes with
  * no match resolve to ``null`` so the caller falls through to the
  * Turtle-derived badge instead of erroring.
  *
  * Collision handling: if two source tables normalize to the same key we do NOT
- * attach either by normalized name (ambiguous — could mis-attach); such tables
- * remain reachable via the R2RML fallback, which is exact.
+ * attach either by normalized name (ambiguous — could mis-attach). A bare-table
+ * R2RML fallback is allowed only for a unique legacy match that has no stable
+ * identity.
  */
+function uniqueMatchIndex(
+  matches: ConceptMatch[],
+  keyOf: (match: ConceptMatch) => string,
+): Map<string, ConceptMatch> {
+  const result = new Map<string, ConceptMatch>();
+  const ambiguous = new Set<string>();
+  for (const match of matches) {
+    const key = keyOf(match);
+    if (!key) continue;
+    if (result.has(key)) ambiguous.add(key);
+    else result.set(key, match);
+  }
+  for (const key of ambiguous) result.delete(key);
+  return result;
+}
+
+interface ParsedTableIdentity {
+  datasourceId?: string;
+  qualifier: string;
+}
+
+function parseTableIdentity(
+  identity: string,
+  tableName: string,
+): ParsedTableIdentity | null {
+  const separator = identity.indexOf("::");
+  const datasourceId =
+    separator >= 0 ? identity.slice(0, separator) : undefined;
+  const qualifiedName =
+    separator >= 0 ? identity.slice(separator + 2) : identity;
+  const tableStart = qualifiedName.length - tableName.length;
+  if (
+    tableStart < 0 ||
+    qualifiedName.slice(tableStart) !== tableName ||
+    (tableStart > 0 && qualifiedName[tableStart - 1] !== ".")
+  ) {
+    return null;
+  }
+  return {
+    datasourceId,
+    qualifier: tableStart > 0 ? qualifiedName.slice(0, tableStart - 1) : "",
+  };
+}
+
+function matchFitsR2rmlRef(match: ConceptMatch, ref: R2rmlTableRef): boolean {
+  if (match.source_table !== ref.tableName || !match.source_table_identity) {
+    return false;
+  }
+
+  const identity = parseTableIdentity(
+    match.source_table_identity,
+    match.source_table,
+  );
+  if (!identity) return false;
+
+  if (ref.datasourceId && identity.datasourceId !== ref.datasourceId) {
+    return false;
+  }
+  if (
+    ref.sourceSchema &&
+    identity.qualifier !== ref.sourceSchema &&
+    !identity.qualifier.endsWith(`.${ref.sourceSchema}`)
+  ) {
+    return false;
+  }
+  return true;
+}
+
 export function buildClassMatchResolver(
   matches: ConceptMatch[],
   r2rmlTurtle: string | null | undefined,
 ): (classSubject: string) => ConceptMatch | null {
-  const byTable = tableMatchesByTable(matches);
-
-  // Normalized-name index. Detect collisions so we never mis-attach.
-  const byNormalizedName = new Map<string, ConceptMatch>();
-  const ambiguousKeys = new Set<string>();
-  for (const [table, match] of byTable) {
-    const key = normalizeNameKey(table);
-    if (!key) continue;
-    if (byNormalizedName.has(key)) {
-      ambiguousKeys.add(key);
-    } else {
-      byNormalizedName.set(key, match);
-    }
+  const tableMatches = matches.filter((match) => !match.source_column);
+  const byNormalizedName = uniqueMatchIndex(tableMatches, (match) =>
+    normalizeNameKey(match.source_table),
+  );
+  const byLegacyBareTable = uniqueMatchIndex(
+    tableMatches.filter((match) => !match.source_table_identity),
+    (match) => match.source_table,
+  );
+  const matchesBySourceTable = new Map<string, ConceptMatch[]>();
+  for (const match of tableMatches) {
+    const bucket = matchesBySourceTable.get(match.source_table);
+    if (bucket) bucket.push(match);
+    else matchesBySourceTable.set(match.source_table, [match]);
   }
-  for (const key of ambiguousKeys) byNormalizedName.delete(key);
-
-  // R2RML fallback: classLocalName → tableName (exact).
-  const classToTable = classToTableFromR2rml(r2rmlTurtle);
+  const classToTableRef = classToTableRefFromR2rml(r2rmlTurtle);
+  const byR2rmlClass = new Map<string, ConceptMatch | null>();
+  for (const [local, ref] of classToTableRef) {
+    const candidates = (matchesBySourceTable.get(ref.tableName) ?? []).filter(
+      (match) => matchFitsR2rmlRef(match, ref),
+    );
+    byR2rmlClass.set(
+      local,
+      candidates.length === 1
+        ? candidates[0]
+        : (byLegacyBareTable.get(ref.tableName) ?? null),
+    );
+  }
 
   return (classSubject: string): ConceptMatch | null => {
     const local = classLocalName(classSubject);
 
-    // Primary: normalized-name match (R2RML-independent).
-    const byName = byNormalizedName.get(normalizeNameKey(local));
-    if (byName) return byName;
+    // Provenance first: never let a unique normalized name override an
+    // explicitly different datasource/schema/table reference.
+    if (byR2rmlClass.has(local)) {
+      return byR2rmlClass.get(local) ?? null;
+    }
 
-    // Fallback: TriplesMap-id join → table → match (exact; handles collisions
-    // and any name-transform edge cases the normalized key can't invert).
-    const table = classToTable.get(local);
-    if (table) return byTable.get(table) ?? null;
-
-    return null;
+    return byNormalizedName.get(normalizeNameKey(local)) ?? null;
   };
 }

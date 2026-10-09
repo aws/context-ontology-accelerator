@@ -17,6 +17,8 @@ is recoverable.
 
 from __future__ import annotations
 
+from copy import deepcopy
+
 import pytest
 
 pytestmark = pytest.mark.unit
@@ -157,3 +159,133 @@ def test_clear_override_sets_novel(monkeypatch):
     assert pub["match_type"] == "novel"
     assert pub["matched_class_uri"] is None
     assert pub["similarity"] is None
+
+
+def test_override_keyed_by_identity_updates_only_the_selected_same_named_table(monkeypatch):
+    proposals, captured = _patch_store_and_pipeline(monkeypatch)
+    item = _proposal_item()
+    finance = item["metadata"]["matches"][0]
+    finance["source_table_identity"] = "DS#finance::finance.public.publication"
+    identity = deepcopy(finance)
+    identity["source_table_identity"] = "DS#identity::identity.public.publication"
+    item["metadata"]["matches"].append(identity)
+
+    proposals._apply_grounding_overrides(
+        "p-ground",
+        {"DS#finance::finance.public.publication": _PRODUCT},
+        item,
+        namespace="ns",
+    )
+
+    by_identity = {match["source_table_identity"]: match for match in captured["matches"]}
+    assert by_identity["DS#finance::finance.public.publication"]["matched_class_uri"] == _PRODUCT
+    assert by_identity["DS#identity::identity.public.publication"]["matched_class_uri"] == _PUBLICATION
+    assert by_identity["DS#identity::identity.public.publication"]["similarity"] == 0.95
+
+
+def test_legacy_bare_override_still_updates_a_unique_identity_bearing_match(monkeypatch):
+    proposals, captured = _patch_store_and_pipeline(monkeypatch)
+    item = _proposal_item()
+    item["metadata"]["matches"][0]["source_table_identity"] = "DS#one::db.publication"
+
+    proposals._apply_grounding_overrides(
+        "p-ground",
+        {"publication": _PRODUCT},
+        item,
+        namespace="ns",
+    )
+
+    [publication] = captured["matches"]
+    assert publication["matched_class_uri"] == _PRODUCT
+    assert publication["similarity"] == 0.72
+
+
+def test_identity_override_takes_precedence_over_legacy_bare_key(monkeypatch):
+    proposals, captured = _patch_store_and_pipeline(monkeypatch)
+    item = _proposal_item()
+    identity = "DS#one::db.publication"
+    item["metadata"]["matches"][0]["source_table_identity"] = identity
+
+    proposals._apply_grounding_overrides(
+        "p-ground",
+        {identity: _PRODUCT, "publication": _PUBLICATION},
+        item,
+        namespace="ns",
+    )
+
+    [publication] = captured["matches"]
+    assert publication["matched_class_uri"] == _PRODUCT
+    assert publication["similarity"] == 0.72
+
+
+def test_ambiguous_legacy_bare_override_does_not_update_same_named_tables(monkeypatch):
+    proposals, captured = _patch_store_and_pipeline(monkeypatch)
+    item = _proposal_item()
+    item["metadata"]["matches"][0]["source_table_identity"] = "DS#finance::finance.public.publication"
+    duplicate = deepcopy(item["metadata"]["matches"][0])
+    duplicate["source_table_identity"] = "DS#identity::identity.public.publication"
+    duplicate["matched_class_uri"] = _PRODUCT
+    duplicate["similarity"] = 0.72
+    duplicate["match_type"] = "high_confidence"
+    item["metadata"]["matches"].append(duplicate)
+
+    proposals._apply_grounding_overrides(
+        "p-ground",
+        {"publication": _PRODUCT},
+        item,
+        namespace="ns",
+    )
+
+    assert [match["matched_class_uri"] for match in captured["matches"]] == [
+        _PUBLICATION,
+        _PRODUCT,
+    ]
+    assert [match["similarity"] for match in captured["matches"]] == [0.95, 0.72]
+
+
+def test_ambiguous_bare_override_does_not_update_a_mixed_legacy_match(monkeypatch):
+    proposals, captured = _patch_store_and_pipeline(monkeypatch)
+    item = _proposal_item()
+    identity_match = deepcopy(item["metadata"]["matches"][0])
+    identity_match["source_table_identity"] = "DS#identity::identity.public.publication"
+    identity_match["matched_class_uri"] = _PRODUCT
+    identity_match["similarity"] = 0.72
+    identity_match["match_type"] = "high_confidence"
+    item["metadata"]["matches"].append(identity_match)
+
+    proposals._apply_grounding_overrides(
+        "p-ground",
+        {"publication": None},
+        item,
+        namespace="ns",
+    )
+
+    assert [match["matched_class_uri"] for match in captured["matches"]] == [
+        _PUBLICATION,
+        _PRODUCT,
+    ]
+    assert [match["similarity"] for match in captured["matches"]] == [0.95, 0.72]
+
+
+def test_identity_keyed_clear_updates_only_the_selected_same_named_table(monkeypatch):
+    proposals, captured = _patch_store_and_pipeline(monkeypatch)
+    item = _proposal_item()
+    finance = item["metadata"]["matches"][0]
+    finance["source_table_identity"] = "DS#finance::finance.public.publication"
+    identity = deepcopy(finance)
+    identity["source_table_identity"] = "DS#identity::identity.public.publication"
+    item["metadata"]["matches"].append(identity)
+
+    proposals._apply_grounding_overrides(
+        "p-ground",
+        {"DS#finance::finance.public.publication": None},
+        item,
+        namespace="ns",
+    )
+
+    by_identity = {match["source_table_identity"]: match for match in captured["matches"]}
+    assert by_identity["DS#finance::finance.public.publication"]["matched_class_uri"] is None
+    assert by_identity["DS#finance::finance.public.publication"]["match_type"] == "novel"
+    assert by_identity["DS#finance::finance.public.publication"]["similarity"] is None
+    assert by_identity["DS#identity::identity.public.publication"]["matched_class_uri"] == _PUBLICATION
+    assert by_identity["DS#identity::identity.public.publication"]["similarity"] == 0.95

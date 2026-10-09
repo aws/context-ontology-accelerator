@@ -948,6 +948,11 @@ structure ConceptMatch {
     @required
     sourceTable: String
 
+    /// Stable data-source-qualified identity for the source table. New
+    /// structured inductions populate this so same-named tables remain
+    /// distinguishable; absent on legacy and unstructured matches.
+    sourceTableIdentity: String
+
     /// Source column the match originates from.
     @required
     sourceColumn: String
