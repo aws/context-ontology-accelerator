@@ -267,7 +267,7 @@ class ResponseAssembler:
         self,
         *,
         synthesized_answer: str,
-        supporting_content: Sequence[dict],
+        supporting_content: Sequence[dict] | None,
         graph_context: Sequence[dict],
         confidence: float,
         guardrail_blocked: bool = False,
@@ -283,7 +283,9 @@ class ResponseAssembler:
 
         Args:
             synthesized_answer: The natural-language answer produced by synthesis.
-            supporting_content: Retrieved chunks backing the answer.
+            supporting_content: Retrieved chunks backing the answer. ``None`` when the
+                caller opted out (``includeSupporting=False``) — the field is then
+                omitted from the response, as on Tier 1/2; ``[]`` means none found.
             graph_context: Graph entities used as context.
             confidence: Resolution confidence in [0, 1]; forced to 0 when blocked.
             guardrail_blocked: Whether a guardrail blocked the synthesized answer.
@@ -314,7 +316,7 @@ class ResponseAssembler:
             tier=3,
             confidence=ConfidenceScore(score=confidence, rationale="Agentic synthesis"),
             synthesized_answer=synthesized_answer,
-            supporting_content=list(supporting_content),
+            supporting_content=None if supporting_content is None else list(supporting_content),
             graph_context={"entities": list(graph_context)},
             guardrail_blocked=guardrail_blocked,
             trace=trace.steps,

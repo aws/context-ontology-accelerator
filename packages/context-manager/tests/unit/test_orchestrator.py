@@ -1078,6 +1078,78 @@ class TestOrchestratorTier3Fallback:
         assert call_kwargs["catalog_summary"] == catalog
 
 
+# ── includeSupporting option ─────────────────────────────────────────────
+
+
+_INCLUDE_SUPPORTING_KEEPS = [{}, {"includeSupporting": True}, {"includeSupporting": None}]
+
+
+def _serialized_result(response: InvokeResponse) -> dict:
+    """The result dict exactly as the handler puts it on the wire (main.py / sse_emitter.py)."""
+    return response.model_dump(by_alias=True, exclude_none=True, mode="json")["result"]
+
+
+def _deep_reasoning_orchestrator() -> Orchestrator:
+    orch = _make_orchestrator()
+    orch._agentic_retriever = AsyncMock()
+    orch._agentic_retriever.resolve.return_value = Tier3Result(
+        synthesized_answer="Combined structured and document evidence answer.",
+        supporting_content=({"chunkId": "a1", "text": "Evidence...", "relevanceScore": 0.8},),
+        graph_context=(),
+        confidence=0.7,
+        trace_steps=(),
+    )
+    return orch
+
+
+@pytest.mark.unit
+class TestIncludeSupporting:
+    """options.includeSupporting=False omits supportingContent from a Tier-3 response.
+
+    Any other value (absent, True, None) keeps the chunks — the documented default.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("options", _INCLUDE_SUPPORTING_KEEPS)
+    async def test_resolve_include_supporting_not_false_returns_chunks(self, options):
+        orch = _make_orchestrator(tier2_success=False)
+        response = await orch.resolve(InvokeRequest(query="Explain the data model", namespace="demo", options=options))
+
+        assert [c["chunkId"] for c in _serialized_result(response)["supportingContent"]] == ["c1"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("options", _INCLUDE_SUPPORTING_KEEPS)
+    async def test_resolve_deep_reasoning_include_supporting_not_false_returns_chunks(self, options):
+        orch = _deep_reasoning_orchestrator()
+        request = InvokeRequest(query="q", namespace="demo", options={"mode": "deep-reasoning", **options})
+        response = await orch.resolve(request)
+
+        assert [c["chunkId"] for c in _serialized_result(response)["supportingContent"]] == ["a1"]
+
+    @pytest.mark.asyncio
+    async def test_resolve_include_supporting_false_omits_field(self):
+        orch = _make_orchestrator(tier2_success=False)
+        request = InvokeRequest(query="Explain the data model", namespace="demo", options={"includeSupporting": False})
+        response = await orch.resolve(request)
+
+        result = _serialized_result(response)
+        assert result["tier"] == 3
+        assert "claims are insurance" in result["synthesizedAnswer"].lower()
+        assert "supportingContent" not in result
+
+    @pytest.mark.asyncio
+    async def test_resolve_deep_reasoning_include_supporting_false_omits_field(self):
+        orch = _deep_reasoning_orchestrator()
+        request = InvokeRequest(
+            query="q", namespace="demo", options={"mode": "deep-reasoning", "includeSupporting": False}
+        )
+        response = await orch.resolve(request)
+
+        result = _serialized_result(response)
+        assert result["metadata"]["mode"] == "deep-reasoning"
+        assert "supportingContent" not in result
+
+
 # ── startTier option ─────────────────────────────────────────────────────
 
 

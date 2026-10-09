@@ -30,6 +30,7 @@ from coa_ontology.inducer.services.data_catalog import CatalogTable, DataCatalog
 from coa_ontology.inducer.services.embedding_generator import EmbeddingGeneratorClient
 from coa_ontology.inducer.services.grounding import GroundingService
 from coa_ontology.inducer.services.ontology_catalog import OntologyCatalogClient
+from coa_ontology.inducer.strategies.base import table_identity as catalog_table_identity
 
 # Mapping from data-catalog SQL types to XSD datatypes
 _SQL_TO_XSD = {
@@ -80,6 +81,29 @@ class SourceConcept:
     is_table_level: bool = False  # True if this represents the table itself, not a column
     embedding_text: str = ""
     vector: list[float] = field(default_factory=list)
+    source_table_identity: str = ""
+
+
+def _concept_identity(
+    concept: SourceConcept,
+    legacy_table_identities: dict[str, str] | None = None,
+) -> str:
+    """Return the stable table key, with fallbacks for legacy test fixtures."""
+    if concept.source_table_identity:
+        return concept.source_table_identity
+    legacy_key = concept.table_fqn or concept.table_name
+    return (legacy_table_identities or {}).get(legacy_key, legacy_key)
+
+
+def _legacy_table_identity_map(tables: list[CatalogTable]) -> dict[str, str]:
+    """Map unambiguous legacy table names and FQNs to canonical identities."""
+    candidates: dict[str, set[str]] = {}
+    for table in tables:
+        identity = catalog_table_identity(table)
+        for legacy_key in (table.fullyQualifiedName, table.name):
+            if legacy_key:
+                candidates.setdefault(legacy_key, set()).add(identity)
+    return {legacy_key: next(iter(identities)) for legacy_key, identities in candidates.items() if len(identities) == 1}
 
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -142,6 +166,7 @@ class InductionPipeline:
         """
         concepts = []
         for table in tables:
+            source_table_identity = catalog_table_identity(table)
             # Table-level concept
             table_text = f"{table.name}"
             if table.description:
@@ -157,6 +182,7 @@ class InductionPipeline:
                     data_type="",
                     is_table_level=True,
                     embedding_text=table_text,
+                    source_table_identity=source_table_identity,
                 )
             )
             # Column-level concepts
@@ -177,6 +203,7 @@ class InductionPipeline:
                         data_type=col.dataType,
                         constraint=col.constraint,
                         embedding_text=col_text,
+                        source_table_identity=source_table_identity,
                     )
                 )
         return concepts
@@ -396,14 +423,17 @@ class InductionPipeline:
         candidates: list[dict],
         confidence_threshold: float,
         strategy: str,
+        source_table_identity: str | None = None,
     ) -> ConceptMatch:
         """Select the best candidate using the given scoring strategy."""
         from coa_ontology.inducer.schemas import MatchCandidate
 
+        identity = source_table_identity or _concept_identity(concept)
         if not candidates:
             return ConceptMatch(
                 source_column=concept.column_name,
                 source_table=concept.table_name,
+                source_table_identity=identity,
                 matched_class_uri=None,
                 matched_ontology_id=None,
                 similarity=None,
@@ -423,6 +453,7 @@ class InductionPipeline:
         return ConceptMatch(
             source_column=concept.column_name,
             source_table=concept.table_name,
+            source_table_identity=identity,
             matched_class_uri=best["entity_uri"],
             matched_ontology_id=best["ontology_id"],
             similarity=sim,
@@ -524,8 +555,10 @@ class InductionPipeline:
 
         # Build table metadata lookup for the grounding service
         table_meta: dict[str, CatalogTable] = {}
+        legacy_table_identities: dict[str, str] = {}
         if tables:
-            table_meta = {t.name: t for t in tables}
+            table_meta = {catalog_table_identity(t): t for t in tables}
+            legacy_table_identities = _legacy_table_identity_map(tables)
 
         # First pass: match table-level concepts via centralized grounding service (parallel)
         grounding_svc = GroundingService(
@@ -538,8 +571,9 @@ class InductionPipeline:
 
         table_concepts = [(i, c) for i, c in enumerate(concepts) if c.is_table_level]
 
-        def _ground_one(concept):
-            tbl = table_meta.get(concept.table_name)
+        def _ground_one(concept: SourceConcept) -> ConceptMatch:
+            identity = _concept_identity(concept, legacy_table_identities)
+            tbl = table_meta.get(identity)
             columns_for_grounding = [
                 {"name": c.name, "dataType": c.dataType, "description": c.description, "constraint": c.constraint}
                 for c in (tbl.columns if tbl else [])
@@ -555,7 +589,9 @@ class InductionPipeline:
                 ontology_ids=grounding_ontology_ids,
                 rerank_max_tokens=rerank_max_tokens,
             )
-            return grounding_svc.to_concept_match(result)
+            match = grounding_svc.to_concept_match(result)
+            match.source_table_identity = identity
+            return match
 
         grounding_workers = _grounding_workers()
         # ponytail: worker cap (24); coupled to the shared bedrock client's
@@ -568,8 +604,9 @@ class InductionPipeline:
 
         for (idx, concept), match in zip(table_concepts, grounding_results, strict=True):
             matches[idx] = match
-            table_ontology[concept.table_name] = match.matched_ontology_id
-            table_class_uri[concept.table_name] = match.matched_class_uri
+            identity = _concept_identity(concept, legacy_table_identities)
+            table_ontology[identity] = match.matched_ontology_id
+            table_class_uri[identity] = match.matched_class_uri
 
         # Second pass: match columns against property embeddings, in parallel.
         # Each column is an independent embedding-search + cosine + _pick_winner
@@ -588,7 +625,8 @@ class InductionPipeline:
             # Read-only over the captured dicts (no shared mutable state), so it
             # is safe to run concurrently. Returns the match; the caller re-pairs
             # by input order so output is independent of completion order.
-            scoped_onto_id = table_ontology.get(concept.table_name)
+            identity = _concept_identity(concept, legacy_table_identities)
+            scoped_onto_id = table_ontology.get(identity)
 
             candidates = []
             if scoped_onto_id is not None:
@@ -609,7 +647,7 @@ class InductionPipeline:
 
             # Apply structural scoring if requested
             if scoring_strategy == "structural_fusion" and candidates:
-                class_uri = table_class_uri.get(concept.table_name)
+                class_uri = table_class_uri.get(identity)
                 if class_uri:
                     self._apply_structural_scores(
                         candidates,
@@ -622,6 +660,7 @@ class InductionPipeline:
                 candidates,
                 confidence_threshold,
                 scoring_strategy,
+                source_table_identity=identity,
             )
 
         _col_match_t0 = time.perf_counter()

@@ -20,11 +20,15 @@ from __future__ import annotations
 
 import os
 import re
+from typing import cast
 
 import structlog
 from botocore.exceptions import BotoCoreError, ClientError
 from coa_common.dao import DynamoDBDAO
 from coa_control_plane_server.models.source_status import SourceStatus
+
+from coa_metrics import data_source_lookup_factory
+from coa_metrics.lookups import LOOKUP_NOT_PROVIDED, DataSourceLookup, LookupArgument
 
 logger = structlog.get_logger(__name__)
 
@@ -137,7 +141,30 @@ def check_source_approved(namespace: str, data_source_id: str) -> str | None:
     return None
 
 
-def check_source_table_exists(namespace: str, data_source_id: str, source_table: str) -> str | None:
+def build_validation_lookup(namespace: str) -> DataSourceLookup | None:
+    """Build one catalog lookup for all source validation in a request.
+
+    In permissive development mode, lookup initialization failures degrade to
+    ``None`` just as soft validation historically did. Otherwise they fail
+    closed so hard source-table validation can return a 503.
+    """
+    try:
+        return data_source_lookup_factory.build_data_source_lookup(namespace)
+    except Exception as exc:
+        if permissive_lookup_enabled():
+            logger.warning("data_source_lookup_init_failed_non_blocking", namespace=namespace, error=str(exc))
+            return None
+        logger.error("data_source_lookup_init_failed", namespace=namespace, error=str(exc), exc_info=True)
+        raise SourceValidationUnavailableError(f"data source lookup unavailable: {exc}") from exc
+
+
+def check_source_table_exists(
+    namespace: str,
+    data_source_id: str,
+    source_table: str,
+    *,
+    data_source_lookup: LookupArgument = LOOKUP_NOT_PROVIDED,
+) -> str | None:
     """Verify the declared ``sourceTable`` exists in the source's catalog (#161).
 
     Rejects only **provable** absence. An unconfigured catalog lookup falls back
@@ -165,6 +192,8 @@ def check_source_table_exists(namespace: str, data_source_id: str, source_table:
         namespace: The namespace the metric belongs to.
         data_source_id: The source referenced by the metric's ``dataSourceId``.
         source_table: The metric's declared ``sourceTable``.
+        data_source_lookup: Optional request-scoped lookup to reuse. When
+            omitted, this function builds one for backward-compatible callers.
 
     Returns:
         None when the table exists, its absence cannot be proven, the lookup
@@ -188,13 +217,11 @@ def check_source_table_exists(namespace: str, data_source_id: str, source_table:
         )
         return None
 
-    from coa_metrics import data_source_lookup_factory
-
-    try:
-        lookup = data_source_lookup_factory.build_data_source_lookup(namespace)
-    except Exception as exc:
-        logger.error("data_source_lookup_init_failed", namespace=namespace, error=str(exc), exc_info=True)
-        raise SourceValidationUnavailableError(f"data source lookup unavailable: {exc}") from exc
+    lookup = (
+        build_validation_lookup(namespace)
+        if data_source_lookup is LOOKUP_NOT_PROVIDED
+        else cast("DataSourceLookup | None", data_source_lookup)
+    )
 
     if lookup is None:
         # Not configured / namespace not provisioned — not an outage. Degrade to

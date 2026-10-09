@@ -348,7 +348,9 @@ function ValidationResults({
       <Alert type="info" header={`Validation ${job.status}…`}>
         <SpaceBetween direction="horizontal" size="xs">
           <Spinner />
-          <Box>Running HermiT reasoner + structural metrics + OoPS!</Box>
+          <Box>
+            Running HermiT reasoner + structural metrics + OoPS! (if enabled)
+          </Box>
         </SpaceBetween>
       </Alert>
     );
@@ -550,11 +552,11 @@ export function ProposalDetailPage() {
   // Legacy proposals still carry them inline; refresh() prefers that when present.
   const [groundingMatches, setGroundingMatches] = useState<ConceptMatch[]>([]);
   const [dirty, setDirty] = useState(false);
-  // Staged grounding overrides (table → chosen foundational URI, or ``null``
-  // to keep the table novel) that are NOT yet persisted. Picking a candidate /
-  // marking novel stages here + marks dirty; sent on the next explicit Save
-  // (not auto-committed on every selection). ``null`` clears grounding — the
-  // backend ``grounding_overrides`` contract is ``dict[str, str | None]``.
+  // Staged grounding overrides (stable table identity, with a bare-table
+  // fallback for legacy matches → chosen foundational URI, or ``null`` to keep
+  // the table novel) that are NOT yet persisted. Picking a candidate / marking
+  // novel stages here + marks dirty; sent on the next explicit Save. ``null``
+  // clears grounding; the backend contract remains ``dict[str, str | None]``.
   const [pendingGroundingOverrides, setPendingGroundingOverrides] = useState<
     Record<string, string | null>
   >({});
@@ -839,24 +841,24 @@ export function ProposalDetailPage() {
     }
   }
 
-  // Stage a chosen grounding candidate for a source table. Memoized so the
+  // Stage a chosen grounding candidate for a stable match key. Memoized so the
   // ProposalEntitiesPanel effect that mounts the split panel doesn't re-run on
   // every render (which would reopen the panel each keystroke). Selections are
   // ignored while a save is in flight — saveChanges → refresh() clears the
   // staged map, so a mid-save selection would be lost.
   const stageGroundingCandidate = useCallback(
-    (table: string, uri: string) => {
+    (matchKey: string, uri: string) => {
       if (updating) return;
-      setPendingGroundingOverrides((prev) => ({ ...prev, [table]: uri }));
+      setPendingGroundingOverrides((prev) => ({ ...prev, [matchKey]: uri }));
       setDirty(true);
     },
     [updating],
   );
   // Stage "keep novel" (null clears grounding — see grounding_overrides type).
   const stageGroundingNovel = useCallback(
-    (table: string) => {
+    (matchKey: string) => {
       if (updating) return;
-      setPendingGroundingOverrides((prev) => ({ ...prev, [table]: null }));
+      setPendingGroundingOverrides((prev) => ({ ...prev, [matchKey]: null }));
       setDirty(true);
     },
     [updating],
@@ -1124,7 +1126,7 @@ export function ProposalDetailPage() {
                   Cancel
                 </Button>
                 <ButtonWithHint
-                  hint="Read-only quality checks: reasoner consistency (HermiT), structural metrics, and design pitfalls (OoPS!). Doesn't change the proposal."
+                  hint="Read-only quality checks: reasoner consistency (HermiT), structural metrics, and design pitfalls (OoPS!, if enabled). Doesn't change the proposal."
                   onClick={validate}
                   loading={validating}
                   disabled={!editedTurtle}
