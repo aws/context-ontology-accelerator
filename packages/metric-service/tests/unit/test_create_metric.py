@@ -334,6 +334,41 @@ class TestValidateSoft:
         assert kwargs["ontology_lookup"] is None
 
     @patch("coa_metrics.validator.validate_metric")
+    @patch("coa_metrics.lookups.NeptuneOntologyLookup")
+    @patch("coa_metrics.data_source_lookup_factory.build_data_source_lookup")
+    def test_injected_lookup_is_reused_without_building(
+        self,
+        mock_build_lookup: MagicMock,
+        mock_onto: MagicMock,
+        mock_validate: MagicMock,
+    ) -> None:
+        lookup = MagicMock()
+        mock_validate.return_value = ValidationResult(valid=True, errors=[], warnings=[])
+
+        result = _validate_soft(self._request(), "test-ns", data_source_lookup=lookup)
+
+        assert result == []
+        mock_build_lookup.assert_not_called()
+        assert mock_validate.call_args.kwargs["data_sources_lookup"] is lookup
+
+    @patch("coa_metrics.validator.validate_metric")
+    @patch("coa_metrics.lookups.NeptuneOntologyLookup")
+    @patch("coa_metrics.data_source_lookup_factory.build_data_source_lookup")
+    def test_injected_none_does_not_rebuild(
+        self,
+        mock_build_lookup: MagicMock,
+        mock_onto: MagicMock,
+        mock_validate: MagicMock,
+    ) -> None:
+        mock_validate.return_value = ValidationResult(valid=True, errors=[], warnings=[])
+
+        result = _validate_soft(self._request(), "test-ns", data_source_lookup=None)
+
+        assert result == []
+        mock_build_lookup.assert_not_called()
+        assert mock_validate.call_args.kwargs["data_sources_lookup"] is None
+
+    @patch("coa_metrics.validator.validate_metric")
     def test_converts_errors_and_warnings(self, mock_validate: MagicMock) -> None:
         mock_validate.return_value = ValidationResult(
             valid=False,
@@ -584,6 +619,49 @@ class TestSourceApprovalEnforcement:
 
 class TestSourceTableEnforcement:
     """#161: sourceTable is a hard block, but only on provable absence."""
+
+    @patch("coa_metrics.api.create_metric._validate_soft")
+    @patch("coa_metrics.api.create_metric.check_source_table_exists")
+    @patch("coa_metrics.api.create_metric.check_source_approved")
+    @patch("coa_metrics.data_source_lookup_factory.build_data_source_lookup")
+    @patch("coa_metrics.api.create_metric._get_eventbridge")
+    @patch("coa_metrics.api.create_metric._get_opensearch")
+    @patch("coa_metrics.api.create_metric._get_neptune")
+    def test_reuses_one_catalog_lookup_for_hard_and_soft_validation(
+        self,
+        mock_neptune: MagicMock,
+        mock_opensearch: MagicMock,
+        mock_eventbridge: MagicMock,
+        mock_build_lookup: MagicMock,
+        mock_source_approved: MagicMock,
+        mock_table_exists: MagicMock,
+        mock_validate_soft: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv(PERMISSIVE_ENV, raising=False)
+        lookup = MagicMock(name="shared_catalog_lookup")
+        mock_build_lookup.return_value = lookup
+        mock_source_approved.return_value = None
+        mock_table_exists.return_value = None
+        mock_validate_soft.return_value = []
+        mock_neptune.return_value.get_metric.return_value = None
+        mock_eventbridge.return_value.put_events.return_value = {}
+
+        response = handler(_make_event(body=_valid_body()), None)
+
+        assert response["statusCode"] == 201
+        mock_build_lookup.assert_called_once_with("test-ns")
+        mock_table_exists.assert_called_once_with(
+            "test-ns",
+            "ds-abc123",
+            "orders",
+            data_source_lookup=lookup,
+        )
+        mock_validate_soft.assert_called_once()
+        soft_call = mock_validate_soft.call_args
+        assert soft_call.args[0].source_table == "orders"
+        assert soft_call.args[1] == "test-ns"
+        assert soft_call.kwargs == {"data_source_lookup": lookup}
 
     @patch("coa_metrics.api.create_metric.check_source_table_exists")
     @patch("coa_metrics.api.create_metric._get_neptune")
