@@ -29,10 +29,11 @@ import os
 import random
 import time as _t
 import uuid
+from collections import Counter
 from collections.abc import Callable
 from datetime import UTC, datetime
 from threading import Thread
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from botocore.exceptions import ClientError
 from coa_common import sql_ident as _sql_ident
@@ -51,6 +52,9 @@ from coa_ontology.catalog.ingest import (
     wait_for_embeddings_searchable,
 )
 from coa_ontology.stores import build_stores as _build_stores  # noqa: F401 (re-exported for tests)
+
+if TYPE_CHECKING:
+    from coa_ontology.inducer.schemas import ConceptMatch
 
 _log = logging.getLogger("proposals.accept")
 
@@ -1952,6 +1956,18 @@ def repair_proposal_datatypes(
     )
 
 
+def _grounding_override_key(
+    match: "ConceptMatch",
+    overrides: dict[str, str | None],
+    table_match_counts: Counter[str],
+) -> str | None:
+    """Pick an exact identity key, or a safe unique-table legacy key."""
+    candidate_keys = [match.source_table_identity] if match.source_table_identity else []
+    if table_match_counts[match.source_table] == 1:
+        candidate_keys.append(match.source_table)
+    return next((key for key in candidate_keys if key in overrides), None)
+
+
 def _apply_grounding_overrides(proposal_id: str, overrides: dict[str, str | None], item: dict, namespace: str) -> dict:
     """Patch grounding matches and rebuild Turtle + R2RML."""
     import os
@@ -1969,17 +1985,21 @@ def _apply_grounding_overrides(proposal_id: str, overrides: dict[str, str | None
         raise HTTPException(409, "Proposal has no grounding matches to update")
 
     matches = [ConceptMatch(**m) if isinstance(m, dict) else m for m in raw_matches]
+    table_match_counts = Counter(m.source_table for m in matches if not m.source_column)
 
     for m in matches:
         if m.source_column:
             continue
-        override_uri = overrides.get(m.source_table)
-        if override_uri is None and m.source_table in overrides:
+        match_key = _grounding_override_key(m, overrides, table_match_counts)
+        if match_key is None:
+            continue
+        override_uri = overrides[match_key]
+        if override_uri is None:
             m.matched_class_uri = None
             m.matched_ontology_id = None
             m.match_type = "novel"
             m.similarity = None
-        elif override_uri is not None:
+        else:
             m.matched_class_uri = override_uri
             # Derive the tier from the chosen candidate's own score rather than
             # hardcoding "high_confidence". Hardcoding was lossy and wrong: an
