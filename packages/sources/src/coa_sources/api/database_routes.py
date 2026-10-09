@@ -1391,6 +1391,56 @@ def _scl_form_content(forms_data: list[dict[str, Any]] | None) -> str | None:
     return None
 
 
+def _find_table_asset(
+    client: SMUSClient,
+    project_id: str,
+    source_id: str,
+    table_id: str,
+) -> AssetResult | None:
+    """Find one table, tolerating temporary disagreement between search indexes.
+
+    The exact-name lookup restricts DataZone search to the name attribute,
+    while list-tables uses the normal search index. Immediately after asset
+    creation, the latter can expose a table before the former does. On an
+    exact-name miss, issue one unrestricted search for the full asset name and
+    verify candidates by exact equality.
+
+    The fallback deliberately does not paginate: synchronous review and
+    key-validation requests can resolve several assets, so each miss must cost
+    at most one additional DataZone call rather than multiplying a source-wide
+    page budget.
+    """
+    ds_key = f"DS#{source_id}"
+    asset_name = f"{ds_key}:{table_id}"
+    asset = client.find_asset_by_name(project_id=project_id, name=asset_name)
+    if asset is not None:
+        return asset
+
+    result = client.search_assets(
+        project_id=project_id,
+        search_text=asset_name,
+        max_results=50,
+        next_token=None,
+    )
+    for candidate in result.items:
+        if candidate.name == asset_name:
+            logger.info(
+                "table_asset_source_search_fallback_recovered",
+                source_id=source_id,
+                table_id=table_id,
+                asset_id=candidate.asset_id,
+            )
+            return candidate
+
+    logger.info(
+        "table_asset_source_search_fallback_missed",
+        source_id=source_id,
+        table_id=table_id,
+        additional_results_available=bool(result.next_token),
+    )
+    return None
+
+
 def _handle_list_tables(event: dict[str, Any], namespace_id: str, source_id: str) -> dict[str, Any]:
     """GET /namespaces/{namespaceId}/sources/{sourceId}/tables."""
     from coa_common.datazone_forms import FORM_TYPE_NAME
@@ -1598,10 +1648,8 @@ def _handle_get_table(namespace_id: str, source_id: str, table_id: str) -> dict[
 
     client = _get_smus_client()
     removed_tables, removed_columns, added_tables = _removed_sets(namespace_id, source_id)
-    ds_key = f"DS#{source_id}"
-    asset_name = f"{ds_key}:{table_id}"
     try:
-        asset = client.find_asset_by_name(project_id=project_id, name=asset_name)
+        asset = _find_table_asset(client, project_id, source_id, table_id)
     except Exception:
         logger.exception("get_table_search_failed", source_id=source_id, table_id=table_id)
         return api_response(500, {"error": "Failed to search for table"})
@@ -1778,14 +1826,14 @@ def _load_single_asset(
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """Search-and-load a single table asset by exact name match.
 
-    Performs 2 DataZone API calls (exact-name search + get_asset_forms),
-    independent of the total table count for the source. Returns
-    (asset_dict, None) or (None, error_response).
+    The normal path performs an exact-name search followed by
+    ``get_asset_forms``. If the exact-name index lags, the lookup performs one
+    additional unrestricted search for the full asset name before loading
+    forms or returning 404. Returns ``(asset_dict, None)`` or
+    ``(None, error_response)``.
     """
-    ds_key = f"DS#{source_id}"
-    asset_name = f"{ds_key}:{table_id}"
     try:
-        asset = client.find_asset_by_name(project_id=project_id, name=asset_name)
+        asset = _find_table_asset(client, project_id, source_id, table_id)
     except Exception:
         logger.exception("load_single_asset_search_failed", source_id=source_id, table_id=table_id)
         return None, api_response(500, {"error": "Failed to load table from catalog"})
@@ -1838,9 +1886,12 @@ def _find_source_table_assets_by_name(
     identifier, and persisting a reference outside this source would make the
     relationship impossible to validate or resolve later. The source record's
     discovered schema list is the complete namespace for its canonical
-    ``schema.table`` IDs, so probe each possible full asset name with an exact
-    DataZone filter. This proves uniqueness without catalog-wide token-search
-    pagination and retains the matched asset for metadata loading.
+    ``schema.table`` IDs, so probe each possible full asset name. Each schema
+    costs one exact-name lookup and, only while that index lags, one bounded
+    non-paginated fallback search. The worst case is therefore two DataZone
+    calls per schema; probing stops as soon as a second match proves ambiguity.
+    This preserves completeness without catalog-wide pagination and retains the
+    matched asset for metadata loading.
     """
     if not schemas:
         logger.warning("find_fk_target_tables_missing_schema_index", source_id=source_id, project_id=project_id)
@@ -1850,7 +1901,7 @@ def _find_source_table_assets_by_name(
     try:
         for schema in sorted(set(schemas)):
             table_id = f"{schema}.{table_name}"
-            asset = client.find_asset_by_name(project_id=project_id, name=f"DS#{source_id}:{table_id}")
+            asset = _find_table_asset(client, project_id, source_id, table_id)
             if asset is not None:
                 matching_assets[table_id] = asset
                 # Once two exact matches exist, the bare name is known to be

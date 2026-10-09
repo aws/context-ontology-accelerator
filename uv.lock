@@ -615,7 +615,7 @@ wheels = [
 
 [[package]]
 name = "coa"
-version = "0.3.5"
+version = "0.3.6"
 source = { virtual = "." }
 
 [package.dev-dependencies]
@@ -654,7 +654,7 @@ dev = [
 
 [[package]]
 name = "coa-common"
-version = "0.3.5"
+version = "0.3.6"
 source = { editable = "libs/common" }
 dependencies = [
     { name = "boto3" },
@@ -683,7 +683,7 @@ requires-dist = [
 
 [[package]]
 name = "coa-control-plane"
-version = "0.3.5"
+version = "0.3.6"
 source = { editable = "packages/control-plane" }
 dependencies = [
     { name = "boto3" },
@@ -721,7 +721,7 @@ requires-dist = [{ name = "pydantic", specifier = ">=2.0" }]
 
 [[package]]
 name = "coa-data-layer"
-version = "0.3.5"
+version = "0.3.6"
 source = { editable = "packages/data-layer" }
 dependencies = [
     { name = "coa-common" },
@@ -743,7 +743,7 @@ requires-dist = [{ name = "pydantic", specifier = ">=2.0" }]
 
 [[package]]
 name = "coa-mcp"
-version = "0.3.5"
+version = "0.3.6"
 source = { editable = "packages/mcp-server" }
 dependencies = [
     { name = "coa-common" },
@@ -770,7 +770,7 @@ requires-dist = [
 
 [[package]]
 name = "coa-metrics"
-version = "0.3.5"
+version = "0.3.6"
 source = { editable = "packages/metric-service" }
 dependencies = [
     { name = "boto3" },
@@ -799,7 +799,7 @@ requires-dist = [
 
 [[package]]
 name = "coa-ontology"
-version = "0.3.5"
+version = "0.3.6"
 source = { editable = "packages/ontology-engine" }
 dependencies = [
     { name = "aiosqlite" },
@@ -867,7 +867,7 @@ dev = [
 
 [[package]]
 name = "coa-serve"
-version = "0.3.5"
+version = "0.3.6"
 source = { editable = "packages/context-manager" }
 dependencies = [
     { name = "aiomysql" },
@@ -926,7 +926,7 @@ requires-dist = [
 
 [[package]]
 name = "coa-sources"
-version = "0.3.5"
+version = "0.3.6"
 source = { editable = "packages/sources" }
 dependencies = [
     { name = "boto3" },
@@ -959,7 +959,7 @@ integ = [
 
 [[package]]
 name = "coa-vkg"
-version = "0.3.5"
+version = "0.3.6"
 source = { virtual = "packages/vkg" }
 dependencies = [
     { name = "coa-common" },

@@ -23,6 +23,7 @@ import { ButtonWithHint } from "@components/ButtonWithHint";
 import { InfoPopover } from "@components/InfoPopover";
 import { SortableTable } from "@components/SortableTable";
 import {
+  conceptMatchKey,
   type ConceptMatch,
   type MatchCandidate,
   localName,
@@ -74,10 +75,10 @@ interface Props {
    * ``undefined`` means nothing is staged.
    */
   pendingOverride?: string | null;
-  /** Stage a chosen candidate URI for this table. */
-  onSelectCandidate?: (table: string, uri: string) => void;
-  /** Stage "keep novel" for this table. */
-  onMarkNovel?: (table: string) => void;
+  /** Stage a chosen candidate URI for this stable grounding match key. */
+  onSelectCandidate?: (matchKey: string, uri: string) => void;
+  /** Stage "keep novel" for this stable grounding match key. */
+  onMarkNovel?: (matchKey: string) => void;
 }
 
 export function GroundingCandidates({
@@ -87,6 +88,7 @@ export function GroundingCandidates({
   onMarkNovel,
 }: Props) {
   const candidates = match.candidates ?? [];
+  const matchKey = conceptMatchKey(match);
   // Optimistic chosen URI: a staged (unsaved) override wins over the persisted
   // one. A ``null`` override means the steward staged "keep novel".
   const hasPending = pendingOverride !== undefined;
@@ -189,7 +191,7 @@ export function GroundingCandidates({
             ? ({ detail }) => {
                 const picked = detail.selectedItems[0];
                 if (picked && picked.entity_uri !== chosenUri) {
-                  onSelectCandidate?.(match.source_table, picked.entity_uri);
+                  onSelectCandidate?.(matchKey, picked.entity_uri);
                 }
               }
             : undefined
@@ -272,7 +274,7 @@ export function GroundingCandidates({
         <ButtonWithHint
           hint="Clears grounding so this class becomes a new concept with no foundational link. Use when no candidate is a real match. Staged until you Save changes."
           variant="inline-link"
-          onClick={() => onMarkNovel(match.source_table)}
+          onClick={() => onMarkNovel(matchKey)}
         >
           Mark novel (no grounding)
         </ButtonWithHint>

@@ -30,8 +30,9 @@ function renderOntology(
     bedrockChatModelId?: string;
   },
   id: string,
+  extraContext: Record<string, unknown> = {},
 ): Template {
-  const app = new cdk.App({ context: TEST_CONTEXT });
+  const app = new cdk.App({ context: { ...TEST_CONTEXT, ...extraContext } });
   const network = new NetworkStack(app, `${id}Network`);
   return Template.fromStack(
     new OntologyStack(app, id, {
@@ -123,6 +124,49 @@ describe("OntologyStack model IDs from deploy config (#94)", () => {
     // No stale us. literals left behind in the widgets.
     expect(body).not.toContain("us.anthropic.claude-sonnet-4-6");
     expect(body).not.toContain("us.cohere.embed-v4:0");
+  });
+});
+
+describe("OntologyStack OoPS! endpoint is opt-in (#171)", () => {
+  test("oops_endpoint context reaches the container as OOPS_ENDPOINT", () => {
+    const t = renderOntology({}, "OopsOn", {
+      oops_endpoint: "https://oops.example.test/rest",
+    });
+    expect(envValue(t, "OOPS_ENDPOINT")).toBe("https://oops.example.test/rest");
+  });
+
+  test("a non-https oops_endpoint fails synth", () => {
+    expect(() =>
+      renderOntology({}, "OopsHttp", {
+        oops_endpoint: "http://oops.example.test/rest",
+      }),
+    ).toThrow(/https:\/\//);
+  });
+
+  test("the https scheme check is case-insensitive", () => {
+    const t = renderOntology({}, "OopsUpper", {
+      oops_endpoint: "HTTPS://oops.example.test/rest",
+    });
+    expect(envValue(t, "OOPS_ENDPOINT")).toBe("HTTPS://oops.example.test/rest");
+  });
+
+  test.each([
+    ["object", { url: "https://oops.example.test/rest" }],
+    ["boolean", true],
+    ["number", 443],
+  ])("a non-string (%s) oops_endpoint fails synth", (_label, value) => {
+    expect(() =>
+      renderOntology({}, `OopsBad${_label}`, { oops_endpoint: value }),
+    ).toThrow(/https:\/\//);
+  });
+
+  test.each([
+    ["absent", {}],
+    ["empty", { oops_endpoint: "" }],
+    ["whitespace", { oops_endpoint: "  " }],
+  ])("%s oops_endpoint leaves OOPS_ENDPOINT unset", (_label, ctx) => {
+    const t = renderOntology({}, `OopsOff${_label}`, ctx);
+    expect(containerEnv(t).some((e) => e.Name === "OOPS_ENDPOINT")).toBe(false);
   });
 });
 

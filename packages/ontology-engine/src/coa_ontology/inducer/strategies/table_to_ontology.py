@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from collections import Counter
 from itertools import batched
 
 import httpx
@@ -114,6 +115,35 @@ def _xsd_for(data_type: str, column_name: str = "") -> URIRef:
     return _SQL_TO_XSD.get(base, XSD.string)
 
 
+def _match_maps(
+    matches: list[ConceptMatch],
+) -> tuple[dict[tuple[str, str], ConceptMatch], dict[tuple[str, str], ConceptMatch]]:
+    """Index current matches by identity and only unambiguous legacy matches by name."""
+    identity_matches = {
+        (match.source_table_identity, match.source_column): match for match in matches if match.source_table_identity
+    }
+    legacy_key_counts = Counter((match.source_table, match.source_column) for match in matches)
+    legacy_matches = {
+        (match.source_table, match.source_column): match
+        for match in matches
+        if not match.source_table_identity and legacy_key_counts[(match.source_table, match.source_column)] == 1
+    }
+    return identity_matches, legacy_matches
+
+
+def _match_for_table(
+    identity_matches: dict[tuple[str, str], ConceptMatch],
+    legacy_matches: dict[tuple[str, str], ConceptMatch],
+    table: CatalogTable,
+    column_name: str,
+) -> ConceptMatch | None:
+    """Return the identity-scoped match, falling back for old persisted records."""
+    match = identity_matches.get((table_identity(table), column_name))
+    if match is not None:
+        return match
+    return legacy_matches.get((table.name, column_name))
+
+
 class TableToOntologyStrategy(InductionStrategy):
     """Original strategy: embed table/column names, match via cosine similarity."""
 
@@ -163,7 +193,8 @@ class TableToOntologyStrategy(InductionStrategy):
         # Behavior-preserving: match_concepts has no cross-table dependency —
         # table-level grounding hits the EXTERNAL AOSS foundational pool
         # (grounding_svc.ground_table) and column-level matching reads only its
-        # OWN table's grounding result (table_ontology[concept.table_name]),
+        # OWN table identity's grounding result
+        # (table_ontology[concept.source_table_identity]),
         # both computed within the same call; and embed_concepts uses store=False
         # so no batch writes embeddings a later batch could recall. So a table's
         # matches are identical whether it is processed alone, in a batch, or with
@@ -262,6 +293,7 @@ class TableToOntologyStrategy(InductionStrategy):
                     CM(
                         source_column=column_name,
                         source_table=table.name,
+                        source_table_identity=table_identity(table),
                         matched_class_uri=None,
                         matched_ontology_id=None,
                         similarity=None,
@@ -292,8 +324,8 @@ class TableToOntologyStrategy(InductionStrategy):
             cost_tracker.record_stage_duration("ColumnMatch", total_column_match_ms)
 
         # Build proposal ontology once, from ALL tables + ALL matches (no vectors
-        # resident). match_map is a (table, column) dict, so match order is
-        # irrelevant, but batches stay grouped for cleanliness.
+        # resident). Match maps are keyed by (table identity, column), with a
+        # legacy name-only fallback, so match order is irrelevant.
         proposal_graph, novel_tables = self._build_proposal_ontology(
             ontology_uri_prefix,
             tables,
@@ -326,7 +358,8 @@ class TableToOntologyStrategy(InductionStrategy):
         match_confidence = ns["matchConfidence"]
         g.add((match_confidence, RDF.type, OWL.AnnotationProperty))
 
-        match_map = {(m.source_table, m.source_column): m for m in matches}
+        identity_match_map, legacy_match_map = _match_maps(matches)
+
         pk_sharing_confirmed, pk_sharing_suggested = detect_pk_sharing_subtypes(tables)
         novel_tables = set()
 
@@ -386,7 +419,7 @@ class TableToOntologyStrategy(InductionStrategy):
             return None
 
         for table in tables:
-            tm = match_map.get((table.name, ""))
+            tm = _match_for_table(identity_match_map, legacy_match_map, table, "")
             is_grounded = tm and tm.match_type in ("exact", "high_confidence")
 
             if not is_grounded:
@@ -603,7 +636,7 @@ class TableToOntologyStrategy(InductionStrategy):
                         if tc.constraintType == "UNIQUE" and col.name in tc.columns and len(tc.columns) == 1:
                             is_unique = True
                             break
-                cm = match_map.get((table.name, col.name))
+                cm = _match_for_table(identity_match_map, legacy_match_map, table, col.name)
                 for prop_uri in minted:
                     g.add((prop_uri, RDFS.label, Literal(col.name)))
                     # Column synonyms -> skos:altLabel (persisted in the graph).

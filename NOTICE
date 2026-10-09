@@ -13,22 +13,23 @@ Third-party components
 --------------------------------------------------------------------------------
 
 - aiohappyeyeballs (2.6.2) — PSF-2.0
-- aiohttp (3.14.1) — Apache-2.0
+- aiohttp (3.14.3) — Apache-2.0
+- aiomysql (0.3.2) — MIT
 - aiosignal (1.4.0) — Apache-2.0
 - aiosqlite (0.22.1) — MIT
 - annotated-doc (0.0.4) — MIT
 - annotated-types (0.7.0) — MIT
 - anthropic (0.109.1) — MIT
 - anthropic-bedrock (0.8.0) — MIT
-- anyio (4.13.0) — MIT
+- anyio (4.14.2) — MIT
 - asyncpg (0.31.0) — Apache-2.0
 - attrs (26.1.0) — MIT
-- banks (2.4.2) — MIT
-- bedrock-agentcore (1.9.1) — Apache-2.0
+- banks (2.5.1) — MIT
+- bedrock-agentcore (1.18.1) — Apache-2.0
 - blis (1.3.3) — BSD-3-Clause
-- boto3 (1.43.15) — Apache-2.0
+- boto3 (1.43.65) — Apache-2.0
 - boto3-stubs (1.43.37) — MIT
-- botocore (1.43.15) — Apache-2.0
+- botocore (1.43.65) — Apache-2.0
 - botocore-stubs (1.43.14) — MIT
 - catalogue (2.0.10) — MIT
 - cedarpy (4.8.3) — Apache-2.0
@@ -40,13 +41,13 @@ Third-party components
 - colorama (0.4.6) — BSD-3-Clause
 - confection (0.1.5) — MIT
 - coverage (7.14.1) — Apache-2.0
-- cryptography (48.0.0) — Apache-2.0
+- cryptography (50.0.0) — Apache-2.0
 - cymem (2.0.13) — MIT
 - dataclasses-json (0.6.7) — MIT
 - defusedxml (0.7.1) — PSF-2.0
 - Deprecated (1.3.1) — MIT
 - dirtyjson (1.0.8) — MIT
-- distro (1.9.0) — Apache-2.0
+- distro (1.9.0) — Apache License, Version 2.0
 - docker (7.1.0) — Apache-2.0
 - docstring_parser (0.18.0) — MIT
 - Events (0.5) — BSD-3-Clause
@@ -57,7 +58,7 @@ Third-party components
 - frozenlist (1.8.0) — Apache-2.0
 - fsspec (2026.4.0) — BSD-3-Clause
 - google-auth (2.53.0) — Apache-2.0
-- graphrag-lexical-graph (3.18.6) — Apache-2.0
+- graphrag-lexical-graph (3.18.7) — Apache-2.0
 - greenlet (3.5.1) — MIT
 - griffe (2.0.2) — ISC
 - griffecli (2.0.2) — ISC
@@ -92,7 +93,7 @@ Third-party components
 - markdown-it-py (4.2.0) — MIT
 - MarkupSafe (3.0.3) — BSD-3-Clause
 - marshmallow (3.26.2) — MIT
-- mcp (1.27.1) — MIT
+- mcp (1.29.0) — MIT
 - mdurl (0.1.2) — MIT
 - moto (5.2.1) — Apache-2.0
 - multidict (6.7.1) — Apache-2.0
@@ -103,7 +104,7 @@ Third-party components
 - narwhals (2.22.1) — MIT
 - nest-asyncio (1.6.0) — BSD-3-Clause
 - networkx (3.6.1) — BSD-3-Clause
-- nltk (3.9.4) — Apache-2.0
+- nltk (3.10.3) — Apache License, Version 2.0
 - numpy (2.4.6) — BSD-3-Clause
 - opensearch-protobufs (1.2.0) — Apache-2.0
 - opensearch-py (3.2.0) — Apache-2.0
@@ -117,7 +118,7 @@ Third-party components
 - packaging (26.2) — Apache-2.0
 - pandas (3.0.3) — BSD-3-Clause
 - pathspec (1.1.1) — MPL-2.0
-- pillow (12.2.0) — MIT
+- pillow (12.3.0) — MIT
 - pipe (2.2) — MIT
 - platformdirs (4.10.0) — MIT
 - pluggy (1.6.0) — MIT
@@ -127,15 +128,17 @@ Third-party components
 - protobuf (7.35.0) — BSD-3-Clause
 - py (1.11.0) — MIT
 - py-partiql-parser (0.6.3) — MIT
-- pyasn1 (0.6.3) — BSD-2-Clause
+- pyasn1 (0.6.4) — BSD-2-Clause
 - pyasn1_modules (0.4.2) — BSD-3-Clause
 - pycparser (3.0) — BSD-3-Clause
 - pydantic (2.13.4) — MIT
-- pydantic-settings (2.14.1) — MIT
+- pydantic-settings (2.15.0) — MIT
 - pydantic_core (2.46.4) — MIT
 - Pygments (2.20.0) — BSD-2-Clause
-- PyJWT (2.13.0) — MIT
+- PyJWT (2.15.1) — MIT
+- PyMySQL (1.2.0) — MIT
 - pyparsing (3.3.2) — MIT
+- pypdfium2 (5.13.0) — BSD-3-Clause, Apache-2.0, dependency licenses
 - pyshacl (0.31.0) — Apache-2.0
 - pytest (9.0.3) — MIT
 - pytest-asyncio (1.4.0) — Apache-2.0
@@ -143,7 +146,8 @@ Third-party components
 - pytest-xdist (3.8.0) — MIT
 - python-dateutil (2.9.0.post0) — BSD-3-Clause
 - python-dotenv (1.2.2) — BSD-3-Clause
-- python-multipart (0.0.29) — Apache-2.0
+- python-multipart (0.0.32) — Apache-2.0
+- python-tds (1.17.1) — MIT
 - python-ulid (3.1.0) — MIT
 - PyYAML (6.0.3) — MIT
 - rdflib (7.6.0) — BSD-3-Clause
@@ -156,10 +160,10 @@ Third-party components
 - rich (15.0.0) — MIT
 - rpds-py (0.30.0) — MIT
 - ruff (0.15.14) — MIT
-- s3transfer (0.17.1) — Apache-2.0
+- s3transfer (0.19.2) — Apache-2.0
 - scikit-learn (1.9.0) — BSD-3-Clause
 - scipy (1.17.1) — BSD-3-Clause
-- setuptools (82.0.1) — MIT
+- setuptools (84.0.0) — MIT
 - shellingham (1.5.4) — ISC
 - six (1.17.0) — MIT
 - smart-open (7.1.0) — MIT
@@ -171,7 +175,7 @@ Third-party components
 - sqlglot (30.8.0) — MIT
 - srsly (2.5.3) — MIT
 - sse-starlette (3.4.4) — BSD-3-Clause
-- starlette (1.1.0) — BSD-3-Clause
+- starlette (1.4.1) — BSD-3-Clause
 - strands-agents (1.41.0) — Apache-2.0
 - structlog (25.5.0) — Apache-2.0
 - tenacity (9.1.4) — Apache-2.0
@@ -191,14 +195,14 @@ Third-party components
 - typing-inspect (0.9.0) — MIT
 - typing-inspection (0.4.2) — MIT
 - typing_extensions (4.15.0) — PSF-2.0
-- urllib3 (2.7.0) — MIT
+- urllib3 (2.8.0) — MIT
 - uvicorn (0.48.0) — BSD-3-Clause
 - wasabi (1.1.3) — MIT
 - watchdog (6.0.0) — Apache-2.0
 - wcwidth (0.7.0) — MIT
 - weasel (0.4.3) — MIT
 - websockets (16.0) — BSD-3-Clause
-- Werkzeug (3.1.8) — BSD-3-Clause
+- Werkzeug (3.1.9) — BSD-3-Clause
 - wrapt (1.17.3) — BSD-3-Clause
 - xmltodict (1.0.4) — MIT
 - yarl (1.24.2) — Apache-2.0
