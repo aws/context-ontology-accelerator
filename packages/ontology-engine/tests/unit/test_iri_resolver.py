@@ -6,7 +6,7 @@
 Tests cover:
 
 - :func:`normalize_for_iri_path` (case-preserving normalization)
-- :func:`normalize_for_lookup_key` (case-folded normalization for hash equality)
+- :func:`normalize_for_lookup_key` (lowercased normalization for hash equality)
 - Resolver lookup / mint / resolve / bulk_resolve operations
 - Idempotent mint
 - Case-only variants share the same minted IRI (first-seen wins)
@@ -16,6 +16,8 @@ Tests cover:
 
 Requirements: 6.1–6.5, 7.1–7.5, 8.1–8.5
 """
+
+from __future__ import annotations
 
 import pytest
 from coa_common.constants import GRAPH_BASE_URI
@@ -133,7 +135,7 @@ class TestNormalizeForIRIPath:
 
 
 class TestNormalizeForLookupKey:
-    """:func:`normalize_for_lookup_key` — case-folded variant."""
+    """:func:`normalize_for_lookup_key` — lowercased variant."""
 
     def test_camel_case_lowercased(self):
         assert normalize_for_lookup_key("FinancialInstrument") == "financialinstrument"
@@ -152,7 +154,51 @@ class TestNormalizeForLookupKey:
         key = normalize_for_lookup_key("FinancialInstrument")
         assert path == "FinancialInstrument"
         assert key == "financialinstrument"
-        assert key == path.casefold()
+        assert key == path.lower()
+
+    def test_distinct_sharp_s_word_does_not_collide(self):
+        assert normalize_for_lookup_key("Maße") != normalize_for_lookup_key("Masse")
+
+    def test_simple_case_variants_share_lookup_key(self):
+        assert normalize_for_lookup_key("Σ") == normalize_for_lookup_key("σ") == normalize_for_lookup_key("ς")
+
+    def test_long_s_remains_distinct_from_ascii_s(self):
+        assert normalize_for_lookup_key("ſ") != normalize_for_lookup_key("s")
+
+    @pytest.mark.parametrize(
+        ("left", "right"),
+        [
+            pytest.param("A￣B", "A¯B", id="fullwidth-macron"),
+            pytest.param("ﾡￂ", "ㄱㅏ", id="halfwidth-hangul"),
+            pytest.param("Ꭰ", "ꭰ", id="cherokee-case"),
+            pytest.param("HO\u0308HE", "HÖHE", id="canonical-equivalence"),
+        ],
+    )
+    def test_width_case_and_canonical_variants_share_lookup_key(self, left: str, right: str):
+        assert normalize_for_lookup_key(left) == normalize_for_lookup_key(right)
+
+    @pytest.mark.parametrize(
+        ("left", "right"),
+        [
+            pytest.param("👩‍🔬", "👩🔬", id="zwj-sequence"),
+            pytest.param("a‌b", "ab", id="zwnj-sequence"),
+            pytest.param("µ", "μ", id="micro-sign-vs-greek-mu"),
+            pytest.param("ϐ", "β", id="beta-symbol-vs-beta"),
+            pytest.param("aͅ", "a", id="greek-combining-mark"),
+            pytest.param("ſ", "s", id="long-s"),
+        ],
+    )
+    def test_distinct_unicode_identities_do_not_share_lookup_key(self, left: str, right: str):
+        assert normalize_for_lookup_key(left) != normalize_for_lookup_key(right)
+
+    def test_width_variants_share_lookup_key_without_changing_path_spelling(self):
+        assert normalize_for_lookup_key("Ａ") == normalize_for_lookup_key("A") == "a"
+        assert normalize_for_lookup_key("ﾒｰｶｰ") == normalize_for_lookup_key("メーカー") == "メーカー"
+        assert normalize_for_iri_path("Ａ") == "Ａ"
+
+    def test_dotless_i_remains_distinct_and_cherokee_uses_lowercase_identity(self):
+        assert normalize_for_lookup_key("ı") != normalize_for_lookup_key("i")
+        assert normalize_for_lookup_key("Ꭰ") == normalize_for_lookup_key("ꭰ") == "ꭰ"
 
 
 class TestNormalizeStringAlias:
@@ -195,7 +241,7 @@ class TestLookup:
 
     def test_lookup_finds_via_case_only_variant(self):
         """Lookup with a case-only variant of a previously minted pair
-        finds it (case-folded equality on the lookup key)."""
+        finds it (lowercased equality on the lookup key)."""
         resolver = InMemoryIRIResolver(namespace="ns", ontology_name="onto")
         resolver.mint("Person", "class")
         # All of these case-only variants find the same IRI.
@@ -244,7 +290,7 @@ class TestMint:
         """First spelling persists; case-only variants reuse the same IRI.
 
         This is the intended behaviour described in the
-        :class:`InMemoryIRIResolver` docstring: case-folded lookup,
+        :class:`InMemoryIRIResolver` docstring: lowercased lookup,
         case-preserving IRI minting, first-seen-wins.
         """
         resolver = InMemoryIRIResolver(namespace="ns", ontology_name="onto")
@@ -261,6 +307,22 @@ class TestMint:
         iri1 = resolver.mint("Person", "class")
         iri2 = resolver.mint("Company", "class")
         assert iri1 != iri2
+
+    def test_distinct_sharp_s_words_get_different_iris(self):
+        resolver = InMemoryIRIResolver(namespace="ns", ontology_name="onto")
+        assert resolver.mint("Maße", "property") != resolver.mint("Masse", "property")
+
+    def test_greek_sigma_variants_reuse_first_seen_iri(self):
+        resolver = InMemoryIRIResolver(namespace="ns", ontology_name="onto")
+        first = resolver.mint("Σ", "property")
+        assert resolver.mint("σ", "property") == first
+        assert resolver.mint("ς", "property") == first
+
+    def test_width_variants_reuse_first_seen_iri_spelling(self):
+        resolver = InMemoryIRIResolver(namespace="ns", ontology_name="onto")
+        first = resolver.mint("Ａ", "class")
+        assert resolver.mint("A", "class") == first
+        assert first.endswith("/class/Ａ")
 
     def test_raises_on_whitespace_only_input(self):
         resolver = InMemoryIRIResolver(namespace="ns", ontology_name="onto")

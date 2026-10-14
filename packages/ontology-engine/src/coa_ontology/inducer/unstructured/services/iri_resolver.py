@@ -39,7 +39,7 @@ Two normalization passes operate at different stages:
     - ``"acme corp"`` → ``"acme-corp"``
     - ``"Treasury Bond (2024)"`` → ``"Treasury-Bond-2024"``
 
-- :func:`normalize_for_lookup_key` — case-folding. Used to build the
+- :func:`normalize_for_lookup_key` — lowercasing. Used to build the
   hash key for the resolver's internal dict so case-only variants
   ``"Person"`` and ``"PERSON"`` collide on the same canonical IRI.
   The first-seen spelling is preserved in the IRI itself; subsequent
@@ -67,6 +67,8 @@ from typing import Protocol, runtime_checkable
 from urllib.parse import quote
 
 from coa_common.constants import GRAPH_BASE_URI
+
+from coa_ontology.inducer.services.unicode_normalization import simple_case_identity, width_only_nfkc
 
 _IRI_TEMPLATE = f"{GRAPH_BASE_URI}/namespace/{{ns}}/ontology/{{name}}/{{cls}}/{{value}}"
 _MAX_IRI_LENGTH = 2048
@@ -162,16 +164,18 @@ def normalize_for_iri_path(s: str) -> str:
 
 
 def normalize_for_lookup_key(s: str) -> str:
-    """Case-folded variant of :func:`normalize_for_iri_path`.
+    """Simple-case identity variant of :func:`normalize_for_iri_path`.
 
-    Used by :class:`InMemoryIRIResolver` to build hash keys so that
-    case-only variants of the same string ("Person" vs "person" vs
-    "PERSON") collide on the same canonical IRI. The IRI itself uses
-    the first-seen spelling, preserved by :func:`normalize_for_iri_path`.
-
-    Equivalent to ``normalize_for_iri_path(s).casefold()``.
+    Used by :class:`InMemoryIRIResolver` to build hash keys so ordinary
+    case-only variants share the first-seen IRI. Ordinary lowercase plus an
+    explicit final-sigma mapping unifies Greek ``Σ``/``σ``/``ς`` without
+    compatibility substitutions or expansions: persisted identities such as
+    German ``Maße``/``Masse``, ``µ``/``μ``, and ``ſ``/``s`` remain distinct.
+    The lookup key folds only U+FF00–U+FFEF width forms before path
+    normalization, so fullwidth ASCII and halfwidth Katakana reuse the
+    first-seen IRI spelling without applying destructive compatibility folds.
     """
-    return normalize_for_iri_path(s).casefold()
+    return simple_case_identity(normalize_for_iri_path(width_only_nfkc(s)))
 
 
 # Legacy alias for backwards compatibility. Now case-preserving.
@@ -258,10 +262,10 @@ class InMemoryIRIResolver:
 
     - :func:`normalize_for_iri_path` builds the case-preserving path
       segment used in the minted IRI.
-    - :func:`normalize_for_lookup_key` builds the case-folded hash key
+    - :func:`normalize_for_lookup_key` builds the lowercased hash key
       used to look up an existing IRI for the same logical pair.
 
-    The first call to ``resolve`` (or ``mint``) for a given case-folded
+    The first call to ``resolve`` (or ``mint``) for a given lowercased
     pair "wins" — its case-preserving form goes into the IRI, and
     subsequent calls with case-only variants reuse that IRI.
 
@@ -287,7 +291,7 @@ class InMemoryIRIResolver:
 
         self._namespace = namespace
         self._ontology_name = ontology_name
-        # Maps (case-folded value, case-folded classification) → minted IRI.
+        # Maps (lowercased value, lowercased classification) → minted IRI.
         # The IRI itself contains the first-seen case-preserving forms.
         self._store: dict[tuple[str, str], str] = {}
 

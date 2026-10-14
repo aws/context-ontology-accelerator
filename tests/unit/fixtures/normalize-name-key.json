@@ -1,0 +1,272 @@
+[
+  {
+    "id": "ja-kanji",
+    "input": "設置場所",
+    "expected": "設置場所"
+  },
+  {
+    "id": "ja-katakana",
+    "input": "メーカー",
+    "expected": "メーカー"
+  },
+  {
+    "id": "ja-halfwidth-katakana",
+    "input": "ﾒｰｶｰ",
+    "expected": "メーカー"
+  },
+  {
+    "id": "fullwidth-ascii",
+    "input": "ＡＢＣ１２３",
+    "expected": "abc123"
+  },
+  {
+    "id": "fullwidth-macron-direct-width-map",
+    "input": "A￣B",
+    "expected": "a¯b"
+  },
+  {
+    "id": "halfwidth-hangul-direct-width-map",
+    "input": "ﾡￂ",
+    "expected": "ㄱㅏ"
+  },
+  {
+    "id": "compatibility-hangul-counterpart",
+    "input": "ㄱㅏ",
+    "expected": "ㄱㅏ"
+  },
+  {
+    "id": "latin-dotless-i",
+    "input": "ı",
+    "expected": "ı"
+  },
+  {
+    "id": "cherokee-uppercase",
+    "input": "Ꭰ",
+    "expected": "ꭰ"
+  },
+  {
+    "id": "cherokee-lowercase",
+    "input": "ꭰ",
+    "expected": "ꭰ"
+  },
+  {
+    "id": "ja-katakana-nfd-dakuten",
+    "input": "カ\u3099イド",
+    "expected": "ガイド"
+  },
+  {
+    "id": "zh-hans",
+    "input": "安装位置",
+    "expected": "安装位置"
+  },
+  {
+    "id": "ko-hangul",
+    "input": "제조사",
+    "expected": "제조사"
+  },
+  {
+    "id": "ko-jamo-separated-by-punctuation",
+    "input": "ᄀ-ᅡ",
+    "expected": "가"
+  },
+  {
+    "id": "hi-vowel-sign-i",
+    "input": "कि",
+    "expected": "कि"
+  },
+  {
+    "id": "hi-vowel-sign-ii",
+    "input": "की",
+    "expected": "की"
+  },
+  {
+    "id": "th-vowel-sign-i",
+    "input": "กิ",
+    "expected": "กิ"
+  },
+  {
+    "id": "th-vowel-sign-ii",
+    "input": "กี",
+    "expected": "กี"
+  },
+  {
+    "id": "attached-enclosing-mark",
+    "input": "क⃝",
+    "expected": "क⃝"
+  },
+  {
+    "id": "heart-symbol-with-variation-selector",
+    "input": "❤️",
+    "expected": "❤️"
+  },
+  {
+    "id": "airplane-symbol-with-variation-selector",
+    "input": "✈️",
+    "expected": "✈️"
+  },
+  {
+    "id": "emoji-zwj-sequence",
+    "input": "👩‍🔬",
+    "expected": "👩‍🔬"
+  },
+  {
+    "id": "emoji-unjoined-symbols",
+    "input": "👩🔬",
+    "expected": "👩🔬"
+  },
+  {
+    "id": "england-subdivision-flag",
+    "input": "\ud83c\udff4\udb40\udc67\udb40\udc62\udb40\udc65\udb40\udc6e\udb40\udc67\udb40\udc7f",
+    "expected": "\ud83c\udff4\udb40\udc67\udb40\udc62\udb40\udc65\udb40\udc6e\udb40\udc67\udb40\udc7f"
+  },
+  {
+    "id": "scotland-subdivision-flag",
+    "input": "\ud83c\udff4\udb40\udc67\udb40\udc62\udb40\udc73\udb40\udc63\udb40\udc74\udb40\udc7f",
+    "expected": "\ud83c\udff4\udb40\udc67\udb40\udc62\udb40\udc73\udb40\udc63\udb40\udc74\udb40\udc7f"
+  },
+  {
+    "id": "orphan-tag-character",
+    "input": "\udb40\udc67",
+    "expected": ""
+  },
+  {
+    "id": "zwnj-sequence",
+    "input": "a‌b",
+    "expected": "a‌b"
+  },
+  {
+    "id": "zwnj-unjoined-counterpart",
+    "input": "ab",
+    "expected": "ab"
+  },
+  {
+    "id": "micro-sign",
+    "input": "µ",
+    "expected": "µ"
+  },
+  {
+    "id": "greek-small-mu",
+    "input": "μ",
+    "expected": "μ"
+  },
+  {
+    "id": "greek-beta-symbol",
+    "input": "ϐ",
+    "expected": "ϐ"
+  },
+  {
+    "id": "greek-small-beta",
+    "input": "β",
+    "expected": "β"
+  },
+  {
+    "id": "attached-greek-ypogegrammeni",
+    "input": "aͅ",
+    "expected": "aͅ"
+  },
+  {
+    "id": "temperature-symbol",
+    "input": "℃",
+    "expected": "℃"
+  },
+  {
+    "id": "trademark-symbol",
+    "input": "™",
+    "expected": "™"
+  },
+  {
+    "id": "symbol-bearing-name",
+    "input": "Brand™",
+    "expected": "brand™"
+  },
+  {
+    "id": "ru-cyrillic",
+    "input": "ИЗГОТОВИТЕЛЬ",
+    "expected": "изготовитель"
+  },
+  {
+    "id": "el-uppercase-sigma",
+    "input": "Σ",
+    "expected": "σ"
+  },
+  {
+    "id": "el-small-sigma",
+    "input": "σ",
+    "expected": "σ"
+  },
+  {
+    "id": "el-final-sigma",
+    "input": "ς",
+    "expected": "σ"
+  },
+  {
+    "id": "latin-long-s-lowercase",
+    "input": "ſ",
+    "expected": "ſ"
+  },
+  {
+    "id": "de-umlaut-nfc",
+    "input": "HÖHE",
+    "expected": "höhe"
+  },
+  {
+    "id": "de-umlaut-nfd",
+    "input": "HO\u0308HE",
+    "expected": "höhe"
+  },
+  {
+    "id": "pt-accents",
+    "input": "ÓRGÃO",
+    "expected": "órgão"
+  },
+  {
+    "id": "fr-grave",
+    "input": "MODÈLE",
+    "expected": "modèle"
+  },
+  {
+    "id": "de-sharp-s",
+    "input": "Straße",
+    "expected": "straße"
+  },
+  {
+    "id": "de-uppercase-sharp-s",
+    "input": "STRAẞE",
+    "expected": "straße"
+  },
+  {
+    "id": "de-ascii-double-s",
+    "input": "STRASSE",
+    "expected": "strasse"
+  },
+  {
+    "id": "spaced-name",
+    "input": "Financial Instrument",
+    "expected": "financialinstrument"
+  },
+  {
+    "id": "snake-case",
+    "input": "clinical_trial",
+    "expected": "clinicaltrial"
+  },
+  {
+    "id": "mixed-separators",
+    "input": "Policy_Amount",
+    "expected": "policyamount"
+  },
+  {
+    "id": "ascii-punctuation",
+    "input": "Policy (v2)",
+    "expected": "policyv2"
+  },
+  {
+    "id": "cjk-punctuation",
+    "input": "設置場所（屋内）",
+    "expected": "設置場所屋内"
+  },
+  {
+    "id": "unicode-15-unassigned-cjk-extension-i",
+    "input": "\ud87a\udff0",
+    "expected": ""
+  }
+]

@@ -18,13 +18,18 @@ from unittest.mock import MagicMock
 
 import pytest
 from coa_common.constants import GRAPH_BASE_URI
+from coa_ontology.inducer.schemas import ConceptMatch, MatchCandidate
 from coa_ontology.inducer.services.grounding import (
     GroundingCandidate,
     GroundingRerankError,
     GroundingResult,
+    GroundingService,
 )
 from coa_ontology.inducer.unstructured.services.class_grounding import (
     ClassGroundingInput,
+    _local_name,
+    _normalize_name_key,
+    apply_overrides_to_turtle,
     ground_classes,
 )
 from rdflib import OWL, RDF, RDFS, Graph, Literal, URIRef
@@ -88,8 +93,6 @@ def _novel_with_candidates() -> GroundingResult:
 
 
 def _svc(result: GroundingResult) -> MagicMock:
-    from coa_ontology.inducer.services.grounding import GroundingService
-
     svc = MagicMock()
     svc.ground_class.return_value = result
     # Delegate to_concept_match to the REAL pure mapping so match records are
@@ -362,8 +365,6 @@ class TestApplyOverridesToTurtle:
     """
 
     def _match(self, *, matched_uri, match_type, candidates_uris=("http://fibo/Agreement", "http://fibo/Commitment")):
-        from coa_ontology.inducer.schemas import ConceptMatch, MatchCandidate
-
         return ConceptMatch(
             source_table="FinancialInstrument",  # == rdfs:label
             source_column="",
@@ -375,10 +376,6 @@ class TestApplyOverridesToTurtle:
         )
 
     def test_repick_replaces_grounding_target(self):
-        from coa_ontology.inducer.unstructured.services.class_grounding import (
-            apply_overrides_to_turtle,
-        )
-
         m = self._match(matched_uri=self._NEW_TARGET, match_type="high_confidence")
         new_ttl, grounded = apply_overrides_to_turtle(self._BASE_TTL, [m], uri_prefix=_PREFIX)
 
@@ -396,10 +393,6 @@ class TestApplyOverridesToTurtle:
         assert (cls, RDFS.label, Literal("FinancialInstrument")) in g
 
     def test_mark_novel_drops_grounding(self):
-        from coa_ontology.inducer.unstructured.services.class_grounding import (
-            apply_overrides_to_turtle,
-        )
-
         m = self._match(matched_uri=None, match_type="novel")
         new_ttl, grounded = apply_overrides_to_turtle(self._BASE_TTL, [m], uri_prefix=_PREFIX)
 
@@ -414,19 +407,75 @@ class TestApplyOverridesToTurtle:
         # Class declaration + label still intact.
         assert (cls, RDF.type, OWL.Class) in g
 
-    def test_unknown_label_is_skipped(self):
-        from coa_ontology.inducer.unstructured.services.class_grounding import (
-            apply_overrides_to_turtle,
+    def test_partial_override_counts_untouched_grounded_classes(self):
+        other_class = f"{GRAPH_BASE_URI}/namespace/ns/ontology/induced#Other"
+        other_target = "http://fibo/Other"
+        turtle = (
+            self._BASE_TTL
+            + f"""
+<{other_class}> a owl:Class ;
+    rdfs:label "Other" ;
+    rdfs:subClassOf <{other_target}> ;
+    skos:closeMatch <{other_target}> .
+"""
         )
+        changed = self._match(matched_uri=None, match_type="novel")
 
+        new_ttl, grounded = apply_overrides_to_turtle(turtle, [changed], uri_prefix=_PREFIX)
+
+        graph = Graph().parse(data=new_ttl, format="turtle")
+        assert (URIRef(other_class), SKOS.closeMatch, URIRef(other_target)) in graph
+        assert grounded == 1
+
+    def test_unknown_label_aborts(self):
         m = self._match(matched_uri=self._NEW_TARGET, match_type="exact")
-        m.source_table = "NoSuchClass"  # no rdfs:label match
-        new_ttl, grounded = apply_overrides_to_turtle(self._BASE_TTL, [m], uri_prefix=_PREFIX)
-        g = Graph()
-        g.parse(data=new_ttl, format="turtle")
-        # Original grounding untouched (nothing to patch), nothing new grounded.
-        assert (URIRef(self._CLS), SKOS.closeMatch, URIRef(self._OLD_TARGET)) in g
-        assert grounded == 0
+        m.source_table = "NoSuchClass"
+        with pytest.raises(ValueError, match="no class matching"):
+            apply_overrides_to_turtle(self._BASE_TTL, [m], uri_prefix=_PREFIX)
+
+    def test_empty_normalized_label_aborts(self):
+        """An empty punctuation-only key must abort rather than report success."""
+        ttl = self._BASE_TTL.replace('"FinancialInstrument"', '"!!!"')
+        m = self._match(matched_uri=self._NEW_TARGET, match_type="exact")
+        m.source_table = "???"
+        with pytest.raises(ValueError, match="empty normalized key"):
+            apply_overrides_to_turtle(ttl, [m], uri_prefix=_PREFIX)
+
+    def test_ambiguous_normalized_label_aborts(self):
+        """A lossy fallback key must never choose one of multiple classes."""
+        first = f"{GRAPH_BASE_URI}/namespace/ns/ontology/induced#First"
+        second = f"{GRAPH_BASE_URI}/namespace/ns/ontology/induced#Second"
+        ttl = f"""
+        @prefix owl: <http://www.w3.org/2002/07/owl#> .
+        @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+        @prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+        <{first}> a owl:Class ; rdfs:label "A-B" ; skos:closeMatch <{self._OLD_TARGET}> .
+        <{second}> a owl:Class ; rdfs:label "AB" ; skos:closeMatch <{self._OLD_TARGET}> .
+        """
+        m = self._match(matched_uri=self._NEW_TARGET, match_type="exact")
+        m.source_table = "A B"
+        with pytest.raises(ValueError, match="matches 2 classes"):
+            apply_overrides_to_turtle(ttl, [m], uri_prefix=_PREFIX)
+
+    def test_exact_label_wins_when_normalized_key_collides(self):
+        first = f"{GRAPH_BASE_URI}/namespace/ns/ontology/induced#First"
+        second = f"{GRAPH_BASE_URI}/namespace/ns/ontology/induced#Second"
+        ttl = f"""
+        @prefix owl: <http://www.w3.org/2002/07/owl#> .
+        @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+        @prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+        <{first}> a owl:Class ; rdfs:label "A-B" ; skos:closeMatch <{self._OLD_TARGET}> .
+        <{second}> a owl:Class ; rdfs:label "AB" ; skos:closeMatch <{self._OLD_TARGET}> .
+        """
+        m = self._match(matched_uri=self._NEW_TARGET, match_type="exact")
+        m.source_table = "AB"
+        new_ttl, grounded = apply_overrides_to_turtle(ttl, [m], uri_prefix=_PREFIX)
+        graph = Graph().parse(data=new_ttl, format="turtle")
+        assert (URIRef(second), SKOS.exactMatch, URIRef(self._NEW_TARGET)) in graph
+        assert (URIRef(first), SKOS.closeMatch, URIRef(self._OLD_TARGET)) in graph
+        # The untouched colliding class remains grounded while the exact-label
+        # class receives the override.
+        assert grounded == 2
 
 
 class TestOverrideLabelNormalization:
@@ -445,8 +494,6 @@ class TestOverrideLabelNormalization:
 """
 
     def _novel_match_spaced_label(self):
-        from coa_ontology.inducer.schemas import ConceptMatch, MatchCandidate
-
         return ConceptMatch(
             source_table="Financial Instrument",  # SPACED — differs from rdfs:label
             source_column="",
@@ -458,10 +505,6 @@ class TestOverrideLabelNormalization:
         )
 
     def test_spaced_label_override_matches_camelcase_class(self):
-        from coa_ontology.inducer.unstructured.services.class_grounding import (
-            apply_overrides_to_turtle,
-        )
-
         new_ttl, grounded = apply_overrides_to_turtle(self._TTL, [self._novel_match_spaced_label()], uri_prefix=_PREFIX)
         g = Graph()
         g.parse(data=new_ttl, format="turtle")
@@ -473,6 +516,19 @@ class TestOverrideLabelNormalization:
         assert grounded == 0
         # Class + label still present.
         assert (cls, RDF.type, OWL.Class) in g
+
+    def test_percent_encoded_local_name_matches_unicode_label(self):
+        class_iri = f"{GRAPH_BASE_URI}/namespace/ns/ontology/unstructured/class/क%E0%A4%BF"
+        ttl = f"""@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+<{class_iri}> a owl:Class ; skos:closeMatch <{self._TARGET}> .
+"""
+        match = self._novel_match_spaced_label()
+        match.source_table = "कि"
+        new_ttl, grounded = apply_overrides_to_turtle(ttl, [match], uri_prefix=_PREFIX)
+        graph = Graph().parse(data=new_ttl, format="turtle")
+        assert (URIRef(class_iri), SKOS.closeMatch, URIRef(self._TARGET)) not in graph
+        assert grounded == 0
 
 
 class TestEmissionRelationship:
@@ -579,9 +635,6 @@ class TestOverridePreservesWithinRunLinks:
         """
 
     def test_within_run_sibling_closematch_survives_override(self):
-        from coa_ontology.inducer.schemas import ConceptMatch, MatchCandidate
-        from coa_ontology.inducer.unstructured.services.class_grounding import apply_overrides_to_turtle
-
         m = ConceptMatch(
             source_table="FinancialInstrument",
             source_column="",
@@ -602,3 +655,76 @@ class TestOverridePreservesWithinRunLinks:
         # The within-namespace sibling closeMatch MUST survive (not a grounding edge).
         assert (cls, SKOS.closeMatch, URIRef(self._SIBLING)) in g
         assert grounded == 1
+
+
+class TestNormalizeNameKeyIsScriptAgnostic:
+    """The key drives dict lookup, so an empty key attaches results to the wrong class.
+
+    ``_normalize_name_key`` joins the grounding side's SPACED label with the
+    Turtle's CamelCase ``rdfs:label``. The previous ``[^a-zA-Z0-9]`` filter judged
+    by ASCII range, so a non-Latin class label keyed to ``""`` — and because the
+    key is a dict key, every such label collided on one bucket rather than simply
+    failing to join.
+
+    These assertions must stay in step with ``grounding.ts::normalizeNameKey``:
+    the join works only because both sides produce the same key.
+    """
+
+    @pytest.mark.parametrize(
+        "label",
+        ["設置場所", "メーカー", "安装位置", "제조사", "ИЗГОТОВИТЕЛЬ"],
+    )
+    def test_a_non_latin_label_keeps_a_key(self, label):
+        assert _normalize_name_key(label) != ""
+
+    @pytest.mark.parametrize(
+        ("left", "right"),
+        [
+            pytest.param("設置場所", "メーカー", id="ja-unrelated"),
+            pytest.param("엘리베이터", "제조사", id="ko-unrelated"),
+        ],
+    )
+    def test_unrelated_non_latin_labels_do_not_share_a_key(self, left, right):
+        assert _normalize_name_key(left) != _normalize_name_key(right)
+
+    @pytest.mark.parametrize(
+        ("label", "expected"),
+        [
+            pytest.param("HÖHE", "höhe", id="de-umlaut"),
+            pytest.param("ÓRGÃO", "órgão", id="pt-accents"),
+            pytest.param("MODÈLE", "modèle", id="fr-grave"),
+        ],
+    )
+    def test_a_latin_label_keeps_its_accented_letter(self, label, expected):
+        """Previously ``HÖHE`` keyed to ``hhe`` — the letter went, not just its case.
+
+        Unlike ``grounding._normalize``, this key deliberately does NOT fold
+        diacritics: it joins two spellings of the same label, not two labels that
+        merely resemble each other.
+        """
+        assert _normalize_name_key(label) == expected
+
+    @pytest.mark.parametrize(
+        ("spaced", "camel"),
+        [
+            pytest.param("Financial Instrument", "FinancialInstrument", id="spaced-vs-camel"),
+            pytest.param("clinical_trial", "ClinicalTrial", id="snake-vs-camel"),
+            pytest.param("Policy_Amount", "PolicyAmount", id="mixed-separators"),
+        ],
+    )
+    def test_still_joins_the_spellings_it_exists_for(self, spaced, camel):
+        assert _normalize_name_key(spaced) == _normalize_name_key(camel)
+
+    def test_still_strips_punctuation(self):
+        assert _normalize_name_key("Policy (v2)") == "policyv2"
+        assert _normalize_name_key("設置場所（屋内）") == "設置場所屋内"
+
+    def test_preserves_symbols_and_unifies_sigma_without_expanding_sharp_s(self):
+        assert _normalize_name_key("Brand™") == "brand™"
+        assert _normalize_name_key("Temperature ℃") == "temperature℃"
+        assert _normalize_name_key("Σ") == _normalize_name_key("σ") == _normalize_name_key("ς")
+        assert _normalize_name_key("Maße") != _normalize_name_key("Masse")
+
+    @pytest.mark.parametrize("local_name", ["%FF", "A%20B%ZZ", "%E0%A4%BF%ZZ", "%", "%2"])
+    def test_local_name_preserves_whole_value_when_any_percent_escape_is_invalid(self, local_name: str):
+        assert _local_name(f"http://example.test/class/{local_name}") == local_name

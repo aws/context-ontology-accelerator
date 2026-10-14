@@ -40,6 +40,14 @@ const mkTestTable = (scope: Construct, id: string) =>
     stream: dynamodb.StreamViewType.NEW_AND_OLD_IMAGES,
   });
 
+/** The network-stack security groups ApiStack's VPC Lambdas require. */
+const mkTestSgs = (scope: Construct, vpc: ec2.IVpc) => ({
+  lambdaSecurityGroup: new ec2.SecurityGroup(scope, "LambdaSG", { vpc }),
+  authorizerSecurityGroup: new ec2.SecurityGroup(scope, "AuthorizerSG", {
+    vpc,
+  }),
+});
+
 describe("ApiStack authorizer — ARCHIVED guard wiring", () => {
   let template: Template;
 
@@ -57,6 +65,7 @@ describe("ApiStack authorizer — ARCHIVED guard wiring", () => {
         env: { account: "123456789012", region: "us-east-1" },
         allowedOrigin: "*",
         vpc,
+        ...mkTestSgs(depStack, vpc),
         rolesTable: mkTable("Roles"),
         resourceRoleMappingsTable: mkTable("RRM"),
         cacheInvalidationTable: mkTable("Cache"),
@@ -126,6 +135,7 @@ describe("ApiStack OE monitoring", () => {
         env: { account: "123456789012", region: "us-east-1" },
         allowedOrigin: "*",
         vpc,
+        ...mkTestSgs(depStack, vpc),
         rolesTable: mkTable("Roles"),
         resourceRoleMappingsTable: mkTable("RRM"),
         cacheInvalidationTable: mkTable("Cache"),
@@ -153,6 +163,7 @@ describe("ApiStack WAF WebACL", () => {
         env: { account: "123456789012", region: "us-east-1" },
         allowedOrigin: "*",
         vpc,
+        ...mkTestSgs(depStack, vpc),
         rolesTable: mkTable("Roles"),
         resourceRoleMappingsTable: mkTable("RRM"),
         cacheInvalidationTable: mkTable("Cache"),
@@ -232,6 +243,7 @@ describe("ApiStack request throttling", () => {
         env: { account: "123456789012", region: "us-east-1" },
         allowedOrigin: "*",
         vpc,
+        ...mkTestSgs(depStack, vpc),
         rolesTable: mkTable("Roles"),
         resourceRoleMappingsTable: mkTable("RRM"),
         cacheInvalidationTable: mkTable("Cache"),
@@ -305,6 +317,7 @@ describe("ApiStack cache invalidation stream handler", () => {
         env: { account: "123456789012", region: "us-east-1" },
         allowedOrigin: "*",
         vpc,
+        ...mkTestSgs(depStack, vpc),
         rolesTable: mkTable("Roles"),
         resourceRoleMappingsTable: mkTable("RRM"),
         cacheInvalidationTable: mkTable("Cache"),
@@ -326,6 +339,24 @@ describe("ApiStack cache invalidation stream handler", () => {
       },
       VpcConfig: Match.objectLike({ SubnetIds: Match.anyValue() }),
     });
+  });
+
+  it("puts the VPC Lambdas on the network stack's SGs, so their ENIs can be pre-warmed", () => {
+    // The authorizer keeps its own all-outbound SG (an external IdP may serve
+    // its JWKS on any port); cache-invalidation uses the shared Lambda SG.
+    const sgsOf = (name: string): string =>
+      JSON.stringify(
+        Object.values(
+          template.findResources("AWS::Lambda::Function", {
+            Properties: {
+              FunctionName: `${DEFAULT_RESOURCE_PREFIX}-${DEFAULT_ENV}-${name}`,
+            },
+          }),
+        )[0].Properties.VpcConfig.SecurityGroupIds,
+      );
+    expect(sgsOf("authorizer")).toContain("AuthorizerSG");
+    expect(sgsOf("cache-invalidation")).toContain("LambdaSG");
+    template.resourceCountIs("AWS::EC2::SecurityGroup", 0);
   });
 
   it("creates two DynamoDB event source mappings (Roles + RRM)", () => {
@@ -405,6 +436,7 @@ describe("ApiStack GET /health", () => {
       env: { account: "123456789012", region: "us-east-1" },
       allowedOrigin,
       vpc,
+      ...mkTestSgs(depStack, vpc),
       rolesTable: mkTable("Roles"),
       resourceRoleMappingsTable: mkTable("RRM"),
       cacheInvalidationTable: mkTable("Cache"),
@@ -467,13 +499,12 @@ describe("ApiStack GET /health", () => {
   });
 
   it("echoes the configured CORS origin, not a wildcard", () => {
-    const params =
-      healthGet(mkStack("https://app.example.com"))[
-        "x-amazon-apigateway-integration"
-      ].responses.default.responseParameters;
-    expect(
-      params["method.response.header.Access-Control-Allow-Origin"],
-    ).toBe("'https://app.example.com'");
+    const params = healthGet(mkStack("https://app.example.com"))[
+      "x-amazon-apigateway-integration"
+    ].responses.default.responseParameters;
+    expect(params["method.response.header.Access-Control-Allow-Origin"]).toBe(
+      "'https://app.example.com'",
+    );
   });
 });
 
@@ -515,6 +546,7 @@ describe("ApiStack 501-stub guard", () => {
         env: { account: "123456789012", region: "us-east-1" },
         allowedOrigin: "*",
         vpc,
+        ...mkTestSgs(depStack, vpc),
         rolesTable: mkTable("Roles"),
         resourceRoleMappingsTable: mkTable("RRM"),
         cacheInvalidationTable: mkTable("Cache"),

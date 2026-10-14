@@ -33,8 +33,9 @@ The discovery connector and federated-query connector run inside Context Ontolog
 must reach the database host. Establish a private path (VPC peering, Transit
 Gateway, or PrivateLink) and open the DB security group to Context Ontology Accelerator's connector
 security group on the engine port. See
-"Cross-Network Connectivity" section below for the full
-peering/TGW walkthrough — it is the same regardless of account boundary.
+[Cross-Network Connectivity](cross-network-connectivity.md) for the full
+peering / Transit Gateway / PrivateLink walkthrough — it is the same regardless
+of account boundary.
 
 ### 2. Share the credential secret
 
@@ -425,116 +426,12 @@ and querying once access is in place.
 
 ---
 
-# Cross-Network Connectivity
+## Network connectivity
 
-How to establish network connectivity between the Context Ontology Accelerator platform and databases in a separate VPC or account.
+Reaching a database in a different VPC or account (VPC peering, Transit Gateway,
+or PrivateLink; routes; security-group ingress; the `jdbc_peer_*` / `jdbc_tgw_*`
+/ `jdbc_privatelink_*` CDK context keys) is covered in one place:
+[Cross-Network Connectivity](cross-network-connectivity.md). The network path is
+identical whether or not an account boundary is involved — this page adds only
+the credential-sharing and catalog-authorization steps on top of it.
 
-> The connectors are routing-agnostic (a plain TCP connection to `host:port`), so **no application change** is needed — only the network plumbing below.
-
-## Scenarios
-
-| Situation | Connectivity | Notes |
-|---|---|---|
-| DBs in Context Ontology Accelerator's VPC | None needed | Deploy test stack with `vpc_id`=Context Ontology Accelerator VPC |
-| DBs in a separate VPC (same account) | VPC Peering or Transit Gateway | Deploy test stack first, then Context Ontology Accelerator with `jdbc_peer_*` context |
-| DBs in a separate account | VPC Peering/TGW + cross-account role | As above + `CustomerAccessStack` |
-
-## Same-VPC (No Cross-Network)
-
-> **Note:** The `tests/cdk` directory referenced below is an internal integration-test stack and is not included in the public mirror. The CDK patterns shown here illustrate how to deploy companion test databases; adapt them to your own infrastructure stack.
-
-Simplest path. Deploy the test databases into Context Ontology Accelerator's VPC:
-
-```bash
-cd tests/cdk
-npx cdk deploy coa-integ-test-databases \
-  -c vpc_id=<accelerator-vpc-id> \
-  -c connector_security_group_id=<accelerator-connector-sg-id>
-```
-
-The DB security group allows the VPC CIDR, so the discovery Lambda can reach the DBs directly.
-
-## Separate-VPC Peering
-
-Cross-network peering is two-sided. Deploy order: test stack → Context Ontology Accelerator → finish peer side.
-
-### 1. Deploy the test stack in its own VPC
-
-```bash
-cd tests/cdk && npx cdk deploy coa-integ-test-databases
-```
-
-Capture: test VPC ID, VPC CIDR from stack outputs.
-
-### 2. Deploy Context Ontology Accelerator with peering context
-
-```bash
-cd infra && npx cdk deploy --all -c env=dev \
-  -c jdbc_peer_vpc_id=<test-vpc-id> \
-  -c jdbc_peer_cidrs=<test-vpc-cidr>
-```
-
-For cross-account peers, also pass:
-- `-c jdbc_peer_owner_id=<account-id>`
-- `-c jdbc_peer_region=<region>` (if cross-region)
-
-### 3. Finish the peer (test-DB) side
-
-> **CI note:** The `configure-peering` job in `ci/mainline.yml` automates this step via `tests/cdk/scripts/connect-cross-network.sh`. The manual steps below are for ad-hoc deployments.
-
-1. **Accept** the peering connection:
-   ```bash
-   aws ec2 accept-vpc-peering-connection --vpc-peering-connection-id <pcx-id>
-   ```
-
-2. **Add return routes** in the test VPC's private route tables — destination = Context Ontology Accelerator's private-subnet CIDRs, target = peering connection.
-
-3. **Open the DB security group** for inbound DB ports from Context Ontology Accelerator's CIDRs:
-   ```bash
-   aws ec2 authorize-security-group-ingress --group-id <test-db-sg> \
-     --protocol tcp --port 5432 --cidr <accelerator-private-cidr>
-   ```
-
-4. Ensure the DB hostname resolves from Context Ontology Accelerator's VPC (enable DNS resolution on the peering connection).
-
-## Alternatives to Peering
-
-### Transit Gateway
-
-Best for many-VPC fan-out:
-
-```bash
-cd infra && npx cdk deploy --all -c env=dev \
-  -c jdbc_tgw_id=<tgw-id> \
-  -c jdbc_tgw_cidrs=<test-cidr>
-```
-
-Attach the test VPC to the same TGW and add route-table entries both ways.
-
-### PrivateLink
-
-Tolerates overlapping CIDRs — no route/CIDR coordination needed:
-
-```bash
-cd infra && npx cdk deploy --all -c env=dev \
-  -c jdbc_privatelink_service=<svc-name> \
-  -c jdbc_privatelink_port=<port>
-```
-
-Requires the test side to expose the DB behind an NLB + VPC endpoint service.
-
-## CDK Context-Key Reference
-
-| Key | Purpose |
-|---|---|
-| `jdbc_peer_vpc_id` | Peer VPC to connect to (enables peering) |
-| `jdbc_peer_cidrs` | Comma-separated CIDRs in the peer network to route to |
-| `jdbc_peer_owner_id` | Peer account ID (cross-account peering) |
-| `jdbc_peer_region` | Peer region (cross-region peering) |
-| `jdbc_tgw_id` | Existing Transit Gateway ID to attach to |
-| `jdbc_tgw_cidrs` | Comma-separated CIDRs reachable via the TGW |
-| `jdbc_privatelink_service` | Producer endpoint-service name |
-| `jdbc_privatelink_port` | DB port the endpoint service listens on |
-| `jdbc_privatelink_private_dns` | `"true"` to enable private DNS on the endpoint |
-
-These keys apply only when Context Ontology Accelerator creates its own VPC (no `vpc_id` context set). Imported VPCs are expected to bring their own connectivity.

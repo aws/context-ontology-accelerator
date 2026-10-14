@@ -375,6 +375,23 @@ def _fetch_catalog_from_fixture(datasource_id: str) -> dict:
     return {"databases": []}
 
 
+def fetch_datasource_catalog(config: dict, datasource_id: str, *, namespace: str) -> dict:
+    """The catalog of one datasource, from wherever this deployment reads catalogs.
+
+    Shared by induction and by the proposal update that rebuilds a structured
+    proposal, so both resolve a datasource the same way. A mock datasource (ID ending
+    in ``-mock``) reads the bundled fixture; otherwise ``CATALOG_SOURCE`` picks SMUS or
+    the HTTP data catalog. The helpers are looked up at call time, so tests that
+    patch them on this module still take effect.
+    """
+    if datasource_id.endswith("-mock"):
+        # Mock datasources read from bundled JSON fixture (no SMUS / no Glue)
+        return _fetch_catalog_from_fixture(datasource_id)
+    if config.get("catalog_source") == "smus":
+        return _fetch_catalog_from_smus(config, datasource_id, namespace=namespace)
+    return _fetch_catalog(config["data_catalog_url"], datasource_id)
+
+
 def _string_list(value: object) -> list[str]:
     """Normalize a catalog list field to non-empty strings (``None`` → ``[]``)."""
     if not isinstance(value, list):
@@ -747,13 +764,7 @@ def _run_induction(
             all_tables = []
             datasource_details = []
             for ds_id in body.datasource_ids:
-                if ds_id.endswith("-mock"):
-                    # Mock datasources read from bundled JSON fixture (no SMUS / no Glue)
-                    catalog = _fetch_catalog_from_fixture(ds_id)
-                elif config.get("catalog_source") == "smus":
-                    catalog = _fetch_catalog_from_smus(config, ds_id, namespace=ns)
-                else:
-                    catalog = _fetch_catalog(config["data_catalog_url"], ds_id)
+                catalog = fetch_datasource_catalog(config, ds_id, namespace=ns)
                 tbl_dicts = _catalog_to_tables(catalog)
                 from coa_ontology.inducer.strategies.base import schema_from_fqn
 

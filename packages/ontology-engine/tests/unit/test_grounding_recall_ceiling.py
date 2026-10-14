@@ -22,7 +22,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from coa_ontology.inducer.services.grounding import (
+    _LEXICAL_INDEX_MAX_ENTITIES,
     GroundingCandidate,
+    GroundingRecallLimitError,
     GroundingService,
     _tokenize,
     classify_score_tier,
@@ -89,6 +91,17 @@ class TestTokenize:
         # "a" is below _MIN_TOKEN_LEN; "id" (2 chars) survives.
         assert _tokenize("aXId") == {"id"}
 
+    def test_keeps_non_latin_tokens(self):
+        assert _tokenize("顧客") == {"顧客"}
+        assert _tokenize("設置場所_メーカー") == {"設置場所", "メーカー"}
+        assert _tokenize("고객-주소") == {"고객", "주소"}
+
+    def test_splits_unicode_camel_case(self):
+        assert _tokenize("ΔείγμαΠελάτη") == {"δείγμα", "πελάτη"}
+
+    def test_keeps_single_character_non_ascii_identifier(self):
+        assert _tokenize("顧") == {"顧"}
+
 
 # ── Fix 2: lexical (token-overlap) recall ────────────────────────────────────
 
@@ -142,6 +155,100 @@ class TestLexicalRecall:
         svc = _svc(self._catalog(dense, listed), mock_eg)
         cands = svc._recall([0.1] * 10, "model", ["npd-v2"], top_k=30, subject_name="apaAreaGross")
         assert sum(1 for c in cands if c.entity_uri == "http://npdv/MainArea") == 1
+
+    def test_surfaces_non_latin_exact_name_dense_missed(self, mock_eg):
+        dense = [
+            {
+                "entity_uri": f"http://example.test/Unrelated{i}",
+                "ontology_id": "business",
+                "score": 0.60 - i * 0.001,
+            }
+            for i in range(30)
+        ]
+        listed = [
+            {
+                "entity_uri": "http://example.test/顧客",
+                "ontology_id": "business",
+                "text": "顧客",
+            }
+        ]
+        svc = _svc(self._catalog(dense, listed), mock_eg)
+
+        candidates = svc._recall(
+            [0.1] * 10,
+            "model",
+            ["business"],
+            top_k=30,
+            subject_name="顧客",
+        )
+
+        recalled = next(candidate for candidate in candidates if candidate.entity_uri.endswith("/顧客"))
+        assert recalled.from_lexical is True
+
+    def test_reuses_one_bounded_metadata_index(self, mock_eg):
+        listed = [
+            {
+                "entity_uri": "http://example.test/MainArea",
+                "ontology_id": "business",
+                "text": "Main area",
+            }
+        ]
+        oc = self._catalog(
+            [
+                {
+                    "entity_uri": "http://example.test/Unrelated",
+                    "ontology_id": "business",
+                    "score": 0.1,
+                }
+            ],
+            listed,
+        )
+        svc = _svc(oc, mock_eg)
+
+        for subject in ("MainArea", "GrossArea"):
+            svc._recall(
+                [0.1] * 10,
+                "model",
+                ["business"],
+                top_k=30,
+                subject_name=subject,
+            )
+
+        oc.list_embeddings_for_ontology.assert_called_once_with(
+            "business",
+            entity_type="class",
+            embedding_type="lexical",
+            namespace=None,
+            limit=_LEXICAL_INDEX_MAX_ENTITIES + 1,
+        )
+
+    def test_metadata_overflow_fails_loud(self, mock_eg):
+        oc = self._catalog(
+            [
+                {
+                    "entity_uri": "http://example.test/Unrelated",
+                    "ontology_id": "business",
+                    "score": 0.1,
+                }
+            ],
+            [
+                {
+                    "entity_uri": f"http://example.test/Class{i}",
+                    "ontology_id": "business",
+                }
+                for i in range(_LEXICAL_INDEX_MAX_ENTITIES + 1)
+            ],
+        )
+        svc = _svc(oc, mock_eg)
+
+        with pytest.raises(GroundingRecallLimitError, match="exceeds"):
+            svc._recall(
+                [0.1] * 10,
+                "model",
+                ["business"],
+                top_k=30,
+                subject_name="MainArea",
+            )
 
 
 # ── Fix 1: reranker window ───────────────────────────────────────────────────

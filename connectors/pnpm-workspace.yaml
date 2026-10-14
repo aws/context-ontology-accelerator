@@ -1,12 +1,15 @@
-# A workspace of its own, separate from the repository root's.
-#
-# Every connector owns its own CDK app, so that a customer can add whatever resources their
-# source needs — a VPC, an RDS proxy, a secret, a KMS key — without asking permission from
-# any code here. That means N CDK apps, and each one would otherwise pull its own copy of
-# aws-cdk-lib. This workspace shares that dependency between them.
-#
-# It is deliberately not part of the repository's workspace: these are customer-facing
-# samples, they are copied out, and they must build on their own.
 packages:
   - "cdk-toolkit"
   - "*/cdk"
+
+# Security overrides for transitive dev/test dependencies (jest/ts-jest toolchain).
+# Range-scoped so each major stays on its own line and a blanket pin can't cross
+# majors. These projects are customer-facing CDK samples copied out and built on
+# their own, so the pins travel with the sample.
+overrides:
+  # brace-expansion ReDoS (GHSA, HIGH/MODERATE). Patched floors: v1 >=1.1.20,
+  # v2 >=2.1.4. Transitive via jest's micromatch. Same majors.
+  "brace-expansion@<1.1.20": 1.1.21
+  "brace-expansion@>=2.0.0 <2.1.4": 2.1.7
+  # handlebars <4.7.10 — critical RCE (GHSA-p8wg-vrv2-v86f, GHSA-8r5x-fm3f-whwj); via ts-jest.
+  "handlebars@<4.7.10": 4.7.10

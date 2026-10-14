@@ -37,7 +37,8 @@ def _stub_store(monkeypatch, item, put_sink, update_sink):
         proposals.dynamo_store,
         "_put_artifact_s3",
         lambda namespace, pid, artifact, content, version="latest": (
-            put_sink.update({artifact: content}) or f"proposals/{namespace}/{pid}/latest/{artifact}.ttl"
+            put_sink.update({artifact: content, f"{artifact}_version": version})
+            or f"proposals/{namespace}/{pid}/{version}/{artifact}.ttl"
         ),
     )
     monkeypatch.setattr(
@@ -65,6 +66,8 @@ def test_repair_rewrites_malformed_ontology_and_persists(monkeypatch):
     assert "xsd:datetime" not in put_sink["ontology"]
     assert update_sink["status"] == "updated"
     assert "ontology_s3_key" in update_sink
+    assert put_sink["ontology_version"].startswith("revisions/")
+    assert update_sink["revision_id"] == put_sink["ontology_version"].removeprefix("revisions/")
 
 
 def test_repair_also_fixes_r2rml(monkeypatch):
@@ -83,6 +86,7 @@ def test_repair_also_fixes_r2rml(monkeypatch):
     # R2RML artifact was rewritten; ontology (clean) was not.
     assert "r2rml" in put_sink
     assert "ontology" not in put_sink
+    assert put_sink["r2rml_version"].startswith("revisions/")
 
 
 def test_repair_clean_proposal_is_noop(monkeypatch):
@@ -187,3 +191,42 @@ def test_repair_unparseable_stored_turtle_returns_422_not_500(monkeypatch, dry_r
     assert exc.value.status_code == 422
     assert "parseable" in str(exc.value.detail).lower()
     assert put_sink == {}  # nothing persisted on the error path
+
+
+def test_repair_does_not_publish_partial_revision_when_second_s3_write_fails(monkeypatch):
+    from coa_ontology import proposals
+
+    r2rml = """@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+<http://x#om> rr:datatype xsd:datetime .
+"""
+    item = {
+        "proposal_id": "p-atomic",
+        "status": "pending",
+        "ontology_turtle": _MALFORMED,
+        "r2rml_turtle": r2rml,
+    }
+    monkeypatch.setattr(proposals.dynamo_store, "get_proposal_by_id", lambda pid, namespace="default": item)
+    writes: list[tuple[str, str]] = []
+
+    def _put(namespace, pid, artifact, content, version="latest"):
+        writes.append((artifact, version))
+        if artifact == "r2rml":
+            raise RuntimeError("simulated S3 failure")
+        return f"proposals/{namespace}/{pid}/{version}/{artifact}.ttl"
+
+    monkeypatch.setattr(proposals.dynamo_store, "_put_artifact_s3", _put)
+    update_call = []
+    monkeypatch.setattr(
+        proposals.dynamo_store,
+        "update_proposal",
+        lambda pid, namespace="default", **fields: update_call.append(fields),
+    )
+
+    with pytest.raises(RuntimeError, match="simulated S3 failure"):
+        proposals.repair_proposal_datatypes("p-atomic", namespace="ns")
+
+    assert len(writes) == 2
+    assert writes[0][1] == writes[1][1]
+    assert writes[0][1].startswith("revisions/")
+    assert update_call == []
