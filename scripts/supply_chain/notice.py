@@ -13,7 +13,7 @@ from __future__ import annotations
 from scripts.supply_chain.licenses import UNKNOWN, PackageLicense
 
 _HEADER = """\
-Context Ontology Accelerator — Context Ontology Accelerator
+Context Ontology Accelerator
 Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 
 This product includes software developed by third parties, listed below with

@@ -176,7 +176,7 @@ The default region is `us-east-1`. To deploy to a different region:
 - **pip** — detects macOS Xcode stubs that look like pip but fail at runtime
 - **Docker** — required for Lambda bundling fallback when local pip is unavailable
 - **Smithy artifacts** — ensures `smithy-generated/openapi/` contains valid specs
-- **VPC quota** — queries the account VPC limit and blocks if saturated
+- **VPC quota** — queries the account VPC limit and blocks if saturated, when the deploy would create a VPC (not on updates or with `SCL_VPC_ID`)
 
 ### Tearing down (`make destroy-dev`)
 

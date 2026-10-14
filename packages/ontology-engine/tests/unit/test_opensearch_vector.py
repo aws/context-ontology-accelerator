@@ -136,6 +136,18 @@ class TestLookups:
         assert {"term": {"ontology_id": "ont-1"}} in filters
         assert {"term": {"embedding_type": "lexical"}} in filters
 
+    def test_bounded_listing_projects_metadata_only(self):
+        client = MagicMock()
+        client.filter_search.return_value = []
+        store = _store_with_client(client)
+
+        store.list_embeddings_for_ontology("ont-1", limit=25)
+
+        assert client.filter_search.call_args.kwargs == {
+            "size": 25,
+            "source": ["entity_uri", "ontology_id", "text"],
+        }
+
     def test_list_searchable_entity_uris_projects_via_iter_source_field(self):
         client = MagicMock()
         client.iter_source_field.return_value = ["http://x/A", "http://x/B"]

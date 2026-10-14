@@ -18,6 +18,7 @@ import { Paths, fromRoot } from "../../paths";
 import { resolveContext } from "../../context";
 import { bundlePython } from "../../utils/python-bundling";
 import { NamespaceDeletionPipeline } from "./namespace-deletion-pipeline";
+import { METRIC_API_FUNCTION_NAME } from "./metric-service-stack";
 import { TABLE_NAMES } from "@coa/shared";
 
 export interface NamespaceStackProps extends cdk.StackProps {
@@ -822,7 +823,7 @@ export class NamespaceStack extends SCLStack {
         resourceRoleMappingsTable: props.resourceRoleMappingsTable,
         rolesTable: props.rolesTable,
         sourcesApiFnName: this.prefixed("sources-api"),
-        metricApiFnName: this.prefixed("metric-api"),
+        metricApiFnName: this.prefixed(METRIC_API_FUNCTION_NAME),
         datazoneDomainId: domain.attrId,
         // DeletePlatform assumes namespaceApiFn's own execution role for
         // datazone:DeleteProject — DataZone records the CreateProject

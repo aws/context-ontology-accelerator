@@ -50,6 +50,9 @@ class ConceptMatch(BaseModel):
 
     source_column: str  # fully qualified column name
     source_table: str
+    # Stable identity, data-source-qualified when available, for same-named tables.
+    # Optional so previously persisted matches remain readable.
+    source_table_identity: str | None = None
     matched_class_uri: str | None  # ontology class URI, None if novel
     matched_ontology_id: str | None
     similarity: float | None

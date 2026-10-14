@@ -1165,16 +1165,21 @@ export class SourcesStack extends SCLStack {
     dbConnectorFn.addEnvironment("LF_GRANTOR_ROLE_ARN", fedFnRole.roleArn);
 
     // Serve runtime role ARN — the consumer query principal that needs SELECT
-    // grants on LF-governed tables. Read from SSM (written by ServeStack) to
-    // avoid a circular CDK cross-stack reference. Requires addDependency(serve)
-    // in app.ts so the SSM param exists at deploy time.
-    const serveRuntimeRoleArn = ssm.StringParameter.valueForStringParameter(
-      this,
+    // grants on LF-governed tables. Resolved at RUNTIME from SSM (written by
+    // ServeStack), like the federation provisioner does, so this stack does not
+    // have to wait for ServeStack at deploy time.
+    dbConnectorFn.addEnvironment(
+      "CONSUMER_QUERY_ROLE_SSM_PARAM",
       serveRuntimeRoleArnParam,
     );
-    dbConnectorFn.addEnvironment(
-      "CONSUMER_QUERY_ROLE_ARN",
-      serveRuntimeRoleArn,
+    dbConnectorFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: "ReadConsumerQueryRoleArn",
+        actions: ["ssm:GetParameter"],
+        resources: [
+          `arn:aws:ssm:${this.region}:${this.account}:parameter${serveRuntimeRoleArnParam}`,
+        ],
+      }),
     );
     dbConnectorFn.addToRolePolicy(
       new iam.PolicyStatement({
@@ -3501,7 +3506,20 @@ export class SourcesStack extends SCLStack {
       visibilityTimeout: cdk.Duration.seconds(180),
       deadLetterQueue: { queue: glueEventDlq, maxReceiveCount: 5 },
     });
-    // Allow EventBridge rules in THIS account to deliver to the queue.
+    // The API Lambda names every per-source rule `<prefix>-<sourceId>` and puts
+    // it on the default event bus (no EventBusName), whose rule ARNs are
+    // `rule/<name>`. One ARN pattern serves both the queue policy and the API
+    // Lambda's rule-management grant below, so the two cannot drift: a rule the
+    // Lambda may create is exactly a rule the queue accepts.
+    const glueEventRulePrefix = this.prefixed("glue-rescan");
+    const glueEventRuleArnPattern = this.formatArn({
+      service: "events",
+      resource: "rule",
+      resourceName: `${glueEventRulePrefix}-*`,
+      arnFormat: cdk.ArnFormat.SLASH_RESOURCE_NAME,
+    });
+    // Allow only this deployment's Glue re-scan rules to deliver to the queue.
+    // The account check alone admitted any rule anyone in the account created.
     glueEventQueue.addToResourcePolicy(
       new iam.PolicyStatement({
         sid: "AllowEventBridgeSend",
@@ -3509,7 +3527,10 @@ export class SourcesStack extends SCLStack {
         principals: [new iam.ServicePrincipal("events.amazonaws.com")],
         actions: ["sqs:SendMessage"],
         resources: [glueEventQueue.queueArn],
-        conditions: { StringEquals: { "aws:SourceAccount": this.account } },
+        conditions: {
+          StringEquals: { "aws:SourceAccount": this.account },
+          ArnLike: { "aws:SourceArn": glueEventRuleArnPattern },
+        },
       }),
     );
 
@@ -3560,7 +3581,6 @@ export class SourcesStack extends SCLStack {
     // The API Lambda manages per-source Glue-event rules (scoped to the rule
     // name prefix). SQS delivery is authorized by the queue policy above, so no
     // target role / PassRole is needed.
-    const glueEventRulePrefix = this.prefixed("glue-rescan");
     sourcesApiFn.addToRolePolicy(
       new iam.PolicyStatement({
         sid: "ManageGlueEventRules",
@@ -3571,14 +3591,7 @@ export class SourcesStack extends SCLStack {
           "events:RemoveTargets",
           "events:DescribeRule",
         ],
-        resources: [
-          this.formatArn({
-            service: "events",
-            resource: "rule",
-            resourceName: `${glueEventRulePrefix}-*`,
-            arnFormat: cdk.ArnFormat.SLASH_RESOURCE_NAME,
-          }),
-        ],
+        resources: [glueEventRuleArnPattern],
       }),
     );
     sourcesApiFn.addEnvironment(

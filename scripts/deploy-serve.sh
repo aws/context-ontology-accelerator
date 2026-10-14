@@ -33,10 +33,12 @@ ECR_REPO="${PREFIX}-${ENV}-context-manager"
 # Default to short git SHA for immutable image references
 IMAGE_TAG="${IMAGE_TAG:-$(git -C "${REPO_ROOT}" rev-parse --short HEAD 2>/dev/null || echo latest)}"
 
-# Resolution order matches CDK's own precedence (infra/bin/app.ts uses
-# CDK_DEFAULT_REGION as the source of truth), so this script pushes the
-# ECR image to the same region CDK will deploy the stack into.
-REGION="${CDK_DEFAULT_REGION:-${AWS_DEFAULT_REGION:-${AWS_REGION:-$(aws configure get region 2>/dev/null || echo us-east-1)}}}"
+# Resolved the way the CDK CLI resolves it, the profile's region included, so
+# this script pushes the ECR image to the same region CDK will deploy the
+# stack into.
+# shellcheck source=lib/resolve-region.sh source-path=SCRIPTDIR
+source "${REPO_ROOT}/scripts/lib/resolve-region.sh"
+REGION="$(coa_resolve_region)"
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 ECR_URI="${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com/${ECR_REPO}"
 IMAGE_FULL="${ECR_URI}:${IMAGE_TAG}"

@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+import unicodedata
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
 
@@ -23,6 +24,10 @@ from coa_ontology.inducer.services.data_catalog import (
     CatalogConstraint,
     CatalogTable,
     parse_referred_column,
+)
+from coa_ontology.inducer.services.unicode_normalization import (
+    filter_letters_marks_numbers,
+    width_only_nfkc,
 )
 
 log = logging.getLogger(__name__)
@@ -168,7 +173,33 @@ def xsd_for_column(data_type: str, column_name: str) -> URIRef:
 
 
 def to_pascal(s: str) -> str:
-    """Convert an arbitrary string to PascalCase for use as a class name.
+    r"""Convert an arbitrary string to PascalCase for use as a class name.
+
+    Letters, numbers, and marks attached to them are retained in every script.
+    Whitespace, underscores and hyphens are one separator class; everything else
+    is dropped. Fullwidth forms are folded to their ordinary width first, so a
+    Glue column arriving as ``顧客ＩＤ`` mints the same name as ``顧客ID``.
+
+    Retaining non-Latin letters is the point. The previous implementation cleaned
+    with ``[^a-zA-Z0-9\s_\-]``, which deletes every character outside ASCII —
+    so an identifier written in Japanese, Chinese, Korean, Cyrillic, Greek or
+    Arabic reduced to ``""`` and fell back to ``"Entity"``. Table names survived
+    on :func:`pascal_names_for`'s discriminator, but column names have no such
+    layer: every column of one table collapsed onto ``{table}_``, fusing them
+    into a single property and dropping all but one ``rr:predicateObjectMap``.
+    A 3-table Japanese schema mapped 6 of its 15 columns.
+
+    ASCII input mints exactly what it minted before, so every ontology induced
+    so far keeps its IRIs — ``customers`` → ``Customers``, ``order_items`` →
+    ``OrderItems``, ``ORDER ITEMS`` → ``OrderItems``.
+
+    Symbols are dropped rather than retained. The reason is not IRI legality —
+    ``℃``, ``™`` and ``€`` are all valid RFC 3987 ``ucschar`` and valid Turtle
+    ``PN_CHARS_BASE``. It is that Unicode category ``S`` also covers the ASCII
+    operators ``$ + < = > ^ ` | ~``, which have no place in a class name and which
+    the previous implementation stripped. Dropping the whole category keeps ASCII
+    output identical at the cost of leaving ``温度℃`` and ``温度`` colliding;
+    :func:`camel_names_for` resolves that collision for columns.
 
     Args:
         s: Input string (may contain spaces, underscores, or hyphens).
@@ -176,8 +207,19 @@ def to_pascal(s: str) -> str:
     Returns:
         The PascalCase form, or ``"Entity"`` if nothing usable remains.
     """
-    cleaned = re.sub(r"[^a-zA-Z0-9\s_\-]", "", s or "")
-    return "".join(w.capitalize() for w in re.split(r"[\s_\-]+", cleaned) if w) or "Entity"
+    folded = width_only_nfkc(s or "")
+    # Unify the separator class first: ``filter_letters_marks_numbers`` retains
+    # only letters/marks/numbers and (optionally) underscore, so whitespace and
+    # hyphens have to become underscores before filtering or the word boundaries
+    # are lost. ``\s`` covers the ideographic space, an ordinary word separator
+    # in Japanese and Chinese.
+    separated = re.sub(r"[\s\-]+", "_", folded)
+    cleaned = filter_letters_marks_numbers(separated, keep_underscore=True)
+    # ``str.capitalize`` lowercases the remainder of each word — that is the
+    # pre-existing contract (``ORDER ITEMS`` → ``OrderItems``) and is a no-op for
+    # caseless scripts. Recompose afterwards: casing can emit a combining mark.
+    pascal = "".join(word.capitalize() for word in re.split(r"_+", cleaned) if word)
+    return unicodedata.normalize("NFC", pascal) or "Entity"
 
 
 def to_camel(s: str) -> str:
@@ -207,6 +249,18 @@ def _name_discriminator(identity: str) -> str:
     identical in every consumer that mints IRIs for the same table.
     """
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:8]
+
+
+def pom_segment(column_local: str) -> str:
+    """PascalCase a deduped column local for use in a POM node IRI.
+
+    The POM node is an IRI in its own right, so it needs the same per-column
+    uniqueness as the predicate it carries. Deriving it from the deduped local
+    rather than re-deriving it from the raw column name is what keeps the two in
+    step — a POM node shared by two columns silently drops one mapping, because
+    the triples are then identical rather than merely similar.
+    """
+    return column_local[:1].upper() + column_local[1:]
 
 
 def table_identity(table: CatalogTable) -> str:
@@ -319,8 +373,8 @@ def pascal_names_for(tables: Iterable[CatalogTable]) -> dict[str, str]:
 
     assigned: dict[str, str] = {}
     taken: set[str] = set()
-    # Sorted so that a residual collision between one base and another base's
-    # discriminated form resolves the same way on every run.
+    # Sorted so that a residual collision (two identities whose discriminators
+    # share a SHA-256 prefix) resolves the same way on every run.
     for base in sorted(by_base):
         members = by_base[base]
         keeper = min(members)
@@ -332,9 +386,10 @@ def pascal_names_for(tables: Iterable[CatalogTable]) -> dict[str, str]:
                     extra={"table": identity, "collided_on": base, "minted": candidate},
                 )
             if candidate in taken:
-                # Pathological: the form is already taken (identities were deduped
-                # above, so this needs a genuine hash collision, or a base equal to
-                # another base's discriminated form). Widen until unique.
+                # Pathological: the form is already taken. Identities were deduped
+                # above and to_pascal never emits an underscore, so no base can equal
+                # another base's ``{base}_{sha8}`` form; this needs a genuine SHA-256
+                # prefix collision. Widen until unique.
                 candidate = f"{base}_{_name_discriminator(identity)}"
                 suffix = 2
                 while candidate in taken:
@@ -345,6 +400,73 @@ def pascal_names_for(tables: Iterable[CatalogTable]) -> dict[str, str]:
     # Returned in caller order: the assignment does not depend on it, but stable
     # iteration keeps logs and serialized artifacts diff-friendly.
     return {identity: assigned[identity] for identity in identities}
+
+
+def camel_names_for(table: CatalogTable) -> dict[str, str]:
+    """Map each column NAME of one table to a collision-free camelCase local name.
+
+    The column analogue of :func:`pascal_names_for`, and it exists for the same
+    reason: :func:`to_camel` is lossy, so two distinct columns can mint the same
+    local name. SQL guarantees column names are unique within a table, and the
+    ontology, the R2RML mapping and the SHACL shapes must therefore mint one
+    property per column — but nothing enforced that.
+
+    Retaining non-Latin letters removed the worst case (every column of a Japanese
+    table minting ``""``), not the general one. ``to_camel`` still drops Unicode
+    category ``S`` and every punctuation mark, so ``温度℃``/``温度``,
+    ``住所・氏名``/``住所氏名`` and ``会員（有効）``/``会員有効`` remain pairs that
+    collapse onto one name. That failure is SILENT in R2RML: the POM node is a
+    ``URIRef`` derived from the predicate, so the second column's mapping is not a
+    duplicate row that a reader would notice — it is the same triple, and rdflib
+    keeps one. The column simply stops being queryable.
+
+    Scope is one table, not the whole run: column names only have to be unique
+    within their table, and the emitted local name is already prefixed with the
+    table's own (run-unique) name by every caller.
+
+    Returns:
+        ``{column_name: unique_camelCase_local_name}`` covering every column, in
+        the table's column order.
+    """
+    names: list[str] = []
+    base_for: dict[str, str] = {}
+    for column in table.columns:
+        if column.name in base_for:
+            continue  # a catalog that repeats a column — one mapping is enough
+        names.append(column.name)
+        base_for[column.name] = to_camel(column.name)
+
+    by_base: dict[str, list[str]] = {}
+    for name in names:
+        by_base.setdefault(base_for[name], []).append(name)
+
+    assigned: dict[str, str] = {}
+    taken: set[str] = set()
+    # Sorted for the same reason as pascal_names_for: a residual collision (two
+    # names whose discriminators share a SHA-256 prefix) must resolve identically
+    # on every run, in every one of the three emitters.
+    for base in sorted(by_base):
+        members = by_base[base]
+        keeper = min(members)
+        for name in sorted(members):
+            candidate = base if name == keeper else f"{base}_{_name_discriminator(name)}"
+            if name != keeper:
+                log.warning(
+                    "column_name_collides_after_camel_case",
+                    extra={
+                        "table": table_identity(table),
+                        "column": name,
+                        "collided_on": base,
+                        "minted": candidate,
+                    },
+                )
+            suffix = 2
+            while candidate in taken:
+                candidate = f"{base}_{_name_discriminator(name)}_{suffix}"
+                suffix += 1
+            taken.add(candidate)
+            assigned[name] = candidate
+    return {name: assigned[name] for name in names}
 
 
 def reference_index(tables: Iterable[CatalogTable]) -> dict[str, str]:
@@ -1231,13 +1353,16 @@ class InductionStrategy(ABC):
             )
             return None
 
-        def _pom(tmap: URIRef, col_name: str, suffix: str = "") -> tuple[URIRef, URIRef]:
+        def _pom(tmap: URIRef, column_local: str, suffix: str = "") -> tuple[URIRef, URIRef]:
             """Mint a predicate-object map + object map for a column.
 
-            ``suffix`` qualifies one of several maps on the same column (a column
-            carrying more than one relationship gets one map per target).
+            ``column_local`` is the column's deduped local from
+            :func:`camel_names_for`, so the POM node is as unique per column as
+            the predicate it carries (see :func:`pom_segment`). ``suffix``
+            qualifies one of several maps on the same column (a column carrying
+            more than one relationship gets one map per target).
             """
-            pom = URIRef(f"{tmap}/POM_{to_pascal(col_name)}{suffix}")
+            pom = URIRef(f"{tmap}/POM_{pom_segment(column_local)}{suffix}")
             g.add((tmap, RR.predicateObjectMap, pom))
             om = URIRef(f"{pom}/ObjectMap")
             g.add((pom, RR.objectMap, om))
@@ -1272,6 +1397,8 @@ class InductionStrategy(ABC):
                 pk_id = "{ID}"
             subj = URIRef(f"{tmap}/SubjectMap")
             g.add((tmap, RR.subjectMap, subj))
+            # Deliberately the table name from subject_template_names (schema-qualified only on a
+            # collision), not the pascal_names_for class local: instance IRIs are published.
             template = f"{ontology_uri_prefix}{subject_names[identity]}/{pk_id}"
             g.add((subj, RR.template, Literal(template)))
             g.add((subj, RR["class"], table_cls))
@@ -1298,6 +1425,8 @@ class InductionStrategy(ABC):
                 for col_name in tc.columns
             }
 
+            column_locals = camel_names_for(table)
+
             for col in table.columns:
                 # A column absorbed into a sibling's composite-FK Referencing
                 # Object Map still gets its OWN datatype POM. The relationship is
@@ -1309,23 +1438,23 @@ class InductionStrategy(ABC):
                 # the ontology declares these columns as datatype properties (see
                 # composite_fk_columns).
                 if col.name in absorbed_columns:
-                    pom = URIRef(f"{tmap}/POM_{to_pascal(col.name)}")
+                    pom = URIRef(f"{tmap}/POM_{pom_segment(column_locals[col.name])}")
                     g.add((tmap, RR.predicateObjectMap, pom))
-                    g.add((pom, RR.predicate, ns[f"{camel_by_id[identity]}_{to_camel(col.name)}"]))
+                    g.add((pom, RR.predicate, ns[f"{camel_by_id[identity]}_{column_locals[col.name]}"]))
                     om = URIRef(f"{pom}/ObjectMap")
                     g.add((pom, RR.objectMap, om))
                     g.add((om, RR.column, Literal(sql_ident(col.name))))
                     g.add((om, RR.datatype, xsd_for_column(col.dataType, col.name)))
                     continue
 
-                base_local = f"{camel_by_id[identity]}_{to_camel(col.name)}"
+                base_local = f"{camel_by_id[identity]}_{column_locals[col.name]}"
 
                 # This column anchors a composite FK when the shared anchor table
                 # says so — never by re-deriving it here.
                 composite_fk = composite_anchors.get(col.name)
 
                 if composite_fk is not None and composite_fk.referredColumns:
-                    pom, om = _pom(tmap, col.name)
+                    pom, om = _pom(tmap, column_locals[col.name])
                     g.add((pom, RR.predicate, ns[base_local]))
                     # Composite FK: emit a single Referencing Object Map for the
                     # entire relationship, with one joinCondition per column pair.
@@ -1367,7 +1496,7 @@ class InductionStrategy(ABC):
                     continue
 
                 if col.name in malformed_composite_columns:
-                    pom, om = _pom(tmap, col.name)
+                    pom, om = _pom(tmap, column_locals[col.name])
                     g.add((pom, RR.predicate, ns[base_local]))
                     # columns/referredColumns disagree in length, or the targets span
                     # several tables: no join can be derived, so the column degrades
@@ -1409,7 +1538,7 @@ class InductionStrategy(ABC):
                         # single relationship, qualified per fk_property_qualifiers
                         # otherwise.
                         pom_suffix = f"__{qualifier}" if qualifier else ""
-                        pom, om = _pom(tmap, col.name, pom_suffix)
+                        pom, om = _pom(tmap, column_locals[col.name], pom_suffix)
                         g.add((pom, RR.predicate, ns[fk_property_local_name(base_local, qualifier)]))
                         g.add((om, RR.parentTriplesMap, parent_tmap))
                         jc = BNode()
@@ -1418,7 +1547,7 @@ class InductionStrategy(ABC):
                         g.add((jc, RR.parent, Literal(sql_ident(fk_parent_col))))
                 else:
                     # Non-FK (or every FK withheld/unresolvable): datatype ObjectMap
-                    pom, om = _pom(tmap, col.name)
+                    pom, om = _pom(tmap, column_locals[col.name])
                     g.add((pom, RR.predicate, ns[base_local]))
                     g.add((om, RR.column, Literal(sql_ident(col.name))))
                     dt = xsd_for_column(col.dataType, col.name)

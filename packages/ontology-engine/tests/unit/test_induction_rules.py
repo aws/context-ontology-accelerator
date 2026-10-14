@@ -1762,7 +1762,14 @@ class TestRule4LabelAndComment:
         assert labels[0].datatype == XSD.string  # type: ignore[union-attr]
 
     def test_observation_frequency_comment_single_class(self):
-        """Req 13.8 — comment names the count and (single) class."""
+        """Req 13.8 — the comment names the count; the class comes from rdfs:domain.
+
+        The class name is deliberately NOT interpolated into the sentence. It comes
+        from the corpus, so an English frame around it manufactures a literal
+        holding two languages on a non-English corpus ("Observed across 1 fact(s)
+        in class 技術的特性"). RDF 1.1 cannot language-tag such a literal, and no
+        extraction-prompt change can remove it because we generate it ourselves.
+        """
         from rdflib import RDFS, XSD, URIRef
 
         facts = [
@@ -1782,13 +1789,23 @@ class TestRule4LabelAndComment:
         assert comment.datatype == XSD.string  # type: ignore[union-attr]
         text = str(comment)
         assert "2" in text  # fact count
-        assert "Company" in text  # the class name (local segment)
+        # No corpus-derived text at all — that is what keeps the literal
+        # single-language whatever the corpus is written in.
+        assert text.isascii()
+        # The class is not lost: rdfs:domain carries it, which is where a consumer
+        # should read it from anyway.
+        assert URIRef(_class_iri("Company")) in set(g.objects(prop_uri, RDFS.domain))
 
     def test_observation_frequency_comment_per_subject_class(self):
-        """Req 13.8 (Task 12D-amended) — the same predicate observed
-        on TWO subject classes produces TWO distinct properties, each
-        with its own observation-frequency comment naming only that
-        property's single subject class."""
+        """Req 13.8 (Task 12D-amended) — the same predicate observed on TWO
+        subject classes produces TWO distinct properties, each with its own
+        observation-frequency comment and its own ``rdfs:domain``.
+
+        The per-class distinction is asserted on ``rdfs:domain`` rather than on the
+        comment text: the class name no longer appears in the sentence, because
+        interpolating corpus-derived text into an English frame manufactures a
+        mixed-language literal (see the single-class test above).
+        """
         from rdflib import RDFS, URIRef
 
         facts = [
@@ -1813,15 +1830,15 @@ class TestRule4LabelAndComment:
         assert len(company_comments) == 1
         company_text = str(company_comments[0])
         assert "2" in company_text  # two facts on Company
-        assert "Company" in company_text
-        assert "Person" not in company_text
 
         person_comments = list(g.objects(person_prop, RDFS.comment))
         assert len(person_comments) == 1
         person_text = str(person_comments[0])
         assert "1" in person_text  # one fact on Person
-        assert "Person" in person_text
-        assert "Company" not in person_text
+
+        # Each property is still attributed to exactly its own class, via domain.
+        assert set(g.objects(company_prop, RDFS.domain)) == {URIRef(_class_iri("Company"))}
+        assert set(g.objects(person_prop, RDFS.domain)) == {URIRef(_class_iri("Person"))}
 
 
 class TestRule4MissingClassFiltering:
@@ -2456,3 +2473,56 @@ class TestRule5NamespaceBindings:
         # consistency with the other rules.
         for required in ("owl", "rdf", "rdfs", "xsd", "skos"):
             assert required in bound
+
+
+class TestGeneratedCommentsAreSingleLanguage:
+    """A comment COA writes itself must not mix languages, whatever the corpus.
+
+    Issue #897's blocker is that RDF 1.1 gives a literal one language tag or one
+    datatype, never a tag per fragment — so a literal holding two languages cannot
+    be tagged correctly under any scheme. Extraction-prompt work can reduce
+    mixed-language labels coming FROM the corpus, but it cannot touch a literal
+    that COA manufactures by interpolating a corpus-derived name into an English
+    frame. Those have to be fixed here.
+    """
+
+    def test_a_non_ascii_class_name_does_not_leak_into_the_comment(self):
+        """The measured case: 17 such literals in one real induced ontology.
+
+        The frame was ``f"Observed across {n} fact(s) in class {domain_name}"``, and
+        ``domain_name`` is the class's own label — Japanese on a Japanese corpus.
+        """
+        from rdflib import RDFS
+
+        facts = [
+            _spc("測定器A", "技術的特性", "設置場所", "屋内"),
+            _spc("測定器B", "技術的特性", "設置場所", "屋外"),
+        ]
+        class_iris = {"技術的特性": _class_iri("技術的特性")}
+        g = induce_datatype_properties(
+            facts=facts,
+            class_iris=class_iris,
+            iri_resolver=_real_resolver(),
+        )
+        comments = [str(c) for _s, _p, c in g.triples((None, RDFS.comment, None))]
+        assert comments, "expected at least one generated comment"
+        for text in comments:
+            assert text.isascii(), f"generated comment carries corpus text: {text!r}"
+
+    def test_the_class_is_still_recoverable_from_domain(self):
+        """Dropping the name from the prose must not lose the attribution.
+
+        A consumer that wants the class reads ``rdfs:domain``; the comment restated
+        it only in a form that made the literal untaggable.
+        """
+        from rdflib import RDFS, URIRef
+
+        facts = [_spc("測定器A", "技術的特性", "設置場所", "屋内")]
+        class_iris = {"技術的特性": _class_iri("技術的特性")}
+        g = induce_datatype_properties(
+            facts=facts,
+            class_iris=class_iris,
+            iri_resolver=_real_resolver(),
+        )
+        prop = URIRef(_datatype_property_iri("設置場所", "技術的特性"))
+        assert set(g.objects(prop, RDFS.domain)) == {URIRef(_class_iri("技術的特性"))}

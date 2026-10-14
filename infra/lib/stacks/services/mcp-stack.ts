@@ -9,11 +9,13 @@ import * as iam from "aws-cdk-lib/aws-iam";
 import * as ssm from "aws-cdk-lib/aws-ssm";
 import { DockerImageAsset, Platform } from "aws-cdk-lib/aws-ecr-assets";
 import { Construct } from "constructs";
-import { resolveContext } from "../../context";
+import { prefixedLambdaArn, resolveContext } from "../../context";
 import { agentCoreSupportedSubnets } from "../../utils/agentcore-az";
 import { brandEnv } from "../../utils/brand-env";
 import { parseEcrImageUri } from "../../utils/ecr-utils";
 import { Paths } from "../../paths";
+import { METRIC_API_FUNCTION_NAME } from "./metric-service-stack";
+import { ONTOLOGY_API_PROXY_FUNCTION_NAME } from "./ontology-stack";
 import { SCLStack } from "../../constructs";
 
 export interface McpStackProps extends cdk.StackProps {
@@ -83,14 +85,18 @@ export class McpStack extends SCLStack {
       `${ssmPrefix}/authentication-group-token-name`,
     );
 
-    // ── Resolve backend Lambda ARNs from SSM (discovery tools) ────────
-    const metricServiceLambdaArn = ssm.StringParameter.valueForStringParameter(
+    // ── Backend Lambda ARNs (discovery tools) ─────────────────────────
+    // Built from the functions' fixed names so this stack needs no dependency on
+    // the metric-service and ontology stacks. Keep it that way: serve and mcp
+    // share one image asset, and CDK makes that publish wait for all of mcp's
+    // dependencies, so an edge here would delay ServeStack too.
+    const metricServiceLambdaArn = prefixedLambdaArn(
       this,
-      `${ssmPrefix}/metric/api-fn-arn`,
+      METRIC_API_FUNCTION_NAME,
     );
-    const ontologyProxyLambdaArn = ssm.StringParameter.valueForStringParameter(
+    const ontologyProxyLambdaArn = prefixedLambdaArn(
       this,
-      `${ssmPrefix}/ontology-engine/api-fn-arn`,
+      ONTOLOGY_API_PROXY_FUNCTION_NAME,
     );
 
     // ── Security Group (minimal: HTTPS only) ──────────────────────────

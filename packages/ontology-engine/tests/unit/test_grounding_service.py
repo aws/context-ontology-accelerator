@@ -3,6 +3,9 @@
 
 """Unit tests for the centralized grounding service."""
 
+from __future__ import annotations
+
+import unicodedata
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -16,6 +19,9 @@ from coa_ontology.inducer.services.grounding import (
 )
 
 pytestmark = pytest.mark.unit
+
+_ENGLAND_FLAG = "\U0001f3f4\U000e0067\U000e0062\U000e0065\U000e006e\U000e0067\U000e007f"
+_SCOTLAND_FLAG = "\U0001f3f4\U000e0067\U000e0062\U000e0073\U000e0063\U000e0074\U000e007f"
 
 
 @pytest.fixture
@@ -54,6 +60,152 @@ class TestNormalize:
     def test_strips_special_chars(self):
         assert _normalize("hello-world_123") == "helloworld123"
 
+    def test_does_not_casefold_distinct_sharp_s_words(self):
+        assert _normalize("Maße") != _normalize("Masse")
+
+    def test_preserves_compatibility_symbols_without_expanding_them(self):
+        assert _normalize("℃") == "℃"
+        assert _normalize("™") == "™"
+        assert _normalize("℃") != _normalize("C")
+        assert _normalize("™") != _normalize("TM")
+
+    def test_simple_case_identity_unifies_sigma_without_expanding_sharp_s(self):
+        assert _normalize("Σ") == _normalize("σ") == _normalize("ς")
+        assert _normalize("Maße") != _normalize("Masse")
+
+    @pytest.mark.parametrize(
+        ("left", "right"),
+        [
+            pytest.param("A￣B", "A¯B", id="fullwidth-macron"),
+            pytest.param("ﾡￂ", "ㄱㅏ", id="halfwidth-hangul"),
+            pytest.param("HO\u0308HE", "HÖHE", id="canonical-equivalence"),
+        ],
+    )
+    def test_width_and_canonical_variants_share_fuzzy_identity(self, left: str, right: str) -> None:
+        assert _normalize(left) == _normalize(right)
+
+    @pytest.mark.parametrize(
+        ("left", "right"),
+        [
+            pytest.param("👩‍🔬", "👩🔬", id="zwj-sequence"),
+            pytest.param("a‌b", "ab", id="zwnj-sequence"),
+            pytest.param("µ", "μ", id="micro-sign-vs-greek-mu"),
+            pytest.param("ϐ", "β", id="beta-symbol-vs-beta"),
+            pytest.param("aͅ", "a", id="greek-combining-mark"),
+            pytest.param("ſ", "s", id="long-s"),
+        ],
+    )
+    def test_distinct_unicode_identities_do_not_share_fuzzy_key(self, left: str, right: str) -> None:
+        assert _normalize(left) != _normalize(right)
+
+    def test_attached_greek_mark_remains_significant_after_ascii_base(self) -> None:
+        assert _normalize("aͅ") == "aͅ"
+
+    def test_subdivision_flags_keep_attached_tags_and_orphans_are_dropped(self) -> None:
+        assert _normalize(_ENGLAND_FLAG) == _ENGLAND_FLAG
+        assert _normalize(_SCOTLAND_FLAG) == _SCOTLAND_FLAG
+        assert _normalize(_ENGLAND_FLAG) != _normalize(_SCOTLAND_FLAG)
+        assert _normalize("\U000e0067") == ""
+
+
+class TestNormalizeIsScriptAgnostic:
+    """The key must survive in every script, because equal keys mean "same concept".
+
+    ``_normalize`` is only ever used as ``_normalize(a) == _normalize(b)``. The
+    previous ``[^a-z0-9]`` filter judged by ASCII range, so a label in any
+    non-Latin script normalized to ``""`` — and ``"" == ""`` is True, so every
+    pair of non-Latin labels matched each other. That is worse than failing to
+    match: it grounded distinct concepts onto one another silently, and the more
+    of a corpus was non-Latin the more of it collapsed.
+    """
+
+    @pytest.mark.parametrize(
+        "label",
+        ["設置場所", "メーカー", "エレベーター", "安装位置", "제조사", "ИЗГОТОВИТЕЛЬ"],
+    )
+    def test_a_non_latin_label_does_not_normalize_away(self, label):
+        assert _normalize(label) != ""
+
+    @pytest.mark.parametrize(
+        ("left", "right"),
+        [
+            pytest.param("設置場所", "メーカー", id="ja-unrelated-pair"),
+            pytest.param("エレベーター", "エスカレーター", id="ja-elevator-vs-escalator"),
+            pytest.param("제조사", "설치장소", id="ko-unrelated-pair"),
+            pytest.param("安装位置", "制造商", id="zh-unrelated-pair"),
+        ],
+    )
+    def test_two_unrelated_non_latin_labels_are_not_equal(self, left, right):
+        """The defect itself: unrelated concepts compared equal via the empty string."""
+        assert _normalize(left) != _normalize(right)
+
+    @pytest.mark.parametrize(
+        ("voiced", "unvoiced"),
+        [
+            pytest.param("ベース", "ヘース", id="katakana-dakuten"),
+            pytest.param("ゲージ", "ケージ", id="katakana-gauge-vs-cage"),
+            pytest.param("ぱす", "はす", id="hiragana-handakuten"),
+        ],
+    )
+    def test_japanese_voicing_marks_are_not_stripped(self, voiced, unvoiced):
+        """Dakuten and handakuten are combining marks, but they are part of the letter.
+
+        NFKD splits ベ into ヘ + U+3099, so a blanket combining-mark strip — the
+        obvious way to fold Latin accents — turns エレベーター into エレヘーター and
+        ぱ into は. Those are different words, and folding them together matches
+        the wrong concept. Marks are dropped only when the base letter is ASCII.
+        """
+        assert _normalize(voiced) != _normalize(unvoiced)
+
+    @pytest.mark.parametrize(
+        ("left", "right"),
+        [
+            pytest.param("कि", "की", id="devanagari-vowel-signs"),
+            pytest.param("กิ", "กี", id="thai-vowel-signs"),
+        ],
+    )
+    def test_script_vowel_marks_keep_labels_distinct(self, left: str, right: str) -> None:
+        """Spacing and nonspacing vowel marks are part of the comparison key."""
+        assert _normalize(left) == left
+        assert _normalize(right) == right
+        assert _normalize(left) != _normalize(right)
+
+    @pytest.mark.parametrize("label", ["❤️", "✈️", "☀️", "⚙️"])
+    def test_symbol_variation_selectors_remain_attached(self, label: str) -> None:
+        """Symbols are identity bases; their variation selectors stay attached."""
+        assert _normalize(label) == label
+
+    def test_enclosing_mark_attached_to_a_letter_is_retained(self) -> None:
+        assert _normalize("क⃝") == "क⃝"
+
+    @pytest.mark.parametrize(
+        ("accented", "plain"),
+        [
+            pytest.param("HÖHE", "HOHE", id="de-umlaut"),
+            pytest.param("MODÈLE", "MODELE", id="fr-grave"),
+            pytest.param("TAMAÑO", "TAMANO", id="es-tilde"),
+            pytest.param("AÇÃO", "ACAO", id="pt-cedilla-tilde"),
+        ],
+    )
+    def test_latin_accents_still_fold_for_matching(self, accented, plain):
+        """Folding Latin diacritics is deliberate here and must not regress.
+
+        Unlike ``normalize_predicate``, this value is a comparison key that is
+        never persisted, so making ``Höhe`` match ``HOHE`` is the point rather
+        than data loss.
+        """
+        assert _normalize(accented) == _normalize(plain)
+
+    @pytest.mark.parametrize("label", ["HÖHE", "エレベーター", "설치장소"])
+    def test_key_is_independent_of_input_normalization_form(self, label):
+        """Composed and decomposed input must produce the same key.
+
+        Labels arrive from an LLM, a Turtle file, and a graph store, which need not
+        agree on NFC vs NFD. If the key depended on the form, the same label from
+        two sources would fail to match itself.
+        """
+        assert _normalize(unicodedata.normalize("NFC", label)) == _normalize(unicodedata.normalize("NFD", label))
+
 
 class TestLocalName:
     def test_hash_fragment(self):
@@ -61,6 +213,13 @@ class TestLocalName:
 
     def test_slash_path(self):
         assert _local_name("http://fibo/Agreements/Agreement") == "Agreement"
+
+    def test_percent_encoded_combining_mark_is_decoded(self):
+        assert _local_name("http://example.test/class/क%E0%A4%BF") == "कि"
+
+    @pytest.mark.parametrize("local_name", ["%FF", "A%20B%ZZ", "%E0%A4%BF%ZZ", "%", "%2"])
+    def test_malformed_percent_encoding_is_preserved_whole(self, local_name: str):
+        assert _local_name(f"http://example.test/class/{local_name}") == local_name
 
 
 class TestGroundingModeNone:
@@ -79,6 +238,48 @@ class TestGroundingModeNone:
 
 
 class TestExactNameMatch:
+    def test_symbol_only_names_do_not_exact_match(self, service):
+        candidate = GroundingCandidate(
+            entity_uri="http://example.test/Airplane",
+            ontology_id="test",
+            label="✈️",
+            definition="",
+            lexical_sim=1.0,
+        )
+
+        assert service._exact_name_matches("❤️", [candidate]) == []
+
+    def test_subdivision_flags_do_not_exact_match(self, service):
+        candidate = GroundingCandidate(
+            entity_uri="http://example.test/Scotland",
+            ontology_id="test",
+            label=_SCOTLAND_FLAG,
+            definition="Scotland flag",
+            lexical_sim=1.0,
+        )
+
+        assert service._exact_name_matches(_ENGLAND_FLAG, [candidate]) == []
+
+    def test_distinct_sharp_s_words_do_not_exact_match(self, service):
+        candidate = GroundingCandidate(
+            entity_uri="http://example.test/Masse",
+            ontology_id="test",
+            label="Masse",
+            definition="Mass.",
+            lexical_sim=1.0,
+        )
+        assert service._exact_name_matches("Maße", [candidate]) == []
+
+    def test_percent_encoded_iri_local_name_exact_matches(self, service):
+        candidate = GroundingCandidate(
+            entity_uri="http://example.test/क%E0%A4%BF",
+            ontology_id="test",
+            label=_local_name("http://example.test/क%E0%A4%BF"),
+            definition="",
+            lexical_sim=1.0,
+        )
+        assert service._exact_name_matches("कि", [candidate]) == [candidate]
+
     def test_exact_match_auto_grounds_in_standard_mode(self, service, mock_catalog):
         # In STANDARD mode (no LLM), exact-name match auto-grounds
         result = service.ground_table(
@@ -137,6 +338,31 @@ class TestExactNameMatch:
 
 
 class TestStandardMode:
+    def test_equal_score_duplicate_exact_names_abstain(self, service):
+        candidates = [
+            GroundingCandidate(
+                entity_uri=f"http://ontology-{suffix}.test/Duplicate",
+                ontology_id=f"ontology-{suffix}",
+                label="Duplicate",
+                definition="",
+                lexical_sim=0.9,
+            )
+            for suffix in ("a", "b")
+        ]
+        with patch.object(service, "_recall", return_value=candidates):
+            result = service.ground_table(
+                table_name="duplicate",
+                table_description="",
+                columns=[],
+                concept_vector=[0.1],
+                model_id="titan",
+                grounding_mode="STANDARD",
+                ontology_ids=["ontology-a", "ontology-b"],
+            )
+        assert result.chosen is None
+        assert result.match_type == "novel"
+        assert "share the top embedding score" in (result.reason or "")
+
     def test_uses_embedding_score_no_llm(self, service, mock_catalog):
         with patch.object(service, "_llm_rerank") as mock_llm:
             result = service.ground_table(
@@ -178,6 +404,89 @@ class TestEnhancedMode:
         assert result.relationship == "exactMatch"
         assert result.confidence == 0.92
         assert result.mode == "ENHANCED"
+
+    def test_llm_exact_spelling_wins_over_normalized_collision(self, service):
+        candidates = [
+            GroundingCandidate(
+                entity_uri="http://example.test/Hohe",
+                ontology_id="test",
+                label="Hohe",
+                definition="Height without umlaut.",
+                lexical_sim=0.9,
+            ),
+            GroundingCandidate(
+                entity_uri="http://example.test/H%C3%B6he",
+                ontology_id="test",
+                label="Höhe",
+                definition="Height.",
+                lexical_sim=0.8,
+            ),
+        ]
+        response = {
+            "choice": "Höhe",
+            "relationship": "exactMatch",
+            "confidence": 0.95,
+            "reason": "Exact spelling selected",
+        }
+        with (
+            patch.object(service, "_recall", return_value=candidates),
+            patch.object(service, "_llm_rerank", return_value=response),
+        ):
+            result = service.ground_table(
+                table_name="height_record",
+                table_description="",
+                columns=[],
+                concept_vector=[0.1],
+                model_id="titan",
+                grounding_mode="ENHANCED",
+                ontology_ids=["test"],
+            )
+        assert result.chosen is candidates[1]
+
+    @pytest.mark.parametrize("reverse", [False, True])
+    def test_llm_duplicate_exact_choice_abstains_independent_of_recall_order(self, service, reverse: bool):
+        candidates = [
+            GroundingCandidate(
+                entity_uri="http://ontology-a.test/Duplicate",
+                ontology_id="ontology-a",
+                label="Duplicate",
+                definition="First domain.",
+                lexical_sim=0.9,
+            ),
+            GroundingCandidate(
+                entity_uri="http://ontology-b.test/Duplicate",
+                ontology_id="ontology-b",
+                label="Duplicate",
+                definition="Second domain.",
+                lexical_sim=0.8,
+            ),
+        ]
+        if reverse:
+            candidates.reverse()
+        response = {
+            "choice": "Duplicate",
+            "relationship": "exactMatch",
+            "confidence": 0.95,
+            "reason": "Selected by local name",
+        }
+        with (
+            patch.object(service, "_recall", return_value=candidates),
+            patch.object(service, "_llm_rerank", return_value=response),
+        ):
+            result = service.ground_table(
+                table_name="source_record",
+                table_description="",
+                columns=[],
+                concept_vector=[0.1],
+                model_id="titan",
+                grounding_mode="ENHANCED",
+                ontology_ids=["ontology-a", "ontology-b"],
+            )
+        assert result.chosen is None
+        assert result.match_type == "novel"
+        assert "did not uniquely identify" in (result.reason or "")
+        assert "http://ontology-a.test/Duplicate" in (result.reason or "")
+        assert "http://ontology-b.test/Duplicate" in (result.reason or "")
 
     def test_llm_abstains(self, service):
         llm_response = {

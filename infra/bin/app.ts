@@ -426,7 +426,8 @@ async function deploy(): Promise<void> {
   });
   sources.addDependency(smusDomain); // needs SSM params from namespace stack
   sources.addDependency(storage); // needs Neptune/OpenSearch endpoints
-  sources.addDependency(serve); // needs /{env}/serve/runtime-role-arn SSM param (LF consumer grant)
+  // No dependency on serve: DbConnectorFn reads the serve runtime role ARN from SSM at runtime.
+  sources.addDependency(guardrail); // reads /bedrock/retrieval-guardrail-{id,version} at deploy time
 
   api.addDependency(sources);
   api.addDependency(metricService);
@@ -530,8 +531,6 @@ async function deploy(): Promise<void> {
     agentCoreAzNames,
   });
   mcp.addDependency(serve); // needs CM runtime-arn SSM param
-  mcp.addDependency(metricService); // needs /metric/api-fn-arn SSM param (discovery tools)
-  mcp.addDependency(ontology); // needs /ontology-engine/api-fn-arn SSM param (discovery tools)
   mcp.addDependency(auth); // needs /issuer, /userpool-client-id, /mcp-client-id SSM params
 
   // Inject the resolved brand tokens (BRAND_PREFIX / GRAPH_BASE_URI /

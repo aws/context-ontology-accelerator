@@ -33,6 +33,9 @@ import {
 import { bundlePython } from "../../utils/python-bundling";
 import { bedrockModelArn } from "../../utils/bedrock-utils";
 
+/** Name (without the `{prefix}-{env}-` prefix) of the metric API Lambda. */
+export const METRIC_API_FUNCTION_NAME = "metric-api";
+
 export interface MetricServiceStackProps extends cdk.StackProps {
   /** VPC for Lambda placement. */
   readonly vpc: ec2.IVpc;
@@ -153,7 +156,7 @@ export class MetricServiceStack extends SCLStack {
 
     // ── Metric API Lambda ──────────────────────────────────────────
     this.metricApiFn = new lambda.Function(this, "MetricApiFn", {
-      functionName: this.prefixed("metric-api"),
+      functionName: this.prefixed(METRIC_API_FUNCTION_NAME),
       runtime: lambda.Runtime.PYTHON_3_12,
       handler: "coa_metrics.api.metric_api_handler.handler",
       code: lambdaCode,

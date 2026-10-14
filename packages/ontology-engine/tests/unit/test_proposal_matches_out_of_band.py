@@ -154,12 +154,12 @@ class TestGetProposalRoute:
         monkeypatch.setattr(
             proposals.dynamo_store,
             "presign_proposal_artifact",
-            lambda namespace, pid, artifact: None,
+            lambda namespace, pid, artifact, **kwargs: None,
         )
         monkeypatch.setattr(
             proposals.dynamo_store,
             "presign_proposal_matches",
-            lambda namespace, pid: matches_url,
+            lambda namespace, pid, **kwargs: matches_url,
         )
         monkeypatch.setattr(
             proposals.dynamo_store,
@@ -201,3 +201,51 @@ class TestGetProposalRoute:
         resp = proposals.get_proposal("p-old", namespace="ns")
         assert resp["matches_url"] is None
         assert resp["metadata"]["matches"] == legacy_matches
+
+    def test_revision_pointers_are_presigned_exactly(self, monkeypatch):
+        from coa_ontology import proposals
+
+        revision = "revisions/390d7391-6a2f-4678-8959-3d1496b7f852"
+        item = {
+            "proposal_id": "p-revision",
+            "status": "updated",
+            "ontology_s3_key": f"proposals/ns/p-revision/{revision}/ontology.ttl",
+            "r2rml_s3_key": f"proposals/ns/p-revision/{revision}/r2rml.ttl",
+            "matches_s3_key": f"proposals/ns/p-revision/{revision}/matches.json",
+            "metadata": {},
+        }
+        monkeypatch.setattr(
+            proposals.dynamo_store,
+            "get_proposal_by_id",
+            lambda pid, namespace="default", hydrate_turtle=True, hydrate_matches=True, hydrate_constraints=True: item,
+        )
+        signed: list[str | None] = []
+
+        def _artifact(namespace, pid, artifact, **kwargs):
+            signed.append(kwargs.get("s3_key"))
+            return f"https://s3.test/{artifact}"
+
+        def _matches(namespace, pid, **kwargs):
+            signed.append(kwargs.get("s3_key"))
+            return "https://s3.test/matches"
+
+        monkeypatch.setattr(proposals.dynamo_store, "presign_proposal_artifact", _artifact)
+        monkeypatch.setattr(proposals.dynamo_store, "presign_proposal_matches", _matches)
+        # ``presign_proposal_constraints`` derives its own key and probes S3 with
+        # ``head_object`` on every ``GET /proposals/{id}``, so without a stub it
+        # would make a real S3 call here. It takes no ``s3_key``, so it is not
+        # part of the pass-through assertion below.
+        monkeypatch.setattr(
+            proposals.dynamo_store,
+            "presign_proposal_constraints",
+            lambda namespace, pid: None,
+        )
+
+        response = proposals.get_proposal("p-revision", namespace="ns")
+
+        assert response["ontology_url"] == "https://s3.test/ontology"
+        assert signed == [
+            item["ontology_s3_key"],
+            item["r2rml_s3_key"],
+            item["matches_s3_key"],
+        ]

@@ -99,7 +99,14 @@ class StoreOntologyCatalogAdapter:
         )
         return [asdict(h) for h in hits]
 
-    def list_embeddings_for_ontology(self, ontology_id, entity_type=None, embedding_type=None, namespace=None):
+    def list_embeddings_for_ontology(
+        self,
+        ontology_id,
+        entity_type=None,
+        embedding_type=None,
+        namespace=None,
+        limit=None,
+    ):
         """List an ontology's embedding docs (delegates to the vector store).
 
         Used by the grounding service's lexical (token-overlap) recall to
@@ -113,6 +120,7 @@ class StoreOntologyCatalogAdapter:
             entity_type=entity_type,
             embedding_type=embedding_type,
             namespace=ns,
+            limit=limit,
         )
 
     def get_embeddings_for_entity(self, entity_uri, embedding_type=None, namespace=None):

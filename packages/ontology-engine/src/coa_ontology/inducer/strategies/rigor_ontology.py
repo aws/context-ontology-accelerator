@@ -37,14 +37,17 @@ from coa_ontology.inducer.strategies.base import (
     InductionStrategy,
     add_glossary_and_tags,
     ambiguous_target_names,
+    camel_names_for,
     fk_edge_allowed,
     logical_table_names,
     pascal_names_for,
+    pom_segment,
     reference_index,
     resolve_fk_target_identity,
     simple_fk_constraints,
     subject_template_names,
     table_identity,
+    to_pascal,
 )
 
 log = logging.getLogger(__name__)
@@ -71,11 +74,20 @@ _RAG_TOP_K_PROPERTIES = 5
 
 
 def _to_pascal(s: str) -> str:
-    """Convert snake_case / kebab-case / spaced names to PascalCase."""
-    if not s:
-        return "Entity"
-    cleaned = re.sub(r"[^a-zA-Z0-9\s_\-]", "", s)
-    return "".join(w.capitalize() for w in re.split(r"[\s_\-]+", cleaned) if w)
+    """Convert snake_case / kebab-case / spaced names to PascalCase.
+
+    Delegates to :func:`~coa_ontology.inducer.strategies.base.to_pascal` rather
+    than keeping a private copy — the private copies are what let the non-Latin
+    identifier defect survive in three files at once.
+
+    This strategy is NOT otherwise name-compatible with the table-to-ontology
+    strategy: it mints its TriplesMap IRI from the bare table name (see
+    ``build_r2rml`` below) rather than from
+    :func:`~coa_ontology.inducer.strategies.base.pascal_names_for`, so two
+    same-named tables from different databases still fuse here. That is a separate
+    pre-existing gap, tracked apart from the identifier normalization.
+    """
+    return to_pascal(s)
 
 
 def _iri_local_name(iri: str) -> str:
@@ -984,6 +996,8 @@ class RigorOntologyStrategy(InductionStrategy):
             pk_id = sql_ident(pk_col) if pk_col else '"ID"'
             subj = URIRef(f"{tmap}/SubjectMap")
             g.add((tmap, RR.subjectMap, subj))
+            # Deliberately the table name from subject_template_names (schema-qualified only on a
+            # collision), not the pascal_names_for class local: instance IRIs are published.
             g.add((subj, RR.template, Literal(f"{ontology_uri_prefix}{subject_names[identity]}/{{{pk_id}}}")))
             g.add((subj, RR["class"], table_cls))
 
@@ -995,6 +1009,8 @@ class RigorOntologyStrategy(InductionStrategy):
                 table,
             )
 
+            column_locals = camel_names_for(table)
+
             for col in table.columns:
                 prop_uri = prop_by_col.get(col.name)
                 if prop_uri is None:
@@ -1005,7 +1021,7 @@ class RigorOntologyStrategy(InductionStrategy):
                     )
                     continue
 
-                pom = URIRef(f"{tmap}/POM_{_to_pascal(col.name)}")
+                pom = URIRef(f"{tmap}/POM_{pom_segment(column_locals[col.name])}")
                 g.add((tmap, RR.predicateObjectMap, pom))
                 g.add((pom, RR.predicate, prop_uri))
 
