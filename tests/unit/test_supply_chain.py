@@ -88,6 +88,30 @@ def test_iter_installed_excludes_first_party_and_applies_overrides(monkeypatch):
     assert pkgs["owlrl"].normalized == "W3C"
 
 
+@pytest.mark.parametrize("classifiers", [[], ["License :: OSI Approved :: Apache Software License"]])
+@pytest.mark.parametrize("name", ["pypdfium2", "cedarpy"])
+def test_inventory_and_notice_preserve_compound_license_declaration(monkeypatch, classifiers, name):
+    class _FakeMeta(dict):
+        def get_all(self, key):
+            return classifiers if key == "Classifier" else []
+
+    class _FakeDist:
+        metadata = _FakeMeta(
+            {
+                "Name": name,
+                "Version": "5.13.0",
+                "License": "BSD-3-Clause, Apache-2.0, dependency licenses",
+            }
+        )
+
+    monkeypatch.setattr(licenses.im, "distributions", lambda: iter([_FakeDist()]))
+
+    packages = licenses.iter_installed()
+    assert packages[0].normalized == licenses.UNKNOWN
+    assert packages[0].raw_license == "BSD-3-Clause, Apache-2.0, dependency licenses"
+    assert f"{name} (5.13.0) — BSD-3-Clause, Apache-2.0, dependency licenses" in notice.render_notice(packages)
+
+
 # --- notice ------------------------------------------------------------------
 
 

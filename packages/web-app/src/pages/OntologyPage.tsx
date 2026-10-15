@@ -245,10 +245,14 @@ export function OntologyPage() {
           }
         } else {
           Promise.all([
-            // No status filter: we need accepted AND pending inductions.
-            listProposals(apiClient, namespaceId ?? "").catch(
-              (): Proposal[] => [],
-            ),
+            // Only structured inductions can cover a database source. The list
+            // is capped (newest first), so asking for just those keeps the cap
+            // from being spent on document inductions. No status filter: we
+            // need accepted AND pending inductions.
+            listProposals(apiClient, namespaceId ?? "", {
+              type: "induction",
+              source_type: "STRUCTURED",
+            }).catch((): Proposal[] => []),
             Promise.all(
               approvedDbSources.map((s) =>
                 apiClient

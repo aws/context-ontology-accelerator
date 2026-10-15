@@ -38,8 +38,14 @@ from .strategies import DEFAULT_SPEC, StrategySpec
 #
 # Patching the module-level constants is the only reliable workaround.
 # TODO: Remove once graphrag-toolkit publishes a fix with active model defaults.
+#
+# Model resolution: GRAPHRAG_LLM_MODEL (explicit override), then BEDROCK_MODEL_ID
+# (serve-stack always sets it from bedrockLlmModelId, which synth validates for
+# the deploy region), then the US default. ``or`` so an empty value falls through.
 # ---------------------------------------------------------------------------
-_ACTIVE_MODEL = os.environ.get("GRAPHRAG_LLM_MODEL", "us.anthropic.claude-sonnet-5")
+_ACTIVE_MODEL = (
+    os.environ.get("GRAPHRAG_LLM_MODEL") or os.environ.get("BEDROCK_MODEL_ID") or "us.anthropic.claude-sonnet-5"
+)
 _graphrag_cfg.DEFAULT_RESPONSE_MODEL = _ACTIVE_MODEL
 _graphrag_cfg.DEFAULT_EXTRACTION_MODEL = _ACTIVE_MODEL
 

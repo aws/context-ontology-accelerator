@@ -455,6 +455,51 @@ class TestDeleteSingleOntology:
     @patch("coa_ontology.dynamo_store.update_ontology_registry")
     @patch("coa_ontology.dynamo_store.delete_ontology_registry")
     @patch("coa_ontology.dynamo_store.get_ontology_registry")
+    def test_embedding_delete_incomplete_keeps_registry_row(
+        self, mock_get_reg, mock_del_reg, mock_upd_reg, mock_list_props, mock_del_prop, client
+    ):
+        """A delete that stalls with embeddings still matching is a teardown
+        failure too: it used to return normally, so the row was removed with the
+        embeddings left behind. Now it trips the same hard gate."""
+        from coa_common.opensearch import AossVectorClient
+        from coa_common.opensearch import client as oss_client
+
+        # The real delete loop, over one doc whose per-doc delete is rejected.
+        aoss = AossVectorClient(endpoint="https://example.invalid", region="us-east-1")
+        aoss._client = MagicMock()
+        aoss._client.delete.side_effect = RuntimeError("simulated per-doc delete failure")
+        aoss._client.search.side_effect = lambda index, body: (
+            {"hits": {"hits": [], "total": {"value": 1}}}
+            if body.get("size") == 0
+            else {"hits": {"hits": [{"_id": "stale"}], "total": {"value": 1}}}
+        )
+
+        test_client, mock_graph, mock_vector = client
+        oid = "http://ex.org/ont#"
+        mock_get_reg.return_value = {"ontology_id": oid, "source_proposals": ["p-A"]}
+        mock_list_props.return_value = []
+        mock_graph.get_ontology_by_uri.return_value = {"uri": oid}
+        mock_vector.list_searchable_entity_uris.return_value = []
+        mock_vector.delete_embeddings_for_ontology.side_effect = lambda ontology_id, namespace=None: (
+            aoss.delete_by_term("idx", "ontology_id", ontology_id)
+        )
+
+        with patch.object(oss_client, "_DELETE_VERIFY_STALL_TIMEOUT_S", 0.0):
+            resp = test_client.delete("/ontologies/", params={"namespace": "test-ns", "ontology_id": oid})
+
+        assert resp.status_code == 202
+        err_calls = [c for c in mock_upd_reg.call_args_list if "delete_error" in c.kwargs and c.kwargs["delete_error"]]
+        assert err_calls, "expected a delete_error to be recorded on an incomplete embedding delete"
+        assert "Embedding delete failed: DeleteIncompleteError" in err_calls[0].kwargs["delete_error"]
+        mock_del_reg.assert_not_called()
+        mock_del_prop.assert_not_called()
+
+    @patch("coa_ontology.catalog.routers.ontologies.Thread", _InlineThread)
+    @patch("coa_ontology.dynamo_store.delete_proposal")
+    @patch("coa_ontology.dynamo_store.list_proposals")
+    @patch("coa_ontology.dynamo_store.update_ontology_registry")
+    @patch("coa_ontology.dynamo_store.delete_ontology_registry")
+    @patch("coa_ontology.dynamo_store.get_ontology_registry")
     def test_status_flip_failure_aborts_with_500(
         self, mock_get_reg, mock_del_reg, mock_upd_reg, mock_list_props, mock_del_prop, client
     ):

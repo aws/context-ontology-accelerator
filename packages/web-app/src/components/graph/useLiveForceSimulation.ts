@@ -24,7 +24,7 @@ import {
   type SimulationNodeDatum,
 } from "d3-force";
 import type { Node } from "@xyflow/react";
-import { connectedComponents, type LayoutEdge } from "./layout";
+import { componentScale, connectedComponents, type LayoutEdge } from "./layout";
 
 interface SimNode extends SimulationNodeDatum {
   id: string;
@@ -39,6 +39,13 @@ interface Options {
   enabled: boolean;
   nodeSize: number;
   linkDistance: number;
+  /**
+   * Per-node collision radius in px. Falls back to `nodeSize / 2`. Used to let
+   * a hovered class carve out room for its attribute ring + edge labels on
+   * the fly: the hovered node's radius inflates, forceCollide pushes its
+   * neighbours outward live, and the home force pulls them back on unhover.
+   */
+  nodeRadius?: (id: string) => number;
 }
 
 /** Fraction of the distance from cluster centroid nodes start at (fly-in). */
@@ -54,7 +61,7 @@ export function useLiveForceSimulation<T extends Node>(
   initialNodes: readonly T[],
   edges: readonly LayoutEdge[],
   setNodes: (updater: (prev: T[]) => T[]) => void,
-  { enabled, nodeSize, linkDistance }: Options,
+  { enabled, nodeSize, linkDistance, nodeRadius }: Options,
 ) {
   const simRef = useRef<Simulation<SimNode, SimLink> | null>(null);
   const byIdRef = useRef<Map<string, SimNode>>(new Map());
@@ -110,6 +117,25 @@ export function useLiveForceSimulation<T extends Node>(
     const byId = new Map(simNodes.map((n) => [n.id, n]));
     byIdRef.current = byId;
 
+    // Per-connected-component spacing scale: a subgraph with a popular hub
+    // gets its own larger linkDistance; a 3-node side cluster stays at the
+    // baseline. Shared helper so static homes (layout.ts) and this live link
+    // force never disagree about preferred edge length.
+    const linkScaleByNode = new Map<string, number>();
+    for (const component of connectedComponents(ids, edges)) {
+      const compSet = new Set(component);
+      const degree = new Map<string, number>();
+      for (const e of edges) {
+        if (!compSet.has(e.source) || !compSet.has(e.target)) continue;
+        degree.set(e.source, (degree.get(e.source) ?? 0) + 1);
+        degree.set(e.target, (degree.get(e.target) ?? 0) + 1);
+      }
+      let compMaxDeg = 0;
+      for (const d of degree.values()) if (d > compMaxDeg) compMaxDeg = d;
+      const scale = componentScale(compMaxDeg);
+      for (const id of component) linkScaleByNode.set(id, scale);
+    }
+
     // Push positions into React state — but only for nodes that actually
     // moved. Re-creating all node objects every tick makes React Flow re-render
     // every node and edge ~60×/s during a drag; reusing the unchanged objects
@@ -140,7 +166,13 @@ export function useLiveForceSimulation<T extends Node>(
         "link",
         forceLink<SimNode, SimLink>(links)
           .id((n) => n.id)
-          .distance(linkDistance)
+          .distance((link) => {
+            const src = link.source;
+            // forceLink's SimLink generic narrows link.source to SimNode when
+            // it's an object; the string/number cases (pre-resolution) coerce.
+            const sId = typeof src === "object" ? src.id : String(src);
+            return linkDistance * (linkScaleByNode.get(sId) ?? 1);
+          })
           .strength(0.6),
       )
       // distanceMax keeps repulsion local so clusters don't push each other
@@ -151,7 +183,12 @@ export function useLiveForceSimulation<T extends Node>(
           .strength(-linkDistance * 4)
           .distanceMax(linkDistance * 2.5),
       )
-      .force("collide", forceCollide(half + 16).iterations(2))
+      .force(
+        "collide",
+        forceCollide<SimNode>(
+          (n) => (nodeRadius?.(n.id) ?? half) + 16,
+        ).iterations(2),
+      )
       .force("x", forceX<SimNode>((n) => n.homeX).strength(0.06))
       .force("y", forceY<SimNode>((n) => n.homeY).strength(0.06))
       .alpha(1)
@@ -167,7 +204,7 @@ export function useLiveForceSimulation<T extends Node>(
       simRef.current = null;
       byIdRef.current = new Map();
     };
-  }, [enabled, initialNodes, edges, setNodes, half, linkDistance]);
+  }, [enabled, initialNodes, edges, setNodes, half, linkDistance, nodeRadius]);
 
   const setHomeStrength = (strength: number) => {
     const sim = simRef.current;
@@ -201,8 +238,9 @@ export function useLiveForceSimulation<T extends Node>(
   );
 
   /**
-   * Release the node. Every node adopts where it is now as its new home, so
-   * the arrangement the user made sticks instead of springing back.
+   * Release the node. Only the dragged node adopts its current position as
+   * its new home — leaving neighbours' homes untouched so a hover-expanded
+   * layout does not get baked in by every drag.
    */
   const onDragStop = useCallback((nodeId: string) => {
     const s = byIdRef.current.get(nodeId);
@@ -210,13 +248,72 @@ export function useLiveForceSimulation<T extends Node>(
     if (!s || !sim) return;
     s.fx = null;
     s.fy = null;
-    for (const n of byIdRef.current.values()) {
-      if (n.x !== undefined) n.homeX = n.x;
-      if (n.y !== undefined) n.homeY = n.y;
-    }
+    if (s.x !== undefined) s.homeX = s.x;
+    if (s.y !== undefined) s.homeY = s.y;
     setHomeStrength(HOME_STRENGTH_REST);
     sim.alphaTarget(0);
   }, []);
 
-  return { onDragStart, onDrag, onDragStop };
+  /**
+   * Re-invoke `forceCollide`'s radius accessor against every node, so a
+   * recently changed per-node radius (e.g. the hover-expansion ref) actually
+   * reaches the running simulation. d3-force caches radii at `initialize()`
+   * time and never re-reads them per tick; calling `.radius(...)` with the
+   * current accessor forces a re-initialize.
+   */
+  const refreshCollide = useCallback(() => {
+    const sim = simRef.current;
+    const collide = sim?.force("collide") as
+      | { radius: (fn?: unknown) => unknown }
+      | null
+      | undefined;
+    if (!sim || !collide) return;
+    collide.radius(collide.radius());
+  }, []);
+
+  /**
+   * Pin a node at its current simulation position (`fx`/`fy`), so forces
+   * cannot move it. The parent uses this on hover so the hovered node stays
+   * under the pointer while neighbours drift outward around it — otherwise
+   * the sim's one-shot alpha kick jiggles the hovered node and the pointer
+   * keeps losing it, flipping the hover on and off.
+   */
+  const pinNode = useCallback((nodeId: string) => {
+    const s = byIdRef.current.get(nodeId);
+    if (!s) return;
+    if (s.x !== undefined) s.fx = s.x;
+    if (s.y !== undefined) s.fy = s.y;
+  }, []);
+
+  /** Release a previously pinned node. No-op for ids the sim does not know. */
+  const unpinNode = useCallback((nodeId: string) => {
+    const s = byIdRef.current.get(nodeId);
+    if (!s) return;
+    s.fx = null;
+    s.fy = null;
+  }, []);
+
+  /**
+   * One-shot alpha boost — gives the sim a burst of energy that decays
+   * naturally (via `alphaDecay`), without holding `alphaTarget` above
+   * `alphaMin`. The caller (hover enter / leave) uses this to let a radius
+   * change actually move neighbours out, without a continuous 60fps warm.
+   * Does not touch `alphaTarget`, so a parallel drag keeps ownership of it.
+   */
+  const kickAlpha = useCallback((value: number) => {
+    const sim = simRef.current;
+    if (!sim) return;
+    if (sim.alpha() < value) sim.alpha(value);
+    sim.restart();
+  }, []);
+
+  return {
+    onDragStart,
+    onDrag,
+    onDragStop,
+    refreshCollide,
+    kickAlpha,
+    pinNode,
+    unpinNode,
+  };
 }

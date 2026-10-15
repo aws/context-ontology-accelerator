@@ -447,6 +447,50 @@ def merge_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
     return merged
 
 
+def _strictly_contained_metric_ids(matched_spans: dict[str, list[tuple[int, int]]]) -> set[str]:
+    """Return candidates whose matched text is wholly subsumed by one other metric.
+
+    Unspaced-script aliases intentionally use substring matching. That lets a
+    shorter alias match inside a longer, more specific alias, but if another
+    metric matches the full phrase, counting both as independent metrics
+    incorrectly turns a single-metric question into an ambiguous multi-metric
+    query.
+
+    A candidate is removed only when ONE other metric covers every span it
+    matched and at least one covering span is strictly larger. Equal spans stay
+    ambiguous, and a metric that also matches a disjoint part of the question
+    stays independent.
+    """
+    merged_by_metric = {metric_id: merge_spans(spans) for metric_id, spans in matched_spans.items()}
+    contained: set[str] = set()
+
+    for metric_id, spans in merged_by_metric.items():
+        for other_id, other_spans in merged_by_metric.items():
+            if metric_id == other_id:
+                continue
+
+            strictly_covered = False
+            for start, end in spans:
+                covering_span = next(
+                    (
+                        (other_start, other_end)
+                        for other_start, other_end in other_spans
+                        if other_start <= start and end <= other_end
+                    ),
+                    None,
+                )
+                if covering_span is None:
+                    break
+                if covering_span != (start, end):
+                    strictly_covered = True
+            else:
+                if strictly_covered:
+                    contained.add(metric_id)
+                    break
+
+    return contained
+
+
 def residual_tokens(folded_query: str, matched_spans: list[tuple[int, int]]) -> list[str]:
     """Return the query tokens left unconsumed by the metric match.
 
@@ -826,6 +870,15 @@ class MetricResolver:
 
         if not matched_metrics:
             return MetricMatch(found=False, match_count=0)
+
+        # Unspaced-script matching deliberately permits substrings. Prefer a
+        # candidate that consumes the complete phrase over metrics whose matches
+        # are strictly contained within that same phrase. Do this only after all
+        # name and synonym spans have been collected so genuine matches elsewhere
+        # in the query keep the multi-metric signal.
+        for metric_id in _strictly_contained_metric_ids(matched_spans):
+            matched_metrics.pop(metric_id, None)
+            matched_spans.pop(metric_id, None)
 
         first_id = next(iter(matched_metrics))
         defn, source = matched_metrics[first_id]

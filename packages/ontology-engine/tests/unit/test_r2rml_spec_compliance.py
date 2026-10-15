@@ -412,24 +412,88 @@ class TestSubjectMapPrimaryKeys:
         tmpl = _subject_template(g, ns.TriplesMap_Metrics)
         assert '{"metric (id)"}' in tmpl
 
-    def test_pk_column_with_embedded_quotes(self, strategy):
-        """Column name with double quotes gets them escaped (doubled) per SQL standard."""
+    def test_embedded_quote_column_is_skipped_without_breaking_table(self, strategy, caplog):
+        """Ontop cannot resolve SQL-doubled quotes in R2RML column references."""
         tables = [
             CatalogTable(
                 id="1",
                 name="weird",
                 fullyQualifiedName="db.weird",
-                columns=[CatalogColumn(name='col"name', dataType="INT")],
+                columns=[
+                    CatalogColumn(name='has"quote', dataType="INT"),
+                    CatalogColumn(name="normal_id", dataType="INT"),
+                    CatalogColumn(name="description", dataType="VARCHAR"),
+                ],
                 tableConstraints=[
-                    CatalogConstraint(constraintType="PRIMARY_KEY", columns=['col"name']),
+                    CatalogConstraint(constraintType="PRIMARY_KEY", columns=["normal_id"]),
                 ],
             )
         ]
-        g = _build(strategy, tables)
+
+        with caplog.at_level("WARNING"):
+            g = _build(strategy, tables)
+
         ns = Namespace(PREFIX)
-        tmpl = _subject_template(g, ns.TriplesMap_Weird)
-        # Embedded quote is doubled for SQL delimited identifier
-        assert '{"col""name"}' in tmpl
+        template = _subject_template(g, ns.TriplesMap_Weird)
+        referenced_columns = [
+            str(value)
+            for predicate in (RR.template, RR.column, RR.child, RR.parent)
+            for value in g.objects(None, predicate)
+        ]
+        assert 'has""quote' not in "\n".join(referenced_columns)
+        assert template == f'{PREFIX}weird/{{"normal_id"}}'
+        assert (ns["TriplesMap_Weird/POM_HasQuote"], None, None) not in g
+        assert _object_map_column(g, ns["TriplesMap_Weird/POM_Description"]) == '"description"'
+
+        warning = next(record for record in caplog.records if record.message == "r2rml_column_skipped_embedded_quote")
+        assert warning.table == "weird"
+        assert warning.column == 'has"quote'
+
+    @pytest.mark.parametrize(
+        ("pk_columns", "unsupported"),
+        [
+            # Keeping only `tenant` would merge every order line of a tenant into
+            # one individual.
+            pytest.param(["tenant", 'line"no'], ['line"no'], id="composite-pk-one-unsupported-component"),
+            # Falling back to another column (`amount`) would mint one individual
+            # per amount value.
+            pytest.param(['line"no'], ['line"no'], id="single-unsupported-pk"),
+        ],
+    )
+    def test_table_with_unsupported_pk_column_is_skipped(self, strategy, caplog, pk_columns, unsupported):
+        """A subject template without the whole PK cannot identify a row, so no TriplesMap."""
+        tables = [
+            CatalogTable(
+                id="1",
+                name="order_lines",
+                fullyQualifiedName="db.order_lines",
+                columns=[
+                    CatalogColumn(name="tenant", dataType="INT"),
+                    CatalogColumn(name='line"no', dataType="INT"),
+                    CatalogColumn(name="amount", dataType="INT"),
+                ],
+                tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=pk_columns)],
+            ),
+            CatalogTable(
+                id="2",
+                name="tenants",
+                fullyQualifiedName="db.tenants",
+                columns=[CatalogColumn(name="id", dataType="INT")],
+                tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["id"])],
+            ),
+        ]
+
+        with caplog.at_level("WARNING"):
+            g = _build(strategy, tables)
+
+        ns = Namespace(PREFIX)
+        assert (ns.TriplesMap_OrderLines, None, None) not in g
+        assert set(g.subjects(RDF.type, RR.TriplesMap)) == {ns.TriplesMap_Tenants}
+        warning = next(
+            record for record in caplog.records if record.message == "r2rml_table_skipped_unsupported_primary_key"
+        )
+        assert warning.table == "order_lines"
+        assert warning.columns == unsupported
 
     def test_pk_preserves_column_order(self, strategy):
         """Composite PK template columns appear in constraint declaration order."""
@@ -641,6 +705,63 @@ class TestForeignKeyObjectMaps:
         ns = Namespace(PREFIX)
         conditions = _object_map_join_conditions(g, ns["TriplesMap_Orders/POM_CustomerId"])
         assert conditions == [('"customer_id"', '"id"')]
+
+    def test_quoted_parent_column_leaves_relationship_unmapped(self, strategy, caplog):
+        """Unsafe rr:parent text drops the join and maps no literal in its place.
+
+        The ontology declares ``children_parentId`` an owl:ObjectProperty, so a
+        literal under it is a MappingOntologyMismatchException at Ontop load.
+        """
+        tables = [
+            CatalogTable(
+                id="parent",
+                name="parents",
+                fullyQualifiedName="db.parents",
+                columns=[
+                    CatalogColumn(name='has"quote', dataType="INT"),
+                    CatalogColumn(name="safe_id", dataType="INT"),
+                ],
+                tableConstraints=[
+                    CatalogConstraint(constraintType="PRIMARY_KEY", columns=["safe_id"]),
+                ],
+            ),
+            CatalogTable(
+                id="child",
+                name="children",
+                fullyQualifiedName="db.children",
+                columns=[
+                    CatalogColumn(name="id", dataType="INT"),
+                    CatalogColumn(name="parent_id", dataType="INT"),
+                ],
+                tableConstraints=[
+                    CatalogConstraint(constraintType="PRIMARY_KEY", columns=["id"]),
+                    CatalogConstraint(
+                        constraintType="FOREIGN_KEY",
+                        columns=["parent_id"],
+                        referredColumns=['parents.has"quote'],
+                    ),
+                ],
+            ),
+        ]
+
+        with caplog.at_level("WARNING"):
+            g = _build(strategy, tables)
+
+        ns = Namespace(PREFIX)
+        assert (ns["TriplesMap_Children/POM_ParentId"], None, None) not in g
+        assert (None, RR.predicate, ns.children_parentId) not in g
+        assert any(
+            record.message == "r2rml_column_skipped_embedded_quote"
+            and record.table == "parents"
+            and record.column == 'has"quote'
+            for record in caplog.records
+        )
+        assert any(
+            record.message == "r2rml_relationship_left_unmapped"
+            and record.table == "children"
+            and record.column == "parent_id"
+            for record in caplog.records
+        )
 
     # ── 3.2 Simple FK → Simple PK (happy path) ──────────────────────────────
 
@@ -3684,3 +3805,136 @@ class TestRejectedTargetDegradesAcrossArtifacts:
         assert any(r.getMessage() == "fk_target_out_of_run_degraded_to_literal" for r in caplog.records), (
             "_fk_target_token must warn when it degrades an out-of-run FK target"
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Unsupported (embedded-quote) columns: the mapping must still agree with the
+# ontology. Ontop loads the two together (`ontop endpoint --ontology --mapping`)
+# and rejects the whole namespace with MappingOntologyMismatchException when a
+# predicate the ontology declares an owl:ObjectProperty is mapped to a literal.
+# An object property with NO mapping is fine; a literal under it is not.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _table(name, columns, constraints=(), ds="1"):
+    return CatalogTable(
+        id=f"{ds}:{name}",
+        name=name,
+        fullyQualifiedName=f"db_{ds}.{name}",
+        datasourceId=ds,
+        columns=[CatalogColumn(name=c, dataType="INT") for c in columns],
+        tableConstraints=list(constraints),
+    )
+
+
+def _pk(columns):
+    return CatalogConstraint(constraintType="PRIMARY_KEY", columns=columns)
+
+
+def _fk(columns, referred, ds=None):
+    return CatalogConstraint(
+        constraintType="FOREIGN_KEY", columns=columns, referredColumns=referred, targetDatasourceId=ds
+    )
+
+
+def _mapping_ontology_mismatches(onto: Graph, r2rml: Graph) -> list[str]:
+    """What Ontop would reject: object properties mapped as literals, joins to absent TriplesMaps."""
+    object_props = set(onto.subjects(RDF.type, OWL.ObjectProperty))
+    emitted = set(r2rml.subjects(RDF.type, RR.TriplesMap))
+    problems = []
+    for pom, predicate in r2rml.subject_objects(RR.predicate):
+        om = r2rml.value(pom, RR.objectMap)
+        parent = r2rml.value(om, RR.parentTriplesMap)
+        if predicate in object_props and parent is None:
+            problems.append(f"object property mapped as literal: {predicate}")
+        if parent is not None and parent not in emitted:
+            problems.append(f"join to a TriplesMap that is not emitted: {parent}")
+    return sorted(problems)
+
+
+class TestUnsupportedColumnsKeepMappingAndOntologyInStep:
+    """Mapping checked against the ontology the same run produces."""
+
+    CASES = {
+        # Kun's reproduction: the only FK's parent column contains a quote.
+        "single-fk-quoted-parent-column": (
+            [
+                _table("parents", ['has"quote', "safe_id"], [_pk(["safe_id"])]),
+                _table("children", ["id", "parent_id"], [_pk(["id"]), _fk(["parent_id"], ['parents.has"quote'])]),
+            ],
+            "children_parentId",
+        ),
+        "composite-fk-quoted-parent-column": (
+            [
+                _table("parents", ["id", "a", 'b"q'], [_pk(["id"])]),
+                _table("children", ["id", "x", "y"], [_pk(["id"]), _fk(["x", "y"], ["parents.a", 'parents.b"q'])]),
+            ],
+            "children_x",
+        ),
+        "composite-fk-quoted-child-column": (
+            [
+                _table("parents", ["id", "a", "b"], [_pk(["id"])]),
+                _table("children", ["id", "x", 'y"q'], [_pk(["id"]), _fk(["x", 'y"q'], ["parents.a", "parents.b"])]),
+            ],
+            "children_x",
+        ),
+        # The parent column is fine, but the parent table has no TriplesMap
+        # because its PK has an unsupported component.
+        "fk-to-table-skipped-for-its-pk": (
+            [
+                _table("lines", ["tenant", 'line"no'], [_pk(["tenant", 'line"no'])]),
+                _table("notes", ["id", "tenant"], [_pk(["id"]), _fk(["tenant"], ["lines.tenant"])]),
+            ],
+            "notes_tenant",
+        ),
+        "fk-to-table-with-no-supported-column": (
+            [
+                _table("customers", ['i"d'], [], ds="2"),
+                _table("invoice", ["id", "ba_no"], [_pk(["id"]), _fk(["ba_no"], ["customers.id"], ds="2")]),
+            ],
+            "invoice_baNo",
+        ),
+    }
+
+    @staticmethod
+    def _artifacts(tables):
+        from coa_ontology.inducer.strategies.table_to_ontology import TableToOntologyStrategy
+
+        strategy = TableToOntologyStrategy()
+        onto, novel = strategy._build_proposal_ontology(PREFIX, tables, [])
+        return onto, strategy.build_r2rml(PREFIX, tables, novel, onto)
+
+    @pytest.mark.parametrize("case", list(CASES))
+    def test_unjoinable_relationship_is_unmapped_not_a_literal(self, case, caplog):
+        tables, relationship = self.CASES[case]
+        with caplog.at_level("WARNING"):
+            onto, r2rml = self._artifacts(tables)
+
+        ns = Namespace(PREFIX)
+        # The hazard is real for this case: the ontology still declares the edge.
+        assert (ns[relationship], RDF.type, OWL.ObjectProperty) in onto
+        assert _mapping_ontology_mismatches(onto, r2rml) == []
+        assert (None, RR.predicate, ns[relationship]) not in r2rml
+        assert any(record.message == "r2rml_relationship_left_unmapped" for record in caplog.records)
+
+    def test_withheld_composite_fk_with_quoted_column_stays_a_literal(self):
+        # A PENDING AI-inferred FK is withheld: the ontology declares a datatype
+        # property, so the literal still matches it.
+        fk = CatalogConstraint(
+            constraintType="FOREIGN_KEY",
+            columns=["x", "y"],
+            referredColumns=["parents.a", 'parents.b"q'],
+            relationshipType="AI_INFERRED",
+            reviewStatus="PENDING_REVIEW",
+        )
+        tables = [
+            _table("parents", ["id", "a", 'b"q'], [_pk(["id"])]),
+            _table("children", ["id", "x", "y"], [_pk(["id"]), fk]),
+        ]
+        onto, r2rml = self._artifacts(tables)
+
+        ns = Namespace(PREFIX)
+        assert (ns.children_x, RDF.type, OWL.DatatypeProperty) in onto
+        assert _mapping_ontology_mismatches(onto, r2rml) == []
+        om = r2rml.value(ns["TriplesMap_Children/POM_X"], RR.objectMap)
+        assert str(r2rml.value(om, RR.column)) == '"x"'

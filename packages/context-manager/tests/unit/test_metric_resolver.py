@@ -382,6 +382,81 @@ class TestMultiMetricDetection:
         assert result.found
         assert result.match_count == 2
 
+    async def test_contained_unspaced_synonym_is_not_a_second_metric(self):
+        """The metric consuming the complete phrase wins over its substring."""
+        resolver = _make_resolver(
+            seed=[
+                {
+                    "metric_id": "m-equipment-count",
+                    "name": "equipment_count",
+                    "synonyms": ["設備台数"],
+                    "namespace": "maintenance",
+                },
+                {
+                    "metric_id": "m-aging-equipment-count",
+                    "name": "aging_equipment_count",
+                    "synonyms": ["老朽設備台数"],
+                    "namespace": "maintenance",
+                },
+            ]
+        )
+
+        result = resolver.exact_name_synonym_match("老朽設備台数は？", "maintenance")
+
+        assert result.found
+        assert result.metric_id == "m-aging-equipment-count"
+        assert result.match_count == 1
+        assert result.matched_text == "老朽設備台数"
+        assert result.residual == ""
+
+    async def test_equal_unspaced_synonyms_remain_ambiguous(self):
+        """Containment must not break ties between identical aliases."""
+        resolver = _make_resolver(
+            seed=[
+                {
+                    "metric_id": "m-equipment-count-a",
+                    "name": "equipment_count_a",
+                    "synonyms": ["設備台数"],
+                    "namespace": "maintenance",
+                },
+                {
+                    "metric_id": "m-equipment-count-b",
+                    "name": "equipment_count_b",
+                    "synonyms": ["設備台数"],
+                    "namespace": "maintenance",
+                },
+            ]
+        )
+
+        result = resolver.exact_name_synonym_match("設備台数は？", "maintenance")
+
+        assert result.found
+        assert result.match_count == 2
+
+    async def test_disjoint_match_keeps_metric_independent(self):
+        """A contained alias plus a separate hit is still a real second metric."""
+        resolver = _make_resolver(
+            seed=[
+                {
+                    "metric_id": "m-equipment",
+                    "name": "equipment_metrics",
+                    "synonyms": ["設備台数", "故障件数"],
+                    "namespace": "maintenance",
+                },
+                {
+                    "metric_id": "m-aging-equipment-count",
+                    "name": "aging_equipment_count",
+                    "synonyms": ["老朽設備台数"],
+                    "namespace": "maintenance",
+                },
+            ]
+        )
+
+        result = resolver.exact_name_synonym_match("老朽設備台数と故障件数を比較", "maintenance")
+
+        assert result.found
+        assert result.match_count == 2
+
 
 @pytest.mark.unit
 class TestLookup:
@@ -1459,6 +1534,78 @@ class TestNonAsciiMatching:
 
         result = resolver.exact_name_synonym_match("monthlykwh使用量", "energy")
         assert not result.found
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "設備台数は何台ですか",
+            "設備台数はいくつですか",
+            "設備台数はどれくらいですか",
+            "設備台数はどのくらいですか",
+        ],
+    )
+    async def test_japanese_quantity_question_has_no_residual(self, query):
+        resolver = MetricResolver(
+            seed=[
+                {
+                    "metric_id": "m-equipment-count",
+                    "name": "equipment_count",
+                    "synonyms": ["設備台数"],
+                    "namespace": "maintenance",
+                }
+            ]
+        )
+
+        result = resolver.exact_name_synonym_match(query, "maintenance")
+
+        assert result.found
+        assert result.residual == ""
+
+    @pytest.mark.parametrize("counter", ["何件", "何名", "何社"])
+    async def test_japanese_counter_question_tokens_are_consumed(self, counter):
+        """Counter compounds are one kanji token, not decomposable hiragana."""
+        resolver = MetricResolver(
+            seed=[
+                {
+                    "metric_id": "m-count",
+                    "name": "record_count",
+                    "synonyms": ["対象数"],
+                    "namespace": "counts",
+                }
+            ]
+        )
+
+        result = resolver.exact_name_synonym_match(f"対象数は{counter}ですか", "counts")
+
+        assert result.found
+        assert result.residual == ""
+
+    @pytest.mark.parametrize(
+        ("query", "expected"),
+        [
+            ("東京地域の設備台数は何台ですか", "東京地域"),
+            # The adjacent qualifier forms one kanji run with the counter.
+            # Exact membership therefore fails closed and preserves the whole
+            # run instead of partially swallowing the question.
+            ("設備台数は何台以上ですか", "何台以上"),
+        ],
+    )
+    async def test_japanese_counter_does_not_hide_a_real_qualifier(self, query, expected):
+        resolver = MetricResolver(
+            seed=[
+                {
+                    "metric_id": "m-equipment-count",
+                    "name": "equipment_count",
+                    "synonyms": ["設備台数"],
+                    "namespace": "maintenance",
+                }
+            ]
+        )
+
+        result = resolver.exact_name_synonym_match(query, "maintenance")
+
+        assert result.found
+        assert result.residual == expected
 
     async def test_korean_particle_attachment_matches_and_gates(self):
         """Hangul attaches particles directly (총매출은) — the match must land.

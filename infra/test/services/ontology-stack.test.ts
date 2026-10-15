@@ -30,8 +30,9 @@ function renderOntology(
     bedrockChatModelId?: string;
   },
   id: string,
+  extraContext: Record<string, unknown> = {},
 ): Template {
-  const app = new cdk.App({ context: TEST_CONTEXT });
+  const app = new cdk.App({ context: { ...TEST_CONTEXT, ...extraContext } });
   const network = new NetworkStack(app, `${id}Network`);
   return Template.fromStack(
     new OntologyStack(app, id, {
@@ -123,6 +124,49 @@ describe("OntologyStack model IDs from deploy config (#94)", () => {
     // No stale us. literals left behind in the widgets.
     expect(body).not.toContain("us.anthropic.claude-sonnet-4-6");
     expect(body).not.toContain("us.cohere.embed-v4:0");
+  });
+});
+
+describe("OntologyStack OoPS! endpoint is opt-in (#171)", () => {
+  test("oops_endpoint context reaches the container as OOPS_ENDPOINT", () => {
+    const t = renderOntology({}, "OopsOn", {
+      oops_endpoint: "https://oops.example.test/rest",
+    });
+    expect(envValue(t, "OOPS_ENDPOINT")).toBe("https://oops.example.test/rest");
+  });
+
+  test("a non-https oops_endpoint fails synth", () => {
+    expect(() =>
+      renderOntology({}, "OopsHttp", {
+        oops_endpoint: "http://oops.example.test/rest",
+      }),
+    ).toThrow(/https:\/\//);
+  });
+
+  test("the https scheme check is case-insensitive", () => {
+    const t = renderOntology({}, "OopsUpper", {
+      oops_endpoint: "HTTPS://oops.example.test/rest",
+    });
+    expect(envValue(t, "OOPS_ENDPOINT")).toBe("HTTPS://oops.example.test/rest");
+  });
+
+  test.each([
+    ["object", { url: "https://oops.example.test/rest" }],
+    ["boolean", true],
+    ["number", 443],
+  ])("a non-string (%s) oops_endpoint fails synth", (_label, value) => {
+    expect(() =>
+      renderOntology({}, `OopsBad${_label}`, { oops_endpoint: value }),
+    ).toThrow(/https:\/\//);
+  });
+
+  test.each([
+    ["absent", {}],
+    ["empty", { oops_endpoint: "" }],
+    ["whitespace", { oops_endpoint: "  " }],
+  ])("%s oops_endpoint leaves OOPS_ENDPOINT unset", (_label, ctx) => {
+    const t = renderOntology({}, `OopsOff${_label}`, ctx);
+    expect(containerEnv(t).some((e) => e.Name === "OOPS_ENDPOINT")).toBe(false);
   });
 });
 
@@ -485,10 +529,11 @@ describe("OntologyStack", () => {
 
 // The running coa-dev-ontology-engine image accreted Critical/High OS CVEs
 // (glibc, perl, sqlite3, libssh2, gzip, pcre2) whenever a build predated the
-// Debian point releases that fix them. Two Dockerfile properties keep the image
-// patchable: a pinned base digest (supply-chain integrity + a cache-busting
-// bump lever) and a post-install `apt-get upgrade` (the only mechanism pulling
-// trixie-security point releases in). These guard both against regression —
+// Debian point releases that fix them; the base is now AL2023. Two
+// Dockerfile properties keep the image patchable: a pinned base digest
+// (supply-chain integrity + a cache-busting bump lever) and a post-install
+// `dnf upgrade --releasever=latest` (the only mechanism pulling AL2023 security
+// updates in past the pinned snapshot). These guard both against regression —
 // removing the upgrade line, or floating the base back onto a mutable tag, is
 // exactly how the CVEs came back.
 describe("ontology-engine Dockerfile CVE hygiene", () => {
@@ -507,20 +552,19 @@ describe("ontology-engine Dockerfile CVE hygiene", () => {
 
   test("pins the base image to a digest, not a mutable tag", () => {
     const from = dockerfile.match(
-      /^FROM .*python:3\.12-slim(@sha256:[a-f0-9]{64})?/m,
+      /^FROM .*amazonlinux:2023-minimal(@sha256:[a-f0-9]{64})?/m,
     );
     expect(from).not.toBeNull();
     // A digest pin (@sha256:...) must be present; a bare/:latest tag would let
     // the base float and silently reintroduce unpatched packages.
     expect(from?.[1]).toMatch(/@sha256:[a-f0-9]{64}/);
-    expect(dockerfile).not.toMatch(/python:3\.12-slim\s*$/m);
+    expect(dockerfile).not.toMatch(/amazonlinux:2023-minimal\s*$/m);
   });
 
-  test("runs apt-get upgrade so OS security point releases are applied", () => {
-    // This is the line that resolves the Debian package CVEs at build time.
-    // Must be `upgrade`, never `dist-upgrade` (which may remove packages).
-    expect(dockerfile).toMatch(/apt-get upgrade -y/);
-    expect(dockerfile).not.toMatch(/apt-get dist-upgrade/);
+  test("runs dnf upgrade against the latest AL2023 release so OS security updates are applied", () => {
+    // AL2023 locks dnf to the base image's repo snapshot; without
+    // --releasever=latest a stale digest pin freezes the OS patch level.
+    expect(dockerfile).toMatch(/dnf upgrade -y --releasever=latest/);
   });
 
   test("strips owlready2's unused Pellet reasoner (vulnerable bundled JARs)", () => {

@@ -60,6 +60,12 @@ export class NetworkStack extends SCLStack {
   /** Security group for Lambda functions. */
   public readonly lambdaSecurityGroup: ec2.SecurityGroup;
 
+  /**
+   * API authorizer Lambda. Keeps unrestricted egress: it fetches the identity
+   * provider's signing keys, and an external OIDC IdP may serve them on any port.
+   */
+  public readonly authorizerSecurityGroup: ec2.SecurityGroup;
+
   /** Port-80 egress used only by direct Snowflake discovery for OCSP. */
   public readonly discoveryOcspSecurityGroup: ec2.SecurityGroup;
 
@@ -334,6 +340,17 @@ export class NetworkStack extends SCLStack {
         `Source database ${port} (direct JDBC discovery)`,
       );
     }
+    // The API authorizer fetches the IdP's JWKS, and an external OIDC IdP can
+    // serve it on any port, so this SG allows all outbound traffic. It is defined
+    // here, not in ApiStack, so that EniWarmStack can pre-warm its Lambda network
+    // interface.
+    this.authorizerSecurityGroup = new ec2.SecurityGroup(this, "AuthorizerSG", {
+      vpc: this.vpc,
+      securityGroupName: this.prefixed("authorizer-sg"),
+      description: "API authorizer security group",
+      allowAllOutbound: true,
+    });
+
     // Keep HTTP egress off the shared Lambda SG: most platform functions never
     // call an OCSP responder. SourcesStack attaches this dedicated SG only to
     // sources-db-connector, which is the Lambda that loads the Snowflake driver.

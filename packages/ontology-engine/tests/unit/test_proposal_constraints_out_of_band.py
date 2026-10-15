@@ -166,15 +166,18 @@ class TestGetProposalRouteConstraints:
             "get_proposal_by_id",
             lambda pid, namespace="default", hydrate_turtle=True, hydrate_matches=True, hydrate_constraints=True: item,
         )
+        # ``**kwargs`` absorbs the ``s3_key`` the route now passes through so the
+        # revision key is signed instead of the "latest" one. Without it these
+        # stubs raise TypeError and the failure reads as a route bug.
         monkeypatch.setattr(
             proposals.dynamo_store,
             "presign_proposal_artifact",
-            lambda namespace, pid, artifact: None,
+            lambda namespace, pid, artifact, **kwargs: None,
         )
         monkeypatch.setattr(
             proposals.dynamo_store,
             "presign_proposal_matches",
-            lambda namespace, pid: matches_url,
+            lambda namespace, pid, **kwargs: matches_url,
         )
         monkeypatch.setattr(
             proposals.dynamo_store,

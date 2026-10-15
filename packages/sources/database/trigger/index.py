@@ -51,8 +51,14 @@ def handler(event: dict, context: object) -> None:
             if "scanJobSK" in body:
                 execution_input["scanJobSK"] = body["scanJobSK"]
             # Pass bare sourceId (without DS# prefix) for sources-table status updates.
+            # Messages sent before re-scans carried it (still queued, or redriven
+            # from the DLQ) have only datasourceId, so derive it from that.
             if "sourceId" in body:
                 execution_input["sourceId"] = body["sourceId"]
+            else:
+                datasource_id = str(body["datasourceId"])
+                if datasource_id.startswith("DS#") and len(datasource_id) > len("DS#"):
+                    execution_input["sourceId"] = datasource_id[len("DS#") :]
             # Re-scan marker, normalized to a string and ALWAYS present: the
             # enrichment ECS step reads it as an env var and the state machine
             # maps it via JsonPath.stringAt, both of which need a string that

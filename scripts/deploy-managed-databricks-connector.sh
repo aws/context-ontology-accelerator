@@ -35,9 +35,11 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # environment deployed as scl-* and reports COA as not deployed at all.
 PREFIX="${SCL_PREFIX:-coa}"
 SSM_PREFIX="/${PREFIX}"
-# Resolution order matches CDK's own (infra/bin/app.ts treats CDK_DEFAULT_REGION as the
-# source of truth), so the region the roles are read from is the region the stack lands in.
-REGION="${CDK_DEFAULT_REGION:-${AWS_DEFAULT_REGION:-${AWS_REGION:-us-east-1}}}"
+# Resolved the way the CDK CLI resolves it, the profile's region included, so the region
+# the roles are read from is the region the platform stacks landed in.
+# shellcheck source=lib/resolve-region.sh source-path=SCRIPTDIR
+source "${REPO_ROOT}/scripts/lib/resolve-region.sh"
+REGION="$(coa_resolve_region)"
 
 # Both this and PREFIX below end up in a CloudFormation stack name, which allows no underscores
 # and must start with a letter — stricter than the other scripts' checks, which is deliberate.

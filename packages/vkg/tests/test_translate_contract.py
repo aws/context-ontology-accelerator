@@ -13,6 +13,7 @@ Verifies:
 import importlib.util
 import io
 import json
+import re
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -544,32 +545,31 @@ class TestExtractTableRefs:
         assert _extract_table_refs("SELECT 1") == []
 
 
-class TestPython39Compatibility:
-    """``translate-server.py`` must import under the CONTAINER's Python, not the repo's.
+class TestContainerPythonVersion:
+    """The container's ``python3`` must resolve to python3.12, not the system 3.9.
 
-    The Dockerfile installs AL2023's system ``python3`` (3.9) and the entrypoint
-    runs the server with it, while the rest of the repo targets 3.12. A PEP 604
-    annotation (``dict[str, Any] | None``) without ``from __future__ import
-    annotations`` is evaluated at import time and raises TypeError on 3.9, so the
-    container dies before serving /health — invisible to any test running on 3.12.
+    entrypoint.sh runs translate-server.py with bare ``python3`` and the
+    Dockerfile installs its deps with ``pip3``. AL2023's /usr/bin/python3 is 3.9
+    (past end of life) and must stay, because dnf runs on it — so the image links
+    python3/pip3 to 3.12 in /usr/local/bin (ahead of /usr/bin on PATH). Without
+    those links everything silently runs on 3.9 while every test here runs on 3.12.
     """
 
-    def test_module_has_future_annotations_import(self):
-        """Guards PEP 604 / PEP 585 annotations against the 3.9 runtime."""
-        source = _server_path.read_text()
-        assert "from __future__ import annotations" in source, (
-            "translate-server.py runs on Python 3.9 in the container; "
-            "`from __future__ import annotations` is required or PEP 604 "
-            "annotations raise TypeError at import and kill the server."
-        )
+    _dockerfile = (_server_path.parent / "Dockerfile").read_text()
 
-    def test_compiles_under_python39_grammar(self):
-        """Syntax must be valid for the container interpreter's feature set."""
-        import ast
+    def test_installs_python312(self):
+        assert re.search(r"yum install[^\n]* python3\.12 python3\.12-pip ", self._dockerfile)
 
-        tree = ast.parse(_server_path.read_text())
-        # match statements (3.10+) and PEP 695 type params (3.12+) would not
-        # parse on 3.9 even with the __future__ import.
-        for node in ast.walk(tree):
-            assert type(node).__name__ != "Match", "match statement requires Python 3.10+"
-            assert not getattr(node, "type_params", None), "PEP 695 type params require Python 3.12+"
+    def test_links_python3_and_pip3_to_312_in_usr_local_bin(self):
+        assert "ln -sf /usr/bin/python3.12 /usr/local/bin/python3" in self._dockerfile
+        assert "ln -sf /usr/bin/pip3.12 /usr/local/bin/pip3" in self._dockerfile
+        # Repointing /usr/bin/python3 itself would break dnf/yum.
+        assert not re.search(r"ln -sf? \S+ /usr/bin/python3\b", self._dockerfile)
+
+    def test_build_fails_unless_python3_is_312(self):
+        assert "python3 --version | grep -q '^Python 3\\.12'" in self._dockerfile
+
+    def test_links_precede_dependency_install(self):
+        link = self._dockerfile.index("/usr/local/bin/pip3")
+        install = self._dockerfile.index("pip3 install")
+        assert link < install, "pip3 install would run on system python3.9"

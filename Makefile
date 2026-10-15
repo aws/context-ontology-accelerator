@@ -80,14 +80,14 @@ notice:
 preflight:
 	./scripts/preflight-deploy.sh
 
-## Full dev deploy: the platform stacks, then the COA-operated Databricks connector.
+## Full dev deploy: the platform stacks and the COA-operated Databricks connector.
 ## The connector is chained rather than left to be remembered: a DATABRICKS_SQL_WAREHOUSE
 ## source cannot be registered without it, so a deployment missing it advertises a
-## sub-type nothing can serve. The ordering is the one deploy-databricks-connector
-## requires anyway, and it is the same order ci/mainline.yml models with a blocking job.
+## sub-type nothing can serve. It must follow the network, serve and sources stacks;
+## scripts/deploy-all.sh starts it as soon as those exist on a first deploy, and after
+## the platform deploy on an update (the order ci/mainline.yml models with a blocking job).
 deploy-dev:
-	./scripts/deploy.sh dev
-	$(MAKE) deploy-databricks-connector
+	./scripts/deploy-all.sh dev
 
 deploy-serve:
 	./scripts/deploy-serve.sh dev

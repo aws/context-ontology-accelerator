@@ -30,6 +30,9 @@ import {
   DEFAULT_BEDROCK_INDUCTION_MODEL_ID,
 } from "../../constants";
 
+/** Name (without the `{prefix}-{env}-` prefix) of the ontology API proxy Lambda. */
+export const ONTOLOGY_API_PROXY_FUNCTION_NAME = "ontology-api-proxy";
+
 export interface OntologyStackProps extends cdk.StackProps {
   readonly network: NetworkStack;
   readonly neptuneClusterArn: string;
@@ -221,6 +224,18 @@ export class OntologyStack extends SCLStack {
       | string
       | undefined;
 
+    // String(): context from cdk.json may be a non-string; CLI values always are.
+    const oopsEndpoint = String(
+      this.node.tryGetContext("oops_endpoint") ?? "",
+    ).trim();
+    // The scan POSTs the whole serialised ontology, so never over plaintext.
+    // URL schemes are case-insensitive (RFC 3986), so HTTPS:// is accepted too.
+    if (oopsEndpoint && !/^https:\/\//i.test(oopsEndpoint)) {
+      throw new Error(
+        `oops_endpoint must be an https:// URL (got "${oopsEndpoint}"): the OoPS! scan sends the serialised ontology to it.`,
+      );
+    }
+
     let containerImage: ecs.ContainerImage;
     if (imageUri && ecrRepositoryArn && ecrRepositoryName) {
       const ecrRepo = cdk.aws_ecr.Repository.fromRepositoryAttributes(
@@ -276,6 +291,10 @@ export class OntologyStack extends SCLStack {
         SOURCES_API_FN_NAME: `${this.prefixed("sources-api")}`,
         INDUCE_OUTPUT_DIR: "/tmp/induce",
         PORT: String(this.containerPort),
+        // Optional OoPS! pitfall scan (Tier-3 validation). It sends the
+        // serialised ontology to this endpoint, so it is opt-in: absent context
+        // leaves the variable unset and the validator makes no request.
+        ...(oopsEndpoint && { OOPS_ENDPOINT: oopsEndpoint }),
       },
       portMappings: [
         {
@@ -1034,7 +1053,7 @@ export class OntologyStack extends SCLStack {
     // API Proxy Lambda (forwards API Gateway → ECS via Cloud Map DNS)
     // ================================================================
     const apiProxyFn = new lambda.Function(this, "ApiProxyFn", {
-      functionName: this.prefixed("ontology-api-proxy"),
+      functionName: this.prefixed(ONTOLOGY_API_PROXY_FUNCTION_NAME),
       runtime: lambda.Runtime.PYTHON_3_12,
       handler: "coa_ontology.api_proxy_handler.handler",
       // Merges libs/common/src into the asset root so

@@ -101,6 +101,60 @@ describe("useLiveForceSimulation", () => {
     expect(() => unmount()).not.toThrow();
   });
 
+  it("exposes refreshCollide and kickAlpha and both are safe to call", () => {
+    const setNodes = vi.fn();
+    const { result } = renderHook(() =>
+      useLiveForceSimulation(nodes(), edges, setNodes, opts),
+    );
+    expect(typeof result.current.refreshCollide).toBe("function");
+    expect(typeof result.current.kickAlpha).toBe("function");
+    expect(() => {
+      act(() => result.current.refreshCollide());
+      act(() => result.current.kickAlpha(0.25));
+    }).not.toThrow();
+  });
+
+  it("refreshCollide re-invokes the per-node radius accessor (hover fix)", () => {
+    const setNodes = vi.fn();
+    let fatRadius = false;
+    const nodeRadius = (id: string) => (id === "a" && fatRadius ? 200 : 40);
+    const seen: number[] = [];
+    const tracingRadius = (id: string) => {
+      const r = nodeRadius(id);
+      seen.push(r);
+      return r;
+    };
+    const { result } = renderHook(() =>
+      useLiveForceSimulation(nodes(), edges, setNodes, {
+        ...opts,
+        nodeRadius: tracingRadius,
+      }),
+    );
+    const seenAtMount = seen.length;
+    // Flip the ref so a refresh must see the new radius for 'a'.
+    fatRadius = true;
+    act(() => result.current.refreshCollide());
+    expect(seen.length).toBeGreaterThan(seenAtMount);
+    // The last pass sampled the inflated radius.
+    expect(seen.slice(seenAtMount)).toContain(200);
+  });
+
+  it("exposes pinNode / unpinNode and both are safe to call", () => {
+    const setNodes = vi.fn();
+    const { result } = renderHook(() =>
+      useLiveForceSimulation(nodes(), edges, setNodes, opts),
+    );
+    expect(typeof result.current.pinNode).toBe("function");
+    expect(typeof result.current.unpinNode).toBe("function");
+    expect(() => {
+      act(() => result.current.pinNode("a"));
+      act(() => result.current.unpinNode("a"));
+      // Unknown ids are silently ignored.
+      act(() => result.current.pinNode("ghost"));
+      act(() => result.current.unpinNode("ghost"));
+    }).not.toThrow();
+  });
+
   it("re-applies positions when the node set changes", () => {
     const setNodes = vi.fn();
     const { rerender } = renderHook(
