@@ -21,6 +21,8 @@ import re
 from unittest.mock import MagicMock, patch
 
 import pytest
+from coa_common.opensearch import AossVectorClient, DeleteIncompleteError
+from coa_common.opensearch import client as oss_client
 from coa_ontology.catalog.ingest import (
     SUPERSEDED_ALT_LABEL,
     SUPERSEDED_COMMENT,
@@ -32,6 +34,7 @@ from coa_ontology.catalog.ingest import (
 )
 from coa_ontology.stores.na_graph import NeptuneAnalyticsGraphStore
 from coa_ontology.stores.neptune_db_graph import _SUPERSEDE_CHUNK, NeptuneDBGraphStore
+from coa_ontology.stores.opensearch_vector import OpenSearchVectorStore
 from rdflib import OWL, RDF, RDFS, Dataset, Graph, Literal, URIRef
 from rdflib.namespace import SKOS
 
@@ -178,6 +181,27 @@ class RecordingVectorStore:
 class BrokenVectorStore(RecordingVectorStore):
     def delete_embeddings_for_entities(self, entity_uris, ontology_id, namespace=None):
         raise RuntimeError("aoss down")
+
+
+class IncompleteDeleteVectorStore(RecordingVectorStore):
+    """The delete ran but stopped with a stale embedding still matching."""
+
+    def delete_embeddings_for_entities(self, entity_uris, ontology_id, namespace=None):
+        raise DeleteIncompleteError("1 matching document(s) left", deleted=3, remaining=1, failed=5)
+
+
+class _StuckDeleteAoss(AossVectorClient):
+    """Real delete loop over one stale doc whose every per-doc delete is rejected."""
+
+    def __init__(self) -> None:
+        super().__init__(endpoint="https://example.invalid", region="us-east-1")
+        self._client = MagicMock()
+        self._client.delete.side_effect = RuntimeError("simulated per-doc delete failure")
+
+    def _search(self, index, body):
+        if body.get("size") == 0:  # count()
+            return {"hits": {"hits": [], "total": {"value": 1}}}
+        return {"hits": {"hits": [{"_id": "stale-ai-text-doc"}], "total": {"value": 1}}}
 
 
 def _ingest(store, ttl, *, existing_row, allow_append=True, vector_store=None):
@@ -611,6 +635,44 @@ class TestReAcceptSupersedesEmbeddings:
             pass
 
         assert _supersede_incoming_embeddings(Legacy(), "ns", ONT, [CUST]) == 0  # type: ignore[arg-type]
+
+    def test_supersede_embeddings_stale_doc_survives_delete_raises_ingest_store_error(self):
+        # The real OpenSearch backend over a client whose per-doc deletes are all
+        # rejected: the stale AI-text embedding keeps matching. This used to come
+        # back as "0 retired" and the accept went on to embed the steward text
+        # beside the AI text it was meant to replace.
+        aoss = _StuckDeleteAoss()
+        store = OpenSearchVectorStore.__new__(OpenSearchVectorStore)
+        with (
+            patch.object(oss_client, "_DELETE_VERIFY_STALL_TIMEOUT_S", 0.0),
+            patch.object(oss_client, "_DELETE_VERIFY_POLL_S", 0.0),
+            patch.object(OpenSearchVectorStore, "_aoss", lambda self: aoss),
+            patch.object(OpenSearchVectorStore, "_read_index", lambda self, ns=None: "idx"),
+            pytest.raises(IngestStoreError, match="embedding supersession failed.*1 matching document"),
+        ):
+            _supersede_incoming_embeddings(store, "ns", ONT, [CUST])
+
+    def test_reaccept_after_incomplete_embedding_supersession_converges(self):
+        # The failed append wrote nothing, so re-running it (what a re-accept of
+        # an accept_failed proposal does) retires the same scoped set and lands
+        # the steward text.
+        store = AdditiveGraphStore()
+        _ingest(store, AI_TTL, existing_row=None)
+        before = set(store.g)
+        with pytest.raises(IngestStoreError, match="embedding supersession failed"):
+            _ingest(store, CURATED_TTL, existing_row=_LIVE_ROW, vector_store=IncompleteDeleteVectorStore())
+        assert set(store.g) == before
+        assert store.supersede_calls == []
+
+        vs = RecordingVectorStore()
+        result = _ingest(store, CURATED_TTL, existing_row=_LIVE_ROW, vector_store=vs)
+        assert result["appended"] is True
+        assert len(vs.deleted) == 1
+        uris, oid, _ns = vs.deleted[0]
+        assert (set(uris), oid) == ({str(CUST), str(ACCT), str(CUST_TYP), str(CUST_ACCT)}, ONT)
+        assert _values(store.g, CUST, RDFS.comment) == [
+            "Steward: customer master. cust_typ_cd is the private-banking flag, NOT cust_seg_cd."
+        ]
 
 
 class TestNeptuneDBSupersedeChunking:

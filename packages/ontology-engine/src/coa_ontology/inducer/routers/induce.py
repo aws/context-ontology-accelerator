@@ -1,7 +1,15 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Router for structured (table-to-ontology) induction jobs and their status."""
+"""Router for structured (table-to-ontology) induction jobs and their status.
+
+``router`` is NOT mounted: ``main.py`` serves structured induction through
+``induce_catalog.router``, so ``_run_induction`` and the endpoints below are a
+retired reference that mints IRIs with ``InductionPipeline.build_ontology``,
+whose names are not collision-safe (see its docstring). :func:`_build_pipeline`
+is still live, because ``main.py`` wraps it and hands it to ``induce_catalog``,
+so this module cannot simply be deleted.
+"""
 
 import uuid
 from datetime import datetime

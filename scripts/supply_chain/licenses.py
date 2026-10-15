@@ -207,8 +207,10 @@ def iter_installed(*, include_first_party: bool = False) -> list[PackageLicense]
             continue
         raw = _raw_license_of(md)
         classifiers = md.get_all("Classifier") or []
-        normalized = normalize_license(raw, classifiers)
-        if normalized == UNKNOWN and name.lower() in REVIEWED_OVERRIDES:
+        # Keep compound declarations verbatim instead of selecting one license.
+        compound = "," in raw
+        normalized = UNKNOWN if compound else normalize_license(raw, classifiers)
+        if not compound and normalized == UNKNOWN and name.lower() in REVIEWED_OVERRIDES:
             normalized = REVIEWED_OVERRIDES[name.lower()]
         out.append(
             PackageLicense(

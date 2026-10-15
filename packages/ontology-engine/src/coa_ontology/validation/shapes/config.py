@@ -21,6 +21,7 @@ from rdflib.namespace import RDF
 # (they lived in 3+ places). ``base.py`` owns the authoritative copies.
 from coa_ontology.inducer.services.data_catalog import parse_referred_column
 from coa_ontology.inducer.strategies.base import ambiguous_target_names as _ambiguous_target_names
+from coa_ontology.inducer.strategies.base import camel_names_for as _camel_names_for
 from coa_ontology.inducer.strategies.base import composite_fk_anchors as _composite_fk_anchors
 from coa_ontology.inducer.strategies.base import composite_fk_columns as _composite_fk_columns
 from coa_ontology.inducer.strategies.base import fk_edge_allowed as _fk_edge_allowed
@@ -33,7 +34,6 @@ from coa_ontology.inducer.strategies.base import (
 )
 from coa_ontology.inducer.strategies.base import simple_fk_constraints as _simple_fk_constraints
 from coa_ontology.inducer.strategies.base import table_identity as _table_identity
-from coa_ontology.inducer.strategies.base import to_camel as _to_camel
 from coa_ontology.inducer.strategies.base import xsd_for as _xsd_for
 
 SH = Namespace("http://www.w3.org/ns/shacl#")
@@ -169,8 +169,10 @@ def generate_config_from_db(tables, uri_prefix: str) -> ConstraintConfig:
                         for tc in simple
                     ]
 
+        column_locals = _camel_names_for(table)
+
         for col in table.columns:
-            base_local = f"{camel_by_id[identity]}_{_to_camel(col.name)}"
+            base_local = f"{camel_by_id[identity]}_{column_locals[col.name]}"
             is_pk = col.name in pk_cols
             is_not_null = col.constraint in ("NOT_NULL", "PRIMARY_KEY") or is_pk
             is_unique = col.constraint in ("UNIQUE", "PRIMARY_KEY") or col.name in unique_cols or is_pk

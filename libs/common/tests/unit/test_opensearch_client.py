@@ -21,6 +21,7 @@ pytestmark = pytest.mark.unit
 
 from coa_common.opensearch import (
     AossVectorClient,
+    DeleteIncompleteError,
     IncompatibleEngineError,
     build_index_mapping,
     bulk_with_retry,
@@ -588,14 +589,94 @@ class TestDeleteByTerm:
 
     def test_stall_gives_up_without_infinite_loop(self):
         # search always empty + count never drops → no progress. The no-progress
-        # stall deadline must end the loop (this test hangs if it doesn't).
+        # stall deadline must end the loop (this test hangs if it doesn't), and
+        # it ends it LOUDLY: 7 docs still match, so this is not a finished delete.
         c, fake = _delete_client(search_pages=[[], [], []], count_seq=[7, 7, 7])
         with (
             patch.object(client_mod.time, "sleep"),
             patch.object(client_mod, "_DELETE_VERIFY_STALL_TIMEOUT_S", 0),
+            pytest.raises(DeleteIncompleteError) as ei,
         ):
-            deleted = c.delete_by_term("idx", "ontology_id", "urn:o")
-        assert deleted == 0  # nothing deletable; returned rather than hung
+            c.delete_by_term("idx", "ontology_id", "urn:o")
+        assert ei.value.deleted == 0
+        assert ei.value.remaining == 7
+        assert ei.value.failed == 0
+
+    def test_delete_by_term_stall_with_matches_left_raises_delete_incomplete(self):
+        # Every per-doc delete is rejected (a throttle the retry outlasted, or a
+        # policy that allows search but not delete) and the one stale doc keeps
+        # matching. Returning the 0 deleted as if the delete had finished let the
+        # caller report success with the doc still searchable.
+        c, fake = _delete_client(search_pages=[["stale-doc"]], count_seq=[1])
+        fake.delete.side_effect = RuntimeError("simulated per-doc delete failure")
+        with (
+            patch.object(client_mod.time, "sleep"),
+            patch.object(client_mod, "_DELETE_VERIFY_STALL_TIMEOUT_S", 0),
+            pytest.raises(DeleteIncompleteError) as ei,
+        ):
+            c.delete_by_term("idx", "entity_uri", ["http://ex.org/C"], and_filters=[{"term": {"ontology_id": "o"}}])
+        err = ei.value
+        assert (err.deleted, err.remaining, err.failed) == (0, 1, 1)
+        assert "1 matching document(s) left" in str(err)
+        assert "RuntimeError: simulated per-doc delete failure" in str(err)
+
+    def test_delete_by_term_per_doc_errors_are_counted_across_passes(self):
+        # Pass 1: "a" deletes, "b" is rejected; progress resets the deadline.
+        # Pass 2: "b" is rejected again, nothing deleted → stall → raise.
+        c, fake = _delete_client(search_pages=[["a", "b"], ["b"]], count_seq=[1, 1])
+        fake.delete.side_effect = [None, RuntimeError("429"), RuntimeError("429")]
+        with (
+            patch.object(client_mod.time, "sleep"),
+            patch.object(client_mod, "_DELETE_VERIFY_STALL_TIMEOUT_S", 0),
+            pytest.raises(DeleteIncompleteError) as ei,
+        ):
+            c.delete_by_term("idx", "ontology_id", "urn:o")
+        assert (ei.value.deleted, ei.value.remaining, ei.value.failed) == (1, 1, 2)
+        assert fake.delete.call_count == 3
+
+    def test_delete_by_term_per_doc_not_found_is_not_counted_as_failure(self):
+        # A stale search view can return a doc that is already gone; its delete
+        # 404s. That is lag, not a rejected delete, so it is not reported as one.
+        c, fake = _delete_client(search_pages=[["gone"]], count_seq=[1])
+        fake.delete.side_effect = NotFoundError(404, "not_found", {})
+        with (
+            patch.object(client_mod.time, "sleep"),
+            patch.object(client_mod, "_DELETE_VERIFY_STALL_TIMEOUT_S", 0),
+            pytest.raises(DeleteIncompleteError) as ei,
+        ):
+            c.delete_by_term("idx", "ontology_id", "urn:o")
+        assert ei.value.failed == 0
+        assert "last error" not in str(ei.value)
+
+    def test_delete_by_term_count_that_never_answers_raises_with_unknown_remaining(self):
+        # The deletes cannot be verified at all: the stall must not read that as
+        # done, and the error says the remainder is unknown rather than inventing 0.
+        c = AossVectorClient(endpoint="https://x.aoss.us-west-2.on.aws", region="us-west-2", dimensions=4)
+        fake = MagicMock()
+
+        def _search(index, body):
+            if body.get("size") == 0:
+                raise RuntimeError("count unavailable")
+            return {"hits": {"hits": []}}
+
+        fake.search.side_effect = _search
+        c._client = fake
+        with (
+            patch.object(client_mod.time, "sleep"),
+            patch.object(client_mod, "_DELETE_VERIFY_STALL_TIMEOUT_S", 0),
+            pytest.raises(DeleteIncompleteError) as ei,
+        ):
+            c.delete_by_term("idx", "ontology_id", "urn:o")
+        assert ei.value.remaining is None
+        assert "an unknown number of matching document(s) left" in str(ei.value)
+
+    def test_delete_by_term_progress_then_zero_still_returns_count(self):
+        # A per-doc failure that the recount shows was harmless (count reaches 0)
+        # keeps the old outcome: the deleted count is returned, nothing raised.
+        c, fake = _delete_client(search_pages=[["a", "b"], ["b"]], count_seq=[1, 0])
+        fake.delete.side_effect = [None, RuntimeError("429"), None]
+        with patch.object(client_mod.time, "sleep"):
+            assert c.delete_by_term("idx", "ontology_id", "urn:o") == 2
 
 
 # ── signed-client auth ─────────────────────────────────────────────────────

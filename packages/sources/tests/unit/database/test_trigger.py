@@ -51,10 +51,11 @@ def test_starts_execution_on_valid_message(mock_sfn, sqs_event, valid_message):
     handler(sqs_event, None)
     # `isRescan` and `hadOpenRescan` are always added (normalized to strings),
     # both defaulting to "false" for a scan whose message carries neither marker.
+    # The message has no sourceId, so it is derived from datasourceId.
     mock_sfn.start_execution.assert_called_once_with(
         stateMachineArn=os.environ["STATE_MACHINE_ARN"],
         name="scan-456",
-        input=json.dumps({**valid_message, "isRescan": "false", "hadOpenRescan": "false"}),
+        input=json.dumps({**valid_message, "sourceId": "ds-123", "isRescan": "false", "hadOpenRescan": "false"}),
     )
 
 
@@ -72,7 +73,39 @@ def test_only_forwards_required_fields(mock_sfn):
     call_input = json.loads(mock_sfn.start_execution.call_args[1]["input"])
     assert "extraField" not in call_input
     required = {k: body[k] for k in ("datasourceId", "scanJobId", "namespaceId", "scanType")}
-    assert call_input == {**required, "isRescan": "false", "hadOpenRescan": "false"}
+    assert call_input == {**required, "sourceId": "x", "isRescan": "false", "hadOpenRescan": "false"}
+
+
+def _execution_input(mock_sfn, body: dict) -> dict:
+    handler({"Records": [{"messageId": "msg-src", "body": json.dumps(body)}]}, None)
+    return json.loads(mock_sfn.start_execution.call_args[1]["input"])
+
+
+@patch("index.sfn_client")
+def test_forwards_source_id_from_the_message(mock_sfn):
+    # The state machine's SCAN_FAILED step and the reaper key the sources row on it.
+    body = {"datasourceId": "DS#x", "sourceId": "src-1", "scanJobId": "SCAN#y", "namespaceId": "ns", "scanType": "full"}
+    assert _execution_input(mock_sfn, body)["sourceId"] == "src-1"
+
+
+@patch("index.sfn_client")
+def test_derives_source_id_when_the_message_lacks_it(mock_sfn):
+    # Re-scan messages carry only datasourceId.
+    body = {
+        "datasourceId": "DS#src-2",
+        "scanJobId": "SCAN#y",
+        "namespaceId": "ns",
+        "scanType": "full",
+        "isRescan": True,
+    }
+    assert _execution_input(mock_sfn, body)["sourceId"] == "src-2"
+
+
+@pytest.mark.parametrize("datasource_id", ["src-3", "DS#", ""])
+@patch("index.sfn_client")
+def test_does_not_invent_a_source_id_from_an_unprefixed_datasource_id(mock_sfn, datasource_id):
+    body = {"datasourceId": datasource_id, "scanJobId": "SCAN#y", "namespaceId": "ns", "scanType": "full"}
+    assert "sourceId" not in _execution_input(mock_sfn, body)
 
 
 @patch("index.sfn_client")

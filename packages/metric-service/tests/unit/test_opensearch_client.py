@@ -5,10 +5,11 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from coa_common.constants import URN_PREFIX
+from coa_common.opensearch import DeleteIncompleteError
 from coa_metrics.neptune_client import MetricAiContext, MetricDefinition, MetricDialect
 from coa_metrics.opensearch_client import (
     MetricOpenSearchClient,
@@ -128,6 +129,20 @@ class TestEmbedMetric:
             page=10,
         )
         aoss.index_document.assert_called_once()
+
+    def test_embed_metric_incomplete_delete_logs_and_still_indexes(self, sample_metric: MetricDefinition) -> None:
+        # The delete-before-write is best-effort: a delete that stops with the old
+        # doc still matching is logged at warning, and the new doc still lands.
+        client, aoss = self._client_with(self._fake_embedder([0.1]))
+        aoss.delete_by_term.side_effect = DeleteIncompleteError(
+            "1 matching document(s) left", deleted=0, remaining=1, failed=2
+        )
+        with patch("coa_metrics.opensearch_client.logger") as log:
+            client.embed_metric("test-ns", sample_metric)
+        aoss.index_document.assert_called_once()
+        warned = [c for c in log.warning.call_args_list if c.args and c.args[0] == "delete_by_entity_uri_incomplete"]
+        assert len(warned) == 1
+        assert warned[0].kwargs["remaining"] == 1
 
 
 # ── Delete embedding tests ──────────────────────────────────────────────

@@ -42,6 +42,88 @@ def _summaries(*titles: str) -> list[dict[str, str]]:
     return [{"codeReviewId": f"cr-{t}", "agentSpaceId": AGENT_SPACE, "title": t} for t in titles]
 
 
+def _stack(outputs: dict[str, str]) -> dict[str, Any]:
+    return {
+        "Stacks": [
+            {
+                "StackName": "sa-stack",
+                "CreationTime": "2026-01-01T00:00:00Z",
+                "StackStatus": "UPDATE_COMPLETE",
+                "Outputs": [{"OutputKey": k, "OutputValue": v} for k, v in outputs.items()],
+            }
+        ]
+    }
+
+
+class TestCheckStackCurrent:
+    """A merged template change does nothing until redeployed; the job must say so."""
+
+    @pytest.fixture
+    def template(self, tmp_path: Path) -> str:
+        path = tmp_path / "template.yaml"
+        path.write_text("Resources: {}\n")
+        return str(path)
+
+    @staticmethod
+    def _cfn() -> Any:
+        return boto3.client("cloudformation", region_name="us-east-1", aws_access_key_id="x", aws_secret_access_key="y")
+
+    def test_matching_hash_passes(self, template: str) -> None:
+        cfn = self._cfn()
+        with Stubber(cfn) as stub:
+            stub.add_response(
+                "describe_stacks",
+                _stack({"TemplateSha256": scan.template_sha256(template)}),
+                {"StackName": scan.STACK_NAME},
+            )
+            scan.check_stack_current(cfn, template)
+            stub.assert_no_pending_responses()
+
+    # A stale stamp, the parameter default, no such output at all, and an output with no
+    # value (both fields are optional in the API model).
+    @pytest.mark.parametrize(
+        "outputs",
+        [
+            [{"OutputKey": "TemplateSha256", "OutputValue": "0" * 64}],
+            [{"OutputKey": "TemplateSha256", "OutputValue": "unstamped"}],
+            [],
+            [{"OutputKey": "TemplateSha256"}],
+        ],
+    )
+    def test_stale_or_missing_stamp_dies(self, template: str, outputs: list[dict[str, Any]]) -> None:
+        cfn = self._cfn()
+        response = _stack({})
+        response["Stacks"][0]["Outputs"] = outputs
+        with Stubber(cfn) as stub:
+            stub.add_response("describe_stacks", response)
+            with pytest.raises(SystemExit) as exc:
+                scan.check_stack_current(cfn, template)
+        assert "is behind" in str(exc.value)
+        assert "deploy.sh" in str(exc.value)
+
+    def test_undescribable_stack_dies_naming_the_redeploy(self, template: str) -> None:
+        # A stack older than this check: its CI role has no DescribeStacks grant.
+        cfn = self._cfn()
+        with Stubber(cfn) as stub:
+            stub.add_client_error("describe_stacks", service_error_code="AccessDenied")
+            with pytest.raises(SystemExit) as exc:
+                scan.check_stack_current(cfn, template)
+        assert f"cannot read stack {scan.STACK_NAME}" in str(exc.value)
+        assert "deploy.sh" in str(exc.value)
+
+    def test_missing_template_dies_instead_of_a_traceback(self, tmp_path: Path) -> None:
+        with pytest.raises(SystemExit) as exc:
+            scan.check_stack_current(self._cfn(), str(tmp_path / "absent.yaml"))
+        assert "cannot hash" in str(exc.value)
+
+    def test_repo_template_emits_the_stamp(self) -> None:
+        # Guards TEMPLATE_PATH against a rename, and the template against losing the
+        # output this check reads — which would make every run report "unstamped".
+        root = Path(__file__).resolve().parents[4]
+        text = (root / scan.TEMPLATE_PATH).read_text()
+        assert "TemplateSha256:" in text.split("\nOutputs:")[1]
+
+
 class TestBucketName:
     """The bucket arrives as an ARN, and boto3 rejects an ARN as Bucket=."""
 
@@ -260,6 +342,8 @@ class TestEnsureCodeReview:
                     "agentSpaceId": AGENT_SPACE,
                     "codeReviewId": "cr-target",
                     "assets": self.ASSETS,
+                    # Without it the service rejects the update with a ValidationException.
+                    "serviceRole": "role",
                 },
             )
             assert scan.ensure_code_review(client, AGENT_SPACE, "target", self.ASSETS, "role") == "cr-target"
@@ -302,15 +386,19 @@ class TestEnsureCodeReview:
         assert "'target'" in str(exc.value)
 
 
+# Every variable main() validates, all valid; each case below breaks exactly one.
+VALID_ENV = {"SA_AGENT_SPACE_ID": "as-1", "SA_NAME": "ok", "AWS_DEFAULT_REGION": "us-east-1"}
+
+
 class TestMainValidation:
     @pytest.mark.parametrize(
         ("env", "expected"),
         [
-            ({"SA_AGENT_SPACE_ID": "", "SA_NAME": "ok", "AWS_DEFAULT_REGION": "us-east-1"}, "SECURITY_AGENT_SPACE_ID"),
-            ({"SA_AGENT_SPACE_ID": "as-1", "SA_NAME": "", "AWS_DEFAULT_REGION": "us-east-1"}, "SA_NAME"),
-            ({"SA_AGENT_SPACE_ID": "as-1", "SA_NAME": "bad name!", "AWS_DEFAULT_REGION": "us-east-1"}, "SA_NAME"),
-            ({"SA_AGENT_SPACE_ID": "as-1", "SA_NAME": "x" * 101, "AWS_DEFAULT_REGION": "us-east-1"}, "SA_NAME"),
-            ({"SA_AGENT_SPACE_ID": "as-1", "SA_NAME": "ok", "AWS_DEFAULT_REGION": ""}, "SECURITY_AGENT_REGION"),
+            ({**VALID_ENV, "SA_AGENT_SPACE_ID": ""}, "SECURITY_AGENT_SPACE_ID"),
+            ({**VALID_ENV, "SA_NAME": ""}, "SA_NAME"),
+            ({**VALID_ENV, "SA_NAME": "bad name!"}, "SA_NAME"),
+            ({**VALID_ENV, "SA_NAME": "x" * 101}, "SA_NAME"),
+            ({**VALID_ENV, "AWS_DEFAULT_REGION": ""}, "SECURITY_AGENT_REGION"),
         ],
     )
     def test_bad_input_dies_before_any_aws_call(
@@ -324,3 +412,20 @@ class TestMainValidation:
         with pytest.raises(SystemExit) as exc:
             scan.main()
         assert expected in str(exc.value)
+
+    def test_stale_stack_dies_before_zipping(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        for k, v in VALID_ENV.items():
+            monkeypatch.setenv(k, v)
+        # template_sha256 reads TEMPLATE_PATH relative to the repo root, as in CI.
+        monkeypatch.chdir(Path(__file__).resolve().parents[4])
+        cfn = TestCheckStackCurrent._cfn()
+        sa = _client()
+        clients = {"cloudformation": cfn, "securityagent": sa, "s3": boto3.client("s3", region_name="us-east-1")}
+        monkeypatch.setattr(boto3, "client", lambda name, **k: clients[name])
+        monkeypatch.setattr(scan, "build_zip", lambda *a, **k: pytest.fail("zipped before the stack check"))
+        # No securityagent responses are queued, so any call on it fails the test too.
+        with Stubber(cfn) as cfn_stub, Stubber(sa):
+            cfn_stub.add_response("describe_stacks", _stack({"TemplateSha256": "0" * 64}))
+            with pytest.raises(SystemExit) as exc:
+                scan.main()
+        assert "is behind" in str(exc.value)

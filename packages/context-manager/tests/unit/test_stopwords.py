@@ -25,6 +25,10 @@ class TestMergedSet:
         assert "알려줘" in stopwords.RESIDUAL_STOP_WORDS  # ko
         assert "いくら" in stopwords.RESIDUAL_STOP_WORDS  # ja
 
+    @pytest.mark.parametrize("word", ["何台", "何件", "何名", "何社", "いくつ", "どれくらい", "どのくらい"])
+    def test_japanese_quantity_questions_are_scaffolding(self, word):
+        assert word in stopwords.RESIDUAL_STOP_WORDS
+
     def test_groups_are_nonempty(self):
         for group in stopwords.RESIDUAL_STOP_WORD_GROUPS:
             assert group.split(), "empty stop-word group"

@@ -8,7 +8,9 @@ matching Glue Data Catalog state changes for a source's database. Each message
 carries ``{namespaceId, sourceId, trigger}`` (a constant emitted by the rule's
 input transformer). For each, fire an EVENT-trigger rescan via the shared
 rescan path — which applies the EVENT cooldown and the active-scan guard, so a
-burst of upstream change events coalesces into a single rescan.
+burst of upstream change events coalesces into a single rescan. A message is
+skipped (consumed without a scan) unless the source row is a database source
+with ``eventRescan`` enabled: the record, not the message, decides.
 
 Failures are reported per message via ``batchItemFailures`` rather than raising,
 so only the messages that actually failed are retried and eventually reach the
@@ -27,7 +29,7 @@ import structlog
 from coa_common.logging import setup_logging
 from coa_control_plane_server.models.scan_trigger import ScanTrigger
 
-from coa_sources.api.sources_handler import _handle_rescan
+from coa_sources.api.sources_handler import _automated_rescan_skip_reason, _handle_rescan
 
 setup_logging(os.environ.get("LOG_LEVEL", "INFO"))
 logger = structlog.get_logger(__name__)
@@ -67,6 +69,19 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             continue
 
         try:
+            skip_reason = _automated_rescan_skip_reason(namespace_id, source_id, ScanTrigger.EVENT)
+            if skip_reason:
+                # Consumed, not failed: a message for a source whose event
+                # re-scans are off (or that is not a database source) will never
+                # become valid, so retrying it only fills the DLQ.
+                logger.warning(
+                    "glue_event_rescan_skipped",
+                    namespace_id=namespace_id,
+                    source_id=source_id,
+                    reason=skip_reason,
+                )
+                processed += 1
+                continue
             # Empty event so confirmDiscardOpenReview stays false: an upstream
             # change must not discard a steward's open review.
             response = _handle_rescan({}, namespace_id, source_id, trigger=ScanTrigger.EVENT)

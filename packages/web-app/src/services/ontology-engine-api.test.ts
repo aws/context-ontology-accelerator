@@ -8,6 +8,7 @@ import {
   listProposals,
   getProposal,
   getProposalUploadUrls,
+  updateProposal,
   acceptProposal,
   cancelProposal,
   rejectProposals,
@@ -75,6 +76,18 @@ describe("ontology-engine API wrappers", () => {
       "/namespaces/ns/proposals/p1/upload-url",
       {},
     );
+  });
+
+  it("updateProposal forwards non-null grounding and novel table fields", async () => {
+    await updateProposal(api, "ns", "p1", {
+      grounding_overrides: { orders: "https://schema.org/Order" },
+      novel_tables: ["customers"],
+    });
+    expect(post).toHaveBeenCalledWith("/namespaces/ns/proposals/update", {
+      proposal_id: "p1",
+      grounding_overrides: { orders: "https://schema.org/Order" },
+      novel_tables: ["customers"],
+    });
   });
 
   it("acceptProposal without opts POSTs an empty body", async () => {
@@ -300,21 +313,75 @@ describe("ontology-engine API wrappers", () => {
       );
     });
 
-    it("putToPresignedUrl PUTs with the content type", async () => {
+    it("putToPresignedUrl PUTs with the signed create-only header", async () => {
       const f = vi.fn().mockResolvedValue({ ok: true });
       vi.stubGlobal("fetch", f);
       await putToPresignedUrl("https://s3/put", "body");
-      expect(f).toHaveBeenCalledWith(
-        "https://s3/put",
-        expect.objectContaining({
-          method: "PUT",
-          body: "body",
-          headers: { "Content-Type": "text/turtle" },
-        }),
-      );
+      expect(f).toHaveBeenCalledWith("https://s3/put", {
+        method: "PUT",
+        body: "body",
+        headers: {
+          "Content-Type": "text/turtle",
+          "If-None-Match": "*",
+        },
+      });
     });
 
-    it("putToPresignedUrl throws on non-ok", async () => {
+    it.each([409, 412])(
+      "putToPresignedUrl treats %i as a failed conflicting write",
+      async (status) => {
+        const url = "https://s3/secret-presigned-query";
+        vi.stubGlobal(
+          "fetch",
+          vi.fn().mockResolvedValue({
+            ok: false,
+            status,
+            statusText: status === 409 ? "Conflict" : "Precondition Failed",
+          }),
+        );
+
+        try {
+          await putToPresignedUrl(url, "body");
+          expect.unreachable("a conflicting write must fail");
+        } catch (error: unknown) {
+          expect(error).toBeInstanceOf(Error);
+          if (error instanceof Error) {
+            expect(error.message).toMatch(
+              /revision already has an upload or the write outcome conflicted/,
+            );
+            expect(error.message).toContain(
+              "Save again to create a fresh revision and re-upload.",
+            );
+            expect(error.message).not.toContain(url);
+          }
+        }
+      },
+    );
+
+    it("putToPresignedUrl explains a 403 without leaking the URL", async () => {
+      const url = "https://s3/secret-presigned-query";
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockResolvedValue({
+          ok: false,
+          status: 403,
+          statusText: "Forbidden",
+        }),
+      );
+
+      try {
+        await putToPresignedUrl(url, "body");
+        expect.unreachable("a forbidden write must fail");
+      } catch (error: unknown) {
+        expect(error).toBeInstanceOf(Error);
+        if (error instanceof Error) {
+          expect(error.message).toMatch(/expired or a required signed header/);
+          expect(error.message).not.toContain(url);
+        }
+      }
+    });
+
+    it("putToPresignedUrl keeps generic handling for other failures", async () => {
       vi.stubGlobal(
         "fetch",
         vi

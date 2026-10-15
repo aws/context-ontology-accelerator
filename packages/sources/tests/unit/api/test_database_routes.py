@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, call, create_autospec, patch
 
 import pytest
 from botocore.exceptions import ClientError
+from coa_common.datazone_forms import FORM_TYPE_NAME
 from coa_control_plane_server.models.source_type import SourceType
 
 # ---------------------------------------------------------------------------
@@ -2079,6 +2080,7 @@ class TestHandleListTables:
         mock_result.next_token = None
 
         mock_smus = MagicMock()
+        mock_smus.find_asset_by_name.return_value = None
         mock_smus.search_assets.return_value = mock_result
 
         with (
@@ -3012,6 +3014,7 @@ class TestHandleGetTable:
             status, body = _parse(_dr._handle_get_table(_NAMESPACE_ID, _SOURCE_ID, "sales.orders"))
         assert status == 200
         assert body["columns"][0]["businessMetadata"]["confidence"] == 0.88
+        mock_smus.search_assets.assert_not_called()
 
     def test_get_table_namespace_not_found_returns_404(self):
         mock_ns_dao = dao_double()
@@ -3031,8 +3034,10 @@ class TestHandleGetTable:
 
         mock_result = MagicMock()
         mock_result.items = []
+        mock_result.next_token = None
 
         mock_smus = MagicMock()
+        mock_smus.find_asset_by_name.return_value = None
         mock_smus.search_assets.return_value = mock_result
 
         with (
@@ -3043,6 +3048,117 @@ class TestHandleGetTable:
             status, _ = _parse(_dr._handle_get_table(_NAMESPACE_ID, _SOURCE_ID, "mydb.mytable"))
 
         assert status == 404
+        mock_smus.search_assets.assert_called_once()
+
+    def test_get_table_falls_back_to_source_search_when_exact_name_index_lags(self):
+        mock_ns_dao = dao_double()
+        mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
+
+        decoy_asset = MagicMock()
+        decoy_asset.name = f"DS#{_SOURCE_ID}:sales.orders_archive"
+        decoy_asset.asset_id = "asset-decoy"
+        mock_asset = MagicMock()
+        mock_asset.name = f"DS#{_SOURCE_ID}:sales.orders"
+        mock_asset.asset_id = "asset-001"
+        mock_result = MagicMock()
+        mock_result.items = [decoy_asset, mock_asset]
+        mock_result.next_token = None
+
+        mock_smus = MagicMock()
+        mock_smus.find_asset_by_name.return_value = None
+        mock_smus.search_assets.return_value = mock_result
+        mock_smus.get_asset_forms.return_value = {
+            "formsOutput": [
+                {
+                    "formName": FORM_TYPE_NAME,
+                    "content": _serialize_table(table_name="orders", database="sales"),
+                }
+            ]
+        }
+
+        with (
+            patch(f"{_DR}._SMUS_DOMAIN_ID", "domain-id"),
+            patch(f"{_DR}._get_ns_dao", return_value=mock_ns_dao),
+            patch(f"{_DR}._get_smus_client", return_value=mock_smus),
+        ):
+            status, body = _parse(_dr._handle_get_table(_NAMESPACE_ID, _SOURCE_ID, "sales.orders"))
+
+        assert status == 200
+        assert body["tableId"] == "sales.orders"
+        mock_smus.find_asset_by_name.assert_called_once_with(
+            project_id="proj-123",
+            name=f"DS#{_SOURCE_ID}:sales.orders",
+        )
+        mock_smus.search_assets.assert_called_once_with(
+            project_id="proj-123",
+            search_text=f"DS#{_SOURCE_ID}:sales.orders",
+            max_results=50,
+            next_token=None,
+        )
+
+    def test_get_table_fallback_does_not_paginate_a_miss(self):
+        mock_ns_dao = dao_double()
+        mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
+
+        unrelated_asset = MagicMock()
+        unrelated_asset.name = f"DS#{_SOURCE_ID}:sales.customers"
+        first_page = MagicMock(items=[unrelated_asset], next_token="page-2")
+
+        mock_smus = MagicMock()
+        mock_smus.find_asset_by_name.return_value = None
+        mock_smus.search_assets.return_value = first_page
+
+        with (
+            patch(f"{_DR}._SMUS_DOMAIN_ID", "domain-id"),
+            patch(f"{_DR}._get_ns_dao", return_value=mock_ns_dao),
+            patch(f"{_DR}._get_smus_client", return_value=mock_smus),
+        ):
+            status, _ = _parse(_dr._handle_get_table(_NAMESPACE_ID, _SOURCE_ID, "sales.orders"))
+
+        assert status == 404
+        mock_smus.search_assets.assert_called_once()
+
+    def test_get_table_fallback_search_failure_returns_500(self):
+        mock_ns_dao = dao_double()
+        mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
+
+        mock_smus = MagicMock()
+        mock_smus.find_asset_by_name.return_value = None
+        mock_smus.search_assets.side_effect = RuntimeError("source search unavailable")
+
+        with (
+            patch(f"{_DR}._SMUS_DOMAIN_ID", "domain-id"),
+            patch(f"{_DR}._get_ns_dao", return_value=mock_ns_dao),
+            patch(f"{_DR}._get_smus_client", return_value=mock_smus),
+        ):
+            status, _ = _parse(_dr._handle_get_table(_NAMESPACE_ID, _SOURCE_ID, "sales.orders"))
+
+        assert status == 500
+
+    def test_load_single_asset_recovers_when_exact_name_index_lags(self):
+        mock_asset = MagicMock()
+        mock_asset.name = f"DS#{_SOURCE_ID}:sales.orders"
+        mock_asset.asset_id = "asset-001"
+
+        mock_smus = MagicMock()
+        mock_smus.find_asset_by_name.return_value = None
+        mock_smus.search_assets.return_value = MagicMock(items=[mock_asset], next_token=None)
+        mock_smus.get_asset_forms.return_value = {
+            "formsOutput": [
+                {
+                    "formName": FORM_TYPE_NAME,
+                    "content": _serialize_table(table_name="orders", database="sales"),
+                }
+            ]
+        }
+
+        loaded, error = _dr._load_single_asset(mock_smus, "proj-123", _SOURCE_ID, "sales.orders")
+
+        assert error is None
+        assert loaded is not None
+        assert loaded["asset_id"] == "asset-001"
+        assert loaded["table"].database == "sales"
+        assert loaded["table"].name == "orders"
 
     def test_get_table_search_fails_returns_500(self):
         mock_ns_dao = dao_double()
@@ -5365,6 +5481,74 @@ class TestUpdateTableKeys:
         assert "Ambiguous" in response["error"]
         _review_env["smus"].create_asset_revision.assert_not_called()
 
+    def test_ambiguous_bare_target_detected_when_exact_name_index_lags(self, _review_env):
+        smus = _review_env["smus"]
+        _mock_single_asset_load(smus, table_id=self._TABLE_ID, form_content=_serialize_table())
+        for database in ("sales", "crm"):
+            _mock_single_asset_load(
+                smus,
+                table_id=f"{database}.customers",
+                form_content=_serialize_table(
+                    table_name="customers",
+                    database=database,
+                    columns=[{"name": "id"}],
+                ),
+            )
+        catalog = smus.__dict__["_coa_test_table_catalog"]
+
+        def _find_asset(*, name, **_):
+            if name == f"DS#{_SOURCE_ID}:{self._TABLE_ID}":
+                return None
+            return catalog[name][0] if name in catalog else None
+
+        smus.find_asset_by_name.side_effect = _find_asset
+
+        body = {"foreignKeys": [{"column": "col_a", "targetTable": "customers", "targetColumn": "id"}]}
+        status, response = _parse(
+            _dr._handle_update_table_keys(self._event(body), _NAMESPACE_ID, _SOURCE_ID, self._TABLE_ID)
+        )
+
+        assert status == 400
+        assert "Ambiguous" in response["error"]
+        smus.search_assets.assert_called_once()
+        smus.create_asset_revision.assert_not_called()
+
+    def test_ambiguous_bare_target_detected_when_target_name_index_lags(self, _review_env):
+        smus = _review_env["smus"]
+        _mock_single_asset_load(smus, table_id=self._TABLE_ID, form_content=_serialize_table())
+        for database in ("sales", "crm"):
+            _mock_single_asset_load(
+                smus,
+                table_id=f"{database}.customers",
+                form_content=_serialize_table(
+                    table_name="customers",
+                    database=database,
+                    columns=[{"name": "id"}],
+                ),
+            )
+        catalog = smus.__dict__["_coa_test_table_catalog"]
+        target_names = {
+            f"DS#{_SOURCE_ID}:sales.customers",
+            f"DS#{_SOURCE_ID}:crm.customers",
+        }
+
+        def _find_asset(*, name, **_):
+            if name in target_names:
+                return None
+            return catalog[name][0] if name in catalog else None
+
+        smus.find_asset_by_name.side_effect = _find_asset
+
+        body = {"foreignKeys": [{"column": "col_a", "targetTable": "customers", "targetColumn": "id"}]}
+        status, response = _parse(
+            _dr._handle_update_table_keys(self._event(body), _NAMESPACE_ID, _SOURCE_ID, self._TABLE_ID)
+        )
+
+        assert status == 400
+        assert "Ambiguous" in response["error"]
+        assert smus.search_assets.call_count == 2
+        smus.create_asset_revision.assert_not_called()
+
     def test_foreign_key_unique_bare_target_in_other_database_is_valid(self, _review_env):
         _mock_single_asset_load(_review_env["smus"], table_id=self._TABLE_ID, form_content=_serialize_table())
         _mock_single_asset_load(
@@ -5380,6 +5564,36 @@ class TestUpdateTableKeys:
         status, _ = _parse(_dr._handle_update_table_keys(self._event(body), _NAMESPACE_ID, _SOURCE_ID, self._TABLE_ID))
         assert status == 200
         assert self._written_table(_review_env).foreign_keys[0].target_table == "customers"
+
+    def test_unique_bare_target_recovers_when_exact_name_index_lags(self, _review_env):
+        smus = _review_env["smus"]
+        _mock_single_asset_load(smus, table_id=self._TABLE_ID, form_content=_serialize_table())
+        _mock_single_asset_load(
+            smus,
+            table_id="crm.customers",
+            form_content=_serialize_table(
+                table_name="customers",
+                database="crm",
+                columns=[{"name": "id"}],
+            ),
+        )
+        catalog = smus.__dict__["_coa_test_table_catalog"]
+        lagging_name = f"DS#{_SOURCE_ID}:crm.customers"
+
+        def _find_asset(*, name, **_):
+            if name == lagging_name:
+                return None
+            return catalog[name][0] if name in catalog else None
+
+        smus.find_asset_by_name.side_effect = _find_asset
+
+        body = {"foreignKeys": [{"column": "col_a", "targetTable": "customers", "targetColumn": "id"}]}
+        status, _ = _parse(_dr._handle_update_table_keys(self._event(body), _NAMESPACE_ID, _SOURCE_ID, self._TABLE_ID))
+
+        assert status == 200
+        assert self._written_table(_review_env).foreign_keys[0].target_table == "customers"
+        assert any(call.kwargs["search_text"] == lagging_name for call in smus.search_assets.call_args_list)
+        smus.create_asset_revision.assert_called_once()
 
     def test_foreign_key_bare_target_uses_schema_index_and_reuses_matched_asset(self, _review_env):
         smus = _review_env["smus"]
@@ -5398,7 +5612,12 @@ class TestUpdateTableKeys:
         status, _ = _parse(_dr._handle_update_table_keys(self._event(body), _NAMESPACE_ID, _SOURCE_ID, self._TABLE_ID))
 
         assert status == 200
-        smus.search_assets.assert_not_called()
+        smus.search_assets.assert_called_once_with(
+            project_id="proj-123",
+            search_text=f"DS#{_SOURCE_ID}:sales.customers",
+            max_results=50,
+            next_token=None,
+        )
         names = [call.kwargs["name"] for call in smus.find_asset_by_name.call_args_list]
         assert names == [
             f"DS#{_SOURCE_ID}:{self._TABLE_ID}",
@@ -5794,6 +6013,65 @@ class TestHandlePutRescanSchedule:
         # Exactly the one delete from the disable itself, no rollback on top.
         assert mock_scheduler.delete_schedule.call_count == 1
 
+    @pytest.mark.parametrize("code", ["ThrottlingException", "AccessDeniedException", "InternalServerException"])
+    def test_disable_delete_fails_returns_500_and_keeps_the_record(self, code):
+        """The schedule may still be live, so answering 200 and recording OFF
+        would tell the steward the source is frozen while it keeps re-scanning."""
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {"sourceType": "DATABASE", "rescanSchedule": {"enabled": True}}
+        mock_scheduler = MagicMock()
+        mock_scheduler.delete_schedule.side_effect = ClientError({"Error": {"Code": code}}, "DeleteSchedule")
+
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}._get_scheduler", return_value=mock_scheduler),
+            patch(f"{_DR}._RESCAN_SCHEDULE_GROUP", "grp"),
+        ):
+            status, body = _parse(
+                _dr._handle_put_rescan_schedule({"body": json.dumps({"enabled": False})}, _NAMESPACE_ID, _SOURCE_ID)
+            )
+
+        assert status == 500, f"DeleteSchedule failed ({code}) but the API answered {status}"
+        assert body == {"error": "Failed to remove schedule"}
+        mock_dao.update.assert_not_called()
+
+    def test_disable_schedule_already_gone_returns_200(self):
+        """NotFound means the schedule is already gone, which is what was asked."""
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {"sourceType": "DATABASE"}
+        mock_scheduler = MagicMock()
+        mock_scheduler.delete_schedule.side_effect = ClientError(
+            {"Error": {"Code": "ResourceNotFoundException"}}, "DeleteSchedule"
+        )
+
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}._get_scheduler", return_value=mock_scheduler),
+            patch(f"{_DR}._RESCAN_SCHEDULE_GROUP", "grp"),
+        ):
+            status, body = _parse(
+                _dr._handle_put_rescan_schedule({"body": json.dumps({"enabled": False})}, _NAMESPACE_ID, _SOURCE_ID)
+            )
+
+        assert status == 200
+        assert body["rescanSchedule"] == {"enabled": False}
+        assert mock_dao.update.call_args[0][1]["rescanSchedule"] == {"enabled": False}
+
+    def test_delete_rescan_schedule_reports_whether_it_is_gone(self):
+        mock_scheduler = MagicMock()
+        with (
+            patch(f"{_DR}._get_scheduler", return_value=mock_scheduler),
+            patch(f"{_DR}._RESCAN_SCHEDULE_GROUP", "grp"),
+        ):
+            assert _dr._delete_rescan_schedule(_SOURCE_ID) is True
+            mock_scheduler.delete_schedule.side_effect = ClientError(
+                {"Error": {"Code": "ThrottlingException"}}, "DeleteSchedule"
+            )
+            assert _dr._delete_rescan_schedule(_SOURCE_ID) is False
+        with patch(f"{_DR}._RESCAN_SCHEDULE_GROUP", ""):
+            # Scheduling not configured: no schedule can exist.
+            assert _dr._delete_rescan_schedule(_SOURCE_ID) is True
+
 
 @pytest.mark.unit
 class TestHandlePutEventRescan:
@@ -6010,3 +6288,75 @@ class TestHandlePutEventRescan:
             status, _ = _parse(_dr._handle_put_event_rescan(event, _NAMESPACE_ID, _SOURCE_ID))
 
         assert status == 200
+
+    def _disable(self, mock_events: MagicMock, mock_dao: MagicMock):
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}._get_events", return_value=mock_events),
+            patch(f"{_DR}._GLUE_EVENT_RULE_PREFIX", "coa-dev-glue-rescan"),
+        ):
+            event = {"body": json.dumps({"enabled": False})}
+            return _parse(_dr._handle_put_event_rescan(event, _NAMESPACE_ID, _SOURCE_ID))
+
+    @pytest.mark.parametrize("code", ["ThrottlingException", "AccessDeniedException", "InternalException"])
+    def test_disable_delete_rule_fails_returns_500_and_keeps_the_record(self, code):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {**self._glue_item(), "eventRescan": {"enabled": True}}
+        mock_events = MagicMock()
+        mock_events.remove_targets.return_value = {"FailedEntryCount": 0, "FailedEntries": []}
+        mock_events.delete_rule.side_effect = ClientError({"Error": {"Code": code}}, "DeleteRule")
+
+        status, body = self._disable(mock_events, mock_dao)
+
+        assert status == 500, f"DeleteRule failed ({code}) but the API answered {status}"
+        assert body == {"error": "Failed to remove event-driven rescans"}
+        mock_dao.update.assert_not_called()
+
+    def test_disable_remove_targets_fails_returns_500_and_keeps_the_record(self):
+        """The rule's target is what routes events to the queue; a failure there
+        is no longer swallowed."""
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {**self._glue_item(), "eventRescan": {"enabled": True}}
+        mock_events = MagicMock()
+        mock_events.remove_targets.side_effect = ClientError(
+            {"Error": {"Code": "ThrottlingException"}}, "RemoveTargets"
+        )
+
+        status, _ = self._disable(mock_events, mock_dao)
+
+        assert status == 500
+        mock_events.delete_rule.assert_not_called()
+        mock_dao.update.assert_not_called()
+
+    def test_disable_remove_targets_partial_failure_returns_500(self):
+        """RemoveTargets reports a per-target failure in its body, not as an error."""
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = self._glue_item()
+        mock_events = MagicMock()
+        mock_events.remove_targets.return_value = {
+            "FailedEntryCount": 1,
+            "FailedEntries": [{"TargetId": "glue-event-queue", "ErrorCode": "InternalException"}],
+        }
+
+        status, _ = self._disable(mock_events, mock_dao)
+
+        assert status == 500
+        mock_events.delete_rule.assert_not_called()
+        mock_dao.update.assert_not_called()
+
+    def test_disable_rule_already_gone_returns_200(self):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = self._glue_item()
+        mock_events = MagicMock()
+        mock_events.remove_targets.side_effect = ClientError(
+            {"Error": {"Code": "ResourceNotFoundException"}}, "RemoveTargets"
+        )
+        mock_events.delete_rule.side_effect = ClientError(
+            {"Error": {"Code": "ResourceNotFoundException"}}, "DeleteRule"
+        )
+
+        status, body = self._disable(mock_events, mock_dao)
+
+        assert status == 200
+        assert body["eventRescan"] == {"enabled": False}
+        assert mock_dao.update.call_args[0][1]["eventRescan"] == {"enabled": False}
