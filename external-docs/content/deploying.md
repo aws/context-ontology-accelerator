@@ -96,7 +96,7 @@ or sandbox account it is worth confirming them up front:
 
 | Quota | Code | Requirement | If too low |
 |-------|------|-------------|------------|
-| **VPC** (VPCs per Region) | `L-F678F1CE` | Room for one more VPC in the target region | Delete an unused VPC or request an increase |
+| **VPC** (VPCs per Region) | `L-F678F1CE` | Room for one more VPC in the target region. Only checked when the deploy creates a VPC: not on an update of an existing deployment, and not with `SCL_VPC_ID` | Delete an unused VPC or request an increase |
 | **Lambda** (Concurrent executions) | `L-B99A9384` | Enough unreserved headroom to reserve the deployment's Lambda concurrency (default 5 × 2 functions = 10) above Lambda's account-wide minimum of 10 | Request an increase, **or** deploy with `SCL_LAMBDA_RESERVED_CONCURRENCY=0` (see [Lambda reserved concurrency](#lambda-reserved-concurrency)) |
 
 Check them with:
@@ -121,7 +121,7 @@ fuller list and why each one matters here.
 
 ### Region Selection
 
-Context Ontology Accelerator defaults to `us-east-1` if no region is set. To deploy to a different region, export `AWS_DEFAULT_REGION` (used by the AWS CLI and preflight checks) **and** `CDK_DEFAULT_REGION` (used by CDK/`bin/app.ts` for AZ resolution and region-specific config) before running any deploy command:
+If no region is set in the environment, Context Ontology Accelerator deploys to the region of your active AWS CLI profile (`aws configure get region`, which honors `AWS_PROFILE`), and to `us-east-1` if the profile has none. The CDK CLI and the deploy, preflight and destroy scripts resolve it the same way. To deploy to a different region, export `AWS_DEFAULT_REGION` (used by the AWS CLI and preflight checks) **and** `CDK_DEFAULT_REGION` (used by CDK/`bin/app.ts` for AZ resolution and region-specific config) before running any deploy command:
 
 ```bash
 export AWS_DEFAULT_REGION=us-west-2
@@ -181,8 +181,8 @@ or the bare in-region model ID. The models to check:
 
 | Model | Used for |
 |-------|----------|
-| Claude Sonnet 4.6 | Induction, grounding |
-| Claude Haiku 4.5 | Rerank, enrichment, document ingestion |
+| Claude Sonnet 4.6 | Induction |
+| Claude Haiku 4.5 | Grounding rerank, enrichment, document ingestion |
 | Claude Sonnet 5 | Serve query resolution (NL-to-SPARQL, synthesis) |
 | Cohere Embed v4 | All embeddings |
 
@@ -203,11 +203,25 @@ exactly as it does today; outside the US the defaults are unusable (see the warn
 
 | Config key | Sets the model for | Default |
 |------------|--------------------|---------|
-| `bedrockLlmModelId` | Serve query LLM (NL-to-SPARQL, synthesis) | `us.anthropic.claude-sonnet-5` |
+| `bedrockLlmModelId` | Serve query LLM (NL-to-SPARQL, synthesis, GraphRAG lexical retrieval) | `us.anthropic.claude-sonnet-5` |
 | `bedrockEmbedModelId` | **All** embeddings — induction, doc-KG-build, metric matching, serve retrieval | `us.cohere.embed-v4:0` |
 | `bedrockEmbedDimensions` | Vector dimension for the embedding model above | `1024` |
-| `bedrockInductionLlmModelId` | Ontology induction, grounding rerank, description generation | `us.anthropic.claude-sonnet-5` |
+| `bedrockInductionLlmModelId` | Ontology induction, description generation | `us.anthropic.claude-sonnet-5` |
 | `bedrockChatModelId` | Source enrichment, constraint inference, document-ingestion extraction | `us.anthropic.claude-haiku-4-5-20251001-v1:0` |
+| `bedrockGroundingLlmModelId` | Ontology-engine grounding reranker | *follows `bedrockChatModelId`* |
+
+Grounding rerank is a cheap, high-volume call, so `bedrockGroundingLlmModelId` defaults to
+whatever `bedrockChatModelId` resolves to (a Haiku-class model) rather than the heavier
+induction model. Set it to a region-valid profile id (e.g. a `jp.`/`global.` Haiku) when
+deploying outside the US so the rerank call does not reject the default `us.` profile.
+It feeds the ontology-engine `GROUNDING_LLM_MODEL_ID` environment variable; the
+grounding region follows `LLM_REGION` (the deploy region). Like the other model keys it is
+geography-validated at `cdk synth`.
+
+GraphRAG lexical retrieval calls the model through llama-index's `BedrockConverse`, which accepts only
+the models in its own table (Claude Sonnet 4.6 and Sonnet 5 in the pinned version). If `bedrockLlmModelId`
+names another model, the Tier 3 lexical retrieval strategies fail when they start, while the rest of serve
+keeps working.
 
 Both **geographic inference profiles** (`us.`, `eu.`, `apac.`, `jp.`, `global.`) and **bare in-region model
 IDs** (e.g. `cohere.embed-v4:0`) are accepted — bare IDs matter because some models publish geo
@@ -326,7 +340,9 @@ This runs `scripts/deploy.sh` which:
 1. **Preflight checks** — verifies toolchain versions (Node, Java, pnpm), Docker (including ARM64 emulation on x86_64 hosts), regenerates Smithy artifacts if missing/stale, authenticates to ECR Public, checks VPC quota
 2. **Builds all packages** — compiles TypeScript, bundles Lambdas
 3. **Synthesizes CloudFormation** — generates templates from CDK
-4. **Deploys all stacks** — CDK handles ordering via dependency graph
+4. **Deploys all stacks** — CDK handles ordering via the dependency graph, deploying up to three independent stacks at once
+
+`make deploy-dev` then deploys the [Databricks SQL Warehouse connector](#the-databricks-sql-warehouse-connector). On a first deploy it starts as soon as the stacks it reads from exist, alongside the remaining platform stacks.
 
 !!! note "ECR Public authentication is automatic"
     `make deploy-dev` authenticates to ECR Public (`us-east-1`) as part of its preflight checks. No manual `docker login` step is needed.
@@ -338,6 +354,7 @@ This runs `scripts/deploy.sh` which:
 | Stack | Purpose |
 |-------|---------|
 | `coa-dev-network` | VPC, subnets, security groups |
+| `coa-dev-eni-warm` | Never-invoked Lambda functions that pre-create the VPC network interfaces the service stacks' Lambdas share (see below) |
 | `coa-dev-auth` | Cognito User Pool, OIDC configuration |
 | `coa-dev-guardrail` | Bedrock guardrails |
 | `coa-dev-storage` | Neptune (graph DB), OpenSearch Serverless |
@@ -354,19 +371,21 @@ This runs `scripts/deploy.sh` which:
 | `coa-dev-ontology` | Ontology engine (induction, reasoning) |
 | `coa-dev-mcp` | MCP Server on AgentCore Runtime |
 
-Total fresh deploy: **~1.5 hours** for CDK/CloudFormation provisioning of all 16 stacks, once dependencies are installed and Smithy artifacts are generated. Neptune and OpenSearch Serverless provisioning, AgentCore Runtime setup, and cross-stack SSM dependency waits account for most of that time — individual stacks vary widely and several run in parallel, so a per-stack breakdown understates the real end-to-end wall-clock time. CDK resolves the deploy order automatically from the dependency graph declared in `bin/app.ts` — you don't need to deploy stacks individually or in this order by hand.
+Total fresh deploy: **about 40 minutes** for `make deploy-dev` to provision all 17 stacks and the connector, once dependencies are installed and Smithy artifacts are generated (measured from a laptop deploying to `us-east-1`; image build and push time depend on your machine and uplink). Running `cdk deploy --all` directly, without `--concurrency`, deploys one stack at a time and takes about 1.5 hours. Most of the time is spent along one chain of dependent stacks — network → storage (Neptune) → vkg → namespace (DataZone) → serve (AgentCore Runtime) → data-layer → api → web (CloudFront) — while the other stacks deploy alongside it. If a deploy appears stuck, check `aws cloudformation list-stacks` before intervening: it is usually waiting on the Neptune instance, the AgentCore Runtime or the CloudFront distribution.
+
+**Why `coa-dev-eni-warm` exists.** A Lambda function in a VPC reaches it through a [Hyperplane ENI](https://docs.aws.amazon.com/lambda/latest/dg/configuration-vpc.html#configuration-vpc-enis), which Lambda shares between all functions with the same subnets and security groups. The first function to use a new combination waits about four minutes for that interface to be created; later ones take seconds. The platform's VPC Lambdas therefore share a small set of security groups, and `coa-dev-eni-warm` creates one never-invoked function per combination early in the deploy. That only saves time because the warm-up runs while the storage stack is still creating Neptune, which the service stacks wait for anyway. CDK resolves the deploy order automatically from the dependency graph declared in `bin/app.ts` — you don't need to deploy stacks individually or in this order by hand.
 
 !!! warning "First-time setup adds significant time"
-    The ~1.5 hour figure above is CDK/CloudFormation provisioning time only. On a fresh machine or first-time deploy, budget additional time on top of that for: installing `mise`-managed toolchains, `uv sync`/`pnpm install`, Smithy/Gradle codegen (`make generate` — first run downloads Gradle wrappers, openapi-generator, and builds TypeScript clients from scratch), Docker image builds, and CDK bootstrap. Subsequent deploys after initial setup are faster since dependencies and generated artifacts are cached, though CloudFormation provisioning time for a fresh set of stacks remains similar.
+    The deploy time above is CDK/CloudFormation provisioning time only. On a fresh machine or first-time deploy, budget additional time on top of that for: installing `mise`-managed toolchains, `uv sync`/`pnpm install`, Smithy/Gradle codegen (`make generate` — first run downloads Gradle wrappers, openapi-generator, and builds TypeScript clients from scratch), Docker image builds, and CDK bootstrap. Subsequent deploys after initial setup are faster since dependencies and generated artifacts are cached, though CloudFormation provisioning time for a fresh set of stacks remains similar.
 
 ### The Databricks SQL Warehouse connector
 
-`DATABRICKS_SQL_WAREHOUSE` sources are served by **one connector Lambda that Context Ontology Accelerator operates**, deployed from its own CDK app rather than as one of the 16 stacks above. It is not optional and it is not per source: **a `DATABRICKS_SQL_WAREHOUSE` source cannot be registered at all until it exists.** Source creation resolves the connector's function ARN from an SSM parameter the connector's own stack publishes, and fails the create with a `400` naming the missing connector if that parameter is absent — so a deployment that skips this step advertises a source sub-type nothing can serve, and the first person to hit it is whoever tries to onboard a warehouse.
+`DATABRICKS_SQL_WAREHOUSE` sources are served by **one connector Lambda that Context Ontology Accelerator operates**, deployed from its own CDK app rather than as one of the 17 stacks above. It is not optional and it is not per source: **a `DATABRICKS_SQL_WAREHOUSE` source cannot be registered at all until it exists.** Source creation resolves the connector's function ARN from an SSM parameter the connector's own stack publishes, and fails the create with a `400` naming the missing connector if that parameter is absent — so a deployment that skips this step advertises a source sub-type nothing can serve, and the first person to hit it is whoever tries to onboard a warehouse.
 
-`make deploy-dev` deploys it for you, as a second step after the platform stacks:
+`make deploy-dev` deploys it for you. On a first deploy it starts once the platform stacks it reads from (network, serve and sources) are complete, and runs alongside the rest of the platform deploy. When the platform is already deployed, it runs after the platform update, as a second step:
 
 ```bash
-make deploy-dev          # platform stacks, then the connector
+make deploy-dev          # platform stacks and the connector
 ```
 
 To deploy or redeploy just the connector against an already-deployed environment:
@@ -377,7 +396,7 @@ make deploy-databricks-connector
 
 Both run `scripts/deploy-managed-databricks-connector.sh`, which installs the `connectors/` workspace, builds the connector's fat JAR with Maven, and deploys its stack.
 
-!!! important "The order is platform first, then connector — and it cannot be reversed"
+!!! important "The connector needs the platform's network, serve and sources stacks first — and the order cannot be reversed"
     The two deployments each read something the other publishes, in one direction only:
 
     - The connector's stack **reads Context Ontology Accelerator's serve and discovery role ARNs from SSM** (`/<prefix>/<env>/serve/runtime-role-arn` and `/<prefix>/<env>/sources/db-connector-role-arn`) to grant them `lambda:InvokeFunction`, spill-bucket reads and `kms:Decrypt` on its spill key. Those parameters are written by the platform stacks, so the connector cannot synthesize before they exist.
@@ -416,6 +435,9 @@ SCL_PREFIX=myproject make deploy-dev
 # Use an existing VPC
 SCL_VPC_ID=vpc-abc123 make deploy-dev
 
+# Stacks CloudFormation deploys in parallel (default: 3); 1 deploys one stack at a time
+SCL_CDK_CONCURRENCY=1 make deploy-dev
+
 # SMUS admin principal(s) — override the account's `Admin` role fallback.
 # Comma-separated IAM role/user ARN(s) that human admins federate into to
 # access the SageMaker Unified Studio console. Required on any account that
@@ -434,7 +456,25 @@ SCL_API_DOMAIN=api.ontology.example.com \
 SCL_API_CERT_ARN=arn:aws:acm:us-west-2:123456789012:certificate/api-cert-id \
 SCL_HOSTED_ZONE_ID=Z0123456789ABCDEFGHIJ \
 make deploy-dev
+
+# Optional OoPS! ontology pitfall scan (off by default) — see the note below
+SCL_OOPS_ENDPOINT=https://oops.example.internal/rest make deploy-dev
 ```
+
+!!! warning "The OoPS! pitfall scan sends your ontology to the endpoint you configure"
+    Tier-3 ontology validation can run the OoPS! (OntOlogy Pitfall Scanner)
+    pitfall scanner. To do so it POSTs the whole serialised ontology to the configured endpoint:
+    class and property names, labels, comments, and other literal values such as
+    sampled distinct values. It is therefore **off by default** — with no endpoint
+    configured, validation makes no outbound request and reports one `info` finding,
+    `OOPS_NOT_CONFIGURED`, while the rest of Tier 3 runs as usual.
+
+    To enable it, set `SCL_OOPS_ENDPOINT` (or pass `-c oops_endpoint=<url>` to
+    `cdk deploy`); the deploy sets `OOPS_ENDPOINT` on the ontology-engine container.
+    The value must be an `https://` URL (synth fails otherwise). Point it at a
+    self-hosted OoPS! instance unless you are content for your schema to leave your
+    network. Releases before this one defaulted to the public OoPS! service;
+    deployments that relied on that must now set the endpoint explicitly.
 
 !!! note "Custom domain certificate regions"
     `SCL_UI_CERT_ARN` must be an ACM certificate in `us-east-1` (CloudFront requirement) regardless of your deploy region. `SCL_API_CERT_ARN` must be in the same region you're deploying to (API Gateway requirement). CDK validates both at synth time and fails fast with a clear error if either is in the wrong region.
@@ -663,6 +703,7 @@ when tuning a large or pathological source.
 
 | Variable | Set By | Purpose |
 |----------|--------|---------|
+| `OOPS_ENDPOINT` | `ontology-stack.ts`, from the `oops_endpoint` context | REST endpoint of the OoPS! pitfall scanner used by Tier-3 ontology validation. **Unset by default**, which turns the scan off (no outbound request). When set, the serialised ontology is sent to it — see *Configuration Options*. |
 | `SCL_MCP_MODE` | `mcp-stack.ts` | Switches the container entrypoint between Context Manager (default) and MCP Server. When set to `"true"`, the container starts in MCP mode. |
 | `BULK_REVIEW_PAGE_BUDGET` | `worker.py` default | Per-invocation table budget for the bulk-review worker (default `1000`); when a source has more tables, the worker processes one page, re-enqueues a continuation, and resumes across chained invocations rather than silently capping. |
 | `BULK_REVIEW_WALL_CLOCK_BUDGET_S` | `worker.py` default | Per-invocation wall-clock budget in seconds (default `240`), a second guard under the 5-minute Lambda timeout that stops the worker after the current search page and continues in a fresh invocation when neared. |
@@ -1356,6 +1397,7 @@ group most easily missed when scoping IAM permissions or regional availability.
 | **Amazon Redshift Data API** | Querying Redshift-backed sources | `packages/context-manager/.../clients/redshift_data.py` |
 | **AWS Secrets Manager** | Data-source credentials (e.g. JDBC) | `packages/sources`, `packages/context-manager` |
 | **AWS STS** | Role assumption and caller identity across services | Widely used (~10 modules) |
+| **OoPS! (third party, optional)** | Ontology pitfall scan in Tier-3 validation. Off unless `OOPS_ENDPOINT` is configured; when on, receives the serialised ontology | `packages/ontology-engine/.../validation/validators/tier3.py` |
 
 
 ### A.3 Quotas to check before deploying
@@ -1372,7 +1414,7 @@ own applied values with the commands that follow.
 
 | Service | Quota (code) | AWS default | Why it matters here |
 |---------|--------------|-------------|---------------------|
-| **VPC** | VPCs per Region (`L-F678F1CE`) | 5 | Deploy creates one VPC unless `SCL_VPC_ID` is set. Preflight-checked — see [Service Quotas](#service-quotas) |
+| **VPC** | VPCs per Region (`L-F678F1CE`) | 5 | A first deploy creates one VPC unless `SCL_VPC_ID` is set; updates reuse it. Preflight-checked — see [Service Quotas](#service-quotas) |
 | **Lambda** | Concurrent executions (`L-B99A9384`) | 1,000 (10 on some new accounts) | Two functions reserve concurrency (default 5 each). Preflight-checked — see [Lambda reserved concurrency](#lambda-reserved-concurrency) |
 | **ECS / Fargate** | Fargate On-Demand vCPU resource count (`L-3032A538`) | **6** | **The tightest fit here.** Tasks are 2 vCPU / 8 GB and 4 vCPU / 16 GB, and VKG runs one service **per namespace** — so a single enrichment task plus two namespaces' VKG services can exhaust the default |
 | **OpenSearch Serverless** | Indexing max OCU (`L-50FA809B`), search max OCU (`L-4E98D4EB`) | 10 each | The collection runs with standby replicas enabled, which roughly doubles OCU consumption — see [A.4](#a4-considerations) |
@@ -1382,7 +1424,7 @@ own applied values with the commands that follow.
 | **Amazon Textract** | `DetectDocumentText` TPS (`L-75788A8B`) | 25 | Only relevant if ingesting scanned documents at volume |
 
 Quotas that are **not** worth checking, having confirmed the headroom: the deploy
-creates 16 CloudFormation stacks against a default of 2,000 (`L-0485CB21`), about
+creates 17 CloudFormation stacks plus the connector's against a default of 2,000 (`L-0485CB21`), about
 11 S3 buckets against a far higher bucket limit, and consumes ENIs against a
 default of 5,000 per Region (`L-DF5E4CA3`). A single NAT gateway
 (`natGateways: 1`, `maxAzs: 2`) means one Elastic IP. AgentCore's slow ENI
@@ -1436,11 +1478,6 @@ rest, and 7-day backups. Deletion protection is enabled **only** when
 `envName === "prod"`. Two consequences for a `dev` deploy: there is no
 availability guarantee from a second instance, and the cluster is deletable — so
 `make destroy-dev` will remove the graph and its data irreversibly.
-
-**Neptune and OpenSearch dominate deploy time.** They, plus AgentCore Runtime
-setup and cross-stack SSM waits, are why a fresh deploy takes ~1.5 hours. A
-deploy that looks stuck is usually waiting on one of them — check
-`aws cloudformation list-stacks` before intervening.
 
 **Teardown is not symmetric with deploy.** AgentCore Runtime provisions ENIs
 outside CloudFormation and can hold them for hours to days after runtime

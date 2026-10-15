@@ -45,7 +45,7 @@ def _dispatch(body: WorkbenchInductionRequest):
     UnstructuredInductionRequest it was called with."""
     with (
         patch.object(induce_catalog, "dynamo_store", autospec=True),
-        patch("coa_ontology.inducer.routers.induce_unstructured.start_induction") as mock_unstructured,
+        patch("coa_ontology.inducer.routers.induce_unstructured.start_unstructured_job") as mock_unstructured,
     ):
         mock_unstructured.return_value = SimpleNamespace(job_id="j", status="pending")
         # graph_arn must satisfy UnstructuredInductionRequest's SSRF-guard

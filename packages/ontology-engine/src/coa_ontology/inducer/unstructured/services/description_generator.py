@@ -49,6 +49,15 @@ from __future__ import annotations
 import logging
 from typing import Protocol, runtime_checkable
 
+from coa_common.language_tags import (
+    DEFAULT_LANGUAGE,
+    LanguageTagError,
+    describe_language,
+    needs_language_instruction,
+)
+
+from coa_ontology.inducer.services.generated_text import join_list, join_parts, render
+
 log = logging.getLogger(__name__)
 
 # Maximum number of entity labels included in the LLM prompt per class.
@@ -68,6 +77,36 @@ _SYSTEM_PROMPT = (
     "lists, no quotation marks around the response. Describe only what the "
     "given examples suggest; do not invent unrelated facts."
 )
+
+
+def _system_prompt(base: str, namespace_language: str) -> str:
+    """Return a trusted system prompt for the namespace language.
+
+    An English namespace (primary subtag ``en``) gets ``base`` unchanged. Any
+    other language appends a fixed output-language instruction. The instruction
+    is application control text, so it sits in the system prompt; class and
+    entity labels stay in the user prompt. Only a canonical tag and a language
+    name from a fixed table are interpolated.
+
+    An unsupported tag also gets ``base`` unchanged, as the fixed-text
+    templates fall back to English. A route never passes one: it canonicalizes
+    the namespace language when it resolves it.
+    """
+    try:
+        instruct = needs_language_instruction(namespace_language)
+    except LanguageTagError:
+        instruct = False
+    if not instruct:
+        return base
+    target = describe_language(namespace_language)
+    return (
+        base + "\n\nOutput language:\n"
+        f"- Write the description in {target}, the language of this knowledge graph.\n"
+        "- Keep class labels, entity labels, predicate names, model numbers, product names, units and "
+        "codes exactly as given. Do not translate or transliterate them.\n"
+        "- These instructions are in English for your benefit; do not treat them as evidence about "
+        "the language of the output."
+    )
 
 
 @runtime_checkable
@@ -112,7 +151,7 @@ def _build_user_prompt(class_label: str, labels: list[str]) -> str:
     )
 
 
-def _fallback_description(labels: list[str]) -> str:
+def _fallback_description(labels: list[str], namespace_language: str = DEFAULT_LANGUAGE) -> str:
     """Build the deterministic fallback description.
 
     The fallback lists the lexicographically smallest ``FALLBACK_TOP_N`` labels
@@ -123,15 +162,17 @@ def _fallback_description(labels: list[str]) -> str:
 
     Args:
         labels: Entity surface-form labels for the class.
+        namespace_language: Namespace language; selects the reviewed template.
 
     Returns:
         A string of the form
-        ``"Class representing {N} entities including: {top-5-alphabetical-labels}"``.
+        ``"Class representing {N} entities including: {top-5-alphabetical-labels}"``
+        (or its reviewed Japanese version).
     """
     n = len(labels)
     sorted_labels = sorted(labels, key=str.casefold)
     top = sorted_labels[:FALLBACK_TOP_N]
-    return f"Class representing {n} entities including: {', '.join(top)}"
+    return render("class_fallback_entities", namespace_language, count=n, labels=join_list(top, namespace_language))
 
 
 def _post_process_response(text: str) -> str:
@@ -157,6 +198,7 @@ def _post_process_response(text: str) -> str:
 def generate_descriptions(
     class_entities: dict[str, list[str]],
     llm_client: LLMDescriptionClient,
+    namespace_language: str = DEFAULT_LANGUAGE,
 ) -> dict[str, str]:
     """Generate ``rdfs:comment`` descriptions for each class via an LLM.
 
@@ -176,6 +218,8 @@ def generate_descriptions(
             ``["Treasury Bond", "Corporate Note", ...]``). NOT entity IDs.
         llm_client: Any object satisfying the ``LLMDescriptionClient`` Protocol
             — i.e. exposing ``generate(prompt, system, max_tokens) -> str``.
+        namespace_language: Namespace language. A non-English namespace adds an
+            output-language instruction and uses the reviewed fallback text.
 
     Returns:
         Mapping from each input classification string to a non-empty
@@ -204,12 +248,12 @@ def generate_descriptions(
                 "Class '%s' has no entity labels — using fallback description",
                 class_label,
             )
-            descriptions[class_label] = _fallback_description(labels)
+            descriptions[class_label] = _fallback_description(labels, namespace_language)
             continue
 
         prompt = _build_user_prompt(class_label, labels)
         try:
-            raw = llm_client.generate(prompt, system=_SYSTEM_PROMPT)
+            raw = llm_client.generate(prompt, system=_system_prompt(_SYSTEM_PROMPT, namespace_language))
         except Exception as exc:  # noqa: BLE001 — broad on purpose; see docstring.
             log.warning(
                 "LLM call failed for class '%s' (%s: %s) — using fallback",
@@ -217,7 +261,7 @@ def generate_descriptions(
                 type(exc).__name__,
                 exc,
             )
-            descriptions[class_label] = _fallback_description(labels)
+            descriptions[class_label] = _fallback_description(labels, namespace_language)
             continue
 
         cleaned = _post_process_response(raw)
@@ -226,7 +270,7 @@ def generate_descriptions(
                 "LLM returned empty response for class '%s' — using fallback",
                 class_label,
             )
-            descriptions[class_label] = _fallback_description(labels)
+            descriptions[class_label] = _fallback_description(labels, namespace_language)
             continue
 
         descriptions[class_label] = cleaned
@@ -352,6 +396,7 @@ def _entity_contexts_to_label_list(
 def generate_descriptions_with_context(
     class_contexts: dict[str, list[EntityContext]],
     llm_client: LLMDescriptionClient,
+    namespace_language: str = DEFAULT_LANGUAGE,
 ) -> dict[str, str]:
     """Enriched variant of :func:`generate_descriptions`.
 
@@ -374,6 +419,7 @@ def generate_descriptions_with_context(
         class_contexts: Mapping from classification string to a list of
             :class:`EntityContext` records.
         llm_client: Any object satisfying the ``LLMDescriptionClient`` Protocol.
+        namespace_language: Namespace language, as for :func:`generate_descriptions`.
 
     Returns:
         Mapping from each input classification string to a non-empty
@@ -404,12 +450,12 @@ def generate_descriptions_with_context(
                 "Class '%s' has no entity contexts — using fallback description",
                 class_label,
             )
-            descriptions[class_label] = _fallback_description(labels_for_fallback)
+            descriptions[class_label] = _fallback_description(labels_for_fallback, namespace_language)
             continue
 
         prompt = _build_enriched_user_prompt(class_label, contexts)
         try:
-            raw = llm_client.generate(prompt, system=_ENRICHED_SYSTEM_PROMPT)
+            raw = llm_client.generate(prompt, system=_system_prompt(_ENRICHED_SYSTEM_PROMPT, namespace_language))
         except Exception as exc:  # noqa: BLE001
             log.warning(
                 "Enriched LLM call failed for class '%s' (%s: %s) — using fallback",
@@ -417,7 +463,7 @@ def generate_descriptions_with_context(
                 type(exc).__name__,
                 exc,
             )
-            descriptions[class_label] = _fallback_description(labels_for_fallback)
+            descriptions[class_label] = _fallback_description(labels_for_fallback, namespace_language)
             continue
 
         cleaned = _post_process_response(raw)
@@ -426,7 +472,7 @@ def generate_descriptions_with_context(
                 "Enriched LLM returned empty response for class '%s' — using fallback",
                 class_label,
             )
-            descriptions[class_label] = _fallback_description(labels_for_fallback)
+            descriptions[class_label] = _fallback_description(labels_for_fallback, namespace_language)
             continue
 
         descriptions[class_label] = cleaned
@@ -544,7 +590,7 @@ def _build_schema_user_prompt(ctx: ClassSchemaContext) -> str:
     return "\n".join(lines)
 
 
-def _schema_fallback_description(ctx: ClassSchemaContext) -> str:
+def _schema_fallback_description(ctx: ClassSchemaContext, namespace_language: str = DEFAULT_LANGUAGE) -> str:
     """Deterministic fallback for the schema mode.
 
     Falls back to a brief textual summary of the top edges, e.g.:
@@ -555,23 +601,25 @@ def _schema_fallback_description(ctx: ClassSchemaContext) -> str:
     If neither outgoing nor incoming edges are present, falls back to a
     minimal "Class with no observed inter-class relationships." sentence.
     """
+    lang = namespace_language
     top_out = ctx.outgoing[:FALLBACK_TOP_N]
     top_in = ctx.incoming[:FALLBACK_TOP_N]
     if not top_out and not top_in:
-        return f"Class {ctx.class_label!r} with no observed inter-class relationships."
+        return render("class_fallback_no_relationships", lang, label=ctx.class_label)
     parts: list[str] = []
     if top_out:
-        preds = ", ".join(sorted({e.predicate for e in top_out}))
-        parts.append(f"connected outgoing via {preds}")
+        preds = join_list(sorted({e.predicate for e in top_out}), lang)
+        parts.append(render("class_fallback_outgoing", lang, predicates=preds))
     if top_in:
-        preds = ", ".join(sorted({e.predicate for e in top_in}))
-        parts.append(f"and connected incoming via {preds}")
-    return f"Class {ctx.class_label!r} with edges " + " ".join(parts) + "."
+        preds = join_list(sorted({e.predicate for e in top_in}), lang)
+        parts.append(render("class_fallback_incoming", lang, predicates=preds))
+    return render("class_fallback_edges", lang, label=ctx.class_label, edges=join_parts(parts, lang))
 
 
 def generate_descriptions_with_schema(
     class_schemas: dict[str, ClassSchemaContext],
     llm_client: LLMDescriptionClient,
+    namespace_language: str = DEFAULT_LANGUAGE,
 ) -> dict[str, str]:
     """Schema-context variant of :func:`generate_descriptions`.
 
@@ -593,6 +641,7 @@ def generate_descriptions_with_schema(
         class_schemas: Mapping from class label to its
             :class:`ClassSchemaContext`.
         llm_client: Any object satisfying :class:`LLMDescriptionClient`.
+        namespace_language: Namespace language, as for :func:`generate_descriptions`.
 
     Returns:
         Mapping from each input class label to a non-empty description.
@@ -619,12 +668,12 @@ def generate_descriptions_with_schema(
                 "Class %r has no schema edges — using fallback description",
                 class_label,
             )
-            descriptions[class_label] = _schema_fallback_description(ctx)
+            descriptions[class_label] = _schema_fallback_description(ctx, namespace_language)
             continue
 
         prompt = _build_schema_user_prompt(ctx)
         try:
-            raw = llm_client.generate(prompt, system=_SCHEMA_SYSTEM_PROMPT)
+            raw = llm_client.generate(prompt, system=_system_prompt(_SCHEMA_SYSTEM_PROMPT, namespace_language))
         except Exception as exc:  # noqa: BLE001
             log.warning(
                 "Schema LLM call failed for %r (%s: %s) — using fallback",
@@ -632,7 +681,7 @@ def generate_descriptions_with_schema(
                 type(exc).__name__,
                 exc,
             )
-            descriptions[class_label] = _schema_fallback_description(ctx)
+            descriptions[class_label] = _schema_fallback_description(ctx, namespace_language)
             continue
 
         cleaned = _post_process_response(raw)
@@ -641,7 +690,7 @@ def generate_descriptions_with_schema(
                 "Schema LLM returned empty response for %r — using fallback",
                 class_label,
             )
-            descriptions[class_label] = _schema_fallback_description(ctx)
+            descriptions[class_label] = _schema_fallback_description(ctx, namespace_language)
             continue
 
         descriptions[class_label] = cleaned

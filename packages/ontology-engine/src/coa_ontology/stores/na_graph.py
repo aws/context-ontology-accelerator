@@ -10,6 +10,8 @@ namespace to every call so the underlying queries filter on it.
 
 from __future__ import annotations
 
+from coa_common.label_language import LabelPreference
+
 from coa_ontology.catalog import na_store
 from coa_ontology.stores.base import GraphStore
 
@@ -222,7 +224,7 @@ class NeptuneAnalyticsGraphStore(GraphStore):
         return None
 
     # Vertex lookup ----------------------------------------------------
-    def get_vertex(self, vertex_uri, namespace=None):
+    def get_vertex(self, vertex_uri, namespace=None, *, label_preference=None):
         """Return None — Neptune Analytics has no cross-graph vertex lookup.
 
         Neptune Analytics doesn't expose a SPARQL surface, so this backend
@@ -241,6 +243,8 @@ class NeptuneAnalyticsGraphStore(GraphStore):
         exclude_ontology_id=None,
         limit=50,
         offset=0,
+        *,
+        label_preference=None,
     ):
         """Not supported on Neptune Analytics."""
         return []
@@ -257,7 +261,7 @@ class NeptuneAnalyticsGraphStore(GraphStore):
         return 0
 
     # Ontology overview ------------------------------------------------
-    def get_ontology_overview(self, ontology_id, namespace=None, *, sample=False):
+    def get_ontology_overview(self, ontology_id, namespace=None, *, sample=False, label_preference=None):
         """Not supported on Neptune Analytics — no SPARQL surface.
 
         Returns ``None`` so the catalog/graph router maps this to a 501,
@@ -278,6 +282,7 @@ class NeptuneAnalyticsGraphStore(GraphStore):
         *,
         max_results: int = 100,
         include_properties: bool = True,
+        label_preference: LabelPreference | None = None,
     ) -> dict:
         """Raise — Neptune Analytics has no bulk namespace schema query.
 
@@ -285,6 +290,7 @@ class NeptuneAnalyticsGraphStore(GraphStore):
             namespace: Namespace whose schema was requested.
             max_results: Unused; kept for protocol parity.
             include_properties: Unused; kept for protocol parity.
+            label_preference: Unused; kept for protocol parity.
 
         Raises:
             NotImplementedError: Always, on this backend.

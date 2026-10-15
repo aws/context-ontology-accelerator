@@ -39,9 +39,14 @@ def _rescan(item: dict[str, Any], trigger: str = ScanTrigger.MANUAL, event: dict
     item.setdefault("lastScanAt", (datetime.now(UTC) - timedelta(hours=2)).isoformat())
     mock_dao = MagicMock()
     mock_dao.get.return_value = item
+    # Every re-scan snapshots the namespace language from the namespace item; a
+    # legacy item without ``language`` resolves to ``en``.
+    mock_ns_dao = MagicMock()
+    mock_ns_dao.get.return_value = {"PK": f"NS#{_NAMESPACE_ID}", "SK": "METADATA"}
     mock_sqs = MagicMock()
     with (
         patch(f"{_SH}._get_dao", return_value=mock_dao),
+        patch(f"{_SH}._get_ns_dao", return_value=mock_ns_dao),
         patch(f"{_SH}._get_scan_dao", return_value=MagicMock()),
         patch(f"{_SH}._get_sqs", return_value=mock_sqs),
         patch(f"{_SH}._SCAN_QUEUE_URL", _QUEUE),

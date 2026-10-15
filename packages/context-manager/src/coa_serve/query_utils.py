@@ -692,7 +692,10 @@ def object_properties_sparql(
 
     Returns:
         A SPARQL SELECT binding ``?op ?opLabel ?domain ?domainLabel ?range
-        ?rangeLabel`` (plus ``?comment`` when requested).
+        ?rangeLabel`` (plus ``?comment`` when requested), and each label's tag as
+        ``?opLabelLang`` / ``?domainLabelLang`` / ``?rangeLabelLang``. A resource
+        with several labels yields one row per label; consumers group by URI and
+        choose the label with the request's namespace-language preference.
     """
     gate = ""
     if mapped_gate_iri:
@@ -717,6 +720,8 @@ def object_properties_sparql(
             ?range rdfs:label ?rangeLabel .
             OPTIONAL {{ ?op rdfs:label ?opLabel }}{comment_pattern}"""
     return f"""{SPARQL_PREFIXES}
-        SELECT ?op ?opLabel ?domain ?domainLabel ?range ?rangeLabel{comment_select} WHERE {{
+        SELECT ?op ?opLabel (LANG(?opLabel) AS ?opLabelLang)
+               ?domain ?domainLabel (LANG(?domainLabel) AS ?domainLabelLang)
+               ?range ?rangeLabel (LANG(?rangeLabel) AS ?rangeLabelLang){comment_select} WHERE {{
 {graph_scoped_body(body, graph_uri_prefix, graph_iris)}
         }} LIMIT {int(limit)}"""

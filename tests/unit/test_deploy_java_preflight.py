@@ -52,6 +52,7 @@ def _run(stub_dir: Path, *, include_system_path: bool = True) -> subprocess.Comp
         ('openjdk version "17.0.12" 2024-07-16', "17"),
         ('openjdk version "21.0.4" 2024-07-16 LTS', "21"),
         ('java version "21" 2023-09-19 LTS', "21"),
+        ('openjdk version "24.0.2" 2025-07-15', "24"),
     ],
 )
 def test_supported_java_versions_pass(tmp_path: Path, banner: str, major: str) -> None:
@@ -77,8 +78,27 @@ def test_legacy_java_8_is_reported_as_too_old(tmp_path: Path) -> None:
     result = _run(_stub_java(tmp_path, 'java version "1.8.0_412"'))
 
     assert result.returncode == 1
-    assert "Java 17+ required" in result.stdout
+    assert "Java 17-24 required" in result.stdout
     assert "found 8" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "banner",
+    [
+        'openjdk version "25" 2025-09-16',
+        'openjdk version "25.0.1" 2025-10-21 LTS',
+        'openjdk version "26-ea" 2026-03-17',
+    ],
+)
+def test_java_newer_than_the_federation_sdk_supports_is_rejected(tmp_path: Path, banner: str) -> None:
+    # brew install maven pulls in the newest OpenJDK, on which the Databricks connector's
+    # tests fail deep inside the bundled Netty; the preflight must refuse it up front.
+    result = _run(_stub_java(tmp_path, banner))
+
+    assert result.returncode == 1
+    assert "is not supported" in result.stdout
+    assert "Java 17-24 required, 21 recommended" in result.stdout
+    assert "java_home -v 21" in result.stdout
 
 
 def test_unrecognized_version_output_reports_parse_failure(tmp_path: Path) -> None:
@@ -86,7 +106,7 @@ def test_unrecognized_version_output_reports_parse_failure(tmp_path: Path) -> No
 
     assert result.returncode == 1
     assert "Could not parse the Java version" in result.stdout
-    assert "Java 17+ required" not in result.stdout
+    assert "required" not in result.stdout
 
 
 def test_failed_java_version_command_is_distinct_from_parse_failure(tmp_path: Path) -> None:

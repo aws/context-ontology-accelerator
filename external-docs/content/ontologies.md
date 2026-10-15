@@ -51,6 +51,96 @@ Grounding targets come from `groundingOntologyIds` (foundational/uploaded ontolo
 
 In `ENHANCED` mode the LLM reranker returns a small JSON verdict per class or table. Reasoning models spend part of their output budget on internal thinking before that JSON, so on a very long or complex source the answer can be truncated. When that happens the induction job **fails with a clear error** (rather than silently marking everything novel) and the error tells you to raise **`rerankMaxTokens`**. This optional `StartInduction` parameter caps the reranker's output-token budget; it defaults to `1000` (ample for the short verdict on all current models) and accepts `1`–`8192`. You only need to set it in the rare case that error names it — raise it (e.g. to `2000`) and re-run. It has no effect in `STANDARD` or `NONE` mode, which don't call the LLM.
 
+#### Namespace language
+
+Induction writes the text it generates, such as class descriptions,
+foreign-key notes and default proposal titles, in the
+[namespace language](namespaces.md#namespace-language). Table names, column
+names and source-authored metadata are kept as-is.
+
+- **Strategy:** `rigor_ontology` supports only English namespaces. In any other
+  namespace, **StartInduction** with that strategy returns `400` before a job
+  starts; use `table_to_ontology` instead.
+  - **Who this affects:** only namespaces whose language is not English. A
+    namespace's language is fixed at creation and every namespace created
+    before languages existed is `en`, so existing namespaces, their
+    `rigor_ontology` runs and their proposals are unchanged and need no
+    re-induction.
+  - **Switching:** in a non-English namespace, omit `strategy` or set it to
+    `table_to_ontology`, the default; the rest of the request is the same.
+    `table_to_ontology` builds classes from table and column names, matches them
+    against existing ontologies by embedding similarity and keeps the unmatched
+    ones. `rigor_ontology` instead asks an LLM to write and then review a Turtle
+    fragment per table, with related existing concepts as context. Its semantic
+    naming and grounding are not localized yet, which is why it is limited to
+    English namespaces.
+  - **Unstructured sources:** document induction (`unstructured_lexical_graph`)
+    is not limited by the namespace language.
+- **RDF language tags:** in a Japanese (`ja`), Korean (`ko`) or Chinese
+  (exactly `zh`) namespace, a generated literal written only in that
+  language's scripts carries the namespace tag, e.g. `"制御盤"@ja`. Catalog
+  descriptions, synonyms, glossary terms and tags are tagged only when COA
+  generated them, and a foreign-key note joined to a column's description only
+  when COA generated that description too. A literal that mixes in Latin
+  letters, such as `PLC制御盤`, stays untagged, as does every literal in a
+  namespace of another language. English namespaces produce the same untagged
+  output as before.
+
+#### Overriding grounding choices
+
+A pending proposal shows each class's grounding candidates in its **Grounding**
+tab. Select a candidate to replace the automatic choice, or choose **Mark novel
+(no grounding)** to keep the class independent. The selection is staged until
+you choose **Save changes**.
+
+The API exposes the same workflow through **UpdateProposal**. The modeled
+**GetProposal** output names the out-of-band match URL `matchesUrl`, while the
+current raw REST JSON still emits `matches_url`. Fetch that presigned URL to
+read the grounding candidates. Its JSON uses a `matches` envelope and raw
+artifact field names.
+
+```json
+{
+  "matches": [
+    {
+      "source_table_identity": "DS#sales::warehouse.public.orders",
+      "source_table": "orders",
+      "candidates": [
+        { "entity_uri": "https://schema.org/Order" }
+      ]
+    }
+  ]
+}
+```
+
+These nested fields are part of the match artifact, not `ProposalMetadata`.
+Use `source_table_identity` as the `groundingOverrides` or `novelTables` key
+when it is present. Fall back to `source_table` only when that table name is
+unique in the proposal. Use the selected `candidates[].entity_uri` as the
+grounding override value. An ambiguous bare table name returns `409 Conflict`
+and saves nothing.
+
+```json
+{
+  "proposalId": "7c2e9a1b-4d6f-4b8a-9e3c-1f0a2b5d7c9e",
+  "groundingOverrides": {
+    "DS#sales::warehouse.public.orders": "https://schema.org/Order"
+  },
+  "novelTables": ["DS#sales::warehouse.public.customers"]
+}
+```
+
+To keep a table novel, list it in `novelTables`. `groundingOverrides` values
+must be class URIs: a `null` value, which earlier releases accepted as "mark
+novel", now returns `422 Unprocessable Entity` and saves nothing. Clients that
+sent `"groundingOverrides": {"orders": null}` should send
+`"novelTables": ["orders"]` instead, using the same key. A key cannot appear in
+both fields.
+
+Grounding choices rebuild the generated ontology and mappings. Save them in a
+separate request from `ontologyTurtle` or `r2rmlTurtle` edits; the service
+rejects a mixed request and saves neither change.
+
 ### Manual Upload
 
 Upload an existing ontology file:
@@ -67,6 +157,61 @@ optional `groundingOntologyIds` / `groundingMode`, defaulting to `ENHANCED`)
 are each separate calls. See **CreateOntology**, **UploadOntology**, and
 **StartInduction** in the [API Reference](#/api-reference) for the full
 request/response schemas.
+
+### Saving large proposal edits
+
+The console uses this workflow automatically when a user saves edited proposal
+Turtle. Direct API clients can use the same workflow so large `ontologyTurtle`
+or `r2rmlTurtle` revisions do not have to fit in the API proxy's 6 MB request
+payload.
+
+1. Call **GetProposalUploadUrls** for the pending proposal. Its camelCase
+   response contains a `revisionId` plus separate `ontologyPutUrl` and
+   `r2rmlPutUrl` targets.
+2. Upload each changed Turtle artifact directly to its URL with an HTTP `PUT`,
+   `Content-Type: text/turtle`, and `If-None-Match: *`. The precondition is a
+   required signed S3 header. The URL carries its own authorization, so do not
+   send the control-plane authorization header to S3.
+3. After every requested PUT succeeds, call **UpdateProposal** with the same
+   `revisionId` as `uploadRevisionId`. Set `ontologyUploaded`, `r2rmlUploaded`,
+   or both to `true` to match the artifacts you uploaded.
+
+A shortened ontology-only request follows.
+
+```text
+POST /namespaces/<namespaceId>/proposals/<proposalId>/upload-url
+{}
+
+200 OK
+{
+  "revisionId": "d3bc58e9-52a4-43cf-b8b2-44a2f05b43f8",
+  "ontologyPutUrl": "https://<signed-s3-url>",
+  "r2rmlPutUrl": "https://<signed-s3-url>"
+}
+
+PUT <ontologyPutUrl>
+Content-Type: text/turtle
+If-None-Match: *
+
+<revised ontology Turtle>
+
+POST /namespaces/<namespaceId>/proposals/update
+{
+  "proposalId": "<proposalId>",
+  "ontologyUploaded": true,
+  "uploadRevisionId": "d3bc58e9-52a4-43cf-b8b2-44a2f05b43f8"
+}
+```
+
+Each artifact URL permits one successful object creation. If a PUT returns 409
+or 412, or its network outcome is ambiguous, request a fresh revision and
+re-upload every changed artifact. Do not reuse the earlier URLs or continue to
+**UpdateProposal** with an uncertain write outcome.
+
+**UpdateProposal** reads and validates the created bytes before it points the
+proposal at that revision. A missing or invalid artifact leaves the proposal's
+current revision unchanged. Keep grounding-choice changes in a separate
+**UpdateProposal** request.
 
 ## Ontology Lifecycle
 

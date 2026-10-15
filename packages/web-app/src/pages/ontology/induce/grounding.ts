@@ -15,7 +15,12 @@
  * (``source_table``), so a class row is mapped to its match by resolving the
  * class → source-table link from the R2RML mapping.
  */
-import { splitStatements, stripComments } from "../../../utils/turtleLexer";
+import { splitStatements, stripComments } from "@utils/turtleLexer";
+import {
+  LETTER_NUMBER_RANGES,
+  MARK_RANGES,
+  SYMBOL_RANGES,
+} from "./unicodeCategoryRanges";
 
 export interface MatchCandidate {
   entity_uri: string;
@@ -27,6 +32,7 @@ export interface MatchCandidate {
 
 export interface ConceptMatch {
   source_table: string;
+  source_table_identity?: string | null;
   source_column: string;
   matched_class_uri?: string | null;
   matched_ontology_id?: string | null;
@@ -68,6 +74,7 @@ function parseConceptMatch(value: unknown): ConceptMatch | null {
   if (!isRecord(value)) return null;
   const {
     source_table,
+    source_table_identity,
     source_column,
     matched_class_uri,
     matched_ontology_id,
@@ -87,6 +94,11 @@ function parseConceptMatch(value: unknown): ConceptMatch | null {
     : null;
   return {
     source_table,
+    source_table_identity:
+      typeof source_table_identity === "string" ||
+      source_table_identity === null
+        ? source_table_identity
+        : undefined,
     source_column: typeof source_column === "string" ? source_column : "",
     matched_class_uri:
       typeof matched_class_uri === "string" || matched_class_uri === null
@@ -108,6 +120,11 @@ function parseConceptMatch(value: unknown): ConceptMatch | null {
     reason: typeof reason === "string" || reason === null ? reason : undefined,
     candidates: parsedCandidates,
   };
+}
+
+/** Stable key for a grounding match, with a legacy bare-table fallback. */
+export function conceptMatchKey(match: ConceptMatch): string {
+  return match.source_table_identity || match.source_table;
 }
 
 /**
@@ -186,21 +203,6 @@ export function ontologyLabel(ontologyId: string | null | undefined): string {
   return ontologyId.split("/").slice(-2).join("/");
 }
 
-/**
- * Table-level matches only (a class row corresponds to a table, not a column).
- * Keyed by ``source_table`` for O(1) lookup from a class row.
- */
-export function tableMatchesByTable(
-  matches: ConceptMatch[],
-): Map<string, ConceptMatch> {
-  const map = new Map<string, ConceptMatch>();
-  for (const m of matches) {
-    if (m.source_column) continue; // column-level, not a table match
-    map.set(m.source_table, m);
-  }
-  return map;
-}
-
 // ─── Class-row → ConceptMatch resolution ────────────────────────────
 //
 // Grounding candidates are keyed per-TABLE (``ConceptMatch.source_table``,
@@ -214,13 +216,13 @@ export function tableMatchesByTable(
 // ``#TriplesMap_X/SubjectMap`` IRI and ``rr:tableName`` on the
 // ``rr:logicalTable`` blank node of ``#TriplesMap_X`` in SEPARATE
 // blank-line-delimited blocks, so they never co-occur. Two complementary,
-// layout-independent strategies replace it (tried in order):
-//   1. Primary — normalized-name match. Normalize BOTH the class local name
-//      and every ``source_table`` to a canonical key (strip non-alphanumerics,
-//      lowercase) and join on it. Independent of the R2RML entirely.
-//   2. Fallback — TriplesMap-id join over the WHOLE R2RML. Key both predicates
-//      by the ``TriplesMap_X`` id embedded in the subject IRI and join
-//      class→table→match. Exact; also disambiguates normalized-key collisions.
+// layout-independent strategies replace it:
+//   1. When R2RML provenance exists, a TriplesMap-id join over the WHOLE
+//      document resolves class→datasource/schema/table→match. This exact link
+//      must take precedence when same-named tables collide.
+//   2. Without R2RML provenance, normalize BOTH the class local name and every
+//      ``source_table`` to a canonical key (strip non-alphanumerics, lowercase)
+//      and join only when that key is unique.
 
 /**
  * Extract the class local name from a (possibly prefixed / full-IRI) subject.
@@ -232,17 +234,153 @@ export function tableMatchesByTable(
 export function classLocalName(subject: string): string {
   const afterFragment = subject.split(/[#/]/).pop() ?? subject;
   const colon = afterFragment.lastIndexOf(":");
-  return colon >= 0 ? afterFragment.slice(colon + 1) : afterFragment;
+  const localName = colon >= 0 ? afterFragment.slice(colon + 1) : afterFragment;
+  try {
+    return decodeURIComponent(localName);
+  } catch {
+    // Preserve malformed external IRIs literally; matching can fail safely.
+    return localName;
+  }
 }
 
 /**
- * Canonical key for name matching: strip everything that is not a letter or
- * digit and lowercase. Inverts the inducer's ``to_pascal`` transform for
- * comparison purposes (``clinical_trial`` → ``clinicaltrial`` ←
- * ``ClinicalTrial``; ``Policy_Amount``/``PolicyAmount`` → ``policyamount``).
+ * Canonical key for name matching: strip separators and punctuation, preserve
+ * symbols literally, then apply simple one-code-point case identity. Inverts
+ * the inducer's ``to_pascal`` transform for comparison purposes
+ * (``clinical_trial`` → ``clinicaltrial`` ← ``ClinicalTrial``;
+ * ``Policy_Amount``/``PolicyAmount`` → ``policyamount``).
+ *
+ * Letters, digits, symbols, and combining marks attached to those base
+ * characters are kept in **every** script. Unicode TAG characters attached to
+ * a retained base are also kept so subdivision flags remain distinct. Orphan
+ * marks and TAG characters are discarded. Keeping symbols prevents
+ * compatibility identities such as ``℃``/``™`` from collapsing onto plain
+ * ``C``/``TM`` or the empty key.
+ *
+ * Canonical composition runs before filtering so NFC and NFD spellings share a
+ * key. Marks that do not compose — such as Devanagari and Thai vowel signs —
+ * remain part of the key instead of collapsing distinct words. Recomposition
+ * after filtering also makes punctuation-separated Jamo a one-pass operation.
+ * Ordinary lowercase preserves compatibility symbols and expansion-prone
+ * letters; Greek final sigma is the sole explicit caseless mapping. Width
+ * folding is limited to direct U+FFxx width counterparts, so fullwidth ASCII
+ * and halfwidth Katakana join ordinary-width forms without recursively
+ * compatibility-expanding FULLWIDTH MACRON or halfwidth Hangul.
+ *
+ * Must stay in step with ``class_grounding.py::_normalize_name_key``: the join
+ * works only because both sides produce the same key, so changing one alone
+ * breaks the very thing it exists for. Generated Unicode 15.0 ranges prevent
+ * the browser and Python runtime from assigning different categories to a new
+ * code point.
  */
+const NAME_KEY_JOIN_CONTROLS = new Set(["\u200c", "\u200d"]);
+const NAME_KEY_TAG_MIN = 0xe0020;
+const NAME_KEY_TAG_MAX = 0xe007f;
+
+function codePointInRanges(
+  codePoint: number,
+  ranges: ReadonlyArray<readonly [number, number]>,
+): boolean {
+  let low = 0;
+  let high = ranges.length - 1;
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    const [start, end] = ranges[middle];
+    if (codePoint < start) {
+      high = middle - 1;
+    } else if (codePoint > end) {
+      low = middle + 1;
+    } else {
+      return true;
+    }
+  }
+  return false;
+}
+
+function filterNameKeyCharacters(value: string): string {
+  let filtered = "";
+  let hasBase = false;
+
+  for (const character of value) {
+    const codePoint = character.codePointAt(0);
+    if (
+      codePoint !== undefined &&
+      (codePointInRanges(codePoint, LETTER_NUMBER_RANGES) ||
+        codePointInRanges(codePoint, SYMBOL_RANGES))
+    ) {
+      filtered += character;
+      hasBase = true;
+      continue;
+    }
+    if (codePoint !== undefined && codePointInRanges(codePoint, MARK_RANGES)) {
+      if (hasBase) filtered += character;
+      continue;
+    }
+    if (NAME_KEY_JOIN_CONTROLS.has(character) && hasBase) {
+      filtered += character;
+      continue;
+    }
+    if (
+      codePoint !== undefined &&
+      codePoint >= NAME_KEY_TAG_MIN &&
+      codePoint <= NAME_KEY_TAG_MAX &&
+      hasBase
+    ) {
+      filtered += character;
+      continue;
+    }
+    hasBase = false;
+  }
+
+  return filtered;
+}
+
+const HALFWIDTH_HANGUL_RANGES: ReadonlyArray<
+  readonly [number, number, number]
+> = [
+  [0xffa1, 0xffbe, 0x3131],
+  [0xffc2, 0xffc7, 0x314f],
+  [0xffca, 0xffcf, 0x3155],
+  [0xffd2, 0xffd7, 0x315b],
+  [0xffda, 0xffdc, 0x3161],
+];
+
+function foldWidthCharacter(character: string): string {
+  const codePoint = character.codePointAt(0);
+  if (codePoint === undefined) return character;
+  if (codePoint === 0xffa0) return "\u3164";
+  for (const [start, end, targetStart] of HALFWIDTH_HANGUL_RANGES) {
+    if (codePoint >= start && codePoint <= end) {
+      return String.fromCodePoint(targetStart + codePoint - start);
+    }
+  }
+  if (codePoint === 0xffe3) return "\u00af";
+  return character.normalize("NFKC");
+}
+
+function widthOnlyNfkc(value: string): string {
+  const folded = [...value.normalize("NFC")]
+    .map((character) => {
+      const codePoint = character.codePointAt(0);
+      return codePoint !== undefined &&
+        codePoint >= 0xff00 &&
+        codePoint <= 0xffef
+        ? foldWidthCharacter(character)
+        : character;
+    })
+    .join("");
+  return folded.normalize("NFC");
+}
+
+function simpleCaseIdentity(value: string): string {
+  return [...value]
+    .map((character) => (character === "ς" ? "σ" : character.toLowerCase()))
+    .join("");
+}
+
 export function normalizeNameKey(name: string): string {
-  return name.replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
+  const normalized = simpleCaseIdentity(widthOnlyNfkc(name));
+  return filterNameKeyCharacters(normalized).normalize("NFC");
 }
 
 /**
@@ -322,18 +460,63 @@ export function qualifiedSqlIdent(turtleLiteral: string): string {
 }
 
 /**
- * The TriplesMap local name embedded in an IRI, used as the join key.
+ * Return the first generated R2RML id after ``marker``: the TriplesMap or POM
+ * local name embedded in an IRI, used as the join key.
+ *
+ * Python's ``to_pascal`` producer emits Unicode letters, marks, numbers, and
+ * (for compatibility with external mappings) underscores, plus the ZWJ/ZWNJ and
+ * TAG characters it retains after a base (``unicode_normalization.py``).
+ * Parsing those characters through the same pinned Unicode 15.0 tables avoids
+ * JavaScript's ASCII-only ``\w`` behavior.
  *
  * The dot is part of the name, not a delimiter: the RIGOR strategy mints
  * ``TriplesMap_{schema}.{table}`` for a table whose bare name another datasource
- * shares (``inducer/strategies/base.py:subject_template_names``). A ``\w+``
- * class stops at the dot, so both twins keyed on ``public`` and the second
- * overwrote the first — re-fusing in the UI exactly the two tables the mapping
- * separated. ``/`` is excluded, which is what keeps a
- * ``TriplesMap_X/POM_Y/ObjectMap`` IRI resolving to ``X``.
+ * shares (``inducer/strategies/base.py:subject_template_names``). ``/`` is
+ * excluded, which is what keeps a ``TriplesMap_X/POM_Y/ObjectMap`` IRI
+ * resolving to ``X``.
  */
-const TRIPLES_MAP_ID = /TriplesMap_([\w.]+)/;
+function firstGeneratedR2rmlId(
+  text: string,
+  marker: "TriplesMap_" | "POM_",
+  fromIndex = 0,
+): { id: string; markerIndex: number; endIndex: number } | null {
+  const markerIndex = text.indexOf(marker, fromIndex);
+  if (markerIndex < 0) return null;
 
+  let id = "";
+  let endIndex = markerIndex + marker.length;
+  for (const character of text.slice(endIndex)) {
+    const codePoint = character.codePointAt(0);
+    const accepted =
+      character === "_" ||
+      character === "." ||
+      character === "\u200c" ||
+      character === "\u200d" ||
+      (codePoint !== undefined &&
+        ((codePoint >= 0xe0020 && codePoint <= 0xe007f) ||
+          codePointInRanges(codePoint, LETTER_NUMBER_RANGES) ||
+          codePointInRanges(codePoint, MARK_RANGES)));
+    if (!accepted) break;
+    id += character;
+    endIndex += character.length;
+  }
+  return id ? { id, markerIndex, endIndex } : null;
+}
+
+function allGeneratedR2rmlIds(
+  text: string,
+  marker: "TriplesMap_" | "POM_",
+): string[] {
+  const ids: string[] = [];
+  let fromIndex = 0;
+  while (fromIndex < text.length) {
+    const match = firstGeneratedR2rmlId(text, marker, fromIndex);
+    if (!match) break;
+    ids.push(match.id);
+    fromIndex = match.endIndex;
+  }
+  return ids;
+}
 /**
  * TriplesMap-id join over the whole R2RML. Returns ``classLocalName →
  * tableName`` regardless of how ``rr:class`` and ``rr:tableName`` are
@@ -345,10 +528,45 @@ export function classToTableFromR2rml(
   r2rmlTurtle: string | null | undefined,
 ): Map<string, string> {
   const result = new Map<string, string>();
+  for (const [cls, ref] of classToTableRefFromR2rml(r2rmlTurtle)) {
+    result.set(cls, ref.tableName);
+  }
+  return result;
+}
+
+interface R2rmlTableRef {
+  tableName: string;
+  datasourceId?: string;
+  sourceSchema?: string;
+}
+
+function turtleLiteralValue(literal: string): string {
+  const inner =
+    literal.length >= 2 && literal.startsWith('"') && literal.endsWith('"')
+      ? literal.slice(1, -1)
+      : literal;
+  return inner.replace(/\\(.)/g, "$1");
+}
+
+/**
+ * Resolve each class to the R2RML provenance that identifies its source table.
+ *
+ * ``rr:tableName`` alone is insufficient when two datasources both expose the
+ * same schema and table. The producer also annotates each TriplesMap with
+ * ``scl:datasourceId`` and ``scl:sourceSchema``; those values join against the
+ * stable identity without duplicating its hash-derived class naming here.
+ */
+function classToTableRefFromR2rml(
+  r2rmlTurtle: string | null | undefined,
+): Map<string, R2rmlTableRef> {
+  const result = new Map<string, R2rmlTableRef>();
   if (!r2rmlTurtle) return result;
 
   const triplesMapToClass = new Map<string, string>();
   const triplesMapToTable = new Map<string, string>();
+  const triplesMapToDatasource = new Map<string, string>();
+  const triplesMapToSchema = new Map<string, string>();
+  const triplesMapToLogicalSchema = new Map<string, string>();
 
   // Scan line by line, remembering the most recent ``TriplesMap_X`` id seen in
   // any IRI on the line; both ``rr:class`` and ``rr:tableName`` statements sit
@@ -356,8 +574,8 @@ export function classToTableFromR2rml(
   // different serialized blocks.
   let currentTriplesMap: string | null = null;
   for (const line of r2rmlTurtle.split("\n")) {
-    const idMatch = line.match(TRIPLES_MAP_ID);
-    if (idMatch) currentTriplesMap = idMatch[1];
+    const idMatch = firstGeneratedR2rmlId(line, "TriplesMap_");
+    if (idMatch) currentTriplesMap = idMatch.id;
 
     const classMatch = line.match(/rr:class\s+([^\s;,.\]]+)/);
     if (classMatch && currentTriplesMap) {
@@ -368,13 +586,46 @@ export function classToTableFromR2rml(
     // quotes) then unescape + strip SQL-delimiter quotes.
     const tableMatch = line.match(/rr:tableName\s+("(?:\\.|[^"\\])*")/);
     if (tableMatch && currentTriplesMap) {
-      triplesMapToTable.set(currentTriplesMap, unquoteSqlIdent(tableMatch[1]));
+      const segments = sqlIdentSegments(tableMatch[1]);
+      triplesMapToTable.set(currentTriplesMap, segments[segments.length - 1]);
+      if (segments.length >= 2) {
+        triplesMapToLogicalSchema.set(
+          currentTriplesMap,
+          segments[segments.length - 2],
+        );
+      }
+    }
+
+    const datasourceMatch = line.match(
+      /(?:scl|coa):datasourceId\s+("(?:\\.|[^"\\])*")/,
+    );
+    if (datasourceMatch && currentTriplesMap) {
+      triplesMapToDatasource.set(
+        currentTriplesMap,
+        turtleLiteralValue(datasourceMatch[1]),
+      );
+    }
+
+    const schemaMatch = line.match(
+      /(?:scl|coa):sourceSchema\s+("(?:\\.|[^"\\])*")/,
+    );
+    if (schemaMatch && currentTriplesMap) {
+      triplesMapToSchema.set(
+        currentTriplesMap,
+        turtleLiteralValue(schemaMatch[1]),
+      );
     }
   }
 
   for (const [tmId, cls] of triplesMapToClass) {
     const table = triplesMapToTable.get(tmId);
-    if (table) result.set(cls, table);
+    if (!table) continue;
+    result.set(cls, {
+      tableName: table,
+      datasourceId: triplesMapToDatasource.get(tmId),
+      sourceSchema:
+        triplesMapToSchema.get(tmId) ?? triplesMapToLogicalSchema.get(tmId),
+    });
   }
   return result;
 }
@@ -512,9 +763,9 @@ export function parseR2rmlByClass(
 
   const firstToken = (text: string): string => text.trim().split(/\s/)[0] ?? "";
   const tmIdOf = (text: string): string | null =>
-    text.match(TRIPLES_MAP_ID)?.[1] ?? null;
+    firstGeneratedR2rmlId(text, "TriplesMap_")?.id ?? null;
   const pomIdOf = (text: string): string | null =>
-    text.match(/POM_(\w+)/)?.[1] ?? null;
+    firstGeneratedR2rmlId(text, "POM_")?.id ?? null;
 
   for (const stmt of splitStatements(stripComments(r2rmlTurtle))) {
     const text = stmt.text;
@@ -543,10 +794,9 @@ export function parseR2rmlByClass(
     // The header lives on the TriplesMap subject, so ``tmId`` is set and each
     // POM id resolves to its composite ``TriplesMap_X/POM_Y`` key.
     if (tmId && /rr:predicateObjectMap/.test(text)) {
-      const keys: string[] = [];
-      const pomRe = /POM_(\w+)/g;
-      let m: RegExpExecArray | null;
-      while ((m = pomRe.exec(text)) !== null) keys.push(`${tmId}/POM_${m[1]}`);
+      const keys = allGeneratedR2rmlIds(text, "POM_").map(
+        (pomId) => `${tmId}/POM_${pomId}`,
+      );
       if (keys.length) mapToPomKeys.set(mapKey, keys);
     }
 
@@ -606,54 +856,136 @@ export function parseR2rmlByClass(
 
 /**
  * Build a resolver ``classSubject → ConceptMatch | null`` for the review
- * table. Primary strategy is the R2RML-independent normalized-name match; the
- * TriplesMap-id R2RML join is the fallback for the rare cases the name
- * transform can't be inverted (e.g. characters ``to_pascal`` drops, or two
- * tables that normalize to the same key).
+ * table. R2RML provenance is authoritative when present; normalized-name
+ * matching is used only for classes without an R2RML table reference.
  *
  * Only table-level matches (empty ``source_column``) participate. Classes with
  * no match resolve to ``null`` so the caller falls through to the
  * Turtle-derived badge instead of erroring.
  *
  * Collision handling: if two source tables normalize to the same key we do NOT
- * attach either by normalized name (ambiguous — could mis-attach); such tables
- * remain reachable via the R2RML fallback, which is exact.
+ * attach either by normalized name (ambiguous — could mis-attach). A bare-table
+ * R2RML fallback is allowed only for a unique legacy match that has no stable
+ * identity.
  */
+function uniqueMatchIndex(
+  matches: ConceptMatch[],
+  keyOf: (match: ConceptMatch) => string,
+): Map<string, ConceptMatch> {
+  const result = new Map<string, ConceptMatch>();
+  const ambiguous = new Set<string>();
+  for (const match of matches) {
+    const key = keyOf(match);
+    if (!key) continue;
+    if (result.has(key)) ambiguous.add(key);
+    else result.set(key, match);
+  }
+  for (const key of ambiguous) result.delete(key);
+  return result;
+}
+
+interface ParsedTableIdentity {
+  datasourceId?: string;
+  qualifier: string;
+}
+
+function parseTableIdentity(
+  identity: string,
+  tableName: string,
+): ParsedTableIdentity | null {
+  const separator = identity.indexOf("::");
+  const datasourceId =
+    separator >= 0 ? identity.slice(0, separator) : undefined;
+  const qualifiedName =
+    separator >= 0 ? identity.slice(separator + 2) : identity;
+  const tableStart = qualifiedName.length - tableName.length;
+  if (
+    tableStart < 0 ||
+    qualifiedName.slice(tableStart) !== tableName ||
+    (tableStart > 0 && qualifiedName[tableStart - 1] !== ".")
+  ) {
+    return null;
+  }
+  return {
+    datasourceId,
+    qualifier: tableStart > 0 ? qualifiedName.slice(0, tableStart - 1) : "",
+  };
+}
+
+function matchFitsR2rmlRef(match: ConceptMatch, ref: R2rmlTableRef): boolean {
+  if (match.source_table !== ref.tableName || !match.source_table_identity) {
+    return false;
+  }
+
+  const identity = parseTableIdentity(
+    match.source_table_identity,
+    match.source_table,
+  );
+  if (!identity) return false;
+
+  if (ref.datasourceId && identity.datasourceId !== ref.datasourceId) {
+    return false;
+  }
+  if (
+    ref.sourceSchema &&
+    identity.qualifier !== ref.sourceSchema &&
+    !identity.qualifier.endsWith(`.${ref.sourceSchema}`)
+  ) {
+    return false;
+  }
+  return true;
+}
+
 export function buildClassMatchResolver(
   matches: ConceptMatch[],
   r2rmlTurtle: string | null | undefined,
 ): (classSubject: string) => ConceptMatch | null {
-  const byTable = tableMatchesByTable(matches);
-
-  // Normalized-name index. Detect collisions so we never mis-attach.
-  const byNormalizedName = new Map<string, ConceptMatch>();
-  const ambiguousKeys = new Set<string>();
-  for (const [table, match] of byTable) {
-    const key = normalizeNameKey(table);
-    if (!key) continue;
-    if (byNormalizedName.has(key)) {
-      ambiguousKeys.add(key);
-    } else {
-      byNormalizedName.set(key, match);
-    }
+  const tableMatches = matches.filter((match) => !match.source_column);
+  const byNormalizedName = uniqueMatchIndex(tableMatches, (match) =>
+    normalizeNameKey(match.source_table),
+  );
+  const byUniqueSourceTable = uniqueMatchIndex(
+    tableMatches,
+    (match) => match.source_table,
+  );
+  const byLegacyBareTable = uniqueMatchIndex(
+    tableMatches.filter((match) => !match.source_table_identity),
+    (match) => match.source_table,
+  );
+  const matchesBySourceTable = new Map<string, ConceptMatch[]>();
+  for (const match of tableMatches) {
+    const bucket = matchesBySourceTable.get(match.source_table);
+    if (bucket) bucket.push(match);
+    else matchesBySourceTable.set(match.source_table, [match]);
   }
-  for (const key of ambiguousKeys) byNormalizedName.delete(key);
-
-  // R2RML fallback: classLocalName → tableName (exact).
-  const classToTable = classToTableFromR2rml(r2rmlTurtle);
+  const classToTableRef = classToTableRefFromR2rml(r2rmlTurtle);
+  const byR2rmlClass = new Map<string, ConceptMatch | null>();
+  for (const [local, ref] of classToTableRef) {
+    const candidates = (matchesBySourceTable.get(ref.tableName) ?? []).filter(
+      (match) => matchFitsR2rmlRef(match, ref),
+    );
+    byR2rmlClass.set(
+      local,
+      candidates.length === 1
+        ? candidates[0]
+        : (byLegacyBareTable.get(ref.tableName) ?? null),
+    );
+  }
 
   return (classSubject: string): ConceptMatch | null => {
     const local = classLocalName(classSubject);
 
-    // Primary: normalized-name match (R2RML-independent).
-    const byName = byNormalizedName.get(normalizeNameKey(local));
-    if (byName) return byName;
+    // Provenance first: never let a unique normalized name override an
+    // explicitly different datasource/schema/table reference.
+    if (byR2rmlClass.has(local)) {
+      return byR2rmlClass.get(local) ?? null;
+    }
 
-    // Fallback: TriplesMap-id join → table → match (exact; handles collisions
-    // and any name-transform edge cases the normalized key can't invert).
-    const table = classToTable.get(local);
-    if (table) return byTable.get(table) ?? null;
+    // An exact, unique source label wins even when a lossy normalized key
+    // collides. Same-named tables stay ambiguous here, as they do above.
+    const exact = byUniqueSourceTable.get(local);
+    if (exact) return exact;
 
-    return null;
+    return byNormalizedName.get(normalizeNameKey(local)) ?? null;
   };
 }

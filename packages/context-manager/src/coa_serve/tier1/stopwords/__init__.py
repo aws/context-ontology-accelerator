@@ -40,7 +40,9 @@ Adding a new language
    the preceding word). Japanese works as script runs — a hiragana particle
    separates from the kanji/katakana content word it follows — with unspaced
    hiragana fusions handled by the decomposition in
-   ``metric_resolver._is_stop_scaffolding``. Chinese or Thai would need real
+   ``metric_resolver._is_stop_scaffolding``; a language whose one-scalar
+   particles also spell content words lists its grammatical pairs in
+   ``SAFE_PARTICLE_RUNS``. Chinese or Thai would need real
    word segmentation first, which is a larger change.
 2. **Curate the stop words** in a new module here (request verbs, question
    words, counters that restate the metric's own aggregate, connectives), and
@@ -62,6 +64,7 @@ from __future__ import annotations
 
 from .en import GROUPS as _EN_GROUPS
 from .ja import GROUPS as _JA_GROUPS
+from .ja import SAFE_PARTICLE_RUNS as _JA_SAFE_PARTICLE_RUNS
 from .ko import GROUPS as _KO_GROUPS
 
 RESIDUAL_STOP_WORD_GROUPS: tuple[str, ...] = (*_EN_GROUPS, *_KO_GROUPS, *_JA_GROUPS)
@@ -69,3 +72,6 @@ RESIDUAL_STOP_WORD_GROUPS: tuple[str, ...] = (*_EN_GROUPS, *_KO_GROUPS, *_JA_GRO
 
 RESIDUAL_STOP_WORDS: frozenset[str] = frozenset(word for group in RESIDUAL_STOP_WORD_GROUPS for word in group.split())
 """The merged stop-word set the residual gate consumes."""
+
+SAFE_PARTICLE_RUNS: frozenset[str] = frozenset(_JA_SAFE_PARTICLE_RUNS)
+"""All languages' reviewed one-scalar particle pairs (only ja has any)."""

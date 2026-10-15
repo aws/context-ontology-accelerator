@@ -206,7 +206,7 @@ class _Harness:
             patch(f"{_DR}.write_config_parameter", self.write_param),
             patch(f"{_DR}.delete_config_parameter", self.delete_param),
         ):
-            return _parse(_dr._create_database_source(req, _NAMESPACE_ID))
+            return _parse(_dr._create_database_source(req, _NAMESPACE_ID, namespace_language="en"))
 
 
 @pytest.fixture

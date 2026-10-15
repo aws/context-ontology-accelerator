@@ -16,6 +16,12 @@ named graph in the namespace, so a vertex from an induced ontology
 can include edges that reach into foundational ontologies registered
 in the same namespace.
 
+Labels follow the namespace's immutable language (namespace-language LLD
+§2.2.5): each resource is named with the label ranked first by
+:func:`~coa_ontology.catalog.namespace_language.label_preference_for`, and a
+vertex's ``labels`` list is ordered best first. A language never hides a
+resource.
+
 Vertex-kind validation is enforced server-side: hitting
 ``/graph/class/{uri}`` for a URI that exists in the namespace but is
 typed as an ``owl:ObjectProperty`` returns 404 with a hint, since
@@ -42,6 +48,7 @@ from coa_ontology.catalog.graph_schemas import (
     GraphSearchResult,
     GraphVertex,
 )
+from coa_ontology.catalog.namespace_language import label_preference_for
 from coa_ontology.stores import build_stores
 from coa_ontology.stores.base import GraphStore
 
@@ -76,8 +83,9 @@ def _graph(namespace: str | None) -> GraphStore:
 
 def _lookup(vertex_uri: str, namespace: str, kind: str) -> GraphVertex:
     graph = _graph(namespace)
+    preference = label_preference_for(namespace)
     try:
-        record = graph.get_vertex(vertex_uri, namespace=namespace)
+        record = graph.get_vertex(vertex_uri, namespace=namespace, label_preference=preference)
     except NotImplementedError as e:
         raise HTTPException(501, f"Active backend does not support graph lookup: {e}") from e
     except ValueError as e:
@@ -153,6 +161,7 @@ def search_entities(
         raise HTTPException(400, f"limit must be between 1 and {_MAX_SEARCH_LIMIT}")
 
     graph = _graph(namespace)
+    preference = label_preference_for(namespace)
     try:
         results = graph.search_entities(
             query=q,
@@ -162,6 +171,7 @@ def search_entities(
             exclude_ontology_id=exclude_ontology_id,
             limit=limit,
             offset=offset,
+            label_preference=preference,
         )
         # Recomputed per page by design: ``total_count`` is part of every page's
         # envelope contract (clients use it as the paging stop condition), so it
@@ -210,8 +220,11 @@ def get_ontology_overview(
     yields a 200 with empty lists.
     """
     graph = _graph(namespace)
+    preference = label_preference_for(namespace)
     try:
-        overview = graph.get_ontology_overview(ontology_id, namespace=namespace, sample=sample)
+        overview = graph.get_ontology_overview(
+            ontology_id, namespace=namespace, sample=sample, label_preference=preference
+        )
     except NotImplementedError as e:
         raise HTTPException(501, f"Active backend does not support ontology overview: {e}") from e
     except ValueError as e:
@@ -271,6 +284,7 @@ def get_namespace_schema(
     prefix that matches every class still respects the caller's cap.
     """
     graph = _graph(namespace)
+    preference = label_preference_for(namespace)
     # When filtering, fetch the full page so the filter matches even if the
     # target class isn't in the first ``max_results`` classes the backend
     # returns; otherwise honour the caller's requested cap directly.
@@ -280,6 +294,7 @@ def get_namespace_schema(
             namespace,
             max_results=backend_limit,
             include_properties=include_properties,
+            label_preference=preference,
         )
     except NotImplementedError as e:
         raise HTTPException(501, f"Active backend does not support namespace schema: {e}") from e
@@ -319,8 +334,9 @@ def _matches_class_filter(uri: str, prefix: str) -> bool:
 def get_vertex(uri: str, namespace: str = "default"):
     """Look up any vertex by IRI — no kind validation."""
     graph = _graph(namespace)
+    preference = label_preference_for(namespace)
     try:
-        record = graph.get_vertex(uri, namespace=namespace)
+        record = graph.get_vertex(uri, namespace=namespace, label_preference=preference)
     except NotImplementedError as e:
         raise HTTPException(501, f"Active backend does not support graph lookup: {e}") from e
     except ValueError as e:

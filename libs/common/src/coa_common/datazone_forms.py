@@ -20,6 +20,7 @@ from coa_common.domain_models import (
     BusinessMetadata,
     Column,
     ForeignKey,
+    GeneratedField,
     PrimaryKey,
     Table,
     TechnicalMetadata,
@@ -41,12 +42,15 @@ def serialize_form(table: Table) -> dict[str, Any]:
 
     Keys align 1:1 with the Smithy model members. Complex values are
     JSON-serialized into strings.
+
+    The table's ``generated_fields`` is the JSON-encoded ``generatedFields``
+    member; a column's travels inside the ``columns`` JSON.
     """
     tech = table.technical_metadata
     biz = table.business_metadata
     pk = table.primary_key
 
-    return {
+    form: dict[str, Any] = {
         "tableName": table.name,
         "databaseName": table.database,
         "dataSourceId": table.data_source_id,
@@ -68,6 +72,11 @@ def serialize_form(table: Table) -> dict[str, Any]:
         "foreignKeys": json.dumps([to_dict(fk) for fk in table.foreign_keys]),
         "columns": json.dumps([to_dict(col) for col in table.columns]),
     }
+    # Only write the member when there is a proof to record, so English and legacy
+    # tables keep the exact content they had before the form gained the member.
+    if biz.generated_fields:
+        form["generatedFields"] = json.dumps(biz.generated_fields)
+    return form
 
 
 def build_forms_input(table: Table) -> list[dict[str, str]]:
@@ -98,16 +107,19 @@ def deserialize_form(payload: dict[str, Any], *, data_source_id: str = "") -> Ta
     columns_raw = _parse_json_list(payload.get("columns", "[]"))
 
     columns = [
-        Column(
-            name=c["name"],
-            data_type=c.get("data_type", ""),
-            nullable=c.get("nullable", True),
-            is_partition_key=c.get("is_partition_key", False),
-            business_metadata=BusinessMetadata(
-                **{k: v for k, v in c.get("business_metadata", {}).items() if k in bm_fields}
+        _with_generated_fields(
+            Column(
+                name=c["name"],
+                data_type=c.get("data_type", ""),
+                nullable=c.get("nullable", True),
+                is_partition_key=c.get("is_partition_key", False),
+                business_metadata=BusinessMetadata(
+                    **{k: v for k, v in c.get("business_metadata", {}).items() if k in bm_fields}
+                ),
+                distinct_values=c.get("distinct_values", []),
+                unrepresentable_fk_target=c.get("unrepresentable_fk_target", ""),
             ),
-            distinct_values=c.get("distinct_values", []),
-            unrepresentable_fk_target=c.get("unrepresentable_fk_target", ""),
+            c.get("business_metadata", {}).get("generated_fields"),
         )
         for c in columns_raw
         if isinstance(c, dict) and "name" in c
@@ -132,6 +144,9 @@ def deserialize_form(payload: dict[str, Any], *, data_source_id: str = "") -> Ta
             tags=tags,
             enrichment_source=payload.get("enrichmentSource", ""),
             review_status=payload.get("reviewStatus", ""),
+            # Absent on assets written before the member existed: an empty set,
+            # which proves nothing.
+            generated_fields=_parse_generated_fields(payload.get("generatedFields")),
         ),
         primary_key=PrimaryKey(
             columns=pk_columns,
@@ -156,6 +171,21 @@ def deserialize_form(payload: dict[str, Any], *, data_source_id: str = "") -> Ta
         ],
         columns=columns,
     )
+
+
+def _parse_generated_fields(value: Any) -> list[str]:
+    """Parse a stored generated-field set, keeping only known field names.
+
+    Missing, malformed or unknown entries read as absent. An empty result proves
+    nothing about how the metadata was produced.
+    """
+    known = {f.value for f in GeneratedField}
+    return [f for f in _parse_json_list(value) if isinstance(f, str) and f in known]
+
+
+def _with_generated_fields(column: Column, raw: Any) -> Column:
+    column.business_metadata.generated_fields = _parse_generated_fields(raw)
+    return column
 
 
 def _parse_json_list(value: Any) -> list:

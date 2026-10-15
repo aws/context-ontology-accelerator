@@ -20,6 +20,7 @@ import structlog
 from coa_common.constants import URN_PREFIX, VOCAB_URI
 
 from ...clients.base import GraphClient
+from ...namespace_language import current_label_preference, row_label
 from ...query_utils import (
     DEFAULT_GRAPH_URI_TEMPLATE,
     build_query_search_plan,
@@ -652,7 +653,7 @@ class TBoxContextBuilder:
             ?class rdfs:label ?label .
             {_parent_pattern(mapped)}"""
         classes_sparql = f"""
-        SELECT DISTINCT ?class ?label ?parentClass
+        SELECT DISTINCT ?class ?label (LANG(?label) AS ?labelLang) ?parentClass
         WHERE {{
 {graph_scoped_body(classes_body, graph_uri_prefix, graph_iris)}
         }} LIMIT {_SPARQL_RESULT_LIMIT}
@@ -674,7 +675,7 @@ class TBoxContextBuilder:
             ?property rdfs:range ?range .
             OPTIONAL {{ ?property <{_SCL_DISTINCT_VALUES}> ?distinctValue . }}"""
         props_sparql = f"""
-        SELECT ?class ?property ?range ?propLabel ?distinctValue
+        SELECT ?class ?property ?range ?propLabel (LANG(?propLabel) AS ?propLabelLang) ?distinctValue
         WHERE {{
 {graph_scoped_body(props_body, graph_uri_prefix, graph_iris)}
         }} LIMIT {_SPARQL_RESULT_LIMIT}
@@ -761,20 +762,34 @@ class TBoxContextBuilder:
         )
         try:
             results = await self._graph.query(sparql)
-            obj_props = []
+            # One row per label combination: group by edge (and by class for the
+            # end labels) so a multilingual class is one join path, not several.
+            edges: dict[tuple[str, str, str], None] = {}
+            label_rows: list[tuple[str, str, str]] = []
+            op_label_rows: list[tuple[tuple[str, str, str], str, str]] = []
             for row in results:
                 if row.get("op") and row.get("domain") and row.get("range"):
-                    obj_props.append(
-                        {
-                            "uri": row["op"],
-                            "label": row.get("opLabel", ""),
-                            "domain": row["domain"],
-                            "domain_label": row.get("domainLabel", ""),
-                            "range_class": row["range"],
-                            "range_label": row.get("rangeLabel", ""),
-                        }
-                    )
-            return obj_props
+                    key = (row["op"], row["domain"], row["range"])
+                    edges.setdefault(key, None)
+                    label_rows.append((row["domain"], *row_label(row, "domainLabel")))
+                    label_rows.append((row["range"], *row_label(row, "rangeLabel")))
+                    op_label_rows.append((key, *row_label(row, "opLabel")))
+            preference = current_label_preference()
+            class_labels = preference.pick_by_resource(label_rows)
+            op_labels: dict[tuple[str, str, str], list[tuple[str, str]]] = {}
+            for key, text, language in op_label_rows:
+                op_labels.setdefault(key, []).append((text, language))
+            return [
+                {
+                    "uri": op,
+                    "label": preference.pick(op_labels.get((op, domain, rng), [])),
+                    "domain": domain,
+                    "domain_label": class_labels.get(domain, ""),
+                    "range_class": rng,
+                    "range_label": class_labels.get(rng, ""),
+                }
+                for op, domain, rng in edges
+            ]
         except Exception as e:
             logger.warning("object_property_fetch_failed", namespace=namespace, error=str(e))
             return []
@@ -864,7 +879,8 @@ class TBoxContextBuilder:
             }}""")
 
         sparql = f"""
-        SELECT ?class ?property ?range ?label ?propLabel ?parentClass ?distinctValue
+        SELECT ?class ?property ?range ?label (LANG(?label) AS ?labelLang)
+               ?propLabel (LANG(?propLabel) AS ?propLabelLang) ?parentClass ?distinctValue
         WHERE {{
 {graph_scoped_body(" UNION ".join(union_clauses), graph_uri_prefix, graph_iris)}
         }} LIMIT {_SPARQL_RESULT_LIMIT}
@@ -939,7 +955,7 @@ class TBoxContextBuilder:
             FILTER({filters})
             {_parent_pattern(mapped)}"""
         classes_sparql = f"""
-        SELECT DISTINCT ?class ?label ?parentClass
+        SELECT DISTINCT ?class ?label (LANG(?label) AS ?labelLang) ?parentClass
         WHERE {{
 {graph_scoped_body(entity_classes_body, graph_uri_prefix, graph_iris)}
         }} LIMIT {_SPARQL_RESULT_LIMIT}
@@ -1000,7 +1016,7 @@ class TBoxContextBuilder:
             ?property rdfs:range ?range .
             OPTIONAL {{ ?property <{_SCL_DISTINCT_VALUES}> ?distinctValue . }}"""
         props_sparql = f"""
-        SELECT ?class ?property ?range ?propLabel ?distinctValue
+        SELECT ?class ?property ?range ?propLabel (LANG(?propLabel) AS ?propLabelLang) ?distinctValue
         WHERE {{
 {graph_scoped_body(entity_props_body, graph_uri_prefix, graph_iris)}
         }} LIMIT {_SPARQL_RESULT_LIMIT}
@@ -1059,7 +1075,7 @@ class TBoxContextBuilder:
             ?s <urn:{URN_PREFIX}:vocab#aiContext> ?aiContext .
             OPTIONAL {{ ?s rdfs:label ?label . }}"""
         sparql = f"""
-        SELECT ?s ?label ?aiContext
+        SELECT ?s ?label (LANG(?label) AS ?labelLang) ?aiContext
         WHERE {{
 {graph_scoped_body(aicontext_body, graph_uri_prefix, graph_iris)}
         }} LIMIT {_SPARQL_RESULT_LIMIT}
@@ -1077,10 +1093,25 @@ class TBoxContextBuilder:
         """Parse :aiContext JSON literals into AiContextTerm entries."""
         import json as _json
 
+        # One row per (node, label, aiContext): keep one term per distinct
+        # (node, aiContext literal), labelled with the namespace-language
+        # preference, instead of repeating it per label. A node with two distinct
+        # aiContext literals (or one in two graphs) keeps each literal once, and a
+        # row is marked seen only after it produced a term, so an unparseable row
+        # never hides a later valid one.
+        preference = current_label_preference()
+        labels_by_node = preference.pick_by_resource(
+            (row.get("s", ""), *row_label(row, "label")) for row in results if row.get("s")
+        )
+        seen: set[tuple[str, str]] = set()
         terms: list[AiContextTerm] = []
         for row in results:
+            node = row.get("s", "")
             raw = row.get("aiContext", "")
             if not raw:
+                continue
+            key = (node, str(raw))
+            if node and key in seen:
                 continue
             try:
                 ctx = _json.loads(raw)
@@ -1094,8 +1125,10 @@ class TBoxContextBuilder:
             instructions = ctx.get("instructions", "")
             if not isinstance(instructions, str):
                 instructions = ""
-            label = row.get("label", "") or ctx.get("label", "")
+            label = (labels_by_node.get(node, "") if node else row.get("label", "")) or ctx.get("label", "")
             if synonyms or instructions:
+                if node:
+                    seen.add(key)
                 terms.append(
                     AiContextTerm(
                         label=str(label),
@@ -1303,15 +1336,24 @@ class TBoxContextBuilder:
         """
         classes: dict[str, dict[str, Any]] = {}
         properties: dict[tuple[str, str], dict[str, Any]] = {}
+        # A resource with several rdfs:label values arrives once per label. Collect
+        # them by URI and choose with the namespace-language preference, so the
+        # label the prompt shows does not depend on Neptune's row order.
+        class_labels: dict[str, list[tuple[str, str]]] = {}
+        prop_labels: dict[str, list[tuple[str, str]]] = {}
 
         for row in results:
             cls_uri = row.get("class")
             if cls_uri and cls_uri not in classes:
                 classes[cls_uri] = {
                     "uri": cls_uri,
-                    "label": row.get("label", ""),
+                    "label": "",
                     "parent": row.get("parentClass"),
                 }
+            if cls_uri:
+                label = row_label(row, "label")
+                if label[0]:
+                    class_labels.setdefault(cls_uri, []).append(label)
             prop_uri = row.get("property")
             if prop_uri and cls_uri:
                 key = (cls_uri, prop_uri)
@@ -1319,16 +1361,24 @@ class TBoxContextBuilder:
                 if prop is None:
                     prop = {
                         "uri": prop_uri,
-                        "label": row.get("propLabel", ""),
+                        "label": "",
                         "domain": cls_uri,
                         "range": row.get("range", ""),
                         "distinct_values": [],
                     }
                     properties[key] = prop
+                label = row_label(row, "propLabel")
+                if label[0]:
+                    prop_labels.setdefault(prop_uri, []).append(label)
                 sample = row.get("distinctValue")
                 if sample and sample not in prop["distinct_values"]:
                     prop["distinct_values"].append(str(sample))
 
+        preference = current_label_preference()
+        for cls_uri, cls in classes.items():
+            cls["label"] = preference.pick(class_labels.get(cls_uri, []))
+        for (_cls_uri, prop_uri), prop in properties.items():
+            prop["label"] = preference.pick(prop_labels.get(prop_uri, []))
         return list(classes.values()), list(properties.values())
 
     def _estimate_tokens(

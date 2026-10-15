@@ -51,8 +51,14 @@ def handler(event: dict, context: object) -> None:
             if "scanJobSK" in body:
                 execution_input["scanJobSK"] = body["scanJobSK"]
             # Pass bare sourceId (without DS# prefix) for sources-table status updates.
+            # Messages sent before re-scans carried it (still queued, or redriven
+            # from the DLQ) have only datasourceId, so derive it from that.
             if "sourceId" in body:
                 execution_input["sourceId"] = body["sourceId"]
+            else:
+                datasource_id = str(body["datasourceId"])
+                if datasource_id.startswith("DS#") and len(datasource_id) > len("DS#"):
+                    execution_input["sourceId"] = datasource_id[len("DS#") :]
             # Re-scan marker, normalized to a string and ALWAYS present: the
             # enrichment ECS step reads it as an env var and the state machine
             # maps it via JsonPath.stringAt, both of which need a string that
@@ -71,6 +77,13 @@ def handler(event: dict, context: object) -> None:
             # be ignored). The discovery Lambda receives the full execution input,
             # so this reaches it without a state-machine change.
             execution_input["hadOpenRescan"] = "true" if body.get("hadOpenRescan") else "false"
+            # Namespace-language snapshot the API resolved when it enqueued the
+            # scan. ALWAYS present for the same JsonPath.stringAt reason as
+            # isRescan; a message from an older API revision carries none and
+            # forwards "". The enrichment worker then resolves the language once
+            # from the namespace item and records it on the scan job; it never
+            # defaults to English.
+            execution_input["namespaceLanguage"] = str(body.get("namespaceLanguage") or "")
             execution_name = body["scanJobId"].replace("#", "-").replace("SCAN-", "")[:80]
 
             logger.info(

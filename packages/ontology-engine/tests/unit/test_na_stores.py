@@ -80,6 +80,19 @@ class TestNeptuneAnalyticsVectorStore:
         assert out == ["http://ex.com/A", "http://ex.com/B"]
         self.mock.list_searchable_entity_uris.assert_called_once_with("onto1", namespace="ns1")
 
+    def test_bounded_embedding_listing_forwards_limit(self):
+        store = self._make_store(namespace="ns1")
+
+        store.list_embeddings_for_ontology("onto1", limit=25)
+
+        self.mock.list_embeddings_for_ontology.assert_called_once_with(
+            "onto1",
+            entity_type=None,
+            embedding_type=None,
+            limit=25,
+            namespace="ns1",
+        )
+
     def test_search_nearest_builds_embedding_hits(self):
         self.mock.search_nearest.return_value = [
             {

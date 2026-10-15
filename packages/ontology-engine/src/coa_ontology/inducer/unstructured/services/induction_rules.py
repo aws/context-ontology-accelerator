@@ -107,9 +107,12 @@ import logging
 from collections import Counter, defaultdict
 from typing import TYPE_CHECKING
 
-from rdflib import OWL, RDF, RDFS, XSD, Graph, Literal, URIRef
+from coa_common.language_tags import DEFAULT_LANGUAGE
+from rdflib import OWL, RDF, RDFS, XSD, Graph, URIRef
 from rdflib.namespace import SKOS
 
+from coa_ontology.inducer.services.generated_text import render
+from coa_ontology.inducer.services.literal_language import generated_literal
 from coa_ontology.inducer.unstructured.services.normalizers import (
     normalize_predicate,
     select_canonical_label,
@@ -158,6 +161,8 @@ def induce_classes(
     normalizer_results: dict[str, NormalizationResult],
     iri_resolver: IRIResolver,
     floor: int = DEFAULT_FLOOR,
+    *,
+    namespace_language: str = DEFAULT_LANGUAGE,
 ) -> Graph:
     """Induce ``owl:Class`` declarations from the lexical graph's class layer.
 
@@ -187,6 +192,9 @@ def induce_classes(
             spec (Req 10.2 calls out the resolver as the IRI source).
         floor: Minimum ``ClassRecord.count`` for inclusion (Req 10.1
             and Req 3.4). Defaults to 3.
+        namespace_language: Canonical namespace language. Generated labels and
+            comments compatible with it carry its tag; everything else keeps
+            the untagged ``xsd:string`` form. ``en`` asserts no tags.
 
     Returns:
         An :class:`rdflib.Graph` containing all class declarations,
@@ -244,13 +252,15 @@ def induce_classes(
         g.add((class_uri, RDF.type, OWL.Class))
 
         # Req 10.3 — rdfs:label is the original __SYS_Class__ value
-        # (CamelCase form), with explicit xsd:string datatype.
-        g.add((class_uri, RDFS.label, Literal(camel_label, datatype=XSD.string)))
+        # (CamelCase form), with explicit xsd:string datatype. Extraction names
+        # the class in the namespace language, so a compatible label carries
+        # the namespace tag instead (see ``generated_literal``).
+        g.add((class_uri, RDFS.label, generated_literal(camel_label, namespace_language, datatype=XSD.string)))
 
         # Req 10.4 — rdfs:comment is the generated description.
         comment = descriptions.get(spaced_label)
         if comment:
-            g.add((class_uri, RDFS.comment, Literal(comment, datatype=XSD.string)))
+            g.add((class_uri, RDFS.comment, generated_literal(comment, namespace_language, datatype=XSD.string)))
         else:
             log.info(
                 "induce_classes: no description for class %r; emitting rdfs:label only",
@@ -310,6 +320,7 @@ def induce_individuals(
     iri_resolver: IRIResolver,
     *,
     include_individuals: bool = False,
+    namespace_language: str = DEFAULT_LANGUAGE,
 ) -> Graph:
     """Induce ``owl:NamedIndividual`` declarations from sampled entities.
 
@@ -355,6 +366,9 @@ def induce_individuals(
         include_individuals: Gate flag (Req 11.6). Defaults to ``False``;
             when ``False`` the function returns an empty graph and emits
             a single INFO log line. When ``True`` the rule actually runs.
+        namespace_language: Canonical namespace language. Generated labels and
+            comments compatible with it carry its tag; everything else keeps
+            the untagged ``xsd:string`` form. ``en`` asserts no tags.
 
     Returns:
         An :class:`rdflib.Graph` with three triples per emitted entity
@@ -433,7 +447,7 @@ def induce_individuals(
             (
                 individual_uri,
                 RDFS.label,
-                Literal(entity.value, datatype=XSD.string),
+                generated_literal(entity.value, namespace_language, datatype=XSD.string),
             )
         )
 
@@ -480,6 +494,8 @@ def induce_object_properties(
     facts: list[FactRecord],
     class_iris: dict[str, str],
     iri_resolver: IRIResolver,
+    *,
+    namespace_language: str = DEFAULT_LANGUAGE,
 ) -> Graph:
     """Induce ``owl:ObjectProperty`` declarations from SPO facts.
 
@@ -557,6 +573,9 @@ def induce_object_properties(
             the corresponding facts are skipped.
         iri_resolver: An :class:`IRIResolver` for minting deterministic
             property IRIs.
+        namespace_language: Canonical namespace language. Generated labels and
+            comments compatible with it carry its tag; everything else keeps
+            the untagged ``xsd:string`` form. ``en`` asserts no tags.
 
     Returns:
         An :class:`rdflib.Graph` containing one declaration block per
@@ -730,7 +749,7 @@ def induce_object_properties(
             (
                 property_uri,
                 RDFS.label,
-                Literal(canonical, datatype=XSD.string),
+                generated_literal(canonical, namespace_language, datatype=XSD.string),
             )
         )
 
@@ -845,6 +864,8 @@ def induce_datatype_properties(
     facts: list[FactRecord],
     class_iris: dict[str, str],
     iri_resolver: IRIResolver,
+    *,
+    namespace_language: str = DEFAULT_LANGUAGE,
 ) -> Graph:
     """Induce ``owl:DatatypeProperty`` declarations from SPC facts.
 
@@ -934,6 +955,9 @@ def induce_datatype_properties(
             to the ``owl:Class`` IRI minted by Rule 1.
         iri_resolver: An :class:`IRIResolver` for minting deterministic
             property IRIs.
+        namespace_language: Canonical namespace language. Generated labels and
+            comments compatible with it carry its tag; everything else keeps
+            the untagged ``xsd:string`` form. ``en`` asserts no tags.
 
     Returns:
         An :class:`rdflib.Graph` containing one declaration block per
@@ -1089,20 +1113,30 @@ def induce_datatype_properties(
             (
                 property_uri,
                 RDFS.label,
-                Literal(canonical, datatype=XSD.string),
+                generated_literal(canonical, namespace_language, datatype=XSD.string),
             )
         )
 
         # Req 13.8 — observation-frequency comment. After 12D each
         # property has exactly one subject class, so the wording is
         # always single-class.
-        domain_name = _local_class_name(agg["subject_iri"])
-        comment = f"Observed across {agg['fact_count']} fact(s) in class {domain_name}"
+        #
+        # The class name is deliberately NOT interpolated into the sentence. It
+        # comes from the corpus, so on a non-English corpus an English frame around
+        # it produced a literal holding two languages ("Observed across 1 fact(s)
+        # in class 技術的特性"). RDF 1.1 gives a literal one language tag or one
+        # datatype, never a tag per fragment, so such a literal cannot be tagged
+        # correctly under any scheme — and this one is manufactured by us, so no
+        # amount of extraction-prompt work can remove it. The name is already
+        # reachable from this property's rdfs:domain, so stating it here only
+        # duplicated it in a form that made the literal untaggable. The same holds
+        # for a Japanese frame around a Latin-mixed class name such as PLC制御盤.
+        comment = render("datatype_property_observation", namespace_language, count=agg["fact_count"])
         g.add(
             (
                 property_uri,
                 RDFS.comment,
-                Literal(comment, datatype=XSD.string),
+                generated_literal(comment, namespace_language, datatype=XSD.string),
             )
         )
 
@@ -1121,20 +1155,6 @@ def induce_datatype_properties(
     )
 
     return g
-
-
-def _local_class_name(class_iri: str) -> str:
-    """Extract the local class-name segment from a Rule 1 class IRI.
-
-    Class IRIs are shaped as
-    ``{prefix}/class/{normalized-class-label}``. This helper returns
-    the trailing segment for use in human-readable comments.
-    Defensively handles non-Rule-1-shaped IRIs by returning the full
-    string.
-    """
-    marker = "/class/"
-    idx = class_iri.rfind(marker)
-    return class_iri[idx + len(marker) :] if idx >= 0 else class_iri
 
 
 # ── Rule 5 — __Topic__ nodes → skos:Concept (T-Box) ────────────────────
@@ -1162,6 +1182,8 @@ def induce_concepts(
     topics: list[TopicRecord],
     iri_resolver: IRIResolver,
     namespace_name: str,
+    *,
+    namespace_language: str = DEFAULT_LANGUAGE,
 ) -> Graph:
     """Induce ``skos:Concept`` declarations from ``__Topic__`` nodes.
 
@@ -1230,6 +1252,9 @@ def induce_concepts(
         namespace_name: The pipeline's namespace name (e.g.
             ``"my-graph"``). Used to build the ConceptScheme IRI and
             its ``rdfs:label`` (``"{namespace_name} Topic Scheme"``).
+        namespace_language: Canonical namespace language. Generated labels and
+            comments compatible with it carry its tag; everything else keeps
+            the untagged ``xsd:string`` form. ``en`` asserts no tags.
 
     Returns:
         An :class:`rdflib.Graph` containing:
@@ -1282,7 +1307,11 @@ def induce_concepts(
         (
             scheme_uri,
             RDFS.label,
-            Literal(f"{namespace_name} Topic Scheme", datatype=XSD.string),
+            generated_literal(
+                render("topic_scheme_label", namespace_language, namespace=namespace_name),
+                namespace_language,
+                datatype=XSD.string,
+            ),
         )
     )
 
@@ -1340,7 +1369,7 @@ def induce_concepts(
             (
                 concept_uri,
                 SKOS.prefLabel,
-                Literal(topic.value, datatype=XSD.string),
+                generated_literal(topic.value, namespace_language, datatype=XSD.string),
             )
         )
         # Req 14.4 — link concept to its scheme.

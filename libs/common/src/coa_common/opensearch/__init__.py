@@ -39,7 +39,9 @@ AOSS quirks this client encapsulates
 - **No client-supplied ``_id``** on index/bulk (AOSS auto-assigns). Upserts
   therefore delete-then-insert rather than overwrite by id.
 - **No ``_delete_by_query``** on VECTORSEARCH — delete by searching for matching
-  docs and deleting each by its auto-assigned ``_id``.
+  docs and deleting each by its auto-assigned ``_id``. A delete that stops with
+  matching docs left RAISES :class:`DeleteIncompleteError` rather than returning
+  the partial count as if it were done.
 - **No scroll API** — paginate with ``search_after`` on a stable sort.
 - **Root ``/`` returns 404** — ``client.info()`` is unusable as a liveness
   probe; probe by ensuring an index exists instead.
@@ -71,6 +73,7 @@ from __future__ import annotations
 
 from coa_common.opensearch.client import (
     AossVectorClient,
+    DeleteIncompleteError,
     IncompatibleEngineError,
     build_index_mapping,
 )
@@ -87,6 +90,7 @@ from coa_common.opensearch.retry import (
 
 __all__ = [
     "AossVectorClient",
+    "DeleteIncompleteError",
     "IncompatibleEngineError",
     "build_index_mapping",
     "OSS_RETRY_STATUS",

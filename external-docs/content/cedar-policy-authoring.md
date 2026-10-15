@@ -171,6 +171,7 @@ Set `ALLOW_WITHOUT_ROLES=true` on the authorizer Lambda in a **dev-only** enviro
 | Policy injection | Policies are stored in DynamoDB, not user-supplied at request time |
 | Fail-open risk | Unknown routes default to `denyAll` action; Cedar evaluation exceptions deny |
 | Stale cache | DynamoDB Streams handler bumps a version counter; authorizer clears cache on mismatch |
+| Roles table unavailable | The API authorizer and the MCP server deny. The query runtime (Context Manager) reuses each role's last successfully loaded policy for up to 15 minutes (`SCL_CEDAR_POLICY_MAX_STALE_S`), then denies; it never falls back to the shipped default policies |
 | SPARQL injection (ontology concepts) | Identifiers are validated against a strict CURIE/IRI allowlist before any SPARQL query |
 
 ## Reference

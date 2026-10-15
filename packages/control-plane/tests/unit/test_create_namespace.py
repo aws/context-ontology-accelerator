@@ -14,6 +14,7 @@ import pytest
 from botocore.exceptions import ClientError
 from coa_common.constants import NamespaceStatus
 from coa_common.dao import PaginatedResult
+from coa_common.language_tags import LanguageTagError
 from coa_common.metadata_store import MetadataStoreError
 from coa_common.metadata_store.base import ProjectResult
 
@@ -175,6 +176,7 @@ class TestCreateNamespace:
             name="sales",
             owner="alice@co.com",
             status=NamespaceStatus.ACTIVE,
+            language="en",
             dataZoneProjectId="proj-abc",
             sourceCount=0,
             createdAt="2026-01-01T00:00:00Z",
@@ -196,6 +198,7 @@ class TestCreateNamespace:
             description="Sales data",
             owner="alice@co.com",
             status=NamespaceStatus.ACTIVE,
+            language="en",
             createdAt="2026-01-01T00:00:00Z",
         )
         mock_get_svc.return_value.create.return_value = ns
@@ -566,3 +569,137 @@ class TestNamespaceService:
             pytest.raises(MetadataStoreError, match="not found"),
         ):
             svc.create(req)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Namespace language (immutable, canonicalized before provisioning)
+# ═══════════════════════════════════════════════════════════════════
+
+
+def _ssm_ok(mock_boto3: MagicMock) -> None:
+    mock_boto3.client.return_value = MagicMock(
+        get_parameter=MagicMock(return_value={"Parameter": {"Value": "arn:aws:iam::123:role/access"}})
+    )
+
+
+def _namespace_record_puts(svc: NamespaceService) -> list[dict]:
+    return [c.args[0] for c in svc._ns_dao.put.call_args_list if c.args[0]["PK"].startswith("NS#")]
+
+
+class TestNamespaceLanguage:
+    def _make_service(self, **kwargs):
+        return TestNamespaceService()._make_service(**kwargs)
+
+    def _assert_no_side_effects(self, svc: NamespaceService) -> None:
+        svc._ns_dao.query.assert_not_called()
+        svc._ns_dao.put.assert_not_called()
+        svc._ns_dao.update.assert_not_called()
+        svc._metadata_store.create_project.assert_not_called()
+        svc._roles_dao.put.assert_not_called()
+        svc._mappings_dao.put.assert_not_called()
+
+    @patch("coa_control_plane.namespace.service.boto3")
+    def test_create_without_language_persists_and_returns_en(self, mock_boto3):
+        _ssm_ok(mock_boto3)
+        svc = self._make_service()
+
+        result = svc.create(CreateNamespaceRequestContent(name="sales", owner="alice@co.com"))
+
+        assert result.language == "en"
+        [record] = _namespace_record_puts(svc)
+        assert record["SK"] == "METADATA"
+        assert record["language"] == "en"
+
+    @pytest.mark.parametrize(("requested", "canonical"), [("ja", "ja"), (" JA-jp\t", "ja-JP"), ("zh-hant", "zh-Hant")])
+    @patch("coa_control_plane.namespace.service.boto3")
+    def test_create_persists_canonical_language(self, mock_boto3, requested, canonical):
+        _ssm_ok(mock_boto3)
+        svc = self._make_service()
+
+        result = svc.create(CreateNamespaceRequestContent(name="sales", owner="alice@co.com", language=requested))
+
+        assert result.language == canonical
+        [record] = _namespace_record_puts(svc)
+        assert record["language"] == canonical
+
+    @pytest.mark.parametrize("language", ["ja\n", "ja_JP", "de-CH-1901", "", "   "])
+    def test_service_rejects_invalid_language_before_any_side_effect(self, language):
+        # model_construct skips the generated model's regex: the service must
+        # not rely on it. "ja\n" also passes that regex in production
+        # (``re.match`` lets ``$`` match before a trailing newline).
+        svc = self._make_service()
+        request = CreateNamespaceRequestContent.model_construct(name="sales", owner="alice@co.com", language=language)
+
+        with pytest.raises(LanguageTagError):
+            svc.create(request)
+
+        self._assert_no_side_effects(svc)
+
+    @pytest.mark.parametrize("language", ["ja_JP", "x-private", "de-CH-1901", "zh-TW-Hant", "", "日本語", "ja\n"])
+    def test_handler_rejects_invalid_language_with_400_and_no_provisioning(self, language):
+        svc = self._make_service()
+        with patch("coa_control_plane.namespace.create_handler._get_service", return_value=svc):
+            resp = handler(_event({**VALID_BODY, "language": language}), None)
+
+        assert resp["statusCode"] == 400
+        assert "message" in json.loads(resp["body"])
+        self._assert_no_side_effects(svc)
+
+    def test_handler_rejects_non_string_language(self):
+        svc = self._make_service()
+        with patch("coa_control_plane.namespace.create_handler._get_service", return_value=svc):
+            resp = handler(_event({**VALID_BODY, "language": 7}), None)
+
+        assert resp["statusCode"] == 400
+        self._assert_no_side_effects(svc)
+
+    @patch("coa_control_plane.namespace.service.boto3")
+    def test_handler_returns_canonical_language(self, mock_boto3):
+        _ssm_ok(mock_boto3)
+        svc = self._make_service()
+        with patch("coa_control_plane.namespace.create_handler._get_service", return_value=svc):
+            resp = handler(_event({**VALID_BODY, "language": "PT-br"}), None)
+
+        assert resp["statusCode"] == 201
+        assert json.loads(resp["body"])["namespace"]["language"] == "pt-BR"
+
+    @patch("coa_control_plane.namespace.service.boto3")
+    def test_handler_defaults_language_to_en(self, mock_boto3):
+        _ssm_ok(mock_boto3)
+        svc = self._make_service()
+        with patch("coa_control_plane.namespace.create_handler._get_service", return_value=svc):
+            resp = handler(_event(VALID_BODY), None)
+
+        assert resp["statusCode"] == 201
+        assert json.loads(resp["body"])["namespace"]["language"] == "en"
+
+    def test_duplicate_name_preflight_conflict_does_not_write_language(self):
+        svc = self._make_service(query_items=[{"PK": "NS#existing"}])
+        request = CreateNamespaceRequestContent(name="sales", owner="alice@co.com", language="ja")
+
+        with pytest.raises(ConflictError, match="already exists"):
+            svc.create(request)
+
+        svc._ns_dao.put.assert_not_called()
+        svc._ns_dao.update.assert_not_called()
+        svc._metadata_store.create_project.assert_not_called()
+
+    def test_duplicate_name_reservation_conflict_does_not_write_language(self):
+        error_response = {"Error": {"Code": "ConditionalCheckFailedException", "Message": "exists"}}
+        svc = self._make_service(reserve_error=ClientError(error_response, "PutItem"))
+        request = CreateNamespaceRequestContent(name="sales", owner="alice@co.com", language="ja")
+
+        with pytest.raises(ConflictError, match="already exists"):
+            svc.create(request)
+
+        # Only the (rejected) reservation put was attempted; the existing
+        # namespace record is never written or updated.
+        assert [c.args[0]["PK"] for c in svc._ns_dao.put.call_args_list] == ["NS_NAME#sales"]
+        svc._ns_dao.update.assert_not_called()
+        svc._metadata_store.create_project.assert_not_called()
+
+    @patch("coa_control_plane.namespace.create_handler._get_service")
+    def test_handler_conflict_is_still_409_with_language(self, mock_get_svc):
+        mock_get_svc.return_value.create.side_effect = ConflictError("Namespace 'sales' already exists")
+        resp = handler(_event({**VALID_BODY, "language": "ja"}), None)
+        assert resp["statusCode"] == 409

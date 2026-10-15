@@ -243,6 +243,7 @@ export async function listProposals(
     ontology_id?: string;
     status?: string;
     type?: string;
+    source_type?: string;
     limit?: number;
   },
 ): Promise<Proposal[]> {
@@ -307,17 +308,12 @@ export async function fetchJsonFromUrl(url: string): Promise<unknown> {
 }
 
 /**
- * Upload Turtle directly to S3 via a presigned PUT URL — the write-side mirror
- * of {@link fetchTurtleFromUrl}.
+ * Upload Turtle directly to S3 via a create-only presigned PUT URL.
  *
- * Why straight to S3 (and NOT through apiClient / the Lambda proxy): a large
- * edited ontology (6+ MB) sent inline in an update request would exceed the
- * 6 MB API Gateway / Lambda *request* payload limit and fail before ever
- * reaching the backend — the inverse of the response-limit problem the read
- * path avoids. The presigned URL carries its own auth, so this MUST NOT go
- * through apiClient. Content-Type is intentionally not part of the signature,
- * so sending ``text/turtle`` is safe and keeps the stored object's type
- * consistent with the read path.
+ * The URL carries its own authorization and signs ``If-None-Match: *``, so
+ * this request must bypass apiClient and include that exact header. The
+ * precondition prevents a replay from replacing bytes that UpdateProposal
+ * already validated. Content-Type remains unsigned.
  */
 export async function putToPresignedUrl(
   url: string,
@@ -326,14 +322,25 @@ export async function putToPresignedUrl(
 ): Promise<void> {
   const resp = await fetch(url, {
     method: "PUT",
-    headers: { "Content-Type": contentType },
+    headers: {
+      "Content-Type": contentType,
+      "If-None-Match": "*",
+    },
     body,
   });
-  if (!resp.ok) {
+  if (resp.ok) return;
+
+  if (resp.status === 409 || resp.status === 412) {
     throw new Error(
-      `Failed to upload to S3 (${resp.status} ${resp.statusText})`,
+      `The proposal revision already has an upload or the write outcome conflicted (${resp.status} ${resp.statusText}). Save again to create a fresh revision and re-upload.`,
     );
   }
+  if (resp.status === 403) {
+    throw new Error(
+      `Failed to upload to S3 (403 ${resp.statusText}). The upload URL may have expired or a required signed header may be missing. Save again to request a fresh revision.`,
+    );
+  }
+  throw new Error(`Failed to upload to S3 (${resp.status} ${resp.statusText})`);
 }
 
 /**
@@ -345,8 +352,16 @@ export async function getProposalUploadUrls(
   apiClient: ApiClient,
   namespace: string,
   proposalId: string,
-): Promise<{ ontology_put_url: string; r2rml_put_url: string }> {
-  return apiClient.post<{ ontology_put_url: string; r2rml_put_url: string }>(
+): Promise<{
+  revisionId: string;
+  ontologyPutUrl: string;
+  r2rmlPutUrl: string;
+}> {
+  return apiClient.post<{
+    revisionId: string;
+    ontologyPutUrl: string;
+    r2rmlPutUrl: string;
+  }>(
     `/namespaces/${encodeURIComponent(namespace)}/proposals/${encodeURIComponent(proposalId)}/upload-url`,
     {},
   );
@@ -387,7 +402,9 @@ export async function updateProposal(
     r2rml_turtle?: string;
     ontology_uploaded?: boolean;
     r2rml_uploaded?: boolean;
-    grounding_overrides?: Record<string, string | null>;
+    grounding_overrides?: Record<string, string>;
+    novel_tables?: string[];
+    upload_revision_id?: string;
   },
 ): Promise<{ proposal_id: string; status: string }> {
   return apiClient.post<{ proposal_id: string; status: string }>(

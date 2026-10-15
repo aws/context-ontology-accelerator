@@ -176,7 +176,7 @@ The default region is `us-east-1`. To deploy to a different region:
 - **pip** — detects macOS Xcode stubs that look like pip but fail at runtime
 - **Docker** — required for Lambda bundling fallback when local pip is unavailable
 - **Smithy artifacts** — ensures `smithy-generated/openapi/` contains valid specs
-- **VPC quota** — queries the account VPC limit and blocks if saturated
+- **VPC quota** — queries the account VPC limit and blocks if saturated, when the deploy would create a VPC (not on updates or with `SCL_VPC_ID`)
 
 ### Tearing down (`make destroy-dev`)
 
@@ -258,7 +258,8 @@ Stacks are deployed in dependency order (managed by `addDependency()` in `bin/ap
 
 | Stack                | Resources                                                                                                                                                                          | Key Outputs                                                 | Dependencies                       | ~Deploy Time |
 | -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- | ---------------------------------- | ------------ |
-| `coa-dev-network`    | VPC, subnets, VPC endpoints (S3, DynamoDB, Bedrock, AgentCore, ECR, SSM, CloudWatch), Neptune SG, ECS SG, Lambda SG, **Connector SG** (Glue Connection / Athena federation egress) | VpcId                                                       | —                                  | 3 min        |
+| `coa-dev-network`    | VPC, subnets, VPC endpoints (S3, DynamoDB, Bedrock, AgentCore, ECR, SSM, CloudWatch), Neptune SG, ECS SG, Lambda SG, Authorizer SG, **Connector SG** (Glue Connection / Athena federation egress) | VpcId                                                       | —                                  | 3 min        |
+| `coa-dev-eni-warm`   | Never-invoked VPC Lambdas, one per security-group set, that pre-create the Hyperplane ENIs the service stacks' Lambdas share                                                                      | —                                                           | network                            | 4 min        |
 | `coa-dev-auth`       | Cognito User Pool, App Client, SSM parameters                                                                                                                                      | Issuer URL, Client ID                                       | —                                  | 2 min        |
 | `coa-dev-guardrail`  | Bedrock Guardrail                                                                                                                                                                  | GuardrailId                                                 | —                                  | 1 min        |
 | `coa-dev-storage`    | Neptune cluster, OpenSearch Serverless collection, S3 buckets (assets, logs, **athena-results** 7-day retention, **athena-spill** 1-day retention)                                 | Neptune ARN, AOSS ARN                                       | network                            | 15 min       |

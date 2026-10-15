@@ -160,6 +160,25 @@ describe("GetNamespace", () => {
     ).toBeInTheDocument();
   });
 
+  it("renders the namespace language read-only with a human label", () => {
+    mockNamespace = { ...baseNamespace, language: "ja" };
+    render(<GetNamespace />, { wrapper });
+    expect(screen.getByText("Language")).toBeInTheDocument();
+    expect(screen.getByText("Japanese (ja)")).toBeInTheDocument();
+  });
+
+  it("renders English for an en namespace", () => {
+    mockNamespace = { ...baseNamespace, language: "en" };
+    render(<GetNamespace />, { wrapper });
+    expect(screen.getByText("English (en)")).toBeInTheDocument();
+  });
+
+  it("renders an unknown language tag as the raw tag", () => {
+    mockNamespace = { ...baseNamespace, language: "pt-BR" };
+    render(<GetNamespace />, { wrapper });
+    expect(screen.getByText("pt-BR")).toBeInTheDocument();
+  });
+
   it("renders Edit and Permissions action buttons", () => {
     render(<GetNamespace />, { wrapper });
     expect(screen.getByRole("button", { name: /edit/i })).toBeInTheDocument();

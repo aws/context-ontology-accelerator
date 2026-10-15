@@ -192,3 +192,28 @@ class TestUpdateNamespaceStatus:
             resp = handler(event, None)
 
         assert resp["statusCode"] == 404
+
+
+@pytest.mark.unit
+class TestNamespaceLanguage:
+    @pytest.mark.parametrize(("stored", "expected"), [({}, "en"), ({"language": "ja"}, "ja")])
+    def test_status_change_returns_effective_language_and_does_not_write_it(self, stored, expected):
+        from coa_control_plane.namespace.update_status_handler import handler
+
+        item = {**_NS_ITEM, **stored}
+        dao = MagicMock()
+        dao.get.side_effect = [item, {**item, "status": "ARCHIVED"}]
+        with patch(f"{MODULE}._get_ns_dao", return_value=dao):
+            resp = handler(
+                {
+                    "pathParameters": {"namespaceId": "ns-123"},
+                    "body": json.dumps({"status": "ARCHIVED"}),
+                    "httpMethod": "PATCH",
+                    "resource": "/namespaces/{namespaceId}/status",
+                },
+                None,
+            )
+
+        assert resp["statusCode"] == 200
+        assert json.loads(resp["body"])["namespace"]["language"] == expected
+        assert dao.update.call_args.kwargs["update_fields"] == {"status": "ARCHIVED"}

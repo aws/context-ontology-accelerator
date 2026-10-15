@@ -26,6 +26,7 @@ import re
 import boto3
 from coa_common import async_boto_config
 from coa_common.bedrock_metrics import CostTracker
+from coa_common.language_tags import DEFAULT_LANGUAGE, LanguageTagError, primary_language
 from rdflib import OWL, RDF, RDFS, XSD, BNode, Graph, Literal, Namespace, URIRef
 from rdflib.collection import Collection
 from rdflib.namespace import SKOS
@@ -37,17 +38,34 @@ from coa_ontology.inducer.strategies.base import (
     InductionStrategy,
     add_glossary_and_tags,
     ambiguous_target_names,
+    camel_names_for,
     fk_edge_allowed,
     logical_table_names,
     pascal_names_for,
+    pom_segment,
+    r2rml_column_name_supported,
     reference_index,
     resolve_fk_target_identity,
     simple_fk_constraints,
     subject_template_names,
     table_identity,
+    to_pascal,
 )
 
 log = logging.getLogger(__name__)
+
+
+def rigor_supports_language(namespace_language: str) -> bool:
+    """Whether RIGOR may run for a namespace language.
+
+    V1 has no localized RIGOR semantic naming or grounding, so only a namespace
+    whose primary subtag is ``en`` (including every legacy namespace) is allowed.
+    """
+    try:
+        return primary_language(namespace_language) == DEFAULT_LANGUAGE
+    except LanguageTagError:
+        return False
+
 
 _PROMPTS_DIR = os.path.join(os.path.dirname(__file__), "prompts")
 
@@ -71,11 +89,20 @@ _RAG_TOP_K_PROPERTIES = 5
 
 
 def _to_pascal(s: str) -> str:
-    """Convert snake_case / kebab-case / spaced names to PascalCase."""
-    if not s:
-        return "Entity"
-    cleaned = re.sub(r"[^a-zA-Z0-9\s_\-]", "", s)
-    return "".join(w.capitalize() for w in re.split(r"[\s_\-]+", cleaned) if w)
+    """Convert snake_case / kebab-case / spaced names to PascalCase.
+
+    Delegates to :func:`~coa_ontology.inducer.strategies.base.to_pascal` rather
+    than keeping a private copy — the private copies are what let the non-Latin
+    identifier defect survive in three files at once.
+
+    This strategy is NOT otherwise name-compatible with the table-to-ontology
+    strategy: it mints its TriplesMap IRI from the bare table name (see
+    ``build_r2rml`` below) rather than from
+    :func:`~coa_ontology.inducer.strategies.base.pascal_names_for`, so two
+    same-named tables from different databases still fuse here. That is a separate
+    pre-existing gap, tracked apart from the identifier normalization.
+    """
+    return to_pascal(s)
 
 
 def _iri_local_name(iri: str) -> str:
@@ -167,6 +194,7 @@ class RigorOntologyStrategy(InductionStrategy):
         grounding_ontology_ids: list[str] | None = None,
         grounding_mode: str = "ENHANCED",
         cost_tracker: CostTracker | None = None,
+        namespace_language: str = DEFAULT_LANGUAGE,
     ) -> tuple[Graph, set[str], list[ConceptMatch], list[dict]]:
         """Induce a Turtle ontology via iterative Gen-LLM + Judge-LLM with RAG context.
 
@@ -184,11 +212,22 @@ class RigorOntologyStrategy(InductionStrategy):
             grounding_ontology_ids: Accepted for signature parity; unused by this strategy.
             grounding_mode: Accepted for signature parity; unused by this strategy.
             cost_tracker: Optional per-job Bedrock usage accumulator threaded into LLM calls.
+            namespace_language: Canonical namespace language. RIGOR supports only
+                namespaces whose primary subtag is ``en``; the induction route
+                rejects any other language before a job starts.
 
         Returns:
             A tuple of the proposal graph, the set of novel table names, the
             list of concept matches, and the list of dropped tables with failure reasons.
+
+        Raises:
+            ValueError: If the namespace language is not English. This is a
+                backstop; the route never starts such a job.
         """
+        if not rigor_supports_language(namespace_language):
+            raise ValueError(
+                f"rigor_ontology supports only English namespaces; this namespace's language is {namespace_language}"
+            )
         # rigor_ontology uses LLM Gen+Judge rather than embedding match, so
         # grounding_ontology_ids and grounding_mode have no effect on its
         # current path. Accept for signature parity with the abstract base.
@@ -947,6 +986,20 @@ class RigorOntologyStrategy(InductionStrategy):
         ref_index = reference_index(tables)
         ambiguous_names = ambiguous_target_names(tables)
 
+        warned_unsupported_columns: set[tuple[str, str]] = set()
+
+        def _column_is_supported(table_name: str, column_name: str) -> bool:
+            if r2rml_column_name_supported(column_name):
+                return True
+            warning_key = (table_name, column_name)
+            if warning_key not in warned_unsupported_columns:
+                warned_unsupported_columns.add(warning_key)
+                log.warning(
+                    "r2rml_column_skipped_embedded_quote",
+                    extra={"table": table_name, "column": column_name},
+                )
+            return False
+
         # Build lookup indices from the proposal graph
         class_by_identity = self._index_classes_by_table(
             proposal_graph,
@@ -955,6 +1008,32 @@ class RigorOntologyStrategy(InductionStrategy):
             pascal_by_id,
         )
         prov_base = ontology_uri_prefix.rstrip("#").rstrip("/") + "/provenance"
+
+        # Tables that get no TriplesMap because of an unsupported column. An FK
+        # to one of them has no target individuals: _fk_target_token resolves it
+        # to None, and an object property for it is left unmapped below.
+        unmapped_ids: set[str] = set()
+        for table in tables:
+            identity = table_identity(table)
+            if table.name not in novel_tables or class_by_identity.get(identity) is None:
+                continue
+            if table.columns and not any(_column_is_supported(table.name, col.name) for col in table.columns):
+                log.warning(
+                    "r2rml_table_skipped_no_supported_columns",
+                    extra={"table": table.name},
+                )
+                unmapped_ids.add(identity)
+                continue
+            pk_col = self._primary_key_col(table)
+            if pk_col and not _column_is_supported(table.name, pk_col):
+                # Substituting another column for the PK lets different rows mint
+                # the same individual, and FK templates elsewhere assume the target
+                # is keyed by its PK. Skip the table instead.
+                log.warning(
+                    "r2rml_table_skipped_unsupported_primary_key",
+                    extra={"table": table.name, "columns": [pk_col]},
+                )
+                unmapped_ids.add(identity)
 
         for table in tables:
             if table.name not in novel_tables:
@@ -968,6 +1047,10 @@ class RigorOntologyStrategy(InductionStrategy):
                     table.name,
                 )
                 continue
+            if identity in unmapped_ids:
+                continue  # skipped above, with its warning
+
+            safe_column_names = [col.name for col in table.columns if _column_is_supported(table.name, col.name)]
 
             # TriplesMap IRI, rr:tableName and subject template all key on the
             # identity's disambiguated token so two same-named tables no longer
@@ -984,6 +1067,8 @@ class RigorOntologyStrategy(InductionStrategy):
             pk_id = sql_ident(pk_col) if pk_col else '"ID"'
             subj = URIRef(f"{tmap}/SubjectMap")
             g.add((tmap, RR.subjectMap, subj))
+            # Deliberately the table name from subject_template_names (schema-qualified only on a
+            # collision), not the pascal_names_for class local: instance IRIs are published.
             g.add((subj, RR.template, Literal(f"{ontology_uri_prefix}{subject_names[identity]}/{{{pk_id}}}")))
             g.add((subj, RR["class"], table_cls))
 
@@ -995,7 +1080,11 @@ class RigorOntologyStrategy(InductionStrategy):
                 table,
             )
 
+            column_locals = camel_names_for(table)
+
             for col in table.columns:
+                if col.name not in safe_column_names:
+                    continue
                 prop_uri = prop_by_col.get(col.name)
                 if prop_uri is None:
                     log.info(
@@ -1004,13 +1093,6 @@ class RigorOntologyStrategy(InductionStrategy):
                         col.name,
                     )
                     continue
-
-                pom = URIRef(f"{tmap}/POM_{_to_pascal(col.name)}")
-                g.add((tmap, RR.predicateObjectMap, pom))
-                g.add((pom, RR.predicate, prop_uri))
-
-                om = URIRef(f"{pom}/ObjectMap")
-                g.add((pom, RR.objectMap, om))
 
                 fk_target, _ = self._fk_info(col.name, table)
                 fk_constraint = self._fk_constraint(col.name, table)
@@ -1035,7 +1117,28 @@ class RigorOntologyStrategy(InductionStrategy):
                     subject_names,
                     ambiguous_names,
                     fk_target_datasource_id,
+                    unmapped_ids,
                 )
+                if (
+                    is_object_property
+                    and fk_target
+                    and resolve_fk_target_identity(table, fk_target, ref_index, fk_target_datasource_id) in unmapped_ids
+                ):
+                    # The target got no TriplesMap, so there is nothing to point an
+                    # IRI at, and a literal under an owl:ObjectProperty makes Ontop
+                    # reject the namespace. Leave the property unmapped.
+                    log.warning(
+                        "r2rml_relationship_left_unmapped",
+                        extra={"table": table.name, "column": col.name, "target": fk_target},
+                    )
+                    continue
+
+                pom = URIRef(f"{tmap}/POM_{pom_segment(column_locals[col.name])}")
+                g.add((tmap, RR.predicateObjectMap, pom))
+                g.add((pom, RR.predicate, prop_uri))
+
+                om = URIRef(f"{pom}/ObjectMap")
+                g.add((pom, RR.objectMap, om))
 
                 col_id = sql_ident(col.name)
                 if is_object_property and target_token is not None:
@@ -1172,6 +1275,7 @@ class RigorOntologyStrategy(InductionStrategy):
         subject_names: dict[str, str],
         ambiguous_names: set[str],
         target_datasource_id: str | None = None,
+        unmapped_ids: set[str] | frozenset[str] = frozenset(),
     ) -> str | None:
         """Resolve an FK target name to the subject-IRI token of its TriplesMap.
 
@@ -1185,6 +1289,10 @@ class RigorOntologyStrategy(InductionStrategy):
         ``target_datasource_id`` (an approved cross-source FK, #1140) goes to the
         same :func:`resolve_fk_target_identity` call the other three artifacts
         make, so the template names the table the ontology's range does.
+
+        A target in ``unmapped_ids`` (skipped for an unsupported column) also
+        returns ``None``: it has no TriplesMap, so an IRI template would point at
+        individuals nothing mints, or at an unrelated row of a fallback key.
 
         A target genuinely outside this induction run is NOT minted this
         run, so it has no TriplesMap here to point an IRI template at. Returning
@@ -1200,6 +1308,8 @@ class RigorOntologyStrategy(InductionStrategy):
             ref_index,
             target_datasource_id,
         )
+        if target_id is not None and target_id in unmapped_ids:
+            return None
         if target_id is not None and target_id in subject_names:
             return subject_names[target_id]
         if target_name in ambiguous_names:

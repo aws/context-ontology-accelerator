@@ -9,6 +9,10 @@ without the SQL ever touching them, and their names used to reach the caller in
 the ``t2.sql.generate`` / ``t2.sql.execute`` step details (streamed over SSE) and
 in the response metadata. These tests pin every client-visible table list to the
 grant, through the same allowlist normalization the firewall uses.
+
+The ``t2.sql.generate`` / ``t2.sql.execute`` steps list the tables the SQL reads,
+not the retrieval context, so even an unrestricted caller is never told a query
+read a table it did not (``TestTraceListsTablesTheSqlReads``).
 """
 
 from __future__ import annotations
@@ -17,6 +21,7 @@ import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import sqlglot
 from coa_serve.exceptions import AccessDeniedError
 from coa_serve.models import InvokeRequest
 from coa_serve.sse_emitter import SSEEmitter
@@ -127,20 +132,24 @@ def _exec_result():
     return r
 
 
-def _strategy(nl_result):
+def _strategy(nl_result, executor=None, corrected_sql=None):
     gen = AsyncMock()
     gen.generate.return_value = nl_result
-    executor = AsyncMock()
-    executor.execute.return_value = _exec_result()
+    if corrected_sql is not None:
+        gen.correct.return_value = (corrected_sql, 0.8)
+    if executor is None:
+        executor = AsyncMock()
+        executor.execute.return_value = _exec_result()
     return NLtoSQLStrategy(
         sql_generator=gen,
         firewall=SQLFirewall(cedar_authorizer=NullCedarAuthorizer()),
         query_executor=executor,
         oss_ontology_index="idx",
+        max_shots=2,
     )
 
 
-async def _resolve_streamed(profile, nl_result=None):
+async def _resolve_streamed(profile, nl_result=None, executor=None, corrected_sql=None):
     """Run the strategy with a trace wired to a real SSEEmitter, as the streaming handler does."""
     emitter = SSEEmitter("req-1")
 
@@ -154,7 +163,8 @@ async def _resolve_streamed(profile, nl_result=None):
         options={"maxResults": 10, "dataSourceId": "ds-1"},
         trace=trace,
     )
-    result = await _strategy(nl_result or _nl_result()).resolve("how many orders?", "ns", ctx)
+    strategy = _strategy(nl_result or _nl_result(), executor=executor, corrected_sql=corrected_sql)
+    result = await strategy.resolve("how many orders?", "ns", ctx)
     await trace.flush()
     events = []
     while not emitter._queue.empty():
@@ -184,12 +194,12 @@ class TestNLtoSQLTraceTables:
         assert _step_detail(events, StepId.T2_SQL_EXECUTE)["tables"] == ["orders"]
 
     @pytest.mark.asyncio
-    async def test_resolve_no_allowlist_trace_lists_every_table(self):
+    async def test_resolve_no_allowlist_trace_lists_only_tables_the_sql_reads(self):
+        # The FK walk put two more tables in the context; the SQL reads ``orders`` only.
         _, _, events = await _resolve_streamed({"userId": "analyst"})
 
-        expected = ["orders", *RESTRICTED]
-        assert _step_detail(events, StepId.T2_SQL_GENERATE)["tables"] == expected
-        assert _step_detail(events, StepId.T2_SQL_EXECUTE)["tables"] == expected
+        assert _step_detail(events, StepId.T2_SQL_GENERATE)["tables"] == ["orders"]
+        assert _step_detail(events, StepId.T2_SQL_EXECUTE)["tables"] == ["orders"]
 
     @pytest.mark.asyncio
     async def test_resolve_fk_walked_restricted_tables_removed_from_collected_trace(self):
@@ -205,6 +215,132 @@ class TestNLtoSQLTraceTables:
         nl_result = _nl_result(sql="SELECT * FROM employee_salaries")
         with pytest.raises(AccessDeniedError):
             await _resolve_streamed(ALLOWLIST_PROFILE, nl_result=nl_result)
+
+
+# ── NL→SQL strategy: trace lists the tables the SQL reads ───────────────
+
+JOIN_SQL = (
+    "SELECT c.region, SUM(o.order_total_usd) AS total FROM orders o "
+    "JOIN customers c ON o.customer_id = c.customer_id GROUP BY c.region"
+)
+# Trino-only syntax: sqlglot's default dialect cannot parse a ROW type cast.
+ROW_CAST_SQL = "SELECT CAST(ROW(o.id, o.amount) AS ROW(id bigint, amt double)).amt AS amt FROM orders o"
+
+
+def _context_result(sql):
+    """Retrieval found four tables; the generated SQL may read fewer of them."""
+    r = _nl_result(sql=sql)
+    r.retrieved_tables = ["orders", "customers", "products", "order_items"]
+    r.expanded_tables = ["orders", "customers", "products", "order_items"]
+    return r
+
+
+class TestTraceListsTablesTheSqlReads:
+    @pytest.mark.asyncio
+    async def test_resolve_trino_only_row_cast_lists_its_table(self):
+        """Unrestricted grant: the firewall only parses as Trino, and the query runs.
+
+        The trace used to show ``tables: []`` here, plus two parse-error warnings.
+        """
+        with capture_logs() as logs:
+            result, _, events = await _resolve_streamed({"userId": "analyst"}, nl_result=_context_result(ROW_CAST_SQL))
+
+        assert result is not None, "precondition: the query passes the firewall and runs"
+        assert _step_detail(events, StepId.T2_SQL_GENERATE)["tables"] == ["orders"]
+        assert _step_detail(events, StepId.T2_SQL_EXECUTE)["tables"] == ["orders"]
+        assert not [log for log in logs if log["event"] == "sql_firewall_parse_error"]
+
+    @pytest.mark.asyncio
+    async def test_resolve_join_lists_joined_tables_not_the_retrieval_context(self):
+        _, _, events = await _resolve_streamed({"userId": "analyst"}, nl_result=_context_result(JOIN_SQL))
+
+        assert _step_detail(events, StepId.T2_SQL_GENERATE)["tables"] == ["customers", "orders"]
+        assert _step_detail(events, StepId.T2_SQL_EXECUTE)["tables"] == ["customers", "orders"]
+
+    @pytest.mark.asyncio
+    async def test_resolve_join_response_metadata_keeps_the_retrieval_context(self):
+        result, _, _ = await _resolve_streamed({"userId": "analyst"}, nl_result=_context_result(JOIN_SQL))
+
+        assert result.expanded_tables == ["orders", "customers", "products", "order_items"]
+
+    @pytest.mark.asyncio
+    async def test_resolve_allowlisted_principal_join_lists_joined_tables(self):
+        profile = {"userId": "analyst", "tableAllowlist": ["orders", "customers", "products"]}
+        _, _, events = await _resolve_streamed(profile, nl_result=_context_result(JOIN_SQL))
+
+        assert _step_detail(events, StepId.T2_SQL_EXECUTE)["tables"] == ["customers", "orders"]
+
+    @pytest.mark.asyncio
+    async def test_resolve_cte_name_is_not_listed_as_a_table(self):
+        sql = "WITH done AS (SELECT * FROM orders WHERE status = 'completed') SELECT count(*) AS n FROM done"
+        _, _, events = await _resolve_streamed({"userId": "analyst"}, nl_result=_context_result(sql))
+
+        assert _step_detail(events, StepId.T2_SQL_EXECUTE)["tables"] == ["orders"]
+
+    @pytest.mark.asyncio
+    async def test_resolve_correction_shot_lists_the_corrected_sql_tables(self):
+        executor = AsyncMock()
+        executor.execute.side_effect = [RuntimeError("COLUMN_NOT_FOUND"), _exec_result()]
+        _, _, events = await _resolve_streamed(
+            {"userId": "analyst"},
+            nl_result=_context_result(JOIN_SQL),
+            executor=executor,
+            corrected_sql="SELECT count(*) AS n FROM customers",
+        )
+
+        executes = [e["payload"] for e in events if e["payload"]["stepName"] == StepId.T2_SQL_EXECUTE]
+        assert [e["status"] for e in executes] == ["error", "success"]
+        assert executes[1]["detail"]["tables"] == ["customers"]
+
+
+class TestReferencedTables:
+    def test_referenced_tables_qualified_names_reduce_to_bare_lower_case_names(self):
+        sql = 'SELECT 1 FROM "AwsDataCatalog"."sales"."Orders" o JOIN sales.customers c ON o.id = c.id'
+        assert SQLFirewall.referenced_tables(sql) == ["customers", "orders"]
+
+    def test_referenced_tables_subquery_and_cte_tables_are_listed_once(self):
+        sql = "WITH t AS (SELECT * FROM orders) SELECT * FROM t WHERE id IN (SELECT order_id FROM orders)"
+        assert SQLFirewall.referenced_tables(sql) == ["orders"]
+
+    @pytest.mark.parametrize("sql", ["", "SELECT FROM WHERE (((", None])
+    def test_referenced_tables_unparseable_or_empty_returns_empty_list(self, sql):
+        assert SQLFirewall.referenced_tables(sql) == []
+
+    def test_referenced_tables_trino_only_row_cast_lists_its_table(self):
+        """sqlglot's default dialect can't parse a ROW type cast; Trino can."""
+        assert SQLFirewall.referenced_tables(ROW_CAST_SQL) == ["orders"]
+
+    def test_referenced_tables_default_dialect_fallback(self, monkeypatch):
+        """A statement only the default dialect parses still lists its tables."""
+        real_parse_one = sqlglot.parse_one
+
+        def trino_fails(sql, read=None, **kwargs):
+            if read == "trino":
+                raise sqlglot.errors.ParseError("trino can't")
+            return real_parse_one(sql, read=read, **kwargs)
+
+        monkeypatch.setattr(sqlglot, "parse_one", trino_fails)
+        assert SQLFirewall.referenced_tables(JOIN_SQL) == ["customers", "orders"]
+
+    def test_referenced_tables_untokenizable_sql_returns_empty_list_without_raising(self):
+        # TokenError is not a ParseError: it used to escape into the trace step.
+        assert SQLFirewall.referenced_tables("SELECT 'unterminated FROM orders") == []
+
+    def test_referenced_tables_logs_no_firewall_parse_error(self):
+        """Nothing was authorized here, so the firewall's parse-error event is not logged."""
+        with capture_logs() as logs:
+            SQLFirewall.referenced_tables(ROW_CAST_SQL)
+            SQLFirewall.referenced_tables("SELECT FROM WHERE (((")
+        assert not [log for log in logs if log["event"] == "sql_firewall_parse_error"]
+
+    def test_referenced_tables_matches_what_the_allowlist_checks(self):
+        """Every listed table is one the firewall checked against the allowlist."""
+        firewall = SQLFirewall(cedar_authorizer=NullCedarAuthorizer())
+        tables = SQLFirewall.referenced_tables(JOIN_SQL)
+        assert not firewall.evaluate(JOIN_SQL, {"tableAllowlist": tables}).denied
+        for dropped in tables:
+            remaining = [t for t in tables if t != dropped]
+            assert firewall.evaluate(JOIN_SQL, {"tableAllowlist": remaining}).denied
 
 
 # ── /invoke response metadata ───────────────────────────────────────────
@@ -280,6 +416,42 @@ class TestAgenticTraceTables:
         assert result.retrieved_tables == ["orders"] and result.expanded_tables == ["orders"]
         execute = next(s for s in trace.steps if s.step == StepId.T2_SQL_EXECUTE)
         assert execute.detail["tables"] == ["orders"]
+
+    @pytest.mark.asyncio
+    async def test_resolve_execute_step_lists_executed_sql_tables_not_inspected_ones(self, monkeypatch):
+        from coa_serve.agents.sql_agent import SqlAgentOutcome
+        from coa_serve.tier2.nl_to_sql import agentic_strategy as mod
+
+        outcome = SqlAgentOutcome(
+            executed_sql="SELECT count(*) FROM orders",
+            rows=[{"n": 1}],
+            columns=["n"],
+            row_count=1,
+            confidence=0.8,
+            data_source_id="ds-1",
+            tables=["customers", "orders", "products"],
+        )
+        agent = MagicMock()
+        agent.run = AsyncMock(return_value=outcome)
+        monkeypatch.setattr(mod, "SqlAgent", MagicMock(return_value=agent))
+        gen = MagicMock()
+        gen.llm = MagicMock()
+        strategy = mod.AgenticStrategy(
+            sql_generator=gen,
+            firewall=MagicMock(),
+            query_executor=MagicMock(),
+            vector_client=MagicMock(),
+            oss_ontology_index="idx",
+        )
+        trace = TraceCollector()
+        ctx = StrategyContext(embedding=None, profile={"userId": "analyst"}, options={}, trace=trace)
+
+        result = await strategy.resolve("how many orders", "ns", ctx)
+
+        execute = next(s for s in trace.steps if s.step == StepId.T2_SQL_EXECUTE)
+        assert execute.detail["tables"] == ["orders"]
+        # What the agent inspected is still reported as the retrieval context.
+        assert result.retrieved_tables == ["customers", "orders", "products"]
 
 
 # ── Ontop/VKG compile step ──────────────────────────────────────────────

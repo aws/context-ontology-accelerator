@@ -16,15 +16,94 @@ Namespaces are the top-level organizational unit in Context Ontology Accelerator
    - **Display name** — human-friendly label
    - **Description** — purpose of this namespace
    - **Owner** — email of the initial owner (will receive `namespace-owner` role automatically)
-4. Click **Create**
+   - **Language** — **English (en)** (default) or **Japanese (ja)**. Text COA
+     generates (descriptions, synonyms, and labels for document sources) uses
+     this language; source text and table and column names are kept as-is.
+     The language cannot be changed later (see
+     [Namespace Language](#namespace-language))
+4. Click **Create namespace**, check the language in the
+   **Confirm namespace language** dialog, then click **Confirm and create**
 
 ### Via API
 
-`POST /namespaces` with `name`, `displayName`, `description`, and `owner` —
+`POST /namespaces` with `name`, `displayName`, `description`, `owner` and an
+optional `language` —
 see **CreateNamespace** in the [API Reference](#/api-reference) for the full
 request/response schema. Returns `201 Created` with the new namespace
-(`namespaceId`, `status: ACTIVE`, `dataZoneProjectId`, `athenaWorkgroupName`,
-etc.).
+(`namespaceId`, `status: ACTIVE`, `language`, `dataZoneProjectId`,
+`athenaWorkgroupName`, etc.).
+
+### Namespace Language
+
+`language` is the language your sources are written in. COA uses it for the
+text it generates for that namespace, such as descriptions and synonyms. It is
+fixed when the namespace is created.
+
+- **Format:** `language[-script][-region]` — language is 2–8 letters, script is
+  4 letters, region is 2 letters or 3 digits. Examples: `en`, `ja`, `pt-BR`,
+  `es-419`, `zh-Hant`. Variants, extensions and private-use subtags are
+  rejected with `400`. This is a subset of the BCP 47 tag format; see
+  [BCP 47 language tag](https://developer.mozilla.org/en-US/docs/Glossary/BCP_47_language_tag)
+  for how tags are built and the
+  [list of common primary language subtags](https://en.wikipedia.org/wiki/IETF_language_tag#List_of_common_primary_language_subtags)
+  to find the code for your language.
+- **Canonical form:** surrounding spaces are trimmed and case is normalized, so
+  ` JA-jp ` is stored and returned as `ja-JP`.
+- **Default:** omitting `language` creates an English (`en`) namespace.
+- **Immutable:** `UpdateNamespace` has no `language` member. To use another
+  language, create a new namespace and onboard the sources there.
+- **In responses:** every namespace response includes the effective
+  `language`. Namespaces created before this field existed report `en`.
+- **For API clients:** the change is additive. Requests are unchanged
+  (`language` on **CreateNamespace** is optional and defaults to `en`), so an
+  existing caller keeps working. `language` is a required member of
+  `NamespaceSummary` (**ListNamespaces**) and `NamespaceDetail` (**CreateNamespace**,
+  **GetNamespace**, **UpdateNamespace**, **UpdateNamespaceStatus**), so it is
+  always present and never needs a null check. To read it from a typed client,
+  regenerate the client from the Smithy models (`make generate`, see
+  [Smithy Code Generation](smithy-codegen.md)); the console already uses it.
+- **Languages in the console:** the console offers English (`en`) and
+  Japanese (`ja`), the two languages tested end to end, and shows each
+  namespace's language on the namespace list and detail pages. The API
+  accepts any tag in the format above. In a namespace of another language,
+  COA gives the model the same instruction to write in the namespace
+  language, so the text listed under
+  [What the language changes](#what-the-language-changes) as generated in
+  the namespace language should come out in it; only English and Japanese
+  are tested end to end. Two things differ from English and Japanese:
+  - The fixed text COA adds itself, such as foreign-key notes, fallback class
+    descriptions and default proposal titles, stays English, so a proposal
+    can mix English boilerplate with generated text in your language.
+  - Only Korean (`ko`) and Chinese (exactly `zh`) generated text carries an
+    RDF language tag (see
+    [Namespace language](ontologies.md#namespace-language) in the ontology
+    guide). Other languages produce untagged literals. COA still shows them,
+    because the language never filters a label out, but a SPARQL query or RDF
+    tool that filters with `lang()` or `langMatches()` will not find them,
+    and if a resource also has another untagged label, COA picks between the
+    two in lexical order instead of preferring the generated one.
+
+#### What the language changes
+
+- **Generated in the namespace language:** descriptions, synonyms, glossary
+  terms and tags from database enrichment (see
+  [Language of Generated Metadata](sources.md#language-of-generated-metadata));
+  propositions, topics, entity classes, entities and relationships extracted
+  from documents (see
+  [Language of Extracted Content](sources.md#language-of-extracted-content));
+  and class descriptions, foreign-key notes and default proposal titles from
+  ontology induction (the fixed parts of foreign-key notes and proposal titles
+  exist in English and Japanese only, see above).
+- **Kept as they are:** table and column names, catalog comments, document
+  text, metadata a steward wrote, and identifiers such as model numbers,
+  product names, units and codes. COA does not translate them.
+- **Always English:** console text, API error messages, and platform
+  vocabulary in the ontology such as `matchConfidence`.
+- **Queries:** nothing is translated at query time. When a class or property
+  has a label in the namespace language next to an untagged one, query context
+  and the graph views use the namespace-language label; no resource is hidden
+  because of its language. A Tier 3 answer is written in the language of the
+  question.
 
 ### What Happens on Create
 

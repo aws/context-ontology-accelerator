@@ -238,3 +238,62 @@ class TestShapeSeverity:
         assert len(shape) == 1
         assert shape[0]["severity"] == "ERROR"
         assert "full SELECT statement" in shape[0]["message"]
+
+
+# ── Declared sourceTable: one verdict, one wording ──────────────────────
+
+
+class TestKnownButRejectedSourceTable:
+    """The table is in the catalog but ``table_exists`` rejects it.
+
+    The source gate and the validator's ``table_reference`` check both run on the
+    real SMUS lookup here, with only the DataZone reads patched, so the response
+    shows what a caller of validate-before-create actually gets.
+    """
+
+    @staticmethod
+    def _asset(status: str):
+        from coa_common.domain_models import BusinessMetadata, Column, ReviewStatus, Table
+
+        return Table(
+            name="orders",
+            database="public",
+            business_metadata=BusinessMetadata(review_status=ReviewStatus(status)),
+            columns=[Column(name="total_amount", data_type="decimal")],
+        )
+
+    @pytest.mark.parametrize(
+        ("asset_status", "expected_tail"),
+        [
+            ("PENDING_REVIEW", "but is not approved — approve the table on the data source, then retry"),
+            (None, "but its catalog metadata is missing or could not be read — re-scan the data source, then retry"),
+        ],
+    )
+    def test_no_finding_says_not_found(self, monkeypatch: pytest.MonkeyPatch, asset_status, expected_tail) -> None:
+        from coa_metrics.lookups import SmusCatalogDataSourceLookup
+        from coa_metrics.source_status import PERMISSIVE_ENV
+
+        monkeypatch.delenv(PERMISSIVE_ENV, raising=False)
+        lookup = SmusCatalogDataSourceLookup(
+            domain_id="dzd-1", project_id="prj-1", namespace_id="test-ns", datasources_table="sources-tbl"
+        )
+        asset = None if asset_status is None else self._asset(asset_status)
+        with (
+            patch("coa_metrics.lookups.read_asset_names_for_datasource", return_value={"orders": "asset-orders"}),
+            patch("coa_metrics.lookups.read_table_for_asset", return_value=asset),
+            patch("coa_metrics.data_source_lookup_factory.build_data_source_lookup", return_value=lookup),
+            patch.multiple(
+                "coa_metrics.api.validate_metric",
+                _get_data_source_lookup=MagicMock(return_value=lookup),
+                _get_ontology_lookup=MagicMock(return_value=None),
+                check_source_approved=MagicMock(return_value=None),
+            ),
+        ):
+            resp = handler(_make_event(body=_valid_body()), None)
+
+        assert resp["statusCode"] == 200
+        warnings = json.loads(resp["body"])["warnings"]
+        expected = f"Source table 'orders' exists in data source 'ds-abc123' {expected_tail}"
+        assert {"field": "sourceTable", "message": expected, "severity": "ERROR"} in warnings
+        assert {"field": "table_reference", "message": expected, "severity": "INFO"} in warnings
+        assert not [w for w in warnings if "not found" in w["message"]]

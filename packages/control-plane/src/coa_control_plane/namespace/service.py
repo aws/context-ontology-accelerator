@@ -16,6 +16,7 @@ from botocore.exceptions import ClientError
 from coa_common import sanitize_principal_key
 from coa_common.authnz_types import PrincipalType, ResourceType
 from coa_common.dao import DynamoDBDAO, QueryParams
+from coa_common.language_tags import DEFAULT_LANGUAGE, canonicalize_language_tag
 from coa_common.metadata_store import MetadataStoreClient, MetadataStoreError
 from coa_control_plane_server.models.create_namespace_request_content import CreateNamespaceRequestContent
 from coa_control_plane_server.models.namespace_detail import NamespaceDetail
@@ -62,9 +63,10 @@ class NamespaceService:
     def create(self, request: CreateNamespaceRequestContent) -> NamespaceDetail:
         """Create a namespace and its DataZone project atomically.
 
-        Reserves the name, provisions the DataZone project and Athena
-        workgroup, then writes the namespace record, roles, and mappings,
-        rolling back the reservation if project creation fails.
+        Canonicalizes the requested language (``en`` when omitted), reserves
+        the name, provisions the DataZone project and Athena workgroup, then
+        writes the namespace record, roles, and mappings, rolling back the
+        reservation if project creation fails.
 
         Args:
             request: The validated create-namespace request.
@@ -73,9 +75,16 @@ class NamespaceService:
             The detail of the newly created namespace.
 
         Raises:
+            LanguageTagError: If the requested language is not a supported
+                tag. Raised before any reservation or provisioning.
             ConflictError: If a namespace with the same name already exists.
             MetadataStoreError: If DataZone project provisioning fails.
         """
+        # Validate the language before anything is reserved or provisioned so
+        # an invalid tag has no side effect. The language is immutable, so this
+        # canonical value is the only one the namespace will ever carry.
+        language = DEFAULT_LANGUAGE if request.language is None else canonicalize_language_tag(request.language)
+
         namespace_id = str(uuid.uuid4())
         now = datetime.now(UTC).isoformat()
 
@@ -121,7 +130,7 @@ class NamespaceService:
         workgroup_name = self._create_athena_workgroup(namespace_id)
 
         # Step 3: Write namespace record, roles, mappings, and confirm reservation.
-        self._finalize(namespace_id, request, project.project_id, workgroup_name, now)
+        self._finalize(namespace_id, request, language, project.project_id, workgroup_name, now)
 
         return NamespaceDetail.model_construct(
             namespace_id=namespace_id,
@@ -130,6 +139,7 @@ class NamespaceService:
             description=request.description,
             owner=request.owner,
             status=NamespaceStatus.ACTIVE,
+            language=language,
             data_zone_project_id=project.project_id,
             source_count=0,
             created_at=now,
@@ -259,6 +269,7 @@ class NamespaceService:
         self,
         namespace_id: str,
         request: CreateNamespaceRequestContent,
+        language: str,
         datazone_project_id: str,
         athena_workgroup_name: str | None,
         now: str,
@@ -280,6 +291,7 @@ class NamespaceService:
             "description": request.description,
             "owner": request.owner,
             "status": NamespaceStatus.ACTIVE,
+            "language": language,
             "dataZoneProjectId": datazone_project_id,
             "sourceCount": 0,
         }

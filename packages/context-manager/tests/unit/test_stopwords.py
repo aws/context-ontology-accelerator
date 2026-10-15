@@ -25,6 +25,10 @@ class TestMergedSet:
         assert "알려줘" in stopwords.RESIDUAL_STOP_WORDS  # ko
         assert "いくら" in stopwords.RESIDUAL_STOP_WORDS  # ja
 
+    @pytest.mark.parametrize("word", ["何台", "何件", "何名", "何社", "いくつ", "どれくらい", "どのくらい"])
+    def test_japanese_quantity_questions_are_scaffolding(self, word):
+        assert word in stopwords.RESIDUAL_STOP_WORDS
+
     def test_groups_are_nonempty(self):
         for group in stopwords.RESIDUAL_STOP_WORD_GROUPS:
             assert group.split(), "empty stop-word group"
@@ -66,3 +70,21 @@ class TestCurationPolicy:
     )
     def test_japanese_qualifier_words_are_absent(self, word):
         assert word not in stopwords.RESIDUAL_STOP_WORDS
+
+    @pytest.mark.parametrize("run", sorted(ja.SAFE_PARTICLE_RUNS))
+    def test_safe_particle_run_is_a_pair_of_listed_particles(self, run):
+        # Every entry is two hiragana scalars, each a listed stop word, and the
+        # pair itself is not a stop word (else the entry would be redundant).
+        assert len(run) == 2
+        assert all("\u3041" <= char <= "\u3096" for char in run)
+        assert all(char in stopwords.RESIDUAL_STOP_WORDS for char in run)
+        assert run not in stopwords.RESIDUAL_STOP_WORDS
+
+    def test_safe_particle_runs_exclude_content_words(self):
+        assert {"ごご", "もも", "かが", "もの", "ので"}.isdisjoint(ja.SAFE_PARTICLE_RUNS)
+
+    def test_resolver_consumes_the_merged_safe_particle_runs(self):
+        from coa_serve.tier1 import metric_resolver
+
+        assert stopwords.SAFE_PARTICLE_RUNS is metric_resolver.SAFE_PARTICLE_RUNS
+        assert ja.SAFE_PARTICLE_RUNS <= stopwords.SAFE_PARTICLE_RUNS

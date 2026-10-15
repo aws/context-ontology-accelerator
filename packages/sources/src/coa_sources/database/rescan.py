@@ -57,6 +57,7 @@ from coa_common.domain_models import (
     Column,
     EnrichmentSource,
     ForeignKey,
+    GeneratedField,
     PrimaryKey,
     ReviewStatus,
     Table,
@@ -345,6 +346,10 @@ def _carry_curated_status(bm: BusinessMetadata, fresh: BusinessMetadata, *, chan
         new_status: str = ReviewStatus.PENDING_REVIEW
     else:
         new_status = bm.review_status
+    # Generated-field markers survive only for values carried over unchanged. A
+    # description the source now supplies is source text, so its marker goes in
+    # the same revision; synonyms / glossary / tags are always carried as-is.
+    generated_fields = [f for f in bm.generated_fields if not (take_fresh and f == GeneratedField.DESCRIPTION)]
     return BusinessMetadata(
         description=fresh.description if take_fresh else bm.description,
         synonyms=list(bm.synonyms),
@@ -353,6 +358,7 @@ def _carry_curated_status(bm: BusinessMetadata, fresh: BusinessMetadata, *, chan
         enrichment_source=fresh.enrichment_source if take_fresh else bm.enrichment_source,
         review_status=new_status,
         confidence=fresh.confidence if take_fresh else bm.confidence,
+        generated_fields=generated_fields,
     )
 
 

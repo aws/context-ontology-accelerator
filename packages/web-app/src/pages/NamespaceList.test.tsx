@@ -20,6 +20,7 @@ let mockNamespaces: Array<{
   name: string;
   status: string;
   sourceCount?: number;
+  language?: string;
 }> = [];
 
 vi.mock("../api-hooks", () => ({
@@ -67,6 +68,45 @@ describe("NamespaceList", () => {
     expect(
       screen.getAllByRole("button", { name: /create namespace/i }).length,
     ).toBeGreaterThan(0);
+  });
+});
+
+describe("NamespaceList language column", () => {
+  beforeEach(() => {
+    mockNamespaces = [
+      { namespaceId: "ns-en", name: "en-ns", status: "ACTIVE", language: "en" },
+      { namespaceId: "ns-ja", name: "ja-ns", status: "ACTIVE", language: "ja" },
+      {
+        namespaceId: "ns-pt",
+        name: "pt-ns",
+        status: "ACTIVE",
+        language: "pt-BR",
+      },
+    ];
+  });
+
+  it("shows each namespace language read-only with a human label", () => {
+    render(<NamespaceList />, { wrapper });
+    expect(
+      screen.getByRole("columnheader", { name: /language/i }),
+    ).toBeInTheDocument();
+    expect(
+      within(screen.getByRole("row", { name: /en-ns/i })).getByText(
+        "English (en)",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      within(screen.getByRole("row", { name: /ja-ns/i })).getByText(
+        "Japanese (ja)",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("shows an unknown language tag as the raw tag", () => {
+    render(<NamespaceList />, { wrapper });
+    expect(
+      within(screen.getByRole("row", { name: /pt-ns/i })).getByText("pt-BR"),
+    ).toBeInTheDocument();
   });
 });
 

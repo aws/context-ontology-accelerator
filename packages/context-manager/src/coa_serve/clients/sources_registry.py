@@ -23,6 +23,7 @@ from typing import Any
 import boto3
 import structlog
 from coa_common import resolve_namespace_id, resolve_region, sync_boto_config
+from coa_common.language_tags import LanguageTagError, canonicalize_language_tag, effective_namespace_language
 
 from ..query_utils import validate_namespace
 
@@ -41,6 +42,16 @@ _QUERY_LIMIT = 50
 # a long-lived process from growing without bound under high namespace cardinality
 # (TTL alone only invalidates on read, it never evicts).
 _ITEMS_CACHE_MAX = 1024
+
+
+class NamespaceLanguageUnavailableError(RuntimeError):
+    """The namespace's language could not be determined.
+
+    Raised for a missing namespace item, a failed read, or a stored value that is
+    not a supported tag. Never resolved to ``en``: only an existing item without a
+    ``language`` attribute (a namespace created before the field) reads as ``en``.
+    """
+
 
 # Source-type literals as stored in the sources DDB table (mirror of the
 # generated control-plane SourceType enum: DATABASE / DOCUMENTS). Kept as string
@@ -125,6 +136,9 @@ class SourcesRegistry:
         # _query_sources), so the cache only ever holds complete result sets.
         self._items_cache: OrderedDict[str, tuple[list[dict[str, Any]], float]] = OrderedDict()
         self._cache_lock = asyncio.Lock()
+        # Namespace language is immutable once the namespace exists, so a value
+        # read from its METADATA item never goes stale. Bounded LRU, no TTL.
+        self._language_cache: OrderedDict[str, str] = OrderedDict()
 
     @property
     def available(self) -> bool:
@@ -190,7 +204,66 @@ class SourcesRegistry:
         except Exception:
             logger.warning("namespace_exists_metadata_failed", namespace=namespace, exc_info=True)
             return None
-        return bool(resp.get("Item"))
+        item = resp.get("Item")
+        if item:
+            # The existence gate already holds the item: remember its language so
+            # the request's label preference costs no second read.
+            self._remember_language(namespace, item)
+        return bool(item)
+
+    def _remember_language(self, namespace: str, item: dict[str, Any]) -> None:
+        """Cache the canonical language of a loaded METADATA item, if valid."""
+        try:
+            language = canonicalize_language_tag(effective_namespace_language(item))
+        except (LanguageTagError, TypeError, AttributeError):
+            # Leave it uncached; namespace_language() re-reads and reports it.
+            return
+        self._language_cache[namespace] = language
+        self._language_cache.move_to_end(namespace)
+        while len(self._language_cache) > _ITEMS_CACHE_MAX:
+            self._language_cache.popitem(last=False)
+
+    async def namespace_language(self, namespace: str) -> str | None:
+        """Return the namespace's canonical effective language.
+
+        Returns:
+            The stored language, ``"en"`` for an existing item written before the
+            field existed, or ``None`` when no namespaces table is configured (the
+            feature is absent, as for :meth:`namespace_exists`).
+
+        Raises:
+            NamespaceLanguageUnavailableError: The table is configured but the
+                item is missing, the read failed, or the stored value is invalid.
+        """
+        if not self._namespaces_table or not self._dynamodb:
+            return None
+        cached = self._language_cache.get(namespace)
+        if cached is not None:
+            self._language_cache.move_to_end(namespace)
+            return cached
+        loop = asyncio.get_running_loop()
+        table = self._dynamodb.Table(self._namespaces_table)
+        try:
+            ns_id = await loop.run_in_executor(self._executor, lambda: resolve_namespace_id(namespace, table))
+            resp = await asyncio.wait_for(
+                loop.run_in_executor(
+                    self._executor,
+                    lambda: table.get_item(Key={"PK": f"NS#{ns_id}", "SK": "METADATA"}),
+                ),
+                timeout=_RESOLVE_TIMEOUT_S,
+            )
+        except Exception as exc:
+            logger.warning("namespace_language_read_failed", namespace=namespace, error=type(exc).__name__)
+            raise NamespaceLanguageUnavailableError(f"cannot read namespace {namespace!r}") from exc
+        item = resp.get("Item")
+        if not item:
+            raise NamespaceLanguageUnavailableError(f"namespace {namespace!r} not found")
+        try:
+            language = canonicalize_language_tag(effective_namespace_language(item))
+        except (LanguageTagError, TypeError, AttributeError) as exc:
+            raise NamespaceLanguageUnavailableError(f"namespace {namespace!r} has an invalid language") from exc
+        self._remember_language(namespace, item)
+        return language
 
     async def get_source(self, namespace: str, data_source_id: str) -> dict[str, Any]:
         """Fetch a single source record by namespace + source ID."""

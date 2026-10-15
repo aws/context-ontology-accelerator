@@ -47,6 +47,8 @@ CONTEXT="--context env=$ENV"
 [ -n "${SCL_NL2SQL_GRAPH_EXPAND:-}" ] && CONTEXT="$CONTEXT --context serve_nl2sql_graph_expand=$SCL_NL2SQL_GRAPH_EXPAND"
 [ -n "${SCL_NL2SQL_GRAPH_EXPAND_MAX_TABLES:-}" ] && CONTEXT="$CONTEXT --context serve_nl2sql_graph_expand_max_tables=$SCL_NL2SQL_GRAPH_EXPAND_MAX_TABLES"
 [ -n "${SCL_SMUS_ADMIN_ARNS:-}" ] && CONTEXT="$CONTEXT --context smus_admin_principal_arns=$SCL_SMUS_ADMIN_ARNS"
+# Optional: enables the OoPS! pitfall scan, which sends the serialised ontology to this endpoint.
+[ -n "${SCL_OOPS_ENDPOINT:-}" ] && CONTEXT="$CONTEXT --context oops_endpoint=$SCL_OOPS_ENDPOINT"
 
 # ── Preflight: SMUS admin principal ──────────────────────────────────────
 # NamespaceStack falls back to arn:aws:iam::<account>:role/Admin when
@@ -112,7 +114,7 @@ cd "$REPO_ROOT"
 
 # ── Preflight ────────────────────────────────────────────────────────────
 echo ""
-./scripts/preflight-deploy.sh
+./scripts/preflight-deploy.sh "$ENV"
 
 # ── Build ────────────────────────────────────────────────────────────────
 echo ""
@@ -126,7 +128,10 @@ pnpm --filter coa-infra exec cdk synth $CONTEXT >/dev/null
 
 echo ""
 echo "Deploying all stacks..."
-pnpm --filter coa-infra exec cdk deploy --all $CONTEXT --require-approval=never
+# Stacks deploy in parallel where the dependency graph allows. Override with
+# SCL_CDK_CONCURRENCY (1 deploys one stack at a time).
+pnpm --filter coa-infra exec cdk deploy --all $CONTEXT --require-approval=never \
+  --concurrency "${SCL_CDK_CONCURRENCY:-3}"
 
 echo ""
 echo "=== Deployment to $ENV complete ==="

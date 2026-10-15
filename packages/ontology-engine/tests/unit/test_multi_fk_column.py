@@ -363,3 +363,80 @@ class TestSharedSelectionHelper:
                 "invoice_baNo__BillingAccount_legacyId": "BillingAccount",
             },
         )
+
+
+class TestUnsupportedColumnsWithMultipleForeignKeys:
+    """The R2RML embedded-quote guard inside the per-relationship FK loop."""
+
+    def test_quoted_parent_column_drops_only_that_join_and_keeps_sibling_names(self):
+        # The local FK's parent column is unresolvable by Ontop, so its join is
+        # skipped. The cross-source sibling must keep the QUALIFIED name the
+        # ontology and SHACL mint for it; recomputing qualifiers over the
+        # survivors would rename it to the plain `invoice_baNo`, which the
+        # ontology declares with rdfs:range BillingAccount — a mis-typed edge.
+        tables = [
+            _table(
+                "invoice",
+                "1",
+                ["id", "ba_no"],
+                [
+                    CatalogConstraint(
+                        constraintType="FOREIGN_KEY", columns=["ba_no"], referredColumns=['billing_account.has"quote']
+                    ),
+                    _fk("ba_no", "account_xref", ds="2"),
+                ],
+            ),
+            _table("billing_account", "1", ["id", 'has"quote']),
+            _table("account_xref", "2", ["id"]),
+        ]
+        onto, r2rml, _ = _artifacts(tables)
+
+        joins = _r2rml_join_predicates(r2rml, NS["TriplesMap_Invoice"])
+        assert joins == {str(NS["invoice_baNo__AccountXref"]): str(NS["TriplesMap_AccountXref"])}
+        onto_props = _onto_object_props(onto, NS["Invoice"])
+        assert onto_props[str(NS["invoice_baNo__AccountXref"])] == str(NS["AccountXref"])
+        referenced = "\n".join(str(v) for p in (RR.column, RR.child, RR.parent) for v in r2rml.objects(None, p))
+        assert 'has""quote' not in referenced
+
+    def test_skipped_cross_source_target_does_not_join_same_named_local_table(self):
+        # The cross-source target `customers` (datasource 2) has no R2RML-supported
+        # column, so it gets no TriplesMap. The relationship must not fall back to
+        # the bare name and join the LOCAL `customers`, and must not become a
+        # literal either: the ontology still declares it an object property.
+        tables = [
+            _table("invoice", "1", ["id", "ba_no"], [_fk("ba_no", "customers", ds="2")]),
+            _table("customers", "1", ["id"]),
+            _table("customers", "2", ['i"d']),
+        ]
+        onto, r2rml, _ = _artifacts(tables)
+
+        assert _r2rml_join_predicates(r2rml, NS["TriplesMap_Invoice"]) == {}
+        assert (NS["TriplesMap_Invoice/POM_BaNo"], None, None) not in r2rml
+        assert set(_onto_object_props(onto, NS["Invoice"])) == {str(NS["invoice_baNo"])}
+
+    @pytest.mark.parametrize(
+        "other_tables",
+        [
+            # The skipped hinted table is the only `customers`: the bare fallback
+            # would emit a parentTriplesMap no TriplesMap answers to (Ontop rejects
+            # the mapping).
+            pytest.param([], id="only-the-skipped-target"),
+            # `Customers` in datasource 1 is not the same `table.name`, so the
+            # ambiguity guard does not fire, but it owns the bare `TriplesMap_Customers`
+            # IRI: the bare fallback would join the wrong datasource's table.
+            pytest.param([_table("Customers", "1", ["id"])], id="case-variant-in-other-datasource"),
+        ],
+    )
+    def test_resolved_but_skipped_cross_source_target_never_falls_back_to_bare_name(self, other_tables):
+        # The hint resolves to datasource 2's `customers`, which has no supported
+        # column and so no TriplesMap. That must leave the relationship unmapped,
+        # never reach the bare-name fallback the unresolved path uses.
+        tables = [
+            _table("invoice", "1", ["id", "ba_no"], [_fk("ba_no", "customers", ds="2")]),
+            *other_tables,
+            _table("customers", "2", ['i"d']),
+        ]
+        _, r2rml, _ = _artifacts(tables)
+
+        assert _r2rml_join_predicates(r2rml, NS["TriplesMap_Invoice"]) == {}
+        assert (NS["TriplesMap_Invoice/POM_BaNo"], None, None) not in r2rml

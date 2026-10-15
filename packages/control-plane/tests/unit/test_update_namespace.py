@@ -107,6 +107,57 @@ class TestUpdateNamespace:
 
 
 @pytest.mark.unit
+class TestNamespaceLanguageImmutable:
+    def _put(self, dao, body):
+        from coa_control_plane.namespace.update_handler import handler
+
+        with patch(f"{MODULE}._get_ns_dao", return_value=dao):
+            return handler(
+                {
+                    "pathParameters": {"namespaceId": "ns-123"},
+                    "httpMethod": "PUT",
+                    "resource": "/namespaces/{namespaceId}",
+                    "body": json.dumps(body),
+                },
+                None,
+            )
+
+    def test_legacy_item_without_language_reads_en(self):
+        dao = MagicMock()
+        dao.get.side_effect = [_NS_ITEM, {**_NS_ITEM, "displayName": "New Name"}]
+
+        resp = self._put(dao, {"displayName": "New Name"})
+
+        assert resp["statusCode"] == 200
+        assert json.loads(resp["body"])["namespace"]["language"] == "en"
+
+    def test_language_in_request_is_ignored_and_not_written(self):
+        # UpdateNamespace has no language member; the generated model ignores
+        # unknown members, so the display-name update proceeds and the stored
+        # language is untouched.
+        stored = {**_NS_ITEM, "language": "ja"}
+        dao = MagicMock()
+        dao.get.side_effect = [stored, {**stored, "displayName": "New Name"}]
+
+        resp = self._put(dao, {"displayName": "New Name", "language": "fr"})
+
+        assert resp["statusCode"] == 200
+        assert json.loads(resp["body"])["namespace"]["language"] == "ja"
+        dao.update.assert_called_once()
+        assert "language" not in dao.update.call_args.kwargs["update_fields"]
+
+    def test_language_only_request_has_no_updatable_fields(self):
+        dao = MagicMock()
+        dao.get.return_value = {**_NS_ITEM, "language": "ja"}
+
+        resp = self._put(dao, {"language": "fr"})
+
+        assert resp["statusCode"] == 400
+        assert json.loads(resp["body"])["message"] == "No updatable fields provided"
+        dao.update.assert_not_called()
+
+
+@pytest.mark.unit
 class TestUpdateNamespaceInputValidation:
     def _call(self, body: dict) -> tuple[dict, MagicMock]:
         with patch(f"{MODULE}._get_ns_dao") as mock:

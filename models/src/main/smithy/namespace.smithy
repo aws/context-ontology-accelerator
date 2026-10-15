@@ -38,6 +38,21 @@ string NamespaceDescription
 @length(min: 6, max: 254)
 string OwnerEmail
 
+/// Namespace language: a BCP 47 tag limited to `language[-script][-region]`
+/// (language 2-8 letters, script 4 letters, region 2 letters or 3 digits),
+/// e.g. `en`, `ja`, `pt-BR`, `es-419`, `zh-Hant`. Variants, extensions and
+/// private-use tags are rejected.
+///
+/// The pattern is case-insensitive and tolerates surrounding ASCII spaces and
+/// tabs so that the service can trim and canonicalize the value before
+/// persisting it (e.g. ` JA-jp ` is stored and returned as `ja-JP`). Values
+/// returned by the service are always canonical.
+@pattern("^[ \\t]*[A-Za-z]{2,8}(-[A-Za-z]{4})?(-([A-Za-z]{2}|[0-9]{3}))?[ \\t]*$")
+// The canonical form is at most 17 characters; the length bound leaves room
+// for the surrounding whitespace the service trims.
+@length(min: 2, max: 64)
+string LanguageTag
+
 // ──────────────────────────────────────────────
 // Enums
 // ──────────────────────────────────────────────
@@ -100,6 +115,11 @@ structure NamespaceSummary {
     @required
     status: NamespaceStatus
 
+    /// Immutable namespace language (canonical BCP 47 tag). Namespaces created
+    /// before the language field existed report `en`.
+    @required
+    language: LanguageTag
+
     /// Number of data sources registered in the namespace.
     sourceCount: Integer
 
@@ -127,6 +147,11 @@ structure NamespaceDetail {
 
     @required
     status: NamespaceStatus
+
+    /// Immutable namespace language (canonical BCP 47 tag), set at creation.
+    /// Namespaces created before the language field existed report `en`.
+    @required
+    language: LanguageTag
 
     /// Amazon DataZone project ID linked to this namespace, when applicable.
     dataZoneProjectId: String
@@ -193,6 +218,11 @@ operation CreateNamespace {
 
         @required
         owner: OwnerEmail
+
+        /// Language of the sources, ontology and knowledge graph this
+        /// namespace will hold. Defaults to `en` when omitted. Cannot be
+        /// changed after creation.
+        language: LanguageTag
     }
 
     output: CreateNamespaceOutput
@@ -272,6 +302,7 @@ structure ListNamespacesOutput with [PaginatedOutput] {
 // UpdateNamespace
 // ──────────────────────────────────────────────
 /// Update the mutable fields (display name, description) of an existing namespace.
+/// The namespace language is immutable and cannot be changed here.
 @idempotent
 @http(method: "PUT", uri: "/namespaces/{namespaceId}")
 operation UpdateNamespace {

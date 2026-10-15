@@ -27,6 +27,11 @@ def mock_aws_env():
         # inject an explicit authorizer to assert both postures). Mirrors the dev
         # deployment env; prod leaves this UNSET so it fails closed.
         "SCL_CEDAR_FAIL_OPEN_NO_ROLES": "true",
+        # No Roles table exists under unit tests, and the default Cedar authorizer
+        # denies every query when none is configured. Opt into the shipped
+        # seed policies for the session, as a local dev run does. Prod never sets
+        # this (it always has ROLES_TABLE_NAME, where the opt-in has no effect).
+        "ALLOW_WITHOUT_ROLES": "true",
     }
     with patch.dict(os.environ, env_vars):
         yield

@@ -17,10 +17,12 @@ from coa_common.bedrock import BedrockTruncationError, GuardrailBlockedError
 from coa_common.config import resolve_region
 from coa_common.datazone_forms import build_forms_input
 from coa_common.domain_models import (
+    GENERATED_FIELD_ATTRIBUTES,
     BusinessMetadata,
     Column,
     EnrichmentSource,
     ForeignKey,
+    GeneratedField,
     PrimaryKey,
     ReviewStatus,
     Table,
@@ -28,7 +30,7 @@ from coa_common.domain_models import (
 from coa_common.metadata_store.reader import read_assets_for_datasource
 
 from coa_sources.database.enrichment.bedrock_client import BedrockClient
-from coa_sources.database.enrichment.prompts import SYSTEM_PROMPT, build_user_prompt
+from coa_sources.database.enrichment.prompts import build_system_prompt, build_user_prompt
 from coa_sources.database.pipeline.enrichment_metrics import (
     EnrichmentMetricEmitter,
 )
@@ -82,6 +84,32 @@ _PROTECTED_DESCRIPTION_SOURCES: frozenset[str] = frozenset(
 )
 
 
+def _generated_fields(biz: BusinessMetadata) -> list[str]:
+    """Every non-empty field of freshly generated metadata, in canonical order."""
+    return [f.value for f, attr in GENERATED_FIELD_ATTRIBUTES.items() if getattr(biz, attr)]
+
+
+def _supplemented_generated_fields(existing: BusinessMetadata, merged: BusinessMetadata) -> list[str]:
+    """Generated-field markers after AI supplements a preserved record.
+
+    The preserved description is never marked. A supplement field keeps its
+    marker only when the stored value survived unchanged and was already
+    marked; a field that was empty and is now filled from the model result is
+    marked, because every value it holds is COA-generated.
+    """
+    previously = set(existing.generated_fields)
+    marked: list[str] = []
+    for f, attr in GENERATED_FIELD_ATTRIBUTES.items():
+        if f == GeneratedField.DESCRIPTION:
+            continue
+        if getattr(existing, attr):
+            if f.value in previously:
+                marked.append(f.value)
+        elif getattr(merged, attr):
+            marked.append(f.value)
+    return marked
+
+
 def _prepare_table_context(table: Table) -> dict:
     """Extract existing metadata from a table for use as prompt context."""
     existing_description = table.business_metadata.description
@@ -123,6 +151,8 @@ def run(
     scan_type: str,
     emitter: EnrichmentMetricEmitter,
     progress: Callable[[int, int], None] | None = None,
+    *,
+    namespace_language: str,
 ) -> dict:
     """Enrich all tables for a data source via Bedrock LLM calls.
 
@@ -132,6 +162,10 @@ def run(
 
     ``progress`` is called with (tables_processed, tables_total) as the run
     advances; the caller persists it.
+
+    ``namespace_language`` is the job's canonical namespace-language snapshot.
+    It selects the system prompt once for the whole run; an ``en`` namespace
+    keeps the unmodified prompt.
 
     Returns:
         Dict describing the run outcome:
@@ -159,6 +193,8 @@ def run(
 
     guardrail_id = _resolve_guardrail_id()
     client = BedrockClient(read_timeout=TABLE_TIMEOUT_SEC, guardrail_id=guardrail_id)
+    system_prompt = build_system_prompt(namespace_language)
+    logger.info("Enrichment language for datasource %s: %s", datasource_id, namespace_language)
 
     # PLAN: build all Bedrock call work items
     work_items: list[tuple[Table, list[Column], int, dict]] = []
@@ -212,6 +248,7 @@ def run(
                 cols,
                 client,
                 emitter,
+                system_prompt=system_prompt,
                 **ctx,
             ): (table, batch_idx)
             for table, cols, batch_idx, ctx in work_items
@@ -432,6 +469,7 @@ def _call_bedrock(
     client: BedrockClient,
     emitter: EnrichmentMetricEmitter,
     *,
+    system_prompt: str,
     existing_description: str = "",
     existing_pk: list[str] | None = None,
     existing_fks: list[dict] | None = None,
@@ -456,7 +494,7 @@ def _call_bedrock(
     if extra_context:
         max_tokens = 16384 if extra_context_hint else 8192
 
-    result = client.invoke(SYSTEM_PROMPT, user_prompt, max_tokens=max_tokens)
+    result = client.invoke(system_prompt, user_prompt, max_tokens=max_tokens)
 
     emitter.emit_bedrock_invocation_metrics(
         stage="Pass1",
@@ -494,7 +532,7 @@ def _apply_table_metadata(table: Table, result: dict) -> None:
         # NOTE: Do NOT auto-approve the table here. The table's review_status
         # must remain PENDING_REVIEW until all child columns reach terminal
         # states. The steward (or bulk approve) will flip it via review_logic.
-        table.business_metadata = BusinessMetadata(
+        merged = BusinessMetadata(
             description=existing.description,
             synonyms=existing.synonyms or table_meta.get("synonyms", []),
             glossary_terms=existing.glossary_terms or table_meta.get("glossary_terms", []),
@@ -503,6 +541,8 @@ def _apply_table_metadata(table: Table, result: dict) -> None:
             review_status=existing.review_status,
             confidence=existing.confidence or 1.0,
         )
+        merged.generated_fields = _supplemented_generated_fields(existing, merged)
+        table.business_metadata = merged
         return
 
     # Already-reviewed AI table descriptions are preserved verbatim on a
@@ -529,7 +569,7 @@ def _apply_table_metadata(table: Table, result: dict) -> None:
             len(table_meta.get("tags") or []),
         )
 
-    table.business_metadata = BusinessMetadata(
+    generated = BusinessMetadata(
         description=ai_description,
         synonyms=table_meta.get("synonyms", []),
         glossary_terms=table_meta.get("glossary_terms", []),
@@ -537,6 +577,9 @@ def _apply_table_metadata(table: Table, result: dict) -> None:
         enrichment_source=EnrichmentSource.AI_GENERATED,
         review_status=ReviewStatus.PENDING_REVIEW,
     )
+    # Every field was regenerated from the model result in full.
+    generated.generated_fields = _generated_fields(generated)
+    table.business_metadata = generated
 
 
 def _apply_primary_key(table: Table, result: dict) -> None:
@@ -595,7 +638,7 @@ def _apply_column_metadata(table: Table, column_results: list[dict]) -> None:
         existing = col.business_metadata
 
         if existing.enrichment_source in _PROTECTED_DESCRIPTION_SOURCES and existing.description:
-            col.business_metadata = BusinessMetadata(
+            merged = BusinessMetadata(
                 description=existing.description,
                 synonyms=existing.synonyms or meta.get("synonyms", []),
                 glossary_terms=existing.glossary_terms or meta.get("glossary_terms", []),
@@ -604,6 +647,8 @@ def _apply_column_metadata(table: Table, column_results: list[dict]) -> None:
                 review_status=existing.review_status,
                 confidence=existing.confidence or 1.0,
             )
+            merged.generated_fields = _supplemented_generated_fields(existing, merged)
+            col.business_metadata = merged
             continue
 
         # Already-reviewed columns (APPROVED/REJECTED) are preserved verbatim on
@@ -611,7 +656,7 @@ def _apply_column_metadata(table: Table, column_results: list[dict]) -> None:
         if existing.review_status in (ReviewStatus.APPROVED, ReviewStatus.REJECTED):
             continue
 
-        col.business_metadata = BusinessMetadata(
+        generated = BusinessMetadata(
             description=meta.get("description", ""),
             synonyms=meta.get("synonyms", []),
             glossary_terms=meta.get("glossary_terms", []),
@@ -620,6 +665,8 @@ def _apply_column_metadata(table: Table, column_results: list[dict]) -> None:
             review_status=ReviewStatus.PENDING_REVIEW,
             confidence=meta.get("confidence", 0.0),
         )
+        generated.generated_fields = _generated_fields(generated)
+        col.business_metadata = generated
 
 
 def _write_enriched_assets(tables: list[Table], domain_id: str, project_id: str) -> None:

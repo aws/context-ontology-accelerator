@@ -16,6 +16,7 @@ from typing import Any
 
 import structlog
 from coa_common.dao import DynamoDBDAO
+from coa_common.language_tags import LanguageTagError
 from coa_common.logging import setup_logging
 from coa_common.metadata_store import MetadataStoreError, SMUSClient
 from coa_common.response import api_response
@@ -83,6 +84,9 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     try:
         ns = _get_service().create(request)
         return api_response(201, {"namespace": ns.model_dump(by_alias=True, exclude_none=True)})
+    except LanguageTagError as exc:
+        logger.info("namespace_language_rejected", reason=str(exc))
+        return api_response(400, {"message": f"Invalid language: {exc}"})
     except ConflictError as exc:
         return api_response(409, {"message": str(exc)})
     except MetadataStoreError as exc:

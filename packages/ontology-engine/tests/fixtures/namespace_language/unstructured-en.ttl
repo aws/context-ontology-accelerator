@@ -1,0 +1,42 @@
+@prefix dcterms: <http://purl.org/dc/terms/> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+<http://coa.amazon.com/namespace/golden-ns/ontology/golden/Company/DatatypeProperty/headquartered_in> a owl:DatatypeProperty ;
+    rdfs:label "HEADQUARTERED IN"^^xsd:string ;
+    rdfs:comment "Observed across 1 fact(s)."^^xsd:string ;
+    rdfs:domain <http://coa.amazon.com/namespace/golden-ns/ontology/golden/class/Company> ;
+    rdfs:range xsd:string .
+
+<http://coa.amazon.com/namespace/golden-ns/ontology/golden/Company/ObjectProperty/café_owner> a owl:ObjectProperty ;
+    rdfs:label "café owner"^^xsd:string ;
+    rdfs:domain <http://coa.amazon.com/namespace/golden-ns/ontology/golden/class/Company> ;
+    rdfs:range <http://coa.amazon.com/namespace/golden-ns/ontology/golden/class/Financial-Instrument> .
+
+<http://coa.amazon.com/namespace/golden-ns/ontology/golden/Company/ObjectProperty/issues> a owl:ObjectProperty ;
+    rdfs:label "ISSUES"^^xsd:string ;
+    rdfs:domain <http://coa.amazon.com/namespace/golden-ns/ontology/golden/class/Company> ;
+    rdfs:range <http://coa.amazon.com/namespace/golden-ns/ontology/golden/class/Financial-Instrument> .
+
+<http://coa.amazon.com/namespace/golden-ns/ontology/golden/Topic/Bond-issuance> a skos:Concept ;
+    skos:inScheme <http://coa.amazon.com/namespace/golden-ns/ontology/golden/ConceptScheme/golden> ;
+    skos:prefLabel "Bond issuance"^^xsd:string .
+
+<http://example.org/a1-golden-docs> a owl:Ontology ;
+    rdfs:label "golden"^^xsd:string ;
+    dcterms:created "2026-01-01T00:00:00+00:00"^^xsd:dateTime ;
+    owl:versionInfo "2026-01-01T00:00:00Z" .
+
+<http://coa.amazon.com/namespace/golden-ns/ontology/golden/ConceptScheme/golden> a skos:ConceptScheme ;
+    rdfs:label "golden Topic Scheme"^^xsd:string .
+
+<http://coa.amazon.com/namespace/golden-ns/ontology/golden/class/Financial-Instrument> a owl:Class ;
+    rdfs:label "FinancialInstrument"^^xsd:string ;
+    rdfs:comment "Tradable assets such as bonds."^^xsd:string .
+
+<http://coa.amazon.com/namespace/golden-ns/ontology/golden/class/Company> a owl:Class ;
+    rdfs:label "Company"^^xsd:string ;
+    rdfs:comment "Business organisations that issue instruments."^^xsd:string .
+

@@ -12,18 +12,22 @@ from __future__ import annotations
 
 import logging
 import os
-import re
+from collections import Counter
 from itertools import batched
 
 import httpx
 from coa_common.bedrock_metrics import CostTracker
+from coa_common.domain_models import GeneratedField
+from coa_common.language_tags import DEFAULT_LANGUAGE
 from opensearchpy.exceptions import OpenSearchException
 from rdflib import OWL, RDF, RDFS, XSD, BNode, Graph, Literal, Namespace, URIRef
 from rdflib.namespace import SKOS
 
 from coa_ontology.inducer.schemas import ConceptMatch
 from coa_ontology.inducer.services.data_catalog import CatalogTable, parse_referred_column
-from coa_ontology.inducer.services.grounding import GroundingRerankError
+from coa_ontology.inducer.services.generated_text import render
+from coa_ontology.inducer.services.grounding import GroundingLookupError, GroundingRerankError
+from coa_ontology.inducer.services.literal_language import catalog_literal, generated_literal
 from coa_ontology.inducer.services.subtype_detection import detect_pk_sharing_subtypes
 from coa_ontology.inducer.strategies.base import (
     AUTHORITATIVE_FK_SOURCES,
@@ -31,6 +35,7 @@ from coa_ontology.inducer.strategies.base import (
     InductionStrategy,
     add_glossary_and_tags,
     ambiguous_target_names,
+    camel_names_for,
     composite_fk_anchors,
     composite_fk_columns,
     fk_edge_allowed,
@@ -41,6 +46,8 @@ from coa_ontology.inducer.strategies.base import (
     resolve_fk_target_identity,
     simple_fk_constraints,
     table_identity,
+    to_camel,
+    to_pascal,
 )
 
 log = logging.getLogger(__name__)
@@ -66,6 +73,23 @@ def _join_comment(generated: str, description: str | None) -> str:
     return f"{text} ({generated})"
 
 
+def _joined_comment_literal(
+    note: str, description: str | None, namespace_language: str, *, description_generated: bool
+) -> Literal:
+    """The single ``rdfs:comment`` literal for a generated note and a column description.
+
+    The note is COA-generated. The description is catalog metadata and needs its
+    ``generatedFields`` proof. With no description the literal is the note alone,
+    so it is tagged like any generated text. A description without the proof may be
+    source- or steward-authored, which makes the joined text mixed provenance: it
+    stays untagged (``languageTagCompatibilityV1`` rule 1).
+    """
+    text = _join_comment(note, description)
+    if (description or "").strip() and not description_generated:
+        return Literal(text)
+    return generated_literal(text, namespace_language)
+
+
 # Tables per fusion batch when INDUCER_TABLE_BATCH_SIZE is unset.
 DEFAULT_TABLE_BATCH_SIZE = 500
 
@@ -88,12 +112,11 @@ _SQL_TO_XSD = {
 
 
 def _to_pascal(s: str) -> str:
-    return "".join(w.capitalize() for w in re.split(r"[\s_\-]+", re.sub(r"[^a-zA-Z0-9\s_\-]", "", s)) if w)
+    return to_pascal(s)
 
 
 def _to_camel(s: str) -> str:
-    p = _to_pascal(s)
-    return p[0].lower() + p[1:] if p else p
+    return to_camel(s)
 
 
 def _local_name_of(class_iri: URIRef) -> str:
@@ -114,6 +137,35 @@ def _xsd_for(data_type: str, column_name: str = "") -> URIRef:
     return _SQL_TO_XSD.get(base, XSD.string)
 
 
+def _match_maps(
+    matches: list[ConceptMatch],
+) -> tuple[dict[tuple[str, str], ConceptMatch], dict[tuple[str, str], ConceptMatch]]:
+    """Index current matches by identity and only unambiguous legacy matches by name."""
+    identity_matches = {
+        (match.source_table_identity, match.source_column): match for match in matches if match.source_table_identity
+    }
+    legacy_key_counts = Counter((match.source_table, match.source_column) for match in matches)
+    legacy_matches = {
+        (match.source_table, match.source_column): match
+        for match in matches
+        if not match.source_table_identity and legacy_key_counts[(match.source_table, match.source_column)] == 1
+    }
+    return identity_matches, legacy_matches
+
+
+def _match_for_table(
+    identity_matches: dict[tuple[str, str], ConceptMatch],
+    legacy_matches: dict[tuple[str, str], ConceptMatch],
+    table: CatalogTable,
+    column_name: str,
+) -> ConceptMatch | None:
+    """Return the identity-scoped match, falling back for old persisted records."""
+    match = identity_matches.get((table_identity(table), column_name))
+    if match is not None:
+        return match
+    return legacy_matches.get((table.name, column_name))
+
+
 class TableToOntologyStrategy(InductionStrategy):
     """Original strategy: embed table/column names, match via cosine similarity."""
 
@@ -131,6 +183,7 @@ class TableToOntologyStrategy(InductionStrategy):
         grounding_ontology_ids: list[str] | None = None,
         grounding_mode: str = "ENHANCED",
         cost_tracker: CostTracker | None = None,
+        namespace_language: str = DEFAULT_LANGUAGE,
     ) -> tuple[Graph, set[str], list[ConceptMatch], list[dict]]:
         """Induce an ontology by embedding table/column names and matching by similarity.
 
@@ -147,6 +200,8 @@ class TableToOntologyStrategy(InductionStrategy):
             grounding_ontology_ids: Optional ontology ids to restrict grounding to.
             grounding_mode: Grounding intensity ("NONE", "STANDARD", or "ENHANCED").
             cost_tracker: Optional per-job Bedrock usage accumulator.
+            namespace_language: Canonical language of the namespace. Selects the
+                fixed-text templates and the tag asserted on generated literals.
 
         Returns:
             A tuple of the proposal graph, the set of novel table names, and the
@@ -163,7 +218,8 @@ class TableToOntologyStrategy(InductionStrategy):
         # Behavior-preserving: match_concepts has no cross-table dependency —
         # table-level grounding hits the EXTERNAL AOSS foundational pool
         # (grounding_svc.ground_table) and column-level matching reads only its
-        # OWN table's grounding result (table_ontology[concept.table_name]),
+        # OWN table identity's grounding result
+        # (table_ontology[concept.source_table_identity]),
         # both computed within the same call; and embed_concepts uses store=False
         # so no batch writes embeddings a later batch could recall. So a table's
         # matches are identical whether it is processed alone, in a batch, or with
@@ -238,6 +294,13 @@ class TableToOntologyStrategy(InductionStrategy):
                 # reasoning-model defect (issue #59); the broad handler below
                 # would otherwise swallow it into all-novel.
                 raise
+            except GroundingLookupError:
+                # The lexical metadata listing failed or exceeded a bound, so the
+                # candidate set is incomplete. The all-novel fallback below would
+                # mark a table novel even when dense recall already found its
+                # exact-name class, producing a duplicate class with no grounding
+                # link. Fail the job instead, as for a rerank failure.
+                raise
             except MemoryError:
                 # MemoryError subclasses Exception, so the broad handler below would
                 # swallow it. At 50k-table scale an OOM is the failure this batching
@@ -262,6 +325,7 @@ class TableToOntologyStrategy(InductionStrategy):
                     CM(
                         source_column=column_name,
                         source_table=table.name,
+                        source_table_identity=table_identity(table),
                         matched_class_uri=None,
                         matched_ontology_id=None,
                         similarity=None,
@@ -292,12 +356,13 @@ class TableToOntologyStrategy(InductionStrategy):
             cost_tracker.record_stage_duration("ColumnMatch", total_column_match_ms)
 
         # Build proposal ontology once, from ALL tables + ALL matches (no vectors
-        # resident). match_map is a (table, column) dict, so match order is
-        # irrelevant, but batches stay grouped for cleanliness.
+        # resident). Match maps are keyed by (table identity, column), with a
+        # legacy name-only fallback, so match order is irrelevant.
         proposal_graph, novel_tables = self._build_proposal_ontology(
             ontology_uri_prefix,
             tables,
             all_matches,
+            namespace_language=namespace_language,
         )
         # table_to_ontology never drops tables (all tables are processable)
         return proposal_graph, novel_tables, all_matches, []
@@ -307,7 +372,20 @@ class TableToOntologyStrategy(InductionStrategy):
         uri_prefix: str,
         tables: list[CatalogTable],
         matches: list[ConceptMatch],
+        *,
+        namespace_language: str = DEFAULT_LANGUAGE,
     ) -> tuple[Graph, set[str]]:
+        """Build the proposal ontology from all tables and grounding matches.
+
+        Language (namespace-language LLD, section 2.2.6): class and property
+        labels stay the physical table and column names and are never tagged.
+        Descriptions (``rdfs:comment``) and synonyms (``skos:altLabel``) are
+        tagged only when the table's or column's ``generatedFields`` proves COA
+        generated that field; source- and steward-authored values stay
+        untagged. The ontology label and foreign-key notes use the reviewed
+        template for the namespace language.
+        """
+        lang = namespace_language
         g = Graph()
         ns = Namespace(uri_prefix)
         g.bind("ind", ns)
@@ -318,7 +396,7 @@ class TableToOntologyStrategy(InductionStrategy):
 
         ont_uri = URIRef(uri_prefix.rstrip("#").rstrip("/"))
         g.add((ont_uri, RDF.type, OWL.Ontology))
-        g.add((ont_uri, RDFS.label, Literal("Proposal Ontology")))
+        g.add((ont_uri, RDFS.label, generated_literal(render("structured_ontology_label", lang), lang)))
 
         g.bind("scl", SCL)
 
@@ -326,7 +404,8 @@ class TableToOntologyStrategy(InductionStrategy):
         match_confidence = ns["matchConfidence"]
         g.add((match_confidence, RDF.type, OWL.AnnotationProperty))
 
-        match_map = {(m.source_table, m.source_column): m for m in matches}
+        identity_match_map, legacy_match_map = _match_maps(matches)
+
         pk_sharing_confirmed, pk_sharing_suggested = detect_pk_sharing_subtypes(tables)
         novel_tables = set()
 
@@ -344,10 +423,18 @@ class TableToOntologyStrategy(InductionStrategy):
         ref_index = reference_index(tables)
         ambiguous_names = ambiguous_target_names(tables)
 
-        def table_prop(table: CatalogTable, column_name: str) -> URIRef:
-            """Mint the property IRI for ``table.column_name``."""
+        def table_prop(table: CatalogTable, column_name: str, column_locals: dict[str, str]) -> URIRef:
+            """Mint the property IRI for ``table.column_name``.
+
+            ``column_locals`` is this table's own :func:`camel_names_for` mapping,
+            passed in rather than looked up by identity. Two entries in one run can
+            share a ``table_identity`` — ``fullyQualifiedName`` is only
+            ``{database}.{table}`` and a run flattens every datasource — so an
+            identity-keyed cache is last-wins and would hand one table the other's
+            column names, declaring properties the mapping never populates.
+            """
             local = camel_by_id.get(table_identity(table), _to_camel(table.name))
-            return ns[f"{local}_{_to_camel(column_name)}"]
+            return ns[f"{local}_{column_locals[column_name]}"]
 
         def parent_class(
             target_name: str, referrer: CatalogTable, target_datasource_id: str | None = None
@@ -386,7 +473,9 @@ class TableToOntologyStrategy(InductionStrategy):
             return None
 
         for table in tables:
-            tm = match_map.get((table.name, ""))
+            # Per-table, not cached by identity: see table_prop's docstring.
+            column_locals = camel_names_for(table)
+            tm = _match_for_table(identity_match_map, legacy_match_map, table, "")
             is_grounded = tm and tm.match_type in ("exact", "high_confidence")
 
             if not is_grounded:
@@ -399,14 +488,32 @@ class TableToOntologyStrategy(InductionStrategy):
             # is an FK target that legitimately may sit outside this run.
             table_cls = ns[pascal_by_id[table_identity(table)]]
             g.add((table_cls, RDF.type, OWL.Class))
+            # The label is the physical name on the v1 path: never tagged.
             g.add((table_cls, RDFS.label, Literal(table.name)))
+            table_generated = set(table.generatedFields)
             if table.description:
-                g.add((table_cls, RDFS.comment, Literal(table.description)))
+                g.add(
+                    (
+                        table_cls,
+                        RDFS.comment,
+                        catalog_literal(
+                            table.description, lang, generated=GeneratedField.DESCRIPTION in table_generated
+                        ),
+                    )
+                )
             # Synonyms → skos:altLabel so they persist in the graph and flow
             # into the accept-time embedding text (ingest.py _class_text_for).
             for syn in table.synonyms:
-                g.add((table_cls, SKOS.altLabel, Literal(syn)))
-            add_glossary_and_tags(g, table_cls, table.glossaryTerms, table.tags)
+                g.add(
+                    (
+                        table_cls,
+                        SKOS.altLabel,
+                        catalog_literal(syn, lang, generated=GeneratedField.SYNONYMS in table_generated),
+                    )
+                )
+            add_glossary_and_tags(
+                g, table_cls, table.glossaryTerms, table.tags, namespace_language=lang, generated_fields=table_generated
+            )
 
             if is_grounded and tm and tm.matched_class_uri:
                 grounding_cls = URIRef(tm.matched_class_uri)
@@ -444,10 +551,17 @@ class TableToOntologyStrategy(InductionStrategy):
                     if tc.constraintType == "PRIMARY_KEY" and tc.columns:
                         from rdflib.collection import Collection
 
-                        key_props: list = [table_prop(table, c) for c in tc.columns]
-                        key_bnode = BNode()
-                        Collection(g, key_bnode, key_props)
-                        g.add((table_cls, OWL.hasKey, key_bnode))
+                        # Only real columns: a constraint naming a column absent from
+                        # ``table.columns`` has no property declaration anywhere, and
+                        # listing it in ``owl:hasKey`` makes the ontology OWL-DL
+                        # inconsistent for a column that does not exist.
+                        key_props: list = [
+                            table_prop(table, c, column_locals) for c in tc.columns if c in column_locals
+                        ]
+                        if key_props:
+                            key_bnode = BNode()
+                            Collection(g, key_bnode, key_props)
+                            g.add((table_cls, OWL.hasKey, key_bnode))
                         break
 
             # Columns absorbed into a sibling's composite-FK POM. build_r2rml emits
@@ -468,7 +582,7 @@ class TableToOntologyStrategy(InductionStrategy):
             composite_anchors = composite_fk_anchors(table)
 
             for col in table.columns:
-                base_prop = table_prop(table, col.name)
+                base_prop = table_prop(table, col.name, column_locals)
                 # Relationships this column carries, as (property IRI, target class,
                 # target name, target column, provenance). Empty -> datatype property.
                 relationships: list[tuple[URIRef, URIRef, str, str | None, str | None]] = []
@@ -532,11 +646,12 @@ class TableToOntologyStrategy(InductionStrategy):
                         for (parent, t_name, t_col, prov, _), qualifier in zip(resolved, qualifiers, strict=True):
                             local = fk_property_local_name(
                                 camel_by_id.get(table_identity(table), _to_camel(table.name))
-                                + f"_{_to_camel(col.name)}",
+                                + f"_{column_locals[col.name]}",
                                 qualifier,
                             )
                             relationships.append((ns[local], parent, t_name, t_col, prov))
 
+                column_generated = set(col.generatedFields)
                 minted: list[URIRef] = []
                 if relationships:
                     for prop_uri, parent_cls, fk_target, fk_target_col, fk_provenance in relationships:
@@ -554,8 +669,13 @@ class TableToOntologyStrategy(InductionStrategy):
                         g.add((prop_uri, RDFS.range, parent_cls))
                         if fk_provenance:
                             g.add((prop_uri, SCL.fkProvenance, Literal(fk_provenance)))
-                        fk_comment = (
-                            f"Foreign key: {table.name}.{col.name} references {fk_target}.{fk_target_col or 'id'}"
+                        fk_comment = render(
+                            "fk_note",
+                            lang,
+                            table=table.name,
+                            column=col.name,
+                            target_table=fk_target,
+                            target_column=fk_target_col or "id",
                         )
                         # ONE comment per property: the generated join note followed by
                         # the column's approved description. A foreign-key column's
@@ -564,7 +684,18 @@ class TableToOntologyStrategy(InductionStrategy):
                         # per property (the serve context, the FK-traversal tool's
                         # per-row join), so two comments would be picked arbitrarily
                         # or duplicate every edge.
-                        g.add((prop_uri, RDFS.comment, Literal(_join_comment(fk_comment, col.description))))
+                        g.add(
+                            (
+                                prop_uri,
+                                RDFS.comment,
+                                _joined_comment_literal(
+                                    fk_comment,
+                                    col.description,
+                                    lang,
+                                    description_generated=GeneratedField.DESCRIPTION in column_generated,
+                                ),
+                            )
+                        )
                         minted.append(prop_uri)
                 else:
                     prop_uri = base_prop
@@ -575,22 +706,44 @@ class TableToOntologyStrategy(InductionStrategy):
                         # Record why an FK column is a datatype property, so the
                         # relationship stays discoverable from the ontology alone.
                         owner = absorbed_fk_columns[col.name]
+                        # The carrier is the owner column's deduped local, as minted
+                        # for its property by camel_names_for.
+                        owner_local = column_locals.get(owner, _to_camel(owner)) if owner else ""
                         note = (
-                            f"Part of a composite foreign key on {table.name}; the relationship is carried by "
-                            f"{camel_by_id[table_identity(table)]}_{_to_camel(owner)}"
-                            if owner
-                            else (
-                                f"Part of a malformed composite foreign key on {table.name} "
-                                "(column/target counts differ, or targets span several tables); "
-                                "mapped as a literal because no join can be derived"
+                            render(
+                                "composite_fk_member_note",
+                                lang,
+                                table=table.name,
+                                carrier=f"{camel_by_id[table_identity(table)]}_{owner_local}",
                             )
+                            if owner
+                            else render("malformed_composite_fk_note", lang, table=table.name)
                         )
                         # One comment (see the object-property branch above): the
                         # composite-FK note and the approved description were two
                         # literals, and the serve context kept whichever came first.
-                        g.add((prop_uri, RDFS.comment, Literal(_join_comment(note, col.description))))
+                        g.add(
+                            (
+                                prop_uri,
+                                RDFS.comment,
+                                _joined_comment_literal(
+                                    note,
+                                    col.description,
+                                    lang,
+                                    description_generated=GeneratedField.DESCRIPTION in column_generated,
+                                ),
+                            )
+                        )
                     elif col.description:
-                        g.add((prop_uri, RDFS.comment, Literal(col.description)))
+                        g.add(
+                            (
+                                prop_uri,
+                                RDFS.comment,
+                                catalog_literal(
+                                    col.description, lang, generated=GeneratedField.DESCRIPTION in column_generated
+                                ),
+                            )
+                        )
                     minted.append(prop_uri)
 
                 # Column-level facts apply to EVERY property minted for the column:
@@ -603,13 +756,27 @@ class TableToOntologyStrategy(InductionStrategy):
                         if tc.constraintType == "UNIQUE" and col.name in tc.columns and len(tc.columns) == 1:
                             is_unique = True
                             break
-                cm = match_map.get((table.name, col.name))
+                cm = _match_for_table(identity_match_map, legacy_match_map, table, col.name)
                 for prop_uri in minted:
+                    # The label is the physical column name on the v1 path: never tagged.
                     g.add((prop_uri, RDFS.label, Literal(col.name)))
                     # Column synonyms -> skos:altLabel (persisted in the graph).
                     for syn in col.synonyms:
-                        g.add((prop_uri, SKOS.altLabel, Literal(syn)))
-                    add_glossary_and_tags(g, prop_uri, col.glossaryTerms, col.tags)
+                        g.add(
+                            (
+                                prop_uri,
+                                SKOS.altLabel,
+                                catalog_literal(syn, lang, generated=GeneratedField.SYNONYMS in column_generated),
+                            )
+                        )
+                    add_glossary_and_tags(
+                        g,
+                        prop_uri,
+                        col.glossaryTerms,
+                        col.tags,
+                        namespace_language=lang,
+                        generated_fields=column_generated,
+                    )
                     # Sampled distinct values (low-cardinality categorical columns) ->
                     # coa:distinctValues, one literal per value. Read by the ingest text
                     # builder (_class_text_for) so serve's NL->SQL context can hint the

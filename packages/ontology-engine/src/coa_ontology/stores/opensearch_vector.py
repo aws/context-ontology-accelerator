@@ -221,6 +221,7 @@ class OpenSearchVectorStore(VectorStore):
         entity_type=None,
         embedding_type=None,
         namespace=None,
+        limit=None,
     ):
         """Return all embeddings for an ontology, optionally filtered.
 
@@ -229,6 +230,7 @@ class OpenSearchVectorStore(VectorStore):
             entity_type: Restrict to one entity type when provided.
             embedding_type: Restrict to one embedding variant when provided.
             namespace: Per-call namespace override; defaults to the bound one.
+            limit: Maximum rows to return; the backend default applies when absent.
 
         Returns:
             List of matching embedding documents.
@@ -239,7 +241,13 @@ class OpenSearchVectorStore(VectorStore):
             filters.append({"term": {"entity_type": entity_type}})
         if embedding_type:
             filters.append({"term": {"embedding_type": embedding_type}})
-        return self._aoss().filter_search(idx, filters, size=10_000)
+        size = 10_000 if limit is None else limit
+        if size < 1:
+            return []
+        # Bounded lexical consumers need only metadata. Excluding the vector
+        # avoids transferring tens of megabytes while building a name index.
+        source = ["entity_uri", "ontology_id", "text"] if limit is not None else None
+        return self._aoss().filter_search(idx, filters, size=size, source=source)
 
     def list_searchable_entity_uris(self, ontology_id, namespace=None):
         """Return the entity URIs currently searchable for an ontology.
@@ -327,7 +335,9 @@ class OpenSearchVectorStore(VectorStore):
         """Delete all embeddings for an ontology, returning the deleted count.
 
         Uses per-doc deletes because AOSS has no ``_delete_by_query`` on
-        VECTORSEARCH collections.
+        VECTORSEARCH collections. Raises
+        :class:`~coa_common.opensearch.DeleteIncompleteError` if matching docs
+        are left when the delete stops making progress.
         """
         idx = self._read_index(namespace)
         return self._aoss().delete_by_term(idx, "ontology_id", ontology_id)
@@ -349,7 +359,9 @@ class OpenSearchVectorStore(VectorStore):
         One ``bool``-wrapped ``terms``+``term`` query + one verified delete loop
         for the whole set (see ``AossVectorClient.delete_by_term``) — NOT one
         round-trip per entity, so a re-accepted proposal with hundreds of
-        classes/properties pays the AOSS refresh-lag wait once.
+        classes/properties pays the AOSS refresh-lag wait once. Raises
+        :class:`~coa_common.opensearch.DeleteIncompleteError` if matching docs
+        are left when the delete stops making progress.
         """
         uris = [u for u in dict.fromkeys(entity_uris) if u]
         if not uris or not ontology_id:

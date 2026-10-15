@@ -41,6 +41,8 @@ def clean_env(monkeypatch):
         "LLM_REGION",
         "BEDROCK_REGION",
         "BEDROCK_EMBED_MODEL_ID",
+        "BEDROCK_CHAT_MODEL_ID",
+        "GROUNDING_LLM_MODEL_ID",
     ):
         monkeypatch.delenv(var, raising=False)
     yield monkeypatch
@@ -86,3 +88,35 @@ class TestConfigOverrides:
         clean_env.setenv("LLM_MODEL_ID", "us.anthropic.claude-sonnet-4-6")
         mod = _reload_main()
         assert mod.app.state.config["llm_model_id"] == "us.anthropic.claude-sonnet-4-6"
+
+
+class TestGroundingLlmModelId:
+    """GH #236: grounding rerank defaults to Haiku (FALLBACK_CHAT_MODEL_ID), a
+    cheap reranker, and is overridable with GROUNDING_LLM_MODEL_ID for a
+    region-valid id. An empty variable falls through to the Haiku default."""
+
+    _HAIKU = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+
+    def test_defaults_to_haiku(self, clean_env):
+        """No GROUNDING_LLM_MODEL_ID: the cheap Haiku reranker default."""
+        mod = _reload_main()
+        assert mod.app.state.config["grounding_llm_model_id"] == self._HAIKU
+
+    def test_does_not_track_induction_model(self, clean_env):
+        """Grounding is independent of LLM_MODEL_ID — setting the induction
+        model does NOT change the grounding default (it stays Haiku)."""
+        clean_env.setenv("LLM_MODEL_ID", "global.anthropic.claude-sonnet-5")
+        mod = _reload_main()
+        assert mod.app.state.config["grounding_llm_model_id"] == self._HAIKU
+
+    def test_dedicated_override_wins(self, clean_env):
+        clean_env.setenv("GROUNDING_LLM_MODEL_ID", "jp.anthropic.claude-haiku-4-5-20251001-v1:0")
+        clean_env.setenv("LLM_MODEL_ID", "global.anthropic.claude-sonnet-5")
+        mod = _reload_main()
+        assert mod.app.state.config["grounding_llm_model_id"] == "jp.anthropic.claude-haiku-4-5-20251001-v1:0"
+
+    def test_empty_override_falls_through_to_haiku(self, clean_env):
+        clean_env.setenv("GROUNDING_LLM_MODEL_ID", "")
+        clean_env.setenv("LLM_MODEL_ID", "global.anthropic.claude-sonnet-5")
+        mod = _reload_main()
+        assert mod.app.state.config["grounding_llm_model_id"] == self._HAIKU

@@ -9,7 +9,10 @@ export default defineConfig({
   plugins: [react()],
   resolve: {
     alias: {
-      "@coa/shared": path.resolve(__dirname, "../../libs/ts-shared/src/index.ts"),
+      "@coa/shared": path.resolve(
+        __dirname,
+        "../../libs/ts-shared/src/index.ts",
+      ),
       "@auth": path.resolve(__dirname, "src/auth"),
       "@app-types": path.resolve(__dirname, "src/app-types"),
       "@api-hooks": path.resolve(__dirname, "src/api-hooks"),
@@ -17,6 +20,7 @@ export default defineConfig({
       "@pages": path.resolve(__dirname, "src/pages"),
       "@utils": path.resolve(__dirname, "src/utils"),
       "@constants": path.resolve(__dirname, "src/constants"),
+      "@test-fixtures": path.resolve(__dirname, "../../tests/unit/fixtures"),
     },
   },
   test: {

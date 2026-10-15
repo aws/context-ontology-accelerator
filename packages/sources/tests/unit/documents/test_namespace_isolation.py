@@ -257,7 +257,7 @@ class TestDocSourceCreationNamespaceBinding:
                 name="test-source",
                 uploadId="11111111-1111-4111-8111-111111111111",
             )
-            result = _docr._create_document_source(req, _NS_A, {})
+            result = _docr._create_document_source(req, _NS_A, {}, namespace_language="en")
 
         assert result["statusCode"] == 201
         assert len(written_items) == 1
@@ -286,7 +286,7 @@ class TestDocSourceCreationNamespaceBinding:
                 name="another-source",
                 uploadId="22222222-2222-4222-8222-222222222222",
             )
-            _docr._create_document_source(req, _NS_A, {})
+            _docr._create_document_source(req, _NS_A, {}, namespace_language="en")
 
         for item in written_items:
             assert item.get("PK") != f"NS#{_NS_B}", f"Source was incorrectly written under namespace {_NS_B!r}"

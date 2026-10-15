@@ -5,9 +5,11 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import patch
+from datetime import UTC, datetime, timedelta
+from unittest.mock import MagicMock, patch
 
 import pytest
+from botocore.exceptions import ClientError
 
 _MODULE = "coa_sources.database.glue_event_rescan_handler"
 _SH = "coa_sources.api.sources_handler"
@@ -22,7 +24,15 @@ def _failed_ids(result: dict) -> list[str]:
     return [f["itemIdentifier"] for f in result["batchItemFailures"]]
 
 
+@pytest.fixture
+def _event_rescan_on():
+    """Wiring tests below stub the re-scan itself; let the switch check pass."""
+    with patch(f"{_MODULE}._automated_rescan_skip_reason", autospec=True, return_value=None) as gate:
+        yield gate
+
+
 @pytest.mark.unit
+@pytest.mark.usefixtures("_event_rescan_on")
 class TestGlueEventRescanHandler:
     def test_fires_event_rescan_per_record(self):
         from coa_sources.database import glue_event_rescan_handler as mod
@@ -141,3 +151,118 @@ class TestGlueEventRescanHandler:
             result = mod.handler({"Records": [{"body": json.dumps({"namespaceId": "n", "sourceId": "s"})}]}, None)
 
         assert result == {"batchItemFailures": []}
+
+
+def _source_row(**extra) -> dict:
+    row = {
+        "PK": "NS#ns-1",
+        "SK": "SRC#src-1",
+        "sourceId": "src-1",
+        "namespaceId": "ns-1",
+        "name": "sales",
+        "sourceType": "DATABASE",
+        "sourceSubType": "GLUE_DATABASE",
+        "status": "APPROVED",
+        # Outside the EVENT cooldown, so an allowed message really scans.
+        "lastScanAt": (datetime.now(UTC) - timedelta(hours=2)).isoformat(),
+        "createdAt": "2026-01-01T00:00:00Z",
+        "updatedAt": "2026-01-01T00:00:00Z",
+    }
+    row.update(extra)
+    return row
+
+
+def _scan_started(mock_dao: MagicMock) -> bool:
+    return any(
+        len(c.args) > 1 and isinstance(c.args[1], dict) and c.args[1].get("status") == "SCANNING"
+        for c in mock_dao.update.call_args_list
+    )
+
+
+@pytest.mark.unit
+class TestGlueEventRescanReadsTheSwitch:
+    """The source record, not the message, decides whether an EVENT re-scan runs."""
+
+    def _deliver(self, row):
+        from coa_sources.database import glue_event_rescan_handler as mod
+
+        # Patch the globals the consumer's re-scan path actually reads: other
+        # tests re-import the sources handler module, so its sys.modules entry
+        # can be a different object from the one this consumer imported.
+        sh_globals = mod._handle_rescan.__globals__
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = row
+        mock_sqs = MagicMock()
+        # Every re-scan snapshots the namespace language; a legacy item resolves to ``en``.
+        mock_ns_dao = MagicMock()
+        mock_ns_dao.get.return_value = {"PK": "NS#ns-1", "SK": "METADATA"}
+        with patch.dict(
+            sh_globals,
+            {
+                "_get_dao": lambda: mock_dao,
+                "_get_ns_dao": lambda: mock_ns_dao,
+                "_get_scan_dao": lambda: MagicMock(),
+                "_get_sqs": lambda: mock_sqs,
+                "_SCAN_QUEUE_URL": "https://sqs.us-east-1.amazonaws.com/123/scan-queue",
+                "_EVENT_RESCAN_COOLDOWN_S": 300,
+            },
+        ):
+            result = mod.handler(_sqs_event({"namespaceId": "ns-1", "sourceId": "src-1", "trigger": "EVENT"}), None)
+        return result, mock_dao, mock_sqs
+
+    @pytest.mark.parametrize(
+        "switch",
+        [{"enabled": False}, None, {}],
+        ids=["disabled", "absent", "empty"],
+    )
+    def test_handler_event_rescan_not_enabled_skips_and_consumes(self, switch):
+        """A message for a source whose event re-scans are OFF never becomes
+        valid, so it is consumed (not retried) and no scan starts."""
+        row = _source_row() if switch is None else _source_row(eventRescan=switch)
+
+        result, mock_dao, mock_sqs = self._deliver(row)
+
+        assert result == {"batchItemFailures": []}
+        assert not _scan_started(mock_dao), "a Glue event started a scan on a source whose eventRescan is OFF"
+        mock_sqs.send_message.assert_not_called()
+
+    def test_handler_documents_source_skips_and_consumes(self):
+        row = _source_row(sourceType="DOCUMENTS", sourceSubType=None, status="COMPLETED", eventRescan={"enabled": True})
+
+        result, mock_dao, mock_sqs = self._deliver(row)
+
+        assert result == {"batchItemFailures": []}
+        mock_dao.put.assert_not_called()
+        assert not _scan_started(mock_dao)
+        mock_sqs.send_message.assert_not_called()
+
+    def test_handler_source_gone_skips_and_consumes(self):
+        result, mock_dao, mock_sqs = self._deliver(None)
+
+        assert result == {"batchItemFailures": []}
+        mock_dao.update.assert_not_called()
+        mock_sqs.send_message.assert_not_called()
+
+    def test_handler_event_rescan_enabled_starts_scan(self):
+        result, mock_dao, mock_sqs = self._deliver(_source_row(eventRescan={"enabled": True}))
+
+        assert result == {"batchItemFailures": []}
+        assert _scan_started(mock_dao)
+        mock_sqs.send_message.assert_called_once()
+
+    def test_handler_source_read_fails_is_reported_for_retry(self):
+        """A transient read failure is not a decision, so the message is retried."""
+        from coa_sources.database import glue_event_rescan_handler as mod
+
+        with (
+            patch(
+                f"{_MODULE}._automated_rescan_skip_reason",
+                autospec=True,
+                side_effect=ClientError({"Error": {"Code": "InternalServerError", "Message": "x"}}, "GetItem"),
+            ),
+            patch(f"{_MODULE}._handle_rescan", autospec=True) as mock_rescan,
+        ):
+            result = mod.handler(_sqs_event({"namespaceId": "ns-1", "sourceId": "src-1"}), None)
+
+        assert _failed_ids(result) == ["m0"]
+        mock_rescan.assert_not_called()

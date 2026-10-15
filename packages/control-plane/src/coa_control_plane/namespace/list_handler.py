@@ -21,6 +21,7 @@ from coa_common import sanitize_principal_key
 from coa_common.authnz_types import PrincipalType, ResourceType
 from coa_common.constants import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
 from coa_common.dao import DynamoDBDAO, QueryParams
+from coa_common.language_tags import effective_namespace_language
 from coa_common.logging import setup_logging
 from coa_common.response import api_response
 from coa_control_plane_server.models.namespace_status import NamespaceStatus
@@ -277,6 +278,7 @@ def _to_summary(item: dict[str, Any]) -> NamespaceSummary:
             name=item["name"],
             display_name=item.get("displayName"),
             status=NamespaceStatus(item.get("status", "ACTIVE")),
+            language=effective_namespace_language(item),
             source_count=item.get("sourceCount", 0),
             created_at=item.get("createdAt"),
             updated_at=item.get("updatedAt"),

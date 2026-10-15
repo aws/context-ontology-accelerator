@@ -27,6 +27,8 @@ def load_policies_for_roles(
     role_ids: Iterable[str],
     table_name: str,
     region: str,
+    *,
+    dao: DynamoDBDAO | None = None,
 ) -> str:
     """Load and concatenate Cedar policy text for the given role IDs.
 
@@ -38,15 +40,20 @@ def load_policies_for_roles(
         role_ids: Set of role identifiers to load (e.g., {"default", "data-analyst"}).
         table_name: DynamoDB Roles table name.
         region: AWS region for DynamoDB access.
+        dao: DAO bound to the Roles table, for callers that read repeatedly or
+            from several threads: building one creates a boto3 resource on the
+            shared default session, which is slow and not thread-safe. When
+            omitted, a DAO is built for this call.
 
     Returns:
         Concatenated Cedar policy text (newline-separated), or empty string.
     """
-    # Both known callers (the control-plane authorizer Lambda and the MCP
-    # server grant resolver) are on a synchronous request path. Fail fast
-    # instead of inheriting the DAO's background 30-second/three-attempt
-    # default (matches the Cedar policy loader's #1092 fix).
-    dao = DynamoDBDAO(table_name, region=region, config=sync_boto_config())
+    if dao is None:
+        # Both known callers (the control-plane authorizer Lambda and the MCP
+        # server grant resolver) are on a synchronous request path. Fail fast
+        # instead of inheriting the DAO's background 30-second/three-attempt
+        # default.
+        dao = DynamoDBDAO(table_name, region=region, config=sync_boto_config())
     policies = ""
 
     for role_id in role_ids:

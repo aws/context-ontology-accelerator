@@ -673,3 +673,69 @@ class TestNamespaceExists:
         with patch("boto3.resource"):
             unconfigured = SourcesRegistry(table_name="test-sources", region="us-west-2")
         assert unconfigured.namespaces_configured is False
+
+
+@pytest.mark.unit
+class TestNamespaceLanguage:
+    """The namespace language behind the request's label preference (LLD §2.2.5)."""
+
+    NS = "11111111-2222-3333-4444-555555555555"
+
+    def _registry(self, **item):
+        with patch("boto3.resource") as mock_resource:
+            mock_table = MagicMock()
+            mock_resource.return_value.Table.return_value = mock_table
+            registry = SourcesRegistry(
+                table_name="test-sources", namespaces_table="test-namespaces", region="us-west-2"
+            )
+        mock_table.get_item.return_value = {"Item": {"PK": f"NS#{self.NS}", "SK": "METADATA", **item}}
+        registry._mock_table = mock_table
+        return registry
+
+    @pytest.mark.asyncio
+    async def test_returns_the_stored_language(self):
+        assert await self._registry(language="ja").namespace_language(self.NS) == "ja"
+
+    @pytest.mark.asyncio
+    async def test_legacy_item_without_language_reads_as_english(self):
+        assert await self._registry().namespace_language(self.NS) == "en"
+
+    @pytest.mark.asyncio
+    async def test_missing_item_fails_closed(self):
+        from coa_serve.clients.sources_registry import NamespaceLanguageUnavailableError
+
+        registry = self._registry()
+        registry._mock_table.get_item.return_value = {}
+        with pytest.raises(NamespaceLanguageUnavailableError):
+            await registry.namespace_language(self.NS)
+
+    @pytest.mark.asyncio
+    async def test_read_error_fails_closed(self):
+        from coa_serve.clients.sources_registry import NamespaceLanguageUnavailableError
+
+        registry = self._registry(language="ja")
+        registry._mock_table.get_item.side_effect = RuntimeError("throttled")
+        with pytest.raises(NamespaceLanguageUnavailableError):
+            await registry.namespace_language(self.NS)
+
+    @pytest.mark.asyncio
+    async def test_invalid_stored_language_fails_closed(self):
+        from coa_serve.clients.sources_registry import NamespaceLanguageUnavailableError
+
+        with pytest.raises(NamespaceLanguageUnavailableError):
+            await self._registry(language="ja_JP").namespace_language(self.NS)
+
+    @pytest.mark.asyncio
+    async def test_unconfigured_table_has_no_language(self):
+        with patch("boto3.resource"):
+            registry = SourcesRegistry(table_name="test-sources", region="us-west-2")
+        assert await registry.namespace_language("anything") is None
+
+    @pytest.mark.asyncio
+    async def test_existence_gate_read_is_reused(self):
+        """The gate's METADATA read supplies the language; no second read."""
+        registry = self._registry(language="ja")
+        assert await registry.namespace_exists(self.NS) is True
+        reads = registry._mock_table.get_item.call_count
+        assert await registry.namespace_language(self.NS) == "ja"
+        assert registry._mock_table.get_item.call_count == reads

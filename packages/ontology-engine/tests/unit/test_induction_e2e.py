@@ -431,13 +431,24 @@ class TestInductionE2E:
         resp = http.post(f"/ontology/proposals/{proposal_id}/upload-url")
         assert resp.status_code == 200, resp.text
         urls = resp.json()
-        assert urls["ontology_put_url"] and urls["r2rml_put_url"]
+        revision_id = urls["revisionId"]
+        assert urls["ontologyPutUrl"] and urls["r2rmlPutUrl"]
 
         uploaded_turtle = ontology_turtle.replace("Proposal Ontology", "Uploaded Reviewed Ontology")
-        ds._put_artifact_s3("default", proposal_id, "ontology", uploaded_turtle)
+        ds._put_artifact_s3(
+            "default",
+            proposal_id,
+            "ontology",
+            uploaded_turtle,
+            version=f"revisions/{revision_id}",
+        )
         resp = http.post(
             "/ontology/proposals/update",
-            json={"proposal_id": proposal_id, "ontology_uploaded": True},
+            json={
+                "proposal_id": proposal_id,
+                "ontology_uploaded": True,
+                "upload_revision_id": revision_id,
+            },
         )
         assert resp.status_code == 200, resp.text
         assert resp.json()["status"] == "updated"

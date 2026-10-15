@@ -386,10 +386,12 @@ class NLtoSQLStrategy:
 
         # Consolidate sub-steps into single t2.sql.generate/success step (E10)
         confidence = nl_to_sql_result.confidence
-        # The trace reaches the caller (SSE and the response), so list only the
-        # tables the grant lets them see: retrieval and the FK walk can surface
-        # tables outside ``tableAllowlist`` that the SQL never touches.
-        tables = tables_visible_to(nl_to_sql_result.expanded_tables or nl_to_sql_result.retrieved_tables, profile)
+        # List the tables the generated SQL reads, not the retrieval context:
+        # retrieval and the FK walk put tables in front of the SQL writer that the
+        # statement may never touch (the context stays in the response metadata as
+        # ``retrieved_tables`` / ``expanded_tables``). The grant filter still applies
+        # so a name outside ``tableAllowlist`` never reaches the caller.
+        tables = tables_visible_to(SQLFirewall.referenced_tables(nl_to_sql_result.sql), profile)
         trace.record(
             StepId.T2_SQL_GENERATE,
             "success",
@@ -476,9 +478,9 @@ class NLtoSQLStrategy:
                     expanded_tables=nl_to_sql_result.expanded_tables,
                     data_source_id=nl_to_sql_result.data_source_id or "",
                 )
-                tables = tables_visible_to(
-                    nl_to_sql_result.expanded_tables or nl_to_sql_result.retrieved_tables, profile
-                )
+                # The tables THIS shot's statement read (a correction shot can read
+                # different ones than the first), grant-filtered like the generate step.
+                tables = tables_visible_to(SQLFirewall.referenced_tables(fw_result.authorized_sql), profile)
 
                 # Decide whether a ZERO-row result is a legitimate, deterministic
                 # answer or a signal worth one corrective regeneration. A

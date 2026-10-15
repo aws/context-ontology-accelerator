@@ -11,9 +11,11 @@ from __future__ import annotations
 import json
 import os
 import sys
+import uuid
 from unittest.mock import MagicMock, patch
 
 import pytest
+from botocore.exceptions import ClientError
 from coa_control_plane_server.models.source_type import SourceType
 
 os.environ.setdefault("SOURCES_TABLE", "test-sources")
@@ -1205,6 +1207,14 @@ class TestHandleDeleteCounter:
 
 @pytest.mark.unit
 class TestHandleRescan:
+    @pytest.fixture(autouse=True)
+    def _namespace_item(self):
+        # Every re-scan resolves the namespace-language snapshot first.
+        ns_dao = MagicMock()
+        ns_dao.get.return_value = {"PK": f"NS#{_NAMESPACE_ID}", "SK": "METADATA"}
+        with patch(f"{_SH}._get_ns_dao", return_value=ns_dao):
+            yield ns_dao
+
     def test_rescan_database_source_happy_path(self):
         mock_dao = MagicMock()
         # SCAN_FAILED with no recorded origin and nothing approved is a first scan
@@ -1230,6 +1240,31 @@ class TestHandleRescan:
         assert body_json["isRescan"] is False
         # SCAN_FAILED is not an open review, so no backup reconstruction.
         assert body_json["hadOpenRescan"] is False
+
+    @pytest.mark.parametrize("entry_status", ["APPROVED", "SCAN_FAILED"])
+    def test_rescan_message_lets_the_trigger_derive_source_id(self, entry_status):
+        # The trigger derives the bare sourceId from datasourceId (DS#<id>) for the
+        # execution input, where the state machine's SCAN_FAILED step and the reaper
+        # key the sources row on it. The message carries only datasourceId, so the
+        # id comes from one place, and has every field the trigger requires.
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = _db_source_item(entry_status)
+        mock_sqs = MagicMock()
+
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._get_scan_dao", return_value=dao_double()),
+            patch(f"{_SH}._get_sqs", return_value=mock_sqs),
+            patch(f"{_SH}._SCAN_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/scan-queue"),
+        ):
+            status, _ = _parse(_current_sh()._handle_rescan({}, _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 202
+        body_json = json.loads(mock_sqs.send_message.call_args[1]["MessageBody"])
+        assert body_json["datasourceId"] == f"DS#{_SOURCE_ID}"
+        assert "sourceId" not in body_json
+        for field in ("scanJobId", "namespaceId", "scanType"):
+            assert body_json[field], field
 
     @pytest.mark.parametrize("entry_status", ["APPROVED", "RESCAN_REVIEW"])
     def test_rescan_approved_source_marks_isrescan_true(self, entry_status):
@@ -1568,6 +1603,122 @@ class TestHandleCreate:
         assert status == 400
 
 
+@pytest.mark.unit
+class TestNamespaceLanguageResolution:
+    """Sources resolve the language from the namespace item, never from the request."""
+
+    _GLUE_BODY = {
+        "sourceType": "DATABASE",
+        "databaseSource": {
+            "name": "my-db",
+            "glueConfiguration": {"databaseName": "mydb", "region": "us-east-1", "catalogId": "123456789012"},
+        },
+    }
+
+    def _create(self, body, ns_item):
+        mock_ns_dao = MagicMock()
+        mock_ns_dao.get.return_value = ns_item
+        with (
+            patch(f"{_SH}._get_ns_dao", return_value=mock_ns_dao),
+            patch(f"{_SH}._create_database_source", return_value={"statusCode": 202, "body": "{}"}) as db_create,
+            patch(f"{_SH}._create_document_source", return_value={"statusCode": 201, "body": "{}"}) as doc_create,
+        ):
+            event = _make_event("POST", "/namespaces/{namespaceId}/sources", body=body)
+            status, _ = _parse(_current_sh()._handle_create(event, _NAMESPACE_ID))
+        return status, db_create, doc_create
+
+    def test_database_create_uses_namespace_language(self):
+        _, db_create, _ = self._create(self._GLUE_BODY, {"PK": f"NS#{_NAMESPACE_ID}", "language": "ja"})
+        assert db_create.call_args.kwargs["namespace_language"] == "ja"
+
+    def test_document_create_uses_namespace_language(self):
+        body = {"sourceType": "DOCUMENTS", "documentSource": {"name": "docs", "uploadId": str(uuid.uuid4())}}
+        _, _, doc_create = self._create(body, {"PK": f"NS#{_NAMESPACE_ID}", "language": "ja"})
+        assert doc_create.call_args.kwargs["namespace_language"] == "ja"
+
+    def test_legacy_namespace_without_language_reads_english(self):
+        _, db_create, _ = self._create(self._GLUE_BODY, {"PK": f"NS#{_NAMESPACE_ID}"})
+        assert db_create.call_args.kwargs["namespace_language"] == "en"
+
+    def test_request_cannot_override_the_namespace_language(self):
+        body = {
+            **self._GLUE_BODY,
+            "language": "en",
+            "databaseSource": {**self._GLUE_BODY["databaseSource"], "language": "en", "sourceLanguage": "en"},
+        }
+        _, db_create, _ = self._create(body, {"PK": f"NS#{_NAMESPACE_ID}", "language": "ja"})
+        assert db_create.call_args.kwargs["namespace_language"] == "ja"
+
+    def test_create_namespace_read_error_fails_the_request(self):
+        mock_ns_dao = MagicMock()
+        mock_ns_dao.get.side_effect = ClientError({"Error": {"Code": "InternalServerError", "Message": "x"}}, "GetItem")
+        with (
+            patch(f"{_SH}._get_ns_dao", return_value=mock_ns_dao),
+            patch(f"{_SH}._create_database_source") as db_create,
+        ):
+            event = _make_event("POST", "/namespaces/{namespaceId}/sources", body=self._GLUE_BODY)
+            status, _ = _parse(_current_sh().handler({**event, "pathParameters": {"namespaceId": _NAMESPACE_ID}}, None))
+        assert status == 500
+        db_create.assert_not_called()
+
+    # ── Re-scan ──────────────────────────────────────────────────────
+
+    def _rescan(self, source_item, *, ns_item=None, ns_error=None):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = source_item
+        mock_ns_dao = MagicMock()
+        if ns_error is not None:
+            mock_ns_dao.get.side_effect = ns_error
+        else:
+            mock_ns_dao.get.return_value = ns_item
+        mock_scan_dao = MagicMock()
+        mock_sqs = MagicMock()
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._get_ns_dao", return_value=mock_ns_dao),
+            patch(f"{_SH}._get_scan_dao", return_value=mock_scan_dao),
+            patch(f"{_SH}._get_sqs", return_value=mock_sqs),
+            patch(f"{_SH}._SCAN_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/scan-queue"),
+            patch(f"{_SH}._INGESTION_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/ingestion-queue"),
+        ):
+            status, _ = _parse(_current_sh()._handle_rescan({}, _NAMESPACE_ID, _SOURCE_ID))
+        return status, mock_dao, mock_scan_dao, mock_sqs
+
+    def test_database_rescan_snapshots_language_into_job(self):
+        status, _, scan_dao, sqs = self._rescan(
+            _db_source_item("SCAN_FAILED"), ns_item={"PK": f"NS#{_NAMESPACE_ID}", "language": "ja"}
+        )
+        assert status == 202
+        assert scan_dao.put.call_args[0][0]["namespaceLanguage"] == "ja"
+        assert json.loads(sqs.send_message.call_args[1]["MessageBody"])["namespaceLanguage"] == "ja"
+
+    def test_document_rescan_snapshots_language_into_job(self):
+        status, _, _, sqs = self._rescan(
+            _doc_source_item("COMPLETED"), ns_item={"PK": f"NS#{_NAMESPACE_ID}", "language": "ja"}
+        )
+        assert status == 200
+        assert json.loads(sqs.send_message.call_args[1]["MessageBody"])["namespace_language"] == "ja"
+
+    @pytest.mark.parametrize("item", [_db_source_item("SCAN_FAILED"), _doc_source_item("COMPLETED")])
+    def test_rescan_missing_namespace_fails_without_writes(self, item):
+        status, dao, scan_dao, sqs = self._rescan(item, ns_item=None)
+        assert status == 404
+        dao.put.assert_not_called()
+        dao.update.assert_not_called()
+        scan_dao.put.assert_not_called()
+        sqs.send_message.assert_not_called()
+
+    @pytest.mark.parametrize("item", [_db_source_item("SCAN_FAILED"), _doc_source_item("COMPLETED")])
+    def test_rescan_namespace_read_error_fails_without_writes(self, item):
+        error = ClientError({"Error": {"Code": "ProvisionedThroughputExceededException", "Message": "x"}}, "GetItem")
+        status, dao, scan_dao, sqs = self._rescan(item, ns_error=error)
+        assert status == 500
+        dao.put.assert_not_called()
+        dao.update.assert_not_called()
+        scan_dao.put.assert_not_called()
+        sqs.send_message.assert_not_called()
+
+
 # ===================================================================
 # handler (Lambda entry point) routing
 # ===================================================================
@@ -1620,9 +1771,13 @@ class TestHandlerRouting:
         mock_scan_dao = dao_double()
         mock_sqs = MagicMock()
 
+        mock_ns_dao = MagicMock()
+        mock_ns_dao.get.return_value = {"PK": f"NS#{_NAMESPACE_ID}", "SK": "METADATA"}
+
         with (
             patch(f"{_SH}._get_dao", return_value=mock_dao),
             patch(f"{_SH}._get_scan_dao", return_value=mock_scan_dao),
+            patch(f"{_SH}._get_ns_dao", return_value=mock_ns_dao),
             patch(f"{_SH}._get_sqs", return_value=mock_sqs),
             patch(f"{_SH}._SCAN_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/scan-queue"),
         ):
@@ -1824,13 +1979,34 @@ class TestPathParameterDecoding:
         handler_mock.assert_called_once_with(_NAMESPACE_ID, _SOURCE_ID, "sales.discount%50")
 
 
+@pytest.fixture
+def _rescan_namespace_item():
+    """The namespace item every re-scan trigger resolves its language snapshot from."""
+    ns_dao = MagicMock()
+    ns_dao.get.return_value = {"PK": f"NS#{_NAMESPACE_ID}", "SK": "METADATA"}
+    with patch(f"{_SH}._get_ns_dao", return_value=ns_dao):
+        yield ns_dao
+
+
+_SCHEDULE_ON = {"enabled": True, "scheduleExpression": "rate(1 day)", "timezone": "UTC"}
+
+
+def _scan_started(mock_dao: MagicMock) -> bool:
+    """Whether the re-scan path took the scan lock (moved the source to SCANNING)."""
+    return any(
+        len(c.args) > 1 and isinstance(c.args[1], dict) and c.args[1].get("status") == "SCANNING"
+        for c in mock_dao.update.call_args_list
+    )
+
+
 @pytest.mark.unit
+@pytest.mark.usefixtures("_rescan_namespace_item")
 class TestScheduledRescan:
     """EventBridge Scheduler invokes the API Lambda to fire a SCHEDULED rescan (#683 R7)."""
 
     def test_scheduled_event_triggers_rescan_with_scheduled_trigger(self):
         mock_dao = MagicMock()
-        mock_dao.get.return_value = _db_source_item("APPROVED")
+        mock_dao.get.return_value = {**_db_source_item("APPROVED"), "rescanSchedule": _SCHEDULE_ON}
         mock_scan_dao = MagicMock()
         mock_sqs = MagicMock()
 
@@ -1864,7 +2040,7 @@ class TestScheduledRescan:
         """A 409 for an open review is the designed outcome, not a broken
         schedule, so it must not make Scheduler retry."""
         mock_dao = MagicMock()
-        mock_dao.get.return_value = _db_source_item("RESCAN_REVIEW")
+        mock_dao.get.return_value = {**_db_source_item("RESCAN_REVIEW"), "rescanSchedule": _SCHEDULE_ON}
         mock_scan_dao = MagicMock()
         mock_sqs = MagicMock()
 
@@ -1883,8 +2059,201 @@ class TestScheduledRescan:
         assert resp["statusCode"] == 409
         mock_sqs.send_message.assert_not_called()
 
+    def _tick(self, item):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = item
+        mock_sqs = MagicMock()
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._get_scan_dao", return_value=MagicMock()),
+            patch(f"{_SH}._get_sqs", return_value=mock_sqs),
+            patch(f"{_SH}._SCAN_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/scan-queue"),
+        ):
+            resp = _current_sh().handler(
+                {"scheduledRescan": True, "namespaceId": _NAMESPACE_ID, "sourceId": _SOURCE_ID},
+                None,
+            )
+        return resp, mock_dao, mock_sqs
+
+    @pytest.mark.parametrize(
+        "schedule",
+        [{"enabled": False}, None, {}, "not-a-dict"],
+        ids=["disabled", "absent", "empty", "malformed"],
+    )
+    def test_scheduled_tick_schedule_not_enabled_skips_without_failing(self, schedule):
+        """The record decides, not the delivery: a schedule that survived a
+        failed delete, or a direct invocation, must not re-scan a source whose
+        schedule is OFF. Returned rather than raised so Scheduler does not run
+        its retry policy on every tick."""
+        item = _db_source_item("APPROVED")
+        if schedule is not None:
+            item["rescanSchedule"] = schedule
+
+        resp, mock_dao, mock_sqs = self._tick(item)
+
+        assert resp == {"ok": False, "skipped": "rescanSchedule_disabled"}
+        assert not _scan_started(mock_dao)
+        mock_sqs.send_message.assert_not_called()
+
+    def test_scheduled_tick_documents_source_skips(self):
+        item = {**_doc_source_item("COMPLETED"), "rescanSchedule": _SCHEDULE_ON}
+
+        resp, mock_dao, mock_sqs = self._tick(item)
+
+        assert resp == {"ok": False, "skipped": "not_a_database_source"}
+        mock_dao.put.assert_not_called()
+        mock_sqs.send_message.assert_not_called()
+
+    def test_scheduled_tick_source_gone_skips(self):
+        resp, mock_dao, mock_sqs = self._tick(None)
+
+        assert resp == {"ok": False, "skipped": "source_not_found"}
+        mock_dao.update.assert_not_called()
+        mock_sqs.send_message.assert_not_called()
+
+    def test_scheduled_tick_source_read_fails_does_not_scan(self):
+        mock_dao = MagicMock()
+        mock_dao.get.side_effect = ClientError(
+            {"Error": {"Code": "ProvisionedThroughputExceededException", "Message": "slow down"}}, "GetItem"
+        )
+        mock_sqs = MagicMock()
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._get_sqs", return_value=mock_sqs),
+        ):
+            resp = _current_sh().handler(
+                {"scheduledRescan": True, "namespaceId": _NAMESPACE_ID, "sourceId": _SOURCE_ID},
+                None,
+            )
+
+        assert resp == {"ok": False, "statusCode": 500}
+        mock_dao.update.assert_not_called()
+        mock_sqs.send_message.assert_not_called()
+
 
 @pytest.mark.unit
+class TestAutomatedRescanSwitchLeavesManualRescanAlone:
+    def test_handle_rescan_manual_with_automation_off_starts_scan(self):
+        """Turning automation off must not take away the steward's own re-scan."""
+        item = {
+            **_db_source_item("APPROVED"),
+            "rescanSchedule": {"enabled": False},
+            "eventRescan": {"enabled": False},
+        }
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = item
+        # Every re-scan snapshots the namespace language; a legacy item resolves to ``en``.
+        mock_ns_dao = MagicMock()
+        mock_ns_dao.get.return_value = {"PK": f"NS#{_NAMESPACE_ID}", "SK": "METADATA"}
+        mock_sqs = MagicMock()
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._get_ns_dao", return_value=mock_ns_dao),
+            patch(f"{_SH}._get_scan_dao", return_value=MagicMock()),
+            patch(f"{_SH}._get_sqs", return_value=mock_sqs),
+            patch(f"{_SH}._SCAN_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/scan-queue"),
+        ):
+            resp = _current_sh()._handle_rescan({}, _NAMESPACE_ID, _SOURCE_ID)
+
+        assert resp["statusCode"] in (200, 202)
+        assert _scan_started(mock_dao)
+        mock_sqs.send_message.assert_called_once()
+
+    @pytest.mark.parametrize(
+        ("trigger", "item_extra", "expected"),
+        [
+            ("SCHEDULED", {"rescanSchedule": {"enabled": True}}, None),
+            ("EVENT", {"eventRescan": {"enabled": True}}, None),
+            # Each trigger reads only its own switch.
+            ("SCHEDULED", {"eventRescan": {"enabled": True}}, "rescanSchedule_disabled"),
+            ("EVENT", {"rescanSchedule": {"enabled": True}}, "eventRescan_disabled"),
+            ("MANUAL", {"rescanSchedule": {"enabled": True}}, "not_an_automated_trigger"),
+        ],
+    )
+    def test_automated_rescan_skip_reason_reads_the_triggers_own_switch(self, trigger, item_extra, expected):
+        from coa_control_plane_server.models.scan_trigger import ScanTrigger
+
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {**_db_source_item("APPROVED"), **item_extra}
+        with patch(f"{_SH}._get_dao", return_value=mock_dao):
+            reason = _current_sh()._automated_rescan_skip_reason(_NAMESPACE_ID, _SOURCE_ID, ScanTrigger(trigger))
+
+        assert reason == expected
+
+
+@pytest.mark.unit
+class TestRescanTriggerNamespaceLanguage:
+    """SCHEDULED and EVENT re-scans snapshot the namespace language like a manual one.
+
+    Both triggers reuse ``_handle_rescan`` with no request body, so the language
+    comes only from the namespace item and reaches the scan job and its input.
+    """
+
+    def _run(self, trigger):
+        from coa_control_plane_server.models.scan_trigger import ScanTrigger
+
+        item = _db_source_item("APPROVED")
+        item.pop("lastScanAt", None)
+        # A SCHEDULED re-scan runs only while the source's schedule switch is on.
+        item["rescanSchedule"] = _SCHEDULE_ON
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = item
+        mock_ns_dao = MagicMock()
+        mock_ns_dao.get.return_value = {"PK": f"NS#{_NAMESPACE_ID}", "SK": "METADATA", "language": "ja"}
+        mock_scan_dao = MagicMock()
+        mock_sqs = MagicMock()
+
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._get_ns_dao", return_value=mock_ns_dao),
+            patch(f"{_SH}._get_scan_dao", return_value=mock_scan_dao),
+            patch(f"{_SH}._get_sqs", return_value=mock_sqs),
+            patch(f"{_SH}._SCAN_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/scan-queue"),
+        ):
+            if trigger == ScanTrigger.SCHEDULED:
+                resp = _current_sh().handler(
+                    {"scheduledRescan": True, "namespaceId": _NAMESPACE_ID, "sourceId": _SOURCE_ID}, None
+                )
+                assert resp["statusCode"] == 202
+            else:
+                status, _ = _parse(_current_sh()._handle_rescan({}, _NAMESPACE_ID, _SOURCE_ID, trigger=trigger))
+                assert status == 202
+        return mock_scan_dao.put.call_args[0][0], json.loads(mock_sqs.send_message.call_args[1]["MessageBody"])
+
+    @pytest.mark.parametrize("trigger", ["SCHEDULED", "EVENT"])
+    def test_trigger_carries_the_namespace_language(self, trigger):
+        scan_job, message = self._run(trigger)
+        assert scan_job["triggerType"] == trigger
+        assert scan_job["namespaceLanguage"] == "ja"
+        assert message["namespaceLanguage"] == "ja"
+
+    def test_namespace_read_error_fails_an_event_rescan_for_retry(self):
+        """A 5xx is what the Glue-event consumer reports as a batch item failure."""
+        from coa_control_plane_server.models.scan_trigger import ScanTrigger
+
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = _db_source_item("APPROVED")
+        mock_ns_dao = MagicMock()
+        mock_ns_dao.get.side_effect = ClientError({"Error": {"Code": "InternalServerError", "Message": "x"}}, "GetItem")
+        mock_scan_dao = MagicMock()
+        mock_sqs = MagicMock()
+
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._get_ns_dao", return_value=mock_ns_dao),
+            patch(f"{_SH}._get_scan_dao", return_value=mock_scan_dao),
+            patch(f"{_SH}._get_sqs", return_value=mock_sqs),
+        ):
+            status, _ = _parse(_current_sh()._handle_rescan({}, _NAMESPACE_ID, _SOURCE_ID, trigger=ScanTrigger.EVENT))
+
+        assert status == 500
+        mock_dao.update.assert_not_called()
+        mock_scan_dao.put.assert_not_called()
+        mock_sqs.send_message.assert_not_called()
+
+
+@pytest.mark.unit
+@pytest.mark.usefixtures("_rescan_namespace_item")
 class TestEventRescanCooldown:
     """EVENT rescans coalesce upstream-change bursts via a cooldown (#683 R8)."""
 
@@ -1939,6 +2308,7 @@ class TestEventRescanCooldown:
 
 
 @pytest.mark.unit
+@pytest.mark.usefixtures("_rescan_namespace_item")
 class TestRescanStatusTransition:
     """The SCANNING transition is the lock that serialises concurrent triggers."""
 

@@ -38,6 +38,7 @@ from coa_common import (
     BedrockEmbedder,
     ontology_vector_index_name,
 )
+from coa_common.opensearch import DeleteIncompleteError
 
 from coa_metrics.neptune_client import MetricDefinition, _metric_uri
 
@@ -181,9 +182,16 @@ class MetricOpenSearchClient:
     def _delete_by_entity_uri(self, index: str, entity_uri: str) -> None:
         """Delete documents matching entity_uri (AOSS idempotent upsert pattern).
 
-        Best-effort: the index may not exist yet (first metric in a namespace).
+        Best-effort: the index may not exist yet (first metric in a namespace),
+        and a delete that stops with the old document still matching is logged,
+        not raised. The metric write that follows still lands, and the next
+        upsert or delete of the same metric retries the leftover.
         """
         try:
             self._aoss().delete_by_term(index, "entity_uri", entity_uri, page=10)
+        except DeleteIncompleteError as exc:
+            logger.warning(
+                "delete_by_entity_uri_incomplete", entity_uri=entity_uri, remaining=exc.remaining, error=str(exc)
+            )
         except Exception as exc:  # noqa: BLE001 — index-absent on first write is expected
             logger.debug("delete_by_entity_uri_skipped", entity_uri=entity_uri, error=str(exc))

@@ -7,3 +7,4 @@ export * from "./grant-overrides";
 export * from "./errors";
 export * from "./run-sequential";
 export * from "./routes";
+export * from "./namespace-language";

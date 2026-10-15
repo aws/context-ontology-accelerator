@@ -7,9 +7,10 @@ from __future__ import annotations
 
 import json
 import os
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
+from botocore.exceptions import ClientError
 
 os.environ.setdefault("STATE_MACHINE_ARN", "arn:aws:states:us-east-1:123456789012:stateMachine:test")
 os.environ.setdefault(
@@ -36,6 +37,7 @@ _VALID_BODY = {
     "namespace_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
     "doc_source_id": "ds-1",
     "s3_prefixes": ["aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/raw/ds-1/"],
+    "namespace_language": "en",
 }
 
 
@@ -90,7 +92,11 @@ class TestHandlerMalformedMessage:
     @patch.object(index, "sfn_client")
     def test_whole_bucket_no_prefixes(self, mock_sfn):
         """s3_prefixes absent means whole-bucket ingestion — still valid."""
-        body = {"namespace_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "doc_source_id": "ds-1"}
+        body = {
+            "namespace_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "doc_source_id": "ds-1",
+            "namespace_language": "en",
+        }
         index.handler(_make_event(_make_record(body)), None)
         mock_sfn.start_execution.assert_called_once()
         call_input = json.loads(mock_sfn.start_execution.call_args.kwargs["input"])
@@ -246,3 +252,95 @@ class TestStringifyConfigValue:
     def test_string_and_other_passthrough(self):
         assert index._stringify_config_value("already") == "already"
         assert index._stringify_config_value(None) is None
+
+
+def _legacy_body() -> dict:
+    return {k: v for k, v in _VALID_BODY.items() if k != "namespace_language"}
+
+
+def _ns_dao(item=None, error=None):
+    dao = MagicMock()
+    if error is not None:
+        dao.get.side_effect = error
+    else:
+        dao.get.return_value = item
+    return dao
+
+
+@pytest.mark.unit
+class TestNamespaceLanguage:
+    @pytest.mark.parametrize("snapshot", ["ja", "", "ja_JP"])
+    @patch.object(index, "_NAMESPACES_TABLE", "namespaces")
+    @patch.object(index, "DynamoDBDAO")
+    @patch.object(index, "sfn_client")
+    def test_present_snapshot_is_forwarded_without_reading_the_namespace(self, mock_sfn, mock_dao_cls, snapshot):
+        # An invalid or empty snapshot is forwarded too: the KG-build task
+        # rejects it (fail closed) rather than it being replaced here. The
+        # namespace table is configured and would answer "en", so a trigger
+        # that resolved a present snapshot would fail this test.
+        mock_dao_cls.return_value = _ns_dao({"language": "en"})
+        index.handler(_make_event(_make_record({**_VALID_BODY, "namespace_language": snapshot})), None)
+        call_input = json.loads(mock_sfn.start_execution.call_args.kwargs["input"])
+        assert call_input["namespace_language"] == snapshot
+        mock_dao_cls.assert_not_called()
+
+    @pytest.mark.parametrize(("item", "expected"), [({"language": "ja"}, "ja"), ({}, "en")])
+    @patch.object(index, "_NAMESPACES_TABLE", "namespaces")
+    @patch.object(index, "DynamoDBDAO")
+    @patch.object(index, "sfn_client")
+    def test_pre_snapshot_message_resolves_once_from_the_namespace(self, mock_sfn, mock_dao_cls, item, expected):
+        mock_dao_cls.return_value = _ns_dao({"PK": "NS#x", "SK": "METADATA", **item})
+        index.handler(_make_event(_make_record(_legacy_body())), None)
+        call_input = json.loads(mock_sfn.start_execution.call_args.kwargs["input"])
+        assert call_input["namespace_language"] == expected
+        mock_dao_cls.return_value.get.assert_called_once_with(
+            {"PK": "NS#aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "SK": "METADATA"}
+        )
+
+    @pytest.mark.parametrize("item", [None, {"language": "ja_JP"}])
+    @patch.object(index, "_NAMESPACES_TABLE", "namespaces")
+    @patch.object(index, "DynamoDBDAO")
+    @patch.object(index, "sfn_client")
+    def test_unresolvable_namespace_forwards_empty_not_english(self, mock_sfn, mock_dao_cls, item):
+        # Missing namespace or unsupported stored value: the KG-build task
+        # fails the source (SCAN_FAILED) instead of defaulting to English.
+        mock_dao_cls.return_value = _ns_dao(item)
+        index.handler(_make_event(_make_record(_legacy_body())), None)
+        call_input = json.loads(mock_sfn.start_execution.call_args.kwargs["input"])
+        assert call_input["namespace_language"] == ""
+
+    @patch.object(index, "_NAMESPACES_TABLE", "namespaces")
+    @patch.object(index, "DynamoDBDAO")
+    @patch.object(index, "sfn_client")
+    def test_null_snapshot_is_forwarded_as_empty_without_reading_the_namespace(self, mock_sfn, mock_dao_cls):
+        # A message that carries the key is not a pre-snapshot message, even
+        # when the value is null: it is forwarded as "" for the KG-build task to
+        # reject, never resolved here. The configured namespace would answer
+        # "ja", so treating null as pre-snapshot would fail this test.
+        mock_dao_cls.return_value = _ns_dao({"language": "ja"})
+        index.handler(_make_event(_make_record({**_VALID_BODY, "namespace_language": None})), None)
+        call_input = json.loads(mock_sfn.start_execution.call_args.kwargs["input"])
+        assert call_input["namespace_language"] == ""
+        mock_dao_cls.assert_not_called()
+
+    @patch.object(index, "_NAMESPACES_TABLE", "")
+    @patch.object(index, "DynamoDBDAO")
+    @patch.object(index, "sfn_client")
+    def test_pre_snapshot_message_without_namespaces_table_forwards_empty(self, mock_sfn, mock_dao_cls):
+        # Misconfigured trigger: the execution still starts, and the KG-build
+        # task fails the source instead of building it in English.
+        index.handler(_make_event(_make_record(_legacy_body())), None)
+        mock_sfn.start_execution.assert_called_once()
+        call_input = json.loads(mock_sfn.start_execution.call_args.kwargs["input"])
+        assert call_input["namespace_language"] == ""
+        mock_dao_cls.assert_not_called()
+
+    @patch.object(index, "_NAMESPACES_TABLE", "namespaces")
+    @patch.object(index, "DynamoDBDAO")
+    @patch.object(index, "sfn_client")
+    def test_namespace_read_error_is_retried_not_defaulted(self, mock_sfn, mock_dao_cls):
+        error = ClientError({"Error": {"Code": "ProvisionedThroughputExceededException", "Message": "x"}}, "GetItem")
+        mock_dao_cls.return_value = _ns_dao(error=error)
+        with pytest.raises(ClientError):
+            index.handler(_make_event(_make_record(_legacy_body())), None)
+        mock_sfn.start_execution.assert_not_called()

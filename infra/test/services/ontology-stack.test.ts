@@ -28,10 +28,12 @@ function renderOntology(
     bedrockEmbedDimensions?: number;
     bedrockInductionLlmModelId?: string;
     bedrockChatModelId?: string;
+    bedrockGroundingLlmModelId?: string;
   },
   id: string,
+  extraContext: Record<string, unknown> = {},
 ): Template {
-  const app = new cdk.App({ context: TEST_CONTEXT });
+  const app = new cdk.App({ context: { ...TEST_CONTEXT, ...extraContext } });
   const network = new NetworkStack(app, `${id}Network`);
   return Template.fromStack(
     new OntologyStack(app, id, {
@@ -79,6 +81,7 @@ describe("OntologyStack model IDs from deploy config (#94)", () => {
         bedrockEmbedDimensions: 512,
         bedrockInductionLlmModelId: "jp.anthropic.claude-sonnet-4-6",
         bedrockChatModelId: "jp.anthropic.claude-haiku-4-5-20251001-v1:0",
+        bedrockGroundingLlmModelId: "jp.anthropic.claude-haiku-4-5-20251001-v1:0",
       },
       "CfgOntology",
     );
@@ -94,6 +97,10 @@ describe("OntologyStack model IDs from deploy config (#94)", () => {
     expect(envValue(t, "BEDROCK_CHAT_MODEL_ID")).toBe(
       "jp.anthropic.claude-haiku-4-5-20251001-v1:0",
     );
+    // Grounding reranker override reaches the container (GH #236).
+    expect(envValue(t, "GROUNDING_LLM_MODEL_ID")).toBe(
+      "jp.anthropic.claude-haiku-4-5-20251001-v1:0",
+    );
   });
 
   test("omitting config keeps the previous defaults (backward compatibility)", () => {
@@ -104,25 +111,141 @@ describe("OntologyStack model IDs from deploy config (#94)", () => {
     expect(envValue(t, "LLM_MODEL_ID")).toBe("us.anthropic.claude-sonnet-5");
   });
 
+  test("grounding model defaults to the chat model, independently overridable (GH #236)", () => {
+    // Unset: grounding follows the chat (Haiku) model, not the induction model.
+    const def = renderOntology({}, "GroundDefaultOntology");
+    expect(envValue(def, "GROUNDING_LLM_MODEL_ID")).toBe(
+      "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+    );
+    expect(envValue(def, "GROUNDING_LLM_MODEL_ID")).toBe(
+      envValue(def, "BEDROCK_CHAT_MODEL_ID"),
+    );
+
+    // A grounding override wins over the chat model and does not disturb it.
+    const ovr = renderOntology(
+      {
+        bedrockChatModelId: "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        bedrockGroundingLlmModelId: "jp.anthropic.claude-haiku-4-5-20251001-v1:0",
+      },
+      "GroundOverrideOntology",
+    );
+    expect(envValue(ovr, "GROUNDING_LLM_MODEL_ID")).toBe(
+      "jp.anthropic.claude-haiku-4-5-20251001-v1:0",
+    );
+    expect(envValue(ovr, "BEDROCK_CHAT_MODEL_ID")).toBe(
+      "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+    );
+  });
+
   test("dashboard ModelId dimensions follow the configured models", () => {
     // The dashboard used to hold independent literal copies, so a configured
-    // model left the Bedrock widgets querying a dimension with no data.
+    // model left the Bedrock widgets querying a dimension with no data. The
+    // Bedrock widgets plot the induction invoker (Sonnet), the enrichment
+    // invoker (chat/Haiku), embeddings, and — when it differs from chat — the
+    // grounding invoker.
     const t = renderOntology(
       {
         bedrockEmbedModelId: "cohere.embed-v4:0",
         bedrockInductionLlmModelId: "jp.anthropic.claude-sonnet-4-6",
         bedrockChatModelId: "jp.anthropic.claude-haiku-4-5-20251001-v1:0",
+        // Grounding distinct from chat → it gets its own dimension.
+        bedrockGroundingLlmModelId: "global.anthropic.claude-haiku-4-5-20251001-v1:0",
       },
       "DashOntology",
     );
     const dashboards = t.findResources("AWS::CloudWatch::Dashboard");
     const body = JSON.stringify(Object.values(dashboards));
+    // Induction (Sonnet), chat (Haiku), grounding (distinct), and embed all appear.
     expect(body).toContain("jp.anthropic.claude-sonnet-4-6");
     expect(body).toContain("jp.anthropic.claude-haiku-4-5-20251001-v1:0");
+    expect(body).toContain("global.anthropic.claude-haiku-4-5-20251001-v1:0");
     expect(body).toContain("cohere.embed-v4:0");
     // No stale us. literals left behind in the widgets.
-    expect(body).not.toContain("us.anthropic.claude-sonnet-4-6");
     expect(body).not.toContain("us.cohere.embed-v4:0");
+  });
+
+  test("cost estimate never prices one ModelId as two terms (GH #236)", () => {
+    // Default deploy: grounding == chat, so the cost MathExpression must NOT
+    // carry a grounding (gi/go) term — otherwise the chat/Haiku tokens would be
+    // counted twice (once as hi/ho, once as gi/go). Regression guard for the
+    // rerank/haiku double-count Kun flagged.
+    const def = renderOntology({}, "CostDefaultOntology");
+    const defBody = JSON.stringify(
+      Object.values(def.findResources("AWS::CloudWatch::Dashboard")),
+    );
+    const costExpr = (body: string): string => {
+      // The est-cost MathExpression is the only one multiplying by a Sonnet price.
+      const m = body.match(/si\*0\.003[^"]*/);
+      return m ? m[0] : "";
+    };
+    const defExpr = costExpr(defBody);
+    expect(defExpr).not.toBe("");
+    // si/so (induction, Sonnet) and hi/ho (chat, Haiku) present; no gi/go by default.
+    expect(defExpr).toContain("si*0.003");
+    expect(defExpr).toContain("hi*0.001");
+    expect(defExpr).not.toContain("gi*");
+    expect(defExpr).not.toContain("go*");
+
+    // Grounding distinct from chat: a separate Haiku-priced gi/go term appears,
+    // so grounding tokens are priced once at Haiku rates (not folded into si/so
+    // at Sonnet rates, and not double-counted with hi/ho).
+    const ovr = renderOntology(
+      {
+        bedrockChatModelId: "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        bedrockGroundingLlmModelId: "jp.anthropic.claude-haiku-4-5-20251001-v1:0",
+      },
+      "CostGroundingOntology",
+    );
+    const ovrExpr = costExpr(
+      JSON.stringify(
+        Object.values(ovr.findResources("AWS::CloudWatch::Dashboard")),
+      ),
+    );
+    expect(ovrExpr).toContain("gi*0.001"); // grounding priced at Haiku input
+    expect(ovrExpr).toContain("go*0.005"); // grounding priced at Haiku output
+  });
+});
+
+describe("OntologyStack OoPS! endpoint is opt-in (#171)", () => {
+  test("oops_endpoint context reaches the container as OOPS_ENDPOINT", () => {
+    const t = renderOntology({}, "OopsOn", {
+      oops_endpoint: "https://oops.example.test/rest",
+    });
+    expect(envValue(t, "OOPS_ENDPOINT")).toBe("https://oops.example.test/rest");
+  });
+
+  test("a non-https oops_endpoint fails synth", () => {
+    expect(() =>
+      renderOntology({}, "OopsHttp", {
+        oops_endpoint: "http://oops.example.test/rest",
+      }),
+    ).toThrow(/https:\/\//);
+  });
+
+  test("the https scheme check is case-insensitive", () => {
+    const t = renderOntology({}, "OopsUpper", {
+      oops_endpoint: "HTTPS://oops.example.test/rest",
+    });
+    expect(envValue(t, "OOPS_ENDPOINT")).toBe("HTTPS://oops.example.test/rest");
+  });
+
+  test.each([
+    ["object", { url: "https://oops.example.test/rest" }],
+    ["boolean", true],
+    ["number", 443],
+  ])("a non-string (%s) oops_endpoint fails synth", (_label, value) => {
+    expect(() =>
+      renderOntology({}, `OopsBad${_label}`, { oops_endpoint: value }),
+    ).toThrow(/https:\/\//);
+  });
+
+  test.each([
+    ["absent", {}],
+    ["empty", { oops_endpoint: "" }],
+    ["whitespace", { oops_endpoint: "  " }],
+  ])("%s oops_endpoint leaves OOPS_ENDPOINT unset", (_label, ctx) => {
+    const t = renderOntology({}, `OopsOff${_label}`, ctx);
+    expect(containerEnv(t).some((e) => e.Name === "OOPS_ENDPOINT")).toBe(false);
   });
 });
 
@@ -485,10 +608,11 @@ describe("OntologyStack", () => {
 
 // The running coa-dev-ontology-engine image accreted Critical/High OS CVEs
 // (glibc, perl, sqlite3, libssh2, gzip, pcre2) whenever a build predated the
-// Debian point releases that fix them. Two Dockerfile properties keep the image
-// patchable: a pinned base digest (supply-chain integrity + a cache-busting
-// bump lever) and a post-install `apt-get upgrade` (the only mechanism pulling
-// trixie-security point releases in). These guard both against regression —
+// Debian point releases that fix them; the base is now AL2023. Two
+// Dockerfile properties keep the image patchable: a pinned base digest
+// (supply-chain integrity + a cache-busting bump lever) and a post-install
+// `dnf upgrade --releasever=latest` (the only mechanism pulling AL2023 security
+// updates in past the pinned snapshot). These guard both against regression —
 // removing the upgrade line, or floating the base back onto a mutable tag, is
 // exactly how the CVEs came back.
 describe("ontology-engine Dockerfile CVE hygiene", () => {
@@ -507,20 +631,19 @@ describe("ontology-engine Dockerfile CVE hygiene", () => {
 
   test("pins the base image to a digest, not a mutable tag", () => {
     const from = dockerfile.match(
-      /^FROM .*python:3\.12-slim(@sha256:[a-f0-9]{64})?/m,
+      /^FROM .*amazonlinux:2023-minimal(@sha256:[a-f0-9]{64})?/m,
     );
     expect(from).not.toBeNull();
     // A digest pin (@sha256:...) must be present; a bare/:latest tag would let
     // the base float and silently reintroduce unpatched packages.
     expect(from?.[1]).toMatch(/@sha256:[a-f0-9]{64}/);
-    expect(dockerfile).not.toMatch(/python:3\.12-slim\s*$/m);
+    expect(dockerfile).not.toMatch(/amazonlinux:2023-minimal\s*$/m);
   });
 
-  test("runs apt-get upgrade so OS security point releases are applied", () => {
-    // This is the line that resolves the Debian package CVEs at build time.
-    // Must be `upgrade`, never `dist-upgrade` (which may remove packages).
-    expect(dockerfile).toMatch(/apt-get upgrade -y/);
-    expect(dockerfile).not.toMatch(/apt-get dist-upgrade/);
+  test("runs dnf upgrade against the latest AL2023 release so OS security updates are applied", () => {
+    // AL2023 locks dnf to the base image's repo snapshot; without
+    // --releasever=latest a stale digest pin freezes the OS patch level.
+    expect(dockerfile).toMatch(/dnf upgrade -y --releasever=latest/);
   });
 
   test("strips owlready2's unused Pellet reasoner (vulnerable bundled JARs)", () => {

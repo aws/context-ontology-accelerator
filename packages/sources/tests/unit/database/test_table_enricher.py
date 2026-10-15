@@ -137,7 +137,7 @@ class TestRun:
         mock_client_cls.return_value.invoke.return_value = _mock_invocation_result()
         mock_read.return_value = [_make_table("t1"), _make_table("t2")]
 
-        result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock())
+        result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock(), namespace_language="en")
 
         assert result["tables_enriched"] == 2
         assert result["tables_failed"] == 0
@@ -152,7 +152,7 @@ class TestRun:
         mock_client_cls.return_value.invoke.side_effect = Exception("Bedrock error")
         mock_read.return_value = [_make_table("t1")]
 
-        result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock())
+        result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock(), namespace_language="en")
 
         assert result["tables_enriched"] == 0
         assert result["tables_failed"] == 1
@@ -185,7 +185,7 @@ class TestRun:
         tables = [_make_table("t1"), _make_table("t2")]
         mock_read.return_value = tables
 
-        result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock())
+        result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock(), namespace_language="en")
 
         total = len(tables)
         enriched = result["tables_enriched"]
@@ -212,7 +212,7 @@ class TestRun:
         mock_read.return_value = [_make_table("t1")]
         mock_emitter = MagicMock()
 
-        result = run("ds-123", "ns-456", "dom-789", "full", emitter=mock_emitter)
+        result = run("ds-123", "ns-456", "dom-789", "full", emitter=mock_emitter, namespace_language="en")
 
         assert result["tables_failed"] == 1
         mock_emitter.emit_bedrock_invocation_error.assert_called_once()
@@ -225,7 +225,7 @@ class TestRun:
     def test_run_no_tables(self, mock_client_cls: MagicMock, mock_read: MagicMock, mock_write: MagicMock) -> None:
         mock_read.return_value = []
 
-        result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock())
+        result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock(), namespace_language="en")
 
         assert result == {
             "tables_enriched": 0,
@@ -258,7 +258,15 @@ class TestRunProgress:
         mock_read.return_value = [_make_table("t1"), _make_table("t2")]
         calls: list[tuple[int, int]] = []
 
-        run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock(), progress=lambda p, t: calls.append((p, t)))
+        run(
+            "ds-123",
+            "ns-456",
+            "dom-789",
+            "full",
+            emitter=MagicMock(),
+            progress=lambda p, t: calls.append((p, t)),
+            namespace_language="en",
+        )
 
         # The throttle suppresses the per-table publishes in a sub-second run, so
         # what is left is the forced pair either side of the work.
@@ -274,7 +282,15 @@ class TestRunProgress:
         mock_read.return_value = [self._reviewed("done"), _make_table("pending")]
         calls: list[tuple[int, int]] = []
 
-        run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock(), progress=lambda p, t: calls.append((p, t)))
+        run(
+            "ds-123",
+            "ns-456",
+            "dom-789",
+            "full",
+            emitter=MagicMock(),
+            progress=lambda p, t: calls.append((p, t)),
+            namespace_language="en",
+        )
 
         # 1/2 up front: a skipped table was inspected and found unchanged. Without
         # it the bar would sit near zero through a rescan that changed almost nothing.
@@ -291,7 +307,15 @@ class TestRunProgress:
         mock_read.return_value = [_make_table("t1"), _make_table("t2")]
         calls: list[tuple[int, int]] = []
 
-        run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock(), progress=lambda p, t: calls.append((p, t)))
+        run(
+            "ds-123",
+            "ns-456",
+            "dom-789",
+            "full",
+            emitter=MagicMock(),
+            progress=lambda p, t: calls.append((p, t)),
+            namespace_language="en",
+        )
 
         assert calls == [(0, 2), (1, 2), (2, 2), (2, 2)]
 
@@ -306,7 +330,13 @@ class TestRunProgress:
         calls: list[tuple[int, int]] = []
 
         result = run(
-            "ds-123", "ns-456", "dom-789", "full", emitter=MagicMock(), progress=lambda p, t: calls.append((p, t))
+            "ds-123",
+            "ns-456",
+            "dom-789",
+            "full",
+            emitter=MagicMock(),
+            progress=lambda p, t: calls.append((p, t)),
+            namespace_language="en",
         )
 
         # Its work ran and errored, so the bar completes rather than stalling at 0.
@@ -325,7 +355,9 @@ class TestRunProgress:
         def explode(processed: int, total: int) -> None:
             raise RuntimeError("ddb unavailable")
 
-        result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock(), progress=explode)
+        result = run(
+            "ds-123", "ns-456", "dom-789", "full", emitter=MagicMock(), progress=explode, namespace_language="en"
+        )
 
         assert result["tables_enriched"] == 1
 
@@ -406,7 +438,7 @@ class TestParallelChunkDispatch:
         table = _make_table("big", num_columns=120)
         mock_read.return_value = [table]
 
-        result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock())
+        result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock(), namespace_language="en")
 
         # 3 Pass 1 batch calls + 1 Pass 2 FK inference call
         assert mock_client_cls.return_value.invoke.call_count == 4
@@ -422,7 +454,7 @@ class TestParallelChunkDispatch:
         table = _make_table("small", num_columns=10)
         mock_read.return_value = [table]
 
-        result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock())
+        result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock(), namespace_language="en")
 
         # 1 Pass 1 call + 1 Pass 2 FK inference call
         assert mock_client_cls.return_value.invoke.call_count == 2
@@ -446,7 +478,7 @@ class TestPerTableTimeout:
         )
         mock_read.return_value = [_make_table("t1")]
 
-        result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock())
+        result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock(), namespace_language="en")
 
         assert result["tables_enriched"] == 0
         assert result["tables_failed"] == 1
@@ -468,7 +500,7 @@ class TestPerTableTimeout:
         mock_client_cls.return_value.invoke.side_effect = mock_invoke
         mock_read.return_value = [_make_table("t1"), _make_table("t2")]
 
-        result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock())
+        result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock(), namespace_language="en")
 
         assert result["tables_enriched"] == 1
         assert result["tables_failed"] == 1
@@ -497,7 +529,7 @@ class TestRetryConfig:
         )
         mock_read.return_value = [_make_table("t1")]
 
-        result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock())
+        result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock(), namespace_language="en")
 
         assert result["tables_enriched"] == 0
         assert result["tables_failed"] == 1
@@ -526,7 +558,7 @@ class TestExistingMetadataPassThrough:
         ]
         mock_read.return_value = [table]
 
-        run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock())
+        run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock(), namespace_language="en")
 
         # First invoke call is Pass 1 (per-table); last is Pass 2 (FK inference)
         invoke_call = mock_client_cls.return_value.invoke.call_args_list[0]
@@ -545,7 +577,7 @@ class TestExistingMetadataPassThrough:
         table.primary_key = PrimaryKey(columns=["order_id"], source=EnrichmentSource.DETERMINISTIC, confidence=1.0)
         mock_read.return_value = [table]
 
-        run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock())
+        run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock(), namespace_language="en")
 
         # First invoke call is Pass 1 (per-table); last is Pass 2 (FK inference)
         invoke_call = mock_client_cls.return_value.invoke.call_args_list[0]
@@ -567,7 +599,7 @@ class TestMetricEmissionDuringEnrichment:
         mock_read.return_value = [_make_table("t1")]
         mock_emitter = MagicMock()
 
-        run("ds-123", "ns-456", "dom-789", "full", emitter=mock_emitter)
+        run("ds-123", "ns-456", "dom-789", "full", emitter=mock_emitter, namespace_language="en")
 
         # Pass1 invocation for the single table
         mock_emitter.emit_bedrock_invocation_metrics.assert_called()
@@ -587,7 +619,7 @@ class TestMetricEmissionDuringEnrichment:
         mock_read.return_value = [_make_table("t1"), _make_table("t2")]
         mock_emitter = MagicMock()
 
-        run("ds-123", "ns-456", "dom-789", "full", emitter=mock_emitter)
+        run("ds-123", "ns-456", "dom-789", "full", emitter=mock_emitter, namespace_language="en")
 
         # Pass2 FK inference call should also emit metrics
         pass2_calls = [
@@ -605,7 +637,7 @@ class TestMetricEmissionDuringEnrichment:
         mock_read.return_value = [_make_table("t1")]
         mock_emitter = MagicMock()
 
-        run("ds-123", "ns-456", "dom-789", "full", emitter=mock_emitter)
+        run("ds-123", "ns-456", "dom-789", "full", emitter=mock_emitter, namespace_language="en")
 
         mock_emitter.emit_bedrock_invocation_error.assert_called_once()
         call_kwargs = mock_emitter.emit_bedrock_invocation_error.call_args[1]
@@ -622,7 +654,7 @@ class TestMetricEmissionDuringEnrichment:
         mock_read.return_value = [_make_table("t1"), _make_table("t2"), _make_table("t3")]
         mock_emitter = MagicMock()
 
-        run("ds-123", "ns-456", "dom-789", "full", emitter=mock_emitter)
+        run("ds-123", "ns-456", "dom-789", "full", emitter=mock_emitter, namespace_language="en")
 
         pass1_calls = [
             c for c in mock_emitter.emit_bedrock_invocation_metrics.call_args_list if c[1]["stage"] == "Pass1"
@@ -639,7 +671,7 @@ class TestMetricEmissionDuringEnrichment:
         mock_read.return_value = []
         mock_emitter = MagicMock()
 
-        run("ds-123", "ns-456", "dom-789", "full", emitter=mock_emitter)
+        run("ds-123", "ns-456", "dom-789", "full", emitter=mock_emitter, namespace_language="en")
 
         mock_emitter.emit_bedrock_invocation_metrics.assert_not_called()
         mock_emitter.emit_bedrock_invocation_error.assert_not_called()
@@ -699,7 +731,7 @@ class TestGuardrailBlockedPath:
         mock_read.return_value = [_make_table("t1")]
         mock_emitter = MagicMock()
 
-        result = run("ds-123", "ns-456", "dom-789", "full", emitter=mock_emitter)
+        result = run("ds-123", "ns-456", "dom-789", "full", emitter=mock_emitter, namespace_language="en")
 
         assert result["tables_enriched"] == 0
         assert result["tables_failed"] == 1
@@ -724,7 +756,7 @@ class TestGuardrailBlockedPath:
         mock_client_cls.return_value.invoke.side_effect = mock_invoke
         mock_read.return_value = [_make_table("t1"), _make_table("t2")]
 
-        result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock())
+        result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock(), namespace_language="en")
 
         assert result["tables_enriched"] == 1
         assert result["tables_failed"] == 1
@@ -740,7 +772,7 @@ class TestGuardrailBlockedPath:
         mock_client_cls.return_value.invoke.side_effect = GuardrailBlockedError("content blocked")
         mock_read.return_value = [_make_table("t1", database="public")]
 
-        result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock())
+        result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock(), namespace_language="en")
 
         assert result["tables_failed"] == 1
         # table_id == f"{database}.{name}"
@@ -755,7 +787,7 @@ class TestGuardrailBlockedPath:
         mock_client_cls.return_value.invoke.return_value = _mock_invocation_result()
         mock_read.return_value = [_make_table("t1")]
 
-        result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock())
+        result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock(), namespace_language="en")
 
         assert result["tables_failed"] == 0
         assert result["failed_table_ids"] == []
@@ -775,7 +807,7 @@ class TestBedrockTruncationPath:
         mock_read.return_value = [_make_table("t1")]
         mock_emitter = MagicMock()
 
-        result = run("ds-123", "ns-456", "dom-789", "full", emitter=mock_emitter)
+        result = run("ds-123", "ns-456", "dom-789", "full", emitter=mock_emitter, namespace_language="en")
 
         assert result["tables_enriched"] == 0
         assert result["tables_failed"] == 1
@@ -1028,7 +1060,7 @@ class TestIncompleteBatchDetection:
         table = _make_table("big", database="public", num_columns=120)
         mock_read.return_value = [table]
 
-        result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock())
+        result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock(), namespace_language="en")
 
         # The table is KEPT (enriched), flagged partial, and NOT counted as failed.
         assert result["tables_enriched"] == 1
@@ -1054,7 +1086,7 @@ class TestIncompleteBatchDetection:
         table = _make_table("big", database="public", num_columns=120)
         mock_read.return_value = [table]
 
-        result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock())
+        result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock(), namespace_language="en")
 
         assert result["tables_enriched"] == 0
         assert result["tables_failed"] == 1
@@ -1081,7 +1113,7 @@ class TestIncompleteBatchDetection:
         mock_read.return_value = [table]
         mock_emitter = MagicMock()
 
-        result = run("ds-123", "ns-456", "dom-789", "full", emitter=mock_emitter)
+        result = run("ds-123", "ns-456", "dom-789", "full", emitter=mock_emitter, namespace_language="en")
 
         assert result["tables_partial"] == 1
         # The partial count is surfaced as its own metric (mirrors TablesMissingDescription).
@@ -1099,7 +1131,7 @@ class TestIncompleteBatchDetection:
         table = _make_table("big", database="public", num_columns=120)
         mock_read.return_value = [table]
 
-        result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock())
+        result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock(), namespace_language="en")
 
         assert result["tables_enriched"] == 1
         assert result["tables_partial"] == 0
@@ -1140,7 +1172,7 @@ class TestIncompleteBatchDetection:
         mock_client_cls.return_value.invoke.side_effect = mock_invoke
         mock_read.return_value = [table]
 
-        result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock())
+        result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock(), namespace_language="en")
 
         assert result["tables_enriched"] == 1
         assert result["tables_failed"] == 0
@@ -1175,7 +1207,7 @@ class TestPass2FailureFallback:
         original_infer = ri_mod.infer_relationships
         ri_mod.infer_relationships = MagicMock(side_effect=Exception("Pass 2 exploded"))
         try:
-            result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock())
+            result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock(), namespace_language="en")
         finally:
             ri_mod.infer_relationships = original_infer
 
@@ -1304,7 +1336,7 @@ class TestCallBedrockMaxTokens:
                 "extra_context": "Evidence text",
                 "extra_context_hint": "Use this for FK inference",
             }
-            run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock())
+            run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock(), namespace_language="en")
 
         invoke_call = mock_client_cls.return_value.invoke.call_args_list[0]
         assert invoke_call[1]["max_tokens"] == 16384
@@ -1379,7 +1411,7 @@ class TestEmptyDescriptionFallback:
         mock_read.return_value = [_make_table("t1"), _make_table("t2")]
         mock_emitter = MagicMock()
 
-        run("ds-123", "ns-456", "dom-789", "full", emitter=mock_emitter)
+        run("ds-123", "ns-456", "dom-789", "full", emitter=mock_emitter, namespace_language="en")
 
         calls = [c for c in mock_emitter.emit_metric.call_args_list if c[0][0] == "TablesMissingDescription"]
         assert len(calls) == 1
@@ -1395,7 +1427,7 @@ class TestEmptyDescriptionFallback:
         mock_read.return_value = [_make_table("t1")]
         mock_emitter = MagicMock()
 
-        run("ds-123", "ns-456", "dom-789", "full", emitter=mock_emitter)
+        run("ds-123", "ns-456", "dom-789", "full", emitter=mock_emitter, namespace_language="en")
 
         calls = [c for c in mock_emitter.emit_metric.call_args_list if c[0][0] == "TablesMissingDescription"]
         assert calls[0][0][1] == 0
@@ -1548,7 +1580,7 @@ class TestReScanPreservesReviewedItems:
         mock_client_cls.return_value.invoke.return_value = _mock_invocation_result()
         mock_read.return_value = [approved, pending]
 
-        result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock())
+        result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock(), namespace_language="en")
 
         assert result["tables_enriched"] == 1
         assert result["tables_skipped_unchanged"] == 1

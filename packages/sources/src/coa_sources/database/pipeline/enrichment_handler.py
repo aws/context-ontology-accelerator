@@ -11,6 +11,11 @@ Environment variables (injected by Step Functions container overrides):
     DATASOURCE_ID: The data source being enriched
     SCAN_JOB_ID: The current scan job ID
     NAMESPACE_ID: The namespace owning this data source
+    NAMESPACE_LANGUAGE: Canonical namespace language snapshotted by the Sources
+        API when the scan was triggered, so a retried task uses the language its
+        job started with. Empty only for a job enqueued before the snapshot
+        existed (or redriven from the DLQ): that job resolves it once from the
+        namespace item and records it on the scan-job row.
     SCAN_TYPE: "full" or "incremental"
     SMUS_DOMAIN_ID: DataZone domain ID
     DATASOURCES_TABLE: DynamoDB table for data source configs
@@ -29,6 +34,11 @@ from coa_control_plane_server.models.source_status import SourceStatus
 from coa_sources.database.pipeline.enrichment_metrics import (
     EnrichmentContext,
     EnrichmentMetricEmitter,
+)
+from coa_sources.namespace_language import (
+    NAMESPACE_LANGUAGE_ENV,
+    namespace_language_from_item,
+    require_language_snapshot,
 )
 
 logger = logging.getLogger(__name__)
@@ -60,6 +70,13 @@ def handler() -> None:
     else:
         terminal_status = SourceStatus.APPROVED
 
+    # The job's namespace-language snapshot. A present but invalid value fails
+    # the task (and, through the state machine's error chain, the scan) rather
+    # than defaulting to English. An empty one means a pre-snapshot job and is
+    # resolved from the namespace item below.
+    raw_snapshot = os.environ.get(NAMESPACE_LANGUAGE_ENV, "")
+    namespace_language = require_language_snapshot(raw_snapshot) if raw_snapshot else None
+
     # Strip "DS#" prefix to get the bare source UUID
     source_id = datasource_id.removeprefix("DS#")
 
@@ -88,6 +105,28 @@ def handler() -> None:
     if not ns_item or "dataZoneProjectId" not in ns_item:
         raise ValueError(f"Namespace {namespace_id} not found or missing dataZoneProjectId")
     project_id = ns_item["dataZoneProjectId"]
+
+    if namespace_language is None:
+        # A job enqueued before the snapshot existed. Resolve once from the item
+        # already read above (a legacy item without the attribute is en; a
+        # missing item has already failed) and record it on the scan-job row,
+        # before any asset is written, as this job's immutable language.
+        namespace_language = namespace_language_from_item(ns_item, namespace_id)
+        DynamoDBDAO(os.environ["SOURCE_SCAN_JOBS_TABLE"], region=region).update(
+            key=scan_job_key,
+            update_fields={"namespaceLanguage": namespace_language},
+            condition="attribute_exists(PK)",
+            raise_on_error=False,
+        )
+        language_source = "legacy_resolve"
+    else:
+        language_source = "job_snapshot"
+    logger.info(
+        "Enrichment language: namespace=%s language=%s language_source=%s",
+        namespace_id,
+        namespace_language,
+        language_source,
+    )
 
     ds_dao = DynamoDBDAO(os.environ["SOURCES_TABLE"], region=region)
 
@@ -152,6 +191,7 @@ def handler() -> None:
             scan_type=scan_type,
             emitter=emitter,
             progress=publish_progress,
+            namespace_language=namespace_language,
         )
         enrich_duration_ms = (time.monotonic() - enrich_start) * 1000
 

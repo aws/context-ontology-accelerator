@@ -22,6 +22,7 @@ import { ClassDetailPanel } from "./ClassDetailPanel";
 import type { TurtleEntity } from "./turtle";
 import {
   buildClassMatchResolver,
+  conceptMatchKey,
   extractQuoted,
   extractUri,
   localName,
@@ -272,13 +273,13 @@ interface Props {
    *  table. The class→match link is recovered via ``buildClassMatchResolver``.
    *  Owned + persisted by ProposalDetail (``grounding_overrides``). */
   groundingMatches?: ConceptMatch[];
-  /** Staged-but-unsaved overrides (source_table → chosen foundational URI, or
-   *  ``null`` to keep novel). */
+  /** Staged-but-unsaved overrides (stable table identity, or legacy bare table,
+   *  → chosen foundational URI; ``null`` keeps the table novel). */
   pendingGroundingOverrides?: Record<string, string | null>;
-  /** Stage a chosen candidate URI for a source table. */
-  onSelectGroundingCandidate?: (table: string, uri: string) => void;
-  /** Stage "keep novel" for a source table. */
-  onMarkGroundingNovel?: (table: string) => void;
+  /** Stage a chosen candidate URI for a stable grounding match key. */
+  onSelectGroundingCandidate?: (matchKey: string, uri: string) => void;
+  /** Stage "keep novel" for a stable grounding match key. */
+  onMarkGroundingNovel?: (matchKey: string) => void;
 }
 
 // ─── Component ──────────────────────────────────────────────────────
@@ -373,7 +374,7 @@ export function ProposalEntitiesPanel({
     const mapping = r2rmlMappingByClass.get(g.classEntity.subject) ?? null;
     const groundingMatch = classMatchResolver(g.classEntity.fullSubject);
     const pendingOverride = groundingMatch
-      ? pendingGroundingOverrides?.[groundingMatch.source_table]
+      ? pendingGroundingOverrides?.[conceptMatchKey(groundingMatch)]
       : undefined;
 
     openPanel(

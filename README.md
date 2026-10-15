@@ -18,7 +18,13 @@ Access is governed by namespace isolation and role-based access control: namespa
 
 - Python 3.12, Node.js 22+, Docker
 - [pnpm](https://pnpm.io/) (Node package manager — installed via `mise` or `npm install -g pnpm`)
-- Java 17+ and Gradle (for Smithy codegen)
+- Java 17–24 (21 recommended) and Gradle (for Smithy codegen), plus Maven (for the
+  Databricks connector `make deploy-dev` builds). JDK 25+ is not supported yet: the Athena
+  Federation SDK the connector bundles fails its tests on it, and `make preflight` rejects it.
+  **`brew install maven` also installs the newest OpenJDK and runs Maven on it** — after
+  installing, check `mvn -v` and, if it shows Java 25+, point Maven at JDK 21:
+  `export JAVA_HOME=$(/usr/libexec/java_home -v 21)` (`brew install --cask corretto@21` if
+  you don't have it). `mise install` provides a supported JDK and Maven from `.mise.toml`.
 - [uv](https://docs.astral.sh/uv/) (Python package manager)
 
 ### Setup

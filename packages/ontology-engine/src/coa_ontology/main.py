@@ -19,6 +19,7 @@ import defusedxml
 
 # ── Workbench-specific ──────────────────────────────────────────────────
 from coa_common import DEFAULT_EMBED_MODEL_ID
+from coa_common.bedrock import FALLBACK_CHAT_MODEL_ID
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -165,6 +166,11 @@ app.state.config = {
     "ontology_catalog_url": os.getenv("ONTOLOGY_CATALOG_URL", _DEFAULT_ENGINE_SELF_URL),
     "llm_model_id": os.getenv("LLM_MODEL_ID", "us.anthropic.claude-sonnet-4-6"),
     "llm_region": os.getenv("LLM_REGION", "us-east-1"),
+    # Grounding rerank defaults to Haiku (FALLBACK_CHAT_MODEL_ID) — a cheap
+    # reranker — overridable with GROUNDING_LLM_MODEL_ID for a region-valid id
+    # (GH #236). `or` so an empty variable falls through to the Haiku default,
+    # exactly parallel to how LLM_MODEL_ID falls back to its Sonnet literal.
+    "grounding_llm_model_id": (os.getenv("GROUNDING_LLM_MODEL_ID") or FALLBACK_CHAT_MODEL_ID),
     "description_llm_model_id": os.getenv("DESCRIPTION_LLM_MODEL_ID", "us.anthropic.claude-sonnet-4-6"),
     "description_mode": os.getenv("DESCRIPTION_MODE", "schema"),
     "neptune_analytics_url": os.getenv("NEPTUNE_ANALYTICS_URL", "http://localhost:9200"),

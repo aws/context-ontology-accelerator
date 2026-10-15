@@ -110,7 +110,9 @@ class TestCreateDocumentSource:
             patch(f"{_DOCR}._get_sqs", return_value=mock_sqs),
             patch(f"{_DOCR}._INGESTION_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/ingestion-queue"),
         ):
-            status, body = _parse(_docr._create_document_source(_make_doc_req(), _NAMESPACE_ID, _make_event()))
+            status, body = _parse(
+                _docr._create_document_source(_make_doc_req(), _NAMESPACE_ID, _make_event(), namespace_language="en")
+            )
 
         assert status == 201
         assert "sourceId" in body
@@ -119,6 +121,27 @@ class TestCreateDocumentSource:
         # Prefix is derived server-side from the uploadId, never taken from s3Prefixes.
         put_item = mock_dao.put.call_args[0][0]
         assert put_item["s3Prefixes"] == [f"{_NAMESPACE_ID}/raw/11111111-1111-4111-8111-111111111111/"]
+
+    def test_create_snapshots_namespace_language_into_ingestion_input(self):
+        mock_dao = MagicMock()
+        mock_dao.query.return_value = MagicMock(items=[], last_evaluated_key=None)
+        mock_sqs = MagicMock()
+
+        with (
+            patch(f"{_DOCR}._get_dao", return_value=mock_dao),
+            patch(f"{_DOCR}._get_sqs", return_value=mock_sqs),
+            patch(f"{_DOCR}._INGESTION_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/ingestion-queue"),
+        ):
+            status, _ = _parse(
+                _docr._create_document_source(_make_doc_req(), _NAMESPACE_ID, _make_event(), namespace_language="ja")
+            )
+
+        assert status == 201
+        message = json.loads(mock_sqs.send_message.call_args[1]["MessageBody"])
+        assert message["namespace_language"] == "ja"
+        # The source record does not duplicate the namespace's language.
+        assert "language" not in mock_dao.put.call_args[0][0]
+        assert "namespaceLanguage" not in mock_dao.put.call_args[0][0]
 
     def test_create_s3_source_happy_path(self):
         mock_dao = MagicMock()
@@ -137,7 +160,9 @@ class TestCreateDocumentSource:
             patch(f"{_DOCR}._get_sqs", return_value=mock_sqs),
             patch(f"{_DOCR}._INGESTION_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/ingestion-queue"),
         ):
-            status, body = _parse(_docr._create_document_source(req, _NAMESPACE_ID, _make_event()))
+            status, body = _parse(
+                _docr._create_document_source(req, _NAMESPACE_ID, _make_event(), namespace_language="en")
+            )
 
         assert status == 201
         put_item = mock_dao.put.call_args[0][0]
@@ -145,7 +170,11 @@ class TestCreateDocumentSource:
         assert put_item["sourceBucketArn"] == "arn:aws:s3:::my-bucket"
 
     def test_create_blank_name_returns_400(self):
-        status, body = _parse(_docr._create_document_source(_make_doc_req(name="  "), _NAMESPACE_ID, _make_event()))
+        status, body = _parse(
+            _docr._create_document_source(
+                _make_doc_req(name="  "), _NAMESPACE_ID, _make_event(), namespace_language="en"
+            )
+        )
         assert status == 400
         assert "name" in body["error"]
 
@@ -161,7 +190,9 @@ class TestCreateDocumentSource:
         mock_dao.query.return_value = MagicMock(items=[existing], last_evaluated_key=None)
 
         with patch(f"{_DOCR}._get_dao", return_value=mock_dao):
-            status, body = _parse(_docr._create_document_source(_make_doc_req(), _NAMESPACE_ID, _make_event()))
+            status, body = _parse(
+                _docr._create_document_source(_make_doc_req(), _NAMESPACE_ID, _make_event(), namespace_language="en")
+            )
 
         assert status == 409
         assert "already exists" in body["error"]
@@ -174,7 +205,9 @@ class TestCreateDocumentSource:
         mock_dao.put.side_effect = ClientError({"Error": {"Code": "InternalError"}}, "PutItem")
 
         with patch(f"{_DOCR}._get_dao", return_value=mock_dao):
-            status, _ = _parse(_docr._create_document_source(_make_doc_req(), _NAMESPACE_ID, _make_event()))
+            status, _ = _parse(
+                _docr._create_document_source(_make_doc_req(), _NAMESPACE_ID, _make_event(), namespace_language="en")
+            )
 
         assert status == 500
 
@@ -191,7 +224,9 @@ class TestCreateDocumentSource:
             patch(f"{_DOCR}._get_sqs", return_value=mock_sqs),
             patch(f"{_DOCR}._INGESTION_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/ingestion-queue"),
         ):
-            status, _ = _parse(_docr._create_document_source(_make_doc_req(), _NAMESPACE_ID, _make_event()))
+            status, _ = _parse(
+                _docr._create_document_source(_make_doc_req(), _NAMESPACE_ID, _make_event(), namespace_language="en")
+            )
 
         assert status == 500
 
@@ -203,7 +238,9 @@ class TestCreateDocumentSource:
             patch(f"{_DOCR}._get_dao", return_value=mock_dao),
             patch(f"{_DOCR}._INGESTION_QUEUE_URL", ""),
         ):
-            status, _ = _parse(_docr._create_document_source(_make_doc_req(), _NAMESPACE_ID, _make_event()))
+            status, _ = _parse(
+                _docr._create_document_source(_make_doc_req(), _NAMESPACE_ID, _make_event(), namespace_language="en")
+            )
 
         assert status == 201
 
@@ -224,7 +261,9 @@ class TestCreateDocumentSource:
             patch(f"{_DOCR}._get_sqs", return_value=mock_sqs),
             patch(f"{_DOCR}._INGESTION_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/ingestion-queue"),
         ):
-            status, body = _parse(_docr._create_document_source(req, _NAMESPACE_ID, _make_event()))
+            status, body = _parse(
+                _docr._create_document_source(req, _NAMESPACE_ID, _make_event(), namespace_language="en")
+            )
 
         assert status == 201
         put_item = mock_dao.put.call_args[0][0]
@@ -237,7 +276,9 @@ class TestCreateDocumentSource:
         mock_dao.query.side_effect = ClientError({"Error": {"Code": "InternalError"}}, "Query")
 
         with patch(f"{_DOCR}._get_dao", return_value=mock_dao):
-            status, _ = _parse(_docr._create_document_source(_make_doc_req(), _NAMESPACE_ID, _make_event()))
+            status, _ = _parse(
+                _docr._create_document_source(_make_doc_req(), _NAMESPACE_ID, _make_event(), namespace_language="en")
+            )
 
         assert status == 500
 
@@ -251,7 +292,9 @@ class TestCreateDocumentSource:
             patch(f"{_DOCR}._get_sqs", return_value=mock_sqs),
             patch(f"{_DOCR}._INGESTION_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/ingestion-queue"),
         ):
-            status, _ = _parse(_docr._create_document_source(_make_doc_req(), _NAMESPACE_ID, _make_event()))
+            status, _ = _parse(
+                _docr._create_document_source(_make_doc_req(), _NAMESPACE_ID, _make_event(), namespace_language="en")
+            )
 
         assert status == 201
         put_item = mock_dao.put.call_args[0][0]
@@ -267,7 +310,9 @@ class TestCreateDocumentSource:
             patch(f"{_DOCR}._get_sqs", return_value=mock_sqs),
             patch(f"{_DOCR}._INGESTION_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/ingestion-queue"),
         ):
-            status, _ = _parse(_docr._create_document_source(_make_doc_req(), _NAMESPACE_ID, _make_event()))
+            status, _ = _parse(
+                _docr._create_document_source(_make_doc_req(), _NAMESPACE_ID, _make_event(), namespace_language="en")
+            )
 
         assert status == 201
         put_item = mock_dao.put.call_args[0][0]
@@ -283,7 +328,9 @@ class TestCreateDocumentSource:
             patch(f"{_DOCR}._get_sqs", return_value=mock_sqs),
             patch(f"{_DOCR}._INGESTION_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/ingestion-queue"),
         ):
-            status, _ = _parse(_docr._create_document_source(_make_doc_req(), _NAMESPACE_ID, _make_event()))
+            status, _ = _parse(
+                _docr._create_document_source(_make_doc_req(), _NAMESPACE_ID, _make_event(), namespace_language="en")
+            )
 
         assert status == 201
         put_item = mock_dao.put.call_args[0][0]
@@ -309,7 +356,9 @@ class TestCreateDocumentSource:
             patch(f"{_DOCR}._get_sqs", return_value=mock_sqs),
             patch(f"{_DOCR}._INGESTION_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/ingestion-queue"),
         ):
-            status, _ = _parse(_docr._create_document_source(req, _NAMESPACE_ID, _make_event()))
+            status, _ = _parse(
+                _docr._create_document_source(req, _NAMESPACE_ID, _make_event(), namespace_language="en")
+            )
 
         assert status == 201
         derived = f"{_NAMESPACE_ID}/raw/22222222-2222-4222-8222-222222222222/"
@@ -322,7 +371,7 @@ class TestCreateDocumentSource:
 
     def test_upload_missing_upload_id_returns_400(self):
         req = _make_doc_req(upload_id=None)
-        status, body = _parse(_docr._create_document_source(req, _NAMESPACE_ID, _make_event()))
+        status, body = _parse(_docr._create_document_source(req, _NAMESPACE_ID, _make_event(), namespace_language="en"))
         assert status == 400
         assert "uploadId" in body["error"]
 
@@ -332,7 +381,9 @@ class TestCreateDocumentSource:
         namespace. Guards the validate_id() check from silent removal."""
         for bad in ("../other-ns", "ns/path", "..", "ns\\path", "a b"):
             req = _make_doc_req(upload_id=bad)
-            status, body = _parse(_docr._create_document_source(req, _NAMESPACE_ID, _make_event()))
+            status, body = _parse(
+                _docr._create_document_source(req, _NAMESPACE_ID, _make_event(), namespace_language="en")
+            )
             assert status == 400, f"expected 400 for uploadId={bad!r}, got {status}"
             assert "uploadId" in body["error"]
 
@@ -354,7 +405,9 @@ class TestCreateDocumentSource:
             # S3 sources are authorized by the bucket's own namespace tag.
             patch(f"{_DOCR}.get_bucket_tags", return_value={bucket_namespace_tag_key(): _NAMESPACE_ID}),
         ):
-            status, _ = _parse(_docr._create_document_source(req, _NAMESPACE_ID, _make_event()))
+            status, _ = _parse(
+                _docr._create_document_source(req, _NAMESPACE_ID, _make_event(), namespace_language="en")
+            )
         assert status == 201
         put_item = mock_dao.put.call_args[0][0]
         assert put_item["s3Prefixes"] == ["data/"]
@@ -385,7 +438,9 @@ class TestCreateDocumentSourceCounter:
             patch(f"{_DOCR}._INGESTION_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/ingestion-queue"),
             patch(f"{_DOCR}.adjust_namespace_source_count") as mock_counter,
         ):
-            status, _ = _parse(_docr._create_document_source(_make_doc_req(), _NAMESPACE_ID, _make_event()))
+            status, _ = _parse(
+                _docr._create_document_source(_make_doc_req(), _NAMESPACE_ID, _make_event(), namespace_language="en")
+            )
 
         assert status == 201
         mock_counter.assert_called_once_with(_NAMESPACE_ID, SourceType.DOCUMENTS, 1)
@@ -403,7 +458,9 @@ class TestCreateDocumentSourceCounter:
             patch(f"{_DOCR}._get_sqs", return_value=MagicMock()),
             patch(f"{_DOCR}.adjust_namespace_source_count") as mock_counter,
         ):
-            status, _ = _parse(_docr._create_document_source(_make_doc_req(), _NAMESPACE_ID, _make_event()))
+            status, _ = _parse(
+                _docr._create_document_source(_make_doc_req(), _NAMESPACE_ID, _make_event(), namespace_language="en")
+            )
 
         assert status == 500
         mock_counter.assert_not_called()
@@ -574,7 +631,9 @@ class TestBucketNamespaceAuthorizationAtCreate:
             patch(f"{_DOCR}._get_dao", return_value=mock_dao),
             patch(f"{_DOCR}.get_bucket_tags", return_value={}),
         ):
-            status, body = _parse(_docr._create_document_source(self._req(), _NAMESPACE_ID, _make_event()))
+            status, body = _parse(
+                _docr._create_document_source(self._req(), _NAMESPACE_ID, _make_event(), namespace_language="en")
+            )
         assert status == 400
         assert bucket_namespace_tag_key() in body["error"]
         mock_dao.put.assert_not_called()
@@ -586,7 +645,9 @@ class TestBucketNamespaceAuthorizationAtCreate:
             patch(f"{_DOCR}._get_dao", return_value=mock_dao),
             patch(f"{_DOCR}.get_bucket_tags", return_value={bucket_namespace_tag_key(): "some-other-namespace"}),
         ):
-            status, body = _parse(_docr._create_document_source(self._req(), _NAMESPACE_ID, _make_event()))
+            status, body = _parse(
+                _docr._create_document_source(self._req(), _NAMESPACE_ID, _make_event(), namespace_language="en")
+            )
         assert status == 400
         mock_dao.put.assert_not_called()
 
@@ -603,7 +664,9 @@ class TestBucketNamespaceAuthorizationAtCreate:
                 side_effect=ClientError({"Error": {"Code": "AccessDenied"}}, "GetBucketTagging"),
             ),
         ):
-            status, body = _parse(_docr._create_document_source(self._req(), _NAMESPACE_ID, _make_event()))
+            status, body = _parse(
+                _docr._create_document_source(self._req(), _NAMESPACE_ID, _make_event(), namespace_language="en")
+            )
         assert status == 400
         assert "s3:GetBucketTagging" in body["error"]
         mock_dao.put.assert_not_called()
@@ -616,7 +679,9 @@ class TestBucketNamespaceAuthorizationAtCreate:
         mock_dao.query.return_value = MagicMock(items=[], last_evaluated_key=None)
         req = _make_doc_req(name="bad-arn", source_bucket_arn="not-an-arn", s3_prefixes=["data/"])
         with patch(f"{_DOCR}._get_dao", return_value=mock_dao):
-            status, body = _parse(_docr._create_document_source(req, _NAMESPACE_ID, _make_event()))
+            status, body = _parse(
+                _docr._create_document_source(req, _NAMESPACE_ID, _make_event(), namespace_language="en")
+            )
         assert status == 400
         assert "malformed" in body["error"]
         mock_dao.put.assert_not_called()
@@ -635,7 +700,9 @@ class TestBucketNamespaceAuthorizationAtCreate:
                 side_effect=EndpointConnectionError(endpoint_url="https://s3.amazonaws.com"),
             ),
         ):
-            status, body = _parse(_docr._create_document_source(self._req(), _NAMESPACE_ID, _make_event()))
+            status, body = _parse(
+                _docr._create_document_source(self._req(), _NAMESPACE_ID, _make_event(), namespace_language="en")
+            )
         assert status == 503
         assert "retry" in body["error"].lower()
         assert "GetBucketTagging" not in body["error"]
@@ -652,7 +719,9 @@ class TestBucketNamespaceAuthorizationAtCreate:
             patch(f"{_DOCR}._INGESTION_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/q"),
             patch(f"{_DOCR}.get_bucket_tags", return_value={bucket_namespace_tag_key(): shared}),
         ):
-            status, _ = _parse(_docr._create_document_source(self._req(), _NAMESPACE_ID, _make_event()))
+            status, _ = _parse(
+                _docr._create_document_source(self._req(), _NAMESPACE_ID, _make_event(), namespace_language="en")
+            )
         assert status == 201
 
     def test_upload_sources_are_not_tag_checked(self):
@@ -667,6 +736,8 @@ class TestBucketNamespaceAuthorizationAtCreate:
             patch(f"{_DOCR}._INGESTION_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/q"),
             patch(f"{_DOCR}.get_bucket_tags") as mock_tags,
         ):
-            status, _ = _parse(_docr._create_document_source(req, _NAMESPACE_ID, _make_event()))
+            status, _ = _parse(
+                _docr._create_document_source(req, _NAMESPACE_ID, _make_event(), namespace_language="en")
+            )
         assert status == 201
         mock_tags.assert_not_called()

@@ -7,6 +7,8 @@ set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ERRORS=0
+# Deploy environment, as passed to deploy.sh; names the stacks checked below.
+DEPLOY_ENV="${1:-dev}"
 
 err() { echo "ERROR: $1" >&2; ERRORS=$((ERRORS + 1)); }
 warn() { echo "WARN:  $1" >&2; }
@@ -15,7 +17,7 @@ ok() { echo "  OK:  $1"; }
 echo "=== Pre-deploy preflight checks ==="
 echo ""
 
-# ── 1. Required toolchain versions (Node 22+, Java 17+, pnpm) ────────────
+# ── 1. Required toolchain versions (Node 22+, Java 17-24, pnpm) ──────────
 # Mirrors the versions pinned in .mise.toml. We only check presence/version
 # here — installing mise itself is a one-time local setup step (see
 # scripts/setup-dev.sh) and is intentionally not automated in this script,
@@ -207,26 +209,17 @@ else
 fi
 
 # ── 6. VPC limit check (requires AWS credentials) ────────────────────────
-# Resolution order matches CDK's own precedence (infra/bin/app.ts uses
-# CDK_DEFAULT_REGION as the source of truth) so preflight validates the
-# same region CDK will actually deploy to.
-REGION="${CDK_DEFAULT_REGION:-${AWS_DEFAULT_REGION:-${AWS_REGION:-us-east-1}}}"
-if command -v aws >/dev/null 2>&1 && aws sts get-caller-identity >/dev/null 2>&1; then
-  VPC_COUNT=$(aws ec2 describe-vpcs --region "$REGION" --query 'length(Vpcs)' --output text 2>/dev/null || echo "?")
-  VPC_LIMIT_RAW=$(aws service-quotas get-service-quota --service-code vpc --quota-code L-F678F1CE --region "$REGION" --query 'Quota.Value' --output text 2>/dev/null || echo "5")
-  VPC_LIMIT="${VPC_LIMIT_RAW%%.*}"
-  [[ "$VPC_LIMIT" =~ ^[0-9]+$ ]] || VPC_LIMIT=5
-  if [ "$VPC_COUNT" != "?" ]; then
-    if [ "$VPC_COUNT" -ge "$VPC_LIMIT" ]; then
-      err "VPC limit reached: $VPC_COUNT/$VPC_LIMIT VPCs in $REGION."
-      err "Delete unused VPCs or request a quota increase before deploying."
-    else
-      ok "VPC headroom: $VPC_COUNT/$VPC_LIMIT used in $REGION"
-    fi
-  fi
-else
-  warn "AWS credentials not available — skipping VPC limit check"
-fi
+# Resolved the way the CDK CLI resolves it, the profile's region included, so
+# preflight validates the same region CDK will actually deploy to.
+# shellcheck source=lib/resolve-region.sh source-path=SCRIPTDIR
+source "${REPO_ROOT}/scripts/lib/resolve-region.sh"
+REGION="$(coa_resolve_region)"
+VPC_CHECK="$("$REPO_ROOT/scripts/check-vpc-limit.sh" "$REGION" "${SCL_PREFIX:-coa}-${DEPLOY_ENV}-network")"
+case $? in
+  0) ok "$VPC_CHECK" ;;
+  2) warn "$VPC_CHECK" ;;
+  *) err "$VPC_CHECK" ;;
+esac
 
 # ── 7. Lambda reserved-concurrency headroom (requires AWS credentials) ────
 # The VKG-reload and doc-preprocessing Lambdas each reserve

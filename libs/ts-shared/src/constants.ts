@@ -177,10 +177,11 @@ export const DEFAULT_BEDROCK_CHAT_MODEL_ID =
   "us.anthropic.claude-haiku-4-5-20251001-v1:0";
 
 /**
- * Default Bedrock model ID for ontology induction, grounding rerank, and
- * description generation (ontology-engine LLM_MODEL_ID /
- * DESCRIPTION_LLM_MODEL_ID). Sonnet-class: induction quality gates on it, and
- * this tracks the same Sonnet generation the serve query LLM defaults to.
+ * Default Bedrock model ID for ontology induction and description generation
+ * (ontology-engine LLM_MODEL_ID / DESCRIPTION_LLM_MODEL_ID). Sonnet-class:
+ * induction quality gates on it, and this tracks the same Sonnet generation
+ * the serve query LLM defaults to. Grounding rerank no longer uses this — it
+ * has its own `bedrockGroundingLlmModelId` key (GH #236).
  * Overridable per deployment via the `bedrockInductionLlmModelId` SSM config
  * key (#94).
  */

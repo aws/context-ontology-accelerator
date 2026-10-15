@@ -673,8 +673,13 @@ def _strip_external_id(config_dict: dict[str, Any], existing_config: Any = None)
     return config_dict
 
 
-def _create_database_source(db_req: Any, namespace_id: str) -> dict[str, Any]:
-    """Create a DATABASE source. db_req is a CreateDatabaseSourceInput model instance."""
+def _create_database_source(db_req: Any, namespace_id: str, *, namespace_language: str) -> dict[str, Any]:
+    """Create a DATABASE source. db_req is a CreateDatabaseSourceInput model instance.
+
+    ``namespace_language`` is the canonical language the caller resolved from the
+    namespace item. It is recorded on the scan job and carried in the scan job
+    input as the enrichment worker's snapshot.
+    """
     name: str = db_req.name.strip()
     if not name:
         return api_response(400, {"error": "name is required"})
@@ -1109,6 +1114,7 @@ def _create_database_source(db_req: Any, namespace_id: str) -> dict[str, Any]:
                 "SK": scan_job_sk,
                 "sourceId": source_id,
                 "namespaceId": namespace_id,
+                "namespaceLanguage": namespace_language,
                 "status": "IN_PROGRESS",
                 "scanType": "full",
                 "triggerType": ScanTrigger.INITIAL,
@@ -1134,6 +1140,7 @@ def _create_database_source(db_req: Any, namespace_id: str) -> dict[str, Any]:
                         "scanJobPK": f"SRC#{source_id}",
                         "scanJobSK": scan_job_sk,
                         "namespaceId": namespace_id,
+                        "namespaceLanguage": namespace_language,
                         "scanType": "full",
                     }
                 ),
@@ -1391,6 +1398,56 @@ def _scl_form_content(forms_data: list[dict[str, Any]] | None) -> str | None:
     return None
 
 
+def _find_table_asset(
+    client: SMUSClient,
+    project_id: str,
+    source_id: str,
+    table_id: str,
+) -> AssetResult | None:
+    """Find one table, tolerating temporary disagreement between search indexes.
+
+    The exact-name lookup restricts DataZone search to the name attribute,
+    while list-tables uses the normal search index. Immediately after asset
+    creation, the latter can expose a table before the former does. On an
+    exact-name miss, issue one unrestricted search for the full asset name and
+    verify candidates by exact equality.
+
+    The fallback deliberately does not paginate: synchronous review and
+    key-validation requests can resolve several assets, so each miss must cost
+    at most one additional DataZone call rather than multiplying a source-wide
+    page budget.
+    """
+    ds_key = f"DS#{source_id}"
+    asset_name = f"{ds_key}:{table_id}"
+    asset = client.find_asset_by_name(project_id=project_id, name=asset_name)
+    if asset is not None:
+        return asset
+
+    result = client.search_assets(
+        project_id=project_id,
+        search_text=asset_name,
+        max_results=50,
+        next_token=None,
+    )
+    for candidate in result.items:
+        if candidate.name == asset_name:
+            logger.info(
+                "table_asset_source_search_fallback_recovered",
+                source_id=source_id,
+                table_id=table_id,
+                asset_id=candidate.asset_id,
+            )
+            return candidate
+
+    logger.info(
+        "table_asset_source_search_fallback_missed",
+        source_id=source_id,
+        table_id=table_id,
+        additional_results_available=bool(result.next_token),
+    )
+    return None
+
+
 def _handle_list_tables(event: dict[str, Any], namespace_id: str, source_id: str) -> dict[str, Any]:
     """GET /namespaces/{namespaceId}/sources/{sourceId}/tables."""
     from coa_common.datazone_forms import FORM_TYPE_NAME
@@ -1598,10 +1655,8 @@ def _handle_get_table(namespace_id: str, source_id: str, table_id: str) -> dict[
 
     client = _get_smus_client()
     removed_tables, removed_columns, added_tables = _removed_sets(namespace_id, source_id)
-    ds_key = f"DS#{source_id}"
-    asset_name = f"{ds_key}:{table_id}"
     try:
-        asset = client.find_asset_by_name(project_id=project_id, name=asset_name)
+        asset = _find_table_asset(client, project_id, source_id, table_id)
     except Exception:
         logger.exception("get_table_search_failed", source_id=source_id, table_id=table_id)
         return api_response(500, {"error": "Failed to search for table"})
@@ -1778,14 +1833,14 @@ def _load_single_asset(
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """Search-and-load a single table asset by exact name match.
 
-    Performs 2 DataZone API calls (exact-name search + get_asset_forms),
-    independent of the total table count for the source. Returns
-    (asset_dict, None) or (None, error_response).
+    The normal path performs an exact-name search followed by
+    ``get_asset_forms``. If the exact-name index lags, the lookup performs one
+    additional unrestricted search for the full asset name before loading
+    forms or returning 404. Returns ``(asset_dict, None)`` or
+    ``(None, error_response)``.
     """
-    ds_key = f"DS#{source_id}"
-    asset_name = f"{ds_key}:{table_id}"
     try:
-        asset = client.find_asset_by_name(project_id=project_id, name=asset_name)
+        asset = _find_table_asset(client, project_id, source_id, table_id)
     except Exception:
         logger.exception("load_single_asset_search_failed", source_id=source_id, table_id=table_id)
         return None, api_response(500, {"error": "Failed to load table from catalog"})
@@ -1838,9 +1893,12 @@ def _find_source_table_assets_by_name(
     identifier, and persisting a reference outside this source would make the
     relationship impossible to validate or resolve later. The source record's
     discovered schema list is the complete namespace for its canonical
-    ``schema.table`` IDs, so probe each possible full asset name with an exact
-    DataZone filter. This proves uniqueness without catalog-wide token-search
-    pagination and retains the matched asset for metadata loading.
+    ``schema.table`` IDs, so probe each possible full asset name. Each schema
+    costs one exact-name lookup and, only while that index lags, one bounded
+    non-paginated fallback search. The worst case is therefore two DataZone
+    calls per schema; probing stops as soon as a second match proves ambiguity.
+    This preserves completeness without catalog-wide pagination and retains the
+    matched asset for metadata loading.
     """
     if not schemas:
         logger.warning("find_fk_target_tables_missing_schema_index", source_id=source_id, project_id=project_id)
@@ -1850,7 +1908,7 @@ def _find_source_table_assets_by_name(
     try:
         for schema in sorted(set(schemas)):
             table_id = f"{schema}.{table_name}"
-            asset = client.find_asset_by_name(project_id=project_id, name=f"DS#{source_id}:{table_id}")
+            asset = _find_table_asset(client, project_id, source_id, table_id)
             if asset is not None:
                 matching_assets[table_id] = asset
                 # Once two exact matches exist, the bare name is known to be
@@ -1995,25 +2053,26 @@ def _apply_business_overrides(biz: Any, overrides: dict[str, Any]) -> bool:
     Returns True if any field was changed (forces enrichmentSource to
     STEWARD_EDITED on change). Only non-None values mutate state — passing
     null/missing leaves the existing field untouched.
-    """
-    from coa_common.domain_models import EnrichmentSource
 
-    field_map = {
-        "description": "description",
-        "synonyms": "synonyms",
-        "glossaryTerms": "glossary_terms",
-        "tags": "tags",
-    }
-    changed = False
-    for in_field, out_attr in field_map.items():
+    Each changed field also loses its internal ``generated_fields`` marker: the
+    steward's text (or the steward's mix of generated and own values) is no
+    longer wholly COA-generated. Unchanged fields keep theirs.
+    """
+    from coa_common.domain_models import GENERATED_FIELD_ATTRIBUTES, EnrichmentSource
+
+    changed_fields: set[str] = set()
+    for generated_field, out_attr in GENERATED_FIELD_ATTRIBUTES.items():
+        in_field = generated_field.value
         if in_field in overrides and overrides[in_field] is not None:
             new_value = overrides[in_field]
             if getattr(biz, out_attr) != new_value:
                 setattr(biz, out_attr, new_value)
-                changed = True
-    if changed:
+                changed_fields.add(in_field)
+    if changed_fields:
+        # Record-level and coarse by design (one edited field marks the record); generated_fields tracks fields.
         biz.enrichment_source = EnrichmentSource.STEWARD_EDITED
-    return changed
+        biz.generated_fields = [f for f in biz.generated_fields if f not in changed_fields]
+    return bool(changed_fields)
 
 
 def _parse_decision(body: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
@@ -3166,15 +3225,23 @@ def _upsert_rescan_schedule(namespace_id: str, source_id: str, expression: str, 
             raise
 
 
-def _delete_rescan_schedule(source_id: str) -> None:
-    """Best-effort delete of a source's rescan schedule (no-op when absent)."""
+def _delete_rescan_schedule(source_id: str) -> bool:
+    """Delete a source's rescan schedule.
+
+    Returns True when the schedule is gone (deleted, already absent, or
+    scheduling not configured) and False when the delete failed and the
+    schedule may still be live. Never raises, so cleanup callers can treat it
+    as best-effort; the disable route reads the result instead.
+    """
     if not _RESCAN_SCHEDULE_GROUP:
-        return
+        return True
     try:
         _get_scheduler().delete_schedule(Name=_schedule_name(source_id), GroupName=_RESCAN_SCHEDULE_GROUP)
     except ClientError as exc:
         if exc.response.get("Error", {}).get("Code") != "ResourceNotFoundException":
             logger.warning("rescan_schedule_delete_failed", source_id=source_id, exc_info=True)
+            return False
+    return True
 
 
 def _handle_put_rescan_schedule(event: dict[str, Any], namespace_id: str, source_id: str) -> dict[str, Any]:
@@ -3223,7 +3290,11 @@ def _handle_put_rescan_schedule(event: dict[str, Any], namespace_id: str, source
             return api_response(500, {"error": "Failed to configure schedule"})
         schedule: dict[str, Any] = {"enabled": True, "scheduleExpression": expression, "timezone": timezone}
     else:
-        _delete_rescan_schedule(source_id)
+        # A schedule that survived a failed delete keeps firing, so recording
+        # OFF here would tell the steward the source is frozen when it is not.
+        # Leave the record as it was and let the caller retry.
+        if not _delete_rescan_schedule(source_id):
+            return api_response(500, {"error": "Failed to remove schedule"})
         schedule = {"enabled": False}
 
     try:
@@ -3379,19 +3450,40 @@ def _enable_event_rule(namespace_id: str, source_id: str, database_name: str) ->
     )
 
 
-def _disable_event_rule(source_id: str) -> None:
-    """Best-effort delete of a source's Glue-event rule (no-op when absent)."""
+def _disable_event_rule(source_id: str) -> bool:
+    """Delete a source's Glue-event rule and its target.
+
+    Returns True when the rule is gone (deleted, already absent, or event
+    rescans not configured) and False when either call failed and the rule may
+    still route events to the queue. Never raises, so cleanup callers can treat
+    it as best-effort; the disable route reads the result instead.
+    """
     if not _GLUE_EVENT_RULE_PREFIX:
-        return
+        return True
     events = _get_events()
     name = _event_rule_name(source_id)
-    with contextlib.suppress(ClientError):
-        events.remove_targets(Rule=name, Ids=["glue-event-queue"])
+    try:
+        resp = events.remove_targets(Rule=name, Ids=["glue-event-queue"])
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") != "ResourceNotFoundException":
+            logger.warning("event_rule_target_remove_failed", source_id=source_id, exc_info=True)
+            return False
+    else:
+        # RemoveTargets reports per-target failures in the body, not as an error.
+        if isinstance(resp, dict) and resp.get("FailedEntryCount"):
+            logger.warning(
+                "event_rule_target_remove_failed",
+                source_id=source_id,
+                failed_entries=resp.get("FailedEntries"),
+            )
+            return False
     try:
         events.delete_rule(Name=name)
     except ClientError as exc:
         if exc.response.get("Error", {}).get("Code") != "ResourceNotFoundException":
             logger.warning("event_rule_delete_failed", source_id=source_id, exc_info=True)
+            return False
+    return True
 
 
 def _handle_put_event_rescan(event: dict[str, Any], namespace_id: str, source_id: str) -> dict[str, Any]:
@@ -3438,7 +3530,11 @@ def _handle_put_event_rescan(event: dict[str, Any], namespace_id: str, source_id
             return api_response(500, {"error": "Failed to configure event-driven rescans"})
         config: dict[str, Any] = {"enabled": True}
     else:
-        _disable_event_rule(source_id)
+        # A rule that survived a failed delete keeps routing Glue changes to
+        # the queue, so recording OFF would be untrue. Leave the record as it
+        # was and let the caller retry.
+        if not _disable_event_rule(source_id):
+            return api_response(500, {"error": "Failed to remove event-driven rescans"})
         config = {"enabled": False}
 
     try:

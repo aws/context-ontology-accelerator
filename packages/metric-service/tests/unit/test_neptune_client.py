@@ -474,6 +474,44 @@ class TestResolveClassUris:
 
         assert raised.value.__class__ is ValueError
 
+    def test_resolve_matches_language_tagged_labels_by_lexical_form(
+        self, client: MetricNeptuneClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A plain concept name resolves a class whose label is language-tagged.
+
+        Runs the generated query on an in-memory RDF dataset, so it is the SPARQL
+        semantics — not a string shape — that is pinned: ``"空調設備"@ja`` and the
+        plain ``"空調設備"`` are different RDF terms and only compare equal by
+        ``STR()``. A label in another namespace's graph still does not match.
+        """
+        import json
+
+        from rdflib import OWL, RDF, RDFS, Dataset, Literal, URIRef
+
+        monkeypatch.delenv("NDB_GRAPH_URI_BASE", raising=False)
+        monkeypatch.delenv("NDB_GRAPH_URI", raising=False)
+        base = "https://ontology-workbench.local"
+        dataset = Dataset()
+        own = dataset.graph(URIRef(f"{base}/ns/ontology"))
+        other = dataset.graph(URIRef(f"{base}/other-ns/ontology"))
+        tagged = URIRef("http://example.org/AirConditioner")
+        plain = URIRef("http://example.org/Order")
+        foreign = URIRef("http://example.org/Foreign")
+        own.add((tagged, RDF.type, OWL.Class))
+        own.add((tagged, RDFS.label, Literal("空調設備", lang="ja")))
+        own.add((plain, RDF.type, OWL.Class))
+        own.add((plain, RDFS.label, Literal("Order")))
+        other.add((foreign, RDF.type, OWL.Class))
+        other.add((foreign, RDFS.label, Literal("Foreign", lang="ja")))
+
+        def run(query: str) -> dict:
+            return json.loads(dataset.query(query).serialize(format="json"))
+
+        with patch("coa_metrics.neptune_client._sparql_query", side_effect=run):
+            result = client.resolve_class_uris("ns", ["空調設備", "Order", "Foreign"])
+
+        assert result == [str(tagged), str(plain)]
+
     @patch("coa_metrics.neptune_client._sparql_query")
     def test_resolve_drops_unresolvable(self, mock_query: patch, client: MetricNeptuneClient) -> None:
         mock_query.return_value = {"results": {"bindings": []}}

@@ -240,3 +240,49 @@ class TestGetNamespace:
         body = json.loads(resp["body"])
         # Field should be filtered out (not None) when not stored on the record
         assert "athenaWorkgroupName" not in body["namespace"]
+
+
+@pytest.mark.unit
+class TestNamespaceLanguage:
+    def _get(self, dao):
+        from coa_control_plane.namespace.get_handler import handler
+
+        with (
+            patch(f"{MODULE}._get_ns_dao", return_value=dao),
+            patch(f"{MODULE}.resolve_vkg_health_with_reason", return_value=("HEALTHY", None)),
+        ):
+            return handler({"pathParameters": {"namespaceId": "ns-123"}}, None)
+
+    def test_legacy_item_without_language_reads_en(self):
+        dao = MagicMock()
+        dao.get.return_value = _NS_ITEM
+        assert "language" not in _NS_ITEM
+
+        resp = self._get(dao)
+
+        assert resp["statusCode"] == 200
+        assert json.loads(resp["body"])["namespace"]["language"] == "en"
+
+    def test_returns_stored_language(self):
+        dao = MagicMock()
+        dao.get.return_value = {**_NS_ITEM, "language": "ja"}
+
+        resp = self._get(dao)
+
+        assert json.loads(resp["body"])["namespace"]["language"] == "ja"
+
+    def test_missing_item_is_still_404_not_en(self):
+        dao = MagicMock()
+        dao.get.return_value = None
+
+        resp = self._get(dao)
+
+        assert resp["statusCode"] == 404
+        assert "language" not in json.loads(resp["body"])
+
+    def test_read_error_is_not_turned_into_en(self):
+        dao = MagicMock()
+        dao.get.side_effect = RuntimeError("dynamodb unavailable")
+
+        with pytest.raises(RuntimeError, match="dynamodb unavailable"):
+            self._get(dao)

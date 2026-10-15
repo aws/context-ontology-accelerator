@@ -115,6 +115,8 @@ from coa_metrics.lookups import (  # noqa: E402, F401
     NeptuneOntologyLookup,
     OntologyLookup,
     SmusCatalogDataSourceLookup,
+    declared_source_table_exists,
+    source_table_rejection,
 )
 
 # Backward compat alias — new code should use SmusCatalogDataSourceLookup.
@@ -615,8 +617,12 @@ def _check_table_references(
                     continue
                 tables_checked.add(table_name.lower())
 
-                exists = lookup.table_exists(data_source_id, table_name)
                 is_declared_source = bool(source_table) and table_name.lower() == source_table_lower
+                exists = (
+                    declared_source_table_exists(lookup, data_source_id, table_name, known_tables)
+                    if is_declared_source
+                    else lookup.table_exists(data_source_id, table_name)
+                )
                 provable_source_absence = (
                     is_declared_source
                     and not exists
@@ -624,19 +630,24 @@ def _check_table_references(
                     and bool(known_tables)
                     and not declared_source_known
                 )
+                if exists:
+                    message = (
+                        f"{'Source table' if is_declared_source else 'Table'} '{table_name}' exists in data source"
+                    )
+                elif is_declared_source:
+                    message = _declared_source_rejection(
+                        lookup, data_source_id, table_name, known_tables, catalog_available
+                    )
+                else:
+                    # A bare SQL reference can also be a CTE or subquery alias, so it
+                    # keeps the plain wording.
+                    message = f"Table '{table_name}' not found in data source '{data_source_id}'"
                 checks.append(
                     ValidationCheck(
                         check="table_reference",
                         severity=Severity.ERROR if provable_source_absence else Severity.WARNING,
                         passed=exists,
-                        message=(
-                            f"{'Source table' if is_declared_source else 'Table'} '{table_name}' exists in data source"
-                            if exists
-                            else (
-                                f"{'Source table' if is_declared_source else 'Table'} '{table_name}' "
-                                f"not found in data source '{data_source_id}'"
-                            )
-                        ),
+                        message=message,
                         details={"table": table_name, "dataSourceId": data_source_id},
                     )
                 )
@@ -649,7 +660,7 @@ def _check_table_references(
     # not catalog tables. The exact table that also equals the declared
     # sourceTable is promoted above, because it is not an alias ambiguity.
     if source_table and source_table.lower() not in tables_checked:
-        exists = lookup.table_exists(data_source_id, source_table)
+        exists = declared_source_table_exists(lookup, data_source_id, source_table, known_tables)
         provable_absence = not exists and catalog_available and bool(known_tables) and not declared_source_known
         checks.append(
             ValidationCheck(
@@ -659,13 +670,33 @@ def _check_table_references(
                 message=(
                     f"Source table '{source_table}' exists in data source"
                     if exists
-                    else f"Source table '{source_table}' not found in data source '{data_source_id}'"
+                    else _declared_source_rejection(
+                        lookup, data_source_id, source_table, known_tables, catalog_available
+                    )
                 ),
                 details={"table": source_table, "dataSourceId": data_source_id},
             )
         )
 
     return checks
+
+
+def _declared_source_rejection(
+    lookup: DataSourceLookup,
+    data_source_id: str,
+    source_table: str,
+    known_tables: set[str],
+    catalog_available: bool,
+) -> str:
+    """Why the declared ``sourceTable`` was rejected, in the create/update gate's words.
+
+    Uses the gate's wording only when the gate would reach a verdict (the catalog
+    was read and lists tables). Otherwise nothing is provable and the plain "not
+    found" warning stays: an outage must not read as "not approved".
+    """
+    if catalog_available and known_tables:
+        return source_table_rejection(lookup, data_source_id, source_table, known_tables)
+    return f"Source table '{source_table}' not found in data source '{data_source_id}'"
 
 
 # ── Check 3: Column References ──────────────────────────────────────────

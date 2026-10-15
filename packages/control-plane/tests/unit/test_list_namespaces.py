@@ -483,3 +483,32 @@ class TestErrorHandling:
         assert resp["statusCode"] == 500
         body = json.loads(resp["body"])
         assert body["message"] == "Internal server error"
+
+
+class TestNamespaceLanguage:
+    @patch("coa_control_plane.namespace.list_handler.DynamoDBDAO")
+    def test_global_list_reads_legacy_items_as_en(self, mock_dao_cls):
+        mock_ns_dao = MagicMock()
+        mock_dao_cls.side_effect = [mock_ns_dao, MagicMock()]
+        mock_ns_dao.scan.return_value = PaginatedResult(items=[NS_ITEM, {**NS_ITEM_2, "language": "ja"}])
+
+        resp = handler(_event(global_roles="platform-admin"), None)
+
+        languages = {ns["name"]: ns["language"] for ns in json.loads(resp["body"])["namespaces"]}
+        assert languages == {"sales": "en", "marketing": "ja"}
+
+    @patch("coa_control_plane.namespace.list_handler.DynamoDBDAO")
+    def test_scoped_list_reads_legacy_items_as_en(self, mock_dao_cls):
+        mock_ns_dao = MagicMock()
+        mock_mappings_dao = MagicMock()
+        mock_dao_cls.side_effect = [mock_ns_dao, mock_mappings_dao]
+        mock_mappings_dao.query_all.return_value = [
+            {"resourceType": "Namespace", "resourceId": "11111111-1111-1111-1111-111111111111"},
+            {"resourceType": "Namespace", "resourceId": "22222222-2222-2222-2222-222222222222"},
+        ]
+        mock_ns_dao.batch_get.return_value = [NS_ITEM, {**NS_ITEM_2, "language": "pt-BR"}]
+
+        resp = handler(_event(user_id="alice@co.com"), None)
+
+        languages = {ns["name"]: ns["language"] for ns in json.loads(resp["body"])["namespaces"]}
+        assert languages == {"sales": "en", "marketing": "pt-BR"}

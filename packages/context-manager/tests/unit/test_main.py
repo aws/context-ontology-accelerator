@@ -414,6 +414,61 @@ class TestInvokeFunction:
         orch.resolve.assert_awaited_once()
 
     @patch("coa_serve.main._ensure_initialized")
+    async def test_namespace_language_is_bound_for_the_readers(self, mock_init, config):
+        """The gate resolves the namespace language once; readers see its preference."""
+        mock_init.return_value = None
+        import coa_serve.main as main_mod
+        from coa_serve.namespace_language import current_label_preference
+
+        seen: list[str | None] = []
+
+        async def resolve(*_args, **_kwargs):
+            seen.append(current_label_preference().preferred_tag)
+            return InvokeResponse(
+                result=QueryResult(
+                    tier=3,
+                    confidence=ConfidenceScore(score=0.5, rationale="ok"),
+                    trace=[TraceStep(step="s", status="success", duration_ms=0)],
+                    metadata={},
+                ),
+            )
+
+        orch = MagicMock()
+        orch.resolve = AsyncMock(side_effect=resolve)
+        main_mod._orchestrator = orch
+        registry = MagicMock()
+        registry.namespace_exists = AsyncMock(return_value=True)
+        registry.namespaces_configured = True
+        registry.namespace_language = AsyncMock(return_value="ja")
+        main_mod._sources_registry = registry
+
+        await _invoke_collect({"query": "test", "namespace": "demo"})
+
+        registry.namespace_language.assert_awaited_once_with("demo")
+        assert seen == ["ja"]
+
+    @patch("coa_serve.main._ensure_initialized")
+    async def test_unreadable_namespace_language_fails_closed(self, mock_init, config):
+        """A missing or unreadable namespace item must not read as English."""
+        mock_init.return_value = None
+        import coa_serve.main as main_mod
+        from coa_serve.clients.sources_registry import NamespaceLanguageUnavailableError
+
+        orch = MagicMock()
+        orch.resolve = AsyncMock()
+        main_mod._orchestrator = orch
+        registry = MagicMock()
+        registry.namespace_exists = AsyncMock(return_value=True)
+        registry.namespaces_configured = True
+        registry.namespace_language = AsyncMock(side_effect=NamespaceLanguageUnavailableError("gone"))
+        main_mod._sources_registry = registry
+
+        result = await _invoke_collect({"query": "test", "namespace": "demo"})
+
+        assert result["statusCode"] == 502
+        orch.resolve.assert_not_called()
+
+    @patch("coa_serve.main._ensure_initialized")
     async def test_invoke_validation_error_does_not_leak_constraints(self, mock_init, config):
         mock_init.return_value = None
         import coa_serve.main as main_mod

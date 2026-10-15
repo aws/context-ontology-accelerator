@@ -34,7 +34,10 @@ export class NamespacesPage {
    * Create a namespace and wait for it in the list. Creation provisions backend
    * resources (roles, Athena workgroup, project), so the redirect can be slow.
    */
-  async create(displayName: string): Promise<void> {
+  async create(
+    displayName: string,
+    language: "en" | "ja" = "en",
+  ): Promise<void> {
     // Track up-front so teardown can remove it even if creation succeeds
     // server-side but this method fails before confirming the row.
     this.created.add(displayName);
@@ -44,10 +47,17 @@ export class NamespacesPage {
     ).toBeVisible();
 
     await this.page.getByPlaceholder("e.g., Insurance Prod").fill(displayName);
+    const languageLabel = language === "ja" ? "Japanese (ja)" : "English (en)";
+    await this.page.getByRole("radio", { name: languageLabel }).check();
     // The form's submit button shares the "Create namespace" label.
     await this.page
       .getByRole("button", { name: "Create namespace" })
       .last()
+      .click();
+    // The language is immutable, so creation goes through a confirmation modal.
+    await this.page
+      .getByRole("dialog")
+      .getByRole("button", { name: "Confirm and create" })
       .click();
 
     await expect(

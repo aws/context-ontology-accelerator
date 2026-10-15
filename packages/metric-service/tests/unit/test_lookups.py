@@ -141,6 +141,45 @@ class TestSmusCatalogDataSourceLookup:
 
     @patch("coa_metrics.lookups.read_table_for_asset")
     @patch("coa_metrics.lookups.read_asset_names_for_datasource")
+    def test_rejection_reason_tells_unapproved_from_no_metadata(self, mock_names, mock_asset):
+        """``table_exists`` is False for both, but only one needs approving."""
+        from coa_metrics.lookups import TABLE_NO_METADATA, TABLE_UNAPPROVED
+
+        mock_names.return_value = {
+            "public.pending": "asset-pending",
+            "public.formless": "asset-formless",
+            "public.orders": "asset-orders",
+        }
+        by_asset = {"asset-pending": _table(name="pending", status="PENDING_REVIEW"), "asset-formless": None}
+        mock_asset.side_effect = lambda _domain, asset_id, _name, _ds: by_asset.get(asset_id, _table())
+        lookup = _lookup()
+
+        assert lookup.table_exists("ds-1", "public.pending") is False
+        assert lookup.table_rejection_reason("ds-1", "public.pending") == TABLE_UNAPPROVED
+        assert lookup.table_exists("ds-1", "public.formless") is False
+        assert lookup.table_rejection_reason("ds-1", "PUBLIC.FORMLESS") == TABLE_NO_METADATA
+        assert lookup.table_exists("ds-1", "public.orders") is True
+        assert lookup.table_rejection_reason("ds-1", "public.orders") is None
+
+    @patch("coa_metrics.lookups.read_table_for_asset")
+    @patch("coa_metrics.lookups.read_asset_names_for_datasource")
+    def test_no_rejection_reason_without_one_resolved_asset(self, mock_names, mock_asset):
+        """Missing and ambiguous names never reach the form read, and a transient
+        read failure is an outage, not a reason."""
+        mock_names.return_value = {"sales.customers": "asset-sales", "marketing.customers": "asset-mkt"}
+        mock_asset.side_effect = RuntimeError("throttled")
+        lookup = _lookup()
+
+        assert lookup.table_exists("ds-1", "customers") is False
+        assert lookup.table_rejection_reason("ds-1", "customers") is None
+        assert lookup.table_exists("ds-1", "public.missing") is False
+        assert lookup.table_rejection_reason("ds-1", "public.missing") is None
+        assert lookup.table_exists("ds-1", "sales.customers") is False
+        assert lookup.table_rejection_reason("ds-1", "sales.customers") is None
+        assert lookup.catalog_available("ds-1") is False
+
+    @patch("coa_metrics.lookups.read_table_for_asset")
+    @patch("coa_metrics.lookups.read_asset_names_for_datasource")
     def test_legacy_bare_name_is_ambiguous_with_qualified_sibling(self, mock_names, mock_asset):
         mock_names.return_value = {"orders": "asset-legacy", "archive.orders": "asset-archive"}
         lookup = _lookup()

@@ -205,6 +205,7 @@ class UnstructuredInductionPipeline:
                 class_to_entity_labels=class_to_entity_labels,
                 schema=schema,
                 description_llm=config.description_llm,
+                namespace_language=config.namespace_language,
             )
 
             # ── Stage 4 — resolving_iris ────────────────────────────
@@ -248,6 +249,7 @@ class UnstructuredInductionPipeline:
                 normalizer_results=normalizer_results,
                 iri_resolver=config.iri_resolver,
                 floor=config.sampling.floor,
+                namespace_language=config.namespace_language,
             )
 
             # Rule 2 — owl:NamedIndividual A-Box (gated). Rule 2 takes
@@ -259,6 +261,7 @@ class UnstructuredInductionPipeline:
                     class_iris=class_iris,
                     iri_resolver=config.iri_resolver,
                     include_individuals=True,
+                    namespace_language=config.namespace_language,
                 )
 
             # Rule 3 — owl:ObjectProperty declarations from SPO facts.
@@ -266,6 +269,7 @@ class UnstructuredInductionPipeline:
                 facts=facts,
                 class_iris=class_iris,
                 iri_resolver=config.iri_resolver,
+                namespace_language=config.namespace_language,
             )
 
             # Rule 4 — owl:DatatypeProperty declarations from SPC facts.
@@ -276,6 +280,7 @@ class UnstructuredInductionPipeline:
                 facts=facts,
                 class_iris=class_iris,
                 iri_resolver=config.iri_resolver,
+                namespace_language=config.namespace_language,
             )
 
             # Rule 5 — skos:Concept declarations from __Topic__ nodes.
@@ -283,6 +288,7 @@ class UnstructuredInductionPipeline:
                 topics=topics,
                 iri_resolver=config.iri_resolver,
                 namespace_name=config.name,
+                namespace_language=config.namespace_language,
             )
 
             # ── Foundational grounding (optional, additive) ─────────
@@ -494,6 +500,7 @@ def _generate_descriptions(
     class_to_entity_labels: dict[str, list[str]],
     schema,
     description_llm,
+    namespace_language: str = "en",
 ) -> dict[str, str]:
     """Dispatch to the right description-generator function.
 
@@ -524,10 +531,12 @@ def _generate_descriptions(
             schema,
             class_labels=canonical_class_labels,
             class_label_to_canonical=raw_to_canonical,
+            namespace_language=namespace_language,
         )
         return generate_descriptions_with_schema(
             class_schemas=contexts,
             llm_client=description_llm,
+            namespace_language=namespace_language,
         )
 
     # label_only / instance — both share the bare label-list path in
@@ -537,4 +546,5 @@ def _generate_descriptions(
     return generate_descriptions(
         class_entities=class_to_entity_labels,
         llm_client=description_llm,
+        namespace_language=namespace_language,
     )

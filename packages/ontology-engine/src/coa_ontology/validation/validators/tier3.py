@@ -21,15 +21,21 @@ from coa_ontology.validation.validators import OntologyValidator
 
 
 class OoPSValidator(OntologyValidator):
-    """Check ontology against OoPS! (OntOlogy Pitfall Scanner)."""
+    """Check ontology against OoPS! (OntOlogy Pitfall Scanner).
 
-    OOPS_ENDPOINT = os.getenv("OOPS_ENDPOINT", "https://oops.linkeddata.es/rest")
+    Opt-in: the scan sends the serialised ontology (class and property names,
+    labels, comments and other literals) to the configured endpoint, so it runs
+    only when ``OOPS_ENDPOINT`` is set. There is deliberately no built-in default
+    endpoint — a deployment must never transmit its schema to a third party
+    without the operator choosing to.
+    """
 
     def validate(self, graph: Graph, **kwargs) -> list[ValidationFinding]:
         """Submit the ontology to the OoPS! pitfall scanner and map pitfalls to findings.
 
         Strips ``owl:imports`` and posts the RDF/XML serialization to the OoPS!
-        REST endpoint, parsing either the XML or JSON response shape.
+        REST endpoint named by ``OOPS_ENDPOINT``, parsing either the XML or JSON
+        response shape. With no endpoint configured, makes no request.
 
         Args:
             graph: The ontology graph to scan.
@@ -37,8 +43,25 @@ class OoPSValidator(OntologyValidator):
 
         Returns:
             A finding per detected pitfall (warning for IMPORTANT/CRITICAL, else
-            info), or a single info finding when the service is unavailable or errors.
+            info), or a single info finding when no endpoint is configured, or the
+            service is unavailable or errors.
         """
+        endpoint = os.getenv("OOPS_ENDPOINT", "").strip()
+        if not endpoint:
+            return [
+                ValidationFinding(
+                    validator="oops",
+                    tier=ValidationTier.tier3_review,
+                    severity=Severity.info,
+                    code="OOPS_NOT_CONFIGURED",
+                    message=(
+                        "OoPS! pitfall scan is off — no endpoint is configured, so the ontology was not sent "
+                        "anywhere. Set OOPS_ENDPOINT (deploy context oops_endpoint) to an OoPS! REST endpoint "
+                        "to enable it."
+                    ),
+                )
+            ]
+
         findings = []
         # OoPS! self-hosted expects RDF/XML content via JSON API.
         # Strip owl:imports to prevent OoPS from trying to fetch remote ontologies.
@@ -60,7 +83,7 @@ class OoPSValidator(OntologyValidator):
             )
             with httpx.Client(timeout=120) as client:
                 resp = client.post(
-                    self.OOPS_ENDPOINT,
+                    endpoint,
                     content=xml_payload,
                     headers={"Content-Type": "application/xml"},
                 )

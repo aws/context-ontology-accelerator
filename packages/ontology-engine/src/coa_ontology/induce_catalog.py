@@ -27,12 +27,20 @@ from coa_common.bedrock_metrics import (
     emit_induction_job_metrics,
 )
 from coa_common.constants import DATABASE_SUB_TYPES, validate_ontology_uri_prefix
+from coa_common.language_tags import DEFAULT_LANGUAGE
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 from coa_ontology import dynamo_store
 from coa_ontology.datasource_ids import bare_datasource_id, is_valid_datasource_id
+from coa_ontology.inducer.services.generated_text import render
 from coa_ontology.inducer.strategies import get_strategy
+from coa_ontology.inducer.strategies.rigor_ontology import rigor_supports_language
+from coa_ontology.namespace_language import (
+    NamespaceLanguageNotFoundError,
+    NamespaceLanguageUnconfiguredError,
+    resolve_namespace_language,
+)
 
 if TYPE_CHECKING:
     # Type-only: ``inducer.schemas`` is deliberately NOT imported at runtime here
@@ -169,6 +177,24 @@ class NamespaceNotFoundError(ValueError):
 
 class NamespaceMissingProjectError(ValueError):
     """Raised when a namespace exists but has no DataZone project provisioned."""
+
+
+def namespace_language_or_404(namespace: str, config: dict) -> str:
+    """Resolve the namespace language for an induction route.
+
+    A missing namespace is a 404 and a missing namespaces table (outside the
+    local HTTP catalog) a 500, matching ``_fetch_catalog_from_smus``; any other
+    read failure propagates as a 500. That includes a ``LanguageTagError`` for
+    a stored value outside the supported grammar: CreateNamespace canonicalizes
+    the language before it writes the item, so such a value is a corrupt
+    server-side record, not a client error.
+    """
+    try:
+        return resolve_namespace_language(namespace, config)
+    except NamespaceLanguageNotFoundError as e:
+        raise HTTPException(404, str(e)) from e
+    except NamespaceLanguageUnconfiguredError as e:
+        raise HTTPException(500, str(e)) from e
 
 
 _jobs: dict = {}
@@ -375,6 +401,23 @@ def _fetch_catalog_from_fixture(datasource_id: str) -> dict:
     return {"databases": []}
 
 
+def fetch_datasource_catalog(config: dict, datasource_id: str, *, namespace: str) -> dict:
+    """The catalog of one datasource, from wherever this deployment reads catalogs.
+
+    Shared by induction and by the proposal update that rebuilds a structured
+    proposal, so both resolve a datasource the same way. A mock datasource (ID ending
+    in ``-mock``) reads the bundled fixture; otherwise ``CATALOG_SOURCE`` picks SMUS or
+    the HTTP data catalog. The helpers are looked up at call time, so tests that
+    patch them on this module still take effect.
+    """
+    if datasource_id.endswith("-mock"):
+        # Mock datasources read from bundled JSON fixture (no SMUS / no Glue)
+        return _fetch_catalog_from_fixture(datasource_id)
+    if config.get("catalog_source") == "smus":
+        return _fetch_catalog_from_smus(config, datasource_id, namespace=namespace)
+    return _fetch_catalog(config["data_catalog_url"], datasource_id)
+
+
 def _string_list(value: object) -> list[str]:
     """Normalize a catalog list field to non-empty strings (``None`` → ``[]``)."""
     if not isinstance(value, list):
@@ -412,6 +455,7 @@ def _catalog_to_tables(catalog: dict) -> list[dict]:
                         "constraint": "PRIMARY_KEY"
                         if col["name"] in ((tbl.get("primaryKey") or {}).get("columns") or [])
                         else None,
+                        "generatedFields": cbm.get("generatedFields") or [],
                     }
                 )
             # ``relationshipType`` carries the FK provenance tag
@@ -465,6 +509,7 @@ def _catalog_to_tables(catalog: dict) -> list[dict]:
                     "tags": _string_list(bm.get("tags")),
                     "columns": columns,
                     "tableConstraints": pk_constraints + fk_constraints or None,
+                    "generatedFields": bm.get("generatedFields") or [],
                 }
             )
     return tables
@@ -720,9 +765,11 @@ def _run_induction(
     build_pipeline_fn,
     schemas_mod,
     catalog_table_cls,
+    namespace_language: str = DEFAULT_LANGUAGE,
 ):
     job = _jobs[job_id]
     ns = namespace
+    proposal_label = body.label or render("structured_proposal_title", namespace_language)
     _t_start = time.perf_counter()
     # One tracker per job, shared across every Bedrock seam reached below
     # (grounding rerank + LLM generate). Metrics are emitted exactly once on
@@ -747,13 +794,7 @@ def _run_induction(
             all_tables = []
             datasource_details = []
             for ds_id in body.datasource_ids:
-                if ds_id.endswith("-mock"):
-                    # Mock datasources read from bundled JSON fixture (no SMUS / no Glue)
-                    catalog = _fetch_catalog_from_fixture(ds_id)
-                elif config.get("catalog_source") == "smus":
-                    catalog = _fetch_catalog_from_smus(config, ds_id, namespace=ns)
-                else:
-                    catalog = _fetch_catalog(config["data_catalog_url"], ds_id)
+                catalog = fetch_datasource_catalog(config, ds_id, namespace=ns)
                 tbl_dicts = _catalog_to_tables(catalog)
                 from coa_ontology.inducer.strategies.base import schema_from_fqn
 
@@ -947,6 +988,7 @@ def _run_induction(
                 grounding_ontology_ids=resolved_grounding_ids,
                 grounding_mode=body.grounding_mode,
                 cost_tracker=cost_tracker,
+                namespace_language=namespace_language,
             )
             r2rml_graph = strategy_instance.build_r2rml(
                 ontology_uri_prefix=body.ontology_uri_prefix,
@@ -1010,7 +1052,7 @@ def _run_induction(
                 r2rml_turtle=r2rml_ttl,
                 source_type="STRUCTURED",
                 metadata={
-                    "label": body.label or "Induced Structured Ontology",
+                    "label": proposal_label,
                     "tables_processed": len(all_tables),
                     "columns_processed": sum(len(t.columns) for t in all_tables),
                     "novel_classes_created": novel_count,
@@ -1036,6 +1078,9 @@ def _run_induction(
                     "grounding_ontologies_used": grounding_report_uris,
                     "structural_fingerprint": fingerprint,
                     "has_constraint_config": True,
+                    # Diagnostic snapshot of the immutable namespace language this
+                    # run used; the namespace remains the authority.
+                    "namespaceLanguage": namespace_language,
                 },
             )
 
@@ -1162,17 +1207,29 @@ def start_induction(body: WorkbenchInductionRequest, request: Request, namespace
         The pending :class:`JobResponse` for the newly started job.
 
     Raises:
-        HTTPException: 422 if the requested lexical source is unsupported or
-            the Neptune endpoint is unconfigured for an unstructured run; 409
-            if another induction/proposal is in flight.
+        HTTPException: 404 if the namespace does not exist, 400 if the strategy
+            is ``rigor_ontology`` and the namespace language is not English, 422
+            if the requested lexical source is unsupported or the Neptune
+            endpoint is unconfigured for an unstructured run, or 409 if another
+            induction/proposal is in flight.
     """
+    # Resolve the immutable namespace language once, before any job state is
+    # written, and hand it to whichever pipeline runs.
+    namespace_language = namespace_language_or_404(namespace, request.app.state.config)
+    if body.strategy == "rigor_ontology" and not rigor_supports_language(namespace_language):
+        raise HTTPException(
+            400,
+            (
+                f"The rigor_ontology strategy supports only English namespaces; this namespace's language is "
+                f"{namespace_language}. Use table_to_ontology."
+            ),
+        )
+
     # Dispatch to unstructured pipeline if strategy is unstructured_lexical_graph
     if getattr(body, "strategy", "") == "unstructured_lexical_graph":
         from coa_ontology.inducer.routers.induce_unstructured import (
             UnstructuredInductionRequest,
-        )
-        from coa_ontology.inducer.routers.induce_unstructured import (
-            start_induction as start_unstructured,
+            start_unstructured_job,
         )
 
         graph_arn = getattr(body, "graph_arn", None) or "neptune-db"
@@ -1197,7 +1254,7 @@ def start_induction(body: WorkbenchInductionRequest, request: Request, namespace
             graph_arn=graph_arn,
             name="unstructured",
             ontology_uri_prefix=body.ontology_uri_prefix,
-            label="Unstructured Induction",
+            label=render("unstructured_dispatch_title", namespace_language),
             datasource_ids=body.datasource_ids,
             confidence_threshold=getattr(body, "confidence_threshold", 0.8),
             # Forward foundational-grounding params so the unstructured path
@@ -1210,7 +1267,12 @@ def start_induction(body: WorkbenchInductionRequest, request: Request, namespace
             grounding_mode=getattr(body, "grounding_mode", "ENHANCED"),
             rerank_max_tokens=getattr(body, "rerank_max_tokens", 1000),
         )
-        return start_unstructured(body=unstructured_body, request=request, namespace=namespace)
+        return start_unstructured_job(
+            body=unstructured_body,
+            request=request,
+            namespace=namespace,
+            namespace_language=namespace_language,
+        )
 
     # Enforce one in-flight induction at a time per namespace, in two layers:
     #
@@ -1299,7 +1361,7 @@ def start_induction(body: WorkbenchInductionRequest, request: Request, namespace
             namespace=namespace,
             ontology_id=body.ontology_uri_prefix,
             source_type="STRUCTURED",
-            label=body.label or "Induced Structured Ontology",
+            label=body.label or render("structured_proposal_title", namespace_language),
         )
 
         # Write initial job record to DynamoDB.
@@ -1314,7 +1376,16 @@ def start_induction(body: WorkbenchInductionRequest, request: Request, namespace
 
         Thread(
             target=_run_induction,
-            args=(job_id, body, namespace, config, _build_pipeline, _schemas_mod, _catalog_table_cls),
+            args=(
+                job_id,
+                body,
+                namespace,
+                config,
+                _build_pipeline,
+                _schemas_mod,
+                _catalog_table_cls,
+                namespace_language,
+            ),
             daemon=True,
         ).start()
     except Exception:

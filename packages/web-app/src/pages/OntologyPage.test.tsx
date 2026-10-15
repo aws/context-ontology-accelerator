@@ -1093,4 +1093,75 @@ describe("Ontology page — re-scanned-source warning", () => {
     await screen.findByText(WARNING);
     await screen.findByText(PENDING_WARNING);
   });
+
+  // The proposals list is capped (50 rows by default). This mock applies the
+  // filters the page sends, then keeps the first `limit` rows in STORAGE order
+  // (not newest first), so the tests below do not lean on the backend's
+  // ordering: the page itself must keep other proposals from crowding its
+  // structured inductions out of the capped list.
+  function mockStoredProposals(stored: Array<Record<string, unknown>>) {
+    listProposals.mockImplementation(
+      (
+        _client: unknown,
+        _namespace: unknown,
+        opts?: {
+          type?: string;
+          status?: string;
+          source_type?: string;
+          limit?: number;
+        },
+      ) => {
+        let rows = stored;
+        if (opts?.type)
+          rows = rows.filter((p) => p.proposal_type === opts.type);
+        if (opts?.status) rows = rows.filter((p) => p.status === opts.status);
+        if (opts?.source_type === "STRUCTURED")
+          // Rows written before source_type existed count as structured.
+          rows = rows.filter(
+            (p) =>
+              p.source_type === undefined || p.source_type === "STRUCTURED",
+          );
+        else if (opts?.source_type)
+          rows = rows.filter((p) => p.source_type === opts.source_type);
+        return Promise.resolve(rows.slice(0, opts?.limit ?? 50));
+      },
+    );
+  }
+
+  // 60 document (unstructured) inductions. They share the "induction" type,
+  // and none can cover a database source.
+  function documentInductions(createdAt: string) {
+    return Array.from({ length: 60 }, (_, i) => ({
+      proposal_id: `doc-${i}`,
+      proposal_type: "induction",
+      source_type: "UNSTRUCTURED",
+      status: "accepted",
+      created_at: createdAt,
+      metadata: { datasource_ids: [`doc-src-${i}`] },
+    }));
+  }
+
+  it("does NOT warn when the re-induction after the re-scan sits behind 60 other proposals", async () => {
+    mockSourceRescannedAt("2026-06-01T00:00:00Z");
+    mockStoredProposals([
+      inductionProposal("src-1", "2026-01-01T00:00:00Z"), // stale accepted
+      ...documentInductions("2026-03-01T00:00:00Z"),
+      inductionProposal("src-1", "2026-06-02T00:00:00Z"), // re-induced after re-scan
+    ]);
+    renderPage();
+    await awaitScanFetched();
+    expect(screen.queryByText(WARNING)).toBeNull();
+    expect(screen.queryByText(PENDING_WARNING)).toBeNull();
+  });
+
+  it("warns when the only induction of a re-scanned source sits behind 60 other proposals", async () => {
+    mockSourceRescannedAt("2026-06-01T00:00:00Z");
+    mockStoredProposals([
+      ...documentInductions("2026-03-01T00:00:00Z"),
+      inductionProposal("src-1", "2026-01-01T00:00:00Z"), // older than re-scan
+    ]);
+    renderPage();
+    await screen.findByText(WARNING);
+    await screen.findByText(/Orders DB/);
+  });
 });

@@ -130,6 +130,8 @@ def _table_to_induction_format(table: Table) -> dict[str, Any]:
             "tags": biz.tags,
             "enrichmentSource": biz.enrichment_source,
             "reviewStatus": biz.review_status,
+            # Field-level provenance: induction tags a field only when it is listed.
+            "generatedFields": list(biz.generated_fields),
         },
         "primaryKey": {
             "columns": table.primary_key.columns,
@@ -169,6 +171,7 @@ def _table_to_induction_format(table: Table) -> dict[str, Any]:
                     "tags": col.business_metadata.tags,
                     "enrichmentSource": col.business_metadata.enrichment_source,
                     "reviewStatus": col.business_metadata.review_status,
+                    "generatedFields": list(col.business_metadata.generated_fields),
                 },
             }
             for col in approved_cols

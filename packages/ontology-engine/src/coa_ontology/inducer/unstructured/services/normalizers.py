@@ -27,19 +27,33 @@ Usage::
 from __future__ import annotations
 
 import re
+import unicodedata
+
+from coa_ontology.inducer.services.unicode_normalization import (
+    filter_letters_marks_numbers,
+    simple_case_identity,
+    width_only_nfkc,
+)
 
 
 def normalize_predicate(s: str) -> str:
-    """Normalize a predicate label for consistent property naming.
+    """Normalize a predicate label into a non-destructive aggregation key.
 
-    Rules:
-    - Lowercase
-    - Spaces → underscores
-    - Strip non-alphanumeric characters (except underscores)
-    - Collapse consecutive underscores
-    - Strip leading/trailing underscores
+    Letters, numbers, and marks attached to them are retained in every script;
+    whitespace becomes underscores and other characters are removed. Fullwidth
+    and halfwidth forms are normalized so legacy Katakana and fullwidth ASCII
+    share their ordinary spelling.
 
-    Idempotent: ``normalize_predicate(normalize_predicate(s)) == normalize_predicate(s)``
+    Compatibility folding is deliberately limited to the Unicode Halfwidth and
+    Fullwidth Forms block. Applying NFKC to the whole value turns symbols such as
+    ``℃`` and ``™`` into the letters ``C`` and ``TM`` and silently merges distinct
+    predicates. Ordinary lowercase is likewise deliberate: it preserves
+    compatibility distinctions such as MICRO SIGN versus GREEK MU and avoids
+    expansions that would merge distinct words such as German ``Maße`` and
+    ``Masse``. Greek final sigma is the only explicit caseless mapping. The
+    resolver uses the same identity contract.
+
+    Idempotent: ``normalize_predicate(normalize_predicate(s)) == normalize_predicate(s)``.
 
     Args:
         s: Raw predicate string.
@@ -47,17 +61,21 @@ def normalize_predicate(s: str) -> str:
     Returns:
         Normalized predicate string.
     """
-    # Lowercase
-    s = s.lower()
-    # Spaces to underscores
-    s = s.replace(" ", "_")
-    # Strip non-alphanumeric except underscores
-    s = re.sub(r"[^a-z0-9_]", "", s)
-    # Collapse consecutive underscores
+    s = width_only_nfkc(s)
+    # Any whitespace to underscores, not just U+0020: an ideographic space is an
+    # ordinary word separator in Japanese and Chinese text.
+    s = re.sub(r"\s+", "_", s)
+    s = filter_letters_marks_numbers(s, keep_underscore=True, keep_symbols=True)
+    # Ordinary lowercase plus the explicit final-sigma mapping avoids full
+    # case-fold compatibility substitutions and expansions such as ß → ss.
+    # Lowercasing can emit a combining mark (for example, Turkish capital dotted
+    # I), so recompose and filter once more to enforce the attached-mark invariant.
+    s = unicodedata.normalize("NFC", simple_case_identity(s))
+    s = filter_letters_marks_numbers(s, keep_underscore=True, keep_symbols=True)
     s = re.sub(r"_{2,}", "_", s)
-    # Strip leading/trailing underscores
-    s = s.strip("_")
-    return s
+    # Recompose after punctuation removal. For example, removing the hyphen from
+    # Hangul Jamo ``ᄀ-ᅡ`` must yield ``가`` in the same pass.
+    return unicodedata.normalize("NFC", s.strip("_"))
 
 
 # ── XSD type inference ──────────────────────────────────────────────────

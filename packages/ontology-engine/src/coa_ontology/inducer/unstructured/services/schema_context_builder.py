@@ -79,6 +79,7 @@ def build_class_schema_contexts(
     class_labels: list[str],
     *,
     class_label_to_canonical: dict[str, str] | None = None,
+    namespace_language: str = "en",
 ) -> dict[str, ClassSchemaContext]:
     """Assemble per-class T-Box schema fingerprints from SYS_RELATION aggregates.
 
@@ -111,6 +112,8 @@ def build_class_schema_contexts(
             If omitted, raw values are matched as-is — appropriate when
             the graph already stores classes in the same form as
             ``class_labels``.
+        namespace_language: Canonical namespace language, forwarded to
+            ``normalize_predicate``.
 
     Returns:
         Mapping from each entry in ``class_labels`` to its
@@ -188,6 +191,7 @@ def build_class_schema_contexts_from_schema_result(
     class_labels: list[str],
     *,
     class_label_to_canonical: dict[str, str] | None = None,
+    namespace_language: str = "en",
 ) -> dict[str, ClassSchemaContext]:
     """Convenience wrapper accepting the full ``ClassSchemaResult`` directly.
 
@@ -197,11 +201,13 @@ def build_class_schema_contexts_from_schema_result(
             from ``LexicalGraphStore.get_graph_schema()``.
         class_labels: As :func:`build_class_schema_contexts`.
         class_label_to_canonical: As :func:`build_class_schema_contexts`.
+        namespace_language: As :func:`build_class_schema_contexts`.
     """
     return build_class_schema_contexts(
         schema_result.relations,
         class_labels,
         class_label_to_canonical=class_label_to_canonical,
+        namespace_language=namespace_language,
     )
 
 

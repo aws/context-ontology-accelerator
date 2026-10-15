@@ -1,0 +1,98 @@
+@prefix ind: <http://example.org/a1-golden#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix scl: <http://coa.amazon.com/vocab/coa#> .
+@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+<http://example.org/a1-golden> a owl:Ontology ;
+    rdfs:label "Proposal Ontology" .
+
+ind:customers_segment a owl:DatatypeProperty ;
+    rdfs:label "segment" ;
+    scl:distinctValues "retail",
+        "wholesale" ;
+    rdfs:comment "Market segment" ;
+    rdfs:domain ind:Customers ;
+    rdfs:range xsd:string .
+
+ind:matchConfidence a owl:AnnotationProperty .
+
+ind:orders_customerId a owl:ObjectProperty ;
+    rdfs:label "customer_id" ;
+    scl:fkProvenance "DETERMINISTIC" ;
+    rdfs:comment "Buyer reference (Foreign key: orders.customer_id references customers.customer_id)" ;
+    rdfs:domain ind:Orders ;
+    rdfs:range ind:Customers .
+
+ind:orders_orderId a owl:DatatypeProperty ;
+    rdfs:label "order_id" ;
+    rdfs:comment "Order number" ;
+    rdfs:domain ind:Orders ;
+    rdfs:range xsd:integer .
+
+ind:orders_regionCode a owl:ObjectProperty ;
+    rdfs:label "region_code" ;
+    scl:fkProvenance "DETERMINISTIC" ;
+    rdfs:comment "Foreign key: orders.region_code references regions.code" ;
+    rdfs:domain ind:Orders ;
+    rdfs:range ind:Regions .
+
+ind:orders_regionSeq a owl:DatatypeProperty ;
+    rdfs:label "region_seq" ;
+    rdfs:comment "Part of a composite foreign key on orders; the relationship is carried by orders_regionCode" ;
+    rdfs:domain ind:Orders ;
+    rdfs:range xsd:integer .
+
+ind:regions_code a owl:DatatypeProperty ;
+    rdfs:label "code" ;
+    scl:distinctValues "EU",
+        "JP",
+        "US" ;
+    rdfs:domain ind:Regions ;
+    rdfs:range xsd:string .
+
+ind:regions_seq a owl:DatatypeProperty ;
+    rdfs:label "seq" ;
+    rdfs:domain ind:Regions ;
+    rdfs:range xsd:integer .
+
+ind:orders_status a owl:DatatypeProperty ;
+    rdfs:label "status" ;
+    rdfs:comment "Order status" ;
+    rdfs:domain ind:Orders ;
+    rdfs:range xsd:string .
+
+ind:customers_customerId a owl:DatatypeProperty ;
+    rdfs:label "customer_id" ;
+    rdfs:comment "Customer identifier" ;
+    rdfs:domain ind:Customers ;
+    rdfs:range xsd:integer ;
+    skos:altLabel "client id" .
+
+ind:Customers a owl:Class ;
+    rdfs:label "customers" ;
+    ind:matchConfidence "0.97"^^xsd:float ;
+    rdfs:comment "People who buy products" ;
+    rdfs:subClassOf [ a owl:Restriction ;
+            owl:cardinality "1"^^xsd:nonNegativeInteger ;
+            owl:onProperty ind:customers_customerId ],
+        <http://schema.org/Person> ;
+    owl:hasKey ( ind:customers_customerId ) ;
+    skos:altLabel "buyer",
+        "client" ;
+    skos:exactMatch <http://schema.org/Person> .
+
+ind:Regions a owl:Class ;
+    rdfs:label "regions" ;
+    rdfs:comment "Sales regions" .
+
+ind:Orders a owl:Class ;
+    rdfs:label "orders" ;
+    rdfs:comment "Purchase orders" ;
+    rdfs:subClassOf [ a owl:Restriction ;
+            owl:minCardinality "1"^^xsd:nonNegativeInteger ;
+            owl:onProperty ind:orders_status ] ;
+    skos:altLabel "purchase" .
+

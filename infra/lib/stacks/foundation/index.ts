@@ -8,3 +8,4 @@ export { IdpAuthenticationStack } from "./idp-authentication-stack";
 export { NetworkStack } from "./network-stack";
 export { StorageStack } from "./storage-stack";
 export { WebStack } from "./web-stack";
+export { EniWarmStack } from "./eni-warm-stack";

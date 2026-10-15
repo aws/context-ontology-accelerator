@@ -139,6 +139,10 @@ class UnstructuredInductionConfig(BaseModel):
     description_mode: Literal["label_only", "instance", "schema"]
     include_individuals: bool
     entailment_enabled: bool
+    # Canonical namespace language, resolved server-side by the route from the
+    # namespace item (never from the request). Drives the class-description
+    # prompts, the fixed-text templates and the RDF language tags.
+    namespace_language: str = "en"
 
     # Foundational grounding params (threaded from the request). When
     # grounding_ontology_ids is non-empty AND grounding_service is set, the

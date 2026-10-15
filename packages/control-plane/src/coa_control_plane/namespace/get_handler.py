@@ -11,6 +11,7 @@ from typing import Any
 import structlog
 from coa_common.constants import datasource_external_id
 from coa_common.dao import DynamoDBDAO
+from coa_common.language_tags import effective_namespace_language
 from coa_common.response import api_response
 
 from coa_control_plane.namespace.vkg_health import resolve_vkg_health_with_reason
@@ -50,6 +51,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             "description": item.get("description"),
             "owner": item.get("owner"),
             "status": item.get("status"),
+            "language": effective_namespace_language(item),
             "dataZoneProjectId": item.get("dataZoneProjectId"),
             "sourceCount": _source_count,
             "createdAt": item.get("createdAt"),

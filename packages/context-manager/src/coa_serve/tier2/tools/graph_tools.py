@@ -36,6 +36,15 @@ request-scoped tool), so hop count, node-type filtering, ordering and truncation
 are exact and cheap; recursive SPARQL over reified domain/range property nodes
 would be both awkward and unbounded.
 
+Labels (namespace-language LLD §2.2.5). A table or column class can carry an
+untagged physical-name label and, from a trusted artifact or a later induction,
+tagged labels too. ``table`` / ``column`` stay the PHYSICAL identifier the SQL
+writer executes against — the untagged label when there is one, chosen the same
+way on every request — and are never replaced by a display label. When the
+namespace-language preference picks a different label it is added alongside as
+``table_label`` / ``column_label``. Grouping is by IRI, so a table with several
+labels is still one node, and a language never hides a table.
+
 Every query here is bound to the namespace's named graphs, which a cheap probe
 resolves once per request (:meth:`OntologyGraphTool._resolve_graph_iris`). The
 scoping matters for cost, not just correctness — see
@@ -54,8 +63,10 @@ from collections import deque
 from typing import Any
 
 import structlog
+from coa_common.label_language import LabelPreference
 
 from ...clients.base import GraphClient
+from ...namespace_language import current_label_preference, lang_projection, row_label
 from ...query_utils import (
     SPARQL_PREFIXES,
     get_graph_uri_template,
@@ -249,27 +260,47 @@ class OntologyGraphTool:
             OPTIONAL {{ ?col rdfs:range ?range }}
             OPTIONAL {{ ?col rdfs:comment ?colComment }}"""
         sparql = f"""{SPARQL_PREFIXES}
-        SELECT ?class ?col ?colLabel ?range ?colComment WHERE {{
+        SELECT ?class ?col ?colLabel {lang_projection("colLabel")} ?range
+               ?colComment {lang_projection("colComment")} WHERE {{
 {graph_scoped_body(body, prefix, graphs)}
         }}"""
         rows = await self._query(sparql, what="columns")
-        by_class: dict[str, list[dict[str, str]]] = {}
+        # One entry per (class, column) however many labels/comments the column
+        # carries; first-seen order is kept so a single-label graph reads as before.
+        grouped: dict[tuple[str, str], dict[str, Any]] = {}
         for r in rows:
             cls = r.get("class", "")
             if not cls:
                 continue
-            column = r.get("colLabel", "") or _localname(r.get("col", ""))
-            by_class.setdefault(cls, []).append(
-                {
-                    "column": column,
-                    "type": _localname(r.get("range", "")),
-                    # The ingest pipeline's per-column description. Used only by
-                    # :func:`_schema_text` when a walk has to rebuild a schema for a
-                    # consumer with no retrieved text; ``explore_graph`` does not
-                    # return it (the agent asked for structure, not prose).
-                    "desc": (r.get("colComment", "") or "").strip(),
-                }
-            )
+            # ``?col`` is always bound by the query; a row without one (a
+            # hand-built fixture) is keyed by its label so it stays its own column.
+            col_key = r.get("col", "") or f"label:{r.get('colLabel', '')}"
+            entry = grouped.setdefault((cls, col_key), {"labels": [], "comments": [], "range": r.get("range", "")})
+            label = row_label(r, "colLabel")
+            if label[0]:
+                entry["labels"].append(label)
+            comment = row_label(r, "colComment")
+            if comment[0].strip():
+                entry["comments"].append((comment[0].strip(), comment[1]))
+            if not entry["range"] and r.get("range"):
+                entry["range"] = r["range"]
+        preference = current_label_preference()
+        by_class: dict[str, list[dict[str, str]]] = {}
+        for (cls, col_iri), entry in grouped.items():
+            column = _IDENTIFIER_PREFERENCE.pick(entry["labels"]) or _localname(_col_key_iri(col_iri))
+            item = {
+                "column": column,
+                "type": _localname(entry["range"]),
+                # The ingest pipeline's per-column description. Used only by
+                # :func:`_schema_text` when a walk has to rebuild a schema for a
+                # consumer with no retrieved text; ``explore_graph`` does not
+                # return it (the agent asked for structure, not prose).
+                "desc": preference.pick(entry["comments"]),
+            }
+            display = preference.pick(entry["labels"])
+            if display and display != column:
+                item["column_label"] = display
+            by_class.setdefault(cls, []).append(item)
         return by_class
 
     async def _resolve_label_to_iris(self, prefix: str, label: str) -> list[str]:
@@ -368,6 +399,7 @@ class OntologyGraphTool:
         prefix = namespace_graph_prefix(self._graph_uri_template, self._namespace)
         edges = await self._load_fk_edges(prefix)
         adjacency, label_of = _build_adjacency(edges)
+        display_of = _display_labels(edges, label_of, current_label_preference())
         reached = _bfs(seeds, adjacency, hops)
 
         seed_set = set(seeds)
@@ -386,18 +418,19 @@ class OntologyGraphTool:
         out: list[dict[str, Any]] = []
         for iri, (hop, via, direction) in ordered:
             label = label_of.get(iri, _localname(iri))
-            out.append(
-                {
-                    "iri": iri,
-                    "table": label,
-                    "hop": hop,
-                    "direction": direction,
-                    "via": via,
-                    # Keyed to the class the walk actually reached, so a homonym in
-                    # another database cannot supply the schema.
-                    "schema": _schema_text(label, cols_by_class.get(iri, [])),
-                }
-            )
+            node = {
+                "iri": iri,
+                "table": label,
+                "hop": hop,
+                "direction": direction,
+                "via": via,
+                # Keyed to the class the walk actually reached, so a homonym in
+                # another database cannot supply the schema.
+                "schema": _schema_text(label, cols_by_class.get(iri, []), display_of.get(iri, "")),
+            }
+            if iri in display_of:
+                node["table_label"] = display_of[iri]
+            out.append(node)
         return out
 
     async def explore_graph(
@@ -451,6 +484,7 @@ class OntologyGraphTool:
 
         edges = await self._load_fk_edges(prefix)
         adjacency, label_of = _build_adjacency(edges)
+        display_of = _display_labels(edges, label_of, current_label_preference())
         reached = _bfs(seed_iris, adjacency, hops)  # iri -> (hop, via, direction)
         ordered = sorted(reached.items(), key=lambda kv: (kv[1][0], label_of.get(kv[0], kv[0])))
 
@@ -460,6 +494,7 @@ class OntologyGraphTool:
         if "table" in types:
             table_nodes = [
                 {"table": label_of.get(iri, _localname(iri)), "hop": hop, "direction": direction, "via": via}
+                | ({"table_label": display_of[iri]} if iri in display_of else {})
                 for iri, (hop, via, direction) in ordered
             ]
 
@@ -469,7 +504,10 @@ class OntologyGraphTool:
             for iri, _meta in ordered:
                 table = label_of.get(iri, _localname(iri))
                 for col in cols_by_class.get(iri, []):
-                    column_nodes.append({"table": table, "column": col["column"], "type": col["type"]})
+                    node = {"table": table, "column": col["column"], "type": col["type"]}
+                    if "column_label" in col:
+                        node["column_label"] = col["column_label"]
+                    column_nodes.append(node)
 
         # Global truncation: tables consume the budget first, then columns.
         total = len(table_nodes) + len(column_nodes)
@@ -505,7 +543,7 @@ def _normalize_node_types(node_types: list[str] | None) -> tuple[str, ...]:
     return tuple(t for t in VALID_NODE_TYPES if t in wanted) or VALID_NODE_TYPES
 
 
-def _schema_text(label: str, cols: list[dict[str, str]]) -> str:
+def _schema_text(label: str, cols: list[dict[str, str]], display_label: str = "") -> str:
     """One table as the ``"Table: … | Columns: …"`` line the SQL writer reads.
 
     Deliberately the same shape as the class text the ingest pipeline stores in the
@@ -514,20 +552,36 @@ def _schema_text(label: str, cols: list[dict[str, str]]) -> str:
     the column name, its XSD type and the ingest-time description; what it cannot
     supply is the sampled allowed-values block, so a walk-derived schema is thinner
     than a retrieved one — which is why the caller never overwrites a retrieved one.
+
+    ``label`` and each column's ``column`` are the physical identifiers the writer
+    must use. A namespace-language display label that differs is appended as a
+    hint (``(label: …)`` / ``[label: …]``); when there is none the line is exactly
+    what it was before labels were ranked.
     """
+    head = f"Table: {label}"
+    if display_label and display_label != label:
+        head += f" (label: {display_label})"
     if not cols:
-        return f"Table: {label}"
+        return head
     parts = []
     for col in cols:
         name = col.get("column") or ""
         if not name:
             continue
         text = f"{name}:{col.get('type') or 'unknown'}"
+        column_label = col.get("column_label") or ""
+        if column_label and column_label != name:
+            text += f" [label: {column_label}]"
         desc = (col.get("desc") or "")[:_MAX_COL_DESC]
         parts.append(f"{text} ({desc})" if desc else text)
     if not parts:
-        return f"Table: {label}"
-    return f"Table: {label} | Columns: {', '.join(parts)}"
+        return head
+    return f"{head} | Columns: {', '.join(parts)}"
+
+
+def _col_key_iri(key: str) -> str:
+    """The column IRI from a :meth:`OntologyGraphTool._load_columns` group key."""
+    return "" if key.startswith("label:") else key
 
 
 def _localname(iri: str) -> str:
@@ -537,30 +591,76 @@ def _localname(iri: str) -> str:
     return iri.rsplit("#", 1)[-1].rsplit("/", 1)[-1]
 
 
+# Physical identifiers never follow the namespace language: an untagged label
+# (the physical name the ingest pipeline wrote) wins, then any label in lexical
+# order, so the executable name is the same on every request and in every
+# namespace. Display labels use the request's namespace-language preference.
+_IDENTIFIER_PREFERENCE = LabelPreference.untagged_first()
+
+
 def _build_adjacency(edges: list[dict[str, str]]) -> tuple[dict[str, list[dict[str, str]]], dict[str, str]]:
-    """Build a bidirectional FK adjacency + an IRI→label map from FK edge rows.
+    """Build a bidirectional FK adjacency + an IRI→identifier map from FK edge rows.
 
     Each edge (domain --FK--> range) yields an *outgoing* neighbor from the domain
     and an *incoming* neighbor to the range, so BFS follows joins in both
     directions (a query may join parent→child or child→parent).
+
+    A table or FK with several labels arrives as one row per label combination.
+    Rows are grouped by IRI: each table gets one physical identifier (see
+    :data:`_IDENTIFIER_PREFERENCE`) and each ``(op, domain, range)`` edge appears
+    once, in first-seen order.
     """
-    adjacency: dict[str, list[dict[str, str]]] = {}
-    label_of: dict[str, str] = {}
+    labels_of: dict[str, list[tuple[str, str]]] = {}
+    edge_rows: dict[tuple[str, str, str], dict[str, list[tuple[str, str]]]] = {}
     for e in edges:
         dom, rng = e.get("domain", ""), e.get("range", "")
         if not dom or not rng:
             continue
-        label_of[dom] = e.get("domainLabel", "") or _localname(dom)
-        label_of[rng] = e.get("rangeLabel", "") or _localname(rng)
+        for iri, var in ((dom, "domainLabel"), (rng, "rangeLabel")):
+            candidates = labels_of.setdefault(iri, [])
+            label = row_label(e, var)
+            if label[0]:
+                candidates.append(label)
         # A self-referential FK (employee.manager_id → employee) adds two adjacency
         # entries that BFS can never use: the node is already reached at hop 0 by
         # the time its own neighbours are scanned. Keep its label, drop the edges.
         if dom == rng:
             continue
-        via = e.get("comment", "") or e.get("opLabel", "") or _localname(e.get("op", ""))
+        edge = edge_rows.setdefault((e.get("op", ""), dom, rng), {"comments": [], "labels": []})
+        if e.get("comment"):
+            edge["comments"].append((str(e["comment"]), ""))
+        op_label = row_label(e, "opLabel")
+        if op_label[0]:
+            edge["labels"].append(op_label)
+
+    label_of = {iri: _IDENTIFIER_PREFERENCE.pick(c) or _localname(iri) for iri, c in labels_of.items()}
+    adjacency: dict[str, list[dict[str, str]]] = {}
+    for (op, dom, rng), edge in edge_rows.items():
+        via = (
+            _IDENTIFIER_PREFERENCE.pick(edge["comments"])
+            or _IDENTIFIER_PREFERENCE.pick(edge["labels"])
+            or _localname(op)
+        )
         adjacency.setdefault(dom, []).append({"to": rng, "via": via, "direction": "outgoing"})
         adjacency.setdefault(rng, []).append({"to": dom, "via": via, "direction": "incoming"})
     return adjacency, label_of
+
+
+def _display_labels(
+    edges: list[dict[str, str]], label_of: dict[str, str], preference: LabelPreference
+) -> dict[str, str]:
+    """IRI → namespace-language display label, only where it differs from the identifier."""
+    rows = [
+        (e[iri_var], *row_label(e, label_var))
+        for e in edges
+        for iri_var, label_var in (("domain", "domainLabel"), ("range", "rangeLabel"))
+        if e.get(iri_var)
+    ]
+    return {
+        iri: display
+        for iri, display in preference.pick_by_resource(rows).items()
+        if display and display != label_of.get(iri, _localname(iri))
+    }
 
 
 def _bfs(

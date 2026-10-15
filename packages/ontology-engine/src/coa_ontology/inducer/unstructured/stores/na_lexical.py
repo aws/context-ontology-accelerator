@@ -196,6 +196,33 @@ def _is_predicate_word(token: str) -> bool:
     return any(ch.isalpha() for ch in stripped)
 
 
+# Punctuation stripped from around a caseless predicate token. CJK text uses
+# full-width marks, which the ASCII set in ``_is_predicate_word`` does not cover.
+_CASELESS_TOKEN_PUNCTUATION = ",.;:()[]{}\"'、。，．；：（）［］｛｝「」『』【】〈〉《》"
+
+
+def _is_caseless_predicate_word(token: str) -> bool:
+    """Return True iff ``token`` can be a predicate in a script without case.
+
+    The extraction prompt asks for predicates in uppercase, and for a
+    namespace in another language it tells the model that uppercase applies
+    only to letters that have case and that an underscore stands where the
+    name would contain a space. A Japanese, Chinese or Korean predicate such
+    as ``点検周期`` therefore arrives as one token with no cased letter, and
+    ``str.isupper()`` is False for it, so ``_is_predicate_word`` cannot
+    accept it.
+
+    A token qualifies when it starts with a letter and contains no cased
+    letter at all. Starting with a letter keeps quantities like ``30日``
+    out. A token with any cased letter (``KX-7``, ``Company``) is left to
+    ``_is_predicate_word``.
+    """
+    stripped = token.strip(_CASELESS_TOKEN_PUNCTUATION)
+    if not stripped or not stripped[0].isalpha():
+        return False
+    return not any(ch.isupper() or ch.islower() for ch in stripped)
+
+
 def _extract_spo_predicate(fact_value: str, subject_value: str, object_value: str) -> str:
     """Recover the predicate phrase from an SPO fact's ``value``.
 
@@ -232,6 +259,9 @@ def _extract_spc_predicate_complement(fact_value: str, subject_value: str) -> tu
        :func:`_is_predicate_word` belong to the predicate; the first
        token that fails ends the predicate phrase. Everything from
        there to the end of the string is the complement.
+    3. In a script without case, the first token is the whole predicate
+       when it passes :func:`_is_caseless_predicate_word`, and the rest is
+       the complement.
 
     Returns ``(predicate, None)`` when the heuristic finds zero
     predicate words (e.g. the LLM output didn't follow the
@@ -266,6 +296,13 @@ def _extract_spc_predicate_complement(fact_value: str, subject_value: str) -> tu
     # content word — but the heuristic doesn't enforce that.
     predicate_tokens: list[str] = []
     for i, tok in enumerate(tokens):
+        if not predicate_tokens and _is_caseless_predicate_word(tok):
+            # A caseless script has no uppercase to mark where the predicate
+            # ends, and its complement is often caseless too (``担当者 田中``).
+            # The prompt joins a multi-word name with underscores, so the
+            # predicate is this one token and the rest is the complement.
+            complement = " ".join(tokens[i + 1 :]).strip()
+            return tok.strip(_CASELESS_TOKEN_PUNCTUATION), complement or None
         if _is_predicate_word(tok):
             predicate_tokens.append(tok)
         else:

@@ -248,8 +248,12 @@ Cedar policy is evaluated at **two** points, so that namespace authorization cov
 surfaces which never generate SQL as well as those that do. The evaluator
 (`tier2/cedar_authorizer.py` + the vendored engine under `authz/`) runs the same
 `cedarpy`-backed `coa_authorization` engine the control-plane API authorizer uses,
-against the same shipped seed policies (`authz/seed/*.cedar`: global_admin,
-global_viewer, and the namespace-scoped data-analyst/steward/owner/maintainer roles).
+against the role policies stored in the Roles table (`ROLES_TABLE_NAME`), read
+through the shared `coa_authorization.policy_loader.load_policies_for_roles` (the
+loader the MCP grant resolver uses). The shipped seed policies (`authz/seed/*.cedar`:
+global_admin, global_viewer, and the namespace-scoped data-analyst/steward/owner/maintainer
+roles) are what deploy seeds into that table; serve evaluates them directly only in a
+local/test run with no Roles table and `ALLOW_WITHOUT_ROLES=true`.
 A byte-identity guard test keeps the vendored copy in sync with the control-plane source.
 
 1. **Namespace admission gate** (`main.py::_authorize_namespace_access`, via
@@ -270,8 +274,10 @@ and are intentionally not gated.
 How a decision is made:
 
 1. The caller's identity is taken **only from the validated JWT** — any `userId`/`groups`/`globalRoles`/`resourceRoles` keys in the request body are stripped on both consumer surfaces (WebSocket handler and `invoke` entrypoint), so a client cannot self-escalate by claiming roles. The JWT-over-body precedence lives in one place (`identity.resolve_principal`).
-2. The caller's **resolved roles** are looked up by the admission gate itself via `role_resolver.resolve_profile` (the `ResourceRoleMappings` `PrincipalIndex` GSI) — the serve path does not depend on an upstream forwarding them, since the Playground calls the runtime directly. The resolved profile is reused by the query path, so the lookup happens once per request. `SCL::Action::"query"` is then evaluated on the target namespace against the seed policies.
-3. **Fail-closed**: no roles → deny; evaluator error → deny; deny is terminal (`AccessDeniedError` → HTTP 403, no Tier-3 fall-through, generic client message with the reason logged server-side only). If the grant lookup itself fails, the request is rejected as a retryable `502` rather than a 403, so a transient DynamoDB fault is not reported as an access change.
+2. The caller's **resolved roles** are looked up by the admission gate itself via `role_resolver.resolve_profile` (the `ResourceRoleMappings` `PrincipalIndex` GSI) — the serve path does not depend on an upstream forwarding them, since the Playground calls the runtime directly. The resolved profile is reused by the query path, so the lookup happens once per request. `SCL::Action::"query"` is then evaluated on the target namespace against those roles' Roles-table policies (plus `default`).
+3. **Fail-closed**: no roles → deny; evaluator error → deny; no usable role policy → deny (`authorization_policies_unavailable`, see below); deny is terminal (`AccessDeniedError` → HTTP 403, no Tier-3 fall-through, generic client message with the reason logged server-side only). If the grant lookup itself fails, the request is rejected as a retryable `502` rather than a 403, so a transient DynamoDB fault is not reported as an access change.
+
+Role policies are cached per role for `SCL_CEDAR_POLICY_CACHE_TTL_S` (60 s). When a refresh fails, or the table reads back empty (`default` missing, which in a deployed environment means the table itself is missing or broken), each role's last successfully loaded policy is reused, logged as `cedar_policy_last_known_good_used` with its age, until it is `SCL_CEDAR_POLICY_MAX_STALE_S` (900 s) old. Past that, or for a role never loaded by this process, the query is denied (HTTP 403, reason `authorization_policies_unavailable` in the server log). The shipped seed policies are never substituted for a failing table: a tenant that tightened a built-in role keeps the tightened policy during a Roles-table outage. With no `ROLES_TABLE_NAME`, or a Roles table that cannot be used (e.g. no `AWS_REGION`), every query is denied; only with no table configured does `ALLOW_WITHOUT_ROLES=true` (dev/test only, same name as the control-plane authorizer's opt-in) switch serve to the shipped seed policies.
 
 Both blocking steps (the DynamoDB grant lookup and the `cedarpy` evaluation) are dispatched via `asyncio.to_thread`, since the gate runs on every namespace-scoped request and must not block the runtime's event loop.
 
@@ -316,6 +322,10 @@ All executed queries are subject to a `max_rows` cap (default: 10,000):
 | `MEMORY_ID` | No | `""` (disabled) | AgentCore Memory ID for conversation session state. When set, enables multi-turn session management (create/resume, history loading, turn storage). Obtain from CDK output of serve-stack. |
 | `SCL_DISABLE_JDBC_DISPATCH` | No | unset (JDBC dispatch on) | `true` forces Athena-only execution — the composite executor never routes to direct JDBC. Operational off-switch; restores the previous single-executor behavior. |
 | `SCL_DISABLE_CEDAR` | No | unset (Cedar on) | `true` swaps the real Cedar evaluator for the allow-all `NullCedarAuthorizer`. SQL-firewall safety + allowlist/denylist checks still run. |
+| `ROLES_TABLE_NAME` | Yes | unset (deny all queries) | Roles table the Cedar role policies are read from. Always set by the serve stack. Unset → every query is denied unless `ALLOW_WITHOUT_ROLES=true`. |
+| `ALLOW_WITHOUT_ROLES` | No | unset (deny) | **Dev/test only.** `true` makes serve evaluate the shipped seed policies when `ROLES_TABLE_NAME` is unset (local runs, unit tests). No effect when a Roles table is configured. Never set on a deployed runtime. |
+| `SCL_CEDAR_POLICY_CACHE_TTL_S` | No | `60` | Seconds a role's Roles-table policy is served from cache before it is re-read. |
+| `SCL_CEDAR_POLICY_MAX_STALE_S` | No | `900` | Seconds a role's last successfully loaded policy may still be used while the Roles table cannot be read (or reads back empty). Past this the query is denied with `authorization_policies_unavailable`. A value below `SCL_CEDAR_POLICY_CACHE_TTL_S` is raised to the TTL (logged as `cedar_policy_max_stale_below_ttl`), so with `0` a cached policy is never used past the TTL, and queries are not denied while the table is healthy. |
 | `SCL_CEDAR_FAIL_OPEN_NO_ROLES` | No | unset (fail-closed) | `true` lets callers with **no resolved roles** pass Cedar (dev/pre-provisioning E2E convenience). Leave unset in production: no roles → deny. |
 | `SERVE_GUARDRAILS_DISABLED` | No | unset (both guardrails on) | `1`/`true`/`on`/`yes` makes serve ignore both Bedrock guardrail ids from SSM — the primary generation guardrail and the retrieval one — for the whole deployment. **Benchmark-only**, and the reason is measurable: the primary guardrail anonymizes PII on *input* (NAME/EMAIL/PHONE → `{NAME}`), and in a text-to-SQL question the literals **are** the query, so "what is the border colour of card 'Ancestor's Chosen'?" reaches the model as `'{NAME}'` and the generated `WHERE` matches no row. Measured over the Tier-2 benchmark campaign: 1.6–3.2% of BIRD questions per run end up with a placeholder in their final SQL, and 306 of those 313 questions (97.8%) scored wrong against a 47–55% base wrong rate — worth roughly **1pp of execution accuracy per run** (0.7–1.6pp across five runs), charged to the system under test but caused by the guardrail. Blocks are a smaller, separate effect: 944 of 18,305 guardrailed Converse calls returned `BLOCK`, and the questions that saw one still scored 52.1% EX against 55.5% for those that did not. Deployment-scoped on purpose and deliberately **not** a request option: the primary guardrail is the prompt-attack boundary, so dropping it is the account owner's decision, taken where it is reviewable (`-c serve_guardrails_disabled=true`). Setting SSM `<prefix>/bedrock/guardrail-id` to `none` is *not* equivalent — that parameter is also read by the ingestion and ontology tasks, and `cdk deploy` of the guardrail stack writes the real id back over it. A stack that starts with this set logs `guardrails_disabled_by_configuration` at **error** on every cold start; alarm on it, and note that `cdk synth` of the serve stack **refuses** the context key in `prod`. One interaction to know about: with no guardrail id the Tier-3 `Synthesizer` refuses to construct in a non-local environment unless `ALLOW_NO_GUARDRAIL=true` (which serve-stack sets for every env but `prod`), so a Tier-2 benchmark is unaffected but document questions on the same stack would fail. The numbers above measure the *mechanism* (how often a placeholder reaches the SQL, and how those questions score); to measure the switch end to end, `benchmarks/common/run_guardrail_ab.sh` runs the same arms on the same namespaces once per side and refuses to start unless the live runtime is the side it was told to measure. The first such A/B read as a null — inconsistent sign across cells, every delta inside its cell's own seed spread — so treat ~1pp as an upper bound on the mechanism rather than a measured deployment delta. |
 | `GROUP_CLAIM_NAME` | No | `groups` | JWT claim holding the caller's IdP group memberships (list or delimited string). Mirrors the control-plane authorizer's setting. |
@@ -372,7 +382,8 @@ uv run mypy src/                # type check
 ## Local testing
 
 ```bash
-uv run python -m coa_serve.main
+# No Roles table locally: opt into the shipped seed policies, or every query is denied.
+ALLOW_WITHOUT_ROLES=true uv run python -m coa_serve.main
 # Server starts on http://localhost:8080
 # WebSocket available at ws://localhost:8080/ws
 ```

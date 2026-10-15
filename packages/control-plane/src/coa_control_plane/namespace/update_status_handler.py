@@ -11,6 +11,7 @@ from typing import Any
 
 import structlog
 from coa_common.dao import DynamoDBDAO
+from coa_common.language_tags import effective_namespace_language
 from coa_common.response import api_response
 from coa_control_plane_server.models.namespace_status import NamespaceStatus
 
@@ -96,6 +97,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         "description": updated.get("description"),
         "owner": updated.get("owner"),
         "status": updated.get("status"),
+        "language": effective_namespace_language(updated),
         "dataZoneProjectId": updated.get("dataZoneProjectId"),
         "sourceCount": updated.get("sourceCount", 0),
         "createdAt": updated.get("createdAt"),

@@ -97,6 +97,7 @@ class NeptuneAnalyticsVectorStore(VectorStore):
         entity_type=None,
         embedding_type=None,
         namespace=None,
+        limit=None,
     ):
         """Return all embeddings attached to an ontology, optionally filtered.
 
@@ -105,6 +106,7 @@ class NeptuneAnalyticsVectorStore(VectorStore):
             entity_type: Restrict to one entity type when provided.
             embedding_type: Restrict to one embedding variant when provided.
             namespace: Per-call namespace override; defaults to the bound one.
+            limit: Maximum rows to return; the backend default applies when absent.
 
         Returns:
             List of embedding dicts for the ontology.
@@ -113,6 +115,7 @@ class NeptuneAnalyticsVectorStore(VectorStore):
             ontology_id,
             entity_type=entity_type,
             embedding_type=embedding_type,
+            limit=100 if limit is None else limit,
             namespace=self._resolve_ns(namespace),
         )
 

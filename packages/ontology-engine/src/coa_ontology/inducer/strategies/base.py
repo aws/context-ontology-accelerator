@@ -8,13 +8,15 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+import unicodedata
 from abc import ABC, abstractmethod
-from collections.abc import Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping
 
 from coa_common import sql_ident
 from coa_common.bedrock_metrics import CostTracker
 from coa_common.constants import VOCAB_URI
-from coa_common.domain_models import EnrichmentSource, ReviewStatus
+from coa_common.domain_models import EnrichmentSource, GeneratedField, ReviewStatus
+from coa_common.language_tags import DEFAULT_LANGUAGE
 from rdflib import RDF, XSD, BNode, Graph, Literal, Namespace, URIRef
 
 from coa_ontology.datasource_ids import bare_datasource_id
@@ -23,6 +25,11 @@ from coa_ontology.inducer.services.data_catalog import (
     CatalogConstraint,
     CatalogTable,
     parse_referred_column,
+)
+from coa_ontology.inducer.services.literal_language import catalog_literal
+from coa_ontology.inducer.services.unicode_normalization import (
+    filter_letters_marks_numbers,
+    width_only_nfkc,
 )
 
 log = logging.getLogger(__name__)
@@ -47,6 +54,9 @@ def add_glossary_and_tags(
     subject: URIRef,
     glossary_terms: Iterable[str] | None,
     tags: Iterable[str] | None,
+    *,
+    namespace_language: str = DEFAULT_LANGUAGE,
+    generated_fields: Collection[str] = (),
 ) -> None:
     """Emit a table's or column's approved glossary terms and tags on ``subject``.
 
@@ -54,17 +64,39 @@ def add_glossary_and_tags(
     whitespace-only values are skipped so a blank catalog entry cannot become an
     empty annotation.
 
+    Enrichment writes glossary terms and tags in the namespace language, so a
+    field whose ``generatedFields`` proof is present is tagged like a generated
+    description or synonym (``languageTagCompatibilityV1``). Without the proof,
+    or in an ``en`` namespace (the default), every value stays a plain literal.
+
     Args:
         g: Graph to write into.
         subject: Class (for a table) or property (for a column).
         glossary_terms: Approved glossary terms, or ``None``.
         tags: Approved tags, or ``None``.
+        namespace_language: The namespace's canonical language tag.
+        generated_fields: The table's or column's ``generatedFields``.
     """
-    for predicate, values in ((GLOSSARY_TERM, glossary_terms), (TAG, tags)):
+    for predicate, values, field in (
+        (GLOSSARY_TERM, glossary_terms, GeneratedField.GLOSSARY_TERMS),
+        (TAG, tags, GeneratedField.TAGS),
+    ):
+        generated = field in generated_fields
         for value in values or ():
             text = value.strip() if isinstance(value, str) else ""
             if text:
-                g.add((subject, predicate, Literal(text)))
+                g.add((subject, predicate, catalog_literal(text, namespace_language, generated=generated)))
+
+
+def r2rml_column_name_supported(name: str) -> bool:
+    """Return whether Ontop can resolve ``name`` in an R2RML column reference.
+
+    SQL-delimited identifiers escape an embedded double quote by doubling it,
+    but Ontop compares the raw R2RML placeholder/column text with source-query
+    column names and does not undo that doubling. Until an Ontop-compatible
+    representation is verified end to end, omit these column references.
+    """
+    return '"' not in name
 
 
 # SQL → XSD datatype mapping (shared across strategies)
@@ -168,7 +200,33 @@ def xsd_for_column(data_type: str, column_name: str) -> URIRef:
 
 
 def to_pascal(s: str) -> str:
-    """Convert an arbitrary string to PascalCase for use as a class name.
+    r"""Convert an arbitrary string to PascalCase for use as a class name.
+
+    Letters, numbers, and marks attached to them are retained in every script.
+    Whitespace, underscores and hyphens are one separator class; everything else
+    is dropped. Fullwidth forms are folded to their ordinary width first, so a
+    Glue column arriving as ``顧客ＩＤ`` mints the same name as ``顧客ID``.
+
+    Retaining non-Latin letters is the point. The previous implementation cleaned
+    with ``[^a-zA-Z0-9\s_\-]``, which deletes every character outside ASCII —
+    so an identifier written in Japanese, Chinese, Korean, Cyrillic, Greek or
+    Arabic reduced to ``""`` and fell back to ``"Entity"``. Table names survived
+    on :func:`pascal_names_for`'s discriminator, but column names have no such
+    layer: every column of one table collapsed onto ``{table}_``, fusing them
+    into a single property and dropping all but one ``rr:predicateObjectMap``.
+    A 3-table Japanese schema mapped 6 of its 15 columns.
+
+    ASCII input mints exactly what it minted before, so every ontology induced
+    so far keeps its IRIs — ``customers`` → ``Customers``, ``order_items`` →
+    ``OrderItems``, ``ORDER ITEMS`` → ``OrderItems``.
+
+    Symbols are dropped rather than retained. The reason is not IRI legality —
+    ``℃``, ``™`` and ``€`` are all valid RFC 3987 ``ucschar`` and valid Turtle
+    ``PN_CHARS_BASE``. It is that Unicode category ``S`` also covers the ASCII
+    operators ``$ + < = > ^ ` | ~``, which have no place in a class name and which
+    the previous implementation stripped. Dropping the whole category keeps ASCII
+    output identical at the cost of leaving ``温度℃`` and ``温度`` colliding;
+    :func:`camel_names_for` resolves that collision for columns.
 
     Args:
         s: Input string (may contain spaces, underscores, or hyphens).
@@ -176,8 +234,19 @@ def to_pascal(s: str) -> str:
     Returns:
         The PascalCase form, or ``"Entity"`` if nothing usable remains.
     """
-    cleaned = re.sub(r"[^a-zA-Z0-9\s_\-]", "", s or "")
-    return "".join(w.capitalize() for w in re.split(r"[\s_\-]+", cleaned) if w) or "Entity"
+    folded = width_only_nfkc(s or "")
+    # Unify the separator class first: ``filter_letters_marks_numbers`` retains
+    # only letters/marks/numbers and (optionally) underscore, so whitespace and
+    # hyphens have to become underscores before filtering or the word boundaries
+    # are lost. ``\s`` covers the ideographic space, an ordinary word separator
+    # in Japanese and Chinese.
+    separated = re.sub(r"[\s\-]+", "_", folded)
+    cleaned = filter_letters_marks_numbers(separated, keep_underscore=True)
+    # ``str.capitalize`` lowercases the remainder of each word — that is the
+    # pre-existing contract (``ORDER ITEMS`` → ``OrderItems``) and is a no-op for
+    # caseless scripts. Recompose afterwards: casing can emit a combining mark.
+    pascal = "".join(word.capitalize() for word in re.split(r"_+", cleaned) if word)
+    return unicodedata.normalize("NFC", pascal) or "Entity"
 
 
 def to_camel(s: str) -> str:
@@ -207,6 +276,18 @@ def _name_discriminator(identity: str) -> str:
     identical in every consumer that mints IRIs for the same table.
     """
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:8]
+
+
+def pom_segment(column_local: str) -> str:
+    """PascalCase a deduped column local for use in a POM node IRI.
+
+    The POM node is an IRI in its own right, so it needs the same per-column
+    uniqueness as the predicate it carries. Deriving it from the deduped local
+    rather than re-deriving it from the raw column name is what keeps the two in
+    step — a POM node shared by two columns silently drops one mapping, because
+    the triples are then identical rather than merely similar.
+    """
+    return column_local[:1].upper() + column_local[1:]
 
 
 def table_identity(table: CatalogTable) -> str:
@@ -319,8 +400,8 @@ def pascal_names_for(tables: Iterable[CatalogTable]) -> dict[str, str]:
 
     assigned: dict[str, str] = {}
     taken: set[str] = set()
-    # Sorted so that a residual collision between one base and another base's
-    # discriminated form resolves the same way on every run.
+    # Sorted so that a residual collision (two identities whose discriminators
+    # share a SHA-256 prefix) resolves the same way on every run.
     for base in sorted(by_base):
         members = by_base[base]
         keeper = min(members)
@@ -332,9 +413,10 @@ def pascal_names_for(tables: Iterable[CatalogTable]) -> dict[str, str]:
                     extra={"table": identity, "collided_on": base, "minted": candidate},
                 )
             if candidate in taken:
-                # Pathological: the form is already taken (identities were deduped
-                # above, so this needs a genuine hash collision, or a base equal to
-                # another base's discriminated form). Widen until unique.
+                # Pathological: the form is already taken. Identities were deduped
+                # above and to_pascal never emits an underscore, so no base can equal
+                # another base's ``{base}_{sha8}`` form; this needs a genuine SHA-256
+                # prefix collision. Widen until unique.
                 candidate = f"{base}_{_name_discriminator(identity)}"
                 suffix = 2
                 while candidate in taken:
@@ -345,6 +427,73 @@ def pascal_names_for(tables: Iterable[CatalogTable]) -> dict[str, str]:
     # Returned in caller order: the assignment does not depend on it, but stable
     # iteration keeps logs and serialized artifacts diff-friendly.
     return {identity: assigned[identity] for identity in identities}
+
+
+def camel_names_for(table: CatalogTable) -> dict[str, str]:
+    """Map each column NAME of one table to a collision-free camelCase local name.
+
+    The column analogue of :func:`pascal_names_for`, and it exists for the same
+    reason: :func:`to_camel` is lossy, so two distinct columns can mint the same
+    local name. SQL guarantees column names are unique within a table, and the
+    ontology, the R2RML mapping and the SHACL shapes must therefore mint one
+    property per column — but nothing enforced that.
+
+    Retaining non-Latin letters removed the worst case (every column of a Japanese
+    table minting ``""``), not the general one. ``to_camel`` still drops Unicode
+    category ``S`` and every punctuation mark, so ``温度℃``/``温度``,
+    ``住所・氏名``/``住所氏名`` and ``会員（有効）``/``会員有効`` remain pairs that
+    collapse onto one name. That failure is SILENT in R2RML: the POM node is a
+    ``URIRef`` derived from the predicate, so the second column's mapping is not a
+    duplicate row that a reader would notice — it is the same triple, and rdflib
+    keeps one. The column simply stops being queryable.
+
+    Scope is one table, not the whole run: column names only have to be unique
+    within their table, and the emitted local name is already prefixed with the
+    table's own (run-unique) name by every caller.
+
+    Returns:
+        ``{column_name: unique_camelCase_local_name}`` covering every column, in
+        the table's column order.
+    """
+    names: list[str] = []
+    base_for: dict[str, str] = {}
+    for column in table.columns:
+        if column.name in base_for:
+            continue  # a catalog that repeats a column — one mapping is enough
+        names.append(column.name)
+        base_for[column.name] = to_camel(column.name)
+
+    by_base: dict[str, list[str]] = {}
+    for name in names:
+        by_base.setdefault(base_for[name], []).append(name)
+
+    assigned: dict[str, str] = {}
+    taken: set[str] = set()
+    # Sorted for the same reason as pascal_names_for: a residual collision (two
+    # names whose discriminators share a SHA-256 prefix) must resolve identically
+    # on every run, in every one of the three emitters.
+    for base in sorted(by_base):
+        members = by_base[base]
+        keeper = min(members)
+        for name in sorted(members):
+            candidate = base if name == keeper else f"{base}_{_name_discriminator(name)}"
+            if name != keeper:
+                log.warning(
+                    "column_name_collides_after_camel_case",
+                    extra={
+                        "table": table_identity(table),
+                        "column": name,
+                        "collided_on": base,
+                        "minted": candidate,
+                    },
+                )
+            suffix = 2
+            while candidate in taken:
+                candidate = f"{base}_{_name_discriminator(name)}_{suffix}"
+                suffix += 1
+            taken.add(candidate)
+            assigned[name] = candidate
+    return {name: assigned[name] for name in names}
 
 
 def reference_index(tables: Iterable[CatalogTable]) -> dict[str, str]:
@@ -1097,6 +1246,7 @@ class InductionStrategy(ABC):
         grounding_ontology_ids: list[str] | None = None,
         grounding_mode: str = "ENHANCED",
         cost_tracker: CostTracker | None = None,
+        namespace_language: str = DEFAULT_LANGUAGE,
     ) -> tuple[Graph, set[str], list[ConceptMatch], list[dict]]:
         """Run induction and return (proposal_graph, novel_tables, matches, dropped_tables).
 
@@ -1112,6 +1262,10 @@ class InductionStrategy(ABC):
         ``cost_tracker`` is an optional per-job Bedrock usage accumulator; when
         present the strategy threads it into every Bedrock seam (grounding
         rerank, LLM generate) so token/cost metrics are captured for the job.
+
+        ``namespace_language`` is the namespace's canonical language, resolved
+        once by the induction entry point. It never comes from a request or a
+        source record.
 
         ``dropped_tables`` is a list of dicts with ``table_name`` and ``reason``
         for tables that could not be processed. Empty for strategies that don't
@@ -1149,7 +1303,12 @@ class InductionStrategy(ABC):
         wrapped as a SQL-delimited identifier via :func:`sql_ident`. This
         preserves names exactly as they appear in the source datasource --
         spaces, mixed case, reserved words, special chars -- so the SQL Ontop
-        emits references the real columns without any reverse mapping.
+        emits references the real columns without any reverse mapping. Column
+        names containing a double quote are omitted because Ontop does not
+        resolve the SQL-doubled quote in R2RML column references. A table whose
+        primary key includes such a column gets no TriplesMap (its subject IRI
+        could not identify a row), and a relationship that cannot be joined
+        because of one is left unmapped rather than mapped as a literal.
         Class/property IRIs keep their readable PascalCase/camelCase form.
 
         Strategies whose output doesn't follow this naming convention
@@ -1163,6 +1322,32 @@ class InductionStrategy(ABC):
         g.bind("scl", SCL)
         g.bind("ind", ns)
         g.bind("xsd", XSD)
+
+        warned_unsupported_columns: set[tuple[str, str]] = set()
+
+        def _column_is_supported(table_name: str, column_name: str) -> bool:
+            if r2rml_column_name_supported(column_name):
+                return True
+            warning_key = (table_name, column_name)
+            if warning_key not in warned_unsupported_columns:
+                warned_unsupported_columns.add(warning_key)
+                log.warning(
+                    "r2rml_column_skipped_embedded_quote",
+                    extra={"table": table_name, "column": column_name},
+                )
+            return False
+
+        def _primary_key_columns(table: CatalogTable) -> list[str]:
+            for tc in table.tableConstraints or []:
+                if tc.constraintType == "PRIMARY_KEY" and tc.columns:
+                    return list(tc.columns)
+            return []
+
+        def _warn_relationship_unmapped(table: CatalogTable, column_name: str, target: str | None) -> None:
+            log.warning(
+                "r2rml_relationship_left_unmapped",
+                extra={"table": table.name, "column": column_name, "target": target},
+            )
 
         # Build a lookup from table identity → TriplesMap URI for parentTriplesMap
         # refs. Local names come from the collision-resolving helper, not bare
@@ -1188,23 +1373,64 @@ class InductionStrategy(ABC):
         # The path token instance IRIs are minted under. Same disambiguation, so two
         # same-named tables cannot mint one individual per PK value.
         subject_names = subject_template_names(tables)
+        safe_column_names_by_id: dict[str, list[str]] = {}
+        pk_columns_by_id: dict[str, list[str]] = {}
+        # Every in-run table's TriplesMap IRI, including tables that get no
+        # TriplesMap below: an FK must still resolve to its target to know the
+        # ontology declares an object property for it (see _parent_tmap).
         tmap_by_id: dict[str, URIRef] = {}
+        # The TriplesMaps actually emitted. A join may only point at one of these.
+        mapped_tmaps: set[URIRef] = set()
         for table in tables:
             identity = table_identity(table)
             tmap_by_id[identity] = ns[f"TriplesMap_{pascal_by_id[identity]}"]
+            safe_column_names_by_id[identity] = [
+                col.name for col in table.columns if _column_is_supported(table.name, col.name)
+            ]
+            pk_columns_by_id[identity] = _primary_key_columns(table)
+            if table.columns and not safe_column_names_by_id[identity]:
+                log.warning(
+                    "r2rml_table_skipped_no_supported_columns",
+                    extra={"table": table.name},
+                )
+                continue
+            unsupported_pk = [c for c in pk_columns_by_id[identity] if not _column_is_supported(table.name, c)]
+            if unsupported_pk:
+                # The subject IRI must be built from the WHOLE primary key. Dropping
+                # a component (or substituting another column) lets different rows
+                # mint the same individual, which silently merges them and skews
+                # every count, aggregate and per-entity property. Skip the table.
+                log.warning(
+                    "r2rml_table_skipped_unsupported_primary_key",
+                    extra={"table": table.name, "columns": unsupported_pk},
+                )
+                continue
+            mapped_tmaps.add(tmap_by_id[identity])
 
         def _parent_tmap(
             target_name: str, referrer: CatalogTable, target_datasource_id: str | None = None
         ) -> URIRef | None:
             """Resolve an FK target table name to its TriplesMap IRI.
 
-            Returns ``None`` when the target cannot be resolved to a single table,
-            so the caller emits a datatype literal instead of a join. A
-            cross-source FK carries ``target_datasource_id``;
-            :func:`resolve_fk_target_identity` keeps it inside THAT datasource.
+            Returns ``None`` when the target cannot be resolved to a single in-run
+            table, so the caller emits a datatype literal instead of a join (the
+            ontology declares a datatype property for it too). A cross-source FK
+            carries ``target_datasource_id``; :func:`resolve_fk_target_identity`
+            keeps it inside THAT datasource.
+
+            A resolved target is returned even when it gets no TriplesMap (see
+            ``mapped_tmaps``): the ontology still declares an object property for
+            the relationship, so the caller must leave it unmapped rather than map
+            the column as a literal.
             """
             target_id = resolve_fk_target_identity(referrer, target_name, ref_index, target_datasource_id)
             if target_id is not None and target_id in tmap_by_id:
+                # Never fall through to the bare fallback below for a resolved
+                # target, mapped or not: with a cross-source hint the resolver named
+                # THIS table, and the bare ``to_pascal`` IRI can be a same-named
+                # table in another datasource. ``ref_index`` covers every table in
+                # the run, skipped ones included, which is what lets the hinted
+                # lookup find a skipped target at all.
                 return tmap_by_id[target_id]
             if target_name in ambiguous_names:
                 # Two in-run tables answer to this name and the referrer's own
@@ -1231,13 +1457,16 @@ class InductionStrategy(ABC):
             )
             return None
 
-        def _pom(tmap: URIRef, col_name: str, suffix: str = "") -> tuple[URIRef, URIRef]:
+        def _pom(tmap: URIRef, column_local: str, suffix: str = "") -> tuple[URIRef, URIRef]:
             """Mint a predicate-object map + object map for a column.
 
-            ``suffix`` qualifies one of several maps on the same column (a column
-            carrying more than one relationship gets one map per target).
+            ``column_local`` is the column's deduped local from
+            :func:`camel_names_for`, so the POM node is as unique per column as
+            the predicate it carries (see :func:`pom_segment`). ``suffix``
+            qualifies one of several maps on the same column (a column carrying
+            more than one relationship gets one map per target).
             """
-            pom = URIRef(f"{tmap}/POM_{to_pascal(col_name)}{suffix}")
+            pom = URIRef(f"{tmap}/POM_{pom_segment(column_local)}{suffix}")
             g.add((tmap, RR.predicateObjectMap, pom))
             om = URIRef(f"{pom}/ObjectMap")
             g.add((pom, RR.objectMap, om))
@@ -1245,7 +1474,10 @@ class InductionStrategy(ABC):
 
         for table in tables:
             identity = table_identity(table)
+            safe_column_names = safe_column_names_by_id[identity]
             tmap = tmap_by_id[identity]
+            if tmap not in mapped_tmaps:
+                continue  # skipped above, with its warning
             table_cls = ns[pascal_by_id[identity]]
 
             g.add((tmap, RDF.type, RR.TriplesMap))
@@ -1254,24 +1486,23 @@ class InductionStrategy(ABC):
             g.add((tmap, RR.logicalTable, lt))
             g.add((lt, RR.tableName, Literal(logical_names[identity])))
 
-            pk_cols = []
-            if table.tableConstraints:
-                for tc in table.tableConstraints:
-                    if tc.constraintType == "PRIMARY_KEY" and tc.columns:
-                        pk_cols = tc.columns
-                        break
+            pk_cols = pk_columns_by_id[identity]
 
             # Build subject URI template from all PK columns to ensure uniqueness
-            # for composite PKs (e.g. {prefix}/table/{col1}/{col2}).
-            # Fall back to first column, then literal "ID".
+            # for composite PKs (e.g. {prefix}/table/{col1}/{col2}). Every PK
+            # column is supported here (a table with an unsupported one was
+            # skipped above). Without a PK, fall back to the first supported
+            # column, then literal "ID".
             if pk_cols:
                 pk_id = "/".join(f"{{{sql_ident(c)}}}" for c in pk_cols)
-            elif table.columns:
-                pk_id = f"{{{sql_ident(table.columns[0].name)}}}"
+            elif safe_column_names:
+                pk_id = f"{{{sql_ident(safe_column_names[0])}}}"
             else:
                 pk_id = "{ID}"
             subj = URIRef(f"{tmap}/SubjectMap")
             g.add((tmap, RR.subjectMap, subj))
+            # Deliberately the table name from subject_template_names (schema-qualified only on a
+            # collision), not the pascal_names_for class local: instance IRIs are published.
             template = f"{ontology_uri_prefix}{subject_names[identity]}/{pk_id}"
             g.add((subj, RR.template, Literal(template)))
             g.add((subj, RR["class"], table_cls))
@@ -1298,7 +1529,12 @@ class InductionStrategy(ABC):
                 for col_name in tc.columns
             }
 
+            column_locals = camel_names_for(table)
+
             for col in table.columns:
+                if col.name not in safe_column_names:
+                    continue
+
                 # A column absorbed into a sibling's composite-FK Referencing
                 # Object Map still gets its OWN datatype POM. The relationship is
                 # carried once (by the owning column's referencing map, per R2RML
@@ -1309,24 +1545,22 @@ class InductionStrategy(ABC):
                 # the ontology declares these columns as datatype properties (see
                 # composite_fk_columns).
                 if col.name in absorbed_columns:
-                    pom = URIRef(f"{tmap}/POM_{to_pascal(col.name)}")
+                    pom = URIRef(f"{tmap}/POM_{pom_segment(column_locals[col.name])}")
                     g.add((tmap, RR.predicateObjectMap, pom))
-                    g.add((pom, RR.predicate, ns[f"{camel_by_id[identity]}_{to_camel(col.name)}"]))
+                    g.add((pom, RR.predicate, ns[f"{camel_by_id[identity]}_{column_locals[col.name]}"]))
                     om = URIRef(f"{pom}/ObjectMap")
                     g.add((pom, RR.objectMap, om))
                     g.add((om, RR.column, Literal(sql_ident(col.name))))
                     g.add((om, RR.datatype, xsd_for_column(col.dataType, col.name)))
                     continue
 
-                base_local = f"{camel_by_id[identity]}_{to_camel(col.name)}"
+                base_local = f"{camel_by_id[identity]}_{column_locals[col.name]}"
 
                 # This column anchors a composite FK when the shared anchor table
                 # says so — never by re-deriving it here.
                 composite_fk = composite_anchors.get(col.name)
 
                 if composite_fk is not None and composite_fk.referredColumns:
-                    pom, om = _pom(tmap, col.name)
-                    g.add((pom, RR.predicate, ns[base_local]))
                     # Composite FK: emit a single Referencing Object Map for the
                     # entire relationship, with one joinCondition per column pair.
                     #
@@ -1349,13 +1583,45 @@ class InductionStrategy(ABC):
                         # Ambiguous target: no join to emit. Anchor the column as a
                         # literal so the mapping stays valid, matching what the
                         # ontology declares for the same column.
+                        pom, om = _pom(tmap, column_locals[col.name])
+                        g.add((pom, RR.predicate, ns[base_local]))
                         g.add((om, RR.column, Literal(sql_ident(col.name))))
                         g.add((om, RR.datatype, xsd_for_column(col.dataType, col.name)))
                         continue
-                    g.add((om, RR.parentTriplesMap, parent_tmap))
+                    join_pairs: list[tuple[str, str]] = []
+                    join_is_supported = parent_tmap in mapped_tmaps
                     for child_col, ref_col in zip(composite_fk.columns, composite_fk.referredColumns, strict=True):
-                        _, parsed_parent = parse_referred_column(ref_col)
+                        if not join_is_supported:
+                            break
+                        target_name, parsed_parent = parse_referred_column(ref_col)
                         parent_col = parsed_parent if parsed_parent is not None else ref_col
+                        if not _column_is_supported(table.name, child_col) or not _column_is_supported(
+                            target_name or fk_target, parent_col
+                        ):
+                            join_is_supported = False
+                            break
+                        join_pairs.append((child_col, parent_col))
+                    if not join_is_supported:
+                        if fk_edge_allowed(composite_fk.relationshipType, composite_fk.reviewStatus):
+                            # The ontology declares this column an owl:ObjectProperty
+                            # ranging over the parent class. A literal under that
+                            # predicate makes Ontop reject the namespace
+                            # (MappingOntologyMismatchException), so leave the
+                            # property unmapped: Ontop accepts an object property with
+                            # no mapping, and the absorbed columns keep their own
+                            # datatype maps above.
+                            _warn_relationship_unmapped(table, col.name, fk_target)
+                            continue
+                        # Withheld edge: the ontology declares a datatype property.
+                        pom, om = _pom(tmap, column_locals[col.name])
+                        g.add((pom, RR.predicate, ns[base_local]))
+                        g.add((om, RR.column, Literal(sql_ident(col.name))))
+                        g.add((om, RR.datatype, xsd_for_column(col.dataType, col.name)))
+                        continue
+                    pom, om = _pom(tmap, column_locals[col.name])
+                    g.add((pom, RR.predicate, ns[base_local]))
+                    g.add((om, RR.parentTriplesMap, parent_tmap))
+                    for child_col, parent_col in join_pairs:
                         jc = BNode()
                         g.add((om, RR.joinCondition, jc))
                         g.add((jc, RR.child, Literal(sql_ident(child_col))))
@@ -1367,7 +1633,7 @@ class InductionStrategy(ABC):
                     continue
 
                 if col.name in malformed_composite_columns:
-                    pom, om = _pom(tmap, col.name)
+                    pom, om = _pom(tmap, column_locals[col.name])
                     g.add((pom, RR.predicate, ns[base_local]))
                     # columns/referredColumns disagree in length, or the targets span
                     # several tables: no join can be derived, so the column degrades
@@ -1389,36 +1655,59 @@ class InductionStrategy(ABC):
                 # there. This is also where the review gate reaches the mapping: a
                 # PENDING/REJECTED inferred FK used to become a live Ontop join while
                 # the ontology withheld its edge.
-                resolved: list[tuple[URIRef, str, str | None]] = []  # (parent TriplesMap, parent column, target ds)
+                # (parent TriplesMap, parent column, target ds, join R2RML-supported)
+                resolved: list[tuple[URIRef, str, str | None, bool]] = []
                 for tc in simple_fk_constraints(table, col.name):
                     fk_target, fk_parent_col = parse_referred_column(tc.referredColumns[0])  # type: ignore[index]
                     parent_tmap = _parent_tmap(fk_target, table, tc.targetDatasourceId)
                     if parent_tmap is None:
                         continue  # ambiguous target: this relationship degrades (ontology does the same)
-                    resolved.append((parent_tmap, fk_parent_col, tc.targetDatasourceId))  # type: ignore[arg-type]
+                    # A join needs an emitted parent TriplesMap and an rr:parent Ontop
+                    # can resolve (no embedded quote). Checked per relationship so one
+                    # unjoinable relationship does not take the column's others down.
+                    parent_col_supported = _column_is_supported(fk_target, fk_parent_col)  # type: ignore[arg-type]
+                    join_supported = parent_tmap in mapped_tmaps and parent_col_supported
+                    resolved.append((parent_tmap, fk_parent_col, tc.targetDatasourceId, join_supported))  # type: ignore[arg-type]
 
-                if resolved:
+                # Qualifiers are computed over EVERY resolved relationship, including
+                # one whose join is skipped, so the surviving joins keep the
+                # property names the ontology and SHACL mint for them (those two
+                # artifacts do not apply the R2RML column guard).
+                joins = [r for r in resolved if r[3]]
+                if joins:
                     # Per-FK qualifiers computed once; identical rule in ontology + SHACL.
                     entries: list[tuple[str, str | None, str | None]] = [
                         (str(pt).rsplit("TriplesMap_", 1)[-1], fk_parent_col, tds)
-                        for pt, fk_parent_col, tds in resolved
+                        for pt, fk_parent_col, tds, _ in resolved
                     ]
                     qualifiers = fk_property_qualifiers(entries)
-                    for (parent_tmap, fk_parent_col, _), qualifier in zip(resolved, qualifiers, strict=True):
+                    for (parent_tmap, fk_parent_col, _, supported), qualifier in zip(resolved, qualifiers, strict=True):
+                        if not supported:
+                            continue
                         # Property/POM names must match the ontology's: plain for a
                         # single relationship, qualified per fk_property_qualifiers
                         # otherwise.
                         pom_suffix = f"__{qualifier}" if qualifier else ""
-                        pom, om = _pom(tmap, col.name, pom_suffix)
+                        pom, om = _pom(tmap, column_locals[col.name], pom_suffix)
                         g.add((pom, RR.predicate, ns[fk_property_local_name(base_local, qualifier)]))
                         g.add((om, RR.parentTriplesMap, parent_tmap))
                         jc = BNode()
                         g.add((om, RR.joinCondition, jc))
                         g.add((jc, RR.child, Literal(sql_ident(col.name))))
                         g.add((jc, RR.parent, Literal(sql_ident(fk_parent_col))))
+                elif resolved:
+                    # Every relationship resolved to an in-run table, so the ontology
+                    # declares each as an owl:ObjectProperty, but none can be joined.
+                    # Mapping the column as a literal under that predicate makes Ontop
+                    # reject the namespace (MappingOntologyMismatchException); leave
+                    # the properties unmapped instead.
+                    _warn_relationship_unmapped(
+                        table, col.name, ", ".join(str(pt).rsplit("TriplesMap_", 1)[-1] for pt, *_ in resolved)
+                    )
                 else:
                     # Non-FK (or every FK withheld/unresolvable): datatype ObjectMap
-                    pom, om = _pom(tmap, col.name)
+                    # of the child column, as the ontology declares it.
+                    pom, om = _pom(tmap, column_locals[col.name])
                     g.add((pom, RR.predicate, ns[base_local]))
                     g.add((om, RR.column, Literal(sql_ident(col.name))))
                     dt = xsd_for_column(col.dataType, col.name)

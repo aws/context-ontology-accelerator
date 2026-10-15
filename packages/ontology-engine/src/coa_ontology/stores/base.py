@@ -21,6 +21,8 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
+from coa_common.label_language import LabelPreference
+
 # ── Vector store ────────────────────────────────────────────────────────
 
 
@@ -78,8 +80,14 @@ class VectorStore(Protocol):
         entity_type: str | None = None,
         embedding_type: str | None = None,
         namespace: str | None = None,
+        limit: int | None = None,
     ) -> list[dict]:
-        """Return all embeddings attached to an ontology."""
+        """Return embeddings attached to an ontology.
+
+        ``limit`` is an explicit caller-side ceiling. Implementations must
+        honor it before transferring result rows so bounded metadata consumers
+        do not accidentally enumerate an entire vector index.
+        """
         ...
 
     def list_searchable_entity_uris(
@@ -149,7 +157,9 @@ class VectorStore(Protocol):
     ) -> int:
         """Drop every embedding whose ``entity_uri`` is in ``entity_uris`` within a single ontology.
 
-        Returns the deleted count.
+        Returns the deleted count. Raises when it cannot remove them all: append
+        ingest relies on that to fail an accept instead of leaving the stale
+        embedding searchable beside the new one.
 
         Used by append-mode ingest right before it re-embeds the subjects of an
         incoming proposal: a class whose description a steward replaced must not
@@ -335,6 +345,8 @@ class GraphStore(Protocol):
         self,
         vertex_uri: str,
         namespace: str | None = None,
+        *,
+        label_preference: LabelPreference | None = None,
     ) -> dict | None:
         """Return ``vertex_uri``'s outgoing triples + neighbor metadata.
 
@@ -376,6 +388,8 @@ class GraphStore(Protocol):
         exclude_ontology_id: str | None = None,
         limit: int = 50,
         offset: int = 0,
+        *,
+        label_preference: LabelPreference | None = None,
     ) -> list[dict]:
         """Substring search over entity IRIs and labels in a namespace.
 
@@ -408,6 +422,7 @@ class GraphStore(Protocol):
         namespace: str | None = None,
         *,
         sample: bool = False,
+        label_preference: LabelPreference | None = None,
     ) -> dict | None:
         """Return every class and property persisted in one ontology's graph.
 
@@ -444,6 +459,7 @@ class GraphStore(Protocol):
         *,
         max_results: int = 100,
         include_properties: bool = True,
+        label_preference: LabelPreference | None = None,
     ) -> dict:
         """List all classes and properties across all ontologies in a namespace.
 

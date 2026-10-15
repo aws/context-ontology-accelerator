@@ -5,8 +5,56 @@
 
 from __future__ import annotations
 
+import hashlib
+
+import pytest
 from coa_common.domain_models import BusinessMetadata, Column
-from coa_sources.database.enrichment.prompts import SYSTEM_PROMPT, build_user_prompt
+from coa_sources.database.enrichment.prompts import SYSTEM_PROMPT, build_system_prompt, build_user_prompt
+
+# sha256 of SYSTEM_PROMPT as it stands on main before namespace language existed.
+# An English namespace must send exactly these bytes.
+_MAIN_SYSTEM_PROMPT_SHA256 = "09819b04302a90e6f8ddfd41d8b22103382d26aa48c2aa1c7711122b547e6d18"
+
+
+class TestBuildSystemPrompt:
+    @pytest.mark.parametrize("language", ["en", "en-US", "en-GB"])
+    def test_english_namespace_prompt_is_byte_identical_to_main(self, language) -> None:
+        prompt = build_system_prompt(language)
+        assert prompt == SYSTEM_PROMPT
+        assert hashlib.sha256(prompt.encode()).hexdigest() == _MAIN_SYSTEM_PROMPT_SHA256
+
+    def test_japanese_namespace_appends_fixed_instruction(self) -> None:
+        prompt = build_system_prompt("ja")
+        assert prompt.startswith(SYSTEM_PROMPT)
+        instruction = prompt[len(SYSTEM_PROMPT) :]
+        assert "Output language:" in instruction
+        assert (
+            "Write every newly generated description, synonym, glossary term, and tag in "
+            "Japanese (BCP 47 tag `ja`)." in instruction
+        )
+        # Identifiers and existing source/steward text are never translated or regenerated.
+        assert "Do not translate or transliterate them" in instruction
+        assert "Reproduce existing metadata and source comments unchanged" in instruction
+
+    def test_japanese_instruction_excludes_english_translations_from_synonyms(self) -> None:
+        # A ja scan of Japanese-named columns (設備id, 設備区分) returned English
+        # snake_case synonyms (equipment_id, equipment_type) next to Japanese ones.
+        instruction = build_system_prompt("ja")[len(SYSTEM_PROMPT) :]
+        assert "A synonym is another name a business user would use in Japanese (BCP 47 tag `ja`)." in instruction
+        assert "Do not add an English translation of a table or column name" in instruction
+        assert "(such as a snake_case name), as a synonym" in instruction
+        # Source-used abbreviations and codes are still allowed verbatim.
+        assert "An abbreviation or code that the source itself uses may stay as written." in instruction
+
+    def test_instruction_interpolates_only_the_canonical_tag(self) -> None:
+        assert "Japanese (BCP 47 tag `ja-JP`)" in build_system_prompt(" JA-jp ")
+        assert " JA-jp " not in build_system_prompt(" JA-jp ")
+
+    def test_user_prompt_carries_no_language_instruction(self) -> None:
+        # The instruction is trusted control text; the guardrail-screened user
+        # message holds only schema and source-provided content.
+        user = build_user_prompt("t", "db", [Column(name="型番", data_type="string")])
+        assert "Output language" not in user
 
 
 class TestBuildUserPrompt:

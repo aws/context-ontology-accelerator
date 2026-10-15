@@ -19,6 +19,11 @@ Environment variables:
     DOC_SOURCE_ID            — doc-source identifier (DDB sort key)
     NAMESPACE_ID             — namespace / tenant identifier (DDB partition key)
     STAGING_PREFIX           — S3 prefix containing pre-processed text + metadata sidecars
+    NAMESPACE_LANGUAGE       — canonical namespace-language snapshot resolved by the
+                               Sources API when the ingestion was triggered. Never
+                               re-read from the namespace; a non-``en`` value adds a
+                               fixed output-language instruction to the proposition
+                               and topic extraction prompts.
 
   Optional:
     EXTRACTION_MODE          — "continuous" (default) or "separated"
@@ -101,9 +106,12 @@ from coa_common.constants import (
 )
 from coa_common.dao import DynamoDBDAO
 from coa_common.embeddings import make_llama_index_embedding
+from coa_common.language_tags import describe_language, needs_language_instruction
 from coa_common.logging import setup_logging
 from coa_common.s3 import get_s3_client, list_objects, read_file_bytes
 from coa_control_plane_server.models.source_status import SourceStatus
+
+from coa_sources.namespace_language import NAMESPACE_LANGUAGE_ENV, require_language_snapshot
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -639,6 +647,113 @@ def _patch_graphrag_llm_cache_client_config() -> None:
     _graphrag_llm_client_patched = True
 
 
+# Where the language instruction goes in each toolkit prompt: immediately before
+# the first block that carries document-derived (untrusted) content, so it stays
+# with the trusted instructions and never inside the data the model is told to
+# read. Keyed by the ExtractionConfig parameter the rewritten template feeds.
+_LANGUAGE_INSTRUCTION_ANCHORS: dict[str, tuple[str, str]] = {
+    "extract_propositions_prompt_template": ("EXTRACT_PROPOSITIONS_PROMPT", "<sourceInformation>"),
+    "extract_topics_prompt_template": ("EXTRACT_TOPICS_PROMPT", "<propositions>"),
+}
+
+# The same rule for the entity-classification inference sweep, keyed by the
+# InferClassificationsConfig parameter: the instruction goes ahead of the sample
+# chunks the model reads. The toolkit's ranking prompt is not listed because
+# InferClassificationsConfig has no field for it and LexicalGraphIndex does not
+# pass one to InferClassifications.
+_CLASSIFICATION_LANGUAGE_INSTRUCTION_ANCHORS: dict[str, tuple[str, str]] = {
+    "prompt_template": ("DOMAIN_ENTITY_CLASSIFICATIONS_PROMPT", "Sample text chunks:"),
+}
+
+
+def _extraction_language_instruction(namespace_language: str) -> str:
+    """Fixed output-language instruction for the GraphRAG extraction prompts.
+
+    Only the canonical tag and a name from a fixed table are interpolated. The
+    text contains no braces: the toolkit renders these templates with
+    ``str.format``.
+    """
+    target = describe_language(namespace_language)
+    return f"""# Output Language (REQUIRED)
+
+Write your output in {target}, the language of this knowledge graph.
+
+- Write every title, proposition, topic, entity, classification, relationship and \
+attribute name you produce in that language, using the words the source text itself \
+uses. Do not translate them into English and do not append an English gloss.
+- Where these instructions ask for relationship or attribute names in uppercase with \
+underscores (for example WORKS_FOR), that rule sets the format, not the language: write \
+each such name in the output language. Uppercase applies only to letters that have case, \
+and an underscore stands only where the name would otherwise contain a space.
+- When a preferred topic or entity-classification list is provided in English, treat \
+each entry as a concept, not a spelling: name the matching concept in the output language.
+- Copy identifiers exactly as printed, whatever script they use: model, type, part, \
+drawing and option numbers; standard and regulation designations; company, brand and \
+product names; signal and terminal names; units; codes and IRIs. An identifier that is \
+ASCII in the source stays ASCII.
+- These instructions are in English for your benefit. Do not echo them, and do not \
+treat them as evidence about the language of the output.
+
+"""
+
+
+def _language_instructed_templates(anchors: dict[str, tuple[str, str]], namespace_language: str) -> dict[str, str]:
+    """Toolkit templates from ``anchors`` with the language instruction inserted.
+
+    Empty for a namespace whose primary subtag is ``en``. Otherwise each listed
+    toolkit template gains the fixed instruction immediately before its anchor.
+
+    Raises:
+        RuntimeError: If a toolkit template no longer contains its anchor, so a
+            toolkit upgrade cannot silently move the instruction into (or drop
+            it from) the document-content portion.
+    """
+    if not needs_language_instruction(namespace_language):
+        return {}
+
+    from graphrag_toolkit.lexical_graph.indexing import prompts
+
+    instruction = _extraction_language_instruction(namespace_language)
+    overrides: dict[str, str] = {}
+    for parameter, (template_name, anchor) in anchors.items():
+        template: str = getattr(prompts, template_name)
+        position = template.find(anchor)
+        if position < 0:
+            raise RuntimeError(
+                f"graphrag-toolkit {template_name} has no {anchor} block to anchor the language instruction"
+            )
+        overrides[parameter] = template[:position] + instruction + template[position:]
+    return overrides
+
+
+def _namespace_language_prompts(namespace_language: str) -> dict[str, str]:
+    """ExtractionConfig prompt overrides for a namespace language.
+
+    Empty for a namespace whose primary subtag is ``en``: English and legacy
+    namespaces keep the toolkit prompts unchanged. Otherwise both the
+    proposition and topic templates gain the fixed instruction, placed ahead of
+    their document-content blocks.
+
+    Raises:
+        RuntimeError: If a toolkit template no longer contains its anchor.
+    """
+    return _language_instructed_templates(_LANGUAGE_INSTRUCTION_ANCHORS, namespace_language)
+
+
+def _classification_inference_prompts(namespace_language: str) -> dict[str, str]:
+    """InferClassificationsConfig prompt override for a namespace language.
+
+    Empty for a namespace whose primary subtag is ``en``. Otherwise the
+    toolkit's domain-classification inference template gains the fixed
+    instruction ahead of its sample chunks, so the inferred class vocabulary is
+    named in the namespace language.
+
+    Raises:
+        RuntimeError: If the toolkit template no longer contains its anchor.
+    """
+    return _language_instructed_templates(_CLASSIFICATION_LANGUAGE_INSTRUCTION_ANCHORS, namespace_language)
+
+
 _graphrag_aoss_patched = False
 
 
@@ -1084,7 +1199,7 @@ def _setup_graphrag(tenant_id: str):
     return graph_store_uri, vector_store_uri
 
 
-def _build_indexing_config(bucket_name: str, namespace_id: str, doc_source_id: str):
+def _build_indexing_config(bucket_name: str, namespace_id: str, doc_source_id: str, *, namespace_language: str):
     """Build the IndexingConfig handed to LexicalGraphIndex.
 
     ALWAYS returns an IndexingConfig with a fully-specified ExtractionConfig —
@@ -1151,8 +1266,13 @@ def _build_indexing_config(bucket_name: str, namespace_id: str, doc_source_id: s
         # seed with what it derives from THIS corpus, so the final vocabulary
         # is entirely corpus-driven. Leaving the argument unset would have
         # fallen back to the news/finance list — the exact bug this fixes.
+        # A non-English namespace also passes the inference prompt with the
+        # language instruction; an English one passes no template, as before.
         preferred = []
-        infer_config = InferClassificationsConfig(replace_default_classifications=True)
+        infer_config = InferClassificationsConfig(
+            replace_default_classifications=True,
+            **_classification_inference_prompts(namespace_language),
+        )
     else:
         # Both off → unguided extraction. Logged loudly, since this is the
         # only configuration where the LLM types entities from scratch.
@@ -1168,11 +1288,16 @@ def _build_indexing_config(bucket_name: str, namespace_id: str, doc_source_id: s
     # entity IS. An empty list is passed through unchanged — the toolkit reads it
     # as "no preferred topics", the extractor names them from the chunk text, and
     # behaviour matches every ingest before this field existed.
+    #
+    # A non-English namespace also overrides the proposition and topic prompt
+    # templates with the fixed language instruction; an English one passes no
+    # template arguments, exactly as before.
     extraction_config = ExtractionConfig(
         enable_proposition_extraction=ENABLE_PROPOSITION_EXTRACTION,
         preferred_entity_classifications=preferred,
         infer_entity_classifications=infer_config,
         preferred_topics=PREFERRED_TOPICS,
+        **_namespace_language_prompts(namespace_language),
     )
 
     # --- Chunking ---
@@ -1212,6 +1337,7 @@ def _build_indexing_config(bucket_name: str, namespace_id: str, doc_source_id: s
 
     logger.info(
         "Extraction config built",
+        namespace_language=namespace_language,
         proposition_extraction=ENABLE_PROPOSITION_EXTRACTION,
         preferred_entity_classifications_count=len(preferred),
         infer_entity_classifications=bool(infer_config),
@@ -1473,10 +1599,6 @@ def main() -> None:
         logger.error("Input validation failed", error=str(exc))
         sys.exit(1)
 
-    logger.info(
-        "KG Build Task started", doc_source_id=doc_source_id, namespace_id=namespace_id, staging_prefix=staging_prefix
-    )
-
     ddb = DynamoDBDAO(ddb_table, region=AWS_REGION)
     ddb_key = {"PK": f"NS#{namespace_id}", "SK": f"SRC#{doc_source_id}"}
 
@@ -1485,6 +1607,24 @@ def main() -> None:
     if item and item.get("status") == SourceStatus.COMPLETED:
         logger.info("Doc source already completed, skipping")
         return
+
+    # The job's namespace-language snapshot. A missing or invalid value fails the
+    # build rather than defaulting to English or re-reading the namespace;
+    # re-scanning the source resolves the language again.
+    try:
+        namespace_language = require_language_snapshot(os.environ.get(NAMESPACE_LANGUAGE_ENV))
+    except ValueError as exc:
+        logger.error("Namespace language snapshot invalid", error=str(exc))
+        ddb.update(ddb_key, {"status": SourceStatus.SCAN_FAILED, "errorMessage": f"SCAN_FAILED_CONFIG: {exc}"})
+        sys.exit(1)
+
+    logger.info(
+        "KG Build Task started",
+        doc_source_id=doc_source_id,
+        namespace_id=namespace_id,
+        namespace_language=namespace_language,
+        staging_prefix=staging_prefix,
+    )
 
     # 1. Load. A listing failure raises (transient S3/IAM error must not look
     # like "empty prefix") → mark SCAN_FAILED and exit non-zero. load_failed is
@@ -1518,7 +1658,9 @@ def main() -> None:
 
     # 2. Setup
     graph_store_uri, vector_store_uri = _setup_graphrag(tenant_id)
-    indexing_config = _build_indexing_config(bucket_name, namespace_id, doc_source_id)
+    indexing_config = _build_indexing_config(
+        bucket_name, namespace_id, doc_source_id, namespace_language=namespace_language
+    )
 
     # Build the progress monitor. The toolkit invokes its increment_* methods at
     # document boundaries (single-threaded, main process), and each call atomic-

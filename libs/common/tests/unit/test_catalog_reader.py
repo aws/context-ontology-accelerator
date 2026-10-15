@@ -163,3 +163,47 @@ class TestReadApprovedCatalogKeySchema:
 
         assert result == {"namespaceId": "ns-uuid", "sources": []}
         mock_read_assets.assert_not_called()
+
+
+@pytest.mark.unit
+class TestInductionFormatGeneratedFields:
+    """The induction projection carries the field-level generated-text proof."""
+
+    def test_table_and_column_generated_fields_are_projected(self):
+        from coa_common.domain_models import BusinessMetadata, Column, ReviewStatus, Table
+        from coa_common.metadata_store.catalog_reader import _table_to_induction_format
+
+        table = Table(
+            name="orders",
+            database="shop",
+            business_metadata=BusinessMetadata(
+                description="注文",
+                synonyms=["受注"],
+                review_status=ReviewStatus.APPROVED,
+                generated_fields=["description", "synonyms"],
+            ),
+            columns=[
+                Column(
+                    name="amount",
+                    data_type="int",
+                    business_metadata=BusinessMetadata(
+                        description="金額",
+                        review_status=ReviewStatus.APPROVED,
+                        generated_fields=["description"],
+                    ),
+                ),
+                Column(
+                    name="note",
+                    data_type="varchar",
+                    business_metadata=BusinessMetadata(description="steward text", review_status=ReviewStatus.APPROVED),
+                ),
+            ],
+        )
+
+        projected = _table_to_induction_format(table)
+
+        assert projected["businessMetadata"]["generatedFields"] == ["description", "synonyms"]
+        by_name = {c["name"]: c for c in projected["columns"]}
+        assert by_name["amount"]["businessMetadata"]["generatedFields"] == ["description"]
+        # No proof recorded: an empty set, which proves nothing.
+        assert by_name["note"]["businessMetadata"]["generatedFields"] == []

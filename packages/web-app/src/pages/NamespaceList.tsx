@@ -31,6 +31,7 @@ import {
   NamespaceSummary,
 } from "@api-hooks";
 import { NamespaceStatus } from "@coa/control-plane-client";
+import { formatNamespaceLanguage } from "@utils";
 
 const PAGE_SIZE_OPTIONS = [
   { value: 10, label: "10 namespaces" },
@@ -40,6 +41,7 @@ const PAGE_SIZE_OPTIONS = [
 
 const COLUMNS = [
   { id: "name", label: "Namespace", alwaysVisible: true },
+  { id: "language", label: "Language" },
   { id: "sources", label: "Sources" },
   { id: "status", label: "Status" },
   { id: "createdAt", label: "Created" },
@@ -122,6 +124,12 @@ const COLUMN_DEFINITIONS: TableProps.ColumnDefinition<NamespaceSummary>[] = [
     sortingField: "displayName",
     isRowHeader: true,
     cell: (item) => item.displayName ?? item.name ?? "-",
+  },
+  {
+    id: "language",
+    header: "Language",
+    sortingField: "language",
+    cell: (item) => formatNamespaceLanguage(item.language),
   },
   {
     id: "sources",

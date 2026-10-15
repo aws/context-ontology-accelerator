@@ -116,7 +116,11 @@ def _put_artifact_s3(namespace: str, proposal_id: str, artifact: str, content: s
 
 def _get_artifact_s3(namespace: str, proposal_id: str, artifact: str, version: str = "latest") -> str | None:
     """Retrieve artifact content from S3."""
-    key = _proposal_s3_key(namespace, proposal_id, artifact, version)
+    return _get_s3_text(_proposal_s3_key(namespace, proposal_id, artifact, version))
+
+
+def _get_s3_text(key: str) -> str | None:
+    """Retrieve a UTF-8 text object by its authoritative stored key."""
     try:
         resp = _get_s3().get_object(Bucket=_S3_BUCKET, Key=key)
         return resp["Body"].read().decode("utf-8")
@@ -133,13 +137,15 @@ def presign_proposal_artifact(
     artifact: str = "ontology",
     version: str = "latest",
     expires_in: int = 3600,
+    *,
+    s3_key: str | None = None,
 ) -> str | None:
     """Presigned S3 GET URL for a proposal Turtle artifact (``None`` if absent).
 
     Lets the browser fetch large Turtle directly from S3, bypassing the 6 MB
     API Gateway / Lambda response cap.
     """
-    key = _proposal_s3_key(namespace, proposal_id, artifact, version)
+    key = s3_key or _proposal_s3_key(namespace, proposal_id, artifact, version)
     s3 = _get_s3()
     try:
         s3.head_object(Bucket=_S3_BUCKET, Key=key)
@@ -166,22 +172,25 @@ def presign_proposal_artifact_put(
     version: str = "latest",
     expires_in: int = 600,
 ) -> str:
-    """Presigned S3 PUT URL for uploading a proposal Turtle artifact.
+    """Presign a create-only S3 PUT for one proposal artifact key.
 
-    The mirror of :func:`presign_proposal_artifact`: lets the browser upload a
-    large edited ontology / R2RML directly to S3, bypassing the 6 MB API
-    Gateway / Lambda *request* cap (the inverse of the read-path response cap).
+    The mirror of :func:`presign_proposal_artifact` lets the browser upload a
+    large edited ontology or R2RML artifact directly to S3, bypassing the 6 MB
+    API Gateway and Lambda request cap.
 
-    The target key is the same deterministic ``latest`` key the read path
-    serves, so a subsequent ``get_proposal`` presigns exactly the bytes just
-    uploaded. ``Content-Type`` is intentionally left out of the signature so
-    the browser may send any value (the bucket uses SSE-S3, which needs no
-    extra signed headers).
+    ``IfNoneMatch="*"`` is part of the signature, so callers must send
+    ``If-None-Match: *``. S3 accepts only the first object creation at the key;
+    a conflicting write returns 409 or 412 and must not be treated as success.
+    ``Content-Type`` remains unsigned so callers may send ``text/turtle``.
+
+    Callers should pass a fresh revision as ``version``. ``latest`` remains for
+    backward-compatible internal callers, but it cannot overwrite an existing
+    key under this create-only contract.
     """
     key = _proposal_s3_key(namespace, proposal_id, artifact, version)
     return _get_s3().generate_presigned_url(
         "put_object",
-        Params={"Bucket": _S3_BUCKET, "Key": key},
+        Params={"Bucket": _S3_BUCKET, "Key": key, "IfNoneMatch": "*"},
         ExpiresIn=expires_in,
     )
 
@@ -1048,7 +1057,7 @@ def _matches_json_default(o):
     raise TypeError(f"Object of type {type(o).__name__} is not JSON serializable")
 
 
-def _proposal_matches_s3_key(namespace: str, proposal_id: str) -> str:
+def _proposal_matches_s3_key(namespace: str, proposal_id: str, version: str = "latest") -> str:
     """S3 key for a proposal's offloaded ``matches.json``.
 
     Distinct from ``_proposal_s3_key`` (which is Turtle-only, suffixing
@@ -1057,10 +1066,15 @@ def _proposal_matches_s3_key(namespace: str, proposal_id: str) -> str:
     (``get_proposal_by_id``) and the presign (``presign_proposal_matches``) can
     never drift.
     """
-    return f"{_S3_PROPOSALS_PREFIX}/{namespace}/{proposal_id}/latest/matches.json"
+    return f"{_S3_PROPOSALS_PREFIX}/{namespace}/{proposal_id}/{version}/matches.json"
 
 
-def put_proposal_matches_s3(proposal_id: str, matches: list, namespace: str = DEFAULT_NAMESPACE) -> str:
+def put_proposal_matches_s3(
+    proposal_id: str,
+    matches: list,
+    namespace: str = DEFAULT_NAMESPACE,
+    version: str = "latest",
+) -> str:
     """Offload a proposal's grounding ``matches`` to S3 and return the key.
 
     ``matches`` (with candidates + definitions) routinely exceed the DynamoDB
@@ -1072,7 +1086,7 @@ def put_proposal_matches_s3(proposal_id: str, matches: list, namespace: str = DE
     """
     import json as _json
 
-    key = _proposal_matches_s3_key(namespace, proposal_id)
+    key = _proposal_matches_s3_key(namespace, proposal_id, version)
     _get_s3().put_object(
         Bucket=_S3_BUCKET,
         Key=key,
@@ -1086,6 +1100,8 @@ def presign_proposal_matches(
     namespace: str,
     proposal_id: str,
     expires_in: int = 3600,
+    *,
+    s3_key: str | None = None,
 ) -> str | None:
     """Presigned S3 GET URL for a proposal's ``matches.json`` (``None`` if absent).
 
@@ -1097,7 +1113,7 @@ def presign_proposal_matches(
     (all-novel inductions skip the write; pre-offload legacy proposals carry the
     list inline instead), so the caller can fall back accordingly.
     """
-    key = _proposal_matches_s3_key(namespace, proposal_id)
+    key = s3_key or _proposal_matches_s3_key(namespace, proposal_id)
     s3 = _get_s3()
     try:
         s3.head_object(Bucket=_S3_BUCKET, Key=key)
@@ -1238,9 +1254,9 @@ def get_proposal_by_id(
     # that only need metadata (e.g. the detail endpoint, which serves the
     # Turtle out-of-band via a presigned S3 URL rather than inlining it).
     if hydrate_turtle and item.get("ontology_s3_key"):
-        item["ontology_turtle"] = _get_artifact_s3(namespace, proposal_id, "ontology") or ""
+        item["ontology_turtle"] = _get_s3_text(item["ontology_s3_key"]) or ""
     if hydrate_turtle and item.get("r2rml_s3_key"):
-        item["r2rml_turtle"] = _get_artifact_s3(namespace, proposal_id, "r2rml") or ""
+        item["r2rml_turtle"] = _get_s3_text(item["r2rml_s3_key"]) or ""
     # Hydrate matches from S3
     if hydrate_matches and item.get("matches_s3_key") and not (item.get("metadata", {}) or {}).get("matches"):
         try:
@@ -1277,12 +1293,12 @@ def list_proposals(
     source_type: str | None = None,
     limit: int | None = 50,
 ) -> list[dict]:
-    """Scan proposals with optional filters.
+    """Scan proposals with optional filters, newest first.
 
-    ``limit`` caps the number of matching items returned. Pass ``limit=None``
-    to drain ALL matches (paginating the scan to exhaustion) — used by cleanup
-    paths that must not silently truncate (e.g. deleting every proposal
-    grounded against an ontology). ``source_type`` filter semantics (added in
+    Results are ordered newest first by ``created_at``, and ``limit`` keeps the
+    NEWEST ``limit`` matches. Pass ``limit=None`` to return ALL matches — used
+    by cleanup paths that must not silently truncate (e.g. deleting every
+    proposal grounded against an ontology). ``source_type`` filter semantics (added in
     the unstructured-induction-api wiring):
       - ``None`` (default): no filter on source_type — every proposal
         regardless of source type is returned.
@@ -1332,17 +1348,25 @@ def list_proposals(
     if names:
         kwargs["ExpressionAttributeNames"] = names
 
-    # Paginate the scan to collect matching items. DynamoDB Limit caps items
-    # evaluated (not returned), so a single scan page may return fewer matches
-    # than requested. ``limit=None`` drains every matching item (no cap).
+    if limit is not None and limit <= 0:
+        return []
+
+    # Drain the scan, then keep the newest ``limit`` matches. A Scan returns
+    # items in no useful order, so stopping at the first ``limit`` matches gave
+    # an arbitrary subset once a namespace held more than ``limit`` of them —
+    # a caller asking for the latest induction could get only older ones.
+    # Draining costs nothing extra in the common case: with fewer than
+    # ``limit`` matches the old loop scanned the whole table anyway.
     items: list[dict] = []
-    while limit is None or len(items) < limit:
+    while True:
         resp = _get_table().scan(**kwargs)
         items.extend(resp.get("Items", []))
         last_key = resp.get("LastEvaluatedKey")
         if not last_key:
             break
         kwargs["ExclusiveStartKey"] = last_key
+    # ISO-8601 UTC strings sort chronologically; a row without one sorts last.
+    items.sort(key=lambda i: str(i.get("created_at") or ""), reverse=True)
     return items if limit is None else items[:limit]
 
 

@@ -20,6 +20,8 @@ from typing import TYPE_CHECKING, Any
 import structlog
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from coa_common.constants import validate_query_text
+from coa_common.label_language import LabelPreference
+from coa_common.language_tags import LanguageTagError
 from coa_common.logging import setup_logging
 from pydantic import ValidationError
 
@@ -40,6 +42,7 @@ from .exceptions import (
 from .guardrail_config import GuardrailConfigProvider, build_guardrail_config_provider
 from .identity import extract_jwt_identity, resolve_principal, resolve_user_id
 from .models import InvokeRequest, TraceStep
+from .namespace_language import bind_label_preference
 from .orchestrator import Orchestrator
 from .role_resolver import ResolvedProfile, resolve_profile
 from .session import SessionManager
@@ -881,6 +884,36 @@ async def _handle_streaming_query(payload: dict, request, request_id: str, sessi
         yield emitter.format_error("InternalError", "Query resolution failed", 500)
 
 
+async def _bind_namespace_label_preference(
+    namespace: str, namespace_present: bool | None, request_id: str
+) -> dict | None:
+    """Resolve the namespace language once and bind this request's label preference.
+
+    Readers choose display labels from the namespace's immutable language
+    (namespace-language LLD §2.2.5). The existence gate has just read the
+    namespace item, so the registry answers from that read. When the item is
+    missing or unreadable the request fails closed rather than reading as
+    English; only a deployment with no namespaces table at all (existence could
+    not be checked, ``namespace_present is None``) proceeds untagged-first.
+
+    Returns:
+        ``None`` on success, else the error payload to yield.
+    """
+    from .clients.sources_registry import NamespaceLanguageUnavailableError
+
+    if _sources_registry is None or namespace_present is not True:
+        bind_label_preference(LabelPreference.untagged_first())
+        return None
+    try:
+        language = await _sources_registry.namespace_language(namespace)
+        preference = LabelPreference.untagged_first() if language is None else LabelPreference.for_namespace(language)
+    except (NamespaceLanguageUnavailableError, LanguageTagError):
+        logger.warning("namespace_language_unavailable_fail_closed", namespace=namespace, request_id=request_id)
+        return DataSourceUnavailableError("Unable to read namespace language").to_dict(request_id)
+    bind_label_preference(preference)
+    return None
+
+
 async def _authorize_namespace_access(
     namespace: str,
     jwt_user_id: str,
@@ -1089,6 +1122,10 @@ async def invoke(payload: dict, context=None):
         if namespace_present is None and _sources_registry.namespaces_configured:
             logger.warning("namespace_exists_indeterminate_fail_closed", namespace=namespace, request_id=request_id)
             yield DataSourceUnavailableError("Unable to verify namespace").to_dict(request_id)
+            return
+        language_error = await _bind_namespace_label_preference(namespace, namespace_present, request_id)
+        if language_error is not None:
+            yield language_error
             return
 
     # ── Namespace admission gate (Cedar) ───────────────────────────────────

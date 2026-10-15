@@ -266,7 +266,7 @@ class TestDispatchBuildsValidGraphArn:
         )
         req = MagicMock()
         req.app.state.config = config
-        with patch("coa_ontology.inducer.routers.induce_unstructured.start_induction") as mock_unstr:
+        with patch("coa_ontology.inducer.routers.induce_unstructured.start_unstructured_job") as mock_unstr:
             mock_unstr.return_value = SimpleNamespace(job_id="j", status="pending")
             start_induction(body=body, request=req, namespace="550e8400-e29b-41d4-a716-446655440003")
             mock_unstr.assert_called_once()

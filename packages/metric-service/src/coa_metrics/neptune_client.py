@@ -310,6 +310,12 @@ class MetricNeptuneClient:
         # Batch resolution via VALUES clause. Query/response failures must
         # propagate so callers do not checkpoint a definition with silently
         # dropped ontology links during a Neptune outage.
+        #
+        # Labels match by lexical form: a concept "空調設備" must resolve a class
+        # labelled "空調設備"@ja. Joining the plain VALUES literal on
+        # ``rdfs:label ?label`` directly would compare RDF terms, and a
+        # language-tagged literal is a different term from the plain one. ORDER BY
+        # makes the first class per label deterministic when labels collide.
         ns_prefix = f"{_resolve_graph_base()}/{namespace}/"
         values = " ".join(f'"{_esc(label)}"' for label in to_resolve)
         query = f"""
@@ -317,10 +323,12 @@ class MetricNeptuneClient:
           VALUES ?label {{ {values} }}
           GRAPH ?g {{
             ?cls {_iri(RDF + "type")} {_iri(OWL + "Class")} .
-            ?cls {_iri(RDFS + "label")} ?label .
+            ?cls {_iri(RDFS + "label")} ?classLabel .
           }}
           FILTER(STRSTARTS(STR(?g), "{_esc(ns_prefix)}"))
+          FILTER(STR(?classLabel) = ?label)
         }}
+        ORDER BY ?label STR(?cls)
         """
         result = _sparql_query(query)
         bindings = result["results"]["bindings"]

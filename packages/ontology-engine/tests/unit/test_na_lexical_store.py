@@ -628,6 +628,7 @@ class TestErrorHandling:
 from coa_ontology.inducer.unstructured.stores.na_lexical import (  # noqa: E402
     _extract_spc_predicate_complement,
     _extract_spo_predicate,
+    _is_caseless_predicate_word,
     _is_predicate_word,
     _strip_object_suffix,
     _strip_subject_prefix,
@@ -933,3 +934,114 @@ class TestExtractSpcPredicateComplement:
             assert result == expected, (
                 f"Mismatch for {fact_value!r} (subject={subject!r}):\n  expected: {expected}\n  actual:   {result}"
             )
+
+
+class TestCaselessPredicates:
+    """Predicates in a script without case (Japanese, Chinese, Korean).
+
+    The A1 extraction prompt tells the model to write predicate names in the
+    namespace language, uppercase only where letters have case and an
+    underscore where the name would contain a space. Before this fix every
+    such SPC fact parsed to an empty predicate and Rule 4 dropped it, so a
+    Japanese document produced no datatype properties.
+    """
+
+    @pytest.mark.parametrize(
+        ("fact_value", "subject", "expected"),
+        [
+            ("プレス機 KX-7 点検周期 30日", "プレス機 KX-7", ("点検周期", "30日")),
+            ("設備 担当者 田中", "設備", ("担当者", "田中")),
+            ("プレス機 KX-7 設置場所 第二工場", "プレス機 KX-7", ("設置場所", "第二工場")),
+            ("プレス機 KX-7 点検_周期 30 日", "プレス機 KX-7", ("点検_周期", "30 日")),
+            ("压力机 安装位置 第二工厂", "压力机", ("安装位置", "第二工厂")),
+            ("프레스기 설치_장소 제2공장", "프레스기", ("설치_장소", "제2공장")),
+            # Full-width punctuation around the predicate is not part of it.
+            ("設備 「担当者」 田中", "設備", ("担当者", "田中")),
+        ],
+    )
+    def test_caseless_predicate_is_the_first_token(self, fact_value, subject, expected):
+        assert _extract_spc_predicate_complement(fact_value, subject) == expected
+
+    def test_caseless_predicate_without_complement(self):
+        # Same contract as an English predicate-only fact: Rule 4 skips it.
+        assert _extract_spc_predicate_complement("設備 稼働中", "設備") == ("稼働中", None)
+
+    def test_uppercase_latin_predicate_after_japanese_subject_is_unchanged(self):
+        assert _extract_spc_predicate_complement("プレス機 KX-7 INSPECTION_CYCLE 30日", "プレス機 KX-7") == (
+            "INSPECTION_CYCLE",
+            "30日",
+        )
+
+    def test_quantity_is_not_a_predicate(self):
+        # Starts with a digit, so it is the complement, not a predicate.
+        assert _extract_spc_predicate_complement("設備 30日", "設備") == ("", "30日")
+
+    def test_english_complement_after_uppercase_predicate_is_unchanged(self):
+        # A caseless token only starts a predicate; after an uppercase
+        # predicate it is complement as before.
+        assert _extract_spc_predicate_complement("company LOCATION 東京", "company") == ("LOCATION", "東京")
+
+    @pytest.mark.parametrize(
+        ("fact_value", "expected"),
+        [
+            ("設備 担当者A 田中", ("担当者A", "田中")),
+            # A caseless token after it is complement, as after any uppercase predicate.
+            ("設備 担当者A 点検 田中", ("担当者A", "点検 田中")),
+            # A further uppercase token joins the predicate, as in English.
+            ("設備 担当者A B 田中", ("担当者A B", "田中")),
+        ],
+    )
+    def test_caseless_with_uppercase_latin_suffix_is_uppercase_predicate(self, fact_value, expected):
+        # ``"担当者A".isupper()`` is True because ``A`` is its only cased
+        # letter, so the token keeps the existing uppercase rule. This MR does
+        # not change how such a token parses.
+        assert _is_caseless_predicate_word("担当者A") is False
+        assert _extract_spc_predicate_complement(fact_value, "設備") == expected
+
+    @pytest.mark.parametrize(
+        ("tok", "expected"),
+        [
+            ("点検周期", True),
+            ("担当者", True),
+            ("点検_周期", True),
+            ("설치_장소", True),
+            ("安装位置", True),
+            ("「担当者」", True),
+            ("30日", False),
+            ("KX-7", False),
+            ("Company", False),
+            ("AUDITS", False),
+            ("", False),
+            ("、。", False),
+        ],
+    )
+    def test_is_caseless_predicate_word(self, tok, expected):
+        assert _is_caseless_predicate_word(tok) is expected
+
+    def test_japanese_spc_fact_yields_a_datatype_property(self):
+        """End to end through Rule 4: the parsed fact becomes a Japanese property."""
+        from coa_ontology.inducer.unstructured.services.induction_rules import induce_datatype_properties
+        from coa_ontology.inducer.unstructured.services.iri_resolver import InMemoryIRIResolver
+        from coa_ontology.inducer.unstructured.stores.protocol import FactRecord
+        from rdflib import OWL, RDF, RDFS, Literal
+
+        predicate, complement = _extract_spc_predicate_complement("プレス機 KX-7 点検周期 30日", "プレス機 KX-7")
+        fact = FactRecord(
+            subject_value="プレス機 KX-7",
+            subject_class="設備",
+            predicate=predicate,
+            object_value=None,
+            object_class=None,
+            complement=complement,
+        )
+        resolver = InMemoryIRIResolver(namespace="n1", ontology_name="unstructured")
+        graph = induce_datatype_properties(
+            facts=[fact],
+            class_iris={"設備": resolver.resolve("設備", "class")},
+            iri_resolver=resolver,
+            namespace_language="ja",
+        )
+        properties = list(graph.subjects(RDF.type, OWL.DatatypeProperty))
+        assert len(properties) == 1, graph.serialize(format="turtle")
+        labels = list(graph.objects(properties[0], RDFS.label))
+        assert Literal("点検周期", lang="ja") in labels, labels

@@ -38,6 +38,7 @@ import botocore.exceptions
 import httpx
 from coa_common import validate_namespace_name
 from coa_common.constants import VOCAB_URI
+from coa_common.label_language import LabelPreference
 from coa_common.opensearch import retry_call
 
 from coa_ontology.stores.base import GraphStore
@@ -417,6 +418,21 @@ _KIND_BY_TYPE: dict[str, str] = {
     RDF + "Property": "property",
     RDFS + "Class": "class",
 }
+
+
+def _literal_candidate(binding: dict | None) -> tuple[str, str]:
+    """``(lexical form, language tag)`` of a SPARQL JSON literal binding.
+
+    The tag is the ``xml:lang`` member; a plain or typed literal is untagged.
+    """
+    if not binding:
+        return ("", "")
+    return (str(binding.get("value", "")), str(binding.get("xml:lang", "") or ""))
+
+
+def _preference(label_preference: LabelPreference | None) -> LabelPreference:
+    """The caller's namespace-language preference, or untagged-first when none."""
+    return label_preference if label_preference is not None else LabelPreference.untagged_first()
 
 
 def _kind_from_type(type_uri: str) -> str | None:
@@ -1009,6 +1025,8 @@ class NeptuneDBGraphStore(GraphStore):
         self,
         vertex_uri: str,
         namespace: str | None = None,
+        *,
+        label_preference: LabelPreference | None = None,
     ) -> dict | None:
         """Cross-ontology vertex lookup scoped to one namespace.
 
@@ -1026,7 +1044,12 @@ class NeptuneDBGraphStore(GraphStore):
 
         Returns ``None`` when the vertex has no triples anywhere in
         the namespace.
+
+        ``labels`` (and ``comments`` / ``alt_labels``) list every distinct
+        lexical form, ordered best first by ``label_preference`` (the
+        namespace-language ranking); each neighbor is named by its best label.
         """
+        preference = _preference(label_preference)
         ns_prefix = _namespace_graph_prefix(namespace).rstrip("/") + "/"
 
         # ── (1) outgoing triples ────────────────────────────────────
@@ -1056,9 +1079,9 @@ class NeptuneDBGraphStore(GraphStore):
             return None
 
         types: list[str] = []
-        labels: list[str] = []
-        comments: list[str] = []
-        alt_labels: list[str] = []
+        labels: list[tuple[str, str]] = []
+        comments: list[tuple[str, str]] = []
+        alt_labels: list[tuple[str, str]] = []
         superseded: dict[str, list[str]] = {}
         edges: list[dict] = []
         graph_uris: set[str] = set()
@@ -1095,14 +1118,11 @@ class NeptuneDBGraphStore(GraphStore):
                 if o_value not in types:
                     types.append(o_value)
             elif p == rdfs_label and o_type == "literal":
-                if o_value not in labels:
-                    labels.append(o_value)
+                labels.append(_literal_candidate(o_node))
             elif p == rdfs_comment and o_type == "literal":
-                if o_value not in comments:
-                    comments.append(o_value)
+                comments.append(_literal_candidate(o_node))
             elif p == skos_alt_label and o_type == "literal":
-                if o_value not in alt_labels:
-                    alt_labels.append(o_value)
+                alt_labels.append(_literal_candidate(o_node))
             elif p in history_preds and o_type == "literal":
                 bucket = superseded.setdefault(history_preds[p], [])
                 if o_value not in bucket:
@@ -1147,7 +1167,7 @@ class NeptuneDBGraphStore(GraphStore):
         # 500 IRIs ≈ 150 KB — well within limits while avoiding DoS
         # from vertices with thousands of neighbors.
         _VALUES_BATCH = 500
-        neighbor_labels: dict[str, str] = {}
+        neighbor_label_rows: list[tuple[str, str, str]] = []
         if neighbor_uris:
             uri_list = list(neighbor_uris)
             for batch_start in range(0, len(uri_list), _VALUES_BATCH):
@@ -1162,7 +1182,10 @@ class NeptuneDBGraphStore(GraphStore):
                 }}
                 """
                 for r in _sparql_query(q2).get("results", {}).get("bindings", []):
-                    neighbor_labels.setdefault(r["o"]["value"], r["label"]["value"])
+                    neighbor_label_rows.append((r["o"]["value"], *_literal_candidate(r.get("label"))))
+        neighbor_labels = {
+            uri: label for uri, label in preference.pick_by_resource(neighbor_label_rows).items() if label
+        }
 
         # ── (3) types for URI neighbors (batched queries) ───────────
         neighbor_kinds: dict[str, str] = {}
@@ -1227,9 +1250,9 @@ class NeptuneDBGraphStore(GraphStore):
             "uri": vertex_uri,
             "graph_uris": sorted(graph_uris),
             "types": types,
-            "labels": labels,
-            "comments": comments,
-            "alt_labels": alt_labels,
+            "labels": preference.order(labels),
+            "comments": preference.order(comments),
+            "alt_labels": preference.order(alt_labels),
             "superseded": superseded,
             "is_mapped": is_mapped,
             "edges": out_edges,
@@ -1371,6 +1394,8 @@ class NeptuneDBGraphStore(GraphStore):
         exclude_ontology_id: str | None = None,
         limit: int = 50,
         offset: int = 0,
+        *,
+        label_preference: LabelPreference | None = None,
     ) -> list[dict]:
         """Substring search over entity IRIs and labels in a namespace.
 
@@ -1394,10 +1419,13 @@ class NeptuneDBGraphStore(GraphStore):
                 named graph (e.g., exclude governed-metrics classes).
             limit: Maximum number of results to return (the page size).
             offset: Number of leading (ordered) distinct entities to skip.
+            label_preference: Namespace-language ranking used to name each hit
+                when it carries several labels; untagged-first when omitted.
 
         Returns:
             List of dicts with keys: uri, label, kind, graph_uris.
         """
+        preference = _preference(label_preference)
         where = self._search_where_clause(query, namespace, kind, ontology_id, exclude_ontology_id)
         safe_offset = max(0, offset)
         # Both bounds are interpolated into the SPARQL query below, so they are
@@ -1455,13 +1483,13 @@ class NeptuneDBGraphStore(GraphStore):
             if g not in lst:
                 lst.append(g)
 
+        label_rows: list[tuple[str, str, str]] = []
         for b in bindings:
             uri = b["s"]["value"]
             _add_graph(uri, b)
+            if "label" in b and b["label"].get("type") == "literal":
+                label_rows.append((uri, *_literal_candidate(b["label"])))
             if uri in hits:
-                # Update label if we got one
-                if "label" in b and b["label"]["type"] == "literal" and not hits[uri].get("label"):
-                    hits[uri]["label"] = b["label"]["value"]
                 # Update kind if more specific
                 if "t" in b:
                     new_kind = _kind_from_type(b["t"]["value"])
@@ -1470,12 +1498,16 @@ class NeptuneDBGraphStore(GraphStore):
                 continue
             entry: dict = {
                 "uri": uri,
-                "label": b.get("label", {}).get("value") if "label" in b else None,
+                "label": None,
                 "kind": _kind_from_type(b.get("t", {}).get("value", "")) or "unknown",
             }
             hits[uri] = entry
 
+        # One label per hit, chosen by the namespace-language ranking rather than
+        # by which row arrived first. A hit with no label keeps ``None``.
+        label_of = preference.pick_by_resource(label_rows)
         for uri, entry in hits.items():
+            entry["label"] = label_of.get(uri) or None
             entry["graph_uris"] = graphs_for.get(uri, [])
 
         return list(hits.values())
@@ -1555,8 +1587,9 @@ class NeptuneDBGraphStore(GraphStore):
         """Fold one class-query binding into the per-URI class summary map.
 
         A class yields one row per (label × comment × parent × …) combination,
-        so collapse to a single entry: first label/comment/grounding wins;
-        named-IRI subClassOf parents accumulate (deduped, order-preserving).
+        so collapse to a single entry: label/comment candidates accumulate for
+        :meth:`_finalize_class_rows`, first grounding wins, and named-IRI
+        subClassOf parents accumulate (deduped, order-preserving).
         Blank-node parents (owl:Restriction cardinality axioms) are skipped —
         they aren't taxonomy edges.
         """
@@ -1570,16 +1603,18 @@ class NeptuneDBGraphStore(GraphStore):
                 "grounded_to": None,
                 "match_type": None,
                 "sub_class_of": [],
+                "_labels": [],
+                "_comments": [],
             },
         )
         if "parent" in b and b["parent"]["type"] == "uri":
             parent = b["parent"]["value"]
             if parent not in entry["sub_class_of"]:
                 entry["sub_class_of"].append(parent)
-        if entry["label"] is None and "label" in b:
-            entry["label"] = b["label"]["value"]
-        if entry["comment"] is None and "comment" in b:
-            entry["comment"] = b["comment"]["value"]
+        if "label" in b:
+            entry["_labels"].append(_literal_candidate(b["label"]))
+        if "comment" in b:
+            entry["_comments"].append(_literal_candidate(b["comment"]))
         # Grounding target: prefer coa:groundedTo, else a skos exact/close
         # mapping. Record the match type so the UI can distinguish exact/close.
         if entry["grounded_to"] is None:
@@ -1595,7 +1630,16 @@ class NeptuneDBGraphStore(GraphStore):
             elif "close" in b and b["close"]["type"] == "uri":
                 entry["match_type"] = "close"
 
-    def _sample_overview(self, ontology_id: str, graph_uri: str, gi: str) -> dict:
+    @staticmethod
+    def _finalize_class_rows(classes: dict[str, dict], preference: LabelPreference) -> None:
+        """Replace accumulated label/comment candidates with the preferred one."""
+        for entry in classes.values():
+            entry["label"] = preference.pick(entry.pop("_labels")) or None
+            entry["comment"] = preference.pick(entry.pop("_comments")) or None
+
+    def _sample_overview(
+        self, ontology_id: str, graph_uri: str, gi: str, preference: LabelPreference | None = None
+    ) -> dict:
         """Bounded taxonomy seed for the Graph view's initial render.
 
         Enumerates the ontology's full class set once (the class scan is cheap;
@@ -1610,6 +1654,7 @@ class NeptuneDBGraphStore(GraphStore):
         classes: dict[str, dict] = {}
         for b in _sparql_query(self._overview_class_query(gi)).get("results", {}).get("bindings", []):
             self._accumulate_class_row(classes, b)
+        self._finalize_class_rows(classes, _preference(preference))
 
         # child → parents (within this ontology graph) and parent → children.
         children_of: dict[str, list[str]] = {uri: [] for uri in classes}
@@ -1676,6 +1721,7 @@ class NeptuneDBGraphStore(GraphStore):
         namespace: str | None = None,
         *,
         sample: bool = False,
+        label_preference: LabelPreference | None = None,
     ) -> dict | None:
         """Enumerate the classes + properties persisted in one named graph.
 
@@ -1684,7 +1730,8 @@ class NeptuneDBGraphStore(GraphStore):
         (``owl:ObjectProperty`` / ``owl:DatatypeProperty`` / generic
         ``rdf:Property``). Rows are aggregated by subject in Python so a
         subject with multiple labels/domains/ranges collapses to a single
-        summary (first value wins). Generic ``rdf:Property`` rows are
+        summary (labels and comments by ``label_preference``, the
+        namespace-language ranking; otherwise first value wins). Generic ``rdf:Property`` rows are
         bucketed by range: an ``xsd:``/``rdfs:Literal`` range → datatype
         property, anything else → object property (relationship).
 
@@ -1700,14 +1747,16 @@ class NeptuneDBGraphStore(GraphStore):
         graph_uri = _ontology_graph_uri(ontology_id, self._namespace)
         gi = _iri(graph_uri)
 
+        preference = _preference(label_preference)
         if sample:
-            return self._sample_overview(ontology_id, graph_uri, gi)
+            return self._sample_overview(ontology_id, graph_uri, gi, preference)
 
         # ── Classes ──────────────────────────────────────────────────
         class_q = self._overview_class_query(gi)
         classes: dict[str, dict] = {}
         for b in _sparql_query(class_q).get("results", {}).get("bindings", []):
             self._accumulate_class_row(classes, b)
+        self._finalize_class_rows(classes, preference)
 
         # ── Properties (object + datatype + generic) ─────────────────
         prop_q = f"""
@@ -1729,11 +1778,11 @@ class NeptuneDBGraphStore(GraphStore):
             uri = b["p"]["value"]
             entry = props.setdefault(
                 uri,
-                {"uri": uri, "label": None, "domain": None, "range": None, "types": set()},
+                {"uri": uri, "label": None, "domain": None, "range": None, "types": set(), "_labels": []},
             )
             entry["types"].add(b["type"]["value"])
-            if entry["label"] is None and "label" in b:
-                entry["label"] = b["label"]["value"]
+            if "label" in b:
+                entry["_labels"].append(_literal_candidate(b["label"]))
             # Only keep named-IRI domains/ranges (skip blank-node class expressions).
             if entry["domain"] is None and "domain" in b and b["domain"]["type"] == "uri":
                 entry["domain"] = b["domain"]["value"]
@@ -1743,6 +1792,7 @@ class NeptuneDBGraphStore(GraphStore):
         object_properties: list[dict] = []
         datatype_properties: list[dict] = []
         for entry in props.values():
+            entry["label"] = preference.pick(entry.pop("_labels")) or None
             types = entry.pop("types")
             is_object = OWL + "ObjectProperty" in types
             is_datatype = OWL + "DatatypeProperty" in types
@@ -1777,43 +1827,73 @@ class NeptuneDBGraphStore(GraphStore):
         *,
         max_results: int = 100,
         include_properties: bool = True,
+        label_preference: LabelPreference | None = None,
     ) -> dict:
         """List all OWL classes and properties across all ontologies in a namespace.
 
-        Queries all named graphs under the namespace prefix.
+        Queries all named graphs under the namespace prefix. A class or property
+        with several labels (or descriptions) arrives once per value; rows are
+        grouped by URI, in first-seen order, and each is named with
+        ``label_preference`` (the namespace-language ranking), so a multilingual
+        class is listed once and never dropped for its language.
         """
+        preference = _preference(label_preference)
         validate_namespace_name(namespace)
         ns_prefix = _namespace_graph_prefix(namespace)
 
-        # Classes
+        # Classes. ``max_results`` bounds CLASSES, not rows: the inner subquery
+        # picks the page of distinct class IRIs (ordered by their lowest label,
+        # falling back to the IRI), and the outer pattern fetches EVERY label,
+        # description and parent of those classes. Limiting the joined rows
+        # instead could cut a class's preferred-language label off the page.
         class_q = f"""
         PREFIX rdf: <{RDF}>
         PREFIX rdfs: <{RDFS}>
         PREFIX owl: <{OWL}>
-        SELECT ?classUri ?classLabel ?classDescription ?parentClass WHERE {{
-          GRAPH ?g {{
-            ?classUri rdf:type ?t .
-            VALUES ?t {{ owl:Class rdfs:Class }}
+        SELECT ?classUri ?classLabel ?classDescription ?parentClass ?sortKey WHERE {{
+          {{
+            SELECT ?classUri (MIN(LCASE(COALESCE(STR(?anyLabel), STR(?classUri)))) AS ?sortKey) WHERE {{
+              GRAPH ?g {{
+                ?classUri rdf:type ?t .
+                VALUES ?t {{ owl:Class rdfs:Class }}
+                OPTIONAL {{ ?classUri rdfs:label ?anyLabel }}
+              }}
+              FILTER(STRSTARTS(STR(?g), "{ns_prefix}"))
+            }}
+            GROUP BY ?classUri
+            ORDER BY ?sortKey ?classUri
+            LIMIT {max_results}
+          }}
+          GRAPH ?g2 {{
+            ?classUri rdf:type ?t2 .
+            VALUES ?t2 {{ owl:Class rdfs:Class }}
             OPTIONAL {{ ?classUri rdfs:label ?classLabel }}
             OPTIONAL {{ ?classUri rdfs:comment ?classDescription }}
             OPTIONAL {{ ?classUri rdfs:subClassOf ?parentClass }}
           }}
-          FILTER(STRSTARTS(STR(?g), "{ns_prefix}"))
+          FILTER(STRSTARTS(STR(?g2), "{ns_prefix}"))
         }}
-        ORDER BY ?classLabel
-        LIMIT {max_results}
+        ORDER BY ?sortKey ?classUri
         """
 
         classes_raw = _sparql_query(class_q).get("results", {}).get("bindings", [])
+        grouped: dict[str, dict] = {}
+        for b in classes_raw:
+            uri = b["classUri"]["value"]
+            entry = grouped.setdefault(uri, {"labels": [], "descriptions": [], "parent": ""})
+            entry["labels"].append(_literal_candidate(b.get("classLabel")))
+            entry["descriptions"].append(_literal_candidate(b.get("classDescription")))
+            if not entry["parent"]:
+                entry["parent"] = b.get("parentClass", {}).get("value", "")
         classes = [
             {
-                "uri": b["classUri"]["value"],
-                "label": b.get("classLabel", {}).get("value", ""),
-                "description": b.get("classDescription", {}).get("value", ""),
-                "parentClass": b.get("parentClass", {}).get("value", ""),
+                "uri": uri,
+                "label": preference.pick(entry["labels"]),
+                "description": preference.pick(entry["descriptions"]),
+                "parentClass": entry["parent"],
                 "properties": [],
             }
-            for b in classes_raw
+            for uri, entry in grouped.items()
         ]
 
         # Properties (grouped by domain)
@@ -1837,16 +1917,25 @@ class NeptuneDBGraphStore(GraphStore):
             """
             props_raw = _sparql_query(prop_q).get("results", {}).get("bindings", [])
 
-            # Group by domain
-            props_by_domain: dict[str, list[dict]] = {}
+            # Group by (domain, property): one entry per property per domain.
+            grouped_props: dict[tuple[str, str], dict] = {}
             for b in props_raw:
                 domain = b.get("domain", {}).get("value", "")
+                entry = grouped_props.setdefault(
+                    (domain, b["propUri"]["value"]), {"labels": [], "descriptions": [], "range": ""}
+                )
+                entry["labels"].append(_literal_candidate(b.get("propLabel")))
+                entry["descriptions"].append(_literal_candidate(b.get("propDescription")))
+                if not entry["range"]:
+                    entry["range"] = b.get("range", {}).get("value", "")
+            props_by_domain: dict[str, list[dict]] = {}
+            for (domain, prop_uri), entry in grouped_props.items():
                 props_by_domain.setdefault(domain, []).append(
                     {
-                        "uri": b["propUri"]["value"],
-                        "label": b.get("propLabel", {}).get("value", ""),
-                        "range": b.get("range", {}).get("value", ""),
-                        "description": b.get("propDescription", {}).get("value", ""),
+                        "uri": prop_uri,
+                        "label": preference.pick(entry["labels"]),
+                        "range": entry["range"],
+                        "description": preference.pick(entry["descriptions"]),
                     }
                 )
 

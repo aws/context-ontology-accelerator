@@ -112,6 +112,39 @@ class IncompatibleEngineError(RuntimeError):
     """
 
 
+class DeleteIncompleteError(RuntimeError):
+    """:meth:`AossVectorClient.delete_by_term` stopped with documents still matching.
+
+    Raised when the delete-then-recount loop hits its no-progress deadline while
+    the count is still above zero, or could not be read at all. The usual cause
+    is AOSS rejecting the per-document deletes: throttling that outlasts the
+    per-call retry, or a data-access policy that allows search but not delete.
+    Before this was raised, the loop logged and returned the partial count, so a
+    caller that needed the documents gone reported success with them still
+    searchable.
+
+    A caller that needs the delete to be complete lets this propagate. A caller
+    for which leftover documents are acceptable catches it at the call site and
+    logs.
+    """
+
+    def __init__(self, message: str, *, deleted: int, remaining: int | None, failed: int):
+        """Record what the delete achieved so callers/tests can assert on it.
+
+        Args:
+            message: Human-readable summary.
+            deleted: Documents this call deleted.
+            remaining: Documents still matching at the last count, or ``None``
+                when the count itself kept failing.
+            failed: Per-document delete calls that raised (a document that keeps
+                failing is counted once per pass).
+        """
+        super().__init__(message)
+        self.deleted = deleted
+        self.remaining = remaining
+        self.failed = failed
+
+
 def build_index_mapping(dims: int, *, method: bool = True) -> dict:
     """Canonical vector-index mapping — the single source of truth.
 
@@ -565,9 +598,11 @@ class AossVectorClient:
         To be correct against that lag, we loop delete-then-recount until the
         term-query ``count`` is a *stable* zero, tracking a no-progress stall
         deadline (resets whenever we delete ≥1 more doc, mirrors ingest.py's
-        readiness wait). On a genuine stall we log and stop rather than spin
-        forever — the caller verifies teardown and retries. Returns the number of
-        docs deleted.
+        readiness wait). A per-document delete that raises is counted rather than
+        raised on the spot (the recount is the gate, and a document a stale
+        search view returned may already be gone). On a genuine stall we log and
+        raise :class:`DeleteIncompleteError` rather than spin forever or report a
+        partial delete as done. Returns the number of docs deleted.
         """
         c = self._c()
         if isinstance(value, str):
@@ -590,6 +625,8 @@ class AossVectorClient:
             query = primary
             count_filters = [primary]
         deleted = 0
+        failed = 0
+        last_error: Exception | None = None
         stall_deadline = time.perf_counter() + _DELETE_VERIFY_STALL_TIMEOUT_S
 
         while True:
@@ -608,8 +645,13 @@ class AossVectorClient:
                     c.delete(index=index, id=h["_id"])
                     deleted += 1
                     deleted_this_pass += 1
-                except Exception:  # noqa: BLE001 — best-effort per-doc; recount is the gate
-                    pass
+                except Exception as e:  # noqa: BLE001 — per-doc; recount is the gate, a stall raises below
+                    # A 404 means a stale search view returned a doc that is
+                    # already gone: not a failure. Anything else (a throttle the
+                    # retry outlasted, a policy denial) is counted and reported.
+                    if not _is_index_not_found(e):
+                        failed += 1
+                        last_error = e
 
             # 2. Terminal check via count (does NOT rely on this page being
             #    empty — that empty could be a stale view). Only a real zero
@@ -632,16 +674,27 @@ class AossVectorClient:
             if deleted_this_pass > 0:
                 stall_deadline = time.perf_counter() + _DELETE_VERIFY_STALL_TIMEOUT_S
             elif time.perf_counter() >= stall_deadline:
+                term = value if isinstance(value, str) else f"<{len(primary['terms'][field])} values>"
                 log.warning(
                     "delete_by_term(%s=%s) stalled — deleted %d, ~%s still matching after %.0fs "
-                    "no-progress; giving up this pass (caller will retry / verify)",
+                    "no-progress, %d per-doc delete(s) failed; giving up this pass (raising to the caller)",
                     field,
-                    value if isinstance(value, str) else f"<{len(primary['terms'][field])} values>",
+                    term,
                     deleted,
                     remaining if remaining >= 0 else "unknown",
                     _DELETE_VERIFY_STALL_TIMEOUT_S,
+                    failed,
                 )
-                return deleted
+                cause = f"; last error: {type(last_error).__name__}: {str(last_error)[:200]}" if last_error else ""
+                raise DeleteIncompleteError(
+                    f"delete_by_term({field}={term}) on {index!r} stopped with "
+                    f"{remaining if remaining >= 0 else 'an unknown number of'} matching document(s) left "
+                    f"after {_DELETE_VERIFY_STALL_TIMEOUT_S:.0f}s without progress "
+                    f"(deleted {deleted}, {failed} per-doc delete(s) failed{cause})",
+                    deleted=deleted,
+                    remaining=remaining if remaining >= 0 else None,
+                    failed=failed,
+                )
 
             time.sleep(_DELETE_VERIFY_POLL_S)
 

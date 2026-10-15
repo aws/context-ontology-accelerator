@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from coa_common.domain_models import Column
+from coa_common.language_tags import describe_language, needs_language_instruction
 
 SYSTEM_PROMPT = """\
 You are a data catalog expert. \
@@ -59,6 +60,33 @@ per-column confidence reflecting how certain you are of that column's generated 
 If a column has a source comment (shown after "--"), use it as-is for the description.
 - If "External evidence" is provided below, use it as authoritative domain knowledge \
 to improve both the table description and the column descriptions."""
+
+
+def build_system_prompt(namespace_language: str) -> str:
+    """Return the trusted system prompt for a namespace language.
+
+    An English namespace (primary subtag ``en``) gets :data:`SYSTEM_PROMPT`
+    unchanged. Any other language appends a fixed output-language instruction.
+
+    The instruction is application-owned control text, so it lives in the system
+    prompt: the table schema, identifiers, comments and external evidence stay
+    in the user message, which is what the Bedrock guardrail's prompt-attack
+    filter screens. Only the canonical tag and a name from a fixed table are
+    interpolated.
+    """
+    if not needs_language_instruction(namespace_language):
+        return SYSTEM_PROMPT
+    target = describe_language(namespace_language)
+    return (
+        SYSTEM_PROMPT + "\n\nOutput language:\n"
+        f"- Write every newly generated description, synonym, glossary term, and tag in {target}.\n"
+        f"- A synonym is another name a business user would use in {target}. Do not add an English "
+        "translation of a table or column name, or an English-style identifier made from it (such as a "
+        "snake_case name), as a synonym. An abbreviation or code that the source itself uses may stay as written.\n"
+        "- Keep table names, column names, and other identifiers (model numbers, product names, "
+        "units, codes) exactly as they appear. Do not translate or transliterate them.\n"
+        "- Reproduce existing metadata and source comments unchanged, even when they use another language."
+    )
 
 
 def build_user_prompt(

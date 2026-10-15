@@ -445,7 +445,9 @@ class SqlAgent:
             that join to a known one — including tables several hops away that a
             single semantic search will not surface. Returns neighbor tables
             (nearest hop first) and, optionally, their columns; the result is
-            capped and ordered tables-first.
+            capped and ordered tables-first. ``table_label`` / ``column_label``
+            and ``(label: …)`` / ``[label: …]`` hints are display-only; write SQL
+            with ``table`` / ``column``.
 
             Args:
                 table_name: Exact table name (lowercase), ideally one you already

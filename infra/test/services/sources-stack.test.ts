@@ -1930,13 +1930,30 @@ describe("SourcesStack", () => {
       }
     });
 
-    it("has CONSUMER_QUERY_ROLE_ARN environment variable (from SSM)", () => {
+    it("resolves the serve runtime role ARN from SSM at runtime, not deploy time", () => {
+      // A deploy-time SSM read would make SourcesStack wait for ServeStack.
       template.hasResourceProperties("AWS::Lambda::Function", {
         FunctionName: Match.stringLikeRegexp(".*sources-db-connector$"),
         Environment: {
           Variables: Match.objectLike({
-            CONSUMER_QUERY_ROLE_ARN: Match.anyValue(),
+            CONSUMER_QUERY_ROLE_SSM_PARAM: Match.stringLikeRegexp(
+              "/serve/runtime-role-arn$",
+            ),
+            CONSUMER_QUERY_ROLE_ARN: Match.absent(),
           }),
+        },
+      });
+      template.hasResourceProperties("AWS::IAM::Policy", {
+        PolicyDocument: {
+          Statement: Match.arrayWith([
+            Match.objectLike({
+              Sid: "ReadConsumerQueryRoleArn",
+              Action: "ssm:GetParameter",
+              Resource: Match.stringLikeRegexp(
+                ":parameter/.*/serve/runtime-role-arn$",
+              ),
+            }),
+          ]),
         },
       });
     });
@@ -2018,6 +2035,47 @@ describe("SourcesStack", () => {
       // an approved source this routes the terminal status to RESCAN_REVIEW.
       expect(definition).toContain("IS_RESCAN");
       expect(definition).toContain("$.isRescan");
+    });
+  });
+
+  describe("Namespace-language snapshot", () => {
+    // Workers take the namespace language from the job input the Sources API
+    // built when it triggered the job; they never re-read the namespace.
+    const flatDefinitions = (): string =>
+      JSON.stringify(
+        Object.values(template.findResources("AWS::StepFunctions::StateMachine")),
+      ).replace(/\\+"/g, '"');
+
+    it("passes NAMESPACE_LANGUAGE from $.namespaceLanguage to the enrichment task", () => {
+      expect(flatDefinitions()).toMatch(
+        /"Name":"NAMESPACE_LANGUAGE","Value.\$":"\$\.namespaceLanguage"/,
+      );
+    });
+
+    it("lets the document trigger resolve a pre-snapshot message with GetItem only", () => {
+      template.hasResourceProperties("AWS::Lambda::Function", {
+        FunctionName: Match.stringLikeRegexp("sources-doc-ingestion-trigger"),
+        Environment: {
+          Variables: Match.objectLike({ NAMESPACES_TABLE: Match.anyValue() }),
+        },
+      });
+      template.hasResourceProperties("AWS::IAM::Policy", {
+        PolicyDocument: {
+          Statement: Match.arrayWith([
+            Match.objectLike({
+              Sid: "ReadNamespaceLanguage",
+              Action: "dynamodb:GetItem",
+              Effect: "Allow",
+            }),
+          ]),
+        },
+      });
+    });
+
+    it("passes NAMESPACE_LANGUAGE from $.namespace_language to the KG-build task", () => {
+      expect(flatDefinitions()).toMatch(
+        /"Name":"NAMESPACE_LANGUAGE","Value.\$":"\$\.namespace_language"/,
+      );
     });
   });
 
@@ -2767,6 +2825,55 @@ describe("SourcesStack", () => {
       });
     });
 
+    // The account check alone admitted any EventBridge rule anyone in the
+    // account created, and the consumer takes the source ids from the message.
+    // Bound to this deployment's re-scan rules on the default bus, the same
+    // pattern the API Lambda is allowed to create rules under.
+    it("accepts sends only from this deployment's Glue re-scan rules", () => {
+      const statements = Object.values(
+        template.findResources("AWS::SQS::QueuePolicy"),
+      ).flatMap(
+        (p) =>
+          (p as { Properties: { PolicyDocument: { Statement: any[] } } })
+            .Properties.PolicyDocument.Statement,
+      );
+      const send = statements.filter((s) => s.Sid === "AllowEventBridgeSend");
+      expect(send).toHaveLength(1);
+      const condition = send[0].Condition;
+      expect(condition.StringEquals).toEqual({
+        "aws:SourceAccount": "123456789012",
+      });
+      const sourceArn = JSON.stringify(condition.ArnLike?.["aws:SourceArn"]);
+      expect(sourceArn).toContain(":events:us-east-1:123456789012:rule/");
+      expect(sourceArn).toMatch(/glue-rescan-\*/);
+      // Default bus: `rule/<name>`, never `rule/<bus>/<name>`.
+      expect(sourceArn).not.toMatch(/rule\/[^"]*\/[^"]*glue-rescan/);
+    });
+
+    it("binds the queue policy to the same rule ARNs the API Lambda may create", () => {
+      const queueStatements = Object.values(
+        template.findResources("AWS::SQS::QueuePolicy"),
+      ).flatMap(
+        (p) =>
+          (p as { Properties: { PolicyDocument: { Statement: any[] } } })
+            .Properties.PolicyDocument.Statement,
+      );
+      const iamStatements = Object.values(
+        template.findResources("AWS::IAM::Policy"),
+      ).flatMap(
+        (p) =>
+          (p as { Properties: { PolicyDocument: { Statement: any[] } } })
+            .Properties.PolicyDocument.Statement,
+      );
+      const send = queueStatements.find(
+        (s) => s.Sid === "AllowEventBridgeSend",
+      );
+      const manage = iamStatements.find(
+        (s) => s.Sid === "ManageGlueEventRules",
+      );
+      expect(send.Condition.ArnLike["aws:SourceArn"]).toEqual(manage.Resource);
+    });
+
     it("creates the consumer Lambda with an SQS event source", () => {
       template.hasResourceProperties("AWS::Lambda::Function", {
         FunctionName: Match.stringLikeRegexp("sources-glue-event-rescan$"),
@@ -2829,6 +2936,48 @@ describe("SourcesStack", () => {
           Variables: Match.objectLike({ ALLOWED_ORIGIN: Match.anyValue() }),
         },
       });
+    });
+
+    // The shared re-scan path snapshots the namespace language before taking
+    // the lock. Without the table name and a read grant every EVENT re-scan
+    // fails before it starts.
+    it("lets the consumer Lambda read the namespace language with GetItem only", () => {
+      const fns = template.findResources("AWS::Lambda::Function", {
+        Properties: {
+          FunctionName: Match.stringLikeRegexp("sources-glue-event-rescan$"),
+        },
+      });
+      const [fn] = Object.values(fns) as Array<{
+        Properties: {
+          Role: { "Fn::GetAtt": [string, string] };
+          Environment: { Variables: Record<string, unknown> };
+        };
+      }>;
+      expect(
+        fn.Properties.Environment.Variables.NAMESPACES_TABLE,
+      ).toBeDefined();
+      const roleId = fn.Properties.Role["Fn::GetAtt"][0];
+      const statements = Object.values(
+        template.findResources("AWS::IAM::Policy"),
+      )
+        .filter((p) =>
+          JSON.stringify(
+            (p as { Properties: { Roles: unknown } }).Properties.Roles,
+          ).includes(roleId),
+        )
+        .flatMap(
+          (p) =>
+            (
+              p as {
+                Properties: {
+                  PolicyDocument: { Statement: Array<Record<string, unknown>> };
+                };
+              }
+            ).Properties.PolicyDocument.Statement,
+        );
+      const read = statements.find((st) => st.Sid === "ReadNamespaceLanguage");
+      expect(read).toBeDefined();
+      expect(read?.Action).toBe("dynamodb:GetItem");
     });
 
     it("grants the API Lambda scoped Glue-event rule management", () => {
@@ -3127,10 +3276,11 @@ describe("Athena catalog-name prefix budget", () => {
 
 // The running coa-dev-kg-build image accreted Critical/High OS CVEs (perl,
 // openssl, glibc, pcre2, sqlite3) whenever a build predated the Debian point
-// releases that fix them. Two Dockerfile properties keep the image patchable:
-// a pinned base digest (supply-chain integrity + a cache-busting bump lever)
-// and a post-install `apt-get upgrade` (the only mechanism pulling
-// trixie-security point releases in). These guard against regression —
+// releases that fix them; the base is now AL2023. Two Dockerfile
+// properties keep the image patchable: a pinned base digest (supply-chain
+// integrity + a cache-busting bump lever) and a post-install
+// `dnf upgrade --releasever=latest` (the only mechanism pulling AL2023 security
+// updates in past the pinned snapshot). These guard against regression —
 // removing the upgrade line, or floating the base back onto a mutable tag, is
 // exactly how the CVEs came back. Mirrors ontology-stack's hygiene block.
 describe("kg-build Dockerfile CVE hygiene", () => {
@@ -3151,16 +3301,17 @@ describe("kg-build Dockerfile CVE hygiene", () => {
 
   test("pins the base image to a digest, not a mutable tag", () => {
     const from = dockerfile.match(
-      /^FROM .*python:3\.12-slim(@sha256:[a-f0-9]{64})?/m,
+      /^FROM .*amazonlinux:2023-minimal(@sha256:[a-f0-9]{64})?/m,
     );
     expect(from).not.toBeNull();
     expect(from?.[1]).toMatch(/@sha256:[a-f0-9]{64}/);
-    expect(dockerfile).not.toMatch(/python:3\.12-slim\s*$/m);
+    expect(dockerfile).not.toMatch(/amazonlinux:2023-minimal\s*$/m);
   });
 
-  test("runs apt-get upgrade so OS security point releases are applied", () => {
-    expect(dockerfile).toMatch(/apt-get upgrade -y/);
-    expect(dockerfile).not.toMatch(/apt-get dist-upgrade/);
+  test("runs dnf upgrade against the latest AL2023 release so OS security updates are applied", () => {
+    // AL2023 locks dnf to the base image's repo snapshot; without
+    // --releasever=latest a stale digest pin freezes the OS patch level.
+    expect(dockerfile).toMatch(/dnf upgrade -y --releasever=latest/);
   });
 
   test("upgrades pip so its own advisories are picked up", () => {

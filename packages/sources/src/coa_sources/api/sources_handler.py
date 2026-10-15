@@ -47,6 +47,7 @@ from coa_common.constants import (
 )
 from coa_common.dao import DynamoDBDAO
 from coa_common.dao.base import QueryParams
+from coa_common.language_tags import LanguageTagError
 from coa_common.logging import setup_logging
 from coa_common.response import api_response, iso_to_epoch
 from coa_control_plane_server.models.create_source_input import CreateSourceInput
@@ -79,6 +80,11 @@ from coa_sources.database.sub_types import (
     CONNECTOR_BACKED_SUB_TYPES,
     FEDERATED_TEARDOWN_SUB_TYPES,
     PLATFORM_CATALOG_CLAIM_SUB_TYPES,
+)
+from coa_sources.namespace_language import (
+    NamespaceNotFoundError,
+    namespace_language_from_item,
+    resolve_namespace_language,
 )
 from coa_sources.utils import merge_extraction_config
 
@@ -699,19 +705,22 @@ def _handle_create(event: dict[str, Any], namespace_id: str) -> dict[str, Any]:
     except ValidationError as exc:
         return api_response(400, {"error": _validation_message(exc)})
 
-    # Verify namespace exists
+    # Verify namespace exists and resolve its language. The language is the
+    # namespace's, never the request's: the snapshot taken here travels in the
+    # scan/ingestion job input so the workers need not (and must not) re-read it.
     ns_item = _get_ns_dao().get({"PK": f"NS#{namespace_id}", "SK": "METADATA"})
     if not ns_item:
         return api_response(404, {"error": f"Namespace not found: {namespace_id}"})
+    namespace_language = namespace_language_from_item(ns_item, namespace_id)
 
     if req.source_type == SourceType.DATABASE:
         if not req.database_source:
             return api_response(400, {"error": "databaseSource is required when sourceType=DATABASE"})
-        return _create_database_source(req.database_source, namespace_id)
+        return _create_database_source(req.database_source, namespace_id, namespace_language=namespace_language)
     else:
         if not req.document_source:
             return api_response(400, {"error": "documentSource is required when sourceType=DOCUMENTS"})
-        return _create_document_source(req.document_source, namespace_id, event)
+        return _create_document_source(req.document_source, namespace_id, event, namespace_language=namespace_language)
 
 
 # ---------------------------------------------------------------------------
@@ -1510,6 +1519,17 @@ def _handle_rescan(
     if not item:
         return api_response(404, {"error": f"Source '{source_id}' not found"})
 
+    # Snapshot the namespace language for this job before anything is written.
+    # A missing namespace or a failed read fails the re-scan; it never falls
+    # back to English, and nothing in the request can choose the value.
+    try:
+        namespace_language = resolve_namespace_language(_get_ns_dao(), namespace_id)
+    except NamespaceNotFoundError:
+        return api_response(404, {"error": f"Namespace not found: {namespace_id}"})
+    except (ClientError, BotoCoreError, LanguageTagError):
+        logger.exception("namespace_language_resolve_failed", namespace_id=namespace_id, source_id=source_id)
+        return api_response(500, {"error": "Internal server error"})
+
     source_type = item.get("sourceType", "")
     current_status = item.get("status", "")
     now = _now_iso()
@@ -1642,6 +1662,7 @@ def _handle_rescan(
             "source_type": item.get("docSourceType", "s3"),
             "s3_prefixes": item.get("s3Prefixes", []),
             "extraction_config": extraction_config,
+            "namespace_language": namespace_language,
         }
         if item.get("sourceBucketArn"):
             sqs_body["source_bucket_arn"] = item["sourceBucketArn"]
@@ -1726,6 +1747,7 @@ def _handle_rescan(
                     "SK": scan_job_sk,
                     "sourceId": source_id,
                     "namespaceId": namespace_id,
+                    "namespaceLanguage": namespace_language,
                     "status": "IN_PROGRESS",
                     "scanType": "full",
                     "triggerType": trigger,
@@ -1743,11 +1765,15 @@ def _handle_rescan(
                 QueueUrl=_SCAN_QUEUE_URL,
                 MessageBody=json.dumps(
                     {
+                        # The trigger derives the bare sourceId from this for the
+                        # execution input, where the state machine's SCAN_FAILED step
+                        # and the reaper key the sources row on it.
                         "datasourceId": f"DS#{source_id}",
                         "scanJobId": f"SCAN#{str(uuid.uuid4())}",
                         "scanJobPK": f"SRC#{source_id}",
                         "scanJobSK": scan_job_sk,
                         "namespaceId": namespace_id,
+                        "namespaceLanguage": namespace_language,
                         "scanType": "full",
                         # Set when re-scanning an already-approved (or drift-review)
                         # source, including a retry of such a re-scan that failed.
@@ -1821,13 +1847,50 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         return api_response(500, {"error": "Internal server error"})
 
 
+# Source-row attribute holding each automated trigger's on/off switch. MANUAL is
+# absent on purpose: a steward can always re-scan through the API.
+_AUTOMATED_RESCAN_SWITCH: dict[str, str] = {
+    ScanTrigger.SCHEDULED: "rescanSchedule",
+    ScanTrigger.EVENT: "eventRescan",
+}
+
+
+def _automated_rescan_skip_reason(namespace_id: str, source_id: str, trigger: str) -> str | None:
+    """Why an automated re-scan must not start, or None when it may.
+
+    Reads the source row and checks the switch for ``trigger``. Turning a
+    trigger off deletes its schedule or rule, but a delivery already in flight,
+    a schedule or rule that survived a failed delete, or a direct invocation
+    still reaches the consumers, so the record is the authority. Kept out of
+    ``_handle_rescan`` so a manual re-scan works with automation off.
+
+    Raises:
+        ClientError: when the source row cannot be read; the caller decides
+            whether that is retried.
+    """
+    switch = _AUTOMATED_RESCAN_SWITCH.get(trigger)
+    if switch is None:
+        return "not_an_automated_trigger"
+    item = _get_dao().get({"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"})
+    if not item:
+        return "source_not_found"
+    if item.get("sourceType") != SourceType.DATABASE:
+        return "not_a_database_source"
+    config = item.get(switch)
+    if not isinstance(config, dict) or not config.get("enabled"):
+        return f"{switch}_disabled"
+    return None
+
+
 def _handle_scheduled_rescan(event: dict[str, Any]) -> dict[str, Any]:
     """Handle an EventBridge Scheduler invocation: fire a SCHEDULED rescan.
 
     The schedule payload carries the namespace and source ids. This reuses the
     same rescan path as the API (bookkeeping, status transition, enqueue) with
     the trigger stamped SCHEDULED. A rejected rescan (e.g. an active scan) is
-    logged and swallowed — the next scheduled tick will retry.
+    logged and swallowed — the next scheduled tick will retry. A tick for a
+    source whose ``rescanSchedule`` is not enabled, or that is not a database
+    source, is skipped the same way without starting a scan.
 
     Raises:
         ValueError: when the payload carries no ids, which means the schedule
@@ -1840,6 +1903,23 @@ def _handle_scheduled_rescan(event: dict[str, Any]) -> dict[str, Any]:
     if not namespace_id or not source_id:
         logger.error("scheduled_rescan_missing_ids", event_keys=sorted(event.keys()))
         raise ValueError("scheduled rescan payload requires namespaceId and sourceId")
+
+    try:
+        skip_reason = _automated_rescan_skip_reason(namespace_id, source_id, ScanTrigger.SCHEDULED)
+    except ClientError:
+        logger.exception("ddb_get_failed", source_id=source_id)
+        return {"ok": False, "statusCode": 500}
+    if skip_reason:
+        # Returned, not raised: a schedule that outlived its OFF switch would
+        # otherwise run Scheduler's full retry policy on every tick. The warning
+        # is what makes such a schedule visible.
+        logger.warning(
+            "scheduled_rescan_skipped",
+            namespace_id=namespace_id,
+            source_id=source_id,
+            reason=skip_reason,
+        )
+        return {"ok": False, "skipped": skip_reason}
 
     logger.info("scheduled_rescan_triggered", namespace_id=namespace_id, source_id=source_id)
     # Empty event so confirmDiscardOpenReview stays false: a scheduled tick must

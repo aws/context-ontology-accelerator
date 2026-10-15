@@ -1,20 +1,25 @@
 # Build context must be the repo root:
 #   docker build -f packages/sources/database/enrichment/Dockerfile .
 # Pin to digest to prevent supply-chain attacks via tag mutation. The pin is for
-# supply-chain integrity only, NOT patch currency — see the apt-get upgrade below.
-# python:3.12-slim, digest resolved from the tag on 2026-09-01.
-FROM --platform=linux/amd64 public.ecr.aws/docker/library/python:3.12-slim@sha256:f77ac9e44ae96ef2c90b8053ea08c31f8be030f824196b0ae4db6d462c84e51f
+# supply-chain integrity only, NOT patch currency — see the dnf upgrade below.
+# amazonlinux:2023-minimal (not Debian python:3.12-slim, whose OS findings are
+# mostly unfixed upstream), digest resolved from the tag on 2026-10-13.
+FROM --platform=linux/amd64 public.ecr.aws/amazonlinux/amazonlinux:2023-minimal@sha256:fe18d1ee02440b6480eb4a045be052e9aeaf9bf5029368f09d3425ddab2bfa0a
 
 WORKDIR /app
 
-# Apply Debian security patches on top of the pinned base. This image installs no
-# apt packages of its own, so without this layer its OS patch level was frozen at
-# whatever the pinned base shipped — which is how it ended up on openssl
-# 3.5.6-1~deb13u2 with 10 open Inspector findings. `upgrade` (not `dist-upgrade`)
-# keeps this to security and point-release updates from the trixie suites only.
-RUN apt-get update && \
-    apt-get upgrade -y && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
+# Apply AL2023 security updates on top of the pinned base. Runs as numeric UID 1000, so no useradd.
+# python3.12 comes from the AL2023 repos; `python`/`pip` are symlinked because
+# the CMD/ENTRYPOINT and the pip steps below call them unversioned.
+# `--releasever=latest` is what makes the upgrade effective: AL2023 locks dnf to
+# the repo snapshot the base image was cut from, so without it a stale pin
+# freezes the OS patch level exactly as it did on the Debian base.
+RUN dnf upgrade -y --releasever=latest && \
+    dnf install -y --releasever=latest python3.12 python3.12-pip && \
+    ln -sf /usr/bin/python3.12 /usr/local/bin/python && \
+    ln -sf /usr/bin/python3.12 /usr/local/bin/python3 && \
+    ln -sf /usr/bin/pip3.12 /usr/local/bin/pip && \
+    dnf clean all && rm -rf /var/cache/dnf
 
 # Install shared common library
 COPY libs/common/ /tmp/common/

@@ -54,6 +54,7 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import structlog
 
+from ....namespace_language import current_label_preference, row_label
 from ....query_utils import validate_namespace
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, no runtime import
@@ -159,16 +160,22 @@ _ONTOLOGY_PREFIXES = (
     "PREFIX owl: <http://www.w3.org/2002/07/owl#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>"
 )
 
-# The determined node types — every ``owl:Class`` that carries a label.
-_NODE_TYPES_SELECT = "SELECT DISTINCT ?classLabel"
+# The determined node types — every ``owl:Class`` that carries a label. The class
+# IRI and each label's tag are projected so a class with several labels becomes
+# ONE node type, named by the namespace-language preference (LLD §2.2.5).
+_NODE_TYPES_SELECT = "SELECT DISTINCT ?classUri ?classLabel (LANG(?classLabel) AS ?classLabelLang)"
 _NODE_TYPES_BODY = "?classUri a owl:Class .\n?classUri rdfs:label ?classLabel ."
 # The variables the node-type query binds, in projection order.
-_NODE_TYPES_VARS: tuple[str, ...] = ("classLabel",)
+_NODE_TYPES_VARS: tuple[str, ...] = ("classUri", "classLabel", "classLabelLang")
 
 # The determined edge types and their directional domain→range mapping. Domain
 # and range are OPTIONAL so an edge type with no declared source/target class
 # still surfaces in ``edge_types`` (it simply has no ``edge_map`` entry).
-_EDGE_TYPES_SELECT = "SELECT DISTINCT ?propLabel ?domainLabel ?rangeLabel"
+_EDGE_TYPES_SELECT = (
+    "SELECT DISTINCT ?propUri ?propLabel (LANG(?propLabel) AS ?propLabelLang)"
+    " ?domain ?domainLabel (LANG(?domainLabel) AS ?domainLabelLang)"
+    " ?range ?rangeLabel (LANG(?rangeLabel) AS ?rangeLabelLang)"
+)
 _EDGE_TYPES_BODY = (
     "?propUri a owl:ObjectProperty .\n"
     "?propUri rdfs:label ?propLabel .\n"
@@ -182,7 +189,17 @@ _EDGE_TYPES_BODY = (
     "}"
 )
 # The variables the edge-type query binds, in projection order.
-_EDGE_TYPES_VARS: tuple[str, ...] = ("propLabel", "domainLabel", "rangeLabel")
+_EDGE_TYPES_VARS: tuple[str, ...] = (
+    "propUri",
+    "propLabel",
+    "propLabelLang",
+    "domain",
+    "domainLabel",
+    "domainLabelLang",
+    "range",
+    "rangeLabel",
+    "rangeLabelLang",
+)
 
 
 def _graph_wrapped_query(select: str, body: str, graph_uri_prefix: str, graph_iris: list[str] | None = None) -> str:
@@ -242,25 +259,51 @@ def _result_rows(result: Iterable[Any], var_names: tuple[str, ...]) -> list[dict
 def _build_ontology(node_rows: list[dict[str, Any]], edge_rows: list[dict[str, Any]]) -> Ontology:
     """Shape SPARQL binding rows into a sorted, de-duplicated :class:`Ontology`.
 
-    ``node_rows`` bind ``classLabel``; ``edge_rows`` bind ``propLabel`` and
-    optionally ``domainLabel`` / ``rangeLabel``. An edge row contributes an
-    ``edge_map`` triple only when BOTH a domain and a range label are present so
-    every triple is fully directional (Req 3.1). Shared verbatim by both sources.
+    ``node_rows`` bind ``classUri`` / ``classLabel``; ``edge_rows`` bind
+    ``propUri`` / ``propLabel`` and optionally ``domain`` / ``domainLabel`` and
+    ``range`` / ``rangeLabel``, each label with its ``…Lang`` tag. Rows are grouped
+    by IRI and each resource is named once with the request's namespace-language
+    preference, so a class carrying ``"設備"@ja`` and an untagged ``"Equipment"`` is
+    one node type rather than two. A row without an IRI (older fixtures) is keyed
+    by its label. An edge row contributes an ``edge_map`` triple only when BOTH a
+    domain and a range label are present so every triple is fully directional
+    (Req 3.1). Shared verbatim by both sources.
     """
-    node_types = {str(row["classLabel"]) for row in node_rows if row.get("classLabel")}
+    preference = current_label_preference()
 
-    edge_types: set[str] = set()
-    edge_map: set[tuple[str, str, str]] = set()
+    def key(row: dict[str, Any], uri_var: str, label_var: str) -> str:
+        return str(row.get(uri_var) or f"label:{row.get(label_var, '')}")
+
+    class_labels: list[tuple[str, str, str]] = []
+    for row in node_rows:
+        if row.get("classLabel"):
+            class_labels.append((key(row, "classUri", "classLabel"), *row_label(row, "classLabel")))
+    node_types = {label for label in preference.pick_by_resource(class_labels).values() if label}
+
+    prop_labels: list[tuple[str, str, str]] = []
+    end_labels: list[tuple[str, str, str]] = []
+    triples: set[tuple[str, str, str]] = set()
     for row in edge_rows:
-        edge = row.get("propLabel")
-        if not edge:
+        if not row.get("propLabel"):
             continue
-        edge = str(edge)
-        edge_types.add(edge)
-        domain = row.get("domainLabel")
-        rng = row.get("rangeLabel")
+        prop = key(row, "propUri", "propLabel")
+        prop_labels.append((prop, *row_label(row, "propLabel")))
+        domain = key(row, "domain", "domainLabel") if row.get("domainLabel") else ""
+        rng = key(row, "range", "rangeLabel") if row.get("rangeLabel") else ""
+        if domain:
+            end_labels.append((domain, *row_label(row, "domainLabel")))
+        if rng:
+            end_labels.append((rng, *row_label(row, "rangeLabel")))
         if domain and rng:
-            edge_map.add((edge, str(domain), str(rng)))
+            triples.add((prop, domain, rng))
+    edge_label_of = preference.pick_by_resource(prop_labels)
+    end_label_of = preference.pick_by_resource(end_labels)
+    edge_types = {label for label in edge_label_of.values() if label}
+    edge_map = {
+        (edge_label_of[prop], end_label_of[domain], end_label_of[rng])
+        for prop, domain, rng in triples
+        if edge_label_of.get(prop) and end_label_of.get(domain) and end_label_of.get(rng)
+    }
 
     return Ontology(
         node_types=tuple(sorted(node_types)),
@@ -428,7 +471,7 @@ class OntologyFileSource:
     # that guards both the rdflib parse/query (not thread-safe) and the cache. The
     # ontology file is immutable for the process lifetime, so a single resolve per
     # path is correct; the lock makes the first concurrent batch safe.
-    _cache: dict[str, Ontology] = {}
+    _cache: dict[str, tuple[list[dict[str, Any]], list[dict[str, Any]]]] = {}
     _lock = threading.Lock()
 
     def __init__(self, ttl_path: str) -> None:
@@ -456,31 +499,31 @@ class OntologyFileSource:
         return await asyncio.to_thread(self._load_locked)
 
     def _load_locked(self) -> Ontology:
-        """Return the cached :class:`Ontology` for the path, resolving it once under the lock.
+        """Return the :class:`Ontology` for the path, running rdflib at most once.
 
         Double-checked against the cache: a fast pre-lock read avoids contending
         once the path is resolved, and the in-lock re-check ensures only the first
         of a racing cold batch performs the (non-thread-safe) rdflib parse/query
-        while the rest reuse its result.
+        while the rest reuse its result. The cache holds the query ROWS rather than
+        the shaped ontology: label choice follows the calling request's namespace
+        language, so shaping (cheap, no rdflib) runs on every load.
         """
         cached = self._cache.get(self._ttl_path)
-        if cached is not None:
-            return cached
-        with self._lock:
-            cached = self._cache.get(self._ttl_path)
-            if cached is not None:
-                return cached
-            ontology = self._load_sync()
-            self._cache[self._ttl_path] = ontology
-            return ontology
+        if cached is None:
+            with self._lock:
+                cached = self._cache.get(self._ttl_path)
+                if cached is None:
+                    cached = self._load_sync()
+                    self._cache[self._ttl_path] = cached
+        return _build_ontology(*cached)
 
-    def _load_sync(self) -> Ontology:
+    def _load_sync(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """Parse the ``.ttl`` and run the shared, un-graphed SPARQL via rdflib.
 
         Runs the SAME node/edge SELECT bodies the graph source uses — without the
         ``GRAPH`` wrapper, since the parsed file lands in rdflib's default graph —
-        through rdflib's in-memory SPARQL engine, then feeds the rows into the
-        shared :func:`_build_ontology`. No hand-walking of triples.
+        through rdflib's in-memory SPARQL engine and returns the shaped rows for
+        the shared :func:`_build_ontology`. No hand-walking of triples.
         """
         from rdflib import Graph  # lazy import (Req 12.3 discipline)
 
@@ -490,6 +533,4 @@ class OntologyFileSource:
         node_result = graph.query(_default_graph_query(_NODE_TYPES_SELECT, _NODE_TYPES_BODY))
         edge_result = graph.query(_default_graph_query(_EDGE_TYPES_SELECT, _EDGE_TYPES_BODY))
 
-        node_rows = _result_rows(node_result, _NODE_TYPES_VARS)
-        edge_rows = _result_rows(edge_result, _EDGE_TYPES_VARS)
-        return _build_ontology(node_rows, edge_rows)
+        return _result_rows(node_result, _NODE_TYPES_VARS), _result_rows(edge_result, _EDGE_TYPES_VARS)

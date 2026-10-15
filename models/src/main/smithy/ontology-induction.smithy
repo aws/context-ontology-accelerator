@@ -11,6 +11,7 @@ namespace com.amazon.semanticcontext.ontologyinduction
 use com.amazon.semanticcontext.common#ConflictError
 use com.amazon.semanticcontext.common#NotFoundError
 use com.amazon.semanticcontext.common#PaginatedOutput
+use com.amazon.semanticcontext.common#ServiceUnavailableError
 use com.amazon.semanticcontext.common#Uuid
 use com.amazon.semanticcontext.common#ValidationError
 use com.amazon.semanticcontext.metric#DataSourceId
@@ -27,7 +28,9 @@ enum InductionStrategy {
     /// Structured strategy: induce an ontology directly from relational table schemas.
     TABLE_TO_ONTOLOGY = "table_to_ontology"
 
-    /// The RIGOR ontology induction strategy.
+    /// The RIGOR ontology induction strategy. Available only for namespaces
+    /// whose language has the primary subtag `en`; any other namespace is
+    /// rejected with a validation error before a job starts.
     RIGOR_ONTOLOGY = "rigor_ontology"
 
     /// Unstructured strategy: induce an ontology from a lexical knowledge graph.
@@ -574,6 +577,21 @@ operation UpdateProposal {
         /// Revised R2RML mappings in Turtle format.
         r2rmlTurtle: String
 
+        /// Class-level grounding choices keyed by the match's
+        /// sourceTableIdentity, or by its bare sourceTable when that name is
+        /// unique in the proposal. A bare sourceTable that several class-level
+        /// matches share is rejected with ConflictError and nothing is saved.
+        /// Values must be one of the candidates returned with the proposal.
+        /// Grounding choices cannot be combined with Turtle/R2RML edits in the
+        /// same request.
+        groundingOverrides: GroundingOverrideMap
+
+        /// Source tables whose grounding should be cleared so they remain
+        /// novel, keyed like groundingOverrides. Kept separate from
+        /// groundingOverrides because OpenAPI map values cannot faithfully
+        /// preserve Smithy sparse-map nulls.
+        novelTables: GroundingNovelTableList
+
         /// Set true when the revised OWL ontology was uploaded directly to S3
         /// via a presigned PUT (see GetProposalUploadUrls) instead of being sent
         /// inline in `ontologyTurtle` — for large proposals exceeding the API
@@ -583,6 +601,11 @@ operation UpdateProposal {
         /// Set true when the revised R2RML was uploaded via presigned PUT
         /// instead of inline `r2rmlTurtle`. Defaults to false (inline).
         r2rmlUploaded: Boolean
+
+        /// Immutable revision returned by GetProposalUploadUrls. Required when
+        /// either uploaded flag is true so an upload cannot overwrite the
+        /// proposal's currently active artifacts before validation succeeds.
+        uploadRevisionId: Uuid
     }
 
     output := {
@@ -597,14 +620,17 @@ operation UpdateProposal {
         NotFoundError
         ConflictError
         ValidationError
+        ServiceUnavailableError
     ]
 }
 
-/// Get presigned S3 PUT URLs for uploading a large revised proposal Turtle
-/// directly to S3, bypassing the API payload cap. After uploading, call
-/// UpdateProposal with `ontologyUploaded` / `r2rmlUploaded` set (instead of
-/// sending the Turtle inline). The write-side mirror of the presigned-GET
-/// read path exposed on GetProposal.
+/// Get create-only presigned S3 PUT URLs for a large revised proposal Turtle.
+/// Each direct PUT must send `If-None-Match: *`, which is a signed S3 header,
+/// and may create its artifact key only once. After every requested upload
+/// succeeds, call UpdateProposal with `ontologyUploaded` / `r2rmlUploaded` set.
+/// A 409, 412, or ambiguous network outcome requires requesting a fresh
+/// revision and re-uploading every changed artifact; callers must not reuse the
+/// prior URLs or assume that an uncertain write succeeded.
 @http(method: "POST", uri: "/namespaces/{namespaceId}/proposals/{proposalId}/upload-url", code: 200)
 operation GetProposalUploadUrls {
     input := {
@@ -618,10 +644,22 @@ operation GetProposalUploadUrls {
     }
 
     output := {
-        /// Presigned S3 PUT URL for uploading the revised OWL ontology Turtle.
+        /// Revision containing both create-only upload targets. Pass this value
+        /// to UpdateProposal as uploadRevisionId only after every requested PUT
+        /// succeeds.
+        @required
+        revisionId: Uuid
+
+        /// Create-only S3 PUT URL for the revised OWL ontology Turtle. Send
+        /// `If-None-Match: *`; after 409, 412, or an ambiguous outcome, request
+        /// a fresh revision rather than reusing this URL.
+        @required
         ontologyPutUrl: String
 
-        /// Presigned S3 PUT URL for uploading the revised R2RML Turtle.
+        /// Create-only S3 PUT URL for the revised R2RML Turtle. Send
+        /// `If-None-Match: *`; after 409, 412, or an ambiguous outcome, request
+        /// a fresh revision rather than reusing this URL.
+        @required
         r2rmlPutUrl: String
     }
 
@@ -948,6 +986,11 @@ structure ConceptMatch {
     @required
     sourceTable: String
 
+    /// Stable data-source-qualified identity for the source table. New
+    /// structured inductions populate this so same-named tables remain
+    /// distinguishable; absent on legacy and unstructured matches.
+    sourceTableIdentity: String
+
     /// Source column the match originates from.
     @required
     sourceColumn: String
@@ -1064,7 +1107,24 @@ structure EmbeddingResult {
     index: String
 }
 
-// ── Lists ───────────────────────────────────────────────────────────
+// ── Collections ─────────────────────────────────────────────────────
+/// Non-empty absolute grounding target URI. Runtime validation also rejects
+/// whitespace, non-printable characters, and relative references for callers
+/// that bypass generated Smithy clients.
+@length(min: 1, max: 2048)
+string GroundingOverrideTargetUri
+
+/// Source-table grounding choices. Values are candidate ontology class URIs.
+map GroundingOverrideMap {
+    key: String
+    value: GroundingOverrideTargetUri
+}
+
+/// Source tables whose grounding should be cleared so they remain novel.
+list GroundingNovelTableList {
+    member: String
+}
+
 list DataSourceIdList {
     member: DataSourceId
 }

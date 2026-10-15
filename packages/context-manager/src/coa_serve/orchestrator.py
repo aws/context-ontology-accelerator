@@ -1225,6 +1225,12 @@ class Orchestrator:
         has_structured_source: bool = True,
         has_unstructured_source: bool = True,
     ) -> InvokeResponse:
+        # options.includeSupporting=False omits supportingContent from the response
+        # (default True). Tier 3 still retrieves and synthesizes over the chunks;
+        # only the response payload drops them. Checked `is not False` so any other
+        # value (absent, None, True) keeps the chunks — the Smithy/REST default.
+        include_supporting = (options or {}).get("includeSupporting") is not False
+
         # Deep-reasoning Tier-3 path (opt-in). Engaged per-request via
         # options.mode=="deep-reasoning" or as the deployment default. Returns the
         # same Tier3Result contract, so the assembler tail below is shared. When
@@ -1255,7 +1261,7 @@ class Orchestrator:
             )
             result = self._assembler.assemble_tier3(
                 synthesized_answer=tier3_result.synthesized_answer,
-                supporting_content=tier3_result.supporting_content,
+                supporting_content=tier3_result.supporting_content if include_supporting else None,
                 graph_context=tier3_result.graph_context,
                 confidence=tier3_result.confidence,
                 guardrail_blocked=tier3_result.guardrail_blocked,
@@ -1316,7 +1322,7 @@ class Orchestrator:
 
         result = self._assembler.assemble_tier3(
             synthesized_answer=tier3_result.synthesized_answer,
-            supporting_content=tier3_result.supporting_content,
+            supporting_content=tier3_result.supporting_content if include_supporting else None,
             graph_context=tier3_result.graph_context,
             confidence=tier3_result.confidence,
             guardrail_blocked=tier3_result.guardrail_blocked,

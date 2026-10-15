@@ -36,7 +36,9 @@ Design notes:
   ``GroundingRerankError`` (LLM rerank infrastructure failure — Bedrock error
   after retries, truncated/blocked stopReason, unparseable output) is re-raised
   so the job fails loud instead of silently grounding every class novel — the
-  documented fail-loud guarantee (issue #59), matching the structured path.
+  documented fail-loud guarantee (issue #59), matching the structured path. A
+  ``GroundingLookupError`` (the lexical metadata listing failed or exceeded a
+  bound) is re-raised for the same reason.
 - **No-op when disabled.** Empty/None ``ontology_ids`` or a ``None`` service
   → returns an empty graph and the pipeline behaves exactly as pre-grounding.
 """
@@ -44,31 +46,71 @@ Design notes:
 from __future__ import annotations
 
 import logging
-import re
+import unicodedata
 from dataclasses import dataclass
 
 from rdflib import OWL, RDF, RDFS, XSD, Graph, Literal, Namespace, URIRef
 from rdflib.namespace import SKOS
 
 from coa_ontology.inducer.schemas import ConceptMatch
-from coa_ontology.inducer.services.grounding import GroundingRerankError, GroundingService
+from coa_ontology.inducer.services.grounding import (
+    GroundingLookupError,
+    GroundingRerankError,
+    GroundingService,
+)
+from coa_ontology.inducer.services.unicode_normalization import (
+    filter_letters_marks_numbers,
+    simple_case_identity,
+    strict_percent_decode,
+    width_only_nfkc,
+)
 
 log = logging.getLogger(__name__)
 
 
 def _normalize_name_key(name: str) -> str:
-    """Build a canonical key for name matching by stripping non-alphanumerics and lowercasing.
+    """Build a canonical key for name matching by stripping separators and lowercasing.
 
     Mirrors the web-app's ``grounding.ts::normalizeNameKey`` so the SPACED grounding
     label ("Financial Instrument") and the Turtle's CamelCase ``rdfs:label``
     ("FinancialInstrument") both collapse to ``financialinstrument`` and join.
+    **Both implementations must change together** — the whole point is that the two
+    sides produce the same key, so a fix applied to one alone breaks the join it
+    exists to make.
+
+    Keeps letters, digits, and combining marks attached to those base
+    characters in every script. Orphan marks are discarded so removed symbols
+    cannot leave identical mark-only keys. The previous ``[^a-zA-Z0-9]`` filter
+    judged by ASCII range, which broke the join in two ways:
+
+    - A class label in any non-Latin script keyed to ``""``. Since the key is used
+      for dictionary lookup and equality, every such label collided on one bucket
+      — so grounding results attached to the wrong class rather than simply
+      failing to attach.
+    - A Latin label lost the accented letter itself rather than its case
+      (``HÖHE`` → ``hhe``, ``ÓRGÃO`` → ``rgo``). Both sides mangled it identically,
+      so the join still worked; the harm is that two labels differing only in an
+      accent became one key.
+
+    Canonical composition runs before filtering so canonically equivalent input
+    forms produce one key. Marks that do not compose — such as Devanagari and Thai
+    vowel signs — remain part of the key instead of collapsing distinct words.
+    Recomposition after filtering also makes separators between Hangul Jamo a
+    one-pass operation rather than changing the key on a second normalization.
+
+    Simple one-code-point case folding is shared with the browser contract. It
+    unifies ordinary case variants such as Greek final sigma while rejecting
+    expansions: ``Straße`` stays distinct from ``STRASSE`` in both runtimes.
     """
-    return re.sub(r"[^a-zA-Z0-9]", "", name).lower()
+    normalized = unicodedata.normalize("NFC", simple_case_identity(width_only_nfkc(name)))
+    filtered = filter_letters_marks_numbers(normalized, keep_symbols=True)
+    return unicodedata.normalize("NFC", filtered)
 
 
 def _local_name(uri: str) -> str:
-    """Local name of an IRI — the segment after the last ``#`` or ``/``."""
-    return uri.split("#")[-1].split("/")[-1] or uri
+    """Strictly percent-decoded local name of an IRI."""
+    local_name = uri.split("#")[-1].split("/")[-1] or uri
+    return strict_percent_decode(local_name)
 
 
 @dataclass
@@ -190,6 +232,12 @@ def ground_classes(
             # (issue #59). The broad handler below would otherwise swallow it,
             # which is exactly the silent all-novel degradation the documented
             # fail-loud guarantee forbids. Must precede the broad except.
+            raise
+        except GroundingLookupError:
+            # The lexical metadata listing failed or exceeded a bound, so the
+            # candidate set is incomplete. Leaving the class novel here would
+            # drop a grounding the dense recall may already have found, so fail
+            # the job, matching the structured path. Must precede the broad except.
             raise
         except Exception:
             # Fail-open for a genuine per-class fault (e.g. a bad vector or a
@@ -366,14 +414,21 @@ def apply_overrides_to_turtle(
 
     Args:
         turtle: The stored induced-ontology Turtle.
-        matches: The patched ConceptMatch list (post-override), keyed by
-            ``source_table`` == class label.
+        matches: Only the patched ConceptMatch entries selected in this save,
+            keyed by ``source_table`` == class label. Untouched historical
+            matches are deliberately excluded so a class removed by a prior
+            direct Turtle edit cannot block an unrelated grounding change.
         uri_prefix: Proposal namespace prefix, for the ``matchConfidence``
             annotation-property IRI. When empty, matchConfidence is omitted.
 
     Returns:
         ``(new_turtle, grounded_count)`` — the re-serialized Turtle and the
-        number of classes that carry a grounding link afterward.
+        total number of classes in the final graph that carry a grounding link.
+
+    Raises:
+        ValueError: If a match cannot be associated with exactly one class. The
+            caller must abort all persistence so match metadata and RDF cannot
+            diverge.
     """
     g = Graph()
     g.parse(data=turtle, format="turtle")
@@ -383,27 +438,41 @@ def apply_overrides_to_turtle(
         match_confidence_prop = Namespace(uri_prefix)["matchConfidence"]
         g.add((match_confidence_prop, RDF.type, OWL.AnnotationProperty))
 
-    # Map class → class IRI by NORMALIZED-NAME key (strip non-alphanumerics,
-    # lowercase — mirrors the web-app's grounding.ts::normalizeNameKey). The
-    # match's source_table is the SPACED label ("Financial Instrument") the
-    # grounding step used, while the Turtle's rdfs:label is the CamelCase form
-    # ("FinancialInstrument"); a raw string compare misses. Normalizing both
-    # sides makes them join (both → "financialinstrument"). The class IRI
-    # local-name is also indexed as a fallback for label-less classes.
-    key_to_iri: dict[str, URIRef] = {}
+    # Index both exact names and the legacy normalized join. Exact label/local
+    # identity wins; the lossy key is only a fallback for transforms such as
+    # ``Financial Instrument`` → ``FinancialInstrument`` and must be unique.
+    exact_name_to_iris: dict[str, set[URIRef]] = {}
+    key_to_iris: dict[str, set[URIRef]] = {}
     for cls in g.subjects(RDF.type, OWL.Class):
-        for lbl in g.objects(cls, RDFS.label):
-            key_to_iri.setdefault(_normalize_name_key(str(lbl)), cls)  # type: ignore[arg-type]
-        key_to_iri.setdefault(_normalize_name_key(_local_name(str(cls))), cls)  # type: ignore[arg-type]
+        if not isinstance(cls, URIRef):
+            continue
+        names = [str(label) for label in g.objects(cls, RDFS.label)]
+        names.append(_local_name(str(cls)))
+        for name in names:
+            exact_name_to_iris.setdefault(name, set()).add(cls)
+            key = _normalize_name_key(name)
+            if key:
+                key_to_iris.setdefault(key, set()).add(cls)
 
-    grounded = 0
     for m in matches:
         if m.source_column:  # class-level matches only
             continue
-        class_uri = key_to_iri.get(_normalize_name_key(m.source_table))
-        if class_uri is None:
-            log.warning("override: no class matching %r in Turtle; skipping", m.source_table)
-            continue
+
+        exact_uris = exact_name_to_iris.get(m.source_table, set())
+        if len(exact_uris) == 1:
+            class_uri = next(iter(exact_uris))
+        elif len(exact_uris) > 1:
+            raise ValueError(f"class label {m.source_table!r} matches multiple classes exactly")
+        else:
+            match_key = _normalize_name_key(m.source_table)
+            if not match_key:
+                raise ValueError(f"class label {m.source_table!r} has an empty normalized key")
+            class_uris = key_to_iris.get(match_key, set())
+            if not class_uris:
+                raise ValueError(f"no class matching {m.source_table!r} in ontology Turtle")
+            if len(class_uris) > 1:
+                raise ValueError(f"normalized class label {m.source_table!r} matches {len(class_uris)} classes")
+            class_uri = next(iter(class_uris))
 
         # Clean replace: drop the prior grounding axioms for this class first —
         # but ONLY the edges pointing at a FOUNDATIONAL target (outside the
@@ -419,10 +488,8 @@ def apply_overrides_to_turtle(
         if match_confidence_prop is not None:
             g.remove((class_uri, match_confidence_prop, None))
 
-        if (
-            m.matched_class_uri
-            and m.match_type != "novel"
-            and _emit_grounding_axioms(
+        if m.matched_class_uri and m.match_type != "novel":
+            _emit_grounding_axioms(
                 g,
                 class_uri=class_uri,
                 match_type=m.match_type,
@@ -431,7 +498,21 @@ def apply_overrides_to_turtle(
                 match_confidence_prop=match_confidence_prop,
                 relationship=getattr(m, "relationship", None),
             )
-        ):
-            grounded += 1
 
-    return g.serialize(format="turtle"), grounded
+    # ``matches`` may contain only the changed subset, so count grounding from
+    # the final graph rather than from the number of entries processed above.
+    # Every accepted grounding emitted by this module carries exactly one SKOS
+    # relationship; using those links avoids counting an ordinary foundational
+    # rdfs:subClassOf axiom as a grounding choice.
+    grounding_relationships = _GROUNDING_PREDICATES[1:]
+    grounded_classes: set[URIRef] = set()
+    for predicate in grounding_relationships:
+        for subject, target in g.subject_objects(predicate):
+            if (
+                isinstance(subject, URIRef)
+                and isinstance(target, URIRef)
+                and _is_foundational_target(str(target), uri_prefix)
+            ):
+                grounded_classes.add(subject)
+
+    return g.serialize(format="turtle"), len(grounded_classes)

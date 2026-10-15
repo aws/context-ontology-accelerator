@@ -17,6 +17,7 @@ from dataclasses import dataclass
 import structlog
 
 from ..clients.base import GraphClient
+from ..namespace_language import current_label_preference, row_label
 from ..query_utils import (
     MAX_QUERY_CODEPOINTS,
     MAX_SEARCH_TOKEN_CODEPOINTS,
@@ -241,7 +242,8 @@ class GraphTraverser:
         # across identical requests without claiming a relevance order the query
         # cannot express.
         return f"""
-        SELECT ?entity ?label ?type ?predicate ?related ?relLabel
+        SELECT ?entity ?label (LANG(?label) AS ?labelLang) ?type ?predicate ?related
+               ?relLabel (LANG(?relLabel) AS ?relLabelLang)
         WHERE {{
           GRAPH ?g {{
             ?entity rdfs:label ?label ;
@@ -391,7 +393,8 @@ class GraphTraverser:
         # aborted at 15s); the seed set is already capped at 10 URIs, keeping the
         # common case cheap.
         return f"""
-        SELECT ?entity ?label ?type ?relPredicate ?related ?relLabel
+        SELECT ?entity ?label (LANG(?label) AS ?labelLang) ?type ?relPredicate ?related
+               ?relLabel (LANG(?relLabel) AS ?relLabelLang)
         WHERE {{
           GRAPH ?g {{
             VALUES ?seed {{ {values_clause} }}
@@ -402,74 +405,54 @@ class GraphTraverser:
         """
 
     def _parse_results(self, results: list[dict]) -> list[GraphEntity]:
-        entities_map: dict[str, GraphEntity] = {}
-        rels_map: dict[str, list[dict]] = {}
-        for row in results:
-            uri = row.get("entity", "")
-            if not uri:
-                continue
-            if uri not in entities_map:
-                entities_map[uri] = GraphEntity(
-                    uri=uri,
-                    label=row.get("label", ""),
-                    type=row.get("type", ""),
-                )
-                rels_map[uri] = []
-            if row.get("predicate") and row.get("related"):
-                rels_map[uri].append(
-                    {
-                        "predicate": row["predicate"],
-                        "target_uri": row["related"],
-                        "target_label": row.get("relLabel", ""),
-                    }
-                )
-        return [
-            GraphEntity(
-                uri=e.uri,
-                label=e.label,
-                type=e.type,
-                relationships=tuple(rels_map[e.uri]),
-            )
-            for e in entities_map.values()
-        ]
+        return _group_entities(results, predicate_var="predicate")
 
     def _parse_hop_results(self, results: list[dict]) -> list[GraphEntity]:
-        entities_map: dict[str, GraphEntity] = {}
-        rels_map: dict[str, list[dict]] = {}
-        seen_rels: dict[str, set[tuple[str, str]]] = {}
-        for row in results:
-            uri = row.get("entity", "")
-            if not uri:
-                continue
-            if uri not in entities_map:
-                entities_map[uri] = GraphEntity(
-                    uri=uri,
-                    label=row.get("label", ""),
-                    type=row.get("type", ""),
-                )
-                rels_map[uri] = []
-                seen_rels[uri] = set()
+        return _group_entities(results, predicate_var="relPredicate")
 
-            if row.get("relPredicate") and row.get("related"):
-                # De-dupe: the induced graph often carries the same domain/range
-                # triple twice, and a property can bridge to several classes.
-                key = (row["relPredicate"], row["related"])
-                if key not in seen_rels[uri]:
-                    seen_rels[uri].add(key)
-                    rels_map[uri].append(
-                        {
-                            "predicate": row["relPredicate"],
-                            "target_uri": row["related"],
-                            "target_label": row.get("relLabel", ""),
-                        }
-                    )
 
-        return [
-            GraphEntity(
-                uri=e.uri,
-                label=e.label,
-                type=e.type,
-                relationships=tuple(rels_map[e.uri]),
-            )
-            for e in entities_map.values()
-        ]
+def _group_entities(results: list[dict], *, predicate_var: str) -> list[GraphEntity]:
+    """Fold traversal rows into one :class:`GraphEntity` per entity URI.
+
+    A resource with several ``rdfs:label`` values arrives once per label (and a
+    related node once per ITS labels). Labels are collected per URI and chosen
+    with the request's namespace-language preference (LLD §2.2.5), so the label
+    does not depend on row order and no entity or relationship is dropped for its
+    language. Entities keep first-seen order; each ``(predicate, target)``
+    relationship appears once — the induced graph often carries the same
+    domain/range triple twice, and a property can bridge to several classes.
+    """
+    preference = current_label_preference()
+    types: dict[str, str] = {}
+    labels: dict[str, list[tuple[str, str]]] = {}
+    rels: dict[str, dict[tuple[str, str], list[tuple[str, str]]]] = {}
+    for row in results:
+        uri = row.get("entity", "")
+        if not uri:
+            continue
+        if uri not in types:
+            types[uri] = row.get("type", "")
+            labels[uri] = []
+            rels[uri] = {}
+        elif not types[uri] and row.get("type"):
+            types[uri] = row["type"]
+        label = row_label(row, "label")
+        if label[0]:
+            labels[uri].append(label)
+        if row.get(predicate_var) and row.get("related"):
+            target_labels = rels[uri].setdefault((row[predicate_var], row["related"]), [])
+            target_label = row_label(row, "relLabel")
+            if target_label[0]:
+                target_labels.append(target_label)
+    return [
+        GraphEntity(
+            uri=uri,
+            label=preference.pick(labels[uri]),
+            type=types[uri],
+            relationships=tuple(
+                {"predicate": predicate, "target_uri": target, "target_label": preference.pick(target_labels)}
+                for (predicate, target), target_labels in rels[uri].items()
+            ),
+        )
+        for uri in types
+    ]

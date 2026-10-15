@@ -30,3 +30,9 @@ export type { RuntimeConfig } from "./types";
 export { NAMESPACE_ID_PREFIX } from "./namespace";
 export { PrincipalType, ResourceType, sanitizePrincipalKey } from "./authnz";
 export type { ResourceRoleMapping } from "./authnz";
+export {
+  DEFAULT_LANGUAGE,
+  LanguageTagError,
+  canonicalizeLanguageTag,
+  primaryLanguage,
+} from "./language-tags";

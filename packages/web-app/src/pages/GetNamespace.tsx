@@ -40,6 +40,7 @@ import {
   VkgHealthStatus,
 } from "@coa/control-plane-client";
 import { useApiClient } from "@components/ApiClientProvider";
+import { formatNamespaceLanguage } from "@utils";
 import { listOntologies } from "../services/ontology-engine";
 import type { OntologyRecord } from "../services/ontology-engine";
 
@@ -135,6 +136,21 @@ export const GetNamespace: React.FC = () => {
             { label: "Namespace ID", value: ns.namespaceId },
             { label: "Name", value: ns.name },
             { label: "Owner", value: ns.owner },
+            {
+              label: "Language",
+              info: (
+                <Popover
+                  dismissButton={false}
+                  position="top"
+                  triggerType="text"
+                  header="Namespace language"
+                  content="Set when the namespace was created and cannot be changed."
+                >
+                  Info
+                </Popover>
+              ),
+              value: formatNamespaceLanguage(ns.language),
+            },
             {
               label: "Status",
               value: (

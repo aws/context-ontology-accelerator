@@ -28,7 +28,7 @@ from coa_common.constants import URN_PREFIX as _URN_PREFIX
 from coa_common.sql_safety import select_tier1_sql_expression
 
 from coa_serve.query_utils import get_graph_uri_template, is_unspaced_script_letter, iter_word_tokens
-from coa_serve.tier1.stopwords import RESIDUAL_STOP_WORDS
+from coa_serve.tier1.stopwords import RESIDUAL_STOP_WORDS, SAFE_PARTICLE_RUNS
 
 if TYPE_CHECKING:
     from coa_serve.clients.neptune import NeptuneGraphClient
@@ -355,26 +355,41 @@ def _is_stop_scaffolding(token: str) -> bool:
     Restricted to hiragana-only tokens on purpose. Hiragana carries Japanese
     grammar; the qualifier classes this gate exists to catch — dimension values,
     entity names, time windows, aggregate modifiers — are written with kanji,
-    katakana, Latin, or digits, which this decomposition never touches. A
-    hiragana content word that is NOT fully composed of listed
-    particles/copula fragments (きのう, いま, すべて) still fails the
-    decomposition and trips the gate — the safe direction.
+    katakana, Latin, or digits, which this decomposition never touches.
+    Two one-scalar particles in a row are ambiguous: the same shape spells
+    content words such as ごご, もも and かが, anywhere in the run (ごごの,
+    はごごですか). The decomposition therefore never takes two consecutive
+    one-scalar steps. A grammatical pair such as では or には passes only as a
+    whole entry of ``SAFE_PARTICLE_RUNS``, which the decomposition treats as a
+    multi-scalar fragment. Other hiragana content words fail decomposition and
+    trip the gate — the safe direction.
     """
-    if token in _RESIDUAL_STOP_WORDS:
+    if token in _RESIDUAL_STOP_WORDS or token in SAFE_PARTICLE_RUNS:
         return True
     if not _HIRAGANA_RUN_RE.fullmatch(token):
         return False
     if len(token) > _MAX_SCAFFOLDING_RUN:
         return False
-    # DP over prefix positions: reachable[i] ⇔ token[:i] splits into stop words.
-    reachable = [True] + [False] * len(token)
-    for i in range(len(token)):
-        if not reachable[i]:
+    # DP over prefix positions with the length of the last step as state:
+    # after_multi[i] — token[:i] decomposes and its last fragment is longer than
+    # one scalar (or i == 0); after_single[i] — it decomposes and its last
+    # fragment is one scalar. A one-scalar step may only follow after_multi, so
+    # one multi-scalar fragment elsewhere in the run cannot vouch for an
+    # adjacent pair of one-scalar steps.
+    n = len(token)
+    after_multi = [True] + [False] * n
+    after_single = [False] * (n + 1)
+    for i in range(n):
+        if not (after_multi[i] or after_single[i]):
             continue
-        for j in range(i + 1, len(token) + 1):
-            if token[i:j] in _RESIDUAL_STOP_WORDS:
-                reachable[j] = True
-    return reachable[len(token)]
+        for j in range(i + 1, n + 1):
+            piece = token[i:j]
+            if j - i == 1:
+                if after_multi[i] and piece in _RESIDUAL_STOP_WORDS:
+                    after_single[j] = True
+            elif piece in _RESIDUAL_STOP_WORDS or piece in SAFE_PARTICLE_RUNS:
+                after_multi[j] = True
+    return after_multi[n] or after_single[n]
 
 
 _FUZZY_MATCH_THRESHOLD = 0.88
@@ -445,6 +460,55 @@ def merge_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
         else:
             merged.append((start, end))
     return merged
+
+
+def _strictly_contained_metric_ids(matched_spans: dict[str, list[tuple[int, int]]]) -> set[str]:
+    """Return candidates whose matched text is wholly subsumed by another metric.
+
+    The rule is script-independent: longest match wins. It matters most for
+    unspaced-script aliases, which use substring matching, so a shorter alias
+    (設備台数) matches inside a longer, more specific one (老朽設備台数) and
+    counting both would turn a single-metric question into an ambiguous
+    multi-metric one. Latin aliases can nest too even with word boundaries:
+    ``revenue`` inside ``total revenue`` in "what is total revenue" now resolves
+    to the ``total revenue`` metric instead of bypassing Tier 1.
+
+    A candidate is removed only when ONE other metric covers every span it
+    matched and at least one covering span is strictly larger. Coverage is
+    checked against that metric's spans after :func:`merge_spans`, which also
+    joins adjacent spans, so two touching aliases of the other metric count as
+    one covering span. Equal spans stay ambiguous, partial overlaps stay two
+    metrics, and a metric that also matches a disjoint part of the question
+    stays independent.
+    """
+    merged_by_metric = {metric_id: merge_spans(spans) for metric_id, spans in matched_spans.items()}
+    contained: set[str] = set()
+
+    for metric_id, spans in merged_by_metric.items():
+        for other_id, other_spans in merged_by_metric.items():
+            if metric_id == other_id:
+                continue
+
+            strictly_covered = False
+            for start, end in spans:
+                covering_span = next(
+                    (
+                        (other_start, other_end)
+                        for other_start, other_end in other_spans
+                        if other_start <= start and end <= other_end
+                    ),
+                    None,
+                )
+                if covering_span is None:
+                    break
+                if covering_span != (start, end):
+                    strictly_covered = True
+            else:
+                if strictly_covered:
+                    contained.add(metric_id)
+                    break
+
+    return contained
 
 
 def residual_tokens(folded_query: str, matched_spans: list[tuple[int, int]]) -> list[str]:
@@ -826,6 +890,15 @@ class MetricResolver:
 
         if not matched_metrics:
             return MetricMatch(found=False, match_count=0)
+
+        # Prefer a candidate that consumes the complete phrase over metrics whose
+        # matches are strictly contained within that same phrase (any script;
+        # unspaced aliases nest most often because they match as substrings).
+        # Do this only after all name and synonym spans have been collected so
+        # genuine matches elsewhere in the query keep the multi-metric signal.
+        for metric_id in _strictly_contained_metric_ids(matched_spans):
+            matched_metrics.pop(metric_id, None)
+            matched_spans.pop(metric_id, None)
 
         first_id = next(iter(matched_metrics))
         defn, source = matched_metrics[first_id]

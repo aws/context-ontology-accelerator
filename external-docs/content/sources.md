@@ -521,6 +521,27 @@ If you don't need AI-generated metadata and want faster scans, disable enrichmen
 
 The source transitions `SCANNING → PENDING_REVIEW` directly, skipping the `ENRICHING` phase. You can toggle `metadataEnrichmentEnabled` later (see "Updating Source-Level Metadata" below), then re-scan the source to run enrichment over it (see "Triggering Re-scans" below). Note that a re-scan only regenerates metadata for items still pending review — anything you have already approved keeps the metadata you approved.
 
+### Language of Generated Metadata
+
+Enrichment writes descriptions, synonyms, glossary terms and tags in the
+language of the source's namespace (see
+[Namespace Language](namespaces.md#namespace-language)). Every scan of the
+source uses that language, including scheduled and event-driven re-scans,
+because a namespace's language cannot change. An English namespace produces
+the same metadata as before the setting existed.
+
+Values that come from the catalog, such as table and column comments, and
+values a steward wrote are kept unchanged, in whatever language they are in.
+
+For each table and column, COA records which of these four fields it generated
+itself, and stores that record with the catalog metadata. A field loses
+that mark when a steward edits it, or when a re-scan replaces it with source
+text, removes it, or merges it with source text. A later enrichment run marks
+the field again only if it regenerates the whole field. Ontology induction
+treats only marked fields as COA-generated text: in a non-English namespace it
+tags those fields with the namespace language and leaves catalog and steward
+text untagged.
+
 ## Reviewing Enriched Metadata
 
 After a scan completes, the source enters `PENDING_REVIEW`. Review the discovered tables and columns before they become queryable.
@@ -1010,6 +1031,21 @@ After creation, documents go through:
 2. **Entity extraction** — identifies concepts and relationships from text
 3. **Knowledge graph build** — creates nodes/edges in Neptune
 4. **Embedding** — vectorizes chunks for semantic search in OpenSearch
+
+### Language of Extracted Content
+
+In a namespace whose language is not English (see
+[Namespace Language](namespaces.md#namespace-language)), the extractor is told
+to write propositions, topics, entity classes, entities and relationship names
+in that language, using the words the documents use. Identifiers such as model
+and part numbers, standard designations, product names, units and codes are
+copied as printed. An English namespace uses the extraction prompts unchanged.
+
+The same instruction applies to `preferredEntityClassifications` and
+`preferredTopics` (see below): COA tells the extractor to treat each English
+entry as a concept and name it in the namespace language, so the recorded name
+can differ from what you supplied. To get your exact names, write the lists in
+the namespace language.
 
 ### Configuring Document Extraction
 

@@ -33,7 +33,7 @@ import logging
 import os
 
 import boto3
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 
 logger = logging.getLogger(__name__)
 
@@ -45,8 +45,25 @@ AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 LF_GRANTOR_ROLE_ARN = os.getenv("LF_GRANTOR_ROLE_ARN", "")
 
 # Serve-runtime principal that queries the data later; granted SELECT/DESCRIBE so
-# Athena can read LF-governed tables once discovery succeeds.
+# Athena can read LF-governed tables once discovery succeeds. Taken from the env
+# when set, else resolved lazily from the SSM parameter named by
+# CONSUMER_QUERY_ROLE_SSM_PARAM (written by the serve stack).
 CONSUMER_QUERY_ROLE_ARN = os.getenv("CONSUMER_QUERY_ROLE_ARN", "")
+CONSUMER_QUERY_ROLE_SSM_PARAM = os.getenv("CONSUMER_QUERY_ROLE_SSM_PARAM", "")
+
+
+def _consumer_query_role_arn() -> str:
+    """Return the serve-runtime role ARN, reading SSM once on first use."""
+    global CONSUMER_QUERY_ROLE_ARN
+    if CONSUMER_QUERY_ROLE_ARN or not CONSUMER_QUERY_ROLE_SSM_PARAM:
+        return CONSUMER_QUERY_ROLE_ARN
+    try:
+        CONSUMER_QUERY_ROLE_ARN = boto3.client("ssm", region_name=AWS_REGION).get_parameter(
+            Name=CONSUMER_QUERY_ROLE_SSM_PARAM
+        )["Parameter"]["Value"]
+    except (ClientError, BotoCoreError):
+        logger.warning("lf_self_grant: could not read %s", CONSUMER_QUERY_ROLE_SSM_PARAM, exc_info=True)
+    return CONSUMER_QUERY_ROLE_ARN
 
 
 def is_access_denied(exc: Exception) -> bool:
@@ -156,14 +173,26 @@ def attempt_self_grant(database: str, catalog_id: str, region: str, *, owner_ver
     if lf is None:
         return False
 
+    consumer_role = _consumer_query_role_arn()
+    if not consumer_role and CONSUMER_QUERY_ROLE_SSM_PARAM:
+        # The serve role is configured but its ARN could not be read. Fail the
+        # self-heal so onboarding reports it, rather than succeeding without the
+        # serve role's SELECT grant and failing later at query time. The next
+        # attempt re-reads the parameter.
+        logger.error(
+            "lf_self_grant: could not resolve the serve runtime role from %s; no grants issued",
+            CONSUMER_QUERY_ROLE_SSM_PARAM,
+        )
+        return False
+
     connector_arn = _caller_role_arn()
     granted_any = False
     try:
         if connector_arn:
             _grant(lf, connector_arn, database, catalog_id, ["DESCRIBE"])
             granted_any = True
-        if CONSUMER_QUERY_ROLE_ARN:
-            _grant(lf, CONSUMER_QUERY_ROLE_ARN, database, catalog_id, ["SELECT", "DESCRIBE"])
+        if consumer_role:
+            _grant(lf, consumer_role, database, catalog_id, ["SELECT", "DESCRIBE"])
         else:
             logger.warning(
                 "lf_self_grant: CONSUMER_QUERY_ROLE_ARN not set — serve runtime role will not "
@@ -180,9 +209,20 @@ def attempt_self_grant(database: str, catalog_id: str, region: str, *, owner_ver
 
 def lf_onboarding_hint(database: str, catalog_id: str) -> str:
     """Actionable message for the Option A fallback (customer-prerequisite grant)."""
-    connector_arn = _caller_role_arn() or "<coa-discovery-connector-role-arn>"
-    consumer = CONSUMER_QUERY_ROLE_ARN or "<coa-serve-runtime-role-arn>"
     cat = f" (catalog {catalog_id})" if catalog_id else ""
+    consumer = _consumer_query_role_arn()
+    if not consumer and CONSUMER_QUERY_ROLE_SSM_PARAM:
+        # Not a missing grant: the serve role itself could not be resolved, so
+        # attempt_self_grant refused to grant anything. Say so instead of
+        # suggesting a cross-account prerequisite with a placeholder principal.
+        return (
+            f"Database '{database}'{cat} is Lake Formation-governed, and Context Ontology Accelerator could not "
+            f"read the serve runtime role ARN from SSM parameter {CONSUMER_QUERY_ROLE_SSM_PARAM}, so it granted "
+            f"no access. Check that the serve stack is deployed and the discovery role can read that parameter, "
+            f"then retry."
+        )
+    connector_arn = _caller_role_arn() or "<coa-discovery-connector-role-arn>"
+    consumer = consumer or "<coa-serve-runtime-role-arn>"
     return (
         f"Database '{database}'{cat} is Lake Formation-governed and Context Ontology Accelerator could not "
         f"self-grant access (this is expected for cross-account or customer-owned catalogs). "

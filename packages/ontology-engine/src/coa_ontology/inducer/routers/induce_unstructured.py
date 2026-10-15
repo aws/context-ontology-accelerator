@@ -39,6 +39,8 @@ import uuid
 from datetime import UTC, datetime
 from threading import Event, Thread
 
+from coa_common.bedrock import FALLBACK_CHAT_MODEL_ID
+from coa_common.language_tags import DEFAULT_LANGUAGE
 from coa_control_plane_server.models.induction_job_status import (
     InductionJobStatus,
 )
@@ -51,6 +53,7 @@ from coa_ontology import dynamo_store
 from coa_ontology.bedrock_embeddings import BedrockEmbeddingClient
 from coa_ontology.inducer.schemas import JobResponse
 from coa_ontology.inducer.services.embedding_generator import EmbeddingGeneratorClient
+from coa_ontology.inducer.services.generated_text import render
 from coa_ontology.inducer.services.grounding import GroundingService
 from coa_ontology.inducer.services.llm import LLMClient
 from coa_ontology.inducer.unstructured.schemas import (
@@ -99,6 +102,30 @@ def start_induction(body: UnstructuredInductionRequest, request: Request, namesp
     Returns HTTP 202 with a :class:`JobResponse`. The pipeline runs
     asynchronously in a daemon worker thread; clients poll
     ``GET /jobs/{job_id}`` to track status.
+
+    The namespace language is resolved here, from the namespace item, and
+    never taken from the request.
+    """
+    from coa_ontology.induce_catalog import namespace_language_or_404
+
+    return start_unstructured_job(
+        body=body,
+        request=request,
+        namespace=namespace,
+        namespace_language=namespace_language_or_404(namespace, request.app.state.config),
+    )
+
+
+def start_unstructured_job(
+    body: UnstructuredInductionRequest,
+    request: Request,
+    namespace: str,
+    namespace_language: str,
+) -> JobResponse:
+    """Start an unstructured job whose namespace language is already resolved.
+
+    Shared by :func:`start_induction` and the structured route's dispatch, so
+    each request resolves the namespace language exactly once.
     """
     job_id = str(uuid.uuid4())
 
@@ -165,7 +192,7 @@ def start_induction(body: UnstructuredInductionRequest, request: Request, namesp
             namespace=namespace,
             ontology_id=body.ontology_uri_prefix,
             source_type=SOURCE_TYPE,
-            label=body.label or "Induced Unstructured Ontology",
+            label=body.label or render("unstructured_proposal_title", namespace_language),
         )
 
         dynamo_store.put_job(
@@ -179,7 +206,7 @@ def start_induction(body: UnstructuredInductionRequest, request: Request, namesp
 
         Thread(
             target=_run_unstructured_induction,
-            args=(job_id, body, namespace, request.app.state.config),
+            args=(job_id, body, namespace, request.app.state.config, namespace_language),
             daemon=True,
         ).start()
     except Exception:
@@ -275,6 +302,7 @@ def _run_unstructured_induction(
     body: UnstructuredInductionRequest,
     namespace: str,
     app_config: dict,
+    namespace_language: str = DEFAULT_LANGUAGE,
 ) -> None:
     """Background worker: build clients, run the pipeline, persist the proposal.
 
@@ -306,6 +334,9 @@ def _run_unstructured_induction(
         app_config: ``request.app.state.config`` snapshot. Used to pick
             up the Bedrock + LLM model defaults configured at app
             startup.
+        namespace_language: Canonical namespace language resolved by the
+            route. Drives class-description prompts, fixed-text templates and
+            RDF language tags.
     """
     ns = namespace
 
@@ -405,10 +436,12 @@ def _run_unstructured_induction(
                 ontology_catalog=StoreOntologyCatalogAdapter(ns_graph, ns_vec, namespace=ns),
                 embedding_generator=EmbeddingGeneratorClient(app_config["embedding_generator_url"]),
                 llm_region=app_config.get("llm_region", "us-east-1"),
-                llm_model_id=app_config.get(
-                    "grounding_llm_model_id",
-                    "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-                ),
+                # Grounding rerank defaults to Haiku (a cheap reranker);
+                # main.py resolves grounding_llm_model_id, overridable with
+                # GROUNDING_LLM_MODEL_ID for a region-valid id (GH #236). `or`
+                # covers an empty value reaching this far — fall back to the
+                # same Haiku literal main.py defaults to.
+                llm_model_id=app_config.get("grounding_llm_model_id") or FALLBACK_CHAT_MODEL_ID,
                 namespace=ns,
             )
 
@@ -422,6 +455,7 @@ def _run_unstructured_induction(
             description_mode=body.description_mode,
             include_individuals=body.include_individuals,
             entailment_enabled=body.entailment_enabled,
+            namespace_language=namespace_language,
             # Pass the resolved pool AS-IS, including an empty list — an empty
             # pool ([] or None) means "no grounding scope" and recall returns no
             # candidates instead of falling back to a namespace-wide search
@@ -474,7 +508,7 @@ def _run_unstructured_induction(
             r2rml_turtle="",  # unstructured sources have no R2RML
             source_type=SOURCE_TYPE,
             metadata={
-                "label": body.label or "Induced Unstructured Ontology",
+                "label": body.label or render("unstructured_proposal_title", namespace_language),
                 "source_type": SOURCE_TYPE,
                 "datasource_ids": body.datasource_ids,
                 "graph_arn": body.graph_arn,
@@ -494,6 +528,9 @@ def _run_unstructured_induction(
                 # so no empty matches.json is written for ungrounded runs.
                 **({"matches": report.groundingMatches} if report.groundingMatches else {}),
                 "warnings": report.warnings,
+                # Diagnostic snapshot of the immutable namespace language this
+                # run used; the namespace remains the authority.
+                "namespaceLanguage": namespace_language,
             },
         )
 

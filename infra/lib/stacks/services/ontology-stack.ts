@@ -30,6 +30,9 @@ import {
   DEFAULT_BEDROCK_INDUCTION_MODEL_ID,
 } from "../../constants";
 
+/** Name (without the `{prefix}-{env}-` prefix) of the ontology API proxy Lambda. */
+export const ONTOLOGY_API_PROXY_FUNCTION_NAME = "ontology-api-proxy";
+
 export interface OntologyStackProps extends cdk.StackProps {
   readonly network: NetworkStack;
   readonly neptuneClusterArn: string;
@@ -64,6 +67,7 @@ export interface OntologyStackProps extends cdk.StackProps {
   readonly bedrockEmbedDimensions?: number;
   readonly bedrockInductionLlmModelId?: string;
   readonly bedrockChatModelId?: string;
+  readonly bedrockGroundingLlmModelId?: string;
   readonly alarmAction?: IAlarmActionStrategy;
 }
 
@@ -113,6 +117,10 @@ export class OntologyStack extends SCLStack {
       props.bedrockInductionLlmModelId ?? DEFAULT_BEDROCK_INDUCTION_MODEL_ID;
     const chatModelId =
       props.bedrockChatModelId ?? DEFAULT_BEDROCK_CHAT_MODEL_ID;
+    // Grounding rerank defaults to the chat (Haiku-class) model — a cheap
+    // reranker — matching the ontology-engine GROUNDING_LLM_MODEL_ID default.
+    const groundingModelId =
+      props.bedrockGroundingLlmModelId ?? chatModelId;
 
     // ── OpenSearch config via SSM ──────────────────────────────────────
     const opensearchEndpoint = ssm.StringParameter.valueForStringParameter(
@@ -221,6 +229,18 @@ export class OntologyStack extends SCLStack {
       | string
       | undefined;
 
+    // String(): context from cdk.json may be a non-string; CLI values always are.
+    const oopsEndpoint = String(
+      this.node.tryGetContext("oops_endpoint") ?? "",
+    ).trim();
+    // The scan POSTs the whole serialised ontology, so never over plaintext.
+    // URL schemes are case-insensitive (RFC 3986), so HTTPS:// is accepted too.
+    if (oopsEndpoint && !/^https:\/\//i.test(oopsEndpoint)) {
+      throw new Error(
+        `oops_endpoint must be an https:// URL (got "${oopsEndpoint}"): the OoPS! scan sends the serialised ontology to it.`,
+      );
+    }
+
     let containerImage: ecs.ContainerImage;
     if (imageUri && ecrRepositoryArn && ecrRepositoryName) {
       const ecrRepo = cdk.aws_ecr.Repository.fromRepositoryAttributes(
@@ -263,6 +283,10 @@ export class OntologyStack extends SCLStack {
         DESCRIPTION_LLM_MODEL_ID: inductionModelId,
         // Shared BedrockClient default (constraint inference / nl_generator).
         BEDROCK_CHAT_MODEL_ID: chatModelId,
+        // Grounding reranker model (ontology-engine). Defaults to the chat
+        // (Haiku-class) model; override via bedrockGroundingLlmModelId for a
+        // region-valid profile on a non-US deploy (GH #236).
+        GROUNDING_LLM_MODEL_ID: groundingModelId,
         LLM_REGION: cdk.Aws.REGION,
         // SSM path to the Bedrock guardrail id — the app resolves it at runtime
         // and applies content filtering to LLM calls (constraint inference).
@@ -276,6 +300,10 @@ export class OntologyStack extends SCLStack {
         SOURCES_API_FN_NAME: `${this.prefixed("sources-api")}`,
         INDUCE_OUTPUT_DIR: "/tmp/induce",
         PORT: String(this.containerPort),
+        // Optional OoPS! pitfall scan (Tier-3 validation). It sends the
+        // serialised ontology to this endpoint, so it is opt-in: absent context
+        // leaves the variable unset and the validator makes no request.
+        ...(oopsEndpoint && { OOPS_ENDPOINT: oopsEndpoint }),
       },
       portMappings: [
         {
@@ -730,8 +758,16 @@ export class OntologyStack extends SCLStack {
     // container environment above (#94) — they used to be duplicate literals, so
     // a model change for a non-US deploy left these widgets querying a
     // dimension with no data.
-    const rerankModelId = inductionModelId; // configured LLM_MODEL_ID
-    const haikuModelId = chatModelId; // actual rerank/enrichment invoker
+    //
+    // Three DISTINCT Bedrock invokers feed these widgets, each priced on its
+    // own tier — never overload one slot across two models, or a token series
+    // gets double-counted / mispriced (grounding is Haiku-class, induction is
+    // Sonnet-class). Grounding defaults to the chat model, so its term/series
+    // is only emitted when it actually differs — otherwise the default deploy
+    // would plot and charge the same Haiku series twice.
+    const sonnetModelId = inductionModelId; // induction + description generation (Sonnet-priced)
+    const haikuModelId = chatModelId; // enrichment / doc-ingestion invoker (Haiku-priced)
+    const groundingDistinct = groundingModelId !== chatModelId;
 
     // ponytail: Hardcoded us-west-2 on-demand list prices (USD per 1K tokens) as of
     // 2026-07-21 — CloudWatch math cannot look prices up, so these MUST be updated by
@@ -920,13 +956,19 @@ export class OntologyStack extends SCLStack {
       new cloudwatch.GraphWidget({
         title: "AWS/Bedrock per-model",
         left: [
-          bedrockModelMetric("Invocations", rerankModelId),
+          bedrockModelMetric("Invocations", sonnetModelId),
           bedrockModelMetric("Invocations", haikuModelId),
+          ...(groundingDistinct
+            ? [bedrockModelMetric("Invocations", groundingModelId)]
+            : []),
           bedrockModelMetric("Invocations", embedModelId),
         ],
         right: [
-          bedrockModelMetric("InvocationThrottles", rerankModelId),
+          bedrockModelMetric("InvocationThrottles", sonnetModelId),
           bedrockModelMetric("InvocationThrottles", haikuModelId),
+          ...(groundingDistinct
+            ? [bedrockModelMetric("InvocationThrottles", groundingModelId)]
+            : []),
           bedrockModelMetric("InvocationThrottles", embedModelId),
         ],
         leftYAxis: { label: "invocations", showUnits: false },
@@ -942,14 +984,31 @@ export class OntologyStack extends SCLStack {
         metrics: [
           new cloudwatch.MathExpression({
             // Total Bedrock spend: tokens are counts, so divide each term by 1000.
+            // si/so = induction (Sonnet), hi/ho = chat/enrichment (Haiku),
+            // ei = embed (input-only). gi/go = grounding (Haiku), added only
+            // when the grounding model differs from the chat model — otherwise
+            // its tokens are already the hi/ho series and would be double-charged.
             // Cohere embed is input-only (no output term).
-            expression: `si*${sonnetInputPer1K}/1000 + so*${sonnetOutputPer1K}/1000 + hi*${haikuInputPer1K}/1000 + ho*${haikuOutputPer1K}/1000 + ei*${embedInputPer1K}/1000`,
+            expression: [
+              `si*${sonnetInputPer1K}/1000 + so*${sonnetOutputPer1K}/1000`,
+              `hi*${haikuInputPer1K}/1000 + ho*${haikuOutputPer1K}/1000`,
+              ...(groundingDistinct
+                ? [`gi*${haikuInputPer1K}/1000 + go*${haikuOutputPer1K}/1000`]
+                : []),
+              `ei*${embedInputPer1K}/1000`,
+            ].join(" + "),
             label: "Est. cost (USD)",
             usingMetrics: {
-              si: bedrockModelMetric("InputTokenCount", rerankModelId),
-              so: bedrockModelMetric("OutputTokenCount", rerankModelId),
+              si: bedrockModelMetric("InputTokenCount", sonnetModelId),
+              so: bedrockModelMetric("OutputTokenCount", sonnetModelId),
               hi: bedrockModelMetric("InputTokenCount", haikuModelId),
               ho: bedrockModelMetric("OutputTokenCount", haikuModelId),
+              ...(groundingDistinct
+                ? {
+                    gi: bedrockModelMetric("InputTokenCount", groundingModelId),
+                    go: bedrockModelMetric("OutputTokenCount", groundingModelId),
+                  }
+                : {}),
               ei: bedrockModelMetric("InputTokenCount", embedModelId),
             },
             period: defaultPeriod,
@@ -985,8 +1044,11 @@ export class OntologyStack extends SCLStack {
           // Rerank errors are intentionally absent — the emitter publishes no
           // rerank-errors metric (out of scope for this consolidation).
           inductionSearch("InductionJobErrors", "Sum", "Job errors"),
-          bedrockModelMetric("InvocationThrottles", rerankModelId),
+          bedrockModelMetric("InvocationThrottles", sonnetModelId),
           bedrockModelMetric("InvocationThrottles", haikuModelId),
+          ...(groundingDistinct
+            ? [bedrockModelMetric("InvocationThrottles", groundingModelId)]
+            : []),
           bedrockModelMetric("InvocationThrottles", embedModelId),
         ],
         width: 24,
@@ -1034,7 +1096,7 @@ export class OntologyStack extends SCLStack {
     // API Proxy Lambda (forwards API Gateway → ECS via Cloud Map DNS)
     // ================================================================
     const apiProxyFn = new lambda.Function(this, "ApiProxyFn", {
-      functionName: this.prefixed("ontology-api-proxy"),
+      functionName: this.prefixed(ONTOLOGY_API_PROXY_FUNCTION_NAME),
       runtime: lambda.Runtime.PYTHON_3_12,
       handler: "coa_ontology.api_proxy_handler.handler",
       // Merges libs/common/src into the asset root so
