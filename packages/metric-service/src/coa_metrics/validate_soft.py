@@ -13,19 +13,28 @@ the deterministic SQL checks.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 import structlog
+
+from coa_metrics.lookups import LOOKUP_NOT_PROVIDED, DataSourceLookup, LookupArgument
 
 logger = structlog.get_logger(__name__)
 
 
-def validate_soft(metric_body: dict[str, Any], namespace: str) -> list[dict[str, str]]:
+def validate_soft(
+    metric_body: dict[str, Any],
+    namespace: str,
+    *,
+    data_source_lookup: LookupArgument = LOOKUP_NOT_PROVIDED,
+) -> list[dict[str, str]]:
     """Run soft validation checks that produce warnings but don't block creation/update.
 
     Args:
         metric_body: Dict with keys: expression.dialects, dataSourceId, sourceTable, ontologyConcepts.
         namespace: The namespace context.
+        data_source_lookup: Optional request-scoped catalog lookup. When
+            omitted, soft validation builds its own lookup.
 
     Returns:
         List of warning dicts with field, message, severity keys.
@@ -38,13 +47,16 @@ def validate_soft(metric_body: dict[str, Any], namespace: str) -> list[dict[str,
         logger.warning("validator_import_failed", error=str(exc))
         return []
 
-    data_source_lookup = None
+    resolved_data_source_lookup = None
     ontology_lookup = None
 
-    try:
-        data_source_lookup = build_data_source_lookup(namespace)
-    except Exception as exc:
-        logger.warning("data_source_lookup_init_failed", error=str(exc))
+    if data_source_lookup is LOOKUP_NOT_PROVIDED:
+        try:
+            resolved_data_source_lookup = build_data_source_lookup(namespace)
+        except Exception as exc:
+            logger.warning("data_source_lookup_init_failed", error=str(exc))
+    else:
+        resolved_data_source_lookup = cast("DataSourceLookup | None", data_source_lookup)
 
     try:
         ontology_lookup = NeptuneOntologyLookup()
@@ -54,7 +66,7 @@ def validate_soft(metric_body: dict[str, Any], namespace: str) -> list[dict[str,
     try:
         result = validate_metric(
             metric_body=metric_body,
-            data_sources_lookup=data_source_lookup,
+            data_sources_lookup=resolved_data_source_lookup,
             ontology_lookup=ontology_lookup,
             namespace=namespace,
         )

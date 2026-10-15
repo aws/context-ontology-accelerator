@@ -1,17 +1,26 @@
 {
   "$schema": "https://raw.githubusercontent.com/nrwl/nx/master/packages/nx/schemas/nx-schema.json",
   "namedInputs": {
-    "default": ["{projectRoot}/**/*", "!{projectRoot}/**/*.md"],
+    "normalizationFixtures": [
+      "{workspaceRoot}/tests/unit/fixtures/normalize-name-key.json"
+    ],
+    "default": [
+      "{projectRoot}/**/*",
+      "!{projectRoot}/**/*.md",
+      "normalizationFixtures"
+    ],
     "python": [
       "{projectRoot}/src/**/*.py",
       "{projectRoot}/tests/**/*.py",
-      "{projectRoot}/pyproject.toml"
+      "{projectRoot}/pyproject.toml",
+      "normalizationFixtures"
     ],
     "typescript": [
       "{projectRoot}/src/**/*.ts",
       "{projectRoot}/src/**/*.tsx",
       "{projectRoot}/tsconfig.json",
-      "{projectRoot}/package.json"
+      "{projectRoot}/package.json",
+      "normalizationFixtures"
     ]
   },
   "targetDefaults": {

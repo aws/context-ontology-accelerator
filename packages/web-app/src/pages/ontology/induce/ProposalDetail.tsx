@@ -37,7 +37,7 @@ import {
   type ProposalValidationFinding,
   type ProposalValidationJob,
 } from "../../../services/ontology-engine";
-import { useApiClient } from "@components/ApiClientProvider";
+import { ApiError, useApiClient } from "@components/ApiClientProvider";
 import {
   OntologyGraphFlow,
   type GraphAttribute,
@@ -190,6 +190,39 @@ function extractInferredClasses(payload: unknown): InferredClass[] {
       "class_uri" in c &&
       typeof c.class_uri === "string",
   );
+}
+
+/**
+ * Turn a failed save into a message that says whether to retry or to fix input.
+ *
+ * The update route distinguishes its failures deliberately: a 503 means the
+ * attempt was abandoned before any write and is safe to repeat, while a 409 or
+ * 400 means the request itself was refused and repeating it unchanged will fail
+ * the same way. Rendering only `error.message` collapsed that distinction, so a
+ * user who hit a transient DynamoDB throttle was told to fix input that was
+ * never wrong. The server's own sentence is always kept — for grounding
+ * overrides it names which class aborted the save.
+ */
+export function describeSaveFailure(error: unknown): string {
+  if (error instanceof ApiError) {
+    switch (error.status) {
+      case 503:
+        return `${error.message} Nothing was saved, so you can retry this save as-is.`;
+      case 409:
+        return `The server refused this save: ${error.message} Retrying unchanged will fail the same way.`;
+      case 400:
+        return `This save was rejected as malformed: ${error.message}`;
+      // 401/403 messages are already written for the reader, and a 5xx other
+      // than 503 carries no retry promise, so neither gets a prefix.
+      default:
+        return error.message;
+    }
+  }
+  // Local guards (the mixed grounding/Turtle check) and presigned-PUT failures
+  // throw ordinary Errors whose messages are already the whole story.
+  return error instanceof Error
+    ? error.message
+    : "Failed to save proposal changes";
 }
 
 const DATATYPE_FINDING_CODE = "MALFORMED_DATATYPE_TOKENS";
@@ -348,7 +381,9 @@ function ValidationResults({
       <Alert type="info" header={`Validation ${job.status}…`}>
         <SpaceBetween direction="horizontal" size="xs">
           <Spinner />
-          <Box>Running HermiT reasoner + structural metrics + OoPS!</Box>
+          <Box>
+            Running HermiT reasoner + structural metrics + OoPS! (if enabled)
+          </Box>
         </SpaceBetween>
       </Alert>
     );
@@ -507,6 +542,9 @@ export function ProposalDetailPage() {
   const [proposal, setProposal] = useState<Proposal | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // Save failures are recoverable editing errors. Keep them separate from the
+  // initial-load error, which replaces the page with a retry screen.
+  const [saveError, setSaveError] = useState<string | null>(null);
   // Inline error for the entity-edit panel. Kept separate from `error` so an
   // apply failure surfaces inside the editor rather than replacing the whole
   // page (the page-level `error` triggers a full-page "Could not load proposal").
@@ -550,11 +588,13 @@ export function ProposalDetailPage() {
   // Legacy proposals still carry them inline; refresh() prefers that when present.
   const [groundingMatches, setGroundingMatches] = useState<ConceptMatch[]>([]);
   const [dirty, setDirty] = useState(false);
-  // Staged grounding overrides (table → chosen foundational URI, or ``null``
-  // to keep the table novel) that are NOT yet persisted. Picking a candidate /
-  // marking novel stages here + marks dirty; sent on the next explicit Save
-  // (not auto-committed on every selection). ``null`` clears grounding — the
-  // backend ``grounding_overrides`` contract is ``dict[str, str | None]``.
+  // Staged grounding overrides (stable table identity, with a bare-table
+  // fallback for legacy matches → chosen foundational URI, or ``null`` to keep
+  // the table novel) that are NOT yet persisted. Picking a candidate / marking
+  // novel stages here + marks dirty; sent on the next explicit Save.
+  // The wire contract splits candidate URIs into ``grounding_overrides`` and
+  // clears into ``novel_tables`` so generated OpenAPI clients never need null
+  // map values. The staged UI state keeps the ergonomic nullable form.
   const [pendingGroundingOverrides, setPendingGroundingOverrides] = useState<
     Record<string, string | null>
   >({});
@@ -585,6 +625,7 @@ export function ProposalDetailPage() {
   const refresh = useCallback(() => {
     if (!proposalId || !namespaceId) return;
     setError(null);
+    setSaveError(null);
     setLoading(true);
     getProposal(apiClient, namespaceId, proposalId)
       .then(async (p) => {
@@ -785,24 +826,52 @@ export function ProposalDetailPage() {
     setEditingEntity(null);
   }
 
+  const ontologyChanged =
+    editedTurtle != null && editedTurtle !== originalTurtleRef.current;
+  const r2rmlChanged =
+    editedR2rml != null && editedR2rml !== originalR2rmlRef.current;
+  const groundingChanged = Object.keys(pendingGroundingOverrides).length > 0;
+  const hasMixedEdits = groundingChanged && (ontologyChanged || r2rmlChanged);
+
+  function discardGroundingChanges() {
+    setPendingGroundingOverrides({});
+    setDirty(ontologyChanged || r2rmlChanged);
+    setSaveError(null);
+  }
+
+  function discardTurtleChanges() {
+    setEditedTurtle(originalTurtleRef.current);
+    setEditedR2rml(originalR2rmlRef.current);
+    setTurtleDraft(originalTurtleRef.current);
+    setTurtleEditMode(false);
+    setR2rmlEditMode(false);
+    setEditingEntity(null);
+    setEditError(null);
+    setParseError(null);
+    setDirty(groundingChanged);
+    setSaveError(null);
+  }
+
   async function saveChanges() {
     if (!proposalId || !namespaceId || !dirty) return;
+    setSaveError(null);
     setUpdating(true);
     try {
-      const ontologyChanged =
-        editedTurtle != null && editedTurtle !== originalTurtleRef.current;
-      const r2rmlChanged =
-        editedR2rml != null && editedR2rml !== originalR2rmlRef.current;
-      const groundingChanged =
-        Object.keys(pendingGroundingOverrides).length > 0;
       if (!ontologyChanged && !r2rmlChanged && !groundingChanged) {
         setUpdating(false);
         return;
       }
+      if (groundingChanged && (ontologyChanged || r2rmlChanged)) {
+        throw new Error(
+          "Grounding overrides and Turtle edits must be saved separately",
+        );
+      }
       const fields: {
         ontology_uploaded?: boolean;
         r2rml_uploaded?: boolean;
-        grounding_overrides?: Record<string, string | null>;
+        grounding_overrides?: Record<string, string>;
+        novel_tables?: string[];
+        upload_revision_id?: string;
       } = {};
       // Upload edited Turtle straight to S3 via presigned PUT, bypassing the
       // 6 MB API Gateway / Lambda request limit (mirror of the presigned-GET
@@ -815,49 +884,67 @@ export function ProposalDetailPage() {
           namespaceId,
           proposalId,
         );
+        fields.upload_revision_id = urls.revisionId;
         if (ontologyChanged && editedTurtle) {
-          await putToPresignedUrl(urls.ontology_put_url, editedTurtle);
+          await putToPresignedUrl(urls.ontologyPutUrl, editedTurtle);
           fields.ontology_uploaded = true;
         }
         if (r2rmlChanged && editedR2rml) {
-          await putToPresignedUrl(urls.r2rml_put_url, editedR2rml);
+          await putToPresignedUrl(urls.r2rmlPutUrl, editedR2rml);
           fields.r2rml_uploaded = true;
         }
       }
-      // Grounding overrides are small; sent inline alongside the upload flags.
+      // Grounding overrides are small and are sent inline only when no Turtle
+      // artifact changed; the server rejects mixed requests as a second guard.
       if (groundingChanged) {
-        fields.grounding_overrides = pendingGroundingOverrides;
+        const groundingOverrides: Record<string, string> = {};
+        const novelTables: string[] = [];
+        for (const [table, uri] of Object.entries(pendingGroundingOverrides)) {
+          if (uri === null) {
+            novelTables.push(table);
+          } else {
+            groundingOverrides[table] = uri;
+          }
+        }
+        if (Object.keys(groundingOverrides).length > 0) {
+          fields.grounding_overrides = groundingOverrides;
+        }
+        if (novelTables.length > 0) {
+          fields.novel_tables = novelTables;
+        }
       }
       await updateProposal(apiClient, namespaceId, proposalId, fields);
       setDirty(false);
       setPendingGroundingOverrides({});
       refresh();
-    } catch (e) {
-      setError((e as Error).message);
+    } catch (error: unknown) {
+      setSaveError(describeSaveFailure(error));
     } finally {
       setUpdating(false);
     }
   }
 
-  // Stage a chosen grounding candidate for a source table. Memoized so the
+  // Stage a chosen grounding candidate for a stable match key. Memoized so the
   // ProposalEntitiesPanel effect that mounts the split panel doesn't re-run on
   // every render (which would reopen the panel each keystroke). Selections are
   // ignored while a save is in flight — saveChanges → refresh() clears the
   // staged map, so a mid-save selection would be lost.
   const stageGroundingCandidate = useCallback(
-    (table: string, uri: string) => {
+    (matchKey: string, uri: string) => {
       if (updating) return;
-      setPendingGroundingOverrides((prev) => ({ ...prev, [table]: uri }));
+      setPendingGroundingOverrides((prev) => ({ ...prev, [matchKey]: uri }));
       setDirty(true);
+      setSaveError(null);
     },
     [updating],
   );
-  // Stage "keep novel" (null clears grounding — see grounding_overrides type).
+  // Stage "keep novel" (serialized as novel_tables by saveChanges).
   const stageGroundingNovel = useCallback(
-    (table: string) => {
+    (matchKey: string) => {
       if (updating) return;
-      setPendingGroundingOverrides((prev) => ({ ...prev, [table]: null }));
+      setPendingGroundingOverrides((prev) => ({ ...prev, [matchKey]: null }));
       setDirty(true);
+      setSaveError(null);
     },
     [updating],
   );
@@ -1124,7 +1211,7 @@ export function ProposalDetailPage() {
                   Cancel
                 </Button>
                 <ButtonWithHint
-                  hint="Read-only quality checks: reasoner consistency (HermiT), structural metrics, and design pitfalls (OoPS!). Doesn't change the proposal."
+                  hint="Read-only quality checks: reasoner consistency (HermiT), structural metrics, and design pitfalls (OoPS!, if enabled). Doesn't change the proposal."
                   onClick={validate}
                   loading={validating}
                   disabled={!editedTurtle}
@@ -1149,9 +1236,38 @@ export function ProposalDetailPage() {
           >
             {(md.label as string) || `Proposal ${proposalId?.slice(0, 8)}…`}
           </Header>
-          {dirty && (
+          {dirty && !hasMixedEdits && (
             <Alert type="info">
               Unsaved edits. Click <strong>Save changes</strong> to upload.
+            </Alert>
+          )}
+          {hasMixedEdits && (
+            <Alert
+              type="warning"
+              header="Choose which edits to save"
+              action={
+                <SpaceBetween direction="horizontal" size="xs">
+                  <Button onClick={discardGroundingChanges}>
+                    Discard grounding choices
+                  </Button>
+                  <Button onClick={discardTurtleChanges}>
+                    Discard Turtle edits
+                  </Button>
+                </SpaceBetween>
+              }
+            >
+              Grounding choices rebuild the ontology, so grounding and Turtle
+              edits must be saved separately.
+            </Alert>
+          )}
+          {saveError && (
+            <Alert
+              type="error"
+              header="Could not save changes"
+              dismissible
+              onDismiss={() => setSaveError(null)}
+            >
+              {saveError}
             </Alert>
           )}
           {acceptResult && (

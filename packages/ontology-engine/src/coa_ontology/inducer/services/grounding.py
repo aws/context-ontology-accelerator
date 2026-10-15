@@ -23,6 +23,7 @@ import re
 import time
 import unicodedata
 from dataclasses import dataclass
+from threading import Lock
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
@@ -31,6 +32,12 @@ from coa_common.bedrock import extract_text_blocks
 from coa_common.bedrock_metrics import CostTracker
 
 from coa_ontology.inducer.schemas import ConceptMatch, MatchCandidate
+from coa_ontology.inducer.services.unicode_normalization import (
+    filter_letters_marks_numbers,
+    simple_case_identity,
+    strict_percent_decode,
+    width_only_nfkc,
+)
 
 log = logging.getLogger(__name__)
 
@@ -51,6 +58,29 @@ class GroundingRerankError(Exception):
     strategy's batch loop re-raises this (rather than degrading to all-novel) so
     the induction job fails loud instead of returning a wrong-but-plausible
     all-novel ontology.
+    """
+
+
+class GroundingLookupError(RuntimeError):
+    """The grounding candidate lookup is incomplete, so no decision can be made.
+
+    Raised when the lexical metadata listing fails or a lookup exceeds a declared
+    bound. Without the full candidate set, "no candidate matched" and "the
+    candidates were never read" look the same, so a table or class that should
+    ground to an existing class would come out novel (a duplicate class with no
+    link to the existing one). Both induction callers re-raise this ahead of
+    their per-batch / per-class fail-open handlers, the same way they treat
+    ``GroundingRerankError``, so the job fails instead of persisting that
+    decision.
+    """
+
+
+class GroundingRecallLimitError(GroundingLookupError):
+    """Grounding metadata exceeded a declared bound.
+
+    An incomplete lexical index can silently classify a real class as novel, so
+    pool, row, and byte overflows fail the induction instead of returning a
+    partial candidate set.
     """
 
 
@@ -85,6 +115,19 @@ _FLAT_RECALL_SPREAD = 0.05
 # name to be a lexical candidate. Two-plus chars drops noise (single letters,
 # stray digits) while keeping the real signal ("area", "tuf" in issue 72).
 _MIN_TOKEN_LEN = 2
+
+# Both dense and lexical recall loop once per selected ontology. The structured
+# pipeline already documents a practical maximum of ten; enforce it here.
+_LEXICAL_INDEX_MAX_ONTOLOGIES = 10
+
+# The previous backends disagreed: Neptune returned 100 rows while OpenSearch
+# returned up to 10,000 full embedding documents. Reserve one row within that
+# backend window for overflow detection, so truncation fails loud instead of
+# becoming a backend-dependent false-novel result.
+_LEXICAL_INDEX_MAX_ENTITIES = 9_999
+_LEXICAL_INDEX_MAX_TOTAL_UTF8_BYTES = 4 * 1024 * 1024
+_LEXICAL_INDEX_MAX_ID_UTF8_BYTES = 2_048
+_LEXICAL_INDEX_MAX_DEFINITION_UTF8_BYTES = 512
 
 _RERANK_SYSTEM = (
     "You are an ontology grounding expert. Given a source database table "
@@ -170,6 +213,17 @@ class GroundingCandidate:
     from_lexical: bool = False
 
 
+@dataclass(frozen=True)
+class _LexicalIndexEntry:
+    """One immutable, metadata-only lexical index row."""
+
+    entity_uri: str
+    ontology_id: str
+    label: str
+    definition: str
+    tokens: frozenset[str]
+
+
 @dataclass
 class GroundingResult:
     """Result of grounding one source column: the chosen match, tier, and rationale."""
@@ -186,28 +240,110 @@ class GroundingResult:
 
 
 def _normalize(s: str) -> str:
-    """Normalize a label for exact-match comparison."""
-    s = unicodedata.normalize("NFKD", s)
-    s = re.sub(r"[^a-z0-9]", "", s.lower())
-    return s
+    """Build a comparison key without merging distinct Unicode words.
+
+    Separators and punctuation are removed, width forms are unified, and Latin
+    diacritics are folded for the existing fuzzy-name behavior. Marks belonging
+    to non-Latin scripts remain significant, and symbols remain literal rather
+    than compatibility-expanding into ASCII text. Ordinary lowercase plus an
+    explicit final-sigma mapping avoids compatibility case-fold collisions.
+    """
+    width_normalized = width_only_nfkc(s)
+    decomposed = unicodedata.normalize("NFD", width_normalized)
+    kept: list[str] = []
+    has_base = False
+    base_is_ascii = False
+    for character in decomposed:
+        category = unicodedata.category(character)[0]
+        if category in "LNS":
+            kept.append(character)
+            has_base = True
+            base_is_ascii = character.isascii() and category in "LN"
+            continue
+        if category == "M":
+            # Generic Latin diacritics remain foldable after an ASCII base, but
+            # script-specific marks are lexical identity. U+0345, for example,
+            # is COMBINING GREEK YPOGEGRAMMENI and must not collapse ``aͅ`` to
+            # plain ``a`` merely because its synthetic test/base is ASCII.
+            is_script_specific = "GREEK" in unicodedata.name(character, "")
+            if has_base and (not base_is_ascii or is_script_specific):
+                kept.append(character)
+            continue
+        if unicodedata.category(character) == "Cf" and has_base:
+            # Preserve attached format characters until the shared helper can
+            # allow only ZWJ/ZWNJ and Unicode TAG sequences. Unsupported format
+            # controls are still discarded there and reset attachment state.
+            kept.append(character)
+            continue
+        has_base = False
+        base_is_ascii = False
+    folded = simple_case_identity("".join(kept))
+    filtered = filter_letters_marks_numbers(folded, keep_symbols=True)
+    return unicodedata.normalize("NFC", filtered)
 
 
 def _tokenize(name: str) -> set[str]:
-    """Lowercase token set from a name, splitting camelCase and snake/kebab/space.
+    """Unicode token set from a name, splitting camelCase and separators.
 
     ``apaAreaGross`` → ``{"apa", "area", "gross"}``; ``tuf_petreg_licence`` →
-    ``{"tuf", "petreg", "licence"}``. Tokens shorter than ``_MIN_TOKEN_LEN`` are
-    dropped. Used only by the lexical retriever — dense recall is unaffected.
+    ``{"tuf", "petreg", "licence"}``; ``顧客`` → ``{"顧客"}``. Short ASCII
+    tokens are dropped, while a one-character non-ASCII identifier remains
+    eligible because it can be a complete word in scripts without Latin-style
+    word boundaries. Used only by the lexical retriever — dense recall is
+    unaffected.
     """
-    spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", " ", name)
-    return {t for t in re.split(r"[^a-z0-9]+", spaced.lower()) if len(t) >= _MIN_TOKEN_LEN}
+    characters = list(width_only_nfkc(name))
+    with_camel_boundaries: list[str] = []
+    for index, character in enumerate(characters):
+        previous = characters[index - 1] if index > 0 else ""
+        following = characters[index + 1] if index + 1 < len(characters) else ""
+        if character.isupper() and (
+            previous.islower() or previous.isdigit() or (previous.isupper() and following.islower())
+        ):
+            with_camel_boundaries.append(" ")
+        with_camel_boundaries.append(character)
+
+    tokens: set[str] = set()
+    current: list[str] = []
+
+    def flush() -> None:
+        if not current:
+            return
+        token = unicodedata.normalize(
+            "NFC",
+            filter_letters_marks_numbers(simple_case_identity("".join(current))),
+        )
+        current.clear()
+        if not token:
+            return
+        has_non_ascii_letter = any(
+            not character.isascii() and unicodedata.category(character).startswith("L") for character in token
+        )
+        if len(token) >= _MIN_TOKEN_LEN or has_non_ascii_letter:
+            tokens.add(token)
+
+    for character in with_camel_boundaries:
+        category = unicodedata.category(character)[0]
+        if category in "LN" or (category == "M" and current):
+            current.append(character)
+        else:
+            flush()
+    flush()
+    return tokens
+
+
+def _utf8_prefix(value: str, max_bytes: int) -> str:
+    """Return a valid UTF-8 prefix no larger than ``max_bytes``."""
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
 
 
 def _local_name(uri: str) -> str:
-    """Extract local name from an IRI."""
-    if "#" in uri:
-        return uri.rsplit("#", 1)[1]
-    return uri.rsplit("/", 1)[-1]
+    """Extract and strictly percent-decode the local name from an IRI."""
+    local_name = uri.rsplit("#", 1)[1] if "#" in uri else uri.rsplit("/", 1)[-1]
+    return strict_percent_decode(local_name)
 
 
 def _recall_spread(candidates: list[GroundingCandidate]) -> float | None:
@@ -309,6 +445,10 @@ class GroundingService:
         # ONLY for default-namespace deployments. Pass the real namespace on
         # multi-namespace deployments or recall hits the empty bare index.
         self._namespace = namespace
+        # One service instance is shared by the structured worker pool and by
+        # one unstructured induction. Build each pool's lexical index once.
+        self._lexical_index_cache: dict[tuple[str, ...], tuple[_LexicalIndexEntry, ...]] = {}
+        self._lexical_index_lock = Lock()
 
     @property
     def bedrock(self):
@@ -462,7 +602,9 @@ class GroundingService:
             )
 
         # Layer 2: Exact-name match check.
-        # In STANDARD mode (no LLM): auto-ground single matches, pick best for multiple.
+        # In STANDARD mode (no LLM): auto-ground a unique exact name. For
+        # multiple exact names, embedding score may disambiguate only when the
+        # maximum itself is unique; equal maxima must not pick recall order.
         # In ENHANCED mode: ALWAYS defer to LLM for domain verification — a name match
         # is NOT sufficient (e.g. Dublin Core "Policy" ≠ insurance "policy").
         exact_matches = self._exact_name_matches(table_name, raw_candidates)
@@ -481,7 +623,21 @@ class GroundingService:
                     mode="STANDARD",
                 )
             else:
-                best = max(exact_matches, key=lambda c: c.lexical_sim)
+                best_score = max(candidate.lexical_sim for candidate in exact_matches)
+                best_matches = [candidate for candidate in exact_matches if candidate.lexical_sim == best_score]
+                if len(best_matches) != 1:
+                    return GroundingResult(
+                        source_table=table_name,
+                        source_column="",
+                        candidates=raw_candidates,
+                        chosen=None,
+                        match_type="novel",
+                        relationship=None,
+                        confidence=None,
+                        reason=(f"Multiple exact-name matches ({len(exact_matches)}) share the top embedding score"),
+                        mode="STANDARD",
+                    )
+                best = best_matches[0]
                 return GroundingResult(
                     source_table=table_name,
                     source_column="",
@@ -492,7 +648,7 @@ class GroundingService:
                     confidence=best.lexical_sim,
                     reason=(
                         f"Multiple exact-name matches ({len(exact_matches)}); "
-                        "picked by embedding score (no LLM in STANDARD mode)"
+                        "picked unique best embedding score (no LLM in STANDARD mode)"
                     ),
                     mode="STANDARD",
                 )
@@ -553,15 +709,51 @@ class GroundingService:
                 mode="ENHANCED",
             )
 
-        # LLM picked a candidate
+        # Resolve the model's returned local name without letting a lossy
+        # comparison key choose the wrong candidate. Prefer the exact label/local
+        # spelling; use normalization only when it identifies one candidate.
         choice_name = rerank_result["choice"]
-        chosen = next(
-            (c for c in raw_candidates if _normalize(_local_name(c.entity_uri)) == _normalize(choice_name)),
-            None,
-        )
+        exact_choices = [
+            candidate
+            for candidate in raw_candidates
+            if choice_name in (candidate.label, _local_name(candidate.entity_uri))
+        ]
+        normalized_choices: list[GroundingCandidate] = []
+        if len(exact_choices) == 1:
+            chosen = exact_choices[0]
+        elif exact_choices:
+            # The reranker returns only a local name, so duplicate exact names
+            # from different ontologies are not distinguishable. Never let
+            # recall ordering silently choose one ontology's concept.
+            chosen = None
+        else:
+            norm_choice = _normalize(choice_name)
+            normalized_choices = (
+                [
+                    candidate
+                    for candidate in raw_candidates
+                    if _normalize(candidate.label) == norm_choice
+                    or _normalize(_local_name(candidate.entity_uri)) == norm_choice
+                ]
+                if norm_choice
+                else []
+            )
+            chosen = normalized_choices[0] if len(normalized_choices) == 1 else None
         if not chosen:
-            # LLM named something not in the candidate list — treat as novel
-            log.warning("LLM chose '%s' which is not in candidates for table '%s'", choice_name, table_name)
+            # Preserve the established missing-choice diagnostic while failing
+            # closed with a distinct message when the name is ambiguous.
+            ambiguous = bool(exact_choices or normalized_choices)
+            conflicting_candidates = sorted(
+                {candidate.entity_uri for candidate in (exact_choices or normalized_choices)}
+            )
+            displayed_candidates = [uri if len(uri) <= 160 else f"{uri[:157]}..." for uri in conflicting_candidates[:5]]
+            candidate_context = f"; conflicting candidate URIs: {displayed_candidates}" if ambiguous else ""
+            reason = (
+                f"LLM choice '{choice_name}' did not uniquely identify a candidate{candidate_context}"
+                if ambiguous
+                else f"LLM choice '{choice_name}' not in candidates"
+            )
+            log.warning("%s for table '%s'", reason, table_name)
             return GroundingResult(
                 source_table=table_name,
                 source_column="",
@@ -570,7 +762,7 @@ class GroundingService:
                 match_type="novel",
                 relationship=None,
                 confidence=None,
-                reason=f"LLM chose '{choice_name}' not in candidates",
+                reason=reason,
                 mode="ENHANCED",
             )
 
@@ -626,7 +818,11 @@ class GroundingService:
         if not ontology_ids:
             log.info("grounding_recall: empty grounding scope — returning no candidates (all-novel)")
             return []
-        ids_to_search: list[str] = list(ontology_ids)
+        ids_to_search = list(dict.fromkeys(ontology_ids))
+        if len(ids_to_search) > _LEXICAL_INDEX_MAX_ONTOLOGIES:
+            raise GroundingRecallLimitError(
+                f"grounding ontology pool exceeds {_LEXICAL_INDEX_MAX_ONTOLOGIES} distinct ontologies"
+            )
 
         log.info(
             "grounding_recall: vector_len=%d model_id=%s ontology_ids=%s top_k=%d",
@@ -705,7 +901,16 @@ class GroundingService:
             uri = r.get("entity_uri", "")
             local = _local_name(uri)
             oid = r.get("ontology_id") or ""
-            key = (local.lower(), oid)
+            # Candidate identity must be lossless: dedup canonical/width/case
+            # variants, but preserve punctuation, accents, script marks, and
+            # join controls. Reusing fuzzy ``_normalize`` here erased distinct
+            # candidates (for example ``Hohe``/``Höhe`` or ``A-B``/``AB``)
+            # before the exact-spelling resolver had a chance to choose.
+            candidate_identity = unicodedata.normalize(
+                "NFC",
+                simple_case_identity(width_only_nfkc(local)),
+            )
+            key = (candidate_identity or uri, oid)
             existing = seen_name.get(key)
             if existing is None or (r.get("score") or 0) > (existing.get("score") or 0):
                 seen_name[key] = r
@@ -775,12 +980,12 @@ class GroundingService:
         class by Jaccard token overlap between its local-name and the subject
         name, returning the top ``top_k`` with a positive overlap.
 
-        Portable across both vector backends: it lists the pool's class
-        embeddings through the catalog (both ``StoreOntologyCatalogAdapter`` and
-        the underlying store expose this) and scores in-process — no analyzer,
-        index-mapping, or BM25 assumption. Degrades to a no-op (``[]``) when the
-        catalog cannot list embeddings (e.g. the non-hot-path HTTP client),
-        leaving dense recall unaffected.
+        Portable across both vector backends: it builds one bounded,
+        metadata-only index per ontology pool and scores that immutable index
+        in-process. A catalog without the listing capability remains a no-op.
+        A supported listing that fails or exceeds a declared bound fails loud;
+        returning a partial index would create backend-dependent false-novel
+        results.
         """
         if not subject_name:
             return []
@@ -790,44 +995,149 @@ class GroundingService:
         subj = _tokenize(subject_name)
         if not subj:
             return []
-        scored: list[tuple[float, dict]] = []
-        for oid in ontology_ids:
-            try:
-                docs = lister(oid, entity_type="class", embedding_type="lexical", namespace=self._namespace)
-            except Exception as e:
-                # Additive recall is best-effort: a listing failure must neither
-                # fail the job nor suppress the dense candidates already found.
-                log.warning("lexical_recall: list failed for ontology_id=%s: %s", oid, e)
+        entries = self._get_lexical_index(tuple(dict.fromkeys(ontology_ids)), lister)
+        scored: list[tuple[float, _LexicalIndexEntry]] = []
+        for entry in entries:
+            overlap = subj & entry.tokens
+            if not overlap:
                 continue
-            for d in docs or []:
-                uri = (d.get("entity_uri") or "").strip()
-                if not uri:
-                    continue
-                cand_tokens = _tokenize(_local_name(uri))
-                overlap = subj & cand_tokens
-                if not overlap:
-                    continue
-                score = len(overlap) / len(subj | cand_tokens)
-                scored.append((score, d))
+            score = len(overlap) / len(subj | entry.tokens)
+            scored.append((score, entry))
         scored.sort(key=lambda s: -s[0])
         out: list[GroundingCandidate] = []
-        for _score, d in scored[:top_k]:
-            uri = (d.get("entity_uri") or "").strip()
+        for _score, entry in scored[:top_k]:
             out.append(
                 GroundingCandidate(
-                    entity_uri=uri,
-                    ontology_id=d.get("ontology_id"),
-                    label=_local_name(uri),
-                    definition=(d.get("text") or ""),
+                    entity_uri=entry.entity_uri,
+                    ontology_id=entry.ontology_id,
+                    label=entry.label,
+                    definition=entry.definition,
                     lexical_sim=0.0,
                     from_lexical=True,
                 )
             )
         return out
 
+    def _get_lexical_index(
+        self,
+        ontology_ids: tuple[str, ...],
+        lister,
+    ) -> tuple[_LexicalIndexEntry, ...]:
+        """Return one bounded lexical index, building it once across workers."""
+        if len(ontology_ids) > _LEXICAL_INDEX_MAX_ONTOLOGIES:
+            raise GroundingRecallLimitError(
+                f"grounding ontology pool exceeds {_LEXICAL_INDEX_MAX_ONTOLOGIES} distinct ontologies"
+            )
+
+        cached = self._lexical_index_cache.get(ontology_ids)
+        if cached is not None:
+            return cached
+
+        with self._lexical_index_lock:
+            cached = self._lexical_index_cache.get(ontology_ids)
+            if cached is not None:
+                return cached
+
+            entries: list[_LexicalIndexEntry] = []
+            seen: set[tuple[str, str]] = set()
+            total_bytes = 0
+
+            for requested_ontology_id in ontology_ids:
+                remaining = _LEXICAL_INDEX_MAX_ENTITIES - len(entries)
+                if remaining <= 0:
+                    raise GroundingRecallLimitError(
+                        f"lexical grounding index exceeds {_LEXICAL_INDEX_MAX_ENTITIES} entities"
+                    )
+                try:
+                    docs = lister(
+                        requested_ontology_id,
+                        entity_type="class",
+                        embedding_type="lexical",
+                        namespace=self._namespace,
+                        limit=remaining + 1,
+                    )
+                except Exception as exc:
+                    log.error(
+                        "lexical_recall: metadata listing failed ontology_id=%s",
+                        requested_ontology_id,
+                        exc_info=True,
+                    )
+                    raise GroundingLookupError(
+                        f"lexical grounding metadata unavailable for ontology {requested_ontology_id!r}"
+                    ) from exc
+
+                if len(docs or []) > remaining:
+                    raise GroundingRecallLimitError(
+                        f"lexical grounding index exceeds {_LEXICAL_INDEX_MAX_ENTITIES} entities"
+                    )
+
+                for document in docs or []:
+                    uri = str(document.get("entity_uri") or "").strip()
+                    if not uri:
+                        continue
+                    ontology_id = str(document.get("ontology_id") or requested_ontology_id)
+                    uri_bytes = len(uri.encode("utf-8"))
+                    ontology_id_bytes = len(ontology_id.encode("utf-8"))
+                    if (
+                        uri_bytes > _LEXICAL_INDEX_MAX_ID_UTF8_BYTES
+                        or ontology_id_bytes > _LEXICAL_INDEX_MAX_ID_UTF8_BYTES
+                    ):
+                        raise GroundingRecallLimitError(
+                            f"lexical grounding identity exceeds {_LEXICAL_INDEX_MAX_ID_UTF8_BYTES} UTF-8 bytes"
+                        )
+                    identity = (uri.rstrip("/"), ontology_id)
+                    if identity in seen:
+                        continue
+
+                    label = _local_name(uri)
+                    tokens = frozenset(_tokenize(label))
+                    if not tokens:
+                        continue
+                    definition = _utf8_prefix(
+                        str(document.get("text") or ""),
+                        _LEXICAL_INDEX_MAX_DEFINITION_UTF8_BYTES,
+                    )
+                    row_bytes = (
+                        uri_bytes + ontology_id_bytes + len(label.encode("utf-8")) + len(definition.encode("utf-8"))
+                    )
+                    if total_bytes + row_bytes > _LEXICAL_INDEX_MAX_TOTAL_UTF8_BYTES:
+                        raise GroundingRecallLimitError(
+                            f"lexical grounding metadata exceeds {_LEXICAL_INDEX_MAX_TOTAL_UTF8_BYTES} UTF-8 bytes"
+                        )
+
+                    seen.add(identity)
+                    total_bytes += row_bytes
+                    entries.append(
+                        _LexicalIndexEntry(
+                            entity_uri=uri,
+                            ontology_id=ontology_id,
+                            label=label,
+                            definition=definition,
+                            tokens=tokens,
+                        )
+                    )
+
+            built = tuple(entries)
+            self._lexical_index_cache[ontology_ids] = built
+            log.info(
+                "lexical_recall: built bounded metadata index ontologies=%d entities=%d bytes=%d",
+                len(ontology_ids),
+                len(built),
+                total_bytes,
+            )
+            return built
+
     def _exact_name_matches(self, table_name: str, candidates: list[GroundingCandidate]) -> list[GroundingCandidate]:
-        """Return all candidates whose label is an exact normalized match to the table name."""
+        """Return all candidates whose label is an exact normalized match to the table name.
+
+        An empty normalized key is not a match. ``_normalize`` returns ``""`` for a
+        name with no letters or digits at all (``"—"``, ``"(1)"``), and ``"" == ""``
+        would make every such name match every other one — grounding distinct
+        concepts onto each other. Bail rather than compare.
+        """
         norm_table = _normalize(table_name)
+        if not norm_table:
+            return []
         return [c for c in candidates if _normalize(c.label) == norm_table]
 
     def _llm_rerank(

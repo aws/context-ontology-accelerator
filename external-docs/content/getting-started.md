@@ -163,7 +163,7 @@ SCL_PREFIX=acme SCL_VPC_ID=vpc-xyz make deploy-dev
 #### Deployment architecture
 
 See [Deploying Context Ontology Accelerator](deploying.md) for the full stack list
-(16 stacks total), dependency order, and per-stack purpose — CDK resolves
+(17 stacks total), dependency order, and per-stack purpose — CDK resolves
 ordering automatically from the dependency graph in `bin/app.ts`.
 
 > **Cost warning:** Neptune + OpenSearch Serverless cost ~$930/mo when idle.

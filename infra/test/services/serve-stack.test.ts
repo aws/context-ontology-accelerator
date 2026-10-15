@@ -883,7 +883,6 @@ describe("ServeStack - GRAPH_URI_TEMPLATE reader/writer alignment", () => {
   });
 });
 
-
 describe("ServeStack - SERVE_VKG_TRANSLATION_TIMEOUT_S wiring", () => {
   const envOf = (template: Template): Record<string, unknown> => {
     const runtimes = template.findResources("AWS::BedrockAgentCore::Runtime");
@@ -900,9 +899,9 @@ describe("ServeStack - SERVE_VKG_TRANSLATION_TIMEOUT_S wiring", () => {
     // The load-bearing case: a numeric 0 in cdk.json context is falsy in JS, so a
     // truthiness check would drop it. serve-stack uses `!== undefined`, so it must
     // survive as "0" and be clamped downstream rather than silently ignored.
-    expect(envOf(createStack({ serve_vkg_translation_timeout_s: 0 }))).toMatchObject(
-      { SERVE_VKG_TRANSLATION_TIMEOUT_S: "0" },
-    );
+    expect(
+      envOf(createStack({ serve_vkg_translation_timeout_s: 0 })),
+    ).toMatchObject({ SERVE_VKG_TRANSLATION_TIMEOUT_S: "0" });
   });
 
   it("passes a set value through verbatim", () => {
@@ -951,10 +950,11 @@ describe("ServeStack - parameter read is deliberately broad", () => {
 // (perl, openssl, glibc, pcre2, sqlite3) whenever a build predated the Debian
 // point releases that fix them. This image is also an arm64 OCI index, which
 // ECR BASIC scanning silently refuses — so regressions here go unnoticed until
-// a child manifest is scanned by digest. Two Dockerfile properties keep the
-// image patchable: a pinned base digest (supply-chain integrity + a
-// cache-busting bump lever) and a post-install `apt-get upgrade` (the only
-// mechanism pulling trixie-security point releases in). Mirrors ontology-stack.
+// a child manifest is scanned by digest. The base is now AL2023. Two
+// Dockerfile properties keep the image patchable: a pinned base digest
+// (supply-chain integrity + a cache-busting bump lever) and a post-install
+// `dnf upgrade --releasever=latest` (the only mechanism pulling AL2023 security
+// updates in past the pinned snapshot). Mirrors ontology-stack.
 describe("context-manager Dockerfile CVE hygiene", () => {
   const dockerfile = fs.readFileSync(
     path.join(
@@ -971,16 +971,17 @@ describe("context-manager Dockerfile CVE hygiene", () => {
 
   test("pins the base image to a digest, not a mutable tag", () => {
     const from = dockerfile.match(
-      /^FROM .*python:3\.12-slim(@sha256:[a-f0-9]{64})?/m,
+      /^FROM .*amazonlinux:2023-minimal(@sha256:[a-f0-9]{64})?/m,
     );
     expect(from).not.toBeNull();
     expect(from?.[1]).toMatch(/@sha256:[a-f0-9]{64}/);
-    expect(dockerfile).not.toMatch(/python:3\.12-slim\s*$/m);
+    expect(dockerfile).not.toMatch(/amazonlinux:2023-minimal\s*$/m);
   });
 
-  test("runs apt-get upgrade so OS security point releases are applied", () => {
-    expect(dockerfile).toMatch(/apt-get upgrade -y/);
-    expect(dockerfile).not.toMatch(/apt-get dist-upgrade/);
+  test("runs dnf upgrade against the latest AL2023 release so OS security updates are applied", () => {
+    // AL2023 locks dnf to the base image's repo snapshot; without
+    // --releasever=latest a stale digest pin freezes the OS patch level.
+    expect(dockerfile).toMatch(/dnf upgrade -y --releasever=latest/);
   });
 
   test("upgrades pip so its own advisories are picked up", () => {

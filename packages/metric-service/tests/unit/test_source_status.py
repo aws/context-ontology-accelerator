@@ -12,6 +12,7 @@ from botocore.exceptions import ClientError, EndpointConnectionError
 from coa_metrics.source_status import (
     PERMISSIVE_ENV,
     SourceValidationUnavailableError,
+    build_validation_lookup,
     check_source_approved,
     check_source_table_exists,
     permissive_lookup_enabled,
@@ -181,6 +182,50 @@ class TestCheckSourceTableExists:
         with self._patch_build(self._lookup(tables={"orders"})):
             assert check_source_table_exists("ns-1", "ds-1", "Orders") is None
 
+    def test_injected_lookup_is_reused_without_building(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv(PERMISSIVE_ENV, raising=False)
+        lookup = self._lookup(tables={"orders"})
+        with patch("coa_metrics.data_source_lookup_factory.build_data_source_lookup") as mock_build:
+            assert (
+                check_source_table_exists(
+                    "ns-1",
+                    "ds-1",
+                    "orders",
+                    data_source_lookup=lookup,
+                )
+                is None
+            )
+        mock_build.assert_not_called()
+
+    def test_injected_none_degrades_without_rebuilding(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv(PERMISSIVE_ENV, raising=False)
+        with patch("coa_metrics.data_source_lookup_factory.build_data_source_lookup") as mock_build:
+            assert (
+                check_source_table_exists(
+                    "ns-1",
+                    "ds-1",
+                    "orders",
+                    data_source_lookup=None,
+                )
+                is None
+            )
+        mock_build.assert_not_called()
+
+    def test_injected_unavailable_catalog_fails_closed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv(PERMISSIVE_ENV, raising=False)
+        lookup = self._lookup(available=False, tables={"orders"})
+        with (
+            patch("coa_metrics.data_source_lookup_factory.build_data_source_lookup") as mock_build,
+            pytest.raises(SourceValidationUnavailableError),
+        ):
+            check_source_table_exists(
+                "ns-1",
+                "ds-1",
+                "orders",
+                data_source_lookup=lookup,
+            )
+        mock_build.assert_not_called()
+
     def test_empty_catalog_falls_back_to_soft_warning(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A COMPLETED source with no steward-approved assets yet knows zero
         tables — absence is NOT provable, so this must not 400."""
@@ -296,6 +341,36 @@ class TestCheckSourceTableExists:
         with patch("coa_metrics.data_source_lookup_factory.build_data_source_lookup") as mock_build:
             assert check_source_table_exists("ns-1", "ds-1", "no_such_table") is None
         mock_build.assert_not_called()
+
+
+class TestBuildValidationLookup:
+    def test_returns_built_lookup(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv(PERMISSIVE_ENV, raising=False)
+        lookup = MagicMock()
+        with patch(
+            "coa_metrics.data_source_lookup_factory.build_data_source_lookup",
+            return_value=lookup,
+        ):
+            assert build_validation_lookup("ns-1") is lookup
+
+    def test_permissive_mode_degrades_build_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(PERMISSIVE_ENV, "true")
+        with patch(
+            "coa_metrics.data_source_lookup_factory.build_data_source_lookup",
+            side_effect=RuntimeError("catalog unavailable"),
+        ):
+            assert build_validation_lookup("ns-1") is None
+
+    def test_strict_mode_fails_closed_on_build_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv(PERMISSIVE_ENV, raising=False)
+        with (
+            patch(
+                "coa_metrics.data_source_lookup_factory.build_data_source_lookup",
+                side_effect=RuntimeError("catalog unavailable"),
+            ),
+            pytest.raises(SourceValidationUnavailableError, match="catalog unavailable"),
+        ):
+            build_validation_lookup("ns-1")
 
 
 class TestPermissiveLookupEnabled:

@@ -213,7 +213,7 @@ apply GetProposalUploadUrls @examples([
     {
         title: "Get presigned PUT URLs for a large proposal revision"
         input: { namespaceId: "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d", proposalId: "7c2e9a1b-4d6f-4b8a-9e3c-1f0a2b5d7c9e" }
-        output: { ontologyPutUrl: "https://coa-proposals.s3.amazonaws.com/ont-sales-2026/ontology.ttl?X-Amz-Signature=abc123", r2rmlPutUrl: "https://coa-proposals.s3.amazonaws.com/ont-sales-2026/mappings.ttl?X-Amz-Signature=def456" }
+        output: { revisionId: "d3bc58e9-52a4-43cf-b8b2-44a2f05b43f8", ontologyPutUrl: "https://coa-proposals.s3.amazonaws.com/ont-sales-2026/ontology.ttl?X-Amz-Signature=abc123", r2rmlPutUrl: "https://coa-proposals.s3.amazonaws.com/ont-sales-2026/mappings.ttl?X-Amz-Signature=def456" }
     }
 ])
 

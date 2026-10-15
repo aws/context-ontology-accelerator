@@ -18,6 +18,7 @@ import { Paths, fromRoot } from "../../paths";
 import { resolveContext } from "../../context";
 import { bundlePython } from "../../utils/python-bundling";
 import { NamespaceDeletionPipeline } from "./namespace-deletion-pipeline";
+import { METRIC_API_FUNCTION_NAME } from "./metric-service-stack";
 import { TABLE_NAMES } from "@coa/shared";
 
 export interface NamespaceStackProps extends cdk.StackProps {
@@ -822,7 +823,7 @@ export class NamespaceStack extends SCLStack {
         resourceRoleMappingsTable: props.resourceRoleMappingsTable,
         rolesTable: props.rolesTable,
         sourcesApiFnName: this.prefixed("sources-api"),
-        metricApiFnName: this.prefixed("metric-api"),
+        metricApiFnName: this.prefixed(METRIC_API_FUNCTION_NAME),
         datazoneDomainId: domain.attrId,
         // DeletePlatform assumes namespaceApiFn's own execution role for
         // datazone:DeleteProject — DataZone records the CreateProject
@@ -873,6 +874,9 @@ export class NamespaceStack extends SCLStack {
       memorySize: 256,
       vpc: props.vpc,
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+      // Shared platform Lambda SG (also on the two Lambdas below): a per-function
+      // auto SG is a new Hyperplane ENI combination, which costs ~228 s on first create.
+      securityGroups: [props.lambdaSecurityGroup],
       environment: {
         ROLES_TABLE: props.rolesTable.tableName,
         ALLOWED_ORIGIN: allowedOrigin,
@@ -889,6 +893,7 @@ export class NamespaceStack extends SCLStack {
       memorySize: 256,
       vpc: props.vpc,
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+      securityGroups: [props.lambdaSecurityGroup],
       environment: {
         ROLES_TABLE: props.rolesTable.tableName,
         ALLOWED_ORIGIN: allowedOrigin,
@@ -909,6 +914,7 @@ export class NamespaceStack extends SCLStack {
       memorySize: 256,
       vpc: props.vpc,
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+      securityGroups: [props.lambdaSecurityGroup],
       environment: {
         ROLES_TABLE: props.rolesTable.tableName,
         RESOURCE_ROLE_MAPPINGS_TABLE: props.resourceRoleMappingsTable.tableName,

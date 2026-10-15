@@ -28,11 +28,9 @@ SQL Extraction Strategy:
     - Structured query logging (ontop.queryLogging): still file-based, async flush issues
     - /ontop/reformulate: direct HTTP, no file I/O, no parsing — cleanest solution
 
-Runtime note: this file runs on the container's system ``python3``, which is
-Python 3.9 (Amazon Corretto AL2023 base image) — NOT the 3.12 the rest of the
-repo targets. ``from __future__ import annotations`` is therefore mandatory:
-without it a PEP 604 ``X | None`` annotation is evaluated at import time and
-raises ``TypeError``, killing the server before it can serve /health.
+Runtime note: entrypoint.sh runs this file with ``python3``, which the Dockerfile
+links to python3.12 from the AL2023 repos — the same version the rest of the repo
+targets. The image's /usr/bin/python3 (3.9) is left in place only for dnf.
 """
 
 from __future__ import annotations

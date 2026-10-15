@@ -1393,13 +1393,65 @@ class TestRetiredModelPatch:
 
     def test_active_model_is_overridable_via_env(self):
         """``_ACTIVE_MODEL`` is sourced from ``GRAPHRAG_LLM_MODEL`` (overridable),
-        falling back to the active default when the env var is unset."""
+        then ``BEDROCK_MODEL_ID``, falling back to the active default when both
+        are unset."""
         import os
 
         from coa_serve.lexical.baseline_retriever import _ACTIVE_MODEL
 
-        expected = os.environ.get("GRAPHRAG_LLM_MODEL", "us.anthropic.claude-sonnet-5")
+        expected = (
+            os.environ.get("GRAPHRAG_LLM_MODEL") or os.environ.get("BEDROCK_MODEL_ID") or "us.anthropic.claude-sonnet-5"
+        )
         assert expected == _ACTIVE_MODEL
+
+    @pytest.mark.parametrize(
+        ("env", "expected"),
+        [
+            pytest.param(
+                {"BEDROCK_MODEL_ID": "global.anthropic.claude-sonnet-5"},
+                "global.anthropic.claude-sonnet-5",
+                id="graphrag-unset-uses-bedrock-model-id",
+            ),
+            pytest.param(
+                {"GRAPHRAG_LLM_MODEL": "", "BEDROCK_MODEL_ID": "global.anthropic.claude-sonnet-5"},
+                "global.anthropic.claude-sonnet-5",
+                id="graphrag-empty-falls-through-to-bedrock-model-id",
+            ),
+            pytest.param(
+                {
+                    "GRAPHRAG_LLM_MODEL": "us.anthropic.claude-sonnet-4-6",
+                    "BEDROCK_MODEL_ID": "global.anthropic.claude-sonnet-5",
+                },
+                "us.anthropic.claude-sonnet-4-6",
+                id="graphrag-set-wins-over-bedrock-model-id",
+            ),
+            pytest.param({}, "us.anthropic.claude-sonnet-5", id="both-unset-uses-default"),
+        ],
+    )
+    def test_active_model_resolution_order(self, env, expected):
+        """#1253: serve sets ``BEDROCK_MODEL_ID`` from ``bedrockLlmModelId`` but never
+        ``GRAPHRAG_LLM_MODEL``, so the toolkit model must follow ``BEDROCK_MODEL_ID``
+        when the GraphRAG override is unset or empty. Otherwise a non-US deploy
+        sends a ``us.`` model ID to Bedrock and the LLM-backed strategies fail."""
+        import importlib
+        import os
+        from unittest.mock import patch as _patch
+
+        import coa_serve.lexical.baseline_retriever as br
+        import graphrag_toolkit.lexical_graph.config as _graphrag_cfg
+
+        try:
+            with _patch.dict(os.environ):
+                os.environ.pop("GRAPHRAG_LLM_MODEL", None)
+                os.environ.pop("BEDROCK_MODEL_ID", None)
+                os.environ.update(env)
+                importlib.reload(br)
+                assert expected == br._ACTIVE_MODEL
+                assert expected == _graphrag_cfg.DEFAULT_EXTRACTION_MODEL
+                assert expected == _graphrag_cfg.DEFAULT_RESPONSE_MODEL
+        finally:
+            # Restore the module (and the toolkit constants) to the default patch.
+            importlib.reload(br)
 
     def test_env_override_changes_patched_constants_on_reimport(self):
         """Setting ``GRAPHRAG_LLM_MODEL`` and re-importing the module patches the

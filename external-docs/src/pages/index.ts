@@ -9,6 +9,7 @@ import agentAccess from '@docs/agent-access.md?raw'
 import cedarPolicies from '@docs/cedar-policy-authoring.md?raw'
 import sources from '@docs/sources.md?raw'
 import crossAccountSources from '@docs/cross-account-sources.md?raw'
+import crossNetworkConnectivity from '@docs/cross-network-connectivity.md?raw'
 import customConnectorSources from '@docs/custom-connector-sources.md?raw'
 import databricksSources from '@docs/databricks-sources.md?raw'
 import ontologies from '@docs/ontologies.md?raw'
@@ -27,6 +28,7 @@ export type PageId =
   | 'cedar-policies'
   | 'sources'
   | 'cross-account-sources'
+  | 'cross-network-connectivity'
   | 'custom-connector-sources'
   | 'databricks-sources'
   | 'ontologies'
@@ -45,6 +47,7 @@ export const pages: Record<PageId, string> = {
   'cedar-policies': cedarPolicies,
   sources,
   'cross-account-sources': crossAccountSources,
+  'cross-network-connectivity': crossNetworkConnectivity,
   'custom-connector-sources': customConnectorSources,
   'databricks-sources': databricksSources,
   ontologies,

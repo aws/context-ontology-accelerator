@@ -78,8 +78,14 @@ class VectorStore(Protocol):
         entity_type: str | None = None,
         embedding_type: str | None = None,
         namespace: str | None = None,
+        limit: int | None = None,
     ) -> list[dict]:
-        """Return all embeddings attached to an ontology."""
+        """Return embeddings attached to an ontology.
+
+        ``limit`` is an explicit caller-side ceiling. Implementations must
+        honor it before transferring result rows so bounded metadata consumers
+        do not accidentally enumerate an entire vector index.
+        """
         ...
 
     def list_searchable_entity_uris(
@@ -149,7 +155,9 @@ class VectorStore(Protocol):
     ) -> int:
         """Drop every embedding whose ``entity_uri`` is in ``entity_uris`` within a single ontology.
 
-        Returns the deleted count.
+        Returns the deleted count. Raises when it cannot remove them all: append
+        ingest relies on that to fail an accept instead of leaving the stale
+        embedding searchable beside the new one.
 
         Used by append-mode ingest right before it re-embeds the subjects of an
         incoming proposal: a class whose description a steward replaced must not

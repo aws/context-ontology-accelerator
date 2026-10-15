@@ -3,8 +3,11 @@
 
 import { describe, it, expect } from "vitest";
 import {
+  COMPONENT_SCALE_MAX,
+  componentScale,
   connectedComponents,
   forceLayoutComponent,
+  HUB_DEGREE_THRESHOLD,
   isolatedNodeIds,
   layoutForceGraph,
   packComponents,
@@ -210,6 +213,25 @@ describe("packComponents", () => {
     expect(offsets[2].x).toBe(420);
     expect(offsets[1].y).toBe(0);
     expect(offsets[2].y).toBe(120);
+  });
+});
+
+describe("componentScale", () => {
+  it("returns 1 for components at or below the hub threshold", () => {
+    expect(componentScale(0)).toBe(1);
+    expect(componentScale(HUB_DEGREE_THRESHOLD)).toBe(1);
+  });
+
+  it("scales up by sqrt(maxDegree / threshold) past the threshold", () => {
+    // maxDegree=20 → sqrt(20/5) = sqrt(4) = 2
+    expect(componentScale(20)).toBeCloseTo(2, 5);
+    // maxDegree=45 → sqrt(9) = 3
+    expect(componentScale(45)).toBeCloseTo(3, 5);
+  });
+
+  it("clamps at COMPONENT_SCALE_MAX so a 100-spoke hub stays in frame", () => {
+    expect(componentScale(100)).toBe(COMPONENT_SCALE_MAX);
+    expect(componentScale(10_000)).toBe(COMPONENT_SCALE_MAX);
   });
 });
 

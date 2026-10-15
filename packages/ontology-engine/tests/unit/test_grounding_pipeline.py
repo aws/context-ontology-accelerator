@@ -139,6 +139,61 @@ class TestRecall:
         assert len(result.candidates) == 1
         assert result.candidates[0].lexical_sim == pytest.approx(0.80)
 
+    @pytest.mark.parametrize(
+        ("first", "second"),
+        [
+            pytest.param("A￣B", "A¯B", id="fullwidth-macron"),
+            pytest.param("ﾡￂ", "ㄱㅏ", id="halfwidth-hangul"),
+            pytest.param("Ꭰ", "ꭰ", id="cherokee-case"),
+            pytest.param("HO\u0308HE", "HÖHE", id="canonical-equivalence"),
+        ],
+    )
+    def test_secondary_dedup_collapses_only_lossless_identity_variants(self, first: str, second: str):
+        hits = [
+            {"entity_uri": f"http://example.test/{first}", "ontology_id": "test", "score": 0.60},
+            {"entity_uri": f"http://example.test/{second}", "ontology_id": "test", "score": 0.80},
+        ]
+        result = _make_service(hits).ground_table(
+            table_name="unrelated",
+            table_description="",
+            columns=[],
+            concept_vector=[0.5] * 8,
+            model_id="titan",
+            grounding_mode="STANDARD",
+            ontology_ids=["test"],
+        )
+        assert len(result.candidates) == 1
+        assert result.candidates[0].lexical_sim == pytest.approx(0.80)
+
+    @pytest.mark.parametrize(
+        ("first", "second"),
+        [
+            pytest.param("Hohe", "H%C3%B6he", id="accent"),
+            pytest.param("A-B", "AB", id="punctuation"),
+            pytest.param("👩‍🔬", "👩🔬", id="zwj-sequence"),
+            pytest.param("a‌b", "ab", id="zwnj-sequence"),
+            pytest.param("µ", "μ", id="micro-sign-vs-greek-mu"),
+            pytest.param("ϐ", "β", id="beta-symbol-vs-beta"),
+            pytest.param("aͅ", "a", id="greek-combining-mark"),
+            pytest.param("ſ", "s", id="long-s"),
+        ],
+    )
+    def test_secondary_dedup_preserves_distinct_local_names(self, first: str, second: str):
+        hits = [
+            {"entity_uri": f"http://example.test/{first}", "ontology_id": "test", "score": 0.60},
+            {"entity_uri": f"http://example.test/{second}", "ontology_id": "test", "score": 0.80},
+        ]
+        result = _make_service(hits).ground_table(
+            table_name="unrelated",
+            table_description="",
+            columns=[],
+            concept_vector=[0.5] * 8,
+            model_id="titan",
+            grounding_mode="STANDARD",
+            ontology_ids=["test"],
+        )
+        assert len(result.candidates) == 2
+
     def test_cosine_fallback_used_when_score_absent(self):
         # No 'score' key but a raw vector present → local cosine is computed.
         hits = [

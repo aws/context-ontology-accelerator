@@ -49,6 +49,15 @@ structure ConflictError {
     message: String
 }
 
+/// Returned with HTTP 503 when a required dependency is temporarily unavailable.
+@error("server")
+@httpError(503)
+structure ServiceUnavailableError {
+    /// Human-readable description of the unavailable dependency or operation.
+    @required
+    message: String
+}
+
 /// Returned with HTTP 403 when the caller lacks permission to perform the requested operation.
 @error("client")
 @httpError(403)

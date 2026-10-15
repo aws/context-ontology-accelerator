@@ -23,9 +23,12 @@ are: they restate the aggregate the metric's SQL already computes.
 from __future__ import annotations
 
 GROUPS: tuple[str, ...] = (
-    # Particles, copula, polite forms, and interrogative-quantity words:
+    # Particles, copula, polite forms, and interrogative-quantity words.
+    # Counter-bearing interrogatives are atomic kanji runs under the shared
+    # tokenizer, so list each safe question form explicitly.
     "は が を に で の と も か です ます だ ですか ますか でしょうか ください さい"
-    " お ご 教 えて いくら どれくらい どのくらい",
+    " お ご 教 えて いくら いくつ どれくらい どのくらい"
+    " 何台 何件 何名 何社",
     # Aggregate restaters (kanji runs), greetings, and units:
     "合計 総計 総額 総数 件数 金額 数 総"
     " こんにちは こんばんは おはよう ありがとう ありがとうございます よろしく どうも すみません"

@@ -51,11 +51,34 @@ export interface ForceLayoutOptions {
 
 const DEFAULTS: Required<ForceLayoutOptions> = {
   nodeSize: 80,
-  linkDistance: 170,
-  componentGap: 90,
+  linkDistance: 330,
+  componentGap: 175,
   aspect: 2.4,
   iterations: 300,
 };
+
+/**
+ * A node is a "hub" that drives per-component spacing and label stagger when
+ * its degree reaches this threshold.
+ */
+export const HUB_DEGREE_THRESHOLD = 5;
+
+/**
+ * Upper clamp on the per-component spacing scale, so one 100-spoke hub does
+ * not blow its component out of the packed frame.
+ */
+export const COMPONENT_SCALE_MAX = 3.5;
+
+/**
+ * Per-component spacing scale: a subgraph with a popular hub gets more room
+ * than a 3-node side cluster. Shared by `layoutForceGraph` (static homes) and
+ * `useLiveForceSimulation` (live link distance), so the two never disagree
+ * about where a node wants to live.
+ */
+export function componentScale(maxDegree: number): number {
+  const raw = Math.sqrt(Math.max(1, maxDegree / HUB_DEGREE_THRESHOLD));
+  return Math.min(raw, COMPONENT_SCALE_MAX);
+}
 
 /** Ids of nodes that appear in no edge (degree 0). */
 export function isolatedNodeIds(
@@ -241,8 +264,25 @@ export function layoutForceGraph(
   const components = connectedComponents(nodeIds, edges);
 
   // Lay out each component around its own origin and measure its bounding box.
+  // Spacing scales *per component* with that component's own maxDegree, so a
+  // 24-spoke hub cluster blooms while a 3-node side cluster stays compact.
+  // Sqrt scaling matches the exact knob OntologyGraphFlow uses when it chose
+  // to drive this at the global level, but applied one component at a time.
   const laidOut = components.map((ids) => {
-    const positions = forceLayoutComponent(ids, edges, o);
+    const idSet = new Set(ids);
+    const degree = new Map<string, number>();
+    for (const e of edges) {
+      if (!idSet.has(e.source) || !idSet.has(e.target)) continue;
+      degree.set(e.source, (degree.get(e.source) ?? 0) + 1);
+      degree.set(e.target, (degree.get(e.target) ?? 0) + 1);
+    }
+    let compMaxDeg = 0;
+    for (const d of degree.values()) if (d > compMaxDeg) compMaxDeg = d;
+    const scale = componentScale(compMaxDeg);
+    const positions = forceLayoutComponent(ids, edges, {
+      ...o,
+      linkDistance: o.linkDistance * scale,
+    });
     let minX = Infinity;
     let minY = Infinity;
     let maxX = -Infinity;
