@@ -32,6 +32,18 @@ trustPolicyExclude:
 # Renovate's format (see renovate.json), not pnpm's: it parses to NaN here, which
 # fails closed and rejects every package including decade-old ones.
 minimumReleaseAge: 10080
+# zod 4.6.6 (the security advisory floor for an uncontrolled resource
+# consumption HIGH) was published 2026-10-11, within the 7-day quarantine window.
+# Excluded here so the security override above resolves; remove this entry once
+# 4.6.6 ages past the quarantine (after 2026-10-18).
+minimumReleaseAgeExclude:
+  - zod
+  # aws-cdk-lib 2.273.0 is the first release that bundles a patched
+  # brace-expansion (5.0.12 >= the 5.0.11 stack-exhaustion floor); the bundled
+  # 5.0.9 in 2.270.0-2.272.0 cannot be reached by an override. 2.273.0 was
+  # published 2026-10-08, within the quarantine window. Excluded so the tests/cdk
+  # harness picks it up; remove once 2.273.0 ages past the quarantine (2026-10-15).
+  - aws-cdk-lib
 
 overrides:
   # downlevel-dts depends on typescript@"next" — a dist-tag that resolves to
@@ -50,12 +62,16 @@ overrides:
   "downlevel-dts>typescript": 6.0.3
   # axios <1.20.0 — CVE (GHSA, HIGH). 1.20.0 is the patched floor; same major.
   axios: 1.20.0
-  # brace-expansion ReDoS (GHSA, HIGH). Patched floors: v1 line >=1.1.20,
-  # v2 line >=2.1.4, v5 line >=5.0.11. Range-scoped so each major stays on its
-  # own line (a blanket pin would cross majors).
+  # brace-expansion stack-exhaustion DoS (GHSA, HIGH). Nested-brace recursion
+  # in parseCommaParts/expand_ (CVE-2026-14257 and its parsing-side counterpart).
+  # Patched floors: v1 >=1.1.20, v2 >=2.1.6, v5 >=5.0.11. Range-scoped so each
+  # major stays on its own line (a blanket pin would cross majors).
   "brace-expansion@<1.1.20": 1.1.20
-  "brace-expansion@>=2.0.0 <2.1.4": 2.1.4
+  "brace-expansion@>=2.0.0 <2.1.6": 2.1.6
   "brace-expansion@>=4.0.0 <5.0.11": 5.0.11
+  # zod <4.6.6 — uncontrolled resource consumption / memory exhaustion on
+  # unbounded array schemas (GHSA, HIGH). 4.6.6 is the patched floor; same major.
+  "zod@<4.6.6": 4.6.6
   fast-xml-builder: 1.1.7
   form-data: 4.0.6
   js-yaml: 3.15.2
@@ -76,3 +92,5 @@ overrides:
   # source-map-js <1.2.2 — event-loop DoS (GHSA-68fv-2mgg-jv7q, HIGH). Transitive
   # via vite/postcss in web-app. 1.2.2 is the patched floor; same major.
   "source-map-js@<1.2.2": 1.2.2
+  # handlebars <4.7.10 — critical RCE (GHSA-p8wg-vrv2-v86f, GHSA-8r5x-fm3f-whwj); via ts-jest.
+  "handlebars@<4.7.10": 4.7.10

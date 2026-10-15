@@ -105,7 +105,7 @@ class TestPredicateNormalization:
 
     def test_predicate_normalizing_to_empty_skipped(self):
         rels = [
-            _r("Company", "@#$%", "Location", 5),  # normalizes to empty
+            _r("Company", "@#%", "Location", 5),  # normalizes to empty
             _r("Company", "valid", "Location", 3),
         ]
         result = build_class_schema_contexts(rels, ["Company"])

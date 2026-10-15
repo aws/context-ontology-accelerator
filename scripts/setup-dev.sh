@@ -22,16 +22,11 @@ else
     echo "✓ pnpm $(pnpm --version) found"
 fi
 
-# Check Java 17+
-if command -v java &> /dev/null; then
-    JAVA_VER=$(java -version 2>&1 | head -1 | awk -F '"' '{print $2}' | cut -d. -f1)
-    if [ "$JAVA_VER" -ge 17 ]; then
-        echo "✓ Java $JAVA_VER found"
-    else
-        echo "⚠ Java 17+ required for Smithy (found $JAVA_VER)"
-    fi
+# Check Java (17-24; see check-java-version.sh for the upper bound)
+if JAVA_CHECK="$("$(dirname "$0")/check-java-version.sh")"; then
+    echo "✓ $JAVA_CHECK"
 else
-    echo "⚠ Java not found — required for Smithy code generation"
+    echo "⚠ $JAVA_CHECK"
 fi
 
 # Check Gradle

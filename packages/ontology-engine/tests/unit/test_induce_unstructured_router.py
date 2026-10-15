@@ -911,7 +911,7 @@ class TestRunUnstructuredInductionWorker:
                 )
             )
             stack.enter_context(patch.object(induce_unstructured, "EmbeddingGeneratorClient", return_value=MagicMock()))
-            stack.enter_context(
+            grounding_service_cls = stack.enter_context(
                 patch.object(
                     induce_unstructured,
                     "GroundingService",
@@ -924,6 +924,9 @@ class TestRunUnstructuredInductionWorker:
             # Expose the registry-query calls so a test can assert the
             # auto-include was scoped to ontology_type="induced".
             self._ds_list_registry_calls = list(ds.list_ontologies_registry.call_args_list)
+            # Expose the GroundingService constructor mock so a test can assert
+            # the model/region it was built with.
+            self._grounding_service_cls = grounding_service_cls
 
             pipeline_mock.run.assert_called_once()
             # First positional arg to pipeline.run is the config.
@@ -946,6 +949,70 @@ class TestRunUnstructuredInductionWorker:
         assert config.grounding_ontology_ids == ["https://fibo/FBC/"]
         assert config.grounding_mode == "ENHANCED"
         assert config.grounding_service is not None
+
+    def test_grounding_service_uses_configured_model_and_region(self):
+        """GH #236: GROUNDING_LLM_MODEL_ID (resolved into
+        ``grounding_llm_model_id``) overrides the induction default and pairs
+        with ``llm_region``, so a non-US Region can name a profile it can
+        invoke instead of the us. default."""
+        body = UnstructuredInductionRequest(
+            **_valid_request_body(),
+            grounding_ontology_ids=["fibo-agreements"],
+            grounding_mode="ENHANCED",
+        )
+        app_config = {
+            "ontology_catalog_url": "http://catalog",
+            "embedding_generator_url": "http://embed",
+            "llm_region": "ap-northeast-1",
+            "llm_model_id": "global.anthropic.claude-sonnet-5",
+            # Resolved by main.py from GROUNDING_LLM_MODEL_ID (the override).
+            "grounding_llm_model_id": "jp.anthropic.claude-haiku-4-5-20251001-v1:0",
+        }
+        config = self._run_and_capture_config(body=body, app_config=app_config, resolved_ids=["https://fibo/FBC/"])
+        assert config.grounding_service is not None
+        self._grounding_service_cls.assert_called_once()
+        kwargs = self._grounding_service_cls.call_args.kwargs
+        assert kwargs["llm_model_id"] == "jp.anthropic.claude-haiku-4-5-20251001-v1:0"
+        assert kwargs["llm_region"] == "ap-northeast-1"
+
+    def test_grounding_service_uses_resolved_grounding_model(self):
+        """With no override, main.py resolves grounding_llm_model_id to the
+        Haiku rerank default; the router forwards whatever value it is given."""
+        body = UnstructuredInductionRequest(
+            **_valid_request_body(),
+            grounding_ontology_ids=["fibo-agreements"],
+            grounding_mode="ENHANCED",
+        )
+        app_config = {
+            "ontology_catalog_url": "http://catalog",
+            "embedding_generator_url": "http://embed",
+            "llm_region": "us-east-1",
+            "llm_model_id": "global.anthropic.claude-sonnet-5",
+            # main.py's Haiku default when GROUNDING_LLM_MODEL_ID is unset.
+            "grounding_llm_model_id": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        }
+        self._run_and_capture_config(body=body, app_config=app_config, resolved_ids=["https://fibo/FBC/"])
+        kwargs = self._grounding_service_cls.call_args.kwargs
+        assert kwargs["llm_model_id"] == "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+
+    def test_grounding_service_falls_back_when_grounding_model_id_is_empty(self):
+        """An empty grounding model id must not reach Bedrock as an empty
+        modelId; it falls back to the Haiku rerank default."""
+        body = UnstructuredInductionRequest(
+            **_valid_request_body(),
+            grounding_ontology_ids=["fibo-agreements"],
+            grounding_mode="ENHANCED",
+        )
+        app_config = {
+            "ontology_catalog_url": "http://catalog",
+            "embedding_generator_url": "http://embed",
+            "llm_region": "us-east-1",
+            "llm_model_id": "us.anthropic.claude-sonnet-4-6",
+            "grounding_llm_model_id": "",
+        }
+        self._run_and_capture_config(body=body, app_config=app_config, resolved_ids=["https://fibo/FBC/"])
+        kwargs = self._grounding_service_cls.call_args.kwargs
+        assert kwargs["llm_model_id"] == "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 
     def test_grounding_skipped_when_no_selection(self):
         """No grounding_ontology_ids on the request → resolver isn't consulted,

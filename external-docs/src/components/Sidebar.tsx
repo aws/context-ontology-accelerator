@@ -19,6 +19,7 @@ const SECTIONS: NavSection[] = [
   { stage: 'Scan', items: [
     { id: 'sources', label: 'Sources' },
     { id: 'cross-account-sources', label: 'Cross-Account Sources' },
+    { id: 'cross-network-connectivity', label: 'Cross-Network Connectivity' },
     { id: 'custom-connector-sources', label: 'Custom Connectors' },
     { id: 'databricks-sources', label: 'Databricks Sources' },
   ]},

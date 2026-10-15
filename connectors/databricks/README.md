@@ -462,7 +462,7 @@ re-scan that should pick a new table up.
 
 ## Deploy
 
-Prerequisites: JDK 11+, Maven, Node 20.12+, pnpm, AWS credentials, and a **CDK-bootstrapped** account
+Prerequisites: JDK 17–24 (21 recommended; see the [connectors README](../README.md)), Maven, Node 20.12+, pnpm, AWS credentials, and a **CDK-bootstrapped** account
 and region — the jar ships as an S3 asset.
 
 ```bash

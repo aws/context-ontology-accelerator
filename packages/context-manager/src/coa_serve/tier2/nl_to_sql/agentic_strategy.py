@@ -227,13 +227,16 @@ class AgenticStrategy:
         # its SQL read; keep names outside the grant's ``tableAllowlist`` out of
         # the client-visible trace and response.
         visible_tables = tables_visible_to(outcome.tables, context.profile)
+        # The execute step reports the tables the executed statement read; what the
+        # agent inspected stays in ``retrieved_tables`` / ``expanded_tables``.
+        executed_tables = tables_visible_to(SQLFirewall.referenced_tables(outcome.executed_sql), context.profile)
         trace.record(
             StepId.T2_SQL_EXECUTE,
             "success",
             t_ms,
             detail={
                 "rowCount": outcome.row_count,
-                "tables": visible_tables,
+                "tables": executed_tables,
                 "deepReasoning": True,
                 "confidence": confidence,
             },

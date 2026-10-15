@@ -12,7 +12,7 @@ S3 bucket, points a code review at that object and starts a review job, then exi
 It does not wait for the ~1h review, so findings are read in the Security Agent
 console, never in the job log.
 
-Two properties matter more than anything else here, because the nightly run has no
+Three properties matter more than anything else here, because the nightly run has no
 audience:
 
 1. **Every misconfiguration names itself.** Nothing should fail with a bare
@@ -23,10 +23,14 @@ audience:
    code review, not per job, so reuse without :func:`~botocore.client.BaseClient`
    ``update_code_review`` would re-scan whatever snapshot created the review — every
    night, forever, while still paying to upload a fresh zip.
+3. **A stack behind its template fails before anything else.** Nothing deploys it
+   automatically, so a merged IAM fix does nothing until someone redeploys — and
+   should say so, not surface as an ``AccessDeniedException`` three calls later.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import sys
@@ -59,6 +63,11 @@ SKIP_DIRS = frozenset(
         "cdk.out",
     }
 )
+
+# Relative to the repo root, which is the job's working directory.
+TEMPLATE_PATH = "ci/security-agent/template.yaml"
+STACK_NAME = "scl-security-agent"
+DEPLOY_HINT = "redeploy with ci/security-agent/deploy.sh"
 
 # The `name` component input documents this contract; enforce it rather than trusting
 # it, since `name` becomes both the S3 key prefix and the review title.
@@ -134,6 +143,38 @@ def build_zip(dest: str, root: str = ".") -> int:
     return written
 
 
+def template_sha256(path: str) -> str:
+    """Hex sha256 of the file's raw bytes — the same digest ``deploy.sh`` stamps."""
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+def check_stack_current(cfn: Any, template_path: str = TEMPLATE_PATH) -> None:
+    """Die unless the stack was deployed from exactly the checked-out template.
+
+    ``deploy.sh`` passes the template's hash as the ``TemplateSha256`` parameter and the
+    stack echoes it as an output. A stack that predates this check cannot be described
+    at all — its CI role has no ``DescribeStacks`` grant — which also means "redeploy".
+    """
+    try:
+        expected = template_sha256(template_path)
+    except OSError as e:
+        die(f"cannot hash {template_path} — run from the repo root: {e}")
+    try:
+        stacks = cfn.describe_stacks(StackName=STACK_NAME)["Stacks"]
+    except Exception as e:
+        die(f"cannot read stack {STACK_NAME} to check it matches {template_path} — {DEPLOY_HINT}: {e}")
+    stack = first(stacks, "stack", f"describe_stacks({STACK_NAME})")
+    # Both fields are optional in the API model; a missing one reads as unstamped.
+    outputs = {o.get("OutputKey"): o.get("OutputValue") for o in stack.get("Outputs", [])}
+    deployed = outputs.get("TemplateSha256") or "unstamped"
+    if deployed != expected:
+        die(
+            f"stack {STACK_NAME} is behind {template_path} "
+            f"(deployed {deployed[:12]}, checkout {expected[:12]}) — {DEPLOY_HINT}"
+        )
+
+
 def resolve_agent_space(client: Any, agent_space_id: str) -> tuple[str, str]:
     """Return ``(bucket_name, service_role_arn)`` for the agent space.
 
@@ -198,7 +239,10 @@ def ensure_code_review(client: Any, agent_space_id: str, title: str, assets: dic
         location = assets["sourceCode"][0]["s3Location"]
         print(f"Reusing code review {cr_id} → repointing it at {location}")
         try:
-            client.update_code_review(agentSpaceId=agent_space_id, codeReviewId=cr_id, assets=assets)
+            # serviceRole is mandatory whenever assets carry sourceCode, even on update.
+            client.update_code_review(
+                agentSpaceId=agent_space_id, codeReviewId=cr_id, assets=assets, serviceRole=service_role
+            )
         except Exception as e:
             die(f"update_code_review failed for {cr_id} — could not repoint it at {location}: {e}")
         return cr_id
@@ -234,8 +278,9 @@ def main() -> None:
     client = boto3.client("securityagent", config=BOTO_CONFIG)
     s3 = boto3.client("s3", config=BOTO_CONFIG)
 
-    # Resolved before zipping: a misconfigured agent space should fail in seconds
-    # rather than after deflating the whole tree.
+    # Both checked before zipping: a stale stack or a misconfigured agent space should
+    # fail in seconds rather than after deflating the whole tree.
+    check_stack_current(boto3.client("cloudformation", config=BOTO_CONFIG))
     bucket, service_role = resolve_agent_space(client, agent_space_id)
 
     # mkstemp rather than NamedTemporaryFile: build_zip and upload_file both reopen by

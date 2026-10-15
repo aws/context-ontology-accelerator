@@ -39,6 +39,7 @@ import uuid
 from datetime import UTC, datetime
 from threading import Event, Thread
 
+from coa_common.bedrock import FALLBACK_CHAT_MODEL_ID
 from coa_control_plane_server.models.induction_job_status import (
     InductionJobStatus,
 )
@@ -405,10 +406,12 @@ def _run_unstructured_induction(
                 ontology_catalog=StoreOntologyCatalogAdapter(ns_graph, ns_vec, namespace=ns),
                 embedding_generator=EmbeddingGeneratorClient(app_config["embedding_generator_url"]),
                 llm_region=app_config.get("llm_region", "us-east-1"),
-                llm_model_id=app_config.get(
-                    "grounding_llm_model_id",
-                    "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-                ),
+                # Grounding rerank defaults to Haiku (a cheap reranker);
+                # main.py resolves grounding_llm_model_id, overridable with
+                # GROUNDING_LLM_MODEL_ID for a region-valid id (GH #236). `or`
+                # covers an empty value reaching this far — fall back to the
+                # same Haiku literal main.py defaults to.
+                llm_model_id=app_config.get("grounding_llm_model_id") or FALLBACK_CHAT_MODEL_ID,
                 namespace=ns,
             )
 

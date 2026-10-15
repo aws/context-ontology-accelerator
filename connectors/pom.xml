@@ -28,6 +28,7 @@
     <junit.version>5.10.2</junit.version>
     <surefire.version>3.2.5</surefire.version>
     <shade.version>3.5.1</shade.version>
+    <enforcer.version>3.5.0</enforcer.version>
     <!-- The federation SDK's own Jackson, and above the CVE floor (2.18.9). The BOM below
          applies it to every Jackson module, the SDK's transitives included, so it has to
          move with athena.federation.sdk.version: a lower value downgrades the Jackson the
@@ -130,6 +131,31 @@
     </pluginManagement>
 
     <plugins>
+      <!-- Refuse a JDK the federation SDK cannot run on before anything compiles. On JDK 25
+           the Arrow/Netty the SDK shades in throws "PooledDirectByteBuf cannot be cast to
+           PooledUnsafeDirectByteBuf" from the Databricks query-builder tests, which reads
+           like a COA bug. `brew install maven` pulls in the newest OpenJDK, so this is the
+           common way to hit it. Only the build JDK is constrained; the Lambda runs java21.
+           Keep the upper bound in step with scripts/check-java-version.sh. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-enforcer-plugin</artifactId>
+        <version>${enforcer.version}</version>
+        <executions>
+          <execution>
+            <id>enforce-java-version</id>
+            <goals><goal>enforce</goal></goals>
+            <configuration>
+              <rules>
+                <requireJavaVersion>
+                  <version>[17,25)</version>
+                  <message>JDK 17-24 required (21 recommended): the Athena Federation SDK fails on JDK 25+. Point JAVA_HOME at JDK 21, e.g. on macOS: export JAVA_HOME=$(/usr/libexec/java_home -v 21)</message>
+                </requireJavaVersion>
+              </rules>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-surefire-plugin</artifactId>

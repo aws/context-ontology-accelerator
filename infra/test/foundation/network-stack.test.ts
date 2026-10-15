@@ -190,6 +190,16 @@ describe("NetworkStack", () => {
       }
     });
 
+    it("authorizer SG keeps all-outbound egress (external IdP JWKS on any port)", () => {
+      const template = buildStack();
+      template.hasResourceProperties("AWS::EC2::SecurityGroup", {
+        GroupDescription: "API authorizer security group",
+        SecurityGroupEgress: [
+          Match.objectLike({ CidrIp: "0.0.0.0/0", IpProtocol: "-1" }),
+        ],
+      });
+    });
+
     it("Lambda SG has egress to source-DB ports (direct JDBC discovery)", () => {
       const template = buildStack();
       const sgs = template.findResources("AWS::EC2::SecurityGroup");

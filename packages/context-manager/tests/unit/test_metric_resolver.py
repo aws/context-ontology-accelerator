@@ -382,6 +382,158 @@ class TestMultiMetricDetection:
         assert result.found
         assert result.match_count == 2
 
+    async def test_contained_unspaced_synonym_is_not_a_second_metric(self):
+        """The metric consuming the complete phrase wins over its substring."""
+        resolver = _make_resolver(
+            seed=[
+                {
+                    "metric_id": "m-equipment-count",
+                    "name": "equipment_count",
+                    "synonyms": ["設備台数"],
+                    "namespace": "maintenance",
+                },
+                {
+                    "metric_id": "m-aging-equipment-count",
+                    "name": "aging_equipment_count",
+                    "synonyms": ["老朽設備台数"],
+                    "namespace": "maintenance",
+                },
+            ]
+        )
+
+        result = resolver.exact_name_synonym_match("老朽設備台数は？", "maintenance")
+
+        assert result.found
+        assert result.metric_id == "m-aging-equipment-count"
+        assert result.match_count == 1
+        assert result.matched_text == "老朽設備台数"
+        assert result.residual == ""
+
+    async def test_equal_unspaced_synonyms_remain_ambiguous(self):
+        """Containment must not break ties between identical aliases."""
+        resolver = _make_resolver(
+            seed=[
+                {
+                    "metric_id": "m-equipment-count-a",
+                    "name": "equipment_count_a",
+                    "synonyms": ["設備台数"],
+                    "namespace": "maintenance",
+                },
+                {
+                    "metric_id": "m-equipment-count-b",
+                    "name": "equipment_count_b",
+                    "synonyms": ["設備台数"],
+                    "namespace": "maintenance",
+                },
+            ]
+        )
+
+        result = resolver.exact_name_synonym_match("設備台数は？", "maintenance")
+
+        assert result.found
+        assert result.match_count == 2
+
+    async def test_disjoint_match_keeps_metric_independent(self):
+        """A contained alias plus a separate hit is still a real second metric."""
+        resolver = _make_resolver(
+            seed=[
+                {
+                    "metric_id": "m-equipment",
+                    "name": "equipment_metrics",
+                    "synonyms": ["設備台数", "故障件数"],
+                    "namespace": "maintenance",
+                },
+                {
+                    "metric_id": "m-aging-equipment-count",
+                    "name": "aging_equipment_count",
+                    "synonyms": ["老朽設備台数"],
+                    "namespace": "maintenance",
+                },
+            ]
+        )
+
+        result = resolver.exact_name_synonym_match("老朽設備台数と故障件数を比較", "maintenance")
+
+        assert result.found
+        assert result.match_count == 2
+
+    async def test_partially_overlapping_aliases_remain_two_metrics(self):
+        """Overlap without containment leaves both metrics standing."""
+        resolver = _make_resolver(
+            seed=[
+                {
+                    "metric_id": "m-aging-equipment",
+                    "name": "aging_equipment",
+                    "synonyms": ["老朽設備"],
+                    "namespace": "maintenance",
+                },
+                {
+                    "metric_id": "m-equipment-count",
+                    "name": "equipment_count",
+                    "synonyms": ["設備台数"],
+                    "namespace": "maintenance",
+                },
+            ]
+        )
+
+        # 老朽設備 covers [0, 4) and 設備台数 covers [2, 6): neither contains the other.
+        result = resolver.exact_name_synonym_match("老朽設備台数は？", "maintenance")
+
+        assert result.found
+        assert result.match_count == 2
+
+    async def test_containment_chain_keeps_only_the_longest(self):
+        """台数 ⊂ 設備台数 ⊂ 老朽設備台数: only the outermost metric survives."""
+        resolver = _make_resolver(
+            seed=[
+                {"metric_id": "m-count", "name": "unit_count", "synonyms": ["台数"], "namespace": "maintenance"},
+                {
+                    "metric_id": "m-equipment-count",
+                    "name": "equipment_count",
+                    "synonyms": ["設備台数"],
+                    "namespace": "maintenance",
+                },
+                {
+                    "metric_id": "m-aging-equipment-count",
+                    "name": "aging_equipment_count",
+                    "synonyms": ["老朽設備台数"],
+                    "namespace": "maintenance",
+                },
+            ]
+        )
+
+        result = resolver.exact_name_synonym_match("老朽設備台数は？", "maintenance")
+
+        assert result.found
+        assert result.metric_id == "m-aging-equipment-count"
+        assert result.match_count == 1
+
+    async def test_latin_alias_inside_a_longer_alias_also_prefers_the_longer(self):
+        """Pruning is script-independent: longest match wins for Latin aliases too.
+
+        ``revenue`` and ``total revenue`` both match "what is total revenue"
+        with word boundaries. Before containment pruning this was a two-metric
+        question (Tier 2/3); now it resolves to the metric that names the whole
+        phrase.
+        """
+        resolver = _make_resolver(
+            seed=[
+                {"metric_id": "m-revenue", "name": "revenue", "synonyms": [], "namespace": "sales"},
+                {
+                    "metric_id": "m-total-revenue",
+                    "name": "booked_total",
+                    "synonyms": ["total revenue"],
+                    "namespace": "sales",
+                },
+            ]
+        )
+
+        result = resolver.exact_name_synonym_match("what is total revenue", "sales")
+
+        assert result.found
+        assert result.metric_id == "m-total-revenue"
+        assert result.match_count == 1
+
 
 @pytest.mark.unit
 class TestLookup:
@@ -1406,6 +1558,61 @@ class TestNonAsciiMatching:
         assert result.found
         assert result.residual == expected, f"{query!r} must leave {expected!r} as residual"
 
+    @pytest.mark.parametrize("qualifier", ["ごご", "もも", "かが"])
+    async def test_hiragana_content_word_is_not_proved_by_particle_decomposition(self, qualifier):
+        """A content word made from one-scalar particles must force Tier 2/3.
+
+        The complete hiragana run includes the following ``の``. Accepting any
+        stop-word decomposition swallowed the whole run and let Tier 1 execute
+        the unfiltered metric at confidence 1.0.
+        """
+        resolver = self._resolver()
+
+        result = resolver.exact_name_synonym_match(f"{qualifier}の総発電容量", "energy")
+
+        assert result.found
+        assert result.residual == f"{qualifier}の"
+
+    @pytest.mark.parametrize("qualifier", ["ごご", "もも", "かが"])
+    @pytest.mark.parametrize("ending", ["ですか", "です", "ください"])
+    async def test_trailing_hiragana_content_word_is_not_swallowed(self, qualifier, ending):
+        """A content word before a polite ending must still force Tier 2/3.
+
+        「総発電容量はごごですか」 fuses ``はごごですか`` into one run. A
+        multi-scalar fragment elsewhere in the run (``ですか``) must not vouch
+        for the adjacent one-scalar pair ``ご`` + ``ご``.
+        """
+        resolver = self._resolver()
+
+        result = resolver.exact_name_synonym_match(f"総発電容量は{qualifier}{ending}", "energy")
+
+        assert result.found
+        assert qualifier in result.residual
+
+    @pytest.mark.parametrize("run", ["では", "には", "とは", "のは", "でも", "にも", "とも", "での"])
+    def test_reviewed_particle_pair_is_scaffolding(self, run):
+        from coa_serve.tier1.metric_resolver import _is_stop_scaffolding
+
+        assert _is_stop_scaffolding(run)
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "総発電容量とは",
+            "総発電容量とはいくらですか",
+            "では総発電容量はいくらですか",
+            "総発電容量はいくらですか",
+            "総発電容量を教えてください",
+        ],
+    )
+    async def test_particle_pair_inside_a_question_resolves_at_tier1(self, query):
+        resolver = self._resolver()
+
+        result = resolver.exact_name_synonym_match(query, "energy")
+
+        assert result.found
+        assert result.residual == "", f"unexpected residual for {query!r}: {result.residual!r}"
+
     async def test_oversized_hiragana_run_is_not_decomposed(self):
         """A hiragana run past the ceiling skips the O(n²) DP and trips the gate.
 
@@ -1459,6 +1666,78 @@ class TestNonAsciiMatching:
 
         result = resolver.exact_name_synonym_match("monthlykwh使用量", "energy")
         assert not result.found
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "設備台数は何台ですか",
+            "設備台数はいくつですか",
+            "設備台数はどれくらいですか",
+            "設備台数はどのくらいですか",
+        ],
+    )
+    async def test_japanese_quantity_question_has_no_residual(self, query):
+        resolver = MetricResolver(
+            seed=[
+                {
+                    "metric_id": "m-equipment-count",
+                    "name": "equipment_count",
+                    "synonyms": ["設備台数"],
+                    "namespace": "maintenance",
+                }
+            ]
+        )
+
+        result = resolver.exact_name_synonym_match(query, "maintenance")
+
+        assert result.found
+        assert result.residual == ""
+
+    @pytest.mark.parametrize("counter", ["何件", "何名", "何社"])
+    async def test_japanese_counter_question_tokens_are_consumed(self, counter):
+        """Counter compounds are one kanji token, not decomposable hiragana."""
+        resolver = MetricResolver(
+            seed=[
+                {
+                    "metric_id": "m-count",
+                    "name": "record_count",
+                    "synonyms": ["対象数"],
+                    "namespace": "counts",
+                }
+            ]
+        )
+
+        result = resolver.exact_name_synonym_match(f"対象数は{counter}ですか", "counts")
+
+        assert result.found
+        assert result.residual == ""
+
+    @pytest.mark.parametrize(
+        ("query", "expected"),
+        [
+            ("東京地域の設備台数は何台ですか", "東京地域"),
+            # The adjacent qualifier forms one kanji run with the counter.
+            # Exact membership therefore fails closed and preserves the whole
+            # run instead of partially swallowing the question.
+            ("設備台数は何台以上ですか", "何台以上"),
+        ],
+    )
+    async def test_japanese_counter_does_not_hide_a_real_qualifier(self, query, expected):
+        resolver = MetricResolver(
+            seed=[
+                {
+                    "metric_id": "m-equipment-count",
+                    "name": "equipment_count",
+                    "synonyms": ["設備台数"],
+                    "namespace": "maintenance",
+                }
+            ]
+        )
+
+        result = resolver.exact_name_synonym_match(query, "maintenance")
+
+        assert result.found
+        assert result.residual == expected
 
     async def test_korean_particle_attachment_matches_and_gates(self):
         """Hangul attaches particles directly (총매출은) — the match must land.

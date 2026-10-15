@@ -1,7 +1,8 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { Node } from "constructs";
+import * as cdk from "aws-cdk-lib";
+import { Construct, Node } from "constructs";
 import {
   CTX_RESOURCE_PREFIX,
   CTX_ENV,
@@ -94,6 +95,20 @@ export function resolveContext(node: Node): ResolvedContext {
 export function prefixed(node: Node, name: string): string {
   const { prefix, envName } = resolveContext(node);
   return `${prefix}-${envName}-${name}`;
+}
+
+/**
+ * ARN of the platform Lambda named `prefixed(name)` in the caller's account and
+ * region. Lets a stack address another stack's function by its fixed name,
+ * without the cross-stack reference (and dependency) that `functionArn` brings.
+ */
+export function prefixedLambdaArn(scope: Construct, name: string): string {
+  return cdk.Stack.of(scope).formatArn({
+    service: "lambda",
+    resource: "function",
+    resourceName: prefixed(scope.node, name),
+    arnFormat: cdk.ArnFormat.COLON_RESOURCE_NAME,
+  });
 }
 
 /**

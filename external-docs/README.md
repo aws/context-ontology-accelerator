@@ -43,6 +43,7 @@ pandoc \
   content/agent-access.md \
   content/cedar-policy-authoring.md \
   content/cross-account-sources.md \
+  content/cross-network-connectivity.md \
   content/custom-connector-sources.md \
   content/databricks-sources.md \
   content/package-guide.md \

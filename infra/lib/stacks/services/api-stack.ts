@@ -53,6 +53,19 @@ export const INTENTIONALLY_STUBBED = new Set([
 
 export interface ApiStackProps extends cdk.StackProps {
   /**
+   * Shared platform Lambda security group, used by the cache-invalidation
+   * Lambda instead of a per-function auto SG: each new SG combination costs a
+   * ~228 s Hyperplane ENI create on first deploy.
+   */
+  readonly lambdaSecurityGroup: ec2.ISecurityGroup;
+
+  /**
+   * Security group for the authorizer Lambda, created in NetworkStack so its
+   * network interface can be pre-warmed.
+   */
+  readonly authorizerSecurityGroup: ec2.ISecurityGroup;
+
+  /**
    * CORS allowed origin for the API (e.g. `https://d2xw5y8g9akfew.cloudfront.net`).
    * Defaults to `"*"` when no custom domain is configured (local dev).
    */
@@ -183,6 +196,7 @@ export class ApiStack extends SCLStack {
       memorySize: 256,
       vpc: props.vpc,
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+      securityGroups: [props.authorizerSecurityGroup],
       environment: {
         JWKS_ISSUER: issuerUrl,
         ...(props.jwksUri && { JWKS_URI: props.jwksUri }),
@@ -225,10 +239,11 @@ export class ApiStack extends SCLStack {
         }),
         timeout: cdk.Duration.seconds(10),
         memorySize: 128,
-        // Same VPC placement as the authorizer beside it: DynamoDB is reached
-        // over the VPC's gateway endpoint, no public egress needed.
+        // Same subnets as the authorizer, but on the shared Lambda SG: DynamoDB
+        // is reached over the VPC's gateway endpoint, no public egress needed.
         vpc: props.vpc,
         vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+        securityGroups: [props.lambdaSecurityGroup],
         logRetention: logs.RetentionDays.ONE_MONTH,
         environment: {
           CACHE_INVALIDATION_TABLE_NAME: props.cacheInvalidationTable.tableName,

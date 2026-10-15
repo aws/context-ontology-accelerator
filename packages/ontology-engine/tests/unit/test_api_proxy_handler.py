@@ -148,6 +148,107 @@ class TestHandler:
         assert "namespace=ns-1" in call_url
 
     @patch("urllib.request.urlopen")
+    def test_path_param_cannot_smuggle_namespace(self, mock_urlopen, mod):
+        """A '?' or '#' in a path-param value must stay trapped in its path
+        segment. If a bare '?' reached the backend URL it would start a query
+        string, demoting the authorizer-threaded ``?namespace=own-ns`` and
+        letting a caller reach another tenant's data. The proxy percent-encodes
+        it, so the namespace stays authoritative. (This guards the hostile case
+        even though real clients pre-encode the id.)
+        """
+        from urllib.parse import parse_qs, urlparse
+
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.read.return_value = b"{}"
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_resp
+
+        event = {
+            "httpMethod": "DELETE",
+            "resource": "/namespaces/{namespaceId}/ontologies/{ontologyId}",
+            "pathParameters": {
+                "namespaceId": "own-ns",
+                "ontologyId": "abc?namespace=victim-ns&z=",
+            },
+            "queryStringParameters": None,
+            "body": "",
+        }
+        assert mod.handler(event, None)["statusCode"] == 200
+
+        parsed = urlparse(mock_urlopen.call_args[0][0].full_url)
+        # The authorized namespace wins; the smuggled one never reaches the query.
+        assert parse_qs(parsed.query)["namespace"][0] == "own-ns"
+        assert "victim-ns" not in parsed.query
+        # The smuggling '?' is percent-encoded and stays inside the path segment.
+        assert "abc%3Fnamespace" in parsed.path
+
+    @pytest.mark.parametrize(
+        "ontology_id",
+        [
+            "https://schema.org/",  # the real foundational-ontology id (trailing slash)
+            "http://example.org/onto#Customer",  # OWL IRI with ':' '/' '#'
+            "catalog/customers/v2",  # slash-bearing identifier
+            "オントロジー商品マスタ",  # non-ASCII (Japanese)
+            "produkt-stammdaten-größe",  # non-ASCII (German)
+        ],
+    )
+    @patch("urllib.request.urlopen")
+    def test_iri_path_param_round_trips_through_backend(self, mock_urlopen, mod, ontology_id):
+        """ontologyId is a free-form IRI/slash/non-ASCII identifier. The backend
+        keys the ontology's named graph on ``quote(raw_id, safe="")`` on both the
+        write (ingest) and read (download) paths, so the proxy must deliver a
+        segment the backend decodes back to the RAW id. Double-encoding it makes
+        write-URI != read-URI and the download reads an empty graph — the real
+        e2e failure (0 of N triples). API Gateway hands the proxy the id still
+        encoded, so the invariant is: a single unquote of the emitted segment
+        recovers the raw id.
+        """
+        from urllib.parse import parse_qs, quote, unquote, urlsplit
+
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.read.return_value = b"{}"
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_resp
+
+        # The writer keys the named graph on quote(raw_id, safe=""); API Gateway
+        # delivers the id to the proxy still encoded (client sent quote(id)).
+        write_graph_segment = quote(ontology_id, safe="")
+        delivered_encoded = quote(ontology_id, safe="")
+
+        event = {
+            "httpMethod": "GET",
+            "resource": "/namespaces/{namespaceId}/ontologies/{ontologyId}/download",
+            "pathParameters": {"namespaceId": "own-ns", "ontologyId": delivered_encoded},
+            "queryStringParameters": None,
+            "body": "",
+        }
+        assert mod.handler(event, None)["statusCode"] == 200
+
+        proxied = urlsplit(mock_urlopen.call_args[0][0].full_url)
+        emitted_segment = proxied.path.split("/ontologies/", 1)[1].rsplit("/download", 1)[0]
+
+        # The decisive, transport-independent property: a single unquote of the
+        # emitted segment must recover the raw id (the backend decodes once, then
+        # re-encodes to rebuild the graph URI). Both shipped-broken variants
+        # (safe="" and safe="/:" without the unquote) emit a double-encoded
+        # segment -> read URI %253A != write URI %3A -> empty graph. Asserting on
+        # the emitted bytes avoids an HTTP client's decode leniency hiding it.
+        assert unquote(emitted_segment) == ontology_id, (
+            f"proxy emitted {emitted_segment!r}; one backend decode gives "
+            f"{unquote(emitted_segment)!r}, not the raw id {ontology_id!r} — the "
+            f"download would recompute a differently-encoded (empty) named graph"
+        )
+        # And re-encoding that recovered id reproduces the writer's graph segment.
+        assert quote(unquote(emitted_segment), safe="") == write_graph_segment
+
+        # Namespace stays authoritative regardless of the id's contents.
+        assert parse_qs(proxied.query)["namespace"][0] == "own-ns"
+
+    @patch("urllib.request.urlopen")
     def test_http_error_forwarded(self, mock_urlopen, mod):
         from urllib.error import HTTPError
 

@@ -111,3 +111,17 @@ class TestLoadPoliciesForRoles:
         config = mock_dao_cls.call_args.kwargs["config"]
         assert config.read_timeout == 8
         assert config.retries["max_attempts"] == 2
+
+    @patch("coa_authorization.policy_loader.DynamoDBDAO")
+    def test_uses_given_dao_without_building_one(self, mock_dao_cls):
+        # Callers that read repeatedly (serve's policy cache) pass one DAO built
+        # up front, so no boto3 resource is created per call.
+        dao = MagicMock()
+        dao.get.side_effect = [{"cedarPolicy": "policyA"}, None, {"cedarPolicy": "policyB"}]
+
+        result = load_policies_for_roles(["roleA", "roleB"], table_name="roles", region="us-east-1", dao=dao)
+
+        assert result == "policyA\npolicyB"
+        mock_dao_cls.assert_not_called()
+        assert dao.get.call_args_list[0].args == ({"PK": "GLOBAL", "SK": "ROLE#roleA"},)
+        assert dao.get.call_args_list[2].args == ({"PK": "NAMESPACE_TEMPLATE", "SK": "ROLE#roleB"},)

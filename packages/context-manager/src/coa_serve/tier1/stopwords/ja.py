@@ -10,7 +10,9 @@ that pair is the canonical polite ask). Longer all-hiragana fusions
 (``えてください``, ``はいくらですか``) are handled by the hiragana
 decomposition in ``metric_resolver._is_stop_scaffolding`` — a bounded DP that
 splits an unspaced hiragana run into listed scaffolding words — not by listing
-every combination here. An unlisted verb ("見せて" → ``見`` + ``せて``)
+every combination here. The DP never takes two one-scalar particles in a row
+(that shape also spells content words such as ごご), so a grammatical pair such
+as では must be listed in ``SAFE_PARTICLE_RUNS``. An unlisted verb ("見せて" → ``見`` + ``せて``)
 demotes to Tier 2, the safe direction, same contract as the English list.
 
 Deliberately absent, per the package curation policy: aggregate modifiers
@@ -22,10 +24,36 @@ are: they restate the aggregate the metric's SQL already computes.
 
 from __future__ import annotations
 
+SAFE_PARTICLE_RUNS: frozenset[str] = frozenset(
+    {
+        # Reviewed grammatical fusions of two one-scalar particles. The
+        # decomposition never takes two one-scalar steps in a row, because that
+        # shape also spells content words (ごご, もも, かが, もの, ので), so each
+        # pair that is pure grammar is listed here as a whole. Never add a pair
+        # that is also a word.
+        "では",
+        "には",
+        "とは",
+        "のは",
+        "でも",
+        "にも",
+        "とも",
+        "での",
+    }
+)
+"""Two-particle hiragana runs proven to be grammar, not content words.
+
+``_is_stop_scaffolding`` accepts each entry on its own and also uses it as a
+multi-scalar fragment inside a longer run (``総発電容量とはいくらですか``).
+"""
+
 GROUPS: tuple[str, ...] = (
-    # Particles, copula, polite forms, and interrogative-quantity words:
+    # Particles, copula, polite forms, and interrogative-quantity words.
+    # Counter-bearing interrogatives are atomic kanji runs under the shared
+    # tokenizer, so list each safe question form explicitly.
     "は が を に で の と も か です ます だ ですか ますか でしょうか ください さい"
-    " お ご 教 えて いくら どれくらい どのくらい",
+    " お ご 教 えて いくら いくつ どれくらい どのくらい"
+    " 何台 何件 何名 何社",
     # Aggregate restaters (kanji runs), greetings, and units:
     "合計 総計 総額 総数 件数 金額 数 総"
     " こんにちは こんばんは おはよう ありがとう ありがとうございます よろしく どうも すみません"

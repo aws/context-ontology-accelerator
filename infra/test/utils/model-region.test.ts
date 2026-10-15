@@ -152,6 +152,11 @@ describe("resolveConfiguredModelIds", () => {
           modelId: DEFAULT_BEDROCK_CHAT_MODEL_ID,
           origin: "default",
         },
+        {
+          key: "bedrockGroundingLlmModelId",
+          modelId: DEFAULT_BEDROCK_CHAT_MODEL_ID,
+          origin: "default",
+        },
       ]),
     );
   });

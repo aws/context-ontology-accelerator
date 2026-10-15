@@ -154,6 +154,15 @@ export interface SsmConfig {
    *  us.anthropic.claude-haiku-4-5-20251001-v1:0. */
   readonly bedrockChatModelId?: string;
 
+  /** Bedrock model ID used by the ontology-engine grounding reranker
+   *  (GROUNDING_LLM_MODEL_ID). Grounding reranks concept candidates, a cheap
+   *  high-volume call, so it defaults to the chat model
+   *  (DEFAULT_BEDROCK_CHAT_MODEL_ID, a Haiku-class model) rather than the
+   *  heavier induction model. Set a region-valid profile here to override it
+   *  on a non-US deploy (GH #236). Accepts geo inference profiles and bare
+   *  in-region IDs. */
+  readonly bedrockGroundingLlmModelId?: string;
+
   /** Model IDs allowed for per-request override via options.modelId.
    *  When omitted or empty, any valid model ID is accepted. */
   readonly allowedOverrideModels?: string[];

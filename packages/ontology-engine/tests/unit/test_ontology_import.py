@@ -499,6 +499,25 @@ class TestUploadEndpoint:
         )
         assert r.status_code == 200
 
+    def test_delete_ontology_incomplete_embedding_delete_stays_best_effort(self, import_client):
+        """The synchronous DELETE route clears embeddings best-effort: a delete
+        that stops with documents still matching must not fail the request or
+        keep the registry row (that is the async route's hard gate, not this one)."""
+        from coa_common.opensearch import DeleteIncompleteError
+
+        http, _mock_graph, mock_vec, *_ = import_client
+        files = {"file": ("onto.ttl", TURTLE.encode("utf-8"), "text/turtle")}
+        http.post("/ontologies/https://example.com/onto/upload", data={"namespace": "default"}, files=files)
+        mock_vec.delete_embeddings_for_ontology.side_effect = DeleteIncompleteError(
+            "2 matching document(s) left", deleted=1, remaining=2, failed=4
+        )
+        r = http.delete("/ontologies/https://example.com/onto", params={"namespace": "default"})
+        assert r.status_code == 204
+        mock_vec.delete_embeddings_for_ontology.assert_called_once()
+        files = {"file": ("onto.ttl", TURTLE.encode("utf-8"), "text/turtle")}
+        r = http.post("/ontologies/https://example.com/onto/upload", data={"namespace": "default"}, files=files)
+        assert r.status_code == 200
+
     def test_malformed_turtle_returns_422(self, import_client):
         http, mock_graph, mock_vec, *_ = import_client
         resp = http.post(

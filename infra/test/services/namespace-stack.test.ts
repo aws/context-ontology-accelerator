@@ -88,6 +88,29 @@ describe("NamespaceStack", () => {
     return JSON.stringify(role.Properties.AssumeRolePolicyDocument);
   }
 
+  test("roles, platform-roles and grants Lambdas share the platform Lambda SG", () => {
+    // A per-function auto SG is a new Hyperplane ENI combination, which costs
+    // ~228 s on first deploy; the shared SG reuses the pre-warmed ENI.
+    for (const name of ["roles-api", "platform-roles-api", "grants-api"]) {
+      const fns = template.findResources("AWS::Lambda::Function", {
+        Properties: {
+          FunctionName: `${DEFAULT_RESOURCE_PREFIX}-${DEFAULT_ENV}-${name}`,
+        },
+      });
+      const [fn] = Object.values(fns);
+      expect(fn).toBeDefined();
+      const sgs: unknown[] = fn.Properties.VpcConfig.SecurityGroupIds;
+      expect(sgs).toHaveLength(1);
+      expect(JSON.stringify(sgs[0])).toContain("LambdaSG");
+    }
+    const autoSgs = Object.keys(
+      template.findResources("AWS::EC2::SecurityGroup"),
+    ).filter((id) =>
+      /^(Roles|PlatformRoles|Grants)ApiFnSecurityGroup/.test(id),
+    );
+    expect(autoSgs).toEqual([]);
+  });
+
   test("creates Namespaces table with PK/SK", () => {
     template.hasResourceProperties("AWS::DynamoDB::Table", {
       TableName: Match.stringLikeRegexp("namespaces$"),

@@ -733,6 +733,91 @@ class TestListProposalsScanPaginationDrain:
         assert {r["proposal_id"] for r in rows} == {"p1", "p2", "p3"}
 
 
+class TestListProposalsNewestFirst:
+    """``list_proposals`` returns the NEWEST matches, newest first, across scan pages.
+
+    A Scan has no order, so a capped list must drain every page and sort before it
+    cuts, or a namespace holding more than ``limit`` matches gets an arbitrary
+    subset (a page asking for the latest induction could see only older ones).
+    ``page_size=2`` forces a multi-page scan with the matches spread across pages.
+    """
+
+    @staticmethod
+    def _seed(table: _FakeDynamoTable, ns: str, pid: str, created_at: str | None, source_type: str) -> None:
+        item = {
+            "PK": f"{ns}#PROPOSAL#{pid}",
+            "SK": "META",
+            "proposal_id": pid,
+            "namespace": ns,
+            "proposal_type": "induction",
+            "source_type": source_type,
+            "status": "accepted",
+        }
+        if created_at is not None:
+            item["created_at"] = created_at
+        table.put_item(Item=item)
+
+    @pytest.fixture()
+    def paged(self, monkeypatch):
+        from coa_ontology import dynamo_store as ds
+
+        table = _FakeDynamoTable(page_size=2)
+        ns = "ns-newest"
+        # Storage (scan) order deliberately differs from age order; the newest
+        # structured match sits on the last page behind document inductions.
+        self._seed(table, ns, "p-old", "2026-01-01T00:00:00+00:00", "STRUCTURED")
+        for i in range(4):
+            self._seed(table, ns, f"u-{i}", f"2026-07-0{i + 1}T00:00:00+00:00", "UNSTRUCTURED")
+        self._seed(table, ns, "p-mid", "2026-03-01T00:00:00+00:00", "STRUCTURED")
+        self._seed(table, ns, "p-new", "2026-06-02T00:00:00+00:00", "STRUCTURED")
+        # Newer than everything, but in another namespace: must not match.
+        self._seed(table, "ns-other", "x-1", "2026-09-01T00:00:00+00:00", "STRUCTURED")
+        monkeypatch.setattr(ds, "_get_table", lambda: table)
+        return ns
+
+    def test_list_proposals_more_matches_than_limit_returns_newest(self, paged):
+        from coa_ontology import dynamo_store as ds
+
+        rows = ds.list_proposals(namespace=paged, proposal_type="induction", source_type="STRUCTURED", limit=2)
+
+        # The two newest structured inductions, not the first two the scan meets.
+        assert [r["proposal_id"] for r in rows] == ["p-new", "p-mid"]
+
+    def test_list_proposals_filtered_drain_is_newest_first(self, paged):
+        from coa_ontology import dynamo_store as ds
+
+        rows = ds.list_proposals(namespace=paged, proposal_type="induction", source_type="STRUCTURED", limit=None)
+
+        assert [r["proposal_id"] for r in rows] == ["p-new", "p-mid", "p-old"]
+
+    def test_list_proposals_default_limit_is_newest_first(self, paged):
+        from coa_ontology import dynamo_store as ds
+
+        rows = ds.list_proposals(namespace=paged)
+
+        assert [r["proposal_id"] for r in rows] == ["u-3", "u-2", "u-1", "u-0", "p-new", "p-mid", "p-old"]
+
+    def test_list_proposals_missing_created_at_sorts_last(self, monkeypatch):
+        from coa_ontology import dynamo_store as ds
+
+        table = _FakeDynamoTable(page_size=2)
+        self._seed(table, "ns-undated", "p-undated", None, "STRUCTURED")
+        self._seed(table, "ns-undated", "p-dated", "2026-01-01T00:00:00+00:00", "STRUCTURED")
+        monkeypatch.setattr(ds, "_get_table", lambda: table)
+
+        rows = ds.list_proposals(namespace="ns-undated")
+
+        assert [r["proposal_id"] for r in rows] == ["p-dated", "p-undated"]
+
+    def test_list_proposals_non_positive_limit_returns_empty(self, paged):
+        """A zero or negative ``limit`` returns nothing, as it did before the drain
+        (a negative slice would otherwise drop only the oldest row)."""
+        from coa_ontology import dynamo_store as ds
+
+        assert ds.list_proposals(namespace=paged, limit=0) == []
+        assert ds.list_proposals(namespace=paged, limit=-1) == []
+
+
 class TestListProposalsCrossNamespaceContainsFilter:
     """``list_proposals(namespace=None)`` filters on ``contains(PK, "#PROPOSAL#")``.
 

@@ -199,8 +199,8 @@ class SQLFirewall:
     a ``CedarAuthorizer`` adds a namespace-level policy gate that runs
     AFTER the structural checks pass (an additional deny, never a relaxation).
     The default is the REAL ``cedarpy``-backed ``RealCedarAuthorizer`` (evaluates
-    ``query`` on the namespace vs the shipped seed policies using the caller's
-    resolved roles); set ``SCL_DISABLE_CEDAR=true`` to swap in
+    ``query`` on the namespace vs the caller's Roles-table role policies, and
+    denies when none is available); set ``SCL_DISABLE_CEDAR=true`` to swap in
     ``NullCedarAuthorizer`` (opt-out of the policy layer only — structural checks
     still apply).
     """
@@ -541,7 +541,34 @@ class SQLFirewall:
         return checked
 
     @staticmethod
-    def _analyze_refs(sql: str) -> _QueryRefs | None:
+    def referenced_tables(sql: str, dialect: str = "trino") -> list[str]:
+        """Bare, lower-cased names of the source tables ``sql`` reads, sorted.
+
+        Reads the statement the way the allowlist check does: CTE names are
+        excluded and catalog/schema qualifiers are dropped. It parses with
+        ``dialect`` first (Trino, the safety check's default), then with sqlglot's
+        default dialect, so Trino-only syntax such as ``CAST(ROW(...) AS ROW(...))``
+        still lists its tables. Returns an empty list when neither parse works.
+        For reporting only (trace step details) — never use it to authorize, since
+        an empty list there would read as "nothing to check".
+        """
+        if not sql:
+            return []
+        for read in (dialect, None):
+            try:
+                refs = SQLFirewall._analyze_refs(sql, dialect=read, log_parse_error=False)
+            except (sqlglot.errors.SqlglotError, RecursionError):
+                # e.g. a TokenError on an unterminated literal. A trace detail must
+                # not fail the request; the firewall's own checks reject such SQL.
+                refs = None
+            if refs is not None:
+                return sorted(refs.tables)
+        # Not the firewall's parse-error event: nothing was authorized here.
+        logger.info("referenced_tables_unparsed", sql_len=len(sql))
+        return []
+
+    @staticmethod
+    def _analyze_refs(sql: str, dialect: str | None = None, *, log_parse_error: bool = True) -> _QueryRefs | None:
         """Parse ``sql`` and extract table/column references for authorization.
 
         Returns None when the statement cannot be parsed (caller fails closed).
@@ -551,12 +578,21 @@ class SQLFirewall:
         with the (also lower-cased) grant profile are case-insensitive — SQL
         identifiers are case-insensitive for unquoted names and the firewall
         must not be bypassed by varying case in either the query or profile.
+
+        Args:
+            sql: The statement to analyze.
+            dialect: sqlglot read-dialect; ``None`` (the authorization path) uses
+                sqlglot's default dialect.
+            log_parse_error: Log ``sql_firewall_parse_error`` when parsing fails.
+                ``referenced_tables`` turns it off, since its fallback parse may
+                still succeed.
         """
         try:
-            parsed = sqlglot.parse_one(sql)
+            parsed = sqlglot.parse_one(sql, read=dialect) if dialect else sqlglot.parse_one(sql)
         except sqlglot.errors.ParseError:
-            # SQL may carry caller-supplied literal values (potential PII); log length only.
-            logger.warning("sql_firewall_parse_error", sql_len=len(sql))
+            if log_parse_error:
+                # SQL may carry caller-supplied literal values (potential PII); log length only.
+                logger.warning("sql_firewall_parse_error", sql_len=len(sql))
             return None
         if parsed is None:
             return None

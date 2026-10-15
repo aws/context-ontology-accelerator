@@ -1096,8 +1096,17 @@ def induce_datatype_properties(
         # Req 13.8 — observation-frequency comment. After 12D each
         # property has exactly one subject class, so the wording is
         # always single-class.
-        domain_name = _local_class_name(agg["subject_iri"])
-        comment = f"Observed across {agg['fact_count']} fact(s) in class {domain_name}"
+        #
+        # The class name is deliberately NOT interpolated into the sentence. It
+        # comes from the corpus, so on a non-English corpus an English frame around
+        # it produced a literal holding two languages ("Observed across 1 fact(s)
+        # in class 技術的特性"). RDF 1.1 gives a literal one language tag or one
+        # datatype, never a tag per fragment, so such a literal cannot be tagged
+        # correctly under any scheme — and this one is manufactured by us, so no
+        # amount of extraction-prompt work can remove it. The name is already
+        # reachable from this property's rdfs:domain, so stating it here only
+        # duplicated it in a form that made the literal untaggable.
+        comment = f"Observed across {agg['fact_count']} fact(s)."
         g.add(
             (
                 property_uri,
@@ -1121,20 +1130,6 @@ def induce_datatype_properties(
     )
 
     return g
-
-
-def _local_class_name(class_iri: str) -> str:
-    """Extract the local class-name segment from a Rule 1 class IRI.
-
-    Class IRIs are shaped as
-    ``{prefix}/class/{normalized-class-label}``. This helper returns
-    the trailing segment for use in human-readable comments.
-    Defensively handles non-Rule-1-shaped IRIs by returning the full
-    string.
-    """
-    marker = "/class/"
-    idx = class_iri.rfind(marker)
-    return class_iri[idx + len(marker) :] if idx >= 0 else class_iri
 
 
 # ── Rule 5 — __Topic__ nodes → skos:Concept (T-Box) ────────────────────

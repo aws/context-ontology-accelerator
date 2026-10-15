@@ -48,7 +48,11 @@ set -uo pipefail
 
 ENV="${1:-dev}"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-REGION="${CDK_DEFAULT_REGION:-${AWS_DEFAULT_REGION:-${AWS_REGION:-us-east-1}}}"
+# Resolved the way the CDK CLI resolves it, the profile's region included, so the
+# pre-cleanup steps below act on the region `cdk destroy` tears down.
+# shellcheck source=lib/resolve-region.sh source-path=SCRIPTDIR
+source "${REPO_ROOT}/scripts/lib/resolve-region.sh"
+REGION="$(coa_resolve_region)"
 # Default MUST match the CDK app's DEFAULT_RESOURCE_PREFIX
 # (libs/ts-shared/src/constants.ts, resolved in infra/lib/context.ts).
 # A mismatch means this script resolves scl-* names / /scl SSM parameters

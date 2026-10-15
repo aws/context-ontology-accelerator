@@ -120,11 +120,11 @@ class TestPredicateNormalization:
     def test_predicate_normalizing_to_empty_is_skipped(self):
         """Predicates that normalize to "" must be skipped, not crash.
 
-        Defensive guard: ``normalize_predicate("@#$%")`` returns "" and
+        Defensive guard: ``normalize_predicate("@#%")`` returns "" and
         cannot produce a valid property IRI downstream.
         """
         relations = [
-            _rel("A", "@#$%", "B", 5),  # normalizes to ""
+            _rel("A", "@#%", "B", 5),  # normalizes to ""
             _rel("A", "valid", "B", 3),
         ]
         proposals = aggregate(relations)
@@ -362,7 +362,7 @@ class TestEmptyInput:
     def test_only_empty_normalized_predicates_returns_empty(self):
         """If every predicate normalizes to "", result is still []."""
         relations = [
-            _rel("A", "@#$", "B", 5),
+            _rel("A", "@#", "B", 5),
             _rel("C", "!!!", "D", 7),
         ]
         proposals = aggregate(relations)

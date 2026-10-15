@@ -726,3 +726,72 @@ def test_match_concepts_records_column_match_stage_duration():
     # Assert: the second-pass timer recorded the ColumnMatch stage.
     assert "ColumnMatch" in tracker.stage_durations_ms
     assert tracker.stage_durations_ms["ColumnMatch"] >= 0.0
+
+
+# ── Grounding rerank model (GH #236) ──
+
+
+def _run_match_with_mock_grounding(pipeline):
+    from unittest.mock import patch
+
+    table_concept = SourceConcept(
+        table_fqn="db.orders",
+        table_name="orders",
+        column_name="",
+        description="orders table",
+        data_type="",
+        is_table_level=True,
+    )
+    benign_match = ConceptMatch(
+        source_column="",
+        source_table="orders",
+        matched_class_uri=None,
+        matched_ontology_id=None,
+        similarity=None,
+        match_type="novel",
+    )
+    with patch("coa_ontology.inducer.services.pipeline.GroundingService") as mock_grounding_cls:
+        mock_grounding_cls.return_value.to_concept_match.return_value = benign_match
+        pipeline.match_concepts([table_concept], confidence_threshold=0.8, model_id="titan", grounding_ontology_ids=[])
+    mock_grounding_cls.assert_called_once()
+    return mock_grounding_cls.call_args.kwargs
+
+
+def test_structured_grounding_uses_configured_model_and_region():
+    """The structured rerank must use the pipeline's region + configured
+    grounding model (here a GROUNDING_LLM_MODEL_ID override), not
+    GroundingService's us-east-1 / us. defaults (GH #236)."""
+    oc = MagicMock()
+    oc.search_embeddings.return_value = []
+    pipeline = InductionPipeline(
+        None,
+        None,
+        oc,
+        llm_region="ap-northeast-1",
+        grounding_llm_model_id="jp.anthropic.claude-haiku-4-5-20251001-v1:0",
+    )
+    kwargs = _run_match_with_mock_grounding(pipeline)
+    assert kwargs["llm_region"] == "ap-northeast-1"
+    assert kwargs["llm_model_id"] == "jp.anthropic.claude-haiku-4-5-20251001-v1:0"
+
+
+def test_build_pipeline_threads_grounding_config():
+    """induce._build_pipeline (wrapped by main.py's patched builder) must carry
+    llm_region and grounding_llm_model_id from app config onto the pipeline."""
+    from coa_ontology.inducer.routers import induce
+
+    build = getattr(induce, "_orig_build_pipeline", induce._build_pipeline)
+    base = {
+        "data_catalog_url": "http://dc",
+        "embedding_generator_url": "http://eg",
+        "ontology_catalog_url": "http://oc",
+    }
+    jp_haiku = "jp.anthropic.claude-haiku-4-5-20251001-v1:0"
+    pipeline = build({**base, "llm_region": "ap-northeast-1", "grounding_llm_model_id": jp_haiku})
+    assert pipeline.llm_region == "ap-northeast-1"
+    assert pipeline.grounding_llm_model_id == jp_haiku
+
+    # Absent/empty grounding model id → the Haiku rerank fallback.
+    defaulted = build({**base, "grounding_llm_model_id": ""})
+    assert defaulted.llm_region == "us-east-1"
+    assert defaulted.grounding_llm_model_id == "us.anthropic.claude-haiku-4-5-20251001-v1:0"

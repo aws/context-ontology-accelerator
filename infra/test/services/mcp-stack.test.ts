@@ -298,4 +298,23 @@ describe("McpStack", () => {
       }),
     ).toBe(true);
   });
+
+  it("targets the discovery Lambdas by fixed name, without deploy-time SSM reads", () => {
+    // Reading these ARNs from SSM at deploy time made McpStack (and, through the
+    // shared image asset, ServeStack) wait for the metric-service and ontology
+    // stacks.
+    const runtime = JSON.stringify(
+      template.findResources("AWS::BedrockAgentCore::Runtime"),
+    );
+    for (const fn of ["metric-api", "ontology-api-proxy"]) {
+      expect(runtime).toContain(
+        `:lambda:us-east-1:123456789012:function:${DEFAULT_RESOURCE_PREFIX}-${DEFAULT_ENV}-${fn}`,
+      );
+    }
+    // The partition comes from the stack, so GovCloud/China ARNs stay valid.
+    expect(runtime).toContain("AWS::Partition");
+    const params = JSON.stringify(template.toJSON().Parameters ?? {});
+    expect(params).not.toContain("/metric/api-fn-arn");
+    expect(params).not.toContain("/ontology-engine/api-fn-arn");
+  });
 });

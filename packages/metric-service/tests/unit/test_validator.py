@@ -18,6 +18,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from coa_common.constants import URN_PREFIX
+from coa_metrics.lookups import TABLE_NO_METADATA, TABLE_UNAPPROVED, source_table_rejection
 from coa_metrics.validator import (
     ColumnMetadata,
     DataSourceLookup,
@@ -853,6 +854,119 @@ class TestSourceTableProvableAbsence:
 
         assert result.valid  # 'cte' is not in the catalog but must not block
         assert any("cte" in w["message"] for w in result.warnings if w["check"] == "table_reference")
+
+
+class TestDeclaredSourceTableWording:
+    """The declared sourceTable is worded the way the create/update gate words it.
+
+    ValidateMetric used to add "Source table 'X' not found" next to the gate's
+    "exists ... but is not approved" for the same table. Bare SQL references keep
+    "not found": they can also be CTE or subquery aliases.
+    """
+
+    _KNOWN = {"public.customers", "public.orders"}
+
+    def _lookup(self, *, reason: str | None = TABLE_UNAPPROVED, available: bool = True):
+        known = self._KNOWN
+
+        class _Lookup(MockDataSourceLookup):
+            def catalog_available(self, data_source_id: str) -> bool:
+                return available
+
+            def known_tables(self, data_source_id: str) -> set[str]:
+                return set(known)
+
+            def table_rejection_reason(self, data_source_id: str, table_name: str) -> str | None:
+                return reason if table_name.lower() == "public.customers" else None
+
+        return _Lookup(sources={"ds-abc123"}, tables={"ds-abc123": {"public.orders"}})
+
+    def _metric(self, sql: str) -> dict:
+        return {
+            "expression": {"dialects": [{"dialect": "trino", "expression": sql}]},
+            "dataSourceId": "ds-abc123",
+            "sourceTable": "public.customers",
+            "ontologyConcepts": [],
+        }
+
+    def _source_findings(self, result) -> list[dict]:
+        return [
+            f
+            for f in result.errors + result.warnings
+            if f["check"] == "table_reference" and f["details"]["table"] == "public.customers"
+        ]
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            # Declared table also named in the SQL (the in-loop check).
+            "SELECT COUNT(*) FROM public.customers",
+            # Declared table not named in the SQL (the standalone check).
+            "SELECT COUNT(*) FROM public.orders",
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("reason", "expected_tail"),
+        [
+            (TABLE_UNAPPROVED, "but is not approved — approve the table on the data source, then retry"),
+            (
+                TABLE_NO_METADATA,
+                "but its catalog metadata is missing or could not be read — re-scan the data source, then retry",
+            ),
+        ],
+    )
+    def test_known_rejected_source_table_uses_the_gate_wording(self, sql, reason, expected_tail) -> None:
+        lookup = self._lookup(reason=reason)
+        result = validate_metric(self._metric(sql), data_sources_lookup=lookup)
+
+        findings = self._source_findings(result)
+        assert [f["message"] for f in findings] == [
+            source_table_rejection(lookup, "ds-abc123", "public.customers", self._KNOWN)
+        ]
+        assert (
+            findings[0]["message"]
+            == f"Source table 'public.customers' exists in data source 'ds-abc123' {expected_tail}"
+        )
+        assert not any("not found" in f["message"] for f in result.errors + result.warnings)
+
+    def test_catalog_outage_keeps_plain_not_found(self) -> None:
+        """No verdict is provable, so "not approved" would be a guess."""
+        lookup = self._lookup(available=False)
+        result = validate_metric(self._metric("SELECT COUNT(*) FROM public.orders"), data_sources_lookup=lookup)
+
+        assert [f["message"] for f in self._source_findings(result)] == [
+            "Source table 'public.customers' not found in data source 'ds-abc123'"
+        ]
+
+    def test_sql_alias_keeps_plain_not_found(self) -> None:
+        lookup = self._lookup()
+        metric = self._metric("WITH c AS (SELECT * FROM public.customers) SELECT COUNT(*) FROM c")
+        result = validate_metric(metric, data_sources_lookup=lookup)
+
+        assert any(
+            w["message"] == "Table 'c' not found in data source 'ds-abc123'"
+            for w in result.warnings
+            if w["check"] == "table_reference"
+        )
+
+    def test_legacy_bare_catalog_entry_is_accepted_like_the_gate(self) -> None:
+        """``public.orders`` declared against a catalog that lists only ``orders``."""
+
+        class _LegacyLookup(MockDataSourceLookup):
+            def catalog_available(self, data_source_id: str) -> bool:
+                return True
+
+            def known_tables(self, data_source_id: str) -> set[str]:
+                return {"orders"}
+
+        lookup = _LegacyLookup(sources={"ds-abc123"}, tables={"ds-abc123": {"orders"}})
+        metric = self._metric("SELECT COUNT(*) FROM public.orders")
+        metric["sourceTable"] = "public.orders"
+        result = validate_metric(metric, data_sources_lookup=lookup)
+
+        findings = [f for f in result.errors + result.warnings if f["check"] == "table_reference"]
+        assert findings == []
+        assert result.valid
 
 
 # ── Check 3: Column References ──────────────────────────────────────────

@@ -458,7 +458,8 @@ stack. It is deliberately not a stack inside COA's `infra/` app, because
 `make deploy-dev` runs `cdk deploy --all` over that app and a customer-facing sample has no
 business being swept into it.
 
-Prerequisites: JDK 11 or later, Maven, **Node 20.12 or later** (the CDK toolkit uses Node's
+Prerequisites: JDK 17–24 (21 recommended; JDK 25+ fails inside the Athena Federation SDK and
+the build refuses it — note `brew install maven` installs the newest OpenJDK), Maven, **Node 20.12 or later** (the CDK toolkit uses Node's
 built-in `process.loadEnvFile`, so it needs no dependency of its own), pnpm, AWS credentials,
 and a target
 account and region that have been **CDK-bootstrapped** — the connector JAR is uploaded as an

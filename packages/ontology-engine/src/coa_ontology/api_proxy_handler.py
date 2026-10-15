@@ -17,7 +17,7 @@ import json
 import os
 from urllib import request as urllib_request
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import quote, unquote, urlencode
 
 from coa_common import resolve_region
 
@@ -248,10 +248,16 @@ def handler(event: dict, context) -> dict:
     if resource == "/system-health":
         return _handle_system_health()
 
-    # Resolve backend path
+    # Resolve backend path. API Gateway delivers path params still percent-
+    # encoded, so normalize each to exactly ONE layer (unquote then re-quote):
+    # re-encoding without the unquote double-encodes an IRI id, and the backend
+    # then writes and reads the ontology under different named-graph URIs,
+    # silently returning an empty graph. Keep '/' and ':' literal so the IRI
+    # round-trips; encoding '?' '#' '&' stops a value from opening the query
+    # early and overriding the authorizer-validated '?namespace=' set below.
     backend_path = _PATH_MAP.get(resource, resource)
     for key, val in path_params.items():
-        backend_path = backend_path.replace(f"{{{key}}}", val)
+        backend_path = backend_path.replace(f"{{{key}}}", quote(unquote(val), safe="/:"))
 
     # Add namespace as query param (ontology-engine uses ?namespace=)
     namespace_id = path_params.get("namespaceId")

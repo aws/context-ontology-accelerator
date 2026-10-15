@@ -4,6 +4,7 @@
 
 import * as fs from "fs";
 import * as cdk from "aws-cdk-lib";
+import * as lambda from "aws-cdk-lib/aws-lambda";
 import { SSMClient, GetParameterCommand } from "@aws-sdk/client-ssm";
 import type { IAlarmActionStrategy } from "cdk-monitoring-constructs/lib/common/alarm/action";
 import {
@@ -29,6 +30,7 @@ import {
 import {
   AuthnzStack,
   EdgeWafStack,
+  EniWarmStack,
   GuardrailStack,
   IdpAuthenticationStack,
   NetworkStack,
@@ -226,6 +228,14 @@ async function deploy(): Promise<void> {
   const network = new NetworkStack(app, `${stackPrefix}-network`, {
     agentCoreAzNames,
   });
+  // Pre-warms the Lambda Hyperplane ENIs off the critical path (see EniWarmStack).
+  const eniWarm = new EniWarmStack(app, `${stackPrefix}-eni-warm`, {
+    vpc: network.vpc,
+    lambdaSecurityGroup: network.lambdaSecurityGroup,
+    discoveryOcspSecurityGroup: network.discoveryOcspSecurityGroup,
+    ecsSecurityGroup: network.ecsSecurityGroup,
+    authorizerSecurityGroup: network.authorizerSecurityGroup,
+  });
   const auth = new IdpAuthenticationStack(
     app,
     `${stackPrefix}-auth`,
@@ -287,6 +297,8 @@ async function deploy(): Promise<void> {
     ...(apiWebAclId && { webAclId: apiWebAclId }),
     alarmAction,
     vpc: network.vpc,
+    lambdaSecurityGroup: network.lambdaSecurityGroup,
+    authorizerSecurityGroup: network.authorizerSecurityGroup,
     rolesTable: authnz.rolesTable,
     resourceRoleMappingsTable: authnz.resourceRoleMappingsTable,
     cacheInvalidationTable: authnz.cacheInvalidationTable,
@@ -426,7 +438,8 @@ async function deploy(): Promise<void> {
   });
   sources.addDependency(smusDomain); // needs SSM params from namespace stack
   sources.addDependency(storage); // needs Neptune/OpenSearch endpoints
-  sources.addDependency(serve); // needs /{env}/serve/runtime-role-arn SSM param (LF consumer grant)
+  // No dependency on serve: DbConnectorFn reads the serve runtime role ARN from SSM at runtime.
+  sources.addDependency(guardrail); // reads /bedrock/retrieval-guardrail-{id,version} at deploy time
 
   api.addDependency(sources);
   api.addDependency(metricService);
@@ -502,6 +515,7 @@ async function deploy(): Promise<void> {
     bedrockEmbedDimensions: config.bedrockEmbedDimensions,
     bedrockInductionLlmModelId: config.bedrockInductionLlmModelId,
     bedrockChatModelId: config.bedrockChatModelId,
+    bedrockGroundingLlmModelId: config.bedrockGroundingLlmModelId,
     alarmAction,
   });
   ontology.addDependency(smusDomain); // /namespace/namespaces-table-name, /smus/dz-project-access-role-arn
@@ -530,9 +544,26 @@ async function deploy(): Promise<void> {
     agentCoreAzNames,
   });
   mcp.addDependency(serve); // needs CM runtime-arn SSM param
-  mcp.addDependency(metricService); // needs /metric/api-fn-arn SSM param (discovery tools)
-  mcp.addDependency(ontology); // needs /ontology-engine/api-fn-arn SSM param (discovery tools)
   mcp.addDependency(auth); // needs /issuer, /userpool-client-id, /mcp-client-id SSM params
+
+  // Every stack with a VPC Lambda waits for EniWarmStack, so its functions reuse
+  // the pre-warmed Hyperplane ENIs instead of each paying a ~4 min create.
+  // Derived rather than listed, so a new stack with a VPC Lambda is covered too.
+  for (const stack of app.node.children) {
+    if (
+      !(stack instanceof cdk.Stack) ||
+      stack === eniWarm ||
+      stack === network
+    ) {
+      continue;
+    }
+    const hasVpcLambda = stack.node
+      .findAll()
+      .some((c) => c instanceof lambda.Function && c.isBoundToVpc);
+    if (hasVpcLambda) {
+      stack.addDependency(eniWarm);
+    }
+  }
 
   // Inject the resolved brand tokens (BRAND_PREFIX / GRAPH_BASE_URI /
   // EVENT_SOURCE_PREFIX) into every Lambda and ECS container. Applied as an

@@ -1,25 +1,28 @@
 # Build context: monorepo root ($CI_PROJECT_DIR)
 #   docker build -f packages/ontology-engine/Dockerfile .
 # Pin to digest to prevent supply-chain attacks via tag mutation. The pin is for
-# supply-chain integrity only, NOT patch currency: the previous digest sat at
-# openssl 3.5.6-1~deb13u2 and Inspector flagged 10 CVEs against it. Patch level
-# now comes from the apt-get upgrade below, so a stale pin can no longer hold
-# back an OS security fix.
-# python:3.12-slim, digest resolved from the tag on 2026-09-01.
-FROM --platform=linux/amd64 public.ecr.aws/docker/library/python:3.12-slim@sha256:f77ac9e44ae96ef2c90b8053ea08c31f8be030f824196b0ae4db6d462c84e51f
+# supply-chain integrity only, NOT patch currency — see the dnf upgrade below.
+# amazonlinux:2023-minimal (not Debian python:3.12-slim, whose OS findings are
+# mostly unfixed upstream), digest resolved from the tag on 2026-10-13.
+FROM --platform=linux/amd64 public.ecr.aws/amazonlinux/amazonlinux:2023-minimal@sha256:fe18d1ee02440b6480eb4a045be052e9aeaf9bf5029368f09d3425ddab2bfa0a
 
 WORKDIR /app
 
-# Java runtime for owlready2 HermiT reasoner (tier-1 validation).
-# `upgrade` runs after our own installs so it also patches what we just pulled
-# in. Debian has no apt equivalent of `dnf update --security`, but on a stable
-# release the configured suites are trixie + trixie-updates + trixie-security,
-# so a plain `upgrade` is security/point-release only. Use `upgrade`, never
-# `dist-upgrade` — the latter may remove packages to satisfy dependencies.
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends default-jre-headless curl && \
-    apt-get upgrade -y && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
+# Java runtime for owlready2 HermiT reasoner (tier-1 validation) — Corretto 21,
+# matching the OpenJDK 21 that Debian's default-jre-headless shipped. curl-minimal
+# (already in the base) provides curl, findutils the `find` the Pellet strip below
+# needs, and shadow-utils useradd.
+# python3.12 comes from the AL2023 repos; `python`/`pip` are symlinked because
+# the CMD/ENTRYPOINT and the pip steps below call them unversioned.
+# `--releasever=latest` is what makes the upgrade effective: AL2023 locks dnf to
+# the repo snapshot the base image was cut from, so without it a stale pin
+# freezes the OS patch level exactly as it did on the Debian base.
+RUN dnf upgrade -y --releasever=latest && \
+    dnf install -y --releasever=latest python3.12 python3.12-pip java-21-amazon-corretto-headless findutils shadow-utils && \
+    ln -sf /usr/bin/python3.12 /usr/local/bin/python && \
+    ln -sf /usr/bin/python3.12 /usr/local/bin/python3 && \
+    ln -sf /usr/bin/pip3.12 /usr/local/bin/pip && \
+    dnf clean all && rm -rf /var/cache/dnf
 
 RUN useradd --no-create-home --shell /bin/false appuser
 

@@ -72,13 +72,28 @@ export const ApiClientProvider: React.FC<PropsWithChildren> = ({
       });
       if (!res.ok) {
         const text = await res.text().catch(() => "");
-        let code = "UNKNOWN_ERROR";
-        let message = `API ${method} ${path} failed (${res.status}): ${text}`;
+        const rawFallback = `API ${method} ${path} failed (${res.status}): ${text}`;
+        // Left undefined until the body supplies them, so the 403 branch below
+        // can tell "the server said nothing" from "the server said this". With
+        // both pre-seeded to a fallback its `||` defaults were unreachable, and
+        // a 403 with an empty body rendered the bare `API GET … failed (403):`
+        // string at the user instead of the authorization sentence.
+        let code: string | undefined;
+        let message: string | undefined;
 
         try {
           const parsed = JSON.parse(text);
           code = parsed.code ?? code;
-          message = parsed.message ?? message;
+          // Smithy-modeled errors carry `message`; a FastAPI `HTTPException`
+          // uses `detail` instead, and most ontology-engine 4xx responses are
+          // the latter. Reading only `message` left those falling through to
+          // the raw fallback, so a caller that surfaced `error.message` showed
+          // the user `API POST … failed (409): {"detail":"…"}` with the real
+          // sentence buried in JSON. A non-string `detail` (some routes send an
+          // object) keeps the fallback rather than rendering "[object Object]".
+          const detail =
+            typeof parsed.detail === "string" ? parsed.detail : undefined;
+          message = parsed.message ?? detail;
           // Some endpoints return a structured `errors` array with the
           // specific reasons (e.g. OSI import parse errors). Fold the string
           // entries into the message so the UI surfaces actionable detail
@@ -89,7 +104,7 @@ export const ApiClientProvider: React.FC<PropsWithChildren> = ({
               (e: unknown): e is string => typeof e === "string",
             );
             if (details.length > 0) {
-              message = `${message}: ${details.join("; ")}`;
+              message = `${message ?? rawFallback}: ${details.join("; ")}`;
             }
           }
         } catch {
@@ -99,12 +114,16 @@ export const ApiClientProvider: React.FC<PropsWithChildren> = ({
         if (res.status === 403) {
           throw new ApiError(
             403,
-            code || "FORBIDDEN",
-            message || "You are not authorized to perform this action.",
+            code ?? "FORBIDDEN",
+            message ?? "You are not authorized to perform this action.",
           );
         }
 
-        throw new ApiError(res.status, code, message);
+        throw new ApiError(
+          res.status,
+          code ?? "UNKNOWN_ERROR",
+          message ?? rawFallback,
+        );
       }
       if (res.status === 204 || res.headers.get("content-length") === "0") {
         return undefined as T;
@@ -130,7 +149,10 @@ export const ApiClientProvider: React.FC<PropsWithChildren> = ({
           try {
             const parsed = JSON.parse(text);
             code = parsed.code ?? code;
-            message = parsed.message ?? message;
+            // Same two envelopes as `request`; see the comment there.
+            const detail =
+              typeof parsed.detail === "string" ? parsed.detail : undefined;
+            message = parsed.message ?? detail ?? message;
           } catch {
             // not JSON, use defaults
           }

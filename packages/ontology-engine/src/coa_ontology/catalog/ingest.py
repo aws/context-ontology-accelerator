@@ -183,6 +183,14 @@ def _supersede_incoming_embeddings(
     leave the index disagreeing with the graph (stale AI text still searchable)
     — the exact state this step exists to prevent.
 
+    "Failure" includes a delete that stops with stale embeddings still matching:
+    the OpenSearch backend raises :class:`~coa_common.opensearch.DeleteIncompleteError`
+    then, rather than returning the partial count, so the accept ends
+    ``accept_failed`` and a re-accept retries the same scoped delete. The count
+    returned on success is NOT re-checked here: the backend already verified it
+    against a recount, and a fresh search right after the delete would read the
+    index's lagging view.
+
     The delete is scoped by ``ontology_id`` in addition to ``entity_uri``. A
     single namespace index can carry embeddings for multiple ontologies
     (foundational reloads with ``allow_append=True``, explicit-target merges),

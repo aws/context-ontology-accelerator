@@ -7,7 +7,7 @@ pydantic-settings>=2.15.0
 python-ulid>=3.2.1
 pg8000>=1.31.5
 # JDBC discovery dialects (pure-Python drivers preferred for Lambda packaging):
-pymysql>=1.2.0           # MySQL
+pymysql>=1.2.3           # MySQL
 oracledb>=2.5.1          # Oracle (thin mode — no Oracle client needed)
 python-tds>=1.17.1       # SQL Server (import: pytds — pure Python, no ODBC)
-snowflake-connector-python>=4.7.5  # Snowflake (needs a warehouse in config; heavier bundle)
+snowflake-connector-python>=4.8.0  # Snowflake (needs a warehouse in config; heavier bundle)

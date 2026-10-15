@@ -40,6 +40,7 @@ export const MODEL_ID_CONFIG_KEYS = [
   "bedrockEmbedModelId",
   "bedrockInductionLlmModelId",
   "bedrockChatModelId",
+  "bedrockGroundingLlmModelId",
 ] as const;
 export type ModelIdConfigKey = (typeof MODEL_ID_CONFIG_KEYS)[number];
 
@@ -54,6 +55,9 @@ export const MODEL_ID_DEFAULTS: Readonly<Record<ModelIdConfigKey, string>> = {
   bedrockEmbedModelId: DEFAULT_BEDROCK_MODEL_ID,
   bedrockInductionLlmModelId: DEFAULT_BEDROCK_INDUCTION_MODEL_ID,
   bedrockChatModelId: DEFAULT_BEDROCK_CHAT_MODEL_ID,
+  // Grounding rerank defaults to the chat (Haiku-class) model, matching the
+  // ontology-engine GROUNDING_LLM_MODEL_ID default (FALLBACK_CHAT_MODEL_ID).
+  bedrockGroundingLlmModelId: DEFAULT_BEDROCK_CHAT_MODEL_ID,
 };
 
 export interface ResolvedModelId {
@@ -124,11 +128,21 @@ export function resolveConfiguredModelIds(
   const normalized = normalizeModelIdConfig(config);
   return MODEL_ID_CONFIG_KEYS.map((key) => {
     const configured = normalized[key];
+    if (configured != null) {
+      return { key, modelId: configured, origin: "config" as const };
+    }
+    // Grounding has no independent default: it follows the resolved chat model
+    // (mirrors ontology-stack's `?? chatModelId`), so a region-valid chat model
+    // makes grounding region-valid too — it never re-introduces a us. default.
+    if (key === "bedrockGroundingLlmModelId") {
+      const chat = normalized.bedrockChatModelId;
+      return chat != null
+        ? { key, modelId: chat, origin: "config" as const }
+        : { key, modelId: MODEL_ID_DEFAULTS.bedrockChatModelId, origin: "default" as const };
+    }
     // Empty values were normalized away before both this check and stack
     // construction, so the effective value here is the value deployed.
-    return configured != null
-      ? { key, modelId: configured, origin: "config" }
-      : { key, modelId: MODEL_ID_DEFAULTS[key], origin: "default" };
+    return { key, modelId: MODEL_ID_DEFAULTS[key], origin: "default" as const };
   });
 }
 
