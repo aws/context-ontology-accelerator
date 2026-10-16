@@ -81,7 +81,7 @@ class TestCurationPolicy:
         assert run not in stopwords.RESIDUAL_STOP_WORDS
 
     def test_safe_particle_runs_exclude_content_words(self):
-        assert {"ごご", "もも", "かが", "もの", "ので"}.isdisjoint(ja.SAFE_PARTICLE_RUNS)
+        assert {"ごご", "もも", "かが", "もの", "ので", "とも"}.isdisjoint(ja.SAFE_PARTICLE_RUNS)
 
     def test_resolver_consumes_the_merged_safe_particle_runs(self):
         from coa_serve.tier1 import metric_resolver

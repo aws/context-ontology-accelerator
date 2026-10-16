@@ -130,7 +130,7 @@ deploy-databricks-connector:
 ## SCL_CONNECTOR_DELETE_WAIT_MAX_SECONDS (1800).
 destroy-dev:
 	make generate
-	pnpm install
+	pnpm install --frozen-lockfile
 	./scripts/destroy.sh dev
 
 docs:
@@ -138,7 +138,7 @@ docs:
 	else echo "⚠ docs/ not available (stripped from public mirror); see external-docs/"; fi
 
 web-dev:
-	cd packages/web-app && pnpm install && pnpm dev
+	cd packages/web-app && pnpm install --frozen-lockfile && pnpm dev
 
 vkg-dev:
 	docker build -t vkg-local packages/vkg/
