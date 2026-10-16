@@ -187,7 +187,7 @@ If you don't edit `.smithy` files, you don't need to run this.
 cd packages/web-app
 cp public/runtime-config.example.json public/runtime-config.json
 # Edit runtime-config.json with your OIDC provider details (authority, clientId)
-pnpm install
+pnpm install --frozen-lockfile
 pnpm dev        # opens at http://localhost:5173
 ```
 
