@@ -328,11 +328,15 @@ class BaselineLexicalRetriever:
 
         from graphrag_toolkit.lexical_graph.storage import GraphStoreFactory, VectorStoreFactory
 
+        from .cross_script_prune import patch_cross_script_statement_prune
         from .graphrag_patches import patch_paginated_search_source
 
         # Must run before any index is queried: AOSS NEXTGEN omits knn_vector from the
         # default _source, which silently collapses the TopicBeamSearch beam.
         patch_paginated_search_source()
+        # A question in one script must not lose the statements written in another
+        # because a few same-script statements share a word with it (#1263).
+        patch_cross_script_statement_prune()
 
         graph_store = GraphStoreFactory.for_graph_store(self._graph_store_uri)
         # Open the topic index too, not just the toolkit default ['chunk','statement'].
