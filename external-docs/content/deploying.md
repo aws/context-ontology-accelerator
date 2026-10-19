@@ -11,7 +11,7 @@ This guide walks you through deploying Context Ontology Accelerator into your AW
 | Node.js | 22+ | CDK CLI, web-app build |
 | Python | 3.12 | Backend services |
 | pnpm | 10+ | TypeScript package management |
-| uv | 0.4+ | Python package management |
+| uv | 0.5.14+ | Python package management |
 | Java | 17+ | Smithy code generation |
 | Docker | — | Container image builds |
 
@@ -323,7 +323,7 @@ curl https://mise.run | sh
 mise install
 
 # make setup runs smithy-generate.sh (make generate) + setup-dev.sh
-# (uv sync --all-packages, pnpm install, pre-commit hooks)
+# (uv sync --all-packages, pnpm install --frozen-lockfile, pre-commit hooks)
 make setup
 ```
 

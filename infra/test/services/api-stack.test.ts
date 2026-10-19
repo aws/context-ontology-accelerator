@@ -610,3 +610,58 @@ describe("ApiStack 501-stub guard", () => {
     expect(synth()).not.toThrow();
   });
 });
+
+describe("ApiStack access log format", () => {
+  // The API authenticates via a custom Lambda authorizer, so
+  // $context.identity.caller/user are always "-" even on an authenticated
+  // 200/201. The real caller is $context.authorizer.principalId (the validated
+  // token's email). AppSec V2298834436 (CWE-778): the access log must carry it.
+  const mkTemplate = (): Template => {
+    const app = new cdk.App({ context: TEST_CONTEXT });
+    const depStack = new cdk.Stack(app, "DepStack", {
+      env: { account: "123456789012", region: "us-east-1" },
+    });
+    const vpc = new ec2.Vpc(depStack, "Vpc");
+    const mkTable = (id: string) => mkTestTable(depStack, id);
+    return Template.fromStack(
+      new ApiStack(app, "TestApiAccessLog", {
+        env: { account: "123456789012", region: "us-east-1" },
+        allowedOrigin: "*",
+        vpc,
+        ...mkTestSgs(depStack, vpc),
+        rolesTable: mkTable("Roles"),
+        resourceRoleMappingsTable: mkTable("RRM"),
+        cacheInvalidationTable: mkTable("Cache"),
+      }),
+    );
+  };
+
+  it("logs the authorizer principalId (not just the always-'-' IAM caller)", () => {
+    mkTemplate().hasResourceProperties("AWS::ApiGateway::Stage", {
+      AccessLogSetting: Match.objectLike({
+        Format: Match.stringLikeRegexp(
+          '"principalId":"\\$context\\.authorizer\\.principalId"',
+        ),
+      }),
+    });
+  });
+
+  it("preserves the standard access-log fields after switching to custom format", () => {
+    const template = mkTemplate();
+    for (const token of [
+      "$context.requestId",
+      "$context.identity.sourceIp",
+      "$context.httpMethod",
+      "$context.resourcePath",
+      "$context.status",
+      "$context.identity.caller",
+      "$context.identity.user",
+    ]) {
+      template.hasResourceProperties("AWS::ApiGateway::Stage", {
+        AccessLogSetting: Match.objectLike({
+          Format: Match.stringLikeRegexp(token.replace(/[.$]/g, "\\$&")),
+        }),
+      });
+    }
+  });
+});
