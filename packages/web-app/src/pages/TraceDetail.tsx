@@ -20,6 +20,7 @@ import type { TraceStep } from "@app-types";
 import {
   humanizeStepId,
   mapTraceStatus,
+  tier2Title,
   CEDAR_STEP_IDS,
   FIREWALL_STEP_IDS,
   GUARDRAIL_STEP_IDS,
@@ -33,10 +34,15 @@ function tierBadgeColor(tier: number): "green" | "blue" | "grey" {
   return "grey";
 }
 
-function tierLabel(tier: number): string {
-  if (tier === 1) return "metric";
-  if (tier === 2) return "ontology";
-  return "knowledge";
+/**
+ * Tier outcome badge text. Tier 2 names the strategy that ran (NL→SQL and/or
+ * VKG (Ontop)) through the same tier2Title the Rationale panel uses, so the
+ * two views of one answer agree.
+ */
+function tierOutcome(tier: number, trace: TraceStep[]): string {
+  if (tier === 2) return tier2Title(trace);
+  if (tier === 1) return "Tier 1 — metric";
+  return `Tier ${tier} — knowledge`;
 }
 
 function formatDurationMs(ms: number): string {
@@ -169,7 +175,7 @@ export function TraceDetail() {
                   label: "Tier outcome",
                   value: (
                     <Badge color={tierBadgeColor(tier)}>
-                      Tier {tier} — {tierLabel(tier)}
+                      {tierOutcome(tier, trace)}
                     </Badge>
                   ),
                 },

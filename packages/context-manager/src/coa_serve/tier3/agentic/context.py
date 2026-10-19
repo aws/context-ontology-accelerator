@@ -148,6 +148,11 @@ class AccumulatedContext:
     # planner can propose for an ``edge_typed`` traversal even when the pruned
     # ontology omits them. Insertion order preserved (discovery is frequency-ranked).
     present_edge_types: list[str] = field(default_factory=list)
+    # BCP 47 tag of the user's question, resolved ONCE at session start and read by
+    # every step that writes prose (the planner's working answer and the final
+    # synthesis), so no step has to guess the language again. Empty means
+    # unresolved: those steps fall back to "match the question's language".
+    answer_language: str = ""
 
     def add(self, result: ToolResult) -> int:
         """Incorporate a ToolResult's chunks/entities/rows, returning the NEW count.
@@ -212,7 +217,11 @@ class AccumulatedContext:
         retrievals, not a sibling's). Results are folded back with :meth:`merge`
         after the sibling loops join.
         """
-        return AccumulatedContext(ontology=self.ontology, present_edge_types=list(self.present_edge_types))
+        return AccumulatedContext(
+            ontology=self.ontology,
+            present_edge_types=list(self.present_edge_types),
+            answer_language=self.answer_language,
+        )
 
     def merge(self, other: AccumulatedContext) -> int:
         """Fold a forked sub-context back into this one, returning the NEW count (P2).
