@@ -6,6 +6,7 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { LocaleProvider } from "../i18n/LocaleProvider";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { readFileSync } from "node:fs";
 import path from "node:path";
@@ -117,25 +118,30 @@ vi.mock("@utils/helpers", () => ({
 // Wrapper
 // ---------------------------------------------------------------------------
 
+// LocaleProvider sits at the app root in production and supplies the wizard's
+// and file upload's built-in strings ("Next", "Choose file", …) that the page
+// no longer hand-writes.
 const wrapper = ({ children }: { children: React.ReactNode }) => (
-  <QueryClientProvider client={new QueryClient()}>
-    <MemoryRouter initialEntries={[`/namespaces/${NS_ID}/sources/connect`]}>
-      <Routes>
-        <Route
-          path="/namespaces/:namespaceId/sources/connect"
-          element={children}
-        />
-        <Route
-          path="/namespaces/:namespaceId/sources/:sourceId"
-          element={<div>SOURCE_DETAIL</div>}
-        />
-        <Route
-          path="/namespaces/:namespaceId/sources"
-          element={<div>SOURCE_LIST</div>}
-        />
-      </Routes>
-    </MemoryRouter>
-  </QueryClientProvider>
+  <LocaleProvider>
+    <QueryClientProvider client={new QueryClient()}>
+      <MemoryRouter initialEntries={[`/namespaces/${NS_ID}/sources/connect`]}>
+        <Routes>
+          <Route
+            path="/namespaces/:namespaceId/sources/connect"
+            element={children}
+          />
+          <Route
+            path="/namespaces/:namespaceId/sources/:sourceId"
+            element={<div>SOURCE_DETAIL</div>}
+          />
+          <Route
+            path="/namespaces/:namespaceId/sources"
+            element={<div>SOURCE_LIST</div>}
+          />
+        </Routes>
+      </MemoryRouter>
+    </QueryClientProvider>
+  </LocaleProvider>
 );
 
 // ---------------------------------------------------------------------------

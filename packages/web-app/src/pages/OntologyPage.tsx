@@ -10,6 +10,8 @@
  */
 import React, { useEffect, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
+import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
+import { useNamespace } from "@api-hooks/use-namespace";
 import Alert from "@cloudscape-design/components/alert";
 import Tabs from "@cloudscape-design/components/tabs";
 import FormField from "@cloudscape-design/components/form-field";
@@ -111,6 +113,14 @@ function latestRescanMs(
 export function OntologyPage() {
   const { namespaceId } = useParams<{ namespaceId: string }>();
   const [activeTab, setActiveTab] = useState("proposals");
+
+  const { name: nsName } = useNamespace(namespaceId);
+  useBreadcrumbTrail([
+    { text: nsName, href: `/namespaces/${namespaceId}`, namespaceId },
+    { text: "Ontology" },
+    { text: "Induction" },
+  ]);
+
   const [inducting, setInducting] = useState(false);
   const [inductionError, setInductionError] = useState<string | null>(null);
   // Set when a run is short-circuited by duplicate detection: the proposal_id of
@@ -1725,10 +1735,9 @@ function OntologiesTab({
                 showFileLastModified
                 showFileSize
                 i18nStrings={{
-                  uploadButtonText: () => "Choose file",
+                  // App copy ("ontology file"); the button, remove and error
+                  // strings come from the I18nProvider.
                   dropzoneText: () => "Drop ontology file here",
-                  removeFileAriaLabel: () => "Remove file",
-                  errorIconAriaLabel: "Error",
                 }}
               />
             </FormField>

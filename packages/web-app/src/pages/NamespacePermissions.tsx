@@ -13,6 +13,7 @@
  */
 import React, { useEffect, useMemo, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
+import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
 import { useCollection } from "@cloudscape-design/collection-hooks";
 import Badge, { type BadgeProps } from "@cloudscape-design/components/badge";
 import Box from "@cloudscape-design/components/box";
@@ -127,6 +128,11 @@ export const NamespacePermissions: React.FC = () => {
   const { data: nsData } = useGetNamespace(namespaceId);
   const ns = nsData?.namespace;
   const title = ns?.displayName ?? ns?.name ?? namespaceId;
+
+  useBreadcrumbTrail([
+    { text: title, href: `/namespaces/${namespaceId}`, namespaceId },
+    { text: "Permissions" },
+  ]);
 
   return (
     <SpaceBetween size="m">

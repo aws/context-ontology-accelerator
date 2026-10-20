@@ -53,8 +53,8 @@ For each :class:`ClassRecord` whose ``count >= floor``:
    T-Box class IRIs from A-Box individual IRIs when an entity is
    literally named after its class.
 2. Emit ``<class_iri> rdf:type owl:Class`` (Req 10.1).
-3. Emit ``<class_iri> rdfs:label "<original ClassRecord.value>"^^xsd:string``
-   (Req 10.3 — preserves the CamelCase form from ``__SYS_Class__``).
+3. Emit one ``rdfs:label`` for the first-seen preferred form and preserve
+   every other observed form consolidated into the IRI as ``skos:altLabel``.
 4. Emit ``<class_iri> rdfs:comment "<description>"^^xsd:string``
    (Req 10.4) when a description is available.
 
@@ -103,16 +103,20 @@ Usage
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import secrets
 from collections import Counter, defaultdict
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from coa_common.language_tags import DEFAULT_LANGUAGE
 from rdflib import OWL, RDF, RDFS, XSD, Graph, URIRef
-from rdflib.namespace import SKOS
+from rdflib.namespace import DCTERMS, SKOS
 
 from coa_ontology.inducer.services.generated_text import render
 from coa_ontology.inducer.services.literal_language import generated_literal
+from coa_ontology.inducer.unstructured.services.iri_resolver import normalize_for_lookup_key
 from coa_ontology.inducer.unstructured.services.normalizers import (
     normalize_predicate,
     select_canonical_label,
@@ -122,6 +126,8 @@ from coa_ontology.inducer.unstructured.services.sampler import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from coa_ontology.inducer.unstructured.services.class_normalizer import (
         NormalizationResult,
     )
@@ -141,6 +147,18 @@ log = logging.getLogger(__name__)
 # Default floor threshold: matches Requirement 3.4 (Stratified Sampler default).
 DEFAULT_FLOOR = 3
 
+# Rule 5's class-to-topic link is optional enrichment, but its reverse lookup
+# duplicates normalized class-label keys for the lifetime of the emitted graph.
+# Ten thousand source entries keeps that auxiliary index in the low-megabyte
+# range for ordinary label/IRI sizes while covering the current unstructured
+# induction operating envelope. Above the limit, all class-to-topic links are
+# disabled before indexing starts: a partial index would make output depend on
+# mapping iteration order and could turn an unseen ambiguity into a false exact
+# match.
+MAX_CONCEPT_CLASS_LOOKUP_ENTRIES = 10_000
+_AMBIGUOUS_LABEL_FINGERPRINT_SAMPLE_SIZE = 5
+_AMBIGUOUS_LABEL_LOG_KEY = secrets.token_bytes(16)
+
 
 def _label_for_lookup(class_record_value: str) -> str:
     """Convert a ``__SYS_Class__`` CamelCase value to the upstream label form.
@@ -155,6 +173,63 @@ def _label_for_lookup(class_record_value: str) -> str:
     return _camel_to_spaced(class_record_value)
 
 
+@dataclass
+class _ClassVocabulary:
+    """Annotations accumulated for one consolidated class IRI.
+
+    ``label_counts`` holds every observed surface form for the IRI keyed to
+    its observation weight, in the form the label is emitted: the original
+    ``__SYS_Class__`` value (Req 10.3), not the spaced lookup form. Only the
+    lexical-graph label of a :class:`ClassRecord` carries real evidence;
+    sibling forms contributed by the normalizer enter at zero weight so they
+    still surface as ``skos:altLabel`` even when their own record fell below
+    the floor.
+    """
+
+    label_counts: Counter[str] = field(default_factory=Counter)
+    close_matches: set[str] = field(default_factory=set)
+    # Spaced lookup labels for this IRI, used to find the generated
+    # description, which ``descriptions`` keys by the spaced form.
+    lookup_labels: set[str] = field(default_factory=set)
+
+
+def _fold_surface_forms(observed: Mapping[str, int]) -> dict[str, int]:
+    """Collapse surface forms the shared lookup key considers identical.
+
+    ``normalize_for_lookup_key`` is the equivalence relation the inducer
+    already uses to decide that two labels denote the same thing — it backs
+    the normalizer's deterministic class match and the topic/class link in
+    Rule 5. Emitting a ``skos:altLabel`` for a form that relation calls
+    identical to the preferred label adds a triple that asserts nothing, so
+    such forms are folded into one group here and their counts summed.
+
+    The relation is narrower than plain case-folding: it preserves the
+    separator, so ``"HAS_PART"`` (``has_part``) and ``"has part"``
+    (``has-part``) stay distinct and both survive as labels. What it folds
+    is padding and casing noise — ``"  DELIVERED TO  "``, ``"delivered to"``
+    and ``"DELIVERED TO"`` collapse to a single group.
+
+    Args:
+        observed: Mapping from raw surface form to its observation count.
+
+    Returns:
+        Mapping from each group's representative form — the highest-count
+        member, ties broken lexicographically — to the group's summed
+        count. Whitespace-only forms are dropped. Empty when ``observed``
+        holds no usable form.
+    """
+    groups: dict[str, Counter[str]] = defaultdict(Counter)
+    for original, count in observed.items():
+        label = (original or "").strip()
+        if not label:
+            continue
+        groups[normalize_for_lookup_key(label) or label][label] += count
+    folded: dict[str, int] = {}
+    for members in groups.values():
+        folded[select_canonical_label(dict(members))] = sum(members.values())
+    return folded
+
+
 def induce_classes(
     class_distribution: list[ClassRecord],
     descriptions: dict[str, str],
@@ -166,12 +241,17 @@ def induce_classes(
 ) -> Graph:
     """Induce ``owl:Class`` declarations from the lexical graph's class layer.
 
-    Implements Rule 1 (Requirement 10): every classification with
-    ``count >= floor`` becomes one ``owl:Class`` with deterministic IRI,
-    ``rdfs:label`` (the original CamelCase value), and ``rdfs:comment``
-    (the LLM-generated description). When the class normalizer flagged
-    a class as ``close_match``, also emits a ``skos:closeMatch`` link
-    to the matched existing IRI (Req 9.4).
+    Implements Rule 1 (Requirement 10): classifications with ``count >=
+    floor`` become deterministic ``owl:Class`` resources. Exact matches
+    sharing an IRI are consolidated into one declaration with a stable
+    ``rdfs:label`` and observed variants as ``skos:altLabel``. The preferred
+    form is the spelling observed most often in the lexical graph — ties
+    broken lexicographically — so it does not depend on the order records
+    arrive in. Spellings that the shared lookup key considers identical to
+    the preferred form are folded away instead of being emitted as
+    redundant alternatives. The preferred form's generated description
+    becomes ``rdfs:comment``. A ``close_match`` remains a separate class
+    linked with ``skos:closeMatch`` (Req 9.4).
 
     Args:
         class_distribution: Class records from the lexical graph
@@ -214,9 +294,23 @@ def induce_classes(
         log.warning("induce_classes: empty class_distribution input — returning empty graph")
         return g
 
-    classes_emitted = 0
     classes_skipped_floor = 0
     classes_skipped_missing_normalizer = 0
+    vocabulary_by_iri: dict[str, _ClassVocabulary] = {}
+
+    # The normalizer and the description generator key classes by the spaced
+    # lookup form, but Req 10.3 emits the original ``__SYS_Class__`` value as
+    # the label. Map every lookup form back to the original form it came
+    # from, across all records (a sibling the normalizer consolidated may
+    # belong to a record below the floor). When several originals share one
+    # lookup form, the most observed one wins, ties broken lexicographically.
+    originals_by_lookup: dict[str, Counter[str]] = defaultdict(Counter)
+    for cls in class_distribution:
+        originals_by_lookup[_label_for_lookup(cls.value)][cls.value] += max(cls.count, 1)
+
+    def emitted_form(lookup_label: str) -> str:
+        originals = originals_by_lookup.get(lookup_label)
+        return select_canonical_label(dict(originals)) if originals else lookup_label
 
     for cls in class_distribution:
         camel_label = cls.value
@@ -246,37 +340,97 @@ def induce_classes(
             classes_skipped_missing_normalizer += 1
             continue
 
-        class_uri = URIRef(nr.class_iri)
+        preferred_lookup_label = nr.preferred_label or spaced_label
+        vocabulary = vocabulary_by_iri.setdefault(nr.class_iri, _ClassVocabulary())
 
+        # Weight the lexical-graph label by the count actually observed, so
+        # the dominant spelling — not whichever record the normalizer happened
+        # to see first — becomes the preferred label. A record that reached
+        # this line passed the floor, so it always outweighs a zero-weight
+        # sibling even when ``floor`` was configured down to 0.
+        if camel_label:
+            vocabulary.label_counts[camel_label] += max(cls.count, 1)
+            vocabulary.lookup_labels.add(spaced_label)
+
+        # Retain every other spelling the normalizer consolidated into this
+        # IRI. These carry no count of their own: a form whose own record
+        # fell below the floor never reaches this loop, and re-weighting the
+        # normalizer's identity label here would double-count the record
+        # that does carry it.
+        for sibling_lookup_label in (preferred_lookup_label, *nr.alternative_labels):
+            if not sibling_lookup_label:
+                continue
+            vocabulary.lookup_labels.add(sibling_lookup_label)
+            sibling_label = emitted_form(sibling_lookup_label)
+            if sibling_label not in vocabulary.label_counts:
+                vocabulary.label_counts[sibling_label] = 0
+
+        if nr.band == "close_match" and nr.matched_existing_iri:
+            vocabulary.close_matches.add(nr.matched_existing_iri)
+
+    # Counts emitted declarations, which is a count of consolidated IRIs
+    # rather than of input records: several records sharing an IRI produce
+    # one declaration carrying their spellings as altLabels.
+    classes_emitted = 0
+    classes_skipped_no_label = 0
+
+    for class_iri, vocabulary in vocabulary_by_iri.items():
+        surface_forms = _fold_surface_forms(vocabulary.label_counts)
+        if not surface_forms:
+            log.warning(
+                "induce_classes: no usable label for class IRI %s (observed=%r); skipping",
+                class_iri,
+                sorted(vocabulary.label_counts),
+            )
+            classes_skipped_no_label += 1
+            continue
+
+        preferred_label = select_canonical_label(surface_forms)
+        alternative_labels = sorted(label for label in surface_forms if label != preferred_label)
+
+        class_uri = URIRef(class_iri)
         # Req 10.1 — owl:Class declaration.
         g.add((class_uri, RDF.type, OWL.Class))
-
         # Req 10.3 — rdfs:label is the original __SYS_Class__ value
         # (CamelCase form), with explicit xsd:string datatype. Extraction names
         # the class in the namespace language, so a compatible label carries
-        # the namespace tag instead (see ``generated_literal``).
-        g.add((class_uri, RDFS.label, generated_literal(camel_label, namespace_language, datatype=XSD.string)))
+        # the namespace tag instead (see ``generated_literal``). The other
+        # consolidated spellings are the same kind of text and follow the
+        # same rule as ``skos:altLabel``.
+        g.add((class_uri, RDFS.label, generated_literal(preferred_label, namespace_language, datatype=XSD.string)))
+        for alternative_label in alternative_labels:
+            g.add(
+                (
+                    class_uri,
+                    SKOS.altLabel,
+                    generated_literal(alternative_label, namespace_language, datatype=XSD.string),
+                )
+            )
 
         # Req 10.4 — rdfs:comment is the generated description.
-        comment = descriptions.get(spaced_label)
+        # ``descriptions`` is keyed by the spaced lookup form, and the
+        # preferred label can be any of the consolidated forms, so try the
+        # preferred form's lookup label first and then the others in order.
+        preferred_lookup = _label_for_lookup(preferred_label)
+        comment = descriptions.get(preferred_lookup) or next(
+            (
+                descriptions[label]
+                for label in sorted(vocabulary.lookup_labels - {preferred_lookup})
+                if descriptions.get(label)
+            ),
+            None,
+        )
         if comment:
             g.add((class_uri, RDFS.comment, generated_literal(comment, namespace_language, datatype=XSD.string)))
         else:
             log.info(
                 "induce_classes: no description for class %r; emitting rdfs:label only",
-                camel_label,
+                preferred_label,
             )
 
         # Req 9.4 — close_match band emits a skos:closeMatch link.
-        if nr.band == "close_match" and nr.matched_existing_iri:
-            g.add(
-                (
-                    class_uri,
-                    SKOS.closeMatch,
-                    URIRef(nr.matched_existing_iri),
-                )
-            )
-
+        for matched_iri in sorted(vocabulary.close_matches):
+            g.add((class_uri, SKOS.closeMatch, URIRef(matched_iri)))
         classes_emitted += 1
 
     if classes_emitted == 0:
@@ -284,23 +438,69 @@ def induce_classes(
         log.warning(
             "induce_classes: zero classes passed the floor threshold "
             "(floor=%d, total considered=%d, skipped due to floor=%d, "
-            "skipped due to missing normalizer=%d). Returning empty graph.",
+            "skipped due to missing normalizer=%d, skipped due to no usable label=%d). "
+            "Returning empty graph.",
             floor,
             len(class_distribution),
             classes_skipped_floor,
             classes_skipped_missing_normalizer,
+            classes_skipped_no_label,
         )
     else:
         log.info(
             "induce_classes: emitted %d owl:Class declarations "
-            "(total considered=%d, below floor=%d, missing normalizer=%d)",
+            "(total considered=%d, below floor=%d, missing normalizer=%d, no usable label=%d)",
             classes_emitted,
             len(class_distribution),
             classes_skipped_floor,
             classes_skipped_missing_normalizer,
+            classes_skipped_no_label,
         )
 
     return g
+
+
+def _add_vocabulary_labels(
+    graph: Graph,
+    subject: URIRef,
+    originals: Counter[str],
+    namespace_language: str,
+) -> None:
+    """Emit one preferred label and every other observed surface form.
+
+    Surface forms are folded through :func:`_fold_surface_forms` first, so
+    padding and casing noise does not become a ``skos:altLabel`` that repeats
+    the preferred label. Emits nothing when no usable form survives folding
+    (every observed spelling was whitespace); a label built from padding
+    alone would be worse than none. Both the label and the alternatives are
+    extracted text, so they follow the same tagging rule
+    (:func:`generated_literal`) the label alone followed before.
+    """
+    surface_forms = _fold_surface_forms(originals)
+    if not surface_forms:
+        log.warning(
+            "_add_vocabulary_labels: no usable surface form for %s (observed=%r); emitting no labels",
+            subject,
+            sorted(originals),
+        )
+        return
+
+    canonical = select_canonical_label(surface_forms)
+    graph.add(
+        (
+            subject,
+            RDFS.label,
+            generated_literal(canonical, namespace_language, datatype=XSD.string),
+        )
+    )
+    for alternative in sorted(label for label in surface_forms if label != canonical):
+        graph.add(
+            (
+                subject,
+                SKOS.altLabel,
+                generated_literal(alternative, namespace_language, datatype=XSD.string),
+            )
+        )
 
 
 # ── Rule 2 — Sampled entities → owl:NamedIndividual (A-Box, OPTIONAL) ──
@@ -528,6 +728,7 @@ def induce_object_properties(
       original predicate string within this aggregation key
       (Req 12.6 / Req 19.3, applied per-key — not pooled across
       subject classes)
+    - one ``skos:altLabel`` for each non-canonical observed spelling
 
     The property IRI is minted via
     ``iri_resolver.resolve(normalized_predicate, f"{subject_class}/ObjectProperty")``
@@ -744,14 +945,7 @@ def induce_object_properties(
         # Req 12.6 / Req 19.3 — canonical original-spelling label,
         # selected within this aggregation key (NOT pooled across
         # subject classes).
-        canonical = select_canonical_label(dict(agg["originals"]))
-        g.add(
-            (
-                property_uri,
-                RDFS.label,
-                generated_literal(canonical, namespace_language, datatype=XSD.string),
-            )
-        )
+        _add_vocabulary_labels(g, property_uri, agg["originals"], namespace_language)
 
         properties_emitted += 1
 
@@ -897,6 +1091,7 @@ def induce_datatype_properties(
       original predicate string within this aggregation key
       (Req 13.7 / Req 19.3, applied per-key — not pooled across
       subject classes)
+    - one ``skos:altLabel`` for each non-canonical observed spelling
     - one ``rdfs:comment`` summarizing observation frequency on this
       single subject class (Req 13.8)
 
@@ -1108,14 +1303,7 @@ def induce_datatype_properties(
 
         # Req 13.7 / Req 19.3 — canonical original-spelling label,
         # selected within this aggregation key.
-        canonical = select_canonical_label(dict(agg["originals"]))
-        g.add(
-            (
-                property_uri,
-                RDFS.label,
-                generated_literal(canonical, namespace_language, datatype=XSD.string),
-            )
-        )
+        _add_vocabulary_labels(g, property_uri, agg["originals"], namespace_language)
 
         # Req 13.8 — observation-frequency comment. After 12D each
         # property has exactly one subject class, so the wording is
@@ -1184,6 +1372,7 @@ def induce_concepts(
     namespace_name: str,
     *,
     namespace_language: str = DEFAULT_LANGUAGE,
+    class_iris: dict[str, str] | None = None,
 ) -> Graph:
     """Induce ``skos:Concept`` declarations from ``__Topic__`` nodes.
 
@@ -1191,6 +1380,8 @@ def induce_concepts(
     non-empty ``value`` becomes one ``skos:Concept`` typed and labelled
     via ``skos:prefLabel``. All concepts are linked to a single
     ``skos:ConceptScheme`` (one per pipeline run) via ``skos:inScheme``.
+    When ``class_iris`` supplies one unambiguous deterministic label
+    match, the class is linked to the concept via ``dcterms:subject``.
 
     Per topic the function emits:
 
@@ -1255,12 +1446,15 @@ def induce_concepts(
         namespace_language: Canonical namespace language. Generated labels and
             comments compatible with it carry its tag; everything else keeps
             the untagged ``xsd:string`` form. ``en`` asserts no tags.
+        class_iris: Optional mapping of observed class labels to their
+            consolidated class IRIs. An unambiguous deterministic label match
+            links the class to the topic with ``dcterms:subject``.
 
     Returns:
         An :class:`rdflib.Graph` containing:
           - one ``skos:ConceptScheme`` declaration (always emitted)
           - three triples per emitted concept (declaration, prefLabel,
-            inScheme)
+            inScheme), plus an optional class-to-concept subject link
         plus the standard prefix bindings. Empty if ``namespace_name``
         is empty (we cannot mint the scheme without it).
 
@@ -1277,6 +1471,7 @@ def induce_concepts(
     g.bind("rdfs", RDFS)
     g.bind("xsd", XSD)
     g.bind("skos", SKOS)
+    g.bind("dcterms", DCTERMS)
 
     if not namespace_name:
         # Defensive: namespace_name is the only handle the function has
@@ -1323,6 +1518,64 @@ def induce_concepts(
     concepts_emitted = 0
     skipped_empty_value = 0
     skipped_resolver_failure = 0
+    skipped_ambiguous_class_link = 0
+    class_iri_by_label: dict[str, str | None] = {}
+    ambiguous_label_count = 0
+    ambiguous_label_fingerprints: list[str] = []
+    class_iri_entries = class_iris or {}
+    class_lookup_enabled = len(class_iri_entries) <= MAX_CONCEPT_CLASS_LOOKUP_ENTRIES
+    if not class_lookup_enabled:
+        log.warning(
+            "induce_concepts: class-label reverse lookup exceeded its safe limit; "
+            "disabling all dcterms:subject links for this call",
+            extra={
+                "event": "induce_concepts_class_lookup_limit_exceeded",
+                "class_iri_entry_count": len(class_iri_entries),
+                "class_iri_entry_limit": MAX_CONCEPT_CLASS_LOOKUP_ENTRIES,
+            },
+        )
+
+    for class_label, class_iri in class_iri_entries.items() if class_lookup_enabled else ():
+        lookup_key = normalize_for_lookup_key(class_label)
+        if not lookup_key or not class_iri:
+            continue
+
+        if lookup_key not in class_iri_by_label:
+            class_iri_by_label[lookup_key] = class_iri
+            continue
+
+        existing_iri = class_iri_by_label[lookup_key]
+        if existing_iri is None or existing_iri == class_iri:
+            continue
+
+        # We only need to distinguish exactly one IRI from more than one.
+        # Retaining every conflicting IRI would recreate the unbounded-memory
+        # problem without changing the matching decision.
+        class_iri_by_label[lookup_key] = None
+        ambiguous_label_count += 1
+        # A process-local keyed fingerprint lets operators correlate repeated
+        # collisions within one run without exposing low-entropy customer
+        # labels to an offline dictionary attack.
+        fingerprint = hashlib.blake2s(
+            lookup_key.encode("utf-8"),
+            digest_size=6,
+            key=_AMBIGUOUS_LABEL_LOG_KEY,
+        ).hexdigest()
+        ambiguous_label_fingerprints.append(fingerprint)
+        ambiguous_label_fingerprints.sort()
+        if len(ambiguous_label_fingerprints) > _AMBIGUOUS_LABEL_FINGERPRINT_SAMPLE_SIZE:
+            ambiguous_label_fingerprints.pop()
+
+    if class_lookup_enabled and ambiguous_label_count:
+        log.debug(
+            "induce_concepts: ambiguous normalized class labels detected; "
+            "omitting dcterms:subject links for those labels",
+            extra={
+                "event": "induce_concepts_ambiguous_class_labels",
+                "ambiguous_normalized_label_count": ambiguous_label_count,
+                "normalized_label_fingerprint_sample": tuple(ambiguous_label_fingerprints),
+            },
+        )
 
     for topic in topics:
         # Req 14.6 — topics with empty/null value are skipped with
@@ -1375,16 +1628,31 @@ def induce_concepts(
         # Req 14.4 — link concept to its scheme.
         g.add((concept_uri, SKOS.inScheme, scheme_uri))
 
+        # Link a topic to a class only for an unambiguous deterministic
+        # label match. Semantic topic/class matching remains a review-time
+        # concern; this path deliberately avoids guessing.
+        lookup_key = normalize_for_lookup_key(value)
+        if class_lookup_enabled and lookup_key in class_iri_by_label:
+            matching_class_iri = class_iri_by_label[lookup_key]
+            if matching_class_iri is not None:
+                g.add((URIRef(matching_class_iri), DCTERMS.subject, concept_uri))
+            else:
+                # Several class IRIs share this normalized label. The
+                # aggregate debug event above identifies the collision
+                # without logging customer labels or every matching IRI.
+                skipped_ambiguous_class_link += 1
+
         concepts_emitted += 1
 
     log.info(
         "induce_concepts: emitted %d skos:Concept declarations "
         "(total topics considered=%d, skipped empty value=%d, "
-        "skipped resolver failure=%d) within scheme %s",
+        "skipped resolver failure=%d, skipped ambiguous class link=%d) within scheme %s",
         concepts_emitted,
         len(topics),
         skipped_empty_value,
         skipped_resolver_failure,
+        skipped_ambiguous_class_link,
         scheme_iri_str,
     )
 

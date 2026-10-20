@@ -3,6 +3,8 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
+import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
+import { useNamespace } from "@api-hooks/use-namespace";
 import Alert from "@cloudscape-design/components/alert";
 import Badge from "@cloudscape-design/components/badge";
 import Box from "@cloudscape-design/components/box";
@@ -538,6 +540,18 @@ export function ProposalDetailPage() {
   const navigate = useNavigate();
   const apiClient = useApiClient();
   const { current: currentNamespace } = useCurrentNamespace();
+
+  const { name: nsName } = useNamespace(namespaceId);
+  useBreadcrumbTrail([
+    { text: nsName, href: `/namespaces/${namespaceId}`, namespaceId },
+    { text: "Ontology" },
+    {
+      text: "Induction",
+      href: `/namespaces/${namespaceId}/ontology`,
+      namespaceId,
+    },
+    { text: proposalId ?? "" },
+  ]);
 
   const [proposal, setProposal] = useState<Proposal | null>(null);
   const [loading, setLoading] = useState(true);

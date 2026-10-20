@@ -36,6 +36,7 @@ import {
   CLASS_DISPLAY_PAGE_SIZE,
 } from "@api-hooks/use-graph-classes";
 import { useApiClient } from "@components/ApiClientProvider";
+import { useNamespace } from "@api-hooks/use-namespace";
 import {
   useBreadcrumbs,
   type BreadcrumbItem,
@@ -729,6 +730,8 @@ export function GraphSearchPage() {
   const navigate = useNavigate();
   const apiClient = useApiClient();
   const { setBreadcrumbs, clearBreadcrumbs } = useBreadcrumbs();
+  const { name: nsName, canAccess: canReachNamespace } =
+    useNamespace(namespaceId);
   // Page-level tab. Deep-linkable via ?tab= so the Induction page (and any
   // "go look at what you just built" hand-off) can land the user directly on
   // the Ontologies inventory.
@@ -1396,15 +1399,25 @@ export function GraphSearchPage() {
 
   // Publish a live breadcrumb trail to the AppLayout breadcrumbs slot (the bar
   // below the top nav). Always present on this page and reflects the current
-  // state:  COA › Ontology Explorer › [Class] › [Graph]
+  // state:  COA › {Namespace} › Ontology › Explorer › [Class] › [Graph]
   //   - COA              → app root view
-  //   - Ontology Explorer → clear selection, back to the list root
+  //   - {Namespace}      → the namespace detail page (grant-trimmed: plain text
+  //                        when the user has no grant in this namespace, so it
+  //                        matches the site-wide trim done by useBreadcrumbTrail)
+  //   - Ontology         → non-navigable group label
+  //   - Explorer         → clear selection, back to the list root
   //   - {Class}          → the selected class's detail panel (when one is open)
   //   - Graph            → shown when the graph view is active
   // Cleared on unmount.
   useEffect(() => {
     const crumbs: BreadcrumbItem[] = [
       { text: "COA", onClick: () => navigate("/") },
+      {
+        text: nsName,
+        ...(canReachNamespace
+          ? { onClick: () => navigate(`/namespaces/${namespaceId}`) }
+          : {}),
+      },
       { text: "Ontology" },
       { text: "Explorer", onClick: handleGoToRoot },
     ];
@@ -1419,10 +1432,10 @@ export function GraphSearchPage() {
     }
     setBreadcrumbs(crumbs);
     return () => clearBreadcrumbs();
-    // Re-run whenever the crumb-affecting state changes. The handlers are
-    // recreated each render but that's fine — the trail is cheap to rebuild.
+    // Re-run only when the crumb-affecting state changes; navigate,
+    // setBreadcrumbs, clearBreadcrumbs, and handleGoToRoot are stable.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [view, selectedVertex, namespaceId]);
+  }, [view, selectedVertex, namespaceId, nsName, canReachNamespace]);
 
   // The List view now pages across EVERY class in the namespace via the
   // server, not a capped client-side slice. Typing in the search box filters

@@ -3,6 +3,8 @@
 
 import React, { useCallback, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
+import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
+import { useNamespace } from "@api-hooks/use-namespace";
 import Alert from "@cloudscape-design/components/alert";
 import AttributeEditor from "@cloudscape-design/components/attribute-editor";
 import Badge from "@cloudscape-design/components/badge";
@@ -511,6 +513,26 @@ export const TableDetail: React.FC = () => {
   const [editingTable, setEditingTable] = useState(false);
   const [editingKeys, setEditingKeys] = useState(false);
   const [bulkLoading, setBulkLoading] = useState(false);
+
+  const { name: nsName } = useNamespace(namespaceId);
+  const sourceName = sourceData?.body?.name ?? dataSourceId ?? "";
+  const tableName = data?.name ?? tableId ?? "";
+  const isEditing = editing !== null || editingTable || editingKeys;
+  useBreadcrumbTrail([
+    { text: nsName, href: `/namespaces/${namespaceId}`, namespaceId },
+    {
+      text: "Sources",
+      href: `/namespaces/${namespaceId}/sources`,
+      namespaceId,
+    },
+    {
+      text: sourceName,
+      href: `/namespaces/${namespaceId}/sources/${dataSourceId}`,
+      namespaceId,
+    },
+    { text: tableName },
+    ...(isEditing ? [{ text: "Edit" }] : []),
+  ]);
 
   // Re-scan review: keep (decline) a table or column the re-scan flagged for
   // deletion, so approving the re-scan no longer removes it.

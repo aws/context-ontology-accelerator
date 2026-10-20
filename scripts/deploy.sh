@@ -116,6 +116,16 @@ cd "$REPO_ROOT"
 echo ""
 ./scripts/preflight-deploy.sh "$ENV"
 
+# ── Dependencies ─────────────────────────────────────────────────────────
+# Install exactly what pnpm-lock.yaml pins. After `git pull`, node_modules still
+# holds the previous release's packages; pnpm 10 would build against them, and
+# pnpm 11+ runs a plain `pnpm install` before the first `pnpm nx`, which on the
+# public repo rewrites pnpm-lock.yaml (it lists workspace packages the mirror
+# leaves out) and makes the next `git pull` fail on local changes.
+echo ""
+echo "Installing locked Node dependencies..."
+pnpm install --frozen-lockfile
+
 # ── Build ────────────────────────────────────────────────────────────────
 echo ""
 echo "Building all packages..."

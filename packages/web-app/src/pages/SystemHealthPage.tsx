@@ -20,6 +20,7 @@ import StatusIndicator from "@cloudscape-design/components/status-indicator";
 import type { StatusIndicatorProps } from "@cloudscape-design/components/status-indicator";
 
 import { useApiClient } from "@components";
+import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
 
 interface OntologyInductionHealth {
   graphStore?: string;
@@ -76,6 +77,7 @@ function HealthCard({ title, description, status }: HealthCardProps) {
 }
 
 export function SystemHealthPage() {
+  useBreadcrumbTrail([{ text: "Administration" }, { text: "System Health" }]);
   const apiClient = useApiClient();
   const [health, setHealth] = useState<SystemHealthResponse | null>(null);
   const [loading, setLoading] = useState(true);

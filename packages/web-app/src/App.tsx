@@ -58,8 +58,15 @@ import {
   type BreadcrumbItem,
 } from "@components/BreadcrumbProvider";
 import BreadcrumbGroup from "@cloudscape-design/components/breadcrumb-group";
+import type { ButtonDropdownProps } from "@cloudscape-design/components/button-dropdown";
 import { PlaygroundHelpPanel } from "./pages/PlaygroundHelpPanel";
 import { PageErrorBoundary } from "@components/PageErrorBoundary";
+import {
+  isSupported,
+  useLocale,
+  LOCALE_LABELS,
+  SUPPORTED_LOCALES,
+} from "./i18n/LocaleProvider";
 import { VersionBadge } from "@components/VersionBadge";
 
 const DARK_MODE_KEY = "scl.darkMode";
@@ -112,6 +119,7 @@ function AppShell() {
   const [navOpen, setNavOpen] = useState(true);
   const [darkMode, setDarkMode] = useState(initialDark);
   const [densityCompact, setDensityCompact] = useState(initialCompact);
+  const { locale, setLocale } = useLocale();
   const { current, namespaces, setNamespace, namespaceId, isLoading } =
     useCurrentNamespace();
   const { state: splitPanelState, closePanel } = useSplitPanel();
@@ -329,6 +337,9 @@ function AppShell() {
             setDarkMode((prev) => !prev);
           } else if (detail.id === "density") {
             setDensityCompact((prev) => !prev);
+          } else if (detail.id.startsWith("locale-")) {
+            const requested = detail.id.slice("locale-".length);
+            if (isSupported(requested)) setLocale(requested);
           }
         },
         items: [
@@ -341,6 +352,20 @@ function AppShell() {
           {
             id: "theme",
             text: darkMode ? "Switch to light mode" : "Switch to dark mode",
+          },
+          {
+            id: "language",
+            text: "Language",
+            items: SUPPORTED_LOCALES.map(
+              (l): ButtonDropdownProps.Item => ({
+                id: `locale-${l}`,
+                // Each language names itself, so these labels are
+                // deliberately not translated.
+                text: LOCALE_LABELS[l],
+                iconName: l === locale ? "check" : undefined,
+                disabled: l === locale,
+              }),
+            ),
           },
         ],
       },
@@ -371,6 +396,8 @@ function AppShell() {
       setNamespace,
       darkMode,
       densityCompact,
+      locale,
+      setLocale,
       user?.email,
       navigate,
       logout,
@@ -428,22 +455,7 @@ function AppShell() {
         }
         splitPanel={
           splitPanelState.isOpen && splitPanelState.content ? (
-            <SplitPanel
-              header={splitPanelState.header}
-              i18nStrings={{
-                closeButtonAriaLabel: "Close panel",
-                openButtonAriaLabel: "Open panel",
-                preferencesTitle: "Split panel preferences",
-                preferencesPositionLabel: "Position",
-                preferencesPositionDescription:
-                  "Choose the position of the panel",
-                preferencesPositionSide: "Side",
-                preferencesPositionBottom: "Bottom",
-                preferencesConfirm: "Confirm",
-                preferencesCancel: "Cancel",
-                resizeHandleAriaLabel: "Resize split panel",
-              }}
-            >
+            <SplitPanel header={splitPanelState.header}>
               {splitPanelState.content}
             </SplitPanel>
           ) : undefined

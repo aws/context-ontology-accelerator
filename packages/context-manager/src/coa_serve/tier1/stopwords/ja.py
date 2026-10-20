@@ -30,14 +30,14 @@ SAFE_PARTICLE_RUNS: frozenset[str] = frozenset(
         # decomposition never takes two one-scalar steps in a row, because that
         # shape also spells content words (ごご, もも, かが, もの, ので), so each
         # pair that is pure grammar is listed here as a whole. Never add a pair
-        # that is also a word.
+        # that is also a word: とも is left out because, in hiragana, it is also
+        # a noun (友, 共) and a given name, so ともの<metric> is a qualifier.
         "では",
         "には",
         "とは",
         "のは",
         "でも",
         "にも",
-        "とも",
         "での",
     }
 )
@@ -50,9 +50,11 @@ multi-scalar fragment inside a longer run (``総発電容量とはいくらで�
 GROUPS: tuple[str, ...] = (
     # Particles, copula, polite forms, and interrogative-quantity words.
     # Counter-bearing interrogatives are atomic kanji runs under the shared
-    # tokenizer, so list each safe question form explicitly.
+    # tokenizer, so list each safe question form explicitly. The honorific
+    # おいくら/おいくつ are listed whole: after a particle (はおいくら) the お
+    # would be a second one-scalar step in a row, which the decomposition refuses.
     "は が を に で の と も か です ます だ ですか ますか でしょうか ください さい"
-    " お ご 教 えて いくら いくつ どれくらい どのくらい"
+    " お ご 教 えて いくら いくつ おいくら おいくつ どれくらい どのくらい"
     " 何台 何件 何名 何社",
     # Aggregate restaters (kanji runs), greetings, and units:
     "合計 総計 総額 総数 件数 金額 数 総"

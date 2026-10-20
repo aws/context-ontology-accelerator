@@ -23,6 +23,7 @@ import {
   GUARDRAIL_STEP_IDS,
   humanizeStepId,
   mapTraceStatus,
+  tier2Title,
 } from "@components/Chat/step-labels";
 
 export interface RationalePanelProps {
@@ -362,22 +363,6 @@ function sectionKeyFor(stepId: string, setupTarget: string): string {
   // Tier-3 execution plan looks incomplete.
   if (stepId === "lexical_baseline_retrieve") return "t3";
   return "other";
-}
-
-/**
- * Title for the Tier 2 section, reflecting which strategy/strategies ran.
- * Both strategies are structured-query strategies; name them in parallel:
- * NL→SQL (generates SQL) and VKG (Ontop) (generates SPARQL → SQL).
- */
-function tier2Title(trace: TraceStep[]): string {
-  const hasSql = trace.some((s) => s.step.startsWith("t2.sql."));
-  const hasVkg = trace.some((s) => s.step.startsWith("t2.vkg."));
-  const strategies: string[] = [];
-  if (hasSql) strategies.push("NL→SQL");
-  if (hasVkg) strategies.push("VKG (Ontop)");
-  return strategies.length
-    ? `Tier 2 — Structured Query (${strategies.join(" + ")})`
-    : "Tier 2 — Structured Query";
 }
 
 /**

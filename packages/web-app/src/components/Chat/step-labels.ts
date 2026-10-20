@@ -148,6 +148,24 @@ export function humanizeStepId(stepId: string): string {
 }
 
 /**
+ * Title for a Tier 2 result, reflecting which strategy/strategies ran.
+ * Both strategies are structured-query strategies; name them in parallel:
+ * NL→SQL (generates SQL) and VKG (Ontop) (generates SPARQL → SQL).
+ * Shared by the Rationale panel and the Trace detail page so both name the
+ * strategy the same way.
+ */
+export function tier2Title(trace: readonly { step: string }[]): string {
+  const hasSql = trace.some((s) => s.step.startsWith("t2.sql."));
+  const hasVkg = trace.some((s) => s.step.startsWith("t2.vkg."));
+  const strategies: string[] = [];
+  if (hasSql) strategies.push("NL→SQL");
+  if (hasVkg) strategies.push("VKG (Ontop)");
+  return strategies.length
+    ? `Tier 2 — Structured Query (${strategies.join(" + ")})`
+    : "Tier 2 — Structured Query";
+}
+
+/**
  * Visual indicator type for a trace step's status. Single source of truth for
  * every trace surface (LiveSteps, TracePanel, RationalePanel) so a given status
  * always renders the same color. The return type matches both Cloudscape's

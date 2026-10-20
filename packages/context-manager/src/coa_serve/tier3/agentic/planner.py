@@ -44,6 +44,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 import structlog
+from coa_common.language_tags import describe_language
 
 from .controller import TOOL_PREFERENCE_INSTRUCTION
 from .models import PlannerDecision
@@ -174,7 +175,7 @@ _CHUNK_WINDOW_INSTRUCTION = (
 # gathered context is enough AND produces its current best answer grounded ONLY in
 # that context — never its own parametric/prior knowledge — so the running guess
 # handed to the synthesizer cannot smuggle in ungrounded facts.
-_ASSESS_SYSTEM = (
+_ASSESS_INTRO = (
     "You are the reasoning planner for a server-side knowledge-retrieval agent. "
     "Given a sub-question and the context gathered so far (document-chunk snippets, "
     "graph entities, and prior findings), do BOTH of the following:\n"
@@ -189,13 +190,43 @@ _ASSESS_SYSTEM = (
     "partially answers the question, say what IS supported and state plainly what "
     "is still missing — do not fill gaps from memory. Answer the WHOLE question as "
     "asked (e.g. every period/segment requested), not just one sub-part.\n\n"
-    "LANGUAGE: Write your working_answer in the SAME language as the sub-question. The "
-    "gathered context may be in other languages; ignore their language and match the "
-    "sub-question's language (this answer is handed to the final synthesizer, so a "
-    "consistent language prevents it from drifting to the wrong one — work item #901).\n\n"
+)
+_ASSESS_RESPONSE_SHAPE = (
     "Respond with ONLY a JSON object of this exact shape, and no prose outside it:\n"
     '{"sufficient": <true|false>, "working_answer": "<your grounded best answer>"}'
 )
+
+
+def _assess_language_clause(answer_language: str) -> str:
+    """The LANGUAGE paragraph of the assess prompt, the one place it is written.
+
+    The working answer is handed to the final synthesizer, so its language must
+    be consistent. When the session resolved the question's language up front,
+    the clause names it, so this JSON-only call does not re-guess it (left to
+    guess, it sometimes wrote an English question's answer in Spanish or
+    Italian). Unresolved, it falls back to matching the sub-question.
+    """
+    if answer_language:
+        return (
+            f"LANGUAGE: Write your working_answer in {describe_language(answer_language)}, "
+            "the language of the user's question. The gathered context may be in other "
+            "languages; ignore their language.\n\n"
+        )
+    return (
+        "LANGUAGE: Write your working_answer in the SAME language as the sub-question. The "
+        "gathered context may be in other languages; ignore their language and match the "
+        "sub-question's language (this answer is handed to the final synthesizer, so a "
+        "consistent language prevents it from drifting to the wrong one).\n\n"
+    )
+
+
+def _assess_system(answer_language: str) -> str:
+    """System instruction for the combined Sufficiency_Check + grounded best-guess answer."""
+    return _ASSESS_INTRO + _assess_language_clause(answer_language) + _ASSESS_RESPONSE_SHAPE
+
+
+# The prompt used when no language was resolved; kept as a name for callers and tests.
+_ASSESS_SYSTEM = _assess_system("")
 
 
 class BedrockStepPlanner:
@@ -308,7 +339,7 @@ class BedrockStepPlanner:
         try:
             result = await self._planner.converse(
                 prompt=prompt,
-                system=_ASSESS_SYSTEM,
+                system=_assess_system(getattr(context, "answer_language", "") or ""),
                 guardrail_id=self._effective_guardrail_id(),
                 guard_content=f"Question: {question}",
                 temperature=0.0,

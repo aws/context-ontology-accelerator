@@ -3,6 +3,7 @@
 
 import React, { useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
 import Form from "@cloudscape-design/components/form";
 import FormField from "@cloudscape-design/components/form-field";
 import Input from "@cloudscape-design/components/input";
@@ -40,6 +41,11 @@ const toMachineName = (value: string): string =>
 export const CreateNamespace: React.FC = () => {
   const navigate = useNavigate();
   const { user } = useUser();
+  useBreadcrumbTrail([
+    { text: "Administration" },
+    { text: "Namespaces", href: "/namespaces" },
+    { text: "Create" },
+  ]);
   const [displayName, setDisplayName] = useState("");
   const [description, setDescription] = useState("");
   const [language, setLanguage] = useState<NamespaceLanguage>("en");
