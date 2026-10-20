@@ -32,6 +32,7 @@ import type { SelectProps } from "@cloudscape-design/components/select";
 import { useListPlatformRoles } from "@api-hooks/use-list-platform-roles";
 import { useListPlatformGrants } from "@api-hooks/use-list-platform-grants";
 import { useCreatePlatformGrant } from "@api-hooks/use-create-platform-grant";
+import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
 import { useDeletePlatformGrant } from "@api-hooks/use-delete-platform-grant";
 import type { PlatformGrantSummary } from "@api-hooks/use-list-platform-grants";
 import type { ListPlatformRolesOutput } from "@coa/control-plane-client";
@@ -56,6 +57,7 @@ function formatDate(iso: string | undefined): string {
 }
 
 export function IdentityPage() {
+  useBreadcrumbTrail([{ text: "Administration" }, { text: "Identity" }]);
   const { data: rolesData, isLoading: rolesLoading } = useListPlatformRoles();
 
   // Only PLATFORM-scoped roles are managed from this page.

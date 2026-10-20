@@ -3,6 +3,8 @@
 
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
+import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
+import { useNamespace } from "@api-hooks/use-namespace";
 import Form from "@cloudscape-design/components/form";
 import FormField from "@cloudscape-design/components/form-field";
 import Input from "@cloudscape-design/components/input";
@@ -84,6 +86,27 @@ export const MetricForm: React.FC = () => {
 
   const createMutation = useCreateMetric(namespaceId ?? "");
   const updateMutation = useUpdateMetric(namespaceId ?? "", metricName ?? "");
+
+  const { name: nsName } = useNamespace(namespaceId);
+  useBreadcrumbTrail([
+    { text: nsName, href: `/namespaces/${namespaceId}`, namespaceId },
+    { text: "Ontology" },
+    {
+      text: "Metrics",
+      href: `/namespaces/${namespaceId}/metrics`,
+      namespaceId,
+    },
+    ...(isEdit
+      ? [
+          {
+            text: metricName,
+            href: `/namespaces/${namespaceId}/metrics/${metricName}`,
+            namespaceId,
+          },
+          { text: "Edit" },
+        ]
+      : [{ text: "Create" }]),
+  ]);
 
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");

@@ -24,6 +24,7 @@ import {
 } from "@coa/control-plane-client";
 import { useUser } from "@auth/index";
 import { useListPrincipalGrants, useListPlatformRoles } from "@api-hooks/index";
+import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
 import { useCurrentNamespace } from "@components/NamespaceProvider";
 import { useControlPlaneClient } from "@components/ControlPlaneClientProvider";
 import { formatTimestamp } from "@utils/helpers";
@@ -45,6 +46,7 @@ const nsColumns: TableProps.ColumnDefinition<NamespaceSummary>[] = [
 
 export const ProfilePage: React.FC = () => {
   const { user } = useUser();
+  useBreadcrumbTrail([{ text: "Profile" }]);
   const client = useControlPlaneClient();
   const { namespaces } = useCurrentNamespace();
   const {

@@ -3,6 +3,8 @@
 
 import React, { useMemo, useState } from "react";
 import { useNavigate, useParams, useLocation } from "react-router-dom";
+import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
+import { useNamespace } from "@api-hooks/use-namespace";
 import { useCollection } from "@cloudscape-design/collection-hooks";
 import Table from "@cloudscape-design/components/table";
 import Header from "@cloudscape-design/components/header";
@@ -80,6 +82,13 @@ export const MetricList: React.FC = () => {
   const { namespaceId } = useParams<{ namespaceId: string }>();
   const navigate = useNavigate();
   const location = useLocation();
+
+  const { name: nsName } = useNamespace(namespaceId);
+  useBreadcrumbTrail([
+    { text: nsName, href: `/namespaces/${namespaceId}`, namespaceId },
+    { text: "Ontology" },
+    { text: "Metrics" },
+  ]);
 
   // Resolve dataSourceId -> human-readable source name
   const sourceNameById = useSourceNameById(namespaceId ?? "");
@@ -704,28 +713,12 @@ export const MetricList: React.FC = () => {
             {...propertyFilterProps}
             filteringAriaLabel="Filter metrics"
             filteringPlaceholder="Find metrics"
-            countText={`${filteredItemsCount ?? 0} match${(filteredItemsCount ?? 0) === 1 ? "" : "es"}`}
             i18nStrings={{
-              filteringAriaLabel: "Filter metrics",
-              filteringPlaceholder: "Find metrics",
-              groupValuesText: "Values",
-              groupPropertiesText: "Properties",
-              operatorsText: "Operators",
-              operatorContainsText: "Contains",
-              operatorDoesNotContainText: "Does not contain",
-              operatorEqualsText: "Equals",
-              operatorDoesNotEqualText: "Does not equal",
-              operationAndText: "and",
-              operationOrText: "or",
-              clearFiltersText: "Clear filters",
-              applyActionText: "Apply",
+              // App copy the Cloudscape bundle does not carry (the free-text
+              // token offer); everything else comes from the I18nProvider.
               enteredTextLabel: (text) => `Use: "${text}"`,
-              allPropertiesLabel: "All properties",
-              tokenLimitShowMore: "Show more",
-              tokenLimitShowFewer: "Show fewer",
-              removeTokenButtonAriaLabel: (token) =>
-                `Remove filter: ${token.propertyLabel} ${token.operator} ${token.value}`,
             }}
+            countText={`${filteredItemsCount ?? 0} match${(filteredItemsCount ?? 0) === 1 ? "" : "es"}`}
             expandToViewport
           />
         }
@@ -953,17 +946,6 @@ export const MetricList: React.FC = () => {
               value={importFiles}
               onChange={({ detail }) => setImportFiles(detail.value)}
               accept=".yaml,.yml"
-              i18nStrings={{
-                uploadButtonText: (multiple) =>
-                  multiple ? "Choose files" : "Choose file",
-                dropzoneText: (multiple) =>
-                  multiple ? "Drop files to upload" : "Drop file to upload",
-                removeFileAriaLabel: (fileIndex) =>
-                  `Remove file ${fileIndex + 1}`,
-                limitShowFewer: "Show fewer files",
-                limitShowMore: "Show more files",
-                errorIconAriaLabel: "Error",
-              }}
               constraintText="Accepted format: .yaml, .yml (OSI v1.0)"
             />
           </FormField>

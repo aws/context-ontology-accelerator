@@ -3,6 +3,8 @@
 
 import React, { useCallback, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
+import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
+import { useNamespace } from "@api-hooks/use-namespace";
 import Wizard from "@cloudscape-design/components/wizard";
 import type { WizardProps } from "@cloudscape-design/components/wizard";
 import Alert from "@cloudscape-design/components/alert";
@@ -781,6 +783,17 @@ export const ConnectSource: React.FC = () => {
     [datasourceExternalId, namespaceId],
   );
   const navigate = useNavigate();
+
+  const { name: nsName } = useNamespace(namespaceId);
+  useBreadcrumbTrail([
+    { text: nsName, href: `/namespaces/${namespaceId}`, namespaceId },
+    {
+      text: "Sources",
+      href: `/namespaces/${namespaceId}/sources`,
+      namespaceId,
+    },
+    { text: "Connect" },
+  ]);
 
   const [model, setModel] = useState<Model>(initialModel);
   const [activeStepIndex, setActiveStepIndex] = useState(0);
@@ -1933,19 +1946,6 @@ export const ConnectSource: React.FC = () => {
                               multiple
                               showFileSize
                               showFileThumbnail={false}
-                              i18nStrings={{
-                                uploadButtonText: (m) =>
-                                  m ? "Choose files" : "Choose file",
-                                dropzoneText: (m) =>
-                                  m
-                                    ? "Drop files to upload"
-                                    : "Drop file to upload",
-                                removeFileAriaLabel: (i) =>
-                                  `Remove file ${i + 1}`,
-                                limitShowFewer: "Show fewer files",
-                                limitShowMore: "Show more files",
-                                errorIconAriaLabel: "Error",
-                              }}
                             />
                           </FormField>
                           {uploadProgress !== null && (
@@ -2524,11 +2524,7 @@ export const ConnectSource: React.FC = () => {
       }}
       isLoadingNextStep={isSubmitting}
       i18nStrings={{
-        stepNumberLabel: (n) => `Step ${n}`,
-        collapsedStepsLabel: (step, total) => `Step ${step} of ${total}`,
-        cancelButton: "Cancel",
-        previousButton: "Previous",
-        nextButton: "Next",
+        // App-specific copy; everything else comes from the I18nProvider.
         submitButton: "Connect source",
       }}
     />

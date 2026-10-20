@@ -3,6 +3,8 @@
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
+import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
+import { useNamespace } from "@api-hooks/use-namespace";
 import { useQueryClient } from "@tanstack/react-query";
 import Alert from "@cloudscape-design/components/alert";
 import Badge from "@cloudscape-design/components/badge";
@@ -193,6 +195,18 @@ export const SourceDetail: React.FC = () => {
     namespaceId ?? "",
     sourceId ?? "",
   );
+
+  const { name: nsName } = useNamespace(namespaceId);
+  const sourceName = data?.body?.name ?? sourceId ?? "";
+  useBreadcrumbTrail([
+    { text: nsName, href: `/namespaces/${namespaceId}`, namespaceId },
+    {
+      text: "Sources",
+      href: `/namespaces/${namespaceId}/sources`,
+      namespaceId,
+    },
+    { text: sourceName },
+  ]);
 
   const {
     mutate: deleteSource,

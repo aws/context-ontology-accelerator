@@ -8,8 +8,8 @@
  * Uses the same ``useOntologyOverview`` hook and client-side filters to scope
  * relationships and attributes to one class. No new backend needed.
  */
-import { useEffect, useMemo } from "react";
-import { useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { useMemo } from "react";
+import { useParams, useSearchParams } from "react-router-dom";
 import Alert from "@cloudscape-design/components/alert";
 import Badge from "@cloudscape-design/components/badge";
 import Box from "@cloudscape-design/components/box";
@@ -21,7 +21,8 @@ import Tabs from "@cloudscape-design/components/tabs";
 import { SortableTable } from "@components/SortableTable";
 import { useOntologyOverview } from "@api-hooks/use-ontology-overview";
 import { useListOntologies } from "@api-hooks/use-list-ontologies";
-import { useBreadcrumbs } from "@components/BreadcrumbProvider";
+import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
+import { useNamespace } from "@api-hooks/use-namespace";
 import { localName } from "./InducedOntologyDetail";
 
 export function OntologyClassDetailPage() {
@@ -29,7 +30,6 @@ export function OntologyClassDetailPage() {
   const [searchParams] = useSearchParams();
   const ontologyId = searchParams.get("ontology_id") ?? "";
   const classUri = searchParams.get("class_uri") ?? "";
-  const navigate = useNavigate();
 
   const {
     data: overview,
@@ -44,51 +44,51 @@ export function OntologyClassDetailPage() {
 
   // Breadcrumb — origin-aware. Reached two ways:
   //   • from the Explorer "Expand" link (?from=explorer):
-  //       COA › Ontology › Explorer › {Class}
+  //       COA › {Namespace} › Ontology › Explorer › {Class}
   //   • from the Induced Ontology page (default):
-  //       COA › Ontology › Induction › {Ontology} › {Class}
+  //       COA › {Namespace} › Ontology › Induction › {Ontology} › {Class}
   const fromOrigin = searchParams.get("from");
   const { data: ontologies } = useListOntologies(namespaceId);
-  const { setBreadcrumbs, clearBreadcrumbs } = useBreadcrumbs();
+  const { name: nsName } = useNamespace(namespaceId);
   const ontologyLabel =
     ontologies?.find((r) => r.ontologyId === ontologyId || r.uri === ontologyId)
       ?.title || localName(ontologyId);
   const classLabel = cls?.label || localName(classUri);
-  useEffect(() => {
-    const trail =
-      fromOrigin === "explorer"
-        ? [
-            { text: "COA", onClick: () => navigate("/") },
-            { text: "Ontology" },
-            {
-              text: "Explorer",
-              onClick: () =>
-                navigate(`/namespaces/${namespaceId}/ontology/graph`),
-            },
-            { text: classLabel },
-          ]
-        : [
-            { text: "COA", onClick: () => navigate("/") },
-            { text: "Ontology" },
-            {
-              text: "Induction",
-              onClick: () => navigate(`/namespaces/${namespaceId}/ontology`),
-            },
-            {
-              text: ontologyLabel,
-              onClick: () =>
-                navigate(
-                  `/namespaces/${namespaceId}/ontology/induced?ontology_id=${encodeURIComponent(
-                    ontologyId,
-                  )}`,
-                ),
-            },
-            { text: classLabel },
-          ];
-    setBreadcrumbs(trail);
-    return () => clearBreadcrumbs();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [namespaceId, ontologyId, ontologyLabel, classLabel, fromOrigin]);
+  const nsCrumb = {
+    text: nsName,
+    href: `/namespaces/${namespaceId}`,
+    namespaceId,
+  };
+  useBreadcrumbTrail(
+    fromOrigin === "explorer"
+      ? [
+          nsCrumb,
+          { text: "Ontology" },
+          {
+            text: "Explorer",
+            href: `/namespaces/${namespaceId}/ontology/graph`,
+            namespaceId,
+          },
+          { text: classLabel },
+        ]
+      : [
+          nsCrumb,
+          { text: "Ontology" },
+          {
+            text: "Induction",
+            href: `/namespaces/${namespaceId}/ontology`,
+            namespaceId,
+          },
+          {
+            text: ontologyLabel,
+            href: `/namespaces/${namespaceId}/ontology/induced?ontology_id=${encodeURIComponent(
+              ontologyId,
+            )}`,
+            namespaceId,
+          },
+          { text: classLabel },
+        ],
+  );
 
   const relationships = useMemo(
     () =>

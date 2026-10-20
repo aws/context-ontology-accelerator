@@ -10,6 +10,7 @@
  */
 import React, { useEffect, useMemo, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
+import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
 import Box from "@cloudscape-design/components/box";
 import Button from "@cloudscape-design/components/button";
 import Container from "@cloudscape-design/components/container";
@@ -83,6 +84,14 @@ export const GetNamespace: React.FC = () => {
   const { namespaceId } = useParams<{ namespaceId: string }>();
   const { data, isLoading, error } = useGetNamespace(namespaceId ?? "");
   const [editVisible, setEditVisible] = useState(false);
+
+  const nsName =
+    data?.namespace?.displayName ?? data?.namespace?.name ?? namespaceId ?? "";
+  useBreadcrumbTrail([
+    { text: "Namespaces", href: "/namespaces" },
+    { text: nsName },
+    ...(editVisible ? [{ text: "Edit" }] : []),
+  ]);
 
   if (isLoading) {
     return (

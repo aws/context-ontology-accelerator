@@ -9,6 +9,7 @@ import React, {
   useState,
 } from "react";
 import { useParams } from "react-router-dom";
+import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
 import { useInView } from "react-intersection-observer";
 import {
   Box,
@@ -59,6 +60,8 @@ export const Playground: React.FC = () => {
     providerNamespaceId ||
     urlNamespaceId ||
     (import.meta.env.DEV ? "demo" : "");
+
+  useBreadcrumbTrail([{ text: "Serve" }, { text: "Playground" }]);
 
   const [inputValue, setInputValue] = useState("");
   // Sent as options.mode on every query. Defaults to "standard" to match serve's

@@ -3,6 +3,8 @@
 
 import React, { useMemo, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
+import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
+import { useNamespace } from "@api-hooks/use-namespace";
 import Table from "@cloudscape-design/components/table";
 import Header from "@cloudscape-design/components/header";
 import Button from "@cloudscape-design/components/button";
@@ -124,6 +126,12 @@ function sortItems(
 export const SourceList: React.FC = () => {
   const { namespaceId } = useParams<{ namespaceId: string }>();
   const navigate = useNavigate();
+
+  const { name: nsName } = useNamespace(namespaceId);
+  useBreadcrumbTrail([
+    { text: nsName, href: `/namespaces/${namespaceId}`, namespaceId },
+    { text: "Sources" },
+  ]);
 
   const [filterText, setFilterText] = useState("");
   const [typeFilter, setTypeFilter] = useState<string>("");

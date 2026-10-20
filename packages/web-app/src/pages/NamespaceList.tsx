@@ -3,6 +3,7 @@
 
 import React, { useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
 import { useCollection } from "@cloudscape-design/collection-hooks";
 import Table from "@cloudscape-design/components/table";
 import Header from "@cloudscape-design/components/header";
@@ -165,6 +166,7 @@ const COLUMN_DEFINITIONS: TableProps.ColumnDefinition<NamespaceSummary>[] = [
 
 export const NamespaceList: React.FC = () => {
   const navigate = useNavigate();
+  useBreadcrumbTrail([{ text: "Administration" }, { text: "Namespaces" }]);
   const updateStatus = useUpdateNamespaceStatus();
   const deleteNamespace = useDeleteNamespace();
   const [deleteError, setDeleteError] = useState<string | null>(null);

@@ -66,6 +66,7 @@ semantic-context/
 ├── libs/common/         # Shared Python config, logging, exceptions
 ├── libs/ts-shared/      # Shared TypeScript interfaces and constants
 ├── connectors/          # Athena federation connectors: toolkit, reference connector, Databricks
+├── coa-skills/          # Agent skills for driving a deployed COA (control-plane)
 ├── scripts/             # CI-agnostic build/test/deploy scripts
 └── external-docs/       # Published documentation (getting-started, deployment guides)
 ```

@@ -3,6 +3,8 @@
 
 import React, { useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
+import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
+import { useNamespace } from "@api-hooks/use-namespace";
 import Container from "@cloudscape-design/components/container";
 import Header from "@cloudscape-design/components/header";
 import SpaceBetween from "@cloudscape-design/components/space-between";
@@ -31,6 +33,18 @@ export const MetricDetail: React.FC = () => {
     metricName ?? "",
   );
   const deleteMutation = useDeleteMetric(namespaceId ?? "");
+
+  const { name: nsName } = useNamespace(namespaceId);
+  useBreadcrumbTrail([
+    { text: nsName, href: `/namespaces/${namespaceId}`, namespaceId },
+    { text: "Ontology" },
+    {
+      text: "Metrics",
+      href: `/namespaces/${namespaceId}/metrics`,
+      namespaceId,
+    },
+    { text: metricName ?? "" },
+  ]);
 
   // Resolve dataSourceId -> human-readable source name
   const sourceNameById = useSourceNameById(namespaceId ?? "");

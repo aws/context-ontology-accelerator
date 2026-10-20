@@ -7,7 +7,7 @@
  * Uses react-query hooks + the Smithy-generated TS client for data fetching.
  * The ontology IRI is passed as the ``ontology_id`` query param.
  */
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import Alert from "@cloudscape-design/components/alert";
 import Badge from "@cloudscape-design/components/badge";
@@ -27,6 +27,8 @@ import Tabs from "@cloudscape-design/components/tabs";
 import { SortableTable } from "@components/SortableTable";
 import { useOntologyOverview } from "@api-hooks/use-ontology-overview";
 import { useListOntologies } from "@api-hooks/use-list-ontologies";
+import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
+import { useNamespace } from "@api-hooks/use-namespace";
 import {
   deleteOntology,
   downloadOntology,
@@ -34,7 +36,6 @@ import {
 import { OntologyDeleteWarning } from "@components/ontology/OntologyDeleteWarning";
 import { downloadTextFile } from "@utils/download";
 import { useApiClient } from "@components/ApiClientProvider";
-import { useBreadcrumbs } from "@components/BreadcrumbProvider";
 import { TurtleHighlight } from "@components/TurtleHighlight";
 import { PendingReviewBanner } from "@components/ontology/PendingReviewBanner";
 
@@ -68,22 +69,19 @@ export function InducedOntologyDetailPage() {
     (r) => r.ontologyId === ontologyId || r.uri === ontologyId,
   );
 
-  // Breadcrumb: COA › Ontology › Induction › {Ontology}
-  const { setBreadcrumbs, clearBreadcrumbs } = useBreadcrumbs();
+  // Breadcrumb: COA › {Namespace} › Ontology › Induction › {Ontology}
+  const { name: nsName } = useNamespace(namespaceId);
   const ontologyLabel = record?.title || localName(ontologyId);
-  useEffect(() => {
-    setBreadcrumbs([
-      { text: "COA", onClick: () => navigate("/") },
-      { text: "Ontology" },
-      {
-        text: "Induction",
-        onClick: () => navigate(`/namespaces/${namespaceId}/ontology`),
-      },
-      { text: ontologyLabel },
-    ]);
-    return () => clearBreadcrumbs();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [namespaceId, ontologyLabel]);
+  useBreadcrumbTrail([
+    { text: nsName, href: `/namespaces/${namespaceId}`, namespaceId },
+    { text: "Ontology" },
+    {
+      text: "Induction",
+      href: `/namespaces/${namespaceId}/ontology`,
+      namespaceId,
+    },
+    { text: ontologyLabel },
+  ]);
 
   const [activeTabId, setActiveTabId] = useState("classes");
   const [turtle, setTurtle] = useState<string | null>(null);
