@@ -2,3 +2,6 @@ boto3>=1.43.108
 structlog>=24.4.0
 pydantic>=2.13.5
 pydantic-settings>=2.15.0
+# 2026.10.19 is the first certifi bundle without the roots behind the compromised
+# emSign intermediates. botocore also uses certifi's bundle over its own when installed.
+certifi>=2026.10.19

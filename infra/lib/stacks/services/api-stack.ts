@@ -565,17 +565,26 @@ export class ApiStack extends SCLStack {
       }),
       deployOptions: {
         accessLogDestination: new apigw.LogGroupLogDestination(logGroup),
-        accessLogFormat: apigw.AccessLogFormat.jsonWithStandardFields({
-          caller: true,
-          httpMethod: true,
-          ip: true,
-          protocol: true,
-          requestTime: true,
-          resourcePath: true,
-          responseLength: true,
-          status: true,
-          user: true,
-        }),
+        // Custom format (not jsonWithStandardFields) so we can log the
+        // authorizer-resolved caller. This API uses a custom Lambda
+        // authorizer, so $context.identity.caller/user are always "-"; the
+        // real caller is $context.authorizer.principalId (the validated
+        // token's email, set by the authorizer's _build_policy). (V2298834436)
+        accessLogFormat: apigw.AccessLogFormat.custom(
+          JSON.stringify({
+            requestId: apigw.AccessLogField.contextRequestId(),
+            ip: apigw.AccessLogField.contextIdentitySourceIp(),
+            requestTime: apigw.AccessLogField.contextRequestTime(),
+            httpMethod: apigw.AccessLogField.contextHttpMethod(),
+            resourcePath: apigw.AccessLogField.contextResourcePath(),
+            status: apigw.AccessLogField.contextStatus(),
+            protocol: apigw.AccessLogField.contextProtocol(),
+            responseLength: apigw.AccessLogField.contextResponseLength(),
+            principalId: apigw.AccessLogField.contextAuthorizer("principalId"),
+            caller: apigw.AccessLogField.contextIdentityCaller(),
+            user: apigw.AccessLogField.contextIdentityUser(),
+          }),
+        ),
         loggingLevel: apigw.MethodLoggingLevel.INFO,
         // Logs full request/response payloads — only safe in single-developer sandbox accounts.
         dataTraceEnabled: this.envName === "dev",

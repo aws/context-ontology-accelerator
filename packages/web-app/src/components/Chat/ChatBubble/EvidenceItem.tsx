@@ -7,12 +7,14 @@
 import React, { useState } from "react";
 import { Badge, Box } from "@cloudscape-design/components";
 import type { SupportingContentItem } from "@app-types";
+import { useAppI18n } from "../../../i18n/LocaleProvider";
 
 export interface EvidenceItemProps {
   item: SupportingContentItem;
 }
 
 export const EvidenceItem: React.FC<EvidenceItemProps> = ({ item }) => {
+  const { t } = useAppI18n();
   const [expanded, setExpanded] = useState(false);
   const label =
     [
@@ -21,7 +23,7 @@ export const EvidenceItem: React.FC<EvidenceItemProps> = ({ item }) => {
       item.label,
       item.sourceDocumentId,
     ].find((value) => typeof value === "string" && value.trim()) ??
-    "Unknown source";
+    t("Unknown source");
   const text = item.text ?? "";
   const preview = text.length > 200 ? `${text.slice(0, 200)}…` : text;
 
@@ -56,9 +58,9 @@ export const EvidenceItem: React.FC<EvidenceItemProps> = ({ item }) => {
                 fontSize: "12px",
                 padding: "0 4px",
               }}
-              aria-label={expanded ? "Show less" : "Show more"}
+              aria-label={expanded ? t("Show less") : t("Show more")}
             >
-              {expanded ? "Show less" : "Show more"}
+              {expanded ? t("Show less") : t("Show more")}
             </button>
           )}
         </div>

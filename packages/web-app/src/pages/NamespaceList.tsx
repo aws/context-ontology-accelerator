@@ -3,6 +3,7 @@
 
 import React, { useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
 import { useCollection } from "@cloudscape-design/collection-hooks";
 import Table from "@cloudscape-design/components/table";
 import Header from "@cloudscape-design/components/header";
@@ -31,15 +32,21 @@ import {
   NamespaceSummary,
 } from "@api-hooks";
 import { NamespaceStatus } from "@coa/control-plane-client";
-import { formatNamespaceLanguage } from "@utils";
+import { localizeNamespaceLanguage } from "@utils";
+import { useAppI18n } from "../i18n/LocaleProvider";
+import type { AppMessage } from "../i18n/appMessages";
 
-const PAGE_SIZE_OPTIONS = [
+const PAGE_SIZE_OPTIONS: Array<{ value: number; label: AppMessage }> = [
   { value: 10, label: "10 namespaces" },
   { value: 20, label: "20 namespaces" },
   { value: 50, label: "50 namespaces" },
 ];
 
-const COLUMNS = [
+const COLUMNS: Array<{
+  id: string;
+  label: AppMessage;
+  alwaysVisible?: boolean;
+}> = [
   { id: "name", label: "Namespace", alwaysVisible: true },
   { id: "language", label: "Language" },
   { id: "sources", label: "Sources" },
@@ -59,7 +66,9 @@ const STATUS_MAP: Record<
   [NamespaceStatus.DELETE_FAILED]: "error",
 };
 
-const STATUS_FILTER_OPTIONS: SelectProps.Option[] = [
+const STATUS_FILTER_OPTIONS: Array<
+  Omit<SelectProps.Option, "label"> & { label: AppMessage }
+> = [
   { value: "all", label: "All statuses" },
   { value: NamespaceStatus.ACTIVE, label: "Active" },
   { value: NamespaceStatus.ARCHIVED, label: "Archived" },
@@ -71,7 +80,7 @@ const STATUS_FILTER_OPTIONS: SelectProps.Option[] = [
 // All lifecycle actions shown in the "Change status" dropdown. They are always
 // rendered; invalid transitions for the selected namespace are disabled rather
 // than hidden so the full set of actions is discoverable.
-const STATUS_ACTIONS: { id: NamespaceStatus; text: string }[] = [
+const STATUS_ACTIONS: { id: NamespaceStatus; text: AppMessage }[] = [
   { id: NamespaceStatus.ACTIVE, text: "Activate" },
   { id: NamespaceStatus.ARCHIVED, text: "Archive" },
   { id: NamespaceStatus.DELETED, text: "Delete" },
@@ -117,54 +126,74 @@ export function getHeaderCounterText(total: number, selected: number): string {
   return selected ? `(${selected}/${total} selected)` : `(${total})`;
 }
 
-const COLUMN_DEFINITIONS: TableProps.ColumnDefinition<NamespaceSummary>[] = [
-  {
-    id: "name",
-    header: "Namespace",
-    sortingField: "displayName",
-    isRowHeader: true,
-    cell: (item) => item.displayName ?? item.name ?? "-",
-  },
-  {
-    id: "language",
-    header: "Language",
-    sortingField: "language",
-    cell: (item) => formatNamespaceLanguage(item.language),
-  },
-  {
-    id: "sources",
-    header: "Sources",
-    sortingField: "sourceCount",
-    cell: (item) => item.sourceCount ?? 0,
-  },
-  {
-    id: "status",
-    header: "Status",
-    sortingField: "status",
-    cell: (item) => (
-      <StatusIndicator type={STATUS_MAP[item.status as string] ?? "info"}>
-        {item.status}
-      </StatusIndicator>
-    ),
-  },
-  {
-    id: "createdAt",
-    header: "Created",
-    sortingField: "createdAt",
-    cell: (item) =>
-      item.createdAt ? new Date(item.createdAt).toLocaleDateString() : "-",
-  },
-  {
-    id: "updatedAt",
-    header: "Updated",
-    sortingField: "updatedAt",
-    cell: (item) =>
-      item.updatedAt ? new Date(item.updatedAt).toLocaleDateString() : "-",
-  },
-];
+function buildColumnDefinitions(
+  locale: string,
+  t: (message: AppMessage) => string,
+): Array<
+  TableProps.ColumnDefinition<NamespaceSummary> & { header: AppMessage }
+> {
+  return [
+    {
+      id: "name",
+      header: "Namespace",
+      sortingField: "displayName",
+      isRowHeader: true,
+      cell: (item) => item.displayName ?? item.name ?? "-",
+    },
+    {
+      id: "language",
+      header: "Language",
+      sortingField: "language",
+      cell: (item) => localizeNamespaceLanguage(item.language, t),
+    },
+    {
+      id: "sources",
+      header: "Sources",
+      sortingField: "sourceCount",
+      cell: (item) => item.sourceCount ?? 0,
+    },
+    {
+      id: "status",
+      header: "Status",
+      sortingField: "status",
+      cell: (item) => (
+        <StatusIndicator type={STATUS_MAP[item.status as string] ?? "info"}>
+          {item.status}
+        </StatusIndicator>
+      ),
+    },
+    {
+      id: "createdAt",
+      header: "Created",
+      sortingField: "createdAt",
+      cell: (item) =>
+        item.createdAt
+          ? new Date(item.createdAt).toLocaleDateString(locale)
+          : "-",
+    },
+    {
+      id: "updatedAt",
+      header: "Updated",
+      sortingField: "updatedAt",
+      cell: (item) =>
+        item.updatedAt
+          ? new Date(item.updatedAt).toLocaleDateString(locale)
+          : "-",
+    },
+  ];
+}
 
 export const NamespaceList: React.FC = () => {
   const navigate = useNavigate();
+  const { locale, t } = useAppI18n();
+  const baseColumnDefinitions = useMemo(
+    () => buildColumnDefinitions(locale, t),
+    [locale, t],
+  );
+  useBreadcrumbTrail([
+    { text: t("Administration") },
+    { text: t("Namespaces") },
+  ]);
   const updateStatus = useUpdateNamespaceStatus();
   const deleteNamespace = useDeleteNamespace();
   const [deleteError, setDeleteError] = useState<string | null>(null);
@@ -173,6 +202,14 @@ export const NamespaceList: React.FC = () => {
 
   const [selectedStatus, setSelectedStatus] = useState<SelectProps.Option>(
     STATUS_FILTER_OPTIONS[0]!,
+  );
+  const statusFilterOptions = useMemo(
+    () =>
+      STATUS_FILTER_OPTIONS.map((option) => ({
+        ...option,
+        label: t(option.label),
+      })),
+    [t],
   );
 
   const [preferences, setPreferences] =
@@ -216,15 +253,17 @@ export const NamespaceList: React.FC = () => {
       empty: (
         <Box textAlign="center" padding="xxl">
           <SpaceBetween size="m">
-            <b>No namespaces</b>
+            <b>{t("No namespaces")}</b>
             <Box variant="p" color="text-body-secondary">
-              Create your first namespace to start building a semantic context.
+              {t(
+                "Create your first namespace to start building a semantic context.",
+              )}
             </Box>
             <Button
               variant="primary"
               onClick={() => navigate("/namespaces/create")}
             >
-              Create namespace
+              {t("Create namespace")}
             </Button>
           </SpaceBetween>
         </Box>
@@ -232,16 +271,16 @@ export const NamespaceList: React.FC = () => {
       noMatch: (
         <Box textAlign="center" padding="xxl">
           <SpaceBetween size="m">
-            <b>No matches</b>
+            <b>{t("No matches")}</b>
             <Box variant="p" color="text-body-secondary">
-              No namespaces matched the filter criteria.
+              {t("No namespaces matched the filter criteria.")}
             </Box>
           </SpaceBetween>
         </Box>
       ),
     },
     pagination: { pageSize: preferences.pageSize ?? 20 },
-    sorting: { defaultState: { sortingColumn: COLUMN_DEFINITIONS[0]! } },
+    sorting: { defaultState: { sortingColumn: baseColumnDefinitions[0]! } },
     selection: {},
   });
 
@@ -270,10 +309,11 @@ export const NamespaceList: React.FC = () => {
     TableProps.ColumnDefinition<NamespaceSummary>[]
   >(
     () =>
-      COLUMN_DEFINITIONS.map((col) =>
+      baseColumnDefinitions.map((col) =>
         col.id === "name"
           ? {
               ...col,
+              header: t(col.header),
               cell: (item: NamespaceSummary) => (
                 <Link
                   href={`/namespaces/${item.namespaceId}`}
@@ -286,9 +326,12 @@ export const NamespaceList: React.FC = () => {
                 </Link>
               ),
             }
-          : col,
+          : {
+              ...col,
+              header: t(col.header),
+            },
       ),
-    [navigate],
+    [baseColumnDefinitions, navigate, t],
   );
 
   return (
@@ -298,7 +341,7 @@ export const NamespaceList: React.FC = () => {
           type="error"
           dismissible
           onDismiss={() => setDeleteError(null)}
-          header="Namespace deletion blocked"
+          header={t("Namespace deletion blocked")}
         >
           {deleteError}
         </Alert>
@@ -312,7 +355,7 @@ export const NamespaceList: React.FC = () => {
         resizableColumns
         enableKeyboardNavigation
         loading={isLoading}
-        loadingText="Loading namespaces"
+        loadingText={t("Loading namespaces")}
         selectionType="multi"
         columnDefinitions={columnDefinitions}
         columnDisplay={preferences.contentDisplay}
@@ -320,21 +363,31 @@ export const NamespaceList: React.FC = () => {
         stripedRows={preferences.stripedRows}
         contentDensity={preferences.contentDensity}
         ariaLabels={{
-          tableLabel: "Namespaces",
-          selectionGroupLabel: "Namespace selection",
+          tableLabel: t("Namespaces"),
+          selectionGroupLabel: t("Namespace selection"),
           allItemsSelectionLabel: ({ selectedItems }) =>
-            `${selectedItems.length} namespaces selected`,
+            t("{count} namespaces selected", {
+              count: selectedItems.length,
+            }),
           itemSelectionLabel: (_state, row) =>
-            `Select ${row.displayName ?? row.name}`,
+            t("Select {name}", {
+              name: row.displayName ?? row.name ?? "—",
+            }),
         }}
         renderAriaLive={({ firstIndex, lastIndex, totalItemsCount }) =>
-          `Displaying namespaces ${firstIndex} to ${lastIndex} of ${totalItemsCount}`
+          t("Displaying namespaces {first} to {last} of {total}", {
+            first: firstIndex,
+            last: lastIndex,
+            total: totalItemsCount ?? 0,
+          })
         }
         header={
           <Header
             variant="h1"
             counter={getHeaderCounterText(visibleItems.length, selected.length)}
-            description="Namespaces partition the semantic graph into isolated scopes. Each namespace has its own data sources, ontology, and access policies."
+            description={t(
+              "Namespaces partition the semantic graph into isolated scopes. Each namespace has its own data sources, ontology, and access policies.",
+            )}
             actions={
               <SpaceBetween direction="horizontal" size="xs">
                 <Button
@@ -342,13 +395,19 @@ export const NamespaceList: React.FC = () => {
                   loading={isFetching}
                   onClick={() => refetch()}
                 >
-                  Refresh
+                  {t("Refresh")}
                 </Button>
                 <ButtonDropdown
                   disabled={selected.length !== 1}
                   items={getStatusActionItems(
                     selected[0]?.status as NamespaceStatus | undefined,
-                  )}
+                  ).map((item) => ({
+                    ...item,
+                    text: t(item.text),
+                    disabledReason: item.disabled
+                      ? t("This action is unavailable for the current status.")
+                      : undefined,
+                  }))}
                   onItemClick={({ detail }) => {
                     const ns = selected[0];
                     if (!ns?.namespaceId) return;
@@ -365,7 +424,9 @@ export const NamespaceList: React.FC = () => {
                         {
                           onError: (e) => {
                             setDeleteError(
-                              `Status update failed: ${e.message}`,
+                              t("Status update failed: {message}", {
+                                message: e.message,
+                              }),
                             );
                           },
                         },
@@ -373,35 +434,41 @@ export const NamespaceList: React.FC = () => {
                     }
                   }}
                 >
-                  Change status
+                  {t("Change status")}
                 </ButtonDropdown>
                 <Button
                   variant="primary"
                   onClick={() => navigate("/namespaces/create")}
                 >
-                  Create namespace
+                  {t("Create namespace")}
                 </Button>
               </SpaceBetween>
             }
           >
-            Namespaces
+            {t("Namespaces")}
           </Header>
         }
         filter={
           <SpaceBetween direction="horizontal" size="s">
             <TextFilter
               {...filterProps}
-              filteringAriaLabel="Filter namespaces"
-              filteringPlaceholder="Find namespaces"
-              countText={`${filteredItemsCount ?? 0} match${(filteredItemsCount ?? 0) === 1 ? "" : "es"}`}
+              filteringAriaLabel={t("Filter namespaces")}
+              filteringPlaceholder={t("Find namespaces")}
+              countText={t("{count} matches", {
+                count: filteredItemsCount ?? 0,
+              })}
             />
             <Select
-              selectedOption={selectedStatus}
+              selectedOption={
+                statusFilterOptions.find(
+                  (option) => option.value === selectedStatus.value,
+                ) ?? statusFilterOptions[0]!
+              }
               onChange={({ detail }) =>
                 setSelectedStatus(detail.selectedOption)
               }
-              options={STATUS_FILTER_OPTIONS}
-              ariaLabel="Filter by status"
+              options={statusFilterOptions}
+              ariaLabel={t("Filter by status")}
               expandToViewport
             />
           </SpaceBetween>
@@ -409,33 +476,36 @@ export const NamespaceList: React.FC = () => {
         pagination={<Pagination {...paginationProps} openEnd={hasNextPage} />}
         preferences={
           <CollectionPreferences
-            title="Preferences"
-            confirmLabel="Confirm"
-            cancelLabel="Cancel"
+            title={t("Preferences")}
+            confirmLabel={t("Confirm")}
+            cancelLabel={t("Cancel")}
             preferences={preferences}
             onConfirm={({ detail }) => setPreferences(detail)}
             pageSizePreference={{
-              title: "Page size",
-              options: PAGE_SIZE_OPTIONS,
+              title: t("Page size"),
+              options: PAGE_SIZE_OPTIONS.map((option) => ({
+                ...option,
+                label: t(option.label),
+              })),
             }}
             wrapLinesPreference={{
-              label: "Wrap lines",
-              description: "Wrap long text to multiple lines.",
+              label: t("Wrap lines"),
+              description: t("Wrap long text to multiple lines."),
             }}
             stripedRowsPreference={{
-              label: "Striped rows",
-              description: "Alternate row background.",
+              label: t("Striped rows"),
+              description: t("Alternate row background."),
             }}
             contentDensityPreference={{
-              label: "Density",
-              description: "Use compact density for scanning.",
+              label: t("Density"),
+              description: t("Use compact density for scanning."),
             }}
             contentDisplayPreference={{
-              title: "Column preferences",
-              description: "Customize column visibility and order.",
+              title: t("Column preferences"),
+              description: t("Customize column visibility and order."),
               options: COLUMNS.map((c) => ({
                 id: c.id,
-                label: c.label,
+                label: t(c.label),
                 alwaysVisible: c.alwaysVisible,
               })),
             }}
@@ -449,7 +519,9 @@ export const NamespaceList: React.FC = () => {
             setShowDeleteConfirm(false);
             setDeleteConfirmText("");
           }}
-          header={`Delete namespace "${selected[0].name}"?`}
+          header={t("Delete namespace “{name}”?", {
+            name: selected[0].name ?? "—",
+          })}
           footer={
             <SpaceBetween direction="horizontal" size="xs">
               <Button
@@ -458,7 +530,7 @@ export const NamespaceList: React.FC = () => {
                   setDeleteConfirmText("");
                 }}
               >
-                Cancel
+                {t("Cancel")}
               </Button>
               <Button
                 variant="primary"
@@ -497,27 +569,37 @@ export const NamespaceList: React.FC = () => {
                   );
                 }}
               >
-                Delete
+                {t("Delete")}
               </Button>
             </SpaceBetween>
           }
         >
           <SpaceBetween size="m">
-            <Alert type="warning" header="This action cannot be undone">
-              Deleting <b>{selected[0].name}</b> will permanently delete ALL of
-              its resources, including:
+            <Alert type="warning" header={t("This action cannot be undone")}>
+              <b>{selected[0].name}</b>:{" "}
+              {t(
+                "Deleting this namespace permanently removes all of its resources:",
+              )}
               <ul>
-                <li>All data sources and their discovered metadata</li>
-                <li>All metric definitions</li>
-                <li>All ontology data (classes, properties, induced graphs)</li>
-                <li>Role and permission grants scoped to this namespace</li>
-                <li>The Athena workgroup and DataZone project</li>
+                <li>{t("All data sources and their discovered metadata")}</li>
+                <li>{t("All metric definitions")}</li>
+                <li>
+                  {t("All ontology data (classes, properties, induced graphs)")}
+                </li>
+                <li>
+                  {t("Role and permission grants scoped to this namespace")}
+                </li>
+                <li>{t("The Athena workgroup and DataZone project")}</li>
               </ul>
-              This runs as a background deletion job — the namespace will show
-              status <b>Deleting</b> until it completes. There is no way to
-              recover a deleted namespace or its data once this starts.
+              {t(
+                "Deletion runs in the background. The namespace remains in Deleting status until it completes, and deleted data cannot be recovered.",
+              )}
             </Alert>
-            <FormField label={`Type "${selected[0].name}" to confirm`}>
+            <FormField
+              label={t("Type “{name}” to confirm", {
+                name: selected[0].name ?? "—",
+              })}
+            >
               <Input
                 value={deleteConfirmText}
                 onChange={({ detail }) => setDeleteConfirmText(detail.value)}

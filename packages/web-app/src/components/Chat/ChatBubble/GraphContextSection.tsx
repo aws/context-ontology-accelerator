@@ -10,6 +10,7 @@ import type {
   GraphContextItem,
   LegacyGraphContextRelationship,
 } from "@app-types";
+import { useAppI18n } from "../../../i18n/LocaleProvider";
 
 export interface GraphContextSectionProps {
   context: GraphContextItem;
@@ -81,6 +82,7 @@ const legacyRelationship = (
 export const GraphContextSection: React.FC<GraphContextSectionProps> = ({
   context,
 }) => {
+  const { t } = useAppI18n();
   const entities = context.entities ?? [];
   const relationships: RenderedRelationship[] = [
     ...(context.relationships ?? []).map((relationship) => ({
@@ -106,7 +108,7 @@ export const GraphContextSection: React.FC<GraphContextSectionProps> = ({
   return (
     <div style={{ borderTop: "1px solid #e9ebed", paddingTop: "8px" }}>
       <Box variant="span" fontSize="body-s" fontWeight="bold">
-        Graph context
+        {t("Graph context")}
       </Box>
       {entities.length > 0 && (
         <div style={{ marginTop: "4px" }}>

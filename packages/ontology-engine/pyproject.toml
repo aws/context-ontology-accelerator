@@ -23,6 +23,9 @@ dependencies = [
     "sqlglot>=25.0",
     "requests-aws4auth>=1.3",
     "defusedxml>=0.7",
+    # 2026.10.19 is the first certifi bundle without the roots behind the compromised
+    # emSign intermediates. botocore also uses certifi's bundle over its own when installed.
+    "certifi>=2026.10.19",
 ]
 
 [project.optional-dependencies]

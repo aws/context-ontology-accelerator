@@ -62,6 +62,24 @@ describe("useListPlatformGrants", () => {
     expect(mockSend.mock.calls[0][0].input.nextToken).toBeUndefined();
   });
 
+  it("forwards the principal filter onto the command input", async () => {
+    mockSend.mockResolvedValueOnce({ grants: [] });
+
+    renderHook(() => useListPlatformGrants("me"), { wrapper });
+
+    await waitFor(() => expect(mockSend).toHaveBeenCalled());
+    expect(mockSend.mock.calls[0][0].input.principal).toBe("me");
+  });
+
+  it("omits the principal filter when called with no argument", async () => {
+    mockSend.mockResolvedValueOnce({ grants: [] });
+
+    renderHook(() => useListPlatformGrants(), { wrapper });
+
+    await waitFor(() => expect(mockSend).toHaveBeenCalled());
+    expect(mockSend.mock.calls[0][0].input.principal).toBeUndefined();
+  });
+
   it("derives hasNextPage from nextToken and fetches subsequent pages", async () => {
     mockSend
       .mockResolvedValueOnce({

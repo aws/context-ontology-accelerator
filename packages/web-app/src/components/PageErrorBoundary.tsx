@@ -10,6 +10,7 @@ import {
   SpaceBetween,
   StatusIndicator,
 } from "@cloudscape-design/components";
+import { useAppI18n } from "../i18n/LocaleProvider";
 
 interface Props {
   children: React.ReactNode;
@@ -18,6 +19,32 @@ interface Props {
 interface State {
   hasError: boolean;
   error: Error | null;
+}
+
+function PageErrorFallback({ error }: { error: Error | null }) {
+  const { t } = useAppI18n();
+
+  return (
+    <Box padding="xl">
+      <Container
+        header={<Header variant="h2">{t("Something went wrong")}</Header>}
+      >
+        <SpaceBetween size="m">
+          <StatusIndicator type="error">
+            {t("An unexpected error occurred while rendering this page.")}
+          </StatusIndicator>
+          {error && (
+            <Box variant="code" fontSize="body-s">
+              {error.message}
+            </Box>
+          )}
+          <Button iconName="refresh" onClick={() => window.location.reload()}>
+            {t("Reload page")}
+          </Button>
+        </SpaceBetween>
+      </Container>
+    </Box>
+  );
 }
 
 export class PageErrorBoundary extends React.Component<Props, State> {
@@ -36,24 +63,6 @@ export class PageErrorBoundary extends React.Component<Props, State> {
       return this.props.children;
     }
 
-    return (
-      <Box padding="xl">
-        <Container header={<Header variant="h2">Something went wrong</Header>}>
-          <SpaceBetween size="m">
-            <StatusIndicator type="error">
-              An unexpected error occurred while rendering this page.
-            </StatusIndicator>
-            {this.state.error && (
-              <Box variant="code" fontSize="body-s">
-                {this.state.error.message}
-              </Box>
-            )}
-            <Button iconName="refresh" onClick={() => window.location.reload()}>
-              Reload page
-            </Button>
-          </SpaceBetween>
-        </Container>
-      </Box>
-    );
+    return <PageErrorFallback error={this.state.error} />;
   }
 }

@@ -23,6 +23,7 @@ import type {
 } from "@app-types";
 import { LiveSteps } from "./LiveSteps";
 import { EvidencePanel } from "./EvidencePanel";
+import { useAppI18n } from "../../../i18n/LocaleProvider";
 import "../chat.css";
 
 export type ChatBubbleState = "loading" | "error" | "success";
@@ -80,6 +81,7 @@ export const ChatBubble: React.FC<ChatBubbleProps> = ({
   onRationaleClick,
   onRetry,
 }) => {
+  const { locale, t } = useAppI18n();
   const isUser = role === "user";
 
   if (isUser) {
@@ -106,7 +108,7 @@ export const ChatBubble: React.FC<ChatBubbleProps> = ({
         </StatusIndicator>
         {onRetry && (
           <Button variant="inline-link" onClick={onRetry}>
-            Retry
+            {t("Retry")}
           </Button>
         )}
       </SpaceBetween>
@@ -122,7 +124,7 @@ export const ChatBubble: React.FC<ChatBubbleProps> = ({
     // affordance. StatusIndicator (previously used here) renders plain text and
     // does not parse Markdown.
     return (
-      <Alert type="warning" statusIconAriaLabel="Warning">
+      <Alert type="warning" statusIconAriaLabel={t("Warning")}>
         <div style={{ fontSize: "14px", lineHeight: "20px" }}>
           <TextContent>
             <Markdown remarkPlugins={[remarkGfm]}>
@@ -135,7 +137,9 @@ export const ChatBubble: React.FC<ChatBubbleProps> = ({
   }
 
   const suppressedText = response.suppressedRows
-    ? ` (${response.suppressedRows.toLocaleString()} suppressed by SQL Firewall)`
+    ? t(" ({count} suppressed by SQL Firewall)", {
+        count: response.suppressedRows.toLocaleString(locale),
+      })
     : "";
 
   const displayAnswer = response.synthesizedAnswer || content;
@@ -157,15 +161,17 @@ export const ChatBubble: React.FC<ChatBubbleProps> = ({
       case "redshift":
         return "Redshift";
       case "jdbc":
-        return "the JDBC engine";
+        return t("the JDBC engine");
       default:
-        return "the query engine";
+        return t("the query engine");
     }
   })();
 
   const sqlArtifactCaption = response.sparqlGenerated
-    ? `The SPARQL the LLM emitted (Tier 2) and the SQL ${executionEngineLabel} executed.`
-    : `The SQL ${executionEngineLabel} executed.`;
+    ? t("The SPARQL the LLM emitted (Tier 2) and the SQL {engine} executed.", {
+        engine: executionEngineLabel,
+      })
+    : t("The SQL {engine} executed.", { engine: executionEngineLabel });
 
   return (
     <SpaceBetween size="s">
@@ -191,7 +197,7 @@ export const ChatBubble: React.FC<ChatBubbleProps> = ({
 
       {(response.sparqlGenerated || response.queryUsed) && (
         <ExpandableSection
-          headerText="Compiled artifacts"
+          headerText={t("Compiled artifacts")}
           headerDescription={sqlArtifactCaption}
           variant="footer"
         >
@@ -238,7 +244,7 @@ export const ChatBubble: React.FC<ChatBubbleProps> = ({
               iconName="angle-right"
               onClick={onRationaleClick}
             >
-              Show trace
+              {t("Show trace")}
             </Button>
           </div>
         ) : (
@@ -264,9 +270,11 @@ function ValidationErrorBubble({
     details?: { field: string; type: string }[];
   };
 }) {
+  const { t } = useAppI18n();
+
   return (
     <SpaceBetween size="s">
-      <Badge color="red">Validation error</Badge>
+      <Badge color="red">{t("Validation error")}</Badge>
       <Alert
         type="error"
         header={`${errorDetails.statusCode} ${errorDetails.error}`}
@@ -277,14 +285,15 @@ function ValidationErrorBubble({
             <KeyValuePairs
               columns={2}
               items={errorDetails.details.flatMap((d) => [
-                { label: "Field", value: d.field },
-                { label: "Type", value: d.type },
+                { label: t("Field"), value: d.field },
+                { label: t("Type"), value: d.type },
               ])}
             />
           )}
           <Box variant="small" color="text-body-secondary">
-            Zero compute consumed. Boundary checks: namespace regex, query
-            length, character allowlist.
+            {t(
+              "Zero compute consumed. Boundary checks: namespace regex, query length, character allowlist.",
+            )}
           </Box>
         </SpaceBetween>
       </Alert>
@@ -300,6 +309,7 @@ function ValidationErrorBubble({
 const MAX_DISPLAY_ROWS = 50;
 
 function ResultTable({ rows }: { rows: Record<string, unknown>[] }) {
+  const { t } = useAppI18n();
   if (rows.length === 0) return null;
   const firstRow = rows[0];
   if (!firstRow || Object.keys(firstRow).length === 0) return null;
@@ -325,7 +335,10 @@ function ResultTable({ rows }: { rows: Record<string, unknown>[] }) {
       />
       {truncated && (
         <Box variant="span" fontSize="body-s" color="text-body-secondary">
-          Showing {MAX_DISPLAY_ROWS} of {rows.length} rows
+          {t("Showing {shown} of {total} rows", {
+            shown: MAX_DISPLAY_ROWS,
+            total: rows.length,
+          })}
         </Box>
       )}
     </SpaceBetween>
@@ -341,6 +354,7 @@ function CodeBlock({ code }: { code: string }) {
 }
 
 function CopyButton({ content }: { content: string }) {
+  const { t } = useAppI18n();
   const [copied, setCopied] = useState(false);
 
   const handleCopy = () => {
@@ -355,7 +369,7 @@ function CopyButton({ content }: { content: string }) {
     <Button
       iconName={copied ? "status-positive" : "copy"}
       variant="icon"
-      ariaLabel="Copy answer"
+      ariaLabel={t("Copy answer")}
       onClick={handleCopy}
     />
   );

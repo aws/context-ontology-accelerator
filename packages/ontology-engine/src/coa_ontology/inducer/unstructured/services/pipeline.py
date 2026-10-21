@@ -289,6 +289,7 @@ class UnstructuredInductionPipeline:
                 iri_resolver=config.iri_resolver,
                 namespace_name=config.name,
                 namespace_language=config.namespace_language,
+                class_iris=class_iris,
             )
 
             # ── Foundational grounding (optional, additive) ─────────

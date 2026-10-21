@@ -11,3 +11,6 @@ pymysql>=1.2.3           # MySQL
 oracledb>=2.5.1          # Oracle (thin mode — no Oracle client needed)
 python-tds>=1.17.1       # SQL Server (import: pytds — pure Python, no ODBC)
 snowflake-connector-python>=4.8.0  # Snowflake (needs a warehouse in config; heavier bundle)
+# 2026.10.19 is the first certifi bundle without the roots behind the compromised
+# emSign intermediates. botocore also uses certifi's bundle over its own when installed.
+certifi>=2026.10.19

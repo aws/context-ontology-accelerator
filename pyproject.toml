@@ -25,6 +25,9 @@ dev = [
 ]
 
 [tool.uv]
+# uv < 0.13.4 embeds roots that trust the compromised eMudhra/emSign intermediates
+# (GHSA-hq85-5cpj-mr62); refuse to run with an older uv instead of fetching wheels with it.
+required-version = ">=0.13.4"
 # Pin transitive dependencies up to the patched floor for security advisories
 # that are only reachable through dev/test tooling (no direct declaration).
 #   werkzeug: pulled by moto (AWS mocking, dev group only). CVE-2026-102598
