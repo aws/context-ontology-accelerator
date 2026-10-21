@@ -2,8 +2,32 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { formatStepDetail } from "./format-step-detail";
+import { formatAppMessage } from "../../../i18n/appMessages";
+import type { AppTranslate } from "../../../i18n/LocaleProvider";
+
+const jaTranslate: AppTranslate = (message, values) =>
+  formatAppMessage("ja", message, values);
 
 describe("formatStepDetail", () => {
+  it("formats application-owned trace details in Japanese", () => {
+    expect(
+      formatStepDetail(
+        "t1.metric_match",
+        {
+          metricName: "total_revenue",
+          matchSource: "exact",
+          confidence: 0.95,
+        },
+        jaTranslate,
+      ),
+    ).toBe("total_revenue に解決しました（完全一致、信頼度 0.95）。");
+    expect(
+      formatStepDetail("t2.vkg.firewall", { denied: false }, jaTranslate),
+    ).toBe(
+      "SQL ファイアウォールを通過しました — 安全な読み取り専用 SELECT です。",
+    );
+  });
+
   describe("returns fallback for missing/empty detail", () => {
     it("returns fallback when detail is undefined", () => {
       expect(formatStepDetail("t1.metric_match", undefined)).toBe(

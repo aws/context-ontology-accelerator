@@ -33,6 +33,7 @@ import {
   parseTriples,
 } from "../../utils/turtleLexer";
 import { SuggestionPanel } from "./SuggestionPanel";
+import { useAppI18n } from "../../i18n/LocaleProvider";
 
 type ParsedOntology = {
   classes: Set<string>;
@@ -209,16 +210,17 @@ type Props = {
 
 /** Render a green/amber pill for an FK / subClass provenance value. */
 function ProvenanceBadge({ value }: { value: string }) {
+  const { t } = useAppI18n();
   const ok = value === "DETERMINISTIC" || value === "STEWARD_SPECIFIED";
   const label =
     value === "DETERMINISTIC"
-      ? "Deterministic"
+      ? t("Deterministic")
       : value === "AI_INFERRED"
-        ? "AI-inferred"
+        ? t("AI-inferred")
         : value === "STEWARD_SPECIFIED"
-          ? "Steward-specified"
+          ? t("Steward-specified")
           : value === "PK_SHARING"
-            ? "Auto-detected (PK-sharing)"
+            ? t("Auto-detected (PK-sharing)")
             : value;
   return <Badge color={ok ? "green" : "severity-medium"}>{label}</Badge>;
 }
@@ -230,6 +232,7 @@ export function ClassDetailCard({
   onTurtleEdit,
   onClose,
 }: Props) {
+  const { t } = useAppI18n();
   const onto = useMemo(() => parseOntology(turtle), [turtle]);
   const labelOf = (i: string) => onto.labels[i] ?? localName(i);
   const directParents = onto.parents[iri] ?? [];
@@ -257,7 +260,7 @@ export function ClassDetailCard({
               <Button
                 iconName="close"
                 variant="icon"
-                ariaLabel="Close class details"
+                ariaLabel={t("Close class details")}
                 onClick={onClose}
               />
             )
@@ -275,7 +278,7 @@ export function ClassDetailCard({
 
         {(ds || sch) && (
           <Box>
-            <Box variant="awsui-key-label">Source</Box>
+            <Box variant="awsui-key-label">{t("Source")}</Box>
             <SpaceBetween direction="horizontal" size="xxs">
               {ds && <Badge>{ds}</Badge>}
               {sch && <Badge color="blue">{sch}</Badge>}
@@ -285,7 +288,7 @@ export function ClassDetailCard({
 
         {pkCols && pkCols.length > 0 && (
           <Box>
-            <Box variant="awsui-key-label">Primary key</Box>
+            <Box variant="awsui-key-label">{t("Primary key")}</Box>
             <Box variant="small">{pkCols.join(", ")}</Box>
           </Box>
         )}
@@ -302,7 +305,8 @@ export function ClassDetailCard({
         {directParents.length > 0 && (
           <Box>
             <Box variant="awsui-key-label">
-              Subclass of {subProv && <ProvenanceBadge value={subProv} />}
+              {t("Subclass of")}{" "}
+              {subProv && <ProvenanceBadge value={subProv} />}
             </Box>
             <SpaceBetween size="xxs">
               {directParents.map((parentIri) => (
@@ -319,7 +323,7 @@ export function ClassDetailCard({
 
         {subclasses.length > 0 && (
           <Box>
-            <Box variant="awsui-key-label">Subclasses</Box>
+            <Box variant="awsui-key-label">{t("Subclasses")}</Box>
             <SpaceBetween size="xxs">
               {subclasses.map((childIri) => (
                 <ClassLink
@@ -335,7 +339,7 @@ export function ClassDetailCard({
 
         {ownDataProps.length > 0 && (
           <Box>
-            <Box variant="awsui-key-label">Datatype properties</Box>
+            <Box variant="awsui-key-label">{t("Datatype properties")}</Box>
             <SpaceBetween size="xxs">
               {ownDataProps.map((p) => (
                 <Box key={p.iri} variant="small">
@@ -348,7 +352,7 @@ export function ClassDetailCard({
 
         {ownObjectProps.length > 0 && (
           <Box>
-            <Box variant="awsui-key-label">Object properties</Box>
+            <Box variant="awsui-key-label">{t("Object properties")}</Box>
             <SpaceBetween size="xxs">
               {ownObjectProps.map((p) => (
                 <Box key={p.iri} variant="small">
@@ -377,7 +381,9 @@ export function ClassDetailCard({
           return (
             <ExpandableSection
               key={ancestor}
-              headerText={`Inherited from ${labelOf(ancestor)}`}
+              headerText={t("Inherited from {name}", {
+                name: labelOf(ancestor),
+              })}
               variant="footer"
             >
               <SpaceBetween size="xxs">

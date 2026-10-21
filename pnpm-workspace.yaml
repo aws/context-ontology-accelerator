@@ -10,6 +10,15 @@ packages:
 allowBuilds:
   esbuild: true
   nx: true
+  # Both come in through jest 30 (tests/cdk). pnpm 10 skips an undecided install
+  # script with a warning, but pnpm 11 and later fail `pnpm install` on it, so every
+  # package with one must be listed here. Neither script is needed, because each
+  # package's prebuilt binary arrives as an optional dependency:
+  # - @parcel/watcher: the script compiles from source, and only when
+  #   npm_config_build_from_source=true.
+  # - unrs-resolver: the script only checks that the prebuilt binding is installed.
+  '@parcel/watcher': false
+  unrs-resolver: false
 
 # Supply chain hardening — prevent exotic subdependency installs and silent downgrades.
 # All three are TOP-LEVEL pnpm-workspace.yaml settings. They were previously nested
@@ -38,12 +47,6 @@ minimumReleaseAge: 10080
 # 4.6.6 ages past the quarantine (after 2026-10-18).
 minimumReleaseAgeExclude:
   - zod
-  # aws-cdk-lib 2.273.0 is the first release that bundles a patched
-  # brace-expansion (5.0.12 >= the 5.0.11 stack-exhaustion floor); the bundled
-  # 5.0.9 in 2.270.0-2.272.0 cannot be reached by an override. 2.273.0 was
-  # published 2026-10-08, within the quarantine window. Excluded so the tests/cdk
-  # harness picks it up; remove once 2.273.0 ages past the quarantine (2026-10-15).
-  - aws-cdk-lib
 
 overrides:
   # downlevel-dts depends on typescript@"next" — a dist-tag that resolves to

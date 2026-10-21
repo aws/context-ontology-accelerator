@@ -17,9 +17,9 @@ description: Node, pnpm, Python and uv with repo-pinned versions, plus lockfile-
 
 inputs:
   node-version:
-    description: Node major version.
+    description: Node version — keep in step with .mise.toml.
     required: false
-    default: "22"
+    default: "22.23.4"
   pnpm-version:
     description: pnpm version — keep in step with .mise.toml.
     required: false
@@ -47,7 +47,7 @@ runs:
     # surface of a public repo minimal.
     - name: Install uv
       shell: bash
-      run: pip install uv
+      run: pip install "uv>=0.13.4"
 
     # Only the uv cache is restored. The pnpm install is ~15s cold, so a store
     # cache would add moving parts for little gain; revisit if that changes.

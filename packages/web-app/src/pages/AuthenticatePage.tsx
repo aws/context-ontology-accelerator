@@ -11,6 +11,7 @@ import {
 import { useSearchParams } from "react-router-dom";
 import { RuntimeConfigContext } from "@components/RuntimeContext";
 import { OIDCProvider } from "@auth";
+import { useAppI18n } from "../i18n/LocaleProvider";
 
 interface AuthenticatePageProps {
   title: string;
@@ -19,6 +20,7 @@ interface AuthenticatePageProps {
 export const AuthenticatePage: React.FC<AuthenticatePageProps> = ({
   title,
 }) => {
+  const { t } = useAppI18n();
   const [status, setStatus] = useState<"processing" | "success" | "failure">(
     "processing",
   );
@@ -59,10 +61,10 @@ export const AuthenticatePage: React.FC<AuthenticatePageProps> = ({
 
   const message =
     status === "processing"
-      ? "Authenticating with the configured Identity Provider..."
+      ? t("Authenticating with the configured Identity Provider...")
       : status === "success"
-        ? "Authentication successful. Redirecting..."
-        : "Authentication failed. Redirecting...";
+        ? t("Authentication successful. Redirecting...")
+        : t("Authentication failed. Redirecting...");
 
   return (
     <AppLayout

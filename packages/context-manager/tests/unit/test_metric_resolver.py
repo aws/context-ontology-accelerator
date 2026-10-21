@@ -1558,7 +1558,7 @@ class TestNonAsciiMatching:
         assert result.found
         assert result.residual == expected, f"{query!r} must leave {expected!r} as residual"
 
-    @pytest.mark.parametrize("qualifier", ["ごご", "もも", "かが"])
+    @pytest.mark.parametrize("qualifier", ["ごご", "もも", "かが", "とも"])
     async def test_hiragana_content_word_is_not_proved_by_particle_decomposition(self, qualifier):
         """A content word made from one-scalar particles must force Tier 2/3.
 
@@ -1589,7 +1589,7 @@ class TestNonAsciiMatching:
         assert result.found
         assert qualifier in result.residual
 
-    @pytest.mark.parametrize("run", ["では", "には", "とは", "のは", "でも", "にも", "とも", "での"])
+    @pytest.mark.parametrize("run", ["では", "には", "とは", "のは", "でも", "にも", "での"])
     def test_reviewed_particle_pair_is_scaffolding(self, run):
         from coa_serve.tier1.metric_resolver import _is_stop_scaffolding
 
@@ -1603,6 +1603,9 @@ class TestNonAsciiMatching:
             "では総発電容量はいくらですか",
             "総発電容量はいくらですか",
             "総発電容量を教えてください",
+            "総発電容量はおいくらですか",
+            "総発電容量はおいくつですか",
+            "総発電容量はおいくらでしょうか",
         ],
     )
     async def test_particle_pair_inside_a_question_resolves_at_tier1(self, query):

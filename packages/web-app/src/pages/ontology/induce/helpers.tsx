@@ -4,6 +4,7 @@
 import Badge from "@cloudscape-design/components/badge";
 import StatusIndicator from "@cloudscape-design/components/status-indicator";
 import { ProposalStatus } from "@coa/control-plane-client";
+import type { AppTranslate } from "../../../i18n/LocaleProvider";
 
 export function shortId(id: string, len = 8): string {
   return id.length > len ? `${id.slice(0, len)}…` : id;
@@ -17,8 +18,11 @@ export function shortId(id: string, len = 8): string {
  */
 export function proposalSourceTypeLabel(
   sourceType: string | undefined,
+  t?: AppTranslate,
 ): string {
-  return sourceType === "UNSTRUCTURED" ? "Unstructured" : "Structured";
+  return sourceType === "UNSTRUCTURED"
+    ? (t?.("Unstructured") ?? "Unstructured")
+    : (t?.("Structured") ?? "Structured");
 }
 
 /**
@@ -39,6 +43,7 @@ export function proposalSourceTypeLabel(
 export function proposalScope(
   metadata: Record<string, unknown> | undefined,
   sourceType: string | undefined,
+  t?: AppTranslate,
 ): string | null {
   const isUnstructured = sourceType === "UNSTRUCTURED";
   const key = isUnstructured ? "class_count" : "tables_processed";
@@ -47,14 +52,16 @@ export function proposalScope(
   // never a real "N tables"/"N classes". Treated as "no metric" ("—").
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0)
     return null;
-  const unit = isUnstructured
+  const message = isUnstructured
     ? value === 1
-      ? "class"
-      : "classes"
+      ? "{count} class"
+      : "{count} classes"
     : value === 1
-      ? "table"
-      : "tables";
-  return `${value} ${unit}`;
+      ? "{count} table"
+      : "{count} tables";
+  return (
+    t?.(message, { count: value }) ?? message.replace("{count}", `${value}`)
+  );
 }
 
 /**
@@ -187,30 +194,58 @@ export function proposalBlocksNewInduction(status: string): boolean {
   return PROPOSAL_BLOCKS_NEW_INDUCTION_STATUSES.has(status);
 }
 
-export function proposalStatusIndicator(status: string) {
+export function proposalStatusIndicator(status: string, t?: AppTranslate) {
   switch (status) {
     case "pending":
-      return <StatusIndicator type="pending">Pending</StatusIndicator>;
+      return (
+        <StatusIndicator type="pending">
+          {t?.("Pending") ?? "Pending"}
+        </StatusIndicator>
+      );
     case "accepting":
-      return <StatusIndicator type="in-progress">Accepting…</StatusIndicator>;
+      return (
+        <StatusIndicator type="in-progress">
+          {t?.("Accepting…") ?? "Accepting…"}
+        </StatusIndicator>
+      );
     case "embeddings_sync":
       return (
         <StatusIndicator type="in-progress">
-          Syncing embeddings…
+          {t?.("Syncing embeddings…") ?? "Syncing embeddings…"}
         </StatusIndicator>
       );
     case "accepted":
-      return <StatusIndicator type="success">Accepted</StatusIndicator>;
+      return (
+        <StatusIndicator type="success">
+          {t?.("Accepted") ?? "Accepted"}
+        </StatusIndicator>
+      );
     // An accept whose pipeline step exhausted its retries. The proposal is
     // still re-acceptable; ``accept_error`` names the failing step.
     case "accept_failed":
-      return <StatusIndicator type="error">Accept failed</StatusIndicator>;
+      return (
+        <StatusIndicator type="error">
+          {t?.("Accept failed") ?? "Accept failed"}
+        </StatusIndicator>
+      );
     case "rejected":
-      return <StatusIndicator type="error">Rejected</StatusIndicator>;
+      return (
+        <StatusIndicator type="error">
+          {t?.("Rejected") ?? "Rejected"}
+        </StatusIndicator>
+      );
     case "cancelled":
-      return <StatusIndicator type="stopped">Cancelled</StatusIndicator>;
+      return (
+        <StatusIndicator type="stopped">
+          {t?.("Cancelled") ?? "Cancelled"}
+        </StatusIndicator>
+      );
     case "updated":
-      return <StatusIndicator type="in-progress">Updated</StatusIndicator>;
+      return (
+        <StatusIndicator type="in-progress">
+          {t?.("Proposal updated") ?? "Updated"}
+        </StatusIndicator>
+      );
     default:
       return <Badge>{status}</Badge>;
   }

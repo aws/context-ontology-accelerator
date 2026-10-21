@@ -33,7 +33,7 @@ Third-party components
 - botocore-stubs (1.43.14) — MIT
 - catalogue (2.0.10) — MIT
 - cedarpy (4.8.3) — Apache-2.0
-- certifi (2026.5.20) — MPL-2.0
+- certifi (2026.10.19) — MPL-2.0
 - cffi (2.0.0) — MIT
 - charset-normalizer (3.4.7) — MIT
 - click (8.4.1) — BSD-3-Clause
@@ -56,7 +56,7 @@ Third-party components
 - filelock (3.29.1) — MIT
 - filetype (1.2.0) — MIT
 - frozenlist (1.8.0) — Apache-2.0
-- fsspec (2026.4.0) — BSD-3-Clause
+- fsspec (2026.9.0) — BSD-3-Clause
 - google-auth (2.53.0) — Apache-2.0
 - graphrag-lexical-graph (3.18.7) — Apache-2.0
 - greenlet (3.5.1) — MIT

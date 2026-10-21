@@ -64,7 +64,14 @@ export class DataLayerStack extends SCLStack {
     // MCP/data-layer parity refactor, so the bundle shipped zero pip deps.)
     const lambdaCode = bundlePython({
       srcDirs: [fromRoot("packages/data-layer/src"), Paths.commonLib],
-      pipDeps: ["pydantic", "pydantic-settings", "structlog"],
+      pipDeps: [
+        "pydantic",
+        "pydantic-settings",
+        "structlog",
+        // Runtime boto3 prefers a bundled certifi to the CA bundle botocore ships; this is
+        // the first certifi without the roots behind the compromised emSign intermediates.
+        "certifi>=2026.10.19",
+      ],
     });
 
     // ── Data Layer API Lambda ──────────────────────────────────────

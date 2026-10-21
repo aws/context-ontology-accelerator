@@ -17,6 +17,8 @@ import { useUser } from "@auth";
 import { useToolsPanel } from "@components/ToolsPanelProvider";
 import { HomeHelpPanel } from "./HomeHelpPanel";
 import { ONBOARDING_ICON } from "@constants/drawer-icons";
+import { useAppI18n } from "../i18n/LocaleProvider";
+import type { AppMessage } from "../i18n/appMessages";
 
 /**
  * Decorative ontology-graph watermark rendered behind the hero. Purely visual
@@ -24,9 +26,10 @@ import { ONBOARDING_ICON } from "@constants/drawer-icons";
  * domain classes so the landing hero echoes the product's semantic model.
  */
 const OntologyWatermark: React.FC = () => {
+  const { t } = useAppI18n();
   const nodes: Array<{
     id: string;
-    label: string;
+    label: AppMessage;
     x: number;
     y: number;
     r: number;
@@ -95,7 +98,7 @@ const OntologyWatermark: React.FC = () => {
                 fontSize={14}
                 fontFamily="inherit"
               >
-                {n.label}
+                {t(n.label)}
               </text>
             </g>
           ))}
@@ -115,6 +118,7 @@ export const HomePage: React.FC = () => {
   const navigate = useNavigate();
   const { user } = useUser();
   const { registerDrawer, unregisterDrawer } = useToolsPanel();
+  const { t } = useAppI18n();
   const greetingName = user?.name || user?.email || "";
 
   useEffect(() => {
@@ -123,12 +127,12 @@ export const HomePage: React.FC = () => {
       content: <HomeHelpPanel />,
       trigger: { iconSvg: ONBOARDING_ICON },
       ariaLabels: {
-        drawerName: "Get started",
-        closeButton: "Close Get started",
+        drawerName: t("Get started"),
+        closeButton: t("Close Get started"),
       },
     });
     return () => unregisterDrawer("onboarding");
-  }, [registerDrawer, unregisterDrawer]);
+  }, [registerDrawer, unregisterDrawer, t]);
 
   return (
     <ContentLayout
@@ -147,7 +151,7 @@ export const HomePage: React.FC = () => {
             >
               <SpaceBetween size="xs">
                 <Box color="inherit" fontSize="body-m">
-                  AI Platform · Context Layer
+                  {t("AI Platform · Context Layer")}
                 </Box>
                 <Header variant="h1">
                   <Box
@@ -160,12 +164,12 @@ export const HomePage: React.FC = () => {
                   </Box>
                 </Header>
                 <Box fontWeight="light" fontSize="display-l" color="inherit">
-                  The governed context layer for enterprise AI.
+                  {t("The governed context layer for enterprise AI.")}
                 </Box>
                 <Box variant="p" color="inherit" fontSize="heading-s">
-                  Connect to your Glue and SageMaker catalogs, induce a
-                  W3C-standard semantic model, and serve it to analysts and AI
-                  agents over MCP.
+                  {t(
+                    "Connect to your Glue and SageMaker catalogs, induce a W3C-standard semantic model, and serve it to analysts and AI agents over MCP.",
+                  )}
                 </Box>
               </SpaceBetween>
 
@@ -174,19 +178,22 @@ export const HomePage: React.FC = () => {
               <Container>
                 <SpaceBetween size="l">
                   <Box variant="p">
-                    {greetingName ? `Welcome, ${greetingName}. ` : ""}
-                    Create a namespace and connect your first source in a few
-                    guided steps.
+                    {greetingName
+                      ? `${t("Welcome, {name}.", { name: greetingName })} `
+                      : ""}
+                    {t(
+                      "Create a namespace and connect your first source in a few guided steps.",
+                    )}
                   </Box>
                   <SpaceBetween direction="horizontal" size="xs">
                     <Button
                       variant="primary"
                       onClick={() => navigate("/namespaces/create")}
                     >
-                      Get started
+                      {t("Get started")}
                     </Button>
                     <Button onClick={() => navigate("/namespaces")}>
-                      View namespaces
+                      {t("View namespaces")}
                     </Button>
                   </SpaceBetween>
                 </SpaceBetween>
@@ -196,29 +203,30 @@ export const HomePage: React.FC = () => {
         </div>
       }
     >
-      <Container header={<Header variant="h2">How it works</Header>}>
+      <Container header={<Header variant="h2">{t("How it works")}</Header>}>
         <ColumnLayout columns={3} variant="text-grid">
           <SpaceBetween size="xs">
-            <Header variant="h3">Scan</Header>
+            <Header variant="h3">{t("Scan")}</Header>
             <Box variant="p" color="text-body-secondary">
-              Point Context Ontology Accelerator at your Glue and SageMaker
-              catalogs. It inventories tables and columns, then previews
-              AI-generated business context for your review.
+              {t(
+                "Point Context Ontology Accelerator at your Glue and SageMaker catalogs. It inventories tables and columns, then previews AI-generated business context for your review.",
+              )}
             </Box>
           </SpaceBetween>
           <SpaceBetween size="xs">
-            <Header variant="h3">Ontology</Header>
+            <Header variant="h3">{t("Ontology")}</Header>
             <Box variant="p" color="text-body-secondary">
-              Draft a W3C-standard ontology over scanned catalogs. Author
-              validation rules, define governed metrics, and publish through a
-              versioned workflow.
+              {t(
+                "Draft a W3C-standard ontology over scanned catalogs. Author validation rules, define governed metrics, and publish through a versioned workflow.",
+              )}
             </Box>
           </SpaceBetween>
           <SpaceBetween size="xs">
-            <Header variant="h3">Serve</Header>
+            <Header variant="h3">{t("Serve")}</Header>
             <Box variant="p" color="text-body-secondary">
-              Expose the governed surface to analysts and agents. Every request
-              flows through policy enforcement, with every decision logged.
+              {t(
+                "Expose the governed surface to analysts and agents. Every request flows through policy enforcement, with every decision logged.",
+              )}
             </Box>
           </SpaceBetween>
         </ColumnLayout>

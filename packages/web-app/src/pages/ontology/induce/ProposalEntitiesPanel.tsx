@@ -29,6 +29,7 @@ import {
   parseR2rmlByClass,
   type ConceptMatch,
 } from "./grounding";
+import { useAppI18n } from "../../../i18n/LocaleProvider";
 
 // ─── Helpers ────────────────────────────────────────────────────────
 
@@ -298,6 +299,7 @@ export function ProposalEntitiesPanel({
   onSelectGroundingCandidate,
   onMarkGroundingNovel,
 }: Props) {
+  const { t } = useAppI18n();
   const [selectedClassUri, setSelectedClassUri] = useState<string | null>(null);
   const { openPanel, closePanel, state: panelState } = useSplitPanel();
 
@@ -415,6 +417,7 @@ export function ProposalEntitiesPanel({
     isReadOnly,
     onUpdateEntityTurtle,
     onUpdateTurtle,
+    t,
   ]);
 
   // Close panel on unmount
@@ -425,9 +428,11 @@ export function ProposalEntitiesPanel({
       <ExpandableSection
         variant="container"
         defaultExpanded
-        headerText="Proposed classes"
-        headerCounter={`(${groups.length} classes)`}
-        headerDescription="Select a class to view its relationships, attributes, and mappings."
+        headerText={t("Proposed classes")}
+        headerCounter={t("({count} classes)", { count: groups.length })}
+        headerDescription={t(
+          "Select a class to view its relationships, attributes, and mappings.",
+        )}
         headerActions={
           !isReadOnly ? (
             <Button
@@ -440,7 +445,7 @@ export function ProposalEntitiesPanel({
               }}
               disabled={!selectedGroup}
             >
-              Edit selected
+              {t("Edit selected")}
             </Button>
           ) : undefined
         }
@@ -466,14 +471,14 @@ export function ProposalEntitiesPanel({
           columnDefinitions={[
             {
               id: "name",
-              header: "Class",
+              header: t("Class"),
               isRowHeader: true,
               sortingField: "label",
               cell: (g) => (
                 <SpaceBetween direction="horizontal" size="xs">
                   <Box fontWeight="bold">{g.label}</Box>
                   {g.hasSuggestedParent && (
-                    <Badge color="blue">Suggested subclass</Badge>
+                    <Badge color="blue">{t("Suggested subclass")}</Badge>
                   )}
                 </SpaceBetween>
               ),
@@ -486,24 +491,29 @@ export function ProposalEntitiesPanel({
                   size="xxs"
                   alignItems="center"
                 >
-                  <span>Origin</span>
-                  <InfoPopover header="Origin" ariaLabel="About class origin">
+                  <span>{t("Origin")}</span>
+                  <InfoPopover
+                    header={t("Origin")}
+                    ariaLabel={t("About class origin")}
+                  >
                     <SpaceBetween size="xs">
                       <Box variant="p">
-                        <strong>Grounded</strong>: matched to a foundational
-                        ontology, reusing standard vocabulary.
+                        {t(
+                          "Grounded: matched to a foundational ontology, reusing standard vocabulary.",
+                        )}
                       </Box>
                       <Box variant="p">
-                        <strong>Ambiguous</strong>: low-confidence match, review
-                        before accepting.
+                        {t(
+                          "Ambiguous: low-confidence match, review before accepting.",
+                        )}
                       </Box>
                       <Box variant="p">
-                        <strong>Novel</strong>: created fresh, no confident
-                        match.
+                        {t("Novel: created fresh, no confident match.")}
                       </Box>
                       <Box variant="p">
-                        Open a class and see its Grounding tab to change the
-                        match.
+                        {t(
+                          "Open a class and see its Grounding tab to change the match.",
+                        )}
                       </Box>
                     </SpaceBetween>
                   </InfoPopover>
@@ -527,23 +537,23 @@ export function ProposalEntitiesPanel({
               },
               cell: (g) =>
                 g.matchType === "exact" || g.matchType === "close" ? (
-                  <Badge color="blue">Grounded</Badge>
+                  <Badge color="blue">{t("Grounded")}</Badge>
                 ) : g.matchType === "related" ? (
-                  <Badge>Ambiguous</Badge>
+                  <Badge>{t("Ambiguous")}</Badge>
                 ) : (
-                  <Badge color="green">Novel</Badge>
+                  <Badge color="green">{t("Novel")}</Badge>
                 ),
             },
             {
               id: "relationships",
-              header: "Relationships",
+              header: t("Relationships"),
               sortingComparator: (a, b) =>
                 a.relationships.length - b.relationships.length,
               cell: (g) => g.relationships.length,
             },
             {
               id: "attributes",
-              header: "Attributes",
+              header: t("Attributes"),
               sortingComparator: (a, b) =>
                 a.attributes.length - b.attributes.length,
               cell: (g) => g.attributes.length,
@@ -557,7 +567,7 @@ export function ProposalEntitiesPanel({
               // not emit intra-proposal matches. Distinct from the card's
               // "Grounding" tab, which counts EXTERNAL foundational candidates.
               id: "matches",
-              header: "Matches",
+              header: t("Matches"),
               sortingComparator: (a, b) =>
                 (a.matches?.length ?? 0) - (b.matches?.length ?? 0),
               cell: (g) => g.matches?.length ?? 0,
@@ -565,7 +575,7 @@ export function ProposalEntitiesPanel({
           ]}
           empty={
             <Box textAlign="center" color="text-body-secondary">
-              No classes in this proposal.
+              {t("No classes in this proposal.")}
             </Box>
           }
         />
@@ -574,7 +584,7 @@ export function ProposalEntitiesPanel({
         <ExpandableSection
           variant="container"
           defaultExpanded={false}
-          headerText="Prefixes (shared)"
+          headerText={t("Prefixes (shared)")}
         >
           <TurtleHighlight>{prelude}</TurtleHighlight>
         </ExpandableSection>
@@ -584,9 +594,11 @@ export function ProposalEntitiesPanel({
         <ExpandableSection
           variant="container"
           defaultExpanded={false}
-          headerText="Ungrouped properties"
+          headerText={t("Ungrouped properties")}
           headerCounter={`(${ungrouped.length})`}
-          headerDescription="Properties whose domain class is not in this proposal."
+          headerDescription={t(
+            "Properties whose domain class is not in this proposal.",
+          )}
         >
           <SortableTable
             items={ungrouped}
@@ -596,7 +608,7 @@ export function ProposalEntitiesPanel({
             columnDefinitions={[
               {
                 id: "name",
-                header: "Property",
+                header: t("Property"),
                 isRowHeader: true,
                 sortingComparator: (a, b) =>
                   (
@@ -608,20 +620,20 @@ export function ProposalEntitiesPanel({
               },
               {
                 id: "kind",
-                header: "Type",
+                header: t("Type"),
                 sortingComparator: (a, b) =>
                   (a.kind.includes("Object") ? 0 : 1) -
                   (b.kind.includes("Object") ? 0 : 1),
                 cell: (p) =>
                   p.kind.includes("Object") ? (
-                    <Badge color="green">Relationship</Badge>
+                    <Badge color="green">{t("Relationship")}</Badge>
                   ) : (
-                    <Badge color="grey">Attribute</Badge>
+                    <Badge color="grey">{t("Attribute")}</Badge>
                   ),
               },
               {
                 id: "domain",
-                header: "Domain",
+                header: t("Domain"),
                 sortingComparator: (a, b) =>
                   (extractUri(a.body, "rdfs:domain") ?? "—").localeCompare(
                     extractUri(b.body, "rdfs:domain") ?? "—",
@@ -630,7 +642,7 @@ export function ProposalEntitiesPanel({
               },
               {
                 id: "range",
-                header: "Range",
+                header: t("Range"),
                 sortingComparator: (a, b) =>
                   (extractUri(a.body, "rdfs:range") ?? "—").localeCompare(
                     extractUri(b.body, "rdfs:range") ?? "—",

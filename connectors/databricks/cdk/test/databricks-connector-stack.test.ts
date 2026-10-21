@@ -522,3 +522,17 @@ describe("connector alarms", () => {
     });
   });
 });
+
+describe("the stack description", () => {
+  it("starts with the AWS Solutions ID and reports the COA release", () => {
+    const root = path.join(__dirname, "..", "..", "..", "..");
+    const release = fs.readFileSync(path.join(root, "VERSION"), "utf8").trim();
+    // The same release the main COA app's stacks report.
+    expect(JSON.parse(fs.readFileSync(path.join(root, "infra", "package.json"), "utf8")).version).toBe(
+      release,
+    );
+    expect(synth().toJSON().Description).toBe(
+      `(SO0376) - Context Ontology Accelerator - databricks-coa-connector. Version v${release}`,
+    );
+  });
+});

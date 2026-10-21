@@ -13,6 +13,7 @@
  */
 import React, { useEffect, useMemo, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
+import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
 import { useCollection } from "@cloudscape-design/collection-hooks";
 import Badge, { type BadgeProps } from "@cloudscape-design/components/badge";
 import Box from "@cloudscape-design/components/box";
@@ -44,12 +45,15 @@ import {
   type ColumnDenylistRow,
 } from "@components/ColumnDenylistEditor";
 import { columnDenylistRowsToMap } from "@utils/grant-overrides";
+import { useAppI18n } from "../i18n/LocaleProvider";
+
+type Translate = ReturnType<typeof useAppI18n>["t"];
 
 /** Formats an ISO timestamp into a localized short date+time string, or "—". */
-function formatDate(iso: string | undefined): string {
+function formatDate(iso: string | undefined, locale: string): string {
   if (!iso) return "—";
   try {
-    return new Date(iso).toLocaleDateString(undefined, {
+    return new Date(iso).toLocaleDateString(locale, {
       year: "numeric",
       month: "short",
       day: "numeric",
@@ -102,9 +106,10 @@ function renderBadgeList(
  */
 function renderDeniedColumns(
   map: Record<string, string[]> | undefined,
+  noneLabel: string,
 ): React.ReactNode {
   const entries = map ? Object.entries(map) : [];
-  if (!entries.length) return unrestrictedLabel("None");
+  if (!entries.length) return unrestrictedLabel(noneLabel);
   return (
     <SpaceBetween size="xxs">
       {entries.map(([table, cols]) => (
@@ -125,8 +130,14 @@ export const NamespacePermissions: React.FC = () => {
   const navigate = useNavigate();
   const { namespaceId = "" } = useParams<{ namespaceId: string }>();
   const { data: nsData } = useGetNamespace(namespaceId);
+  const { t } = useAppI18n();
   const ns = nsData?.namespace;
   const title = ns?.displayName ?? ns?.name ?? namespaceId;
+
+  useBreadcrumbTrail([
+    { text: title, href: `/namespaces/${namespaceId}`, namespaceId },
+    { text: t("Permissions") },
+  ]);
 
   return (
     <SpaceBetween size="m">
@@ -134,11 +145,11 @@ export const NamespacePermissions: React.FC = () => {
         variant="h1"
         actions={
           <Button onClick={() => navigate(`/namespaces/${namespaceId}`)}>
-            Back to namespace
+            {t("Back to namespace")}
           </Button>
         }
       >
-        {title} — Permissions
+        {t("{name} — Permissions", { name: title })}
       </Header>
       <PermissionsTabs namespaceId={namespaceId} />
     </SpaceBetween>
@@ -150,6 +161,7 @@ export const NamespacePermissions: React.FC = () => {
 const PermissionsTabs: React.FC<{ namespaceId: string }> = ({
   namespaceId,
 }) => {
+  const { locale, t } = useAppI18n();
   const {
     data: rolesData,
     isLoading: rolesLoading,
@@ -192,8 +204,8 @@ const PermissionsTabs: React.FC<{ namespaceId: string }> = ({
   );
 
   const memberColumns = useMemo(
-    () => makeMemberColumns(roleNameMap),
-    [roleNameMap],
+    () => makeMemberColumns(roleNameMap, locale, t),
+    [locale, roleNameMap, t],
   );
 
   const {
@@ -206,16 +218,18 @@ const PermissionsTabs: React.FC<{ namespaceId: string }> = ({
     filtering: {
       empty: grantsError ? (
         <StatusIndicator type="error">
-          Failed to load members: {grantsError.message}
+          {t("Failed to load members: {message}", {
+            message: grantsError.message,
+          })}
         </StatusIndicator>
       ) : (
         <Box textAlign="center" color="text-body-secondary">
-          No members in this namespace.
+          {t("No members in this namespace.")}
         </Box>
       ),
       noMatch: (
         <Box textAlign="center" color="text-body-secondary">
-          No members match the filter.
+          {t("No members match the filter.")}
         </Box>
       ),
     },
@@ -244,19 +258,24 @@ const PermissionsTabs: React.FC<{ namespaceId: string }> = ({
   ]);
 
   const roleColumns: TableProps.ColumnDefinition<RoleSummary>[] = [
-    { id: "name", header: "Role", isRowHeader: true, cell: (r) => r.name },
-    { id: "scope", header: "Scope", cell: (r) => r.scope ?? "—" },
+    {
+      id: "name",
+      header: t("Role"),
+      isRowHeader: true,
+      cell: (r) => r.name,
+    },
+    { id: "scope", header: t("Scope"), cell: (r) => r.scope ?? "—" },
     {
       id: "description",
-      header: "Description",
+      header: t("Description"),
       cell: (r) => r.description ?? "—",
     },
     {
       id: "builtIn",
-      header: "Built-in",
+      header: t("Built-in"),
       cell: (r) => (
         <StatusIndicator type={r.isBuiltIn ? "info" : "success"}>
-          {r.isBuiltIn ? "Yes" : "No"}
+          {r.isBuiltIn ? t("Yes") : t("No")}
         </StatusIndicator>
       ),
     },
@@ -279,9 +298,11 @@ const PermissionsTabs: React.FC<{ namespaceId: string }> = ({
         .filter((g): g is GrantSummary => g !== null);
       if (failed.length > 0) {
         setRevokeError(
-          `Failed to revoke ${failed.length} of ${results.length}: ${failed
-            .map((g) => g.principalId)
-            .join(", ")}`,
+          t("Failed to revoke {failed} of {total}: {principals}", {
+            failed: failed.length,
+            total: results.length,
+            principals: failed.map((g) => g.principalId).join(", "),
+          }),
         );
       } else {
         setRevokeError(null);
@@ -297,14 +318,14 @@ const PermissionsTabs: React.FC<{ namespaceId: string }> = ({
         tabs={[
           {
             id: "members",
-            label: `Members (${grants.length})`,
+            label: t("Members ({count})", { count: grants.length }),
             content: (
               <Table<GrantSummary>
                 {...collectionProps}
                 items={memberItems}
                 trackBy="grantId"
                 loading={grantsLoading}
-                loadingText="Loading members…"
+                loadingText={t("Loading members…")}
                 selectionType="multi"
                 selectedItems={selected}
                 onSelectionChange={({ detail }) =>
@@ -313,12 +334,16 @@ const PermissionsTabs: React.FC<{ namespaceId: string }> = ({
                 columnDefinitions={memberColumns}
                 variant="container"
                 ariaLabels={{
-                  tableLabel: "Namespace members",
-                  selectionGroupLabel: "Member selection",
+                  tableLabel: t("Namespace members"),
+                  selectionGroupLabel: t("Member selection"),
                   allItemsSelectionLabel: ({ selectedItems }) =>
-                    `${selectedItems.length} members selected`,
+                    t("{count} members selected", {
+                      count: selectedItems.length,
+                    }),
                   itemSelectionLabel: (_s, g) =>
-                    `Select grant for ${g.principalId}`,
+                    t("Select grant for {principal}", {
+                      principal: g.principalId ?? "—",
+                    }),
                 }}
                 header={
                   <Header
@@ -331,33 +356,35 @@ const PermissionsTabs: React.FC<{ namespaceId: string }> = ({
                           loading={isFetchingGrants}
                           onClick={() => refetchGrants()}
                         >
-                          Refresh
+                          {t("Refresh")}
                         </Button>
                         <Button
                           disabled={selected.length === 0}
                           loading={deleteGrant.isPending}
                           onClick={() => setConfirmRevokeVisible(true)}
                         >
-                          Revoke
+                          {t("Revoke")}
                         </Button>
                         <Button
                           variant="primary"
                           onClick={() => setGrantModalVisible(true)}
                         >
-                          Grant access
+                          {t("Grant access")}
                         </Button>
                       </SpaceBetween>
                     }
                   >
-                    Users with access to this namespace
+                    {t("Users with access to this namespace")}
                   </Header>
                 }
                 filter={
                   <TextFilter
                     {...filterProps}
-                    filteringAriaLabel="Filter members"
-                    filteringPlaceholder="Find members"
-                    countText={`${filteredItemsCount ?? 0} match${(filteredItemsCount ?? 0) === 1 ? "" : "es"}`}
+                    filteringAriaLabel={t("Filter members")}
+                    filteringPlaceholder={t("Find members")}
+                    countText={t("{count} matches", {
+                      count: filteredItemsCount ?? 0,
+                    })}
                   />
                 }
                 pagination={
@@ -368,28 +395,30 @@ const PermissionsTabs: React.FC<{ namespaceId: string }> = ({
           },
           {
             id: "roles",
-            label: `Roles (${roles.length})`,
+            label: t("Roles ({count})", { count: roles.length }),
             content: (
               <Table<RoleSummary>
                 variant="container"
                 items={roles}
                 trackBy="roleId"
                 loading={rolesLoading}
-                loadingText="Loading roles…"
+                loadingText={t("Loading roles…")}
                 columnDefinitions={roleColumns}
                 header={
                   <Header variant="h2" counter={`(${roles.length})`}>
-                    Namespace roles
+                    {t("Namespace roles")}
                   </Header>
                 }
                 empty={
                   rolesError ? (
                     <StatusIndicator type="error">
-                      Failed to load roles: {rolesError.message}
+                      {t("Failed to load roles: {message}", {
+                        message: rolesError.message,
+                      })}
                     </StatusIndicator>
                   ) : (
                     <Box textAlign="center" color="text-body-secondary">
-                      No roles defined for this namespace.
+                      {t("No roles defined for this namespace.")}
                     </Box>
                   )
                 }
@@ -410,7 +439,7 @@ const PermissionsTabs: React.FC<{ namespaceId: string }> = ({
       <Modal
         visible={confirmRevokeVisible}
         onDismiss={() => setConfirmRevokeVisible(false)}
-        header="Confirm revoke"
+        header={t("Confirm revoke")}
         footer={
           <Box float="right">
             <SpaceBetween direction="horizontal" size="xs">
@@ -418,14 +447,14 @@ const PermissionsTabs: React.FC<{ namespaceId: string }> = ({
                 variant="link"
                 onClick={() => setConfirmRevokeVisible(false)}
               >
-                Cancel
+                {t("Cancel")}
               </Button>
               <Button
                 variant="primary"
                 loading={deleteGrant.isPending}
                 onClick={handleRevoke}
               >
-                Revoke
+                {t("Revoke")}
               </Button>
             </SpaceBetween>
           </Box>
@@ -436,9 +465,12 @@ const PermissionsTabs: React.FC<{ namespaceId: string }> = ({
             <StatusIndicator type="error">{revokeError}</StatusIndicator>
           )}
           <Box>
-            Are you sure you want to revoke access for{" "}
-            <strong>{selected.length}</strong>{" "}
-            {selected.length === 1 ? "principal" : "principals"}?
+            {t(
+              "Are you sure you want to revoke access for {count} principals?",
+              {
+                count: selected.length,
+              },
+            )}
           </Box>
           {selected.map((g) => (
             <Box key={g.grantId} variant="code">
@@ -456,40 +488,50 @@ const PermissionsTabs: React.FC<{ namespaceId: string }> = ({
 
 function makeMemberColumns(
   roleNameMap: Map<string, string>,
+  locale: string,
+  t: Translate,
 ): TableProps.ColumnDefinition<GrantSummary>[] {
   return [
     {
       id: "principalId",
-      header: "Principal",
+      header: t("Principal"),
       cell: (g) => g.principalId,
       isRowHeader: true,
     },
-    { id: "principalType", header: "Type", cell: (g) => g.principalType },
+    {
+      id: "principalType",
+      header: t("Type"),
+      cell: (g) => g.principalType,
+    },
     {
       id: "role",
-      header: "Role",
+      header: t("Role"),
       cell: (g) => (g.role ? (roleNameMap.get(g.role) ?? g.role) : "—"),
     },
-    { id: "grantedBy", header: "Granted by", cell: (g) => g.grantedBy },
+    {
+      id: "grantedBy",
+      header: t("Granted by"),
+      cell: (g) => g.grantedBy,
+    },
     {
       id: "grantedAt",
-      header: "Granted at",
-      cell: (g) => formatDate(g.grantedAt),
+      header: t("Granted at"),
+      cell: (g) => formatDate(g.grantedAt, locale),
     },
     {
       id: "allowedTables",
-      header: "Allowed tables",
-      cell: (g) => renderBadgeList(g.tableAllowlist, "blue", "All"),
+      header: t("Allowed tables"),
+      cell: (g) => renderBadgeList(g.tableAllowlist, "blue", t("All")),
     },
     {
       id: "allowedMetrics",
-      header: "Allowed metrics",
-      cell: (g) => renderBadgeList(g.allowedMetrics, "blue", "All"),
+      header: t("Allowed metrics"),
+      cell: (g) => renderBadgeList(g.allowedMetrics, "blue", t("All")),
     },
     {
       id: "deniedColumns",
-      header: "Denied columns",
-      cell: (g) => renderDeniedColumns(g.columnDenylist),
+      header: t("Denied columns"),
+      cell: (g) => renderDeniedColumns(g.columnDenylist, t("None")),
     },
   ];
 }
@@ -504,11 +546,6 @@ interface CreateGrantModalProps {
   onDismiss: () => void;
 }
 
-const PRINCIPAL_TYPE_OPTIONS = [
-  { value: PrincipalType.USER, label: "User" },
-  { value: PrincipalType.GROUP, label: "Group" },
-];
-
 const CreateGrantModal: React.FC<CreateGrantModalProps> = ({
   namespaceId,
   roles,
@@ -516,9 +553,15 @@ const CreateGrantModal: React.FC<CreateGrantModalProps> = ({
   visible,
   onDismiss,
 }) => {
-  const [principalType, setPrincipalType] = useState(
-    PRINCIPAL_TYPE_OPTIONS[0]!,
+  const { t } = useAppI18n();
+  const principalTypeOptions = useMemo(
+    () => [
+      { value: PrincipalType.USER, label: t("User") },
+      { value: PrincipalType.GROUP, label: t("Group") },
+    ],
+    [t],
   );
+  const [principalType, setPrincipalType] = useState(principalTypeOptions[0]!);
   const [principalId, setPrincipalId] = useState("");
   const [selectedRole, setSelectedRole] = useState<SelectProps.Option | null>(
     null,
@@ -545,7 +588,7 @@ const CreateGrantModal: React.FC<CreateGrantModalProps> = ({
 
   React.useEffect(() => {
     if (visible) {
-      setPrincipalType(PRINCIPAL_TYPE_OPTIONS[0]!);
+      setPrincipalType(principalTypeOptions[0]!);
       setPrincipalId("");
       setSelectedRole(null);
       setTableAllowlist([]);
@@ -553,15 +596,17 @@ const CreateGrantModal: React.FC<CreateGrantModalProps> = ({
       setAllowedMetrics([]);
       setError(null);
     }
-  }, [visible]);
+  }, [visible, principalTypeOptions]);
 
   const validatePrincipalId = (): string | null => {
-    if (!principalId.trim()) return "Principal ID is required";
+    if (!principalId.trim()) return t("Principal ID is required");
     if (principalType.value === PrincipalType.USER) {
       if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(principalId))
-        return "Please enter a valid email address";
+        return t("Please enter a valid email address");
     } else if (!/^[\w.-]+$/.test(principalId)) {
-      return "Group name may only contain letters, numbers, hyphens, underscores, and dots";
+      return t(
+        "Group name may only contain letters, numbers, hyphens, underscores, and dots",
+      );
     }
     return null;
   };
@@ -591,7 +636,7 @@ const CreateGrantModal: React.FC<CreateGrantModalProps> = ({
       },
       {
         onSuccess: () => onDismiss(),
-        onError: (e) => setError(e.message ?? "Failed to create grant"),
+        onError: (e) => setError(e.message ?? t("Failed to create grant")),
       },
     );
   };
@@ -600,12 +645,12 @@ const CreateGrantModal: React.FC<CreateGrantModalProps> = ({
     <Modal
       visible={visible}
       onDismiss={onDismiss}
-      header="Grant access"
+      header={t("Grant access")}
       footer={
         <Box float="right">
           <SpaceBetween direction="horizontal" size="xs">
             <Button variant="link" onClick={onDismiss}>
-              Cancel
+              {t("Cancel")}
             </Button>
             <Button
               variant="primary"
@@ -613,7 +658,7 @@ const CreateGrantModal: React.FC<CreateGrantModalProps> = ({
               loading={createGrant.isPending}
               disabled={!principalId || !selectedRole}
             >
-              Grant
+              {t("Grant")}
             </Button>
           </SpaceBetween>
         </Box>
@@ -621,18 +666,20 @@ const CreateGrantModal: React.FC<CreateGrantModalProps> = ({
     >
       <SpaceBetween size="l">
         {error && <StatusIndicator type="error">{error}</StatusIndicator>}
-        <FormField label="Type">
+        <FormField label={t("Type")}>
           <Select
             selectedOption={principalType}
             onChange={({ detail }) =>
               setPrincipalType(detail.selectedOption as typeof principalType)
             }
-            options={PRINCIPAL_TYPE_OPTIONS}
+            options={principalTypeOptions}
           />
         </FormField>
         <FormField
           label={
-            principalType.value === PrincipalType.USER ? "Email" : "Group name"
+            principalType.value === PrincipalType.USER
+              ? t("Email")
+              : t("Group name")
           }
         >
           <Input
@@ -646,31 +693,35 @@ const CreateGrantModal: React.FC<CreateGrantModalProps> = ({
           />
         </FormField>
         <FormField
-          label="Role"
-          errorText={rolesError ? "Failed to load roles" : undefined}
+          label={t("Role")}
+          errorText={rolesError ? t("Failed to load roles") : undefined}
         >
           <Select
             selectedOption={selectedRole}
             onChange={({ detail }) => setSelectedRole(detail.selectedOption)}
             options={roleOptions}
-            placeholder="Select a role"
-            empty="No roles available"
+            placeholder={t("Select a role")}
+            empty={t("No roles available")}
           />
         </FormField>
         <FormField
-          label="Table allowlist"
-          description="Optional. Tables the principal may query. Add one per chip; blank means no table restriction."
+          label={t("Table allowlist")}
+          description={t(
+            "Optional. Tables the principal may query. Add one per chip; blank means no table restriction.",
+          )}
         >
           <TokenInput
             value={tableAllowlist}
             onChange={setTableAllowlist}
             placeholder="orders"
-            ariaLabel="Table allowlist"
+            ariaLabel={t("Table allowlist")}
           />
         </FormField>
         <FormField
-          label="Column denylist"
-          description="Optional. Per table, the columns the principal may not read."
+          label={t("Column denylist")}
+          description={t(
+            "Optional. Per table, the columns the principal may not read.",
+          )}
         >
           <ColumnDenylistEditor
             value={columnDenylistRows}
@@ -678,14 +729,16 @@ const CreateGrantModal: React.FC<CreateGrantModalProps> = ({
           />
         </FormField>
         <FormField
-          label="Allowed metrics"
-          description="Optional. Metrics the principal may read. Add one per chip."
+          label={t("Allowed metrics")}
+          description={t(
+            "Optional. Metrics the principal may read. Add one per chip.",
+          )}
         >
           <TokenInput
             value={allowedMetrics}
             onChange={setAllowedMetrics}
             placeholder="revenue"
-            ariaLabel="Allowed metrics"
+            ariaLabel={t("Allowed metrics")}
           />
         </FormField>
       </SpaceBetween>

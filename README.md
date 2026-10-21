@@ -16,7 +16,7 @@ Access is governed by namespace isolation and role-based access control: namespa
 
 ### Prerequisites
 
-- Python 3.12, Node.js 22+, Docker
+- Python 3.12, Node.js 22.23.4+, Docker
 - [pnpm](https://pnpm.io/) (Node package manager — installed via `mise` or `npm install -g pnpm`)
 - Java 17–24 (21 recommended) and Gradle (for Smithy codegen), plus Maven (for the
   Databricks connector `make deploy-dev` builds). JDK 25+ is not supported yet: the Athena
@@ -66,6 +66,7 @@ semantic-context/
 ├── libs/common/         # Shared Python config, logging, exceptions
 ├── libs/ts-shared/      # Shared TypeScript interfaces and constants
 ├── connectors/          # Athena federation connectors: toolkit, reference connector, Databricks
+├── coa-skills/          # Agent skills for driving a deployed COA (control-plane)
 ├── scripts/             # CI-agnostic build/test/deploy scripts
 └── external-docs/       # Published documentation (getting-started, deployment guides)
 ```

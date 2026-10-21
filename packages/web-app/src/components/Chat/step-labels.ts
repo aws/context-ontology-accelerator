@@ -1,6 +1,9 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import type { AppMessage } from "../../i18n/appMessages";
+import type { AppTranslate } from "../../i18n/LocaleProvider";
+
 /**
  * Canonical trace step taxonomy → human-readable labels.
  *
@@ -15,7 +18,7 @@
  */
 
 /** Short, present-tense labels shown while a step is the current/live step. */
-export const STEP_LABELS: Record<string, string> = {
+export const STEP_LABELS: Readonly<Record<string, AppMessage>> = {
   "t1.metric_match": "Searching metric catalog",
   "t1.execute": "Running query",
   "query.embed": "Embedding query",
@@ -57,7 +60,7 @@ export const STEP_LABELS: Record<string, string> = {
 };
 
 /** Noun-phrase labels shown in the detailed execution plan (RationalePanel). */
-export const STEP_DISPLAY_NAMES: Record<string, string> = {
+export const STEP_DISPLAY_NAMES: Readonly<Record<string, AppMessage>> = {
   "t1.metric_match": "Match metric",
   "t1.authorize": "Cedar authorize",
   "t1.firewall": "SQL Firewall",
@@ -91,6 +94,73 @@ export const STEP_DISPLAY_NAMES: Record<string, string> = {
   // to the t3.* taxonomy); labeled explicitly so it doesn't fall back to raw.
   lexical_baseline_retrieve: "Lexical retrieval",
 };
+
+/**
+ * Labels historically produced by humanizeStepId and used by the compact trace
+ * panel/table. Keep their English copy stable while making known backend step
+ * IDs translatable. Unknown extension step IDs still use the generic fallback.
+ */
+const TRACE_STEP_NAMES = {
+  "t1.metric_match": "Metric Match",
+  "t1.authorize": "Authorize",
+  "t1.firewall": "Firewall",
+  "t1.execute": "Execute",
+  "query.embed": "Embed",
+  "routing.select": "Select",
+  "t2.sql.generate": "Sql Generate",
+  "t2.sql.authorize": "Sql Authorize",
+  "t2.sql.firewall": "Sql Firewall",
+  "t2.sql.execute": "Sql Execute",
+  "t2.sql.failed": "Sql Failed",
+  "t2.vkg.context": "Vkg Context",
+  "t2.vkg.translate": "Vkg Translate",
+  "t2.vkg.validate": "Vkg Validate",
+  "t2.vkg.compile": "Vkg Compile",
+  "t2.vkg.retry": "Vkg Retry",
+  "t2.vkg.authorize": "Vkg Authorize",
+  "t2.vkg.firewall": "Vkg Firewall",
+  "t2.vkg.execute": "Vkg Execute",
+  "t2.vkg.failed": "Vkg Failed",
+  "t2.strategy_selected": "Strategy Selected",
+  "t3.retrieve": "Retrieve",
+  "t3.vector_search": "Vector Search",
+  "t3.graph_traverse": "Graph Traverse",
+  "t3.catalog_context": "Catalog Context",
+  "t3.synthesize": "Synthesize",
+  "t3.guardrail": "Guardrail",
+  "response.assemble": "Response Assemble",
+  lexical_baseline_retrieve: "Lexical Baseline Retrieve",
+  agentic_session_start: "Agentic Session Start",
+  decompose: "Decompose",
+  subquestion_start: "Subquestion Start",
+  next_step_select: "Next Step Select",
+  tools_gated: "Tools Gated",
+  ontology_resolved: "Ontology Resolved",
+  ontology_edge_filter: "Ontology Edge Filter",
+  present_edges_discovered: "Present Edges Discovered",
+  exploration_branch: "Exploration Branch",
+  no_progress_step: "No Progress Step",
+  ad_hoc_query: "Ad Hoc Query",
+  agentic_working_answer: "Agentic Working Answer",
+  agentic_final_semantic_search: "Agentic Final Semantic Search",
+  agentic_retrieval_stop: "Agentic Retrieval Stop",
+  llm_synthesize: "Llm Synthesize",
+} satisfies Record<string, AppMessage>;
+
+export function localizeLiveStep(t: AppTranslate, stepId: string): string {
+  const message = STEP_LABELS[stepId as keyof typeof STEP_LABELS];
+  return message ? t(message) : humanizeStepId(stepId);
+}
+
+export function localizeDisplayStep(t: AppTranslate, stepId: string): string {
+  const message = STEP_DISPLAY_NAMES[stepId as keyof typeof STEP_DISPLAY_NAMES];
+  return message ? t(message) : humanizeStepId(stepId);
+}
+
+export function localizeTraceStep(t: AppTranslate, stepId: string): string {
+  const message = TRACE_STEP_NAMES[stepId as keyof typeof TRACE_STEP_NAMES];
+  return message ? t(message) : humanizeStepId(stepId);
+}
 
 /**
  * Steps hidden from the inline TracePanel summary unless they failed/denied —
@@ -145,6 +215,29 @@ export function humanizeStepId(stepId: string): string {
     .replace(/\./g, " ")
     .replace(/_/g, " ")
     .replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+/**
+ * Title for a Tier 2 result, reflecting which strategy/strategies ran.
+ * Both strategies are structured-query strategies; name them in parallel:
+ * NL→SQL (generates SQL) and VKG (Ontop) (generates SPARQL → SQL).
+ * Shared by the Rationale panel and the Trace detail page so both name the
+ * strategy the same way.
+ */
+export function tier2Title(
+  t: AppTranslate,
+  trace: readonly { step: string }[],
+): string {
+  const hasSql = trace.some((s) => s.step.startsWith("t2.sql."));
+  const hasVkg = trace.some((s) => s.step.startsWith("t2.vkg."));
+  const strategies: string[] = [];
+  if (hasSql) strategies.push("NL→SQL");
+  if (hasVkg) strategies.push("VKG (Ontop)");
+  return strategies.length
+    ? t("Tier 2 — Structured Query ({strategies})", {
+        strategies: strategies.join(" + "),
+      })
+    : t("Tier 2 — Structured Query");
 }
 
 /**
