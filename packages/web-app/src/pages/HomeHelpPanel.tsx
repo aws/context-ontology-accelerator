@@ -5,10 +5,12 @@ import React from "react";
 import HelpPanel from "@cloudscape-design/components/help-panel";
 import Box from "@cloudscape-design/components/box";
 import Icon from "@cloudscape-design/components/icon";
+import { useAppI18n } from "../i18n/LocaleProvider";
+import type { AppMessage } from "../i18n/appMessages";
 
 interface Step {
-  title: string;
-  description: string;
+  title: AppMessage;
+  description: AppMessage;
   status: "active" | "pending" | "complete";
 }
 
@@ -55,78 +57,81 @@ const StepIndicator: React.FC<{ status: Step["status"] }> = ({ status }) => {
   );
 };
 
-export const HomeHelpPanel: React.FC = () => (
-  <HelpPanel header={<h2>Get started</h2>}>
-    <p>Set up your governed context layer in a few steps.</p>
+export const HomeHelpPanel: React.FC = () => {
+  const { t } = useAppI18n();
+  return (
+    <HelpPanel header={<h2>{t("Get started")}</h2>}>
+      <p>{t("Set up your governed context layer in a few steps.")}</p>
 
-    <div
-      style={{
-        display: "grid",
-        gridTemplateColumns: "20px 1fr",
-        gap: "0 12px",
-        marginTop: 16,
-      }}
-    >
-      {STEPS.map((step, i) => {
-        const isLast = i === STEPS.length - 1;
-        const dimmed = step.status === "pending";
-        return (
-          <React.Fragment key={step.title}>
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                height: 20,
-                opacity: dimmed ? 0.45 : undefined,
-              }}
-            >
-              <StepIndicator status={step.status} />
-            </div>
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                height: 20,
-                opacity: dimmed ? 0.45 : undefined,
-              }}
-            >
-              <Box fontWeight="bold">{step.title}</Box>
-            </div>
-
-            {!isLast && (
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "20px 1fr",
+          gap: "0 12px",
+          marginTop: 16,
+        }}
+      >
+        {STEPS.map((step, i) => {
+          const isLast = i === STEPS.length - 1;
+          const dimmed = step.status === "pending";
+          return (
+            <React.Fragment key={step.title}>
               <div
                 style={{
                   display: "flex",
+                  alignItems: "center",
                   justifyContent: "center",
+                  height: 20,
                   opacity: dimmed ? 0.45 : undefined,
                 }}
               >
+                <StepIndicator status={step.status} />
+              </div>
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  height: 20,
+                  opacity: dimmed ? 0.45 : undefined,
+                }}
+              >
+                <Box fontWeight="bold">{t(step.title)}</Box>
+              </div>
+
+              {!isLast && (
                 <div
                   style={{
-                    width: 2,
-                    height: "100%",
-                    backgroundColor:
-                      "var(--color-border-divider-default, #e9ebed)",
+                    display: "flex",
+                    justifyContent: "center",
+                    opacity: dimmed ? 0.45 : undefined,
                   }}
-                />
-              </div>
-            )}
-            {isLast && <div />}
+                >
+                  <div
+                    style={{
+                      width: 2,
+                      height: "100%",
+                      backgroundColor:
+                        "var(--color-border-divider-default, #e9ebed)",
+                    }}
+                  />
+                </div>
+              )}
+              {isLast && <div />}
 
-            <div
-              style={{
-                padding: isLast ? "4px 0 0" : "4px 0 20px",
-                opacity: dimmed ? 0.45 : undefined,
-              }}
-            >
-              <Box variant="small" color="text-body-secondary">
-                {step.description}
-              </Box>
-            </div>
-          </React.Fragment>
-        );
-      })}
-    </div>
-  </HelpPanel>
-);
+              <div
+                style={{
+                  padding: isLast ? "4px 0 0" : "4px 0 20px",
+                  opacity: dimmed ? 0.45 : undefined,
+                }}
+              >
+                <Box variant="small" color="text-body-secondary">
+                  {t(step.description)}
+                </Box>
+              </div>
+            </React.Fragment>
+          );
+        })}
+      </div>
+    </HelpPanel>
+  );
+};

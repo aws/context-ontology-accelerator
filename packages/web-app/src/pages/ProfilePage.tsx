@@ -24,27 +24,35 @@ import {
 } from "@coa/control-plane-client";
 import { useUser } from "@auth/index";
 import { useListPrincipalGrants, useListPlatformRoles } from "@api-hooks/index";
+import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
 import { useCurrentNamespace } from "@components/NamespaceProvider";
 import { useControlPlaneClient } from "@components/ControlPlaneClientProvider";
 import { formatTimestamp } from "@utils/helpers";
+import { useAppI18n, type AppTranslate } from "../i18n/LocaleProvider";
 
-const nsColumns: TableProps.ColumnDefinition<NamespaceSummary>[] = [
-  {
-    id: "name",
-    header: "Namespace",
-    cell: (n) => n.displayName ?? n.name ?? "",
-    isRowHeader: true,
-  },
-  { id: "status", header: "Status", cell: (n) => n.status ?? "—" },
-  {
-    id: "sources",
-    header: "Sources",
-    cell: (n) => n.sourceCount ?? 0,
-  },
-];
+function namespaceColumns(
+  t: AppTranslate,
+): TableProps.ColumnDefinition<NamespaceSummary>[] {
+  return [
+    {
+      id: "name",
+      header: t("Namespace"),
+      cell: (n) => n.displayName ?? n.name ?? "",
+      isRowHeader: true,
+    },
+    { id: "status", header: t("Status"), cell: (n) => n.status ?? "—" },
+    {
+      id: "sources",
+      header: t("Sources"),
+      cell: (n) => n.sourceCount ?? 0,
+    },
+  ];
+}
 
 export const ProfilePage: React.FC = () => {
+  const { t } = useAppI18n();
   const { user } = useUser();
+  useBreadcrumbTrail([{ text: t("Profile") }]);
   const client = useControlPlaneClient();
   const { namespaces } = useCurrentNamespace();
   const {
@@ -91,7 +99,7 @@ export const ProfilePage: React.FC = () => {
       console.error("Failed to load role details", { grant, error: err });
       setRoleDetail({
         name: grant.role,
-        description: "Failed to load role details.",
+        description: t("Failed to load role details."),
       } as unknown as RoleDetail);
     } finally {
       setDetailLoading(false);
@@ -101,36 +109,44 @@ export const ProfilePage: React.FC = () => {
   const grantColumns: TableProps.ColumnDefinition<GrantSummary>[] = [
     {
       id: "role",
-      header: "Role",
+      header: t("Role"),
       isRowHeader: true,
       cell: (g) => <Link onFollow={() => handleRoleClick(g)}>{g.role}</Link>,
     },
     {
       id: "principalType",
-      header: "Principal type",
+      header: t("Principal type"),
       cell: (g) => g.principalType ?? "—",
     },
-    { id: "namespace", header: "Namespace", cell: (g) => g.namespaceId ?? "—" },
+    {
+      id: "namespace",
+      header: t("Namespace"),
+      cell: (g) => g.namespaceId ?? "—",
+    },
     {
       id: "grantedAt",
-      header: "Granted at",
+      header: t("Granted at"),
       cell: (g) => formatTimestamp(g.grantedAt),
     },
-    { id: "grantedBy", header: "Granted by", cell: (g) => g.grantedBy ?? "—" },
+    {
+      id: "grantedBy",
+      header: t("Granted by"),
+      cell: (g) => g.grantedBy ?? "—",
+    },
   ];
 
   return (
     <SpaceBetween size="l">
-      <Header variant="h1">Profile</Header>
+      <Header variant="h1">{t("Profile")}</Header>
 
-      <Container header={<Header variant="h2">Identity</Header>}>
+      <Container header={<Header variant="h2">{t("Identity")}</Header>}>
         <KeyValuePairs
           columns={3}
           items={[
-            { label: "Name", value: user.name || "—" },
-            { label: "Email", value: user.email || "—" },
+            { label: t("Name"), value: user.name || "—" },
+            { label: t("Email"), value: user.email || "—" },
             {
-              label: "Group / Team",
+              label: t("Group / Team"),
               value:
                 user.groups.length > 0 ? (
                   <SpaceBetween direction="horizontal" size="xs">
@@ -150,7 +166,7 @@ export const ProfilePage: React.FC = () => {
         tabs={[
           {
             id: "roles",
-            label: `Roles (${grants.length})`,
+            label: t("Roles ({count})", { count: grants.length }),
             content: (
               <SpaceBetween size="s">
                 {/* A failed grants query must not read as "you have no roles":
@@ -158,7 +174,7 @@ export const ProfilePage: React.FC = () => {
                     unprivileged account, which is the same silent-wrong-view
                     failure the handler's fan-out fix removes server-side. */}
                 {grantsError && (
-                  <Alert type="error" header="Failed to load your roles">
+                  <Alert type="error" header={t("Failed to load your roles")}>
                     {grantsError.message}
                   </Alert>
                 )}
@@ -168,7 +184,7 @@ export const ProfilePage: React.FC = () => {
                   columnDefinitions={grantColumns}
                   trackBy="grantId"
                   loading={grantsLoading}
-                  loadingText="Loading roles..."
+                  loadingText={t("Loading roles...")}
                   header={
                     <Header
                       variant="h2"
@@ -179,18 +195,18 @@ export const ProfilePage: React.FC = () => {
                           loading={isFetchingGrants}
                           onClick={() => refetchGrants()}
                         >
-                          Refresh
+                          {t("Refresh")}
                         </Button>
                       }
                     >
-                      Your roles
+                      {t("Your roles")}
                     </Header>
                   }
                   empty={
                     <Box textAlign="center" color="text-body-secondary">
                       {grantsError
-                        ? "Roles could not be loaded."
-                        : "No roles assigned."}
+                        ? t("Roles could not be loaded.")
+                        : t("No roles assigned.")}
                     </Box>
                   }
                 />
@@ -199,21 +215,21 @@ export const ProfilePage: React.FC = () => {
           },
           {
             id: "namespaces",
-            label: `Namespaces (${namespaces.length})`,
+            label: t("Namespaces ({count})", { count: namespaces.length }),
             content: (
               <Table<NamespaceSummary>
                 variant="container"
                 items={namespaces}
-                columnDefinitions={nsColumns}
+                columnDefinitions={namespaceColumns(t)}
                 trackBy="namespaceId"
                 header={
                   <Header variant="h2" counter={`(${namespaces.length})`}>
-                    Namespace memberships
+                    {t("Namespace memberships")}
                   </Header>
                 }
                 empty={
                   <Box textAlign="center" color="text-body-secondary">
-                    No namespace memberships.
+                    {t("No namespace memberships.")}
                   </Box>
                 }
               />
@@ -225,7 +241,7 @@ export const ProfilePage: React.FC = () => {
       <Modal
         visible={roleDetail !== null}
         onDismiss={() => setRoleDetail(null)}
-        header={roleDetail?.name ?? "Role details"}
+        header={roleDetail?.name ?? t("Role details")}
         size="large"
       >
         {detailLoading ? (
@@ -235,17 +251,22 @@ export const ProfilePage: React.FC = () => {
             <KeyValuePairs
               columns={2}
               items={[
-                { label: "Role", value: roleDetail.name ?? "—" },
-                { label: "Scope", value: roleDetail.scope ?? "—" },
-                { label: "Description", value: roleDetail.description ?? "—" },
+                { label: t("Role"), value: roleDetail.name ?? "—" },
+                { label: t("Scope"), value: roleDetail.scope ?? "—" },
                 {
-                  label: "Built-in",
-                  value: roleDetail.isBuiltIn ? "Yes" : "No",
+                  label: t("Description"),
+                  value: roleDetail.description ?? "—",
+                },
+                {
+                  label: t("Built-in"),
+                  value: roleDetail.isBuiltIn ? t("Yes") : t("No"),
                 },
               ]}
             />
             {roleDetail.cedarPolicy && (
-              <Container header={<Header variant="h3">Cedar policy</Header>}>
+              <Container
+                header={<Header variant="h3">{t("Cedar policy")}</Header>}
+              >
                 <Box variant="code">
                   <pre style={{ whiteSpace: "pre-wrap", margin: 0 }}>
                     {roleDetail.cedarPolicy}

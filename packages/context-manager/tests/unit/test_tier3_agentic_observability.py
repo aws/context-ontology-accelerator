@@ -260,6 +260,7 @@ class TestOrderedTrace:
         assert step_names(trace.steps) == [
             "agentic_session_start",
             "decompose",
+            "answer_language",  # resolved once, before the loop
             "subquestion_start",  # root
             "next_step_select",  # root: chose the strategy tool
             "strategy:entity_based",  # the per-tool invocation
@@ -416,9 +417,10 @@ class TestStepsSurviveEarlyTermination:
 
         names = step_names(trace.steps)
         # The early-termination path still ran the first sub-question's steps...
-        assert names[:5] == [
+        assert names[:6] == [
             "agentic_session_start",
             "decompose",
+            "answer_language",
             "subquestion_start",
             "next_step_select",
             "strategy:entity_based",

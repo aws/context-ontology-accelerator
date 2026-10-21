@@ -296,8 +296,8 @@ export class ServeStack extends SCLStack {
         // index.py imports coa_common (resolve_region); include
         // libs/common/src + its runtime deps or the Lambda fails at import
         // with Runtime.ImportModuleError: No module named
-        // 'coa_common'. Bare names (no `>=`) avoid the shell
-        // treating the version spec as an output redirect during local bundling.
+        // 'coa_common'. Each dep is single-quoted in the install command, so a
+        // `>=` spec is not read as a shell redirect.
         fromRoot("libs/common/src"),
       ],
       pipDeps: [
@@ -309,6 +309,8 @@ export class ServeStack extends SCLStack {
         "PyJWT",
         "requests",
         "structlog",
+        // First certifi without the roots behind the compromised emSign intermediates.
+        "certifi>=2026.10.19",
       ],
       architecture: "arm64",
     });

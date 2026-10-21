@@ -11,9 +11,18 @@ This guide walks you through deploying Context Ontology Accelerator into your AW
 | Node.js | 22+ | CDK CLI, web-app build |
 | Python | 3.12 | Backend services |
 | pnpm | 10+ | TypeScript package management |
-| uv | 0.4+ | Python package management |
+| uv | 0.5.14+ | Python package management |
 | Java | 17+ | Smithy code generation |
-| Docker | — | Container image builds |
+| Docker or Finch | — | Container image builds (required) |
+
+A running container engine is required: the MCP, Ontology, Serve, Sources and
+VKG stacks build container images, and there is no fallback without one. The
+preflight check stops the deploy when it finds no running engine. It uses
+`CDK_DOCKER` when set, otherwise a running Finch, otherwise Docker.
+
+If you know no container image changed since the last deploy, CDK reuses the
+images already in ECR and needs no engine. Set `SCL_ALLOW_NO_CONTAINER_ENGINE=1`
+to deploy without one; any changed image still fails the deploy at build time.
 
 ### Cross-architecture container builds
 
@@ -323,7 +332,7 @@ curl https://mise.run | sh
 mise install
 
 # make setup runs smithy-generate.sh (make generate) + setup-dev.sh
-# (uv sync --all-packages, pnpm install, pre-commit hooks)
+# (uv sync --all-packages, pnpm install --frozen-lockfile, pre-commit hooks)
 make setup
 ```
 

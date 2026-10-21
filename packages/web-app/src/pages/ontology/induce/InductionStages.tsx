@@ -5,6 +5,8 @@ import Box from "@cloudscape-design/components/box";
 import Popover from "@cloudscape-design/components/popover";
 import SpaceBetween from "@cloudscape-design/components/space-between";
 import StatusIndicator from "@cloudscape-design/components/status-indicator";
+import { useAppI18n } from "../../../i18n/LocaleProvider";
+import type { AppMessage } from "../../../i18n/appMessages";
 
 /**
  * Induction job stages — mirrors the Smithy ``InductionJobStatus`` enum
@@ -20,9 +22,9 @@ import StatusIndicator from "@cloudscape-design/components/status-indicator";
 
 interface Stage {
   id: string;
-  label: string;
+  label: AppMessage;
   /** Plain-language explanation of what this stage does, shown on hover/click. */
-  info: string;
+  info: AppMessage;
 }
 
 const STAGES: Stage[] = [
@@ -68,6 +70,7 @@ interface Props {
 }
 
 export function InductionStages({ status, error }: Props) {
+  const { t } = useAppI18n();
   // Map the status string to its index in STAGES. ``pending`` comes
   // before any stage runs (index -1). ``completed`` is after the last
   // stage (length).
@@ -96,7 +99,11 @@ export function InductionStages({ status, error }: Props) {
               size="xs"
               alignItems="center"
             >
-              <StageDot label={stage.label} info={stage.info} state={state} />
+              <StageDot
+                label={t(stage.label)}
+                info={t(stage.info)}
+                state={state}
+              />
               {i < STAGES.length - 1 && (
                 <span
                   style={{

@@ -70,7 +70,7 @@ jobs:
       # Node is needed here even though nothing else in this job uses pnpm.
       - uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: "22.23.4"
 
       - name: Generate Smithy artifacts
         run: |
