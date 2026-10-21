@@ -17,6 +17,7 @@ import React from "react";
 import AttributeEditor from "@cloudscape-design/components/attribute-editor";
 import Input from "@cloudscape-design/components/input";
 import { TokenInput } from "@components/TokenInput";
+import { useAppI18n } from "../../i18n/LocaleProvider";
 
 export interface ColumnDenylistRow {
   table: string;
@@ -34,6 +35,7 @@ export const ColumnDenylistEditor: React.FC<ColumnDenylistEditorProps> = ({
   onChange,
   disabled = false,
 }) => {
+  const { t } = useAppI18n();
   const updateRow = (index: number, patch: Partial<ColumnDenylistRow>) => {
     onChange(value.map((row, i) => (i === index ? { ...row, ...patch } : row)));
   };
@@ -41,9 +43,9 @@ export const ColumnDenylistEditor: React.FC<ColumnDenylistEditorProps> = ({
   return (
     <AttributeEditor<ColumnDenylistRow>
       items={value}
-      addButtonText="Add table"
-      removeButtonText="Remove"
-      empty="No column restrictions. Add a table to deny specific columns."
+      addButtonText={t("Add table")}
+      removeButtonText={t("Remove")}
+      empty={t("No column restrictions. Add a table to deny specific columns.")}
       disableAddButton={disabled}
       onAddButtonClick={() => onChange([...value, { table: "", columns: [] }])}
       onRemoveButtonClick={({ detail }) =>
@@ -51,7 +53,7 @@ export const ColumnDenylistEditor: React.FC<ColumnDenylistEditorProps> = ({
       }
       definition={[
         {
-          label: "Table",
+          label: t("Table"),
           control: (item, index) => (
             <Input
               value={item.table}
@@ -59,19 +61,19 @@ export const ColumnDenylistEditor: React.FC<ColumnDenylistEditorProps> = ({
                 updateRow(index, { table: detail.value })
               }
               placeholder="customers"
-              ariaLabel={`Table name for row ${index + 1}`}
+              ariaLabel={t("Table name for row {row}", { row: index + 1 })}
               disabled={disabled}
             />
           ),
         },
         {
-          label: "Denied columns",
+          label: t("Denied columns"),
           control: (item, index) => (
             <TokenInput
               value={item.columns}
               onChange={(columns) => updateRow(index, { columns })}
               placeholder="ssn"
-              ariaLabel={`Denied columns for row ${index + 1}`}
+              ariaLabel={t("Denied columns for row {row}", { row: index + 1 })}
               disabled={disabled}
             />
           ),

@@ -13,6 +13,7 @@ import {
 } from "@cloudscape-design/components";
 import { RuntimeConfigContext } from "@components/RuntimeContext";
 import { OIDCProvider } from "@auth";
+import { useAppI18n } from "../i18n/LocaleProvider";
 
 interface LoginPageProps {
   title: string;
@@ -21,6 +22,7 @@ interface LoginPageProps {
 export const LoginPage: React.FC<LoginPageProps> = ({ title }) => {
   const runtimeContext = useContext(RuntimeConfigContext);
   const [error, setError] = useState<string | null>(null);
+  const { t } = useAppI18n();
 
   const handleSignIn = async () => {
     if (!runtimeContext?.oidcConfig) return;
@@ -29,7 +31,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({ title }) => {
       const provider = OIDCProvider.build(runtimeContext.oidcConfig);
       await provider.authenticate();
     } catch {
-      setError("Sign in failed. Please try again.");
+      setError(t("Sign in failed. Please try again."));
     }
   };
 
@@ -49,7 +51,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({ title }) => {
           <Container>
             <SpaceBetween size="s" direction="vertical">
               <Button fullWidth variant="primary" onClick={handleSignIn}>
-                Sign in
+                {t("Sign in")}
               </Button>
             </SpaceBetween>
           </Container>

@@ -239,6 +239,15 @@ export class WebStack extends SCLStack {
       }),
       ...(uiDomainName &&
         uiCertificateArn && { uiDomainName, uiCertificateArn }),
+      // Optional Lambda@Edge viewer-request authorizer, from context
+      // `edge_auth_version_arn` (the versioned ARN output by the
+      // cloudfront-oidc-auth stack). Omitted → distribution stays ungated.
+      ...(() => {
+        const arn = this.node.tryGetContext("edge_auth_version_arn") as
+          | string
+          | undefined;
+        return arn ? { edgeAuthVersionArn: arn } : {};
+      })(),
     });
 
     // The origin the browser is actually served from — the custom UI domain
