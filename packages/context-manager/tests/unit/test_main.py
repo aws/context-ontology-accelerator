@@ -1039,6 +1039,68 @@ class TestNamespaceAdmissionGate:
 
     @patch("coa_serve.main._ensure_initialized")
     @patch("coa_serve.main.resolve_profile")
+    async def test_streaming_denial_is_a_typed_error_event(self, mock_resolve, mock_init):
+        # A streaming caller (the web Playground) only renders envelopes whose
+        # `type` is one of step/token/done/error/rows, so the admission denial
+        # must arrive as a typed error event rather than a flat dict.
+        import coa_serve.main as main_mod
+        from coa_serve.role_resolver import ResolvedProfile
+
+        mock_init.return_value = None
+        mock_resolve.return_value = ResolvedProfile(user_id="attacker")
+        orch = self._orchestrator(denied=True)
+        main_mod._orchestrator = orch
+
+        result = await _invoke_collect({"query": "secret", "namespace": "victim", "stream": True})
+
+        assert result["type"] == "error"
+        # The client type guard also requires a string requestId.
+        assert isinstance(result["requestId"], str)
+        # Exact payload: the generic message, never the Cedar reason.
+        assert result["payload"] == {"error": "AccessDenied", "message": "Access denied", "statusCode": 403}
+        assert "not permitted" not in str(result)
+        orch.authorize_namespace.assert_called_once()
+        orch.resolve.assert_not_called()
+
+    @patch("coa_serve.main._ensure_initialized")
+    @patch("coa_serve.main.resolve_profile")
+    async def test_streaming_grant_lookup_failure_is_a_typed_502_event(self, mock_resolve, mock_init):
+        """The other arm of the name mapping: a non-deny admission error keeps its own
+        name and status, still as a typed event, and still before any orchestration."""
+        import coa_serve.main as main_mod
+
+        mock_init.return_value = None
+        mock_resolve.side_effect = RuntimeError("dynamodb throttled")
+        orch = self._orchestrator(denied=False)
+        main_mod._orchestrator = orch
+
+        result = await _invoke_collect({"query": "hello", "namespace": "mine", "stream": True})
+
+        assert result["type"] == "error"
+        assert result["payload"]["statusCode"] == 502
+        assert result["payload"]["error"] == "DataSourceUnavailableError"
+        assert "dynamodb" not in str(result).lower()
+        orch.resolve.assert_not_called()
+
+    @patch("coa_serve.main._ensure_initialized")
+    @patch("coa_serve.main.resolve_profile")
+    async def test_blocking_denial_keeps_the_flat_error_shape(self, mock_resolve, mock_init):
+        # MCP and the data-layer actions read the flat shape; it must not change.
+        import coa_serve.main as main_mod
+        from coa_serve.role_resolver import ResolvedProfile
+
+        mock_init.return_value = None
+        mock_resolve.return_value = ResolvedProfile(user_id="attacker")
+        main_mod._orchestrator = self._orchestrator(denied=True)
+
+        result = await _invoke_collect({"query": "secret", "namespace": "victim"})
+
+        assert "type" not in result
+        assert result["error"] == "AccessDeniedError"
+        assert result["statusCode"] == 403
+
+    @patch("coa_serve.main._ensure_initialized")
+    @patch("coa_serve.main.resolve_profile")
     async def test_query_denied_returns_403_without_orchestration(self, mock_resolve, mock_init):
         import coa_serve.main as main_mod
         from coa_serve.role_resolver import ResolvedProfile

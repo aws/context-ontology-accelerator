@@ -31,8 +31,17 @@ import {
   ontologyTypeDisplay,
   ontologyTypeGroup,
 } from "@utils/ontology-display";
+import { useAppI18n } from "../../../i18n/LocaleProvider";
+import type { AppMessage } from "../../../i18n/appMessages";
 
 type TypeFilter = "all" | "induced" | "foundational" | "uploaded";
+
+const TYPE_MESSAGES: Record<string, AppMessage> = {
+  Induced: "Induced",
+  Foundational: "Foundational",
+  Uploaded: "Uploaded",
+  Unknown: "Unknown",
+};
 
 export function OntologyInventoryView({
   apiClient,
@@ -41,6 +50,7 @@ export function OntologyInventoryView({
   apiClient: ApiClient;
   namespace?: string;
 }) {
+  const { t } = useAppI18n();
   const navigate = useNavigate();
   const [items, setItems] = useState<ListedOntology[]>([]);
   const [loading, setLoading] = useState(true);
@@ -99,7 +109,7 @@ export function OntologyInventoryView({
           type="warning"
           dismissible
           onDismiss={() => setError(null)}
-          header="Could not load ontologies"
+          header={t("Could not load ontologies")}
         >
           {error}
         </Alert>
@@ -112,7 +122,7 @@ export function OntologyInventoryView({
         columnDefinitions={[
           {
             id: "title",
-            header: "Ontology",
+            header: t("Ontology"),
             isRowHeader: true,
             sortingComparator: (a, b) =>
               (a.title || a.ontologyId || "").localeCompare(
@@ -152,50 +162,57 @@ export function OntologyInventoryView({
           },
           {
             id: "type",
-            header: "Type",
+            header: t("Type"),
             sortingComparator: (a, b) =>
               ontologyTypeGroup(a.ontologyType).localeCompare(
                 ontologyTypeGroup(b.ontologyType),
               ),
             cell: (o) => {
               const { label, color } = ontologyTypeDisplay(o.ontologyType);
+              const typeMessage = TYPE_MESSAGES[label];
               if (o.status !== "deleting")
-                return <Badge color={color}>{label}</Badge>;
+                return (
+                  <Badge color={color}>
+                    {typeMessage ? t(typeMessage) : label}
+                  </Badge>
+                );
               // A wedged teardown stops the poll, so say so here rather than
               // showing "in progress" forever. Retry = re-issue the delete.
               return o.deleteError ? (
-                <StatusIndicator type="error">Delete failed</StatusIndicator>
+                <StatusIndicator type="error">
+                  {t("Delete failed")}
+                </StatusIndicator>
               ) : (
                 <StatusIndicator type="in-progress">
-                  Delete in progress
+                  {t("Delete in progress")}
                 </StatusIndicator>
               );
             },
           },
           {
             id: "classes",
-            header: "Classes",
+            header: t("Classes"),
             sortingComparator: (a, b) =>
               (a.classCount ?? 0) - (b.classCount ?? 0),
             cell: (o) => o.classCount ?? 0,
           },
           {
             id: "properties",
-            header: "Properties",
+            header: t("Properties"),
             sortingComparator: (a, b) =>
               (a.propertyCount ?? 0) - (b.propertyCount ?? 0),
             cell: (o) => o.propertyCount ?? 0,
           },
           {
             id: "axioms",
-            header: "Axioms",
+            header: t("Axioms"),
             sortingComparator: (a, b) =>
               (a.axiomCount ?? 0) - (b.axiomCount ?? 0),
             cell: (o) => o.axiomCount ?? 0,
           },
           {
             id: "created",
-            header: "Created",
+            header: t("Created"),
             sortingComparator: (a, b) =>
               (a.createdAt ?? "").localeCompare(b.createdAt ?? ""),
             cell: (o) => formatTimestamp(o.createdAt),
@@ -204,14 +221,18 @@ export function OntologyInventoryView({
         empty={
           <Box textAlign="center" color="text-status-inactive" padding="l">
             {typeFilter === "all"
-              ? "No ontologies yet. Run an induction, or load a reference ontology from the Induction page."
-              : "No ontologies of this type."}
+              ? t(
+                  "No ontologies yet. Run an induction, or load a reference ontology from the Induction page.",
+                )
+              : t("No ontologies of this type.")}
           </Box>
         }
         header={
           <Header
             counter={`(${visible.length})`}
-            description="Every ontology registered in this namespace. Open an induced ontology to browse its classes and relationships."
+            description={t(
+              "Every ontology registered in this namespace. Open an induced ontology to browse its classes and relationships.",
+            )}
             actions={
               <SpaceBetween direction="horizontal" size="xs">
                 <SegmentedControl
@@ -227,15 +248,30 @@ export function OntologyInventoryView({
                       setTypeFilter(id);
                     }
                   }}
-                  label="Filter by ontology type"
+                  label={t("Filter by ontology type")}
                   options={[
-                    { id: "all", text: `All (${items.length})` },
-                    { id: "induced", text: `Induced (${counts.induced})` },
+                    {
+                      id: "all",
+                      text: t("All ({count})", { count: items.length }),
+                    },
+                    {
+                      id: "induced",
+                      text: t("Induced ({count})", {
+                        count: counts.induced,
+                      }),
+                    },
                     {
                       id: "foundational",
-                      text: `Foundational (${counts.foundational})`,
+                      text: t("Foundational ({count})", {
+                        count: counts.foundational,
+                      }),
                     },
-                    { id: "uploaded", text: `Uploaded (${counts.uploaded})` },
+                    {
+                      id: "uploaded",
+                      text: t("Uploaded ({count})", {
+                        count: counts.uploaded,
+                      }),
+                    },
                   ]}
                 />
                 <Button
@@ -243,12 +279,12 @@ export function OntologyInventoryView({
                   loading={loading}
                   onClick={() => setRefreshKey((k) => k + 1)}
                 >
-                  Refresh
+                  {t("Refresh")}
                 </Button>
               </SpaceBetween>
             }
           >
-            Ontologies
+            {t("Ontologies")}
           </Header>
         }
       />

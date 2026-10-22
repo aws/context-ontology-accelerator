@@ -45,11 +45,15 @@ echo ""
 echo "Syncing UV workspace..."
 uv sync --all-packages
 
-# Install Node dependencies via pnpm (TS packages: infra, web-app, ts-shared)
+# Install Node dependencies via pnpm (TS packages: infra, web-app, ts-shared).
+# --frozen-lockfile: install exactly what pnpm-lock.yaml pins and never rewrite it.
+# A plain install rewrites it on the public repo (it lists workspace packages the
+# mirror leaves out), and the next `git pull` then fails on local changes. After
+# changing a package.json, run a plain `pnpm install` yourself.
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 echo ""
 echo "Installing Node dependencies..."
-cd "$REPO_ROOT" && pnpm install
+cd "$REPO_ROOT" && pnpm install --frozen-lockfile
 
 # Install pre-commit hooks
 echo ""

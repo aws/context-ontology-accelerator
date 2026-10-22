@@ -1145,7 +1145,22 @@ async def invoke(payload: dict, context=None):
             namespace, _jwt_user_id, _jwt_email, _jwt_groups, payload.get("profile", {}), request_id
         )
         if authz_error is not None:
-            yield authz_error
+            # Streaming callers (the web Playground) accept only typed envelopes
+            # (`type` in {step, token, done, error, rows}); a flat error dict is
+            # dropped by the client, so the user would see no error at all when a
+            # namespace admission check denies the request. Blocking callers
+            # (MCP, data-layer actions) read the flat shape and keep it.
+            if payload.get("stream", False):
+                # ``authz_error`` is always a ServeError.to_dict() (AccessDeniedError or
+                # DataSourceUnavailableError), so the keys are present. The Tier-1/2
+                # streaming deny path reports "AccessDenied"; keep one spelling for clients.
+                error_name = authz_error["error"]
+                client_name = "AccessDenied" if error_name == "AccessDeniedError" else error_name
+                yield SSEEmitter(request_id).format_error(
+                    client_name, authz_error["message"], authz_error["statusCode"]
+                )
+            else:
+                yield authz_error
             return
 
     try:

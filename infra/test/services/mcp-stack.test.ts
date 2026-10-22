@@ -318,3 +318,42 @@ describe("McpStack", () => {
     expect(params).not.toContain("/ontology-engine/api-fn-arn");
   });
 });
+
+describe("McpStack - teardown", () => {
+  // AgentCore's ENIs keep McpSG in use for hours after the runtime is deleted.
+  // Retained, the stack deletes at once instead of failing on the group and
+  // keeping every stack it imports from alive; destroy.sh deletes the group.
+  it("retains the runtime security group and tags it for destroy.sh", () => {
+    const app = new cdk.App({ context: TEST_CONTEXT });
+    const depStack = new cdk.Stack(app, "DepStack", {
+      env: { account: "123456789012", region: "us-east-1" },
+    });
+    const vpc = new ec2.Vpc(depStack, "Vpc", { maxAzs: 2 });
+    const mkTable = (id: string) =>
+      new dynamodb.Table(depStack, id, {
+        partitionKey: { name: "PK", type: dynamodb.AttributeType.STRING },
+      });
+    const template = Template.fromStack(
+      new McpStack(app, "TestMcpTeardown", {
+        env: { account: "123456789012", region: "us-east-1" },
+        vpc,
+        rolesTable: mkTable("Roles"),
+        resourceRoleMappingsTable: mkTable("RRM"),
+      }),
+    );
+
+    template.hasResource("AWS::EC2::SecurityGroup", {
+      DeletionPolicy: "Retain",
+      UpdateReplacePolicy: "Retain",
+      Properties: Match.objectLike({
+        GroupDescription: "AgentCore Runtime - MCP Server (thin proxy)",
+        Tags: Match.arrayWith([
+          {
+            Key: `${DEFAULT_RESOURCE_PREFIX}:teardown`,
+            Value: "delete-after-eni-release",
+          },
+        ]),
+      }),
+    });
+  });
+});

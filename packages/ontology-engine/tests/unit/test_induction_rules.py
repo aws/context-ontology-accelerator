@@ -57,7 +57,8 @@ from coa_ontology.inducer.unstructured.stores.protocol import (
     ClassRecord,
 )
 from rdflib import OWL, RDF, RDFS, XSD, Graph, Literal, URIRef
-from rdflib.namespace import SKOS
+from rdflib.compare import isomorphic
+from rdflib.namespace import DCTERMS, SKOS
 
 # Test namespace + ontology used to construct expected IRIs throughout
 # this file. Same convention as ``test_class_normalizer.py``.
@@ -94,6 +95,8 @@ def _nr(
     band: str = "novel",
     similarity: float = 0.0,
     matched: str | None = None,
+    preferred_label: str | None = None,
+    alternative_labels: tuple[str, ...] = (),
 ) -> NormalizationResult:
     """Compact NormalizationResult builder for tests."""
     return NormalizationResult(
@@ -102,6 +105,8 @@ def _nr(
         similarity_score=similarity,
         matched_existing_iri=matched,
         source_mode="schema",
+        preferred_label=preferred_label,
+        alternative_labels=alternative_labels,
     )
 
 
@@ -199,6 +204,200 @@ class TestCamelCaseLabel:
         labels = list(g.objects(URIRef(_class_iri("FinancialInstrument")), RDFS.label))
         # Label uses the CamelCase form straight from ClassRecord.value.
         assert labels[0] == Literal("FinancialInstrument", datatype=XSD.string)
+
+
+class TestClassAlternativeLabels:
+    """Exact class variants emit one preferred label plus SKOS alternatives."""
+
+    def test_consolidated_labels_keep_the_original_camelcase_form(self):
+        """Req 10.3 holds for every consolidated spelling, not just one.
+
+        The normalizer and the description generator key classes by the
+        spaced lookup form (``"Control Panel"``). The emitted labels must
+        still be the original ``__SYS_Class__`` values, and the description
+        must still be found through the spaced key.
+        """
+        class_iri = _class_iri("ControlPanel")
+        g = induce_classes(
+            class_distribution=[
+                ClassRecord(value="ControlPanel", count=5),
+                ClassRecord(value="制御盤", count=3),
+            ],
+            descriptions={"Control Panel": "A panel that houses control equipment."},
+            normalizer_results={
+                "Control Panel": _nr(class_iri, preferred_label="Control Panel"),
+                "制御盤": _nr(
+                    class_iri,
+                    band="exact",
+                    similarity=0.99,
+                    matched=class_iri,
+                    preferred_label="Control Panel",
+                    alternative_labels=("制御盤",),
+                ),
+            },
+            iri_resolver=_real_resolver(),
+            namespace_language="ja",
+        )
+
+        class_uri = URIRef(class_iri)
+        assert list(g.objects(class_uri, RDFS.label)) == [Literal("ControlPanel", datatype=XSD.string)]
+        assert set(g.objects(class_uri, SKOS.altLabel)) == {Literal("制御盤", lang="ja")}
+        assert list(g.objects(class_uri, RDFS.comment)) == [
+            Literal("A panel that houses control equipment.", datatype=XSD.string)
+        ]
+
+    def test_consolidated_class_keeps_observed_surface_forms(self):
+        class_iri = _class_iri("Compressor")
+        g = induce_classes(
+            class_distribution=[
+                ClassRecord(value="Compressor", count=10),
+                ClassRecord(value="コンプレッサー", count=7),
+            ],
+            descriptions={
+                "Compressor": "Equipment that compresses a gas.",
+                "コンプレッサー": "気体を圧縮する装置。",
+            },
+            normalizer_results={
+                "Compressor": _nr(class_iri, preferred_label="Compressor"),
+                "コンプレッサー": _nr(
+                    class_iri,
+                    band="exact",
+                    similarity=0.99,
+                    matched=class_iri,
+                    preferred_label="Compressor",
+                    alternative_labels=("コンプレッサー",),
+                ),
+            },
+            iri_resolver=_real_resolver(),
+            namespace_language="ja",
+        )
+
+        class_uri = URIRef(class_iri)
+        assert list(g.objects(class_uri, RDFS.label)) == [Literal("Compressor", datatype=XSD.string)]
+        assert set(g.objects(class_uri, SKOS.altLabel)) == {
+            Literal("コンプレッサー", lang="ja"),
+        }
+        assert len(set(g.subjects(RDF.type, OWL.Class))) == 1
+        assert list(g.objects(class_uri, RDFS.comment)) == [
+            Literal("Equipment that compresses a gas.", datatype=XSD.string)
+        ]
+
+    def test_preferred_label_is_not_repeated_as_alternative(self):
+        class_iri = _class_iri("Company")
+        g = induce_classes(
+            class_distribution=[ClassRecord(value="Company", count=10)],
+            descriptions={},
+            normalizer_results={
+                "Company": _nr(
+                    class_iri,
+                    preferred_label="Company",
+                    alternative_labels=("Company",),
+                )
+            },
+            iri_resolver=_real_resolver(),
+            namespace_language="en",
+        )
+
+        assert not list(g.objects(URIRef(class_iri), SKOS.altLabel))
+
+    def test_preferred_label_follows_observed_frequency_not_record_order(self):
+        """The dominant spelling wins even when a rarer one is seen first.
+
+        Regression: the preferred label used to be whichever record reached
+        the consolidated IRI first, so reordering ``class_distribution``
+        silently changed the emitted ``rdfs:label``.
+        """
+        class_iri = _class_iri("Compressor")
+        normalizer_results = {
+            "Compressor": _nr(class_iri, preferred_label="Compressor"),
+            "コンプレッサー": _nr(
+                class_iri,
+                band="exact",
+                similarity=0.99,
+                matched=class_iri,
+                preferred_label="Compressor",
+                alternative_labels=("コンプレッサー",),
+            ),
+        }
+        rarer_form_first = [
+            ClassRecord(value="Compressor", count=4),
+            ClassRecord(value="コンプレッサー", count=9),
+        ]
+
+        g = induce_classes(
+            class_distribution=rarer_form_first,
+            descriptions={"Compressor": "Equipment that compresses a gas."},
+            normalizer_results=normalizer_results,
+            iri_resolver=_real_resolver(),
+            namespace_language="ja",
+        )
+
+        class_uri = URIRef(class_iri)
+        assert list(g.objects(class_uri, RDFS.label)) == [Literal("コンプレッサー", lang="ja")]
+        assert set(g.objects(class_uri, SKOS.altLabel)) == {Literal("Compressor", datatype=XSD.string)}
+        # The description is keyed by the alternative form, so the comment
+        # must still be found after the preferred label moved.
+        assert list(g.objects(class_uri, RDFS.comment)) == [
+            Literal("Equipment that compresses a gas.", datatype=XSD.string)
+        ]
+
+        reversed_order = induce_classes(
+            class_distribution=list(reversed(rarer_form_first)),
+            descriptions={"Compressor": "Equipment that compresses a gas."},
+            normalizer_results=normalizer_results,
+            iri_resolver=_real_resolver(),
+            namespace_language="ja",
+        )
+        assert isomorphic(g, reversed_order)
+
+    def test_case_only_variants_are_folded_instead_of_emitted(self):
+        """A spelling the lookup key calls identical is not an altLabel.
+
+        ``Compressor`` and ``COMPRESSOR`` share one deterministic lookup
+        key, so an altLabel for the loser would assert nothing the
+        preferred label does not already say.
+        """
+        class_iri = _class_iri("Compressor")
+        g = induce_classes(
+            class_distribution=[
+                ClassRecord(value="Compressor", count=3),
+                ClassRecord(value="COMPRESSOR", count=90),
+            ],
+            descriptions={},
+            normalizer_results={
+                "Compressor": _nr(class_iri, preferred_label="Compressor"),
+                "COMPRESSOR": _nr(
+                    class_iri,
+                    band="exact",
+                    similarity=1.0,
+                    matched=class_iri,
+                    preferred_label="Compressor",
+                    alternative_labels=("COMPRESSOR",),
+                ),
+            },
+            iri_resolver=_real_resolver(),
+            namespace_language="en",
+        )
+
+        class_uri = URIRef(class_iri)
+        # An English namespace asserts no tags, so the label keeps the
+        # untagged ``xsd:string`` form, as it does on ``main``.
+        assert list(g.objects(class_uri, RDFS.label)) == [Literal("COMPRESSOR", datatype=XSD.string)]
+        assert not list(g.objects(class_uri, SKOS.altLabel))
+
+    def test_class_with_no_usable_label_is_skipped(self):
+        """A consolidated IRI whose every spelling is blank emits nothing."""
+        class_iri = _class_iri("Blank")
+        g = induce_classes(
+            class_distribution=[ClassRecord(value="   ", count=10)],
+            descriptions={},
+            normalizer_results={"   ": _nr(class_iri, preferred_label="  ")},
+            iri_resolver=_real_resolver(),
+            namespace_language="en",
+        )
+
+        assert not list(g.objects(URIRef(class_iri), RDFS.label))
+        assert not list(g.subjects(RDF.type, OWL.Class))
 
 
 class TestFloorThreshold:
@@ -1157,6 +1356,60 @@ class TestRule3PredicateNormalization:
         assert len(labels) == 1
         assert str(labels[0]) == "WORKS_FOR"
 
+    def test_noncanonical_surface_forms_are_alt_labels(self):
+        facts = [
+            _spo("a", "Company", "WORKS_FOR", "x", "Person"),
+            _spo("b", "Company", "WORKS_FOR", "y", "Person"),
+            _spo("c", "Company", "works for", "z", "Person"),
+        ]
+        g = induce_object_properties(
+            facts=facts,
+            class_iris={
+                "Company": _class_iri("Company"),
+                "Person": _class_iri("Person"),
+            },
+            iri_resolver=_real_resolver(),
+            namespace_language="en",
+        )
+
+        prop_uri = URIRef(_property_iri("works_for"))
+        assert list(g.objects(prop_uri, RDFS.label)) == [Literal("WORKS_FOR", datatype=XSD.string)]
+        assert set(g.objects(prop_uri, SKOS.altLabel)) == {
+            Literal("works for", datatype=XSD.string),
+        }
+
+    def test_padding_and_case_noise_do_not_become_alt_labels(self):
+        """Surface forms differing only by padding/case fold into one.
+
+        Regression: every raw spelling became a ``skos:altLabel``, so a
+        predicate could carry alternatives like ``"  DELIVERED TO  "`` that
+        repeat the preferred label with different whitespace.
+        """
+        facts = [
+            _spo("a", "Company", "DELIVERED TO", "x", "Person"),
+            _spo("b", "Company", "DELIVERED TO", "y", "Person"),
+            _spo("c", "Company", "  DELIVERED TO  ", "z", "Person"),
+            _spo("d", "Company", "delivered to", "w", "Person"),
+            _spo("e", "Company", "Delivered To", "v", "Person"),
+            _spo("f", "Company", "DELIVERED_TO", "u", "Person"),
+        ]
+        g = induce_object_properties(
+            facts=facts,
+            class_iris={
+                "Company": _class_iri("Company"),
+                "Person": _class_iri("Person"),
+            },
+            iri_resolver=_real_resolver(),
+            namespace_language="en",
+        )
+
+        prop_uri = URIRef(_property_iri("delivered_to"))
+        assert list(g.objects(prop_uri, RDFS.label)) == [Literal("DELIVERED TO", datatype=XSD.string)]
+        # ``DELIVERED_TO`` keeps its own lookup key (underscore vs space), so
+        # it survives folding; the padding and casing variants do not. An
+        # English namespace asserts no tags, so every label stays untagged.
+        assert set(g.objects(prop_uri, SKOS.altLabel)) == {Literal("DELIVERED_TO", datatype=XSD.string)}
+
     def test_label_is_xsd_string_typed(self):
         from rdflib import RDFS, XSD, URIRef
 
@@ -1746,6 +1999,25 @@ class TestRule4LabelAndComment:
         assert len(labels) == 1
         assert str(labels[0]) == "FOUNDED"
 
+    def test_noncanonical_surface_forms_are_alt_labels(self):
+        facts = [
+            _spc("a", "Company", "MODEL_NO", "A-1"),
+            _spc("b", "Company", "MODEL_NO", "B-2"),
+            _spc("c", "Company", "model no", "C-3"),
+        ]
+        g = induce_datatype_properties(
+            facts=facts,
+            class_iris={"Company": _class_iri("Company")},
+            iri_resolver=_real_resolver(),
+            namespace_language="en",
+        )
+
+        prop_uri = URIRef(_datatype_property_iri("model_no"))
+        assert list(g.objects(prop_uri, RDFS.label)) == [Literal("MODEL_NO", datatype=XSD.string)]
+        assert set(g.objects(prop_uri, SKOS.altLabel)) == {
+            Literal("model no", datatype=XSD.string),
+        }
+
     def test_label_is_xsd_string_typed(self):
         from rdflib import RDFS, XSD, URIRef
 
@@ -2097,6 +2369,7 @@ class TestRule4NamespaceBindings:
 
 
 from coa_ontology.inducer.unstructured.services.induction_rules import (  # noqa: E402
+    MAX_CONCEPT_CLASS_LOOKUP_ENTRIES,
     induce_concepts,
 )
 from coa_ontology.inducer.unstructured.services.iri_resolver import (  # noqa: E402
@@ -2221,6 +2494,176 @@ class TestConceptEmission:
         # Exactly four triples for the concept (decl + prefLabel + inScheme)
         # plus two for the scheme (decl + label).
         assert len(g) == 5
+
+    def test_matching_class_label_links_topic_as_subject(self):
+        class_iri = _class_iri("Compressor")
+        concept_iri = URIRef(_topic_iri("コンプレッサー"))
+        g = induce_concepts(
+            topics=[_topic("コンプレッサー")],
+            iri_resolver=_real_resolver(),
+            namespace_name=_TOPIC_NS,
+            namespace_language="ja",
+            class_iris={
+                "Compressor": class_iri,
+                "コンプレッサー": class_iri,
+            },
+        )
+
+        assert (URIRef(class_iri), DCTERMS.subject, concept_iri) in g
+
+    def test_unmatched_or_ambiguous_class_label_does_not_link_topic(self):
+        g = induce_concepts(
+            topics=[_topic("Equipment")],
+            iri_resolver=_real_resolver(),
+            namespace_name=_TOPIC_NS,
+            class_iris={
+                "equipment": _class_iri("EquipmentA"),
+                "EQUIPMENT": _class_iri("EquipmentB"),
+            },
+        )
+
+        assert not list(g.triples((None, DCTERMS.subject, None)))
+
+    def test_equivalent_labels_for_same_iri_remain_an_exact_match(self):
+        class_iri = _class_iri("Equipment")
+        g = induce_concepts(
+            topics=[_topic("Equipment")],
+            iri_resolver=_real_resolver(),
+            namespace_name=_TOPIC_NS,
+            class_iris={
+                "equipment": class_iri,
+                "EQUIPMENT": class_iri,
+            },
+        )
+
+        assert (URIRef(class_iri), DCTERMS.subject, URIRef(_topic_iri("Equipment"))) in g
+
+    @pytest.mark.parametrize(
+        "class_count",
+        [
+            MAX_CONCEPT_CLASS_LOOKUP_ENTRIES - 1,
+            MAX_CONCEPT_CLASS_LOOKUP_ENTRIES,
+        ],
+    )
+    def test_class_lookup_at_or_below_limit_preserves_exact_match(self, class_count):
+        class_iris = {f"Class {index}": _class_iri(f"Class {index}") for index in range(class_count - 1)}
+        matching_iri = _class_iri("Target")
+        class_iris["Target"] = matching_iri
+
+        g = induce_concepts(
+            topics=[_topic("Target")],
+            iri_resolver=_real_resolver(),
+            namespace_name=_TOPIC_NS,
+            class_iris=class_iris,
+        )
+
+        assert (URIRef(matching_iri), DCTERMS.subject, URIRef(_topic_iri("Target"))) in g
+
+    def test_class_lookup_above_limit_disables_all_links_without_partial_match(self, caplog):
+        target_iri = _class_iri("TargetA")
+        entries = [("Target", target_iri)]
+        entries.extend(
+            (f"Class {index}", _class_iri(f"Class {index}")) for index in range(MAX_CONCEPT_CLASS_LOOKUP_ENTRIES - 1)
+        )
+        # At exactly limit + 1, this conflicting alias falls after the limit
+        # in one order. A partial index would incorrectly retain TargetA as an
+        # exact match.
+        entries.append(("TARGET", _class_iri("TargetB")))
+
+        graphs = []
+        with caplog.at_level(logging.WARNING):
+            for ordered_entries in (entries, list(reversed(entries))):
+                graphs.append(
+                    induce_concepts(
+                        topics=[_topic("Target")],
+                        iri_resolver=_real_resolver(),
+                        namespace_name=_TOPIC_NS,
+                        class_iris=dict(ordered_entries),
+                    )
+                )
+
+        assert all(not list(graph.triples((None, DCTERMS.subject, None))) for graph in graphs)
+        assert isomorphic(graphs[0], graphs[1])
+        limit_records = [
+            record
+            for record in caplog.records
+            if getattr(record, "event", None) == "induce_concepts_class_lookup_limit_exceeded"
+        ]
+        assert len(limit_records) == 2
+        assert all(
+            record.class_iri_entry_limit == MAX_CONCEPT_CLASS_LOOKUP_ENTRIES
+            and record.class_iri_entry_count == MAX_CONCEPT_CLASS_LOOKUP_ENTRIES + 1
+            for record in limit_records
+        )
+        assert "Target" not in "\n".join(record.message for record in limit_records)
+        assert target_iri not in "\n".join(record.message for record in limit_records)
+
+    def test_ambiguous_class_labels_emit_one_redacted_debug_event(self, caplog):
+        customer_label = "Confidential Turbine"
+        first_iri = _class_iri("TurbineA")
+        second_iri = _class_iri("TurbineB")
+
+        with caplog.at_level(logging.DEBUG):
+            g = induce_concepts(
+                topics=[
+                    _topic(customer_label, topic_id="topic-1"),
+                    _topic(customer_label.upper(), topic_id="topic-2"),
+                ],
+                iri_resolver=_real_resolver(),
+                namespace_name=_TOPIC_NS,
+                class_iris={
+                    customer_label: first_iri,
+                    customer_label.upper(): second_iri,
+                },
+            )
+
+        assert not list(g.triples((None, DCTERMS.subject, None)))
+        ambiguity_records = [
+            record
+            for record in caplog.records
+            if getattr(record, "event", None) == "induce_concepts_ambiguous_class_labels"
+        ]
+        assert len(ambiguity_records) == 1
+        record = ambiguity_records[0]
+        assert record.ambiguous_normalized_label_count == 1
+        assert len(record.normalized_label_fingerprint_sample) == 1
+        rendered_log = caplog.text
+        assert customer_label not in rendered_log
+        assert first_iri not in rendered_log
+        assert second_iri not in rendered_log
+
+    def test_ambiguity_debug_sample_is_bounded_and_order_independent(self, caplog):
+        ambiguous_pairs = [
+            (
+                f"Sensitive Label {index}",
+                _class_iri(f"SensitiveA{index}"),
+                _class_iri(f"SensitiveB{index}"),
+            )
+            for index in range(12)
+        ]
+
+        fingerprints = []
+        with caplog.at_level(logging.DEBUG):
+            for pairs in (ambiguous_pairs, list(reversed(ambiguous_pairs))):
+                class_iris = {}
+                for label, first_iri, second_iri in pairs:
+                    class_iris[label] = first_iri
+                    class_iris[label.upper()] = second_iri
+                induce_concepts(
+                    topics=[_topic("Unmatched")],
+                    iri_resolver=_real_resolver(),
+                    namespace_name=_TOPIC_NS,
+                    class_iris=class_iris,
+                )
+                record = next(
+                    record
+                    for record in reversed(caplog.records)
+                    if getattr(record, "event", None) == "induce_concepts_ambiguous_class_labels"
+                )
+                fingerprints.append(record.normalized_label_fingerprint_sample)
+
+        assert fingerprints[0] == fingerprints[1]
+        assert len(fingerprints[0]) == 5
 
     def test_preflabel_is_xsd_string(self):
         """Req 14.3 — prefLabel must be xsd:string-typed."""

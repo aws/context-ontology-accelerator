@@ -36,6 +36,7 @@ import {
   CLASS_DISPLAY_PAGE_SIZE,
 } from "@api-hooks/use-graph-classes";
 import { useApiClient } from "@components/ApiClientProvider";
+import { useNamespace } from "@api-hooks/use-namespace";
 import {
   useBreadcrumbs,
   type BreadcrumbItem,
@@ -45,6 +46,7 @@ import {
   type GraphAttribute,
   type GraphNodeData,
 } from "../../components/graph/OntologyGraphFlow";
+import { useAppI18n } from "../../i18n/LocaleProvider";
 
 /**
  * How many relationship hops out from a search match to pull into the graph,
@@ -725,10 +727,13 @@ async function fetchVertexByKind(
 const EXPLORER_TABS = new Set(["classes", "ontologies", "sources"]);
 
 export function GraphSearchPage() {
+  const { t } = useAppI18n();
   const { namespaceId } = useParams<{ namespaceId: string }>();
   const navigate = useNavigate();
   const apiClient = useApiClient();
   const { setBreadcrumbs, clearBreadcrumbs } = useBreadcrumbs();
+  const { name: nsName, canAccess: canReachNamespace } =
+    useNamespace(namespaceId);
   // Page-level tab. Deep-linkable via ?tab= so the Induction page (and any
   // "go look at what you just built" hand-off) can land the user directly on
   // the Ontologies inventory.
@@ -1049,7 +1054,7 @@ export function GraphSearchPage() {
         });
       })
       .catch((e) =>
-        setError(e instanceof Error ? e.message : "Failed to load graph"),
+        setError(e instanceof Error ? e.message : t("Failed to load graph")),
       )
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -1058,7 +1063,7 @@ export function GraphSearchPage() {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [view, hasSearched, namespaceId, ontologyById, graphOntologyId]);
+  }, [view, hasSearched, namespaceId, ontologyById, graphOntologyId, t]);
 
   // Load the ontology registry once per namespace: it resolves names + the
   // induced flag for the List view's per-ontology grouping, sets the default
@@ -1196,7 +1201,7 @@ export function GraphSearchPage() {
       setVisibleUris(searchUris);
       setTotalRoots(0);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Search failed");
+      setError(e instanceof Error ? e.message : t("Search failed"));
     } finally {
       setLoading(false);
     }
@@ -1296,7 +1301,9 @@ export function GraphSearchPage() {
       setSelectedVertex(vertex);
     } catch (e) {
       setError(
-        e instanceof Error ? e.message : `Failed to load ${localName(uri)}`,
+        e instanceof Error
+          ? e.message
+          : t("Failed to load {name}", { name: localName(uri) }),
       );
     }
   };
@@ -1364,7 +1371,7 @@ export function GraphSearchPage() {
       setQuery(vertex.labels?.[0] || localName(vertex.uri));
     } catch (e) {
       if (!isMountedRef.current) return;
-      setError(e instanceof Error ? e.message : "Failed to open graph view");
+      setError(e instanceof Error ? e.message : t("Failed to open graph view"));
     } finally {
       if (isMountedRef.current) setLoading(false);
     }
@@ -1396,17 +1403,27 @@ export function GraphSearchPage() {
 
   // Publish a live breadcrumb trail to the AppLayout breadcrumbs slot (the bar
   // below the top nav). Always present on this page and reflects the current
-  // state:  COA › Ontology Explorer › [Class] › [Graph]
+  // state:  COA › {Namespace} › Ontology › Explorer › [Class] › [Graph]
   //   - COA              → app root view
-  //   - Ontology Explorer → clear selection, back to the list root
+  //   - {Namespace}      → the namespace detail page (grant-trimmed: plain text
+  //                        when the user has no grant in this namespace, so it
+  //                        matches the site-wide trim done by useBreadcrumbTrail)
+  //   - Ontology         → non-navigable group label
+  //   - Explorer         → clear selection, back to the list root
   //   - {Class}          → the selected class's detail panel (when one is open)
   //   - Graph            → shown when the graph view is active
   // Cleared on unmount.
   useEffect(() => {
     const crumbs: BreadcrumbItem[] = [
       { text: "COA", onClick: () => navigate("/") },
-      { text: "Ontology" },
-      { text: "Explorer", onClick: handleGoToRoot },
+      {
+        text: nsName,
+        ...(canReachNamespace
+          ? { onClick: () => navigate(`/namespaces/${namespaceId}`) }
+          : {}),
+      },
+      { text: t("Ontology") },
+      { text: t("Explorer"), onClick: handleGoToRoot },
     ];
     if (selectedVertex) {
       crumbs.push({
@@ -1415,14 +1432,14 @@ export function GraphSearchPage() {
       });
     }
     if (view === "graph") {
-      crumbs.push({ text: "Graph", onClick: () => setView("graph") });
+      crumbs.push({ text: t("Graph"), onClick: () => setView("graph") });
     }
     setBreadcrumbs(crumbs);
     return () => clearBreadcrumbs();
-    // Re-run whenever the crumb-affecting state changes. The handlers are
-    // recreated each render but that's fine — the trail is cheap to rebuild.
+    // Re-run only when the crumb-affecting state changes; navigate,
+    // setBreadcrumbs, clearBreadcrumbs, and handleGoToRoot are stable.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [view, selectedVertex, namespaceId]);
+  }, [view, selectedVertex, namespaceId, nsName, canReachNamespace, t]);
 
   // The List view now pages across EVERY class in the namespace via the
   // server, not a capped client-side slice. Typing in the search box filters
@@ -1441,8 +1458,17 @@ export function GraphSearchPage() {
   // defaultOntologyFilterValue). The selected ontology_id restricts the server
   // search; ALL_ONTOLOGIES_VALUE means no restriction (undefined to the hook).
   const ontologyFilterOptions = useMemo(
-    () => buildOntologyFilterOptions(ontologyById),
-    [ontologyById],
+    () =>
+      buildOntologyFilterOptions(ontologyById).map((option) => ({
+        ...option,
+        label:
+          option.value === ALL_ONTOLOGIES_VALUE
+            ? t("All ontologies")
+            : option.label,
+        description:
+          option.description === "Induced" ? t("Induced") : option.description,
+      })),
+    [ontologyById, t],
   );
   const selectedOntologyOption =
     ontologyFilterOptions.find((o) => o.value === ontologyFilter) ??
@@ -1489,9 +1515,9 @@ export function GraphSearchPage() {
       setError(
         classesError instanceof Error
           ? classesError.message
-          : "Failed to load ontology classes",
+          : t("Failed to load ontology classes"),
       );
-  }, [classesError]);
+  }, [classesError, t]);
 
   // Controlled Cloudscape pagination. Page count comes from the server total
   // (known-total UX), so users see "N of M" even before every chunk is loaded.
@@ -1565,7 +1591,9 @@ export function GraphSearchPage() {
         vertex = await getClass(apiClient, namespaceId, uri);
       } catch (e) {
         setError(
-          e instanceof Error ? e.message : `Failed to expand ${localName(uri)}`,
+          e instanceof Error
+            ? e.message
+            : t("Failed to expand {name}", { name: localName(uri) }),
         );
         return;
       }
@@ -1653,10 +1681,10 @@ export function GraphSearchPage() {
                 onChange={({ detail }) =>
                   setView(detail.selectedId as "graph" | "list")
                 }
-                label="View"
+                label={t("View")}
                 options={[
-                  { id: "list", text: "List", iconName: "list-view" },
-                  { id: "graph", text: "Graph", iconName: "share" },
+                  { id: "list", text: t("List"), iconName: "list-view" },
+                  { id: "graph", text: t("Graph"), iconName: "share" },
                 ]}
               />
               <div style={{ flexGrow: 1, minWidth: 300 }}>
@@ -1669,8 +1697,8 @@ export function GraphSearchPage() {
                   }}
                   placeholder={
                     view === "list"
-                      ? "Filter classes..."
-                      : "Search classes, properties..."
+                      ? t("Filter classes...")
+                      : t("Search classes, properties...")
                   }
                   type="search"
                 />
@@ -1685,7 +1713,7 @@ export function GraphSearchPage() {
                   }
                   options={ontologyFilterOptions}
                   disabled={!ontologyRegistrySettled}
-                  ariaLabel="Restrict classes by ontology"
+                  ariaLabel={t("Restrict classes by ontology")}
                   expandToViewport
                 />
               )}
@@ -1695,7 +1723,7 @@ export function GraphSearchPage() {
                   onClick={() => handleSearch()}
                   loading={loading}
                 >
-                  Search
+                  {t("Search")}
                 </Button>
               )}
               {view === "graph" && hasSearched && (
@@ -1738,7 +1766,7 @@ export function GraphSearchPage() {
                 color="text-body-secondary"
               >
                 <Box variant="p" fontSize="heading-m">
-                  No results found. Try a different search term.
+                  {t("No results found. Try a different search term.")}
                 </Box>
               </Box>
             )}
@@ -1753,7 +1781,7 @@ export function GraphSearchPage() {
                 color="text-body-secondary"
               >
                 <Box variant="p" fontSize="heading-m">
-                  No classes found in this namespace yet.
+                  {t("No classes found in this namespace yet.")}
                 </Box>
               </Box>
             )}
@@ -1790,19 +1818,34 @@ export function GraphSearchPage() {
                 padding={{ top: "xs" }}
               >
                 {totalRoots > graphData.nodes.length
-                  ? `Showing ${graphData.nodes.length} of ${totalRoots} root classes · `
-                  : `${graphData.nodes.length} nodes · ${graphData.edges.length} edges · `}
-                double-click a class to expand its sub-classes
+                  ? t(
+                      "Showing {shown} of {total} root classes · double-click a class to expand its sub-classes",
+                      {
+                        shown: graphData.nodes.length,
+                        total: totalRoots,
+                      },
+                    )
+                  : t(
+                      "{nodes} nodes · {edges} edges · double-click a class to expand its sub-classes",
+                      {
+                        nodes: graphData.nodes.length,
+                        edges: graphData.edges.length,
+                      },
+                    )}
               </Box>
               {expandFailedUris.size > 0 && (
                 <StatusIndicator type="warning">
-                  {expandFailedUris.size} sub-class
-                  {expandFailedUris.size > 1 ? "es" : ""} couldn't be loaded.{" "}
+                  {t(
+                    expandFailedUris.size === 1
+                      ? "{count} sub-class couldn't be loaded."
+                      : "{count} sub-classes couldn't be loaded.",
+                    { count: expandFailedUris.size },
+                  )}{" "}
                   <Link
                     variant="primary"
                     onFollow={() => setExpandFailedUris(new Set())}
                   >
-                    Dismiss
+                    {t("Dismiss")}
                   </Link>
                 </StatusIndicator>
               )}
@@ -1820,7 +1863,7 @@ export function GraphSearchPage() {
                 items={pagedClasses}
                 variant="embedded"
                 loading={listLoading}
-                loadingText="Loading classes…"
+                loadingText={t("Loading classes…")}
                 trackBy="uri"
                 selectionType="single"
                 selectedItems={
@@ -1835,18 +1878,18 @@ export function GraphSearchPage() {
                 columnDefinitions={[
                   {
                     id: "label",
-                    header: "Class",
+                    header: t("Class"),
                     cell: (c) => c.label,
                     isRowHeader: true,
                   },
                   {
                     id: "ontology",
-                    header: "Ontology",
+                    header: t("Ontology"),
                     cell: (c) => c.ontologyName,
                   },
                   {
                     id: "description",
-                    header: "Description",
+                    header: t("Description"),
                     cell: (c) =>
                       c.description || (
                         <Box variant="small" color="text-status-inactive">
@@ -1858,10 +1901,12 @@ export function GraphSearchPage() {
                 empty={
                   <Box textAlign="center" color="text-body-secondary">
                     {classesError
-                      ? "Couldn't load classes. See the error above and retry."
+                      ? t(
+                          "Couldn't load classes. See the error above and retry.",
+                        )
                       : listQuery.trim()
-                        ? "No classes match your search."
-                        : "No classes found in this namespace yet."}
+                        ? t("No classes match your search.")
+                        : t("No classes found in this namespace yet.")}
                   </Box>
                 }
                 pagination={
@@ -1908,7 +1953,7 @@ export function GraphSearchPage() {
                     <Button
                       variant="icon"
                       iconName="close"
-                      ariaLabel="Close detail panel"
+                      ariaLabel={t("Close detail panel")}
                       onClick={() => setSelectedVertex(null)}
                     />
                   }
@@ -1923,14 +1968,14 @@ export function GraphSearchPage() {
                         variant="primary"
                         onFollow={() => handleExpandClass(selectedVertex)}
                       >
-                        Expand
+                        {t("Expand")}
                       </Link>
                       {" | "}
                       <Link
                         variant="primary"
                         onFollow={() => handleOpenInGraph(selectedVertex)}
                       >
-                        Graph view
+                        {t("Graph view")}
                       </Link>
                     </Box>
                   </SpaceBetween>
@@ -1940,7 +1985,7 @@ export function GraphSearchPage() {
               <SpaceBetween size="s">
                 {hydrationFailedUri === selectedVertex.uri && (
                   <StatusIndicator type="warning">
-                    Some details couldn't be loaded.{" "}
+                    {t("Some details couldn't be loaded.")}{" "}
                     <Link
                       variant="primary"
                       // Retry through the URI-keyed path rather than
@@ -1952,26 +1997,26 @@ export function GraphSearchPage() {
                         void retryVertexHydration(selectedVertex.uri)
                       }
                     >
-                      Retry
+                      {t("Retry")}
                     </Link>
                   </StatusIndicator>
                 )}
                 <Box variant="p">
-                  <strong>Kind:</strong> {selectedVertex.kind}
+                  <strong>{t("Kind:")}</strong> {selectedVertex.kind}
                 </Box>
                 <Box variant="p" fontSize="body-s" color="text-status-inactive">
                   {selectedVertex.uri}
                 </Box>
                 {selectedVertex.comments?.length > 0 && (
                   <Box variant="p">
-                    <strong>Description:</strong>{" "}
+                    <strong>{t("Description:")}</strong>{" "}
                     {selectedVertex.comments.join(" ")}
                   </Box>
                 )}
 
                 {selectedVertex.alt_labels?.length > 0 && (
                   <Box variant="p">
-                    <strong>Synonyms:</strong>{" "}
+                    <strong>{t("Synonyms:")}</strong>{" "}
                     {selectedVertex.alt_labels.join(", ")}
                   </Box>
                 )}
@@ -1990,8 +2035,11 @@ export function GraphSearchPage() {
                   return (
                     <Box variant="p">
                       <strong>
-                        Defined in{" "}
-                        {sources.length > 1 ? "ontologies" : "ontology"}:
+                        {t(
+                          sources.length > 1
+                            ? "Defined in ontologies:"
+                            : "Defined in ontology:",
+                        )}
                       </strong>{" "}
                       {sources.map((s) => s.name).join(", ")}
                     </Box>
@@ -2016,20 +2064,22 @@ export function GraphSearchPage() {
                       {relEdges.length > 0 && (
                         <>
                           <Header variant="h3">
-                            Relationships ({relEdges.length})
+                            {t("Relationships ({count})", {
+                              count: relEdges.length,
+                            })}
                           </Header>
                           <Table
                             items={relEdges}
                             columnDefinitions={[
                               {
                                 id: "predicate",
-                                header: "Predicate",
+                                header: t("Predicate"),
                                 cell: (e) =>
                                   e.predicate_label || localName(e.predicate),
                               },
                               {
                                 id: "neighbor",
-                                header: "Neighbor",
+                                header: t("Neighbor"),
                                 cell: (e) =>
                                   e.neighbor?.label ||
                                   localName(e.neighbor?.uri),
@@ -2049,20 +2099,22 @@ export function GraphSearchPage() {
                       {attrEdges.length > 0 && (
                         <>
                           <Header variant="h3">
-                            Attributes ({attrEdges.length})
+                            {t("Attributes ({count})", {
+                              count: attrEdges.length,
+                            })}
                           </Header>
                           <Table
                             items={attrEdges}
                             columnDefinitions={[
                               {
                                 id: "predicate",
-                                header: "Attribute",
+                                header: t("Attribute"),
                                 cell: (e) =>
                                   e.predicate_label || localName(e.predicate),
                               },
                               {
                                 id: "neighbor",
-                                header: "Type / target",
+                                header: t("Type / target"),
                                 cell: (e) =>
                                   e.neighbor?.label ||
                                   localName(e.neighbor?.uri),
@@ -2076,24 +2128,26 @@ export function GraphSearchPage() {
                       {matchEdges.length > 0 && (
                         <>
                           <Header variant="h3">
-                            Matches ({matchEdges.length})
+                            {t("Matches ({count})", {
+                              count: matchEdges.length,
+                            })}
                           </Header>
                           <Box variant="small" color="text-status-inactive">
-                            Near-duplicate / grounding links (skos:closeMatch /
-                            exactMatch) — drawn as edges in the graph; not
-                            counted as relationships.
+                            {t(
+                              "Near-duplicate / grounding links (skos:closeMatch / exactMatch) — drawn as edges in the graph; not counted as relationships.",
+                            )}
                           </Box>
                           <Table
                             items={matchEdges}
                             columnDefinitions={[
                               {
                                 id: "predicate",
-                                header: "Match type",
+                                header: t("Match type"),
                                 cell: (e) => localName(e.predicate),
                               },
                               {
                                 id: "neighbor",
-                                header: "Class",
+                                header: t("Class"),
                                 cell: (e) =>
                                   e.neighbor?.label ||
                                   localName(e.neighbor?.uri),
@@ -2120,18 +2174,20 @@ export function GraphSearchPage() {
       <PendingReviewBanner />
       <Header
         variant="h1"
-        description="Browse the ontologies in this namespace, the classes inside them, and the sources they were induced from."
+        description={t(
+          "Browse the ontologies in this namespace, the classes inside them, and the sources they were induced from.",
+        )}
       >
-        Explorer
+        {t("Explorer")}
       </Header>
       <Tabs
         activeTabId={tab}
         onChange={({ detail }) => setTab(detail.activeTabId)}
         tabs={[
-          { id: "classes", label: "Classes", content: classesTab },
+          { id: "classes", label: t("Classes"), content: classesTab },
           {
             id: "ontologies",
-            label: "Ontologies",
+            label: t("Ontologies"),
             content: (
               <OntologyInventoryView
                 apiClient={apiClient}
@@ -2141,7 +2197,7 @@ export function GraphSearchPage() {
           },
           {
             id: "sources",
-            label: "Inducted sources",
+            label: t("Inducted sources"),
             content: (
               <InductedSourcesView
                 apiClient={apiClient}

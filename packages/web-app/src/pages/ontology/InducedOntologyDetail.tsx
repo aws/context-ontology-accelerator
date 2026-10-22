@@ -7,7 +7,7 @@
  * Uses react-query hooks + the Smithy-generated TS client for data fetching.
  * The ontology IRI is passed as the ``ontology_id`` query param.
  */
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import Alert from "@cloudscape-design/components/alert";
 import Badge from "@cloudscape-design/components/badge";
@@ -27,6 +27,8 @@ import Tabs from "@cloudscape-design/components/tabs";
 import { SortableTable } from "@components/SortableTable";
 import { useOntologyOverview } from "@api-hooks/use-ontology-overview";
 import { useListOntologies } from "@api-hooks/use-list-ontologies";
+import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
+import { useNamespace } from "@api-hooks/use-namespace";
 import {
   deleteOntology,
   downloadOntology,
@@ -34,9 +36,9 @@ import {
 import { OntologyDeleteWarning } from "@components/ontology/OntologyDeleteWarning";
 import { downloadTextFile } from "@utils/download";
 import { useApiClient } from "@components/ApiClientProvider";
-import { useBreadcrumbs } from "@components/BreadcrumbProvider";
 import { TurtleHighlight } from "@components/TurtleHighlight";
 import { PendingReviewBanner } from "@components/ontology/PendingReviewBanner";
+import { useAppI18n } from "../../i18n/LocaleProvider";
 
 /** Strip an IRI down to its local name (after the last ``#`` or ``/``). */
 export function localName(uri: string | undefined | null): string {
@@ -52,6 +54,7 @@ export function localName(uri: string | undefined | null): string {
 }
 
 export function InducedOntologyDetailPage() {
+  const { t } = useAppI18n();
   const { namespaceId } = useParams<{ namespaceId: string }>();
   const [searchParams] = useSearchParams();
   const ontologyId = searchParams.get("ontology_id") ?? "";
@@ -68,22 +71,19 @@ export function InducedOntologyDetailPage() {
     (r) => r.ontologyId === ontologyId || r.uri === ontologyId,
   );
 
-  // Breadcrumb: COA › Ontology › Induction › {Ontology}
-  const { setBreadcrumbs, clearBreadcrumbs } = useBreadcrumbs();
+  // Breadcrumb: COA › {Namespace} › Ontology › Induction › {Ontology}
+  const { name: nsName } = useNamespace(namespaceId);
   const ontologyLabel = record?.title || localName(ontologyId);
-  useEffect(() => {
-    setBreadcrumbs([
-      { text: "COA", onClick: () => navigate("/") },
-      { text: "Ontology" },
-      {
-        text: "Induction",
-        onClick: () => navigate(`/namespaces/${namespaceId}/ontology`),
-      },
-      { text: ontologyLabel },
-    ]);
-    return () => clearBreadcrumbs();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [namespaceId, ontologyLabel]);
+  useBreadcrumbTrail([
+    { text: nsName, href: `/namespaces/${namespaceId}`, namespaceId },
+    { text: t("Ontology") },
+    {
+      text: t("Induction"),
+      href: `/namespaces/${namespaceId}/ontology`,
+      namespaceId,
+    },
+    { text: ontologyLabel },
+  ]);
 
   const [activeTabId, setActiveTabId] = useState("classes");
   const [turtle, setTurtle] = useState<string | null>(null);
@@ -114,7 +114,7 @@ export function InducedOntologyDetailPage() {
       closeDeleteModal();
       navigate(`/namespaces/${namespaceId}/ontology/graph?tab=ontologies`);
     } catch (e) {
-      setDeleteError(e instanceof Error ? e.message : "Failed to delete");
+      setDeleteError(e instanceof Error ? e.message : t("Failed to delete"));
     } finally {
       setDeleteBusy(false);
     }
@@ -174,7 +174,7 @@ export function InducedOntologyDetailPage() {
       return text;
     } catch (e) {
       setTurtleError(
-        e instanceof Error ? e.message : "Failed to load ontology source",
+        e instanceof Error ? e.message : t("Failed to load ontology source"),
       );
       return null;
     } finally {
@@ -210,8 +210,8 @@ export function InducedOntologyDetailPage() {
 
   if (!ontologyId) {
     return (
-      <Alert type="error" header="Missing ontology">
-        No ontology was specified.
+      <Alert type="error" header={t("Missing ontology")}>
+        {t("No ontology was specified.")}
       </Alert>
     );
   }
@@ -226,7 +226,7 @@ export function InducedOntologyDetailPage() {
             {isDeleting && (
               <Box padding={{ top: "xxs" }}>
                 <StatusIndicator type="in-progress">
-                  Delete in progress
+                  {t("Delete in progress")}
                 </StatusIndicator>
               </Box>
             )}
@@ -235,31 +235,33 @@ export function InducedOntologyDetailPage() {
               loading={downloadBusy}
               onClick={handleDownload}
             >
-              Download .ttl
+              {t("Download .ttl")}
             </Button>
             <Button
               onClick={() => setShowDeleteModal(true)}
               disabled={isDeleting}
-              disabledReason="A delete is already in progress for this ontology."
+              disabledReason={t(
+                "A delete is already in progress for this ontology.",
+              )}
             >
-              Delete ontology
+              {t("Delete ontology")}
             </Button>
           </SpaceBetween>
         }
         description={ontologyId}
       >
-        Induced Ontology
+        {t("Induced Ontology")}
       </Header>
 
       {error && (
-        <Alert type="warning" header="Could not load graph contents">
+        <Alert type="warning" header={t("Could not load graph contents")}>
           {error.message}
         </Alert>
       )}
 
       {/* A stuck delete: still "deleting" but teardown failed. Re-issue to retry. */}
       {isDeleting && record?.deleteError && (
-        <Alert type="error" header="Delete failed — retry to try again">
+        <Alert type="error" header={t("Delete failed — retry to try again")}>
           {record.deleteError}
         </Alert>
       )}
@@ -268,12 +270,14 @@ export function InducedOntologyDetailPage() {
         <Modal
           visible
           onDismiss={closeDeleteModal}
-          header={`Delete ontology "${record?.title || localName(ontologyId)}"?`}
+          header={t('Delete ontology "{name}"?', {
+            name: record?.title || localName(ontologyId),
+          })}
           footer={
             <Box float="right">
               <SpaceBetween direction="horizontal" size="xs">
                 <Button variant="link" onClick={closeDeleteModal}>
-                  Cancel
+                  {t("Cancel")}
                 </Button>
                 <Button
                   variant="primary"
@@ -281,7 +285,7 @@ export function InducedOntologyDetailPage() {
                   disabled={deleteBusy || deleteConfirmText !== "delete"}
                   onClick={confirmDelete}
                 >
-                  Delete
+                  {t("Delete")}
                 </Button>
               </SpaceBetween>
             </Box>
@@ -293,11 +297,11 @@ export function InducedOntologyDetailPage() {
               name={record?.title || localName(ontologyId)}
             />
             {deleteError && (
-              <Alert type="error" header="Delete failed">
+              <Alert type="error" header={t("Delete failed")}>
                 {deleteError}
               </Alert>
             )}
-            <FormField label="Type delete to confirm">
+            <FormField label={t('Type "delete" to confirm')}>
               <Input
                 value={deleteConfirmText}
                 onChange={({ detail }) => setDeleteConfirmText(detail.value)}
@@ -313,16 +317,19 @@ export function InducedOntologyDetailPage() {
         <KeyValuePairs
           columns={4}
           items={[
-            { label: "Classes", value: String(totalClasses) },
-            { label: "Relationships", value: String(totalRelationships) },
-            { label: "Attributes", value: String(totalAttributes) },
+            { label: t("Classes"), value: String(totalClasses) },
             {
-              label: "Grounded against",
+              label: t("Relationships"),
+              value: String(totalRelationships),
+            },
+            { label: t("Attributes"), value: String(totalAttributes) },
+            {
+              label: t("Grounded against"),
               value:
                 groundedAgainst.length === 0 ? (
                   // Mid-fetch must not read as "ungrounded".
                   <Box color="text-status-inactive">
-                    {loading ? "—" : "None (all classes novel)"}
+                    {loading ? "—" : t("None (all classes novel)")}
                   </Box>
                 ) : (
                   <SpaceBetween size="xxxs">
@@ -334,12 +341,20 @@ export function InducedOntologyDetailPage() {
                           color="text-status-inactive"
                           display="inline"
                         >
-                          ({g.count} {g.count === 1 ? "class" : "classes"})
+                          (
+                          {t(
+                            g.count === 1 ? "{count} class" : "{count} classes",
+                            { count: g.count },
+                          )}
+                          )
                         </Box>
                       </Box>
                     ))}
                     <Box variant="small" color="text-status-inactive">
-                      {groundedClassCount} of {totalClasses} classes grounded
+                      {t("{grounded} of {total} classes grounded", {
+                        grounded: groundedClassCount,
+                        total: totalClasses,
+                      })}
                     </Box>
                   </SpaceBetween>
                 ),
@@ -351,17 +366,23 @@ export function InducedOntologyDetailPage() {
       {(classes.length < totalClasses ||
         relationships.length < totalRelationships ||
         attributes.length < totalAttributes) && (
-        <Alert type="info" header="Showing a partial view">
-          This ontology is larger than the page the tables load, so they show
-          the first {classes.length} of {totalClasses} classes,{" "}
-          {relationships.length} of {totalRelationships} relationships, and{" "}
-          {attributes.length} of {totalAttributes} attributes. Download the .ttl
-          for the complete ontology.
+        <Alert type="info" header={t("Showing a partial view")}>
+          {t(
+            "This ontology is larger than the page the tables load, so they show the first {classesShown} of {classesTotal} classes, {relationshipsShown} of {relationshipsTotal} relationships, and {attributesShown} of {attributesTotal} attributes. Download the .ttl for the complete ontology.",
+            {
+              classesShown: classes.length,
+              classesTotal: totalClasses,
+              relationshipsShown: relationships.length,
+              relationshipsTotal: totalRelationships,
+              attributesShown: attributes.length,
+              attributesTotal: totalAttributes,
+            },
+          )}
         </Alert>
       )}
 
       <Tabs
-        ariaLabel="Induced ontology graph contents"
+        ariaLabel={t("Induced ontology graph contents")}
         activeTabId={activeTabId}
         onChange={({ detail }) => {
           setActiveTabId(detail.activeTabId);
@@ -370,7 +391,7 @@ export function InducedOntologyDetailPage() {
         tabs={[
           {
             id: "classes",
-            label: `Classes (${totalClasses})`,
+            label: t("Classes ({count})", { count: totalClasses }),
             content: (
               <SortableTable
                 loading={loading}
@@ -381,7 +402,7 @@ export function InducedOntologyDetailPage() {
                 columnDefinitions={[
                   {
                     id: "name",
-                    header: "Class",
+                    header: t("Class"),
                     isRowHeader: true,
                     sortingComparator: (a, b) =>
                       (a.label || localName(a.uri)).localeCompare(
@@ -400,22 +421,24 @@ export function InducedOntologyDetailPage() {
                   },
                   {
                     id: "origin",
-                    header: "Origin",
+                    header: t("Origin"),
                     // Grounded (0) sorts before Novel (1).
                     sortingComparator: (a, b) =>
                       (a.groundedTo ? 0 : 1) - (b.groundedTo ? 0 : 1),
                     cell: (c) =>
                       c.groundedTo ? (
                         <Badge color="blue">
-                          {`Grounded${c.matchType ? ` (${c.matchType})` : ""}`}
+                          {`${t("Grounded")}${
+                            c.matchType ? ` (${c.matchType})` : ""
+                          }`}
                         </Badge>
                       ) : (
-                        <Badge color="green">Novel</Badge>
+                        <Badge color="green">{t("Novel")}</Badge>
                       ),
                   },
                   {
                     id: "groundedTo",
-                    header: "Grounded to",
+                    header: t("Grounded to"),
                     sortingComparator: (a, b) =>
                       (a.groundedTo
                         ? localName(a.groundedTo)
@@ -434,7 +457,7 @@ export function InducedOntologyDetailPage() {
                   },
                   {
                     id: "comment",
-                    header: "Description",
+                    header: t("Description"),
                     sortingComparator: (a, b) =>
                       (a.comment || "").localeCompare(b.comment || ""),
                     cell: (c) => c.comment || "—",
@@ -442,9 +465,9 @@ export function InducedOntologyDetailPage() {
                 ]}
                 empty={
                   <Box textAlign="center" color="text-body-secondary">
-                    No classes persisted in the graph yet. If you just accepted
-                    a proposal, the graph may still be materializing — refresh
-                    in a moment.
+                    {t(
+                      "No classes persisted in the graph yet. If you just accepted a proposal, the graph may still be materializing — refresh in a moment.",
+                    )}
                   </Box>
                 }
               />
@@ -452,7 +475,9 @@ export function InducedOntologyDetailPage() {
           },
           {
             id: "relationships",
-            label: `Relationships (${totalRelationships})`,
+            label: t("Relationships ({count})", {
+              count: totalRelationships,
+            }),
             content: (
               <SortableTable
                 loading={loading}
@@ -463,7 +488,7 @@ export function InducedOntologyDetailPage() {
                 columnDefinitions={[
                   {
                     id: "name",
-                    header: "Relationship",
+                    header: t("Relationship"),
                     isRowHeader: true,
                     sortingComparator: (a, b) =>
                       (a.label || localName(a.uri)).localeCompare(
@@ -473,14 +498,14 @@ export function InducedOntologyDetailPage() {
                   },
                   {
                     id: "domain",
-                    header: "Subject class",
+                    header: t("Subject class"),
                     sortingComparator: (a, b) =>
                       localName(a.domain).localeCompare(localName(b.domain)),
                     cell: (p) => localName(p.domain),
                   },
                   {
                     id: "range",
-                    header: "Object class",
+                    header: t("Object class"),
                     sortingComparator: (a, b) =>
                       localName(a.range).localeCompare(localName(b.range)),
                     cell: (p) => localName(p.range),
@@ -488,7 +513,9 @@ export function InducedOntologyDetailPage() {
                 ]}
                 empty={
                   <Box textAlign="center" color="text-body-secondary">
-                    No object-property relationships persisted in the graph.
+                    {t(
+                      "No object-property relationships persisted in the graph.",
+                    )}
                   </Box>
                 }
               />
@@ -496,7 +523,9 @@ export function InducedOntologyDetailPage() {
           },
           {
             id: "attributes",
-            label: `Attributes (${totalAttributes})`,
+            label: t("Attributes ({count})", {
+              count: totalAttributes,
+            }),
             content: (
               <SortableTable
                 loading={loading}
@@ -507,7 +536,7 @@ export function InducedOntologyDetailPage() {
                 columnDefinitions={[
                   {
                     id: "name",
-                    header: "Attribute",
+                    header: t("Attribute"),
                     isRowHeader: true,
                     sortingComparator: (a, b) =>
                       (a.label || localName(a.uri)).localeCompare(
@@ -517,14 +546,14 @@ export function InducedOntologyDetailPage() {
                   },
                   {
                     id: "domain",
-                    header: "Class",
+                    header: t("Class"),
                     sortingComparator: (a, b) =>
                       localName(a.domain).localeCompare(localName(b.domain)),
                     cell: (p) => localName(p.domain),
                   },
                   {
                     id: "range",
-                    header: "Datatype",
+                    header: t("Datatype"),
                     sortingComparator: (a, b) =>
                       localName(a.range).localeCompare(localName(b.range)),
                     cell: (p) => localName(p.range),
@@ -532,7 +561,9 @@ export function InducedOntologyDetailPage() {
                 ]}
                 empty={
                   <Box textAlign="center" color="text-body-secondary">
-                    No datatype-property attributes persisted in the graph.
+                    {t(
+                      "No datatype-property attributes persisted in the graph.",
+                    )}
                   </Box>
                 }
               />
@@ -540,24 +571,24 @@ export function InducedOntologyDetailPage() {
           },
           {
             id: "source",
-            label: "Source (Turtle)",
+            label: t("Source (Turtle)"),
             content: (
               <SpaceBetween size="s">
                 {turtleError && (
-                  <Alert type="warning" header="Could not load source">
+                  <Alert type="warning" header={t("Could not load source")}>
                     {turtleError}
                   </Alert>
                 )}
                 {turtleLoading ? (
                   <Box textAlign="center" padding="l">
-                    <Spinner /> Loading source…
+                    <Spinner /> {t("Loading source…")}
                   </Box>
                 ) : turtle ? (
                   <TurtleHighlight>{turtle}</TurtleHighlight>
                 ) : (
                   !turtleError && (
                     <Box color="text-body-secondary">
-                      No source available for this ontology.
+                      {t("No source available for this ontology.")}
                     </Box>
                   )
                 )}

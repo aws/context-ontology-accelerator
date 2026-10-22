@@ -11,6 +11,7 @@ import { DockerImageAsset, Platform } from "aws-cdk-lib/aws-ecr-assets";
 import { Construct } from "constructs";
 import { prefixedLambdaArn, resolveContext } from "../../context";
 import { agentCoreSupportedSubnets } from "../../utils/agentcore-az";
+import { retainAgentCoreSecurityGroup } from "../../utils/agentcore-teardown";
 import { brandEnv } from "../../utils/brand-env";
 import { parseEcrImageUri } from "../../utils/ecr-utils";
 import { Paths } from "../../paths";
@@ -105,6 +106,8 @@ export class McpStack extends SCLStack {
       description: "AgentCore Runtime - MCP Server (thin proxy)",
       allowAllOutbound: false,
     });
+    // Its ENIs outlive the runtime by hours; destroy.sh deletes it afterwards.
+    retainAgentCoreSecurityGroup(mcpSg);
 
     // HTTPS to VPC endpoints (AgentCore invocations)
     mcpSg.addEgressRule(

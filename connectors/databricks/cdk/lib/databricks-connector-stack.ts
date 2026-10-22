@@ -18,6 +18,7 @@ import {
   publishSingleTargetOutputs,
   singleTargetEnvironment,
 } from "./single-target";
+import { solutionStackDescription } from "./solution";
 
 /**
  * A customer-deployed Databricks connector: the Lambda, its own spill bucket and CMK, and read
@@ -29,7 +30,11 @@ export class DatabricksConnectorStack extends cdk.Stack {
   public readonly connector: AthenaFederationConnector;
 
   constructor(scope: Construct, id: string, props: DatabricksConnectorStackProps = {}) {
-    super(scope, id, props);
+    super(scope, id, {
+      ...props,
+      // AWS Solutions counts stack launches by the `(SO0376)` description prefix.
+      description: props.description ?? solutionStackDescription(id),
+    });
 
     assertNotManagedFunctionName(props);
 

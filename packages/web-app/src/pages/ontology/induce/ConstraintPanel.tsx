@@ -23,6 +23,7 @@ import Textarea from "@cloudscape-design/components/textarea";
 import { ButtonWithHint } from "@components/ButtonWithHint";
 import { InfoPopover } from "@components/InfoPopover";
 import { downloadTextFile } from "@utils/download";
+import { useAppI18n, type AppTranslate } from "../../../i18n/LocaleProvider";
 
 interface PropertyConstraint {
   property_path: string;
@@ -44,31 +45,31 @@ interface ConstraintConfig {
   classes: ClassConstraints[];
 }
 
-function sourceBadge(source: string) {
+function sourceBadge(source: string, t: AppTranslate) {
   switch (source) {
     case "db_constraint":
       return <Badge color="blue">DB</Badge>;
     case "llm_inferred":
       return <Badge color="green">LLM</Badge>;
     case "user_added":
-      return <Badge color="grey">custom</Badge>;
+      return <Badge color="grey">{t("custom")}</Badge>;
     default:
       return <Badge>{source}</Badge>;
   }
 }
 
-function typeBadge(type: string) {
+function typeBadge(type: string, t: AppTranslate) {
   switch (type) {
     case "required":
-      return <Badge color="severity-medium">required</Badge>;
+      return <Badge color="severity-medium">{t("required")}</Badge>;
     case "unique":
-      return <Badge color="blue">unique</Badge>;
+      return <Badge color="blue">{t("unique")}</Badge>;
     case "positive":
-      return <Badge color="green">positive</Badge>;
+      return <Badge color="green">{t("positive")}</Badge>;
     case "reference":
-      return <Badge color="blue">reference</Badge>;
+      return <Badge color="blue">{t("reference")}</Badge>;
     case "datatype":
-      return <Badge color="grey">datatype</Badge>;
+      return <Badge color="grey">{t("datatype")}</Badge>;
     default:
       return <Badge>{type}</Badge>;
   }
@@ -116,6 +117,7 @@ export function ConstraintPanel({
   // editable panels in ProposalDetail).
   isReadOnly?: boolean;
 }) {
+  const { t } = useAppI18n();
   const [newRule, setNewRule] = useState("");
 
   function toggleConstraint(
@@ -197,54 +199,65 @@ export function ConstraintPanel({
     <ExpandableSection
       variant="container"
       defaultExpanded={false}
-      headerText="SHACL Constraints"
+      headerText={t("SHACL Constraints")}
       headerInfo={
         <SpaceBetween direction="horizontal" size="xxs" alignItems="center">
           <Badge color="blue">Beta</Badge>
           <InfoPopover
-            header="SHACL constraints"
-            ariaLabel="About SHACL constraints"
+            header={t("SHACL constraints")}
+            ariaLabel={t("About SHACL constraints")}
           >
             <SpaceBetween size="xs">
               <Box variant="p">
-                Formal data-quality rules for this ontology (required fields,
-                uniqueness, value ranges, references).
+                {t(
+                  "Formal data-quality rules for this ontology (required fields, uniqueness, value ranges, references).",
+                )}
               </Box>
               <Box variant="p">
-                Context Ontology Accelerator pre-fills them from your database
-                schema, and Infer adds domain rules using an AI model.
+                {t(
+                  "Context Ontology Accelerator pre-fills them from your database schema, and Infer adds domain rules using an AI model.",
+                )}
               </Box>
               <Box variant="p">
-                Validate compiles the enabled rules and checks the proposal
-                against them; violations are reported before you accept.
+                {t(
+                  "Validate compiles the enabled rules and checks the proposal against them; violations are reported before you accept.",
+                )}
               </Box>
             </SpaceBetween>
           </InfoPopover>
         </SpaceBetween>
       }
-      headerCounter={config ? `(${totalEnabled} active)` : undefined}
+      headerCounter={
+        config ? t("({count} active)", { count: totalEnabled }) : undefined
+      }
       headerActions={
         <SpaceBetween direction="horizontal" size="xs" alignItems="center">
           <ButtonWithHint
-            hint="Uses an AI model to suggest domain rules the schema can't capture (value ranges, date ordering, allowed status values). Suggestions are tagged LLM to keep or remove."
+            hint={t(
+              "Uses an AI model to suggest domain rules the schema can't capture (value ranges, date ordering, allowed status values). Suggestions are tagged LLM to keep or remove.",
+            )}
             onClick={onInfer}
             loading={inferring}
             disabled={isReadOnly}
             iconName="gen-ai"
           >
-            Infer constraints
+            {t("Infer constraints")}
           </ButtonWithHint>
           <ButtonWithHint
-            hint="Compiles the enabled constraints into SHACL shapes and checks the proposal against them, reporting violations below. Also unlocks Export SHACL."
+            hint={t(
+              "Compiles the enabled constraints into SHACL shapes and checks the proposal against them, reporting violations below. Also unlocks Export SHACL.",
+            )}
             variant="primary"
             onClick={() => config && onValidate(config, customTurtle)}
             loading={validating}
             disabled={!config || totalEnabled === 0}
           >
-            Validate
+            {t("Validate")}
           </ButtonWithHint>
           <ButtonWithHint
-            hint="Downloads the compiled constraints as a standard SHACL Turtle file you can version, share, or run in any SHACL validator. Enabled after you run Validate."
+            hint={t(
+              "Downloads the compiled constraints as a standard SHACL Turtle file you can version, share, or run in any SHACL validator. Enabled after you run Validate.",
+            )}
             iconName="download"
             onClick={() => {
               if (!compiledShapes) return;
@@ -258,7 +271,7 @@ export function ConstraintPanel({
             }}
             disabled={!compiledShapes}
           >
-            Export SHACL
+            {t("Export SHACL")}
           </ButtonWithHint>
         </SpaceBetween>
       }
@@ -269,7 +282,7 @@ export function ConstraintPanel({
             so the user sees it immediately, not scrolled off the bottom. */}
         {inferring && (
           <StatusIndicator type="loading">
-            Inferring domain constraints from ontology...
+            {t("Inferring domain constraints from ontology...")}
           </StatusIndicator>
         )}
 
@@ -294,8 +307,8 @@ export function ConstraintPanel({
                 type={shaclPassed ? "success" : "error"}
                 header={
                   shaclPassed
-                    ? "SHACL validation passed"
-                    : "SHACL validation failed"
+                    ? t("SHACL validation passed")
+                    : t("SHACL validation failed")
                 }
                 dismissible
                 onDismiss={onDismissValidation}
@@ -322,45 +335,43 @@ export function ConstraintPanel({
 
         {!config && (
           <Box variant="small" color="text-status-inactive">
-            No constraint config available. Run a new induction to auto-generate
-            constraints from database schema.
+            {t(
+              "No constraint config available. Run a new induction to auto-generate constraints from database schema.",
+            )}
           </Box>
         )}
 
         {config && config.classes.length > 0 && (
           <SpaceBetween direction="horizontal" size="xxs" alignItems="center">
             <Box variant="small" color="text-status-inactive">
-              Per class: enable the rules to enforce.
+              {t("Per class: enable the rules to enforce.")}
             </Box>
             <InfoPopover
-              header="Badges legend"
-              ariaLabel="About constraint sources and types"
+              header={t("Badges legend")}
+              ariaLabel={t("About constraint sources and types")}
             >
               <SpaceBetween size="xs">
+                <Box variant="p">{t("Sources")}</Box>
                 <Box variant="p">
-                  <strong>Sources</strong>
+                  {t(
+                    "DB: from your database schema (NOT NULL, UNIQUE, keys, column types).",
+                  )}
                 </Box>
                 <Box variant="p">
-                  <strong>DB</strong>: from your database schema (NOT NULL,
-                  UNIQUE, keys, column types).
+                  {t(
+                    "LLM: a domain rule suggested by Infer. Review before trusting.",
+                  )}
                 </Box>
                 <Box variant="p">
-                  <strong>LLM</strong>: a domain rule suggested by Infer. Review
-                  before trusting.
+                  {t(
+                    "Custom: a rule you added (natural language or pasted SHACL).",
+                  )}
                 </Box>
+                <Box variant="p">{t("Types")}</Box>
                 <Box variant="p">
-                  <strong>Custom</strong>: a rule you added (natural language or
-                  pasted SHACL).
-                </Box>
-                <Box variant="p">
-                  <strong>Types</strong>
-                </Box>
-                <Box variant="p">
-                  <strong>required</strong>: field must have a value.{" "}
-                  <strong>unique</strong>: at most one value per record.{" "}
-                  <strong>reference</strong>: must point to a related record.{" "}
-                  <strong>datatype</strong>: pins the value's type.{" "}
-                  <strong>positive</strong>: value above a minimum.
+                  {t(
+                    "required: field must have a value. unique: at most one value per record. reference: must point to a related record. datatype: pins the value's type. positive: value above a minimum.",
+                  )}
                 </Box>
               </SpaceBetween>
             </InfoPopover>
@@ -389,7 +400,11 @@ export function ConstraintPanel({
                     <Checkbox
                       checked={constraint.enabled}
                       disabled={isReadOnly}
-                      ariaLabel={`Enable constraint ${constraint.property_name || constraint.constraint_type}`}
+                      ariaLabel={t("Enable constraint {name}", {
+                        name:
+                          constraint.property_name ||
+                          constraint.constraint_type,
+                      })}
                       onChange={({ detail }) =>
                         toggleConstraint(
                           classIdx,
@@ -401,8 +416,8 @@ export function ConstraintPanel({
                     <Box variant="small" display="inline" fontWeight="bold">
                       {constraint.property_name || "—"}
                     </Box>
-                    {typeBadge(constraint.constraint_type)}
-                    {sourceBadge(constraint.source)}
+                    {typeBadge(constraint.constraint_type, t)}
+                    {sourceBadge(constraint.source, t)}
                     <Box
                       variant="small"
                       color="text-status-inactive"
@@ -416,47 +431,49 @@ export function ConstraintPanel({
             </ExpandableSection>
           ))}
 
-        <ExpandableSection headerText="Add custom rule" variant="footer">
+        <ExpandableSection headerText={t("Add custom rule")} variant="footer">
           <SpaceBetween size="s">
             <Box variant="small" color="text-status-inactive">
-              Natural-language rules are recorded for reviewer context but are
-              not automatically compiled into SHACL. To enforce a rule, express
-              it as a structured constraint above or paste SHACL in "Custom
-              SHACL (advanced)".
+              {t(
+                'Natural-language rules are recorded for reviewer context but are not automatically compiled into SHACL. To enforce a rule, express it as a structured constraint above or paste SHACL in "Custom SHACL (advanced)".',
+              )}
             </Box>
             <div style={{ display: "flex", gap: 8 }}>
               <div style={{ flex: 1 }}>
                 <Input
                   value={newRule}
                   disabled={isReadOnly}
-                  ariaLabel="Natural-language constraint rule"
+                  ariaLabel={t("Natural-language constraint rule")}
                   onChange={({ detail }) => setNewRule(detail.value)}
-                  placeholder="e.g., Every policy must have a premium amount greater than zero"
+                  placeholder={t(
+                    "e.g., Every policy must have a premium amount greater than zero",
+                  )}
                 />
               </div>
               <Button
                 onClick={addCustomRule}
                 disabled={isReadOnly || !newRule.trim()}
               >
-                Add
+                {t("Add")}
               </Button>
             </div>
           </SpaceBetween>
         </ExpandableSection>
 
         <ExpandableSection
-          headerText="Custom SHACL (advanced)"
+          headerText={t("Custom SHACL (advanced)")}
           variant="footer"
         >
           <SpaceBetween size="s">
             <Box variant="small" color="text-status-inactive">
-              Paste additional SHACL shapes in Turtle format. These are appended
-              verbatim to the compiled constraints.
+              {t(
+                "Paste additional SHACL shapes in Turtle format. These are appended verbatim to the compiled constraints.",
+              )}
             </Box>
             <Textarea
               value={customTurtle}
               disabled={isReadOnly}
-              ariaLabel="Custom SHACL shapes (Turtle)"
+              ariaLabel={t("Custom SHACL shapes (Turtle)")}
               onChange={({ detail }) => onCustomTurtleChange(detail.value)}
               placeholder="@prefix sh: <http://www.w3.org/ns/shacl#> ."
               rows={5}

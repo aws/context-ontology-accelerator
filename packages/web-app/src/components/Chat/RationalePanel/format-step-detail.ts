@@ -1,6 +1,13 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import {
+  formatAppMessage,
+  type AppMessage,
+  type AppMessageValues,
+} from "../../../i18n/appMessages";
+import type { AppTranslate } from "../../../i18n/LocaleProvider";
+
 /**
  * Per-step-type formatters that convert structured detail objects
  * from the backend into human-readable sentences for the execution plan.
@@ -10,11 +17,16 @@
  */
 
 type DetailRecord = Record<string, unknown>;
-type Formatter = (detail: DetailRecord) => string;
+type Formatter = (detail: DetailRecord, t: AppTranslate) => string;
+
+const englishTranslate: AppTranslate = (
+  message: AppMessage,
+  values?: AppMessageValues,
+) => formatAppMessage("en", message, values);
 
 // Human-readable phrasing for raw backend error codes so the UI never shows
 // snake_case identifiers like "vkg_translation_error".
-const ERROR_CODE_LABELS: Record<string, string> = {
+const ERROR_CODE_LABELS: Readonly<Record<string, AppMessage>> = {
   vkg_translation_error: "Ontop could not translate the SPARQL to SQL",
   no_tables_retrieved: "no matching tables found",
   query_execution_error: "query execution failed",
@@ -29,9 +41,10 @@ const ERROR_CODE_LABELS: Record<string, string> = {
   RetrieveError: "the search backend was unavailable",
 };
 
-function humanizeError(value: unknown): string {
+function humanizeError(value: unknown, t: AppTranslate): string {
   const raw = String(value ?? "").trim();
-  if (ERROR_CODE_LABELS[raw]) return ERROR_CODE_LABELS[raw];
+  const knownLabel = ERROR_CODE_LABELS[raw];
+  if (knownLabel) return t(knownLabel);
   // Some backend errors arrive as "<code>: <detail>" (e.g.
   // "retrieve_failed: Vector search proxy returned an error"). Humanize the
   // leading code and keep a short, readable tail rather than leaking the raw
@@ -39,9 +52,10 @@ function humanizeError(value: unknown): string {
   const prefixed = raw.match(/^([a-z][a-z0-9_]+):\s*(.+)$/);
   if (prefixed) {
     const code = prefixed[1];
-    if (code === "retrieve_failed") return "the search backend was unavailable";
-    const label = ERROR_CODE_LABELS[code] ?? code.replace(/_/g, " ");
-    return label;
+    if (code === "retrieve_failed")
+      return t("the search backend was unavailable");
+    const label = ERROR_CODE_LABELS[code];
+    return label ? t(label) : code.replace(/_/g, " ");
   }
   // Generic snake_case → sentence case for unknown codes.
   if (/^[a-z][a-z0-9_]+$/.test(raw)) return raw.replace(/_/g, " ");
@@ -56,63 +70,89 @@ function isRawExceptionName(value: unknown): boolean {
 }
 
 // Cap a list for inline display; full list stays in the raw detail/trace.
-function summarizeList(items: unknown, max = 5): string {
+function summarizeList(items: unknown, t: AppTranslate, max = 5): string {
   if (!Array.isArray(items) || items.length === 0) return "";
   const shown = items.slice(0, max).join(", ");
   const extra = items.length - max;
-  return extra > 0 ? `${shown}, +${extra} more` : shown;
+  return extra > 0
+    ? t("{items}, +{count} more", { items: shown, count: extra })
+    : shown;
 }
 
-const _authorizeFormatter: Formatter = (d) => {
+const _authorizeFormatter: Formatter = (d, t) => {
   const principal = d.principal ?? "unknown";
   // "allow" with no row/column restriction to apply. Phrased as an outcome
   // ("access authorized") rather than the implementation detail ("no filter
   // injection required"), which read as a non-sequitur in the demo trace.
   if (d.decision === "allow")
-    return `Access authorized for ${principal} (no row/column restrictions).`;
-  if (d.decision === "deny") return `Access denied for principal ${principal}.`;
+    return t(
+      "Access authorized for {principal} (no row/column restrictions).",
+      { principal: String(principal) },
+    );
+  if (d.decision === "deny")
+    return t("Access denied for principal {principal}.", {
+      principal: String(principal),
+    });
   return "";
 };
 
-const _firewallFormatter: Formatter = (d) => {
+const _firewallFormatter: Formatter = (d, t) => {
   // Backend emits {denied: false} on the pass path (t2.vkg.firewall) and
   // {decision: "authorized"} elsewhere. The firewall validates the SQL — it
   // does not "inject" — so a clean pass reads as "passed", not "no injection".
   if (d.denied === false || d.decision === "authorized")
-    return "SQL firewall passed — query is a safe read-only SELECT.";
+    return t("SQL firewall passed — query is a safe read-only SELECT.");
   // Error path: the firewall rejected the generated SQL (e.g. a low-confidence
   // SPARQL translated to non-SELECT SQL). Explain the cause rather than showing
   // the raw exception name; this is a non-fatal fallthrough to Tier 3.
   if (d.error)
-    return `SQL firewall blocked the query — ${humanizeError(d.error)}.`;
-  if (d.denied === true) return "SQL firewall blocked the query.";
+    return t("SQL firewall blocked the query — {reason}.", {
+      reason: humanizeError(d.error, t),
+    });
+  if (d.denied === true) return t("SQL firewall blocked the query.");
   if (d.reason) return String(d.reason);
   return "";
 };
 
-const _executeFormatter: Formatter = (d) => {
+const _executeFormatter: Formatter = (d, t) => {
   const rows = d.rowCount ?? d.rows ?? 0;
   const tables = Array.isArray(d.tables)
-    ? summarizeList(d.tables)
+    ? summarizeList(d.tables, t)
     : d.table
       ? String(d.table)
       : "";
-  let msg = `${rows} row(s) returned${tables ? ` from ${tables}` : ""}.`;
-  if (d.truncated) msg += " (truncated)";
+  let msg = tables
+    ? t("{rows} row(s) returned from {tables}.", {
+        rows: String(rows),
+        tables,
+      })
+    : t("{rows} row(s) returned.", { rows: String(rows) });
+  if (d.truncated) msg += t(" (truncated)");
   return msg;
 };
 
 const stepFormatters: Record<string, Formatter> = {
-  "t1.metric_match": (d) => {
+  "t1.metric_match": (d, t) => {
     // Tier-1 matched a metric but the question carried a qualifier the metric's
     // fixed SQL cannot express (a filter, grouping, or time window), so it
     // declined rather than return the unfiltered aggregate. Checked before the
     // metricName branch — a bypass is not a resolution and carries no confidence.
     if (d.unhandledQualifier) {
-      return `Matched ${d.metricName ?? "a metric"} but "${d.unhandledQualifier}" can't be applied to it; routing to structured query.`;
+      return t(
+        'Matched {metric} but "{qualifier}" can\'t be applied to it; routing to structured query.',
+        {
+          metric: String(d.metricName ?? t("a metric")),
+          qualifier: String(d.unhandledQualifier),
+        },
+      );
     }
     if (d.metricName) {
-      return `Resolved to ${d.metricName} (${d.matchSource ?? "exact"}, confidence ${d.confidence ?? 1.0}).`;
+      const matchSource = String(d.matchSource ?? "exact");
+      return t("Resolved to {metric} ({source}, confidence {confidence}).", {
+        metric: String(d.metricName),
+        source: matchSource === "exact" ? t("exact") : matchSource,
+        confidence: String(d.confidence ?? 1.0),
+      });
     }
     // No metric matched — don't echo the query (it's already on screen above);
     // state what happens next instead. The backend miss detail is
@@ -122,85 +162,110 @@ const stepFormatters: Record<string, Formatter> = {
       d.matchCount !== undefined ||
       d.query_length !== undefined
     ) {
-      return "No matching metric; routing to structured query.";
+      return t("No matching metric; routing to structured query.");
     }
     return "";
   },
 
-  "query.embed": (d) => {
-    if (d.dimensions) return `Embedded query (${d.dimensions} dimensions).`;
-    if (d.error) return `Embedding failed: ${d.message || d.error}`;
+  "query.embed": (d, t) => {
+    if (d.dimensions)
+      return t("Embedded query ({count} dimensions).", {
+        count: String(d.dimensions),
+      });
+    if (d.error)
+      return t("Embedding failed: {error}", {
+        error: String(d.message || d.error),
+      });
     return "";
   },
 
-  "t2.vkg.context": (d) => {
+  "t2.vkg.context": (d, t) => {
     const classes = d.classCount ?? d.classes ?? 0;
     const props = d.propertyCount ?? d.properties ?? 0;
-    return `${classes} classes, ${props} properties pulled from the published ontology.`;
+    return t(
+      "{classes} classes, {properties} properties pulled from the published ontology.",
+      { classes: String(classes), properties: String(props) },
+    );
   },
 
-  "t2.vkg.translate": (d) => {
-    if (d.confidence) return `NL → SPARQL with confidence ${d.confidence}.`;
+  "t2.vkg.translate": (d, t) => {
+    if (d.confidence)
+      return t("NL → SPARQL with confidence {confidence}.", {
+        confidence: String(d.confidence),
+      });
     const parts: string[] = [];
-    if (d.dialect) parts.push(`Dialect=${d.dialect}`);
+    if (d.dialect)
+      parts.push(t("Dialect={dialect}", { dialect: String(d.dialect) }));
     if (d.tables) {
       const tables = Array.isArray(d.tables)
         ? d.tables.join(", ")
         : String(d.tables);
-      parts.push(`Tables: ${tables}`);
+      parts.push(t("Tables: {tables}", { tables }));
     }
     return parts.length > 0 ? `${parts.join(". ")}.` : "";
   },
 
-  "t2.vkg.validate": (d) => {
-    if (d.valid === true || d.status === "clean") return "Parsed clean.";
-    if (d.error) return `Validation error: ${d.error}`;
+  "t2.vkg.validate": (d, t) => {
+    if (d.valid === true || d.status === "clean") return t("Parsed clean.");
+    if (d.error)
+      return t("Validation error: {error}", { error: String(d.error) });
     return "";
   },
 
-  "t2.vkg.retry": (d) => {
+  "t2.vkg.retry": (d, t) => {
     if (d.reason) {
       // Strip the "retry also failed: <code>" wrapper and humanize the code.
       const reason = String(d.reason).replace(/^retry also failed:\s*/i, "");
-      return `Retry failed — ${humanizeError(reason)}.`;
+      return t("Retry failed — {reason}.", {
+        reason: humanizeError(reason, t),
+      });
     }
-    if (d.error) return `Retry failed — ${humanizeError(d.error)}.`;
+    if (d.error)
+      return t("Retry failed — {reason}.", {
+        reason: humanizeError(d.error, t),
+      });
     return "";
   },
 
-  "t2.vkg.compile": (d) => {
+  "t2.vkg.compile": (d, t) => {
     // Ontop SPARQL→SQL translation. On failure this is what triggers the retry.
     // Suppress a bare exception class name (no user value); the base message
     // already explains the failure.
     if (d.error) {
       return isRawExceptionName(d.error)
-        ? "Ontop could not translate SPARQL to SQL."
-        : `Ontop could not translate SPARQL to SQL: ${humanizeError(d.error)}.`;
+        ? t("Ontop could not translate SPARQL to SQL.")
+        : t("Ontop could not translate SPARQL to SQL: {reason}.", {
+            reason: humanizeError(d.error, t),
+          });
     }
     const parts: string[] = [];
-    if (d.dialect) parts.push(`dialect ${d.dialect}`);
-    const tables = summarizeList(d.tables);
-    if (tables) parts.push(`tables: ${tables}`);
+    if (d.dialect)
+      parts.push(t("dialect {dialect}", { dialect: String(d.dialect) }));
+    const tables = summarizeList(d.tables, t);
+    if (tables) parts.push(t("tables: {tables}", { tables }));
     return parts.length > 0
-      ? `Translated to SQL (${parts.join(", ")}).`
-      : "Translated SPARQL to SQL.";
+      ? t("Translated to SQL ({details}).", { details: parts.join(", ") })
+      : t("Translated SPARQL to SQL.");
   },
 
-  "t2.sql.generate": (d) => {
+  "t2.sql.generate": (d, t) => {
     // Error path: the NL→SQL strategy couldn't produce SQL (e.g. its schema
     // retrieval was unavailable). This is a non-fatal fallthrough — the VKG
     // (Ontop) strategy runs next — so phrase it as "skipped", not a hard error.
     if (d.error) {
-      return `NL→SQL skipped (${humanizeError(d.error)}); falling back to VKG.`;
+      return t("NL→SQL skipped ({reason}); falling back to VKG.", {
+        reason: humanizeError(d.error, t),
+      });
     }
     const conf = d.confidence;
-    const tables = summarizeList(d.tables);
+    const tables = summarizeList(d.tables, t);
     const parts: string[] = [];
-    if (conf !== undefined) parts.push(`confidence ${conf}`);
-    if (tables) parts.push(`tables: ${tables}`);
+    if (conf !== undefined)
+      parts.push(t("confidence {confidence}", { confidence: String(conf) }));
+    if (tables) parts.push(t("tables: {tables}", { tables }));
     return parts.length > 0
-      ? `SQL generated (${parts.join(", ")}).`
-      : "SQL generated.";
+      ? t("SQL generated ({details}).", { details: parts.join(", ") })
+      : t("SQL generated.");
   },
 
   "t1.authorize": _authorizeFormatter,
@@ -215,49 +280,72 @@ const stepFormatters: Record<string, Formatter> = {
   "t2.sql.execute": _executeFormatter,
   "t2.vkg.execute": _executeFormatter,
 
-  "t3.vector_search": (d) => {
-    if (d.chunks !== undefined) return `${d.chunks} chunks retrieved.`;
-    if (d.itemCount !== undefined) return `${d.itemCount} items retrieved.`;
+  "t3.vector_search": (d, t) => {
+    if (d.chunks !== undefined)
+      return t("{count} chunks retrieved.", { count: String(d.chunks) });
+    if (d.itemCount !== undefined)
+      return t("{count} items retrieved.", { count: String(d.itemCount) });
     return "";
   },
 
-  "t3.graph_traverse": (d) => {
-    if (d.entities !== undefined) return `${d.entities} entities found.`;
-    if (d.itemCount !== undefined) return `${d.itemCount} items.`;
+  "t3.graph_traverse": (d, t) => {
+    if (d.entities !== undefined)
+      return t("{count} entities found.", { count: String(d.entities) });
+    if (d.itemCount !== undefined)
+      return t("{count} items.", { count: String(d.itemCount) });
     return "";
   },
 
-  "t3.synthesize": (d) => {
+  "t3.synthesize": (d, t) => {
     if (d.outputTokens)
-      return `${d.inputTokens ?? "?"} → ${d.outputTokens} tokens.`;
-    if (d.tokenCount) return `Generated ${d.tokenCount} tokens.`;
+      return t("{input} → {output} tokens.", {
+        input: String(d.inputTokens ?? "?"),
+        output: String(d.outputTokens),
+      });
+    if (d.tokenCount)
+      return t("Generated {count} tokens.", {
+        count: String(d.tokenCount),
+      });
     return "";
   },
 
-  "t3.retrieve": (d) => {
+  "t3.retrieve": (d, t) => {
     const count = Array.isArray(d.sources) ? d.sources.length : 0;
-    return count ? `${count} sources in parallel.` : "Parallel retrieval.";
+    return count
+      ? t("{count} sources in parallel.", { count })
+      : t("Parallel retrieval.");
   },
 
   // graphrag-toolkit lexical retriever (TIER3_STRATEGY=lexical-baseline).
   // Backend sends a STRING detail ("strategy=chunk_based_semantic; 5 nodes
   // retrieved"), which formatStepDetail passes through directly — this handler
   // only fires if the detail is ever upgraded to a structured object.
-  lexical_baseline_retrieve: (d) => {
+  lexical_baseline_retrieve: (d, t) => {
     const nodes = d.nodes ?? d.itemCount ?? d.count;
-    const strategy = d.strategy ? ` via ${d.strategy}` : "";
     if (nodes !== undefined)
-      return `Retrieved ${nodes} document chunk(s)${strategy}.`;
-    if (d.error) return `Lexical retrieval failed: ${humanizeError(d.error)}.`;
+      return d.strategy
+        ? t("Retrieved {count} document chunk(s) via {strategy}.", {
+            count: String(nodes),
+            strategy: String(d.strategy),
+          })
+        : t("Retrieved {count} document chunk(s).", {
+            count: String(nodes),
+          });
+    if (d.error)
+      return t("Lexical retrieval failed: {reason}.", {
+        reason: humanizeError(d.error, t),
+      });
     return "";
   },
 
-  "t2.sql.failed": (d) => strategyFailedDetail(d),
-  "t2.vkg.failed": (d) => strategyFailedDetail(d),
+  "t2.sql.failed": (d, t) => strategyFailedDetail(d, t),
+  "t2.vkg.failed": (d, t) => strategyFailedDetail(d, t),
 
-  "t2.strategy_selected": (d) => {
+  "t2.strategy_selected": (d, t) => {
     const friendly = STRATEGY_DISPLAY_NAMES[String(d.strategy)] ?? d.strategy;
-    return friendly ? `Chose ${friendly}.` : "Strategy selected.";
+    return friendly
+      ? t("Chose {strategy}.", { strategy: String(friendly) })
+      : t("Strategy selected.");
   },
 };
 
@@ -268,20 +356,33 @@ const STRATEGY_DISPLAY_NAMES: Record<string, string> = {
 };
 
 /** Detail for an abandoned-strategy step: explain why it was skipped. */
-function strategyFailedDetail(d: DetailRecord): string {
+function strategyFailedDetail(d: DetailRecord, t: AppTranslate): string {
   if (d.reason === "empty_low_confidence") {
     const conf =
-      typeof d.confidence === "number" ? ` (confidence ${d.confidence})` : "";
-    return `Returned no rows with low confidence${conf} — trying another approach.`;
+      typeof d.confidence === "number"
+        ? t(" (confidence {confidence})", {
+            confidence: String(d.confidence),
+          })
+        : "";
+    return t(
+      "Returned no rows with low confidence{confidence} — trying another approach.",
+      { confidence: conf },
+    );
   }
-  if (d.message) return `Abandoned — ${humanizeError(d.message)}.`;
-  if (d.error) return `Abandoned — ${humanizeError(d.error)}.`;
-  return "Strategy abandoned; trying another approach.";
+  if (d.message)
+    return t("Abandoned — {reason}.", {
+      reason: humanizeError(d.message, t),
+    });
+  if (d.error)
+    return t("Abandoned — {reason}.", {
+      reason: humanizeError(d.error, t),
+    });
+  return t("Strategy abandoned; trying another approach.");
 }
 
 const NOISE_VALUES = new Set(["ok", "empty", "null", "{}", "[]", "none"]);
 
-const STEP_FALLBACKS: Record<string, string> = {
+const STEP_FALLBACKS = {
   "t1.metric_match": "Checked metric catalog.",
   "query.embed": "Query embedded.",
   "t2.vkg.context": "Ontology context loaded.",
@@ -309,7 +410,7 @@ const STEP_FALLBACKS: Record<string, string> = {
   "t2.vkg.failed": "VKG strategy abandoned.",
   "t2.strategy_selected": "Strategy selected.",
   "routing.select": "Intent routed.",
-};
+} satisfies Record<string, AppMessage>;
 
 /**
  * Format a trace step's detail for display in the execution plan.
@@ -320,14 +421,16 @@ const STEP_FALLBACKS: Record<string, string> = {
 export function formatStepDetail(
   stepName: string,
   detail: string | Record<string, unknown> | undefined | null,
+  translate: AppTranslate = englishTranslate,
 ): string {
-  if (!detail) return STEP_FALLBACKS[stepName] ?? "";
+  const fallback = STEP_FALLBACKS[stepName as keyof typeof STEP_FALLBACKS];
+  if (!detail) return fallback ? translate(fallback) : "";
 
   // Structured detail object — use formatter
   if (typeof detail === "object") {
     const formatter = stepFormatters[stepName];
     if (formatter) {
-      const result = formatter(detail);
+      const result = formatter(detail, translate);
       if (result) return result;
     }
     // Generic error/message extraction
@@ -340,24 +443,30 @@ export function formatStepDetail(
     if (detail.reason && typeof detail.reason === "string") {
       return String(detail.reason);
     }
-    return STEP_FALLBACKS[stepName] ?? "";
+    return fallback ? translate(fallback) : "";
   }
 
   // String detail — clean up noise
   const trimmed = detail.trim();
   if (NOISE_VALUES.has(trimmed.toLowerCase())) {
-    return STEP_FALLBACKS[stepName] ?? "";
+    return fallback ? translate(fallback) : "";
   }
 
   // Some backend steps send terse string details; turn them into sentences.
   if (stepName === "t2.vkg.context") {
     const m = trimmed.match(/(\d+)\s+classes?,\s*(\d+)\s+properties?/i);
     if (m)
-      return `${m[1]} classes, ${m[2]} properties pulled from the published ontology.`;
+      return translate(
+        "{classes} classes, {properties} properties pulled from the published ontology.",
+        { classes: m[1], properties: m[2] },
+      );
   }
   if (stepName === "t2.vkg.translate") {
     const m = trimmed.match(/confidence=([\d.]+)/i);
-    if (m) return `NL → SPARQL with confidence ${m[1]}.`;
+    if (m)
+      return translate("NL → SPARQL with confidence {confidence}.", {
+        confidence: m[1],
+      });
   }
   // The OTHER Tier-1 bypass. When more than one governed metric matches, the
   // question is ambiguous for the single-metric path, so Tier 1 declines rather
@@ -372,7 +481,12 @@ export function formatStepDetail(
     const m = trimmed.match(/^(\d+)\s+metrics?$/i);
     if (m) {
       const n = Number(m[1]);
-      return `Question matched ${n} ${n === 1 ? "metric" : "metrics"}, so it is ambiguous for the single-metric path; routing to structured query.`;
+      return translate(
+        n === 1
+          ? "Question matched {count} metric, so it is ambiguous for the single-metric path; routing to structured query."
+          : "Question matched {count} metrics, so it is ambiguous for the single-metric path; routing to structured query.",
+        { count: n },
+      );
     }
   }
   // The NL→SQL generate step records its failure detail as a BARE STRING
@@ -382,7 +496,9 @@ export function formatStepDetail(
   // non-fatal fallthrough (VKG/Ontop runs next); the trace status already
   // conveys skipped-vs-error, this is just the copy.
   if (stepName === "t2.sql.generate") {
-    return `NL→SQL skipped (${humanizeError(trimmed)}); falling back to VKG.`;
+    return translate("NL→SQL skipped ({reason}); falling back to VKG.", {
+      reason: humanizeError(trimmed, translate),
+    });
   }
 
   // Lexical retriever sends a string detail: "strategy=<name>; <N nodes
@@ -394,12 +510,17 @@ export function formatStepDetail(
   if (stepName === "lexical_baseline_retrieve") {
     const outcome = trimmed.replace(/^strategy=[^;]*;\s*/i, "");
     const nodeMatch = outcome.match(/^(\d+)\s+nodes?\s+retrieved/i);
-    if (nodeMatch) return `Retrieved ${nodeMatch[1]} document chunk(s).`;
+    if (nodeMatch)
+      return translate("Retrieved {count} document chunk(s).", {
+        count: nodeMatch[1],
+      });
     if (/timeouterror/i.test(outcome))
-      return "No documents retrieved — the graph store timed out.";
+      return translate("No documents retrieved — the graph store timed out.");
     if (/^[A-Za-z]+Error/.test(outcome))
-      return `No documents retrieved — ${humanizeError(outcome.match(/^[A-Za-z]+Error/)?.[0])}.`;
-    return outcome || (STEP_FALLBACKS[stepName] ?? "");
+      return translate("No documents retrieved — {reason}.", {
+        reason: humanizeError(outcome.match(/^[A-Za-z]+Error/)?.[0], translate),
+      });
+    return outcome || (fallback ? translate(fallback) : "");
   }
 
   // Python-style dicts or JSON — try to extract message
@@ -415,12 +536,12 @@ export function formatStepDetail(
         if (typeof msg === "string") return msg;
         const values = Object.values(parsed);
         if (values.every((v) => !v || (Array.isArray(v) && v.length === 0))) {
-          return STEP_FALLBACKS[stepName] ?? "";
+          return fallback ? translate(fallback) : "";
         }
       }
-      return STEP_FALLBACKS[stepName] ?? "";
+      return fallback ? translate(fallback) : "";
     } catch {
-      return STEP_FALLBACKS[stepName] ?? "";
+      return fallback ? translate(fallback) : "";
     }
   }
 

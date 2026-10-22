@@ -3,6 +3,8 @@
 
 import React, { useMemo, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
+import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
+import { useNamespace } from "@api-hooks/use-namespace";
 import Table from "@cloudscape-design/components/table";
 import Header from "@cloudscape-design/components/header";
 import Button from "@cloudscape-design/components/button";
@@ -23,14 +25,16 @@ import Link from "@cloudscape-design/components/link";
 import { useListSources, SourceSummary } from "@api-hooks";
 import { formatTimestamp } from "@utils/helpers";
 import { sourceStatusType, sourceStatusLabel } from "@utils/source-status";
+import { useAppI18n } from "../i18n/LocaleProvider";
+import type { AppMessage } from "../i18n/appMessages";
 
 // ── Type labels ──────────────────────────────────────────────────────────────
 
-const SOURCE_TYPE_LABELS: Record<string, string> = {
+const SOURCE_TYPE_LABELS: Record<string, AppMessage> = {
   DATABASE: "Database",
   DOCUMENTS: "Documents",
 };
-const SOURCE_SUBTYPE_LABELS: Record<string, string> = {
+const SOURCE_SUBTYPE_LABELS: Record<string, AppMessage> = {
   GLUE_DATABASE: "Glue",
   JDBC_DATABASE: "JDBC",
   CUSTOM_CONNECTOR: "Custom connector",
@@ -39,19 +43,47 @@ const SOURCE_SUBTYPE_LABELS: Record<string, string> = {
   LOCAL_UPLOAD: "Upload",
 };
 
-function sourceTypeLabel(sourceType: string, sourceSubType: string): string {
-  const type = SOURCE_TYPE_LABELS[sourceType] ?? sourceType;
-  const sub = SOURCE_SUBTYPE_LABELS[sourceSubType] ?? sourceSubType;
-  return `${type} · ${sub}`;
+function sourceTypeLabel(
+  sourceType: string,
+  sourceSubType: string,
+  t: ReturnType<typeof useAppI18n>["t"],
+): string {
+  const typeKey = SOURCE_TYPE_LABELS[sourceType];
+  const subtypeKey = SOURCE_SUBTYPE_LABELS[sourceSubType];
+  return `${typeKey ? t(typeKey) : sourceType} · ${
+    subtypeKey ? t(subtypeKey) : sourceSubType
+  }`;
+}
+
+const LOCALIZED_SOURCE_STATUS_LABELS: Readonly<Record<string, AppMessage>> = {
+  Approved: "Approved",
+  Completed: "Completed",
+  "Pending review": "Pending review",
+  "Re-scan review": "Re-scan review",
+  Registered: "Registered",
+  Scanning: "Scanning",
+  Enriching: "Enriching",
+  "Approving…": "Approving…",
+  "Rejecting…": "Rejecting…",
+  "Approval failed": "Approval failed",
+  "Rejection failed": "Rejection failed",
+  "Scan failed": "Scan failed",
+  "Delete failed": "Delete failed",
+  Deleting: "Deleting",
+  Deleted: "Deleted",
+  Rejected: "Rejected",
+};
+
+function localizedSourceStatus(
+  status: string | undefined,
+  t: ReturnType<typeof useAppI18n>["t"],
+): string {
+  const label = sourceStatusLabel(status);
+  const message = LOCALIZED_SOURCE_STATUS_LABELS[label];
+  return message ? t(message) : label;
 }
 
 // ── Type filter options ───────────────────────────────────────────────────────
-
-const SOURCE_TYPE_SEGMENTS = [
-  { id: "", text: "All" },
-  { id: "DATABASE", text: "Database" },
-  { id: "DOCUMENTS", text: "Documents" },
-];
 
 // Priority order for summary dashboard
 const SUMMARY_STATUS_PRIORITY = [
@@ -66,25 +98,29 @@ const SUMMARY_STATUS_PRIORITY = [
 
 // ── Preferences ───────────────────────────────────────────────────────────────
 
-const PAGE_SIZE_OPTIONS: CollectionPreferencesProps.PageSizeOption[] = [
+const PAGE_SIZE_OPTIONS: Array<
+  CollectionPreferencesProps.PageSizeOption & { label: AppMessage }
+> = [
   { value: 10, label: "10 sources" },
   { value: 20, label: "20 sources" },
   { value: 50, label: "50 sources" },
 ];
 
-const COLUMN_DISPLAY_OPTIONS: CollectionPreferencesProps.VisibleContentOptionsGroup[] =
-  [
-    {
-      label: "Source properties",
-      options: [
-        { id: "name", label: "Name", editable: false },
-        { id: "status", label: "Status" },
-        { id: "sourceType", label: "Type" },
-        { id: "createdAt", label: "Created" },
-        { id: "updatedAt", label: "Last updated" },
-      ],
-    },
-  ];
+const COLUMN_DISPLAY_OPTIONS: Array<{
+  label: AppMessage;
+  options: Array<{ id: string; label: AppMessage; editable?: boolean }>;
+}> = [
+  {
+    label: "Source properties",
+    options: [
+      { id: "name", label: "Name", editable: false },
+      { id: "status", label: "Status" },
+      { id: "sourceType", label: "Type" },
+      { id: "createdAt", label: "Created" },
+      { id: "updatedAt", label: "Last updated" },
+    ],
+  },
+];
 
 const DEFAULT_PREFERENCES: CollectionPreferencesProps.Preferences = {
   pageSize: 20,
@@ -124,6 +160,18 @@ function sortItems(
 export const SourceList: React.FC = () => {
   const { namespaceId } = useParams<{ namespaceId: string }>();
   const navigate = useNavigate();
+  const { t } = useAppI18n();
+  const sourceTypeSegments = [
+    { id: "", text: t("All") },
+    { id: "DATABASE", text: t("Database") },
+    { id: "DOCUMENTS", text: t("Documents") },
+  ];
+
+  const { name: nsName } = useNamespace(namespaceId);
+  useBreadcrumbTrail([
+    { text: nsName, href: `/namespaces/${namespaceId}`, namespaceId },
+    { text: t("Sources") },
+  ]);
 
   const [filterText, setFilterText] = useState("");
   const [typeFilter, setTypeFilter] = useState<string>("");
@@ -159,10 +207,10 @@ export const SourceList: React.FC = () => {
       .slice(0, 4)
       .map((s) => ({
         status: s,
-        label: sourceStatusLabel(s),
+        label: localizedSourceStatus(s, t),
         count: counts.get(s)!,
       }));
-  }, [allItems]);
+  }, [allItems, t]);
 
   // Dynamic status filter options based on what's actually in the data
   const statusFilterOptions = useMemo<SelectProps.Option[]>(() => {
@@ -170,17 +218,20 @@ export const SourceList: React.FC = () => {
     for (const item of allItems) {
       if (item.status) seen.add(item.status);
     }
-    const opts: SelectProps.Option[] = [{ label: "All statuses", value: "" }];
+    const opts: SelectProps.Option[] = [
+      { label: t("All statuses"), value: "" },
+    ];
     for (const s of SUMMARY_STATUS_PRIORITY) {
-      if (seen.has(s)) opts.push({ label: sourceStatusLabel(s), value: s });
+      if (seen.has(s))
+        opts.push({ label: localizedSourceStatus(s, t), value: s });
       seen.delete(s);
     }
     // Any remaining statuses not in priority list
     for (const s of seen) {
-      opts.push({ label: sourceStatusLabel(s), value: s });
+      opts.push({ label: localizedSourceStatus(s, t), value: s });
     }
     return opts;
-  }, [allItems]);
+  }, [allItems, t]);
 
   // Client-side filtering
   const filteredItems = useMemo(
@@ -217,7 +268,7 @@ export const SourceList: React.FC = () => {
   const columnDefinitions = [
     {
       id: "name",
-      header: "Name",
+      header: t("Name"),
       sortingField: "name",
       isRowHeader: true,
       cell: (item: SourceSummary) => (
@@ -235,29 +286,29 @@ export const SourceList: React.FC = () => {
     },
     {
       id: "status",
-      header: "Status",
+      header: t("Status"),
       sortingField: "status",
       cell: (item: SourceSummary) => (
         <StatusIndicator type={sourceStatusType(item.status)}>
-          {sourceStatusLabel(item.status ?? "")}
+          {localizedSourceStatus(item.status, t)}
         </StatusIndicator>
       ),
     },
     {
       id: "sourceType",
-      header: "Type",
+      header: t("Type"),
       cell: (item: SourceSummary) =>
-        sourceTypeLabel(item.sourceType ?? "", item.sourceSubType ?? ""),
+        sourceTypeLabel(item.sourceType ?? "", item.sourceSubType ?? "", t),
     },
     {
       id: "createdAt",
-      header: "Created",
+      header: t("Created"),
       sortingField: "createdAt",
       cell: (item: SourceSummary) => formatTimestamp(item.createdAt),
     },
     {
       id: "updatedAt",
-      header: "Last updated",
+      header: t("Last updated"),
       sortingField: "updatedAt",
       cell: (item: SourceSummary) => formatTimestamp(item.updatedAt),
     },
@@ -266,15 +317,15 @@ export const SourceList: React.FC = () => {
   const emptyState = (
     <Box textAlign="center" padding="xxl">
       <SpaceBetween size="m">
-        <b>No sources</b>
+        <b>{t("No sources")}</b>
         <Box variant="p" color="text-body-secondary">
-          Connect a database or document source to get started.
+          {t("Connect a database or document source to get started.")}
         </Box>
         <Button
           variant="primary"
           onClick={() => navigate(`/namespaces/${namespaceId}/sources/connect`)}
         >
-          Connect source
+          {t("Connect source")}
         </Button>
       </SpaceBetween>
     </Box>
@@ -288,7 +339,7 @@ export const SourceList: React.FC = () => {
   return (
     <>
       {error && (
-        <Alert type="error" header="Failed to load sources">
+        <Alert type="error" header={t("Failed to load sources")}>
           {error.message}
         </Alert>
       )}
@@ -300,7 +351,7 @@ export const SourceList: React.FC = () => {
         wrapLines={preferences.wrapLines}
         stripedRows={preferences.stripedRows}
         loading={isLoading}
-        loadingText="Loading sources"
+        loadingText={t("Loading sources")}
         sortingColumn={sortingColumn}
         sortingDescending={isDescending}
         onSortingChange={({ detail }) => {
@@ -313,7 +364,7 @@ export const SourceList: React.FC = () => {
             <Header
               variant="awsui-h1-sticky"
               counter={counterText}
-              description="All sources registered in this namespace."
+              description={t("All sources registered in this namespace.")}
               actions={
                 <SpaceBetween direction="horizontal" size="xs">
                   <Button
@@ -321,7 +372,7 @@ export const SourceList: React.FC = () => {
                     loading={isFetching}
                     onClick={() => refetch()}
                   >
-                    Refresh
+                    {t("Refresh")}
                   </Button>
                   <Button
                     variant="primary"
@@ -329,12 +380,12 @@ export const SourceList: React.FC = () => {
                       navigate(`/namespaces/${namespaceId}/sources/connect`)
                     }
                   >
-                    Connect source
+                    {t("Connect source")}
                   </Button>
                 </SpaceBetween>
               }
             >
-              Sources
+              {t("Sources")}
             </Header>
             {statusCounts.length > 0 && (
               <Container>
@@ -352,8 +403,11 @@ export const SourceList: React.FC = () => {
                             statusFilter.value === status ? "" : status;
                           setStatusFilter(
                             next
-                              ? { label: sourceStatusLabel(next), value: next }
-                              : { label: "All statuses", value: "" },
+                              ? {
+                                  label: localizedSourceStatus(next, t),
+                                  value: next,
+                                }
+                              : { label: t("All statuses"), value: "" },
                           );
                           resetPage();
                         }}
@@ -371,7 +425,7 @@ export const SourceList: React.FC = () => {
         filter={
           <SpaceBetween direction="horizontal" size="s" alignItems="center">
             <TextFilter
-              filteringPlaceholder="Find sources"
+              filteringPlaceholder={t("Find sources")}
               filteringText={filterText}
               onChange={({ detail }) => {
                 setFilterText(detail.filteringText);
@@ -384,16 +438,20 @@ export const SourceList: React.FC = () => {
                 setTypeFilter(detail.selectedId);
                 resetPage();
               }}
-              options={SOURCE_TYPE_SEGMENTS}
+              options={sourceTypeSegments}
             />
             <Select
-              selectedOption={statusFilter}
+              selectedOption={
+                statusFilterOptions.find(
+                  (option) => option.value === statusFilter.value,
+                ) ?? statusFilterOptions[0]!
+              }
               onChange={({ detail }) => {
                 setStatusFilter(detail.selectedOption);
                 resetPage();
               }}
               options={statusFilterOptions}
-              ariaLabel="Filter by status"
+              ariaLabel={t("Filter by status")}
               expandToViewport
             />
           </SpaceBetween>
@@ -409,29 +467,39 @@ export const SourceList: React.FC = () => {
         }
         preferences={
           <CollectionPreferences
-            title="Preferences"
-            confirmLabel="Confirm"
-            cancelLabel="Cancel"
+            title={t("Preferences")}
+            confirmLabel={t("Confirm")}
+            cancelLabel={t("Cancel")}
             preferences={preferences}
             onConfirm={({ detail }) => {
               setPreferences(detail);
               resetPage();
             }}
             pageSizePreference={{
-              title: "Page size",
-              options: PAGE_SIZE_OPTIONS,
+              title: t("Page size"),
+              options: PAGE_SIZE_OPTIONS.map((option) => ({
+                ...option,
+                label: t(option.label),
+              })),
             }}
             visibleContentPreference={{
-              title: "Select visible columns",
-              options: COLUMN_DISPLAY_OPTIONS,
+              title: t("Select visible columns"),
+              options: COLUMN_DISPLAY_OPTIONS.map((group) => ({
+                ...group,
+                label: t(group.label),
+                options: group.options.map((option) => ({
+                  ...option,
+                  label: t(option.label),
+                })),
+              })),
             }}
             wrapLinesPreference={{
-              label: "Wrap lines",
-              description: "Wrap long text in table cells",
+              label: t("Wrap lines"),
+              description: t("Wrap long text in table cells"),
             }}
             stripedRowsPreference={{
-              label: "Striped rows",
-              description: "Alternate row background colors",
+              label: t("Striped rows"),
+              description: t("Alternate row background colors"),
             }}
           />
         }
@@ -439,8 +507,8 @@ export const SourceList: React.FC = () => {
         items={pagedItems}
         empty={emptyState}
         ariaLabels={{
-          tableLabel: "Sources",
-          selectionGroupLabel: "Source selection",
+          tableLabel: t("Sources"),
+          selectionGroupLabel: t("Source selection"),
         }}
       />
     </>

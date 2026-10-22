@@ -9,6 +9,16 @@ The web app is a React SPA providing the management console for the Context Onto
 
 Built on the [Cloudscape Design System](https://cloudscape.design/) and communicates with the backend via the Smithy-generated `@coa/control-plane-client` and a generic `ApiClient` (for endpoints not yet in the Smithy model).
 
+### UI language
+
+The Settings menu lets users choose English or Japanese. The preference is
+stored in the browser and survives reloads. Both Cloudscape component strings
+and application-authored console copy are localized. Application components
+read typed messages from `appMessages.ts` through the `useAppI18n` hook.
+
+Adding UI copy? Call it via `t()` and add its Japanese translation to
+`messages.ja.ts` — the build enforces this.
+
 ## Getting Started
 
 ### Prerequisites
@@ -45,13 +55,13 @@ Edit `public/runtime-config.json`:
 }
 ```
 
-| Field         | Required | Description                                                   |
-| ------------- | -------- | ------------------------------------------------------------- |
-| `region`      | Yes      | AWS region                                                    |
-| `authority`   | Yes      | OIDC issuer URL (Cognito User Pool or generic OIDC)           |
-| `clientId`    | Yes      | OAuth client ID                                               |
-| `apiEndpoint` | No       | Backend API base URL (falls back to relative `/api`)          |
-| `wsEndpoint`  | No       | WebSocket endpoint for Playground chat (relative or absolute) |
+| Field         | Required | Description                                                                                                            |
+| ------------- | -------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `region`      | Yes      | AWS region                                                                                                             |
+| `authority`   | Yes      | OIDC issuer URL (Cognito User Pool or generic OIDC)                                                                    |
+| `clientId`    | Yes      | OAuth client ID                                                                                                        |
+| `apiEndpoint` | No       | Backend API base URL (falls back to relative `/api`)                                                                   |
+| `wsEndpoint`  | No       | WebSocket endpoint for Playground chat (relative or absolute)                                                          |
 | `version`     | No       | Deployed monorepo version, auto-populated from the repo-root `VERSION` file at deploy time; shown as a badge in the UI |
 
 ### Run
@@ -192,19 +202,21 @@ npm run format   # ESLint --fix + Prettier --write
 
 ```
 main.tsx
-  └─ BrowserRouter
-       └─ RuntimeContextProvider    ← loads /runtime-config.json
-            └─ ControlPlaneClientProvider  ← Smithy client (namespaces, roles, grants)
-                 └─ ApiClientProvider      ← generic fetch client (sources, metrics, ontology)
-                      └─ QueryClientProvider  ← React Query cache
-                           └─ Auth            ← OIDC login gate
-                                └─ App        ← routes + AppLayout shell
+  └─ LocaleProvider               ← UI locale + Cloudscape component strings
+       └─ BrowserRouter
+            └─ RuntimeContextProvider    ← loads /runtime-config.json
+                 └─ ControlPlaneClientProvider  ← Smithy client (namespaces, roles, grants)
+                      └─ ApiClientProvider      ← generic fetch client (sources, metrics, ontology)
+                           └─ QueryClientProvider  ← React Query cache
+                                └─ Auth            ← OIDC login gate
+                                     └─ App        ← routes + AppLayout shell
 ```
 
 ### Provider Stack
 
 | Provider                     | Purpose                                                                                                   |
 | ---------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `LocaleProvider`             | Resolves and persists the English/Japanese UI locale; supplies Cloudscape component strings               |
 | `RuntimeContextProvider`     | Fetches `/runtime-config.json` at boot, provides region/auth/endpoint config                              |
 | `ControlPlaneClientProvider` | Instantiates the Smithy-generated `ControlPlaneServiceClient` with OIDC token injection                   |
 | `ApiClientProvider`          | Provides a generic `{ get, post, put, del }` client for non-Smithy endpoints (sources, metrics, ontology) |
