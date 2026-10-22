@@ -3,6 +3,7 @@
 
 import React from "react";
 import { Box, Spinner } from "@cloudscape-design/components";
+import { useAppI18n } from "../../../i18n/LocaleProvider";
 
 export interface StageIndicatorProps {
   /** Current stage description from stage_start event. */
@@ -15,7 +16,8 @@ export interface StageIndicatorProps {
  * when a stage_start event arrives.
  */
 export const StageIndicator: React.FC<StageIndicatorProps> = ({ stage }) => {
-  const displayText = stage ?? "Thinking...";
+  const { t } = useAppI18n();
+  const displayText = stage ?? t("Thinking...");
 
   return (
     <Box>

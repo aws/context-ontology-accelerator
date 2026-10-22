@@ -18,6 +18,7 @@ import {
   listInducedDatasources,
   type InducedDatasource,
 } from "../../../services/ontology-engine";
+import { useAppI18n } from "../../../i18n/LocaleProvider";
 
 export function InductedSourcesView({
   apiClient,
@@ -26,6 +27,7 @@ export function InductedSourcesView({
   apiClient: ApiClient;
   namespace?: string;
 }) {
+  const { t } = useAppI18n();
   const [items, setItems] = useState<InducedDatasource[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -48,7 +50,7 @@ export function InductedSourcesView({
           type="warning"
           dismissible
           onDismiss={() => setError(null)}
-          header="Could not load inducted sources"
+          header={t("Could not load inducted sources")}
         >
           {error}
         </Alert>
@@ -61,7 +63,7 @@ export function InductedSourcesView({
         columnDefinitions={[
           {
             id: "id",
-            header: "Datasource",
+            header: t("Datasource"),
             sortingComparator: (a, b) =>
               (a.name || a.datasourceId).localeCompare(
                 b.name || b.datasourceId,
@@ -70,13 +72,13 @@ export function InductedSourcesView({
           },
           {
             id: "label",
-            header: "Label",
+            header: t("Label"),
             sortingField: "label",
             cell: (e) => e.label,
           },
           {
             id: "tables",
-            header: "Tables",
+            header: t("Tables"),
             // Sort numerically; UNSTRUCTURED rows (rendered "N/A") sort as -1 so
             // they group together below the numeric table counts.
             sortingComparator: (a, b) => {
@@ -87,40 +89,45 @@ export function InductedSourcesView({
               return av - bv;
             },
             cell: (e) =>
-              e.source_type === "UNSTRUCTURED" ? "N/A" : e.tables_processed,
+              e.source_type === "UNSTRUCTURED" ? t("N/A") : e.tables_processed,
           },
           {
             id: "classes",
-            header: "Classes",
+            header: t("Classes"),
             sortingComparator: (a, b) =>
               a.novel_classes_created - b.novel_classes_created,
             cell: (e) =>
               e.source_type === "UNSTRUCTURED"
                 ? e.novel_classes_created
-                : `${e.novel_classes_created} (novel)`,
+                : t("{count} (novel)", {
+                    count: e.novel_classes_created,
+                  }),
           },
         ]}
         empty={
           <Box textAlign="center" color="text-status-inactive" padding="l">
-            No inducted sources yet. Run an induction to see the sources it
-            used.
+            {t(
+              "No inducted sources yet. Run an induction to see the sources it used.",
+            )}
           </Box>
         }
         header={
           <Header
             counter={`(${items.length})`}
-            description="Data sources that have fed an induction in this namespace."
+            description={t(
+              "Data sources that have fed an induction in this namespace.",
+            )}
             actions={
               <Button
                 iconName="refresh"
                 loading={loading}
                 onClick={() => setRefreshKey((k) => k + 1)}
               >
-                Refresh
+                {t("Refresh")}
               </Button>
             }
           >
-            Inducted sources
+            {t("Inducted sources")}
           </Header>
         }
       />

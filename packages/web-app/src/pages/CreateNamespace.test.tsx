@@ -8,6 +8,7 @@ import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { CreateNamespace } from "./CreateNamespace";
+import { LocaleProvider } from "../i18n/LocaleProvider";
 
 const mockMutate = vi.fn();
 // Mutable so a test can simulate a failed create; reset in beforeEach.
@@ -197,6 +198,46 @@ describe("CreateNamespace language", () => {
 
     expect(mockMutate).not.toHaveBeenCalled();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("shows the language choice and its confirmation in Japanese", async () => {
+    window.localStorage.setItem("scl.locale", "ja");
+    try {
+      const user = userEvent.setup();
+      render(
+        <LocaleProvider>
+          <CreateNamespace />
+        </LocaleProvider>,
+        { wrapper },
+      );
+      await user.type(
+        await screen.findByPlaceholderText("例: 保険本番"),
+        "Sales Data",
+      );
+      await user.click(screen.getByRole("radio", { name: "日本語 (ja)" }));
+      expect(
+        screen.getByRole("radio", { name: "英語 (en)" }),
+      ).not.toBeChecked();
+      await user.click(screen.getByRole("button", { name: "名前空間を作成" }));
+
+      const dialog = screen.getByRole("dialog");
+      expect(
+        within(dialog).getByText("言語は変更できません"),
+      ).toBeInTheDocument();
+      expect(within(dialog).getAllByText("日本語 (ja)").length).toBeGreaterThan(
+        0,
+      );
+      await user.click(
+        within(dialog).getByRole("button", { name: "確認して作成" }),
+      );
+      // Only the copy is localized; the request still carries the tag.
+      expect(mockMutate).toHaveBeenCalledWith(
+        expect.objectContaining({ name: "sales-data", language: "ja" }),
+      );
+    } finally {
+      window.localStorage.clear();
+      document.documentElement.lang = "";
+    }
   });
 
   it("closes the confirmation and shows the form error when create fails", async () => {

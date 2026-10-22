@@ -3,6 +3,8 @@
 
 import React, { useMemo, useState } from "react";
 import { useNavigate, useParams, useLocation } from "react-router-dom";
+import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
+import { useNamespace } from "@api-hooks/use-namespace";
 import { useCollection } from "@cloudscape-design/collection-hooks";
 import Table from "@cloudscape-design/components/table";
 import Header from "@cloudscape-design/components/header";
@@ -29,16 +31,22 @@ import {
 } from "../api-hooks/use-metrics";
 import type { MetricDefinition } from "../api-hooks/use-metrics";
 import { useSourceNameById } from "../api-hooks/use-source-name-by-id";
+import { useAppI18n } from "../i18n/LocaleProvider";
+import type { AppMessage } from "../i18n/appMessages";
 
 type MetricWithDataSource = MetricDefinition & { dataSourceName: string };
 
-const PAGE_SIZE_OPTIONS = [
+const PAGE_SIZE_OPTIONS: Array<{ value: number; label: AppMessage }> = [
   { value: 20, label: "20 metrics" },
   { value: 50, label: "50 metrics" },
   { value: 100, label: "100 metrics" },
 ];
 
-const COLUMNS = [
+const COLUMNS: Array<{
+  id: string;
+  label: AppMessage;
+  alwaysVisible?: boolean;
+}> = [
   { id: "name", label: "Name", alwaysVisible: true },
   { id: "description", label: "Description" },
   { id: "dataSourceId", label: "Data source" },
@@ -49,37 +57,18 @@ const COLUMNS = [
   { id: "definedBy", label: "Defined by" },
 ];
 
-const FILTERING_PROPERTIES: PropertyFilterProps.FilteringProperty[] = [
-  {
-    key: "name",
-    propertyLabel: "Name",
-    groupValuesLabel: "Name values",
-    operators: ["=", "!=", ":", "!:"],
-  },
-  {
-    key: "dataSourceName",
-    propertyLabel: "Data source",
-    groupValuesLabel: "Data source values",
-    operators: ["=", "!=", ":", "!:"],
-  },
-  {
-    key: "sourceTable",
-    propertyLabel: "Source table",
-    groupValuesLabel: "Source table values",
-    operators: ["=", "!=", ":", "!:"],
-  },
-  {
-    key: "definedBy",
-    propertyLabel: "Defined by",
-    groupValuesLabel: "Defined by values",
-    operators: ["=", "!=", ":", "!:"],
-  },
-];
-
 export const MetricList: React.FC = () => {
+  const { t } = useAppI18n();
   const { namespaceId } = useParams<{ namespaceId: string }>();
   const navigate = useNavigate();
   const location = useLocation();
+
+  const { name: nsName } = useNamespace(namespaceId);
+  useBreadcrumbTrail([
+    { text: nsName, href: `/namespaces/${namespaceId}`, namespaceId },
+    { text: t("Ontology") },
+    { text: t("Metrics") },
+  ]);
 
   // Resolve dataSourceId -> human-readable source name
   const sourceNameById = useSourceNameById(namespaceId ?? "");
@@ -108,6 +97,43 @@ export const MetricList: React.FC = () => {
       contentDensity: "comfortable",
       contentDisplay: COLUMNS.map((c) => ({ id: c.id, visible: true })),
     });
+  const pageSizeOptions = useMemo(
+    () =>
+      PAGE_SIZE_OPTIONS.map((option) => ({
+        ...option,
+        label: t(option.label),
+      })),
+    [t],
+  );
+  const filteringProperties = useMemo<PropertyFilterProps.FilteringProperty[]>(
+    () => [
+      {
+        key: "name",
+        propertyLabel: t("Name"),
+        groupValuesLabel: t("Name values"),
+        operators: ["=", "!=", ":", "!:"],
+      },
+      {
+        key: "dataSourceName",
+        propertyLabel: t("Data source"),
+        groupValuesLabel: t("Data source values"),
+        operators: ["=", "!=", ":", "!:"],
+      },
+      {
+        key: "sourceTable",
+        propertyLabel: t("Source table"),
+        groupValuesLabel: t("Source table values"),
+        operators: ["=", "!=", ":", "!:"],
+      },
+      {
+        key: "definedBy",
+        propertyLabel: t("Defined by"),
+        groupValuesLabel: t("Defined by values"),
+        operators: ["=", "!=", ":", "!:"],
+      },
+    ],
+    [t],
+  );
 
   const {
     data,
@@ -219,24 +245,26 @@ export const MetricList: React.FC = () => {
     filteredItemsCount,
   } = useCollection(allMetrics, {
     propertyFiltering: {
-      filteringProperties: FILTERING_PROPERTIES,
+      filteringProperties,
       empty: (
         <Box textAlign="center" color="inherit">
-          <b>No metrics</b>
+          <b>{t("No metrics")}</b>
           <Box padding={{ bottom: "s" }} variant="p" color="inherit">
-            No metrics have been defined yet. Import an OSI file to get started.
+            {t(
+              "No metrics have been defined yet. Import an OSI file to get started.",
+            )}
           </Box>
           <Button onClick={() => setImportModalVisible(true)}>
-            Import OSI
+            {t("Import OSI")}
           </Button>
         </Box>
       ),
       noMatch: (
         <Box textAlign="center" color="inherit">
           <SpaceBetween size="m">
-            <b>No matches</b>
+            <b>{t("No matches")}</b>
             <Box variant="p" color="text-body-secondary">
-              No metrics matched the filter criteria.
+              {t("No metrics matched the filter criteria.")}
             </Box>
           </SpaceBetween>
         </Box>
@@ -295,13 +323,16 @@ export const MetricList: React.FC = () => {
         setPendingFilteredOp(null);
         setImportResult({
           type: "error",
-          message: `Failed to load all metrics for the filtered operation: ${
-            err instanceof Error ? err.message : "Unknown error"
-          }`,
+          message: t(
+            "Failed to load all metrics for the filtered operation: {message}",
+            {
+              message: err instanceof Error ? err.message : t("Unknown error"),
+            },
+          ),
         });
       });
     }
-  }, [pendingFilteredOp, hasNextPage, isFetchingNextPage, fetchNextPage]);
+  }, [pendingFilteredOp, hasNextPage, isFetchingNextPage, fetchNextPage, t]);
 
   const filteredNamesComplete = React.useMemo(
     () =>
@@ -341,38 +372,51 @@ export const MetricList: React.FC = () => {
             startJobPolling(result.jobId);
             setImportResult({
               type: "success",
-              message: "Import started. Processing in the background...",
+              message: t("Import started. Processing in the background…"),
             });
           } else {
             // Sync — completed immediately
             const parts: string[] = [];
             if (result.metricsCreated > 0)
-              parts.push(`${result.metricsCreated} created`);
+              parts.push(
+                t("{count} created", { count: result.metricsCreated }),
+              );
             if (result.metricsUpdated > 0)
-              parts.push(`${result.metricsUpdated} updated`);
+              parts.push(
+                t("{count} updated", { count: result.metricsUpdated }),
+              );
             if (result.datasetsResolved > 0)
-              parts.push(`${result.datasetsResolved} datasets resolved`);
+              parts.push(
+                t("{count} datasets resolved", {
+                  count: result.datasetsResolved,
+                }),
+              );
             setImportResult({
               type: "success",
-              message: `Import successful: ${parts.join(", ")}.${
-                result.warnings?.length
-                  ? ` Warnings: ${result.warnings.join("; ")}`
-                  : ""
-              }`,
+              message: t("Import successful: {result}.{warnings}", {
+                result: parts.join(", "),
+                warnings: result.warnings?.length
+                  ? t(" Warnings: {warnings}", {
+                      warnings: result.warnings.join("; "),
+                    })
+                  : "",
+              }),
             });
           }
         },
         onError: (err) => {
           setImportResult({
             type: "error",
-            message: `Import failed: ${err.message}`,
+            message: t("Import failed: {message}", { message: err.message }),
           });
         },
       });
     } catch (err) {
       setImportResult({
         type: "error",
-        message: `Failed to read file: ${err instanceof Error ? err.message : "Unknown error"}`,
+        message: t("Failed to read file: {message}", {
+          message: err instanceof Error ? err.message : t("Unknown error"),
+        }),
       });
     }
   };
@@ -421,7 +465,9 @@ export const MetricList: React.FC = () => {
           setExportModalVisible(false);
         } catch (err) {
           setDownloadError(
-            `Download failed: ${err instanceof Error ? err.message : "Unknown error"}`,
+            t("Download failed: {message}", {
+              message: err instanceof Error ? err.message : t("Unknown error"),
+            }),
           );
         }
       },
@@ -439,17 +485,22 @@ export const MetricList: React.FC = () => {
           setSelectedMetrics([]);
           setImportResult({
             type: "success",
-            message: `Deleted ${result.deleted} metrics.${
-              result.notFound?.length
-                ? ` ${result.notFound.length} not found.`
-                : ""
-            }`,
+            message: t("Deleted {count} metrics.{notFound}", {
+              count: result.deleted,
+              notFound: result.notFound?.length
+                ? t(" {count} not found.", {
+                    count: result.notFound.length,
+                  })
+                : "",
+            }),
           });
         },
         onError: (err) => {
           setImportResult({
             type: "error",
-            message: `Bulk delete failed: ${err.message}`,
+            message: t("Bulk delete failed: {message}", {
+              message: err.message,
+            }),
           });
         },
       },
@@ -466,7 +517,7 @@ export const MetricList: React.FC = () => {
         .map((m) => m.name)
         .filter((name): name is string => Boolean(name));
       if (names.length === 0) {
-        setDownloadError("No metrics selected to export.");
+        setDownloadError(t("No metrics selected to export."));
         return;
       }
       runExport(names);
@@ -480,7 +531,7 @@ export const MetricList: React.FC = () => {
       return;
     }
     if (filteredNamesComplete.length === 0) {
-      setDownloadError("No metrics match the current filter to export.");
+      setDownloadError(t("No metrics match the current filter to export."));
       return;
     }
     runExport(filteredNamesComplete);
@@ -499,13 +550,16 @@ export const MetricList: React.FC = () => {
     if (error) {
       setImportResult({
         type: "error",
-        message: `Cancelled filtered ${op}: the metric list failed to load completely (${error.message}).`,
+        message: t(
+          "Cancelled filtered {operation}: the metric list failed to load completely ({message}).",
+          { operation: op, message: error.message },
+        ),
       });
       return;
     }
     if (op === "export") {
       if (filteredNamesComplete.length === 0) {
-        setDownloadError("No metrics match the current filter to export.");
+        setDownloadError(t("No metrics match the current filter to export."));
         return;
       }
       runExport(filteredNamesComplete);
@@ -542,43 +596,58 @@ export const MetricList: React.FC = () => {
           dismissible
           onDismiss={() => setQueryErrorDismissed(true)}
         >
-          Failed to load metrics: {error.message}
+          {t("Failed to load metrics: {message}", {
+            message: error.message,
+          })}
         </Alert>
       )}
 
       {importJob && importJob.status === "IN_PROGRESS" && (
-        <Alert type="info" header="Import in progress">
-          Processing metrics: {importJob.metricsProcessed}/
-          {importJob.metricsTotal} ({importJob.metricsCreated} created,{" "}
-          {importJob.metricsUpdated} updated). This page will update
-          automatically.
+        <Alert type="info" header={t("Import in progress")}>
+          {t(
+            "Processing metrics: {processed}/{total} ({created} created, {updated} updated). This page will update automatically.",
+            {
+              processed: importJob.metricsProcessed,
+              total: importJob.metricsTotal,
+              created: importJob.metricsCreated,
+              updated: importJob.metricsUpdated,
+            },
+          )}
         </Alert>
       )}
 
       {importJob && importJob.status === "COMPLETED" && activeJobId && (
         <Alert type="success" dismissible onDismiss={() => clearActiveJob()}>
-          Import complete: {importJob.metricsCreated} created,{" "}
-          {importJob.metricsUpdated} updated.
+          {t("Import complete: {created} created, {updated} updated.", {
+            created: importJob.metricsCreated,
+            updated: importJob.metricsUpdated,
+          })}
           {importJob.warnings &&
             importJob.warnings.length > 0 &&
-            ` Warnings: ${importJob.warnings.join("; ")}`}
+            t(" Warnings: {warnings}", {
+              warnings: importJob.warnings.join("; "),
+            })}
         </Alert>
       )}
 
       {importJob && importJob.status === "FAILED" && activeJobId && (
         <Alert type="error" dismissible onDismiss={() => clearActiveJob()}>
-          Import failed after processing {importJob.metricsProcessed}/
-          {importJob.metricsTotal} metrics.
+          {t("Import failed after processing {processed}/{total} metrics.", {
+            processed: importJob.metricsProcessed,
+            total: importJob.metricsTotal,
+          })}
           {importJob.errors &&
             importJob.errors.length > 0 &&
-            ` Errors: ${importJob.errors.slice(0, 5).join("; ")}`}
+            t(" Errors: {errors}", {
+              errors: importJob.errors.slice(0, 5).join("; "),
+            })}
         </Alert>
       )}
 
       <Table
         {...collectionProps}
         loading={isLoading}
-        loadingText="Loading metrics"
+        loadingText={t("Loading metrics")}
         items={items}
         selectionType="multi"
         selectedItems={selectedMetrics}
@@ -595,7 +664,7 @@ export const MetricList: React.FC = () => {
         columnDefinitions={[
           {
             id: "name",
-            header: "Name",
+            header: t("Name"),
             cell: (item: MetricDefinition) => (
               <Link
                 href={`/namespaces/${namespaceId}/metrics/${item.name}`}
@@ -612,12 +681,12 @@ export const MetricList: React.FC = () => {
           },
           {
             id: "description",
-            header: "Description",
+            header: t("Description"),
             cell: (item: MetricDefinition) => item.description,
           },
           {
             id: "dataSourceId",
-            header: "Data source",
+            header: t("Data source"),
             cell: (item: MetricDefinition) =>
               item.dataSourceId
                 ? (sourceNameById.get(item.dataSourceId) ?? item.dataSourceId)
@@ -625,12 +694,12 @@ export const MetricList: React.FC = () => {
           },
           {
             id: "sourceTable",
-            header: "Table",
+            header: t("Table"),
             cell: (item: MetricDefinition) => item.sourceTable,
           },
           {
             id: "dialects",
-            header: "Dialects",
+            header: t("Dialects"),
             cell: (item: MetricDefinition) =>
               (item.expression?.dialects ?? [])
                 .map((d: { dialect?: string }) => d.dialect ?? "")
@@ -638,18 +707,18 @@ export const MetricList: React.FC = () => {
           },
           {
             id: "defaultTimeGrain",
-            header: "Time grain",
+            header: t("Time grain"),
             cell: (item: MetricDefinition) => item.defaultTimeGrain ?? "—",
             sortingField: "defaultTimeGrain",
           },
           {
             id: "unit",
-            header: "Unit",
+            header: t("Unit"),
             cell: (item: MetricDefinition) => item.unit ?? "—",
           },
           {
             id: "definedBy",
-            header: "Defined by",
+            header: t("Defined by"),
             cell: (item: MetricDefinition) => item.definedBy ?? "—",
             sortingField: "definedBy",
           },
@@ -658,7 +727,9 @@ export const MetricList: React.FC = () => {
           <Header
             variant="h1"
             counter={`(${allMetrics.length}${hasNextPage ? "+" : ""})`}
-            description="Governed business metrics with pre-compiled SQL expressions."
+            description={t(
+              "Governed business metrics with pre-compiled SQL expressions.",
+            )}
             actions={
               <SpaceBetween direction="horizontal" size="xs">
                 <Button
@@ -671,11 +742,13 @@ export const MetricList: React.FC = () => {
                   onClick={() => setBulkDeleteModalVisible(true)}
                 >
                   {selectedMetrics.length > 0
-                    ? `Delete ${selectedMetrics.length} selected`
-                    : "Delete"}
+                    ? t("Delete {count} selected", {
+                        count: selectedMetrics.length,
+                      })
+                    : t("Delete")}
                 </Button>
                 <Button iconName="upload" onClick={openImportModal}>
-                  Import OSI
+                  {t("Import OSI")}
                 </Button>
                 <Button
                   iconName="download"
@@ -683,7 +756,7 @@ export const MetricList: React.FC = () => {
                   loading={exportMutation.isPending}
                   disabled={allMetrics.length === 0}
                 >
-                  Export OSI
+                  {t("Export OSI")}
                 </Button>
                 <Button
                   variant="primary"
@@ -691,74 +764,60 @@ export const MetricList: React.FC = () => {
                     navigate(`/namespaces/${namespaceId}/metrics/create`)
                   }
                 >
-                  Create metric
+                  {t("Create metric")}
                 </Button>
               </SpaceBetween>
             }
           >
-            Metrics
+            {t("Metrics")}
           </Header>
         }
         filter={
           <PropertyFilter
             {...propertyFilterProps}
-            filteringAriaLabel="Filter metrics"
-            filteringPlaceholder="Find metrics"
-            countText={`${filteredItemsCount ?? 0} match${(filteredItemsCount ?? 0) === 1 ? "" : "es"}`}
+            filteringAriaLabel={t("Filter metrics")}
+            filteringPlaceholder={t("Find metrics")}
             i18nStrings={{
-              filteringAriaLabel: "Filter metrics",
-              filteringPlaceholder: "Find metrics",
-              groupValuesText: "Values",
-              groupPropertiesText: "Properties",
-              operatorsText: "Operators",
-              operatorContainsText: "Contains",
-              operatorDoesNotContainText: "Does not contain",
-              operatorEqualsText: "Equals",
-              operatorDoesNotEqualText: "Does not equal",
-              operationAndText: "and",
-              operationOrText: "or",
-              clearFiltersText: "Clear filters",
-              applyActionText: "Apply",
-              enteredTextLabel: (text) => `Use: "${text}"`,
-              allPropertiesLabel: "All properties",
-              tokenLimitShowMore: "Show more",
-              tokenLimitShowFewer: "Show fewer",
-              removeTokenButtonAriaLabel: (token) =>
-                `Remove filter: ${token.propertyLabel} ${token.operator} ${token.value}`,
+              // App copy the Cloudscape bundle does not carry (the free-text
+              // token offer); everything else comes from the I18nProvider.
+              enteredTextLabel: (text) => t('Use: "{value}"', { value: text }),
             }}
+            countText={t("{count} matches", {
+              count: filteredItemsCount ?? 0,
+            })}
             expandToViewport
           />
         }
         pagination={<Pagination {...paginationProps} openEnd={hasNextPage} />}
         preferences={
           <CollectionPreferences
-            title="Preferences"
-            confirmLabel="Confirm"
-            cancelLabel="Cancel"
+            title={t("Preferences")}
+            confirmLabel={t("Confirm")}
+            cancelLabel={t("Cancel")}
             preferences={preferences}
             onConfirm={({ detail }) => setPreferences(detail)}
             pageSizePreference={{
-              title: "Page size",
-              options: PAGE_SIZE_OPTIONS,
+              title: t("Page size"),
+              options: pageSizeOptions,
             }}
             wrapLinesPreference={{
-              label: "Wrap lines",
-              description: "Wrap long text to multiple lines.",
+              label: t("Wrap lines"),
+              description: t("Wrap long text to multiple lines."),
             }}
             stripedRowsPreference={{
-              label: "Striped rows",
-              description: "Alternate row background.",
+              label: t("Striped rows"),
+              description: t("Alternate row background."),
             }}
             contentDensityPreference={{
-              label: "Density",
-              description: "Use compact density for scanning.",
+              label: t("Density"),
+              description: t("Use compact density for scanning."),
             }}
             contentDisplayPreference={{
-              title: "Column preferences",
-              description: "Customize column visibility and order.",
+              title: t("Column preferences"),
+              description: t("Customize column visibility and order."),
               options: COLUMNS.map((c) => ({
                 id: c.id,
-                label: c.label,
+                label: t(c.label),
                 alwaysVisible: c.alwaysVisible,
               })),
             }}
@@ -775,7 +834,7 @@ export const MetricList: React.FC = () => {
           setBulkDeleteModalVisible(false);
           setPendingFilteredOp(null);
         }}
-        header="Delete metrics"
+        header={t("Delete metrics")}
         footer={
           <Box float="right">
             <SpaceBetween direction="horizontal" size="xs">
@@ -786,7 +845,7 @@ export const MetricList: React.FC = () => {
                   setPendingFilteredOp(null);
                 }}
               >
-                Cancel
+                {t("Cancel")}
               </Button>
               <Button
                 variant="primary"
@@ -811,7 +870,7 @@ export const MetricList: React.FC = () => {
                   bulkDeleteMutation.isPending || pendingFilteredOp === "delete"
                 }
               >
-                Delete
+                {t("Delete")}
               </Button>
             </SpaceBetween>
           </Box>
@@ -828,21 +887,35 @@ export const MetricList: React.FC = () => {
               items={[
                 {
                   value: "selected",
-                  label: `Delete ${selectedMetrics.length} selected metrics`,
+                  label: t("Delete {count} selected metrics", {
+                    count: selectedMetrics.length,
+                  }),
                 },
                 {
                   value: "filtered",
-                  label: `Delete all ${filteredItemsCount ?? 0}${hasNextPage ? "+" : ""} metrics matching: ${propertyFilterProps.query.tokens.map((t) => `${t.propertyKey} ${t.operator} ${t.value}`).join(", ")}`,
+                  label: t("Delete all {count} metrics matching: {filter}", {
+                    count: `${filteredItemsCount ?? 0}${hasNextPage ? "+" : ""}`,
+                    filter: propertyFilterProps.query.tokens
+                      .map(
+                        (token) =>
+                          `${token.propertyKey} ${token.operator} ${token.value}`,
+                      )
+                      .join(", "),
+                  }),
                 },
               ]}
             />
           ) : (
             <Box>
-              Permanently delete <b>{selectedMetrics.length}</b> selected
-              metrics? This action cannot be undone.
+              {t(
+                "Permanently delete {count} selected metrics? This action cannot be undone.",
+                { count: selectedMetrics.length },
+              )}
             </Box>
           )}
-          <Box color="text-body-secondary">This action cannot be undone.</Box>
+          <Box color="text-body-secondary">
+            {t("This action cannot be undone.")}
+          </Box>
           {bulkDeleteMutation.isError && (
             <Alert type="error">
               {bulkDeleteMutation.error?.message ?? "Delete failed"}
@@ -860,7 +933,7 @@ export const MetricList: React.FC = () => {
           setExportModalVisible(false);
           setPendingFilteredOp(null);
         }}
-        header="Export OSI metrics"
+        header={t("Export OSI metrics")}
         footer={
           <Box float="right">
             <SpaceBetween direction="horizontal" size="xs">
@@ -871,7 +944,7 @@ export const MetricList: React.FC = () => {
                   setPendingFilteredOp(null);
                 }}
               >
-                Cancel
+                {t("Cancel")}
               </Button>
               <Button
                 variant="primary"
@@ -880,7 +953,7 @@ export const MetricList: React.FC = () => {
                   exportMutation.isPending || pendingFilteredOp === "export"
                 }
               >
-                Export
+                {t("Export")}
               </Button>
             </SpaceBetween>
           </Box>
@@ -895,26 +968,38 @@ export const MetricList: React.FC = () => {
             items={[
               {
                 value: "all",
-                label: `Export all ${allMetrics.length} metrics in this namespace`,
+                label: t("Export all {count} metrics in this namespace", {
+                  count: allMetrics.length,
+                }),
               },
               {
                 value: "selected",
-                label: `Export ${selectedMetrics.length} selected metrics`,
+                label: t("Export {count} selected metrics", {
+                  count: selectedMetrics.length,
+                }),
                 disabled: selectedMetrics.length === 0,
               },
               {
                 value: "filtered",
                 label:
                   propertyFilterProps.query.tokens.length > 0
-                    ? `Export all ${filteredItemsCount ?? 0}${hasNextPage ? "+" : ""} metrics matching: ${propertyFilterProps.query.tokens.map((t) => `${t.propertyKey} ${t.operator} ${t.value}`).join(", ")}`
-                    : "Export filtered metrics (no filter applied)",
+                    ? t("Export all {count} metrics matching: {filter}", {
+                        count: `${filteredItemsCount ?? 0}${hasNextPage ? "+" : ""}`,
+                        filter: propertyFilterProps.query.tokens
+                          .map(
+                            (token) =>
+                              `${token.propertyKey} ${token.operator} ${token.value}`,
+                          )
+                          .join(", "),
+                      })
+                    : t("Export filtered metrics (no filter applied)"),
                 disabled: propertyFilterProps.query.tokens.length === 0,
               },
             ]}
           />
           {exportMutation.isError && (
             <Alert type="error">
-              {exportMutation.error?.message ?? "Export failed"}
+              {exportMutation.error?.message ?? t("Export failed")}
             </Alert>
           )}
           {downloadError && <Alert type="error">{downloadError}</Alert>}
@@ -925,12 +1010,12 @@ export const MetricList: React.FC = () => {
       <Modal
         visible={importModalVisible}
         onDismiss={closeImportModal}
-        header="Import OSI metrics"
+        header={t("Import OSI metrics")}
         footer={
           <Box float="right">
             <SpaceBetween direction="horizontal" size="xs">
               <Button variant="link" onClick={closeImportModal}>
-                Cancel
+                {t("Cancel")}
               </Button>
               <Button
                 variant="primary"
@@ -938,7 +1023,7 @@ export const MetricList: React.FC = () => {
                 loading={importMutation.isPending}
                 disabled={importFiles.length === 0}
               >
-                Import
+                {t("Import")}
               </Button>
             </SpaceBetween>
           </Box>
@@ -946,30 +1031,21 @@ export const MetricList: React.FC = () => {
       >
         <SpaceBetween size="m">
           <FormField
-            label="OSI YAML file"
-            description="Select an OSI v1.0 YAML file containing metric definitions."
+            label={t("OSI YAML file")}
+            description={t(
+              "Select an OSI v1.0 YAML file containing metric definitions.",
+            )}
           >
             <FileUpload
               value={importFiles}
               onChange={({ detail }) => setImportFiles(detail.value)}
               accept=".yaml,.yml"
-              i18nStrings={{
-                uploadButtonText: (multiple) =>
-                  multiple ? "Choose files" : "Choose file",
-                dropzoneText: (multiple) =>
-                  multiple ? "Drop files to upload" : "Drop file to upload",
-                removeFileAriaLabel: (fileIndex) =>
-                  `Remove file ${fileIndex + 1}`,
-                limitShowFewer: "Show fewer files",
-                limitShowMore: "Show more files",
-                errorIconAriaLabel: "Error",
-              }}
-              constraintText="Accepted format: .yaml, .yml (OSI v1.0)"
+              constraintText={t("Accepted format: .yaml, .yml (OSI v1.0)")}
             />
           </FormField>
           {importMutation.isError && (
             <Alert type="error">
-              {importMutation.error?.message ?? "Import failed"}
+              {importMutation.error?.message ?? t("Import failed")}
             </Alert>
           )}
         </SpaceBetween>

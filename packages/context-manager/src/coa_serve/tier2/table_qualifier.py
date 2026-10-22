@@ -90,6 +90,11 @@ _IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 # that process boundary as JSON, so the two spellings are one contract.
 AMBIGUOUS_KEY = "ambiguousWith"
 
+# The ``table_sources`` value (bare table -> data_source_id) for a name that more
+# than one class or database claims. ``sql_table_routing`` turns it into an
+# ``AMBIGUOUS_KEY`` entry, so a query touching that name is refused.
+AMBIGUOUS_SOURCE = "__ambiguous__"
+
 
 class QualificationError(Exception):
     """Raised when cross-source SQL cannot be safely qualified.

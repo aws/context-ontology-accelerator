@@ -1115,6 +1115,8 @@ export class OntologyStack extends SCLStack {
           "cryptography>=43.0",
           "PyJWT>=2.9.0",
           "requests>=2.32.0",
+          // First certifi without the roots behind the compromised emSign intermediates.
+          "certifi>=2026.10.19",
         ],
       }),
       timeout: cdk.Duration.seconds(60),

@@ -8,8 +8,8 @@
  * Uses the same ``useOntologyOverview`` hook and client-side filters to scope
  * relationships and attributes to one class. No new backend needed.
  */
-import { useEffect, useMemo } from "react";
-import { useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { useMemo } from "react";
+import { useParams, useSearchParams } from "react-router-dom";
 import Alert from "@cloudscape-design/components/alert";
 import Badge from "@cloudscape-design/components/badge";
 import Box from "@cloudscape-design/components/box";
@@ -21,15 +21,17 @@ import Tabs from "@cloudscape-design/components/tabs";
 import { SortableTable } from "@components/SortableTable";
 import { useOntologyOverview } from "@api-hooks/use-ontology-overview";
 import { useListOntologies } from "@api-hooks/use-list-ontologies";
-import { useBreadcrumbs } from "@components/BreadcrumbProvider";
+import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
+import { useNamespace } from "@api-hooks/use-namespace";
 import { localName } from "./InducedOntologyDetail";
+import { useAppI18n } from "../../i18n/LocaleProvider";
 
 export function OntologyClassDetailPage() {
+  const { t } = useAppI18n();
   const { namespaceId } = useParams<{ namespaceId: string }>();
   const [searchParams] = useSearchParams();
   const ontologyId = searchParams.get("ontology_id") ?? "";
   const classUri = searchParams.get("class_uri") ?? "";
-  const navigate = useNavigate();
 
   const {
     data: overview,
@@ -44,51 +46,51 @@ export function OntologyClassDetailPage() {
 
   // Breadcrumb — origin-aware. Reached two ways:
   //   • from the Explorer "Expand" link (?from=explorer):
-  //       COA › Ontology › Explorer › {Class}
+  //       COA › {Namespace} › Ontology › Explorer › {Class}
   //   • from the Induced Ontology page (default):
-  //       COA › Ontology › Induction › {Ontology} › {Class}
+  //       COA › {Namespace} › Ontology › Induction › {Ontology} › {Class}
   const fromOrigin = searchParams.get("from");
   const { data: ontologies } = useListOntologies(namespaceId);
-  const { setBreadcrumbs, clearBreadcrumbs } = useBreadcrumbs();
+  const { name: nsName } = useNamespace(namespaceId);
   const ontologyLabel =
     ontologies?.find((r) => r.ontologyId === ontologyId || r.uri === ontologyId)
       ?.title || localName(ontologyId);
   const classLabel = cls?.label || localName(classUri);
-  useEffect(() => {
-    const trail =
-      fromOrigin === "explorer"
-        ? [
-            { text: "COA", onClick: () => navigate("/") },
-            { text: "Ontology" },
-            {
-              text: "Explorer",
-              onClick: () =>
-                navigate(`/namespaces/${namespaceId}/ontology/graph`),
-            },
-            { text: classLabel },
-          ]
-        : [
-            { text: "COA", onClick: () => navigate("/") },
-            { text: "Ontology" },
-            {
-              text: "Induction",
-              onClick: () => navigate(`/namespaces/${namespaceId}/ontology`),
-            },
-            {
-              text: ontologyLabel,
-              onClick: () =>
-                navigate(
-                  `/namespaces/${namespaceId}/ontology/induced?ontology_id=${encodeURIComponent(
-                    ontologyId,
-                  )}`,
-                ),
-            },
-            { text: classLabel },
-          ];
-    setBreadcrumbs(trail);
-    return () => clearBreadcrumbs();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [namespaceId, ontologyId, ontologyLabel, classLabel, fromOrigin]);
+  const nsCrumb = {
+    text: nsName,
+    href: `/namespaces/${namespaceId}`,
+    namespaceId,
+  };
+  useBreadcrumbTrail(
+    fromOrigin === "explorer"
+      ? [
+          nsCrumb,
+          { text: t("Ontology") },
+          {
+            text: t("Explorer"),
+            href: `/namespaces/${namespaceId}/ontology/graph`,
+            namespaceId,
+          },
+          { text: classLabel },
+        ]
+      : [
+          nsCrumb,
+          { text: t("Ontology") },
+          {
+            text: t("Induction"),
+            href: `/namespaces/${namespaceId}/ontology`,
+            namespaceId,
+          },
+          {
+            text: ontologyLabel,
+            href: `/namespaces/${namespaceId}/ontology/induced?ontology_id=${encodeURIComponent(
+              ontologyId,
+            )}`,
+            namespaceId,
+          },
+          { text: classLabel },
+        ],
+  );
 
   const relationships = useMemo(
     () =>
@@ -105,8 +107,8 @@ export function OntologyClassDetailPage() {
 
   if (!ontologyId || !classUri) {
     return (
-      <Alert type="error" header="Missing class">
-        No class was specified.
+      <Alert type="error" header={t("Missing class")}>
+        {t("No class was specified.")}
       </Alert>
     );
   }
@@ -118,7 +120,7 @@ export function OntologyClassDetailPage() {
       </Header>
 
       {error && (
-        <Alert type="warning" header="Could not load class">
+        <Alert type="warning" header={t("Could not load class")}>
           {error.message}
         </Alert>
       )}
@@ -128,30 +130,34 @@ export function OntologyClassDetailPage() {
           columns={3}
           items={[
             {
-              label: "Origin",
+              label: t("Origin"),
               value: cls?.groundedTo ? (
                 <Badge color="blue">
-                  {`Grounded${cls.matchType ? ` (${cls.matchType})` : ""}`}
+                  {`${t("Grounded")}${
+                    cls.matchType ? ` (${cls.matchType})` : ""
+                  }`}
                 </Badge>
               ) : (
-                <Badge color="green">Novel</Badge>
+                <Badge color="green">{t("Novel")}</Badge>
               ),
             },
             {
-              label: "Grounded to",
+              label: t("Grounded to"),
               value: cls?.groundedTo ? localName(cls.groundedTo) : "—",
             },
-            { label: "Description", value: cls?.comment || "—" },
+            { label: t("Description"), value: cls?.comment || "—" },
           ]}
         />
       </Container>
 
       <Tabs
-        ariaLabel="Class relationships and attributes"
+        ariaLabel={t("Class relationships and attributes")}
         tabs={[
           {
             id: "relationships",
-            label: `Relationships (${relationships.length})`,
+            label: t("Relationships ({count})", {
+              count: relationships.length,
+            }),
             content: (
               <SortableTable
                 loading={loading}
@@ -162,7 +168,7 @@ export function OntologyClassDetailPage() {
                 columnDefinitions={[
                   {
                     id: "name",
-                    header: "Relationship",
+                    header: t("Relationship"),
                     isRowHeader: true,
                     sortingComparator: (a, b) =>
                       (a.label || localName(a.uri)).localeCompare(
@@ -172,14 +178,14 @@ export function OntologyClassDetailPage() {
                   },
                   {
                     id: "domain",
-                    header: "Subject class",
+                    header: t("Subject class"),
                     sortingComparator: (a, b) =>
                       localName(a.domain).localeCompare(localName(b.domain)),
                     cell: (p) => localName(p.domain),
                   },
                   {
                     id: "range",
-                    header: "Object class",
+                    header: t("Object class"),
                     sortingComparator: (a, b) =>
                       localName(a.range).localeCompare(localName(b.range)),
                     cell: (p) => localName(p.range),
@@ -187,7 +193,7 @@ export function OntologyClassDetailPage() {
                 ]}
                 empty={
                   <Box textAlign="center" color="text-body-secondary">
-                    This class has no object-property relationships.
+                    {t("This class has no object-property relationships.")}
                   </Box>
                 }
               />
@@ -195,7 +201,9 @@ export function OntologyClassDetailPage() {
           },
           {
             id: "attributes",
-            label: `Attributes (${attributes.length})`,
+            label: t("Attributes ({count})", {
+              count: attributes.length,
+            }),
             content: (
               <SortableTable
                 loading={loading}
@@ -206,7 +214,7 @@ export function OntologyClassDetailPage() {
                 columnDefinitions={[
                   {
                     id: "name",
-                    header: "Attribute",
+                    header: t("Attribute"),
                     isRowHeader: true,
                     sortingComparator: (a, b) =>
                       (a.label || localName(a.uri)).localeCompare(
@@ -216,7 +224,7 @@ export function OntologyClassDetailPage() {
                   },
                   {
                     id: "range",
-                    header: "Datatype",
+                    header: t("Datatype"),
                     sortingComparator: (a, b) =>
                       localName(a.range).localeCompare(localName(b.range)),
                     cell: (p) => localName(p.range),
@@ -224,7 +232,7 @@ export function OntologyClassDetailPage() {
                 ]}
                 empty={
                   <Box textAlign="center" color="text-body-secondary">
-                    This class has no datatype-property attributes.
+                    {t("This class has no datatype-property attributes.")}
                   </Box>
                 }
               />

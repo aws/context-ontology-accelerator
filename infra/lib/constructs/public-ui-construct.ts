@@ -5,6 +5,7 @@ import * as cdk from "aws-cdk-lib";
 import * as s3 from "aws-cdk-lib/aws-s3";
 import * as cloudfront from "aws-cdk-lib/aws-cloudfront";
 import * as origins from "aws-cdk-lib/aws-cloudfront-origins";
+import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as s3deploy from "aws-cdk-lib/aws-s3-deployment";
 import * as acm from "aws-cdk-lib/aws-certificatemanager";
 import { Construct } from "constructs";
@@ -195,6 +196,15 @@ export interface PublicUIConstructProps {
   readonly uiDomainName?: string;
   /** ACM certificate ARN for {@link uiDomainName}. MUST be in us-east-1. */
   readonly uiCertificateArn?: string;
+  /**
+   * Versioned ARN of a Lambda@Edge viewer-request authorizer to gate the
+   * distribution (e.g. the cloudfront-oidc-auth function). When set, the
+   * authorizer is associated with EVERY cache behavior as VIEWER_REQUEST so no
+   * path reaches the origin unauthenticated, plus a caching-disabled `/__auth/*`
+   * behavior for the authorizer's own login/callback/logout routes. Omit to
+   * leave the distribution ungated. MUST be a function in us-east-1.
+   */
+  readonly edgeAuthVersionArn?: string;
 }
 
 export class PublicUIConstruct extends SCLConstruct {
@@ -269,6 +279,24 @@ export class PublicUIConstruct extends SCLConstruct {
       this.uiBucket,
     );
 
+    // Optional Lambda@Edge viewer-request authorizer (cloudfront-oidc-auth).
+    // Attached to EVERY behavior below so no path reaches the origin without a
+    // valid session — a behavior left ungated is an open door to the same
+    // origin. Imported by versioned ARN (an edge association must reference a
+    // specific version, never $LATEST). us-east-1 only, which this stack is.
+    const edgeLambdas = props.edgeAuthVersionArn
+      ? [
+          {
+            functionVersion: lambda.Version.fromVersionArn(
+              this,
+              "EdgeAuthorizer",
+              props.edgeAuthVersionArn,
+            ),
+            eventType: cloudfront.LambdaEdgeEventType.VIEWER_REQUEST,
+          },
+        ]
+      : undefined;
+
     // Dedicated CloudFront access-log bucket. Legacy standard logging delivers
     // via a bucket ACL grant, so this bucket enables ACLs
     // (BUCKET_OWNER_PREFERRED) while still blocking all public access.
@@ -287,6 +315,7 @@ export class PublicUIConstruct extends SCLConstruct {
         viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
         cachePolicy: cloudfront.CachePolicy.CACHING_OPTIMIZED,
         responseHeadersPolicy,
+        ...(edgeLambdas && { edgeLambdas }),
       },
       additionalBehaviors: {
         // runtime-config.json must never be cached — it contains per-environment
@@ -297,7 +326,22 @@ export class PublicUIConstruct extends SCLConstruct {
             cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
           cachePolicy: cloudfront.CachePolicy.CACHING_DISABLED,
           responseHeadersPolicy,
+          ...(edgeLambdas && { edgeLambdas }),
         },
+        // The authorizer's own routes (login / callback / logout). Caching MUST
+        // be disabled: each response carries a unique OAuth `state`, so a cached
+        // one would hand a viewer someone else's login attempt. The function
+        // answers these itself; the S3 origin behind them is never reached.
+        ...(edgeLambdas && {
+          "/__auth/*": {
+            origin: s3Origin,
+            viewerProtocolPolicy:
+              cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+            cachePolicy: cloudfront.CachePolicy.CACHING_DISABLED,
+            responseHeadersPolicy,
+            edgeLambdas,
+          },
+        }),
       },
       defaultRootObject: "index.html",
       minimumProtocolVersion: cloudfront.SecurityPolicyProtocol.TLS_V1_2_2021,

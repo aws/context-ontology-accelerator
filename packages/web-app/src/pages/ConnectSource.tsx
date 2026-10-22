@@ -3,6 +3,8 @@
 
 import React, { useCallback, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
+import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
+import { useNamespace } from "@api-hooks/use-namespace";
 import Wizard from "@cloudscape-design/components/wizard";
 import type { WizardProps } from "@cloudscape-design/components/wizard";
 import Alert from "@cloudscape-design/components/alert";
@@ -64,31 +66,38 @@ function CrossAccountExternalIdField({
    *  carries no ExternalId. Only the first is worth reloading the page for. */
   readonly loadFailed: boolean;
 }): React.JSX.Element {
+  const { t } = useAppI18n();
   // errorText rather than a Box: it renders in an assertive live region, so the
   // unavailable state reaches a screen reader even though nothing here is focusable.
   let errorText: string | undefined;
   if (!externalId && !isLoading) {
     errorText = loadFailed
-      ? "Unavailable — the namespace could not be loaded. Reload the page to retrieve it."
-      : "Unavailable — this namespace carries no External ID, so the role's trust policy cannot be bound to it. Report this to the operator of this deployment.";
+      ? t(
+          "Unavailable — the namespace could not be loaded. Reload the page to retrieve it.",
+        )
+      : t(
+          "Unavailable — this namespace carries no External ID, so the role's trust policy cannot be bound to it. Report this to the operator of this deployment.",
+        );
   }
   return (
     <FormField
-      label="External ID (add to the role's trust policy)"
-      description="Context Ontology Accelerator presents this value when assuming the role above. Add it as an sts:ExternalId condition on that role's trust policy — without the condition the role is assumable on behalf of any namespace in this deployment."
+      label={t("External ID (add to the role's trust policy)")}
+      description={t(
+        "Context Ontology Accelerator presents this value when assuming the role above. Add it as an sts:ExternalId condition on that role's trust policy — without the condition the role is assumable on behalf of any namespace in this deployment.",
+      )}
       errorText={errorText}
     >
       {externalId ? (
         <CopyToClipboard
-          copyButtonAriaLabel="Copy External ID"
-          copyButtonText="Copy"
-          copySuccessText="External ID copied"
-          copyErrorText="Failed to copy External ID"
+          copyButtonAriaLabel={t("Copy External ID")}
+          copyButtonText={t("Copy")}
+          copySuccessText={t("External ID copied")}
+          copyErrorText={t("Failed to copy External ID")}
           textToCopy={externalId}
           variant="inline"
         />
       ) : isLoading ? (
-        <Box color="text-status-inactive">Loading…</Box>
+        <Box color="text-status-inactive">{t("Loading…")}</Box>
       ) : null}
     </FormField>
   );
@@ -130,6 +139,8 @@ function extractErrorMessage(
 }
 import { SUPPORTED_UPLOAD_CONTENT_TYPES, MAX_UPLOAD_FILES } from "@coa/shared";
 import { S3_ARN_RE, validateS3Prefix } from "@utils/helpers";
+import { useAppI18n, type AppTranslate } from "../i18n/LocaleProvider";
+import type { AppMessage } from "../i18n/appMessages";
 
 // ── Source type options ───────────────────────────────────────────────────────
 
@@ -154,7 +165,7 @@ function isSourceKind(value: string): value is SourceKind {
 }
 
 // Labels for the step-1 tiles, reused by the review step's summary.
-const SOURCE_KIND_LABELS: Record<SourceKind, string> = {
+const SOURCE_KIND_LABELS: Record<SourceKind, AppMessage> = {
   GLUE_DATABASE: "Glue database",
   JDBC_DATABASE: "JDBC database",
   CUSTOM_CONNECTOR: "Custom connector",
@@ -183,8 +194,8 @@ type GlueExecutionEngine = "ATHENA" | "REDSHIFT";
 
 const GLUE_EXECUTION_ENGINE_OPTIONS: {
   value: GlueExecutionEngine;
-  label: string;
-  description: string;
+  label: AppMessage;
+  description: AppMessage;
 }[] = [
   {
     value: "ATHENA",
@@ -374,12 +385,18 @@ function buildExtractionConfig(model: Model): {
  * "Dress"). Neither is an error — the labels are used as written — so this is
  * `warningText`, not `errorText`.
  */
-function vocabularyWarning(labels: string[]): string | undefined {
+function vocabularyWarning(
+  labels: string[],
+  t: AppTranslate,
+): string | undefined {
   const rewritten = labelsRewrittenOnIngest(labels);
   const parts: string[] = [];
   if (labels.length > RECOMMENDED_MAX_LABELS) {
     parts.push(
-      `${labels.length} classes. Long lists measurably reduce how closely the extractor follows them.`,
+      t(
+        "{count} classes. Long lists measurably reduce how closely the extractor follows them.",
+        { count: labels.length },
+      ),
     );
   }
   if (rewritten.length > 0) {
@@ -388,9 +405,14 @@ function vocabularyWarning(labels: string[]): string | undefined {
     // behind "and N more" defeats it. The set is naturally small — only labels
     // whose recorded form differs from what was typed.
     const shown = rewritten
-      .map((r) => `“${r.typed}” as “${r.stored}”`)
+      .map((r) =>
+        t("“{typed}” as “{stored}”", {
+          typed: r.typed,
+          stored: r.stored,
+        }),
+      )
       .join(", ");
-    parts.push(`Extraction will record ${shown}.`);
+    parts.push(t("Extraction will record {items}.", { items: shown }));
   }
   return parts.length > 0 ? parts.join(" ") : undefined;
 }
@@ -401,15 +423,26 @@ function vocabularyWarning(labels: string[]): string | undefined {
  * is dropped, so a supplied name can still be recorded differently. Surfacing the
  * specific names beats a general sentence nobody reads.
  */
-function topicWarning(topics: string[]): string | undefined {
+function topicWarning(topics: string[], t: AppTranslate): string | undefined {
   const rewritten = topicsRewrittenOnIngest(topics);
   if (rewritten.length === 0) return undefined;
   const shown = rewritten
     .slice(0, 3)
-    .map((r) => `“${r.typed}” as “${r.stored}”`)
+    .map((r) =>
+      t("“{typed}” as “{stored}”", {
+        typed: r.typed,
+        stored: r.stored,
+      }),
+    )
     .join(", ");
-  const more = rewritten.length > 3 ? ` and ${rewritten.length - 3} more` : "";
-  return `Extraction will record ${shown}${more}.`;
+  const more =
+    rewritten.length > 3
+      ? t(", and {count} more", { count: rewritten.length - 3 })
+      : "";
+  return t("Extraction will record {items}{more}.", {
+    items: shown,
+    more,
+  });
 }
 
 const initialModel: Model = {
@@ -477,12 +510,17 @@ const initialModel: Model = {
  * Default prefix is "coa", default env is "dev", so pattern becomes:
  *   arn:aws:iam::ACCOUNT:role/coa-dev-datasource-access-SUFFIX
  */
-function validateCrossAccountRoleArn(arn: string): string | undefined {
+function validateCrossAccountRoleArn(
+  arn: string,
+  t: AppTranslate,
+): string | undefined {
   if (!arn.trim()) return undefined; // optional field
   const roleArnPattern =
     /^arn:aws:iam::\d{12}:role\/[a-zA-Z0-9_+=,.@-]+-datasource-access-[a-zA-Z0-9_+=,.@-]+$/;
   if (!roleArnPattern.test(arn.trim())) {
-    return "Role ARN must match pattern: arn:aws:iam::ACCOUNT:role/{prefix}-datasource-access-*";
+    return t(
+      "Role ARN must match pattern: arn:aws:iam::ACCOUNT:role/{prefix}-datasource-access-*",
+    );
   }
   return undefined;
 }
@@ -518,10 +556,15 @@ const DATASOURCE_ACCESS_SEGMENT = "datasource-access-";
  *  Databricks path — a Glue or JDBC steward who takes a hardcoded
  *  `{prefix}-datasource-access-*` literally passes the form and fails at first
  *  scan with an opaque AccessDenied. */
-function requiredRoleNamePrefix(resourcePrefix: string | undefined): string {
+function requiredRoleNamePrefix(
+  resourcePrefix: string | undefined,
+  t: AppTranslate,
+): string {
   return resourcePrefix
     ? `'${resourcePrefix}${DATASOURCE_ACCESS_SEGMENT}'`
-    : `this deployment's resource prefix followed by '${DATASOURCE_ACCESS_SEGMENT}'`;
+    : t("this deployment's resource prefix followed by '{segment}'", {
+        segment: DATASOURCE_ACCESS_SEGMENT,
+      });
 }
 
 /**
@@ -535,12 +578,16 @@ function requiredRoleNamePrefix(resourcePrefix: string | undefined): string {
 function validateRequiredCrossAccountRoleArn(
   arn: string,
   resourcePrefix: string | undefined,
+  t: AppTranslate,
 ): string | undefined {
   const trimmed = arn.trim();
   if (!trimmed)
-    return `Credential access role ARN is required, and the role's name must start with ${requiredRoleNamePrefix(resourcePrefix)} — the assume grant is scoped to that prefix.`;
+    return t(
+      "Credential access role ARN is required, and the role's name must start with {prefix} — the assume grant is scoped to that prefix.",
+      { prefix: requiredRoleNamePrefix(resourcePrefix, t) },
+    );
 
-  const shapeError = validateCrossAccountRoleArn(trimmed);
+  const shapeError = validateCrossAccountRoleArn(trimmed, t);
   if (shapeError) return shapeError;
   // Without a derived prefix the shape check is all the form can assert; the API
   // applies the exact rule either way.
@@ -549,7 +596,10 @@ function validateRequiredCrossAccountRoleArn(
   const roleName = trimmed.slice(trimmed.lastIndexOf("/") + 1);
   const requiredStart = `${resourcePrefix}${DATASOURCE_ACCESS_SEGMENT}`;
   if (!roleName.startsWith(requiredStart)) {
-    return `Role name must start with '${requiredStart}'. This deployment's sts:AssumeRole grant is scoped to that prefix, so a role named anything else is denied however it is configured. The role's account is unconstrained.`;
+    return t(
+      "Role name must start with '{prefix}'. This deployment's sts:AssumeRole grant is scoped to that prefix, so a role named anything else is denied however it is configured. The role's account is unconstrained.",
+      { prefix: requiredStart },
+    );
   }
   return undefined;
 }
@@ -573,12 +623,17 @@ const SECRET_ARN_RE =
  * account, so an unqualified name would resolve against this deployment's
  * account instead.
  */
-function validateLambdaFunctionArn(arn: string): string | undefined {
+function validateLambdaFunctionArn(
+  arn: string,
+  t: AppTranslate,
+): string | undefined {
   if (!arn.trim()) return undefined; // callers decide whether the field is required
   const lambdaArnPattern =
     /^arn:aws[a-z-]*:lambda:[a-z0-9-]+:\d{12}:function:[a-zA-Z0-9_-]+(:(\$LATEST|[a-zA-Z0-9_-]+))?$/;
   if (!lambdaArnPattern.test(arn.trim())) {
-    return "Must be a full Lambda function ARN: arn:aws:lambda:REGION:ACCOUNT:function:NAME";
+    return t(
+      "Must be a full Lambda function ARN: arn:aws:lambda:REGION:ACCOUNT:function:NAME",
+    );
   }
   return undefined;
 }
@@ -636,17 +691,21 @@ function sourceNameFor(model: Model, docTab: "upload" | "s3"): string {
 function validateStep2(
   model: Model,
   docTab: "upload" | "s3",
+  t: AppTranslate,
   // Only the Databricks arm uses it; Glue and JDBC keep a shape-only check.
   resourcePrefix?: string,
 ): ValidationErrors {
   const errs: ValidationErrors = {};
   if (model.sourceKind === "GLUE_DATABASE") {
-    if (!model.dbName.trim()) errs.dbName = "Name is required.";
+    if (!model.dbName.trim()) errs.dbName = t("Name is required.");
     if (!model.glueCatalogId.trim())
-      errs.glueCatalogId = "Catalog ID is required.";
+      errs.glueCatalogId = t("Catalog ID is required.");
     if (!model.glueDatabaseName.trim())
-      errs.glueDatabaseName = "Database name is required.";
-    const roleErr = validateCrossAccountRoleArn(model.glueCrossAccountRoleArn);
+      errs.glueDatabaseName = t("Database name is required.");
+    const roleErr = validateCrossAccountRoleArn(
+      model.glueCrossAccountRoleArn,
+      t,
+    );
     if (roleErr) errs.glueCrossAccountRoleArn = roleErr;
     // A Redshift-executed Glue source must name its workgroup — the
     // backend cannot infer which Serverless workgroup to use.
@@ -654,89 +713,108 @@ function validateStep2(
       model.glueExecutionEngine === "REDSHIFT" &&
       !model.glueRedshiftWorkgroup.trim()
     )
-      errs.glueRedshiftWorkgroup =
-        "Redshift workgroup is required when the execution engine is Redshift.";
+      errs.glueRedshiftWorkgroup = t(
+        "Redshift workgroup is required when the execution engine is Redshift.",
+      );
   } else if (model.sourceKind === "JDBC_DATABASE") {
-    if (!model.jdbcName.trim()) errs.jdbcName = "Name is required.";
-    if (!model.dbEngine) errs.dbEngine = "Select a database engine.";
-    if (!model.dbHost.trim()) errs.dbHost = "Host is required.";
-    if (!model.dbPort.trim()) errs.dbPort = "Port is required.";
+    if (!model.jdbcName.trim()) errs.jdbcName = t("Name is required.");
+    if (!model.dbEngine) errs.dbEngine = t("Select a database engine.");
+    if (!model.dbHost.trim()) errs.dbHost = t("Host is required.");
+    if (!model.dbPort.trim()) errs.dbPort = t("Port is required.");
     if (!model.dbDatabaseName.trim())
-      errs.dbDatabaseName = "Database name is required.";
+      errs.dbDatabaseName = t("Database name is required.");
     if (!model.dbSecretArn.trim())
-      errs.dbSecretArn = "Secrets Manager ARN is required.";
-    const roleErr = validateCrossAccountRoleArn(model.jdbcCrossAccountRoleArn);
+      errs.dbSecretArn = t("Secrets Manager ARN is required.");
+    const roleErr = validateCrossAccountRoleArn(
+      model.jdbcCrossAccountRoleArn,
+      t,
+    );
     if (roleErr) errs.jdbcCrossAccountRoleArn = roleErr;
   } else if (model.sourceKind === "CUSTOM_CONNECTOR") {
     if (!model.customConnectorName.trim())
-      errs.customConnectorName = "Name is required.";
+      errs.customConnectorName = t("Name is required.");
     if (!model.customConnectorFunctionArn.trim())
-      errs.customConnectorFunctionArn = "Connector function ARN is required.";
+      errs.customConnectorFunctionArn = t(
+        "Connector function ARN is required.",
+      );
     else {
       const arnErr = validateLambdaFunctionArn(
         model.customConnectorFunctionArn,
+        t,
       );
       if (arnErr) errs.customConnectorFunctionArn = arnErr;
     }
     if (!model.customConnectorDatabaseName.trim())
-      errs.customConnectorDatabaseName = "Database name is required.";
+      errs.customConnectorDatabaseName = t("Database name is required.");
   } else if (model.sourceKind === "DATABRICKS_SQL_WAREHOUSE") {
-    if (!model.databricksName.trim()) errs.databricksName = "Name is required.";
+    if (!model.databricksName.trim())
+      errs.databricksName = t("Name is required.");
     if (!model.databricksWorkspaceHostname.trim())
-      errs.databricksWorkspaceHostname = "Workspace hostname is required.";
+      errs.databricksWorkspaceHostname = t("Workspace hostname is required.");
     else if (
       !DATABRICKS_WORKSPACE_HOSTNAME_RE.test(
         model.databricksWorkspaceHostname.trim(),
       )
     )
-      errs.databricksWorkspaceHostname =
-        "Must be a lowercase Databricks workspace host ending in cloud.databricks.com, azuredatabricks.net, or gcp.databricks.com.";
+      errs.databricksWorkspaceHostname = t(
+        "Must be a lowercase Databricks workspace host ending in cloud.databricks.com, azuredatabricks.net, or gcp.databricks.com.",
+      );
     if (!model.databricksHttpPath.trim())
-      errs.databricksHttpPath = "HTTP path is required.";
+      errs.databricksHttpPath = t("HTTP path is required.");
     else if (!DATABRICKS_HTTP_PATH_RE.test(model.databricksHttpPath.trim()))
-      errs.databricksHttpPath =
-        "Must be the warehouse's HTTP path: /sql/1.0/warehouses/ID (or /sql/1.0/endpoints/ID).";
+      errs.databricksHttpPath = t(
+        "Must be the warehouse's HTTP path: /sql/1.0/warehouses/ID (or /sql/1.0/endpoints/ID).",
+      );
     if (!model.databricksCatalog.trim())
-      errs.databricksCatalog = "Unity Catalog catalog is required.";
+      errs.databricksCatalog = t("Unity Catalog catalog is required.");
     else if (!DATABRICKS_IDENTIFIER_RE.test(model.databricksCatalog.trim()))
-      errs.databricksCatalog =
-        "Must be a SQL identifier: a letter or underscore, then letters, digits, or underscores.";
+      errs.databricksCatalog = t(
+        "Must be a SQL identifier: a letter or underscore, then letters, digits, or underscores.",
+      );
     if (!model.databricksSchemaName.trim())
-      errs.databricksSchemaName = "Unity Catalog schema is required.";
+      errs.databricksSchemaName = t("Unity Catalog schema is required.");
     else if (!DATABRICKS_IDENTIFIER_RE.test(model.databricksSchemaName.trim()))
-      errs.databricksSchemaName =
-        "Must be a SQL identifier: a letter or underscore, then letters, digits, or underscores.";
+      errs.databricksSchemaName = t(
+        "Must be a SQL identifier: a letter or underscore, then letters, digits, or underscores.",
+      );
     if (!model.databricksSecretArn.trim())
-      errs.databricksSecretArn = "Credential secret ARN is required.";
+      errs.databricksSecretArn = t("Credential secret ARN is required.");
     else if (!SECRET_ARN_RE.test(model.databricksSecretArn.trim()))
-      errs.databricksSecretArn =
-        "Must be a Secrets Manager secret ARN: arn:aws:secretsmanager:REGION:ACCOUNT:secret:NAME";
+      errs.databricksSecretArn = t(
+        "Must be a Secrets Manager secret ARN: arn:aws:secretsmanager:REGION:ACCOUNT:secret:NAME",
+      );
     const roleErr = validateRequiredCrossAccountRoleArn(
       model.databricksCrossAccountRoleArn,
       resourcePrefix,
+      t,
     );
     if (roleErr) errs.databricksCrossAccountRoleArn = roleErr;
   } else {
     // DOCUMENTS
     if (docTab === "upload") {
-      if (!model.docUploadName.trim()) errs.docUploadName = "Name is required.";
+      if (!model.docUploadName.trim())
+        errs.docUploadName = t("Name is required.");
       if (model.docUploadFiles.length === 0)
-        errs.docFiles = "Select at least one file.";
+        errs.docFiles = t("Select at least one file.");
       else if (model.docUploadFiles.length > MAX_UPLOAD_FILES)
-        errs.docFiles = `Maximum ${MAX_UPLOAD_FILES} files.`;
+        errs.docFiles = t("Maximum {count} files.", {
+          count: MAX_UPLOAD_FILES,
+        });
       else {
         const bad = model.docUploadFiles.filter(
           (f) => !SUPPORTED_UPLOAD_CONTENT_TYPES.has(resolveContentType(f)),
         );
         if (bad.length > 0)
-          errs.docFiles = `Unsupported: ${bad.map((f) => f.name).join(", ")}`;
+          errs.docFiles = t("Unsupported: {files}", {
+            files: bad.map((f) => f.name).join(", "),
+          });
       }
     } else {
-      if (!model.docS3Name.trim()) errs.docS3Name = "Name is required.";
+      if (!model.docS3Name.trim()) errs.docS3Name = t("Name is required.");
       if (!model.docS3BucketArn.trim())
-        errs.docS3BucketArn = "Bucket ARN is required.";
+        errs.docS3BucketArn = t("Bucket ARN is required.");
       else if (!S3_ARN_RE.test(model.docS3BucketArn.trim()))
-        errs.docS3BucketArn = "Must be a valid S3 bucket ARN.";
+        errs.docS3BucketArn = t("Must be a valid S3 bucket ARN.");
       const prefixErrs: Record<number, string> = {};
       model.docS3Prefixes.forEach(({ id, value }) => {
         if (!value.trim()) return;
@@ -760,13 +838,14 @@ function validateStep2(
       errs.preferredTopics = "Add at least one topic, or choose “Automatic”.";
     }
   }
-  if (Object.keys(errs).length > 0) errs.step1 = "Fix the errors above.";
+  if (Object.keys(errs).length > 0) errs.step1 = t("Fix the errors above.");
   return errs;
 }
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
 export const ConnectSource: React.FC = () => {
+  const { t } = useAppI18n();
   const { namespaceId } = useParams<{ namespaceId: string }>();
   // The ExternalId shown for cross-account roles is derived server-side from the
   // namespace, so it comes from the namespace detail rather than being typed in.
@@ -781,6 +860,17 @@ export const ConnectSource: React.FC = () => {
     [datasourceExternalId, namespaceId],
   );
   const navigate = useNavigate();
+
+  const { name: nsName } = useNamespace(namespaceId);
+  useBreadcrumbTrail([
+    { text: nsName, href: `/namespaces/${namespaceId}`, namespaceId },
+    {
+      text: t("Sources"),
+      href: `/namespaces/${namespaceId}/sources`,
+      namespaceId,
+    },
+    { text: t("Connect") },
+  ]);
 
   const [model, setModel] = useState<Model>(initialModel);
   const [activeStepIndex, setActiveStepIndex] = useState(0);
@@ -848,7 +938,7 @@ export const ConnectSource: React.FC = () => {
 
   // ── Submit ─────────────────────────────────────────────────────────
   const handleSubmit = async () => {
-    const step2Errs = validateStep2(model, docTab, resourcePrefix);
+    const step2Errs = validateStep2(model, docTab, t, resourcePrefix);
     if (step2Errs.step1) {
       setShowErrors({ 0: true, 1: true });
       setActiveStepIndex(1);
@@ -1057,7 +1147,7 @@ export const ConnectSource: React.FC = () => {
       // Everything before it reports here, so one failure always yields one message.
       if (!createStarted) {
         setUploadError(
-          extractErrorMessage(err, "Upload failed. Please try again."),
+          extractErrorMessage(err, t("Upload failed. Please try again.")),
         );
       }
     }
@@ -1065,17 +1155,18 @@ export const ConnectSource: React.FC = () => {
 
   // ── Steps ──────────────────────────────────────────────────────────
   const step2Errs = useMemo(
-    () => (showErrors[1] ? validateStep2(model, docTab, resourcePrefix) : {}),
-    [showErrors, model, docTab, resourcePrefix],
+    () =>
+      showErrors[1] ? validateStep2(model, docTab, t, resourcePrefix) : {},
+    [showErrors, model, docTab, t, resourcePrefix],
   );
 
   const steps: WizardProps.Step[] = useMemo(() => {
     // ── Step 1: Choose source type (3 tiles) ──────────────────────────
     const step1: WizardProps.Step = {
-      title: "Choose source type",
-      description: "Select the type of source you want to connect.",
+      title: t("Choose source type"),
+      description: t("Select the type of source you want to connect."),
       content: (
-        <Container header={<Header variant="h2">Source type</Header>}>
+        <Container header={<Header variant="h2">{t("Source type")}</Header>}>
           <Tiles
             value={model.sourceKind}
             onChange={({ detail }) => {
@@ -1085,32 +1176,39 @@ export const ConnectSource: React.FC = () => {
             items={[
               {
                 value: "GLUE_DATABASE",
-                label: SOURCE_KIND_LABELS.GLUE_DATABASE,
-                description:
+                label: t(SOURCE_KIND_LABELS.GLUE_DATABASE),
+                description: t(
                   "Connect to an existing AWS Glue Data Catalog database. Covers S3/Iceberg tables, DynamoDB, and Athena-federated JDBC sources.",
+                ),
               },
               {
                 value: "JDBC_DATABASE",
-                label: SOURCE_KIND_LABELS.JDBC_DATABASE,
-                description: `Connect directly to a relational database. Schema is discovered from information_schema. Supported engines: ${ENGINE_LABELS}.`,
+                label: t(SOURCE_KIND_LABELS.JDBC_DATABASE),
+                description: t(
+                  "Connect directly to a relational database. Schema is discovered from information_schema. Supported engines: {engines}.",
+                  { engines: ENGINE_LABELS },
+                ),
               },
               {
                 value: "CUSTOM_CONNECTOR",
-                label: SOURCE_KIND_LABELS.CUSTOM_CONNECTOR,
-                description:
+                label: t(SOURCE_KIND_LABELS.CUSTOM_CONNECTOR),
+                description: t(
                   "Bring your own data source: register an Athena Query Federation SDK connector you built and deployed as a Lambda in your own AWS account. Schema and rows are read through Athena against that connector.",
+                ),
               },
               {
                 value: "DATABRICKS_SQL_WAREHOUSE",
-                label: SOURCE_KIND_LABELS.DATABRICKS_SQL_WAREHOUSE,
-                description:
+                label: t(SOURCE_KIND_LABELS.DATABRICKS_SQL_WAREHOUSE),
+                description: t(
                   "Connect one Unity Catalog schema on a Databricks SQL Warehouse. Nothing to deploy — Context Ontology Accelerator operates the connector; you supply the warehouse, the credential secret, and the role that reads it.",
+                ),
               },
               {
                 value: "DOCUMENTS",
-                label: SOURCE_KIND_LABELS.DOCUMENTS,
-                description:
+                label: t(SOURCE_KIND_LABELS.DOCUMENTS),
+                description: t(
                   "Ingest unstructured documents from an S3 bucket or by uploading files directly.",
+                ),
               },
             ]}
           />
@@ -1123,39 +1221,45 @@ export const ConnectSource: React.FC = () => {
 
     if (model.sourceKind === "GLUE_DATABASE") {
       step2 = {
-        title: "Configure connection",
-        description: "Select the Glue Data Catalog database to connect.",
+        title: t("Configure connection"),
+        description: t("Select the Glue Data Catalog database to connect."),
         errorText: step2Errs.step1,
         content: (
           <SpaceBetween size="l">
-            <Container header={<Header variant="h2">Source details</Header>}>
+            <Container
+              header={<Header variant="h2">{t("Source details")}</Header>}
+            >
               <SpaceBetween size="l">
                 <FormField
                   label={
                     <>
-                      Source name{" "}
+                      {t("Source name")}{" "}
                       <Box variant="span" color="text-status-error">
                         *
                       </Box>
                     </>
                   }
-                  description="A unique name for this source within the namespace."
+                  description={t(
+                    "A unique name for this source within the namespace.",
+                  )}
                   errorText={step2Errs.dbName}
                 >
                   <Input
                     value={model.dbName}
                     onChange={({ detail }) => setField("dbName", detail.value)}
-                    placeholder="My Glue Database"
+                    placeholder={t("My Glue Database")}
                   />
                 </FormField>
               </SpaceBetween>
             </Container>
-            <Container header={<Header variant="h2">Glue database</Header>}>
+            <Container
+              header={<Header variant="h2">{t("Glue database")}</Header>}
+            >
               <SpaceBetween size="l">
                 <FormField
                   label={
                     <>
-                      Catalog ID (AWS account){" "}
+                      {t("Catalog ID (AWS account)")}{" "}
                       <Box variant="span" color="text-status-error">
                         *
                       </Box>
@@ -1174,7 +1278,7 @@ export const ConnectSource: React.FC = () => {
                 <FormField
                   label={
                     <>
-                      Region{" "}
+                      {t("Region")}{" "}
                       <Box variant="span" color="text-status-error">
                         *
                       </Box>
@@ -1192,13 +1296,15 @@ export const ConnectSource: React.FC = () => {
                 <FormField
                   label={
                     <>
-                      Database name{" "}
+                      {t("Database name")}{" "}
                       <Box variant="span" color="text-status-error">
                         *
                       </Box>
                     </>
                   }
-                  description="Choose a Glue Data Catalog database to connect. All tables within the database will be scanned."
+                  description={t(
+                    "Choose a Glue Data Catalog database to connect. All tables within the database will be scanned.",
+                  )}
                   errorText={step2Errs.glueDatabaseName}
                 >
                   <Input
@@ -1212,13 +1318,15 @@ export const ConnectSource: React.FC = () => {
               </SpaceBetween>
             </Container>
             <ExpandableSection
-              headerText="Advanced configuration"
+              headerText={t("Advanced configuration")}
               variant="container"
             >
               <SpaceBetween size="l">
                 <FormField
-                  label="Table filter"
-                  description="Optional Glue expression (a regular expression, e.g. orders|customers) to include specific tables."
+                  label={t("Table filter")}
+                  description={t(
+                    "Optional Glue expression (a regular expression, e.g. orders|customers) to include specific tables.",
+                  )}
                 >
                   <Input
                     value={model.glueTableFilter}
@@ -1229,8 +1337,10 @@ export const ConnectSource: React.FC = () => {
                   />
                 </FormField>
                 <FormField
-                  label="Table exclude filter"
-                  description="Optional glob(s) (* ? [seq]) to exclude specific tables. Applied after the include filter. Separate multiple with | or ,."
+                  label={t("Table exclude filter")}
+                  description={t(
+                    "Optional glob(s) (* ? [seq]) to exclude specific tables. Applied after the include filter. Separate multiple with | or ,.",
+                  )}
                 >
                   <Input
                     value={model.glueTableExcludeFilter}
@@ -1241,8 +1351,10 @@ export const ConnectSource: React.FC = () => {
                   />
                 </FormField>
                 <FormField
-                  label="Execution engine"
-                  description="How this Glue/Iceberg source's queries run at serve time. Redshift runs them via Redshift Serverless (awsdatacatalog auto-mount) instead of Athena. This does NOT connect to a Redshift database — to query a Redshift cluster's own tables, onboard a JDBC source instead."
+                  label={t("Execution engine")}
+                  description={t(
+                    "How this Glue/Iceberg source's queries run at serve time. Redshift runs them via Redshift Serverless (awsdatacatalog auto-mount) instead of Athena. This does NOT connect to a Redshift database — to query a Redshift cluster's own tables, onboard a JDBC source instead.",
+                  )}
                 >
                   <Select
                     selectedOption={
@@ -1257,20 +1369,26 @@ export const ConnectSource: React.FC = () => {
                       if (selected)
                         setField("glueExecutionEngine", selected.value);
                     }}
-                    options={GLUE_EXECUTION_ENGINE_OPTIONS}
+                    options={GLUE_EXECUTION_ENGINE_OPTIONS.map((option) => ({
+                      ...option,
+                      label: t(option.label),
+                      description: t(option.description),
+                    }))}
                   />
                 </FormField>
                 {model.glueExecutionEngine === "REDSHIFT" && (
                   <FormField
                     label={
                       <>
-                        Redshift workgroup{" "}
+                        {t("Redshift workgroup")}{" "}
                         <Box variant="span" color="text-status-error">
                           *
                         </Box>
                       </>
                     }
-                    description="The Amazon Redshift Serverless workgroup that executes this source's queries."
+                    description={t(
+                      "The Amazon Redshift Serverless workgroup that executes this source's queries.",
+                    )}
                     errorText={step2Errs.glueRedshiftWorkgroup}
                   >
                     <Input
@@ -1284,8 +1402,10 @@ export const ConnectSource: React.FC = () => {
                 )}
                 {model.glueExecutionEngine !== "REDSHIFT" && (
                   <FormField
-                    label="Athena DataCatalog name"
-                    description="Optional. Required for JDBC-backed Glue databases to enable federated queries."
+                    label={t("Athena DataCatalog name")}
+                    description={t(
+                      "Optional. Required for JDBC-backed Glue databases to enable federated queries.",
+                    )}
                   >
                     <Input
                       value={model.glueAthenaDataCatalogName}
@@ -1297,8 +1417,11 @@ export const ConnectSource: React.FC = () => {
                   </FormField>
                 )}
                 <FormField
-                  label="Cross-account role ARN"
-                  description={`Optional. For a Glue catalog in another account, the IAM role Context Ontology Accelerator assumes to read catalog metadata. Its name must start with ${requiredRoleNamePrefix(resourcePrefix)}, and its trust policy must require the External ID below.`}
+                  label={t("Cross-account role ARN")}
+                  description={t(
+                    "Optional. For a Glue catalog in another account, the IAM role Context Ontology Accelerator assumes to read catalog metadata. Its name must start with {prefix}, and its trust policy must require the External ID below.",
+                    { prefix: requiredRoleNamePrefix(resourcePrefix, t) },
+                  )}
                   errorText={step2Errs.glueCrossAccountRoleArn}
                 >
                   <Input
@@ -1321,39 +1444,43 @@ export const ConnectSource: React.FC = () => {
       };
     } else if (model.sourceKind === "JDBC_DATABASE") {
       step2 = {
-        title: "Configure connection",
-        description: "Provide connection details for your JDBC database.",
+        title: t("Configure connection"),
+        description: t("Provide connection details for your JDBC database."),
         errorText: step2Errs.step1,
         content: (
           <SpaceBetween size="l">
-            <Container header={<Header variant="h2">Source details</Header>}>
+            <Container
+              header={<Header variant="h2">{t("Source details")}</Header>}
+            >
               <FormField
                 label={
                   <>
-                    Source name{" "}
+                    {t("Source name")}{" "}
                     <Box variant="span" color="text-status-error">
                       *
                     </Box>
                   </>
                 }
-                description="A unique name for this source within the namespace."
+                description={t(
+                  "A unique name for this source within the namespace.",
+                )}
                 errorText={step2Errs.jdbcName}
               >
                 <Input
                   value={model.jdbcName}
                   onChange={({ detail }) => setField("jdbcName", detail.value)}
-                  placeholder="My JDBC Database"
+                  placeholder={t("My JDBC Database")}
                 />
               </FormField>
             </Container>
             <Container
-              header={<Header variant="h2">Connection settings</Header>}
+              header={<Header variant="h2">{t("Connection settings")}</Header>}
             >
               <SpaceBetween size="l">
                 <FormField
                   label={
                     <>
-                      Database engine{" "}
+                      {t("Database engine")}{" "}
                       <Box variant="span" color="text-status-error">
                         *
                       </Box>
@@ -1375,13 +1502,13 @@ export const ConnectSource: React.FC = () => {
                       setField("dbPort", DEFAULT_PORTS[eng]);
                     }}
                     options={ENGINE_OPTIONS}
-                    placeholder="Select an engine"
+                    placeholder={t("Select an engine")}
                   />
                 </FormField>
                 <FormField
                   label={
                     <>
-                      Host{" "}
+                      {t("Host")}{" "}
                       <Box variant="span" color="text-status-error">
                         *
                       </Box>
@@ -1398,7 +1525,7 @@ export const ConnectSource: React.FC = () => {
                 <FormField
                   label={
                     <>
-                      Port{" "}
+                      {t("Port")}{" "}
                       <Box variant="span" color="text-status-error">
                         *
                       </Box>
@@ -1415,7 +1542,7 @@ export const ConnectSource: React.FC = () => {
                 <FormField
                   label={
                     <>
-                      Database name{" "}
+                      {t("Database name")}{" "}
                       <Box variant="span" color="text-status-error">
                         *
                       </Box>
@@ -1434,13 +1561,15 @@ export const ConnectSource: React.FC = () => {
                 <FormField
                   label={
                     <>
-                      Credential secret ARN{" "}
+                      {t("Credential secret ARN")}{" "}
                       <Box variant="span" color="text-status-error">
                         *
                       </Box>
                     </>
                   }
-                  description="AWS Secrets Manager secret containing the database username and password."
+                  description={t(
+                    "AWS Secrets Manager secret containing the database username and password.",
+                  )}
                   errorText={step2Errs.dbSecretArn}
                 >
                   <Input
@@ -1454,13 +1583,15 @@ export const ConnectSource: React.FC = () => {
               </SpaceBetween>
             </Container>
             <ExpandableSection
-              headerText="Advanced configuration"
+              headerText={t("Advanced configuration")}
               variant="container"
             >
               <SpaceBetween size="l">
                 <FormField
-                  label="Schema filter"
-                  description="Optional glob(s) (* ? [seq]) to include specific schemas. Separate multiple with | or ,."
+                  label={t("Schema filter")}
+                  description={t(
+                    "Optional glob(s) (* ? [seq]) to include specific schemas. Separate multiple with | or ,.",
+                  )}
                 >
                   <Input
                     value={model.dbSchemaFilter}
@@ -1471,8 +1602,10 @@ export const ConnectSource: React.FC = () => {
                   />
                 </FormField>
                 <FormField
-                  label="Schema exclude filter"
-                  description="Optional glob(s) (* ? [seq]) to exclude specific schemas, in addition to the engine's system schemas (always excluded). Separate multiple with | or ,."
+                  label={t("Schema exclude filter")}
+                  description={t(
+                    "Optional glob(s) (* ? [seq]) to exclude specific schemas, in addition to the engine's system schemas (always excluded). Separate multiple with | or ,.",
+                  )}
                 >
                   <Input
                     value={model.dbSchemaExcludeFilter}
@@ -1483,8 +1616,10 @@ export const ConnectSource: React.FC = () => {
                   />
                 </FormField>
                 <FormField
-                  label="Table filter"
-                  description="Optional glob(s) (* ? [seq]) to include specific tables. Separate multiple with | or ,."
+                  label={t("Table filter")}
+                  description={t(
+                    "Optional glob(s) (* ? [seq]) to include specific tables. Separate multiple with | or ,.",
+                  )}
                 >
                   <Input
                     value={model.dbTableFilter}
@@ -1495,8 +1630,10 @@ export const ConnectSource: React.FC = () => {
                   />
                 </FormField>
                 <FormField
-                  label="Table exclude filter"
-                  description="Optional glob(s) (* ? [seq]) to exclude specific tables. Separate multiple with | or ,."
+                  label={t("Table exclude filter")}
+                  description={t(
+                    "Optional glob(s) (* ? [seq]) to exclude specific tables. Separate multiple with | or ,.",
+                  )}
                 >
                   <Input
                     value={model.dbTableExcludeFilter}
@@ -1511,8 +1648,10 @@ export const ConnectSource: React.FC = () => {
                 {model.dbEngine === "SNOWFLAKE" && (
                   <>
                     <FormField
-                      label="Warehouse"
-                      description="Snowflake virtual warehouse for discovery queries."
+                      label={t("Warehouse")}
+                      description={t(
+                        "Snowflake virtual warehouse for discovery queries.",
+                      )}
                     >
                       <Input
                         value={model.dbWarehouse}
@@ -1523,8 +1662,8 @@ export const ConnectSource: React.FC = () => {
                       />
                     </FormField>
                     <FormField
-                      label="Role"
-                      description="Optional Snowflake RBAC role to assume."
+                      label={t("Role")}
+                      description={t("Optional Snowflake RBAC role to assume.")}
                     >
                       <Input
                         value={model.dbRole}
@@ -1537,8 +1676,11 @@ export const ConnectSource: React.FC = () => {
                   </>
                 )}
                 <FormField
-                  label="Cross-account role ARN"
-                  description={`Optional. For a credential secret in another account, the IAM role Context Ontology Accelerator assumes to read it. Its name must start with ${requiredRoleNamePrefix(resourcePrefix)}, and its trust policy must require the External ID below.`}
+                  label={t("Cross-account role ARN")}
+                  description={t(
+                    "Optional. For a credential secret in another account, the IAM role Context Ontology Accelerator assumes to read it. Its name must start with {prefix}, and its trust policy must require the External ID below.",
+                    { prefix: requiredRoleNamePrefix(resourcePrefix, t) },
+                  )}
                   errorText={step2Errs.jdbcCrossAccountRoleArn}
                 >
                   <Input
@@ -1561,23 +1703,28 @@ export const ConnectSource: React.FC = () => {
       };
     } else if (model.sourceKind === "CUSTOM_CONNECTOR") {
       step2 = {
-        title: "Configure connection",
-        description:
+        title: t("Configure connection"),
+        description: t(
           "Point at the Athena Query Federation connector you deployed.",
+        ),
         errorText: step2Errs.step1,
         content: (
           <SpaceBetween size="l">
-            <Container header={<Header variant="h2">Source details</Header>}>
+            <Container
+              header={<Header variant="h2">{t("Source details")}</Header>}
+            >
               <FormField
                 label={
                   <>
-                    Source name{" "}
+                    {t("Source name")}{" "}
                     <Box variant="span" color="text-status-error">
                       *
                     </Box>
                   </>
                 }
-                description="A unique name for this source within the namespace."
+                description={t(
+                  "A unique name for this source within the namespace.",
+                )}
                 errorText={step2Errs.customConnectorName}
               >
                 <Input
@@ -1589,18 +1736,20 @@ export const ConnectSource: React.FC = () => {
                 />
               </FormField>
             </Container>
-            <Container header={<Header variant="h2">Connector</Header>}>
+            <Container header={<Header variant="h2">{t("Connector")}</Header>}>
               <SpaceBetween size="l">
                 <FormField
                   label={
                     <>
-                      Connector function ARN{" "}
+                      {t("Connector function ARN")}{" "}
                       <Box variant="span" color="text-status-error">
                         *
                       </Box>
                     </>
                   }
-                  description="The connector Lambda. It serves both metadata and record requests. It must live in the same AWS Region as Context Ontology Accelerator; a connector in another Region is rejected, because Athena can only invoke a data source connector co-located with the query."
+                  description={t(
+                    "The connector Lambda. It serves both metadata and record requests. It must live in the same AWS Region as Context Ontology Accelerator; a connector in another Region is rejected, because Athena can only invoke a data source connector co-located with the query.",
+                  )}
                   errorText={step2Errs.customConnectorFunctionArn}
                 >
                   <Input
@@ -1614,13 +1763,15 @@ export const ConnectSource: React.FC = () => {
                 <FormField
                   label={
                     <>
-                      Database name{" "}
+                      {t("Database name")}{" "}
                       <Box variant="span" color="text-status-error">
                         *
                       </Box>
                     </>
                   }
-                  description="The single database inside the connector's catalog that this source exposes. A connector serving several databases is onboarded once per database."
+                  description={t(
+                    "The single database inside the connector's catalog that this source exposes. A connector serving several databases is onboarded once per database.",
+                  )}
                   errorText={step2Errs.customConnectorDatabaseName}
                 >
                   <Input
@@ -1634,13 +1785,15 @@ export const ConnectSource: React.FC = () => {
               </SpaceBetween>
             </Container>
             <ExpandableSection
-              headerText="Advanced configuration"
+              headerText={t("Advanced configuration")}
               variant="container"
             >
               <SpaceBetween size="l">
                 <FormField
-                  label="Table filter"
-                  description="Optional glob(s) (* ? [seq]) to include specific tables. Separate multiple with | or ,."
+                  label={t("Table filter")}
+                  description={t(
+                    "Optional glob(s) (* ? [seq]) to include specific tables. Separate multiple with | or ,.",
+                  )}
                 >
                   <Input
                     value={model.customConnectorTableFilter}
@@ -1651,8 +1804,10 @@ export const ConnectSource: React.FC = () => {
                   />
                 </FormField>
                 <FormField
-                  label="Table exclude filter"
-                  description="Optional glob(s) (* ? [seq]) to exclude specific tables. Applied after the include filter. Separate multiple with | or ,."
+                  label={t("Table exclude filter")}
+                  description={t(
+                    "Optional glob(s) (* ? [seq]) to exclude specific tables. Applied after the include filter. Separate multiple with | or ,.",
+                  )}
                 >
                   <Input
                     value={model.customConnectorTableExcludeFilter}
@@ -1672,23 +1827,28 @@ export const ConnectSource: React.FC = () => {
       };
     } else if (model.sourceKind === "DATABRICKS_SQL_WAREHOUSE") {
       step2 = {
-        title: "Configure connection",
-        description:
+        title: t("Configure connection"),
+        description: t(
           "Name the warehouse to read and the credential Context Ontology Accelerator may read it with.",
+        ),
         errorText: step2Errs.step1,
         content: (
           <SpaceBetween size="l">
-            <Container header={<Header variant="h2">Source details</Header>}>
+            <Container
+              header={<Header variant="h2">{t("Source details")}</Header>}
+            >
               <FormField
                 label={
                   <>
-                    Source name{" "}
+                    {t("Source name")}{" "}
                     <Box variant="span" color="text-status-error">
                       *
                     </Box>
                   </>
                 }
-                description="A unique name for this source within the namespace."
+                description={t(
+                  "A unique name for this source within the namespace.",
+                )}
                 errorText={step2Errs.databricksName}
               >
                 <Input
@@ -1696,23 +1856,29 @@ export const ConnectSource: React.FC = () => {
                   onChange={({ detail }) =>
                     setField("databricksName", detail.value)
                   }
-                  placeholder="My Databricks Warehouse"
+                  placeholder={t("My Databricks Warehouse")}
                 />
               </FormField>
             </Container>
-            <Container header={<Header variant="h2">SQL Warehouse</Header>}>
+            <Container
+              header={<Header variant="h2">{t("SQL Warehouse")}</Header>}
+            >
               <SpaceBetween size="l">
                 <FormField
                   label={
                     <>
-                      Workspace hostname{" "}
+                      {t("Workspace hostname")}{" "}
                       <Box variant="span" color="text-status-error">
                         *
                       </Box>
                     </>
                   }
-                  description="The workspace's server hostname, without a scheme or path. AWS, Azure, and GCP workspaces are all accepted."
-                  constraintText="A PrivateLink-only workspace is not reachable: the connector runs outside your VPC."
+                  description={t(
+                    "The workspace's server hostname, without a scheme or path. AWS, Azure, and GCP workspaces are all accepted.",
+                  )}
+                  constraintText={t(
+                    "A PrivateLink-only workspace is not reachable: the connector runs outside your VPC.",
+                  )}
                   errorText={step2Errs.databricksWorkspaceHostname}
                 >
                   <Input
@@ -1726,14 +1892,18 @@ export const ConnectSource: React.FC = () => {
                 <FormField
                   label={
                     <>
-                      HTTP path{" "}
+                      {t("HTTP path")}{" "}
                       <Box variant="span" color="text-status-error">
                         *
                       </Box>
                     </>
                   }
-                  description="Copy it from the warehouse's Connection details tab. The Databricks analogue of a port — it selects which warehouse this source queries."
-                  constraintText="Keep the warehouse running, or make its auto-stop window match how often you expect questions: a stopped warehouse turns the first query into a resume, seconds on serverless and minutes on classic or pro."
+                  description={t(
+                    "Copy it from the warehouse's Connection details tab. The Databricks analogue of a port — it selects which warehouse this source queries.",
+                  )}
+                  constraintText={t(
+                    "Keep the warehouse running, or make its auto-stop window match how often you expect questions: a stopped warehouse turns the first query into a resume, seconds on serverless and minutes on classic or pro.",
+                  )}
                   errorText={step2Errs.databricksHttpPath}
                 >
                   <Input
@@ -1747,7 +1917,7 @@ export const ConnectSource: React.FC = () => {
                 <FormField
                   label={
                     <>
-                      Unity Catalog catalog{" "}
+                      {t("Unity Catalog catalog")}{" "}
                       <Box variant="span" color="text-status-error">
                         *
                       </Box>
@@ -1766,14 +1936,18 @@ export const ConnectSource: React.FC = () => {
                 <FormField
                   label={
                     <>
-                      Unity Catalog schema{" "}
+                      {t("Unity Catalog schema")}{" "}
                       <Box variant="span" color="text-status-error">
                         *
                       </Box>
                     </>
                   }
-                  description="The single schema this source exposes. A catalog with several schemas is onboarded once per schema."
-                  constraintText="Every table must be SELECT-able by this credential. Visibility in information_schema comes from BROWSE or USE SCHEMA, so a table that is discovered is not necessarily one that can be read — and it would fail only when a question reaches it."
+                  description={t(
+                    "The single schema this source exposes. A catalog with several schemas is onboarded once per schema.",
+                  )}
+                  constraintText={t(
+                    "Every table must be SELECT-able by this credential. Visibility in information_schema comes from BROWSE or USE SCHEMA, so a table that is discovered is not necessarily one that can be read — and it would fail only when a question reaches it.",
+                  )}
                   errorText={step2Errs.databricksSchemaName}
                 >
                   <Input
@@ -1786,19 +1960,25 @@ export const ConnectSource: React.FC = () => {
                 </FormField>
               </SpaceBetween>
             </Container>
-            <Container header={<Header variant="h2">Credential access</Header>}>
+            <Container
+              header={<Header variant="h2">{t("Credential access")}</Header>}
+            >
               <SpaceBetween size="l">
                 <FormField
                   label={
                     <>
-                      Credential secret ARN{" "}
+                      {t("Credential secret ARN")}{" "}
                       <Box variant="span" color="text-status-error">
                         *
                       </Box>
                     </>
                   }
-                  description={`AWS Secrets Manager secret holding the Databricks credential, in this deployment's Region. Its JSON shape selects the authentication mode: {"token": "…"} for a personal access token, {"client_id": "…", "client_secret": "…"} for OAuth machine-to-machine.`}
-                  constraintText="Machine-to-machine is the recommendation: a personal access token carries a user's identity and expires on a schedule you may not control."
+                  description={t(
+                    'AWS Secrets Manager secret holding the Databricks credential, in this deployment\'s Region. Its JSON shape selects the authentication mode: {"token": "…"} for a personal access token, {"client_id": "…", "client_secret": "…"} for OAuth machine-to-machine.',
+                  )}
+                  constraintText={t(
+                    "Machine-to-machine is the recommendation: a personal access token carries a user's identity and expires on a schedule you may not control.",
+                  )}
                   errorText={step2Errs.databricksSecretArn}
                 >
                   <Input
@@ -1812,13 +1992,16 @@ export const ConnectSource: React.FC = () => {
                 <FormField
                   label={
                     <>
-                      Credential access role ARN{" "}
+                      {t("Credential access role ARN")}{" "}
                       <Box variant="span" color="text-status-error">
                         *
                       </Box>
                     </>
                   }
-                  description={`Required. The IAM role Context Ontology Accelerator assumes to read the secret above — it holds no Secrets Manager permission of its own, so there is no fallback. The role's name must start with ${requiredRoleNamePrefix(resourcePrefix)}, and its trust policy must require the External ID below. Any AWS account, including this one.`}
+                  description={t(
+                    "Required. The IAM role Context Ontology Accelerator assumes to read the secret above — it holds no Secrets Manager permission of its own, so there is no fallback. The role's name must start with {prefix}, and its trust policy must require the External ID below. Any AWS account, including this one.",
+                    { prefix: requiredRoleNamePrefix(resourcePrefix, t) },
+                  )}
                   errorText={step2Errs.databricksCrossAccountRoleArn}
                 >
                   <Input
@@ -1837,13 +2020,15 @@ export const ConnectSource: React.FC = () => {
               </SpaceBetween>
             </Container>
             <ExpandableSection
-              headerText="Advanced configuration"
+              headerText={t("Advanced configuration")}
               variant="container"
             >
               <SpaceBetween size="l">
                 <FormField
-                  label="Table filter"
-                  description="Optional glob(s) (* ? [seq]) to include specific tables. Separate multiple with | or ,."
+                  label={t("Table filter")}
+                  description={t(
+                    "Optional glob(s) (* ? [seq]) to include specific tables. Separate multiple with | or ,.",
+                  )}
                 >
                   <Input
                     value={model.databricksTableFilter}
@@ -1854,8 +2039,10 @@ export const ConnectSource: React.FC = () => {
                   />
                 </FormField>
                 <FormField
-                  label="Table exclude filter"
-                  description="Optional glob(s) (* ? [seq]) to exclude specific tables. Applied after the include filter. Separate multiple with | or ,."
+                  label={t("Table exclude filter")}
+                  description={t(
+                    "Optional glob(s) (* ? [seq]) to exclude specific tables. Applied after the include filter. Separate multiple with | or ,.",
+                  )}
                 >
                   <Input
                     value={model.databricksTableExcludeFilter}
@@ -1873,8 +2060,8 @@ export const ConnectSource: React.FC = () => {
     } else {
       // DOCUMENTS
       step2 = {
-        title: "Configure source",
-        description: "Upload files or connect an S3 bucket.",
+        title: t("Configure source"),
+        description: t("Upload files or connect an S3 bucket."),
         errorText: step2Errs.step1,
         content: (
           <SpaceBetween size="l">
@@ -1886,17 +2073,19 @@ export const ConnectSource: React.FC = () => {
               tabs={[
                 {
                   id: "upload",
-                  label: "Upload files",
+                  label: t("Upload files"),
                   content: (
                     <SpaceBetween size="l">
                       <Container
-                        header={<Header variant="h2">Source details</Header>}
+                        header={
+                          <Header variant="h2">{t("Source details")}</Header>
+                        }
                       >
                         <SpaceBetween size="l">
                           <FormField
                             label={
                               <>
-                                Name{" "}
+                                {t("Name")}{" "}
                                 <Box variant="span" color="text-status-error">
                                   *
                                 </Box>
@@ -1915,13 +2104,15 @@ export const ConnectSource: React.FC = () => {
                           <FormField
                             label={
                               <>
-                                Files{" "}
+                                {t("Files")}{" "}
                                 <Box variant="span" color="text-status-error">
                                   *
                                 </Box>
                               </>
                             }
-                            description="PDF, DOCX, TXT, or Markdown. Maximum 100 files."
+                            description={t(
+                              "PDF, DOCX, TXT, or Markdown. Maximum 100 files.",
+                            )}
                             errorText={step2Errs.docFiles}
                           >
                             <FileUpload
@@ -1933,29 +2124,18 @@ export const ConnectSource: React.FC = () => {
                               multiple
                               showFileSize
                               showFileThumbnail={false}
-                              i18nStrings={{
-                                uploadButtonText: (m) =>
-                                  m ? "Choose files" : "Choose file",
-                                dropzoneText: (m) =>
-                                  m
-                                    ? "Drop files to upload"
-                                    : "Drop file to upload",
-                                removeFileAriaLabel: (i) =>
-                                  `Remove file ${i + 1}`,
-                                limitShowFewer: "Show fewer files",
-                                limitShowMore: "Show more files",
-                                errorIconAriaLabel: "Error",
-                              }}
                             />
                           </FormField>
                           {uploadProgress !== null && (
                             <ProgressBar
                               value={uploadProgress}
-                              label="Uploading files"
+                              label={t("Uploading files")}
                               description={
                                 uploadProgress < 95
-                                  ? `Uploading ${model.docUploadFiles.length} file(s)...`
-                                  : "Triggering ingestion..."
+                                  ? t("Uploading {count} file(s)…", {
+                                      count: model.docUploadFiles.length,
+                                    })
+                                  : t("Triggering ingestion…")
                               }
                             />
                           )}
@@ -1966,17 +2146,19 @@ export const ConnectSource: React.FC = () => {
                 },
                 {
                   id: "s3",
-                  label: "S3 bucket",
+                  label: t("S3 bucket"),
                   content: (
                     <SpaceBetween size="l">
                       <Container
-                        header={<Header variant="h2">Source details</Header>}
+                        header={
+                          <Header variant="h2">{t("Source details")}</Header>
+                        }
                       >
                         <SpaceBetween size="l">
                           <FormField
                             label={
                               <>
-                                Name{" "}
+                                {t("Name")}{" "}
                                 <Box variant="span" color="text-status-error">
                                   *
                                 </Box>
@@ -1995,7 +2177,7 @@ export const ConnectSource: React.FC = () => {
                           <FormField
                             label={
                               <>
-                                Source bucket ARN{" "}
+                                {t("Source bucket ARN")}{" "}
                                 <Box variant="span" color="text-status-error">
                                   *
                                 </Box>
@@ -2012,8 +2194,10 @@ export const ConnectSource: React.FC = () => {
                             />
                           </FormField>
                           <FormField
-                            label="S3 prefixes"
-                            description="Leave blank to ingest the entire bucket."
+                            label={t("S3 prefixes")}
+                            description={t(
+                              "Leave blank to ingest the entire bucket.",
+                            )}
                           >
                             <SpaceBetween size="xs">
                               {model.docS3Prefixes.map(({ id, value }, idx) => (
@@ -2031,7 +2215,9 @@ export const ConnectSource: React.FC = () => {
                                         updatePrefix(id, detail.value)
                                       }
                                       placeholder="documents/"
-                                      ariaLabel={`S3 prefix ${idx + 1}`}
+                                      ariaLabel={t("S3 prefix {number}", {
+                                        number: idx + 1,
+                                      })}
                                     />
                                   </FormField>
                                   {model.docS3Prefixes.length > 1 && (
@@ -2039,7 +2225,7 @@ export const ConnectSource: React.FC = () => {
                                       <Button
                                         iconName="close"
                                         variant="icon"
-                                        ariaLabel="Remove prefix"
+                                        ariaLabel={t("Remove prefix")}
                                         onClick={() => removePrefix(id)}
                                       />
                                     </Box>
@@ -2047,17 +2233,17 @@ export const ConnectSource: React.FC = () => {
                                 </SpaceBetween>
                               ))}
                               <Button iconName="add-plus" onClick={addPrefix}>
-                                Add prefix
+                                {t("Add prefix")}
                               </Button>
                             </SpaceBetween>
                           </FormField>
                         </SpaceBetween>
                       </Container>
                       <ExpandableSection
-                        headerText="Cross-account access (optional)"
+                        headerText={t("Cross-account access (optional)")}
                         variant="container"
                       >
-                        <FormField label="Role ARN">
+                        <FormField label={t("Role ARN")}>
                           <Input
                             value={model.docS3RoleArn}
                             onChange={({ detail }) =>
@@ -2080,26 +2266,37 @@ export const ConnectSource: React.FC = () => {
                 as a field label — it was previously both the section name and
                 the name of one of the two things inside it. */}
             <ExpandableSection
-              headerText="Entity classes and topics (optional)"
+              headerText={t("Entity classes and topics (optional)")}
               variant="container"
             >
               <SpaceBetween size="l">
                 <FormField
-                  label="Entity classes"
-                  description="What the extractor calls each thing it finds — a brand, a policy, a material. Each entity is recorded with its class, and those classes become classes in the ontology."
+                  label={t("Entity classes")}
+                  description={t(
+                    "What the extractor calls each thing it finds — a brand, a policy, a material. Each entity is recorded with its class, and those classes become classes in the ontology.",
+                  )}
                   constraintText={
                     model.vocabularyMode === "custom"
-                      ? `Enter one at a time, or paste several separated by commas. ${MAX_CLASSIFICATION_LENGTH} characters each; 15–25 classes works best.`
+                      ? t(
+                          "Enter one at a time, or paste several separated by commas. {max} characters each; 15–25 classes works best.",
+                          { max: MAX_CLASSIFICATION_LENGTH },
+                        )
                       : undefined
                   }
                   characterCountText={
                     model.vocabularyMode === "custom"
-                      ? `${model.preferredEntityClassifications.length} of ${MAX_VOCABULARY_ENTRIES} classes`
+                      ? t("{count} of {max} classes", {
+                          count: model.preferredEntityClassifications.length,
+                          max: MAX_VOCABULARY_ENTRIES,
+                        })
                       : undefined
                   }
                   warningText={
                     model.vocabularyMode === "custom"
-                      ? vocabularyWarning(model.preferredEntityClassifications)
+                      ? vocabularyWarning(
+                          model.preferredEntityClassifications,
+                          t,
+                        )
                       : undefined
                   }
                   errorText={step2Errs.preferredEntityClassifications}
@@ -2115,15 +2312,17 @@ export const ConnectSource: React.FC = () => {
                       items={[
                         {
                           value: "infer",
-                          label: "Infer from my documents",
-                          description:
+                          label: t("Infer from my documents"),
+                          description: t(
                             "Recommended. Classes are derived from a sample of your documents at ingest.",
+                          ),
                         },
                         {
                           value: "custom",
-                          label: "Define my own",
-                          description:
+                          label: t("Define my own"),
+                          description: t(
                             "Your classes are preferred, and a new one is created when nothing on your list fits. No extra classes are derived from your documents.",
+                          ),
                         },
                       ]}
                     />
@@ -2133,8 +2332,8 @@ export const ConnectSource: React.FC = () => {
                         onChange={(next) =>
                           setField("preferredEntityClassifications", next)
                         }
-                        placeholder="e.g. Loss Ratio, Claim Handler"
-                        ariaLabel="Entity class labels"
+                        placeholder={t("e.g. Loss Ratio, Claim Handler")}
+                        ariaLabel={t("Entity class labels")}
                         itemLabelPlural="classes"
                         validate={(candidate, existing) =>
                           validateClassification(candidate, existing)
@@ -2144,21 +2343,29 @@ export const ConnectSource: React.FC = () => {
                   </SpaceBetween>
                 </FormField>
                 <FormField
-                  label="Topics"
-                  description="What a passage is about, rather than what a thing is. Topics group related passages together and drive topic-based retrieval."
+                  label={t("Topics")}
+                  description={t(
+                    "What a passage is about, rather than what a thing is. Topics group related passages together and drive topic-based retrieval.",
+                  )}
                   constraintText={
                     model.topicMode === "custom"
-                      ? `Enter one at a time, or paste several separated by commas. Phrases are fine, and your capitalisation is kept. ${MAX_TOPIC_LENGTH} characters each.`
+                      ? t(
+                          "Enter one at a time, or paste several separated by commas. Phrases are fine, and your capitalisation is kept. {max} characters each.",
+                          { max: MAX_TOPIC_LENGTH },
+                        )
                       : undefined
                   }
                   characterCountText={
                     model.topicMode === "custom"
-                      ? `${model.preferredTopics.length} of ${MAX_VOCABULARY_ENTRIES} topics`
+                      ? t("{count} of {max} topics", {
+                          count: model.preferredTopics.length,
+                          max: MAX_VOCABULARY_ENTRIES,
+                        })
                       : undefined
                   }
                   warningText={
                     model.topicMode === "custom"
-                      ? topicWarning(model.preferredTopics)
+                      ? topicWarning(model.preferredTopics, t)
                       : undefined
                   }
                   errorText={step2Errs.preferredTopics}
@@ -2174,15 +2381,17 @@ export const ConnectSource: React.FC = () => {
                       items={[
                         {
                           value: "auto",
-                          label: "Automatic",
-                          description:
+                          label: t("Automatic"),
+                          description: t(
                             "Recommended. Topics are extracted from your documents.",
+                          ),
                         },
                         {
                           value: "custom",
-                          label: "Define my own",
-                          description:
+                          label: t("Define my own"),
+                          description: t(
                             "Topics are still extracted from your documents; your names are used where one matches. Expect topics beyond your list.",
+                          ),
                         },
                       ]}
                     />
@@ -2190,8 +2399,8 @@ export const ConnectSource: React.FC = () => {
                       <TokenInput
                         value={model.preferredTopics}
                         onChange={(next) => setField("preferredTopics", next)}
-                        placeholder="e.g. Black Tie Gala, Quiet Luxury"
-                        ariaLabel="Preferred topic names"
+                        placeholder={t("e.g. Black Tie Gala, Quiet Luxury")}
+                        ariaLabel={t("Preferred topic names")}
                         itemLabelPlural="topics"
                         validate={(candidate, existing) =>
                           validateTopic(candidate, existing)
@@ -2203,21 +2412,27 @@ export const ConnectSource: React.FC = () => {
               </SpaceBetween>
             </ExpandableSection>
             <ExpandableSection
-              headerText="Advanced options"
+              headerText={t("Advanced options")}
               variant="container"
             >
               <SpaceBetween size="l">
-                <FormField description="Tracks document versions in Neptune.">
+                <FormField
+                  description={t("Tracks document versions in Neptune.")}
+                >
                   <Toggle
                     checked={model.enableVersioning}
                     onChange={({ detail }) =>
                       setField("enableVersioning", detail.checked)
                     }
                   >
-                    Enable versioning
+                    {t("Enable versioning")}
                   </Toggle>
                 </FormField>
-                <FormField description="Deletes previous versions after re-ingestion.">
+                <FormField
+                  description={t(
+                    "Deletes previous versions after re-ingestion.",
+                  )}
+                >
                   <Toggle
                     checked={model.deletePrevVersions}
                     disabled={!model.enableVersioning}
@@ -2225,7 +2440,7 @@ export const ConnectSource: React.FC = () => {
                       setField("deletePrevVersions", detail.checked)
                     }
                   >
-                    Delete previous versions on re-ingestion
+                    {t("Delete previous versions on re-ingestion")}
                   </Toggle>
                 </FormField>
               </SpaceBetween>
@@ -2237,58 +2452,71 @@ export const ConnectSource: React.FC = () => {
 
     // ── Step 3: Enrichment (database only) ────────────────────────────
     const enrichmentStep: WizardProps.Step = {
-      title: "Configure enrichment",
-      description: "Choose AI enrichment features.",
+      title: t("Configure enrichment"),
+      description: t("Choose AI enrichment features."),
       content: (
-        <Container header={<Header variant="h2">Metadata enrichment</Header>}>
+        <Container
+          header={<Header variant="h2">{t("Metadata enrichment")}</Header>}
+        >
           <SpaceBetween size="l">
-            <FormField description="When disabled, only technical metadata is captured during the scan. AI-generated descriptions, synonyms, glossary terms, and tags are skipped.">
+            <FormField
+              description={t(
+                "When disabled, only technical metadata is captured during the scan. AI-generated descriptions, synonyms, glossary terms, and tags are skipped.",
+              )}
+            >
               <Toggle
                 checked={model.metadataEnrichmentEnabled}
                 onChange={({ detail }) =>
                   setField("metadataEnrichmentEnabled", detail.checked)
                 }
               >
-                Enable AI metadata enrichment
+                {t("Enable AI metadata enrichment")}
               </Toggle>
             </FormField>
             <SpaceBetween size="s">
-              <Box variant="h4">Auto-generate descriptions</Box>
+              <Box variant="h4">{t("Auto-generate descriptions")}</Box>
               <Checkbox checked={model.metadataEnrichmentEnabled} disabled>
-                Generate business-friendly descriptions for tables and columns
+                {t(
+                  "Generate business-friendly descriptions for tables and columns",
+                )}
               </Checkbox>
               <Box variant="small" color="text-body-secondary">
-                1–2 sentence business-friendly description per table and column.
-                Tagged AI_GENERATED.
+                {t(
+                  "1–2 sentence business-friendly description per table and column. Tagged AI_GENERATED.",
+                )}
               </Box>
             </SpaceBetween>
             <SpaceBetween size="s">
-              <Box variant="h4">Generate synonyms</Box>
+              <Box variant="h4">{t("Generate synonyms")}</Box>
               <Checkbox checked={model.metadataEnrichmentEnabled} disabled>
-                Generate business-language alternatives for tables and columns
+                {t(
+                  "Generate business-language alternatives for tables and columns",
+                )}
               </Checkbox>
               <Box variant="small" color="text-body-secondary">
-                2–5 business-language alternatives per table and column.
+                {t("2–5 business-language alternatives per table and column.")}
               </Box>
             </SpaceBetween>
             <SpaceBetween size="s">
-              <Box variant="h4">Generate glossary terms</Box>
+              <Box variant="h4">{t("Generate glossary terms")}</Box>
               <Checkbox checked={model.metadataEnrichmentEnabled} disabled>
-                Map tables and columns to business domain concepts
+                {t("Map tables and columns to business domain concepts")}
               </Checkbox>
               <Box variant="small" color="text-body-secondary">
-                1–3 business domain concepts (e.g., "Order Management",
-                "Revenue").
+                {t(
+                  '1–3 business domain concepts (e.g., "Order Management", "Revenue").',
+                )}
               </Box>
             </SpaceBetween>
             <SpaceBetween size="s">
-              <Box variant="h4">Constraint discovery</Box>
+              <Box variant="h4">{t("Constraint discovery")}</Box>
               <Checkbox checked={model.metadataEnrichmentEnabled} disabled>
-                Enable AI-assisted cross-table relationship inference
+                {t("Enable AI-assisted cross-table relationship inference")}
               </Checkbox>
               <Box variant="small" color="text-body-secondary">
-                AI-inferred relationships are tagged as AI_INFERRED and require
-                steward review before promotion.
+                {t(
+                  "AI-inferred relationships are tagged as AI_INFERRED and require steward review before promotion.",
+                )}
               </Box>
             </SpaceBetween>
           </SpaceBetween>
@@ -2298,65 +2526,65 @@ export const ConnectSource: React.FC = () => {
 
     // ── Step 3/4: Review ──────────────────────────────────────────────
     const reviewStep: WizardProps.Step = {
-      title: "Review and connect",
-      description: "Review your configuration before connecting.",
+      title: t("Review and connect"),
+      description: t("Review your configuration before connecting."),
       content: (
         <SpaceBetween size="l">
-          <Container header={<Header variant="h2">Source type</Header>}>
+          <Container header={<Header variant="h2">{t("Source type")}</Header>}>
             <KeyValuePairs
               columns={2}
               items={[
                 {
-                  label: "Category",
-                  value: SOURCE_KIND_LABELS[model.sourceKind],
+                  label: t("Category"),
+                  value: t(SOURCE_KIND_LABELS[model.sourceKind]),
                 },
                 {
-                  label: "Source name",
+                  label: t("Source name"),
                   value: sourceNameFor(model, docTab),
                 },
               ]}
             />
           </Container>
           {model.sourceKind === "GLUE_DATABASE" && (
-            <Container header={<Header variant="h2">Connection</Header>}>
+            <Container header={<Header variant="h2">{t("Connection")}</Header>}>
               <KeyValuePairs
                 columns={2}
                 items={[
-                  { label: "Catalog ID", value: model.glueCatalogId },
-                  { label: "Region", value: model.glueRegion },
-                  { label: "Database", value: model.glueDatabaseName },
+                  { label: t("Catalog ID"), value: model.glueCatalogId },
+                  { label: t("Region"), value: model.glueRegion },
+                  { label: t("Database"), value: model.glueDatabaseName },
                   {
-                    label: "Table filter",
-                    value: model.glueTableFilter || "(none)",
+                    label: t("Table filter"),
+                    value: model.glueTableFilter || t("(none)"),
                   },
                 ]}
               />
             </Container>
           )}
           {model.sourceKind === "JDBC_DATABASE" && (
-            <Container header={<Header variant="h2">Connection</Header>}>
+            <Container header={<Header variant="h2">{t("Connection")}</Header>}>
               <KeyValuePairs
                 columns={2}
                 items={[
                   {
-                    label: "Engine",
+                    label: t("Engine"),
                     value:
                       ENGINE_OPTIONS.find((o) => o.value === model.dbEngine)
                         ?.label ?? "—",
                   },
-                  { label: "Host", value: model.dbHost },
-                  { label: "Port", value: model.dbPort },
-                  { label: "Database name", value: model.dbDatabaseName },
+                  { label: t("Host"), value: model.dbHost },
+                  { label: t("Port"), value: model.dbPort },
+                  { label: t("Database name"), value: model.dbDatabaseName },
                   {
-                    label: "Schema filter",
-                    value: model.dbSchemaFilter || "(none)",
+                    label: t("Schema filter"),
+                    value: model.dbSchemaFilter || t("(none)"),
                   },
                   {
-                    label: "Table filter",
-                    value: model.dbTableFilter || "(none)",
+                    label: t("Table filter"),
+                    value: model.dbTableFilter || t("(none)"),
                   },
                   {
-                    label: "Authentication",
+                    label: t("Authentication"),
                     value: "AWS Secrets Manager",
                   },
                 ]}
@@ -2364,75 +2592,78 @@ export const ConnectSource: React.FC = () => {
             </Container>
           )}
           {model.sourceKind === "CUSTOM_CONNECTOR" && (
-            <Container header={<Header variant="h2">Connection</Header>}>
+            <Container header={<Header variant="h2">{t("Connection")}</Header>}>
               <KeyValuePairs
                 columns={2}
                 items={[
                   {
-                    label: "Connector function ARN",
+                    label: t("Connector function ARN"),
                     value: model.customConnectorFunctionArn,
                   },
                   {
-                    label: "Database",
+                    label: t("Database"),
                     value: model.customConnectorDatabaseName,
                   },
                   {
-                    label: "Table filter",
-                    value: model.customConnectorTableFilter || "(none)",
+                    label: t("Table filter"),
+                    value: model.customConnectorTableFilter || t("(none)"),
                   },
                 ]}
               />
             </Container>
           )}
           {model.sourceKind === "DATABRICKS_SQL_WAREHOUSE" && (
-            <Container header={<Header variant="h2">Connection</Header>}>
+            <Container header={<Header variant="h2">{t("Connection")}</Header>}>
               <KeyValuePairs
                 columns={2}
                 items={[
                   {
-                    label: "Workspace hostname",
+                    label: t("Workspace hostname"),
                     value: model.databricksWorkspaceHostname,
                   },
-                  { label: "HTTP path", value: model.databricksHttpPath },
+                  { label: t("HTTP path"), value: model.databricksHttpPath },
                   {
-                    label: "Unity Catalog catalog",
+                    label: t("Unity Catalog catalog"),
                     value: model.databricksCatalog,
                   },
                   {
-                    label: "Unity Catalog schema",
+                    label: t("Unity Catalog schema"),
                     value: model.databricksSchemaName,
                   },
                   {
-                    label: "Credential secret ARN",
+                    label: t("Credential secret ARN"),
                     value: model.databricksSecretArn,
                   },
                   {
-                    label: "Credential access role ARN",
+                    label: t("Credential access role ARN"),
                     value: model.databricksCrossAccountRoleArn,
                   },
                   {
-                    label: "Table filter",
-                    value: model.databricksTableFilter || "(none)",
+                    label: t("Table filter"),
+                    value: model.databricksTableFilter || t("(none)"),
                   },
                 ]}
               />
             </Container>
           )}
           {model.sourceKind === "DOCUMENTS" && (
-            <Container header={<Header variant="h2">Source</Header>}>
+            <Container header={<Header variant="h2">{t("Source")}</Header>}>
               <KeyValuePairs
                 columns={2}
                 items={[
                   {
-                    label: "Mode",
-                    value: docTab === "upload" ? "File upload" : "S3 bucket",
+                    label: t("Mode"),
+                    value:
+                      docTab === "upload" ? t("File upload") : t("S3 bucket"),
                   },
                   ...(docTab === "s3"
-                    ? [{ label: "Bucket ARN", value: model.docS3BucketArn }]
+                    ? [{ label: t("Bucket ARN"), value: model.docS3BucketArn }]
                     : [
                         {
-                          label: "Files",
-                          value: `${model.docUploadFiles.length} file(s)`,
+                          label: t("Files"),
+                          value: t("{count} file(s)", {
+                            count: model.docUploadFiles.length,
+                          }),
                         },
                       ]),
                 ]}
@@ -2441,39 +2672,46 @@ export const ConnectSource: React.FC = () => {
           )}
           {isDatabase && (
             <Container
-              header={<Header variant="h2">Enrichment settings</Header>}
+              header={<Header variant="h2">{t("Enrichment settings")}</Header>}
             >
               <KeyValuePairs
                 columns={2}
                 items={[
                   {
-                    label: "Metadata enrichment",
+                    label: t("Metadata enrichment"),
                     value: model.metadataEnrichmentEnabled
-                      ? "Enabled"
-                      : "Disabled",
+                      ? t("Enabled")
+                      : t("Disabled"),
                   },
                 ]}
               />
             </Container>
           )}
           {isDatabase && (
-            <Alert type="info" header="What happens next">
+            <Alert type="info" header={t("What happens next")}>
               {model.metadataEnrichmentEnabled
-                ? `Context Ontology Accelerator will start the scan and enrichment pipeline. The data source status changes to Scanning while technical metadata is discovered, then to Enriching while AI generates business descriptions, synonyms, glossary terms, and tags. Once complete, the status changes to Pending review — you will be notified to review and approve the enriched metadata before it is used for ontology induction.`
-                : `Context Ontology Accelerator will scan the source and discover technical metadata only. AI metadata enrichment is disabled, so no business descriptions, synonyms, glossary terms, or tags will be generated. The status changes to Scanning, then directly to Pending review for steward approval.`}
+                ? t(
+                    "Context Ontology Accelerator will start the scan and enrichment pipeline. The data source status changes to Scanning while technical metadata is discovered, then to Enriching while AI generates business descriptions, synonyms, glossary terms, and tags. Once complete, the status changes to Pending review — you will be notified to review and approve the enriched metadata before it is used for ontology induction.",
+                  )
+                : t(
+                    "Context Ontology Accelerator will scan the source and discover technical metadata only. AI metadata enrichment is disabled, so no business descriptions, synonyms, glossary terms, or tags will be generated. The status changes to Scanning, then directly to Pending review for steward approval.",
+                  )}
             </Alert>
           )}
           {uploadError && (
-            <Alert type="error" header="Upload failed">
+            <Alert type="error" header={t("Upload failed")}>
               {uploadError}
             </Alert>
           )}
           {createError && (
-            <Alert type="error" header="Failed to connect source">
+            <Alert type="error" header={t("Failed to connect source")}>
               {/* Registration errors are newline-formatted numbered lists naming the
                   exact sts:ExternalId — render them as written, not on one line. */}
               <div className="coa-preserve-newlines">
-                {extractErrorMessage(createError)}
+                {extractErrorMessage(
+                  createError,
+                  t("An unexpected error occurred."),
+                )}
               </div>
             </Alert>
           )}
@@ -2495,6 +2733,7 @@ export const ConnectSource: React.FC = () => {
     addPrefix,
     removePrefix,
     updatePrefix,
+    t,
     resourcePrefix,
     datasourceExternalId,
     namespaceLoading,
@@ -2509,7 +2748,7 @@ export const ConnectSource: React.FC = () => {
         const requested = detail.requestedStepIndex;
         if (requested > activeStepIndex) {
           if (activeStepIndex === 1) {
-            const errs = validateStep2(model, docTab, resourcePrefix);
+            const errs = validateStep2(model, docTab, t, resourcePrefix);
             if (errs.step1) {
               setShowErrors((p) => ({ ...p, 1: true }));
               return;
@@ -2524,12 +2763,8 @@ export const ConnectSource: React.FC = () => {
       }}
       isLoadingNextStep={isSubmitting}
       i18nStrings={{
-        stepNumberLabel: (n) => `Step ${n}`,
-        collapsedStepsLabel: (step, total) => `Step ${step} of ${total}`,
-        cancelButton: "Cancel",
-        previousButton: "Previous",
-        nextButton: "Next",
-        submitButton: "Connect source",
+        // App-specific copy; everything else comes from the I18nProvider.
+        submitButton: t("Connect source"),
       }}
     />
   );

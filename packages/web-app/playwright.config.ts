@@ -75,5 +75,6 @@ export default defineConfig({
     featureProject("grants"),
     featureProject("playground"),
     featureProject("system-health"),
+    featureProject("settings"),
   ],
 });

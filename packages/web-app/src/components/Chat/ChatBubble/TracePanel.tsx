@@ -19,9 +19,10 @@ import {
   HIDDEN_UNLESS_DENIED,
   PARALLEL_RETRIEVE_GROUP,
   RETRIEVE_CHILD_STEPS,
-  humanizeStepId,
+  localizeTraceStep,
   mapTraceStatus,
 } from "@components/Chat/step-labels";
+import { useAppI18n } from "../../../i18n/LocaleProvider";
 import "../chat.css";
 
 export interface TracePanelProps {
@@ -45,13 +46,19 @@ function shouldShowStep(step: TraceStep): boolean {
  * Expandable trace panel showing each pipeline step with status + timing.
  */
 export const TracePanel: React.FC<TracePanelProps> = ({ steps, isLive }) => {
+  const { t } = useAppI18n();
   if (steps.length === 0 && !isLive) return null;
 
   const visibleSteps = steps.filter(shouldShowStep);
 
   return (
     <ExpandableSection
-      headerText={`Processing trace (${visibleSteps.length} step${visibleSteps.length !== 1 ? "s" : ""})`}
+      headerText={t(
+        visibleSteps.length === 1
+          ? "Processing trace ({count} step)"
+          : "Processing trace ({count} steps)",
+        { count: visibleSteps.length },
+      )}
       variant="footer"
       defaultExpanded={false}
     >
@@ -86,10 +93,14 @@ function TraceStepRow({
   step: TraceStep;
   childSteps?: TraceStep[];
 }) {
+  const { t } = useAppI18n();
   const [expanded, setExpanded] = useState(false);
   const hasDetail = Boolean(step.detail || step.toolUsed);
   const durationLabel =
-    step.wallMs != null ? `${step.wallMs}ms wall` : `${step.durationMs}ms`;
+    step.wallMs != null
+      ? t("{duration}ms wall", { duration: step.wallMs })
+      : t("{duration}ms", { duration: step.durationMs });
+  const stepLabel = localizeTraceStep(t, step.step);
 
   return (
     <div>
@@ -106,10 +117,10 @@ function TraceStepRow({
         role={hasDetail ? "button" : undefined}
         tabIndex={hasDetail ? 0 : undefined}
         aria-expanded={hasDetail ? expanded : undefined}
-        aria-label={`Trace step: ${humanizeStepId(step.step)}`}
+        aria-label={t("Trace step: {step}", { step: stepLabel })}
       >
         <StatusIndicator type={mapTraceStatus(step.status)}>
-          {humanizeStepId(step.step)}
+          {stepLabel}
         </StatusIndicator>
         <Badge color="blue">{durationLabel}</Badge>
         {hasDetail && (
@@ -122,7 +133,7 @@ function TraceStepRow({
         <div className="trace-step-detail">
           {step.toolUsed && (
             <Box variant="span" fontSize="body-s" color="text-body-secondary">
-              Tool: {step.toolUsed}
+              {t("Tool: {tool}", { tool: step.toolUsed })}
             </Box>
           )}
           {step.detail && (
@@ -146,9 +157,11 @@ function TraceStepRow({
                   ├
                 </Box>
                 <StatusIndicator type={mapTraceStatus(child.status)}>
-                  {humanizeStepId(child.step)}
+                  {localizeTraceStep(t, child.step)}
                 </StatusIndicator>
-                <Badge color="grey">{child.durationMs}ms</Badge>
+                <Badge color="grey">
+                  {t("{duration}ms", { duration: child.durationMs })}
+                </Badge>
                 {child.toolUsed && (
                   <Box
                     variant="span"

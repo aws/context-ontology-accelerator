@@ -87,4 +87,20 @@ export class PlaygroundPage {
   async newChat(): Promise<void> {
     await this.page.getByRole("button", { name: "New chat" }).click();
   }
+
+  /**
+   * Open the full Trace detail page for the latest answer: "Show trace" opens
+   * the Rationale side panel, whose "Open full trace" link routes to
+   * /playground/trace/:sessionId/:requestId.
+   */
+  async openLatestFullTrace(): Promise<void> {
+    await this.page
+      .getByRole("button", { name: "Show trace" })
+      .last()
+      .click({ timeout: 90_000 });
+    await this.page.getByRole("button", { name: "Open full trace" }).click();
+    await expect(
+      this.page.getByRole("heading", { name: "Trace detail" }),
+    ).toBeVisible();
+  }
 }

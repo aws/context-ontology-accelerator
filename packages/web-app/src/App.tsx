@@ -58,8 +58,16 @@ import {
   type BreadcrumbItem,
 } from "@components/BreadcrumbProvider";
 import BreadcrumbGroup from "@cloudscape-design/components/breadcrumb-group";
+import type { ButtonDropdownProps } from "@cloudscape-design/components/button-dropdown";
 import { PlaygroundHelpPanel } from "./pages/PlaygroundHelpPanel";
 import { PageErrorBoundary } from "@components/PageErrorBoundary";
+import {
+  isSupported,
+  useLocale,
+  useAppI18n,
+  LOCALE_LABELS,
+  SUPPORTED_LOCALES,
+} from "./i18n/LocaleProvider";
 import { VersionBadge } from "@components/VersionBadge";
 
 const DARK_MODE_KEY = "scl.darkMode";
@@ -112,6 +120,8 @@ function AppShell() {
   const [navOpen, setNavOpen] = useState(true);
   const [darkMode, setDarkMode] = useState(initialDark);
   const [densityCompact, setDensityCompact] = useState(initialCompact);
+  const { locale, setLocale } = useLocale();
+  const { t } = useAppI18n();
   const { current, namespaces, setNamespace, namespaceId, isLoading } =
     useCurrentNamespace();
   const { state: splitPanelState, closePanel } = useSplitPanel();
@@ -141,10 +151,13 @@ function AppShell() {
           </svg>
         ),
       },
-      ariaLabels: { drawerName: "Info", closeButton: "Close info" },
+      ariaLabels: {
+        drawerName: t("Info"),
+        closeButton: t("Close info"),
+      },
     });
     return () => unregisterDrawer("help");
-  }, [registerDrawer, unregisterDrawer]);
+  }, [registerDrawer, unregisterDrawer, t]);
   const [splitPanelPreferences, setSplitPanelPreferences] = useState<{
     position: "side" | "bottom";
   }>({ position: "side" });
@@ -169,32 +182,32 @@ function AppShell() {
   const namespaceScopedNavItems = [
     {
       type: "section" as const,
-      text: "Scan",
+      text: t("Scan"),
       items: [
         {
           type: "link" as const,
-          text: "Sources",
+          text: t("Sources"),
           href: `${nsPath}/sources`,
         },
       ],
     },
     {
       type: "section" as const,
-      text: "Ontology",
+      text: t("Ontology"),
       items: [
         {
           type: "link" as const,
-          text: "Induction",
+          text: t("Induction"),
           href: `${nsPath}/ontology`,
         },
         {
           type: "link" as const,
-          text: "Explorer",
+          text: t("Explorer"),
           href: `${nsPath}/ontology/graph`,
         },
         {
           type: "link" as const,
-          text: "Metrics",
+          text: t("Metrics"),
           href: `${nsPath}/metrics`,
         },
       ],
@@ -209,20 +222,28 @@ function AppShell() {
     label: string;
     href: string;
   }> = [
-    { section: null, label: "Home", href: "/" },
+    { section: null, label: t("Home"), href: "/" },
     ...namespaceScopedNavItems.flatMap((s) =>
       s.items.map((i) => ({ section: s.text, label: i.text, href: i.href })),
     ),
     {
-      section: "Serve",
-      label: "Playground",
+      section: t("Serve"),
+      label: t("Playground"),
       href: "/playground",
     },
-    { section: "Administration", label: "Namespaces", href: "/namespaces" },
-    { section: "Administration", label: "Identity", href: "/identity" },
     {
-      section: "Administration",
-      label: "System Health",
+      section: t("Administration"),
+      label: t("Namespaces"),
+      href: "/namespaces",
+    },
+    {
+      section: t("Administration"),
+      label: t("Identity"),
+      href: "/identity",
+    },
+    {
+      section: t("Administration"),
+      label: t("System Health"),
       href: "/system-health",
     },
   ];
@@ -265,9 +286,13 @@ function AppShell() {
         : [
             {
               type: "menu-dropdown" as const,
-              text: `Namespace: ${isLoading ? "Loading…" : (current?.displayName ?? current?.name ?? "—")}`,
-              ariaLabel: "Namespace switcher",
-              title: "Namespace",
+              text: t("Namespace: {name}", {
+                name: isLoading
+                  ? `${t("Loading")}…`
+                  : (current?.displayName ?? current?.name ?? "—"),
+              }),
+              ariaLabel: t("Namespace switcher"),
+              title: t("Namespace"),
               onItemClick: ({ detail }: { detail: { id: string } }) =>
                 setNamespace(detail.id),
               items:
@@ -287,7 +312,7 @@ function AppShell() {
                   : [
                       {
                         id: "none",
-                        text: "No namespaces — create one first",
+                        text: t("No namespaces — create one first"),
                         disabled: true,
                       },
                     ],
@@ -311,8 +336,10 @@ function AppShell() {
             fill: "currentColor",
           }),
         ),
-        ariaLabel: darkMode ? "Switch to light mode" : "Switch to dark mode",
-        title: darkMode ? "Light mode" : "Dark mode",
+        ariaLabel: darkMode
+          ? t("Switch to light mode")
+          : t("Switch to dark mode"),
+        title: darkMode ? t("Light mode") : t("Dark mode"),
         onClick: () => {
           const next = !darkMode;
           setDarkMode(next);
@@ -322,25 +349,44 @@ function AppShell() {
       {
         type: "menu-dropdown",
         iconName: "settings",
-        ariaLabel: "Settings",
-        title: "Settings",
+        ariaLabel: t("Settings"),
+        title: t("Settings"),
         onItemClick: ({ detail }) => {
           if (detail.id === "theme") {
             setDarkMode((prev) => !prev);
           } else if (detail.id === "density") {
             setDensityCompact((prev) => !prev);
+          } else if (detail.id.startsWith("locale-")) {
+            const requested = detail.id.slice("locale-".length);
+            if (isSupported(requested)) setLocale(requested);
           }
         },
         items: [
           {
             id: "density",
             text: densityCompact
-              ? "Switch to comfortable density"
-              : "Switch to compact density",
+              ? t("Switch to comfortable density")
+              : t("Switch to compact density"),
           },
           {
             id: "theme",
-            text: darkMode ? "Switch to light mode" : "Switch to dark mode",
+            text: darkMode
+              ? t("Switch to light mode")
+              : t("Switch to dark mode"),
+          },
+          {
+            id: "language",
+            text: t("Language"),
+            items: SUPPORTED_LOCALES.map(
+              (l): ButtonDropdownProps.Item => ({
+                id: `locale-${l}`,
+                // Each language names itself, so these labels are
+                // deliberately not translated.
+                text: LOCALE_LABELS[l],
+                iconName: l === locale ? "check" : undefined,
+                disabled: l === locale,
+              }),
+            ),
           },
         ],
       },
@@ -348,10 +394,10 @@ function AppShell() {
         type: "menu-dropdown",
         text: user?.email || "",
         iconName: "user-profile",
-        ariaLabel: "User menu",
+        ariaLabel: t("User menu"),
         items: [
-          { id: "profile", text: "Profile" },
-          { id: "signout", text: "Sign out" },
+          { id: "profile", text: t("Profile") },
+          { id: "signout", text: t("Sign out") },
         ],
         onItemClick: ({ detail }) => {
           if (detail.id === "profile") {
@@ -371,6 +417,12 @@ function AppShell() {
       setNamespace,
       darkMode,
       densityCompact,
+      locale,
+      setLocale,
+      // `t` closes over the active locale's bundle, so the memo must recompute
+      // when it changes — otherwise the top nav keeps the previous language's
+      // labels after a switch.
+      t,
       user?.email,
       navigate,
       logout,
@@ -397,7 +449,7 @@ function AppShell() {
         headerSelector="#top-nav"
         breadcrumbs={
           <BreadcrumbGroup
-            ariaLabel="Breadcrumbs"
+            ariaLabel={t("Breadcrumbs")}
             // Encode each crumb's index in its href so the click handler can
             // resolve back to the source item and run its onClick action.
             items={effectiveCrumbs.map((b, i) => ({
@@ -417,7 +469,7 @@ function AppShell() {
               items={[
                 {
                   type: "warning",
-                  content: "Please select or create a namespace first.",
+                  content: t("Please select or create a namespace first."),
                   dismissible: true,
                   onDismiss: () => setNamespaceWarning(false),
                   id: "ns-warning",
@@ -428,22 +480,7 @@ function AppShell() {
         }
         splitPanel={
           splitPanelState.isOpen && splitPanelState.content ? (
-            <SplitPanel
-              header={splitPanelState.header}
-              i18nStrings={{
-                closeButtonAriaLabel: "Close panel",
-                openButtonAriaLabel: "Open panel",
-                preferencesTitle: "Split panel preferences",
-                preferencesPositionLabel: "Position",
-                preferencesPositionDescription:
-                  "Choose the position of the panel",
-                preferencesPositionSide: "Side",
-                preferencesPositionBottom: "Bottom",
-                preferencesConfirm: "Confirm",
-                preferencesCancel: "Cancel",
-                resizeHandleAriaLabel: "Resize split panel",
-              }}
-            >
+            <SplitPanel header={splitPanelState.header}>
               {splitPanelState.content}
             </SplitPanel>
           ) : undefined
@@ -459,15 +496,15 @@ function AppShell() {
             activeHref={location.pathname}
             header={{ href: "/", text: "Context Ontology Accelerator" }}
             items={[
-              { type: "link", text: "Home", href: "/" },
+              { type: "link", text: t("Home"), href: "/" },
               ...namespaceScopedNavItems,
               {
                 type: "section",
-                text: "Serve",
+                text: t("Serve"),
                 items: [
                   {
                     type: "link",
-                    text: "Playground",
+                    text: t("Playground"),
                     href: "/playground",
                   },
                 ],
@@ -475,13 +512,17 @@ function AppShell() {
               { type: "divider" },
               {
                 type: "section",
-                text: "Administration",
+                text: t("Administration"),
                 items: [
-                  { type: "link", text: "Namespaces", href: "/namespaces" },
-                  { type: "link", text: "Identity", href: "/identity" },
                   {
                     type: "link",
-                    text: "System Health",
+                    text: t("Namespaces"),
+                    href: "/namespaces",
+                  },
+                  { type: "link", text: t("Identity"), href: "/identity" },
+                  {
+                    type: "link",
+                    text: t("System Health"),
                     href: "/system-health",
                   },
                 ],

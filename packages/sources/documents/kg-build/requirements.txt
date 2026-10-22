@@ -20,3 +20,6 @@ graphrag-lexical-graph==3.18.7
 opensearch-py==3.2.0
 llama-index-vector-stores-opensearch==1.2.0
 llama-index-core==0.14.23
+# 2026.10.19 is the first certifi bundle without the roots behind the compromised
+# emSign intermediates. botocore also uses certifi's bundle over its own when installed.
+certifi>=2026.10.19

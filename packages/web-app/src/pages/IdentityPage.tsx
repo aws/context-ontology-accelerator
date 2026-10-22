@@ -32,18 +32,20 @@ import type { SelectProps } from "@cloudscape-design/components/select";
 import { useListPlatformRoles } from "@api-hooks/use-list-platform-roles";
 import { useListPlatformGrants } from "@api-hooks/use-list-platform-grants";
 import { useCreatePlatformGrant } from "@api-hooks/use-create-platform-grant";
+import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
 import { useDeletePlatformGrant } from "@api-hooks/use-delete-platform-grant";
 import type { PlatformGrantSummary } from "@api-hooks/use-list-platform-grants";
 import type { ListPlatformRolesOutput } from "@coa/control-plane-client";
 import { PrincipalType, RoleScope } from "@coa/control-plane-client";
+import { useAppI18n } from "../i18n/LocaleProvider";
 
 type RoleSummary = NonNullable<ListPlatformRolesOutput["roles"]>[number];
 
 /** Formats an ISO timestamp into a localized short date+time string, or "—". */
-function formatDate(iso: string | undefined): string {
+function formatDate(iso: string | undefined, locale: string): string {
   if (!iso) return "—";
   try {
-    return new Date(iso).toLocaleDateString(undefined, {
+    return new Date(iso).toLocaleDateString(locale, {
       year: "numeric",
       month: "short",
       day: "numeric",
@@ -56,6 +58,8 @@ function formatDate(iso: string | undefined): string {
 }
 
 export function IdentityPage() {
+  const { t } = useAppI18n();
+  useBreadcrumbTrail([{ text: t("Administration") }, { text: t("Identity") }]);
   const { data: rolesData, isLoading: rolesLoading } = useListPlatformRoles();
 
   // Only PLATFORM-scoped roles are managed from this page.
@@ -67,17 +71,17 @@ export function IdentityPage() {
 
   return (
     <SpaceBetween size="m">
-      <Header variant="h1">Identity</Header>
+      <Header variant="h1">{t("Identity")}</Header>
       <Tabs
         tabs={[
           {
             id: "members",
-            label: "Members",
+            label: t("Members"),
             content: <MembersTab roles={platformRoles} />,
           },
           {
             id: "roles",
-            label: "Roles",
+            label: t("Roles"),
             content: (
               <RolesTab roles={platformRoles} isLoading={rolesLoading} />
             ),
@@ -91,6 +95,7 @@ export function IdentityPage() {
 // ── Members tab ────────────────────────────────────────────────────────
 
 function MembersTab({ roles }: { roles: RoleSummary[] }) {
+  const { locale, t } = useAppI18n();
   const {
     data: grantsData,
     isLoading,
@@ -136,16 +141,16 @@ function MembersTab({ roles }: { roles: RoleSummary[] }) {
     filtering: {
       empty: error ? (
         <StatusIndicator type="error">
-          Failed to load members: {error.message}
+          {t("Failed to load members: {error}", { error: error.message })}
         </StatusIndicator>
       ) : (
         <Box textAlign="center" color="text-body-secondary">
-          No platform-level grants yet.
+          {t("No platform-level grants yet.")}
         </Box>
       ),
       noMatch: (
         <Box textAlign="center" color="text-body-secondary">
-          No members match the filter.
+          {t("No members match the filter.")}
         </Box>
       ),
     },
@@ -176,31 +181,39 @@ function MembersTab({ roles }: { roles: RoleSummary[] }) {
   const columns: TableProps.ColumnDefinition<PlatformGrantSummary>[] = [
     {
       id: "principalId",
-      header: "Principal",
+      header: t("Principal"),
       isRowHeader: true,
       cell: (g) => g.principalId,
     },
     {
       id: "principalType",
-      header: "Type",
+      header: t("Type"),
       cell: (g) => (
         <StatusIndicator
           type={g.principalType === PrincipalType.GROUP ? "info" : "success"}
         >
-          {g.principalType}
+          {g.principalType === PrincipalType.GROUP
+            ? t("Group")
+            : g.principalType === PrincipalType.USER
+              ? t("User")
+              : g.principalType}
         </StatusIndicator>
       ),
     },
     {
       id: "role",
-      header: "Role",
+      header: t("Role"),
       cell: (g) => (g.role ? (roleNameMap.get(g.role) ?? g.role) : "—"),
     },
-    { id: "grantedBy", header: "Granted by", cell: (g) => g.grantedBy },
+    {
+      id: "grantedBy",
+      header: t("Granted by"),
+      cell: (g) => g.grantedBy,
+    },
     {
       id: "grantedAt",
-      header: "Granted at",
-      cell: (g) => formatDate(g.grantedAt),
+      header: t("Granted at"),
+      cell: (g) => formatDate(g.grantedAt, locale),
     },
   ];
 
@@ -218,9 +231,11 @@ function MembersTab({ roles }: { roles: RoleSummary[] }) {
         .filter((g): g is PlatformGrantSummary => g !== null);
       if (failed.length > 0) {
         setRevokeError(
-          `Failed to revoke ${failed.length} of ${results.length}: ${failed
-            .map((g) => g.principalId)
-            .join(", ")}`,
+          t("Failed to revoke {failed} of {total}: {principals}", {
+            failed: failed.length,
+            total: results.length,
+            principals: failed.map((g) => g.principalId).join(", "),
+          }),
         );
       } else {
         setRevokeError(null);
@@ -238,7 +253,7 @@ function MembersTab({ roles }: { roles: RoleSummary[] }) {
         trackBy="grantId"
         variant="container"
         loading={isLoading}
-        loadingText="Loading members…"
+        loadingText={t("Loading members…")}
         selectionType="multi"
         selectedItems={selected}
         onSelectionChange={({ detail }) =>
@@ -246,11 +261,16 @@ function MembersTab({ roles }: { roles: RoleSummary[] }) {
         }
         columnDefinitions={columns}
         ariaLabels={{
-          tableLabel: "Platform members",
-          selectionGroupLabel: "Member selection",
+          tableLabel: t("Platform members"),
+          selectionGroupLabel: t("Member selection"),
           allItemsSelectionLabel: ({ selectedItems }) =>
-            `${selectedItems.length} members selected`,
-          itemSelectionLabel: (_s, g) => `Select grant for ${g.principalId}`,
+            t("{count} members selected", {
+              count: selectedItems.length,
+            }),
+          itemSelectionLabel: (_s, g) =>
+            t("Select grant for {principal}", {
+              principal: g.principalId ?? "",
+            }),
         }}
         header={
           <Header
@@ -263,33 +283,38 @@ function MembersTab({ roles }: { roles: RoleSummary[] }) {
                   loading={isFetching}
                   onClick={() => refetch()}
                 >
-                  Refresh
+                  {t("Refresh")}
                 </Button>
                 <Button
                   disabled={selected.length === 0}
                   loading={deleteGrant.isPending}
                   onClick={() => setConfirmRevokeVisible(true)}
                 >
-                  Revoke
+                  {t("Revoke")}
                 </Button>
                 <Button
                   variant="primary"
                   onClick={() => setGrantModalVisible(true)}
                 >
-                  Grant access
+                  {t("Grant access")}
                 </Button>
               </SpaceBetween>
             }
           >
-            Members
+            {t("Members")}
           </Header>
         }
         filter={
           <TextFilter
             {...filterProps}
-            filteringAriaLabel="Filter members"
-            filteringPlaceholder="Find members"
-            countText={`${filteredItemsCount ?? 0} match${(filteredItemsCount ?? 0) === 1 ? "" : "es"}`}
+            filteringAriaLabel={t("Filter members")}
+            filteringPlaceholder={t("Find members")}
+            countText={t(
+              (filteredItemsCount ?? 0) === 1
+                ? "{count} match"
+                : "{count} matches",
+              { count: filteredItemsCount ?? 0 },
+            )}
           />
         }
         pagination={<Pagination {...paginationProps} openEnd={hasNextPage} />}
@@ -304,7 +329,7 @@ function MembersTab({ roles }: { roles: RoleSummary[] }) {
       <Modal
         visible={confirmRevokeVisible}
         onDismiss={() => setConfirmRevokeVisible(false)}
-        header="Confirm revoke"
+        header={t("Confirm revoke")}
         footer={
           <Box float="right">
             <SpaceBetween direction="horizontal" size="xs">
@@ -312,14 +337,14 @@ function MembersTab({ roles }: { roles: RoleSummary[] }) {
                 variant="link"
                 onClick={() => setConfirmRevokeVisible(false)}
               >
-                Cancel
+                {t("Cancel")}
               </Button>
               <Button
                 variant="primary"
                 loading={deleteGrant.isPending}
                 onClick={handleRevoke}
               >
-                Revoke
+                {t("Revoke")}
               </Button>
             </SpaceBetween>
           </Box>
@@ -330,9 +355,12 @@ function MembersTab({ roles }: { roles: RoleSummary[] }) {
             <StatusIndicator type="error">{revokeError}</StatusIndicator>
           )}
           <Box>
-            Are you sure you want to revoke platform access for{" "}
-            <strong>{selected.length}</strong>{" "}
-            {selected.length === 1 ? "principal" : "principals"}?
+            {t(
+              selected.length === 1
+                ? "Are you sure you want to revoke platform access for {count} principal?"
+                : "Are you sure you want to revoke platform access for {count} principals?",
+              { count: selected.length },
+            )}
           </Box>
           {selected.map((g) => (
             <Box key={g.grantId} variant="code">
@@ -355,6 +383,7 @@ function RolesTab({
   roles: RoleSummary[];
   isLoading: boolean;
 }) {
+  const { t } = useAppI18n();
   const [filterText, setFilterText] = useState("");
 
   const filtered = useMemo(() => {
@@ -368,16 +397,21 @@ function RolesTab({
   }, [roles, filterText]);
 
   const columns: TableProps.ColumnDefinition<RoleSummary>[] = [
-    { id: "name", header: "Role", isRowHeader: true, cell: (r) => r.name },
-    { id: "scope", header: "Scope", cell: (r) => r.scope },
+    {
+      id: "name",
+      header: t("Role"),
+      isRowHeader: true,
+      cell: (r) => r.name,
+    },
+    { id: "scope", header: t("Scope"), cell: (r) => r.scope },
     {
       id: "builtIn",
-      header: "Built-in",
-      cell: (r) => (r.isBuiltIn ? "Yes" : "No"),
+      header: t("Built-in"),
+      cell: (r) => (r.isBuiltIn ? t("Yes") : t("No")),
     },
     {
       id: "description",
-      header: "Description",
+      header: t("Description"),
       cell: (r) => r.description ?? "—",
     },
   ];
@@ -389,23 +423,23 @@ function RolesTab({
       trackBy="roleId"
       columnDefinitions={columns}
       loading={isLoading}
-      loadingText="Loading roles…"
+      loadingText={t("Loading roles…")}
       header={
         <Header variant="h2" counter={`(${filtered.length})`}>
-          Platform roles
+          {t("Platform roles")}
         </Header>
       }
       filter={
         <TextFilter
           filteringText={filterText}
           onChange={({ detail }) => setFilterText(detail.filteringText)}
-          filteringAriaLabel="Filter roles"
-          filteringPlaceholder="Find roles"
+          filteringAriaLabel={t("Filter roles")}
+          filteringPlaceholder={t("Find roles")}
         />
       }
       empty={
         <Box textAlign="center" color="text-body-secondary">
-          No platform roles defined.
+          {t("No platform roles defined.")}
         </Box>
       }
     />
@@ -413,11 +447,6 @@ function RolesTab({
 }
 
 // ── Grant platform role modal ────────────────────────────────────────────
-
-const PRINCIPAL_TYPE_OPTIONS: SelectProps.Option[] = [
-  { value: PrincipalType.USER, label: "User" },
-  { value: PrincipalType.GROUP, label: "Group" },
-];
 
 function GrantPlatformRoleModal({
   roles,
@@ -428,9 +457,14 @@ function GrantPlatformRoleModal({
   visible: boolean;
   onDismiss: () => void;
 }) {
+  const { t } = useAppI18n();
   const createGrant = useCreatePlatformGrant();
-  const [principalType, setPrincipalType] = useState<SelectProps.Option>(
-    PRINCIPAL_TYPE_OPTIONS[0]!,
+  const principalTypeOptions: SelectProps.Option[] = [
+    { value: PrincipalType.USER, label: t("User") },
+    { value: PrincipalType.GROUP, label: t("Group") },
+  ];
+  const [principalType, setPrincipalType] = useState<PrincipalType>(
+    PrincipalType.USER,
   );
   const [principalId, setPrincipalId] = useState("");
   const [selectedRole, setSelectedRole] = useState<SelectProps.Option | null>(
@@ -454,7 +488,7 @@ function GrantPlatformRoleModal({
   // Reset the form whenever the modal is (re)opened.
   React.useEffect(() => {
     if (visible) {
-      setPrincipalType(PRINCIPAL_TYPE_OPTIONS[0]!);
+      setPrincipalType(PrincipalType.USER);
       setPrincipalId("");
       setSelectedRole(null);
       setError(null);
@@ -462,12 +496,14 @@ function GrantPlatformRoleModal({
   }, [visible]);
 
   const validatePrincipalId = (): string | null => {
-    if (!principalId.trim()) return "Principal ID is required";
-    if (principalType.value === PrincipalType.USER) {
+    if (!principalId.trim()) return t("Principal ID is required");
+    if (principalType === PrincipalType.USER) {
       if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(principalId))
-        return "Please enter a valid email address";
+        return t("Please enter a valid email address");
     } else if (!/^[\w.-]+$/.test(principalId)) {
-      return "Name may only contain letters, numbers, hyphens, underscores, and dots";
+      return t(
+        "Name may only contain letters, numbers, hyphens, underscores, and dots",
+      );
     }
     return null;
   };
@@ -483,14 +519,14 @@ function GrantPlatformRoleModal({
     createGrant.mutate(
       {
         body: {
-          principalType: principalType.value as PrincipalType,
+          principalType,
           principalId,
           role: selectedRole.value!,
         },
       },
       {
         onSuccess: () => onDismiss(),
-        onError: (e) => setError(e.message ?? "Failed to create grant"),
+        onError: (e) => setError(e.message ?? t("Failed to create grant")),
       },
     );
   };
@@ -499,12 +535,12 @@ function GrantPlatformRoleModal({
     <Modal
       visible={visible}
       onDismiss={onDismiss}
-      header="Grant platform access"
+      header={t("Grant platform access")}
       footer={
         <Box float="right">
           <SpaceBetween direction="horizontal" size="xs">
             <Button variant="link" onClick={onDismiss}>
-              Cancel
+              {t("Cancel")}
             </Button>
             <Button
               variant="primary"
@@ -512,7 +548,7 @@ function GrantPlatformRoleModal({
               loading={createGrant.isPending}
               disabled={!principalId || !selectedRole}
             >
-              Grant
+              {t("Grant")}
             </Button>
           </SpaceBetween>
         </Box>
@@ -520,33 +556,38 @@ function GrantPlatformRoleModal({
     >
       <SpaceBetween size="l">
         {error && <StatusIndicator type="error">{error}</StatusIndicator>}
-        <FormField label="Type">
+        <FormField label={t("Type")}>
           <Select
-            selectedOption={principalType}
-            onChange={({ detail }) => setPrincipalType(detail.selectedOption)}
-            options={PRINCIPAL_TYPE_OPTIONS}
+            selectedOption={
+              principalTypeOptions.find((o) => o.value === principalType) ??
+              principalTypeOptions[0]!
+            }
+            onChange={({ detail }) =>
+              setPrincipalType(detail.selectedOption.value as PrincipalType)
+            }
+            options={principalTypeOptions}
           />
         </FormField>
         <FormField
-          label={principalType.value === PrincipalType.USER ? "Email" : "Name"}
+          label={principalType === PrincipalType.USER ? t("Email") : t("Name")}
         >
           <Input
             value={principalId}
             onChange={({ detail }) => setPrincipalId(detail.value)}
             placeholder={
-              principalType.value === PrincipalType.USER
+              principalType === PrincipalType.USER
                 ? "user@example.com"
                 : "platform-operators"
             }
           />
         </FormField>
-        <FormField label="Platform role">
+        <FormField label={t("Platform role")}>
           <Select
             selectedOption={selectedRole}
             onChange={({ detail }) => setSelectedRole(detail.selectedOption)}
             options={roleOptions}
-            placeholder="Select a platform role"
-            empty="No platform roles available"
+            placeholder={t("Select a platform role")}
+            empty={t("No platform roles available")}
           />
         </FormField>
       </SpaceBetween>

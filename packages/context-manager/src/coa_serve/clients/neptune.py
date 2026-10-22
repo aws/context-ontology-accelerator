@@ -36,6 +36,24 @@ _SPARQL_WRITE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Tokens whose text is data, not SPARQL syntax: string literals (long and short,
+# with escapes), IRI refs, and comments. They are blanked before the write-keyword
+# check, which otherwise fires on any IRI or literal that merely contains one of
+# those words -- e.g. a class IRI ``<https://clear.example/ns#Account>`` or a label
+# ``"Load Balancer"`` -- and turns every read that names it into an error.
+# One left-to-right scan, so a quote inside an IRI or a ``#`` inside a string is
+# consumed by the token it belongs to. An unterminated literal matches nothing and
+# stays visible, and an IRI token never spans whitespace, so it cannot swallow an
+# update keyword together with its operand.
+_SPARQL_DATA_TOKEN = re.compile(
+    r'"""(?:[^"\\]|\\.|"(?!""))*"""'
+    r"|'''(?:[^'\\]|\\.|'(?!''))*'''"
+    r'|"(?:[^"\\\n]|\\.)*"'
+    r"|'(?:[^'\\\n]|\\.)*'"
+    r"|<[^<>\s]*>"
+    r"|#[^\r\n]*"
+)
+
 DEFAULT_MAX_RESULTS = 10_000
 
 
@@ -183,5 +201,5 @@ class NeptuneGraphClient:
         return await loop.run_in_executor(None, _sign)
 
     def _validate_sparql(self, sparql: str) -> None:
-        if _SPARQL_WRITE_PATTERN.search(sparql):
+        if _SPARQL_WRITE_PATTERN.search(_SPARQL_DATA_TOKEN.sub(" ", sparql)):
             raise SPARQLValidationError("Only read-only SPARQL queries are allowed (SELECT, ASK, DESCRIBE, CONSTRUCT)")

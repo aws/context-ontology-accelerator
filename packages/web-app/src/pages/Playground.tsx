@@ -9,6 +9,7 @@ import React, {
   useState,
 } from "react";
 import { useParams } from "react-router-dom";
+import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
 import { useInView } from "react-intersection-observer";
 import {
   Box,
@@ -38,6 +39,7 @@ import { ONBOARDING_ICON } from "@constants/drawer-icons";
 import { scrollToBottom } from "@utils/scroll";
 
 import { buildQueryEndpoint } from "@utils/build-query-endpoint";
+import { useAppI18n } from "../i18n/LocaleProvider";
 
 /**
  * The execution-mode toggle's options, typed by `ExecutionMode` so the ids sent
@@ -45,12 +47,15 @@ import { buildQueryEndpoint } from "@utils/build-query-endpoint";
  * `deep-reasoning` was previously labelled "Agentic"; serve still accepts the old
  * wire value, but the UI only ever sends the current one.
  */
-const EXECUTION_MODE_OPTIONS: readonly { id: ExecutionMode; text: string }[] = [
-  { id: "standard", text: "Standard" },
-  { id: "deep-reasoning", text: "Deep Reasoning" },
-];
-
 export const Playground: React.FC = () => {
+  const { t } = useAppI18n();
+  const executionModeOptions: readonly {
+    id: ExecutionMode;
+    text: string;
+  }[] = [
+    { id: "standard", text: t("Standard") },
+    { id: "deep-reasoning", text: t("Deep Reasoning") },
+  ];
   const runtimeContext = useContext(RuntimeConfigContext);
   const { namespaceId: urlNamespaceId } = useParams<{ namespaceId: string }>();
   const { namespaceId: providerNamespaceId } = useCurrentNamespace();
@@ -59,6 +64,8 @@ export const Playground: React.FC = () => {
     providerNamespaceId ||
     urlNamespaceId ||
     (import.meta.env.DEV ? "demo" : "");
+
+  useBreadcrumbTrail([{ text: t("Serve") }, { text: t("Playground") }]);
 
   const [inputValue, setInputValue] = useState("");
   // Sent as options.mode on every query. Defaults to "standard" to match serve's
@@ -141,7 +148,7 @@ export const Playground: React.FC = () => {
       setSelectedMessage(msg);
       const query = findUserQuery(msg);
       openPanel(
-        "Rationale",
+        t("Rationale"),
         <RationalePanel
           message={msg}
           sessionId={sessionId}
@@ -149,7 +156,7 @@ export const Playground: React.FC = () => {
         />,
       );
     },
-    [openPanel, sessionId, findUserQuery],
+    [openPanel, sessionId, findUserQuery, t],
   );
 
   // Update the split panel content when the selected message's response arrives
@@ -161,7 +168,7 @@ export const Playground: React.FC = () => {
       setSelectedMessage(updated);
       const query = findUserQuery(updated);
       openPanel(
-        "Rationale",
+        t("Rationale"),
         <RationalePanel
           message={updated}
           sessionId={sessionId}
@@ -176,6 +183,7 @@ export const Playground: React.FC = () => {
     openPanel,
     sessionId,
     findUserQuery,
+    t,
   ]);
 
   // Register the onboarding drawer on the Playground page
@@ -187,15 +195,15 @@ export const Playground: React.FC = () => {
         iconSvg: ONBOARDING_ICON,
       },
       ariaLabels: {
-        drawerName: "Get started",
-        closeButton: "Close Get started",
+        drawerName: t("Get started"),
+        closeButton: t("Close Get started"),
       },
     });
     return () => {
       closePanel();
       unregisterDrawer("onboarding");
     };
-  }, [registerDrawer, unregisterDrawer, closePanel]);
+  }, [registerDrawer, unregisterDrawer, closePanel, t]);
 
   const isReady = !isRestoring && !isStreaming && !!namespaceId;
   const canSubmit = isReady && inputValue.trim().length > 0 && !!namespaceId;
@@ -219,36 +227,37 @@ export const Playground: React.FC = () => {
                 // Resolve against the typed option list rather than comparing
                 // string literals, so an id and the state setter cannot drift
                 // apart — a mismatch is a compile error, not a dead toggle.
-                const picked = EXECUTION_MODE_OPTIONS.find(
+                const picked = executionModeOptions.find(
                   (o) => o.id === detail.selectedId,
                 );
                 if (picked) setMode(picked.id);
               }}
-              label="Execution mode"
-              options={EXECUTION_MODE_OPTIONS}
+              label={t("Execution mode")}
+              options={executionModeOptions}
             />
             <Button
               variant="normal"
               onClick={newChat}
               disabled={state.messages.length === 0}
             >
-              New chat
+              {t("New chat")}
             </Button>
           </SpaceBetween>
         }
       >
-        Playground
+        {t("Playground")}
       </Header>
 
       {!runtimeContext?.serveRuntimeArn && (
         <StatusIndicator type="warning">
-          Query endpoint not configured. Add serveRuntimeArn to
-          runtime-config.json.
+          {t(
+            "Query endpoint not configured. Add serveRuntimeArn to runtime-config.json.",
+          )}
         </StatusIndicator>
       )}
       {!namespaceId && (
         <StatusIndicator type="warning">
-          No namespace selected. Choose one from the top navigation.
+          {t("No namespace selected. Choose one from the top navigation.")}
         </StatusIndicator>
       )}
 
@@ -266,7 +275,7 @@ export const Playground: React.FC = () => {
               items={[
                 {
                   type: "warning",
-                  content: "Previous session history may not have loaded",
+                  content: t("Previous session history may not have loaded"),
                   dismissible: true,
                   onDismiss: dismissRestoreWarning,
                   id: "restore-timeout-warning",
@@ -292,7 +301,7 @@ export const Playground: React.FC = () => {
             {!isReady && !isStreaming && state.messages.length === 0 && (
               <Box textAlign="center" padding="l">
                 <StatusIndicator type="loading">
-                  {!namespaceId ? "Connecting" : "Restoring session"}
+                  {!namespaceId ? t("Connecting") : t("Restoring session")}
                 </StatusIndicator>
               </Box>
             )}
@@ -306,7 +315,7 @@ export const Playground: React.FC = () => {
                 >
                   {isLoadingOlderHistory ? (
                     <StatusIndicator type="loading">
-                      Loading earlier messages
+                      {t("Loading earlier messages")}
                     </StatusIndicator>
                   ) : (
                     <Button
@@ -314,7 +323,7 @@ export const Playground: React.FC = () => {
                       variant="normal"
                       onClick={requestOlderHistory}
                     >
-                      Load earlier messages
+                      {t("Load earlier messages")}
                     </Button>
                   )}
                 </Box>
