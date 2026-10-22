@@ -66,11 +66,12 @@ class TestListMetrics:
         assert result["metrics"] == []
 
     @pytest.mark.asyncio
-    async def test_max_results_capped_at_1000(self, mock_lambda_client):
+    async def test_max_results_capped_at_page_size_limit(self, mock_lambda_client):
         mock_lambda_client.invoke_api.return_value = {"metrics": [], "namespace": "ns"}
         await list_metrics(mock_lambda_client, "ns", "tok", max_results=9999)
         call_kwargs = mock_lambda_client.invoke_api.call_args[1]
-        assert call_kwargs["query_params"]["maxResults"] == "1000"
+        # ListMetrics maxResults is @range(max: 200) in metric-service.smithy.
+        assert call_kwargs["query_params"]["maxResults"] == "200"
 
     @pytest.mark.asyncio
     async def test_forwards_bearer_token(self, mock_lambda_client):

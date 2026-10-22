@@ -4,6 +4,7 @@
 import * as cdk from "aws-cdk-lib";
 import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import * as cr from "aws-cdk-lib/custom-resources";
+import * as ssm from "aws-cdk-lib/aws-ssm";
 import { Construct } from "constructs";
 import * as fs from "fs";
 import * as path from "path";
@@ -11,6 +12,8 @@ import * as path from "path";
 import { SCLStack } from "../../constructs/scl-stack";
 import { DynamoDBTable } from "../../constructs/dynamodb-table";
 import { Paths } from "../../paths";
+import { resolveContext } from "../../context";
+import { IDEMPOTENCY_TABLE_SSM_SUFFIX } from "../../utils/idempotency";
 import { ClaimMapping } from "../../types";
 import {
   PrincipalType,
@@ -32,6 +35,10 @@ export interface AuthnzStackProps extends cdk.StackProps {
  *   - ResourceRoleMappings — principal ↔ resource ↔ role grants with
  *                            PrincipalIndex and NamespaceGrantsIndex GSIs
  *   - CacheInvalidation    — single-row version counter for auth cache busting
+ *   - Idempotency          — clientToken records that make the API's create
+ *                            operations retry-safe (PK only, TTL on `ttl`).
+ *                            Shared with the namespace, sources, metric and
+ *                            ontology stacks via SSM.
  *
  * IdP group → role mappings are handled via ResourceRoleMappings with
  * principalType "Group" and the IdP group name as principalId. The
@@ -53,6 +60,9 @@ export class AuthnzStack extends SCLStack {
 
   /** CacheInvalidation table. */
   public readonly cacheInvalidationTable: dynamodb.Table;
+
+  /** Idempotency-record table for retry-safe create operations. */
+  public readonly idempotencyTable: dynamodb.Table;
 
   constructor(scope: Construct, id: string, props?: AuthnzStackProps) {
     super(scope, id, props);
@@ -112,6 +122,22 @@ export class AuthnzStack extends SCLStack {
       sortKey: SK,
     });
     this.cacheInvalidationTable = cache.table;
+
+    // ── 4b. Idempotency ──────────────────────────────────────────────
+    // One record per (operation, caller, scope, clientToken) hash. Records
+    // expire after 24 h via TTL; consumers read the name from SSM and get
+    // Get/Put/Update/DeleteItem on this table only (see utils/idempotency.ts).
+    const idempotency = new DynamoDBTable(this, "IdempotencyTable", {
+      tableName: TABLE_NAMES.IDEMPOTENCY,
+      partitionKey: PK,
+      timeToLiveAttribute: "ttl",
+    });
+    this.idempotencyTable = idempotency.table;
+    new ssm.StringParameter(this, "SsmIdempotencyTableName", {
+      parameterName: `${resolveContext(this.node).ssmPrefix}${IDEMPOTENCY_TABLE_SSM_SUFFIX}`,
+      stringValue: idempotency.table.tableName,
+      description: "Idempotency-record DynamoDB table name",
+    });
 
     // ── 5. Seed built-in roles ───────────────────────────────────────
     this.seedBuiltInRoles(roles.table);

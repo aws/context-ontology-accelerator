@@ -15,6 +15,9 @@ import structlog
 
 logger = structlog.get_logger(__name__)
 
+# Returned by get_caller_identity when the event carries no caller identity.
+UNKNOWN_CALLER = "unknown"
+
 
 def _get_allowed_origin() -> str:
     origin = os.environ.get("ALLOWED_ORIGIN", "")
@@ -26,12 +29,17 @@ def _get_allowed_origin() -> str:
     return origin
 
 
-def _cors_headers() -> dict[str, str]:
+def cors_headers() -> dict[str, str]:
+    """CORS headers for an API Gateway proxy response (reads ``ALLOWED_ORIGIN``)."""
     return {
         "Access-Control-Allow-Origin": _get_allowed_origin(),
         "Access-Control-Allow-Headers": "Content-Type,Authorization",
         "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS",
     }
+
+
+# Backward-compatible private alias for existing callers.
+_cors_headers = cors_headers
 
 
 # Backward-compatible module-level constant — evaluates lazily on first access
@@ -41,7 +49,7 @@ CORS_HEADERS: dict[str, str] = {}
 
 def api_response(status: int, body: dict, extra_headers: dict | None = None) -> dict[str, Any]:
     """Build an API Gateway proxy response with CORS headers."""
-    headers = {"Content-Type": "application/json", **_cors_headers()}
+    headers = {"Content-Type": "application/json", **cors_headers()}
     if extra_headers:
         headers.update(extra_headers)
     return {"statusCode": status, "headers": headers, "body": json.dumps(body, default=str)}
@@ -69,7 +77,7 @@ def get_caller_identity(event: dict[str, Any]) -> str:
     2. Cognito authorizer claims (email, then sub)
     3. IAM identity (userArn)
 
-    Returns ``"unknown"`` if none of the above are present.
+    Returns :data:`UNKNOWN_CALLER` (``"unknown"``) if none of the above are present.
     """
     rc = event.get("requestContext", {})
     authorizer = rc.get("authorizer", {})
@@ -92,4 +100,4 @@ def get_caller_identity(event: dict[str, Any]) -> str:
         return identity["userArn"]
 
     logger.warning("no_caller_identity_in_event")
-    return "unknown"
+    return UNKNOWN_CALLER

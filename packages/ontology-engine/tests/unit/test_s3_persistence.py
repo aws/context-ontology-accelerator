@@ -260,9 +260,9 @@ class TestListInducedDatasources:
             },
         ]
 
-        result = list_induced_datasources(namespace="test-ns")
+        result = list_induced_datasources(namespace="test-ns", max_results=1000, next_token=None)["datasources"]
 
-        mock_dynamo.list_proposals.assert_called_once_with(namespace="test-ns", status="accepted")
+        mock_dynamo.list_proposals.assert_called_once_with(namespace="test-ns", status="accepted", limit=None)
         assert len(result) == 2
         ids = {r["datasourceId"] for r in result}
         assert ids == {"ds-a", "ds-b"}
@@ -272,8 +272,8 @@ class TestListInducedDatasources:
         from coa_ontology.induce_catalog import list_induced_datasources
 
         mock_dynamo.list_proposals.return_value = []
-        result = list_induced_datasources(namespace="empty-ns")
-        assert result == []
+        result = list_induced_datasources(namespace="empty-ns", max_results=1000, next_token=None)
+        assert result == {"datasources": []}
 
 
 class TestCleanOntologyForVkg:

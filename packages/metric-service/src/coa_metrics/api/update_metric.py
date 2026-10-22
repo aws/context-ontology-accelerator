@@ -26,6 +26,7 @@ from coa_control_plane_server.models.update_metric_request_content import (
 )
 from pydantic import ValidationError
 
+from coa_metrics.api.contract import check_metric_name
 from coa_metrics.api.create_metric import _metric_to_dict, _validate_soft
 from coa_metrics.api.validation_errors import format_validation_error
 from coa_metrics.constants import VALID_SQL_DIALECTS, invalid_dialect_message
@@ -87,6 +88,9 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
 
     if not name:
         return api_response(400, {"message": "Metric name is required in path"})
+    name_error = check_metric_name(name)
+    if name_error:
+        return api_response(400, {"message": name_error})
 
     # Parse request body
     try:
@@ -106,7 +110,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     # Check metric exists
     existing = _get_neptune().get_metric(namespace, name)
     if existing is None:
-        return api_response(404, {"message": f"Metric '{name}' not found in namespace '{namespace}'"})
+        return api_response(404, {"message": "Metric not found in namespace"})
 
     # Build updated metric definition (includes SqlDialect validation)
     try:

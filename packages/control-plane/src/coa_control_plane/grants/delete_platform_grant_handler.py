@@ -57,7 +57,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
 
     # Only platform grants may be revoked through this endpoint.
     if not pk.startswith(_PLATFORM_RESOURCE_PREFIX):
-        return api_response(404, {"message": f"Platform grant '{grant_id}' not found"})
+        return api_response(404, {"message": "Platform grant not found"})
 
     region = os.environ.get("AWS_REGION")
     mappings_table = os.environ.get("RESOURCE_ROLE_MAPPINGS_TABLE")
@@ -73,7 +73,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
         # misleading 200 for a non-existent grant. Return 404 instead.
         existing = mappings_dao.get({"PK": pk, "SK": sk})
         if not existing:
-            return api_response(404, {"message": f"Platform grant '{grant_id}' not found"})
+            return api_response(404, {"message": "Platform grant not found"})
         mappings_dao.delete({"PK": pk, "SK": sk})
         return api_response(200, {})
 

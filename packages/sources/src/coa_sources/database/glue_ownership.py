@@ -60,6 +60,8 @@ import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 from coa_common.constants import namespace_tag_key, parse_namespace_tag
 
+from coa_sources.client_errors import ClientSafeError, client_safe_error, redact
+
 logger = logging.getLogger(__name__)
 
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
@@ -125,12 +127,16 @@ def _partition(region: str) -> str:
     return "aws"
 
 
-class GlueOwnershipError(Exception):
+class GlueOwnershipError(ClientSafeError):
     """The caller's namespace is not authorized for the requested Glue database.
 
     Carries a message written for the steward who will read it: it names the
     database, why it was refused, and the one command that fixes it. Callers turn
-    it into a 403 (control plane) or a scan failure (pipeline) without rewording.
+    it into a 403 (control plane) or a scan failure (pipeline) without rewording —
+    as a :class:`ClientSafeError` it is neither truncated nor redacted on the way,
+    which would break the tag command it carries. It names only the caller's own
+    account, database and namespace; any underlying AWS error is reduced by
+    :func:`client_safe_error` before it is embedded.
     """
 
 
@@ -276,10 +282,14 @@ def _tagged_namespaces(catalog_id: str, database_name: str, region: str, glue_cl
             logger.info("glue_ownership_database_absent", extra={"resource_arn": arn})
             return _TagLookup(frozenset(), missing=True)
         logger.warning("glue_get_tags_failed", extra={"resource_arn": arn}, exc_info=True)
-        return _TagLookup(frozenset(), unreadable=True, detail=str(exc)[:300])
+        # The detail reaches the caller (403 / scan failure): error code only, the
+        # service message (role ARN, account) stays in the log line above.
+        return _TagLookup(frozenset(), unreadable=True, detail=client_safe_error(exc))
     except BotoCoreError as exc:
         logger.warning("glue_get_tags_failed", extra={"resource_arn": arn}, exc_info=True)
-        return _TagLookup(frozenset(), unreadable=True, detail=str(exc)[:300])
+        # The detail reaches the caller (403 / scan failure): error code only, the
+        # service message (role ARN, account) stays in the log line above.
+        return _TagLookup(frozenset(), unreadable=True, detail=client_safe_error(exc))
     raw = tags.get(namespace_tag_key(), "") or ""
     # `ALL` is Glue-only and is not a namespace id, so it is recognised before the
     # shared parser sees it — only as the WHOLE value, never as a list entry. A
@@ -305,7 +315,7 @@ def _tagged_namespaces(catalog_id: str, database_name: str, region: str, glue_cl
             "glue_ownership_tag_malformed",
             extra={"resource_arn": arn, "error": str(exc)},
         )
-        return _TagLookup(frozenset(), unreadable=True, detail=f"tag value is not usable: {exc}")
+        return _TagLookup(frozenset(), unreadable=True, detail=f"tag value is not usable: {redact(str(exc))}")
 
 
 def _unreadable_hint(catalog_id: str, database_name: str, region: str, detail: str) -> str:

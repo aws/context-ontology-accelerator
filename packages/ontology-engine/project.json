@@ -7,6 +7,7 @@
             "command": "uv run ruff check packages/ontology-engine && uv run ruff format --check packages/ontology-engine && uv run mypy packages/ontology-engine/src --ignore-missing-imports --cache-dir packages/ontology-engine/.mypy_cache"
         },
         "test": {
+            "inputs": ["default", "^default", "smithyModels"],
             "command": "COVERAGE_FILE=packages/ontology-engine/.coverage uv run pytest packages/ontology-engine -m unit -v --tb=short --cov=packages/ontology-engine/src --cov-config=packages/ontology-engine/pyproject.toml --cov-report=term-missing --cov-report=xml:packages/ontology-engine/coverage.xml --cov-fail-under=80 --junitxml=packages/ontology-engine/junit.xml"
         },
         "format": {"command": "uv run ruff format packages/ontology-engine"},

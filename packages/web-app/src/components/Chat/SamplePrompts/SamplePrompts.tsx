@@ -4,6 +4,7 @@
 import React from "react";
 import { Box, Button, SpaceBetween } from "@cloudscape-design/components";
 import type { ExampleQuestion } from "@api-hooks/use-example-questions";
+import { useAppI18n } from "../../../i18n/LocaleProvider";
 
 export interface SamplePromptsProps {
   questions: ExampleQuestion[];
@@ -21,10 +22,12 @@ export const SamplePrompts: React.FC<SamplePromptsProps> = ({
   onSelect,
   disabled = false,
 }) => {
+  const { t } = useAppI18n();
+
   if (questions.length === 0) {
     return (
       <Box textAlign="center" color="text-body-secondary" padding="xl">
-        Ask a question against the governed surface...
+        {t("Ask a question against the governed surface...")}
       </Box>
     );
   }
@@ -33,7 +36,7 @@ export const SamplePrompts: React.FC<SamplePromptsProps> = ({
     <Box textAlign="center" padding="xl">
       <SpaceBetween size="m" alignItems="center">
         <Box color="text-body-secondary">
-          Try one of the sample prompts below, or type your own question.
+          {t("Try one of the sample prompts below, or type your own question.")}
         </Box>
         <div
           style={{

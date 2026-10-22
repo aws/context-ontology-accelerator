@@ -58,3 +58,11 @@ class TestCorsConfiguration:
             assert result["headers"]["Access-Control-Allow-Headers"] == "Content-Type,Authorization"
             assert result["headers"]["Access-Control-Allow-Methods"] == "GET,POST,PUT,DELETE,OPTIONS"
             assert result["headers"]["Content-Type"] == "application/json"
+
+    def test_public_cors_headers_matches_private_alias(self):
+        """cors_headers is the public name; _cors_headers stays as an alias for existing callers."""
+        from coa_common import response
+
+        with patch.dict(os.environ, {"ALLOWED_ORIGIN": "https://test.example.com"}, clear=True):
+            assert response.cors_headers()["Access-Control-Allow-Origin"] == "https://test.example.com"
+            assert response._cors_headers() == response.cors_headers()

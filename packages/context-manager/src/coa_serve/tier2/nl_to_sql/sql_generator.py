@@ -21,7 +21,7 @@ from __future__ import annotations
 import os
 import re
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
@@ -29,7 +29,7 @@ import structlog
 
 from ...clients.base import ConverseResult, LLMClient, VectorClient, VectorHit
 from ..sql_firewall import SQLFirewall
-from ..table_qualifier import AMBIGUOUS_KEY
+from ..table_qualifier import AMBIGUOUS_KEY, AMBIGUOUS_SOURCE
 
 # Matches opening OR closing <user_context> tags, case-insensitively and
 # tolerant of surrounding whitespace (e.g. "</USER_CONTEXT>",
@@ -305,6 +305,10 @@ class GraphExpander(Protocol):
         ...
 
 
+# {bare table: data_source_id ("" if unplaced)} -> {bare table: (source_id, database)}.
+TablePlacementResolver = Callable[[dict[str, str]], Awaitable[dict[str, tuple[str, str]]]]
+
+
 @dataclass
 class NLtoSQLResult:
     """Result of NL-to-SQL SQL generation pipeline."""
@@ -419,6 +423,7 @@ class SQLGenerator:
         dialect: str | None = None,
         graph_expander: GraphExpander | None = None,
         governed_metric: str = "",
+        table_placements: TablePlacementResolver | None = None,
     ) -> NLtoSQLResult:
         """Run the NL-to-SQL pipeline: retrieve → expand → generate SQL.
 
@@ -445,6 +450,13 @@ class SQLGenerator:
                 Tier-1 matched but declined (see
                 ``DeclinedMetricContext.prompt_block``). Empty — the default —
                 leaves the prompt byte-identical to the pre-change baseline.
+            table_placements: Optional resolver from ``{bare table: data_source_id}``
+                to ``{bare table: (source_id, database)}``. A table it places is
+                shown to the writer as ``Table: t | Database: db (write it as db.t)``,
+                so a query joining two databases names each one, and a table whose
+                class carried no ``data_source_id`` (a top-down ontology) is routed
+                to the placed source. ``None``, or an empty mapping (every
+                single-database namespace), leaves prompt and routing unchanged.
         """
         trace: list[dict[str, Any]] = []
 
@@ -461,9 +473,9 @@ class SQLGenerator:
                 query_embedding = await self._llm.embed(question)
                 trace.append({"step": "embed", "status": "ok", "ms": _ms(start)})
             except Exception as e:
-                logger.warning("nl_to_sql_embed_failed", error=str(e))
-                trace.append({"step": "embed", "status": "error", "ms": _ms(start), "error": str(e)})
-                return NLtoSQLResult(sql="", trace_steps=trace, error=f"embed_failed: {e}")
+                logger.warning("nl_to_sql_embed_failed", error=str(e), error_type=type(e).__name__)
+                trace.append({"step": "embed", "status": "error", "ms": _ms(start), "error": type(e).__name__})
+                return NLtoSQLResult(sql="", trace_steps=trace, error=f"embed_failed: {type(e).__name__}")
 
         # Step 2: Retrieve classes (entity_type="class" excludes column/property
         # entries that don't match the "Table: ..." text format).
@@ -519,8 +531,9 @@ class SQLGenerator:
                 }
             )
         except Exception as e:
-            trace.append({"step": "retrieve", "status": "error", "ms": _ms(start), "error": str(e)})
-            return NLtoSQLResult(sql="", trace_steps=trace, error=f"retrieve_failed: {e}")
+            logger.warning("nl_to_sql_retrieve_failed", error=str(e), error_type=type(e).__name__)
+            trace.append({"step": "retrieve", "status": "error", "ms": _ms(start), "error": type(e).__name__})
+            return NLtoSQLResult(sql="", trace_steps=trace, error=f"retrieve_failed: {type(e).__name__}")
 
         if not retrieved_tables:
             return NLtoSQLResult(sql="", trace_steps=trace, error="no_tables_retrieved")
@@ -581,7 +594,7 @@ class SQLGenerator:
                         "status": "error",
                         "ms": _ms(start),
                         "seeds": len(seed_iris),
-                        "error": str(e)[:200],
+                        "error": type(e).__name__,
                     }
                 )
             # Retrieval accounting for the walk: `seeds` is how many retrieved hits
@@ -601,9 +614,42 @@ class SQLGenerator:
                 tables=[t.get("table") for t in graph_tables],
             )
 
+        # Step 3c: which source and database each table in the prompt lives in (see
+        # `table_placements`). The walked tables are included: the graph carries no
+        # source id, so without a placement a cross-database lookup table the walk
+        # added ran bare against the default database.
+        table_sources = _hit_table_source_map(hits)
+        databases: dict[str, str] = {}
+        if table_placements is not None:
+            hit_sources = {
+                name: hit.data_source_id or ""
+                for hit in hits
+                if (name := _table_name_from_class_text(hit.metadata.get("context_text") or hit.text))
+            }
+            for walked in graph_tables:
+                if name := str(walked.get("table") or "").strip().lower():
+                    hit_sources.setdefault(name, "")
+            placements: dict[str, tuple[str, str]] = {}
+            try:
+                placements = await table_placements(hit_sources)
+            except Exception as e:
+                # An enrichment: an unreachable registry/catalog leaves tables bare, as before.
+                logger.warning("nl_to_sql_table_placements_failed", error=f"{type(e).__name__}: {str(e)[:120]}")
+            for table, (source_id, database) in placements.items():
+                # Fills only names the hits left unplaced; a hit's own source (or
+                # its ambiguity marker) is never overridden.
+                table_sources.setdefault(table, source_id)
+                # Hint only where the placement is what routes the table: a name
+                # two classes or databases claim stays marked ambiguous (refused
+                # downstream), so the writer is not told it lives in one database.
+                if database and table_sources[table] == source_id:
+                    databases[table] = database
+            if placements:
+                trace.append({"step": "table_placements", "status": "ok", "databases": databases})
+
         # Step 4: Build context from class metadata (raw text — no DDL reformatting)
-        ddl_context = _build_raw_context(hits, expanded_tables)
-        graph_block, graph_added = _graph_context_block(expanded_tables, graph_tables)
+        ddl_context = _build_raw_context(hits, expanded_tables, databases)
+        graph_block, graph_added = _graph_context_block(expanded_tables, graph_tables, databases)
         if graph_block:
             # Appended AFTER the retrieved block, and never in place of it: a
             # walk-derived schema has no sampled values, so overwriting a retrieved
@@ -646,20 +692,23 @@ class SQLGenerator:
             )
             trace.append({"step": "generate_sql", "status": "ok", "ms": _ms(start), "confidence": confidence})
         except Exception as e:
-            trace.append({"step": "generate_sql", "status": "error", "ms": _ms(start), "error": str(e)})
+            logger.warning("nl_to_sql_generate_failed", error=str(e), error_type=type(e).__name__)
+            trace.append({"step": "generate_sql", "status": "error", "ms": _ms(start), "error": type(e).__name__})
             return NLtoSQLResult(
                 sql="",
                 retrieved_tables=retrieved_tables,
                 expanded_tables=expanded_tables,
                 trace_steps=trace,
-                error=f"generate_failed: {e}",
+                error=f"generate_failed: {type(e).__name__}",
             )
 
         # Prefer resolving the source from the tables the generated SQL actually
         # references (precise, single-source even when retrieval mixed sources);
         # fall back to the all-hits agreement when the SQL-based resolution is
         # inconclusive (e.g. unparseable SQL or unmapped tables).
-        resolved_source = _resolve_data_source_from_sql(sql, hits) or _resolve_data_source_from_hits(hits)
+        resolved_source = _resolve_data_source_from_table_sources(sql, table_sources) or _resolve_data_source_from_hits(
+            hits
+        )
 
         return NLtoSQLResult(
             sql=sql,
@@ -669,7 +718,7 @@ class SQLGenerator:
             trace_steps=trace,
             data_source_id=resolved_source,
             ddl_context=ddl_context,
-            table_sources=_hit_table_source_map(hits),
+            table_sources=table_sources,
         )
 
     async def generate_from_context(
@@ -727,7 +776,9 @@ class SQLGenerator:
 
         Second (and final) shot of the two-shot NL→SQL path: the first-shot SQL
         raised a database execution error, so we hand the model the SAME schema
-        context, the SQL it wrote, and the verbatim engine error, and ask it to
+        context, the statement that actually executed (on a cross-source query the
+        qualified rewrite, which the engine's error positions refer to), and the
+        verbatim engine error, and ask it to
         produce a corrected query. This is deliberately model-driven — no
         hardcoded error-pattern rules — so the fix generalizes across dialects
         and error classes (type mismatches, unknown columns, bad casts, GROUP BY
@@ -962,8 +1013,13 @@ def hit_class_iri(hit: VectorHit) -> str:
     return str(md.get("uri") or md.get("entity_uri") or "")
 
 
-def _graph_context_block(existing_tables: Iterable[str], graph_tables: list[dict[str, Any]]) -> tuple[str, list[str]]:
+def _graph_context_block(
+    existing_tables: Iterable[str], graph_tables: list[dict[str, Any]], databases: dict[str, str] | None = None
+) -> tuple[str, list[str]]:
     """``(prompt block, added table names)`` for walk-discovered tables.
+
+    A table in ``databases`` gets its database after its name, as a retrieved
+    table does (see :func:`_with_database`).
 
     Tables the retrieved block already carries are dropped: their retrieved text is
     strictly richer, and listing a table twice invites the writer to treat two
@@ -980,6 +1036,7 @@ def _graph_context_block(existing_tables: Iterable[str], graph_tables: list[dict
     unconditionally and the unflagged path stays byte-identical.
     """
     have = {t.strip().lower() for t in existing_tables if t and t.strip()}
+    databases = databases or {}
     lines: list[str] = []
     added: list[str] = []
     for t in graph_tables:
@@ -989,6 +1046,7 @@ def _graph_context_block(existing_tables: Iterable[str], graph_tables: list[dict
             continue
         have.add(name.lower())
         added.append(name)
+        schema = _with_database(schema, name, databases.get(name.lower(), ""))
         via = str(t.get("via") or "").strip()
         lines.append(f"{schema}\n  -- reached via: {via}" if via else schema)
     if not lines:
@@ -1019,7 +1077,7 @@ def _resolve_data_source_from_hits(hits: list[VectorHit]) -> str:
     return ""
 
 
-_AMBIGUOUS_SOURCE = "__ambiguous__"
+_AMBIGUOUS_SOURCE = AMBIGUOUS_SOURCE
 
 
 def _hit_table_source_map(hits: list[VectorHit]) -> dict[str, str]:
@@ -1080,7 +1138,11 @@ def _resolve_data_source_from_sql(sql: str, hits: list[VectorHit]) -> str:
     to Athena federation. Returns "" when the SQL references tables from more
     than one source, or when no referenced table maps to a known source.
     """
-    table_source = _hit_table_source_map(hits)
+    return _resolve_data_source_from_table_sources(sql, _hit_table_source_map(hits))
+
+
+def _resolve_data_source_from_table_sources(sql: str, table_source: dict[str, str]) -> str:
+    """:func:`_resolve_data_source_from_sql` over an already-built table -> source map."""
     if not table_source:
         return ""
     source_ids: set[str] = set()
@@ -1185,15 +1247,35 @@ def sql_table_routing(sql: str, table_sources: dict[str, str]) -> dict[str, dict
     return routing
 
 
-def _build_raw_context(hits: list[VectorHit], expanded_tables: list[str]) -> str:
+def _build_raw_context(
+    hits: list[VectorHit], expanded_tables: list[str], databases: dict[str, str] | None = None
+) -> str:
     """Pass class text directly as context — no DDL reformatting.
 
     The class text stored in OpenSearch already contains structured metadata
     ('Table: name | Description: ... | Columns: col:type (desc), ...') which
     LLMs parse effectively without transformation to CREATE TABLE syntax.
+    A table in ``databases`` also gets its database right after its name.
     """
     hit_map = _hit_map(hits)
-    return "\n".join(hit_map[table] for table in expanded_tables if hit_map.get(table))
+    databases = databases or {}
+    return "\n".join(
+        _with_database(hit_map[table], table, databases.get(table, ""))
+        for table in expanded_tables
+        if hit_map.get(table)
+    )
+
+
+def _with_database(text: str, table: str, database: str) -> str:
+    """``Table: t | ...`` -> ``Table: t | Database: db (write it as db.t) | ...``.
+
+    Kept a separate segment after the name, not folded into it, because every
+    other reader of this text keys the table by the bare ``Table:`` segment.
+    """
+    if not database:
+        return text
+    head, sep, rest = text.partition(" | ")
+    return f"{head} | Database: {database} (write it as {database}.{table}){sep}{rest}"
 
 
 _SQL_KEYWORD_RE = re.compile(r"\b(SELECT|WITH)\b", re.IGNORECASE)

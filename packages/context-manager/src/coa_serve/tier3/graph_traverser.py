@@ -60,7 +60,19 @@ _UNSAFE_ENTITY_RE = re.compile(r"[\x00-\x1f\x7f-\x9f  ]")
 # injection (whitespace, angle brackets, quotes, braces, pipe, backslash,
 # caret, backtick) remain excluded. (Dropping '#' here silently rejected every
 # induced-ontology seed URI, making Tier-3 URI-hop return 0.)
+#
+# Mirrors ``TraversalStartUri`` in ``serve.smithy`` (the GraphTraverse ``startUri``
+# contract); ``test_graph_traverse_contract`` fails if the two drift. Matched with
+# ``fullmatch`` — ``match`` + ``$`` would accept a trailing newline.
 _SAFE_URI_RE = re.compile(r"^https?://[^\s<>\"{}|\\^`;]+$|^urn:[a-zA-Z0-9][a-zA-Z0-9._:-]*$")
+# ``TraversalStartUri`` @length(max: 2048).
+MAX_TRAVERSAL_URI_LENGTH = 2048
+
+
+def is_traversable_uri(uri: object) -> bool:
+    """Whether ``uri`` is safe to interpolate as a ``<…>`` IRI ref in a hop query."""
+    return isinstance(uri, str) and len(uri) <= MAX_TRAVERSAL_URI_LENGTH and bool(_SAFE_URI_RE.fullmatch(uri))
+
 
 _MAX_TRAVERSAL_RESULTS = 50
 # Row cap for the URI-hop query. Raised 100→300 when _build_hop_query grew from
@@ -146,7 +158,7 @@ class GraphTraverser:
             logger.warning("graph_traverser_no_template", namespace=namespace)
             return []
 
-        safe_uris = [u for u in uris if _SAFE_URI_RE.match(u)]
+        safe_uris = [u for u in uris if is_traversable_uri(u)]
         if not safe_uris:
             logger.info("graph_traverse_uris_all_rejected", namespace=namespace, in_count=len(uris))
             return []

@@ -22,12 +22,19 @@ import structlog
 from coa_common.constants import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, validate_namespace_id
 from coa_common.dao import DynamoDBDAO, QueryParams
 from coa_common.logging import setup_logging
+from coa_common.pagination import check_start_key, is_rejected_start_key
 from coa_common.response import api_response
 
+from .contract import validate_list_query
 from .grant_id import encode_grant_id
 
 setup_logging(os.environ.get("LOG_LEVEL", "INFO"))
 logger = structlog.get_logger(__name__)
+
+# Key attributes of each GSI's items: base-table keys plus the index keys. A
+# resume key must be exactly one of these, in the partition being queried.
+_PRINCIPAL_INDEX_KEY_ATTRS = ("PK", "SK", "principalKey", "resourceRoleKey")
+_NAMESPACE_INDEX_KEY_ATTRS = ("PK", "SK", "namespaceKey", "principalRoleKey")
 
 
 def _decode_next_token(token: str) -> dict[str, Any]:
@@ -85,10 +92,26 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
         return api_response(400, {"message": f"maxResults must be between 1 and {MAX_PAGE_SIZE}"})
 
     next_token = query_params.get("nextToken")
+    bounds_error = validate_list_query(principal, next_token)
+    if bounds_error is not None:
+        return api_response(400, {"message": bounds_error})
     exclusive_start_key: dict[str, Any] | None = None
     if next_token:
         try:
             exclusive_start_key = _decode_next_token(next_token)
+            if principal:
+                check_start_key(
+                    exclusive_start_key,
+                    _PRINCIPAL_INDEX_KEY_ATTRS,
+                    expected={"principalKey": principal},
+                    prefixes={"resourceRoleKey": f"Namespace::{namespace_id}#"},
+                )
+            else:
+                check_start_key(
+                    exclusive_start_key,
+                    _NAMESPACE_INDEX_KEY_ATTRS,
+                    expected={"namespaceKey": f"NS#{namespace_id}"},
+                )
         except ValueError as exc:
             return api_response(400, {"message": f"Invalid nextToken: {exc}"})
 
@@ -134,7 +157,9 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
             body["nextToken"] = _encode_next_token(result.last_evaluated_key)
         return api_response(200, body)
 
-    except Exception:
+    except Exception as exc:
+        if exclusive_start_key is not None and is_rejected_start_key(exc):
+            return api_response(400, {"message": "Invalid nextToken: not a key for this listing"})
         logger.exception("list_grants_error")
         return api_response(500, {"message": "Internal server error"})
 

@@ -25,9 +25,17 @@ from typing import Any
 import structlog
 from coa_common.smithy_shapes import normalize_dimensions
 
-from ..clients.context_manager import ContextManagerClient
+from ..clients.context_manager import _INVOKE_TIMEOUT_S, ContextManagerClient
 
 logger = structlog.get_logger(__name__)
+
+# ``timeoutMs`` budget accepted on the MCP surface. ``serve.smithy``'s
+# ``Query.timeoutMs`` @range(max: 29000) is the REST bound, set by the API
+# Gateway integration timeout; MCP calls the Context Manager directly over a
+# transport with its own read timeout, so the useful upper bound here is that
+# transport budget — a larger value could never be honoured.
+QUERY_TIMEOUT_MS_MIN = 1
+QUERY_TIMEOUT_MS_MAX = _INVOKE_TIMEOUT_S * 1000
 
 
 class ContextManagerError(Exception):
@@ -104,15 +112,26 @@ async def execute_query(
     ``timeoutMs`` is honoured by the Context Manager (it builds a request-scoped
     deadline from ``options.timeoutMs``, clamping to ``min(transport, caller)``),
     so a caller may ask for a SHORTER budget and get a graceful structured
-    return instead of waiting the full transport budget. Forwarded here on the
-    same terms as the data-layer handler: only a positive numeric value is
-    passed through; zero, negative, non-numeric, or non-integral values are
-    dropped rather than coerced (``int(1.5) == 1`` would smuggle a 1ms budget).
+    return instead of waiting the full transport budget. Validated on the same
+    terms as the data-layer handler, but bounded by the MCP transport timeout
+    (``QUERY_TIMEOUT_MS_MAX``) rather than the REST surface's 29000: a genuine
+    integer in range is forwarded; anything else (``bool``, a float, a string,
+    out of range) is rejected with ``ValueError`` rather than dropped or coerced
+    (``int(1.5) == 1`` would smuggle a 1ms budget).
 
     Returns the ``{result, requestId, sessionId}`` envelope; the caller should
     forward it verbatim so downstream identifiers stay observable in traces.
-    Raises :class:`ContextManagerError` on CM >=400 with the code preserved.
+    Raises :class:`ContextManagerError` on CM >=400 with the code preserved, and
+    ``ValueError`` on an out-of-contract ``timeoutMs`` (before calling the CM).
     """
+    if timeout_ms is not None and (
+        isinstance(timeout_ms, bool)
+        or not isinstance(timeout_ms, int)
+        or not QUERY_TIMEOUT_MS_MIN <= timeout_ms <= QUERY_TIMEOUT_MS_MAX
+    ):
+        raise ValueError(
+            f"Invalid timeoutMs. Must be an integer from {QUERY_TIMEOUT_MS_MIN} to {QUERY_TIMEOUT_MS_MAX}."
+        )
     payload: dict[str, Any] = {
         "query": query,
         "namespace": namespace_id,
@@ -138,19 +157,7 @@ async def execute_query(
     if not include_supporting:
         payload["options"]["includeSupporting"] = False
     if timeout_ms is not None:
-        # Same validation as the data-layer handler (handler.py): only a genuine
-        # positive int is a valid millisecond budget. bool (a subclass of int),
-        # floats, strings and non-positive values are meaningless as a deadline
-        # and are dropped rather than coerced (int(1.5) == 1 would smuggle a 1ms
-        # budget). Kept byte-for-byte consistent so both surfaces behave alike.
-        if isinstance(timeout_ms, bool):
-            _t = 0
-        elif isinstance(timeout_ms, int):
-            _t = timeout_ms
-        else:
-            _t = 0
-        if _t > 0:
-            payload["options"]["timeoutMs"] = _t
+        payload["options"]["timeoutMs"] = timeout_ms
 
     response = await cm_client.invoke(payload, bearer_token)
     _raise_for_cm_error(response)

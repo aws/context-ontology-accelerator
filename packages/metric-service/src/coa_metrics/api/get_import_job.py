@@ -17,6 +17,7 @@ import structlog
 from coa_common.logging import setup_logging
 from coa_common.response import api_response
 
+from coa_metrics.api.contract import JOB_ID_MAX_LENGTH, JOB_ID_MIN_LENGTH, check_string
 from coa_metrics.api.import_job_store import get_job
 
 setup_logging(os.environ.get("LOG_LEVEL", "INFO"))
@@ -31,10 +32,13 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
 
     if not job_id:
         return api_response(400, {"message": "jobId is required"})
+    job_id_error = check_string(job_id, "jobId", min_length=JOB_ID_MIN_LENGTH, max_length=JOB_ID_MAX_LENGTH)
+    if job_id_error:
+        return api_response(400, {"message": job_id_error})
 
     job = get_job(namespace_id, job_id)
     if not job:
-        return api_response(404, {"message": f"Import job '{job_id}' not found"})
+        return api_response(404, {"message": "Import job not found"})
 
     return api_response(
         200,

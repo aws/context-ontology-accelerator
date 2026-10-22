@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import math
+from unittest import mock
 from unittest.mock import MagicMock
 
 import pytest
@@ -29,6 +30,7 @@ from coa_common.constants import GRAPH_BASE_URI
 
 pytestmark = pytest.mark.unit
 
+from coa_ontology.inducer.unstructured.services import class_normalizer
 from coa_ontology.inducer.unstructured.services.class_normalizer import (
     CLOSE_MATCH_THRESHOLD,
     EXACT_THRESHOLD,
@@ -37,6 +39,7 @@ from coa_ontology.inducer.unstructured.services.class_normalizer import (
     _band_for_score,
     _build_embedding_text,
     _cosine,
+    _IndexEntry,
     normalize,
 )
 from coa_ontology.inducer.unstructured.services.iri_resolver import (
@@ -212,6 +215,64 @@ class TestInMemoryClassEmbeddingIndex:
         hits = idx.top_k(_unit(1.0, 0.0), k=2)
         assert [h[1].label for h in hits] == ["Good"]
 
+    def test_find_by_label_matches_lexical_variants(self):
+        idx = InMemoryClassEmbeddingIndex()
+        idx.add("Financial Instrument", "", _unit(1.0, 0.0), "iri-FI")
+
+        for variant in ("financial instrument", "FINANCIAL INSTRUMENT", "  Financial Instrument  "):
+            found = idx.find_by_label(variant)
+            assert found is not None, variant
+            assert found.iri == "iri-FI"
+
+        assert idx.find_by_label("Unrelated") is None
+        assert idx.find_by_label("   ") is None
+
+    def test_find_by_label_is_backed_by_a_lookup_map(self):
+        """The lookup must not re-normalize every stored label per call.
+
+        Regression: ``find_by_label`` scanned ``entries`` and normalized
+        each label on every call, so a deterministic match cost O(n)
+        normalizations and the whole pass over a class population was
+        quadratic.
+        """
+        idx = InMemoryClassEmbeddingIndex()
+        for i in range(50):
+            idx.add(f"Class {i}", "", _unit(1.0, 0.0), f"iri-{i}")
+
+        assert len(idx.entries_by_lookup_key) == 50
+        assert idx.indexed_entry_count == 50
+
+        calls = 0
+        real_key = class_normalizer.normalize_for_lookup_key
+
+        def counting_key(label: str) -> str:
+            nonlocal calls
+            calls += 1
+            return real_key(label)
+
+        with mock.patch.object(class_normalizer, "normalize_for_lookup_key", counting_key):
+            assert idx.find_by_label("class 49").iri == "iri-49"  # type: ignore[union-attr]
+        assert calls == 1
+
+    def test_find_by_label_keeps_the_first_entry_for_a_shared_key(self):
+        idx = InMemoryClassEmbeddingIndex()
+        idx.add("Compressor", "", _unit(1.0, 0.0), "iri-first")
+        idx.add("COMPRESSOR", "", _unit(0.0, 1.0), "iri-second")
+
+        found = idx.find_by_label("compressor")
+        assert found is not None
+        assert found.iri == "iri-first"
+
+    def test_find_by_label_recovers_from_direct_entry_mutation(self):
+        """Entries appended outside ``add`` are still matched."""
+        idx = InMemoryClassEmbeddingIndex()
+        idx.entries.append(_IndexEntry(label="Injected", description="", vector=_unit(1.0, 0.0), iri="iri-injected"))
+
+        found = idx.find_by_label("injected")
+        assert found is not None
+        assert found.iri == "iri-injected"
+        assert idx.indexed_entry_count == 1
+
 
 # ── normalize() ─────────────────────────────────────────────────────────
 
@@ -265,10 +326,59 @@ class TestExactBand:
         assert r.class_iri == _expected_class_iri("X")
         assert r.matched_existing_iri == _expected_class_iri("X")
         assert r.similarity_score == pytest.approx(1.0)
+        assert r.preferred_label == "X"
+        assert r.alternative_labels == ()
         # Resolver MUST NOT be called the second time.
         assert resolver.resolve.call_count == 1
         # Index should still hold exactly one entry.
         assert len(idx) == 1
+
+
+class TestVocabularyLabels:
+    """Exact matches retain the preferred and observed surface forms."""
+
+    def test_semantic_exact_match_records_alternative_label(self):
+        client = MagicMock()
+        client.embed_text.return_value = _unit(1.0, 0.0)
+        resolver = _real_resolver()
+
+        result = normalize(
+            classes={
+                "Compressor": "Equipment that compresses a gas.",
+                "コンプレッサー": "気体を圧縮する装置。",
+            },
+            embedding_client=client,
+            iri_resolver=resolver,
+        )
+
+        canonical = result["Compressor"]
+        alternative = result["コンプレッサー"]
+        assert canonical.preferred_label == "Compressor"
+        assert canonical.alternative_labels == ()
+        assert alternative.band == "exact"
+        assert alternative.class_iri == canonical.class_iri
+        assert alternative.preferred_label == "Compressor"
+        assert alternative.alternative_labels == ("コンプレッサー",)
+
+    def test_safe_lookup_key_variant_reuses_iri_without_embedding(self):
+        client = _scripted_client({"MODEL: identifier": _unit(1.0, 0.0)})
+        resolver = _real_resolver()
+
+        result = normalize(
+            classes={
+                "MODEL": "identifier",
+                "model": "different description",
+            },
+            embedding_client=client,
+            iri_resolver=resolver,
+        )
+
+        assert result["model"].band == "exact"
+        assert result["model"].class_iri == result["MODEL"].class_iri
+        assert result["model"].preferred_label == "MODEL"
+        assert result["model"].alternative_labels == ("model",)
+        client.embed_text.assert_called_once_with("MODEL: identifier")
+        resolver.resolve.assert_called_once_with("MODEL", "class")
 
 
 class TestCloseMatchBand:
@@ -508,6 +618,8 @@ class TestNormalizationResultDataclass:
         )
         assert r.matched_existing_iri is None
         assert r.source_mode is None
+        assert r.preferred_label is None
+        assert r.alternative_labels == ()
 
     def test_full_construction(self):
         r = NormalizationResult(
@@ -520,6 +632,8 @@ class TestNormalizationResultDataclass:
         assert r.band == "close_match"
         assert r.matched_existing_iri == _expected_class_iri("X")
         assert r.source_mode == "schema"
+        assert r.preferred_label is None
+        assert r.alternative_labels == ()
 
 
 class TestIterationOrderEffect:

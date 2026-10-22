@@ -415,6 +415,8 @@ class TestDeleteSingleOntology:
         err_calls = [c for c in mock_upd_reg.call_args_list if "delete_error" in c.kwargs and c.kwargs["delete_error"]]
         assert err_calls, "expected a delete_error to be recorded on graph-delete failure"
         assert "Graph delete failed" in err_calls[0].kwargs["delete_error"]
+        # Returned by ListOntologies as deleteError: the type, never the backend's message.
+        assert err_calls[0].kwargs["delete_error"] == "Graph delete failed: RuntimeError"
         # Hard gate: registry row NOT removed, embeddings + proposals not touched.
         mock_del_reg.assert_not_called()
         mock_vector.delete_embeddings_for_ontology.assert_not_called()
@@ -445,6 +447,7 @@ class TestDeleteSingleOntology:
         err_calls = [c for c in mock_upd_reg.call_args_list if "delete_error" in c.kwargs and c.kwargs["delete_error"]]
         assert err_calls, "expected a delete_error to be recorded on embedding-delete failure"
         assert "Embedding delete failed" in err_calls[0].kwargs["delete_error"]
+        assert "AOSS 503" not in err_calls[0].kwargs["delete_error"]
         # Hard gate: registry row NOT removed, proposals not touched.
         mock_del_reg.assert_not_called()
         mock_del_prop.assert_not_called()

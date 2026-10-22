@@ -32,12 +32,13 @@ class TestDialectHint:
 class TestInvalidDialectMessage:
     def test_athena_gets_trino_hint(self):
         msg = invalid_dialect_message("ATHENA")
-        assert "ATHENA" in msg
+        assert "Athena" in msg
         assert "TRINO" in msg
 
     def test_unknown_dialect_has_no_hint(self):
         msg = invalid_dialect_message("ORACLE")
-        assert "ORACLE" in msg
+        # The caller's value is not reflected back.
+        assert "ORACLE" not in msg
         # Assert on the absence of the HINT, not of the word "TRINO": the base
         # message always lists every valid dialect (see
         # test_base_message_lists_valid_dialects), TRINO among them, so

@@ -3,6 +3,7 @@
 
 import React from "react";
 import { useNavigate, useParams } from "react-router-dom";
+import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
 import {
   Badge,
   Box,
@@ -18,14 +19,16 @@ import {
 } from "@cloudscape-design/components";
 import type { TraceStep } from "@app-types";
 import {
-  humanizeStepId,
+  localizeTraceStep,
   mapTraceStatus,
+  tier2Title,
   CEDAR_STEP_IDS,
   FIREWALL_STEP_IDS,
   GUARDRAIL_STEP_IDS,
 } from "@components/Chat/step-labels";
 import { useTraceData } from "@api-hooks/use-trace-data";
 import { useCurrentNamespace } from "@components/NamespaceProvider";
+import { useAppI18n, type AppTranslate } from "../i18n/LocaleProvider";
 
 function tierBadgeColor(tier: number): "green" | "blue" | "grey" {
   if (tier === 1) return "green";
@@ -33,10 +36,21 @@ function tierBadgeColor(tier: number): "green" | "blue" | "grey" {
   return "grey";
 }
 
-function tierLabel(tier: number): string {
-  if (tier === 1) return "metric";
-  if (tier === 2) return "ontology";
-  return "knowledge";
+/**
+ * Tier outcome badge text. Tier 2 names the strategy that ran (NL→SQL and/or
+ * VKG (Ontop)) through the same tier2Title the Rationale panel uses, so the
+ * two views of one answer agree.
+ */
+function tierOutcome(
+  tier: number,
+  trace: TraceStep[],
+  t: AppTranslate,
+): string {
+  if (tier === 2) return tier2Title(t, trace);
+  return t("Tier {tier} — {label}", {
+    tier,
+    label: tier === 1 ? t("metric") : t("knowledge"),
+  });
 }
 
 function formatDurationMs(ms: number): string {
@@ -44,6 +58,7 @@ function formatDurationMs(ms: number): string {
 }
 
 export function TraceDetail() {
+  const { t } = useAppI18n();
   const { requestId } = useParams<{
     sessionId: string;
     requestId: string;
@@ -57,33 +72,43 @@ export function TraceDetail() {
     retry: fetchRetry,
   } = useTraceData();
 
+  useBreadcrumbTrail([
+    { text: t("Serve") },
+    { text: t("Playground"), href: "/playground" },
+    { text: `Trace ${requestId ?? ""}`.trim() },
+  ]);
+
   if (!resolvedTrace) {
     return (
       <SpaceBetween size="l">
-        <Header variant="h1">Trace detail</Header>
+        <Header variant="h1">{t("Trace detail")}</Header>
         <Container>
           <SpaceBetween size="m">
             {fetching ? (
               <StatusIndicator type="loading">
-                Loading trace for request {requestId ?? "unknown"}...
+                {t("Loading trace for request {id}...", {
+                  id: requestId ?? t("unknown"),
+                })}
               </StatusIndicator>
             ) : fetchError ? (
               <SpaceBetween size="s">
                 <StatusIndicator type="error">{fetchError}</StatusIndicator>
                 <SpaceBetween size="xs" direction="horizontal">
                   <Button onClick={fetchRetry} iconName="refresh">
-                    Retry
+                    {t("Retry")}
                   </Button>
                   <Button
                     variant="link"
                     onClick={() => navigate("/playground")}
                   >
-                    Back to Playground
+                    {t("Back to Playground")}
                   </Button>
                 </SpaceBetween>
               </SpaceBetween>
             ) : (
-              <StatusIndicator type="loading">Loading trace...</StatusIndicator>
+              <StatusIndicator type="loading">
+                {t("Loading trace...")}
+              </StatusIndicator>
             )}
           </SpaceBetween>
         </Container>
@@ -136,21 +161,23 @@ export function TraceDetail() {
             onClick={onBack}
             data-testid="trace-detail-back"
           >
-            Back to Playground
+            {t("Back to Playground")}
           </Button>
         }
       >
-        Trace detail
+        {t("Trace detail")}
       </Header>
 
-      <Container header={<Header variant="h2">Resolution summary</Header>}>
+      <Container
+        header={<Header variant="h2">{t("Resolution summary")}</Header>}
+      >
         <SpaceBetween size="m">
           <ColumnLayout columns={3} variant="text-grid">
             <KeyValuePairs
               items={[
-                { label: "Question", value: userQuery },
+                { label: t("Question"), value: userQuery },
                 {
-                  label: "Answer",
+                  label: t("Answer"),
                   value: content
                     ? content.length > 120
                       ? `${content.slice(0, 120)}...`
@@ -162,19 +189,19 @@ export function TraceDetail() {
             <KeyValuePairs
               items={[
                 {
-                  label: "Total latency",
+                  label: t("Total latency"),
                   value: formatDurationMs(totalLatencyMs),
                 },
                 {
-                  label: "Tier outcome",
+                  label: t("Tier outcome"),
                   value: (
                     <Badge color={tierBadgeColor(tier)}>
-                      Tier {tier} — {tierLabel(tier)}
+                      {tierOutcome(tier, trace, t)}
                     </Badge>
                   ),
                 },
                 {
-                  label: "Request ID",
+                  label: t("Request ID"),
                   value: (
                     <button
                       type="button"
@@ -203,10 +230,10 @@ export function TraceDetail() {
             <KeyValuePairs
               items={[
                 {
-                  label: "Principal",
+                  label: t("Principal"),
                   value: metadata.principal ? (
                     <>
-                      <Badge color="green">human</Badge>{" "}
+                      <Badge color="green">{t("human")}</Badge>{" "}
                       {String(metadata.principal)}
                     </>
                   ) : (
@@ -214,11 +241,11 @@ export function TraceDetail() {
                   ),
                 },
                 {
-                  label: "Namespace",
+                  label: t("Namespace"),
                   value: metadata.namespace ? String(metadata.namespace) : "—",
                 },
                 {
-                  label: "Model",
+                  label: t("Model"),
                   value: metadata.modelId ? String(metadata.modelId) : "—",
                 },
               ]}
@@ -226,25 +253,36 @@ export function TraceDetail() {
           </ColumnLayout>
           <SpaceBetween size="xs">
             <Box variant="small" fontWeight="bold">
-              Boundary controls
+              {t("Boundary controls")}
             </Box>
             <SpaceBetween size="xxs" direction="horizontal">
               <Badge color={boundaryColor(cedarStatus)}>
-                Cedar: {cedarStatus}
+                {t("Cedar: {status}", {
+                  status: boundaryStatusLabel(cedarStatus, t),
+                })}
               </Badge>
               <Badge color={boundaryColor(firewallStatus)}>
-                SQL Firewall: {firewallStatus}
+                {t("SQL Firewall: {status}", {
+                  status: boundaryStatusLabel(firewallStatus, t),
+                })}
               </Badge>
               <Badge color={boundaryColor(guardrailStatus)}>
-                Guardrails: {guardrailStatus}
+                {t("Guardrails: {status}", {
+                  status: boundaryStatusLabel(guardrailStatus, t),
+                })}
               </Badge>
             </SpaceBetween>
           </SpaceBetween>
         </SpaceBetween>
       </Container>
 
-      <Container header={<Header variant="h2">Compiled artifacts</Header>}>
-        <ExpandableSection headerText="SPARQL & SQL" defaultExpanded={true}>
+      <Container
+        header={<Header variant="h2">{t("Compiled artifacts")}</Header>}
+      >
+        <ExpandableSection
+          headerText={t("SPARQL & SQL")}
+          defaultExpanded={true}
+        >
           <SpaceBetween size="s">
             {displaySparql && (
               <Box>
@@ -276,7 +314,7 @@ export function TraceDetail() {
             )}
             {!displaySparql && !displaySql && (
               <Box color="text-body-secondary">
-                No compiled artifacts for this request.
+                {t("No compiled artifacts for this request.")}
               </Box>
             )}
           </SpaceBetween>
@@ -295,6 +333,7 @@ interface IndexedTraceStep extends TraceStep {
 }
 
 function TraceTable({ trace }: { trace: TraceStep[] }) {
+  const { t } = useAppI18n();
   const items: IndexedTraceStep[] = trace.map((step, i) => ({
     ...step,
     _index: i,
@@ -306,25 +345,29 @@ function TraceTable({ trace }: { trace: TraceStep[] }) {
       header={
         <Header
           variant="h2"
-          description="Every tier the request passed through, with the MCP tool invoked and the per-step latency."
+          description={t(
+            "Every tier the request passed through, with the MCP tool invoked and the per-step latency.",
+          )}
         >
-          Tier trace
+          {t("Tier trace")}
         </Header>
       }
       columnDefinitions={[
         {
           id: "step",
-          header: "Step",
+          header: t("Step"),
           cell: (item: IndexedTraceStep) => item._index + 1,
           width: 60,
         },
         {
           id: "tier",
-          header: "Tier",
+          header: t("Tier"),
           cell: (item: IndexedTraceStep) => {
             const tierNum = extractTier(item.step);
             return tierNum ? (
-              <Badge color={tierBadgeColor(tierNum)}>Tier {tierNum}</Badge>
+              <Badge color={tierBadgeColor(tierNum)}>
+                {t("Tier {tier}", { tier: tierNum })}
+              </Badge>
             ) : (
               "—"
             );
@@ -332,27 +375,27 @@ function TraceTable({ trace }: { trace: TraceStep[] }) {
         },
         {
           id: "stage",
-          header: "Stage",
-          cell: (item: IndexedTraceStep) => humanizeStepId(item.step),
+          header: t("Stage"),
+          cell: (item: IndexedTraceStep) => localizeTraceStep(t, item.step),
         },
         {
           id: "status",
-          header: "Status",
+          header: t("Status"),
           cell: (item: IndexedTraceStep) => (
             <StatusIndicator type={mapTraceStatus(item.status)}>
-              {statusLabel(item.status)}
+              {statusLabel(item.status, t)}
             </StatusIndicator>
           ),
         },
         {
           id: "duration",
-          header: "Duration",
+          header: t("Duration"),
           cell: (item: IndexedTraceStep) => formatDurationMs(item.durationMs),
           width: 100,
         },
         {
           id: "detail",
-          header: "Detail",
+          header: t("Detail"),
           cell: (item: IndexedTraceStep) => formatDetail(item.detail),
         },
       ]}
@@ -408,6 +451,21 @@ function boundaryColor(
   return "grey";
 }
 
+function boundaryStatusLabel(status: BoundaryStatus, t: AppTranslate): string {
+  switch (status) {
+    case "allow":
+      return t("allow");
+    case "ok":
+      return t("ok");
+    case "passed":
+      return t("passed");
+    case "blocked":
+      return t("blocked");
+    default:
+      return t("n/a");
+  }
+}
+
 function extractTier(stepId: string): number | null {
   if (stepId.startsWith("t1.") || stepId.startsWith("tier1")) return 1;
   if (stepId.startsWith("t2.") || stepId.startsWith("tier2")) return 2;
@@ -415,17 +473,17 @@ function extractTier(stepId: string): number | null {
   return null;
 }
 
-function statusLabel(status: string): string {
+function statusLabel(status: string, t: AppTranslate): string {
   switch (status) {
     case "success":
-      return "Resolved";
+      return t("Resolved");
     case "miss":
     case "skipped":
-      return "Skipped";
+      return t("Skipped");
     case "error":
-      return "Failed";
+      return t("Failed");
     case "denied":
-      return "Denied";
+      return t("Denied");
     default:
       return status;
   }

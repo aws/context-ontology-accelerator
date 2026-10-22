@@ -58,5 +58,12 @@
     "typescript-eslint": "^8.59.3",
     "vite": "^6.4.3",
     "vitest": "^4.1.11"
+  },
+  "nx": {
+    "targets": {
+      "test": {
+        "inputs": ["default", "^default", "smithyModels"]
+      }
+    }
   }
 }

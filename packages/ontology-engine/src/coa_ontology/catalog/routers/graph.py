@@ -75,6 +75,18 @@ _KIND_TO_REQUIRED_TYPES: dict[str, set[str]] = {
 # Explorer's 100-class fetch chunk).
 _DEFAULT_SEARCH_LIMIT = 50
 _MAX_SEARCH_LIMIT = 500
+# ``offset`` is interpolated into the SPARQL OFFSET clause; bounded so an absurd
+# value is a 400, not a query the store has to walk. Generous on purpose: the
+# class browser pages through every class of an ontology, and induced ontologies
+# reach tens of thousands of classes. Equals the Smithy GraphSearch ``offset``
+# @range max (and GetOntologyOverview's).
+_MAX_SEARCH_OFFSET = 1_000_000
+
+# Fixed client-facing messages: backend exception text (store class names,
+# endpoints) is logged, never returned, and the caller's own URI is not echoed.
+_MSG_LOOKUP_UNSUPPORTED = "Graph lookup is not supported on this backend."
+_MSG_INVALID_VERTEX_URI = "Invalid vertex URI."
+_MSG_VERTEX_NOT_FOUND = "No triples found for this URI in the namespace."
 
 
 def _graph(namespace: str | None) -> GraphStore:
@@ -87,26 +99,24 @@ def _lookup(vertex_uri: str, namespace: str, kind: str) -> GraphVertex:
     try:
         record = graph.get_vertex(vertex_uri, namespace=namespace, label_preference=preference)
     except NotImplementedError as e:
-        raise HTTPException(501, f"Active backend does not support graph lookup: {e}") from e
+        log.warning("graph lookup unsupported by backend: %s", e)
+        raise HTTPException(501, _MSG_LOOKUP_UNSUPPORTED) from e
     except ValueError as e:
-        # _iri() raises ValueError for malformed URIs.
-        raise HTTPException(400, f"Invalid vertex URI: {e}") from e
+        # _iri() raises ValueError for malformed URIs; its text echoes the URI.
+        raise HTTPException(400, _MSG_INVALID_VERTEX_URI) from e
     if record is None:
         # Backend may also return None when the call is unsupported
         # (e.g. Neptune Analytics today).
         if not getattr(graph, "get_vertex", None) or graph.__class__.__name__ == "NeptuneAnalyticsGraphStore":
             raise HTTPException(501, "Vertex lookup is not supported on this backend.")
-        raise HTTPException(
-            404,
-            f"No triples found for '{vertex_uri}' in namespace '{namespace}'.",
-        )
+        raise HTTPException(404, _MSG_VERTEX_NOT_FOUND)
 
     required = _KIND_TO_REQUIRED_TYPES[kind]
     if not (set(record.get("types") or []) & required):
         raise HTTPException(
             404,
             (
-                f"'{vertex_uri}' exists in namespace '{namespace}' but is not a "
+                f"The vertex exists in this namespace but is not a "
                 f"{kind.replace('-', ' ')} (rdf:type = {record.get('types') or []})."
             ),
         )
@@ -155,8 +165,8 @@ def search_entities(
         raise HTTPException(400, "Cannot use both ontology_id and exclude_ontology_id")
     if exclude_ontology_id is not None and not exclude_ontology_id.strip():
         raise HTTPException(400, "exclude_ontology_id cannot be empty")
-    if offset < 0:
-        raise HTTPException(400, "offset cannot be negative")
+    if not 0 <= offset <= _MAX_SEARCH_OFFSET:
+        raise HTTPException(400, f"offset must be between 0 and {_MAX_SEARCH_OFFSET}")
     if not 1 <= limit <= _MAX_SEARCH_LIMIT:
         raise HTTPException(400, f"limit must be between 1 and {_MAX_SEARCH_LIMIT}")
 
@@ -184,7 +194,8 @@ def search_entities(
             exclude_ontology_id=exclude_ontology_id,
         )
     except (NotImplementedError, AttributeError) as e:
-        raise HTTPException(501, f"Active backend does not support entity search: {e}") from e
+        log.warning("entity search unsupported by backend: %s", e)
+        raise HTTPException(501, "Entity search is not supported on this backend.") from e
     return GraphSearchResult(hits=[GraphSearchHit(**r) for r in results], total_count=total)
 
 
@@ -226,9 +237,10 @@ def get_ontology_overview(
             ontology_id, namespace=namespace, sample=sample, label_preference=preference
         )
     except NotImplementedError as e:
-        raise HTTPException(501, f"Active backend does not support ontology overview: {e}") from e
+        log.warning("ontology overview unsupported by backend: %s", e)
+        raise HTTPException(501, "Ontology overview is not supported on this backend.") from e
     except ValueError as e:
-        raise HTTPException(400, f"Invalid ontology id: {e}") from e
+        raise HTTPException(400, "Invalid ontology id.") from e
     except Exception as e:
         log.exception("get_ontology_overview failed for %s in %s", ontology_id, namespace)
         raise HTTPException(500, f"Internal error querying ontology graph: {type(e).__name__}") from e
@@ -297,7 +309,8 @@ def get_namespace_schema(
             label_preference=preference,
         )
     except NotImplementedError as e:
-        raise HTTPException(501, f"Active backend does not support namespace schema: {e}") from e
+        log.warning("namespace schema unsupported by backend: %s", e)
+        raise HTTPException(501, "Namespace schema is not supported on this backend.") from e
     except Exception as e:
         log.exception("get_namespace_schema failed for %s", namespace)
         raise HTTPException(500, f"Internal error querying schema: {type(e).__name__}") from e
@@ -338,11 +351,12 @@ def get_vertex(uri: str, namespace: str = "default"):
     try:
         record = graph.get_vertex(uri, namespace=namespace, label_preference=preference)
     except NotImplementedError as e:
-        raise HTTPException(501, f"Active backend does not support graph lookup: {e}") from e
+        log.warning("graph lookup unsupported by backend: %s", e)
+        raise HTTPException(501, _MSG_LOOKUP_UNSUPPORTED) from e
     except ValueError as e:
-        raise HTTPException(400, f"Invalid vertex URI: {e}") from e
+        raise HTTPException(400, _MSG_INVALID_VERTEX_URI) from e
     if record is None:
-        raise HTTPException(404, f"No triples found for '{uri}' in namespace '{namespace}'.")
+        raise HTTPException(404, _MSG_VERTEX_NOT_FOUND)
     record.setdefault("kind", "unknown")
     record.setdefault("namespace", namespace)
     return GraphVertex(**record)

@@ -601,3 +601,10 @@ class TestInvokeResponse:
         response = InvokeResponse(result=result)
         assert response.requestId is None
         assert response.sessionId is None
+
+
+@pytest.mark.unit
+def test_dimension_integer_beyond_float_range_is_accepted_not_overflow():
+    """An int too large for a float is still a finite number; it must not raise OverflowError (a 500)."""
+    req = InvokeRequest(query="q", namespace="ns", options={"dimensions": [{"name": "year", "value": 10**400}]})
+    assert req.options["dimensions"] == {"year": 10**400}

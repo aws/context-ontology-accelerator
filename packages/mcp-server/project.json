@@ -7,6 +7,7 @@
       "command": "uv run ruff check packages/mcp-server && uv run ruff format --check packages/mcp-server && uv run mypy packages/mcp-server/src --ignore-missing-imports --cache-dir packages/mcp-server/.mypy_cache"
     },
     "test": {
+      "inputs": ["default", "^default", "smithyModels"],
       "command": "COVERAGE_FILE=packages/mcp-server/.coverage uv run pytest packages/mcp-server/tests/unit -m unit -v --tb=short --cov=packages/mcp-server/src --cov-report=term-missing --cov-report=xml:packages/mcp-server/coverage.xml --cov-fail-under=80 --junitxml=packages/mcp-server/junit.xml"
     },
     "format": {

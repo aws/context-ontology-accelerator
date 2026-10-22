@@ -27,7 +27,9 @@ _SMITHY_DIR = Path(__file__).resolve().parents[2] / "models" / "src" / "main" / 
 def _smithy_pattern(filename: str, shape: str) -> re.Pattern[str]:
     """Return the compiled @pattern of ``string <shape>`` in *filename*."""
     text = (_SMITHY_DIR / filename).read_text()
-    match = re.search(rf'@pattern\("((?:[^"\\]|\\.)*)"\)\s*(?:@\w+\([^)]*\)\s*)*string {shape}\b', text)
+    # Other traits may sit between @pattern and the shape, with or without
+    # arguments (e.g. ``@length(max: 256)``, ``@sensitive``).
+    match = re.search(rf'@pattern\("((?:[^"\\]|\\.)*)"\)\s*(?:@\w+(?:\([^)]*\))?\s*)*string {shape}\b', text)
     assert match, f"no @pattern found for {shape} in {filename}"
     # Undo Smithy string escaping (``\\`` -> ``\``) to get the regex source.
     return re.compile(match.group(1).encode().decode("unicode_escape"))

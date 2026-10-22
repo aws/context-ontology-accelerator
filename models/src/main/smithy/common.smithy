@@ -17,9 +17,11 @@ structure ValidationError {
 @mixin
 structure PaginatedInput {
     /// Opaque token from a prior response; pass it to fetch the next page.
-    nextToken: String
+    nextToken: PaginationToken
 
-    /// Maximum number of items to return in a single page.
+    /// Maximum number of items to return in a single page. Each operation
+    /// narrows this to its own server page-size cap.
+    @range(min: 1, max: 1000)
     maxResults: Integer
 }
 
@@ -27,7 +29,7 @@ structure PaginatedInput {
 @mixin
 structure PaginatedOutput {
     /// Opaque token for fetching the next page; absent when there are no more results.
-    nextToken: String
+    nextToken: PaginationToken
 }
 
 // ── Standard error responses ─────────────────────────────────────────
@@ -49,20 +51,37 @@ structure ConflictError {
     message: String
 }
 
-/// Returned with HTTP 503 when a required dependency is temporarily unavailable.
-@error("server")
-@httpError(503)
-structure ServiceUnavailableError {
-    /// Human-readable description of the unavailable dependency or operation.
-    @required
-    message: String
-}
-
 /// Returned with HTTP 403 when the caller lacks permission to perform the requested operation.
 @error("client")
 @httpError(403)
 structure AccessDeniedError {
     /// Human-readable description of the authorization failure.
+    @required
+    message: String
+}
+
+/// Returned with HTTP 500 when the service fails unexpectedly. The message is a
+/// fixed, generic description; the underlying cause is logged, never returned.
+@error("server")
+@httpError(500)
+structure InternalServerError {
+    /// Generic description of the failure; carries no internal detail.
+    @required
+    message: String
+}
+
+/// Returned with HTTP 503 when the service, or a required dependency (including
+/// one it needs to handle the request safely), is temporarily unavailable. For
+/// example, a create that
+/// carries a `clientToken` fails closed with this error when the retry-safety
+/// store cannot be reached, rather than risk running the create twice. Retry
+/// the request (with the same `clientToken`) after a backoff.
+@error("server")
+@httpError(503)
+@retryable
+structure ServiceUnavailableError {
+    /// Description of the unavailable dependency or operation; carries no
+    /// internal detail.
     @required
     message: String
 }
@@ -101,3 +120,26 @@ string S3BucketArn
 @pattern("^arn:(aws|aws-us-gov):iam::\\d{12}:role(/|/[\\u0021-\\u007F]+/)[\\w+=,.@\\-]+$")
 @length(min: 20, max: 2048)
 string IamRoleArn
+
+/// Opaque pagination cursor returned by a list operation as `nextToken`. Pass
+/// it back unchanged to fetch the next page. Sized for the largest cursor any
+/// list operation passes through from an upstream catalog search (8,192
+/// characters); cursors minted from an encoded table key are far shorter.
+@length(min: 1, max: 8192)
+string PaginationToken
+
+/// Caller-chosen token that makes a create request safe to retry. Printable
+/// ASCII, 1-64 characters; a UUID is a good choice.
+@length(min: 1, max: 64)
+@pattern("^[\\x21-\\x7E]+$")
+string ClientToken
+
+/// Ontology identifier: an IRI or URN, e.g. `https://schema.org/` or
+/// `urn:ontology:upload-1a2b3c4d`.
+@length(min: 1, max: 2048)
+string OntologyId
+
+/// Presigned S3 URL. Anyone holding it can read or write the object until it
+/// expires, so it is a bearer credential: generated clients keep it out of logs.
+@sensitive
+string PresignedUrl

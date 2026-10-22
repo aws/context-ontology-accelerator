@@ -17,6 +17,7 @@ import structlog
 from coa_common.logging import setup_logging
 from coa_common.response import api_response
 
+from coa_metrics.api.contract import check_metric_name
 from coa_metrics.api.create_metric import _metric_to_dict
 from coa_metrics.neptune_client import MetricNeptuneClient
 
@@ -41,9 +42,12 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
 
     if not name:
         return api_response(400, {"message": "Metric name is required"})
+    name_error = check_metric_name(name)
+    if name_error:
+        return api_response(400, {"message": name_error})
 
     metric = _get_neptune().get_metric(namespace, name)
     if metric is None:
-        return api_response(404, {"message": f"Metric '{name}' not found in namespace '{namespace}'"})
+        return api_response(404, {"message": "Metric not found in namespace"})
 
     return api_response(200, {"metric": _metric_to_dict(metric)})

@@ -401,7 +401,7 @@ class TestInductionE2E:
         # Step 6: List proposals
         resp = http.get("/ontology/proposals/")
         assert resp.status_code == 200
-        proposals = resp.json()
+        proposals = resp.json()["proposals"]
         assert len(proposals) >= 1
         assert any(p["proposal_id"] == proposal_id for p in proposals)
 
@@ -645,7 +645,7 @@ class TestInductionInFlightVisibilityAndLock:
         # before (indeed without) the worker ever writing the real proposal.
         resp = http.get("/ontology/proposals/")
         assert resp.status_code == 200
-        proposals = resp.json()
+        proposals = resp.json()["proposals"]
         stub = next((p for p in proposals if p["proposal_id"] == job_id), None)
         assert stub is not None, "in-flight induction should be visible in the list immediately"
         assert stub["status"] == "inducing"

@@ -11,7 +11,7 @@ namespace com.amazon.semanticcontext.ontologygraph
 apply ListOntologies @examples([
     {
         title: "List induced ontologies in a namespace"
-        input: { namespaceId: "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d", ontologyType: "induced", limit: 20 }
+        input: { namespaceId: "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d", ontologyType: "induced", maxResults: 20 }
         output: {
             ontologies: [
                 {
@@ -74,7 +74,7 @@ apply DownloadOntology @examples([
 apply FetchOntology @examples([
     {
         title: "Fetch a foundational ontology from a URL"
-        input: { namespaceId: "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d", ontologyId: "foaf", sourceUrl: "http://xmlns.com/foaf/spec/index.rdf" }
+        input: { namespaceId: "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d", ontologyId: "foaf", sourceUrl: "https://xmlns.com/foaf/spec/index.rdf" }
         output: {
             result: { ontologyId: "foaf", classCount: 13, status: "ingested" }
         }

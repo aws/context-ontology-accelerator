@@ -16,65 +16,29 @@ from typing import Any
 import structlog
 from botocore.exceptions import ClientError
 from coa_common import sanitize_principal_key
-from coa_common.authnz_types import PrincipalType, ResourceType
-from coa_common.constants import validate_namespace_id, validate_principal_id
+from coa_common.authnz_types import ResourceType
+from coa_common.constants import validate_namespace_id
 from coa_common.dao import DynamoDBDAO
+from coa_common.idempotency import idempotent
 from coa_common.logging import setup_logging
 from coa_common.response import api_response, get_caller_identity
 
+from .contract import validate_grant_item_keys, validate_grant_overrides, validate_principal_binding
 from .grant_id import encode_grant_id
 
 setup_logging(os.environ.get("LOG_LEVEL", "INFO"))
 logger = structlog.get_logger(__name__)
 
-_VALID_PRINCIPAL_TYPES = {e.value for e in PrincipalType}
 _ROLE_SK_PREFIX = "ROLE#"
 
 
-def _validate_grant_overrides(body: dict[str, Any]) -> str | None:
-    """Validate optional data-access override fields on a grant request.
-
-    Returns ``None`` when valid, or an error message describing the first
-    violation. Mirrors the Smithy contract: ``tableAllowlist`` and
-    ``allowedMetrics`` are ``list[str]``; ``columnDenylist`` is
-    ``dict[str, list[str]]``.
-    """
-    table_allowlist = body.get("tableAllowlist")
-    if table_allowlist is not None:
-        if not isinstance(table_allowlist, list):
-            return "tableAllowlist must be a list of strings"
-        if not all(isinstance(t, str) for t in table_allowlist):
-            return "tableAllowlist must contain only strings"
-
-    allowed_metrics = body.get("allowedMetrics")
-    if allowed_metrics is not None:
-        if not isinstance(allowed_metrics, list):
-            return "allowedMetrics must be a list of strings"
-        if not all(isinstance(m, str) for m in allowed_metrics):
-            return "allowedMetrics must contain only strings"
-
-    column_denylist = body.get("columnDenylist")
-    if column_denylist is not None:
-        # Reject bool explicitly: bool is a subclass of int, but isinstance(True, dict) is False
-        # so the standard check is sufficient.
-        if not isinstance(column_denylist, dict):
-            return "columnDenylist must be a mapping of table name to list of column names"
-        for table, columns in column_denylist.items():
-            if not isinstance(table, str):
-                return "columnDenylist keys must be strings"
-            if not isinstance(columns, list):
-                return f"columnDenylist['{table}'] must be a list of column names"
-            if not all(isinstance(c, str) for c in columns):
-                return f"columnDenylist['{table}'] must contain only strings"
-
-    return None
-
-
+@idempotent(operation="CreateGrant")
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG001
     """Create a namespace-scoped grant binding a principal to a role.
 
     Validates the request body, confirms the role exists in the namespace, and
-    writes the grant record with a duplicate-prevention condition.
+    writes the grant record with a duplicate-prevention condition. Retry-safe
+    when the body carries a ``clientToken`` (see ``coa_common.idempotency``).
 
     Args:
         event: API Gateway proxy event with path parameters and JSON body.
@@ -99,29 +63,22 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
 
     if not body:
         return api_response(400, {"message": "Request body is required"})
+    if not isinstance(body, dict):
+        return api_response(400, {"message": "Request body must be a JSON object"})
 
-    # Validate required fields
-    principal_type = body.get("principalType")
-    principal_id = body.get("principalId")
-    role = body.get("role")
-
-    if not principal_type or not principal_id or not role:
-        return api_response(400, {"message": "principalType, principalId, and role are required"})
-
-    if principal_type not in _VALID_PRINCIPAL_TYPES:
-        return api_response(400, {"message": f"Invalid principalType: {principal_type}"})
-
-    try:
-        validate_principal_id(principal_id)
-    except ValueError as exc:
-        return api_response(400, {"message": str(exc)})
+    binding_error = validate_principal_binding(body)
+    if binding_error is not None:
+        return api_response(400, {"message": binding_error})
+    principal_type = body["principalType"]
+    principal_id = body["principalId"]
+    role = body["role"]
 
     # Validate optional grant overrides — these fields are passed verbatim to
     # the SQL firewall via the principal's resolved profile, so the data shape
     # must be enforced at write time. A malformed value (e.g. tableAllowlist
     # as a string) would otherwise cause runtime errors or silently incorrect
     # authorization (set("orders") iterates over characters).
-    override_error = _validate_grant_overrides(body)
+    override_error = validate_grant_overrides(body)
     if override_error is not None:
         return api_response(400, {"message": override_error})
 
@@ -140,7 +97,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
         # 1. Validate role exists in namespace
         role_item = roles_dao.get({"PK": f"NS#{namespace_id}", "SK": f"{_ROLE_SK_PREFIX}{role}"})
         if not role_item:
-            return api_response(404, {"message": f"Role '{role}' not found in namespace"})
+            return api_response(404, {"message": "Role not found in namespace"})
 
         # 2. Build the grant record
         caller = get_caller_identity(event)
@@ -177,6 +134,9 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
             if body.get(opt) is not None:
                 item[opt] = body[opt]
 
+        key_error = validate_grant_item_keys(item, encode_grant_id(pk, sk))
+        if key_error:
+            return api_response(400, {"message": key_error})
         # 3. Write with condition to prevent duplicates
         mappings_dao.put(item, condition="attribute_not_exists(PK) AND attribute_not_exists(SK)", auto_timestamp=False)
 

@@ -10,6 +10,7 @@
       "command": "uv run ruff check libs/common && uv run ruff format --check libs/common && uv run mypy libs/common/src --ignore-missing-imports --cache-dir libs/common/.mypy_cache"
     },
     "test": {
+      "inputs": ["default", "^default", "smithyModels"],
       "command": "COVERAGE_FILE=libs/common/.coverage uv run pytest libs/common -m unit -v --tb=short --cov=libs/common --cov-report=term-missing --cov-report=xml:libs/common/coverage.xml --cov-fail-under=80 --junitxml=libs/common/junit.xml"
     },
     "format": {

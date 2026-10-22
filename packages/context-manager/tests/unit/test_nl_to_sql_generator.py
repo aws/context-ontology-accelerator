@@ -181,6 +181,55 @@ class TestSQLGeneratorGenerate:
         assert result.retrieved_tables  # retrieval still happened
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("failing", "step"),
+        [("embed", "embed"), ("search", "retrieve"), ("converse", "generate_sql")],
+    )
+    async def test_generate_failure_does_not_leak_exception_message(
+        self, generator, mock_llm, mock_vector, failing, step
+    ):
+        """CWE-209: trace steps and ``result.error`` reach the client, so a backend
+        message (ARNs, hostnames) must not; only the exception type is surfaced."""
+        secret = "arn:aws:iam::123456789012:role/Internal is not authorized"
+        target = mock_vector.search if failing == "search" else getattr(mock_llm, failing)
+        target.side_effect = RuntimeError(secret)
+
+        result = await generator.generate("test", namespace="ns")
+
+        assert secret not in str(result.trace_steps)
+        assert secret not in (result.error or "")
+        failed = next(s for s in result.trace_steps if s.get("step") == step)
+        assert failed["error"] == "RuntimeError"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("failing", "event"),
+        [
+            ("embed", "nl_to_sql_embed_failed"),
+            ("search", "nl_to_sql_retrieve_failed"),
+            ("converse", "nl_to_sql_generate_failed"),
+        ],
+    )
+    async def test_generate_failure_logs_full_exception_server_side(
+        self, generator, mock_llm, mock_vector, failing, event
+    ):
+        """The server-side log keeps the full exception text (only the client-visible
+        trace and ``result.error`` are reduced to the type), so an operator can
+        diagnose a failure whose message is longer than any truncation limit."""
+        import structlog
+
+        detail = "backend failure " + "x" * 300
+        target = mock_vector.search if failing == "search" else getattr(mock_llm, failing)
+        target.side_effect = RuntimeError(detail)
+
+        with structlog.testing.capture_logs() as logs:
+            await generator.generate("test", namespace="ns")
+
+        rec = next(e for e in logs if e.get("event") == event)
+        assert rec["error"] == detail
+        assert rec["error_type"] == "RuntimeError"
+
+    @pytest.mark.asyncio
     async def test_passes_index_and_namespace(self, generator, mock_vector):
         await generator.generate("q", namespace="prod", index="my-idx")
         call_kwargs = mock_vector.search.call_args.kwargs
@@ -854,3 +903,155 @@ class TestSQLGeneratorDialect:
         assert "Athena" in system_prompt
         assert "Trino" in system_prompt
         assert "PostgreSQL" not in system_prompt
+
+
+@pytest.mark.unit
+class TestTablePlacements:
+    """Pooled namespaces: each retrieved table is shown with, and routed to, its database."""
+
+    @pytest.mark.asyncio
+    async def test_database_shown_next_to_the_table(self, generator, mock_llm):
+        seen = {}
+
+        async def resolver(table_sources):
+            seen.update(table_sources)
+            return {"orders": ("ds-sales", "sales_db")}
+
+        result = await generator.generate("How many orders?", namespace="demo", table_placements=resolver)
+
+        assert seen == {"orders": "ds-sales", "customers": "ds-sales"}
+        assert "Table: orders | Database: sales_db (write it as sales_db.orders) | Description:" in result.ddl_context
+        # A table the resolver did not place stays exactly as retrieved.
+        assert "Table: customers | Description: Customer info" in result.ddl_context
+        assert "Database: sales_db" in mock_llm.converse.call_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_unplaced_class_is_routed_to_the_placed_source(self, generator, mock_vector):
+        # A top-down ontology's classes carry no data_source_id. Without a
+        # placement the executor has no source for a bare statement and refuses
+        # it as ambiguous in a namespace with several DATABASE sources.
+        mock_vector.search.return_value = [
+            VectorHit(id="1", text="Table: orders | Columns: id (int)", score=0.9, metadata={}),
+            VectorHit(id="2", text="Table: branches | Columns: id (int)", score=0.8, metadata={}),
+        ]
+
+        async def resolver(_):
+            return {"orders": ("ds-sales", "sales_db"), "branches": ("ds-party", "party_db")}
+
+        result = await generator.generate("How many orders?", namespace="demo", table_placements=resolver)
+
+        assert result.table_sources == {"orders": "ds-sales", "branches": "ds-party"}
+        # The SQL touches only `orders`, so the statement pins that one source.
+        assert result.data_source_id == "ds-sales"
+        assert sql_table_routing(result.sql, result.table_sources) == {"orders": {"datasourceId": "ds-sales"}}
+
+    @pytest.mark.asyncio
+    async def test_hit_source_is_never_overridden(self, generator):
+        async def resolver(_):
+            return {"orders": ("ds-other", "other_db")}
+
+        result = await generator.generate("How many orders?", namespace="demo", table_placements=resolver)
+
+        assert result.table_sources["orders"] == "ds-sales"
+
+    @pytest.mark.asyncio
+    async def test_empty_mapping_leaves_prompt_unchanged(self, mock_llm, mock_vector, fk_adjacency):
+        async def none(_):
+            return {}
+
+        base = await SQLGenerator(llm_client=mock_llm, vector_client=mock_vector, fk_adjacency=fk_adjacency).generate(
+            "q", namespace="demo"
+        )
+        with_resolver = await SQLGenerator(
+            llm_client=mock_llm, vector_client=mock_vector, fk_adjacency=fk_adjacency
+        ).generate("q", namespace="demo", table_placements=none)
+
+        assert with_resolver.ddl_context == base.ddl_context
+        assert with_resolver.table_sources == base.table_sources
+
+    @pytest.mark.asyncio
+    async def test_resolver_failure_degrades_to_bare_tables(self, generator):
+        async def boom(_):
+            raise RuntimeError("registry down")
+
+        result = await generator.generate("q", namespace="demo", table_placements=boom)
+
+        assert result.error is None
+        assert "Database:" not in result.ddl_context
+
+    def test_build_raw_context_single_segment_text(self):
+        hits = [VectorHit(id="1", text="Table: orders", score=1.0, metadata={})]
+
+        assert (
+            _build_raw_context(hits, ["orders"], {"orders": "db"})
+            == "Table: orders | Database: db (write it as db.orders)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_name_gets_no_database_hint(self, generator, mock_vector):
+        # Two classes named `orders` from two sources: main marks the name
+        # ambiguous so the query is refused, and the prompt must not claim one db.
+        mock_vector.search.return_value = [
+            VectorHit(id="1", text="Table: orders | Columns: id (int)", score=0.9, metadata={"data_source_id": "a"}),
+            VectorHit(id="2", text="Table: orders | Columns: id (int)", score=0.8, metadata={"data_source_id": "b"}),
+        ]
+
+        async def resolver(_):
+            return {"orders": ("b", "db_b")}
+
+        result = await generator.generate("q", namespace="demo", table_placements=resolver)
+
+        assert result.table_sources == {"orders": "__ambiguous__"}
+        assert "Database:" not in result.ddl_context
+
+    @pytest.mark.asyncio
+    async def test_walked_lookup_table_is_placed_and_routed(self, mock_llm, mock_vector):
+        # The ontology walk adds `fx_rate` from another database. The graph
+        # carries no source id, so it must be placed like a retrieved table, or the
+        # join runs bare against the default database and fails TABLE_NOT_FOUND.
+        mock_llm.converse.return_value = ConverseResult(
+            text="```sql\nSELECT sum(o.total * f.usd_rate) FROM orders o JOIN fx_rate f ON o.cur = f.cur\n```"
+        )
+        expander = AsyncMock()
+        expander.expand_from.return_value = [
+            {"table": "fx_rate", "schema": "Table: fx_rate | Columns: cur:string, usd_rate:double", "via": "cur"}
+        ]
+        mock_vector.search.return_value[0].metadata["entity_uri"] = "http://x/Orders"
+        seen = {}
+
+        async def resolver(table_sources):
+            seen.update(table_sources)
+            return {"orders": ("ds-sales", "sales_db"), "fx_rate": ("ds-ref", "ref_db")}
+
+        result = await SQLGenerator(llm_client=mock_llm, vector_client=mock_vector).generate(
+            "total in USD?", namespace="demo", graph_expander=expander, table_placements=resolver
+        )
+
+        # The walked table is asked about as unplaced, not left out.
+        assert seen["fx_rate"] == ""
+        assert "Table: fx_rate | Database: ref_db (write it as ref_db.fx_rate) | Columns:" in result.ddl_context
+        assert sql_table_routing(result.sql, result.table_sources) == {
+            "orders": {"datasourceId": "ds-sales"},
+            "fx_rate": {"datasourceId": "ds-ref"},
+        }
+
+    @pytest.mark.asyncio
+    async def test_name_held_by_two_databases_is_routed_ambiguous(self, generator, mock_vector):
+        # The registry marks a name two databases hold; the generator keeps the
+        # marker (so the query is refused) and gives no database hint.
+        mock_vector.search.return_value = [
+            VectorHit(id="1", text="Table: acct_mstr | Columns: id (int)", score=0.9, metadata={}),
+            VectorHit(id="2", text="Table: dim_dt | Columns: id (int)", score=0.8, metadata={}),
+        ]
+
+        async def resolver(_):
+            return {"acct_mstr": ("s-ops", "bank_ops"), "dim_dt": ("__ambiguous__", "")}
+
+        result = await generator.generate("q", namespace="demo", table_placements=resolver)
+
+        assert result.table_sources == {"acct_mstr": "s-ops", "dim_dt": "__ambiguous__"}
+        assert "Table: dim_dt | Columns:" in result.ddl_context
+        assert sql_table_routing("SELECT * FROM acct_mstr a JOIN dim_dt d ON a.id = d.id", result.table_sources) == {
+            "acct_mstr": {"datasourceId": "s-ops"},
+            "dim_dt": {AMBIGUOUS_KEY: "dim_dt"},
+        }

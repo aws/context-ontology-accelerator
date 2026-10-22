@@ -392,16 +392,14 @@ def validate_id(value: str, name: str) -> None:
     """
     if not value or not SAFE_ID_RE.match(value):
         raise ValueError(
-            f"Invalid {name}: {value!r}. "
-            "Must be non-empty and contain only alphanumeric characters, "
-            "hyphens, or underscores."
+            f"Invalid {name}. Must be non-empty and contain only alphanumeric characters, hyphens, or underscores."
         )
 
 
 def validate_namespace_id(value: str, name: str = "namespaceId") -> None:
     """Raise ``ValueError`` if *value* is not a valid UUID v4 namespace ID."""
     if not value or not NAMESPACE_ID_RE.match(value):
-        raise ValueError(f"Invalid {name}: {value!r}. Must be a UUID v4 (e.g. '550e8400-e29b-41d4-a716-446655440000').")
+        raise ValueError(f"Invalid {name}. Must be a UUID v4 (e.g. '550e8400-e29b-41d4-a716-446655440000').")
 
 
 def validate_source_id(value: str, name: str = "sourceId") -> None:
@@ -431,7 +429,7 @@ def validate_namespace_name(value: str) -> None:
     Used for safe interpolation in SPARQL graph URIs and OpenSearch index names.
     """
     if not NAMESPACE_NAME_RE.match(value):
-        raise ValueError(f"Invalid namespace {value!r}: must match ^[a-zA-Z0-9][a-zA-Z0-9_-]{{0,127}}$")
+        raise ValueError("Invalid namespace: must match ^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$")
 
 
 def validate_s3_prefix(value: str, name: str) -> None:
@@ -444,7 +442,7 @@ def validate_s3_prefix(value: str, name: str) -> None:
     if not value:
         return
     if value.startswith("/") or ".." in value or value.startswith("s3://") or not SAFE_S3_PREFIX_RE.match(value):
-        raise ValueError(f"Invalid {name}: {value!r}. Must be a relative path like 'healthcare/' or 'documents/2024/'.")
+        raise ValueError(f"Invalid {name}. Must be a relative path like 'healthcare/' or 'documents/2024/'.")
 
 
 # Grant principal IDs: emails, IdP ``sub`` UUIDs, group names, agent IDs.
@@ -547,7 +545,7 @@ def to_graphrag_tenant_id(namespace_id: str, doc_source_id: str = "") -> str:
         return ""
     stripped = namespace_id.replace("-", "")
     if not _TENANT_ID_HEX_RE.match(stripped):
-        raise ValueError(f"namespace_id must be a hex UUID after hyphen stripping; got {namespace_id!r}")
+        raise ValueError("namespace_id must be a hex UUID after hyphen stripping")
     return stripped[:25]
 
 
@@ -739,7 +737,7 @@ def ontology_artifact_s3_key(namespace: str, version: str, filename: str) -> str
     validate_id(version, "version")
     validate_id(filename.replace(".", ""), "filename")
     if ".." in filename or "/" in filename:
-        raise ValueError(f"Invalid filename: {filename!r}. Must not contain path traversal characters.")
+        raise ValueError("Invalid filename. Must not contain path traversal characters.")
     return f"{ONTOLOGY_ARTIFACTS_PREFIX}/{namespace}/{version}/{filename}"
 
 
@@ -749,6 +747,9 @@ def ontology_artifact_s3_key(namespace: str, version: str, filename: str) -> str
 
 DEFAULT_PAGE_SIZE: int = 25
 MAX_PAGE_SIZE: int = 100
+# common.smithy PaginationToken @length(max: 8192): the longest nextToken a
+# list operation accepts.
+PAGINATION_TOKEN_MAX_LENGTH: int = 8192
 
 
 # ---------------------------------------------------------------------------

@@ -7,6 +7,7 @@
       "command": "uv run ruff check packages/metric-service && uv run ruff format --check packages/metric-service && uv run mypy packages/metric-service/src --ignore-missing-imports --cache-dir packages/metric-service/.mypy_cache"
     },
     "test": {
+      "inputs": ["default", "^default", "smithyModels"],
       "command": "COVERAGE_FILE=packages/metric-service/.coverage uv run pytest packages/metric-service/tests/unit -m unit -v --tb=short --cov=packages/metric-service/src --cov-report=term-missing --cov-report=xml:packages/metric-service/coverage.xml --cov-fail-under=80 --junitxml=packages/metric-service/junit.xml"
     },
     "format": {

@@ -74,6 +74,11 @@ structure RoleDetail {
     cedarPolicy: String
 }
 
+/// Roles are a small fixed set: the built-in roles seeded at deployment and
+/// copied into each namespace when it is created. No operation creates roles,
+/// so the role listings are returned whole rather than paginated; the bound
+/// documents that guarantee.
+@length(max: 100)
 list RoleSummaryList {
     member: RoleSummary
 }
@@ -81,7 +86,8 @@ list RoleSummaryList {
 // ──────────────────────────────────────────────
 // ListPlatformRoles
 // ──────────────────────────────────────────────
-/// List the platform-scoped roles available across the deployment.
+/// List the platform-scoped roles available across the deployment. Not
+/// paginated: the role set is small and fixed (see `RoleSummaryList`).
 @readonly
 @http(method: "GET", uri: "/roles")
 operation ListPlatformRoles {
@@ -102,7 +108,8 @@ structure ListPlatformRolesOutput {
 // ──────────────────────────────────────────────
 // ListNamespaceRoles
 // ──────────────────────────────────────────────
-/// List the roles available within a specific namespace.
+/// List the roles available within a specific namespace. Not paginated: the
+/// role set is small and fixed (see `RoleSummaryList`).
 @readonly
 @http(method: "GET", uri: "/namespaces/{namespaceId}/roles")
 operation ListNamespaceRoles {
@@ -142,6 +149,8 @@ operation GetNamespaceRole {
         /// Unique identifier of the role to retrieve.
         @required
         @httpLabel
+        @length(min: 1, max: 128)
+        @pattern("^[A-Za-z0-9_-]+$")
         roleId: String
     }
 

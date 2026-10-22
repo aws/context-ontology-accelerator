@@ -55,25 +55,11 @@ else
 fi
 
 # ── 3. Container engine (Docker or Finch) ─────────────────────────────────
-# CDK shells out to $CDK_DOCKER (default: docker) for asset bundling.
-CONTAINER_ENGINE=""
-if [ -n "${CDK_DOCKER:-}" ]; then
-  if command -v "$CDK_DOCKER" >/dev/null 2>&1 && "$CDK_DOCKER" info >/dev/null 2>&1; then
-    CONTAINER_ENGINE="$CDK_DOCKER"
-    ok "CDK_DOCKER=$CDK_DOCKER (explicit, daemon running)"
-  else
-    err "CDK_DOCKER=$CDK_DOCKER set but daemon is not reachable"
-  fi
-elif command -v finch >/dev/null 2>&1 && finch info >/dev/null 2>&1; then
-  export CDK_DOCKER=finch
-  CONTAINER_ENGINE=finch
-  ok "Finch daemon running (exported CDK_DOCKER=finch)"
-elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-  CONTAINER_ENGINE=docker
-  ok "Docker daemon running"
-else
-  warn "No container engine running (docker/finch) — local pip bundling must succeed"
-fi
+# A missing engine is an error: five stacks build container images, and there is
+# no local fallback for an image (see the helper for the opt-out).
+# shellcheck source=lib/container-engine.sh source-path=SCRIPTDIR
+source "${REPO_ROOT}/scripts/lib/container-engine.sh"
+coa_check_container_engine
 
 # ── 3b. ARM64 image builds (vkg, serve, mcp) ──────────────────────────────
 # Those stacks pin Platform.LINUX_ARM64 for their image assets. On an x86_64
@@ -208,12 +194,21 @@ else
   warn "No container engine — skipping ECR Public authentication"
 fi
 
-# ── 6. VPC limit check (requires AWS credentials) ────────────────────────
+# ── 6. Pending teardown and VPC limit (requires AWS credentials) ─────────
 # Resolved the way the CDK CLI resolves it, the profile's region included, so
 # preflight validates the same region CDK will actually deploy to.
 # shellcheck source=lib/resolve-region.sh source-path=SCRIPTDIR
 source "${REPO_ROOT}/scripts/lib/resolve-region.sh"
 REGION="$(coa_resolve_region)"
+# A teardown of this deployment that is still waiting for AgentCore to release
+# its ENIs leaves the network stack undeployable for up to 8 hours.
+TEARDOWN_CHECK="$("$REPO_ROOT/scripts/check-teardown-pending.sh" "$REGION" "${SCL_PREFIX:-coa}" "$DEPLOY_ENV")"
+case $? in
+  0) ok "$TEARDOWN_CHECK" ;;
+  2) warn "$TEARDOWN_CHECK" ;;
+  *) err "$TEARDOWN_CHECK" ;;
+esac
+
 VPC_CHECK="$("$REPO_ROOT/scripts/check-vpc-limit.sh" "$REGION" "${SCL_PREFIX:-coa}-${DEPLOY_ENV}-network")"
 case $? in
   0) ok "$VPC_CHECK" ;;

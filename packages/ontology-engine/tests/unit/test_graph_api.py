@@ -376,10 +376,11 @@ class TestSearchEntities:
         assert call_kwargs["limit"] == 10
 
     def test_501_when_backend_unsupported(self, _patch_build_stores):
-        _patch_build_stores.mock_graph.search_entities.side_effect = NotImplementedError("nope")
+        _patch_build_stores.mock_graph.search_entities.side_effect = NotImplementedError("NeptuneStore.search_x")
         resp = client.get("/graph/search", params={"q": "x", "namespace": "default"})
         assert resp.status_code == 501
-        assert "does not support" in resp.json()["detail"]
+        assert resp.json()["detail"] == "Entity search is not supported on this backend."
+        assert "NeptuneStore" not in resp.text
 
     def test_exclude_ontology_id_passed_to_store(self, _patch_build_stores):
         _patch_build_stores.mock_graph.search_entities.return_value = []
@@ -626,10 +627,11 @@ class TestNamespaceSchema:
         assert call_kwargs["max_results"] == 50
 
     def test_501_when_backend_unsupported(self, _patch_build_stores):
-        _patch_build_stores.mock_graph.get_namespace_schema.side_effect = NotImplementedError("not supported")
+        _patch_build_stores.mock_graph.get_namespace_schema.side_effect = NotImplementedError("NeptuneStore.schema_x")
         resp = client.get("/graph/schema", params={"namespace": "default"})
         assert resp.status_code == 501
-        assert "does not support" in resp.json()["detail"]
+        assert resp.json()["detail"] == "Namespace schema is not supported on this backend."
+        assert "NeptuneStore" not in resp.text
 
     def test_500_on_unexpected_error(self, _patch_build_stores):
         _patch_build_stores.mock_graph.get_namespace_schema.side_effect = RuntimeError("boom")

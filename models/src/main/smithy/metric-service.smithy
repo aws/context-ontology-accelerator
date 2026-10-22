@@ -6,10 +6,13 @@ $version: "2"
 namespace com.amazon.semanticcontext.metric
 
 use com.amazon.semanticcontext.common#AccessDeniedError
+use com.amazon.semanticcontext.common#ClientToken
 use com.amazon.semanticcontext.common#ConflictError
 use com.amazon.semanticcontext.common#NotFoundError
 use com.amazon.semanticcontext.common#PaginatedInput
 use com.amazon.semanticcontext.common#PaginatedOutput
+use com.amazon.semanticcontext.common#PaginationToken
+use com.amazon.semanticcontext.common#PresignedUrl
 use com.amazon.semanticcontext.common#Uuid
 use com.amazon.semanticcontext.common#ValidationError
 
@@ -120,24 +123,30 @@ structure MetricExpression {
 /// AI context for metric discoverability.
 structure MetricAiContext {
     /// Alternative names the metric may be referred to by.
+    @length(max: 1000)
     synonyms: SynonymList
 
     /// Free-text guidance for how to use or interpret the metric.
+    @length(max: 10000)
     instructions: String
 
     /// Example questions or usages illustrating the metric.
+    @length(max: 1000)
     examples: ExampleList
 }
 
 list SynonymList {
+    @length(max: 2048)
     member: String
 }
 
 list ExampleList {
+    @length(max: 4096)
     member: String
 }
 
 list OntologyConceptList {
+    @length(max: 2048)
     member: String
 }
 
@@ -224,6 +233,7 @@ operation CreateMetric {
 
         /// Human-readable description of what the metric measures.
         @required
+        @length(max: 10000)
         description: String
 
         @required
@@ -238,15 +248,25 @@ operation CreateMetric {
         defaultTimeGrain: TimeGrain
 
         /// Unit of measure for the metric value (e.g. "USD", "count").
+        @length(max: 1024)
         unit: String
 
         /// Data type of the value the metric returns (e.g. "integer", "decimal").
+        @length(max: 1024)
         returnType: String
 
         aiContext: MetricAiContext
 
         /// Ontology concept URIs this metric is associated with.
+        @length(max: 1000)
         ontologyConcepts: OntologyConceptList
+
+        /// Optional idempotency token. A retry with the same token and the same
+        /// parameters within 24 hours returns the original result instead of creating
+        /// a duplicate; reusing the token with different parameters is rejected with
+        /// ConflictError (409).
+        @idempotencyToken
+        clientToken: ClientToken
     }
 
     output: CreateMetricOutput
@@ -305,6 +325,7 @@ structure GetMetricOutput {
 /// List metric definitions in a namespace, optionally filtered by data source or source table.
 @readonly
 @http(method: "GET", uri: "/namespaces/{namespaceId}/metrics")
+@paginated(inputToken: "nextToken", outputToken: "nextToken", pageSize: "maxResults", items: "metrics")
 operation ListMetrics {
     input := with [PaginatedInput] {
         @required
@@ -313,10 +334,11 @@ operation ListMetrics {
 
         /// Pagination token from a previous response; omit for the first page.
         @httpQuery("nextToken")
-        nextToken: String
+        nextToken: PaginationToken
 
         /// Maximum number of metrics to return in one page.
         @httpQuery("maxResults")
+        @range(min: 1, max: 200)
         maxResults: Integer
 
         @httpQuery("dataSourceId")
@@ -358,6 +380,7 @@ operation UpdateMetric {
 
         /// Human-readable description of what the metric measures.
         @required
+        @length(max: 10000)
         description: String
 
         @required
@@ -372,14 +395,17 @@ operation UpdateMetric {
         defaultTimeGrain: TimeGrain
 
         /// Unit of measure for the metric value (e.g. "USD", "count").
+        @length(max: 1024)
         unit: String
 
         /// Data type of the value the metric returns (e.g. "integer", "decimal").
+        @length(max: 1024)
         returnType: String
 
         aiContext: MetricAiContext
 
         /// Ontology concept URIs this metric is associated with.
+        @length(max: 1000)
         ontologyConcepts: OntologyConceptList
     }
 
@@ -430,6 +456,8 @@ operation DeleteMetric {
 // ──────────────────────────────────────────────
 /// Validate a metric definition without persisting it. ERROR findings predict
 /// create/update rejection; INFO findings are advisory.
+///
+/// Takes no `clientToken`: nothing is persisted, so a retry simply validates again.
 @http(method: "POST", uri: "/namespaces/{namespaceId}/metrics/validate")
 operation ValidateMetric {
     input := {
@@ -442,6 +470,7 @@ operation ValidateMetric {
 
         /// Human-readable description of what the metric measures.
         @required
+        @length(max: 10000)
         description: String
 
         @required
@@ -456,14 +485,17 @@ operation ValidateMetric {
         defaultTimeGrain: TimeGrain
 
         /// Unit of measure for the metric value (e.g. "USD", "count").
+        @length(max: 1024)
         unit: String
 
         /// Data type of the value the metric returns (e.g. "integer", "decimal").
+        @length(max: 1024)
         returnType: String
 
         aiContext: MetricAiContext
 
         /// Ontology concept URIs this metric is associated with.
+        @length(max: 1000)
         ontologyConcepts: OntologyConceptList
     }
 
@@ -488,6 +520,10 @@ structure ValidateMetricOutput {
 // ──────────────────────────────────────────────
 /// Delete multiple metrics by name list or filter criteria.
 /// Returns the count of metrics deleted.
+///
+/// Takes no `clientToken`: deletion is naturally idempotent. A retry deletes
+/// nothing further; metrics already removed are reported in `notFound` (names)
+/// or are simply no longer matched (filter / deleteAll).
 @http(method: "POST", uri: "/namespaces/{namespaceId}/bulk-delete-metrics")
 operation BulkDeleteMetrics {
     input := {
@@ -496,11 +532,16 @@ operation BulkDeleteMetrics {
         namespaceId: Uuid
 
         /// Explicit list of metric names to delete. Mutually exclusive with filter.
+        @length(max: 2000)
         names: MetricNameList
 
         /// Filter criteria — deletes all metrics matching the filter.
         /// Mutually exclusive with names.
         filter: BulkDeleteFilter
+
+        /// Delete every metric in the namespace (used by namespace deletion).
+        /// Mutually exclusive with names and filter.
+        deleteAll: Boolean
     }
 
     output := {
@@ -525,12 +566,15 @@ list MetricNameList {
 /// Filter criteria selecting which metrics a bulk delete should remove.
 structure BulkDeleteFilter {
     /// Delete all metrics with this data source ID.
+    @length(max: 128)
     dataSourceId: String
 
     /// Delete all metrics with this source table.
+    @length(max: 256)
     sourceTable: String
 
     /// Delete all metrics whose name matches this prefix.
+    @length(max: 128)
     namePrefix: String
 }
 
@@ -547,17 +591,27 @@ operation ImportOsi {
 
         /// OSI YAML content as a string (inline). Mutually exclusive with s3Key.
         /// Maximum 5MB for inline content; use GetOsiUploadUrl + s3Key for larger files.
+        @length(max: 5242880)
         content: String
 
         /// S3 object key containing the OSI YAML (for large files uploaded via GetOsiUploadUrl).
         /// Mutually exclusive with content.
+        @length(min: 1, max: 1024)
         s3Key: String
+
+        /// Optional idempotency token. A retry with the same token and the same
+        /// parameters within 24 hours returns the original result instead of creating
+        /// a duplicate; reusing the token with different parameters is rejected with
+        /// ConflictError (409).
+        @idempotencyToken
+        clientToken: ClientToken
     }
 
     output: ImportOsiOutput
 
     errors: [
         ValidationError
+        ConflictError
         AccessDeniedError
     ]
 }
@@ -623,6 +677,7 @@ operation GetImportJob {
         /// Identifier of the async import job to poll.
         @required
         @httpLabel
+        @length(min: 1, max: 128)
         jobId: String
     }
 
@@ -670,6 +725,9 @@ structure ImportJobOutput {
 // ──────────────────────────────────────────────
 /// Generate a pre-signed S3 PUT URL for uploading large OSI YAML files.
 /// After uploading, call ImportOsi with the returned s3Key.
+///
+/// Takes no `clientToken`: it creates no server-side resource. A retry mints a
+/// fresh URL under a new key; an unused URL simply expires.
 @http(method: "POST", uri: "/namespaces/{namespaceId}/import-osi/upload-url")
 operation GetOsiUploadUrl {
     input := {
@@ -679,13 +737,14 @@ operation GetOsiUploadUrl {
 
         /// Original filename (used for content-type validation).
         @required
+        @length(min: 1, max: 255)
         filename: String
     }
 
     output := {
         /// Pre-signed S3 PUT URL. Upload the YAML file here with Content-Type: application/x-yaml.
         @required
-        uploadUrl: String
+        uploadUrl: PresignedUrl
 
         /// S3 key to pass to ImportOsi after upload completes.
         @required
@@ -723,6 +782,7 @@ operation ExportOsi {
         /// e.g. ?names=a&names=b). Omit to export every metric in the
         /// namespace (default, unchanged behavior).
         @httpQuery("names")
+        @length(max: 512)
         names: MetricNameList
     }
 
@@ -753,7 +813,7 @@ structure ExportOsiOutput {
     content: String
 
     /// Pre-signed S3 GET URL for downloading the export (populated when format=s3).
-    downloadUrl: String
+    downloadUrl: PresignedUrl
 
     /// Seconds until the download URL expires (populated when format=s3).
     expiresIn: Integer

@@ -2120,3 +2120,11 @@ class TestNamespaceLanguagePrompts:
         assert SourceStatus.SCAN_FAILED in update_kwargs["ExpressionAttributeValues"].values()
         tables_opened = [c.args[0] for c in mock_ddb_boto.resource.return_value.Table.call_args_list]
         assert tables_opened == [_BASE_ENV["DOC_SOURCES_TABLE"]]
+
+
+@pytest.mark.unit
+def test_stage_failure_message_is_fixed_text_without_traceback(mod):
+    """errorMessage is returned to callers by GetSource; the traceback stays in the log."""
+    msg = mod._stage_failure_message("SCAN_FAILED_BUILD")
+    assert msg.startswith("SCAN_FAILED_BUILD: ")
+    assert "Traceback" not in msg and "File " not in msg

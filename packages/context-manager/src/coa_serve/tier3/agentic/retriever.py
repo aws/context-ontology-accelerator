@@ -50,7 +50,9 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from ...namespace_language import current_label_preference
 from ...query_utils import validate_namespace
+from ...trace import client_error_detail
 from ..knowledge_retriever import Tier3Result
 from .budget import BudgetClock
 from .context import AccumulatedContext
@@ -346,8 +348,21 @@ class AgenticRetriever:
 
         # 1. Decompose the question into >= 1 Sub_Questions (Req 13.1-13.3). The
         # decomposer is best-effort and never raises (it degrades to a single
-        # Sub_Question), so no guard is needed here.
-        sub_questions = await self._decomposer.decompose(query, trace)
+        # Sub_Question), so no guard is needed here. The same call reports the
+        # question's language, resolved once, so the planner and synthesizer are
+        # told the language rather than each guessing it.
+        decompose_with_language = getattr(self._decomposer, "decompose_with_language", None)
+        if callable(decompose_with_language):
+            sub_questions, detected = await decompose_with_language(query, trace)
+        else:
+            sub_questions, detected = await self._decomposer.decompose(query, trace), ""
+        ctx.answer_language = detected or (current_label_preference().preferred_tag or "")
+        trace.record(
+            "answer_language",
+            "success" if ctx.answer_language else "skipped",
+            clock.elapsed_ms(),
+            detail=ctx.answer_language or "unresolved; prompts match the question's language",
+        )
 
         # 2. Run the initial (independent) Sub_Questions concurrently: each gets a
         # private forked sub-context (own seen_keys, own local branch queue) while the
@@ -710,7 +725,7 @@ class AgenticRetriever:
                 "llm_synthesize",
                 "error",
                 clock.elapsed_ms(),
-                detail={"error": type(exc).__name__, "message": str(exc)[:200]},
+                detail=client_error_detail(exc),
                 tool_used="bedrock",
             )
             return self._build_result(
@@ -804,6 +819,9 @@ class AgenticRetriever:
         # idea-2 ablation (complement): withhold the working answer from synthesis
         # while keeping the chunks — isolates idea 2's synthesis contribution.
         working_answer = "" if self._synthesize_without_working_answer else ctx.working_answer
+        # Only pass the resolved language when there is one, so a synthesizer that
+        # predates the parameter keeps working on an unresolved session.
+        language = {"answer_language": ctx.answer_language} if ctx.answer_language else {}
         if on_token is not None and hasattr(self._synthesizer, "synthesize_stream"):
             return await self._synthesizer.synthesize_stream(
                 query,
@@ -814,6 +832,7 @@ class AgenticRetriever:
                 conversation_history=conversation_history,
                 on_token=on_token,
                 working_answer=working_answer,
+                **language,
             )
         return await self._synthesizer.synthesize(
             query,
@@ -823,6 +842,7 @@ class AgenticRetriever:
             catalog_summary=catalog_summary,
             conversation_history=conversation_history,
             working_answer=working_answer,
+            **language,
         )
 
     # ── context → result mappers (Req 8.2) ─────────────────────────────

@@ -13,9 +13,9 @@ import pytest
 MODULE = "coa_control_plane.namespace.update_handler"
 
 _NS_ITEM = {
-    "PK": "NS#ns-123",
+    "PK": "NS#11111111-1111-4111-8111-111111111111",
     "SK": "METADATA",
-    "namespaceId": "ns-123",
+    "namespaceId": "11111111-1111-4111-8111-111111111111",
     "name": "sales",
     "displayName": "Sales Domain",
     "description": "Sales data",
@@ -57,7 +57,7 @@ class TestUpdateNamespace:
             from coa_control_plane.namespace.update_handler import handler
 
             event = {
-                "pathParameters": {"namespaceId": "ns-123"},
+                "pathParameters": {"namespaceId": "11111111-1111-4111-8111-111111111111"},
                 "httpMethod": "PUT",
                 "resource": "/namespaces/{namespaceId}",
                 "body": json.dumps({"displayName": "New Name"}),
@@ -78,7 +78,7 @@ class TestUpdateNamespace:
             from coa_control_plane.namespace.update_handler import handler
 
             event = {
-                "pathParameters": {"namespaceId": "ns-999"},
+                "pathParameters": {"namespaceId": "99999999-9999-4999-8999-999999999999"},
                 "body": json.dumps({"displayName": "x"}),
                 "httpMethod": "PUT",
                 "resource": "/namespaces/{namespaceId}",
@@ -96,7 +96,7 @@ class TestUpdateNamespace:
             from coa_control_plane.namespace.update_handler import handler
 
             event = {
-                "pathParameters": {"namespaceId": "ns-123"},
+                "pathParameters": {"namespaceId": "11111111-1111-4111-8111-111111111111"},
                 "body": json.dumps({"unknownField": "x"}),
                 "httpMethod": "PUT",
                 "resource": "/namespaces/{namespaceId}",
@@ -114,7 +114,7 @@ class TestNamespaceLanguageImmutable:
         with patch(f"{MODULE}._get_ns_dao", return_value=dao):
             return handler(
                 {
-                    "pathParameters": {"namespaceId": "ns-123"},
+                    "pathParameters": {"namespaceId": "11111111-1111-4111-8111-111111111111"},
                     "httpMethod": "PUT",
                     "resource": "/namespaces/{namespaceId}",
                     "body": json.dumps(body),
@@ -168,7 +168,7 @@ class TestUpdateNamespaceInputValidation:
             from coa_control_plane.namespace.update_handler import handler
 
             event = {
-                "pathParameters": {"namespaceId": "ns-123"},
+                "pathParameters": {"namespaceId": "11111111-1111-4111-8111-111111111111"},
                 "body": json.dumps(body),
                 "httpMethod": "PUT",
                 "resource": "/namespaces/{namespaceId}",

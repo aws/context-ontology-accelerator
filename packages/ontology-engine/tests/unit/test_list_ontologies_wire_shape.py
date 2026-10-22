@@ -51,8 +51,8 @@ SAMPLE_ROW = {
 @pytest.fixture
 def _registry_rows():
     with patch(
-        "coa_ontology.catalog.routers.ontologies.dynamo_store.list_ontologies_registry",
-        return_value=[SAMPLE_ROW],
+        "coa_ontology.catalog.routers.ontologies.dynamo_store.list_ontologies_registry_page",
+        return_value=([SAMPLE_ROW], None),
     ) as p:
         yield p
 
@@ -101,8 +101,8 @@ class TestListOntologiesWireShape:
     def test_empty_registry_still_returns_the_envelope(self):
         """An empty namespace yields ``{"ontologies": []}``, not ``[]`` or ``null``."""
         with patch(
-            "coa_ontology.catalog.routers.ontologies.dynamo_store.list_ontologies_registry",
-            return_value=[],
+            "coa_ontology.catalog.routers.ontologies.dynamo_store.list_ontologies_registry_page",
+            return_value=([], None),
         ):
             body = client.get("/ontologies/", params={"namespace": "ns"}).json()
         assert body == {"ontologies": []}

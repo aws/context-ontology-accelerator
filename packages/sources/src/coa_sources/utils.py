@@ -56,7 +56,7 @@ def _clean_vocabulary(values: list[Any], *, field: str) -> list[str]:
             continue
         key = entry.lower()
         if key in seen:
-            raise ValueError(f"{field} contains duplicate entry {entry!r}.")
+            raise ValueError(f"{field} contains a duplicate entry (entries are compared case-insensitively).")
         seen.add(key)
         cleaned.append(entry)
 
@@ -89,10 +89,7 @@ def merge_extraction_config(config: object) -> dict[str, Any]:
     else:
         return result
     if "extraction_mode" in overrides and overrides["extraction_mode"] not in _VALID_EXTRACTION_MODES:
-        raise ValueError(
-            f"Invalid extractionMode: {overrides['extraction_mode']!r}. "
-            f"Must be one of: {', '.join(sorted(_VALID_EXTRACTION_MODES))}."
-        )
+        raise ValueError(f"Invalid extractionMode: must be one of: {', '.join(sorted(_VALID_EXTRACTION_MODES))}.")
     # Both lists get identical treatment: the toolkit imposes no format on either.
     if "preferred_entity_classifications" in overrides:
         overrides["preferred_entity_classifications"] = _clean_vocabulary(

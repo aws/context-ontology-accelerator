@@ -24,6 +24,7 @@ from typing import Any
 import boto3
 import structlog
 from coa_common.constants import EVENT_SOURCE_PREFIX
+from coa_common.idempotency import idempotent
 from coa_common.logging import setup_logging
 from coa_common.response import api_response, get_caller_identity
 from coa_control_plane_server.models.create_metric_request_content import (
@@ -88,8 +89,14 @@ def _get_eventbridge() -> Any:
 # ── Handler ─────────────────────────────────────────────────────────────
 
 
+@idempotent(operation="CreateMetric")
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
-    """API Gateway proxy-integration Lambda handler for POST /namespaces/{ns}/metrics."""
+    """API Gateway proxy-integration Lambda handler for POST /namespaces/{ns}/metrics.
+
+    Retry-safe when the body carries a ``clientToken``: the token is validated,
+    removed from the body, and used to replay the original response for a
+    retried request (see ``coa_common.idempotency``).
+    """
     namespace = event.get("pathParameters", {}).get("namespaceId", "")
     caller = get_caller_identity(event)
     logger.info("create_metric", namespace=namespace, caller=caller)

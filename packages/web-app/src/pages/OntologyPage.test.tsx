@@ -163,14 +163,14 @@ const listOntologies = vi.fn();
 const listFoundationalOntologies = vi.fn();
 const loadFoundationalOntology = vi.fn();
 const getOntologyIngestStatus = vi.fn();
-const listProposals = vi.fn();
+const listAllProposals = vi.fn();
 const triggerInduction = vi.fn();
 const deleteOntology = vi.fn();
 vi.mock("../services/ontology-engine", () => ({
   listOntologies: (...args: unknown[]) => listOntologies(...args),
   listFoundationalOntologies: (...args: unknown[]) =>
     listFoundationalOntologies(...args),
-  listProposals: (...args: unknown[]) => listProposals(...args),
+  listAllProposals: (...args: unknown[]) => listAllProposals(...args),
   listInducedDatasources: vi.fn().mockResolvedValue([]),
   listInducedDatasource: vi.fn(),
   triggerInduction: (...args: unknown[]) => triggerInduction(...args),
@@ -260,7 +260,7 @@ describe("OntologiesTab Actions cell", () => {
     vi.clearAllMocks();
     // Default: no proposals → induction lock stays open. Individual tests
     // override to exercise the in-progress / awaiting-review lock.
-    listProposals.mockResolvedValue([]);
+    listAllProposals.mockResolvedValue([]);
     // Default: sources API succeeds with empty lists. Individual tests override.
     mockApiGet.mockResolvedValue({ items: [] });
   });
@@ -537,7 +537,7 @@ describe("Induce Ontology modal — grounding is available for both strategies",
     vi.clearAllMocks();
     listOntologies.mockResolvedValue([]);
     listFoundationalOntologies.mockResolvedValue({ items: [] });
-    listProposals.mockResolvedValue([]);
+    listAllProposals.mockResolvedValue([]);
     mockApiGet.mockResolvedValue({ items: [] });
   });
 
@@ -752,7 +752,7 @@ describe("Induction in-flight visibility + trigger lock (issue I-3f1f50cc)", () 
     vi.clearAllMocks();
     listOntologies.mockResolvedValue([]);
     listFoundationalOntologies.mockResolvedValue({ items: [] });
-    listProposals.mockResolvedValue([]);
+    listAllProposals.mockResolvedValue([]);
   });
 
   function proposal(overrides: Record<string, unknown>) {
@@ -776,7 +776,7 @@ describe("Induction in-flight visibility + trigger lock (issue I-3f1f50cc)", () 
     // Cloudscape Tabs -> SortableTable -> 4s-poll stack in jsdom is flaky (the
     // live poll interval prevents the tab-content render from settling). The
     // server->component wiring that DECIDES a row is "inducing" is covered by
-    // the trigger-lock tests below, which read listProposals end-to-end.
+    // the trigger-lock tests below, which read listAllProposals end-to-end.
     expect(proposalStatusDisplay("inducing")).toEqual({
       type: "in-progress",
       label: "Inducing…",
@@ -807,7 +807,7 @@ describe("Induction in-flight visibility + trigger lock (issue I-3f1f50cc)", () 
   });
 
   it("locks the Start-induction button when a proposal is in flight (survives refresh via server state)", async () => {
-    listProposals.mockResolvedValue([proposal({ status: "inducing" })]);
+    listAllProposals.mockResolvedValue([proposal({ status: "inducing" })]);
     renderPage();
     // The header Start-induction button is disabled purely from the server
     // proposal list (no in-session trigger needed) — this is the refresh-safe
@@ -819,7 +819,7 @@ describe("Induction in-flight visibility + trigger lock (issue I-3f1f50cc)", () 
   });
 
   it("keeps Start-induction enabled when there are no in-flight/pending proposals", async () => {
-    listProposals.mockResolvedValue([proposal({ status: "accepted" })]);
+    listAllProposals.mockResolvedValue([proposal({ status: "accepted" })]);
     renderPage();
     await waitFor(() => {
       const btn = screen.getByText("Start induction").closest("button");
@@ -828,7 +828,7 @@ describe("Induction in-flight visibility + trigger lock (issue I-3f1f50cc)", () 
   });
 
   it("also locks when a completed proposal is awaiting review (pending)", async () => {
-    listProposals.mockResolvedValue([proposal({ status: "pending" })]);
+    listAllProposals.mockResolvedValue([proposal({ status: "pending" })]);
     renderPage();
     await waitFor(() => {
       const btn = screen.getByText("Start induction").closest("button");
@@ -843,7 +843,7 @@ describe("Ontology page — re-scanned-source warning", () => {
     vi.clearAllMocks();
     listOntologies.mockResolvedValue([]);
     listFoundationalOntologies.mockResolvedValue({ items: [] });
-    listProposals.mockResolvedValue([]);
+    listAllProposals.mockResolvedValue([]);
   });
 
   const WARNING = /A re-scanned source has an out-of-date induction/;
@@ -888,9 +888,9 @@ describe("Ontology page — re-scanned-source warning", () => {
         expect.stringContaining("/sources/src-1/scan"),
       ),
     );
-    await waitFor(() => expect(listProposals).toHaveBeenCalled());
+    await waitFor(() => expect(listAllProposals).toHaveBeenCalled());
     // The banner state is set inside a Promise.all(...).then(...) that resolves
-    // several microtasks after the scan fetch is issued (and listProposals is
+    // several microtasks after the scan fetch is issued (and listAllProposals is
     // also called by a separate effect, so the wait above does not sync this
     // chain). A macrotask boundary drains all pending microtasks, so after this
     // the staleness callback has run and re-rendered — otherwise a "does NOT
@@ -902,13 +902,51 @@ describe("Ontology page — re-scanned-source warning", () => {
 
   it("warns when the source was re-scanned after its latest induction", async () => {
     mockSourceRescannedAt("2026-06-01T00:00:00Z");
-    listProposals.mockResolvedValue([
+    listAllProposals.mockResolvedValue([
       inductionProposal("src-1", "2026-01-01T00:00:00Z"), // induction is older
     ]);
     renderPage();
     await screen.findByText(WARNING);
     // The banner names the stale source.
     await screen.findByText(/Orders DB/);
+  });
+
+  it("pages the scan history until it finds the newest re-scan", async () => {
+    // ListSourceScanJobs is paginated newest first: the re-scan can sit past a
+    // first page of ordinary scan rows, or past an empty page with a token.
+    mockApiGet.mockImplementation((url: unknown) => {
+      const path = String(url);
+      if (path.includes("sourceType=DATABASE")) {
+        return Promise.resolve({
+          items: [{ sourceId: "src-1", name: "Orders DB", status: "APPROVED" }],
+        });
+      }
+      if (path.endsWith("/sources/src-1/scan")) {
+        return Promise.resolve({
+          items: [{ eventType: "SCAN", at: "2026-07-01T00:00:00Z" }],
+          nextToken: "a",
+        });
+      }
+      if (path.endsWith("/sources/src-1/scan?nextToken=a")) {
+        return Promise.resolve({ items: [], nextToken: "b" });
+      }
+      if (path.endsWith("/sources/src-1/scan?nextToken=b")) {
+        return Promise.resolve({
+          items: [
+            { eventType: "REVIEW", isRescan: true, at: "2026-06-01T00:00:00Z" },
+          ],
+        });
+      }
+      return Promise.resolve({ items: [] });
+    });
+    listAllProposals.mockResolvedValue([
+      inductionProposal("src-1", "2026-01-01T00:00:00Z"),
+    ]);
+    renderPage();
+    await screen.findByText(WARNING);
+    expect(mockApiGet).toHaveBeenCalledWith(
+      expect.stringContaining("/sources/src-1/scan?nextToken=b"),
+    );
   });
 
   it("lists every stale source when multiple were re-scanned after induction", async () => {
@@ -934,7 +972,7 @@ describe("Ontology page — re-scanned-source warning", () => {
       }
       return Promise.resolve({ items: [] });
     });
-    listProposals.mockResolvedValue([
+    listAllProposals.mockResolvedValue([
       inductionProposal("src-1", "2026-01-01T00:00:00Z"), // both older
       inductionProposal("src-2", "2026-01-01T00:00:00Z"),
     ]);
@@ -945,7 +983,7 @@ describe("Ontology page — re-scanned-source warning", () => {
 
   it("does NOT warn when the source was re-induced after the re-scan", async () => {
     mockSourceRescannedAt("2026-06-01T00:00:00Z");
-    listProposals.mockResolvedValue([
+    listAllProposals.mockResolvedValue([
       inductionProposal("src-1", "2026-06-02T00:00:00Z"), // induction is newer
     ]);
     renderPage();
@@ -955,7 +993,7 @@ describe("Ontology page — re-scanned-source warning", () => {
 
   it("does NOT warn when the re-scanned source has no induction", async () => {
     mockSourceRescannedAt("2026-06-01T00:00:00Z");
-    listProposals.mockResolvedValue([]); // nothing induced this source
+    listAllProposals.mockResolvedValue([]); // nothing induced this source
     renderPage();
     await awaitScanFetched();
     expect(screen.queryByText(WARNING)).toBeNull();
@@ -979,7 +1017,7 @@ describe("Ontology page — re-scanned-source warning", () => {
       }
       return Promise.resolve({ items: [] });
     });
-    listProposals.mockResolvedValue([
+    listAllProposals.mockResolvedValue([
       inductionProposal("src-1", "2026-01-01T00:00:00Z"),
     ]);
     renderPage();
@@ -989,7 +1027,7 @@ describe("Ontology page — re-scanned-source warning", () => {
 
   it("warns (pending) when a PENDING induction predates the re-scan", async () => {
     mockSourceRescannedAt("2026-06-01T00:00:00Z");
-    listProposals.mockResolvedValue([
+    listAllProposals.mockResolvedValue([
       inductionProposal("src-1", "2026-01-01T00:00:00Z", "pending"), // older
     ]);
     renderPage();
@@ -1002,7 +1040,7 @@ describe("Ontology page — re-scanned-source warning", () => {
 
   it("does NOT warn when a PENDING induction postdates the re-scan", async () => {
     mockSourceRescannedAt("2026-06-01T00:00:00Z");
-    listProposals.mockResolvedValue([
+    listAllProposals.mockResolvedValue([
       inductionProposal("src-1", "2026-06-02T00:00:00Z", "pending"), // newer
     ]);
     renderPage();
@@ -1013,7 +1051,7 @@ describe("Ontology page — re-scanned-source warning", () => {
 
   it("does NOT warn when a newer PENDING re-induction follows a stale accepted one", async () => {
     mockSourceRescannedAt("2026-06-01T00:00:00Z");
-    listProposals.mockResolvedValue([
+    listAllProposals.mockResolvedValue([
       inductionProposal("src-1", "2026-01-01T00:00:00Z", "accepted"), // stale
       inductionProposal("src-1", "2026-06-02T00:00:00Z", "pending"), // fresh
     ]);
@@ -1025,7 +1063,7 @@ describe("Ontology page — re-scanned-source warning", () => {
 
   it("does NOT warn when the only induction is for a different datasource", async () => {
     mockSourceRescannedAt("2026-06-01T00:00:00Z");
-    listProposals.mockResolvedValue([
+    listAllProposals.mockResolvedValue([
       inductionProposal("other-src", "2026-01-01T00:00:00Z"), // not src-1
     ]);
     renderPage();
@@ -1055,7 +1093,7 @@ describe("Ontology page — re-scanned-source warning", () => {
       }
       return Promise.resolve({ items: [] });
     });
-    listProposals.mockResolvedValue([
+    listAllProposals.mockResolvedValue([
       inductionProposal("src-1", "2026-01-01T00:00:00Z"), // older than re-scan
     ]);
     renderPage();
@@ -1085,7 +1123,7 @@ describe("Ontology page — re-scanned-source warning", () => {
       }
       return Promise.resolve({ items: [] });
     });
-    listProposals.mockResolvedValue([
+    listAllProposals.mockResolvedValue([
       inductionProposal("src-1", "2026-01-01T00:00:00Z", "accepted"),
       inductionProposal("src-2", "2026-01-01T00:00:00Z", "pending"),
     ]);
@@ -1099,8 +1137,10 @@ describe("Ontology page — re-scanned-source warning", () => {
   // (not newest first), so the tests below do not lean on the backend's
   // ordering: the page itself must keep other proposals from crowding its
   // structured inductions out of the capped list.
+  // The page reads every proposal page (listAllProposals), so nothing is capped:
+  // the newest induction is found however many other proposals there are.
   function mockStoredProposals(stored: Array<Record<string, unknown>>) {
-    listProposals.mockImplementation(
+    listAllProposals.mockImplementation(
       (
         _client: unknown,
         _namespace: unknown,
@@ -1108,7 +1148,6 @@ describe("Ontology page — re-scanned-source warning", () => {
           type?: string;
           status?: string;
           source_type?: string;
-          limit?: number;
         },
       ) => {
         let rows = stored;
@@ -1123,7 +1162,7 @@ describe("Ontology page — re-scanned-source warning", () => {
           );
         else if (opts?.source_type)
           rows = rows.filter((p) => p.source_type === opts.source_type);
-        return Promise.resolve(rows.slice(0, opts?.limit ?? 50));
+        return Promise.resolve(rows);
       },
     );
   }

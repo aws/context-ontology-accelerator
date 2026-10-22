@@ -47,6 +47,7 @@ from coa_common.constants import (
 )
 from coa_common.dao import DynamoDBDAO
 from coa_common.dao.base import QueryParams
+from coa_common.idempotency import idempotent_create
 from coa_common.language_tags import LanguageTagError
 from coa_common.logging import setup_logging
 from coa_common.response import api_response, iso_to_epoch
@@ -60,6 +61,7 @@ from coa_control_plane_server.models.source_summary import SourceSummary
 from coa_control_plane_server.models.source_type import SourceType
 from pydantic import ValidationError
 
+from coa_sources.client_errors import redact
 from coa_sources.database.connectors.athena_catalog import (
     AthenaCatalogError,
     catalog_source_id,
@@ -88,6 +90,7 @@ from coa_sources.namespace_language import (
 )
 from coa_sources.utils import merge_extraction_config
 
+from .contract import LIST_SOURCES_MAX_RESULTS, body_bound_error, label_bound_error, pagination_token_error
 from .namespace_counters import adjust_namespace_source_count
 
 setup_logging(os.environ.get("LOG_LEVEL", "INFO"))
@@ -136,7 +139,7 @@ except (ValueError, TypeError):
     _EVENT_RESCAN_COOLDOWN_S = 300
 
 _DEFAULT_MAX_RESULTS = 100
-_MAX_RESULTS_LIMIT = 100
+_MAX_RESULTS_LIMIT = LIST_SOURCES_MAX_RESULTS
 _MAX_UPLOAD_FILES = 100
 _MAX_REVIEW_TABLES = 500
 _UPLOAD_URL_EXPIRY_SECONDS = 900
@@ -496,9 +499,12 @@ def _build_document_detail(item: dict[str, Any], metrics: dict[str, Any] | None 
     #   1. A plain string (e.g. from sources_handler itself)
     #   2. A Lambda error envelope: {"errorMessage": "...", "errorType": "..."}
     #   3. A raw ECS task JSON blob with "StoppedReason" and "Containers[].Reason"
+    # The Step Functions failure path stores the failing Lambda's raw error
+    # cause here, so redact what is returned: no ARNs, account ids, endpoints or
+    # tracebacks reach the caller (rows written before this change included).
     raw_error = item.get("errorMessage")
     if raw_error:
-        doc["errorMessage"] = _parse_error_message(raw_error)
+        doc["errorMessage"] = redact(_parse_error_message(raw_error))
 
     if item.get("preprocessingIssues"):
         val = item["preprocessingIssues"]
@@ -632,11 +638,18 @@ def _handle_list(event: dict[str, Any], namespace_id: str) -> dict[str, Any]:
         return api_response(400, {"error": "maxResults must be a valid integer"})
 
     next_token: str | None = qs.get("nextToken")
+    token_error = pagination_token_error(next_token)
+    if token_error:
+        return api_response(400, {"error": token_error})
     exclusive_start_key: dict[str, Any] | None = None
     if next_token:
         try:
             exclusive_start_key = json.loads(base64.b64decode(next_token).decode())
         except Exception:
+            return api_response(400, {"error": "Invalid nextToken"})
+        # A token minted for another namespace (or hand-edited) would otherwise
+        # reach DynamoDB as an out-of-partition start key and fail as a 500.
+        if not isinstance(exclusive_start_key, dict) or exclusive_start_key.get("namespaceId") != namespace_id:
             return api_response(400, {"error": "Invalid nextToken"})
 
     try:
@@ -664,7 +677,9 @@ def _handle_list(event: dict[str, Any], namespace_id: str) -> dict[str, Any]:
                     scan_forward=False,
                 )
             )
-    except ClientError:
+    except ClientError as exc:
+        if exclusive_start_key and exc.response.get("Error", {}).get("Code") == "ValidationException":
+            return api_response(400, {"error": "Invalid nextToken"})
         logger.exception("ddb_query_failed", namespace_id=namespace_id)
         return api_response(500, {"error": "Internal server error"})
 
@@ -1936,6 +1951,28 @@ def _handle_scheduled_rescan(event: dict[str, Any]) -> dict[str, Any]:
     return {"ok": status_code in (200, 202), "statusCode": status_code}
 
 
+_BODY_METHODS = frozenset({"POST", "PUT", "PATCH"})
+
+
+def _body_bound_error(event: dict[str, Any], http_method: str, resource: str) -> str | None:
+    """Shape or upper-bound violation in the JSON body, or None (unparseable bodies are the handler's to report).
+
+    Every request body in the contract is a JSON object. A body that parses to
+    anything else (``null``, a list, a string, a number) is rejected here, once,
+    rather than reaching a handler that calls ``.get`` on it and fails as a 500.
+    """
+    raw = event.get("body")
+    if not raw or not isinstance(raw, str):
+        return None
+    try:
+        body = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if http_method in _BODY_METHODS and not isinstance(body, dict):
+        return "Request body must be a JSON object"
+    return body_bound_error(http_method, resource, body)
+
+
 def _route(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
     http_method: str = event.get("httpMethod", "")
     resource: str = event.get("resource", "")
@@ -1974,11 +2011,26 @@ def _route(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
         except ValueError as exc:
             return api_response(400, {"error": str(exc)})
 
+    # Declared bounds the handlers below do not check themselves: path-label
+    # lengths and the upper bounds of each body's members (see .contract).
+    bound_error = label_bound_error(http_method, resource, path_params) or _body_bound_error(
+        event, http_method, resource
+    )
+    if bound_error:
+        return api_response(400, {"error": bound_error})
+
     if resource == "/namespaces/{namespaceId}/sources":
         if http_method == "GET":
             return _handle_list(event, namespace_id)
         if http_method == "POST":
-            return _handle_create(event, namespace_id)
+            # Retry-safe with a body ``clientToken``: a retried database create
+            # would otherwise register a duplicate source and enqueue a second scan.
+            return idempotent_create(
+                event,
+                lambda ev: _handle_create(ev, namespace_id),
+                operation="CreateSource",
+                error_field="error",
+            )
 
     if resource == "/namespaces/{namespaceId}/sources/upload-urls" and http_method == "POST":
         return _handle_upload_urls(event, namespace_id)
@@ -1996,7 +2048,14 @@ def _route(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
         source_id = path_params.get("sourceId", "")
         if not source_id:
             return api_response(400, {"error": "sourceId is required"})
-        return _handle_rescan(event, namespace_id, source_id)
+        # Retry-safe with a body ``clientToken``: a retried rescan would otherwise
+        # get 409 (active scan) instead of its original 202.
+        return idempotent_create(
+            event,
+            lambda ev: _handle_rescan(ev, namespace_id, source_id),
+            operation="RescanSource",
+            error_field="error",
+        )
 
     if resource == "/namespaces/{namespaceId}/sources/{sourceId}/approve" and http_method == "POST":
         source_id = path_params.get("sourceId", "")
@@ -2077,7 +2136,7 @@ def _route(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
         source_id = path_params.get("sourceId", "")
         if not source_id:
             return api_response(400, {"error": "sourceId is required"})
-        return _handle_list_scan_jobs(namespace_id, source_id)
+        return _handle_list_scan_jobs(event, namespace_id, source_id)
 
     if resource == "/namespaces/{namespaceId}/sources/{sourceId}/scan/{jobId}" and http_method == "GET":
         source_id = path_params.get("sourceId", "")

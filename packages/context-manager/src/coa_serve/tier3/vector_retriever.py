@@ -20,6 +20,9 @@ from ..clients.base import VectorClient
 logger = structlog.get_logger(__name__)
 
 DEFAULT_TOP_K = 20
+# Default cap for the Tier-3 retrieval path. The isolated KBSearch action raises it
+# to its contract bound (100) via ``max_top_k``: 100 chunks of indexed text are a
+# few hundred KB, well inside the 6 MB synchronous Lambda response limit.
 _MAX_TOP_K = 50
 
 
@@ -60,6 +63,7 @@ class VectorRetriever:
         namespace: str,
         *,
         top_k: int = DEFAULT_TOP_K,
+        max_top_k: int = _MAX_TOP_K,
     ) -> list[ChunkResult]:
         """Search for document chunks matching the query embedding.
 
@@ -67,11 +71,14 @@ class VectorRetriever:
             embedding: Pre-computed query embedding vector.
             namespace: Namespace to scope the search.
             top_k: Maximum number of chunks to return.
+            max_top_k: Ceiling applied to ``top_k``. Tier-3 retrieval keeps the
+                default; the KBSearch API passes its own contract bound (100) so a
+                caller's validated ``topK`` is not silently cut to the default.
 
         Returns:
             List of ChunkResult ordered by relevance score (descending).
         """
-        top_k = min(top_k, _MAX_TOP_K)
+        top_k = min(top_k, max_top_k)
         index_name = graphrag_chunk_index_name(namespace)
 
         hits = await self._vector.search(

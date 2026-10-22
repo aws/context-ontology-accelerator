@@ -37,6 +37,7 @@ import {
 } from "../../context";
 import { Paths, fromRoot } from "../../paths";
 import { bundlePython } from "../../utils/python-bundling";
+import { grantIdempotencyTable } from "../../utils/idempotency";
 import { bedrockModelArn } from "../../utils/bedrock-utils";
 import { NetworkStack } from "../foundation/network-stack";
 import { StorageStack } from "../foundation/storage-stack";
@@ -2978,6 +2979,8 @@ export class SourcesStack extends SCLStack {
     });
 
     this.sourcesTable.grantReadWriteData(sourcesApiFn);
+    // CreateSource is retry-safe with a caller-supplied clientToken.
+    grantIdempotencyTable(this, sourcesApiFn);
     // Registration verifies that a caller-named bucket carries the
     // `{prefix}:namespace` tag authorizing this namespace, so the customer is told
     // at create time instead of discovering it as a failed scan. Tag metadata

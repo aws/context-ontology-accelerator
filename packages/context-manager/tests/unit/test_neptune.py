@@ -165,6 +165,41 @@ class TestNeptuneGraphClient:
         with pytest.raises(SPARQLValidationError):
             await client.ask("DROP GRAPH <http://example.org/g>")
 
+    @pytest.mark.parametrize(
+        "sparql",
+        [
+            # Class IRI whose host contains a write keyword ("clear").
+            "SELECT ?p WHERE { ?p <http://www.w3.org/2000/01/rdf-schema#domain> <https://clear.example/ns#Account> }",
+            "PREFIX b: <https://load.example/add#> SELECT ?c WHERE { ?c a b:Thing }",
+            'SELECT ?c WHERE { ?c <http://www.w3.org/2000/01/rdf-schema#label> "Load Balancer" }',
+            "SELECT ?c WHERE { ?c ?p '''multi\nline Delete note''' }",
+            "SELECT ?c WHERE { ?c ?p ?o } # drop this comment",
+        ],
+    )
+    def test_keyword_inside_iri_literal_or_comment_allowed(self, sparql):
+        from coa_serve.clients.neptune import NeptuneGraphClient
+
+        NeptuneGraphClient(endpoint="test.neptune.amazonaws.com")._validate_sparql(sparql)
+
+    @pytest.mark.parametrize(
+        "sparql",
+        [
+            'SELECT ?c WHERE { ?c ?p "x" } ; CLEAR ALL',
+            "PREFIX b: <https://clear.example/ns#> INSERT DATA { b:s b:p b:o }",
+            # A keyword after an unterminated quote is not hidden.
+            'SELECT ?c WHERE { ?c ?p "unterminated\n} ; DROP ALL',
+            # A quote inside an IRI does not open a literal that swallows the write.
+            'SELECT * WHERE { <http://x/a"b> ?p ?o } ; LOAD <http://x/g> "',
+            # SPARQL ends a comment at CR as well as LF.
+            "# hi\rDROP ALL",
+        ],
+    )
+    def test_write_outside_data_tokens_still_rejected(self, sparql):
+        from coa_serve.clients.neptune import NeptuneGraphClient, SPARQLValidationError
+
+        with pytest.raises(SPARQLValidationError):
+            NeptuneGraphClient(endpoint="test.neptune.amazonaws.com")._validate_sparql(sparql)
+
     async def test_injects_limit_when_missing(self):
         from coa_serve.clients.neptune import NeptuneGraphClient
 

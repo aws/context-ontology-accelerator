@@ -224,6 +224,21 @@ class TestNLtoSQLStrategyResolve:
         assert result.truncated is False
 
     @pytest.mark.asyncio
+    async def test_table_placements_resolve_through_the_executor(
+        self, strategy, sql_generator, firewall, query_executor
+    ):
+        sql_generator.generate.return_value = _make_nl_to_sql_result()
+        firewall.evaluate.return_value = _make_firewall_result()
+        query_executor.execute.return_value = _make_exec_result()
+        query_executor.resolve_table_placements.return_value = {"orders": ("ds-1", "sales_db")}
+
+        await strategy.resolve("How many orders?", "ns1", _make_context())
+
+        resolver = sql_generator.generate.call_args.kwargs["table_placements"]
+        assert await resolver({"orders": ""}) == {"orders": ("ds-1", "sales_db")}
+        query_executor.resolve_table_placements.assert_awaited_once_with("ns1", {"orders": ""})
+
+    @pytest.mark.asyncio
     async def test_correct_strategy_result_fields(self, strategy, sql_generator, firewall, query_executor):
         sql_generator.generate.return_value = _make_nl_to_sql_result(
             retrieved_tables=["orders", "products"],
@@ -311,6 +326,9 @@ class TestNLtoSQLStrategyResolve:
         query_executor.execute.assert_not_called()
         fw_err = [s for s in context.trace.steps if s.step == "t2.sql.firewall" and s.status == "error"]
         assert fw_err, "expected a t2.sql.firewall/error step for unsafe SQL"
+        # The trace reaches the client: a fixed code, never the firewall message
+        # (which quotes the offending statement).
+        assert fw_err[0].detail == {"error": "unsafe_sql"}
 
     @pytest.mark.asyncio
     async def test_firewall_allows_with_rewritten_sql_executes_authorized_sql(
@@ -393,6 +411,43 @@ class TestNLtoSQLStrategyResolve:
         # question + ddl_context are passed positionally.
         assert args[0] == "How many orders?"
         assert args[1] == "CREATE TABLE orders (id int);"
+
+    @pytest.mark.asyncio
+    async def test_correction_receives_the_statement_that_actually_ran(
+        self, strategy, sql_generator, firewall, query_executor
+    ):
+        """On a cross-source query the executed statement is the QUALIFIED rewrite
+        (catalog/schema prefixes, single-line rendering), not the firewall-authorized
+        text. The engine reports its error line/column against the executed statement,
+        so the correction prompt must carry that text — otherwise the model is pointed
+        at coordinates inside a statement it never saw."""
+        authorized = "SELECT count(*) FROM orders JOIN crm.customers ON TRUE"
+        executed = 'SELECT count(*) FROM "awsdatacatalog"."sales"."orders" JOIN "pg_cat"."crm"."customers" ON TRUE'
+        # Two real sources: that is what makes ``_prepare_sql`` run the qualifier at all.
+        sql_generator.generate.return_value = _make_nl_to_sql_result(
+            sql=authorized, table_sources={"orders": "ds-glue", "customers": "ds-pg"}
+        )
+        sql_generator.correct.return_value = ("SELECT count(*) FROM orders", 0.9)
+        firewall.evaluate.side_effect = [
+            _make_firewall_result(authorized_sql=authorized),
+            _make_firewall_result(authorized_sql="SELECT count(*) FROM orders"),
+        ]
+        query_executor.execute.side_effect = [
+            Exception("line 1:28: Table 'awsdatacatalog.sales.orders' does not exist"),
+            _make_exec_result(row_count=3),
+        ]
+        prepare = AsyncMock(side_effect=[PreparedSQL(sql=executed), PreparedSQL(sql="SELECT count(*) FROM orders")])
+        with patch("coa_serve.tier2.nl_to_sql.strategy.prepare_execution_sql", prepare):
+            result = await strategy.resolve("How many orders?", "ns1", _make_context())
+
+        assert result is not None
+        assert result.row_count == 3
+        # Bind the two seams: shot 1 executed the qualified text, shot 2 the corrected one...
+        assert query_executor.execute.call_args_list[0].args[0] == executed
+        assert query_executor.execute.call_args_list[1].args[0] == "SELECT count(*) FROM orders"
+        # ...and correct() was handed exactly the text that shot 1 executed.
+        _, kwargs = sql_generator.correct.call_args
+        assert kwargs["failed_sql"] == executed
 
     @pytest.mark.asyncio
     async def test_no_correction_when_first_shot_succeeds(self, strategy, sql_generator, firewall, query_executor):

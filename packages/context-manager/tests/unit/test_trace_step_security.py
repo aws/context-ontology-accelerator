@@ -81,3 +81,21 @@ class TestTraceStepDetailTruncation:
         serialized = step.model_dump(by_alias=True, exclude_none=True)
 
         assert "detail" not in serialized
+
+
+class TestClientErrorDetail:
+    """CWE-209: the client-facing detail for a caught exception carries its type only."""
+
+    def test_omits_exception_message(self):
+        from coa_serve.trace import client_error_detail
+
+        exc = RuntimeError("User: arn:aws:iam::123456789012:assumed-role/X is not authorized")
+        assert client_error_detail(exc) == {"error": "RuntimeError"}
+
+    def test_merges_extra_fields(self):
+        from coa_serve.trace import client_error_detail
+
+        assert client_error_detail(TimeoutError("db-host:5432"), timeoutSeconds=30) == {
+            "error": "TimeoutError",
+            "timeoutSeconds": 30,
+        }

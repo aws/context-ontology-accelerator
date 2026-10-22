@@ -189,3 +189,30 @@ class TestListMetrics:
         call_kwargs = mock_neptune.return_value.list_metrics.call_args[1]
         assert call_kwargs["offset"] == 50
         assert call_kwargs["limit"] == 26  # 25 + 1 for pagination check
+
+    @pytest.mark.parametrize(
+        "token",
+        [
+            "2147483648",  # one past the largest accepted offset
+            "9" * 5000,  # past int()'s digit limit; was a 500
+            "-1",
+            "eyJvZmZzZXQiOjI1fQ==",
+            "１２",  # non-ASCII digits
+        ],
+    )
+    @patch("coa_metrics.api.list_metrics._get_neptune")
+    def test_list_out_of_range_or_malformed_token_returns_400(self, mock_neptune: MagicMock, token: str) -> None:
+        resp = list_handler(_make_list_event(query_params={"nextToken": token}), None)
+
+        assert resp["statusCode"] == 400
+        assert json.loads(resp["body"]) == {"message": "Invalid nextToken"}
+        mock_neptune.return_value.list_metrics.assert_not_called()
+
+    @patch("coa_metrics.api.list_metrics._get_neptune")
+    def test_list_largest_offset_token_is_accepted(self, mock_neptune: MagicMock) -> None:
+        mock_neptune.return_value.list_metrics.return_value = []
+
+        resp = list_handler(_make_list_event(query_params={"nextToken": "2147483647"}), None)
+
+        assert resp["statusCode"] == 200
+        assert mock_neptune.return_value.list_metrics.call_args[1]["offset"] == 2147483647

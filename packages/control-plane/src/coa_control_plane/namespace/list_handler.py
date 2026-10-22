@@ -12,6 +12,7 @@ Returns namespaces visible to the authenticated user:
 from __future__ import annotations
 
 import base64
+import binascii
 import json
 import os
 from typing import Any
@@ -19,10 +20,11 @@ from typing import Any
 import structlog
 from coa_common import sanitize_principal_key
 from coa_common.authnz_types import PrincipalType, ResourceType
-from coa_common.constants import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
+from coa_common.constants import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, PAGINATION_TOKEN_MAX_LENGTH
 from coa_common.dao import DynamoDBDAO, QueryParams
 from coa_common.language_tags import effective_namespace_language
 from coa_common.logging import setup_logging
+from coa_common.pagination import check_start_key, is_rejected_start_key
 from coa_common.response import api_response
 from coa_control_plane_server.models.namespace_status import NamespaceStatus
 from coa_control_plane_server.models.namespace_summary import NamespaceSummary
@@ -37,6 +39,9 @@ _METADATA_SK = "METADATA"
 # Fail closed for stale/mis-seeded GLOBAL grants: only roles whose built-in
 # contract is cross-namespace may bypass per-principal namespace filtering.
 _CROSS_NAMESPACE_ROLES = frozenset({"platform-admin", "platform-viewer"})
+# Key attributes of a Namespaces table item: the resume key of the full scan.
+_TABLE_KEY_ATTRS = ("PK", "SK")
+_INVALID_TOKEN = "Invalid nextToken"
 
 
 # ── Pydantic input models ─────────────────────────────────────────
@@ -45,7 +50,7 @@ _CROSS_NAMESPACE_ROLES = frozenset({"platform-admin", "platform-viewer"})
 class ListNamespacesParams(BaseModel):
     """Validated query string parameters."""
 
-    next_token: str | None = Field(None, alias="nextToken")
+    next_token: str | None = Field(None, alias="nextToken", max_length=PAGINATION_TOKEN_MAX_LENGTH)
     max_results: int = Field(DEFAULT_PAGE_SIZE, alias="maxResults", ge=1, le=MAX_PAGE_SIZE)
 
     @field_validator("next_token")
@@ -119,9 +124,22 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
     except Exception as exc:
         return api_response(400, {"message": str(exc.errors()[0]["msg"]) if hasattr(exc, "errors") else str(exc)})
 
+    # The two listings mint different tokens (a scan key vs. an offset), so a
+    # token is only checked once the caller's listing is known.
+    cross_namespace = bool(_CROSS_NAMESPACE_ROLES.intersection(auth.global_roles))
+    start_key: dict[str, str] | None = None
+    start_offset = 0
     try:
-        if _CROSS_NAMESPACE_ROLES.intersection(auth.global_roles):
-            items, out_token = _list_all(ns_dao, params.max_results, params.next_token)
+        if cross_namespace:
+            start_key = _decode_scan_token(params.next_token)
+        else:
+            start_offset = _decode_offset_token(params.next_token)
+    except ValueError:
+        return api_response(400, {"message": _INVALID_TOKEN})
+
+    try:
+        if cross_namespace:
+            items, out_token = _list_all(ns_dao, params.max_results, start_key)
         else:
             items, out_token = _list_for_user(
                 ns_dao,
@@ -129,7 +147,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
                 auth.user_id,
                 auth.groups,
                 params.max_results,
-                params.next_token,
+                start_offset,
             )
 
         body: dict[str, Any] = {
@@ -138,9 +156,39 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
         if out_token:
             body["nextToken"] = out_token
         return api_response(200, body)
-    except Exception:
+    except Exception as exc:
+        if start_key is not None and is_rejected_start_key(exc):
+            return api_response(400, {"message": _INVALID_TOKEN})
         logger.exception("list_namespaces_error")
         return api_response(500, {"message": "Internal server error"})
+
+
+# ── Pagination tokens ─────────────────────────────────────────────
+
+
+def _decode_scan_token(token: str | None) -> dict[str, str] | None:
+    """The scan resume key in ``token`` (None for the first page); ValueError if malformed."""
+    if not token:
+        return None
+    try:
+        key = json.loads(base64.b64decode(token, validate=True))
+    except (binascii.Error, ValueError, UnicodeDecodeError) as exc:
+        raise ValueError(_INVALID_TOKEN) from exc
+    return check_start_key(key, _TABLE_KEY_ATTRS)
+
+
+def _decode_offset_token(token: str | None) -> int:
+    """The list offset in ``token`` (0 for the first page); ValueError if malformed."""
+    if not token:
+        return 0
+    try:
+        raw = base64.b64decode(token, validate=True).decode("ascii")
+    except (binascii.Error, ValueError, UnicodeDecodeError) as exc:
+        raise ValueError(_INVALID_TOKEN) from exc
+    # Digits only: int() would also take signs, whitespace and underscores.
+    if not raw.isdigit():
+        raise ValueError(_INVALID_TOKEN)
+    return int(raw)
 
 
 # ── Data access ───────────────────────────────────────────────────
@@ -149,7 +197,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
 def _list_all(
     ns_dao: DynamoDBDAO,
     limit: int,
-    next_token: str | None,
+    exclusive_start_key: dict[str, Any] | None,
 ) -> tuple[list[NamespaceSummary], str | None]:
     """Scan all namespace METADATA records (for users with global roles).
 
@@ -167,8 +215,6 @@ def _list_all(
     actually returned, so the next call resumes the SAME scan page from
     there rather than skipping straight to (a nonexistent) subsequent page.
     """
-    exclusive_start_key = json.loads(base64.b64decode(next_token)) if next_token else None
-
     items: list[NamespaceSummary] = []
     last_key = exclusive_start_key
 
@@ -214,7 +260,7 @@ def _list_for_user(
     user_id: str,
     groups: list[str],
     limit: int,
-    next_token: str | None,
+    start: int,
 ) -> tuple[list[NamespaceSummary], str | None]:
     """List namespaces where the user has a scoped role assignment."""
     namespace_ids = resolve_accessible_namespace_ids(mappings_dao, user_id, groups)
@@ -230,7 +276,6 @@ def _list_for_user(
     )
 
     # Offset-based pagination over the full sorted list
-    start = int(base64.b64decode(next_token).decode()) if next_token else 0
     page = items[start : start + limit]
 
     out_token = None

@@ -13,21 +13,61 @@ Environment:
 
 from __future__ import annotations
 
+import base64
 import json
+import logging
 import os
 from urllib import request as urllib_request
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urlencode
 
 from coa_common import resolve_region
+from coa_common.constants import validate_namespace_id
+from coa_common.idempotency import idempotent_create
+from coa_common.logging import setup_logging
+
+# JSON logs for this module and for coa_common.idempotency's structlog events.
+setup_logging(os.environ.get("LOG_LEVEL", "INFO"))
+_log = logging.getLogger(__name__)
 
 ENDPOINT = os.environ["ONTOLOGY_ENGINE_ENDPOINT"].rstrip("/")
+
+# Backend read timeout for ordinary routes: just under API Gateway's 29 s
+# integration timeout and the 30 s budget of direct Lambda callers (the MCP
+# server and the data layer invoke describe_schema directly), so a slow backend
+# surfaces as this handler's 504 rather than the caller's own timeout.
+_BACKEND_TIMEOUT_SECONDS = 28
+# Tighter read timeout for the ``clientToken`` POSTs in ``_IDEMPOTENT_POSTS``:
+# the handler must return its 504 — which lets the idempotency wrapper release
+# its claim — with margin before this Lambda's own timeout, rather than being
+# killed mid-request with the claim left IN_PROGRESS, locking the caller's
+# clientToken out of retries.
+_IDEMPOTENT_BACKEND_TIMEOUT_SECONDS = 25
+
+# Fixed client-facing messages for transport failures; the detail is logged.
+_MSG_BACKEND_UNREACHABLE = "The ontology service is unavailable. Retry the request."
+_MSG_BACKEND_TIMEOUT = "The ontology service did not respond in time. Retry the request."
+_MSG_BACKEND_ERROR = "The ontology service request failed."
 
 _ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "")
 
 _CORS_HEADERS = {
     "Content-Type": "application/json",
     "Access-Control-Allow-Origin": _ALLOWED_ORIGIN,
+}
+
+# POST operations made retry-safe by an optional ``clientToken`` (Smithy
+# @idempotencyToken), keyed resource -> operation name. Enforced here, not in the
+# ECS service: only this Lambda sees the API Gateway authorizer context the
+# idempotency key needs. Each starts a new job per call, so an unguarded retry
+# would start a duplicate. The other mutating POSTs routed here are naturally
+# idempotent; their Smithy docs say why.
+_IDEMPOTENT_POSTS = {
+    "/namespaces/{namespaceId}/induce": "StartInduction",
+    "/namespaces/{namespaceId}/ontologies/{ontologyId}/ingest-from-s3": "IngestOntologyFromS3",
+    "/namespaces/{namespaceId}/ontology/foundational/{key}/load": "LoadFoundationalOntology",
+    "/namespaces/{namespaceId}/proposals/{proposalId}/validate": "ValidateProposal",
+    "/namespaces/{namespaceId}/proposals/{proposalId}/infer-constraints": "InferConstraints",
 }
 
 # Map API Gateway paths to ontology-engine paths
@@ -133,9 +173,7 @@ def _handle_system_health() -> dict:
             status = resp["Table"]["TableStatus"]
             results["dynamodb"] = "ok" if status == "ACTIVE" else f"table_status: {status}"
         except Exception:
-            import logging
-
-            logging.getLogger(__name__).error("health_check_dynamodb_failed", exc_info=True)
+            _log.error("health_check_dynamodb_failed", exc_info=True)
             results["dynamodb"] = "error"
     else:
         results["dynamodb"] = "not_configured"
@@ -152,9 +190,7 @@ def _handle_system_health() -> dict:
             client.execute_open_cypher_query(openCypherQuery="RETURN 1 AS health")
             results["neptuneKg"] = "ok"
         except Exception:
-            import logging
-
-            logging.getLogger(__name__).error("health_check_neptune_failed", exc_info=True)
+            _log.error("health_check_neptune_failed", exc_info=True)
             results["neptuneKg"] = "error"
     else:
         results["neptuneKg"] = "not_configured"
@@ -172,9 +208,7 @@ def _handle_system_health() -> dict:
             else:
                 results["opensearch"] = f"collection_status: {details[0].get('status') if details else 'not_found'}"
         except Exception:
-            import logging
-
-            logging.getLogger(__name__).error("health_check_opensearch_failed", exc_info=True)
+            _log.error("health_check_opensearch_failed", exc_info=True)
             results["opensearch"] = "error"
     else:
         results["opensearch"] = "not_configured"
@@ -192,9 +226,7 @@ def _handle_system_health() -> dict:
             "descriptionLlm": data.get("description_llm", "unknown"),
         }
     except Exception:
-        import logging
-
-        logging.getLogger(__name__).error("health_check_ontology_induction_failed", exc_info=True)
+        _log.error("health_check_ontology_induction_failed", exc_info=True)
         results["ontologyInduction"] = {
             "graphStore": "error",
             "vectorStore": "error",
@@ -236,17 +268,46 @@ def handler(event: dict, context) -> dict:
 
     Returns:
         A Lambda proxy response dict with ``statusCode``, ``headers``, and
-        ``body``; a 502 when the ECS service is unreachable.
+        ``body``; a 502 when the ECS service is unreachable, a 504 when it does
+        not answer within ``_BACKEND_TIMEOUT_SECONDS``
+        (``_IDEMPOTENT_BACKEND_TIMEOUT_SECONDS`` for ``_IDEMPOTENT_POSTS``).
     """
-    method = event["httpMethod"]
     resource = event.get("resource", "")
-    path_params = event.get("pathParameters") or {}
-    query = event.get("queryStringParameters") or {}
-    body = event.get("body", "")
 
     # System health is handled directly (not proxied to ECS)
     if resource == "/system-health":
         return _handle_system_health()
+
+    # namespaceId is a UUID v4 in the contract. Reject anything else here,
+    # before it is forwarded (or an idempotency record is claimed for it): the
+    # ontology engine's graph routes surfaced a malformed id as a 500.
+    if "{namespaceId}" in resource:
+        try:
+            validate_namespace_id((event.get("pathParameters") or {}).get("namespaceId") or "")
+        except ValueError as exc:
+            return _error(400, str(exc))
+
+    operation = _IDEMPOTENT_POSTS.get(resource)
+    if operation and event.get("httpMethod") == "POST":
+        return idempotent_create(
+            event,
+            lambda e: _forward(e, timeout=_IDEMPOTENT_BACKEND_TIMEOUT_SECONDS),
+            operation=operation,
+            headers=lambda: dict(_CORS_HEADERS),
+        )
+    return _forward(event, timeout=_BACKEND_TIMEOUT_SECONDS)
+
+
+def _forward(event: dict, *, timeout: float) -> dict:
+    """Proxy one API Gateway event to the ontology-engine and return its response.
+
+    ``timeout`` is the backend read timeout in seconds; a timeout is a 504.
+    """
+    method = event["httpMethod"]
+    resource = event.get("resource", "")
+    path_params = event.get("pathParameters") or {}
+    query: dict[str, str] = dict(event.get("queryStringParameters") or {})
+    body = event.get("body", "")
 
     # Resolve backend path. API Gateway delivers path params still percent-
     # encoded, so normalize each to exactly ONE layer (unquote then re-quote):
@@ -279,15 +340,13 @@ def handler(event: dict, context) -> dict:
     headers = {"Content-Type": content_type}
     data: bytes | None = None
     if event.get("isBase64Encoded") and body:
-        import base64
-
         data = base64.b64decode(body)
     elif body:
         data = body.encode("utf-8")
     req = urllib_request.Request(url, data=data, headers=headers, method=method)
 
     try:
-        with urllib_request.urlopen(req, timeout=60) as resp:
+        with urllib_request.urlopen(req, timeout=timeout) as resp:
             resp_body = resp.read().decode("utf-8")
             return {
                 "statusCode": resp.status,
@@ -295,15 +354,29 @@ def handler(event: dict, context) -> dict:
                 "body": resp_body,
             }
     except HTTPError as e:
-        resp_body = e.read().decode("utf-8") if e.fp else json.dumps({"message": str(e)})
+        # The ontology engine's own error body (its FastAPI ``detail``) is this
+        # service's response and passes through. Without one, answer a fixed
+        # message — never one built from the exception text.
+        resp_body = e.read().decode("utf-8") if e.fp else ""
+        if not resp_body:
+            _log.warning("ontology_engine_http_error status=%s resource=%s", e.code, resource)
+            resp_body = json.dumps({"message": _MSG_BACKEND_ERROR})
         return {
             "statusCode": e.code,
             "headers": _CORS_HEADERS,
             "body": resp_body,
         }
     except URLError as e:
-        return {
-            "statusCode": 502,
-            "headers": _CORS_HEADERS,
-            "body": json.dumps({"message": f"Cannot reach ontology-engine: {e.reason}"}),
-        }
+        if isinstance(e.reason, TimeoutError):
+            _log.warning("ontology_engine_timeout resource=%s", resource)
+            return _error(504, _MSG_BACKEND_TIMEOUT)
+        _log.error("ontology_engine_unreachable resource=%s reason=%s", resource, e.reason)
+        return _error(502, _MSG_BACKEND_UNREACHABLE)
+    except TimeoutError:
+        # A read timeout after the connection succeeded is raised bare.
+        _log.warning("ontology_engine_timeout resource=%s", resource)
+        return _error(504, _MSG_BACKEND_TIMEOUT)
+
+
+def _error(status: int, message: str) -> dict:
+    return {"statusCode": status, "headers": _CORS_HEADERS, "body": json.dumps({"message": message})}

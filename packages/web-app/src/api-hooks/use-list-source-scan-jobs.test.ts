@@ -56,6 +56,60 @@ describe("useListSourceScanJobs", () => {
     expect(result.current.data?.items).toHaveLength(2);
   });
 
+  it("follows nextToken and returns every page, newest first", async () => {
+    // The server caps a page (1000 rows); a long-lived source's older scans
+    // are on later pages and must not silently drop off the tab.
+    mockSend
+      .mockResolvedValueOnce({
+        items: [
+          { jobId: "2026-01-04T00:00:00Z", status: "COMPLETED" },
+          { jobId: "2026-01-03T00:00:00Z", status: "FAILED" },
+        ],
+        nextToken: "page-2",
+      })
+      .mockResolvedValueOnce({ items: [], nextToken: "page-3" })
+      .mockResolvedValueOnce({
+        items: [{ jobId: "2026-01-01T00:00:00Z", status: "COMPLETED" }],
+      });
+    const { wrapper } = createWrapper();
+
+    const { result } = renderHook(
+      () => useListSourceScanJobs("ns-1", "src-1"),
+      { wrapper },
+    );
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(mockSend).toHaveBeenCalledTimes(3);
+    expect(
+      mockSend.mock.calls.map(
+        (c) => (c[0] as { input: { nextToken?: string } }).input.nextToken,
+      ),
+    ).toEqual([undefined, "page-2", "page-3"]);
+    expect(result.current.data?.items?.map((i) => i.jobId)).toEqual([
+      "2026-01-04T00:00:00Z",
+      "2026-01-03T00:00:00Z",
+      "2026-01-01T00:00:00Z",
+    ]);
+  });
+
+  it("surfaces a later-page failure instead of a truncated history", async () => {
+    mockSend
+      .mockResolvedValueOnce({
+        items: [{ jobId: "2026-01-02T00:00:00Z" }],
+        nextToken: "page-2",
+      })
+      .mockRejectedValueOnce(new Error("page 2 failed"));
+    const { wrapper } = createWrapper();
+
+    const { result } = renderHook(
+      () => useListSourceScanJobs("ns-1", "src-1"),
+      { wrapper },
+    );
+
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(result.current.error?.message).toBe("page 2 failed");
+  });
+
   it("keys the cache per source so two sources do not share history", async () => {
     // The Scan-history tab is rendered per source; a shared key would show one
     // source's scans under another.

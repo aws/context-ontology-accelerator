@@ -596,6 +596,19 @@ class CompositeQueryExecutor:
         # Multiple sources or no JDBC sources → federated Athena/Trino
         return "athena"
 
+    async def resolve_table_placements(
+        self, namespace: str, table_sources: dict[str, str]
+    ) -> dict[str, tuple[str, str]]:
+        """Bare table name -> ``(source_id, Glue database)``, so NL→SQL can show and route it.
+
+        Delegates to :meth:`SourcesRegistry.table_placements`; ``{}`` (prompt and
+        routing unchanged) when no registry is wired or the namespace holds < 2
+        Glue databases.
+        """
+        if not self._sources or not hasattr(self._sources, "table_placements"):
+            return {}
+        return await self._sources.table_placements(namespace, table_sources)
+
     async def health_check(self) -> dict[str, Any]:
         """Aggregate the Athena (and JDBC, if present) executor health into one dict."""
         athena_health = await self._athena.health_check()

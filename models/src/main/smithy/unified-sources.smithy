@@ -7,10 +7,14 @@ $version: "2"
 
 namespace com.amazon.semanticcontext.unifiedsources
 
+use com.amazon.semanticcontext.common#ClientToken
+use com.amazon.semanticcontext.common#ConflictError
 use com.amazon.semanticcontext.common#DisplayName
 use com.amazon.semanticcontext.common#IamRoleArn
 use com.amazon.semanticcontext.common#PaginatedInput
 use com.amazon.semanticcontext.common#PaginatedOutput
+use com.amazon.semanticcontext.common#PaginationToken
+use com.amazon.semanticcontext.common#PresignedUrl
 use com.amazon.semanticcontext.common#S3BucketArn
 use com.amazon.semanticcontext.common#S3Prefix
 use com.amazon.semanticcontext.common#Uuid
@@ -28,8 +32,11 @@ string ColumnName
 /// STS ExternalId used when assuming a cross-account access role
 /// (confused-deputy protection). Must match the ExternalId on the role's
 /// trust policy. See AWS STS ExternalId character/length constraints.
+/// Sensitive: it is the shared secret of the confused-deputy check, so
+/// generated clients keep it out of logs.
 @length(min: 2, max: 1224)
 @pattern("^[a-zA-Z0-9+=,.@:\\/-]+$")
+@sensitive
 string ExternalId
 
 /// Review status for enriched metadata.
@@ -250,10 +257,12 @@ structure JdbcConfiguration {
 
     /// Snowflake only: the virtual warehouse used to run INFORMATION_SCHEMA
     /// queries during discovery (Snowflake requires an active warehouse).
+    @length(max: 1024)
     warehouse: String
 
     /// Snowflake only: optional Snowflake RBAC role name to assume for the
     /// session (a Snowflake construct — not an AWS IAM role; see crossAccountRoleArn).
+    @length(max: 1024)
     role: String
 }
 
@@ -536,7 +545,7 @@ structure ColumnMetadata {
     /// (capped, best-effort). Empty for high-cardinality, non-string, or
     /// unsampled columns. Used by the serve NL→SQL layer to hint the LLM
     /// with correct enum literals for WHERE clauses, and shown in the UI.
-    distinctValues: StringList
+    distinctValues: DistinctValueList
 
     /// True when a re-scan found this column removed from the source; it is
     /// deleted on approve unless the steward keeps it. Absent/false otherwise.
@@ -652,16 +661,17 @@ structure TechnicalMetadataOutput {
 /// synonyms, glossary terms, and tags.
 structure MetadataOverrides {
     /// Override description for the table or column.
+    @length(max: 65536)
     description: String
 
     /// Override synonyms or aliases.
-    synonyms: StringList
+    synonyms: MetadataTermList
 
     /// Override business glossary terms.
-    glossaryTerms: StringList
+    glossaryTerms: MetadataTermList
 
     /// Override classification tags.
-    tags: StringList
+    tags: MetadataTermList
 }
 
 /// Steward-supplied primary key. Replaces the table's primary key; an empty
@@ -669,7 +679,7 @@ structure MetadataOverrides {
 structure PrimaryKeyInput {
     /// Column names composing the primary key; empty list clears it.
     @required
-    columns: StringList
+    columns: PrimaryKeyColumnList
 }
 
 /// Steward-supplied foreign key relationship. Stored with
@@ -680,23 +690,29 @@ structure ForeignKeyInput {
 
     /// Referenced table.
     @required
+    @length(min: 1, max: 1024)
     targetTable: String
 
     /// Referenced column in the target table.
+    @length(max: 1024)
     targetColumn: String
 
     /// Origin of the key. Preserved on a steward review so an approved inferred
     /// relationship keeps its AI_INFERRED provenance (#1088).
+    @length(max: 256)
     source: String
 
     /// Steward review decision for an inferred relationship (#1088): APPROVED or
     /// REJECTED. Omitted for a plain steward-authored edit (treated as approved).
+    @length(max: 32)
     reviewStatus: String
 
     /// Datasource id of the target table for a cross-source relationship (#1088).
+    @length(max: 256)
     targetDatasourceId: String
 
     /// Provenance note, preserved across a review round-trip (#1088).
+    @length(max: 4096)
     provenance: String
 }
 
@@ -767,6 +783,43 @@ list TableSummaryList {
 list StringList {
     member: String
 }
+
+/// Values sampled from a customer's table. They are row data, not metadata,
+/// so generated clients keep them out of logs.
+@sensitive
+list DistinctValueList {
+    member: String
+}
+
+/// Source identifier. Server-minted (a UUID today); letters, digits, hyphens
+/// and underscores only, matching the check every source route applies.
+@length(min: 1, max: 128)
+@pattern("^[A-Za-z0-9_-]+$")
+string SourceId
+
+/// Steward-supplied synonyms, glossary terms or tags for a table or column.
+/// Input-only (responses use StringList, which also carries catalog data). The
+/// count bound is generous: the handler stores the list as given.
+@length(max: 1000)
+list MetadataTermList {
+    member: MetadataTerm
+}
+
+/// A single synonym, glossary term or tag.
+@length(max: 1024)
+string MetadataTerm
+
+/// Column names composing a steward-supplied primary key; an empty list
+/// clears it. Each name must already exist on the table. The count bound sits
+/// above the column-count limit of every supported engine.
+@length(max: 2000)
+list PrimaryKeyColumnList {
+    member: PrimaryKeyColumnName
+}
+
+/// Name of an existing column on the table.
+@length(min: 1, max: 1024)
+string PrimaryKeyColumnName
 
 /// Bedrock inference profile or foundation model ARN.
 @pattern("^arn:(aws|aws-us-gov):bedrock:[a-z0-9-]*:[0-9]*:(inference-profile|foundation-model)/.+$")
@@ -912,10 +965,12 @@ list PreprocessingIssueList {
 structure UploadFileRequest {
     /// Name of the file to upload.
     @required
+    @length(min: 1, max: 1024)
     filename: String
 
     /// MIME content type of the file.
     @required
+    @length(min: 1, max: 256)
     contentType: String
 }
 
@@ -931,7 +986,7 @@ structure UploadUrl {
 
     /// Pre-signed S3 PUT URL for uploading the file.
     @required
-    uploadUrl: String
+    uploadUrl: PresignedUrl
 }
 
 list UploadUrlList {
@@ -1147,6 +1202,18 @@ structure CreateSourceInput {
 
     /// Required when sourceType = DOCUMENTS.
     documentSource: CreateDocumentSourceInput
+
+    /// Optional idempotency token. A retry with the same token and the same
+    /// parameters within 24 hours returns the original result instead of creating
+    /// a duplicate; reusing the token with different parameters is rejected with
+    /// ConflictError (409).
+    // The operation binds this whole structure as its HTTP payload, so the
+    // token has to live here to travel in the JSON body. Smithy only honours
+    // @idempotencyToken on top-level input members (generated clients will not
+    // auto-fill it here); it is kept to mark the member's semantics.
+    @idempotencyToken
+    @suppress(["IdempotencyTokenIgnored"])
+    clientToken: ClientToken
 }
 
 /// Database source creation fields.
@@ -1190,6 +1257,7 @@ structure CreateDocumentSourceInput {
     /// S3 key prefixes to ingest. Used only for the S3 sub-type, where they
     /// point into the caller-owned sourceBucketArn. Ignored for upload sources,
     /// whose prefix is derived server-side from uploadId.
+    @length(max: 1000)
     s3Prefixes: S3PrefixList
 
     /// Server-issued upload session identifier returned by GetSourceUploadUrls.
@@ -1441,10 +1509,11 @@ operation ListSources {
 
         /// Pagination token from a previous response.
         @httpQuery("nextToken")
-        nextToken: String
+        nextToken: PaginationToken
 
         /// Maximum number of items to return per page.
         @httpQuery("maxResults")
+        @range(min: 1, max: 100)
         maxResults: Integer
     }
 
@@ -1463,6 +1532,9 @@ operation ListSources {
 operation CreateSource {
     input: CreateSourceOperationInput
     output: CreateSourceOperationOutput
+    errors: [
+        ConflictError
+    ]
 }
 
 @input
@@ -1500,7 +1572,7 @@ structure GetSourceOperationInput {
     /// Identifier of the source to fetch.
     @required
     @httpLabel
-    sourceId: String
+    sourceId: SourceId
 }
 
 @output
@@ -1521,7 +1593,7 @@ operation DeleteSource {
         /// Identifier of the source to delete.
         @required
         @httpLabel
-        sourceId: String
+        sourceId: SourceId
     }
 
     output := {
@@ -1543,7 +1615,7 @@ operation RescanSource {
         /// Identifier of the source to rescan.
         @required
         @httpLabel
-        sourceId: String
+        sourceId: SourceId
 
         /// Acknowledge that starting this re-scan discards an open re-scan
         /// review. Required only when the source is in RESCAN_REVIEW: a fresh
@@ -1553,6 +1625,13 @@ operation RescanSource {
         /// discarding the review. Ignored from every other status, where a
         /// re-scan discards nothing.
         confirmDiscardOpenReview: Boolean
+
+        /// Optional idempotency token. A retry with the same token and the same
+        /// parameters within 24 hours returns the original result instead of
+        /// starting another scan; reusing the token with different parameters
+        /// is rejected with ConflictError (409).
+        @idempotencyToken
+        clientToken: ClientToken
     }
 
     output := {
@@ -1561,6 +1640,10 @@ operation RescanSource {
 
         status: SourceStatus
     }
+
+    errors: [
+        ConflictError
+    ]
 }
 
 /// Update mutable metadata fields on an existing source (DATABASE only).
@@ -1574,7 +1657,7 @@ operation UpdateSourceMetadata {
         /// Identifier of the source to update.
         @required
         @httpLabel
-        sourceId: String
+        sourceId: SourceId
 
         name: DisplayName
 
@@ -1611,6 +1694,9 @@ operation UpdateSourceMetadata {
 }
 
 /// Generate pre-signed S3 upload URLs for DOCUMENTS sources (upload flow).
+///
+/// Takes no clientToken: it writes no record. Each call mints a fresh uploadId
+/// and URLs; an abandoned set simply expires, so a retry is harmless.
 @http(method: "POST", uri: "/namespaces/{namespaceId}/sources/upload-urls", code: 200)
 operation GetSourceUploadUrls {
     input := {
@@ -1620,6 +1706,7 @@ operation GetSourceUploadUrls {
 
         /// Files to generate pre-signed upload URLs for.
         @required
+        @length(min: 1, max: 100)
         files: UploadFileRequestList
     }
 
@@ -1654,14 +1741,18 @@ operation ListSourceTables {
         /// Identifier of the source whose tables to list.
         @required
         @httpLabel
-        sourceId: String
+        sourceId: SourceId
 
         /// Pagination token from a previous response.
         @httpQuery("nextToken")
-        nextToken: String
+        nextToken: PaginationToken
 
-        /// Maximum number of items to return per page.
+        /// Maximum number of items to return per page (default and maximum 50,
+        /// the catalog search page limit). For compatibility with clients
+        /// written against the earlier 1000 bound, the server still reduces a
+        /// value from 51 to 1000 to 50 rather than rejecting it.
         @httpQuery("maxResults")
+        @range(min: 1, max: 50)
         maxResults: Integer
 
         @httpQuery("reviewStatus")
@@ -1692,11 +1783,12 @@ operation GetSourceTable {
         /// Identifier of the source containing the table.
         @required
         @httpLabel
-        sourceId: String
+        sourceId: SourceId
 
         /// Identifier of the table to fetch.
         @required
         @httpLabel
+        @length(min: 1, max: 1024)
         tableId: String
     }
 
@@ -1780,6 +1872,11 @@ structure GetSourceTableOutput {
 /// status via GetSource until it leaves the APPROVING state.
 ///
 /// Returns 409 if the source is not in PENDING_REVIEW or APPROVAL_FAILED.
+///
+/// Takes no clientToken: it is safe to retry as is. The request is a
+/// conditional status transition, so a duplicate while the first is in flight
+/// (APPROVING) or after it finished (APPROVED) gets 409 and starts no second
+/// worker; after APPROVAL_FAILED a retry is the intended recovery.
 @http(method: "POST", uri: "/namespaces/{namespaceId}/sources/{sourceId}/approve", code: 202)
 operation ApproveSource {
     input := {
@@ -1790,7 +1887,7 @@ operation ApproveSource {
         /// Identifier of the source to approve.
         @required
         @httpLabel
-        sourceId: String
+        sourceId: SourceId
     }
 
     output := {
@@ -1807,12 +1904,19 @@ operation ApproveSource {
 ///
 /// Returns 202 immediately and transitions the source's status to REJECTING.
 /// A background worker writes DataZone asset revisions, marking each
-/// non-REJECTED column as REJECTED. On success the source returns to
-/// PENDING_REVIEW (rejection does not approve the source overall — the
-/// steward can re-review). On failure it becomes REJECTION_FAILED. Clients
+/// non-REJECTED column as REJECTED. On success the source becomes REJECTED,
+/// which is terminal (rejecting a re-scan instead restores the pre-rescan
+/// state and returns the source to APPROVED). On failure it becomes
+/// REJECTION_FAILED. Clients
 /// poll the source's status via GetSource until it leaves the REJECTING state.
 ///
 /// Returns 409 if the source is not in PENDING_REVIEW or REJECTION_FAILED.
+///
+/// Takes no clientToken: it is safe to retry as is. The request is a
+/// conditional status transition, so a duplicate while the first is in flight
+/// (REJECTING) or after it finished (REJECTED, or APPROVED after a re-scan
+/// reject) gets 409 and starts no second worker; after REJECTION_FAILED a retry
+/// is the intended recovery.
 @http(method: "POST", uri: "/namespaces/{namespaceId}/sources/{sourceId}/reject", code: 202)
 operation RejectSource {
     input := {
@@ -1823,7 +1927,7 @@ operation RejectSource {
         /// Identifier of the source to reject.
         @required
         @httpLabel
-        sourceId: String
+        sourceId: SourceId
     }
 
     output := {
@@ -1852,7 +1956,7 @@ operation ReviewSourceTable {
         /// Identifier of the source containing the table.
         @required
         @httpLabel
-        sourceId: String
+        sourceId: SourceId
 
         @required
         @httpLabel
@@ -1886,7 +1990,7 @@ operation UpdateSourceTableMetadata {
         /// Identifier of the source containing the table.
         @required
         @httpLabel
-        sourceId: String
+        sourceId: SourceId
 
         @required
         @httpLabel
@@ -1921,7 +2025,7 @@ operation ReviewSourceColumn {
         /// Identifier of the source containing the column.
         @required
         @httpLabel
-        sourceId: String
+        sourceId: SourceId
 
         @required
         @httpLabel
@@ -1971,7 +2075,7 @@ operation KeepRescanRemoval {
         /// Identifier of the source containing the flagged table.
         @required
         @httpLabel
-        sourceId: String
+        sourceId: SourceId
 
         @required
         @httpLabel
@@ -2012,7 +2116,7 @@ operation UpdateSourceColumnMetadata {
         /// Identifier of the source containing the column.
         @required
         @httpLabel
-        sourceId: String
+        sourceId: SourceId
 
         @required
         @httpLabel
@@ -2056,7 +2160,7 @@ operation UpdateSourceTableKeys {
         /// Identifier of the source containing the table.
         @required
         @httpLabel
-        sourceId: String
+        sourceId: SourceId
 
         @required
         @httpLabel
@@ -2065,6 +2169,7 @@ operation UpdateSourceTableKeys {
         primaryKey: PrimaryKeyInput
 
         /// Foreign-key relationships to set for the table.
+        @length(max: 1000)
         foreignKeys: ForeignKeyInputList
     }
 
@@ -2091,11 +2196,12 @@ operation GetSourceScanJob {
         /// Identifier of the source the scan job belongs to.
         @required
         @httpLabel
-        sourceId: String
+        sourceId: SourceId
 
         /// Identifier of the scan job to fetch.
         @required
         @httpLabel
+        @length(min: 1, max: 128)
         jobId: String
     }
 
@@ -2182,8 +2288,12 @@ list FailedTableList {
 /// List the scan and review history for a DATABASE source, newest first.
 /// Combines discovery/enrichment scan rows with steward approve/reject events
 /// so the console can show a real audit trail instead of a derived guess.
+///
+/// Paginated: a request without `nextToken` returns the newest page; follow
+/// `nextToken` until it is absent to read the whole history.
 @http(method: "GET", uri: "/namespaces/{namespaceId}/sources/{sourceId}/scan")
 @readonly
+@paginated(inputToken: "nextToken", outputToken: "nextToken", pageSize: "maxResults", items: "items")
 operation ListSourceScanJobs {
     input := {
         @required
@@ -2193,14 +2303,25 @@ operation ListSourceScanJobs {
         /// Identifier of the source whose history to list.
         @required
         @httpLabel
-        sourceId: String
+        sourceId: SourceId
+
+        /// Pagination token from a previous response.
+        @httpQuery("nextToken")
+        nextToken: PaginationToken
+
+        /// Maximum number of entries to return per page. Defaults to 1000, so a
+        /// caller that does not follow `nextToken` still sees the whole history
+        /// of all but the busiest sources.
+        @httpQuery("maxResults")
+        @range(min: 1, max: 1000)
+        maxResults: Integer
     }
 
     output: ListSourceScanJobsOutput
 }
 
 @output
-structure ListSourceScanJobsOutput {
+structure ListSourceScanJobsOutput with [PaginatedOutput] {
     /// History entries, newest first.
     @required
     items: ScanJobEntryList
@@ -2221,7 +2342,7 @@ operation PutSourceRescanSchedule {
         /// Identifier of the source to schedule rescans for.
         @required
         @httpLabel
-        sourceId: String
+        sourceId: SourceId
 
         /// Whether the recurring rescan should be active.
         @required
@@ -2234,9 +2355,11 @@ operation PutSourceRescanSchedule {
         /// enrichment pass. A `rate()` below the floor is rejected with 400, a
         /// `cron()` must name a single minute so it cannot fire sub-hourly, and
         /// one-time `at()` expressions are not accepted.
+        @length(max: 256)
         scheduleExpression: String
 
         /// IANA timezone for cron evaluation. Defaults to UTC.
+        @length(max: 256)
         timezone: String
     }
 
@@ -2271,7 +2394,7 @@ operation PutSourceEventRescan {
         /// Identifier of the source to configure.
         @required
         @httpLabel
-        sourceId: String
+        sourceId: SourceId
 
         /// Whether event-driven rescans should be active.
         @required

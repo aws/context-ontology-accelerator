@@ -90,7 +90,9 @@ class OntologyResponse(BaseModel):
 class OntologyFetchRequest(BaseModel):
     """Request to fetch/update an ontology from its source URL."""
 
-    source_url: str | None = None  # override the stored source_url
+    # Override the stored source_url. ``sourceUrl`` is the FetchOntology contract
+    # spelling; ``source_url`` is still accepted for existing callers.
+    source_url: str | None = Field(default=None, alias="sourceUrl")
     accept_formats: list[str] = Field(
         default=["text/turtle", "application/rdf+xml", "application/ld+json"],
         description="Content-negotiation Accept header values",
@@ -126,6 +128,8 @@ class OntologyFetchRequest(BaseModel):
             "`unresolved_references` for the caller to surface as warnings."
         ),
     )
+
+    model_config = {"populate_by_name": True}
 
 
 class PropertyExtract(BaseModel):

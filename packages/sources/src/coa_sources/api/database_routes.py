@@ -20,6 +20,7 @@ because they are async via SQS.
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import json
 import os
@@ -49,6 +50,7 @@ from coa_control_plane_server.models.source_sub_type import SourceSubType
 from coa_control_plane_server.models.source_type import SourceType
 from pydantic import ValidationError as PydanticValidationError
 
+from coa_sources.client_errors import CLIENT_SAFE_FLAG, redact
 from coa_sources.database.connectors.athena_catalog import (
     AthenaCatalogConflictError,
     AthenaCatalogError,
@@ -85,6 +87,12 @@ from coa_sources.database.metrics import emit_metric
 from coa_sources.database.rescan_backup import S3_ABSENT_CODES, backup_s3_key
 from coa_sources.database.secret_binding import NAMESPACE_TAG_KEY, check_secret_namespace_binding
 
+from .contract import (
+    LIST_SOURCE_SCAN_JOBS_MAX_RESULTS,
+    LIST_SOURCE_TABLES_LEGACY_MAX_RESULTS,
+    LIST_SOURCE_TABLES_MAX_RESULTS,
+    pagination_token_error,
+)
 from .namespace_counters import adjust_namespace_source_count
 from .sources_handler import (
     _AWS_REGION,
@@ -1448,6 +1456,21 @@ def _find_table_asset(
     return None
 
 
+def _is_search_validation_error(exc: BaseException) -> bool:
+    """True if ``exc`` (or the client error it wraps) is the catalog refusing the request as invalid.
+
+    Matches the ``ValidationException`` code and, for any other code, a plain
+    400 status: throttling, access and not-found refusals carry their own
+    statuses, so a 400 can only be a malformed request.
+    """
+    cause = exc if isinstance(exc, ClientError) else exc.__cause__
+    if not isinstance(cause, ClientError):
+        return False
+    if cause.response.get("Error", {}).get("Code") == "ValidationException":
+        return True
+    return cause.response.get("ResponseMetadata", {}).get("HTTPStatusCode") == 400
+
+
 def _handle_list_tables(event: dict[str, Any], namespace_id: str, source_id: str) -> dict[str, Any]:
     """GET /namespaces/{namespaceId}/sources/{sourceId}/tables."""
     from coa_common.datazone_forms import FORM_TYPE_NAME
@@ -1460,16 +1483,25 @@ def _handle_list_tables(event: dict[str, Any], namespace_id: str, source_id: str
     qs = event.get("queryStringParameters") or {}
     review_status_filter = qs.get("reviewStatus")
     next_token = qs.get("nextToken")
+    token_error = pagination_token_error(next_token)
+    if token_error:
+        return api_response(400, {"error": token_error})
     try:
-        max_results = min(int(qs.get("maxResults", "50")), 50)  # DataZone Search API hard limit is 50
+        max_results = int(qs.get("maxResults", str(LIST_SOURCE_TABLES_MAX_RESULTS)))
     except (ValueError, TypeError):
         return api_response(400, {"error": "maxResults must be a valid integer"})
+    # The model bound is 1-50 (the DataZone Search page limit). 51-1000 was valid
+    # under the earlier bound, so it is still reduced to 50 rather than rejected.
+    if not 1 <= max_results <= LIST_SOURCE_TABLES_LEGACY_MAX_RESULTS:
+        return api_response(400, {"error": f"maxResults must be between 1 and {LIST_SOURCE_TABLES_MAX_RESULTS}"})
+    max_results = min(max_results, LIST_SOURCE_TABLES_MAX_RESULTS)
 
     if review_status_filter:
         try:
             ReviewStatus(review_status_filter)
         except ValueError:
-            return api_response(400, {"error": f"Invalid reviewStatus: {review_status_filter}"})
+            allowed = ", ".join(s.value for s in ReviewStatus)
+            return api_response(400, {"error": f"reviewStatus must be one of: {allowed}"})
 
     project_id = _resolve_project_id(namespace_id)
     if not project_id:
@@ -1486,7 +1518,13 @@ def _handle_list_tables(event: dict[str, Any], namespace_id: str, source_id: str
             next_token=next_token,
             include_forms=True,
         )
-    except Exception:
+    except Exception as exc:
+        # The token is the catalog search's own opaque cursor, passed through
+        # unchanged, so it cannot be checked here. Every other search parameter
+        # is built by this route, so a request the search rejects as invalid
+        # while carrying a caller token was rejected for that token.
+        if next_token and _is_search_validation_error(exc):
+            return api_response(400, {"error": "Invalid nextToken"})
         logger.exception("list_tables_search_failed", source_id=source_id, project_id=project_id)
         return api_response(500, {"error": "Failed to search tables"})
 
@@ -2085,7 +2123,8 @@ def _parse_decision(body: dict[str, Any]) -> tuple[str | None, dict[str, Any] | 
     try:
         ReviewDecision(decision)
     except ValueError:
-        return None, api_response(400, {"error": f"Invalid decision: {decision}"})
+        allowed = ", ".join(d.value for d in ReviewDecision)
+        return None, api_response(400, {"error": f"decision must be one of: {allowed}"})
     return decision, None
 
 
@@ -2516,7 +2555,15 @@ def _handle_update_table_keys(
             # decision a steward makes — a steward can only decide (approve/reject).
             review_status = fk.get("reviewStatus") or "" if isinstance(fk, dict) else ""
             if review_status and review_status not in (ReviewStatus.APPROVED, ReviewStatus.REJECTED):
-                return api_response(400, {"error": f"Invalid foreign key reviewStatus: {review_status!r}"})
+                return api_response(
+                    400,
+                    {
+                        "error": (
+                            "foreign key reviewStatus must be one of: "
+                            f"{ReviewStatus.APPROVED.value}, {ReviewStatus.REJECTED.value}"
+                        )
+                    },
+                )
             parsed_fks.append((col, target, tcol, review_status))
 
         # Existing rows are already persisted catalog state. The UI re-sends
@@ -3038,7 +3085,9 @@ def _handle_get_scan_job(namespace_id: str, source_id: str, job_id: str) -> dict
         "tablesTotal": _optional_int(_scan_total(scan_item, source_item)),
         "startedAt": iso_to_epoch(scan_item.get("startedAt")),
         "completedAt": iso_to_epoch(scan_item.get("completedAt")),
-        "errorMessage": scan_item.get("errorMessage"),
+        # Redacted on read too, so rows written before the write side stored
+        # client-safe text do not return raw exception text.
+        "errorMessage": _client_error_text(scan_item),
         # A scan can SUCCEED while individual tables were unreadable, leaving those
         # tables with no columns, no comments, and no declared keys — and enrichment
         # then generates descriptions over the gap. Unsurfaced, the result is
@@ -3063,6 +3112,18 @@ def _handle_get_scan_job(namespace_id: str, source_id: str, job_id: str) -> dict
     return api_response(200, {k: v for k, v in response.items() if v is not None})
 
 
+def _client_error_text(item: dict[str, Any]) -> str | None:
+    """A stored scan-job ``errorMessage`` as returned to the caller, or None.
+
+    Redacted, except for a message the writer flagged as written for the caller
+    (``CLIENT_SAFE_FLAG``), which is returned unchanged.
+    """
+    value = item.get("errorMessage")
+    if not value:
+        return None
+    return redact(str(value), client_safe=item.get(CLIENT_SAFE_FLAG) is True)
+
+
 def _scan_job_to_entry(item: dict[str, Any]) -> dict[str, Any]:
     """Map one source-scan-jobs row to a ListSourceScanJobs entry.
 
@@ -3080,19 +3141,65 @@ def _scan_job_to_entry(item: dict[str, Any]) -> dict[str, Any]:
         "tablesDiscovered": item.get("tablesDiscovered"),
         "tablesApproved": item.get("tablesApproved"),
         "completedAt": iso_to_epoch(item.get("completedAt")),
-        "errorMessage": item.get("errorMessage"),
+        "errorMessage": _client_error_text(item),
         "decision": item.get("decision"),
         "isRescan": item.get("isRescan"),
     }
     return {k: v for k, v in entry.items() if v is not None}
 
 
-def _handle_list_scan_jobs(namespace_id: str, source_id: str) -> dict[str, Any]:
+def _encode_scan_jobs_token(last_evaluated_key: dict[str, Any]) -> str:
+    """Opaque cursor carrying only the last row's SK; the PK is re-derived from the route."""
+    return base64.urlsafe_b64encode(json.dumps({"SK": str(last_evaluated_key["SK"])}).encode()).decode()
+
+
+def _decode_scan_jobs_token(token: str, source_id: str) -> dict[str, Any] | None:
+    """The DynamoDB start key for ``token`` within ``source_id``'s partition, or None if malformed.
+
+    Only the SK comes from the caller; the PK is this route's own, so a token
+    can never start a query in another source's history.
+    """
+    try:
+        decoded = json.loads(base64.urlsafe_b64decode(token.encode()).decode())
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(decoded, dict) or set(decoded) != {"SK"} or not isinstance(decoded["SK"], str):
+        return None
+    if not decoded["SK"] or len(decoded["SK"]) > _MAX_SCAN_JOB_SK_LENGTH:
+        return None
+    return {"PK": f"SRC#{source_id}", "SK": decoded["SK"]}
+
+
+# Scan-job SKs are ISO timestamps; GetSourceScanJob bounds a jobId (the SK) at 128.
+_MAX_SCAN_JOB_SK_LENGTH = 128
+
+
+def _handle_list_scan_jobs(event: dict[str, Any], namespace_id: str, source_id: str) -> dict[str, Any]:
     """GET /namespaces/{namespaceId}/sources/{sourceId}/scan.
 
-    Lists every scan-job and review-event row for the source, newest first.
-    PK = SRC#{sourceId}; rows are sorted by SK (ISO timestamp) descending.
+    Lists the source's scan-job and review-event rows, newest first, one page at
+    a time. PK = SRC#{sourceId}; rows are read by SK (ISO timestamp) descending.
+    No ``nextToken`` returns the newest page; ``maxResults`` defaults to the
+    maximum (``LIST_SOURCE_SCAN_JOBS_MAX_RESULTS``, 1000), which covers a typical
+    source's whole history in one page.
     """
+    qs = event.get("queryStringParameters") or {}
+    next_token = qs.get("nextToken")
+    token_error = pagination_token_error(next_token)
+    if token_error:
+        return api_response(400, {"error": token_error})
+    try:
+        max_results = int(qs.get("maxResults", str(LIST_SOURCE_SCAN_JOBS_MAX_RESULTS)))
+    except (ValueError, TypeError):
+        return api_response(400, {"error": "maxResults must be a valid integer"})
+    if not 1 <= max_results <= LIST_SOURCE_SCAN_JOBS_MAX_RESULTS:
+        return api_response(400, {"error": f"maxResults must be between 1 and {LIST_SOURCE_SCAN_JOBS_MAX_RESULTS}"})
+    start_key: dict[str, Any] | None = None
+    if next_token:
+        start_key = _decode_scan_jobs_token(next_token, source_id)
+        if start_key is None:
+            return api_response(400, {"error": "Invalid nextToken"})
+
     try:
         source_item = _get_dao().get({"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"})
     except ClientError:
@@ -3103,11 +3210,13 @@ def _handle_list_scan_jobs(namespace_id: str, source_id: str) -> dict[str, Any]:
         return api_response(404, {"error": f"Source '{source_id}' not found"})
 
     try:
-        rows = _get_scan_dao().query_all(
+        page = _get_scan_dao().query(
             QueryParams(
                 key_condition="#pk = :pk",
                 expression_values={":pk": f"SRC#{source_id}"},
                 expression_names={"#pk": "PK"},
+                limit=max_results,
+                exclusive_start_key=start_key,
                 scan_forward=False,
             )
         )
@@ -3117,9 +3226,11 @@ def _handle_list_scan_jobs(namespace_id: str, source_id: str) -> dict[str, Any]:
 
     # Sort newest-first by SK regardless of the store's return order (belt and
     # suspenders alongside scan_forward=False).
-    rows.sort(key=lambda r: str(r.get("SK", "")), reverse=True)
-    items = [_scan_job_to_entry(r) for r in rows]
-    return api_response(200, {"items": items})
+    rows = sorted(page.items, key=lambda r: str(r.get("SK", "")), reverse=True)
+    body: dict[str, Any] = {"items": [_scan_job_to_entry(r) for r in rows]}
+    if page.last_evaluated_key and page.last_evaluated_key.get("SK"):
+        body["nextToken"] = _encode_scan_jobs_token(page.last_evaluated_key)
+    return api_response(200, body)
 
 
 # ---------------------------------------------------------------------------
@@ -3190,7 +3301,7 @@ def _schedule_expression_error(expression: str) -> str | None:
     if cron:
         minute = (cron.group(1).strip().split() or [""])[0]
         if not minute.isdigit():
-            return f"cron minute field must be a single value so the cadence can be bounded; got '{minute}'"
+            return "cron minute field must be a single value so the cadence can be bounded"
         # A literal minute bounds it at hourly, which is the strongest bound
         # available without a full cron interval analysis.
         if _MIN_RESCAN_INTERVAL_S > 3600:
@@ -3284,8 +3395,12 @@ def _handle_put_rescan_schedule(event: dict[str, Any], namespace_id: str, source
         except ClientError as exc:
             code = exc.response.get("Error", {}).get("Code", "")
             if code == "ValidationException":
-                msg = exc.response.get("Error", {}).get("Message", "invalid schedule expression")
-                return api_response(400, {"error": f"Invalid schedule: {msg}"})
+                # EventBridge's own message is not forwarded: it is raw service text.
+                logger.info("rescan_schedule_rejected_by_scheduler", source_id=source_id, exc_info=True)
+                return api_response(
+                    400,
+                    {"error": "Invalid schedule: EventBridge Scheduler rejected the scheduleExpression or timezone"},
+                )
             logger.exception("rescan_schedule_upsert_failed", source_id=source_id)
             return api_response(500, {"error": "Failed to configure schedule"})
         schedule: dict[str, Any] = {"enabled": True, "scheduleExpression": expression, "timezone": timezone}

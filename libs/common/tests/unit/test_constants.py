@@ -727,3 +727,25 @@ class TestBucketNamespaceTag:
         assert bucket_grants_namespace(tags, "550e8400-e29b-41d4-a716-446655440000")
         assert bucket_grants_namespace(tags, "f47ac10b-58cc-4372-a567-0e02b2c3d479")
         assert not bucket_grants_namespace(tags, "00000000-0000-0000-0000-000000000000")
+
+
+class TestValidatorsDoNotEchoInput:
+    """The messages reach API responses; the rejected value must never be reflected."""
+
+    _PROBE = "<script>x</script>"
+
+    @pytest.mark.parametrize(
+        "call",
+        [
+            lambda v: validate_id(v, "myId"),
+            lambda v: validate_namespace_id(v),
+            lambda v: validate_source_id(v),
+            lambda v: validate_namespace_name(v),
+            lambda v: validate_s3_prefix(v, "prefix"),
+        ],
+    )
+    def test_message_omits_value(self, call) -> None:
+        with pytest.raises(ValueError) as exc:
+            call(self._PROBE)
+        assert self._PROBE not in str(exc.value)
+        assert "script" not in str(exc.value)

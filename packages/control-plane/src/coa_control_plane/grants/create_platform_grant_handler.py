@@ -22,22 +22,19 @@ from typing import Any
 import structlog
 from botocore.exceptions import ClientError
 from coa_common import sanitize_principal_key
-from coa_common.authnz_types import NON_ASSIGNABLE_ROLE_IDS, PrincipalType, ResourceType
-from coa_common.constants import validate_principal_id
+from coa_common.authnz_types import NON_ASSIGNABLE_ROLE_IDS, ResourceType
 from coa_common.dao import DynamoDBDAO
+from coa_common.idempotency import idempotent
 from coa_common.logging import setup_logging
 from coa_common.response import api_response, get_caller_identity
 
+from .contract import validate_grant_item_keys, validate_principal_binding
 from .grant_id import encode_grant_id
 
 setup_logging(os.environ.get("LOG_LEVEL", "INFO"))
 logger = structlog.get_logger(__name__)
 
-_VALID_PRINCIPAL_TYPES = {e.value for e in PrincipalType}
 _ROLE_SK_PREFIX = "ROLE#"
-# Bound on the caller-supplied role name, which becomes a DynamoDB key
-# component. principalId is bounded and charset-checked by validate_principal_id.
-_MAX_ROLE_LEN = 128
 # Platform roles are stored under PK=GLOBAL in the roles table.
 _PLATFORM_ROLE_PK = "GLOBAL"
 # Synthetic resource id used for the cross-namespace platform scope. Matches
@@ -49,12 +46,14 @@ _PLATFORM_RESOURCE_ID = "GLOBAL"
 _PLATFORM_NAMESPACE_KEY = "NS#GLOBAL"
 
 
+@idempotent(operation="CreatePlatformGrant")
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG001
     """Create a platform-scoped grant binding a principal to a platform role.
 
     Validates the request body and identifier bounds, confirms the platform
     role exists, and writes the cross-namespace grant with a
-    duplicate-prevention condition.
+    duplicate-prevention condition. Retry-safe when the body carries a
+    ``clientToken`` (see ``coa_common.idempotency``).
 
     Args:
         event: API Gateway proxy event carrying the JSON grant request body.
@@ -71,31 +70,24 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
 
     if not body:
         return api_response(400, {"message": "Request body is required"})
+    if not isinstance(body, dict):
+        return api_response(400, {"message": "Request body must be a JSON object"})
 
-    principal_type = body.get("principalType")
-    principal_id = body.get("principalId")
-    role = body.get("role")
-
-    if not principal_type or not principal_id or not role:
-        return api_response(400, {"message": "principalType, principalId, and role are required"})
-
-    if principal_type not in _VALID_PRINCIPAL_TYPES:
-        return api_response(400, {"message": f"Invalid principalType: {principal_type}"})
-
-    try:
-        validate_principal_id(principal_id)
-    except ValueError as exc:
-        return api_response(400, {"message": str(exc)})
-
-    if len(role) > _MAX_ROLE_LEN:
-        return api_response(400, {"message": f"role exceeds maximum length of {_MAX_ROLE_LEN}"})
+    # Bounds the caller-supplied role name, which becomes a DynamoDB key
+    # component; principalId is bounded and charset-checked as well.
+    binding_error = validate_principal_binding(body)
+    if binding_error is not None:
+        return api_response(400, {"message": binding_error})
+    principal_type = body["principalType"]
+    principal_id = body["principalId"]
+    role = body["role"]
 
     if role in NON_ASSIGNABLE_ROLE_IDS:
         # ``default`` exists under PK=GLOBAL as the baseline policy bundle, so
         # the existence check below would accept it; granting it hands the
         # principal a GLOBAL role row that filtering code treats as
         # cross-namespace (#988).
-        return api_response(400, {"message": f"Role '{role}' is not assignable"})
+        return api_response(400, {"message": "Role is not assignable"})
 
     region = os.environ.get("AWS_REGION")
     roles_table = os.environ.get("ROLES_TABLE")
@@ -112,7 +104,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
         # 1. Validate the role exists as a platform role (PK=GLOBAL).
         role_item = roles_dao.get({"PK": _PLATFORM_ROLE_PK, "SK": f"{_ROLE_SK_PREFIX}{role}"})
         if not role_item:
-            return api_response(404, {"message": f"Platform role '{role}' not found"})
+            return api_response(404, {"message": "Platform role not found"})
 
         # 2. Build the platform grant record.
         caller = get_caller_identity(event)
@@ -140,6 +132,9 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
             "grantedAt": now,
         }
 
+        key_error = validate_grant_item_keys(item, encode_grant_id(pk, sk))
+        if key_error:
+            return api_response(400, {"message": key_error})
         # 3. Write with a condition to prevent duplicate grants.
         mappings_dao.put(item, condition="attribute_not_exists(PK) AND attribute_not_exists(SK)", auto_timestamp=False)
 

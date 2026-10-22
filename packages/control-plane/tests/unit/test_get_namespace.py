@@ -14,9 +14,9 @@ from coa_common.constants import RESOURCE_PREFIX
 MODULE = "coa_control_plane.namespace.get_handler"
 
 _NS_ITEM = {
-    "PK": "NS#ns-123",
+    "PK": "NS#11111111-1111-4111-8111-111111111111",
     "SK": "METADATA",
-    "namespaceId": "ns-123",
+    "namespaceId": "11111111-1111-4111-8111-111111111111",
     "name": "sales",
     "displayName": "Sales Domain",
     "description": "Sales data",
@@ -67,10 +67,13 @@ class TestDatasourceExternalId:
 
             from coa_control_plane.namespace.get_handler import handler
 
-            resp = handler({"pathParameters": {"namespaceId": "ns-123"}}, None)
+            resp = handler({"pathParameters": {"namespaceId": "11111111-1111-4111-8111-111111111111"}}, None)
 
         assert resp["statusCode"] == 200
-        assert json.loads(resp["body"])["namespace"]["datasourceExternalId"] == "coa-dev-ns-123"
+        assert (
+            json.loads(resp["body"])["namespace"]["datasourceExternalId"]
+            == "coa-dev-11111111-1111-4111-8111-111111111111"
+        )
 
     def test_matches_the_shared_derivation(self, monkeypatch):
         """Must equal what the sources connector sends, or every assume fails."""
@@ -84,10 +87,10 @@ class TestDatasourceExternalId:
 
             from coa_control_plane.namespace.get_handler import handler
 
-            resp = handler({"pathParameters": {"namespaceId": "ns-123"}}, None)
+            resp = handler({"pathParameters": {"namespaceId": "11111111-1111-4111-8111-111111111111"}}, None)
 
         published = json.loads(resp["body"])["namespace"]["datasourceExternalId"]
-        assert published == datasource_external_id("ns-123")
+        assert published == datasource_external_id("11111111-1111-4111-8111-111111111111")
 
 
 @pytest.mark.unit
@@ -102,7 +105,7 @@ class TestGetNamespace:
 
             resp = handler(
                 {
-                    "pathParameters": {"namespaceId": "ns-123"},
+                    "pathParameters": {"namespaceId": "11111111-1111-4111-8111-111111111111"},
                     "httpMethod": "GET",
                     "resource": "/namespaces/{namespaceId}",
                 },
@@ -111,7 +114,7 @@ class TestGetNamespace:
 
         assert resp["statusCode"] == 200
         body = json.loads(resp["body"])
-        assert body["namespace"]["namespaceId"] == "ns-123"
+        assert body["namespace"]["namespaceId"] == "11111111-1111-4111-8111-111111111111"
         assert body["namespace"]["name"] == "sales"
         assert body["namespace"]["owner"] == "bob@example.com"
 
@@ -125,7 +128,7 @@ class TestGetNamespace:
 
             resp = handler(
                 {
-                    "pathParameters": {"namespaceId": "ns-999"},
+                    "pathParameters": {"namespaceId": "99999999-9999-4999-8999-999999999999"},
                     "httpMethod": "GET",
                     "resource": "/namespaces/{namespaceId}",
                 },
@@ -144,13 +147,16 @@ class TestGetNamespace:
         with patch(f"{MODULE}._get_ns_dao") as mock:
             dao = MagicMock()
             mock.return_value = dao
-            dao.get.return_value = {**_NS_ITEM, "athenaWorkgroupName": f"{RESOURCE_PREFIX}-dev-ns-123"}
+            dao.get.return_value = {
+                **_NS_ITEM,
+                "athenaWorkgroupName": f"{RESOURCE_PREFIX}-dev-11111111-1111-4111-8111-111111111111",
+            }
 
             from coa_control_plane.namespace.get_handler import handler
 
             resp = handler(
                 {
-                    "pathParameters": {"namespaceId": "ns-123"},
+                    "pathParameters": {"namespaceId": "11111111-1111-4111-8111-111111111111"},
                     "httpMethod": "GET",
                     "resource": "/namespaces/{namespaceId}",
                 },
@@ -159,7 +165,7 @@ class TestGetNamespace:
 
         assert resp["statusCode"] == 200
         body = json.loads(resp["body"])
-        assert body["namespace"]["athenaWorkgroupName"] == f"{RESOURCE_PREFIX}-dev-ns-123"
+        assert body["namespace"]["athenaWorkgroupName"] == f"{RESOURCE_PREFIX}-dev-11111111-1111-4111-8111-111111111111"
 
     def test_includes_vkg_health(self):
         with (
@@ -177,7 +183,7 @@ class TestGetNamespace:
 
             resp = handler(
                 {
-                    "pathParameters": {"namespaceId": "ns-123"},
+                    "pathParameters": {"namespaceId": "11111111-1111-4111-8111-111111111111"},
                     "httpMethod": "GET",
                     "resource": "/namespaces/{namespaceId}",
                 },
@@ -206,7 +212,7 @@ class TestGetNamespace:
 
             resp = handler(
                 {
-                    "pathParameters": {"namespaceId": "ns-123"},
+                    "pathParameters": {"namespaceId": "11111111-1111-4111-8111-111111111111"},
                     "httpMethod": "GET",
                     "resource": "/namespaces/{namespaceId}",
                 },
@@ -229,7 +235,7 @@ class TestGetNamespace:
 
             resp = handler(
                 {
-                    "pathParameters": {"namespaceId": "ns-123"},
+                    "pathParameters": {"namespaceId": "11111111-1111-4111-8111-111111111111"},
                     "httpMethod": "GET",
                     "resource": "/namespaces/{namespaceId}",
                 },
@@ -251,7 +257,7 @@ class TestNamespaceLanguage:
             patch(f"{MODULE}._get_ns_dao", return_value=dao),
             patch(f"{MODULE}.resolve_vkg_health_with_reason", return_value=("HEALTHY", None)),
         ):
-            return handler({"pathParameters": {"namespaceId": "ns-123"}}, None)
+            return handler({"pathParameters": {"namespaceId": "11111111-1111-4111-8111-111111111111"}}, None)
 
     def test_legacy_item_without_language_reads_en(self):
         dao = MagicMock()

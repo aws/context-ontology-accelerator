@@ -5,11 +5,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from unittest.mock import MagicMock, patch
 
 import pytest
 from coa_serve.clients.sources_registry import _ITEMS_CACHE_MAX, SourcesRegistry
+from coa_serve.tier2.nl_to_sql.sql_generator import sql_table_routing
+from coa_serve.tier2.sql_firewall import SQLFirewall
+from coa_serve.tier2.table_qualifier import AMBIGUOUS_SOURCE, prepare_execution_sql
 
 
 @pytest.mark.unit
@@ -739,3 +743,304 @@ class TestNamespaceLanguage:
         reads = registry._mock_table.get_item.call_count
         assert await registry.namespace_language(self.NS) == "ja"
         assert registry._mock_table.get_item.call_count == reads
+
+
+def _glue_source(source_id, database, **extra):
+    """A root-catalog Glue source shaped like the ones the sources API wrote before it stopped setting
+    ``athenaDataCatalogName`` for Glue."""
+    return {
+        "sourceType": "DATABASE",
+        "sourceSubType": "GLUE_DATABASE",
+        "sourceId": source_id,
+        "athenaDatabase": database,
+        "athenaDataCatalogName": "AwsDataCatalog",
+        "athenaCatalog": "AwsDataCatalog",
+        "discoveredSchemas": [database],
+        "configuration": json.dumps({"catalogId": "123456789012", "databaseName": database}),
+        "queryable": True,
+        **extra,
+    }
+
+
+@pytest.mark.unit
+class TestPooledGlueDatabases:
+    """A namespace pooling several Glue databases in the root catalog."""
+
+    def _registry(self, items):
+        with patch("boto3.resource") as mock_resource:
+            mock_table = MagicMock()
+            mock_table.query.return_value = {"Items": items}
+            by_sk = {f"SRC#{i['sourceId']}": i for i in items}
+            mock_table.get_item.side_effect = lambda Key: {"Item": by_sk[Key["SK"]]} if Key["SK"] in by_sk else {}
+            mock_resource.return_value.Table.return_value = mock_table
+            registry = SourcesRegistry(table_name="test-sources", region="us-west-2")
+        return registry
+
+    def _glue(self, registry, tables_by_db):
+        glue = MagicMock()
+        glue.get_paginator.return_value.paginate.side_effect = lambda DatabaseName, **_: [
+            {"TableList": [{"Name": t} for t in tables_by_db[DatabaseName]]}
+        ]
+        registry._glue = glue
+        return glue
+
+    @pytest.mark.asyncio
+    async def test_root_catalog_glue_source_is_a_native_database(self):
+        # `AwsDataCatalog` is the root catalog, not a nested one: filing it as a
+        # federated pair left native_databases empty and denied the qualifier's
+        # own three-part rewrite of a cross-database join.
+        registry = self._registry([_glue_source("s-ops", "bank_ops"), _glue_source("s-risk", "bank_risk")])
+
+        scope = await registry.sql_namespace_scope("ns-a")
+
+        assert scope.native_databases == frozenset({"bank_ops", "bank_risk"})
+        assert scope.federated_catalog_schemas == frozenset()
+        for sql in (
+            'SELECT * FROM "awsdatacatalog"."bank_risk"."risk_ecl"',
+            "SELECT * FROM bank_ops.acct_mstr a JOIN bank_risk.risk_ecl r ON a.id = r.id",
+        ):
+            assert SQLFirewall.validate_namespace_sql_scope(
+                sql,
+                native_databases=scope.native_databases,
+                federated_catalog_schemas=scope.federated_catalog_schemas,
+                default_catalog="",
+            )
+
+    @pytest.mark.asyncio
+    async def test_single_database_namespace_places_nothing(self):
+        registry = self._registry([_glue_source("s-ops", "bank_ops")])
+        glue = self._glue(registry, {"bank_ops": ["acct_mstr"]})
+
+        assert await registry.table_placements("ns-a", {"acct_mstr": "s-ops"}) == {}
+        glue.get_paginator.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_places_by_source_id_then_by_catalog(self):
+        registry = self._registry([_glue_source("s-ops", "bank_ops"), _glue_source("s-party", "bank_party")])
+        self._glue(registry, {"bank_ops": ["acct_mstr", "dim_dt"], "bank_party": ["br_dir", "dim_dt"]})
+
+        out = await registry.table_placements(
+            "ns-a",
+            # br_dir carries no source (an uploaded ontology has no R2RML);
+            # dim_dt exists in BOTH databases, so it is marked ambiguous.
+            {"acct_mstr": "s-ops", "br_dir": "", "dim_dt": ""},
+        )
+
+        assert out == {
+            "acct_mstr": ("s-ops", "bank_ops"),
+            "br_dir": ("s-party", "bank_party"),
+            "dim_dt": (AMBIGUOUS_SOURCE, ""),
+        }
+
+    @pytest.mark.asyncio
+    async def test_table_of_another_source_is_never_looked_up_in_glue(self):
+        # `customers` belongs to a JDBC source; a same-named Glue table must not
+        # label it with the Glue database.
+        registry = self._registry([_glue_source("s-ops", "bank_ops"), _glue_source("s-party", "bank_party")])
+        glue = self._glue(registry, {"bank_ops": ["customers"], "bank_party": ["br_dir"]})
+
+        out = await registry.table_placements("ns-a", {"customers": "pg-src"})
+
+        assert out == {}
+        glue.get_paginator.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_database_shared_by_two_sources_is_not_placed_by_catalog(self):
+        registry = self._registry(
+            [
+                _glue_source("s-ops", "bank_ops"),
+                _glue_source("s-ops-2", "bank_ops"),
+                _glue_source("s-party", "bank_party"),
+            ]
+        )
+        self._glue(registry, {"bank_ops": ["acct_mstr"], "bank_party": ["br_dir"]})
+
+        out = await registry.table_placements("ns-a", {"acct_mstr": "", "br_dir": ""})
+
+        assert out == {"acct_mstr": (AMBIGUOUS_SOURCE, ""), "br_dir": ("s-party", "bank_party")}
+
+    @pytest.mark.asyncio
+    async def test_catalog_failure_leaves_unplaced_tables_bare(self):
+        registry = self._registry([_glue_source("s-ops", "bank_ops"), _glue_source("s-party", "bank_party")])
+        glue = MagicMock()
+        glue.get_paginator.side_effect = RuntimeError("AccessDenied")
+        registry._glue = glue
+
+        out = await registry.table_placements("ns-a", {"acct_mstr": "s-ops", "br_dir": ""})
+
+        assert out == {"acct_mstr": ("s-ops", "bank_ops")}
+
+    @pytest.mark.asyncio
+    async def test_nested_catalog_source_is_not_a_bare_database(self):
+        registry = self._registry(
+            [
+                _glue_source("s-ops", "bank_ops"),
+                _glue_source("s-fed", "sales", athenaDataCatalogName="sclds_a"),
+            ]
+        )
+
+        assert await registry.native_glue_databases("ns-a") == {"s-ops": ("123456789012", "bank_ops")}
+
+    @pytest.mark.asyncio
+    async def test_mixed_namespace_does_not_guess_by_catalog(self):
+        # A JDBC source cannot be listed in Glue, so a same-named table there
+        # would be invisible: an unplaced `customers` must stay unplaced (and be
+        # refused downstream), not be guessed onto bank_ops.
+        pg = {"sourceType": "DATABASE", "sourceSubType": "JDBC", "sourceId": "s-pg", "queryable": True}
+        registry = self._registry([_glue_source("s-ops", "bank_ops"), _glue_source("s-party", "bank_party"), pg])
+        glue = self._glue(registry, {"bank_ops": ["customers"], "bank_party": ["br_dir"]})
+
+        out = await registry.table_placements("ns-a", {"customers": "", "br_dir": "s-party"})
+
+        # A table carrying its own Glue source id is still placed.
+        assert out == {"br_dir": ("s-party", "bank_party")}
+        glue.get_paginator.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_listing_failure_is_cached(self):
+        registry = self._registry([_glue_source("s-ops", "bank_ops"), _glue_source("s-party", "bank_party")])
+        glue = MagicMock()
+        glue.get_paginator.side_effect = RuntimeError("AccessDenied")
+        registry._glue = glue
+
+        for _ in range(3):
+            assert await registry.table_placements("ns-a", {"br_dir": ""}) == {}
+
+        # Paid once per TTL, not once per request.
+        assert glue.get_paginator.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_listing_asks_glue_for_names_only(self):
+        registry = self._registry([_glue_source("s-ops", "bank_ops"), _glue_source("s-party", "bank_party")])
+        glue = self._glue(registry, {"bank_ops": ["acct_mstr"], "bank_party": ["br_dir"]})
+
+        await registry.table_placements("ns-a", {"br_dir": ""})
+
+        for call in glue.get_paginator.return_value.paginate.call_args_list:
+            assert call.kwargs["AttributesToGet"] == ["NAME"]
+
+    @pytest.mark.asyncio
+    async def test_added_source_is_a_cache_miss(self):
+        # The listing is cached by the set of databases it covered: once a third
+        # source holding the same name is added, a cached two-database listing
+        # must not still call the name unique.
+        ops, party = _glue_source("s-ops", "bank_ops"), _glue_source("s-party", "bank_party")
+        registry = self._registry([ops, party])
+        tables = {"bank_ops": ["dim_dt"], "bank_party": ["br_dir"], "bank_risk": ["dim_dt"]}
+        self._glue(registry, tables)
+        assert await registry.table_placements("ns-a", {"dim_dt": ""}) == {"dim_dt": ("s-ops", "bank_ops")}
+
+        registry._dynamodb.Table.return_value.query.return_value = {
+            "Items": [ops, party, _glue_source("s-risk", "bank_risk")]
+        }
+        registry._items_cache.clear()  # the source list refreshed; the listing did not
+
+        assert await registry.table_placements("ns-a", {"dim_dt": ""}) == {"dim_dt": (AMBIGUOUS_SOURCE, "")}
+
+    @pytest.mark.asyncio
+    async def test_concurrent_misses_share_one_listing(self):
+        registry = self._registry([_glue_source("s-ops", "bank_ops"), _glue_source("s-party", "bank_party")])
+        glue = self._glue(registry, {"bank_ops": ["acct_mstr"], "bank_party": ["br_dir"]})
+
+        results = await asyncio.gather(*(registry.table_placements("ns-a", {"br_dir": ""}) for _ in range(5)))
+
+        assert all(r == {"br_dir": ("s-party", "bank_party")} for r in results)
+        # One listing: one paginator per database, not one per request.
+        assert glue.get_paginator.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_legacy_record_with_mismatched_schema_grants_nothing(self):
+        # The executor runs a legacy root-catalog Glue record against
+        # discoveredSchemas[0]; granting athenaDatabase when the two differ would
+        # authorize a database the source is not queried as.
+        odd = _glue_source("s-odd", "bank_risk", discoveredSchemas=["bank_other"])
+        registry = self._registry([_glue_source("s-ops", "bank_ops"), odd])
+
+        scope = await registry.sql_namespace_scope("ns-a")
+
+        assert scope.native_databases == frozenset({"bank_ops"})
+        assert scope.federated_catalog_schemas == frozenset()
+
+    @pytest.mark.asyncio
+    async def test_record_with_mismatched_schema_places_nothing(self):
+        # Placing `t` under athenaDatabase would pin a bare query to a source the
+        # executor runs against discoveredSchemas[0], a different database. The
+        # record is left out, and since it then cannot be listed, the lookup is
+        # off for the namespace (it could hold `u` too), as for a JDBC source.
+        odd = _glue_source("s-odd", "db_x", discoveredSchemas=["db_y"])
+        registry = self._registry([odd, _glue_source("s-z", "db_z"), _glue_source("s-w", "db_w")])
+        glue = self._glue(registry, {"db_x": ["t"], "db_z": ["u"], "db_w": []})
+
+        assert "s-odd" not in await registry.native_glue_databases("ns-a")
+        assert await registry.table_placements("ns-a", {"t": "", "u": ""}) == {}
+        glue.get_paginator.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_failed_listing_is_retried_after_the_short_window(self, monkeypatch):
+        import coa_serve.clients.sources_registry as sr
+
+        registry = self._registry([_glue_source("s-ops", "bank_ops"), _glue_source("s-party", "bank_party")])
+        glue = MagicMock()
+        glue.get_paginator.side_effect = RuntimeError("Throttling")
+        registry._glue = glue
+        now = [1000.0]
+        monkeypatch.setattr(sr.time, "monotonic", lambda: now[0])
+
+        assert await registry.table_placements("ns-a", {"br_dir": ""}) == {}
+        now[0] += sr._FAILED_LISTING_TTL_S + 1
+        self._glue(registry, {"bank_ops": ["acct_mstr"], "bank_party": ["br_dir"]})
+
+        assert await registry.table_placements("ns-a", {"br_dir": ""}) == {"br_dir": ("s-party", "bank_party")}
+
+    @pytest.mark.asyncio
+    async def test_top_down_join_with_a_shared_name_is_refused(self):
+        # acct_mstr is only in bank_ops; dim_dt is in both. Routing the join to
+        # bank_ops and running dim_dt bare would silently pick bank_ops.dim_dt.
+        registry = self._registry([_glue_source("s-ops", "bank_ops"), _glue_source("s-party", "bank_party")])
+        self._glue(registry, {"bank_ops": ["acct_mstr", "dim_dt"], "bank_party": ["br_dir", "dim_dt"]})
+        sql = "SELECT * FROM acct_mstr a JOIN dim_dt d ON a.dt = d.dt"
+
+        placements = await registry.table_placements("ns-a", {"acct_mstr": "", "dim_dt": ""})
+        routing = sql_table_routing(sql, {t: source for t, (source, _) in placements.items()})
+        prepared = await prepare_execution_sql(sql, routing, registry, namespace="ns-a")
+
+        assert prepared.error is not None
+        assert "dim_dt" in prepared.error
+
+    @pytest.mark.asyncio
+    async def test_root_catalog_value_on_a_non_glue_record_is_not_native(self):
+        # Only a Glue record is read as a legacy root-catalog source; any other
+        # record keeps its (awsdatacatalog, schema) pair and gains no native grant.
+        odd = _glue_source("s-odd", "other_db", sourceSubType="CUSTOM_CONNECTOR")
+        registry = self._registry([_glue_source("s-ops", "bank_ops"), odd])
+
+        scope = await registry.sql_namespace_scope("ns-a")
+
+        assert scope.native_databases == frozenset({"bank_ops"})
+        assert scope.federated_catalog_schemas == frozenset({("awsdatacatalog", "other_db")})
+
+    @pytest.mark.asyncio
+    async def test_top_down_cross_database_join_is_placed_qualified_and_authorized(self):
+        # The reported failure, end to end: top-down classes carry no source id;
+        # placement routes them, the qualifier rewrites to three-part names, and
+        # the executor's namespace check accepts the rewrite.
+        registry = self._registry([_glue_source("s-ops", "bank_ops"), _glue_source("s-risk", "bank_risk")])
+        self._glue(registry, {"bank_ops": ["acct_mstr"], "bank_risk": ["risk_ecl"]})
+        sql = "SELECT a.id FROM bank_ops.acct_mstr a JOIN risk_ecl r ON a.id = r.acct_id"
+
+        placements = await registry.table_placements("ns-a", {"acct_mstr": "", "risk_ecl": ""})
+        routing = sql_table_routing(sql, {t: source for t, (source, _) in placements.items()})
+        prepared = await prepare_execution_sql(sql, routing, registry, namespace="ns-a")
+        scope = await registry.sql_namespace_scope("ns-a")
+
+        assert prepared.error is None
+        assert prepared.sql == (
+            'SELECT a.id FROM "AwsDataCatalog"."bank_ops".acct_mstr AS a '
+            'JOIN "AwsDataCatalog"."bank_risk".risk_ecl AS r ON a.id = r.acct_id'
+        )
+        assert SQLFirewall.validate_namespace_sql_scope(
+            prepared.sql,
+            native_databases=scope.native_databases,
+            federated_catalog_schemas=scope.federated_catalog_schemas,
+            default_catalog="",
+        )

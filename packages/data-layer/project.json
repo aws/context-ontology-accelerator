@@ -7,6 +7,7 @@
       "command": "uv run ruff check packages/data-layer && uv run ruff format --check packages/data-layer && uv run mypy packages/data-layer/src --ignore-missing-imports --cache-dir packages/data-layer/.mypy_cache"
     },
     "test": {
+      "inputs": ["default", "^default", "smithyModels"],
       "command": "COVERAGE_FILE=packages/data-layer/.coverage uv run pytest packages/data-layer/tests/unit -m unit -v --tb=short --cov=packages/data-layer/src --cov-report=term-missing --cov-report=xml:packages/data-layer/coverage.xml --cov-fail-under=80 --junitxml=packages/data-layer/junit.xml"
     },
     "format": {

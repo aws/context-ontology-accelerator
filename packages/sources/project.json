@@ -7,6 +7,7 @@
       "command": "uv run ruff check packages/sources && uv run ruff format --check packages/sources && uv run mypy packages/sources/src --ignore-missing-imports --cache-dir packages/sources/.mypy_cache"
     },
     "test": {
+      "inputs": ["default", "^default", "smithyModels"],
       "command": "COVERAGE_FILE=packages/sources/.coverage uv run pytest packages/sources/tests/unit -v --tb=short --cov=packages/sources/src --cov-report=term-missing --cov-report=xml:packages/sources/coverage.xml --cov-fail-under=80 --junitxml=packages/sources/junit.xml"
     },
     "format": {

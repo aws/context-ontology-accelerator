@@ -29,7 +29,7 @@ if TYPE_CHECKING:
     from ..lexical.strategies import RetrieverStrategy
 
 from ..step_ids import StepId
-from ..trace import TraceCollector
+from ..trace import TraceCollector, client_error_detail
 from .graph_traverser import GraphTraverser
 from .synthesizer import MAX_PROMPT_CHUNKS, SynthesisResult, Synthesizer
 from .vector_retriever import VectorRetriever
@@ -334,7 +334,7 @@ class KnowledgeRetriever:
             self._record_guardrail_step(synthesis, trace_steps, trace)
         except Exception as exc:
             logger.error("synthesis_failure", error_type=type(exc).__name__, exc_info=True)
-            error_detail = {"error": type(exc).__name__, "message": str(exc)}
+            error_detail = client_error_detail(exc)
             trace_steps.append(
                 {
                     "step": StepId.T3_SYNTHESIZE,
@@ -467,7 +467,7 @@ class KnowledgeRetriever:
             self._record_guardrail_step(synthesis, trace_steps, trace)
         except Exception as exc:
             logger.error("synthesis_failure", error_type=type(exc).__name__, exc_info=True)
-            error_detail = {"error": type(exc).__name__, "message": str(exc)}
+            error_detail = client_error_detail(exc)
             trace_steps.append(
                 {
                     "step": StepId.T3_SYNTHESIZE,
@@ -548,7 +548,9 @@ class KnowledgeRetriever:
         elif is_error:
             status = "error"
             detail = "retrieval_error"
-            degraded_sources.append({"source": source_name, "reason": "error", "detail": str(result)})
+            # ``degradedSources`` reaches the client, so carry the exception type,
+            # never its message (backend text, hostnames). ``_safe_call`` logged it.
+            degraded_sources.append({"source": source_name, "reason": "error", "detail": type(result).__name__})
         else:
             status = "success"
             detail = f"{len(data)} items"

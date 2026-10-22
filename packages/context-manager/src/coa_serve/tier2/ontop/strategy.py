@@ -19,7 +19,7 @@ from coa_common import ontology_vector_index_name
 from ...clients.base import VectorClient
 from ...exceptions import AccessDeniedError
 from ...step_ids import TOOL_FOR_STEP, StepId
-from ...trace import TraceCollector
+from ...trace import TraceCollector, client_error_detail
 from ..strategy import StrategyContext, StrategyOption, StrategyResult, capped_max_rows
 from .nl_to_sparql import NLtoSPARQL
 from .types import VectorHit
@@ -200,7 +200,10 @@ class OntopStrategy:
             vkg_ms = int((time.perf_counter() - vkg_start) * 1000)
             vkg_error = str(e)
             logger.warning("tier2_vkg_failed", error=vkg_error, error_type=type(e).__name__)
-            trace.record(StepId.T2_VKG_COMPILE, "error", vkg_ms, detail={"error": vkg_error[:200]}, tool_used="ontop")
+            # The VKG message can carry backend response text and internal URLs, so
+            # the trace (client-visible) gets the exception type only; the message
+            # stays in the log above and drives the retry decision below.
+            trace.record(StepId.T2_VKG_COMPILE, "error", vkg_ms, detail=client_error_detail(e), tool_used="ontop")
             if _is_retryable_vkg_error(vkg_error):
                 return await self._retry_vkg(
                     query,

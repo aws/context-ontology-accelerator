@@ -22,6 +22,8 @@ from botocore.config import Config
 from coa_common.logging import setup_logging
 from coa_common.response import api_response, get_caller_identity
 
+from coa_metrics.api.contract import FILENAME_MAX_LENGTH, FILENAME_MIN_LENGTH, check_string
+
 setup_logging(os.environ.get("LOG_LEVEL", "INFO"))
 logger = structlog.get_logger(__name__)
 
@@ -71,6 +73,9 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     filename = body.get("filename", "")
     if not filename:
         return api_response(400, {"message": "'filename' is required"})
+    filename_error = check_string(filename, "filename", min_length=FILENAME_MIN_LENGTH, max_length=FILENAME_MAX_LENGTH)
+    if filename_error:
+        return api_response(400, {"message": filename_error})
 
     # Reject path traversal — filename must be a bare name with no separators
     if "/" in filename or "\\" in filename or filename != os.path.basename(filename):
@@ -81,7 +86,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     if ext not in ALLOWED_EXTENSIONS:
         return api_response(
             400,
-            {"message": f"Invalid file extension '{ext}'. Allowed: {sorted(ALLOWED_EXTENSIONS)}"},
+            {"message": f"Invalid file extension. Allowed: {sorted(ALLOWED_EXTENSIONS)}"},
         )
 
     # Generate unique S3 key

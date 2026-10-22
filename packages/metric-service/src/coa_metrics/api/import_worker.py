@@ -63,6 +63,8 @@ logger = structlog.get_logger(__name__)
 _QUEUE_URL = os.environ.get("IMPORT_QUEUE_URL", "")
 _BUCKET = os.environ.get("OSI_BUCKET_NAME", "")
 _OFFSET_LEASE_SECONDS = int(os.environ.get("IMPORT_OFFSET_LEASE_SECONDS", "960"))
+# Job error recorded when source approval / table catalog checks are unavailable.
+SOURCE_VALIDATION_UNAVAILABLE_ERROR = "Data source validation is unavailable — retry the import later"
 
 _neptune: MetricNeptuneClient | None = None
 _s3 = None
@@ -506,7 +508,8 @@ def _load_source_document(job: Mapping[str, Any], s3_key: str, metrics_total: in
 
     parse_result = parse_osi_yaml(content)
     if not parse_result.success:
-        raise InvalidImportSourceError(f"OSI YAML parse errors: {parse_result.errors}")
+        details = "; ".join(f"{e.path}: {e.message}" for e in parse_result.errors)
+        raise InvalidImportSourceError(f"OSI YAML parse errors: {details}")
     document = parse_result.document
     if document is None:
         raise InvalidImportSourceError("parsed import source did not contain an OSI document")
@@ -524,7 +527,8 @@ def _validate_datasets(namespace_id: str, job_id: str, offset: int, document: Os
     lookup = _get_lookup(namespace_id)
     resolution = resolve_datasets(document.datasets, lookup)
     if not resolution.success:
-        raise InvalidImportSourceError(f"dataset resolution failed: {resolution.errors}")
+        details = "; ".join(f"Dataset '{e.dataset_name}': {e.reason}" for e in resolution.errors)
+        raise InvalidImportSourceError(f"dataset resolution failed: {details}")
     logger.info("import_datasets_resolved", job_id=job_id, count=len(resolution.resolved))
 
 
@@ -690,7 +694,9 @@ def _process_chunk(msg: ImportQueueMessage | dict[str, Any]) -> None:
             offset=offset,
             error=str(exc),
         )
-        _fail_owned_import(namespace_id, job_id, offset, claim.token, str(exc))
+        # Stored on the job and returned by GetImportJob: fixed text only, the
+        # cause (DynamoDB / catalog error) stays in the log above.
+        _fail_owned_import(namespace_id, job_id, offset, claim.token, SOURCE_VALIDATION_UNAVAILABLE_ERROR)
         return
 
     if len(plan.entries) != expected_entry_count:

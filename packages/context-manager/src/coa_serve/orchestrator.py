@@ -43,7 +43,7 @@ from .tier2.strategy import (
     normalize_strategy_option,
 )
 from .tier3.knowledge_retriever import VECTOR_SEARCH_TIMEOUT_S, KnowledgeRetriever
-from .trace import TraceCollector
+from .trace import TraceCollector, client_error_detail
 
 logger = structlog.get_logger(__name__)
 
@@ -980,7 +980,7 @@ class Orchestrator:
                     StepId.T1_FIREWALL,
                     "error",
                     fw_ms,
-                    detail={"error": type(e).__name__, "message": str(e)[:120]},
+                    detail=client_error_detail(e),
                     tool_used="sql-firewall",
                 )
                 logger.warning(
@@ -1064,11 +1064,7 @@ class Orchestrator:
                     StepId.T1_EXECUTE,
                     "error",
                     exec_ms,
-                    detail={
-                        "error": type(e).__name__,
-                        "message": str(e)[:120],
-                        "timeoutSeconds": timeout_seconds,
-                    },
+                    detail=client_error_detail(e, timeoutSeconds=timeout_seconds),
                     tool_used="sql-engine",
                 )
                 logger.warning(
@@ -1080,12 +1076,15 @@ class Orchestrator:
                     timeout_seconds=timeout_seconds,
                 )
                 # A cross-namespace SQL reference is a policy denial, not a data-source
-                # outage: surface it as 403 with its (non-sensitive) policy reason.
+                # outage: surface it as 403 with a fixed policy reason (never the
+                # executor's message, which is not ours to vouch for).
                 # Detected via the wrapped firewall cause so the executor keeps raising
                 # its own {Athena,Redshift}QueryError (unit-test contract) and generic
                 # executor failures stay masked as DataSourceUnavailableError.
                 if isinstance(e.__cause__, NamespaceSQLScopeError):
-                    raise NamespaceScopeDeniedError(str(e)) from e
+                    raise NamespaceScopeDeniedError(
+                        "Access denied: SQL reference is outside the requested namespace"
+                    ) from e
                 raise DataSourceUnavailableError(
                     f"Metric '{metric_match.metric_name}' execution failed: {type(e).__name__}"
                 ) from e

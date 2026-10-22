@@ -5,6 +5,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as cdk from "aws-cdk-lib";
 import { Template, Match } from "aws-cdk-lib/assertions";
+import { expectIdempotencyWiring } from "../utils/idempotency-assertions";
 import { OntologyStack } from "../../lib/stacks/services/ontology-stack";
 import { NetworkStack } from "../../lib/stacks/foundation/network-stack";
 import { DEFAULT_RESOURCE_PREFIX, DEFAULT_ENV } from "../../lib/constants";
@@ -273,6 +274,11 @@ describe("OntologyStack", () => {
         allowedOrigin: "https://test.example.com",
       }),
     );
+  });
+
+  it("wires only the create-operation Lambda(s) to the idempotency table", () => {
+    // IDEMPOTENCY_TABLE env + Get/Put/Update/DeleteItem on that table only.
+    expectIdempotencyWiring(template, ["-ontology-api-proxy"]);
   });
 
   // ── DynamoDB Table ──────────────────────────────────────────────

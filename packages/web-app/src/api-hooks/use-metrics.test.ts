@@ -5,7 +5,13 @@ import { renderHook } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import React from "react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { useImportOsiFile, useExportOsi } from "./use-metrics";
+import {
+  BULK_DELETE_NAMES_MAX_ITEMS,
+  bulkDeleteInBatches,
+  useBulkDeleteMetrics,
+  useImportOsiFile,
+  useExportOsi,
+} from "./use-metrics";
 
 // ---------------------------------------------------------------------------
 // Mocks
@@ -285,5 +291,104 @@ describe("useExportOsi", () => {
 
     const { result } = renderHook(() => useExportOsi(NS_ID), { wrapper });
     await expect(result.current.mutateAsync()).rejects.toThrow(/500/);
+  });
+});
+
+describe("bulkDeleteInBatches", () => {
+  const names = (n: number) => Array.from({ length: n }, (_, i) => `m_${i}`);
+
+  it("sends a list within the server limit as one request", async () => {
+    const post = vi.fn().mockResolvedValue({ deleted: 3 });
+    const result = await bulkDeleteInBatches({ names: names(3) }, post);
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({ deleted: 3 });
+  });
+
+  it("splits a list over the server limit into ordered batches and sums the results", async () => {
+    const all = names(BULK_DELETE_NAMES_MAX_ITEMS * 2 + 5);
+    const post = vi
+      .fn()
+      .mockResolvedValueOnce({ deleted: BULK_DELETE_NAMES_MAX_ITEMS })
+      .mockResolvedValueOnce({
+        deleted: BULK_DELETE_NAMES_MAX_ITEMS - 1,
+        notFound: ["m_2000"],
+      })
+      .mockResolvedValueOnce({ deleted: 5 });
+
+    const result = await bulkDeleteInBatches({ names: all }, post);
+
+    expect(post).toHaveBeenCalledTimes(3);
+    const sent = post.mock.calls.map(
+      (c) => (c[0] as { names: string[] }).names,
+    );
+    expect(sent.map((b) => b.length)).toEqual([
+      BULK_DELETE_NAMES_MAX_ITEMS,
+      BULK_DELETE_NAMES_MAX_ITEMS,
+      5,
+    ]);
+    expect(sent.flat()).toEqual(all);
+    expect(result).toEqual({
+      deleted: BULK_DELETE_NAMES_MAX_ITEMS * 2 + 4,
+      notFound: ["m_2000"],
+    });
+  });
+
+  it("stops at a failing batch and reports what earlier batches deleted", async () => {
+    const post = vi
+      .fn()
+      .mockResolvedValueOnce({ deleted: BULK_DELETE_NAMES_MAX_ITEMS })
+      .mockRejectedValueOnce(new Error("Throttled"));
+
+    await expect(
+      bulkDeleteInBatches(
+        { names: names(BULK_DELETE_NAMES_MAX_ITEMS * 3) },
+        post,
+      ),
+    ).rejects.toThrow(
+      `Throttled (${BULK_DELETE_NAMES_MAX_ITEMS} metrics were already deleted; the remaining ${BULK_DELETE_NAMES_MAX_ITEMS * 2} were not confirmed deleted)`,
+    );
+    expect(post).toHaveBeenCalledTimes(2);
+  });
+
+  it("rethrows a first-batch failure unchanged", async () => {
+    const error = new Error("Forbidden");
+    const post = vi.fn().mockRejectedValueOnce(error);
+    await expect(
+      bulkDeleteInBatches(
+        { names: names(BULK_DELETE_NAMES_MAX_ITEMS + 1) },
+        post,
+      ),
+    ).rejects.toBe(error);
+  });
+});
+
+describe("useBulkDeleteMetrics", () => {
+  beforeEach(() => mockPost.mockReset());
+
+  it("posts each batch to the bulk-delete endpoint and refreshes the list", async () => {
+    mockPost
+      .mockResolvedValueOnce({ deleted: BULK_DELETE_NAMES_MAX_ITEMS })
+      .mockResolvedValueOnce({ deleted: 1 });
+    const { wrapper, queryClient } = makeHarness();
+    const invalidate = vi.spyOn(queryClient, "invalidateQueries");
+    const { result } = renderHook(() => useBulkDeleteMetrics(NS_ID), {
+      wrapper,
+    });
+
+    const out = await result.current.mutateAsync({
+      names: Array.from(
+        { length: BULK_DELETE_NAMES_MAX_ITEMS + 1 },
+        (_, i) => `m_${i}`,
+      ),
+    });
+
+    expect(out).toEqual({ deleted: BULK_DELETE_NAMES_MAX_ITEMS + 1 });
+    expect(mockPost).toHaveBeenCalledTimes(2);
+    expect(mockPost.mock.calls[0][0]).toBe(
+      `/namespaces/${NS_ID}/bulk-delete-metrics`,
+    );
+    expect(invalidate).toHaveBeenCalledWith({
+      queryKey: ["metrics", NS_ID],
+    });
   });
 });

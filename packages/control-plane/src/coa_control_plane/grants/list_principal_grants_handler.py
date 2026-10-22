@@ -6,20 +6,33 @@
 GET /principals/{principalId}/grants
 
 When principalId is the SELF_PRINCIPAL sentinel, resolves the caller's email
-and groups from the authorizer context and returns all grants for the user
+and groups from the authorizer context and returns the grants held by the user
 and their groups.
+
+Paginated with ``maxResults`` (default and maximum :data:`MAX_PAGE_SIZE`, so a
+caller that ignores ``nextToken`` still sees every grant unless it holds more
+than that) and an opaque ``nextToken``. The token records which of the caller's
+principal keys (self, then each group, in claim order) the next page resumes
+in, and where within it; it is only valid for a caller holding that principal
+key.
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 import os
 import re
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import Any
 
 import structlog
 from coa_common import sanitize_principal_key
-from coa_common.dao import DynamoDBDAO, QueryParams
+from coa_common.constants import PAGINATION_TOKEN_MAX_LENGTH
+from coa_common.dao import DynamoDBDAO, PaginatedResult, QueryParams
 from coa_common.logging import setup_logging
 from coa_common.response import api_response
 
@@ -73,13 +86,22 @@ concurrent use across threads.
 _GROUP_NAME_RE = re.compile(r"^[\w.@\-]+$")
 """Valid group name pattern — alphanumeric, dots, @, hyphens."""
 
+MAX_PAGE_SIZE = 1000
+"""Page-size cap and default; equals ``ListPrincipalGrants$maxResults`` @range max."""
+
+_INDEX_KEY_ATTRS = ("PK", "SK", "principalKey", "resourceRoleKey")
+"""Key attributes of a PrincipalIndex item: a valid ``ExclusiveStartKey`` for the index."""
+
+_INVALID_TOKEN = "Invalid nextToken"
+
 
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG001
-    """List all grants held by the calling principal and their groups.
+    """List the grants held by the calling principal and their groups, one page at a time.
 
     Only self-lookup is permitted: the principal id must be the ``me``
     sentinel. The caller's email and group memberships are resolved from the
-    authorizer context and every matching grant is returned.
+    authorizer context; ``maxResults`` / ``nextToken`` page through the
+    matching grants.
 
     Args:
         event: API Gateway proxy event with a ``principalId`` path parameter
@@ -92,6 +114,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
     """
     path_params = event.get("pathParameters") or {}
     principal_id = path_params.get("principalId", "")
+    query_params = event.get("queryStringParameters") or {}
 
     if not principal_id:
         return api_response(400, {"message": "principalId is required"})
@@ -146,45 +169,140 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
             principal_keys.append(f"Group::{sanitize_principal_key(group)}")
             groups_added += 1
 
+    # De-duplicate (repeated group claims) while keeping claim order, which the
+    # pagination cursor depends on.
+    principal_keys = list(dict.fromkeys(principal_keys))
+
+    try:
+        max_results = _parse_max_results(query_params.get("maxResults"))
+        cursor = _decode_cursor(query_params.get("nextToken"), principal_keys)
+    except ValueError as exc:
+        return api_response(400, {"message": str(exc)})
+
     try:
         mappings_dao = DynamoDBDAO(mappings_table, region=region)
-        seen_grant_ids: set[str] = set()
-        grants: list[dict[str, Any]] = []
 
-        def _query_principal_key(pk: str) -> list[dict[str, Any]]:
-            # query_all, not query: a single query returns one 1 MB page, so a
-            # principal with many grants would see an arbitrary subset of their
-            # own permissions here — with no indication the list is incomplete.
-            return mappings_dao.query_all(
+        def _query_key(pk: str, limit: int, start_key: dict[str, Any] | None) -> PaginatedResult:
+            return mappings_dao.query(
                 QueryParams(
                     key_condition="#pk = :pk",
                     expression_values={":pk": pk},
                     expression_names={"#pk": "principalKey"},
                     index_name="PrincipalIndex",
+                    limit=limit,
+                    exclusive_start_key=start_key,
                 )
             )
 
-        # Parallelize the per-principal-key fan-out (self + every group) over a
-        # small thread pool. Sequential queries scale request latency linearly
-        # with the caller's group count — an enterprise SSO
-        # user with 100+ group memberships would otherwise add seconds to a
-        # single page load. boto3 clients are safe for concurrent use across
-        # threads, so this is a plain I/O-bound fan-out, not a new concurrency
-        # model for the codebase.
-        worker_count = min(_MAX_GROUP_QUERY_WORKERS, len(principal_keys))
-        with ThreadPoolExecutor(max_workers=worker_count) as pool:
-            for items in pool.map(_query_principal_key, principal_keys):
-                for item in items:
-                    summary = _to_grant_summary(item)
-                    if summary["grantId"] not in seen_grant_ids:
-                        seen_grant_ids.add(summary["grantId"])
-                        grants.append(summary)
-
-        return api_response(200, {"grants": grants})
+        grants, next_cursor = _collect_page(_query_key, principal_keys, cursor, max_results)
+        response: dict[str, Any] = {"grants": grants}
+        if next_cursor is not None:
+            response["nextToken"] = _encode_cursor(next_cursor, principal_keys)
+        return api_response(200, response)
 
     except Exception:
         logger.exception("list_principal_grants_error", principal_id=email)
         return api_response(500, {"message": "Internal server error"})
+
+
+@dataclass(frozen=True)
+class _Cursor:
+    """Where a page starts: a principal key, and the index key to resume after (None = its start)."""
+
+    key_index: int
+    start_key: dict[str, Any] | None = None
+
+
+_QueryFn = Callable[[str, int, "dict[str, Any] | None"], PaginatedResult]
+
+
+def _parse_max_results(raw: str | None) -> int:
+    if raw is None:
+        return MAX_PAGE_SIZE
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("maxResults must be an integer") from exc
+    if not 1 <= value <= MAX_PAGE_SIZE:
+        raise ValueError(f"maxResults must be between 1 and {MAX_PAGE_SIZE}")
+    return value
+
+
+def _encode_cursor(cursor: _Cursor, principal_keys: list[str]) -> str:
+    payload = {"p": principal_keys[cursor.key_index], "k": cursor.start_key}
+    return base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode()).decode().rstrip("=")
+
+
+def _decode_cursor(token: str | None, principal_keys: list[str]) -> _Cursor:
+    """Decode ``nextToken``; it must name one of the caller's own principal keys."""
+    if not token:
+        return _Cursor(0)
+    if len(token) > PAGINATION_TOKEN_MAX_LENGTH:
+        raise ValueError(_INVALID_TOKEN)
+    try:
+        raw = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4))
+        payload = json.loads(raw)
+    except (binascii.Error, ValueError, UnicodeDecodeError) as exc:
+        raise ValueError(_INVALID_TOKEN) from exc
+    if not isinstance(payload, dict) or payload.get("p") not in principal_keys:
+        raise ValueError(_INVALID_TOKEN)
+    principal_key = payload["p"]
+    start_key = payload.get("k")
+    if start_key is not None and (
+        not isinstance(start_key, dict)
+        or set(start_key) != set(_INDEX_KEY_ATTRS)
+        or not all(isinstance(v, str) for v in start_key.values())
+        or start_key["principalKey"] != principal_key
+    ):
+        raise ValueError(_INVALID_TOKEN)
+    return _Cursor(principal_keys.index(principal_key), start_key)
+
+
+def _index_key(item: dict[str, Any]) -> dict[str, Any]:
+    return {attr: item[attr] for attr in _INDEX_KEY_ATTRS}
+
+
+def _collect_page(
+    query: _QueryFn, principal_keys: list[str], cursor: _Cursor, limit: int
+) -> tuple[list[dict[str, Any]], _Cursor | None]:
+    """Fill one page of grants, walking the principal keys in order from ``cursor``.
+
+    Keys are queried a window at a time in parallel, each asking for at most
+    the number of grants the page still needs, so the latency of a caller with
+    many groups stays near that of one query per window. Returns the page and
+    the cursor of the next one (None when every key is exhausted).
+    """
+    grants: list[dict[str, Any]] = []
+    seen_grant_ids: set[str] = set()
+    idx, start_key = cursor.key_index, cursor.start_key
+    workers = max(1, min(_MAX_GROUP_QUERY_WORKERS, len(principal_keys) - idx))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        while idx < len(principal_keys):
+            window = range(idx, min(idx + _MAX_GROUP_QUERY_WORKERS, len(principal_keys)))
+            need = limit - len(grants)
+            starts = [start_key if i == idx else None for i in window]
+            pages = list(pool.map(query, [principal_keys[i] for i in window], [need] * len(window), starts))
+            resume: _Cursor | None = None
+            for i, page in zip(window, pages, strict=True):
+                for pos, item in enumerate(page.items):
+                    summary = _to_grant_summary(item)
+                    if summary["grantId"] not in seen_grant_ids:
+                        seen_grant_ids.add(summary["grantId"])
+                        grants.append(summary)
+                    if len(grants) >= limit:
+                        if pos < len(page.items) - 1 or page.last_evaluated_key:
+                            return grants, _Cursor(i, _index_key(item))
+                        return grants, (_Cursor(i + 1) if i + 1 < len(principal_keys) else None)
+                if page.last_evaluated_key:
+                    # This key has more grants and the page is not full yet:
+                    # resume on it in the next round.
+                    resume = _Cursor(i, page.last_evaluated_key)
+                    break
+            if resume is not None:
+                idx, start_key = resume.key_index, resume.start_key
+            else:
+                idx, start_key = window.stop, None
+    return grants, None
 
 
 def _to_grant_summary(item: dict[str, Any]) -> dict[str, Any]:

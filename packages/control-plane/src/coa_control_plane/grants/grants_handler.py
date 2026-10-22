@@ -73,4 +73,4 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             return delete_platform_handler(event, context)
         return api_response(405, {"message": "Method not allowed"})
 
-    return api_response(404, {"message": f"Unknown route: {http_method} {resource}"})
+    return api_response(404, {"message": "Unknown route"})

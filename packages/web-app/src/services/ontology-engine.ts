@@ -13,6 +13,9 @@
  */
 import type { OntologyRecord } from "@coa/control-plane-client";
 import type { ApiClient } from "../components/ApiClientProvider";
+import { collectAllPages } from "../utils/pagination";
+
+export { LIST_ALL_MAX_PAGES } from "../utils/pagination";
 
 // ─── Types ─────────────────────────────────────────────────────────────
 
@@ -236,20 +239,76 @@ export async function getInductionJob(
 
 // ─── Proposals ─────────────────────────────────────────────────────────
 
+/** One page of the Smithy ``ListProposals`` output. */
+export interface ListProposalsPage {
+  proposals: Proposal[];
+  /** Present only when more proposals may follow; pass back as ``nextToken``. */
+  nextToken?: string;
+}
+
+type ListProposalsOpts = {
+  ontologyId?: string;
+  status?: string;
+  type?: string;
+  source_type?: string;
+  maxResults?: number;
+  nextToken?: string;
+};
+
+/**
+ * Fetch one page of a namespace's proposals (the first page unless
+ * ``opts.nextToken`` is given). Query keys use the contract's camelCase.
+ *
+ * Also accepts the pre-pagination bare-array response, so the UI keeps working
+ * against a backend rolled back to before the ``ListProposals`` envelope.
+ */
+export async function listProposalsPage(
+  apiClient: ApiClient,
+  namespace: string,
+  opts?: ListProposalsOpts,
+): Promise<ListProposalsPage> {
+  const page = await apiClient.get<ListProposalsPage | Proposal[]>(
+    `/namespaces/${encodeURIComponent(namespace)}/proposals${qs(opts ?? {})}`,
+  );
+  if (Array.isArray(page)) return { proposals: page };
+  if (!Array.isArray(page?.proposals)) {
+    console.warn("ListProposals response has no proposals list", {
+      namespace,
+    });
+    return { proposals: [], nextToken: page?.nextToken };
+  }
+  return { proposals: page.proposals, nextToken: page.nextToken };
+}
+
+/**
+ * List the first page of a namespace's proposals. Use
+ * {@link listAllProposals} when the caller needs every proposal (e.g. to
+ * decide whether ANY proposal blocks a new induction).
+ */
 export async function listProposals(
   apiClient: ApiClient,
   namespace: string,
-  opts?: {
-    ontology_id?: string;
-    status?: string;
-    type?: string;
-    source_type?: string;
-    limit?: number;
-  },
+  opts?: ListProposalsOpts,
 ): Promise<Proposal[]> {
-  return apiClient.get<Proposal[]>(
-    `/namespaces/${encodeURIComponent(namespace)}/proposals${qs(opts ?? {})}`,
-  );
+  return (await listProposalsPage(apiClient, namespace, opts)).proposals;
+}
+
+/**
+ * List every proposal in a namespace by following ``nextToken`` to the end
+ * (see {@link collectAllPages} for the short/empty-page and loop-guard rules).
+ */
+export async function listAllProposals(
+  apiClient: ApiClient,
+  namespace: string,
+  opts?: Omit<ListProposalsOpts, "nextToken">,
+): Promise<Proposal[]> {
+  return collectAllPages("ListProposals", async (nextToken) => {
+    const page = await listProposalsPage(apiClient, namespace, {
+      ...opts,
+      nextToken,
+    });
+    return { items: page.proposals, nextToken: page.nextToken };
+  });
 }
 
 export async function getProposal(
@@ -567,6 +626,10 @@ export function hasOntologyId(o: OntologyRecord): o is ListedOntology {
   return typeof o.ontologyId === "string" && o.ontologyId.length > 0;
 }
 
+/**
+ * List a namespace's ontologies. Follows ``nextToken`` across every page unless
+ * ``opts.limit`` is given, in which case only that one bounded page is fetched.
+ */
 export async function listOntologies(
   apiClient: ApiClient,
   namespace: string,
@@ -579,10 +642,20 @@ export async function listOntologies(
   // Unwraps the `{ontologies: [...]}` envelope the Smithy contract declares.
   // `?? []` guards a legacy deployment still emitting a bare array: callers get
   // an empty list rather than a crash mid-render.
-  const out = await apiClient.get<{ ontologies?: OntologyRecord[] }>(
-    `/namespaces/${encodeURIComponent(namespace)}/ontologies${qs(opts ?? {})}`,
-  );
-  return (out.ontologies ?? []).filter(hasOntologyId);
+  const fetchPage = async (nextToken: string | undefined) => {
+    const out = await apiClient.get<{
+      ontologies?: OntologyRecord[];
+      nextToken?: string;
+    }>(
+      `/namespaces/${encodeURIComponent(namespace)}/ontologies${qs({ ...opts, nextToken })}`,
+    );
+    return { items: out.ontologies ?? [], nextToken: out.nextToken };
+  };
+  const rows =
+    opts?.limit !== undefined
+      ? (await fetchPage(undefined)).items
+      : await collectAllPages("ListOntologies", fetchPage);
+  return rows.filter(hasOntologyId);
 }
 
 /**
@@ -811,13 +884,26 @@ export interface InducedDatasource {
   novel_classes_created: number;
 }
 
+/**
+ * List every datasource behind a namespace's accepted proposals, following
+ * ``nextToken`` across pages. Accepts both the paginated
+ * ``{datasources: [...], nextToken}`` envelope and the bare array older
+ * deployments returned.
+ */
 export async function listInducedDatasources(
   apiClient: ApiClient,
   namespace: string,
 ): Promise<InducedDatasource[]> {
-  return apiClient.get<InducedDatasource[]>(
-    `/namespaces/${encodeURIComponent(namespace)}/induce/datasources/induced`,
-  );
+  return collectAllPages("ListInducedDatasources", async (nextToken) => {
+    const out = await apiClient.get<
+      | InducedDatasource[]
+      | { datasources?: InducedDatasource[]; nextToken?: string }
+    >(
+      `/namespaces/${encodeURIComponent(namespace)}/induce/datasources/induced${qs({ nextToken })}`,
+    );
+    if (Array.isArray(out)) return { items: out };
+    return { items: out?.datasources ?? [], nextToken: out?.nextToken };
+  });
 }
 
 // ─── Foundational ontologies ───────────────────────────────────────────

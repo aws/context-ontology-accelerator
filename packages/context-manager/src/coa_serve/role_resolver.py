@@ -26,7 +26,7 @@ from coa_common.dao import DynamoDBDAO, QueryParams
 # canonical location is ``coa_common.principal_keys``; keeping the alias here
 # avoids churn in packages that already ``from coa_serve.role_resolver import
 # build_principal_keys``.
-__all__ = ["ResolvedProfile", "build_principal_keys", "resolve_profile"]
+__all__ = ["ResolvedProfile", "build_principal_keys", "may_view_debug_info", "resolve_profile"]
 
 logger = structlog.get_logger(__name__)
 
@@ -69,6 +69,31 @@ class ResolvedProfile:
             profile["columnDenylist"] = self.column_denylist
         if self.allowed_metrics is not None:
             profile["allowedMetrics"] = self.allowed_metrics
+
+
+# Roles entitled to ``options.includeDebugInfo`` (the generated SQL and SPARQL,
+# which name physical tables, columns and joins). Only principals who already
+# administer the namespace's sources and ontology — and so already see that
+# schema — qualify; a data analyst may query but not read the physical schema.
+# Matched by role id, so a custom role does not qualify unless listed here.
+_DEBUG_INFO_GLOBAL_ROLES = frozenset({"platform-admin"})
+_DEBUG_INFO_NAMESPACE_ROLES = frozenset({"namespace-owner", "namespace-maintainer", "data-steward"})
+
+
+def may_view_debug_info(profile: dict[str, Any], namespace: str) -> bool:
+    """Whether the resolved ``profile`` may receive debug info for ``namespace``.
+
+    ``profile`` must be the server-resolved one (client-supplied role keys are
+    stripped before resolution), so this cannot be satisfied from the request body.
+    """
+    if any(role in _DEBUG_INFO_GLOBAL_ROLES for role in profile.get("globalRoles") or ()):
+        return True
+    if not namespace:
+        return False
+    return any(
+        isinstance(rr, dict) and rr.get("resourceUID") == namespace and rr.get("role") in _DEBUG_INFO_NAMESPACE_ROLES
+        for rr in profile.get("resourceRoles") or ()
+    )
 
 
 def resolve_profile(

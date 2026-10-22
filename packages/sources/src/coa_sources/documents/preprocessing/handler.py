@@ -52,6 +52,7 @@ from coa_common.s3 import (
 )
 from coa_control_plane_server.models.source_status import SourceStatus
 
+from coa_sources.client_errors import client_safe_error
 from coa_sources.documents.preprocessing.processors import (
     _PROCESSORS,
     get_page_count,
@@ -551,7 +552,9 @@ def handler(event: dict, context: Any) -> dict:
         except Exception as exc:
             error_msg = f"Error processing {filename}: {exc}"
             logger.error(error_msg, extra=log_extra, exc_info=True)
-            issues.append({"filename": source_key, "type": "error", "reason": str(exc)})
+            # The reason is returned to callers in preprocessingIssues; the full
+            # exception is in the log line above.
+            issues.append({"filename": source_key, "type": "error", "reason": client_safe_error(exc)})
             # Continue with remaining files
 
     elapsed = round(time.time() - start_ts, 2)

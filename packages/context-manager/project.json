@@ -6,6 +6,7 @@
       "command": "uv run ruff check packages/context-manager && uv run ruff format --check packages/context-manager"
     },
     "test": {
+      "inputs": ["default", "^default", "smithyModels"],
       "command": "COVERAGE_FILE=packages/context-manager/.coverage uv run pytest packages/context-manager/tests/unit -m unit -v --tb=short --cov=packages/context-manager --cov-report=term-missing --cov-report=xml:packages/context-manager/coverage.xml --cov-fail-under=85 --junitxml=packages/context-manager/junit.xml"
     },
     "format": {

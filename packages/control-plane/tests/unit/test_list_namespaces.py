@@ -11,6 +11,7 @@ import os
 from unittest.mock import MagicMock, patch
 
 import pytest
+from botocore.exceptions import ClientError
 from coa_common.dao import PaginatedResult
 
 os.environ.update(
@@ -445,6 +446,72 @@ class TestInputValidation:
     def test_max_results_over_limit_returns_400(self):
         resp = handler(_event(global_roles="platform-admin", query_params={"maxResults": "999"}), None)
         assert resp["statusCode"] == 400
+
+
+def _token(decoded: object) -> str:
+    return base64.b64encode(json.dumps(decoded).encode()).decode()
+
+
+# Decodable tokens neither listing mints: each was a 500 before.
+_FOREIGN_TOKENS = [
+    _token({"foo": "bar"}),
+    _token([1, 2]),
+    _token("x"),
+    _token({"PK": 1, "SK": 2}),
+    "eyJvZmZzZXQiOjI1fQ==",  # {"offset": 25}, the contract's example token
+    _token({"PK": "NS#a", "SK": "METADATA", "extra": "x"}),
+]
+
+
+class TestNextTokenShape:
+    """Each listing accepts only the token shape it mints: a scan key or an offset."""
+
+    @pytest.mark.parametrize("token", [*_FOREIGN_TOKENS, base64.b64encode(b"5").decode()])
+    @patch("coa_control_plane.namespace.list_handler.DynamoDBDAO")
+    def test_cross_namespace_listing_malformed_token_returns_400(self, mock_dao_cls, token):
+        mock_ns_dao = MagicMock()
+        mock_dao_cls.side_effect = [mock_ns_dao, MagicMock()]
+
+        resp = handler(_event(global_roles="platform-admin", query_params={"nextToken": token}), None)
+
+        assert resp["statusCode"] == 400
+        assert json.loads(resp["body"]) == {"message": "Invalid nextToken"}
+        mock_ns_dao.scan.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "token",
+        [
+            *_FOREIGN_TOKENS,
+            _token({"PK": "NS#a", "SK": "METADATA"}),
+            base64.b64encode(b"-1").decode(),
+            base64.b64encode(b" 2").decode(),
+        ],
+    )
+    @patch("coa_control_plane.namespace.list_handler.DynamoDBDAO")
+    def test_scoped_listing_malformed_token_returns_400(self, mock_dao_cls, token):
+        mock_ns_dao = MagicMock()
+        mock_mappings_dao = MagicMock()
+        mock_dao_cls.side_effect = [mock_ns_dao, mock_mappings_dao]
+
+        resp = handler(_event(user_id="alice@co.com", query_params={"nextToken": token}), None)
+
+        assert resp["statusCode"] == 400
+        assert json.loads(resp["body"]) == {"message": "Invalid nextToken"}
+        mock_mappings_dao.query_all.assert_not_called()
+
+    @patch("coa_control_plane.namespace.list_handler.DynamoDBDAO")
+    def test_scan_key_rejected_by_dynamodb_returns_400(self, mock_dao_cls):
+        mock_ns_dao = MagicMock()
+        mock_dao_cls.side_effect = [mock_ns_dao, MagicMock()]
+        mock_ns_dao.scan.side_effect = ClientError(
+            {"Error": {"Code": "ValidationException", "Message": "The provided starting key is invalid"}}, "Scan"
+        )
+        token = _token({"PK": "NS#a", "SK": "METADATA"})
+
+        resp = handler(_event(global_roles="platform-admin", query_params={"nextToken": token}), None)
+
+        assert resp["statusCode"] == 400
+        assert json.loads(resp["body"]) == {"message": "Invalid nextToken"}
 
 
 class TestResponseShape:

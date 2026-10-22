@@ -6,6 +6,7 @@ import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import * as ec2 from "aws-cdk-lib/aws-ec2";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import { Template, Match } from "aws-cdk-lib/assertions";
+import { expectIdempotencyWiring } from "../utils/idempotency-assertions";
 import { NamespaceStack } from "../../lib/stacks/services";
 import { DEFAULT_RESOURCE_PREFIX, DEFAULT_ENV } from "../../lib/constants";
 
@@ -83,6 +84,11 @@ describe("NamespaceStack", () => {
         },
       });
     });
+  });
+
+  it("wires only the create-operation Lambda(s) to the idempotency table", () => {
+    // IDEMPOTENCY_TABLE env + Get/Put/Update/DeleteItem on that table only.
+    expectIdempotencyWiring(template, ["-namespace-api", "-grants-api"]);
   });
 
   // Build a fresh NamespaceStack with extra context and return the smus-login

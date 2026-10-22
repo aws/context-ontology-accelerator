@@ -36,7 +36,9 @@ def invalid_dialect_message(dialect: str) -> str:
 
     Appends a targeted hint (e.g. "for Athena-backed sources, use TRINO") when
     the caller passed a known execution-engine name instead of a SQL dialect.
+    The caller's value itself is not echoed back; the message lists the
+    accepted values instead.
     """
     hint = dialect_hint(dialect)
-    base = f"Invalid dialect '{dialect}'. Must be one of: {sorted(VALID_SQL_DIALECTS)}"
+    base = f"Invalid dialect. Must be one of: {sorted(VALID_SQL_DIALECTS)}"
     return f"{base} ({hint})" if hint else base

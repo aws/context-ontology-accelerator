@@ -8,9 +8,13 @@ $version: "2"
 
 namespace com.amazon.semanticcontext.ontologyinduction
 
+use com.amazon.semanticcontext.common#ClientToken
 use com.amazon.semanticcontext.common#ConflictError
 use com.amazon.semanticcontext.common#NotFoundError
+use com.amazon.semanticcontext.common#OntologyId
 use com.amazon.semanticcontext.common#PaginatedOutput
+use com.amazon.semanticcontext.common#PaginationToken
+use com.amazon.semanticcontext.common#PresignedUrl
 use com.amazon.semanticcontext.common#ServiceUnavailableError
 use com.amazon.semanticcontext.common#Uuid
 use com.amazon.semanticcontext.common#ValidationError
@@ -231,6 +235,7 @@ operation StartInduction {
 
         /// Data source IDs to induct from.
         @required
+        @length(max: 1000)
         datasourceIds: DataSourceIdList
 
         /// URI prefix for generated ontology classes and properties.
@@ -238,6 +243,7 @@ operation StartInduction {
         ontologyUriPrefix: OntologyUriPrefix
 
         /// Human-readable label for this induction run.
+        @length(max: 256)
         label: String
 
         /// Confidence threshold for matching against existing ontologies.
@@ -252,17 +258,27 @@ operation StartInduction {
         strategy: InductionStrategy
 
         /// Existing ontology IDs to ground against (reuse existing concepts).
-        groundingOntologyIds: OntologyIdList
+        groundingOntologyIds: GroundingOntologyIdList
 
         /// How aggressively to ground induced classes against existing ontologies.
         /// Defaults to ENHANCED when omitted.
         groundingMode: GroundingMode
 
-        /// Caller-selected lexical sources are not supported. Providing this field
-        /// returns HTTP 422 with ``detail.code`` set to ``UNSUPPORTED_SOURCE``.
-        /// Omit it to use the deployment-configured lexical source.
+        /// Caller-selected lexical sources are not supported. A Neptune Analytics
+        /// graph ARN or graph id returns HTTP 422 with ``detail.code`` set to
+        /// ``UNSUPPORTED_SOURCE``; the ``neptune-db`` sentinel names the
+        /// deployment-configured lexical source, the same as omitting the field.
         @deprecated(message: "Caller-selected lexical sources are not supported; omit this field.", since: "2026-10-01")
+        @length(min: 1, max: 2048)
+        @pattern("^(?:neptune-db|g-[a-z0-9]+|arn:aws[a-z-]*:neptune-graph:[a-z0-9-]+:[0-9]{12}:graph/g-[a-z0-9]+)$")
         graphArn: String
+
+        /// Optional idempotency token. A retry with the same token and the same
+        /// parameters within 24 hours returns the original result instead of creating
+        /// a duplicate; reusing the token with different parameters is rejected with
+        /// ConflictError (409).
+        @idempotencyToken
+        clientToken: ClientToken
     }
 
     output := {
@@ -322,8 +338,13 @@ operation GetInductionJob {
     ]
 }
 
-/// List induction jobs for a namespace.
+/// List induction jobs for a namespace, one page at a time.
+///
+/// A page can hold fewer than `maxResults` jobs, or none, while `nextToken` is
+/// present: each request reads a bounded slice of the job table. Keep paging
+/// until `nextToken` is absent. Jobs are newest-first within a page only.
 @readonly
+@paginated(inputToken: "nextToken", outputToken: "nextToken", pageSize: "maxResults", items: "jobs")
 @http(method: "GET", uri: "/namespaces/{namespaceId}/induce/jobs", code: 200)
 operation ListInductionJobs {
     input := {
@@ -337,10 +358,11 @@ operation ListInductionJobs {
 
         /// Pagination token from a previous response.
         @httpQuery("nextToken")
-        nextToken: String
+        nextToken: PaginationToken
 
-        /// Maximum number of jobs to return.
+        /// Maximum number of jobs to return in one page (default 50).
         @httpQuery("maxResults")
+        @range(min: 1, max: 200)
         maxResults: Integer
     }
 
@@ -351,25 +373,41 @@ operation ListInductionJobs {
     }
 }
 
-/// List data sources that have been successfully inducted.
+/// List data sources that have been successfully inducted, one page at a time,
+/// ordered by data source ID.
 @readonly
+@paginated(inputToken: "nextToken", outputToken: "nextToken", pageSize: "maxResults", items: "datasources")
 @http(method: "GET", uri: "/namespaces/{namespaceId}/induce/datasources/induced", code: 200)
 operation ListInducedDatasources {
     input := {
         @required
         @httpLabel
         namespaceId: Uuid
+
+        /// Pagination token from a previous response.
+        @httpQuery("nextToken")
+        nextToken: PaginationToken
+
+        /// Maximum number of data sources to return in one page (default 1000).
+        @httpQuery("maxResults")
+        @range(min: 1, max: 1000)
+        maxResults: Integer
     }
 
-    output := {
+    output := with [PaginatedOutput] {
         /// Data sources that have been successfully inducted.
         @required
         datasources: InducedDatasourceList
     }
 }
 
-/// List ontology proposals for a namespace.
+/// List ontology proposals for a namespace, newest first, one page at a time.
+///
+/// Proposals are ordered by creation time, newest first, so the first page
+/// holds the newest `maxResults` matches and later pages continue with older
+/// ones. Keep paging until `nextToken` is absent.
 @readonly
+@paginated(inputToken: "nextToken", outputToken: "nextToken", pageSize: "maxResults", items: "proposals")
 @http(method: "GET", uri: "/namespaces/{namespaceId}/proposals", code: 200)
 operation ListProposals {
     input := {
@@ -381,16 +419,29 @@ operation ListProposals {
         @httpQuery("status")
         status: ProposalStatus
 
-        /// Filter by target ontology ID.
+        /// Filter by target ontology ID. The server also accepts the legacy
+        /// spelling `ontology_id`; this one wins when both are sent.
         @httpQuery("ontologyId")
-        ontologyId: String
+        ontologyId: OntologyId
+
+        /// Filter by induction origin. `STRUCTURED` also matches proposals
+        /// recorded before the attribute existed.
+        @httpQuery("source_type")
+        sourceType: InductionSourceType
+
+        /// Filter by proposal type (e.g. `induction`), exact match.
+        @httpQuery("type")
+        @length(min: 1, max: 64)
+        proposalType: String
 
         /// Pagination token from a previous response.
         @httpQuery("nextToken")
-        nextToken: String
+        nextToken: PaginationToken
 
-        /// Maximum number of proposals to return.
+        /// Maximum number of proposals to return in one page (default 50). The
+        /// server also accepts the legacy spelling `limit`; this one wins.
         @httpQuery("maxResults")
+        @range(min: 1, max: 200)
         maxResults: Integer
     }
 
@@ -436,21 +487,21 @@ operation GetProposal {
         /// Presigned S3 GET URL for the OWL ontology Turtle when it is served
         /// out-of-band (proposals exceeding the API payload cap). Null when
         /// `ontologyTurtle` is inlined.
-        ontologyUrl: String
+        ontologyUrl: PresignedUrl
 
         /// Presigned S3 GET URL for the R2RML Turtle when served out-of-band.
-        r2rmlUrl: String
+        r2rmlUrl: PresignedUrl
 
         /// Presigned S3 GET URL for the grounding-match list (`matches.json`)
         /// when it is served out-of-band. Null when the match list is small
         /// enough to be returned inline.
-        matchesUrl: String
+        matchesUrl: PresignedUrl
 
         /// Presigned S3 GET URL for the SHACL constraint config
         /// (`constraints.ttl`) when it is served out-of-band. Null when no
         /// constraints artifact exists, in which case any small inline
         /// `constraintConfig` in `metadata` is returned instead.
-        constraintsUrl: String
+        constraintsUrl: PresignedUrl
 
         /// Proposal metadata (tables processed, classes created, etc.).
         metadata: ProposalMetadata
@@ -471,6 +522,10 @@ operation GetProposal {
 /// proposal flipped to ``accepting``. Clients poll ``GetProposal`` until
 /// ``status`` becomes ``accepted`` (success) or ``pending`` (failed —
 /// ``acceptError`` on the proposal record carries the reason).
+///
+/// Naturally idempotent, so there is no `clientToken`: accepting an
+/// already-accepted proposal returns ``accepted`` without starting a new job,
+/// and a repeat while the first accept is in progress is a ConflictError (409).
 @http(method: "POST", uri: "/namespaces/{namespaceId}/proposals/{proposalId}/accept", code: 202)
 operation AcceptProposal {
     input := {
@@ -483,7 +538,7 @@ operation AcceptProposal {
         proposalId: Uuid
 
         /// Target ontology ID to merge into. If omitted, uses the proposal's own ontology ID.
-        ontologyId: String
+        ontologyId: OntologyId
     }
 
     output := {
@@ -510,10 +565,12 @@ operation RejectProposals {
 
         /// IDs of the proposals to reject.
         @required
+        @length(max: 1000)
         proposalIds: ProposalIdList
 
         /// Reason for rejecting the proposals.
         @required
+        @length(max: 4096)
         reason: String
     }
 
@@ -572,10 +629,10 @@ operation UpdateProposal {
         proposalId: Uuid
 
         /// Revised OWL ontology in Turtle format.
-        ontologyTurtle: String
+        ontologyTurtle: TurtleDocument
 
         /// Revised R2RML mappings in Turtle format.
-        r2rmlTurtle: String
+        r2rmlTurtle: TurtleDocument
 
         /// Class-level grounding choices keyed by the match's
         /// sourceTableIdentity, or by its bare sourceTable when that name is
@@ -584,12 +641,14 @@ operation UpdateProposal {
         /// Values must be one of the candidates returned with the proposal.
         /// Grounding choices cannot be combined with Turtle/R2RML edits in the
         /// same request.
+        @length(max: 1000)
         groundingOverrides: GroundingOverrideMap
 
         /// Source tables whose grounding should be cleared so they remain
         /// novel, keyed like groundingOverrides. Kept separate from
         /// groundingOverrides because OpenAPI map values cannot faithfully
         /// preserve Smithy sparse-map nulls.
+        @length(max: 1000)
         novelTables: GroundingNovelTableList
 
         /// Set true when the revised OWL ontology was uploaded directly to S3
@@ -654,13 +713,13 @@ operation GetProposalUploadUrls {
         /// `If-None-Match: *`; after 409, 412, or an ambiguous outcome, request
         /// a fresh revision rather than reusing this URL.
         @required
-        ontologyPutUrl: String
+        ontologyPutUrl: PresignedUrl
 
         /// Create-only S3 PUT URL for the revised R2RML Turtle. Send
         /// `If-None-Match: *`; after 409, 412, or an ambiguous outcome, request
         /// a fresh revision rather than reusing this URL.
         @required
-        r2rmlPutUrl: String
+        r2rmlPutUrl: PresignedUrl
     }
 
     errors: [
@@ -669,10 +728,10 @@ operation GetProposalUploadUrls {
     ]
 }
 
-/// Trigger validation of a proposal — runs the configured tier validators
 /// Start LLM inference of semantic constraints from the proposal's ontology.
 /// Runs asynchronously (the LLM call can exceed the API-GW 29s timeout);
 /// returns 202 + a job handle. Poll GetInferConstraintsJob for the result.
+/// Each call starts a new job; send a `clientToken` to make a retry safe.
 @http(method: "POST", uri: "/namespaces/{namespaceId}/proposals/{proposalId}/infer-constraints", code: 202)
 operation InferConstraints {
     input := {
@@ -683,6 +742,13 @@ operation InferConstraints {
         @required
         @httpLabel
         proposalId: Uuid
+
+        /// Optional idempotency token. A retry with the same token and the same
+        /// parameters within 24 hours returns the original job handle instead of
+        /// starting a second job; reusing the token with different parameters is
+        /// rejected with a 409.
+        @idempotencyToken
+        clientToken: ClientToken
     }
 
     output := {
@@ -746,6 +812,9 @@ operation GetInferConstraintsJob {
 }
 
 /// Compile a reviewed ConstraintConfig into SHACL Turtle.
+///
+/// Pure computation over the request and the stored proposal; nothing is
+/// persisted, so a retry is harmless and there is no `clientToken`.
 @http(method: "POST", uri: "/namespaces/{namespaceId}/proposals/{proposalId}/compile-constraints", code: 200)
 operation CompileConstraints {
     input := {
@@ -757,12 +826,14 @@ operation CompileConstraints {
         @httpLabel
         proposalId: Uuid
 
-        /// Reviewed ConstraintConfig to compile into SHACL.
+        /// Reviewed ConstraintConfig to compile into SHACL. At most 65536 bytes
+        /// once serialized as JSON; larger configs are rejected with a 400.
         @required
+        @tags(["bounded-at-runtime"])
         constraint_config: Document
 
         /// Optional custom SHACL Turtle to merge with the compiled shapes.
-        custom_turtle: String
+        custom_turtle: TurtleDocument
     }
 
     output := {
@@ -779,8 +850,10 @@ operation CompileConstraints {
     ]
 }
 
+/// Trigger validation of a proposal — runs the configured tier validators
 /// (HermiT reasoning, structural metrics, OoPS!) and returns a job ID for
-/// polling.
+/// polling. Each call starts a new job; send a `clientToken` to make a retry
+/// safe.
 @http(method: "POST", uri: "/namespaces/{namespaceId}/proposals/{proposalId}/validate", code: 202)
 operation ValidateProposal {
     input := {
@@ -793,13 +866,21 @@ operation ValidateProposal {
         proposalId: Uuid
 
         /// Validator tiers to run (defaults to all three tiers if omitted).
+        @length(max: 10)
         tiers: ProposalValidationTierList
 
         /// Optional SHACL shapes Turtle for tier-1 SHACL validation.
-        shaclShapesTurtle: String
+        shaclShapesTurtle: TurtleDocument
 
         /// Optional competency-question prompts for tier-3 LLM validators.
-        competencyQuestions: StringList
+        competencyQuestions: CompetencyQuestionList
+
+        /// Optional idempotency token. A retry with the same token and the same
+        /// parameters within 24 hours returns the original job handle instead of
+        /// starting a second validation job; reusing the token with different
+        /// parameters is rejected with a 409.
+        @idempotencyToken
+        clientToken: ClientToken
     }
 
     output := {
@@ -878,6 +959,9 @@ operation GetProposalValidationJob {
 /// With `dryRun` true, computes and returns the same change list WITHOUT
 /// persisting — used by the accept-time guard to detect unrepaired datatype
 /// issues before an accept, without mutating the proposal.
+///
+/// Naturally idempotent, so there is no `clientToken`: a repeat finds the
+/// tokens already canonical and rewrites nothing (`repairedCount` 0).
 @http(method: "POST", uri: "/namespaces/{namespaceId}/proposals/{proposalId}/repair-datatypes", code: 200)
 operation RepairProposalDatatypes {
     input := {
@@ -1116,14 +1200,18 @@ string GroundingOverrideTargetUri
 
 /// Source-table grounding choices. Values are candidate ontology class URIs.
 map GroundingOverrideMap {
-    key: String
+    key: GroundingSourceTableKey
     value: GroundingOverrideTargetUri
 }
 
 /// Source tables whose grounding should be cleared so they remain novel.
 list GroundingNovelTableList {
-    member: String
+    member: GroundingSourceTableKey
 }
+
+/// A match's sourceTableIdentity, or its bare sourceTable name.
+@length(min: 1, max: 1024)
+string GroundingSourceTableKey
 
 list DataSourceIdList {
     member: DataSourceId
@@ -1132,6 +1220,29 @@ list DataSourceIdList {
 list OntologyIdList {
     member: String
 }
+
+/// Existing ontology IDs to ground an induction run against. Input-only; the
+/// induced proposal reports what it actually used in `OntologyIdList`.
+@length(max: 100)
+list GroundingOntologyIdList {
+    member: OntologyId
+}
+
+/// Natural-language competency questions a proposal is checked against.
+@length(max: 100)
+list CompetencyQuestionList {
+    member: CompetencyQuestion
+}
+
+/// A single competency question.
+@length(min: 1, max: 4096)
+string CompetencyQuestion
+
+/// An RDF Turtle document sent inline. Bounded by the 6 MB synchronous
+/// request ceiling of the serving function; larger artifacts go through the
+/// presigned-upload path instead.
+@length(max: 6000000)
+string TurtleDocument
 
 list ConceptMatchList {
     member: ConceptMatch
@@ -1263,6 +1374,9 @@ structure ProposalValidationReport {
 // Foundational Ontologies
 // ──────────────────────────────────────────────
 /// List the curated catalog of foundational ontologies available for grounding.
+///
+/// Not paginated: the catalog is a fixed list compiled into the service (a
+/// handful of entries), not data that grows per namespace.
 @readonly
 @http(method: "GET", uri: "/namespaces/{namespaceId}/ontology/foundational", code: 200)
 operation ListFoundationalOntologies {
@@ -1280,6 +1394,7 @@ operation ListFoundationalOntologies {
 }
 
 /// Trigger loading/embedding of a foundational ontology into the namespace.
+/// Each call starts a new load job; send a `clientToken` to make a retry safe.
 @http(method: "POST", uri: "/namespaces/{namespaceId}/ontology/foundational/{key}/load", code: 202)
 operation LoadFoundationalOntology {
     input := {
@@ -1290,7 +1405,14 @@ operation LoadFoundationalOntology {
         /// Catalog key of the foundational ontology to load.
         @required
         @httpLabel
+        @length(min: 1, max: 128)
         key: String
+
+        /// Optional idempotency token. A retry with the same token within 24
+        /// hours returns the original job handle instead of starting a second
+        /// load; reusing the token for a different key is rejected with a 409.
+        @idempotencyToken
+        clientToken: ClientToken
     }
 
     output := {

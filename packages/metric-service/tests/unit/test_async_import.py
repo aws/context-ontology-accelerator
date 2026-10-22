@@ -9,6 +9,8 @@ import json
 from unittest.mock import MagicMock, patch
 
 import pytest
+from coa_metrics.api.import_worker import SOURCE_VALIDATION_UNAVAILABLE_ERROR
+from coa_metrics.dataset_resolver import ResolutionError
 from coa_metrics.osi_parser import (
     MAX_SQL_EXPRESSION_LENGTH,
     OsiCustomExtension,
@@ -1871,7 +1873,9 @@ class TestImportWorker:
         mock_get_job.return_value = self._active_job(1)
         mock_claim.return_value = OffsetClaim(OffsetClaimState.ACQUIRED, "claim-token")
         self._mock_document(mock_s3, mock_parse, 1, datasets=[MagicMock()])
-        mock_resolve.return_value = MagicMock(success=False, errors=["bad"])
+        mock_resolve.return_value = MagicMock(
+            success=False, errors=[ResolutionError(dataset_name="sales", reason="Data source 'ds-x' does not exist")]
+        )
 
         _process_chunk(self._msg())
 
@@ -1880,7 +1884,7 @@ class TestImportWorker:
             "j-1",
             offset=0,
             claim_token="claim-token",
-            error="dataset resolution failed: ['bad']",
+            error="dataset resolution failed: Dataset 'sales': Data source 'ds-x' does not exist",
         )
         mock_complete.assert_not_called()
 
@@ -2277,16 +2281,20 @@ class TestImportWorker:
 
         with patch(
             "coa_metrics.api.import_worker.check_source_approved",
-            side_effect=SourceValidationUnavailableError("sources table unavailable"),
+            side_effect=SourceValidationUnavailableError(
+                "sources table read failed (AccessDeniedException): arn:aws:dynamodb:us-east-1:123456789012:table/x"
+            ),
         ):
             _process_chunk(self._msg())
 
+        # The stored job error (returned by GetImportJob) is fixed text, never the
+        # exception message with its ARN / account ID.
         mock_fail_claimed.assert_called_once_with(
             "ns-1",
             "j-1",
             offset=0,
             claim_token="claim-token",
-            error="sources table unavailable",
+            error=SOURCE_VALIDATION_UNAVAILABLE_ERROR,
         )
         mock_store_job_offset_plan.assert_not_called()
         mock_neptune.return_value.get_metric.assert_not_called()

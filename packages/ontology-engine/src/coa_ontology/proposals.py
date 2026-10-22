@@ -33,16 +33,16 @@ from collections import Counter
 from collections.abc import Callable
 from datetime import UTC, datetime
 from threading import Thread
-from typing import TYPE_CHECKING, Any, Self
+from typing import TYPE_CHECKING, Annotated, Any, Self
 from urllib.parse import urlsplit
 
 from botocore.exceptions import ClientError
 from coa_common import sql_ident as _sql_ident
 from coa_common.constants import EVENT_SOURCE_PREFIX, VOCAB_URI, split_sql_ident_path
 from coa_control_plane_server.models.proposal_status import ProposalStatus
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 from rdflib import Graph
 
 from coa_ontology import dynamo_store
@@ -53,6 +53,7 @@ from coa_ontology.catalog.ingest import (
     ingest_ontology,
     wait_for_embeddings_searchable,
 )
+from coa_ontology.pagination import InvalidNextToken, decode_next_token, page_body
 from coa_ontology.stores import build_stores as _build_stores  # noqa: F401 (re-exported for tests)
 
 if TYPE_CHECKING:
@@ -127,6 +128,19 @@ class RejectRequest(BaseModel):
     reason: str
 
 
+# UpdateProposal grounding bounds, per ``ontology-induction.smithy``:
+# groundingOverrides / novelTables @length(max: 1000); keys and novel-table
+# entries are GroundingSourceTableKey @length(min: 1, max: 1024); override
+# values are GroundingOverrideTargetUri @length(min: 1, max: 2048).
+MAX_GROUNDING_CHOICES = 1000
+MAX_GROUNDING_SOURCE_TABLE_KEY_LENGTH = 1024
+MAX_GROUNDING_TARGET_URI_LENGTH = 2048
+_GroundingSourceTableKey = Annotated[
+    str, StringConstraints(min_length=1, max_length=MAX_GROUNDING_SOURCE_TABLE_KEY_LENGTH)
+]
+_GroundingTargetUri = Annotated[str, StringConstraints(min_length=1, max_length=MAX_GROUNDING_TARGET_URI_LENGTH)]
+
+
 class UpdateProposalRequest(BaseModel):
     """Request body for editing a proposal's ontology and/or R2RML Turtle."""
 
@@ -144,8 +158,12 @@ class UpdateProposalRequest(BaseModel):
     # cap. The server reads the uploaded artifact back from S3 to validate it.
     ontology_uploaded: bool = Field(default=False, alias="ontologyUploaded")
     r2rml_uploaded: bool = Field(default=False, alias="r2rmlUploaded")
-    grounding_overrides: dict[str, str] | None = Field(default=None, alias="groundingOverrides")
-    novel_tables: list[str] | None = Field(default=None, alias="novelTables")
+    grounding_overrides: dict[_GroundingSourceTableKey, _GroundingTargetUri] | None = Field(
+        default=None, alias="groundingOverrides", max_length=MAX_GROUNDING_CHOICES
+    )
+    novel_tables: list[_GroundingSourceTableKey] | None = Field(
+        default=None, alias="novelTables", max_length=MAX_GROUNDING_CHOICES
+    )
     upload_revision_id: str | None = Field(default=None, alias="uploadRevisionId")
 
     @model_validator(mode="after")
@@ -970,19 +988,41 @@ def _emit_ontology_published(namespace: str, version: str) -> bool:
 # ── Routes ──────────────────────────────────────────────────────────────
 
 
+# ListProposals ``maxResults`` bounds and default. The max equals the Smithy
+# ``ListProposals.maxResults`` @range max (checked by a parity test). Also applied
+# to the legacy ``limit`` spelling so neither can ask for an unbounded page.
+LIST_PROPOSALS_DEFAULT_MAX_RESULTS = 50
+LIST_PROPOSALS_MAX_RESULTS = 200
+
+
+def proposals_list_scope(namespace: str | None) -> str:
+    """``nextToken`` scope of a ListProposals listing (see :mod:`coa_ontology.pagination`)."""
+    return f"proposals:{namespace}" if namespace else "proposals:*"
+
+
 @router.get("/")
 def list_proposals(
     namespace: str | None = None,
-    ontology_id: str | None = None,
+    ontology_id: str | None = Query(None, alias="ontologyId"),
+    legacy_ontology_id: str | None = Query(None, alias="ontology_id"),
     status: str | None = None,
     type: str | None = None,
     source_type: str | None = None,
-    limit: int = 50,
-):
-    """List proposals with optional filters, newest first.
+    max_results: int | None = Query(None, alias="maxResults", ge=1, le=LIST_PROPOSALS_MAX_RESULTS),
+    legacy_limit: int | None = Query(None, alias="limit", ge=1, le=LIST_PROPOSALS_MAX_RESULTS),
+    next_token: str | None = Query(None, alias="nextToken"),
+) -> dict[str, Any]:
+    """List one page of proposals, as the Smithy ``ListProposals`` output.
 
-    ``limit`` keeps the newest ``limit`` matches (see
-    :func:`dynamo_store.list_proposals`).
+    Returns ``{"proposals": [...], "nextToken": "..."}``; ``nextToken`` is present
+    only when more results may follow, and is passed back unchanged to fetch the
+    next page. A malformed token, or one minted for another namespace, is a 400.
+
+    Query parameters use the contract's camelCase (``maxResults``, ``nextToken``,
+    ``ontologyId``) — the API proxy forwards them verbatim, so a snake_case-only
+    binding would silently drop them. The pre-contract spellings ``limit`` and
+    ``ontology_id`` still bind for existing callers; the contract spelling wins
+    when both are sent.
 
     The ``source_type`` query parameter is forwarded to
     :func:`dynamo_store.list_proposals` unchanged — see that function's
@@ -991,20 +1031,31 @@ def list_proposals(
     not validate the value (no ``Literal`` restriction): unknown values
     simply produce no matches, which lets the route degrade gracefully
     if a client sends a stale enum member.
+
+    Proposals are returned newest first (by ``created_at``); ``limit`` /
+    ``maxResults`` therefore keep the newest matches, and later pages continue
+    with older ones.
     """
-    items = dynamo_store.list_proposals(
+    scope = proposals_list_scope(namespace)
+    try:
+        start_key = decode_next_token(next_token, scope=scope)
+    except InvalidNextToken as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    items, next_key = dynamo_store.list_proposals_newest_page(
         namespace=namespace,
-        ontology_id=ontology_id,
+        ontology_id=ontology_id or legacy_ontology_id,
         status=status,
         proposal_type=type,
         source_type=source_type,
-        limit=limit,
+        limit=max_results or legacy_limit or LIST_PROPOSALS_DEFAULT_MAX_RESULTS,
+        after=start_key,
     )
-    # Strip large content fields from list view
+    # Defensive: the Turtle artifacts live in S3, but never let an inline copy
+    # bloat the list view.
     for item in items:
         item.pop("ontology_turtle", None)
         item.pop("r2rml_turtle", None)
-    return items
+    return page_body("proposals", items, next_key, scope=scope)
 
 
 @router.get("/{proposal_id}")
@@ -2791,6 +2842,12 @@ class CompileConstraintsRequest(BaseModel):
     custom_turtle: str | None = None
 
 
+# Upper bound on a CompileConstraints ``constraint_config`` once serialized as
+# JSON. A Smithy Document member cannot carry @length, so the model states the
+# bound in its docs and this enforces it before the config is compiled.
+MAX_CONSTRAINT_CONFIG_BYTES = 64 * 1024
+
+
 @router.post("/{proposal_id}/compile-constraints")
 def compile_constraints(proposal_id: str, body: CompileConstraintsRequest, namespace: str = "default"):
     """Compile a reviewed ConstraintConfig into SHACL Turtle.
@@ -2799,6 +2856,10 @@ def compile_constraints(proposal_id: str, body: CompileConstraintsRequest, names
     and receives compiled SHACL ready for validation.
     """
     from coa_ontology.validation.shapes.config import ConstraintConfig, compile_to_shacl
+
+    serialized = json.dumps(body.constraint_config, separators=(",", ":"), ensure_ascii=False, default=str)
+    if len(serialized.encode("utf-8")) > MAX_CONSTRAINT_CONFIG_BYTES:
+        raise HTTPException(400, f"constraint_config exceeds {MAX_CONSTRAINT_CONFIG_BYTES} bytes")
 
     item = dynamo_store.get_proposal_by_id(proposal_id, namespace=namespace)
     if not item:

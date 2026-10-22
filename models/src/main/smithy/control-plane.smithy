@@ -8,6 +8,8 @@ namespace com.amazon.semanticcontext
 use aws.apigateway#authorizer
 use aws.apigateway#authorizers
 use aws.protocols#restJson1
+use com.amazon.semanticcontext.common#InternalServerError
+use com.amazon.semanticcontext.common#ServiceUnavailableError
 use com.amazon.semanticcontext.common#ValidationError
 use com.amazon.semanticcontext.grant#CreateGrant
 use com.amazon.semanticcontext.grant#CreatePlatformGrant
@@ -221,6 +223,8 @@ service ControlPlaneService {
     ]
     errors: [
         ValidationError
+        InternalServerError
+        ServiceUnavailableError
     ]
 }
 

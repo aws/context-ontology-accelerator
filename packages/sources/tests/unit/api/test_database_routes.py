@@ -10,12 +10,14 @@ full module path strings so the patches apply to the correct namespace.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 from unittest.mock import MagicMock, call, create_autospec, patch
 
 import pytest
 from botocore.exceptions import ClientError
+from coa_common.dao.base import PaginatedResult
 from coa_common.datazone_forms import FORM_TYPE_NAME
 from coa_control_plane_server.models.source_type import SourceType
 
@@ -2573,6 +2575,83 @@ class TestHandleListTables:
             status, _ = _parse(_dr._handle_list_tables(self._make_list_event(), _NAMESPACE_ID, _SOURCE_ID))
 
         assert status == 500
+
+    @pytest.mark.parametrize(
+        "token",
+        [
+            base64.b64encode(json.dumps({"foo": "bar"}).encode()).decode(),
+            base64.b64encode(json.dumps([1, 2]).encode()).decode(),
+            base64.b64encode(json.dumps("x").encode()).decode(),
+            base64.b64encode(json.dumps({"PK": 1, "SK": 2}).encode()).decode(),
+            "eyJvZmZzZXQiOjI1fQ==",
+            base64.urlsafe_b64encode(json.dumps({"PK": "a", "SK": "b"}).encode()).decode().rstrip("="),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "error",
+        [
+            {"Error": {"Code": "ValidationException", "Message": "Invalid pagination token"}},
+            {"Error": {"Code": "BadRequestException", "Message": "x"}, "ResponseMetadata": {"HTTPStatusCode": 400}},
+        ],
+    )
+    def test_list_tables_search_rejects_caller_token_returns_400(self, token, error):
+        """The token is the catalog search's own cursor; its refusal of a caller token is a client error."""
+        from coa_common.metadata_store.exceptions import MetadataStoreError
+
+        mock_ns_dao = dao_double()
+        mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
+        mock_smus = MagicMock()
+        cause = ClientError(error, "Search")
+        wrapped = MetadataStoreError("Failed to search assets: Invalid pagination token")
+        wrapped.__cause__ = cause
+        mock_smus.search_assets.side_effect = wrapped
+
+        with (
+            patch(f"{_DR}._SMUS_DOMAIN_ID", "domain-id"),
+            patch(f"{_DR}._get_ns_dao", return_value=mock_ns_dao),
+            patch(f"{_DR}._get_smus_client", return_value=mock_smus),
+        ):
+            status, body = _parse(
+                _dr._handle_list_tables(self._make_list_event({"nextToken": token}), _NAMESPACE_ID, _SOURCE_ID)
+            )
+
+        assert status == 400
+        assert body == {"error": "Invalid nextToken"}
+
+    @pytest.mark.parametrize(
+        ("error", "qs"),
+        [
+            # Without a caller token the request is entirely this route's own.
+            ({"Error": {"Code": "ValidationException", "Message": "bad"}}, {}),
+            # Throttling and access refusals are not the token's fault.
+            (
+                {"Error": {"Code": "ThrottlingException", "Message": "x"}, "ResponseMetadata": {"HTTPStatusCode": 429}},
+                {"nextToken": "tok"},
+            ),
+            (
+                {
+                    "Error": {"Code": "AccessDeniedException", "Message": "x"},
+                    "ResponseMetadata": {"HTTPStatusCode": 403},
+                },
+                {"nextToken": "tok"},
+            ),
+        ],
+    )
+    def test_list_tables_other_search_failures_stay_500(self, error, qs):
+        mock_ns_dao = dao_double()
+        mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
+        mock_smus = MagicMock()
+        mock_smus.search_assets.side_effect = ClientError(error, "Search")
+
+        with (
+            patch(f"{_DR}._SMUS_DOMAIN_ID", "domain-id"),
+            patch(f"{_DR}._get_ns_dao", return_value=mock_ns_dao),
+            patch(f"{_DR}._get_smus_client", return_value=mock_smus),
+        ):
+            status, body = _parse(_dr._handle_list_tables(self._make_list_event(qs), _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 500
+        assert body == {"error": "Failed to search tables"}
 
     def test_list_tables_with_next_token(self):
         from coa_common.datazone_forms import FORM_TYPE_NAME
@@ -5718,36 +5797,45 @@ class TestUpdateTableKeys:
 
 @pytest.mark.unit
 class TestHandleListScanJobs:
-    def test_lists_newest_first_and_defaults_missing_event_type_to_scan(self):
+    @staticmethod
+    def _source_dao() -> MagicMock:
         mock_dao = MagicMock()
         mock_dao.get.return_value = {"PK": f"NS#{_NAMESPACE_ID}", "SK": f"SRC#{_SOURCE_ID}"}
+        return mock_dao
+
+    def _list(self, scan_dao: MagicMock, qs: dict | None = None, source_dao: MagicMock | None = None):
+        with (
+            patch(f"{_DR}._get_dao", return_value=source_dao or self._source_dao()),
+            patch(f"{_DR}._get_scan_dao", return_value=scan_dao),
+        ):
+            return _parse(_dr._handle_list_scan_jobs({"queryStringParameters": qs}, _NAMESPACE_ID, _SOURCE_ID))
+
+    def test_lists_newest_first_and_defaults_missing_event_type_to_scan(self):
         mock_scan_dao = MagicMock()
         # Returned oldest-first on purpose: the handler must sort newest-first.
-        mock_scan_dao.query_all.return_value = [
-            {
-                "PK": f"SRC#{_SOURCE_ID}",
-                "SK": "2026-01-01T00:00:00Z",
-                "status": "COMPLETED",
-                "scanType": "full",
-                "tablesDiscovered": 5,
-                # No eventType — a legacy scan row; must default to SCAN.
-            },
-            {
-                "PK": f"SRC#{_SOURCE_ID}",
-                "SK": "2026-01-02T00:00:00Z",
-                "eventType": "REVIEW",
-                "decision": "APPROVED",
-                "isRescan": False,
-                "tablesApproved": 5,
-                "status": "APPROVED",
-            },
-        ]
+        mock_scan_dao.query.return_value = PaginatedResult(
+            items=[
+                {
+                    "PK": f"SRC#{_SOURCE_ID}",
+                    "SK": "2026-01-01T00:00:00Z",
+                    "status": "COMPLETED",
+                    "scanType": "full",
+                    "tablesDiscovered": 5,
+                    # No eventType — a legacy scan row; must default to SCAN.
+                },
+                {
+                    "PK": f"SRC#{_SOURCE_ID}",
+                    "SK": "2026-01-02T00:00:00Z",
+                    "eventType": "REVIEW",
+                    "decision": "APPROVED",
+                    "isRescan": False,
+                    "tablesApproved": 5,
+                    "status": "APPROVED",
+                },
+            ]
+        )
 
-        with (
-            patch(f"{_DR}._get_dao", return_value=mock_dao),
-            patch(f"{_DR}._get_scan_dao", return_value=mock_scan_dao),
-        ):
-            status, body = _parse(_dr._handle_list_scan_jobs(_NAMESPACE_ID, _SOURCE_ID))
+        status, body = self._list(mock_scan_dao)
 
         assert status == 200
         items = body["items"]
@@ -5761,41 +5849,68 @@ class TestHandleListScanJobs:
         assert items[1]["eventType"] == "SCAN"
         assert items[1]["tablesDiscovered"] == 5
         assert "decision" not in items[1]
+        assert "nextToken" not in body
+        params = mock_scan_dao.query.call_args.args[0]
+        assert params.limit == 1000 and params.exclusive_start_key is None and params.scan_forward is False
 
     def test_list_scan_jobs_source_not_found(self):
         mock_dao = MagicMock()
         mock_dao.get.return_value = None
-        with (
-            patch(f"{_DR}._get_dao", return_value=mock_dao),
-            patch(f"{_DR}._get_scan_dao", return_value=MagicMock()),
-        ):
-            status, _ = _parse(_dr._handle_list_scan_jobs(_NAMESPACE_ID, _SOURCE_ID))
+        status, _ = self._list(MagicMock(), source_dao=mock_dao)
         assert status == 404
 
     def test_list_scan_jobs_empty_returns_empty_items(self):
-        mock_dao = MagicMock()
-        mock_dao.get.return_value = {"PK": f"NS#{_NAMESPACE_ID}", "SK": f"SRC#{_SOURCE_ID}"}
         mock_scan_dao = MagicMock()
-        mock_scan_dao.query_all.return_value = []
-        with (
-            patch(f"{_DR}._get_dao", return_value=mock_dao),
-            patch(f"{_DR}._get_scan_dao", return_value=mock_scan_dao),
-        ):
-            status, body = _parse(_dr._handle_list_scan_jobs(_NAMESPACE_ID, _SOURCE_ID))
+        mock_scan_dao.query.return_value = PaginatedResult(items=[])
+        status, body = self._list(mock_scan_dao)
         assert status == 200
         assert body["items"] == []
 
     def test_list_scan_jobs_scan_dao_error_returns_500(self):
-        mock_dao = MagicMock()
-        mock_dao.get.return_value = {"PK": f"NS#{_NAMESPACE_ID}", "SK": f"SRC#{_SOURCE_ID}"}
         mock_scan_dao = MagicMock()
-        mock_scan_dao.query_all.side_effect = ClientError({"Error": {"Code": "InternalError"}}, "Query")
-        with (
-            patch(f"{_DR}._get_dao", return_value=mock_dao),
-            patch(f"{_DR}._get_scan_dao", return_value=mock_scan_dao),
-        ):
-            status, _ = _parse(_dr._handle_list_scan_jobs(_NAMESPACE_ID, _SOURCE_ID))
+        mock_scan_dao.query.side_effect = ClientError({"Error": {"Code": "InternalError"}}, "Query")
+        status, _ = self._list(mock_scan_dao)
         assert status == 500
+
+    def test_list_scan_jobs_pages_with_opaque_token_scoped_to_the_source(self):
+        mock_scan_dao = MagicMock()
+        last_key = {"PK": f"SRC#{_SOURCE_ID}", "SK": "2026-01-02T00:00:00Z"}
+        mock_scan_dao.query.return_value = PaginatedResult(
+            items=[{**last_key, "status": "COMPLETED"}], last_evaluated_key=last_key
+        )
+        status, first = self._list(mock_scan_dao, {"maxResults": "1"})
+        assert status == 200
+        token = first["nextToken"]
+        assert _SOURCE_ID not in base64.urlsafe_b64decode(token).decode()
+        assert mock_scan_dao.query.call_args.args[0].limit == 1
+
+        mock_scan_dao.query.return_value = PaginatedResult(items=[])
+        status, second = self._list(mock_scan_dao, {"nextToken": token})
+        assert status == 200 and "nextToken" not in second
+        assert mock_scan_dao.query.call_args.args[0].exclusive_start_key == last_key
+
+    @pytest.mark.parametrize(
+        "token",
+        [
+            "not-base64!!",
+            base64.urlsafe_b64encode(b"[1]").decode(),
+            base64.urlsafe_b64encode(json.dumps({"SK": "x", "PK": "SRC#other"}).encode()).decode(),
+            "x" * 8193,
+        ],
+    )
+    def test_list_scan_jobs_rejects_bad_token(self, token):
+        mock_scan_dao = MagicMock()
+        status, body = self._list(mock_scan_dao, {"nextToken": token})
+        assert status == 400
+        assert token not in body["error"]
+        mock_scan_dao.query.assert_not_called()
+
+    @pytest.mark.parametrize("max_results", ["0", "1001", "abc"])
+    def test_list_scan_jobs_rejects_out_of_range_max_results(self, max_results):
+        mock_scan_dao = MagicMock()
+        status, _ = self._list(mock_scan_dao, {"maxResults": max_results})
+        assert status == 400
+        mock_scan_dao.query.assert_not_called()
 
 
 @pytest.mark.unit

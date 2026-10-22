@@ -345,6 +345,15 @@ class NLtoSQLStrategy:
             if (_graph_expand_enabled(options) and self._graph_client is not None)
             else None
         )
+        # Which source and database each retrieved table lives in, for a namespace
+        # pooling several Glue databases; the executor owns the sources registry.
+        table_placements = None
+        if self._query_executor and hasattr(self._query_executor, "resolve_table_placements"):
+            executor = self._query_executor
+
+            async def table_placements(table_sources: dict[str, str]) -> dict[str, tuple[str, str]]:
+                return await executor.resolve_table_placements(namespace, table_sources)
+
         nl_to_sql_result = await self._sql_generator.generate(
             query,
             namespace=namespace,
@@ -360,6 +369,7 @@ class NLtoSQLStrategy:
             # unpinned, so pre-retrieval we forward best-effort). Empty on every
             # non-declining path, keeping the prompt byte-identical to the baseline.
             governed_metric=_governed_metric_block(context.declined_metric, data_source_id),
+            table_placements=table_placements,
         )
 
         t_ms = int((time.perf_counter() - t_start) * 1000)
@@ -603,7 +613,15 @@ class NLtoSQLStrategy:
                 sql, confidence = await self._sql_generator.correct(
                     query,
                     nl_to_sql_result.ddl_context,
-                    failed_sql=fw_result.authorized_sql,
+                    # The statement handed to the executor (post-qualification), which
+                    # is what the engine reported its line/column positions against.
+                    # The pre-qualification text differs from it on a cross-source
+                    # query (catalog/schema rewrite, single-line sqlglot rendering), so
+                    # the error coordinates pointed into a statement the model never
+                    # saw. The executor may still cap LIMIT or transpile, so this is the
+                    # closest text the strategy has to what ran. correct() is reached
+                    # only after execute() ran, so exec_sql is always set here.
+                    failed_sql=exec_sql,
                     execution_error=last_error,
                     evidence=evidence,
                     model_id=context.model_id,
@@ -692,7 +710,8 @@ class NLtoSQLStrategy:
                 StepId.T2_SQL_FIREWALL,
                 "error",
                 fw_ms,
-                detail={"error": "unsafe_sql", "message": str(e)[:200]},
+                # Fixed code only: the firewall message quotes the offending SQL.
+                detail={"error": "unsafe_sql"},
                 tool_used="sql-firewall",
             )
             logger.warning("nl_to_sql_unsafe_sql", message=str(e), security_event="unsafe_sql_attempt")

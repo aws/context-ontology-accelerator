@@ -6,6 +6,9 @@ import {
   triggerInduction,
   getInductionJob,
   listProposals,
+  listProposalsPage,
+  listAllProposals,
+  LIST_ALL_MAX_PAGES,
   getProposal,
   getProposalUploadUrls,
   updateProposal,
@@ -15,6 +18,7 @@ import {
   validateProposal,
   getProposalValidationJob,
   listOntologies,
+  listInducedDatasources,
   deleteOntology,
   searchEntities,
   getClass,
@@ -53,16 +57,112 @@ describe("ontology-engine API wrappers", () => {
   });
 
   it("listProposals appends a query string from opts", async () => {
-    await listProposals(api, "ns", { status: "pending", limit: 5 });
+    await listProposals(api, "ns", { status: "pending", maxResults: 5 });
     const url = get.mock.calls[0][0] as string;
     expect(url.startsWith("/namespaces/ns/proposals")).toBe(true);
     expect(url).toContain("status=pending");
-    expect(url).toContain("limit=5");
+    expect(url).toContain("maxResults=5");
   });
 
   it("listProposals with no opts hits the bare endpoint", async () => {
     await listProposals(api, "ns");
     expect(get).toHaveBeenCalledWith("/namespaces/ns/proposals");
+  });
+
+  it("listProposals unwraps the paginated ListProposals envelope", async () => {
+    get.mockResolvedValueOnce({
+      proposals: [{ proposal_id: "p1" }],
+      nextToken: "t",
+    });
+    await expect(listProposals(api, "ns")).resolves.toEqual([
+      { proposal_id: "p1" },
+    ]);
+  });
+
+  it("listProposalsPage returns the proposals and the nextToken", async () => {
+    get.mockResolvedValueOnce({
+      proposals: [{ proposal_id: "p1" }],
+      nextToken: "t",
+    });
+    await expect(listProposalsPage(api, "ns")).resolves.toEqual({
+      proposals: [{ proposal_id: "p1" }],
+      nextToken: "t",
+    });
+  });
+
+  it("listProposalsPage tolerates the legacy bare-array response", async () => {
+    get.mockResolvedValueOnce([{ proposal_id: "p1" }]);
+    await expect(listProposalsPage(api, "ns")).resolves.toEqual({
+      proposals: [{ proposal_id: "p1" }],
+    });
+  });
+
+  it("listProposalsPage warns and returns no proposals when the list is missing", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    get.mockResolvedValueOnce({ nextToken: "t" });
+    await expect(listProposalsPage(api, "ns")).resolves.toEqual({
+      proposals: [],
+      nextToken: "t",
+    });
+    expect(warn).toHaveBeenCalledOnce();
+    warn.mockRestore();
+  });
+
+  it("listAllProposals follows nextToken across short and empty pages", async () => {
+    get
+      .mockResolvedValueOnce({
+        proposals: [{ proposal_id: "p1" }],
+        nextToken: "a",
+      })
+      .mockResolvedValueOnce({ proposals: [], nextToken: "b" })
+      .mockResolvedValueOnce({ proposals: [{ proposal_id: "p2" }] });
+    await expect(
+      listAllProposals(api, "ns", { status: "pending" }),
+    ).resolves.toEqual([{ proposal_id: "p1" }, { proposal_id: "p2" }]);
+    expect(get).toHaveBeenCalledTimes(3);
+    expect(get.mock.calls[0][0]).toBe(
+      "/namespaces/ns/proposals?status=pending",
+    );
+    expect(get.mock.calls[1][0]).toBe(
+      "/namespaces/ns/proposals?status=pending&nextToken=a",
+    );
+    expect(get.mock.calls[2][0]).toBe(
+      "/namespaces/ns/proposals?status=pending&nextToken=b",
+    );
+  });
+
+  it("listAllProposals stops when the server repeats a token", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    get.mockResolvedValue({
+      proposals: [{ proposal_id: "p" }],
+      nextToken: "same",
+    });
+    const all = await listAllProposals(api, "ns");
+    expect(get).toHaveBeenCalledTimes(2);
+    expect(all).toHaveLength(2);
+    expect(warn).toHaveBeenCalledOnce();
+    warn.mockRestore();
+  });
+
+  it("listAllProposals stops at the page limit", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let n = 0;
+    get.mockImplementation(async () => ({
+      proposals: [],
+      nextToken: `t${n++}`,
+    }));
+    await expect(listAllProposals(api, "ns")).resolves.toEqual([]);
+    expect(get).toHaveBeenCalledTimes(LIST_ALL_MAX_PAGES);
+    expect(warn).toHaveBeenCalledOnce();
+    warn.mockRestore();
+  });
+
+  it("listAllProposals accepts the legacy bare-array response as the only page", async () => {
+    get.mockResolvedValueOnce([{ proposal_id: "p1" }]);
+    await expect(listAllProposals(api, "ns")).resolves.toEqual([
+      { proposal_id: "p1" },
+    ]);
+    expect(get).toHaveBeenCalledTimes(1);
   });
 
   it("getProposal GETs the proposal by id", async () => {
@@ -133,6 +233,56 @@ describe("ontology-engine API wrappers", () => {
     const url = get.mock.calls[0][0] as string;
     expect(url).toContain("ontology_type=domain");
     expect(url).toContain("limit=10");
+  });
+
+  it("listOntologies follows nextToken across pages", async () => {
+    get
+      .mockResolvedValueOnce({
+        ontologies: [{ ontologyId: "o1", uri: "o1" }],
+        nextToken: "a",
+      })
+      .mockResolvedValueOnce({ ontologies: [], nextToken: "b" })
+      .mockResolvedValueOnce({ ontologies: [{ ontologyId: "o2", uri: "o2" }] });
+    const rows = await listOntologies(api, "ns");
+    expect(rows.map((r) => r.ontologyId)).toEqual(["o1", "o2"]);
+    expect(get.mock.calls.map((c) => c[0])).toEqual([
+      "/namespaces/ns/ontologies",
+      "/namespaces/ns/ontologies?nextToken=a",
+      "/namespaces/ns/ontologies?nextToken=b",
+    ]);
+  });
+
+  it("listOntologies with an explicit limit fetches only that page", async () => {
+    get.mockResolvedValueOnce({
+      ontologies: [{ ontologyId: "o1", uri: "o1" }],
+      nextToken: "a",
+    });
+    await expect(listOntologies(api, "ns", { limit: 1 })).resolves.toHaveLength(
+      1,
+    );
+    expect(get).toHaveBeenCalledTimes(1);
+  });
+
+  it("listInducedDatasources pages the {datasources} envelope", async () => {
+    get
+      .mockResolvedValueOnce({
+        datasources: [{ datasourceId: "d1" }],
+        nextToken: "a",
+      })
+      .mockResolvedValueOnce({ datasources: [{ datasourceId: "d2" }] });
+    const rows = await listInducedDatasources(api, "ns");
+    expect(rows.map((r) => r.datasourceId)).toEqual(["d1", "d2"]);
+    expect(get.mock.calls[1][0]).toBe(
+      "/namespaces/ns/induce/datasources/induced?nextToken=a",
+    );
+  });
+
+  it("listInducedDatasources accepts the legacy bare array", async () => {
+    get.mockResolvedValueOnce([{ datasourceId: "d1" }]);
+    await expect(listInducedDatasources(api, "ns")).resolves.toEqual([
+      { datasourceId: "d1" },
+    ]);
+    expect(get).toHaveBeenCalledTimes(1);
   });
 
   // ── ListOntologies wire contract ──

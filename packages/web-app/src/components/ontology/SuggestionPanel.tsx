@@ -53,6 +53,7 @@ import {
   splitOnSemicolons,
   splitStatements,
 } from "../../utils/turtleLexer";
+import { useAppI18n } from "../../i18n/LocaleProvider";
 
 export interface SuggestedPair {
   child: string;
@@ -75,6 +76,7 @@ interface Props {
 }
 
 export function SuggestionPanel({ iri, turtle, onTurtleEdit, labelOf }: Props) {
+  const { t } = useAppI18n();
   const [deferred, setDeferred] = useState<Set<string>>(new Set());
   const [batchPrompt, setBatchPrompt] = useState<{
     parent: string;
@@ -134,7 +136,7 @@ export function SuggestionPanel({ iri, turtle, onTurtleEdit, labelOf }: Props) {
 
   return (
     <Container
-      header={<Header variant="h3">Suggested inheritance</Header>}
+      header={<Header variant="h3">{t("Suggested inheritance")}</Header>}
       data-testid="suggestion-panel"
     >
       <SpaceBetween size="s">
@@ -145,14 +147,16 @@ export function SuggestionPanel({ iri, turtle, onTurtleEdit, labelOf }: Props) {
               key={`${pair.child}-${pair.parent}`}
               type="info"
               data-testid={`suggestion-${localName(pair.parent)}`}
-              header={`Looks like ${labelOf(pair.child)} could be a subclass of ${labelOf(pair.parent)}`}
+              header={t("Looks like {child} could be a subclass of {parent}", {
+                child: labelOf(pair.child),
+                parent: labelOf(pair.parent),
+              })}
             >
               <SpaceBetween size="xs">
                 <Box variant="small">
-                  Auto-detected from PK-sharing — child and parent share the
-                  same primary-key column. Confirm to promote to
-                  rdfs:subClassOf, reject to leave the FK as a regular has-a
-                  relation.
+                  {t(
+                    "Auto-detected from PK-sharing — child and parent share the same primary-key column. Confirm to promote to rdfs:subClassOf, reject to leave the FK as a regular has-a relation.",
+                  )}
                 </Box>
                 {pair.reason && (
                   <Box>
@@ -165,11 +169,13 @@ export function SuggestionPanel({ iri, turtle, onTurtleEdit, labelOf }: Props) {
                     onClick={() => handleConfirm(pair)}
                     data-testid={`confirm-${localName(pair.parent)}`}
                   >
-                    Confirm
+                    {t("Confirm")}
                   </Button>
-                  <Button onClick={() => handleReject(pair)}>Reject</Button>
+                  <Button onClick={() => handleReject(pair)}>
+                    {t("Reject")}
+                  </Button>
                   <Button variant="link" onClick={() => handleDefer(pair)}>
-                    Defer
+                    {t("Defer")}
                   </Button>
                 </SpaceBetween>
               </SpaceBetween>
@@ -178,13 +184,27 @@ export function SuggestionPanel({ iri, turtle, onTurtleEdit, labelOf }: Props) {
         {batchPrompt && (
           <Alert
             type="success"
-            header={`Found ${batchPrompt.pairs.length} similar pending suggestion${batchPrompt.pairs.length === 1 ? "" : "s"} on ${labelOf(batchPrompt.parent)}`}
+            header={t(
+              batchPrompt.pairs.length === 1
+                ? "Found {count} similar pending suggestion on {parent}"
+                : "Found {count} similar pending suggestions on {parent}",
+              {
+                count: batchPrompt.pairs.length,
+                parent: labelOf(batchPrompt.parent),
+              },
+            )}
             data-testid="batch-suggestion-card"
           >
             <SpaceBetween size="xs">
               <Box variant="small">
-                {batchPrompt.pairs.map((p) => labelOf(p.child)).join(", ")}{" "}
-                share the same parent. Apply the same confirm to all?
+                {t(
+                  "{children} share the same parent. Apply the same confirm to all?",
+                  {
+                    children: batchPrompt.pairs
+                      .map((p) => labelOf(p.child))
+                      .join(", "),
+                  },
+                )}
               </Box>
               <SpaceBetween direction="horizontal" size="xs">
                 <Button
@@ -192,10 +212,12 @@ export function SuggestionPanel({ iri, turtle, onTurtleEdit, labelOf }: Props) {
                   onClick={handleBatchApply}
                   data-testid="batch-apply-all"
                 >
-                  Apply all {batchPrompt.pairs.length}
+                  {t("Apply all {count}", {
+                    count: batchPrompt.pairs.length,
+                  })}
                 </Button>
                 <Button onClick={() => setBatchPrompt(null)}>
-                  Review individually
+                  {t("Review individually")}
                 </Button>
               </SpaceBetween>
             </SpaceBetween>

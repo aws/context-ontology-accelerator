@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from coa_mcp.tools.execution import (
+    QUERY_TIMEOUT_MS_MAX,
     execute_graph_traversal,
     execute_query,
     execute_rag_retrieval,
@@ -197,17 +198,45 @@ class TestExecuteQuery:
         payload = mock_cm.invoke.call_args[0][0]
         assert "timeoutMs" not in payload["options"]
 
-    @pytest.mark.parametrize("bad", [0, -5, "abc", 1.5, 2.0, True, False])
+    @pytest.mark.parametrize("bad", [0, -5, QUERY_TIMEOUT_MS_MAX + 1, "abc", "5000", 1.5, 2.0, True, False])
     @pytest.mark.asyncio
-    async def test_invalid_timeout_ms_dropped(self, mock_cm, profile, bad):
-        """Non-positive, non-int, and bool values are dropped rather than
-        coerced — identical to the data-layer handler, so a bad value can never
-        smuggle a degenerate budget (e.g. ``int(1.5) == 1``) into the CM
-        deadline. Note ``2.0`` is dropped too: only a genuine ``int`` is valid,
-        matching handler.py byte-for-byte."""
-        await execute_query(mock_cm, "test", "ns", profile, "tok", timeout_ms=bad)
-        payload = mock_cm.invoke.call_args[0][0]
-        assert "timeoutMs" not in payload["options"]
+    async def test_invalid_timeout_ms_rejected(self, mock_cm, profile, bad):
+        """An out-of-contract budget is a tool error, as it is a 400 on the REST
+        surface — never dropped (the caller would silently get the full budget) or
+        coerced (``int(1.5) == 1`` would smuggle a 1ms budget). ``2.0`` and ``bool``
+        are rejected too: only a genuine ``int`` is valid."""
+        with pytest.raises(ValueError, match="timeoutMs"):
+            await execute_query(mock_cm, "test", "ns", profile, "tok", timeout_ms=bad)
+        mock_cm.invoke.assert_not_called()
+
+    @pytest.mark.parametrize("edge", [1, 29_000, 29_001, QUERY_TIMEOUT_MS_MAX])
+    @pytest.mark.asyncio
+    async def test_timeout_ms_bounds_are_inclusive(self, mock_cm, profile, edge):
+        await execute_query(mock_cm, "test", "ns", profile, "tok", timeout_ms=edge)
+        assert mock_cm.invoke.call_args[0][0]["options"]["timeoutMs"] == edge
+
+    def test_timeout_ms_bound_derives_from_transport_timeout(self):
+        """The MCP bound is the CM transport timeout, not the model's REST bound.
+
+        MCP calls the Context Manager directly, so the API Gateway limit behind
+        ``serve.smithy``'s ``Query.timeoutMs`` @range does not apply; the minimum
+        still matches the model.
+        """
+        import re
+        from pathlib import Path
+
+        from coa_mcp.clients import context_manager
+        from coa_mcp.tools import execution
+
+        assert execution.QUERY_TIMEOUT_MS_MAX == context_manager._INVOKE_TIMEOUT_S * 1000
+
+        model = Path(__file__).resolve().parents[4] / "models" / "src" / "main" / "smithy" / "serve.smithy"
+        op = re.search(r"operation Query \{(.*?)\n\}", model.read_text(), re.DOTALL)
+        assert op, "operation Query not found in serve.smithy"
+        declared = re.search(r"@range\(min:\s*(\d+),\s*max:\s*(\d+)\)\s*timeoutMs:", op.group(1))
+        assert declared, "Query.timeoutMs @range not found"
+        assert int(declared.group(1)) == execution.QUERY_TIMEOUT_MS_MIN
+        assert int(declared.group(2)) <= execution.QUERY_TIMEOUT_MS_MAX
 
 
 @pytest.mark.unit
@@ -352,9 +381,8 @@ class TestQueryStrategyForwarding:
     """``strategy`` must reach CM's ``options`` — it is the only way a caller can
     deliberately select the Ontop/VKG engine rather than getting it as a fallback.
 
-    Contrast ``timeoutMs``, which ``execute_query`` deliberately omits because CM has
-    no reader for it. ``strategy`` does have one
-    (``Orchestrator._resolve_strategy_selection``), so dropping it would reinstate
+    CM has a reader for it (``Orchestrator._resolve_strategy_selection``), so
+    dropping it would reinstate
     the original defect — the Ontop/VKG engine reachable only as an automatic
     fallback — rather than guarding against a phantom field.
     """

@@ -17,6 +17,7 @@ import { DynamoDBTable } from "../../constructs/dynamodb-table";
 import { Paths, fromRoot } from "../../paths";
 import { resolveContext } from "../../context";
 import { bundlePython } from "../../utils/python-bundling";
+import { grantIdempotencyTable } from "../../utils/idempotency";
 import { NamespaceDeletionPipeline } from "./namespace-deletion-pipeline";
 import { METRIC_API_FUNCTION_NAME } from "./metric-service-stack";
 import { TABLE_NAMES } from "@coa/shared";
@@ -710,6 +711,8 @@ export class NamespaceStack extends SCLStack {
     );
 
     namespaces.table.grantReadWriteData(namespaceApiFn);
+    // CreateNamespace is retry-safe with a caller-supplied clientToken.
+    grantIdempotencyTable(this, namespaceApiFn);
     props.rolesTable.grantReadWriteData(namespaceApiFn);
     props.resourceRoleMappingsTable.grantReadWriteData(namespaceApiFn);
 
@@ -934,6 +937,8 @@ export class NamespaceStack extends SCLStack {
     });
     props.rolesTable.grantReadData(grantsApiFn);
     props.resourceRoleMappingsTable.grantReadWriteData(grantsApiFn);
+    // CreateGrant / CreatePlatformGrant are retry-safe with a clientToken.
+    grantIdempotencyTable(this, grantsApiFn);
 
     this.grantsApiFn = grantsApiFn;
 

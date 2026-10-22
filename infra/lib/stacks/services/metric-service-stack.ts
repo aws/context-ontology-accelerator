@@ -31,6 +31,7 @@ import {
   DEFAULT_GRAPH_URI_BASE,
 } from "../../constants";
 import { bundlePython } from "../../utils/python-bundling";
+import { grantIdempotencyTable } from "../../utils/idempotency";
 import { bedrockModelArn } from "../../utils/bedrock-utils";
 
 /** Name (without the `{prefix}-{env}-` prefix) of the metric API Lambda. */
@@ -182,6 +183,9 @@ export class MetricServiceStack extends SCLStack {
         PROJECT_ACCESS_ROLE_ARN: projectAccessRoleArn,
       },
     });
+
+    // CreateMetric / ImportOsi are retry-safe with a caller-supplied clientToken.
+    grantIdempotencyTable(this, this.metricApiFn);
 
     // ── IAM: S3 (OSI import/export) ──────────────────────────────
     this.metricApiFn.addToRolePolicy(

@@ -13,9 +13,9 @@ import pytest
 MODULE = "coa_control_plane.namespace.update_status_handler"
 
 _NS_ITEM = {
-    "PK": "NS#ns-123",
+    "PK": "NS#11111111-1111-4111-8111-111111111111",
     "SK": "METADATA",
-    "namespaceId": "ns-123",
+    "namespaceId": "11111111-1111-4111-8111-111111111111",
     "name": "sales",
     "displayName": "Sales Domain",
     "owner": "bob@example.com",
@@ -53,7 +53,7 @@ class TestUpdateNamespaceStatus:
             from coa_control_plane.namespace.update_status_handler import handler
 
             event = {
-                "pathParameters": {"namespaceId": "ns-123"},
+                "pathParameters": {"namespaceId": "11111111-1111-4111-8111-111111111111"},
                 "body": json.dumps({"status": "ARCHIVED"}),
                 "httpMethod": "PATCH",
                 "resource": "/namespaces/{namespaceId}/status",
@@ -74,7 +74,7 @@ class TestUpdateNamespaceStatus:
             from coa_control_plane.namespace.update_status_handler import handler
 
             event = {
-                "pathParameters": {"namespaceId": "ns-123"},
+                "pathParameters": {"namespaceId": "11111111-1111-4111-8111-111111111111"},
                 "body": json.dumps({"status": "ACTIVE"}),
                 "httpMethod": "PATCH",
                 "resource": "/namespaces/{namespaceId}/status",
@@ -92,7 +92,7 @@ class TestUpdateNamespaceStatus:
             from coa_control_plane.namespace.update_status_handler import handler
 
             event = {
-                "pathParameters": {"namespaceId": "ns-123"},
+                "pathParameters": {"namespaceId": "11111111-1111-4111-8111-111111111111"},
                 "body": json.dumps({"status": "DELETED"}),
                 "httpMethod": "PATCH",
                 "resource": "/namespaces/{namespaceId}/status",
@@ -111,7 +111,7 @@ class TestUpdateNamespaceStatus:
             from coa_control_plane.namespace.update_status_handler import handler
 
             event = {
-                "pathParameters": {"namespaceId": "ns-123"},
+                "pathParameters": {"namespaceId": "11111111-1111-4111-8111-111111111111"},
                 "body": json.dumps({"status": "DELETED"}),
                 "httpMethod": "PATCH",
                 "resource": "/namespaces/{namespaceId}/status",
@@ -130,7 +130,7 @@ class TestUpdateNamespaceStatus:
             from coa_control_plane.namespace.update_status_handler import handler
 
             event = {
-                "pathParameters": {"namespaceId": "ns-123"},
+                "pathParameters": {"namespaceId": "11111111-1111-4111-8111-111111111111"},
                 "body": json.dumps({"status": "DELETED"}),
                 "httpMethod": "PATCH",
                 "resource": "/namespaces/{namespaceId}/status",
@@ -149,7 +149,7 @@ class TestUpdateNamespaceStatus:
             from coa_control_plane.namespace.update_status_handler import handler
 
             event = {
-                "pathParameters": {"namespaceId": "ns-123"},
+                "pathParameters": {"namespaceId": "11111111-1111-4111-8111-111111111111"},
                 "body": json.dumps({"status": "ACTIVE"}),
                 "httpMethod": "PATCH",
                 "resource": "/namespaces/{namespaceId}/status",
@@ -166,7 +166,7 @@ class TestUpdateNamespaceStatus:
             from coa_control_plane.namespace.update_status_handler import handler
 
             event = {
-                "pathParameters": {"namespaceId": "ns-123"},
+                "pathParameters": {"namespaceId": "11111111-1111-4111-8111-111111111111"},
                 "body": json.dumps({"status": "INVALID"}),
                 "httpMethod": "PATCH",
                 "resource": "/namespaces/{namespaceId}/status",
@@ -184,7 +184,7 @@ class TestUpdateNamespaceStatus:
             from coa_control_plane.namespace.update_status_handler import handler
 
             event = {
-                "pathParameters": {"namespaceId": "ns-999"},
+                "pathParameters": {"namespaceId": "99999999-9999-4999-8999-999999999999"},
                 "body": json.dumps({"status": "ARCHIVED"}),
                 "httpMethod": "PATCH",
                 "resource": "/namespaces/{namespaceId}/status",
@@ -206,7 +206,7 @@ class TestNamespaceLanguage:
         with patch(f"{MODULE}._get_ns_dao", return_value=dao):
             resp = handler(
                 {
-                    "pathParameters": {"namespaceId": "ns-123"},
+                    "pathParameters": {"namespaceId": "11111111-1111-4111-8111-111111111111"},
                     "body": json.dumps({"status": "ARCHIVED"}),
                     "httpMethod": "PATCH",
                     "resource": "/namespaces/{namespaceId}/status",

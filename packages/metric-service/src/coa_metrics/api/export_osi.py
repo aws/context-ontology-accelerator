@@ -26,6 +26,7 @@ from coa_common.logging import setup_logging
 from coa_common.response import api_response
 from coa_control_plane_server.models.export_format import ExportFormat
 
+from coa_metrics.api.contract import EXPORT_NAMES_MAX_ITEMS, check_metric_name_list
 from coa_metrics.neptune_client import (
     MetricDefinition,
     MetricNeptuneClient,
@@ -78,6 +79,11 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     if not namespace:
         return api_response(400, {"message": "namespaceId is required"})
 
+    if names is not None:
+        names_error = check_metric_name_list(names, "names", max_items=EXPORT_NAMES_MAX_ITEMS)
+        if names_error:
+            return api_response(400, {"message": names_error})
+
     if export_format not in (ExportFormat.INLINE, ExportFormat.S3):
         return api_response(
             400,
@@ -97,11 +103,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         return api_response(500, {"message": "Failed to retrieve metrics"})
 
     if not metrics:
-        message = (
-            f"No matching metrics found in namespace '{namespace}'"
-            if names
-            else f"No metrics found in namespace '{namespace}'"
-        )
+        message = "No matching metrics found in namespace" if names else "No metrics found in namespace"
         return api_response(404, {"message": message})
 
     # Convert to OSI document

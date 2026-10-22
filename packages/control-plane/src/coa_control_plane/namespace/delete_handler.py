@@ -38,7 +38,7 @@ from urllib.error import HTTPError, URLError
 
 import boto3
 import structlog
-from coa_common.constants import SOURCE_ACTIVE_STATUSES
+from coa_common.constants import SOURCE_ACTIVE_STATUSES, validate_namespace_id
 from coa_common.dao import DynamoDBDAO, QueryParams
 from coa_common.response import api_response
 from coa_control_plane_server.models.namespace_status import NamespaceStatus
@@ -88,11 +88,15 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
 
     if not namespace_id:
         return api_response(400, {"message": "namespaceId is required"})
+    try:
+        validate_namespace_id(namespace_id)
+    except ValueError as exc:
+        return api_response(400, {"message": str(exc)})
 
     dao = _get_ns_dao()
     item = dao.get({"PK": f"NS#{namespace_id}", "SK": "METADATA"})
     if not item:
-        return api_response(404, {"message": f"Namespace not found: {namespace_id}"})
+        return api_response(404, {"message": "Namespace not found"})
 
     current_status = item.get("status")
 

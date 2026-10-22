@@ -99,7 +99,7 @@ def _get_role(roles_dao: DynamoDBDAO, namespace_id: str, role_id: str) -> dict[s
     item = roles_dao.get({"PK": f"NS#{namespace_id}", "SK": f"{_ROLE_SK_PREFIX}{role_id}"})
 
     if not item:
-        return api_response(404, {"message": f"Role '{role_id}' not found"})
+        return api_response(404, {"message": "Role not found"})
 
     detail = RoleDetail.model_construct(
         role_id=role_id,

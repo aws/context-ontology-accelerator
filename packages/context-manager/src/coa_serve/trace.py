@@ -22,6 +22,18 @@ logger = structlog.get_logger(__name__)
 OnRecordCallback = Callable[[TraceStep], Awaitable[None]]
 
 
+def client_error_detail(exc: BaseException, **extra: object) -> dict[str, object]:
+    """Build a trace-step ``detail`` for a caught exception that is safe to return to a client.
+
+    Trace steps are serialized into API responses and SSE events, so the
+    exception MESSAGE must not go here: a botocore, Neptune or SQL-engine message
+    routinely names ARNs, account IDs, hostnames and schema objects (CWE-209).
+    Truncation does not help — the sensitive part is usually at the front. Only
+    the exception type is surfaced; log the full message at the call site.
+    """
+    return {"error": type(exc).__name__, **extra}
+
+
 class TraceCollector:
     """Collects TraceStep entries as the pipeline progresses.
 

@@ -339,6 +339,23 @@ class TestOntopStrategyResolve:
         assert result is None
 
     @pytest.mark.asyncio
+    async def test_vkg_exception_trace_names_the_type_not_the_backend_text(
+        self, strategy, nl_to_sparql, vkg_translator
+    ):
+        """CWE-209: the compile step reaches the client; the VKG message (backend
+        response body, internal URLs) must stay in the logs."""
+        secret = "VKG returned 500: http://vkg.internal:8080/sparql/translate failed"
+        nl_to_sparql.translate.return_value = _make_sparql_result()
+        vkg_translator.resolve.side_effect = RuntimeError(secret)
+        context = _make_context()
+
+        assert await strategy.resolve("query", "ns1", context) is None
+
+        compile_errors = [s for s in context.trace.steps if s.step == "t2.vkg.compile" and s.status == "error"]
+        assert compile_errors and compile_errors[0].detail == {"error": "RuntimeError"}
+        assert secret not in str([s.detail for s in context.trace.steps])
+
+    @pytest.mark.asyncio
     async def test_retry_second_vkg_call_also_fails_returns_none(self, strategy, nl_to_sparql, vkg_translator):
         nl_to_sparql.translate.return_value = _make_sparql_result()
 

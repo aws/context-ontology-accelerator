@@ -3,6 +3,9 @@
   "namedInputs": { "default": ["typescript"] },
   "implicitDependencies": ["coa-web-app"],
   "targets": {
+    "test": {
+      "inputs": ["default", "^default", "smithyModels"]
+    },
     "synth": {
       "command": "pnpm --filter coa-infra exec cdk synth",
       "dependsOn": ["build"]

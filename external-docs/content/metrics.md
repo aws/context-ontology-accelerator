@@ -75,6 +75,7 @@ Current constraints to factor into the decision:
 `POST /namespaces/{namespaceId}/metrics` with `name`, `description`,
 `expression.dialects`, `dataSourceId`, and `sourceTable` — see **CreateMetric**
 in the [API Reference](#/api-reference) for the full request/response schema.
+Create calls are retry-safe with an optional `clientToken` — see [Retrying Creates Safely](namespaces.md#retrying-creates-safely).
 
 ## Metric Validation
 

@@ -31,6 +31,7 @@ import time
 
 from coa_control_plane_server.models.source_status import SourceStatus
 
+from coa_sources.client_errors import client_safe_error
 from coa_sources.database.pipeline.enrichment_metrics import (
     EnrichmentContext,
     EnrichmentMetricEmitter,
@@ -323,7 +324,8 @@ def handler() -> None:
         )
         scan_dao.update(
             key=scan_job_key,
-            update_fields={"errorMessage": str(exc)},
+            # Returned to callers by the scan-job routes: client-safe text only.
+            update_fields={"errorMessage": client_safe_error(exc)},
             condition="attribute_exists(PK)",
             raise_on_error=False,
         )

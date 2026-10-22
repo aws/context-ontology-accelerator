@@ -344,6 +344,29 @@ class TestKnowledgeRetrieverPartialFailure:
         with pytest.raises(Exception, match="Bedrock throttled"):
             await retriever.resolve("test query", "550e8400-e29b-41d4-a716-446655440000", embedding=[0.1] * 10)
 
+    async def test_synthesis_failure_trace_omits_exception_message(
+        self, vector_retriever, graph_traverser, mock_bedrock
+    ):
+        """CWE-209: the synthesize error step reaches the client; it names the type only."""
+        from coa_serve.trace import TraceCollector
+
+        secret = "arn:aws:bedrock:us-east-1:123456789012:guardrail/abc is not authorized"
+        failing_bedrock = AsyncMock()
+        failing_bedrock.converse.side_effect = RuntimeError(secret)
+        retriever = KnowledgeRetriever(
+            vector_retriever, graph_traverser, Synthesizer(failing_bedrock, guardrail_id="gr-123")
+        )
+        trace = TraceCollector()
+
+        with pytest.raises(RuntimeError):
+            await retriever.resolve(
+                "test query", "550e8400-e29b-41d4-a716-446655440000", embedding=[0.1] * 10, trace=trace
+            )
+
+        assert secret not in str(trace.steps_serializable)
+        errored = [s for s in trace.steps_serializable if s.get("status") == "error"]
+        assert errored and errored[-1]["detail"] == {"error": "RuntimeError"}
+
 
 @pytest.mark.unit
 class TestKnowledgeRetrieverDegradedSources:
@@ -364,6 +387,18 @@ class TestKnowledgeRetrieverDegradedSources:
         deg = result.degraded_sources[0]
         assert deg["source"] == "t3.vector_search"
         assert deg["reason"] == "error"
+
+    async def test_degraded_source_detail_names_the_type_not_the_message(self, graph_traverser, synthesizer):
+        """CWE-209: ``degradedSources`` reaches the client, so it must not carry the
+        backend's error text (hostnames, index names)."""
+        secret = "https://vpc-internal.example:443 index coa-chunks-ns1"
+        failing_os = AsyncMock()
+        failing_os.search.side_effect = ConnectionError(secret)
+        retriever = KnowledgeRetriever(VectorRetriever(failing_os), graph_traverser, synthesizer)
+        result = await retriever.resolve("test", "550e8400-e29b-41d4-a716-446655440000", embedding=[0.1] * 10)
+
+        assert result.degraded_sources[0]["detail"] == "ConnectionError"
+        assert secret not in str(result.degraded_sources)
 
     async def test_source_timeout_recorded_as_timeout(self, graph_traverser, synthesizer, monkeypatch):
         import coa_serve.tier3.knowledge_retriever as kr

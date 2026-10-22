@@ -20,6 +20,7 @@ from coa_common.constants import EVENT_SOURCE_PREFIX
 from coa_common.logging import setup_logging
 from coa_common.response import api_response
 
+from coa_metrics.api.contract import check_metric_name
 from coa_metrics.neptune_client import MetricNeptuneClient
 from coa_metrics.opensearch_client import MetricOpenSearchClient
 
@@ -60,11 +61,14 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
 
     if not name:
         return api_response(400, {"message": "Metric name is required in path"})
+    name_error = check_metric_name(name)
+    if name_error:
+        return api_response(400, {"message": name_error})
 
     # Delete from Neptune (returns False if not found)
     deleted = _get_neptune().delete_metric(namespace, name)
     if not deleted:
-        return api_response(404, {"message": f"Metric '{name}' not found in namespace '{namespace}'"})
+        return api_response(404, {"message": "Metric not found in namespace"})
 
     # Delete OpenSearch embedding (best-effort)
     try:

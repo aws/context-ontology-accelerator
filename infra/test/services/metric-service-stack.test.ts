@@ -4,6 +4,7 @@
 import * as cdk from "aws-cdk-lib";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import { Template, Match } from "aws-cdk-lib/assertions";
+import { expectIdempotencyWiring } from "../utils/idempotency-assertions";
 import { NetworkStack } from "../../lib/stacks/foundation/network-stack";
 import { MetricServiceStack } from "../../lib/stacks/services/metric-service-stack";
 import { DEFAULT_BEDROCK_MODEL_ID } from "../../lib/constants";
@@ -36,6 +37,11 @@ describe("MetricServiceStack", () => {
         env: TEST_ENV,
       }),
     );
+  });
+
+  it("wires only the create-operation Lambda(s) to the idempotency table", () => {
+    // IDEMPOTENCY_TABLE env + Get/Put/Update/DeleteItem on that table only.
+    expectIdempotencyWiring(template, ["-metric-api"]);
   });
 
   // ── Lambda Function ─────────────────────────────────────────────

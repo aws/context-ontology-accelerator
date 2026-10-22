@@ -850,3 +850,77 @@ class TestVendorBlockShapeWarnings:
 
         assert response["statusCode"] == 200
         assert not any("not part of OSI" in w or "no source_table" in w for w in self._warnings(response))
+
+
+# ── Client-safe failure text ────────────────────────────────────────────
+
+_INTERNAL_DETAIL = "arn:aws:neptune-db:us-east-1:123456789012:cluster-ABC/* AccessDenied"
+
+
+class TestImportOsiFailureTextIsClientSafe:
+    """Backend failures surface as fixed per-metric warnings; the exception text is only logged."""
+
+    def _assert_safe(self, resp: dict) -> list[str]:
+        assert resp["statusCode"] == 200, resp["body"]
+        assert "123456789012" not in resp["body"] and "arn:aws" not in resp["body"]
+        return json.loads(resp["body"])["warnings"]
+
+    @patch("coa_metrics.api.import_osi._get_opensearch")
+    @patch("coa_metrics.api.import_osi._get_neptune")
+    def test_lookup_failure_warning_names_metric_without_exception(self, mock_neptune, mock_opensearch) -> None:
+        mock_neptune.return_value.get_metric.side_effect = RuntimeError(_INTERNAL_DETAIL)
+        warnings = self._assert_safe(handler(_make_event(MINIMAL_OSI_CONTENT), None))
+        assert "Metric 'simple_count': lookup failed — internal error, retry the import" in warnings
+
+    @patch("coa_metrics.api.import_osi._get_opensearch")
+    @patch("coa_metrics.api.import_osi._get_neptune")
+    def test_write_failure_warning_names_metric_without_exception(self, mock_neptune, mock_opensearch) -> None:
+        mock_neptune.return_value.get_metric.return_value = None
+        mock_neptune.return_value.create_metric.side_effect = RuntimeError(_INTERNAL_DETAIL)
+        warnings = self._assert_safe(handler(_make_event(MINIMAL_OSI_CONTENT), None))
+        assert "Metric 'simple_count': write failed — internal error, retry the import" in warnings
+
+    @patch("coa_metrics.api.import_osi._get_opensearch")
+    @patch("coa_metrics.api.import_osi._get_neptune")
+    def test_indexing_failure_warning_names_metric_without_exception(self, mock_neptune, mock_opensearch) -> None:
+        mock_neptune.return_value.get_metric.return_value = None
+        mock_opensearch.return_value.embed_metric.side_effect = RuntimeError(_INTERNAL_DETAIL)
+        warnings = self._assert_safe(handler(_make_event(MINIMAL_OSI_CONTENT), None))
+        assert any(w.startswith("Metric 'simple_count': search indexing delayed") for w in warnings)
+
+    @patch("coa_metrics.api.import_osi._get_metadata_store")
+    @patch("coa_metrics.api.import_osi._get_opensearch")
+    @patch("coa_metrics.api.import_osi._get_neptune")
+    @patch("coa_metrics.api.import_osi._get_lookup")
+    def test_reconciliation_failure_warning_is_fixed_text(
+        self, mock_lookup, mock_neptune, mock_opensearch, mock_store
+    ) -> None:
+        mock_lookup.return_value.data_source_exists.return_value = True
+        mock_neptune.return_value.get_metric.return_value = None
+        mock_store.side_effect = RuntimeError(_INTERNAL_DETAIL)
+        warnings = self._assert_safe(handler(_make_event(VALID_OSI_CONTENT), None))
+        assert "Metadata reconciliation skipped: metadata store unavailable" in warnings
+
+    def test_lookup_init_error_message_omits_cause(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from coa_metrics.api import import_osi
+        from coa_metrics.source_status import PERMISSIVE_ENV, SourceValidationUnavailableError
+
+        import_osi._lookups.clear()
+        monkeypatch.delenv(PERMISSIVE_ENV, raising=False)
+        with (
+            patch.object(import_osi, "build_data_source_lookup", side_effect=RuntimeError(_INTERNAL_DETAIL)),
+            pytest.raises(SourceValidationUnavailableError) as raised,
+        ):
+            import_osi._get_lookup("ns-safe-message")
+        assert str(raised.value) == import_osi.SOURCE_LOOKUP_UNAVAILABLE_MESSAGE
+
+    @patch("coa_metrics.api.import_osi._read_from_s3")
+    def test_missing_s3_object_404_does_not_echo_key(self, mock_read) -> None:
+        from botocore.exceptions import ClientError
+
+        mock_read.side_effect = ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+        event = _make_event("")
+        event["body"] = json.dumps({"s3Key": "test-ns/imports/<script>.yaml"})
+        resp = handler(event, None)
+        assert resp["statusCode"] == 404
+        assert "<script>" not in resp["body"]

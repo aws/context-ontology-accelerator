@@ -148,3 +148,38 @@ def test_mode_values_are_wire_stable():
     """These strings are the public API (options.mode); pinning guards a rename."""
     assert (Mode.STANDARD, Mode.DEEP_REASONING, Mode.AUTO) == ("standard", "deep-reasoning", "auto")
     assert LEGACY_MODE_ALIASES == {"agentic": Mode.DEEP_REASONING}
+
+
+def _smithy_query_mode_values() -> set[str]:
+    """Wire values of the Smithy ``QueryMode`` enum, parsed from the source model.
+
+    Parsing the model rather than the generated client proves the source of truth
+    agrees with the runtime, not merely that codegen ran.
+    """
+    import re
+    from pathlib import Path
+
+    # tests/unit/ -> tests/ -> context-manager/ -> packages/ -> repo root
+    model = Path(__file__).resolve().parents[4] / "models" / "src" / "main" / "smithy" / "serve.smithy"
+    assert model.is_file(), f"Smithy model not found at {model}"
+    match = re.search(r"enum QueryMode \{(.*?)\n\}", model.read_text(), re.DOTALL)
+    assert match, "enum QueryMode not found in serve.smithy"
+    return set(re.findall(r'=\s*"([^"]+)"', match.group(1)))
+
+
+def test_smithy_query_mode_matches_accepted_wire_values():
+    """The contract must advertise exactly the modes ``InvokeRequest`` accepts.
+
+    Advertising a value serve rejects 400s a contract-conformant caller; accepting a
+    value the contract omits leaves it reachable only by callers who read the code.
+    ``auto`` is internal (the absent-mode resolution) and is not a wire value.
+    """
+    from coa_serve.models import InvokeRequest
+    from pydantic import ValidationError
+
+    declared = _smithy_query_mode_values()
+    assert declared == {Mode.STANDARD.value, Mode.DEEP_REASONING.value, *LEGACY_MODE_ALIASES}
+    for value in sorted(declared):
+        InvokeRequest(query="q", namespace="ns", options={"mode": value})
+    with pytest.raises(ValidationError):
+        InvokeRequest(query="q", namespace="ns", options={"mode": Mode.AUTO.value})

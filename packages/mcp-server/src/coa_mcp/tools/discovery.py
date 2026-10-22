@@ -55,7 +55,8 @@ async def list_metrics(
         lambda_client: Lambda client for direct invocation.
         namespace_id: The namespace to query.
         bearer_token: Caller's JWT for identity propagation.
-        max_results: Maximum metrics to return (default 100, max 1000).
+        max_results: Maximum metrics to return (default 100, max 200 — the
+            ListMetrics page-size cap; larger values are reduced to it).
         next_token: Continuation token from a prior response (``nextToken``).
         authorizer_context: Optional authorizer context for the synthetic event.
 
@@ -63,7 +64,7 @@ async def list_metrics(
         Dict with ``metrics`` list and, when the backend paginates, a
         ``nextToken`` string to pass on the next call.
     """
-    query_params: dict[str, str] = {"maxResults": str(min(max_results, 1000))}
+    query_params: dict[str, str] = {"maxResults": str(min(max_results, 200))}
     if next_token:
         query_params["nextToken"] = next_token
 

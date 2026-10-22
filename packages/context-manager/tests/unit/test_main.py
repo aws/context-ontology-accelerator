@@ -8,6 +8,8 @@ from __future__ import annotations
 import ast
 import importlib.util
 import inspect
+import re
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -20,6 +22,21 @@ pytestmark = pytest.mark.unit
 HAS_AGENTCORE = importlib.util.find_spec("bedrock_agentcore") is not None
 
 agentcore_required = pytest.mark.skipif(not HAS_AGENTCORE, reason="bedrock_agentcore SDK not installed")
+
+
+_SERVE_SMITHY = Path(__file__).resolve().parents[4] / "models" / "src" / "main" / "smithy" / "serve.smithy"
+
+
+def _smithy_operation(operation: str) -> str:
+    op = re.search(rf"operation {operation} \{{(.*?)\n\}}", _SERVE_SMITHY.read_text(), re.DOTALL)
+    assert op, f"operation {operation} not found in serve.smithy"
+    return op.group(1)
+
+
+def _smithy_member_range(operation: str, member: str) -> tuple[int, int]:
+    declared = re.search(rf"@range\(min:\s*(\d+),\s*max:\s*(\d+)\)\s*{member}:", _smithy_operation(operation))
+    assert declared, f"{operation}.{member} @range not found"
+    return int(declared.group(1)), int(declared.group(2))
 
 
 async def _invoke_collect(payload, context=None):
@@ -971,6 +988,108 @@ class TestHandleKbSearch:
 
 
 @pytest.mark.unit
+class TestHandleKbSearchOptions:
+    """KBSearch members: topK honoured up to the contract bound, minScore applied,
+    unsupported filters rejected rather than silently ignored."""
+
+    @staticmethod
+    def _orchestrator(chunks):
+        from coa_serve.tier3.vector_retriever import ChunkResult
+
+        orch = MagicMock()
+        orch._bedrock_client = AsyncMock()
+        orch._bedrock_client.embed.return_value = [0.1]
+        orch._bedrock_client._embed_model_id = "embed-model"
+        orch._knowledge_retriever._vector.search = AsyncMock(
+            return_value=[ChunkResult(chunk_id=c, text=c, source_doc="d", relevance_score=s) for c, s in chunks]
+        )
+        return orch
+
+    async def _run(self, options, chunks=(("a", 0.9), ("b", 0.5), ("c", 0.2))):
+        from coa_serve.main import _handle_kb_search
+
+        orch = self._orchestrator(chunks)
+        with patch("coa_serve.main._orchestrator", orch):
+            result = await _handle_kb_search({"query": "q", "namespace": "ns", "options": options}, "req")
+        return result, orch
+
+    @pytest.mark.asyncio
+    async def test_kb_search_min_score_drops_lower_scoring_chunks(self):
+        result, _ = await self._run({"topK": 10, "minScore": 0.5})
+        assert result["statusCode"] == 200
+        assert [c["chunkId"] for c in result["chunks"]] == ["a", "b"]
+
+    @pytest.mark.asyncio
+    async def test_kb_search_without_min_score_returns_every_chunk(self):
+        result, _ = await self._run({"topK": 10})
+        assert [c["chunkId"] for c in result["chunks"]] == ["a", "b", "c"]
+
+    @pytest.mark.asyncio
+    async def test_kb_search_top_k_up_to_contract_bound_reaches_retriever(self):
+        """topK=100 is valid on the contract; it must not be cut to the Tier-3 default cap."""
+        from coa_serve.main import KB_SEARCH_MAX_TOP_K
+
+        _, orch = await self._run({"topK": 100})
+        kwargs = orch._knowledge_retriever._vector.search.call_args.kwargs
+        assert kwargs["top_k"] == 100
+        assert kwargs["max_top_k"] == KB_SEARCH_MAX_TOP_K == 100
+
+    @pytest.mark.asyncio
+    async def test_kb_search_defaults_top_k(self):
+        _, orch = await self._run({})
+        assert orch._knowledge_retriever._vector.search.call_args.kwargs["top_k"] == 10
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "options",
+        [
+            {"topK": 0},
+            {"topK": 101},
+            {"topK": "10"},
+            {"topK": True},
+            {"minScore": "0.5"},
+            {"minScore": float("nan")},
+            {"minScore": -0.1},
+            {"sourceFilter": ["doc-1"]},
+            {"entityFilter": ["Acme"]},
+            "not-an-object",
+        ],
+    )
+    async def test_kb_search_rejects_invalid_or_unsupported_options(self, options):
+        result, orch = await self._run(options)
+        assert result["statusCode"] == 400
+        orch._bedrock_client.embed.assert_not_called()
+
+    def test_kb_search_top_k_bound_matches_smithy_model(self):
+        """``KB_SEARCH_{MIN,MAX}_TOP_K`` are the model's ``KBSearch.topK`` @range."""
+        from coa_serve.main import KB_SEARCH_MAX_TOP_K, KB_SEARCH_MIN_TOP_K
+
+        assert _smithy_member_range("KBSearch", "topK") == (KB_SEARCH_MIN_TOP_K, KB_SEARCH_MAX_TOP_K)
+
+    @pytest.mark.asyncio
+    async def test_kb_search_default_top_k_is_within_bounds_and_applied(self):
+        from coa_serve.main import KB_SEARCH_DEFAULT_TOP_K, KB_SEARCH_MAX_TOP_K, KB_SEARCH_MIN_TOP_K
+
+        assert KB_SEARCH_MIN_TOP_K <= KB_SEARCH_DEFAULT_TOP_K <= KB_SEARCH_MAX_TOP_K
+        _, orch = await self._run({})
+        assert orch._knowledge_retriever._vector.search.call_args.kwargs["top_k"] == KB_SEARCH_DEFAULT_TOP_K
+
+    @pytest.mark.asyncio
+    async def test_kb_search_accepts_min_top_k(self):
+        from coa_serve.main import KB_SEARCH_MIN_TOP_K
+
+        result, orch = await self._run({"topK": KB_SEARCH_MIN_TOP_K})
+        assert result["statusCode"] == 200
+        assert orch._knowledge_retriever._vector.search.call_args.kwargs["top_k"] == KB_SEARCH_MIN_TOP_K
+
+    @pytest.mark.asyncio
+    async def test_kb_search_empty_filters_are_accepted(self):
+        """An empty filter list restricts nothing, so it is not a request to filter."""
+        result, _ = await self._run({"sourceFilter": [], "entityFilter": []})
+        assert result["statusCode"] == 200
+
+
+@pytest.mark.unit
 class TestNamespaceAdmissionGate:
     """F-2 (CWE-862): invoke() gates every namespace-scoped surface before dispatch.
 
@@ -1036,6 +1155,68 @@ class TestNamespaceAdmissionGate:
         # The retriever/embedder must never run for an unauthorized namespace.
         orch._bedrock_client.embed.assert_not_called()
         orch._knowledge_retriever._vector.search.assert_not_called()
+
+    @patch("coa_serve.main._ensure_initialized")
+    @patch("coa_serve.main.resolve_profile")
+    async def test_streaming_denial_is_a_typed_error_event(self, mock_resolve, mock_init):
+        # A streaming caller (the web Playground) only renders envelopes whose
+        # `type` is one of step/token/done/error/rows, so the admission denial
+        # must arrive as a typed error event rather than a flat dict.
+        import coa_serve.main as main_mod
+        from coa_serve.role_resolver import ResolvedProfile
+
+        mock_init.return_value = None
+        mock_resolve.return_value = ResolvedProfile(user_id="attacker")
+        orch = self._orchestrator(denied=True)
+        main_mod._orchestrator = orch
+
+        result = await _invoke_collect({"query": "secret", "namespace": "victim", "stream": True})
+
+        assert result["type"] == "error"
+        # The client type guard also requires a string requestId.
+        assert isinstance(result["requestId"], str)
+        # Exact payload: the generic message, never the Cedar reason.
+        assert result["payload"] == {"error": "AccessDenied", "message": "Access denied", "statusCode": 403}
+        assert "not permitted" not in str(result)
+        orch.authorize_namespace.assert_called_once()
+        orch.resolve.assert_not_called()
+
+    @patch("coa_serve.main._ensure_initialized")
+    @patch("coa_serve.main.resolve_profile")
+    async def test_streaming_grant_lookup_failure_is_a_typed_502_event(self, mock_resolve, mock_init):
+        """The other arm of the name mapping: a non-deny admission error keeps its own
+        name and status, still as a typed event, and still before any orchestration."""
+        import coa_serve.main as main_mod
+
+        mock_init.return_value = None
+        mock_resolve.side_effect = RuntimeError("dynamodb throttled")
+        orch = self._orchestrator(denied=False)
+        main_mod._orchestrator = orch
+
+        result = await _invoke_collect({"query": "hello", "namespace": "mine", "stream": True})
+
+        assert result["type"] == "error"
+        assert result["payload"]["statusCode"] == 502
+        assert result["payload"]["error"] == "DataSourceUnavailableError"
+        assert "dynamodb" not in str(result).lower()
+        orch.resolve.assert_not_called()
+
+    @patch("coa_serve.main._ensure_initialized")
+    @patch("coa_serve.main.resolve_profile")
+    async def test_blocking_denial_keeps_the_flat_error_shape(self, mock_resolve, mock_init):
+        # MCP and the data-layer actions read the flat shape; it must not change.
+        import coa_serve.main as main_mod
+        from coa_serve.role_resolver import ResolvedProfile
+
+        mock_init.return_value = None
+        mock_resolve.return_value = ResolvedProfile(user_id="attacker")
+        main_mod._orchestrator = self._orchestrator(denied=True)
+
+        result = await _invoke_collect({"query": "secret", "namespace": "victim"})
+
+        assert "type" not in result
+        assert result["error"] == "AccessDeniedError"
+        assert result["statusCode"] == 403
 
     @patch("coa_serve.main._ensure_initialized")
     @patch("coa_serve.main.resolve_profile")
@@ -1236,3 +1417,211 @@ class TestTier2QualifierWiring:
                 f"(table_qualifier needs the "
                 f"registry to resolve each table's Athena catalog). Got kwargs={sorted(kwargs)}."
             )
+
+
+@pytest.mark.unit
+class TestHandleGraphTraverseOptions:
+    """GraphTraverse members are validated against the contract (the MCP server calls
+    this action directly, so the REST edge is not the only way in)."""
+
+    _URI = "https://example.com/ontology#Claim"
+
+    @staticmethod
+    def _entities(n):
+        from coa_serve.tier3.graph_traverser import GraphEntity
+
+        return [
+            GraphEntity(
+                uri=f"urn:e:{i}",
+                label=f"e{i}",
+                type="T",
+                relationships=({"predicate": "urn:p", "target_uri": f"urn:t:{i}", "target_label": "t"},),
+            )
+            for i in range(n)
+        ]
+
+    async def _run(self, options, entities=None):
+        from coa_serve.main import _handle_graph_traverse
+
+        orch = MagicMock()
+        orch._knowledge_retriever._graph.traverse_from_uris = AsyncMock(return_value=entities or [])
+        with patch("coa_serve.main._orchestrator", orch):
+            result = await _handle_graph_traverse({"namespace": "ns", "options": options}, "req")
+        return result, orch._knowledge_retriever._graph.traverse_from_uris
+
+    @pytest.mark.asyncio
+    async def test_defaults_apply_when_members_are_absent(self):
+        result, traverse = await self._run({"startUri": self._URI})
+        assert result["statusCode"] == 200
+        assert traverse.call_args.kwargs["max_hops"] == 2
+
+    @pytest.mark.asyncio
+    async def test_max_results_caps_entities_and_their_relationships(self):
+        result, _ = await self._run({"startUri": self._URI, "maxResults": 3}, entities=self._entities(10))
+        assert [e["uri"] for e in result["entities"]] == ["urn:e:0", "urn:e:1", "urn:e:2"]
+        assert {r["sourceUri"] for r in result["relationships"]} == {"urn:e:0", "urn:e:1", "urn:e:2"}
+
+    @pytest.mark.asyncio
+    async def test_boundary_values_are_accepted(self):
+        options = {
+            "startUri": "urn:coa:customer:acme-corp",
+            "maxDepth": 5,
+            "maxResults": 1000,
+            "direction": "incoming",
+            "relationshipFilter": ["urn:coa:rel:placed"],
+        }
+        result, traverse = await self._run(options)
+        assert result["statusCode"] == 200
+        assert traverse.call_args.kwargs["max_hops"] == 5
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "options",
+        [
+            {},
+            {"startUri": ""},
+            {"startUri": 42},
+            {"startUri": "not-an-iri"},
+            {"startUri": "https://example.com/a b"},
+            {"startUri": "https://example.com/a>"},
+            {"startUri": "https://example.com/a\n"},
+            {"startUri": "https://example.com/" + "a" * 2048},
+            {"startUri": _URI, "maxDepth": 0},
+            {"startUri": _URI, "maxDepth": -1},
+            {"startUri": _URI, "maxDepth": 6},
+            {"startUri": _URI, "maxDepth": "2"},
+            {"startUri": _URI, "maxDepth": 2.0},
+            {"startUri": _URI, "maxDepth": True},
+            {"startUri": _URI, "maxResults": 0},
+            {"startUri": _URI, "maxResults": 1001},
+            {"startUri": _URI, "direction": "sideways"},
+            {"startUri": _URI, "direction": ["both"]},
+            {"startUri": _URI, "relationshipFilter": "urn:p"},
+            {"startUri": _URI, "relationshipFilter": [""]},
+            {"startUri": _URI, "relationshipFilter": ["urn:p"] * 51},
+            "not-an-object",
+        ],
+    )
+    async def test_out_of_contract_options_are_rejected_before_traversal(self, options):
+        result, traverse = await self._run(options)
+        assert result["statusCode"] == 400
+        traverse.assert_not_called()
+
+    def test_bounds_match_smithy_model(self):
+        from coa_serve import main
+
+        assert _smithy_member_range("GraphTraverse", "maxDepth") == (
+            main.GRAPH_TRAVERSE_MIN_DEPTH,
+            main.GRAPH_TRAVERSE_MAX_DEPTH,
+        )
+        assert _smithy_member_range("GraphTraverse", "maxResults") == (
+            main.GRAPH_TRAVERSE_MIN_RESULTS,
+            main.GRAPH_TRAVERSE_MAX_RESULTS,
+        )
+        assert main.GRAPH_TRAVERSE_MIN_DEPTH <= main.GRAPH_TRAVERSE_DEFAULT_DEPTH <= main.GRAPH_TRAVERSE_MAX_DEPTH
+        assert main.GRAPH_TRAVERSE_MIN_RESULTS <= main.GRAPH_TRAVERSE_DEFAULT_RESULTS <= main.GRAPH_TRAVERSE_MAX_RESULTS
+
+    def test_direction_and_filter_bounds_match_smithy_model(self):
+        from coa_serve import main
+
+        text = _SERVE_SMITHY.read_text()
+        enum = re.search(r"enum TraversalDirection \{(.*?)\n\}", text, re.S)
+        assert enum, "TraversalDirection enum not found in serve.smithy"
+        assert set(re.findall(r'=\s*"([^"]+)"', enum.group(1))) == main.GRAPH_TRAVERSE_DIRECTIONS
+        list_max = re.search(r"@length\(max: (\d+)\)\nlist FilterValueList", text)
+        value_max = re.search(r"@length\(min: 1, max: (\d+)\)\nstring FilterValue\b", text)
+        assert list_max and value_max, "FilterValueList / FilterValue bounds not found in serve.smithy"
+        assert int(list_max.group(1)) == main._FILTER_VALUE_LIST_MAX_ITEMS
+        assert int(value_max.group(1)) == main._FILTER_VALUE_MAX_LENGTH
+
+    def test_start_uri_constraint_matches_smithy_model(self):
+        """The traverser's IRI gate is the model's ``TraversalStartUri`` constraint."""
+        from coa_serve.tier3 import graph_traverser
+
+        text = _SERVE_SMITHY.read_text()
+        shape = re.search(r'@length\(min: 1, max: (\d+)\)\n@pattern\("(.*)"\)\nstring TraversalStartUri', text)
+        assert shape, "TraversalStartUri shape not found in serve.smithy"
+        assert int(shape.group(1)) == graph_traverser.MAX_TRAVERSAL_URI_LENGTH
+        smithy_pattern = shape.group(2).encode().decode("unicode_escape")
+        probes = [
+            "https://example.com/ontology#Claim",
+            "http://x",
+            "urn:coa:customer:acme-corp",
+            "urn:-bad",
+            "ftp://example.com/x",
+            "https://example.com/a b",
+            'https://example.com/a"',
+            "https://example.com/a;b",
+            "https://example.com/a\\b",
+            "https://example.com/a`",
+            "",
+        ]
+        for probe in probes:
+            assert bool(re.fullmatch(smithy_pattern, probe)) == graph_traverser.is_traversable_uri(probe), probe
+
+
+@pytest.mark.unit
+class TestIncludeDebugInfoGate:
+    """``includeDebugInfo`` exposes the physical schema, so it is honoured only for a
+    caller who administers the namespace's schema; others get the default."""
+
+    @staticmethod
+    def _resolved(global_roles=(), resource_roles=()):
+        from coa_serve.role_resolver import ResolvedProfile
+
+        return ResolvedProfile(user_id="u", global_roles=list(global_roles), resource_roles=list(resource_roles))
+
+    @patch("coa_serve.main._ensure_initialized")
+    @patch("coa_serve.main.resolve_profile")
+    @pytest.mark.parametrize(
+        ("global_roles", "resource_roles", "honoured"),
+        [
+            (["platform-admin"], [], True),
+            ([], [{"role": "namespace-owner", "resourceUID": "demo"}], True),
+            ([], [{"role": "namespace-maintainer", "resourceUID": "demo"}], True),
+            ([], [{"role": "data-steward", "resourceUID": "demo"}], True),
+            ([], [{"role": "data-analyst", "resourceUID": "demo"}], False),
+            ([], [{"role": "data-steward", "resourceUID": "other-ns"}], False),
+            (["global-viewer"], [], False),
+            ([], [], False),
+        ],
+    )
+    async def test_flag_is_honoured_only_for_schema_administrators(
+        self, mock_resolve, mock_init, global_roles, resource_roles, honoured, config
+    ):
+        import coa_serve.main as main_mod
+
+        mock_init.return_value = None
+        mock_resolve.return_value = self._resolved(global_roles, resource_roles)
+        orch = MagicMock()
+        orch.resolve = AsyncMock(
+            return_value=InvokeResponse(
+                result=QueryResult(
+                    tier=2,
+                    confidence=ConfidenceScore(score=0.9, rationale="ok"),
+                    trace=[TraceStep(step="s", status="success", duration_ms=0)],
+                    metadata={},
+                )
+            )
+        )
+        with patch.object(main_mod, "_orchestrator", orch):
+            await _invoke_collect(
+                {
+                    "query": "q",
+                    "namespace": "demo",
+                    "profile": {"userId": "u"},
+                    "options": {"includeDebugInfo": True},
+                }
+            )
+
+        assert orch.resolve.call_args[0][0].options["includeDebugInfo"] is honoured
+
+    def test_client_supplied_roles_cannot_satisfy_the_gate(self):
+        """The gate reads the server-resolved profile; a body-supplied role is stripped
+        before resolution (see ``test_invoke_strips_injectable_roles_before_orchestrator``),
+        and an empty resolved profile never qualifies."""
+        from coa_serve.role_resolver import may_view_debug_info
+
+        assert may_view_debug_info({}, "demo") is False
+        assert may_view_debug_info({"resourceRoles": ["namespace-owner"]}, "demo") is False
+        assert may_view_debug_info({"resourceRoles": [{"role": "namespace-owner", "resourceUID": "demo"}]}, "") is False

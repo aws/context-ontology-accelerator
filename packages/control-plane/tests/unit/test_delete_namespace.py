@@ -14,9 +14,9 @@ from coa_common.constants import RESOURCE_PREFIX
 MODULE = "coa_control_plane.namespace.delete_handler"
 
 _NS_ITEM = {
-    "PK": "NS#ns-123",
+    "PK": "NS#11111111-1111-4111-8111-111111111111",
     "SK": "METADATA",
-    "namespaceId": "ns-123",
+    "namespaceId": "11111111-1111-4111-8111-111111111111",
     "name": "sales",
     "status": "ARCHIVED",
     "athenaWorkgroupName": f"{RESOURCE_PREFIX}-dev-sales",
@@ -24,7 +24,7 @@ _NS_ITEM = {
 }
 
 
-def _make_event(namespace_id: str = "ns-123") -> dict:
+def _make_event(namespace_id: str = "11111111-1111-4111-8111-111111111111") -> dict:
     return {
         "pathParameters": {"namespaceId": namespace_id},
         "httpMethod": "DELETE",
@@ -69,19 +69,20 @@ class TestDeleteNamespaceAsync:
 
         assert resp["statusCode"] == 202
         body = json.loads(resp["body"])
-        assert body["namespaceId"] == "ns-123"
+        assert body["namespaceId"] == "11111111-1111-4111-8111-111111111111"
         assert body["status"] == "DELETING"
 
         # Status set to DELETING before starting the execution.
         mock_dao.update.assert_called_once_with(
-            key={"PK": "NS#ns-123", "SK": "METADATA"}, update_fields={"status": "DELETING"}
+            key={"PK": "NS#11111111-1111-4111-8111-111111111111", "SK": "METADATA"},
+            update_fields={"status": "DELETING"},
         )
 
         mock_sfn.start_execution.assert_called_once()
         kwargs = mock_sfn.start_execution.call_args.kwargs
-        assert kwargs["name"] == "delete-ns-123"
+        assert kwargs["name"] == "delete-11111111-1111-4111-8111-111111111111"
         sfn_input = json.loads(kwargs["input"])
-        assert sfn_input["namespaceId"] == "ns-123"
+        assert sfn_input["namespaceId"] == "11111111-1111-4111-8111-111111111111"
         assert sfn_input["namespaceName"] == "sales"
         assert sfn_input["athenaWorkgroupName"] == f"{RESOURCE_PREFIX}-dev-sales"
         assert sfn_input["dataZoneProjectId"] == "proj-abc"
@@ -102,8 +103,8 @@ class TestDeleteNamespaceAsync:
 
         assert resp["statusCode"] == 202
         kwargs = mock_sfn.start_execution.call_args.kwargs
-        assert kwargs["name"].startswith("delete-ns-123-retry-")
-        assert kwargs["name"] != "delete-ns-123"
+        assert kwargs["name"].startswith("delete-11111111-1111-4111-8111-111111111111-retry-")
+        assert kwargs["name"] != "delete-11111111-1111-4111-8111-111111111111"
 
     def test_blocked_by_active_operation_returns_409(self):
         mock_dao = MagicMock()
@@ -269,7 +270,7 @@ class TestCheckActiveOperations:
             patch(f"{MODULE}._check_active_induction_jobs", return_value=["b"]),
             patch(f"{MODULE}._check_active_import_jobs", return_value=["c"]),
         ):
-            result = _check_active_operations("ns-123")
+            result = _check_active_operations("11111111-1111-4111-8111-111111111111")
 
         assert result == ["a", "b", "c"]
 
@@ -281,7 +282,7 @@ class TestCheckActiveOperations:
             patch(f"{MODULE}._check_active_induction_jobs", return_value=[]),
             patch(f"{MODULE}._check_active_import_jobs", return_value=[]),
         ):
-            result = _check_active_operations("ns-123")
+            result = _check_active_operations("11111111-1111-4111-8111-111111111111")
 
         assert result == []
 
@@ -297,7 +298,7 @@ class TestCheckActiveSources:
         with patch(f"{MODULE}.DynamoDBDAO", return_value=mock_dao):
             from coa_control_plane.namespace.delete_handler import _check_active_sources
 
-            result = _check_active_sources("ns-123")
+            result = _check_active_sources("11111111-1111-4111-8111-111111111111")
 
         assert result == []
 
@@ -311,7 +312,7 @@ class TestCheckActiveSources:
         with patch(f"{MODULE}.DynamoDBDAO", return_value=mock_dao):
             from coa_control_plane.namespace.delete_handler import _check_active_sources
 
-            result = _check_active_sources("ns-123")
+            result = _check_active_sources("11111111-1111-4111-8111-111111111111")
 
         assert len(result) == 1
         assert "1 source(s) actively scanning or enriching" in result[0]
@@ -328,7 +329,7 @@ class TestCheckActiveSources:
         with patch(f"{MODULE}.DynamoDBDAO", return_value=mock_dao):
             from coa_control_plane.namespace.delete_handler import _check_active_sources
 
-            result = _check_active_sources("ns-123")
+            result = _check_active_sources("11111111-1111-4111-8111-111111111111")
 
         assert result == []
 
@@ -339,17 +340,17 @@ class TestCheckActiveSources:
         with patch(f"{MODULE}.DynamoDBDAO", return_value=mock_dao):
             from coa_control_plane.namespace.delete_handler import _check_active_sources
 
-            _check_active_sources("ns-123")
+            _check_active_sources("11111111-1111-4111-8111-111111111111")
 
         params = mock_dao.query.call_args[0][0]
         assert params.index_name == "ByNamespace"
-        assert params.expression_values[":ns"] == "ns-123"
+        assert params.expression_values[":ns"] == "11111111-1111-4111-8111-111111111111"
 
     def test_no_table_configured_returns_empty(self, monkeypatch):
         monkeypatch.delenv("SOURCES_TABLE", raising=False)
         from coa_control_plane.namespace.delete_handler import _check_active_sources
 
-        assert _check_active_sources("ns-123") == []
+        assert _check_active_sources("11111111-1111-4111-8111-111111111111") == []
 
 
 @pytest.mark.unit
@@ -365,7 +366,7 @@ class TestCheckActiveInductionJobs:
         mock_cm.__enter__.return_value = mock_resp
 
         with patch(f"{MODULE}.urllib_request.urlopen", return_value=mock_cm):
-            result = _check_active_induction_jobs("ns-123")
+            result = _check_active_induction_jobs("11111111-1111-4111-8111-111111111111")
 
         assert result == []
 
@@ -378,7 +379,7 @@ class TestCheckActiveInductionJobs:
         mock_cm.__enter__.return_value = mock_resp
 
         with patch(f"{MODULE}.urllib_request.urlopen", return_value=mock_cm):
-            result = _check_active_induction_jobs("ns-123")
+            result = _check_active_induction_jobs("11111111-1111-4111-8111-111111111111")
 
         assert len(result) == 1
         assert "3 ontology induction/ingest job(s) or proposal accept(s) in progress" in result[0]
@@ -387,7 +388,7 @@ class TestCheckActiveInductionJobs:
         monkeypatch.delenv("ONTOLOGY_ENGINE_ENDPOINT", raising=False)
         from coa_control_plane.namespace.delete_handler import _check_active_induction_jobs
 
-        assert _check_active_induction_jobs("ns-123") == []
+        assert _check_active_induction_jobs("11111111-1111-4111-8111-111111111111") == []
 
     def test_unreachable_endpoint_fails_open_after_retries(self, monkeypatch):
         """If the ontology-engine can't be reached after retries, ALLOW deletion
@@ -406,7 +407,7 @@ class TestCheckActiveInductionJobs:
             patch(f"{MODULE}.urllib_request.urlopen", side_effect=URLError("unreachable")),
             patch(f"{MODULE}.time.sleep"),  # don't actually sleep in tests
         ):
-            result = _check_active_induction_jobs("ns-123")
+            result = _check_active_induction_jobs("11111111-1111-4111-8111-111111111111")
 
         assert result == []
 
@@ -428,7 +429,7 @@ class TestCheckActiveInductionJobs:
             patch(f"{MODULE}.urllib_request.urlopen", side_effect=[URLError("transient"), mock_cm]),
             patch(f"{MODULE}.time.sleep"),
         ):
-            result = _check_active_induction_jobs("ns-123")
+            result = _check_active_induction_jobs("11111111-1111-4111-8111-111111111111")
 
         assert len(result) == 1
         assert "2 ontology induction/ingest job(s) or proposal accept(s) in progress" in result[0]
@@ -445,7 +446,7 @@ class TestCheckActiveImportJobs:
         with patch(f"{MODULE}.DynamoDBDAO", return_value=mock_dao):
             from coa_control_plane.namespace.delete_handler import _check_active_import_jobs
 
-            result = _check_active_import_jobs("ns-123")
+            result = _check_active_import_jobs("11111111-1111-4111-8111-111111111111")
 
         assert result == []
 
@@ -464,7 +465,7 @@ class TestCheckActiveImportJobs:
         with patch(f"{MODULE}.DynamoDBDAO", return_value=mock_dao):
             from coa_control_plane.namespace.delete_handler import _check_active_import_jobs
 
-            result = _check_active_import_jobs("ns-123")
+            result = _check_active_import_jobs("11111111-1111-4111-8111-111111111111")
 
         assert result == []
 
@@ -478,7 +479,7 @@ class TestCheckActiveImportJobs:
         with patch(f"{MODULE}.DynamoDBDAO", return_value=mock_dao):
             from coa_control_plane.namespace.delete_handler import _check_active_import_jobs
 
-            result = _check_active_import_jobs("ns-123")
+            result = _check_active_import_jobs("11111111-1111-4111-8111-111111111111")
 
         assert len(result) == 1
         assert "1 metric import job(s) in progress" in result[0]
@@ -487,4 +488,4 @@ class TestCheckActiveImportJobs:
         monkeypatch.delenv("METRIC_IMPORT_JOBS_TABLE", raising=False)
         from coa_control_plane.namespace.delete_handler import _check_active_import_jobs
 
-        assert _check_active_import_jobs("ns-123") == []
+        assert _check_active_import_jobs("11111111-1111-4111-8111-111111111111") == []

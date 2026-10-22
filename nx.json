@@ -21,7 +21,8 @@
       "{projectRoot}/tsconfig.json",
       "{projectRoot}/package.json",
       "normalizationFixtures"
-    ]
+    ],
+    "smithyModels": ["{workspaceRoot}/models/**/*"]
   },
   "targetDefaults": {
     "build": {

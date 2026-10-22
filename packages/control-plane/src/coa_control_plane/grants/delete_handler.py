@@ -57,7 +57,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
 
     # Verify the grant belongs to this namespace
     if not pk.startswith(f"Namespace::{namespace_id}#"):
-        return api_response(404, {"message": f"Grant '{grant_id}' not found"})
+        return api_response(404, {"message": "Grant not found"})
 
     region = os.environ.get("AWS_REGION")
     mappings_table = os.environ.get("RESOURCE_ROLE_MAPPINGS_TABLE")

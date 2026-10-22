@@ -6,6 +6,7 @@ import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { LocaleProvider } from "../i18n/LocaleProvider";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { MetricList } from "./MetricList";
 
@@ -64,10 +65,14 @@ vi.mock("../api-hooks/use-source-name-by-id", () => ({
   useSourceNameById: () => new Map<string, string>(),
 }));
 
+// LocaleProvider sits at the app root in production and supplies the
+// property filter's built-in strings the page no longer hand-writes.
 const wrapper = ({ children }: { children: React.ReactNode }) => (
-  <QueryClientProvider client={new QueryClient()}>
-    <MemoryRouter>{children}</MemoryRouter>
-  </QueryClientProvider>
+  <LocaleProvider>
+    <QueryClientProvider client={new QueryClient()}>
+      <MemoryRouter>{children}</MemoryRouter>
+    </QueryClientProvider>
+  </LocaleProvider>
 );
 
 function makeMetric(name: string) {

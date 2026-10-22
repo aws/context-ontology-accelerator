@@ -11,6 +11,7 @@ import os
 from unittest.mock import MagicMock, patch
 
 import pytest
+from botocore.exceptions import ClientError
 from coa_common.dao import PaginatedResult
 
 os.environ.update(
@@ -27,6 +28,24 @@ from coa_control_plane.grants.list_handler import handler  # noqa: E402
 pytestmark = pytest.mark.unit
 
 VALID_NS_ID = "550e8400-e29b-41d4-a716-446655440000"
+OTHER_NS_ID = "11111111-1111-4111-8111-111111111111"
+
+_NS_INDEX_KEY = {
+    "PK": f"Namespace::{VALID_NS_ID}#User::z@co.com",
+    "SK": "ROLE#data-analyst",
+    "namespaceKey": f"NS#{VALID_NS_ID}",
+    "principalRoleKey": "User::z@co.com#ROLE#data-analyst",
+}
+_PRINCIPAL_INDEX_KEY = {
+    "PK": f"Namespace::{VALID_NS_ID}#User::z@co.com",
+    "SK": "ROLE#data-analyst",
+    "principalKey": "User::z@co.com",
+    "resourceRoleKey": f"Namespace::{VALID_NS_ID}#ROLE#data-analyst",
+}
+
+
+def _token(decoded: object) -> str:
+    return base64.b64encode(json.dumps(decoded).encode()).decode()
 
 
 def _event(namespace_id: str = VALID_NS_ID, query_params: dict | None = None) -> dict:
@@ -241,12 +260,78 @@ class TestListGrantsPagination:
         mock_dao = MagicMock()
         mock_dao_cls.return_value = mock_dao
         mock_dao.query.return_value = PaginatedResult(items=[], last_evaluated_key=None)
-        start_key = {"PK": "p", "SK": "s"}
-        token = base64.b64encode(json.dumps(start_key).encode()).decode()
+        start_key = _NS_INDEX_KEY
+        token = _token(start_key)
 
         resp = handler(_event(query_params={"nextToken": token}), None)
         assert resp["statusCode"] == 200
         assert mock_dao.query.call_args[0][0].exclusive_start_key == start_key
+
+    @patch("coa_control_plane.grants.list_handler.DynamoDBDAO")
+    def test_principal_filtered_next_token_round_trips(self, mock_dao_cls):
+        mock_dao = MagicMock()
+        mock_dao_cls.return_value = mock_dao
+        mock_dao.query.return_value = PaginatedResult(items=[], last_evaluated_key=None)
+
+        query = {"principal": "User::z@co.com", "nextToken": _token(_PRINCIPAL_INDEX_KEY)}
+        assert handler(_event(query_params=query), None)["statusCode"] == 200
+        assert mock_dao.query.call_args[0][0].exclusive_start_key == _PRINCIPAL_INDEX_KEY
+
+    @pytest.mark.parametrize(
+        "decoded",
+        [
+            {"foo": "bar"},
+            [1, 2],
+            "x",
+            {"PK": 1, "SK": 2},
+            {"offset": 25},
+            {"PK": "a", "SK": "b"},
+            {**_NS_INDEX_KEY, "PK": 1},
+            {**_NS_INDEX_KEY, "extra": "x"},
+            # A key minted for another namespace.
+            {**_NS_INDEX_KEY, "namespaceKey": f"NS#{OTHER_NS_ID}"},
+            # A principal-index key replayed on the unfiltered listing.
+            _PRINCIPAL_INDEX_KEY,
+        ],
+    )
+    @patch("coa_control_plane.grants.list_handler.DynamoDBDAO")
+    def test_malformed_next_token_returns_400_without_query(self, mock_dao_cls, decoded):
+        resp = handler(_event(query_params={"nextToken": _token(decoded)}), None)
+        assert resp["statusCode"] == 400
+        assert json.loads(resp["body"])["message"].startswith("Invalid nextToken")
+        mock_dao_cls.return_value.query.assert_not_called()
+
+    def test_smithy_example_next_token_returns_400(self):
+        assert handler(_event(query_params={"nextToken": "eyJvZmZzZXQiOjI1fQ=="}), None)["statusCode"] == 400
+
+    @pytest.mark.parametrize(
+        "decoded",
+        [
+            {**_PRINCIPAL_INDEX_KEY, "principalKey": "User::mallory@co.com"},
+            {**_PRINCIPAL_INDEX_KEY, "resourceRoleKey": f"Namespace::{OTHER_NS_ID}#ROLE#data-analyst"},
+            _NS_INDEX_KEY,
+        ],
+    )
+    def test_principal_filtered_foreign_next_token_returns_400(self, decoded):
+        query = {"principal": "User::z@co.com", "nextToken": _token(decoded)}
+        assert handler(_event(query_params=query), None)["statusCode"] == 400
+
+    @patch("coa_control_plane.grants.list_handler.DynamoDBDAO")
+    def test_start_key_rejected_by_dynamodb_returns_400(self, mock_dao_cls):
+        mock_dao_cls.return_value.query.side_effect = ClientError(
+            {"Error": {"Code": "ValidationException", "Message": "The provided starting key is invalid"}}, "Query"
+        )
+        resp = handler(_event(query_params={"nextToken": _token(_NS_INDEX_KEY)}), None)
+        assert resp["statusCode"] == 400
+        assert "starting key" not in resp["body"]
+
+    @patch("coa_control_plane.grants.list_handler.DynamoDBDAO")
+    def test_other_dynamodb_error_with_next_token_stays_500(self, mock_dao_cls):
+        mock_dao_cls.return_value.query.side_effect = ClientError(
+            {"Error": {"Code": "ProvisionedThroughputExceededException", "Message": "slow down"}}, "Query"
+        )
+        resp = handler(_event(query_params={"nextToken": _token(_NS_INDEX_KEY)}), None)
+        assert resp["statusCode"] == 500
 
     def test_invalid_next_token_returns_400(self):
         bad = base64.b64encode(b"not-json").decode()

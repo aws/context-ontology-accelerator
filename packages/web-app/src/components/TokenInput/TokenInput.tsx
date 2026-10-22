@@ -29,6 +29,8 @@ import Button from "@cloudscape-design/components/button";
 import Input from "@cloudscape-design/components/input";
 import SpaceBetween from "@cloudscape-design/components/space-between";
 import TokenGroup from "@cloudscape-design/components/token-group";
+import { useAppI18n, type AppTranslate } from "../../i18n/LocaleProvider";
+import type { AppMessage } from "../../i18n/appMessages";
 
 /**
  * Separators recognised when splitting committed text.
@@ -64,7 +66,7 @@ export interface TokenInputProps {
    * Plural noun for the values, used in the multi-entry confirmation
    * ("Added 3 classes."). Only ever rendered in the plural.
    */
-  itemLabelPlural?: string;
+  itemLabelPlural?: AppMessage;
 }
 
 export const TokenInput: React.FC<TokenInputProps> = ({
@@ -76,6 +78,7 @@ export const TokenInput: React.FC<TokenInputProps> = ({
   validate,
   itemLabelPlural = "entries",
 }) => {
+  const { t } = useAppI18n();
   const [text, setText] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -135,10 +138,13 @@ export const TokenInput: React.FC<TokenInputProps> = ({
     }
 
     setText("");
-    setError(summariseRejections(rejections));
+    setError(summariseRejections(rejections, t));
     setNotice(
       accepted.length > 1
-        ? `Added ${accepted.length} ${itemLabelPlural}.`
+        ? t("Added {count} {items}.", {
+            count: accepted.length,
+            items: t(itemLabelPlural),
+          })
         : null,
     );
   };
@@ -172,9 +178,11 @@ export const TokenInput: React.FC<TokenInputProps> = ({
           iconName="add-plus"
           disabled={disabled || text.trim().length === 0}
           onClick={addTokens}
-          ariaLabel={ariaLabel ? `Add ${ariaLabel}` : "Add value"}
+          ariaLabel={
+            ariaLabel ? t("Add {label}", { label: ariaLabel }) : t("Add value")
+          }
         >
-          Add
+          {t("Add")}
         </Button>
       </SpaceBetween>
       {notice && <Box variant="small">{notice}</Box>}
@@ -185,7 +193,10 @@ export const TokenInput: React.FC<TokenInputProps> = ({
       )}
       {value.length > 0 && (
         <TokenGroup
-          items={value.map((v) => ({ label: v, dismissLabel: `Remove ${v}` }))}
+          items={value.map((v) => ({
+            label: v,
+            dismissLabel: t("Remove {value}", { value: v }),
+          }))}
           onDismiss={({ detail }) => removeToken(detail.itemIndex)}
         />
       )}
@@ -200,13 +211,27 @@ export const TokenInput: React.FC<TokenInputProps> = ({
  * gives the same message), so identical reasons are shown once and the tail is
  * counted rather than listed.
  */
-function summariseRejections(rejections: string[]): string | null {
+function summariseRejections(
+  rejections: string[],
+  t: AppTranslate,
+): string | null {
   if (rejections.length === 0) return null;
   const unique = [...new Set(rejections)];
   const shown = unique.slice(0, 2).join(" ");
   const remaining = unique.length - 2;
-  const skipped = `${rejections.length} skipped.`;
   return remaining > 0
-    ? `${skipped} ${shown} And ${remaining} other problem${remaining === 1 ? "" : "s"}.`
-    : `${skipped} ${shown}`;
+    ? t(
+        remaining === 1
+          ? "{count} skipped. {reasons} And {remaining} other problem."
+          : "{count} skipped. {reasons} And {remaining} other problems.",
+        {
+          count: rejections.length,
+          reasons: shown,
+          remaining,
+        },
+      )
+    : t("{count} skipped. {reasons}", {
+        count: rejections.length,
+        reasons: shown,
+      });
 }

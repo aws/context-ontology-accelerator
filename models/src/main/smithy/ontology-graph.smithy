@@ -9,7 +9,12 @@ $version: "2"
 
 namespace com.amazon.semanticcontext.ontologygraph
 
+use com.amazon.semanticcontext.common#ClientToken
 use com.amazon.semanticcontext.common#NotFoundError
+use com.amazon.semanticcontext.common#OntologyId
+use com.amazon.semanticcontext.common#PaginatedOutput
+use com.amazon.semanticcontext.common#PaginationToken
+use com.amazon.semanticcontext.common#PresignedUrl
 use com.amazon.semanticcontext.common#Uuid
 use com.amazon.semanticcontext.common#ValidationError
 
@@ -24,7 +29,51 @@ enum OntologyType {
 
     /// An ontology created manually by a user.
     USER_CREATED = "user_created"
+
+    /// An ontology file a user uploaded (the web app's upload flow).
+    USER_UPLOADED = "user_uploaded"
 }
+
+/// Serialization format of an ontology file, as accepted by
+/// IngestOntologyFromS3. Several spellings name the same format.
+enum OntologyFileFormat {
+    /// Turtle.
+    TURTLE = "turtle"
+
+    /// Turtle (file-extension spelling).
+    TTL = "ttl"
+
+    /// RDF/XML.
+    RDF_XML = "rdf-xml"
+
+    /// RDF/XML (media-type spelling).
+    RDF_PLUS_XML = "rdf+xml"
+
+    /// OWL in RDF/XML.
+    OWL_XML = "owl-xml"
+
+    /// RDF/XML (short spelling).
+    XML = "xml"
+
+    /// JSON-LD.
+    JSON_LD = "json-ld"
+
+    /// JSON-LD (file-extension spelling).
+    JSONLD = "jsonld"
+}
+
+/// Key of an object in the ontology upload bucket, as issued by
+/// GetOntologyUploadUrl: relative (no leading `/`), with no `..` path segment
+/// and no backslash.
+@length(min: 1, max: 1024)
+@pattern("^(?!/)(?!(?:.*/)?\\.\\.(?:/|$))[^\\\\]+$")
+string OntologyUploadKey
+
+/// IRI of a graph vertex: an `http(s)://` IRI with a host, or a `urn:`, with
+/// no whitespace or characters forbidden in a SPARQL IRI reference.
+@length(min: 1, max: 2048)
+@pattern("^(?:https?://[^/\\s<>\"{}|\\\\^`]|urn:)[^\\s<>\"{}|\\\\^`]*$")
+string VertexIri
 
 /// Summary of an ontology in the namespace registry.
 structure OntologyRecord {
@@ -99,8 +148,17 @@ list StringList {
     member: String
 }
 
-/// List ontologies registered in a namespace.
+/// List ontologies registered in a namespace, one page at a time.
+///
+/// A page can hold fewer than `maxResults` ontologies, or none, while
+/// `nextToken` is present: each request reads a bounded slice of the registry.
+/// Keep paging until `nextToken` is absent.
+///
+/// The server also binds a legacy `skip` query parameter (an offset applied
+/// before the page, up to 10000). It predates `nextToken`, is kept for existing
+/// callers, and is deliberately not modelled: use `nextToken`.
 @readonly
+@paginated(inputToken: "nextToken", outputToken: "nextToken", pageSize: "maxResults", items: "ontologies")
 @http(method: "GET", uri: "/namespaces/{namespaceId}/ontologies", code: 200)
 operation ListOntologies {
     input := {
@@ -113,14 +171,41 @@ operation ListOntologies {
 
         /// Filters the listing to ontologies carrying this domain tag.
         @httpQuery("domain_tag")
+        @length(min: 1, max: 256)
         domainTag: String
 
-        /// Maximum number of ontologies to return.
+        /// Filters the listing to the ontology with exactly this canonical IRI.
+        @httpQuery("uri")
+        uri: OntologyId
+
+        /// Filters the listing to ontologies from this source registry (e.g.
+        /// `induced`, `document`), exact match.
+        @httpQuery("source_registry")
+        @length(min: 1, max: 256)
+        sourceRegistry: String
+
+        /// Filters the listing to ontologies with this license tier (e.g.
+        /// `restricted`), exact match.
+        @httpQuery("license_tier")
+        @length(min: 1, max: 256)
+        licenseTier: String
+
+        /// Legacy spelling of `maxResults`; `maxResults` wins when both are sent.
         @httpQuery("limit")
+        @range(min: 1, max: 1000)
         limit: Integer
+
+        /// Pagination token from a previous response.
+        @httpQuery("nextToken")
+        nextToken: PaginationToken
+
+        /// Maximum number of ontologies to return in one page (default 50).
+        @httpQuery("maxResults")
+        @range(min: 1, max: 1000)
+        maxResults: Integer
     }
 
-    output := {
+    output := with [PaginatedOutput] {
         /// The ontologies registered in the namespace.
         @required
         ontologies: OntologyRecordList
@@ -139,7 +224,7 @@ operation GetOntology {
         /// Identifier of the ontology to fetch.
         @required
         @httpLabel
-        ontologyId: String
+        ontologyId: OntologyId
     }
 
     output := {
@@ -174,11 +259,15 @@ operation DeleteOntology {
         /// Full IRI of the ontology to delete (passed as a query parameter).
         @required
         @httpQuery("ontology_id")
-        ontologyId: String
+        ontologyId: OntologyId
     }
 }
 
 /// Upload an ontology file (Turtle, RDF/XML, or JSON-LD).
+///
+/// Not served: the API answers 501 for this path. Uploads go through
+/// GetOntologyUploadUrl + IngestOntologyFromS3, which take a `clientToken`;
+/// this operation therefore has none.
 @http(method: "POST", uri: "/namespaces/{namespaceId}/ontologies/{ontologyId}/upload", code: 200)
 operation UploadOntology {
     input := {
@@ -189,11 +278,12 @@ operation UploadOntology {
         /// Identifier of the ontology the file belongs to.
         @required
         @httpLabel
-        ontologyId: String
+        ontologyId: OntologyId
 
         /// Raw ontology file contents (Turtle, RDF/XML, or JSON-LD).
         @required
         @httpPayload
+        @length(max: 6000000)
         body: Blob
     }
 
@@ -216,7 +306,7 @@ operation DownloadOntology {
         /// Identifier of the ontology to download.
         @required
         @httpLabel
-        ontologyId: String
+        ontologyId: OntologyId
     }
 
     output := {
@@ -225,7 +315,7 @@ operation DownloadOntology {
         /// rather than inlined, because a large induced ontology (6+ MB) would
         /// exceed the API Gateway / Lambda response limit and 502 the call.
         @required
-        downloadUrl: String
+        downloadUrl: PresignedUrl
 
         /// Seconds until the presigned URL expires.
         expiresInSeconds: Integer
@@ -233,6 +323,10 @@ operation DownloadOntology {
 }
 
 /// Fetch an ontology from its source URL and ingest it.
+///
+/// Naturally idempotent, so there is no `clientToken`: it refreshes an ontology
+/// that must already be registered under `ontologyId` (404 otherwise), and a
+/// repeat re-fetches into the same registry row instead of creating another.
 @http(method: "POST", uri: "/namespaces/{namespaceId}/ontologies/{ontologyId}/fetch", code: 200)
 operation FetchOntology {
     input := {
@@ -243,9 +337,11 @@ operation FetchOntology {
         /// Identifier to register the fetched ontology under.
         @required
         @httpLabel
-        ontologyId: String
+        ontologyId: OntologyId
 
-        /// Source URL to fetch the ontology from.
+        /// Source URL to fetch the ontology from. HTTPS only.
+        @length(min: 1, max: 2048)
+        @pattern("^https://")
         sourceUrl: String
     }
 
@@ -264,24 +360,29 @@ operation GetOntologyUploadUrl {
         @httpLabel
         namespaceId: Uuid
 
-        /// Name of the file to be uploaded.
+        /// Name of the file to be uploaded. The server sanitizes it and keeps the
+        /// first 200 characters, so the bound is generous: clients derive the
+        /// name from the ontology identifier, which may itself be a long IRI.
         @required
+        @length(max: 4096)
         filename: String
 
         /// MIME content type of the file to be uploaded.
+        @length(max: 256)
         contentType: String
 
         /// Identifier to register the uploaded ontology under.
-        ontologyId: String
+        ontologyId: OntologyId
 
         /// Human-readable display title for the ontology.
+        @length(max: 1024)
         title: String
     }
 
     output := {
         /// Presigned S3 URL to PUT the file to.
         @required
-        uploadUrl: String
+        uploadUrl: PresignedUrl
 
         /// S3 object key where the file will be stored.
         @required
@@ -346,6 +447,8 @@ structure IngestJob {
 }
 
 /// Ingest an ontology file from S3 (async — returns 202, poll ingest-status).
+///
+/// Each call starts a new ingest job; send a `clientToken` to make a retry safe.
 @http(method: "POST", uri: "/namespaces/{namespaceId}/ontologies/{ontologyId}/ingest-from-s3", code: 202)
 operation IngestOntologyFromS3 {
     input := {
@@ -356,20 +459,30 @@ operation IngestOntologyFromS3 {
         /// Identifier to register the ingested ontology under.
         @required
         @httpLabel
-        ontologyId: String
+        ontologyId: OntologyId
 
-        /// S3 object key of the uploaded ontology file.
+        /// S3 object key of the uploaded ontology file, as returned by
+        /// GetOntologyUploadUrl.
         @required
-        s3Key: String
+        s3Key: OntologyUploadKey
 
-        /// Serialization format of the file (e.g. turtle, rdfxml, jsonld).
-        format: String
+        /// Serialization format of the file. Inferred from the key's file
+        /// extension when omitted.
+        format: OntologyFileFormat
 
         /// Human-readable display title for the ontology.
+        @length(max: 1024)
         title: String
 
-        /// Category of the ontology (foundational, induced, or user_created).
-        ontologyType: String
+        /// Category of the ontology. Defaults to `user_created`.
+        ontologyType: OntologyType
+
+        /// Optional idempotency token. A retry with the same token and the same
+        /// parameters within 24 hours returns the original result instead of
+        /// starting a second ingest job; reusing the token with different
+        /// parameters is rejected with a 409.
+        @idempotencyToken
+        clientToken: ClientToken
     }
 
     output := {
@@ -390,11 +503,12 @@ operation GetIngestStatus {
         /// Identifier of the ontology whose ingest job is being polled.
         @required
         @httpLabel
-        ontologyId: String
+        ontologyId: OntologyId
 
         /// Identifier of the ingest job to poll.
         @required
         @httpLabel
+        @length(min: 1, max: 128)
         jobId: String
     }
 
@@ -568,6 +682,7 @@ operation GraphSearch {
         /// Substring search term matched against entity IRIs and labels.
         @required
         @httpQuery("q")
+        @length(min: 1, max: 4000)
         q: String
 
         @httpQuery("kind")
@@ -575,12 +690,12 @@ operation GraphSearch {
 
         /// Restricts results to the specified ontology's named graph.
         @httpQuery("ontology_id")
-        ontologyId: String
+        ontologyId: OntologyId
 
         /// Excludes results from the specified ontology's named graph
         /// (e.g., to filter out governed metrics classes).
         @httpQuery("exclude_ontology_id")
-        excludeOntologyId: String
+        excludeOntologyId: OntologyId
 
         /// Maximum number of hits to return (the page size). Bounded because the
         /// value drives the underlying query's LIMIT clause; out-of-range values
@@ -591,9 +706,12 @@ operation GraphSearch {
 
         /// Number of leading hits to skip, for pagination. Combined with
         /// ``limit`` this yields a stable page window over the full,
-        /// deterministically-ordered result set.
+        /// deterministically-ordered result set. Bounded like
+        /// GetOntologyOverview's ``offset`` (the class browser pages through
+        /// every class of large induced ontologies); out-of-range values are
+        /// rejected with a 400.
         @httpQuery("offset")
-        @range(min: 0)
+        @range(min: 0, max: 1000000)
         offset: Integer
     }
 
@@ -625,7 +743,7 @@ operation GetGraphClass {
         /// IRI of the class vertex to look up.
         @required
         @httpQuery("uri")
-        uri: String
+        uri: VertexIri
     }
 
     output: GraphVertex
@@ -648,7 +766,7 @@ operation GetGraphObjectProperty {
         /// IRI of the object-property vertex to look up.
         @required
         @httpQuery("uri")
-        uri: String
+        uri: VertexIri
     }
 
     output: GraphVertex
@@ -671,7 +789,7 @@ operation GetGraphDatatypeProperty {
         /// IRI of the datatype-property vertex to look up.
         @required
         @httpQuery("uri")
-        uri: String
+        uri: VertexIri
     }
 
     output: GraphVertex
@@ -788,19 +906,28 @@ operation GetOntologyOverview {
         /// Identifier of the ontology to summarize.
         @required
         @httpQuery("ontology_id")
-        ontologyId: String
+        ontologyId: OntologyId
 
         /// Max entities to return per collection (classes, object properties,
         /// datatype properties are each capped independently). Bounds the
         /// response so a large ontology does not exceed the API Gateway / Lambda
         /// response limit. Omit for the server default.
         @httpQuery("limit")
+        @range(min: 1, max: 10000)
         limit: Integer
 
         /// Zero-based offset into each collection, for paging. Combined with
         /// ``limit`` this yields a stable page window over the full ontology.
         @httpQuery("offset")
+        @range(min: 0, max: 1000000)
         offset: Integer
+
+        /// When true, return a bounded taxonomy seed instead of the full
+        /// ontology: a few root classes with the largest subtrees plus a capped
+        /// set of their descendants, and no properties. For a first render of a
+        /// very large ontology; the rest loads on demand.
+        @httpQuery("sample")
+        sample: Boolean
     }
 
     output: OntologyOverview

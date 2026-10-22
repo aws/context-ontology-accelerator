@@ -12,7 +12,7 @@ vi.mock("@components/ApiClientProvider", () => ({
 }));
 
 vi.mock("../../services/ontology-engine", () => ({
-  listProposals: vi
+  listAllProposals: vi
     .fn()
     .mockResolvedValue([{ proposal_id: "p1", status: "pending" }]),
 }));

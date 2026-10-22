@@ -29,9 +29,11 @@ from typing import Any
 import boto3
 import structlog
 from botocore.exceptions import ClientError
+from coa_common.idempotency import idempotent
 from coa_common.logging import setup_logging
 from coa_common.response import api_response, get_caller_identity
 
+from coa_metrics.api.contract import IMPORT_CONTENT_MAX_LENGTH, IMPORT_S3_KEY_MAX_LENGTH, check_metric_definition
 from coa_metrics.api.import_s3_key import IMPORT_S3_KEY_SCOPE_ERROR, is_import_s3_key_for_namespace
 from coa_metrics.data_source_lookup_factory import build_data_source_lookup
 from coa_metrics.dataset_resolver import resolve_datasets
@@ -78,6 +80,15 @@ logger = structlog.get_logger(__name__)
 # Single-metric creates stay synchronous: they go through create_metric.py,
 # which never consults this threshold.
 SYNC_THRESHOLD = 0
+
+# Client-facing text for failures whose underlying cause (a DynamoDB, Neptune,
+# OpenSearch or catalog error) is logged but never returned: exception messages
+# carry ARNs, endpoints, account IDs and table names.
+SOURCE_LOOKUP_UNAVAILABLE_MESSAGE = "data source lookup unavailable"
+_WARN_RECONCILIATION_SKIPPED = "Metadata reconciliation skipped: metadata store unavailable"
+_WARN_LOOKUP_FAILED = "Metric '{name}': lookup failed — internal error, retry the import"
+_WARN_WRITE_FAILED = "Metric '{name}': write failed — internal error, retry the import"
+_WARN_INDEXING_DELAYED = "Metric '{name}': search indexing delayed — saved, but may not appear in search yet"
 _IMPORT_QUEUE_URL = os.environ.get("IMPORT_QUEUE_URL", "")
 _sqs_client: Any = None
 
@@ -125,19 +136,18 @@ def _get_lookup(namespace: str) -> DataSourceLookup:
             mode not enabled — callers map this to a 5xx / failed job.
     """
     if namespace not in _lookups:
-        init_error = "lookup not configured"
         try:
             lookup = build_data_source_lookup(namespace)
             if lookup:
                 _lookups[namespace] = lookup
                 return _lookups[namespace]
+            logger.warning("data_source_lookup_not_configured", namespace=namespace)
         except Exception as exc:
-            init_error = str(exc)
-            logger.warning("data_source_lookup_init_failed", error=init_error)
+            # The underlying error stays in the log: this exception's message
+            # can reach a stored import job, which callers read back.
+            logger.warning("data_source_lookup_init_failed", namespace=namespace, error=str(exc), exc_info=True)
         if not permissive_lookup_enabled():
-            raise SourceValidationUnavailableError(
-                f"data source lookup unavailable for namespace '{namespace}': {init_error}"
-            )
+            raise SourceValidationUnavailableError(SOURCE_LOOKUP_UNAVAILABLE_MESSAGE)
         logger.warning(
             "permissive_source_lookup_active",
             namespace=namespace,
@@ -210,8 +220,14 @@ def _write_to_s3(content: str, namespace: str) -> StagedImportSource:
 # ── Handler ─────────────────────────────────────────────────────────────
 
 
+@idempotent(operation="ImportOsi")
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
-    """API Gateway proxy-integration Lambda handler for POST /namespaces/{ns}/import-osi."""
+    """API Gateway proxy-integration Lambda handler for POST /namespaces/{ns}/import-osi.
+
+    Retry-safe when the body carries a ``clientToken``: the token is validated,
+    removed from the body, and used to replay the original response for a
+    retried request (see ``coa_common.idempotency``).
+    """
     namespace = event.get("pathParameters", {}).get("namespaceId", "")
     caller = get_caller_identity(event)
     logger.info("import_osi_start", namespace=namespace, caller=caller)
@@ -229,6 +245,13 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     content = body.get("content", "")
     raw_s3_key: object = body.get("s3Key", "")
     has_s3_key = "s3Key" in body and raw_s3_key != ""
+    # Contract bounds. Over-long inline content is answered 413 below (the byte
+    # limit is stricter than the model's character limit); a non-string s3Key
+    # fails the namespace-prefix check below.
+    if content and not isinstance(content, str):
+        return api_response(400, {"message": "content must be a string"})
+    if isinstance(raw_s3_key, str) and len(raw_s3_key) > IMPORT_S3_KEY_MAX_LENGTH:
+        return api_response(400, {"message": f"s3Key must be at most {IMPORT_S3_KEY_MAX_LENGTH} characters"})
 
     if content and has_s3_key:
         return api_response(400, {"message": "'content' and 's3Key' are mutually exclusive"})
@@ -243,7 +266,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         except ClientError as exc:
             code = exc.response.get("Error", {}).get("Code", "")
             if code in ("NoSuchKey", "404"):
-                return api_response(404, {"message": f"OSI YAML not found at S3 key: {s3_key}"})
+                return api_response(404, {"message": "OSI YAML not found at the given s3Key"})
             logger.exception("s3_read_failed", s3_key=s3_key)
             return api_response(503, {"message": "Failed to read from S3 — service unavailable, retry later"})
         except Exception:
@@ -252,7 +275,9 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     elif content:
         s3_key = ""
         # Enforce inline size limit (5MB)
-        max_inline_bytes = 5 * 1024 * 1024
+        # The model bounds content at IMPORT_CONTENT_MAX_LENGTH characters; the
+        # same number as a byte limit is never looser.
+        max_inline_bytes = IMPORT_CONTENT_MAX_LENGTH
         if len(content.encode("utf-8")) > max_inline_bytes:
             return api_response(
                 413,
@@ -358,8 +383,8 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
                 reconciliation = reconcile_metadata(resolution.resolved, metadata_store)
                 warnings.extend(reconciliation.warnings)
         except Exception as exc:
-            logger.warning("metadata_reconciliation_failed", error=str(exc))
-            warnings.append(f"Metadata reconciliation skipped: {exc}")
+            logger.warning("metadata_reconciliation_failed", error=str(exc), exc_info=True)
+            warnings.append(_WARN_RECONCILIATION_SKIPPED)
     else:
         datasets_resolved = 0
 
@@ -413,8 +438,8 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         try:
             existing = neptune.get_metric(namespace, metric_def.name)
         except Exception as exc:
-            logger.warning("metric_lookup_failed", name=metric_def.name, error=str(exc))
-            warnings.append(f"Metric '{metric_def.name}': lookup failed — {exc}")
+            logger.warning("metric_lookup_failed", name=metric_def.name, error=str(exc), exc_info=True)
+            warnings.append(_WARN_LOOKUP_FAILED.format(name=metric_def.name))
             continue
 
         try:
@@ -431,15 +456,15 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
                 logger.info("metric_created_via_import", name=metric_def.name, namespace=namespace)
         except Exception as exc:
             logger.exception("metric_write_failed", name=osi_metric.name, error=str(exc))
-            warnings.append(f"Metric '{osi_metric.name}': write failed — {exc}")
+            warnings.append(_WARN_WRITE_FAILED.format(name=osi_metric.name))
             continue
 
         # Embed in OpenSearch (best-effort)
         try:
             opensearch.embed_metric(namespace, metric_def)
         except Exception as exc:
-            logger.warning("opensearch_embed_failed", name=metric_def.name, error=str(exc))
-            warnings.append(f"Metric '{metric_def.name}': search indexing delayed — {exc}")
+            logger.warning("opensearch_embed_failed", name=metric_def.name, error=str(exc), exc_info=True)
+            warnings.append(_WARN_INDEXING_DELAYED.format(name=metric_def.name))
 
     # Build response
     response_body: dict[str, Any] = {
@@ -551,7 +576,7 @@ def _osi_metric_to_definition(
     # Map time_dimension to TimeGrain enum values
     default_time_grain = _map_time_dimension(time_grain) if time_grain else None
 
-    return MetricDefinition(
+    definition = MetricDefinition(
         name=osi_metric.name,
         description=osi_metric.description,
         expression_dialects=dialects,
@@ -565,6 +590,13 @@ def _osi_metric_to_definition(
         defined_by=caller,
         effective_from=datetime.now(UTC).strftime("%Y-%m-%d"),
     )
+    # The CreateMetric contract bounds: a metric stored outside them could not be
+    # fetched, updated or deleted afterwards. Raised as ValueError so every import
+    # path records it as that metric's error and carries on with the rest.
+    bounds_error = check_metric_definition(definition)
+    if bounds_error:
+        raise ValueError(bounds_error)
+    return definition
 
 
 def _map_time_dimension(time_dim: str) -> str | None:

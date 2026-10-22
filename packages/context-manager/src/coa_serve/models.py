@@ -262,7 +262,9 @@ class InvokeRequest(BaseModel):
             # reference rather than a literal — silently comparing two columns.
             if isinstance(value, bool):
                 pass
-            elif isinstance(value, (int, float)):
+            elif isinstance(value, int):
+                pass  # always finite; isfinite() would raise OverflowError past float range
+            elif isinstance(value, float):
                 if not math.isfinite(value):
                     raise ValueError(
                         f"Invalid dimension value {_clip(value)} for {_clip(name)}; must be a finite number"

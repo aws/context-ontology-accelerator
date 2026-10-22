@@ -165,28 +165,72 @@ export interface BulkDeleteOutput {
   notFound?: string[];
 }
 
+/**
+ * Most names one BulkDeleteMetrics request may carry: the `@length(max: 2000)`
+ * on `BulkDeleteMetrics.names` in metric-service.smithy (enforced server-side as
+ * `BULK_DELETE_NAMES_MAX_ITEMS` in the metric-service contract). Larger name
+ * lists are sent as consecutive requests of at most this many names.
+ */
+export const BULK_DELETE_NAMES_MAX_ITEMS = 2000;
+
+export interface BulkDeleteInput {
+  names?: string[];
+  filter?: {
+    dataSourceId?: string;
+    sourceTable?: string;
+    namePrefix?: string;
+  };
+}
+
+/**
+ * Deletes `input.names` in requests of at most {@link BULK_DELETE_NAMES_MAX_ITEMS}
+ * names, sent one after another, and sums the results. A failing request stops
+ * the run; its error says how many metrics earlier requests already deleted.
+ */
+export async function bulkDeleteInBatches(
+  input: BulkDeleteInput,
+  post: (body: BulkDeleteInput) => Promise<BulkDeleteOutput>,
+): Promise<BulkDeleteOutput> {
+  const names = input.names;
+  if (!names || names.length <= BULK_DELETE_NAMES_MAX_ITEMS) {
+    return post(input);
+  }
+  let deleted = 0;
+  const notFound: string[] = [];
+  for (let i = 0; i < names.length; i += BULK_DELETE_NAMES_MAX_ITEMS) {
+    const batch = names.slice(i, i + BULK_DELETE_NAMES_MAX_ITEMS);
+    let result: BulkDeleteOutput;
+    try {
+      result = await post({ ...input, names: batch });
+    } catch (err) {
+      if (deleted === 0) throw err;
+      const reason = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `${reason} (${deleted} metrics were already deleted; the remaining ${names.length - i} were not confirmed deleted)`,
+        { cause: err },
+      );
+    }
+    deleted += result.deleted;
+    notFound.push(...(result.notFound ?? []));
+  }
+  return notFound.length ? { deleted, notFound } : { deleted };
+}
+
 export function useBulkDeleteMetrics(namespaceId: string) {
   const client = useApiClient();
   const queryClient = useQueryClient();
 
-  return useMutation<
-    BulkDeleteOutput,
-    Error,
-    {
-      names?: string[];
-      filter?: {
-        dataSourceId?: string;
-        sourceTable?: string;
-        namePrefix?: string;
-      };
-    }
-  >({
+  return useMutation<BulkDeleteOutput, Error, BulkDeleteInput>({
     mutationFn: (input) =>
-      client.post<BulkDeleteOutput>(
-        `/namespaces/${namespaceId}/bulk-delete-metrics`,
-        input,
+      bulkDeleteInBatches(input, (body) =>
+        client.post<BulkDeleteOutput>(
+          `/namespaces/${namespaceId}/bulk-delete-metrics`,
+          body,
+        ),
       ),
-    onSuccess: () => {
+    // Settled, not success: a batched delete that fails part-way has still
+    // removed the metrics in its earlier batches.
+    onSettled: () => {
       queryClient.invalidateQueries({ queryKey: ["metrics", namespaceId] });
     },
   });

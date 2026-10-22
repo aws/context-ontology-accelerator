@@ -65,6 +65,9 @@ class _FakeDynamoTable:
         # (≤1 MB per page) even with no ``Limit`` — set this to force multi-page
         # drains (e.g. an orphan on page 2). ``None`` = everything in one page.
         self.page_size = page_size
+        # Every ``scan`` call's kwargs, so tests can count reads and check what
+        # was sent (e.g. no per-call ``Limit``).
+        self.scan_calls: list[dict] = []
 
     def put_item(self, Item):
         self.items[(Item["PK"], Item["SK"])] = dict(Item)
@@ -115,9 +118,6 @@ class _FakeDynamoTable:
         return {}
 
     def scan(self, **kwargs):
-        filter_expr: str = kwargs.get("FilterExpression", "")
-        values: dict[str, Any] = kwargs.get("ExpressionAttributeValues", {}) or {}
-        names: dict[str, str] = kwargs.get("ExpressionAttributeNames", {}) or {}
         # DynamoDB ``Limit`` caps items SCANNED per page (not returned), so a page
         # can return fewer matches than requested and set LastEvaluatedKey. We
         # model that faithfully: walk the raw store from ExclusiveStartKey, read
@@ -125,7 +125,26 @@ class _FakeDynamoTable:
         # slice, and emit LastEvaluatedKey when more raw items remain. This is
         # what makes a paginated drain testable with a row on page 2. Without a
         # Limit, everything is one page.
-        ordered = list(self.items.items())  # [((PK, SK), item), ...] insertion order
+        self.scan_calls.append(dict(kwargs))
+        return self._read(list(self.items.items()), **kwargs)
+
+    def query(self, **kwargs):
+        """``Query`` for the one key condition the registry listing uses.
+
+        ``PK = :pk AND begins_with(SK, :skp)``: the partition's rows, then the
+        same paging and post-read filtering as :meth:`scan`.
+        """
+        assert kwargs["KeyConditionExpression"] == "PK = :pk AND begins_with(SK, :skp)"
+        values = kwargs["ExpressionAttributeValues"]
+        ordered = [
+            (k, item) for k, item in self.items.items() if k[0] == values[":pk"] and k[1].startswith(values[":skp"])
+        ]
+        return self._read(ordered, **kwargs)
+
+    def _read(self, ordered: list, **kwargs):
+        filter_expr: str = kwargs.get("FilterExpression", "")
+        values: dict[str, Any] = kwargs.get("ExpressionAttributeValues", {}) or {}
+        names: dict[str, str] = kwargs.get("ExpressionAttributeNames", {}) or {}
         start = 0
         start_key = kwargs.get("ExclusiveStartKey")
         if start_key is not None:

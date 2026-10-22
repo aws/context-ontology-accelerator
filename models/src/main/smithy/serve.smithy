@@ -52,9 +52,6 @@ structure OntologyNotPublishedError {
 
     /// Identifier of the namespace whose ontology is not published.
     namespaceId: String
-
-    /// Additional detail about why the ontology is unavailable.
-    detail: String
 }
 
 /// Returned with HTTP 400 when a natural-language question cannot be translated
@@ -65,9 +62,6 @@ structure QueryTranslationError {
     /// Human-readable description of the error.
     @required
     message: String
-
-    /// Additional detail about the translation failure.
-    detail: String
 }
 
 /// Returned with HTTP 429 when the caller exceeds the request rate limit;
@@ -84,19 +78,18 @@ structure RateLimitExceededError {
 }
 
 /// Returned with HTTP 502 when the virtual knowledge graph fails to execute the
-/// generated SPARQL query; `sparqlQuery` carries the query that failed.
+/// generated SPARQL query.
+///
+/// Carries a fixed, client-safe message only. The failing query and the
+/// backend's own error text are deliberately not returned: they name internal
+/// schema objects and endpoints. Operators correlate a failure through the
+/// request id instead.
 @error("server")
 @httpError(502)
 structure VKGExecutionError {
     /// Human-readable description of the error.
     @required
     message: String
-
-    /// The SPARQL query that failed to execute.
-    sparqlQuery: String
-
-    /// Additional detail about the execution failure.
-    detail: String
 }
 
 /// Returned with HTTP 502 when a backing data source cannot be reached to
@@ -110,9 +103,6 @@ structure DataSourceUnavailableError {
 
     /// Identifier of the data source that could not be reached.
     dataSourceId: String
-
-    /// Additional detail about the unavailability.
-    detail: String
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -198,7 +188,7 @@ structure SupportingContent {
 
     /// Text content of the chunk.
     @required
-    text: String
+    text: CustomerData
 
     /// Opaque, unique identifier of the source document the chunk came from.
     /// Use this value to correlate chunks; it is not a display name.
@@ -234,15 +224,48 @@ list StringList {
 /// keep the whole serialized body under 8 KB. Natural-language questions are far
 /// below any of these; see `MAX_QUERY_CODEPOINTS` in `coa_common.constants` for
 /// the measurements and why the WAF limit is left as it is.
+///
+/// Marked sensitive: the text is caller-authored and routinely carries business
+/// data or personal information, so generated clients must not log it.
 @length(min: 1, max: 4000)
+@sensitive
 string NaturalLanguageQuery
+
+/// Customer data returned by or sent to a query: result cell values, knowledge-base
+/// chunk text, synthesized answers, generated SQL/SPARQL, and dimension filter
+/// values. Marked sensitive so generated clients keep it out of logs.
+@sensitive
+string CustomerData
+
+/// Tier-3 execution mode for a query. Orthogonal to the tier cascade.
+enum QueryMode {
+    /// Single-shot retrieval and synthesis.
+    STANDARD = "standard"
+
+    /// Multi-step reasoning loop. Higher recall, much slower (p50 ~90s).
+    DEEP_REASONING = "deep-reasoning"
+
+    /// Deprecated pre-rename spelling of `deep-reasoning`; still accepted.
+    AGENTIC = "agentic"
+}
+
+/// A bounded list of filter values (source identifiers, entity names, or
+/// relationship IRIs) that restricts a retrieval or traversal.
+@length(max: 50)
+list FilterValueList {
+    member: FilterValue
+}
+
+/// A single filter value.
+@length(min: 1, max: 2048)
+string FilterValue
 
 // ══════════════════════════════════════════════════════════════════════════════
 // Shared Shapes — Result Rows (Tier 1/2 tabular data)
 // ══════════════════════════════════════════════════════════════════════════════
 map ResultRow {
     key: String
-    value: String
+    value: CustomerData
 }
 
 list ResultRowList {
@@ -312,6 +335,17 @@ map PropertyMap {
     value: String
 }
 
+/// The IRI a graph traversal starts from: an absolute `http`/`https` IRI or a
+/// `urn:` name.
+///
+/// The character set excludes whitespace and the characters that could end or
+/// escape an IRI reference in the generated graph query (`<>"{}|\^` and
+/// backtick), plus `;`. A value outside it is rejected with 400 rather than
+/// silently matching nothing.
+@length(min: 1, max: 2048)
+@pattern("^(https?://[^\\s<>\"{}|\\\\^`;]+|urn:[a-zA-Z0-9][a-zA-Z0-9._:-]*)$")
+string TraversalStartUri
+
 // ══════════════════════════════════════════════════════════════════════════════
 // Shared Shapes — Enums
 // ══════════════════════════════════════════════════════════════════════════════
@@ -357,13 +391,18 @@ enum DimensionOperator {
 structure DimensionFilter {
     /// Name of the dimension to filter on.
     @required
+    @length(min: 1, max: 256)
     name: String
 
-    /// Value to match for the dimension.
+    /// Value to match for the dimension. For compatibility, the server also
+    /// accepts a JSON number (finite) or boolean here and binds it as a typed
+    /// literal; `null`, objects, and arrays are rejected.
     @required
-    value: String
+    @length(max: 4000)
+    value: CustomerData
 
-    /// Comparison operator to apply (defaults to equality).
+    /// Comparison operator to apply (defaults to equality). An empty or
+    /// whitespace-only string is treated as absent.
     operator: DimensionOperator
 }
 
@@ -389,13 +428,13 @@ structure QueryResult {
     resultRows: ResultRowList
 
     /// Natural-language answer synthesized from the results.
-    synthesizedAnswer: String
+    synthesizedAnswer: CustomerData
 
     /// The query that was executed to produce the result.
-    queryUsed: String
+    queryUsed: CustomerData
 
     /// The SPARQL query generated for the result, if any.
-    sparqlGenerated: String
+    sparqlGenerated: CustomerData
 
     /// Knowledge-base chunks supporting the answer.
     supportingContent: SupportingContentList
@@ -520,7 +559,8 @@ operation Query {
         /// Whether to execute the generated query (versus translate only).
         execute: Boolean
 
-        /// Pin resolution to a specific tier, bypassing automatic routing.
+        /// Pin resolution to a specific tier (1, 2 or 3), bypassing automatic routing.
+        @range(min: 1, max: 3)
         tierOverride: Integer
 
         /// Execution mode: "standard" (single-shot) or "deep-reasoning" (multi-step
@@ -529,7 +569,7 @@ operation Query {
         /// (p50 ~90s), so a caller behind a short client timeout should send
         /// "standard". "agentic" is the deprecated pre-rename spelling of
         /// "deep-reasoning" and is still accepted.
-        mode: String
+        mode: QueryMode
 
         /// Which Tier-2 engine answers a structured query. Absent = the serve
         /// default (``nl_to_sql_first``). Orthogonal to ``mode`` — see
@@ -537,9 +577,12 @@ operation Query {
         strategy: QueryStrategy
 
         /// Dimension filters to constrain the query.
+        @length(max: 100)
         dimensions: DimensionFilterList
 
-        /// Maximum time to wait for the query, in milliseconds.
+        /// Maximum time to wait for the query, in milliseconds. A caller may
+        /// narrow the service's own REST budget (29,000 ms) but not widen it.
+        @range(min: 1, max: 29000)
         timeoutMs: Long
 
         /// Whether to include supporting content in the response.
@@ -550,11 +593,15 @@ operation Query {
         /// Defaults to false; when unset or false, both fields are omitted.
         ///
         /// **Security:** these fields expose internal schema (table and column
-        /// names, joins). Only enable for trusted callers, admin-tier users, or
-        /// development environments.
+        /// names, joins), so the flag is honoured only for a caller who already
+        /// administers that schema: a platform admin, or a namespace owner,
+        /// maintainer or data steward of the queried namespace. For any other
+        /// caller the request still succeeds, but both fields are omitted as if
+        /// the flag were false.
         includeDebugInfo: Boolean
 
         /// Maximum number of result rows to return.
+        @range(min: 1, max: 10000)
         maxResults: Integer
     }
 
@@ -636,16 +683,24 @@ operation KBSearch {
         query: NaturalLanguageQuery
 
         /// Maximum number of chunks to return.
+        @range(min: 1, max: 100)
         topK: Integer
 
-        /// Minimum relevance score a chunk must meet to be returned.
+        /// Minimum relevance score a chunk must meet to be returned. Relevance
+        /// scores are non-negative; no upper bound is set because the scale
+        /// depends on the index's similarity metric.
+        @range(min: 0)
         minScore: Float
 
-        /// Restrict results to these source document identifiers.
-        sourceFilter: StringList
+        /// Not yet supported; a non-empty value is rejected with 400. Reserved
+        /// for restricting results to these source document identifiers. An
+        /// empty list is accepted and restricts nothing.
+        sourceFilter: FilterValueList
 
-        /// Restrict results to chunks annotated with these entities.
-        entityFilter: StringList
+        /// Not yet supported; a non-empty value is rejected with 400. Reserved
+        /// for restricting results to chunks annotated with these entities. An
+        /// empty list is accepted and restricts nothing.
+        entityFilter: FilterValueList
     }
 
     output := {
@@ -679,18 +734,24 @@ operation GraphTraverse {
 
         /// IRI of the entity to start traversal from.
         @required
-        startUri: String
+        startUri: TraversalStartUri
 
-        /// Maximum traversal depth from the starting entity.
+        /// Maximum traversal depth from the starting entity. Defaults to 2.
+        /// Depths above 2 are accepted but currently traverse 2 hops.
+        @range(min: 1, max: 5)
         maxDepth: Integer
 
-        /// Restrict traversal to these relationship (predicate) IRIs.
-        relationshipFilter: StringList
+        /// Accepted and validated, but not yet applied: traversal currently
+        /// follows every relationship. Reserved for restricting traversal to
+        /// these relationship (predicate) IRIs.
+        relationshipFilter: FilterValueList
 
-        /// Direction to traverse relationships in.
+        /// Accepted and validated, but not yet applied: traversal currently
+        /// follows relationships in both directions. Defaults to `both`.
         direction: TraversalDirection
 
-        /// Maximum number of entities to return.
+        /// Maximum number of entities to return. Defaults to 100.
+        @range(min: 1, max: 1000)
         maxResults: Integer
     }
 
@@ -735,6 +796,7 @@ operation DescribeSchema {
 
         /// Maximum number of classes to return.
         @httpQuery("maxResults")
+        @range(min: 1, max: 1000)
         maxResults: Integer
     }
 

@@ -304,6 +304,24 @@ class TestListPlatformGrants:
         assert resp["statusCode"] == 500
 
 
+_PLATFORM_INDEX_KEY = {
+    "PK": "Platform::GLOBAL#User::z@co.com",
+    "SK": "ROLE#platform-viewer",
+    "namespaceKey": "NS#GLOBAL",
+    "principalRoleKey": "User::z@co.com#ROLE#platform-viewer",
+}
+_PLATFORM_PRINCIPAL_KEY = {
+    "PK": "Platform::GLOBAL#User::alice@company.com",
+    "SK": "ROLE#platform-viewer",
+    "principalKey": "User::alice@company.com",
+    "resourceRoleKey": "Platform::GLOBAL#ROLE#platform-viewer",
+}
+
+
+def _token(decoded: object) -> str:
+    return base64.b64encode(json.dumps(decoded).encode()).decode()
+
+
 class TestListPlatformGrantsPagination:
     @patch("coa_control_plane.grants.list_platform_grants_handler.DynamoDBDAO")
     def test_passes_max_results_as_limit(self, mock_dao_cls):
@@ -341,12 +359,77 @@ class TestListPlatformGrantsPagination:
         dao = MagicMock()
         mock_dao_cls.return_value = dao
         dao.query.return_value = PaginatedResult(items=[], last_evaluated_key=None)
-        start_key = {"PK": "p", "SK": "s"}
-        token = base64.b64encode(json.dumps(start_key).encode()).decode()
+        start_key = _PLATFORM_INDEX_KEY
+        token = _token(start_key)
 
         resp = list_handler(_list_event({"nextToken": token}), None)
         assert resp["statusCode"] == 200
         assert dao.query.call_args[0][0].exclusive_start_key == start_key
+
+    @patch("coa_control_plane.grants.list_platform_grants_handler.DynamoDBDAO")
+    def test_principal_filtered_next_token_round_trips(self, mock_dao_cls):
+        dao = MagicMock()
+        mock_dao_cls.return_value = dao
+        dao.query.return_value = PaginatedResult(items=[], last_evaluated_key=None)
+
+        query = {"principal": "User::alice@company.com", "nextToken": _token(_PLATFORM_PRINCIPAL_KEY)}
+        resp = list_handler(_list_event(query), None)
+        assert resp["statusCode"] == 200
+        assert dao.query.call_args[0][0].exclusive_start_key == _PLATFORM_PRINCIPAL_KEY
+
+    @pytest.mark.parametrize(
+        "decoded",
+        [
+            {"foo": "bar"},
+            [1, 2],
+            "x",
+            {"PK": 1, "SK": 2},
+            {"offset": 25},
+            {"PK": "a", "SK": "b"},
+            # Right shape, wrong partition: a namespace's index key.
+            {**_PLATFORM_INDEX_KEY, "namespaceKey": "NS#11111111-1111-4111-8111-111111111111"},
+            # Principal-index key replayed on the unfiltered listing.
+            _PLATFORM_PRINCIPAL_KEY,
+        ],
+    )
+    @patch("coa_control_plane.grants.list_platform_grants_handler.DynamoDBDAO")
+    def test_malformed_next_token_returns_400_without_query(self, mock_dao_cls, decoded):
+        resp = list_handler(_list_event({"nextToken": _token(decoded)}), None)
+        assert resp["statusCode"] == 400
+        assert json.loads(resp["body"])["message"].startswith("Invalid nextToken")
+        mock_dao_cls.return_value.query.assert_not_called()
+
+    def test_smithy_example_next_token_returns_400(self):
+        resp = list_handler(_list_event({"nextToken": "eyJvZmZzZXQiOjI1fQ=="}), None)
+        assert resp["statusCode"] == 400
+
+    @pytest.mark.parametrize(
+        "decoded",
+        [
+            {**_PLATFORM_PRINCIPAL_KEY, "principalKey": "User::mallory@company.com"},
+            {**_PLATFORM_PRINCIPAL_KEY, "resourceRoleKey": "Namespace::abc#ROLE#owner"},
+            _PLATFORM_INDEX_KEY,
+        ],
+    )
+    def test_principal_filtered_foreign_next_token_returns_400(self, decoded):
+        query = {"principal": "User::alice@company.com", "nextToken": _token(decoded)}
+        assert list_handler(_list_event(query), None)["statusCode"] == 400
+
+    @patch("coa_control_plane.grants.list_platform_grants_handler.DynamoDBDAO")
+    def test_start_key_rejected_by_dynamodb_returns_400(self, mock_dao_cls):
+        mock_dao_cls.return_value.query.side_effect = ClientError(
+            {"Error": {"Code": "ValidationException", "Message": "The provided starting key is invalid"}}, "Query"
+        )
+        resp = list_handler(_list_event({"nextToken": _token(_PLATFORM_INDEX_KEY)}), None)
+        assert resp["statusCode"] == 400
+        assert "starting key" not in resp["body"]
+
+    @patch("coa_control_plane.grants.list_platform_grants_handler.DynamoDBDAO")
+    def test_validation_error_without_next_token_stays_500(self, mock_dao_cls):
+        mock_dao_cls.return_value.query.side_effect = ClientError(
+            {"Error": {"Code": "ValidationException", "Message": "bad"}}, "Query"
+        )
+        assert list_handler(_list_event(), None)["statusCode"] == 500
 
     def test_invalid_next_token_returns_400(self):
         bad = base64.b64encode(b"not-json").decode()
@@ -462,3 +545,19 @@ class TestGrantsRouterPlatformRoutes:
 
         resp = grants_handler.handler({"httpMethod": "PUT", "resource": "/grants"}, None)
         assert resp["statusCode"] == 405
+
+
+@pytest.mark.unit
+@patch("coa_control_plane.grants.create_platform_grant_handler.DynamoDBDAO")
+def test_create_platform_grant_principal_too_long_once_encoded_is_400(mock_dao_cls):
+    roles_dao = MagicMock()
+    mappings_dao = MagicMock()
+    mock_dao_cls.side_effect = [roles_dao, mappings_dao]
+    roles_dao.get.return_value = {"PK": "GLOBAL", "SK": "ROLE#platform-viewer", "name": "Platform Viewer"}
+
+    resp = create_handler(
+        _create_event({"principalType": "Group", "principalId": "グループ" * 30, "role": "platform-viewer"}),
+        None,
+    )
+    assert resp["statusCode"] == 400
+    mappings_dao.put.assert_not_called()

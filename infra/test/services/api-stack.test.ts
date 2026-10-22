@@ -172,6 +172,14 @@ describe("ApiStack WAF WebACL", () => {
     );
   };
 
+  it("keeps the synthesized template well under the 1 MB CloudFormation limit", () => {
+    // The merged OpenAPI body is inlined into the template, so every modeled
+    // operation, error response and constraint grows it. Fail at 900 KB to leave
+    // headroom before a deploy is rejected outright.
+    const size = Buffer.byteLength(JSON.stringify(mkApi().toJSON()));
+    expect(size).toBeLessThan(900 * 1024);
+  });
+
   it("auto-creates a REGIONAL WebACL with the Common Rule Set when no ARN is given", () => {
     const template = mkApi();
     template.hasResourceProperties("AWS::WAFv2::WebACL", {
@@ -508,6 +516,118 @@ describe("ApiStack GET /health", () => {
   });
 });
 
+describe("Data-layer API authentication", () => {
+  const HTTP_METHODS = [
+    "get",
+    "put",
+    "post",
+    "delete",
+    "patch",
+    "head",
+  ] as const;
+
+  /** The slice of an OpenAPI document these tests read. */
+  type SecurityRequirement = Record<string, string[]>;
+  type OpenApiSpec = {
+    security?: SecurityRequirement[];
+    components?: {
+      securitySchemes?: Record<
+        string,
+        {
+          "x-amazon-apigateway-authorizer"?: {
+            authorizerResultTtlInSeconds?: number;
+          };
+        }
+      >;
+    };
+    paths: Record<
+      string,
+      Partial<
+        Record<
+          (typeof HTTP_METHODS)[number],
+          { security?: SecurityRequirement[] }
+        >
+      >
+    >;
+  };
+
+  const dataLayerSpec = (): OpenApiSpec =>
+    readOpenApiSpec(Paths.dataLayerOpenApiSpec) as OpenApiSpec;
+
+  /** The merged control-plane + data-layer spec the RestApi is created from. */
+  let deployedSpec: OpenApiSpec | undefined;
+  const deployed = (): OpenApiSpec => {
+    if (deployedSpec) return deployedSpec;
+    const app = new cdk.App({ context: TEST_CONTEXT });
+    const depStack = new cdk.Stack(app, "DataLayerAuthDeps", {
+      env: { account: "123456789012", region: "us-east-1" },
+    });
+    const vpc = new ec2.Vpc(depStack, "Vpc");
+    const mkTable = (id: string) => mkTestTable(depStack, id);
+    const stack = new ApiStack(app, "TestApiDataLayerAuth", {
+      env: { account: "123456789012", region: "us-east-1" },
+      allowedOrigin: "https://app.example.com",
+      vpc,
+      ...mkTestSgs(depStack, vpc),
+      rolesTable: mkTable("Roles"),
+      resourceRoleMappingsTable: mkTable("RRM"),
+      cacheInvalidationTable: mkTable("Cache"),
+    });
+    const apis = Template.fromStack(stack).findResources(
+      "AWS::ApiGateway::RestApi",
+    );
+    deployedSpec = Object.values(apis)[0].Properties.Body as OpenApiSpec;
+    return deployedSpec;
+  };
+
+  it("declares the TokenAuthorizer in the data-layer contract itself", () => {
+    // Secure-by-default: the contract must say the data plane is authenticated,
+    // not leave it to the merge with the control-plane spec to supply.
+    const spec = dataLayerSpec();
+    expect(spec.security).toEqual([{ TokenAuthorizer: [] }]);
+    expect(
+      spec.components?.securitySchemes?.TokenAuthorizer[
+        "x-amazon-apigateway-authorizer"
+      ]?.authorizerResultTtlInSeconds,
+    ).toBe(0);
+  });
+
+  it("puts every data-layer operation behind the authorizer on the deployed API", () => {
+    const checked: string[] = [];
+    for (const [apiPath, methods] of Object.entries(dataLayerSpec().paths)) {
+      for (const method of HTTP_METHODS) {
+        if (!methods[method]) continue;
+        expect(deployed().paths[apiPath][method]?.security).toEqual([
+          { TokenAuthorizer: [] },
+        ]);
+        checked.push(`${method.toUpperCase()} ${apiPath}`);
+      }
+    }
+    expect(checked.length).toBeGreaterThanOrEqual(5);
+  });
+
+  it("leaves only GET /health unauthenticated on the deployed API", () => {
+    // fillAuthorizerParameters keeps an operation's existing `security: []`,
+    // which is what the OpenAPI conversion emits for @optionalAuth / @auth([]).
+    // So a new unauthenticated Smithy operation would reach API Gateway
+    // without the authorizer; this pins the deployed allowlist to the probe.
+    const unsecured: string[] = [];
+    let operations = 0;
+    for (const [apiPath, methods] of Object.entries(deployed().paths)) {
+      for (const method of HTTP_METHODS) {
+        const operation = methods[method];
+        if (!operation) continue;
+        operations++;
+        const security = operation.security ?? [];
+        const authorized = security.some((req) => "TokenAuthorizer" in req);
+        if (!authorized) unsecured.push(`${method.toUpperCase()} ${apiPath}`);
+      }
+    }
+    expect(unsecured).toEqual(["GET /health"]);
+    expect(operations).toBeGreaterThan(50);
+  });
+});
+
 describe("ApiStack 501-stub guard", () => {
   // The paths the stack itself declares as deliberately unimplemented,
   // asserted against the exported INTENTIONALLY_STUBBED below so this list
@@ -608,5 +728,60 @@ describe("ApiStack 501-stub guard", () => {
     // Most tests in this file construct the stack to assert on the authorizer or
     // the WAF and pass no handlers. For them every path stubs, which is correct.
     expect(synth()).not.toThrow();
+  });
+});
+
+describe("ApiStack access log format", () => {
+  // The API authenticates via a custom Lambda authorizer, so
+  // $context.identity.caller/user are always "-" even on an authenticated
+  // 200/201. The real caller is $context.authorizer.principalId (the validated
+  // token's email). AppSec V2298834436 (CWE-778): the access log must carry it.
+  const mkTemplate = (): Template => {
+    const app = new cdk.App({ context: TEST_CONTEXT });
+    const depStack = new cdk.Stack(app, "DepStack", {
+      env: { account: "123456789012", region: "us-east-1" },
+    });
+    const vpc = new ec2.Vpc(depStack, "Vpc");
+    const mkTable = (id: string) => mkTestTable(depStack, id);
+    return Template.fromStack(
+      new ApiStack(app, "TestApiAccessLog", {
+        env: { account: "123456789012", region: "us-east-1" },
+        allowedOrigin: "*",
+        vpc,
+        ...mkTestSgs(depStack, vpc),
+        rolesTable: mkTable("Roles"),
+        resourceRoleMappingsTable: mkTable("RRM"),
+        cacheInvalidationTable: mkTable("Cache"),
+      }),
+    );
+  };
+
+  it("logs the authorizer principalId (not just the always-'-' IAM caller)", () => {
+    mkTemplate().hasResourceProperties("AWS::ApiGateway::Stage", {
+      AccessLogSetting: Match.objectLike({
+        Format: Match.stringLikeRegexp(
+          '"principalId":"\\$context\\.authorizer\\.principalId"',
+        ),
+      }),
+    });
+  });
+
+  it("preserves the standard access-log fields after switching to custom format", () => {
+    const template = mkTemplate();
+    for (const token of [
+      "$context.requestId",
+      "$context.identity.sourceIp",
+      "$context.httpMethod",
+      "$context.resourcePath",
+      "$context.status",
+      "$context.identity.caller",
+      "$context.identity.user",
+    ]) {
+      template.hasResourceProperties("AWS::ApiGateway::Stage", {
+        AccessLogSetting: Match.objectLike({
+          Format: Match.stringLikeRegexp(token.replace(/[.$]/g, "\\$&")),
+        }),
+      });
+    }
   });
 });

@@ -72,9 +72,16 @@ def _item(**over):
 
 
 def _list_jobs(namespace="ns-a", **kw):
+    """Call the route function directly and return its ``jobs`` page.
+
+    The FastAPI ``Query(...)`` defaults only resolve through the app, so a direct
+    call passes them explicitly.
+    """
     from coa_ontology import induce_catalog
 
-    return induce_catalog.list_jobs(namespace=namespace, **kw)
+    kw.setdefault("max_results", 50)
+    kw.setdefault("next_token", None)
+    return induce_catalog.list_jobs(namespace=namespace, **kw)["jobs"]
 
 
 def test_reads_from_dynamodb_not_in_memory_jobs() -> None:
@@ -87,7 +94,7 @@ def test_reads_from_dynamodb_not_in_memory_jobs() -> None:
 
     assert not induce_catalog._jobs, "precondition: no in-memory jobs"
 
-    with patch.object(induce_catalog.dynamo_store, "list_jobs", return_value=[_item()]) as m:
+    with patch.object(induce_catalog.dynamo_store, "list_jobs_page", return_value=([_item()], None)) as m:
         result = _list_jobs()
 
     assert len(result) == 1
@@ -99,7 +106,7 @@ def test_summary_keys_match_declared_contract() -> None:
     """Key set is exactly InductionJobSummary — no report, no DynamoDB internals."""
     from coa_ontology import induce_catalog
 
-    with patch.object(induce_catalog.dynamo_store, "list_jobs", return_value=[_item()]):
+    with patch.object(induce_catalog.dynamo_store, "list_jobs_page", return_value=([_item()], None)):
         (entry,) = _list_jobs()
 
     assert set(entry) == _DECLARED_SUMMARY_KEYS
@@ -112,7 +119,7 @@ def test_numeric_attributes_are_ints_not_decimals() -> None:
     """The contract types these Integer; a raw Decimal serializes as "7.0"."""
     from coa_ontology import induce_catalog
 
-    with patch.object(induce_catalog.dynamo_store, "list_jobs", return_value=[_item()]):
+    with patch.object(induce_catalog.dynamo_store, "list_jobs_page", return_value=([_item()], None)):
         (entry,) = _list_jobs()
 
     assert entry["tables_processed"] == 7
@@ -127,7 +134,7 @@ def test_missing_source_type_defaults_to_structured() -> None:
 
     row = _item()
     del row["source_type"]
-    with patch.object(induce_catalog.dynamo_store, "list_jobs", return_value=[row]):
+    with patch.object(induce_catalog.dynamo_store, "list_jobs_page", return_value=([row], None)):
         (entry,) = _list_jobs()
 
     assert entry["source_type"] == "STRUCTURED"
@@ -140,7 +147,7 @@ def test_in_progress_row_without_counts_does_not_crash() -> None:
     row = _item(status="pending")
     del row["tables_processed"]
     del row["novel_classes_created"]
-    with patch.object(induce_catalog.dynamo_store, "list_jobs", return_value=[row]):
+    with patch.object(induce_catalog.dynamo_store, "list_jobs_page", return_value=([row], None)):
         (entry,) = _list_jobs()
 
     assert entry["status"] == "pending"
@@ -152,31 +159,38 @@ def test_malformed_numeric_degrades_to_none() -> None:
     """One bad row must not 500 the whole list read."""
     from coa_ontology import induce_catalog
 
-    with patch.object(induce_catalog.dynamo_store, "list_jobs", return_value=[_item(tables_processed="not-a-number")]):
+    rows = [_item(tables_processed="not-a-number")]
+    with patch.object(induce_catalog.dynamo_store, "list_jobs_page", return_value=(rows, None)):
         (entry,) = _list_jobs()
 
     assert entry["tables_processed"] is None
 
 
-def test_dynamo_scan_failure_degrades_to_empty_list() -> None:
-    """A DynamoDB scan failure (throttling, network, permissions) must not 500
-    this read-only listing endpoint — degrade to no jobs shown instead."""
+def test_dynamo_scan_failure_is_503_not_an_empty_page() -> None:
+    """A DynamoDB scan failure (throttling, network, permissions) must not look
+    like "no more jobs": an empty page without ``nextToken`` silently truncates a
+    paging client. Surface a retryable 503 with a fixed message instead."""
     from coa_ontology import induce_catalog
+    from fastapi import HTTPException
 
-    with patch.object(induce_catalog.dynamo_store, "list_jobs", side_effect=RuntimeError("scan failed")):
-        result = _list_jobs()
+    with (
+        patch.object(induce_catalog.dynamo_store, "list_jobs_page", side_effect=RuntimeError("scan failed")),
+        pytest.raises(HTTPException) as exc,
+    ):
+        _list_jobs()
 
-    assert result == []
+    assert exc.value.status_code == 503
+    assert "scan failed" not in str(exc.value.detail)
 
 
 def test_filters_and_limit_are_passed_through() -> None:
     """``status`` and ``maxResults`` are declared on the contract — wire them."""
     from coa_ontology import induce_catalog
 
-    with patch.object(induce_catalog.dynamo_store, "list_jobs", return_value=[]) as m:
+    with patch.object(induce_catalog.dynamo_store, "list_jobs_page", return_value=([], None)) as m:
         _list_jobs(namespace="ns-b", status="failed", max_results=5)
 
-    m.assert_called_once_with(namespace="ns-b", status="failed", limit=5)
+    m.assert_called_once_with(namespace="ns-b", status="failed", limit=5, exclusive_start_key=None)
 
 
 def test_newest_first() -> None:
@@ -188,7 +202,7 @@ def test_newest_first() -> None:
         _item(job_id="new", created_at="2026-06-01T00:00:00Z"),
         _item(job_id="mid", created_at="2026-03-01T00:00:00Z"),
     ]
-    with patch.object(induce_catalog.dynamo_store, "list_jobs", return_value=rows):
+    with patch.object(induce_catalog.dynamo_store, "list_jobs_page", return_value=(rows, None)):
         result = _list_jobs()
 
     assert [e["job_id"] for e in result] == ["new", "mid", "old"]
@@ -209,11 +223,11 @@ class TestOverHttp:
         from coa_ontology.main import app
         from fastapi.testclient import TestClient
 
-        with patch.object(induce_catalog.dynamo_store, "list_jobs", return_value=[]) as m:
+        with patch.object(induce_catalog.dynamo_store, "list_jobs_page", return_value=([], None)) as m:
             resp = TestClient(app).get("/induce/jobs?namespace=ns-a&status=failed&maxResults=5")
 
         assert resp.status_code == 200
-        m.assert_called_once_with(namespace="ns-a", status="failed", limit=5)
+        m.assert_called_once_with(namespace="ns-a", status="failed", limit=5, exclusive_start_key=None)
 
     def test_out_of_range_max_results_is_rejected(self) -> None:
         """Bounded so a caller cannot ask for an unbounded scan."""
@@ -230,22 +244,22 @@ class TestOverHttp:
         from coa_ontology.main import app
         from fastapi.testclient import TestClient
 
-        with patch.object(induce_catalog.dynamo_store, "list_jobs", return_value=[_item()]):
+        with patch.object(induce_catalog.dynamo_store, "list_jobs_page", return_value=([_item()], None)):
             resp = TestClient(app).get("/induce/jobs?namespace=ns-a")
 
         assert resp.status_code == 200
-        (entry,) = resp.json()
+        (entry,) = resp.json()["jobs"]
         assert set(entry) == _DECLARED_SUMMARY_KEYS
         assert entry["tables_processed"] == 7  # Decimal survived JSON as an int
 
-    def test_dynamo_scan_failure_returns_200_empty_not_500(self) -> None:
-        """Transient DynamoDB issues degrade the response, not the endpoint."""
+    def test_dynamo_scan_failure_returns_503(self) -> None:
+        """Transient DynamoDB issues are a retryable 503, never a 500 or a truncating empty 200."""
         from coa_ontology import induce_catalog
         from coa_ontology.main import app
         from fastapi.testclient import TestClient
 
-        with patch.object(induce_catalog.dynamo_store, "list_jobs", side_effect=RuntimeError("throttled")):
+        with patch.object(induce_catalog.dynamo_store, "list_jobs_page", side_effect=RuntimeError("throttled")):
             resp = TestClient(app).get("/induce/jobs?namespace=ns-a")
 
-        assert resp.status_code == 200
-        assert resp.json() == []
+        assert resp.status_code == 503
+        assert "throttled" not in resp.text

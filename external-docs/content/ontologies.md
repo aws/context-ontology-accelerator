@@ -156,7 +156,9 @@ creating an entry, uploading a Turtle/RDF file, and triggering induction (with
 optional `groundingOntologyIds` / `groundingMode`, defaulting to `ENHANCED`)
 are each separate calls. See **CreateOntology**, **UploadOntology**, and
 **StartInduction** in the [API Reference](#/api-reference) for the full
-request/response schemas.
+request/response schemas. StartInduction, IngestOntologyFromS3, and
+LoadFoundationalOntology are retry-safe with an optional `clientToken` — see
+[Retrying Creates Safely](namespaces.md#retrying-creates-safely).
 
 ### Saving large proposal edits
 

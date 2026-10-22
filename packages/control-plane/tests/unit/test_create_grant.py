@@ -285,6 +285,62 @@ class TestCreateGrant:
         assert resp["statusCode"] == 500
 
 
+class TestCreateGrantKeySize:
+    @patch("coa_control_plane.grants.create_handler.DynamoDBDAO")
+    def test_principal_too_long_once_encoded_is_400_not_a_write(self, mock_dao_cls):
+        """120 CJK characters pass the 256-char principalId bound but percent-encode
+        past DynamoDB's 1024-byte sort-key limit; reject before writing."""
+        mock_roles_dao = MagicMock()
+        mock_mappings_dao = MagicMock()
+        mock_dao_cls.side_effect = [mock_roles_dao, mock_mappings_dao]
+        mock_roles_dao.get.return_value = {"PK": f"NS#{VALID_NS_ID}", "SK": "ROLE#analyst"}
+
+        resp = handler(
+            _event(body={"principalType": "Group", "principalId": "グループ" * 30, "role": "analyst"}),
+            None,
+        )
+        assert resp["statusCode"] == 400
+        assert "too long" in json.loads(resp["body"])["message"]
+        mock_mappings_dao.put.assert_not_called()
+
+    @patch("coa_control_plane.grants.create_handler.DynamoDBDAO")
+    def test_principal_whose_grant_id_could_not_be_revoked_is_400(self, mock_dao_cls):
+        """80 CJK characters fit DynamoDB, but the grant id would exceed the revoke
+        request path limit, so the grant could never be deleted through the API."""
+        mock_roles_dao = MagicMock()
+        mock_mappings_dao = MagicMock()
+        mock_dao_cls.side_effect = [mock_roles_dao, mock_mappings_dao]
+        mock_roles_dao.get.return_value = {"PK": f"NS#{VALID_NS_ID}", "SK": "ROLE#analyst"}
+
+        resp = handler(
+            _event(body={"principalType": "Group", "principalId": "グループ" * 20, "role": "analyst"}),
+            None,
+        )
+        assert resp["statusCode"] == 400
+        mock_mappings_dao.put.assert_not_called()
+
+    def test_create_bound_keeps_grant_ids_within_the_contract(self):
+        from coa_control_plane.grants.contract import GRANT_ID_CREATE_MAX_LENGTH
+        from coa_control_plane.grants.grant_id import GRANT_ID_MAX_LENGTH
+
+        assert GRANT_ID_CREATE_MAX_LENGTH < GRANT_ID_MAX_LENGTH
+
+    @patch("coa_control_plane.grants.create_handler.DynamoDBDAO")
+    def test_long_ascii_principal_within_key_limits_is_created(self, mock_dao_cls):
+        mock_roles_dao = MagicMock()
+        mock_mappings_dao = MagicMock()
+        mock_dao_cls.side_effect = [mock_roles_dao, mock_mappings_dao]
+        mock_roles_dao.get.return_value = {"PK": f"NS#{VALID_NS_ID}", "SK": "ROLE#analyst"}
+
+        resp = handler(
+            _event(body={"principalType": "Group", "principalId": "g" * 256, "role": "analyst"}),
+            None,
+        )
+        assert resp["statusCode"] == 201
+        mock_mappings_dao.put.assert_called_once()
+        assert len(json.loads(resp["body"])["grant"]["grantId"]) <= 900
+
+
 class TestCreateGrantOverrideValidation:
     """Validate type enforcement on optional grant override fields.
 

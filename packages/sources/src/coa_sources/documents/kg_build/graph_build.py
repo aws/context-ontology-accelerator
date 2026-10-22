@@ -1405,8 +1405,28 @@ def _run_continuous(
         except Exception:
             tb = traceback.format_exc()
             logger.error("Continuous build failed", error=tb)
-            ddb.update(ddb_key, {"status": SourceStatus.SCAN_FAILED, "errorMessage": f"SCAN_FAILED_BUILD: {tb[:500]}"})
+            ddb.update(
+                ddb_key,
+                {"status": SourceStatus.SCAN_FAILED, "errorMessage": _stage_failure_message("SCAN_FAILED_BUILD")},
+            )
             return 0, total_docs
+
+
+# Client-facing text per failure stage. errorMessage is returned to callers by
+# GetSource, so it carries the stage code and a fixed explanation; the traceback
+# goes to the log only (it names hosts, ARNs and internal paths).
+_STAGE_FAILURE_TEXT: dict[str, str] = {
+    "SCAN_FAILED_BUILD": "the knowledge-graph build failed",
+    "SCAN_FAILED_EXTRACT": "entity extraction failed",
+    "SCAN_FAILED_LOAD": "the staged documents could not be loaded",
+    "SCAN_FAILED_GRAPH_STORE": "the graph store health check failed",
+    "SCAN_FAILED_VECTOR_STORE": "the vector store health check failed",
+}
+
+
+def _stage_failure_message(code: str) -> str:
+    """Return ``"<code>: <fixed explanation>; see the service logs for details."``."""
+    return f"{code}: {_STAGE_FAILURE_TEXT.get(code, 'processing failed')}; see the service logs for details."
 
 
 # ---------------------------------------------------------------------------
@@ -1439,7 +1459,7 @@ def _check_backend_health(
             ddb_key,
             {
                 "status": SourceStatus.SCAN_FAILED,
-                "errorMessage": f"SCAN_FAILED_GRAPH_STORE: {tb[:500]}",
+                "errorMessage": _stage_failure_message("SCAN_FAILED_GRAPH_STORE"),
             },
         )
         return False
@@ -1464,7 +1484,7 @@ def _check_backend_health(
             ddb_key,
             {
                 "status": SourceStatus.SCAN_FAILED,
-                "errorMessage": f"SCAN_FAILED_VECTOR_STORE: {tb[:500]}",
+                "errorMessage": _stage_failure_message("SCAN_FAILED_VECTOR_STORE"),
             },
         )
         return False
@@ -1537,7 +1557,8 @@ def _run_separated(
             tb = traceback.format_exc()
             logger.error("Extract failed", error=tb)
             ddb.update(
-                ddb_key, {"status": SourceStatus.SCAN_FAILED, "errorMessage": f"SCAN_FAILED_EXTRACT: {tb[:500]}"}
+                ddb_key,
+                {"status": SourceStatus.SCAN_FAILED, "errorMessage": _stage_failure_message("SCAN_FAILED_EXTRACT")},
             )
             return 0, total_docs
 
@@ -1558,7 +1579,10 @@ def _run_separated(
                 collection_id,
                 error=tb,
             )
-            ddb.update(ddb_key, {"status": SourceStatus.SCAN_FAILED, "errorMessage": f"SCAN_FAILED_BUILD: {tb[:500]}"})
+            ddb.update(
+                ddb_key,
+                {"status": SourceStatus.SCAN_FAILED, "errorMessage": _stage_failure_message("SCAN_FAILED_BUILD")},
+            )
             return 0, total_docs
 
         ddb.update(ddb_key, {"docsGraphIngested": total_docs})
@@ -1634,7 +1658,9 @@ def main() -> None:
     except Exception:
         tb = traceback.format_exc()
         logger.error("Failed to load staged documents", staging_prefix=staging_prefix, error=tb)
-        ddb.update(ddb_key, {"status": SourceStatus.SCAN_FAILED, "errorMessage": f"SCAN_FAILED_LOAD: {tb[:500]}"})
+        ddb.update(
+            ddb_key, {"status": SourceStatus.SCAN_FAILED, "errorMessage": _stage_failure_message("SCAN_FAILED_LOAD")}
+        )
         sys.exit(1)
     if not documents:
         # Genuinely empty prefix (listing succeeded, zero usable docs). If some

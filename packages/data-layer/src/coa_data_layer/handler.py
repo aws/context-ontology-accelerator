@@ -27,9 +27,12 @@ from coa_common.constants import (
     DESCRIBE_SCHEMA_RESOURCE,
     ONTOLOGY_PROXY_LAMBDA_ARN_ENV,
     QUERY_STRATEGIES,
+    validate_namespace_id,
     validate_query_text,
 )
 from coa_common.smithy_shapes import normalize_dimensions
+
+from coa_data_layer import contract
 
 logger = logging.getLogger(__name__)
 
@@ -125,9 +128,12 @@ def _parse_body(event: dict) -> dict | None:
     if not raw:
         return None
     try:
-        return json.loads(raw)
+        parsed = json.loads(raw)
     except (json.JSONDecodeError, TypeError):
         return None
+    # A JSON array or scalar is not a request structure; treating it as absent
+    # yields the route's own 400 instead of an AttributeError surfacing as a 502.
+    return parsed if isinstance(parsed, dict) else None
 
 
 def _parse_query(body: dict) -> str:
@@ -180,6 +186,179 @@ def _get_bearer_token(event: dict) -> str:
     return auth_header
 
 
+# Optional ``Query`` members that are forwarded verbatim once validated, by kind.
+# A member listed here is read from the body by ``_parse_query_options``; the
+# API conformance test resolves these tables when it checks which members are read.
+_QUERY_INT_MEMBERS: dict[str, tuple[int, int]] = {
+    "tierOverride": (contract.QUERY_TIER_OVERRIDE_MIN, contract.QUERY_TIER_OVERRIDE_MAX),
+    "timeoutMs": (contract.QUERY_TIMEOUT_MS_MIN, contract.QUERY_TIMEOUT_MS_MAX),
+    "maxResults": (contract.QUERY_MAX_RESULTS_MIN, contract.QUERY_MAX_RESULTS_MAX),
+}
+_QUERY_ENUM_MEMBERS: dict[str, frozenset[str]] = {
+    "mode": contract.QUERY_MODES,
+    "strategy": QUERY_STRATEGIES,
+}
+_QUERY_BOOL_MEMBERS: tuple[str, ...] = ("includeSupporting", "includeDebugInfo")
+
+
+def _parse_query_options(body: dict) -> dict[str, Any]:
+    """Validate the optional ``Query`` members and return the CM ``options`` map.
+
+    Each member is checked against its ``serve.smithy`` type and bound (see
+    :mod:`coa_data_layer.contract`) and an out-of-contract value raises
+    :class:`~coa_data_layer.contract.ContractViolation` — the request is rejected,
+    never clamped, coerced or silently dropped. Nothing upstream validates the body
+    against the model, so this is where the contract is enforced. ``null`` is
+    treated as absent.
+
+    ``strategy`` deserves a note: an unrecognised value forwarded blind would fall
+    out of ``Orchestrator._EXPLICIT_STRATEGY_OPTIONS`` in serve and resolve to the
+    default chain, leaving the caller believing it had pinned an engine.
+
+    ``timeoutMs`` narrows the Context Manager's request-scoped deadline; the
+    upper bound is this handler's own REST ceiling, so a caller cannot ask for a
+    budget the transport could never honour.
+
+    ``includeDebugInfo`` is forwarded as sent; the Context Manager honours it only
+    for a caller entitled to see the generated SQL/SPARQL (it resolves the
+    caller's namespace roles, which this handler does not have).
+
+    Raises:
+        ContractViolation: A member has the wrong type or is out of range.
+    """
+    options: dict[str, Any] = {}
+
+    execute = body.get("execute")
+    if execute is not None and contract.require_bool(execute, "execute") is False:
+        options["execute"] = False
+    for name, (lo, hi) in _QUERY_INT_MEMBERS.items():
+        if (value := body.get(name)) is not None:
+            options[name] = contract.require_int(value, name, lo, hi)
+    for name, allowed in _QUERY_ENUM_MEMBERS.items():
+        if (value := body.get(name)) is not None:
+            options[name] = contract.require_enum(value, name, allowed)
+    for name in _QUERY_BOOL_MEMBERS:
+        if (value := body.get(name)) is not None:
+            options[name] = contract.require_bool(value, name)
+    dimensions = body.get("dimensions")
+    if dimensions is not None:
+        # Smithy DimensionFilterList arrives as ``[{name, value}, ...]``; CM's
+        # Tier-1 ``substitute_dimensions`` calls ``.items()`` and expects a
+        # mapping. Normalize here so a Tier-1 metric query with dimensions does
+        # not 500 with ``AttributeError``. Bounds are checked first: the mapping
+        # can no longer express a duplicate name or an operator.
+        normalized = normalize_dimensions(contract.require_dimensions(dimensions))
+        if normalized:
+            options["dimensions"] = normalized
+    return options
+
+
+def _parse_kb_search_options(body: dict) -> dict[str, Any]:
+    """Validate the optional ``KBSearch`` members and return the CM ``options`` map.
+
+    ``topK`` defaults to :data:`~coa_data_layer.contract.KB_SEARCH_TOP_K_DEFAULT`
+    when absent. ``sourceFilter`` and ``entityFilter`` are shape-checked and
+    forwarded. Neither is supported yet: the Context Manager rejects a non-empty
+    filter with 400 rather than return unfiltered chunks as if it had applied it.
+    An empty list is accepted and restricts nothing.
+
+    Raises:
+        ContractViolation: A member has the wrong type or is out of range.
+    """
+    top_k = body.get("topK")
+    options: dict[str, Any] = {
+        "topK": contract.KB_SEARCH_TOP_K_DEFAULT
+        if top_k is None
+        else contract.require_int(top_k, "topK", contract.KB_SEARCH_TOP_K_MIN, contract.KB_SEARCH_TOP_K_MAX)
+    }
+    min_score = body.get("minScore")
+    if min_score is not None:
+        options["minScore"] = contract.require_number(
+            min_score, "minScore", contract.KB_SEARCH_MIN_SCORE_MIN, contract.KB_SEARCH_MIN_SCORE_MAX
+        )
+    source_filter = body.get("sourceFilter")
+    if source_filter is not None:
+        options["sourceFilter"] = contract.require_filter_values(source_filter, "sourceFilter")
+    entity_filter = body.get("entityFilter")
+    if entity_filter is not None:
+        options["entityFilter"] = contract.require_filter_values(entity_filter, "entityFilter")
+    return options
+
+
+def _parse_graph_traverse_options(body: dict) -> dict[str, Any]:
+    """Validate the ``GraphTraverse`` members and return the CM ``options`` map.
+
+    ``startUri`` is required; the other members take their documented defaults
+    when absent. ``direction`` and ``relationshipFilter`` are validated and
+    forwarded although the Context Manager does not apply them yet (the model
+    documents this), so a malformed value is still a 400 rather than ignored.
+
+    Raises:
+        ValueError: ``startUri`` is absent.
+        ContractViolation: A member has the wrong type or is out of range.
+    """
+    start_uri = body.get("startUri")
+    if start_uri is None or start_uri == "":
+        raise ValueError("Missing required field: startUri")
+    max_depth = body.get("maxDepth")
+    max_results = body.get("maxResults")
+    direction = body.get("direction")
+    options: dict[str, Any] = {
+        "startUri": contract.require_start_uri(start_uri),
+        "maxDepth": contract.GRAPH_TRAVERSE_MAX_DEPTH_DEFAULT
+        if max_depth is None
+        else contract.require_int(
+            max_depth, "maxDepth", contract.GRAPH_TRAVERSE_MAX_DEPTH_MIN, contract.GRAPH_TRAVERSE_MAX_DEPTH_MAX
+        ),
+        "direction": contract.GRAPH_TRAVERSE_DIRECTION_DEFAULT
+        if direction is None
+        else contract.require_enum(direction, "direction", contract.GRAPH_TRAVERSE_DIRECTIONS),
+        "maxResults": contract.GRAPH_TRAVERSE_MAX_RESULTS_DEFAULT
+        if max_results is None
+        else contract.require_int(
+            max_results,
+            "maxResults",
+            contract.GRAPH_TRAVERSE_MAX_RESULTS_MIN,
+            contract.GRAPH_TRAVERSE_MAX_RESULTS_MAX,
+        ),
+    }
+    relationship_filter = body.get("relationshipFilter")
+    if relationship_filter is not None:
+        relationship_filter = contract.require_filter_values(relationship_filter, "relationshipFilter")
+        if relationship_filter:
+            options["relationshipFilter"] = relationship_filter
+    return options
+
+
+def _parse_describe_schema_query(query: dict) -> dict[str, str]:
+    """Validate the ``DescribeSchema`` query string and return it in canonical form.
+
+    Query-string values always arrive as strings, so the booleans and integers
+    are parsed here. The camelCase (Smithy wire) names are kept: the
+    ontology-api-proxy's per-path alias table renames them for FastAPI.
+
+    Raises:
+        ContractViolation: A parameter is malformed or out of range.
+    """
+    forwarded: dict[str, str] = {}
+    include_properties = query.get("includeProperties")
+    if include_properties is not None:
+        forwarded["includeProperties"] = str(
+            contract.require_query_bool(include_properties, "includeProperties")
+        ).lower()
+    max_results = query.get("maxResults")
+    if max_results is not None:
+        forwarded["maxResults"] = str(
+            contract.require_query_int(
+                max_results,
+                "maxResults",
+                contract.DESCRIBE_SCHEMA_MAX_RESULTS_MIN,
+                contract.DESCRIBE_SCHEMA_MAX_RESULTS_MAX,
+            )
+        )
+    return forwarded
+
+
 # ── Route handlers ───────────────────────────────────────────────────────────
 
 
@@ -197,82 +376,10 @@ def _handle_query(namespace: str, event: dict) -> dict:
         "options": {},
     }
 
-    if body.get("execute") is False:
-        payload["options"]["execute"] = False
-    if body.get("tierOverride") is not None:
-        payload["options"]["tierOverride"] = body["tierOverride"]
-    if body.get("mode") is not None:
-        payload["options"]["mode"] = body["mode"]
-    # Which Tier-2 engine answers a structured query. Without this the field was
-    # dropped here even when sent, leaving the Ontop/VKG path unreachable by any
-    # REST caller: it ran only as an automatic fallback, so no caller could
-    # select it deliberately.
-    #
-    # Validated rather than forwarded blind, because nothing else checks it: the handler
-    # does not validate the body against the generated Smithy model and API Gateway has no
-    # RequestValidator, so an unrecognised value would reach serve, fall out of
-    # ``Orchestrator._EXPLICIT_STRATEGY_OPTIONS`` and silently resolve to DEFAULT_STRATEGY
-    # — the caller getting the cheap fallback chain believing it had pinned an engine.
-    #
-    # The isinstance check is load-bearing: ``body`` is caller-controlled, and
-    # ``["ontop"] not in QUERY_STRATEGIES`` raises TypeError on an unhashable value, which
-    # would escape to the top-level ``except Exception`` and surface as 502 "Context
-    # Manager invocation failed" — an upstream-failure code for a client mistake.
-    strategy = body.get("strategy")
-    if strategy is not None:
-        if not isinstance(strategy, str) or strategy not in QUERY_STRATEGIES:
-            # The rejected value is deliberately NOT echoed. It is unbounded
-            # caller-controlled input, and ``!r`` would serialise whatever arrived —
-            # a multi-KB string or a whole nested object — straight back in the
-            # response. The caller already knows what it sent; the actionable half
-            # is the list of values it should have sent.
-            return _error_response(
-                400,
-                f"Invalid strategy. Must be one of: {', '.join(sorted(QUERY_STRATEGIES))}.",
-            )
-        payload["options"]["strategy"] = strategy
-    if body.get("dimensions"):
-        # Smithy DimensionFilterList arrives as ``[{name, value}, ...]``; CM's
-        # Tier-1 ``substitute_dimensions`` calls ``.items()`` and expects a
-        # mapping. Normalize here so a Tier-1 metric query with dimensions does
-        # not 500 with ``AttributeError``.
-        normalized = normalize_dimensions(body["dimensions"])
-        if normalized:
-            payload["options"]["dimensions"] = normalized
-    # ``timeoutMs`` is now honoured by the Context Manager (it builds a
-    # request-scoped deadline from ``options.timeoutMs``), so forwarding it is no
-    # longer a silent no-op. A caller may narrow their budget below this handler's
-    # own REST ceiling (``REST_TIMEOUT_MS``) to get a graceful early return rather
-    # than waiting the full window; they cannot widen past it because serve caps
-    # the deadline at its transport budget and the urllib timeout below still
-    # bounds this handler's upstream call. Values <= 0 are dropped as meaningless.
-    if body.get("timeoutMs") is not None:
-        _raw_timeout = body["timeoutMs"]
-        # Only a genuine positive integer is a valid millisecond budget. Floats,
-        # strings and non-positive values are meaningless as a deadline and are
-        # dropped rather than coerced (int(1.5)==1 would smuggle a 1ms budget).
-        if isinstance(_raw_timeout, bool):
-            _timeout_ms = 0
-        elif isinstance(_raw_timeout, int):
-            _timeout_ms = _raw_timeout
-        else:
-            _timeout_ms = 0
-        if _timeout_ms > 0:
-            payload["options"]["timeoutMs"] = _timeout_ms
-        else:
-            # Surface the drop so a caller can tell "my timeout was ignored" apart
-            # from "I sent no timeout" when debugging why their budget wasn't honored.
-            logger.info(
-                "query_timeout_ms_dropped raw=%r namespace=%s",
-                _raw_timeout,
-                namespace,
-            )
-    if body.get("includeSupporting") is not None:
-        payload["options"]["includeSupporting"] = body["includeSupporting"]
-    if body.get("includeDebugInfo") is not None:
-        payload["options"]["includeDebugInfo"] = body["includeDebugInfo"]
-    if body.get("maxResults") is not None:
-        payload["options"]["maxResults"] = body["maxResults"]
+    try:
+        payload["options"].update(_parse_query_options(body))
+    except contract.ContractViolation as exc:
+        return _error_response(400, str(exc))
 
     result = _invoke_context_manager(payload, _get_bearer_token(event))
 
@@ -333,10 +440,11 @@ def _handle_kb_search(namespace: str, event: dict) -> dict:
         "query": query,
         "namespace": namespace,
         "profile": _get_caller_profile(event),
-        "options": {
-            "topK": body.get("topK", 10),
-        },
     }
+    try:
+        payload["options"] = _parse_kb_search_options(body)
+    except contract.ContractViolation as exc:
+        return _error_response(400, str(exc))
 
     result = _invoke_context_manager(payload, _get_bearer_token(event))
 
@@ -355,18 +463,11 @@ def _handle_kb_search(namespace: str, event: dict) -> dict:
 
 
 def _handle_graph_traverse(namespace: str, event: dict) -> dict:
-    body = _parse_body(event)
-    if not body or not body.get("startUri"):
-        return _error_response(400, "Missing required field: startUri")
-
-    options: dict = {
-        "startUri": body["startUri"],
-        "maxDepth": body.get("maxDepth", 2),
-        "direction": body.get("direction", "both"),
-        "maxResults": body.get("maxResults", 100),
-    }
-    if body.get("relationshipFilter"):
-        options["relationshipFilter"] = body["relationshipFilter"]
+    body = _parse_body(event) or {}
+    try:
+        options = _parse_graph_traverse_options(body)
+    except ValueError as exc:  # includes ContractViolation
+        return _error_response(400, str(exc))
 
     payload = {
         "action": "graphTraverse",
@@ -406,11 +507,10 @@ def _handle_describe_schema(namespace: str, event: dict) -> dict:
     query = event.get("queryStringParameters") or {}
     # camelCase (Smithy wire form) → forward as-is; the ontology-api-proxy's
     # per-path alias table renames them to snake_case for FastAPI binding.
-    forwarded_query: dict[str, str] = {}
-    if query.get("includeProperties") is not None:
-        forwarded_query["includeProperties"] = str(query["includeProperties"]).lower()
-    if query.get("maxResults") is not None:
-        forwarded_query["maxResults"] = str(query["maxResults"])
+    try:
+        forwarded_query = _parse_describe_schema_query(query)
+    except contract.ContractViolation as exc:
+        return _error_response(400, str(exc))
 
     # Send the canonical Smithy path (``/namespaces/{namespaceId}/schema``); the
     # ontology-api-proxy's alias table renames it to the FastAPI ``/graph/schema``
@@ -451,7 +551,12 @@ def _handle_describe_schema(namespace: str, event: dict) -> dict:
         # numbers that shouldn't reach the customer. Log the truncated
         # payload for operators and return a generic message.
         err_preview = response["Payload"].read().decode("utf-8", errors="replace")[:500]
-        logger.warning("describe_schema_function_error err_preview=%s", err_preview)
+        logger.warning(
+            "describe_schema_function_error function_error=%s request_id=%s err_preview=%s",
+            response.get("FunctionError"),
+            response.get("ResponseMetadata", {}).get("RequestId"),
+            err_preview,
+        )
         return _error_response(502, "Schema backend failed")
 
     # An invoke that succeeded at the Lambda control-plane level can still
@@ -491,6 +596,46 @@ def _handle_describe_schema(namespace: str, event: dict) -> dict:
 
 # ── Main handler ─────────────────────────────────────────────────────────────
 
+# Error types the Context Manager itself emits (``coa_serve.exceptions`` plus the
+# entrypoint's own validation/internal errors). An HTTP error body carrying one of
+# these is our service's structured, client-safe error; anything else came from
+# the transport in between (the runtime's own JSON errors can name ARNs and roles).
+_CONTEXT_MANAGER_ERROR_TYPES = frozenset(
+    {
+        "AccessDeniedError",
+        "AmbiguousReferenceError",
+        "DataSourceUnavailableError",
+        "InternalError",
+        "NamespaceNotFoundError",
+        "NoResultError",
+        "QueryTranslationError",
+        "TimeoutError",
+        "ValidationError",
+    }
+)
+_UPSTREAM_MESSAGE_MAX_CHARS = 500
+
+
+def _client_safe_upstream_error(resp_body: str, status_code: int) -> tuple[str, str | None]:
+    """Return ``(message, error_type)`` that may be shown to the caller for an upstream HTTP error.
+
+    Only a Context Manager structured error (a JSON object whose ``error`` is one
+    of :data:`_CONTEXT_MANAGER_ERROR_TYPES` and whose ``message`` is a string) is
+    forwarded, and then only those two fields. Any other body — the runtime's own
+    error JSON, an HTML gateway page, plain text — is replaced by a fixed message.
+    """
+    try:
+        detail = json.loads(resp_body)
+    except (json.JSONDecodeError, TypeError):
+        detail = None
+    if isinstance(detail, dict):
+        error = detail.get("error")
+        message = detail.get("message")
+        if error in _CONTEXT_MANAGER_ERROR_TYPES and isinstance(message, str) and message:
+            return message[:_UPSTREAM_MESSAGE_MAX_CHARS], error
+    return f"Context Manager request failed (HTTP {status_code})", None
+
+
 _ROUTE_MAP = {
     ("POST", "/namespaces/{namespaceId}/query"): _handle_query,
     ("POST", "/namespaces/{namespaceId}/translate"): _handle_translate,
@@ -509,6 +654,12 @@ def handler(event: dict, context) -> dict:
 
     if not namespace:
         return _error_response(400, "Missing namespace path parameter")
+    # namespaceId is a UUID v4 in the contract. Reject anything else here rather
+    # than forwarding it, where a malformed id surfaced as a backend 500.
+    try:
+        validate_namespace_id(namespace)
+    except ValueError as exc:
+        return _error_response(400, str(exc))
 
     route_handler = _ROUTE_MAP.get((method, resource))
     if not route_handler:
@@ -517,14 +668,9 @@ def handler(event: dict, context) -> dict:
     try:
         return route_handler(namespace, event)
     except HTTPError as e:
-        resp_body = e.read().decode("utf-8") if e.fp else ""
-        try:
-            detail = json.loads(resp_body)
-            msg = detail.get("message", resp_body[:200])
-            error = detail.get("error")
-        except (json.JSONDecodeError, TypeError):
-            msg = resp_body[:200] or str(e)
-            error = None
+        resp_body = e.read().decode("utf-8", errors="replace") if e.fp else ""
+        logger.warning("context_manager_http_error status=%s body_preview=%s", e.code, resp_body[:500])
+        msg, error = _client_safe_upstream_error(resp_body, e.code)
         return _error_response(e.code, msg, **({"error": error} if error else {}))
     except URLError as e:
         # A urlopen timeout (the 29s REST budget in _invoke_context_manager) surfaces
@@ -535,17 +681,28 @@ def handler(event: dict, context) -> dict:
         # naming the streaming path rather than a misleading 502 "cannot reach", so a
         # builder does not chase a phantom connectivity/timeout bug.
         if isinstance(e.reason, TimeoutError):
-            return _error_response(
-                504,
-                (
-                    "Query exceeded the 29s REST timeout. The request may still be "
-                    "completing server-side; long-running queries (e.g. Tier-3 "
-                    "synthesis) should use the streaming query endpoint, which has a "
-                    "larger budget. See the serve docs: 'REST query timeout'."
-                ),
-                error="rest_deadline_exceeded",
-                limitMs=REST_TIMEOUT_MS,
-            )
-        return _error_response(502, f"Cannot reach Context Manager: {e.reason}")
+            return _rest_deadline_exceeded()
+        # ``reason`` names the endpoint host and the socket error; log it, don't return it.
+        logger.warning("context_manager_unreachable reason=%s", e.reason)
+        return _error_response(502, "Cannot reach Context Manager")
+    except TimeoutError:
+        # A read timeout (the response did not arrive within the budget) is raised by
+        # urlopen as a bare TimeoutError, not wrapped in URLError like a connect timeout.
+        return _rest_deadline_exceeded()
     except Exception as e:
+        logger.exception("context_manager_invocation_failed")
         return _error_response(502, f"Context Manager invocation failed: {type(e).__name__}")
+
+
+def _rest_deadline_exceeded() -> dict:
+    return _error_response(
+        504,
+        (
+            "Query exceeded the 29s REST timeout. The request may still be "
+            "completing server-side; long-running queries (e.g. Tier-3 "
+            "synthesis) should use the streaming query endpoint, which has a "
+            "larger budget. See the serve docs: 'REST query timeout'."
+        ),
+        error="rest_deadline_exceeded",
+        limitMs=REST_TIMEOUT_MS,
+    )

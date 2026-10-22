@@ -11,9 +11,18 @@ This guide walks you through deploying Context Ontology Accelerator into your AW
 | Node.js | 22+ | CDK CLI, web-app build |
 | Python | 3.12 | Backend services |
 | pnpm | 10+ | TypeScript package management |
-| uv | 0.4+ | Python package management |
+| uv | 0.5.14+ | Python package management |
 | Java | 17+ | Smithy code generation |
-| Docker | — | Container image builds |
+| Docker or Finch | — | Container image builds (required) |
+
+A running container engine is required: the MCP, Ontology, Serve, Sources and
+VKG stacks build container images, and there is no fallback without one. The
+preflight check stops the deploy when it finds no running engine. It uses
+`CDK_DOCKER` when set, otherwise a running Finch, otherwise Docker.
+
+If you know no container image changed since the last deploy, CDK reuses the
+images already in ECR and needs no engine. Set `SCL_ALLOW_NO_CONTAINER_ENGINE=1`
+to deploy without one; any changed image still fails the deploy at build time.
 
 ### Cross-architecture container builds
 
@@ -323,7 +332,7 @@ curl https://mise.run | sh
 mise install
 
 # make setup runs smithy-generate.sh (make generate) + setup-dev.sh
-# (uv sync --all-packages, pnpm install, pre-commit hooks)
+# (uv sync --all-packages, pnpm install --frozen-lockfile, pre-commit hooks)
 make setup
 ```
 
@@ -337,7 +346,7 @@ make deploy-dev
 
 This runs `scripts/deploy.sh` which:
 
-1. **Preflight checks** — verifies toolchain versions (Node, Java, pnpm), Docker (including ARM64 emulation on x86_64 hosts), regenerates Smithy artifacts if missing/stale, authenticates to ECR Public, checks VPC quota
+1. **Preflight checks** — verifies toolchain versions (Node, Java, pnpm), Docker (including ARM64 emulation on x86_64 hosts), regenerates Smithy artifacts if missing/stale, authenticates to ECR Public, checks that no teardown of the same prefix is still finishing, checks VPC quota
 2. **Builds all packages** — compiles TypeScript, bundles Lambdas
 3. **Synthesizes CloudFormation** — generates templates from CDK
 4. **Deploys all stacks** — CDK handles ordering via the dependency graph, deploying up to three independent stacks at once
@@ -358,7 +367,7 @@ This runs `scripts/deploy.sh` which:
 | `coa-dev-auth` | Cognito User Pool, OIDC configuration |
 | `coa-dev-guardrail` | Bedrock guardrails |
 | `coa-dev-storage` | Neptune (graph DB), OpenSearch Serverless |
-| `coa-dev-authnz` | DynamoDB tables for roles, grants, Cedar policies |
+| `coa-dev-authnz` | DynamoDB tables for roles, grants, Cedar policies, and `clientToken` retry records (on-demand billing, 24-hour TTL; if the retry table is unreachable, creates that carry a `clientToken` return `503`) |
 | `coa-dev-vkg` | Virtual Knowledge Graph (Ontop) |
 | `coa-dev-namespace` | Namespace service (SMUS domain) |
 | `coa-dev-metric-service` | Metric authoring and validation |
@@ -1145,13 +1154,22 @@ CDK performs incremental updates — only changed stacks are redeployed.
 make destroy-dev
 ```
 
-This runs `scripts/destroy.sh dev`, which orchestrates teardown of resources CFN can't cleanly delete on its own before running `cdk destroy --all`:
+This runs `scripts/destroy.sh dev`, which orchestrates teardown of resources CFN can't cleanly delete on its own around `cdk destroy`:
 
 1. **Deletes AgentCore Runtimes** (serve + mcp) directly via the Bedrock AgentCore API.
-2. **Waits for AgentCore-owned ENIs to detach** from their security groups — see the [AgentCore ENI wait](#agentcore-eni-wait-can-take-hours) note below. This step is currently a no-op pending a shorter, reliable detach signal.
+2. **Checks the runtimes' ENIs without waiting for them.** AWS releases them up to 8 hours after the runtimes are deleted, and they hold only the runtime security groups, the private subnets and the VPC — see [AgentCore ENIs outlive the runtimes](#agentcore-enis-outlive-the-runtimes).
 3. **Deletes VKG's per-namespace ECS services** (created outside CloudFormation by the ontology-reload Lambda) and waits for them to reach `INACTIVE`.
-4. **Force-deletes the DataZone domain** via `delete-domain --skip-deletion-check`, which cascades through every project, asset, and asset type under it — CloudFormation's own delete can't do this (see [FAQ](#why-does-namespace-stack-fail-to-delete-with-domain-not-empty)).
-5. **Runs `cdk destroy --all`**, then verifies no stacks remain.
+4. **Deletes the Cloud Map services** the VKG reload Lambda registered in the private DNS namespace, which CloudFormation cannot delete while they exist.
+5. **Force-deletes the DataZone domain** via `delete-domain --skip-deletion-check`, which cascades through every project, asset, and asset type under it — CloudFormation's own delete can't do this (see [FAQ](#why-does-namespace-stack-fail-to-delete-with-domain-not-empty)).
+6. **Starts deleting the connector stacks** (`<PREFIX>-dev-*-coa-connector`), which are separate CDK apps; step 8 waits for them.
+7. **Runs `cdk destroy` on every stack except network**, re-running it past the failures teardown is known to hit: a runtime security group AWS still holds and a runtime AgentCore is still deleting (the stack is deleted again with either kept out), and an access-log bucket that refilled after it was emptied.
+8. **Finishes the network stack**: waits for the connector stacks, deletes detached Lambda ENIs and the kept runtime security groups once AWS has released their ENIs, then the stack.
+
+One run deletes everything that runs continuously: Neptune, OpenSearch Serverless, the Fargate services, the NAT gateway and the interface endpoints. If AWS still holds the runtimes' ENIs, what remains until the next run is the VPC, its subnets and two security groups, which AWS does not charge for ([Amazon VPC pricing](https://docs.aws.amazon.com/vpc/latest/userguide/what-is-amazon-vpc.html#pricing)); with an imported VPC (`SCL_VPC_ID`), only the two security groups. The script then **exits 3** and prints what is left, when the runtimes were deleted, and the commands to delete the rest by hand. Run `make destroy-dev` again after that (AWS releases the ENIs up to 8 hours after the runtimes were deleted), or set `SCL_ENI_WAIT_MAX_SECONDS` to wait in one run. It defers only while AgentCore's own ENIs hold what is left: anything else that keeps the network stack or a runtime security group is a failure (exit 1), and the script lists it.
+
+To deploy again before that, use another `SCL_PREFIX`. With a VPC COA created, the same prefix cannot be deployed until the teardown has finished: its network stack is still being deleted or in `DELETE_FAILED`, which CloudFormation cannot deploy over, so `make deploy-dev` stops in preflight and says when AWS releases the ENIs.
+
+Until a deferred teardown finishes, the VPC COA created still counts toward the VPCs-per-Region quota (default 5, see [Service Quotas](#service-quotas)). Each deploy under another prefix needs a VPC of its own, so a few deferred teardowns in a row, or one that is never run again, can make the preflight's VPC check stop the next deploy. The runtime security groups, AgentCore's ENIs (for up to 8 hours) and the `DELETE_FAILED` network stack count toward their quotas too (security groups, network interfaces and CloudFormation stacks per Region). Running the teardown again once AWS has released the ENIs, or the cleanup commands its summary prints, frees all of them. The first run already deletes the Elastic IP and the NAT gateway.
 
 Same environment-variable overrides as `make deploy-dev` — pass the same `SCL_PREFIX` and region you deployed with:
 
@@ -1164,11 +1182,16 @@ Additional destroy-specific variables:
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `SCL_DESTROY_YES` | unset | Set to `1` to skip the interactive confirmation prompt (e.g. in CI). |
-| `SCL_ENI_WAIT_MAX_SECONDS` | `600` | Max wait for AgentCore ENI detach (step 2 — currently disabled). |
+| `SCL_ENI_WAIT_MAX_SECONDS` | `0` | Step 8: how long to wait for AWS to release the runtimes' ENIs before exiting 3. The wait starts once the NAT gateway and endpoints are deleted; `32400` (9 h) finishes in one run. |
+| `SCL_DESTROY_CONCURRENCY` | `4` | Stacks `cdk destroy` deletes in parallel, dependencies permitting. |
 | `SCL_ECS_WAIT_MAX_SECONDS` | `300` | Max wait for VKG ECS services to reach `INACTIVE`. |
+| `SCL_CLOUDMAP_WAIT_MAX_SECONDS` | `180` | Max wait for Cloud Map instances to deregister. |
 | `SCL_DOMAIN_WAIT_MAX_SECONDS` | `300` | Max wait for the DataZone domain to finish deleting. |
+| `SCL_CONNECTOR_DELETE_WAIT_MAX_SECONDS` | `1800` | Max wait for each connector stack to delete. |
 
-Steps 1-4 are idempotent — if the script exits early or a step warns and continues, re-running it later picks up from an already-deleted/in-progress state.
+Exit status of `scripts/destroy.sh`: `0` everything deleted, `3` only the network resources above left for a re-run, anything else a failure to inspect. `make destroy-dev` reports any non-zero status as make's own exit `2` (its message says `Error 3`), so call the script directly to tell a deferred teardown from a failed one.
+
+Every step is idempotent — if the script exits early or a step warns and continues, re-running it later picks up from an already-deleted/in-progress state.
 
 !!! warning
     This deletes all resources including databases and stored data. Neptune and OpenSearch data is not recoverable after deletion.
@@ -1188,7 +1211,7 @@ cd <repo-root>
 AWS_DEFAULT_REGION=<REGION> SCL_PREFIX=<PREFIX> ./scripts/destroy.sh <env>
 ```
 
-Or fall back to a plain `cdk destroy` (skips all the pre-cleanup steps above — expect the known failures documented in Troubleshooting):
+Or fall back to a plain `cdk destroy`. It skips all the steps above, and CDK stops at the first stack that fails to delete — expect the failures documented in Troubleshooting. It also leaves the retained AgentCore Runtime security groups behind: in a VPC COA created, the network stack then fails to delete the VPC; with an imported VPC (`SCL_VPC_ID`), the command succeeds and the groups stay in that VPC. Either way, `make destroy-dev` deletes them once AWS has released their ENIs:
 
 ```bash
 cd infra
@@ -1232,26 +1255,27 @@ aws sqs start-message-move-task --source-arn <sources-delete-dlq ARN>
 
 A source that reads `DELETE_FAILED` can instead be retried with another `DELETE`.
 
-### AgentCore ENI wait can take hours
+### AgentCore ENIs outlive the runtimes
 
-**Symptom:** the `*-mcp` and `*-serve` stacks fail to delete their security groups with `has a dependent object` (`DependencyViolation`), even after `make destroy-dev` deletes the AgentCore Runtimes.
+**Symptom:** `make destroy-dev` ends with "Teardown deferred: AWS still holds the AgentCore Runtimes' ENIs" and `Error 3` (`scripts/destroy.sh` exits 3, make itself 2). Or, with a plain `cdk destroy`, the network stack fails to delete its subnets and VPC (`has dependencies`); with an imported VPC (`SCL_VPC_ID`), it succeeds and leaves the runtime security groups in that VPC. On a deployment from before the runtime security groups were retained, the `*-mcp` or `*-serve` stack fails on its security group instead (`has a dependent object`) and CDK stops there.
 
-**Cause:** AgentCore Runtime provisions VPC network interfaces (ENIs) directly, outside CloudFormation. Runtime deletion doesn't synchronously release them — in practice this has been observed to take **several hours, and sometimes days**, not the few minutes originally expected. CloudFormation has no visibility into these ENIs and tries to delete the security group immediately, before they're gone.
+**Cause:** AgentCore Runtime provisions VPC network interfaces (ENIs) itself, outside CloudFormation, and shares them across runtimes that use the same subnets and security group. Deleting a runtime doesn't release them: "the associated ENI may persist in your VPC for up to 8 hours before it is automatically removed" (AgentCore VPC documentation); about 8 hours was measured on COA dev deployments. Until then they hold the runtime's security group, the private subnets and the VPC.
 
-**Fix:** there isn't a fast one. `make destroy-dev` already deletes the Runtimes as its first step to start the detach clock as early as possible, but you generally need to **wait and retry later** (a few hours to a day) rather than intervene:
+**Fix:** nothing to do now. `make destroy-dev` keeps the two runtime security groups out of their stacks' delete and deletes everything else, leaving the VPC, its subnets and the two security groups, which AWS does not charge for. Re-run it after the time the summary prints (up to 8 hours after the runtimes were deleted) to delete them, or run the commands it prints:
 
 ```bash
-# Re-run later — steps 1-4 are idempotent and safe to repeat.
-make destroy-dev
+make destroy-dev   # same SCL_PREFIX and region as the first run
 ```
 
-Do not attempt to manually detach or delete the ENIs yourself — they're AWS-managed and manual intervention doesn't speed up the release. If it's still stuck after a day or more, treat it as an AWS-side issue rather than something to fix locally.
+To deploy again in the meantime, use another `SCL_PREFIX`; with a VPC COA created, `make deploy-dev` refuses the same prefix until the teardown has finished.
+
+Do not try to detach or delete the `agentic_ai` ENIs yourself: AWS owns them and releases them on its own schedule. Detached Lambda ENIs (status `available`, description `AWS Lambda VPC ENI-<PREFIX>-dev-*`) are different; `make destroy-dev` deletes those itself.
 
 ### Why does namespace stack fail to delete with "domain not empty"?
 
 **Symptom:** the `*-namespace` stack fails to delete with `Domain cannot be deleted because there are existing projects under this domain`, or the `SystemProject`/`DefaultProjectProfile` resources fail with `failed to stabilize due to internal failure` or `deletion prevented by project ...`.
 
-**Cause:** every namespace creates its own DataZone project, and CloudFormation's native `DeleteDomain`/`DeleteProject` calls can't force past a shared asset type (`CoaRelationalTable`) that's still referenced by other projects' assets — which is always true while more than one namespace exists. `make destroy-dev` handles this automatically (step 4: `delete-domain --skip-deletion-check`, a true force-delete at the domain level). If you're running a bare `cdk destroy` instead of `make destroy-dev`, you'll hit this.
+**Cause:** every namespace creates its own DataZone project, and CloudFormation's native `DeleteDomain`/`DeleteProject` calls can't force past a shared asset type (`CoaRelationalTable`) that's still referenced by other projects' assets — which is always true while more than one namespace exists. `make destroy-dev` handles this automatically (step 5: `delete-domain --skip-deletion-check`, a true force-delete at the domain level). If you're running a bare `cdk destroy` instead of `make destroy-dev`, you'll hit this.
 
 **Fix:** use `make destroy-dev` instead of a raw `cdk destroy`. If you're already stuck on a bare `cdk destroy`, resolve the SMUS domain ID from SSM and force-delete it directly, then retry:
 
@@ -1429,7 +1453,7 @@ creates 17 CloudFormation stacks plus the connector's against a default of 2,000
 default of 5,000 per Region (`L-DF5E4CA3`). A single NAT gateway
 (`natGateways: 1`, `maxAzs: 2`) means one Elastic IP. AgentCore's slow ENI
 release after teardown is a real problem, but it is a *timing* issue rather than a
-quota one — see [AgentCore ENI wait](#agentcore-eni-wait-can-take-hours).
+quota one — see [AgentCore ENIs outlive the runtimes](#agentcore-enis-outlive-the-runtimes).
 
 Check a specific quota's default and your account's applied value with:
 
@@ -1480,8 +1504,8 @@ availability guarantee from a second instance, and the cluster is deletable — 
 `make destroy-dev` will remove the graph and its data irreversibly.
 
 **Teardown is not symmetric with deploy.** AgentCore Runtime provisions ENIs
-outside CloudFormation and can hold them for hours to days after runtime
-deletion, blocking security-group deletion. VKG creates ECS services outside
+outside CloudFormation and holds them for up to 8 hours after runtime
+deletion, blocking deletion of the VPC that contains them. VKG creates ECS services outside
 CloudFormation (one per namespace), and DataZone domains need a force-delete.
 `make destroy-dev` handles all three; a bare `cdk destroy` does not. Budget for
 teardown taking longer than deploy, and see [Tearing Down](#tearing-down).

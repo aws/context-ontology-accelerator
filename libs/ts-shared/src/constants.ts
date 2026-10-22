@@ -129,6 +129,8 @@ export const TABLE_NAMES = {
   SOURCE_SCAN_JOBS: "source-scan-jobs",
   ONTOLOGY_ENGINE: "ontology-engine",
   METRIC_IMPORT_JOBS: "metric-import-jobs",
+  /** Caller-supplied clientToken records that make create operations retry-safe. */
+  IDEMPOTENCY: "idempotency",
 } as const;
 
 // ---------------------------------------------------------------------------

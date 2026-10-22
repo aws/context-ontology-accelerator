@@ -344,6 +344,41 @@ class TestListSourcesPagination:
         assert len(body["items"]) == 3
         assert "nextToken" not in body
 
+    def test_next_token_from_another_namespace_is_400_not_500(self, aws_env):
+        """A token minted for one namespace and replayed in another is a client error."""
+        for i in range(3):
+            _put_source(aws_env["table"], _NAMESPACE_ID, f"src-{i:03d}", created_at=f"2026-0{i + 1}-01T00:00:00Z")
+        first = _make_event(
+            "GET", _LIST_RESOURCE, path_params={"namespaceId": _NAMESPACE_ID}, query_params={"maxResults": "1"}
+        )
+        _, page = _parse_response(aws_env["handler"](first, None))
+        other_ns = "00000000-0000-4000-8000-000000000000"
+        replay = _make_event(
+            "GET",
+            _LIST_RESOURCE,
+            path_params={"namespaceId": other_ns},
+            query_params={"maxResults": "1", "nextToken": page["nextToken"]},
+        )
+        status, body = _parse_response(aws_env["handler"](replay, None))
+
+        assert status == 400
+        assert body == {"error": "Invalid nextToken"}
+
+    def test_next_token_follow_up_page_in_same_namespace_still_works(self, aws_env):
+        for i in range(3):
+            _put_source(aws_env["table"], _NAMESPACE_ID, f"src-{i:03d}", created_at=f"2026-0{i + 1}-01T00:00:00Z")
+        seen, token = [], None
+        for _ in range(5):
+            params = {"maxResults": "1"} | ({"nextToken": token} if token else {})
+            event = _make_event("GET", _LIST_RESOURCE, path_params={"namespaceId": _NAMESPACE_ID}, query_params=params)
+            status, body = _parse_response(aws_env["handler"](event, None))
+            assert status == 200
+            seen += [i["sourceId"] for i in body["items"]]
+            token = body.get("nextToken")
+            if not token:
+                break
+        assert sorted(seen) == ["src-000", "src-001", "src-002"]
+
     def test_pagination_second_page_returns_remaining_items(self, aws_env):
         """Using nextToken from page 1 returns the remaining items on page 2."""
         for i in range(4):

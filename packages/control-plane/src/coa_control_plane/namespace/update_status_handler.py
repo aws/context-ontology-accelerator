@@ -10,6 +10,7 @@ import os
 from typing import Any
 
 import structlog
+from coa_common.constants import validate_namespace_id
 from coa_common.dao import DynamoDBDAO
 from coa_common.language_tags import effective_namespace_language
 from coa_common.response import api_response
@@ -54,11 +55,18 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
 
     if not namespace_id:
         return api_response(400, {"message": "namespaceId is required"})
+    try:
+        validate_namespace_id(namespace_id)
+    except ValueError as exc:
+        return api_response(400, {"message": str(exc)})
 
     try:
         body = json.loads(event.get("body") or "{}")
     except (json.JSONDecodeError, TypeError):
         return api_response(400, {"message": "Invalid JSON body"})
+
+    if not isinstance(body, dict):
+        return api_response(400, {"message": "Request body must be a JSON object"})
 
     new_status = body.get("status")
     if not new_status:
@@ -67,14 +75,14 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     # Validate status value
     try:
         NamespaceStatus(new_status)
-    except ValueError:
+    except (ValueError, TypeError):
         valid = [s.value for s in NamespaceStatus]
         return api_response(400, {"message": f"Invalid status. Must be one of: {valid}"})
 
     # Fetch current namespace
     item = _get_ns_dao().get({"PK": f"NS#{namespace_id}", "SK": "METADATA"})
     if not item:
-        return api_response(404, {"message": f"Namespace not found: {namespace_id}"})
+        return api_response(404, {"message": "Namespace not found"})
 
     current_status = item.get("status")
 

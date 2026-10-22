@@ -26,6 +26,7 @@ from coa_common import resolve_namespace_id, resolve_region, sync_boto_config
 from coa_common.language_tags import LanguageTagError, canonicalize_language_tag, effective_namespace_language
 
 from ..query_utils import validate_namespace
+from ..tier2.table_qualifier import AMBIGUOUS_SOURCE
 
 logger = structlog.get_logger(__name__)
 
@@ -33,6 +34,10 @@ _IDENTIFIER_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
 _WORKGROUP_PATTERN = re.compile(r"^[a-zA-Z0-9._-]+$")
 _RESOLVE_TIMEOUT_S = 5.0
 _CACHE_TTL_S = 120.0
+# A failed Glue listing is retried sooner than a good one is refreshed: until it
+# is, every table it would have placed stays unplaced (and a cross-database query
+# is refused), so one throttle should not cost two minutes.
+_FAILED_LISTING_TTL_S = 15.0
 # Max SRC# records fetched per namespace query. If DynamoDB reports more results
 # beyond this page (LastEvaluatedKey present), callers that derive a zero-count
 # signal (get_source_composition) MUST treat the read as unknown, since a source
@@ -59,6 +64,12 @@ class NamespaceLanguageUnavailableError(RuntimeError):
 # literals are already used for routing at find_database_source / find_sole_database_source.
 _SOURCE_TYPE_DATABASE = "DATABASE"
 _SOURCE_TYPE_DOCUMENTS = "DOCUMENTS"
+_GLUE_SUB_TYPE = "GLUE_DATABASE"
+# Athena's root catalog, lower-cased as the scope comparison is.
+_ROOT_CATALOG_LC = "awsdatacatalog"
+
+# (namespace, sorted (glue catalog id, database) pairs) — see `_glue_table_owners`.
+_GlueListingKey = tuple[str, tuple[tuple[str, str], ...]]
 
 
 @dataclass(frozen=True)
@@ -97,6 +108,26 @@ class SourceComposition:
     def unknown_composition(cls) -> SourceComposition:
         """Fail-open sentinel: treat the namespace as if it has every source type."""
         return cls(has_structured_source=True, has_unstructured_source=True, unknown=True)
+
+
+def _glue_database_mismatch(item: dict[str, Any], database: str, namespace: str) -> bool:
+    """True when a Glue record's ``discoveredSchemas[0]`` is not its ``database``.
+
+    The executor runs a Glue record against ``discoveredSchemas[0]`` when there is
+    one (AthenaQueryExecutor), not ``athenaDatabase``. When the two disagree the
+    record is not used to place tables, and a legacy root-catalog record is not
+    granted either: both would act on a database the source is not queried as.
+    """
+    discovered = [str(d).lower() for d in item.get("discoveredSchemas") or []]
+    if not discovered or discovered[0] == database:
+        return False
+    logger.warning(
+        "glue_database_mismatch",
+        namespace=namespace,
+        athena_database=database,
+        discovered_schema=discovered[0],
+    )
+    return True
 
 
 class SourcesRegistry:
@@ -139,6 +170,17 @@ class SourcesRegistry:
         # Namespace language is immutable once the namespace exists, so a value
         # read from its METADATA item never goes stale. Bounded LRU, no TTL.
         self._language_cache: OrderedDict[str, str] = OrderedDict()
+        # Only a namespace pooling several Glue databases ever lists the catalog
+        # (see ``table_placements``). Keyed by (namespace, listed databases), so a
+        # source added or removed since the listing is a cache miss, not a stale
+        # answer about which databases hold a name.
+        self._glue: Any = (
+            boto3.client("glue", region_name=self._region, config=sync_boto_config()) if self._table_name else None
+        )
+        self._glue_tables_cache: OrderedDict[_GlueListingKey, tuple[dict[str, set[str]] | None, float]] = OrderedDict()
+        # One listing in flight per key: a burst of cache misses shares it rather
+        # than each holding a pool thread (a timed-out listing keeps its thread).
+        self._glue_inflight: dict[_GlueListingKey, asyncio.Future[dict[str, set[str]] | None]] = {}
 
     @property
     def available(self) -> bool:
@@ -419,7 +461,24 @@ class SourcesRegistry:
                 continue
 
             catalog = str(item.get("athenaDataCatalogName") or "").lower()
-            if catalog:
+            # `POST /sources` copied the caller's
+            # `glueConfiguration.athenaDataCatalogName` into this attribute until
+            # 217d7c5fa (2026-09-03), and onboarding clients passed
+            # `AwsDataCatalog`, so a deployment that onboarded Glue before then
+            # still has such records. Filed as a federated
+            # (awsdatacatalog, schema) pair they authorized nothing:
+            # validate_namespace_sql_scope checks an `awsdatacatalog` reference
+            # ONLY against `native_databases`, so the qualifier's own rewrite
+            # ("awsdatacatalog"."bank_risk"."risk_ecl") was denied as outside the
+            # namespace. Such a Glue record falls through to the native path
+            # below, which authorizes its own `athenaDatabase` — the database a
+            # bare query already runs against (the executor and the qualifier
+            # still read the record as catalog `AwsDataCatalog` + its discovered
+            # schema, which names the same database). Limited to Glue records: a
+            # connector that carried this value would otherwise be granted a root
+            # database it never owned.
+            legacy_root_glue = catalog == _ROOT_CATALOG_LC and item.get("sourceSubType") == _GLUE_SUB_TYPE
+            if catalog and not legacy_root_glue:
                 for schema in item.get("discoveredSchemas") or []:
                     schema_name = str(schema).lower()
                     if _IDENTIFIER_PATTERN.fullmatch(catalog) and _IDENTIFIER_PATTERN.fullmatch(schema_name):
@@ -430,6 +489,8 @@ class SourcesRegistry:
             database = str(
                 item.get("athenaDatabase") or item.get("glueDatabaseName") or config.get("databaseName") or ""
             ).lower()
+            if legacy_root_glue and _glue_database_mismatch(item, database, namespace):
+                continue
 
             # A native Glue source can sit in a DISTINCT (non-root) Athena catalog,
             # declared at create and recorded in ``athenaCatalog`` (NOT the
@@ -473,6 +534,144 @@ class SourcesRegistry:
             native_databases=frozenset(native_databases),
             federated_catalog_schemas=frozenset(federated_catalog_schemas),
         )
+
+    async def native_glue_databases(self, namespace: str) -> dict[str, tuple[str, str]]:
+        """``source_id -> (glue catalog id, database)`` for the root-catalog Glue sources.
+
+        Only queryable Glue sources in the account's root catalog are listed: a
+        nested/federated catalog is addressed as ``catalog.schema``, not as a bare
+        database, so it cannot be named the same way.
+        """
+        items = await self._query_sources(namespace)
+        out: dict[str, tuple[str, str]] = {}
+        for item in items or []:
+            if item.get("sourceType") != _SOURCE_TYPE_DATABASE or item.get("queryable") is False:
+                continue
+            if item.get("sourceSubType") != _GLUE_SUB_TYPE:
+                continue
+            nested = [str(item.get(k) or "").lower() for k in ("athenaDataCatalogName", "athenaCatalog")]
+            if any(c and c != _ROOT_CATALOG_LC for c in nested):
+                continue
+            config = self.parse_configuration(item)
+            database = str(
+                item.get("athenaDatabase") or item.get("glueDatabaseName") or config.get("databaseName") or ""
+            ).lower()
+            if _glue_database_mismatch(item, database, namespace):
+                # Not placeable under `database`: the executor queries a different one.
+                continue
+            source_id = str(item.get("sourceId") or str(item.get("SK", "")).removeprefix("SRC#"))
+            if source_id and _IDENTIFIER_PATTERN.fullmatch(database):
+                out[source_id] = (str(config.get("catalogId") or ""), database)
+        return out
+
+    async def table_placements(self, namespace: str, table_sources: dict[str, str]) -> dict[str, tuple[str, str]]:
+        """Map each bare table name to ``(source_id, database)`` of the Glue source holding it.
+
+        Only meaningful when a namespace pools SEVERAL root-catalog Glue databases:
+        the SQL writer is shown bare table names, and a query joining tables from
+        two of them cannot run against any one default database. Returns ``{}``
+        for every other namespace, so the writer's prompt and the routing are
+        unchanged there.
+
+        A table's own ``data_source_id`` decides first. A table WITHOUT one (an
+        uploaded ontology carries no R2RML, so its classes are unplaced) is looked
+        up in the Glue catalog of the namespace's own databases, and placed only
+        when exactly one of them holds that name. A name held by two or more of them
+        (or by a database two sources share) maps to ``(AMBIGUOUS_SOURCE, "")``, so
+        a query touching it is refused rather than run against a guessed database.
+        That lookup runs only when EVERY
+        database source of the namespace is one of these Glue databases: a JDBC
+        (or nested-catalog) source cannot be listed the same way, so a same-named
+        table there would be invisible and the guess could pick the wrong source.
+        Such a table stays unplaced and is refused downstream, as before. A
+        non-queryable database source, or a Glue record whose two database fields
+        disagree, turns the lookup off for the same reason. A table whose id names
+        some other source is never looked up: it is not a Glue table.
+
+        Args:
+            namespace: Namespace whose sources bound the lookup.
+            table_sources: Bare table name -> the retrieved class's
+                ``data_source_id`` ("" when the class is unplaced).
+        """
+        sources = await self.native_glue_databases(namespace)
+        if len({db for _, db in sources.values()}) < 2:
+            return {}
+        out = {t.lower(): (s, sources[s][1]) for t, s in table_sources.items() if s in sources}
+        unplaced = [t.lower() for t, s in table_sources.items() if not s]
+        if unplaced and await self.database_source_count(namespace) == len(sources):
+            # A database two sources both register cannot name one source.
+            by_database: dict[str, list[str]] = {}
+            for source_id, (_, database) in sources.items():
+                by_database.setdefault(database, []).append(source_id)
+            catalog = await self._glue_table_owners(namespace, sorted(set(sources.values())))
+            if catalog is not None:
+                for table in unplaced:
+                    owners = catalog.get(table, set())
+                    if not owners:
+                        continue
+                    database = next(iter(owners))
+                    if len(owners) == 1 and len(by_database.get(database, [])) == 1:
+                        out[table] = (by_database[database][0], database)
+                    else:
+                        out[table] = (AMBIGUOUS_SOURCE, "")
+        return out
+
+    async def _glue_table_owners(self, namespace: str, databases: list[tuple[str, str]]) -> dict[str, set[str]] | None:
+        """Bare table name -> the databases (of ``databases``) holding it; cached per listed set.
+
+        ``None`` when ANY database could not be listed (e.g. a cross-account
+        catalog the serve role cannot read, or a listing past the timeout): a
+        partial listing could make a name look unique when it is not. The failure
+        is cached too (for ``_FAILED_LISTING_TTL_S``), so a namespace that cannot be
+        listed pays the timeout once per window rather than on every request.
+
+        The key covers which databases were listed, not what they hold: a table
+        created in one of them is seen only after the entry expires.
+        """
+        key: _GlueListingKey = (namespace, tuple(databases))
+        cached = self._glue_tables_cache.get(key)
+        if cached is not None:
+            ttl = _CACHE_TTL_S if cached[0] is not None else _FAILED_LISTING_TTL_S
+            if time.monotonic() - cached[1] < ttl:
+                return cached[0]
+        inflight = self._glue_inflight.get(key)
+        if inflight is None:
+            inflight = asyncio.ensure_future(self._list_glue_table_owners(key))
+            self._glue_inflight[key] = inflight
+            inflight.add_done_callback(lambda _f: self._glue_inflight.pop(key, None))
+        return await asyncio.shield(inflight)
+
+    async def _list_glue_table_owners(self, key: _GlueListingKey) -> dict[str, set[str]] | None:
+        """List ``key``'s databases once and cache the result (``None`` on any failure)."""
+        namespace, databases = key
+        glue = self._glue
+
+        def _list() -> dict[str, set[str]]:
+            if glue is None:
+                raise RuntimeError("no sources table configured")
+            owners: dict[str, set[str]] = {}
+            for catalog_id, database in databases:
+                kwargs: dict[str, Any] = {"DatabaseName": database, "AttributesToGet": ["NAME"]}
+                if catalog_id:
+                    kwargs["CatalogId"] = catalog_id
+                for page in glue.get_paginator("get_tables").paginate(**kwargs):
+                    for table in page.get("TableList", []):
+                        owners.setdefault(str(table["Name"]).lower(), set()).add(database)
+            return owners
+
+        loop = asyncio.get_running_loop()
+        owners: dict[str, set[str]] | None
+        try:
+            owners = await asyncio.wait_for(loop.run_in_executor(self._executor, _list), timeout=_RESOLVE_TIMEOUT_S)
+        except Exception as e:
+            # Degrade to "unplaced": the table stays bare and is handled as before.
+            logger.warning("glue_table_owners_failed", namespace=namespace, error=f"{type(e).__name__}: {str(e)[:120]}")
+            owners = None
+        self._glue_tables_cache[key] = (owners, time.monotonic())
+        self._glue_tables_cache.move_to_end(key)
+        while len(self._glue_tables_cache) > _ITEMS_CACHE_MAX:
+            self._glue_tables_cache.popitem(last=False)
+        return owners
 
     async def get_source_composition(self, namespace: str) -> SourceComposition:
         """Return which source types a namespace has (for serve-tier gating).

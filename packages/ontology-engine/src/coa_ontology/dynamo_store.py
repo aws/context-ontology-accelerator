@@ -266,8 +266,12 @@ def _job_pk(namespace: str, job_id: str) -> str:
     return f"{namespace}#JOB#{job_id}"
 
 
+# Infix every standalone-proposal PK carries (``{namespace}#PROPOSAL#{id}``).
+PROPOSAL_PK_MARKER = "#PROPOSAL#"
+
+
 def _proposal_pk(namespace: str, proposal_id: str) -> str:
-    return f"{namespace}#PROPOSAL#{proposal_id}"
+    return f"{namespace}{PROPOSAL_PK_MARKER}{proposal_id}"
 
 
 def _ingest_job_pk(namespace: str, job_id: str) -> str:
@@ -784,6 +788,41 @@ def get_async_job(kind: str, job_id: str, namespace: str = DEFAULT_NAMESPACE) ->
     return _sweep_if_stale(kind, item, namespace)
 
 
+def _job_scan_kwargs(namespace: str, status: str | None, source_type: str | None) -> dict[str, Any]:
+    """Scan kwargs selecting a namespace's job-status rows, with optional filters."""
+    filter_parts: list[str] = ["begins_with(PK, :pk_pfx)", "SK = :sk"]
+    values: dict[str, Any] = {
+        ":pk_pfx": job_pk_prefix(namespace),
+        ":sk": "STATUS",
+    }
+    names: dict[str, str] = {}
+    if status:
+        # `status` is a DynamoDB reserved word — must be aliased.
+        names["#s"] = "status"
+        filter_parts.append("#s = :st")
+        values[":st"] = status
+    if source_type is not None:
+        # Mirror list_proposals' asymmetric backfill rule.
+        if source_type == "STRUCTURED":
+            filter_parts.append("(source_type = :src OR attribute_not_exists(source_type))")
+        else:
+            filter_parts.append("source_type = :src")
+        values[":src"] = source_type
+
+    kwargs: dict[str, Any] = {
+        "FilterExpression": " AND ".join(filter_parts),
+        "ExpressionAttributeValues": values,
+    }
+    if names:
+        kwargs["ExpressionAttributeNames"] = names
+    return kwargs
+
+
+def job_pk_prefix(namespace: str) -> str:
+    """PK prefix shared by every job row in ``namespace`` (``{namespace}#JOB#``)."""
+    return f"{namespace}#JOB#"
+
+
 def list_jobs(
     namespace: str = DEFAULT_NAMESPACE,
     status: str | None = None,
@@ -805,41 +844,102 @@ def list_jobs(
       - ``"UNSTRUCTURED"``: matches only items with the attribute set
         to ``"UNSTRUCTURED"`` exactly.
     """
-    filter_parts: list[str] = ["begins_with(PK, :pk_pfx)", "SK = :sk"]
-    values: dict[str, Any] = {
-        ":pk_pfx": f"{namespace}#JOB#",
-        ":sk": "STATUS",
-    }
-    names: dict[str, str] = {}
-    if status:
-        # `status` is a DynamoDB reserved word — must be aliased.
-        names["#s"] = "status"
-        filter_parts.append("#s = :st")
-        values[":st"] = status
-    if source_type is not None:
-        # Mirror list_proposals' asymmetric backfill rule.
-        if source_type == "STRUCTURED":
-            filter_parts.append("(source_type = :src OR attribute_not_exists(source_type))")
-        else:
-            filter_parts.append("source_type = :src")
-        values[":src"] = source_type
+    items, _ = _scan_page(_job_scan_kwargs(namespace, status, source_type), limit, None)
+    return items
 
-    kwargs: dict[str, Any] = {
-        "FilterExpression": " AND ".join(filter_parts),
-        "ExpressionAttributeValues": values,
-        "Limit": limit,
-    }
-    if names:
-        kwargs["ExpressionAttributeNames"] = names
+
+def list_jobs_page(
+    namespace: str = DEFAULT_NAMESPACE,
+    status: str | None = None,
+    source_type: str | None = None,
+    limit: int = 50,
+    exclusive_start_key: dict[str, str] | None = None,
+) -> tuple[list[dict], dict[str, str] | None]:
+    """One page of :func:`list_jobs` for a list route: ``(items, next_key)``.
+
+    ``next_key`` is the DynamoDB key to resume from (pass it back as
+    ``exclusive_start_key``), or ``None`` when the scan is exhausted. The read is
+    capped at :data:`MAX_SCAN_CALLS_PER_PAGE` scan calls, so a page may hold
+    fewer than ``limit`` items — or none — while ``next_key`` is still set; see
+    :func:`_scan_page`.
+    """
+    kwargs = _job_scan_kwargs(namespace, status, source_type)
+    return _scan_page(kwargs, limit, exclusive_start_key, max_calls=MAX_SCAN_CALLS_PER_PAGE)
+
+
+# Upper bound on DynamoDB read calls (each reads at most 1 MB) one list-route
+# request makes. Namespace scoping on the job and proposal scans is a filter, not
+# a key condition, so without a cap a namespace with few rows in a large table
+# would read the whole table in one request. When the cap is hit the page is
+# returned short (possibly empty) with a resume key.
+MAX_SCAN_CALLS_PER_PAGE = 10
+
+
+def _item_key(item: dict) -> dict[str, str]:
+    return {"PK": item["PK"], "SK": item["SK"]}
+
+
+def _read_page(
+    read: Callable[..., dict],
+    kwargs: dict[str, Any],
+    limit: int | None,
+    exclusive_start_key: dict[str, str] | None,
+    *,
+    max_calls: int | None,
+) -> tuple[list[dict], dict[str, str] | None]:
+    """Collect up to ``limit`` filtered matches from ``read`` (a table's ``scan``/``query``).
+
+    Starts after ``exclusive_start_key``. ``limit=None`` collects every match and
+    ``max_calls=None`` removes the read budget — internal callers that must see
+    the complete set use both.
+
+    DynamoDB applies a ``FilterExpression`` after reading, so one call may hold
+    fewer matches than wanted (keep reading) or more (truncate). Whenever the
+    page fills, the resume key is the primary key of the last item RETURNED: any
+    item key is a valid ``ExclusiveStartKey`` and the read resumes strictly after
+    it, so the next page neither skips nor repeats an item. The call's own
+    ``LastEvaluatedKey`` is not used there — on truncation it would skip the
+    remainder, and it may be a row the filter rejects.
+
+    When ``max_calls`` reads have run without filling the page or reaching the
+    end, the matches so far are returned with that ``LastEvaluatedKey`` (a
+    position, possibly a filtered-out row) so the next request continues where
+    this one stopped. Tokens are scoped to the listing, not to the key's ``PK``
+    (see :mod:`coa_ontology.pagination`), so that key round-trips.
+    """
+    if limit is not None and limit <= 0:
+        return [], None
+    if exclusive_start_key:
+        kwargs["ExclusiveStartKey"] = exclusive_start_key
     items: list[dict] = []
-    while len(items) < limit:
-        resp = _get_table().scan(**kwargs)
-        items.extend(resp.get("Items", []))
+    calls = 0
+    while True:
+        resp = read(**kwargs)
+        calls += 1
+        page = resp.get("Items", [])
         last_key = resp.get("LastEvaluatedKey")
+        if limit is not None:
+            room = limit - len(items)
+            if len(page) > room or (len(page) == room and last_key):
+                items.extend(page[:room])
+                return items, _item_key(items[-1])
+        items.extend(page)
         if not last_key:
-            break
+            return items, None
+        if max_calls is not None and calls >= max_calls:
+            return items, last_key
         kwargs["ExclusiveStartKey"] = last_key
-    return items[:limit]
+
+
+def _scan_page(
+    kwargs: dict[str, Any],
+    limit: int | None,
+    exclusive_start_key: dict[str, str] | None,
+    *,
+    max_calls: int | None = None,
+) -> tuple[list[dict], dict[str, str] | None]:
+    """:func:`_read_page` over a table ``Scan``."""
+    return _read_page(_get_table().scan, kwargs, limit, exclusive_start_key, max_calls=max_calls)
 
 
 def put_proposal(job_id: str, ontology_turtle: str, r2rml_turtle: str, namespace: str = DEFAULT_NAMESPACE):
@@ -1310,13 +1410,75 @@ def list_proposals(
         ``"UNSTRUCTURED"`` exactly. Pre-delta items that lack the
         attribute are NEVER returned for this filter.
     """
+    if limit is not None and limit <= 0:
+        return []
+    # Drain the scan, then keep the newest ``limit`` matches. A Scan returns
+    # items in no useful order, so stopping at the first ``limit`` matches would
+    # give an arbitrary subset once a namespace holds more than ``limit`` of them —
+    # a caller asking for the latest induction could get only older ones.
+    kwargs = _proposal_scan_kwargs(namespace, ontology_id, status, proposal_type, source_type)
+    items, _ = _scan_page(kwargs, None, None)
+    items.sort(key=_newest_first_key, reverse=True)
+    return items if limit is None else items[:limit]
+
+
+def _proposal_created(item: dict) -> str:
+    """``created_at`` for ordering; ISO-8601 UTC sorts chronologically, a row without one sorts last."""
+    return str(item.get("created_at") or "-")
+
+
+def _newest_first_key(item: dict) -> tuple[str, str]:
+    # PK breaks ties so the order (and therefore every page boundary) is total.
+    return (_proposal_created(item), str(item.get("PK", "")))
+
+
+def list_proposals_newest_page(
+    namespace: str | None = None,
+    ontology_id: str | None = None,
+    status: str | None = None,
+    proposal_type: str | None = None,
+    source_type: str | None = None,
+    limit: int = 50,
+    after: dict[str, str] | None = None,
+) -> tuple[list[dict], dict[str, str] | None]:
+    """One newest-first page of :func:`list_proposals`: ``(items, next_key)``.
+
+    ``after`` is the ``next_key`` of the previous page: ``{"PK": <proposal PK>,
+    "SK": <its created_at>}`` of the last item returned. The page holds the next
+    ``limit`` proposals strictly older than it in (created_at, PK) order, so a
+    proposal created or deleted between pages never shifts or repeats the rest.
+    """
+    items = list_proposals(namespace, ontology_id, status, proposal_type, source_type, limit=None)
+    if after:
+        cursor = (after["SK"], after["PK"])
+        items = [i for i in items if _newest_first_key(i) < cursor]
+    page = items[:limit]
+    if len(items) <= limit or not page:
+        return page, None
+    last = page[-1]
+    return page, {"PK": str(last["PK"]), "SK": _proposal_created(last)}
+
+
+def proposal_pk_prefix(namespace: str) -> str:
+    """PK prefix shared by every proposal row in ``namespace`` (``{namespace}#PROPOSAL#``)."""
+    return f"{namespace}{PROPOSAL_PK_MARKER}"
+
+
+def _proposal_scan_kwargs(
+    namespace: str | None,
+    ontology_id: str | None,
+    status: str | None,
+    proposal_type: str | None,
+    source_type: str | None,
+) -> dict[str, Any]:
+    """Scan kwargs selecting proposal META rows, with optional filters."""
     filter_parts, values, names = [], {}, {}
     if namespace:
         filter_parts.append("begins_with(PK, :ns_pfx)")
-        values[":ns_pfx"] = f"{namespace}#PROPOSAL#"
+        values[":ns_pfx"] = proposal_pk_prefix(namespace)
     else:
         filter_parts.append("contains(PK, :proposal_marker)")
-        values[":proposal_marker"] = "#PROPOSAL#"
+        values[":proposal_marker"] = PROPOSAL_PK_MARKER
     if ontology_id:
         filter_parts.append("ontology_id = :oid")
         values[":oid"] = ontology_id
@@ -1348,26 +1510,7 @@ def list_proposals(
     if names:
         kwargs["ExpressionAttributeNames"] = names
 
-    if limit is not None and limit <= 0:
-        return []
-
-    # Drain the scan, then keep the newest ``limit`` matches. A Scan returns
-    # items in no useful order, so stopping at the first ``limit`` matches gave
-    # an arbitrary subset once a namespace held more than ``limit`` of them —
-    # a caller asking for the latest induction could get only older ones.
-    # Draining costs nothing extra in the common case: with fewer than
-    # ``limit`` matches the old loop scanned the whole table anyway.
-    items: list[dict] = []
-    while True:
-        resp = _get_table().scan(**kwargs)
-        items.extend(resp.get("Items", []))
-        last_key = resp.get("LastEvaluatedKey")
-        if not last_key:
-            break
-        kwargs["ExclusiveStartKey"] = last_key
-    # ISO-8601 UTC strings sort chronologically; a row without one sorts last.
-    items.sort(key=lambda i: str(i.get("created_at") or ""), reverse=True)
-    return items if limit is None else items[:limit]
+    return kwargs
 
 
 def update_proposal(
@@ -1605,6 +1748,54 @@ def list_ontologies_registry(
     return items if limit is None else items[:limit]
 
 
+def list_ontologies_registry_page(
+    namespace: str,
+    ontology_type: str | None = None,
+    domain_tag: str | None = None,
+    attribute_equals: dict[str, str] | None = None,
+    limit: int = 50,
+    exclusive_start_key: dict[str, str] | None = None,
+) -> tuple[list[dict], dict[str, str] | None]:
+    """One page of a namespace's ontology registry rows: ``(items, next_key)``.
+
+    The paged variant of :func:`list_ontologies_registry` behind the
+    ``ListOntologies`` route. ``attribute_equals`` adds exact-match filters on
+    further registry attributes (e.g. ``{"uri": ...}``), applied in DynamoDB so
+    they page correctly rather than thinning each page afterwards. Same resume
+    and read-budget rules as :func:`list_jobs_page`: a page may be short or empty
+    while ``next_key`` is still set.
+    """
+    values: dict[str, Any] = {":pk": _namespace_pk(namespace), ":skp": "ONTOLOGY#"}
+    names: dict[str, str] = {}
+    filter_parts: list[str] = []
+    if ontology_type:
+        filter_parts.append("ontology_type = :otype")
+        values[":otype"] = ontology_type
+    if domain_tag:
+        filter_parts.append("contains(domain_tags, :dt)")
+        values[":dt"] = domain_tag
+    # Alias every extra attribute: several registry attribute names are
+    # DynamoDB reserved words.
+    for i, (attr, want) in enumerate(sorted((attribute_equals or {}).items())):
+        names[f"#f{i}"] = attr
+        values[f":f{i}"] = want
+        filter_parts.append(f"#f{i} = :f{i}")
+    kwargs: dict[str, Any] = {
+        "KeyConditionExpression": "PK = :pk AND begins_with(SK, :skp)",
+        "ExpressionAttributeValues": values,
+    }
+    if filter_parts:
+        kwargs["FilterExpression"] = " AND ".join(filter_parts)
+    if names:
+        kwargs["ExpressionAttributeNames"] = names
+    return _read_page(_get_table().query, kwargs, limit, exclusive_start_key, max_calls=MAX_SCAN_CALLS_PER_PAGE)
+
+
+def ontology_registry_pk(namespace: str) -> str:
+    """Partition key of ``namespace``'s ontology registry (``NAMESPACE#{namespace}``)."""
+    return _namespace_pk(namespace)
+
+
 def update_ontology_registry(namespace: str, ontology_id: str, **fields) -> dict | None:
     """Patch a subset of attributes on an ontology registry row."""
     if not fields:
@@ -1786,7 +1977,7 @@ def delete_all_namespace_items(namespace: str) -> int:
     prefixes = [
         _namespace_pk(namespace),  # NAMESPACE#{ns} — ontology registry
         f"{namespace}#JOB#",  # induction jobs + proposal artifacts
-        f"{namespace}#PROPOSAL#",  # standalone proposals
+        proposal_pk_prefix(namespace),  # standalone proposals
         f"{namespace}#INGESTJOB#",  # async ingest jobs
         f"{namespace}#ASYNCJOB#",  # async validate / infer-constraints jobs
     ]

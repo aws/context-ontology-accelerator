@@ -20,6 +20,14 @@ import structlog
 from coa_common.logging import setup_logging
 from coa_common.response import api_response
 
+from coa_metrics.api.contract import (
+    BULK_DELETE_FILTER_DATA_SOURCE_ID_MAX_LENGTH,
+    BULK_DELETE_FILTER_NAME_PREFIX_MAX_LENGTH,
+    BULK_DELETE_FILTER_SOURCE_TABLE_MAX_LENGTH,
+    BULK_DELETE_NAMES_MAX_ITEMS,
+    check_metric_name_list,
+    check_string,
+)
 from coa_metrics.neptune_client import MetricNeptuneClient
 from coa_metrics.opensearch_client import MetricOpenSearchClient
 
@@ -60,6 +68,9 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     names = body.get("names")
     filter_criteria = body.get("filter")
     delete_all = body.get("deleteAll", False)
+    bound_error = _check_bounds(names, filter_criteria, delete_all)
+    if bound_error:
+        return api_response(400, {"message": bound_error})
 
     # Validate mutual exclusivity
     provided = sum([bool(names), bool(filter_criteria), bool(delete_all)])
@@ -77,6 +88,30 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         return _delete_by_names(namespace, names, neptune, opensearch)
     else:
         return _delete_by_filter(namespace, filter_criteria, neptune, opensearch)
+
+
+def _check_bounds(names: Any, filter_criteria: Any, delete_all: Any) -> str | None:
+    """Enforce the BulkDeleteMetrics input bounds from the Smithy model (no value echo)."""
+    if names is not None:
+        error = check_metric_name_list(names, "names", max_items=BULK_DELETE_NAMES_MAX_ITEMS)
+        if error:
+            return error
+    if filter_criteria is not None:
+        if not isinstance(filter_criteria, dict):
+            return "filter must be an object"
+        for field, max_length in (
+            ("dataSourceId", BULK_DELETE_FILTER_DATA_SOURCE_ID_MAX_LENGTH),
+            ("sourceTable", BULK_DELETE_FILTER_SOURCE_TABLE_MAX_LENGTH),
+            ("namePrefix", BULK_DELETE_FILTER_NAME_PREFIX_MAX_LENGTH),
+        ):
+            value = filter_criteria.get(field)
+            if value is not None:
+                error = check_string(value, f"filter.{field}", max_length=max_length)
+                if error:
+                    return error
+    if not isinstance(delete_all, bool):
+        return "deleteAll must be a boolean"
+    return None
 
 
 def _delete_all(

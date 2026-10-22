@@ -115,6 +115,27 @@ When you create a namespace, the platform:
 4. Copies built-in role templates into the namespace
 5. Grants the `namespace-owner` role to the specified owner
 
+## Retrying Creates Safely
+
+Create calls accept an optional `clientToken` in the request body: 1–64
+printable ASCII characters (a UUID works well). Retrying the same request with
+the same token within 24 hours returns the original response, marked with the
+`X-Idempotent-Replay: true` header, instead of creating a duplicate.
+
+- Reusing a token with different parameters, or while the first call is still
+  running, returns `409`.
+- A call that failed (any non-2xx response) is not recorded, so a retry with the
+  same token runs it again.
+- If retry protection is temporarily unavailable, the call returns `503` and
+  nothing is created; retry later with the same token.
+- Tokens are scoped to the caller, the operation, and the namespace, and expire
+  after 24 hours.
+
+Operations that accept `clientToken`: CreateNamespace, CreateGrant,
+CreatePlatformGrant, CreateMetric, ImportOsi, CreateSource, RescanSource,
+StartInduction, IngestOntologyFromS3, LoadFoundationalOntology,
+InferConstraints, and ValidateProposal.
+
 ## Namespace Lifecycle
 
 Namespaces follow a defined lifecycle with controlled state transitions:

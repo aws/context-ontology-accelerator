@@ -273,6 +273,7 @@ aws secretsmanager create-secret \
 Create via `POST /namespaces/{namespaceId}/sources` with `sourceType: "DATABASE"`
 and a `databaseSource.jdbcConfiguration` body — see **CreateSource** in the
 [API Reference](#/api-reference) for the full request schema and response.
+Create calls are retry-safe with an optional `clientToken` — see [Retrying Creates Safely](namespaces.md#retrying-creates-safely).
 
 ### Register via Web UI
 
@@ -437,6 +438,7 @@ Two cases need no tag:
 Create via `POST /namespaces/{namespaceId}/sources` with `sourceType: "DATABASE"`
 and a `databaseSource.glueConfiguration` body — see **CreateSource** in the
 [API Reference](#/api-reference) for the full request schema and response.
+Create calls are retry-safe with an optional `clientToken` — see [Retrying Creates Safely](namespaces.md#retrying-creates-safely).
 
 ### Glue Configuration Fields
 
@@ -945,7 +947,9 @@ Upload files directly through the web app:
 
 Creating a document source from local files is a three-call sequence — see
 **GetSourceUploadUrls** and **CreateSource** in the
-[API Reference](#/api-reference) for the full request/response schemas:
+[API Reference](#/api-reference) for the full request/response schemas
+(CreateSource is retry-safe with an optional `clientToken` — see
+[Retrying Creates Safely](namespaces.md#retrying-creates-safely)):
 
 1. `POST /namespaces/{namespaceId}/sources/upload-urls` with the list of
    files (`fileName`, `contentType`) to get back a pre-signed S3 URL per file,

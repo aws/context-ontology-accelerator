@@ -13,9 +13,9 @@ function buildTemplate(): Template {
 
 describe("AuthnzStack", () => {
   describe("table count", () => {
-    it("creates exactly 3 DynamoDB tables", () => {
+    it("creates exactly 4 DynamoDB tables", () => {
       const template = buildTemplate();
-      template.resourceCountIs("AWS::DynamoDB::Table", 3);
+      template.resourceCountIs("AWS::DynamoDB::Table", 4);
     });
   });
 
@@ -47,6 +47,29 @@ describe("AuthnzStack", () => {
       for (const [, resource] of Object.entries(tables)) {
         expect((resource as any).DeletionPolicy).toBe("Delete");
       }
+    });
+  });
+
+  describe("Idempotency table", () => {
+    it("is PK-only with TTL on ttl, on-demand, encrypted and PITR-enabled", () => {
+      const template = buildTemplate();
+      template.hasResourceProperties("AWS::DynamoDB::Table", {
+        TableName: Match.stringLikeRegexp("-idempotency$"),
+        KeySchema: [{ AttributeName: "PK", KeyType: "HASH" }],
+        AttributeDefinitions: [{ AttributeName: "PK", AttributeType: "S" }],
+        TimeToLiveSpecification: { AttributeName: "ttl", Enabled: true },
+        BillingMode: "PAY_PER_REQUEST",
+        SSESpecification: { SSEEnabled: true },
+        PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true },
+      });
+    });
+
+    it("publishes its name to SSM for the consuming stacks", () => {
+      const template = buildTemplate();
+      template.hasResourceProperties("AWS::SSM::Parameter", {
+        Name: Match.stringLikeRegexp("/authnz/idempotency-table-name$"),
+        Value: Match.objectLike({ Ref: Match.stringLikeRegexp("^IdempotencyTable") }),
+      });
     });
   });
 

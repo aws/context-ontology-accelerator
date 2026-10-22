@@ -6,10 +6,12 @@ $version: "2"
 namespace com.amazon.semanticcontext.namespace
 
 use com.amazon.semanticcontext.common#AccessDeniedError
+use com.amazon.semanticcontext.common#ClientToken
 use com.amazon.semanticcontext.common#ConflictError
 use com.amazon.semanticcontext.common#NotFoundError
 use com.amazon.semanticcontext.common#PaginatedInput
 use com.amazon.semanticcontext.common#PaginatedOutput
+use com.amazon.semanticcontext.common#PaginationToken
 use com.amazon.semanticcontext.common#Uuid
 use com.amazon.semanticcontext.common#ValidationError
 
@@ -34,8 +36,11 @@ string NamespaceDescription
 
 /// Owner email address. The local part allows the RFC 5322 atext characters
 /// except # | and backtick (the owner also becomes a grant principalId).
+/// Personal information, so marked sensitive to keep it out of
+/// generated-client logs.
 @pattern("^[A-Za-z0-9!$%&'*+/=?^_{}~-]+(\\.[A-Za-z0-9!$%&'*+/=?^_{}~-]+)*@[A-Za-z0-9-]+(\\.[A-Za-z0-9-]+)*\\.[A-Za-z]{2,63}$")
 @length(min: 6, max: 254)
+@sensitive
 string OwnerEmail
 
 /// Namespace language: a BCP 47 tag limited to `language[-script][-region]`
@@ -223,6 +228,13 @@ operation CreateNamespace {
         /// namespace will hold. Defaults to `en` when omitted. Cannot be
         /// changed after creation.
         language: LanguageTag
+
+        /// Optional idempotency token. A retry with the same token and the same
+        /// parameters within 24 hours returns the original result instead of creating
+        /// a duplicate; reusing the token with different parameters is rejected with
+        /// ConflictError (409).
+        @idempotencyToken
+        clientToken: ClientToken
     }
 
     output: CreateNamespaceOutput
@@ -273,14 +285,16 @@ structure GetNamespaceOutput {
 /// List namespaces the caller can access, with optional pagination.
 @readonly
 @http(method: "GET", uri: "/namespaces")
+@paginated(inputToken: "nextToken", outputToken: "nextToken", pageSize: "maxResults", items: "namespaces")
 operation ListNamespaces {
     input := with [PaginatedInput] {
         /// Opaque token from a prior response; pass it to fetch the next page.
         @httpQuery("nextToken")
-        nextToken: String
+        nextToken: PaginationToken
 
         /// Maximum number of namespaces to return in a single page.
         @httpQuery("maxResults")
+        @range(min: 1, max: 100)
         maxResults: Integer
     }
 
@@ -371,6 +385,11 @@ operation DeleteNamespace {
 // UpdateNamespaceStatus
 // ──────────────────────────────────────────────
 /// Change a namespace's lifecycle status (e.g., archive or reactivate it).
+///
+/// Takes no `clientToken`: the request names the target status, so it is a
+/// state transition rather than a create. Repeating it after it succeeded
+/// changes nothing and is rejected with ConflictError (409) because the
+/// namespace is already in that status; GetNamespace confirms the outcome.
 @http(method: "PATCH", uri: "/namespaces/{namespaceId}/status")
 operation UpdateNamespaceStatus {
     input := {

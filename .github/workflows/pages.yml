@@ -68,7 +68,7 @@ jobs:
       # --- Build the docs site ---
       - uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: "22.23.4"
       - name: Enable pnpm
         run: corepack enable && corepack prepare "pnpm@${PNPM_VERSION}" --activate
       - name: Build docs

@@ -47,15 +47,13 @@ from coa_common.s3 import get_s3_client, read_file_bytes, upload_json
 from coa_control_plane_server.models.source_status import SourceStatus
 from coa_control_plane_server.models.source_sub_type import SourceSubType
 
+from coa_sources.client_errors import CLIENT_SAFE_FLAG, client_safe_error, is_client_safe
 from coa_sources.database.connectors import (
     MetadataConnector,
     get_connector,
 )
 from coa_sources.database.errors import PermanentScanError, TransientScanError, is_permanent_scan_error
-from coa_sources.database.glue_ownership import (
-    GlueOwnershipError,
-    assert_namespace_may_catalog,
-)
+from coa_sources.database.glue_ownership import assert_namespace_may_catalog
 from coa_sources.database.metadata_writer import write_to_datazone
 from coa_sources.database.metrics import emit_metric
 from coa_sources.database.rescan import diff_tables, merged_write_set, reconstruct_approved_baseline
@@ -556,7 +554,9 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         )
         _get_scan_dao().update(
             key=scan_job_key,
-            update_fields={"errorMessage": str(exc)},
+            # Returned to callers by GetSourceScanJob / ListSourceScanJobs, so it
+            # carries the client-safe text, not the raw exception (logged above).
+            update_fields={"errorMessage": client_safe_error(exc), CLIENT_SAFE_FLAG: is_client_safe(exc)},
             condition="attribute_exists(PK)",
             raise_on_error=False,
         )
@@ -670,17 +670,17 @@ def _discover(
     # authorized rather than merely not-forbidden. See
     # ``coa_sources.database.glue_ownership``.
     if (source_item or {}).get("sourceSubType") == SourceSubType.GLUE_DATABASE:
-        try:
-            assert_namespace_may_catalog(
-                _get_ds_dao(),
-                namespace_id=namespace_id,
-                catalog_id=connector_config["catalog_id"],
-                database_name=connector_config["database_name"],
-                region=connector_config["region"],
-                cross_account_role_arn=connector_config["cross_account_role_arn"],
-            )
-        except GlueOwnershipError as exc:
-            raise RuntimeError(str(exc)) from exc
+        # A refusal raises GlueOwnershipError, a ClientSafeError: it propagates
+        # as-is so the scan job stores the steward-facing message (and the tag
+        # command it carries) without rewording.
+        assert_namespace_may_catalog(
+            _get_ds_dao(),
+            namespace_id=namespace_id,
+            catalog_id=connector_config["catalog_id"],
+            database_name=connector_config["database_name"],
+            region=connector_config["region"],
+            cross_account_role_arn=connector_config["cross_account_role_arn"],
+        )
         connector_config["lf_self_grant_allowed"] = True
 
     # Test connection first

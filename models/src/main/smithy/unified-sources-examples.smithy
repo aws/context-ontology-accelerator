@@ -93,6 +93,11 @@ apply RescanSource @examples([
         input: { namespaceId: "3f2504e0-4f89-41d3-9a0c-0305e82c3301", sourceId: "src-7f3a9c1e" }
         output: { sourceId: "src-7f3a9c1e", status: "SCANNING" }
     }
+    {
+        title: "Re-scan with an idempotency token so a retry starts no second scan"
+        input: { namespaceId: "3f2504e0-4f89-41d3-9a0c-0305e82c3301", sourceId: "src-7f3a9c1e", clientToken: "6f1c2b9e-4d3a-4f0e-9b8a-2c1d0e9f8a7b" }
+        output: { sourceId: "src-7f3a9c1e", status: "SCANNING" }
+    }
 ])
 
 apply UpdateSourceMetadata @examples([
@@ -353,6 +358,23 @@ apply ListSourceScanJobs @examples([
                     completedAt: "2026-07-23T14:35:00Z"
                 }
             ]
+        }
+    }
+    {
+        title: "Page through a long history"
+        input: { namespaceId: "3f2504e0-4f89-41d3-9a0c-0305e82c3301", sourceId: "src-7f3a9c1e", maxResults: 1 }
+        output: {
+            items: [
+                {
+                    at: "2026-07-23T15:02:00Z"
+                    eventType: "REVIEW"
+                    status: "APPROVED"
+                    decision: "APPROVED"
+                    isRescan: false
+                    tablesApproved: 12
+                }
+            ]
+            nextToken: "eyJTSyI6ICIyMDI2LTA3LTIzVDE1OjAyOjAwWiJ9"
         }
     }
 ])

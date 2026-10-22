@@ -378,6 +378,36 @@ class TestCrossAccountAccess:
 
 
 @pytest.mark.unit
+class TestPerFileErrorReason:
+    """A library failure on one file keeps its (redacted) reason for the Reason column."""
+
+    @patch.dict(os.environ, _ENV)
+    @patch("coa_sources.documents.preprocessing.handler.upload_metadata")
+    @patch("coa_sources.documents.preprocessing.handler.upload_file")
+    @patch("coa_sources.documents.preprocessing.handler.read_file_bytes", return_value=b"%PDF-1.7")
+    @patch("coa_sources.documents.preprocessing.handler.get_page_count", return_value=3)
+    @patch("coa_sources.documents.preprocessing.handler.process_pdf")
+    @patch("coa_sources.documents.preprocessing.handler.list_objects")
+    @patch("coa_sources.documents.preprocessing.handler.get_s3_client")
+    def test_library_error_reason_is_kept(
+        self, mock_client, mock_list, mock_pdf, mock_pages, mock_read, mock_upload, mock_meta
+    ):
+        class PdfReadError(Exception):
+            pass
+
+        mock_pdf.side_effect = PdfReadError("EOF marker not found")
+        mock_list.return_value = [{"Key": "raw/broken.pdf", "Size": 5000}]
+        from coa_sources.documents.preprocessing.handler import handler
+
+        result = handler({"namespace_id": "ns1", "doc_source_id": "ds1"}, None)
+
+        assert result["files_errored"] == 1
+        issue = result["issues_preview"][0]
+        assert issue["type"] == "error"
+        assert issue["reason"] == "PdfReadError: EOF marker not found"
+
+
+@pytest.mark.unit
 class TestEmptyExtractionIsReported:
     """A processor can return "" without raising, and used to be counted a success.
 

@@ -19,6 +19,7 @@ import {
   RESERVED_DATASOURCE_ROLE_SEGMENT,
   ReservedRoleNamePrefix,
 } from "./reserved-role-prefix";
+import { solutionStackDescription } from "./solution";
 
 /**
  * COA's own deployment of the Databricks connector: one Lambda serving every Databricks SQL
@@ -40,7 +41,11 @@ export class ManagedDatabricksConnectorStack extends cdk.Stack {
   public readonly managed: ManagedDeployment;
 
   constructor(scope: Construct, id: string, props: ConnectorStackProps = {}) {
-    super(scope, id, props);
+    super(scope, id, {
+      ...props,
+      // AWS Solutions counts stack launches by the `(SO0376)` description prefix.
+      description: props.description ?? solutionStackDescription(id),
+    });
 
     // Resolved first, so a mistake fails before the fat jar is staged.
     const managed = resolveManagedDeployment();

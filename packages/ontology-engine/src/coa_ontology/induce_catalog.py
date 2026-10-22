@@ -41,6 +41,7 @@ from coa_ontology.namespace_language import (
     NamespaceLanguageUnconfiguredError,
     resolve_namespace_language,
 )
+from coa_ontology.pagination import InvalidNextToken, decode_next_token, page_body
 
 if TYPE_CHECKING:
     # Type-only: ``inducer.schemas`` is deliberately NOT imported at runtime here
@@ -1598,13 +1599,37 @@ def _job_summary(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# ListInductionJobs ``maxResults`` default and bound. The max equals the Smithy
+# ``ListInductionJobs.maxResults`` @range max (checked by a parity test).
+LIST_INDUCTION_JOBS_DEFAULT_MAX_RESULTS = 50
+LIST_INDUCTION_JOBS_MAX_RESULTS = 200
+
+
+def jobs_list_scope(namespace: str) -> str:
+    """``nextToken`` scope of a ListInductionJobs listing (see :mod:`coa_ontology.pagination`)."""
+    return f"jobs:{namespace}"
+
+
 @router.get("/jobs")
 def list_jobs(
     namespace: str,
     status: str | None = None,
-    max_results: int = Query(50, alias="maxResults", ge=1, le=200),
-) -> list[dict[str, Any]]:
-    """List a namespace's induction jobs as contract summaries, from DynamoDB.
+    max_results: int = Query(
+        LIST_INDUCTION_JOBS_DEFAULT_MAX_RESULTS, alias="maxResults", ge=1, le=LIST_INDUCTION_JOBS_MAX_RESULTS
+    ),
+    next_token: str | None = Query(None, alias="nextToken"),
+) -> dict[str, Any]:
+    """List one page of a namespace's induction jobs, from DynamoDB.
+
+    Returns the Smithy ``ListInductionJobs`` output,
+    ``{"jobs": [InductionJobSummary, ...], "nextToken": "..."}``. ``nextToken`` is
+    present only when more results may follow; pass it back unchanged for the
+    next page. A malformed token, or one minted for another namespace, is a 400.
+
+    A page can hold fewer than ``maxResults`` jobs — even none — while
+    ``nextToken`` is present: each request reads a bounded slice of the table
+    (see :data:`dynamo_store.MAX_SCAN_CALLS_PER_PAGE`). Keep paging until
+    ``nextToken`` is absent.
 
     Reads the durable job rows, NOT the in-memory ``_jobs`` dict. ``_jobs`` only
     holds jobs started by the task serving the request and is wiped on every
@@ -1627,17 +1652,29 @@ def list_jobs(
     Args:
         namespace: Namespace whose jobs to list.
         status: Optional ``InductionJobStatus`` filter (contract ``status``).
-        max_results: Cap on returned jobs (contract ``maxResults``), 1–200.
+        max_results: Page size (contract ``maxResults``), 1–200.
+        next_token: Opaque resume token from a previous page (contract ``nextToken``).
 
     Returns:
-        One ``InductionJobSummary``-shaped dict per persisted job, newest first.
-        Returns an empty list (rather than a 500) if the underlying DynamoDB
-        scan fails — this is a read-only listing endpoint, and degrading to
-        "no jobs shown" is preferable to making the endpoint unavailable
-        during transient throttling or network issues.
+        One page of ``InductionJobSummary``-shaped dicts, newest first WITHIN the
+        page (DynamoDB scan order is not time order, so ordering across pages is
+        not guaranteed).
+
+    Raises:
+        HTTPException: 400 for a bad ``nextToken``; 503 when the DynamoDB scan
+            fails. An empty 200 there would read as "no more jobs" and silently
+            truncate a client that is paging, so the failure is surfaced and the
+            client can retry the same token.
     """
+    scope = jobs_list_scope(namespace)
     try:
-        items = dynamo_store.list_jobs(namespace=namespace, status=status, limit=max_results)
+        start_key = decode_next_token(next_token, scope=scope)
+    except InvalidNextToken as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        items, next_key = dynamo_store.list_jobs_page(
+            namespace=namespace, status=status, limit=max_results, exclusive_start_key=start_key
+        )
     except Exception:
         _log.exception(
             "list_jobs_scan_failed namespace=%s status=%s max_results=%s",
@@ -1645,9 +1682,9 @@ def list_jobs(
             status,
             max_results,
         )
-        return []
+        raise HTTPException(status_code=503, detail="Induction jobs are temporarily unavailable; retry.") from None
     items.sort(key=lambda i: str(i.get("created_at") or ""), reverse=True)
-    return [_job_summary(item) for item in items]
+    return page_body("jobs", [_job_summary(item) for item in items], next_key, scope=scope)
 
 
 # Terminal IngestJobState values (see ontology-graph.smithy) — an ingest job
@@ -1766,12 +1803,37 @@ def list_datasources(request: Request, namespace: str):
     return result
 
 
+# ListInducedDatasources ``maxResults`` bound (and default: a caller that does not
+# page gets everything up to the bound). Equals the Smithy @range max.
+LIST_INDUCED_DATASOURCES_MAX_RESULTS = 1000
+
+
 @router.get("/datasources/induced")
-def list_induced_datasources(namespace: str):
-    """Return distinct datasource IDs from all accepted proposals in a namespace."""
+def list_induced_datasources(
+    namespace: str,
+    max_results: int = Query(
+        LIST_INDUCED_DATASOURCES_MAX_RESULTS, alias="maxResults", ge=1, le=LIST_INDUCED_DATASOURCES_MAX_RESULTS
+    ),
+    next_token: str | None = Query(None, alias="nextToken"),
+) -> dict[str, Any]:
+    """List one page of the distinct datasources behind a namespace's accepted proposals.
+
+    Returns the Smithy ``ListInducedDatasources`` output,
+    ``{"datasources": [...], "nextToken": "..."}``, ordered by ``datasourceId``.
+    The set is derived (deduplicated across every accepted proposal), so each
+    request reads all accepted proposals; paging bounds the response and the
+    per-datasource name lookups, not the proposal read. ``nextToken`` carries the
+    last ``datasourceId`` returned.
+    """
     import boto3
 
-    proposals = dynamo_store.list_proposals(namespace=namespace, status="accepted")
+    scope = f"induced-datasources:{namespace}"
+    try:
+        start_key = decode_next_token(next_token, scope=scope, pk=namespace)
+    except InvalidNextToken as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    proposals = dynamo_store.list_proposals(namespace=namespace, status="accepted", limit=None)
     ds_set: dict[str, dict] = {}
     for p in proposals:
         meta = p.get("metadata") or {}
@@ -1790,11 +1852,18 @@ def list_induced_datasources(namespace: str):
                     "novel_classes_created": meta.get("novel_classes_created", meta.get("class_count", 0)),
                 }
 
+    ordered = sorted(ds_set)
+    if start_key:
+        ordered = [ds_id for ds_id in ordered if ds_id > start_key["SK"]]
+    page = [ds_set[ds_id] for ds_id in ordered[:max_results]]
+    next_key = {"PK": namespace, "SK": page[-1]["datasourceId"]} if len(ordered) > max_results else None
+
     # Resolve source names from the sources table
     sources_table = os.environ.get("SOURCES_TABLE", "")
-    if sources_table and ds_set:
+    if sources_table and page:
         table = boto3.resource("dynamodb", region_name=os.environ.get("AWS_REGION", "us-east-1")).Table(sources_table)
-        for ds_id, entry in ds_set.items():
+        for entry in page:
+            ds_id = entry["datasourceId"]
             try:
                 resp = table.get_item(Key={"PK": f"NS#{namespace}", "SK": f"SRC#{ds_id}"})
                 item = resp.get("Item")
@@ -1803,4 +1872,4 @@ def list_induced_datasources(namespace: str):
             except Exception:
                 pass  # fall back to showing UUID
 
-    return list(ds_set.values())
+    return page_body("datasources", page, next_key, scope=scope)
