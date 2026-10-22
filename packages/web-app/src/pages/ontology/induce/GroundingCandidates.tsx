@@ -29,6 +29,7 @@ import {
   localName,
   ontologyLabel,
 } from "./grounding";
+import { useAppI18n } from "../../../i18n/LocaleProvider";
 
 /** Numeric score for a candidate: fused score when present, else lexical. */
 function candidateScore(candidate: MatchCandidate): number {
@@ -87,6 +88,7 @@ export function GroundingCandidates({
   onSelectCandidate,
   onMarkNovel,
 }: Props) {
+  const { t } = useAppI18n();
   const candidates = match.candidates ?? [];
   const matchKey = conceptMatchKey(match);
   // Optimistic chosen URI: a staged (unsaved) override wins over the persisted
@@ -119,62 +121,66 @@ export function GroundingCandidates({
       {/* Status line — current grounding state, unsaved indicator. */}
       {isSuggested && chosenUri ? (
         <StatusIndicator type={hasPending ? "pending" : "warning"}>
-          Ambiguous match to <strong>{localName(chosenUri)}</strong>
-          {hasPending && " (unsaved — click Save changes to apply)"}
+          {t("Ambiguous match to {name}", { name: localName(chosenUri) })}
+          {hasPending && t(" (unsaved — click Save changes to apply)")}
           {match.matched_ontology_id && !hasPending && (
             <>
-              {" "}
-              from <strong>{ontologyLabel(match.matched_ontology_id)}</strong>
+              {t(" from {ontology}", {
+                ontology: ontologyLabel(match.matched_ontology_id),
+              })}
             </>
           )}
           <Box variant="small" display="inline" color="text-status-inactive">
-            {" "}
-            — low confidence, review before accepting
+            {t(" — low confidence, review before accepting")}
           </Box>
         </StatusIndicator>
       ) : chosenUri ? (
         <StatusIndicator type={hasPending ? "pending" : "success"}>
-          Grounded to <strong>{localName(chosenUri)}</strong>
-          {hasPending && " (unsaved — click Save changes to apply)"}
+          {t("Grounded to {name}", { name: localName(chosenUri) })}
+          {hasPending && t(" (unsaved — click Save changes to apply)")}
           {match.matched_ontology_id && !hasPending && (
             <>
-              {" "}
-              from <strong>{ontologyLabel(match.matched_ontology_id)}</strong>
+              {t(" from {ontology}", {
+                ontology: ontologyLabel(match.matched_ontology_id),
+              })}
             </>
           )}
           {isExactName && !hasPending && (
             <Box variant="small" display="inline" color="text-status-inactive">
-              {" "}
-              — exact name identity
+              {t(" — exact name identity")}
             </Box>
           )}
         </StatusIndicator>
       ) : stagedNovel ? (
         <StatusIndicator type="pending">
-          Kept novel (unsaved — click Save changes to apply)
+          {t("Kept novel (unsaved — click Save changes to apply)")}
         </StatusIndicator>
       ) : isSuggested ? (
         <StatusIndicator type="warning">
-          No confident match — {candidates.length} suggestion
-          {candidates.length !== 1 ? "s" : ""} below
+          {t(
+            candidates.length === 1
+              ? "No confident match — {count} suggestion below"
+              : "No confident match — {count} suggestions below",
+            { count: candidates.length },
+          )}
         </StatusIndicator>
       ) : (
         <StatusIndicator type="stopped">
-          Novel concept — no foundational match
+          {t("Novel concept — no foundational match")}
         </StatusIndicator>
       )}
 
       {match.reason && (
         <Box variant="small" color="text-status-inactive">
-          <em>Reasoning: {match.reason}</em>
+          <em>{t("Reasoning: {reason}", { reason: match.reason })}</em>
         </Box>
       )}
 
       {isExactName && candidates.length > 0 && (
         <Box variant="small" color="text-status-inactive">
-          Scores below are embedding similarity (semantic closeness of the table
-          description to each class definition). The match above was decided by
-          name identity, not embedding score.
+          {t(
+            "Scores below are embedding similarity (semantic closeness of the table description to each class definition). The match above was decided by name identity, not embedding score.",
+          )}
         </Box>
       )}
 
@@ -197,14 +203,14 @@ export function GroundingCandidates({
             : undefined
         }
         ariaLabels={{
-          selectionGroupLabel: "Grounding candidate",
+          selectionGroupLabel: t("Grounding candidate"),
           itemSelectionLabel: (_data, row) =>
-            `Ground to ${localName(row.entity_uri)}`,
+            t("Ground to {name}", { name: localName(row.entity_uri) }),
         }}
         columnDefinitions={[
           {
             id: "candidate",
-            header: "Candidate class",
+            header: t("Candidate class"),
             isRowHeader: true,
             sortingComparator: (a, b) =>
               localName(a.entity_uri).localeCompare(localName(b.entity_uri)),
@@ -216,7 +222,7 @@ export function GroundingCandidates({
           },
           {
             id: "ontology",
-            header: "Ontology",
+            header: t("Ontology"),
             sortingComparator: (a, b) =>
               (ontologyLabel(a.ontology_id) ?? "").localeCompare(
                 ontologyLabel(b.ontology_id) ?? "",
@@ -234,19 +240,21 @@ export function GroundingCandidates({
                 size="xxs"
                 alignItems="center"
               >
-                <span>Score</span>
+                <span>{t("Score")}</span>
                 <InfoPopover
-                  header="Match confidence"
-                  ariaLabel="About the match confidence score"
+                  header={t("Match confidence")}
+                  ariaLabel={t("About the match confidence score")}
                 >
                   <SpaceBetween size="xs">
                     <Box variant="p">
-                      How closely the table matches each candidate class, from 0
-                      to 1 (higher is stronger).
+                      {t(
+                        "How closely the table matches each candidate class, from 0 to 1 (higher is stronger).",
+                      )}
                     </Box>
                     <Box variant="p">
-                      Enhanced mode blends embedding similarity with LLM
-                      confidence; Standard mode uses similarity alone.
+                      {t(
+                        "Enhanced mode blends embedding similarity with LLM confidence; Standard mode uses similarity alone.",
+                      )}
                     </Box>
                   </SpaceBetween>
                 </InfoPopover>
@@ -263,7 +271,7 @@ export function GroundingCandidates({
         ]}
         empty={
           <Box color="text-body-secondary">
-            No foundational grounding candidates.
+            {t("No foundational grounding candidates.")}
           </Box>
         }
       />
@@ -272,11 +280,13 @@ export function GroundingCandidates({
           when editing is possible and the class is not already staged-novel. */}
       {editable && onMarkNovel && !stagedNovel && (
         <ButtonWithHint
-          hint="Clears grounding so this class becomes a new concept with no foundational link. Use when no candidate is a real match. Staged until you Save changes."
+          hint={t(
+            "Clears grounding so this class becomes a new concept with no foundational link. Use when no candidate is a real match. Staged until you Save changes.",
+          )}
           variant="inline-link"
           onClick={() => onMarkNovel(matchKey)}
         >
-          Mark novel (no grounding)
+          {t("Mark novel (no grounding)")}
         </ButtonWithHint>
       )}
     </SpaceBetween>

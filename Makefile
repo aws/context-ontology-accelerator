@@ -117,20 +117,22 @@ deploy-example-connector:
 deploy-databricks-connector:
 	./scripts/deploy-managed-databricks-connector.sh dev
 
-## Tear down all dev stacks in one command. Deletes AgentCore Runtimes,
-## waits for their ENIs to detach (and stops if they do not),
-## deletes VKG's ECS services, force-deletes the DataZone domain (cascades
-## to RETAINed child resources CFN can't clear on its own), deletes every connector
-## stack (separate CDK apps, so `cdk destroy --all` never sees them), then runs
-## `cdk destroy --all` and verifies no stacks remain (see #660, #661, #707).
-## Optional env vars: SCL_PREFIX (default: coa — matches the CDK app), SCL_DESTROY_YES=1 to skip
-## the confirmation prompt (e.g. in CI), and the wait budgets
-## SCL_ENI_WAIT_MAX_SECONDS (600), SCL_ECS_WAIT_MAX_SECONDS (300),
+## Tear down all dev stacks. Deletes AgentCore Runtimes, deletes VKG's ECS services and
+## Cloud Map services, force-deletes the DataZone domain (cascades to RETAINed child
+## resources CFN can't clear on its own), deletes every connector stack (separate CDK apps),
+## runs `cdk destroy` on every stack but network (re-running it past a runtime security group
+## AgentCore's ENIs still hold and a refilled access-log bucket), then finishes the network
+## stack. AgentCore releases its ENIs up to 8 h after the Runtimes
+## are deleted; until then the VPC, its subnets and two security groups stay,
+## and scripts/destroy.sh exits 3 (make reports it as 2) — re-run it later.
+## Optional env vars: SCL_PREFIX (default: coa — matches the CDK app), SCL_DESTROY_YES=1 to
+## skip the confirmation prompt (e.g. in CI), SCL_DESTROY_CONCURRENCY (4), and the wait
+## budgets SCL_ENI_WAIT_MAX_SECONDS (0), SCL_ECS_WAIT_MAX_SECONDS (300),
 ## SCL_DOMAIN_WAIT_MAX_SECONDS (300), SCL_CLOUDMAP_WAIT_MAX_SECONDS (180),
 ## SCL_CONNECTOR_DELETE_WAIT_MAX_SECONDS (1800).
 destroy-dev:
 	make generate
-	pnpm install
+	pnpm install --frozen-lockfile
 	./scripts/destroy.sh dev
 
 docs:
@@ -138,7 +140,7 @@ docs:
 	else echo "⚠ docs/ not available (stripped from public mirror); see external-docs/"; fi
 
 web-dev:
-	cd packages/web-app && pnpm install && pnpm dev
+	cd packages/web-app && pnpm install --frozen-lockfile && pnpm dev
 
 vkg-dev:
 	docker build -t vkg-local packages/vkg/

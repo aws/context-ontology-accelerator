@@ -5,6 +5,7 @@ import React, { useRef, useCallback } from "react";
 import { Box, Container, SpaceBetween } from "@cloudscape-design/components";
 import { ChatInput } from "../ChatInput";
 import { findScrollParent } from "@utils/scroll";
+import { useAppI18n } from "../../../i18n/LocaleProvider";
 
 export interface ChatContainerProps {
   children: React.ReactNode;
@@ -30,6 +31,7 @@ export const ChatContainer: React.FC<ChatContainerProps> = ({
   placeholder,
   emptyStateContent,
 }) => {
+  const { t } = useAppI18n();
   const observerRef = useRef<MutationObserver | null>(null);
   const rafRef = useRef<number | null>(null);
 
@@ -109,7 +111,7 @@ export const ChatContainer: React.FC<ChatContainerProps> = ({
       {isEmpty ? (
         (emptyStateContent ?? (
           <Box textAlign="center" color="text-body-secondary" padding="xl">
-            Ask a question against the governed surface...
+            {t("Ask a question against the governed surface...")}
           </Box>
         ))
       ) : (

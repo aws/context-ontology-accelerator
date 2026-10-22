@@ -87,6 +87,12 @@ fi
 # ── CDK Deploy ───────────────────────────────────────────────────────────────
 
 echo ""
+echo "--- Installing locked Node dependencies ---"
+# Same reason as scripts/deploy.sh: install what pnpm-lock.yaml pins, without
+# rewriting it, before pnpm 11+ would run a plain install on its own.
+pnpm install --frozen-lockfile
+
+echo ""
 echo "--- Deploying CDK stack ---"
 
 CONTEXT="--context env=${ENV} --context context_manager_image_uri=${IMAGE_FULL}"

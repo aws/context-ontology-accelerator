@@ -7,9 +7,14 @@ from __future__ import annotations
 
 import boto3
 import pytest
+from coa_common import __version__
 from coa_common.aws_user_agent import USER_AGENT_EXTRA, install_user_agent
 
 pytestmark = pytest.mark.unit
+
+
+def test_token_is_the_aws_solutions_format():
+    assert f"AWSSOLUTION/SO0376/v{__version__}" == USER_AGENT_EXTRA
 
 
 def test_default_session_client_carries_tag():

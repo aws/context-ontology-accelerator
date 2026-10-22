@@ -3,6 +3,7 @@
 
 import React from "react";
 import { Button, StatusIndicator } from "@cloudscape-design/components";
+import { useAppI18n } from "../../i18n/LocaleProvider";
 import "./chat.css";
 
 interface ChatErrorBoundaryProps {
@@ -13,6 +14,27 @@ interface ChatErrorBoundaryProps {
 
 interface ChatErrorBoundaryState {
   hasError: boolean;
+}
+
+function ChatErrorFallback({
+  onRetry,
+}: {
+  onRetry?: () => void;
+}): React.ReactElement {
+  const { t } = useAppI18n();
+
+  return (
+    <div className="chat-error-fallback">
+      <StatusIndicator type="error">
+        {t("Failed to render response")}
+      </StatusIndicator>
+      {onRetry && (
+        <Button variant="inline-link" onClick={onRetry}>
+          {t("Retry")}
+        </Button>
+      )}
+    </div>
+  );
 }
 
 /**
@@ -48,16 +70,9 @@ export class ChatErrorBoundary extends React.Component<
   render(): React.ReactNode {
     if (this.state.hasError) {
       return (
-        <div className="chat-error-fallback">
-          <StatusIndicator type="error">
-            Failed to render response
-          </StatusIndicator>
-          {this.props.onRetry && (
-            <Button variant="inline-link" onClick={this.handleRetry}>
-              Retry
-            </Button>
-          )}
-        </div>
+        <ChatErrorFallback
+          onRetry={this.props.onRetry ? this.handleRetry : undefined}
+        />
       );
     }
 

@@ -3,7 +3,7 @@
 
 """AWS SDK User-Agent tagging for usage attribution.
 
-Appends a globally-unique solution identifier to the User-Agent header of every
+Appends the AWS Solutions token (``AWSSOLUTION/SO0376/v<version>``) to the User-Agent header of every
 boto3/botocore AWS API call so AWS usage can be attributed to this solution.
 
 The tag is injected once at the botocore *session* layer via a small,
@@ -23,7 +23,9 @@ import boto3
 from coa_common import __version__
 from coa_common.aws_config import apply_default_client_config
 
-USER_AGENT_EXTRA = f"AwsSolutions/context-ontology-accelerator-31415926_{__version__}"
+# AWS Solutions usage-metrics token: AWSSOLUTION/<solution id>/v<version>.
+SOLUTION_ID = "SO0376"
+USER_AGENT_EXTRA = f"AWSSOLUTION/{SOLUTION_ID}/v{__version__}"
 
 _installed = False
 

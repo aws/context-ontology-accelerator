@@ -3,6 +3,8 @@
 
 import React, { useCallback, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
+import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
+import { useNamespace } from "@api-hooks/use-namespace";
 import Alert from "@cloudscape-design/components/alert";
 import AttributeEditor from "@cloudscape-design/components/attribute-editor";
 import Badge from "@cloudscape-design/components/badge";
@@ -52,6 +54,8 @@ import type {
 } from "@coa/control-plane-client";
 import { extractErrorMessage, runSequential } from "@utils";
 import { InfoPopover } from "@components/InfoPopover";
+import { useAppI18n, type AppTranslate } from "../i18n/LocaleProvider";
+import type { AppMessage } from "../i18n/appMessages";
 
 // --- Constants ---
 
@@ -63,28 +67,21 @@ const REVIEW_STATUS_TYPE: Record<string, "success" | "warning" | "error"> = {
   [ReviewStatus.REJECTED]: "error",
 };
 
-const REVIEW_FILTER_OPTIONS: SelectProps.Option[] = [
-  { value: "all", label: "All statuses" },
-  { value: ReviewStatus.PENDING_REVIEW, label: "Pending review" },
-  { value: ReviewStatus.APPROVED, label: "Approved" },
-  { value: ReviewStatus.REJECTED, label: "Rejected" },
-];
-
 // --- Helpers ---
 
 function getColumnStatus(col: ColumnMetadata): string {
   return col.businessMetadata?.reviewStatus ?? ReviewStatus.PENDING_REVIEW;
 }
 
-function statusCell(col: ColumnMetadata) {
+function statusCell(col: ColumnMetadata, t: AppTranslate) {
   const s = getColumnStatus(col);
   return (
     <StatusIndicator type={REVIEW_STATUS_TYPE[s] ?? "info"}>
       {s === ReviewStatus.PENDING_REVIEW
-        ? "Pending review"
+        ? t("Pending review")
         : s === ReviewStatus.APPROVED
-          ? "Approved"
-          : "Rejected"}
+          ? t("Approved")
+          : t("Rejected")}
     </StatusIndicator>
   );
 }
@@ -110,7 +107,7 @@ function sourceBadge(source?: string) {
  * record (source catalog, 3rd-party catalog, or a human steward) rather than
  * AI inference. Mirrors `_PROTECTED_DESCRIPTION_SOURCES` in
  * `table_enricher.py`. */
-const DESCRIPTION_SOURCE_LABEL: Record<string, string> = {
+const DESCRIPTION_SOURCE_LABEL: Record<string, AppMessage> = {
   DETERMINISTIC: "Source catalog",
   CATALOG_EXISTING: "3rd-party catalog",
   STEWARD_EDITED: "Steward-edited",
@@ -141,12 +138,14 @@ function descriptionSourceBadge(
       }
     | undefined,
   metadataEnrichmentEnabled: boolean,
+  t: AppTranslate,
 ) {
   const source = meta?.enrichmentSource;
   if (!source) return <>—</>;
+  const label = DESCRIPTION_SOURCE_LABEL[source];
   return (
     <SpaceBetween direction="horizontal" size="xxs" alignItems="center">
-      <Badge color="blue">{DESCRIPTION_SOURCE_LABEL[source] ?? source}</Badge>
+      <Badge color="blue">{label ? t(label) : source}</Badge>
       {hasPossiblyAiEnrichedFields(meta, metadataEnrichmentEnabled) && (
         <AiEnrichedHint />
       )}
@@ -192,14 +191,21 @@ function hasPossiblyAiEnrichedFields(
  * distinct from the tag/synonym/glossary Badges, so it doesn't read as just
  * another generated tag. */
 function AiEnrichedHint() {
+  const { t } = useAppI18n();
   return (
     <Popover
       triggerType="custom"
       size="small"
       dismissButton={false}
-      content="This description came from a non-AI source, but tags, synonyms, and glossary terms may still be AI-generated."
+      content={t(
+        "This description came from a non-AI source, but tags, synonyms, and glossary terms may still be AI-generated.",
+      )}
     >
-      <Icon name="status-info" variant="subtle" ariaLabel="AI-enriched hint" />
+      <Icon
+        name="status-info"
+        variant="subtle"
+        ariaLabel={t("AI-enriched hint")}
+      />
     </Popover>
   );
 }
@@ -236,61 +242,21 @@ function ReviewNote({ note }: { note: string }) {
   );
 }
 
-const FK_COLUMN_DEFS: TableProps.ColumnDefinition<ForeignKeyOutput>[] = [
-  {
-    id: "column",
-    header: "Column",
-    isRowHeader: true,
-    cell: (fk) => <Box fontWeight="bold">{fk.column ?? "—"}</Box>,
-  },
-  {
-    id: "references",
-    header: "References",
-    cell: (fk) =>
-      fk.targetColumn
-        ? `${fk.targetTable ?? ""}.${fk.targetColumn}`
-        : (fk.targetTable ?? "—"),
-  },
-  { id: "source", header: "Source", cell: (fk) => sourceBadge(fk.source) },
-  {
-    id: "review",
-    header: "Review",
-    // Inferred relationships (#1088) carry a review state; authoritative keys
-    // (deterministic/steward) do not and render "—". Cross-source relationships
-    // also show a chip and their inference provenance so a steward can judge.
-    cell: (fk) => {
-      if (fk.source !== "AI_INFERRED" || !fk.reviewStatus) return "—";
-      const type = REVIEW_STATUS_TYPE[fk.reviewStatus] ?? "warning";
-      return (
-        <SpaceBetween size="xxs">
-          <StatusIndicator type={type}>{fk.reviewStatus}</StatusIndicator>
-          {fk.targetDatasourceId ? (
-            <Badge color="blue">cross-source</Badge>
-          ) : null}
-          {fk.provenance ? <ReviewNote note={fk.provenance} /> : null}
-        </SpaceBetween>
-      );
-    },
-  },
-  {
-    id: "confidence",
-    header: "Confidence",
-    cell: (fk) => confidenceCell(fk.confidence),
-  },
-];
-
 // --- Re-scan diff (old vs new) ---
 
 /** Badge text + colour for a re-scan column change status. Added is additive
  * (green), removed is destructive (red), a modified column is a neutral change
  * (blue). Defaults to "Changed" for any unexpected status. */
-function rescanColumnBadge(status: string): {
+function rescanColumnBadge(
+  status: string,
+  t: AppTranslate,
+): {
   text: string;
   color: NonNullable<BadgeProps["color"]>;
 } {
-  if (status === "added") return { text: "Added", color: "green" };
-  if (status === "removed") return { text: "Removed", color: "red" };
-  return { text: "Changed", color: "blue" };
+  if (status === "added") return { text: t("Added"), color: "green" };
+  if (status === "removed") return { text: t("Removed"), color: "red" };
+  return { text: t("Changed"), color: "blue" };
 }
 
 /** Display a re-scan field value; empty/absent renders as an em dash so an
@@ -327,8 +293,8 @@ function rescanFieldChangeList(fields: RescanFieldChange[]) {
 /** One column's re-scan change for the summary Alert: the column name + an
  * Added/Removed/Changed badge, and — for a modified column — its changed fields
  * listed (indented) as old → new. */
-function rescanColumnChangeRow(change: RescanColumnChange) {
-  const { text, color } = rescanColumnBadge(change.status ?? "modified");
+function rescanColumnChangeRow(change: RescanColumnChange, t: AppTranslate) {
+  const { text, color } = rescanColumnBadge(change.status ?? "modified", t);
   const fields = change.fields ?? [];
   return (
     <SpaceBetween size="xxs">
@@ -351,45 +317,57 @@ function rescanColumnChangeRow(change: RescanColumnChange) {
  * old → new. The same per-column detail is also reachable inline on each column
  * row in the Columns table below (via the info icon next to its badge). */
 function RescanChangesPanel({ diff }: { diff: RescanTableDiff }) {
+  const { t } = useAppI18n();
   const tableFields = diff.tableFields ?? [];
   const columns = diff.columns ?? [];
   // Foldable so a table with many changed columns doesn't produce a huge panel
   // on larger graphs. Collapsed still shows the counts, so the steward sees the
   // magnitude at a glance; expand for the old → new detail.
-  const countLabel =
-    `${tableFields.length} table-level change${tableFields.length === 1 ? "" : "s"}, ` +
-    `${columns.length} column change${columns.length === 1 ? "" : "s"}`;
+  const tableCount = t(
+    tableFields.length === 1
+      ? "{count} table-level change"
+      : "{count} table-level changes",
+    { count: tableFields.length },
+  );
+  const columnCount = t(
+    columns.length === 1 ? "{count} column change" : "{count} column changes",
+    { count: columns.length },
+  );
+  const countLabel = t("{tableCount}, {columnCount}", {
+    tableCount,
+    columnCount,
+  });
   return (
-    <Alert type="info" header="Changes since last approved scan">
+    <Alert type="info" header={t("Changes since last approved scan")}>
       <ExpandableSection variant="footer" headerText={countLabel}>
         <SpaceBetween size="m">
           <div>
             <Box variant="small" fontWeight="bold">
-              Table-level changes
+              {t("Table-level changes")}
             </Box>
             {tableFields.length > 0 ? (
               rescanFieldChangeList(tableFields)
             ) : (
               <Box variant="small" color="text-status-inactive">
-                None
+                {t("None")}
               </Box>
             )}
           </div>
           <div>
             <Box variant="small" fontWeight="bold">
-              Column changes
+              {t("Column changes")}
             </Box>
             {columns.length > 0 ? (
               <SpaceBetween size="xs">
                 {columns.map((cc, i) => (
                   <div key={`${cc.name ?? "col"}-${i}`}>
-                    {rescanColumnChangeRow(cc)}
+                    {rescanColumnChangeRow(cc, t)}
                   </div>
                 ))}
               </SpaceBetween>
             ) : (
               <Box variant="small" color="text-status-inactive">
-                None
+                {t("None")}
               </Box>
             )}
           </div>
@@ -403,11 +381,12 @@ function RescanChangesPanel({ diff }: { diff: RescanTableDiff }) {
  * for the first time (`added`): it has no old-vs-new diff — the whole table is
  * new — so we say so instead of showing an empty changes panel. */
 function NewTablePanel() {
+  const { t } = useAppI18n();
   return (
-    <Alert type="info" header="New table">
-      This table was discovered during the latest re-scan and did not exist in
-      the last approved scan. There is no before/after to compare — review its
-      generated metadata below and approve to add it.
+    <Alert type="info" header={t("New table")}>
+      {t(
+        "This table was discovered during the latest re-scan and did not exist in the last approved scan. There is no before/after to compare — review its generated metadata below and approve to add it.",
+      )}
     </Alert>
   );
 }
@@ -416,12 +395,12 @@ function NewTablePanel() {
  * gone from the source (`pendingDeletion`): it is dropped and will be deleted
  * when the re-scan is approved, unless the steward keeps it. */
 function DroppedTablePanel() {
+  const { t } = useAppI18n();
   return (
-    <Alert type="warning" header="Dropped table">
-      This table was not found in the source during the latest re-scan. It will
-      be deleted when you approve the re-scan — use "Keep table" above to retain
-      it if the source removal was unintended (e.g. a partial scan or a changed
-      filter).
+    <Alert type="warning" header={t("Dropped table")}>
+      {t(
+        'This table was not found in the source during the latest re-scan. It will be deleted when you approve the re-scan — use "Keep table" above to retain it if the source removal was unintended (e.g. a partial scan or a changed filter).',
+      )}
     </Alert>
   );
 }
@@ -431,8 +410,8 @@ function DroppedTablePanel() {
  * listing each changed field as old → new — the icon is the discoverable
  * trigger (matching the `InfoPopover` pattern used across the app), since a
  * plain badge gives no signal that it is interactive. */
-function rescanColumnChangeCell(change: RescanColumnChange) {
-  const { text, color } = rescanColumnBadge(change.status ?? "modified");
+function rescanColumnChangeCell(change: RescanColumnChange, t: AppTranslate) {
+  const { text, color } = rescanColumnBadge(change.status ?? "modified", t);
   const fields = change.fields ?? [];
   const badge = <Badge color={color}>{text}</Badge>;
   if (change.status === "modified" && fields.length > 0) {
@@ -440,8 +419,8 @@ function rescanColumnChangeCell(change: RescanColumnChange) {
       <SpaceBetween direction="horizontal" size="xxs" alignItems="center">
         {badge}
         <InfoPopover
-          header="Changes since last approved scan"
-          ariaLabel="Column changes since last approved scan"
+          header={t("Changes since last approved scan")}
+          ariaLabel={t("Column changes since last approved scan")}
         >
           {rescanFieldChangeList(fields)}
         </InfoPopover>
@@ -454,6 +433,7 @@ function rescanColumnChangeCell(change: RescanColumnChange) {
 // --- Component ---
 
 export const TableDetail: React.FC = () => {
+  const { t } = useAppI18n();
   const navigate = useNavigate();
   const { namespaceId, dataSourceId, tableId } = useParams<{
     namespaceId: string;
@@ -504,13 +484,31 @@ export const TableDetail: React.FC = () => {
   const [flash, setFlash] = useState<
     { id: string; type: "success" | "error"; content: string }[]
   >([]);
-  const [statusFilter, setStatusFilter] = useState<SelectProps.Option>(
-    REVIEW_FILTER_OPTIONS[0]!,
-  );
+  const [statusFilter, setStatusFilter] = useState("all");
   const [editing, setEditing] = useState<ColumnMetadata | null>(null);
   const [editingTable, setEditingTable] = useState(false);
   const [editingKeys, setEditingKeys] = useState(false);
   const [bulkLoading, setBulkLoading] = useState(false);
+
+  const { name: nsName } = useNamespace(namespaceId);
+  const sourceName = sourceData?.body?.name ?? dataSourceId ?? "";
+  const tableName = data?.name ?? tableId ?? "";
+  const isEditing = editing !== null || editingTable || editingKeys;
+  useBreadcrumbTrail([
+    { text: nsName, href: `/namespaces/${namespaceId}`, namespaceId },
+    {
+      text: t("Sources"),
+      href: `/namespaces/${namespaceId}/sources`,
+      namespaceId,
+    },
+    {
+      text: sourceName,
+      href: `/namespaces/${namespaceId}/sources/${dataSourceId}`,
+      namespaceId,
+    },
+    { text: tableName },
+    ...(isEditing ? [{ text: t("Edit") }] : []),
+  ]);
 
   // Re-scan review: keep (decline) a table or column the re-scan flagged for
   // deletion, so approving the re-scan no longer removes it.
@@ -534,7 +532,10 @@ export const TableDetail: React.FC = () => {
               {
                 id: String(Date.now()),
                 type: "success",
-                content: `Keeping column "${columnName}". Approving the re-scan will no longer drop it.`,
+                content: t(
+                  'Keeping column "{name}". Approving the re-scan will no longer drop it.',
+                  { name: columnName },
+                ),
               },
             ]),
           onError: (e) =>
@@ -546,7 +547,7 @@ export const TableDetail: React.FC = () => {
         },
       );
     },
-    [keepMutate, tableId],
+    [keepMutate, tableId, t],
   );
   const handleKeepTable = () => {
     setKeepingTable(true);
@@ -559,8 +560,9 @@ export const TableDetail: React.FC = () => {
             {
               id: String(Date.now()),
               type: "success",
-              content:
+              content: t(
                 "Keeping this table. Approving the re-scan will no longer delete it.",
+              ),
             },
           ]),
         onError: (e) =>
@@ -576,9 +578,74 @@ export const TableDetail: React.FC = () => {
   // Filter columns by review status
   const filteredColumns = useMemo(() => {
     const cols = data?.columns ?? [];
-    if (!statusFilter.value || statusFilter.value === "all") return cols;
-    return cols.filter((c) => getColumnStatus(c) === statusFilter.value);
+    if (statusFilter === "all") return cols;
+    return cols.filter((c) => getColumnStatus(c) === statusFilter);
   }, [data?.columns, statusFilter]);
+
+  const reviewFilterOptions = useMemo<SelectProps.Option[]>(
+    () => [
+      { value: "all", label: t("All statuses") },
+      {
+        value: ReviewStatus.PENDING_REVIEW,
+        label: t("Pending review"),
+      },
+      { value: ReviewStatus.APPROVED, label: t("Approved") },
+      { value: ReviewStatus.REJECTED, label: t("Rejected") },
+    ],
+    [t],
+  );
+
+  const foreignKeyColumnDefs = useMemo<
+    TableProps.ColumnDefinition<ForeignKeyOutput>[]
+  >(
+    () => [
+      {
+        id: "column",
+        header: t("Column"),
+        isRowHeader: true,
+        cell: (fk) => <Box fontWeight="bold">{fk.column ?? "—"}</Box>,
+      },
+      {
+        id: "references",
+        header: t("References"),
+        cell: (fk) =>
+          fk.targetColumn
+            ? `${fk.targetTable ?? ""}.${fk.targetColumn}`
+            : (fk.targetTable ?? "—"),
+      },
+      {
+        id: "source",
+        header: t("Source"),
+        cell: (fk) => sourceBadge(fk.source),
+      },
+      {
+        id: "review",
+        header: t("Review"),
+        // Inferred relationships (#1088) carry a review state; authoritative keys
+        // (deterministic/steward) do not and render "—". Cross-source relationships
+        // also show a chip and their inference provenance so a steward can judge.
+        cell: (fk) => {
+          if (fk.source !== "AI_INFERRED" || !fk.reviewStatus) return "—";
+          const type = REVIEW_STATUS_TYPE[fk.reviewStatus] ?? "warning";
+          return (
+            <SpaceBetween size="xxs">
+              <StatusIndicator type={type}>{fk.reviewStatus}</StatusIndicator>
+              {fk.targetDatasourceId ? (
+                <Badge color="blue">{t("cross-source")}</Badge>
+              ) : null}
+              {fk.provenance ? <ReviewNote note={fk.provenance} /> : null}
+            </SpaceBetween>
+          );
+        },
+      },
+      {
+        id: "confidence",
+        header: t("Confidence"),
+        cell: (fk) => confidenceCell(fk.confidence),
+      },
+    ],
+    [t],
+  );
 
   // Re-scan review: per-column change breakdown keyed by column name, so each
   // row can show an Added/Removed/Changed badge (and, for a modified column,
@@ -596,26 +663,26 @@ export const TableDetail: React.FC = () => {
     () => [
       {
         id: "name",
-        header: "Column",
+        header: t("Column"),
         sortingField: "name",
         isRowHeader: true,
         cell: (col) => <Box fontWeight="bold">{col.name}</Box>,
       },
       {
         id: "dataType",
-        header: "Data type",
+        header: t("Data type"),
         sortingField: "dataType",
         cell: (col) => <Box variant="code">{col.dataType}</Box>,
       },
       {
         id: "description",
-        header: "Description",
+        header: t("Description"),
         cell: (col) => col.businessMetadata?.description ?? "—",
         minWidth: 200,
       },
       {
         id: "synonyms",
-        header: "Synonyms",
+        header: t("Synonyms"),
         cell: (col) => {
           const syns = col.businessMetadata?.synonyms;
           return syns && syns.length > 0 ? syns.join(", ") : "—";
@@ -623,7 +690,7 @@ export const TableDetail: React.FC = () => {
       },
       {
         id: "glossaryTerms",
-        header: "Glossary",
+        header: t("Glossary"),
         cell: (col) => {
           const terms = col.businessMetadata?.glossaryTerms;
           if (!terms || terms.length === 0) return "—";
@@ -638,7 +705,7 @@ export const TableDetail: React.FC = () => {
       },
       {
         id: "tags",
-        header: "Tags",
+        header: t("Tags"),
         cell: (col) => {
           const tags = col.businessMetadata?.tags;
           if (!tags || tags.length === 0) return "—";
@@ -655,7 +722,7 @@ export const TableDetail: React.FC = () => {
       },
       {
         id: "distinctValues",
-        header: "Sample values",
+        header: t("Sample values"),
         cell: (col) => {
           const vals = col.distinctValues;
           if (!vals || vals.length === 0) return "—";
@@ -672,26 +739,27 @@ export const TableDetail: React.FC = () => {
       },
       {
         id: "nullable",
-        header: "Nullable",
-        cell: (col) => (col.nullable ? "Yes" : "No"),
+        header: t("Nullable"),
+        cell: (col) => (col.nullable ? t("Yes") : t("No")),
       },
       {
         id: "enrichmentSource",
-        header: "Description source",
+        header: t("Description source"),
         cell: (col) =>
           descriptionSourceBadge(
             col.businessMetadata,
             metadataEnrichmentEnabled,
+            t,
           ),
       },
       {
         id: "confidence",
-        header: "Confidence",
+        header: t("Confidence"),
         cell: (col) => confidenceCell(col.businessMetadata?.confidence),
       },
       {
         id: "status",
-        header: "Review status",
+        header: t("Review status"),
         sortingComparator: (a, b) =>
           getColumnStatus(a).localeCompare(getColumnStatus(b)),
         cell: (col) => {
@@ -708,22 +776,22 @@ export const TableDetail: React.FC = () => {
             !(rescanChange.status === "removed" && col.pendingDeletion);
           return (
             <SpaceBetween size="xxs">
-              {statusCell(col)}
-              {showRescanChange && rescanColumnChangeCell(rescanChange)}
+              {statusCell(col, t)}
+              {showRescanChange && rescanColumnChangeCell(rescanChange, t)}
               {col.pendingDeletion && (
                 <SpaceBetween
                   direction="horizontal"
                   size="xs"
                   alignItems="center"
                 >
-                  <Badge color="red">Pending deletion</Badge>
+                  <Badge color="red">{t("Pending deletion")}</Badge>
                   <Button
                     variant="inline-link"
                     loading={keepingColumn === col.name}
                     disabled={keepPending}
                     onClick={() => handleKeepColumn(col.name ?? "")}
                   >
-                    Keep
+                    {t("Keep")}
                   </Button>
                 </SpaceBetween>
               )}
@@ -738,6 +806,7 @@ export const TableDetail: React.FC = () => {
       keepPending,
       handleKeepColumn,
       rescanColumnChanges,
+      t,
     ],
   );
 
@@ -746,12 +815,12 @@ export const TableDetail: React.FC = () => {
       filtering: {
         empty: (
           <Box textAlign="center" color="text-status-inactive" padding="l">
-            No columns found.
+            {t("No columns found.")}
           </Box>
         ),
         noMatch: (
           <Box textAlign="center" color="text-status-inactive" padding="l">
-            No columns match the filter.
+            {t("No columns match the filter.")}
           </Box>
         ),
       },
@@ -770,7 +839,7 @@ export const TableDetail: React.FC = () => {
 
   if (error) {
     return (
-      <Alert type="error" header="Failed to load table">
+      <Alert type="error" header={t("Failed to load table")}>
         {error.message}
       </Alert>
     );
@@ -814,14 +883,35 @@ export const TableDetail: React.FC = () => {
       setBulkLoading(false);
     }
 
-    const verb = decision === ReviewDecision.APPROVED ? "Approved" : "Rejected";
+    const approved = decision === ReviewDecision.APPROVED;
     if (failed.length === 0) {
-      notify("success", `${verb} ${total} column${total === 1 ? "" : "s"}.`);
+      notify(
+        "success",
+        t(
+          approved
+            ? total === 1
+              ? "Approved {count} column."
+              : "Approved {count} columns."
+            : total === 1
+              ? "Rejected {count} column."
+              : "Rejected {count} columns.",
+          { count: total },
+        ),
+      );
     } else {
       const succeeded = total - failed.length;
       notify(
         "error",
-        `${verb} ${succeeded} of ${total} column${total === 1 ? "" : "s"}; ${failed.length} failed.`,
+        t(
+          approved
+            ? total === 1
+              ? "Approved {succeeded} of {total} column; {failed} failed."
+              : "Approved {succeeded} of {total} columns; {failed} failed."
+            : total === 1
+              ? "Rejected {succeeded} of {total} column; {failed} failed."
+              : "Rejected {succeeded} of {total} columns; {failed} failed.",
+          { succeeded, total, failed: failed.length },
+        ),
       );
     }
   }
@@ -832,7 +922,7 @@ export const TableDetail: React.FC = () => {
       await reviewTableMutation.mutateAsync({
         decision: ReviewDecision.APPROVED,
       });
-      notify("success", "Table and all columns approved.");
+      notify("success", t("Table and all columns approved."));
     } catch (e) {
       notify("error", e instanceof Error ? e.message : String(e));
     }
@@ -844,7 +934,7 @@ export const TableDetail: React.FC = () => {
       await reviewTableMutation.mutateAsync({
         decision: ReviewDecision.REJECTED,
       });
-      notify("success", "Table and all columns rejected.");
+      notify("success", t("Table and all columns rejected."));
     } catch (e) {
       notify("error", e instanceof Error ? e.message : String(e));
     }
@@ -861,7 +951,10 @@ export const TableDetail: React.FC = () => {
       { columnName: editing.name!, overrides },
       {
         onSuccess: () => {
-          notify("success", `Updated column "${editing.name}".`);
+          notify(
+            "success",
+            t('Updated column "{name}".', { name: editing.name ?? "" }),
+          );
           setEditing(null);
         },
         onError: (e) => notify("error", e.message),
@@ -880,7 +973,7 @@ export const TableDetail: React.FC = () => {
       { overrides },
       {
         onSuccess: () => {
-          notify("success", "Table metadata updated.");
+          notify("success", t("Table metadata updated."));
           setEditingTable(false);
         },
         onError: (e) => notify("error", e.message),
@@ -899,7 +992,7 @@ export const TableDetail: React.FC = () => {
     if (!tableId) return;
     updateKeysMutation.mutate(payload, {
       onSuccess: () => {
-        notify("success", "Keys & relationships updated.");
+        notify("success", t("Keys & relationships updated."));
         setEditingKeys(false);
       },
     });
@@ -938,10 +1031,10 @@ export const TableDetail: React.FC = () => {
   // Base FK columns plus a per-row Approve/Reject action for pending inferred
   // relationships (authoritative and already-decided keys show no action).
   const fkColumnDefs: TableProps.ColumnDefinition<ForeignKeyOutput>[] = [
-    ...FK_COLUMN_DEFS,
+    ...foreignKeyColumnDefs,
     {
       id: "actions",
-      header: "Actions",
+      header: t("Actions"),
       cell: (fk) =>
         fk.source === "AI_INFERRED" &&
         fk.reviewStatus === ReviewStatus.PENDING_REVIEW ? (
@@ -951,14 +1044,14 @@ export const TableDetail: React.FC = () => {
               loading={updateKeysMutation.isPending}
               onClick={() => reviewRelationship(fk, ReviewStatus.APPROVED)}
             >
-              Approve
+              {t("Approve")}
             </Button>
             <Button
               variant="inline-link"
               disabled={updateKeysMutation.isPending}
               onClick={() => reviewRelationship(fk, ReviewStatus.REJECTED)}
             >
-              Reject
+              {t("Reject")}
             </Button>
           </SpaceBetween>
         ) : null,
@@ -988,16 +1081,16 @@ export const TableDetail: React.FC = () => {
               loading={isFetching}
               onClick={() => refetch()}
             >
-              Refresh
+              {t("Refresh")}
             </Button>
-            <Button onClick={() => navigate(-1)}>Back</Button>
+            <Button onClick={() => navigate(-1)}>{t("Back")}</Button>
             {data.pendingDeletion && (
               <Button
                 loading={keepingTable}
                 disabled={keepPending}
                 onClick={handleKeepTable}
               >
-                Keep table
+                {t("Keep table")}
               </Button>
             )}
             <Button
@@ -1005,7 +1098,7 @@ export const TableDetail: React.FC = () => {
               loading={reviewTableMutation.isPending}
               disabled={tableStatus === ReviewStatus.REJECTED}
             >
-              Reject table &amp; all columns
+              {t("Reject table & all columns")}
             </Button>
             <Button
               variant="primary"
@@ -1013,7 +1106,7 @@ export const TableDetail: React.FC = () => {
               loading={reviewTableMutation.isPending}
               disabled={tableStatus === ReviewStatus.APPROVED}
             >
-              Approve table &amp; all columns
+              {t("Approve table & all columns")}
             </Button>
           </SpaceBetween>
         }
@@ -1033,19 +1126,19 @@ export const TableDetail: React.FC = () => {
           <Header
             variant="h2"
             actions={
-              <Button onClick={() => setEditingTable(true)}>Edit</Button>
+              <Button onClick={() => setEditingTable(true)}>{t("Edit")}</Button>
             }
           >
-            Table metadata
+            {t("Table metadata")}
           </Header>
         }
       >
         <KeyValuePairs
           columns={3}
           items={[
-            { label: "Table ID", value: data.tableId },
+            { label: t("Table ID"), value: data.tableId },
             {
-              label: "Review status",
+              label: t("Review status"),
               value: (
                 <SpaceBetween
                   direction="horizontal"
@@ -1056,41 +1149,45 @@ export const TableDetail: React.FC = () => {
                     type={REVIEW_STATUS_TYPE[tableStatus] ?? "info"}
                   >
                     {tableStatus === ReviewStatus.PENDING_REVIEW
-                      ? "Pending review"
+                      ? t("Pending review")
                       : tableStatus}
                   </StatusIndicator>
                   {data.pendingDeletion && (
-                    <Badge color="red">Pending deletion</Badge>
+                    <Badge color="red">{t("Pending deletion")}</Badge>
                   )}
                 </SpaceBetween>
               ),
             },
             {
-              label: "Description source",
+              label: t("Description source"),
               value: descriptionSourceBadge(
                 data.businessMetadata,
                 metadataEnrichmentEnabled,
+                t,
               ),
             },
             {
-              label: "Description",
+              label: t("Description"),
               value: data.businessMetadata?.description ?? "—",
             },
             {
-              label: "Synonyms",
+              label: t("Synonyms"),
               value: data.businessMetadata?.synonyms?.join(", ") || "—",
             },
             {
-              label: "Tags",
+              label: t("Tags"),
               value: data.businessMetadata?.tags?.join(", ") || "—",
             },
             {
-              label: "Glossary terms",
+              label: t("Glossary terms"),
               value: data.businessMetadata?.glossaryTerms?.join(", ") || "—",
             },
-            { label: "Format", value: data.technicalMetadata?.format || "—" },
             {
-              label: "Location",
+              label: t("Format"),
+              value: data.technicalMetadata?.format || "—",
+            },
+            {
+              label: t("Location"),
               value: data.technicalMetadata?.location || "—",
             },
           ]}
@@ -1109,11 +1206,11 @@ export const TableDetail: React.FC = () => {
                   setEditingKeys(true);
                 }}
               >
-                Edit keys
+                {t("Edit keys")}
               </Button>
             }
           >
-            Keys &amp; relationships
+            {t("Keys & relationships")}
           </Header>
         }
       >
@@ -1122,15 +1219,18 @@ export const TableDetail: React.FC = () => {
             columns={3}
             items={[
               {
-                label: "Primary key",
+                label: t("Primary key"),
                 value:
                   data.primaryKey?.columns && data.primaryKey.columns.length > 0
                     ? data.primaryKey.columns.join(", ")
                     : "—",
               },
-              { label: "Source", value: sourceBadge(data.primaryKey?.source) },
               {
-                label: "Confidence",
+                label: t("Source"),
+                value: sourceBadge(data.primaryKey?.source),
+              },
+              {
+                label: t("Confidence"),
                 value: confidenceCell(data.primaryKey?.confidence),
               },
             ]}
@@ -1145,12 +1245,12 @@ export const TableDetail: React.FC = () => {
                 variant="h3"
                 counter={`(${data.foreignKeys?.length ?? 0})`}
               >
-                Foreign keys &amp; relationships
+                {t("Foreign keys & relationships")}
               </Header>
             }
             empty={
               <Box textAlign="center" color="text-status-inactive" padding="s">
-                No foreign key relationships detected.
+                {t("No foreign key relationships detected.")}
               </Box>
             }
           />
@@ -1161,10 +1261,16 @@ export const TableDetail: React.FC = () => {
       {pendingCount > 0 && (
         <Alert
           type="info"
-          header={`${pendingCount} column${pendingCount === 1 ? "" : "s"} pending review`}
+          header={t(
+            pendingCount === 1
+              ? "{count} column pending review"
+              : "{count} columns pending review",
+            { count: pendingCount },
+          )}
         >
-          AI enrichment produced descriptions, synonyms, and glossary mappings
-          for these columns. Review or edit them before approving.
+          {t(
+            "AI enrichment produced descriptions, synonyms, and glossary mappings for these columns. Review or edit them before approving.",
+          )}
         </Alert>
       )}
 
@@ -1189,54 +1295,63 @@ export const TableDetail: React.FC = () => {
                   loading={bulkLoading}
                   onClick={() => handleBulkColumns(ReviewDecision.REJECTED)}
                 >
-                  Reject selected
+                  {t("Reject selected")}
                 </Button>
                 <Button
                   disabled={selected.length === 0 || bulkLoading}
                   loading={bulkLoading}
                   onClick={() => handleBulkColumns(ReviewDecision.APPROVED)}
                 >
-                  Approve selected
+                  {t("Approve selected")}
                 </Button>
                 <Button
                   disabled={selected.length !== 1 || bulkLoading}
                   onClick={() => setEditing(selected[0] ?? null)}
                 >
-                  Edit
+                  {t("Edit")}
                 </Button>
               </SpaceBetween>
             }
           >
-            Columns
+            {t("Columns")}
           </Header>
         }
         filter={
           <SpaceBetween direction="horizontal" size="s">
             <TextFilter
               {...filterProps}
-              filteringPlaceholder="Find columns"
-              filteringAriaLabel="Filter columns"
+              filteringPlaceholder={t("Find columns")}
+              filteringAriaLabel={t("Filter columns")}
             />
             <Select
-              selectedOption={statusFilter}
-              onChange={({ detail }) => setStatusFilter(detail.selectedOption)}
-              options={REVIEW_FILTER_OPTIONS}
-              ariaLabel="Filter by review status"
+              selectedOption={
+                reviewFilterOptions.find(
+                  (option) => option.value === statusFilter,
+                ) ?? null
+              }
+              onChange={({ detail }) =>
+                setStatusFilter(detail.selectedOption.value ?? "all")
+              }
+              options={reviewFilterOptions}
+              ariaLabel={t("Filter by review status")}
             />
           </SpaceBetween>
         }
         pagination={<Pagination {...paginationProps} />}
         empty={
           <Box textAlign="center" color="text-status-inactive" padding="l">
-            No columns discovered yet.
+            {t("No columns discovered yet.")}
           </Box>
         }
         ariaLabels={{
-          tableLabel: "Column metadata",
-          selectionGroupLabel: "Column selection",
+          tableLabel: t("Column metadata"),
+          selectionGroupLabel: t("Column selection"),
           allItemsSelectionLabel: ({ selectedItems }) =>
-            `${selectedItems.length} columns selected`,
-          itemSelectionLabel: (_s, row) => `Select ${row.name}`,
+            t("{count} columns selected", {
+              count: selectedItems.length,
+            }),
+          itemSelectionLabel: (_s, row) =>
+            t("Select {name}", { name: row.name ?? "" }),
         }}
       />
 
@@ -1280,31 +1395,36 @@ export const TableDetail: React.FC = () => {
 
 // --- Shared helpers ---
 
-function toTokens(values: string[]): { label: string; dismissLabel: string }[] {
-  return values.map((v) => ({ label: v, dismissLabel: `Remove ${v}` }));
+function toTokens(
+  values: string[],
+  t: AppTranslate,
+): { label: string; dismissLabel: string }[] {
+  return values.map((value) => ({
+    label: value,
+    dismissLabel: t("Remove {value}", { value }),
+  }));
 }
 
 function useTokenField(initial: string[]) {
-  const [items, setItems] = useState(toTokens(initial));
+  const { t } = useAppI18n();
+  const [values, setValues] = useState(initial);
   const [input, setInput] = useState("");
+  const items = useMemo(() => toTokens(values, t), [t, values]);
 
   function add() {
     const trimmed = input.trim();
-    if (trimmed && !items.some((t) => t.label === trimmed)) {
-      setItems([
-        ...items,
-        { label: trimmed, dismissLabel: `Remove ${trimmed}` },
-      ]);
+    if (trimmed && !values.includes(trimmed)) {
+      setValues([...values, trimmed]);
     }
     setInput("");
   }
 
   function remove(index: number) {
-    setItems(items.filter((_, i) => i !== index));
+    setValues(values.filter((_, i) => i !== index));
   }
 
   function clear() {
-    setItems([]);
+    setValues([]);
   }
 
   return {
@@ -1314,7 +1434,7 @@ function useTokenField(initial: string[]) {
     add,
     remove,
     clear,
-    values: items.map((t) => t.label),
+    values,
   };
 }
 
@@ -1338,6 +1458,7 @@ function SynonymsField({
   // conditional on `items.length > 0`). Without moving focus, keyboard users
   // lose their place. After clear() runs, transfer focus to the synonyms
   // input — the natural next thing to interact with, and it stays mounted.
+  const { t } = useAppI18n();
   const inputRef = useRef<InputProps.Ref>(null);
   const handleClear = () => {
     field.clear();
@@ -1346,17 +1467,19 @@ function SynonymsField({
   };
   return (
     <FormField
-      label="Synonyms"
-      description="Press Enter to add. Pre-filled terms may be AI-generated; saving replaces the whole list."
+      label={t("Synonyms")}
+      description={t(
+        "Press Enter to add. Pre-filled terms may be AI-generated; saving replaces the whole list.",
+      )}
       secondaryControl={
         field.items.length > 0 ? (
           <Button
             variant="link"
             iconName="remove"
             onClick={handleClear}
-            ariaLabel="Clear all synonyms"
+            ariaLabel={t("Clear all synonyms")}
           >
-            Clear all
+            {t("Clear all")}
           </Button>
         ) : undefined
       }
@@ -1405,6 +1528,7 @@ function EditTableModal({
   }) => void;
   loading: boolean;
 }) {
+  const { t } = useAppI18n();
   const bm = businessMetadata;
   const [description, setDescription] = useState(bm?.description ?? "");
   const synonyms = useTokenField(bm?.synonyms ?? []);
@@ -1416,12 +1540,12 @@ function EditTableModal({
       visible
       size="large"
       onDismiss={onDismiss}
-      header={`Edit table: ${tableName}`}
+      header={t("Edit table: {name}", { name: tableName })}
       footer={
         <Box float="right">
           <SpaceBetween direction="horizontal" size="xs">
             <Button variant="link" onClick={onDismiss}>
-              Cancel
+              {t("Cancel")}
             </Button>
             <Button
               variant="primary"
@@ -1435,22 +1559,28 @@ function EditTableModal({
                 })
               }
             >
-              Save
+              {t("Save")}
             </Button>
           </SpaceBetween>
         </Box>
       }
     >
       <SpaceBetween size="m">
-        <FormField label="Description">
+        <FormField label={t("Description")}>
           <Textarea
             value={description}
             onChange={({ detail }) => setDescription(detail.value)}
             rows={3}
           />
         </FormField>
-        <SynonymsField field={synonyms} placeholder="e.g. customers_table" />
-        <FormField label="Glossary terms" description="Press Enter to add.">
+        <SynonymsField
+          field={synonyms}
+          placeholder={t("e.g. customers_table")}
+        />
+        <FormField
+          label={t("Glossary terms")}
+          description={t("Press Enter to add.")}
+        >
           <SpaceBetween size="xs">
             <Input
               value={glossary.input}
@@ -1458,7 +1588,7 @@ function EditTableModal({
               onKeyDown={({ detail }) => {
                 if (detail.key === "Enter") glossary.add();
               }}
-              placeholder="e.g. Customer"
+              placeholder={t("e.g. Customer")}
             />
             <TokenGroup
               items={glossary.items}
@@ -1466,7 +1596,7 @@ function EditTableModal({
             />
           </SpaceBetween>
         </FormField>
-        <FormField label="Tags" description="Press Enter to add.">
+        <FormField label={t("Tags")} description={t("Press Enter to add.")}>
           <SpaceBetween size="xs">
             <Input
               value={tags.input}
@@ -1474,7 +1604,7 @@ function EditTableModal({
               onKeyDown={({ detail }) => {
                 if (detail.key === "Enter") tags.add();
               }}
-              placeholder="e.g. pii"
+              placeholder={t("e.g. pii")}
             />
             <TokenGroup
               items={tags.items}
@@ -1505,6 +1635,7 @@ function EditColumnModal({
   }) => void;
   loading: boolean;
 }) {
+  const { t } = useAppI18n();
   const bm = column.businessMetadata;
   const [description, setDescription] = useState(bm?.description ?? "");
   const synonyms = useTokenField(bm?.synonyms ?? []);
@@ -1516,12 +1647,12 @@ function EditColumnModal({
       visible
       size="large"
       onDismiss={onDismiss}
-      header={`Edit column: ${column.name}`}
+      header={t("Edit column: {name}", { name: column.name ?? "" })}
       footer={
         <Box float="right">
           <SpaceBetween direction="horizontal" size="xs">
             <Button variant="link" onClick={onDismiss}>
-              Cancel
+              {t("Cancel")}
             </Button>
             <Button
               variant="primary"
@@ -1535,25 +1666,28 @@ function EditColumnModal({
                 })
               }
             >
-              Save &amp; approve
+              {t("Save & approve")}
             </Button>
           </SpaceBetween>
         </Box>
       }
     >
       <SpaceBetween size="m">
-        <FormField label="Data type">
+        <FormField label={t("Data type")}>
           <Input value={column.dataType ?? ""} disabled />
         </FormField>
-        <FormField label="Description">
+        <FormField label={t("Description")}>
           <Textarea
             value={description}
             onChange={({ detail }) => setDescription(detail.value)}
             rows={3}
           />
         </FormField>
-        <SynonymsField field={synonyms} placeholder="e.g. customer_id" />
-        <FormField label="Glossary terms" description="Press Enter to add.">
+        <SynonymsField field={synonyms} placeholder={t("e.g. customer_id")} />
+        <FormField
+          label={t("Glossary terms")}
+          description={t("Press Enter to add.")}
+        >
           <SpaceBetween size="xs">
             <Input
               value={glossary.input}
@@ -1561,7 +1695,7 @@ function EditColumnModal({
               onKeyDown={({ detail }) => {
                 if (detail.key === "Enter") glossary.add();
               }}
-              placeholder="e.g. Customer"
+              placeholder={t("e.g. Customer")}
             />
             <TokenGroup
               items={glossary.items}
@@ -1569,7 +1703,7 @@ function EditColumnModal({
             />
           </SpaceBetween>
         </FormField>
-        <FormField label="Tags" description="Press Enter to add.">
+        <FormField label={t("Tags")} description={t("Press Enter to add.")}>
           <SpaceBetween size="xs">
             <Input
               value={tags.input}
@@ -1577,7 +1711,7 @@ function EditColumnModal({
               onKeyDown={({ detail }) => {
                 if (detail.key === "Enter") tags.add();
               }}
-              placeholder="e.g. pii"
+              placeholder={t("e.g. pii")}
             />
             <TokenGroup
               items={tags.items}
@@ -1618,6 +1752,7 @@ function EditKeysModal({
   loading: boolean;
   error?: Error | null;
 }) {
+  const { t } = useAppI18n();
   const columnOptions = columnNames.map((c) => ({ label: c, value: c }));
   const [pkSelected, setPkSelected] = useState<readonly SelectProps.Option[]>(
     primaryKey.map((c) => ({ label: c, value: c })),
@@ -1639,12 +1774,12 @@ function EditKeysModal({
       visible
       size="large"
       onDismiss={onDismiss}
-      header={`Edit keys: ${tableName}`}
+      header={t("Edit keys: {name}", { name: tableName })}
       footer={
         <Box float="right">
           <SpaceBetween direction="horizontal" size="xs">
             <Button variant="link" onClick={onDismiss}>
-              Cancel
+              {t("Cancel")}
             </Button>
             <Button
               variant="primary"
@@ -1666,7 +1801,7 @@ function EditKeysModal({
                 })
               }
             >
-              Save
+              {t("Save")}
             </Button>
           </SpaceBetween>
         </Box>
@@ -1674,26 +1809,26 @@ function EditKeysModal({
     >
       <SpaceBetween size="l">
         {error && (
-          <Alert type="error" header="Failed to save keys">
-            {extractErrorMessage(error)}
+          <Alert type="error" header={t("Failed to save keys")}>
+            {extractErrorMessage(error, t("An unexpected error occurred."))}
           </Alert>
         )}
         <FormField
-          label="Primary key columns"
-          description="Steward-specified keys override discovered ones."
+          label={t("Primary key columns")}
+          description={t("Steward-specified keys override discovered ones.")}
         >
           <Multiselect
             selectedOptions={pkSelected}
             onChange={({ detail }) => setPkSelected(detail.selectedOptions)}
             options={columnOptions}
-            placeholder="Select primary key columns"
+            placeholder={t("Select primary key columns")}
           />
         </FormField>
         <AttributeEditor
           items={fkRows}
-          addButtonText="Add foreign key"
-          removeButtonText="Remove"
-          empty="No foreign keys."
+          addButtonText={t("Add foreign key")}
+          removeButtonText={t("Remove")}
+          empty={t("No foreign keys.")}
           onAddButtonClick={() =>
             setFkRows([
               ...fkRows,
@@ -1705,7 +1840,7 @@ function EditKeysModal({
           }
           definition={[
             {
-              label: "Column",
+              label: t("Column"),
               control: (item, i) => (
                 <Input
                   value={item.column}
@@ -1717,7 +1852,7 @@ function EditKeysModal({
               ),
             },
             {
-              label: "Target table",
+              label: t("Target table"),
               control: (item, i) => (
                 <Input
                   value={item.targetTable}
@@ -1729,7 +1864,7 @@ function EditKeysModal({
               ),
             },
             {
-              label: "Target column",
+              label: t("Target column"),
               control: (item, i) => (
                 <Input
                   value={item.targetColumn}

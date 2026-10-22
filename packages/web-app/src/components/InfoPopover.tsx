@@ -4,6 +4,7 @@
 import Popover from "@cloudscape-design/components/popover";
 import Icon from "@cloudscape-design/components/icon";
 import type { ReactNode } from "react";
+import { useAppI18n } from "../i18n/LocaleProvider";
 
 export interface InfoPopoverProps {
   /** Optional bold header shown at the top of the popover. */
@@ -26,6 +27,8 @@ export interface InfoPopoverProps {
  * hosts that have no info slot (KeyValuePairs, Button, table headers).
  */
 export function InfoPopover({ header, children, ariaLabel }: InfoPopoverProps) {
+  const { t } = useAppI18n();
+
   return (
     <Popover
       triggerType="custom"
@@ -37,7 +40,7 @@ export function InfoPopover({ header, children, ariaLabel }: InfoPopoverProps) {
       <Icon
         name="status-info"
         variant="subtle"
-        ariaLabel={ariaLabel ?? header ?? "More info"}
+        ariaLabel={ariaLabel ?? header ?? t("More info")}
       />
     </Popover>
   );

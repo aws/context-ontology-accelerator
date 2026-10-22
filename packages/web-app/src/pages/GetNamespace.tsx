@@ -10,6 +10,7 @@
  */
 import React, { useEffect, useMemo, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
+import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
 import Box from "@cloudscape-design/components/box";
 import Button from "@cloudscape-design/components/button";
 import Container from "@cloudscape-design/components/container";
@@ -40,15 +41,17 @@ import {
   VkgHealthStatus,
 } from "@coa/control-plane-client";
 import { useApiClient } from "@components/ApiClientProvider";
-import { formatNamespaceLanguage } from "@utils";
+import { localizeNamespaceLanguage } from "@utils";
 import { listOntologies } from "../services/ontology-engine";
 import type { OntologyRecord } from "../services/ontology-engine";
+import { useAppI18n } from "../i18n/LocaleProvider";
+import type { AppMessage } from "../i18n/appMessages";
 
 /** Formats an ISO timestamp into a localized short date+time string, or "—" if absent. */
-function formatDate(iso: string | undefined): string {
+function formatDate(iso: string | undefined, locale: string): string {
   if (!iso) return "—";
   try {
-    return new Date(iso).toLocaleDateString(undefined, {
+    return new Date(iso).toLocaleDateString(locale, {
       year: "numeric",
       month: "short",
       day: "numeric",
@@ -65,7 +68,7 @@ function formatDate(iso: string | undefined): string {
  * the namespace detail page. Mirrors the VkgHealthStatus enum docs in
  * models/src/main/smithy/namespace.smithy.
  */
-const VKG_HEALTH_DESCRIPTIONS: Record<VkgHealthStatus, string> = {
+const VKG_HEALTH_DESCRIPTIONS: Record<VkgHealthStatus, AppMessage> = {
   [VkgHealthStatus.HEALTHY]:
     "The VKG translation service is running and able to translate queries.",
   [VkgHealthStatus.DEGRADED]:
@@ -80,9 +83,18 @@ const VKG_HEALTH_DESCRIPTIONS: Record<VkgHealthStatus, string> = {
 
 export const GetNamespace: React.FC = () => {
   const navigate = useNavigate();
+  const { locale, t } = useAppI18n();
   const { namespaceId } = useParams<{ namespaceId: string }>();
   const { data, isLoading, error } = useGetNamespace(namespaceId ?? "");
   const [editVisible, setEditVisible] = useState(false);
+
+  const nsName =
+    data?.namespace?.displayName ?? data?.namespace?.name ?? namespaceId ?? "";
+  useBreadcrumbTrail([
+    { text: t("Namespaces"), href: "/namespaces" },
+    { text: nsName },
+    ...(editVisible ? [{ text: t("Edit") }] : []),
+  ]);
 
   if (isLoading) {
     return (
@@ -96,7 +108,9 @@ export const GetNamespace: React.FC = () => {
     return (
       <Box textAlign="center" padding="xxl">
         <StatusIndicator type="error">
-          Failed to load namespace: {error.message}
+          {t("Failed to load namespace: {message}", {
+            message: error.message,
+          })}
         </StatusIndicator>
       </Box>
     );
@@ -106,7 +120,9 @@ export const GetNamespace: React.FC = () => {
   if (!ns)
     return (
       <Box textAlign="center" padding="xxl">
-        <StatusIndicator type="warning">Namespace not found</StatusIndicator>
+        <StatusIndicator type="warning">
+          {t("Namespace not found")}
+        </StatusIndicator>
       </Box>
     );
 
@@ -116,12 +132,12 @@ export const GetNamespace: React.FC = () => {
         variant="h1"
         actions={
           <SpaceBetween direction="horizontal" size="xs">
-            <Button onClick={() => setEditVisible(true)}>Edit</Button>
+            <Button onClick={() => setEditVisible(true)}>{t("Edit")}</Button>
             <Button
               iconName="lock-private"
               onClick={() => navigate(`/namespaces/${namespaceId}/permissions`)}
             >
-              Permissions
+              {t("Permissions")}
             </Button>
           </SpaceBetween>
         }
@@ -129,30 +145,32 @@ export const GetNamespace: React.FC = () => {
         {ns.displayName ?? ns.name}
       </Header>
 
-      <Container header={<Header variant="h2">Summary</Header>}>
+      <Container header={<Header variant="h2">{t("Summary")}</Header>}>
         <KeyValuePairs
           columns={3}
           items={[
-            { label: "Namespace ID", value: ns.namespaceId },
-            { label: "Name", value: ns.name },
-            { label: "Owner", value: ns.owner },
+            { label: t("Namespace ID"), value: ns.namespaceId },
+            { label: t("Name"), value: ns.name },
+            { label: t("Owner"), value: ns.owner },
             {
-              label: "Language",
+              label: t("Language"),
               info: (
                 <Popover
                   dismissButton={false}
                   position="top"
                   triggerType="text"
-                  header="Namespace language"
-                  content="Set when the namespace was created and cannot be changed."
+                  header={t("Namespace language")}
+                  content={t(
+                    "Set when the namespace was created and cannot be changed.",
+                  )}
                 >
-                  Info
+                  {t("Info")}
                 </Popover>
               ),
-              value: formatNamespaceLanguage(ns.language),
+              value: localizeNamespaceLanguage(ns.language, t),
             },
             {
-              label: "Status",
+              label: t("Status"),
               value: (
                 <StatusIndicator
                   type={
@@ -171,19 +189,19 @@ export const GetNamespace: React.FC = () => {
               ),
             },
             {
-              label: "VKG health",
+              label: t("VKG health"),
               value: (() => {
                 const vkgHealth = ns.vkgHealth ?? VkgHealthStatus.UNKNOWN;
                 // Prefer the server-provided reason (the live cause) when
                 // present; fall back to the static per-status description.
                 const vkgHealthContent =
-                  ns.vkgHealthReason ?? VKG_HEALTH_DESCRIPTIONS[vkgHealth];
+                  ns.vkgHealthReason ?? t(VKG_HEALTH_DESCRIPTIONS[vkgHealth]);
                 return (
                   <Popover
                     dismissButton={false}
                     position="top"
                     triggerType="text"
-                    header="VKG health"
+                    header={t("VKG health")}
                     content={vkgHealthContent}
                   >
                     <StatusIndicator
@@ -205,16 +223,16 @@ export const GetNamespace: React.FC = () => {
               })(),
             },
             {
-              label: "Sources",
+              label: t("Sources"),
               value: String(ns.sourceCount ?? 0),
             },
-            { label: "Created", value: formatDate(ns.createdAt) },
+            { label: t("Created"), value: formatDate(ns.createdAt, locale) },
             {
-              label: "Updated",
-              value: formatDate(ns.updatedAt),
+              label: t("Updated"),
+              value: formatDate(ns.updatedAt, locale),
             },
             {
-              label: "Description",
+              label: t("Description"),
               value: ns.description ?? "—",
             },
           ]}
@@ -237,22 +255,23 @@ export const GetNamespace: React.FC = () => {
 // ── Tabs ─────────────────────────────────────────────────────────────
 
 const NamespaceTabs: React.FC<{ namespaceId: string }> = ({ namespaceId }) => {
+  const { t } = useAppI18n();
   return (
     <Tabs
       tabs={[
         {
           id: "sources",
-          label: "Sources",
+          label: t("Sources"),
           content: <SourcesTab namespaceId={namespaceId} />,
         },
         {
           id: "ontologies",
-          label: "Ontologies",
+          label: t("Ontologies"),
           content: <OntologiesTab namespaceId={namespaceId} />,
         },
         {
           id: "metrics",
-          label: "Metrics",
+          label: t("Metrics"),
           content: <MetricsTab namespaceId={namespaceId} />,
         },
       ]}
@@ -264,6 +283,7 @@ const NamespaceTabs: React.FC<{ namespaceId: string }> = ({ namespaceId }) => {
 
 const SourcesTab: React.FC<{ namespaceId: string }> = ({ namespaceId }) => {
   const navigate = useNavigate();
+  const { t } = useAppI18n();
   const { data, isLoading, error, refetch, isFetching } =
     useListSources(namespaceId);
 
@@ -275,7 +295,7 @@ const SourcesTab: React.FC<{ namespaceId: string }> = ({ namespaceId }) => {
   const columns: TableProps.ColumnDefinition<SourceSummary>[] = [
     {
       id: "name",
-      header: "Source name",
+      header: t("Source name"),
       isRowHeader: true,
       cell: (item) => (
         <Link
@@ -291,13 +311,15 @@ const SourcesTab: React.FC<{ namespaceId: string }> = ({ namespaceId }) => {
     },
     {
       id: "type",
-      header: "Type",
+      header: t("Type"),
       cell: (item) =>
-        item.sourceType === SourceType.DATABASE ? "Database" : "Documents",
+        item.sourceType === SourceType.DATABASE
+          ? t("Database")
+          : t("Documents"),
     },
     {
       id: "status",
-      header: "Status",
+      header: t("Status"),
       cell: (item) => (
         <StatusIndicator
           type={item.status === SourceStatus.APPROVED ? "success" : "info"}
@@ -308,7 +330,7 @@ const SourcesTab: React.FC<{ namespaceId: string }> = ({ namespaceId }) => {
     },
     {
       id: "tables",
-      header: "Tables",
+      header: t("Tables"),
       cell: (item) =>
         item.sourceType === SourceType.DATABASE
           ? (item.tablesDiscovered ?? 0)
@@ -322,7 +344,7 @@ const SourcesTab: React.FC<{ namespaceId: string }> = ({ namespaceId }) => {
       items={sources}
       trackBy="sourceId"
       loading={isLoading}
-      loadingText="Loading sources…"
+      loadingText={t("Loading sources…")}
       columnDefinitions={columns}
       header={
         <Header
@@ -334,21 +356,23 @@ const SourcesTab: React.FC<{ namespaceId: string }> = ({ namespaceId }) => {
               loading={isFetching}
               onClick={() => refetch()}
             >
-              Refresh
+              {t("Refresh")}
             </Button>
           }
         >
-          Sources
+          {t("Sources")}
         </Header>
       }
       empty={
         error ? (
           <StatusIndicator type="error">
-            Failed to load sources: {error.message}
+            {t("Failed to load sources: {message}", {
+              message: error.message,
+            })}
           </StatusIndicator>
         ) : (
           <Box textAlign="center" color="text-body-secondary">
-            No sources in this namespace.
+            {t("No sources in this namespace.")}
           </Box>
         )
       }
@@ -360,6 +384,7 @@ const SourcesTab: React.FC<{ namespaceId: string }> = ({ namespaceId }) => {
 
 const OntologiesTab: React.FC<{ namespaceId: string }> = ({ namespaceId }) => {
   const navigate = useNavigate();
+  const { locale, t } = useAppI18n();
   const apiClient = useApiClient();
   const [items, setItems] = useState<OntologyRecord[]>([]);
   const [loading, setLoading] = useState(true);
@@ -374,12 +399,14 @@ const OntologiesTab: React.FC<{ namespaceId: string }> = ({ namespaceId }) => {
         setItems(res);
       })
       .catch((e: unknown) => {
-        setError(e instanceof Error ? e.message : "Failed to load ontologies");
+        setError(
+          e instanceof Error ? e.message : t("Failed to load ontologies"),
+        );
       })
       .finally(() => {
         setLoading(false);
       });
-  }, [apiClient, namespaceId]);
+  }, [apiClient, namespaceId, t]);
 
   useEffect(() => {
     fetchOntologies();
@@ -388,7 +415,7 @@ const OntologiesTab: React.FC<{ namespaceId: string }> = ({ namespaceId }) => {
   const columns: TableProps.ColumnDefinition<OntologyRecord>[] = [
     {
       id: "title",
-      header: "Ontology",
+      header: t("Ontology"),
       isRowHeader: true,
       cell: (o) => (
         <Link
@@ -402,13 +429,17 @@ const OntologiesTab: React.FC<{ namespaceId: string }> = ({ namespaceId }) => {
         </Link>
       ),
     },
-    { id: "type", header: "Type", cell: (o) => o.ontologyType },
-    { id: "classes", header: "Classes", cell: (o) => o.classCount },
-    { id: "properties", header: "Properties", cell: (o) => o.propertyCount },
+    { id: "type", header: t("Type"), cell: (o) => o.ontologyType },
+    { id: "classes", header: t("Classes"), cell: (o) => o.classCount },
+    {
+      id: "properties",
+      header: t("Properties"),
+      cell: (o) => o.propertyCount,
+    },
     {
       id: "created",
-      header: "Created",
-      cell: (o) => formatDate(o.createdAt),
+      header: t("Created"),
+      cell: (o) => formatDate(o.createdAt, locale),
     },
   ];
 
@@ -418,7 +449,7 @@ const OntologiesTab: React.FC<{ namespaceId: string }> = ({ namespaceId }) => {
       items={items}
       trackBy="ontologyId"
       loading={loading}
-      loadingText="Loading ontologies…"
+      loadingText={t("Loading ontologies…")}
       columnDefinitions={columns}
       header={
         <Header
@@ -430,21 +461,21 @@ const OntologiesTab: React.FC<{ namespaceId: string }> = ({ namespaceId }) => {
               loading={loading}
               onClick={() => fetchOntologies()}
             >
-              Refresh
+              {t("Refresh")}
             </Button>
           }
         >
-          Ontologies
+          {t("Ontologies")}
         </Header>
       }
       empty={
         error ? (
           <StatusIndicator type="error">
-            Failed to load ontologies: {error}
+            {t("Failed to load ontologies: {message}", { message: error })}
           </StatusIndicator>
         ) : (
           <Box textAlign="center" color="text-body-secondary">
-            No ontologies in this namespace yet.
+            {t("No ontologies in this namespace yet.")}
           </Box>
         )
       }
@@ -456,6 +487,7 @@ const OntologiesTab: React.FC<{ namespaceId: string }> = ({ namespaceId }) => {
 
 const MetricsTab: React.FC<{ namespaceId: string }> = ({ namespaceId }) => {
   const navigate = useNavigate();
+  const { t } = useAppI18n();
   const { data, isLoading, error, refetch, isFetching } =
     useListMetrics(namespaceId);
 
@@ -467,7 +499,7 @@ const MetricsTab: React.FC<{ namespaceId: string }> = ({ namespaceId }) => {
   const columns: TableProps.ColumnDefinition<MetricDefinition>[] = [
     {
       id: "name",
-      header: "Metric",
+      header: t("Metric"),
       isRowHeader: true,
       cell: (m) => (
         <Link
@@ -485,11 +517,15 @@ const MetricsTab: React.FC<{ namespaceId: string }> = ({ namespaceId }) => {
     },
     {
       id: "description",
-      header: "Description",
+      header: t("Description"),
       cell: (m) => m.description || "—",
     },
-    { id: "dataSourceId", header: "Data source", cell: (m) => m.dataSourceId },
-    { id: "sourceTable", header: "Table", cell: (m) => m.sourceTable },
+    {
+      id: "dataSourceId",
+      header: t("Data source"),
+      cell: (m) => m.dataSourceId,
+    },
+    { id: "sourceTable", header: t("Table"), cell: (m) => m.sourceTable },
   ];
 
   return (
@@ -498,7 +534,7 @@ const MetricsTab: React.FC<{ namespaceId: string }> = ({ namespaceId }) => {
       items={metrics}
       trackBy="name"
       loading={isLoading}
-      loadingText="Loading metrics…"
+      loadingText={t("Loading metrics…")}
       columnDefinitions={columns}
       header={
         <Header
@@ -510,21 +546,23 @@ const MetricsTab: React.FC<{ namespaceId: string }> = ({ namespaceId }) => {
               loading={isFetching}
               onClick={() => refetch()}
             >
-              Refresh
+              {t("Refresh")}
             </Button>
           }
         >
-          Metrics
+          {t("Metrics")}
         </Header>
       }
       empty={
         error ? (
           <StatusIndicator type="error">
-            Failed to load metrics: {error.message}
+            {t("Failed to load metrics: {message}", {
+              message: error.message,
+            })}
           </StatusIndicator>
         ) : (
           <Box textAlign="center" color="text-body-secondary">
-            No metrics in this namespace yet.
+            {t("No metrics in this namespace yet.")}
           </Box>
         )
       }
@@ -549,6 +587,7 @@ const EditNamespaceModal: React.FC<EditNamespaceModalProps> = ({
   visible,
   onDismiss,
 }) => {
+  const { t } = useAppI18n();
   const [displayName, setDisplayName] = useState(initialDisplayName);
   const [description, setDescription] = useState(initialDescription);
   const updateNamespace = useUpdateNamespace();
@@ -569,7 +608,7 @@ const EditNamespaceModal: React.FC<EditNamespaceModalProps> = ({
       { namespaceId, displayName, description },
       {
         onSuccess: () => onDismiss(),
-        onError: (e) => setError(e.message ?? "Failed to update namespace"),
+        onError: (e) => setError(e.message ?? t("Failed to update namespace")),
       },
     );
   };
@@ -578,19 +617,19 @@ const EditNamespaceModal: React.FC<EditNamespaceModalProps> = ({
     <Modal
       visible={visible}
       onDismiss={onDismiss}
-      header="Edit namespace"
+      header={t("Edit namespace")}
       footer={
         <Box float="right">
           <SpaceBetween direction="horizontal" size="xs">
             <Button variant="link" onClick={onDismiss}>
-              Cancel
+              {t("Cancel")}
             </Button>
             <Button
               variant="primary"
               onClick={handleSubmit}
               loading={updateNamespace.isPending}
             >
-              Save
+              {t("Save")}
             </Button>
           </SpaceBetween>
         </Box>
@@ -598,13 +637,13 @@ const EditNamespaceModal: React.FC<EditNamespaceModalProps> = ({
     >
       <SpaceBetween size="l">
         {error && <StatusIndicator type="error">{error}</StatusIndicator>}
-        <FormField label="Display name">
+        <FormField label={t("Display name")}>
           <Input
             value={displayName}
             onChange={({ detail }) => setDisplayName(detail.value)}
           />
         </FormField>
-        <FormField label="Description">
+        <FormField label={t("Description")}>
           <Textarea
             value={description}
             onChange={({ detail }) => setDescription(detail.value)}

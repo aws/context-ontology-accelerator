@@ -43,6 +43,9 @@ dependencies = [
     # llama-index-vector-stores-opensearch packages not found") at engine-build time.
     "llama-index-vector-stores-opensearch>=0.5",
     "retryhttp>=1.4.0",
+    # 2026.10.19 is the first certifi bundle without the roots behind the compromised
+    # emSign intermediates. botocore also uses certifi's bundle over its own when installed.
+    "certifi>=2026.10.19",
 ]
 
 [build-system]

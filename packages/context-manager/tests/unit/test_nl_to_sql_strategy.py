@@ -224,6 +224,21 @@ class TestNLtoSQLStrategyResolve:
         assert result.truncated is False
 
     @pytest.mark.asyncio
+    async def test_table_placements_resolve_through_the_executor(
+        self, strategy, sql_generator, firewall, query_executor
+    ):
+        sql_generator.generate.return_value = _make_nl_to_sql_result()
+        firewall.evaluate.return_value = _make_firewall_result()
+        query_executor.execute.return_value = _make_exec_result()
+        query_executor.resolve_table_placements.return_value = {"orders": ("ds-1", "sales_db")}
+
+        await strategy.resolve("How many orders?", "ns1", _make_context())
+
+        resolver = sql_generator.generate.call_args.kwargs["table_placements"]
+        assert await resolver({"orders": ""}) == {"orders": ("ds-1", "sales_db")}
+        query_executor.resolve_table_placements.assert_awaited_once_with("ns1", {"orders": ""})
+
+    @pytest.mark.asyncio
     async def test_correct_strategy_result_fields(self, strategy, sql_generator, firewall, query_executor):
         sql_generator.generate.return_value = _make_nl_to_sql_result(
             retrieved_tables=["orders", "products"],

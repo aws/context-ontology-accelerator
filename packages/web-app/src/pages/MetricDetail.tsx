@@ -3,6 +3,8 @@
 
 import React, { useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
+import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
+import { useNamespace } from "@api-hooks/use-namespace";
 import Container from "@cloudscape-design/components/container";
 import Header from "@cloudscape-design/components/header";
 import SpaceBetween from "@cloudscape-design/components/space-between";
@@ -18,8 +20,10 @@ import FormField from "@cloudscape-design/components/form-field";
 import Spinner from "@cloudscape-design/components/spinner";
 import { useGetMetric, useDeleteMetric } from "../api-hooks/use-metrics";
 import { useSourceNameById } from "../api-hooks/use-source-name-by-id";
+import { useAppI18n } from "../i18n/LocaleProvider";
 
 export const MetricDetail: React.FC = () => {
+  const { t } = useAppI18n();
   const navigate = useNavigate();
   const { namespaceId, metricName } = useParams<{
     namespaceId: string;
@@ -31,6 +35,18 @@ export const MetricDetail: React.FC = () => {
     metricName ?? "",
   );
   const deleteMutation = useDeleteMetric(namespaceId ?? "");
+
+  const { name: nsName } = useNamespace(namespaceId);
+  useBreadcrumbTrail([
+    { text: nsName, href: `/namespaces/${namespaceId}`, namespaceId },
+    { text: t("Ontology") },
+    {
+      text: t("Metrics"),
+      href: `/namespaces/${namespaceId}/metrics`,
+      namespaceId,
+    },
+    { text: metricName ?? "" },
+  ]);
 
   // Resolve dataSourceId -> human-readable source name
   const sourceNameById = useSourceNameById(namespaceId ?? "");
@@ -48,7 +64,7 @@ export const MetricDetail: React.FC = () => {
           state: {
             flash: {
               type: "success",
-              content: `Metric "${metricName}" deleted.`,
+              content: t("Metric “{name}” deleted.", { name: metricName }),
             },
           },
         });
@@ -65,11 +81,15 @@ export const MetricDetail: React.FC = () => {
   }
 
   if (error) {
-    return <Alert type="error">Failed to load metric: {error.message}</Alert>;
+    return (
+      <Alert type="error">
+        {t("Failed to load metric: {message}", { message: error.message })}
+      </Alert>
+    );
   }
 
   if (!metric) {
-    return <Alert type="warning">Metric not found.</Alert>;
+    return <Alert type="warning">{t("Metric not found.")}</Alert>;
   }
 
   return (
@@ -88,13 +108,13 @@ export const MetricDetail: React.FC = () => {
                     )
                   }
                 >
-                  Edit
+                  {t("Edit")}
                 </Button>
                 <Button
                   variant="normal"
                   onClick={() => setDeleteModalVisible(true)}
                 >
-                  Delete
+                  {t("Delete")}
                 </Button>
               </SpaceBetween>
             }
@@ -105,37 +125,37 @@ export const MetricDetail: React.FC = () => {
       >
         <ColumnLayout columns={3} variant="text-grid">
           <div>
-            <Box variant="awsui-key-label">Description</Box>
+            <Box variant="awsui-key-label">{t("Description")}</Box>
             <div>{metric.description}</div>
           </div>
           <div>
-            <Box variant="awsui-key-label">Unit</Box>
+            <Box variant="awsui-key-label">{t("Unit")}</Box>
             <div>{metric.unit ?? "—"}</div>
           </div>
           <div>
-            <Box variant="awsui-key-label">Return type</Box>
+            <Box variant="awsui-key-label">{t("Return type")}</Box>
             <div>{metric.returnType ?? "—"}</div>
           </div>
           <div>
-            <Box variant="awsui-key-label">Defined by</Box>
+            <Box variant="awsui-key-label">{t("Defined by")}</Box>
             <div>{metric.definedBy ?? "—"}</div>
           </div>
           <div>
-            <Box variant="awsui-key-label">Effective from</Box>
+            <Box variant="awsui-key-label">{t("Effective from")}</Box>
             <div>{metric.effectiveFrom ?? "—"}</div>
           </div>
           <div>
-            <Box variant="awsui-key-label">Default time grain</Box>
+            <Box variant="awsui-key-label">{t("Default time grain")}</Box>
             <div>{metric.defaultTimeGrain ?? "—"}</div>
           </div>
         </ColumnLayout>
       </Container>
 
       {/* Source */}
-      <Container header={<Header variant="h2">Source</Header>}>
+      <Container header={<Header variant="h2">{t("Source")}</Header>}>
         <ColumnLayout columns={3} variant="text-grid">
           <div>
-            <Box variant="awsui-key-label">Data source</Box>
+            <Box variant="awsui-key-label">{t("Data source")}</Box>
             <div>
               {metric.dataSourceId
                 ? (sourceNameById.get(metric.dataSourceId) ??
@@ -144,30 +164,30 @@ export const MetricDetail: React.FC = () => {
             </div>
           </div>
           <div>
-            <Box variant="awsui-key-label">Source table</Box>
+            <Box variant="awsui-key-label">{t("Source table")}</Box>
             <div>{metric.sourceTable}</div>
           </div>
           <div>
-            <Box variant="awsui-key-label">Time grain</Box>
+            <Box variant="awsui-key-label">{t("Time grain")}</Box>
             <div>{metric.defaultTimeGrain ?? "—"}</div>
           </div>
         </ColumnLayout>
       </Container>
 
       {/* Expressions */}
-      <Container header={<Header variant="h2">Expressions</Header>}>
+      <Container header={<Header variant="h2">{t("Expressions")}</Header>}>
         <Table
           items={metric.expression?.dialects ?? []}
           columnDefinitions={[
             {
               id: "dialect",
-              header: "Dialect",
+              header: t("Dialect"),
               cell: (item) => <Badge>{item.dialect}</Badge>,
               width: 150,
             },
             {
               id: "expression",
-              header: "SQL Expression",
+              header: t("SQL Expression"),
               cell: (item) => (
                 <code
                   style={{
@@ -186,12 +206,12 @@ export const MetricDetail: React.FC = () => {
 
       {/* AI Context */}
       {metric.aiContext && (
-        <Container header={<Header variant="h2">AI Context</Header>}>
+        <Container header={<Header variant="h2">{t("AI Context")}</Header>}>
           <SpaceBetween size="m">
             {metric.aiContext.synonyms &&
               metric.aiContext.synonyms.length > 0 && (
                 <div>
-                  <Box variant="awsui-key-label">Synonyms</Box>
+                  <Box variant="awsui-key-label">{t("Synonyms")}</Box>
                   <SpaceBetween direction="horizontal" size="xs">
                     {metric.aiContext.synonyms.map((s) => (
                       <Badge key={s} color="blue">
@@ -203,14 +223,14 @@ export const MetricDetail: React.FC = () => {
               )}
             {metric.aiContext.instructions && (
               <div>
-                <Box variant="awsui-key-label">Instructions</Box>
+                <Box variant="awsui-key-label">{t("Instructions")}</Box>
                 <div>{metric.aiContext.instructions}</div>
               </div>
             )}
             {metric.aiContext.examples &&
               metric.aiContext.examples.length > 0 && (
                 <div>
-                  <Box variant="awsui-key-label">Examples</Box>
+                  <Box variant="awsui-key-label">{t("Examples")}</Box>
                   <ul>
                     {metric.aiContext.examples.map((e, i) => (
                       <li key={i}>{e}</li>
@@ -223,7 +243,7 @@ export const MetricDetail: React.FC = () => {
       )}
 
       {/* Ontology Links */}
-      <Container header={<Header variant="h2">Ontology Links</Header>}>
+      <Container header={<Header variant="h2">{t("Ontology Links")}</Header>}>
         {metric.ontologyConcepts && metric.ontologyConcepts.length > 0 ? (
           <SpaceBetween direction="horizontal" size="xs">
             {metric.ontologyConcepts.map((c) => (
@@ -232,8 +252,9 @@ export const MetricDetail: React.FC = () => {
           </SpaceBetween>
         ) : (
           <Box color="text-status-inactive">
-            No ontology classes linked. Edit this metric to associate it with
-            classes from your ontology.
+            {t(
+              "No ontology classes linked. Edit this metric to associate it with classes from your ontology.",
+            )}
           </Box>
         )}
       </Container>
@@ -246,7 +267,7 @@ export const MetricDetail: React.FC = () => {
           setDeleteConfirmText("");
           deleteMutation.reset();
         }}
-        header="Delete metric"
+        header={t("Delete metric")}
         footer={
           <Box float="right">
             <SpaceBetween direction="horizontal" size="xs">
@@ -257,7 +278,7 @@ export const MetricDetail: React.FC = () => {
                   setDeleteConfirmText("");
                 }}
               >
-                Cancel
+                {t("Cancel")}
               </Button>
               <Button
                 variant="primary"
@@ -265,7 +286,7 @@ export const MetricDetail: React.FC = () => {
                 loading={deleteMutation.isPending}
                 disabled={deleteConfirmText !== metricName}
               >
-                Delete
+                {t("Delete")}
               </Button>
             </SpaceBetween>
           </Box>
@@ -273,11 +294,16 @@ export const MetricDetail: React.FC = () => {
       >
         <SpaceBetween size="m">
           <Box>
-            Permanently delete metric <b>{metricName}</b>? This action cannot be
-            undone. The metric will be removed from the ontology graph and will
-            no longer be discoverable.
+            {t("Permanently delete metric {name}?", {
+              name: metricName ?? "",
+            })}{" "}
+            {t(
+              "This action cannot be undone. The metric will be removed from the ontology graph and will no longer be discoverable.",
+            )}
           </Box>
-          <FormField label={`Type "${metricName}" to confirm`}>
+          <FormField
+            label={t("Type “{name}” to confirm", { name: metricName ?? "" })}
+          >
             <Input
               value={deleteConfirmText}
               onChange={({ detail }) => setDeleteConfirmText(detail.value)}
@@ -286,7 +312,7 @@ export const MetricDetail: React.FC = () => {
           </FormField>
           {deleteMutation.isError && (
             <Alert type="error">
-              {deleteMutation.error?.message ?? "Delete failed"}
+              {deleteMutation.error?.message ?? t("Delete failed")}
             </Alert>
           )}
         </SpaceBetween>

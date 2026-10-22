@@ -14,6 +14,7 @@ import type {
 import { normalizeGraphContext } from "@utils/graph-context";
 import { EvidenceItem } from "./EvidenceItem";
 import { GraphContextSection } from "./GraphContextSection";
+import { useAppI18n } from "../../../i18n/LocaleProvider";
 
 export interface EvidencePanelProps {
   supportingContent?: SupportingContentItem[];
@@ -28,6 +29,7 @@ export const EvidencePanel: React.FC<EvidencePanelProps> = ({
   supportingContent,
   graphContext,
 }) => {
+  const { t } = useAppI18n();
   const normalizedGraphContext = normalizeGraphContext(graphContext);
   const sorted = [...(supportingContent ?? [])].sort(
     (a, b) => (b.relevanceScore ?? 0) - (a.relevanceScore ?? 0),
@@ -41,8 +43,13 @@ export const EvidencePanel: React.FC<EvidencePanelProps> = ({
 
   const headerText =
     sorted.length > 0
-      ? `${sorted.length} source${sorted.length !== 1 ? "s" : ""} cited`
-      : "Graph evidence";
+      ? t(
+          sorted.length === 1
+            ? "{count} source cited"
+            : "{count} sources cited",
+          { count: sorted.length },
+        )
+      : t("Graph evidence");
 
   return (
     <ExpandableSection

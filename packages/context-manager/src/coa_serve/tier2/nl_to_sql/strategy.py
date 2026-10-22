@@ -345,6 +345,15 @@ class NLtoSQLStrategy:
             if (_graph_expand_enabled(options) and self._graph_client is not None)
             else None
         )
+        # Which source and database each retrieved table lives in, for a namespace
+        # pooling several Glue databases; the executor owns the sources registry.
+        table_placements = None
+        if self._query_executor and hasattr(self._query_executor, "resolve_table_placements"):
+            executor = self._query_executor
+
+            async def table_placements(table_sources: dict[str, str]) -> dict[str, tuple[str, str]]:
+                return await executor.resolve_table_placements(namespace, table_sources)
+
         nl_to_sql_result = await self._sql_generator.generate(
             query,
             namespace=namespace,
@@ -360,6 +369,7 @@ class NLtoSQLStrategy:
             # unpinned, so pre-retrieval we forward best-effort). Empty on every
             # non-declining path, keeping the prompt byte-identical to the baseline.
             governed_metric=_governed_metric_block(context.declined_metric, data_source_id),
+            table_placements=table_placements,
         )
 
         t_ms = int((time.perf_counter() - t_start) * 1000)

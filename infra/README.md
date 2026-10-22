@@ -151,8 +151,8 @@ fromRoot("packages/my-new-package");
 
 ```bash
 make deploy-dev         # Full deploy: preflight → build → synth → deploy all stacks
-make destroy-dev         # Full teardown: pre-destroy checks → cdk destroy --all → verify
-make preflight           # Run pre-deploy checks only (pip, Docker, Smithy, VPC quota)
+make destroy-dev         # Teardown; the VPC and two security groups stay until AWS releases the AgentCore ENIs (~8 h), then run it again
+make preflight           # Run pre-deploy checks only (pip, Docker, Smithy, pending teardown, VPC quota)
 npx cdk synth            # Synthesize CloudFormation templates
 npx cdk deploy <stack>   # Deploy a specific stack
 npx cdk diff <stack>     # Preview changes
@@ -176,6 +176,7 @@ The default region is `us-east-1`. To deploy to a different region:
 - **pip** — detects macOS Xcode stubs that look like pip but fail at runtime
 - **Docker** — required for Lambda bundling fallback when local pip is unavailable
 - **Smithy artifacts** — ensures `smithy-generated/openapi/` contains valid specs
+- **Pending teardown** — blocks when a `make destroy-dev` of the same prefix and environment is still waiting for AgentCore to release its ENIs (the network stack is mid-delete or `DELETE_FAILED`, which CloudFormation cannot deploy over), and says when they go. Deploy under another `SCL_PREFIX` meanwhile.
 - **VPC quota** — queries the account VPC limit and blocks if saturated, when the deploy would create a VPC (not on updates or with `SCL_VPC_ID`)
 
 ### Tearing down (`make destroy-dev`)
@@ -188,26 +189,25 @@ these:
 1. **Delete AgentCore Runtimes** (serve + mcp) directly via
    `bedrock-agentcore-control delete-agent-runtime`, resolving each
    runtime's ID from the `/serve/runtime-arn` and `/mcp/runtime-arn` SSM
-   parameters.
-2. **Wait for AgentCore-owned ENIs to detach** from the runtimes'
-   security groups (`ec2 describe-network-interfaces`). AgentCore
-   Runtime ENIs are provisioned outside CFN and can take a long time to
-   detach after Runtime delete — observed up to several hours in
-   practice, not a hang (#661, see also
-   https://github.com/hashicorp/terraform-provider-aws/issues/47399 for
-   the equivalent Terraform-side report). If they haven't detached
-   within `SCL_ENI_WAIT_MAX_SECONDS` (default 600s), the script **stops
-   here** rather than proceeding into `cdk destroy`, where
-   `DeleteSecurityGroup` would just fail with `DependencyViolation`.
-   **Currently disabled** in `destroy.sh` (commented out) given the wait
-   time observed in practice — re-enable once a shorter, reliable ENI
-   detach signal is confirmed.
+   parameters, and its security groups from the runtime
+   (`networkConfiguration.networkModeConfig.securityGroups`) and by name.
+   The deletion time is tagged onto the groups (`<prefix>:runtime-deleted-at`).
+2. **Check the runtimes' ENIs, without waiting for them.** AgentCore
+   provisions them outside CFN, shares them per (subnet, security group), and
+   releases them up to 8 hours after the runtime is deleted ("the associated
+   ENI may persist in your VPC for up to 8 hours", AgentCore VPC docs;
+   a little over 8 hours on COA dev deployments). They hold only the
+   two runtime security groups, the private subnets and the VPC, so nothing
+   waits for them before step 8.
 3. **Delete VKG's per-namespace ECS services** and wait for them to
    reach `INACTIVE`. These are created outside CFN by the VKG reload
    Lambda reacting to `ontology.published` events, so ECS's
    `DeleteCluster` fails with `ClusterContainsServicesException` while
    any are active.
-4. **Force-delete the DataZone domain** via
+4. **Delete the Cloud Map services** inside the private DNS namespace. CFN
+   owns the namespace (network stack) but not the services the VKG reload
+   Lambda registers in it, and `DeleteNamespace` fails while any remain.
+5. **Force-delete the DataZone domain** via
    `datazone delete-domain --skip-deletion-check`, resolving the domain
    ID from the `/smus/domain-id` SSM parameter, then wait for it to fully
    delete. CFN already calls `DeleteProject` with `skipDeletionCheck=true`
@@ -227,11 +227,25 @@ these:
    `RemovalPolicy.RETAIN` in `namespace-stack.ts` so CFN never attempts
    (and fails) to delete any of them itself — this step is what actually
    tears the whole tree down.
-5. **`cdk destroy --all`** with the same context resolution as
-   `deploy.sh` (`SCL_PREFIX`, `SCL_PROJECT_TAG`, `SCL_VPC_ID` env vars
-   are honored), then verify no `${SCL_PREFIX:-coa}-dev-*` stacks remain.
-   If any stack is `DELETE_FAILED`, the script scans its stack events for
-   two known upstream CDK `autoDeleteObjects` failure modes —
+6. **Start deleting the connector stacks** (`${SCL_PREFIX:-coa}-dev-*-coa-connector`).
+   They are separate CDK apps under `connectors/`, so `cdk destroy` never sees
+   them. Step 8 waits for them.
+7. **`cdk destroy` every stack except network**, with the same context
+   resolution as `deploy.sh` (`SCL_PREFIX`, `SCL_PROJECT_TAG`, `SCL_VPC_ID`
+   env vars are honored), synthesized once into a per-run directory so a
+   concurrent CDK command in the same checkout cannot block it. CDK stops at
+   the first stack that fails to delete, so the script fixes the failures a
+   teardown is known to hit and runs it again: a runtime security group
+   AgentCore's ENIs still hold (retained: `RemovalPolicy.RETAIN` in
+   `lib/utils/agentcore-teardown.ts`, or `--retain-resources` for a deployment
+   created before that), a Runtime AgentCore is still deleting (retained), and
+   an access-log bucket that refilled after its auto-delete (emptied). Getting
+   serve deleted matters beyond serve: it imports exports from storage, authnz
+   and network, and CFN deletes none of those while serve exists.
+
+   Anything else stops the script. If a stack is still `DELETE_FAILED`, the
+   script scans its stack events for two known upstream CDK
+   `autoDeleteObjects` failure modes —
    `GetBucketTagging`/`NoSuchTagSet` (the custom resource's tag check
    racing bucket-policy propagation) and "bucket not empty" (the same
    race leaving objects undeleted) — and prints the exact remediation
@@ -241,16 +255,24 @@ these:
    explicit `DependsOn` ahead of the custom resource — this isn't a
    missing grant in this repo's code) — the script detects and guides
    through them, it doesn't prevent them.
+8. **Finish the network stack.** Wait for the connector stacks, delete
+   detached Lambda ENIs of this deployment whose function is gone and the
+   retained runtime security groups whose ENIs are gone, then the stack.
+   While AgentCore still holds ENIs, CloudFormation deletes only its NAT
+   gateway, Elastic IP and VPC endpoints, and the script exits **3** (only
+   while AgentCore's own ENIs hold what is left); a later run deletes the
+   rest. What is left, the exit statuses, the in-run wait and redeploying
+   meanwhile are in the [deployment guide's Tearing Down section](../external-docs/content/deploying.md#tearing-down).
 
 Prompts for confirmation before starting (skip with `SCL_DESTROY_YES=1`,
-e.g. in CI). Steps 1-4 are idempotent — if the script exits early (or a
-step warns and continues), re-running it later picks up from an
-already-deleted/in-progress state.
+e.g. in CI). Every step is idempotent: re-running the script picks up from an
+already-deleted or in-progress state. The variables are listed in the same
+section of the deployment guide.
 
-CDK destroys stacks in reverse of the dependency graph declared in
-`bin/app.ts` (the same `addDependency()` calls used for deploy ordering) —
-this script does not hand-roll stack-by-stack ordering for the CFN-owned
-resources.
+CDK destroys stacks in reverse of the dependency graph: the `addDependency()`
+calls in `bin/app.ts` plus the dependencies cross-stack references create
+(storage → network, for example). This script does not hand-roll that
+ordering; it only keeps network for step 8.
 
 ## Deployment Architecture
 
