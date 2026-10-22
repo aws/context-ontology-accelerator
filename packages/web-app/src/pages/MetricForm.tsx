@@ -3,6 +3,8 @@
 
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
+import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
+import { useNamespace } from "@api-hooks/use-namespace";
 import Form from "@cloudscape-design/components/form";
 import FormField from "@cloudscape-design/components/form-field";
 import Input from "@cloudscape-design/components/input";
@@ -32,6 +34,8 @@ import { useListSources } from "../api-hooks/use-list-sources";
 import { useListSourceTables } from "../api-hooks/use-list-source-tables";
 import { useApiClient } from "@components/ApiClientProvider";
 import { searchEntities } from "../services/ontology-engine";
+import { useAppI18n } from "../i18n/LocaleProvider";
+import type { AppMessage } from "../i18n/appMessages";
 
 const DIALECT_OPTIONS: Array<{ value: SqlDialect; label: string }> = [
   { value: SqlDialectEnum.POSTGRESQL, label: "PostgreSQL" },
@@ -54,7 +58,7 @@ export const normalizeLoadedDialect = (raw: string): string => {
   return _DIALECT_VALUES.includes(upper) ? upper : raw;
 };
 
-const TIME_GRAIN_OPTIONS = [
+const TIME_GRAIN_OPTIONS: Array<{ value: string; label: AppMessage }> = [
   { value: "", label: "None" },
   { value: "DAY", label: "Day" },
   { value: "WEEK", label: "Week" },
@@ -69,6 +73,7 @@ interface DialectRow {
 }
 
 export const MetricForm: React.FC = () => {
+  const { t } = useAppI18n();
   const navigate = useNavigate();
   const { namespaceId, metricName } = useParams<{
     namespaceId: string;
@@ -84,6 +89,27 @@ export const MetricForm: React.FC = () => {
 
   const createMutation = useCreateMetric(namespaceId ?? "");
   const updateMutation = useUpdateMetric(namespaceId ?? "", metricName ?? "");
+
+  const { name: nsName } = useNamespace(namespaceId);
+  useBreadcrumbTrail([
+    { text: nsName, href: `/namespaces/${namespaceId}`, namespaceId },
+    { text: t("Ontology") },
+    {
+      text: t("Metrics"),
+      href: `/namespaces/${namespaceId}/metrics`,
+      namespaceId,
+    },
+    ...(isEdit
+      ? [
+          {
+            text: metricName,
+            href: `/namespaces/${namespaceId}/metrics/${metricName}`,
+            namespaceId,
+          },
+          { text: t("Edit") },
+        ]
+      : [{ text: t("Create") }]),
+  ]);
 
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
@@ -140,6 +166,14 @@ export const MetricForm: React.FC = () => {
   const [warnings, setWarnings] = useState<string[]>([]);
 
   const apiClient = useApiClient();
+  const timeGrainOptions = useMemo(
+    () =>
+      TIME_GRAIN_OPTIONS.map((option) => ({
+        ...option,
+        label: t(option.label),
+      })),
+    [t],
+  );
 
   const handleConceptSearch = useCallback(
     async (text: string) => {
@@ -167,13 +201,13 @@ export const MetricForm: React.FC = () => {
         setConceptError(
           err instanceof Error
             ? err.message
-            : "Failed to search ontology classes",
+            : t("Failed to search ontology classes"),
         );
       } finally {
         setConceptLoading(false);
       }
     },
-    [apiClient, namespaceId],
+    [apiClient, namespaceId, t],
   );
 
   useEffect(() => {
@@ -216,26 +250,26 @@ export const MetricForm: React.FC = () => {
     setWarnings([]);
 
     if (!name.trim()) {
-      setFormError("Name is required");
+      setFormError(t("Name is required"));
       return;
     }
     if (!description.trim()) {
-      setFormError("Description is required");
+      setFormError(t("Description is required"));
       return;
     }
     if (!dataSourceId.trim()) {
-      setFormError("Data source is required");
+      setFormError(t("Data source is required"));
       return;
     }
     if (!sourceTable.trim()) {
-      setFormError("Source table is required");
+      setFormError(t("Source table is required"));
       return;
     }
     const validDialects = dialects.filter(
       (d) => d.dialect && d.expression.trim(),
     );
     if (validDialects.length === 0) {
-      setFormError("At least one dialect expression is required");
+      setFormError(t("At least one dialect expression is required"));
       return;
     }
 
@@ -287,7 +321,9 @@ export const MetricForm: React.FC = () => {
     <Form
       header={
         <Header variant="h1">
-          {isEdit ? `Edit ${metricName}` : "Create metric"}
+          {isEdit
+            ? t("Edit {name}", { name: metricName ?? "" })
+            : t("Create metric")}
         </Header>
       }
       actions={
@@ -296,10 +332,10 @@ export const MetricForm: React.FC = () => {
             variant="link"
             onClick={() => navigate(`/namespaces/${namespaceId}/metrics`)}
           >
-            Cancel
+            {t("Cancel")}
           </Button>
           <Button variant="primary" onClick={handleSubmit} loading={isPending}>
-            {isEdit ? "Save changes" : "Create metric"}
+            {isEdit ? t("Save changes") : t("Create metric")}
           </Button>
         </SpaceBetween>
       }
@@ -312,32 +348,38 @@ export const MetricForm: React.FC = () => {
           </Alert>
         )}
 
-        <Container header={<Header variant="h2">Basic information</Header>}>
+        <Container
+          header={<Header variant="h2">{t("Basic information")}</Header>}
+        >
           <SpaceBetween size="m">
             <FormField
-              label="Name"
-              constraintText="Alphanumeric and underscores, 1-128 characters"
+              label={t("Name")}
+              constraintText={t(
+                "Alphanumeric and underscores, 1-128 characters",
+              )}
             >
               <Input
                 value={name}
                 onChange={({ detail }) => setName(detail.value)}
                 disabled={isEdit}
-                placeholder="monthly_revenue"
+                placeholder={t("monthly_revenue")}
               />
             </FormField>
-            <FormField label="Description">
+            <FormField label={t("Description")}>
               <Textarea
                 value={description}
                 onChange={({ detail }) => setDescription(detail.value)}
-                placeholder="Total revenue from all orders in a calendar month"
+                placeholder={t(
+                  "Total revenue from all orders in a calendar month",
+                )}
               />
             </FormField>
           </SpaceBetween>
         </Container>
 
-        <Container header={<Header variant="h2">Source</Header>}>
+        <Container header={<Header variant="h2">{t("Source")}</Header>}>
           <SpaceBetween size="m">
-            <FormField label="Data source">
+            <FormField label={t("Data source")}>
               <Select
                 selectedOption={
                   sourceOptions.find((o) => o.value === dataSourceId) ?? null
@@ -348,13 +390,13 @@ export const MetricForm: React.FC = () => {
                   if (newId !== dataSourceId) setSourceTable("");
                 }}
                 options={sourceOptions}
-                placeholder="Select a data source"
+                placeholder={t("Select a data source")}
                 filteringType="auto"
-                loadingText="Loading sources"
-                empty="No sources available"
+                loadingText={t("Loading sources")}
+                empty={t("No sources available")}
               />
             </FormField>
-            <FormField label="Source table">
+            <FormField label={t("Source table")}>
               <Select
                 selectedOption={
                   tableOptions.find((o) => o.value === sourceTable) ?? null
@@ -363,52 +405,57 @@ export const MetricForm: React.FC = () => {
                   setSourceTable(detail.selectedOption.value ?? "")
                 }
                 options={tableOptions}
-                placeholder="Select a table"
+                placeholder={t("Select a table")}
                 filteringType="auto"
                 statusType={tablesFetching ? "loading" : "finished"}
-                loadingText="Loading tables"
+                loadingText={t("Loading tables")}
                 empty={
                   dataSourceId
-                    ? "No tables found for this source"
-                    : "Select a data source first"
+                    ? t("No tables found for this source")
+                    : t("Select a data source first")
                 }
                 disabled={!dataSourceId}
               />
             </FormField>
             <FormField
-              label="Default time grain (optional)"
-              description="Default time granularity for aggregation (e.g., DAY, MONTH). Used when no grain is specified in a query."
+              label={t("Default time grain (optional)")}
+              description={t(
+                "Default time granularity for aggregation (e.g., DAY, MONTH). Used when no grain is specified in a query.",
+              )}
             >
               <Select
                 selectedOption={
-                  TIME_GRAIN_OPTIONS.find(
-                    (o) => o.value === defaultTimeGrain,
-                  ) ?? TIME_GRAIN_OPTIONS[0]
+                  timeGrainOptions.find((o) => o.value === defaultTimeGrain) ??
+                  timeGrainOptions[0]
                 }
                 onChange={({ detail }) =>
                   setDefaultTimeGrain(detail.selectedOption.value ?? "")
                 }
-                options={TIME_GRAIN_OPTIONS}
+                options={timeGrainOptions}
               />
             </FormField>
             <FormField
-              label="Unit (optional)"
-              description="Unit of measurement for the metric result (e.g., USD, claims, percentage)."
+              label={t("Unit (optional)")}
+              description={t(
+                "Unit of measurement for the metric result (e.g., USD, claims, percentage).",
+              )}
             >
               <Input
                 value={unit}
                 onChange={({ detail }) => setUnit(detail.value)}
-                placeholder="currency"
+                placeholder={t("currency")}
               />
             </FormField>
             <FormField
-              label="Return type (optional)"
-              description="Data type returned by the expression (e.g., INTEGER, DECIMAL, FLOAT)."
+              label={t("Return type (optional)")}
+              description={t(
+                "Data type returned by the expression (e.g., INTEGER, DECIMAL, FLOAT).",
+              )}
             >
               <Input
                 value={returnType}
                 onChange={({ detail }) => setReturnType(detail.value)}
-                placeholder="xsd:decimal"
+                placeholder={t("xsd:decimal")}
               />
             </FormField>
           </SpaceBetween>
@@ -418,9 +465,11 @@ export const MetricForm: React.FC = () => {
           header={
             <Header
               variant="h2"
-              description="SQL expression to compute this metric. Add one per SQL dialect your sources use."
+              description={t(
+                "SQL expression to compute this metric. Add one per SQL dialect your sources use.",
+              )}
             >
-              Expressions
+              {t("Expressions")}
             </Header>
           }
         >
@@ -437,11 +486,11 @@ export const MetricForm: React.FC = () => {
               updated.splice(detail.itemIndex, 1);
               setDialects(updated);
             }}
-            addButtonText="Add dialect"
-            removeButtonText="Remove"
+            addButtonText={t("Add dialect")}
+            removeButtonText={t("Remove")}
             definition={[
               {
-                label: "Dialect",
+                label: t("Dialect"),
                 control: (item, itemIndex) => (
                   <Select
                     selectedOption={
@@ -463,7 +512,7 @@ export const MetricForm: React.FC = () => {
                 ),
               },
               {
-                label: "SQL Expression",
+                label: t("SQL Expression"),
                 control: (item, itemIndex) => (
                   <Textarea
                     value={item.expression}
@@ -475,7 +524,7 @@ export const MetricForm: React.FC = () => {
                       };
                       setDialects(updated);
                     }}
-                    placeholder="SUM(orders.total_amount)"
+                    placeholder={t("SUM(orders.total_amount)")}
                     rows={2}
                   />
                 ),
@@ -484,18 +533,22 @@ export const MetricForm: React.FC = () => {
           />
         </Container>
 
-        <Container header={<Header variant="h2">AI Context (optional)</Header>}>
+        <Container
+          header={<Header variant="h2">{t("AI Context (optional)")}</Header>}
+        >
           <SpaceBetween size="m">
             <FormField
-              label="Synonyms"
-              description="Alternative names users might use when asking about this metric."
+              label={t("Synonyms")}
+              description={t(
+                "Alternative names users might use when asking about this metric.",
+              )}
             >
               <SpaceBetween size="xs">
                 <Grid gridDefinition={[{ colspan: 10 }, { colspan: 2 }]}>
                   <Input
                     value={synonymInput}
                     onChange={({ detail }) => setSynonymInput(detail.value)}
-                    placeholder="Add synonym and press Enter"
+                    placeholder={t("Add synonym and press Enter")}
                     onKeyDown={({ detail }) => {
                       if (detail.key === "Enter" && synonymInput.trim()) {
                         setSynonyms([...synonyms, synonymInput.trim()]);
@@ -511,7 +564,7 @@ export const MetricForm: React.FC = () => {
                       }
                     }}
                   >
-                    Add
+                    {t("Add")}
                   </Button>
                 </Grid>
                 {synonyms.length > 0 && (
@@ -532,19 +585,23 @@ export const MetricForm: React.FC = () => {
               </SpaceBetween>
             </FormField>
             <FormField
-              label="Instructions"
-              description="Guidance for the AI on when and how to use this metric."
+              label={t("Instructions")}
+              description={t(
+                "Guidance for the AI on when and how to use this metric.",
+              )}
             >
               <Textarea
                 value={instructions}
                 onChange={({ detail }) => setInstructions(detail.value)}
-                placeholder="Use with order_date as time dimension."
+                placeholder={t("Use with order_date as time dimension.")}
                 rows={3}
               />
             </FormField>
             <FormField
-              label="Examples"
-              description="Example natural language questions this metric answers."
+              label={t("Examples")}
+              description={t(
+                "Example natural language questions this metric answers.",
+              )}
             >
               <AttributeEditor
                 items={examples}
@@ -556,11 +613,11 @@ export const MetricForm: React.FC = () => {
                   updated.splice(detail.itemIndex, 1);
                   setExamples(updated);
                 }}
-                addButtonText="Add example"
-                removeButtonText="Remove"
+                addButtonText={t("Add example")}
+                removeButtonText={t("Remove")}
                 definition={[
                   {
-                    label: "Question",
+                    label: t("Question"),
                     control: (item, itemIndex) => (
                       <Input
                         value={item.value}
@@ -569,7 +626,9 @@ export const MetricForm: React.FC = () => {
                           updated[itemIndex] = { value: detail.value };
                           setExamples(updated);
                         }}
-                        placeholder="What was the total revenue last month?"
+                        placeholder={t(
+                          "What was the total revenue last month?",
+                        )}
                       />
                     ),
                   },
@@ -580,11 +639,15 @@ export const MetricForm: React.FC = () => {
         </Container>
 
         <Container
-          header={<Header variant="h2">Ontology Links (optional)</Header>}
+          header={
+            <Header variant="h2">{t("Ontology Links (optional)")}</Header>
+          }
         >
           <FormField
-            label="Ontology classes"
-            description="Search for classes from your ontology to link to this metric."
+            label={t("Ontology classes")}
+            description={t(
+              "Search for classes from your ontology to link to this metric.",
+            )}
             errorText={conceptError}
           >
             <SpaceBetween size="xs">
@@ -603,11 +666,11 @@ export const MetricForm: React.FC = () => {
                 }}
                 options={conceptOptions}
                 statusType={conceptLoading ? "loading" : "finished"}
-                placeholder="Type to search classes…"
-                empty="No classes found"
-                loadingText="Searching…"
+                placeholder={t("Type to search classes…")}
+                empty={t("No classes found")}
+                loadingText={t("Searching…")}
                 filteringType="manual"
-                enteredTextLabel={(v) => `Use: "${v}"`}
+                enteredTextLabel={(value) => t('Use: "{value}"', { value })}
               />
               {ontologyConcepts.length > 0 && (
                 <SpaceBetween direction="horizontal" size="xs">

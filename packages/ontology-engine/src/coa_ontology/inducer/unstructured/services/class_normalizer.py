@@ -13,10 +13,10 @@ fresh IRI through the
 
 The decision is bucketed into three :class:`MatchBand` values:
 
-- ``exact``       — cosine ≥ ``EXACT_THRESHOLD`` (default 0.95). The
-  caller MUST reuse the matched IRI as-is. No new IRI is minted; the
-  index is NOT updated for the class (the existing entry already
-  represents this class).
+- ``exact``       — the deterministic label key matches, or cosine ≥
+  ``EXACT_THRESHOLD`` (default 0.95). The caller MUST reuse the matched
+  IRI as-is. No new IRI is minted; the index is NOT updated for the
+  class (the existing entry already represents this class).
 - ``close_match`` — ``CLOSE_MATCH_THRESHOLD`` ≤ cosine < ``EXACT_THRESHOLD``
   (default 0.80 ≤ x < 0.95). A new IRI IS minted, the new (label,
   vector, IRI) tuple is added to the index, and the caller is
@@ -110,6 +110,8 @@ import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal, Protocol
 
+from coa_ontology.inducer.unstructured.services.iri_resolver import normalize_for_lookup_key
+
 if TYPE_CHECKING:
     from coa_ontology.inducer.unstructured.services.iri_resolver import (
         IRIResolver,
@@ -137,6 +139,10 @@ class NormalizationResult:
         band: One of ``"exact"`` / ``"close_match"`` / ``"novel"``.
         similarity_score: The cosine similarity to the top-1 nearest
             existing class embedding, or ``0.0`` if the index was empty.
+            **Not always a measured cosine:** the deterministic
+            lookup-key path never embeds and reports ``1.0``, the
+            ``exact`` band's ceiling. Treat this as a confidence
+            ordering, not as a metric to average.
         matched_existing_iri: The IRI of the top-1 match when present —
             populated for the ``exact`` and ``close_match`` bands. ``None``
             for ``novel`` (per spec Req 9.5: novel is "no link to
@@ -147,6 +153,12 @@ class NormalizationResult:
             ``"none"`` / ``"instance"`` / ``"schema"`` / ``None``).
             Threaded through verbatim from the caller for traceability;
             the normalizer never branches on it.
+        preferred_label: The first-seen label for the class IRI. Exact
+            matches reuse the matched index entry's label so downstream
+            RDF emission can keep one stable preferred label.
+        alternative_labels: Observed labels consolidated into the same
+            class IRI. This contains the current input label for an exact
+            match when it differs from ``preferred_label``.
     """
 
     class_iri: str
@@ -154,6 +166,8 @@ class NormalizationResult:
     similarity_score: float
     matched_existing_iri: str | None = None
     source_mode: str | None = None
+    preferred_label: str | None = None
+    alternative_labels: tuple[str, ...] = ()
 
 
 class ClassEmbeddingClient(Protocol):
@@ -207,6 +221,18 @@ class InMemoryClassEmbeddingIndex:
     # Maps the canonical embed text to a cached vector. Populated by
     # ``normalize`` when it embeds; consulted by ``embed_or_cache``.
     embed_cache: dict[str, list[float]] = field(default_factory=dict)
+    # Maps the deterministic lookup key to the FIRST entry that produced
+    # it, so ``find_by_label`` is O(1) instead of re-normalizing every
+    # stored label on every lookup. Rebuilt from ``entries`` on demand
+    # when a caller populates ``entries`` directly (e.g. a test fixture
+    # constructing ``InMemoryClassEmbeddingIndex(entries=[...])``).
+    entries_by_lookup_key: dict[str, _IndexEntry] = field(default_factory=dict)
+    # Number of ``entries`` already folded into ``entries_by_lookup_key``.
+    # Compared against ``len(entries)`` to detect direct mutation. A plain
+    # length comparison against the map would not work: two labels can
+    # share one lookup key, and a blank label yields none at all, so the
+    # map is legitimately smaller than ``entries``.
+    indexed_entry_count: int = 0
 
     # ── Public surface ────────────────────────────────────────────────
 
@@ -225,15 +251,23 @@ class InMemoryClassEmbeddingIndex:
 
         Does NOT deduplicate. Callers that need exact-match deduplication
         should consult :meth:`top_k` first and act on the returned band.
+
+        The entry is also registered in the lookup-key map that backs
+        :meth:`find_by_label`. Registration is first-seen-wins so the
+        deterministic match keeps returning the same entry it returned
+        before this index grew.
         """
-        self.entries.append(
-            _IndexEntry(
-                label=label,
-                description=description,
-                vector=vector,
-                iri=iri,
-            )
+        entry = _IndexEntry(
+            label=label,
+            description=description,
+            vector=vector,
+            iri=iri,
         )
+        self.entries.append(entry)
+        lookup_key = normalize_for_lookup_key(label)
+        if lookup_key:
+            self.entries_by_lookup_key.setdefault(lookup_key, entry)
+        self.indexed_entry_count = len(self.entries)
 
     def top_k(self, vector: list[float], k: int = 1) -> list[tuple[float, _IndexEntry]]:
         """Return the top-``k`` nearest entries by cosine similarity.
@@ -257,6 +291,42 @@ class InMemoryClassEmbeddingIndex:
             scored.append((_cosine(vector, entry.vector), entry))
         scored.sort(key=lambda pair: pair[0], reverse=True)
         return scored[:k]
+
+    def find_by_label(self, label: str) -> _IndexEntry | None:
+        """Return the first entry with the same deterministic lookup key.
+
+        This handles safe lexical variants before semantic similarity is
+        consulted. The lookup-key normalizer is shared with IRI resolution,
+        so every variant it considers equivalent converges without depending
+        on an embedding model's score.
+
+        Backed by :attr:`entries_by_lookup_key`, so a lookup costs one
+        normalization of ``label`` rather than one per stored entry. The
+        map is refreshed first when ``entries`` was populated without
+        going through :meth:`add`.
+        """
+        lookup_key = normalize_for_lookup_key(label)
+        if not lookup_key:
+            return None
+        if self.indexed_entry_count != len(self.entries):
+            self._reindex_lookup_keys()
+        return self.entries_by_lookup_key.get(lookup_key)
+
+    # ── Internals ─────────────────────────────────────────────────────
+
+    def _reindex_lookup_keys(self) -> None:
+        """Rebuild the lookup-key map from ``entries``, first-seen wins.
+
+        Only reached when ``entries`` was mutated directly instead of via
+        :meth:`add` — the map is otherwise maintained incrementally.
+        """
+        rebuilt: dict[str, _IndexEntry] = {}
+        for entry in self.entries:
+            lookup_key = normalize_for_lookup_key(entry.label)
+            if lookup_key:
+                rebuilt.setdefault(lookup_key, entry)
+        self.entries_by_lookup_key = rebuilt
+        self.indexed_entry_count = len(self.entries)
 
 
 # ── Internals ───────────────────────────────────────────────────────────
@@ -356,11 +426,12 @@ def normalize(
 
     For each ``(label, description)`` pair, in iteration order:
 
-    1. Build the embedding text via :func:`_build_embedding_text`.
-    2. Embed it via ``embedding_client.embed_text`` (with caching).
-    3. Run a top-1 cosine kNN against the running ``index``.
-    4. Bucket the top hit into a :class:`MatchBand`.
-    5. For ``exact``: reuse ``hit.iri``; do NOT add to the index.
+    1. Reuse a deterministic label-key match when one exists.
+    2. Build the embedding text via :func:`_build_embedding_text`.
+    3. Embed it via ``embedding_client.embed_text`` (with caching).
+    4. Run a top-1 cosine kNN against the running ``index``.
+    5. Bucket the top hit into a :class:`MatchBand`.
+    6. For ``exact``: reuse ``hit.iri``; do NOT add to the index.
        For ``close_match`` / ``novel``: mint a fresh IRI via
        ``iri_resolver.resolve(label, "class")`` (the literal ``"class"``
        token disambiguates T-Box class IRIs from A-Box individual IRIs;
@@ -406,6 +477,31 @@ def normalize(
     results: dict[str, NormalizationResult] = {}
 
     for label, description in classes.items():
+        deterministic_match = index.find_by_label(label)
+        if deterministic_match is not None:
+            preferred_label = deterministic_match.label
+            results[label] = NormalizationResult(
+                class_iri=deterministic_match.iri,
+                band="exact",
+                # 1.0 is asserted, not measured: this path never embeds, so
+                # no cosine exists. The lookup key is a stricter identity
+                # test than the 0.95 cosine threshold, so reporting the
+                # band's ceiling keeps the field monotonic with confidence.
+                # Consumers that need a measured score must filter on
+                # ``source_mode``/band rather than reading this as a cosine.
+                similarity_score=1.0,
+                matched_existing_iri=deterministic_match.iri,
+                source_mode=source_mode,
+                preferred_label=preferred_label,
+                alternative_labels=(label,) if label != preferred_label else (),
+            )
+            log.debug(
+                "Class %r: deterministic label match %r — exact",
+                label,
+                preferred_label,
+            )
+            continue
+
         text = _build_embedding_text(label, description)
         log.debug(
             "Class %r: embedding %d-char text (index size=%d)",
@@ -471,6 +567,8 @@ def normalize(
                 similarity_score=score,
                 matched_existing_iri=matched_iri,
                 source_mode=source_mode,
+                preferred_label=top.label,
+                alternative_labels=(label,) if label != top.label else (),
             )
             continue
 
@@ -494,6 +592,7 @@ def normalize(
                 similarity_score=0.0,
                 matched_existing_iri=None,
                 source_mode=source_mode,
+                preferred_label=label,
             )
             continue
 
@@ -514,6 +613,7 @@ def normalize(
             # so we don't surface the matched_existing_iri there.
             matched_existing_iri=matched_iri if band == "close_match" else None,
             source_mode=source_mode,
+            preferred_label=label,
         )
 
     log.info(
@@ -559,6 +659,7 @@ def _resolve_novel(
             similarity_score=score,
             matched_existing_iri=None,
             source_mode=source_mode,
+            preferred_label=label,
         )
 
     if index_to_update is not None and vector:
@@ -575,4 +676,5 @@ def _resolve_novel(
         similarity_score=score,
         matched_existing_iri=None,
         source_mode=source_mode,
+        preferred_label=label,
     )

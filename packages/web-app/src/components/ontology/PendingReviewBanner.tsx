@@ -11,8 +11,10 @@ import Alert from "@cloudscape-design/components/alert";
 import Button from "@cloudscape-design/components/button";
 import { listProposals, type Proposal } from "../../services/ontology-engine";
 import { useApiClient } from "@components/ApiClientProvider";
+import { useAppI18n } from "../../i18n/LocaleProvider";
 
 export function PendingReviewBanner() {
+  const { t } = useAppI18n();
   const { namespaceId } = useParams<{ namespaceId: string }>();
   const apiClient = useApiClient();
   const navigate = useNavigate();
@@ -36,7 +38,12 @@ export function PendingReviewBanner() {
   return (
     <Alert
       type="info"
-      header={`${pending.length} proposal${pending.length > 1 ? "s" : ""} awaiting review`}
+      header={t(
+        pending.length === 1
+          ? "{count} proposal awaiting review"
+          : "{count} proposals awaiting review",
+        { count: pending.length },
+      )}
       action={
         <Button
           onClick={() =>
@@ -45,12 +52,13 @@ export function PendingReviewBanner() {
             )
           }
         >
-          Review proposal
+          {t("Review proposal")}
         </Button>
       }
     >
-      New ontology changes have been proposed and are pending your review before
-      they are added to the knowledge graph.
+      {t(
+        "New ontology changes have been proposed and are pending your review before they are added to the knowledge graph.",
+      )}
     </Alert>
   );
 }

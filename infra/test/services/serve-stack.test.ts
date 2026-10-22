@@ -1015,3 +1015,24 @@ describe("ServeStack - Cedar policy source", () => {
     }
   });
 });
+
+describe("ServeStack - teardown", () => {
+  // AgentCore's ENIs keep AgentCoreSG in use for hours after the runtime is
+  // deleted. Retained, the stack deletes at once instead of failing on the group
+  // and keeping storage, authnz and network alive; destroy.sh deletes the group.
+  it("retains the runtime security group and tags it for destroy.sh", () => {
+    createStack().hasResource("AWS::EC2::SecurityGroup", {
+      DeletionPolicy: "Retain",
+      UpdateReplacePolicy: "Retain",
+      Properties: Match.objectLike({
+        GroupDescription: "AgentCore Runtime - Context Manager",
+        Tags: Match.arrayWith([
+          {
+            Key: `${DEFAULT_RESOURCE_PREFIX}:teardown`,
+            Value: "delete-after-eni-release",
+          },
+        ]),
+      }),
+    });
+  });
+});

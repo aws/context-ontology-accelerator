@@ -20,6 +20,8 @@ import StatusIndicator from "@cloudscape-design/components/status-indicator";
 import type { StatusIndicatorProps } from "@cloudscape-design/components/status-indicator";
 
 import { useApiClient } from "@components";
+import { useAppI18n, type AppTranslate } from "../i18n/LocaleProvider";
+import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
 
 interface OntologyInductionHealth {
   graphStore?: string;
@@ -45,12 +47,12 @@ function statusType(status: ComponentStatus): StatusIndicatorProps.Type {
   return "error";
 }
 
-function statusLabel(status: ComponentStatus): string {
-  if (status === "ok") return "Healthy";
-  if (status === "loading") return "Checking...";
-  if (status === "degraded") return "Degraded";
+function statusLabel(status: ComponentStatus, t: AppTranslate): string {
+  if (status === "ok") return t("Healthy");
+  if (status === "loading") return t("Checking...");
+  if (status === "degraded") return t("Degraded");
   if (status.startsWith("error:")) return status.replace("error: ", "");
-  return status || "Unknown";
+  return status || t("Unknown");
 }
 
 interface HealthCardProps {
@@ -60,6 +62,7 @@ interface HealthCardProps {
 }
 
 function HealthCard({ title, description, status }: HealthCardProps) {
+  const { t } = useAppI18n();
   return (
     <Container>
       <SpaceBetween size="xs">
@@ -68,7 +71,7 @@ function HealthCard({ title, description, status }: HealthCardProps) {
           {description}
         </Box>
         <StatusIndicator type={statusType(status)}>
-          {statusLabel(status)}
+          {statusLabel(status, t)}
         </StatusIndicator>
       </SpaceBetween>
     </Container>
@@ -76,6 +79,11 @@ function HealthCard({ title, description, status }: HealthCardProps) {
 }
 
 export function SystemHealthPage() {
+  const { locale, t } = useAppI18n();
+  useBreadcrumbTrail([
+    { text: t("Administration") },
+    { text: t("System Health") },
+  ]);
   const apiClient = useApiClient();
   const [health, setHealth] = useState<SystemHealthResponse | null>(null);
   const [loading, setLoading] = useState(true);
@@ -91,13 +99,13 @@ export function SystemHealthPage() {
       setLastChecked(new Date());
     } catch (e) {
       setError(
-        e instanceof Error ? e.message : "Failed to fetch system health",
+        e instanceof Error ? e.message : t("Failed to fetch system health"),
       );
       setHealth(null);
     } finally {
       setLoading(false);
     }
-  }, [apiClient]);
+  }, [apiClient, t]);
 
   useEffect(() => {
     fetchHealth();
@@ -113,14 +121,16 @@ export function SystemHealthPage() {
     <SpaceBetween size="l">
       <Header
         variant="h1"
-        description="Real-time health status of all backend storage and AI services"
+        description={t(
+          "Real-time health status of all backend storage and AI services",
+        )}
         actions={
           <Button iconName="refresh" onClick={fetchHealth} loading={loading}>
-            Refresh
+            {t("Refresh")}
           </Button>
         }
       >
-        System Health
+        {t("System Health")}
       </Header>
 
       <Container
@@ -129,51 +139,53 @@ export function SystemHealthPage() {
             variant="h2"
             description={
               lastChecked
-                ? `Last checked: ${lastChecked.toLocaleTimeString()}`
+                ? t("Last checked: {time}", {
+                    time: lastChecked.toLocaleTimeString(locale),
+                  })
                 : undefined
             }
           >
-            Overall Status
+            {t("Overall Status")}
           </Header>
         }
       >
         <StatusIndicator type={statusType(overallStatus)}>
           {overallStatus === "ok"
-            ? "All systems operational"
+            ? t("All systems operational")
             : overallStatus === "loading"
-              ? "Checking backend health..."
+              ? t("Checking backend health...")
               : error
-                ? `Unreachable: ${error}`
-                : "One or more systems degraded"}
+                ? t("Unreachable: {error}", { error })
+                : t("One or more systems degraded")}
         </StatusIndicator>
       </Container>
 
-      <Header variant="h2">Storage Backends</Header>
+      <Header variant="h2">{t("Storage Backends")}</Header>
 
       <ColumnLayout columns={3}>
         <HealthCard
           title="DynamoDB"
-          description="Sources and metadata table"
+          description={t("Sources and metadata table")}
           status={loading ? "loading" : (health?.dynamodb ?? "unknown")}
         />
         <HealthCard
           title="Neptune KG"
-          description="GraphRAG knowledge graph (Gremlin/openCypher)"
+          description={t("GraphRAG knowledge graph (Gremlin/openCypher)")}
           status={loading ? "loading" : (health?.neptuneKg ?? "unknown")}
         />
         <HealthCard
           title="OpenSearch Serverless"
-          description="Vector embeddings collection (AOSS)"
+          description={t("Vector embeddings collection (AOSS)")}
           status={loading ? "loading" : (health?.opensearch ?? "unknown")}
         />
       </ColumnLayout>
 
-      <Header variant="h2">Ontology Induction</Header>
+      <Header variant="h2">{t("Ontology Induction")}</Header>
 
       <ColumnLayout columns={2}>
         <HealthCard
-          title="Ontology Graph Store"
-          description="Neptune DB — RDF/OWL ontology triples"
+          title={t("Ontology Graph Store")}
+          description={t("Neptune DB — RDF/OWL ontology triples")}
           status={
             loading
               ? "loading"
@@ -181,8 +193,10 @@ export function SystemHealthPage() {
           }
         />
         <HealthCard
-          title="Ontology Vector Store"
-          description="OpenSearch — ontology embeddings and semantic search"
+          title={t("Ontology Vector Store")}
+          description={t(
+            "OpenSearch — ontology embeddings and semantic search",
+          )}
           status={
             loading
               ? "loading"
@@ -190,8 +204,10 @@ export function SystemHealthPage() {
           }
         />
         <HealthCard
-          title="Bedrock Embeddings"
-          description="Amazon Bedrock — text embedding model for vector generation"
+          title={t("Bedrock Embeddings")}
+          description={t(
+            "Amazon Bedrock — text embedding model for vector generation",
+          )}
           status={
             loading
               ? "loading"
@@ -199,8 +215,10 @@ export function SystemHealthPage() {
           }
         />
         <HealthCard
-          title="Description LLM"
-          description="Amazon Bedrock Converse — LLM for entity descriptions and induction"
+          title={t("Description LLM")}
+          description={t(
+            "Amazon Bedrock Converse — LLM for entity descriptions and induction",
+          )}
           status={
             loading
               ? "loading"

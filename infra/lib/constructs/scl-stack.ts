@@ -8,6 +8,7 @@ import {
   RESERVED_DATASOURCE_ROLE_SEGMENT,
   ReservedRoleNamePrefix,
 } from "../aspects/reserved-role-prefix";
+import { solutionStackDescription } from "../solution";
 
 /**
  * Base stack for all SemanticContext CloudFormation stacks.
@@ -40,7 +41,11 @@ export class SCLStack extends cdk.Stack {
   public readonly envName: string;
 
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
-    super(scope, id, props);
+    super(scope, id, {
+      ...props,
+      // AWS Solutions counts stack launches by the `(SO0376)` description prefix.
+      description: props?.description ?? solutionStackDescription(id),
+    });
 
     const { envName, projectTag } = resolveContext(this.node);
     cdk.Tags.of(this).add("Project", projectTag);

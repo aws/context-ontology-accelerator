@@ -524,3 +524,11 @@ describe("alarms", () => {
     }
   });
 });
+
+describe("the stack description", () => {
+  it("starts with the AWS Solutions ID", () => {
+    expect(synthManaged().toJSON().Description).toMatch(
+      /^\(SO0376\) - Context Ontology Accelerator - databricks-coa-connector\. Version v\d+\.\d+\.\d+/,
+    );
+  });
+});
