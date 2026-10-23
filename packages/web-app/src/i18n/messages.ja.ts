@@ -24,6 +24,7 @@ export const MESSAGES_JA = {
   Home: "ホーム",
   Serve: "提供",
   Playground: "プレイグラウンド",
+  "MCP Server": "MCP サーバー",
   Administration: "管理",
   Namespaces: "名前空間",
   Identity: "ID 管理",
@@ -109,6 +110,8 @@ export const MESSAGES_JA = {
     "サインインに失敗しました。もう一度お試しください。",
   Standard: "標準",
   "Deep Reasoning": "深い推論",
+  "The SPARQL and SQL Deep Reasoning generated and {engine} executed.":
+    "深い推論が生成し、{engine} が実行した SPARQL と SQL。",
   "Execution mode": "実行モード",
   "New chat": "新しいチャット",
   Rationale: "根拠",

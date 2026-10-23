@@ -278,6 +278,10 @@ class ResponseAssembler:
         model_id: str | None = None,
         partial: bool = False,
         ontology_version: str | None = None,
+        execution_mode: str | None = None,
+        query_used: str | None = None,
+        sparql_generated: str | None = None,
+        include_debug_info: bool = False,
     ) -> QueryResult:
         """Build a Tier-3 QueryResult from an agentic synthesis.
 
@@ -299,6 +303,17 @@ class ResponseAssembler:
                 the reasoning loop short); surfaced on the QueryResult.
             ontology_version: Version of the ontology the query ran against,
                 when the caller can name one (#986).
+            execution_mode: The resolved execution mode ("standard" /
+                "deep-reasoning"); surfaced structurally on the QueryResult so the
+                console can label a Deep Reasoning answer by its MODE rather than
+                mis-reading its Tier-3 resolution as Standard mode's Tier-3 label
+                (#1166). ``None`` leaves the field unset.
+            query_used: SQL the agentic loop built + executed (#1166).
+            sparql_generated: SPARQL the agentic loop built + executed (#1166).
+            include_debug_info: When False (default), ``query_used`` /
+                ``sparql_generated`` are WITHHELD — they expose internal schema,
+                exactly as the Tier-2 assembler withholds them. Opt in via
+                ``options.includeDebugInfo=true``.
 
         Returns:
             A QueryResult tagged as Tier 3.
@@ -319,6 +334,13 @@ class ResponseAssembler:
             supporting_content=None if supporting_content is None else list(supporting_content),
             graph_context={"entities": list(graph_context)},
             guardrail_blocked=guardrail_blocked,
+            # Same includeDebugInfo gate as the Tier-2 assembler: the compiled SQL
+            # and generated SPARQL expose internal schema, so withhold them unless
+            # the caller opted in. This closes the Deep-Reasoning artifact gap
+            # (#1166) without widening what a default request leaks.
+            query_used=query_used if include_debug_info else None,
+            sparql_generated=sparql_generated if include_debug_info else None,
+            execution_mode=execution_mode,
             trace=trace.steps,
             # ``partial`` signals the answer was built from INCOMPLETE inputs.
             # A degraded source (a retrieval source that errored/timed out) means the

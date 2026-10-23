@@ -453,6 +453,14 @@ structure QueryResult {
 
     /// Whether the result is partial (incomplete).
     partial: Boolean
+
+    /// The execution mode that produced this result: "standard" or
+    /// "deep-reasoning". Deep Reasoning is a mode orthogonal to the tier
+    /// cascade, so a client labels an answer by this field rather than
+    /// inferring mode from `tier` (a Deep Reasoning answer resolves at tier 3
+    /// but is not Standard mode's Tier-3 result). Absent on responses that do
+    /// not set it.
+    executionMode: String
 }
 
 // ══════════════════════════════════════════════════════════════════════════════

@@ -329,6 +329,47 @@ class TestOntologyVersionTruthfulness:
 
         assert response.result.metadata["mode"] == "deep-reasoning"
         assert response.result.ontology_version is None
+        # #1166 cut #2: mode is ALSO surfaced structurally (not only in free-form
+        # metadata) so the console labels by mode instead of mis-reading tier=3.
+        assert response.result.execution_mode == "deep-reasoning"
+
+    @pytest.mark.asyncio
+    async def test_deep_reasoning_query_artifacts_gated_by_debug_info(self):
+        """#1166 cut #3: Deep Reasoning returns the SQL/SPARQL its agentic loop ran
+        — but only when the caller opts in via options.includeDebugInfo (same gate
+        as Standard mode). Default request withholds them (info-disclosure)."""
+
+        def _make_dr_orch():
+            orch = _make_orchestrator()
+            orch._agentic_retriever = AsyncMock()
+            orch._agentic_retriever.resolve.return_value = Tier3Result(
+                synthesized_answer="Answer from executed queries.",
+                supporting_content=(),
+                graph_context=(),
+                confidence=0.7,
+                trace_steps=(),
+                query_used="SELECT revenue FROM t",
+                sparql_generated="SELECT ?r WHERE { ?x :revenue ?r }",
+            )
+            return orch
+
+        # Opted in → artifacts surfaced.
+        on = await _make_dr_orch().resolve(
+            InvokeRequest(
+                query="q",
+                namespace="demo",
+                options={"mode": "deep-reasoning", "includeDebugInfo": True},
+            )
+        )
+        assert on.result.query_used == "SELECT revenue FROM t"
+        assert on.result.sparql_generated == "SELECT ?r WHERE { ?x :revenue ?r }"
+
+        # Default (no includeDebugInfo) → withheld.
+        off = await _make_dr_orch().resolve(
+            InvokeRequest(query="q", namespace="demo", options={"mode": "deep-reasoning"})
+        )
+        assert off.result.query_used is None
+        assert off.result.sparql_generated is None
 
 
 # ── Tier 1: Metric Resolution ───────────────────────────────────────────
@@ -1891,3 +1932,119 @@ class TestRunTier3SeedsEntityUris:
 
         _, kwargs = parts["knowledge_retriever"].resolve.call_args
         assert kwargs["entity_uris"] is None
+
+
+@pytest.mark.unit
+class TestResolveIncludeDebugInfo:
+    """`_resolve_include_debug_info` (#1166): artifacts returned ONLY when the
+    caller opted in (includeDebugInfo) AND holds viewNamespace — the same right
+    that gates the Sources/Tables schema view. Decoupled from the hidden default.
+    """
+
+    _NS = "ns-1166"
+
+    def _orch_with_real_cedar(self, *, fail_open_no_roles=False):
+        from coa_serve.tier2.cedar_authorizer import RealCedarAuthorizer
+
+        orch = _make_orchestrator()
+        assert isinstance(orch, Orchestrator)  # return_parts=False → single orchestrator
+        orch._firewall = SQLFirewall(cedar_authorizer=RealCedarAuthorizer(fail_open_no_roles=fail_open_no_roles))
+        return orch
+
+    def _profile(self, role_ns):
+        return {"userId": "u", "resourceRoles": [{"role": "data-analyst", "resourceUID": role_ns}]}
+
+    def test_flag_off_short_circuits_to_false(self):
+        """No opt-in → False without even consulting Cedar (and so no leak)."""
+        orch = self._orch_with_real_cedar()
+        assert orch._resolve_include_debug_info({}, self._NS, self._profile(self._NS)) is False
+        assert orch._resolve_include_debug_info({"includeDebugInfo": False}, self._NS, self._profile(self._NS)) is False
+
+    def test_flag_on_and_can_view_returns_true(self):
+        """Opt-in + viewNamespace on this namespace → artifacts allowed."""
+        orch = self._orch_with_real_cedar()
+        assert orch._resolve_include_debug_info({"includeDebugInfo": True}, self._NS, self._profile(self._NS)) is True
+
+    def test_flag_on_but_cannot_view_returns_false(self):
+        """NEGATIVE CONTROL: opt-in set but principal lacks viewNamespace on this
+        namespace → artifacts STRIPPED. This is the escalation the gate blocks."""
+        orch = self._orch_with_real_cedar()
+        assert (
+            orch._resolve_include_debug_info({"includeDebugInfo": True}, self._NS, self._profile("other-ns")) is False
+        )
+
+    def test_flag_on_no_roles_prod_returns_false(self):
+        """Opt-in + no resolved roles in prod → fail-closed, no artifacts."""
+        orch = self._orch_with_real_cedar(fail_open_no_roles=False)
+        assert orch._resolve_include_debug_info({"includeDebugInfo": True}, self._NS, {"userId": "u"}) is False
+
+    def test_none_options_returns_false(self):
+        orch = self._orch_with_real_cedar()
+        assert orch._resolve_include_debug_info(None, self._NS, self._profile(self._NS)) is False
+
+
+@pytest.mark.unit
+class TestArtifactVisibilityEndToEnd:
+    """End-to-end through ``resolve()`` (orchestrator → firewall → Cedar →
+    assembler → response): the role gate decides whether the assembled response
+    actually carries query_used / sparql_generated (#1166)."""
+
+    def _real_cedar_orch(self):
+        from coa_serve.tier2.cedar_authorizer import RealCedarAuthorizer
+
+        orch = _make_orchestrator(tier2_success=True, tier2_ontop_assembly=True)
+        assert isinstance(orch, Orchestrator)
+        orch._firewall = SQLFirewall(cedar_authorizer=RealCedarAuthorizer(fail_open_no_roles=False))
+        return orch
+
+    @pytest.mark.asyncio
+    async def test_viewnamespace_holder_sees_artifacts(self):
+        """A data-analyst on the namespace (holds query AND viewNamespace) opting
+        in gets the SQL/SPARQL in the assembled response — gate must not
+        over-block a legitimate user who can already see the schema."""
+        orch = self._real_cedar_orch()
+        request = InvokeRequest(
+            query="Show all claims",
+            namespace="demo",
+            options={"tierOverride": 2, "includeDebugInfo": True},
+            profile={"userId": "u", "resourceRoles": [{"role": "data-analyst", "resourceUID": "demo"}]},
+        )
+        response = await orch.resolve(request)
+        assert response.result.query_used == "SELECT id FROM claims"
+        assert response.result.sparql_generated == "SELECT ?x WHERE { ?x a :Claim }"
+
+    @pytest.mark.asyncio
+    async def test_artifacts_stripped_when_viewnamespace_denied(self):
+        """NEGATIVE CONTROL end-to-end: a caller admitted to query but WITHOUT
+        viewNamespace (modeled via an authorizer whose two actions diverge) opts
+        in, yet the assembled response omits the artifacts. Proves the gate is
+        enforced at assembly, not merely at the flag."""
+
+        class _QueryButNoViewAuthorizer:
+            """Allows the query admission gate but denies viewNamespace — the
+            exact split the artifact gate must honor independently of query."""
+
+            def authorize(self, **kwargs):
+                from coa_serve.tier2.cedar_authorizer import CedarDecision
+
+                return CedarDecision(allowed=True)
+
+            def can_view_namespace(self, **kwargs):
+                return False
+
+        orch = _make_orchestrator(tier2_success=True, tier2_ontop_assembly=True)
+        assert isinstance(orch, Orchestrator)
+        orch._firewall = SQLFirewall(cedar_authorizer=_QueryButNoViewAuthorizer())
+        request = InvokeRequest(
+            query="Show all claims",
+            namespace="demo",
+            options={"tierOverride": 2, "includeDebugInfo": True},
+            profile={"userId": "u", "resourceRoles": [{"role": "data-analyst", "resourceUID": "demo"}]},
+        )
+        response = await orch.resolve(request)
+        # Query succeeded (admitted) ...
+        assert response.result.tier == 2
+        assert response.result.result_rows == [{"id": "1"}]
+        # ... but artifacts are withheld because viewNamespace was denied.
+        assert response.result.query_used is None
+        assert response.result.sparql_generated is None

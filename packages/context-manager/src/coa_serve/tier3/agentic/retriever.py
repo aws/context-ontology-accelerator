@@ -70,6 +70,26 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, no runtime/graphrag import
 
 logger = structlog.get_logger(__name__)
 
+
+def _last_executed_queries(ctx: AccumulatedContext) -> tuple[str | None, str | None]:
+    """Return the last executed (SQL, SPARQL) statements from the session (#1166).
+
+    Deep Reasoning may run several structured statements across its sub-questions;
+    Standard mode exposes a single ``queryUsed`` / ``sparqlGenerated``. To match
+    that shape we surface the LAST statement of each kind — the one that produced
+    the numbers closest to the final answer. Returns ``(None, None)`` when the
+    session ran no structured tool (a document/graph-only answer).
+    """
+    sql: str | None = None
+    sparql: str | None = None
+    for eq in ctx.executed_queries:
+        if eq.kind == "sql":
+            sql = eq.query
+        elif eq.kind == "sparql":
+            sparql = eq.query
+    return sql, sparql
+
+
 # Cap on graph-entity relationships surfaced per entity in ``graph_context``,
 # matching the hand-rolled / lexical Tier 3 paths.
 _MAX_RELATIONSHIPS_PER_ENTITY = 10
@@ -634,6 +654,15 @@ class AgenticRetriever:
         supporting_content = self._supporting_content(ctx)
         graph_context = self._graph_context(ctx)
 
+        # Query artifacts the loop executed (#1166): the LAST SQL and LAST SPARQL
+        # the structured tools ran, mirroring Standard mode's single queryUsed /
+        # sparqlGenerated. Empty when no structured tool ran (document/graph-only
+        # answer), leaving both None. Threaded through every _build_result exit
+        # that carries a synthesized answer; the no-source (Req 9.7) and
+        # guardrail-blocked (Req 8.3) exits return an empty answer and so leave
+        # the artifacts unset by design.
+        sql_used, sparql_used = _last_executed_queries(ctx)
+
         # Req 9.7: every Tool invocation failed AND no context was gathered. Return
         # a partial result with NO Best_Effort_Answer and indicate that no source
         # succeeded — do NOT call the Synthesizer (there is nothing to synthesize).
@@ -712,6 +741,8 @@ class AgenticRetriever:
                 trace=trace,
                 degraded=degraded,
                 partial=True,
+                query_used=sql_used,
+                sparql_generated=sparql_used,
             )
         except Exception as exc:  # noqa: BLE001 - synthesis failure must not raise out
             # Req 8.6: synthesizer raised → partial, empty answer, confidence 0.0,
@@ -737,6 +768,8 @@ class AgenticRetriever:
                 trace=trace,
                 degraded=degraded,
                 partial=True,
+                query_used=sql_used,
+                sparql_generated=sparql_used,
             )
 
         # Req 8.3: a guardrail block excludes the blocked content from the answer.
@@ -778,6 +811,8 @@ class AgenticRetriever:
                 trace=trace,
                 degraded=degraded,
                 partial=True,
+                query_used=sql_used,
+                sparql_generated=sparql_used,
             )
 
         trace.record("llm_synthesize", "success", synthesis.duration_ms, tool_used="bedrock")
@@ -790,6 +825,8 @@ class AgenticRetriever:
             trace=trace,
             degraded=degraded,
             partial=partial,
+            query_used=sql_used,
+            sparql_generated=sparql_used,
         )
 
     async def _synthesize(
@@ -891,12 +928,16 @@ class AgenticRetriever:
         trace: TraceCollector,
         degraded: list[dict],
         partial: bool,
+        query_used: str | None = None,
+        sparql_generated: str | None = None,
     ) -> Tier3Result:
         """Assemble the frozen :class:`Tier3Result` for the session.
 
         Attaches all trace steps recorded up to this point, ordered by invocation
         sequence (Req 10.4), and carries the ``partial`` flag and ``degraded_sources``
-        through unchanged (Req 1.4, 7.7, 9.5).
+        through unchanged (Req 1.4, 7.7, 9.5). ``query_used`` / ``sparql_generated``
+        carry the structured query artifacts the loop executed (#1166); they
+        default to ``None`` for paths that ran no structured tool.
         """
         trace_steps = tuple(
             {
@@ -917,4 +958,6 @@ class AgenticRetriever:
             trace_steps=trace_steps,
             degraded_sources=tuple(degraded),
             partial=partial,
+            query_used=query_used,
+            sparql_generated=sparql_generated,
         )

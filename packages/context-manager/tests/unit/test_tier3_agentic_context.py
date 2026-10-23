@@ -28,7 +28,7 @@ from coa_serve.tier3.agentic import AccumulatedContext
 from coa_serve.tier3.agentic.context import (
     AccumulatedContext as DirectAccumulatedContext,
 )
-from coa_serve.tier3.agentic.tools.base import ToolResult
+from coa_serve.tier3.agentic.tools.base import ExecutedQuery, ToolResult
 
 
 @dataclass(frozen=True)
@@ -355,6 +355,58 @@ class TestDegradedSources:
         ctx = AccumulatedContext()
         ctx.add(ToolResult(chunks=(_Chunk(chunk_id="c1"),)))
         assert ctx.degraded_sources == []
+
+
+@pytest.mark.unit
+class TestExecutedQueries:
+    """#1166 cut #3: query artifacts a structured tool ran are collected on the
+    context (so Deep Reasoning can return them like Standard mode does)."""
+
+    def test_add_collects_executed_queries(self):
+        ctx = AccumulatedContext()
+        ctx.add(
+            ToolResult(
+                rows=({"revenue": 100},),
+                executed_queries=(
+                    ExecutedQuery(kind="sparql", query="SELECT ?r WHERE {}"),
+                    ExecutedQuery(kind="sql", query="SELECT revenue FROM t"),
+                ),
+            )
+        )
+        assert [(e.kind, e.query) for e in ctx.executed_queries] == [
+            ("sparql", "SELECT ?r WHERE {}"),
+            ("sql", "SELECT revenue FROM t"),
+        ]
+
+    def test_executed_queries_not_counted_as_progress(self):
+        """Query artifacts are observability, not retrieval progress: a result
+        with only executed_queries (no rows/chunks/entities) adds 0 new items."""
+        ctx = AccumulatedContext()
+        new = ctx.add(ToolResult(executed_queries=(ExecutedQuery(kind="sql", query="SELECT 1"),)))
+        assert new == 0
+        assert len(ctx.executed_queries) == 1
+
+    def test_executed_queries_not_deduplicated(self):
+        """Two identical statements are two real executions — both are kept."""
+        ctx = AccumulatedContext()
+        ctx.add(ToolResult(rows=({"a": 1},), executed_queries=(ExecutedQuery(kind="sql", query="SELECT 1"),)))
+        ctx.add(ToolResult(rows=({"a": 2},), executed_queries=(ExecutedQuery(kind="sql", query="SELECT 1"),)))
+        assert len(ctx.executed_queries) == 2
+
+    def test_merge_folds_in_sibling_executed_queries(self):
+        """A forked sub-question's executed queries fold back on merge, in order."""
+        parent = AccumulatedContext()
+        parent.add(ToolResult(rows=({"a": 1},), executed_queries=(ExecutedQuery(kind="sql", query="Q_parent"),)))
+        child = parent.fork()
+        child.add(ToolResult(rows=({"b": 2},), executed_queries=(ExecutedQuery(kind="sql", query="Q_child"),)))
+        parent.merge(child)
+        assert [e.query for e in parent.executed_queries] == ["Q_parent", "Q_child"]
+
+    def test_fork_starts_with_no_executed_queries(self):
+        parent = AccumulatedContext()
+        parent.add(ToolResult(rows=({"a": 1},), executed_queries=(ExecutedQuery(kind="sql", query="Q"),)))
+        child = parent.fork()
+        assert child.executed_queries == []
 
 
 @dataclass(frozen=True)

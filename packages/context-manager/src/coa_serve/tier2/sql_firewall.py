@@ -402,6 +402,30 @@ class SQLFirewall:
             return FirewallResult(denied=True, authorized_sql="", reason=reason)
         return FirewallResult(denied=False, authorized_sql="")
 
+    def can_view_namespace(self, namespace: str, profile: dict[str, Any] | None = None) -> bool:
+        """Whether the principal may view this namespace (``viewNamespace``) (#1166).
+
+        The SAME right that gates reading a source's table/column schema on the
+        control-plane read routes. Used to decide whether generated SQL/SPARQL
+        artifacts may be returned: a caller who can already see the schema gains
+        no new disclosure from the query that touches it. Fails CLOSED — any
+        evaluator error returns False, so artifacts are withheld on error rather
+        than leaked. Delegates to the single ``CedarAuthorizer`` so the artifact
+        gate shares the query gate's policy source and fail-closed posture.
+        """
+        ns = namespace or str((profile or {}).get("namespace", ""))
+        try:
+            return self._cedar.can_view_namespace(namespace=ns, profile=profile or {})
+        except Exception as exc:
+            logger.warning(
+                "cedar_view_namespace_error",
+                namespace=ns,
+                error=type(exc).__name__,
+                error_msg=str(exc),
+                exc_info=True,
+            )
+            return False
+
     def _apply_cedar(self, sql: str, namespace: str, profile: dict[str, Any]) -> FirewallResult:
         """Apply the Cedar policy gate as a final authorization step.
 
