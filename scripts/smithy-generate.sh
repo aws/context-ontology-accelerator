@@ -66,8 +66,7 @@ for client_dir in "$GENERATED_DIR/control-plane-typescript-client" "$GENERATED_D
     # Replace yarn: parallel syntax with sequential npm run calls
     sed -i.bak 's|"build": "concurrently.*"|"build": "npm run build:cjs \&\& npm run build:es \&\& npm run build:types"|' "$client_dir/package.json"
     rm -f "$client_dir/package.json.bak"
-    (cd "$client_dir" && npm install --loglevel=error && npm run build --loglevel=error)
-    if [ $? -ne 0 ]; then
+    if ! (cd "$client_dir" && npm install --loglevel=error && npm run build --loglevel=error); then
         echo "✗ Failed to build TypeScript client: $client_dir"
         exit 1
     fi

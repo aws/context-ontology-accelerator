@@ -29,26 +29,34 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # SMUS admin principal(s) — required, comma-separated IAM role/user ARN(s)
 # that human admins federate into (e.g. your IAM Identity Center
 # permission-set role): SCL_SMUS_ADMIN_ARNS=arn:aws:iam::123456789012:role/... make deploy-dev
-CONTEXT="--context env=$ENV"
-[ -n "${SCL_PREFIX:-}" ]        && CONTEXT="$CONTEXT --context resource_prefix=$SCL_PREFIX"
-[ -n "${SCL_PROJECT_TAG:-}" ]   && CONTEXT="$CONTEXT --context project_tag=$SCL_PROJECT_TAG"
-[ -n "${SCL_VPC_ID:-}" ]        && CONTEXT="$CONTEXT --context vpc_id=$SCL_VPC_ID"
-[ -n "${SCL_UI_DOMAIN:-}" ]     && CONTEXT="$CONTEXT --context ui_domain=$SCL_UI_DOMAIN"
-[ -n "${SCL_UI_CERT_ARN:-}" ]   && CONTEXT="$CONTEXT --context ui_cert_arn=$SCL_UI_CERT_ARN"
-[ -n "${SCL_API_DOMAIN:-}" ]    && CONTEXT="$CONTEXT --context api_domain=$SCL_API_DOMAIN"
-[ -n "${SCL_API_CERT_ARN:-}" ]  && CONTEXT="$CONTEXT --context api_cert_arn=$SCL_API_CERT_ARN"
-[ -n "${SCL_HOSTED_ZONE_ID:-}" ] && CONTEXT="$CONTEXT --context hosted_zone_id=$SCL_HOSTED_ZONE_ID"
-[ -n "${SCL_DB_SCAN_ENRICHMENT_TIMEOUT_MINUTES:-}" ] && CONTEXT="$CONTEXT --context dbScanEnrichmentTimeoutMinutes=$SCL_DB_SCAN_ENRICHMENT_TIMEOUT_MINUTES"
-[ -n "${SCL_TIER1_METRIC_TIMEOUT_SECONDS:-}" ] && CONTEXT="$CONTEXT --context tier1_metric_timeout_s=$SCL_TIER1_METRIC_TIMEOUT_SECONDS"
-[ -n "${SCL_DEEP_REASONING_TIME_BUDGET_SECONDS:-}" ] && CONTEXT="$CONTEXT --context deep_reasoning_time_budget_s=$SCL_DEEP_REASONING_TIME_BUDGET_SECONDS"
-[ -n "${SCL_RESOLVE_TIMEOUT_SECONDS:-}" ] && CONTEXT="$CONTEXT --context resolve_timeout_s=$SCL_RESOLVE_TIMEOUT_SECONDS"
-[ -n "${SCL_NEPTUNE_INSTANCE_CLASS:-}" ] && CONTEXT="$CONTEXT --context neptune_instance_class=$SCL_NEPTUNE_INSTANCE_CLASS"
-[ -n "${SCL_LAMBDA_RESERVED_CONCURRENCY:-}" ] && CONTEXT="$CONTEXT --context lambda_reserved_concurrency=$SCL_LAMBDA_RESERVED_CONCURRENCY"
-[ -n "${SCL_NL2SQL_GRAPH_EXPAND:-}" ] && CONTEXT="$CONTEXT --context serve_nl2sql_graph_expand=$SCL_NL2SQL_GRAPH_EXPAND"
-[ -n "${SCL_NL2SQL_GRAPH_EXPAND_MAX_TABLES:-}" ] && CONTEXT="$CONTEXT --context serve_nl2sql_graph_expand_max_tables=$SCL_NL2SQL_GRAPH_EXPAND_MAX_TABLES"
-[ -n "${SCL_SMUS_ADMIN_ARNS:-}" ] && CONTEXT="$CONTEXT --context smus_admin_principal_arns=$SCL_SMUS_ADMIN_ARNS"
+CONTEXT=(--context "env=$ENV")
+[ -n "${SCL_PREFIX:-}" ]        && CONTEXT+=(--context "resource_prefix=$SCL_PREFIX")
+[ -n "${SCL_PROJECT_TAG:-}" ]   && CONTEXT+=(--context "project_tag=$SCL_PROJECT_TAG")
+[ -n "${SCL_VPC_ID:-}" ]        && CONTEXT+=(--context "vpc_id=$SCL_VPC_ID")
+[ -n "${SCL_UI_DOMAIN:-}" ]     && CONTEXT+=(--context "ui_domain=$SCL_UI_DOMAIN")
+[ -n "${SCL_UI_CERT_ARN:-}" ]   && CONTEXT+=(--context "ui_cert_arn=$SCL_UI_CERT_ARN")
+[ -n "${SCL_API_DOMAIN:-}" ]    && CONTEXT+=(--context "api_domain=$SCL_API_DOMAIN")
+[ -n "${SCL_API_CERT_ARN:-}" ]  && CONTEXT+=(--context "api_cert_arn=$SCL_API_CERT_ARN")
+[ -n "${SCL_HOSTED_ZONE_ID:-}" ] && CONTEXT+=(--context "hosted_zone_id=$SCL_HOSTED_ZONE_ID")
+[ -n "${SCL_DB_SCAN_ENRICHMENT_TIMEOUT_MINUTES:-}" ] && CONTEXT+=(--context "dbScanEnrichmentTimeoutMinutes=$SCL_DB_SCAN_ENRICHMENT_TIMEOUT_MINUTES")
+[ -n "${SCL_TIER1_METRIC_TIMEOUT_SECONDS:-}" ] && CONTEXT+=(--context "tier1_metric_timeout_s=$SCL_TIER1_METRIC_TIMEOUT_SECONDS")
+[ -n "${SCL_DEEP_REASONING_TIME_BUDGET_SECONDS:-}" ] && CONTEXT+=(--context "deep_reasoning_time_budget_s=$SCL_DEEP_REASONING_TIME_BUDGET_SECONDS")
+[ -n "${SCL_RESOLVE_TIMEOUT_SECONDS:-}" ] && CONTEXT+=(--context "resolve_timeout_s=$SCL_RESOLVE_TIMEOUT_SECONDS")
+[ -n "${SCL_NEPTUNE_INSTANCE_CLASS:-}" ] && CONTEXT+=(--context "neptune_instance_class=$SCL_NEPTUNE_INSTANCE_CLASS")
+[ -n "${SCL_LAMBDA_RESERVED_CONCURRENCY:-}" ] && CONTEXT+=(--context "lambda_reserved_concurrency=$SCL_LAMBDA_RESERVED_CONCURRENCY")
+[ -n "${SCL_NL2SQL_GRAPH_EXPAND:-}" ] && CONTEXT+=(--context "serve_nl2sql_graph_expand=$SCL_NL2SQL_GRAPH_EXPAND")
+[ -n "${SCL_NL2SQL_GRAPH_EXPAND_MAX_TABLES:-}" ] && CONTEXT+=(--context "serve_nl2sql_graph_expand_max_tables=$SCL_NL2SQL_GRAPH_EXPAND_MAX_TABLES")
+[ -n "${SCL_SMUS_ADMIN_ARNS:-}" ] && CONTEXT+=(--context "smus_admin_principal_arns=$SCL_SMUS_ADMIN_ARNS")
 # Optional: enables the OoPS! pitfall scan, which sends the serialised ontology to this endpoint.
-[ -n "${SCL_OOPS_ENDPOINT:-}" ] && CONTEXT="$CONTEXT --context oops_endpoint=$SCL_OOPS_ENDPOINT"
+[ -n "${SCL_OOPS_ENDPOINT:-}" ] && CONTEXT+=(--context "oops_endpoint=$SCL_OOPS_ENDPOINT")
+
+# Parallel image builds (SCL_ASSET_BUILD_CONCURRENCY, default 1). CDK starts no
+# image build at all for 0 or a non-number, so reject those before any work.
+ASSET_BUILD_CONCURRENCY="${SCL_ASSET_BUILD_CONCURRENCY:-1}"
+[[ "$ASSET_BUILD_CONCURRENCY" =~ ^[1-9][0-9]*$ ]] || {
+  echo "ERROR: SCL_ASSET_BUILD_CONCURRENCY must be a positive integer (got '$ASSET_BUILD_CONCURRENCY')" >&2
+  exit 1
+}
 
 # ── Preflight: SMUS admin principal ──────────────────────────────────────
 # NamespaceStack falls back to arn:aws:iam::<account>:role/Admin when
@@ -75,7 +83,7 @@ fi
 if [ -n "${SCL_JDBC_PEER_VPC_ID:-}" ] && [ "$SCL_JDBC_PEER_VPC_ID" != "None" ] \
   && [ -n "${SCL_JDBC_PEER_CIDRS:-}" ] && [ "$SCL_JDBC_PEER_CIDRS" != "None" ]; then
   echo "Peering into test VPC ${SCL_JDBC_PEER_VPC_ID} (${SCL_JDBC_PEER_CIDRS})"
-  CONTEXT="$CONTEXT --context jdbc_peer_vpc_id=$SCL_JDBC_PEER_VPC_ID --context jdbc_peer_cidrs=$SCL_JDBC_PEER_CIDRS"
+  CONTEXT+=(--context "jdbc_peer_vpc_id=$SCL_JDBC_PEER_VPC_ID" --context "jdbc_peer_cidrs=$SCL_JDBC_PEER_CIDRS")
 else
   # The stack is optional, so skipping is normal — but say so. Silence here is
   # indistinguishable from a prefix mismatch resolving the wrong stack name, which
@@ -108,7 +116,7 @@ if [ -z "${CDK_DOCKER:-}" ]; then
 fi
 
 echo "=== Deploying to $ENV ==="
-echo "CDK context: $CONTEXT"
+echo "CDK context: ${CONTEXT[*]}"
 
 cd "$REPO_ROOT"
 
@@ -134,14 +142,17 @@ pnpm nx run-many -t build
 # ── CDK synth + deploy ───────────────────────────────────────────────────
 echo ""
 echo "Synthesizing CDK stacks..."
-pnpm --filter coa-infra exec cdk synth $CONTEXT >/dev/null
+pnpm --filter coa-infra exec cdk synth "${CONTEXT[@]}" >/dev/null
 
 echo ""
 echo "Deploying all stacks..."
 # Stacks deploy in parallel where the dependency graph allows. Override with
 # SCL_CDK_CONCURRENCY (1 deploys one stack at a time).
-pnpm --filter coa-infra exec cdk deploy --all $CONTEXT --require-approval=never \
-  --concurrency "${SCL_CDK_CONCURRENCY:-3}"
+# SCL_ASSET_BUILD_CONCURRENCY builds that many images at once. Default 1: each
+# parallel build needs its own memory, and on small hosts builds fail or swap.
+pnpm --filter coa-infra exec cdk deploy --all "${CONTEXT[@]}" --require-approval=never \
+  --concurrency "${SCL_CDK_CONCURRENCY:-3}" \
+  --asset-build-concurrency "$ASSET_BUILD_CONCURRENCY"
 
 echo ""
 echo "=== Deployment to $ENV complete ==="

@@ -147,6 +147,23 @@ class TestDeduplication:
         assert ctx.add(ToolResult(chunks=(_Chunk(text="same body"),))) == 0
         assert len(ctx.chunks) == 1
 
+    def test_hash_based_keys_use_sha256(self):
+        """Content-hashed dedupe keys use SHA-256 (not a broken MD5/SHA-1 digest).
+
+        These keys are in-memory, per-session only — never persisted or compared
+        across versions — so the digest can be hardened freely. Pin the hex length
+        (64 chars == SHA-256) so a regression to a weaker digest is caught.
+        """
+        from coa_serve.tier3.agentic.context import _chunk_key, _row_key
+
+        chunk_key = _chunk_key(_Chunk(text="body"))
+        assert chunk_key.startswith("chunk:#")
+        assert len(chunk_key.removeprefix("chunk:#")) == 64
+
+        row_key = _row_key({"a": 1})
+        assert row_key.startswith("row:#")
+        assert len(row_key.removeprefix("row:#")) == 64
+
     def test_chunk_dedupes_by_uri_when_no_id(self):
         ctx = AccumulatedContext()
         assert ctx.add(ToolResult(chunks=(_Chunk(uri="urn:doc#1", text="a"),))) == 1

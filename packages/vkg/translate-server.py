@@ -80,8 +80,31 @@ _health_lock = threading.Lock()
 _HEALTH_TTL_SECONDS = 10
 
 
+# The Ontop sidecar is always reached over plain HTTP on the loopback interface.
+# Scheme and host are fixed constants; only the port varies (ONTOP_PORT /
+# --ontop-port) and is coerced to an int, so it cannot smuggle in a different
+# scheme or host. Every request URL is rebuilt from these constants.
+_ONTOP_SCHEME = "http"
+_ONTOP_HOST = "localhost"
+_ONTOP_ALLOWED_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
 def _ontop_url(path):
-    return f"http://localhost:{_ontop_port}{path}"
+    """Build a request URL for the local Ontop sidecar, enforcing loopback HTTP.
+
+    The URL is assembled from fixed scheme/host constants plus the integer port;
+    ``path`` is a trusted literal chosen by the caller (any user-controlled
+    SPARQL is urlencoded into the query string, never into the scheme or host).
+    The assembled URL is parsed and checked to be plain HTTP on a loopback host
+    before it is returned, so a ``file://`` or foreign-host URL can never reach
+    ``urllib.request.urlopen`` — the guarantee is explicit at the sink. Raises
+    ``ValueError`` on anything that is not loopback HTTP.
+    """
+    url = f"{_ONTOP_SCHEME}://{_ONTOP_HOST}:{_ontop_port}{path}"
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "http" or parsed.hostname not in _ONTOP_ALLOWED_HOSTS:
+        raise ValueError(f"refusing non-loopback Ontop URL: {parsed.scheme}://{parsed.hostname}")
+    return url
 
 
 def _split_sql_qualified(name: str) -> list[str]:

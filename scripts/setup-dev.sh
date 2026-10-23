@@ -7,7 +7,7 @@ set -eu
 echo "=== SCL Dev Environment Setup ==="
 
 # Check UV
-if ! command -v uv &> /dev/null; then
+if ! command -v uv >/dev/null 2>&1; then
     echo "Installing UV..."
     curl -LsSf https://astral.sh/uv/install.sh | sh
 else
@@ -15,7 +15,7 @@ else
 fi
 
 # Check pnpm
-if ! command -v pnpm &> /dev/null; then
+if ! command -v pnpm >/dev/null 2>&1; then
     echo "Installing pnpm..."
     npm install -g pnpm
 else
@@ -30,7 +30,7 @@ else
 fi
 
 # Check Gradle
-if command -v gradle &> /dev/null; then
+if command -v gradle >/dev/null 2>&1; then
     echo "✓ Gradle found"
 else
     echo "⚠ Gradle not found — required for Smithy code generation"
@@ -58,12 +58,12 @@ cd "$REPO_ROOT" && pnpm install --frozen-lockfile
 # Install pre-commit hooks
 echo ""
 echo "Installing pre-commit hooks..."
-if git config --get core.hooksPath &> /dev/null; then
+if git config --get core.hooksPath >/dev/null 2>&1; then
     HOOKS_PATH=$(git config --get core.hooksPath)
     echo "⚠ Skipping pre-commit install: core.hooksPath is set to '$HOOKS_PATH' (likely git-defender)."
     echo "  Run 'make lint' manually before committing, or configure pre-commit to run via git-defender."
 else
-    if command -v pre-commit &> /dev/null; then
+    if command -v pre-commit >/dev/null 2>&1; then
         pre-commit install
         echo "✓ Pre-commit hooks installed"
     else

@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from hashlib import sha1
+from hashlib import sha256
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, no runtime import
@@ -53,7 +53,7 @@ def _chunk_key(chunk: Any) -> str:
     if uri:
         return f"chunk:{uri}"
     text = getattr(chunk, "text", "") or ""
-    return f"chunk:#{sha1(text.encode('utf-8')).hexdigest()}"
+    return f"chunk:#{sha256(text.encode('utf-8')).hexdigest()}"
 
 
 def _entity_key(entity: Any) -> str:
@@ -79,7 +79,7 @@ def _row_key(row: dict) -> str:
     back to ``repr`` via ``default=str`` so the key derivation never raises.
     """
     canonical = json.dumps(row, sort_keys=True, default=str)
-    return f"row:#{sha1(canonical.encode('utf-8')).hexdigest()}"
+    return f"row:#{sha256(canonical.encode('utf-8')).hexdigest()}"
 
 
 # Caps so the carried reasoning state can never blow the planner prompt.

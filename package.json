@@ -8,7 +8,7 @@
     "format": "nx run-many -t format"
   },
   "devDependencies": {
-    "nx": "22.7.9",
+    "nx": "22.7.10",
     "pnpm": "10.34.5"
   },
   "version": "0.3.7"

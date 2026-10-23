@@ -64,6 +64,20 @@ def test_ontop_url_builds_localhost_url():
     assert translate_server._ontop_url("/actuator/health") == "http://localhost:8081/actuator/health"
 
 
+def test_ontop_url_rejects_file_scheme(monkeypatch):
+    """A file:// base must never reach urllib — the sink is loopback-HTTP only."""
+    monkeypatch.setattr(translate_server, "_ONTOP_SCHEME", "file")
+    with pytest.raises(ValueError, match="non-loopback Ontop URL"):
+        translate_server._ontop_url("/etc/passwd")
+
+
+def test_ontop_url_rejects_foreign_host(monkeypatch):
+    """A non-loopback host is an SSRF target and must be refused at build time."""
+    monkeypatch.setattr(translate_server, "_ONTOP_HOST", "evil.example.com")
+    with pytest.raises(ValueError, match="non-loopback Ontop URL"):
+        translate_server._ontop_url("/actuator/health")
+
+
 # --- _extract_sql ------------------------------------------------------------
 
 

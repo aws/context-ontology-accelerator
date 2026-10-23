@@ -126,7 +126,7 @@ ONTOP_PID=$!
 
 # Wait for Ontop readiness
 ONTOP_READY=false
-for i in $(seq 1 90); do
+for _ in $(seq 1 90); do
   if ! kill -0 $ONTOP_PID 2>/dev/null; then
     wait $ONTOP_PID
     EXIT_CODE=$?

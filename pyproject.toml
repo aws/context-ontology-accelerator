@@ -21,7 +21,7 @@ dev = [
     "moto[dynamodb,sqs]>=5.0",
     # Real-PDF unit tests for the sources preprocessing module (parse + render)
     "pypdfium2>=4.30.0",
-    "pillow>=10.4.0",
+    "pillow>=13.0.0",
 ]
 
 [tool.uv]

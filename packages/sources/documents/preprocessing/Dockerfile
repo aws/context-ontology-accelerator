@@ -37,7 +37,7 @@ RUN pip install --no-cache-dir --root-user-action=ignore \
     -r ${LAMBDA_TASK_ROOT}/requirements.txt && \
     pip uninstall -y opencv-python 2>/dev/null; \
     pip install --no-cache-dir --root-user-action=ignore opencv-python-headless && \
-    pip install --no-cache-dir --root-user-action=ignore spacy && \
+    pip install --no-cache-dir --root-user-action=ignore spacy==3.8.7 && \
     python -m spacy download en_core_web_sm
 
 # Install the documents package so handler can be imported as a module

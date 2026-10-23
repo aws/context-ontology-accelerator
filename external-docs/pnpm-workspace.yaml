@@ -22,3 +22,10 @@ overrides:
   # unbounded array schemas (GHSA, HIGH). Transitive via the AI SDK / Scalar
   # packages. 4.6.6 is the patched floor; same major.
   "zod@<4.6.6": 4.6.7
+  # katex <0.18.2 — prototype pollution can bypass the trust restrictions (GHSA-238p-pmpm-9mq7).
+  # Only mermaid 11 pulls it (for math in diagram labels, which these docs don't use);
+  # mermaid 12 is a major bump, so pin the patched katex under mermaid 11 instead.
+  "katex@<0.18.2": 0.18.11
+  # dompurify <3.4.17 — sanitizer bypasses (GHSA, CRITICAL/HIGH). Only mermaid 11 pulls it,
+  # for diagram labels; 3.4.17 is the patched floor on the same minor line.
+  "dompurify@<3.4.17": 3.4.17

@@ -15,7 +15,7 @@
     "test": "jest --runInBand"
   },
   "dependencies": {
-    "aws-cdk-lib": "^2.260.0",
+    "aws-cdk-lib": "^2.273.0",
     "coa-connector-cdk": "workspace:*",
     "constructs": "^10.0.0"
   },

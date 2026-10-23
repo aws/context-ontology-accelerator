@@ -178,10 +178,12 @@ if [ -n "${CONTAINER_ENGINE:-}" ]; then
       # as the password via 2>&1). Failure is a warning, not a fatal error.
       _ecr_awserr="$(mktemp)"
       if _ecr_pw="$(aws ecr-public get-login-password --region us-east-1 2>"$_ecr_awserr")"; then
-        ECR_LOGIN_ERR="$(printf '%s' "$_ecr_pw" \
-          | "$CONTAINER_ENGINE" login --username AWS --password-stdin public.ecr.aws 2>&1)" \
-          && ok "Authenticated to ECR Public (us-east-1)" \
-          || warn "Could not authenticate to ECR Public; base image pulls fall back to anonymous (rate-limited). Detail: ${ECR_LOGIN_ERR:-unknown error}"
+        if ECR_LOGIN_ERR="$(printf '%s' "$_ecr_pw" \
+            | "$CONTAINER_ENGINE" login --username AWS --password-stdin public.ecr.aws 2>&1)"; then
+          ok "Authenticated to ECR Public (us-east-1)"
+        else
+          warn "Could not authenticate to ECR Public; base image pulls fall back to anonymous (rate-limited). Detail: ${ECR_LOGIN_ERR:-unknown error}"
+        fi
       else
         warn "Could not obtain an ECR Public token from AWS; base image pulls fall back to anonymous (rate-limited). Detail: $(cat "$_ecr_awserr" 2>/dev/null || echo 'unknown error')"
       fi
@@ -332,6 +334,7 @@ _coa_model_geo_prefix() {
 }
 
 _coa_resolve_model_ids() {
+  # shellcheck disable=SC2016  # the single-quoted node -e program is passed to node verbatim, not expanded by the shell
   _COA_DEFAULT_LLM_MODEL_ID="$_DEFAULT_LLM_MODEL_ID" \
   _COA_DEFAULT_EMBED_MODEL_ID="$_DEFAULT_EMBED_MODEL_ID" \
   _COA_DEFAULT_INDUCTION_MODEL_ID="$_DEFAULT_INDUCTION_MODEL_ID" \

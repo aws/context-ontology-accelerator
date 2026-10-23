@@ -10,12 +10,12 @@
   },
   "dependencies": {
     "@aws-sdk/client-ssm": "^3.700.0",
-    "tsx": "^4.19.0"
+    "tsx": "^4.23.15"
   },
   "devDependencies": {
     "@types/node": "^26.1.1",
-    "@vitest/coverage-v8": "^4.1.11",
+    "@vitest/coverage-v8": "^4.1.12",
     "typescript": "^6.0.3",
-    "vitest": "^4.1.11"
+    "vitest": "^4.1.12"
   }
 }

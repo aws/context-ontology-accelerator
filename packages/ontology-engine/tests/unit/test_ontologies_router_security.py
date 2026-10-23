@@ -407,3 +407,81 @@ class TestFetchDestinationIsNamespaceScoped:
 
         assert exc.value.status_code == 500
         assert "No space left" not in str(exc.value.detail), "OS error text must not reach the client"
+
+
+class TestDownloadFallbackContainment:
+    """CWE-22: ``/download`` local-file fallback opens a registry-supplied path.
+
+    When the graph backend has no Turtle to export, ``download_ontology_file``
+    falls back to reading the ``file_path`` recorded on the ontology registry.
+    That path is resolved with ``realpath`` and checked against
+    ``ONTOLOGY_STORAGE_PATH`` before the ``open(real_fp)`` sink — a path that
+    escapes the storage root is refused with 403, never read or offloaded.
+    ``TestStorageRootContainment`` covers the predicate; this exercises the
+    route wiring to it at the actual sink.
+    """
+
+    @pytest.fixture()
+    def storage_root(self, tmp_path, monkeypatch):
+        from coa_ontology.catalog.routers import ontologies
+
+        root = tmp_path / "ontologies"
+        root.mkdir()
+        monkeypatch.setattr(ontologies, "ONTOLOGY_STORAGE_PATH", str(root))
+        return root
+
+    def test_registry_file_path_escaping_the_root_is_refused(self, storage_root, tmp_path):
+        """An existing file outside the storage root must not be read out."""
+        from coa_ontology.catalog.routers import ontologies
+        from fastapi import HTTPException
+
+        outside = tmp_path / "secret.ttl"
+        outside.write_text("@prefix ex: <http://ex/> . ex:S a ex:Secret .", encoding="utf-8")
+
+        graph = MagicMock()
+        graph.get_graph_turtle.return_value = None  # force the local-file fallback
+
+        with (
+            patch.object(ontologies, "_graph", return_value=graph),
+            patch.object(
+                ontologies.dynamo_store,
+                "get_ontology_registry",
+                return_value={"file_path": str(outside)},
+            ),
+            patch.object(ontologies.dynamo_store, "write_and_presign_ontology_download") as offload,
+            pytest.raises(HTTPException) as exc,
+        ):
+            ontologies.download_ontology_file("http://ex/onto", namespace="ns")
+
+        assert exc.value.status_code == 403
+        offload.assert_not_called()  # nothing outside the root is read or offloaded
+
+    def test_registry_file_path_inside_the_root_is_served(self, storage_root):
+        """In-root case still works — the guard is containment, not a blanket deny."""
+        from coa_ontology.catalog.routers import ontologies
+
+        inside = storage_root / "ns" / "o.ttl"
+        inside.parent.mkdir(parents=True)
+        inside.write_text("@prefix ex: <http://ex/> . ex:A a ex:Class .", encoding="utf-8")
+
+        graph = MagicMock()
+        graph.get_graph_turtle.return_value = None
+
+        with (
+            patch.object(ontologies, "_graph", return_value=graph),
+            patch.object(
+                ontologies.dynamo_store,
+                "get_ontology_registry",
+                return_value={"file_path": str(inside)},
+            ),
+            patch.object(
+                ontologies.dynamo_store,
+                "write_and_presign_ontology_download",
+                return_value="https://s3.example/presigned",
+            ) as offload,
+        ):
+            result = ontologies.download_ontology_file("http://ex/onto", namespace="ns")
+
+        assert result["downloadUrl"] == "https://s3.example/presigned"
+        # The bytes offloaded are the in-root file's own contents.
+        assert "ex:A" in offload.call_args[0][2]

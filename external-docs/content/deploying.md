@@ -447,6 +447,13 @@ SCL_VPC_ID=vpc-abc123 make deploy-dev
 # Stacks CloudFormation deploys in parallel (default: 3); 1 deploys one stack at a time
 SCL_CDK_CONCURRENCY=1 make deploy-dev
 
+# Container images built in parallel (default: 1). Each parallel build needs its
+# own memory; raise it only if the container engine has memory to spare (on
+# macOS that is the Docker Desktop or Finch VM limit, not the Mac's own memory)
+# With Finch on macOS, parallel builds can race on docker login in the keychain
+# credential helper (error -25299); if they do, set this back to 1
+SCL_ASSET_BUILD_CONCURRENCY=2 make deploy-dev
+
 # SMUS admin principal(s) — override the account's `Admin` role fallback.
 # Comma-separated IAM role/user ARN(s) that human admins federate into to
 # access the SageMaker Unified Studio console. Required on any account that

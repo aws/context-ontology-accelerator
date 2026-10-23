@@ -13,3 +13,9 @@ overrides:
   "brace-expansion@>=2.0.0 <2.1.4": 2.1.7
   # handlebars <4.7.10 — critical RCE (GHSA-p8wg-vrv2-v86f, GHSA-8r5x-fm3f-whwj); via ts-jest.
   "handlebars@<4.7.10": 4.7.10
+  # sprintf-js <=1.1.3 — DoS via unbounded padding (GHSA-hp3w-g68c-fv3c), no patched
+  # release. Its only path is js-yaml 3 -> argparse 1, and js-yaml loads argparse
+  # solely from its CLI (bin/js-yaml.js), which nothing here runs; the library that
+  # jest/istanbul use never imports it. argparse 2 has no dependencies, so pinning it
+  # removes sprintf-js from the tree without touching js-yaml's library code.
+  "argparse@<2.0.0": 2.0.1

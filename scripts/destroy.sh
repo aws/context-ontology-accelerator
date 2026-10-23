@@ -108,14 +108,14 @@ CONTEXT="--context env=$ENV"
 # any of them was reported as gone.
 # REVIEW_IN_PROGRESS is deliberately absent: cdk-dryrun-mr creates change-set-only stacks in that
 # state on every MR, and they are not this deployment's to delete.
-CFN_LIVE_STATUSES="CREATE_COMPLETE UPDATE_COMPLETE UPDATE_ROLLBACK_COMPLETE ROLLBACK_COMPLETE \
-CREATE_FAILED UPDATE_FAILED DELETE_FAILED ROLLBACK_FAILED UPDATE_ROLLBACK_FAILED \
-IMPORT_COMPLETE IMPORT_ROLLBACK_COMPLETE IMPORT_ROLLBACK_FAILED"
+CFN_LIVE_STATUSES=(CREATE_COMPLETE UPDATE_COMPLETE UPDATE_ROLLBACK_COMPLETE ROLLBACK_COMPLETE
+  CREATE_FAILED UPDATE_FAILED DELETE_FAILED ROLLBACK_FAILED UPDATE_ROLLBACK_FAILED
+  IMPORT_COMPLETE IMPORT_ROLLBACK_COMPLETE IMPORT_ROLLBACK_FAILED)
 # A deploy is still changing the stack: never deleted here, but listed, so a sibling
 # deployment mid-deploy is recognised and a stack of ours still settling is reported.
-CFN_BUSY_STATUSES="CREATE_IN_PROGRESS ROLLBACK_IN_PROGRESS UPDATE_IN_PROGRESS \
-UPDATE_COMPLETE_CLEANUP_IN_PROGRESS UPDATE_ROLLBACK_IN_PROGRESS UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS \
-IMPORT_IN_PROGRESS IMPORT_ROLLBACK_IN_PROGRESS"
+CFN_BUSY_STATUSES=(CREATE_IN_PROGRESS ROLLBACK_IN_PROGRESS UPDATE_IN_PROGRESS
+  UPDATE_COMPLETE_CLEANUP_IN_PROGRESS UPDATE_ROLLBACK_IN_PROGRESS UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS
+  IMPORT_IN_PROGRESS IMPORT_ROLLBACK_IN_PROGRESS)
 # 30 minutes, longer than the other budgets, because the COA-operated Databricks connector is
 # VPC-attached: its security group cannot be deleted until Lambda releases the function's ENIs,
 # which can take up to 20 minutes. Giving up sooner leaves the group behind, and step 8 then fails
@@ -209,6 +209,7 @@ runtime_state() {
 }
 stack_gone() { [[ "$(stack_status "$1" "$2")" =~ ^(GONE|DELETE_COMPLETE)$ ]]; }
 # Sets LAST_STATUS, so a wait decides from the lookup that ended it.
+# shellcheck disable=SC2317,SC2329  # invoked indirectly via poll
 stack_settled() {
   LAST_STATUS=$(stack_status "$1" "$2")
   [[ "$LAST_STATUS" =~ ^(GONE|DELETE_COMPLETE|DELETE_FAILED)$ ]]
@@ -695,7 +696,7 @@ CONNECTOR_STACKS=""
 # "<name>\t<status>" of every stack under this prefix that is not deleted.
 list_prefix_stacks() {
   aws cloudformation list-stacks --region "$REGION" \
-    --stack-status-filter $CFN_LIVE_STATUSES DELETE_IN_PROGRESS $CFN_BUSY_STATUSES \
+    --stack-status-filter "${CFN_LIVE_STATUSES[@]}" DELETE_IN_PROGRESS "${CFN_BUSY_STATUSES[@]}" \
     --query "StackSummaries[?starts_with(StackName, '${STACK_PREFIX}-')].[StackName,StackStatus]" --output text
 }
 # A sibling deployment whose name extends this one (env "dev-b" next to "dev") has stacks
@@ -710,7 +711,7 @@ if ! PREFIX_LIST=$(list_prefix_stacks 2>&1); then
 fi
 SIBLINGS=$(siblings_in "$PREFIX_LIST")
 while IFS=$'\t' read -r NAME STATUS; do
-  [[ "$NAME" == *-coa-connector && " $CFN_BUSY_STATUSES " != *" $STATUS "* ]] || continue
+  [[ "$NAME" == *-coa-connector && " ${CFN_BUSY_STATUSES[*]} " != *" $STATUS "* ]] || continue
   for SIBLING in $SIBLINGS; do [[ "$NAME" == "$SIBLING"* ]] && continue 2; done
   CONNECTOR_STACKS+=" $NAME"
 done <<< "$PREFIX_LIST"
@@ -741,6 +742,7 @@ echo "=== Step 7/8: cdk destroy (every stack but network) ==="
 
 # CloudFormation cannot delete a Runtime AgentCore is still deleting (AccessDenied),
 # so give step 1's deletes a moment; fix_failed_stack handles stragglers.
+# shellcheck disable=SC2317,SC2329  # invoked indirectly via poll
 runtime_gone() { [ "$(runtime_state "$1" "$REGION")" == "GONE" ]; }
 DEADLINE=$(( $(date +%s) + RUNTIME_DELETE_WAIT_MAX_SECONDS ))
 for RUNTIME_ID in ${DELETED_RUNTIME_IDS[@]+"${DELETED_RUNTIME_IDS[@]}"}; do
@@ -847,6 +849,7 @@ VPC_ID=$(aws cloudformation list-stack-resources --stack-name "$NETWORK_STACK" -
 { [ -z "$VPC_ID" ] || [ "$VPC_ID" == "None" ]; } && VPC_ID="${SCL_VPC_ID:-}"
 
 # EC2 can still report a dependency for a moment after the last ENI is gone.
+# shellcheck disable=SC2317,SC2329  # invoked indirectly via poll
 delete_runtime_sg() {
   SG_DELETE_ERROR=$(aws ec2 delete-security-group --group-id "$1" --region "$REGION" 2>&1 >/dev/null) \
     || [[ "$SG_DELETE_ERROR" == *InvalidGroup.NotFound* ]]
@@ -952,6 +955,7 @@ only_agentcore_enis() {
 
 # Only AgentCore's ENIs keep what is left, and AWS releases those on its own.
 agentcore_hold() { [ ${#PENDING_SG_IDS[@]} -gt 0 ] && [ ${#PROBLEM_SG_IDS[@]} -eq 0 ]; }
+# shellcheck disable=SC2317,SC2329  # invoked indirectly via poll
 runtime_enis_released() {
   local sg
   for sg in "${PENDING_SG_IDS[@]}"; do [ "$(sg_holder "$sg")" == "none" ] || return 1; done
@@ -1030,6 +1034,7 @@ else
       aws cloudformation list-stack-resources --stack-name "$NETWORK_STACK" --region "$NETWORK_REGION" \
         --query "StackResourceSummaries[?ResourceStatus=='DELETE_FAILED'].[LogicalResourceId,ResourceStatusReason]" \
         --output text 2>&1 | sed 's/^/  /' >&2
+      # shellcheck disable=SC2001  # sed prefixes every line of multi-line output; ${var//…} can't do a per-line prefix
       [ -n "$OTHER_ENIS" ] && { err "ENIs in $VPC_ID other than AgentCore's:"; echo "$OTHER_ENIS" | sed 's/^/  /' >&2; }
     fi
   elif [ ${#PENDING_SG_IDS[@]} -gt 0 ]; then
