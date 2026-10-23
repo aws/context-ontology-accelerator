@@ -50,6 +50,14 @@ CONTEXT="--context env=$ENV"
 # Optional: enables the OoPS! pitfall scan, which sends the serialised ontology to this endpoint.
 [ -n "${SCL_OOPS_ENDPOINT:-}" ] && CONTEXT="$CONTEXT --context oops_endpoint=$SCL_OOPS_ENDPOINT"
 
+# Parallel image builds (SCL_ASSET_BUILD_CONCURRENCY, default 1). CDK starts no
+# image build at all for 0 or a non-number, so reject those before any work.
+ASSET_BUILD_CONCURRENCY="${SCL_ASSET_BUILD_CONCURRENCY:-1}"
+[[ "$ASSET_BUILD_CONCURRENCY" =~ ^[1-9][0-9]*$ ]] || {
+  echo "ERROR: SCL_ASSET_BUILD_CONCURRENCY must be a positive integer (got '$ASSET_BUILD_CONCURRENCY')" >&2
+  exit 1
+}
+
 # ── Preflight: SMUS admin principal ──────────────────────────────────────
 # NamespaceStack falls back to arn:aws:iam::<account>:role/Admin when
 # SCL_SMUS_ADMIN_ARNS is unset. Validate the fallback before CDK runs while
@@ -140,8 +148,11 @@ echo ""
 echo "Deploying all stacks..."
 # Stacks deploy in parallel where the dependency graph allows. Override with
 # SCL_CDK_CONCURRENCY (1 deploys one stack at a time).
+# SCL_ASSET_BUILD_CONCURRENCY builds that many images at once. Default 1: each
+# parallel build needs its own memory, and on small hosts builds fail or swap.
 pnpm --filter coa-infra exec cdk deploy --all $CONTEXT --require-approval=never \
-  --concurrency "${SCL_CDK_CONCURRENCY:-3}"
+  --concurrency "${SCL_CDK_CONCURRENCY:-3}" \
+  --asset-build-concurrency "$ASSET_BUILD_CONCURRENCY"
 
 echo ""
 echo "=== Deployment to $ENV complete ==="

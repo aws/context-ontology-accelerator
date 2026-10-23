@@ -464,8 +464,8 @@ class TestParallelChunkDispatch:
 class TestPerTableTimeout:
     """Verify per-table timeout surfaces as tables_failed."""
 
-    def test_timeout_constant_defaults_to_90(self) -> None:
-        assert TABLE_TIMEOUT_SEC == 90
+    def test_timeout_constant_defaults_to_180(self) -> None:
+        assert TABLE_TIMEOUT_SEC == 180
 
     @patch("coa_sources.database.enrichment.table_enricher._write_enriched_assets")
     @patch("coa_sources.database.enrichment.table_enricher.read_assets_for_datasource")
@@ -1337,6 +1337,22 @@ class TestCallBedrockMaxTokens:
                 "extra_context_hint": "Use this for FK inference",
             }
             run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock(), namespace_language="en")
+
+        invoke_call = mock_client_cls.return_value.invoke.call_args_list[0]
+        assert invoke_call[1]["max_tokens"] == 16384
+
+    @patch("coa_sources.database.enrichment.table_enricher._write_enriched_assets")
+    @patch("coa_sources.database.enrichment.table_enricher.read_assets_for_datasource")
+    @patch("coa_sources.database.enrichment.table_enricher.BedrockClient")
+    def test_plain_wide_table_without_extra_context_uses_16384_tokens(
+        self, mock_client_cls: MagicMock, mock_read: MagicMock, mock_write: MagicMock
+    ) -> None:
+        """A 60-column table with no evidence needs ~6k output tokens; a 4096 cap truncates it."""
+        mock_client_cls.return_value.invoke.return_value = _mock_invocation_result()
+        table = _make_table("wide_events", num_columns=60)
+        mock_read.return_value = [table]
+
+        run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock(), namespace_language="en")
 
         invoke_call = mock_client_cls.return_value.invoke.call_args_list[0]
         assert invoke_call[1]["max_tokens"] == 16384
