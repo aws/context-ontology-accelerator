@@ -327,6 +327,13 @@ class QueryResult(BaseModel):
     ontology_version: str | None = Field(None, alias="ontologyVersion")
     data_sources: list[str] | None = Field(None, alias="dataSources")
     guardrail_blocked: bool = Field(False, alias="guardrailBlocked")
+    # Execution mode that produced this result ("standard" / "deep-reasoning").
+    # Deep Reasoning is a MODE orthogonal to the T1/T2/T3 tier cascade, so the
+    # console labels an answer by this field rather than mis-reading a Deep
+    # Reasoning answer's tier=3 as Standard mode's Tier-3 label (#1166). None on
+    # paths that do not set it (unchanged Standard responses stay unaffected —
+    # the orchestrator stamps it for both modes at the Tier-3 boundary).
+    execution_mode: str | None = Field(None, alias="executionMode")
     # OUT OF SCOPE (flag, do not implement here): `partial` stays unpopulated.
     # The partial/504-timeout flag is owned by the Data Layer and is set
     # on the timeout path (see main.py); this model does not touch it.

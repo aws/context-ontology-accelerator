@@ -10,7 +10,12 @@
  */
 import { useMemo } from "react";
 import { useLocation, useParams } from "react-router-dom";
-import type { ChatMessage, HistoryMessage, TraceStep } from "@app-types";
+import type {
+  ChatMessage,
+  ExecutionMode,
+  HistoryMessage,
+  TraceStep,
+} from "@app-types";
 import { useSessionHistory } from "./use-session-history";
 
 export interface TraceData {
@@ -24,6 +29,14 @@ export interface TraceData {
   metadata: Record<string, unknown>;
   confidence?: { score: number; rationale: string };
   userQuery: string;
+  /**
+   * Resolved execution mode ("standard" / "deep-reasoning"). Threaded so the
+   * full-trace "Tier outcome" badge can follow the same mode-wins rule as the
+   * Rationale panel: a Deep Reasoning answer resolves at tier 3 but must not
+   * read "Tier 3 — knowledge" (#1166). Absent on responses that omit it, in
+   * which case the badge falls back to the tier label.
+   */
+  executionMode?: ExecutionMode;
 }
 
 export interface UseTraceDataReturn {
@@ -67,6 +80,7 @@ function resolveFromRouterState(
     metadata: toRecord(result.metadata),
     confidence: result.confidence,
     userQuery: query ?? "—",
+    executionMode: result.executionMode,
   };
 }
 
@@ -76,6 +90,15 @@ function resolveFromHistory(
   requestId: string,
 ): TraceData {
   const meta = msg.metadata ?? {};
+  // The typed history metadata doesn't expose executionMode, but the backend
+  // stamps the resolved mode into the free-form inner metadata as `mode`
+  // (orchestrator sets result.metadata["mode"] = "deep-reasoning"). Read it and
+  // coerce to ExecutionMode so the badge can apply the same mode-wins rule.
+  const rawMode = meta.metadata?.mode;
+  const executionMode: ExecutionMode | undefined =
+    rawMode === "deep-reasoning" || rawMode === "standard"
+      ? rawMode
+      : undefined;
   return {
     trace: meta.trace ?? [],
     tier: meta.tier ?? 0,
@@ -87,6 +110,7 @@ function resolveFromHistory(
     metadata: toRecord(meta.metadata),
     confidence: meta.confidence,
     userQuery: userQuery !== "—" ? userQuery : (meta.query ?? "—"),
+    executionMode,
   };
 }
 

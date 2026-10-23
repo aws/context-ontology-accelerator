@@ -236,6 +236,72 @@ class TestAssembleTier3:
         assert result.partial is True
         assert result.metadata["degradedSources"][0]["source"] == "vector_search"
 
+    # ── #1166: Deep Reasoning mode label + query artifacts ──────────────
+
+    def test_tier3_execution_mode_surfaced(self, assembler, trace):
+        """#1166 cut #2: the resolved execution mode is surfaced structurally so
+        the console labels a Deep Reasoning answer by MODE, not by its tier=3
+        resolution (which would mis-read as Standard mode's Tier-3 label)."""
+        result = assembler.assemble_tier3(
+            synthesized_answer="Deep answer.",
+            supporting_content=[],
+            graph_context=[],
+            confidence=0.7,
+            trace=trace,
+            namespace="demo",
+            execution_mode="deep-reasoning",
+        )
+        assert result.tier == 3
+        assert result.execution_mode == "deep-reasoning"
+
+    def test_tier3_execution_mode_defaults_none(self, assembler, trace):
+        """Standard Tier-3 responses (no mode passed) leave execution_mode None;
+        the console falls back to tier-based labelling for those."""
+        result = assembler.assemble_tier3(
+            synthesized_answer="Standard tier3 answer.",
+            supporting_content=[],
+            graph_context=[],
+            confidence=0.7,
+            trace=trace,
+            namespace="demo",
+        )
+        assert result.execution_mode is None
+
+    def test_tier3_query_artifacts_surfaced_when_debug_info_on(self, assembler, trace):
+        """#1166 cut #3: Deep Reasoning returns the SQL/SPARQL it executed, same
+        as Standard mode — but only when the caller opts into debug info."""
+        result = assembler.assemble_tier3(
+            synthesized_answer="Revenue was 100.",
+            supporting_content=[],
+            graph_context=[],
+            confidence=0.8,
+            trace=trace,
+            namespace="demo",
+            query_used="SELECT revenue FROM t",
+            sparql_generated="SELECT ?r WHERE { ?x :revenue ?r }",
+            include_debug_info=True,
+        )
+        assert result.query_used == "SELECT revenue FROM t"
+        assert result.sparql_generated == "SELECT ?r WHERE { ?x :revenue ?r }"
+
+    def test_tier3_query_artifacts_withheld_by_default(self, assembler, trace):
+        """Negative control: without includeDebugInfo the Deep Reasoning query
+        artifacts are withheld exactly like the Tier-2 gate — they expose internal
+        schema and must not leak on a default request (#1166)."""
+        result = assembler.assemble_tier3(
+            synthesized_answer="Revenue was 100.",
+            supporting_content=[],
+            graph_context=[],
+            confidence=0.8,
+            trace=trace,
+            namespace="demo",
+            query_used="SELECT revenue FROM sensitive_t",
+            sparql_generated="SELECT ?r WHERE { ?x :revenue ?r }",
+            # include_debug_info defaults to False
+        )
+        assert result.query_used is None
+        assert result.sparql_generated is None
+
 
 # ── confidence calibration + trace-completeness audit ───────────
 

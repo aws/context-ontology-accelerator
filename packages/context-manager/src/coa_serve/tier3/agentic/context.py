@@ -35,7 +35,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, no runtime import
     from ..graph_traverser import GraphEntity
     from ..vector_retriever import ChunkResult
     from .ontology.source import Ontology
-    from .tools.base import ToolResult
+    from .tools.base import ExecutedQuery, ToolResult
 
 
 def _chunk_key(chunk: Any) -> str:
@@ -130,6 +130,14 @@ class AccumulatedContext:
     ontology: Ontology | None = None
     seen_keys: set[str] = field(default_factory=set)
     degraded_sources: list[dict] = field(default_factory=list)
+    # Query artifacts (SQL/SPARQL) that structured tools built and executed this
+    # session, in arrival order — one entry per generated statement. Surfaced
+    # (gated by includeDebugInfo) on the final QueryResult so Deep Reasoning
+    # returns the queries it ran, mirroring Standard mode (#1166). Each item is
+    # an ``ExecutedQuery`` (kind + query). Never de-duplicated: two distinct
+    # sub-questions legitimately run distinct SQL, and even an identical repeat
+    # is a real second execution worth showing.
+    executed_queries: list[ExecutedQuery] = field(default_factory=list)
     # ── Carried reasoning state (improvement ideas 2 & 3) ──────────────
     # The planner is stateless across steps (a fresh Converse call each step), so
     # cross-step continuity lives here and is echoed back into the planner prompt.
@@ -202,6 +210,11 @@ class AccumulatedContext:
             self.rows.append(row)
             new_count += 1
 
+        # Collect any query artifacts the tool executed (#1166). Not counted as
+        # progress (that is what rows/chunks/entities are for) and not
+        # de-duplicated — this is an observability record of what ran.
+        self.executed_queries.extend(result.executed_queries)
+
         return new_count
 
     def fork(self) -> AccumulatedContext:
@@ -261,6 +274,10 @@ class AccumulatedContext:
             new_count += 1
         self.attempt_history.extend(other.attempt_history)
         self.degraded_sources.extend(other.degraded_sources)
+        # Fold in the sibling's executed query artifacts (#1166), in order,
+        # exactly as sequential accumulation would have — same append-only,
+        # non-deduplicated treatment as degraded_sources.
+        self.executed_queries.extend(other.executed_queries)
         for entry in other.working_answers:
             self.set_working_answer(entry.get("question", ""), entry.get("answer", ""))
         # Union discovered predicates (preserve order, drop dups a sibling already had).

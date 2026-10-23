@@ -46,6 +46,7 @@ export function buildRuntimeConfig(args: {
   clientId: string;
   apiEndpoint?: string;
   serveRuntimeArn?: string;
+  mcpRuntimeArn?: string;
   version?: string;
 }): RuntimeConfig {
   const {
@@ -55,6 +56,7 @@ export function buildRuntimeConfig(args: {
     clientId,
     apiEndpoint,
     serveRuntimeArn,
+    mcpRuntimeArn,
     version,
   } = args;
   return {
@@ -64,6 +66,7 @@ export function buildRuntimeConfig(args: {
     clientId,
     ...(apiEndpoint && { apiEndpoint }),
     ...(serveRuntimeArn && { serveRuntimeArn }),
+    ...(mcpRuntimeArn && { mcpRuntimeArn }),
     ...(version && { version }),
   };
 }
@@ -169,6 +172,18 @@ export class WebStack extends SCLStack {
         )
       : undefined;
 
+    // MCP Server AgentCore Runtime ARN, published by the MCP stack
+    // (mcp-stack.ts's McpRuntimeArnParam). Read via SSM to avoid a cross-stack
+    // export/import cycle — the web stack is constructed before the MCP stack
+    // in bin/app.ts, but an explicit web.addDependency(mcp) there orders the
+    // deploy so this parameter exists when runtime-config.json is written.
+    // Surfaced to the frontend so the MCP console page can show the endpoint
+    // and a copy-paste client config for this deployment (#1166).
+    const mcpRuntimeArn = ssm.StringParameter.valueForStringParameter(
+      this,
+      `${ssmPrefix}/mcp/runtime-arn`,
+    );
+
     const uiDomainName = props.customDomain?.uiDomainName;
     const uiCertificateArn = props.customDomain?.uiCertificateArn;
     const apiDomainName = props.customDomain?.apiDomainName;
@@ -186,6 +201,7 @@ export class WebStack extends SCLStack {
       clientId,
       apiEndpoint,
       serveRuntimeArn: props.serveRuntimeArn,
+      mcpRuntimeArn,
       version: readRepoVersion(),
     });
 

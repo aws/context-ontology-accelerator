@@ -133,6 +133,10 @@ class CedarAuthorizer(Protocol):
         """Return a Cedar allow/deny decision for ``query`` in ``namespace``."""
         ...
 
+    def can_view_namespace(self, *, namespace: str, profile: dict[str, Any]) -> bool:
+        """Return whether the principal holds ``viewNamespace`` on ``namespace``."""
+        ...
+
 
 class NullCedarAuthorizer:
     """Opt-out authorizer — allow-all at the Cedar-policy layer.
@@ -156,6 +160,16 @@ class NullCedarAuthorizer:
         logger.debug("cedar_authorize_noop", namespace=namespace, table_count=len(tables))
         return CedarDecision(allowed=True)
 
+    def can_view_namespace(self, *, namespace: str, profile: dict[str, Any]) -> bool:
+        """Allow viewing unconditionally at the Cedar-policy layer (opt-out).
+
+        Mirrors :meth:`authorize`: when Cedar policy enforcement is disabled
+        (``SCL_DISABLE_CEDAR=true``) the artifact gate must not independently
+        withhold — artifacts follow the same allow-all posture as the query gate.
+        """
+        logger.debug("cedar_view_namespace_noop", namespace=namespace)
+        return True
+
 
 # Profile keys carrying the principal's resolved auth context. These mirror what
 # the control-plane authorizer resolves/forwards (see authorization/handler.py
@@ -165,6 +179,7 @@ _GLOBAL_ROLES_KEY = "globalRoles"
 _RESOURCE_ROLES_KEY = "resourceRoles"  # list[{"role","resourceUID"}] — Cedar shape
 
 _QUERY_ACTION = "query"
+_VIEW_NAMESPACE_ACTION = "viewNamespace"
 _NAMESPACE_RESOURCE = "Namespace"
 
 
@@ -432,6 +447,45 @@ class RealCedarAuthorizer:
         Returns:
             A CedarDecision indicating whether the query is allowed.
         """
+        return self._evaluate_action(
+            action=_QUERY_ACTION,
+            namespace=namespace,
+            profile=profile,
+            deny_reason="not permitted to query this namespace",
+        )
+
+    def can_view_namespace(self, *, namespace: str, profile: dict[str, Any]) -> bool:
+        """Whether the principal holds ``viewNamespace`` on ``namespace`` (#1166).
+
+        This is the SAME right that gates reading a source's table/column schema
+        on the control-plane read routes (``viewNamespace`` on ``Source`` reads;
+        see authorization/handler.py). Used to decide whether the generated
+        SQL/SPARQL artifacts may be returned: a caller who can already see the
+        schema in the Sources/Tables view gains no new disclosure from seeing the
+        query that touches it, while a caller who cannot is denied the artifacts
+        even if they pass ``includeDebugInfo=true``.
+
+        Fail-closed semantics are identical to :meth:`authorize` (no-roles →
+        deny unless the explicit bypass is set; evaluator error → deny), so this
+        never leaks artifacts to an unauthorized caller on error.
+        """
+        return self._evaluate_action(
+            action=_VIEW_NAMESPACE_ACTION,
+            namespace=namespace,
+            profile=profile,
+            deny_reason="not permitted to view this namespace",
+        ).allowed
+
+    def _evaluate_action(
+        self, *, action: str, namespace: str, profile: dict[str, Any], deny_reason: str
+    ) -> CedarDecision:
+        """Evaluate ``action`` on ``namespace`` for the principal in ``profile``.
+
+        Shared by :meth:`authorize` (``query``) and :meth:`can_view_namespace`
+        (``viewNamespace``) so role resolution, the no-roles fail-closed policy,
+        the DDB/seed policy source, and the error-denies semantics stay in exactly
+        one place and cannot drift between the two actions.
+        """
         profile = profile or {}
         user_id = str(profile.get(_USER_ID_KEY) or profile.get("sub") or "anonymous")
         global_roles = [str(r) for r in _as_list(profile.get(_GLOBAL_ROLES_KEY))]
@@ -453,9 +507,11 @@ class RealCedarAuthorizer:
         # are forwarded, a dev env may set SCL_CEDAR_FAIL_OPEN_NO_ROLES=true).
         if not global_roles and not resource_roles:
             if self._fail_open:
-                logger.warning("cedar_authorize_fail_open_no_roles", namespace=namespace, bypass="explicit-opt-in")
+                logger.warning(
+                    "cedar_authorize_fail_open_no_roles", namespace=namespace, action=action, bypass="explicit-opt-in"
+                )
                 return CedarDecision(allowed=True)
-            logger.warning("cedar_authorize_fail_closed_no_roles", namespace=namespace)
+            logger.warning("cedar_authorize_fail_closed_no_roles", namespace=namespace, action=action)
             return CedarDecision(allowed=False, reason="no authorization roles resolved for caller")
 
         # Policy source: Roles-table policies (namespace-custom policies apply on the
@@ -476,7 +532,7 @@ class RealCedarAuthorizer:
             result = evaluate(
                 policies=policies,
                 user_id=user_id,
-                action=_QUERY_ACTION,
+                action=action,
                 resource_type=_NAMESPACE_RESOURCE,
                 resource_id=namespace,
                 global_roles=global_roles,
@@ -493,6 +549,7 @@ class RealCedarAuthorizer:
             logger.warning(
                 "cedar_authorize_error",
                 namespace=namespace,
+                action=action,
                 user_id=user_id,
                 global_roles=global_roles,
                 resource_role_count=len(resource_roles),
@@ -503,7 +560,7 @@ class RealCedarAuthorizer:
             return CedarDecision(allowed=False, reason="authorization policy evaluation failed")
 
         if result.allowed:
-            logger.debug("cedar_authorize_allow", namespace=namespace, user_id=user_id)
+            logger.debug("cedar_authorize_allow", namespace=namespace, action=action, user_id=user_id)
             return CedarDecision(allowed=True)
-        logger.warning("cedar_authorize_deny", namespace=namespace, user_id=user_id)
-        return CedarDecision(allowed=False, reason="not permitted to query this namespace")
+        logger.warning("cedar_authorize_deny", namespace=namespace, action=action, user_id=user_id)
+        return CedarDecision(allowed=False, reason=deny_reason)

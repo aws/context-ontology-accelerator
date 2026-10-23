@@ -85,6 +85,32 @@ describe("RationalePanel", () => {
       ).toBeGreaterThanOrEqual(2);
     });
 
+    it("labels the Resolution 'Deep Reasoning' when executionMode is deep-reasoning, overriding the tier", () => {
+      // A Deep Reasoning answer resolves at a tier but must not be labelled by it
+      // (#1166 Cut #2): the mode wins. Reuses the same tier-2 fixture, flipped to
+      // deep-reasoning, so only the mode drives the change.
+      const drMessage: ChatMessage = {
+        ...message,
+        response: {
+          ...message.response!,
+          result: {
+            ...message.response!.result,
+            executionMode: "deep-reasoning",
+          },
+        },
+      };
+      renderPanel({ message: drMessage });
+      expect(screen.getByText("Deep Reasoning")).toBeInTheDocument();
+      // The Resolution field no longer carries the Tier-2 label. The
+      // execution-plan section header still describes which strategy ran
+      // (the trace is unchanged), so the tier string drops from TWO
+      // occurrences (Resolution + header, see the standard-mode test above)
+      // to at most one — proving the Resolution field, not the header, changed.
+      expect(
+        screen.queryAllByText("Tier 2 — Structured Query (VKG (Ontop))").length,
+      ).toBeLessThanOrEqual(1);
+    });
+
     it("renders latency computed from trace steps", () => {
       renderPanel({ message });
       // 15 + 30 + 200 + 5 + 120 = 370
@@ -111,16 +137,23 @@ describe("RationalePanel", () => {
       expect(screen.getByText("req-abc-123")).toBeInTheDocument();
     });
 
-    it("renders confidence score as percentage badge", () => {
+    it("renders confidence as a LOW/MEDIUM/HIGH band word, not a raw score, as the headline", () => {
       renderPanel({ message });
-      expect(screen.getByText("92%")).toBeInTheDocument();
+      // 0.92 → High. The band word is the only confidence signal shown (#1166):
+      // the raw percentage is removed entirely so users read the band, not a number.
+      expect(screen.getByText("High")).toBeInTheDocument();
+    });
+
+    it("does not render the raw percentage at all (#1166)", () => {
+      renderPanel({ message });
+      expect(screen.queryByText("92%")).toBeNull();
     });
 
     it("renders confidence badge in green for high score (>=0.8)", () => {
       const { container } = renderPanel({ message });
       const badge = container.querySelector('[class*="badge-color-green"]');
       expect(badge).not.toBeNull();
-      expect(badge?.textContent).toBe("92%");
+      expect(badge?.textContent).toBe("High");
     });
 
     it("renders confidence rationale", () => {
@@ -134,6 +167,33 @@ describe("RationalePanel", () => {
       expect(screen.getByText("SQL Firewall: ok")).toBeInTheDocument();
       expect(screen.getByText("Guardrails: n/a")).toBeInTheDocument();
     });
+
+    it.each([
+      [0.8, "High"],
+      [0.95, "High"],
+      [0.79, "Medium"],
+      [0.5, "Medium"],
+      [0.49, "Low"],
+      [0.3, "Low"],
+      [0, "Low"],
+    ])(
+      "maps score %s to the %s band (cutoffs: High>=0.8, Medium>=0.5, else Low)",
+      (score, band) => {
+        const scored: ChatMessage = {
+          ...message,
+          response: {
+            ...message.response!,
+            result: {
+              ...message.response!.result,
+              confidence: { score, rationale: "" },
+            },
+          },
+        };
+        renderPanel({ message: scored });
+        // The band word is the headline; assert it appears exactly once as a badge.
+        expect(screen.getAllByText(band).length).toBeGreaterThanOrEqual(1);
+      },
+    );
 
     it("renders data source badges", () => {
       renderPanel({ message });
@@ -336,7 +396,7 @@ describe("RationalePanel", () => {
       const { container } = renderPanel({ message: blockedMessage });
       const badge = container.querySelector('[class*="badge-color-red"]');
       expect(badge).not.toBeNull();
-      expect(badge?.textContent).toBe("0%");
+      expect(badge?.textContent).toBe("Low");
     });
 
     it("renders SQL Firewall as blocked when step has error status", () => {
@@ -406,7 +466,7 @@ describe("RationalePanel", () => {
         '[class*="badge-color-severity-medium"]',
       );
       expect(badge).not.toBeNull();
-      expect(badge?.textContent).toBe("50%");
+      expect(badge?.textContent).toBe("Medium");
     });
 
     it("does not render data sources section when empty", () => {

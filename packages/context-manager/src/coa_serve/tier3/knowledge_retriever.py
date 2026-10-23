@@ -79,6 +79,15 @@ class Tier3Result:
     # ``degraded_sources`` at assembly time; the agentic path sets it on
     # time-budget-expiry / all-tools-fail / no-context paths (Req 7.5-7.8, 9.6-9.7).
     partial: bool = False
+    # Query artifacts the agentic path built + executed to reach its answer
+    # (#1166). ``query_used`` is the SQL, ``sparql_generated`` the SPARQL — same
+    # two fields Standard mode surfaces. When multiple structured statements ran,
+    # these carry the LAST of each kind (the query that produced the final
+    # numbers, matching Standard's single-query semantics). The hand-rolled and
+    # lexical paths leave both None. Surfaced on the QueryResult only when the
+    # caller opts in via ``options.includeDebugInfo`` — see the assembler.
+    query_used: str | None = None
+    sparql_generated: str | None = None
 
 
 class KnowledgeRetriever:

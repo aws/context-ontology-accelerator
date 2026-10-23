@@ -39,12 +39,14 @@ function traceData(overrides: {
   guardrailBlocked?: boolean;
   namespace?: string;
   tier?: number;
+  executionMode?: "standard" | "deep-reasoning";
 }) {
   return {
     trace: overrides.trace ?? [],
     tier: overrides.tier ?? 3,
     content: "Answer",
     guardrailBlocked: overrides.guardrailBlocked ?? false,
+    executionMode: overrides.executionMode,
     metadata: overrides.namespace ? { namespace: overrides.namespace } : {},
     requestId: "req-abc",
     userQuery: "What is the SLA?",
@@ -239,6 +241,21 @@ describe("TraceDetail — Tier outcome names the Tier 2 strategy that ran", () =
   it("keeps the Tier 3 label", () => {
     renderWith(traceData({ tier: 3 }));
     expect(screen.getByText("Tier 3 — knowledge")).toBeInTheDocument();
+  });
+
+  // #1166 — the full-trace page must follow the same mode-wins rule as the
+  // Rationale panel: a Deep Reasoning answer resolves at tier 3 but is labelled
+  // by its mode, not "Tier 3 — knowledge".
+  it("labels a Deep Reasoning answer by mode, not by its tier", () => {
+    renderWith(traceData({ tier: 3, executionMode: "deep-reasoning" }));
+    expect(screen.getByText("Deep Reasoning")).toBeInTheDocument();
+    expect(screen.queryByText("Tier 3 — knowledge")).not.toBeInTheDocument();
+  });
+
+  it("keeps the tier label for a standard-mode tier 3 answer", () => {
+    renderWith(traceData({ tier: 3, executionMode: "standard" }));
+    expect(screen.getByText("Tier 3 — knowledge")).toBeInTheDocument();
+    expect(screen.queryByText("Deep Reasoning")).not.toBeInTheDocument();
   });
 });
 

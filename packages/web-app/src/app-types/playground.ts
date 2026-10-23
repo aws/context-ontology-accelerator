@@ -105,6 +105,15 @@ export interface QueryResult {
   dataSources?: string[];
   guardrailBlocked?: boolean;
   partial: boolean;
+  /**
+   * Execution mode that produced this result ("standard" / "deep-reasoning").
+   * Deep Reasoning is a mode orthogonal to the tier cascade (#1166): the panel
+   * labels an answer by this field rather than inferring mode from `tier`, so a
+   * Deep Reasoning answer (which resolves at tier 3) is not shown as Standard
+   * mode's "Tier 3 — Knowledge Retrieval". Absent on responses that omit it, in
+   * which case the panel falls back to the tier label.
+   */
+  executionMode?: ExecutionMode;
   metadata?: {
     suppressedRows?: number;
     modelId?: string;

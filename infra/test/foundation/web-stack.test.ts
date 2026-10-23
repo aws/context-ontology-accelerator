@@ -239,6 +239,22 @@ describe("buildRuntimeConfig (version include/omit)", () => {
     expect(cfg).not.toHaveProperty("apiEndpoint");
     expect(cfg).not.toHaveProperty("serveRuntimeArn");
   });
+
+  test("includes mcpRuntimeArn when provided", () => {
+    expect(
+      buildRuntimeConfig({ ...base, mcpRuntimeArn: "arn:aws:x:runtime/mcp" }),
+    ).toMatchObject({ mcpRuntimeArn: "arn:aws:x:runtime/mcp" });
+  });
+
+  test("omits the mcpRuntimeArn key entirely when undefined", () => {
+    expect(buildRuntimeConfig(base)).not.toHaveProperty("mcpRuntimeArn");
+  });
+
+  test("omits mcpRuntimeArn when empty", () => {
+    expect(
+      buildRuntimeConfig({ ...base, mcpRuntimeArn: "" }),
+    ).not.toHaveProperty("mcpRuntimeArn");
+  });
 });
 
 describe("WebStack runtime-config.json artifact (end-to-end)", () => {

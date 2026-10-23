@@ -21,6 +21,22 @@ from typing import Any, Protocol, runtime_checkable
 
 
 @dataclass(frozen=True)
+class ExecutedQuery:
+    """A query artifact a structured tool built and executed (#1166).
+
+    ``kind`` is ``"sql"`` or ``"sparql"``; ``query`` is the statement text. The
+    VKG path produces BOTH a SPARQL statement and the SQL it compiles to, so a
+    single structured invocation can yield two ``ExecutedQuery`` records. Carries
+    only the statement text — no rows — because it is surfaced (behind
+    ``includeDebugInfo``) purely to show the query that ran, mirroring Standard
+    mode's ``queryUsed`` / ``sparqlGenerated``.
+    """
+
+    kind: str
+    query: str
+
+
+@dataclass(frozen=True)
 class ToolResult:
     """Uniform output of every Tool invocation (Req 11.1).
 
@@ -49,6 +65,12 @@ class ToolResult:
         produced_directions: Candidate sub-question seeds this result surfaced
             (e.g. one per discovered competitor) that the controller may open as
             Exploration_Branches subject to the fan-out cap (Req 13.4).
+        executed_queries: The query artifacts a structured tool built and ran to
+            produce ``rows`` — one ``ExecutedQuery`` per generated statement (SQL
+            from NL→SQL, SPARQL + its compiled SQL from the VKG path). Document /
+            graph / ontology tools leave this empty. Surfaced (gated by
+            ``includeDebugInfo``) on the final ``QueryResult`` so Deep Reasoning
+            returns the same query artifacts Standard mode does (#1166).
     """
 
     items: tuple[dict, ...] = ()
@@ -57,6 +79,7 @@ class ToolResult:
     rows: tuple[dict, ...] = ()
     detail: str = ""
     produced_directions: tuple[str, ...] = ()
+    executed_queries: tuple[ExecutedQuery, ...] = ()
 
 
 @runtime_checkable
