@@ -336,7 +336,9 @@ operation ListMetrics {
         @httpQuery("nextToken")
         nextToken: PaginationToken
 
-        /// Maximum number of metrics to return in one page.
+        /// Maximum number of metrics to return in one page. For compatibility
+        /// with existing callers that page with larger values, the server
+        /// reduces a value above 200 to 200 rather than rejecting it.
         @httpQuery("maxResults")
         @range(min: 1, max: 200)
         maxResults: Integer

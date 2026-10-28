@@ -506,7 +506,8 @@ class NeptuneAnalyticsLexicalStore:
                 f"(backend=neptune_analytics, graph={self._graph_id}). "
                 "The lexical graph may not have been indexed by "
                 "graphrag-toolkit. Found node labels: "
-                f"{node_labels}"
+                f"{node_labels}. The document ingest may have extracted no entity "
+                "classes; re-ingest the document source."
             )
 
         if "__SYS_RELATION__" not in edge_labels:
@@ -525,7 +526,8 @@ class NeptuneAnalyticsLexicalStore:
                 "Graph schema contains zero class entries "
                 f"(backend=neptune_analytics, graph={self._graph_id}). "
                 "The lexical graph may not have been indexed or contains no "
-                "__SYS_Class__ nodes."
+                "__SYS_Class__ nodes. The document ingest extracted no entity classes; "
+                "re-ingest the document source."
             )
 
         return ClassSchemaResult(classes=classes, relations=relations)

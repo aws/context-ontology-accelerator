@@ -77,7 +77,7 @@ class TestVectorRetriever:
         call_kwargs = mock_opensearch.search.call_args
         assert call_kwargs.kwargs["top_k"] == 20
 
-    async def test_search_handles_missing_metadata(self):
+    async def test_search_drops_chunk_without_document_provenance(self):
         os_client = AsyncMock()
         os_client.search.return_value = [
             VectorHit(
@@ -90,14 +90,19 @@ class TestVectorRetriever:
         retriever = VectorRetriever(os_client)
         results = await retriever.search([0.1] * 10, "550e8400-e29b-41d4-a716-446655440000")
 
-        assert len(results) == 1
-        assert results[0].source_doc == ""
-        assert results[0].label == ""
+        assert results == []
+        assert results.dropped_anonymous_chunks == 1
 
     async def test_search_preserves_order(self):
         os_client = AsyncMock()
         os_client.search.return_value = [
-            VectorHit(id=f"c{i}", text=f"Chunk {i}", score=0.9 - i * 0.01, metadata={}) for i in range(5)
+            VectorHit(
+                id=f"c{i}",
+                text=f"Chunk {i}",
+                score=0.9 - i * 0.01,
+                metadata={"source_doc": f"doc-{i}"},
+            )
+            for i in range(5)
         ]
         retriever = VectorRetriever(os_client)
         results = await retriever.search([0.1] * 10, "550e8400-e29b-41d4-a716-446655440000")
@@ -105,3 +110,18 @@ class TestVectorRetriever:
         assert len(results) == 5
         scores = [r.relevance_score for r in results]
         assert scores == sorted(scores, reverse=True)
+
+    async def test_search_drops_malformed_chunk_fields_without_random_fallbacks(self):
+        os_client = AsyncMock()
+        os_client.search.return_value = [
+            VectorHit(id="", text="Missing id", score=0.9, metadata={"source_doc": "doc-1"}),
+            VectorHit(id="c2", text="", score=0.8, metadata={"source_doc": "doc-2"}),
+            VectorHit(id="c3", text="Anonymous", score=0.7, metadata={"source_doc": "   "}),
+            VectorHit(id="c4", text="Valid", score=0.6, metadata={"source_doc": "doc-4"}),
+        ]
+        retriever = VectorRetriever(os_client)
+
+        results = await retriever.search([0.1] * 10, "550e8400-e29b-41d4-a716-446655440000")
+
+        assert [chunk.chunk_id for chunk in results] == ["c4"]
+        assert results.dropped_anonymous_chunks == 3

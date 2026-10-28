@@ -24,6 +24,7 @@ export const MESSAGES_JA = {
   Home: "ホーム",
   Serve: "提供",
   Playground: "プレイグラウンド",
+  "MCP Server": "MCP サーバー",
   Administration: "管理",
   Namespaces: "名前空間",
   Identity: "ID 管理",
@@ -109,6 +110,8 @@ export const MESSAGES_JA = {
     "サインインに失敗しました。もう一度お試しください。",
   Standard: "標準",
   "Deep Reasoning": "深い推論",
+  "The SPARQL and SQL Deep Reasoning generated and {engine} executed.":
+    "深い推論が生成し、{engine} が実行した SPARQL と SQL。",
   "Execution mode": "実行モード",
   "New chat": "新しいチャット",
   Rationale: "根拠",
@@ -732,6 +735,30 @@ export const MESSAGES_JA = {
   "Cross-account access (optional)": "クロスアカウントアクセス（任意）",
   "Role ARN": "ロール ARN",
   "Advanced options": "詳細オプション",
+  "Chunk size": "チャンクサイズ",
+  "How much text goes into each unit that is extracted and embedded. A larger chunk keeps a full table row and its header together; raise it for CJK or dense, tabular documents.":
+    "抽出と埋め込みを行う 1 単位に入れるテキストの量です。チャンクを大きくすると、表の 1 行とその見出しが同じチャンクに収まります。日本語などの CJK の文書や、表の多い文書では大きくしてください。",
+  "Default (256 tokens)": "既定（256 トークン）",
+  "Suits prose.": "文章が中心の文書に向いています。",
+  "Large, for tabular or CJK text (1024 tokens)":
+    "大（表や CJK のテキスト向け、1024 トークン）",
+  "Keeps a full table row and its header in one chunk.":
+    "表の 1 行とその見出しを 1 つのチャンクに収めます。",
+  Custom: "カスタム",
+  "Set the chunk size and overlap in tokens.":
+    "チャンクサイズとオーバーラップをトークン数で指定します。",
+  "Chunk size (tokens)": "チャンクサイズ（トークン）",
+  "A whole number from 1 to {max}.": "1〜{max} の整数です。",
+  "Chunk overlap (tokens)": "チャンクのオーバーラップ（トークン）",
+  "Default (25 tokens)": "既定（25 トークン）",
+  "Optional. Leave empty to use {overlap}. Must be smaller than the chunk size.":
+    "任意です。空欄のときは {overlap} を使います。チャンクサイズより小さくしてください。",
+  "Enter a whole number from 1 to {max}.":
+    "1〜{max} の整数を入力してください。",
+  "Enter a whole number from 1 to {max}, or leave it empty.":
+    "1〜{max} の整数を入力するか、空欄にしてください。",
+  "Must be larger than the overlap ({overlap} tokens).":
+    "オーバーラップ（{overlap} トークン）より大きくしてください。",
   "Tracks document versions in Neptune.":
     "Neptune で文書のバージョンを追跡します。",
   "Enable versioning": "バージョン管理を有効化",

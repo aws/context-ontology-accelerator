@@ -30,7 +30,7 @@ from coa_common.domain_models import (
 from coa_common.metadata_store.reader import read_assets_for_datasource
 
 from coa_sources.database.enrichment.bedrock_client import BedrockClient
-from coa_sources.database.enrichment.prompts import build_system_prompt, build_user_prompt
+from coa_sources.database.enrichment.prompts import build_system_prompt, build_user_prompt_segments
 from coa_sources.database.pipeline.enrichment_metrics import (
     EnrichmentMetricEmitter,
 )
@@ -127,7 +127,6 @@ def _prepare_table_context(table: Table) -> dict:
         "existing_pk": existing_pk,
         "existing_fks": existing_fks,
         "extra_context": extra_context,
-        "extra_context_hint": "",
     }
 
 
@@ -475,13 +474,12 @@ def _call_bedrock(
     existing_pk: list[str] | None = None,
     existing_fks: list[dict] | None = None,
     extra_context: str = "",
-    extra_context_hint: str = "",
 ) -> tuple[dict, float, int, int]:
     """Build prompt and invoke Bedrock, returning (parsed, latency_ms, input_tokens, output_tokens).
 
     Emits per-call metrics (latency, tokens) via *emitter*.
     """
-    user_prompt = build_user_prompt(
+    user_prompt = build_user_prompt_segments(
         table_name,
         database,
         columns,
@@ -489,7 +487,6 @@ def _call_bedrock(
         existing_pk=existing_pk,
         existing_fks=existing_fks,
         extra_context=extra_context,
-        extra_context_hint=extra_context_hint,
     )
     # Output grows with column count (about 100 tokens per column), so a fixed 16384 ceiling
     # covers a full 50-column batch and any unbatched table up to the 80-column threshold.

@@ -435,6 +435,17 @@ class TestTopicBeamStrategy:
         assert kw["max_statements_per_topic"] == 9999
         assert kw["processor_args"].max_statements_per_topic == 10
 
+    def test_processor_args_request_chunk_details(self):
+        """The retriever's own ProcessorArgs must ask for chunk details.
+
+        Without ``include_chunk_details`` the toolkit's statements query returns each
+        chunk as ``{chunkId, value: NULL, metadata: {}}``: no source node carries any
+        text, so every one is dropped as anonymous and topic_beam answers with no
+        citations, where main returned them for the same query."""
+        _, mock_tb, _mtg, _mtv, _ro = self._build()
+        _, kw = mock_tb.call_args
+        assert kw["processor_args"].include_chunk_details is True
+
     def test_stores_are_wrapped_before_the_retriever_is_constructed(self):
         """The builder must wrap the stores ITSELF (MultiTenant + ReadOnly).
 

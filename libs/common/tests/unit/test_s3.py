@@ -16,9 +16,37 @@ from coa_common.s3 import (
     list_objects,
     parse_bucket_from_arn,
     read_file_bytes,
+    regional_s3_client,
     upload_file,
     upload_json,
 )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("region", "host"),
+    [
+        ("eu-west-1", "example-bucket.s3.eu-west-1.amazonaws.com"),
+        ("cn-north-1", "example-bucket.s3.cn-north-1.amazonaws.com.cn"),
+    ],
+)
+def test_regional_s3_client_presigns_against_regional_hostname(monkeypatch, tmp_path, region, host):
+    # Dummy credentials and an empty shared config: presigning is local, and a
+    # developer's profile or endpoint override must not change the host.
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(tmp_path / "config"))
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(tmp_path / "credentials"))
+    for name in ("AWS_PROFILE", "AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3"):
+        monkeypatch.delenv(name, raising=False)
+
+    url = regional_s3_client(region).generate_presigned_url(
+        "put_object", Params={"Bucket": "example-bucket", "Key": "a/b.pdf", "ContentType": "application/pdf"}
+    )
+
+    assert url.startswith(f"https://{host}/a/b.pdf?")
+    assert "X-Amz-Algorithm=AWS4-HMAC-SHA256" in url
+    assert f"%2F{region}%2Fs3%2Faws4_request" in url
 
 
 @pytest.mark.unit

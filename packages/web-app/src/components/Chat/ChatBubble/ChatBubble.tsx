@@ -20,6 +20,7 @@ import type {
   TraceStep,
   SupportingContentItem,
   GraphContextItem,
+  ExecutionMode,
 } from "@app-types";
 import { LiveSteps } from "./LiveSteps";
 import { EvidencePanel } from "./EvidencePanel";
@@ -43,6 +44,7 @@ export interface ChatBubbleProps {
     resultRows?: Record<string, unknown>[];
     queryUsed?: string;
     sparqlGenerated?: string;
+    executionMode?: ExecutionMode;
     latencyMs?: number;
     guardrailBlocked?: boolean;
     suppressedRows?: number;
@@ -167,10 +169,23 @@ export const ChatBubble: React.FC<ChatBubbleProps> = ({
     }
   })();
 
+  // The SPARQL provenance differs by mode. Standard mode's Tier-2 VKG strategy
+  // emits SPARQL that Ontop compiles to SQL, so "(Tier 2)" is accurate there.
+  // Deep Reasoning also emits SPARQL/SQL but through its agentic loop, not the
+  // Tier-2 cascade — labelling its artifacts "(Tier 2)" mislabels them (#1166).
+  const isDeepReasoning = response.executionMode === "deep-reasoning";
   const sqlArtifactCaption = response.sparqlGenerated
-    ? t("The SPARQL the LLM emitted (Tier 2) and the SQL {engine} executed.", {
-        engine: executionEngineLabel,
-      })
+    ? isDeepReasoning
+      ? t(
+          "The SPARQL and SQL Deep Reasoning generated and {engine} executed.",
+          { engine: executionEngineLabel },
+        )
+      : t(
+          "The SPARQL the LLM emitted (Tier 2) and the SQL {engine} executed.",
+          {
+            engine: executionEngineLabel,
+          },
+        )
     : t("The SQL {engine} executed.", { engine: executionEngineLabel });
 
   return (

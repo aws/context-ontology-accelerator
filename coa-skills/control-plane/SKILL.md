@@ -41,9 +41,9 @@ COA has two public app clients. Use the one that matches the call:
 | `--client` | Use for | Redirect |
 |---|---|---|
 | `web` | Control-plane REST API | `http://localhost:5173/authenticate/` |
-| `mcp` | Serve runtime and MCP server | `http://localhost:9876/oauth/callback` |
+| `mcp` | MCP server, or direct calls to the serve AgentCore runtime (not the REST API) | `http://localhost:9876/oauth/callback` |
 
-The control plane rejects `mcp` tokens with 403 "explicit deny". The `web` redirect is registered only on `dev` deployments. On other environments, add it to the web client first.
+Every REST endpoint, including the serve runtime's `POST /namespaces/{ns}/query`, takes `web` tokens only and rejects `mcp` tokens with 403 "explicit deny". Use `mcp` tokens with the MCP server, or when invoking the serve AgentCore runtime directly. The `web` redirect is registered only on `dev` deployments. On other environments, add it to the web client first.
 
 Run these from the repository root. The script is at `coa-skills/control-plane/scripts/coa_login.py`.
 

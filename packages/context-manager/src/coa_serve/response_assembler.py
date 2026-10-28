@@ -6,15 +6,209 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 
+import structlog
+
+from .graph_context import (
+    LEGACY_SUPPORTING_STATEMENTS_KEY,
+    SUPPORTING_STATEMENTS_KEY,
+    bound_supporting_statements,
+    encode_supporting_statements,
+    fair_bound_statement_groups,
+)
 from .models import ConfidenceScore, QueryResult
+from .step_ids import StepId
 from .trace import TraceCollector
+
+logger = structlog.get_logger(__name__)
+
+# Wire bounds on an assembled graph context. The statement bounds in
+# ``graph_context`` cap how much text ONE entity carries; these cap how many
+# entities and edges a single response can carry at all. Without them the list
+# length is whatever the retrieval loop accumulated, which is unbounded on the
+# wire, in the session envelope, and in the client's renderer.
+MAX_GRAPH_CONTEXT_ENTITIES = 200
+MAX_GRAPH_CONTEXT_RELATIONSHIPS = 500
 
 # empty-result penalty factor for Tier-2 calibration.
 # Conservative, documented default — NOT a tuned/measured value. Tuning the
 # magnitude (and whether 0 rows should instead trigger a Tier-3 fallback) is a
 # follow-up that intersects the Tier-2 accuracy eval; see MR "Notes for reviewers".
 _TIER2_EMPTY_RESULT_PENALTY = 0.5
+
+
+def _first_non_empty_string(*values: object) -> str | None:
+    """Return the first non-blank string from ``values``."""
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+@dataclass(frozen=True)
+class GraphContextDrops:
+    """Counts of graph evidence discarded while mapping to the wire shape.
+
+    Every count here is evidence the caller supplied and the response does NOT
+    contain, so each one has to reach the trace and ``degradedSources``: an empty
+    ``relationships`` list must never be ambiguous between "the graph had no edges"
+    and "every edge was thrown away".
+    """
+
+    relationships_without_identity: int = 0
+    entities_without_uri: int = 0
+    entities_over_bound: int = 0
+    relationships_over_bound: int = 0
+
+    @property
+    def total(self) -> int:
+        """How many pieces of supplied graph evidence were discarded."""
+        return (
+            self.relationships_without_identity
+            + self.entities_without_uri
+            + self.entities_over_bound
+            + self.relationships_over_bound
+        )
+
+    def describe(self) -> str:
+        """Human-readable summary for a trace detail / degraded-source record."""
+        parts = [
+            f"{self.relationships_without_identity} relationship(s) with no predicate identity",
+            f"{self.entities_without_uri} entities with no uri",
+            f"{self.entities_over_bound} entities over the {MAX_GRAPH_CONTEXT_ENTITIES} bound",
+            f"{self.relationships_over_bound} relationship(s) over the {MAX_GRAPH_CONTEXT_RELATIONSHIPS} bound",
+        ]
+        counts = (
+            self.relationships_without_identity,
+            self.entities_without_uri,
+            self.entities_over_bound,
+            self.relationships_over_bound,
+        )
+        return "dropped " + "; ".join(part for part, count in zip(parts, counts, strict=True) if count)
+
+
+def _canonical_graph_context(
+    graph_context: Sequence[dict], *, include_statements: bool = True
+) -> tuple[dict, GraphContextDrops]:
+    """Map internal GraphEntity dictionaries to the Smithy GraphContext shape.
+
+    Returns the canonical context plus a count of everything discarded, so the
+    caller can make the discards observable rather than returning a quietly
+    thinned-out graph.
+
+    ``include_statements=False`` leaves every entity's ``supportingStatements``
+    out. Those statements are retrieved text (an edge-typed traversal's
+    statement, or lexical text with no source document) that used to travel as
+    ``supportingContent`` items, so a caller who opted out of supporting content
+    must not receive them through ``graphContext`` instead.
+    """
+    entities: list[dict] = []
+    entity_statements: list[list[str]] = []
+    relationships: list[dict] = []
+    seen_relationships: set[tuple[str, str, str]] = set()
+    entities_without_uri = 0
+    relationships_without_identity = 0
+
+    for raw_entity in graph_context:
+        uri = _first_non_empty_string(raw_entity.get("uri"))
+        if uri is None:
+            entities_without_uri += 1
+            continue
+
+        entity: dict = {
+            "uri": uri,
+            "label": _first_non_empty_string(raw_entity.get("label")) or uri,
+        }
+        entity_type = _first_non_empty_string(raw_entity.get("type"))
+        if entity_type is not None:
+            entity["type"] = entity_type
+        properties = raw_entity.get("properties")
+        if isinstance(properties, dict) and properties:
+            canonical_properties = {
+                str(key): str(value)
+                for key, value in properties.items()
+                if key not in {SUPPORTING_STATEMENTS_KEY, LEGACY_SUPPORTING_STATEMENTS_KEY}
+            }
+            if canonical_properties:
+                entity["properties"] = canonical_properties
+            entity_statements.append(
+                bound_supporting_statements(
+                    properties.get(
+                        SUPPORTING_STATEMENTS_KEY,
+                        properties.get(LEGACY_SUPPORTING_STATEMENTS_KEY),
+                    )
+                )
+                if include_statements
+                else []
+            )
+        else:
+            entity_statements.append([])
+        entities.append(entity)
+
+        raw_relationships = raw_entity.get("relationships")
+        if not isinstance(raw_relationships, list | tuple):
+            continue
+        for raw_relationship in raw_relationships:
+            if not isinstance(raw_relationship, dict):
+                continue
+            source_uri = _first_non_empty_string(
+                raw_relationship.get("sourceUri"),
+                raw_relationship.get("source_uri"),
+            )
+            predicate_uri = _first_non_empty_string(
+                raw_relationship.get("predicateUri"),
+                raw_relationship.get("predicate_uri"),
+            )
+            target_uri = _first_non_empty_string(
+                raw_relationship.get("targetUri"),
+                raw_relationship.get("target_uri"),
+            )
+            if source_uri is None or predicate_uri is None or target_uri is None:
+                # A relationship with no stable predicate identity cannot be put on
+                # the wire (``predicateUri`` is @required and a human-readable label
+                # is not an identifier). Producers reading a label-only property
+                # graph mint a synthetic tenant-scoped IRI upstream
+                # (``graph_tool.synthetic_predicate_uri``); anything still arriving
+                # without one is genuinely unidentifiable, so it is counted here and
+                # reported by the caller.
+                relationships_without_identity += 1
+                continue
+            relationship_key = (source_uri, predicate_uri, target_uri)
+            if relationship_key in seen_relationships:
+                continue
+            seen_relationships.add(relationship_key)
+            relationship = {
+                "sourceUri": source_uri,
+                "predicateUri": predicate_uri,
+                "targetUri": target_uri,
+            }
+            predicate_label = _first_non_empty_string(
+                raw_relationship.get("predicateLabel"),
+                raw_relationship.get("predicate_label"),
+            )
+            if predicate_label is not None:
+                relationship["predicateLabel"] = predicate_label
+            relationships.append(relationship)
+
+    entities_over_bound = max(0, len(entities) - MAX_GRAPH_CONTEXT_ENTITIES)
+    relationships_over_bound = max(0, len(relationships) - MAX_GRAPH_CONTEXT_RELATIONSHIPS)
+    del entities[MAX_GRAPH_CONTEXT_ENTITIES:]
+    del entity_statements[MAX_GRAPH_CONTEXT_ENTITIES:]
+    del relationships[MAX_GRAPH_CONTEXT_RELATIONSHIPS:]
+
+    for entity, statements in zip(entities, fair_bound_statement_groups(entity_statements), strict=True):
+        if not statements:
+            continue
+        properties = entity.setdefault("properties", {})
+        properties[SUPPORTING_STATEMENTS_KEY] = encode_supporting_statements(statements)
+
+    return {"entities": entities, "relationships": relationships}, GraphContextDrops(
+        relationships_without_identity=relationships_without_identity,
+        entities_without_uri=entities_without_uri,
+        entities_over_bound=entities_over_bound,
+        relationships_over_bound=relationships_over_bound,
+    )
 
 
 class ResponseAssembler:
@@ -278,6 +472,10 @@ class ResponseAssembler:
         model_id: str | None = None,
         partial: bool = False,
         ontology_version: str | None = None,
+        execution_mode: str | None = None,
+        query_used: str | None = None,
+        sparql_generated: str | None = None,
+        include_debug_info: bool = False,
     ) -> QueryResult:
         """Build a Tier-3 QueryResult from an agentic synthesis.
 
@@ -286,7 +484,9 @@ class ResponseAssembler:
             supporting_content: Retrieved chunks backing the answer. ``None`` when the
                 caller opted out (``includeSupporting=False``) — the field is then
                 omitted from the response, as on Tier 1/2; ``[]`` means none found.
-            graph_context: Graph entities used as context.
+            graph_context: Graph entities used as context. Their
+                ``supportingStatements`` are omitted when ``supporting_content``
+                is ``None``; entities and relationships are always returned.
             confidence: Resolution confidence in [0, 1]; forced to 0 when blocked.
             guardrail_blocked: Whether a guardrail blocked the synthesized answer.
             trace: Processing-trace collector for this request.
@@ -299,6 +499,17 @@ class ResponseAssembler:
                 the reasoning loop short); surfaced on the QueryResult.
             ontology_version: Version of the ontology the query ran against,
                 when the caller can name one (#986).
+            execution_mode: The resolved execution mode ("standard" /
+                "deep-reasoning"); surfaced structurally on the QueryResult so the
+                console can label a Deep Reasoning answer by its MODE rather than
+                mis-reading its Tier-3 resolution as Standard mode's Tier-3 label
+                (#1166). ``None`` leaves the field unset.
+            query_used: SQL the agentic loop built + executed (#1166).
+            sparql_generated: SPARQL the agentic loop built + executed (#1166).
+            include_debug_info: When False (default), ``query_used`` /
+                ``sparql_generated`` are WITHHELD — they expose internal schema,
+                exactly as the Tier-2 assembler withholds them. Opt in via
+                ``options.includeDebugInfo=true``.
 
         Returns:
             A QueryResult tagged as Tier 3.
@@ -310,22 +521,64 @@ class ResponseAssembler:
         if guardrail_blocked:
             confidence = 0.0
         metadata = self._base_metadata(namespace, principal, model_id=model_id)
-        if degraded_sources:
-            metadata["degradedSources"] = list(degraded_sources)
+
+        # ``None`` is the opt-out (see Args). Graph statement text is retrieved
+        # text too, and before #984 it was a ``supportingContent`` item, so it
+        # goes with the opt-out rather than moving to ``graphContext``.
+        canonical_graph_context, drops = _canonical_graph_context(
+            graph_context, include_statements=supporting_content is not None
+        )
+        all_degraded_sources = list(degraded_sources or ())
+        if drops.total:
+            # Without this, "the graph returned no edges" and "every edge was
+            # discarded" are the same empty list to an operator: no trace step, no
+            # degraded source, no log. The synthesizer may already have asserted the
+            # discarded relationship in the answer text.
+            detail = drops.describe()
+            logger.warning(
+                "graph_context_evidence_dropped",
+                namespace=namespace,
+                relationships_without_identity=drops.relationships_without_identity,
+                entities_without_uri=drops.entities_without_uri,
+                entities_over_bound=drops.entities_over_bound,
+                relationships_over_bound=drops.relationships_over_bound,
+                retained_entities=len(canonical_graph_context["entities"]),
+                retained_relationships=len(canonical_graph_context["relationships"]),
+            )
+            trace.record(StepId.RESPONSE_ASSEMBLE, "degraded", 0, detail=detail)
+            all_degraded_sources.append(
+                {
+                    "source": str(StepId.RESPONSE_ASSEMBLE),
+                    "reason": "graph_context_evidence_dropped",
+                    "detail": detail,
+                }
+            )
+
+        if all_degraded_sources:
+            metadata["degradedSources"] = all_degraded_sources
         return QueryResult(
             tier=3,
             confidence=ConfidenceScore(score=confidence, rationale="Agentic synthesis"),
             synthesized_answer=synthesized_answer,
             supporting_content=None if supporting_content is None else list(supporting_content),
-            graph_context={"entities": list(graph_context)},
+            graph_context=canonical_graph_context,
             guardrail_blocked=guardrail_blocked,
+            # Same includeDebugInfo gate as the Tier-2 assembler: the compiled SQL
+            # and generated SPARQL expose internal schema, so withhold them unless
+            # the caller opted in. This closes the Deep-Reasoning artifact gap
+            # (#1166) without widening what a default request leaks.
+            query_used=query_used if include_debug_info else None,
+            sparql_generated=sparql_generated if include_debug_info else None,
+            execution_mode=execution_mode,
             trace=trace.steps,
             # ``partial`` signals the answer was built from INCOMPLETE inputs.
             # A degraded source (a retrieval source that errored/timed out) means the
             # synthesis ran on partial context, so flag it. (The REST 29s-timeout
             # truncation case is owned by Data-Layer ; this is the in-runtime
             # partial-context signal we can set authoritatively here.)
-            partial=bool(degraded_sources) or partial,
+            # Discarded graph evidence counts too: the returned context is provably
+            # narrower than what retrieval produced.
+            partial=bool(all_degraded_sources) or partial,
             ontology_version=ontology_version,
             metadata=metadata,
         )

@@ -594,6 +594,11 @@ table's full detail (technical + AI-enriched metadata, `reviewStatus`,
 `enrichmentSource`) via `GET .../tables/{tableId}` — see **ListSourceTables**
 / **GetSourceTable** in the [API Reference](#/api-reference).
 
+The table list returns at most 50 tables per page (the default). For
+compatibility with older clients, a `maxResults` from 51 to 1000 is reduced to
+50 rather than rejected; page with `nextToken` for the rest. Values below 1,
+above 1000, or not an integer return `400`.
+
 ### Approve or Reject a Single Table
 
 `PUT .../tables/{tableId}/review` with `{ "decision": "APPROVED" }` or
@@ -1205,6 +1210,27 @@ default" — `chunkSize` 256, `chunkOverlap` 25. Set a positive `chunkSize`
 `chunkOverlap` must be smaller than `chunkSize`; if it is set greater than or
 equal to `chunkSize` it is clamped down (with a logged warning) so chunking
 still produces valid chunks.
+
+In the web console, set these under **Connect source → Documents → Advanced
+options → Chunk size**:
+
+- **Default (256 tokens)** sends neither field, so the toolkit defaults (256 / 25) apply.
+- **Large, for tabular or CJK text (1024 tokens)** sends `chunkSize: 1024` and
+  leaves the overlap at its default. Use it for Japanese and other CJK text, and
+  for table-heavy documents. A token holds fewer CJK characters than English
+  ones, so at 256 tokens a table row, or a number such as `18.0`, can be split
+  across chunks and extracted wrongly.
+- **Custom** takes a size from 1 to 4096 and an optional overlap from 1 to 512
+  (empty means 25).
+
+The console requires the size to be larger than the overlap before it lets you
+continue, so the clamp above only applies to API callers.
+
+The source's detail page shows the stored values under **Advanced options**, as
+**Chunk size (tokens)** and **Chunk overlap (tokens)**. A field the source did
+not set, or set to 0, shows as the toolkit default. The overlap only takes effect
+when a chunk size is set, so an overlap stored without a chunk size also shows
+as the default (25 tokens).
 
 ## Cross-Account Sources
 

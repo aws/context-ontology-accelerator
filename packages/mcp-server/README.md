@@ -50,134 +50,59 @@ Connect your IDE to the deployed MCP server using `mcp-proxy` as a stdio-to-stre
 
 ### Prerequisites
 
-- `uvx` installed (`pip install uv`)
-- AWS credentials with access to SSM + Secrets Manager + Cognito
+- Node.js 18+ (the proxy runs on Node)
+- `uvx` installed (`pip install uv`) — the proxy spawns `uvx mcp-proxy` internally
+- AWS credentials for this account on your default profile (any read-only role that can read SSM)
 - Deployed `coa-dev-mcp` stack
-- `jq` installed
 
 ### How it works
 
 ```
-IDE (stdio) --> wrapper script --> mcp-proxy --> HTTPS (Bearer JWT) --> AgentCore Runtime --> MCP Server
+IDE (stdio) --> mcp-proxy (Cognito PKCE + Bearer JWT) --> HTTPS --> AgentCore Runtime --> MCP Server
 ```
 
-You need two shell scripts: one to fetch a Cognito token, and one to launch the proxy.
+The `packages/mcp-proxy` bridge handles authentication itself — there is no token
+script. On first run it opens a browser for a Cognito PKCE login (no password
+stored), caches a refresh token in `~/.scl/tokens.json`, and keeps you signed in
+for 30 days. Each request is authenticated as **your own** Cognito identity, so
+Cedar grants and the audit log reflect you — not a shared account. It
+auto-discovers the runtime ARN, MCP client id, and issuer from SSM under the
+deployment's resource prefix (default `/coa`).
 
-### Step 1: Create `get-token.sh`
+> Earlier revisions documented two shell scripts (`get-token.sh` /
+> `start-mcp-proxy.sh`) that minted a Cognito token via `USER_PASSWORD_AUTH` and
+> fell back to the shared `*-integ-test-user` secret. That path is removed: it
+> signed everyone in as the shared test user (wrong identity + audit) and only
+> worked in `dev` (where `USER_PASSWORD_AUTH` is enabled). Use the PKCE proxy
+> below instead.
 
-This script fetches a Cognito ID token. It accepts credentials via `SCL_USERNAME`/`SCL_PASSWORD`/`SCL_CLIENT_ID` env vars, or falls back to Secrets Manager.
+### Step 1: Build the proxy
+
+`coa-mcp-proxy` is an in-repo package (not yet published), so build it from a
+checkout and use the absolute path to the built entrypoint:
 
 ```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-AWS_REGION="${AWS_REGION:-us-east-1}"
-AWS_PROFILE="${AWS_PROFILE:-}"
-RESOURCE_PREFIX="${RESOURCE_PREFIX:-coa}"
-ENV_NAME="${ENV_NAME:-dev}"
-SECRET_NAME="${RESOURCE_PREFIX}-${ENV_NAME}-integ-test-user"
-
-PROFILE_FLAG=""
-if [[ -n "$AWS_PROFILE" ]]; then
-  PROFILE_FLAG="--profile $AWS_PROFILE"
-fi
-
-# Direct credentials (preferred for IDE usage)
-if [[ -n "${SCL_USERNAME:-}" && -n "${SCL_PASSWORD:-}" && -n "${SCL_CLIENT_ID:-}" ]]; then
-  USERNAME="$SCL_USERNAME"
-  PASSWORD="$SCL_PASSWORD"
-  CLIENT_ID="$SCL_CLIENT_ID"
-else
-  # Fall back to Secrets Manager
-  SECRET_JSON=$(aws secretsmanager get-secret-value \
-    $PROFILE_FLAG \
-    --secret-id "$SECRET_NAME" \
-    --region "$AWS_REGION" \
-    --query SecretString \
-    --output text)
-  USERNAME=$(echo "$SECRET_JSON" | jq -r '.username')
-  PASSWORD=$(echo "$SECRET_JSON" | jq -r '.password')
-  CLIENT_ID=$(echo "$SECRET_JSON" | jq -r '.userPoolClientId')
-fi
-
-# Get Cognito ID token
-TOKEN=$(aws cognito-idp initiate-auth \
-  $PROFILE_FLAG \
-  --auth-flow USER_PASSWORD_AUTH \
-  --client-id "$CLIENT_ID" \
-  --auth-parameters "USERNAME=$USERNAME,PASSWORD=$PASSWORD" \
-  --region "$AWS_REGION" \
-  --query 'AuthenticationResult.IdToken' \
-  --output text)
-
-echo "$TOKEN"
+cd packages/mcp-proxy
+npm install
+npx tsc --outDir dist
+# use the absolute path printed by:
+echo "$PWD/dist/index.js"
 ```
 
-### Step 2: Create `start-mcp-proxy.sh`
+### Step 2: Configure your IDE
 
-This script resolves the runtime ARN from SSM, fetches a token, and launches `mcp-proxy`.
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-AWS_REGION="${AWS_REGION:-us-east-1}"
-AWS_PROFILE="${AWS_PROFILE:-}"
-RESOURCE_PREFIX="${RESOURCE_PREFIX:-scl}"
-ENV_NAME="${ENV_NAME:-dev}"
-SSM_KEY="/${RESOURCE_PREFIX}/mcp/runtime-arn"
-
-PROFILE_FLAG=""
-if [[ -n "$AWS_PROFILE" ]]; then
-  PROFILE_FLAG="--profile $AWS_PROFILE"
-fi
-
-# Resolve runtime ARN
-if [[ -z "${MCP_RUNTIME_ARN:-}" ]]; then
-  MCP_RUNTIME_ARN=$(aws ssm get-parameter \
-    $PROFILE_FLAG \
-    --name "$SSM_KEY" \
-    --region "$AWS_REGION" \
-    --query 'Parameter.Value' \
-    --output text)
-fi
-
-# URL-encode the ARN
-ENCODED_ARN=$(python3 -c "from urllib.parse import quote; print(quote('$MCP_RUNTIME_ARN', safe=''))")
-MCP_URL="https://bedrock-agentcore.${AWS_REGION}.amazonaws.com/runtimes/${ENCODED_ARN}/invocations?qualifier=DEFAULT"
-
-# Get fresh Cognito token
-TOKEN=$("$SCRIPT_DIR/get-token.sh")
-
-# Launch mcp-proxy in stdio -> streamable-http mode
-exec uvx mcp-proxy \
-  --transport streamablehttp \
-  --headers Authorization "Bearer $TOKEN" \
-  "$MCP_URL"
-```
-
-Make both executable: `chmod +x get-token.sh start-mcp-proxy.sh`
-
-### Step 3: Configure your IDE
-
-Add to `.kiro/settings/mcp.json` (or Claude Desktop's `claude_desktop_config.json`):
+Add to `.kiro/settings/mcp.json` (or Claude Desktop's `claude_desktop_config.json`),
+pointing `command` at the `dist/index.js` path from Step 1:
 
 ```json
 {
   "mcpServers": {
-    "coa-dev": {
-      "command": "/path/to/start-mcp-proxy.sh",
-      "args": [],
+    "coa": {
+      "command": "node",
+      "args": ["/absolute/path/to/mcp-proxy/dist/index.js"],
       "env": {
         "AWS_REGION": "us-east-1",
-        "AWS_PROFILE": "your-admin-profile",
-        "RESOURCE_PREFIX": "coa",
-        "ENV_NAME": "dev",
-        "SCL_USERNAME": "you@amazon.com",
-        "SCL_CLIENT_ID": "your-cognito-client-id",
-        "SCL_PASSWORD": "your-cognito-password"
+        "RESOURCE_PREFIX": "coa"
       },
       "autoApprove": [
         "list_metrics",
@@ -192,14 +117,32 @@ Add to `.kiro/settings/mcp.json` (or Claude Desktop's `claude_desktop_config.jso
 }
 ```
 
-To find your `SCL_CLIENT_ID`:
+Claude Code registers the server with one command instead of an edited file:
+
 ```bash
-aws ssm get-parameter --name "/coa/userpool-client-id" --region us-east-1 --query 'Parameter.Value' --output text
+claude mcp add coa -- \
+  env AWS_REGION=us-east-1 RESOURCE_PREFIX=coa \
+  node /absolute/path/to/mcp-proxy/dist/index.js
 ```
 
-### Token expiry
+Do **not** set `AWS_PROFILE` to a profile you don't have — the proxy uses the
+default credential chain, and a bogus profile breaks SSM discovery.
 
-Cognito ID tokens last 1 hour. If your session runs longer, reconnect the MCP server from the IDE's MCP panel (Kiro: Cmd+Shift+P, "Reconnect MCP Servers").
+### Step 3: Verify
+
+Reconnect the `coa` server from the IDE's MCP panel (Kiro: Cmd+Shift+P →
+"Reconnect MCP Servers"), or just invoke a tool. The first call opens a browser
+for the Cognito login; after you sign in, `~/.scl/tokens.json` is written and the
+tools become available. Ask the agent to run `list_metrics` for a namespace you
+can access — a working setup returns the governed metrics.
+
+### Token / session lifetime
+
+The PKCE session refreshes silently for 30 days. If it lapses after long
+inactivity, the next call reopens the browser login. To force a fresh login,
+delete `~/.scl/tokens.json`.
+
+See `packages/mcp-proxy/README.md` for the proxy's full option/override reference.
 
 ## Auth Model
 

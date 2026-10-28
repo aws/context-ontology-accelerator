@@ -78,6 +78,28 @@ describe("GuardrailStack", () => {
     });
   });
 
+  test("system-internals topic screens requests only, not answers", () => {
+    const guardrails = template.findResources("AWS::Bedrock::Guardrail");
+    const topics = Object.values(guardrails).flatMap(
+      (r) => r.Properties?.TopicPolicyConfig?.TopicsConfig ?? [],
+    ) as Record<string, unknown>[];
+    const byName = (n: string) => topics.find((t) => t.Name === n);
+    // On answers it blocked grounded regulation/policy answers (see the
+    // comment on DENIED_TOPICS_CONFIG); requests for the prompt still block.
+    expect(byName("System internals disclosure")).toMatchObject({
+      InputEnabled: true,
+      InputAction: "BLOCK",
+      OutputEnabled: false,
+      OutputAction: "NONE",
+    });
+    // Malicious code is about what the model writes, so it keeps both sides
+    // (unset = Bedrock's default of evaluating input and output).
+    const malicious = byName("Malicious code generation");
+    expect(malicious).toBeDefined();
+    expect(malicious?.OutputEnabled).toBeUndefined();
+    expect(malicious?.OutputAction).toBeUndefined();
+  });
+
   test("denied-topic definitions and examples fit Bedrock's limits", () => {
     const guardrails = template.findResources("AWS::Bedrock::Guardrail");
     const topics = Object.values(guardrails).flatMap(

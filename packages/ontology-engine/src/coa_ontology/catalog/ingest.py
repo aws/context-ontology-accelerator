@@ -420,6 +420,94 @@ def _class_datasource_map_from_r2rml(r2rml_content: bytes | str | None) -> dict[
     return mapping
 
 
+def _unquote_sql_identifier(literal: str) -> str:
+    """Bare name of a possibly schema-qualified, SQL-delimited identifier.
+
+    ``"orders"`` -> ``orders``; ``"sales"."orders"`` -> ``orders``; ``a""b`` keeps
+    its escaped quote as ``a"b``. The last dotted segment is returned because the
+    NL->SQL context has always named a table by its bare name (the serve side keys
+    routing on it and qualifies per data source itself).
+    """
+    segments: list[str] = []
+    buf: list[str] = []
+    quoted = False
+    i = 0
+    while i < len(literal):
+        ch = literal[i]
+        if ch == '"':
+            if quoted and i + 1 < len(literal) and literal[i + 1] == '"':
+                buf.append('"')
+                i += 2
+                continue
+            quoted = not quoted
+        elif ch == "." and not quoted:
+            segments.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+        i += 1
+    segments.append("".join(buf))
+    return segments[-1].strip()
+
+
+def _physical_names_from_r2rml(r2rml_content: bytes | str | None) -> tuple[dict[str, str], dict[str, str]]:
+    """Physical table and column names the R2RML maps each class and property to.
+
+    Returns ``(class URI -> bare table name, property URI -> column name)``. Only
+    unambiguous entries are returned:
+
+    * a class backed by ``rr:sqlQuery`` (no ``rr:tableName``) is left out — it is a
+      derived relation, not a table NL->SQL can name;
+    * a class mapped to more than one distinct table, or a property mapped to more
+      than one distinct column, is left out rather than pinned to an arbitrary one.
+
+    Callers fall back to the OWL label for anything not in the maps, which is the
+    behaviour before this existed. Fail-soft like
+    :func:`_class_datasource_map_from_r2rml`: unparseable R2RML yields empty maps.
+    """
+    if not r2rml_content:
+        return {}, {}
+    text = r2rml_content.decode("utf-8") if isinstance(r2rml_content, bytes) else r2rml_content
+    if not text.strip():
+        return {}, {}
+    rr = Namespace("http://www.w3.org/ns/r2rml#")
+    try:
+        rg = Graph()
+        rg.parse(data=text, format="turtle")
+    except Exception as e:  # noqa: BLE001 — malformed R2RML must not fail ingest
+        log.warning("r2rml parse failed while deriving physical names: %s", e)
+        return {}, {}
+
+    tables: dict[str, set[str]] = {}
+    columns: dict[str, set[str]] = {}
+    for tmap in rg.subjects(RDF.type, rr.TriplesMap):
+        table = ""
+        for logical in rg.objects(tmap, rr.logicalTable):
+            name = rg.value(logical, rr.tableName)
+            if name is not None:
+                table = _unquote_sql_identifier(str(name))
+        for subj_map in rg.objects(tmap, rr.subjectMap):
+            for cls_uri in rg.objects(subj_map, rr["class"]):
+                tables.setdefault(str(cls_uri), set()).add(table)
+        for pom in rg.objects(tmap, rr.predicateObjectMap):
+            predicates = list(rg.objects(pom, rr.predicate))
+            for pmap in rg.objects(pom, rr.predicateMap):
+                const = rg.value(pmap, rr.constant)
+                if const is not None:
+                    predicates.append(const)
+            for omap in rg.objects(pom, rr.objectMap):
+                column = rg.value(omap, rr.column)
+                if column is None:
+                    continue
+                for pred in predicates:
+                    columns.setdefault(str(pred), set()).add(_unquote_sql_identifier(str(column)))
+
+    # "" in a class's set means one of its TriplesMaps has no rr:tableName (rr:sqlQuery).
+    class_tables = {cls: next(iter(names)) for cls, names in tables.items() if len(names) == 1 and "" not in names}
+    prop_columns = {prop: next(iter(cols)) for prop, cols in columns.items() if len(cols) == 1 and next(iter(cols))}
+    return class_tables, prop_columns
+
+
 def ingest_ontology(
     graph_store: GraphStore,
     vector_store: VectorStore,
@@ -810,6 +898,7 @@ def ingest_ontology(
         dt_props=dt_props,
         namespace=namespace,
         class_to_datasource=class_to_datasource,
+        physical_names=_physical_names_from_r2rml(r2rml_content),
     )
     log.info(
         "ingest: step3 accumulate_embeddings %.0fms (%s)",
@@ -1267,6 +1356,7 @@ def _accumulate_embeddings(
     dt_props: set,
     namespace: str,
     class_to_datasource: dict[str, str] | None = None,
+    physical_names: tuple[dict[str, str], dict[str, str]] | None = None,
 ) -> dict:
     """Embed every class + property and upsert into the namespace's vector index.
 
@@ -1274,6 +1364,12 @@ def _accumulate_embeddings(
     ``store_embeddings_batch`` carries ``namespace`` on each item so
     backends that shard by namespace (OpenSearch index, Neptune
     Analytics namespace-scoped vertex) write into the correct bucket.
+
+    ``physical_names`` is ``(class URI -> table, property URI -> column)`` from the
+    R2RML (:func:`_physical_names_from_r2rml`). NL->SQL executes the names written
+    after ``Table:`` and in ``Columns:``, so those come from the R2RML; the OWL
+    label is added as ``Business name`` only where it differs (#1287). Without it,
+    or for an entry the R2RML does not resolve, the label is used as before.
     """
     from coa_ontology.bedrock_embeddings import BedrockEmbeddingClient
 
@@ -1311,9 +1407,23 @@ def _accumulate_embeddings(
     # induced class). A class present in the map is R2RML-mapped; its ds-id
     # string is written to ``data_source_id`` for the serve NL->SQL filter.
     ds_map = class_to_datasource or {}
+    table_of, column_of = physical_names or ({}, {})
+
+    def _table_name(cls_uri) -> str:
+        """The executable table name: R2RML's, else the OWL label (pre-#1287 behaviour)."""
+        return table_of.get(str(cls_uri)) or _label_of(cls_uri)
+
+    def _column_name(prop_uri) -> str:
+        """The executable column name: R2RML's, else the OWL label."""
+        return column_of.get(str(prop_uri)) or _label_of(prop_uri)
+
+    def _business_name(uri, physical: str) -> str:
+        """The OWL label when it names the entity differently from its physical name."""
+        label = _label_of(uri)
+        return label if label != physical else ""
 
     def _mapped_parents(cls_uri) -> list[str]:
-        """Labels of this class's ``rdfs:subClassOf`` parents that are mapped tables.
+        """Table names of this class's ``rdfs:subClassOf`` parents that are mapped tables.
 
         Mirrors the Ontop context's mapped-parent gate: a grounded class's
         foundational parent (FIBO, Schema.org) has no table behind it, and naming
@@ -1321,7 +1431,7 @@ def _accumulate_embeddings(
         Restriction blank nodes (cardinality axioms) are not parents and are skipped.
         """
         return sorted(
-            _label_of(parent)
+            _table_name(parent)
             for parent in graph.objects(cls_uri, RDFS.subClassOf)
             if isinstance(parent, URIRef) and str(parent) in ds_map and parent != cls_uri
         )
@@ -1331,7 +1441,7 @@ def _accumulate_embeddings(
         key_list = graph.value(cls_uri, OWL.hasKey)
         if key_list is None:
             return []
-        return [_label_of(prop) for prop in Collection(graph, key_list)]
+        return [_column_name(prop) for prop in Collection(graph, key_list)]
 
     def _term_hints(subject) -> str:
         """Bracketed synonyms / glossary terms / tags for one column or relationship."""
@@ -1360,7 +1470,8 @@ def _accumulate_embeddings(
         class, the primary key, per-column synonyms / glossary terms / tags, and
         each column's type and ``allowed values: [...]``.
         """
-        name = _label_of(cls_uri)
+        name = _table_name(cls_uri)
+        business_name = _business_name(cls_uri, name)
         description = str(graph.value(cls_uri, RDFS.comment) or "")
         synonyms = [str(o) for o in graph.objects(cls_uri, SKOS.altLabel)]
         glossary_terms = _literals(cls_uri, GLOSSARY_TERM)
@@ -1370,8 +1481,8 @@ def _accumulate_embeddings(
 
         # (label, target, comment, hints)
         obj_props_list: list[tuple[str, str, str, str]] = []
-        # (label, dtype, comment, distinct_values, hints)
-        data_props_list: list[tuple[str, str, str, list[str], str]] = []
+        # (column, business name, dtype, comment, distinct_values, hints)
+        data_props_list: list[tuple[str, str, str, str, list[str], str]] = []
 
         for prop_uri in graph.subjects(RDFS.domain, cls_uri):
             prop_label = _label_of(prop_uri)
@@ -1379,12 +1490,14 @@ def _accumulate_embeddings(
             prop_range = graph.value(prop_uri, RDFS.range)
 
             if (prop_uri, RDF.type, OWL.ObjectProperty) in graph:
-                range_label = _label_of(prop_range) if prop_range else ""
+                range_label = _table_name(prop_range) if prop_range else ""
                 obj_props_list.append((prop_label, range_label, prop_comment, _term_hints(prop_uri)))
             elif (prop_uri, RDF.type, OWL.DatatypeProperty) in graph:
                 dtype = str(prop_range).split("#")[-1] if prop_range else "string"
                 distinct_vals = [str(o) for o in graph.objects(prop_uri, _SCL_NS.distinctValues)]
-                data_props_list.append((prop_label, dtype, prop_comment, distinct_vals, _term_hints(prop_uri)))
+                column = _column_name(prop_uri)
+                business = _business_name(prop_uri, column)
+                data_props_list.append((column, business, dtype, prop_comment, distinct_vals, _term_hints(prop_uri)))
 
         if not data_props_list and not obj_props_list:
             thin = _text_for(cls_uri)
@@ -1392,6 +1505,8 @@ def _accumulate_embeddings(
 
         def _head(*, rich: bool) -> list[str]:
             parts = [f"Table: {name}"]
+            if business_name:
+                parts.append(f"Business name: {business_name}")
             if description:
                 parts.append(f"Description: {description}")
             if synonyms:
@@ -1421,12 +1536,15 @@ def _accumulate_embeddings(
             # crowd columns out of the 8000-character input).
             # rich=True → generation context: adds type, steward terms and allowed
             # values so the LLM writes correct casts and WHERE literals.
+            # A column whose OWL label differs from its physical name (#1287) carries
+            # the label as "business name"; the name before ":" is what SQL executes.
             return ", ".join(
-                (f"{label}:{dtype}" if rich else label)
+                (f"{column}:{dtype}" if rich else column)
+                + (f" (business name: {business})" if business else "")
                 + (f" ({comment[:100]})" if comment else "")
                 + (hints if rich else "")
                 + (f" allowed values: [{', '.join(vals[:20])}]" if rich and vals else "")
-                for label, dtype, comment, vals, hints in data_props_list
+                for column, business, dtype, comment, vals, hints in data_props_list
             )
 
         embed_parts = _head(rich=False)

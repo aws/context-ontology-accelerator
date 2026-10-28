@@ -34,6 +34,7 @@ import { useListSources } from "../api-hooks/use-list-sources";
 import { useListSourceTables } from "../api-hooks/use-list-source-tables";
 import { useApiClient } from "@components/ApiClientProvider";
 import { searchEntities } from "../services/ontology-engine";
+import { isSubmitEnter } from "@utils/keyboard";
 import { useAppI18n } from "../i18n/LocaleProvider";
 import type { AppMessage } from "../i18n/appMessages";
 
@@ -550,7 +551,7 @@ export const MetricForm: React.FC = () => {
                     onChange={({ detail }) => setSynonymInput(detail.value)}
                     placeholder={t("Add synonym and press Enter")}
                     onKeyDown={({ detail }) => {
-                      if (detail.key === "Enter" && synonymInput.trim()) {
+                      if (isSubmitEnter(detail) && synonymInput.trim()) {
                         setSynonyms([...synonyms, synonymInput.trim()]);
                         setSynonymInput("");
                       }

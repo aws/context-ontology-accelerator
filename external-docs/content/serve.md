@@ -470,6 +470,103 @@ traverse 2 hops) and `maxResults` (1–1000 entities, default 100) are applied.
 `direction` and `relationshipFilter` are validated but not yet applied:
 traversal currently follows every relationship in both directions.
 
+Query responses expose graph evidence in `graphContext`, using the existing
+Smithy shape:
+
+```json
+{
+  "graphContext": {
+    "entities": [
+      {
+        "uri": "https://example.com/entities/acme",
+        "label": "Acme",
+        "type": "https://example.com/classes/Company",
+        "properties": {
+          "supportingStatements": "[\"Acme acquired Example Corp.\"]"
+        }
+      }
+    ],
+    "relationships": [
+      {
+        "sourceUri": "https://example.com/entities/acme",
+        "predicateUri": "https://example.com/predicates/acquired",
+        "targetUri": "https://example.com/entities/example-corp",
+        "predicateLabel": "acquired"
+      }
+    ]
+  }
+}
+```
+
+`properties` is a string-valued map. Its reserved `supportingStatements` value
+is therefore a JSON-encoded array of graph-only evidence strings; decode it
+before use, for example with
+`JSON.parse(entity.properties.supportingStatements)`. These statements are
+retrieved text, so `includeSupporting: false` omits them along with
+`supportingContent`; the entities, their other properties and `relationships`
+are still returned. The service retains at
+most 100 statements per entity, limits each statement to 1,000 characters and
+2,000 UTF-8 bytes, and caps all statements in an assembled graph context at
+4,000 characters and 6,000 UTF-8 bytes. Statements that exceed a bound are
+truncated without splitting a UTF-8 code point and may end with an ellipsis. The
+same bounds are applied when a stored session is restored, so a record written
+before they existed is returned bounded too.
+
+An agentic edge-typed traversal reads at most 100 supporting-statement rows per
+tool invocation. The graph query returns one statement per row under a hard
+limit instead of aggregating an entity's unbounded statement fan-out. Reaching
+that limit, or the character/UTF-8 byte budget above, adds a degraded source and
+sets the response `partial` flag.
+
+A single `graphContext` carries at most 200 entities and 500 relationships.
+Agentic reasoning retains at most 10 relationships per entity in its bounded
+working set. Reaching that working-set cap, or discarding graph evidence while
+assembling the response (over the 200-entity or 500-relationship bound, an
+entity with no `uri`, or a relationship the graph carries with no predicate
+identifier), adds a `metadata.degradedSources` entry and sets `partial` to
+`true`; response-assembly drops also record a `degraded` processing-trace step.
+An empty `relationships` list with no such entry means no relationship was
+found.
+
+Session history uses a tighter persistence budget than the live response and
+retains at most 200 relationships. If that count cap or envelope-size compaction
+discards relationships, the restored turn is marked `partial` and includes a
+`session_persistence` entry in `metadata.degradedSources`; it is never presented
+as complete.
+
+Tier-3 responses now carry relationships only in the top-level
+`graphContext.relationships` list, as the contract defines. The previous runtime
+nested them under each entity instead, so a client that read entity-nested
+relationships has to read the top-level list.
+
+A property-graph edge may carry only a human-readable predicate string. Such an
+edge is still returned, with a stable tenant-scoped synthetic `predicateUri` in
+the `urn:coa:graph-predicate:` scheme derived from that string. Use it as an
+opaque identity for correlating edges within one namespace; it is not an ontology
+predicate IRI, and the readable form remains in `predicateLabel`. The identifier
+uses collision-resistant hashes; like any hash-derived identifier, it is not a
+mathematical uniqueness guarantee.
+
+### Tier-3 `supportingContent`: renamed fields and deprecated aliases
+
+The documented names are unchanged, but the Tier-3 runtime previously emitted two
+fields that were never in the contract. Where it sent `sourceDoc` and `label`, it
+now also sends the contract's `sourceDocumentId` and `sourceDocumentName`:
+
+| Previous runtime field | Read this instead |
+|---|---|
+| `sourceDoc` | `sourceDocumentId` |
+| `label` | `sourceDocumentName` |
+
+`sourceDoc` and `label` are still emitted, unchanged, as **deprecated aliases** in
+the first release that contains this change, so a client that reads them keeps
+rendering citations. Migrate to `sourceDocumentId` / `sourceDocumentName` during
+that release; the aliases are removed in the release that follows it, and that
+release's notes will say so.
+
+Internal Python names such as `supporting_statements`, `source_doc`, and
+`source_doc_name` are not wire fields and never were.
+
 `DescribeSchema` returns the classes and properties currently loaded into the namespace's ontologies, so a caller can find the entities available before writing a query. Optional query params: `includeProperties` (default `true`) to include class properties, and `maxResults` (1–1000) to cap the class count. The same schema is what the MCP `describe_schema` tool exposes — REST and MCP read from one source.
 
 See these operations in the [API Reference](#/api-reference) for their full request/response schemas.

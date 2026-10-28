@@ -21,14 +21,19 @@ structurally (by attribute), so the tests need neither ``ChunkResult`` /
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 
 import pytest
 from coa_serve.tier3.agentic import AccumulatedContext
+from coa_serve.tier3.agentic import context as context_module
+from coa_serve.tier3.agentic.context import (
+    MAX_CONTEXT_ENTITIES,
+)
 from coa_serve.tier3.agentic.context import (
     AccumulatedContext as DirectAccumulatedContext,
 )
-from coa_serve.tier3.agentic.tools.base import ToolResult
+from coa_serve.tier3.agentic.tools.base import ExecutedQuery, ToolResult
 
 
 @dataclass(frozen=True)
@@ -47,6 +52,8 @@ class _Entity:
     uri: str = ""
     label: str = ""
     type: str = ""
+    relationships: tuple[dict, ...] = ()
+    properties: dict[str, str] | None = None
 
 
 @pytest.mark.unit
@@ -191,6 +198,83 @@ class TestDeduplication:
         assert len(ctx.chunks) == 1
         assert len(ctx.entities) == 1
 
+    def test_entity_relationships_semantically_dedupe_label_variants_before_bound(self):
+        duplicate_variants = [
+            {
+                "sourceUri": "urn:company",
+                "predicateUri": "urn:hasRegion",
+                "targetUri": "urn:us",
+            },
+            {
+                "source_uri": "urn:company",
+                "source_label": "Company",
+                "predicate_uri": "urn:hasRegion",
+                "predicate_label": "has region",
+                "target_uri": "urn:us",
+                "target_label": "United States",
+            },
+            *[
+                {
+                    "source_uri": "urn:company",
+                    "source_label": f"Later Company {index}",
+                    "predicate_uri": "urn:hasRegion",
+                    "predicate_label": f"later label {index}",
+                    "target_uri": "urn:us",
+                    "target_label": f"Later US {index}",
+                }
+                for index in range(20)
+            ],
+        ]
+        distinct = [
+            {
+                "source_uri": "urn:company",
+                "predicate_uri": f"urn:predicate:{index}",
+                "target_uri": f"urn:target:{index}",
+            }
+            for index in range(20)
+        ]
+        ctx = AccumulatedContext()
+
+        ctx.add(
+            ToolResult(
+                entities=(
+                    _Entity(
+                        uri="urn:company",
+                        relationships=tuple([*duplicate_variants, *distinct]),
+                    ),
+                )
+            )
+        )
+
+        relationships = ctx.entities[0].relationships
+        assert len(relationships) == 10
+        assert ctx.relationship_cap_reached is True
+        assert ctx.degraded_sources == [{"source": "accumulated_context", "reason": "relationship_cap_reached"}]
+        assert (
+            len(
+                {
+                    (
+                        relationship["source_uri"],
+                        relationship["predicate_uri"],
+                        relationship["target_uri"],
+                    )
+                    for relationship in relationships
+                }
+            )
+            == 10
+        )
+        assert relationships[0] == {
+            "source_uri": "urn:company",
+            "source_label": "Company",
+            "predicate_uri": "urn:hasRegion",
+            "predicate_label": "has region",
+            "target_uri": "urn:us",
+            "target_label": "United States",
+        }
+        assert [relationship["target_uri"] for relationship in relationships[1:]] == [
+            f"urn:target:{index}" for index in range(9)
+        ]
+
 
 @pytest.mark.unit
 class TestRowsChannel:
@@ -295,6 +379,141 @@ class TestForkAndMerge:
         assert parent.merge(child) == 1
         assert parent.rows == [{"a": 1}, {"b": 2}]
 
+    def test_merge_duplicate_entity_combines_all_parallel_fork_evidence_deterministically(self):
+        parent = AccumulatedContext()
+        first = parent.fork()
+        second = parent.fork()
+        shared_relationship = {
+            "source_uri": "urn:company",
+            "predicate_uri": "urn:hasRegion",
+            "target_uri": "urn:us",
+        }
+        later_relationship = {
+            "source_uri": "urn:company",
+            "source_label": "Company from later fork",
+            "predicate_uri": "urn:hasIndustry",
+            "predicate_label": "has industry",
+            "target_uri": "urn:retail",
+            "target_label": "Retail",
+        }
+        first.add(
+            ToolResult(
+                entities=(
+                    _Entity(
+                        uri="urn:company",
+                        label="Company",
+                        relationships=(shared_relationship,),
+                        properties={
+                            "region": "US",
+                            "supportingStatements": json.dumps(["first statement", "shared statement"]),
+                        },
+                    ),
+                )
+            )
+        )
+        second.add(
+            ToolResult(
+                entities=(
+                    _Entity(
+                        uri="urn:company",
+                        type="Organization",
+                        relationships=(
+                            {
+                                **shared_relationship,
+                                "source_label": "Company",
+                                "predicate_label": "has region",
+                                "target_label": "United States",
+                            },
+                            later_relationship,
+                        ),
+                        properties={
+                            "industry": "Retail",
+                            "supportingStatements": json.dumps(["shared statement", "second statement"]),
+                        },
+                    ),
+                )
+            )
+        )
+
+        assert parent.merge(first) == 1
+        assert parent.merge(second) == 1
+        assert parent.merge(second) == 0
+
+        assert len(parent.entities) == 1
+        merged = parent.entities[0]
+        assert merged.label == "Company"
+        assert merged.type == "Organization"
+        assert merged.relationships == (
+            {
+                **shared_relationship,
+                "source_label": "Company",
+                "predicate_label": "has region",
+                "target_label": "United States",
+            },
+            later_relationship,
+        )
+        assert merged.properties is not None
+        assert list(merged.properties) == ["region", "industry", "supportingStatements"]
+        assert json.loads(merged.properties["supportingStatements"]) == [
+            "first statement",
+            "shared statement",
+            "second statement",
+        ]
+
+    def test_merge_duplicate_entity_bounds_supporting_statements_in_first_seen_order(self):
+        parent = AccumulatedContext()
+        first = parent.fork()
+        second = parent.fork()
+        first.add(
+            ToolResult(
+                entities=(
+                    _Entity(
+                        uri="urn:company",
+                        properties={"supportingStatements": json.dumps([f"first-{index}" for index in range(75)])},
+                    ),
+                )
+            )
+        )
+        second.add(
+            ToolResult(
+                entities=(
+                    _Entity(
+                        uri="urn:company",
+                        properties={"supportingStatements": json.dumps([f"second-{index}" for index in range(75)])},
+                    ),
+                )
+            )
+        )
+
+        parent.merge(first)
+        parent.merge(second)
+
+        merged = parent.entities[0]
+        assert merged.properties is not None
+        statements = json.loads(merged.properties["supportingStatements"])
+        assert len(statements) == 100
+        assert statements[:2] == ["first-0", "first-1"]
+        assert statements[-1] == "second-24"
+
+    def test_entity_supporting_statements_are_utf8_size_bounded_before_synthesis(self):
+        context = AccumulatedContext()
+        context.add(
+            ToolResult(
+                entities=(
+                    _Entity(
+                        uri="urn:company",
+                        properties={"supportingStatements": json.dumps(["界" * 5_000, "second"])},
+                    ),
+                )
+            )
+        )
+
+        statements = json.loads(context.entities[0].properties["supportingStatements"])
+        assert len(statements[0]) <= 1_000
+        assert len(statements[0].encode("utf-8")) <= 2_000
+        assert sum(len(statement) for statement in statements) <= 4_000
+        assert sum(len(statement.encode("utf-8")) for statement in statements) <= 6_000
+
     def test_merge_concatenates_attempts_and_degraded(self):
         parent = AccumulatedContext()
         child = parent.fork()
@@ -355,6 +574,58 @@ class TestDegradedSources:
         ctx = AccumulatedContext()
         ctx.add(ToolResult(chunks=(_Chunk(chunk_id="c1"),)))
         assert ctx.degraded_sources == []
+
+
+@pytest.mark.unit
+class TestExecutedQueries:
+    """#1166 cut #3: query artifacts a structured tool ran are collected on the
+    context (so Deep Reasoning can return them like Standard mode does)."""
+
+    def test_add_collects_executed_queries(self):
+        ctx = AccumulatedContext()
+        ctx.add(
+            ToolResult(
+                rows=({"revenue": 100},),
+                executed_queries=(
+                    ExecutedQuery(kind="sparql", query="SELECT ?r WHERE {}"),
+                    ExecutedQuery(kind="sql", query="SELECT revenue FROM t"),
+                ),
+            )
+        )
+        assert [(e.kind, e.query) for e in ctx.executed_queries] == [
+            ("sparql", "SELECT ?r WHERE {}"),
+            ("sql", "SELECT revenue FROM t"),
+        ]
+
+    def test_executed_queries_not_counted_as_progress(self):
+        """Query artifacts are observability, not retrieval progress: a result
+        with only executed_queries (no rows/chunks/entities) adds 0 new items."""
+        ctx = AccumulatedContext()
+        new = ctx.add(ToolResult(executed_queries=(ExecutedQuery(kind="sql", query="SELECT 1"),)))
+        assert new == 0
+        assert len(ctx.executed_queries) == 1
+
+    def test_executed_queries_not_deduplicated(self):
+        """Two identical statements are two real executions — both are kept."""
+        ctx = AccumulatedContext()
+        ctx.add(ToolResult(rows=({"a": 1},), executed_queries=(ExecutedQuery(kind="sql", query="SELECT 1"),)))
+        ctx.add(ToolResult(rows=({"a": 2},), executed_queries=(ExecutedQuery(kind="sql", query="SELECT 1"),)))
+        assert len(ctx.executed_queries) == 2
+
+    def test_merge_folds_in_sibling_executed_queries(self):
+        """A forked sub-question's executed queries fold back on merge, in order."""
+        parent = AccumulatedContext()
+        parent.add(ToolResult(rows=({"a": 1},), executed_queries=(ExecutedQuery(kind="sql", query="Q_parent"),)))
+        child = parent.fork()
+        child.add(ToolResult(rows=({"b": 2},), executed_queries=(ExecutedQuery(kind="sql", query="Q_child"),)))
+        parent.merge(child)
+        assert [e.query for e in parent.executed_queries] == ["Q_parent", "Q_child"]
+
+    def test_fork_starts_with_no_executed_queries(self):
+        parent = AccumulatedContext()
+        parent.add(ToolResult(rows=({"a": 1},), executed_queries=(ExecutedQuery(kind="sql", query="Q"),)))
+        child = parent.fork()
+        assert child.executed_queries == []
 
 
 @dataclass(frozen=True)
@@ -439,3 +710,75 @@ class TestRecentRowSnippets:
         ctx = AccumulatedContext()
         ctx.rows.append("not-a-dict")
         assert ctx.recent_row_snippets() == []
+
+
+@pytest.mark.unit
+class TestEntityBounds:
+    """Entity accumulation must be bounded and cheap.
+
+    Nothing upstream bounded the entity count, so a broad traversal could push
+    thousands of entities into the planner summary, the synthesis prompt, the wire
+    response and the persisted session envelope; and merging an already-seen entity
+    rescanned the whole list, recomputing a dedupe key per element.
+    """
+
+    def test_entity_count_is_capped_and_the_cap_is_reported(self):
+        ctx = AccumulatedContext()
+        over = MAX_CONTEXT_ENTITIES + 25
+
+        new_count = ctx.add(ToolResult(entities=tuple(_Entity(uri=f"e:{i}") for i in range(over))))
+
+        assert len(ctx.entities) == MAX_CONTEXT_ENTITIES
+        assert new_count == MAX_CONTEXT_ENTITIES
+        assert ctx.dropped_entities == 25
+        # Truncating the evidence set is never silent.
+        assert ctx.degraded_sources == [{"source": "accumulated_context", "reason": "entity_cap_reached"}]
+
+    def test_under_the_cap_nothing_is_dropped_or_degraded(self):
+        ctx = AccumulatedContext()
+
+        ctx.add(ToolResult(entities=tuple(_Entity(uri=f"e:{i}") for i in range(MAX_CONTEXT_ENTITIES))))
+
+        assert len(ctx.entities) == MAX_CONTEXT_ENTITIES
+        assert ctx.dropped_entities == 0
+        assert ctx.degraded_sources == []
+
+    def test_merging_an_existing_entity_does_not_scan_the_entity_list(self):
+        ctx = AccumulatedContext()
+        ctx.add(ToolResult(entities=tuple(_Entity(uri=f"e:{i}", label=f"L{i}") for i in range(400))))
+        calls = 0
+        original = context_module._entity_key
+
+        def counted(entity):
+            nonlocal calls
+            calls += 1
+            return original(entity)
+
+        context_module._entity_key = counted
+        try:
+            # Merge new evidence into the LAST entity — the worst case for a scan.
+            ctx.add(ToolResult(entities=(_Entity(uri="e:399", type="Company"),)))
+        finally:
+            context_module._entity_key = original
+
+        # A constant number of key derivations, not one per accumulated entity.
+        assert calls <= 4, f"{calls} key derivations for a single merge into 400 entities"
+        merged = next(entity for entity in ctx.entities if entity.uri == "e:399")
+        assert merged.type == "Company"
+        assert merged.label == "L399"
+
+    def test_fork_starts_with_its_own_index_and_merge_carries_the_drop_count(self):
+        parent = AccumulatedContext()
+        parent.add(ToolResult(entities=(_Entity(uri="e:shared", label="Shared"),)))
+        child = parent.fork()
+        assert child.entity_positions == {}
+        assert child.dropped_entities == 0
+
+        child.add(ToolResult(entities=(_Entity(uri="e:shared", type="Company"), _Entity(uri="e:new"))))
+        child.dropped_entities = 3
+
+        new_count = parent.merge(child)
+
+        assert new_count == 2  # the merge enriched e:shared and added e:new
+        assert [entity.uri for entity in parent.entities] == ["e:shared", "e:new"]
+        assert parent.dropped_entities == 3

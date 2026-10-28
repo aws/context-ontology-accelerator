@@ -292,7 +292,7 @@ foundational_ontologies:
 # for insurance, FHIR/HL7 for healthcare, SNOMED-CT for clinical terms, an
 # internal corporate data dictionary, etc. These register the same way as
 # foundational ontologies (same embedding pipeline, same grounding API)
-# but are tagged ontology_type=customer_provided so match reports can
+# but are tagged ontology_type=user_created so match reports can
 # distinguish tiers — a grounding to the customer's own ontology is
 # typically worth more than a generic Schema.org match.
 #
@@ -302,8 +302,9 @@ foundational_ontologies:
 # inherently high — a realistic approximation of a real customer bringing
 # their own domain ontology to the pipeline.
 #
-# What a "customer_provided" ontology does differently at runtime:
-#   - Tier label stored on the catalog record (ontology_type=customer_provided)
+# What a customer ontology (ontology_type=user_created) does differently at runtime:
+#   - Tier label stored on the catalog record (ontology_type=user_created;
+#     the catalog accepts only foundational, induced, user_created, user_uploaded)
 #   - setup.py Step 2 logs "Customer tier:" separately from "Foundational tier:"
 #   - demo.py Step 4 breaks down matches by tier: grounded_customer vs
 #     grounded_foundational vs novel
@@ -318,7 +319,7 @@ customer_ontologies:
   - uri: "http://www.swigroup.org/ontologies/p-c-ontology#"
     title: ACME P&C Domain Ontology (via swigroup)
     description: Customer-provided insurance-domain ontology for ACME Insurance (demo stand-in)
-    ontology_type: customer_provided
+    ontology_type: user_created
     format: rdf-xml
     license: Academic / research use
     license_tier: attribution

@@ -194,6 +194,12 @@ def sparql_update(u: str) -> None:
 # STRATEGIES and not driven here, so it is intentionally not listed.)
 _GROUNDING_CAPABLE_STRATEGIES = frozenset({"table_to_ontology"})
 
+# Registry ``ontology_type`` values counted as the customer tier in the golden
+# compare: ``user_created`` is what the demo config registers customer ontologies
+# as; ``customer_provided`` is what it used before the catalog enforced the
+# ``OntologyType`` enum, kept so rows registered earlier still classify.
+_CUSTOMER_ONTOLOGY_TYPES = frozenset({"user_created", "customer_provided"})
+
 
 def _grounding_gate_should_fail(grounding_keys, strategy, grounding_used) -> bool:
     """Return True when a grounding-capable run was ASKED to ground but didn't (#175).
@@ -877,7 +883,7 @@ def _run_one_iteration(idx: int, total: int, datasource_id: str, label: str) -> 
                         if uri and ont_type:
                             tier = (
                                 "customer"
-                                if ont_type == "customer_provided"
+                                if ont_type in _CUSTOMER_ONTOLOGY_TYPES
                                 else "foundational"
                                 if ont_type == "foundational"
                                 else ""

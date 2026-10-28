@@ -10,6 +10,7 @@ import { expectIdempotencyWiring } from "../utils/idempotency-assertions";
 import { NetworkStack } from "../../lib/stacks/foundation/network-stack";
 import { StorageStack } from "../../lib/stacks/foundation/storage-stack";
 import { SourcesStack } from "../../lib/stacks/services/sources-stack";
+import { expectAossGrantsCoveredByDataPolicies } from "../utils/aoss-access-assertions";
 
 // Mock bundlePython to avoid fingerprinting the entire repo root during tests.
 jest.mock("../../lib/utils/python-bundling", () => ({
@@ -52,6 +53,10 @@ describe("SourcesStack", () => {
         env: TEST_ENV,
       }),
     );
+  });
+
+  it("names every aoss:APIAccessAll role in an AOSS data-access policy", () => {
+    expectAossGrantsCoveredByDataPolicies(template);
   });
 
   it("wires only the create-operation Lambda(s) to the idempotency table", () => {

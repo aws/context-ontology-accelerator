@@ -17,21 +17,21 @@ ok() { echo "  OK:  $1"; }
 echo "=== Pre-deploy preflight checks ==="
 echo ""
 
-# ── 1. Required toolchain versions (Node 22+, Java 17-24, pnpm) ──────────
-# Mirrors the versions pinned in .mise.toml. We only check presence/version
-# here — installing mise itself is a one-time local setup step (see
+# ── 1. Required toolchain versions (Node, uv, Java 17-24, pnpm) ──────────
+# Node and uv minimums come from package.json "engines" and pyproject.toml
+# "required-version" (see check-tool-version.sh). We only check presence and
+# version here; installing the tools is a one-time local setup step (see
 # scripts/setup-dev.sh) and is intentionally not automated in this script,
-# since CI provisions its own toolchain and never calls deploy.sh.
-if command -v node >/dev/null 2>&1; then
-  NODE_MAJOR=$(node --version | sed 's/^v//' | cut -d. -f1)
-  if [ "$NODE_MAJOR" -ge 22 ]; then
-    ok "Node $(node --version) found"
+# since CI provisions its own toolchain and never calls deploy.sh. uv is checked
+# because an old uv does not stop `cdk synth`: the Python Lambda bundling falls
+# back to Docker after printing uv's version error.
+for _tool in node uv; do
+  if TOOL_CHECK="$("$REPO_ROOT/scripts/check-tool-version.sh" "$_tool")"; then
+    ok "$TOOL_CHECK"
   else
-    err "Node 22+ required (found $(node --version)). Run: mise install"
+    err "$TOOL_CHECK"
   fi
-else
-  err "Node not found. Install via 'mise install' (see .mise.toml) or https://mise.run"
-fi
+done
 
 if JAVA_CHECK="$("$REPO_ROOT/scripts/check-java-version.sh")"; then
   ok "$JAVA_CHECK"
@@ -216,6 +216,14 @@ case $? in
   0) ok "$VPC_CHECK" ;;
   2) warn "$VPC_CHECK" ;;
   *) err "$VPC_CHECK" ;;
+esac
+
+# An imported VPC's aoss-data endpoint is the collection's only network path.
+AOSS_ENDPOINT_CHECK="$("$REPO_ROOT/scripts/check-aoss-endpoint.sh" "$REGION")"
+case $? in
+  0) ok "$AOSS_ENDPOINT_CHECK" ;;
+  2) warn "$AOSS_ENDPOINT_CHECK" ;;
+  *) err "$AOSS_ENDPOINT_CHECK" ;;
 esac
 
 # ── 7. Lambda reserved-concurrency headroom (requires AWS credentials) ────

@@ -53,7 +53,7 @@ import structlog
 from ...namespace_language import current_label_preference
 from ...query_utils import validate_namespace
 from ...trace import client_error_detail
-from ..knowledge_retriever import Tier3Result
+from ..knowledge_retriever import Tier3Result, _has_document_provenance, _supporting_content_from_chunk
 from .budget import BudgetClock
 from .context import AccumulatedContext
 from .models import StopReason, SubQuestion
@@ -70,9 +70,25 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, no runtime/graphrag import
 
 logger = structlog.get_logger(__name__)
 
-# Cap on graph-entity relationships surfaced per entity in ``graph_context``,
-# matching the hand-rolled / lexical Tier 3 paths.
-_MAX_RELATIONSHIPS_PER_ENTITY = 10
+
+def _last_executed_queries(ctx: AccumulatedContext) -> tuple[str | None, str | None]:
+    """Return the last executed (SQL, SPARQL) statements from the session (#1166).
+
+    Deep Reasoning may run several structured statements across its sub-questions;
+    Standard mode exposes a single ``queryUsed`` / ``sparqlGenerated``. To match
+    that shape we surface the LAST statement of each kind — the one that produced
+    the numbers closest to the final answer. Returns ``(None, None)`` when the
+    session ran no structured tool (a document/graph-only answer).
+    """
+    sql: str | None = None
+    sparql: str | None = None
+    for eq in ctx.executed_queries:
+        if eq.kind == "sql":
+            sql = eq.query
+        elif eq.kind == "sparql":
+            sparql = eq.query
+    return sql, sparql
+
 
 # Floor for the synthesis timeout. A session that has already consumed its whole
 # Time_Budget must still get a real synthesis attempt — without a floor,
@@ -300,7 +316,7 @@ class AgenticRetriever:
         # A MIXED namespace withholds nothing — either kind of tool might answer, so
         # the planner chooses. Fail-open: both flags default True, so an unknown
         # composition never hides a tool that might answer.
-        composition_gated = frozenset()
+        composition_gated: frozenset[str] = frozenset()
         if not has_structured_source:
             composition_gated |= _STRUCTURED_TOOL_NAMES
         if not has_unstructured_source:
@@ -559,11 +575,28 @@ class AgenticRetriever:
             return
 
         tool = final_search.tool
+        if tool is None:
+            trace.record(
+                "agentic_final_semantic_search",
+                "skipped",
+                clock.elapsed_ms(),
+                detail="semantic retrieval task has no tool",
+            )
+            return
         try:
             result = await final_search.task
             ms = int((time.perf_counter() - final_search.start) * 1000)
             ctx.add(result)
-            trace.record("agentic_final_semantic_search", "succeeded", ms, detail=result.detail, tool_used=tool.name)
+            result_degraded_reason = getattr(result, "degraded_reason", "")
+            if result_degraded_reason:
+                ctx.record_degraded(tool.name, result_degraded_reason)
+            trace.record(
+                "agentic_final_semantic_search",
+                "degraded" if result_degraded_reason else "succeeded",
+                ms,
+                detail=result.detail,
+                tool_used=tool.name,
+            )
         except TimeoutError:
             ms = int((time.perf_counter() - final_search.start) * 1000)
             logger.warning("agentic_final_semantic_timeout", tool=getattr(tool, "name", "?"))
@@ -627,12 +660,50 @@ class AgenticRetriever:
         # Structured rows count as context: a namespace answered purely by NL→SQL /
         # metric tools has no chunks or entities but is NOT a no-context case.
         no_context = not ctx.chunks and not ctx.entities and not ctx.rows
+
+        supporting_content, graph_only_chunks, anonymous_chunks = self._supporting_content_with_drops(ctx)
+        graph_context = self._graph_context(ctx)
+        if graph_only_chunks or anonymous_chunks:
+            detail = (
+                f"{len(supporting_content)} document citation(s); "
+                f"{graph_only_chunks} graph-only statement chunk(s) surfaced as graph context; "
+                f"{anonymous_chunks} chunk(s) dropped with neither document nor graph provenance"
+            )
+            logger.info(
+                "agentic_supporting_content_filtered",
+                citations=len(supporting_content),
+                graph_only_chunks=graph_only_chunks,
+                anonymous_chunks=anonymous_chunks,
+            )
+            # Only the unattributable chunks are a degradation: a graph statement
+            # legitimately has no document to cite and is represented in graphContext.
+            trace.record(
+                "agentic_supporting_content",
+                "degraded" if anonymous_chunks else "succeeded",
+                clock.elapsed_ms(),
+                detail=detail,
+            )
+            if anonymous_chunks:
+                degraded.append(
+                    {
+                        "source": "agentic_supporting_content",
+                        "reason": "missing_document_provenance",
+                        "detail": detail,
+                    }
+                )
+
         # Partial on time-budget expiry (Req 7.7-7.8), any degraded source / all
         # tools failing with context (Req 9.6), or no context gathered (Req 7.8).
         partial = clock.expired() or bool(degraded) or no_context
 
-        supporting_content = self._supporting_content(ctx)
-        graph_context = self._graph_context(ctx)
+        # Query artifacts the loop executed (#1166): the LAST SQL and LAST SPARQL
+        # the structured tools ran, mirroring Standard mode's single queryUsed /
+        # sparqlGenerated. Empty when no structured tool ran (document/graph-only
+        # answer), leaving both None. Threaded through every _build_result exit
+        # that carries a synthesized answer; the no-source (Req 9.7) and
+        # guardrail-blocked (Req 8.3) exits return an empty answer and so leave
+        # the artifacts unset by design.
+        sql_used, sparql_used = _last_executed_queries(ctx)
 
         # Req 9.7: every Tool invocation failed AND no context was gathered. Return
         # a partial result with NO Best_Effort_Answer and indicate that no source
@@ -712,6 +783,8 @@ class AgenticRetriever:
                 trace=trace,
                 degraded=degraded,
                 partial=True,
+                query_used=sql_used,
+                sparql_generated=sparql_used,
             )
         except Exception as exc:  # noqa: BLE001 - synthesis failure must not raise out
             # Req 8.6: synthesizer raised → partial, empty answer, confidence 0.0,
@@ -737,6 +810,8 @@ class AgenticRetriever:
                 trace=trace,
                 degraded=degraded,
                 partial=True,
+                query_used=sql_used,
+                sparql_generated=sparql_used,
             )
 
         # Req 8.3: a guardrail block excludes the blocked content from the answer.
@@ -778,6 +853,8 @@ class AgenticRetriever:
                 trace=trace,
                 degraded=degraded,
                 partial=True,
+                query_used=sql_used,
+                sparql_generated=sparql_used,
             )
 
         trace.record("llm_synthesize", "success", synthesis.duration_ms, tool_used="bedrock")
@@ -790,6 +867,8 @@ class AgenticRetriever:
             trace=trace,
             degraded=degraded,
             partial=partial,
+            query_used=sql_used,
+            sparql_generated=sparql_used,
         )
 
     async def _synthesize(
@@ -849,23 +928,46 @@ class AgenticRetriever:
 
     @staticmethod
     def _supporting_content(ctx: AccumulatedContext) -> tuple[dict, ...]:
-        """Map ALL accumulated chunks to ``supporting_content`` (empty when none).
+        """Map document-backed chunks to ``supporting_content`` (empty when none).
 
-        The agentic path surfaces every chunk its multi-step session gathered (no
-        ``MAX_PROMPT_CHUNKS`` slice) so the returned result — and the synthesizer,
-        which is built with ``max_prompt_chunks=None`` for this path — both reflect
-        the full gathered context (Req 8.2).
+        Graph traversal can gather statement snippets with no source-document
+        provenance. They remain available to synthesis, while their entities and
+        relationships surface through ``graph_context``; they must not masquerade
+        as document citations. Every accumulated document chunk is returned with
+        no ``MAX_PROMPT_CHUNKS`` slice (Req 8.2).
         """
-        return tuple(
-            {
-                "chunkId": c.chunk_id,
-                "text": c.text,
-                "sourceDoc": c.source_doc,
-                "label": c.label,
-                "relevanceScore": c.relevance_score,
-            }
-            for c in ctx.chunks
-        )
+        return AgenticRetriever._supporting_content_with_drops(ctx)[0]
+
+    @staticmethod
+    def _supporting_content_with_drops(ctx: AccumulatedContext) -> tuple[tuple[dict, ...], int, int]:
+        """Split accumulated chunks into citations, graph-only text, and anonymous text.
+
+        The hand-rolled and lexical paths both count the chunks they filter for
+        missing provenance, mark the step degraded and add a ``degradedSources``
+        entry. This path filtered silently, so a chunk that should have carried a
+        document id but did not simply vanished from the citation list.
+
+        The two counts are kept apart because they mean different things. A
+        graph-only statement chunk (``uri`` set, no ``source_doc``) is EXPECTED: the
+        graph tool produces it, and it surfaces as ``graphContext`` evidence, so it
+        is reported but not degraded. A chunk with neither a document id nor a graph
+        uri is unattributable evidence that the answer may have used and the
+        response cannot show — that one is a genuine degradation.
+
+        Returns:
+            ``(supporting_content, graph_only_count, anonymous_count)``.
+        """
+        supporting_content: list[dict] = []
+        graph_only = 0
+        anonymous = 0
+        for chunk in ctx.chunks:
+            if _has_document_provenance(chunk):
+                supporting_content.append(_supporting_content_from_chunk(chunk))
+            elif getattr(chunk, "uri", ""):
+                graph_only += 1
+            else:
+                anonymous += 1
+        return tuple(supporting_content), graph_only, anonymous
 
     @staticmethod
     def _graph_context(ctx: AccumulatedContext) -> tuple[dict, ...]:
@@ -875,7 +977,8 @@ class AgenticRetriever:
                 "uri": e.uri,
                 "label": e.label,
                 "type": e.type,
-                "relationships": e.relationships[:_MAX_RELATIONSHIPS_PER_ENTITY],
+                "relationships": e.relationships,
+                "properties": getattr(e, "properties", {}),
             }
             for e in ctx.entities
         )
@@ -891,12 +994,16 @@ class AgenticRetriever:
         trace: TraceCollector,
         degraded: list[dict],
         partial: bool,
+        query_used: str | None = None,
+        sparql_generated: str | None = None,
     ) -> Tier3Result:
         """Assemble the frozen :class:`Tier3Result` for the session.
 
         Attaches all trace steps recorded up to this point, ordered by invocation
         sequence (Req 10.4), and carries the ``partial`` flag and ``degraded_sources``
-        through unchanged (Req 1.4, 7.7, 9.5).
+        through unchanged (Req 1.4, 7.7, 9.5). ``query_used`` / ``sparql_generated``
+        carry the structured query artifacts the loop executed (#1166); they
+        default to ``None`` for paths that ran no structured tool.
         """
         trace_steps = tuple(
             {
@@ -917,4 +1024,6 @@ class AgenticRetriever:
             trace_steps=trace_steps,
             degraded_sources=tuple(degraded),
             partial=partial,
+            query_used=query_used,
+            sparql_generated=sparql_generated,
         )

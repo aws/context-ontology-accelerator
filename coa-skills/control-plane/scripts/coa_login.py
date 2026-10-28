@@ -6,10 +6,13 @@ COA's two public app clients. Caches tokens and refreshes them, so nobody
 copies tokens out of DevTools.
 
   --client mcp  MCP/CLI client, redirect http://localhost:9876/oauth/callback.
-                ID token works on the serve and MCP runtimes. Refresh 30 days.
+                ID token works on the MCP server and on direct calls to the
+                serve AgentCore runtime; the REST API (including /query)
+                rejects it. Refresh 30 days.
   --client web  Web-app client, redirect http://localhost:5173/authenticate/.
-                ID token works on the control-plane REST API (its authorizer
-                checks aud against this client). Refresh 12 hours.
+                ID token works on every REST endpoint, including the serve
+                runtime's /query (the authorizer checks aud against this
+                client). Refresh 12 hours.
 
   coa_login.py login  [--client C] [--file PATH] [--no-browser]
   coa_login.py token  [--client C] [--kind id|access] [--file PATH]

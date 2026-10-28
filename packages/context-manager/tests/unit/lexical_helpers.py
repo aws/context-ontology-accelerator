@@ -107,7 +107,7 @@ class _FakeNode:
 def make_toolkit_node(
     node_id: str = "n1",
     text: str = "some text",
-    score: float = 0.5,
+    score: float | None = 0.5,
     metadata: dict | None = None,
 ) -> _FakeNode:
     """Build a fake toolkit node carrying ``metadata`` for ``_map_results``."""

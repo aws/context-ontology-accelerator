@@ -342,6 +342,11 @@ SQL when extending your definition. An expression alone does not say that
 | Delete | `DELETE /namespaces/{ns}/metrics/{name}` | Remove a metric |
 | Validate | `POST /namespaces/{ns}/metrics/validate` | Check without saving |
 
+The list returns 50 metrics per page by default and at most 200. A `maxResults`
+above 200 is reduced to 200 rather than rejected, for compatibility with
+existing callers; page with `nextToken` for the rest. A value below 1, or one
+that is not an integer, returns `400`.
+
 ## Best Practices
 
 - **Descriptive names**: use `snake_case` names that clearly state what's measured

@@ -157,13 +157,16 @@ class VectorSearchTool:
                 error=str(exc),
                 error_type=type(exc).__name__,
             )
-            return ToolResult(detail=f"{self.name} embed error: {type(exc).__name__}")
+            return ToolResult(
+                detail=f"{self.name} embed error: {type(exc).__name__}",
+                degraded_reason="error",
+            )
 
         if not search_embedding:
             return ToolResult(detail=f"{self.name}: no embedding or query text supplied")
 
         try:
-            chunks = tuple(await self._vector.search(search_embedding, namespace, top_k=top_k))
+            search_results = await self._vector.search(search_embedding, namespace, top_k=top_k)
         except Exception as exc:  # noqa: BLE001 - a Tool must never raise (Req 9.1)
             logger.warning(
                 "vector_tool_search_error",
@@ -171,10 +174,29 @@ class VectorSearchTool:
                 error=str(exc),
                 error_type=type(exc).__name__,
             )
-            return ToolResult(detail=f"{self.name} error: {type(exc).__name__}")
+            return ToolResult(
+                detail=f"{self.name} error: {type(exc).__name__}",
+                degraded_reason="error",
+            )
 
+        dropped_anonymous_chunks = int(getattr(search_results, "dropped_anonymous_chunks", 0) or 0)
+        chunks = tuple(search_results)
         items = tuple(_chunk_item(c) for c in chunks)
-        return ToolResult(chunks=chunks, items=items, detail=f"{self.name}: {len(chunks)} chunks")
+        if dropped_anonymous_chunks:
+            detail = (
+                f"{self.name}: {len(chunks)} chunks; "
+                f"dropped {dropped_anonymous_chunks} anonymous or malformed document chunks"
+            )
+            degraded_reason = "missing_document_provenance"
+        else:
+            detail = f"{self.name}: {len(chunks)} chunks"
+            degraded_reason = ""
+        return ToolResult(
+            chunks=chunks,
+            items=items,
+            detail=detail,
+            degraded_reason=degraded_reason,
+        )
 
     async def _resolve_embedding(self, embedding: list[float] | None, query: str) -> list[float]:
         """Return the embedding to search with: precomputed if supplied, else embed ``query``.

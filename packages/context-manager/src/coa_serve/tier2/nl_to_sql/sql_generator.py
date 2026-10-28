@@ -26,6 +26,8 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
 import structlog
+from coa_common.constants import sql_ident
+from sqlglot.dialects.trino import Trino
 
 from ...clients.base import ConverseResult, LLMClient, VectorClient, VectorHit
 from ..sql_firewall import SQLFirewall
@@ -1271,11 +1273,49 @@ def _with_database(text: str, table: str, database: str) -> str:
 
     Kept a separate segment after the name, not folded into it, because every
     other reader of this text keys the table by the bare ``Table:`` segment.
+
+    The ``write it as`` form is copied into the SQL by the writer, so each part is
+    rendered as a valid Athena (Trino) identifier: double-quoted when it needs it
+    (``"sales-ops".warehouse_stock``, ``crm."group"``), bare otherwise (see
+    :func:`_hint_identifier`). The ``Database:`` label stays the plain name.
     """
     if not database:
         return text
     head, sep, rest = text.partition(" | ")
-    return f"{head} | Database: {database} (write it as {database}.{table}){sep}{rest}"
+    written = f"{_hint_identifier(database)}.{_hint_identifier(table)}"
+    return f"{head} | Database: {database} (write it as {written}){sep}{rest}"
+
+
+# Words Athena DML (Trino) only accepts as an identifier when double-quoted:
+# sqlglot's Trino reserved set, plus the words the Trino "Keywords and
+# identifiers" reference also reserves that sqlglot's set lacks. A superset is
+# harmless (a word is quoted that did not need it); a missing word leaves the
+# name bare, as before.
+_TRINO_RESERVED_KEYWORDS = frozenset(Trino.Generator.RESERVED_KEYWORDS) | {
+    "auto", "cube", "current_catalog", "current_date", "current_path", "current_role", "current_schema",
+    "current_user", "grouping", "json_array", "json_exists", "json_object", "json_query", "json_serialize",
+    "json_table", "json_value", "listagg", "localtime", "localtimestamp", "normalize", "overlaps", "recursive",
+    "rollup", "skip", "trim", "uescape", "unnest",
+}  # fmt: skip
+
+# A name left bare: starts with a letter, then letters, digits and underscores
+# only. Stricter than Trino's IDENTIFIER rule, which also accepts a leading
+# underscore; such a name is quoted though it did not need it, which is harmless.
+_BARE_IDENTIFIER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+
+
+def _hint_identifier(name: str) -> str:
+    """``name`` as the writer must spell it in Athena SQL.
+
+    Quoted when it has to be (a reserved word such as ``group``, a hyphen, a
+    leading digit) and, to keep the rule simple, for a leading underscore, so a
+    plain ``sales_db.orders`` hint is unchanged. Quoting is safe for Athena either way: Glue names are lower-case
+    and Trino resolves a quoted identifier case-insensitively; downstream
+    routing reads table names from the parsed AST, which drops the quotes.
+    """
+    if _BARE_IDENTIFIER_RE.match(name) and name.lower() not in _TRINO_RESERVED_KEYWORDS:
+        return name
+    return sql_ident(name)
 
 
 _SQL_KEYWORD_RE = re.compile(r"\b(SELECT|WITH)\b", re.IGNORECASE)

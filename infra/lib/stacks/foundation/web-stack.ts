@@ -46,6 +46,7 @@ export function buildRuntimeConfig(args: {
   clientId: string;
   apiEndpoint?: string;
   serveRuntimeArn?: string;
+  mcpRuntimeArn?: string;
   version?: string;
 }): RuntimeConfig {
   const {
@@ -55,6 +56,7 @@ export function buildRuntimeConfig(args: {
     clientId,
     apiEndpoint,
     serveRuntimeArn,
+    mcpRuntimeArn,
     version,
   } = args;
   return {
@@ -64,6 +66,7 @@ export function buildRuntimeConfig(args: {
     clientId,
     ...(apiEndpoint && { apiEndpoint }),
     ...(serveRuntimeArn && { serveRuntimeArn }),
+    ...(mcpRuntimeArn && { mcpRuntimeArn }),
     ...(version && { version }),
   };
 }
@@ -78,6 +81,15 @@ export interface WebStackProps extends cdk.StackProps {
    * UserPool/UserPoolClient (see idp-authentication-stack.ts).
    */
   readonly isCognitoMode: boolean;
+  /**
+   * Names of the SAML/OIDC providers the auth stack adds to the web client
+   * (`IdpAuthenticationStack.federatedProviderNames`). The callback-URL patch
+   * replaces the whole client, so it sends `COGNITO` plus these names; leaving
+   * one out removes that provider's sign-in option. Taken from the same config
+   * as {@link isCognitoMode}, for the same reason.
+   * @default - no federated providers
+   */
+  readonly federatedIdentityProviderNames?: readonly string[];
   /** Backend API endpoint URL. */
   readonly apiEndpoint?: string;
   /** API Gateway REST API ID (used to update CORS origin after CloudFront creation). */
@@ -169,6 +181,18 @@ export class WebStack extends SCLStack {
         )
       : undefined;
 
+    // MCP Server AgentCore Runtime ARN, published by the MCP stack
+    // (mcp-stack.ts's McpRuntimeArnParam). Read via SSM to avoid a cross-stack
+    // export/import cycle — the web stack is constructed before the MCP stack
+    // in bin/app.ts, but an explicit web.addDependency(mcp) there orders the
+    // deploy so this parameter exists when runtime-config.json is written.
+    // Surfaced to the frontend so the MCP console page can show the endpoint
+    // and a copy-paste client config for this deployment (#1166).
+    const mcpRuntimeArn = ssm.StringParameter.valueForStringParameter(
+      this,
+      `${ssmPrefix}/mcp/runtime-arn`,
+    );
+
     const uiDomainName = props.customDomain?.uiDomainName;
     const uiCertificateArn = props.customDomain?.uiCertificateArn;
     const apiDomainName = props.customDomain?.apiDomainName;
@@ -186,6 +210,7 @@ export class WebStack extends SCLStack {
       clientId,
       apiEndpoint,
       serveRuntimeArn: props.serveRuntimeArn,
+      mcpRuntimeArn,
       version: readRepoVersion(),
     });
 
@@ -312,7 +337,14 @@ export class WebStack extends SCLStack {
             ],
             AllowedOAuthFlows: ["code"],
             AllowedOAuthScopes: ["email", "openid", "profile"],
-            SupportedIdentityProviders: ["COGNITO"],
+            // Must mirror idp-authentication-stack.ts addClient()
+            // supportedIdentityProviders. A hardcoded ["COGNITO"] here removed
+            // every SAML/OIDC provider from the web client. The names are also
+            // what makes this patch run again when a provider is added.
+            SupportedIdentityProviders: [
+              "COGNITO",
+              ...(props.federatedIdentityProviderNames ?? []),
+            ],
             AllowedOAuthFlowsUserPoolClient: true,
             // Must mirror idp-authentication-stack.ts addClient(). This is a
             // full replacement, so omitting it would reset the client to the
