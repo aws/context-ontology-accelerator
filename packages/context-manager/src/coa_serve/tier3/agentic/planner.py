@@ -47,7 +47,9 @@ import structlog
 from coa_common.language_tags import describe_language
 
 from .controller import TOOL_PREFERENCE_INSTRUCTION
-from .models import PlannerDecision
+from .models import NAMED_TERM_KINDS, PlannerDecision
+from .tools.document_tool import DOCUMENT_CHUNK_PREFIX, document_id, document_ref, document_topic
+from .tools.document_tool import TOOL_NAME as READ_DOCUMENT_TOOL
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, no runtime/graphrag import
     from ...clients.base import LLMClient
@@ -96,6 +98,14 @@ _ASSESS_SNIPPET_WIDTH = 500
 _MAX_ROWS_IN_SUMMARY = 3
 _MAX_ROWS_IN_ASSESS = 12
 _ROW_SNIPPET_WIDTH = 200
+# Source documents listed for the read_document tool (only when it is offered),
+# and how much of each full-document window the assess call sees. A window is the
+# reason the document was read, so the assessor gets far more of it than the
+# 500-char snippet an ordinary chunk gets — capped so two windows stay ~4k tokens.
+_MAX_DOCUMENTS_IN_SUMMARY = 8
+_MAX_CHUNK_IDS_PER_DOCUMENT = 3
+_MAX_DOCUMENT_WINDOWS_IN_ASSESS = 2
+_DOCUMENT_WINDOW_ASSESS_WIDTH = 8000
 
 # System instruction for next-step selection. All static guidance lives here (not
 # in the user message) to avoid tripping PROMPT_ATTACK guardrail filters, matching
@@ -158,6 +168,17 @@ _PROPOSE_SYSTEM = (
     "list ONLY when no tool can make further progress."
 )
 
+# options.singleCallSteps: the next-step call also decides when to stop, so the loop
+# makes one model call per step instead of a step call plus a sufficiency call.
+_STOP_WHEN_DONE_INSTRUCTION = (
+    "\n\nSTOP WHEN DONE. You are shown the content gathered so far (document text, "
+    "structured rows, findings). If it already answers EVERY part of the sub-question, "
+    'return {"candidates": []}: that ends the search, and the answer is then written '
+    "from everything gathered. Do not stop while a part of the question that needs "
+    "numbers or records from the tables has no structured rows yet, or while the part "
+    "of a document the question depends on has not been read."
+)
+
 # Optional chunk-window guidance, appended to the propose prompt ONLY when the
 # chunk_window tool is actually registered (it is gated off by default via
 # AGENTIC_ENABLE_CHUNK_WINDOW). Advertising it unconditionally caused the planner
@@ -169,6 +190,54 @@ _CHUNK_WINDOW_INSTRUCTION = (
     "tool with that chunk's id (from the gathered-context summary) to pull its "
     "neighboring chunks."
 )
+
+# Read-document guidance, appended to the propose prompt ONLY when the
+# read_document tool is offered for this request (options.readDocument, on in the recommended defaults),
+# mirroring the chunk-window gating above.
+_READ_DOCUMENT_INSTRUCTION = (
+    "\n\nREAD THE SOURCE DOCUMENT. Retrieved chunks are short extracts (a topic and a "
+    "few statements) of much longer source documents, so the exact detail a question "
+    "asks for is often in the document but not in any chunk. The context summary lists "
+    "the 'Source documents seen so far' with their source keys. When a listed document "
+    "looks relevant to the sub-question but the gathered chunks do not contain the exact "
+    "detail asked for (a specific date, period, figure, status, section, or "
+    "field/column mapping), select the read_document tool with that document's "
+    "source_key (or its doc_id when no source_key is listed) — reading the right "
+    "document usually answers the question directly, so "
+    "prefer it over another search. If no relevant document has been seen yet, first run "
+    "a retrieval that surfaces candidate documents (an entity-based or chunk-based "
+    "strategy). If a window says more text follows and the detail is still missing, "
+    "read again from the stated offset. Never re-read a window you already read."
+)
+
+# Extra guidance when the ANCHORED reader is offered (options.readDocumentAnchor):
+# the read_document spec then declares an ``anchor`` input.
+_READ_DOCUMENT_ANCHOR_INSTRUCTION = (
+    "\n\nREAD AROUND THE PASSAGE, DO NOT PAGE. read_document centres its window on an "
+    "anchor: pass 'anchor' with a distinctive phrase (a sentence from the relevant chunk, "
+    "or the entity, field, date or period the question asks about), or 'anchor_chunk_id' "
+    "with one of the chunk ids listed for that document; with neither, a document's first "
+    "read centres on the chunks already retrieved from it. Do NOT pass offset on a first "
+    "read. Read around the passage first; page to a stated earlier/later offset only when "
+    "the window shows the needed fact lies just outside it, and prefer re-anchoring on a "
+    "more specific phrase over paging through the document in order."
+)
+
+# Entity-routing guidance, appended ONLY when the find_documents tool is offered
+# (options.entityRouting).
+_FIND_DOCUMENTS_INSTRUCTION = (
+    "\n\nROUTE NAMED THINGS TO THEIR DOCUMENT. When the question names something "
+    f"specific ({NAMED_TERM_KINDS}), call find_documents FIRST with those names copied verbatim from the question "
+    "(unless the context summary already lists 'Documents matching the named terms'). "
+    "Then read the top matching document with read_document, anchored on one of its "
+    "listed mention chunk ids, BEFORE any topic or chunk search. Prefer documents that "
+    "match MORE of the question's terms. Do not consider the sub-question answered until "
+    "you have read a document that matches its named terms, when any were found."
+)
+# Name-matched documents shown to the planner, and the width of each mention
+# snippet: enough to choose what to read, small next to the rest of the prompt.
+_MAX_DOCUMENT_MATCHES_IN_SUMMARY = 5
+_MATCH_SNIPPET_WIDTH = 200
 
 # System instruction for the combined Sufficiency_Check + grounded best-guess
 # answer (Req 6.1-6.2; improvement idea 2). The planner both decides whether the
@@ -229,6 +298,13 @@ def _assess_system(answer_language: str) -> str:
 _ASSESS_SYSTEM = _assess_system("")
 
 
+# Repair turn for an unparseable propose reply (options.plannerParseRetry).
+_PARSE_REPAIR_SUFFIX = (
+    "\n\nYour previous reply could not be parsed. Reply with ONLY the JSON object of the "
+    'required shape ({"candidates": [...]}), with a brief "reasoning", and nothing else.'
+)
+
+
 class BedrockStepPlanner:
     """Concrete :class:`StepPlanner` over a Bedrock :class:`LLMClient` (Req 4.3, 5, 6).
 
@@ -284,26 +360,57 @@ class BedrockStepPlanner:
         sub_question: SubQuestion,
         context: AccumulatedContext,
         tool_specs: list[dict],
-    ) -> list[PlannerDecision]:
+    ) -> list[PlannerDecision] | None:
         """Return candidate next-step decisions for the current context (Req 4.3).
 
         Consults the planner LLM with the sub-question, a compact summary of the
         accumulated context, and the registry's Tool specs. Returns the parsed
         :class:`PlannerDecision` candidates (the controller selects among them by
-        the hard preference ordering, Req 5). Returns an empty list — signalling
-        no Tool can be selected (Req 4.7) — when there are no tools, the Converse
-        call fails, the guardrail blocks, or the response is unparseable.
+        the hard preference ordering, Req 5). Returns an empty list when there
+        are no tools or the planner proposed none (``{"candidates": []}``, which
+        under options.singleCallSteps means "enough"), and ``None`` — no Tool can
+        be selected (Req 4.7), never a stop — when the Converse call fails, the
+        guardrail blocks, or the response is unparseable.
         """
         if not tool_specs:
             return []
 
         question = sub_question.text[: self._max_question_chars]
-        prompt = self._build_propose_prompt(question, context, tool_specs)
-        # Only advertise the chunk-window tool when it is actually registered
-        # (gated off by default), so the planner never selects an unregistered tool.
+        # Only advertise the chunk-window / read-document tools when they are
+        # actually offered (each is offered only when its option is on), so the planner never selects
+        # a tool it cannot use.
         system = _PROPOSE_SYSTEM
-        if any((spec.get("name") if isinstance(spec, dict) else "") == "chunk_window" for spec in tool_specs):
+        offered = {spec.get("name") for spec in tool_specs if isinstance(spec, dict)}
+        if "chunk_window" in offered:
             system += _CHUNK_WINDOW_INSTRUCTION
+        list_documents = READ_DOCUMENT_TOOL in offered
+        anchored = list_documents and any(
+            isinstance(spec, dict)
+            and spec.get("name") == READ_DOCUMENT_TOOL
+            and "anchor" in (spec.get("input_schema") or {})
+            for spec in tool_specs
+        )
+        if list_documents:
+            system += _READ_DOCUMENT_INSTRUCTION
+        if anchored:
+            system += _READ_DOCUMENT_ANCHOR_INSTRUCTION
+        routing = "find_documents" in offered
+        if routing:
+            system += _FIND_DOCUMENTS_INSTRUCTION
+        single_call = getattr(context, "single_call_steps", False) is True
+        if single_call:
+            system += _STOP_WHEN_DONE_INSTRUCTION
+        prompt = self._build_propose_prompt(
+            question,
+            context,
+            tool_specs,
+            list_documents=list_documents,
+            list_chunk_ids=anchored,
+            list_matches=routing,
+        )
+        if single_call:
+            prompt += "\n\nContent gathered so far:\n" + self._content_view(context)
+        max_tokens = getattr(context, "planner_max_tokens", None) or self._max_tokens
         try:
             result = await self._planner.converse(
                 prompt=prompt,
@@ -311,17 +418,47 @@ class BedrockStepPlanner:
                 guardrail_id=self._effective_guardrail_id(),
                 guard_content=f"Question: {question}",
                 temperature=0.0,
-                max_tokens=self._max_tokens,
+                max_tokens=max_tokens,
             )
         except Exception as exc:  # noqa: BLE001 - planner must never raise (Req 4.7)
             logger.warning("planner_propose_error", error=str(exc), error_type=type(exc).__name__)
-            return []
+            return None
 
         if getattr(result, "guardrail_blocked", False):
             logger.warning("planner_propose_guardrail_blocked")
-            return []
+            return None
 
-        return self._parse_candidates(result.text)
+        # options.plannerParseRetry: an unparseable reply (often one cut off by the
+        # output-token cap) gets ONE repair turn instead of ending the loop.
+        if getattr(context, "planner_parse_retry", False) and self._unparseable(result.text):
+            logger.warning("planner_propose_unparseable_retry")
+            try:
+                result = await self._planner.converse(
+                    prompt=prompt + _PARSE_REPAIR_SUFFIX,
+                    system=system,
+                    guardrail_id=self._effective_guardrail_id(),
+                    guard_content=f"Question: {question}",
+                    temperature=0.0,
+                    max_tokens=max_tokens,
+                )
+            except Exception as exc:  # noqa: BLE001 - planner must never raise (Req 4.7)
+                logger.warning("planner_propose_error", error=str(exc), error_type=type(exc).__name__)
+                return None
+            if getattr(result, "guardrail_blocked", False):
+                return None
+
+        if self._unparseable(result.text):
+            return None
+        decisions = self._parse_candidates(result.text)
+        # A non-empty list whose entries are all unusable is a failed reply, not a stop.
+        if not decisions and (self._extract_json_object(result.text) or {}).get("candidates"):
+            return None
+        return decisions
+
+    def _unparseable(self, text: str) -> bool:
+        """Whether a propose reply has no JSON object with a ``candidates`` list."""
+        payload = self._extract_json_object(text or "")
+        return payload is None or not isinstance(payload.get("candidates"), list)
 
     # ── sufficiency + grounded best-guess (Req 6.1-6.2; idea 2) ─────────
 
@@ -343,7 +480,7 @@ class BedrockStepPlanner:
                 guardrail_id=self._effective_guardrail_id(),
                 guard_content=f"Question: {question}",
                 temperature=0.0,
-                max_tokens=self._max_tokens,
+                max_tokens=getattr(context, "planner_max_tokens", None) or self._max_tokens,
             )
         except Exception as exc:  # noqa: BLE001 - planner must never raise.
             logger.warning("planner_assess_error", error=str(exc), error_type=type(exc).__name__)
@@ -367,12 +504,30 @@ class BedrockStepPlanner:
 
     # ── prompt construction ─────────────────────────────────────────────
 
-    def _build_propose_prompt(self, question: str, context: AccumulatedContext, tool_specs: list[dict]) -> str:
-        """Build the next-step-selection user prompt."""
+    def _build_propose_prompt(
+        self,
+        question: str,
+        context: AccumulatedContext,
+        tool_specs: list[dict],
+        *,
+        list_documents: bool = False,
+        list_chunk_ids: bool = False,
+        list_matches: bool = False,
+    ) -> str:
+        """Build the next-step-selection user prompt.
+
+        ``list_documents`` appends the source documents seen so far (for the
+        read_document tool); off, the prompt is unchanged.
+        """
         specs_json = json.dumps(tool_specs, default=str)
+        summary = self._context_summary(context)
+        if list_matches:
+            summary += self._matches_summary(context)
+        if list_documents:
+            summary += self._documents_summary(context, list_chunk_ids=list_chunk_ids)
         return (
             f"Sub-question: {question}\n\n"
-            f"{self._context_summary(context)}\n\n"
+            f"{summary}\n\n"
             f"Available tools:\n{specs_json}\n\n"
             "Select the next tool(s) to invoke."
         )
@@ -429,6 +584,20 @@ class BedrockStepPlanner:
                     labels.append(label)
             if labels:
                 parts.append("Graph entities gathered: " + "; ".join(labels))
+
+        windows = [
+            c
+            for c in (getattr(context, "chunks", []) or [])
+            if (getattr(c, "chunk_id", "") or "").startswith(DOCUMENT_CHUNK_PREFIX)
+        ]
+        if windows:
+            shown = windows[-_MAX_DOCUMENT_WINDOWS_IN_ASSESS:]
+            joined = "\n".join(
+                f"  [document] {(getattr(c, 'text', '') or '')[:_DOCUMENT_WINDOW_ASSESS_WIDTH]}" for c in shown
+            )
+            parts.append(
+                f"Full source-document text read ({len(shown)} most recent window(s) of {len(windows)}):\n{joined}"
+            )
 
         prior = getattr(context, "working_answers", []) or []
         for entry in prior:
@@ -555,6 +724,92 @@ class BedrockStepPlanner:
             summary += f"\nCurrent grounded best-guess answer so far: {working[:600]}"
 
         return summary
+
+    @staticmethod
+    def _matches_summary(context: AccumulatedContext) -> str:
+        """List the name-matched documents (find_documents), best first, with read status."""
+        matches = list(getattr(context, "document_matches", []) or [])[:_MAX_DOCUMENT_MATCHES_IN_SUMMARY]
+        if not matches:
+            return ""
+        read = {
+            getattr(c, "source_doc", "")
+            for c in getattr(context, "chunks", []) or []
+            if (getattr(c, "chunk_id", "") or "").startswith(DOCUMENT_CHUNK_PREFIX)
+        }
+        lines = []
+        for i, m in enumerate(matches, 1):
+            key = m.get("source_key", "")
+            line = (
+                f"  {i}. source_key={key} [matched terms: {', '.join(m.get('matched_terms', []))}; "
+                f"{m.get('mentions', 0)} mention(s); {'ALREADY READ' if key in read else 'not read yet'}]"
+            )
+            for snip in m.get("snippets", [])[:2]:
+                snippet = snip.get("snippet", "")[:_MATCH_SNIPPET_WIDTH]
+                line += f"\n     mention chunk id={snip.get('chunk_id', '')}: {snippet}"
+            lines.append(line)
+        return (
+            "\nDocuments matching the named terms (from find_documents; read the top one with "
+            "read_document anchored on a mention chunk id):\n" + "\n".join(lines)
+        )
+
+    @staticmethod
+    def _documents_summary(context: AccumulatedContext, *, list_chunk_ids: bool = False) -> str:
+        """List the source documents seen so far, for the read_document tool.
+
+        Groups the gathered chunks by source-document key (recovered from each
+        chunk's source header) — or, for a chunk without the header, by its opaque
+        document id — most-supported first (more chunks from one document = more
+        likely relevant; ties keep first-seen order), with the first chunk's topic
+        as a title and which windows were already read. Empty when no chunk carries
+        a document reference. ``list_chunk_ids`` (anchored reader) adds a few of each
+        document's chunk ids, usable as ``anchor_chunk_id``.
+        """
+        order: list[str] = []
+        counts: dict[str, int] = {}
+        topics: dict[str, str] = {}
+        reads: dict[str, list[str]] = {}
+        chunk_ids: dict[str, list[str]] = {}
+        for chunk in getattr(context, "chunks", []) or []:
+            ref = document_ref(chunk)
+            if ref:
+                key = f"source_key={ref}"
+            elif doc := document_id(chunk):
+                key = f"doc_id={doc}"
+            else:
+                continue
+            if key not in counts:
+                order.append(key)
+                counts[key] = 0
+            chunk_id = getattr(chunk, "chunk_id", "") or ""
+            if chunk_id.startswith(DOCUMENT_CHUNK_PREFIX):
+                header = (getattr(chunk, "text", "") or "").split("\n", 1)[0]
+                reads.setdefault(key, []).append(header.strip("[]").split(": ", 1)[-1])
+                continue
+            counts[key] += 1
+            if chunk_id and len(chunk_ids.setdefault(key, [])) < _MAX_CHUNK_IDS_PER_DOCUMENT:
+                chunk_ids[key].append(chunk_id)
+            if key not in topics:
+                topic = document_topic(chunk)
+                if topic:
+                    topics[key] = topic
+        if not order:
+            return ""
+        ranked = sorted(order, key=lambda k: -counts[k])[:_MAX_DOCUMENTS_IN_SUMMARY]
+        lines = []
+        for key in ranked:
+            line = f"  - {key}"
+            if topics.get(key):
+                line += f" (topic: {topics[key]})"
+            line += f" [{counts[key]} chunk(s)]"
+            if list_chunk_ids and chunk_ids.get(key):
+                line += " chunk ids: " + ", ".join(chunk_ids[key])
+            if reads.get(key):
+                line += " ALREADY READ: " + "; ".join(reads[key])
+            lines.append(line)
+        return (
+            "\nSource documents seen so far (pass a source_key — or, when only a doc_id is listed, "
+            "that doc_id — to read_document to read the full text):\n" + "\n".join(lines)
+        )
 
     # ── parsing ──────────────────────────────────────────────────────────
 
