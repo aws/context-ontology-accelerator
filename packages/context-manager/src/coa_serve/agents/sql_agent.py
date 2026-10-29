@@ -32,14 +32,16 @@ It runs natively async (Strands ``Agent.invoke_async``) inside the orchestrator'
 event loop, with async tools backed by the SAME serve clients the other Tier-2
 strategies use — no sources-API, no separate infra.
 
-**What bounds the loop.** Not a turn count: the orchestrator's request deadline
-(``RESOLVE_TIMEOUT_S``) and the per-statement execution timeout
-(:data:`_DEFAULT_EXEC_TIMEOUT_S`) are the real bounds, and a turn cap is
-therefore not offered — see the note on ``invoke_async`` below.
+**What bounds the loop.** Not a turn count (the pinned Strands ignores one): a cap
+on statement executions (:data:`_DEFAULT_MAX_EXECUTIONS`, enforced inside the SQL
+tools), a stop just before the request deadline that keeps the last statement that
+executed successfully, and the per-statement execution timeout
+(:data:`_DEFAULT_EXEC_TIMEOUT_S`) — see the note on ``invoke_async`` below.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from dataclasses import dataclass, field
@@ -48,6 +50,7 @@ from typing import Any
 import structlog
 
 from ..config import env_with_legacy_name
+from ..deadline import Deadline
 from ..exceptions import AccessDeniedError
 from ..sql_execution import SqlExecutionService, SqlExecutionStatus
 from ..tier2.tools import (
@@ -64,6 +67,23 @@ logger = structlog.get_logger(__name__)
 # so one slow query can't consume the whole request; overridable for hard DBs
 # (complex_oracle/oracle_sql) that legitimately need longer.
 _DEFAULT_EXEC_TIMEOUT_S = 35
+
+# Statement executions the agent may run per request. On the COA-100 BIRD nights
+# that first ran this agent, runs that finished needed a median of 1 execution
+# (p90 4), while every run that hit the request deadline had looped through 5-29
+# executions of already-valid SQL. Past the cap, generate_sql/execute_sql stop
+# running and tell the model to answer with what it has.
+_DEFAULT_MAX_EXECUTIONS = 6
+
+# Time kept back from the request deadline so the agent's best verified result
+# can still be returned (strategy result, response assembly) before the
+# orchestrator's outer timeout cancels the request and discards it.
+_DEADLINE_MARGIN_S = 10.0
+
+_BUDGET_EXHAUSTED = (
+    "budget exhausted: no more SQL will be generated or executed. "
+    "Stop calling tools and give your final answer from the results you already have."
+)
 
 # Rows echoed back to the model as the execution observation.
 _PREVIEW_ROWS = 5
@@ -104,6 +124,13 @@ def _resolve_exec_timeout() -> int:
         return max(5, int(env_with_legacy_name("SERVE_DEEP_REASONING_EXEC_TIMEOUT_S", str(_DEFAULT_EXEC_TIMEOUT_S))))
     except (TypeError, ValueError):
         return _DEFAULT_EXEC_TIMEOUT_S
+
+
+def _resolve_max_executions() -> int:
+    try:
+        return max(1, int(env_with_legacy_name("SERVE_DEEP_REASONING_MAX_EXECUTIONS", str(_DEFAULT_MAX_EXECUTIONS))))
+    except (TypeError, ValueError):
+        return _DEFAULT_MAX_EXECUTIONS
 
 
 def _intent_review_enabled() -> bool:
@@ -268,6 +295,7 @@ class SqlAgent:
         exec_timeout_s: int | None = None,
         intent_review: bool | None = None,
         prefetch_schemas: int | None = None,
+        max_executions: int | None = None,
     ):
         """Wire the agent to the Tier-2 tools and the execution primitive.
 
@@ -286,6 +314,8 @@ class SqlAgent:
                 ``SERVE_DEEP_REASONING_INTENT_REVIEW``.
             prefetch_schemas: Table schemas to inline before the first turn;
                 None reads ``SERVE_DEEP_REASONING_PREFETCH_SCHEMAS``, 0 disables.
+            max_executions: Statement executions allowed per run; None reads
+                ``SERVE_DEEP_REASONING_MAX_EXECUTIONS``.
         """
         self._catalog = catalog
         self._authoring = authoring
@@ -296,6 +326,7 @@ class SqlAgent:
         self._exec_timeout_s = exec_timeout_s if exec_timeout_s is not None else _resolve_exec_timeout()
         self._intent_review = intent_review
         self._prefetch_schemas = prefetch_schemas if prefetch_schemas is not None else _resolve_prefetch_schemas()
+        self._max_executions = max_executions if max_executions is not None else _resolve_max_executions()
 
     async def _prefetch_context(self, question: str) -> str:
         """Search once on the raw question and inline the top tables' schemas.
@@ -357,6 +388,7 @@ class SqlAgent:
         evidence: str = "",
         max_rows: int = 1000,
         data_source_id: str = "",
+        deadline: Deadline | None = None,
     ) -> SqlAgentOutcome:
         """Run the bounded tool-use loop and return what it verified.
 
@@ -368,6 +400,9 @@ class SqlAgent:
             max_rows: Row cap for each execution.
             data_source_id: Source to fall back to when the tables the SQL
                 references don't pin one.
+            deadline: Request deadline. The loop is stopped ``_DEADLINE_MARGIN_S``
+                before it, keeping the last statement that executed successfully,
+                rather than letting the outer timeout discard the run.
 
         Returns:
             A :class:`SqlAgentOutcome`. Never raises for a model/tool failure —
@@ -406,6 +441,9 @@ class SqlAgent:
         # as revise-feedback so a re-generation revises rather than repeats
         # identical SQL. Empty until the first execution.
         last_attempt: dict[str, str] = {"sql": "", "obs": ""}
+        # Statement executions so far; past self._max_executions the SQL tools
+        # refuse and tell the model to answer (see _BUDGET_EXHAUSTED).
+        executions = {"count": 0, "generations": 0}
 
         @tool
         async def search_tables(search: str, top_k: int = 7) -> str:
@@ -512,6 +550,11 @@ class SqlAgent:
             # byte-identical SQL (the writer is a stateless temp-0 function of
             # (question, schema), so without this the retry loop is a no-op).
             # Empty on the FIRST generate → identical to single-shot.
+            # Generations are capped too (twice the executions), so a model that keeps
+            # regenerating without executing cannot spend writer calls until the deadline.
+            if executions["count"] >= self._max_executions or executions["generations"] >= 2 * self._max_executions:
+                return json.dumps({"error": _BUDGET_EXHAUSTED})
+            executions["generations"] += 1
             feedback = ""
             if last_attempt["sql"]:
                 feedback = f"```sql\n{last_attempt['sql']}\n```\nObservation from running it: {last_attempt['obs']}"
@@ -568,6 +611,9 @@ class SqlAgent:
                 return json.dumps(
                     {"error": f"unknown handle '{handle}'; call generate_sql and pass the handle it returns"}
                 )
+            if executions["count"] >= self._max_executions:
+                return json.dumps({"error": _BUDGET_EXHAUSTED})
+            executions["count"] += 1
             result = await self._execution.execute(
                 sql,
                 namespace=namespace,
@@ -660,15 +706,36 @@ class SqlAgent:
         )
 
         # No turn cap is passed: on the pinned strands-agents, invoke_async takes a
-        # max_iterations kwarg into **kwargs and ignores it, so a cap here would be
-        # documentation pretending to be a bound. What actually bounds the loop is
-        # the orchestrator's request deadline plus the per-statement exec timeout.
+        # max_iterations kwarg into **kwargs and ignores it. The loop is bounded by
+        # the execution cap in the SQL tools above and by stopping it just before
+        # the request deadline, which keeps ``outcome`` (the last statement that
+        # executed successfully) instead of losing it to the outer timeout.
+        loop_budget_s = deadline.remaining_s() - _DEADLINE_MARGIN_S if deadline is not None else None
         try:
-            await agent.invoke_async(user_prompt)
+            if loop_budget_s is not None and loop_budget_s <= 0:
+                # Not enough time left to run the loop and still return a result.
+                logger.warning(
+                    "agentic_deadline_stop", budget_s=round(loop_budget_s, 1), executions=0, has_result=False
+                )
+            else:
+                async with asyncio.timeout(loop_budget_s) as budget:
+                    await agent.invoke_async(user_prompt)
         except AccessDeniedError:
             raise
+        except TimeoutError as e:
+            if budget.expired():
+                logger.warning(
+                    "agentic_deadline_stop",
+                    budget_s=round(loop_budget_s or 0.0, 1),
+                    executions=executions["count"],
+                    has_result=outcome.succeeded,
+                )
+            else:  # a TimeoutError raised inside the loop, not our stop
+                logger.warning("agentic_agent_failed", error=type(e).__name__, message=str(e)[:200])
         except Exception as e:
             logger.warning("agentic_agent_failed", error=type(e).__name__, message=str(e)[:200])
+        if executions["count"] >= self._max_executions:
+            logger.info("agentic_execution_cap_reached", executions=executions["count"], has_result=outcome.succeeded)
 
         # Telemetry: fold the agent's reasoning-turn usage into the request total
         # (best-effort — see _record_strands_usage). Disjoint from generate_sql's

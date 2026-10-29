@@ -776,6 +776,44 @@ class TestRealCedarThroughFirewall:
         result = fw.evaluate("SELECT id FROM orders", profile={"userId": "u1"}, namespace="ns")
         assert not result.denied
 
+    # ── can_view_namespace: the artifact-visibility gate (#1166) ──────────
+    # The SAME viewNamespace right as the Sources/Tables schema view decides
+    # whether generated SQL/SPARQL artifacts may be returned.
+    def test_can_view_namespace_data_analyst_own_namespace_true(self):
+        fw = self._fw(fail_open_no_roles=False)
+        assert (
+            fw.can_view_namespace(
+                "ns", {"userId": "u1", "resourceRoles": [{"role": "data-analyst", "resourceUID": "ns"}]}
+            )
+            is True
+        )
+
+    def test_can_view_namespace_other_namespace_false(self):
+        fw = self._fw(fail_open_no_roles=False)
+        assert (
+            fw.can_view_namespace(
+                "ns", {"userId": "u1", "resourceRoles": [{"role": "data-analyst", "resourceUID": "other"}]}
+            )
+            is False
+        )
+
+    def test_can_view_namespace_no_roles_prod_false(self):
+        fw = self._fw(fail_open_no_roles=False)
+        assert fw.can_view_namespace("ns", {"userId": "u1"}) is False
+
+    def test_can_view_namespace_fails_closed_on_authorizer_error(self):
+        """A raising authorizer withholds artifacts (returns False), never leaks."""
+
+        class _BoomAuthorizer:
+            def authorize(self, **kwargs):
+                raise RuntimeError("boom")
+
+            def can_view_namespace(self, **kwargs):
+                raise RuntimeError("boom")
+
+        fw = SQLFirewall(cedar_authorizer=_BoomAuthorizer())
+        assert fw.can_view_namespace("ns", {"userId": "a", "globalRoles": ["platform-admin"]}) is False
+
 
 @pytest.mark.unit
 class TestNamespaceSQLScope:
@@ -896,3 +934,85 @@ class TestParseErrorLogsOmitSql:
         event = next(log for log in logs if log["event"] == "sql_firewall_parse_error")
         assert event["sql_len"] == len(self._SQL)
         assert "alice@example.com" not in repr(logs)
+
+
+@pytest.mark.unit
+class TestSameNamedTableGrants:
+    """Two databases holding a table of one name: a database-qualified grant tells them apart."""
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT id FROM crm_db.customers",
+            'SELECT id FROM "CRM_DB"."customers"',
+            'SELECT id FROM "AwsDataCatalog"."crm_db"."customers"',
+        ],
+    )
+    def test_qualified_entry_allows_that_database_in_every_spelling(self, sql):
+        result = SQLFirewall().evaluate(sql, profile={"tableAllowlist": ["crm_db.customers"]})
+        assert not result.denied
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT id FROM sales_db.customers",
+            "SELECT id FROM customers",
+            "SELECT id FROM othercat.crm_db.customers",
+            "SELECT c.id FROM crm_db.customers c JOIN sales_db.customers s ON c.id = s.id",
+        ],
+        ids=["other-database", "bare", "other-catalog", "join-with-the-other"],
+    )
+    def test_qualified_entry_denies_every_other_reference(self, sql):
+        result = SQLFirewall().evaluate(sql, profile={"tableAllowlist": ["crm_db.customers"]})
+        assert result.denied
+        assert "customers" in result.reason
+
+    def test_root_catalog_entry_reads_as_its_database_entry(self):
+        profile = {"tableAllowlist": ["AwsDataCatalog.crm_db.customers"]}
+        assert not SQLFirewall().evaluate("SELECT id FROM crm_db.customers", profile=profile).denied
+        assert SQLFirewall().evaluate("SELECT id FROM sales_db.customers", profile=profile).denied
+
+    @pytest.mark.parametrize(
+        "sql",
+        ["SELECT id FROM customers", "SELECT id FROM crm_db.customers", "SELECT id FROM sales_db.customers"],
+    )
+    def test_bare_entry_still_covers_every_same_named_table(self, sql):
+        # Compatibility: an existing bare grant behaves exactly as before.
+        assert not SQLFirewall().evaluate(sql, profile={"tableAllowlist": ["customers"]}).denied
+
+    def test_qualified_denylist_key_applies_only_to_that_database(self):
+        profile = {"columnDenylist": {"crm_db.customers": ["points"]}}
+        denied = SQLFirewall().evaluate("SELECT points FROM crm_db.customers", profile=profile)
+        assert denied.denied
+        assert "points" in denied.reason
+        assert not SQLFirewall().evaluate("SELECT points FROM sales_db.customers", profile=profile).denied
+
+    def test_bare_denylist_key_still_applies_to_every_same_named_table(self):
+        profile = {"columnDenylist": {"customers": ["points"]}}
+        for sql in ("SELECT points FROM crm_db.customers", "SELECT points FROM sales_db.customers"):
+            assert SQLFirewall().evaluate(sql, profile=profile).denied
+
+    def test_cedar_receives_one_spelling_per_table(self):
+        from coa_serve.tier2.cedar_authorizer import CedarDecision
+
+        seen: dict[str, list[str]] = {}
+
+        class _Recorder:
+            def authorize(self, *, namespace, profile, tables):
+                seen["tables"] = tables
+                return CedarDecision(allowed=True)
+
+        fw = SQLFirewall(cedar_authorizer=_Recorder())
+        for sql in (
+            "SELECT id FROM crm_db.customers",
+            'SELECT id FROM "AwsDataCatalog"."CRM_DB"."customers"',
+        ):
+            assert not fw.evaluate(sql, profile={}, namespace="ns").denied
+            assert seen["tables"] == ["crm_db.customers"]
+
+    def test_trace_filter_matches_the_gate(self):
+        from coa_serve.tier2.sql_firewall import tables_visible_to
+
+        profile = {"tableAllowlist": ["crm_db.customers", "orders"]}
+        names = ["crm_db.customers", "sales_db.customers", "customers", "orders", "x.orders"]
+        assert tables_visible_to(names, profile) == ["crm_db.customers", "orders", "x.orders"]

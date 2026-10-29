@@ -332,6 +332,26 @@ class TestListMetricsTool:
         assert captured["next_token"] == "cursor-abc"
         assert "status" not in captured
 
+    @pytest.mark.asyncio
+    async def test_metric_label_reaches_the_tool_output(self, monkeypatch, _local_dev):
+        """The display-only ``label`` stays in the output so an agent can show it (#1259)."""
+
+        async def fake_delegate(lc, ns, token, **kwargs):
+            return {"metrics": [{"name": "revenue_total", "label": "売上合計"}, {"name": "order_count"}]}
+
+        monkeypatch.setattr(server.discovery, "list_metrics", fake_delegate)
+        parsed = json.loads(await server.list_metrics(None, "sales"))
+        assert parsed["metrics"][0]["label"] == "売上合計"
+        assert "label" not in parsed["metrics"][1]
+
+    @pytest.mark.asyncio
+    async def test_description_says_label_is_display_only(self):
+        """Without this an agent seeing ``label: 売上合計`` would put the label in its query."""
+        tools = await server.mcp.list_tools()
+        description = next(t for t in tools if t.name == "list_metrics").description or ""
+        assert "``label`` is for display only" in description
+        assert "``name`` or its synonyms" in description
+
 
 @pytest.mark.unit
 class TestDescribeSchemaTool:

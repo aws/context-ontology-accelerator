@@ -33,6 +33,8 @@ import {
 } from "@api-hooks";
 import { NamespaceStatus } from "@coa/control-plane-client";
 import { localizeNamespaceLanguage } from "@utils";
+import { localizeNamespaceStatus } from "@utils/namespace-status";
+import { matchesFilteringText } from "@utils/collection-filter";
 import { useAppI18n } from "../i18n/LocaleProvider";
 import type { AppMessage } from "../i18n/appMessages";
 
@@ -156,9 +158,16 @@ function buildColumnDefinitions(
       id: "status",
       header: "Status",
       sortingField: "status",
+      // Sort by the word shown in the cell, not the API value, so the order
+      // matches what the reader sees in every language.
+      sortingComparator: (a, b) =>
+        localizeNamespaceStatus(a.status, t).localeCompare(
+          localizeNamespaceStatus(b.status, t),
+          locale,
+        ),
       cell: (item) => (
         <StatusIndicator type={STATUS_MAP[item.status as string] ?? "info"}>
-          {item.status}
+          {localizeNamespaceStatus(item.status, t)}
         </StatusIndicator>
       ),
     },
@@ -180,6 +189,26 @@ function buildColumnDefinitions(
           ? new Date(item.updatedAt).toLocaleDateString(locale)
           : "-",
     },
+  ];
+}
+
+/**
+ * The texts a namespace row shows, for the free-text filter: the user can
+ * find a row by the translated status or language they see in the table.
+ */
+export function namespaceRowTexts(
+  item: NamespaceSummary,
+  locale: string,
+  t: (message: AppMessage) => string,
+): string[] {
+  const day = (value: Date | string | undefined) =>
+    value ? new Date(value).toLocaleDateString(locale) : "";
+  return [
+    item.displayName ?? item.name ?? "",
+    localizeNamespaceLanguage(item.language, t),
+    localizeNamespaceStatus(item.status, t),
+    day(item.createdAt),
+    day(item.updatedAt),
   ];
 }
 
@@ -250,6 +279,12 @@ export const NamespaceList: React.FC = () => {
     filteredItemsCount,
   } = useCollection(visibleItems, {
     filtering: {
+      filteringFunction: (item, filteringText) =>
+        matchesFilteringText(
+          item,
+          filteringText,
+          namespaceRowTexts(item, locale, t),
+        ),
       empty: (
         <Box textAlign="center" padding="xxl">
           <SpaceBetween size="m">

@@ -2,6 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { expect, type Page } from "@playwright/test";
+import { NamespaceStatus } from "@coa/control-plane-client";
+import { NAMESPACE_STATUS_MESSAGES } from "@utils/namespace-status";
+
+// The list's status cell shows these English words, not the raw API enum, so
+// the page object reads them from the same table the UI renders from. These
+// specs run in English (no locale in the config or the stored auth state).
+const SHOWN_STATUS = NAMESPACE_STATUS_MESSAGES;
 
 /**
  * Page Object for the Namespaces feature (list, create, detail, lifecycle).
@@ -87,12 +94,12 @@ export class NamespacesPage {
 
   async archive(name: string): Promise<void> {
     await this.changeStatus(name, "Archive");
-    await this.expectRowStatus(name, "ARCHIVED");
+    await this.expectRowStatus(name, SHOWN_STATUS[NamespaceStatus.ARCHIVED]);
   }
 
   async reactivate(name: string): Promise<void> {
     await this.changeStatus(name, "Activate");
-    await this.expectRowStatus(name, "ACTIVE");
+    await this.expectRowStatus(name, SHOWN_STATUS[NamespaceStatus.ACTIVE]);
   }
 
   /**
@@ -101,7 +108,8 @@ export class NamespacesPage {
    * field before the Delete button enables. Deletion is async and can land
    * in DELETE_FAILED when managed resources (DataZone project, Athena
    * workgroup) fail to tear down; DELETE_FAILED → DELETED is allowed, so
-   * retry a few times before giving up.
+   * retry a few times before giving up. The row shows these statuses as
+   * "Delete failed" and "Deleted".
    */
   async delete(name: string): Promise<void> {
     for (let attempt = 0; attempt < 4; attempt++) {
@@ -115,7 +123,7 @@ export class NamespacesPage {
       await expect(modal).toBeHidden();
 
       // Wait for the async delete: row disappears (deleted) or shows
-      // DELETE_FAILED (retry); anything else is still in progress.
+      // "Delete failed" (retry); anything else is still in progress.
       const deadline = Date.now() + 60_000;
       while (Date.now() < deadline) {
         await this.gotoList();
@@ -126,8 +134,10 @@ export class NamespacesPage {
           return;
         }
         const text = (await row.first().textContent()) ?? "";
-        if (text.includes("DELETE_FAILED")) break; // retry the delete
-        if (text.includes("DELETED")) {
+        // Check "Delete failed" first: a failed row must be retried, not
+        // counted as deleted.
+        if (text.includes(SHOWN_STATUS[NamespaceStatus.DELETE_FAILED])) break;
+        if (text.includes(SHOWN_STATUS[NamespaceStatus.DELETED])) {
           this.created.delete(name);
           return;
         }

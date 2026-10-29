@@ -69,7 +69,11 @@ from .tier2.skip.aoss_provenance import AossProvenanceEvaluator
 from .tier2.sql_firewall import SQLFirewall
 from .tier2.strategy import StructuredQueryTier
 from .tier3.graph_traverser import GraphTraverser, is_traversable_uri
-from .tier3.knowledge_retriever import KnowledgeRetriever
+from .tier3.knowledge_retriever import (
+    KnowledgeRetriever,
+    _supporting_content_from_chunk,
+    _validated_document_chunks,
+)
 from .tier3.synthesizer import Synthesizer
 
 if TYPE_CHECKING:
@@ -614,11 +618,17 @@ async def _handle_kb_search(payload: dict, request_id: str) -> dict:
             # is in this set. Dropping the rest only shortens the list.
             chunks = [c for c in chunks if c.relevance_score >= min_score]
         search_ms = int((time.perf_counter() - t0) * 1000)
+        # Report dropped evidence the same way the Tier-3 vector step does, so a
+        # search that discarded provenance-less chunks never reads as complete.
+        chunks, dropped_chunk_count = _validated_document_chunks(chunks)
+        search_detail = f"{len(chunks)} chunks"
+        if dropped_chunk_count:
+            search_detail += f"; dropped {dropped_chunk_count} anonymous or malformed document chunks"
         trace.record(
             StepId.T3_VECTOR_SEARCH,
-            "success",
+            "degraded" if dropped_chunk_count else "success",
             search_ms,
-            detail=f"{len(chunks)} chunks",
+            detail=search_detail,
             tool_used="opensearch",
         )
     except TimeoutError as e:
@@ -630,16 +640,9 @@ async def _handle_kb_search(payload: dict, request_id: str) -> dict:
         raise DataSourceUnavailableError("Vector search failed") from e
 
     return {
-        "chunks": [
-            {
-                "chunkId": c.chunk_id,
-                "text": c.text,
-                "sourceDocumentId": c.source_doc,
-                "sourceDocumentName": c.source_doc_name,
-                "relevanceScore": c.relevance_score,
-            }
-            for c in chunks
-        ],
+        # KBSearch chunks never carried the legacy `sourceDoc` / `label` keys, so the
+        # Tier-3-only deprecated aliases are not added here.
+        "chunks": [_supporting_content_from_chunk(chunk, include_deprecated_aliases=False) for chunk in chunks],
         "trace": trace.steps_serializable,
         "queryEmbeddingModel": bedrock_client._embed_model_id,
         "requestId": request_id,
@@ -761,19 +764,20 @@ async def _handle_graph_traverse(payload: dict, request_id: str) -> dict:
                 "uri": e.uri,
                 "label": e.label,
                 "type": e.type,
-                "properties": {},
+                "properties": e.properties,
             }
             for e in entities
         ],
         "relationships": [
             {
-                "sourceUri": e.uri,
-                "predicateUri": r.get("predicate", ""),
+                "sourceUri": r.get("source_uri", ""),
+                "predicateUri": r.get("predicate_uri", ""),
                 "targetUri": r.get("target_uri", ""),
-                "predicateLabel": r.get("target_label", ""),
+                "predicateLabel": r.get("predicate_label", ""),
             }
             for e in entities
             for r in e.relationships
+            if r.get("source_uri") and r.get("predicate_uri") and r.get("target_uri")
         ],
         "trace": trace.steps_serializable,
         "requestId": request_id,

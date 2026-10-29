@@ -609,6 +609,17 @@ class CompositeQueryExecutor:
             return {}
         return await self._sources.table_placements(namespace, table_sources)
 
+    async def resolve_same_name_databases(self, namespace: str, tables: list[str]) -> dict[str, dict[str, str]]:
+        """Table name -> ``{Glue database: source_id}`` for names two or more of the namespace's databases hold.
+
+        Delegates to :meth:`SourcesRegistry.same_name_databases`; ``{}`` (routing
+        unchanged) when no registry is wired or the namespace holds < 2 Glue
+        databases.
+        """
+        if not self._sources or not hasattr(self._sources, "same_name_databases"):
+            return {}
+        return await self._sources.same_name_databases(namespace, tables)
+
     async def health_check(self) -> dict[str, Any]:
         """Aggregate the Athena (and JDBC, if present) executor health into one dict."""
         athena_health = await self._athena.health_check()

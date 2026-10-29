@@ -15,20 +15,31 @@ retrieval will be measured.
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import graphrag_toolkit.lexical_graph.config as _graphrag_cfg
 import structlog
 from coa_common import make_llama_index_embedding, resolve_region
 from coa_common.constants import DEFAULT_EMBED_DIMENSIONS, DEFAULT_EMBED_MODEL_ID
 
+from ..graph_context import (
+    SUPPORTING_STATEMENTS_KEY,
+    bound_supporting_statements,
+    encode_supporting_statements,
+)
 from ..step_ids import StepId
 from ..tier3.graph_traverser import GraphEntity
 from ..tier3.vector_retriever import ChunkResult
-from .strategies import DEFAULT_SPEC, StrategySpec
+from .strategies import (
+    _PRESERVED_RESULT_SCORE_METADATA_KEY,
+    DEFAULT_SPEC,
+    StrategySpec,
+    score_preservation_installed,
+)
 
 # ---------------------------------------------------------------------------
 # WORKAROUND: graphrag-toolkit v3.18.3 hardcodes a retired Bedrock model
@@ -120,8 +131,8 @@ def _warn_shape_mismatch_once(**details) -> None:
         logger.warning("baseline_map_results_shape_mismatch", **details)
 
 
-def _extract_source_doc(metadata: dict) -> str:
-    """Read the source document id from the real nested toolkit shape.
+def _extract_source(metadata: dict) -> tuple[str, dict | None]:
+    """Read one source identity and its matching metadata container.
 
     Tries, in order:
       * ``metadata["source"]["sourceId"]`` — the ``Source`` shape produced by
@@ -131,28 +142,172 @@ def _extract_source_doc(metadata: dict) -> str:
         raw ``SearchResult`` dump under ``"result"``, whose ``source`` is itself
         either a nested ``Source`` dict (``sourceId``) or a bare string.
 
-    Returns an empty string when none of the known shapes are present; the
-    caller decides whether the empty result constitutes a shape mismatch.
+    The returned source dict is the exact container that supplied the identity,
+    preventing a display name from a lower-priority source from being paired
+    with a different identity. Legacy string sources have no metadata container.
     """
     source = metadata.get("source")
     if isinstance(source, dict):
         source_id = source.get("sourceId")
-        if isinstance(source_id, str) and source_id:
-            return source_id
-    elif isinstance(source, str) and source:
-        return source
+        if isinstance(source_id, str) and source_id.strip():
+            return source_id.strip(), source
+    elif isinstance(source, str) and source.strip():
+        return source.strip(), None
 
     result = metadata.get("result")
     if isinstance(result, dict):
         result_source = result.get("source")
         if isinstance(result_source, dict):
             source_id = result_source.get("sourceId")
-            if isinstance(source_id, str) and source_id:
-                return source_id
-        elif isinstance(result_source, str) and result_source:
-            return result_source
+            if isinstance(source_id, str) and source_id.strip():
+                return source_id.strip(), result_source
+        elif isinstance(result_source, str) and result_source.strip():
+            return result_source.strip(), None
 
-    return ""
+    return "", None
+
+
+def _extract_source_doc(metadata: dict) -> str:
+    """Read the opaque source document id from the real toolkit shape."""
+    source_document_id, _ = _extract_source(metadata)
+    return source_document_id
+
+
+def _extract_source_doc_name(metadata: dict) -> str:
+    """Read the original file name from a toolkit ``Source`` metadata payload.
+
+    The raw ``source_s3_key`` preserves the uploaded file's extension, while
+    ``filename`` may name a converted staging artifact, so the raw-key basename
+    wins. This mirrors the OpenSearch provenance mapping used by the hand-rolled
+    path without treating either path-shaped value as document identity.
+    """
+    _, source = _extract_source(metadata)
+    if source is None:
+        return ""
+
+    source_metadata = source.get("metadata")
+    if not isinstance(source_metadata, dict):
+        return ""
+    source_s3_key = source_metadata.get("source_s3_key")
+    if isinstance(source_s3_key, str) and source_s3_key:
+        return source_s3_key.rsplit("/", 1)[-1]
+    filename = source_metadata.get("filename")
+    return filename if isinstance(filename, str) else ""
+
+
+def _finite_score(value: object) -> float | None:
+    """Return a finite numeric score, rejecting booleans and malformed values."""
+    if isinstance(value, bool) or not isinstance(value, int | float | str):
+        return None
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return None
+    return score if math.isfinite(score) else None
+
+
+def _extract_relevance_score(metadata: dict) -> float | None:
+    """Read the exact ranked toolkit score preserved before ``ClearScores``."""
+    result = metadata.get("result")
+    if not isinstance(result, dict):
+        return None
+
+    result_score = _finite_score(result.get("score"))
+    if result_score is not None:
+        return result_score
+
+    topics = result.get("topics")
+    if not isinstance(topics, list):
+        return None
+
+    for topic in topics:
+        if not isinstance(topic, dict):
+            continue
+        chunks = topic.get("chunks")
+        if not isinstance(chunks, list):
+            continue
+        for chunk in chunks:
+            if not isinstance(chunk, dict):
+                continue
+            chunk_metadata = chunk.get("metadata")
+            if not isinstance(chunk_metadata, dict):
+                continue
+            preserved_score = _finite_score(chunk_metadata.get(_PRESERVED_RESULT_SCORE_METADATA_KEY))
+            if preserved_score is not None:
+                return preserved_score
+
+    return None
+
+
+def _source_level_chunks(metadata: dict, node_score: float | None) -> list[ChunkResult] | None:
+    """Expand a toolkit source-level wrapper into its actual chunk records.
+
+    Traversal retrievers return one formatted ``NodeWithScore`` per source, while
+    retaining the unformatted ``SearchResult`` under ``metadata["result"]``.
+    Its node id and text describe the aggregate wrapper, not evidence. ``None``
+    means this is not that wrapper shape; an empty list means it is a wrapper but
+    contains no usable chunk details and must not fall back to aggregate JSON.
+    """
+    result = metadata.get("result")
+    if not isinstance(result, dict) or not isinstance(result.get("topics"), list):
+        return None
+
+    source_document_id, _ = _extract_source(metadata)
+    if not source_document_id:
+        return []
+    source_document_name = _extract_source_doc_name(metadata)
+    result_score = _finite_score(result.get("score"))
+    chunks: list[ChunkResult] = []
+
+    for topic in result["topics"]:
+        if not isinstance(topic, dict) or not isinstance(topic.get("chunks"), list):
+            continue
+        for raw_chunk in topic["chunks"]:
+            if not isinstance(raw_chunk, dict):
+                continue
+            chunk_id = raw_chunk.get("chunkId")
+            if chunk_id is None or not str(chunk_id).strip():
+                continue
+            chunk_metadata = raw_chunk.get("metadata")
+            if not isinstance(chunk_metadata, dict):
+                chunk_metadata = {}
+            text = raw_chunk.get("value")
+            if not isinstance(text, str) or not text:
+                text = chunk_metadata.get("value")
+            if not isinstance(text, str) or not text:
+                continue
+
+            score_candidates = (
+                _finite_score(raw_chunk.get("score")),
+                _finite_score(chunk_metadata.get(_PRESERVED_RESULT_SCORE_METADATA_KEY)),
+                result_score,
+                node_score,
+            )
+            score = next((candidate for candidate in score_candidates if candidate is not None), 0.0)
+            chunks.append(
+                ChunkResult(
+                    chunk_id=str(chunk_id),
+                    text=text,
+                    source_doc=source_document_id,
+                    source_doc_name=source_document_name,
+                    relevance_score=score,
+                )
+            )
+
+    return chunks
+
+
+def _append_graph_statement(entity: GraphEntity, text: str) -> GraphEntity:
+    """Retain anonymous graph-derived text as bounded GraphContext evidence."""
+    properties = dict(entity.properties)
+    statements = bound_supporting_statements(
+        [
+            *bound_supporting_statements(properties.get(SUPPORTING_STATEMENTS_KEY)),
+            text,
+        ]
+    )
+    properties[SUPPORTING_STATEMENTS_KEY] = encode_supporting_statements(statements)
+    return replace(entity, properties=properties)
 
 
 def _extract_entities(metadata: dict) -> list[tuple[str, str, str]]:
@@ -214,6 +369,10 @@ class BaselineResult:
     entities: tuple[GraphEntity, ...]
     source: str = "graphrag-toolkit/lexical"
     trace_steps: tuple[dict, ...] = ()
+    dropped_anonymous_chunks: int = 0
+    # True when toolkit score preservation could not be installed, so every
+    # ``relevance_score`` on ``chunks`` is 0.0 for reasons unrelated to relevance.
+    scores_unranked: bool = False
 
 
 class BaselineLexicalRetriever:
@@ -263,6 +422,13 @@ class BaselineLexicalRetriever:
         # effective tenant is the override (or ``None`` for the toolkit default
         # tenant) when one is set, otherwise the namespace-derived tenant_id.
         self._engines: dict[tuple[str | None, str], object] = {}
+        # Strategy names whose engine could NOT be patched for score preservation.
+        # Membership is a property of the installed toolkit build and the strategy,
+        # not of a tenant, so recording it per strategy name is sufficient. Every
+        # retrieval on such a strategy returns 0.0 relevance for every chunk, which
+        # is indistinguishable from genuinely irrelevant results — so the retrieval
+        # step is marked degraded rather than reported as a clean success.
+        self._unranked_strategies: set[str] = set()
 
         # Dedicated bounded executor for synchronous toolkit retrieval. Owning a
         # private pool (instead of asyncio's shared default `to_thread` executor)
@@ -359,12 +525,16 @@ class BaselineLexicalRetriever:
             engine = strategy.build_engine(graph_store, vector_store, tenant_id=tenant_id)
 
         self._engines[key] = engine
+        score_preservation = score_preservation_installed(engine)
+        if not score_preservation:
+            self._unranked_strategies.add(str(strategy.name))
         logger.info(
             "baseline_lexical_engine_created",
             tenant_id=tenant_id,
             namespace=namespace,
             strategy=str(strategy.name),
             tenant_override_used=override_used,
+            score_preservation_installed=score_preservation,
         )
         return engine
 
@@ -494,16 +664,50 @@ class BaselineLexicalRetriever:
             )
             return BaselineResult(chunks=(), entities=(), trace_steps=tuple(trace_steps))
 
-        chunks, entities = self._map_results(nodes)
+        chunks, entities, dropped_anonymous_chunks = self._map_results_with_diagnostics(nodes)
+        if dropped_anonymous_chunks:
+            trace_steps[-1] = {
+                **trace_steps[-1],
+                "status": "degraded",
+                "detail": (
+                    f"{trace_steps[-1]['detail']}; "
+                    f"dropped {dropped_anonymous_chunks} anonymous or malformed document chunks"
+                ),
+            }
+
+        scores_unranked = str(resolved.name) in self._unranked_strategies
+        if scores_unranked:
+            logger.warning(
+                "lexical_relevance_scores_unavailable",
+                strategy=str(resolved.name),
+                namespace=namespace,
+                chunks=len(chunks),
+            )
+            trace_steps[-1] = {
+                **trace_steps[-1],
+                "status": "degraded",
+                "detail": (
+                    f"{trace_steps[-1]['detail']}; "
+                    "toolkit score preservation is not installed, so every relevance score is 0.0"
+                ),
+            }
 
         return BaselineResult(
             chunks=tuple(chunks),
             entities=tuple(entities),
             trace_steps=tuple(trace_steps),
+            dropped_anonymous_chunks=dropped_anonymous_chunks,
+            scores_unranked=scores_unranked,
         )
 
     @staticmethod
     def _map_results(nodes: list) -> tuple[list[ChunkResult], list[GraphEntity]]:
+        """Map toolkit nodes while preserving the historical two-value test API."""
+        chunks, entities, _ = BaselineLexicalRetriever._map_results_with_diagnostics(nodes)
+        return chunks, entities
+
+    @staticmethod
+    def _map_results_with_diagnostics(nodes: list) -> tuple[list[ChunkResult], list[GraphEntity], int]:
         """Map graphrag-toolkit ``NodeWithScore`` results to Tier 3 data model.
 
         Defensive against the real toolkit metadata shapes (see
@@ -514,20 +718,28 @@ class BaselineLexicalRetriever:
         ``metadata["entity_contexts"]``. All access uses ``.get``/``isinstance``
         with empty fallbacks, and a single ``logger.warning`` is emitted on a
         shape mismatch (a node that has metadata but yields neither a
-        ``source_doc`` nor any entities) instead of crashing.
+        ``source_doc`` nor any entities) instead of crashing. Source-less text
+        attached to real graph entities is retained in their
+        ``supportingStatements`` property; all other anonymous/malformed text is
+        dropped and counted for retrieval tracing.
         """
         chunks: list[ChunkResult] = []
+        chunks_seen: set[tuple[str, str]] = set()
         entities_seen: dict[str, GraphEntity] = {}
+        dropped_anonymous_chunks = 0
 
         for node in nodes:
-            node_id = node.node_id if hasattr(node, "node_id") else str(id(node))
-            text = node.text if getattr(node, "text", None) else ""
-            score = node.score if hasattr(node, "score") and node.score is not None else 0.0
+            raw_node_id = getattr(node, "node_id", "")
+            node_id = raw_node_id if isinstance(raw_node_id, str) and raw_node_id.strip() else ""
+            raw_text = getattr(node, "text", "")
+            text = raw_text if isinstance(raw_text, str) and raw_text.strip() else ""
 
             metadata = node.metadata if hasattr(node, "metadata") and isinstance(node.metadata, dict) else {}
+            node_score = _finite_score(node.score) if hasattr(node, "score") else None
 
             source_doc = _extract_source_doc(metadata)
             extracted_entities = _extract_entities(metadata)
+            source_level_chunks = _source_level_chunks(metadata, node_score)
 
             if metadata and not source_doc and not extracted_entities:
                 _warn_shape_mismatch_once(
@@ -535,14 +747,34 @@ class BaselineLexicalRetriever:
                     metadata_keys=sorted(metadata.keys()),
                 )
 
-            chunks.append(
-                ChunkResult(
-                    chunk_id=node_id,
-                    text=text,
-                    source_doc=source_doc,
-                    relevance_score=score,
-                )
-            )
+            if source_level_chunks is not None:
+                for chunk in source_level_chunks:
+                    chunk_key = (chunk.source_doc, chunk.chunk_id)
+                    if chunk_key not in chunks_seen:
+                        chunks_seen.add(chunk_key)
+                        chunks.append(chunk)
+                if not source_level_chunks:
+                    dropped_anonymous_chunks += 1
+            elif source_doc and node_id and text:
+                score = node_score if node_score is not None else (_extract_relevance_score(metadata) or 0.0)
+                chunk_key = (source_doc, node_id)
+                if chunk_key not in chunks_seen:
+                    chunks_seen.add(chunk_key)
+                    chunks.append(
+                        ChunkResult(
+                            chunk_id=node_id,
+                            text=text,
+                            source_doc=source_doc,
+                            source_doc_name=_extract_source_doc_name(metadata),
+                            relevance_score=score,
+                        )
+                    )
+            elif (node_id or text) and not (extracted_entities and text and not source_doc):
+                # Count every drop except text that is kept below as a graph
+                # statement (entities + text, no source document). A node with a
+                # source document, text and entities but no node id is neither a
+                # chunk nor a statement, so it is counted here too.
+                dropped_anonymous_chunks += 1
 
             for uri, label, entity_type in extracted_entities:
                 if uri not in entities_seen:
@@ -551,5 +783,7 @@ class BaselineLexicalRetriever:
                         label=label,
                         type=entity_type,
                     )
+                if not source_doc and source_level_chunks is None and text:
+                    entities_seen[uri] = _append_graph_statement(entities_seen[uri], text)
 
-        return chunks, list(entities_seen.values())
+        return chunks, list(entities_seen.values()), dropped_anonymous_chunks

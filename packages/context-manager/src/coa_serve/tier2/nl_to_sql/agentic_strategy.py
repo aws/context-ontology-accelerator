@@ -27,10 +27,10 @@ so it constructs those from the request context, runs the agent, and maps the
 outcome onto trace records and a :class:`StrategyResult`. The same tools back any
 other consumer (an MCP tool, an HTTP route) without going through this strategy.
 
-Worst-case latency and token spend are bounded by the orchestrator's request
-deadline and the per-statement execution timeout, not by a turn count (see
-:mod:`coa_serve.agents.sql_agent`). It is an OPT-IN strategy: it runs only when
-the request pins ``options.strategy = "deep-reasoning"`` (see
+Worst-case latency and token spend are bounded by a per-request cap on statement
+executions, a stop just before the request deadline, and the per-statement
+execution timeout, not by a turn count (see :mod:`coa_serve.agents.sql_agent`).
+It is an OPT-IN strategy: it runs only when the request pins ``options.strategy = "deep-reasoning"`` (see
 ``StructuredQueryTier._strategies_for``), never as an implicit fallback.
 """
 
@@ -201,6 +201,7 @@ class AgenticStrategy:
             evidence=capped_evidence(options.get("evidence", "")),
             max_rows=capped_max_rows(options),
             data_source_id=options.get("dataSourceId", ""),
+            deadline=context.deadline,
         )
         t_ms = outcome.duration_ms
 

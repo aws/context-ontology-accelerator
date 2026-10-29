@@ -14,6 +14,7 @@ import {
   validateClassification,
   validateTopic,
 } from "./extraction-vocabulary";
+import { formatEnglishMessage } from "../i18n/appMessages";
 
 describe("toParserForm", () => {
   it("title-cases an all-caps label", () => {
@@ -88,46 +89,58 @@ describe("labelsRewrittenOnIngest", () => {
 
 describe("validateClassification", () => {
   it("accepts a Title Case label", () => {
-    expect(validateClassification("Loss Ratio")).toBeNull();
+    expect(
+      validateClassification("Loss Ratio", [], formatEnglishMessage),
+    ).toBeNull();
   });
 
   it("accepts an all-caps label — spelling is not policed", () => {
-    expect(validateClassification("DRESS")).toBeNull();
+    expect(
+      validateClassification("DRESS", [], formatEnglishMessage),
+    ).toBeNull();
   });
 
   it("rejects an empty label", () => {
-    expect(validateClassification("  ")).toBe("Enter a label.");
+    expect(validateClassification("  ", [], formatEnglishMessage)).toBe(
+      "Enter a label.",
+    );
   });
 
   it("rejects an over-length label", () => {
     const tooLong = "A".repeat(MAX_CLASSIFICATION_LENGTH + 1);
-    expect(validateClassification(tooLong)).toContain(
+    expect(validateClassification(tooLong, [], formatEnglishMessage)).toContain(
       `${MAX_CLASSIFICATION_LENGTH} characters or fewer`,
     );
   });
 
   it("accepts CamelCase — spelling is the user's choice", () => {
     // Surfaced as a non-blocking notice via labelsRewrittenOnIngest instead.
-    expect(validateClassification("StyleArchetype")).toBeNull();
+    expect(
+      validateClassification("StyleArchetype", [], formatEnglishMessage),
+    ).toBeNull();
   });
 });
 
 describe("validateTopic", () => {
   it("accepts a multi-word topic phrase", () => {
-    expect(validateTopic("Black Tie Gala Dress Code")).toBeNull();
+    expect(
+      validateTopic("Black Tie Gala Dress Code", [], formatEnglishMessage),
+    ).toBeNull();
   });
 
   it("accepts CamelCase — topics are not run through format_classification", () => {
-    expect(validateTopic("QuietLuxury")).toBeNull();
+    expect(validateTopic("QuietLuxury", [], formatEnglishMessage)).toBeNull();
   });
 
   it("rejects an empty topic", () => {
-    expect(validateTopic("  ")).toBe("Enter a topic name.");
+    expect(validateTopic("  ", [], formatEnglishMessage)).toBe(
+      "Enter a topic name.",
+    );
   });
 
   it("rejects an over-length topic", () => {
     const tooLong = "A".repeat(MAX_TOPIC_LENGTH + 1);
-    expect(validateTopic(tooLong)).toContain(
+    expect(validateTopic(tooLong, [], formatEnglishMessage)).toContain(
       `${MAX_TOPIC_LENGTH} characters or fewer`,
     );
   });
@@ -142,33 +155,43 @@ describe("list-level limits", () => {
   );
 
   it("rejects a classification once the list is at the cap", () => {
-    expect(validateClassification("One More", atCap)).toBe(
-      `You can add at most ${MAX_VOCABULARY_ENTRIES} labels.`,
-    );
+    expect(
+      validateClassification("One More", atCap, formatEnglishMessage),
+    ).toBe(`You can add at most ${MAX_VOCABULARY_ENTRIES} labels.`);
   });
 
   it("accepts a classification one below the cap", () => {
-    expect(validateClassification("One More", atCap.slice(0, -1))).toBeNull();
+    expect(
+      validateClassification(
+        "One More",
+        atCap.slice(0, -1),
+        formatEnglishMessage,
+      ),
+    ).toBeNull();
   });
 
   it("rejects a topic once the list is at the cap", () => {
-    expect(validateTopic("One More", atCap)).toBe(
+    expect(validateTopic("One More", atCap, formatEnglishMessage)).toBe(
       `You can add at most ${MAX_VOCABULARY_ENTRIES} topics.`,
     );
   });
 
   it("rejects a case-insensitive duplicate classification, as the API does", () => {
-    expect(validateClassification("DRESS", ["Dress"])).toContain("duplicates");
+    expect(
+      validateClassification("DRESS", ["Dress"], formatEnglishMessage),
+    ).toContain("duplicates");
   });
 
   it("rejects a case-insensitive duplicate topic", () => {
-    expect(validateTopic("black tie gala", ["Black Tie Gala"])).toContain(
-      "duplicates",
-    );
+    expect(
+      validateTopic("black tie gala", ["Black Tie Gala"], formatEnglishMessage),
+    ).toContain("duplicates");
   });
 
   it("allows a distinct label alongside existing ones", () => {
-    expect(validateClassification("Outerwear", ["Dress"])).toBeNull();
+    expect(
+      validateClassification("Outerwear", ["Dress"], formatEnglishMessage),
+    ).toBeNull();
   });
 });
 
@@ -234,16 +257,20 @@ describe("topicsRewrittenOnIngest", () => {
 // after filling in the whole form.
 describe("duplicate detection matches the API's folding", () => {
   it("does not treat ß and ss as the same label", () => {
-    expect(validateClassification("STRASSE", ["Straße"])).toBeNull();
-    expect(validateTopic("STRASSE", ["Straße"])).toBeNull();
+    expect(
+      validateClassification("STRASSE", ["Straße"], formatEnglishMessage),
+    ).toBeNull();
+    expect(
+      validateTopic("STRASSE", ["Straße"], formatEnglishMessage),
+    ).toBeNull();
   });
 
   it("still rejects a plain case-only difference", () => {
-    expect(validateClassification("POLICY", ["Policy"])).toContain(
-      "duplicates",
-    );
-    expect(validateTopic("BLACK TIE GALA", ["Black Tie Gala"])).toContain(
-      "duplicates",
-    );
+    expect(
+      validateClassification("POLICY", ["Policy"], formatEnglishMessage),
+    ).toContain("duplicates");
+    expect(
+      validateTopic("BLACK TIE GALA", ["Black Tie Gala"], formatEnglishMessage),
+    ).toContain("duplicates");
   });
 });

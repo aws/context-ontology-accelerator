@@ -24,6 +24,8 @@ subject are pulled into that subject's sub-graph so embedded
 
 from __future__ import annotations
 
+import re
+
 from coa_common.constants import VOCAB_PREFIX, VOCAB_URI
 from rdflib import BNode, Graph, Namespace
 from rdflib.namespace import DCTERMS, OWL, RDF, RDFS, SKOS, XSD
@@ -40,6 +42,33 @@ _NEPTUNE = Namespace("http://aws.amazon.com/neptune/vocab/v01/")
 # discards, yielding an undeclared prefix and unparseable Turtle. Sourced from
 # the shared constant so it tracks any rebrand of the vocab base.
 _VOCAB = Namespace(VOCAB_URI)
+
+# Turtle directives that declare a prefix or a base and carry no triples:
+# ``@prefix p: <iri> .``, ``@base <iri> .`` and the SPARQL-style ``PREFIX p: <iri>``
+# / ``BASE <iri>``. Matched as whole tokens, so a directive and a triple on the
+# same line still leave the triple behind.
+_DIRECTIVE_RE = re.compile(
+    r"@prefix\s+[^\s:]*:\s*<[^>]*>\s*\."
+    r"|@base\s*<[^>]*>\s*\."
+    r"|(?i:\bprefix)\s+[^\s:]*:\s*<[^>]*>"
+    r"|(?i:\bbase)\s*<[^>]*>"
+)
+
+
+def turtle_has_triples(raw_turtle: str) -> bool:
+    """Whether a Turtle document holds anything beyond directives and comments.
+
+    Neptune's GSP GET can answer an unknown or empty named graph with a header of
+    ``@prefix`` lines and no triples. Stripping the directives and comment lines
+    tells that apart without parsing the document a second time (the download
+    route parses it once to reformat). It errs toward ``True``: anything left over
+    counts as content.
+    """
+    for line in _DIRECTIVE_RE.sub(" ", raw_turtle).splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            return True
+    return False
 
 
 def format_grouped_turtle(raw_turtle: str) -> str:

@@ -1,6 +1,6 @@
 # Authentication Setup Guide
 
-This guide covers how to configure authentication for Context Ontology Accelerator (COA). The platform supports AWS Cognito User Pools and any OIDC-compliant identity provider.
+This guide covers how to configure authentication for Context Ontology Accelerator (COA). The platform supports AWS Cognito User Pools, any OIDC-compliant identity provider, and SAML 2.0 or OIDC providers federated through Cognito.
 
 ## Overview
 
@@ -119,6 +119,45 @@ aws cognito-idp admin-add-user-to-group \
   --group-name Admin
 ```
 
+#### Email changes need verification
+
+Grants are looked up by the email in the user's ID token, so the user pool
+only applies a user's own email change after they verify the new address:
+Cognito emails a code to the new address and keeps the old email, in the pool
+and in tokens, until the user confirms it. Users cannot mark an email as
+verified themselves. An administrator can still change a user's email directly
+with `admin-update-user-attributes`; include `Name=email_verified,Value=true`
+to apply it without a code. Review the user's grants when you do, because
+grants made for the new address apply to them from their next sign-in.
+
+When you upgrade a deployment from a release without this setting, the setting
+does not undo email changes made before the upgrade: until then a user's own
+change applied at once and left `email_verified` set to `false`. After the
+upgrade, list the users whose email is not verified and check that each email
+belongs to that person:
+
+```bash
+aws cognito-idp list-users --user-pool-id us-east-1_XXXXX \
+  --query "Users[?Attributes[?Name=='email_verified' && Value=='false']].[Username, Attributes[?Name=='email'].Value | [0], UserLastModifiedDate]" \
+  --output table
+```
+
+Users created with `admin-create-user` without `Name=email_verified,Value=true`
+also appear in this list. For any user whose email is not theirs, set it back
+with `email_verified=true` (without it, the change waits for verification and
+the user keeps the wrong email), sign them out so their refresh token stops
+issuing tokens, and remove grants they should not have:
+
+```bash
+aws cognito-idp admin-update-user-attributes --user-pool-id us-east-1_XXXXX \
+  --username <username> \
+  --user-attributes Name=email,Value=<their-own-email> Name=email_verified,Value=true
+aws cognito-idp admin-user-global-sign-out --user-pool-id us-east-1_XXXXX \
+  --username <username>
+```
+
+ID tokens already issued stay valid until they expire.
+
 ## Option B: External OIDC Provider
 
 COA supports any OIDC-compliant provider (Okta, Azure AD, Auth0, Keycloak, etc.).
@@ -164,6 +203,143 @@ CDK deploy.
 If you're deploying outside CDK entirely (a non-standard setup), you'd set
 these Lambda environment variables directly on the authorizer function —
 but for `make deploy-dev`, editing the SSM config is the only step required.
+
+## Option C: Federate SAML or OIDC Providers Through Cognito
+
+Use this option when users should sign in with your corporate identity
+provider but you want to keep the Cognito User Pool from Option A. Compared
+with Option B:
+
+- It works with **SAML 2.0** providers as well as OIDC. Option B is OIDC only.
+- You can add **several providers**, and Cognito users, including the initial
+  admin, can still sign in with a password.
+- COA still receives **Cognito ID tokens**, so the authorizer, AgentCore
+  runtimes and web app config work exactly as in Option A.
+
+Cognito's hosted login page shows a button for each provider next to the
+username and password form. Both the web app client and the MCP/CLI client
+offer every provider.
+
+### 1. Deploy and Note the User Pool Values
+
+Your IdP needs two values from the user pool, and the user pool ID only exists
+after the first deploy. Deploy with the default Cognito config first, or use an
+existing deployment, then read `UserPoolId` and `CognitoDomainUrl` from the
+`coa-dev-auth` stack outputs (see "What's Already Set Up" above).
+
+Adding providers to an existing deployment works: the next deploy adds them to
+both app clients.
+
+### 2. Register the User Pool with Your IdP
+
+For a **SAML** provider, create a SAML application in your IdP:
+
+| Setting | Value |
+|---------|-------|
+| ACS URL (single sign-on URL) | `<CognitoDomainUrl>/saml2/idpresponse` |
+| SP entity ID (audience URI) | `urn:amazon:cognito:sp:<UserPoolId>` |
+| Attributes | Include the user's email address in the assertion |
+
+Then copy the IdP's metadata URL, or download its metadata XML.
+
+For an **OIDC** provider, create a web application (a confidential client,
+with a client secret) in your IdP:
+
+| Setting | Value |
+|---------|-------|
+| Redirect URI | `<CognitoDomainUrl>/oauth2/idpresponse` |
+| Scopes | `openid`, `email`, `profile` |
+| Client authentication | `client_secret_post` (the only method Cognito uses) |
+
+Note the app's client ID, client secret and issuer URL.
+
+### 3. Add the Providers to the Deploy Config
+
+Add these keys to your existing `/<prefix>/config` JSON, then run
+`make deploy-dev`. A SAML example:
+
+```json
+{
+  "idpType": "SAML",
+  "samlProviders": [
+    {
+      "name": "CorpSSO",
+      "metadataUrl": "https://idp.example.com/app/abc123/sso/saml/metadata"
+    }
+  ],
+  "attributeMapping": {
+    "email": "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress"
+  }
+}
+```
+
+An OIDC example:
+
+```json
+{
+  "idpType": "COGNITO",
+  "oidcProviders": [
+    {
+      "name": "PartnerIdP",
+      "issuerUrl": "https://login.partner.example.com",
+      "clientId": "0oa...",
+      "clientSecret": "...",
+      "scopes": ["openid", "email", "profile"]
+    }
+  ],
+  "attributeMapping": {
+    "email": "email"
+  }
+}
+```
+
+| Key | What to set |
+|-----|-------------|
+| `idpType` | `SAML` or `COGNITO`. Both create the User Pool and register the providers below. With `OIDC` (Option B) the provider lists are ignored. |
+| `samlProviders[]` | `name`, plus one of `metadataUrl` or `metadataContent` (the metadata XML as a JSON string). |
+| `oidcProviders[]` | `name`, `issuerUrl`, `clientId`, `clientSecret`, and optional `scopes` (default `openid`, `email`, `profile`). |
+| `attributeMapping` | Cognito attribute → the IdP's attribute name. One mapping applies to every provider in both lists. |
+
+`name` is the label on the login button and the provider's name in Cognito. It
+must be 3 to 32 characters, with no spaces or underscores.
+
+**Map `email`.** The authorizer uses the ID token's `email` claim as the user's
+principal and rejects tokens without it. Map it from the attribute your IdP
+sends: usually `email` for OIDC, and for SAML the attribute name in the
+assertion, such as
+`http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress` from
+Microsoft Entra ID or AD FS. Because the mapping is shared, providers in one
+deployment have to send email under the same attribute name.
+
+The OIDC `clientSecret` is written into the `coa-dev-auth` CloudFormation
+template.
+
+### 4. Grant Roles to Federated Users
+
+COA reads group memberships from the `cognito:groups` claim, and groups from
+your IdP don't appear there. Cognito instead adds every user who signs in
+through a provider to a group named `<UserPoolId>_<name>`, for example
+`ap-northeast-1_EXAMPLE_CorpSSO`.
+
+To give everyone from a provider a platform role, add a `claimsMappings` entry
+for that group in the same deploy as step 3:
+
+```json
+{
+  "claimsMappings": [
+    {
+      "groupValue": "ap-northeast-1_EXAMPLE_CorpSSO",
+      "mappedRoles": ["platform-viewer"]
+    }
+  ]
+}
+```
+
+For namespace roles or individual users, grant roles to that group or to the
+user's email as described in the
+[Role & Permission Management Guide](role-permission-management.md).
+Federated users aren't in the `Admin` group, so sign in as the initial admin to
+make the first grants.
 
 ## Configure the Web App
 
@@ -300,7 +476,8 @@ This walkthrough covers configuring Okta as the external OIDC identity provider 
     RFC 8252) — you'll only need the **Client ID**. The direct-OIDC integration
     (`idpType: "OIDC"`) has no `clientSecret` field in its config; only the
     separate Cognito-federation path (`oidcProviders`, used when federating an
-    external OIDC IdP *through* Cognito rather than replacing it) accepts one.
+    external OIDC IdP *through* Cognito rather than replacing it; see "Option C"
+    above) accepts one.
     If Okta's app page shows a client secret, you selected the wrong
     application type — switch to Single-Page Application.
 

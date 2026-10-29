@@ -39,7 +39,8 @@
 #      is what actually tears the whole tree down.
 #   6. Start deleting every connector stack. They belong to separate CDK apps in
 #      connectors/, so `cdk destroy` below never sees them, and left behind
-#      each keeps a spill bucket and a customer-managed KMS key alive. Step 8
+#      each keeps a spill bucket and a customer-managed KMS key alive. Also the
+#      integ suites' AOSS inspect stack, whose Lambda sits in the VPC. Step 8
 #      waits for them.
 #   7. `cdk destroy` every stack but network, re-running it past the failures
 #      it is known to hit (see fix_failed_stack).
@@ -98,10 +99,17 @@ if [ -n "${SCL_PROJECT_TAG:-}" ] && [[ ! "$SCL_PROJECT_TAG" =~ ^[a-zA-Z0-9_.:-]+
   echo "ERROR: SCL_PROJECT_TAG contains invalid characters: $SCL_PROJECT_TAG" >&2; exit 1
 fi
 
+# Synth of an imported VPC needs its endpoint, and destroy synthesizes the app to
+# list the stacks it owns: fail here rather than with a generic synth failure.
+if [ -n "${SCL_VPC_ID:-}" ] && [ -z "${SCL_AOSS_VPC_ENDPOINT_ID:-}" ]; then
+  echo "ERROR: SCL_VPC_ID is set: also set SCL_AOSS_VPC_ENDPOINT_ID to the value used at deploy (synth needs it to list the stacks)." >&2; exit 1
+fi
+
 CONTEXT="--context env=$ENV"
 [ -n "${SCL_PREFIX:-}" ]      && CONTEXT="$CONTEXT --context resource_prefix=$SCL_PREFIX"
 [ -n "${SCL_PROJECT_TAG:-}" ] && CONTEXT="$CONTEXT --context project_tag=$SCL_PROJECT_TAG"
 [ -n "${SCL_VPC_ID:-}" ]      && CONTEXT="$CONTEXT --context vpc_id=$SCL_VPC_ID"
+[ -n "${SCL_AOSS_VPC_ENDPOINT_ID:-}" ] && CONTEXT="$CONTEXT --context aoss_vpc_endpoint_id=$SCL_AOSS_VPC_ENDPOINT_ID"
 
 # Statuses that mean "this stack still exists and owns resources", for step 6's connector sweep.
 # It once omitted ROLLBACK_FAILED, UPDATE_ROLLBACK_FAILED and CREATE_FAILED, so a stack stuck in
@@ -735,6 +743,29 @@ fi
 echo "Note: only ${STACK_PREFIX}-* connector stacks are covered. A connector deployed with a"
 echo "custom FUNCTION_NAME_PREFIX must be destroyed by hand."
 
+# The integ suites' AOSS inspect stack (tests/cdk, stack_kind=aoss-inspect) puts a Lambda and
+# a security group into this deployment's VPC, so the network stack cannot delete while it is
+# there. Named after the resource prefix alone, like the /<prefix>/opensearch/* it reads.
+INSPECT_STACK="${PREFIX}-integ-aoss-inspect"
+# Its Lambda's name, for the ENI sweep in step 8. Same string today, but set separately in
+# tests/cdk/lib/aoss-inspect-stack.ts, whose test checks both against these two lines.
+INSPECT_FN="${PREFIX}-integ-aoss-inspect"
+INSPECT_STATUS=$(stack_status "$INSPECT_STACK" "$REGION")
+case "$INSPECT_STATUS" in
+  GONE|DELETE_COMPLETE|REVIEW_IN_PROGRESS) ;;  # the last holds change sets only
+  # Test-only stack: a failed lookup must not mark a customer's run unverified.
+  UNKNOWN) warn "Could not check for the integ test inspect stack; the final check looks again." ;;
+  DELETE_IN_PROGRESS) CONNECTORS_DELETING+=("$INSPECT_STACK") ;;
+  *_IN_PROGRESS) warn "$INSPECT_STACK is $INSPECT_STATUS — not deleting it; see the verification below." ;;
+  *)
+    echo "Deleting $INSPECT_STACK..."
+    if aws cloudformation delete-stack --stack-name "$INSPECT_STACK" --region "$REGION"; then
+      CONNECTORS_DELETING+=("$INSPECT_STACK")
+    else
+      warn "delete-stack failed for $INSPECT_STACK — continuing."
+    fi ;;
+esac
+
 # ── Step 7: cdk destroy every stack but network ───────────────────────────
 # Network is left to step 8: its VPC is what AgentCore's ENIs keep in use.
 echo ""
@@ -839,6 +870,7 @@ DEFERRED=false
 NETWORK_FAILED=false
 PENDING_SG_IDS=()  # held only by AgentCore's ENIs: the teardown can finish later
 PROBLEM_SG_IDS=()  # kept by anything else: a failure
+OTHER_ENIS=""      # set by only_agentcore_enis, which a failure without AgentCore's ENIs never calls
 NETWORK_REGION=$(region_of "$NETWORK_STACK")
 # The stack's own VPC, or the imported one (SCL_VPC_ID): where the Lambda ENIs are.
 VPC_ID=$(aws cloudformation list-stack-resources --stack-name "$NETWORK_STACK" --region "$NETWORK_REGION" \
@@ -911,7 +943,7 @@ sweep_detached_lambda_enis() {
     fi
   done < <(aws ec2 describe-network-interfaces --region "$REGION" \
     --filters "Name=vpc-id,Values=$VPC_ID" "Name=status,Values=available" \
-      "Name=description,Values=AWS Lambda VPC ENI-${STACK_PREFIX}-*" \
+      "Name=description,Values=AWS Lambda VPC ENI-${STACK_PREFIX}-*,AWS Lambda VPC ENI-${INSPECT_FN}*" \
     --query 'NetworkInterfaces[].[NetworkInterfaceId,Description]' --output text 2>/dev/null)
 }
 
@@ -990,7 +1022,7 @@ finish_network_stack() {
 if [ "$DESTROY_EXIT" -ne 0 ]; then
   warn "Step 7 left stacks behind — not touching the network stack (see the verification below)."
 else
-  # Connector stacks from step 6 sit in the VPC (Lambda ENIs, security groups).
+  # Connector and inspect stacks from step 6 sit in the VPC (Lambda ENIs, security groups).
   FAILED_CONNECTORS=()
   for CONNECTOR_STACK in ${CONNECTORS_DELETING[@]+"${CONNECTORS_DELETING[@]}"}; do
     if wait_stack_deleted "$CONNECTOR_STACK" "$REGION" "$CONNECTOR_DELETE_WAIT_MAX_SECONDS"; then
@@ -1063,6 +1095,14 @@ done
 for CONNECTOR_STACK in $CONNECTOR_STACKS; do
   note_remaining "$CONNECTOR_STACK" "$REGION"
 done
+# Looked up again, so one that step 6 could not see is still reported; customers never have it,
+# so a failed lookup only warns instead of marking their run unverified.
+INSPECT_STATUS=$(stack_status "$INSPECT_STACK" "$REGION")
+case "$INSPECT_STATUS" in
+  GONE|DELETE_COMPLETE|REVIEW_IN_PROGRESS) ;;
+  UNKNOWN) warn "Could not check for the integ test inspect stack." ;;
+  *) REMAINING="${REMAINING}${INSPECT_STACK}"$'\t'"${INSPECT_STATUS}"$'\n' ;;
+esac
 # Any other stack under this prefix (one the app no longer synthesizes, or one still
 # being created at step 6) is a leftover too; a sibling deployment's are not ours.
 while IFS=$'\t' read -r NAME _; do
@@ -1100,7 +1140,10 @@ if [ "$DEFERRED" = true ] && [ "$NETWORK_FAILED" = false ] && [ -z "$OTHER_REMAI
     echo "The runtimes were deleted at $DELETED_AT; AWS releases their ENIs up to 8 hours later."
   fi
   echo "Then run this again to delete the rest:"
-  echo "  SCL_PREFIX=$PREFIX AWS_REGION=$REGION ./scripts/destroy.sh $ENV"
+  RERUN_VARS="SCL_PREFIX=$PREFIX AWS_REGION=$REGION"
+  [ -n "${SCL_VPC_ID:-}" ] && RERUN_VARS="$RERUN_VARS SCL_VPC_ID=$SCL_VPC_ID"
+  [ -n "${SCL_AOSS_VPC_ENDPOINT_ID:-}" ] && RERUN_VARS="$RERUN_VARS SCL_AOSS_VPC_ENDPOINT_ID=$SCL_AOSS_VPC_ENDPOINT_ID"
+  echo "  $RERUN_VARS ./scripts/destroy.sh $ENV"
   echo "Or by hand, once those ENIs are gone:"
   for SG_ID in ${PENDING_SG_IDS[@]+"${PENDING_SG_IDS[@]}"}; do
     echo "  aws ec2 delete-security-group --region $REGION --group-id $SG_ID"

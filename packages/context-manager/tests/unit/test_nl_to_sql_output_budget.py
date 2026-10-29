@@ -307,7 +307,7 @@ class TestClassTextNameParsing:
     def test_whitespace_only_class_text_is_skipped_not_raised(self):
         # `if text` is TRUE for "   " while `text.split()` yields no tokens, so the
         # old `text.split()[0]` raised IndexError here and failed the whole request.
-        assert _hit_map(self.BLANK_HITS) == {"orders": "Table: orders | Columns: id (int)"}
+        assert _hit_map(self.BLANK_HITS) == {"orders": {"3": "Table: orders | Columns: id (int)"}}
         assert _extract_table_names(self.BLANK_HITS) == ["orders"]
         assert _build_raw_context(self.BLANK_HITS, ["orders"]) == "Table: orders | Columns: id (int)"
 

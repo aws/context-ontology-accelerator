@@ -8,23 +8,27 @@ from __future__ import annotations
 from unittest.mock import AsyncMock
 
 import pytest
+import structlog.testing
 from coa_serve.clients.base import ConverseResult, VectorHit
 from coa_serve.tier2.nl_to_sql.sql_generator import (
     DEFAULT_MAX_TABLES,
     DEFAULT_RETRIEVAL_K,
     SQLGenerator,
     _build_raw_context,
+    _context_tables,
     _extract_confidence,
     _extract_sql,
     _extract_table_names,
+    _hit_map,
     _hit_table_source_map,
     _resolve_data_source_from_hits,
     _resolve_data_source_from_sql,
+    _resolve_data_source_from_table_sources,
     build_fk_adjacency,
     sql_table_routing,
     table_sources_need_preparation,
 )
-from coa_serve.tier2.table_qualifier import AMBIGUOUS_KEY
+from coa_serve.tier2.table_qualifier import AMBIGUOUS_KEY, ambiguous_reference, prepare_execution_sql
 
 
 @pytest.fixture
@@ -988,21 +992,24 @@ class TestTablePlacements:
         )
 
     @pytest.mark.asyncio
-    async def test_ambiguous_name_gets_no_database_hint(self, generator, mock_vector):
-        # Two classes named `orders` from two sources: main marks the name
-        # ambiguous so the query is refused, and the prompt must not claim one db.
+    async def test_same_name_tables_each_get_their_own_database_hint(self, generator, mock_vector):
+        # Two classes named `orders` from two sources: the bare name stays marked
+        # ambiguous (a bare reference is refused), and each class is shown with ITS
+        # database — never one database claimed for both.
         mock_vector.search.return_value = [
             VectorHit(id="1", text="Table: orders | Columns: id (int)", score=0.9, metadata={"data_source_id": "a"}),
-            VectorHit(id="2", text="Table: orders | Columns: id (int)", score=0.8, metadata={"data_source_id": "b"}),
+            VectorHit(id="2", text="Table: orders | Columns: no (int)", score=0.8, metadata={"data_source_id": "b"}),
         ]
 
-        async def resolver(_):
-            return {"orders": ("b", "db_b")}
+        async def resolver(table_sources):
+            return {t: (s, f"db_{s}") for t, s in table_sources.items()}
 
         result = await generator.generate("q", namespace="demo", table_placements=resolver)
 
-        assert result.table_sources == {"orders": "__ambiguous__"}
-        assert "Database:" not in result.ddl_context
+        assert result.table_sources == {"orders": "__ambiguous__", "db_a.orders": "a", "db_b.orders": "b"}
+        assert result.table_candidates == {"orders": ["db_a.orders", "db_b.orders"]}
+        assert "Table: orders | Database: db_a (write it as db_a.orders) | Columns: id (int)" in result.ddl_context
+        assert "Table: orders | Database: db_b (write it as db_b.orders) | Columns: no (int)" in result.ddl_context
 
     @pytest.mark.asyncio
     async def test_walked_lookup_table_is_placed_and_routed(self, mock_llm, mock_vector):
@@ -1055,3 +1062,540 @@ class TestTablePlacements:
             "acct_mstr": {"datasourceId": "s-ops"},
             "dim_dt": {AMBIGUOUS_KEY: "dim_dt"},
         }
+
+
+# Two Glue databases that each hold a `customers` table with different columns —
+# the shape of a pooled namespace whose induction minted `Customers` and
+# `Customers_<hash>`.
+_SALES_CUSTOMERS = VectorHit(
+    id="c-sales",
+    text="Table: customers | Columns: id (int), name (varchar), email (varchar), signup_date (date)",
+    score=0.9,
+    metadata={"data_source_id": "ds-sales", "uri": "https://x/kg#Customers"},
+)
+_CRM_CUSTOMERS = VectorHit(
+    id="c-crm",
+    text="Table: customers | Columns: customer_id (int), tier (varchar), points (int)",
+    score=0.8,
+    metadata={"data_source_id": "ds-crm", "uri": "https://x/kg#Customers_1a2b"},
+)
+_DATABASES = {"ds-sales": "sales_db", "ds-crm": "crm_db"}
+
+
+async def _placements(table_sources):
+    """Places each table in its own source's database, as the registry does for Glue sources."""
+    return {t: (s, _DATABASES[s]) for t, s in table_sources.items() if s in _DATABASES}
+
+
+class _Registry:
+    async def get_source(self, namespace, data_source_id):
+        return {"glueDatabaseName": _DATABASES[data_source_id]} if data_source_id in _DATABASES else {}
+
+
+@pytest.mark.unit
+class TestSameNameTables:
+    """Same-named tables in two databases: both reach the prompt, and routing tells them apart."""
+
+    @pytest.fixture
+    def same_name_generator(self, mock_llm, mock_vector):
+        mock_vector.search.return_value = [_SALES_CUSTOMERS, _CRM_CUSTOMERS]
+        return SQLGenerator(llm_client=mock_llm, vector_client=mock_vector)
+
+    async def _generate(self, generator, mock_llm, sql, *, placements=_placements):
+        mock_llm.converse.return_value = ConverseResult(text=f"```sql\n{sql}\n```\nConfidence: 0.9")
+        return await generator.generate(
+            "How many customers have gold tier?", namespace="ns", table_placements=placements
+        )
+
+    @pytest.mark.asyncio
+    async def test_both_schemas_reach_the_prompt_each_with_its_database(self, same_name_generator, mock_llm):
+        result = await self._generate(same_name_generator, mock_llm, "SELECT COUNT(*) FROM crm_db.customers")
+
+        prompt = mock_llm.converse.call_args.args[0]
+        for text in (
+            "Table: customers | Database: sales_db (write it as sales_db.customers) | Columns: id (int)",
+            "Table: customers | Database: crm_db (write it as crm_db.customers) | Columns: customer_id (int)",
+        ):
+            assert text in result.ddl_context
+            assert text in prompt
+        assert result.table_sources == {
+            "customers": "__ambiguous__",
+            "sales_db.customers": "ds-sales",
+            "crm_db.customers": "ds-crm",
+        }
+        assert result.table_candidates == {"customers": ["crm_db.customers", "sales_db.customers"]}
+
+    @pytest.mark.asyncio
+    async def test_context_log_lists_each_same_name_table(self, same_name_generator, mock_llm):
+        with structlog.testing.capture_logs() as logs:
+            await self._generate(same_name_generator, mock_llm, "SELECT 1")
+
+        entry = next(log for log in logs if log["event"] == "nl_to_sql_context")
+        assert entry["context_tables"] == ["sales_db.customers", "crm_db.customers"]
+
+    @pytest.mark.asyncio
+    async def test_both_schemas_reach_the_prompt_without_placements(self, same_name_generator, mock_llm):
+        # A namespace the registry cannot place (e.g. JDBC sources): no database is
+        # known, but the writer still sees both schemas, and the refusal names the
+        # two classes rather than repeating the bare name.
+        result = await self._generate(same_name_generator, mock_llm, "SELECT COUNT(*) FROM customers", placements=None)
+
+        assert "Columns: id (int), name (varchar)" in result.ddl_context
+        assert "Columns: customer_id (int), tier (varchar)" in result.ddl_context
+        assert "Database:" not in result.ddl_context
+        routing = sql_table_routing(result.sql, result.table_sources, result.table_candidates)
+        assert routing == {"customers": {AMBIGUOUS_KEY: "Customers,Customers_1a2b"}}
+
+    @pytest.mark.asyncio
+    async def test_bare_reference_is_refused_naming_both_candidates(self, same_name_generator, mock_llm):
+        sql = "SELECT COUNT(*) FROM customers WHERE tier = 'gold'"
+        result = await self._generate(same_name_generator, mock_llm, sql)
+
+        routing = sql_table_routing(sql, result.table_sources, result.table_candidates)
+        assert routing == {"customers": {AMBIGUOUS_KEY: "crm_db.customers,sales_db.customers"}}
+        assert ambiguous_reference(sql, routing) == (
+            "table reference 'customers' is ambiguous: it could be any of crm_db.customers,sales_db.customers"
+        )
+        assert result.data_source_id == ""
+
+    @pytest.mark.asyncio
+    async def test_qualified_reference_routes_to_its_own_source(self, same_name_generator, mock_llm):
+        sql = "SELECT COUNT(*) FROM crm_db.customers WHERE tier = 'gold'"
+        result = await self._generate(same_name_generator, mock_llm, sql)
+
+        routing = sql_table_routing(sql, result.table_sources, result.table_candidates)
+        assert routing["crm_db.customers"] == {"datasourceId": "ds-crm", "sourceSchema": "crm_db"}
+        # The sibling is listed (as the VKG translator does) so the qualifier sees
+        # the name is shared and adds the catalog.
+        assert routing["sales_db.customers"] == {"datasourceId": "ds-sales", "sourceSchema": "sales_db"}
+        assert "customers" not in routing
+        assert ambiguous_reference(sql, routing) is None
+        assert result.data_source_id == "ds-crm"
+
+        prepared = await prepare_execution_sql(sql, routing, _Registry(), namespace="ns")
+        assert prepared.error is None
+        executed = prepared.sql.replace('"', "")
+        assert executed == "SELECT COUNT(*) FROM awsdatacatalog.crm_db.customers WHERE tier = 'gold'"
+
+    @pytest.mark.asyncio
+    async def test_join_of_both_qualified_tables_routes_each(self, same_name_generator, mock_llm):
+        sql = (
+            "SELECT s.name, c.tier, c.points FROM sales_db.customers s "
+            'JOIN "crm_db"."customers" c ON s.id = c.customer_id'
+        )
+        result = await self._generate(same_name_generator, mock_llm, sql)
+
+        routing = sql_table_routing(sql, result.table_sources, result.table_candidates)
+        prepared = await prepare_execution_sql(sql, routing, _Registry(), namespace="ns")
+
+        assert prepared.error is None
+        executed = prepared.sql.replace('"', "")
+        assert "awsdatacatalog.sales_db.customers AS s" in executed
+        assert "awsdatacatalog.crm_db.customers AS c" in executed
+        assert result.data_source_id == ""  # two sources: pinned to neither
+
+    @pytest.mark.asyncio
+    async def test_qualified_reference_to_no_candidate_is_still_refused(self, same_name_generator, mock_llm):
+        sql = "SELECT COUNT(*) FROM other_db.customers"
+        result = await self._generate(same_name_generator, mock_llm, sql)
+
+        routing = sql_table_routing(sql, result.table_sources, result.table_candidates)
+        message = ambiguous_reference(sql, routing)
+        assert message is not None
+        assert "crm_db.customers,sales_db.customers" in message
+
+    @pytest.mark.asyncio
+    async def test_bare_and_qualified_mix_is_refused(self, same_name_generator, mock_llm):
+        sql = "SELECT * FROM crm_db.customers c JOIN customers s ON s.id = c.customer_id"
+        result = await self._generate(same_name_generator, mock_llm, sql)
+
+        routing = sql_table_routing(sql, result.table_sources, result.table_candidates)
+        assert ambiguous_reference(sql, routing) is not None
+
+    @pytest.mark.asyncio
+    async def test_reference_under_another_catalog_is_refused(self, same_name_generator, mock_llm):
+        # `crm_db` is a candidate, but not in `wrongcat`: routing it to the crm
+        # source would run it, fully qualified and untouched, against `wrongcat`.
+        sql = "SELECT COUNT(*) FROM wrongcat.crm_db.customers"
+        result = await self._generate(same_name_generator, mock_llm, sql)
+
+        routing = sql_table_routing(sql, result.table_sources, result.table_candidates)
+        assert routing == {"customers": {AMBIGUOUS_KEY: "crm_db.customers,sales_db.customers"}}
+        assert ambiguous_reference(sql, routing) == (
+            "table reference 'customers' is ambiguous: it could be any of crm_db.customers,sales_db.customers"
+        )
+        assert result.data_source_id == ""
+
+    @pytest.mark.asyncio
+    async def test_reference_under_the_glue_catalog_routes_to_its_source(self, same_name_generator, mock_llm):
+        sql = 'SELECT COUNT(*) FROM "AwsDataCatalog"."crm_db"."customers"'
+        result = await self._generate(same_name_generator, mock_llm, sql)
+
+        routing = sql_table_routing(sql, result.table_sources, result.table_candidates)
+        assert routing["crm_db.customers"] == {"datasourceId": "ds-crm", "sourceSchema": "crm_db"}
+        assert ambiguous_reference(sql, routing) is None
+        assert result.data_source_id == "ds-crm"
+        prepared = await prepare_execution_sql(sql, routing, _Registry(), namespace="ns")
+        assert prepared.error is None
+        assert prepared.sql == sql
+
+    @pytest.mark.asyncio
+    async def test_other_catalog_beside_the_right_one_is_refused(self, same_name_generator, mock_llm):
+        # The correct reference must not lend its routing entry to the wrong one.
+        sql = (
+            "SELECT * FROM awsdatacatalog.crm_db.customers c "
+            "JOIN wrongcat.crm_db.customers w ON w.customer_id = c.customer_id"
+        )
+        result = await self._generate(same_name_generator, mock_llm, sql)
+
+        routing = sql_table_routing(sql, result.table_sources, result.table_candidates)
+        assert routing == {"customers": {AMBIGUOUS_KEY: "crm_db.customers,sales_db.customers"}}
+        assert ambiguous_reference(sql, routing) is not None
+        assert result.data_source_id == ""
+
+    @pytest.mark.asyncio
+    async def test_two_classes_in_one_database_get_no_shared_hint(self, mock_llm, mock_vector):
+        # Two classes, one source and one database: the database cannot tell them
+        # apart, so neither is given a hint the other would share.
+        mock_vector.search.return_value = [
+            VectorHit(
+                id="a",
+                text="Table: claims | Columns: a (int)",
+                score=0.9,
+                metadata={"data_source_id": "ds-sales", "uri": "https://x#Claims"},
+            ),
+            VectorHit(
+                id="b",
+                text="Table: claims | Columns: b (int)",
+                score=0.8,
+                metadata={"data_source_id": "ds-sales", "uri": "https://x#Claims_9f"},
+            ),
+        ]
+        generator = SQLGenerator(llm_client=mock_llm, vector_client=mock_vector)
+
+        result = await self._generate(generator, mock_llm, "SELECT 1 FROM claims")
+
+        assert "Database:" not in result.ddl_context
+        assert result.table_sources == {"claims": "__ambiguous__"}
+        assert result.table_candidates == {"claims": ["Claims", "Claims_9f"]}
+
+    @pytest.mark.asyncio
+    async def test_placement_failure_degrades_to_unhinted_schemas(self, same_name_generator, mock_llm):
+        async def flaky(table_sources):
+            if len(table_sources) == 1:  # the per-source same-name lookups
+                raise RuntimeError("registry down")
+            return {}
+
+        result = await self._generate(same_name_generator, mock_llm, "SELECT 1", placements=flaky)
+
+        assert result.error is None
+        assert result.ddl_context.count("Table: customers") == 2
+        assert "Database:" not in result.ddl_context
+
+    def test_build_raw_context_renders_every_class_of_a_name(self):
+        hits = [_SALES_CUSTOMERS, _CRM_CUSTOMERS]
+
+        assert _build_raw_context(hits, ["customers"]).count("Table: customers") == 2
+        assert _context_tables(hits, ["customers"]) == ["customers", "customers"]
+
+    def test_same_class_text_retrieved_twice_renders_once(self):
+        twice = [_CRM_CUSTOMERS, VectorHit(id="dup", text=_CRM_CUSTOMERS.text, score=0.5, metadata={})]
+
+        assert _build_raw_context(twice, ["customers"]).count("Table: customers") == 1
+
+    @pytest.mark.asyncio
+    async def test_identical_schemas_in_two_sources_both_reach_the_prompt(self, mock_llm, mock_vector):
+        # Two databases holding a byte-identical `customers` table (same columns,
+        # same descriptions) are still two tables: each must reach the prompt with
+        # its own database, or the writer can only write a bare reference, which
+        # is refused. Identical text merges only within one source.
+        text = "Table: customers | Columns: id (int), name (varchar)"
+        mock_vector.search.return_value = [
+            VectorHit(
+                id="a", text=text, score=0.9, metadata={"data_source_id": "ds-sales", "uri": "https://x/kg#Customers"}
+            ),
+            VectorHit(
+                id="b",
+                text=text,
+                score=0.8,
+                metadata={"data_source_id": "ds-crm", "uri": "https://x/kg#Customers_1a2b"},
+            ),
+        ]
+        generator = SQLGenerator(llm_client=mock_llm, vector_client=mock_vector)
+
+        sql = "SELECT COUNT(*) FROM crm_db.customers"
+        result = await self._generate(generator, mock_llm, sql)
+
+        assert result.ddl_context.count("Table: customers") == 2
+        assert "write it as crm_db.customers" in result.ddl_context
+        assert "write it as sales_db.customers" in result.ddl_context
+        routing = sql_table_routing(sql, result.table_sources, result.table_candidates)
+        assert ambiguous_reference(sql, routing) is None
+        assert routing["crm_db.customers"]["datasourceId"] == "ds-crm"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("unsourced_at", [0, 1, 2])
+    async def test_unsourced_identical_text_does_not_hide_the_sourced_copies(self, mock_llm, mock_vector, unsourced_at):
+        # An unsourced hit (an uploaded ontology's class) with the same text as two
+        # sourced ones is no evidence of a table: wherever it ranks, both sourced
+        # copies reach the prompt with their databases, and it renders no line.
+        text = "Table: customers | Columns: id (int), name (varchar)"
+        hits = [
+            VectorHit(id="a", text=text, score=0.9, metadata={"data_source_id": "ds-crm", "uri": "urn:x#Customers"}),
+            VectorHit(id="b", text=text, score=0.8, metadata={"data_source_id": "ds-sales", "uri": "urn:x#Cust_1"}),
+        ]
+        hits.insert(unsourced_at, VectorHit(id="u", text=text, score=0.7, metadata={"uri": "urn:x#UploadedCustomers"}))
+        mock_vector.search.return_value = hits
+        generator = SQLGenerator(llm_client=mock_llm, vector_client=mock_vector)
+
+        result = await self._generate(generator, mock_llm, "SELECT COUNT(*) FROM crm_db.customers")
+
+        assert _hit_map(hits) == {"customers": {"urn:x#Customers": text, "urn:x#Cust_1": text}}
+        assert result.ddl_context.count("Table: customers") == 2
+        assert "write it as crm_db.customers" in result.ddl_context
+        assert "write it as sales_db.customers" in result.ddl_context
+
+    def test_unsourced_copy_alone_or_beside_one_source_renders_once(self):
+        text = "Table: customers | Columns: id (int)"
+        unsourced = VectorHit(id="u", text=text, score=0.7, metadata={"uri": "urn:x#Uploaded"})
+        sourced = VectorHit(id="a", text=text, score=0.9, metadata={"data_source_id": "ds-crm", "uri": "urn:x#C"})
+
+        assert _hit_map([unsourced, sourced]) == {"customers": {"urn:x#C": text}}
+        assert _hit_map([sourced, unsourced]) == {"customers": {"urn:x#C": text}}
+        assert _hit_map([unsourced, unsourced]) == {"customers": {"urn:x#Uploaded": text}}
+
+    def test_cte_named_like_the_shared_table_is_no_reference_to_it(self):
+        sources = {"customers": "__ambiguous__", "crm_db.customers": "ds-crm", "sales_db.customers": "ds-sales"}
+        candidates = {"customers": ["crm_db.customers", "sales_db.customers"]}
+        sql = "WITH customers AS (SELECT * FROM crm_db.customers) SELECT * FROM customers"
+
+        routing = sql_table_routing(sql, sources, candidates)
+
+        assert routing == {
+            "crm_db.customers": {"datasourceId": "ds-crm", "sourceSchema": "crm_db"},
+            "sales_db.customers": {"datasourceId": "ds-sales", "sourceSchema": "sales_db"},
+        }
+        assert ambiguous_reference(sql, routing) is None
+        assert _resolve_data_source_from_table_sources(sql, sources) == "ds-crm"
+
+    def test_resolve_data_source_prefers_the_qualified_candidate(self):
+        sources = {"customers": "__ambiguous__", "crm_db.customers": "ds-crm", "sales_db.customers": "ds-sales"}
+
+        assert _resolve_data_source_from_table_sources("SELECT 1 FROM crm_db.customers", sources) == "ds-crm"
+        assert _resolve_data_source_from_table_sources("SELECT 1 FROM customers", sources) == ""
+        assert (
+            _resolve_data_source_from_table_sources("SELECT 1 FROM AwsDataCatalog.crm_db.customers", sources)
+            == "ds-crm"
+        )
+        assert _resolve_data_source_from_table_sources("SELECT 1 FROM wrongcat.crm_db.customers", sources) == ""
+
+
+# One Glue database per study, each with a `ds` (disposition) table; and an SDTM
+# (human) and a SEND (animal) database that both hold `dm`.
+_STUDY_DATABASES = {
+    "src-101": "sdtm_cs101",
+    "src-102": "sdtm_cs102",
+    "src-103": "sdtm_cs103",
+    "src-sdtm": "sdtm_db",
+    "src-send": "send_db",
+}
+_DS_OWNERS = {"sdtm_cs101": "src-101", "sdtm_cs102": "src-102", "sdtm_cs103": "src-103"}
+
+
+def _study_hit(source_id, table="ds", columns="usubjid (varchar), dsdecod (varchar)"):
+    return VectorHit(
+        id=f"{table}-{source_id}",
+        text=f"Table: {table} | Columns: {columns}",
+        score=0.9,
+        metadata={"data_source_id": source_id, "uri": f"urn:x#{table}_{source_id}"},
+    )
+
+
+async def _study_placements(table_sources):
+    return {t: (s, _STUDY_DATABASES[s]) for t, s in table_sources.items() if s in _STUDY_DATABASES}
+
+
+def _owners(listing):
+    async def resolve(tables):
+        return {t: dict(listing[t]) for t in tables if t in listing}
+
+    return resolve
+
+
+@pytest.mark.unit
+class TestUnretrievedSameNameCopies:
+    """Retrieval returned only some of the tables that share a name: the rest still count."""
+
+    async def _generate(self, mock_llm, mock_vector, hits, sql, owners, question="How many patients enrolled?"):
+        mock_vector.search.return_value = hits
+        mock_llm.converse.return_value = ConverseResult(text=f"```sql\n{sql}\n```\nConfidence: 0.9")
+        generator = SQLGenerator(llm_client=mock_llm, vector_client=mock_vector)
+        return await generator.generate(
+            question,
+            namespace="ns",
+            table_placements=_study_placements,
+            same_name_databases=_owners(owners) if owners is not None else None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_single_retrieved_copy_of_a_multi_db_name_is_flagged(self, mock_llm, mock_vector):
+        sql = "SELECT count(*) FROM ds"
+        result = await self._generate(mock_llm, mock_vector, [_study_hit("src-102")], sql, {"ds": _DS_OWNERS})
+
+        # The writer is not steered to the one study retrieval happened to return.
+        assert "Database:" not in result.ddl_context
+        assert result.table_sources["ds"] == "__ambiguous__"
+        assert result.table_candidates == {"ds": ["sdtm_cs101.ds", "sdtm_cs102.ds", "sdtm_cs103.ds"]}
+        routing = sql_table_routing(sql, result.table_sources, result.table_candidates)
+        assert ambiguous_reference(sql, routing) == (
+            "table reference 'ds' is ambiguous: it could be any of sdtm_cs101.ds,sdtm_cs102.ds,sdtm_cs103.ds"
+        )
+        assert table_sources_need_preparation(result.table_sources)
+
+    @pytest.mark.asyncio
+    async def test_reference_naming_an_unretrieved_database_routes_to_it(self, mock_llm, mock_vector):
+        sql = "SELECT count(*) FROM sdtm_cs101.ds"
+        result = await self._generate(mock_llm, mock_vector, [_study_hit("src-102")], sql, {"ds": _DS_OWNERS})
+
+        routing = sql_table_routing(sql, result.table_sources, result.table_candidates)
+        assert routing["sdtm_cs101.ds"] == {"datasourceId": "src-101", "sourceSchema": "sdtm_cs101"}
+        assert ambiguous_reference(sql, routing) is None
+        assert result.data_source_id == "src-101"
+
+    @pytest.mark.asyncio
+    async def test_refusal_lists_unretrieved_candidates_from_glue_listing(self, mock_llm, mock_vector):
+        # Two of three copies retrieved: the refusal names all three, and neither
+        # retrieved copy gets a hint (an answer from two of three is still partial).
+        sql = "SELECT count(*) FROM ds"
+        hits = [_study_hit("src-101"), _study_hit("src-102", columns="usubjid (varchar)")]
+        result = await self._generate(mock_llm, mock_vector, hits, sql, {"ds": _DS_OWNERS})
+
+        assert result.ddl_context.count("Table: ds") == 2
+        assert "Database:" not in result.ddl_context
+        routing = sql_table_routing(sql, result.table_sources, result.table_candidates)
+        assert routing == {"ds": {AMBIGUOUS_KEY: "sdtm_cs101.ds,sdtm_cs102.ds,sdtm_cs103.ds"}}
+
+    @pytest.mark.asyncio
+    async def test_wrong_domain_single_copy(self, mock_llm, mock_vector):
+        # Only the animal-study `dm` was retrieved for a question about patients:
+        # the query must not run against it as if it were the only `dm`.
+        sql = "SELECT count(*) FROM dm"
+        hits = [_study_hit("src-send", table="dm", columns="usubjid (varchar), species (varchar)")]
+        owners = {"dm": {"sdtm_db": "src-sdtm", "send_db": "src-send"}}
+        result = await self._generate(mock_llm, mock_vector, hits, sql, owners, question="How many patients?")
+
+        routing = sql_table_routing(sql, result.table_sources, result.table_candidates)
+        assert ambiguous_reference(sql, routing) == (
+            "table reference 'dm' is ambiguous: it could be any of sdtm_db.dm,send_db.dm"
+        )
+
+    @pytest.mark.asyncio
+    async def test_every_copy_retrieved_keeps_each_database_hint(self, mock_llm, mock_vector):
+        hits = [_study_hit("src-101"), _study_hit("src-102", columns="usubjid (varchar)")]
+        owners = {"ds": {"sdtm_cs101": "src-101", "sdtm_cs102": "src-102"}}
+        result = await self._generate(mock_llm, mock_vector, hits, "SELECT 1 FROM sdtm_cs102.ds", owners)
+
+        assert "write it as sdtm_cs101.ds" in result.ddl_context
+        assert "write it as sdtm_cs102.ds" in result.ddl_context
+        assert not any(step["step"] == "same_name_partial" for step in result.trace_steps)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("owners", [None, {}], ids=["no-resolver", "name-in-one-database"])
+    async def test_name_in_one_database_is_unaffected(self, mock_llm, mock_vector, owners):
+        sql = "SELECT count(*) FROM ds"
+        result = await self._generate(mock_llm, mock_vector, [_study_hit("src-102")], sql, owners)
+
+        assert "write it as sdtm_cs102.ds" in result.ddl_context
+        assert result.table_sources == {"ds": "src-102"}
+        assert result.table_candidates == {}
+        assert result.data_source_id == "src-102"
+
+    @pytest.mark.asyncio
+    async def test_resolver_failure_leaves_routing_as_the_hits_decide(self, mock_llm, mock_vector):
+        async def failing(tables):
+            raise RuntimeError("catalog unreachable")
+
+        mock_vector.search.return_value = [_study_hit("src-102")]
+        mock_llm.converse.return_value = ConverseResult(text="```sql\nSELECT count(*) FROM ds\n```\nConfidence: 0.9")
+        generator = SQLGenerator(llm_client=mock_llm, vector_client=mock_vector)
+        result = await generator.generate(
+            "q", namespace="ns", table_placements=_study_placements, same_name_databases=failing
+        )
+
+        assert result.error is None
+        assert result.table_sources == {"ds": "src-102"}
+
+    @pytest.mark.asyncio
+    async def test_shared_name_line_lists_every_database_and_singles_none_out(self, mock_llm, mock_vector):
+        result = await self._generate(
+            mock_llm, mock_vector, [_study_hit("src-102")], "SELECT count(*) FROM ds", {"ds": _DS_OWNERS}
+        )
+
+        assert result.ddl_context.startswith(
+            "Table: ds | Databases: sdtm_cs101, sdtm_cs102, sdtm_cs103 (several databases hold this table: "
+            "qualify it with the database the question names, or read each of them) | Columns: "
+        )
+        assert "write it as" not in result.ddl_context
+        assert "Database:" not in result.ddl_context
+
+    @pytest.mark.asyncio
+    async def test_every_retrieved_copy_of_a_partial_name_lists_the_same_databases(self, mock_llm, mock_vector):
+        hits = [_study_hit("src-101"), _study_hit("src-102", columns="usubjid (varchar)")]
+        result = await self._generate(mock_llm, mock_vector, hits, "SELECT count(*) FROM ds", {"ds": _DS_OWNERS})
+
+        lines = result.ddl_context.splitlines()
+        assert len(lines) == 2
+        assert all("| Databases: sdtm_cs101, sdtm_cs102, sdtm_cs103 (" in line for line in lines)
+        assert "write it as" not in result.ddl_context
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("database", ["sdtm_cs101", "sdtm_cs102", "sdtm_cs103"])
+    async def test_question_naming_one_database_gets_a_routable_reference(self, mock_llm, mock_vector, database):
+        # A writer that qualifies the table only with a database its prompt line
+        # names for it, as the live writer does: with no database listed it wrote
+        # a bare `ds`, and the question was refused although it named the study.
+        mock_vector.search.return_value = [_study_hit("src-102")]
+        mock_llm.converse.side_effect = _schema_reading_writer
+        generator = SQLGenerator(llm_client=mock_llm, vector_client=mock_vector)
+        result = await generator.generate(
+            f"How many subjects are in the ds table of the {database} database?",
+            namespace="ns",
+            table_placements=_study_placements,
+            same_name_databases=_owners({"ds": _DS_OWNERS}),
+        )
+
+        assert result.sql == f"SELECT count(*) FROM {database}.ds"
+        routing = sql_table_routing(result.sql, result.table_sources, result.table_candidates)
+        assert ambiguous_reference(result.sql, routing) is None
+        assert routing[f"{database}.ds"]["datasourceId"] == _DS_OWNERS[database]
+        assert result.data_source_id == _DS_OWNERS[database]
+
+    @pytest.mark.asyncio
+    async def test_question_naming_no_database_still_gets_the_refusal(self, mock_llm, mock_vector):
+        mock_vector.search.return_value = [_study_hit("src-102")]
+        mock_llm.converse.side_effect = _schema_reading_writer
+        generator = SQLGenerator(llm_client=mock_llm, vector_client=mock_vector)
+        result = await generator.generate(
+            "How many subjects are there across all studies?",
+            namespace="ns",
+            table_placements=_study_placements,
+            same_name_databases=_owners({"ds": _DS_OWNERS}),
+        )
+
+        assert result.sql == "SELECT count(*) FROM ds"
+        routing = sql_table_routing(result.sql, result.table_sources, result.table_candidates)
+        assert routing == {"ds": {AMBIGUOUS_KEY: "sdtm_cs101.ds,sdtm_cs102.ds,sdtm_cs103.ds"}}
+
+
+async def _schema_reading_writer(prompt, **kwargs):
+    """A stub SQL writer: ``count(*)`` over ``ds``, qualified with a database only if
+    the question names one that the prompt's ``ds`` line lists (``Database:`` or ``Databases:``)."""
+    question = kwargs.get("guard_content") or ""
+    line = next((ln for ln in prompt.splitlines() if ln.startswith("Table: ds |")), "")
+    segment = line.split(" | ")[1] if line.count(" | ") >= 1 else ""
+    listed = []
+    if segment.startswith(("Database: ", "Databases: ")):
+        listed = [d.strip() for d in segment.split(": ", 1)[1].split(" (", 1)[0].split(",")]
+    named = next((d for d in listed if d and d in question), "")
+    table = f"{named}.ds" if named else "ds"
+    return ConverseResult(text=f"```sql\nSELECT count(*) FROM {table}\n```\nConfidence: 0.9")

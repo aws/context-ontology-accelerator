@@ -35,7 +35,6 @@ from urllib.parse import unquote
 import boto3
 import structlog
 from boto3.dynamodb.conditions import Attr
-from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 from coa_common import resolve_region
 from coa_common.constants import (
@@ -51,6 +50,7 @@ from coa_common.idempotency import idempotent_create
 from coa_common.language_tags import LanguageTagError
 from coa_common.logging import setup_logging
 from coa_common.response import api_response, iso_to_epoch
+from coa_common.s3 import regional_s3_client
 from coa_control_plane_server.models.create_source_input import CreateSourceInput
 from coa_control_plane_server.models.extraction_config import ExtractionConfig
 from coa_control_plane_server.models.get_source_output import GetSourceOutput
@@ -236,8 +236,8 @@ def _get_s3():
         # falls back to the deprecated SigV2 presigner in pre-2014 regions,
         # and SigV2-only regions can't presign at all. Only ContentType is
         # signed (see document_routes._handle_upload_urls), so browser PUTs
-        # stay valid under SigV4.
-        _s3 = boto3.client("s3", region_name=_AWS_REGION, config=Config(signature_version="s3v4"))
+        # stay valid under SigV4. Regional hostname: see regional_s3_client.
+        _s3 = regional_s3_client(_AWS_REGION)
     return _s3
 
 

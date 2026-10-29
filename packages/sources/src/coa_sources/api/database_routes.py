@@ -1471,6 +1471,14 @@ def _is_search_validation_error(exc: BaseException) -> bool:
     return cause.response.get("ResponseMetadata", {}).get("HTTPStatusCode") == 400
 
 
+# Names the range the route actually accepts (1-1000, values above 50 reduced to
+# 50), not the model's 1-50, so a caller is not told that 60 is invalid when it works.
+_MSG_LIST_SOURCE_TABLES_MAX_RESULTS = (
+    f"maxResults must be between 1 and {LIST_SOURCE_TABLES_LEGACY_MAX_RESULTS}; "
+    f"values above {LIST_SOURCE_TABLES_MAX_RESULTS} return at most {LIST_SOURCE_TABLES_MAX_RESULTS} tables"
+)
+
+
 def _handle_list_tables(event: dict[str, Any], namespace_id: str, source_id: str) -> dict[str, Any]:
     """GET /namespaces/{namespaceId}/sources/{sourceId}/tables."""
     from coa_common.datazone_forms import FORM_TYPE_NAME
@@ -1493,7 +1501,7 @@ def _handle_list_tables(event: dict[str, Any], namespace_id: str, source_id: str
     # The model bound is 1-50 (the DataZone Search page limit). 51-1000 was valid
     # under the earlier bound, so it is still reduced to 50 rather than rejected.
     if not 1 <= max_results <= LIST_SOURCE_TABLES_LEGACY_MAX_RESULTS:
-        return api_response(400, {"error": f"maxResults must be between 1 and {LIST_SOURCE_TABLES_MAX_RESULTS}"})
+        return api_response(400, {"error": _MSG_LIST_SOURCE_TABLES_MAX_RESULTS})
     max_results = min(max_results, LIST_SOURCE_TABLES_MAX_RESULTS)
 
     if review_status_filter:

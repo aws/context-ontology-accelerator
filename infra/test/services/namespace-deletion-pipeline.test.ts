@@ -7,6 +7,7 @@ import * as ec2 from "aws-cdk-lib/aws-ec2";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import { Template, Match, Capture } from "aws-cdk-lib/assertions";
 import { NamespaceDeletionPipeline } from "../../lib/stacks/services/namespace-deletion-pipeline";
+import { expectAossGrantsCoveredByDataPolicies } from "../utils/aoss-access-assertions";
 
 describe("NamespaceDeletionPipeline", () => {
   let template: Template;
@@ -29,6 +30,7 @@ describe("NamespaceDeletionPipeline", () => {
 
     new NamespaceDeletionPipeline(stack, "DeletionPipeline", {
       prefixed: (name: string) => `coa-dev-${name}`,
+      aossName: (name: string) => `coa-dev-${name}`,
       lambdaCode: lambda.Code.fromInline("def handler(event, context): pass"),
       vpc,
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
@@ -49,6 +51,10 @@ describe("NamespaceDeletionPipeline", () => {
     });
 
     template = Template.fromStack(stack);
+  });
+
+  test("names every aoss:APIAccessAll role in an AOSS data-access policy", () => {
+    expectAossGrantsCoveredByDataPolicies(template);
   });
 
   test("creates a Step Functions state machine with 1 hour timeout", () => {
@@ -256,6 +262,7 @@ describe("NamespaceDeletionPipeline GraphRAG index teardown", () => {
 
     new NamespaceDeletionPipeline(stack, "DeletionPipeline", {
       prefixed: (name: string) => `coa-dev-${name}`,
+      aossName: (name: string) => `coa-dev-${name}`,
       lambdaCode: lambda.Code.fromInline("def handler(event, context): pass"),
       vpc,
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
@@ -321,6 +328,7 @@ describe("NamespaceDeletionPipeline GraphRAG index teardown", () => {
 
     new NamespaceDeletionPipeline(stack, "DeletionPipeline", {
       prefixed: (name: string) => `coa-dev-${name}`,
+      aossName: (name: string) => `coa-dev-${name}`,
       lambdaCode: lambda.Code.fromInline("def handler(event, context): pass"),
       vpc,
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },

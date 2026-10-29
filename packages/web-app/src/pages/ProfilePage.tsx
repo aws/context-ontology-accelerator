@@ -28,6 +28,7 @@ import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
 import { useCurrentNamespace } from "@components/NamespaceProvider";
 import { useControlPlaneClient } from "@components/ControlPlaneClientProvider";
 import { formatTimestamp } from "@utils/helpers";
+import { localizePrincipalType } from "@utils/principal-type";
 import { useAppI18n, type AppTranslate } from "../i18n/LocaleProvider";
 
 function namespaceColumns(
@@ -116,7 +117,7 @@ export const ProfilePage: React.FC = () => {
     {
       id: "principalType",
       header: t("Principal type"),
-      cell: (g) => g.principalType ?? "—",
+      cell: (g) => localizePrincipalType(g.principalType, t),
     },
     {
       id: "namespace",

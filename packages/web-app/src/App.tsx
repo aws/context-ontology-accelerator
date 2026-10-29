@@ -24,6 +24,7 @@ import { NamespacePermissions } from "./pages/NamespacePermissions";
 import { TableDetail } from "./pages/TableDetail";
 import { ProfilePage } from "./pages/ProfilePage";
 import { Playground } from "./pages/Playground";
+import { McpPage } from "./pages/McpPage";
 import { TraceDetail } from "./pages/TraceDetail";
 import { SourceList } from "./pages/SourceList";
 import { ConnectSource } from "./pages/ConnectSource";
@@ -230,6 +231,11 @@ function AppShell() {
       section: t("Serve"),
       label: t("Playground"),
       href: "/playground",
+    },
+    {
+      section: t("Serve"),
+      label: t("MCP Server"),
+      href: "/mcp",
     },
     {
       section: t("Administration"),
@@ -507,6 +513,11 @@ function AppShell() {
                     text: t("Playground"),
                     href: "/playground",
                   },
+                  {
+                    type: "link",
+                    text: "MCP Server",
+                    href: "/mcp",
+                  },
                 ],
               },
               { type: "divider" },
@@ -624,6 +635,7 @@ function AppShell() {
               <Route path="/system-health" element={<SystemHealthPage />} />
               <Route path="/profile" element={<ProfilePage />} />
               <Route path="/playground" element={<Playground />} />
+              <Route path="/mcp" element={<McpPage />} />
               <Route
                 path="/playground/trace/:sessionId/:requestId"
                 element={<TraceDetail />}

@@ -163,6 +163,42 @@ export function localizeTraceStep(t: AppTranslate, stepId: string): string {
 }
 
 /**
+ * Trace step status → label. Same words as the Rationale panel's step list, so
+ * one step reads the same in the panel and on the Trace detail page; the
+ * colour comes from {@link mapTraceStatus}.
+ */
+export const TRACE_STATUS_LABELS: Readonly<Record<string, AppMessage>> = {
+  success: "Resolved",
+  succeeded: "Resolved",
+  ok: "Resolved",
+  allow: "Resolved",
+  completed: "Resolved",
+  skipped: "Skipped",
+  miss: "Skipped",
+  empty: "Empty",
+  error: "Error",
+  denied: "Denied",
+  failed: "Failed",
+  retry: "Retried",
+  retrying: "Retrying",
+  timeout: "Timed out",
+  degraded: "Degraded",
+  multi_metric_bypass: "Skipped",
+  residual_qualifier_bypass: "Skipped",
+};
+
+/** A trace step status in the reader's locale; unknown statuses stay raw. */
+export function localizeTraceStatus(t: AppTranslate, status: string): string {
+  const message = Object.prototype.hasOwnProperty.call(
+    TRACE_STATUS_LABELS,
+    status,
+  )
+    ? TRACE_STATUS_LABELS[status]
+    : undefined;
+  return message ? t(message) : status;
+}
+
+/**
  * Steps hidden from the inline TracePanel summary unless they failed/denied —
  * internal plumbing not useful to end users on the happy path.
  */

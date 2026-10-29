@@ -5,9 +5,14 @@ import * as cdk from "aws-cdk-lib";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import { Template, Match } from "aws-cdk-lib/assertions";
 import { expectIdempotencyWiring } from "../utils/idempotency-assertions";
+import {
+  LONG_PREFIX_CONTEXT,
+  expectValidAossNames,
+} from "../utils/aoss-name-assertions";
 import { NetworkStack } from "../../lib/stacks/foundation/network-stack";
 import { MetricServiceStack } from "../../lib/stacks/services/metric-service-stack";
 import { DEFAULT_BEDROCK_MODEL_ID } from "../../lib/constants";
+import { expectAossGrantsCoveredByDataPolicies } from "../utils/aoss-access-assertions";
 
 // Mock bundlePython to avoid fingerprinting the entire repo root during tests.
 jest.mock("../../lib/utils/python-bundling", () => ({
@@ -37,6 +42,10 @@ describe("MetricServiceStack", () => {
         env: TEST_ENV,
       }),
     );
+  });
+
+  it("names every aoss:APIAccessAll role in an AOSS data-access policy", () => {
+    expectAossGrantsCoveredByDataPolicies(template);
   });
 
   it("wires only the create-operation Lambda(s) to the idempotency table", () => {
@@ -666,5 +675,27 @@ describe("MetricServiceStack", () => {
     template.resourceCountIs("AWS::CloudWatch::Dashboard", 1);
     const alarms = template.findResources("AWS::CloudWatch::Alarm");
     expect(Object.keys(alarms).length).toBeGreaterThanOrEqual(2);
+  });
+});
+
+describe("MetricServiceStack with a long resource_prefix", () => {
+  it("keeps every OpenSearch Serverless name valid", () => {
+    const app = new cdk.App({
+      context: { ...TEST_CONTEXT, ...LONG_PREFIX_CONTEXT },
+    });
+    const network = new NetworkStack(app, "TestNetwork", { env: TEST_ENV });
+    const template = Template.fromStack(
+      new MetricServiceStack(app, "TestMetricService", {
+        vpc: network.vpc,
+        lambdaSecurityGroup: network.lambdaSecurityGroup,
+        aossSecurityGroup: network.aossSecurityGroup,
+        neptuneEndpoint:
+          "test-neptune.cluster-abc.us-east-1.neptune.amazonaws.com",
+        neptuneClusterArn:
+          "arn:aws:neptune-db:us-east-1:123456789012:cluster-abc123/*",
+        env: TEST_ENV,
+      }),
+    );
+    expectValidAossNames(template);
   });
 });

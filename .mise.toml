@@ -1,0 +1,18 @@
+[tools]
+python = "3.12"
+# Supported range for the whole repo is 17-24 (scripts/check-java-version.sh); 25+ breaks
+# the Athena Federation SDK the connectors bundle, and connectors/pom.xml enforces it too.
+java = "17"
+node = "22.23.4"
+# pnpm comes from the aqua backend (prebuilt release binaries), NOT `npm:pnpm`.
+# The npm backend resolves dependencies in the repo's workspace context, so it
+# tries to fetch the unpublished `@coa/control-plane-client` workspace package
+# from the registry and fails with "package not found".
+pnpm = "10.34.5"
+# Builds the Athena federation connectors' fat jars (connectors/, a Maven reactor).
+# Java above is not enough — nothing else in the repo compiles Java, so no job had a
+# build tool for it. Maven rather than Gradle because the Athena Query Federation SDK
+# ecosystem is Maven throughout: the SDK's `with-arrow` classifier, the shade plugin
+# that produces the fat jar, and every AWS connector sample a customer compares ours
+# against.
+maven = "3.9.16"

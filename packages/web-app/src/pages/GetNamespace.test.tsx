@@ -125,8 +125,8 @@ describe("GetNamespace", () => {
   it("renders VKG health, defaulting to UNKNOWN with an explanatory tooltip trigger", () => {
     render(<GetNamespace />, { wrapper });
     expect(screen.getByText("VKG health")).toBeInTheDocument();
-    // Namespace mock has no vkgHealth -> defaults to UNKNOWN.
-    const status = screen.getByText("UNKNOWN");
+    // Namespace mock has no vkgHealth -> defaults to UNKNOWN, shown as a word.
+    const status = screen.getByText("Unknown");
     expect(status).toBeInTheDocument();
     // Popover wraps the indicator as a text trigger (button role).
     expect(
@@ -138,7 +138,7 @@ describe("GetNamespace", () => {
     mockNamespace = { ...baseNamespace, vkgHealth: "DEGRADED" };
     render(<GetNamespace />, { wrapper });
     expect(screen.getByText("VKG health")).toBeInTheDocument();
-    const status = screen.getByText("DEGRADED");
+    const status = screen.getByText("Degraded");
     expect(status).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: /DEGRADED/i }),

@@ -2331,7 +2331,7 @@ class TestImportWorker:
         mock_claim.return_value = OffsetClaim(OffsetClaimState.ACQUIRED, "claim-token")
         metric_definition = self._mock_metric_definition("simple_count")
         mock_to_def.return_value = metric_definition
-        mock_neptune.return_value.get_metric.return_value = MagicMock(defined_by="steward@example.com")
+        mock_neptune.return_value.get_metric.return_value = MagicMock(defined_by="steward@example.com", label=None)
 
         _process_chunk(self._msg())
 
@@ -3471,16 +3471,16 @@ def test_import_worker_replays_durable_plan_and_accounts_once(moto_import_jobs_t
     neptune = MagicMock()
     physical_metrics: dict[str, object] = {}
     if initially_present:
-        physical_metrics["metric_0"] = MagicMock(defined_by="original steward")
+        physical_metrics["metric_0"] = MagicMock(defined_by="original steward", label=None)
 
     def get_metric(_namespace, name):
         return physical_metrics.get(name)
 
     def create_metric(_namespace, definition):
-        physical_metrics[definition.name] = MagicMock(defined_by="import-worker")
+        physical_metrics[definition.name] = MagicMock(defined_by="import-worker", label=None)
 
     def update_metric(_namespace, name, _definition):
-        physical_metrics[name] = MagicMock(defined_by="import-worker")
+        physical_metrics[name] = MagicMock(defined_by="import-worker", label=None)
 
     neptune.get_metric.side_effect = get_metric
     neptune.create_metric.side_effect = create_metric

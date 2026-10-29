@@ -24,6 +24,7 @@ export const MESSAGES_JA = {
   Home: "ホーム",
   Serve: "提供",
   Playground: "プレイグラウンド",
+  "MCP Server": "MCP サーバー",
   Administration: "管理",
   Namespaces: "名前空間",
   Identity: "ID 管理",
@@ -109,6 +110,8 @@ export const MESSAGES_JA = {
     "サインインに失敗しました。もう一度お試しください。",
   Standard: "標準",
   "Deep Reasoning": "深い推論",
+  "The SPARQL and SQL Deep Reasoning generated and {engine} executed.":
+    "深い推論が生成し、{engine} が実行した SPARQL と SQL。",
   "Execution mode": "実行モード",
   "New chat": "新しいチャット",
   Rationale: "根拠",
@@ -243,6 +246,8 @@ export const MESSAGES_JA = {
   Name: "名前",
   Owner: "所有者",
   "VKG health": "VKG の状態",
+  Unavailable: "利用不可",
+  Provisioning: "準備中",
   "The VKG translation service is running and able to translate queries.":
     "VKG 変換サービスは稼働中で、クエリを変換できます。",
   "A VKG task is running but its health check is failing, so it cannot translate queries (for example, the published mapping could not be loaded). Queries will fail — check the container's health status.":
@@ -595,6 +600,16 @@ export const MESSAGES_JA = {
   "Bucket ARN is required.": "バケット ARN は必須です。",
   "Must be a valid S3 bucket ARN.":
     "有効な S3 バケット ARN を指定してください。",
+  "S3 prefix must not be blank.":
+    "S3 プレフィックスを空にすることはできません。",
+  "S3 prefix must not start with a slash.":
+    "S3 プレフィックスをスラッシュで始めることはできません。",
+  'S3 prefix must not contain "..".':
+    "S3 プレフィックスに「..」を含めることはできません。",
+  'S3 prefix must not start with "s3://".':
+    "S3 プレフィックスを「s3://」で始めることはできません。",
+  "S3 prefix contains invalid characters.":
+    "S3 プレフィックスに使用できない文字が含まれています。",
   "Fix the errors above.": "上記のエラーを修正してください。",
   "Upload failed. Please try again.":
     "アップロードに失敗しました。もう一度お試しください。",
@@ -690,6 +705,20 @@ export const MESSAGES_JA = {
   "e.g. Black Tie Gala, Quiet Luxury":
     "例: ブラックタイ・ガラ、クワイエット・ラグジュアリー",
   "Preferred topic names": "優先トピック名",
+  "Enter a label.": "ラベルを入力してください。",
+  "Labels must be {max} characters or fewer.":
+    "ラベルは {max} 文字以内で入力してください。",
+  "You can add at most {max} labels.":
+    "ラベルは最大 {max} 個まで追加できます。",
+  '"{label}" duplicates a label you have already added.':
+    "「{label}」はすでに追加したラベルと重複しています。",
+  "Enter a topic name.": "トピック名を入力してください。",
+  "Topic names must be {max} characters or fewer.":
+    "トピック名は {max} 文字以内で入力してください。",
+  "You can add at most {max} topics.":
+    "トピックは最大 {max} 個まで追加できます。",
+  '"{topic}" duplicates a topic you have already added.':
+    "「{topic}」はすでに追加したトピックと重複しています。",
   "{count} classes. Long lists measurably reduce how closely the extractor follows them.":
     "{count} クラスあります。長いリストでは抽出時の追従精度が低下します。",
   "“{typed}” as “{stored}”": "「{typed}」を「{stored}」として",
@@ -732,6 +761,30 @@ export const MESSAGES_JA = {
   "Cross-account access (optional)": "クロスアカウントアクセス（任意）",
   "Role ARN": "ロール ARN",
   "Advanced options": "詳細オプション",
+  "Chunk size": "チャンクサイズ",
+  "How much text goes into each unit that is extracted and embedded. A larger chunk keeps a full table row and its header together; raise it for CJK or dense, tabular documents.":
+    "抽出と埋め込みを行う 1 単位に入れるテキストの量です。チャンクを大きくすると、表の 1 行とその見出しが同じチャンクに収まります。日本語などの CJK の文書や、表の多い文書では大きくしてください。",
+  "Default (256 tokens)": "既定（256 トークン）",
+  "Suits prose.": "文章が中心の文書に向いています。",
+  "Large, for tabular or CJK text (1024 tokens)":
+    "大（表や CJK のテキスト向け、1024 トークン）",
+  "Keeps a full table row and its header in one chunk.":
+    "表の 1 行とその見出しを 1 つのチャンクに収めます。",
+  Custom: "カスタム",
+  "Set the chunk size and overlap in tokens.":
+    "チャンクサイズとオーバーラップをトークン数で指定します。",
+  "Chunk size (tokens)": "チャンクサイズ（トークン）",
+  "A whole number from 1 to {max}.": "1〜{max} の整数です。",
+  "Chunk overlap (tokens)": "チャンクのオーバーラップ（トークン）",
+  "Default (25 tokens)": "既定（25 トークン）",
+  "Optional. Leave empty to use {overlap}. Must be smaller than the chunk size.":
+    "任意です。空欄のときは {overlap} を使います。チャンクサイズより小さくしてください。",
+  "Enter a whole number from 1 to {max}.":
+    "1〜{max} の整数を入力してください。",
+  "Enter a whole number from 1 to {max}, or leave it empty.":
+    "1〜{max} の整数を入力するか、空欄にしてください。",
+  "Must be larger than the overlap ({overlap} tokens).":
+    "オーバーラップ（{overlap} トークン）より大きくしてください。",
   "Tracks document versions in Neptune.":
     "Neptune で文書のバージョンを追跡します。",
   "Enable versioning": "バージョン管理を有効化",
@@ -1154,6 +1207,7 @@ export const MESSAGES_JA = {
   accepting: "承認中",
   pending: "待機中",
   updated: "更新済み",
+  cancelled: "キャンセル済み",
   "Failed to delete ontology: {error}":
     "オントロジーを削除できませんでした: {error}",
   "Failed to delete ontology": "オントロジーを削除できませんでした",
@@ -1248,6 +1302,20 @@ export const MESSAGES_JA = {
   "Graph view": "グラフ表示",
   "Some details couldn't be loaded.": "一部の詳細を読み込めませんでした。",
   Retry: "再試行",
+  "Access denied": "アクセスが拒否されました",
+  "Query resolution timed out": "質問の処理がタイムアウトしました",
+  "Query resolution failed": "質問を処理できませんでした",
+  "No result for this question": "この質問に対する結果はありませんでした",
+  "The question could not be turned into a query":
+    "質問をクエリに変換できませんでした",
+  "A table in the question matches more than one source":
+    "質問内のテーブルが複数のデータソースに一致します",
+  "A data source is unavailable": "データソースを利用できません",
+  "Received malformed response from server":
+    "サーバーの応答の形式が正しくありません",
+  "Your session has expired. Sign in again.":
+    "セッションの有効期限が切れました。もう一度サインインしてください。",
+  "The request failed": "リクエストに失敗しました",
   "Kind:": "種別:",
   "Description:": "説明:",
   "Synonyms:": "同義語:",
@@ -1434,6 +1502,7 @@ export const MESSAGES_JA = {
   reference: "参照",
   datatype: "データ型",
   "SHACL Constraints": "SHACL 制約",
+  Beta: "ベータ",
   "SHACL constraints": "SHACL 制約",
   "About SHACL constraints": "SHACL 制約について",
   "Formal data-quality rules for this ontology (required fields, uniqueness, value ranges, references).":
@@ -1568,6 +1637,21 @@ export const MESSAGES_JA = {
   "Proposal {id}…": "提案 {id}…",
   "Unsaved edits. Click Save changes to upload.":
     "未保存の編集があります。「変更を保存」をクリックしてアップロードしてください。",
+  "Choose which edits to save": "保存する編集を選択してください",
+  "Discard grounding choices": "グラウンディングの選択を破棄",
+  "Discard Turtle edits": "Turtle の編集を破棄",
+  "Grounding choices rebuild the ontology, so grounding and Turtle edits must be saved separately.":
+    "グラウンディングの選択によってオントロジーが作り直されるため、グラウンディングと Turtle の編集は別々に保存する必要があります。",
+  "Grounding overrides and Turtle edits must be saved separately":
+    "グラウンディングの変更と Turtle の編集は別々に保存してください",
+  "Could not save changes": "変更を保存できませんでした",
+  "{message} Nothing was saved, so you can retry this save as-is.":
+    "{message} 何も保存されていないため、このまま保存をやり直せます。",
+  "The server refused this save: {message} Retrying unchanged will fail the same way.":
+    "サーバーがこの保存を拒否しました: {message} 変更せずにやり直しても同じように失敗します。",
+  "This save was rejected as malformed: {message}":
+    "形式が正しくないため、この保存は拒否されました: {message}",
+  "Failed to save proposal changes": "提案の変更を保存できませんでした",
   Failed: "失敗",
   "Previous accept attempt failed": "前回の承認処理に失敗しました",
   "Accepting proposal…": "提案を承認中…",
@@ -1706,6 +1790,11 @@ export const MESSAGES_JA = {
   "Grounded class": "グラウンディング済みクラス",
   "Full screen": "全画面表示",
   "Exit full screen": "全画面表示を終了",
+  "Control Panel": "操作パネル",
+  "Zoom In": "拡大",
+  "Zoom Out": "縮小",
+  "Fit View": "全体を表示",
+  "Mini Map": "ミニマップ",
   "Show {count} standalone class": "孤立したクラス {count} 件を表示",
   "Show {count} standalone classes": "孤立したクラス {count} 件を表示",
   Reject: "却下",
@@ -1775,6 +1864,7 @@ export const MESSAGES_JA = {
   "Amazon Bedrock Converse — LLM for entity descriptions and induction":
     "Amazon Bedrock Converse — エンティティ説明と誘導用の LLM",
   "Trace detail": "トレース詳細",
+  "Trace {requestId}": "トレース {requestId}",
   "Loading trace for request {id}...":
     "リクエスト {id} のトレースを読み込んでいます...",
   unknown: "不明",
@@ -2183,6 +2273,8 @@ export const MESSAGES_JA = {
     "{total} テーブル中 {processed} 件を処理済み",
   "Tables already reviewed count as processed without being regenerated.":
     "レビュー済みのテーブルは再生成せずに処理済みとして数えます。",
+  "A filter had no effect on the last scan":
+    "前回のスキャンで効果がなかったフィルターがあります",
   "Failed to load tables": "テーブルを読み込めませんでした",
   "The table list could not be retrieved.":
     "テーブル一覧を取得できませんでした。",

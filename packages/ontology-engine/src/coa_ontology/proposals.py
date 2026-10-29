@@ -39,6 +39,7 @@ from urllib.parse import urlsplit
 from botocore.exceptions import ClientError
 from coa_common import sql_ident as _sql_ident
 from coa_common.constants import EVENT_SOURCE_PREFIX, VOCAB_URI, split_sql_ident_path
+from coa_control_plane_server.models.induction_source_type import InductionSourceType
 from coa_control_plane_server.models.proposal_status import ProposalStatus
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import JSONResponse
@@ -54,6 +55,7 @@ from coa_ontology.catalog.ingest import (
     wait_for_embeddings_searchable,
 )
 from coa_ontology.pagination import InvalidNextToken, decode_next_token, page_body
+from coa_ontology.query_params import require_enum_value
 from coa_ontology.stores import build_stores as _build_stores  # noqa: F401 (re-exported for tests)
 
 if TYPE_CHECKING:
@@ -1024,18 +1026,19 @@ def list_proposals(
     ``ontology_id`` still bind for existing callers; the contract spelling wins
     when both are sent.
 
-    The ``source_type`` query parameter is forwarded to
+    ``status`` and ``source_type`` must be a ``ProposalStatus`` /
+    ``InductionSourceType`` value; anything else is a 400, so a typo is not
+    mistaken for "no proposals". ``source_type`` is then forwarded to
     :func:`dynamo_store.list_proposals` unchanged — see that function's
     docstring for the filter semantics, including the backfill rule
-    for pre-schema-delta items that lack the attribute. The route does
-    not validate the value (no ``Literal`` restriction): unknown values
-    simply produce no matches, which lets the route degrade gracefully
-    if a client sends a stale enum member.
+    for pre-schema-delta items that lack the attribute.
 
     Proposals are returned newest first (by ``created_at``); ``limit`` /
     ``maxResults`` therefore keep the newest matches, and later pages continue
     with older ones.
     """
+    require_enum_value("status", status, ProposalStatus)
+    require_enum_value("source_type", source_type, InductionSourceType)
     scope = proposals_list_scope(namespace)
     try:
         start_key = decode_next_token(next_token, scope=scope)

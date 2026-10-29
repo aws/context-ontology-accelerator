@@ -48,6 +48,24 @@ describe("ChatInput", () => {
     expect(defaultProps.onSubmit).toHaveBeenCalledTimes(1);
   });
 
+  it("calls onSubmit when Enter is pressed", () => {
+    render(<ChatInput {...defaultProps} value="売上合計を教えて" />);
+    fireEvent.keyDown(screen.getByRole("textbox", { name: "Query" }), {
+      key: "Enter",
+    });
+    expect(defaultProps.onSubmit).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not submit on the Enter that confirms an IME conversion", () => {
+    render(<ChatInput {...defaultProps} value="売上合計" />);
+    const input = screen.getByRole("textbox", { name: "Query" });
+    // Chrome and Firefox flag the confirming keydown as composing.
+    fireEvent.keyDown(input, { key: "Enter", isComposing: true });
+    // Safari has already ended the composition, but reports key code 229.
+    fireEvent.keyDown(input, { key: "Enter", keyCode: 229 });
+    expect(defaultProps.onSubmit).not.toHaveBeenCalled();
+  });
+
   it("accepts a custom placeholder", () => {
     render(<ChatInput {...defaultProps} placeholder="Custom placeholder" />);
     expect(

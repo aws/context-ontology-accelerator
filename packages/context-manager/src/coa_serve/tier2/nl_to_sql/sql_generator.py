@@ -18,6 +18,7 @@ Execution is handled by the orchestrator — this component only generates SQL.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import time
@@ -25,11 +26,14 @@ from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
+import sqlglot
 import structlog
+from coa_common.constants import sql_ident
+from sqlglot.dialects.trino import Trino
 
 from ...clients.base import ConverseResult, LLMClient, VectorClient, VectorHit
 from ..sql_firewall import SQLFirewall
-from ..table_qualifier import AMBIGUOUS_KEY, AMBIGUOUS_SOURCE
+from ..table_qualifier import AMBIGUOUS_KEY, AMBIGUOUS_SOURCE, real_tables
 
 # Matches opening OR closing <user_context> tags, case-insensitively and
 # tolerant of surrounding whitespace (e.g. "</USER_CONTEXT>",
@@ -308,6 +312,10 @@ class GraphExpander(Protocol):
 # {bare table: data_source_id ("" if unplaced)} -> {bare table: (source_id, database)}.
 TablePlacementResolver = Callable[[dict[str, str]], Awaitable[dict[str, tuple[str, str]]]]
 
+# [bare table] -> {bare table: {database: data_source_id}}, for the names two or more
+# of the namespace's databases hold, whether or not retrieval returned each copy.
+SameNameDatabaseResolver = Callable[[list[str]], Awaitable[dict[str, dict[str, str]]]]
+
 
 @dataclass
 class NLtoSQLResult:
@@ -328,7 +336,15 @@ class NLtoSQLResult:
     # _hit_table_source_map). Carried so the strategy can qualify CROSS-SOURCE
     # SQL per shot — including corrected SQL, whose table set may differ — without
     # holding on to the retrieval hits. Pass it through ``sql_table_routing``.
+    # A name two classes claim maps to ``AMBIGUOUS_SOURCE``; each of those classes
+    # whose database is known is ALSO listed under ``"<database>.<table>"``, so a
+    # reference the writer qualified still routes to its own source.
     table_sources: dict[str, str] = field(default_factory=dict)
+    # Bare table name -> the candidates a bare reference to it could mean, for
+    # every name in ``table_sources`` marked ambiguous by the retrieval hits
+    # (``"<database>.<table>"`` where the database is known). Named in the
+    # refusal, so the user can tell which tables collided.
+    table_candidates: dict[str, list[str]] = field(default_factory=dict)
 
 
 class SQLGenerator:
@@ -424,6 +440,7 @@ class SQLGenerator:
         graph_expander: GraphExpander | None = None,
         governed_metric: str = "",
         table_placements: TablePlacementResolver | None = None,
+        same_name_databases: SameNameDatabaseResolver | None = None,
     ) -> NLtoSQLResult:
         """Run the NL-to-SQL pipeline: retrieve → expand → generate SQL.
 
@@ -456,6 +473,14 @@ class SQLGenerator:
                 so a query joining two databases names each one, and a table whose
                 class carried no ``data_source_id`` (a top-down ontology) is routed
                 to the placed source. ``None``, or an empty mapping (every
+                single-database namespace), leaves prompt and routing unchanged.
+            same_name_databases: Optional resolver from bare table names to
+                ``{name: {database: source_id}}`` for every name two or more of
+                the namespace's databases hold. A name it lists whose copies did
+                not all reach the prompt is treated as shared: its prompt line
+                lists every database that holds it (no ``write it as`` for one
+                copy), a bare reference is refused naming every database, and a
+                qualified one is routed to that database. ``None``, or an empty mapping (every
                 single-database namespace), leaves prompt and routing unchanged.
         """
         trace: list[dict[str, Any]] = []
@@ -647,9 +672,61 @@ class SQLGenerator:
             if placements:
                 trace.append({"step": "table_placements", "status": "ok", "databases": databases})
 
+        # Step 3d: a name two classes claim (``customers`` in two databases). Both
+        # classes reach the prompt (see `_hit_map`), each with its OWN database where
+        # one is known, so the writer can name the table it means; a reference it
+        # qualifies routes to that class's source (see `sql_table_routing`), and a
+        # bare one is refused naming every candidate.
+        collisions = _hit_table_collisions(hits)
+        class_databases: dict[str, str] = {}
+        if collisions and table_placements is not None:
+            class_databases = await _collision_databases(collisions, table_placements)
+        table_candidates: dict[str, list[str]] = {}
+        for name, by_identity in collisions.items():
+            labels: set[str] = set()
+            for identity, ds_id in by_identity.items():
+                database = class_databases.get(identity, "")
+                if database:
+                    table_sources[f"{database}.{name}"] = ds_id
+                    labels.add(f"{database}.{name}")
+                else:
+                    labels.add(_class_label(identity, name))
+            table_candidates[name] = sorted(labels)
+
+        # Step 3e: a name more databases hold than the prompt shows (retrieval kept
+        # one `ds` of seven). See `_apply_unretrieved_copies`.
+        shared_databases: dict[str, list[str]] = {}
+        if same_name_databases is not None:
+            prompt_names = {
+                name
+                for hit in hits
+                if (name := _table_name_from_class_text(hit.metadata.get("context_text") or hit.text))
+            }
+            prompt_names.update(n for walked in graph_tables if (n := str(walked.get("table") or "").strip().lower()))
+            owners: dict[str, dict[str, str]] = {}
+            try:
+                owners = await same_name_databases(sorted(prompt_names)) if prompt_names else {}
+            except Exception as e:
+                # An enrichment like the placements: an unreachable registry/catalog
+                # leaves routing as the hits alone decide it.
+                logger.warning("nl_to_sql_same_name_databases_failed", error=f"{type(e).__name__}: {str(e)[:120]}")
+            partial = _apply_unretrieved_copies(
+                owners, collisions, table_sources, databases, class_databases, table_candidates, shared_databases
+            )
+            if partial:
+                trace.append({"step": "same_name_partial", "status": "ok", "tables": partial})
+        if table_candidates:
+            trace.append(
+                {
+                    "step": "same_name_tables",
+                    "status": "ok",
+                    "candidates": {name: table_candidates[name] for name in sorted(table_candidates)},
+                }
+            )
+
         # Step 4: Build context from class metadata (raw text — no DDL reformatting)
-        ddl_context = _build_raw_context(hits, expanded_tables, databases)
-        graph_block, graph_added = _graph_context_block(expanded_tables, graph_tables, databases)
+        ddl_context = _build_raw_context(hits, expanded_tables, databases, class_databases, shared_databases)
+        graph_block, graph_added = _graph_context_block(expanded_tables, graph_tables, databases, shared_databases)
         if graph_block:
             # Appended AFTER the retrieved block, and never in place of it: a
             # walk-derived schema has no sampled values, so overwriting a retrieved
@@ -672,7 +749,7 @@ class SQLGenerator:
         # too. Without this the line reports fewer tables than the writer saw,
         # which is exactly the misreading the `context_tables` field was added to
         # stop. Appended once: `expanded_tables` already carries them by here.
-        context_tables = _context_tables(hits, expanded_tables) + graph_added
+        context_tables = _context_tables(hits, expanded_tables, class_databases) + graph_added
         logger.info(
             "nl_to_sql_context",
             namespace=namespace,
@@ -719,6 +796,7 @@ class SQLGenerator:
             data_source_id=resolved_source,
             ddl_context=ddl_context,
             table_sources=table_sources,
+            table_candidates=table_candidates,
         )
 
     async def generate_from_context(
@@ -1014,12 +1092,16 @@ def hit_class_iri(hit: VectorHit) -> str:
 
 
 def _graph_context_block(
-    existing_tables: Iterable[str], graph_tables: list[dict[str, Any]], databases: dict[str, str] | None = None
+    existing_tables: Iterable[str],
+    graph_tables: list[dict[str, Any]],
+    databases: dict[str, str] | None = None,
+    shared_databases: dict[str, list[str]] | None = None,
 ) -> tuple[str, list[str]]:
     """``(prompt block, added table names)`` for walk-discovered tables.
 
-    A table in ``databases`` gets its database after its name, as a retrieved
-    table does (see :func:`_with_database`).
+    A table in ``databases`` gets its database after its name, and one in
+    ``shared_databases`` every database that holds it, as a retrieved table does
+    (see :func:`_with_database`).
 
     Tables the retrieved block already carries are dropped: their retrieved text is
     strictly richer, and listing a table twice invites the writer to treat two
@@ -1037,6 +1119,7 @@ def _graph_context_block(
     """
     have = {t.strip().lower() for t in existing_tables if t and t.strip()}
     databases = databases or {}
+    shared_databases = shared_databases or {}
     lines: list[str] = []
     added: list[str] = []
     for t in graph_tables:
@@ -1046,7 +1129,7 @@ def _graph_context_block(
             continue
         have.add(name.lower())
         added.append(name)
-        schema = _with_database(schema, name, databases.get(name.lower(), ""))
+        schema = _with_database(schema, name, databases.get(name.lower(), ""), shared_databases.get(name.lower()))
         via = str(t.get("via") or "").strip()
         lines.append(f"{schema}\n  -- reached via: {via}" if via else schema)
     if not lines:
@@ -1079,6 +1162,45 @@ def _resolve_data_source_from_hits(hits: list[VectorHit]) -> str:
 
 _AMBIGUOUS_SOURCE = AMBIGUOUS_SOURCE
 
+# The catalog every ``database.table`` candidate key in ``table_sources`` lives in.
+# Those keys come only from the ``table_placements`` resolver, which answers for
+# root-catalog Glue databases alone (``SourcesRegistry.native_glue_databases``),
+# so Athena's built-in Glue catalog is the only one a three-part reference to a
+# candidate may name.
+_CANDIDATE_CATALOG = "awsdatacatalog"
+
+
+def _hit_identity(hit: VectorHit, name: str) -> str:
+    """The class a hit describes: its IRI, else its doc id, else its table name.
+
+    A table name is not identity in a namespace pooling several databases (two
+    ``customers`` tables are two classes), so everything that tells same-named
+    tables apart keys on this instead.
+    """
+    return str(hit.metadata.get("uri") or hit.id or name)
+
+
+def _hit_classes_by_name(hits: list[VectorHit]) -> dict[str, dict[str, str]]:
+    """Lowercased table name -> ``{class identity: data_source_id}`` for every sourced hit."""
+    by_name: dict[str, dict[str, str]] = {}
+    for hit in hits:
+        ds_id = hit.data_source_id
+        if not ds_id:
+            continue
+        name = _table_name_from_class_text(hit.text or "")
+        if not name:
+            continue
+        by_name.setdefault(name, {})[_hit_identity(hit, name)] = ds_id
+    return by_name
+
+
+def _hit_table_collisions(hits: list[VectorHit]) -> dict[str, dict[str, str]]:
+    """The names more than one class claims: ``{name: {class identity: data_source_id}}``.
+
+    Exactly the names :func:`_hit_table_source_map` marks ``_AMBIGUOUS_SOURCE``.
+    """
+    return {name: by_identity for name, by_identity in _hit_classes_by_name(hits).items() if len(by_identity) > 1}
+
 
 def _hit_table_source_map(hits: list[VectorHit]) -> dict[str, str]:
     """Map lowercased table name -> data_source_id from class hits.
@@ -1097,32 +1219,178 @@ def _hit_table_source_map(hits: list[VectorHit]) -> dict[str, str]:
     source and the query silently ran against whichever schema the executor
     defaulted to — returning a wrong answer as success. The class IRI
     distinguishes them, and ``_resolve_data_source_from_sql`` /
-    ``sql_table_routing`` both treat an ambiguous table as unroutable so the query
-    is refused rather than mis-routed. Two hits for the SAME class (same IRI, e.g.
-    retrieved via different expansions) are not a collision.
+    ``sql_table_routing`` both treat a BARE reference to an ambiguous table as
+    unroutable so the query is refused rather than mis-routed. Two hits for the
+    SAME class (same IRI, e.g. retrieved via different expansions) are not a
+    collision. The candidates themselves are kept by :func:`_hit_table_collisions`;
+    :meth:`SQLGenerator.generate` adds each one whose database is known under
+    ``"<database>.<table>"``, which is how a qualified reference still routes.
     """
-    # name -> {class identity: data_source_id}. A name with two identities is
-    # ambiguous regardless of whether their source ids agree.
-    by_name: dict[str, dict[str, str]] = {}
-    for hit in hits:
-        ds_id = hit.data_source_id
-        if not ds_id:
-            continue
-        name = _table_name_from_class_text(hit.text or "")
-        if not name:
-            continue
-        # The class IRI is the stable per-class identity; fall back to the doc id
-        # and then the name so a hit missing both is still counted once.
-        identity = hit.metadata.get("uri") or hit.id or name
-        by_name.setdefault(name, {})[identity] = ds_id
-
     mapping: dict[str, str] = {}
-    for name, by_identity in by_name.items():
+    for name, by_identity in _hit_classes_by_name(hits).items():
         if len(by_identity) > 1:
             mapping[name] = _AMBIGUOUS_SOURCE
         else:
             mapping[name] = next(iter(by_identity.values()))
     return mapping
+
+
+async def _collision_databases(
+    collisions: dict[str, dict[str, str]], table_placements: TablePlacementResolver
+) -> dict[str, str]:
+    """Class identity -> database for the classes of each same-named table.
+
+    Asks the resolver once per candidate SOURCE (``{name: that source}``), since
+    it answers one database per bare name per call and the point here is the
+    database of every candidate. A class gets a database only when no other
+    class of the same name resolves to the same one: two schemas of one source
+    resolve to one database and stay apart only by their class, so neither is
+    given a hint the other would share. Any resolver failure gives no hints,
+    exactly as the main placement step degrades.
+    """
+    requests_by_source: dict[str, dict[str, str]] = {}
+    for name, by_identity in collisions.items():
+        for ds_id in by_identity.values():
+            requests_by_source.setdefault(ds_id, {})[name] = ds_id
+    sources = list(requests_by_source)
+    try:
+        results = await asyncio.gather(*(table_placements(requests_by_source[ds_id]) for ds_id in sources))
+    except Exception as e:
+        logger.warning("nl_to_sql_same_name_placements_failed", error=f"{type(e).__name__}: {str(e)[:120]}")
+        return {}
+    placed: dict[tuple[str, str], str] = {}
+    for ds_id, result in zip(sources, results, strict=True):
+        for table, (source_id, database) in (result or {}).items():
+            # Only the asked source's own database: a resolver that answers with a
+            # different source is describing some other table.
+            if source_id == ds_id and database:
+                placed[(table.lower(), ds_id)] = database.lower()
+    out: dict[str, str] = {}
+    for name, by_identity in collisions.items():
+        found = {identity: placed.get((name, ds_id), "") for identity, ds_id in by_identity.items()}
+        known = [database for database in found.values() if database]
+        for identity, database in found.items():
+            if database and known.count(database) == 1:
+                out[identity] = database
+    return out
+
+
+def _apply_unretrieved_copies(
+    owners: dict[str, dict[str, str]],
+    collisions: dict[str, dict[str, str]],
+    table_sources: dict[str, str],
+    databases: dict[str, str],
+    class_databases: dict[str, str],
+    table_candidates: dict[str, list[str]],
+    shared_databases: dict[str, list[str]] | None = None,
+) -> dict[str, dict[str, int]]:
+    """Treat a name as shared when the prompt shows fewer of its databases than hold it.
+
+    ``owners`` is ``{name: {database: source_id}}`` for every name two or more of
+    the namespace's databases hold. Retrieval keeps a handful of classes, so it
+    can return one ``ds`` of seven: nothing collides, the writer is told
+    ``write it as sdtm_cs102.ds``, and the query reads that one study and returns
+    its rows as the whole answer. For such a name, in place (mutating the maps
+    ``generate`` built):
+
+    - the bare name is marked ambiguous, so a bare reference is refused;
+    - every database's ``database.table`` key routes to its source, retrieved or
+      not, so a reference that names a database still runs;
+    - the candidates are every database, so the refusal names all of them;
+    - no copy gets its own ``write it as`` hint: that would steer the writer to
+      the copies retrieval happened to return. Instead ``shared_databases`` gets
+      ``{name: [every database, sorted]}``, so each line for the name lists all
+      of them alike (see :func:`_with_database`). Without that list the writer
+      never learns the databases' names and writes a bare reference, which is
+      refused even when the question names one database.
+
+    A name whose every database already reaches the prompt with its own hint
+    (step 3d) is left as it is. Returns ``{name: {"shown": n, "databases": m}}``
+    for the names changed, for the trace.
+    """
+    changed: dict[str, dict[str, int]] = {}
+    for name, held_by in owners.items():
+        if len(held_by) < 2:
+            continue
+        identities = collisions.get(name, {})
+        if identities:
+            shown = {class_databases[i] for i in identities if class_databases.get(i)}
+        else:
+            shown = {databases[name]} if databases.get(name) else set()
+        if set(held_by) <= shown:
+            continue
+        table_sources[name] = _AMBIGUOUS_SOURCE
+        databases.pop(name, None)
+        for identity in identities:
+            class_databases.pop(identity, None)
+        for database, ds_id in held_by.items():
+            if ds_id and ds_id != _AMBIGUOUS_SOURCE:
+                table_sources.setdefault(f"{database}.{name}", ds_id)
+        table_candidates[name] = sorted(f"{database}.{name}" for database in held_by)
+        if shared_databases is not None:
+            shared_databases[name] = sorted(held_by)
+        changed[name] = {"shown": max(len(identities), 1), "databases": len(held_by)}
+    return changed
+
+
+def _class_label(identity: str, name: str) -> str:
+    """How to name a same-named class whose database is unknown: its IRI's local name, else the table."""
+    if "#" in identity or "://" in identity:
+        local = re.split(r"[#/]", identity.rstrip("/#"))[-1]
+        if local:
+            return local
+    return name
+
+
+def _table_source_for(reference: str, table_sources: dict[str, str]) -> tuple[str, str]:
+    """``(routing key, data_source_id)`` for one referenced table, ``(bare, "")`` if unmapped.
+
+    A ``database.table`` reference that names one of the candidates of a shared
+    name (listed in ``table_sources`` under that qualified key) routes to that
+    candidate. Anything else — a bare reference, or a qualified one naming no
+    candidate — is looked up by its bare name, which for a shared name is the
+    ambiguity marker.
+
+    A ``catalog.database.table`` reference routes to a candidate only when its
+    catalog is the candidates' own (``_CANDIDATE_CATALOG``). Matching on the last
+    two parts alone let ``othercat.crm_db.customers`` route to the ``crm_db``
+    candidate; being fully catalog-qualified, it then ran unchanged against
+    ``othercat`` while the trace attributed it to the ``crm_db`` source. Any other
+    catalog, or more parts than a catalog-qualified name has, falls through to the
+    bare name. ``reference`` comes from :func:`_referenced_tables`, whose parts
+    are the identifiers without their quotes.
+    """
+    parts = reference.strip().lower().split(".")
+    if len(parts) == 2 or (len(parts) == 3 and parts[0] == _CANDIDATE_CATALOG):
+        key = f"{parts[-2]}.{parts[-1]}"
+        ds_id = table_sources.get(key, "")
+        if ds_id and ds_id != _AMBIGUOUS_SOURCE:
+            return key, ds_id
+    return parts[-1], table_sources.get(parts[-1], "")
+
+
+def _referenced_tables(sql: str, dialect: str = "trino") -> list[str]:
+    """The real tables ``sql`` reads, as ``[catalog.][database.]table``, unquoted, in order.
+
+    Built from :func:`~..table_qualifier.real_tables`, the same reading
+    ``ambiguous_reference`` refuses on, so a common table expression is not a
+    table here either. ``SQLFirewall.extract_tables`` lists CTE names too: a CTE
+    named ``customers`` over ``crm_db.customers`` read as a bare reference to the
+    shared name, and a correct qualified query was refused. When the statement
+    cannot be parsed this way, the firewall's listing is used, as before.
+    """
+    try:
+        parsed = sqlglot.parse_one(sql, read=dialect)
+    except (sqlglot.errors.SqlglotError, RecursionError):
+        return SQLFirewall.extract_tables(sql)
+    if parsed is None:
+        return SQLFirewall.extract_tables(sql)
+    tables: list[str] = []
+    for table in real_tables(parsed):
+        qualified = ".".join(part for part in (table.catalog, table.db, table.name) if part)
+        if qualified not in tables:
+            tables.append(qualified)
+    return tables
 
 
 def _resolve_data_source_from_sql(sql: str, hits: list[VectorHit]) -> str:
@@ -1141,16 +1409,16 @@ def _resolve_data_source_from_sql(sql: str, hits: list[VectorHit]) -> str:
     return _resolve_data_source_from_table_sources(sql, _hit_table_source_map(hits))
 
 
-def _resolve_data_source_from_table_sources(sql: str, table_source: dict[str, str]) -> str:
+def _resolve_data_source_from_table_sources(sql: str, table_source: dict[str, str], dialect: str = "trino") -> str:
     """:func:`_resolve_data_source_from_sql` over an already-built table -> source map."""
     if not table_source:
         return ""
     source_ids: set[str] = set()
-    for qualified in SQLFirewall.extract_tables(sql):
-        # firewall returns catalog.schema.table / schema.table / table — the
-        # bare table name is the last dotted segment; hits are keyed by it.
-        bare = qualified.split(".")[-1].strip().lower()
-        ds_id = table_source.get(bare)
+    for qualified in _referenced_tables(sql, dialect):
+        # firewall returns catalog.schema.table / schema.table / table; a
+        # database-qualified reference to one candidate of a shared name resolves
+        # to that candidate, anything else by the bare (last) segment.
+        _, ds_id = _table_source_for(qualified, table_source)
         if ds_id == _AMBIGUOUS_SOURCE:
             # A referenced table exists under >1 source — cannot safely attribute
             # the query to one physical source; fall back (never mis-route).
@@ -1162,37 +1430,79 @@ def _resolve_data_source_from_table_sources(sql: str, table_source: dict[str, st
     return ""
 
 
-def _hit_map(hits: list[VectorHit]) -> dict[str, str]:
-    """Map bare table name -> the class text that describes it.
+def _hit_map(hits: list[VectorHit]) -> dict[str, dict[str, str]]:
+    """Map bare table name -> ``{class identity: the class text that describes it}``.
 
     Prefers the richer ``context_text`` (carries per-column allowed values) over
     the embedded text; the name is derived from whichever text is used, since both
     start with "Table: <name> | ...".
 
-    Keyed by the BARE name, so two same-named classes from different databases
-    collapse to whichever was seen last. That is only reachable in a namespace
-    pooling several databases, and fixing it needs a qualified identity rather than
-    a name — deliberately left alone here.
+    Keyed by class under the name, not by the name alone: in a namespace pooling
+    several databases two classes can describe two different ``customers`` tables,
+    and keying by name kept only the last one seen, so the writer saw one schema
+    for a name that routing then refused as ambiguous, and sometimes answered
+    from an unrelated table. Every class reaches the prompt now. The same class
+    retrieved twice, or two classes with identical text, still render once,
+    unless the two come from two different known sources: two databases can hold
+    byte-identical schemas, and those are two tables, so both render, each with
+    its own database.
+
+    A hit with no ``data_source_id`` is no evidence of a table of its own: it
+    merges with any hit of the same text, and a sourced hit of that text that
+    arrives later takes its place. The result does not depend on hit order; an
+    unsourced hit ranked first used to swallow every sourced copy after it, so
+    the writer saw one schema with no database.
     """
-    hit_map: dict[str, str] = {}
+    hit_map: dict[str, dict[str, str]] = {}
+    # (name, text) -> {data_source_id ("" = none): the identity rendered for it}
+    rendered_by_text: dict[tuple[str, str], dict[str, str]] = {}
     for hit in hits:
         text = hit.metadata.get("context_text") or hit.text
         name = _table_name_from_class_text(text)
-        if name:
-            hit_map[name] = text
+        if not name:
+            continue
+        entries = hit_map.setdefault(name, {})
+        identity = _hit_identity(hit, name)
+        ds_id = hit.data_source_id or ""
+        rendered = rendered_by_text.setdefault((name, text), {})
+        if identity in entries:
+            if ds_id and rendered.get("") == identity:
+                # The same class, now with its source: it is the sourced copy.
+                del rendered[""]
+        elif not ds_id:
+            if rendered:
+                continue
+        else:
+            if ds_id in rendered:
+                continue
+            unsourced = rendered.pop("", None)
+            if unsourced is not None:
+                entries.pop(unsourced, None)
+        rendered.setdefault(ds_id, identity)
+        entries[identity] = text
     return hit_map
 
 
-def _context_tables(hits: list[VectorHit], expanded_tables: list[str]) -> list[str]:
+def _context_tables(
+    hits: list[VectorHit], expanded_tables: list[str], class_databases: dict[str, str] | None = None
+) -> list[str]:
     """The tables :func:`_build_raw_context` actually renders, in prompt order.
 
     Not the same list as ``expanded_tables``: a name with no retrieved hit behind
     it (an FK-expanded neighbour) contributes nothing to the context. Logged so the
     set of tables the writer saw is readable directly, instead of being counted off
-    a length-capped preview string.
+    a length-capped preview string. A name rendered once per class is listed once
+    per class, as ``database.table`` where that class's database is known.
     """
     hit_map = _hit_map(hits)
-    return [table for table in expanded_tables if hit_map.get(table)]
+    class_databases = class_databases or {}
+    tables: list[str] = []
+    for table in expanded_tables:
+        entries = hit_map.get(table) or {}
+        for identity in entries:
+            database = class_databases.get(identity, "") if len(entries) > 1 else ""
+            tables.append(f"{database}.{table}" if database else table)
+    return tables
 
 
 def table_sources_need_preparation(table_sources: dict[str, str]) -> bool:
@@ -1211,7 +1521,13 @@ def table_sources_need_preparation(table_sources: dict[str, str]) -> bool:
     return len(real) >= 2 or _AMBIGUOUS_SOURCE in values
 
 
-def sql_table_routing(sql: str, table_sources: dict[str, str]) -> dict[str, dict[str, str]]:
+def sql_table_routing(
+    sql: str,
+    table_sources: dict[str, str],
+    table_candidates: dict[str, list[str]] | None = None,
+    *,
+    dialect: str = "trino",
+) -> dict[str, dict[str, str]]:
     """Build a ``datasourceRouting``-shaped map for the tables ``sql`` references.
 
     Same shape as the VKG translate response's ``datasourceRouting``, so the
@@ -1222,60 +1538,152 @@ def sql_table_routing(sql: str, table_sources: dict[str, str]) -> dict[str, dict
     single-source query would push it off the direct-JDBC fast path onto Athena.
 
     An ambiguous table — a bare name ``_hit_table_source_map`` attributed to more
-    than one class — gets an ``AMBIGUOUS_KEY`` marker (candidate named, no
-    ``datasourceId``), mirroring the VKG mapping's marker for a shared name. That
-    is what makes ``prepare_execution_sql`` REFUSE a query touching it rather than
-    run it against a guessed schema and return a wrong answer as success.
-    Dropping the name instead — as an earlier version did — left it
-    indistinguishable from a table outside the map, i.e. nothing to route, so the
-    query executed unqualified. Attributed entries carry no ``sourceSchema``
-    (retrieval hits have none), so the qualifier falls back to the per-source
-    schema.
+    than one class — referenced BARE gets an ``AMBIGUOUS_KEY`` marker (no
+    ``datasourceId``) naming its candidates from ``table_candidates``
+    (comma-separated, as the VKG mapping's marker lists them), or the name itself
+    when none are known. That is what makes ``prepare_execution_sql`` REFUSE a
+    query touching it rather than run it against a guessed schema and return a
+    wrong answer as success. Dropping the name instead — as an earlier version
+    did — left it indistinguishable from a table outside the map, i.e. nothing to
+    route, so the query executed unqualified.
+
+    The same table referenced as ``database.table``, naming one candidate, routes
+    to that candidate with its database as ``sourceSchema``. As in the VKG
+    translator, the other candidates are listed beside it: the name is still
+    shared, and the qualifier can only see that (and add the catalog) from them.
+    Other attributed entries carry no ``sourceSchema`` (retrieval hits have none),
+    so the qualifier falls back to the per-source schema.
     """
     routing: dict[str, dict[str, str]] = {}
     if not table_sources:
         return routing
-    for qualified in SQLFirewall.extract_tables(sql):
-        bare = qualified.split(".")[-1].strip().lower()
-        ds_id = table_sources.get(bare)
+    candidates = table_candidates or {}
+    # Real tables only (see `_referenced_tables`): a CTE named like a shared table
+    # is not a bare reference to it.
+    for qualified in _referenced_tables(sql, dialect):
+        key, ds_id = _table_source_for(qualified, table_sources)
         if not ds_id:
             continue
         if ds_id == _AMBIGUOUS_SOURCE:
-            routing[bare] = {AMBIGUOUS_KEY: bare}
+            routing[key] = {AMBIGUOUS_KEY: ",".join(candidates.get(key) or [key])}
             continue
-        routing[bare] = {"datasourceId": ds_id}
+        if "." not in key:
+            routing[key] = {"datasourceId": ds_id}
+            continue
+        database, bare = key.split(".", 1)
+        routing[key] = {"datasourceId": ds_id, "sourceSchema": database}
+        for other, other_ds in table_sources.items():
+            other_database, _, other_bare = other.partition(".")
+            if other_bare == bare and other != key and other_ds != _AMBIGUOUS_SOURCE:
+                routing.setdefault(other, {"datasourceId": other_ds, "sourceSchema": other_database})
+    # A shared name the statement ALSO references in a form naming no candidate
+    # (bare, or under a catalog that is not the candidates') is refused as a
+    # whole. Its qualified entries are dropped so the refusal check resolves every
+    # reference to that name by its bare marker: ``ambiguous_reference`` matches on
+    # ``database.table`` only, so ``othercat.crm_db.customers`` beside a correct
+    # ``crm_db.customers`` would otherwise find the latter's entry and pass.
+    marked = {key for key, entry in routing.items() if AMBIGUOUS_KEY in entry}
+    if marked:
+        routing = {
+            key: entry for key, entry in routing.items() if key in marked or key.rpartition(".")[2] not in marked
+        }
     return routing
 
 
 def _build_raw_context(
-    hits: list[VectorHit], expanded_tables: list[str], databases: dict[str, str] | None = None
+    hits: list[VectorHit],
+    expanded_tables: list[str],
+    databases: dict[str, str] | None = None,
+    class_databases: dict[str, str] | None = None,
+    shared_databases: dict[str, list[str]] | None = None,
 ) -> str:
     """Pass class text directly as context — no DDL reformatting.
 
     The class text stored in OpenSearch already contains structured metadata
     ('Table: name | Description: ... | Columns: col:type (desc), ...') which
     LLMs parse effectively without transformation to CREATE TABLE syntax.
-    A table in ``databases`` also gets its database right after its name.
+    A table in ``databases`` also gets its database right after its name. A
+    name two classes claim is rendered once per class, each with ITS database
+    from ``class_databases`` (class identity -> database) where known, and never
+    with the name's entry in ``databases``, which cannot speak for both. A name
+    in ``shared_databases`` (more databases hold it than the prompt shows) lists
+    all of them on every line for it instead.
     """
     hit_map = _hit_map(hits)
     databases = databases or {}
-    return "\n".join(
-        _with_database(hit_map[table], table, databases.get(table, ""))
-        for table in expanded_tables
-        if hit_map.get(table)
-    )
+    class_databases = class_databases or {}
+    shared_databases = shared_databases or {}
+    lines: list[str] = []
+    for table in expanded_tables:
+        entries = hit_map.get(table) or {}
+        for identity, text in entries.items():
+            database = class_databases.get(identity, "") if len(entries) > 1 else databases.get(table, "")
+            lines.append(_with_database(text, table, database, shared_databases.get(table)))
+    return "\n".join(lines)
 
 
-def _with_database(text: str, table: str, database: str) -> str:
+def _with_database(text: str, table: str, database: str, shared: list[str] | None = None) -> str:
     """``Table: t | ...`` -> ``Table: t | Database: db (write it as db.t) | ...``.
+
+    With ``shared`` (every database that holds ``t``, when the prompt shows fewer
+    of them) the segment is ``Databases: a, b, c (...)`` instead: all of them,
+    in the given order, and none singled out, so a question naming one database
+    can be written against it while one asking about all of them is not steered
+    to one copy. ``shared`` wins over ``database``. Each listed name is spelled as
+    the writer must write it (see :func:`_hint_identifier`).
 
     Kept a separate segment after the name, not folded into it, because every
     other reader of this text keys the table by the bare ``Table:`` segment.
+
+    The ``write it as`` form is copied into the SQL by the writer, so each part is
+    rendered as a valid Athena (Trino) identifier: double-quoted when it needs it
+    (``"sales-ops".warehouse_stock``, ``crm."group"``), bare otherwise (see
+    :func:`_hint_identifier`). The ``Database:`` label stays the plain name.
     """
-    if not database:
+    if shared:
+        segment = (
+            f"Databases: {', '.join(_hint_identifier(d) for d in shared)} (several databases hold this table: "
+            f"qualify it with the database the question names, or read each of them)"
+        )
+    elif database:
+        written = f"{_hint_identifier(database)}.{_hint_identifier(table)}"
+        segment = f"Database: {database} (write it as {written})"
+    else:
         return text
     head, sep, rest = text.partition(" | ")
-    return f"{head} | Database: {database} (write it as {database}.{table}){sep}{rest}"
+    return f"{head} | {segment}{sep}{rest}"
+
+
+# Words Athena DML (Trino) only accepts as an identifier when double-quoted:
+# sqlglot's Trino reserved set, plus the words the Trino "Keywords and
+# identifiers" reference also reserves that sqlglot's set lacks. A superset is
+# harmless (a word is quoted that did not need it); a missing word leaves the
+# name bare, as before.
+_TRINO_RESERVED_KEYWORDS = frozenset(Trino.Generator.RESERVED_KEYWORDS) | {
+    "auto", "cube", "current_catalog", "current_date", "current_path", "current_role", "current_schema",
+    "current_user", "grouping", "json_array", "json_exists", "json_object", "json_query", "json_serialize",
+    "json_table", "json_value", "listagg", "localtime", "localtimestamp", "normalize", "overlaps", "recursive",
+    "rollup", "skip", "trim", "uescape", "unnest",
+}  # fmt: skip
+
+# A name left bare: starts with a letter, then letters, digits and underscores
+# only. Stricter than Trino's IDENTIFIER rule, which also accepts a leading
+# underscore; such a name is quoted though it did not need it, which is harmless.
+_BARE_IDENTIFIER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+
+
+def _hint_identifier(name: str) -> str:
+    """``name`` as the writer must spell it in Athena SQL.
+
+    Quoted when it has to be (a reserved word such as ``group``, a hyphen, a
+    leading digit) and, to keep the rule simple, for a leading underscore, so a
+    plain ``sales_db.orders`` hint is unchanged. Quoting is safe for Athena either way: Glue names are lower-case
+    and Trino resolves a quoted identifier case-insensitively; downstream
+    routing reads table names from the parsed AST, which drops the quotes.
+    """
+    if _BARE_IDENTIFIER_RE.match(name) and name.lower() not in _TRINO_RESERVED_KEYWORDS:
+        return name
+    return sql_ident(name)
 
 
 _SQL_KEYWORD_RE = re.compile(r"\b(SELECT|WITH)\b", re.IGNORECASE)

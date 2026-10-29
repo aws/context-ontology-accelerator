@@ -40,6 +40,7 @@ import pytest
 from coa_serve.tier3.agentic import AgenticBudgetConfig
 from coa_serve.tier3.agentic.models import StopReason, SubQuestion
 from coa_serve.tier3.agentic.retriever import AgenticRetriever
+from coa_serve.tier3.agentic.tools.base import ToolResult
 from coa_serve.tier3.graph_traverser import GraphEntity
 from coa_serve.tier3.synthesizer import SynthesisResult
 from coa_serve.tier3.vector_retriever import ChunkResult
@@ -152,7 +153,14 @@ def make_retriever(
 
 
 def make_chunk(chunk_id: str) -> ChunkResult:
-    return ChunkResult(chunk_id=chunk_id, text=f"text-{chunk_id}", source_doc="doc.pdf", relevance_score=0.9, label="L")
+    return ChunkResult(
+        chunk_id=chunk_id,
+        text=f"text-{chunk_id}",
+        source_doc=f"aws:tenant:source:{chunk_id}",
+        source_doc_name="doc.pdf",
+        relevance_score=0.9,
+        label="L",
+    )
 
 
 def make_entity(uri: str) -> GraphEntity:
@@ -270,6 +278,31 @@ class TestFinalSemanticSearch:
         assert final_step.status == "error"
         assert result.partial is True  # degraded source flags partial
 
+    async def test_returned_final_search_degradation_marks_partial_and_trace(self):
+        degraded_result = _final_result()
+        degraded_result = type(degraded_result)(
+            chunks=degraded_result.chunks,
+            items=degraded_result.items,
+            detail="1 chunk retained; dropped 2 anonymous chunks",
+            degraded_reason="missing_document_provenance",
+        )
+        sem = _FinalTool("strategy:chunk_based_semantic", degraded_result)
+        retriever = self._retriever(_registry(sem))
+        trace = TraceCollector()
+
+        result = await retriever.resolve("q", NS, trace=trace)
+
+        assert result.partial is True
+        assert result.degraded_sources == (
+            {
+                "source": "strategy:chunk_based_semantic",
+                "reason": "missing_document_provenance",
+            },
+        )
+        assert result.supporting_content[0]["chunkId"] == "final-sem"
+        final_step = next(step for step in trace.steps if step.step == "agentic_final_semantic_search")
+        assert final_step.status == "degraded"
+
     async def test_skipped_cleanly_when_no_semantic_tool_registered(self):
         retriever = self._retriever(_registry())  # empty registry
         trace = TraceCollector()
@@ -338,6 +371,80 @@ class TestFinalSemanticSearch:
 
 
 @pytest.mark.unit
+class TestSupportingContentProvenanceSignal:
+    """Filtering provenance-less chunks must be observable, like the other paths.
+
+    The hand-rolled and lexical Tier-3 paths both count the chunks they filter, mark
+    the step degraded and add a ``degradedSources`` entry. This path filtered
+    silently, so a chunk that should have carried a document id but did not simply
+    disappeared from the citation list.
+    """
+
+    @staticmethod
+    def _resolve(chunks):
+        def populate(ctx, clock, queue):
+            ctx.chunks.extend(chunks)
+            ctx.entities.append(make_entity("urn:amazon"))
+
+        retriever = make_retriever(
+            decomposer=FakeDecomposer([SubQuestion(text="q")]),
+            controller=FakeController(on_loop=populate, stops=[StopReason.sufficiency_satisfied]),
+            synthesizer=FakeSynthesizer(result=SynthesisResult(answer="An answer", confidence=0.8, duration_ms=5)),
+            clock_source=FakeClockSource(),
+        )
+        trace = TraceCollector()
+        return retriever, trace
+
+    async def test_graph_only_statement_chunks_are_reported_but_not_degraded(self):
+        # A graph statement legitimately has no document to cite and IS represented
+        # in graphContext, so it is counted and traced without degrading the answer.
+        graph_chunk = ChunkResult(
+            chunk_id="urn:amazon#stmt-1",
+            text="Amazon competes with Walmart.",
+            source_doc="",
+            relevance_score=1.0,
+            uri="urn:amazon",
+        )
+        retriever, trace = self._resolve([make_chunk("c1"), graph_chunk])
+
+        result = await retriever.resolve("q", NS, trace=trace)
+
+        assert [item["chunkId"] for item in result.supporting_content] == ["c1"]
+        step = next(s for s in trace.steps if s.step == "agentic_supporting_content")
+        assert step.status == "succeeded"
+        assert "1 graph-only statement chunk(s)" in step.detail
+        assert result.degraded_sources == ()
+        assert result.partial is False
+
+    async def test_chunks_with_neither_document_nor_graph_provenance_degrade(self):
+        anonymous = ChunkResult(
+            chunk_id="orphan-1",
+            text="Unattributable evidence.",
+            source_doc="",
+            relevance_score=0.5,
+        )
+        retriever, trace = self._resolve([make_chunk("c1"), anonymous])
+
+        result = await retriever.resolve("q", NS, trace=trace)
+
+        assert [item["chunkId"] for item in result.supporting_content] == ["c1"]
+        step = next(s for s in trace.steps if s.step == "agentic_supporting_content")
+        assert step.status == "degraded"
+        assert "1 chunk(s) dropped with neither document nor graph provenance" in step.detail
+        assert [entry["reason"] for entry in result.degraded_sources] == ["missing_document_provenance"]
+        assert result.partial is True
+
+    async def test_no_step_recorded_when_every_chunk_has_document_provenance(self):
+        retriever, trace = self._resolve([make_chunk("c1"), make_chunk("c2")])
+
+        result = await retriever.resolve("q", NS, trace=trace)
+
+        assert len(result.supporting_content) == 2
+        assert "agentic_supporting_content" not in [s.step for s in trace.steps]
+        assert result.degraded_sources == ()
+
+
+@pytest.mark.unit
 class TestResultContract:
     async def test_happy_path_returns_full_tier3_result(self):
         def populate(ctx, clock, queue):
@@ -361,12 +468,58 @@ class TestResultContract:
         assert result.guardrail_blocked is False
         assert result.partial is False  # context gathered, no degraded, no expiry
         # supporting_content / graph_context populated from accumulated context.
-        assert result.supporting_content[0]["chunkId"] == "c1"
+        assert result.supporting_content[0] == {
+            "chunkId": "c1",
+            "text": "text-c1",
+            "sourceDocumentId": "aws:tenant:source:c1",
+            "sourceDocumentName": "doc.pdf",
+            "relevanceScore": 0.9,
+            # Deprecated aliases kept for one release (see #984).
+            "sourceDoc": "aws:tenant:source:c1",
+            "label": "L",
+        }
         assert result.graph_context[0]["uri"] == "urn:amazon"
         assert isinstance(result.degraded_sources, tuple)
         # trace flows through and is attached.
         assert any(s.step == "agentic_session_start" for s in trace.steps)
         assert len(synthesizer.calls) == 1
+
+    async def test_relationship_working_set_cap_marks_result_partial(self):
+        relationships = tuple(
+            {
+                "source_uri": "urn:amazon",
+                "predicate_uri": f"urn:predicate:{index}",
+                "target_uri": f"urn:target:{index}",
+            }
+            for index in range(11)
+        )
+
+        def populate(ctx, clock, queue):
+            ctx.add(
+                ToolResult(
+                    entities=(
+                        GraphEntity(
+                            uri="urn:amazon",
+                            label="Amazon",
+                            type="Company",
+                            relationships=relationships,
+                        ),
+                    )
+                )
+            )
+
+        retriever = make_retriever(
+            decomposer=FakeDecomposer([SubQuestion(text="q")]),
+            controller=FakeController(on_loop=populate, stops=[StopReason.sufficiency_satisfied]),
+            synthesizer=FakeSynthesizer(result=SynthesisResult(answer="An answer", confidence=0.7, duration_ms=4)),
+            clock_source=FakeClockSource(),
+        )
+
+        result = await retriever.resolve("the question", NS)
+
+        assert len(result.graph_context[0]["relationships"]) == 10
+        assert result.degraded_sources == ({"source": "accumulated_context", "reason": "relationship_cap_reached"},)
+        assert result.partial is True
 
     async def test_no_context_yields_empty_supporting_and_graph(self):
         # Nothing gathered, queue drains; synthesis still runs (Req 7.8 shape).

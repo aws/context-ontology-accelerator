@@ -17,6 +17,7 @@ from coa_common.bedrock import (
     BedrockTruncationError,
     GuardrailBlockedError,
     InputTooLargeError,
+    PromptSegment,
     extract_text_blocks,
     resolve_chat_model_id,
 )
@@ -484,6 +485,85 @@ class TestGuardrailIntegration:
 
         call_kwargs = mock_client.converse.call_args[1]
         assert call_kwargs["guardrailConfig"]["guardrailVersion"] == "3"
+
+
+class TestPromptSegments:
+    """A segmented user message screens only the guarded segments with the guardrail."""
+
+    _OK = {
+        "output": {"message": {"content": [{"text": '{"ok": true}'}]}},
+        "stopReason": "end_turn",
+        "usage": {"inputTokens": 1, "outputTokens": 1},
+    }
+    _SEGMENTS = [
+        PromptSegment("Table: ", guarded=False),
+        PromptSegment("sales.orders"),
+        PromptSegment("\n\nColumns:\n", guarded=False),
+        PromptSegment("  - id (bigint)"),
+        PromptSegment(""),
+        PromptSegment("\n\nREQUIRED: generate a description.", guarded=False),
+    ]
+
+    def _content(self, mock_boto3, user_prompt, **client_kwargs):
+        mock_client = MagicMock()
+        mock_boto3.client.return_value = mock_client
+        mock_client.converse.return_value = self._OK
+        BedrockClient(region="us-east-1", **client_kwargs).invoke("sys", user_prompt)
+        return mock_client.converse.call_args[1]["messages"][0]["content"]
+
+    @patch("coa_common.bedrock.boto3")
+    def test_invoke_segments_maps_static_to_text_and_data_to_guard_content(self, mock_boto3):
+        content = self._content(mock_boto3, self._SEGMENTS, guardrail_id="gr-1")
+        assert content == [
+            {"text": "Table: "},
+            {"guardContent": {"text": {"text": "sales.orders"}}},
+            {"text": "\n\nColumns:\n"},
+            # The empty guarded segment is dropped, so the two static segments merge.
+            {"guardContent": {"text": {"text": "  - id (bigint)"}}},
+            {"text": "\n\nREQUIRED: generate a description."},
+        ]
+
+    @patch("coa_common.bedrock.boto3")
+    def test_invoke_segments_merge_adjacent_same_kind(self, mock_boto3):
+        segments = [PromptSegment("a"), PromptSegment("b"), PromptSegment("c", guarded=False)]
+        content = self._content(mock_boto3, segments, guardrail_id="gr-1")
+        assert content == [{"guardContent": {"text": {"text": "ab"}}}, {"text": "c"}]
+
+    @patch("coa_common.bedrock.boto3")
+    def test_invoke_segments_without_guarded_data_screens_everything(self, mock_boto3):
+        # No guarded text at all: fall back to one plain block, which the guardrail
+        # screens in full (no empty guardContent block is ever sent).
+        segments = [PromptSegment("a", guarded=False), PromptSegment(""), PromptSegment("b", guarded=False)]
+        assert self._content(mock_boto3, segments, guardrail_id="gr-1") == [{"text": "ab"}]
+
+    @patch("coa_common.bedrock.boto3")
+    def test_invoke_segments_all_empty_raises_before_calling_bedrock(self, mock_boto3):
+        mock_client = MagicMock()
+        mock_boto3.client.return_value = mock_client
+        client = BedrockClient(region="us-east-1", guardrail_id="gr-1")
+        with pytest.raises(ValueError, match="no non-empty segments"):
+            client.invoke("sys", [PromptSegment(""), PromptSegment("", guarded=False)])
+        mock_client.converse.assert_not_called()
+
+    @patch("coa_common.bedrock.boto3")
+    def test_invoke_segments_without_guardrail_sends_one_text_block(self, mock_boto3):
+        content = self._content(mock_boto3, self._SEGMENTS)
+        assert content == [{"text": "".join(s.text for s in self._SEGMENTS)}]
+
+    @patch("coa_common.bedrock.boto3")
+    def test_invoke_plain_string_with_guardrail_is_unchanged(self, mock_boto3):
+        assert self._content(mock_boto3, "usr", guardrail_id="gr-1") == [{"text": "usr"}]
+
+    @patch("coa_common.bedrock.boto3")
+    def test_invoke_segments_input_limit_counts_every_segment(self, mock_boto3):
+        mock_client = MagicMock()
+        mock_boto3.client.return_value = mock_client
+        client = BedrockClient(region="us-east-1", guardrail_id="gr-1", max_input_chars=100)
+        # Each segment alone is under the limit; together with the system prompt they exceed it.
+        segments = [PromptSegment("x" * 40, guarded=False), PromptSegment("y" * 40)]
+        with pytest.raises(InputTooLargeError):
+            client.invoke("s" * 30, segments)
+        mock_client.converse.assert_not_called()
 
 
 class TestGuardrailDecisionMetrics:

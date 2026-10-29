@@ -19,9 +19,6 @@ def mock_neptune():
             "entity": "http://ex.org/Claim",
             "label": "Claim",
             "type": "owl:Class",
-            "predicate": "",
-            "related": "",
-            "relLabel": "",
         },
     ]
     return client
@@ -52,23 +49,83 @@ class TestGraphTraverserKeyword:
                 "entity": "http://ex.org/Claim",
                 "label": "Claim",
                 "type": "owl:Class",
-                "predicate": "http://ex.org/hasPolicy",
-                "related": "http://ex.org/Policy",
-                "relLabel": "Policy",
+                "sourceUri": "http://ex.org/Claim",
+                "sourceLabel": "Claim",
+                "predicateUri": "http://ex.org/hasPolicy",
+                "predicateLabel": "has policy",
+                "targetUri": "http://ex.org/Policy",
+                "targetLabel": "Policy",
             },
             {
                 "entity": "http://ex.org/Claim",
                 "label": "Claim",
                 "type": "owl:Class",
-                "predicate": "http://ex.org/hasCustomer",
-                "related": "http://ex.org/Customer",
-                "relLabel": "Customer",
+                "sourceUri": "http://ex.org/Claim",
+                "sourceLabel": "Claim",
+                "predicateUri": "http://ex.org/hasCustomer",
+                "predicateLabel": "has customer",
+                "targetUri": "http://ex.org/Customer",
+                "targetLabel": "Customer",
             },
         ]
         traverser = GraphTraverser(mock_neptune, graph_uri_template="https://ontology-workbench.local/{namespace}")
         results = await traverser.traverse("claims", "insurance", entities=["claim"])
         assert len(results) == 1
         assert len(results[0].relationships) == 2
+        assert results[0].relationships[0] == {
+            "source_uri": "http://ex.org/Claim",
+            "source_label": "Claim",
+            "predicate_uri": "http://ex.org/hasPolicy",
+            "predicate_label": "has policy",
+            "target_uri": "http://ex.org/Policy",
+            "target_label": "Policy",
+        }
+
+    async def test_keyword_parser_dedupes_label_variants_by_directed_triple(self, mock_neptune):
+        duplicate = {
+            "entity": "http://ex.org/Claim",
+            "label": "Claim",
+            "type": "owl:Class",
+            "sourceUri": "http://ex.org/Claim",
+            "predicateUri": "http://ex.org/hasPolicy",
+            "targetUri": "http://ex.org/Policy",
+        }
+        mock_neptune.query.return_value = [
+            duplicate,
+            {
+                **duplicate,
+                "sourceLabel": "Claim",
+                "predicateLabel": "has policy",
+                "targetLabel": "Policy",
+            },
+            *[
+                {
+                    **duplicate,
+                    "predicateLabel": f"label variant {index}",
+                }
+                for index in range(20)
+            ],
+            {
+                **duplicate,
+                "predicateUri": "http://ex.org/hasCustomer",
+                "targetUri": "http://ex.org/Customer",
+                "predicateLabel": "has customer",
+                "targetLabel": "Customer",
+            },
+        ]
+        traverser = GraphTraverser(mock_neptune, graph_uri_template="https://ontology-workbench.local/{namespace}")
+
+        results = await traverser.traverse("claims", "insurance", entities=["claim"])
+
+        assert len(results[0].relationships) == 2
+        assert results[0].relationships[0] == {
+            "source_uri": "http://ex.org/Claim",
+            "source_label": "Claim",
+            "predicate_uri": "http://ex.org/hasPolicy",
+            "predicate_label": "has policy",
+            "target_uri": "http://ex.org/Policy",
+            "target_label": "Policy",
+        }
 
     async def test_rejects_invalid_namespace(self, mock_neptune):
         traverser = GraphTraverser(mock_neptune, graph_uri_template="https://ontology-workbench.local/{namespace}")
@@ -87,14 +144,11 @@ class TestGraphTraverserKeyword:
 
     async def test_skips_empty_uri(self, mock_neptune):
         mock_neptune.query.return_value = [
-            {"entity": "", "label": "Ghost", "type": "owl:Class", "predicate": "", "related": "", "relLabel": ""},
+            {"entity": "", "label": "Ghost", "type": "owl:Class"},
             {
                 "entity": "http://ex.org/Real",
                 "label": "Real",
                 "type": "owl:Class",
-                "predicate": "",
-                "related": "",
-                "relLabel": "",
             },
         ]
         traverser = GraphTraverser(mock_neptune, graph_uri_template="https://ontology-workbench.local/{namespace}")
@@ -110,12 +164,12 @@ class TestGraphTraverserFromURIs:
                 "entity": "http://ex.org/Policy",
                 "label": "Policy",
                 "type": "owl:Class",
-                "predicate": "http://ex.org/covers",
-                "related": "http://ex.org/Claim",
-                "relLabel": "Claim",
-                "hop2pred": "",
-                "hop2target": "",
-                "hop2label": "",
+                "sourceUri": "http://ex.org/Policy",
+                "sourceLabel": "Policy",
+                "predicateUri": "http://ex.org/covers",
+                "predicateLabel": "covers",
+                "targetUri": "http://ex.org/Claim",
+                "targetLabel": "Claim",
             },
         ]
         traverser = GraphTraverser(mock_neptune, graph_uri_template="https://ontology-workbench.local/{namespace}")
@@ -163,25 +217,34 @@ class TestGraphTraverserFromURIs:
                 "entity": "http://ex.org/claim_catastropheIdentifier",
                 "label": "catastrophe_identifier",
                 "type": "http://www.w3.org/2002/07/owl#ObjectProperty",
-                "relPredicate": "http://www.w3.org/2000/01/rdf-schema#domain",
-                "related": "http://ex.org/Claim",
-                "relLabel": "claim",
+                "sourceUri": "http://ex.org/claim_catastropheIdentifier",
+                "sourceLabel": "catastrophe_identifier",
+                "predicateUri": "http://www.w3.org/2000/01/rdf-schema#domain",
+                "predicateLabel": "domain",
+                "targetUri": "http://ex.org/Claim",
+                "targetLabel": "claim",
             },
             {  # duplicate domain triple — must be de-duped
                 "entity": "http://ex.org/claim_catastropheIdentifier",
                 "label": "catastrophe_identifier",
                 "type": "http://www.w3.org/2002/07/owl#ObjectProperty",
-                "relPredicate": "http://www.w3.org/2000/01/rdf-schema#domain",
-                "related": "http://ex.org/Claim",
-                "relLabel": "claim",
+                "sourceUri": "http://ex.org/claim_catastropheIdentifier",
+                "sourceLabel": "catastrophe_identifier",
+                "predicateUri": "http://www.w3.org/2000/01/rdf-schema#domain",
+                "predicateLabel": "domain",
+                "targetUri": "http://ex.org/Claim",
+                "targetLabel": "claim",
             },
             {  # range -> the bridged class
                 "entity": "http://ex.org/claim_catastropheIdentifier",
                 "label": "catastrophe_identifier",
                 "type": "http://www.w3.org/2002/07/owl#ObjectProperty",
-                "relPredicate": "http://www.w3.org/2000/01/rdf-schema#range",
-                "related": "http://ex.org/Catastrophe",
-                "relLabel": "catastrophe",
+                "sourceUri": "http://ex.org/claim_catastropheIdentifier",
+                "sourceLabel": "catastrophe_identifier",
+                "predicateUri": "http://www.w3.org/2000/01/rdf-schema#range",
+                "predicateLabel": "range",
+                "targetUri": "http://ex.org/Catastrophe",
+                "targetLabel": "catastrophe",
             },
         ]
         traverser = GraphTraverser(mock_neptune, graph_uri_template="https://ontology-workbench.local/{namespace}")
@@ -217,8 +280,8 @@ class TestGraphTraverserInducedHopQuery:
         assert "rdfs:domain" in q
         assert "rdfs:range" in q
         assert "(rdfs:domain|rdfs:range)" in q
-        # relationships surfaced via the relPredicate/related columns
-        assert "?relPredicate" in q and "?related" in q
+        # relationships surface as explicit source/predicate/target columns.
+        assert "?sourceUri" in q and "?predicateUri" in q and "?targetUri" in q
         # seed-as-property arms (the common case: vector search returns property URIs)
         assert "BIND(?seed AS ?entity)" in q  # seed property emitted as entity
         assert "?sharedClass" in q  # sibling-property (2-hop) arm

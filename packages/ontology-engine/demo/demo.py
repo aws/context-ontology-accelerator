@@ -41,6 +41,12 @@ DATA_CATALOG_URL = _svc.get("data-catalog", "http://localhost:8003")
 INDUCER_URL = _svc.get("ontology-inducer", "http://localhost:8004")
 VALIDATION_URL = _svc.get("ontology-validation", "http://localhost:8005")
 
+# ``ontology_type`` of the customer's own domain ontologies (the
+# ``customer_ontologies`` block of config.yaml). The catalog accepts only
+# ``OntologyType`` values, so the customer tier is stored as a user-created
+# ontology; foundational ones stay ``foundational``.
+CUSTOMER_ONTOLOGY_TYPE = "user_created"
+
 SERVICES = {
     "ontology-catalog": CATALOG_URL,
     "embedding-generator": _svc.get("embedding-generator", "http://localhost:8002"),
@@ -277,7 +283,7 @@ def browse_ontology_catalog() -> list[str] | None:
     # Fetch both foundational and customer-provided in one pass, merge.
     with timed("fetch_ontologies"):
         foundational = _list_ontologies(ontology_type="foundational")
-        customer = _list_ontologies(ontology_type="customer_provided")
+        customer = _list_ontologies(ontology_type=CUSTOMER_ONTOLOGY_TYPE)
 
     # Tag with tier (engine returns ontology_type per record but we want a
     # short display label for the table).
@@ -574,7 +580,7 @@ def show_results(job: dict):
             continue
         onto_id = m.get("matched_ontology_id")
         t = _tier_for(onto_id) or ""
-        if t == "customer_provided":
+        if t == CUSTOMER_ONTOLOGY_TYPE:
             grounded_customer += 1
         elif t == "foundational":
             grounded_foundational += 1
@@ -723,9 +729,9 @@ def benchmark_against_golden(report: dict, datasource_ids: list[str]):
     # counts stay at zero even when grounding edges exist.
     tier_prefixes: dict[str, str] = {}  # uri_prefix → 'customer' | 'foundational'
     try:
-        for ont_type in ("customer_provided", "foundational"):
+        for ont_type in (CUSTOMER_ONTOLOGY_TYPE, "foundational"):
             onts = _list_ontologies(ontology_type=ont_type)
-            tier = "customer" if ont_type == "customer_provided" else "foundational"
+            tier = "customer" if ont_type == CUSTOMER_ONTOLOGY_TYPE else "foundational"
             for o in onts:
                 uri = (o.get("uri") or "").rstrip("/#")
                 if uri:

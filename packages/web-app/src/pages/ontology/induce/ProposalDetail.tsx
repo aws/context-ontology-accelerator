@@ -67,7 +67,7 @@ import { parseTurtleEntities, type TurtleEntity } from "./turtle";
 import { ProposalEntitiesPanel } from "./ProposalEntitiesPanel";
 import { InfoPopover } from "@components/InfoPopover";
 import { ButtonWithHint } from "@components/ButtonWithHint";
-import { useAppI18n } from "../../../i18n/LocaleProvider";
+import { useAppI18n, type AppTranslate } from "../../../i18n/LocaleProvider";
 
 /**
  * Whether the proposal has a COMPUTED ontology to show constraints for.
@@ -206,15 +206,23 @@ function extractInferredClasses(payload: unknown): InferredClass[] {
  * never wrong. The server's own sentence is always kept — for grounding
  * overrides it names which class aborted the save.
  */
-export function describeSaveFailure(error: unknown): string {
+export function describeSaveFailure(error: unknown, t: AppTranslate): string {
   if (error instanceof ApiError) {
     switch (error.status) {
       case 503:
-        return `${error.message} Nothing was saved, so you can retry this save as-is.`;
+        return t(
+          "{message} Nothing was saved, so you can retry this save as-is.",
+          { message: error.message },
+        );
       case 409:
-        return `The server refused this save: ${error.message} Retrying unchanged will fail the same way.`;
+        return t(
+          "The server refused this save: {message} Retrying unchanged will fail the same way.",
+          { message: error.message },
+        );
       case 400:
-        return `This save was rejected as malformed: ${error.message}`;
+        return t("This save was rejected as malformed: {message}", {
+          message: error.message,
+        });
       // 401/403 messages are already written for the reader, and a 5xx other
       // than 503 carries no retry promise, so neither gets a prefix.
       default:
@@ -225,7 +233,7 @@ export function describeSaveFailure(error: unknown): string {
   // throw ordinary Errors whose messages are already the whole story.
   return error instanceof Error
     ? error.message
-    : "Failed to save proposal changes";
+    : t("Failed to save proposal changes");
 }
 
 const DATATYPE_FINDING_CODE = "MALFORMED_DATATYPE_TOKENS";
@@ -917,7 +925,7 @@ export function ProposalDetailPage() {
       }
       if (groundingChanged && (ontologyChanged || r2rmlChanged)) {
         throw new Error(
-          "Grounding overrides and Turtle edits must be saved separately",
+          t("Grounding overrides and Turtle edits must be saved separately"),
         );
       }
       const fields: {
@@ -972,7 +980,7 @@ export function ProposalDetailPage() {
       setPendingGroundingOverrides({});
       refresh();
     } catch (error: unknown) {
-      setSaveError(describeSaveFailure(error));
+      setSaveError(describeSaveFailure(error, t));
     } finally {
       setUpdating(false);
     }
@@ -1316,26 +1324,27 @@ export function ProposalDetailPage() {
           {hasMixedEdits && (
             <Alert
               type="warning"
-              header="Choose which edits to save"
+              header={t("Choose which edits to save")}
               action={
                 <SpaceBetween direction="horizontal" size="xs">
                   <Button onClick={discardGroundingChanges}>
-                    Discard grounding choices
+                    {t("Discard grounding choices")}
                   </Button>
                   <Button onClick={discardTurtleChanges}>
-                    Discard Turtle edits
+                    {t("Discard Turtle edits")}
                   </Button>
                 </SpaceBetween>
               }
             >
-              Grounding choices rebuild the ontology, so grounding and Turtle
-              edits must be saved separately.
+              {t(
+                "Grounding choices rebuild the ontology, so grounding and Turtle edits must be saved separately.",
+              )}
             </Alert>
           )}
           {saveError && (
             <Alert
               type="error"
-              header="Could not save changes"
+              header={t("Could not save changes")}
               dismissible
               onDismiss={() => setSaveError(null)}
             >

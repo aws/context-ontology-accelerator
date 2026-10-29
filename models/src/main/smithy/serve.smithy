@@ -205,6 +205,10 @@ structure SupportingContent {
     entityAnnotations: StringList
 }
 
+// Tier-3 responses additionally carry two DEPRECATED, undocumented aliases on each
+// item for one release — `sourceDoc` (same value as `sourceDocumentId`) and `label`
+// — so a client written against the previous runtime keeps rendering citations.
+// They are not part of this contract; read `sourceDocumentId` / `sourceDocumentName`.
 list SupportingContentList {
     member: SupportingContent
 }
@@ -278,10 +282,17 @@ list ResultRowList {
 /// Graph context accompanying an answer: the entities and relationships that
 /// were traversed or cited.
 structure GraphContext {
-    /// Entities traversed or cited for the answer.
+    /// Entities traversed or cited for the answer. Bounded to 200 entities per
+    /// response; a traversal that reached more is reported through
+    /// `metadata.degradedSources` and the processing trace.
     entities: EntityList
 
-    /// Relationships traversed or cited for the answer.
+    /// Relationships traversed or cited for the answer. Bounded to 500
+    /// relationships per response; a traversal that reached more is reported
+    /// through `metadata.degradedSources` and the processing trace. A relationship
+    /// the graph carries without a predicate identifier cannot be represented (see
+    /// `predicateUri`) and is reported the same way, so an empty list is never
+    /// ambiguous between "none found" and "all discarded".
     relationships: RelationshipList
 }
 
@@ -299,7 +310,9 @@ structure Entity {
     /// Type (class IRI) of the entity, if known.
     type: String
 
-    /// Arbitrary key-value properties of the entity.
+    /// Arbitrary key-value properties of the entity. The reserved
+    /// `supportingStatements` key contains a JSON-encoded string array of
+    /// graph-only evidence. Decode that value as JSON before reading it.
     properties: PropertyMap
 }
 
@@ -310,7 +323,11 @@ structure Relationship {
     @required
     sourceUri: String
 
-    /// IRI of the predicate linking source to target.
+    /// IRI of the predicate linking source to target. A property-graph edge that
+    /// carries only a human-readable predicate string is given a stable,
+    /// tenant-scoped synthetic identifier in the `urn:coa:graph-predicate:` scheme,
+    /// derived from that string. Treat such a value as an opaque identity for
+    /// correlating edges within one namespace, not as an ontology predicate IRI.
     @required
     predicateUri: String
 
@@ -330,6 +347,10 @@ list RelationshipList {
     member: Relationship
 }
 
+/// String-valued entity properties. `supportingStatements` is reserved for a
+/// JSON-encoded string array of graph-only evidence. It is bounded to 100
+/// statements per entity, 1,000 characters and 2,000 UTF-8 bytes per statement,
+/// and 4,000 characters and 6,000 UTF-8 bytes across an assembled graph context.
 map PropertyMap {
     key: String
     value: String
@@ -453,6 +474,14 @@ structure QueryResult {
 
     /// Whether the result is partial (incomplete).
     partial: Boolean
+
+    /// The execution mode that produced this result: "standard" or
+    /// "deep-reasoning". Deep Reasoning is a mode orthogonal to the tier
+    /// cascade, so a client labels an answer by this field rather than
+    /// inferring mode from `tier` (a Deep Reasoning answer resolves at tier 3
+    /// but is not Standard mode's Tier-3 result). Absent on responses that do
+    /// not set it.
+    executionMode: String
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -585,7 +614,10 @@ operation Query {
         @range(min: 1, max: 29000)
         timeoutMs: Long
 
-        /// Whether to include supporting content in the response.
+        /// Whether to include supporting content in the response. When false,
+        /// `supportingContent` and the `supportingStatements` property of each
+        /// `graphContext` entity are omitted; the entities and relationships are
+        /// still returned.
         includeSupporting: Boolean
 
         /// When true, include the generated SQL (`queryUsed`) and SPARQL

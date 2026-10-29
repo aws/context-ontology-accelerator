@@ -34,6 +34,7 @@ import { useListSources } from "../api-hooks/use-list-sources";
 import { useListSourceTables } from "../api-hooks/use-list-source-tables";
 import { useApiClient } from "@components/ApiClientProvider";
 import { searchEntities } from "../services/ontology-engine";
+import { isSubmitEnter } from "@utils/keyboard";
 import { useAppI18n } from "../i18n/LocaleProvider";
 import type { AppMessage } from "../i18n/appMessages";
 
@@ -118,6 +119,11 @@ export const MetricForm: React.FC = () => {
   const [defaultTimeGrain, setDefaultTimeGrain] = useState("");
   const [unit, setUnit] = useState("");
   const [returnType, setReturnType] = useState("");
+  // UpdateMetric is a full replace, so the existing label is kept here and
+  // sent back unchanged, or a save would clear it. Undefined when the metric
+  // has none, so the field is omitted (an empty string is rejected by the
+  // 1-256 length rule).
+  const [label, setLabel] = useState<string | undefined>(undefined);
 
   // Fetch sources for the data source dropdown
   const { data: sourcesData } = useListSources(
@@ -221,6 +227,9 @@ export const MetricForm: React.FC = () => {
       setDefaultTimeGrain(m.defaultTimeGrain ?? "");
       setUnit(m.unit ?? "");
       setReturnType(m.returnType ?? "");
+      setLabel(
+        typeof m.label === "string" && m.label !== "" ? m.label : undefined,
+      );
       setDialects(
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         (m.expression?.dialects ?? []).map((d: any) => ({
@@ -286,6 +295,7 @@ export const MetricForm: React.FC = () => {
       }),
       ...(unit.trim() && { unit: unit.trim() }),
       ...(returnType.trim() && { returnType: returnType.trim() }),
+      ...(label !== undefined && { label }),
     };
 
     const exList = examples.map((e) => e.value).filter(Boolean);
@@ -550,7 +560,7 @@ export const MetricForm: React.FC = () => {
                     onChange={({ detail }) => setSynonymInput(detail.value)}
                     placeholder={t("Add synonym and press Enter")}
                     onKeyDown={({ detail }) => {
-                      if (detail.key === "Enter" && synonymInput.trim()) {
+                      if (isSubmitEnter(detail) && synonymInput.trim()) {
                         setSynonyms([...synonyms, synonymInput.trim()]);
                         setSynonymInput("");
                       }

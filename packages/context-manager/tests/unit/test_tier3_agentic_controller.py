@@ -430,6 +430,31 @@ class TestStopConditions:
 
 @pytest.mark.unit
 class TestPerToolFailureTolerance:
+    async def test_returned_degradation_keeps_context_and_marks_trace(self):
+        degraded = FakeTool(
+            "vector_search",
+            input_schema={"query": "str"},
+            result=ToolResult(
+                chunks=(_Chunk("valid"),),
+                detail="1 chunk retained; dropped 2 anonymous chunks",
+                degraded_reason="missing_document_provenance",
+            ),
+        )
+        registry = make_registry(degraded)
+        planner = ScriptedPlanner(
+            [[PlannerDecision(tool_name="vector_search", inputs={"query": "q"})]],
+            sufficiency=[True],
+        )
+
+        stop, ctx, _queue, trace = await run_loop(planner, registry)
+
+        assert stop == StopReason.sufficiency_satisfied
+        assert [chunk.chunk_id for chunk in ctx.chunks] == ["valid"]
+        assert ctx.degraded_sources == [{"source": "vector_search", "reason": "missing_document_provenance"}]
+        tool_step = next(step for step in trace.steps if step.step == "vector_search")
+        assert tool_step.status == "degraded"
+        assert ctx.attempt_history[0]["status"] == "degraded"
+
     async def test_timeout_is_degraded_and_loop_continues(self):
         slow = FakeTool("strategy:slow", input_schema={"query": "str"}, delay=1.0)
         registry = make_registry(slow)

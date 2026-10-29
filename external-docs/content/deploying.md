@@ -8,12 +8,15 @@ This guide walks you through deploying Context Ontology Accelerator into your AW
 |-------------|---------|---------|
 | AWS Account | — | Target deployment account |
 | AWS CLI v2 | 2.x | Credential management, stack operations |
-| Node.js | 22+ | CDK CLI, web-app build |
+| Node.js | 22.23.4+ | CDK CLI, web-app build |
 | Python | 3.12 | Backend services |
 | pnpm | 10+ | TypeScript package management |
-| uv | 0.5.14+ | Python package management |
+| uv | 0.13.4+ | Python package management |
 | Java | 17+ | Smithy code generation |
 | Docker or Finch | — | Container image builds (required) |
+
+The preflight check (`scripts/preflight-deploy.sh`) stops the deploy when the
+Node.js or uv on your `PATH` is older than the minimum above.
 
 A running container engine is required: the MCP, Ontology, Serve, Sources and
 VKG stacks build container images, and there is no fallback without one. The
@@ -327,7 +330,7 @@ npx cdk bootstrap aws://<ACCOUNT_ID>/<REGION>
 ```bash
 git clone <repo-url> && cd ontology-accelerator
 
-# Install pinned tool versions (Python 3.12, Java 17, Node 22, pnpm 10.27.0)
+# Install pinned tool versions (Python 3.12, Java 17, Node.js, pnpm)
 curl https://mise.run | sh
 mise install
 
@@ -346,12 +349,15 @@ make deploy-dev
 
 This runs `scripts/deploy.sh` which:
 
-1. **Preflight checks** — verifies toolchain versions (Node, Java, pnpm), Docker (including ARM64 emulation on x86_64 hosts), regenerates Smithy artifacts if missing/stale, authenticates to ECR Public, checks that no teardown of the same prefix is still finishing, checks VPC quota
+1. **Preflight checks** — verifies toolchain versions (Node.js, uv, Java, pnpm), Docker (including ARM64 emulation on x86_64 hosts), regenerates Smithy artifacts if missing/stale, authenticates to ECR Public, checks that no teardown of the same prefix is still finishing, checks VPC quota
 2. **Builds all packages** — compiles TypeScript, bundles Lambdas
 3. **Synthesizes CloudFormation** — generates templates from CDK
 4. **Deploys all stacks** — CDK handles ordering via the dependency graph, deploying up to three independent stacks at once
 
 `make deploy-dev` then deploys the [Databricks SQL Warehouse connector](#the-databricks-sql-warehouse-connector). On a first deploy it starts as soon as the stacks it reads from exist, alongside the remaining platform stacks.
+
+!!! note "Existing namespaces move to a new VKG image after the deploy"
+    When a deploy changes the VKG container image (for example after `git pull` to a new release), the VKG stack starts a rollout of every existing namespace's VKG service to the new image as its last step. The rollout runs in the background: the deploy does not wait for it, and a namespace whose VKG cannot start (for example because of bad ontology artifacts) does not fail the deploy. Each service is replaced with zero downtime and rolls back on its own if the new task never becomes healthy. A service whose running tasks already have the image the deploy points at is not restarted. This is checked by image digest, so an image tag that is reused for a new build (for example `-latest`) still rolls out; if the digest cannot be read, the service is restarted to be safe. The weekly VKG sweep works the same way.
 
 !!! note "ECR Public authentication is automatic"
     `make deploy-dev` authenticates to ECR Public (`us-east-1`) as part of its preflight checks. No manual `docker login` step is needed.
@@ -441,8 +447,8 @@ Override defaults via environment variables:
 # Custom resource prefix (default: coa)
 SCL_PREFIX=myproject make deploy-dev
 
-# Use an existing VPC
-SCL_VPC_ID=vpc-abc123 make deploy-dev
+# Use an existing VPC and its OpenSearch Serverless aoss-data endpoint (see below)
+SCL_VPC_ID=vpc-abc123 SCL_AOSS_VPC_ENDPOINT_ID=vpce-0123456789abcdef0 make deploy-dev
 
 # Stacks CloudFormation deploys in parallel (default: 3); 1 deploys one stack at a time
 SCL_CDK_CONCURRENCY=1 make deploy-dev
@@ -497,6 +503,19 @@ SCL_OOPS_ENDPOINT=https://oops.example.internal/rest make deploy-dev
 
 !!! warning "Multi-region deployments"
     S3 buckets and IAM roles are globally scoped, not region-isolated. Deploying the same `SCL_PREFIX` + `env` to a second region **will collide** with an existing deployment. Use a distinct `SCL_PREFIX` per region (e.g., `coa-w2` for `us-west-2`) — do not rely on region alone to disambiguate.
+
+#### Deploying into an existing VPC
+
+With `SCL_VPC_ID`, COA looks up your VPC and creates no VPC endpoints, NAT gateway or routes in it. The VPC must already provide them.
+
+- **OpenSearch Serverless endpoint (required).** Pass the ID of the VPC's `com.amazonaws.<region>.aoss-data` interface endpoint as `SCL_AOSS_VPC_ENDPOINT_ID` (CDK context `aoss_vpc_endpoint_id`). The collection's network policy allows only this endpoint, so the deploy stops at synth if it is missing, and the preflight stops the deploy unless the endpoint is an available `aoss-data` endpoint in `SCL_VPC_ID` with private DNS enabled. The endpoint needs:
+    - private DNS enabled;
+    - a security group that allows HTTPS (TCP 443) from the CIDRs of the private subnets COA uses. If those subnets are on a secondary VPC CIDR, allowing only the primary CIDR is not enough. COA's own security groups don't exist until the first deploy, so they can't be referenced beforehand.
+- **Other AWS services.** ECS tasks, Lambda functions and the AgentCore Runtimes call S3, DynamoDB, Bedrock, Bedrock AgentCore, ECR, CloudWatch Logs, STS, SSM, Secrets Manager, SQS, Step Functions, EventBridge, Glue, Athena, Lambda, ECS, DataZone, Neptune Analytics and the OpenSearch Serverless control plane (`aoss`). Provide a NAT route from the private subnets, or a VPC endpoint for each of them.
+- **Availability Zones.** In a VPC COA creates, it pins subnets to Availability Zones that AgentCore Runtime supports. An imported VPC is not checked: put its private subnets in supported zones, or the AgentCore Runtime deploy fails with "subnets in unsupported availability zones".
+- **Database connectivity.** COA provisions no peering, Transit Gateway or PrivateLink in an imported VPC; see [Cross-network connectivity](cross-network-connectivity.md).
+
+Pass the same two variables to `make destroy-dev`.
 
 #### Tier-1 metric execution timeout
 
@@ -629,6 +648,25 @@ SCL_LAMBDA_RESERVED_CONCURRENCY=0 make deploy-dev
 ```
 
 The value must be a non-negative integer; CDK fails synth otherwise. `0` (or unset via context) omits the reservation entirely — the functions then draw from the shared unreserved pool with no dedicated guarantee or cap, which is fine for a single-tenant evaluation. On a direct `cdk deploy`, pass it as context instead — `--context lambda_reserved_concurrency=0`, or set it in the `context` block of `infra/cdk.json`.
+
+#### Guardrail safeguard tier
+
+Both Bedrock guardrails (`coa-dev-guardrail` for user queries and `coa-dev-retrieval-guardrail` for ingested documents and retrieved chunks) run on the **Classic** tier by default. Classic content filters support English, French and Spanish only, so prompt injection written in another language, Japanese for example, is not detected. The same limit applies to the denied topics. The "System internals disclosure" topic, which blocks requests for the assistant's system prompt, screens requests only, and on Classic neither it nor the prompt-attack filter supports Japanese, so a request for the prompt written in Japanese is not reliably blocked. If your users or documents are in another language, switch both guardrails to the **Standard** tier, which has [broader language support](https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-tiers.html). For a deployment whose namespaces are in Japanese, we recommend Standard.
+
+The Standard tier requires cross-Region inference through a system-defined guardrail profile, so the text a guardrail screens can be processed in any destination Region of that profile, not only the deployment Region. Pick the profile for your geography (for example `us.guardrail.v1:0`, `eu.guardrail.v1:0`, `apac.guardrail.v1:0`) and check its [destination Regions](https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-cross-region-support.html) against your data-residency requirements before you enable it. From `ap-northeast-1`, for example, `apac.guardrail.v1:0` can route to `ap-northeast-2`, `ap-northeast-3`, `ap-south-1`, `ap-southeast-1` and `ap-southeast-2`.
+
+On an existing deployment, switch in two deploys. The guardrail stack deploys before the stacks whose roles call it, so going straight to Standard leaves those roles without permission on the profile until their stacks update, and every guarded call in between fails with `AccessDeniedException`:
+
+```bash
+# 1. Grant the callers' IAM on the profile; the guardrails stay Classic
+SCL_GUARDRAIL_PROFILE=apac.guardrail.v1:0 make deploy-dev
+# 2. Switch both guardrails to Standard
+SCL_GUARDRAIL_TIER=standard SCL_GUARDRAIL_PROFILE=apac.guardrail.v1:0 make deploy-dev
+```
+
+A new deployment can go straight to step 2. CDK fails synth on `guardrail_tier=standard` without a profile and on a value that is not a profile id. On a direct `cdk deploy`, pass `--context guardrail_tier=standard --context guardrail_profile=<profile id>`. To go back to Classic, deploy without `SCL_GUARDRAIL_TIER`; keep `SCL_GUARDRAIL_PROFILE` for that deploy so the roles keep the permission until the guardrails have changed.
+
+Changing the tier updates the existing guardrails in place, and their IDs stay the same. The filter strengths are the same on both tiers, but they were tuned on Classic; the Standard tier can block text that Classic allowed, so watch the [block rate](#guardrail-observability) after you switch.
 
 #### Tier-2 NL→SQL ontology foreign-key expansion
 
@@ -818,8 +856,18 @@ environment enables them together.
 | Data stores (S3, DynamoDB) | Removed on stack deletion for easy teardown | **Retained** on stack deletion to prevent accidental data loss |
 | Graph database (Neptune) | Removed on stack deletion | **Deletion protection enabled** — a stack deletion is blocked until protection is manually disabled |
 | Web-app authentication | Development sign-in conveniences enabled | Standard secure remote-password flow only |
-| Search collection network access | Reachable for local/integration testing | **VPC-only** |
 | API request logging | Full request/response tracing | Reduced (no payload tracing) |
+
+The OpenSearch Serverless (search) collection is **VPC-only in every
+environment**, `dev` included: its network policy admits only the deployment's
+own VPC endpoint, so a request from outside the VPC is refused, even with valid
+credentials (HTTP 401 with `x-aoss-response-hint: X01:network-policy-deny`). To query it directly, connect from inside the VPC (for example
+through an SSM port-forward to a host in it), and add your IAM role to a data
+access policy of the collection: COA's policies name only its own service roles,
+so any other role gets HTTP 403 even from inside the VPC. With an existing VPC
+(`SCL_VPC_ID`), the collection admits that VPC's `aoss-data` endpoint, which you
+pass as `SCL_AOSS_VPC_ENDPOINT_ID` (see
+[Deploying into an existing VPC](#deploying-into-an-existing-vpc)).
 
 !!! note "Custom domain is a hard requirement in production"
     A production deployment with no UI custom domain fails at synth
@@ -890,6 +938,14 @@ All three metrics live in the **`COA/Guardrails`** namespace:
 
 `Component` is one of `kg-build`, `enrichment`, `ontology-shapes`,
 `nl-to-sparql`, or `serve-retrieval`.
+
+The `enrichment` guardrail screens only source-derived content: table and
+column names, types, comments, existing metadata and external evidence. COA's
+own headings and instructions are sent outside the guardrail's content,
+prompt-attack, denied-topic and PII filters, so COA's wording cannot block a
+small table.
+Word-filter policies are the exception and still check the whole message,
+including COA's instructions.
 
 **Block rate is not a stored metric** — compute it in a CloudWatch math
 expression so there is a single source of truth:
@@ -1226,6 +1282,8 @@ AWS_DEFAULT_REGION=<REGION> npx cdk destroy --all \
   --context env=dev \
   --context resource_prefix=<PREFIX>
 ```
+
+With an imported VPC, add `--context vpc_id=<VPC_ID> --context aoss_vpc_endpoint_id=<VPCE_ID>`, the values used at deploy.
 
 ## Troubleshooting
 

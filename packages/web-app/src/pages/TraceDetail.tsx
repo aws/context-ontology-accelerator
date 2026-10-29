@@ -17,8 +17,9 @@ import {
   StatusIndicator,
   Table,
 } from "@cloudscape-design/components";
-import type { TraceStep } from "@app-types";
+import type { ExecutionMode, TraceStep } from "@app-types";
 import {
+  localizeTraceStatus,
   localizeTraceStep,
   mapTraceStatus,
   tier2Title,
@@ -30,22 +31,33 @@ import { useTraceData } from "@api-hooks/use-trace-data";
 import { useCurrentNamespace } from "@components/NamespaceProvider";
 import { useAppI18n, type AppTranslate } from "../i18n/LocaleProvider";
 
-function tierBadgeColor(tier: number): "green" | "blue" | "grey" {
+function tierBadgeColor(
+  tier: number,
+  executionMode?: ExecutionMode,
+): "green" | "blue" | "grey" | "severity-low" {
+  // Mode wins over tier (same rule as the Rationale panel): a Deep Reasoning
+  // answer resolves at tier 3 but is labelled by its mode, so give it its own
+  // badge colour rather than the tier-3 grey.
+  if (executionMode === "deep-reasoning") return "severity-low";
   if (tier === 1) return "green";
   if (tier === 2) return "blue";
   return "grey";
 }
 
 /**
- * Tier outcome badge text. Tier 2 names the strategy that ran (NL→SQL and/or
- * VKG (Ontop)) through the same tier2Title the Rationale panel uses, so the
- * two views of one answer agree.
+ * Tier outcome badge text. Mode wins over tier: a Deep Reasoning answer
+ * resolves at tier 3 but must read "Deep Reasoning", not "Tier 3 — knowledge",
+ * so the full-trace page agrees with the Rationale panel (#1166). Tier 2 names
+ * the strategy that ran (NL→SQL and/or VKG (Ontop)) through the same tier2Title
+ * the Rationale panel uses, so the two views of one answer agree.
  */
 function tierOutcome(
   tier: number,
   trace: TraceStep[],
   t: AppTranslate,
+  executionMode?: ExecutionMode,
 ): string {
+  if (executionMode === "deep-reasoning") return t("Deep Reasoning");
   if (tier === 2) return tier2Title(t, trace);
   return t("Tier {tier} — {label}", {
     tier,
@@ -75,7 +87,11 @@ export function TraceDetail() {
   useBreadcrumbTrail([
     { text: t("Serve") },
     { text: t("Playground"), href: "/playground" },
-    { text: `Trace ${requestId ?? ""}`.trim() },
+    {
+      text: requestId
+        ? t("Trace {requestId}", { requestId })
+        : t("Trace detail"),
+    },
   ]);
 
   if (!resolvedTrace) {
@@ -125,6 +141,7 @@ export function TraceDetail() {
     guardrailBlocked,
     metadata,
     userQuery,
+    executionMode,
   } = resolvedTrace;
 
   const totalLatencyMs =
@@ -195,8 +212,8 @@ export function TraceDetail() {
                 {
                   label: t("Tier outcome"),
                   value: (
-                    <Badge color={tierBadgeColor(tier)}>
-                      {tierOutcome(tier, trace, t)}
+                    <Badge color={tierBadgeColor(tier, executionMode)}>
+                      {tierOutcome(tier, trace, t, executionMode)}
                     </Badge>
                   ),
                 },
@@ -383,7 +400,7 @@ function TraceTable({ trace }: { trace: TraceStep[] }) {
           header: t("Status"),
           cell: (item: IndexedTraceStep) => (
             <StatusIndicator type={mapTraceStatus(item.status)}>
-              {statusLabel(item.status, t)}
+              {localizeTraceStatus(t, item.status)}
             </StatusIndicator>
           ),
         },
@@ -471,22 +488,6 @@ function extractTier(stepId: string): number | null {
   if (stepId.startsWith("t2.") || stepId.startsWith("tier2")) return 2;
   if (stepId.startsWith("t3.") || stepId.startsWith("tier3")) return 3;
   return null;
-}
-
-function statusLabel(status: string, t: AppTranslate): string {
-  switch (status) {
-    case "success":
-      return t("Resolved");
-    case "miss":
-    case "skipped":
-      return t("Skipped");
-    case "error":
-      return t("Failed");
-    case "denied":
-      return t("Denied");
-    default:
-      return status;
-  }
 }
 
 function formatDetail(

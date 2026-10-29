@@ -232,7 +232,8 @@ these:
    them. Step 8 waits for them.
 7. **`cdk destroy` every stack except network**, with the same context
    resolution as `deploy.sh` (`SCL_PREFIX`, `SCL_PROJECT_TAG`, `SCL_VPC_ID`
-   env vars are honored), synthesized once into a per-run directory so a
+   and `SCL_AOSS_VPC_ENDPOINT_ID` env vars are honored; the last is required
+   whenever `SCL_VPC_ID` is set), synthesized once into a per-run directory so a
    concurrent CDK command in the same checkout cannot block it. CDK stops at
    the first stack that fails to delete, so the script fixes the failures a
    teardown is known to hit and runs it again: a runtime security group

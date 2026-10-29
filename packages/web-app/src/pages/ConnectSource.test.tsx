@@ -1455,6 +1455,177 @@ describe("ConnectSource — document upload failures", () => {
   }, 15000);
 });
 
+describe("ConnectSource — document chunk size", () => {
+  beforeEach(() => {
+    mockCreate.mockReset();
+    mockCreateAsync.mockReset();
+  });
+
+  /** Fill the upload step and open the collapsed "Advanced options" section. */
+  async function openAdvancedOptions() {
+    await fillDocumentUploadStep();
+    await user.click(screen.getByText("Advanced options"));
+  }
+
+  async function submitDocuments() {
+    await clickNext(); // → review (documents skip the enrichment step)
+    await user.click(screen.getByRole("button", { name: /^connect source$/i }));
+  }
+
+  function submittedExtractionConfig(): Record<string, unknown> {
+    expect(mockCreateAsync).toHaveBeenCalledTimes(1);
+    return mockCreateAsync.mock.calls[0][0].body.documentSource
+      .extractionConfig;
+  }
+
+  it("sends no chunk fields when the default is left alone", async () => {
+    render(<ConnectSource />, { wrapper });
+
+    await fillDocumentUploadStep();
+    await submitDocuments();
+
+    const cfg = submittedExtractionConfig();
+    expect(cfg).not.toHaveProperty("chunkSize");
+    expect(cfg).not.toHaveProperty("chunkOverlap");
+  });
+
+  it("sends 1024 and no overlap for the large preset", async () => {
+    render(<ConnectSource />, { wrapper });
+
+    await openAdvancedOptions();
+    await user.click(screen.getByText("Default (256 tokens)"));
+    await user.click(
+      screen.getByText("Large, for tabular or CJK text (1024 tokens)"),
+    );
+    await submitDocuments();
+
+    const cfg = submittedExtractionConfig();
+    expect(cfg.chunkSize).toBe(1024);
+    expect(cfg).not.toHaveProperty("chunkOverlap");
+  });
+
+  it("sends the custom size and overlap as numbers", async () => {
+    render(<ConnectSource />, { wrapper });
+
+    await openAdvancedOptions();
+    await user.click(screen.getByText("Default (256 tokens)"));
+    await user.click(screen.getByText("Custom"));
+    await user.type(screen.getByPlaceholderText("1024"), "2048");
+    await user.type(screen.getByPlaceholderText("25"), "100");
+    await submitDocuments();
+
+    const cfg = submittedExtractionConfig();
+    expect(cfg.chunkSize).toBe(2048);
+    expect(cfg.chunkOverlap).toBe(100);
+  });
+
+  it("leaves the overlap out when the custom overlap is empty", async () => {
+    render(<ConnectSource />, { wrapper });
+
+    await openAdvancedOptions();
+    await user.click(screen.getByText("Default (256 tokens)"));
+    await user.click(screen.getByText("Custom"));
+    await user.type(screen.getByPlaceholderText("1024"), "512");
+    await submitDocuments();
+
+    const cfg = submittedExtractionConfig();
+    expect(cfg.chunkSize).toBe(512);
+    expect(cfg).not.toHaveProperty("chunkOverlap");
+  });
+
+  it.each([
+    ["an empty size", "", "", "Enter a whole number from 1 to 4096."],
+    [
+      "a size above the range",
+      "5000",
+      "",
+      "Enter a whole number from 1 to 4096.",
+    ],
+    ["a decimal size", "10.5", "", "Enter a whole number from 1 to 4096."],
+    // 0 means "use the toolkit default" in the model, so accepting it here
+    // would silently give 256-token chunks to a user who chose Custom.
+    ["a zero size", "0", "", "Enter a whole number from 1 to 4096."],
+    ["an exponent size", "1e3", "", "Enter a whole number from 1 to 4096."],
+    ["a negative size", "-1", "", "Enter a whole number from 1 to 4096."],
+    [
+      "a zero overlap",
+      "1024",
+      "0",
+      "Enter a whole number from 1 to 512, or leave it empty.",
+    ],
+    [
+      "a non-numeric overlap",
+      "1024",
+      "abc",
+      "Enter a whole number from 1 to 512, or leave it empty.",
+    ],
+    [
+      "a size not above the default overlap",
+      "20",
+      "",
+      "Must be larger than the overlap (25 tokens).",
+    ],
+    [
+      "a size not above its own overlap",
+      "100",
+      "100",
+      "Must be larger than the overlap (100 tokens).",
+    ],
+    [
+      "an overlap above the range",
+      "1024",
+      "600",
+      "Enter a whole number from 1 to 512, or leave it empty.",
+    ],
+  ])("blocks submit for %s", async (_case, size, overlap, message) => {
+    render(<ConnectSource />, { wrapper });
+
+    await openAdvancedOptions();
+    await user.click(screen.getByText("Default (256 tokens)"));
+    await user.click(screen.getByText("Custom"));
+    if (size) await user.type(screen.getByPlaceholderText("1024"), size);
+    if (overlap) await user.type(screen.getByPlaceholderText("25"), overlap);
+    await clickNext();
+
+    expect(await screen.findByText(message)).toBeInTheDocument();
+    expect(mockCreateAsync).not.toHaveBeenCalled();
+    expect(mockUploadUrls).not.toHaveBeenCalled();
+  });
+
+  // Leaving Custom must drop what was typed there: an invalid leftover must not
+  // block submit, and a valid one must not be sent under another option.
+  it.each([
+    [
+      "Large",
+      "Large, for tabular or CJK text (1024 tokens)",
+      { chunkSize: 1024 },
+    ],
+    ["Default", "Default (256 tokens)", {}],
+  ])(
+    "drops the custom values after switching back to %s",
+    async (_case, optionLabel, expected) => {
+      render(<ConnectSource />, { wrapper });
+
+      await openAdvancedOptions();
+      await user.click(screen.getByText("Default (256 tokens)"));
+      await user.click(screen.getByText("Custom"));
+      await user.type(screen.getByPlaceholderText("1024"), "5000");
+      await user.type(screen.getByPlaceholderText("25"), "100");
+      await user.click(screen.getByText("Custom"));
+      await user.click(screen.getByText(optionLabel));
+      await submitDocuments();
+
+      const cfg = submittedExtractionConfig();
+      expect(cfg).not.toHaveProperty("chunkOverlap");
+      if ("chunkSize" in expected) {
+        expect(cfg.chunkSize).toBe(expected.chunkSize);
+      } else {
+        expect(cfg).not.toHaveProperty("chunkSize");
+      }
+    },
+  );
+});
+
 describe("ConnectSource — reserved role-name prefix in help text", () => {
   it("names the deployment's derived prefix on the Glue form", async () => {
     render(<ConnectSource />, { wrapper });
@@ -1573,5 +1744,25 @@ describe("ConnectSource — Japanese document configuration", () => {
     expect(
       screen.queryByText("Entity classes and topics (optional)"),
     ).not.toBeInTheDocument();
+  });
+
+  it("localizes the chunk size control", async () => {
+    render(<ConnectSource />, { wrapper });
+
+    await waitFor(() => {
+      expect(
+        screen.getAllByText("データソースの種類を選択").length,
+      ).toBeGreaterThan(0);
+    });
+    await user.click(screen.getByLabelText("文書"));
+    await user.click(screen.getByRole("button", { name: "次へ" }));
+    await user.click(await screen.findByText("詳細オプション"));
+
+    expect(screen.getByText("チャンクサイズ")).toBeInTheDocument();
+    await user.click(screen.getByText("既定（256 トークン）"));
+    expect(
+      screen.getByText("大（表や CJK のテキスト向け、1024 トークン）"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Default (256 tokens)")).not.toBeInTheDocument();
   });
 });

@@ -2069,6 +2069,17 @@ class TestHandleListTables:
             )
         assert status == 400
 
+    @pytest.mark.parametrize("value", ["0", "1001"])
+    def test_list_tables_out_of_range_message_names_the_accepted_range(self, value):
+        """51-1000 is accepted (reduced to 50), so the 400 must not claim the range is 1-50."""
+        with patch(f"{_DR}._SMUS_DOMAIN_ID", "domain-id"):
+            status, body = _parse(
+                _dr._handle_list_tables(self._make_list_event({"maxResults": value}), _NAMESPACE_ID, _SOURCE_ID)
+            )
+        assert status == 400
+        assert "between 1 and 1000" in body["error"]
+        assert "at most 50" in body["error"]
+
     def test_list_tables_invalid_review_status_returns_400(self):
         with patch(f"{_DR}._SMUS_DOMAIN_ID", "domain-id"):
             status, _ = _parse(

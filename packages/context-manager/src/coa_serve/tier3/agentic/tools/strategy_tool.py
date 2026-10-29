@@ -119,18 +119,24 @@ def _entity_item(entity: Any) -> dict:
     }
 
 
-def _degraded_detail(result: BaselineResult) -> str | None:
-    """Return a degradation detail if the adapter result carries an error step.
+def _degradation(result: BaselineResult) -> tuple[str, str] | None:
+    """Return machine-readable reason and detail for an adapter degradation.
 
     The adapter records a ``lexical_baseline_retrieve`` trace step with
-    ``status="error"`` when it times out or the toolkit raises (it returns an
-    empty result rather than raising — Req 9.1-9.2). When such a step is present
-    this returns its detail so the Tool can surface the degradation; otherwise
-    ``None``.
+    ``status="error"`` when it times out or the toolkit raises and
+    ``status="degraded"`` when malformed anonymous chunks were dropped. Both
+    must survive the Tool boundary so the controller marks the final response
+    partial rather than treating the invocation as fully successful.
     """
     for step in getattr(result, "trace_steps", ()) or ():
-        if isinstance(step, dict) and step.get("status") == "error":
-            return str(step.get("detail") or "retrieval degraded")
+        if not isinstance(step, dict) or step.get("status") not in {"error", "degraded"}:
+            continue
+        detail = str(step.get("detail") or "retrieval degraded")
+        if step.get("status") == "degraded" and getattr(result, "dropped_anonymous_chunks", 0):
+            return "missing_document_provenance", detail
+        if "TimeoutError" in detail:
+            return "timeout", detail
+        return "error", detail
     return None
 
 
@@ -205,19 +211,30 @@ class RetrievalStrategyTool:
                 error=str(exc),
                 error_type=type(exc).__name__,
             )
-            return ToolResult(detail=f"{self.name} error: {type(exc).__name__}")
+            return ToolResult(
+                detail=f"{self.name} error: {type(exc).__name__}",
+                degraded_reason="error",
+            )
 
         chunks = tuple(result.chunks)
         entities = tuple(result.entities)
         items = tuple(_chunk_item(c) for c in chunks) + tuple(_entity_item(e) for e in entities)
 
-        degraded = _degraded_detail(result)
-        if degraded is not None:
-            detail = f"{self.name} degraded: {degraded}"
+        degradation = _degradation(result)
+        if degradation is not None:
+            degraded_reason, degraded_detail = degradation
+            detail = f"{self.name} degraded: {degraded_detail}"
         else:
+            degraded_reason = ""
             detail = f"{self.name}: {len(chunks)} chunks, {len(entities)} entities"
 
-        return ToolResult(chunks=chunks, entities=entities, items=items, detail=detail)
+        return ToolResult(
+            chunks=chunks,
+            entities=entities,
+            items=items,
+            detail=detail,
+            degraded_reason=degraded_reason,
+        )
 
 
 def build_strategy_tools(

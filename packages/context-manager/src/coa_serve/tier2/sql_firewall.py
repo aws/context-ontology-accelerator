@@ -102,7 +102,41 @@ def _normalized_table_allowlist(allowlist_raw: list[Any] | tuple[Any, ...] | Non
     """
     if allowlist_raw is None:
         return None
-    return {str(t).lower() for t in allowlist_raw}
+    return {_grant_table_key(t) for t in allowlist_raw}
+
+
+# Athena's built-in Glue catalog. A ``database.table`` grant entry names a table
+# in it, so ``awsdatacatalog.crm_db.customers`` is the same entry.
+_ROOT_CATALOG = "awsdatacatalog"
+
+
+def _grant_table_key(entry: Any) -> str:
+    """One ``tableAllowlist`` / ``columnDenylist`` table entry, as references are matched against it.
+
+    A bare entry (``customers``) is only lower-cased, exactly as it was always
+    compared, so an existing grant behaves as before. A ``database.table`` entry
+    is lower-cased with each part unquoted, and ``awsdatacatalog.database.table``
+    reads as ``database.table``.
+    """
+    lowered = str(entry).lower()
+    if "." not in lowered:
+        return lowered
+    parts = [part.strip().strip('"`[]') for part in lowered.strip().split(".")]
+    if len(parts) == 3 and parts[0] == _ROOT_CATALOG:
+        parts = parts[1:]
+    return ".".join(parts)
+
+
+def _qualified_reference(catalog: str, database: str, table: str) -> str:
+    """``database.table`` for a reference a database-qualified grant entry can match, else ``""``.
+
+    Only a reference naming its database, in no catalog or in the root Glue
+    catalog: ``othercat.crm_db.customers`` is not the table a ``crm_db.customers``
+    grant names.
+    """
+    if not database or (catalog and catalog.lower() != _ROOT_CATALOG):
+        return ""
+    return f"{database}.{table}".lower()
 
 
 def _bare_table_name(name: str) -> str:
@@ -145,7 +179,35 @@ def tables_visible_to(tables: list[str] | None, profile: dict[str, Any] | None) 
         return names
     # A name that normalizes to nothing ("", ".", "db.") is not a table; never let
     # it match an empty-string allowlist entry.
-    return [t for t in names if (bare := _bare_table_name(t)) and bare in allowlist]
+    return [t for t in names if (bare := _bare_table_name(t)) and _name_allowed(t, bare, allowlist)]
+
+
+def _name_allowed(name: str, bare: str, allowlist: set[str]) -> bool:
+    """A listed table name passes a bare entry for its table, or a ``database.table`` entry naming it."""
+    if bare in allowlist:
+        return True
+    parts = _grant_table_key(name).split(".")
+    if len(parts) < 2:
+        return False
+    catalog = parts[-3] if len(parts) >= 3 else ""
+    qualified = _qualified_reference(catalog, parts[-2], parts[-1])
+    return bool(qualified) and qualified in allowlist
+
+
+def _cedar_table_names(tables: list[str]) -> list[str]:
+    """The referenced tables in one spelling per table, for the Cedar gate.
+
+    Lower-cased, with the root Glue catalog dropped, as grant entries are read
+    (`_grant_table_key`): ``crm_db.customers``, ``"CRM_DB".customers`` and
+    ``AwsDataCatalog.crm_db.customers`` all name one table, so a table-scoped
+    policy sees ``crm_db.customers`` for each. Order kept, duplicates dropped.
+    """
+    out: list[str] = []
+    for table in tables:
+        key = _grant_table_key(table)
+        if key and key not in out:
+            out.append(key)
+    return out
 
 
 class UnsafeSQLError(ValueError):
@@ -171,6 +233,9 @@ class _QueryRefs:
     unqualified_columns: frozenset[str]
     star_tables: frozenset[str]
     bare_star: bool
+    # One ``(bare, database.table)`` pair per distinct real-table reference; the
+    # second is "" when the reference names no database (see `_qualified_reference`).
+    table_refs: frozenset[tuple[str, str]] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -338,7 +403,7 @@ class SQLFirewall:
             for table, cols in denylist_raw.items():
                 if not isinstance(cols, (list, tuple, set, frozenset)):
                     return self._deny(f"Invalid columnDenylist format for table '{table}': expected list")
-                denylist[str(table).lower()] = {str(c).lower() for c in cols}
+                denylist[_grant_table_key(table)] = {str(c).lower() for c in cols}
 
         # No table/column restrictions on this grant — the structural allowlist/
         # denylist is "sparse opt-in" (an authorization miss returns a
@@ -358,19 +423,37 @@ class SQLFirewall:
         if refs is None:
             return self._deny("Query could not be parsed for authorization")
 
-        # Table allowlist — every referenced table must be permitted.
-        # ``refs.tables`` and ``allowlist`` are both lower-cased.
+        # Table allowlist — every referenced table must be permitted, by a bare
+        # entry for its name (which covers every table of that name, in any
+        # database) or by a ``database.table`` entry naming the database the
+        # reference names. Two databases can hold a table of the same name, and
+        # only the qualified entry tells them apart. Both sides are lower-cased.
         if allowlist is not None:
-            unauthorized = refs.tables - allowlist
+            unauthorized = {
+                qualified or bare
+                for bare, qualified in refs.table_refs
+                if bare not in allowlist and qualified not in allowlist
+            }
             if unauthorized:
                 return self._deny(f"Access denied to table(s): {', '.join(sorted(unauthorized))}")
 
         # Column denylist — per-table evaluation of referenced columns
-        # (keys/values lower-cased to match refs).
+        # (keys/values lower-cased to match refs). A bare key applies to every
+        # reference of that name; a ``database.table`` key to a reference naming
+        # that database. Columns are grouped by bare table, so with both
+        # same-named tables in one statement a qualified key is checked against
+        # the columns of either (fails closed).
+        qualified_refs = {qualified for _, qualified in refs.table_refs if qualified}
         for table_lc, denied_columns in denylist.items():
-            if table_lc not in refs.tables:
+            if "." in table_lc:
+                if table_lc not in qualified_refs:
+                    continue
+                bare_lc = table_lc.rsplit(".", 1)[-1]
+            elif table_lc in refs.tables:
+                bare_lc = table_lc
+            else:
                 continue
-            reason = self._evaluate_columns(table_lc, denied_columns, refs)
+            reason = self._evaluate_columns(bare_lc, denied_columns, refs)
             if reason:
                 return self._deny(reason)
 
@@ -402,6 +485,30 @@ class SQLFirewall:
             return FirewallResult(denied=True, authorized_sql="", reason=reason)
         return FirewallResult(denied=False, authorized_sql="")
 
+    def can_view_namespace(self, namespace: str, profile: dict[str, Any] | None = None) -> bool:
+        """Whether the principal may view this namespace (``viewNamespace``) (#1166).
+
+        The SAME right that gates reading a source's table/column schema on the
+        control-plane read routes. Used to decide whether generated SQL/SPARQL
+        artifacts may be returned: a caller who can already see the schema gains
+        no new disclosure from the query that touches it. Fails CLOSED — any
+        evaluator error returns False, so artifacts are withheld on error rather
+        than leaked. Delegates to the single ``CedarAuthorizer`` so the artifact
+        gate shares the query gate's policy source and fail-closed posture.
+        """
+        ns = namespace or str((profile or {}).get("namespace", ""))
+        try:
+            return self._cedar.can_view_namespace(namespace=ns, profile=profile or {})
+        except Exception as exc:
+            logger.warning(
+                "cedar_view_namespace_error",
+                namespace=ns,
+                error=type(exc).__name__,
+                error_msg=str(exc),
+                exc_info=True,
+            )
+            return False
+
     def _apply_cedar(self, sql: str, namespace: str, profile: dict[str, Any]) -> FirewallResult:
         """Apply the Cedar policy gate as a final authorization step.
 
@@ -411,7 +518,7 @@ class SQLFirewall:
         passed (evaluate() does not currently receive it as a parameter).
         """
         ns = namespace or str(profile.get("namespace", ""))
-        reason = self._cedar_gate(ns, profile, tables=self.extract_tables(sql))
+        reason = self._cedar_gate(ns, profile, tables=_cedar_table_names(self.extract_tables(sql)))
         if reason is not None:
             return self._deny(reason)
         return FirewallResult(denied=False, authorized_sql=sql)
@@ -602,12 +709,14 @@ class SQLFirewall:
         # alias/table-name (lowercased) -> bare table name (lowercased)
         alias_map: dict[str, str] = {}
         tables: set[str] = set()
+        table_refs: set[tuple[str, str]] = set()
         for tbl in parsed.find_all(sqlglot.exp.Table):
             name = tbl.name
             if not name or name.lower() in cte_names:
                 continue
             name_lc = name.lower()
             tables.add(name_lc)
+            table_refs.add((name_lc, _qualified_reference(tbl.catalog, tbl.db, name_lc)))
             alias_map[name_lc] = name_lc
             if tbl.alias:
                 alias_map[tbl.alias.lower()] = name_lc
@@ -645,6 +754,7 @@ class SQLFirewall:
             unqualified_columns=frozenset(unqualified),
             star_tables=frozenset(star_tables),
             bare_star=bare_star,
+            table_refs=frozenset(table_refs),
         )
 
     @staticmethod

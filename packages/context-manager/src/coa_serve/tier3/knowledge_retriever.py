@@ -31,14 +31,12 @@ if TYPE_CHECKING:
 from ..step_ids import StepId
 from ..trace import TraceCollector, client_error_detail
 from .graph_traverser import GraphTraverser
-from .synthesizer import MAX_PROMPT_CHUNKS, SynthesisResult, Synthesizer
+from .synthesizer import SynthesisResult, Synthesizer
 from .vector_retriever import VectorRetriever
 
 logger = structlog.get_logger(__name__)
 
 T = TypeVar("T")
-
-_MAX_RELATIONSHIPS_PER_ENTITY = 10
 
 # Per-source retrieval timeouts (configurable via environment).
 # TIER3_PER_SOURCE_TIMEOUT_S is a single-knob default for both sources; the
@@ -62,6 +60,112 @@ GRAPH_TRAVERSE_TIMEOUT_S = _float_env("TIER3_GRAPH_TIMEOUT", _PER_SOURCE_TIMEOUT
 OnTokenCallback = Callable[[str], Awaitable[None]]
 
 
+# Deprecated wire aliases for one release. `sourceDoc` and `label` were never in
+# the Smithy `SupportingContent` shape but they WERE on the wire, and the deployed
+# web app reads `item.sourceDoc ?? item.label ?? "Unknown source"`. Removing them
+# in the same change that renames them would make every citation in an
+# already-deployed UI render "Unknown source" the moment this service ships, with
+# no error and no alarm. Emitting both spellings removes that ordering constraint
+# for `supportingContent` only. It does not cover `graphContext`: the previous web
+# app renders the new top-level `relationships` list as blank arrow rows, so the web
+# app still has to ship before this service, or together with it. Delete this block
+# (and the note in external-docs/content/serve.md) one release after the web app
+# ships, tracked by #984.
+_EMIT_DEPRECATED_SUPPORTING_CONTENT_ALIASES = True
+
+
+def _supporting_content_from_chunk(chunk: Any, *, include_deprecated_aliases: bool = True) -> dict[str, Any]:
+    """Map a retrieved chunk to the Smithy ``SupportingContent`` wire shape.
+
+    ``source_doc`` is the opaque document identity populated by the retrieval
+    layer; ``source_doc_name`` is the separate, human-readable original file
+    name. Keeping the mapper shared prevents the hand-rolled, lexical, and
+    agentic Tier-3 paths from drifting onto legacy ``sourceDoc`` / ``label``
+    fields again.
+
+    The legacy ``sourceDoc`` / ``label`` keys are still emitted as DEPRECATED
+    ALIASES carrying exactly their previous values, so a consumer deployed before
+    this change keeps rendering citations. See
+    :data:`_EMIT_DEPRECATED_SUPPORTING_CONTENT_ALIASES`. Only Tier-3
+    ``supportingContent`` ever sent them; ``KBSearch`` passes
+    ``include_deprecated_aliases=False`` because its chunks never carried them.
+    """
+    source_document_name = getattr(chunk, "source_doc_name", "")
+    if not isinstance(source_document_name, str):
+        source_document_name = ""
+
+    supporting_content = {
+        "chunkId": chunk.chunk_id,
+        "text": chunk.text,
+        "sourceDocumentId": chunk.source_doc,
+        "relevanceScore": chunk.relevance_score,
+    }
+    if source_document_name.strip():
+        supporting_content["sourceDocumentName"] = source_document_name
+    if include_deprecated_aliases and _EMIT_DEPRECATED_SUPPORTING_CONTENT_ALIASES:
+        legacy_label = getattr(chunk, "label", "")
+        supporting_content["sourceDoc"] = chunk.source_doc
+        supporting_content["label"] = legacy_label if isinstance(legacy_label, str) else ""
+    return supporting_content
+
+
+def _has_document_provenance(chunk: Any) -> bool:
+    """Whether a chunk can be exposed as source-document supporting content."""
+    source_document_id = getattr(chunk, "source_doc", "")
+    return isinstance(source_document_id, str) and bool(source_document_id.strip())
+
+
+def _is_valid_document_chunk(chunk: Any) -> bool:
+    """Whether a chunk is safe to synthesize and expose as document evidence."""
+    chunk_id = getattr(chunk, "chunk_id", "")
+    text = getattr(chunk, "text", "")
+    return (
+        _has_document_provenance(chunk)
+        and isinstance(chunk_id, str)
+        and bool(chunk_id.strip())
+        and isinstance(text, str)
+        and bool(text.strip())
+    )
+
+
+def _validated_document_chunks(chunks: Any) -> tuple[list[Any], int]:
+    """Keep the valid document chunks of a vector result and count every drop.
+
+    The count includes chunks the retriever already rejected while mapping hits
+    (``ChunkSearchResults.dropped_anonymous_chunks``) plus any rejected here, so
+    each caller reports the same total instead of dropping evidence silently.
+    """
+    mapped_drop_count = int(getattr(chunks, "dropped_anonymous_chunks", 0) or 0)
+    valid_chunks = [chunk for chunk in chunks if _is_valid_document_chunk(chunk)]
+    return valid_chunks, mapped_drop_count + len(chunks) - len(valid_chunks)
+
+
+def _mark_dropped_document_chunks(trace_steps: list[dict], step: str, dropped_count: int) -> None:
+    """Mark one retrieval trace as degraded after provenance validation."""
+    if dropped_count <= 0:
+        return
+    suffix = f"dropped {dropped_count} anonymous or malformed document chunks"
+    for index in range(len(trace_steps) - 1, -1, -1):
+        trace_step = trace_steps[index]
+        if trace_step.get("step") != step:
+            continue
+        detail = str(trace_step.get("detail") or "")
+        trace_steps[index] = {
+            **trace_step,
+            "status": "degraded",
+            "detail": detail if suffix in detail else "; ".join(part for part in (detail, suffix) if part),
+        }
+        return
+    trace_steps.append(
+        {
+            "step": step,
+            "status": "degraded",
+            "durationMs": 0,
+            "detail": suffix,
+        }
+    )
+
+
 @dataclass(frozen=True)
 class Tier3Result:
     """Result of Tier 3 retrieval + synthesis: the answer plus supporting context."""
@@ -79,6 +183,15 @@ class Tier3Result:
     # ``degraded_sources`` at assembly time; the agentic path sets it on
     # time-budget-expiry / all-tools-fail / no-context paths (Req 7.5-7.8, 9.6-9.7).
     partial: bool = False
+    # Query artifacts the agentic path built + executed to reach its answer
+    # (#1166). ``query_used`` is the SQL, ``sparql_generated`` the SPARQL — same
+    # two fields Standard mode surfaces. When multiple structured statements ran,
+    # these carry the LAST of each kind (the query that produced the final
+    # numbers, matching Standard's single-query semantics). The hand-rolled and
+    # lexical paths leave both None. Surfaced on the QueryResult only when the
+    # caller opts in via ``options.includeDebugInfo`` — see the assembler.
+    query_used: str | None = None
+    sparql_generated: str | None = None
 
 
 class KnowledgeRetriever:
@@ -210,12 +323,26 @@ class KnowledgeRetriever:
             results[name] = gathered[i]
 
         # Extract results with fallback for failures
-        vec_chunks = []
+        vec_chunks: list[Any] = []
         if "vector_search" in results:
             vec_result, vec_ms = results["vector_search"]
             vec_chunks, vec_trace = self._classify_result(
                 vec_result, vec_ms, StepId.T3_VECTOR_SEARCH, VECTOR_SEARCH_TIMEOUT_S, degraded_sources
             )
+            vec_chunks, dropped_chunk_count = _validated_document_chunks(vec_chunks)
+            if dropped_chunk_count:
+                vec_trace["status"] = "degraded"
+                vec_trace["detail"] = (
+                    f"{len(vec_chunks)} document chunks; "
+                    f"dropped {dropped_chunk_count} anonymous or malformed document chunks"
+                )
+                degraded_sources.append(
+                    {
+                        "source": StepId.T3_VECTOR_SEARCH,
+                        "reason": "missing_document_provenance",
+                        "detail": vec_trace["detail"],
+                    }
+                )
             trace_steps.append(vec_trace)
             trace.record(
                 vec_trace["step"],
@@ -237,7 +364,7 @@ class KnowledgeRetriever:
             )
             trace.record(StepId.T3_VECTOR_SEARCH, "skipped", 0, detail=detail, parallel_group=StepId.T3_RETRIEVE)
 
-        graph_entities = []
+        graph_entities: list[Any] = []
         if "graph_traverse" in results:
             graph_result, graph_ms = results["graph_traverse"]
             graph_entities, graph_trace = self._classify_result(
@@ -345,31 +472,25 @@ class KnowledgeRetriever:
             trace.record(StepId.T3_SYNTHESIZE, "error", 0, detail=error_detail, tool_used="bedrock")
             raise
 
-        grounded_chunks = vec_chunks[:MAX_PROMPT_CHUNKS]
+        # Cite exactly what the prompt rendered: chunks the screener dropped, or that
+        # sat past the prompt cap and were never screened, are not supporting content.
+        grounded_chunks = synthesis.prompt_chunks
 
         return Tier3Result(
             synthesized_answer=synthesis.answer,
-            supporting_content=tuple(
-                {
-                    "chunkId": c.chunk_id,
-                    "text": c.text,
-                    "sourceDoc": c.source_doc,
-                    "label": c.label,
-                    "relevanceScore": c.relevance_score,
-                }
-                for c in grounded_chunks
-            ),
+            supporting_content=tuple(_supporting_content_from_chunk(c) for c in grounded_chunks),
             graph_context=tuple(
                 {
                     "uri": e.uri,
                     "label": e.label,
                     "type": e.type,
-                    "relationships": e.relationships[:_MAX_RELATIONSHIPS_PER_ENTITY],
+                    "relationships": e.relationships,
+                    "properties": getattr(e, "properties", {}),
                 }
-                for e in graph_entities
+                for e in synthesis.graph_entities
             ),
             confidence=synthesis.confidence,
-            supporting_content_truncated=len(vec_chunks) > MAX_PROMPT_CHUNKS,
+            supporting_content_truncated=len(grounded_chunks) < len(vec_chunks),
             guardrail_blocked=synthesis.guardrail_blocked,
             trace_steps=tuple(trace_steps),
             degraded_sources=tuple(degraded_sources),
@@ -398,6 +519,10 @@ class KnowledgeRetriever:
         """
         if trace is None:
             trace = TraceCollector()
+        degraded_sources: list[dict] = []
+        lexical_retriever = self._lexical
+        if lexical_retriever is None:
+            raise RuntimeError("lexical retriever is not configured")
         try:
             spec = None
             if retriever_strategy is not None:
@@ -407,16 +532,45 @@ class KnowledgeRetriever:
                 from ..lexical.strategies import STRATEGY_REGISTRY
 
                 spec = STRATEGY_REGISTRY[retriever_strategy]
-            baseline_result = await self._lexical.retrieve(query, namespace, strategy=spec)
-            trace_steps.extend(baseline_result.trace_steps)
-            for s in baseline_result.trace_steps:
+            baseline_result = await lexical_retriever.retrieve(query, namespace, strategy=spec)
+            lexical_trace_steps = [dict(step) for step in baseline_result.trace_steps]
+            mapped_drop_count = int(getattr(baseline_result, "dropped_anonymous_chunks", 0) or 0)
+            raw_chunks = list(baseline_result.chunks)
+            vec_chunks = [chunk for chunk in raw_chunks if _is_valid_document_chunk(chunk)]
+            defensive_drop_count = len(raw_chunks) - len(vec_chunks)
+            dropped_chunk_count = mapped_drop_count + defensive_drop_count
+            _mark_dropped_document_chunks(
+                lexical_trace_steps,
+                StepId.LEXICAL_BASELINE_RETRIEVE,
+                dropped_chunk_count,
+            )
+            if dropped_chunk_count:
+                degraded_sources.append(
+                    {
+                        "source": StepId.LEXICAL_BASELINE_RETRIEVE,
+                        "reason": "missing_document_provenance",
+                        "detail": f"dropped {dropped_chunk_count} anonymous or malformed document chunks",
+                    }
+                )
+            if getattr(baseline_result, "scores_unranked", False):
+                degraded_sources.append(
+                    {
+                        "source": StepId.LEXICAL_BASELINE_RETRIEVE,
+                        "reason": "relevance_scores_unavailable",
+                        "detail": (
+                            "toolkit score preservation is not installed, so every relevance score is 0.0 "
+                            "and the chunk order is not a ranking"
+                        ),
+                    }
+                )
+            trace_steps.extend(lexical_trace_steps)
+            for s in lexical_trace_steps:
                 trace.record(
                     s.get("step", "unknown"),
                     s.get("status", "unknown"),
                     s.get("durationMs", 0),
                     detail=s.get("detail"),
                 )
-            vec_chunks = list(baseline_result.chunks)
             graph_entities = list(baseline_result.entities)
         except Exception as exc:
             logger.error("lexical_retrieval_unhandled_error", error_type=type(exc).__name__, exc_info=True)
@@ -478,33 +632,27 @@ class KnowledgeRetriever:
             trace.record(StepId.T3_SYNTHESIZE, "error", 0, detail=error_detail, tool_used="bedrock")
             raise
 
-        grounded_chunks = vec_chunks[:MAX_PROMPT_CHUNKS]
+        # Cite exactly what the prompt rendered: chunks the screener dropped, or that
+        # sat past the prompt cap and were never screened, are not supporting content.
+        grounded_chunks = synthesis.prompt_chunks
         return Tier3Result(
             synthesized_answer=synthesis.answer,
-            supporting_content=tuple(
-                {
-                    "chunkId": c.chunk_id,
-                    "text": c.text,
-                    "sourceDoc": c.source_doc,
-                    "label": c.label,
-                    "relevanceScore": c.relevance_score,
-                }
-                for c in grounded_chunks
-            ),
+            supporting_content=tuple(_supporting_content_from_chunk(c) for c in grounded_chunks),
             graph_context=tuple(
                 {
                     "uri": e.uri,
                     "label": e.label,
                     "type": e.type,
-                    "relationships": e.relationships[:_MAX_RELATIONSHIPS_PER_ENTITY],
+                    "relationships": e.relationships,
+                    "properties": getattr(e, "properties", {}),
                 }
-                for e in graph_entities
+                for e in synthesis.graph_entities
             ),
             confidence=synthesis.confidence,
-            supporting_content_truncated=len(vec_chunks) > MAX_PROMPT_CHUNKS,
+            supporting_content_truncated=len(grounded_chunks) < len(vec_chunks),
             guardrail_blocked=synthesis.guardrail_blocked,
             trace_steps=tuple(trace_steps),
-            degraded_sources=(),
+            degraded_sources=tuple(degraded_sources),
         )
 
     def _record_guardrail_step(

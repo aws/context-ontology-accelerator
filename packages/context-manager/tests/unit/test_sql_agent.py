@@ -11,6 +11,7 @@ observation feeds the next generation.
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import json
 import sys
@@ -18,9 +19,10 @@ from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from coa_serve.agents import SqlAgent, build_system_prompt
+from coa_serve.agents import SqlAgent, build_system_prompt, sql_agent
 from coa_serve.agents.sql_agent import AGENT_SYSTEM_PROMPT, INTENT_REVIEW_BLOCK
 from coa_serve.clients.base import VectorHit
+from coa_serve.deadline import Deadline
 from coa_serve.sql_execution import SqlExecutionService
 from coa_serve.tier2.sql_firewall import UnsafeSQLError
 from coa_serve.tier2.tools import SqlAuthoringTool, TableCatalog
@@ -836,3 +838,74 @@ class TestSystemPrompt:
         await _run(agent)
 
         assert INTENT_REVIEW_BLOCK in strands_fake.last_agent.system_prompt
+
+
+@pytest.mark.unit
+class TestSqlAgentStops:
+    @pytest.mark.asyncio
+    async def test_sql_tools_refuse_past_the_execution_cap(self):
+        agent, mocks = _build(max_executions=2)
+        observations: list[dict] = []
+
+        async def driver(tools):
+            await tools["search_tables"]("orders", 5)
+            for _ in range(4):
+                generated = json.loads(await tools["generate_sql"](["orders"]))
+                if "handle" not in generated:
+                    observations.append(generated)
+                    continue
+                observations.append(json.loads(await tools["execute_sql"](generated["handle"])))
+
+        install_fake_strands(driver)
+        outcome = await _run(agent)
+
+        assert mocks["executor"].execute.await_count == 2
+        assert ["budget exhausted" in o.get("error", "") for o in observations] == [False, False, True, True]
+        # The statement verified before the cap is still the answer.
+        assert outcome.succeeded and outcome.executed_sql == GEN_SQL
+
+    @pytest.mark.asyncio
+    async def test_deadline_stop_keeps_the_last_verified_result(self):
+        agent, _ = _build()
+
+        async def driver(tools):
+            await _generate_and_execute(tools)
+            await asyncio.sleep(10)  # keeps looping past the deadline
+
+        install_fake_strands(driver)
+        deadline = Deadline(budget_s=sql_agent._DEADLINE_MARGIN_S + 1.0)
+        outcome = await _run(agent, deadline=deadline)
+
+        assert outcome.succeeded and outcome.executed_sql == GEN_SQL
+        assert deadline.remaining_s() > sql_agent._DEADLINE_MARGIN_S - 2
+
+    @pytest.mark.asyncio
+    async def test_generations_are_capped_without_executions(self):
+        agent, mocks = _build(max_executions=2)
+        replies: list[dict] = []
+
+        async def driver(tools):
+            await tools["search_tables"]("orders", 5)
+            for _ in range(6):
+                replies.append(json.loads(await tools["generate_sql"](["orders"])))
+
+        install_fake_strands(driver)
+        await _run(agent)
+
+        assert mocks["generator"].generate_from_context.await_count == 4  # 2 x max_executions
+        assert all("budget exhausted" in r.get("error", "") for r in replies[4:])
+
+    @pytest.mark.asyncio
+    async def test_an_outer_cancel_still_propagates(self):
+        agent, _ = _build()
+
+        async def driver(tools):
+            await asyncio.sleep(10)
+
+        install_fake_strands(driver)
+        task = asyncio.create_task(_run(agent, deadline=Deadline(budget_s=60.0)))
+        await asyncio.sleep(0.05)
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task

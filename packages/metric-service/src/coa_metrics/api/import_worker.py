@@ -33,7 +33,12 @@ from coa_metrics.api.import_job_store import (
     job_progress_frontier,
     store_job_offset_plan,
 )
-from coa_metrics.api.import_osi import _get_lookup, _osi_metric_to_definition
+from coa_metrics.api.import_osi import (
+    _get_lookup,
+    _osi_metric_to_definition,
+    _overwrite_warning,
+    label_cleared_detail,
+)
 from coa_metrics.api.import_plan_payload import (
     OffsetPlanPayload,
     PlannedMetric,
@@ -188,16 +193,16 @@ def _resolve_ontology_concepts(
         )
 
 
-def _overwrite_warning(metric_name: str, existing: MetricDefinition) -> str:
-    """Return the durable warning for a metric that existed during planning."""
-    author = existing.defined_by
-    author_detail = f" authored by {author.strip()}" if isinstance(author, str) and author.strip() else ""
-    return f"Metric '{metric_name}' overwritten (had existing metadata{author_detail})"
+def _duplicate_overwrite_warning(metric_name: str, earlier: MetricDefinition, later: MetricDefinition) -> str:
+    """Return the deterministic warning for an ordered duplicate definition.
 
-
-def _duplicate_overwrite_warning(metric_name: str) -> str:
-    """Return the deterministic warning for an ordered duplicate definition."""
-    return f"Metric '{metric_name}' overwritten by a later definition in the same import"
+    Says when the later definition clears a label the earlier one set, as the
+    sync handler's overwrite warning does for the same file.
+    """
+    return (
+        f"Metric '{metric_name}' overwritten by a later definition in the same import"
+        f"{label_cleared_detail(earlier, later)}"
+    )
 
 
 def _durable_error(index: int, osi_metric: OsiMetric, error: ValueError) -> PlannedMetric:
@@ -244,7 +249,7 @@ def _build_offset_plan(
 ) -> OffsetPlanPayload:
     """Choose logical outcomes and exact write payloads before any mutation."""
     entries: list[PlannedMetric] = []
-    planned_names: set[str] = set()
+    planned: dict[str, MetricDefinition] = {}
     approval_results: dict[str, str | None] = {}
     table_results: dict[tuple[str, str], str | None] = {}
 
@@ -268,9 +273,11 @@ def _build_offset_plan(
             entries.append(_durable_error(source_index, osi_metric, exc))
             continue
 
-        if metric_definition.name in planned_names:
+        if metric_definition.name in planned:
             disposition = MetricDisposition.UPDATE
-            warning = _duplicate_overwrite_warning(metric_definition.name)
+            warning = _duplicate_overwrite_warning(
+                metric_definition.name, planned[metric_definition.name], metric_definition
+            )
         else:
             existing = neptune.get_metric(namespace_id, metric_definition.name)
             if existing is None:
@@ -278,8 +285,8 @@ def _build_offset_plan(
                 warning = None
             else:
                 disposition = MetricDisposition.UPDATE
-                warning = _overwrite_warning(metric_definition.name, existing)
-            planned_names.add(metric_definition.name)
+                warning = _overwrite_warning(metric_definition.name, existing, metric_definition)
+        planned[metric_definition.name] = metric_definition
 
         entries.append(
             PlannedMetric(
