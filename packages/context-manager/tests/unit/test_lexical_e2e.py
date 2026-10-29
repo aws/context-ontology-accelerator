@@ -47,6 +47,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from coa_serve.lexical.baseline_retriever import BaselineLexicalRetriever
+from coa_serve.lexical.strategies import _PRESERVED_RESULT_SCORE_METADATA_KEY
 from coa_serve.models import InvokeRequest, InvokeResponse
 from coa_serve.orchestrator import Orchestrator
 from coa_serve.tier1.metric_resolver import MetricMatch
@@ -67,6 +68,19 @@ from .lexical_helpers import (
 # ── Fake toolkit engine ─────────────────────────────────────────────
 
 
+class _FakeQueryModeRetriever:
+    """The toolkit's query-mode retriever wrapper, in the shape the adapter patches.
+
+    ``_install_score_preserving_processors`` replaces ``retriever_fn`` to inject the
+    score-preserving processor chain. Without this attribute the engine looks
+    UNPATCHABLE, which the adapter now (correctly) reports as a degraded retrieval —
+    so the fake has to carry it for an end-to-end test to exercise the healthy path.
+    """
+
+    def __init__(self):
+        self.retriever_fn = lambda **kwargs: None
+
+
 class _FakeEngine:
     """Stand-in for a toolkit ``LexicalGraphQueryEngine``.
 
@@ -75,15 +89,17 @@ class _FakeEngine:
     can make the call block to exercise the timeout path).
     """
 
-    def __init__(self, nodes):
+    def __init__(self, nodes, *, patchable: bool = True):
         self._nodes = nodes
+        if patchable:
+            self.retriever = _FakeQueryModeRetriever()
 
     def retrieve(self, query: str):
         return self._nodes() if callable(self._nodes) else self._nodes
 
 
 @contextmanager
-def fake_toolkit_engine(nodes):
+def fake_toolkit_engine(nodes, *, patchable: bool = True):
     """Patch the toolkit storage factories + engine so ``build_engine`` returns a
     :class:`_FakeEngine`. All adapter code between the factory and the engine
     runs for real; only the toolkit boundary is faked.
@@ -93,7 +109,7 @@ def fake_toolkit_engine(nodes):
     only that entry point needs a return value; the deprecated semantic-guided
     entry point is no longer used by any strategy.
     """
-    fake_engine = _FakeEngine(nodes)
+    fake_engine = _FakeEngine(nodes, patchable=patchable)
     with (
         patch("graphrag_toolkit.lexical_graph.storage.GraphStoreFactory"),
         patch("graphrag_toolkit.lexical_graph.storage.VectorStoreFactory"),
@@ -116,9 +132,38 @@ def _populated_nodes():
         make_toolkit_node(
             node_id="chunk-1",
             text="Apple reported revenue of $83 billion in Q3 2022.",
-            score=0.91,
+            # The toolkit's final ClearScores processor removes the wrapper score.
+            # The adapter must recover the ranked value from raw result metadata.
+            score=None,
             metadata={
-                "source": source_metadata("AAPL-2022-Q3.pdf"),
+                "result": {
+                    "source": source_metadata(
+                        "aws:tenant:source:document-42",
+                        {
+                            "source_s3_key": "tenant/raw/source/AAPL-2022-Q3.pdf",
+                            "filename": "AAPL-2022-Q3.md",
+                        },
+                    ),
+                    "topics": [
+                        {
+                            "chunks": [
+                                {
+                                    "chunkId": "chunk-1",
+                                    "value": "Apple reported revenue of $83 billion in Q3 2022.",
+                                    "metadata": {
+                                        _PRESERVED_RESULT_SCORE_METADATA_KEY: 0.91,
+                                    },
+                                }
+                            ],
+                            "statements": [
+                                {
+                                    "statement": "Apple reported revenue of $83 billion in Q3 2022.",
+                                    "score": 0.91,
+                                }
+                            ],
+                        }
+                    ],
+                },
                 "entity_contexts": entity_contexts([("ent-apple", "Apple Inc.", "Company")]),
             },
         )
@@ -194,7 +239,12 @@ def _build_hand_rolled_orchestrator():
     vector_hit.id = "vec-c1"
     vector_hit.text = "Hand-rolled vector chunk."
     vector_hit.score = 0.77
-    vector_hit.metadata = {"source_doc": "handrolled.pdf", "label": "", "uri": ""}
+    vector_hit.metadata = {
+        "source_doc": "aws:tenant:source:handrolled-7",
+        "source_doc_name": "handrolled.pdf",
+        "label": "",
+        "uri": "",
+    }
     vector_client.search.return_value = [vector_hit]
     vector_retriever = VectorRetriever(vector_client)
 
@@ -257,9 +307,18 @@ class TestLexicalPathEndToEnd:
         # assembled supporting_content (chunk) and graph_context (entity).
         supporting = response.result.supporting_content
         assert len(supporting) == 1
-        assert supporting[0]["chunkId"] == "chunk-1"
-        assert supporting[0]["sourceDoc"] == "AAPL-2022-Q3.pdf"
-        assert supporting[0]["text"].startswith("Apple reported revenue")
+        assert supporting[0] == {
+            "chunkId": "chunk-1",
+            "text": "Apple reported revenue of $83 billion in Q3 2022.",
+            "sourceDocumentId": "aws:tenant:source:document-42",
+            "sourceDocumentName": "AAPL-2022-Q3.pdf",
+            "relevanceScore": 0.91,
+            # Deprecated aliases kept for one release so a consumer deployed
+            # before the rename still renders citations (see #984).
+            "sourceDoc": "aws:tenant:source:document-42",
+            "label": "",
+        }
+        assert supporting[0]["relevanceScore"] > 0.0
 
         entities = response.result.graph_context["entities"]
         assert len(entities) == 1
@@ -309,6 +368,28 @@ class TestLexicalPathEndToEnd:
         assert response.result.metadata["retrieverStrategy"] == "entity_based"
         lexical_steps = [s for s in _trace_steps(response) if s.step == "lexical_baseline_retrieve"]
         assert "strategy=entity_based" in lexical_steps[0].detail
+
+    async def test_unpatchable_engine_degrades_instead_of_reporting_zero_relevance(self):
+        # Score preservation reaches into two PRIVATE graphrag-toolkit attributes. A
+        # toolkit upgrade that renames either one turns the patch into a no-op, and
+        # every relevance score silently reverts to 0.0 — which reads exactly like a
+        # genuinely irrelevant result set. The miss has to be visible.
+        orch, _lexical, _synth = _build_lexical_orchestrator()
+        request = InvokeRequest(
+            query="What was Apple's revenue?",
+            namespace="550e8400-e29b-41d4-a716-446655440000",
+            options={"tierOverride": 3},
+        )
+
+        with fake_toolkit_engine(_populated_nodes(), patchable=False):
+            response = await orch.resolve(request)
+
+        lexical_steps = [s for s in _trace_steps(response) if s.step == "lexical_baseline_retrieve"]
+        assert lexical_steps[0].status == "degraded"
+        assert "every relevance score is 0.0" in lexical_steps[0].detail
+        degraded = response.result.metadata["degradedSources"]
+        assert "relevance_scores_unavailable" in [entry["reason"] for entry in degraded]
+        assert response.result.partial is True
 
     async def test_empties_propagate_when_engine_returns_no_nodes(self):
         # A populated graph that returns nothing for this query: empties must
@@ -396,7 +477,16 @@ class TestHandRolledParityEndToEnd:
 
         # The hand-rolled vector chunk propagated to supporting_content.
         assert len(response.result.supporting_content) == 1
-        assert response.result.supporting_content[0]["chunkId"] == "vec-c1"
+        assert response.result.supporting_content[0] == {
+            "chunkId": "vec-c1",
+            "text": "Hand-rolled vector chunk.",
+            "sourceDocumentId": "aws:tenant:source:handrolled-7",
+            "sourceDocumentName": "handrolled.pdf",
+            "relevanceScore": 0.77,
+            # Deprecated aliases kept for one release (see #984).
+            "sourceDoc": "aws:tenant:source:handrolled-7",
+            "label": "",
+        }
 
     async def test_parity_with_and_without_strategy_is_identical(self):
         # Resolving with a retrieverStrategy and without it produce the same

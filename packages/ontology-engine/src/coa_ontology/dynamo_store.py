@@ -26,9 +26,9 @@ from typing import Any
 from urllib.parse import quote
 
 import boto3
-from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 from coa_common.constants import RESOURCE_PREFIX
+from coa_common.s3 import regional_s3_client
 from coa_control_plane_server.models.proposal_status import ProposalStatus
 
 TABLE_NAME = os.getenv("DYNAMODB_TABLE", "ontology-engine")
@@ -94,7 +94,8 @@ def _get_s3():
         # ``Content-Type: text/turtle`` (SignatureDoesNotMatch / 403). SigV4 only
         # signs declared headers, so the browser may send any Content-Type — which
         # is what the presign_proposal_artifact_put contract relies on.
-        _s3 = boto3.client("s3", region_name=REGION, config=Config(signature_version="s3v4"))
+        # Regional hostname: see regional_s3_client.
+        _s3 = regional_s3_client(REGION)
     return _s3
 
 

@@ -47,6 +47,8 @@ import { Construct } from "constructs";
 export interface NamespaceDeletionPipelineProps {
   /** Prefixed name helper from SCLStack. */
   readonly prefixed: (name: string) => string;
+  /** OpenSearch Serverless name helper from SCLStack (at most 32 characters). */
+  readonly aossName: (name: string) => string;
   /** Bundled Python Lambda code (shared with the other namespace Lambdas). */
   readonly lambdaCode: lambda.Code;
   readonly vpc: ec2.IVpc;
@@ -168,7 +170,7 @@ export class NamespaceDeletionPipeline extends Construct {
         this,
         "NsDeletionGraphragIndexAccess",
         {
-          name: props.prefixed("ns-del-graphrag"),
+          name: props.aossName("ns-del-graphrag"),
           type: "data",
           description:
             "Allows namespace deletion to drop GraphRAG doc-KG indexes",

@@ -56,3 +56,15 @@ export function formatAppMessage(
   const template = locale === "en" ? message : CATALOGUES[locale][message];
   return interpolate(template, values);
 }
+
+/**
+ * The default-locale formatter, shaped like `AppTranslate`. Pure helpers that
+ * build user-facing text take a `t` argument; this is its default, so callers
+ * outside React (and existing tests) keep getting English.
+ */
+export function formatEnglishMessage(
+  message: AppMessage,
+  values?: AppMessageValues,
+): string {
+  return formatAppMessage("en", message, values);
+}

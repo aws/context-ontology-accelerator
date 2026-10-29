@@ -36,6 +36,18 @@ describe("TokenInput", () => {
     expect(onChange).toHaveBeenCalledWith(["orders", "products"]);
   });
 
+  it("does not add the value on the Enter that confirms an IME conversion", () => {
+    const onChange = vi.fn();
+    render(<TokenInput value={[]} onChange={onChange} ariaLabel="Topics" />);
+    const input = screen.getByLabelText("Topics");
+    fireEvent.change(input, { target: { value: "総売上" } });
+    fireEvent.keyDown(input, { key: "Enter", isComposing: true });
+    fireEvent.keyDown(input, { key: "Enter", keyCode: 229 });
+    expect(onChange).not.toHaveBeenCalled();
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(onChange).toHaveBeenCalledWith(["総売上"]);
+  });
+
   it("trims whitespace before adding", () => {
     const onChange = vi.fn();
     render(<TokenInput value={[]} onChange={onChange} ariaLabel="Tables" />);

@@ -2,16 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import * as cdk from "aws-cdk-lib";
+import * as cognito from "aws-cdk-lib/aws-cognito";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { Template, Match } from "aws-cdk-lib/assertions";
-import { WebStack } from "../../lib/stacks/foundation";
+import { IdpAuthenticationStack, WebStack } from "../../lib/stacks/foundation";
 import {
   readRepoVersion,
   buildRuntimeConfig,
 } from "../../lib/stacks/foundation/web-stack";
 import { DEFAULT_RESOURCE_PREFIX } from "../../lib/constants";
+import { IdpType, IdpAuthenticationStackProps } from "../../lib/types";
 
 const BASE_PROPS = {
   isCognitoMode: true,
@@ -117,6 +119,97 @@ describe("WebStack (Cognito ExplicitAuthFlows parity)", () => {
     expect(literals).toContain("https://app.example.com/authenticate/");
     expect(literals).toContain(
       '"ExplicitAuthFlows":["ALLOW_USER_SRP_AUTH","ALLOW_REFRESH_TOKEN_AUTH","ALLOW_USER_PASSWORD_AUTH"]',
+    );
+  });
+
+  // The same full-replacement problem, for SupportedIdentityProviders: a
+  // hardcoded ["COGNITO"] removed the SAML/OIDC providers the auth stack adds,
+  // so the hosted login page lost its "sign in with your company" button.
+  test("Cognito-only: UpdateCognitoCallbacks sends just COGNITO", () => {
+    const app = new cdk.App({
+      context: { resource_prefix: DEFAULT_RESOURCE_PREFIX, env: "dev" },
+    });
+    const template = Template.fromStack(
+      new WebStack(app, "TestWebCognitoOnly", BASE_PROPS),
+    );
+
+    const literals = joinedCallLiterals(
+      Object.values(template.findResources("Custom::AWS"))[0],
+    );
+    expect(literals).toContain('"SupportedIdentityProviders":["COGNITO"]');
+  });
+
+  test("federated: UpdateCognitoCallbacks keeps the SAML and OIDC providers", () => {
+    const app = new cdk.App({
+      context: { resource_prefix: DEFAULT_RESOURCE_PREFIX, env: "dev" },
+    });
+    const template = Template.fromStack(
+      new WebStack(app, "TestWebFederated", {
+        ...BASE_PROPS,
+        federatedIdentityProviderNames: ["EnterpriseIdP", "PartnerOidc"],
+      }),
+    );
+
+    const literals = joinedCallLiterals(
+      Object.values(template.findResources("Custom::AWS"))[0],
+    );
+    expect(literals).toContain(
+      '"SupportedIdentityProviders":["COGNITO","EnterpriseIdP","PartnerOidc"]',
+    );
+  });
+
+  test("the patch sends the same providers the auth stack gives the web client", () => {
+    const authProps: IdpAuthenticationStackProps = {
+      idpType: IdpType.SAML,
+      samlProviders: [
+        {
+          name: "EnterpriseIdP",
+          metadata: cognito.UserPoolIdentityProviderSamlMetadata.url(
+            "https://idp.example.com/saml/metadata",
+          ),
+          userPool: undefined as any, // filled by the auth stack
+        },
+      ],
+      oidcProviders: [
+        {
+          name: "PartnerOidc",
+          clientId: "partner-client",
+          clientSecret: "partner-secret",
+          issuerUrl: "https://partner.example.com",
+          userPool: undefined as any, // filled by the auth stack
+        },
+      ],
+    };
+    const app = new cdk.App({
+      context: { resource_prefix: DEFAULT_RESOURCE_PREFIX, env: "dev" },
+    });
+    const authStack = new IdpAuthenticationStack(
+      app,
+      "TestAuthParity",
+      authProps,
+    );
+    // Wired exactly as bin/app.ts does it.
+    const webStack = new WebStack(app, "TestWebParity", {
+      ...BASE_PROPS,
+      federatedIdentityProviderNames:
+        IdpAuthenticationStack.federatedProviderNames(authProps),
+    });
+    const auth = Template.fromStack(authStack);
+    const web = Template.fromStack(webStack);
+
+    const webClient = Object.values(
+      auth.findResources("AWS::Cognito::UserPoolClient", {
+        Properties: { ClientName: `${DEFAULT_RESOURCE_PREFIX}-dev-client` },
+      }),
+    )[0];
+    const declared: string[] = webClient.Properties.SupportedIdentityProviders;
+    expect(declared).toEqual(["COGNITO", "EnterpriseIdP", "PartnerOidc"]);
+
+    const literals = joinedCallLiterals(
+      Object.values(web.findResources("Custom::AWS"))[0],
+    );
+    expect(literals).toContain(
+      `"SupportedIdentityProviders":${JSON.stringify(declared)}`,
     );
   });
 });
@@ -238,6 +331,22 @@ describe("buildRuntimeConfig (version include/omit)", () => {
     const cfg = buildRuntimeConfig(base);
     expect(cfg).not.toHaveProperty("apiEndpoint");
     expect(cfg).not.toHaveProperty("serveRuntimeArn");
+  });
+
+  test("includes mcpRuntimeArn when provided", () => {
+    expect(
+      buildRuntimeConfig({ ...base, mcpRuntimeArn: "arn:aws:x:runtime/mcp" }),
+    ).toMatchObject({ mcpRuntimeArn: "arn:aws:x:runtime/mcp" });
+  });
+
+  test("omits the mcpRuntimeArn key entirely when undefined", () => {
+    expect(buildRuntimeConfig(base)).not.toHaveProperty("mcpRuntimeArn");
+  });
+
+  test("omits mcpRuntimeArn when empty", () => {
+    expect(
+      buildRuntimeConfig({ ...base, mcpRuntimeArn: "" }),
+    ).not.toHaveProperty("mcpRuntimeArn");
   });
 });
 

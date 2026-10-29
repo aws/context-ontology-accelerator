@@ -41,6 +41,15 @@ class ChunkResult:
     source_doc_name: str = ""
 
 
+class ChunkSearchResults(list[ChunkResult]):
+    """List-compatible vector result carrying mapping diagnostics."""
+
+    def __init__(self, chunks: list[ChunkResult], *, dropped_anonymous_chunks: int = 0):
+        """Store valid chunks plus the count rejected during hit mapping."""
+        super().__init__(chunks)
+        self.dropped_anonymous_chunks = dropped_anonymous_chunks
+
+
 class VectorRetriever:
     """Retrieve document chunks via k-NN search against OpenSearch."""
 
@@ -88,15 +97,43 @@ class VectorRetriever:
             index=index_name,
         )
 
-        return [
-            ChunkResult(
-                chunk_id=hit.id,
-                text=hit.text,
-                source_doc=hit.metadata.get("source_doc", ""),
-                source_doc_name=hit.metadata.get("source_doc_name", ""),
-                relevance_score=hit.score,
-                label=hit.metadata.get("label", ""),
-                uri=hit.metadata.get("uri", ""),
+        chunks: list[ChunkResult] = []
+        dropped_anonymous_chunks = 0
+        for hit in hits:
+            metadata = hit.metadata if isinstance(hit.metadata, dict) else {}
+            source_doc = metadata.get("source_doc", "")
+            chunk_id = hit.id
+            text = hit.text
+            if (
+                not isinstance(source_doc, str)
+                or not source_doc.strip()
+                or not isinstance(chunk_id, str)
+                or not chunk_id.strip()
+                or not isinstance(text, str)
+                or not text.strip()
+            ):
+                dropped_anonymous_chunks += 1
+                continue
+
+            source_doc_name = metadata.get("source_doc_name", "")
+            label = metadata.get("label", "")
+            uri = metadata.get("uri", "")
+            chunks.append(
+                ChunkResult(
+                    chunk_id=chunk_id,
+                    text=text,
+                    source_doc=source_doc.strip(),
+                    source_doc_name=source_doc_name if isinstance(source_doc_name, str) else "",
+                    relevance_score=hit.score,
+                    label=label if isinstance(label, str) else "",
+                    uri=uri if isinstance(uri, str) else "",
+                )
             )
-            for hit in hits
-        ]
+
+        if dropped_anonymous_chunks:
+            logger.warning(
+                "vector_chunks_dropped_missing_provenance",
+                dropped_count=dropped_anonymous_chunks,
+                namespace=namespace,
+            )
+        return ChunkSearchResults(chunks, dropped_anonymous_chunks=dropped_anonymous_chunks)

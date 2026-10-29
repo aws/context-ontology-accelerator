@@ -9,6 +9,7 @@ from coa_common.bedrock import (
     BedrockInvocationResult,
     BedrockTruncationError,
     GuardrailBlockedError,
+    PromptSegment,
 )
 
 __all__ = [
@@ -17,4 +18,5 @@ __all__ = [
     "BedrockTruncationError",
     "DEFAULT_MODEL_ID",
     "GuardrailBlockedError",
+    "PromptSegment",
 ]

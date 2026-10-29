@@ -468,4 +468,182 @@ describe("VkgStack", () => {
       },
     });
   });
+
+  // ── Deploy-time image rollout ─────────────────────────────────────
+
+  /** The single deploy-time rollout custom resource in a template. */
+  function rolloutResource(t: Template): {
+    id: string;
+    res: { Properties: Record<string, unknown>; DependsOn?: string[] };
+  } {
+    const found = t.findResources("Custom::AWS");
+    const entries = Object.entries(found).filter(([id]) =>
+      id.startsWith("VkgImageRollout"),
+    );
+    expect(entries).toHaveLength(1);
+    const [id, res] = entries[0];
+    return {
+      id,
+      res: res as {
+        Properties: Record<string, unknown>;
+        DependsOn?: string[];
+      },
+    };
+  }
+
+  function logicalIdOf(t: Template, type: string, prefix: string): string {
+    const ids = Object.keys(t.findResources(type)).filter((id) =>
+      id.startsWith(prefix),
+    );
+    expect(ids).toHaveLength(1);
+    return ids[0];
+  }
+
+  test("a deploy invokes the reload Lambda's sweep asynchronously", () => {
+    const { res } = rolloutResource(template);
+    const create = JSON.stringify(res.Properties.Create);
+    const update = JSON.stringify(res.Properties.Update);
+    expect(create).toEqual(update);
+    expect(create).toContain('\\"service\\":\\"Lambda\\"');
+    expect(create).toContain('\\"action\\":\\"invoke\\"');
+    // Async: a slow or failing ECS rollout must never block or fail the deploy.
+    expect(create).toContain('\\"InvocationType\\":\\"Event\\"');
+    expect(create).toContain("sweep");
+    expect(create).toContain("deploy");
+    // No onDelete: tearing the stack down must not restart services.
+    expect(res.Properties.Delete).toBeUndefined();
+  });
+
+  const ECR_CONTEXT = {
+    ecr_repository_arn:
+      "arn:aws:ecr:us-east-1:111111111111:repository/coa-images",
+    ecr_repository_name: "coa-images",
+  };
+
+  const updateProps = (r: { res: { Properties: Record<string, unknown> } }) =>
+    JSON.stringify(r.res.Properties.Update);
+
+  test("an asset-built image rolls out only when its content-hash URI changes", () => {
+    // The asset tag is the content hash: same build -> same URI -> identical
+    // properties -> CloudFormation makes no call.
+    const a1 = rolloutResource(renderVkgWithContext({}));
+    const a2 = rolloutResource(renderVkgWithContext({}));
+    expect(updateProps(a1)).toEqual(updateProps(a2));
+    expect(updateProps(a1)).not.toContain("deployId");
+  });
+
+  test("a CI image tag runs the rollout on every deploy, since the tag may be reused", () => {
+    // `{repo}:{name}-latest` is pushed again for each build, so the URI does
+    // not change when the image does. A per-synth deploy id changes the
+    // properties every time; the handler's digest check keeps it cheap.
+    const a1 = rolloutResource(
+      renderVkgWithContext({
+        ...ECR_CONTEXT,
+        vkg_image_uri: "repo:vkg-latest",
+      }),
+    );
+    const a2 = rolloutResource(
+      renderVkgWithContext({
+        ...ECR_CONTEXT,
+        vkg_image_uri: "repo:vkg-latest",
+      }),
+    );
+    expect(updateProps(a1)).toContain("vkg-latest");
+    expect(updateProps(a1)).toContain("deployId");
+    expect(updateProps(a1)).not.toEqual(updateProps(a2));
+  });
+
+  // ── Digest comparison permissions ─────────────────────────────────
+
+  /** Every statement attached to the reload Lambda's role. */
+  function reloadStatements(t: Template): Record<string, unknown>[] {
+    const policies = Object.entries(t.findResources("AWS::IAM::Policy")).filter(
+      ([id]) => id.startsWith("VkgReloadFnServiceRoleDefaultPolicy"),
+    );
+    expect(policies).toHaveLength(1);
+    return (
+      policies[0][1] as {
+        Properties: {
+          PolicyDocument: { Statement: Record<string, unknown>[] };
+        };
+      }
+    ).Properties.PolicyDocument.Statement;
+  }
+
+  test("the reload Lambda may read image digests only from the VKG image repository", () => {
+    const ctxTemplate = renderVkgWithContext({
+      ...ECR_CONTEXT,
+      vkg_image_uri: "repo:vkg-latest",
+    });
+    const ecrStatements = reloadStatements(ctxTemplate).filter((st) =>
+      JSON.stringify(st.Action).includes("ecr:"),
+    );
+    expect(ecrStatements).toEqual([
+      {
+        Action: "ecr:DescribeImages",
+        Effect: "Allow",
+        Resource: ECR_CONTEXT.ecr_repository_arn,
+      },
+    ]);
+  });
+
+  test("an asset-built image scopes ecr:DescribeImages to the asset repository", () => {
+    const ecrStatements = reloadStatements(template).filter((st) =>
+      JSON.stringify(st.Action).includes("ecr:"),
+    );
+    expect(ecrStatements).toHaveLength(1);
+    expect(ecrStatements[0].Action).toEqual("ecr:DescribeImages");
+    const resource = JSON.stringify(ecrStatements[0].Resource);
+    expect(resource).toContain("container-assets");
+    expect(resource).not.toContain('"*"');
+  });
+
+  test("the reload Lambda may list and describe tasks only in the VKG cluster", () => {
+    const statements = reloadStatements(template);
+    const list = statements.find((st) => st.Action === "ecs:ListTasks");
+    expect(list).toBeDefined();
+    expect(list!.Resource).toEqual("*");
+    expect(JSON.stringify(list!.Condition)).toContain("ecs:cluster");
+    const describe = statements.find((st) => st.Action === "ecs:DescribeTasks");
+    expect(describe).toBeDefined();
+    expect(JSON.stringify(describe!.Resource)).toContain(":task/");
+  });
+
+  test("the rollout runs after the SSM image parameter and the reload Lambda exist", () => {
+    const { res } = rolloutResource(template);
+    const ssmId = logicalIdOf(
+      template,
+      "AWS::SSM::Parameter",
+      "SsmVkgContainerImage",
+    );
+    const fnId = logicalIdOf(template, "AWS::Lambda::Function", "VkgReloadFn");
+    expect(res.DependsOn).toEqual(expect.arrayContaining([ssmId, fnId]));
+  });
+
+  test("the rollout may only invoke the reload Lambda", () => {
+    const fnId = logicalIdOf(template, "AWS::Lambda::Function", "VkgReloadFn");
+    const policies = template.findResources("AWS::IAM::Policy");
+    const rolloutPolicies = Object.entries(policies).filter(([id]) =>
+      id.startsWith("VkgImageRolloutCustomResourcePolicy"),
+    );
+    expect(rolloutPolicies).toHaveLength(1);
+    const doc = (
+      rolloutPolicies[0][1] as {
+        Properties: { PolicyDocument: { Statement: unknown[] } };
+      }
+    ).Properties.PolicyDocument;
+    expect(doc.Statement).toEqual([
+      {
+        Action: "lambda:InvokeFunction",
+        Effect: "Allow",
+        Resource: { "Fn::GetAtt": [fnId, "Arn"] },
+      },
+    ]);
+  });
+
+  test("the rollout handler function is named with the deployment prefix", () => {
+    template.hasResourceProperties("AWS::Lambda::Function", {
+      FunctionName: `${PREFIX}-vkg-image-rollout`,
+    });
+  });
 });

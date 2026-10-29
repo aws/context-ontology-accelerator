@@ -225,6 +225,41 @@ def test_data_source_id_pattern_matches_model() -> None:
     assert _pattern(_model(), "DataSourceId") == f"^{contract.DATA_SOURCE_ID_PATTERN.pattern}$"
 
 
+def test_metric_label_bounds_and_pattern_match_model() -> None:
+    text = _model()
+    assert _bound(_shape_traits(text, "MetricLabel"), "length") == (
+        contract.METRIC_LABEL_MIN_LENGTH,
+        contract.METRIC_LABEL_MAX_LENGTH,
+    )
+    assert _pattern(text, "MetricLabel") == f"^{contract.METRIC_LABEL_PATTERN.pattern}$"
+    # Same ASCII rule as NamespaceDisplayName (namespace.smithy), by contract #1295.
+    namespace_model = (_SMITHY_DIR / "namespace.smithy").read_text()
+    assert _pattern(text, "MetricLabel") == _pattern(namespace_model, "NamespaceDisplayName")
+
+
+@pytest.mark.parametrize("operation", ["CreateMetric", "UpdateMetric", "ValidateMetric"])
+def test_metric_label_input_members_target_metric_label(operation: str) -> None:
+    target, traits = _input_members(_model(), operation)["label"]
+    assert target == "MetricLabel"
+    assert not any(t.startswith("@required") for t in traits)
+
+
+def test_metric_definition_label_targets_metric_label() -> None:
+    target, traits = _structure_members(_model(), "MetricDefinition")["label"]
+    assert target == "MetricLabel"
+    assert not any(t.startswith("@required") for t in traits)
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["", "x" * (contract.METRIC_LABEL_MAX_LENGTH + 1), "a<b", "a>b", "a\x00", "a\x1f", "a\x7f"],
+    ids=["empty", "too-long", "lt", "gt", "nul", "us", "del"],
+)
+def test_check_metric_label_rejects_everything_the_model_pattern_and_length_reject(value: str) -> None:
+    """The handwritten rule is never looser than the model, so OSI import cannot store what the API refuses."""
+    assert contract.check_metric_label(value) is not None
+
+
 # ── Enforcement ──────────────────────────────────────────────────────────────
 
 

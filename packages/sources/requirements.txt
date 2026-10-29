@@ -6,6 +6,9 @@ pydantic>=2.13.5
 pydantic-settings>=2.15.0
 python-ulid>=3.2.1
 pg8000>=1.31.5
+# pg8000 1.31.5 calls scramp.make_channel_binding(), which scramp 1.5.0 removed
+# (#1376). Drop this cap once a pg8000 release supports scramp 1.5.
+scramp<1.5
 # JDBC discovery dialects (pure-Python drivers preferred for Lambda packaging):
 pymysql>=1.2.3           # MySQL
 oracledb>=2.5.1          # Oracle (thin mode — no Oracle client needed)

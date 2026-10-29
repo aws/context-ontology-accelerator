@@ -13,7 +13,7 @@ class OntologyCreate(BaseModel):
 
     uri: str
     title: str
-    ontology_type: str = "foundational"  # foundational | induced | user_created
+    ontology_type: str = "foundational"  # an OntologyType value; the route rejects anything else
     description: str | None = None
     version: str | None = None
     version_iri: str | None = None

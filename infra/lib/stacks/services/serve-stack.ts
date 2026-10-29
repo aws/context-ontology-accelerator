@@ -12,7 +12,11 @@ import * as ssm from "aws-cdk-lib/aws-ssm";
 import { DockerImageAsset, Platform } from "aws-cdk-lib/aws-ecr-assets";
 import { Construct } from "constructs";
 import type { IAlarmActionStrategy } from "cdk-monitoring-constructs/lib/common/alarm/action";
-import { resolveContext, namespaceTagKey } from "../../context";
+import {
+  resolveContext,
+  namespaceTagKey,
+  guardrailProfileResources,
+} from "../../context";
 import { agentCoreSupportedSubnets } from "../../utils/agentcore-az";
 import { retainAgentCoreSecurityGroup } from "../../utils/agentcore-teardown";
 import { brandEnv } from "../../utils/brand-env";
@@ -352,7 +356,7 @@ export class ServeStack extends SCLStack {
     );
 
     new opensearchserverless.CfnAccessPolicy(this, "OSSProxyDataAccess", {
-      name: this.prefixed("proxy-read-only"),
+      name: this.aossName("proxy-read-only"),
       type: "data",
       // NOTE: keep this description in sync with the deployed policy. AOSS's
       // UpdateAccessPolicy API rejects an update that only removes the
@@ -736,6 +740,7 @@ export class ServeStack extends SCLStack {
             `arn:aws:bedrock:*:${account}:inference-profile/*`,
             `arn:aws:bedrock:*::foundation-model/*`,
             `arn:aws:bedrock:${region}:${account}:guardrail/*`,
+            ...guardrailProfileResources(this),
           ],
         }),
       );
@@ -1264,7 +1269,7 @@ export class ServeStack extends SCLStack {
       );
 
       new opensearchserverless.CfnAccessPolicy(this, "OSSServeDataAccess", {
-        name: this.prefixed("serve-read-only"),
+        name: this.aossName("serve-read-only"),
         type: "data",
         // Keep in sync with the deployed policy — AOSS rejects a description-only
         // removal on update (see OSSProxyDataAccess note above).

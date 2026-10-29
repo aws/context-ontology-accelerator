@@ -326,7 +326,51 @@ interface Model {
   // (there is no corpus-inference pass for topics), "custom" supplies a steer.
   topicMode: TopicMode;
   preferredTopics: string[];
+  // Splitter chunk size: "default" sends nothing (the toolkit's 256 tokens),
+  // "large" sends LARGE_CHUNK_SIZE, "custom" sends the two numbers below.
+  chunkSizeMode: ChunkSizeMode;
+  chunkSize: string;
+  chunkOverlap: string;
 }
+
+/** How the document splitter's chunk size is chosen. */
+type ChunkSizeMode = "default" | "large" | "custom";
+
+// The graphrag-toolkit SentenceSplitter defaults (256 tokens, 25 overlap) apply
+// when extractionConfig carries no chunk size. The backend owns them; the
+// overlap is here only to describe it and to validate custom values against it.
+const TOOLKIT_CHUNK_OVERLAP = 25;
+// A 256-token chunk holds far fewer characters of Japanese than of English, so
+// a table that fits one English chunk is cut mid-row, and sometimes mid-number,
+// in Japanese (#1286). 1024 keeps such a table in one chunk.
+const LARGE_CHUNK_SIZE = 1024;
+// ExtractionConfig's @range on chunkSize and chunkOverlap is 0-4096 and 0-512,
+// where 0 means "use the toolkit default". Custom accepts 1 and up, because the
+// Default option is how a user asks for the toolkit default.
+const MAX_CHUNK_SIZE = 4096;
+const MAX_CHUNK_OVERLAP = 512;
+
+const CHUNK_SIZE_OPTIONS: {
+  value: ChunkSizeMode;
+  label: AppMessage;
+  description: AppMessage;
+}[] = [
+  {
+    value: "default",
+    label: "Default (256 tokens)",
+    description: "Suits prose.",
+  },
+  {
+    value: "large",
+    label: "Large, for tabular or CJK text (1024 tokens)",
+    description: "Keeps a full table row and its header in one chunk.",
+  },
+  {
+    value: "custom",
+    label: "Custom",
+    description: "Set the chunk size and overlap in tokens.",
+  },
+];
 
 /** How the entity-class vocabulary is chosen. */
 export type VocabularyMode = "infer" | "custom";
@@ -357,6 +401,8 @@ function buildExtractionConfig(model: Model): {
   preferredEntityClassifications?: string[];
   inferEntityClassifications?: boolean;
   preferredTopics?: string[];
+  chunkSize?: number;
+  chunkOverlap?: number;
 } {
   const custom = model.vocabularyMode === "custom";
   return {
@@ -373,7 +419,77 @@ function buildExtractionConfig(model: Model): {
     ...(model.topicMode === "custom" && model.preferredTopics.length > 0
       ? { preferredTopics: model.preferredTopics }
       : {}),
+    ...chunkingFields(model),
   };
+}
+
+/**
+ * The chunk fields of `extractionConfig`. "Default" sends neither field, so a
+ * source that never touches the control stores the same config as before.
+ * Custom values are validated by `validateCustomChunking` before submit.
+ */
+function chunkingFields(model: Model): {
+  chunkSize?: number;
+  chunkOverlap?: number;
+} {
+  switch (model.chunkSizeMode) {
+    case "default":
+      return {};
+    case "large":
+      return { chunkSize: LARGE_CHUNK_SIZE };
+    case "custom": {
+      const overlap = model.chunkOverlap.trim();
+      return {
+        chunkSize: Number(model.chunkSize.trim()),
+        ...(overlap ? { chunkOverlap: Number(overlap) } : {}),
+      };
+    }
+  }
+}
+
+/** A whole number in [min, max], or null. Rejects "1e3", "10.5" and "-1". */
+function parseTokenCount(raw: string, min: number, max: number): number | null {
+  const value = raw.trim();
+  if (!/^\d+$/.test(value)) return null;
+  const n = Number(value);
+  return n >= min && n <= max ? n : null;
+}
+
+/**
+ * Validate the custom chunk size and overlap. An empty overlap means the
+ * toolkit's 25 tokens, and the splitter needs the overlap to be smaller than
+ * the chunk, so the size is checked against whichever overlap will apply.
+ */
+function validateCustomChunking(
+  chunkSize: string,
+  chunkOverlap: string,
+  t: AppTranslate,
+): Pick<ValidationErrors, "chunkSize" | "chunkOverlap"> {
+  const errs: Pick<ValidationErrors, "chunkSize" | "chunkOverlap"> = {};
+  const size = parseTokenCount(chunkSize, 1, MAX_CHUNK_SIZE);
+  if (size === null) {
+    errs.chunkSize = t("Enter a whole number from 1 to {max}.", {
+      max: MAX_CHUNK_SIZE,
+    });
+  }
+  let overlap = TOOLKIT_CHUNK_OVERLAP;
+  if (chunkOverlap.trim()) {
+    const parsed = parseTokenCount(chunkOverlap, 1, MAX_CHUNK_OVERLAP);
+    if (parsed === null) {
+      errs.chunkOverlap = t(
+        "Enter a whole number from 1 to {max}, or leave it empty.",
+        { max: MAX_CHUNK_OVERLAP },
+      );
+      return errs;
+    }
+    overlap = parsed;
+  }
+  if (size !== null && overlap >= size) {
+    errs.chunkSize = t("Must be larger than the overlap ({overlap} tokens).", {
+      overlap,
+    });
+  }
+  return errs;
 }
 
 /**
@@ -499,6 +615,9 @@ const initialModel: Model = {
   preferredEntityClassifications: [],
   topicMode: "auto",
   preferredTopics: [],
+  chunkSizeMode: "default",
+  chunkSize: "",
+  chunkOverlap: "",
 };
 
 // ── Validation ────────────────────────────────────────────────────────────────
@@ -668,6 +787,8 @@ interface ValidationErrors {
   docS3BucketArn?: string;
   preferredEntityClassifications?: string;
   preferredTopics?: string;
+  chunkSize?: string;
+  chunkOverlap?: string;
   docS3Prefixes?: Record<number, string>;
 }
 
@@ -818,7 +939,7 @@ function validateStep2(
       const prefixErrs: Record<number, string> = {};
       model.docS3Prefixes.forEach(({ id, value }) => {
         if (!value.trim()) return;
-        const e = validateS3Prefix(value);
+        const e = validateS3Prefix(value, t);
         if (e) prefixErrs[id] = e;
       });
       if (Object.keys(prefixErrs).length > 0) errs.docS3Prefixes = prefixErrs;
@@ -836,6 +957,12 @@ function validateStep2(
     }
     if (model.topicMode === "custom" && model.preferredTopics.length === 0) {
       errs.preferredTopics = "Add at least one topic, or choose “Automatic”.";
+    }
+    if (model.chunkSizeMode === "custom") {
+      Object.assign(
+        errs,
+        validateCustomChunking(model.chunkSize, model.chunkOverlap, t),
+      );
     }
   }
   if (Object.keys(errs).length > 0) errs.step1 = t("Fix the errors above.");
@@ -1158,6 +1285,15 @@ export const ConnectSource: React.FC = () => {
     () =>
       showErrors[1] ? validateStep2(model, docTab, t, resourcePrefix) : {},
     [showErrors, model, docTab, t, resourcePrefix],
+  );
+  const chunkSizeOptions = useMemo(
+    () =>
+      CHUNK_SIZE_OPTIONS.map((option) => ({
+        ...option,
+        label: t(option.label),
+        description: t(option.description),
+      })),
+    [t],
   );
 
   const steps: WizardProps.Step[] = useMemo(() => {
@@ -2336,7 +2472,7 @@ export const ConnectSource: React.FC = () => {
                         ariaLabel={t("Entity class labels")}
                         itemLabelPlural="classes"
                         validate={(candidate, existing) =>
-                          validateClassification(candidate, existing)
+                          validateClassification(candidate, existing, t)
                         }
                       />
                     )}
@@ -2403,7 +2539,7 @@ export const ConnectSource: React.FC = () => {
                         ariaLabel={t("Preferred topic names")}
                         itemLabelPlural="topics"
                         validate={(candidate, existing) =>
-                          validateTopic(candidate, existing)
+                          validateTopic(candidate, existing, t)
                         }
                       />
                     )}
@@ -2416,6 +2552,64 @@ export const ConnectSource: React.FC = () => {
               variant="container"
             >
               <SpaceBetween size="l">
+                <FormField
+                  label={t("Chunk size")}
+                  description={t(
+                    "How much text goes into each unit that is extracted and embedded. A larger chunk keeps a full table row and its header together; raise it for CJK or dense, tabular documents.",
+                  )}
+                >
+                  <Select
+                    selectedOption={
+                      chunkSizeOptions.find(
+                        (o) => o.value === model.chunkSizeMode,
+                      ) ?? null
+                    }
+                    onChange={({ detail }) => {
+                      const selected = chunkSizeOptions.find(
+                        (o) => o.value === detail.selectedOption.value,
+                      );
+                      if (selected) setField("chunkSizeMode", selected.value);
+                    }}
+                    options={chunkSizeOptions}
+                  />
+                </FormField>
+                {model.chunkSizeMode === "custom" && (
+                  <>
+                    <FormField
+                      label={t("Chunk size (tokens)")}
+                      constraintText={t("A whole number from 1 to {max}.", {
+                        max: MAX_CHUNK_SIZE,
+                      })}
+                      errorText={step2Errs.chunkSize}
+                    >
+                      <Input
+                        value={model.chunkSize}
+                        onChange={({ detail }) =>
+                          setField("chunkSize", detail.value)
+                        }
+                        inputMode="numeric"
+                        placeholder={String(LARGE_CHUNK_SIZE)}
+                      />
+                    </FormField>
+                    <FormField
+                      label={t("Chunk overlap (tokens)")}
+                      constraintText={t(
+                        "Optional. Leave empty to use {overlap}. Must be smaller than the chunk size.",
+                        { overlap: TOOLKIT_CHUNK_OVERLAP },
+                      )}
+                      errorText={step2Errs.chunkOverlap}
+                    >
+                      <Input
+                        value={model.chunkOverlap}
+                        onChange={({ detail }) =>
+                          setField("chunkOverlap", detail.value)
+                        }
+                        inputMode="numeric"
+                        placeholder={String(TOOLKIT_CHUNK_OVERLAP)}
+                      />
+                    </FormField>
+                  </>
+                )}
                 <FormField
                   description={t("Tracks document versions in Neptune.")}
                 >
@@ -2738,6 +2932,7 @@ export const ConnectSource: React.FC = () => {
     datasourceExternalId,
     namespaceLoading,
     namespaceLoadFailed,
+    chunkSizeOptions,
   ]);
 
   return (

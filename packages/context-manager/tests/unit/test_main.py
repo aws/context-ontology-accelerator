@@ -974,6 +974,77 @@ class TestHandleKbSearch:
     """Test defensive query validation on the isolated KB search handler."""
 
     @pytest.mark.asyncio
+    async def test_handle_kb_search_omits_blank_optional_source_document_name(self):
+        from coa_serve.main import _handle_kb_search
+        from coa_serve.tier3.vector_retriever import ChunkResult
+
+        vector_retriever = AsyncMock()
+        vector_retriever.search.return_value = [
+            ChunkResult(
+                chunk_id="chunk-1",
+                text="Evidence",
+                source_doc="aws:tenant:source:document-17",
+                source_doc_name="",
+                relevance_score=0.8,
+            )
+        ]
+        bedrock_client = AsyncMock()
+        bedrock_client.embed.return_value = [0.1, 0.2]
+        bedrock_client._embed_model_id = "embed-model"
+        mock_orchestrator = MagicMock()
+        mock_orchestrator._knowledge_retriever._vector = vector_retriever
+        mock_orchestrator._bedrock_client = bedrock_client
+
+        with patch("coa_serve.main._orchestrator", mock_orchestrator):
+            result = await _handle_kb_search(
+                {"query": "evidence", "namespace": "test-ns"},
+                "req-provenance",
+            )
+
+        assert result["chunks"][0]["sourceDocumentId"] == "aws:tenant:source:document-17"
+        assert "sourceDocumentName" not in result["chunks"][0]
+        # The deprecated `sourceDoc` / `label` aliases are Tier-3-only: KBSearch never sent them.
+        assert "sourceDoc" not in result["chunks"][0]
+        assert "label" not in result["chunks"][0]
+
+    @pytest.mark.asyncio
+    async def test_handle_kb_search_reports_dropped_provenance_less_chunks_as_degraded(self):
+        from coa_serve.main import _handle_kb_search
+        from coa_serve.tier3.vector_retriever import ChunkResult, ChunkSearchResults
+
+        vector_retriever = AsyncMock()
+        vector_retriever.search.return_value = ChunkSearchResults(
+            [
+                ChunkResult(
+                    chunk_id="chunk-1",
+                    text="Evidence",
+                    source_doc="aws:tenant:source:document-17",
+                    relevance_score=0.8,
+                ),
+                ChunkResult(chunk_id="chunk-2", text="Orphan", source_doc="", relevance_score=0.7),
+            ],
+            dropped_anonymous_chunks=2,
+        )
+        bedrock_client = AsyncMock()
+        bedrock_client.embed.return_value = [0.1, 0.2]
+        bedrock_client._embed_model_id = "embed-model"
+        mock_orchestrator = MagicMock()
+        mock_orchestrator._knowledge_retriever._vector = vector_retriever
+        mock_orchestrator._bedrock_client = bedrock_client
+
+        with patch("coa_serve.main._orchestrator", mock_orchestrator):
+            result = await _handle_kb_search(
+                {"query": "evidence", "namespace": "test-ns"},
+                "req-dropped",
+            )
+
+        assert [chunk["chunkId"] for chunk in result["chunks"]] == ["chunk-1"]
+        search_steps = [step for step in result["trace"] if step["step"] == "t3.vector_search"]
+        assert len(search_steps) == 1
+        assert search_steps[0]["status"] == "degraded"
+        assert search_steps[0]["detail"] == "1 chunks; dropped 3 anonymous or malformed document chunks"
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("query", [42, "x" * 4001])
     async def test_handle_kb_search_rejects_invalid_query_before_embedding(self, query):
         from coa_serve.main import _handle_kb_search
@@ -1435,7 +1506,16 @@ class TestHandleGraphTraverseOptions:
                 uri=f"urn:e:{i}",
                 label=f"e{i}",
                 type="T",
-                relationships=({"predicate": "urn:p", "target_uri": f"urn:t:{i}", "target_label": "t"},),
+                relationships=(
+                    {
+                        "source_uri": f"urn:e:{i}",
+                        "source_label": f"e{i}",
+                        "predicate_uri": "urn:p",
+                        "predicate_label": "p",
+                        "target_uri": f"urn:t:{i}",
+                        "target_label": "t",
+                    },
+                ),
             )
             for i in range(n)
         ]

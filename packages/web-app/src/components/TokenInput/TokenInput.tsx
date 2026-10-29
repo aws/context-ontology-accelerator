@@ -29,6 +29,7 @@ import Button from "@cloudscape-design/components/button";
 import Input from "@cloudscape-design/components/input";
 import SpaceBetween from "@cloudscape-design/components/space-between";
 import TokenGroup from "@cloudscape-design/components/token-group";
+import { isSubmitEnter } from "@utils/keyboard";
 import { useAppI18n, type AppTranslate } from "../../i18n/LocaleProvider";
 import type { AppMessage } from "../../i18n/appMessages";
 
@@ -164,7 +165,7 @@ export const TokenInput: React.FC<TokenInputProps> = ({
             if (error || notice) clearMessages();
           }}
           onKeyDown={(event) => {
-            if (event.detail.key === "Enter") {
+            if (isSubmitEnter(event.detail)) {
               // Prevent the keypress from submitting an enclosing form.
               event.preventDefault();
               addTokens();

@@ -174,6 +174,16 @@ _FAKE_AWS = textwrap.dedent(
         elif [ -f "$ST/network-slow" ]; then echo DELETE_IN_PROGRESS
         else echo CREATE_COMPLETE; fi ;;
       *"describe-stacks"*"coa-dev-old-structured"*) echo CREATE_COMPLETE ;;
+      *"describe-stacks"*"coa-integ-aoss-inspect"*)  # tests/cdk's inspect stack, in the VPC
+        case "$S" in
+          inspect) [ -f "$ST/inspect-deleted" ] && gone inspect; echo CREATE_COMPLETE ;;
+          inspectfail) echo DELETE_FAILED ;;
+          inspectunknown) echo "An error occurred (Throttling) when calling DescribeStacks" >&2; exit 254 ;;
+          inspectflaky)  # throttled once at step 6, then seen: it exists and was never deleted
+            if [ -f "$ST/inspect-looked" ]; then echo CREATE_COMPLETE
+            else touch "$ST/inspect-looked"; echo "An error occurred (Throttling)" >&2; exit 254; fi ;;
+          *) gone inspect ;;
+        esac ;;
       *"describe-stacks"*"coa-dev-namespace"*)
         case "$S" in domainerror|domainmismatch) echo CREATE_COMPLETE ;; *) gone coa-dev-namespace ;; esac ;;
       *"describe-stacks"*"coa-dev-storage"*)
@@ -198,6 +208,7 @@ _FAKE_AWS = textwrap.dedent(
         [ "$S" = lambdapinned ] && [ ! -f "$ST/lambda-eni-deleted" ] && f="$f,$FAKE_NETWORK_SG_FAILURE"
         echo "{\"StackResourceSummaries\":[$f]}" ;;
       *"list-stack-resources"*"coa-dev-network"*) printf 'AWS::EC2::VPC\tvpc-123\n' ;;
+      *"delete-stack"*"coa-integ-aoss-inspect"*) touch "$ST/inspect-deleted" ;;
       *"delete-stack"*"-coa-connector"*)
         if [ -f "$ST/conn-deleted" ]; then touch "$ST/conn-redeleted"; else touch "$ST/conn-deleted"; fi ;;
       *"delete-stack"*"coa-dev-mcp"*"--retain-resources"*)
@@ -209,7 +220,7 @@ _FAKE_AWS = textwrap.dedent(
           ownerlive|throttle|orphan|rerunsgfail|review|sgretry|otherenv|ourdomain|sgfailonce|connbusy)
             touch "$ST/network-gone" ;;
           released) if [ -f "$ST/sgs-deleted" ]; then touch "$ST/network-gone"; else touch "$ST/network-deleting"; fi ;;
-          domaingone) touch "$ST/network-gone" ;;
+          domaingone|inspect|inspectfail|inspectunknown|inspectflaky) touch "$ST/network-gone" ;;
           netslow) touch "$ST/network-slow" ;;
           refused) echo "An error occurred (ValidationError): Role is invalid or cannot be assumed" >&2; exit 254 ;;
           lambda)
@@ -244,7 +255,7 @@ _FAKE_PNPM = textwrap.dedent(
         clean|lambda|imported|netfail|netpinned|heldnetfail|sgnotfound|natleft|refused|enideny|foreign) exit 0 ;;
         listfail|sibling|connretry|conninprogress|onefail|ownerlive|throttle) exit 0 ;;
         orphan|rerunsgfail|review|sgretry|netsgpinned|lambdapinned|released|otherenv|ourdomain) exit 0 ;;
-        sgfailonce|connbusy|foreigneni|domaingone|netslow) exit 0 ;;
+        sgfailonce|connbusy|foreigneni|domaingone|netslow|inspect|inspectfail|inspectunknown|inspectflaky) exit 0 ;;
         rerunfail) exit 1 ;;
       esac
       if [ ! -f "$ST/mcp-fixed" ]; then touch "$ST/mcp-failed"; exit 1; fi
@@ -491,6 +502,7 @@ def test_anything_else_holding_the_rest_is_a_failure_not_deferred(tmp_path: Path
     assert code == 1, output
     assert marker in output
     assert "Teardown deferred" not in output
+    assert "unbound variable" not in output
 
 
 def test_a_change_set_only_stack_is_not_a_leftover(tmp_path: Path) -> None:
@@ -568,15 +580,32 @@ def test_already_deleted_security_group_is_not_pending(tmp_path: Path) -> None:
     assert code == 0, output
 
 
+# An imported VPC needs its OpenSearch Serverless endpoint: synth fails without it.
+_IMPORTED_VPC = {"SCL_VPC_ID": "vpc-imported", "SCL_AOSS_VPC_ENDPOINT_ID": "vpce-0abc123def4567890"}
+
+
 def test_imported_vpc_deletes_the_network_stack_and_waits_only_for_the_groups(tmp_path: Path) -> None:
-    code, output, calls = _run(tmp_path, "imported", SCL_VPC_ID="vpc-imported")
+    code, output, calls = _run(tmp_path, "imported", **_IMPORTED_VPC)
     assert code == 3, output
     assert "delete-stack --stack-name coa-dev-network" in calls
     assert "aws ec2 delete-security-group --region us-east-1 --group-id sg-mcp" in output
 
 
+def test_imported_vpc_rerun_command_keeps_the_vpc_variables(tmp_path: Path) -> None:
+    code, output, _ = _run(tmp_path, "imported", **_IMPORTED_VPC)
+    assert code == 3, output
+    assert "SCL_VPC_ID=vpc-imported SCL_AOSS_VPC_ENDPOINT_ID=vpce-0abc123def4567890 ./scripts/destroy.sh" in output
+
+
+def test_imported_vpc_without_endpoint_fails_before_synth(tmp_path: Path) -> None:
+    code, output, calls = _run(tmp_path, "imported", SCL_VPC_ID="vpc-imported")
+    assert code == 1, output
+    assert "also set SCL_AOSS_VPC_ENDPOINT_ID" in output
+    assert "cdk" not in calls
+
+
 def test_imported_vpc_waits_for_the_enis_too(tmp_path: Path) -> None:
-    code, output, _ = _run(tmp_path, "imported", SCL_VPC_ID="vpc-imported", SCL_ENI_WAIT_MAX_SECONDS="1")
+    code, output, _ = _run(tmp_path, "imported", **_IMPORTED_VPC, SCL_ENI_WAIT_MAX_SECONDS="1")
     assert code == 3, output
     assert "Waiting up to 1s" in output
 
@@ -586,3 +615,41 @@ def test_region_split_is_refused(tmp_path: Path) -> None:
     assert code == 1, output
     assert "set them to the same region" in output
     assert "delete-agent-runtime" not in calls
+
+
+def test_the_aoss_inspect_stack_is_deleted_before_the_network_stack(tmp_path: Path) -> None:
+    code, output, calls = _run(tmp_path, "inspect")
+    assert code == 0, output
+    delete_inspect = "delete-stack --stack-name coa-integ-aoss-inspect"
+    assert calls.index(delete_inspect) < calls.index("delete-stack --stack-name coa-dev-network")
+    # Awaited in step 8, and its detached Lambda ENIs are swept like the deployment's own.
+    assert calls.rindex("describe-stacks --stack-name coa-integ-aoss-inspect") > calls.index(delete_inspect)
+    assert "AWS Lambda VPC ENI-coa-integ-aoss-inspect*" in calls
+
+
+def test_a_deployment_without_the_inspect_stack_never_mentions_it(tmp_path: Path) -> None:
+    # The inspect stack is internal test infrastructure; customers never have it.
+    code, output, _ = _run(tmp_path, "clean")
+    assert code == 0, output
+    assert "aoss-inspect" not in output
+
+
+def test_an_aoss_inspect_stack_that_will_not_delete_fails_the_teardown(tmp_path: Path) -> None:
+    code, output, calls = _run(tmp_path, "inspectfail")
+    assert code == 1, output
+    assert calls.count("delete-stack --stack-name coa-integ-aoss-inspect") == 2  # again after the ENI sweep
+    assert "coa-integ-aoss-inspect\tDELETE_FAILED" in output
+
+
+def test_a_failed_inspect_stack_lookup_does_not_mark_a_customer_run_unverified(tmp_path: Path) -> None:
+    code, output, calls = _run(tmp_path, "inspectunknown")
+    assert code == 0, output
+    assert "Could not check for the integ test inspect stack" in output
+    assert "delete-stack --stack-name coa-integ-aoss-inspect" not in calls
+
+
+def test_an_inspect_stack_hidden_by_a_failed_lookup_is_still_reported(tmp_path: Path) -> None:
+    code, output, calls = _run(tmp_path, "inspectflaky")
+    assert code == 1, output
+    assert "coa-integ-aoss-inspect\tCREATE_COMPLETE" in output
+    assert "delete-stack --stack-name coa-integ-aoss-inspect" not in calls

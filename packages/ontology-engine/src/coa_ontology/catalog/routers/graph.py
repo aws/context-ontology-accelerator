@@ -36,6 +36,9 @@ from coa_control_plane_server.models import (
     GetOntologyOverviewResponseContent as _OntologyOverview,
 )
 from coa_control_plane_server.models import (
+    GraphVertexKind as _GraphVertexKind,
+)
+from coa_control_plane_server.models import (
     OntologyClassSummary as _OntologyClassSummary,
 )
 from coa_control_plane_server.models import (
@@ -49,6 +52,7 @@ from coa_ontology.catalog.graph_schemas import (
     GraphVertex,
 )
 from coa_ontology.catalog.namespace_language import label_preference_for
+from coa_ontology.query_params import require_enum_value
 from coa_ontology.stores import build_stores
 from coa_ontology.stores.base import GraphStore
 
@@ -81,6 +85,15 @@ _MAX_SEARCH_LIMIT = 500
 # reach tens of thousands of classes. Equals the Smithy GraphSearch ``offset``
 # @range max (and GetOntologyOverview's).
 _MAX_SEARCH_OFFSET = 1_000_000
+# GraphSearch ``q`` @length max. ``q`` is escaped into a SPARQL CONTAINS filter;
+# the bound keeps that query (and the request) a sane size. No minimum: the UI
+# sends an empty or ``*`` query to list a namespace's entities.
+_MAX_SEARCH_QUERY_LENGTH = 4000
+# GetOntologyOverview ``limit`` / ``offset`` @range bounds. Without them a
+# negative ``limit`` slices the last items off the page (``items[0:-1]``) and a
+# negative ``offset`` reads as 0.
+_MAX_OVERVIEW_LIMIT = 10_000
+_MAX_OVERVIEW_OFFSET = 1_000_000
 
 # Fixed client-facing messages: backend exception text (store class names,
 # endpoints) is logged, never returned, and the caller's own URI is not echoed.
@@ -161,6 +174,9 @@ def search_entities(
     is the number of distinct matches across all pages so the client can render
     a known page count.
     """
+    if len(q) > _MAX_SEARCH_QUERY_LENGTH:
+        raise HTTPException(400, f"q must be at most {_MAX_SEARCH_QUERY_LENGTH} characters")
+    require_enum_value("kind", kind, _GraphVertexKind)
     if ontology_id and exclude_ontology_id:
         raise HTTPException(400, "Cannot use both ontology_id and exclude_ontology_id")
     if exclude_ontology_id is not None and not exclude_ontology_id.strip():
@@ -229,7 +245,14 @@ def get_ontology_overview(
     Returns 501 when the active backend cannot enumerate graphs (e.g.
     Neptune Analytics). An ontology that exists but has no schema triples
     yields a 200 with empty lists.
+
+    ``limit`` (1-10000) and ``offset`` (0-1000000) out of range are a 400, as on
+    ``/graph/search``.
     """
+    if not 0 <= offset <= _MAX_OVERVIEW_OFFSET:
+        raise HTTPException(400, f"offset must be between 0 and {_MAX_OVERVIEW_OFFSET}")
+    if limit is not None and not 1 <= limit <= _MAX_OVERVIEW_LIMIT:
+        raise HTTPException(400, f"limit must be between 1 and {_MAX_OVERVIEW_LIMIT}")
     graph = _graph(namespace)
     preference = label_preference_for(namespace)
     try:
@@ -252,8 +275,7 @@ def get_ontology_overview(
     all_datatype_properties = overview.get("datatype_properties", [])
 
     def _page(items: list) -> list:
-        start = max(offset, 0)
-        return items[start : start + limit] if limit is not None else items[start:]
+        return items[offset : offset + limit] if limit is not None else items[offset:]
 
     # Construct the generated model. The store returns dicts with snake_case
     # keys; the generated model accepts them via populate_by_name=True. Each

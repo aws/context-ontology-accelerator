@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from coa_common.constants import RESOURCE_PREFIX
+from structlog.testing import capture_logs
 
 pytestmark = pytest.mark.unit
 
@@ -74,7 +75,14 @@ def _stub_missing_modules() -> None:
     # Populate attributes that @patch decorators need to find on the stub modules.
     # patch() requires the attribute to already exist before it can replace it.
     lg = sys.modules["graphrag_toolkit.lexical_graph"]
-    for attr in ["LexicalGraphIndex", "GraphRAGConfig", "ExtractionConfig", "IndexingConfig", "add_versioning_info"]:
+    for attr in [
+        "LexicalGraphIndex",
+        "GraphRAGConfig",
+        "ExtractionConfig",
+        "IndexingConfig",
+        "TenantId",
+        "add_versioning_info",
+    ]:
         if not hasattr(lg, attr):
             setattr(lg, attr, MagicMock())
 
@@ -1415,6 +1423,39 @@ class TestMainFlow:
         mock_index.extract_and_build.assert_called_once()
 
 
+class TestWarnIfNoTopics:
+    @staticmethod
+    def _store(mock_gsf, *counts):
+        graph_store = MagicMock()
+        graph_store.execute_query.side_effect = [[{"n": n}] for n in counts]
+        mock_gsf.for_graph_store.return_value.__enter__ = MagicMock(return_value=graph_store)
+        mock_gsf.for_graph_store.return_value.__exit__ = MagicMock(return_value=False)
+        return graph_store
+
+    @patch("graphrag_toolkit.lexical_graph.storage.GraphStoreFactory")
+    def test_warn_if_no_topics_zero_topics_logs_warning_with_chunk_count(self, mock_gsf, mod):
+        self._store(mock_gsf, 0, 4)
+        with capture_logs() as logs:
+            mod._warn_if_no_topics("neptune-db://x", "abc123", "ds-001", 1)
+        warnings = [e for e in logs if e["event"] == "kg_build_zero_topics_extracted"]
+        assert len(warnings) == 1
+        assert warnings[0]["log_level"] == "warning"
+        assert (warnings[0]["doc_source_id"], warnings[0]["docs"], warnings[0]["chunks"]) == ("ds-001", 1, 4)
+
+    @patch("graphrag_toolkit.lexical_graph.storage.GraphStoreFactory")
+    def test_warn_if_no_topics_topics_present_logs_nothing(self, mock_gsf, mod):
+        graph_store = self._store(mock_gsf, 7)
+        with capture_logs() as logs:
+            mod._warn_if_no_topics("neptune-db://x", "abc123", "ds-001", 1)
+        assert not [e for e in logs if e["event"] == "kg_build_zero_topics_extracted"]
+        graph_store.execute_query.assert_called_once()
+
+    @patch("graphrag_toolkit.lexical_graph.storage.GraphStoreFactory")
+    def test_warn_if_no_topics_query_error_does_not_raise(self, mock_gsf, mod):
+        mock_gsf.for_graph_store.side_effect = RuntimeError("neptune down")
+        mod._warn_if_no_topics("neptune-db://x", "abc123", "ds-001", 1)
+
+
 # ===================================================================
 # 9. AOSS NEXTGEN patch
 # ===================================================================
@@ -2012,17 +2053,48 @@ class TestNamespaceLanguagePrompts:
             assert "# Output Language (REQUIRED)" in template
             assert "Write your output in Japanese (BCP 47 tag `ja`)" in template
             # Identifiers stay verbatim.
-            assert "Copy identifiers exactly as printed" in template
+            assert "Copy identifiers exactly as printed, whatever script they use" in template
 
     def test_instruction_overrides_the_toolkit_uppercase_relationship_rule(self, mod):
         # EXTRACT_TOPICS_PROMPT asks for uppercase underscore relationship and
         # attribute names with English examples (WORKS_FOR); a ja ingest then
         # emitted BELONGS_TO, which became the object-property label BELONGS TO.
         instruction = mod._extraction_language_instruction("ja")
-        assert "relationship or attribute names in uppercase with underscores" in instruction
-        assert "that rule sets the format, not the language" in instruction
-        assert "write each such name in the output language" in instruction
+        assert (
+            "Relationship and attribute names keep the uppercase-with-underscores format, "
+            "written in Japanese (BCP 47 tag `ja`)."
+        ) in instruction
+        # The format-vs-language clarification must survive: for ja/zh/ko
+        # "uppercase with underscores" has no literal meaning, so the prompt
+        # spells out that it applies only to cased letters and that an underscore
+        # stands only where a space would be (restored from e64c8938a).
         assert "Uppercase applies only to letters that have case" in instruction
+        assert "an underscore stands only where the name would otherwise contain a space" in instruction
+
+    @pytest.mark.parametrize("language", ["es-419", "ko", "zh-Hans"])
+    def test_topics_template_pins_english_response_labels(self, language, mod, fake_toolkit_prompts):
+        # The toolkit parser matches the response-format labels literally and
+        # case-sensitively. Translating them (es-419 `tema:`) or using a full-width
+        # colon (`entidades：`) drops topics only when the whole set is off: a
+        # single mismatched label is tolerated, so the real es-419 failure is the
+        # cumulative all-labels-translated case, not any one label. See
+        # test_topic_label_contract.py for the per-label behaviour.
+        topics = mod._namespace_language_prompts(language)["extract_topics_prompt_template"]
+        instruction = mod._extraction_language_instruction(language)
+        target = mod.describe_language(language)
+        assert instruction in topics
+        assert topics.index(instruction) < topics.index("<propositions>")
+        assert "The response format is a fixed template read by a program." in instruction
+        assert "`topic:`" in instruction and "`entities:`" in instruction and "`proposition:`" in instruction
+        # The value after the `|` separator (the classification) is written in the
+        # target language, restored to back 6360e9aa1.
+        assert f"The classification after the `|` separator is a value: write it in {target}." in instruction
+        assert f"Write only the values that fill its placeholders in {target}" in instruction
+        assert f"Write your output in {target}" in instruction
+        assert "{" not in instruction and "}" not in instruction
+
+    def test_english_namespace_adds_no_label_instruction(self, mod):
+        assert mod._namespace_language_prompts("en") == {}
 
     def test_instruction_sits_before_document_content(self, mod, fake_toolkit_prompts):
         overrides = mod._namespace_language_prompts("ja")

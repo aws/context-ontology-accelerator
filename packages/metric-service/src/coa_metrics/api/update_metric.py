@@ -26,7 +26,7 @@ from coa_control_plane_server.models.update_metric_request_content import (
 )
 from pydantic import ValidationError
 
-from coa_metrics.api.contract import check_metric_name
+from coa_metrics.api.contract import check_metric_label, check_metric_name, normalize_label_member
 from coa_metrics.api.create_metric import _metric_to_dict, _validate_soft
 from coa_metrics.api.validation_errors import format_validation_error
 from coa_metrics.constants import VALID_SQL_DIALECTS, invalid_dialect_message
@@ -101,11 +101,16 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     if body is None:
         return api_response(400, {"message": "Request body is required"})
 
-    # Validate via Smithy-generated Pydantic model
+    # Validate via Smithy-generated Pydantic model. The label is NFC-normalized
+    # first so its length is counted the way it is stored.
+    normalize_label_member(body)
     try:
         request = UpdateMetricRequestContent.model_validate(body)
     except ValidationError as exc:
         return api_response(400, {"message": format_validation_error(exc)})
+    label_error = check_metric_label(request.label)
+    if label_error:
+        return api_response(400, {"message": label_error})
 
     # Check metric exists
     existing = _get_neptune().get_metric(namespace, name)
@@ -247,4 +252,6 @@ def _build_updated_metric(
         ontology_concepts=request.ontology_concepts or [],
         defined_by=caller,
         effective_from=existing.effective_from or datetime.now(UTC).strftime("%Y-%m-%d"),
+        # Full replace, like unit and returnType: an absent or null label clears it.
+        label=request.label,
     )

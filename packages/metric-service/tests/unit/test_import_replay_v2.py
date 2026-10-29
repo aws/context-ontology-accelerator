@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import io
 import json
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -87,6 +88,7 @@ def test_plan_payload_round_trips_every_nested_field_canonically() -> None:
 
     assert parse_plan_payload(serialized) == plan
     assert canonical_plan_payload_bytes(parse_plan_payload(serialized)) == serialized
+    # No metric in this plan has a label, so it is written at v2.
     assert json.loads(serialized)["schemaVersion"] == 2
 
 
@@ -117,6 +119,84 @@ def test_plan_payload_rejects_duplicate_json_keys() -> None:
 
     with pytest.raises(ValueError, match="duplicate key"):
         parse_plan_payload(b'{"schemaVersion":2,"schemaVersion":2,"offset":0,"entries":[]}')
+
+
+def _labelled_payload():
+    from dataclasses import replace
+
+    from coa_metrics.api.import_plan_payload import OffsetPlanPayload
+
+    plan = _payload()
+    first = plan.entries[0]
+    assert first.definition is not None
+    labelled = replace(first, definition=replace(first.definition, label="売上合計"))
+    return OffsetPlanPayload(offset=plan.offset, entries=(labelled, *plan.entries[1:]))
+
+
+def test_plan_payload_v3_round_trips_the_label() -> None:
+    from coa_metrics.api.import_plan_payload import canonical_plan_payload_bytes, parse_plan_payload
+
+    serialized = canonical_plan_payload_bytes(_labelled_payload())
+    raw = json.loads(serialized)
+    assert raw["schemaVersion"] == 3
+    assert raw["entries"][0]["definition"]["label"] == "売上合計"
+    assert raw["entries"][1]["definition"]["label"] is None
+    parsed = parse_plan_payload(serialized)
+    assert parsed == _labelled_payload()
+    assert parsed.entries[0].definition is not None
+    assert parsed.entries[0].definition.label == "売上合計"
+
+
+# Written by the pre-label serializer: base revision 2e57a750b's
+# canonical_plan_payload_bytes over the plan _payload() builds. Committed as
+# bytes so a later change to the shared serializer cannot move the fixture with
+# it; real v2 plans in S3 were written by that code.
+_PRE_LABEL_V2_PLAN = Path(__file__).parent / "fixtures" / "import_plan_v2_pre_label.json"
+
+
+def test_pre_label_v2_plan_still_parses() -> None:
+    from coa_metrics.api.import_plan_payload import parse_plan_payload
+
+    parsed = parse_plan_payload(_PRE_LABEL_V2_PLAN.read_bytes())
+    assert parsed == _payload()
+    assert all(e.definition is None or e.definition.label is None for e in parsed.entries)
+
+
+def test_plan_without_labels_is_byte_identical_to_the_pre_label_v2_plan() -> None:
+    """A pre-label worker (e.g. after a rollback) reads what this one writes when no label is set."""
+    from coa_metrics.api.import_plan_payload import canonical_plan_payload_bytes
+
+    assert canonical_plan_payload_bytes(_payload()) == _PRE_LABEL_V2_PLAN.read_bytes()
+
+
+@pytest.mark.parametrize(
+    ("base", "mutate"),
+    [
+        ("labelled", lambda raw: raw["entries"][0]["definition"].pop("label")),
+        ("plain", lambda raw: raw["entries"][0]["definition"].update({"label": "x"})),
+        ("labelled", lambda raw: raw["entries"][0]["definition"].update({"label": True})),
+        ("labelled", lambda raw: raw["entries"][0]["definition"].update({"label": ""})),
+        ("labelled", lambda raw: raw["entries"][0]["definition"].update({"label": "a\u202eb"})),
+    ],
+    ids=["v3-without-label", "v2-with-label", "non-string", "empty", "bidi-control"],
+)
+def test_plan_payload_rejects_a_label_outside_its_schema(base, mutate) -> None:
+    from coa_metrics.api.import_plan_payload import canonical_plan_payload_bytes, parse_plan_payload
+
+    raw = json.loads(canonical_plan_payload_bytes(_labelled_payload() if base == "labelled" else _payload()))
+    assert raw["schemaVersion"] == (3 if base == "labelled" else 2)
+    mutate(raw)
+    with pytest.raises(ValueError):
+        parse_plan_payload(json.dumps(raw).encode())
+
+
+def test_plan_payload_rejects_an_unknown_schema_version() -> None:
+    from coa_metrics.api.import_plan_payload import canonical_plan_payload_bytes, parse_plan_payload
+
+    raw = json.loads(canonical_plan_payload_bytes(_payload()))
+    raw["schemaVersion"] = 4
+    with pytest.raises(ValueError, match="schema version 4"):
+        parse_plan_payload(json.dumps(raw).encode())
 
 
 def test_offset_plan_reference_strict_dynamodb_round_trip() -> None:

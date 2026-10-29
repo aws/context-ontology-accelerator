@@ -133,6 +133,11 @@ class OsiCustomExtension:
     ontology_concepts: list[str] = field(default_factory=list)
     defined_by: str = ""
     effective_from: str = ""
+    # Display-only metric label. ``None`` means no label. Read string-only: a
+    # YAML ``label: yes`` or ``label: [a]`` is never converted to a string;
+    # ``label_error`` records it so import fails that metric alone.
+    label: str | None = None
+    label_error: str | None = None
 
 
 @dataclass
@@ -371,11 +376,24 @@ def _warn_vendor_prefixed_keys(raw: dict[str, Any], path: str, warnings: list[Pa
         logger.warning("osi_vendor_key_ignored", path=path, key=key, metric=str(raw.get("name", "")))
 
 
+def _warn_top_level_label(raw: dict[str, Any], path: str, warnings: list[ParseWarning]) -> None:
+    """Flag a top-level ``label:`` on a metric — COA reads the label only from its custom extension."""
+    if "label" not in raw:
+        return
+    message = (
+        "Top-level 'label' is not part of OSI v1.0 metrics and was ignored. "
+        f"Put the label under custom_extensions: [{{vendor_name: {OSI_VENDOR_NAME}, data: {{label: ...}}}}]"
+    )
+    warnings.append(ParseWarning(path=f"{path}.label", message=message))
+    logger.warning("osi_top_level_label_ignored", path=path, metric=str(raw.get("name", "")))
+
+
 def _parse_single_metric(
     raw: dict[str, Any], path: str, errors: list[ParseError], warnings: list[ParseWarning]
 ) -> OsiMetric | None:
     """Parse a single metric entry."""
     _warn_vendor_prefixed_keys(raw, path, warnings)
+    _warn_top_level_label(raw, path, warnings)
 
     name = raw.get("name", "")
     if not name:
@@ -471,6 +489,13 @@ def _parse_custom_extensions(raw_extensions: Any, path: str) -> OsiCustomExtensi
             data = ext.get("data", {})
             if not isinstance(data, dict):
                 continue
+            raw_label = data.get("label")
+            label: str | None = None
+            label_error: str | None = None
+            if isinstance(raw_label, str):
+                label = raw_label
+            elif raw_label is not None:
+                label_error = "label must be a string"
             return OsiCustomExtension(
                 data_source_id=_opt_str(data, "data_source_id"),
                 source_table=_opt_str(data, "source_table"),
@@ -480,6 +505,8 @@ def _parse_custom_extensions(raw_extensions: Any, path: str) -> OsiCustomExtensi
                 ontology_concepts=_opt_str_list(data, "ontology_concepts"),
                 defined_by=_opt_str(data, "defined_by"),
                 effective_from=_opt_str(data, "effective_from"),
+                label=label,
+                label_error=label_error,
             )
 
     return None
@@ -563,6 +590,9 @@ def _serialize_metric(metric: OsiMetric) -> dict[str, Any]:
             data["defined_by"] = ext.defined_by
         if ext.effective_from:
             data["effective_from"] = ext.effective_from
+        # Left out when there is no label, so exports of unlabelled metrics do not change.
+        if ext.label:
+            data["label"] = ext.label
 
         if data:
             result["custom_extensions"] = [{"vendor_name": OSI_VENDOR_NAME, "data": data}]

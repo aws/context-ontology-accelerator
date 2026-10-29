@@ -5,8 +5,10 @@ import React from "react";
 import { render, screen, act, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import userEvent from "@testing-library/user-event";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { NamespacePermissions } from "./NamespacePermissions";
+import { LocaleProvider } from "../i18n/LocaleProvider";
 
 const deleteGrantMock = vi.hoisted(() => ({
   mutate: vi.fn(),
@@ -240,5 +242,77 @@ describe("NamespacePermissions", () => {
     await waitFor(() => {
       expect(headerRevoke()).toBeDisabled();
     });
+  });
+
+  it("shows the member's principal type in the UI language", async () => {
+    const { unmount } = render(<NamespacePermissions />, { wrapper });
+    const englishRow = screen.getByText("alice@example.com").closest("tr");
+    expect(
+      within(englishRow as HTMLElement).getByText("User"),
+    ).toBeInTheDocument();
+    unmount();
+
+    window.localStorage.setItem("scl.locale", "ja");
+    try {
+      render(
+        <LocaleProvider>
+          <NamespacePermissions />
+        </LocaleProvider>,
+        { wrapper },
+      );
+      await waitFor(() => {
+        const row = screen.getByText("alice@example.com").closest("tr");
+        expect(
+          within(row as HTMLElement).getByText("ユーザー"),
+        ).toBeInTheDocument();
+      });
+    } finally {
+      window.localStorage.clear();
+      document.documentElement.lang = "";
+    }
+  });
+
+  const shownMembers = () =>
+    ["alice@example.com", "bob@example.com", "carol@example.com"].filter(
+      (principal) => screen.queryByText(principal) !== null,
+    );
+
+  it("finds members by the principal type shown in Japanese", async () => {
+    window.localStorage.setItem("scl.locale", "ja");
+    try {
+      const user = userEvent.setup();
+      render(
+        <LocaleProvider>
+          <NamespacePermissions />
+        </LocaleProvider>,
+        { wrapper },
+      );
+      const filter = await screen.findByPlaceholderText("メンバーを検索");
+      await user.type(filter, "ユーザー");
+      await waitFor(() =>
+        expect(shownMembers()).toEqual([
+          "alice@example.com",
+          "bob@example.com",
+          "carol@example.com",
+        ]),
+      );
+      await user.clear(filter);
+      await user.type(filter, "グループ");
+      await waitFor(() => expect(shownMembers()).toEqual([]));
+    } finally {
+      window.localStorage.clear();
+      document.documentElement.lang = "";
+    }
+  });
+
+  it("still finds members by the English type and by principal", async () => {
+    const user = userEvent.setup();
+    render(<NamespacePermissions />, { wrapper });
+    const filter = screen.getByPlaceholderText("Find members");
+    await user.type(filter, "User");
+    await waitFor(() => expect(shownMembers()).toHaveLength(3));
+    await user.clear(filter);
+    await user.type(filter, "bob");
+    await waitFor(() => expect(shownMembers()).toEqual(["bob@example.com"]));
   });
 });

@@ -412,11 +412,10 @@ class TestVKGTranslatorCrossSourceQualification:
     async def test_firewall_sees_the_unqualified_sql(self):
         """The rewrite MUST run downstream of authorization.
 
-        The firewall normalises table names to their bare component for the
-        allowlist/denylist, so prefixes do not affect those — but Cedar receives
-        ``SQLFirewall.extract_tables()`` output verbatim. Qualifying first would
-        silently change the strings a table-scoped policy matches on, which is an
-        authorization change disguised as a formatting change. Asserting the
+        Database-qualified allowlist/denylist entries and Cedar see the references
+        the SQL makes. Qualifying first would silently change what they match
+        on, which is an authorization change disguised as a formatting change.
+        Asserting the
         firewall's actual argument makes the ordering executable rather than a
         comment.
         """

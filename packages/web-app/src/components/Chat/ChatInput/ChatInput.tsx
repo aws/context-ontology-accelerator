@@ -4,6 +4,7 @@
 import React from "react";
 import { Button, Input } from "@cloudscape-design/components";
 import { useAppI18n } from "../../../i18n/LocaleProvider";
+import { isSubmitEnter, type EnterKeyDetail } from "@utils/keyboard";
 
 export interface ChatInputProps {
   value: string;
@@ -23,8 +24,8 @@ export const ChatInput: React.FC<ChatInputProps> = ({
   placeholder,
 }) => {
   const { t } = useAppI18n();
-  const handleKeyDown = (event: CustomEvent<{ key: string }>) => {
-    if (event.detail.key === "Enter") {
+  const handleKeyDown = (event: CustomEvent<EnterKeyDetail>) => {
+    if (isSubmitEnter(event.detail)) {
       onSubmit();
     }
   };

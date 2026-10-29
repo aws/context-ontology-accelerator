@@ -58,6 +58,7 @@ import {
 import { SortableTable } from "@components/SortableTable";
 import { OntologyDeleteWarning } from "@components/ontology/OntologyDeleteWarning";
 import {
+  localizeOntologyType,
   ontologyTypeDisplay,
   ontologyTypeGroup,
 } from "@utils/ontology-display";
@@ -66,7 +67,7 @@ import Badge from "@cloudscape-design/components/badge";
 import SegmentedControl from "@cloudscape-design/components/segmented-control";
 import FileUpload from "@cloudscape-design/components/file-upload";
 import Input from "@cloudscape-design/components/input";
-import { useAppI18n } from "../i18n/LocaleProvider";
+import { useAppI18n, type AppTranslate } from "../i18n/LocaleProvider";
 import type { AppMessage } from "../i18n/appMessages";
 
 /** Map a custom-uploaded ontology filename to the format string the
@@ -1083,13 +1084,6 @@ export const ONTOLOGY_INGEST_STATUS: Record<
   ingesting: { type: "in-progress", label: "Ingesting" },
 };
 
-const ONTOLOGY_TYPE_MESSAGES: Record<string, AppMessage> = {
-  Induced: "Induced",
-  Foundational: "Foundational",
-  Uploaded: "Uploaded",
-  Unknown: "Unknown",
-};
-
 const PROPOSAL_STATUS_MESSAGES: Record<string, AppMessage> = {
   accepted: "accepted",
   "accept failed": "accept failed",
@@ -1100,6 +1094,9 @@ const PROPOSAL_STATUS_MESSAGES: Record<string, AppMessage> = {
   accepting: "accepting",
   pending: "pending",
   updated: "updated",
+  // Set when a pending proposal is cancelled; the label falls through
+  // proposalStatusDisplay unchanged, so it needs its own entry here.
+  cancelled: "cancelled",
 };
 
 /** Derive the ingest state of a registered ontology row.
@@ -1149,6 +1146,19 @@ export function proposalStatusDisplay(status: string): {
     return { type: "in-progress", label };
   }
   return { type: "pending", label: status };
+}
+
+/** The Proposals-list status label in the reader's locale; a status this
+ * console does not know is shown raw. */
+export function proposalStatusText(status: string, t: AppTranslate): string {
+  const { label } = proposalStatusDisplay(status);
+  const message = Object.prototype.hasOwnProperty.call(
+    PROPOSAL_STATUS_MESSAGES,
+    label,
+  )
+    ? PROPOSAL_STATUS_MESSAGES[label]
+    : undefined;
+  return message ? t(message) : label;
 }
 
 /** What the UI should do when an induction job reaches ``completed``.
@@ -1544,10 +1554,11 @@ function OntologiesTab({
               if (isAvailable) {
                 return <Badge color="green">{t("Foundational")}</Badge>;
               }
-              const { label, color } = ontologyTypeDisplay(e.ontologyType);
-              const message = ONTOLOGY_TYPE_MESSAGES[label];
+              const { color } = ontologyTypeDisplay(e.ontologyType);
               return (
-                <Badge color={color}>{message ? t(message) : label}</Badge>
+                <Badge color={color}>
+                  {localizeOntologyType(e.ontologyType, t)}
+                </Badge>
               );
             },
           },
@@ -1919,11 +1930,10 @@ function ProposalsTab({
           header: t("Status"),
           sortingField: "status",
           cell: (e) => {
-            const { type, label } = proposalStatusDisplay(e.status);
-            const message = PROPOSAL_STATUS_MESSAGES[label];
+            const { type } = proposalStatusDisplay(e.status);
             return (
               <StatusIndicator type={type}>
-                {message ? t(message) : label}
+                {proposalStatusText(e.status, t)}
               </StatusIndicator>
             );
           },

@@ -22,6 +22,8 @@
  * title-cased, so they are unaffected.
  */
 
+import type { AppTranslate } from "../i18n/LocaleProvider";
+
 /** Max length accepted by the API for one entity-class label. */
 export const MAX_CLASSIFICATION_LENGTH = 128;
 /** Max length accepted by the API for one topic name. */
@@ -126,21 +128,28 @@ export function topicsRewrittenOnIngest(
  */
 export function validateClassification(
   candidate: string,
-  existing: string[] = [],
+  existing: string[],
+  t: AppTranslate,
 ): string | null {
   const trimmed = candidate.trim();
-  if (trimmed.length === 0) return "Enter a label.";
+  if (trimmed.length === 0) return t("Enter a label.");
   if (trimmed.length > MAX_CLASSIFICATION_LENGTH) {
-    return `Labels must be ${MAX_CLASSIFICATION_LENGTH} characters or fewer.`;
+    return t("Labels must be {max} characters or fewer.", {
+      max: MAX_CLASSIFICATION_LENGTH,
+    });
   }
   if (existing.length >= MAX_VOCABULARY_ENTRIES) {
-    return `You can add at most ${MAX_VOCABULARY_ENTRIES} labels.`;
+    return t("You can add at most {max} labels.", {
+      max: MAX_VOCABULARY_ENTRIES,
+    });
   }
   // The API compares case-insensitively, because "Dress" and "DRESS" are stored
   // as the same class. Match that here so the UI does not accept a pair the API
   // will reject.
   if (existing.some((e) => e.toLowerCase() === trimmed.toLowerCase())) {
-    return `"${trimmed}" duplicates a label you have already added.`;
+    return t('"{label}" duplicates a label you have already added.', {
+      label: trimmed,
+    });
   }
   return null;
 }
@@ -148,18 +157,25 @@ export function validateClassification(
 /** Validator for topic names. Topics are phrases, so only length is enforced. */
 export function validateTopic(
   candidate: string,
-  existing: string[] = [],
+  existing: string[],
+  t: AppTranslate,
 ): string | null {
   const trimmed = candidate.trim();
-  if (trimmed.length === 0) return "Enter a topic name.";
+  if (trimmed.length === 0) return t("Enter a topic name.");
   if (trimmed.length > MAX_TOPIC_LENGTH) {
-    return `Topic names must be ${MAX_TOPIC_LENGTH} characters or fewer.`;
+    return t("Topic names must be {max} characters or fewer.", {
+      max: MAX_TOPIC_LENGTH,
+    });
   }
   if (existing.length >= MAX_VOCABULARY_ENTRIES) {
-    return `You can add at most ${MAX_VOCABULARY_ENTRIES} topics.`;
+    return t("You can add at most {max} topics.", {
+      max: MAX_VOCABULARY_ENTRIES,
+    });
   }
   if (existing.some((e) => e.toLowerCase() === trimmed.toLowerCase())) {
-    return `"${trimmed}" duplicates a topic you have already added.`;
+    return t('"{topic}" duplicates a topic you have already added.', {
+      topic: trimmed,
+    });
   }
   return null;
 }

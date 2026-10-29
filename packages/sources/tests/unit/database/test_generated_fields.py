@@ -116,7 +116,7 @@ class TestRunUsesNamespaceLanguage:
         assert all(call.args[0] == build_system_prompt("ja") for call in calls)
         # The untrusted schema (user message) is unchanged by the language and
         # still carries identifiers and source comments verbatim.
-        user_prompt = calls[0].args[1]
+        user_prompt = "".join(seg.text for seg in calls[0].args[1])
         assert "Output language" not in user_prompt
         assert "model_no (string)  -- Model number, e.g. FR-A840" in user_prompt
 

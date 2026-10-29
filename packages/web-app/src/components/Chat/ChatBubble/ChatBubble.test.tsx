@@ -320,6 +320,40 @@ describe("ChatBubble", () => {
       ).toBeInTheDocument();
     });
 
+    it("drops the '(Tier 2)' framing in the caption for Deep Reasoning artifacts", () => {
+      // Deep Reasoning also emits SPARQL+SQL but not via the Tier-2 cascade, so
+      // labelling its artifacts "(Tier 2)" is wrong (#1166 Cut #3). Same fixture
+      // as the Tier-2 case, only executionMode flipped.
+      const artifactsResponse = {
+        ...response,
+        sparqlGenerated: "SELECT ?x WHERE { ?x rdf:type :Claim }",
+        queryUsed: "SELECT * FROM claims",
+        executionMode: "deep-reasoning" as const,
+        trace: [
+          {
+            step: "t2.sql.execute",
+            status: "success",
+            durationMs: 5,
+            detail: { engine: "athena" },
+          },
+        ],
+      };
+      render(
+        <ChatBubble
+          role="assistant"
+          state="success"
+          {...baseProps}
+          response={artifactsResponse}
+        />,
+      );
+      expect(
+        screen.getByText(
+          "The SPARQL and SQL Deep Reasoning generated and Athena executed.",
+        ),
+      ).toBeInTheDocument();
+      expect(screen.queryByText(/\(Tier 2\)/)).not.toBeInTheDocument();
+    });
+
     it("shows SQL-only caption naming the ATHENA engine from the trace tag", () => {
       const artifactsResponse = {
         ...response,

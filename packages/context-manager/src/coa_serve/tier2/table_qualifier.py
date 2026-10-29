@@ -45,11 +45,12 @@ point strategies should call, so the two Tier-2 strategies cannot drift in how
 they order the passes or react to a failure.
 
 Ordering constraint — all of this MUST run downstream of the SQL firewall. The
-firewall normalises every table to its bare last component for the
-``tableAllowlist`` / ``columnDenylist`` checks, so prefixes do not affect them;
-but Cedar receives ``SQLFirewall.extract_tables`` output verbatim, so rewriting
-BEFORE authorization would silently change the strings a future table-scoped
-policy matches on. Rewriting after authorization changes no authorization input.
+``tableAllowlist`` / ``columnDenylist`` checks match a bare entry on a table's
+last component and a ``database.table`` entry on the database the reference
+names, and Cedar receives the references the statement makes, so rewriting
+BEFORE authorization (adding a schema or catalog the writer did not name) would
+change what those checks see. Rewriting after authorization changes no
+authorization input.
 ``tests/unit/test_tier2_vkg_translator.py`` and
 ``tests/unit/test_nl_to_sql_strategy.py`` each assert the firewall's actual
 argument, so this constraint is executable rather than advisory.
@@ -315,8 +316,23 @@ def _is_cte_reference(table: exp.Table, cte_names: set[str]) -> bool:
     shadow the real ``crm.customers``, which produced a partial rewrite — the one
     outcome the all-or-nothing contract forbids — and made
     :func:`is_fully_catalog_qualified` certify the result as fully qualified.
+
+    Inside a non-recursive CTE's own body, its name is not yet bound: in
+    ``WITH customers AS (SELECT * FROM customers)`` the inner reference reads the
+    real ``customers`` table. Treating it as the CTE hid that bare reference from
+    the ambiguity check, so it ran against whichever table the default context
+    resolved.
     """
-    return not table.db and not table.catalog and table.name.lower() in cte_names
+    if table.db or table.catalog or table.name.lower() not in cte_names:
+        return False
+    name = table.name.lower()
+    node = table.parent
+    while node is not None:
+        if isinstance(node, exp.CTE) and node.alias_or_name.lower() == name:
+            with_ = node.parent
+            return isinstance(with_, exp.With) and bool(with_.args.get("recursive"))
+        node = node.parent
+    return True
 
 
 def real_tables(parsed: exp.Expression) -> list[exp.Table]:

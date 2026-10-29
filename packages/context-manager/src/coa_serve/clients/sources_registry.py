@@ -616,6 +616,50 @@ class SourcesRegistry:
                         out[table] = (AMBIGUOUS_SOURCE, "")
         return out
 
+    async def same_name_databases(self, namespace: str, tables: list[str]) -> dict[str, dict[str, str]]:
+        """For each of ``tables`` held by two or more of the namespace's Glue databases: ``{database: source_id}``.
+
+        Answers "which tables of this name exist?" independently of what retrieval
+        returned. Retrieval keeps a handful of classes, so it can return one of
+        several same-named tables (one per study, say). Nothing then collides, and
+        a query read that one table and returned its rows as the whole answer. The
+        caller treats a name listed here as shared even when one copy was
+        retrieved, and names every database in the refusal.
+
+        Only the namespace's own root-catalog Glue databases are listed (as for
+        :meth:`table_placements`), so a database outside its sources never makes a
+        name look shared, and a name only one of them holds is not returned. A
+        database two sources both register maps to ``AMBIGUOUS_SOURCE``. ``{}``
+        when the namespace holds fewer than two such databases, or when any of
+        them cannot be listed (the caller then behaves as before).
+
+        Args:
+            namespace: Namespace whose sources bound the lookup.
+            tables: Bare table names to check.
+        """
+        if not tables:
+            return {}
+        sources = await self.native_glue_databases(namespace)
+        if len({db for _, db in sources.values()}) < 2:
+            return {}
+        catalog = await self._glue_table_owners(namespace, sorted(set(sources.values())))
+        if catalog is None:
+            return {}
+        by_database: dict[str, list[str]] = {}
+        for source_id, (_, database) in sources.items():
+            by_database.setdefault(database, []).append(source_id)
+        out: dict[str, dict[str, str]] = {}
+        for table in {t.lower() for t in tables}:
+            owners = catalog.get(table, set())
+            if len(owners) < 2:
+                continue
+            out[table] = {
+                database: ids[0] if len(ids) == 1 else AMBIGUOUS_SOURCE
+                for database in sorted(owners)
+                for ids in [by_database.get(database, [])]
+            }
+        return out
+
     async def _glue_table_owners(self, namespace: str, databases: list[tuple[str, str]]) -> dict[str, set[str]] | None:
         """Bare table name -> the databases (of ``databases``) holding it; cached per listed set.
 

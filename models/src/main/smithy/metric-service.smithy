@@ -24,6 +24,29 @@ use com.amazon.semanticcontext.common#ValidationError
 @length(min: 1, max: 128)
 string MetricName
 
+/// Display-only label for a metric, shown to people alongside `name`. Nothing
+/// resolves, matches or authorizes on it; terms a question should match belong
+/// in `aiContext.synonyms`. Angle brackets and control characters are rejected,
+/// the same as `NamespaceDisplayName` (a trailing LF passes this pattern, since
+/// `$` matches before a final newline, and the server rejects it). The server
+/// also NFC-normalizes the value and counts the 1-256 limit in code points after
+/// normalization (a few characters, such as U+0958, become two code points in
+/// NFC). It then rejects what the pattern cannot express portably:
+/// - control characters (Cc), line and paragraph separators (Zl, Zp), lone
+///   surrogates (Cs) and noncharacters;
+/// - these format characters: U+00AD, U+180E, U+200B, U+202A-202E (bidi
+///   embeddings and overrides), U+2060-206F (word joiner, invisible operators,
+///   bidi isolates, deprecated format characters), U+FEFF, U+FFF9-FFFB,
+///   U+1BCA0-1BCA3, U+1D173-1D17A and U+E0000-E007F (tags). ZWJ, ZWNJ, LRM,
+///   RLM and ALM are allowed;
+/// - a label with no visible base character (only whitespace, marks, format,
+///   blank or unassigned characters).
+/// The error names the first rejected code point. See
+/// `coa_metrics.api.contract.check_metric_label`.
+@pattern("^[^<>\\x00-\\x1F\\x7F]+$")
+@length(min: 1, max: 256)
+string MetricLabel
+
 /// SQL expression. Must be a full SELECT statement (or set operation) —
 /// e.g. "SELECT COUNT(*) AS total FROM orders". Bare aggregate fragments
 /// like "COUNT(*)" are rejected: the serve-time SQL firewall only executes
@@ -179,6 +202,9 @@ structure MetricDefinition {
     @required
     name: MetricName
 
+    /// Display-only label for the metric. Absent when the metric has none.
+    label: MetricLabel
+
     /// Human-readable description of what the metric measures.
     @required
     description: String
@@ -230,6 +256,9 @@ operation CreateMetric {
 
         @required
         name: MetricName
+
+        /// Display-only label for the metric. Omit (or send null) for no label.
+        label: MetricLabel
 
         /// Human-readable description of what the metric measures.
         @required
@@ -336,7 +365,9 @@ operation ListMetrics {
         @httpQuery("nextToken")
         nextToken: PaginationToken
 
-        /// Maximum number of metrics to return in one page.
+        /// Maximum number of metrics to return in one page. For compatibility
+        /// with existing callers that page with larger values, the server
+        /// reduces a value above 200 to 200 rather than rejecting it.
         @httpQuery("maxResults")
         @range(min: 1, max: 200)
         maxResults: Integer
@@ -377,6 +408,10 @@ operation UpdateMetric {
         @required
         @httpLabel
         name: MetricName
+
+        /// Display-only label for the metric. This is a full replace: omitting it
+        /// (or sending null) clears an existing label.
+        label: MetricLabel
 
         /// Human-readable description of what the metric measures.
         @required
@@ -467,6 +502,9 @@ operation ValidateMetric {
 
         @required
         name: MetricName
+
+        /// Display-only label for the metric. Omit (or send null) for no label.
+        label: MetricLabel
 
         /// Human-readable description of what the metric measures.
         @required

@@ -28,20 +28,13 @@ import {
   type ListedOntology,
 } from "../../../services/ontology-engine";
 import {
+  localizeOntologyType,
   ontologyTypeDisplay,
   ontologyTypeGroup,
 } from "@utils/ontology-display";
 import { useAppI18n } from "../../../i18n/LocaleProvider";
-import type { AppMessage } from "../../../i18n/appMessages";
 
 type TypeFilter = "all" | "induced" | "foundational" | "uploaded";
-
-const TYPE_MESSAGES: Record<string, AppMessage> = {
-  Induced: "Induced",
-  Foundational: "Foundational",
-  Uploaded: "Uploaded",
-  Unknown: "Unknown",
-};
 
 export function OntologyInventoryView({
   apiClient,
@@ -168,12 +161,11 @@ export function OntologyInventoryView({
                 ontologyTypeGroup(b.ontologyType),
               ),
             cell: (o) => {
-              const { label, color } = ontologyTypeDisplay(o.ontologyType);
-              const typeMessage = TYPE_MESSAGES[label];
+              const { color } = ontologyTypeDisplay(o.ontologyType);
               if (o.status !== "deleting")
                 return (
                   <Badge color={color}>
-                    {typeMessage ? t(typeMessage) : label}
+                    {localizeOntologyType(o.ontologyType, t)}
                   </Badge>
                 );
               // A wedged teardown stops the poll, so say so here rather than

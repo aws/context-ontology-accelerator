@@ -478,6 +478,8 @@ async function deploy(): Promise<void> {
     // construct properties, so this stack has no direct reference into the
     // auth stack's resource tree (see PR for the export-lock this avoids).
     isCognitoMode: config.idpType !== IdpType.OIDC,
+    federatedIdentityProviderNames:
+      IdpAuthenticationStack.federatedProviderNames(authProps),
     apiEndpoint: api.api.url,
     apiRestApiId: api.api.restApiId,
     apiStageName: api.api.deploymentStage.stageName,
@@ -549,6 +551,12 @@ async function deploy(): Promise<void> {
   });
   mcp.addDependency(serve); // needs CM runtime-arn SSM param
   mcp.addDependency(auth); // needs /issuer, /userpool-client-id, /mcp-client-id SSM params
+  // web reads ${ssmPrefix}/mcp/runtime-arn (published by mcp) to surface the MCP
+  // endpoint in runtime-config.json for the console's MCP page (#1166). CDK can't
+  // infer the ordering from valueForStringParameter, so declare it explicitly —
+  // otherwise a fresh-account deploy can write runtime-config.json before the
+  // parameter exists.
+  web.addDependency(mcp);
 
   // Every stack with a VPC Lambda waits for EniWarmStack, so its functions reuse
   // the pre-warmed Hyperplane ENIs instead of each paying a ~4 min create.

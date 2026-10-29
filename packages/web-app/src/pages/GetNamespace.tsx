@@ -42,6 +42,11 @@ import {
 } from "@coa/control-plane-client";
 import { useApiClient } from "@components/ApiClientProvider";
 import { localizeNamespaceLanguage } from "@utils";
+import {
+  localizeNamespaceStatus,
+  localizeVkgHealth,
+} from "@utils/namespace-status";
+import { localizeOntologyType } from "@utils/ontology-display";
 import { listOntologies } from "../services/ontology-engine";
 import type { OntologyRecord } from "../services/ontology-engine";
 import { useAppI18n } from "../i18n/LocaleProvider";
@@ -184,7 +189,7 @@ export const GetNamespace: React.FC = () => {
                           : "stopped"
                   }
                 >
-                  {ns.status}
+                  {localizeNamespaceStatus(ns.status, t)}
                 </StatusIndicator>
               ),
             },
@@ -216,7 +221,7 @@ export const GetNamespace: React.FC = () => {
                               : "stopped"
                       }
                     >
-                      {vkgHealth}
+                      {localizeVkgHealth(vkgHealth, t)}
                     </StatusIndicator>
                   </Popover>
                 );
@@ -429,7 +434,11 @@ const OntologiesTab: React.FC<{ namespaceId: string }> = ({ namespaceId }) => {
         </Link>
       ),
     },
-    { id: "type", header: t("Type"), cell: (o) => o.ontologyType },
+    {
+      id: "type",
+      header: t("Type"),
+      cell: (o) => localizeOntologyType(o.ontologyType, t),
+    },
     { id: "classes", header: t("Classes"), cell: (o) => o.classCount },
     {
       id: "properties",

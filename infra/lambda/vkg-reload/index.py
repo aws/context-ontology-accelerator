@@ -8,6 +8,8 @@ image (from SSM, written by CDK deploy) before forcing a new deployment. This en
 ontology reloads always pick up the latest VKG image, not a stale one from provision time.
 """
 
+from __future__ import annotations
+
 import json
 import os
 import re
@@ -15,12 +17,21 @@ import re
 import boto3
 
 ecs = boto3.client("ecs")
+ecr = boto3.client("ecr")
 sd = boto3.client("servicediscovery")
 ssm = boto3.client("ssm")
 autoscaling = boto3.client("application-autoscaling")
 cloudwatch = boto3.client("cloudwatch")
 
 _NS_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$")
+
+# <registry>.dkr.ecr.<region>.amazonaws.com[.cn]/<repo>[:<tag>][@sha256:<digest>]
+_ECR_IMAGE = re.compile(
+    r"^(?P<registry>\d{12})\.dkr\.ecr\.(?P<region>[a-z0-9-]+)\.amazonaws\.com(?:\.cn)?/"
+    r"(?P<repo>[a-z0-9][a-z0-9._/-]*?)(?::(?P<tag>[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}))?"
+    r"(?:@(?P<digest>sha256:[0-9a-f]{64}))?$"
+)
+_DIGEST_SUFFIX = re.compile(r"@(?P<digest>sha256:[0-9a-f]{64})$")
 
 # Reload-outcome metrics; the vkg stack alarms on ReloadFailed.
 _METRIC_NAMESPACE = "COA/VKG"
@@ -73,14 +84,17 @@ def handler(event, context):
     * **Per-namespace** (EventBridge ``ontology.published``): the event carries
       ``detail.namespace`` / ``detail.version`` and only that namespace's VKG
       service is reconciled.
-    * **Sweep** (scheduled rule with constant input ``{"sweep": true}``): every
-      ``<prefix>-vkg-*`` service in the cluster is reconciled against the latest
-      SSM image. This keeps long-lived namespaces current even when their
-      ontology is never republished — otherwise a base-image digest bump never
-      reaches a running task, which is how stale VKG images accumulate.
+    * **Sweep** (``{"sweep": true}``, sent by the weekly scheduled rule and,
+      asynchronously, by the deploy-time custom resource whenever the VKG image
+      changes): every ``<prefix>-vkg-*`` service in the cluster is reconciled
+      against the latest SSM image. This keeps long-lived namespaces current even
+      when their ontology is never republished — otherwise a base-image digest
+      bump never reaches a running task, which is how stale VKG images
+      accumulate. A service already on the latest image is left alone.
 
     Args:
-        event: EventBridge event. ``{"sweep": true}`` selects sweep mode;
+        event: EventBridge event or direct invoke payload. ``{"sweep": true}``
+            selects sweep mode (an optional ``trigger`` field is logged);
             otherwise ``detail.namespace`` / ``detail.version`` select the
             per-namespace reload.
         context: Lambda runtime context (unused).
@@ -100,7 +114,7 @@ def handler(event, context):
     prefix = os.environ["RESOURCE_PREFIX"]
 
     if event.get("sweep") is True:
-        return _sweep(cluster, prefix)
+        return _sweep(cluster, prefix, str(event.get("trigger") or "schedule"))
 
     ns = event.get("detail", {}).get("namespace", "unknown")
     version = event.get("detail", {}).get("version", "unknown")
@@ -112,14 +126,18 @@ def handler(event, context):
     return _reload_one(ns, version, cluster, prefix)
 
 
-def _sweep(cluster, prefix):
+def _sweep(cluster, prefix, trigger="schedule"):
     """Reconcile every per-namespace VKG service in the cluster to the SSM image.
 
-    Resolves the target image once, then reloads each ``<prefix>-vkg-*`` service.
-    A single namespace's failure is recorded and the sweep continues — one broken
-    service must not stop the rest from being patched.
+    Resolves the target image once, then reloads each ``<prefix>-vkg-*`` service
+    that is not already running it. A service is skipped (no restart) only when
+    its running tasks' image digest equals the digest the target image resolves
+    to; a tag can be reused for a new build, so equal image URIs alone do not
+    prove the image is current. A single namespace's failure is recorded and the
+    sweep continues — one broken service must not stop the rest from being
+    patched.
     """
-    print(json.dumps({"action": "sweep_start", "cluster": cluster}))
+    print(json.dumps({"action": "sweep_start", "cluster": cluster, "trigger": trigger}))
     container_image = _resolve_container_image()
     if not container_image:
         print(json.dumps({"action": "sweep_failed", "reason": "cannot resolve container image"}))
@@ -137,17 +155,44 @@ def _sweep(cluster, prefix):
         return {"status": "failed", "reason": f"list services failed: {e}"}
 
     results = []
+    # The target image is the same for every service, so look its digest up once.
+    digest_cache: dict[str, str] = {}
     for ns in namespaces:
         try:
-            outcome = _reload_one(ns, "scheduled-sweep", cluster, prefix, container_image)
+            outcome = _reload_one(
+                ns,
+                f"sweep-{trigger}",
+                cluster,
+                prefix,
+                container_image,
+                restart_if_current=False,
+                digest_cache=digest_cache,
+            )
             results.append({"namespace": ns, "status": outcome.get("status")})
         except Exception as e:  # one bad namespace must not abort the sweep
             print(json.dumps({"action": "sweep_item_failed", "namespace": ns, "error": str(e)}))
             results.append({"namespace": ns, "status": "failed", "error": str(e)})
 
     triggered = sum(1 for r in results if r["status"] in ("reload_triggered", "provisioned"))
-    print(json.dumps({"action": "sweep_complete", "total": len(results), "triggered": triggered}))
-    return {"status": "sweep_complete", "total": len(results), "triggered": triggered, "results": results}
+    unchanged = sum(1 for r in results if r["status"] == "unchanged")
+    print(
+        json.dumps(
+            {
+                "action": "sweep_complete",
+                "trigger": trigger,
+                "total": len(results),
+                "triggered": triggered,
+                "unchanged": unchanged,
+            }
+        )
+    )
+    return {
+        "status": "sweep_complete",
+        "total": len(results),
+        "triggered": triggered,
+        "unchanged": unchanged,
+        "results": results,
+    }
 
 
 def _list_vkg_namespaces(cluster, prefix):
@@ -163,15 +208,21 @@ def _list_vkg_namespaces(cluster, prefix):
     return namespaces
 
 
-def _reload_one(ns, version, cluster, prefix, container_image=None):
+def _reload_one(ns, version, cluster, prefix, container_image=None, restart_if_current=True, digest_cache=None):
     """Reconcile a single namespace's VKG service to the latest image.
 
     Resolves the target image from SSM when not supplied (the sweep resolves it
-    once and passes it in for every namespace). If the running service already
-    uses that image, forces a new deployment; otherwise registers a fresh
-    task-definition revision first. If the service does not yet exist, provisions
-    it. Reload outcomes are published as ``ReloadTriggered``/``ReloadFailed``
-    CloudWatch metrics.
+    once and passes it in for every namespace). If the service's task definition
+    names a different image, registers a fresh task-definition revision first.
+    If it names the same image URI, forces a new deployment when
+    ``restart_if_current`` is true (an ontology publish must restart the task to
+    load the new mappings). Otherwise (the sweep) it compares image digests: the
+    service is left alone and reported ``unchanged`` only when every running
+    task's digest equals the digest the image URI resolves to now. A reused tag
+    with a new build therefore still rolls out, and when either digest cannot be
+    resolved the service is restarted as before, so a failed lookup never stops
+    a rollout. If the service does not yet exist, provisions it. Reload outcomes
+    are published as ``ReloadTriggered``/``ReloadFailed`` CloudWatch metrics.
 
     Raises:
         Exception: Re-raised after emitting ``ReloadFailed`` when an unexpected
@@ -191,8 +242,44 @@ def _reload_one(ns, version, cluster, prefix, container_image=None):
 
         current_image = _get_current_service_image(cluster, service_name)
 
+        if current_image == container_image and not restart_if_current:
+            if digest_cache is not None and container_image in digest_cache:
+                target_digest = digest_cache[container_image]
+            else:
+                target_digest = _resolve_image_digest(container_image)
+                if digest_cache is not None:
+                    digest_cache[container_image] = target_digest
+            running_digests = _running_image_digests(cluster, service_name)
+            if target_digest and running_digests and running_digests == {target_digest}:
+                print(
+                    json.dumps(
+                        {
+                            "action": "image_current_skipped",
+                            "namespace": ns,
+                            "image": container_image,
+                            "digest": target_digest,
+                        }
+                    )
+                )
+                return {"status": "unchanged", "namespace": ns}
+            # Same URI but a different (or unknown) digest: the tag now points at
+            # another build, or we cannot tell. Restart so ECS resolves the tag
+            # again, exactly as before the skip existed.
+            known = bool(target_digest and running_digests)
+            print(
+                json.dumps(
+                    {
+                        "action": "image_digest_changed" if known else "image_digest_unknown",
+                        "namespace": ns,
+                        "image": container_image,
+                        "target_digest": target_digest or "(unknown)",
+                        "running_digests": sorted(running_digests) or ["(unknown)"],
+                    }
+                )
+            )
         if current_image == container_image:
-            print(json.dumps({"action": "image_unchanged", "namespace": ns, "image": container_image}))
+            if restart_if_current:
+                print(json.dumps({"action": "image_unchanged", "namespace": ns, "image": container_image}))
             resp = ecs.update_service(
                 cluster=cluster,
                 service=service_name,
@@ -269,6 +356,61 @@ def _get_current_service_image(cluster, service_name):
         return ""
     except Exception as e:
         print(json.dumps({"action": "get_image_failed", "service": service_name, "error_type": type(e).__name__}))
+        return ""
+
+
+def _running_image_digests(cluster, service_name):
+    """Return the set of image digests of the service's RUNNING tasks.
+
+    An empty set means "unknown": no running task, a task that has not reported
+    a digest yet, or an API error. The caller then restarts the service rather
+    than skipping it.
+    """
+    try:
+        arns = ecs.list_tasks(cluster=cluster, serviceName=service_name, desiredStatus="RUNNING").get("taskArns", [])
+        if not arns:
+            return set()
+        digests = set()
+        for i in range(0, len(arns), 100):
+            for task in ecs.describe_tasks(cluster=cluster, tasks=arns[i : i + 100]).get("tasks", []):
+                containers = task.get("containers") or []
+                digest = containers[0].get("imageDigest", "") if containers else ""
+                if not digest:
+                    return set()
+                digests.add(digest)
+        return digests
+    except Exception as e:
+        print(json.dumps({"action": "running_digest_failed", "service": service_name, "error_type": type(e).__name__}))
+        return set()
+
+
+def _resolve_image_digest(image):
+    """Return the digest an image URI points at now, or "" when it cannot be resolved.
+
+    A URI pinned with ``@sha256:`` is its own digest. A tagged ECR URI is looked
+    up with ``ecr:DescribeImages``, so a tag that was moved to a new build
+    resolves to the new digest. Anything else (a non-ECR registry, no tag, an
+    API error) is unknown.
+    """
+    pinned = _DIGEST_SUFFIX.search(image or "")
+    if pinned:
+        return pinned.group("digest")
+    match = _ECR_IMAGE.match(image or "")
+    if not match or not match.group("tag"):
+        print(json.dumps({"action": "image_digest_unresolvable", "image": image, "reason": "not a tagged ECR image"}))
+        return ""
+    region = match.group("region")
+    try:
+        client = ecr if region == os.environ.get("AWS_REGION", region) else boto3.client("ecr", region_name=region)
+        resp = client.describe_images(
+            registryId=match.group("registry"),
+            repositoryName=match.group("repo"),
+            imageIds=[{"imageTag": match.group("tag")}],
+        )
+        details = resp.get("imageDetails") or []
+        return details[0].get("imageDigest", "") if details else ""
+    except Exception as e:
+        print(json.dumps({"action": "image_digest_lookup_failed", "image": image, "error_type": type(e).__name__}))
         return ""
 
 

@@ -354,6 +354,15 @@ class NLtoSQLStrategy:
             async def table_placements(table_sources: dict[str, str]) -> dict[str, tuple[str, str]]:
                 return await executor.resolve_table_placements(namespace, table_sources)
 
+        # Every database of the namespace holding a retrieved table's name, so one
+        # retrieved copy of a shared name is not read as the whole answer.
+        same_name_databases = None
+        if self._query_executor and hasattr(self._query_executor, "resolve_same_name_databases"):
+            owners_executor = self._query_executor
+
+            async def same_name_databases(tables: list[str]) -> dict[str, dict[str, str]]:
+                return await owners_executor.resolve_same_name_databases(namespace, tables)
+
         nl_to_sql_result = await self._sql_generator.generate(
             query,
             namespace=namespace,
@@ -370,6 +379,7 @@ class NLtoSQLStrategy:
             # non-declining path, keeping the prompt byte-identical to the baseline.
             governed_metric=_governed_metric_block(context.declined_metric, data_source_id),
             table_placements=table_placements,
+            same_name_databases=same_name_databases,
         )
 
         t_ms = int((time.perf_counter() - t_start) * 1000)
@@ -691,7 +701,7 @@ class NLtoSQLStrategy:
         # unambiguous source that needs nothing done.
         if not table_sources_need_preparation(nl_result.table_sources):
             return PreparedSQL(sql=sql)
-        routing = sql_table_routing(sql, nl_result.table_sources)
+        routing = sql_table_routing(sql, nl_result.table_sources, nl_result.table_candidates)
         return await prepare_execution_sql(sql, routing, self._sources, namespace=namespace)
 
     def _firewall_check(self, sql: str, profile: dict, namespace: str, trace) -> FirewallResult | None:
