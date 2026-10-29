@@ -192,6 +192,7 @@ async def run_loop(
     sub_question: SubQuestion | None = None,
     namespace: str = NS,
     ontology_edge_mode: str = "soft_prior",
+    tool_context: dict | None = None,
 ):
     """Drive one controller loop and return (stop_reason, ctx, queue, trace)."""
     clock = clock or make_clock()[0]
@@ -202,7 +203,9 @@ async def run_loop(
         planner, per_tool_timeout_s=per_tool_timeout_s, ontology_edge_mode=ontology_edge_mode
     )
     sub_question = sub_question or SubQuestion(text="why")
-    stop = await controller.run_one_loop(sub_question, ctx, registry, clock, queue, trace, namespace=namespace)
+    stop = await controller.run_one_loop(
+        sub_question, ctx, registry, clock, queue, trace, namespace=namespace, tool_context=tool_context
+    )
     return stop, ctx, queue, trace
 
 
@@ -828,3 +831,83 @@ class TestLazyImportInvariant:
             f"importing controller leaked graphrag_toolkit or failed.\nstdout={result.stdout}\nstderr={result.stderr}"
         )
         assert "OK" in result.stdout
+
+
+# ── options.loopFixes ──────────────────────────────────────────────
+
+FIXES = {"options": {"loopFixes": True}}
+
+
+@pytest.mark.unit
+class TestLoopFixes:
+    async def test_unknown_fields_rejected_without_the_option(self):
+        tool = FakeTool("nl_to_sql", input_schema={"query": "str"})
+        planner = ScriptedPlanner(
+            [[PlannerDecision(tool_name="nl_to_sql", inputs={"query": "q", "top_k": 5})]], sufficiency=[True]
+        )
+        await run_loop(planner, make_registry(tool))
+        assert tool.calls == []
+
+    async def test_unknown_fields_dropped_with_the_option(self):
+        tool = FakeTool("nl_to_sql", input_schema={"query": "str"})
+        planner = ScriptedPlanner(
+            [[PlannerDecision(tool_name="nl_to_sql", inputs={"query": "q", "top_k": 5, "entity_class": "X"})]],
+            sufficiency=[True],
+        )
+        stop, _ctx, _q, trace = await run_loop(planner, make_registry(tool), tool_context=FIXES)
+        assert len(tool.calls) == 1 and "top_k" not in tool.calls[0] and tool.calls[0]["query"] == "q"
+        assert "entity_class" in str(find_step(trace, "unknown_fields_dropped")[0].detail)
+        assert stop == StopReason.sufficiency_satisfied
+
+    async def test_type_mismatch_still_rejected_with_the_option(self):
+        tool = FakeTool("nl_to_sql", input_schema={"query": "str"})
+        planner = ScriptedPlanner([[PlannerDecision(tool_name="nl_to_sql", inputs={"query": 3, "x": 1})]])
+        await run_loop(planner, make_registry(tool), tool_context=FIXES)
+        assert tool.calls == []
+
+    async def test_tool_not_started_when_budget_spent(self):
+        tool = FakeTool("strategy:entity_based", input_schema={"query": "str"})
+        clock, src = make_clock(time_budget_s=60, synthesis_reserve_s=5)
+        src.advance(54)  # 6 s left, 1 s usable after the reserve
+        planner = ScriptedPlanner(
+            [[PlannerDecision(tool_name="strategy:entity_based", inputs={"query": "q"})]], repeat_last=True
+        )
+        stop, _ctx, _q, trace = await run_loop(planner, make_registry(tool), clock=clock, tool_context=FIXES)
+        assert tool.calls == [] and stop == StopReason.time_budget_expired
+        assert find_step(trace, "budget_spent")
+        # No planner call is made either, and the step is given back.
+        assert planner.propose_calls == 0 and clock.steps_consumed == 0
+
+    async def test_planner_called_without_the_option_when_budget_spent(self):
+        tool = FakeTool("strategy:entity_based", input_schema={"query": "str"})
+        clock, src = make_clock(time_budget_s=60, synthesis_reserve_s=5)
+        src.advance(54)
+        planner = ScriptedPlanner(
+            [[PlannerDecision(tool_name="strategy:entity_based", inputs={"query": "q"})]], sufficiency=[True]
+        )
+        await run_loop(planner, make_registry(tool), clock=clock)
+        assert planner.propose_calls == 1
+
+    async def test_small_per_tool_cap_does_not_stop_the_loop(self):
+        # A per-tool cap below the 2 s floor must not read as "no time left".
+        tool = FakeTool("strategy:entity_based", input_schema={"query": "str"})
+        planner = ScriptedPlanner(
+            [[PlannerDecision(tool_name="strategy:entity_based", inputs={"query": "q"})]], sufficiency=[True]
+        )
+        stop, _ctx, _q, trace = await run_loop(planner, make_registry(tool), per_tool_timeout_s=1.0, tool_context=FIXES)
+        assert len(tool.calls) == 1 and not find_step(trace, "budget_spent")
+        assert stop == StopReason.sufficiency_satisfied
+
+    async def test_repeated_read_gets_its_step_back(self):
+        tool = FakeTool("read_document", input_schema={"source_key": "str"}, result=chunk_result("doc:a@0"))
+        clock, _src = make_clock(max_steps=3)
+        planner = ScriptedPlanner(
+            [[PlannerDecision(tool_name="read_document", inputs={"source_key": "a"})]], repeat_last=True
+        )
+        stop, ctx, _q, _trace = await run_loop(planner, make_registry(tool), clock=clock, tool_context=FIXES)
+        # The first read is new; the next two repeats get their steps back (the
+        # refund cap), the third does not; the no-progress streak then ends the loop.
+        assert len(tool.calls) == 4
+        assert clock.steps_consumed == 2
+        assert any(a.get("status") == "already_read" for a in ctx.attempt_history)
+        assert stop == StopReason.no_new_information

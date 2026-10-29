@@ -689,6 +689,24 @@ Leaving either setting unset leaves the runtime's default in charge; the stack o
 
 `scripts/deploy.sh` maps the variables above to the CDK context parameters `serve_nl2sql_graph_expand` and `serve_nl2sql_graph_expand_max_tables`. On a direct `cdk deploy`, pass them as context instead — `--context serve_nl2sql_graph_expand=false` — or set them in the `context` block of `infra/cdk.json`.
 
+#### Deep Reasoning default options
+
+A Deep Reasoning request that leaves an option unset gets the recommended value
+(see [Deep Reasoning request options](serve.md#deep-reasoning-request-options)).
+A request on the streaming endpoint can turn any option off itself; a REST
+`Query` carries no per-request options, so for REST callers the deployment
+setting is the only switch. To put every option back to off for the whole
+deployment, pass the CDK context parameter:
+
+```bash
+cdk deploy <prefix>-dev-serve --context serve_deep_reasoning_default_options=off
+```
+
+The stack then sets `DEEP_REASONING_DEFAULT_OPTIONS` on the Serve runtime; `off`,
+`false`, `0` and `no` all switch the defaults off.
+Left unset, the variable is not set and the recommended options apply. Changing
+it is a stack update, not an image rebuild.
+
 ### VKG Task Sizing
 
 Each namespace's Virtual Knowledge Graph runs as a Fargate task hosting Ontop.

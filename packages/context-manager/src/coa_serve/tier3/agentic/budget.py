@@ -155,6 +155,11 @@ class BudgetClock:
         self._steps += 1
         return True
 
+    def refund_step(self) -> None:
+        """Return one consumed Reasoning_Step (a step that did no work, e.g. a repeated read)."""
+        if self._steps > 0:
+            self._steps -= 1
+
     def try_open_branch(self) -> bool:
         """Reserve one Sub_Question/Exploration_Branch against the fan-out cap.
 

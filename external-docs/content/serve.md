@@ -144,7 +144,10 @@ all, or handed to the Deep Reasoning loop.
 Use `standard` when you want cascade behaviour — deterministic, cheapest-first
 routing for questions one layer can answer, including governed Tier-1 metrics.
 Use `deep-reasoning` when the answer should *combine* structured data with
-document knowledge, e.g.:
+document knowledge. The Standard cascade returns one kind of answer per request
+(rows from Tier 1/2, or prose from Tier 3), so a question that needs a table
+figure *and* a document passage should be sent with `mode: "deep-reasoning"`,
+e.g.:
 
 > *"Was last quarter's total revenue consistent with our revenue-recognition
 > policy?"* — the planner can run the revenue query through its structured
@@ -183,6 +186,85 @@ Behaviour notes:
 - Deterministic *always-run-both* joint retrieval (structured + document in one
   guaranteed pass, rather than at the planner's discretion) is roadmap work,
   tracked as issue #417.
+
+#### Deep Reasoning request options
+
+These optional members of the request `options` object tune the Deep Reasoning
+loop (`mode: "deep-reasoning"`). They are read on the streaming endpoint; the REST
+endpoint forwards only the members listed under [REST API](#rest-api). **A Deep
+Reasoning request that leaves an option unset gets the recommended value** below,
+the setting these options were measured with. Set an option yourself to change it:
+`false` switches a boolean option off, `"planner"` restores the ontology look-up
+step, and `prefetchMode: "off"` skips the first pass. An operator can restore the
+previous behaviour (every option off unless the request sets it) for the whole
+deployment with `DEEP_REASONING_DEFAULT_OPTIONS=off` on the serve runtime (the
+CDK context parameter `serve_deep_reasoning_default_options=off`). Because the
+REST endpoint forwards none of these options, a REST Deep Reasoning request always
+gets the recommended set; that deployment setting is its only switch. A value
+of the wrong type is rejected with **400**; a number outside its range is clamped
+to it. The document options do nothing on a namespace with
+no DOCUMENTS source.
+
+| Option | Type | What it does | When to use it | Latency / cost |
+|---|---|---|---|---|
+| `ontologyLookupMode` | `"planner"` or `"preload"` (recommended default) | `preload` resolves the namespace ontology once at the start, alongside question decomposition and outside the step budget, and stops offering `ontology_lookup` to the planner | Questions where the planner's first step would be the ontology lookup anyway | Saves a planner step; the ontology is loaded even when the answer does not use it |
+| `readDocument` | bool | Offers the planner a `read_document` tool that reads a source document's original text in windows, not only its retrieved chunks. `readDocumentMaxChars` (integer, 500–32,000) sets the window size: 32,000 in the recommended set, 12,000 when `readDocument` is on and the size is left unset with the defaults switched off | Answers that sit in the body of a long document (policy, contract, thread) | Each read is a loop step; larger windows make prompts longer |
+| `readDocumentAnchor` | bool (with `readDocument`) | Centres each window on a passage the loop already retrieved, or on a phrase the planner names, instead of paging from the start | Long documents where the relevant passage is far from the start | Negligible |
+| `entityRouting` | bool | The decomposition call also lists the question's named terms (identifiers, people, subjects, systems). Before the loop they are matched to the documents that mention them (graph entity mentions and an exact-phrase search), and the planner is offered `find_documents` for later names. | Questions that name a specific record, person, product or document | One lookup before the loop; no extra model call |
+| `prefetchMode` | `"assess"` or `"off"` | Before the loop, runs the SQL writer on the whole question and reads the top two documents in parallel, then checks sufficiency once and skips the loop when that evidence already answers the question | Mixed questions whose obvious evidence is what the planner would fetch first | Faster when the check passes; the up-front SQL call and reads are spent even when the loop then runs |
+| `tokenCaps` | object of integers: `planner`, `synthesizer` (1,024–16,000) | Output-token cap for this request's planner calls and answer writing. An unset role gets the recommended cap (planner 4,000, answer writing 12,000); with the defaults switched off it keeps the deployment default (planner 1,024, answer writing `TIER3_SYNTH_MAX_TOKENS`, 4,096). A value outside the range is clamped to it | Planner replies or answers cut off in the trace | Higher caps allow longer, costlier calls |
+| `plannerParseRetry` | bool | One repair turn when a planner reply cannot be parsed, instead of losing the step | Planner parse failures in the trace | One extra model call, only on a failure |
+| `loopFixes` | bool | Drops unknown fields in a planner tool call instead of rejecting it, makes no planner call and starts no tool once no time is left for a tool to start (the loop stops on the time budget), gives back the step of a document read that added nothing new (at most twice), and drops privacy-mask placeholders from routed names | Any Deep Reasoning request | None |
+| `sufficiencyGuards` | bool (with `entityRouting`) | A positive sufficiency check, in the loop or in the `prefetchMode` check, is held back while a top name-matched document has been read only in part; the reason (read on from the offset where the reading stopped) becomes the planner's next action. At most two checks are held back per loop | Long documents whose answer may sit past the first window read | Up to two more loop steps on a held-back question |
+| `singleCallSteps` | bool | The planner's next-step call also decides when to stop: it is shown the content gathered so far, and an empty proposal ends the loop (still subject to `sufficiencyGuards`). No separate sufficiency call runs after each step | Any Deep Reasoning request | Faster answers: one model call per loop step instead of two |
+| `fastPathSpeculation` | bool (with `prefetchMode`; blocking requests only) | After the prefetch, the answer is written in parallel with the sufficiency check and kept only if the check passes; otherwise it is discarded and the loop runs. When `sufficiencyGuards` already holds the check back, the check is skipped and the loop starts at once. Streamed requests are unchanged | Any request that uses `prefetchMode` | Faster answers when the check passes; one discarded answer-writing call when it fails |
+| `keepSlowSql` | bool (with `prefetchMode`) | A prefetch SQL call that outlives its timeout keeps running instead of being cancelled. The loop adds its result when it finishes, a planner `nl_to_sql` request waits for it instead of writing a new query, and with `sufficiencyGuards` a positive check is held back while it runs. It is cancelled before the answer is written | Namespaces with slow SQL queries | Recovers answers whose SQL is slow, without added latency (the call runs within the request's existing time budget) |
+
+**Recommended setting (the default).** These options were validated together and
+are applied as one set to any Deep Reasoning request that leaves them unset:
+
+```json
+{
+  "ontologyLookupMode": "preload",
+  "readDocument": true,
+  "readDocumentAnchor": true,
+  "readDocumentMaxChars": 32000,
+  "entityRouting": true,
+  "prefetchMode": "assess",
+  "loopFixes": true,
+  "plannerParseRetry": true,
+  "tokenCaps": {"planner": 4000, "synthesizer": 12000},
+  "sufficiencyGuards": true,
+  "fastPathSpeculation": true,
+  "singleCallSteps": true,
+  "keepSlowSql": true
+}
+```
+
+Document access stays scoped to the namespace: `read_document` and `find_documents`
+return only documents under the bucket and `s3Prefixes` of the namespace's
+registered DOCUMENTS sources (the same plain prefix match ingestion uses), read
+only plain-text originals, and fail closed when the source inventory cannot be
+read in full. Documents of an upload source are read from the platform's
+sources-data bucket, only under that namespace's own upload folder
+(`<namespaceId>/raw/<uploadId>/`).
+
+**Size limits for large namespaces.** These apply to every Deep Reasoning
+request, with or without the options above, so that a namespace with many
+documents or a densely connected graph cannot push a prompt past the model's input
+window. Each one is reported in the request trace when it takes effect, never
+silently:
+
+- the answer step's document context is limited to 600,000 characters as the
+  prompt carries them (`TIER3_SYNTH_MAX_CONTEXT_CHARS`, 20,000–2,000,000; lower
+  it for a model with a smaller input window). Over the limit, document text is
+  kept before graph statements, in gathered order, and the response's
+  `supportingContent` lists only what the answer was given. The trace step
+  `synthesis_context_capped` says how many chunks were left out;
+- a planner-supplied chunk-window `limit` is clamped to 100 (a graph traversal
+  bounds its own limit and its supporting statements);
+- a question is split into at most 6 sub-questions (the `decompose` step names
+  any left out).
 
 #### Which Tier-3 path consults the published ontology?
 
