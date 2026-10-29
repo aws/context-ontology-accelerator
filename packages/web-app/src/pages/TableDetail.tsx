@@ -53,6 +53,7 @@ import type {
   RescanTableDiff,
 } from "@coa/control-plane-client";
 import { extractErrorMessage, runSequential } from "@utils";
+import { isSubmitEnter } from "@utils/keyboard";
 import { InfoPopover } from "@components/InfoPopover";
 import { useAppI18n, type AppTranslate } from "../i18n/LocaleProvider";
 import type { AppMessage } from "../i18n/appMessages";
@@ -1490,7 +1491,7 @@ function SynonymsField({
           value={field.input}
           onChange={({ detail }) => field.setInput(detail.value)}
           onKeyDown={({ detail }) => {
-            if (detail.key === "Enter") field.add();
+            if (isSubmitEnter(detail)) field.add();
           }}
           placeholder={placeholder}
         />
@@ -1586,7 +1587,7 @@ function EditTableModal({
               value={glossary.input}
               onChange={({ detail }) => glossary.setInput(detail.value)}
               onKeyDown={({ detail }) => {
-                if (detail.key === "Enter") glossary.add();
+                if (isSubmitEnter(detail)) glossary.add();
               }}
               placeholder={t("e.g. Customer")}
             />
@@ -1602,7 +1603,7 @@ function EditTableModal({
               value={tags.input}
               onChange={({ detail }) => tags.setInput(detail.value)}
               onKeyDown={({ detail }) => {
-                if (detail.key === "Enter") tags.add();
+                if (isSubmitEnter(detail)) tags.add();
               }}
               placeholder={t("e.g. pii")}
             />
@@ -1693,7 +1694,7 @@ function EditColumnModal({
               value={glossary.input}
               onChange={({ detail }) => glossary.setInput(detail.value)}
               onKeyDown={({ detail }) => {
-                if (detail.key === "Enter") glossary.add();
+                if (isSubmitEnter(detail)) glossary.add();
               }}
               placeholder={t("e.g. Customer")}
             />
@@ -1709,7 +1710,7 @@ function EditColumnModal({
               value={tags.input}
               onChange={({ detail }) => tags.setInput(detail.value)}
               onKeyDown={({ detail }) => {
-                if (detail.key === "Enter") tags.add();
+                if (isSubmitEnter(detail)) tags.add();
               }}
               placeholder={t("e.g. pii")}
             />

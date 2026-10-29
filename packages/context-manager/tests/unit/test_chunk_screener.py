@@ -119,7 +119,7 @@ class TestScreenChunks:
         assert len(excluded) == 1
 
     async def test_no_screener_in_synthesizer_passes_all_chunks(self):
-        """When chunk_screener is None, _screen_chunks returns all chunks unchanged."""
+        """When chunk_screener is None, synthesis passes all chunks through unchanged."""
         from coa_serve.clients.base import ConverseResult
         from coa_serve.tier3.synthesizer import Synthesizer
 

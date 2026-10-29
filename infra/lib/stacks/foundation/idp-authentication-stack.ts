@@ -112,6 +112,21 @@ export class IdpAuthenticationStack extends SCLStack {
     };
   }
 
+  /**
+   * Names of the federated (SAML, then OIDC) providers these props register,
+   * in the order the clients list them after `COGNITO`.
+   *
+   * The web stack's callback-URL patch replaces the whole web client, so it
+   * has to send this same list or it drops every federated provider. app.ts
+   * passes it to `WebStack` from the same props this stack is built from.
+   */
+  static federatedProviderNames(props?: IdpAuthenticationStackProps): string[] {
+    return [
+      ...(props?.samlProviders ?? []).map((p) => p.name),
+      ...(props?.oidcProviders ?? []).map((p) => p.name),
+    ].filter((name): name is string => !!name);
+  }
+
   constructor(
     scope: Construct,
     id: string,
@@ -214,6 +229,13 @@ export class IdpAuthenticationStack extends SCLStack {
       selfSignUpEnabled: false,
       signInAliases: { email: true },
       autoVerify: { email: true },
+      // Grants are looked up by the token's email, so a user's own email
+      // change must not take effect until they prove they own the new
+      // address. Until then Cognito keeps the old value in the pool and in
+      // tokens. Users cannot set email_verified themselves, so this closes
+      // self-service changes. AdminUpdateUserAttributes is held the same way
+      // unless the request also sets email_verified=true.
+      keepOriginal: { email: true },
       passwordPolicy: {
         minLength: 12,
         requireUppercase: true,
@@ -240,15 +262,21 @@ export class IdpAuthenticationStack extends SCLStack {
     const supportedIdPs: cognito.UserPoolClientIdentityProvider[] = [
       cognito.UserPoolClientIdentityProvider.COGNITO,
     ];
+    // The clients name these providers as plain strings, so CloudFormation
+    // can't see that they need the providers first. Kept here so the clients
+    // can depend on them below.
+    const federatedProviders: cognito.IUserPoolIdentityProvider[] = [];
 
     for (const samlCfg of props?.samlProviders ?? []) {
       if (!samlCfg.name) throw new Error("SAML provider name is required");
-      new cognito.UserPoolIdentityProviderSaml(this, `Saml-${samlCfg.name}`, {
-        ...samlCfg,
-        userPool: this.userPool,
-        attributeMapping:
-          samlCfg.attributeMapping ?? this.buildAttrMapping(props),
-      });
+      federatedProviders.push(
+        new cognito.UserPoolIdentityProviderSaml(this, `Saml-${samlCfg.name}`, {
+          ...samlCfg,
+          userPool: this.userPool,
+          attributeMapping:
+            samlCfg.attributeMapping ?? this.buildAttrMapping(props),
+        }),
+      );
       supportedIdPs.push(
         cognito.UserPoolClientIdentityProvider.custom(samlCfg.name),
       );
@@ -256,13 +284,15 @@ export class IdpAuthenticationStack extends SCLStack {
 
     for (const oidcCfg of props?.oidcProviders ?? []) {
       if (!oidcCfg.name) throw new Error("OIDC provider name is required");
-      new cognito.UserPoolIdentityProviderOidc(this, `Oidc-${oidcCfg.name}`, {
-        ...oidcCfg,
-        userPool: this.userPool,
-        scopes: oidcCfg.scopes ?? ["openid", "email", "profile"],
-        attributeMapping:
-          oidcCfg.attributeMapping ?? this.buildAttrMapping(props),
-      });
+      federatedProviders.push(
+        new cognito.UserPoolIdentityProviderOidc(this, `Oidc-${oidcCfg.name}`, {
+          ...oidcCfg,
+          userPool: this.userPool,
+          scopes: oidcCfg.scopes ?? ["openid", "email", "profile"],
+          attributeMapping:
+            oidcCfg.attributeMapping ?? this.buildAttrMapping(props),
+        }),
+      );
       supportedIdPs.push(
         cognito.UserPoolClientIdentityProvider.custom(oidcCfg.name),
       );
@@ -329,6 +359,12 @@ export class IdpAuthenticationStack extends SCLStack {
     });
 
     this.mcpClientId = this.mcpClient.userPoolClientId;
+    for (const provider of federatedProviders) {
+      // Without this, a first deploy can create a client before its provider
+      // exists and fail with "The provider <name> does not exist".
+      this.userPoolClient.node.addDependency(provider);
+      this.mcpClient.node.addDependency(provider);
+    }
     this.issuerUrl = `https://cognito-idp.${this.region}.amazonaws.com/${this.userPool.userPoolId}`;
 
     // ── SSM Parameters ─────────────────────────────────────────────

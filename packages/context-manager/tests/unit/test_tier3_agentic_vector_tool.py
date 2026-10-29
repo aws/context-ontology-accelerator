@@ -34,7 +34,7 @@ from coa_serve.tier3.agentic.tools.vector_tool import (
     VectorSearchTool,
     build_vector_tool,
 )
-from coa_serve.tier3.vector_retriever import ChunkResult
+from coa_serve.tier3.vector_retriever import ChunkResult, ChunkSearchResults
 
 
 def _chunk(chunk_id: str = "c1", text: str = "hello", source_doc: str = "doc-1", score: float = 0.9) -> ChunkResult:
@@ -57,16 +57,26 @@ class FakeVectorRetriever:
     defensive never-raise guard.
     """
 
-    def __init__(self, chunks=None, *, raises: Exception | None = None) -> None:
+    def __init__(
+        self,
+        chunks=None,
+        *,
+        raises: Exception | None = None,
+        dropped_anonymous_chunks: int = 0,
+    ) -> None:
         self._chunks = list(chunks) if chunks is not None else []
         self._raises = raises
+        self._dropped_anonymous_chunks = dropped_anonymous_chunks
         self.calls: list[dict] = []
 
     async def search(self, embedding, namespace, *, top_k=10):
         self.calls.append({"embedding": embedding, "namespace": namespace, "top_k": top_k})
         if self._raises is not None:
             raise self._raises
-        return list(self._chunks)
+        return ChunkSearchResults(
+            list(self._chunks),
+            dropped_anonymous_chunks=self._dropped_anonymous_chunks,
+        )
 
 
 class FakeEmbedClient:
@@ -153,6 +163,31 @@ class TestInvokeReturnsChunks:
         assert "error" not in out.detail
         assert "0 chunks" in out.detail
 
+    async def test_invoke_preserves_dropped_anonymous_chunk_degradation(self):
+        vector = FakeVectorRetriever(
+            chunks=[_chunk()],
+            dropped_anonymous_chunks=4,
+        )
+        tool = VectorSearchTool(vector, FakeEmbedClient())
+
+        out = await tool.invoke(namespace="ns", embedding=[0.1])
+
+        assert len(out.chunks) == 1
+        assert out.degraded_reason == "missing_document_provenance"
+        assert "dropped 4 anonymous or malformed document chunks" in out.detail
+
+    async def test_index_where_no_hit_has_provenance_degrades_instead_of_succeeding_empty(self):
+        # An index whose hits ALL lack document provenance must not look like an
+        # ordinary "0 chunks" search: the evidence existed and was discarded.
+        vector = FakeVectorRetriever(chunks=[], dropped_anonymous_chunks=3)
+        tool = VectorSearchTool(vector, FakeEmbedClient())
+
+        out = await tool.invoke(namespace="ns", embedding=[0.1])
+
+        assert out.chunks == ()
+        assert out.degraded_reason == "missing_document_provenance"
+        assert "dropped 3 anonymous or malformed document chunks" in out.detail
+
 
 # ── Embedding source selection (Req 2.4) ───────────────────────────
 
@@ -223,6 +258,7 @@ class TestDegradedNeverRaises:
         assert out.chunks == ()
         assert "error" in out.detail
         assert "RuntimeError" in out.detail
+        assert out.degraded_reason == "error"
 
     async def test_embed_error_surfaces_as_degraded(self):
         embed = FakeEmbedClient(raises=ValueError("no embedding in response"))
@@ -234,6 +270,7 @@ class TestDegradedNeverRaises:
         assert out.chunks == ()
         assert "embed error" in out.detail
         assert "ValueError" in out.detail
+        assert out.degraded_reason == "error"
         # search must not have been attempted with a failed embedding.
         assert vector.calls == []
 

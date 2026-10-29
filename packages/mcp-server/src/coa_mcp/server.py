@@ -187,6 +187,7 @@ async def list_metrics(
 
     Returns metric summaries including name, description, dimensions, and synonyms.
     Use this tool FIRST to discover what metrics are available before querying.
+    A metric's ``label`` is for display only; queries should use the metric ``name`` or its synonyms.
 
     This is a read-only, lightweight lookup — no LLM calls, no SQL execution.
 

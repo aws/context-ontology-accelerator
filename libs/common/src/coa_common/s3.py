@@ -16,6 +16,7 @@ import re
 from typing import Any
 
 import boto3
+from botocore.config import Config
 from botocore.exceptions import ClientError
 
 from coa_common.aws_config import async_boto_config
@@ -25,6 +26,27 @@ logger = logging.getLogger(__name__)
 _STS_DURATION_SECONDS = 3600
 
 _ROLE_ARN_RE = re.compile(r"^arn:aws:iam::\d{12}:role/.+$")
+
+
+def regional_s3_client(region: str) -> Any:
+    """Return a SigV4 S3 client that addresses buckets by their regional hostname.
+
+    Use it for presigned URLs a browser follows. They name
+    ``<bucket>.s3.<region>.amazonaws.com``, where boto3's default names the global
+    ``<bucket>.s3.amazonaws.com``. S3 answers the global name with a 307 redirect for
+    a bucket created outside us-east-1 until its DNS propagates (up to about 24
+    hours), and a browser does not follow that redirect on a cross-origin request.
+
+    Virtual addressing is what stops botocore rewriting a presigned URL onto the
+    global name. The endpoint itself still comes from botocore's resolver, so every
+    partition keeps its own DNS suffix (``amazonaws.com.cn`` in China). In us-east-1
+    the resolver's endpoint is the global name, which serves that region directly.
+    """
+    return boto3.client(
+        "s3",
+        region_name=region,
+        config=Config(signature_version="s3v4", s3={"addressing_style": "virtual"}),
+    )
 
 
 def get_s3_client(

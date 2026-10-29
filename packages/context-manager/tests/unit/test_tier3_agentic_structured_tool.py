@@ -37,11 +37,15 @@ def build_nl_to_sql_tool(registry, tier):
 class _FakeStrategyResult:
     """StrategyResult-shaped stand-in (attribute access only)."""
 
-    def __init__(self, rows, *, confidence=0.9, strategy_name="nl_to_sql"):
+    def __init__(self, rows, *, confidence=0.9, strategy_name="nl_to_sql", sparql=""):
         self.sql = "SELECT 1"
         self.rows = rows
         self.confidence = confidence
         self.strategy_name = strategy_name
+        # StrategyResult.sparql defaults to "" (empty for the NL→SQL path, set on
+        # the VKG/ontop path). The structured tool reads it to capture query
+        # artifacts (#1166), so the stand-in must expose it too.
+        self.sparql = sparql
 
 
 class _FakeTier:
@@ -74,6 +78,29 @@ class TestNlToSqlTool:
         tier = _FakeTier(_FakeStrategyResult([{"a": 1}]))
         result = await NlToSqlTool(tier).invoke(namespace="ns", query="q")
         assert result.items == ({"type": "row", "a": 1},)
+
+    async def test_captures_sql_query_artifact(self):
+        """#1166 cut #3: the tool captures the SQL it executed so Deep Reasoning
+        can return it. NL→SQL has no SPARQL, so only a single SQL artifact."""
+        tier = _FakeTier(_FakeStrategyResult([{"a": 1}]))
+        result = await NlToSqlTool(tier).invoke(namespace="ns", query="q")
+        assert [(e.kind, e.query) for e in result.executed_queries] == [("sql", "SELECT 1")]
+
+    async def test_captures_both_sparql_and_sql_on_vkg_path(self):
+        """The VKG/ontop path produces a SPARQL statement AND the SQL it compiled
+        to — both are captured (SPARQL first, then SQL)."""
+        tier = _FakeTier(_FakeStrategyResult([{"a": 1}], sparql="SELECT ?x WHERE { ?x a :T }"))
+        result = await NlToSqlTool(tier).invoke(namespace="ns", query="q")
+        assert [(e.kind, e.query) for e in result.executed_queries] == [
+            ("sparql", "SELECT ?x WHERE { ?x a :T }"),
+            ("sql", "SELECT 1"),
+        ]
+
+    async def test_no_rows_captures_no_query_artifacts(self):
+        """A tool that returned no rows surfaces no query artifacts (nothing ran
+        to completion worth showing)."""
+        result = await NlToSqlTool(_FakeTier(_FakeStrategyResult([]))).invoke(namespace="ns", query="q")
+        assert result.executed_queries == ()
 
     async def test_none_result_is_empty_not_raised(self):
         result = await NlToSqlTool(_FakeTier(None)).invoke(namespace="ns", query="q")

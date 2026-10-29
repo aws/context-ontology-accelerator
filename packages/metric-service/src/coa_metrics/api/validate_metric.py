@@ -26,6 +26,7 @@ from coa_control_plane_server.models.validate_metric_request_content import (
 )
 from pydantic import ValidationError
 
+from coa_metrics.api.contract import check_metric_label, normalize_label_member
 from coa_metrics.api.validation_errors import format_validation_error
 from coa_metrics.data_source_lookup_factory import build_data_source_lookup
 from coa_metrics.lookups import DataSourceLookup, NeptuneOntologyLookup
@@ -95,11 +96,19 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     if body is None:
         return api_response(400, {"message": "Request body is required"})
 
-    # Validate request structure via Smithy-generated Pydantic model
+    # Validate request structure via Smithy-generated Pydantic model. The label
+    # is NFC-normalized first, exactly as create/update do, so the dry run and
+    # the real save count its length the same way.
+    normalize_label_member(body)
     try:
         request = ValidateMetricRequestContent.model_validate(body)
     except ValidationError as exc:
         return api_response(400, {"message": format_validation_error(exc)})
+
+    # The label's Unicode rules are a value check like the others: an ERROR
+    # finding here predicts the 400 create/update return for the same input.
+    label_error = check_metric_label(request.label)
+    label_findings = [{"field": "label", "message": label_error, "severity": "ERROR"}] if label_error else []
 
     metric_body = {
         "name": request.name,
@@ -130,13 +139,17 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         return api_response(500, {"message": "Internal error during validation"})
 
     if deterministic_result.errors:
-        warnings = [
-            {"field": err.get("check", "sql_syntax"), "message": err["message"], "severity": "ERROR"}
-            for err in deterministic_result.errors
-        ] + [
-            {"field": warn.get("check", "validation"), "message": warn["message"], "severity": "INFO"}
-            for warn in deterministic_result.warnings
-        ]
+        warnings = (
+            label_findings
+            + [
+                {"field": err.get("check", "sql_syntax"), "message": err["message"], "severity": "ERROR"}
+                for err in deterministic_result.errors
+            ]
+            + [
+                {"field": warn.get("check", "validation"), "message": warn["message"], "severity": "INFO"}
+                for warn in deterministic_result.warnings
+            ]
+        )
         return api_response(200, {"warnings": warnings})
 
     # Use the same source acceptance gates as create/update so validate-before-
@@ -151,6 +164,20 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             source_field = "sourceTable"
     except SourceValidationUnavailableError as exc:
         logger.error("source_validation_unavailable", namespace=namespace, error=str(exc))
+        if label_findings:
+            # Create/update reject a bad label with a 400 before they reach the
+            # source gate, so the outage does not change their verdict. Report
+            # the label here too rather than a "try again later" 503.
+            return api_response(
+                200,
+                {
+                    "warnings": label_findings
+                    + [
+                        {"field": warn.get("check", "validation"), "message": warn["message"], "severity": "INFO"}
+                        for warn in deterministic_result.warnings
+                    ]
+                },
+            )
         return api_response(503, {"message": "Data source validation is unavailable — try again later"})
 
     source_findings = [{"field": source_field, "message": source_error, "severity": "ERROR"}] if source_error else []
@@ -172,7 +199,8 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     # and a provably absent declared sourceTable matches the dedicated source
     # gate. Advisory metadata and ontology findings stay INFO.
     warnings = (
-        source_findings
+        label_findings
+        + source_findings
         + [
             {"field": err.get("check", "sql_syntax"), "message": err["message"], "severity": "ERROR"}
             for err in result.errors

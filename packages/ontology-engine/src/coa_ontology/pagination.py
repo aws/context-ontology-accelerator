@@ -31,6 +31,7 @@ import base64
 import binascii
 import json
 import logging
+from decimal import Decimal
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -112,9 +113,32 @@ def decode_next_token(token: str | None, *, scope: str, pk: str | None = None) -
     return {"PK": decoded["PK"], "SK": decoded["SK"]}
 
 
+def json_native_numbers(value: Any) -> Any:
+    """Return ``value`` with every ``Decimal`` replaced by an ``int`` (whole) or ``float``.
+
+    boto3 reads every DynamoDB number back as ``Decimal``. The list routes carry a
+    return annotation, so FastAPI serializes them through Pydantic's JSON mode,
+    which writes a ``Decimal`` as a JSON string (``"2"``) where the contract types
+    an ``Integer``. Walks dicts and lists/tuples (a tuple comes back as a list, as
+    it would on the wire); every other value, including Pydantic models, is
+    returned unchanged.
+    """
+    if isinstance(value, Decimal):
+        return int(value) if value == value.to_integral_value() else float(value)
+    if isinstance(value, dict):
+        return {k: json_native_numbers(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_native_numbers(v) for v in value]
+    return value
+
+
 def page_body(key: str, items: list, next_key: dict[str, Any] | None, *, scope: str) -> dict[str, Any]:
-    """A list operation's output envelope: ``{key: items}`` plus ``nextToken`` when more may follow."""
-    body: dict[str, Any] = {key: items}
+    """A list operation's output envelope: ``{key: items}`` plus ``nextToken`` when more may follow.
+
+    The items are usually raw DynamoDB rows, so their ``Decimal`` numbers are
+    converted to JSON numbers here (see :func:`json_native_numbers`).
+    """
+    body: dict[str, Any] = {key: json_native_numbers(items)}
     token = encode_next_token(next_key, scope=scope)
     if token:
         body["nextToken"] = token

@@ -19,11 +19,11 @@ import os
 import uuid
 from typing import Any
 
-import boto3
 import structlog
-from botocore.config import Config
+from coa_common import resolve_region
 from coa_common.logging import setup_logging
 from coa_common.response import api_response
+from coa_common.s3 import regional_s3_client
 from coa_control_plane_server.models.export_format import ExportFormat
 
 from coa_metrics.api.contract import EXPORT_NAMES_MAX_ITEMS, check_metric_name_list
@@ -207,6 +207,7 @@ def _metric_to_osi(metric: MetricDefinition) -> OsiMetric:
         ontology_concepts=metric.ontology_concepts,
         defined_by=metric.defined_by or "",
         effective_from=metric.effective_from or "",
+        label=metric.label,
     )
 
     return OsiMetric(
@@ -228,11 +229,7 @@ _s3_client: Any = None
 def _get_s3_client() -> Any:
     global _s3_client  # noqa: PLW0603
     if _s3_client is None:
-        _s3_client = boto3.client(
-            "s3",
-            region_name=os.environ.get("AWS_REGION", "us-east-1"),
-            config=Config(signature_version="s3v4"),
-        )
+        _s3_client = regional_s3_client(resolve_region())
     return _s3_client
 
 

@@ -102,7 +102,11 @@ class OffsetPlan:
 
 @dataclass(frozen=True)
 class OffsetPlanReference:
-    """Compact DynamoDB reference to an exact schema-v2 plan payload in versioned S3."""
+    """Compact DynamoDB reference to an exact plan payload in versioned S3.
+
+    ``schemaVersion`` here versions this reference record, not the payload it
+    points at; the payload carries its own version (``import_plan_payload``).
+    """
 
     offset: int
     entry_count: int

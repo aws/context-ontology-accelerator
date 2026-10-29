@@ -274,7 +274,10 @@ class NeptuneDatabaseLexicalStore:
         """
         classes = self.get_class_nodes()
         if not classes:
-            raise ValueError("Graph contains zero class entries — not a valid lexical graph")
+            raise ValueError(
+                "Graph contains zero class entries — not a valid lexical graph. "
+                "The document ingest extracted no entity classes; re-ingest the document source."
+            )
         relations = self.get_class_relations()
         return ClassSchemaResult(classes=classes, relations=relations)
 

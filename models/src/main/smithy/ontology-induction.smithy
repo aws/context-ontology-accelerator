@@ -233,7 +233,10 @@ operation StartInduction {
         @httpLabel
         namespaceId: Uuid
 
-        /// Data source IDs to induct from.
+        /// Data source IDs to induct from. The table-based strategies
+        /// (`table_to_ontology`, `rigor_ontology`) need at least one; an empty
+        /// list is rejected with a 400. `unstructured_lexical_graph` reads the
+        /// lexical graph instead and accepts an empty list.
         @required
         @length(max: 1000)
         datasourceIds: DataSourceIdList
@@ -352,7 +355,10 @@ operation ListInductionJobs {
         @httpLabel
         namespaceId: Uuid
 
-        /// Filter by job status.
+        /// Filter by job status. Also accepts `ingested` (the job's proposal
+        /// was accepted) and `cancelled`, which the service stores but this
+        /// enum does not list. Any other value returns 400 listing the allowed
+        /// values.
         @httpQuery("status")
         status: InductionJobStatus
 

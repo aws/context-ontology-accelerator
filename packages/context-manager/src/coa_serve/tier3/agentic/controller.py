@@ -382,6 +382,9 @@ class ReasoningController:
 
             # Incorporate the result BEFORE selecting the next step (Req 4.2).
             new_count = ctx.add(result)
+            result_degraded_reason = result.degraded_reason
+            if result_degraded_reason:
+                ctx.record_degraded(decision.tool_name, result_degraded_reason)
             # If the result carried the determined ontology (an Ontology_Lookup_Tool
             # success), cache it on the shared context so the ontology-constrained
             # edge filter (Req 3.4/3.9) and the planner's context summary can use it
@@ -396,10 +399,11 @@ class ReasoningController:
             edges_discovered = self._maybe_cache_present_edges(result, ctx, clock, trace)
             # Record the attempt so the planner can see what it tried and whether it
             # produced anything (idea 3/4 — informs escalation / avoids repeats).
-            ctx.record_attempt(decision.tool_name, decision.inputs, new_count, "succeeded", decision.reasoning)
+            attempt_status = "degraded" if result_degraded_reason else "succeeded"
+            ctx.record_attempt(decision.tool_name, decision.inputs, new_count, attempt_status, decision.reasoning)
             trace.record(
                 decision.tool_name,
-                "succeeded",
+                attempt_status,
                 ms,
                 detail=result.detail,
                 tool_used=decision.tool_name,

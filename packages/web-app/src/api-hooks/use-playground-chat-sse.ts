@@ -25,9 +25,19 @@ import { useSessions } from "./use-sessions";
 import { useTokenBuffer } from "./use-token-buffer";
 
 /**
- * Build the request's `options` object, omitting it entirely when nothing is set.
+ * Build the request's `options` object.
  *
- * One helper rather than two conditional spreads, because
+ * `includeDebugInfo` is set to `false` from the Playground: the compiled SQL
+ * (`queryUsed`) and generated SPARQL (`sparqlGenerated`) expose internal schema
+ * (table/column/relationship names) and are withheld by default server-side
+ * (AppSec gate, commit 594f9c85). The Playground does NOT opt in, so artifacts
+ * stay hidden there for every caller — preserving that AppSec default-withhold
+ * posture. The server-side artifact gate (`includeDebugInfo && viewNamespace`)
+ * remains the authoritative control; whether/when the Playground should opt in
+ * for schema-authorized roles is deferred to the pending role-visibility
+ * decision, not pinned on here.
+ *
+ * One helper rather than conditional spreads, because
  * `...(mode && { options: { mode } })` followed by the same for `strategy` would
  * have the second overwrite the first — both assign the whole `options` key.
  *
@@ -37,12 +47,19 @@ import { useTokenBuffer } from "./use-token-buffer";
 export function buildOptions(
   mode?: ExecutionMode,
   strategy?: QueryStrategy,
-): { options?: { mode?: ExecutionMode; strategy?: QueryStrategy } } {
+): {
+  options: {
+    mode?: ExecutionMode;
+    strategy?: QueryStrategy;
+    includeDebugInfo: boolean;
+  };
+} {
   const options = {
     ...(mode && { mode }),
     ...(strategy && { strategy }),
+    includeDebugInfo: false,
   };
-  return Object.keys(options).length > 0 ? { options } : {};
+  return { options };
 }
 
 export interface UsePlaygroundChatSSEOptions {

@@ -267,24 +267,36 @@ class TestOntologySource:
 
 
 class TestGraphTraverser:
+    # Rows carry the directed-provenance columns the query now selects
+    # (source/predicate/target URIs + their language-tagged labels). The entity
+    # arrives once per label value so the namespace-language preference can pick
+    # the display label and each relationship-endpoint label independently of row
+    # order.
     ROWS = [
         {
             "entity": _iri("Equipment"),
             "label": "Equipment",
             "type": "owl#Class",
-            "predicate": "rdfs#subClassOf",
-            "related": _iri("Asset"),
-            "relLabel": "Asset",
+            "sourceUri": _iri("Equipment"),
+            "sourceLabel": "Equipment",
+            "predicateUri": "rdfs#subClassOf",
+            "predicateLabel": "subClassOf",
+            "targetUri": _iri("Asset"),
+            "targetLabel": "Asset",
         },
         {
             "entity": _iri("Equipment"),
             "label": "設備",
             "labelLang": "ja",
             "type": "owl#Class",
-            "predicate": "rdfs#subClassOf",
-            "related": _iri("Asset"),
-            "relLabel": "資産",
-            "relLabelLang": "ja",
+            "sourceUri": _iri("Equipment"),
+            "sourceLabel": "設備",
+            "sourceLabelLang": "ja",
+            "predicateUri": "rdfs#subClassOf",
+            "predicateLabel": "subClassOf",
+            "targetUri": _iri("Asset"),
+            "targetLabel": "資産",
+            "targetLabelLang": "ja",
         },
         {"entity": _iri("Legacy"), "label": "Legacy", "type": "owl#Class"},
     ]
@@ -296,12 +308,12 @@ class TestGraphTraverser:
         assert [e.uri for e in entities] == [_iri("Equipment"), _iri("Legacy")]
         assert entities[0].label == label
         assert [r["target_label"] for r in entities[0].relationships] == [target]
+        assert [r["target_uri"] for r in entities[0].relationships] == [_iri("Asset")]
         assert entities[1].label == "Legacy"
 
     def test_hop_results_group_the_same_way(self, bind_language) -> None:
         bind_language("ja")
-        rows = [{**row, "relPredicate": row.pop("predicate", None)} for row in map(dict, self.ROWS)]
-        entities = GraphTraverser(graph_client=None, graph_uri_template=TEMPLATE)._parse_hop_results(rows)
+        entities = GraphTraverser(graph_client=None, graph_uri_template=TEMPLATE)._parse_hop_results(self.ROWS)
         assert entities[0].label == "設備"
         assert [r["target_label"] for r in entities[0].relationships] == ["資産"]
 

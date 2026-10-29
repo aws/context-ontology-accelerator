@@ -3,8 +3,14 @@
 
 """Unit tests for ResponseAssembler."""
 
+import json
+
 import pytest
-from coa_serve.response_assembler import ResponseAssembler
+from coa_serve.response_assembler import (
+    MAX_GRAPH_CONTEXT_ENTITIES,
+    MAX_GRAPH_CONTEXT_RELATIONSHIPS,
+    ResponseAssembler,
+)
 from coa_serve.trace import TraceCollector
 
 pytestmark = pytest.mark.unit
@@ -218,9 +224,165 @@ class TestAssembleTier3:
         assert result.tier == 3
         assert result.synthesized_answer == "The answer is 42."
         assert result.supporting_content == [{"chunkId": "c1", "text": "..."}]
-        assert result.graph_context == {"entities": [{"uri": "urn:x", "label": "X"}]}
+        assert result.graph_context == {
+            "entities": [{"uri": "urn:x", "label": "X"}],
+            "relationships": [],
+        }
         assert result.confidence.score == 0.8
         assert result.partial is False  # clean (no degraded sources)
+
+    def test_tier3_graph_only_context_uses_canonical_smithy_shape(self, assembler, trace):
+        result = assembler.assemble_tier3(
+            synthesized_answer="Amazon competes with Walmart.",
+            supporting_content=[],
+            graph_context=[
+                {
+                    "uri": "e:walmart",
+                    "label": "Walmart",
+                    "type": "Company",
+                    "relationships": (
+                        {
+                            "source_uri": "e:amazon",
+                            "predicate_uri": "urn:predicate:competes-with",
+                            "predicate_label": "COMPETES_WITH",
+                            "target_uri": "e:walmart",
+                            "target_label": "Walmart",
+                        },
+                    ),
+                }
+            ],
+            confidence=0.8,
+            trace=trace,
+            namespace="demo",
+        )
+
+        assert result.supporting_content == []
+        assert result.graph_context == {
+            "entities": [{"uri": "e:walmart", "label": "Walmart", "type": "Company"}],
+            "relationships": [
+                {
+                    "sourceUri": "e:amazon",
+                    "predicateUri": "urn:predicate:competes-with",
+                    "targetUri": "e:walmart",
+                    "predicateLabel": "COMPETES_WITH",
+                }
+            ],
+        }
+        wire_result = result.model_dump(by_alias=True, exclude_none=True, mode="json")
+        assert wire_result["supportingContent"] == []
+        assert wire_result["graphContext"] == result.graph_context
+
+    def test_tier3_never_promotes_a_predicate_label_to_predicate_uri(self, assembler, trace):
+        # An edge with NO predicate identity at all (only an untyped ``predicate``
+        # key) still cannot go on the wire — ``predicateUri`` is @required and a
+        # human-readable label is not an identifier. What changed is that the drop is
+        # now OBSERVABLE: an empty ``relationships`` list must not be ambiguous
+        # between "no edges found" and "every edge discarded", because the
+        # synthesizer may already have asserted the relationship in the answer.
+        result = assembler.assemble_tier3(
+            synthesized_answer="Amazon competes with Walmart.",
+            supporting_content=[],
+            graph_context=[
+                {
+                    "uri": "e:walmart",
+                    "label": "Walmart",
+                    "relationships": (
+                        {
+                            "source_uri": "e:amazon",
+                            "predicate": "COMPETES_WITH",
+                            "target_uri": "e:walmart",
+                        },
+                    ),
+                }
+            ],
+            confidence=0.8,
+            trace=trace,
+            namespace="demo",
+        )
+
+        assert result.graph_context["relationships"] == []
+        degraded = result.metadata["degradedSources"]
+        assert [entry["reason"] for entry in degraded] == ["graph_context_evidence_dropped"]
+        assert "1 relationship(s) with no predicate identity" in degraded[0]["detail"]
+        assert result.partial is True
+        degraded_steps = [step for step in result.trace if step.status == "degraded"]
+        assert len(degraded_steps) == 1
+        assert "no predicate identity" in degraded_steps[0].detail
+
+    def test_tier3_reports_dropped_entities_without_a_uri(self, assembler, trace):
+        result = assembler.assemble_tier3(
+            synthesized_answer="Answer.",
+            supporting_content=[],
+            graph_context=[{"label": "No identity"}, {"uri": "e:kept", "label": "Kept"}],
+            confidence=0.8,
+            trace=trace,
+            namespace="demo",
+        )
+
+        assert [entity["uri"] for entity in result.graph_context["entities"]] == ["e:kept"]
+        assert "1 entities with no uri" in result.metadata["degradedSources"][0]["detail"]
+
+    def test_tier3_bounds_graph_context_entity_and_relationship_counts(self, assembler, trace):
+        entities = [
+            {
+                "uri": f"e:{index}",
+                "label": f"Entity {index}",
+                "relationships": (
+                    {
+                        "source_uri": f"e:{index}",
+                        "predicate_uri": "p:rel",
+                        "target_uri": f"e:{index + 1}",
+                    },
+                ),
+            }
+            for index in range(MAX_GRAPH_CONTEXT_ENTITIES + 50)
+        ]
+
+        result = assembler.assemble_tier3(
+            synthesized_answer="Answer.",
+            supporting_content=[],
+            graph_context=entities,
+            confidence=0.8,
+            trace=trace,
+            namespace="demo",
+        )
+
+        assert len(result.graph_context["entities"]) == MAX_GRAPH_CONTEXT_ENTITIES
+        assert len(result.graph_context["relationships"]) <= MAX_GRAPH_CONTEXT_RELATIONSHIPS
+        assert "50 entities over the" in result.metadata["degradedSources"][0]["detail"]
+
+    def test_tier3_fairly_bounds_oversized_multibyte_graph_statements(self, assembler, trace):
+        oversized = "界" * 5_000
+        result = assembler.assemble_tier3(
+            synthesized_answer="Graph-backed answer.",
+            supporting_content=[],
+            graph_context=[
+                {
+                    "uri": "urn:first",
+                    "label": "First",
+                    "properties": {"supportingStatements": json.dumps([oversized, "first-extra"])},
+                },
+                {
+                    "uri": "urn:second",
+                    "label": "Second",
+                    "properties": {"supporting_statements": [oversized, "second-extra"]},
+                },
+            ],
+            confidence=0.8,
+            trace=trace,
+            namespace="demo",
+        )
+
+        statement_groups = [
+            json.loads(entity["properties"]["supportingStatements"]) for entity in result.graph_context["entities"]
+        ]
+        assert all(statement_groups)
+        statements = [statement for group in statement_groups for statement in group]
+        assert all(len(statement) <= 1_000 for statement in statements)
+        assert all(len(statement.encode("utf-8")) <= 2_000 for statement in statements)
+        assert sum(len(statement) for statement in statements) <= 4_000
+        assert sum(len(statement.encode("utf-8")) for statement in statements) <= 6_000
+        assert all("supporting_statements" not in entity["properties"] for entity in result.graph_context["entities"])
 
     def test_tier3_partial_true_with_degraded_sources(self, assembler, trace):
         """a degraded retrieval source means partial-context synthesis → partial=true."""
@@ -235,6 +397,72 @@ class TestAssembleTier3:
         )
         assert result.partial is True
         assert result.metadata["degradedSources"][0]["source"] == "vector_search"
+
+    # ── #1166: Deep Reasoning mode label + query artifacts ──────────────
+
+    def test_tier3_execution_mode_surfaced(self, assembler, trace):
+        """#1166 cut #2: the resolved execution mode is surfaced structurally so
+        the console labels a Deep Reasoning answer by MODE, not by its tier=3
+        resolution (which would mis-read as Standard mode's Tier-3 label)."""
+        result = assembler.assemble_tier3(
+            synthesized_answer="Deep answer.",
+            supporting_content=[],
+            graph_context=[],
+            confidence=0.7,
+            trace=trace,
+            namespace="demo",
+            execution_mode="deep-reasoning",
+        )
+        assert result.tier == 3
+        assert result.execution_mode == "deep-reasoning"
+
+    def test_tier3_execution_mode_defaults_none(self, assembler, trace):
+        """Standard Tier-3 responses (no mode passed) leave execution_mode None;
+        the console falls back to tier-based labelling for those."""
+        result = assembler.assemble_tier3(
+            synthesized_answer="Standard tier3 answer.",
+            supporting_content=[],
+            graph_context=[],
+            confidence=0.7,
+            trace=trace,
+            namespace="demo",
+        )
+        assert result.execution_mode is None
+
+    def test_tier3_query_artifacts_surfaced_when_debug_info_on(self, assembler, trace):
+        """#1166 cut #3: Deep Reasoning returns the SQL/SPARQL it executed, same
+        as Standard mode — but only when the caller opts into debug info."""
+        result = assembler.assemble_tier3(
+            synthesized_answer="Revenue was 100.",
+            supporting_content=[],
+            graph_context=[],
+            confidence=0.8,
+            trace=trace,
+            namespace="demo",
+            query_used="SELECT revenue FROM t",
+            sparql_generated="SELECT ?r WHERE { ?x :revenue ?r }",
+            include_debug_info=True,
+        )
+        assert result.query_used == "SELECT revenue FROM t"
+        assert result.sparql_generated == "SELECT ?r WHERE { ?x :revenue ?r }"
+
+    def test_tier3_query_artifacts_withheld_by_default(self, assembler, trace):
+        """Negative control: without includeDebugInfo the Deep Reasoning query
+        artifacts are withheld exactly like the Tier-2 gate — they expose internal
+        schema and must not leak on a default request (#1166)."""
+        result = assembler.assemble_tier3(
+            synthesized_answer="Revenue was 100.",
+            supporting_content=[],
+            graph_context=[],
+            confidence=0.8,
+            trace=trace,
+            namespace="demo",
+            query_used="SELECT revenue FROM sensitive_t",
+            sparql_generated="SELECT ?r WHERE { ?x :revenue ?r }",
+            # include_debug_info defaults to False
+        )
+        assert result.query_used is None
+        assert result.sparql_generated is None
 
 
 # ── confidence calibration + trace-completeness audit ───────────

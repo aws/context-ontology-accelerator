@@ -8,6 +8,12 @@ import { NetworkStack } from "../../lib/stacks/foundation/network-stack";
 // Env required for fromLookup tests
 const TEST_ENV = { account: "123456789012", region: "us-east-1" };
 
+// An imported VPC must come with its OpenSearch Serverless aoss-data endpoint.
+const IMPORTED_VPC = {
+  vpc_id: "vpc-0abc123",
+  aoss_vpc_endpoint_id: "vpce-0abc123def4567890",
+};
+
 function buildStack(context: Record<string, string> = {}): Template {
   const app = new cdk.App({ context });
   const stack = new NetworkStack(app, "TestNetwork");
@@ -70,8 +76,91 @@ describe("NetworkStack", () => {
 
     it("uses fromLookup when vpc_id context is set (no VPC resource created)", () => {
       // fromLookup with a known account/region produces a dummy VPC at synth time
-      const template = buildStackWithEnv({ vpc_id: "vpc-0abc123" });
+      const template = buildStackWithEnv(IMPORTED_VPC);
       template.resourceCountIs("AWS::EC2::VPC", 0);
+    });
+
+    it("uses the supplied aoss-data endpoint when importing a VPC", () => {
+      const app = new cdk.App({ context: IMPORTED_VPC });
+      const stack = new NetworkStack(app, "TestNetwork", { env: TEST_ENV });
+      expect(stack.aossVpcEndpointId).toBe("vpce-0abc123def4567890");
+    });
+
+    describe("without an explicit stack env", () => {
+      const saved = { ...process.env };
+      afterEach(() => {
+        process.env = { ...saved };
+      });
+
+      it("takes the CLI's account and region when importing a VPC", () => {
+        // What `cdk synth` does with credentials: app.ts passes no env.
+        process.env.CDK_DEFAULT_ACCOUNT = "123456789012";
+        process.env.CDK_DEFAULT_REGION = "us-west-2";
+        const app = new cdk.App({ context: IMPORTED_VPC });
+        const stack = new NetworkStack(app, "TestNetwork");
+        expect(stack.account).toBe("123456789012");
+        expect(stack.region).toBe("us-west-2");
+      });
+
+      it("fails synth with a clear error when importing a VPC without credentials", () => {
+        delete process.env.CDK_DEFAULT_ACCOUNT;
+        delete process.env.CDK_DEFAULT_REGION;
+        const app = new cdk.App({ context: IMPORTED_VPC });
+        expect(() => new NetworkStack(app, "TestNetwork")).toThrow(
+          /vpc_id needs an AWS account and region at synth.*CDK_DEFAULT_ACCOUNT and CDK_DEFAULT_REGION/,
+        );
+      });
+
+      it("fails synth when importing a VPC with an account but no region", () => {
+        process.env.CDK_DEFAULT_ACCOUNT = "123456789012";
+        delete process.env.CDK_DEFAULT_REGION;
+        const app = new cdk.App({ context: IMPORTED_VPC });
+        expect(() => new NetworkStack(app, "TestNetwork")).toThrow(
+          /vpc_id needs an AWS account and region at synth/,
+        );
+      });
+
+      it("stays environment-agnostic without vpc_id", () => {
+        process.env.CDK_DEFAULT_ACCOUNT = "123456789012";
+        const stack = new NetworkStack(new cdk.App(), "TestNetwork");
+        expect(cdk.Token.isUnresolved(stack.account)).toBe(true);
+      });
+    });
+
+    it("fails synth when an imported VPC has no aoss_vpc_endpoint_id", () => {
+      expect(() => buildStackWithEnv({ vpc_id: "vpc-0abc123" })).toThrow(
+        /vpc_id requires aoss_vpc_endpoint_id.*com\.amazonaws\.us-east-1\.aoss-data/,
+      );
+    });
+
+    it.each([
+      ["the wrong prefix", "vpc-0abc123def4567890"],
+      ["7 hex characters", "vpce-1a2b3c4"],
+      ["18 hex characters", "vpce-0abc123def45678901"],
+      ["uppercase hex", "vpce-0ABC123DEF4567890"],
+      ["an inner space", "vpce-0abc123 def4567890"],
+    ])("fails synth when aoss_vpc_endpoint_id has %s", (_case, id) => {
+      expect(() =>
+        buildStackWithEnv({ vpc_id: "vpc-0abc123", aoss_vpc_endpoint_id: id }),
+      ).toThrow(/must be a VPC endpoint ID \(vpce-\.\.\.\)/);
+    });
+
+    it.each([
+      ["8 hex characters (older IDs)", "vpce-1a2b3c4d", "vpce-1a2b3c4d"],
+      ["17 hex characters", "vpce-0abc123def4567890", "vpce-0abc123def4567890"],
+      ["surrounding whitespace, trimmed", " vpce-1a2b3c4d ", "vpce-1a2b3c4d"],
+    ])("accepts an aoss_vpc_endpoint_id with %s", (_case, id, expected) => {
+      const app = new cdk.App({
+        context: { vpc_id: "vpc-0abc123", aoss_vpc_endpoint_id: id },
+      });
+      const stack = new NetworkStack(app, "TestNetwork", { env: TEST_ENV });
+      expect(stack.aossVpcEndpointId).toBe(expected);
+    });
+
+    it("fails synth when aoss_vpc_endpoint_id is set without vpc_id", () => {
+      expect(() =>
+        buildStack({ aoss_vpc_endpoint_id: "vpce-0abc123def4567890" }),
+      ).toThrow(/only applies with vpc_id/);
     });
   });
 
@@ -125,7 +214,7 @@ describe("NetworkStack", () => {
     });
 
     it("does not create VPC endpoints when importing an existing VPC", () => {
-      const template = buildStackWithEnv({ vpc_id: "vpc-0abc123" });
+      const template = buildStackWithEnv(IMPORTED_VPC);
       template.resourceCountIs("AWS::EC2::VPCEndpoint", 0);
     });
   });
@@ -421,7 +510,7 @@ describe("NetworkStack", () => {
 
     it("does not provision connectivity when importing an existing VPC", () => {
       const template = buildStackWithEnv({
-        vpc_id: "vpc-0abc123",
+        ...IMPORTED_VPC,
         jdbc_peer_vpc_id: "vpc-0peer123",
         jdbc_peer_cidrs: "10.20.0.0/16",
       });

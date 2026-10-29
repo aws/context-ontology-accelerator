@@ -776,6 +776,44 @@ class TestRealCedarThroughFirewall:
         result = fw.evaluate("SELECT id FROM orders", profile={"userId": "u1"}, namespace="ns")
         assert not result.denied
 
+    # ── can_view_namespace: the artifact-visibility gate (#1166) ──────────
+    # The SAME viewNamespace right as the Sources/Tables schema view decides
+    # whether generated SQL/SPARQL artifacts may be returned.
+    def test_can_view_namespace_data_analyst_own_namespace_true(self):
+        fw = self._fw(fail_open_no_roles=False)
+        assert (
+            fw.can_view_namespace(
+                "ns", {"userId": "u1", "resourceRoles": [{"role": "data-analyst", "resourceUID": "ns"}]}
+            )
+            is True
+        )
+
+    def test_can_view_namespace_other_namespace_false(self):
+        fw = self._fw(fail_open_no_roles=False)
+        assert (
+            fw.can_view_namespace(
+                "ns", {"userId": "u1", "resourceRoles": [{"role": "data-analyst", "resourceUID": "other"}]}
+            )
+            is False
+        )
+
+    def test_can_view_namespace_no_roles_prod_false(self):
+        fw = self._fw(fail_open_no_roles=False)
+        assert fw.can_view_namespace("ns", {"userId": "u1"}) is False
+
+    def test_can_view_namespace_fails_closed_on_authorizer_error(self):
+        """A raising authorizer withholds artifacts (returns False), never leaks."""
+
+        class _BoomAuthorizer:
+            def authorize(self, **kwargs):
+                raise RuntimeError("boom")
+
+            def can_view_namespace(self, **kwargs):
+                raise RuntimeError("boom")
+
+        fw = SQLFirewall(cedar_authorizer=_BoomAuthorizer())
+        assert fw.can_view_namespace("ns", {"userId": "a", "globalRoles": ["platform-admin"]}) is False
+
 
 @pytest.mark.unit
 class TestNamespaceSQLScope:

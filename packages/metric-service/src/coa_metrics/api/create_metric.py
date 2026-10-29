@@ -32,6 +32,7 @@ from coa_control_plane_server.models.create_metric_request_content import (
 )
 from pydantic import ValidationError
 
+from coa_metrics.api.contract import check_metric_label, normalize_label_member
 from coa_metrics.api.validation_errors import format_validation_error
 from coa_metrics.constants import VALID_SQL_DIALECTS, invalid_dialect_message
 from coa_metrics.lookups import LOOKUP_NOT_PROVIDED, LookupArgument
@@ -110,11 +111,16 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     if body is None:
         return api_response(400, {"message": "Request body is required"})
 
-    # Validate via Smithy-generated Pydantic model
+    # Validate via Smithy-generated Pydantic model. The label is NFC-normalized
+    # first so its length is counted the way it is stored.
+    normalize_label_member(body)
     try:
         request = CreateMetricRequestContent.model_validate(body)
     except ValidationError as exc:
         return api_response(400, {"message": format_validation_error(exc)})
+    label_error = check_metric_label(request.label)
+    if label_error:
+        return api_response(400, {"message": label_error})
 
     # Build metric definition (includes SqlDialect validation)
     try:
@@ -274,6 +280,7 @@ def _build_metric_definition(request: CreateMetricRequestContent, caller: str) -
         ontology_concepts=request.ontology_concepts or [],
         defined_by=caller,
         effective_from=datetime.now(UTC).strftime("%Y-%m-%d"),
+        label=request.label,
     )
 
 
@@ -288,6 +295,8 @@ def _metric_to_dict(metric: MetricDefinition) -> dict[str, Any]:
         "dataSourceId": metric.data_source_id,
         "sourceTable": metric.source_table,
     }
+    if metric.label:
+        result["label"] = metric.label
     if metric.default_time_grain:
         result["defaultTimeGrain"] = metric.default_time_grain
     if metric.unit:

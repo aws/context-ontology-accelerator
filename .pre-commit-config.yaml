@@ -8,4 +8,4 @@ repos:
     rev: v1.13.0
     hooks:
       - id: mypy
-        additional_dependencies: [pydantic-settings, types-requests, boto3-stubs, types-PyYAML]
+        additional_dependencies: [pydantic-settings, types-requests, boto3-stubs, types-PyYAML, pytest]

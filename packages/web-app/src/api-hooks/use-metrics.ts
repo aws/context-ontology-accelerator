@@ -34,6 +34,8 @@ export interface MetricDefinition extends Required<
     "name" | "description" | "expression" | "dataSourceId" | "sourceTable"
   >
 > {
+  /** Display-only label; absent when the metric has none. */
+  label?: string;
   defaultTimeGrain?: string;
   unit?: string;
   returnType?: string;

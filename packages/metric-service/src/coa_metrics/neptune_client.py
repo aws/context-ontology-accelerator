@@ -224,6 +224,10 @@ class MetricDefinition:
     ontology_concepts: list[str] = field(default_factory=list)
     defined_by: str | None = None
     effective_from: str | None = None
+    # Display-only label (MetricLabel). Stored on ``vocab#displayLabel``, never
+    # on rdfs:label or SKOS: Tier 1 lists metrics by rdfs:label and Tier 2 reads
+    # skos:altLabel as synonyms, and nothing may match on the label.
+    label: str | None = None
 
 
 # ── Neptune Metric Client ───────────────────────────────────────────────
@@ -562,6 +566,10 @@ class MetricNeptuneClient:
             f'{_iri(uri)} {_iri(COA_VOCAB + "dataSourceId")} "{_esc(metric.data_source_id)}" .',
             f'{_iri(uri)} {_iri(COA_VOCAB + "sourceTable")} "{_esc(metric.source_table)}" .',
         ]
+        if metric.label:
+            # Untagged plain literal: metric-service does not know the namespace
+            # language, and readers take the label only from the untagged literal.
+            triples.append(f'{_iri(uri)} {_iri(COA_VOCAB + "displayLabel")} "{_esc(metric.label)}" .')
 
         # Expression dialects — stored as JSON string
         dialects_json = json.dumps(
@@ -610,6 +618,11 @@ class MetricNeptuneClient:
 
             if p == RDFS + "comment":
                 props["description"] = o_val
+            elif p == COA_VOCAB + "displayLabel":
+                # Only the untagged literal is the label; a language-tagged one
+                # (e.g. a later translation) must never be returned as it.
+                if binding["o"].get("type", "literal") == "literal" and "xml:lang" not in binding["o"]:
+                    props["label"] = o_val
             elif p == COA_VOCAB + "dataSourceId":
                 props["data_source_id"] = o_val
             elif p == COA_VOCAB + "sourceTable":
@@ -653,4 +666,5 @@ class MetricNeptuneClient:
             ontology_concepts=governed_for,
             defined_by=props.get("defined_by"),
             effective_from=props.get("effective_from"),
+            label=props.get("label"),
         )

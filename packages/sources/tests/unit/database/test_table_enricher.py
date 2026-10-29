@@ -562,7 +562,7 @@ class TestExistingMetadataPassThrough:
 
         # First invoke call is Pass 1 (per-table); last is Pass 2 (FK inference)
         invoke_call = mock_client_cls.return_value.invoke.call_args_list[0]
-        user_prompt = invoke_call[0][1]
+        user_prompt = "".join(seg.text for seg in invoke_call[0][1])
         assert "foreign_keys" in user_prompt
         assert "customers" in user_prompt
 
@@ -581,9 +581,28 @@ class TestExistingMetadataPassThrough:
 
         # First invoke call is Pass 1 (per-table); last is Pass 2 (FK inference)
         invoke_call = mock_client_cls.return_value.invoke.call_args_list[0]
-        user_prompt = invoke_call[0][1]
+        user_prompt = "".join(seg.text for seg in invoke_call[0][1])
         assert "primary_key" in user_prompt
         assert "order_id" in user_prompt
+
+    @patch("coa_sources.database.enrichment.table_enricher._write_enriched_assets")
+    @patch("coa_sources.database.enrichment.table_enricher.read_assets_for_datasource")
+    @patch("coa_sources.database.enrichment.table_enricher.BedrockClient")
+    def test_pass1_sends_segments_with_only_source_data_guarded(
+        self, mock_client_cls: MagicMock, mock_read: MagicMock, mock_write: MagicMock
+    ) -> None:
+        mock_client_cls.return_value.invoke.return_value = _mock_invocation_result()
+        mock_read.return_value = [_make_table("orders")]
+
+        run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock(), namespace_language="en")
+
+        segments = mock_client_cls.return_value.invoke.call_args_list[0][0][1]
+        guarded = "".join(seg.text for seg in segments if seg.guarded)
+        static = "".join(seg.text for seg in segments if not seg.guarded)
+        assert "MUST generate a non-empty table.description" in static
+        assert "orders" in guarded
+        assert "col_0" in guarded
+        assert "orders" not in static
 
 
 class TestMetricEmissionDuringEnrichment:
@@ -1050,6 +1069,7 @@ class TestIncompleteBatchDetection:
         # the batch's CONTENT (a column unique to batch 1), NOT call order — a
         # call counter is non-deterministic across the pool and makes this flaky.
         def mock_invoke(_system, user_prompt, *args, **kwargs):
+            user_prompt = "".join(seg.text for seg in user_prompt)
             # col_50 is the first column of batch 1 (cols 50-99); it appears in no
             # other batch's prompt, so this fails exactly the middle batch.
             if re.search(r"\bcol_50\b", user_prompt):
@@ -1158,6 +1178,7 @@ class TestIncompleteBatchDetection:
         )
 
         def mock_invoke(_system, user_prompt, *args, **kwargs):
+            user_prompt = "".join(seg.text for seg in user_prompt)
             # Batch 0 carries col_0 and is the ONLY batch whose prompt lacks
             # col_50 / col_100 (the leading columns of batches 1 and 2). Fail on
             # batch 0's content, not call order — the ThreadPoolExecutor does not
@@ -1320,7 +1341,7 @@ class TestCallBedrockMaxTokens:
     @patch("coa_sources.database.enrichment.table_enricher._write_enriched_assets")
     @patch("coa_sources.database.enrichment.table_enricher.read_assets_for_datasource")
     @patch("coa_sources.database.enrichment.table_enricher.BedrockClient")
-    def test_extra_context_with_hint_uses_16384_tokens(
+    def test_extra_context_uses_16384_tokens(
         self, mock_client_cls: MagicMock, mock_read: MagicMock, mock_write: MagicMock
     ) -> None:
         mock_client_cls.return_value.invoke.return_value = _mock_invocation_result()
@@ -1334,7 +1355,6 @@ class TestCallBedrockMaxTokens:
                 "existing_pk": None,
                 "existing_fks": None,
                 "extra_context": "Evidence text",
-                "extra_context_hint": "Use this for FK inference",
             }
             run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock(), namespace_language="en")
 

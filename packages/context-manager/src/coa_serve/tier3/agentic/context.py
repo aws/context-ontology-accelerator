@@ -27,15 +27,26 @@ the sibling retriever modules — into ``sys.modules``.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from hashlib import sha256
 from typing import TYPE_CHECKING, Any
+
+import structlog
+
+from ...graph_context import (
+    LEGACY_SUPPORTING_STATEMENTS_KEY,
+    SUPPORTING_STATEMENTS_KEY,
+    bound_supporting_statements,
+    encode_supporting_statements,
+)
+
+logger = structlog.get_logger(__name__)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, no runtime import
     from ..graph_traverser import GraphEntity
     from ..vector_retriever import ChunkResult
     from .ontology.source import Ontology
-    from .tools.base import ToolResult
+    from .tools.base import ExecutedQuery, ToolResult
 
 
 def _chunk_key(chunk: Any) -> str:
@@ -68,6 +79,166 @@ def _entity_key(entity: Any) -> str:
     label = getattr(entity, "label", "") or ""
     etype = getattr(entity, "type", "") or ""
     return f"entity:{label}|{etype}"
+
+
+_MAX_ENTITY_PROPERTIES = 50
+_MAX_RELATIONSHIPS_PER_ENTITY = 10
+
+# Upper bound on distinct entities one reasoning session accumulates. Nothing
+# upstream bounded this: a graph traversal returning thousands of connected nodes
+# put every one of them into the planner summary, the synthesis prompt, the wire
+# response, and the persisted session envelope. Generous enough that no realistic
+# session reaches it; hitting it is recorded as a degraded source rather than
+# silently truncating the evidence set.
+MAX_CONTEXT_ENTITIES = 500
+_RELATIONSHIP_ALIASES = {
+    "source_uri": ("source_uri", "sourceUri"),
+    "source_label": ("source_label", "sourceLabel"),
+    "predicate_uri": ("predicate_uri", "predicateUri"),
+    "predicate_label": ("predicate_label", "predicateLabel"),
+    "target_uri": ("target_uri", "targetUri"),
+    "target_label": ("target_label", "targetLabel"),
+}
+
+
+def _statement_values(value: Any) -> list[str]:
+    """Decode one bounded, ordered ``supportingStatements`` property value."""
+    return bound_supporting_statements(value)
+
+
+def _merge_entity_properties(existing: dict, incoming: dict) -> dict:
+    """Merge graph properties in stable fork order without losing statement evidence.
+
+    Scalar property conflicts retain the first non-empty value, matching the
+    deterministic Sub_Question merge order. Distinct keys from later forks are
+    appended until the property bound. ``supportingStatements`` is an ordered,
+    de-duplicated union with its own prompt-safety bound.
+    """
+    statement_keys = {SUPPORTING_STATEMENTS_KEY, LEGACY_SUPPORTING_STATEMENTS_KEY}
+    merged: dict = {}
+    for properties in (existing, incoming):
+        for key, value in properties.items():
+            if key in statement_keys or key in merged or len(merged) >= _MAX_ENTITY_PROPERTIES:
+                continue
+            merged[key] = value
+
+    statements = bound_supporting_statements(
+        [
+            *_statement_values(existing.get(SUPPORTING_STATEMENTS_KEY, existing.get(LEGACY_SUPPORTING_STATEMENTS_KEY))),
+            *_statement_values(incoming.get(SUPPORTING_STATEMENTS_KEY, incoming.get(LEGACY_SUPPORTING_STATEMENTS_KEY))),
+        ]
+    )
+    if statements:
+        merged[SUPPORTING_STATEMENTS_KEY] = encode_supporting_statements(statements)
+    return merged
+
+
+def _relationship_value(relationship: dict, field: str) -> str:
+    """Read one canonical relationship field through supported aliases."""
+    for alias in _RELATIONSHIP_ALIASES[field]:
+        value = relationship.get(alias)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def _canonical_relationship(relationship: dict) -> dict:
+    """Normalize a directed relationship while preserving non-contract fields."""
+    canonical = {field: value for field in _RELATIONSHIP_ALIASES if (value := _relationship_value(relationship, field))}
+    alias_keys = {alias for aliases in _RELATIONSHIP_ALIASES.values() for alias in aliases}
+    for key, value in relationship.items():
+        if key not in alias_keys:
+            canonical[key] = value
+    return canonical
+
+
+def _relationship_identity(relationship: dict) -> tuple[str, ...]:
+    """Return stable directed-triple identity, falling back for legacy partial rows."""
+    source_uri = _relationship_value(relationship, "source_uri")
+    predicate_uri = _relationship_value(relationship, "predicate_uri")
+    target_uri = _relationship_value(relationship, "target_uri")
+    if source_uri and predicate_uri and target_uri:
+        return ("triple", source_uri, predicate_uri, target_uri)
+    return ("legacy", json.dumps(relationship, sort_keys=True, default=str))
+
+
+def _merge_relationship_labels(existing: dict, incoming: dict) -> dict:
+    """Enrich one triple with the first non-empty label seen in stable fork order."""
+    merged = dict(existing)
+    for label_field in ("source_label", "predicate_label", "target_label"):
+        if not _relationship_value(merged, label_field):
+            value = _relationship_value(incoming, label_field)
+            if value:
+                merged[label_field] = value
+    return merged
+
+
+def _merge_entity_relationships(existing: Any, incoming: Any) -> tuple[tuple[dict, ...], int]:
+    """Return a bounded semantic union and the number of distinct rows discarded."""
+    merged: list[dict] = []
+    positions: dict[tuple[str, ...], int] = {}
+    seen: set[tuple[str, ...]] = set()
+    dropped = 0
+    for relationship in [
+        *(getattr(existing, "relationships", ()) or ()),
+        *(getattr(incoming, "relationships", ()) or ()),
+    ]:
+        if not isinstance(relationship, dict):
+            continue
+        canonical = _canonical_relationship(relationship)
+        identity = _relationship_identity(canonical)
+        if identity in seen:
+            index = positions.get(identity)
+            if index is not None:
+                merged[index] = _merge_relationship_labels(merged[index], canonical)
+            continue
+        seen.add(identity)
+        if len(merged) >= _MAX_RELATIONSHIPS_PER_ENTITY:
+            dropped += 1
+            continue
+        positions[identity] = len(merged)
+        merged.append(canonical)
+    return tuple(merged), dropped
+
+
+def _merge_entities(existing: Any, incoming: Any) -> tuple[Any, int]:
+    """Merge duplicate entities and report distinct relationships over the cap."""
+    updates: dict[str, Any] = {}
+
+    relationships, dropped_relationships = _merge_entity_relationships(existing, incoming)
+    if relationships != tuple(getattr(existing, "relationships", ()) or ()):
+        updates["relationships"] = relationships
+
+    if hasattr(existing, "properties"):
+        existing_properties = dict(getattr(existing, "properties", {}) or {})
+        properties = _merge_entity_properties(
+            existing_properties,
+            dict(getattr(incoming, "properties", {}) or {}),
+        )
+        if properties != existing_properties:
+            updates["properties"] = properties
+
+    for field_name in ("label", "type"):
+        existing_value: Any = getattr(existing, field_name, "")
+        incoming_value: Any = getattr(incoming, field_name, "")
+        if not existing_value and incoming_value:
+            updates[field_name] = incoming_value
+
+    return (replace(existing, **updates) if updates else existing), dropped_relationships
+
+
+def _normalize_entity(entity: Any) -> tuple[Any, int]:
+    """Apply relationship/property bounds and report distinct relationships dropped."""
+    updates: dict[str, Any] = {}
+    relationships, dropped_relationships = _merge_entity_relationships(None, entity)
+    if relationships != tuple(getattr(entity, "relationships", ()) or ()):
+        updates["relationships"] = relationships
+    if hasattr(entity, "properties"):
+        existing_properties = dict(getattr(entity, "properties", {}) or {})
+        properties = _merge_entity_properties({}, existing_properties)
+        if properties != existing_properties:
+            updates["properties"] = properties
+    return (replace(entity, **updates) if updates else entity), dropped_relationships
 
 
 def _row_key(row: dict) -> str:
@@ -130,6 +301,14 @@ class AccumulatedContext:
     ontology: Ontology | None = None
     seen_keys: set[str] = field(default_factory=set)
     degraded_sources: list[dict] = field(default_factory=list)
+    # Query artifacts (SQL/SPARQL) that structured tools built and executed this
+    # session, in arrival order — one entry per generated statement. Surfaced
+    # (gated by includeDebugInfo) on the final QueryResult so Deep Reasoning
+    # returns the queries it ran, mirroring Standard mode (#1166). Each item is
+    # an ``ExecutedQuery`` (kind + query). Never de-duplicated: two distinct
+    # sub-questions legitimately run distinct SQL, and even an identical repeat
+    # is a real second execution worth showing.
+    executed_queries: list[ExecutedQuery] = field(default_factory=list)
     # ── Carried reasoning state (improvement ideas 2 & 3) ──────────────
     # The planner is stateless across steps (a fresh Converse call each step), so
     # cross-step continuity lives here and is echoed back into the planner prompt.
@@ -153,6 +332,74 @@ class AccumulatedContext:
     # synthesis), so no step has to guess the language again. Empty means
     # unresolved: those steps fall back to "match the question's language".
     answer_language: str = ""
+    # Position of each accumulated entity by its stable dedupe key. Without it,
+    # merging an already-seen entity rescanned `entities` linearly and recomputed a
+    # key per element, making accumulation O(n^2) in the entity count.
+    entity_positions: dict[str, int] = field(default_factory=dict)
+    # Number of distinct entities refused because `MAX_CONTEXT_ENTITIES` was
+    # reached. Non-zero means the evidence set is provably incomplete.
+    dropped_entities: int = 0
+    # Whether any entity supplied more distinct relationships than the bounded
+    # agentic working set could retain. The exact overage can recur across
+    # retrieval steps, so the contract records the degradation rather than
+    # presenting a misleading cumulative count.
+    relationship_cap_reached: bool = False
+
+    def _record_relationship_cap(self, dropped_in_merge: int) -> None:
+        """Record the first relationship-cap event for this request context."""
+        if dropped_in_merge <= 0 or self.relationship_cap_reached:
+            return
+        self.relationship_cap_reached = True
+        logger.warning(
+            "agentic_context_relationship_cap_reached",
+            cap_per_entity=_MAX_RELATIONSHIPS_PER_ENTITY,
+            dropped_in_merge=dropped_in_merge,
+        )
+        self.record_degraded("accumulated_context", "relationship_cap_reached")
+
+    def _add_or_merge_entity(self, entity: GraphEntity) -> bool:
+        """Add one entity or merge new evidence into its existing stable slot."""
+        key = _entity_key(entity)
+        if key not in self.seen_keys:
+            if len(self.entities) >= MAX_CONTEXT_ENTITIES:
+                self.dropped_entities += 1
+                if self.dropped_entities == 1:
+                    logger.warning(
+                        "agentic_context_entity_cap_reached",
+                        cap=MAX_CONTEXT_ENTITIES,
+                    )
+                    self.record_degraded("accumulated_context", "entity_cap_reached")
+                return False
+            self.seen_keys.add(key)
+            self.entity_positions[key] = len(self.entities)
+            normalized, dropped_relationships = _normalize_entity(entity)
+            self.entities.append(normalized)
+            self._record_relationship_cap(dropped_relationships)
+            return True
+
+        index = self.entity_positions.get(key)
+        if index is None:
+            # A caller that appended to `entities` directly (tests, older code) has
+            # no recorded position; rebuild the index once rather than rescanning
+            # on every subsequent merge.
+            self._reindex_entities()
+            index = self.entity_positions.get(key)
+        if index is None:
+            return False
+
+        existing = self.entities[index]
+        merged, dropped_relationships = _merge_entities(existing, entity)
+        self._record_relationship_cap(dropped_relationships)
+        if merged == existing:
+            return False
+        self.entities[index] = merged
+        return True
+
+    def _reindex_entities(self) -> None:
+        """Rebuild :attr:`entity_positions` from :attr:`entities` (first-seen wins)."""
+        self.entity_positions = {}
+        for index, existing in enumerate(self.entities):
+            self.entity_positions.setdefault(_entity_key(existing), index)
 
     def add(self, result: ToolResult) -> int:
         """Incorporate a ToolResult's chunks/entities/rows, returning the NEW count.
@@ -187,12 +434,8 @@ class AccumulatedContext:
             new_count += 1
 
         for entity in result.entities:
-            key = _entity_key(entity)
-            if key in self.seen_keys:
-                continue
-            self.seen_keys.add(key)
-            self.entities.append(entity)
-            new_count += 1
+            if self._add_or_merge_entity(entity):
+                new_count += 1
 
         for row in result.rows:
             key = _row_key(row)
@@ -201,6 +444,11 @@ class AccumulatedContext:
             self.seen_keys.add(key)
             self.rows.append(row)
             new_count += 1
+
+        # Collect any query artifacts the tool executed (#1166). Not counted as
+        # progress (that is what rows/chunks/entities are for) and not
+        # de-duplicated — this is an observability record of what ran.
+        self.executed_queries.extend(result.executed_queries)
 
         return new_count
 
@@ -246,12 +494,8 @@ class AccumulatedContext:
             self.chunks.append(chunk)
             new_count += 1
         for entity in other.entities:
-            key = _entity_key(entity)
-            if key in self.seen_keys:
-                continue
-            self.seen_keys.add(key)
-            self.entities.append(entity)
-            new_count += 1
+            if self._add_or_merge_entity(entity):
+                new_count += 1
         for row in other.rows:
             key = _row_key(row)
             if key in self.seen_keys:
@@ -261,6 +505,14 @@ class AccumulatedContext:
             new_count += 1
         self.attempt_history.extend(other.attempt_history)
         self.degraded_sources.extend(other.degraded_sources)
+        # Fold in the sibling's executed query artifacts (#1166), in order,
+        # exactly as sequential accumulation would have — same append-only,
+        # non-deduplicated treatment as degraded_sources.
+        self.executed_queries.extend(other.executed_queries)
+        # A sibling that hit the entity cap already recorded its own degraded source
+        # (concatenated above); carry the count so the total stays accurate.
+        self.dropped_entities += other.dropped_entities
+        self.relationship_cap_reached = self.relationship_cap_reached or other.relationship_cap_reached
         for entry in other.working_answers:
             self.set_working_answer(entry.get("question", ""), entry.get("answer", ""))
         # Union discovered predicates (preserve order, drop dups a sibling already had).

@@ -118,9 +118,10 @@ When you create a namespace, the platform:
 ## Retrying Creates Safely
 
 Create calls accept an optional `clientToken` in the request body: 1–64
-printable ASCII characters (a UUID works well). Retrying the same request with
-the same token within 24 hours returns the original response, marked with the
-`X-Idempotent-Replay: true` header, instead of creating a duplicate.
+printable ASCII characters with no spaces (a UUID works well). Retrying the
+same request with the same token within 24 hours returns the original response,
+marked with the `X-Idempotent-Replay: true` header, instead of creating a
+duplicate.
 
 - Reusing a token with different parameters, or while the first call is still
   running, returns `409`.

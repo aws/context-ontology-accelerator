@@ -21,7 +21,7 @@ import { Construct } from "constructs";
 import { SCLStack } from "../../constructs/scl-stack";
 import { SclMonitoring } from "../../constructs";
 import { Paths } from "../../paths";
-import { resolveContext } from "../../context";
+import { resolveContext, guardrailProfileResources } from "../../context";
 import { bundlePython } from "../../utils/python-bundling";
 import { grantIdempotencyTable } from "../../utils/idempotency";
 import { NetworkStack } from "../foundation/network-stack";
@@ -364,7 +364,7 @@ export class OntologyStack extends SCLStack {
       this,
       "OSSDataAccessPolicy",
       {
-        name: this.prefixed("ontology-oss"),
+        name: this.aossName("ontology-oss"),
         type: "data",
         policy: JSON.stringify([
           {
@@ -434,6 +434,7 @@ export class OntologyStack extends SCLStack {
           `arn:aws:bedrock:*::foundation-model/*`,
           `arn:aws:bedrock:*:${account}:inference-profile/*`,
           `arn:aws:bedrock:${region}:${account}:guardrail/*`,
+          ...guardrailProfileResources(this),
         ],
       }),
     );

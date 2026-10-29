@@ -5,7 +5,11 @@
  * Validates and normalizes raw backend responses into a well-typed
  * PlaygroundResponse with safe defaults for all required fields.
  */
-import type { PlaygroundResponse, TraceStep } from "@app-types/playground";
+import type {
+  PlaygroundResponse,
+  TraceStep,
+  ExecutionMode,
+} from "@app-types/playground";
 import { normalizeGraphContext } from "@utils/graph-context";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -73,6 +77,10 @@ export function normalizeResponse(raw: unknown): PlaygroundResponse | null {
     }),
     ...(typeof rawResult.sparqlGenerated === "string" && {
       sparqlGenerated: rawResult.sparqlGenerated,
+    }),
+    ...((rawResult.executionMode === "deep-reasoning" ||
+      rawResult.executionMode === "standard") && {
+      executionMode: rawResult.executionMode as ExecutionMode,
     }),
     ...(Array.isArray(rawResult.supportingContent) && {
       supportingContent:

@@ -5,7 +5,7 @@ import * as cdk from "aws-cdk-lib";
 import * as cognito from "aws-cdk-lib/aws-cognito";
 import { Template, Match } from "aws-cdk-lib/assertions";
 import { IdpAuthenticationStack } from "../../lib/stacks/foundation";
-import { IdpType } from "../../lib/types";
+import { IdpType, IdpAuthenticationStackProps } from "../../lib/types";
 import { DEFAULT_RESOURCE_PREFIX, DEFAULT_ENV } from "../../lib/constants";
 
 const TEST_CONTEXT = {
@@ -58,6 +58,35 @@ describe("IdpAuthenticationStack (Cognito)", () => {
 
   test("does not create Secrets Manager secret", () => {
     template.resourceCountIs("AWS::SecretsManager::Secret", 0);
+  });
+
+  test("an email change waits for verification before it takes effect", () => {
+    // Grants are looked up by the token's email claim, so a user must not be
+    // able to move their email to an address they have not verified.
+    template.hasResourceProperties("AWS::Cognito::UserPool", {
+      UserAttributeUpdateSettings: {
+        AttributesRequireVerificationBeforeUpdate: ["email"],
+      },
+      // Keeping the original value requires Cognito to send the
+      // verification message for the new one.
+      AutoVerifiedAttributes: ["email"],
+    });
+  });
+
+  test("keeps the sign-in settings that would replace an existing pool", () => {
+    // UsernameAttributes cannot change on a live pool; the hardening above
+    // must be an in-place update that keeps every existing user.
+    template.hasResourceProperties("AWS::Cognito::UserPool", {
+      UsernameAttributes: ["email"],
+    });
+  });
+
+  test("app clients keep default write access so federated sign-in can update mapped email", () => {
+    const clients = template.findResources("AWS::Cognito::UserPoolClient");
+    expect(Object.keys(clients)).toHaveLength(2);
+    for (const client of Object.values(clients)) {
+      expect(client.Properties.WriteAttributes).toBeUndefined();
+    }
   });
 });
 
@@ -292,6 +321,86 @@ describe("IdpAuthenticationStack (SAML federation)", () => {
     template.hasResourceProperties("AWS::Cognito::UserPoolClient", {
       SupportedIdentityProviders: Match.arrayWith(["COGNITO", "EnterpriseIdP"]),
     });
+  });
+
+  test("an email change waits for verification in SAML mode too", () => {
+    template.hasResourceProperties("AWS::Cognito::UserPool", {
+      UserAttributeUpdateSettings: {
+        AttributesRequireVerificationBeforeUpdate: ["email"],
+      },
+    });
+  });
+
+  // The clients name the provider as a string, so without an explicit
+  // dependency CloudFormation creates them in parallel and a first deploy
+  // fails with "The provider EnterpriseIdP does not exist".
+  test("both clients wait for the SAML provider", () => {
+    const providerIds = Object.keys(
+      template.findResources("AWS::Cognito::UserPoolIdentityProvider"),
+    );
+    expect(providerIds).toHaveLength(1);
+    const clients = Object.values(
+      template.findResources("AWS::Cognito::UserPoolClient"),
+    );
+    expect(clients).toHaveLength(2);
+    for (const client of clients) {
+      expect(client.DependsOn).toEqual(expect.arrayContaining(providerIds));
+    }
+  });
+});
+
+describe("IdpAuthenticationStack (SAML + OIDC federation)", () => {
+  const props: IdpAuthenticationStackProps = {
+    idpType: IdpType.SAML,
+    samlProviders: [
+      {
+        name: "EnterpriseIdP",
+        metadata: cognito.UserPoolIdentityProviderSamlMetadata.url(
+          "https://idp.example.com/saml/metadata",
+        ),
+        userPool: undefined as any, // filled by stack
+      },
+    ],
+    oidcProviders: [
+      {
+        name: "PartnerOidc",
+        clientId: "partner-client",
+        clientSecret: "partner-secret",
+        issuerUrl: "https://partner.example.com",
+        userPool: undefined as any, // filled by stack
+      },
+    ],
+  };
+
+  test("both clients wait for every federated provider", () => {
+    const app = new cdk.App({ context: TEST_CONTEXT });
+    const template = Template.fromStack(
+      new IdpAuthenticationStack(app, "FederatedAuth", props),
+    );
+    const providerIds = Object.keys(
+      template.findResources("AWS::Cognito::UserPoolIdentityProvider"),
+    );
+    expect(providerIds).toHaveLength(2);
+    for (const client of Object.values(
+      template.findResources("AWS::Cognito::UserPoolClient"),
+    )) {
+      expect(client.DependsOn).toEqual(expect.arrayContaining(providerIds));
+    }
+  });
+
+  test("federatedProviderNames lists SAML then OIDC, as the clients do", () => {
+    expect(IdpAuthenticationStack.federatedProviderNames(props)).toEqual([
+      "EnterpriseIdP",
+      "PartnerOidc",
+    ]);
+    expect(IdpAuthenticationStack.federatedProviderNames(undefined)).toEqual(
+      [],
+    );
+    expect(
+      IdpAuthenticationStack.federatedProviderNames({
+        idpType: IdpType.COGNITO,
+      }),
+    ).toEqual([]);
   });
 });
 

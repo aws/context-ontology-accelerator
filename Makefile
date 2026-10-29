@@ -47,7 +47,9 @@ coverage:
 ##   INTEG_NAMESPACE_ID  — reuse an existing namespace (skip create)
 test-integ:
 	@if ls packages/*/tests/integ/ >/dev/null 2>&1; then \
-		uv run pytest packages/*/tests/integ/ -m integ -v --tb=short --import-mode=importlib; \
+		uv run pytest packages/*/tests/integ/ -m integ -v --tb=short --import-mode=importlib && \
+		uv run pytest benchmarks/coa100-benchmark/tests/integ/test_rolling_metric_publish.py \
+			-m integ -v --tb=short --import-mode=importlib; \
 	else echo "⚠ integ tests not available (stripped from public mirror)"; fi
 
 ## Load test: validates the pipeline at scale (50 → 50k tables).
