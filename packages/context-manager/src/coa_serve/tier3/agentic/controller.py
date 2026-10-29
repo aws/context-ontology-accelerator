@@ -55,6 +55,7 @@ import structlog
 
 from ...exceptions import AccessDeniedError
 from .models import ExplorationBranch, PlannerDecision, StopReason, SubQuestion
+from .tools.document_tool import DOCUMENT_CHUNK_PREFIX, WINDOW_HEADER_RE
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, no runtime/graphrag import
     from .budget import BudgetClock
@@ -76,6 +77,103 @@ _RANK_AD_HOC = 2
 
 # Prefix identifying a Retrieval_Strategy_Tool name (``strategy:<value>``).
 _STRATEGY_PREFIX = "strategy:"
+
+# Non-strategy tools ranked WITH the strategy tools. Reading a document the agent
+# already found is a prepared, deterministic retrieval (no generated query), and
+# ranking it below a strategy tool would let any strategy alternative the planner
+# lists beside it silently override the planner's explicit choice to read.
+_STRATEGY_RANK_TOOLS: frozenset[str] = frozenset({"read_document"})
+
+# options.loopFixes bounds: a tool is not started with less time than this left
+# before the synthesis reserve, and at most this many repeated reads get their
+# step back per loop.
+_MIN_USEFUL_TOOL_S = 2.0
+_MAX_REFUNDED_READS = 2
+_READ_DOCUMENT_TOOL = "read_document"
+_NL_TO_SQL_TOOL = "nl_to_sql"
+
+# options.sufficiencyGuards: at most this many positive checks are held back per
+# loop, and only the top name-matched documents count for the partial-read guard.
+_MAX_GUARD_DEFERRALS = 2
+_GUARD_TOP_MATCHES = 3
+
+
+class PendingSql:
+    """A prefetch SQL call still running after its timeout (``options.keepSlowSql``)."""
+
+    def __init__(self, task: asyncio.Future, query: str, start: float) -> None:
+        """Hold the running ``task`` for ``query``, started at ``start`` (perf_counter)."""
+        self.task = task
+        self.query = query
+        self.start = start
+        self.consumed = False
+
+    def cancel(self) -> None:
+        """Stop waiting for the call: cancel it unless its result was already taken."""
+        if not self.consumed:
+            self.consumed = True
+            self.task.cancel()
+
+
+async def take_pending_sql(ctx: AccumulatedContext, trace: Any, *, wait_s: float = 0.0) -> bool:
+    """Fold a finished pending prefetch SQL result into ``ctx``; wait up to ``wait_s`` for it.
+
+    Returns True when its result (rows, or an empty result) was taken. A late
+    failure is traced and leaves the context unchanged; an
+    :class:`AccessDeniedError` propagates, as it does from any SQL call.
+    """
+    pending = getattr(ctx, "pending_sql", None)
+    if pending is None or pending.consumed:
+        return False
+    if not pending.task.done() and wait_s > 0:
+        await asyncio.wait({pending.task}, timeout=wait_s)
+    if not pending.task.done() or pending.consumed:
+        return False
+    pending.consumed = True
+    ms = int((time.perf_counter() - pending.start) * 1000)
+    try:
+        result = pending.task.result()
+    except AccessDeniedError:
+        raise
+    except BaseException as exc:  # noqa: BLE001 - a late SQL failure (or cancel) is only traced
+        ctx.record_degraded(_NL_TO_SQL_TOOL, type(exc).__name__)
+        trace.record("prefetch_sql_late", "error", ms, detail=type(exc).__name__, tool_used=_NL_TO_SQL_TOOL)
+        return False
+    new_count = ctx.add(result)
+    ctx.record_attempt(_NL_TO_SQL_TOOL, {"query": pending.query}, new_count, "succeeded", "prefetch SQL, finished late")
+    trace.record("prefetch_sql_late", "success", ms, detail=getattr(result, "detail", ""), tool_used=_NL_TO_SQL_TOOL)
+    return True
+
+
+def insufficiency_reason(ctx: AccumulatedContext) -> str:
+    """Why a positive sufficiency check should be held back (``options.sufficiencyGuards``), or ``""``.
+
+    Bounded by the caller: a top name-matched document was read only in part (its
+    windows end before the document does), or (``options.keepSlowSql``) the
+    prefetch SQL for the whole question is still running and no rows are in yet.
+    The reason is phrased as the next action for the planner.
+    """
+    if not getattr(ctx, "sufficiency_guards", False):
+        return ""
+    pending = getattr(ctx, "pending_sql", None)
+    if pending is not None and not pending.consumed and not (getattr(ctx, "rows", None) or []):
+        return "the SQL query for the whole question is still running: wait for it before answering"
+    top = [m.get("source_key") for m in (getattr(ctx, "document_matches", None) or [])[:_GUARD_TOP_MATCHES]]
+    covered: dict[str, tuple[int, int]] = {}
+    for chunk in getattr(ctx, "chunks", None) or []:
+        if not (getattr(chunk, "chunk_id", "") or "").startswith(DOCUMENT_CHUNK_PREFIX):
+            continue
+        match = WINDOW_HEADER_RE.match(getattr(chunk, "text", "") or "")
+        if not match or match.group("key") not in top:
+            continue
+        end, total = int(match.group("end")), int(match.group("total"))
+        best = covered.get(match.group("key"), (0, total))
+        covered[match.group("key")] = (max(best[0], end), total)
+    for key, (end, total) in covered.items():
+        if end < total:
+            return f"document {key[:120]} was read only to character {end} of {total}: read it from offset {end}"
+    return ""
+
 
 # Instruction the real (Bedrock Converse) planner is given so it proposes
 # preference-ordered candidates; the controller still enforces the ordering below
@@ -109,8 +207,8 @@ class StepPlanner(Protocol):
         sub_question: SubQuestion,
         context: AccumulatedContext,
         tool_specs: list[dict],
-    ) -> list[PlannerDecision]:
-        """Return candidate next-step decisions (empty = no Tool selectable)."""
+    ) -> list[PlannerDecision] | None:
+        """Return candidate next-step decisions (empty = none proposed; ``None`` = the call failed)."""
         ...
 
     async def check_sufficiency(self, *, sub_question: SubQuestion, context: AccumulatedContext) -> bool:
@@ -150,7 +248,8 @@ def validate_inputs(inputs: dict[str, Any], input_schema: dict[str, Any]) -> lis
     every supplied value matches the declared field type. A Tool may declare more
     fields than a given call supplies (most fields are optional / mode-specific),
     so missing declared fields are NOT a violation — only unknown fields and type
-    mismatches are. An empty ``input_schema`` (a Tool that accepts no planner
+    mismatches are. A declared field sent as ``None`` counts as left out (the
+    planner sometimes sends ``null`` for an optional field). An empty ``input_schema`` (a Tool that accepts no planner
     inputs, e.g. the ontology tool) therefore rejects any supplied field.
 
     Args:
@@ -162,6 +261,8 @@ def validate_inputs(inputs: dict[str, Any], input_schema: dict[str, Any]) -> lis
     """
     violations: list[str] = []
     for key, value in inputs.items():
+        if value is None and key in input_schema:
+            continue
         if key not in input_schema:
             violations.append(f"unknown field {key!r}")
             continue
@@ -285,6 +386,15 @@ class ReasoningController:
         # signatures; the aggregate step/time budgets bound it regardless.
         no_progress = 0
         tried: set[str] = set()
+        # options.loopFixes: drop unknown planner fields instead of rejecting the
+        # call, never start a tool once the budget is spent, and give back the step
+        # of a read that returned nothing new (bounded by _MAX_REFUNDED_READS).
+        loop_fixes = ((tool_context or {}).get("options") or {}).get("loopFixes") is True
+        refunded_reads = 0
+        guard_deferrals = 0
+        # The threshold never exceeds the configured per-tool cap, so a cap below it
+        # does not stop every loop.
+        min_useful_s = min(_MIN_USEFUL_TOOL_S, self._per_tool_timeout_s)
 
         while True:
             # Time_Budget bounds the loop in aggregate (Req 7.4): stop before a new
@@ -296,19 +406,44 @@ class ReasoningController:
             if not clock.try_consume_step():
                 return StopReason.max_steps_reached
 
+            # options.keepSlowSql: a prefetch SQL that finished late joins the context.
+            await take_pending_sql(ctx, trace)
+
+            # options.loopFixes: a planner call whose tool could not start is wasted;
+            # stop on the time budget before making it.
+            if loop_fixes and clock.tool_deadline_s(self._per_tool_timeout_s) < min_useful_s:
+                clock.refund_step()
+                trace.record("budget_spent", "success", clock.elapsed_ms(), detail="no time left for another step")
+                return StopReason.time_budget_expired
+
             # Next-step selection over the accumulated context (Req 4.3).
             candidates = await self._planner.propose_steps(
                 sub_question=sub_question, context=ctx, tool_specs=registry.specs(exclude=excluded_tools)
             )
-            decision = self._select_decision(candidates)
+            decision = self._select_decision(candidates or [])
+            if candidates == [] and getattr(ctx, "single_call_steps", False) is True:
+                # options.singleCallSteps: an empty proposal is the planner's "enough"
+                # (a failed or unparseable call returns None and never stops the loop).
+                # It took no tool, so the step is given back; the guards can still
+                # hold it back (bounded), as for a positive sufficiency check.
+                clock.refund_step()
+                reason = insufficiency_reason(ctx) if guard_deferrals < _MAX_GUARD_DEFERRALS else ""
+                if reason:
+                    guard_deferrals += 1
+                    ctx.record_attempt("sufficiency_check", {}, 0, "held_back", reason)
+                    trace.record("sufficiency_guard", "success", clock.elapsed_ms(), detail=reason[:300])
+                    continue
+                trace.record("next_step_select", "success", clock.elapsed_ms(), detail="planner_says_enough")
+                return StopReason.sufficiency_satisfied
             if decision is None:
                 # No Tool can be selected — stop initiating steps (Req 4.7).
                 trace.record("next_step_select", "success", clock.elapsed_ms(), detail="no_tool_selectable")
                 return None
 
             tool = registry.get(decision.tool_name)
-            if tool is None:
-                # The planner named a Tool that is not registered; treat as
+            if tool is None or (excluded_tools and decision.tool_name in excluded_tools):
+                # The planner named a Tool that is not registered — or one withheld
+                # from it for this request, which it was never offered; treat as
                 # nothing-selectable for this step and continue.
                 ctx.record_attempt(decision.tool_name, decision.inputs, 0, "unknown_tool", decision.reasoning)
                 trace.record(
@@ -347,6 +482,19 @@ class ReasoningController:
             # Input-contract validation (Req 2.5): do NOT invoke a non-conforming
             # Tool; record the violation and continue the loop.
             violations = validate_inputs(decision.inputs, tool.input_schema)
+            if violations and loop_fixes:
+                unknown = sorted(k for k in decision.inputs if k not in tool.input_schema)
+                if unknown:
+                    kept = {k: v for k, v in decision.inputs.items() if k in tool.input_schema}
+                    decision = replace(decision, inputs=kept)
+                    violations = validate_inputs(kept, tool.input_schema)
+                    trace.record(
+                        "unknown_fields_dropped",
+                        "success",
+                        clock.elapsed_ms(),
+                        detail=f"{decision.tool_name}: dropped {unknown}",
+                        tool_used=decision.tool_name,
+                    )
             if violations:
                 ctx.record_attempt(decision.tool_name, decision.inputs, 0, "invalid_input", decision.reasoning)
                 trace.record(
@@ -358,11 +506,44 @@ class ReasoningController:
                 )
                 continue
 
+            # options.loopFixes: with less than _MIN_USEFUL_TOOL_S left before the
+            # synthesis reserve the call would time out at once; stop on the time
+            # budget instead of spending a step on it.
+            if loop_fixes and clock.tool_deadline_s(self._per_tool_timeout_s) < min_useful_s:
+                trace.record(
+                    "budget_spent",
+                    "success",
+                    clock.elapsed_ms(),
+                    detail=f"{decision.tool_name} not started: no time left before the synthesis reserve",
+                    tool_used=decision.tool_name,
+                )
+                return StopReason.time_budget_expired
+
             # Invoke under the deadline-aware per-Tool timeout (Req 9.1-9.2): the
             # effective timeout is clamped to the wall-clock time left minus the
             # synthesis reserve, so a late tool cannot overrun the Time_Budget.
+            # A tool that declares ``wants_context`` (the anchored document reader)
+            # also receives the accumulated context and the sub-question, out of
+            # band, so it can anchor on what the loop already retrieved. No other
+            # tool's invocation changes.
+            call_context = tool_context
+            if getattr(tool, "wants_context", False) is True:
+                call_context = {**(tool_context or {}), "accumulated_context": ctx, "sub_question": sub_question.text}
+            pending = getattr(ctx, "pending_sql", None)
+            if decision.tool_name == _NL_TO_SQL_TOOL and pending is not None and not pending.consumed:
+                # options.keepSlowSql: wait for the SQL already running for the whole
+                # question instead of writing a new query with even less time to finish.
+                taken = await take_pending_sql(ctx, trace, wait_s=clock.tool_deadline_s(self._per_tool_timeout_s))
+                trace.record(
+                    "pending_sql_wait",
+                    "success" if taken else "timeout",
+                    clock.elapsed_ms(),
+                    detail="used the prefetch SQL" if taken else "prefetch SQL still running",
+                    tool_used=_NL_TO_SQL_TOOL,
+                )
+                continue
             result, status, ms = await self._invoke_with_timeout(
-                tool, decision.inputs, namespace, clock, tool_context=tool_context
+                tool, decision.inputs, namespace, clock, tool_context=call_context
             )
 
             if status != "success":
@@ -385,6 +566,11 @@ class ReasoningController:
             result_degraded_reason = result.degraded_reason
             if result_degraded_reason:
                 ctx.record_degraded(decision.tool_name, result_degraded_reason)
+            # Documents matched by name (find_documents) are kept on the context so
+            # the planner summary can list them; only that tool emits such items.
+            matches = [i for i in result.items if isinstance(i, dict) and i.get("type") == "document_match"]
+            if matches:
+                ctx.add_document_matches(matches)
             # If the result carried the determined ontology (an Ontology_Lookup_Tool
             # success), cache it on the shared context so the ontology-constrained
             # edge filter (Req 3.4/3.9) and the planner's context summary can use it
@@ -418,6 +604,22 @@ class ReasoningController:
             # consecutive no-progress steps and stop only once the tolerance is spent,
             # so the planner can escalate to a different tool / reframe / switch
             # modality in between. Bounded by the aggregate step/time budgets.
+            if (
+                loop_fixes
+                and new_count == 0
+                and decision.tool_name == _READ_DOCUMENT_TOOL
+                and refunded_reads < _MAX_REFUNDED_READS
+            ):
+                # The window was already in the context: the step did no work.
+                refunded_reads += 1
+                clock.refund_step()
+                ctx.record_attempt(
+                    decision.tool_name,
+                    decision.inputs,
+                    0,
+                    "already_read",
+                    "this window is already in the context; read a different offset or another document",
+                )
             if new_count == 0 and not ontology_resolved and not edges_discovered:
                 # A NOVEL approach (tool+inputs not tried before this sub-question)
                 # RESETS the streak first, so a diversifying planner earns fresh
@@ -451,13 +653,27 @@ class ReasoningController:
             # answer (Req 6.1-6.2; idea 2). ``_assess`` returns both in one planner
             # call; the working answer (grounded ONLY in gathered context) is stored
             # so it carries across steps and is handed to the synthesizer.
+            if getattr(ctx, "single_call_steps", False) is True:
+                # The next propose call decides whether to stop; no separate check.
+                continue
             sufficient, working_answer = await self._assess(sub_question, ctx)
             if working_answer:
                 ctx.set_working_answer(sub_question.text, working_answer)
+            if sufficient and guard_deferrals < _MAX_GUARD_DEFERRALS:
+                reason = insufficiency_reason(ctx)
+                if reason:
+                    guard_deferrals += 1
+                    sufficient = False
+                    ctx.record_attempt("sufficiency_check", {}, 0, "held_back", reason)
+                    trace.record("sufficiency_guard", "success", clock.elapsed_ms(), detail=reason[:300])
             if sufficient:
                 return StopReason.sufficiency_satisfied
 
     # ── selection & preference (Req 5) ─────────────────────────────────
+
+    async def assess(self, sub_question: SubQuestion, ctx: AccumulatedContext) -> tuple[bool, str]:
+        """Public form of :meth:`_assess`, for the session's evidence prefetch."""
+        return await self._assess(sub_question, ctx)
 
     async def _assess(self, sub_question: SubQuestion, ctx: AccumulatedContext) -> tuple[bool, str]:
         """Run the Sufficiency_Check and obtain the agent's grounded best-guess (idea 2).
@@ -522,7 +738,7 @@ class ReasoningController:
         """Rank a decision for the preference sort (lower = more preferred)."""
         if decision.is_ad_hoc:
             return _RANK_AD_HOC
-        if decision.tool_name.startswith(_STRATEGY_PREFIX):
+        if decision.tool_name.startswith(_STRATEGY_PREFIX) or decision.tool_name in _STRATEGY_RANK_TOOLS:
             return _RANK_STRATEGY
         return _RANK_TEMPLATE
 
@@ -738,6 +954,8 @@ class ReasoningController:
         """
         start = time.perf_counter()
         timeout_s = clock.tool_deadline_s(self._per_tool_timeout_s)
+        # A null optional field is the same as leaving it out (see validate_inputs).
+        inputs = {k: v for k, v in inputs.items() if v is not None}
         try:
             result = await asyncio.wait_for(
                 tool.invoke(namespace=namespace, **(tool_context or {}), **inputs),
