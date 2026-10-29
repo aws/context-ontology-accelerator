@@ -27,9 +27,10 @@ Property-graph schema these templates assume (verified against the toolkit
   for both Neptune Database and Neptune Analytics, which both key entities by
   ``~id``).
 - Entity properties: ``value`` (display name) and ``class`` (classification).
-- Entity↔entity relations: ``(:__Entity__)-[r:`__RELATION__` {value: <predicate>}]-(:__Entity__)``.
-  There is a single relationship type ``__RELATION__``; the edge type is the
-  ``value`` property on it (an LLM-extracted predicate string).
+- Entity↔entity relations: ``(:__Entity__)-[r:`__RELATION__`]->(:__Entity__)``.
+  There is a single relationship type ``__RELATION__``. ``r.value`` is its
+  human-readable predicate label; when present, ``r.predicateUri`` is the actual
+  predicate identifier and must remain distinct from that label.
 - Connected-node text: an entity's supporting statements are reached via
   ``(:__Entity__)-[:`__SUBJECT__`|`__OBJECT__`]->()-[:`__SUPPORTS__`]->(:__Statement__)``;
   the statement text is the ``__Statement__.value`` property. The statement label
@@ -45,6 +46,26 @@ openCypher **query parameters** (``$entity_ids``, ``$edge_types_norm``,
 ``$terms``) — never interpolated into the query text — so there is no
 query-injection surface. Only the tenant-scoped labels (derived internally, never
 from caller input) and the integer ``limit`` are formatted into the query text.
+
+Why the traversal templates use one id-anchored undirected match
+----------------------------------------------------------------
+The three ``__RELATION__`` templates start from one variable only:
+``MATCH (seed)-[r]-(neighbor) WHERE id(seed) IN $entity_ids``. This keeps the
+lookup anchored on the caller's bounded id set instead of asking the planner to
+evaluate an ``id(source) ... OR id(target) ...`` predicate over two variables.
+
+An undirected match alone cannot tell which endpoint the edge actually points
+FROM. The templates therefore recover the stored direction with the standard
+openCypher ``startNode(r)`` / ``endNode(r)`` functions before returning
+``sourceUri`` and ``targetUri``. ``WITH DISTINCT`` removes the duplicate match
+produced when both endpoints are seeds while preserving distinct parallel
+relationships (the relationship value ``r`` is part of the distinct key).
+
+The connected-node choice deliberately keeps the previous directed-query
+semantics: when the stored source is a seed, the target is connected; otherwise
+the source is connected. The templates retain their tenant-scoped labels,
+``$entity_ids`` bound of :data:`MAX_ENTITIES`, and global ``LIMIT {limit}``
+bounded by :data:`MAX_TRAVERSAL_LIMIT`.
 """
 
 from __future__ import annotations
@@ -58,7 +79,17 @@ MIN_EDGE_TYPES: int = 1
 MAX_EDGE_TYPES: int = 50
 
 # Default row cap for a traversal result set.
+MIN_TRAVERSAL_LIMIT: int = 1
+MAX_TRAVERSAL_LIMIT: int = 100
 DEFAULT_EDGE_TYPED_LIMIT: int = 100
+
+# A graph statement is copied into both the entity's ``supportingStatements``
+# property and a synthesis chunk. Keep the graph-store result itself bounded,
+# before Python or the LLM can accumulate a high-degree entity's full statement
+# fan-out. The query asks for one extra row so the caller can distinguish an
+# exact fit from truncation.
+MAX_CONNECTED_TEXT_ROWS: int = 100
+CONNECTED_TEXT_QUERY_LIMIT: int = MAX_CONNECTED_TEXT_ROWS + 1
 
 # ── Chunk-window expansion bounds (idea 6) ─────────────────────────────
 # Inclusive bounds for the chunk-window expansion template. Enforced by the
@@ -96,20 +127,45 @@ _CYPHER_EDGE_NORM: str = "toLower(replace(replace(r.value, ' ', '_'), '-', '_'))
 
 
 # The Requirement 5.5 prepared template: traverse the given edge types from the
-# given entities and return the connected nodes plus their supporting statement
-# text. ``entity_label`` / ``statement_label`` are tenant-scoped, already
-# backtick-wrapped labels; ``$entity_ids`` / ``$edge_types_norm`` are query
-# parameters; ``limit`` is an int. ``collect(DISTINCT stext)`` drops nulls, so a
-# connected node with no supporting statement yields an empty text list.
+# given entities and return the connected nodes. Supporting statement text is
+# fetched by :data:`CONNECTED_TEXT_RETRIEVAL` in a second, independently bounded
+# query. Keeping text out of this relationship query prevents one high-degree
+# entity from multiplying or hiding otherwise valid relationship rows.
+#
+# The single-variable id anchor and direction recovery are explained under "Why
+# the traversal templates use one id-anchored undirected match" in this module's
+# docstring. Same for URI_EXPANSION and ENTITY_EDGE_TYPES below.
 EDGE_TYPED_TRAVERSAL: str = (
-    "MATCH (s:{entity_label})-[r:`__RELATION__`]-(t:{entity_label})\n"
-    "WHERE id(s) IN $entity_ids\n"
+    "MATCH (seed:{entity_label})-[r:`__RELATION__`]-(neighbor:{entity_label})\n"
+    "WHERE id(seed) IN $entity_ids\n"
     "  AND " + _CYPHER_EDGE_NORM + " IN $edge_types_norm\n"
-    "OPTIONAL MATCH (t)-[:`__SUBJECT__`|`__OBJECT__`]->()-[:`__SUPPORTS__`]->(st:{statement_label})\n"
-    "WITH id(s) AS source, r.value AS edge, id(t) AS target,\n"
-    "     t.value AS targetLabel, t.class AS targetClass, st.value AS stext\n"
-    "RETURN source, edge, target, targetLabel, targetClass,\n"
-    "       collect(DISTINCT stext) AS targetTexts\n"
+    "WITH DISTINCT startNode(r) AS source, r, endNode(r) AS target\n"
+    "WITH source, r, target,\n"
+    "     CASE WHEN id(source) IN $entity_ids THEN target ELSE source END AS connected\n"
+    "RETURN id(source) AS sourceUri, source.value AS sourceLabel,\n"
+    "       r.predicateUri AS predicateUri, r.value AS predicateLabel,\n"
+    "       id(target) AS targetUri, target.value AS targetLabel,\n"
+    "       id(connected) AS connectedUri, connected.value AS connectedLabel,\n"
+    "       connected.class AS connectedClass\n"
+    "LIMIT {limit}"
+)
+
+
+# Fetch supporting statements for the already-bounded connected entity set.
+# This deliberately returns one statement per row instead of using ``collect``:
+# a Cypher aggregation would materialize every statement before a trailing
+# ``LIMIT`` could apply. ``limit`` is always
+# :data:`CONNECTED_TEXT_QUERY_LIMIT`, so the backend and the Python consumer both
+# have a hard result bound and the extra row truthfully signals degradation.
+#
+# ``DISTINCT`` is required because the match runs through facts: a statement that
+# supports several facts of the same entity would otherwise come back once per
+# fact, spend the row limit on duplicates, and report a cap that was never reached.
+CONNECTED_TEXT_RETRIEVAL: str = (
+    "MATCH (connected:{entity_label})-[:`__SUBJECT__`|`__OBJECT__`]->()-[:`__SUPPORTS__`]->"
+    "(st:{statement_label})\n"
+    "WHERE id(connected) IN $connected_ids\n"
+    "RETURN DISTINCT id(connected) AS connectedUri, st.value AS connectedText\n"
     "LIMIT {limit}"
 )
 
@@ -118,10 +174,16 @@ EDGE_TYPED_TRAVERSAL: str = (
 # entity ids (no edge-type constraint). Same connected-node shape as the
 # edge-typed template minus the text hop.
 URI_EXPANSION: str = (
-    "MATCH (s:{entity_label})-[r:`__RELATION__`]-(t:{entity_label})\n"
-    "WHERE id(s) IN $entity_ids\n"
-    "RETURN id(s) AS source, r.value AS edge, id(t) AS target,\n"
-    "       t.value AS targetLabel, t.class AS targetClass\n"
+    "MATCH (seed:{entity_label})-[r:`__RELATION__`]-(neighbor:{entity_label})\n"
+    "WHERE id(seed) IN $entity_ids\n"
+    "WITH DISTINCT startNode(r) AS source, r, endNode(r) AS target\n"
+    "WITH source, r, target,\n"
+    "     CASE WHEN id(source) IN $entity_ids THEN target ELSE source END AS connected\n"
+    "RETURN id(source) AS sourceUri, source.value AS sourceLabel,\n"
+    "       r.predicateUri AS predicateUri, r.value AS predicateLabel,\n"
+    "       id(target) AS targetUri, target.value AS targetLabel,\n"
+    "       id(connected) AS connectedUri, connected.value AS connectedLabel,\n"
+    "       connected.class AS connectedClass\n"
     "LIMIT {limit}"
 )
 
@@ -136,8 +198,9 @@ URI_EXPANSION: str = (
 # edge-typed traversal re-normalizes on match. ``$entity_ids`` is a query
 # parameter; ``limit`` is an int.
 ENTITY_EDGE_TYPES: str = (
-    "MATCH (s:{entity_label})-[r:`__RELATION__`]-(:{entity_label})\n"
-    "WHERE id(s) IN $entity_ids\n"
+    "MATCH (seed:{entity_label})-[r:`__RELATION__`]-(neighbor:{entity_label})\n"
+    "WHERE id(seed) IN $entity_ids\n"
+    "WITH DISTINCT r\n"
     "RETURN r.value AS edge, count(*) AS freq\n"
     "ORDER BY freq DESC\n"
     "LIMIT {limit}"
@@ -190,16 +253,34 @@ KEYWORD_ENTITY_SEARCH_WITH_CONTAINERS: str = (
 # toolkit's chunk-sequence edges (`__NEXT__` / `__PREVIOUS__`) up to `hops` hops.
 # Verified on the dev graph: chunks are keyed by the Neptune node id (the
 # ``chunkId`` property is null), and the chunk text lives in ``c.value`` — so
-# seeds are matched and neighbors returned via ``id(...)``. ``chunk_label`` is the
-# tenant-scoped, backtick-wrapped ``__Chunk__`` label; ``$chunk_ids`` is a query
-# parameter; ``hops``/``limit`` are ints. The seed chunks themselves are excluded
-# from the result (they are already in the accumulated context). An undirected
-# match (`-[...]-`) returns neighbors on BOTH sides (before and after).
+# seeds are matched and neighbors returned via ``id(...)``. Every chunk is linked
+# to its tenant-scoped ``__Source__`` node by ``__EXTRACTED_FROM__``; the query
+# returns the source identity and display-name fields so document-window text can
+# be cited rather than synthesized anonymously.
+# ``chunk_label`` / ``source_label`` are tenant-scoped labels; ``$chunk_ids`` is
+# a query parameter; ``hops``/``limit`` are ints. The seed chunks themselves are
+# excluded from the result (they are already in the accumulated context). An
+# undirected match (`-[...]-`) returns neighbors on BOTH sides (before and after).
+#
+# The source join is OPTIONAL on purpose. As a mandatory ``MATCH`` it silently
+# converted a SCHEMA MISMATCH into an empty success: a namespace ingested before
+# the ``__EXTRACTED_FROM__`` / ``__Source__`` shape existed — or one whose source
+# label is spelled differently — returned zero rows, so the tool reported
+# "expanded N chunk(s) -> 0 adjacent chunk(s)" with status ``succeeded``, no drop
+# count, and no degraded reason, while chunk-window expansion contributed nothing
+# to every deep-reasoning query. With ``OPTIONAL MATCH`` the adjacency rows still
+# come back and ``sourceDocumentId`` arrives null, which the tool counts as a
+# dropped anonymous chunk and reports as ``missing_document_provenance``. The
+# anonymous rows are still never used as document citations.
 CHUNK_WINDOW_EXPANSION: str = (
     "MATCH (c:{chunk_label})\n"
     "WHERE id(c) IN $chunk_ids\n"
     "MATCH (c)-[:`__NEXT__`|`__PREVIOUS__`*1..{hops}]-(adj:{chunk_label})\n"
     "WHERE NOT id(adj) IN $chunk_ids\n"
-    "RETURN DISTINCT id(adj) AS chunkId, adj.value AS text\n"
+    "OPTIONAL MATCH (adj)-[:`__EXTRACTED_FROM__`]->(source:{source_label})\n"
+    "RETURN DISTINCT id(adj) AS chunkId, adj.value AS text,\n"
+    "       id(source) AS sourceDocumentId,\n"
+    "       source.source_s3_key AS sourceS3Key,\n"
+    "       source.filename AS sourceFilename\n"
     "LIMIT {limit}"
 )

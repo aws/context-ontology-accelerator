@@ -174,6 +174,122 @@ describe("NamespaceList language column", () => {
   });
 });
 
+describe("NamespaceList status column", () => {
+  beforeEach(() => {
+    mockNamespaces = [
+      { namespaceId: "ns-a", name: "active-ns", status: "ACTIVE" },
+      { namespaceId: "ns-b", name: "archived-ns", status: "ARCHIVED" },
+    ];
+  });
+
+  it("shows the status as a word in English", () => {
+    render(<NamespaceList />, { wrapper });
+    expect(
+      within(screen.getByRole("row", { name: /active-ns/i })).getByText(
+        "Active",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("ACTIVE")).not.toBeInTheDocument();
+  });
+
+  it("shows the status in Japanese, matching the status filter", async () => {
+    window.localStorage.setItem("scl.locale", "ja");
+    try {
+      render(<NamespaceList />, { wrapper: localizedWrapper });
+      await screen.findByRole("columnheader", { name: /ステータス/ });
+      expect(
+        within(screen.getByRole("row", { name: /active-ns/i })).getByText(
+          "アクティブ",
+        ),
+      ).toBeInTheDocument();
+      expect(
+        within(screen.getByRole("row", { name: /archived-ns/i })).getByText(
+          "アーカイブ済み",
+        ),
+      ).toBeInTheDocument();
+    } finally {
+      window.localStorage.clear();
+      document.documentElement.lang = "";
+    }
+  });
+});
+
+describe("NamespaceList filter and sort follow the shown status", () => {
+  beforeEach(() => {
+    mockNamespaces = [
+      { namespaceId: "ns-a", name: "alpha-ns", status: "ACTIVE" },
+      { namespaceId: "ns-b", name: "bravo-ns", status: "ARCHIVED" },
+      { namespaceId: "ns-c", name: "charlie-ns", status: "DELETED" },
+      { namespaceId: "ns-d", name: "delta-ns", status: "DELETE_FAILED" },
+    ];
+  });
+
+  const shownNames = () =>
+    screen
+      .getAllByRole("row")
+      .map((row) => row.textContent ?? "")
+      .map((text) => /(alpha|bravo|charlie|delta)-ns/.exec(text)?.[0])
+      .filter((name): name is string => Boolean(name));
+
+  const inJapanese = async (body: () => Promise<void>) => {
+    window.localStorage.setItem("scl.locale", "ja");
+    try {
+      render(<NamespaceList />, { wrapper: localizedWrapper });
+      await screen.findByRole("columnheader", { name: /ステータス/ });
+      await body();
+    } finally {
+      window.localStorage.clear();
+      document.documentElement.lang = "";
+    }
+  };
+
+  it("finds a row by the Japanese status word shown in the cell", async () => {
+    await inJapanese(async () => {
+      const user = userEvent.setup();
+      await user.type(
+        screen.getByPlaceholderText("名前空間を検索"),
+        "アクティブ",
+      );
+      await waitFor(() => expect(shownNames()).toEqual(["alpha-ns"]));
+    });
+  });
+
+  it("still finds a row by the API value and by name", async () => {
+    const user = userEvent.setup();
+    render(<NamespaceList />, { wrapper });
+    const filter = screen.getByPlaceholderText("Find namespaces");
+    await user.type(filter, "ARCHIVED");
+    await waitFor(() => expect(shownNames()).toEqual(["bravo-ns"]));
+    await user.clear(filter);
+    await user.type(filter, "Delete failed");
+    await waitFor(() => expect(shownNames()).toEqual(["delta-ns"]));
+    await user.clear(filter);
+    await user.type(filter, "charlie");
+    await waitFor(() => expect(shownNames()).toEqual(["charlie-ns"]));
+  });
+
+  it("sorts the status column by the Japanese label", async () => {
+    await inJapanese(async () => {
+      const user = userEvent.setup();
+      await user.click(
+        within(
+          screen.getByRole("columnheader", { name: /ステータス/ }),
+        ).getByText("ステータス"),
+      );
+      // アーカイブ済み < アクティブ < 削除済み < 削除失敗 in Japanese
+      // collation; the API values would sort ACTIVE first.
+      await waitFor(() =>
+        expect(shownNames()).toEqual([
+          "bravo-ns",
+          "alpha-ns",
+          "charlie-ns",
+          "delta-ns",
+        ]),
+      );
+    });
+  });
+});
+
 describe("NamespaceList delete confirmation modal", () => {
   beforeEach(() => {
     mockNamespaces = [

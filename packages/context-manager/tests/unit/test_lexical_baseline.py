@@ -15,6 +15,7 @@ Tests cover:
 
 from __future__ import annotations
 
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -23,9 +24,11 @@ from coa_serve.lexical.baseline_retriever import (
     BaselineResult,
 )
 from coa_serve.lexical.strategies import (
+    _PRESERVED_RESULT_SCORE_METADATA_KEY,
     DEFAULT_SPEC,
     STRATEGY_REGISTRY,
     RetrieverStrategy,
+    _score_preserving_processors,
 )
 from coa_serve.tier3.knowledge_retriever import KnowledgeRetriever
 from coa_serve.tier3.vector_retriever import ChunkResult
@@ -135,7 +138,14 @@ class TestBaselineLexicalRetrieverRetrieve:
         mock_node.text = "Apple revenue was $83B"
         mock_node.score = 0.9
         mock_node.metadata = {
-            "source": {"sourceId": "AAPL.pdf", "metadata": {"year": "2022"}},
+            "source": {
+                "sourceId": "aws:tenant:source:document-42",
+                "metadata": {
+                    "year": "2022",
+                    "source_s3_key": "tenant/raw/source/AAPL-2022-Q3.pdf",
+                    "filename": "AAPL-2022-Q3.md",
+                },
+            },
             "entity_contexts": {
                 "contexts": [
                     {
@@ -162,7 +172,8 @@ class TestBaselineLexicalRetrieverRetrieve:
         assert len(result.chunks) == 1
         assert result.chunks[0].text == "Apple revenue was $83B"
         assert result.chunks[0].relevance_score == 0.9
-        assert result.chunks[0].source_doc == "AAPL.pdf"
+        assert result.chunks[0].source_doc == "aws:tenant:source:document-42"
+        assert result.chunks[0].source_doc_name == "AAPL-2022-Q3.pdf"
         assert len(result.entities) == 1
         assert result.entities[0].uri == "ent-apple"
         assert result.entities[0].label == "Apple Inc."
@@ -546,7 +557,7 @@ class TestRetrieveTraceStrategyDetail:
 
     async def test_success_detail_records_instance_default_strategy(self):
         retriever = self._make_retriever()  # instance default = chunk_based_semantic
-        nodes = [MagicMock(node_id="n1", text="t1", score=0.5, metadata={})]
+        nodes = [MagicMock(node_id="n1", text="t1", score=0.5, metadata={"source": "doc-1"})]
 
         with patch.object(retriever, "_retrieve_sync", return_value=nodes):
             result = await retriever.retrieve("q", "ns")
@@ -561,8 +572,8 @@ class TestRetrieveTraceStrategyDetail:
         retriever = self._make_retriever()
         override = STRATEGY_REGISTRY[RetrieverStrategy.TRAVERSAL]
         nodes = [
-            MagicMock(node_id="n1", text="t1", score=0.5, metadata={}),
-            MagicMock(node_id="n2", text="t2", score=0.4, metadata={}),
+            MagicMock(node_id="n1", text="t1", score=0.5, metadata={"source": "doc-1"}),
+            MagicMock(node_id="n2", text="t2", score=0.4, metadata={"source": "doc-2"}),
         ]
 
         with patch.object(retriever, "_retrieve_sync", return_value=nodes):
@@ -571,6 +582,51 @@ class TestRetrieveTraceStrategyDetail:
         step = result.trace_steps[0]
         assert step["status"] == "success"
         assert step["detail"] == f"strategy=traversal; {len(nodes)} nodes retrieved"
+
+    async def test_anonymous_nodes_are_dropped_and_traced_as_degraded(self):
+        retriever = self._make_retriever()
+        nodes = [MagicMock(node_id="n1", text="anonymous", score=0.5, metadata={})]
+
+        with patch.object(retriever, "_retrieve_sync", return_value=nodes):
+            result = await retriever.retrieve("q", "ns")
+
+        assert result.chunks == ()
+        assert result.dropped_anonymous_chunks == 1
+        assert result.trace_steps[0]["status"] == "degraded"
+        assert "dropped 1 anonymous or malformed document chunks" in result.trace_steps[0]["detail"]
+
+    def test_source_document_text_without_node_id_is_counted_as_dropped(self):
+        # A node with a source document, text and entities but no node id is not a
+        # chunk (a chunk needs its id) and not a graph statement (it has a source
+        # document), so its text is discarded and must be counted, not lost silently.
+        node = _make_node(
+            node_id="",
+            text="Document text without a chunk id.",
+            metadata={
+                "source": _source_metadata("aws:tenant:source:document-7"),
+                "entity_contexts": _entity_contexts([("ent-acme", "Acme", "Company")]),
+            },
+        )
+
+        chunks, entities, dropped = BaselineLexicalRetriever._map_results_with_diagnostics([node])
+
+        assert chunks == []
+        assert [entity.uri for entity in entities] == ["ent-acme"]
+        assert "supportingStatements" not in entities[0].properties
+        assert dropped == 1
+
+    def test_anonymous_text_kept_as_graph_statement_is_not_counted_as_dropped(self):
+        node = _make_node(
+            node_id="",
+            text="Acme acquired Example Corp.",
+            metadata={"entity_contexts": _entity_contexts([("ent-acme", "Acme", "Company")])},
+        )
+
+        chunks, entities, dropped = BaselineLexicalRetriever._map_results_with_diagnostics([node])
+
+        assert chunks == []
+        assert entities[0].properties["supportingStatements"] == '["Acme acquired Example Corp."]'
+        assert dropped == 0
 
     async def test_error_detail_records_resolved_strategy(self):
         retriever = self._make_retriever()
@@ -806,6 +862,25 @@ class TestMapResults:
         assert chunks[0].relevance_score == 0.5
         assert entities == []
 
+    def test_source_document_name_uses_original_filename_separately_from_identity(self):
+        """The raw upload name is display metadata, never the opaque identity."""
+        node = _make_node(
+            metadata={
+                "source": _source_metadata(
+                    "aws:tenant:source:document-42",
+                    {
+                        "source_s3_key": "tenant/raw/source/AAPL-2022-Q3.pdf",
+                        "filename": "AAPL-2022-Q3.md",
+                    },
+                )
+            }
+        )
+
+        chunks, _ = BaselineLexicalRetriever._map_results([node])
+
+        assert chunks[0].source_doc == "aws:tenant:source:document-42"
+        assert chunks[0].source_doc_name == "AAPL-2022-Q3.pdf"
+
     def test_entities_read_from_entity_contexts(self):
         """Entities are read from the nested ``entity_contexts`` structure
         (``contexts[].entities[].entity`` with ``entityId``/``value``/
@@ -836,24 +911,253 @@ class TestMapResults:
     def test_source_doc_read_from_traversal_result_shape(self):
         """The traversal retriever nests the source under
         ``metadata["result"]["source"]["sourceId"]``; the mapper reads it too."""
-        node = _make_node(metadata={"result": {"source": _source_metadata("traversal-doc.pdf")}})
+        node = _make_node(
+            metadata={
+                "result": {
+                    "source": _source_metadata(
+                        "aws:tenant:source:traversal-9",
+                        {
+                            "source_s3_key": "tenant/raw/source/traversal-doc.pdf",
+                            "filename": "traversal-doc.md",
+                        },
+                    )
+                }
+            }
+        )
 
         chunks, _ = BaselineLexicalRetriever._map_results([node])
 
-        assert chunks[0].source_doc == "traversal-doc.pdf"
+        assert chunks[0].source_doc == "aws:tenant:source:traversal-9"
+        assert chunks[0].source_doc_name == "traversal-doc.pdf"
+
+    def test_source_level_wrapper_expands_real_chunks_with_stable_evidence_fields(self):
+        node = _make_node(
+            node_id="random-wrapper-node-id",
+            text='{"aggregate": "formatted wrapper text"}',
+            score=0.25,
+            metadata={
+                "result": {
+                    "source": _source_metadata(
+                        "aws:tenant:source:document-42",
+                        {"source_s3_key": "tenant/raw/source/report.pdf"},
+                    ),
+                    "score": 0.7,
+                    "topics": [
+                        {
+                            "chunks": [
+                                {
+                                    "chunkId": "chunk-1",
+                                    "value": "First evidence chunk.",
+                                    "score": 0.91,
+                                },
+                                {
+                                    "chunkId": "chunk-2",
+                                    "metadata": {
+                                        "value": "Second evidence chunk.",
+                                        _PRESERVED_RESULT_SCORE_METADATA_KEY: 0.83,
+                                    },
+                                },
+                            ]
+                        }
+                    ],
+                }
+            },
+        )
+
+        chunks, _ = BaselineLexicalRetriever._map_results([node])
+
+        assert [chunk.chunk_id for chunk in chunks] == ["chunk-1", "chunk-2"]
+        assert [chunk.text for chunk in chunks] == ["First evidence chunk.", "Second evidence chunk."]
+        assert [chunk.source_doc for chunk in chunks] == [
+            "aws:tenant:source:document-42",
+            "aws:tenant:source:document-42",
+        ]
+        assert [chunk.source_doc_name for chunk in chunks] == ["report.pdf", "report.pdf"]
+        assert [chunk.relevance_score for chunk in chunks] == pytest.approx([0.91, 0.83])
+        assert all(chunk.chunk_id != "random-wrapper-node-id" for chunk in chunks)
+        assert all("aggregate" not in chunk.text for chunk in chunks)
+
+    def test_preserved_score_marker_never_reaches_synthesis_text(self):
+        # The score marker is an ADAPTER-ONLY key written onto raw chunk metadata.
+        # `_BENCHMARK_PROCESSOR_ARGS` sets `include_chunk_details: True`, so the
+        # toolkit's raw wrapper text now carries the full chunk dicts — marker
+        # included — and that wrapper text must never become evidence the model
+        # reads, or the model can see (and quote) an internal ranking field.
+        marker = _PRESERVED_RESULT_SCORE_METADATA_KEY
+        wrapper_text = json.dumps(
+            {
+                "source": {"sourceId": "aws:tenant:source:document-42"},
+                "topics": [{"chunks": [{"chunkId": "chunk-1", "metadata": {marker: 0.91}}]}],
+            }
+        )
+        assert marker in wrapper_text  # the leak is available to leak
+        node = _make_node(
+            node_id="random-wrapper-node-id",
+            text=wrapper_text,
+            score=0.25,
+            metadata={
+                "result": {
+                    "source": _source_metadata(
+                        "aws:tenant:source:document-42",
+                        {"source_s3_key": "tenant/raw/source/report.pdf"},
+                    ),
+                    "topics": [
+                        {
+                            "chunks": [
+                                {
+                                    "chunkId": "chunk-1",
+                                    "value": "First evidence chunk.",
+                                    "metadata": {marker: 0.91},
+                                }
+                            ]
+                        }
+                    ],
+                }
+            },
+        )
+
+        chunks, entities = BaselineLexicalRetriever._map_results([node])
+
+        # The score is recovered...
+        assert [chunk.relevance_score for chunk in chunks] == pytest.approx([0.91])
+        # ...but the marker key appears in nothing that reaches the synthesizer.
+        for chunk in chunks:
+            assert marker not in chunk.text
+            assert marker not in chunk.source_doc
+            assert marker not in chunk.source_doc_name
+            assert marker not in chunk.label
+        for entity in entities:
+            assert marker not in json.dumps(dict(entity.properties))
+            assert marker not in entity.label
+
+    def test_source_level_wrapper_without_provenance_does_not_emit_anonymous_evidence(self):
+        node = _make_node(
+            node_id="random-wrapper-node-id",
+            text='{"aggregate": "formatted wrapper text"}',
+            metadata={
+                "result": {
+                    "topics": [
+                        {
+                            "chunks": [
+                                {
+                                    "chunkId": "chunk-1",
+                                    "value": "Anonymous evidence must not reach synthesis.",
+                                }
+                            ]
+                        }
+                    ]
+                }
+            },
+        )
+
+        chunks, _ = BaselineLexicalRetriever._map_results([node])
+
+        assert chunks == []
+
+    def test_exact_pre_truncation_relevance_score_survives_clear_scores(self):
+        """The exact pre-truncation rank survives the real processor suffix."""
+        from graphrag_toolkit.lexical_graph.metadata import FilterConfig
+        from graphrag_toolkit.lexical_graph.retrieval.model import (
+            Chunk,
+            EntityContexts,
+            SearchResult,
+            SearchResultCollection,
+            Source,
+            Statement,
+            Topic,
+            Versioning,
+        )
+        from graphrag_toolkit.lexical_graph.retrieval.processors import ProcessorArgs
+        from llama_index.core.schema import QueryBundle
+
+        def result(source_id: str, scores: list[float]) -> SearchResult:
+            return SearchResult(
+                source=Source(sourceId=source_id, versioning=Versioning()),
+                topics=[
+                    Topic(
+                        topic=f"topic-{source_id}",
+                        topicId=f"topic-{source_id}",
+                        chunks=[Chunk(chunkId=f"chunk-{source_id}", value=f"evidence-{source_id}")],
+                        statements=[
+                            Statement(statement=f"statement-{index}", score=score) for index, score in enumerate(scores)
+                        ],
+                    )
+                ],
+            )
+
+        search_results = SearchResultCollection(
+            results=[
+                # Original mean: 0.755. After truncation, the surviving top ten
+                # statements average 1.0, so reconstruction would invert B > A.
+                result("A", [1.0] * 10 + [0.51] * 10),
+                result("B", [0.9] * 10),
+            ],
+            entity_contexts=EntityContexts(),
+        )
+        args = ProcessorArgs(max_statements_per_topic=10)
+        filter_config = FilterConfig()
+        query = QueryBundle(query_str="rank these")
+        processors = _score_preserving_processors()
+        rescore_index = next(
+            index for index, processor in enumerate(processors) if processor.__name__ == "RescoreResults"
+        )
+        for processor in processors[rescore_index:]:
+            search_results = processor(args, filter_config).process_results(search_results, query, "test")
+
+        assert [item.source.sourceId for item in search_results.results] == ["B", "A"]
+        assert len(search_results.results[1].topics[0].statements) == 10
+        nodes = [
+            _make_node(
+                node_id=f"node-{item.source.sourceId}",
+                score=item.score,
+                metadata={
+                    "result": item.model_dump(
+                        exclude_none=True,
+                        exclude_unset=True,
+                        exclude_defaults=True,
+                    )
+                },
+            )
+            for item in search_results.results
+        ]
+
+        chunks, _ = BaselineLexicalRetriever._map_results(nodes)
+
+        assert [chunk.source_doc for chunk in chunks] == ["B", "A"]
+        assert [chunk.relevance_score for chunk in chunks] == pytest.approx([0.9, 0.755])
+
+    def test_source_name_never_mixes_with_a_higher_priority_legacy_identity(self):
+        """A legacy top-level identity cannot borrow a name from another source."""
+        node = _make_node(
+            metadata={
+                "source": "legacy-source-id",
+                "result": {
+                    "source": _source_metadata(
+                        "aws:tenant:source:different-document",
+                        {"source_s3_key": "tenant/raw/source/different.pdf"},
+                    )
+                },
+            }
+        )
+
+        chunks, _ = BaselineLexicalRetriever._map_results([node])
+
+        assert chunks[0].source_doc == "legacy-source-id"
+        assert chunks[0].source_doc_name == ""
 
     def test_entities_deduplicated_across_nodes(self):
         """The same entity URI appearing on multiple nodes yields a single
-        ``GraphEntity`` (first occurrence wins)."""
+        ``GraphEntity`` and source-less text stays graph-only."""
         ec = _entity_contexts([("ent-apple", "Apple Inc.", "Company")])
         node1 = _make_node(node_id="n1", metadata={"entity_contexts": ec})
         node2 = _make_node(node_id="n2", metadata={"entity_contexts": ec})
 
         chunks, entities = BaselineLexicalRetriever._map_results([node1, node2])
 
-        assert len(chunks) == 2
+        assert chunks == []
         assert len(entities) == 1
         assert entities[0].uri == "ent-apple"
+        assert json.loads(entities[0].properties["supportingStatements"]) == ["some text"]
 
     def test_missing_classification_falls_back_to_default_type(self):
         """An entity context with a value but missing classification uses the
@@ -878,10 +1182,10 @@ class TestMapResults:
 
     # ---- defensive fallbacks + one-time warning ------------------------
 
-    def test_empty_metadata_yields_empty_source_and_entities_no_warning(self):
+    def test_empty_metadata_drops_anonymous_chunk_without_shape_warning(self):
         """A node with NO metadata is the legitimate empty case (e.g. an empty
-        graph) — it degrades to empty ``source_doc``/entities WITHOUT a warning,
-        since there is no shape to mismatch."""
+        graph) — it is dropped WITHOUT a shape warning, since there is no shape
+        to mismatch and no provenance that could support a document citation."""
         import coa_serve.lexical.baseline_retriever as br
 
         node = _make_node(metadata={})
@@ -889,7 +1193,7 @@ class TestMapResults:
         with patch.object(br.logger, "warning") as mock_warn:
             chunks, entities = BaselineLexicalRetriever._map_results([node])
 
-        assert chunks[0].source_doc == ""
+        assert chunks == []
         assert entities == []
         mock_warn.assert_not_called()
 
@@ -909,8 +1213,7 @@ class TestMapResults:
             chunks, entities = BaselineLexicalRetriever._map_results([node1, node2])
 
         # Degraded, not crashed.
-        assert len(chunks) == 2
-        assert all(c.source_doc == "" for c in chunks)
+        assert chunks == []
         assert entities == []
         # Warned exactly once despite two mismatched nodes (one-time guard).
         mock_warn.assert_called_once()
@@ -918,6 +1221,25 @@ class TestMapResults:
         args, kwargs = mock_warn.call_args
         assert args[0] == "baseline_map_results_shape_mismatch"
         assert "metadata_keys" in kwargs
+
+    def test_source_less_graph_text_is_retained_only_in_graph_context_properties(self):
+        node = _make_node(
+            node_id="graph-node",
+            text="Acme acquired Example Corp.",
+            metadata={
+                "entity_contexts": _entity_contexts(
+                    [
+                        ("urn:acme", "Acme", "Company"),
+                    ]
+                )
+            },
+        )
+
+        chunks, entities = BaselineLexicalRetriever._map_results([node])
+
+        assert chunks == []
+        assert len(entities) == 1
+        assert json.loads(entities[0].properties["supportingStatements"]) == ["Acme acquired Example Corp."]
 
     def test_malformed_entity_contexts_does_not_crash(self):
         """Wholly malformed ``entity_contexts`` (wrong types at every level)

@@ -20,9 +20,11 @@ import type {
   TraceStep,
   SupportingContentItem,
   GraphContextItem,
+  ExecutionMode,
 } from "@app-types";
 import { LiveSteps } from "./LiveSteps";
 import { EvidencePanel } from "./EvidencePanel";
+import { describePlaygroundError } from "../playground-errors";
 import { useAppI18n } from "../../../i18n/LocaleProvider";
 import "../chat.css";
 
@@ -43,6 +45,7 @@ export interface ChatBubbleProps {
     resultRows?: Record<string, unknown>[];
     queryUsed?: string;
     sparqlGenerated?: string;
+    executionMode?: ExecutionMode;
     latencyMs?: number;
     guardrailBlocked?: boolean;
     suppressedRows?: number;
@@ -101,12 +104,21 @@ export const ChatBubble: React.FC<ChatBubbleProps> = ({
         />
       );
     }
+    const errorText = describePlaygroundError(
+      errorDetails?.error,
+      errorMessage || content,
+      locale,
+      t,
+    );
     return (
       <SpaceBetween size="xs">
-        <StatusIndicator type="error">
-          {errorMessage || content}
-        </StatusIndicator>
-        {onRetry && (
+        <StatusIndicator type="error">{errorText.summary}</StatusIndicator>
+        {errorText.detail && (
+          <Box variant="small" color="text-body-secondary">
+            {errorText.detail}
+          </Box>
+        )}
+        {onRetry && errorText.retryable && (
           <Button variant="inline-link" onClick={onRetry}>
             {t("Retry")}
           </Button>
@@ -167,10 +179,23 @@ export const ChatBubble: React.FC<ChatBubbleProps> = ({
     }
   })();
 
+  // The SPARQL provenance differs by mode. Standard mode's Tier-2 VKG strategy
+  // emits SPARQL that Ontop compiles to SQL, so "(Tier 2)" is accurate there.
+  // Deep Reasoning also emits SPARQL/SQL but through its agentic loop, not the
+  // Tier-2 cascade — labelling its artifacts "(Tier 2)" mislabels them (#1166).
+  const isDeepReasoning = response.executionMode === "deep-reasoning";
   const sqlArtifactCaption = response.sparqlGenerated
-    ? t("The SPARQL the LLM emitted (Tier 2) and the SQL {engine} executed.", {
-        engine: executionEngineLabel,
-      })
+    ? isDeepReasoning
+      ? t(
+          "The SPARQL and SQL Deep Reasoning generated and {engine} executed.",
+          { engine: executionEngineLabel },
+        )
+      : t(
+          "The SPARQL the LLM emitted (Tier 2) and the SQL {engine} executed.",
+          {
+            engine: executionEngineLabel,
+          },
+        )
     : t("The SQL {engine} executed.", { engine: executionEngineLabel });
 
   return (

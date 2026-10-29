@@ -1,0 +1,40 @@
+# Patched replacements for JARs bundled in the Ontop 5.5.0 CLI (/opt/ontop/lib).
+#
+# Ontop 5.5.0 is the latest release, and its bundled Tomcat, Spring Framework,
+# Thymeleaf, Jackson, commons-beanutils and Guava carry Critical/High CVEs.
+# These versions mirror what Ontop's own `version5` branch now pins on the SAME
+# Spring Boot 2.7.18 line (ontop/ontop pom.xml: tomcat-embed 9.0.122,
+# spring-framework 5.3.39, thymeleaf 3.1.5.RELEASE, jackson 2.18.11,
+# commons-beanutils 1.11.0), so they are drop-in for the endpoint we run. Guava
+# goes past upstream's 32.0.1 to 33.7.2 for CVE-2026-102554; it is API-compatible
+# and brings its failureaccess 1.0.3 runtime dependency. Thymeleaf 3.1 needs
+# attoparser 2.0.7 and absorbed thymeleaf-extras-java8time, which is removed.
+#
+# Format: <Maven Central path> <sha256>. ontop-lib-overrides.sh verifies each pin
+# and swaps it in for every bundled lib/<artifactId>-<version>.jar, refusing to
+# replace a bundled JAR newer than the pin. Drop an entry once a newer Ontop
+# release bundles that version or later.
+org/apache/tomcat/embed/tomcat-embed-core/9.0.122/tomcat-embed-core-9.0.122.jar d89e48fc2835102846988d3cdb9d833f61e1934e5e46440697b6f0cc24923455
+org/apache/tomcat/embed/tomcat-embed-el/9.0.122/tomcat-embed-el-9.0.122.jar cd9fd2b078ec8129134669a9a6bd71c87d87b5e3d4f39dbc328e85342b90bfc6
+org/apache/tomcat/embed/tomcat-embed-websocket/9.0.122/tomcat-embed-websocket-9.0.122.jar e15e6fae2eb07536d545e2d38a8ff71522d91c136be71a55d70f7397a780ad98
+com/fasterxml/jackson/core/jackson-annotations/2.18.11/jackson-annotations-2.18.11.jar 9eab0d36da981645392427eedcb087e13be542488e37f935723dc0be50d18a53
+com/fasterxml/jackson/core/jackson-core/2.18.11/jackson-core-2.18.11.jar 825fa72dfb9e2f8a642322f1390dbac22c30d15ebd6dc6b3772158821ee124eb
+com/fasterxml/jackson/core/jackson-databind/2.18.11/jackson-databind-2.18.11.jar 075ad94a76c3edf83e1972dc26f476361eb6b9d0e260d93fc11105509bc79cab
+com/fasterxml/jackson/datatype/jackson-datatype-guava/2.18.11/jackson-datatype-guava-2.18.11.jar 3eed4eefff6a765f87b5280cb3d6335bbc97fd12930ab39703bcc8f781c80c05
+com/fasterxml/jackson/datatype/jackson-datatype-jdk8/2.18.11/jackson-datatype-jdk8-2.18.11.jar efb0704bc8c9ff1eab7f1f8d0aabe3365d601b875b6dfc2a89ff750f9e0a8d2f
+com/fasterxml/jackson/datatype/jackson-datatype-jsr310/2.18.11/jackson-datatype-jsr310-2.18.11.jar b2bab3e2c34f7b0b7f83bdb4de4c869c884466f756d76ed661ab3d2d9f35d1d3
+com/fasterxml/jackson/module/jackson-module-parameter-names/2.18.11/jackson-module-parameter-names-2.18.11.jar 98175757cb61856bed6e880bd272c455ee296f8f15bfa0e691422c416557fe42
+org/springframework/spring-aop/5.3.39/spring-aop-5.3.39.jar aa706e4f749982c0bae5fa637433c44c24f0fff5d16dc41deea6d30c3dfa7c85
+org/springframework/spring-beans/5.3.39/spring-beans-5.3.39.jar b6697a5d8facb81aa75e5a46d959d4256da9ce3b40d33f3b5bbd42a8b1ed5722
+org/springframework/spring-context/5.3.39/spring-context-5.3.39.jar 9e644fc33bece9a9cb82538167a1b9640ae7b7d80252e893d89b8926a2f81633
+org/springframework/spring-core/5.3.39/spring-core-5.3.39.jar 3a1ddcf05420a9181bd9cacb6062a3edc493e14d555961ad50e1a6360eb1e75f
+org/springframework/spring-expression/5.3.39/spring-expression-5.3.39.jar d5337774d889fcdc9c08b0c8b8aaa1018d4c95b9b441db0118f7ae4d328f2810
+org/springframework/spring-jcl/5.3.39/spring-jcl-5.3.39.jar adbe656fc622e2457fefa09529d4b7c1126a3c4ff1c9306907764fcc93f1b725
+org/springframework/spring-web/5.3.39/spring-web-5.3.39.jar 444f243b936119b5488029f2d9399a3980855c60b493b9e2811464c6433a2b71
+org/springframework/spring-webmvc/5.3.39/spring-webmvc-5.3.39.jar 1ad8a2ba468c07024ba63cb7681bb30a2ecf8d91124f00fdb4a3d184131b87ed
+org/thymeleaf/thymeleaf/3.1.5.RELEASE/thymeleaf-3.1.5.RELEASE.jar 4011795f8494dd69e764b7709443dd13d3068ba8ac37624f61d7084f4429cbe2
+org/thymeleaf/thymeleaf-spring5/3.1.5.RELEASE/thymeleaf-spring5-3.1.5.RELEASE.jar a8f07a87168a6d7aafad2e49bb84aee14d1b676b7c5763ad7ecc5c9ff24d050f
+org/attoparser/attoparser/2.0.7.RELEASE/attoparser-2.0.7.RELEASE.jar 75dd1c045492bff8e1963aabb28bfe903c2064e11e27fe2f0f0aff1ad3d84476
+commons-beanutils/commons-beanutils/1.11.0/commons-beanutils-1.11.0.jar 9e44ba68ec9a3f21286fa2a8bbb003b735c0f69101bb43144b79f4f8aaa74709
+com/google/guava/guava/33.7.2-jre/guava-33.7.2-jre.jar b530942257fb935f8b2cfaa5f8eb5bd59c555fd8e8d01b8ce98912e077ea606c
+com/google/guava/failureaccess/1.0.3/failureaccess-1.0.3.jar cbfc3906b19b8f55dd7cfd6dfe0aa4532e834250d7f080bd8d211a3e246b59cb

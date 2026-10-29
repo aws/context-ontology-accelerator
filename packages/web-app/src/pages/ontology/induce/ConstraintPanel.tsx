@@ -202,7 +202,7 @@ export function ConstraintPanel({
       headerText={t("SHACL Constraints")}
       headerInfo={
         <SpaceBetween direction="horizontal" size="xxs" alignItems="center">
-          <Badge color="blue">Beta</Badge>
+          <Badge color="blue">{t("Beta")}</Badge>
           <InfoPopover
             header={t("SHACL constraints")}
             ariaLabel={t("About SHACL constraints")}

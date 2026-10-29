@@ -2,7 +2,7 @@
 name = "coa"
 # Single source of truth is the repo-root VERSION file. Do not edit by hand —
 # bump VERSION and run `make version` (verified by `make lint`).
-version = "0.3.7"
+version = "0.3.8"
 description = "Context Ontology Accelerator for AWS"
 requires-python = ">=3.12"
 license = {text = "Apache-2.0"}
@@ -37,9 +37,13 @@ required-version = ">=0.13.4"
 #   un-sandboxed Jinja2 render in ReferenceFileSystem (Kerchunk) — SSTI/RCE on
 #   attacker-controlled references JSON (GHSA, HIGH). 2026.6.0 is the patched
 #   floor; constrained here since fsspec is transitive, not directly declared.
+#   filelock: pulled by huggingface-hub (via tokenizers). 3.20.4-4.2.0 let a
+#   local user who can write the lock directory redirect ReadWriteLock's SQLite
+#   onto other files (GHSA-v4x8-3wr5-3wq8, HIGH). 4.2.1 is the patched floor.
 constraint-dependencies = [
     "werkzeug>=3.1.9",
     "fsspec>=2026.6.0",
+    "filelock>=4.2.1",
 ]
 
 [tool.uv.workspace]

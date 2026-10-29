@@ -112,6 +112,22 @@ Cedar (at query execution time by the SQL Firewall) — see the
 | `columnDenylist` | `map[string, list[string]]` | These columns cannot be projected. `SELECT *` on a restricted table is denied. |
 | `allowedMetrics` | `list[string]` | Only these metric IDs can be evaluated. |
 
+A table entry can be a bare name or `database.table`:
+
+- A **bare name** (`customers`) covers every table of that name the namespace can
+  reach, in any database. If two Glue databases of one namespace each hold a
+  `customers` table, one `customers` entry grants both.
+- A **database-qualified name** (`crm_db.customers`, or
+  `AwsDataCatalog.crm_db.customers`) covers only the table in that database, and
+  only when the query names that database. A query that names the table bare, or
+  through another database or catalog, does not match it. Use this form to grant
+  one of two same-named tables. The SQL writer is told to name the database for
+  such a table, so its queries match.
+
+The same rules apply to the table keys of `columnDenylist`. A bare key denies the
+columns in every table of that name; a `database.table` key denies them only where
+the query names that database.
+
 !!! note
     Data restrictions are **optional**. When omitted, the user has full query access to all data within their namespace (subject to Cedar action-level permissions).
 

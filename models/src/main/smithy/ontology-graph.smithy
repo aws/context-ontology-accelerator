@@ -295,6 +295,10 @@ operation UploadOntology {
 }
 
 /// Download an ontology as Turtle.
+///
+/// Returns 404 when the ontology does not exist or its graph holds no triples
+/// and no cached file is available; nothing is written to the artifacts bucket
+/// in that case.
 @readonly
 @http(method: "GET", uri: "/namespaces/{namespaceId}/ontologies/{ontologyId}/download", code: 200)
 operation DownloadOntology {
@@ -679,10 +683,12 @@ operation GraphSearch {
         @httpLabel
         namespaceId: Uuid
 
-        /// Substring search term matched against entity IRIs and labels.
+        /// Substring search term matched against entity IRIs and labels. An
+        /// empty value or `*` lists the namespace's entities; a value over 4000
+        /// characters returns 400.
         @required
         @httpQuery("q")
-        @length(min: 1, max: 4000)
+        @length(max: 4000)
         q: String
 
         @httpQuery("kind")

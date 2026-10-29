@@ -133,10 +133,20 @@ class ChunkExpansionTool:
     @staticmethod
     def _chunk_label(namespace: str) -> str:
         """Tenant-scoped, backtick-wrapped ``__Chunk__`` label for ``namespace``."""
+        return ChunkExpansionTool._format_label(namespace, "__Chunk__")
+
+    @staticmethod
+    def _source_label(namespace: str) -> str:
+        """Tenant-scoped, backtick-wrapped ``__Source__`` label for ``namespace``."""
+        return ChunkExpansionTool._format_label(namespace, "__Source__")
+
+    @staticmethod
+    def _format_label(namespace: str, label: str) -> str:
+        """Format a toolkit graph label for the namespace's tenant."""
         from coa_common.constants import to_graphrag_tenant_id
         from graphrag_toolkit.lexical_graph import TenantId  # lazy
 
-        return TenantId(to_graphrag_tenant_id(namespace)).format_label("__Chunk__")
+        return TenantId(to_graphrag_tenant_id(namespace)).format_label(label)
 
     async def _run_cypher(self, cypher: str, params: dict) -> list[dict]:
         """Execute openCypher on the toolkit store under the query timeout."""
@@ -171,6 +181,7 @@ class ChunkExpansionTool:
 
         cypher = CHUNK_WINDOW_EXPANSION.format(
             chunk_label=self._chunk_label(namespace),
+            source_label=self._source_label(namespace),
             hops=hops,
             limit=int(limit),
         )
@@ -184,16 +195,67 @@ class ChunkExpansionTool:
             return ToolResult(detail=f"{self.name} error: {type(exc).__name__}")
 
         chunks: list[ChunkResult] = []
+        dropped_chunks = 0
+        dropped_without_source = 0
         for row in rows:
+            if not isinstance(row, dict):
+                dropped_chunks += 1
+                continue
             cid = row.get("chunkId", "")
             text = row.get("text", "") or ""
-            if not cid or not text:
+            source_document_id = row.get("sourceDocumentId", "")
+            has_source = isinstance(source_document_id, str) and bool(source_document_id.strip())
+            if cid is None or not str(cid).strip() or not isinstance(text, str) or not text.strip() or not has_source:
+                dropped_chunks += 1
+                if not has_source:
+                    dropped_without_source += 1
                 continue
-            chunks.append(ChunkResult(chunk_id=str(cid), text=text, source_doc="", relevance_score=1.0))
+            source_name = row.get("sourceS3Key") or row.get("sourceFilename") or ""
+            source_name = source_name.rsplit("/", 1)[-1] if isinstance(source_name, str) else ""
+            chunks.append(
+                ChunkResult(
+                    chunk_id=str(cid),
+                    text=text,
+                    source_doc=source_document_id.strip(),
+                    source_doc_name=source_name,
+                    relevance_score=1.0,
+                )
+            )
 
         items = tuple(_chunk_item(c) for c in chunks)
         detail = f"{self.name}: expanded {len(ids)} chunk(s) -> {len(chunks)} adjacent chunk(s) (hops={hops})"
-        return ToolResult(chunks=tuple(chunks), items=items, detail=detail)
+        degraded_reason = ""
+        if dropped_chunks:
+            detail = f"{detail}; dropped {dropped_chunks} anonymous or malformed document chunk(s)"
+            degraded_reason = "missing_document_provenance"
+            # Every adjacency row lacking a `__Source__` join is the schema-mismatch
+            # case: the namespace's graph does not carry `__EXTRACTED_FROM__` (or
+            # spells the source label differently), so chunk-window expansion can
+            # never contribute document evidence for that namespace. Name it in the
+            # detail, because otherwise it reads as an ordinary per-row data problem.
+            # The ``degraded_reason`` vocabulary stays stable for downstream consumers.
+            source_join_missing = dropped_without_source == len(rows)
+            if source_join_missing:
+                detail = (
+                    f"{detail}; no adjacent chunk resolved a `__Source__` via "
+                    "`__EXTRACTED_FROM__` — the namespace graph may be missing that shape"
+                )
+            logger.warning(
+                "chunk_window_chunks_dropped",
+                tool=self.name,
+                seeds=len(ids),
+                rows=len(rows),
+                dropped=dropped_chunks,
+                dropped_without_source=dropped_without_source,
+                source_join_missing=source_join_missing,
+                reason=degraded_reason,
+            )
+        return ToolResult(
+            chunks=tuple(chunks),
+            items=items,
+            detail=detail,
+            degraded_reason=degraded_reason,
+        )
 
 
 def build_chunk_expansion_tool(registry: Any, graph_store_uri: str) -> str:

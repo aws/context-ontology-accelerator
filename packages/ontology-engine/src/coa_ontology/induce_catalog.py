@@ -28,6 +28,7 @@ from coa_common.bedrock_metrics import (
 )
 from coa_common.constants import DATABASE_SUB_TYPES, validate_ontology_uri_prefix
 from coa_common.language_tags import DEFAULT_LANGUAGE
+from coa_control_plane_server.models.induction_job_status import InductionJobStatus
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
@@ -42,6 +43,7 @@ from coa_ontology.namespace_language import (
     resolve_namespace_language,
 )
 from coa_ontology.pagination import InvalidNextToken, decode_next_token, page_body
+from coa_ontology.query_params import require_enum_value
 
 if TYPE_CHECKING:
     # Type-only: ``inducer.schemas`` is deliberately NOT imported at runtime here
@@ -1187,6 +1189,10 @@ _schemas_mod: Any = None  # injected by main.py at startup; import-time cycle av
 _catalog_table_cls = None
 
 
+# The one strategy that does not induce from datasource tables.
+_UNSTRUCTURED_STRATEGY = "unstructured_lexical_graph"
+
+
 @router.post("/", status_code=202)
 def start_induction(body: WorkbenchInductionRequest, request: Request, namespace: str):
     """Start an ontology-induction job for a namespace.
@@ -1208,12 +1214,20 @@ def start_induction(body: WorkbenchInductionRequest, request: Request, namespace
         The pending :class:`JobResponse` for the newly started job.
 
     Raises:
-        HTTPException: 404 if the namespace does not exist, 400 if the strategy
+        HTTPException: 400 if a table-based strategy gets no ``datasource_ids``,
+            404 if the namespace does not exist, 400 if the strategy
             is ``rigor_ontology`` and the namespace language is not English, 422
             if the requested lexical source is unsupported or the Neptune
             endpoint is unconfigured for an unstructured run, or 409 if another
             induction/proposal is in flight.
     """
+    # The table-based strategies read their tables from the listed datasources,
+    # so an empty list can only fail in the worker ("No tables found in
+    # datasources: []") after a 202. Reject it up front. The unstructured
+    # strategy reads the lexical graph and records the list as metadata only,
+    # so it keeps accepting an empty one.
+    if body.strategy != _UNSTRUCTURED_STRATEGY and not body.datasource_ids:
+        raise HTTPException(400, "datasource_ids must list at least one data source for a table-based strategy")
     # Resolve the immutable namespace language once, before any job state is
     # written, and hand it to whichever pipeline runs.
     namespace_language = namespace_language_or_404(namespace, request.app.state.config)
@@ -1227,7 +1241,7 @@ def start_induction(body: WorkbenchInductionRequest, request: Request, namespace
         )
 
     # Dispatch to unstructured pipeline if strategy is unstructured_lexical_graph
-    if getattr(body, "strategy", "") == "unstructured_lexical_graph":
+    if body.strategy == _UNSTRUCTURED_STRATEGY:
         from coa_ontology.inducer.routers.induce_unstructured import (
             UnstructuredInductionRequest,
             start_unstructured_job,
@@ -1605,6 +1619,13 @@ LIST_INDUCTION_JOBS_DEFAULT_MAX_RESULTS = 50
 LIST_INDUCTION_JOBS_MAX_RESULTS = 200
 
 
+# Job-row statuses the service writes that ``InductionJobStatus`` does not list:
+# ``ingested`` (set when the job's proposal is accepted) and ``cancelled`` (the
+# async-job terminal state). A ``status`` filter on them matches real rows, so
+# they stay valid filter values.
+_STORED_JOB_STATUSES_OUTSIDE_ENUM = ("ingested", "cancelled")
+
+
 def jobs_list_scope(namespace: str) -> str:
     """``nextToken`` scope of a ListInductionJobs listing (see :mod:`coa_ontology.pagination`)."""
     return f"jobs:{namespace}"
@@ -1661,11 +1682,13 @@ def list_jobs(
         not guaranteed).
 
     Raises:
-        HTTPException: 400 for a bad ``nextToken``; 503 when the DynamoDB scan
+        HTTPException: 400 for a bad ``nextToken`` or a ``status`` that is not an
+            ``InductionJobStatus`` value; 503 when the DynamoDB scan
             fails. An empty 200 there would read as "no more jobs" and silently
             truncate a client that is paging, so the failure is surfaced and the
             client can retry the same token.
     """
+    require_enum_value("status", status, InductionJobStatus, also_allowed=_STORED_JOB_STATUSES_OUTSIDE_ENUM)
     scope = jobs_list_scope(namespace)
     try:
         start_key = decode_next_token(next_token, scope=scope)

@@ -9,6 +9,8 @@
  * whole module — and its Cloudscape tree — into every consumer's chunk.
  */
 
+import type { AppMessage } from "../i18n/appMessages";
+
 const ONTOLOGY_TYPE_DISPLAY: Record<
   string,
   { label: string; color: "blue" | "green" | "grey" }
@@ -25,6 +27,32 @@ export function ontologyTypeDisplay(type?: string | null): {
 } {
   if (!type) return { label: "Unknown", color: "grey" };
   return ONTOLOGY_TYPE_DISPLAY[type] ?? { label: type, color: "grey" };
+}
+
+/** Catalogue message for each label `ontologyTypeDisplay` can return. */
+export const ONTOLOGY_TYPE_MESSAGES: Readonly<Record<string, AppMessage>> = {
+  Induced: "Induced",
+  Foundational: "Foundational",
+  Uploaded: "Uploaded",
+  Unknown: "Unknown",
+};
+
+/**
+ * The ontology type label in the reader's locale. A type this console does not
+ * know is shown raw, as `ontologyTypeDisplay` does.
+ */
+export function localizeOntologyType(
+  type: string | null | undefined,
+  t: (message: AppMessage) => string,
+): string {
+  const { label } = ontologyTypeDisplay(type);
+  const message = Object.prototype.hasOwnProperty.call(
+    ONTOLOGY_TYPE_MESSAGES,
+    label,
+  )
+    ? ONTOLOGY_TYPE_MESSAGES[label]
+    : undefined;
+  return message ? t(message) : label;
 }
 
 /** Which segment of the type filter a given ontology_type belongs to. */

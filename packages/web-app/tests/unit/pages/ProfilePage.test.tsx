@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { vi, describe, it, expect, beforeEach } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import React from "react";
 import { ProfilePage } from "../../../src/pages/ProfilePage";
+import { LocaleProvider } from "../../../src/i18n/LocaleProvider";
 
 const mockUseUser = vi.fn();
 const mockUseListPrincipalGrants = vi.fn();
@@ -150,5 +151,48 @@ describe("ProfilePage", () => {
     render(<ProfilePage />);
 
     expect(screen.getByText("Namespaces (1)")).toBeInTheDocument();
+  });
+
+  it("shows the grant's principal type in Japanese", async () => {
+    window.localStorage.setItem("scl.locale", "ja");
+    mockUseUser.mockReturnValue({
+      user: { userid: "u1", name: "Alice", email: "a@b.com", groups: ["eng"] },
+      logout: vi.fn(),
+    });
+    mockUseListPrincipalGrants.mockReturnValue({
+      data: {
+        grants: [
+          {
+            grantId: "g1",
+            namespaceId: "ns-1",
+            principalType: "Group",
+            principalId: "eng",
+            role: "analyst",
+            grantedAt: "2026-05-01T10:00:00Z",
+          },
+        ],
+      },
+      isLoading: false,
+    });
+    try {
+      render(
+        <LocaleProvider>
+          <ProfilePage />
+        </LocaleProvider>,
+      );
+      // The locale bundle loads asynchronously and re-renders the table, so
+      // read the row from the settled DOM.
+      await waitFor(() => {
+        const row = screen.getByText("analyst").closest("tr");
+        expect(row).not.toBeNull();
+        expect(
+          within(row as HTMLElement).getByText("グループ"),
+        ).toBeInTheDocument();
+      });
+      expect(screen.queryByText("Group")).toBeNull();
+    } finally {
+      window.localStorage.clear();
+      document.documentElement.lang = "";
+    }
   });
 });

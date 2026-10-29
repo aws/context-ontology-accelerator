@@ -118,3 +118,97 @@ def test_unit_tests_reaching_outside_tests_unit_skip_when_the_path_is_absent() -
         "mirror without a module-level skip. Add: "
         "if not _SCRIPT.exists(): pytest.skip(..., allow_module_level=True)"
     )
+
+
+# Directories and files that ship to the public mirror and carry install instructions.
+_MIRRORED_INSTRUCTION_SOURCES = ("README.md", "docs", "external-docs", "scripts")
+
+
+def _mirrored_files_mentioning(needle: str) -> list[str]:
+    """Mirrored docs and scripts containing `needle`, as repo-relative paths."""
+    hits = []
+    for entry in _MIRRORED_INSTRUCTION_SOURCES:
+        root = _REPO_ROOT / entry
+        candidates = [root] if root.is_file() else sorted(root.rglob("*"))
+        for path in candidates:
+            if not path.is_file():
+                continue
+            try:
+                if needle in path.read_text():
+                    hits.append(str(path.relative_to(_REPO_ROOT)))
+            except UnicodeDecodeError:
+                continue
+    return hits
+
+
+def test_mise_config_ships_if_any_mirrored_file_says_to_run_mise_install() -> None:
+    """`mise install` without a mirrored .mise.toml installs nothing, silently.
+
+    mise reads its tool versions from .mise.toml. The root .npmignore is a
+    fail-closed allowlist, so a config file is absent from the mirror unless it is
+    named there. Ship the instruction without the config and the reader's
+    `mise install` is a no-op, after which scripts/preflight-deploy.sh fails on a
+    missing Node and points them back at the command that did nothing.
+    """
+    callers = _mirrored_files_mentioning("mise install")
+    if not callers:
+        pytest.skip("no mirrored file instructs `mise install`")
+
+    npmignore = (_REPO_ROOT / ".npmignore").read_text()
+    assert re.search(r"^!/\.mise\.toml$", npmignore, re.MULTILINE), (
+        f"{callers} instruct `mise install`, but .npmignore does not re-include "
+        "/.mise.toml, so the public mirror ships the instruction without the file "
+        "it reads. Add '!/.mise.toml' to the root config allowlist."
+    )
+
+
+# Host build output that must never reach a Docker build context. `*.egg-info` is the
+# one with teeth: setuptools writes it under an allowlisted `src/`, so its presence
+# changes the asset hash of every image built from the repo root.
+_HOST_BUILD_OUTPUT = ("**/*.egg-info", "**/.venv", "**/.ruff_cache", "**/.mypy_cache")
+
+
+def _ignore_entries(path: Path) -> list[str]:
+    """Non-comment, non-blank lines of an ignore file, in file order."""
+    return [line.strip() for line in path.read_text().splitlines() if line.strip() and not line.strip().startswith("#")]
+
+
+def _assert_excluded_below_every_reinclude(path: Path, patterns: tuple[str, ...]) -> None:
+    """Require `patterns` to be present and to sit below every `!` re-include.
+
+    Docker and npm both apply the *last* matching pattern, so an exclusion placed
+    above a later `!` line is silently overridden by it.
+    """
+    entries = _ignore_entries(path)
+
+    missing = [p for p in patterns if p not in entries]
+    assert not missing, f"{path.name} no longer excludes {missing}"
+
+    last_reinclude = max((i for i, e in enumerate(entries) if e.startswith("!")), default=-1)
+    overridden = [p for p in patterns if entries.index(p) < last_reinclude]
+    assert not overridden, (
+        f"{path.name} lists {overridden} above a later '!' re-include "
+        f"({entries[last_reinclude]!r}), which therefore wins and ships the paths again. "
+        "Move the exclusions below every '!' line."
+    )
+
+
+def test_dockerignore_excludes_host_build_output() -> None:
+    """A local build must not change the Docker build context.
+
+    Five of the six image assets use the repo root as their build context. Anything
+    a local `pip install`, `ruff` or `mypy` run leaves under an allowlisted `src/`
+    therefore shifts their asset hashes, and the next deploy rebuilds and re-pushes
+    all five with no source change.
+    """
+    _assert_excluded_below_every_reinclude(_REPO_ROOT / ".dockerignore", _HOST_BUILD_OUTPUT)
+
+
+def test_npmignore_keeps_maven_output_out_of_the_public_mirror() -> None:
+    """Compiled connector jars must not ship to the public mirror.
+
+    `connectors/` is published on purpose and is a Maven reactor, so packing a tree
+    where anyone has run the build would otherwise push its `target/` jars to the
+    public repository.
+    """
+    _assert_excluded_below_every_reinclude(_REPO_ROOT / ".npmignore", ("**/target/",))

@@ -92,6 +92,7 @@ from coa_serve.tier3.agentic.ontology.source import OntologyFileSource
 from coa_serve.tier3.agentic.retriever import AgenticRetriever
 from coa_serve.tier3.agentic.tools import ToolRegistry
 from coa_serve.tier3.agentic.tools.base import ToolResult
+from coa_serve.tier3.agentic.tools.chunk_tool import ChunkExpansionTool
 from coa_serve.tier3.synthesizer import SynthesisResult
 from coa_serve.trace import TraceCollector
 
@@ -862,6 +863,61 @@ class TestPartialHonestyProperty:
 
         assert result.partial is True
         assert any(d["source"] == "strategy:bad" and d["reason"] == "error" for d in result.degraded_sources)
+
+    async def test_real_chunk_window_mixed_provenance_marks_partial_and_retains_valid_evidence(self, monkeypatch):
+        monkeypatch.setattr(
+            ChunkExpansionTool,
+            "_format_label",
+            staticmethod(lambda namespace, label: f"`{label}{namespace}__`"),
+        )
+        chunk_window = ChunkExpansionTool("neptune-db://fake-host:8182")
+        chunk_window._store = type(
+            "_Store",
+            (),
+            {
+                "execute_query_with_retry": staticmethod(
+                    lambda cypher, params: [
+                        {
+                            "chunkId": "valid-neighbor",
+                            "text": "Grounded adjacent evidence.",
+                            "sourceDocumentId": "source-42",
+                            "sourceFilename": "annual-report.pdf",
+                        },
+                        {
+                            "chunkId": "anonymous-neighbor",
+                            "text": "This row has no source document.",
+                        },
+                    ]
+                )
+            },
+        )()
+        planner = ScriptedPlanner(
+            [
+                [
+                    PlannerDecision(
+                        tool_name="chunk_window",
+                        inputs={"chunk_ids": ["seed"], "hops": 1, "limit": 10},
+                    )
+                ]
+            ],
+            sufficiency=[True],
+        )
+        retriever = make_retriever(
+            decomposer=FakeDecomposer([SubQuestion(text="root")]),
+            planner=planner,
+            tools=[chunk_window],
+            synthesizer=FakeSynthesizer(),
+            clock_source=FakeClockSource(),
+        )
+
+        result = await retriever.resolve("q", NS, trace=TraceCollector())
+
+        assert result.partial is True
+        assert [item["chunkId"] for item in result.supporting_content] == ["valid-neighbor"]
+        assert result.degraded_sources == ({"source": "chunk_window", "reason": "missing_document_provenance"},)
+        chunk_steps = [step for step in result.trace_steps if step["step"] == "chunk_window"]
+        assert chunk_steps[0]["status"] == "degraded"
+        assert "dropped 1 anonymous or malformed document chunk(s)" in chunk_steps[0]["detail"]
 
     async def test_partial_set_when_no_context_was_gathered(self):
         # The planner can select no Tool, so no context is ever gathered; the

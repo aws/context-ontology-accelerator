@@ -520,7 +520,7 @@ class TestGetGraphSchema:
 
         store = _make_store(mock_client)
 
-        with pytest.raises(ValueError, match="zero class entries"):
+        with pytest.raises(ValueError, match="zero class entries.*re-ingest the document source"):
             store.get_graph_schema()
 
     def test_raises_value_error_on_empty_pg_schema(self):

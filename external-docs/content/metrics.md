@@ -77,6 +77,42 @@ Current constraints to factor into the decision:
 in the [API Reference](#/api-reference) for the full request/response schema.
 Create calls are retry-safe with an optional `clientToken` — see [Retrying Creates Safely](namespaces.md#retrying-creates-safely).
 
+An optional `label` gives the metric a display name in any script, such as
+`売上合計` next to `revenue_total`. It is display-only: nothing matches on it, so
+put the terms questions use in `aiContext.synonyms`. The rules are a string of
+1-256 code points after Unicode NFC normalization, with at least one visible
+character and no control characters, bidi embeddings, overrides or isolates,
+invisible format characters, `<` or `>` (the full list is under
+[label rules](#label-rules)). `PUT` on a
+metric is a full replace, so an update that leaves `label` out, or sends `null`,
+clears it. A read-modify-write must send the label it read back unchanged.
+
+The console does not show or edit labels yet. Set them through the API or an
+[OSI import](#bulk-import-osi-format). Saving a metric from the console's edit
+form keeps its existing label.
+
+#### Label rules
+
+The server stores a label in Unicode NFC and counts the 256 limit in code points
+after that normalization. A few characters get longer in NFC: Devanagari क़
+(U+0958), for example, becomes two code points, so a label of 200 such
+characters counts as 400 and is rejected. A label is also rejected when it
+contains any of these:
+
+- `<` or `>`
+- control characters (including a trailing newline), line or paragraph
+  separators, unpaired surrogates and noncharacters
+- these format characters, which renderers hide: U+00AD (soft hyphen), U+180E,
+  U+200B (zero width space), U+202A-202E (bidi embeddings and overrides),
+  U+2060-206F (word joiner, invisible operators, bidi isolates), U+FEFF (BOM),
+  U+FFF9-FFFB, U+1BCA0-1BCA3, U+1D173-1D17A and U+E0000-E007F (tags)
+
+ZWJ, ZWNJ, LRM, RLM and ALM are allowed, since some scripts need them. A label
+must also contain at least one visible character, so a label made only of
+spaces, combining marks, allowed format characters or unassigned code points is
+rejected. The error names the first rejected code point, such as `U+200B`, but
+never repeats the label.
+
 ## Metric Validation
 
 Before saving, metrics are validated through multiple checks. Validation is
@@ -284,11 +320,21 @@ metrics:
 | `return_type`       | no       | Scalar type of the result (e.g. `decimal`, `integer`).                                                             |
 | `time_dimension`    | no       | Default time grain: one of `day`, `week`, `month`, `quarter`, `year`.                                              |
 | `ontology_concepts` | no       | Ontology classes this metric governs (`:governedMetricFor`). Validated against the published ontology by Check 6.  |
+| `label`             | no       | Display-only label for showing beside `name` (the console does not show it yet). Put matching terms in `synonyms`. |
 
 \* If the document has exactly one `datasets` entry, `data_source_id` is
 inferred from it, and a missing `source_table` defaults to the metric name. Both
 fallbacks are reported as warnings in the import response; declare them
 explicitly.
+
+`label` follows the same rules as the API's `label` field (see
+[label rules](#label-rules)). A `label` that breaks a
+rule (including a non-string such as `label: yes`) fails that metric only.
+`null` or a missing key means no label. Import replaces existing metrics, so
+re-importing a file without `label` clears the label, and the overwrite warning
+says so. A `label` at the top level of a metric, outside `custom_extensions`, is
+ignored with a warning. COA versions before labels existed ignore the key, so
+importing a newer export there drops labels without a warning.
 
 Vendor-prefixed top-level keys such as `x_coa:` are **not** part of OSI and are
 ignored. The importer emits a warning naming the key when it sees one, and the
@@ -338,9 +384,14 @@ SQL when extending your definition. An expression alone does not say that
 |-----------|-----|-------------|
 | List | `GET /namespaces/{ns}/metrics` | All metrics in the namespace |
 | Get | `GET /namespaces/{ns}/metrics/{name}` | Single metric detail |
-| Update | `PUT /namespaces/{ns}/metrics/{name}` | Modify expression, description |
+| Update | `PUT /namespaces/{ns}/metrics/{name}` | Replace the whole definition: optional fields left out, including `label`, are cleared |
 | Delete | `DELETE /namespaces/{ns}/metrics/{name}` | Remove a metric |
 | Validate | `POST /namespaces/{ns}/metrics/validate` | Check without saving |
+
+The list returns 50 metrics per page by default and at most 200. A `maxResults`
+above 200 is reduced to 200 rather than rejected, for compatibility with
+existing callers; page with `nextToken` for the rest. A value below 1, or one
+that is not an integer, returns `400`.
 
 ## Best Practices
 

@@ -1,6 +1,8 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import { createHash } from "node:crypto";
+
 import * as cdk from "aws-cdk-lib";
 import { Construct, Node } from "constructs";
 import {
@@ -10,6 +12,8 @@ import {
   CTX_GRAPH_BASE_URI,
   CTX_EVENT_SOURCE_PREFIX,
   CTX_LAMBDA_RESERVED_CONCURRENCY,
+  CTX_GUARDRAIL_TIER,
+  CTX_GUARDRAIL_PROFILE,
   DEFAULT_RESOURCE_PREFIX,
   DEFAULT_ENV,
   DEFAULT_PROJECT_TAG,
@@ -97,6 +101,29 @@ export function prefixed(node: Node, name: string): string {
   return `${prefix}-${envName}-${name}`;
 }
 
+/** Longest name OpenSearch Serverless accepts for a collection or policy. */
+export const AOSS_NAME_MAX_LENGTH = 32;
+
+/**
+ * `prefixed(name)` for an OpenSearch Serverless collection or policy, which
+ * must be at most 32 characters. A name that fits is returned unchanged, so
+ * existing deployments keep their names and nothing is replaced. A longer one
+ * (a long `resource_prefix` or env name) keeps its leading characters and ends
+ * in a short hash of the full name, so it stays unique and stable per
+ * deployment.
+ */
+export function aossName(node: Node, name: string): string {
+  const full = prefixed(node, name);
+  if (full.length <= AOSS_NAME_MAX_LENGTH) {
+    return full;
+  }
+  const hash = createHash("sha256").update(full).digest("hex").slice(0, 6);
+  const head = full
+    .slice(0, AOSS_NAME_MAX_LENGTH - hash.length - 1)
+    .replace(/-+$/, "");
+  return `${head}-${hash}`;
+}
+
 /**
  * ARN of the platform Lambda named `prefixed(name)` in the caller's account and
  * region. Lets a stack address another stack's function by its fixed name,
@@ -156,4 +183,87 @@ export function resolveLambdaReservedConcurrency(
     );
   }
   return value === 0 ? undefined : value;
+}
+
+/** Resolved Bedrock Guardrails safeguard tier (see {@link resolveGuardrailTier}). */
+export interface GuardrailTier {
+  /** CloudFormation tier name for the content and topic policies. */
+  readonly tierName: "CLASSIC" | "STANDARD";
+  /**
+   * System-defined guardrail profile id. Always set for the Standard tier; on
+   * Classic it only grants the callers' IAM (see {@link resolveGuardrailTier}).
+   */
+  readonly profileId?: string;
+}
+
+const GUARDRAIL_PROFILE_ID = /^[a-z]+(?:-[a-z]+)*\.guardrail\.v[0-9]+:[0-9]+$/;
+
+/**
+ * Resolve the `guardrail_tier` / `guardrail_profile` context pair.
+ *
+ * The default is the Classic tier, which is what an unset tier has always
+ * produced. Classic content filters support English, French and Spanish only:
+ * a Japanese prompt injection is not detected (#1255). The Standard tier
+ * supports more languages but requires cross-Region inference through a
+ * system-defined guardrail profile, so the screened text can be processed in
+ * any destination Region of that profile (for example `apac.guardrail.v1:0`
+ * from ap-northeast-1 also routes to ap-northeast-2/3, ap-south-1 and
+ * ap-southeast-1/2). That is a data residency decision per deployment, so the
+ * Standard tier is opt-in and needs the profile named explicitly.
+ *
+ * A profile with the Classic tier is allowed on purpose: it grants the callers'
+ * IAM on the profile without changing the guardrails. The guardrail stack
+ * deploys before the stacks whose roles call it, so switching an existing
+ * deployment straight to Standard leaves those roles without the profile
+ * permission until their stacks update, and every ApplyGuardrail in between
+ * fails with AccessDeniedException. Deploying with the profile first and the
+ * tier second avoids that window.
+ *
+ * Throws at synth time on an unknown tier, a Standard tier without a profile,
+ * or a malformed profile id.
+ */
+export function resolveGuardrailTier(node: Node): GuardrailTier {
+  const rawTier: unknown = node.tryGetContext(CTX_GUARDRAIL_TIER);
+  const rawProfile: unknown = node.tryGetContext(CTX_GUARDRAIL_PROFILE);
+  const tier = String(rawTier ?? "classic")
+    .trim()
+    .toLowerCase();
+  const profile =
+    rawProfile === undefined || rawProfile === null
+      ? ""
+      : String(rawProfile).trim();
+  if (tier !== "classic" && tier !== "standard") {
+    throw new Error(
+      `${CTX_GUARDRAIL_TIER} must be "classic" or "standard", got: ${String(rawTier)}`,
+    );
+  }
+  if (profile && !GUARDRAIL_PROFILE_ID.test(profile)) {
+    throw new Error(
+      `${CTX_GUARDRAIL_PROFILE} must be a system-defined guardrail profile id such as "apac.guardrail.v1:0", got: ${String(rawProfile)}`,
+    );
+  }
+  if (tier === "standard" && !profile) {
+    throw new Error(
+      `${CTX_GUARDRAIL_TIER}=standard needs ${CTX_GUARDRAIL_PROFILE} set to a system-defined guardrail profile id such as "apac.guardrail.v1:0"`,
+    );
+  }
+  return {
+    tierName: tier === "standard" ? "STANDARD" : "CLASSIC",
+    ...(profile ? { profileId: profile } : {}),
+  };
+}
+
+/**
+ * Extra IAM resources a role that calls a guardrail needs.
+ *
+ * Empty when no profile is set. With a profile, ApplyGuardrail (and Converse
+ * with a guardrail) must also be allowed on the guardrail profile in every
+ * destination Region, so the ARN uses a Region wildcard rather than listing the
+ * profile's current destinations, which AWS can extend.
+ */
+export function guardrailProfileResources(scope: Construct): string[] {
+  const { profileId } = resolveGuardrailTier(scope.node);
+  if (!profileId) return [];
+  const account = cdk.Stack.of(scope).account;
+  return [`arn:aws:bedrock:*:${account}:guardrail-profile/${profileId}`];
 }

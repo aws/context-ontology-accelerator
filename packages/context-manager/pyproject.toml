@@ -1,6 +1,6 @@
 [project]
 name = "coa-serve"
-version = "0.3.7"
+version = "0.3.8"
 description = "Serve layer Context Manager — query orchestration"
 requires-python = ">=3.12"
 
@@ -16,7 +16,7 @@ dependencies = [
     "structlog>=24.0",
     "pydantic>=2.13.4",
     "PyJWT>=2.13.0",
-    "strands-agents>=1.19.0",
+    "strands-agents>=1.43.0",
     "opensearch-py>=2.5",
     "requests-aws4auth>=1.3",
     "sqlalchemy[asyncio]>=2.0",

@@ -63,9 +63,14 @@ def _fake_entity(uri: str = "urn:e:amazon", label: str = "Amazon", type: str = "
     return SimpleNamespace(uri=uri, label=label, type=type)
 
 
-def _baseline_result(*, chunks=(), entities=(), trace_steps=()):
+def _baseline_result(*, chunks=(), entities=(), trace_steps=(), dropped_anonymous_chunks=0):
     """A ``BaselineResult``-shaped stand-in."""
-    return SimpleNamespace(chunks=tuple(chunks), entities=tuple(entities), trace_steps=tuple(trace_steps))
+    return SimpleNamespace(
+        chunks=tuple(chunks),
+        entities=tuple(entities),
+        trace_steps=tuple(trace_steps),
+        dropped_anonymous_chunks=dropped_anonymous_chunks,
+    )
 
 
 class FakeStrategy:
@@ -231,6 +236,30 @@ class TestDegradedNeverRaises:
         assert out.chunks == () and out.entities == ()
         assert "degraded" in out.detail
         assert "TimeoutError" in out.detail
+        assert out.degraded_reason == "timeout"
+
+    async def test_adapter_degraded_trace_step_surfaces_provenance_drop(self):
+        lexical = FakeLexical(
+            _baseline_result(
+                chunks=(_fake_chunk(),),
+                dropped_anonymous_chunks=3,
+                trace_steps=(
+                    {
+                        "step": "lexical_baseline_retrieve",
+                        "status": "degraded",
+                        "durationMs": 10,
+                        "detail": "1 node retained; dropped 3 anonymous chunks",
+                    },
+                ),
+            )
+        )
+        tool = RetrievalStrategyTool(_real_strategy("entity_based"), lexical)
+
+        out = await tool.invoke(namespace="ns", query="q")
+
+        assert len(out.chunks) == 1
+        assert out.degraded_reason == "missing_document_provenance"
+        assert "dropped 3 anonymous chunks" in out.detail
 
     async def test_adapter_raising_is_caught_and_degraded(self):
         """Even if the adapter unexpectedly raises, the Tool never propagates it."""
@@ -242,6 +271,7 @@ class TestDegradedNeverRaises:
         assert out.chunks == () and out.entities == ()
         assert "error" in out.detail
         assert "RuntimeError" in out.detail
+        assert out.degraded_reason == "error"
 
 
 # ── Builder: one tool per strategy (Req 2.2) ───────────────────────

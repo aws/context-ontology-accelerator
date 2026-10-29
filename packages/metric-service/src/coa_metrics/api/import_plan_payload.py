@@ -8,13 +8,49 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from typing import Any
 
+from coa_metrics.api.contract import check_metric_label
 from coa_metrics.api.import_job_store import MetricDisposition
 from coa_metrics.neptune_client import MetricAiContext, MetricDefinition, MetricDialect
 
-_PLAN_SCHEMA_VERSION = 2
+# Schema v3 adds the definition's ``label``. A plan is written at the lowest
+# version that can hold it: v2 (byte-identical to what a pre-label worker
+# writes) when no metric in the offset has a label, v3 only when one does.
+# This worker reads both, so jobs planned before a deploy finish after it.
+#
+# After a rollback, a pre-label worker rejects a v3 plan ("unsupported offset
+# plan payload schema version 3"), so only imports that carry labels are
+# affected. The error propagates out of the handler: SQS retries the offset up
+# to the queue's maxReceiveCount, import_dlq_handler redrives it once, and on
+# the second exhaustion the job is marked FAILED with the generic
+# recovery-exhausted error. By the queue settings that is roughly three hours
+# (computed from the configuration, not measured); rolling forward again within
+# that window lets the job finish. Offsets the job had not planned yet are
+# planned by the old worker, which has no label field, so those metrics are
+# imported without their labels.
+_PLAN_SCHEMA_VERSION = 3
+_PLAN_SCHEMA_VERSION_WITHOUT_LABELS = 2
+_READABLE_PLAN_SCHEMA_VERSIONS = frozenset({2, 3})
+_DEFINITION_KEYS_V2 = frozenset(
+    {
+        "name",
+        "description",
+        "expressionDialects",
+        "dataSourceId",
+        "sourceTable",
+        "defaultTimeGrain",
+        "unit",
+        "returnType",
+        "aiContext",
+        "ontologyConcepts",
+        "definedBy",
+        "effectiveFrom",
+    }
+)
+_DEFINITION_KEYS_V3 = _DEFINITION_KEYS_V2 | {"label"}
 
 
 @dataclass(frozen=True)
@@ -88,13 +124,15 @@ class OffsetPlanPayload:
 
 
 def canonical_plan_payload_bytes(plan: OffsetPlanPayload) -> bytes:
-    """Return the schema-v2 plan as deterministic UTF-8 JSON bytes."""
+    """Return the current-schema plan as deterministic UTF-8 JSON bytes."""
     if not isinstance(plan, OffsetPlanPayload):
         raise ValueError("plan must be an OffsetPlanPayload")
+    with_label = any(entry.definition is not None and entry.definition.label is not None for entry in plan.entries)
+    schema_version = _PLAN_SCHEMA_VERSION if with_label else _PLAN_SCHEMA_VERSION_WITHOUT_LABELS
     value = {
-        "schemaVersion": _PLAN_SCHEMA_VERSION,
+        "schemaVersion": schema_version,
         "offset": plan.offset,
-        "entries": [_serialize_entry(entry) for entry in plan.entries],
+        "entries": [_serialize_entry(entry, with_label=with_label) for entry in plan.entries],
     }
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
 
@@ -110,14 +148,14 @@ def parse_plan_payload(data: bytes) -> OffsetPlanPayload:
 
     root = _exact_mapping(raw, {"schemaVersion", "offset", "entries"}, "offset plan payload")
     schema_version = _integer(root["schemaVersion"], "offset plan payload schemaVersion")
-    if schema_version != _PLAN_SCHEMA_VERSION:
+    if schema_version not in _READABLE_PLAN_SCHEMA_VERSIONS:
         raise ValueError(f"unsupported offset plan payload schema version {schema_version}")
     offset = _non_negative_integer(root["offset"], "offset plan payload offset")
     raw_entries = root["entries"]
     if not isinstance(raw_entries, list) or not raw_entries:
         raise ValueError("offset plan payload entries must be a non-empty list")
 
-    entries = tuple(_parse_entry(raw_entry, index) for index, raw_entry in enumerate(raw_entries))
+    entries = tuple(_parse_entry(raw_entry, index, schema_version) for index, raw_entry in enumerate(raw_entries))
     return OffsetPlanPayload(offset=offset, entries=entries)
 
 
@@ -128,18 +166,20 @@ def plan_payload_sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _serialize_entry(entry: PlannedMetric) -> dict[str, Any]:
+def _serialize_entry(entry: PlannedMetric, *, with_label: bool) -> dict[str, Any]:
     return {
         "sourceIndex": entry.source_index,
         "name": entry.name,
         "disposition": entry.disposition.value,
-        "definition": _serialize_definition(entry.definition) if entry.definition is not None else None,
+        "definition": (
+            _serialize_definition(entry.definition, with_label=with_label) if entry.definition is not None else None
+        ),
         "warning": entry.warning,
         "error": entry.error,
     }
 
 
-def _serialize_definition(definition: MetricDefinition) -> dict[str, Any]:
+def _serialize_definition(definition: MetricDefinition, *, with_label: bool) -> dict[str, Any]:
     _validate_metric_definition(definition)
     ai_context = None
     if definition.ai_context is not None:
@@ -148,7 +188,7 @@ def _serialize_definition(definition: MetricDefinition) -> dict[str, Any]:
             "instructions": definition.ai_context.instructions,
             "examples": list(definition.ai_context.examples),
         }
-    return {
+    serialized = {
         "name": definition.name,
         "description": definition.description,
         "expressionDialects": [
@@ -164,9 +204,12 @@ def _serialize_definition(definition: MetricDefinition) -> dict[str, Any]:
         "definedBy": definition.defined_by,
         "effectiveFrom": definition.effective_from,
     }
+    if with_label:
+        serialized["label"] = definition.label
+    return serialized
 
 
-def _parse_entry(value: object, index: int) -> PlannedMetric:
+def _parse_entry(value: object, index: int, schema_version: int) -> PlannedMetric:
     entry = _exact_mapping(
         value,
         {"sourceIndex", "name", "disposition", "definition", "warning", "error"},
@@ -185,7 +228,7 @@ def _parse_entry(value: object, index: int) -> PlannedMetric:
         raise ValueError(f"offset plan payload entry {index} has unknown disposition {raw_disposition!r}") from exc
 
     raw_definition = entry["definition"]
-    definition = None if raw_definition is None else _parse_definition(raw_definition, index)
+    definition = None if raw_definition is None else _parse_definition(raw_definition, index, schema_version)
     warning = _optional_string(entry["warning"], f"offset plan payload entry {index} warning")
     error = _optional_string(entry["error"], f"offset plan payload entry {index} error")
     try:
@@ -201,26 +244,10 @@ def _parse_entry(value: object, index: int) -> PlannedMetric:
         raise ValueError(f"offset plan payload entry {index} is invalid: {exc}") from exc
 
 
-def _parse_definition(value: object, entry_index: int) -> MetricDefinition:
+def _parse_definition(value: object, entry_index: int, schema_version: int) -> MetricDefinition:
     description = f"offset plan payload entry {entry_index} definition"
-    definition = _exact_mapping(
-        value,
-        {
-            "name",
-            "description",
-            "expressionDialects",
-            "dataSourceId",
-            "sourceTable",
-            "defaultTimeGrain",
-            "unit",
-            "returnType",
-            "aiContext",
-            "ontologyConcepts",
-            "definedBy",
-            "effectiveFrom",
-        },
-        description,
-    )
+    keys = _DEFINITION_KEYS_V2 if schema_version == 2 else _DEFINITION_KEYS_V3
+    definition = _exact_mapping(value, keys, description)
 
     raw_dialects = definition["expressionDialects"]
     if not isinstance(raw_dialects, list) or not raw_dialects:
@@ -278,6 +305,7 @@ def _parse_definition(value: object, entry_index: int) -> MetricDefinition:
         ontology_concepts=concepts,
         defined_by=_optional_string(definition["definedBy"], f"{description} definedBy"),
         effective_from=_optional_string(definition["effectiveFrom"], f"{description} effectiveFrom"),
+        label=_optional_string(definition.get("label"), f"{description} label"),
     )
     _validate_metric_definition(metric)
     return metric
@@ -299,6 +327,9 @@ def _validate_metric_definition(definition: MetricDefinition) -> None:
         _string(dialect.expression, f"definition expression_dialects entry {index} expression", non_empty=True)
     for field_name in ("default_time_grain", "unit", "return_type", "defined_by", "effective_from"):
         _optional_string(getattr(definition, field_name), f"definition {field_name}")
+    label_error = check_metric_label(definition.label, "definition label")
+    if label_error:
+        raise ValueError(label_error)
     if not isinstance(definition.ontology_concepts, list):
         raise ValueError("definition ontology_concepts must be a list")
     for index, concept in enumerate(definition.ontology_concepts):
@@ -320,7 +351,7 @@ def _mapping_without_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, A
     return value
 
 
-def _exact_mapping(value: object, keys: set[str], description: str) -> Mapping[str, Any]:
+def _exact_mapping(value: object, keys: AbstractSet[str], description: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise ValueError(f"{description} must be an object")
     if set(value) != keys:

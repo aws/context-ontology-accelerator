@@ -13,6 +13,31 @@ GENERATED_DIR="$REPO_ROOT/smithy-generated"
 # openapi-generator version for Python server models
 OPENAPI_GENERATOR_VERSION="7.12.0"
 
+# ── Optional Maven Central pull-through cache (CodeArtifact) ─────────────────
+# CI sets CODEARTIFACT_MAVEN_URL so Gradle and the openapi-generator download go
+# through a CodeArtifact cache of Maven Central instead of hitting Maven Central's
+# per-IP rate limit (HTTP 429) from shared runners. Unset (local, forks) -> Maven
+# Central as before. The URL must be a CodeArtifact Maven endpoint, so the token is
+# never sent anywhere else; if no token can be fetched, warn and use Maven Central.
+CODEARTIFACT_URL_RE='^https://([a-z0-9-]+)-([0-9]{12})\.d\.codeartifact\.([a-z0-9-]+)\.amazonaws\.com/maven/[A-Za-z0-9._-]+/$'
+if [ -n "${CODEARTIFACT_MAVEN_URL:-}" ]; then
+    if [[ ! "$CODEARTIFACT_MAVEN_URL" =~ $CODEARTIFACT_URL_RE ]]; then
+        echo "✗ CODEARTIFACT_MAVEN_URL is not a CodeArtifact Maven endpoint (https://<domain>-<account>.d.codeartifact.<region>.amazonaws.com/maven/<repo>/)"
+        exit 1
+    fi
+    if [ -z "${CODEARTIFACT_AUTH_TOKEN:-}" ]; then
+        if CODEARTIFACT_AUTH_TOKEN="$(aws codeartifact get-authorization-token \
+                --domain "${BASH_REMATCH[1]}" --domain-owner "${BASH_REMATCH[2]}" \
+                --region "${BASH_REMATCH[3]}" --query authorizationToken --output text)"; then
+            export CODEARTIFACT_AUTH_TOKEN
+            echo "✓ Using Maven pull-through cache: $CODEARTIFACT_MAVEN_URL"
+        else
+            echo "⚠ Could not get a CodeArtifact token; falling back to Maven Central"
+            unset CODEARTIFACT_MAVEN_URL CODEARTIFACT_AUTH_TOKEN
+        fi
+    fi
+fi
+
 # Fingerprint the inputs BEFORE generating: the stamp written at the end then
 # describes exactly what this run read, even if a model is edited mid-run.
 INPUTS_HASH="$("$REPO_ROOT/scripts/smithy-fingerprint.sh" hash "$REPO_ROOT")"
@@ -134,8 +159,14 @@ OPENAPI_GEN_JAR="${OPENAPI_GENERATOR_HOME:-$HOME/.local/share/openapi-generator}
 if [ ! -f "$OPENAPI_GEN_JAR" ]; then
     echo "Downloading openapi-generator-cli ${OPENAPI_GENERATOR_VERSION}..."
     mkdir -p "$(dirname "$OPENAPI_GEN_JAR")"
-    curl -sfL -o "$OPENAPI_GEN_JAR" \
-        "https://repo1.maven.org/maven2/org/openapitools/openapi-generator-cli/${OPENAPI_GENERATOR_VERSION}/openapi-generator-cli-${OPENAPI_GENERATOR_VERSION}.jar"
+    OPENAPI_GEN_PATH="org/openapitools/openapi-generator-cli/${OPENAPI_GENERATOR_VERSION}/openapi-generator-cli-${OPENAPI_GENERATOR_VERSION}.jar"
+    if [ -n "${CODEARTIFACT_MAVEN_URL:-}" ]; then
+        # Credentials via a config on stdin, so the token stays out of argv.
+        printf 'user = "aws:%s"\n' "$CODEARTIFACT_AUTH_TOKEN" \
+            | curl -sfL -K - -o "$OPENAPI_GEN_JAR" "${CODEARTIFACT_MAVEN_URL}${OPENAPI_GEN_PATH}"
+    else
+        curl -sfL -o "$OPENAPI_GEN_JAR" "https://repo1.maven.org/maven2/${OPENAPI_GEN_PATH}"
+    fi
     echo "✓ openapi-generator downloaded"
 else
     echo "✓ openapi-generator found at $OPENAPI_GEN_JAR"

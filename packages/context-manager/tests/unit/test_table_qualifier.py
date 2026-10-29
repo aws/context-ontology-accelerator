@@ -853,3 +853,21 @@ class TestRealTables:
         parsed = sqlglot.parse_one(sql, dialect="trino")
         names = sorted(f"{t.db}.{t.name}" for t in real_tables(parsed))
         assert names == ["crm.customers", "sales.orders"]
+
+    def test_cte_body_reference_to_its_own_name_is_the_real_table(self):
+        # Non-recursive: the CTE's name is not bound inside its own body, so the
+        # inner `customers` reads the real table and must be checked like one.
+        sql = "WITH customers AS (SELECT * FROM customers WHERE tier = 'gold') SELECT COUNT(*) FROM customers"
+        parsed = sqlglot.parse_one(sql, dialect="trino")
+        assert [t.name for t in real_tables(parsed)] == ["customers"]
+        assert ambiguous_reference(sql, {"customers": {AMBIGUOUS_KEY: "crm.customers,sales.customers"}}) is not None
+
+    def test_earlier_cte_used_in_a_later_cte_body_stays_a_cte(self):
+        sql = "WITH a AS (SELECT * FROM crm.customers), b AS (SELECT * FROM a) SELECT * FROM b"
+        parsed = sqlglot.parse_one(sql, dialect="trino")
+        assert [f"{t.db}.{t.name}" for t in real_tables(parsed)] == ["crm.customers"]
+
+    def test_recursive_cte_self_reference_stays_a_cte(self):
+        sql = "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 3) SELECT x FROM n"
+        parsed = sqlglot.parse_one(sql, dialect="trino")
+        assert real_tables(parsed) == []

@@ -64,6 +64,7 @@ from coa_control_plane_server.models.list_ontologies_response_content import (
 from coa_control_plane_server.models.ontology_record import (
     OntologyRecord as _OntologyRecord,
 )
+from coa_control_plane_server.models.ontology_type import OntologyType
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import Response
 
@@ -86,8 +87,9 @@ from coa_ontology.catalog.schemas import (
     PropertyExtract,
     UnresolvedReference,
 )
-from coa_ontology.catalog.turtle_export import format_grouped_turtle
+from coa_ontology.catalog.turtle_export import format_grouped_turtle, turtle_has_triples
 from coa_ontology.pagination import InvalidNextToken, decode_next_token, page_body
+from coa_ontology.query_params import require_enum_value
 from coa_ontology.stores import build_stores as _build_stores  # noqa: F401 (re-exported)
 from coa_ontology.stores.base import GraphStore, VectorStore
 
@@ -238,7 +240,12 @@ def list_ontologies(
     the registry row. The pre-contract ``limit`` (page size; ``maxResults`` wins
     when both are sent) and ``skip`` (an offset applied before the page) still
     bind for existing callers; ``skip`` is applied relative to ``nextToken``.
+
+    ``ontology_type`` must be an ``OntologyType`` value; anything else is a 400.
+    Every value the service stores is one (the write routes check the same enum),
+    so no stored row is left unfilterable.
     """
+    require_enum_value("ontology_type", ontology_type, OntologyType)
     scope = f"ontologies:{namespace}"
     try:
         start_key = decode_next_token(next_token, scope=scope, pk=dynamo_store.ontology_registry_pk(namespace))
@@ -288,7 +295,10 @@ def download_ontology_file(ontology_id: str, namespace: str = "default"):
             e,
         )
 
-    if graph_turtle is not None and graph_turtle.strip():
+    # An unknown graph can come back as a header with no triples (``@prefix``
+    # lines only). Treat that like an empty graph — fall through to the cache
+    # lookup, which 404s — instead of writing and presigning an empty file.
+    if graph_turtle is not None and turtle_has_triples(graph_turtle):
         try:
             body = format_grouped_turtle(graph_turtle)
         except Exception as e:
@@ -382,7 +392,12 @@ def get_ontology(ontology_id: str, namespace: str = "default"):
 
 @router.post("/", response_model=OntologyResponse, status_code=201)
 def create_ontology(body: OntologyCreate, namespace: str = "default"):
-    """Register metadata only (no content). For full ingests use ``/upload``."""
+    """Register metadata only (no content). For full ingests use ``/upload``.
+
+    ``ontology_type`` must be an ``OntologyType`` value (400 otherwise), the same
+    check ``list_ontologies`` applies, so every stored row can be filtered on.
+    """
+    require_enum_value("ontology_type", body.ontology_type, OntologyType)
     graph = _graph(namespace)
     if graph.get_ontology_by_uri(body.uri) or dynamo_store.get_ontology_registry(namespace, body.uri):
         raise HTTPException(409, f"Ontology with URI '{body.uri}' already exists")
@@ -849,7 +864,11 @@ def upload_ontology_file(
     reject a body value that disagrees with the authorized one. The sibling
     ``/upload-url`` route takes ``namespace`` as a query param for exactly this
     reason.
+
+    ``ontology_type`` must be an ``OntologyType`` value (400 otherwise, before
+    anything is written), the same check ``list_ontologies`` applies.
     """
+    require_enum_value("ontology_type", ontology_type, OntologyType)
     # Fail fast on a duplicate upload before writing the file to disk,
     # so a repeat call doesn't leave an orphaned copy on the filesystem.
     if dynamo_store.get_ontology_registry(namespace, ontology_id):

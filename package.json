@@ -1,6 +1,9 @@
 {
   "name": "coa",
   "private": true,
+  "engines": {
+    "node": ">=22.23.4"
+  },
   "scripts": {
     "build": "nx run-many -t build",
     "test": "nx run-many -t test",
@@ -11,5 +14,5 @@
     "nx": "22.7.10",
     "pnpm": "10.34.5"
   },
-  "version": "0.3.7"
+  "version": "0.3.8"
 }

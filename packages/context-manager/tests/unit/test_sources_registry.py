@@ -860,6 +860,66 @@ class TestPooledGlueDatabases:
         assert out == {"acct_mstr": (AMBIGUOUS_SOURCE, ""), "br_dir": ("s-party", "bank_party")}
 
     @pytest.mark.asyncio
+    async def test_same_name_databases_lists_every_database_holding_a_retrieved_name(self):
+        # One `ds` per study: retrieval may return any one of them, the listing
+        # names all of them. `dm` exists in one database only and is not listed.
+        registry = self._registry(
+            [
+                _glue_source("s-101", "sdtm_cs101"),
+                _glue_source("s-102", "sdtm_cs102"),
+                _glue_source("s-103", "sdtm_cs103"),
+            ]
+        )
+        self._glue(registry, {"sdtm_cs101": ["ds", "dm"], "sdtm_cs102": ["ds"], "sdtm_cs103": ["ds", "ae"]})
+
+        out = await registry.same_name_databases("ns-a", ["ds", "DM", "ae", "nope"])
+
+        assert out == {"ds": {"sdtm_cs101": "s-101", "sdtm_cs102": "s-102", "sdtm_cs103": "s-103"}}
+
+    @pytest.mark.asyncio
+    async def test_same_name_databases_counts_only_the_namespace_databases(self):
+        # A database outside the namespace's sources is never listed, so a name it
+        # also holds does not make a namespace-unique name look shared.
+        registry = self._registry([_glue_source("s-ops", "bank_ops"), _glue_source("s-party", "bank_party")])
+        glue = self._glue(registry, {"bank_ops": ["acct_mstr"], "bank_party": ["br_dir"], "other_db": ["acct_mstr"]})
+
+        assert await registry.same_name_databases("ns-a", ["acct_mstr", "br_dir"]) == {}
+        listed = sorted(c.kwargs["DatabaseName"] for c in glue.get_paginator.return_value.paginate.call_args_list)
+        assert listed == ["bank_ops", "bank_party"]
+
+    @pytest.mark.asyncio
+    async def test_same_name_databases_is_empty_for_a_single_database_namespace(self):
+        registry = self._registry([_glue_source("s-ops", "bank_ops")])
+        glue = self._glue(registry, {"bank_ops": ["acct_mstr"]})
+
+        assert await registry.same_name_databases("ns-a", ["acct_mstr"]) == {}
+        glue.get_paginator.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_same_name_databases_marks_a_database_two_sources_share(self):
+        registry = self._registry(
+            [
+                _glue_source("s-ops", "bank_ops"),
+                _glue_source("s-ops-2", "bank_ops"),
+                _glue_source("s-party", "bank_party"),
+            ]
+        )
+        self._glue(registry, {"bank_ops": ["dim_dt"], "bank_party": ["dim_dt"]})
+
+        out = await registry.same_name_databases("ns-a", ["dim_dt"])
+
+        assert out == {"dim_dt": {"bank_ops": AMBIGUOUS_SOURCE, "bank_party": "s-party"}}
+
+    @pytest.mark.asyncio
+    async def test_same_name_databases_is_empty_when_a_database_cannot_be_listed(self):
+        registry = self._registry([_glue_source("s-ops", "bank_ops"), _glue_source("s-party", "bank_party")])
+        glue = MagicMock()
+        glue.get_paginator.side_effect = RuntimeError("AccessDenied")
+        registry._glue = glue
+
+        assert await registry.same_name_databases("ns-a", ["dim_dt"]) == {}
+
+    @pytest.mark.asyncio
     async def test_catalog_failure_leaves_unplaced_tables_bare(self):
         registry = self._registry([_glue_source("s-ops", "bank_ops"), _glue_source("s-party", "bank_party")])
         glue = MagicMock()

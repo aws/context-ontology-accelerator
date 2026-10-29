@@ -138,7 +138,7 @@ class TestImportOsiHandler:
         mock_lookup.return_value = lookup
 
         neptune = MagicMock()
-        neptune.get_metric.return_value = MagicMock(defined_by="steward@example.com")
+        neptune.get_metric.return_value = MagicMock(defined_by="steward@example.com", label=None)
         mock_neptune.return_value = neptune
 
         opensearch = MagicMock()

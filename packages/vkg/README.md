@@ -10,6 +10,15 @@ Translation-only service wrapping Ontop 5.x. Translates SPARQL queries into SQL 
 
 At startup, the entrypoint downloads ontology + mappings from S3, loads the schema into H2, and starts both services.
 
+### Patched Ontop dependencies
+
+Ontop 5.5.0 (`ARG ONTOP_VERSION` in the Dockerfile) bundles Tomcat, Spring Framework, Thymeleaf, Jackson, commons-beanutils and Guava releases with known CVEs. At build time `ontop-lib-overrides.sh` replaces them in `/opt/ontop/lib` with the versions pinned in `ontop-lib-overrides.txt`, and removes `thymeleaf-extras-java8time`, which Thymeleaf 3.1 absorbed. The pins follow the versions Ontop's own `version5` branch uses on the same Spring Boot 2.7 line.
+
+- Every JAR is checked against its pinned sha256 before it replaces the bundled one. A mismatch or a missing download fails the build.
+- The build also fails if a bundled JAR is newer than its pin, so a pin can never downgrade a library.
+- When you change `ONTOP_VERSION`, go through the manifest and drop each entry the new release already bundles at that version or later. The no-downgrade check names the entries you have to drop.
+- JARs come from Maven Central. Pass `--build-arg MAVEN_BASE=<repository URL>` to use a mirror.
+
 ## Production
 
 The container is built from this Dockerfile and deployed to ECS. Ontology artifacts are fetched from S3 at runtime:
@@ -176,38 +185,62 @@ ontology is published. The `<prefix>-vkg-reload` Lambda owns provisioning and
 image refresh; the latest image URI is published to SSM
 (`/<prefix>/vkg/container-image`) on every CDK deploy.
 
-### Two ways the reload Lambda runs
+### Three ways the reload Lambda runs
 
 | Trigger | Event | Scope |
 |---------|-------|-------|
 | `ontology.published` (EventBridge) | `{"detail": {"namespace": "...", "version": "..."}}` | The one namespace that was published |
+| Deploy-time rollout (CloudFormation custom resource, async) | `{"sweep": true, "trigger": "deploy", "image": "..."}` | **Every** `<prefix>-vkg-*` service in the cluster; runs on every deploy when the image comes from a CI tag, otherwise when the image URI changes |
 | Scheduled sweep (EventBridge, weekly) | `{"sweep": true}` | **Every** `<prefix>-vkg-*` service in the cluster |
 
-On each run the Lambda resolves the latest image from SSM and, per service,
-registers a new task-definition revision when the image differs (else forces a
-new deployment), always with the ECS circuit breaker + rollback.
+On each run the Lambda resolves the latest image from SSM. For a service whose
+task definition names a different image it registers a new task-definition
+revision. When the image URI already matches, the `ontology.published` path
+forces a new deployment (so the republished ontology is loaded). A sweep
+compares image digests instead of URI text, because a tag such as
+`{name}-latest` can be pushed again for a new build: it reads the digest of the
+service's running tasks (`ecs:DescribeTasks`) and the digest the image URI
+points at now (`ecr:DescribeImages`, or the `@sha256:` digest of a pinned URI).
+Only when both are known and equal is the service left alone and reported as
+`unchanged`. Otherwise, including when either digest cannot be read, it forces
+a new deployment so ECS resolves the tag again. Every deployment runs with the
+ECS circuit breaker + rollback. The optional `trigger` field (`deploy`, `schedule` by default, or any
+label such as `manual`) is only logged.
+
+### Deploy-time rollout
+
+A CDK deploy updates the shared template task definition and the SSM image
+parameter, then the `<prefix>-vkg-image-rollout` custom resource invokes the
+reload Lambda asynchronously with `{"sweep": true, "trigger": "deploy", ...}`.
+The image URI is part of that payload, so CloudFormation calls it whenever the
+URI changes (and once when the stack is created). A locally built image is
+tagged with its content hash, so its URI changes exactly when the image does.
+An image passed in by CI (`vkg_image_uri`) uses a tag that may be reused, so
+the payload also carries a per-deploy id and the rollout runs on every deploy.
+Either way the sweep's digest check means a service already running the image
+the deploy points at is not restarted. The invoke is fire-and-forget: the deploy does not wait
+for the ECS rollouts, and a namespace whose VKG cannot start (for example
+because of bad ontology artifacts) does not fail or roll back the deploy. A
+task that never becomes healthy is rolled back by the circuit breaker, and an
+ECS API error during the sweep raises the `ReloadFailed` alarm.
 
 ### Why the scheduled sweep exists
 
 The `ontology.published` trigger only refreshes a namespace **when its ontology
-is re-accepted**. A long-lived namespace that is never republished keeps its
-provision-time image indefinitely, so base-image digest bumps (Renovate, or a
-Dockerfile pin change) never reach a running task and stale, Inspector-flagged
-VKG images accumulate. A CDK deploy does **not** fix this either — it only
-updates the shared template task def and the SSM image parameter, not the
-existing per-namespace services.
-
+is re-accepted**, and the deploy-time rollout only runs as part of a deploy.
 The weekly sweep (EventBridge `rate(7 days)` → reload Lambda with
-`{"sweep": true}`) closes the gap: it reconciles every VKG service to the latest
-SSM image. It is a no-op per namespace when the image already matches, and a
-single namespace's failure is isolated so the rest are still patched.
+`{"sweep": true}`) is the backstop for everything else: a namespace whose
+deploy-time rollout failed or was rolled back is tried again, so stale,
+Inspector-flagged VKG images do not linger. Services already running the
+digest the SSM image points at are skipped (`unchanged`), and a single
+namespace's failure is isolated so the rest are still patched.
 
 ### Manual sweep (on demand)
 
 ```bash
 aws lambda invoke --function-name <prefix>-vkg-reload \
-  --payload "$(printf '{"sweep":true}' | base64)" /tmp/out.json
-cat /tmp/out.json   # -> {"status":"sweep_complete","total":N,"triggered":M,...}
+  --payload "$(printf '{"sweep":true,"trigger":"manual"}' | base64)" /tmp/out.json
+cat /tmp/out.json   # -> {"status":"sweep_complete","total":N,"triggered":M,"unchanged":K,...}
 ```
 
 ### IAM
@@ -219,9 +252,17 @@ via the `ecs:cluster` condition key (`ecs:ListServices` has no IAM resource
 type, so it is granted on `Resource: "*"` and constrained to this cluster by
 condition).
 
+For the digest comparison it also holds **`ecs:ListTasks`** (constrained to the
+VKG cluster by the `ecs:cluster` condition, for the same reason as
+`ecs:ListServices`), **`ecs:DescribeTasks` on this cluster's tasks**, and
+**`ecr:DescribeImages` on the VKG image repository only**.
+
+The deploy-time rollout runs as its own `<prefix>-vkg-image-rollout` function,
+whose role holds only **`lambda:InvokeFunction` on the reload Lambda**.
+
 ### Observability
 
-Both paths emit `ReloadTriggered` / `ReloadFailed` CloudWatch metrics under the
+All three paths emit `ReloadTriggered` / `ReloadFailed` CloudWatch metrics under the
 `COA/VKG` namespace (dimensioned by `Namespace` plus an undimensioned roll-up the
 `ReloadFailed` alarm evaluates). Sweep-level failures — the SSM image can't be
 resolved, or `ListServices` errors — emit `ReloadFailed` with namespace `sweep`

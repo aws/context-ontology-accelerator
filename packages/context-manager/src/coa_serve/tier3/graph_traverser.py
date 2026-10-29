@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import structlog
 
@@ -88,12 +88,65 @@ _GRAPH_QUERY_TIMEOUT_S = 15.0
 
 @dataclass(frozen=True)
 class GraphEntity:
-    """A graph entity with its label, type, and outgoing relationships."""
+    """A graph entity returned by traversal.
+
+    Attributes:
+        uri: Stable IRI identifying the entity.
+        label: Human-readable entity label.
+        type: Class IRI or other type identifier when known.
+        relationships: Canonical outgoing relationships discovered by traversal.
+        properties: String-valued graph-context properties. The reserved
+            ``supportingStatements`` value is a JSON-encoded string array and
+            must be handled through the graph-context helpers.
+    """
 
     uri: str
     label: str
     type: str
     relationships: tuple[dict, ...] = ()
+    properties: dict[str, str] = field(default_factory=dict)
+
+
+def _relationship_from_row(row: dict) -> dict | None:
+    """Build one canonical directed relationship from a graph result row."""
+    source_uri = row.get("sourceUri")
+    predicate_uri = row.get("predicateUri")
+    target_uri = row.get("targetUri")
+    if not source_uri or not predicate_uri or not target_uri:
+        return None
+    return {
+        "source_uri": source_uri,
+        "source_label": row.get("sourceLabel", ""),
+        "predicate_uri": predicate_uri,
+        "predicate_label": row.get("predicateLabel", ""),
+        "target_uri": target_uri,
+        "target_label": row.get("targetLabel", ""),
+    }
+
+
+def _append_unique_relationship(
+    relationships: list[dict],
+    positions: dict[tuple[str, str, str], int],
+    row: dict,
+) -> None:
+    """Append or label-enrich a relationship keyed by directed triple identity."""
+    relationship = _relationship_from_row(row)
+    if relationship is None:
+        return
+    identity = (
+        relationship["source_uri"],
+        relationship["predicate_uri"],
+        relationship["target_uri"],
+    )
+    if identity not in positions:
+        positions[identity] = len(relationships)
+        relationships.append(relationship)
+        return
+
+    existing = relationships[positions[identity]]
+    for label_field in ("source_label", "predicate_label", "target_label"):
+        if not existing.get(label_field) and relationship.get(label_field):
+            existing[label_field] = relationship[label_field]
 
 
 class GraphTraverser:
@@ -254,16 +307,21 @@ class GraphTraverser:
         # across identical requests without claiming a relevance order the query
         # cannot express.
         return f"""
-        SELECT ?entity ?label (LANG(?label) AS ?labelLang) ?type ?predicate ?related
-               ?relLabel (LANG(?relLabel) AS ?relLabelLang)
+        SELECT ?entity ?label (LANG(?label) AS ?labelLang) ?type
+               ?sourceUri ?sourceLabel (LANG(?sourceLabel) AS ?sourceLabelLang)
+               ?predicateUri ?predicateLabel (LANG(?predicateLabel) AS ?predicateLabelLang)
+               ?targetUri ?targetLabel (LANG(?targetLabel) AS ?targetLabelLang)
         WHERE {{
           GRAPH ?g {{
             ?entity rdfs:label ?label ;
                     a ?type .
             FILTER({filters})
             OPTIONAL {{
-              ?entity ?predicate ?related .
-              ?related rdfs:label ?relLabel .
+              ?entity ?predicateUri ?targetUri .
+              ?targetUri rdfs:label ?targetLabel .
+              BIND(?entity AS ?sourceUri)
+              BIND(?label AS ?sourceLabel)
+              OPTIONAL {{ ?predicateUri rdfs:label ?predicateLabel . }}
             }}
           }}
           FILTER(STRSTARTS(STR(?g), "{graph_uri_prefix}"))
@@ -285,7 +343,7 @@ class GraphTraverser:
         #
         # Fix: surface the property nodes attached to the seed as first-class
         # ?entity results and expose EACH property's domain/range targets as its
-        # relationships (?relPredicate/?related/?relLabel) — mirroring the keyword
+        # explicitly directed source/predicate/target relationship — mirroring the keyword
         # path so the synthesizer sees the same class↔property↔class structure.
         # The direct-edge arms are retained for non-induced ontologies that DO
         # carry labelled class→class triples.
@@ -304,21 +362,21 @@ class GraphTraverser:
               ?entity rdfs:label ?label .
               OPTIONAL {{ ?entity a ?type . }}
               OPTIONAL {{
-                ?entity ?relPredicate ?related .
-                ?related rdfs:label ?relLabel .
-                FILTER(?relPredicate IN (rdfs:domain, rdfs:range))
+                ?entity ?predicateUri ?targetUri .
+                FILTER(?predicateUri IN (rdfs:domain, rdfs:range))
+                BIND(?entity AS ?sourceUri)
               }}
             }}""",
             # Seed-as-property → its domain/range CLASSES, emitted as entities so
             # the class neighborhood is present (with the seed property as the
             # linking relationship back). Capture the ACTUAL predicate.
             """{
-              ?seed ?relPredicate ?entity .
-              FILTER(?relPredicate IN (rdfs:domain, rdfs:range))
+              ?seed ?predicateUri ?entity .
+              FILTER(?predicateUri IN (rdfs:domain, rdfs:range))
               ?entity rdfs:label ?label .
               OPTIONAL { ?entity a ?type . }
-              BIND(?seed AS ?related)
-              OPTIONAL { ?seed rdfs:label ?relLabel . }
+              BIND(?seed AS ?sourceUri)
+              BIND(?entity AS ?targetUri)
             }""",
             # Seed IS a class: property nodes whose domain/range is the seed
             # class. Emit the property as ?entity with its domain/range targets.
@@ -327,24 +385,26 @@ class GraphTraverser:
               ?entity rdfs:label ?label .
               OPTIONAL {{ ?entity a ?type . }}
               OPTIONAL {{
-                ?entity ?relPredicate ?related .
-                ?related rdfs:label ?relLabel .
-                FILTER(?relPredicate IN (rdfs:domain, rdfs:range))
+                ?entity ?predicateUri ?targetUri .
+                FILTER(?predicateUri IN (rdfs:domain, rdfs:range))
+                BIND(?entity AS ?sourceUri)
               }}
             }}""",
             # Direct outgoing edge (non-induced ontologies with class→class triples).
             """{
-              ?seed ?relPredicate ?entity .
+              ?seed ?predicateUri ?entity .
               ?entity rdfs:label ?label .
               OPTIONAL { ?entity a ?type . }
-              BIND(?seed AS ?related)
+              BIND(?seed AS ?sourceUri)
+              BIND(?entity AS ?targetUri)
             }""",
             # Direct incoming edge.
             """{
-              ?entity ?relPredicate ?seed .
+              ?entity ?predicateUri ?seed .
               ?entity rdfs:label ?label .
               OPTIONAL { ?entity a ?type . }
-              BIND(?seed AS ?related)
+              BIND(?entity AS ?sourceUri)
+              BIND(?seed AS ?targetUri)
             }""",
         ]
 
@@ -361,9 +421,9 @@ class GraphTraverser:
               ?entity rdfs:label ?label .
               OPTIONAL {{ ?entity a ?type . }}
               OPTIONAL {{
-                ?entity ?relPredicate ?related .
-                ?related rdfs:label ?relLabel .
-                FILTER(?relPredicate IN (rdfs:domain, rdfs:range))
+                ?entity ?predicateUri ?targetUri .
+                FILTER(?predicateUri IN (rdfs:domain, rdfs:range))
+                BIND(?entity AS ?sourceUri)
               }}
             }}""",
                 # Bridged classes: the class on the far side of a property that
@@ -371,13 +431,13 @@ class GraphTraverser:
                 # bridging property as its relationship back (actual predicate).
                 f"""{{
               ?bridge {dr} ?seed .
-              ?bridge ?relPredicate ?entity .
-              FILTER(?relPredicate IN (rdfs:domain, rdfs:range))
+              ?bridge ?predicateUri ?entity .
+              FILTER(?predicateUri IN (rdfs:domain, rdfs:range))
               ?entity rdfs:label ?label .
               OPTIONAL {{ ?entity a ?type . }}
               FILTER(?entity != ?seed)
-              BIND(?bridge AS ?related)
-              OPTIONAL {{ ?bridge rdfs:label ?relLabel . }}
+              BIND(?bridge AS ?sourceUri)
+              BIND(?entity AS ?targetUri)
             }}""",
                 # Property nodes of the bridged classes: for each class reachable
                 # from the seed via a bridging property, also emit ITS property
@@ -391,9 +451,9 @@ class GraphTraverser:
               ?entity rdfs:label ?label .
               OPTIONAL {{ ?entity a ?type . }}
               OPTIONAL {{
-                ?entity ?relPredicate ?related .
-                ?related rdfs:label ?relLabel .
-                FILTER(?relPredicate IN (rdfs:domain, rdfs:range))
+                ?entity ?predicateUri ?targetUri .
+                FILTER(?predicateUri IN (rdfs:domain, rdfs:range))
+                BIND(?entity AS ?sourceUri)
               }}
             }}""",
             ]
@@ -405,39 +465,49 @@ class GraphTraverser:
         # aborted at 15s); the seed set is already capped at 10 URIs, keeping the
         # common case cheap.
         return f"""
-        SELECT ?entity ?label (LANG(?label) AS ?labelLang) ?type ?relPredicate ?related
-               ?relLabel (LANG(?relLabel) AS ?relLabelLang)
+        SELECT ?entity ?label (LANG(?label) AS ?labelLang) ?type
+               ?sourceUri ?sourceLabel (LANG(?sourceLabel) AS ?sourceLabelLang)
+               ?predicateUri ?predicateLabel (LANG(?predicateLabel) AS ?predicateLabelLang)
+               ?targetUri ?targetLabel (LANG(?targetLabel) AS ?targetLabelLang)
         WHERE {{
           GRAPH ?g {{
             VALUES ?seed {{ {values_clause} }}
             {union_body}
+            OPTIONAL {{ ?sourceUri rdfs:label ?sourceLabel . }}
+            OPTIONAL {{ ?predicateUri rdfs:label ?predicateLabel . }}
+            OPTIONAL {{ ?targetUri rdfs:label ?targetLabel . }}
           }}
           FILTER(STRSTARTS(STR(?g), "{graph_uri_prefix}"))
         }} LIMIT {_MAX_HOP_RESULTS}
         """
 
     def _parse_results(self, results: list[dict]) -> list[GraphEntity]:
-        return _group_entities(results, predicate_var="predicate")
+        return _group_entities(results)
 
     def _parse_hop_results(self, results: list[dict]) -> list[GraphEntity]:
-        return _group_entities(results, predicate_var="relPredicate")
+        return _group_entities(results)
 
 
-def _group_entities(results: list[dict], *, predicate_var: str) -> list[GraphEntity]:
+def _group_entities(results: list[dict]) -> list[GraphEntity]:
     """Fold traversal rows into one :class:`GraphEntity` per entity URI.
 
     A resource with several ``rdfs:label`` values arrives once per label (and a
     related node once per ITS labels). Labels are collected per URI and chosen
-    with the request's namespace-language preference (LLD §2.2.5), so the label
-    does not depend on row order and no entity or relationship is dropped for its
-    language. Entities keep first-seen order; each ``(predicate, target)``
-    relationship appears once — the induced graph often carries the same
-    domain/range triple twice, and a property can bridge to several classes.
+    with the request's namespace-language preference, so the chosen label does
+    not depend on row order and no entity or relationship is dropped for its
+    language. Entities keep first-seen order; each directed
+    ``(source, predicate, target)`` relationship appears once — the induced graph
+    often carries the same domain/range triple twice, and a property can bridge
+    to several classes. Each relationship carries full directed provenance
+    (source/predicate/target URIs and labels) so the supporting-content contract
+    can represent and cite it.
     """
     preference = current_label_preference()
     types: dict[str, str] = {}
     labels: dict[str, list[tuple[str, str]]] = {}
-    rels: dict[str, dict[tuple[str, str], list[tuple[str, str]]]] = {}
+    # Per entity: directed-triple identity -> accumulated label candidates for
+    # each endpoint, preserving first-seen order of the triples.
+    rels: dict[str, dict[tuple[str, str, str], dict[str, list[tuple[str, str]]]]] = {}
     for row in results:
         uri = row.get("entity", "")
         if not uri:
@@ -451,19 +521,35 @@ def _group_entities(results: list[dict], *, predicate_var: str) -> list[GraphEnt
         label = row_label(row, "label")
         if label[0]:
             labels[uri].append(label)
-        if row.get(predicate_var) and row.get("related"):
-            target_labels = rels[uri].setdefault((row[predicate_var], row["related"]), [])
-            target_label = row_label(row, "relLabel")
-            if target_label[0]:
-                target_labels.append(target_label)
+        source_uri = row.get("sourceUri")
+        predicate_uri = row.get("predicateUri")
+        target_uri = row.get("targetUri")
+        if source_uri and predicate_uri and target_uri:
+            identity = (source_uri, predicate_uri, target_uri)
+            endpoint_labels = rels[uri].setdefault(identity, {"source": [], "predicate": [], "target": []})
+            for role, variable in (
+                ("source", "sourceLabel"),
+                ("predicate", "predicateLabel"),
+                ("target", "targetLabel"),
+            ):
+                candidate = row_label(row, variable)
+                if candidate[0]:
+                    endpoint_labels[role].append(candidate)
     return [
         GraphEntity(
             uri=uri,
             label=preference.pick(labels[uri]),
             type=types[uri],
             relationships=tuple(
-                {"predicate": predicate, "target_uri": target, "target_label": preference.pick(target_labels)}
-                for (predicate, target), target_labels in rels[uri].items()
+                {
+                    "source_uri": source,
+                    "source_label": preference.pick(endpoint_labels["source"]),
+                    "predicate_uri": predicate,
+                    "predicate_label": preference.pick(endpoint_labels["predicate"]),
+                    "target_uri": target,
+                    "target_label": preference.pick(endpoint_labels["target"]),
+                }
+                for (source, predicate, target), endpoint_labels in rels[uri].items()
             ),
         )
         for uri in types

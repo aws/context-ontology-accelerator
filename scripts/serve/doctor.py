@@ -128,33 +128,18 @@ check("neptune", check_neptune)
 
 
 # ── 4. OpenSearch ──
+# Control plane only: the collection is VPC-only, so its indexes cannot be read
+# from outside the deployment's VPC (where this script usually runs).
 def check_oss():
-    import botocore.session
-    from botocore.auth import SigV4Auth
-    from botocore.awsrequest import AWSRequest
-
-    session = botocore.session.get_session()
-    credentials = session.get_credentials().get_frozen_credentials()
-
+    name = ssm.get_parameter(Name=f"/{prefix}/opensearch/collection-name")["Parameter"]["Value"]
     aoss = boto3.client("opensearchserverless", region_name=region)
-    collections = aoss.list_collections()["collectionSummaries"]
-    coll = next((c for c in collections if prefix in c["name"]), None)
-    if not coll:
-        raise Exception("No AOSS collection found")
-    details = aoss.batch_get_collection(ids=[coll["id"]])["collectionDetails"][0]
-    endpoint = details["collectionEndpoint"]
-
-    index_name = f"{prefix}-dev-vectors-{namespace}"
-    url = f"{endpoint}/_cat/indices/{index_name}?format=json"
-    request = AWSRequest(method="GET", url=url, headers={"Host": endpoint.replace("https://", "")})
-    SigV4Auth(credentials, "aoss", region).add_auth(request)
-    req = urllib.request.Request(url, headers=dict(request.headers))
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        indices = json.loads(resp.read())
-        if not indices:
-            raise Exception(f"Index {index_name} not found")
-        doc_count = indices[0].get("docs.count", "0")
-        return f"{doc_count} embeddings in OpenSearch index"
+    details = aoss.batch_get_collection(names=[name])["collectionDetails"]
+    if not details:
+        raise Exception(f"AOSS collection {name} not found")
+    status = details[0]["status"]
+    if status != "ACTIVE":
+        raise Exception(f"AOSS collection {name} is {status}")
+    return f"AOSS collection {name} is ACTIVE (index contents are readable only inside the VPC)"
 
 
 check("opensearch", check_oss)
@@ -212,50 +197,6 @@ def check_vkg():
 
 
 check("vkg", check_vkg)
-
-
-# ── 7. Unstructured data (Tier 3) ──
-def check_unstructured():
-    import botocore.session
-    from botocore.auth import SigV4Auth
-    from botocore.awsrequest import AWSRequest
-
-    session = botocore.session.get_session()
-    credentials = session.get_credentials().get_frozen_credentials()
-
-    aoss = boto3.client("opensearchserverless", region_name=region)
-    collections = aoss.list_collections()["collectionSummaries"]
-    coll = next((c for c in collections if prefix in c["name"]), None)
-    if not coll:
-        raise Exception("No AOSS collection found")
-    details = aoss.batch_get_collection(ids=[coll["id"]])["collectionDetails"][0]
-    endpoint = details["collectionEndpoint"]
-
-    index_name = f"{prefix}-dev-vectors-{namespace}"
-    url = f"{endpoint}/{index_name}/_count"
-    body = json.dumps(
-        {"query": {"bool": {"must_not": [{"terms": {"entity_type": ["class", "property", "metric"]}}]}}}
-    ).encode()
-    request = AWSRequest(
-        method="POST",
-        url=url,
-        data=body,
-        headers={"Host": endpoint.replace("https://", ""), "Content-Type": "application/json"},
-    )
-    SigV4Auth(credentials, "aoss", region).add_auth(request)
-    req = urllib.request.Request(url, data=body, method="POST", headers=dict(request.headers))
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            result = json.loads(resp.read())
-            doc_count = result.get("count", 0)
-            if doc_count > 0:
-                return f"{doc_count} unstructured documents indexed"
-            return "No unstructured documents (Tier 3 uses synthesis only)"
-    except urllib.error.HTTPError:
-        return "No unstructured documents (Tier 3 uses synthesis only)"
-
-
-check("unstructured", check_unstructured)
 
 
 # ── Output ──

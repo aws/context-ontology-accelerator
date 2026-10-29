@@ -33,7 +33,12 @@ from coa_common.idempotency import idempotent
 from coa_common.logging import setup_logging
 from coa_common.response import api_response, get_caller_identity
 
-from coa_metrics.api.contract import IMPORT_CONTENT_MAX_LENGTH, IMPORT_S3_KEY_MAX_LENGTH, check_metric_definition
+from coa_metrics.api.contract import (
+    IMPORT_CONTENT_MAX_LENGTH,
+    IMPORT_S3_KEY_MAX_LENGTH,
+    check_metric_definition,
+    normalize_metric_label,
+)
 from coa_metrics.api.import_s3_key import IMPORT_S3_KEY_SCOPE_ERROR, is_import_s3_key_for_namespace
 from coa_metrics.data_source_lookup_factory import build_data_source_lookup
 from coa_metrics.dataset_resolver import resolve_datasets
@@ -446,9 +451,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             if existing is not None:
                 neptune.update_metric(namespace, metric_def.name, metric_def)
                 metrics_updated += 1
-                author = getattr(existing, "defined_by", "")
-                author_detail = f" authored by {author.strip()}" if isinstance(author, str) and author.strip() else ""
-                warnings.append(f"Metric '{metric_def.name}' overwritten (had existing metadata{author_detail})")
+                warnings.append(_overwrite_warning(metric_def.name, existing, metric_def))
                 logger.info("metric_updated_via_import", name=metric_def.name, namespace=namespace)
             else:
                 neptune.create_metric(namespace, metric_def)
@@ -489,6 +492,27 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────
+
+
+def _overwrite_warning(metric_name: str, existing: MetricDefinition, replacement: MetricDefinition) -> str:
+    """Return the warning for an import that overwrites an existing metric.
+
+    Shared by the sync handler and the async import worker's plan. Import is a
+    full replace, so re-importing a document without ``label`` clears an
+    existing one: say so rather than dropping it silently (the label is never
+    quoted).
+    """
+    author = (existing.defined_by or "").strip()
+    author_detail = f" authored by {author}" if author else ""
+    label_detail = label_cleared_detail(existing, replacement)
+    return f"Metric '{metric_name}' overwritten (had existing metadata{author_detail}){label_detail}"
+
+
+def label_cleared_detail(existing: MetricDefinition, replacement: MetricDefinition) -> str:
+    """The warning suffix when an overwrite clears a label (empty otherwise). The label is never quoted."""
+    if existing.label and not replacement.label:
+        return "; its label was cleared because the import does not set one"
+    return ""
 
 
 def _get_metadata_store() -> MetadataStore | None:
@@ -541,9 +565,13 @@ def _osi_metric_to_definition(
     return_type = ""
     time_grain = ""
     ontology_concepts: list[str] = []
+    label: str | None = None
 
     if osi_metric.custom_extensions:
         ext = osi_metric.custom_extensions
+        if ext.label_error:
+            raise ValueError(ext.label_error)
+        label = None if ext.label is None else normalize_metric_label(ext.label)
         data_source_id = ext.data_source_id
         source_table = ext.source_table
         unit = ext.unit
@@ -589,6 +617,7 @@ def _osi_metric_to_definition(
         ontology_concepts=ontology_concepts,
         defined_by=caller,
         effective_from=datetime.now(UTC).strftime("%Y-%m-%d"),
+        label=label,
     )
     # The CreateMetric contract bounds: a metric stored outside them could not be
     # fetched, updated or deleted afterwards. Raised as ValueError so every import

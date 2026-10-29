@@ -5,10 +5,12 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 import os
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import boto3
@@ -123,6 +125,26 @@ class InputTooLargeError(ValueError):
 
 
 @dataclass(frozen=True)
+class PromptSegment:
+    """One ordered piece of a user message.
+
+    ``guarded=True`` (the default) marks text the guardrail must screen: anything
+    that comes from a customer's catalog, documents, or other source data.
+    ``guarded=False`` is reserved for literal text the application authors
+    itself (headings, fixed instructions), so the guardrail's prompt-attack
+    filter does not judge the application's own wording.
+    """
+
+    text: str
+    guarded: bool = True
+
+
+def prompt_text(user_prompt: str | Sequence[PromptSegment]) -> str:
+    """Return the user message text exactly as the model sees it."""
+    return user_prompt if isinstance(user_prompt, str) else "".join(s.text for s in user_prompt)
+
+
+@dataclass(frozen=True)
 class BedrockInvocationResult:
     """Result of a Bedrock invocation including parsed content and usage."""
 
@@ -196,9 +218,46 @@ class BedrockClient:
 
         return False
 
-    def invoke(self, system_prompt: str, user_prompt: str, max_tokens: int = 4096) -> BedrockInvocationResult:
-        """Call Bedrock via Converse API, parse JSON response, and return result with token usage + latency."""
-        input_chars = len(system_prompt) + len(user_prompt)
+    def _user_content(self, user_prompt: str | Sequence[PromptSegment]) -> list[dict]:
+        """Map the user prompt to Converse content blocks.
+
+        A plain ``str`` is one ``text`` block, so the guardrail screens the whole
+        message. A segment list keeps its order: guarded segments become
+        ``guardContent`` blocks and the rest plain ``text`` blocks. Once any
+        ``guardContent`` block is present, the guardrail evaluates only those
+        blocks. Word filters are the exception: they also check plain ``text``
+        blocks. That matters only when a guardrail has a word policy, and the plain
+        blocks carry only application-authored text.
+
+        The segment list collapses to a single ``text`` block (screen everything,
+        as for a ``str``) when no guardrail is configured or no guarded segment has
+        text, so an unguarded call is byte-for-byte what it was before. Empty
+        segments are dropped; a list with no text at all raises ``ValueError``,
+        since Converse rejects an empty text block.
+        """
+        if isinstance(user_prompt, str):
+            return [{"text": user_prompt}]
+        segments = [s for s in user_prompt if s.text]
+        if not segments:
+            raise ValueError("user_prompt has no non-empty segments")
+        if not self._guardrail_id or not any(s.guarded for s in segments):
+            return [{"text": prompt_text(segments)}]
+        blocks: list[dict] = []
+        for guarded, group in itertools.groupby(segments, key=lambda s: s.guarded):
+            text = "".join(s.text for s in group)
+            blocks.append({"guardContent": {"text": {"text": text}}} if guarded else {"text": text})
+        return blocks
+
+    def invoke(
+        self, system_prompt: str, user_prompt: str | Sequence[PromptSegment], max_tokens: int = 4096
+    ) -> BedrockInvocationResult:
+        """Call Bedrock via Converse API, parse JSON response, and return result with token usage + latency.
+
+        ``user_prompt`` is either a plain string (the guardrail screens all of it)
+        or an ordered list of :class:`PromptSegment` (the guardrail screens only
+        the guarded segments). The model sees the segments concatenated in order.
+        """
+        input_chars = len(system_prompt) + len(prompt_text(user_prompt))
         if input_chars > self._max_input_chars:
             logger.warning("Bedrock input too large: %d chars (limit %d)", input_chars, self._max_input_chars)
             raise InputTooLargeError(
@@ -207,7 +266,7 @@ class BedrockClient:
         start = time.monotonic()
         kwargs = {
             "modelId": self._model_id,
-            "messages": [{"role": "user", "content": [{"text": user_prompt}]}],
+            "messages": [{"role": "user", "content": self._user_content(user_prompt)}],
             "system": [{"text": system_prompt}],
             "inferenceConfig": {"maxTokens": max_tokens},
         }

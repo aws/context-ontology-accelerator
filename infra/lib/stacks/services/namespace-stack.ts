@@ -829,6 +829,7 @@ export class NamespaceStack extends SCLStack {
     const deletionPipeline: NamespaceDeletionPipeline =
       new NamespaceDeletionPipeline(this, "DeletionPipeline", {
         prefixed: (name: string) => this.prefixed(name),
+        aossName: (name: string) => this.aossName(name),
         lambdaCode,
         vpc: props.vpc,
         vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },

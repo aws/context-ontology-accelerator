@@ -11,6 +11,8 @@ ARG ONTOP_VERSION=5.5.0
 ARG ONTOP_SHA256=430dff312e68e8ad41d26e6113160ca2365c28c4fe911926193000a33299458f
 ARG H2_VERSION=2.2.224
 ARG H2_SHA256=b9d8f19358ada82a4f6eb5b174c6cfe320a375b5a9cb5a4fe456d623e6e55497
+# Maven repository the Ontop JAR overrides are fetched from (sha256-pinned either way).
+ARG MAVEN_BASE=https://repo1.maven.org/maven2
 
 # Install dependencies and Ontop CLI.
 # translate-server.py and the aws CLI run on python3.12 from the AL2023 repos, not
@@ -18,7 +20,13 @@ ARG H2_SHA256=b9d8f19358ada82a4f6eb5b174c6cfe320a375b5a9cb5a4fe456d623e6e55497
 # in /usr/local/bin, which is ahead of /usr/bin on PATH; /usr/bin/python3 itself
 # must stay 3.9 because dnf/yum run on it (`#!/usr/bin/python3`). The version
 # check fails the build if `python3` ever stops resolving to 3.12.
+#
+# ontop-lib-overrides.sh swaps the Ontop CLI's bundled Tomcat/Spring/Thymeleaf/
+# Jackson/Guava JARs for the patched versions pinned in ontop-lib-overrides.txt.
+# It runs in this same layer as the unzip so the replaced JARs never reach a
+# lower layer that scanners would still attribute to the image.
 COPY requirements.txt /tmp/requirements.txt
+COPY ontop-lib-overrides.sh ontop-lib-overrides.txt /tmp/
 RUN yum install -y --releasever=latest python3.12 python3.12-pip unzip shadow-utils findutils && \
   yum update -y --security --releasever=latest && \
   ln -sf /usr/bin/python3.12 /usr/local/bin/python3 && \
@@ -30,6 +38,8 @@ RUN yum install -y --releasever=latest python3.12 python3.12-pip unzip shadow-ut
   echo "${ONTOP_SHA256}  /tmp/ontop.zip" | sha256sum -c - && \
   unzip /tmp/ontop.zip -d /opt/ontop && \
   rm /tmp/ontop.zip && \
+  MAVEN_BASE="${MAVEN_BASE}" sh /tmp/ontop-lib-overrides.sh /tmp/ontop-lib-overrides.txt /opt/ontop/lib && \
+  rm /tmp/ontop-lib-overrides.sh /tmp/ontop-lib-overrides.txt && \
   chmod +x /opt/ontop/ontop && \
   mkdir -p /opt/ontop/jdbc && \
   curl -fsSL "https://repo1.maven.org/maven2/com/h2database/h2/${H2_VERSION}/h2-${H2_VERSION}.jar" \

@@ -45,6 +45,8 @@ import {
   type ColumnDenylistRow,
 } from "@components/ColumnDenylistEditor";
 import { columnDenylistRowsToMap } from "@utils/grant-overrides";
+import { localizePrincipalType } from "@utils/principal-type";
+import { matchesFilteringText } from "@utils/collection-filter";
 import { useAppI18n } from "../i18n/LocaleProvider";
 
 type Translate = ReturnType<typeof useAppI18n>["t"];
@@ -216,6 +218,12 @@ const PermissionsTabs: React.FC<{ namespaceId: string }> = ({
     paginationProps,
   } = useCollection(grants, {
     filtering: {
+      // Also match the principal type as shown (e.g. ユーザー in Japanese),
+      // not only the raw API value.
+      filteringFunction: (g, filteringText) =>
+        matchesFilteringText(g, filteringText, [
+          localizePrincipalType(g.principalType, t),
+        ]),
       empty: grantsError ? (
         <StatusIndicator type="error">
           {t("Failed to load members: {message}", {
@@ -501,7 +509,7 @@ function makeMemberColumns(
     {
       id: "principalType",
       header: t("Type"),
-      cell: (g) => g.principalType,
+      cell: (g) => localizePrincipalType(g.principalType, t),
     },
     {
       id: "role",

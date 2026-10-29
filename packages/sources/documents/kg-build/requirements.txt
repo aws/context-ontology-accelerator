@@ -23,3 +23,10 @@ llama-index-core==0.14.23
 # 2026.10.19 is the first certifi bundle without the roots behind the compromised
 # emSign intermediates. botocore also uses certifi's bundle over its own when installed.
 certifi>=2026.10.19
+# Floors for transitive deps (graphrag-lexical-graph / llama-index) that a stale
+# resolve left on vulnerable releases: pillow 13.0.0 (CVE-2026-112390..112406,
+# CVE-2026-112891..112901, CVE-2026-96639/96640/96644/96778), nltk 3.10.4
+# (CVE-2026-81726), filelock 4.2.1 (CVE-2026-112940).
+pillow>=13.0.0
+nltk>=3.10.4
+filelock>=4.2.1

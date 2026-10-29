@@ -40,6 +40,11 @@ const TIER_LABELS: Readonly<Record<number, AppMessage>> = {
   3: "Tier 3 — Knowledge Retrieval",
 };
 
+// Deep Reasoning is an execution MODE, not a tier. It resolves through the
+// tier-3 assembly path but must be labelled by its mode, otherwise it reads
+// identically to a Standard cascade that happened to resolve at tier 3 (#1166).
+const DEEP_REASONING_LABEL = "Deep Reasoning";
+
 // Only surface a parallel-savings hint when it's material — for fast sources
 // the delta is just the quicker source's time and adds noise, not insight.
 const MIN_NOTABLE_SAVINGS_MS = 500;
@@ -53,7 +58,14 @@ function resolutionLabel(
   t: AppTranslate,
   tier: number,
   trace: TraceStep[],
+  executionMode?: string,
 ): string {
+  // Mode wins over tier: a Deep Reasoning answer resolves at tier 3 but is not
+  // Standard mode's Tier-3 result (#1166). Standard / unset falls through to the
+  // tier label below.
+  if (executionMode === "deep-reasoning") {
+    return t(DEEP_REASONING_LABEL);
+  }
   if (tier === 2) {
     return tier2Title(t, trace);
   }
@@ -71,11 +83,29 @@ function formatDuration(ms: number): string {
   return `${(ms / 1000).toFixed(1)}s`;
 }
 
+// Confidence display bands. These are DISPLAY bands only — they are
+// deliberately independent of the Tier-2→Tier-3 routing filter
+// (EMPTY_RESULT_CONFIDENCE_FLOOR = 0.3 in the orchestrator), which is an
+// internal junk filter, never a user-facing trust bar (#1166). The cutoffs
+// reuse the long-standing badge-colour thresholds so the word and the colour
+// can never disagree.
+const CONFIDENCE_HIGH_MIN = 0.8;
+const CONFIDENCE_MEDIUM_MIN = 0.5;
+
+type ConfidenceBand = "High" | "Medium" | "Low";
+
+function confidenceBand(score: number): ConfidenceBand {
+  if (score >= CONFIDENCE_HIGH_MIN) return "High";
+  if (score >= CONFIDENCE_MEDIUM_MIN) return "Medium";
+  return "Low";
+}
+
 function confidenceBadgeColor(
   score: number,
 ): "green" | "severity-medium" | "red" {
-  if (score >= 0.8) return "green";
-  if (score >= 0.5) return "severity-medium";
+  const band = confidenceBand(score);
+  if (band === "High") return "green";
+  if (band === "Medium") return "severity-medium";
   return "red";
 }
 
@@ -156,7 +186,7 @@ export const RationalePanel: React.FC<RationalePanelProps> = ({
         items={[
           {
             label: t("Resolution"),
-            value: resolutionLabel(t, result.tier, trace),
+            value: resolutionLabel(t, result.tier, trace, result.executionMode),
           },
           { label: t("Latency"), value: `${latencyMs}ms` },
           {
@@ -183,7 +213,7 @@ export const RationalePanel: React.FC<RationalePanelProps> = ({
         <Box variant="h5">{t("Confidence")}</Box>
         <SpaceBetween size="xs" direction="horizontal" alignItems="center">
           <Badge color={confidenceBadgeColor(result.confidence.score)}>
-            {Math.round(result.confidence.score * 100)}%
+            {confidenceBand(result.confidence.score)}
           </Badge>
           <Box variant="span" color="text-body-secondary" fontSize="body-s">
             {result.confidence.rationale}

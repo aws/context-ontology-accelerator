@@ -46,6 +46,7 @@ import {
   type GraphAttribute,
   type GraphNodeData,
 } from "../../components/graph/OntologyGraphFlow";
+import { isSubmitEnter } from "@utils/keyboard";
 import { useAppI18n } from "../../i18n/LocaleProvider";
 
 /**
@@ -1692,7 +1693,7 @@ export function GraphSearchPage() {
                   value={query}
                   onChange={({ detail }) => setQuery(detail.value)}
                   onKeyDown={({ detail }) => {
-                    if (detail.key === "Enter" && view === "graph")
+                    if (isSubmitEnter(detail) && view === "graph")
                       handleSearch();
                   }}
                   placeholder={

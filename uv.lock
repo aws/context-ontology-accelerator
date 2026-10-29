@@ -26,6 +26,7 @@ members = [
     "coa-vkg",
 ]
 constraints = [
+    { name = "filelock", specifier = ">=4.2.1" },
     { name = "fsspec", specifier = ">=2026.6.0" },
     { name = "werkzeug", specifier = ">=3.1.9" },
 ]
@@ -660,7 +661,7 @@ wheels = [
 
 [[package]]
 name = "coa"
-version = "0.3.7"
+version = "0.3.8"
 source = { virtual = "." }
 
 [package.dev-dependencies]
@@ -699,7 +700,7 @@ dev = [
 
 [[package]]
 name = "coa-common"
-version = "0.3.7"
+version = "0.3.8"
 source = { editable = "libs/common" }
 dependencies = [
     { name = "boto3" },
@@ -728,7 +729,7 @@ requires-dist = [
 
 [[package]]
 name = "coa-control-plane"
-version = "0.3.7"
+version = "0.3.8"
 source = { editable = "packages/control-plane" }
 dependencies = [
     { name = "boto3" },
@@ -766,7 +767,7 @@ requires-dist = [{ name = "pydantic", specifier = ">=2.0" }]
 
 [[package]]
 name = "coa-data-layer"
-version = "0.3.7"
+version = "0.3.8"
 source = { editable = "packages/data-layer" }
 dependencies = [
     { name = "coa-common" },
@@ -788,7 +789,7 @@ requires-dist = [{ name = "pydantic", specifier = ">=2.0" }]
 
 [[package]]
 name = "coa-mcp"
-version = "0.3.7"
+version = "0.3.8"
 source = { editable = "packages/mcp-server" }
 dependencies = [
     { name = "coa-common" },
@@ -815,7 +816,7 @@ requires-dist = [
 
 [[package]]
 name = "coa-metrics"
-version = "0.3.7"
+version = "0.3.8"
 source = { editable = "packages/metric-service" }
 dependencies = [
     { name = "boto3" },
@@ -844,7 +845,7 @@ requires-dist = [
 
 [[package]]
 name = "coa-ontology"
-version = "0.3.7"
+version = "0.3.8"
 source = { editable = "packages/ontology-engine" }
 dependencies = [
     { name = "aiosqlite" },
@@ -914,7 +915,7 @@ dev = [
 
 [[package]]
 name = "coa-serve"
-version = "0.3.7"
+version = "0.3.8"
 source = { editable = "packages/context-manager" }
 dependencies = [
     { name = "aiomysql" },
@@ -968,14 +969,14 @@ requires-dist = [
     { name = "retryhttp", specifier = ">=1.4.0" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0" },
     { name = "sqlglot", specifier = ">=25.0" },
-    { name = "strands-agents", specifier = ">=1.19.0" },
+    { name = "strands-agents", specifier = ">=1.43.0" },
     { name = "structlog", specifier = ">=24.0" },
     { name = "uvicorn", specifier = ">=0.30" },
 ]
 
 [[package]]
 name = "coa-sources"
-version = "0.3.7"
+version = "0.3.8"
 source = { editable = "packages/sources" }
 dependencies = [
     { name = "boto3" },
@@ -1010,7 +1011,7 @@ integ = [
 
 [[package]]
 name = "coa-vkg"
-version = "0.3.7"
+version = "0.3.8"
 source = { virtual = "packages/vkg" }
 dependencies = [
     { name = "certifi" },
@@ -1341,11 +1342,11 @@ wheels = [
 
 [[package]]
 name = "filelock"
-version = "3.29.1"
+version = "4.2.1"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/1f/f9/f38573ed5844586db374d085911740a501ccfa373b455fc9413f09f85237/filelock-3.29.1.tar.gz", hash = "sha256:d97e6b1b9757569626c58caa07dc4beb1613f4a2938b1e8cc81afca398906c9e", size = 59335, upload-time = "2026-06-03T15:19:04.053Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/d5/98/771d8ca889f220d7d7e352addf500666368f0fd081c6080a83767580c6e4/filelock-4.2.1.tar.gz", hash = "sha256:c4c937ccac2a813cee448e662a56366cfb374c0f8702e75f295c412cc1c5d5a3", size = 650997, upload-time = "2026-10-17T16:48:14.435Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/4c/a0/614c5fe402fd88951df45f4dda2fa3b4e17a99ecd92340771929169b3b95/filelock-3.29.1-py3-none-any.whl", hash = "sha256:85199dfd706869641b72b2e8955d5416a4b2b7dc4b0e8e6d97b4cc1299a6983b", size = 40750, upload-time = "2026-06-03T15:19:02.959Z" },
+    { url = "https://files.pythonhosted.org/packages/28/00/db89d339bc4ecdc8087fa7b8607ba22ffc27bf96286f340c9620bea428b3/filelock-4.2.1-py3-none-any.whl", hash = "sha256:7be2662e9e826b9bba28afc0f843a123280d799a2ea44bb5d35ccec67905ae44", size = 162455, upload-time = "2026-10-17T16:48:12.937Z" },
 ]
 
 [[package]]
@@ -4118,7 +4119,7 @@ wheels = [
 
 [[package]]
 name = "strands-agents"
-version = "1.41.0"
+version = "1.43.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "boto3" },
@@ -4134,9 +4135,9 @@ dependencies = [
     { name = "typing-extensions" },
     { name = "watchdog" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/f0/2f/315889aa7ec662d72db1743df253bbc463a64715c77f0a244f6483bcdc1d/strands_agents-1.41.0.tar.gz", hash = "sha256:e91837ab7f3b90fc2200426ea8756e0cd6a0f665a488c72d03ab835788f6adcf", size = 886067, upload-time = "2026-05-21T17:50:09.682Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/06/e7/ba9faab3ebaa63325ef03b61a74806bc5ccb6b626428541f898b4f33fb21/strands_agents-1.43.0.tar.gz", hash = "sha256:379ad28af36d9306c7ae3f43702b086082193e8eafa53de051c9ce91496178ac", size = 922114, upload-time = "2026-06-12T14:27:57.069Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/1b/4a/7855503e8e270324e1092745712b78e7de50fc64340ed9cf4eea0cd1c57c/strands_agents-1.41.0-py3-none-any.whl", hash = "sha256:1792e488812ce9fd8a9e815cf37b86a5de33f5b9cae5b1e54608129712cea142", size = 438042, upload-time = "2026-05-21T17:50:07.371Z" },
+    { url = "https://files.pythonhosted.org/packages/68/35/29fc4c02293aef54dfa59a5516419153a9fb15a4857ecf8f2ce8638ae3dd/strands_agents-1.43.0-py3-none-any.whl", hash = "sha256:b934f74fe1b7103d438684b69ee044223a5bb407db2ccd2b55e5da6bf639d31b", size = 472542, upload-time = "2026-06-12T14:27:55.55Z" },
 ]
 
 [[package]]

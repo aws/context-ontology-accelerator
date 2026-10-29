@@ -38,6 +38,7 @@ import {
   type Edge,
   type NodeTypes,
   type NodeChange,
+  type AriaLabelConfig,
   Handle,
   Position,
   ReactFlowProvider,
@@ -635,6 +636,18 @@ function OntologyGraphFlowInner({
   const showEdgeLabels = useStore((s) => s.transform[2] >= EDGE_LABEL_MIN_ZOOM);
 
   const { t } = useAppI18n();
+  // React Flow's own control and minimap labels are English defaults; route
+  // them through the catalogue so screen readers hear the UI language.
+  const ariaLabelConfig: Partial<AriaLabelConfig> = useMemo(
+    () => ({
+      "controls.ariaLabel": t("Control Panel"),
+      "controls.zoomIn.ariaLabel": t("Zoom In"),
+      "controls.zoomOut.ariaLabel": t("Zoom Out"),
+      "controls.fitView.ariaLabel": t("Fit View"),
+      "minimap.ariaLabel": t("Mini Map"),
+    }),
+    [t],
+  );
   const flowNodes: OntologyFlowNode[] = useMemo(
     () =>
       visibleNodes.map((n) => ({
@@ -1272,6 +1285,7 @@ function OntologyGraphFlowInner({
           maxZoom={2.5}
           nodesDraggable
           proOptions={{ hideAttribution: true }}
+          ariaLabelConfig={ariaLabelConfig}
         >
           <Background variant={BackgroundVariant.Dots} gap={16} size={1} />
           <Controls showInteractive={false} />

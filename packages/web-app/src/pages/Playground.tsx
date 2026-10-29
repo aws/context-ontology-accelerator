@@ -393,6 +393,7 @@ export const Playground: React.FC = () => {
                             queryUsed: msg.response.result?.queryUsed,
                             sparqlGenerated:
                               msg.response.result?.sparqlGenerated,
+                            executionMode: msg.response.result?.executionMode,
                             latencyMs: (
                               msg.response.result?.trace ?? []
                             ).reduce((sum, t) => sum + t.durationMs, 0),

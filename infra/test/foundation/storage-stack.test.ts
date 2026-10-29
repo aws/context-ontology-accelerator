@@ -8,8 +8,11 @@ import { StorageStack } from "../../lib/stacks/foundation/storage-stack";
 
 const TEST_ENV = { account: "123456789012", region: "us-east-1" };
 
-function buildStacks(): { network: NetworkStack; template: Template } {
-  const app = new cdk.App();
+function buildStacks(context: Record<string, string> = {}): {
+  network: NetworkStack;
+  template: Template;
+} {
+  const app = new cdk.App({ context });
   const network = new NetworkStack(app, "TestNetwork", { env: TEST_ENV });
   const storage = new StorageStack(app, "TestStorage", {
     network,
@@ -80,9 +83,12 @@ describe("StorageStack", () => {
         network,
         env: TEST_ENV,
       });
-      Template.fromStack(storage).hasResourceProperties("AWS::Neptune::DBInstance", {
-        DBInstanceClass: "db.r8g.2xlarge",
-      });
+      Template.fromStack(storage).hasResourceProperties(
+        "AWS::Neptune::DBInstance",
+        {
+          DBInstanceClass: "db.r8g.2xlarge",
+        },
+      );
     });
 
     it("applies DESTROY removal policy to cluster and instance", () => {
@@ -129,6 +135,98 @@ describe("StorageStack", () => {
           },
         },
       );
+    });
+
+    it("allows the created aoss-data endpoint in the network policy", () => {
+      const { template } = buildStacks();
+      template.hasResourceProperties(
+        "AWS::OpenSearchServerless::SecurityPolicy",
+        {
+          Type: "network",
+          Policy: {
+            "Fn::Join": [
+              "",
+              Match.arrayWith([
+                Match.stringLikeRegexp('"SourceVPCEs":\\["$'),
+                {
+                  "Fn::ImportValue": Match.stringLikeRegexp("AossEndpoint"),
+                },
+              ]),
+            ],
+          },
+        },
+      );
+    });
+
+    it.each(["dev", "tst", "demo", "pentest", "beta", "prod", undefined])(
+      "network policy is VPC-only for env=%s",
+      (envName) => {
+        const app = new cdk.App();
+        if (envName) app.node.setContext("env", envName);
+        const network = new NetworkStack(app, "N", { env: TEST_ENV });
+        const storage = new StorageStack(app, "S", { network, env: TEST_ENV });
+        const policies = Template.fromStack(storage).findResources(
+          "AWS::OpenSearchServerless::SecurityPolicy",
+          { Properties: { Type: "network" } },
+        );
+        const docs = Object.values(policies).map((p) =>
+          JSON.stringify(p.Properties.Policy),
+        );
+        expect(docs).toHaveLength(1);
+        expect(docs[0]).toContain("SourceVPCEs");
+        expect(docs[0]).not.toContain("AllowFromPublic");
+      },
+    );
+
+    it.each(["dev", "tst"])(
+      "allows the supplied aoss-data endpoint when importing a VPC (env %s)",
+      (envName) => {
+        const { template } = buildStacks({
+          env: envName,
+          vpc_id: "vpc-0abc123",
+          aoss_vpc_endpoint_id: "vpce-0abc123def4567890",
+        });
+        const [policy] = Object.values(
+          template.findResources("AWS::OpenSearchServerless::SecurityPolicy", {
+            Properties: { Type: "network" },
+          }),
+        );
+        const rules = JSON.parse(String(policy.Properties.Policy));
+        expect(rules[0].SourceVPCEs).toEqual(["vpce-0abc123def4567890"]);
+      },
+    );
+
+    it("synthesizes an imported VPC with no explicit stack env, as app.ts does", () => {
+      // app.ts passes no env: the account and region come from the CDK CLI.
+      const saved = { ...process.env };
+      process.env.CDK_DEFAULT_ACCOUNT = "123456789012";
+      process.env.CDK_DEFAULT_REGION = "us-west-2";
+      try {
+        const app = new cdk.App({
+          context: {
+            env: "tst",
+            vpc_id: "vpc-0abc123",
+            aoss_vpc_endpoint_id: "vpce-0abc123def4567890",
+          },
+        });
+        const network = new NetworkStack(app, "TestNetwork");
+        const storage = new StorageStack(app, "TestStorage", { network });
+        const template = Template.fromStack(storage);
+
+        expect(storage.account).toBe(network.account);
+        expect(storage.region).toBe(network.region);
+        expect(storage.region).toBe("us-west-2");
+        const [policy] = Object.values(
+          template.findResources("AWS::OpenSearchServerless::SecurityPolicy", {
+            Properties: { Type: "network" },
+          }),
+        );
+        const rules = JSON.parse(String(policy.Properties.Policy));
+        expect(rules[0].SourceVPCEs).toEqual(["vpce-0abc123def4567890"]);
+        app.synth();
+      } finally {
+        process.env = { ...saved };
+      }
     });
 
     it("collection depends on encryption and network policies", () => {

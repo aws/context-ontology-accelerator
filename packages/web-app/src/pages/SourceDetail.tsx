@@ -204,6 +204,17 @@ const ValueWithLabel: React.FC<{
   </div>
 );
 
+// extractionConfig stores chunkSize and chunkOverlap only when the source set
+// them. An absent value, or 0, means the graphrag-toolkit default applies
+// (256-token chunks, 25-token overlap), so only a positive whole number is shown
+// as a set value. The KG build reads chunkOverlap only when chunkSize > 0, so
+// the caller shows the overlap as the default whenever the size is.
+function chunkTokens(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value) && value > 0
+    ? value
+    : undefined;
+}
+
 // ── Component ─────────────────────────────────────────────────────────────────
 
 export const SourceDetail: React.FC = () => {
@@ -748,7 +759,10 @@ export const SourceDetail: React.FC = () => {
       )}
 
       {isDatabase && filterWarnings.length > 0 && (
-        <Alert type="warning" header="A filter had no effect on the last scan">
+        <Alert
+          type="warning"
+          header={t("A filter had no effect on the last scan")}
+        >
           <SpaceBetween size="xs">
             {filterWarnings.map((warning) => (
               <Box variant="p" key={warning}>
@@ -1195,7 +1209,7 @@ export const SourceDetail: React.FC = () => {
                               label: t("Table filter"),
                               value: String(
                                 dbDetails.glueConfiguration.tableFilter ??
-                                  "(none)",
+                                  t("(none)"),
                               ),
                             },
                           ]}
@@ -1233,14 +1247,14 @@ export const SourceDetail: React.FC = () => {
                               label: t("Schema filter"),
                               value: String(
                                 dbDetails.jdbcConfiguration.schemaFilter ??
-                                  "(none)",
+                                  t("(none)"),
                               ),
                             },
                             {
                               label: t("Table filter"),
                               value: String(
                                 dbDetails.jdbcConfiguration.tableFilter ??
-                                  "(none)",
+                                  t("(none)"),
                               ),
                             },
                             {
@@ -1276,14 +1290,14 @@ export const SourceDetail: React.FC = () => {
                               label: t("Table filter"),
                               value: String(
                                 dbDetails.customConnectorConfiguration
-                                  .tableFilter ?? "(none)",
+                                  .tableFilter ?? t("(none)"),
                               ),
                             },
                             {
                               label: t("Table exclude filter"),
                               value: String(
                                 dbDetails.customConnectorConfiguration
-                                  .tableExcludeFilter ?? "(none)",
+                                  .tableExcludeFilter ?? t("(none)"),
                               ),
                             },
                           ]}
@@ -1499,6 +1513,15 @@ export const SourceDetail: React.FC = () => {
                   {(extractionConfig.deletePrevVersions as boolean)
                     ? t("Yes")
                     : t("No")}
+                </ValueWithLabel>
+                <ValueWithLabel label={t("Chunk size (tokens)")}>
+                  {chunkTokens(extractionConfig.chunkSize) ??
+                    t("Default (256 tokens)")}
+                </ValueWithLabel>
+                <ValueWithLabel label={t("Chunk overlap (tokens)")}>
+                  {(chunkTokens(extractionConfig.chunkSize) !== undefined
+                    ? chunkTokens(extractionConfig.chunkOverlap)
+                    : undefined) ?? t("Default (25 tokens)")}
                 </ValueWithLabel>
               </ColumnLayout>
             </Container>

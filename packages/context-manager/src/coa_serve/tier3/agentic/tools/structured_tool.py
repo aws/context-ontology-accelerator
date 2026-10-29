@@ -50,7 +50,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from ....exceptions import AccessDeniedError
-from .base import ToolResult
+from .base import ExecutedQuery, ToolResult
 from .registry import ToolRegistry
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -194,7 +194,17 @@ class StructuredQueryTool:
         # generic item view too (chunks/entities stay empty for a structured tool).
         items = tuple({"type": "row", **row} for row in result.rows)
         detail = f"{self.name}: {len(rows)} rows via {result.strategy_name} (conf {result.confidence:.2f})"
-        return ToolResult(rows=rows, items=items, detail=detail)
+        # Capture the query artifacts this tool built + executed so Deep Reasoning
+        # can return them the same way Standard mode does (#1166). The VKG path
+        # yields both a SPARQL statement and the SQL it compiled to; NL→SQL yields
+        # SQL only (result.sparql is empty). Surfaced behind includeDebugInfo at
+        # assembly time — capturing here does not itself expose them.
+        executed: list[ExecutedQuery] = []
+        if result.sparql:
+            executed.append(ExecutedQuery(kind="sparql", query=result.sparql))
+        if result.sql:
+            executed.append(ExecutedQuery(kind="sql", query=result.sql))
+        return ToolResult(rows=rows, items=items, detail=detail, executed_queries=tuple(executed))
 
 
 def build_structured_tools(

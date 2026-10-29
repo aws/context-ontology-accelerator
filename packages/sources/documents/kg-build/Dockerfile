@@ -43,10 +43,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 # unconstrained — does not touch the boto3/botocore cap above), and REMOVE msgpack — an
 # orphan that nothing imports or declares (verified via grep + pipdeptree --reverse),
 # pulled in transiently and left behind. `pip uninstall -y` is a no-op exit 0 if absent.
+# Also delete spaCy's bundled test suite: spacy/tests/package/requirements.txt pins
+# black==22.3.0, which scanners report as an installed package (CVE-2026-31900,
+# CVE-2026-32274) although black is never installed; nothing imports spacy.tests.
 COPY packages/sources/ /tmp/sources/
 RUN pip install --no-cache-dir /tmp/sources/ && rm -rf /tmp/sources/ && \
     pip install --no-cache-dir --upgrade pip "setuptools>=78.1.1" && \
-    pip uninstall -y msgpack
+    pip uninstall -y msgpack && \
+    python -c "import os, shutil, spacy; shutil.rmtree(os.path.join(os.path.dirname(spacy.__file__), 'tests'), ignore_errors=True)"
 
 USER appuser
 CMD ["python", "-m", "coa_sources.documents.kg_build.graph_build"]

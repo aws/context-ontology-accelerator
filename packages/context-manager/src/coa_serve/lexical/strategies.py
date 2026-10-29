@@ -46,10 +46,11 @@ graphrag/botocore import chain. Only invoking a ``build_engine`` does.
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Literal
+from typing import Any, Literal
 
 import structlog
 
@@ -80,6 +81,30 @@ class RetrieverStrategy(StrEnum):
 
 
 DEFAULT_STRATEGY: RetrieverStrategy = RetrieverStrategy.CHUNK_BASED_SEMANTIC
+
+# Stored on raw chunk metadata immediately before the toolkit clears the
+# source-level score. Formatting clears chunks from the prompt copy, so this
+# adapter-only marker never leaks into synthesis text.
+_PRESERVED_RESULT_SCORE_METADATA_KEY = "_coa_result_relevance_score"
+
+# Set on a query engine by :func:`_install_score_preserving_processors` to record
+# whether the patch actually landed. The patch reads two PRIVATE graphrag-toolkit
+# attributes (``engine.retriever`` and its ``retriever_fn``); a toolkit upgrade that
+# renames or restructures either one makes the patch a silent no-op, and every
+# lexical relevance score then reverts to 0.0 — indistinguishable from a genuine
+# zero relevance, with nothing in the trace to say why. The retriever reads this
+# flag and degrades the step instead.
+SCORE_PRESERVATION_ATTR = "_coa_score_preservation_installed"
+
+
+def score_preservation_installed(engine: object) -> bool:
+    """Whether score preservation is active on ``engine``.
+
+    Defaults to ``True`` for an engine this module never patched (a test double, or
+    a direct-family engine that takes ``processors`` as a constructor argument), so
+    the flag only ever reports a REAL miss.
+    """
+    return bool(getattr(engine, SCORE_PRESERVATION_ATTR, True))
 
 
 @dataclass(frozen=True)
@@ -136,7 +161,79 @@ _BENCHMARK_PROCESSOR_ARGS: dict = {
     "max_search_results": 10,
     "max_statements": 200,
     "derive_subqueries": False,
+    "include_chunk_details": True,
 }
+
+
+def _score_preserving_processors() -> list[type]:
+    """Return the pinned toolkit processor chain with exact rank-score capture.
+
+    The toolkit computes ``SearchResult.score`` before truncating each topic to
+    ``max_statements_per_topic``, then ``ClearScores`` erases that exact ranking
+    value. Reconstructing from the surviving statements is not equivalent. This
+    replacement stores the already-computed score on raw chunk metadata before
+    clearing it; the adapter reads the marker from the unformatted result copy.
+    """
+    from graphrag_toolkit.lexical_graph.retrieval.processors import ClearScores
+    from graphrag_toolkit.lexical_graph.retrieval.retrievers.traversal_based_base_retriever import (
+        DEFAULT_PROCESSORS,
+    )
+
+    class PreserveAndClearScores(ClearScores):
+        def _process_results(self, search_results: Any, query: Any) -> Any:
+            for search_result in search_results.results:
+                score = search_result.score
+                stored = False
+                if score is not None:
+                    for topic in search_result.topics:
+                        for chunk in topic.chunks:
+                            chunk.metadata = {
+                                **chunk.metadata,
+                                _PRESERVED_RESULT_SCORE_METADATA_KEY: score,
+                            }
+                            stored = True
+                # A result without chunks has nowhere safe to store the marker;
+                # retain its NodeWithScore value rather than losing the score.
+                if stored:
+                    search_result.score = None
+            return search_results
+
+    return [PreserveAndClearScores if processor is ClearScores else processor for processor in DEFAULT_PROCESSORS]
+
+
+def _install_score_preserving_processors(engine: Any) -> Any:
+    """Inject score preservation into the factory's per-query retriever.
+
+    Depends on two private graphrag-toolkit attributes. On a miss the engine still
+    works, but every relevance score comes back 0.0, so the outcome is recorded on
+    the engine (:data:`SCORE_PRESERVATION_ATTR`) and warned about here rather than
+    returning quietly — a silently unranked result set looks exactly like a
+    genuinely irrelevant one.
+    """
+    query_mode_retriever = getattr(engine, "retriever", None)
+    original_retriever_fn = getattr(query_mode_retriever, "retriever_fn", None)
+    if not callable(original_retriever_fn):
+        logger.warning(
+            "lexical_score_preservation_not_installed",
+            engine_type=type(engine).__name__,
+            has_retriever=query_mode_retriever is not None,
+            retriever_type=type(query_mode_retriever).__name__ if query_mode_retriever is not None else None,
+            has_retriever_fn=original_retriever_fn is not None,
+            consequence="lexical relevance scores will be 0.0",
+        )
+        with contextlib.suppress(AttributeError, TypeError):
+            setattr(engine, SCORE_PRESERVATION_ATTR, False)
+        return engine
+    processors = _score_preserving_processors()
+
+    def create_retriever(**kwargs: Any) -> Any:
+        kwargs["processors"] = processors
+        return original_retriever_fn(**kwargs)
+
+    query_mode_retriever.retriever_fn = create_retriever
+    with contextlib.suppress(AttributeError, TypeError):
+        setattr(engine, SCORE_PRESERVATION_ATTR, True)
+    return engine
 
 
 # ---------------------------------------------------------------------------
@@ -157,14 +254,16 @@ def _build_chunk_based_engine(graph_store, vector_store, *, tenant_id):
     from graphrag_toolkit.lexical_graph import LexicalGraphQueryEngine
     from graphrag_toolkit.lexical_graph.retrieval.retrievers import ChunkBasedSearch
 
-    return LexicalGraphQueryEngine.for_traversal_based_search(
-        graph_store,
-        vector_store,
-        tenant_id=tenant_id,
-        retrievers=[ChunkBasedSearch],
-        post_processors=[],
-        context_format="raw",
-        **_BENCHMARK_PROCESSOR_ARGS,
+    return _install_score_preserving_processors(
+        LexicalGraphQueryEngine.for_traversal_based_search(
+            graph_store,
+            vector_store,
+            tenant_id=tenant_id,
+            retrievers=[ChunkBasedSearch],
+            post_processors=[],
+            context_format="raw",
+            **_BENCHMARK_PROCESSOR_ARGS,
+        )
     )
 
 
@@ -183,14 +282,16 @@ def _build_chunk_based_semantic_engine(graph_store, vector_store, *, tenant_id):
         ChunkBasedSemanticSearch,
     )
 
-    return LexicalGraphQueryEngine.for_traversal_based_search(
-        graph_store,
-        vector_store,
-        tenant_id=tenant_id,
-        retrievers=[ChunkBasedSemanticSearch],
-        post_processors=[],
-        context_format="raw",
-        **_BENCHMARK_PROCESSOR_ARGS,
+    return _install_score_preserving_processors(
+        LexicalGraphQueryEngine.for_traversal_based_search(
+            graph_store,
+            vector_store,
+            tenant_id=tenant_id,
+            retrievers=[ChunkBasedSemanticSearch],
+            post_processors=[],
+            context_format="raw",
+            **_BENCHMARK_PROCESSOR_ARGS,
+        )
     )
 
 
@@ -199,14 +300,16 @@ def _build_entity_based_engine(graph_store, vector_store, *, tenant_id):
     from graphrag_toolkit.lexical_graph import LexicalGraphQueryEngine
     from graphrag_toolkit.lexical_graph.retrieval.retrievers import EntityBasedSearch
 
-    return LexicalGraphQueryEngine.for_traversal_based_search(
-        graph_store,
-        vector_store,
-        tenant_id=tenant_id,
-        retrievers=[EntityBasedSearch],
-        post_processors=[],
-        context_format="raw",
-        **_BENCHMARK_PROCESSOR_ARGS,
+    return _install_score_preserving_processors(
+        LexicalGraphQueryEngine.for_traversal_based_search(
+            graph_store,
+            vector_store,
+            tenant_id=tenant_id,
+            retrievers=[EntityBasedSearch],
+            post_processors=[],
+            context_format="raw",
+            **_BENCHMARK_PROCESSOR_ARGS,
+        )
     )
 
 
@@ -215,14 +318,16 @@ def _build_entity_context_engine(graph_store, vector_store, *, tenant_id):
     from graphrag_toolkit.lexical_graph import LexicalGraphQueryEngine
     from graphrag_toolkit.lexical_graph.retrieval.retrievers import EntityContextSearch
 
-    return LexicalGraphQueryEngine.for_traversal_based_search(
-        graph_store,
-        vector_store,
-        tenant_id=tenant_id,
-        retrievers=[EntityContextSearch],
-        post_processors=[],
-        context_format="raw",
-        **_BENCHMARK_PROCESSOR_ARGS,
+    return _install_score_preserving_processors(
+        LexicalGraphQueryEngine.for_traversal_based_search(
+            graph_store,
+            vector_store,
+            tenant_id=tenant_id,
+            retrievers=[EntityContextSearch],
+            post_processors=[],
+            context_format="raw",
+            **_BENCHMARK_PROCESSOR_ARGS,
+        )
     )
 
 
@@ -231,14 +336,16 @@ def _build_entity_network_engine(graph_store, vector_store, *, tenant_id):
     from graphrag_toolkit.lexical_graph import LexicalGraphQueryEngine
     from graphrag_toolkit.lexical_graph.retrieval.retrievers import EntityNetworkSearch
 
-    return LexicalGraphQueryEngine.for_traversal_based_search(
-        graph_store,
-        vector_store,
-        tenant_id=tenant_id,
-        retrievers=[EntityNetworkSearch],
-        post_processors=[],
-        context_format="raw",
-        **_BENCHMARK_PROCESSOR_ARGS,
+    return _install_score_preserving_processors(
+        LexicalGraphQueryEngine.for_traversal_based_search(
+            graph_store,
+            vector_store,
+            tenant_id=tenant_id,
+            retrievers=[EntityNetworkSearch],
+            post_processors=[],
+            context_format="raw",
+            **_BENCHMARK_PROCESSOR_ARGS,
+        )
     )
 
 
@@ -247,14 +354,16 @@ def _build_topic_based_engine(graph_store, vector_store, *, tenant_id):
     from graphrag_toolkit.lexical_graph import LexicalGraphQueryEngine
     from graphrag_toolkit.lexical_graph.retrieval.retrievers import TopicBasedSearch
 
-    return LexicalGraphQueryEngine.for_traversal_based_search(
-        graph_store,
-        vector_store,
-        tenant_id=tenant_id,
-        retrievers=[TopicBasedSearch],
-        post_processors=[],
-        context_format="raw",
-        **_BENCHMARK_PROCESSOR_ARGS,
+    return _install_score_preserving_processors(
+        LexicalGraphQueryEngine.for_traversal_based_search(
+            graph_store,
+            vector_store,
+            tenant_id=tenant_id,
+            retrievers=[TopicBasedSearch],
+            post_processors=[],
+            context_format="raw",
+            **_BENCHMARK_PROCESSOR_ARGS,
+        )
     )
 
 
@@ -274,18 +383,20 @@ def _build_traversal_engine(graph_store, vector_store, *, tenant_id):
         WeightedTraversalBasedRetriever,
     )
 
-    return LexicalGraphQueryEngine.for_traversal_based_search(
-        graph_store,
-        vector_store,
-        tenant_id=tenant_id,
-        retrievers=[
-            WeightedTraversalBasedRetriever(retriever=ChunkBasedSearch, weight=1.0),
-            WeightedTraversalBasedRetriever(retriever=EntityNetworkSearch, weight=1.0),
-            WeightedTraversalBasedRetriever(retriever=TopicBasedSearch, weight=0.5),
-        ],
-        post_processors=[],
-        context_format="raw",
-        **_BENCHMARK_PROCESSOR_ARGS,
+    return _install_score_preserving_processors(
+        LexicalGraphQueryEngine.for_traversal_based_search(
+            graph_store,
+            vector_store,
+            tenant_id=tenant_id,
+            retrievers=[
+                WeightedTraversalBasedRetriever(retriever=ChunkBasedSearch, weight=1.0),
+                WeightedTraversalBasedRetriever(retriever=EntityNetworkSearch, weight=1.0),
+                WeightedTraversalBasedRetriever(retriever=TopicBasedSearch, weight=0.5),
+            ],
+            post_processors=[],
+            context_format="raw",
+            **_BENCHMARK_PROCESSOR_ARGS,
+        )
     )
 
 
@@ -350,9 +461,16 @@ def _build_topic_beam_engine(graph_store, vector_store, *, tenant_id):
     # (eval_newproc.py): source-first count caps, no token budget, and
     # max_statements_per_topic=9999 on the RETRIEVER so the beam is capped by the
     # processor (10/topic) rather than truncated twice.
+    #
+    # ``include_chunk_details`` is threaded through too: without it the toolkit's
+    # statements query returns each chunk as ``{chunkId, value: NULL, metadata: {}}``
+    # (``TraversalBasedBaseRetriever.get_statements_by_topic_and_source``), so every
+    # source node reaches ``_source_level_chunks`` with no text and is counted as a
+    # dropped anonymous chunk — topic_beam answered with no citations at all.
     processor_args = ProcessorArgs(
         reranker=_BENCHMARK_PROCESSOR_ARGS["reranker"],
         max_search_results=_BENCHMARK_PROCESSOR_ARGS["max_search_results"],
+        include_chunk_details=_BENCHMARK_PROCESSOR_ARGS["include_chunk_details"],
         max_statements_per_topic=10,
     )
 
@@ -360,6 +478,7 @@ def _build_topic_beam_engine(graph_store, vector_store, *, tenant_id):
         graph_store=graph_store,
         vector_store=vector_store,
         processor_args=processor_args,
+        processors=_score_preserving_processors(),
         beam_width=100,
         max_depth=6,
         top_k=50,

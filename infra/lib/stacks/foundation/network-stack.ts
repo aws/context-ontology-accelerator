@@ -26,6 +26,10 @@ import {
  * Context keys (in addition to SCLStack defaults):
  *   - `vpc_id` - optional; if provided, looks up an existing VPC instead
  *     of creating one.
+ *   - `aoss_vpc_endpoint_id` - required with `vpc_id`: the existing
+ *     `com.amazonaws.<region>.aoss-data` interface endpoint in that VPC. The
+ *     OpenSearch Serverless network policy allows only this endpoint, and COA
+ *     creates no endpoints in an imported VPC.
  *
  * Cross-network JDBC connectivity (created-VPC only; any combination):
  *   - VPC peering: `jdbc_peer_vpc_id`, `jdbc_peer_cidrs` (comma-separated),
@@ -69,7 +73,14 @@ export class NetworkStack extends SCLStack {
   /** Port-80 egress used only by direct Snowflake discovery for OCSP. */
   public readonly discoveryOcspSecurityGroup: ec2.SecurityGroup;
 
-  /** Security group for the AOSS VPC endpoint (port 443). */
+  /**
+   * Security group meant for the AOSS VPC endpoint (port 443). It is NOT attached
+   * to the `aoss-data` endpoint: in a created VPC that endpoint has the security
+   * group CDK creates for it (HTTPS from the VPC CIDR), and in an imported VPC
+   * the customer's endpoint has its own. The ingress rules other stacks add here
+   * therefore have no effect; AOSS traffic relies on the callers' egress, so do
+   * not narrow their 443 egress to this group.
+   */
   public readonly aossSecurityGroup: ec2.SecurityGroup;
   /** EC2 Interface VPC Endpoint ID for AOSS (NextGen *.on.aws private DNS). */
   public readonly aossVpcEndpointId: string;
@@ -90,10 +101,46 @@ export class NetworkStack extends SCLStack {
       | undefined;
 
     if (existingVpcId) {
+      if (
+        cdk.Token.isUnresolved(this.account) ||
+        cdk.Token.isUnresolved(this.region)
+      ) {
+        throw new Error(
+          "vpc_id needs an AWS account and region at synth to look up the VPC, " +
+            "and none was resolved. Configure AWS credentials and a region for " +
+            "the CDK CLI (AWS_PROFILE or credentials, and AWS_REGION), or set " +
+            "CDK_DEFAULT_ACCOUNT and CDK_DEFAULT_REGION.",
+        );
+      }
       this.vpc = ec2.Vpc.fromLookup(this, "ImportedVpc", {
         vpcId: existingVpcId,
       });
+      const aossVpcEndpointId = this.ctxString("aoss_vpc_endpoint_id");
+      if (!aossVpcEndpointId) {
+        throw new Error(
+          "vpc_id requires aoss_vpc_endpoint_id (SCL_AOSS_VPC_ENDPOINT_ID): the ID " +
+            `of the com.amazonaws.${cdk.Stack.of(this).region}.aoss-data interface ` +
+            `endpoint in ${existingVpcId}, with private DNS enabled. COA creates no ` +
+            "VPC endpoints in an imported VPC, and the OpenSearch Serverless network " +
+            "policy allows only this endpoint.",
+        );
+      }
+      if (!/^vpce-[0-9a-f]{8,17}$/.test(aossVpcEndpointId)) {
+        throw new Error(
+          `aoss_vpc_endpoint_id must be a VPC endpoint ID (vpce-...), got "${aossVpcEndpointId}"`,
+        );
+      }
+      this.aossVpcEndpointId = aossVpcEndpointId;
     } else {
+      // Fail rather than ignore it: an endpoint without vpc_id means the
+      // operator meant an existing VPC, and would silently get a new one.
+      if (this.ctxString("aoss_vpc_endpoint_id")) {
+        throw new Error(
+          "aoss_vpc_endpoint_id (SCL_AOSS_VPC_ENDPOINT_ID) only applies with " +
+            "vpc_id (SCL_VPC_ID). Set vpc_id to deploy into that endpoint's " +
+            "VPC, or unset aoss_vpc_endpoint_id to let COA create its own VPC.",
+        );
+      }
       // Pin VPC AZs to AgentCore-supported physical zones. AZ *names*
       // (us-east-1a/b/…) map to different physical AZ *IDs* per account,
       // so a fixed ``maxAzs: 2`` lands on supported zones in one account
@@ -382,8 +429,8 @@ export class NetworkStack extends SCLStack {
       "Allow Neptune Gremlin/SPARQL from Lambda functions",
     );
 
-    // AOSS VPC endpoint — dedicated SG so any component that needs AOSS
-    // can be granted access via an ingress rule here.
+    // Not attached to the aoss-data endpoint in either mode, so its ingress
+    // rules have no effect: see the aossSecurityGroup field doc.
     this.aossSecurityGroup = new ec2.SecurityGroup(this, "AossSG", {
       vpc: this.vpc,
       securityGroupName: this.prefixed("aoss-vpce-sg"),

@@ -152,6 +152,32 @@ describe("normalizeResponse", () => {
       );
     });
 
+    it("preserves executionMode 'deep-reasoning'", () => {
+      const normalized = normalizeResponse({
+        result: { executionMode: "deep-reasoning" },
+      });
+      expect(normalized!.result.executionMode).toBe("deep-reasoning");
+    });
+
+    it("preserves executionMode 'standard'", () => {
+      const normalized = normalizeResponse({
+        result: { executionMode: "standard" },
+      });
+      expect(normalized!.result.executionMode).toBe("standard");
+    });
+
+    it("omits executionMode when absent (Standard falls back to tier labels)", () => {
+      const normalized = normalizeResponse({ result: { tier: 2 } });
+      expect(normalized!.result.executionMode).toBeUndefined();
+    });
+
+    it("omits an unrecognized executionMode value", () => {
+      const normalized = normalizeResponse({
+        result: { executionMode: "agentic" },
+      });
+      expect(normalized!.result.executionMode).toBeUndefined();
+    });
+
     it("preserves dataSources", () => {
       const normalized = normalizeResponse({
         result: { dataSources: ["Athena", "Neptune"] },

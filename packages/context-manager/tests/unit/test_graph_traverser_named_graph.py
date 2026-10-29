@@ -259,9 +259,10 @@ class TestGraphTraverserQueryStructure:
 
         query = mock_neptune.query.call_args[0][0]
         assert "OPTIONAL" in query
-        assert "?predicate" in query
-        assert "?related" in query
-        assert "?relLabel" in query
+        assert "?sourceUri" in query
+        assert "?predicateUri" in query
+        assert "?targetUri" in query
+        assert "?predicateLabel" in query
 
     async def test_label_query_has_limit(self, mock_neptune):
         """Label query has a LIMIT clause."""
@@ -289,8 +290,9 @@ class TestGraphTraverserQueryStructure:
 
         query = mock_neptune.query.call_args[0][0]
         assert "(rdfs:domain|rdfs:range)" in query
-        assert "?relPredicate" in query
-        assert "?related" in query
+        assert "?sourceUri" in query
+        assert "?predicateUri" in query
+        assert "?targetUri" in query
 
     async def test_hop_query_1hop_no_hop2_variables(self, mock_neptune):
         """Query should NOT include the legacy hop2 second-level variables."""
@@ -309,8 +311,8 @@ class TestGraphTraverserQueryStructure:
 
         query = mock_neptune.query.call_args[0][0]
         # Direct arms (non-induced ontologies): both edge directions present.
-        assert "?seed ?relPredicate ?entity" in query
-        assert "?entity ?relPredicate ?seed" in query
+        assert "?seed ?predicateUri ?entity" in query
+        assert "?entity ?predicateUri ?seed" in query
         # Induced arm: property node bridged off the seed class.
         assert "?entity (rdfs:domain|rdfs:range) ?seed" in query
 

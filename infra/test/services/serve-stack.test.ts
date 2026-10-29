@@ -15,6 +15,8 @@ import {
   DEFAULT_ENV,
   DEFAULT_GRAPH_URI_BASE,
 } from "../../lib/constants";
+import { expectValidAossNames } from "../utils/aoss-name-assertions";
+import { expectAossGrantsCoveredByDataPolicies } from "../utils/aoss-access-assertions";
 
 jest.mock("../../lib/utils/python-bundling", () => ({
   bundlePython: () =>
@@ -1034,5 +1036,24 @@ describe("ServeStack - teardown", () => {
         ]),
       }),
     });
+  });
+});
+
+describe("ServeStack with a long resource_prefix", () => {
+  it("keeps every OpenSearch Serverless name valid", () => {
+    // Long enough to shorten the proxy and serve read-only access policy names
+    // (prefix + env over 15 characters), short enough for the AgentCore memory
+    // name's own 48-character limit, which LONG_PREFIX_CONTEXT exceeds.
+    const template = createStack({
+      resource_prefix: "coa-demo-long",
+      env: "staging",
+    });
+    expectValidAossNames(template, 2);
+  });
+});
+
+describe("ServeStack - AOSS data access", () => {
+  it("names every aoss:APIAccessAll role in an AOSS data-access policy", () => {
+    expectAossGrantsCoveredByDataPolicies(createStack());
   });
 });

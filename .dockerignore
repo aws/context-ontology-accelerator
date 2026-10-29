@@ -31,10 +31,17 @@
 # Allow smithy-generated models
 !smithy-generated/control-plane-python-server/
 
-# Exclude test artifacts and caches from allowed dirs
+# Exclude test artifacts, caches and host build output from allowed dirs.
+# *.egg-info is not just noise: it lands under an allowlisted src/, so a local
+# Python build shifts the asset hash of every image that uses the repo root as
+# its build context and forces a full rebuild on the next deploy.
 **/__pycache__
 **/.pytest_cache
 **/htmlcov
 **/coverage.xml
 **/junit.xml
 **/*.pyc
+**/*.egg-info
+**/.venv
+**/.ruff_cache
+**/.mypy_cache
