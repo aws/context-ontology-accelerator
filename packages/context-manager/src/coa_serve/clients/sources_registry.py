@@ -411,6 +411,21 @@ class SourcesRegistry:
                 return item
         return {}
 
+    async def document_sources(self, namespace: str) -> list[dict[str, Any]] | None:
+        """Return every DOCUMENTS source record registered to ``namespace``.
+
+        Used to scope reads of original document objects to the buckets and
+        prefixes a namespace actually ingested from. Returns ``None`` when the
+        inventory is uncertain (registry unavailable, timeout, or a truncated
+        page) so a caller that authorizes on this list can fail CLOSED rather
+        than treat a partial read as the complete set. Reuses the cached
+        ``_query_sources`` round-trip.
+        """
+        items = await self._query_sources(namespace)
+        if items is None:
+            return None
+        return [item for item in items if item.get("sourceType") == _SOURCE_TYPE_DOCUMENTS]
+
     async def find_sole_database_source(self, namespace: str) -> dict[str, Any] | None:
         """Find the sole DATABASE source in a namespace, or None if ambiguous.
 

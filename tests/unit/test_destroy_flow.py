@@ -46,7 +46,16 @@ _NAMESPACE = _failed("Ns", "ns-1", "AWS::ServiceDiscovery::PrivateDnsNamespace",
 _NETWORK_SG = _failed(
     "LambdaSG9DBFCFB7", "sg-lambda", "AWS::EC2::SecurityGroup", "resource sg-lambda has a dependent object"
 )
-_NETWORK_FAILURES = {"netfail": _NAMESPACE, "heldnetfail": _NAMESPACE, "netsgpinned": _NETWORK_SG}
+_CONNECTOR_SG = _failed(
+    "ConnectorSG4C9B3C14", "sg-connector", "AWS::EC2::SecurityGroup", "resource sg-connector has a dependent object"
+)
+_NETWORK_FAILURES = {
+    "netfail": _NAMESPACE,
+    "heldnetfail": _NAMESPACE,
+    "netsgpinned": _NETWORK_SG,
+    "glue_held": _CONNECTOR_SG,
+    "glue_rolealias_sg": _CONNECTOR_SG,
+}
 
 # Fake AWS CLI. State lives in files under $FAKE_STATE so a scenario can move
 # through "failed once, then fixed" the way the real stacks do.
@@ -62,7 +71,7 @@ _FAKE_AWS = textwrap.dedent(
     held() {
       case "$S" in
         pinned|wait|runtime|retry|imported|natleft|heldnetfail|netsgpinned|listfail|throttle) return 0 ;;
-        lambdapinned|foreigneni) return 0 ;;
+        lambdapinned|foreigneni|glue_agentcore) return 0 ;;
         released)  # AWS lets go during the ENI wait
           [ -f "$ST/network-deleting" ] || return 0
           n=$(cat "$ST/eni-lookups" 2>/dev/null || echo 0); echo $((n + 1)) > "$ST/eni-lookups"
@@ -70,10 +79,30 @@ _FAKE_AWS = textwrap.dedent(
       esac
       return 1
     }
+    # Federated Glue connections, "<name>:<status>:<prefix-env of its role>:<security group>".
+    GLUE_OURS=coadevds_0123456789abcdef
+    denied() { echo "An error occurred (AccessDeniedException) when calling the $1 operation" >&2; exit 254; }
+    glue_connections() {
+      ours=$GLUE_OURS
+      case "$S" in
+        glue_inprogress) echo "$ours:IN_PROGRESS:coa-dev:sg-connector" ;;
+        glue_several)  # three of ours; aliases (same name shape, other role), a sibling, another group
+          echo "$ours:READY:coa-dev:sg-connector coadevds_fedcba9876543210:FAILED:coa-dev:sg-connector
+            coadevds_00112233445566aa:READY:coa-dev:sg-connector coadevds_aaaaaaaaaaaaaaaa:READY:COA-dev:sg-alias
+            coadevds_bbbbbbbbbbbbbbbb:READY:coa-d-ev:sg-alias2 coadev1ds_cccccccccccccccc:READY:coa-dev-1:sg-sibling
+            coadevds_dddddddddddddddd:READY:coa-dev:sg-other demo-pg:READY:demo:sg-connector" ;;
+        glue_rolealias_sg) echo "coadevds_aaaaaaaaaaaaaaaa:READY:COA-dev:sg-connector" ;;  # an alias's, on our group
+        glue_foreign_available_eni) echo "demo-pg:READY:demo:sg-connector" ;;
+        glue_dangling|glue_orphancatalog|glue_nosg) ;;  # deleted by an earlier run, which left the rest
+        glue_*) echo "$ours:READY:coa-dev:sg-connector" ;;
+      esac
+    }
     rt=coa_dev; [ "$S" = otherenv ] && rt=coa_dev_b  # otherenv: a sibling env took over the pointers
     case "$a" in
       *"configure get region"*) echo us-east-1 ;;
+      *"sts get-caller-identity"*"--query Arn"*) echo arn:aws:sts::123456789012:assumed-role/Admin/me ;;
       *"sts get-caller-identity"*) echo 123456789012 ;;
+      *"iam get-role --role-name Admin"*) echo arn:aws:iam::123456789012:role/Admin ;;
       *"ssm get-parameter"*"/serve/runtime-arn"*)
         [[ "$S" == rerun* ]] && exit 255
         echo "arn:aws:bedrock-agentcore:us-east-1:1:runtime/${rt}_context_manager-AAA" ;;
@@ -128,6 +157,72 @@ _FAKE_AWS = textwrap.dedent(
         fi
         touch "$ST/sgs-deleted" ;;
       *"delete-security-group"*) touch "$ST/sgs-deleted" ;;
+      *"describe-network-interfaces"*"Values=sg-connector"*)  # ENIs of federated Glue connections
+        case "$S" in
+          glue_held|glue_rolealias_sg) printf 'eni-glue1\tin-use\tvpc-123\t5baf48d80110-POSTGRESQL\n' ;;
+          glue_foreign_available_eni) printf 'eni-glue-foreign\tavailable\tvpc-123\t5baf48d80110-POSTGRESQL\n' ;;
+          glue_enilookupfail) echo "An error occurred (UnauthorizedOperation)" >&2; exit 254 ;;
+          glue_orphan)  # one Glue detached but left; one it releases after a few lookups; not Glue's
+            [ -f "$ST/glue-orphan-deleted" ] || printf 'eni-glue-orphan\tavailable\tvpc-123\t5baf48d80110-POSTGRESQL\n'
+            n=$(cat "$ST/glue-eni-lookups" 2>/dev/null || echo 0); echo $((n + 1)) > "$ST/glue-eni-lookups"
+            [ "$n" -lt 3 ] && printf 'eni-glue-attached\tin-use\tvpc-123\t0123456789ab-MYSQL\n'
+            printf 'eni-lambda2\tavailable\tvpc-123\tAWS Lambda VPC ENI-coa-dev-x\n' ;;
+        esac ;;
+      *"delete-network-interface"*"eni-glue-orphan"*) touch "$ST/glue-orphan-deleted" ;;
+      *"delete-network-interface"*"eni-glue-foreign"*) : ;;
+      *"glue get-connections"*)
+        [ "$S" = glue_listdeny ] && denied GetConnections
+        if [ "$S" = glue_listonce ] && [ ! -f "$ST/glue-listed" ]; then  # throttled in step 6 only
+          touch "$ST/glue-listed"
+          echo "An error occurred (ThrottlingException) when calling the GetConnections operation" >&2; exit 254
+        fi
+        for c in $(glue_connections); do
+          IFS=: read -r name status owner sg <<< "$c"
+          [ -f "$ST/glue-deleted-$name" ] && continue
+          role="arn:aws:iam::123456789012:role/$owner-federated-catalog-role"
+          printf '%s\t%s\t%s\t%s\n' "$name" "$status" "$role" "$sg"
+        done ;;
+      *"glue get-connection "*"Connection.Status"*)  # glue_inprogress: READY on the third look
+        n=$(cat "$ST/glue-polls" 2>/dev/null || echo 0); echo $((n + 1)) > "$ST/glue-polls"
+        if [ "$n" -lt 2 ]; then echo IN_PROGRESS; else echo READY; fi ;;
+      *"glue get-connection "*) echo "An error occurred (EntityNotFoundException)" >&2; exit 254 ;;
+      *"glue delete-catalog"*)  # glue_lfadmin: a data lake administrator, once it granted itself DROP
+        if [ -f "$ST/glue-catalog-dropped" ]; then  # an administrator ran the printed commands
+          echo "An error occurred (EntityNotFoundException) when calling the DeleteCatalog operation" >&2; exit 254
+        fi
+        if [ "$S" = glue_catalogdeny ] || { [[ "$S" == glue_lfadmin* ]] && [ ! -f "$ST/glue-drop-granted" ]; }; then
+          echo "An error occurred (AccessDeniedException) when calling the DeleteCatalog operation:" \
+            "Insufficient Lake Formation permission(s): Required Drop on Catalog" >&2; exit 254
+        fi
+        case "$S" in
+          glue_lfadmin_dropfails|glue_lfadmin_revokefail)  # granted, but the delete itself fails
+            echo "An error occurred (InternalServiceException) when calling the DeleteCatalog operation" >&2
+            exit 254 ;;
+          glue_lfadmin_retrynotfound)  # someone else dropped it in between
+            echo "An error occurred (EntityNotFoundException) when calling the DeleteCatalog operation" >&2
+            exit 254 ;;
+        esac ;;
+      *"lakeformation grant-permissions"*)
+        [[ "$S" == glue_lfadmin* ]] || denied GrantPermissions
+        touch "$ST/glue-drop-granted" ;;
+      *"lakeformation revoke-permissions"*)
+        [ "$S" = glue_lfadmin_revokefail ] && denied RevokePermissions
+        rm -f "$ST/glue-drop-granted" ;;
+      *"lakeformation deregister-resource"*)
+        [ "$S" = glue_deregdeny ] && denied DeregisterResource
+        touch "$ST/glue-deregistered" ;;
+      *"glue delete-connection"*)
+        [ "$S" = glue_deletedeny ] && denied DeleteConnection
+        name=${a##*--connection-name }; touch "$ST/glue-deleted-${name%% *}" ;;
+      *"lakeformation list-resources"*)  # a registration whose connection an earlier run deleted
+        case "$S" in glue_dangling|glue_deregdeny)
+          [ -f "$ST/glue-deregistered" ] || echo "arn:aws:glue:us-east-1:123456789012:connection/$GLUE_OURS" ;;
+        esac ;;
+      *"glue get-catalogs"*)
+        case "$S" in
+          glue_catalogdeny|glue_orphancatalog) echo "$GLUE_OURS" ;;
+          glue_several) printf 'coadevds_aaaaaaaaaaaaaaaa\tcoadev1ds_cccccccccccccccc\n' ;;  # theirs
+        esac ;;
       *"describe-network-interfaces"*"group-id"*)
         case "$S" in
           enideny) echo "An error occurred (UnauthorizedOperation)" >&2; exit 254 ;;
@@ -207,6 +302,7 @@ _FAKE_AWS = textwrap.dedent(
         f=$FAKE_NETWORK_FAILURE  # lambdapinned: the Lambda ENI holds a network stack group until swept
         [ "$S" = lambdapinned ] && [ ! -f "$ST/lambda-eni-deleted" ] && f="$f,$FAKE_NETWORK_SG_FAILURE"
         echo "{\"StackResourceSummaries\":[$f]}" ;;
+      *"list-stack-resources"*"coa-dev-network"*"ConnectorSG"*) [ "$S" = glue_nosg ] || echo sg-connector ;;
       *"list-stack-resources"*"coa-dev-network"*) printf 'AWS::EC2::VPC\tvpc-123\n' ;;
       *"delete-stack"*"coa-integ-aoss-inspect"*) touch "$ST/inspect-deleted" ;;
       *"delete-stack"*"-coa-connector"*)
@@ -221,6 +317,8 @@ _FAKE_AWS = textwrap.dedent(
             touch "$ST/network-gone" ;;
           released) if [ -f "$ST/sgs-deleted" ]; then touch "$ST/network-gone"; else touch "$ST/network-deleting"; fi ;;
           domaingone|inspect|inspectfail|inspectunknown|inspectflaky) touch "$ST/network-gone" ;;
+          glue_held|glue_agentcore|glue_rolealias_sg) touch "$ST/network-deleting" ;;
+          glue_*) touch "$ST/network-gone" ;;
           netslow) touch "$ST/network-slow" ;;
           refused) echo "An error occurred (ValidationError): Role is invalid or cannot be assumed" >&2; exit 254 ;;
           lambda)
@@ -256,6 +354,7 @@ _FAKE_PNPM = textwrap.dedent(
         listfail|sibling|connretry|conninprogress|onefail|ownerlive|throttle) exit 0 ;;
         orphan|rerunsgfail|review|sgretry|netsgpinned|lambdapinned|released|otherenv|ourdomain) exit 0 ;;
         sgfailonce|connbusy|foreigneni|domaingone|netslow|inspect|inspectfail|inspectunknown|inspectflaky) exit 0 ;;
+        glue_*) exit 0 ;;
         rerunfail) exit 1 ;;
       esac
       if [ ! -f "$ST/mcp-fixed" ]; then touch "$ST/mcp-failed"; exit 1; fi
@@ -279,9 +378,10 @@ _FAKE_DATE = textwrap.dedent(
 
 def _run(tmp_path: Path, scenario: str, **extra_env: str) -> tuple[int, str, str]:
     bin_dir = tmp_path / "bin"
-    state = tmp_path / "state"
-    bin_dir.mkdir()
-    state.mkdir()
+    state = tmp_path / "state"  # kept between runs on one tmp_path: the second is a re-run
+    bin_dir.mkdir(exist_ok=True)
+    state.mkdir(exist_ok=True)
+    (state / "calls.log").unlink(missing_ok=True)
     fakes = (
         ("aws", _FAKE_AWS),
         ("pnpm", _FAKE_PNPM),
@@ -558,6 +658,236 @@ def test_a_failed_connector_is_deleted_again_after_the_lambda_eni_sweep(tmp_path
     deletes = "delete-stack --stack-name coa-dev-example-coa-connector"
     assert calls.count(deletes) == 2
     assert calls.index("Name=vpc-id,Values=") < calls.rindex(deletes)
+
+
+_GLUE_OURS = "coadevds_0123456789abcdef"
+_GLUE_ARN = f"arn:aws:glue:us-east-1:123456789012:connection/{_GLUE_OURS}"
+_GLUE_CATALOG = f'{{"Catalog":{{"Id":"123456789012:{_GLUE_OURS}"}}}}'
+
+
+def test_no_federated_glue_connection_leaves_glue_alone(tmp_path: Path) -> None:
+    code, output, calls = _run(tmp_path, "clean")
+    assert code == 0, output
+    assert "No federated Glue connections of this deployment (coadevds_*)" in output
+    assert "glue delete-" not in calls
+    assert "deregister-resource" not in calls
+
+
+def test_a_leftover_federated_connection_is_deleted_before_cdk_destroy(tmp_path: Path) -> None:
+    code, output, calls = _run(tmp_path, "glue_one")
+    assert code == 0, output
+    assert f"Deleted federated Glue connection {_GLUE_OURS}" in output
+    # The order of the API's own source delete (cleanup_federated_resources).
+    steps = [
+        f"glue delete-catalog --catalog-id {_GLUE_OURS}",
+        f"lakeformation deregister-resource --resource-arn {_GLUE_ARN}",
+        f"glue delete-connection --connection-name {_GLUE_OURS}",
+        "cdk destroy",
+    ]
+    positions = [calls.index(step) for step in steps]
+    assert positions == sorted(positions), calls
+
+
+def test_a_rerun_after_the_glue_sweep_deletes_nothing_more(tmp_path: Path) -> None:
+    _run(tmp_path, "glue_one")
+    code, output, calls = _run(tmp_path, "glue_one")
+    assert code == 0, output
+    assert "glue delete-" not in calls
+    assert "No federated Glue connections of this deployment" in output
+
+
+def test_only_this_deployments_federated_connections_are_deleted(tmp_path: Path) -> None:
+    code, output, calls = _run(tmp_path, "glue_several")
+    assert code == 0, output
+    deleted = re.findall(r"glue delete-connection --connection-name (\S+)", calls)
+    assert sorted(deleted) == sorted([_GLUE_OURS, "coadevds_fedcba9876543210", "coadevds_00112233445566aa"])
+    # Same name shape, another deployment's role: "COA"/"dev" and "coa"/"d-ev" alias "coa"/"dev".
+    assert "its role is arn:aws:iam::123456789012:role/COA-dev-federated-catalog-role" in output
+    assert "its role is arn:aws:iam::123456789012:role/coa-d-ev-federated-catalog-role" in output
+    assert "Leaving Glue connection coadevds_dddddddddddddddd: it does not use" in output
+    assert "coadev1ds_" not in output  # a sibling env's ("dev-1") is not even named like ours
+    assert "Glue connection demo-pg is not this deployment's but uses its connector security group" in output
+    assert "Federated catalogs left" not in output  # the aliases' catalogs are theirs
+
+
+def test_a_catalog_the_operator_cannot_drop_keeps_its_connection_and_fails_the_run(tmp_path: Path) -> None:
+    # Glue refuses DeleteConnection while the catalog exists: nothing else is tried, nor waited for.
+    code, output, calls = _run(tmp_path, "glue_catalogdeny")
+    assert code == 1, output
+    assert "lakeformation grant-permissions" in calls  # tried, as an administrator could
+    assert output.count(f"aws glue delete-catalog --region us-east-1 --catalog-id {_GLUE_OURS}") == 1
+    assert (
+        "aws lakeformation grant-permissions --region us-east-1 --permissions DROP --principal"
+        f" DataLakePrincipalIdentifier=<your-principal-arn> --resource '{_GLUE_CATALOG}'"
+    ) in output
+    assert "only a data lake administrator grant DROP" in output
+    assert "glue delete-connection" not in calls
+    assert "deregister-resource" not in calls
+    assert "Waiting up to" not in output
+    assert "whose connection is gone" not in output  # its connection is still there
+
+
+def test_a_rerun_after_an_admin_dropped_the_catalogs_deletes_the_connections(tmp_path: Path) -> None:
+    code, output, _ = _run(tmp_path, "glue_catalogdeny")
+    assert code == 1, output
+    (tmp_path / "state" / "glue-catalog-dropped").touch()  # an administrator ran the printed commands
+    code, output, calls = _run(tmp_path, "glue_catalogdeny")
+    assert code == 0, output
+    assert f"lakeformation deregister-resource --resource-arn {_GLUE_ARN}" in calls
+    assert f"glue delete-connection --connection-name {_GLUE_OURS}" in calls
+    assert "lakeformation grant-permissions" not in calls
+
+
+def test_a_lake_formation_admin_grants_itself_drop_and_deletes_everything(tmp_path: Path) -> None:
+    code, output, calls = _run(tmp_path, "glue_lfadmin")
+    assert code == 0, output
+    grant = (
+        "lakeformation grant-permissions --region us-east-1 --principal"
+        " DataLakePrincipalIdentifier=arn:aws:iam::123456789012:role/Admin"
+        f" --resource {_GLUE_CATALOG} --permissions DROP"
+    )
+    delete = f"glue delete-connection --connection-name {_GLUE_OURS}"
+    steps = [f"glue delete-catalog --catalog-id {_GLUE_OURS}", grant, delete]
+    positions = [calls.find(step) for step in steps]
+    assert -1 not in positions and positions == sorted(positions), calls
+    assert calls.count(f"glue delete-catalog --catalog-id {_GLUE_OURS}") == 2
+    assert "after granting arn:aws:iam::123456789012:role/Admin DROP on it" in output
+
+
+def test_a_failed_delete_after_granting_drop_revokes_the_grant(tmp_path: Path) -> None:
+    code, output, calls = _run(tmp_path, "glue_lfadmin_dropfails")
+    assert code == 1, output
+    grants, revokes = calls.count("lakeformation grant-permissions"), calls.count("lakeformation revoke-permissions")
+    assert grants >= 1 and revokes == grants, calls
+    assert calls.index("lakeformation grant-permissions") < calls.index("lakeformation revoke-permissions")
+    assert f"aws glue delete-catalog --region us-east-1 --catalog-id {_GLUE_OURS}" in output
+
+
+def test_a_revoke_that_fails_after_a_failed_delete_reports_the_grant_left(tmp_path: Path) -> None:
+    code, output, calls = _run(tmp_path, "glue_lfadmin_revokefail")
+    assert code == 1, output
+    assert "so the grant is still on it" in output
+    revoke = (
+        "aws lakeformation revoke-permissions --region us-east-1 --permissions DROP --principal"
+        f" DataLakePrincipalIdentifier=arn:aws:iam::123456789012:role/Admin --resource '{_GLUE_CATALOG}'"
+    )
+    assert f"ERROR:   {revoke}" in output
+
+
+def test_a_catalog_gone_by_the_retry_after_the_grant_counts_as_dropped(tmp_path: Path) -> None:
+    code, output, calls = _run(tmp_path, "glue_lfadmin_retrynotfound")
+    assert code == 0, output
+    assert calls.count(f"glue delete-catalog --catalog-id {_GLUE_OURS}") == 2
+    assert f"glue delete-connection --connection-name {_GLUE_OURS}" in calls
+    assert "lakeformation revoke-permissions" not in calls  # the grant went with the catalog
+
+
+def test_a_failure_step_8_clears_does_not_fail_the_run(tmp_path: Path) -> None:
+    code, output, calls = _run(tmp_path, "glue_listonce")
+    assert code == 0, output
+    assert "Could not list the Glue connections" in output  # step 6, throttled
+    assert "could not delete or look up" not in output
+    assert calls.count(f"glue delete-connection --connection-name {_GLUE_OURS}") == 1
+
+
+def test_a_catalog_whose_connection_is_gone_is_reported_not_a_failure(tmp_path: Path) -> None:
+    code, output, calls = _run(tmp_path, "glue_orphancatalog")
+    assert code == 0, output
+    assert "Federated catalogs left whose connection is gone" in output
+    # Matched by name alone: it may be an alias's, so the commands come with a warning.
+    assert "they may belong to another" in output
+    assert "deployment whose prefix and env sanitise to the same name: check that before running" in output
+    assert f"aws glue delete-catalog --region us-east-1 --catalog-id {_GLUE_OURS}" in output
+
+
+@pytest.mark.parametrize(
+    ("scenario", "command"),
+    [
+        ("glue_deregdeny", f"aws lakeformation deregister-resource --region us-east-1 --resource-arn {_GLUE_ARN}"),
+        ("glue_deletedeny", f"aws glue delete-connection --region us-east-1 --connection-name {_GLUE_OURS}"),
+        ("glue_listdeny", "aws glue get-connections --region us-east-1"),  # not taken as "none"
+    ],
+)
+def test_federated_glue_left_behind_fails_the_run_with_the_command(tmp_path: Path, scenario: str, command: str) -> None:
+    code, output, calls = _run(tmp_path, scenario)
+    assert code == 1, output
+    assert command in output
+    assert "No federated Glue connections" not in output
+    if scenario == "glue_deregdeny":  # the connection still goes, so the network stack can
+        assert calls.count(f"glue delete-connection --connection-name {_GLUE_OURS}") == 1
+        assert calls.count("lakeformation deregister-resource") == 1
+
+
+def test_a_registration_whose_connection_is_gone_is_deregistered(tmp_path: Path) -> None:
+    code, output, calls = _run(tmp_path, "glue_dangling")
+    assert code == 0, output
+    assert f"Deregistered {_GLUE_ARN} from Lake Formation" in output
+
+
+def test_a_connection_still_being_created_is_deleted_once_ready(tmp_path: Path) -> None:
+    code, output, calls = _run(tmp_path, "glue_inprogress")
+    assert code == 0, output
+    assert "is still being created" in output
+    assert calls.count("glue get-connection --name") == 3
+    assert calls.rindex("glue get-connection --name") < calls.index("glue delete-connection")
+
+
+def test_glue_enis_still_held_after_the_wait_fail_the_run(tmp_path: Path) -> None:
+    code, output, calls = _run(tmp_path, "glue_held")
+    assert code == 1, output
+    assert "Glue is still releasing the ENIs of deleted federated connections on sg-connector: eni-glue1" in output
+    assert "Teardown deferred" not in output
+    assert "unbound variable" not in output
+    assert "delete-network-interface" not in calls  # attached: AWS's to release
+    assert "delete-stack --stack-name coa-dev-network" in calls  # its NAT gateway and endpoints still go
+
+
+def test_a_network_stack_without_a_connector_group_is_not_a_glue_failure(tmp_path: Path) -> None:
+    code, output, calls = _run(tmp_path, "glue_nosg")
+    assert code == 0, output
+    assert "No federated Glue connections of this deployment" in output
+    assert "Values=sg-connector" not in calls
+
+
+def test_a_failed_glue_eni_lookup_fails_the_run_without_waiting(tmp_path: Path) -> None:
+    code, output, calls = _run(tmp_path, "glue_enilookupfail")
+    assert code == 1, output
+    assert "Could not tell whether Glue still holds ENIs of federated connections on sg-connector" in output
+    assert "unknown (the lookup failed: An error occurred (UnauthorizedOperation))" in output
+    assert "Waiting up to" not in output
+    assert calls.count("Values=sg-connector") == 1  # not polled for 30 minutes
+
+
+def test_an_aliased_connection_on_the_connector_group_is_not_waited_for(tmp_path: Path) -> None:
+    code, output, calls = _run(tmp_path, "glue_rolealias_sg")
+    assert code == 1, output
+    assert "Leaving Glue connection coadevds_aaaaaaaaaaaaaaaa: named like this deployment's" in output
+    assert "It uses the connector security group sg-connector: coa-dev-network cannot be deleted" in output
+    assert "Waiting up to" not in output
+    assert "glue delete-connection" not in calls
+
+
+def test_no_glue_eni_is_deleted_while_a_connection_still_uses_the_group(tmp_path: Path) -> None:
+    _, output, calls = _run(tmp_path, "glue_foreign_available_eni")
+    assert "Glue connection demo-pg is not this deployment's but uses its connector security group" in output
+    assert "delete-network-interface" not in calls  # the available ENI may be demo-pg's
+    assert "Waiting up to" not in output
+
+
+def test_an_orphaned_glue_eni_is_deleted_and_an_attached_one_awaited(tmp_path: Path) -> None:
+    code, output, calls = _run(tmp_path, "glue_orphan")
+    assert code == 0, output
+    assert "Glue released them" in output
+    deleted = re.findall(r"delete-network-interface --network-interface-id (\S+)", calls)
+    assert deleted == ["eni-glue-orphan"]  # neither the attached one nor one that is not Glue's
+    assert calls.index("eni-glue-orphan") < calls.index("delete-stack --stack-name coa-dev-network")
+
+
+def test_agentcore_alone_holding_after_the_glue_sweep_still_defers(tmp_path: Path) -> None:
+    code, output, calls = _run(tmp_path, "glue_agentcore")
+    assert code == 3, output
+    assert "Teardown deferred" in output
+    assert f"glue delete-connection --connection-name {_GLUE_OURS}" in calls
 
 
 def test_a_lambda_eni_holding_a_network_group_is_swept_and_the_stack_deleted_again(tmp_path: Path) -> None:

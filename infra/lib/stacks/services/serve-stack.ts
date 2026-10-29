@@ -498,6 +498,11 @@ export class ServeStack extends SCLStack {
           // TODO(aoss-proxy): Remove when AgentCore supports AOSS directly
           OPENSEARCH_PROXY_LAMBDA_ARN: aossProxyFn.functionArn,
           ATHENA_OUTPUT_S3: `s3://${props.athenaResultsBucketName ?? this.prefixed("athena-results")}/`,
+          // Platform bucket that holds UPLOADED documents (<namespaceId>/raw/<uploadId>/...).
+          // Upload sources carry no bucket of their own, so Deep Reasoning's document
+          // reads resolve them here. Same name the sources stack gives the bucket; the
+          // prefix-scoped S3 read grant below already covers it.
+          SOURCES_DATA_BUCKET: `${this.prefixed("sources-data")}-${account}`,
           ATHENA_WORKGROUP_PREFIX: `${this.prefixed("")}`,
           // ATHENA_WORKGROUP_PREFIX is a fallback; primary resolution reads
           // athenaWorkgroupName from the namespaces DDB table at runtime.
@@ -580,6 +585,17 @@ export class ServeStack extends SCLStack {
             undefined && {
             SERVE_NL2SQL_GRAPH_EXPAND: String(
               this.node.tryGetContext("serve_nl2sql_graph_expand"),
+            ),
+          }),
+          // Deployment-wide switch for the recommended Deep Reasoning options that a
+          // request leaves unset. "off" puts every option back to off, for callers
+          // that cannot send per-request options (the REST Query contract carries
+          // none). Absent: the variable is not set and the recommended set applies.
+          ...(this.node.tryGetContext(
+            "serve_deep_reasoning_default_options",
+          ) !== undefined && {
+            DEEP_REASONING_DEFAULT_OPTIONS: String(
+              this.node.tryGetContext("serve_deep_reasoning_default_options"),
             ),
           }),
           // Companion budget: how many walked tables may be appended (default 8 in
