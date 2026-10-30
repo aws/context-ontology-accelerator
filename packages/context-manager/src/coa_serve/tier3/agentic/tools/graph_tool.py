@@ -86,6 +86,36 @@ logger = structlog.get_logger(__name__)
 
 TOOL_NAME = "graph_traversal"
 
+# Source-document lookup used by the read_document tool: the lexical graph's
+# ``__Source__`` node is keyed by the toolkit ``sourceId`` (stored as the Neptune
+# node id) and carries the ingest metadata as properties, including the original
+# ``source_s3_key``. ``{source_label}`` is the tenant-scoped, backtick-wrapped label.
+SOURCE_KEY_LOOKUP = "MATCH (s:{source_label})\nWHERE id(s) = $source_id\nRETURN s.source_s3_key AS key\nLIMIT 1"
+
+# Entity-name routing to source documents (find_documents): entities whose
+# normalized name equals (quality 2) or contains (quality 1) a term, optionally of
+# one class, then the lexical-graph mention path to the raw chunk and its source.
+# Node labels past the tenant-scoped entity are left anonymous: the relationship
+# types fix the path and the tenant scoping of the anchor keeps it in-namespace.
+ENTITY_MENTIONS = (
+    "UNWIND $terms AS term\n"
+    "MATCH (e:{entity_label})\n"
+    "WHERE (e.search_str = term OR e.search_str CONTAINS term)\n"
+    "  AND ($entity_class = '' OR e.class = $entity_class)\n"
+    "WITH term, e, CASE WHEN e.search_str = term THEN 2 ELSE 1 END AS quality\n"
+    "ORDER BY quality DESC\n"
+    "LIMIT {entity_limit}\n"
+    "MATCH (e)-[:`__SUBJECT__`|`__OBJECT__`]->()-[:`__SUPPORTS__`]->()-[:`__MENTIONED_IN__`]->(c)"
+    "-[:`__EXTRACTED_FROM__`]->(src)\n"
+    "RETURN DISTINCT term, quality, e.value AS label, e.class AS class, id(c) AS chunk,\n"
+    "       c.value AS text, id(src) AS source, src.source_s3_key AS key\n"
+    "LIMIT {row_limit}"
+)
+
+# Shape of a toolkit sourceId (``aws:<tenant>:<hash>:<hash>``); anything else is
+# rejected before a query is built.
+_SOURCE_ID_PATTERN = re.compile(r"^[A-Za-z0-9:_.\-]{1,256}$")
+
 # Compatibility contract with graphrag-lexical-graph 3.18.7's persisted
 # ``Entity.search_str``. Keep this tiny local copy instead of importing the
 # toolkit's private graph_utils module at import time: that module eagerly pulls
@@ -282,6 +312,68 @@ class GraphTraversalTool:
         from graphrag_toolkit.lexical_graph import TenantId  # lazy
 
         return TenantId(to_graphrag_tenant_id(namespace)).format_label(label)
+
+    async def find_entity_mentions(
+        self,
+        namespace: str,
+        terms: list[str],
+        *,
+        entity_class: str = "",
+        entity_limit: int = 25,
+        row_limit: int = 200,
+    ) -> list[dict]:
+        """Entities matching ``terms`` by normalized name, and the raw chunks that mention them.
+
+        Normalizes each term with the graph's own ``search_str`` contract, matches
+        entities exactly first and then by containment (``quality`` 2 / 1), keeps
+        the best ``entity_limit``, and walks Entity → Fact → Statement → Chunk →
+        Source to return, per mention, the chunk id and RAW chunk text plus the
+        source id and original S3 key. Bounded by both limits and the tool's query
+        timeout; raises on a backend error (the caller degrades).
+
+        Returns:
+            Rows with ``term`` (the caller's term), ``quality``, ``label``,
+            ``class``, ``chunk``, ``text``, ``source`` and ``key``.
+        """
+        originals: dict[str, str] = {}
+        for term in terms:
+            norm = normalize_graphrag_search_text(term or "")
+            if norm and norm not in originals:
+                originals[norm] = term
+        if not originals:
+            return []
+        cypher = ENTITY_MENTIONS.format(
+            entity_label=self._entity_label(namespace),
+            entity_limit=int(entity_limit),
+            row_limit=int(row_limit),
+        )
+        rows = await self._run_cypher(cypher, {"terms": list(originals), "entity_class": entity_class or ""})
+        out = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            norm = row.get("term", "")
+            out.append({**row, "term": originals.get(norm, norm)})
+        return out
+
+    async def resolve_source_key(self, namespace: str, source_id: str) -> str:
+        """Return the original S3 key of the source document ``source_id``, or ``""``.
+
+        Reads the namespace tenant's ``__Source__`` node. Used by the
+        read_document tool to turn a chunk's opaque document id into a readable
+        key; the key it returns is still authorized against the namespace's
+        registered document sources before anything is read. Raises on a backend
+        error or timeout (the caller degrades).
+        """
+        if not isinstance(source_id, str) or not _SOURCE_ID_PATTERN.match(source_id):
+            return ""
+        cypher = SOURCE_KEY_LOOKUP.format(source_label=self._format_label(namespace, "__Source__"))
+        rows = await self._run_cypher(cypher, {"source_id": source_id})
+        for row in rows:
+            key = row.get("key") if isinstance(row, dict) else None
+            if isinstance(key, str) and key:
+                return key
+        return ""
 
     async def _run_cypher(self, cypher: str, params: dict) -> list[dict]:
         """Execute openCypher on the toolkit store under the query timeout.

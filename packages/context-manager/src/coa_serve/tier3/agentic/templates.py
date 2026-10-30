@@ -82,7 +82,6 @@ MAX_EDGE_TYPES: int = 50
 MIN_TRAVERSAL_LIMIT: int = 1
 MAX_TRAVERSAL_LIMIT: int = 100
 DEFAULT_EDGE_TYPED_LIMIT: int = 100
-
 # A graph statement is copied into both the entity's ``supportingStatements``
 # property and a synthesis chunk. Keep the graph-store result itself bounded,
 # before Python or the LLM can accumulate a high-degree entity's full statement
@@ -99,6 +98,21 @@ MAX_CHUNK_IDS: int = 50
 DEFAULT_CHUNK_WINDOW_HOPS: int = 1
 MAX_CHUNK_WINDOW_HOPS: int = 5
 DEFAULT_CHUNK_WINDOW_LIMIT: int = 50
+# Ceiling on a planner-supplied chunk-window ``limit``; twice the default.
+MAX_CHUNK_WINDOW_LIMIT: int = 100
+
+
+def bounded_limit(value: object, *, default: int, ceiling: int) -> int:
+    """Clamp a planner-supplied row limit to ``[1, ceiling]``.
+
+    The limit is formatted into the query text, so it must be an int; a value that
+    is not one falls back to ``default`` instead of failing the tool call.
+    """
+    try:
+        limit = int(value)  # type: ignore[call-overload]
+    except (TypeError, ValueError):
+        limit = default
+    return max(1, min(limit, ceiling))
 
 
 def normalize_edge_type(value: str) -> str:

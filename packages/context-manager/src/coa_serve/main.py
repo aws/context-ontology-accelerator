@@ -400,6 +400,8 @@ async def _ensure_initialized():
                 step_planner,
                 structured_query_tier=structured_query_tier,
                 guardrail_id_provider=guardrail_provider.guardrail_id,
+                # Scopes the read_document tool to each namespace's DOCUMENTS sources.
+                sources_registry=sources_registry,
             )
         except Exception as exc:
             logger.warning("agentic_retriever_unavailable", error=type(exc).__name__, error_msg=str(exc)[:200])
