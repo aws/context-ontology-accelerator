@@ -52,7 +52,9 @@ from ..templates import (
     DEFAULT_CHUNK_WINDOW_LIMIT,
     MAX_CHUNK_IDS,
     MAX_CHUNK_WINDOW_HOPS,
+    MAX_CHUNK_WINDOW_LIMIT,
     MIN_CHUNK_IDS,
+    bounded_limit,
 )
 from .base import ToolResult
 
@@ -167,7 +169,8 @@ class ChunkExpansionTool:
     ) -> ToolResult:
         """Return the chunks adjacent to ``chunk_ids`` in the source document.
 
-        Validates the id count (1-50) and clamps ``hops`` to ``[1, 5]`` before
+        Validates the id count (1-50) and clamps ``hops`` to ``[1, 5]`` and ``limit`` to
+        ``[1, 100]`` before
         building the query. Never raises for an expected failure: invalid params,
         an unconfigured store, a backend error, or a timeout all return a degraded
         :class:`ToolResult` whose ``detail`` records the reason (Req 9.1-9.2).
@@ -183,7 +186,7 @@ class ChunkExpansionTool:
             chunk_label=self._chunk_label(namespace),
             source_label=self._source_label(namespace),
             hops=hops,
-            limit=int(limit),
+            limit=bounded_limit(limit, default=DEFAULT_CHUNK_WINDOW_LIMIT, ceiling=MAX_CHUNK_WINDOW_LIMIT),
         )
         try:
             rows = await self._run_cypher(cypher, {"chunk_ids": ids})
