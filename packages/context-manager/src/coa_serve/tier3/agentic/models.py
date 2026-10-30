@@ -105,3 +105,11 @@ class PlannerDecision:
     inputs: dict[str, Any] = field(default_factory=dict)
     reasoning: str = ""
     is_ad_hoc: bool = False
+
+
+# What counts as a "named term" in a question (options.entityRouting): shared by the
+# term extraction, the find_documents tool description and the planner guidance.
+NAMED_TERM_KINDS = (
+    "specific identifiers (account or record numbers, ids), people, document or message "
+    "subjects, product features, systems, field or table names, and short quoted phrases"
+)

@@ -1104,3 +1104,28 @@ class TestPooledGlueDatabases:
             federated_catalog_schemas=scope.federated_catalog_schemas,
             default_catalog="",
         )
+
+
+@pytest.mark.unit
+class TestDocumentSources:
+    """``document_sources`` keeps the fail-closed signal and filters to DOCUMENTS."""
+
+    def _registry(self, items):
+        with patch("boto3.resource"):
+            registry = SourcesRegistry(table_name="test-sources", region="us-west-2")
+
+        async def _query(namespace):
+            return items
+
+        registry._query_sources = _query
+        return registry
+
+    @pytest.mark.asyncio
+    async def test_unavailable_inventory_stays_none(self):
+        assert await self._registry(None).document_sources("ns-a") is None
+
+    @pytest.mark.asyncio
+    async def test_only_documents_sources_returned(self):
+        docs = {"sourceType": "DOCUMENTS", "sourceId": "d1"}
+        registry = self._registry([{"sourceType": "DATABASE", "sourceId": "g1"}, docs])
+        assert await registry.document_sources("ns-a") == [docs]
