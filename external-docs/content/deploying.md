@@ -479,6 +479,12 @@ SCL_API_CERT_ARN=arn:aws:acm:us-west-2:123456789012:certificate/api-cert-id \
 SCL_HOSTED_ZONE_ID=Z0123456789ABCDEFGHIJ \
 make deploy-dev
 
+# OpenSearch Serverless capacity floor and ceiling in OCU (default 2 / 96; 0 scales
+# to zero when idle). Not stored: set it on every deploy. See
+# "OpenSearch Serverless (OCU) capacity configuration" below
+SCL_AOSS_MIN_OCU=0 make deploy-dev
+SCL_AOSS_MAX_OCU=32 make deploy-dev
+
 # Optional OoPS! ontology pitfall scan (off by default) — see the note below
 SCL_OOPS_ENDPOINT=https://oops.example.internal/rest make deploy-dev
 ```
@@ -556,7 +562,7 @@ The value is minutes and must be a positive number; CDK fails synth otherwise. O
 
 #### Neptune instance class
 
-The knowledge-graph store is a single provisioned Neptune instance. It defaults to **`db.r8g.large`** (2 vCPU / 16 GiB) — the smaller Graviton class that keeps a first-time or single-tenant deploy's cost down. Neptune sizing is driven by **query concurrency × per-query cost, not graph size**: it allocates two query threads per vCPU, so `large` serves four concurrent SPARQL queries. A `db.r8g.large` runs about **$174/month** on-demand; each step up (`xlarge`, `2xlarge`) doubles both the instance and the price.
+The knowledge-graph store is a single provisioned Neptune instance. It defaults to **`db.r8g.large`** (2 vCPU / 16 GiB) — the smaller Graviton class that keeps a first-time or single-tenant deploy's cost down. Neptune sizing is driven by **query concurrency × per-query cost, not graph size**: it allocates two query threads per vCPU, so `large` serves four concurrent SPARQL queries. A `db.r8g.large` runs about **$200/month** on-demand in us-east-1; each step up (`xlarge`, `2xlarge`) doubles both the instance and the price.
 
 ```bash
 # Deploy dev Neptune on the larger class (default is db.r8g.large)
@@ -688,6 +694,24 @@ SCL_NL2SQL_GRAPH_EXPAND_MAX_TABLES=12 make deploy-dev
 Leaving either setting unset leaves the runtime's default in charge; the stack only sets the Serve runtime variable (`SERVE_NL2SQL_GRAPH_EXPAND` / `SERVE_NL2SQL_GRAPH_EXPAND_MAX_TABLES`) when you pass a value. Changing either one is a stack update, not an image rebuild. A single request can also override the deployment setting with `options.flatGraphExpand` (`true` or `false`). An A/B test that compares the expansion on and off must pass `flatGraphExpand: false` for the "off" arm; leaving the option out now means on.
 
 `scripts/deploy.sh` maps the variables above to the CDK context parameters `serve_nl2sql_graph_expand` and `serve_nl2sql_graph_expand_max_tables`. On a direct `cdk deploy`, pass them as context instead — `--context serve_nl2sql_graph_expand=false` — or set them in the `context` block of `infra/cdk.json`.
+
+#### Deep Reasoning default options
+
+A Deep Reasoning request that leaves an option unset gets the recommended value
+(see [Deep Reasoning request options](serve.md#deep-reasoning-request-options)).
+A request on the streaming endpoint can turn any option off itself; a REST
+`Query` carries no per-request options, so for REST callers the deployment
+setting is the only switch. To put every option back to off for the whole
+deployment, pass the CDK context parameter:
+
+```bash
+cdk deploy <prefix>-dev-serve --context serve_deep_reasoning_default_options=off
+```
+
+The stack then sets `DEEP_REASONING_DEFAULT_OPTIONS` on the Serve runtime; `off`,
+`false`, `0` and `no` all switch the defaults off.
+Left unset, the variable is not set and the recommended options apply. Changing
+it is a stack update, not an image rebuild.
 
 ### VKG Task Sizing
 
@@ -1148,7 +1172,9 @@ fields @timestamp, detail.userIdentity.sessionContext.sessionIssuer.userName as 
 
 The vector store is a NEXTGEN OpenSearch Serverless collection group whose
 indexing/search capacity floor and ceiling are set from two CDK context values,
-`aoss_min_ocu` and `aoss_max_ocu` (both in OCUs). The storage stack
+`aoss_min_ocu` and `aoss_max_ocu` (both in OCUs). `make deploy-dev` passes
+them from `SCL_AOSS_MIN_OCU` and `SCL_AOSS_MAX_OCU`; unset or empty leaves the
+default. The storage stack
 (`infra/lib/stacks/foundation/storage-stack.ts`) **validates these at synth
 time** rather than passing an arbitrary `-c` value straight through to
 CloudFormation — an out-of-range value would otherwise only be rejected later
@@ -1193,8 +1219,15 @@ Standby replicas are fixed at `ENABLED` and must not be changed — AWS rejects
 Example — opt a dev collection into scale-to-zero:
 
 ```bash
-cdk deploy -c aoss_min_ocu=0
+SCL_AOSS_MIN_OCU=0 make deploy-dev
 ```
+
+On a direct `cdk deploy`, pass `--context aoss_min_ocu=0` along with the rest of
+your deployment's context. The value is not stored: a later deploy without it
+puts the floor back to `2`. `make deploy-serve` always does, since it also
+updates the storage stack and doesn't pass `SCL_AOSS_*` through; run
+`make deploy-dev` with the variables again afterwards. Changing it updates the
+collection group in place; the collection and its data are kept.
 
 For the operator-facing scale-to-zero cost/latency tradeoff (cold-start return
 time and how it interacts with ingest), see the `aoss_min_ocu` section in
@@ -1224,9 +1257,9 @@ This runs `scripts/destroy.sh dev`, which orchestrates teardown of resources CFN
 3. **Deletes VKG's per-namespace ECS services** (created outside CloudFormation by the ontology-reload Lambda) and waits for them to reach `INACTIVE`.
 4. **Deletes the Cloud Map services** the VKG reload Lambda registered in the private DNS namespace, which CloudFormation cannot delete while they exist.
 5. **Force-deletes the DataZone domain** via `delete-domain --skip-deletion-check`, which cascades through every project, asset, and asset type under it — CloudFormation's own delete can't do this (see [FAQ](#why-does-namespace-stack-fail-to-delete-with-domain-not-empty)).
-6. **Starts deleting the connector stacks** (`<PREFIX>-dev-*-coa-connector`), which are separate CDK apps; step 8 waits for them.
+6. **Starts deleting the connector stacks** (`<PREFIX>-dev-*-coa-connector`), which are separate CDK apps; step 8 waits for them. Then **deletes the federated Glue connections of registered database sources**, with their federated catalogs and Lake Formation registrations, the way deleting a source through the API does: the sources service creates them at runtime, so no stack deletes them, and each keeps an ENI in the network stack's connector security group. Glue deletes no connection its federated catalog still uses, and only a Lake Formation data lake administrator can drop those catalogs: run the teardown as one, or delete your database sources through the API first. See [A database source's Glue connection keeps the network stack](#a-database-sources-glue-connection-keeps-the-network-stack).
 7. **Runs `cdk destroy` on every stack except network**, re-running it past the failures teardown is known to hit: a runtime security group AWS still holds and a runtime AgentCore is still deleting (the stack is deleted again with either kept out), and an access-log bucket that refilled after it was emptied.
-8. **Finishes the network stack**: waits for the connector stacks, deletes detached Lambda ENIs and the kept runtime security groups once AWS has released their ENIs, then the stack.
+8. **Finishes the network stack**: waits for the connector stacks, deletes any federated Glue connection created meanwhile and waits up to 30 minutes for Glue to release those connections' ENIs, deletes detached Lambda ENIs and the kept runtime security groups once AWS has released their ENIs, then the stack.
 
 One run deletes everything that runs continuously: Neptune, OpenSearch Serverless, the Fargate services, the NAT gateway and the interface endpoints. If AWS still holds the runtimes' ENIs, what remains until the next run is the VPC, its subnets and two security groups, which AWS does not charge for ([Amazon VPC pricing](https://docs.aws.amazon.com/vpc/latest/userguide/what-is-amazon-vpc.html#pricing)); with an imported VPC (`SCL_VPC_ID`), only the two security groups. The script then **exits 3** and prints what is left, when the runtimes were deleted, and the commands to delete the rest by hand. Run `make destroy-dev` again after that (AWS releases the ENIs up to 8 hours after the runtimes were deleted), or set `SCL_ENI_WAIT_MAX_SECONDS` to wait in one run. It defers only while AgentCore's own ENIs hold what is left: anything else that keeps the network stack or a runtime security group is a failure (exit 1), and the script lists it.
 
@@ -1335,6 +1368,40 @@ make destroy-dev   # same SCL_PREFIX and region as the first run
 To deploy again in the meantime, use another `SCL_PREFIX`; with a VPC COA created, `make deploy-dev` refuses the same prefix until the teardown has finished.
 
 Do not try to detach or delete the `agentic_ai` ENIs yourself: AWS owns them and releases them on its own schedule. Detached Lambda ENIs (status `available`, description `AWS Lambda VPC ENI-<PREFIX>-dev-*`) are different; `make destroy-dev` deletes those itself.
+
+### A database source's Glue connection keeps the network stack
+
+**Symptom:** `make destroy-dev` exits 1 with "Could not drop federated catalog …, so its connection cannot be deleted either", "Glue is still releasing the ENIs of deleted federated connections on sg-…", or "Could not deregister …" / "Could not delete Glue connection …", and prints the commands that finish the job. Or, with a plain `cdk destroy` or an older `make destroy-dev`, `<PREFIX>-dev-network` ends `DELETE_FAILED` on `ConnectorSG…` (`has a dependent object`) and a private subnet, and the VPC stays. The ENI left in the VPC looks like an orphaned Lambda ENI, but is not: `InterfaceType` `lambda`, an `ela-attach-…` attachment owned by `amazon-aws`, and a description of 12 hex characters and the database engine, such as `d1c612eeec23-POSTGRESQL`.
+
+**Cause:** every registered database (JDBC) source has a federated Glue connection, `<prefix><env>ds_<hash>` (lowercased, dashes dropped, e.g. `coadevds_9b2a…`), with a Lake Formation registration and a federated catalog of the same name. The sources service creates them when it scans the source, in the connector security group and a private subnet; CloudFormation has no record of them. Connections that share the subnet, group and role share one ENI. Three things hold the teardown up:
+
+- Glue refuses to delete a connection while its federated catalog exists (`Failed to delete since there are federated resources associated with connection`), and dropping the catalog takes `DROP` on it (`Insufficient Lake Formation permission(s): Required Drop on Catalog`). Lake Formation gives that only to the catalog's creator, COA's federation provisioner role, which the operator cannot assume. A data lake administrator can grant it to themselves; anyone else cannot. COA makes only its provisioner role an administrator, and only while the sources stack exists.
+- Glue deletes the ENI about 19 minutes after the connection is deleted, and nothing the account does releases it sooner: an `ela-attach` attachment cannot be detached by the account.
+- When the connection's role (`<PREFIX>-dev-federated-catalog-role`, in the sources stack) is deleted before that, Glue detaches the ENI but leaves it `available`.
+
+**Fix:** `make destroy-dev` deletes these itself: in step 6 it drops each catalog (as a data lake administrator, after granting itself `DROP` on it), deregisters the connection from Lake Formation and deletes it, and in step 8 it waits up to 30 minutes for the ENIs and deletes one Glue detached and left (never an attached one). What it cannot do is drop a catalog without Lake Formation permission. So do one of these:
+
+- Run `make destroy-dev` as a Lake Formation data lake administrator.
+- Before the teardown, delete your database sources through the API (`DELETE /namespaces/{namespaceId}/sources/{sourceId}`), which drops the catalogs with COA's own administrator role. Their ENIs then take about 19 minutes to go, which step 8 waits out.
+- After a run that stopped on the catalogs, have a data lake administrator run the commands it printed, then run `make destroy-dev` again with the same `SCL_PREFIX` and region. Per catalog, as that administrator:
+
+```bash
+aws lakeformation grant-permissions --region <REGION> --permissions DROP \
+  --principal DataLakePrincipalIdentifier=<your-principal-arn> \
+  --resource '{"Catalog":{"Id":"<ACCOUNT>:<prefix><env>ds_<hash>"}}'
+aws glue delete-catalog --region <REGION> --catalog-id <prefix><env>ds_<hash>
+```
+
+To check what holds the group:
+
+```bash
+aws ec2 describe-network-interfaces --region <REGION> \
+  --filters "Name=group-id,Values=<connector-security-group-id>" \
+  --query "NetworkInterfaces[].{Id:NetworkInterfaceId,Type:InterfaceType,Status:Status,Description:Description}"
+aws glue get-connections --region <REGION> --query "ConnectionList[?starts_with(Name, '<prefix><env>ds_')].Name"
+```
+
+`make destroy-dev` deletes a connection only when its name, its role and the connector security group are all this deployment's, because prefixes alias once dashes are dropped (`coa`/`dev-1` and `coa`/`dev1` both give `coadev1ds_…`); it reports the others and leaves them. With an `SCL_PREFIX` that starts with a digit it does not look for them, and says so. Besides the catalog drop (`glue:DeleteCatalog`, and `lakeformation:GrantPermissions` and `lakeformation:RevokePermissions` for the administrator's grant), the run needs `sts:GetCallerIdentity`, `cloudformation:ListStackResources`, `glue:GetConnections`, `glue:DeleteConnection`, `lakeformation:ListResources`, `lakeformation:DeregisterResource`, `ec2:DescribeNetworkInterfaces` and `ec2:DeleteNetworkInterface`; any of them denied fails the run, with the commands to run as someone allowed to. It also uses `glue:GetConnection` and `glue:GetCatalogs`, but does without them: denied `glue:GetConnection`, it does not wait for a connection still being created before deleting it, and leaves alone a Lake Formation registration whose connection may be gone; denied `glue:GetCatalogs`, it does not report leftover catalogs. A catalog left after its connection is gone holds nothing up and is reported as a warning ("Federated catalogs left whose connection is gone"), with the commands to drop it: do, since a catalog binds to whichever connection is next created under its name. Catalogs are matched by name alone, though, so one may belong to another deployment whose prefix and env sanitise to the same name: check before running the commands.
 
 ### Why does namespace stack fail to delete with "domain not empty"?
 
@@ -1555,11 +1622,12 @@ throttled.
 **OpenSearch Serverless has a cost and OCU floor.** The collection is
 `VECTORSEARCH` type inside a `NEXTGEN` collection group, which requires
 `standbyReplicas: ENABLED` (see `infra/lib/stacks/foundation/storage-stack.ts`).
-Standby replicas roughly double OCU consumption versus a single-AZ
-configuration, and Serverless bills a minimum OCU allocation whether or not you
-are querying — so an idle evaluation deployment still accrues cost here. This is
-a durability/availability requirement of the collection group type, not a tunable
-knob.
+Standby replicas are a requirement of the collection group type, not a tunable
+knob. The billed floor is: Serverless bills the collection group's minimum OCU
+(`aoss_min_ocu`, default 2 for indexing plus 2 for search) whether or not you are
+querying, so an idle evaluation deployment still accrues cost here, about
+$700/month in us-east-1. `SCL_AOSS_MIN_OCU=0 make deploy-dev` removes that floor
+(see [OpenSearch Serverless (OCU) capacity configuration](#opensearch-serverless-ocu-capacity-configuration)).
 
 **Neptune runs a single provisioned instance, not Serverless.** One
 `db.r8g.large` primary with no read replica, IAM (SigV4) auth, encryption at
