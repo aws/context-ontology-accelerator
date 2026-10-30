@@ -24,7 +24,8 @@ export interface PythonBundlingOptions {
   readonly srcDirs: string[];
   /**
    * How to install pip dependencies. Provide exactly one of:
-   *   - `requirementsFile` — path to a `requirements.txt`
+   *   - `requirementsFile` — path to a `requirements.txt`, or to a hash-pinned
+   *     `requirements.lock.txt`, which is installed with `--require-hashes`
    *   - `pipDeps` — explicit list of package names
    *
    * If neither is provided, no pip install step runs.
@@ -60,6 +61,15 @@ export interface PythonBundlingOptions {
  * dir for local bundling (and the requirements path stays an absolute host path,
  * since the local step runs on the host and reads the real file).
  */
+/**
+ * True for a hash-pinned lock (`requirements.lock.txt`, written by
+ * scripts/relock-python-requirements.sh), which is installed with
+ * `--require-hashes` so a deploy can only ship the locked files.
+ */
+export function _isHashLocked(requirementsFile: string): boolean {
+  return requirementsFile.endsWith(".lock.txt");
+}
+
 export function _uvInstallCommand(opts: PythonBundlingOptions): string | null {
   const uvPlatform =
     opts.architecture === "arm64"
@@ -68,7 +78,14 @@ export function _uvInstallCommand(opts: PythonBundlingOptions): string | null {
   const flags = `--target /asset-output --python-platform ${uvPlatform} --python-version 3.12 --only-binary :all: -q --no-cache`;
   if (opts.requirementsFile) {
     const reqFile = opts.requirementsFile.replace(/\\/g, "/");
-    return `uv pip install ${flags} -r ${reqFile}`;
+    // A lock already pins the whole tree with hashes. --no-config keeps the
+    // workspace's [tool.uv] constraint-dependencies out of the install: they
+    // are `>=` floors for dev tooling, which hash mode rejects as unpinned, and
+    // the relock script already applied them when it compiled the lock.
+    const lockFlags = _isHashLocked(reqFile)
+      ? " --no-config --require-hashes"
+      : "";
+    return `uv pip install${lockFlags} ${flags} -r ${reqFile}`;
   }
   if (opts.pipDeps?.length) {
     const deps = opts.pipDeps.map((d) => `'${d}'`).join(" ");
@@ -143,7 +160,11 @@ export function bundlePython(opts: PythonBundlingOptions): lambda.Code {
   if (opts.requirementsFile) {
     const reqFile = opts.requirementsFile.replace(/\\/g, "/");
     localPipSteps = localInstall ? [localInstall, cleanup] : [];
-    dockerPipSteps = [`pip install -r ${reqFile} ${pipFlags}`, cleanup];
+    const hashFlag = _isHashLocked(reqFile) ? " --require-hashes" : "";
+    dockerPipSteps = [
+      `pip install${hashFlag} -r ${reqFile} ${pipFlags}`,
+      cleanup,
+    ];
   } else if (opts.pipDeps?.length) {
     const deps = opts.pipDeps.map((d) => `'${d}'`).join(" ");
     localPipSteps = localInstall ? [localInstall, cleanup] : [];

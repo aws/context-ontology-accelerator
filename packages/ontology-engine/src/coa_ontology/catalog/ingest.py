@@ -142,6 +142,17 @@ TAG = _COA.tag
 # of the embedding and the prompt. Matches the Ontop context's per-term cap
 # (_MAX_TERMS_IN_PROMPT in the serve T-Box builder), so both paths show the same.
 _MAX_TERMS_PER_HINT = 5
+# Per-column caps on the column description in the class text. A Glue column
+# comment allows 255 characters, and a 100-character cut dropped the deciding
+# clause of long steward notes. The SQL writer's text (rich=True) keeps all 255.
+# The embedded text (rich=False) stays at 100: the embedding input is cut at
+# 8000 characters, and longer notes would push a wide table's last columns out of
+# the vector. The T-Box builder in the serve runtime has its own constant
+# (_MAX_PROPERTY_DESCRIPTION_CHARS), kept equal to _MAX_COLUMN_COMMENT_CHARS on
+# purpose; the two are separate constants and are not linked. Neither is a
+# setting. The 255 cap applies only to ontologies accepted after upgrade.
+_MAX_COLUMN_COMMENT_CHARS = 255
+_MAX_COLUMN_COMMENT_EMBED_CHARS = 100
 _SUPERSEDED_ANNOTATION_PREDICATES: dict[URIRef, URIRef] = {
     RDFS.comment: SUPERSEDED_COMMENT,
     SKOS.definition: SUPERSEDED_DEFINITION,
@@ -1531,17 +1542,20 @@ def _accumulate_embeddings(
             return parts
 
         def _cols(*, rich: bool) -> str:
-            # rich=False → embedded vector: column names + comments (type, sampled
-            # values and per-column terms are low-signal for retrieval and would
-            # crowd columns out of the 8000-character input).
+            # rich=False → embedded vector: column names + comments cut at
+            # _MAX_COLUMN_COMMENT_EMBED_CHARS (type, sampled values and
+            # per-column terms are low-signal for retrieval and would crowd
+            # columns out of the 8000-character input).
             # rich=True → generation context: adds type, steward terms and allowed
-            # values so the LLM writes correct casts and WHERE literals.
+            # values so the LLM writes correct casts and WHERE literals, and keeps
+            # the comment up to _MAX_COLUMN_COMMENT_CHARS.
             # A column whose OWL label differs from its physical name (#1287) carries
             # the label as "business name"; the name before ":" is what SQL executes.
+            comment_cap = _MAX_COLUMN_COMMENT_CHARS if rich else _MAX_COLUMN_COMMENT_EMBED_CHARS
             return ", ".join(
                 (f"{column}:{dtype}" if rich else column)
                 + (f" (business name: {business})" if business else "")
-                + (f" ({comment[:100]})" if comment else "")
+                + (f" ({comment[:comment_cap]})" if comment else "")
                 + (hints if rich else "")
                 + (f" allowed values: [{', '.join(vals[:20])}]" if rich and vals else "")
                 for column, business, dtype, comment, vals, hints in data_props_list

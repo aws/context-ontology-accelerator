@@ -7,6 +7,7 @@ import * as path from "path";
 
 import {
   _computeSourceHash,
+  _isHashLocked,
   _uvInstallCommand,
 } from "../../lib/utils/python-bundling";
 
@@ -343,6 +344,20 @@ describe("_uvInstallCommand (local install uses uv, not host pip)", () => {
       requirementsFile: "/repo/packages/x/requirements.txt",
     })!;
     expect(cmd).toContain("-r /repo/packages/x/requirements.txt");
+    // A plain requirements file is not hash-checked.
+    expect(cmd).not.toContain("--require-hashes");
+    expect(cmd).not.toContain("--no-config");
+  });
+
+  it("installs a lock with --require-hashes and without the workspace config", () => {
+    const cmd = _uvInstallCommand({
+      srcDirs: [],
+      requirementsFile: "/repo/packages/x/requirements.lock.txt",
+      architecture: "arm64",
+    })!;
+    expect(cmd).toMatch(/^uv pip install --no-config --require-hashes /);
+    expect(cmd).toContain("-r /repo/packages/x/requirements.lock.txt");
+    expect(cmd).toContain("--python-platform aarch64-manylinux2014");
   });
 
   it("quotes each explicit dependency (version specifiers are shell-safe)", () => {
@@ -356,5 +371,57 @@ describe("_uvInstallCommand (local install uses uv, not host pip)", () => {
 
   it("returns null when there are no dependencies to install", () => {
     expect(_uvInstallCommand({ srcDirs: [] })).toBeNull();
+  });
+});
+
+describe("hash-locked requirements", () => {
+  const repoRoot = path.resolve(__dirname, "../../..");
+  const lock = path.join(repoRoot, "packages/sources/requirements.lock.txt");
+
+  it("recognizes a lock by its file name only", () => {
+    expect(_isHashLocked("/r/packages/sources/requirements.lock.txt")).toBe(
+      true,
+    );
+    expect(_isHashLocked("/r/packages/sources/requirements.txt")).toBe(false);
+  });
+
+  it("pins every requirement of the sources lock with a hash", () => {
+    // --require-hashes refuses the whole install if one entry is unpinned or
+    // unhashed, so a hand edit that breaks this would fail every deploy.
+    const text = fs.readFileSync(lock, "utf-8");
+    const entries = text
+      .split(/\n(?=[A-Za-z0-9])/)
+      .map((block) => block.trim())
+      .filter((block) => block && !block.startsWith("#"));
+    expect(entries.length).toBeGreaterThan(0);
+    for (const entry of entries) {
+      expect(entry).toMatch(/^[A-Za-z0-9_.-]+==[^\s\\]+ \\/);
+      expect(entry).toMatch(/--hash=sha256:[0-9a-f]{64}/);
+    }
+  });
+
+  it("keeps every direct dependency of requirements.txt in the lock", () => {
+    const direct = fs
+      .readFileSync(
+        path.join(repoRoot, "packages/sources/requirements.txt"),
+        "utf-8",
+      )
+      .split("\n")
+      .map((line) => line.replace(/#.*/, "").trim())
+      .filter(Boolean)
+      .map((line) =>
+        line
+          .split(/[<>=!~;\s[]/)[0]
+          .toLowerCase()
+          .replace(/_/g, "-"),
+      );
+    const pinned = new Set(
+      [
+        ...fs.readFileSync(lock, "utf-8").matchAll(/^([A-Za-z0-9_.-]+)==/gm),
+      ].map((m) => m[1].toLowerCase().replace(/_/g, "-")),
+    );
+    for (const name of direct) {
+      expect(pinned.has(name)).toBe(true);
+    }
   });
 });
