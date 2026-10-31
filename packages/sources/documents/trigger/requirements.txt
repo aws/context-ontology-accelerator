@@ -1,3 +1,5 @@
+# The Lambda installs from requirements.lock.txt (hash-pinned), not this file.
+# After editing it, run scripts/relock-python-requirements.sh.
 boto3>=1.43.108
 structlog>=24.4.0
 pydantic>=2.13.5

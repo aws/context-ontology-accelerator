@@ -23,15 +23,68 @@ Context Ontology Accelerator stores ontologies in OWL/Turtle format and material
 
 ### Automatic Induction
 
-Context Ontology Accelerator can induce an ontology from your approved data sources:
+Context Ontology Accelerator can induce an ontology from your approved data
+sources. The console offers two induction strategies, one per kind of source:
+
+| Strategy | Console label | Induces from | Output |
+|----------|---------------|--------------|--------|
+| `table_to_ontology` *(default)* | **Table to Ontology** | Connected database sources: table and column names, keys and the approved catalog metadata | OWL classes and properties **plus R2RML mappings**, so the classes are SQL-queryable |
+| `unstructured_lexical_graph` | **Unstructured (Lexical Graph)** | [Document sources](sources.md#document-sources): the lexical knowledge graph built when the documents were ingested | OWL classes, properties and SKOS concepts, with **no R2RML mappings** |
+
+To run an induction in the web app:
 
 1. Navigate to your namespace → **Ontology** → **Induction**
 2. Click **Start induction**
-3. Select the data sources to analyze
-4. Context Ontology Accelerator examines table structures, column relationships, and metadata to generate an ontology
-5. Review and refine the generated model
+3. Choose a **Strategy**. The data source list then shows only sources of the
+   matching kind: database sources for **Table to Ontology**, document sources
+   for **Unstructured (Lexical Graph)**
+4. Select the data sources and, optionally, the grounding ontologies (see
+   [Grounding](#grounding) below)
+5. Review and refine the generated proposal, then accept it
 
-Induction uses Bedrock (Claude) to analyze table schemas and infer semantic relationships between entities.
+Both strategies use Amazon Bedrock (Claude) to describe the induced classes
+and to verify grounding matches.
+
+#### Unstructured induction (documents)
+
+`unstructured_lexical_graph` turns the knowledge COA extracts from your
+documents into a formal ontology. When a document source is ingested (see
+[Document Processing Pipeline](sources.md#document-processing-pipeline)), COA
+builds a knowledge graph of the entities, facts and topics found in the text.
+Unstructured induction generalizes that graph:
+
+| From your documents | Becomes |
+|---------------------|---------|
+| Recurring entity types (e.g. `Aircraft`, `Engine`) | Classes, each with a generated description. Near-duplicate types are merged, and closely related ones are linked |
+| Relationships between entities | Object properties between those classes |
+| Attribute values of entities | Datatype properties (typically few) |
+| Topics | SKOS concepts |
+
+Things to know:
+
+- **Ingest first.** Induction works from the processed documents, so wait
+  until the document source has finished processing. A run with too little
+  extracted content completes with an empty or sparse proposal; reject it and
+  re-run later. To influence which entity types are extracted, use
+  [`extractionConfig`](sources.md#configuring-document-extraction) when you
+  create the source.
+- **Scope is the namespace.** The run covers all document content in the
+  namespace, not only the sources you select.
+- **Grounding works the same way** as for structured induction (see
+  [Grounding](#grounding)).
+- **Not SQL-queryable.** The induced classes have no table behind them, so
+  they are [unmapped](#mapped-classes-and-tier-2-answerability) and serve
+  Tier-3 knowledge retrieval rather than NL→SQL/SPARQL. Which Tier-3 paths
+  use the ontology is described in
+  [Which Tier-3 path consults the published ontology?](serve.md#which-tier-3-path-consults-the-published-ontology).
+- **Flat class model.** Induced classes are not arranged into a hierarchy;
+  parent classes come only from grounding against a loaded ontology.
+- **One run at a time.** A pending unstructured proposal does not block a
+  structured induction, and vice versa, but only one induction can run in a
+  namespace at a time; a second request returns `409` until the first
+  finishes.
+
+Review, edit and accept the proposal the same way as a structured one.
 
 #### Grounding
 
@@ -47,7 +100,7 @@ The **`groundingMode`** parameter controls how aggressively this runs:
 
 `ENHANCED` is the default and the right choice for most cases. Use `STANDARD` when you want speed and only trust exact-name alignment, or `NONE` to keep an induced ontology fully independent.
 
-Grounding targets come from `groundingOntologyIds` (foundational/uploaded ontologies you explicitly select) plus the namespace's accepted induced ontologies, which are always grounded against.
+Grounding targets are the ontologies you list in `groundingOntologyIds` (foundational, uploaded or previously accepted induced ontologies); with none listed, every class is treated as novel. The console pre-selects the namespace's accepted induced ontologies so new runs stay consistent with earlier ones. When calling the API, include them yourself.
 
 In `ENHANCED` mode the LLM reranker returns a small JSON verdict per class or table. Reasoning models spend part of their output budget on internal thinking before that JSON, so on a very long or complex source the answer can be truncated. When that happens the induction job **fails with a clear error** (rather than silently marking everything novel) and the error tells you to raise **`rerankMaxTokens`**. This optional `StartInduction` parameter caps the reranker's output-token budget; it defaults to `1000` (ample for the short verdict on all current models) and accepts `1`–`8192`. You only need to set it in the rare case that error names it — raise it (e.g. to `2000`) and re-run. It has no effect in `STANDARD` or `NONE` mode, which don't call the LLM.
 
@@ -58,24 +111,13 @@ foreign-key notes and default proposal titles, in the
 [namespace language](namespaces.md#namespace-language). Table names, column
 names and source-authored metadata are kept as-is.
 
-- **Strategy:** `rigor_ontology` supports only English namespaces. In any other
-  namespace, **StartInduction** with that strategy returns `400` before a job
-  starts; use `table_to_ontology` instead.
-  - **Who this affects:** only namespaces whose language is not English. A
-    namespace's language is fixed at creation and every namespace created
-    before languages existed is `en`, so existing namespaces, their
-    `rigor_ontology` runs and their proposals are unchanged and need no
-    re-induction.
-  - **Switching:** in a non-English namespace, omit `strategy` or set it to
-    `table_to_ontology`, the default; the rest of the request is the same.
-    `table_to_ontology` builds classes from table and column names, matches them
-    against existing ontologies by embedding similarity and keeps the unmatched
-    ones. `rigor_ontology` instead asks an LLM to write and then review a Turtle
-    fragment per table, with related existing concepts as context. Its semantic
-    naming and grounding are not localized yet, which is why it is limited to
-    English namespaces.
-  - **Unstructured sources:** document induction (`unstructured_lexical_graph`)
-    is not limited by the namespace language.
+- **Strategies:** both `table_to_ontology` and `unstructured_lexical_graph`
+  work in every namespace language. For document sources, the lexical graph is
+  already extracted in the namespace language (see
+  [Language of Extracted Content](sources.md#language-of-extracted-content)).
+- **`rigor_ontology`:** still accepted by the API for compatibility but not
+  offered in the console, and it works only in English namespaces. In other
+  namespaces **StartInduction** rejects it with `400`; use `table_to_ontology`.
 - **RDF language tags:** in a Japanese (`ja`), Korean (`ko`) or Chinese
   (exactly `zh`) namespace, a generated literal written only in that
   language's scripts carries the namespace tag, e.g. `"制御盤"@ja`. Catalog
@@ -140,6 +182,9 @@ both fields.
 Grounding choices rebuild the generated ontology and mappings. Save them in a
 separate request from `ontologyTurtle` or `r2rmlTurtle` edits; the service
 rejects a mixed request and saves neither change.
+
+For **unstructured proposals**, the match artifact has no
+`source_table_identity`; use the class label in `source_table` as the key.
 
 ### Manual Upload
 
@@ -220,7 +265,7 @@ current revision unchanged. Keep grounding-choice changes in a separate
 | Action | Description |
 |--------|-------------|
 | **Create** | Register an ontology entry (metadata only) |
-| **Induce** | Auto-generate from data source schemas |
+| **Induce** | Auto-generate from database source schemas or from the document lexical graph |
 | **Upload** | Import from OWL/Turtle/RDF file |
 | **Fetch** | Pull from an external URL |
 | **Update** | Modify metadata or re-upload |
@@ -279,14 +324,14 @@ Induction runs **asynchronously**. When you trigger it (via **Start induction** 
 | Status | Meaning |
 |--------|---------|
 | `pending` | Queued, not yet started. |
-| *in-progress* (`fetching_metadata`, `matching`, `building_ontology`, `storing`, …) | The job is running through its stages. |
+| *in-progress* (`fetching_metadata`, `matching`, `building_ontology`, `storing`, …) | The job is running through its stages. Unstructured runs report their own stage names. |
 | `completed` | Success — a proposal is ready to review and accept. |
 | `failed` | No proposal was produced; check the job's `error` field. |
 
 ### Why a job fails
 
 - **Grounding can't reach OpenSearch (the vector search backend).** The most common cause: the grounding step hits a transport error against OpenSearch — throttling (`429`), a `5xx`, or a connection/timeout — that persists after automatic retries. Transient OpenSearch errors are retried automatically (6 attempts with increasing backoff), so most blips never surface as a failure.
-- **Data or configuration problems** — for example, no tables were found in the selected data sources.
+- **Data or configuration problems** — for example, no tables were found in the selected database sources.
 
 ### Fail-loud reliability guarantee
 
@@ -445,4 +490,5 @@ it to the full class detail including all its relationships and attributes.
 ## Best Practices
 
 - **Start with induction**: let Context Ontology Accelerator generate a baseline ontology from your sources, then refine
+- **Pick the strategy by source kind**: `table_to_ontology` for databases you want to query with SQL, `unstructured_lexical_graph` for document collections you want to retrieve from
 - **One ontology per domain**: keep ontologies focused on a single business domain. Spread ontologies across logically separated namespaces as needed.

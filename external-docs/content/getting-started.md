@@ -63,8 +63,8 @@ All stacks use context-driven configuration via `CoaStack` base class:
 | `project_tag`              | `semantic-context` | AWS `Project` tag value                                        |
 | `vpc_id`                   | (none)             | Import an existing VPC instead of creating one. See [Deploying into an existing VPC](deploying.md#deploying-into-an-existing-vpc) |
 | `aoss_vpc_endpoint_id`     | (none)             | Required with `vpc_id`: the VPC's OpenSearch Serverless `aoss-data` interface endpoint |
-| `aoss_max_ocu`             | `96`               | Max OCU capacity for OpenSearch Serverless (indexing + search) |
-| `aoss_min_ocu`             | `2`                | Min OCU capacity for OpenSearch Serverless (indexing + search). Set to `0` for scale-to-zero — see below |
+| `aoss_max_ocu`             | `96`               | Max OCU capacity for OpenSearch Serverless (indexing + search); `SCL_AOSS_MAX_OCU` with `make deploy-dev` |
+| `aoss_min_ocu`             | `2`                | Min OCU capacity for OpenSearch Serverless (indexing + search); `SCL_AOSS_MIN_OCU` with `make deploy-dev`. Set to `0` for scale-to-zero — see below |
 | `api_throttle_rate_limit`  | `50`               | API Gateway stage requests-per-second rate limit               |
 | `api_throttle_burst_limit` | `100`              | API Gateway stage burst capacity                               |
 | `lambda_reserved_concurrency` | `5`             | Reserved concurrency for the VKG-reload and doc-preprocessing Lambdas; `0` disables reserving (needed on reduced Lambda-quota accounts) |
@@ -84,7 +84,28 @@ latency on its first query after an idle period.
 To opt into scale-to-zero:
 
 ```bash
-cdk deploy -c aoss_min_ocu=0
+SCL_AOSS_MIN_OCU=0 make deploy-dev
+```
+
+`SCL_AOSS_MAX_OCU` sets the ceiling the same way. If you run `cdk deploy`
+yourself, add `--context aoss_min_ocu=0` to the context you already pass
+(`resource_prefix` and the rest); a bare `cdk deploy -c aoss_min_ocu=0` targets
+the default `coa` deployment, not yours.
+
+> **Set it on every deploy.** The value is not stored anywhere. A later
+> `make deploy-dev` without `SCL_AOSS_MIN_OCU` puts the floor back to 2 OCU.
+> `make deploy-serve` always puts the limits back to 2 / 96: it also updates the
+> storage stack and doesn't pass `SCL_AOSS_*` through, so run `make deploy-dev`
+> with the variables again afterwards.
+
+The floor and ceiling are set on this deployment's own collection group, so each
+`SCL_PREFIX` pays its own floor; the ceiling is also capped by the account's
+OpenSearch Serverless max-OCU quotas (see
+[A.3](deploying.md#a3-quotas-to-check-before-deploying)). To see the current limits:
+
+```bash
+aws opensearchserverless list-collection-groups --region <region> \
+  --query 'collectionGroupSummaries[].[name,capacityLimits]'
 ```
 
 Valid `aoss_min_ocu` values are `0`, `2`, `4`, `8`, `16`, or multiples of 16.
@@ -159,6 +180,9 @@ SCL_VPC_ID=vpc-0abc123 SCL_AOSS_VPC_ENDPOINT_ID=vpce-0123456789abcdef0 make depl
 
 # Multiple overrides
 SCL_PREFIX=acme SCL_VPC_ID=vpc-xyz SCL_AOSS_VPC_ENDPOINT_ID=vpce-0123456789abcdef0 make deploy-dev
+
+# OpenSearch Serverless scales to zero when idle (see above)
+SCL_AOSS_MIN_OCU=0 make deploy-dev
 ```
 
 #### Deployment architecture
@@ -167,7 +191,10 @@ See [Deploying Context Ontology Accelerator](deploying.md) for the full stack li
 (17 stacks total), dependency order, and per-stack purpose — CDK resolves
 ordering automatically from the dependency graph in `bin/app.ts`.
 
-> **Cost warning:** Neptune + OpenSearch Serverless cost ~$930/mo when idle.
+> **Cost warning:** a default deployment costs about **$1,600/month (about
+> $2.20/hour) while idle** (on-demand in us-east-1, October 2026 list prices),
+> about $900/month with `SCL_AOSS_MIN_OCU=0`, plus about $30/month for each
+> namespace you create. Usage, storage and data transfer come on top.
 > Destroy stacks when not actively testing — see
 > [Deploying Context Ontology Accelerator: Tearing Down](deploying.md) for the
 > recommended `make destroy-dev` command.
@@ -207,7 +234,7 @@ pnpm dev        # opens at http://localhost:5173
 | `make test`        | Run unit tests via Nx                                                            |
 | `make test-integ`  | Run integration tests                                                            |
 | `make build`       | Build all packages via Nx                                                        |
-| `make deploy-dev`  | Deploy to dev environment via CDK (supports `SCL_PREFIX`, `SCL_VPC_ID` env vars) |
+| `make deploy-dev`  | Deploy to dev environment via CDK (`SCL_*` env vars, see Customizing deployments) |
 | `make destroy-dev` | Tear down all dev stacks. One run deletes everything that runs continuously; the VPC and two security groups stay until AWS releases the AgentCore ENIs, about 8 hours later, and running it again then deletes them — see the [Deploying guide](deploying.md), "Tearing Down" section |
 | `make docs`        | Serve docs site locally (MkDocs)                                                 |
 

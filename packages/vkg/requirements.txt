@@ -1,4 +1,4 @@
-awscli
+awscli>=1.46.2
 sqlglot>=20.11.0
 rdflib>=7.6.0
 # 2026.10.19 is the first certifi bundle without the roots behind the compromised

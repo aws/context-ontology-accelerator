@@ -118,7 +118,9 @@ export class MetricServiceStack extends SCLStack {
         Paths.commonLib,
         Paths.smithyGeneratedControlPlanePythonServer,
       ],
-      requirementsFile: fromRoot("packages/metric-service/requirements.txt"),
+      requirementsFile: fromRoot(
+        "packages/metric-service/requirements.lock.txt",
+      ),
     });
 
     // ── S3 Bucket — OSI import/export staging ────────────────────────

@@ -414,16 +414,16 @@ wheels = [
 
 [[package]]
 name = "boto3"
-version = "1.43.65"
+version = "1.43.117"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "botocore" },
     { name = "jmespath" },
     { name = "s3transfer" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/51/87/d61a5a76088240012800f303d3b910c259f6c630e395a013fa1a1216fdae/boto3-1.43.65.tar.gz", hash = "sha256:f2331154aee1ae97ece48077d77f41d3bd5ea39eb4e3037030448b58695a3a79", size = 112676, upload-time = "2026-08-05T19:25:01.257Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/94/a7/61f0295f79dfdcebb5aa01f86c614fac7e1294faabbd66259d3609c50539/boto3-1.43.117.tar.gz", hash = "sha256:f3d314908d866b577ee6b74ed432c21e565c4c4dbd640ef3fd5e0da30fa13a98", size = 112677, upload-time = "2026-10-21T19:30:03.849Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ec/df/694d81db07214fd98e37836ad114d175680daa127f5be8fb2abe00d949af/boto3-1.43.65-py3-none-any.whl", hash = "sha256:a8217fb68cae3f8a7575eef395383b68b846d92d29b0e8f6e948e6e9e08dcc3f", size = 140024, upload-time = "2026-08-05T19:24:58.853Z" },
+    { url = "https://files.pythonhosted.org/packages/f3/3b/22b05a545fb95983733d84681364c6b0a36afb0710d832f77732d1fc4c0b/boto3-1.43.117-py3-none-any.whl", hash = "sha256:a5b6cd7e67653987fcf0e212187c16f7b58af2ae192e368f7212ddab7c05b25d", size = 140043, upload-time = "2026-10-21T19:30:02.114Z" },
 ]
 
 [[package]]
@@ -441,16 +441,16 @@ wheels = [
 
 [[package]]
 name = "botocore"
-version = "1.43.65"
+version = "1.43.117"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "jmespath" },
     { name = "python-dateutil" },
     { name = "urllib3" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/fa/86/65c298732919b84a3ecf331caeb47b8efcc1ce0537e8fdecad2cfee39174/botocore-1.43.65.tar.gz", hash = "sha256:eea5440cf4b850d0f4de4f7eda418c325c87de6d8980873f8b636bb482b31d0f", size = 15842580, upload-time = "2026-08-05T19:24:55.745Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/6e/a0/d0a5c44ad6a01f195681ddcb4ce203f06c712811daf1d15f8f8785e8a9f8/botocore-1.43.117.tar.gz", hash = "sha256:71993702832cc37c2495048b9945f2929d306fccb3fb767e9964e437e637fa6c", size = 16366888, upload-time = "2026-10-21T19:29:59.274Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/25/0a/3b84332d8dc2acf6af269f8175f94159ad495a7de29e5f335f933f0b5da4/botocore-1.43.65-py3-none-any.whl", hash = "sha256:41a13d9a1954d786f90cdbba0be0953fe9b9389f240b5ff71340c4706ea40135", size = 15526731, upload-time = "2026-08-05T19:24:52.175Z" },
+    { url = "https://files.pythonhosted.org/packages/10/94/050e35c9febf6dd2fce4a76be587ae4a323964865700467d9d7b082f7133/botocore-1.43.117-py3-none-any.whl", hash = "sha256:5920ef9b3002e1361846549078549d9154a6e0004c22853c01ce7b279d05d495", size = 16061765, upload-time = "2026-10-21T19:29:56.001Z" },
 ]
 
 [[package]]
@@ -661,7 +661,7 @@ wheels = [
 
 [[package]]
 name = "coa"
-version = "0.3.8"
+version = "0.3.9"
 source = { virtual = "." }
 
 [package.dev-dependencies]
@@ -700,7 +700,7 @@ dev = [
 
 [[package]]
 name = "coa-common"
-version = "0.3.8"
+version = "0.3.9"
 source = { editable = "libs/common" }
 dependencies = [
     { name = "boto3" },
@@ -729,7 +729,7 @@ requires-dist = [
 
 [[package]]
 name = "coa-control-plane"
-version = "0.3.8"
+version = "0.3.9"
 source = { editable = "packages/control-plane" }
 dependencies = [
     { name = "boto3" },
@@ -767,7 +767,7 @@ requires-dist = [{ name = "pydantic", specifier = ">=2.0" }]
 
 [[package]]
 name = "coa-data-layer"
-version = "0.3.8"
+version = "0.3.9"
 source = { editable = "packages/data-layer" }
 dependencies = [
     { name = "coa-common" },
@@ -789,7 +789,7 @@ requires-dist = [{ name = "pydantic", specifier = ">=2.0" }]
 
 [[package]]
 name = "coa-mcp"
-version = "0.3.8"
+version = "0.3.9"
 source = { editable = "packages/mcp-server" }
 dependencies = [
     { name = "coa-common" },
@@ -816,7 +816,7 @@ requires-dist = [
 
 [[package]]
 name = "coa-metrics"
-version = "0.3.8"
+version = "0.3.9"
 source = { editable = "packages/metric-service" }
 dependencies = [
     { name = "boto3" },
@@ -845,7 +845,7 @@ requires-dist = [
 
 [[package]]
 name = "coa-ontology"
-version = "0.3.8"
+version = "0.3.9"
 source = { editable = "packages/ontology-engine" }
 dependencies = [
     { name = "aiosqlite" },
@@ -915,7 +915,7 @@ dev = [
 
 [[package]]
 name = "coa-serve"
-version = "0.3.8"
+version = "0.3.9"
 source = { editable = "packages/context-manager" }
 dependencies = [
     { name = "aiomysql" },
@@ -951,7 +951,7 @@ requires-dist = [
     { name = "asyncpg", specifier = ">=0.30" },
     { name = "bedrock-agentcore", specifier = "==1.18.1" },
     { name = "boto3", specifier = ">=1.35" },
-    { name = "botocore", specifier = ">=1.35" },
+    { name = "botocore", specifier = ">=1.43.117" },
     { name = "cedarpy", specifier = ">=4.8.0" },
     { name = "certifi", specifier = ">=2026.10.19" },
     { name = "coa-common", editable = "libs/common" },
@@ -976,7 +976,7 @@ requires-dist = [
 
 [[package]]
 name = "coa-sources"
-version = "0.3.8"
+version = "0.3.9"
 source = { editable = "packages/sources" }
 dependencies = [
     { name = "boto3" },
@@ -1011,7 +1011,7 @@ integ = [
 
 [[package]]
 name = "coa-vkg"
-version = "0.3.8"
+version = "0.3.9"
 source = { virtual = "packages/vkg" }
 dependencies = [
     { name = "certifi" },
