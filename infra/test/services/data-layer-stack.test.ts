@@ -1,6 +1,8 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import * as fs from "fs";
+
 import * as cdk from "aws-cdk-lib";
 import * as ec2 from "aws-cdk-lib/aws-ec2";
 import * as lambda from "aws-cdk-lib/aws-lambda";
@@ -64,10 +66,16 @@ describe("DataLayerStack", () => {
     // parity refactor introduced by adding coa_common imports to a Lambda whose
     // bundle previously shipped zero pip deps.
     expect(mockBundlePython).toHaveBeenCalled();
-    const opts = mockBundlePython.mock.calls[0][0] as { pipDeps?: string[] };
-    expect(opts.pipDeps).toEqual(
-      expect.arrayContaining(["pydantic", "pydantic-settings", "structlog"]),
+    const opts = mockBundlePython.mock.calls[0][0] as {
+      requirementsFile?: string;
+    };
+    expect(opts.requirementsFile).toMatch(
+      /packages\/data-layer\/requirements\.lock\.txt$/,
     );
+    const lock = fs.readFileSync(opts.requirementsFile ?? "", "utf-8");
+    for (const dep of ["pydantic", "pydantic-settings", "structlog"]) {
+      expect(lock).toMatch(new RegExp(`^${dep}==`, "m"));
+    }
   });
 
   it("wires the ontology-proxy Lambda ARN into the API Lambda env", () => {
