@@ -74,10 +74,13 @@ _ANNOTATION_MAX_CONCURRENCY = 4
 # truncated. Without it truncation fills the budget and large namespaces, where
 # business wording helps most, would get no annotations at all.
 _ANNOTATION_BUDGET_SHARE = 0.15
-# Prompt caps. Column descriptions match the NL→SQL context's 100-character cut;
-# class descriptions are capped only to bound a pathological catalog entry.
+# Prompt caps. A Glue column comment allows 255 characters, so column descriptions
+# keep 255. The ingest side has its own constant for the NL→SQL class text
+# (_MAX_COLUMN_COMMENT_CHARS in the ontology engine's catalog ingest), kept equal
+# on purpose; the two are not linked. Class descriptions are capped only to bound
+# a pathological catalog entry.
 _MAX_CLASS_DESCRIPTION_CHARS = 500
-_MAX_PROPERTY_DESCRIPTION_CHARS = 100
+_MAX_PROPERTY_DESCRIPTION_CHARS = 255
 _MAX_TERMS_IN_PROMPT = 5
 # ~4 characters per token, the same rough rate the per-element estimates assume.
 _CHARS_PER_TOKEN = 4

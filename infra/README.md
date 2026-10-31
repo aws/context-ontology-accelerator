@@ -227,9 +227,26 @@ these:
    `RemovalPolicy.RETAIN` in `namespace-stack.ts` so CFN never attempts
    (and fails) to delete any of them itself — this step is what actually
    tears the whole tree down.
-6. **Start deleting the connector stacks** (`${SCL_PREFIX:-coa}-dev-*-coa-connector`).
-   They are separate CDK apps under `connectors/`, so `cdk destroy` never sees
-   them. Step 8 waits for them.
+6. **Start deleting the connector stacks**
+   (`${SCL_PREFIX:-coa}-dev-*-coa-connector`). They are separate CDK apps under
+   `connectors/`, so `cdk destroy` never sees them. Step 8 waits for them. Then
+   **delete the federated Glue connections** registered database sources left,
+   as the API's source delete (`cleanup_federated_resources`) does: drop the
+   federated catalog, deregister the connection from Lake Formation, delete the
+   connection. Glue refuses to delete a connection its catalog still uses, and
+   Lake Formation gives `DROP` on the catalog only to its creator, the
+   provisioner role (which the API's delete assumes, and the operator cannot).
+   A data lake admin operator grants itself `DROP` first; anyone else gets the
+   `grant-permissions`/`delete-catalog` commands for an admin and exit 1, and
+   the connection is left for the next run. The sources service creates these
+   at runtime, so CFN has no record of them, and each keeps an ENI in the
+   network stack's connector security group. A connection is deleted only when
+   its name (`build_catalog_name`'s `<prefix><env>ds_<hash>`, derived in
+   `scripts/lib/glue-catalog-name.sh`), its `ROLE_ARN`
+   (`<prefix>-<env>-federated-catalog-role`) and its security group (the
+   network stack's `ConnectorSG`) are all this deployment's: dropping dashes
+   and case makes some prefix/env pairs share names. A connection still being
+   created is waited out first, since Glue refuses to delete it.
 7. **`cdk destroy` every stack except network**, with the same context
    resolution as `deploy.sh` (`SCL_PREFIX`, `SCL_PROJECT_TAG`, `SCL_VPC_ID`
    and `SCL_AOSS_VPC_ENDPOINT_ID` env vars are honored; the last is required
@@ -256,9 +273,15 @@ these:
    explicit `DependsOn` ahead of the custom resource — this isn't a
    missing grant in this repo's code) — the script detects and guides
    through them, it doesn't prevent them.
-8. **Finish the network stack.** Wait for the connector stacks, delete
-   detached Lambda ENIs of this deployment whose function is gone and the
-   retained runtime security groups whose ENIs are gone, then the stack.
+8. **Finish the network stack.** Wait for the connector stacks, delete any
+   federated Glue connection created while step 7 ran, and wait up to 30
+   minutes for Glue to release the deleted connections' ENIs (about 19 minutes
+   after each delete). Glue deletes them itself; one whose connection role step
+   7 deleted first is detached but left `available`, and is deleted here. ENIs
+   still attached after the wait fail the run (exit 1): an account cannot
+   detach an `ela-attach` attachment. Then delete detached Lambda ENIs of this
+   deployment whose function is gone and the retained runtime security groups
+   whose ENIs are gone, then the stack.
    While AgentCore still holds ENIs, CloudFormation deletes only its NAT
    gateway, Elastic IP and VPC endpoints, and the script exits **3** (only
    while AgentCore's own ENIs hold what is left); a later run deletes the
@@ -523,4 +546,4 @@ No downtime is expected for these stack updates — all resources are additive.
 
 ### Rollback
 
-- Removing the feature requires deleting per-namespace workgroups (`{prefix}{namespaceId}`) and per-source Glue Connections / Athena DataCatalogs (`{prefix}ds-{datasourceId}`) before destroying the storage/network resources, otherwise CDK delete will fail. The namespace `delete_handler` and the unified sources `_handle_delete` flow handle this automatically when those resources are deleted via the API.
+- Removing the feature requires deleting per-namespace workgroups (`{prefix}{namespaceId}`) and per-source Glue Connections / Athena DataCatalogs (`{sanitizedPrefix}ds_{hash}`) before destroying the storage/network resources, otherwise CDK delete will fail. The namespace `delete_handler` and the unified sources `_handle_delete` flow handle this automatically when those resources are deleted via the API, and `make destroy-dev` deletes the federated Glue Connections still left at teardown (see [Tearing down](#tearing-down-make-destroy-dev)).
