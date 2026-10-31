@@ -33,6 +33,10 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # and how many walked tables it may append (default 8):
 #   SCL_NL2SQL_GRAPH_EXPAND=false make deploy-dev
 #   SCL_NL2SQL_GRAPH_EXPAND_MAX_TABLES=12 make deploy-dev
+# OpenSearch Serverless capacity floor and ceiling in OCU (default 2 / 96; a
+# floor of 0 scales to zero when idle). Not persisted: set it on every deploy.
+#   SCL_AOSS_MIN_OCU=0 make deploy-dev
+#   SCL_AOSS_MAX_OCU=32 make deploy-dev
 # SMUS admin principal(s) — required, comma-separated IAM role/user ARN(s)
 # that human admins federate into (e.g. your IAM Identity Center
 # permission-set role): SCL_SMUS_ADMIN_ARNS=arn:aws:iam::123456789012:role/... make deploy-dev
@@ -51,6 +55,8 @@ CONTEXT=(--context "env=$ENV")
 [ -n "${SCL_DEEP_REASONING_TIME_BUDGET_SECONDS:-}" ] && CONTEXT+=(--context "deep_reasoning_time_budget_s=$SCL_DEEP_REASONING_TIME_BUDGET_SECONDS")
 [ -n "${SCL_RESOLVE_TIMEOUT_SECONDS:-}" ] && CONTEXT+=(--context "resolve_timeout_s=$SCL_RESOLVE_TIMEOUT_SECONDS")
 [ -n "${SCL_NEPTUNE_INSTANCE_CLASS:-}" ] && CONTEXT+=(--context "neptune_instance_class=$SCL_NEPTUNE_INSTANCE_CLASS")
+[ -n "${SCL_AOSS_MIN_OCU:-}" ] && CONTEXT+=(--context "aoss_min_ocu=$SCL_AOSS_MIN_OCU")
+[ -n "${SCL_AOSS_MAX_OCU:-}" ] && CONTEXT+=(--context "aoss_max_ocu=$SCL_AOSS_MAX_OCU")
 [ -n "${SCL_LAMBDA_RESERVED_CONCURRENCY:-}" ] && CONTEXT+=(--context "lambda_reserved_concurrency=$SCL_LAMBDA_RESERVED_CONCURRENCY")
 [ -n "${SCL_GUARDRAIL_TIER:-}" ] && CONTEXT+=(--context "guardrail_tier=$SCL_GUARDRAIL_TIER")
 [ -n "${SCL_GUARDRAIL_PROFILE:-}" ] && CONTEXT+=(--context "guardrail_profile=$SCL_GUARDRAIL_PROFILE")

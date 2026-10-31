@@ -182,25 +182,25 @@ class TestProposeStepsDegradation:
     async def test_empty_on_converse_error(self):
         planner = BedrockStepPlanner(FakeLLM(raises=RuntimeError("bedrock down")))
         decisions = await planner.propose_steps(sub_question=_sq(), context=AccumulatedContext(), tool_specs=_SPECS)
-        assert decisions == []
+        assert decisions is None  # a failed call is "no tool", never the planner's "enough"
 
     @pytest.mark.asyncio
     async def test_empty_on_guardrail_block(self):
         planner = BedrockStepPlanner(FakeLLM(text='{"candidates": []}', guardrail_blocked=True))
         decisions = await planner.propose_steps(sub_question=_sq(), context=AccumulatedContext(), tool_specs=_SPECS)
-        assert decisions == []
+        assert decisions is None  # a failed call is "no tool", never the planner's "enough"
 
     @pytest.mark.asyncio
     async def test_empty_on_unparseable(self):
         planner = BedrockStepPlanner(FakeLLM(text="not json at all"))
         decisions = await planner.propose_steps(sub_question=_sq(), context=AccumulatedContext(), tool_specs=_SPECS)
-        assert decisions == []
+        assert decisions is None  # a failed call is "no tool", never the planner's "enough"
 
     @pytest.mark.asyncio
     async def test_empty_when_candidates_not_list(self):
         planner = BedrockStepPlanner(FakeLLM(text='{"candidates": "nope"}'))
         decisions = await planner.propose_steps(sub_question=_sq(), context=AccumulatedContext(), tool_specs=_SPECS)
-        assert decisions == []
+        assert decisions is None  # a failed call is "no tool", never the planner's "enough"
 
 
 # ── check_sufficiency (Req 6.1-6.2) ─────────────────────────────────────

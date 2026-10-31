@@ -20,7 +20,7 @@ import { Construct } from "constructs";
 
 import { SCLStack } from "../../constructs/scl-stack";
 import { SclMonitoring } from "../../constructs";
-import { Paths } from "../../paths";
+import { fromRoot, Paths } from "../../paths";
 import { resolveContext, guardrailProfileResources } from "../../context";
 import { bundlePython } from "../../utils/python-bundling";
 import { grantIdempotencyTable } from "../../utils/idempotency";
@@ -1103,23 +1103,14 @@ export class OntologyStack extends SCLStack {
       handler: "coa_ontology.api_proxy_handler.handler",
       // Merges libs/common/src into the asset root so
       // `coa_common` (used for resolve_region) is importable.
-      // Its transitive deps (structlog, pydantic-settings, etc. — see
-      // libs/common/pyproject.toml) must be installed explicitly since this
-      // Lambda has no requirements.txt of its own; mirrors the pipDeps used
-      // wherever else commonLib is bundled (e.g. api-stack.ts).
+      // Its runtime deps (structlog, pydantic-settings, etc. — see
+      // libs/common/pyproject.toml) are listed in the requirements file next
+      // to the handler's lock, since the Lambda has no package of its own.
       code: bundlePython({
         srcDirs: [Paths.ontologyEngineSrc, Paths.commonLib],
-        pipDeps: [
-          "cedarpy>=4.8.0",
-          "pydantic>=2.0",
-          "pydantic-settings>=2.0",
-          "structlog>=24.0",
-          "cryptography>=43.0",
-          "PyJWT>=2.9.0",
-          "requests>=2.32.0",
-          // First certifi without the roots behind the compromised emSign intermediates.
-          "certifi>=2026.10.19",
-        ],
+        requirementsFile: fromRoot(
+          "packages/ontology-engine/lambda/api-proxy/requirements.lock.txt",
+        ),
       }),
       timeout: cdk.Duration.seconds(60),
       memorySize: 256,

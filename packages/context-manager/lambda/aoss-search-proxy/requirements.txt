@@ -1,2 +1,14 @@
+# The Lambda installs from requirements.lock.txt (hash-pinned), not this file.
+# After editing it, run scripts/relock-python-requirements.sh.
+# index.py imports coa_common (resolve_region), so the bundle also needs
+# libs/common's runtime deps.
 opensearch-py>=2.8.0
 requests-aws4auth>=1.3.2
+cedarpy
+cryptography
+pydantic-settings
+PyJWT
+requests
+structlog
+# First certifi without the roots behind the compromised emSign intermediates.
+certifi>=2026.10.19
