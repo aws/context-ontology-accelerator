@@ -143,6 +143,84 @@ class InvokeRequest(BaseModel):
 
     @field_validator("options", mode="after")
     @classmethod
+    def _validate_deep_reasoning_levers(cls, options: dict) -> dict:
+        """Validate the per-request deep-reasoning options (all optional).
+
+        An option the request leaves unset gets its recommended value on the
+        deep-reasoning path (``tier3.agentic.defaults``); validation sees only what
+        the request sent.
+
+        * ``ontologyLookupMode`` (``"planner"`` | ``"preload"``) — ``preload`` resolves
+          the ontology once at session start, outside the step budget, instead of
+          offering ``ontology_lookup`` to the planner.
+        * ``readDocument`` (bool) — offer the planner the ``read_document`` tool;
+          ``readDocumentMaxChars`` (int) sets its default window size.
+        * ``readDocumentAnchor`` (bool) — with ``readDocument``, centre each window
+          on the relevant passage instead of paging from offset 0.
+        * ``entityRouting`` (bool) — offer ``find_documents`` (names in the question
+          -> the source documents mentioning them) and route the question's named
+          terms once before the loop.
+        * ``prefetchMode`` (``"assess"`` | ``"off"``) — before the loop, run the SQL writer on
+          the whole question and read the top documents in parallel, then check
+          sufficiency once and skip the loop when the evidence is enough.
+        * ``plannerParseRetry`` (bool) — one repair turn on an unparseable planner
+          reply.
+        * ``tokenCaps`` ({planner|synthesizer: int}) — per-request output token caps.
+        * ``loopFixes`` (bool) — drop unknown planner fields instead of rejecting
+          the call, do not call the planner or start a tool once no time is left
+          for the tool, give back the step of a read that returned nothing new, and
+          drop privacy-mask placeholders from the routed names.
+        * ``sufficiencyGuards`` (bool) — hold back a positive sufficiency check (at most
+          twice per loop) while a top name-matched document has been read only in
+          part. Takes effect with ``entityRouting``.
+        * ``fastPathSpeculation`` (bool) — with ``prefetchMode: "assess"``, write the
+          answer in parallel with the "enough?" check and keep it only if the check
+          passes; skip the check when a sufficiency guard already holds it back.
+          Blocking requests only.
+        * ``keepSlowSql`` (bool) — with ``prefetchMode: "assess"``, a prefetch SQL call
+          that outlives its timeout keeps running; the loop uses its result instead
+          of writing a new query, and it is cancelled before the answer is written.
+        * ``singleCallSteps`` (bool) — the planner's next-step call also decides when
+          to stop (an empty proposal ends the loop), so each step is one model call.
+
+        Only types and enumerations are checked here; ranges are clamped where the
+        option is used. A malformed value fails fast instead of silently running
+        the default.
+        """
+        if "tokenCaps" in options:
+            caps = options["tokenCaps"]
+            if not isinstance(caps, dict) or any(
+                key not in ("planner", "synthesizer") or isinstance(v, bool) or not isinstance(v, int)
+                for key, v in caps.items()
+            ):
+                raise ValueError(f"Invalid tokenCaps {caps!r}; must map planner/synthesizer to integers")
+        for key in (
+            "readDocument",
+            "readDocumentAnchor",
+            "entityRouting",
+            "plannerParseRetry",
+            "loopFixes",
+            "sufficiencyGuards",
+            "singleCallSteps",
+            "fastPathSpeculation",
+            "keepSlowSql",
+        ):
+            if key in options and not isinstance(options[key], bool):
+                raise ValueError(f"Invalid {key} {options[key]!r}; must be a boolean")
+        for key in ("readDocumentMaxChars",):
+            value = options.get(key)
+            if key in options and (isinstance(value, bool) or not isinstance(value, int)):
+                raise ValueError(f"Invalid {key} {value!r}; must be an integer")
+        if "prefetchMode" in options and options["prefetchMode"] not in ("assess", "off"):
+            raise ValueError(f"Invalid prefetchMode {options['prefetchMode']!r}; must be 'assess' or 'off'")
+        if "ontologyLookupMode" in options and options["ontologyLookupMode"] not in ("planner", "preload"):
+            raise ValueError(
+                f"Invalid ontologyLookupMode {options['ontologyLookupMode']!r}; must be 'planner' or 'preload'"
+            )
+        return options
+
+    @field_validator("options", mode="after")
+    @classmethod
     def _validate_mode(cls, options: dict) -> dict:
         """Validate ``options.mode`` — the per-request EXECUTION mode selector.
 

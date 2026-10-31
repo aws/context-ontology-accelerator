@@ -1,3 +1,5 @@
+# The Lambdas install from requirements.lock.txt (hash-pinned), not this file.
+# After editing it, run scripts/relock-python-requirements.sh.
 httpx>=0.28.1
 structlog>=24.4.0
 pydantic>=2.13.5

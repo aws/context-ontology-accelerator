@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from coa_common.constants import VOCAB_URI
+from coa_serve.tier2.ontop import tbox_context
 from coa_serve.tier2.ontop.tbox_context import (
     _ANNOTATION_MAX_CONCURRENCY,
     _ANNOTATION_SUBJECT_CHUNK,
@@ -181,8 +182,19 @@ async def test_long_column_description_is_capped_in_the_prompt():
     context = _context()
     await builder._attach_annotations(context, "ns-x", max_tokens=20_000)
     prop_line = next(line for line in builder.format_for_prompt(context, "ns-x").splitlines() if "ind:premium" in line)
-    assert "description: " + "x" * 100 in prop_line
-    assert "x" * 101 not in prop_line
+    assert tbox_context._MAX_PROPERTY_DESCRIPTION_CHARS == 255
+    assert "description: " + "x" * 255 in prop_line
+    assert "x" * 256 not in prop_line
+
+
+async def test_230_character_column_description_is_kept_whole_in_the_prompt():
+    note = "y" * 219 + " END-CLAUSE"
+    assert len(note) == 230
+    builder, _ = _builder([{"s": PREMIUM, "p": COMMENT, "o": note}])
+    context = _context()
+    await builder._attach_annotations(context, "ns-x", max_tokens=20_000)
+    prop_line = next(line for line in builder.format_for_prompt(context, "ns-x").splitlines() if "ind:premium" in line)
+    assert "description: " + note in prop_line
 
 
 async def test_annotations_stay_within_the_remaining_token_budget():
