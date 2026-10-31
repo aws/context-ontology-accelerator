@@ -121,6 +121,57 @@ def _max_structured_rows() -> int:
     return max(1, min(2000, v))
 
 
+# Document-context budget for a synthesis prompt that takes every gathered chunk
+# (the deep-reasoning path, ``max_prompt_chunks=None``), counted as the prompt
+# carries the text: after datamarking, each run of whitespace becomes an 8-character
+# marker. Measured on deep reasoning over mixed document-and-table questions, the
+# context is ~60-90k characters at the median and ~300k at p99; whole-document reads
+# reach ~450k; only runaway graph traversals (thousands of statements) passed ~900k.
+# 600k keeps every ordinary prompt whole. TIER3_SYNTH_MAX_CONTEXT_CHARS lowers it for
+# a model with a smaller input window.
+_MAX_CONTEXT_CHARS = 600_000
+_DATAMARK_MARKER_CHARS = 8
+
+
+def synth_max_context_chars() -> int:
+    """Document-context budget for the synthesis prompt (default 600k chars, env-tunable)."""
+    try:
+        v = int(os.environ.get("TIER3_SYNTH_MAX_CONTEXT_CHARS", str(_MAX_CONTEXT_CHARS)))
+    except ValueError:
+        v = _MAX_CONTEXT_CHARS
+    return max(20_000, min(2_000_000, v))
+
+
+def _prompt_chars(chunk: ChunkResult) -> int:
+    """Characters a chunk takes in the prompt: datamarked text plus its label line."""
+    words = chunk.text.split()
+    marked = sum(len(w) for w in words) + _DATAMARK_MARKER_CHARS * max(0, len(words) - 1)
+    return marked + len(chunk.label or chunk.source_doc or "") + 20
+
+
+def fit_chunks_to_budget(chunks: list[ChunkResult], max_chars: int) -> tuple[list[ChunkResult], int]:
+    """Keep the chunks that fit ``max_chars``; return them (in their order) and how many were left out.
+
+    Under the budget the list is returned unchanged. Over it, document text is kept
+    before graph statements (chunk ids ``<node>#stmt<i>``, short facts that a
+    runaway traversal returns by the thousand), each in gathered order; a chunk that
+    does not fit is skipped and smaller ones after it can still fill the budget.
+    """
+    sizes = [_prompt_chars(c) for c in chunks]
+    if sum(sizes) <= max_chars:
+        return chunks, 0
+    order = [i for i, c in enumerate(chunks) if "#stmt" not in c.chunk_id] + [
+        i for i, c in enumerate(chunks) if "#stmt" in c.chunk_id
+    ]
+    keep: set[int] = set()
+    used = 0
+    for i in order:
+        if used + sizes[i] <= max_chars:
+            keep.add(i)
+            used += sizes[i]
+    return [c for i, c in enumerate(chunks) if i in keep], len(chunks) - len(keep)
+
+
 def _synth_max_tokens() -> int:
     """Output-token budget for the synthesis call (default 4096, env-tunable).
 
@@ -339,6 +390,7 @@ class Synthesizer:
         model_id: str | None = None,
         working_answer: str | None = None,
         answer_language: str | None = None,
+        max_tokens: int | None = None,
     ) -> SynthesisResult:
         """Build prompt from all context sections and call Bedrock Converse.
 
@@ -355,6 +407,8 @@ class Synthesizer:
             answer_language: Optional BCP 47 tag resolved once for the request; when
                 set, the output-language directive names it instead of asking the
                 model to work out the question's language.
+            max_tokens: Per-request output-token cap; ``None`` keeps
+                ``TIER3_SYNTH_MAX_TOKENS``.
 
         Returns:
             SynthesisResult with answer, confidence, and duration.
@@ -391,7 +445,7 @@ class Synthesizer:
             guardrail_id=self._effective_guardrail_id(),
             guard_content=guard_content,
             model_id=model_id,
-            max_tokens=_synth_max_tokens(),
+            max_tokens=max_tokens or _synth_max_tokens(),
         )
         duration_ms = int((time.perf_counter() - start) * 1000)
 
@@ -428,6 +482,7 @@ class Synthesizer:
         model_id: str | None = None,
         working_answer: str | None = None,
         answer_language: str | None = None,
+        max_tokens: int | None = None,
     ) -> SynthesisResult:
         """Stream synthesis — emits tokens via on_token callback, returns final result.
 
@@ -447,6 +502,8 @@ class Synthesizer:
             answer_language: Optional BCP 47 tag resolved once for the request; when
                 set, the output-language directive names it instead of asking the
                 model to work out the question's language.
+            max_tokens: Per-request output-token cap; ``None`` keeps
+                ``TIER3_SYNTH_MAX_TOKENS``.
 
         Returns:
             SynthesisResult with assembled answer, confidence, and duration.
@@ -501,7 +558,7 @@ class Synthesizer:
                 guardrail_id=self._effective_guardrail_id(),
                 guard_content=guard_content,
                 model_id=model_id,
-                max_tokens=_synth_max_tokens(),
+                max_tokens=max_tokens or _synth_max_tokens(),
             ):
                 accumulated.append(token)
                 pending += token
@@ -565,7 +622,7 @@ class Synthesizer:
                 guardrail_id=self._effective_guardrail_id(),
                 guard_content=guard_content,
                 model_id=model_id,
-                max_tokens=_synth_max_tokens(),
+                max_tokens=max_tokens or _synth_max_tokens(),
             )
             duration_ms = int((time.perf_counter() - start) * 1000)
             if result.guardrail_blocked:

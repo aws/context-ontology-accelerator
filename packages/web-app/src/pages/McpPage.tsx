@@ -43,6 +43,11 @@ import Table from "@cloudscape-design/components/table";
 import Tabs from "@cloudscape-design/components/tabs";
 import { RuntimeConfigContext, useCurrentNamespace } from "@components";
 import { buildMcpEndpoint } from "@utils/build-mcp-endpoint";
+import {
+  PROXY_BUILD_COMMAND,
+  PROXY_CHECKSUM_SCOPE,
+  PROXY_REPO_BUILD_COMMAND,
+} from "./mcp-proxy-build";
 
 /**
  * Tools exposed by the MCP server. Mirrors the @mcp.tool() functions in
@@ -136,12 +141,18 @@ const PROXY_ARGS = ["/absolute/path/to/mcp-proxy/dist/index.js"];
 /**
  * The raw-source download bundle, generated at build time by
  * `web-app/scripts/pack-mcp-proxy.mjs` (wired as the `prebuild` step) and
- * served from the same auth-gated CloudFront distribution as the rest of the
- * console — not a public endpoint. It contains the proxy's TypeScript SOURCE
- * (not a compiled blob) so a user without repo access can read exactly what
- * runs with their AWS credentials before trusting it, then build it with
- * `npm install && npx tsc --outDir dist`. The `.sha256` sidecar lets the user
- * verify the download was not tampered with.
+ * served as a static file of the console's CloudFront distribution. The
+ * console's sign-in runs in the browser and does not gate static files, so the
+ * zip and its `.sha256` download without signing in (unless the deployment
+ * adds the optional Lambda@Edge authorizer). That is fine: the bundle is
+ * source code only, with no secrets and no deployment-specific values. It
+ * contains the proxy's TypeScript SOURCE (not a compiled blob) so a user
+ * without repo access can read exactly what runs with their AWS credentials
+ * before trusting it, then build it with PROXY_BUILD_COMMAND. The `.sha256`
+ * sidecar lets the user check the download is complete and intact. It is
+ * served from the same origin as the zip, so it is not proof of who published
+ * it, and it covers the pinned direct dependency versions, not the packages
+ * `npm install` resolves for them (PROXY_CHECKSUM_SCOPE says so on the page).
  */
 const PROXY_SRC_ZIP = "/downloads/coa-mcp-proxy-src.zip";
 const PROXY_SRC_SHA = "/downloads/coa-mcp-proxy-src.zip.sha256";
@@ -307,10 +318,7 @@ export const McpPage: React.FC = () => {
                   exactly what runs with your AWS credentials before trusting
                   it. Unzip, then build:
                 </Box>
-                <Box variant="code">
-                  cd coa-mcp-proxy &amp;&amp; npm install &amp;&amp; npx tsc
-                  --outDir dist
-                </Box>
+                <Box variant="code">{PROXY_BUILD_COMMAND}</Box>
                 <BundleChecksum />
                 <Box variant="p" color="text-body-secondary">
                   Verify the download with{" "}
@@ -318,9 +326,11 @@ export const McpPage: React.FC = () => {
                     sha256sum -c coa-mcp-proxy-src.zip.sha256
                   </Box>{" "}
                   (the <Box variant="code">.sha256</Box> file downloads
-                  alongside the zip). If you already have a repo checkout, build{" "}
-                  <Box variant="code">packages/mcp-proxy</Box> the same way
-                  instead.
+                  alongside the zip). {PROXY_CHECKSUM_SCOPE}
+                </Box>
+                <Box variant="p" color="text-body-secondary">
+                  If you already have a repo checkout, run this from its root
+                  instead: <Box variant="code">{PROXY_REPO_BUILD_COMMAND}</Box>
                 </Box>
                 <Box variant="p">
                   Use the absolute path to the resulting{" "}

@@ -82,12 +82,15 @@ deployment's resource prefix (default `/coa`).
 checkout and use the absolute path to the built entrypoint:
 
 ```bash
+pnpm install          # from the repo root
 cd packages/mcp-proxy
-npm install
-npx tsc --outDir dist
+pnpm run build
 # use the absolute path printed by:
 echo "$PWD/dist/index.js"
 ```
+
+Without a repo checkout, download the proxy source from the console's MCP Server page instead
+(see `packages/mcp-proxy/README.md`).
 
 ### Step 2: Configure your IDE
 
