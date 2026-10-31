@@ -1,6 +1,6 @@
 [project]
 name = "coa-serve"
-version = "0.3.8"
+version = "0.3.9"
 description = "Serve layer Context Manager — query orchestration"
 requires-python = ">=3.12"
 
@@ -28,7 +28,7 @@ dependencies = [
     "aiomysql>=0.2",
     "python-tds>=1.15",
     "sqlglot>=25.0",
-    "botocore>=1.35",
+    "botocore>=1.43.117",
     "rdflib>=7.0",
     # real Cedar policy engine for serve-path namespace authorization
     # (same engine the control-plane authorizer uses). arm64 manylinux wheel

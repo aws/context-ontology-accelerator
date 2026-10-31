@@ -23,14 +23,11 @@ export interface PythonBundlingOptions {
   /** Absolute paths to `src/` directories whose contents are copied to the asset root. */
   readonly srcDirs: string[];
   /**
-   * How to install pip dependencies. Provide exactly one of:
-   *   - `requirementsFile` — path to a `requirements.txt`
-   *   - `pipDeps` — explicit list of package names
-   *
-   * If neither is provided, no pip install step runs.
+   * Path to a `requirements.txt`, or to a hash-pinned `requirements.lock.txt`,
+   * which is installed with `--require-hashes`. If omitted, no pip install step
+   * runs.
    */
   readonly requirementsFile?: string;
-  readonly pipDeps?: string[];
   /**
    * Target Lambda architecture. Determines the pip platform tag.
    * @default "x86_64"
@@ -60,6 +57,15 @@ export interface PythonBundlingOptions {
  * dir for local bundling (and the requirements path stays an absolute host path,
  * since the local step runs on the host and reads the real file).
  */
+/**
+ * True for a hash-pinned lock (`requirements.lock.txt`, written by
+ * scripts/relock-python-requirements.sh), which is installed with
+ * `--require-hashes` so a deploy can only ship the locked files.
+ */
+export function _isHashLocked(requirementsFile: string): boolean {
+  return requirementsFile.endsWith(".lock.txt");
+}
+
 export function _uvInstallCommand(opts: PythonBundlingOptions): string | null {
   const uvPlatform =
     opts.architecture === "arm64"
@@ -68,11 +74,14 @@ export function _uvInstallCommand(opts: PythonBundlingOptions): string | null {
   const flags = `--target /asset-output --python-platform ${uvPlatform} --python-version 3.12 --only-binary :all: -q --no-cache`;
   if (opts.requirementsFile) {
     const reqFile = opts.requirementsFile.replace(/\\/g, "/");
-    return `uv pip install ${flags} -r ${reqFile}`;
-  }
-  if (opts.pipDeps?.length) {
-    const deps = opts.pipDeps.map((d) => `'${d}'`).join(" ");
-    return `uv pip install ${flags} ${deps}`;
+    // A lock already pins the whole tree with hashes. --no-config keeps the
+    // workspace's [tool.uv] constraint-dependencies out of the install: they
+    // are `>=` floors for dev tooling, which hash mode rejects as unpinned, and
+    // the relock script already applied them when it compiled the lock.
+    const lockFlags = _isHashLocked(reqFile)
+      ? " --no-config --require-hashes"
+      : "";
+    return `uv pip install${lockFlags} ${flags} -r ${reqFile}`;
   }
   return null;
 }
@@ -83,16 +92,9 @@ export function _uvInstallCommand(opts: PythonBundlingOptions): string | null {
  *
  * @example
  * ```ts
- * // Using a requirements file:
  * bundlePython({
  *   srcDirs: [Paths.controlPlaneSrc, fromRoot("libs/common/src")],
- *   requirementsFile: fromRoot("packages/control-plane/requirements.txt"),
- * });
- *
- * // Using an explicit list:
- * bundlePython({
- *   srcDirs: [Paths.controlPlaneSrc, fromRoot("libs/common/src")],
- *   pipDeps: ["pydantic", "structlog"],
+ *   requirementsFile: fromRoot("packages/control-plane/requirements.lock.txt"),
  * });
  * ```
  */
@@ -143,11 +145,11 @@ export function bundlePython(opts: PythonBundlingOptions): lambda.Code {
   if (opts.requirementsFile) {
     const reqFile = opts.requirementsFile.replace(/\\/g, "/");
     localPipSteps = localInstall ? [localInstall, cleanup] : [];
-    dockerPipSteps = [`pip install -r ${reqFile} ${pipFlags}`, cleanup];
-  } else if (opts.pipDeps?.length) {
-    const deps = opts.pipDeps.map((d) => `'${d}'`).join(" ");
-    localPipSteps = localInstall ? [localInstall, cleanup] : [];
-    dockerPipSteps = [`pip install ${pipFlags} ${deps}`, cleanup];
+    const hashFlag = _isHashLocked(reqFile) ? " --require-hashes" : "";
+    dockerPipSteps = [
+      `pip install${hashFlag} -r ${reqFile} ${pipFlags}`,
+      cleanup,
+    ];
   }
 
   const localSteps = [...copies, ...localPipSteps];
@@ -199,15 +201,10 @@ function escapeRegExp(s: string): string {
  * everything (`cp -r ${d}/*`), so JSON/schema/template files shipped alongside
  * the code are part of the output and must invalidate the asset when edited.
  *
- * Also folds in `pipDeps` and `architecture`, which change the produced bundle
- * without touching any file:
- *   - `pipDeps` is the alternative to `requirementsFile`; callers using it could
- *     add, remove, or re-pin a dependency with no hash change, so the deployed
- *     bundle kept the old dependency set (symptom: `ImportModuleError` for a
- *     freshly added dep).
- *   - `architecture` selects the pip `--platform` tag and therefore which binary
- *     wheels land in the bundle, so flipping x86_64 ↔ arm64 reused an asset built
- *     for the wrong architecture.
+ * Also folds in `architecture`, which changes the produced bundle without
+ * touching any file: it selects the pip `--platform` tag and therefore which
+ * binary wheels land in the bundle, so flipping x86_64 ↔ arm64 reused an asset
+ * built for the wrong architecture.
  *
  * Reads files via Node on every platform. The previous `find … || true` shell
  * pipeline was unquoted and failure-suppressed, so a repo path containing a space
@@ -219,11 +216,6 @@ export function _computeSourceHash(opts: PythonBundlingOptions): string {
 
   // Bundle-shaping inputs first, so they are covered even if a srcDir is absent.
   hash.update(`architecture:${opts.architecture ?? "x86_64"}\n`);
-  if (opts.pipDeps?.length) {
-    // Sorted: dependency ORDER does not change the installed set, so it must not
-    // change the hash (an unsorted list would cause spurious re-bundles).
-    hash.update(`pipDeps:${[...opts.pipDeps].sort().join(",")}\n`);
-  }
 
   for (const dir of opts.srcDirs) {
     const normalizedDir = dir.replace(/\\/g, "/");
