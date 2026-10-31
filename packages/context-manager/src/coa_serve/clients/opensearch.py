@@ -275,6 +275,62 @@ class OpenSearchVectorClient(VectorClient):
         results = await self._run(self._aoss.search_raw, index or self._index, body)
         return self._parse_hits(results)
 
+    async def phrase_search(self, phrases: list[str], *, index: str, size: int = 50) -> list[dict[str, Any]]:
+        """Keyword (BM25) search for exact phrases over the raw chunk text field.
+
+        GraphRAG chunk indexes store each chunk's raw text in ``value`` (an
+        analyzed text field), so a ``match_phrase`` per phrase finds chunks that
+        literally contain a name, identifier or quoted phrase — which an embedding
+        search over summaries does not guarantee. Each phrase is a named clause, so
+        every hit reports which phrases it matched. The query is a top-level
+        ``bool`` (the shape the search proxy accepts) and the proxy caps ``size``.
+
+        Returns:
+            One dict per hit: ``chunk_id`` (the toolkit chunk id), ``source_id``,
+            ``source_s3_key``, ``text``, ``score`` and ``matched`` (indexes into
+            ``phrases``).
+        """
+        clauses = [
+            {"match_phrase": {"value": {"query": phrase, "_name": f"p{i}"}}}
+            for i, phrase in enumerate(phrases)
+            if phrase and phrase.strip()
+        ]
+        if not clauses:
+            return []
+        body: dict[str, Any] = {
+            "size": size,
+            "query": {"bool": {"should": clauses, "minimum_should_match": 1}},
+            "_source": [
+                "value",
+                "metadata.chunk.chunkId",
+                "metadata.source.sourceId",
+                "metadata.source.metadata.source_s3_key",
+            ],
+        }
+        results = await self._run(self._aoss.search_raw, index, body)
+        hits: list[dict[str, Any]] = []
+        for hit in results.get("hits", {}).get("hits", []):
+            source = hit.get("_source") or {}
+            metadata = source.get("metadata") if isinstance(source.get("metadata"), dict) else {}
+            chunk_meta = metadata.get("chunk") if isinstance(metadata.get("chunk"), dict) else {}
+            nested = _nested_source(source)
+            nested_meta = nested.get("metadata") if isinstance(nested.get("metadata"), dict) else {}
+            matched = []
+            for name in hit.get("matched_queries") or []:
+                if isinstance(name, str) and name.startswith("p") and name[1:].isdigit():
+                    matched.append(int(name[1:]))
+            hits.append(
+                {
+                    "chunk_id": chunk_meta.get("chunkId") or hit.get("_id", ""),
+                    "source_id": nested.get("sourceId", "") or "",
+                    "source_s3_key": nested_meta.get("source_s3_key", "") or "",
+                    "text": source.get("value", "") or "",
+                    "score": hit.get("_score") or 0.0,
+                    "matched": matched,
+                }
+            )
+        return hits
+
     # ── hit shaping ──────────────────────────────────────────────────────
 
     def _to_hit(self, source: dict) -> VectorHit:

@@ -7,6 +7,7 @@ import * as path from "path";
 
 import {
   _computeSourceHash,
+  _isHashLocked,
   _uvInstallCommand,
 } from "../../lib/utils/python-bundling";
 
@@ -199,56 +200,6 @@ describe("bundlePython asset hash", () => {
     });
   });
 
-  describe("pipDeps", () => {
-    it("changes when a dependency is added", () => {
-      const dir = srcDir("a", { "mod.py": "x = 1" });
-      const before = _computeSourceHash({
-        srcDirs: [dir],
-        pipDeps: ["pydantic"],
-      });
-
-      const after = _computeSourceHash({
-        srcDirs: [dir],
-        pipDeps: ["pydantic", "structlog"],
-      });
-
-      expect(after).not.toEqual(before);
-    });
-
-    it("changes when a dependency is removed", () => {
-      const dir = srcDir("a", { "mod.py": "x = 1" });
-      const before = _computeSourceHash({
-        srcDirs: [dir],
-        pipDeps: ["pydantic", "structlog"],
-      });
-
-      expect(
-        _computeSourceHash({ srcDirs: [dir], pipDeps: ["pydantic"] }),
-      ).not.toEqual(before);
-    });
-
-    it("changes when a dependency is re-pinned", () => {
-      const dir = srcDir("a", { "mod.py": "x = 1" });
-      const before = _computeSourceHash({
-        srcDirs: [dir],
-        pipDeps: ["pydantic==2.1.0"],
-      });
-
-      expect(
-        _computeSourceHash({ srcDirs: [dir], pipDeps: ["pydantic==2.2.0"] }),
-      ).not.toEqual(before);
-    });
-
-    it("does NOT change when only the order differs", () => {
-      // Order does not change the installed set, so it must not cause a re-bundle.
-      const dir = srcDir("a", { "mod.py": "x = 1" });
-
-      expect(
-        _computeSourceHash({ srcDirs: [dir], pipDeps: ["a", "b"] }),
-      ).toEqual(_computeSourceHash({ srcDirs: [dir], pipDeps: ["b", "a"] }));
-    });
-  });
-
   describe("architecture", () => {
     it("changes between x86_64 and arm64", () => {
       // Selects the pip --platform tag, and therefore which binary wheels are in
@@ -310,7 +261,10 @@ describe("bundlePython asset hash", () => {
  */
 describe("_uvInstallCommand (local install uses uv, not host pip)", () => {
   it("uses uv and never the host pip/pip3", () => {
-    const cmd = _uvInstallCommand({ srcDirs: [], pipDeps: ["structlog"] });
+    const cmd = _uvInstallCommand({
+      srcDirs: [],
+      requirementsFile: "/repo/packages/x/requirements.txt",
+    });
     expect(cmd).not.toBeNull();
     expect(cmd!).toMatch(/^uv pip install /);
     // Guard against a regression to a bare pip/pip3 at a command boundary
@@ -320,7 +274,10 @@ describe("_uvInstallCommand (local install uses uv, not host pip)", () => {
   });
 
   it("cross-targets the 3.12 Lambda runtime with wheels only", () => {
-    const cmd = _uvInstallCommand({ srcDirs: [], pipDeps: ["structlog"] })!;
+    const cmd = _uvInstallCommand({
+      srcDirs: [],
+      requirementsFile: "/repo/packages/x/requirements.txt",
+    })!;
     expect(cmd).toContain("--python-version 3.12");
     expect(cmd).toContain("--python-platform x86_64-manylinux2014");
     expect(cmd).toContain("--only-binary :all:");
@@ -330,7 +287,7 @@ describe("_uvInstallCommand (local install uses uv, not host pip)", () => {
   it("selects the aarch64 platform tag for arm64", () => {
     const cmd = _uvInstallCommand({
       srcDirs: [],
-      pipDeps: ["structlog"],
+      requirementsFile: "/repo/packages/x/requirements.txt",
       architecture: "arm64",
     })!;
     expect(cmd).toContain("--python-platform aarch64-manylinux2014");
@@ -343,18 +300,186 @@ describe("_uvInstallCommand (local install uses uv, not host pip)", () => {
       requirementsFile: "/repo/packages/x/requirements.txt",
     })!;
     expect(cmd).toContain("-r /repo/packages/x/requirements.txt");
+    // A plain requirements file is not hash-checked.
+    expect(cmd).not.toContain("--require-hashes");
+    expect(cmd).not.toContain("--no-config");
   });
 
-  it("quotes each explicit dependency (version specifiers are shell-safe)", () => {
+  it("installs a lock with --require-hashes and without the workspace config", () => {
     const cmd = _uvInstallCommand({
       srcDirs: [],
-      pipDeps: ["pydantic>=2", "structlog"],
+      requirementsFile: "/repo/packages/x/requirements.lock.txt",
+      architecture: "arm64",
     })!;
-    expect(cmd).toContain("'pydantic>=2'");
-    expect(cmd).toContain("'structlog'");
+    expect(cmd).toMatch(/^uv pip install --no-config --require-hashes /);
+    expect(cmd).toContain("-r /repo/packages/x/requirements.lock.txt");
+    expect(cmd).toContain("--python-platform aarch64-manylinux2014");
   });
 
   it("returns null when there are no dependencies to install", () => {
     expect(_uvInstallCommand({ srcDirs: [] })).toBeNull();
+  });
+});
+
+const repoRoot = path.resolve(__dirname, "../../..");
+
+// The packages whose bundles install from a lock, as the relock script, the
+// Renovate rule and the CI check all see them. The script is the source of truth.
+const lockedPackages = (
+  /PACKAGES=\(([^)]*)\)/.exec(
+    fs.readFileSync(
+      path.join(repoRoot, "scripts/relock-python-requirements.sh"),
+      "utf-8",
+    ),
+  )?.[1] ?? ""
+)
+  .split(/\s+/)
+  .filter(Boolean);
+
+const isRecord = (v: unknown): v is Record<string, unknown> =>
+  typeof v === "object" && v !== null;
+
+const stringList = (v: unknown): string[] =>
+  Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+
+/** True when dotted-numeric version `v` is at least `floor` (suffixes ignored). */
+function versionAtLeast(v: string, floor: string): boolean {
+  const nums = (x: string) =>
+    (/^\d+(\.\d+)*/.exec(x)?.[0] ?? "0").split(".").map(Number);
+  const [a, b] = [nums(v), nums(floor)];
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const d = (a[i] ?? 0) - (b[i] ?? 0);
+    if (d !== 0) return d > 0;
+  }
+  return true;
+}
+
+describe("every Python bundle installs from a lock", () => {
+  const stacksDir = path.join(repoRoot, "infra/lib/stacks");
+  const stackFiles = fs
+    .readdirSync(stacksDir, { recursive: true, encoding: "utf-8" })
+    .filter((f) => f.endsWith(".ts"))
+    .map((f) => path.join(stacksDir, f));
+  const used = new Set<string>();
+  let literalUses = 0;
+  let allUses = 0;
+  for (const file of stackFiles) {
+    const text = fs.readFileSync(file, "utf-8");
+    allUses += [...text.matchAll(/\brequirementsFile:/g)].length;
+    for (const m of text.matchAll(
+      /requirementsFile:\s*fromRoot\(\s*"([^"]+)"/g,
+    )) {
+      used.add(m[1]);
+      literalUses += 1;
+    }
+  }
+
+  it("lists the packages to lock", () => {
+    expect(lockedPackages.length).toBeGreaterThan(0);
+  });
+
+  it("writes every requirementsFile as a fromRoot string literal", () => {
+    // The checks below only see literals, so any other form (a constant, a
+    // path.join) would escape them and could point at an unhashed file.
+    expect(allUses).toBe(literalUses);
+  });
+
+  it("points every bundle at a lock that the relock script maintains", () => {
+    expect(used.size).toBeGreaterThan(0);
+    for (const req of used) {
+      expect(req).toMatch(/\/requirements\.lock\.txt$/);
+      expect(lockedPackages).toContain(path.posix.dirname(req));
+    }
+  });
+
+  it("has a bundle for every package the relock script locks", () => {
+    for (const pkg of lockedPackages) {
+      expect(used.has(`${pkg}/requirements.lock.txt`)).toBe(true);
+    }
+  });
+
+  it("has the Renovate rule relock exactly those packages", () => {
+    const parsed: unknown = JSON.parse(
+      fs.readFileSync(path.join(repoRoot, "renovate.json"), "utf-8"),
+    );
+    const rules: unknown[] =
+      isRecord(parsed) && Array.isArray(parsed.packageRules)
+        ? parsed.packageRules
+        : [];
+    expect(rules.length).toBeGreaterThan(0);
+    const rule = rules
+      .filter(isRecord)
+      .find((r) =>
+        stringList(r.matchFileNames).includes(
+          "packages/sources/requirements.lock.txt",
+        ),
+      );
+    expect(rule).toBeDefined();
+    const tasks = rule?.postUpgradeTasks;
+    const locks = lockedPackages.map((p) => `${p}/requirements.lock.txt`);
+    const reqs = lockedPackages.map((p) => `${p}/requirements.txt`);
+    expect(stringList(rule?.matchFileNames).sort()).toEqual(
+      [...locks, ...reqs].sort(),
+    );
+    expect(
+      stringList(isRecord(tasks) ? tasks.fileFilters : undefined).sort(),
+    ).toEqual([...locks].sort());
+  });
+});
+
+describe.each(lockedPackages)("hash-locked requirements: %s", (pkg) => {
+  const lock = path.join(repoRoot, pkg, "requirements.lock.txt");
+
+  it("pins every requirement of the lock with a hash", () => {
+    // --require-hashes refuses the whole install if one entry is unpinned or
+    // unhashed, so a hand edit that breaks this would fail every deploy.
+    const text = fs.readFileSync(lock, "utf-8");
+    const entries = text
+      .split(/\n(?=[A-Za-z0-9])/)
+      .map((block) => block.trim())
+      .filter((block) => block && !block.startsWith("#"));
+    expect(entries.length).toBeGreaterThan(0);
+    for (const entry of entries) {
+      expect(entry).toMatch(/^[A-Za-z0-9_.-]+==[^\s\\]+ \\/);
+      expect(entry).toMatch(/--hash=sha256:[0-9a-f]{64}/);
+    }
+  });
+
+  it("keeps every direct dependency of requirements.txt in the lock, at or above its floor", () => {
+    const normalize = (n: string) => n.toLowerCase().replace(/_/g, "-");
+    const direct = fs
+      .readFileSync(path.join(repoRoot, pkg, "requirements.txt"), "utf-8")
+      .split("\n")
+      .map((line) => line.replace(/#.*/, "").trim())
+      .filter(Boolean)
+      .map((line) => ({
+        name: normalize(line.split(/[<>=!~;\s[]/)[0]),
+        floor: /^[^<>=!~;\s[]+(?:\[[^\]]*\])?>=([0-9][^,;\s]*)/.exec(line)?.[1],
+      }));
+    const pinned = new Map(
+      [
+        ...fs
+          .readFileSync(lock, "utf-8")
+          .matchAll(/^([A-Za-z0-9_.-]+)==([^\s\\]+)/gm),
+      ].map((m) => [normalize(m[1]), m[2]]),
+    );
+    const missing = direct.filter(({ name }) => !pinned.has(name));
+    expect(missing).toEqual([]);
+    // e.g. the certifi security floor: a hand-edited older pin must fail here
+    // as well as in the CI relock check.
+    const belowFloor = direct.filter(({ name, floor }) => {
+      const version = pinned.get(name);
+      return floor && version && !versionAtLeast(version, floor);
+    });
+    expect(belowFloor).toEqual([]);
+  });
+});
+
+describe("_isHashLocked", () => {
+  it("recognizes a lock by its file name only", () => {
+    expect(_isHashLocked("/r/packages/sources/requirements.lock.txt")).toBe(
+      true,
+    );
+    expect(_isHashLocked("/r/packages/sources/requirements.txt")).toBe(false);
   });
 });

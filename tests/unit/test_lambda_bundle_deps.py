@@ -3,8 +3,8 @@
 
 """Every third-party module a Lambda handler imports must be in that Lambda's bundle.
 
-`bundlePython` installs exactly what its caller declares — a `requirementsFile` or
-an inline `pipDeps` list — and nothing else. The uv workspace resolves imports
+`bundlePython` installs exactly what its caller declares in its `requirementsFile`
+(a lock generated from the requirements.txt next to it) and nothing else. The uv workspace resolves imports
 transitively, so a handler can import something that is absent from the bundle and
 still pass every test, lint and type check. The failure appears only at invoke
 time, as::
@@ -58,7 +58,6 @@ adapter, and bundling llama-index into every Lambda would be dead weight.
 from __future__ import annotations
 
 import ast
-import re
 import sys
 from dataclasses import dataclass
 from importlib.metadata import packages_distributions
@@ -80,10 +79,10 @@ _RUNTIME_PROVIDED = frozenset({"boto3", "botocore"})
 class Bundle:
     """One `bundlePython` call: its handlers, its sources, and what it declares.
 
-    ``declared_in`` is the stack file, and ``declares`` names how to read the
-    declaration out of it — either the path of a requirements file relative to the
-    repo root, or ``pipDeps`` to parse the inline array. Reading the real
-    declaration rather than mirroring it here is the point: a copy would drift.
+    ``declared_in`` is the stack file, and ``declares`` is the path, relative to the
+    repo root, of the requirements.txt the bundle's lock is generated from. Reading
+    the real declaration rather than mirroring it here is the point: a copy would
+    drift.
     """
 
     name: str
@@ -93,24 +92,18 @@ class Bundle:
     declares: str
 
     def declared(self) -> set[str]:
-        if self.declares == "pipDeps":
-            source = self.declared_in.read_text()
-            match = re.search(r"pipDeps:\s*\[(.*?)]", source, re.S)
-            assert match, f"no pipDeps array in {self.declared_in.relative_to(_REPO_ROOT)}"
-            names = re.findall(r"""["']([^"']+)["']""", match.group(1))
-        else:
-            requirements = _REPO_ROOT / self.declares
-            assert requirements.is_file(), f"missing {self.declares}"
-            names = []
-            for raw in requirements.read_text().splitlines():
-                line = raw.split("#", 1)[0].strip()
-                if not line:
-                    continue
-                for separator in (">=", "==", "<=", "~=", ">", "<", "["):
-                    if separator in line:
-                        line = line.split(separator, 1)[0]
-                        break
-                names.append(line.strip())
+        requirements = _REPO_ROOT / self.declares
+        assert requirements.is_file(), f"missing {self.declares}"
+        names = []
+        for raw in requirements.read_text().splitlines():
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            for separator in (">=", "==", "<=", "~=", ">", "<", "["):
+                if separator in line:
+                    line = line.split(separator, 1)[0]
+                    break
+            names.append(line.strip())
         assert names, f"{self.name}: declaration parsed as empty"
         return {_normalize(name) for name in names}
 
@@ -124,7 +117,7 @@ BUNDLES = (
             "coa_common": _COMMON,
         },
         declared_in=_STACKS / "data-layer-stack.ts",
-        declares="pipDeps",
+        declares="packages/data-layer/requirements.txt",
     ),
     Bundle(
         name="namespace-deletion-pipeline",

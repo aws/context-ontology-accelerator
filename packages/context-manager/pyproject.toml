@@ -1,6 +1,6 @@
 [project]
 name = "coa-serve"
-version = "0.3.8"
+version = "0.3.9"
 description = "Serve layer Context Manager — query orchestration"
 requires-python = ">=3.12"
 
