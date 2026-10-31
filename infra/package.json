@@ -1,6 +1,6 @@
 {
   "name": "coa-infra",
-  "version": "0.3.8",
+  "version": "0.3.9",
   "description": "SemanticContext CDK Infrastructure (TypeScript)",
   "private": true,
   "scripts": {
@@ -9,7 +9,7 @@
     "lint": "tsc --noEmit && uv run ruff check lambda lib/lambdas test && uv run ruff format --check lambda lib/lambdas test",
     "format": "prettier --write \"bin/**/*.ts\" \"lib/**/*.ts\"",
     "format:check": "prettier --check \"bin/**/*.ts\" \"lib/**/*.ts\"",
-    "test": "jest --runInBand && uv run pytest test/lambdas -q",
+    "test": "jest --maxWorkers=4 && uv run pytest test/lambdas -q",
     "cdk": "cdk"
   },
   "devDependencies": {
