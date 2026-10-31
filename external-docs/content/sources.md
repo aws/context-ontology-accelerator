@@ -1041,6 +1041,10 @@ After creation, documents go through:
 3. **Knowledge graph build** — creates nodes/edges in Neptune
 4. **Embedding** — vectorizes chunks for semantic search in OpenSearch
 
+Once processing finishes, you can turn the extracted knowledge graph into a
+formal ontology with
+[unstructured induction](ontologies.md#unstructured-induction-documents).
+
 ### Language of Extracted Content
 
 In a namespace whose language is not English (see

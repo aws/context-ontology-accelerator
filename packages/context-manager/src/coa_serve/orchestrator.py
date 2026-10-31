@@ -42,6 +42,7 @@ from .tier2.strategy import (
     capped_max_rows,
     normalize_strategy_option,
 )
+from .tier3.agentic.defaults import with_recommended_options
 from .tier3.knowledge_retriever import VECTOR_SEARCH_TIMEOUT_S, KnowledgeRetriever
 from .trace import TraceCollector, client_error_detail
 
@@ -1273,7 +1274,8 @@ class Orchestrator:
                 # rendered as "0 rows". options carries the row cap; model_id the
                 # per-request model override the standard Tier-2 path already honors.
                 profile=profile,
-                options=options,
+                # Unset Deep Reasoning options take the measured recommended values.
+                options=with_recommended_options(options),
                 model_id=model_id,
             )
             result = self._assembler.assemble_tier3(
