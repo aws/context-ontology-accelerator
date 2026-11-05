@@ -1,5 +1,7 @@
 # Non-boto3 dependencies for the sources Lambda.
 # boto3/botocore are excluded (provided by the Lambda runtime).
+# The Lambdas install from requirements.lock.txt (hash-pinned), not this file.
+# After editing it, run scripts/relock-python-requirements.sh.
 structlog>=24.4.0
 python-dateutil>=2.9.0.post0
 pydantic>=2.13.5

@@ -45,6 +45,13 @@ class TestResolveNamespaceId:
 
         assert resolve_namespace_id(_UUID, table) == _UUID
 
+    def test_uuid_with_trailing_newline_is_not_returned_as_a_uuid(self):
+        table = MagicMock()
+        table.get_item.return_value = {}
+
+        with pytest.raises(ValueError, match="Cannot resolve namespace"):
+            resolve_namespace_id(f"{_UUID}\n", table)
+
     def test_unresolvable_name_raises(self):
         table = MagicMock()
         table.get_item.return_value = {}

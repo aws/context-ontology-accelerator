@@ -199,7 +199,7 @@ class TestTBoxContext:
         bind_language("ja")
         graph = _RowsGraph({"?op a owl:ObjectProperty": _FK_ROWS})
         builder = TBoxContextBuilder(graph_client=graph, graph_uri_template=TEMPLATE)
-        edges = await builder._fetch_object_properties(NS, mapped=False)
+        edges = await builder._fetch_object_properties(NS)
         assert [(e["domain_label"], e["range_label"]) for e in edges] == [
             ("注文", "customers"),
             ("customers", "Regionen"),

@@ -33,6 +33,7 @@ from typing import Any
 import boto3
 import structlog
 from coa_common import AossVectorClient, resolve_region, sync_boto_config
+from coa_common.constants import StructuredBackend
 
 from .base import VectorClient, VectorHit
 
@@ -55,6 +56,7 @@ _SOURCE_FIELDS = [
     "entity_type",
     "entity_uri",
     "data_source_id",
+    "query_backend",
     # GraphRAG chunk indexes (``chunk_{tenant}``) carry the document identity
     # nested inside the toolkit's node metadata, not as a flat ``source_doc``
     # key. Project only the identity fields — pulling ``metadata`` whole would
@@ -192,6 +194,22 @@ class OpenSearchVectorClient(VectorClient):
 
     # ── searches ─────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _backend_filter(backend: StructuredBackend) -> dict[str, Any]:
+        """k-NN filter keeping only documents answered by ``backend``.
+
+        Import writes ``query_backend`` on graph (``RDF_SPARQL``) class documents only,
+        so an ABSENT field means SQL and pre-existing documents need no re-index. The
+        value is matched on both ``query_backend`` (keyword on indexes created with
+        it) and ``query_backend.keyword`` (its dynamic sub-field on older indexes, where
+        the top-level field is analyzed text and an exact ``term`` cannot match).
+        """
+        value = StructuredBackend.RDF_SPARQL.value
+        is_graph = [{"term": {"query_backend": value}}, {"term": {"query_backend.keyword": value}}]
+        if backend == StructuredBackend.RDF_SPARQL:
+            return {"bool": {"should": is_graph, "minimum_should_match": 1}}
+        return {"bool": {"must_not": is_graph}}
+
     async def search(
         self,
         query_vector: list[float],
@@ -201,8 +219,10 @@ class OpenSearchVectorClient(VectorClient):
         index: str | None = None,
         entity_type: str | None = None,
         require_mapped: bool = False,
+        ontology_ids: list[str] | None = None,
+        query_backend: StructuredBackend | None = None,
     ) -> list[VectorHit]:
-        """k-NN vector search, optionally filtered by entity_type / mapped-only.
+        """k-NN vector search, optionally filtered by entity_type / mapped-only / ontology / backend.
 
         Filters are pushed SERVER-SIDE into the k-NN ``filter`` clause (the AOSS
         collection uses Faiss/HNSW, which supports filtered k-NN), so the engine
@@ -210,14 +230,21 @@ class OpenSearchVectorClient(VectorClient):
 
         - ``entity_type`` → ``term`` on the ``entity_type`` keyword field.
         - ``require_mapped`` → ``exists`` on ``data_source_id`` (written only for
-          R2RML-mapped, Tier-2-capable classes). Callers that must serve legacy
-          (all-unmapped) namespaces gate this via :meth:`count_documents`.
+          R2RML-mapped, Tier-2-capable classes).
+        - ``ontology_ids`` → ``terms`` on the ``ontology_id`` keyword field.
+        - ``query_backend`` → only documents answered by that backend; absent is SQL
+          (see :meth:`_backend_filter`). Keeps graph classes out of the SQL
+          strategies' retrieval and SQL classes out of the SPARQL strategy's.
         """
         filters: list[dict[str, Any]] = []
         if entity_type:
             filters.append({"term": {"entity_type": entity_type}})
         if require_mapped:
             filters.append({"exists": {"field": "data_source_id"}})
+        if ontology_ids:
+            filters.append({"terms": {"ontology_id": list(ontology_ids)}})
+        if query_backend is not None:
+            filters.append(self._backend_filter(query_backend))
         raw = await self._run(
             self._aoss.knn_search,
             index or self._index,
@@ -227,28 +254,6 @@ class OpenSearchVectorClient(VectorClient):
             source=_SOURCE_FIELDS,
         )
         return [self._to_hit(s) for s in raw]
-
-    async def count_documents(
-        self,
-        *,
-        index: str | None = None,
-        require_mapped: bool = False,
-        entity_type: str | None = None,
-    ) -> int:
-        """Count documents matching optional entity_type / mapped filters.
-
-        Cheap gate for the NL->SQL legacy-namespace bridge: a namespace with at
-        least one R2RML-mapped class (``count_documents(require_mapped=True) > 0``)
-        uses the server-side mapped filter; a namespace with zero mapped records
-        is pre-marker/legacy and must fall back to an unfiltered k-NN so its
-        classes stay visible to Tier-2.
-        """
-        filters: list[dict[str, Any]] = []
-        if entity_type:
-            filters.append({"term": {"entity_type": entity_type}})
-        if require_mapped:
-            filters.append({"exists": {"field": "data_source_id"}})
-        return await self._run(self._aoss.count, index or self._index, filters=filters or None)
 
     async def hybrid_search(
         self,
@@ -275,6 +280,62 @@ class OpenSearchVectorClient(VectorClient):
         results = await self._run(self._aoss.search_raw, index or self._index, body)
         return self._parse_hits(results)
 
+    async def phrase_search(self, phrases: list[str], *, index: str, size: int = 50) -> list[dict[str, Any]]:
+        """Keyword (BM25) search for exact phrases over the raw chunk text field.
+
+        GraphRAG chunk indexes store each chunk's raw text in ``value`` (an
+        analyzed text field), so a ``match_phrase`` per phrase finds chunks that
+        literally contain a name, identifier or quoted phrase — which an embedding
+        search over summaries does not guarantee. Each phrase is a named clause, so
+        every hit reports which phrases it matched. The query is a top-level
+        ``bool`` (the shape the search proxy accepts) and the proxy caps ``size``.
+
+        Returns:
+            One dict per hit: ``chunk_id`` (the toolkit chunk id), ``source_id``,
+            ``source_s3_key``, ``text``, ``score`` and ``matched`` (indexes into
+            ``phrases``).
+        """
+        clauses = [
+            {"match_phrase": {"value": {"query": phrase, "_name": f"p{i}"}}}
+            for i, phrase in enumerate(phrases)
+            if phrase and phrase.strip()
+        ]
+        if not clauses:
+            return []
+        body: dict[str, Any] = {
+            "size": size,
+            "query": {"bool": {"should": clauses, "minimum_should_match": 1}},
+            "_source": [
+                "value",
+                "metadata.chunk.chunkId",
+                "metadata.source.sourceId",
+                "metadata.source.metadata.source_s3_key",
+            ],
+        }
+        results = await self._run(self._aoss.search_raw, index, body)
+        hits: list[dict[str, Any]] = []
+        for hit in results.get("hits", {}).get("hits", []):
+            source = hit.get("_source") or {}
+            metadata = source.get("metadata") if isinstance(source.get("metadata"), dict) else {}
+            chunk_meta = metadata.get("chunk") if isinstance(metadata.get("chunk"), dict) else {}
+            nested = _nested_source(source)
+            nested_meta = nested.get("metadata") if isinstance(nested.get("metadata"), dict) else {}
+            matched = []
+            for name in hit.get("matched_queries") or []:
+                if isinstance(name, str) and name.startswith("p") and name[1:].isdigit():
+                    matched.append(int(name[1:]))
+            hits.append(
+                {
+                    "chunk_id": chunk_meta.get("chunkId") or hit.get("_id", ""),
+                    "source_id": nested.get("sourceId", "") or "",
+                    "source_s3_key": nested_meta.get("source_s3_key", "") or "",
+                    "text": source.get("value", "") or "",
+                    "score": hit.get("_score") or 0.0,
+                    "matched": matched,
+                }
+            )
+        return hits
+
     # ── hit shaping ──────────────────────────────────────────────────────
 
     def _to_hit(self, source: dict) -> VectorHit:
@@ -295,6 +356,8 @@ class OpenSearchVectorClient(VectorClient):
                 "entity_type": source.get("entity_type", ""),
                 "entity_uri": source.get("entity_uri", ""),
                 "data_source_id": source.get("data_source_id", ""),
+                # "" for SQL and pre-existing documents (absent == SQL).
+                "query_backend": source.get("query_backend", ""),
                 # Richer schema context (e.g. column allowed values) for the
                 # NL→SQL generation prompt; absent for entities without it.
                 "context_text": source.get("context_text", ""),

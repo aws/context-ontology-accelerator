@@ -37,7 +37,7 @@ import botocore.awsrequest
 import botocore.exceptions
 import httpx
 from coa_common import validate_namespace_name
-from coa_common.constants import VOCAB_URI
+from coa_common.constants import VOCAB_URI, StructuredBackend
 from coa_common.label_language import LabelPreference
 from coa_common.opensearch import retry_call
 
@@ -373,6 +373,18 @@ def _iri(s: str) -> str:
     return f"<{s}>"
 
 
+def _storable_iris(uris: Iterable[str]) -> list[str]:
+    """The distinct ``uris`` that :func:`_iri` accepts, sorted; the store never holds the others."""
+    storable = []
+    for u in sorted(set(uris)):
+        try:
+            _iri(u)
+        except ValueError:
+            continue
+        storable.append(u)
+    return storable
+
+
 def _is_storable_iri(s) -> bool:
     """True if ``s`` is a named IRI we can safely store as a SPARQL IRI ref.
 
@@ -471,6 +483,21 @@ _KIND_TO_SPARQL_TYPES: dict[str, list[str]] = {
 
 
 # ── GraphStore impl ─────────────────────────────────────────────────────
+
+
+def _class_prefix_filter(prefix: str) -> str:
+    """SPARQL filter for classes that equal ``prefix`` or sit under it as an IRI namespace.
+
+    Mirrors the route's class-filter match, so ``https://ex.org/ins`` does not also
+    page in look-alikes such as ``https://ex.org/insurance#Policy`` before the LIMIT.
+    """
+    escaped = _esc(prefix)
+    if prefix.endswith(("#", "/")):
+        return f'FILTER(STRSTARTS(STR(?classUri), "{escaped}"))'
+    return (
+        f'FILTER(STR(?classUri) = "{escaped}" || STRSTARTS(STR(?classUri), "{escaped}#")'
+        f' || STRSTARTS(STR(?classUri), "{escaped}/"))'
+    )
 
 
 class NeptuneDBGraphStore(GraphStore):
@@ -647,7 +674,17 @@ class NeptuneDBGraphStore(GraphStore):
     _INSERT_BATCH_TRIPLES = 5000
     _INSERT_BATCH_BYTES = 40 * 1024 * 1024
 
-    def _class_triples(self, ontology_uri, class_uri, labels, comments, super_classes, is_mapped) -> list[str]:
+    def _class_triples(
+        self,
+        ontology_uri,
+        class_uri,
+        labels,
+        comments,
+        super_classes,
+        is_mapped,
+        query_backend=None,
+        data_source_id=None,
+    ) -> list[str]:
         """Serialize one class's projected triples (no I/O).
 
         Shared by :meth:`store_class` and :meth:`store_classes_batch` so the two
@@ -668,6 +705,15 @@ class NeptuneDBGraphStore(GraphStore):
                 f"{_iri(class_uri)} {_iri(_SCL + 'isMapped')} "
                 f'"true"^^{_iri("http://www.w3.org/2001/XMLSchema#boolean")} .'
             )
+        # Second serve gate signal: which structured backend answers the class. A
+        # plain literal, matched by term equality in serve's T-Box gate. Emitted only
+        # for a graph class — an absent marker is read as SQL, so the SQL path is
+        # byte-for-byte unchanged.
+        if query_backend:
+            triples.append(f'{_iri(class_uri)} {_iri(_SCL + "queryBackend")} "{_esc(query_backend)}" .')
+        # The source backing a graph class, for routing a query to its endpoint.
+        if data_source_id:
+            triples.append(f'{_iri(class_uri)} {_iri(_SCL + "dataSourceId")} "{_esc(data_source_id)}" .')
         for lbl in labels or []:
             triples.append(f'{_iri(class_uri)} {_iri(RDFS + "label")} "{_esc(lbl)}" .')
         for cmt in comments or []:
@@ -819,6 +865,8 @@ class NeptuneDBGraphStore(GraphStore):
         comments=None,
         super_classes=None,
         is_mapped=False,
+        query_backend=None,
+        data_source_id=None,
     ):
         """Project a class (and its labels, comments, superclasses) into a graph.
 
@@ -829,13 +877,18 @@ class NeptuneDBGraphStore(GraphStore):
             comments: ``rdfs:comment`` values (definitions) for the class.
             super_classes: Parent class URIs; blank-node superclasses are skipped.
             is_mapped: When True, emit the ``coa:isMapped`` Tier-2 answerability
-                marker (SQL-backed class); never emitted as false.
+                marker (structured-backed class); never emitted as false.
+            query_backend: When set (``"RDF_SPARQL"`` for a graph class), emit the
+                ``coa:queryBackend`` gate signal. ``None`` for SQL.
+            data_source_id: When set, emit ``coa:dataSourceId`` (graph class binding).
 
         Returns:
             A dict with the stored class URI and owning ontology id.
         """
         graph_uri = self._graph_for(ontology_uri)
-        triples = self._class_triples(ontology_uri, class_uri, labels, comments, super_classes, is_mapped)
+        triples = self._class_triples(
+            ontology_uri, class_uri, labels, comments, super_classes, is_mapped, query_backend, data_source_id
+        )
         self._emit_insert(graph_uri, triples)
         return {"uri": class_uri, "ontology_id": ontology_uri}
 
@@ -846,7 +899,8 @@ class NeptuneDBGraphStore(GraphStore):
         are accumulated and flushed in a few SPARQL UPDATEs instead of one HTTP
         round-trip per class. Each ``classes`` item is a dict with keys
         ``class_uri`` and optional ``labels``/``comments``/``super_classes``/
-        ``is_mapped`` (same semantics as :meth:`store_class`).
+        ``is_mapped``/``query_backend``/``data_source_id`` (same semantics as
+        :meth:`store_class`).
 
         Returns the number of classes projected.
         """
@@ -859,6 +913,8 @@ class NeptuneDBGraphStore(GraphStore):
                 c.get("comments"),
                 c.get("super_classes"),
                 c.get("is_mapped", False),
+                c.get("query_backend"),
+                c.get("data_source_id"),
             )
             for c in classes
         ]
@@ -1512,6 +1568,53 @@ class NeptuneDBGraphStore(GraphStore):
 
         return list(hits.values())
 
+    def mapped_class_backends(self, class_uris: Iterable[str], namespace: str | None = None) -> dict[str, str]:
+        """Which backend answers each of ``class_uris`` already, across every graph of the namespace.
+
+        A class carrying ``coa:isMapped`` maps to its ``coa:queryBackend`` value, or
+        ``"SQL"`` when that marker is absent; a class mapped nowhere is left out, and so
+        is an IRI the store cannot hold (no marker can be written on it).
+        """
+        uris = _storable_iris(class_uris)
+        if not uris:
+            return {}
+        ns_prefix = _namespace_graph_prefix(namespace or self._namespace).rstrip("/") + "/"
+        q = f"""
+        SELECT DISTINCT ?c ?backend WHERE {{
+          VALUES ?c {{ {" ".join(_iri(u) for u in uris)} }}
+          GRAPH ?g {{
+            ?c {_iri(_SCL + "isMapped")} ?mapped .
+            OPTIONAL {{ ?c {_iri(_SCL + "queryBackend")} ?backend }}
+          }}
+          FILTER(STRSTARTS(STR(?g), "{_esc(ns_prefix)}"))
+        }}
+        """
+        bindings = _sparql_query(q).get("results", {}).get("bindings", [])
+        return {b["c"]["value"]: b.get("backend", {}).get("value") or StructuredBackend.SQL.value for b in bindings}
+
+    def mapped_class_graph_sources(
+        self, class_uris: Iterable[str], namespace: str | None = None
+    ) -> dict[str, set[str]]:
+        """The graph sources (``coa:dataSourceId``) each of ``class_uris`` is already bound to, across the namespace."""
+        uris = _storable_iris(class_uris)
+        if not uris:
+            return {}
+        ns_prefix = _namespace_graph_prefix(namespace or self._namespace).rstrip("/") + "/"
+        q = f"""
+        SELECT DISTINCT ?c ?src WHERE {{
+          VALUES ?c {{ {" ".join(_iri(u) for u in uris)} }}
+          GRAPH ?g {{
+            ?c {_iri(_SCL + "queryBackend")} "{StructuredBackend.RDF_SPARQL.value}" ;
+               {_iri(_SCL + "dataSourceId")} ?src .
+          }}
+          FILTER(STRSTARTS(STR(?g), "{_esc(ns_prefix)}"))
+        }}
+        """
+        sources: dict[str, set[str]] = {}
+        for b in _sparql_query(q).get("results", {}).get("bindings", []):
+            sources.setdefault(b["c"]["value"], set()).add(b["src"]["value"])
+        return sources
+
     # ── Health ────────────────────────────────────────────────────────
 
     def health_check(self) -> dict:
@@ -1828,40 +1931,60 @@ class NeptuneDBGraphStore(GraphStore):
         max_results: int = 100,
         include_properties: bool = True,
         label_preference: LabelPreference | None = None,
+        class_prefix: str | None = None,
     ) -> dict:
-        """List all OWL classes and properties across all ontologies in a namespace.
+        """List OWL classes and their datatype properties across the namespace's ontologies.
 
         Queries all named graphs under the namespace prefix. A class or property
         with several labels (or descriptions) arrives once per value; rows are
         grouped by URI, in first-seen order, and each is named with
         ``label_preference`` (the namespace-language ranking), so a multilingual
         class is listed once and never dropped for its language.
+
+        Classes are ordered mapped-first (``coa:isMapped`` true: R2RML-mapped,
+        SQL-backed classes), then case-insensitively by label, so a large
+        reference ontology loaded alongside cannot push the queryable classes
+        past the LIMIT. ``class_prefix`` is applied in the query, before the
+        LIMIT, as an exact IRI or IRI-namespace (``#`` / ``/``) match.
+        Properties are read only for the domains of the returned classes:
+        datatype properties with no ``rdfs:domain`` (or a blank-node domain) are not
+        returned, and a class whose IRI is not http, https or urn (e.g. ``tag:``) gets
+        ``properties: []``.
         """
         preference = _preference(label_preference)
         validate_namespace_name(namespace)
-        ns_prefix = _namespace_graph_prefix(namespace)
+        ns_prefix = _esc(_namespace_graph_prefix(namespace).rstrip("/") + "/")
+        prefix_filter = _class_prefix_filter(class_prefix) if class_prefix else ""
 
         # Classes. ``max_results`` bounds CLASSES, not rows: the inner subquery
-        # picks the page of distinct class IRIs (ordered by their lowest label,
-        # falling back to the IRI), and the outer pattern fetches EVERY label,
-        # description and parent of those classes. Limiting the joined rows
-        # instead could cut a class's preferred-language label off the page.
+        # picks the page of distinct class IRIs (mapped classes first, then by
+        # their lowest label, falling back to the IRI), and the outer pattern
+        # fetches EVERY label, description and parent of those classes. Limiting
+        # the joined rows instead could cut a class's preferred-language label
+        # off the page. Rank tests the literal "true": an explicit false marker
+        # ranks as unmapped. HAVING keeps an empty page empty on engines that
+        # emit one unbound group when nothing matches, which would join every class.
         class_q = f"""
         PREFIX rdf: <{RDF}>
         PREFIX rdfs: <{RDFS}>
         PREFIX owl: <{OWL}>
-        SELECT ?classUri ?classLabel ?classDescription ?parentClass ?sortKey WHERE {{
+        SELECT ?classUri ?classLabel ?classDescription ?parentClass ?mappedRank ?sortKey WHERE {{
           {{
-            SELECT ?classUri (MIN(LCASE(COALESCE(STR(?anyLabel), STR(?classUri)))) AS ?sortKey) WHERE {{
+            SELECT ?classUri
+                   (MIN(IF(COALESCE(STR(?mapped), "") = "true", 0, 1)) AS ?mappedRank)
+                   (MIN(LCASE(COALESCE(STR(?anyLabel), STR(?classUri)))) AS ?sortKey) WHERE {{
               GRAPH ?g {{
                 ?classUri rdf:type ?t .
                 VALUES ?t {{ owl:Class rdfs:Class }}
                 OPTIONAL {{ ?classUri rdfs:label ?anyLabel }}
+                OPTIONAL {{ ?classUri <{_SCL}isMapped> ?mapped }}
               }}
               FILTER(STRSTARTS(STR(?g), "{ns_prefix}"))
+              {prefix_filter}
             }}
             GROUP BY ?classUri
-            ORDER BY ?sortKey ?classUri
+            HAVING(BOUND(?classUri))
+            ORDER BY ?mappedRank ?sortKey ?classUri
             LIMIT {max_results}
           }}
           GRAPH ?g2 {{
@@ -1873,7 +1996,7 @@ class NeptuneDBGraphStore(GraphStore):
           }}
           FILTER(STRSTARTS(STR(?g2), "{ns_prefix}"))
         }}
-        ORDER BY ?sortKey ?classUri
+        ORDER BY ?mappedRank ?sortKey ?classUri
         """
 
         classes_raw = _sparql_query(class_q).get("results", {}).get("bindings", [])
@@ -1896,17 +2019,21 @@ class NeptuneDBGraphStore(GraphStore):
             for uri, entry in grouped.items()
         ]
 
-        # Properties (grouped by domain)
-        if include_properties and classes:
+        # Properties (grouped by domain), only for the returned classes' domains so
+        # properties of classes outside the page can't fill the LIMIT. Blank-node
+        # classes have no IRI to bind and get no properties.
+        domain_iris = sorted({_iri(c["uri"]) for c in classes if _is_storable_iri(c["uri"])})
+        if include_properties and domain_iris:
             prop_q = f"""
             PREFIX rdf: <{RDF}>
             PREFIX rdfs: <{RDFS}>
             PREFIX owl: <{OWL}>
             SELECT ?propUri ?propLabel ?domain ?range ?propDescription WHERE {{
+              VALUES ?domain {{ {" ".join(domain_iris)} }}
               GRAPH ?g {{
                 ?propUri rdf:type owl:DatatypeProperty .
+                ?propUri rdfs:domain ?domain .
                 OPTIONAL {{ ?propUri rdfs:label ?propLabel }}
-                OPTIONAL {{ ?propUri rdfs:domain ?domain }}
                 OPTIONAL {{ ?propUri rdfs:range ?range }}
                 OPTIONAL {{ ?propUri rdfs:comment ?propDescription }}
               }}

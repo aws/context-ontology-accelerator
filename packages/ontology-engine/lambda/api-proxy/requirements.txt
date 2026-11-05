@@ -1,0 +1,14 @@
+# The Lambda installs from requirements.lock.txt (hash-pinned), not this file.
+# After editing it, run scripts/relock-python-requirements.sh.
+# API proxy Lambda (coa_ontology.api_proxy_handler). It imports coa_common, so
+# the bundle needs libs/common's runtime deps; they are listed here because the
+# Lambda has no package requirements of its own.
+cedarpy>=4.8.0
+pydantic>=2.0
+pydantic-settings>=2.0
+structlog>=24.0
+cryptography>=43.0
+PyJWT>=2.9.0
+requests>=2.32.0
+# First certifi without the roots behind the compromised emSign intermediates.
+certifi>=2026.10.19

@@ -158,7 +158,7 @@ class TestResolveStrategyPrecedence:
 @pytest.mark.unit
 class TestExactlyExpectedStrategies:
     """The enum and registry contain EXACTLY the expected retrievers — the seven
-    traversal retrievers plus ``topic_beam`` (TopicGraphRAG, graphrag 3.18.7). No
+    traversal retrievers plus ``topic_beam`` (TopicGraphRAG, graphrag 3.20.0). No
     other extras, no deprecated dashed aliases. Guards against accidental additions."""
 
     EXPECTED_NAMES = {
@@ -366,7 +366,7 @@ class TestEngineBuilderConstruction:
 @pytest.mark.unit
 class TestTopicBeamStrategy:
     """topic_beam is constructed as the engine's retriever directly, with the
-    3.18.7-valid subset of the benchmark's topic-beam config."""
+    3.20.0-valid subset of the benchmark's topic-beam config."""
 
     def _build(self):
         """Build the topic_beam engine with the toolkit boundary mocked.
@@ -423,6 +423,47 @@ class TestTopicBeamStrategy:
         assert kw["use_same_chunk_neighbors"] is True
         assert kw["use_entity_neighbors"] is True
         assert kw["use_adjacent_chunk_neighbors"] is True
+
+    def test_every_passed_kwarg_is_a_named_param_of_installed_topicbeamsearch(self):
+        """Guards against the pin bump: every kwarg the builder passes must be a
+        REAL named parameter of the installed ``TopicBeamSearch.__init__``, not
+        silently absorbed by ``**kwargs``.
+
+        The other topic_beam tests mock ``TopicBeamSearch`` with a MagicMock,
+        which accepts any kwarg — so a renamed or removed parameter in a toolkit
+        upgrade (e.g. 3.18.7 -> 3.19.1) would be dropped silently with no failing
+        test. This introspects the real installed class instead.
+        """
+        import inspect
+
+        from graphrag_toolkit.lexical_graph.retrieval.retrievers import TopicBeamSearch
+
+        params = inspect.signature(TopicBeamSearch.__init__).parameters
+        named = {
+            name
+            for name, p in params.items()
+            if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        }
+        # Exactly the kwargs strategies.py passes to the retriever.
+        passed = {
+            "graph_store",
+            "vector_store",
+            "processor_args",
+            "beam_width",
+            "max_depth",
+            "top_k",
+            "scoring_mode",
+            "use_entity_neighbors",
+            "use_same_chunk_neighbors",
+            "use_adjacent_chunk_neighbors",
+            "max_statements_per_topic",
+        }
+        missing = passed - named
+        assert not missing, (
+            f"TopicBeamSearch.__init__ no longer names these kwargs the builder passes: "
+            f"{sorted(missing)}. They would be swallowed by **kwargs. "
+            f"Re-verify strategies.py against the installed toolkit."
+        )
 
     def test_engine_family_is_direct(self):
         assert STRATEGY_REGISTRY[RetrieverStrategy.TOPIC_BEAM].engine_family == "direct"

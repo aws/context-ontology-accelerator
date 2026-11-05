@@ -81,6 +81,10 @@ _KEYWORD_FIELDS = (
     # (exists/term inside the k-NN filter) reliably on new indexes. Older indexes
     # that predate this only have it dynamically mapped, where ``exists`` still works.
     "data_source_id",
+    # Structured backend of a graph (RDF_SPARQL) class; absent for SQL. Serve's backend
+    # filter also matches ``query_backend.keyword``, which is how indexes created
+    # before this field existed map it dynamically.
+    "query_backend",
 )
 _TEXT_FIELDS = (
     # Raw text fed to the embedder — kept verbatim for re-examination / re-embed.

@@ -40,12 +40,8 @@ class TestEntityTypeFilter:
 
     @pytest.mark.asyncio
     async def test_sql_generator_passes_entity_type_class(self):
-        """sql_generator.generate() should pass entity_type='class' to vector search.
-
-        generate() first gates the mapped filter via count_documents, then calls
-        search with entity_type='class'; a non-zero mapped count also sets
-        require_mapped=True.
-        """
+        """sql_generator.generate() should pass entity_type='class' (and
+        require_mapped=True) to vector search."""
         mock_llm = AsyncMock()
         mock_llm.embed.return_value = [0.1] * 1024
         mock_llm.converse.return_value = ConverseResult(
@@ -53,7 +49,6 @@ class TestEntityTypeFilter:
         )
 
         mock_vector = AsyncMock()
-        mock_vector.count_documents.return_value = 1  # namespace has mapped classes
         mock_vector.search.return_value = [
             VectorHit(
                 id="1",
@@ -78,7 +73,6 @@ class TestEntityTypeFilter:
         mock_llm.converse.return_value = ConverseResult(text="```sql\nSELECT 1\n```\nConfidence: 0.9")
 
         mock_vector = AsyncMock()
-        mock_vector.count_documents.return_value = 1
         mock_vector.search.return_value = [
             VectorHit(id="1", text="Table: t | Columns: x (int)", score=0.9, metadata={}),
         ]

@@ -713,6 +713,21 @@ def _clean_ontology_for_vkg(turtle: str, r2rml_turtle: str | None = None) -> str
             if str(o).startswith(str(XSD)):
                 g.remove((prop, RDFS.range, o))
 
+    # The document-to-table bridge links columns (properties) to the document
+    # classes that describe them, and marks each linked subject with
+    # coa:linkSource. Those property-level links are catalog/serve metadata
+    # only, so they are left out of the VKG copy (Ontop would have to pun the
+    # property as an individual). Only properties carrying the marker are
+    # affected: any other ontology's links reach the VKG copy unchanged.
+    from rdflib.namespace import SKOS as _SKOS
+
+    _bridged_props = {p for p in obj_props | data_props if (p, SCL.linkSource, None) in g}
+    if _bridged_props:
+        for _pred in (_SKOS.closeMatch, _SKOS.relatedMatch):
+            for s, o in list(g.subject_objects(_pred)):
+                if s in _bridged_props:
+                    g.remove((s, _pred, o))
+
     # Temporal ranges are left INTACT. They used to be rewritten to xsd:string
     # to match the R2RML rr:datatype, which itself only said xsd:string because
     # the H2 validation schema declared temporal columns as VARCHAR. All three
@@ -780,6 +795,71 @@ def _remove_rdf_list(g, node) -> None:
         _remove_rdf_list(g, rest_val)
 
 
+def _accumulated_r2rml(ontology_id: str, namespace: str) -> str | None:
+    """Concatenate (and de-duplicate) the R2RML of every accepted proposal for ``ontology_id``.
+
+    The served mapping set for a namespace is the union of its accepted
+    proposals' R2RML; ``None`` when no accepted proposal carries any.
+    """
+    accepted = dynamo_store.list_proposals(
+        namespace=namespace, ontology_id=ontology_id, status=ProposalStatus.ACCEPTED.value
+    )
+    r2rml_parts = []
+    prefixes_seen: set[str] = set()
+    for p in accepted:
+        r2rml = p.get("r2rml_turtle", "")
+        if not r2rml and p.get("r2rml_s3_key"):
+            r2rml = dynamo_store._get_s3_text(p["r2rml_s3_key"]) or ""
+        if not r2rml:
+            continue
+        # Deduplicate @prefix lines across proposals
+        lines = []
+        for line in r2rml.split("\n"):
+            if line.strip().startswith("@prefix"):
+                if line.strip() not in prefixes_seen:
+                    prefixes_seen.add(line.strip())
+                    lines.append(line)
+            else:
+                lines.append(line)
+        r2rml_parts.append("\n".join(lines))
+    r2rml_turtle = "\n\n".join(r2rml_parts) if r2rml_parts else None
+
+    # Deduplicate R2RML TriplesMaps: multiple proposals for the same ontology
+    # can contribute identical TriplesMap definitions. Ontop rejects R2RML with
+    # duplicate logicalTable nodes on the same TriplesMap subject.
+    if r2rml_turtle:
+        try:
+            from rdflib import Graph
+            from rdflib import Namespace as RdfNamespace
+
+            RR = RdfNamespace("http://www.w3.org/ns/r2rml#")
+            r2rml_g = Graph()
+            r2rml_g.parse(data=r2rml_turtle, format="turtle")
+            for tmap in r2rml_g.subjects(predicate=None, object=RR.TriplesMap):
+                lts = list(r2rml_g.objects(tmap, RR.logicalTable))
+                if len(lts) > 1:
+                    for lt in lts[1:]:
+                        r2rml_g.remove((tmap, RR.logicalTable, lt))
+                        for tn in r2rml_g.objects(lt, RR.tableName):
+                            r2rml_g.remove((lt, RR.tableName, tn))
+            r2rml_turtle = r2rml_g.serialize(format="turtle")
+        except Exception:
+            # Best effort — don't break persist if dedup fails.
+            _log.warning("r2rml_triplesmap_dedup_skipped", exc_info=True)
+    return r2rml_turtle
+
+
+def _put_induced_turtle(namespace: str, ontology_id: str, turtle: str, s3=None) -> None:
+    """Write the induced ontology's Turtle to ``induced/<id>.ttl`` (the ``latest/`` VKG copy is not touched)."""
+    import boto3
+
+    if s3 is None:
+        s3 = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-east-1"))
+    key = f"{_S3_PREFIX}/{namespace}/induced/{_ontology_short_id(ontology_id)}.ttl"
+    s3.put_object(Bucket=_S3_BUCKET, Key=key, Body=turtle.encode("utf-8"), ContentType="text/turtle")
+    _log.info("s3 persist: wrote %s (%d bytes)", key, len(turtle))
+
+
 def _persist_induced_to_s3(
     ontology_id: str, namespace: str, graph_uri: str, current_datasource_ids: list[str] | None = None
 ) -> None:
@@ -808,51 +888,7 @@ def _persist_induced_to_s3(
             return
 
         # 2. Accumulate R2RML from all accepted proposals for this ontology
-        accepted = dynamo_store.list_proposals(
-            namespace=namespace, ontology_id=ontology_id, status=ProposalStatus.ACCEPTED.value
-        )
-        r2rml_parts = []
-        prefixes_seen: set[str] = set()
-        for p in accepted:
-            r2rml = p.get("r2rml_turtle", "")
-            if not r2rml and p.get("r2rml_s3_key"):
-                r2rml = dynamo_store._get_s3_text(p["r2rml_s3_key"]) or ""
-            if not r2rml:
-                continue
-            # Deduplicate @prefix lines across proposals
-            lines = []
-            for line in r2rml.split("\n"):
-                if line.strip().startswith("@prefix"):
-                    if line.strip() not in prefixes_seen:
-                        prefixes_seen.add(line.strip())
-                        lines.append(line)
-                else:
-                    lines.append(line)
-            r2rml_parts.append("\n".join(lines))
-        r2rml_turtle = "\n\n".join(r2rml_parts) if r2rml_parts else None
-
-        # Deduplicate R2RML TriplesMaps: multiple proposals for the same ontology
-        # can contribute identical TriplesMap definitions. Ontop rejects R2RML with
-        # duplicate logicalTable nodes on the same TriplesMap subject.
-        if r2rml_turtle:
-            try:
-                from rdflib import Graph
-                from rdflib import Namespace as RdfNamespace
-
-                RR = RdfNamespace("http://www.w3.org/ns/r2rml#")
-                r2rml_g = Graph()
-                r2rml_g.parse(data=r2rml_turtle, format="turtle")
-                for tmap in r2rml_g.subjects(predicate=None, object=RR.TriplesMap):
-                    lts = list(r2rml_g.objects(tmap, RR.logicalTable))
-                    if len(lts) > 1:
-                        for lt in lts[1:]:
-                            r2rml_g.remove((tmap, RR.logicalTable, lt))
-                            for tn in r2rml_g.objects(lt, RR.tableName):
-                                r2rml_g.remove((lt, RR.tableName, tn))
-                r2rml_turtle = r2rml_g.serialize(format="turtle")
-            except Exception:
-                # Best effort — don't break persist if dedup fails.
-                _log.warning("r2rml_triplesmap_dedup_skipped", exc_info=True)
+        r2rml_turtle = _accumulated_r2rml(ontology_id, namespace)
 
         # 3. Write to S3
         short_id = _ontology_short_id(ontology_id)
@@ -860,13 +896,7 @@ def _persist_induced_to_s3(
         s3 = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-east-1"))
         base_key = f"{_S3_PREFIX}/{namespace}/induced/{short_id}"
 
-        s3.put_object(
-            Bucket=_S3_BUCKET,
-            Key=f"{base_key}.ttl",
-            Body=ontology_turtle.encode("utf-8"),
-            ContentType="text/turtle",
-        )
-        _log.info("s3 persist: wrote %s.ttl (%d bytes)", base_key, len(ontology_turtle))
+        _put_induced_turtle(namespace, ontology_id, ontology_turtle, s3=s3)
 
         if r2rml_turtle:
             s3.put_object(

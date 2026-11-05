@@ -1,7 +1,13 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import React, { useCallback, useMemo, useRef, useState } from "react";
+import React, {
+  useCallback,
+  useContext,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
 import { useNamespace } from "@api-hooks/use-namespace";
@@ -26,6 +32,7 @@ import SpaceBetween from "@cloudscape-design/components/space-between";
 import Tabs from "@cloudscape-design/components/tabs";
 import Tiles from "@cloudscape-design/components/tiles";
 import Toggle from "@cloudscape-design/components/toggle";
+import { RuntimeConfigContext } from "@components/RuntimeContext";
 import { TokenInput } from "@components/TokenInput/TokenInput";
 import {
   MAX_CLASSIFICATION_LENGTH,
@@ -45,6 +52,7 @@ import {
 import {
   ControlPlaneServiceServiceException,
   SourceType,
+  SparqlStore,
 } from "@coa/control-plane-client";
 import "./pages.css";
 
@@ -144,12 +152,13 @@ import type { AppMessage } from "../i18n/appMessages";
 
 // ── Source type options ───────────────────────────────────────────────────────
 
-// Five-way selection shown in step 1
+// Six-way selection shown in step 1
 type SourceKind =
   | "GLUE_DATABASE"
   | "JDBC_DATABASE"
   | "CUSTOM_CONNECTOR"
   | "DATABRICKS_SQL_WAREHOUSE"
+  | "RDF_SPARQL"
   | "DOCUMENTS";
 
 /** Narrow a Tiles selection to a SourceKind. Cloudscape hands back a plain
@@ -160,6 +169,7 @@ function isSourceKind(value: string): value is SourceKind {
     value === "JDBC_DATABASE" ||
     value === "CUSTOM_CONNECTOR" ||
     value === "DATABRICKS_SQL_WAREHOUSE" ||
+    value === "RDF_SPARQL" ||
     value === "DOCUMENTS"
   );
 }
@@ -172,10 +182,22 @@ const SOURCE_KIND_LABELS: Record<SourceKind, AppMessage> = {
   // The sub-type covers a SQL Warehouse only — not Databricks jobs, Delta
   // Sharing or a cluster endpoint.
   DATABRICKS_SQL_WAREHOUSE: "Databricks SQL Warehouse",
+  // Engine-agnostic: the sub-type is any SPARQL store; Neptune is v1's only engine.
+  RDF_SPARQL: "Graph database (SPARQL)",
   DOCUMENTS: "Documents",
 };
 
 // ── Constants ─────────────────────────────────────────────────────────────────
+
+// Mirror the Smithy SparqlEndpoint / SparqlRegion / NamedGraphIri patterns. The
+// named graph is interpolated into GRAPH <...> server-side, so the pattern excludes
+// every character illegal inside a SPARQL IRI.
+const SPARQL_ENDPOINT_RE =
+  /^(https:\/\/)?[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?(\/[A-Za-z0-9._~/-]*)?$/;
+const SPARQL_REGION_RE = /^[a-z]{2}(-[a-z]+)+-[0-9]$/;
+const NAMED_GRAPH_IRI_RE = /^https?:\/\/[^\s<>"{}|\\^`]+$/;
+// Neptune's SPARQL port, and the only one the deployed network rules open.
+const DEFAULT_SPARQL_PORT = 8182;
 
 // Every engine the backend has a dialect for.
 type DatabaseEngine =
@@ -250,6 +272,13 @@ function resolveContentType(file: File): string {
 // ── Form model ────────────────────────────────────────────────────────────────
 
 interface Model {
+  // RDF_SPARQL graph source. Bring-your-own-ontology: registration only checks
+  // the endpoint is reachable; classes come from an imported ontology.
+  sparqlName: string;
+  sparqlEndpoint: string;
+  sparqlRegion: string;
+  sparqlPort: string;
+  sparqlNamedGraph: string;
   // Step 1 — source kind (replaces the old two-step category + type)
   sourceKind: SourceKind;
   // Glue database config
@@ -562,6 +591,12 @@ function topicWarning(topics: string[], t: AppTranslate): string | undefined {
 }
 
 const initialModel: Model = {
+  sparqlName: "",
+  sparqlEndpoint: "",
+  // Blank = the deployment region (the server fills it in).
+  sparqlRegion: "",
+  sparqlPort: String(DEFAULT_SPARQL_PORT),
+  sparqlNamedGraph: "",
   sourceKind: "GLUE_DATABASE",
   dbName: "",
   glueCatalogId: "",
@@ -759,6 +794,11 @@ function validateLambdaFunctionArn(
 
 interface ValidationErrors {
   step1?: string;
+  sparqlName?: string;
+  sparqlEndpoint?: string;
+  sparqlRegion?: string;
+  sparqlPort?: string;
+  sparqlNamedGraph?: string;
   dbName?: string;
   glueCatalogId?: string;
   glueDatabaseName?: string;
@@ -802,6 +842,8 @@ function sourceNameFor(model: Model, docTab: "upload" | "s3"): string {
       return model.jdbcName;
     case "CUSTOM_CONNECTOR":
       return model.customConnectorName;
+    case "RDF_SPARQL":
+      return model.sparqlName;
     case "DATABRICKS_SQL_WAREHOUSE":
       return model.databricksName;
     case "DOCUMENTS":
@@ -867,6 +909,28 @@ function validateStep2(
     }
     if (!model.customConnectorDatabaseName.trim())
       errs.customConnectorDatabaseName = t("Database name is required.");
+  } else if (model.sourceKind === "RDF_SPARQL") {
+    if (!model.sparqlName.trim()) errs.sparqlName = t("Name is required.");
+    const endpoint = model.sparqlEndpoint.trim();
+    if (!endpoint) errs.sparqlEndpoint = t("SPARQL endpoint is required.");
+    else if (!SPARQL_ENDPOINT_RE.test(endpoint))
+      errs.sparqlEndpoint = t(
+        "Must be a host (db.cluster-x.us-east-1.neptune.amazonaws.com) or an https:// URL with optional port and path.",
+      );
+    const region = model.sparqlRegion.trim();
+    if (region && !SPARQL_REGION_RE.test(region))
+      errs.sparqlRegion = t("Must be an AWS region code, e.g. us-east-1.");
+    const port = model.sparqlPort.trim();
+    if (port) {
+      const n = Number(port);
+      if (!Number.isInteger(n) || n < 1 || n > 65535)
+        errs.sparqlPort = t("Must be a port number between 1 and 65535.");
+    }
+    const graph = model.sparqlNamedGraph.trim();
+    if (graph && !NAMED_GRAPH_IRI_RE.test(graph))
+      errs.sparqlNamedGraph = t(
+        'Must be an absolute http(s) IRI without spaces or any of < > " { } | \\ ^ `.',
+      );
   } else if (model.sourceKind === "DATABRICKS_SQL_WAREHOUSE") {
     if (!model.databricksName.trim())
       errs.databricksName = t("Name is required.");
@@ -973,6 +1037,8 @@ function validateStep2(
 
 export const ConnectSource: React.FC = () => {
   const { t } = useAppI18n();
+  const graphSourcesEnabled =
+    useContext(RuntimeConfigContext)?.graphSourcesEnabled === true;
   const { namespaceId } = useParams<{ namespaceId: string }>();
   // The ExternalId shown for cross-account roles is derived server-side from the
   // namespace, so it comes from the namespace detail rather than being typed in.
@@ -1165,6 +1231,30 @@ export const ConnectSource: React.FC = () => {
       return;
     }
 
+    if (model.sourceKind === "RDF_SPARQL") {
+      createSource({
+        namespaceId: namespaceId!,
+        body: {
+          sourceType: SourceType.DATABASE,
+          databaseSource: {
+            name: model.sparqlName.trim(),
+            // One configuration only — it selects the sub-type. No enrichment:
+            // a graph source has no schema to scan.
+            sparqlConfiguration: {
+              store: SparqlStore.NEPTUNE,
+              dataEndpoint: model.sparqlEndpoint.trim(),
+              region: model.sparqlRegion.trim() || undefined,
+              port: model.sparqlPort.trim()
+                ? Number(model.sparqlPort.trim())
+                : undefined,
+              dataNamedGraph: model.sparqlNamedGraph.trim() || undefined,
+            },
+          },
+        },
+      });
+      return;
+    }
+
     if (model.sourceKind === "DATABRICKS_SQL_WAREHOUSE") {
       createSource({
         namespaceId: namespaceId!,
@@ -1339,6 +1429,17 @@ export const ConnectSource: React.FC = () => {
                   "Connect one Unity Catalog schema on a Databricks SQL Warehouse. Nothing to deploy — Context Ontology Accelerator operates the connector; you supply the warehouse, the credential secret, and the role that reads it.",
                 ),
               },
+              ...(graphSourcesEnabled
+                ? [
+                    {
+                      value: "RDF_SPARQL",
+                      label: t(SOURCE_KIND_LABELS.RDF_SPARQL),
+                      description: t(
+                        "Connect an RDF graph (Amazon Neptune) queried natively with SPARQL. There is no schema scan: registration checks the endpoint is reachable, and the classes come from an ontology you import that names this source.",
+                      ),
+                    },
+                  ]
+                : []),
               {
                 value: "DOCUMENTS",
                 label: t(SOURCE_KIND_LABELS.DOCUMENTS),
@@ -1958,6 +2059,137 @@ export const ConnectSource: React.FC = () => {
                 </FormField>
               </SpaceBetween>
             </ExpandableSection>
+          </SpaceBetween>
+        ),
+      };
+    } else if (model.sourceKind === "RDF_SPARQL") {
+      step2 = {
+        title: t("Configure connection"),
+        description: t(
+          "Point at the graph's SPARQL endpoint. No schema is scanned — import an ontology that names this source afterwards.",
+        ),
+        errorText: step2Errs.step1,
+        content: (
+          <SpaceBetween size="l">
+            <Container
+              header={<Header variant="h2">{t("Source details")}</Header>}
+            >
+              <FormField
+                label={
+                  <>
+                    {t("Source name")}{" "}
+                    <Box variant="span" color="text-status-error">
+                      *
+                    </Box>
+                  </>
+                }
+                description={t(
+                  "A unique name for this source within the namespace. Ontology classes refer to it by this name (coa_import:dataSourceName).",
+                )}
+                errorText={step2Errs.sparqlName}
+              >
+                <Input
+                  value={model.sparqlName}
+                  onChange={({ detail }) =>
+                    setField("sparqlName", detail.value)
+                  }
+                  placeholder="support-graph"
+                />
+              </FormField>
+            </Container>
+            <Container
+              header={<Header variant="h2">{t("Graph endpoint")}</Header>}
+            >
+              <SpaceBetween size="l">
+                <FormField
+                  label={t("Engine")}
+                  description={t(
+                    "The SPARQL store. Amazon Neptune is the only engine this release supports.",
+                  )}
+                >
+                  <Input value="Amazon Neptune" readOnly />
+                </FormField>
+                <FormField
+                  label={
+                    <>
+                      {t("SPARQL endpoint")}{" "}
+                      <Box variant="span" color="text-status-error">
+                        *
+                      </Box>
+                    </>
+                  }
+                  description={t(
+                    "The cluster endpoint holding the instance data. Queries run directly against it, signed with SigV4.",
+                  )}
+                  errorText={step2Errs.sparqlEndpoint}
+                >
+                  <Input
+                    value={model.sparqlEndpoint}
+                    onChange={({ detail }) =>
+                      setField("sparqlEndpoint", detail.value)
+                    }
+                    placeholder="my-graph.cluster-xxxx.us-east-1.neptune.amazonaws.com"
+                  />
+                </FormField>
+                <FormField
+                  label={t("Region")}
+                  description={t(
+                    "Region used to sign requests. Leave blank for this deployment's region.",
+                  )}
+                  errorText={step2Errs.sparqlRegion}
+                >
+                  <Input
+                    value={model.sparqlRegion}
+                    onChange={({ detail }) =>
+                      setField("sparqlRegion", detail.value)
+                    }
+                    placeholder="us-east-1"
+                  />
+                </FormField>
+                <FormField
+                  label={t("Port")}
+                  description={t(
+                    "Defaults to {port}. The deployed network rules allow only port {port}; an endpoint on any other port will fail its reachability check unless the deployment opens that port.",
+                    { port: DEFAULT_SPARQL_PORT },
+                  )}
+                  errorText={step2Errs.sparqlPort}
+                >
+                  <Input
+                    type="number"
+                    value={model.sparqlPort}
+                    onChange={({ detail }) =>
+                      setField("sparqlPort", detail.value)
+                    }
+                    placeholder={String(DEFAULT_SPARQL_PORT)}
+                  />
+                </FormField>
+                <FormField
+                  label={
+                    <>
+                      {t("Named graph")} <i>{t("- optional")}</i>
+                    </>
+                  }
+                  description={t(
+                    "The named graph holding this source's data. When set, every query is confined to it; leave blank if the data is in the default graph.",
+                  )}
+                  errorText={step2Errs.sparqlNamedGraph}
+                >
+                  <Input
+                    value={model.sparqlNamedGraph}
+                    onChange={({ detail }) =>
+                      setField("sparqlNamedGraph", detail.value)
+                    }
+                    placeholder="https://example.com/graphs/support"
+                  />
+                </FormField>
+                <FormField
+                  label="Authentication"
+                  description="IAM (SigV4) with this deployment's roles — there is no username, password or secret. The cluster must have IAM authentication enabled and be in this AWS account."
+                >
+                  <Input value="SigV4 / IAM" readOnly />
+                </FormField>
+              </SpaceBetween>
+            </Container>
           </SpaceBetween>
         ),
       };
@@ -2840,6 +3072,37 @@ export const ConnectSource: React.FC = () => {
               />
             </Container>
           )}
+          {model.sourceKind === "RDF_SPARQL" && (
+            <Container header={<Header variant="h2">{t("Connection")}</Header>}>
+              <KeyValuePairs
+                columns={2}
+                items={[
+                  { label: t("Engine"), value: "Amazon Neptune" },
+                  { label: t("SPARQL endpoint"), value: model.sparqlEndpoint },
+                  {
+                    label: t("Region"),
+                    value: model.sparqlRegion || t("(deployment region)"),
+                  },
+                  {
+                    label: t("Port"),
+                    value: model.sparqlPort || String(DEFAULT_SPARQL_PORT),
+                  },
+                  {
+                    label: t("Named graph"),
+                    value: model.sparqlNamedGraph || t("(default graph)"),
+                  },
+                  { label: t("Authentication"), value: "SigV4 / IAM" },
+                ]}
+              />
+            </Container>
+          )}
+          {model.sourceKind === "RDF_SPARQL" && (
+            <Alert type="info" header={t("What happens next")}>
+              {t(
+                "Context Ontology Accelerator checks the endpoint is reachable and that it may call it. The source then becomes Approved (or Scan failed, with the reason). To answer questions from it, import an ontology whose classes name this source with coa_import:dataSourceName.",
+              )}
+            </Alert>
+          )}
           {model.sourceKind === "DOCUMENTS" && (
             <Container header={<Header variant="h2">{t("Source")}</Header>}>
               <KeyValuePairs
@@ -2933,6 +3196,7 @@ export const ConnectSource: React.FC = () => {
     namespaceLoading,
     namespaceLoadFailed,
     chunkSizeOptions,
+    graphSourcesEnabled,
   ]);
 
   return (

@@ -13,6 +13,7 @@ from urllib.error import HTTPError, URLError
 
 import pytest
 from botocore.exceptions import ClientError
+from coa_common.sparql_config import GRAPH_SOURCES_ENV
 
 # The handler module reads env vars at import time.
 with patch.dict(
@@ -380,6 +381,36 @@ class TestQuerySuccess:
 
         assert result["statusCode"] == 200, result
         assert captured["payload"]["options"]["strategy"] == strategy
+
+    def _query_with_strategy(self, strategy):
+        captured: dict = {}
+
+        def _fake_invoke(payload: dict, token: str) -> dict:
+            captured["payload"] = payload
+            return {"statusCode": 200, "result": {}}
+
+        with patch.object(handler_module, "_invoke_context_manager", side_effect=_fake_invoke):
+            event = _api_event(
+                "POST",
+                "/namespaces/{namespaceId}/query",
+                body={"query": "revenue by region", "strategy": strategy},
+                namespace="11111111-1111-4111-8111-111111111111",
+            )
+            return handler(event, None), captured
+
+    def test_nl_to_sparql_is_rejected_with_400_while_graph_sources_are_off(self, monkeypatch):
+        """As on main, where the value was not a strategy: the request never reaches CM."""
+        monkeypatch.delenv(GRAPH_SOURCES_ENV, raising=False)
+        result, captured = self._query_with_strategy("nl_to_sparql")
+        assert result["statusCode"] == 400, result
+        assert "nl_to_sparql" not in json.loads(result["body"])["message"]
+        assert captured == {}
+
+    def test_nl_to_sparql_is_forwarded_while_graph_sources_are_on(self, monkeypatch):
+        monkeypatch.setenv(GRAPH_SOURCES_ENV, "on")
+        result, captured = self._query_with_strategy("nl_to_sparql")
+        assert result["statusCode"] == 200, result
+        assert captured["payload"]["options"]["strategy"] == "nl_to_sparql"
 
     @pytest.mark.parametrize(
         ("value", "label"),

@@ -1,6 +1,8 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import * as fs from "fs";
+
 import * as cdk from "aws-cdk-lib";
 import * as ec2 from "aws-cdk-lib/aws-ec2";
 import * as lambda from "aws-cdk-lib/aws-lambda";
@@ -64,10 +66,16 @@ describe("DataLayerStack", () => {
     // parity refactor introduced by adding coa_common imports to a Lambda whose
     // bundle previously shipped zero pip deps.
     expect(mockBundlePython).toHaveBeenCalled();
-    const opts = mockBundlePython.mock.calls[0][0] as { pipDeps?: string[] };
-    expect(opts.pipDeps).toEqual(
-      expect.arrayContaining(["pydantic", "pydantic-settings", "structlog"]),
+    const opts = mockBundlePython.mock.calls[0][0] as {
+      requirementsFile?: string;
+    };
+    expect(opts.requirementsFile).toMatch(
+      /packages\/data-layer\/requirements\.lock\.txt$/,
     );
+    const lock = fs.readFileSync(opts.requirementsFile ?? "", "utf-8");
+    for (const dep of ["pydantic", "pydantic-settings", "structlog"]) {
+      expect(lock).toMatch(new RegExp(`^${dep}==`, "m"));
+    }
   });
 
   it("wires the ontology-proxy Lambda ARN into the API Lambda env", () => {
@@ -112,5 +120,40 @@ describe("DataLayerStack", () => {
         Name: Match.stringLikeRegexp(".+/data-layer/api-fn-arn$"),
       }),
     );
+  });
+});
+
+describe("DataLayerStack - graph sources switch", () => {
+  const apiEnv = (context: Record<string, unknown>) => {
+    const app = new cdk.App({ context: { ...TEST_CONTEXT, ...context } });
+    const depStack = new cdk.Stack(app, "DepStack", {
+      env: { account: "123456789012", region: "us-east-1" },
+    });
+    const vpc = new ec2.Vpc(depStack, "Vpc", { maxAzs: 2 });
+    const stack = new DataLayerStack(app, "TestDataLayer", {
+      env: { account: "123456789012", region: "us-east-1" },
+      vpc,
+      lambdaSecurityGroup: new ec2.SecurityGroup(depStack, "LambdaSg", { vpc }),
+    });
+    const fns = Template.fromStack(stack).findResources(
+      "AWS::Lambda::Function",
+    );
+    return Object.values(fns).map(
+      (f: any) => f.Properties.Environment?.Variables ?? {},
+    );
+  };
+
+  it("leaves GRAPH_SOURCES_ENABLED unset when off, so nl_to_sparql is refused as on main", () => {
+    for (const env of apiEnv({})) {
+      expect(env).not.toHaveProperty("GRAPH_SOURCES_ENABLED");
+    }
+  });
+
+  it("sets GRAPH_SOURCES_ENABLED on the API Lambda when on", () => {
+    expect(
+      apiEnv({ graph_sources: "on" }).some(
+        (env) => env.GRAPH_SOURCES_ENABLED === "true",
+      ),
+    ).toBe(true);
   });
 });

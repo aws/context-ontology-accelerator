@@ -57,6 +57,29 @@ class TestListDatasourcesFiltering:
         assert result[0]["datasourceId"] == "abc"
         assert result[0]["sourceType"] == "DATABASE"
 
+    def test_excludes_rdf_sparql_graph_source(self):
+        """A graph source has no tables to induce from; its classes are imported."""
+        from coa_ontology.induce_catalog import list_datasources
+
+        request, mock_resource = _make_request(
+            [
+                {
+                    "PK": "NS#ns1",
+                    "SK": "SRC#graph1",
+                    "name": "support-graph",
+                    "status": "APPROVED",
+                    "sourceType": "DATABASE",
+                    "sourceSubType": "RDF_SPARQL",
+                    "namespaceId": "ns1",
+                },
+            ]
+        )
+
+        with patch("boto3.resource", return_value=mock_resource):
+            result = list_datasources(request, "ns1")
+
+        assert result == []
+
     def test_includes_jdbc_database_source(self):
         from coa_ontology.induce_catalog import list_datasources
 

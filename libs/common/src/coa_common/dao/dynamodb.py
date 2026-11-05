@@ -63,12 +63,14 @@ class DynamoDBDAO(DatastoreDAO):
         key: dict[str, Any],
         *,
         projection: list[str] | None = None,
+        consistent_read: bool = False,
     ) -> dict[str, Any] | None:
         """Fetch a single item by primary key.
 
         Args:
             key: Primary key attributes identifying the item.
             projection: Optional attribute names to project; fetches all when omitted.
+            consistent_read: Read the latest committed item rather than a possibly stale replica.
 
         Returns:
             The item as a dict, or None if it does not exist or the table is missing.
@@ -79,6 +81,8 @@ class DynamoDBDAO(DatastoreDAO):
                 attr_names = {f"#a{i}": attr for i, attr in enumerate(projection)}
                 kwargs["ProjectionExpression"] = ", ".join(attr_names.keys())
                 kwargs["ExpressionAttributeNames"] = attr_names
+            if consistent_read:
+                kwargs["ConsistentRead"] = True
             resp = self._table.get_item(**kwargs)
             return resp.get("Item")
         except ClientError as exc:
@@ -316,6 +320,8 @@ class DynamoDBDAO(DatastoreDAO):
             kwargs["Limit"] = params.limit
         if params.exclusive_start_key:
             kwargs["ExclusiveStartKey"] = params.exclusive_start_key
+        if params.consistent_read:
+            kwargs["ConsistentRead"] = True
 
         resp = self._table.query(**kwargs)
         return PaginatedResult(

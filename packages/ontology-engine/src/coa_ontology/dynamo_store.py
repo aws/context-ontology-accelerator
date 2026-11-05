@@ -368,9 +368,23 @@ def acquire_induction_lock(namespace: str, job_id: str) -> None:
         raise
 
 
-def release_induction_lock(namespace: str) -> None:
-    """Release the per-namespace induction lock (unconditional delete, idempotent)."""
-    _get_table().delete_item(Key={"PK": _induction_lock_pk(namespace), "SK": "STATUS"})
+def release_induction_lock(namespace: str, job_id: str | None = None) -> None:
+    """Release the per-namespace induction lock (idempotent).
+
+    Without ``job_id`` the delete is unconditional. With it, the lock is deleted
+    only while that job still holds it: a job that outlived the stale cutoff and
+    lost the lock to a newer induction must not release the newer one's lock.
+    """
+    key = {"PK": _induction_lock_pk(namespace), "SK": "STATUS"}
+    if job_id is None:
+        _get_table().delete_item(Key=key)
+        return
+    try:
+        _get_table().delete_item(Key=key, ConditionExpression="job_id = :j", ExpressionAttributeValues={":j": job_id})
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+            raise
+        _log.warning("induction lock for %s is no longer held by job %s; left in place", namespace, job_id)
 
 
 def put_job(

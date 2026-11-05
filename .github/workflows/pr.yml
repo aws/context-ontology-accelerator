@@ -66,11 +66,17 @@ jobs:
           java-version: "17"
           cache: gradle
 
-      # The generator script builds the emitted TypeScript clients with npm, so
-      # Node is needed here even though nothing else in this job uses pnpm.
+      # The generator script installs and builds the emitted TypeScript clients
+      # with pnpm, and stops before Gradle when pnpm is missing. Keep the
+      # versions in step with .mise.toml, as in .github/actions/setup-build.
       - uses: actions/setup-node@v4
         with:
           node-version: "22.23.4"
+
+      - name: Enable pnpm
+        env:
+          PNPM_VERSION: "10.34.5"
+        run: corepack enable && corepack prepare "pnpm@${PNPM_VERSION}" --activate
 
       - name: Generate Smithy artifacts
         run: |

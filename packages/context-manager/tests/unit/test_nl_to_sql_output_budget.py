@@ -54,7 +54,6 @@ def mock_llm():
 @pytest.fixture
 def mock_vector():
     vector = AsyncMock()
-    vector.count_documents.return_value = 2
     vector.search.return_value = [
         VectorHit(
             id="1",

@@ -23,6 +23,8 @@ export interface RuntimeContext {
   readonly mcpRuntimeArn?: string;
   /** Monorepo version (from VERSION), rendered as a badge in the UI. */
   readonly version?: string;
+  /** True only when the deployment turns on graph sources; absent means off. */
+  readonly graphSourcesEnabled?: boolean;
   readonly oidcConfig: OidcConfig;
 }
 

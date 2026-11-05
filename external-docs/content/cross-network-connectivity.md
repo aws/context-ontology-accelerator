@@ -79,6 +79,7 @@ overrides the default).
 | MariaDB | `MYSQL` | 3306 |
 | Aurora MySQL | `MYSQL` | 3306 |
 | SQL Server | `SQLSERVER` | 1433 |
+| Neptune | `SPARQL` | 8182 |
 
 !!! note "MariaDB and Aurora use an existing engine value"
     COA has no separate `MARIADB` or `AURORA` engine. MariaDB speaks the MySQL

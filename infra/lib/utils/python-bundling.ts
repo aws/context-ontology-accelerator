@@ -17,25 +17,48 @@ import * as fs from "fs";
 import * as path from "path";
 import * as cdk from "aws-cdk-lib";
 import * as lambda from "aws-cdk-lib/aws-lambda";
-import { Paths } from "../paths";
+import { fromRoot, Paths } from "../paths";
+
+/**
+ * The Lambda runtime botocore's bounds, applied to every unlocked bundle install
+ * and compiled into every lock by scripts/relock-python-requirements.sh.
+ */
+export const LAMBDA_RUNTIME_CONSTRAINTS = fromRoot(
+  "infra/lib/utils/lambda-runtime-constraints.txt",
+);
 
 export interface PythonBundlingOptions {
   /** Absolute paths to `src/` directories whose contents are copied to the asset root. */
   readonly srcDirs: string[];
   /**
-   * How to install pip dependencies. Provide exactly one of:
-   *   - `requirementsFile` — path to a `requirements.txt`
-   *   - `pipDeps` — explicit list of package names
-   *
-   * If neither is provided, no pip install step runs.
+   * Path to a `requirements.txt`, or to a hash-pinned `requirements.lock.txt`,
+   * which is installed with `--require-hashes`. If omitted, no pip install step
+   * runs.
    */
   readonly requirementsFile?: string;
-  readonly pipDeps?: string[];
   /**
    * Target Lambda architecture. Determines the pip platform tag.
    * @default "x86_64"
    */
   readonly architecture?: "x86_64" | "arm64";
+  /**
+   * Constraints applied to an unlocked dependency install and folded into the
+   * asset hash. A hash-pinned lock is installed without them, since hash mode
+   * rejects any requirement that is not `==`-pinned; the relock script compiles
+   * them into the lock instead.
+   * @default LAMBDA_RUNTIME_CONSTRAINTS
+   */
+  readonly constraintsFile?: string;
+}
+
+/** A path with forward slashes, as Docker and the shell commands need. */
+function toPosix(p: string): string {
+  return p.replace(/\\/g, "/");
+}
+
+/** The constraints file for this bundle, with forward slashes (Docker-safe). */
+function _constraintsPath(opts: PythonBundlingOptions): string {
+  return toPosix(opts.constraintsFile ?? LAMBDA_RUNTIME_CONSTRAINTS);
 }
 
 /**
@@ -60,19 +83,53 @@ export interface PythonBundlingOptions {
  * dir for local bundling (and the requirements path stays an absolute host path,
  * since the local step runs on the host and reads the real file).
  */
+/**
+ * True for a hash-pinned lock (`requirements.lock.txt`, written by
+ * scripts/relock-python-requirements.sh), which is installed with
+ * `--require-hashes` so a deploy can only ship the locked files.
+ */
+export function _isHashLocked(requirementsFile: string): boolean {
+  return requirementsFile.endsWith(".lock.txt");
+}
+
 export function _uvInstallCommand(opts: PythonBundlingOptions): string | null {
   const uvPlatform =
     opts.architecture === "arm64"
       ? "aarch64-manylinux2014"
       : "x86_64-manylinux2014";
+  const constraints = _constraintsPath(opts);
   const flags = `--target /asset-output --python-platform ${uvPlatform} --python-version 3.12 --only-binary :all: -q --no-cache`;
   if (opts.requirementsFile) {
-    const reqFile = opts.requirementsFile.replace(/\\/g, "/");
-    return `uv pip install ${flags} -r ${reqFile}`;
+    const reqFile = toPosix(opts.requirementsFile);
+    // A lock already pins the whole tree with hashes. --no-config keeps the
+    // workspace's [tool.uv] constraint-dependencies out of the install: they
+    // are `>=` floors for dev tooling, which hash mode rejects as unpinned, and
+    // the relock script already applied them when it compiled the lock.
+    if (_isHashLocked(reqFile)) {
+      return `uv pip install --no-config --require-hashes ${flags} -r ${reqFile}`;
+    }
+    return `uv pip install ${flags} --constraint ${constraints} -r ${reqFile}`;
   }
-  if (opts.pipDeps?.length) {
-    const deps = opts.pipDeps.map((d) => `'${d}'`).join(" ");
-    return `uv pip install ${flags} ${deps}`;
+  return null;
+}
+
+/**
+ * Build the Docker fallback's `pip install` command (inside the 3.12 bundling image,
+ * whose `pip` IS the target interpreter, so it keeps the classic pip cross-flags),
+ * or `null` when there are no dependencies to install.
+ */
+export function _pipInstallCommand(opts: PythonBundlingOptions): string | null {
+  const platform =
+    opts.architecture === "arm64"
+      ? "manylinux2014_aarch64"
+      : "manylinux2014_x86_64";
+  const flags = `--target /asset-output --platform ${platform} --only-binary=:all: --python-version 3.12 -q --no-cache-dir --disable-pip-version-check`;
+  if (opts.requirementsFile) {
+    const reqFile = toPosix(opts.requirementsFile);
+    if (_isHashLocked(reqFile)) {
+      return `pip install --require-hashes -r ${reqFile} ${flags}`;
+    }
+    return `pip install -r ${reqFile} ${flags} -c ${_constraintsPath(opts)}`;
   }
   return null;
 }
@@ -83,16 +140,9 @@ export function _uvInstallCommand(opts: PythonBundlingOptions): string | null {
  *
  * @example
  * ```ts
- * // Using a requirements file:
  * bundlePython({
  *   srcDirs: [Paths.controlPlaneSrc, fromRoot("libs/common/src")],
- *   requirementsFile: fromRoot("packages/control-plane/requirements.txt"),
- * });
- *
- * // Using an explicit list:
- * bundlePython({
- *   srcDirs: [Paths.controlPlaneSrc, fromRoot("libs/common/src")],
- *   pipDeps: ["pydantic", "structlog"],
+ *   requirementsFile: fromRoot("packages/control-plane/requirements.lock.txt"),
  * });
  * ```
  */
@@ -102,13 +152,9 @@ export function bundlePython(opts: PythonBundlingOptions): lambda.Code {
   // running old code or old dependencies, with no error at deploy time.
   const assetHash = _computeSourceHash(opts);
 
-  // Normalize all source paths to forward slashes for Docker compatibility
-  const srcDirs = opts.srcDirs.map((d) => d.replace(/\\/g, "/"));
-  const copies = srcDirs.map((d) => `cp -r ${d}/* /asset-output/`);
-  const platform =
-    opts.architecture === "arm64"
-      ? "manylinux2014_aarch64"
-      : "manylinux2014_x86_64";
+  const copies = opts.srcDirs.map(
+    (d) => `cp -r ${toPosix(d)}/* /asset-output/`,
+  );
 
   // Packages provided by the Lambda runtime — must not be overridden.
   const runtimePkgs = [
@@ -130,31 +176,20 @@ export function bundlePython(opts: PythonBundlingOptions): lambda.Code {
     )
     .join(" && ");
 
-  // Docker path installs inside the 3.12 bundling image, whose `pip` IS the
-  // target interpreter, so it keeps the classic pip cross-flags.
-  const pipFlags = `--target /asset-output --platform ${platform} --only-binary=:all: --python-version 3.12 -q --no-cache-dir --disable-pip-version-check`;
   // Local path uses uv, which does not depend on the host `python3` symlink and
   // so bundles for 3.12 even where the distro default Python is older and cannot
   // be repointed. See _uvInstallCommand.
   const localInstall = _uvInstallCommand(opts);
 
-  let localPipSteps: string[] = [];
-  let dockerPipSteps: string[] = [];
-  if (opts.requirementsFile) {
-    const reqFile = opts.requirementsFile.replace(/\\/g, "/");
-    localPipSteps = localInstall ? [localInstall, cleanup] : [];
-    dockerPipSteps = [`pip install -r ${reqFile} ${pipFlags}`, cleanup];
-  } else if (opts.pipDeps?.length) {
-    const deps = opts.pipDeps.map((d) => `'${d}'`).join(" ");
-    localPipSteps = localInstall ? [localInstall, cleanup] : [];
-    dockerPipSteps = [`pip install ${pipFlags} ${deps}`, cleanup];
-  }
+  const dockerInstall = _pipInstallCommand(opts);
+  const localPipSteps = localInstall ? [localInstall, cleanup] : [];
+  const dockerPipSteps = dockerInstall ? [dockerInstall, cleanup] : [];
 
   const localSteps = [...copies, ...localPipSteps];
   const bundleCmd = localSteps.join(" && ");
 
   const dockerSteps = [...copies, ...dockerPipSteps];
-  const rootForward = Paths.root.replace(/\\/g, "/");
+  const rootForward = toPosix(Paths.root);
   const dockerCmd = dockerSteps
     .join(" && ")
     .replace(new RegExp(escapeRegExp(rootForward), "g"), "/asset-input");
@@ -190,6 +225,9 @@ function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+// Every line break Python's str.splitlines() honours, which is how pip reads a requirements file.
+const PIP_LINE_BREAK = /\r\n|[\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029]/;
+
 /**
  * Compute a stable SHA-256 hash over every input that affects this Lambda
  * bundle. Used as a custom CDK asset hash so unrelated repo changes (test
@@ -199,15 +237,10 @@ function escapeRegExp(s: string): string {
  * everything (`cp -r ${d}/*`), so JSON/schema/template files shipped alongside
  * the code are part of the output and must invalidate the asset when edited.
  *
- * Also folds in `pipDeps` and `architecture`, which change the produced bundle
- * without touching any file:
- *   - `pipDeps` is the alternative to `requirementsFile`; callers using it could
- *     add, remove, or re-pin a dependency with no hash change, so the deployed
- *     bundle kept the old dependency set (symptom: `ImportModuleError` for a
- *     freshly added dep).
- *   - `architecture` selects the pip `--platform` tag and therefore which binary
- *     wheels land in the bundle, so flipping x86_64 ↔ arm64 reused an asset built
- *     for the wrong architecture.
+ * Also folds in `architecture`, which changes the produced bundle without
+ * touching any file: it selects the pip `--platform` tag and therefore which
+ * binary wheels land in the bundle, so flipping x86_64 ↔ arm64 reused an asset
+ * built for the wrong architecture.
  *
  * Reads files via Node on every platform. The previous `find … || true` shell
  * pipeline was unquoted and failure-suppressed, so a repo path containing a space
@@ -219,14 +252,50 @@ export function _computeSourceHash(opts: PythonBundlingOptions): string {
 
   // Bundle-shaping inputs first, so they are covered even if a srcDir is absent.
   hash.update(`architecture:${opts.architecture ?? "x86_64"}\n`);
-  if (opts.pipDeps?.length) {
-    // Sorted: dependency ORDER does not change the installed set, so it must not
-    // change the hash (an unsorted list would cause spurious re-bundles).
-    hash.update(`pipDeps:${[...opts.pipDeps].sort().join(",")}\n`);
+  // The constraints change which versions land in the bundle without touching
+  // any source file, so they are hashed; a missing file, or one with no
+  // constraint line, fails closed rather than bundling unconstrained.
+  const constraints = opts.constraintsFile ?? LAMBDA_RUNTIME_CONSTRAINTS;
+  if (!fs.existsSync(constraints)) {
+    throw new Error(
+      `bundlePython: the constraints file ${constraints} is missing; refusing to bundle unconstrained`,
+    );
   }
+  const constraintText = fs.readFileSync(constraints, "utf8");
+  const lines = constraintText.split(PIP_LINE_BREAK);
+  // pip's rule: `#` starts a comment only at a line start or after whitespace.
+  const uncommented = lines.map((line) => line.replace(/(^|\s+)#.*$/, ""));
+  // pip joins a line ending in `\` to the next and expands `${VAR}`, so what it
+  // reads would not be what is hashed.
+  const rewritten = lines.findIndex(
+    (line, i) =>
+      (line.endsWith("\\") && !/^\s*#/.test(line)) ||
+      uncommented[i].includes("${"),
+  );
+  if (rewritten !== -1) {
+    throw new Error(
+      `bundlePython: the constraints file ${constraints} has a line pip rewrites (${lines[rewritten].trim()}); write each bound on one plain line`,
+    );
+  }
+  const bounds = uncommented.map((line) => line.trim()).filter(Boolean);
+  if (bounds.length === 0) {
+    throw new Error(
+      `bundlePython: the constraints file ${constraints} has no constraint; refusing to bundle unconstrained`,
+    );
+  }
+  // An option line changes the install in ways this hash cannot see: `-r other.txt`
+  // pulls in another file's bounds, `--index-url` or `--pre` changes what resolves.
+  const option = bounds.find((bound) => bound.startsWith("-"));
+  if (option) {
+    throw new Error(
+      `bundlePython: the constraints file ${constraints} carries an option line (${option}); only bounds are allowed`,
+    );
+  }
+  // The bounds, not the raw text: a comment edit must not re-bundle every Lambda.
+  hash.update(`constraints:${bounds.join("\n")}\n`);
 
   for (const dir of opts.srcDirs) {
-    const normalizedDir = dir.replace(/\\/g, "/");
+    const normalizedDir = toPosix(dir);
     if (!fs.existsSync(normalizedDir)) {
       // A source dir that does not exist yet still has to affect the hash, or
       // creating it later would not invalidate the asset. Keyed on the basename
@@ -272,7 +341,7 @@ export function _computeSourceHash(opts: PythonBundlingOptions): string {
  * different code paths entirely).
  */
 function _relative(from: string, target: string): string {
-  return path.relative(from, target).replace(/\\/g, "/");
+  return toPosix(path.relative(from, target));
 }
 
 /**

@@ -17,6 +17,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from coa_common.constants import StructuredBackend
 from coa_serve.exceptions import AccessDeniedError, NoResultError
 from coa_serve.orchestrator import Orchestrator
 from coa_serve.tier1.metric_resolver import DeclinedMetricContext
@@ -37,6 +38,7 @@ def _make_strategy(name: str, result: StrategyResult | None = None, error: Excep
     """Create a mock strategy with a given name and behavior."""
     strategy = MagicMock()
     strategy.name = name
+    strategy.supported_backends = frozenset({StructuredBackend.SQL})
     if error:
         strategy.resolve = AsyncMock(side_effect=error)
     else:
@@ -179,6 +181,53 @@ class TestSequentialPolicy:
         result = await tier.resolve("query", "ns", ctx)
 
         assert result is None
+
+    @pytest.mark.asyncio
+    async def test_low_confidence_result_with_rows_does_not_end_the_chain(self):
+        """A below-floor answer is one the orchestrator discards, so with NL→SPARQL in the
+        chain a later strategy must still run (a 0.05 Ontop answer used to starve it)."""
+        s1 = _make_strategy("a", result=_make_result("a", confidence=0.05))
+        s2 = _make_strategy(StrategyOption.NL_TO_SPARQL, result=_make_result("b", confidence=0.9))
+        tier = StructuredQueryTier(strategies=[s1, s2])
+
+        ctx = StrategyContext(trace=TraceCollector())
+        result = await tier.resolve("query", "ns", ctx)
+
+        assert result is not None
+        assert result.strategy_name == "b"
+        s2.resolve.assert_awaited_once()
+        failed = [s for s in ctx.trace.steps if s.detail and s.detail.get("reason") == "low_confidence"]
+        assert len(failed) == 1
+
+    @pytest.mark.asyncio
+    async def test_best_low_confidence_result_is_returned_when_nothing_beats_it(self):
+        """Kept for a pinned Tier 2, which returns it instead of falling through."""
+        s1 = _make_strategy("a", result=_make_result("a", confidence=0.05))
+        s2 = _make_strategy("b", result=_make_result("b", confidence=0.2))
+        s3 = _make_strategy(StrategyOption.NL_TO_SPARQL, result=None)
+        tier = StructuredQueryTier(strategies=[s1, s2, s3])
+
+        ctx = StrategyContext(trace=TraceCollector())
+        result = await tier.resolve("query", "ns", ctx)
+
+        assert result is not None
+        assert result.strategy_name == "b"
+        s3.resolve.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_without_nl_to_sparql_a_low_confidence_answer_ends_the_chain_as_on_main(self):
+        """With graph sources off the SQL chain is main's: NL→SQL's answer ends it, and the
+        orchestrator's floor then sends it to Tier 3. Ontop must not run and answer instead."""
+        nl_to_sql = _make_strategy(StrategyOption.NL_TO_SQL, result=_make_result("nl_to_sql", confidence=0.2))
+        ontop = _make_strategy(StrategyOption.ONTOP, result=_make_result("ontop", confidence=0.73))
+        tier = StructuredQueryTier(strategies=[ontop, nl_to_sql])
+
+        ctx = StrategyContext(trace=TraceCollector())
+        result = await tier.resolve("query", "ns", ctx, option=StrategyOption.NL_TO_SQL_FIRST)
+
+        assert result is not None
+        assert (result.strategy_name, result.confidence) == ("nl_to_sql", 0.2)
+        ontop.resolve.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_access_denied_propagates(self):
@@ -609,6 +658,19 @@ class TestResolveStrategySelection:
         assert Orchestrator._has_explicit_strategy({"strategy": "turbo"}) is False
         assert Orchestrator._resolve_strategy_selection({"strategy": "turbo"}, None) == "nl_to_sql_first"
 
+    @pytest.mark.usefixtures("graph_sources_off")
+    def test_without_graph_sources_nl_to_sparql_runs_the_default_chain_as_on_main(self):
+        """On main the value was unknown: not a pin, so the default chain and the per-query
+        skip evaluator apply, and a Tier-1/3 pin still keeps Tier 2 out."""
+        assert Orchestrator._has_explicit_strategy({"strategy": "nl_to_sparql"}) is False
+        assert Orchestrator._resolve_strategy_selection({"strategy": "nl_to_sparql"}, None) == "nl_to_sql_first"
+        assert Orchestrator._resolve_strategy_selection({"strategy": "nl_to_sparql"}, 3) is None
+
+    @pytest.mark.usefixtures("graph_sources_on")
+    def test_with_graph_sources_nl_to_sparql_is_an_explicit_pin(self):
+        assert Orchestrator._has_explicit_strategy({"strategy": "nl_to_sparql"}) is True
+        assert Orchestrator._resolve_strategy_selection({"strategy": "nl_to_sparql"}, 3) == "nl_to_sparql"
+
     def test_tier_override_2_maps_to_default_strategy(self):
         assert Orchestrator._resolve_strategy_selection({}, 2) == "nl_to_sql_first"
 
@@ -811,6 +873,109 @@ class TestOrchestratorModelValidation:
 # ── Strategy selection (_strategies_for) ──────────────────────────────────
 
 
+def _backend_strategy(name, *backends):
+    strategy = _make_strategy(name)
+    strategy.supported_backends = frozenset(backends)
+    return strategy
+
+
+@pytest.mark.unit
+class TestBackendStrategySelection:
+    """Fallback chains keep only strategies serving one of the namespace's backends."""
+
+    SQL = StructuredBackend.SQL
+    GRAPH = StructuredBackend.RDF_SPARQL
+
+    def _tier(self):
+        # The order main.py registers them in: NL→SPARQL is inserted before Ontop.
+        return StructuredQueryTier(
+            strategies=[
+                _backend_strategy(StrategyOption.NL_TO_SPARQL, self.GRAPH),
+                _backend_strategy(StrategyOption.ONTOP, self.SQL),
+                _backend_strategy(StrategyOption.NL_TO_SQL, self.SQL),
+            ]
+        )
+
+    def _names(self, option, backends):
+        return [s.name for s in self._tier()._strategies_for(option, backends)]
+
+    @pytest.mark.parametrize(
+        "option", [StrategyOption.BEST, StrategyOption.NL_TO_SQL_FIRST, StrategyOption.ONTOP_FIRST]
+    )
+    def test_sql_only_namespace_never_runs_the_graph_strategy(self, option):
+        assert StrategyOption.NL_TO_SPARQL not in self._names(option, frozenset({self.SQL}))
+
+    @pytest.mark.parametrize(
+        "option", [StrategyOption.BEST, StrategyOption.NL_TO_SQL_FIRST, StrategyOption.ONTOP_FIRST]
+    )
+    def test_graph_only_namespace_runs_only_the_graph_strategy(self, option):
+        assert self._names(option, frozenset({self.GRAPH})) == [StrategyOption.NL_TO_SPARQL]
+
+    def test_mixed_namespace_runs_sparql_before_ontop(self):
+        mixed = frozenset({self.SQL, self.GRAPH})
+        assert self._names(StrategyOption.NL_TO_SQL_FIRST, mixed) == [
+            StrategyOption.NL_TO_SQL,
+            StrategyOption.NL_TO_SPARQL,
+            StrategyOption.ONTOP,
+        ]
+        assert self._names(StrategyOption.BEST, mixed) == [
+            StrategyOption.NL_TO_SPARQL,
+            StrategyOption.ONTOP,
+            StrategyOption.NL_TO_SQL,
+        ]
+
+    def test_unspecified_backends_mean_sql(self):
+        assert StrategyOption.NL_TO_SPARQL not in self._names(StrategyOption.BEST, None)
+
+    def test_a_pin_is_honoured_whatever_the_backends(self):
+        assert self._names(StrategyOption.NL_TO_SPARQL, frozenset({self.SQL})) == [StrategyOption.NL_TO_SPARQL]
+        assert self._names(StrategyOption.ONTOP, frozenset({self.GRAPH})) == [StrategyOption.ONTOP]
+
+    def test_a_namespace_with_no_structured_backend_runs_nothing(self):
+        assert self._names(StrategyOption.BEST, frozenset()) == []
+
+    def test_a_strategy_is_kept_only_for_the_backends_it_declares(self):
+        sql_only = _make_strategy("sql-only")
+        tier = StructuredQueryTier(strategies=[sql_only])
+        assert tier._strategies_for(StrategyOption.BEST, frozenset({self.SQL})) == [sql_only]
+        assert tier._strategies_for(StrategyOption.BEST, frozenset({self.GRAPH})) == []
+
+    async def test_resolve_threads_the_backends(self):
+        sparql = _backend_strategy(StrategyOption.NL_TO_SPARQL, self.GRAPH)
+        sparql.resolve = AsyncMock(return_value=_make_result(StrategyOption.NL_TO_SPARQL))
+        sql = _backend_strategy(StrategyOption.NL_TO_SQL, self.SQL)
+        tier = StructuredQueryTier(strategies=[sql, sparql])
+        result = await tier.resolve(
+            "q",
+            "ns",
+            StrategyContext(),
+            option=StrategyOption.NL_TO_SQL_FIRST,
+            structured_backends=frozenset({self.GRAPH}),
+        )
+        assert result.strategy_name == StrategyOption.NL_TO_SPARQL
+        sql.resolve.assert_not_awaited()
+
+    def test_sparql_ranks_between_nl_to_sql_and_ontop_on_a_tie(self):
+        from coa_serve.tier2.strategy import _strategy_precedence
+
+        assert (
+            _strategy_precedence(StrategyOption.NL_TO_SQL)
+            < _strategy_precedence(StrategyOption.NL_TO_SPARQL)
+            < _strategy_precedence(StrategyOption.ONTOP)
+        )
+
+    def test_real_strategies_declare_their_backends(self):
+        from coa_serve.tier2.nl_to_sql.agentic_strategy import AgenticStrategy
+        from coa_serve.tier2.nl_to_sql.strategy import NLtoSQLStrategy
+        from coa_serve.tier2.ontop.strategy import OntopStrategy
+        from coa_serve.tier2.sparql.strategy import SparqlStrategy
+
+        assert OntopStrategy.supported_backends == {self.SQL}
+        assert NLtoSQLStrategy.supported_backends == {self.SQL}
+        assert AgenticStrategy.supported_backends == {self.SQL}
+        assert SparqlStrategy.supported_backends == {self.GRAPH}
+
+
 @pytest.mark.unit
 class TestAgenticStrategySelection:
     """The DEEP_REASONING arm is opt-in: it runs ONLY when pinned, never as a fallback."""
@@ -823,6 +988,21 @@ class TestAgenticStrategySelection:
                 _make_strategy(StrategyOption.DEEP_REASONING),
             ]
         )
+
+    def test_nl_to_sparql_pin_selects_only_the_graph_strategy(self):
+        tier = StructuredQueryTier(
+            strategies=[
+                _make_strategy(StrategyOption.ONTOP),
+                _make_strategy(StrategyOption.NL_TO_SQL),
+                _make_strategy(StrategyOption.NL_TO_SPARQL),
+            ]
+        )
+        picked = tier._strategies_for(StrategyOption.NL_TO_SPARQL)
+        assert [s.name for s in picked] == [StrategyOption.NL_TO_SPARQL]
+
+    def test_nl_to_sparql_pin_without_the_strategy_registered_selects_nothing(self):
+        """Flag off: the pin must not fall through to the SQL chain."""
+        assert self._tier()._strategies_for(StrategyOption.NL_TO_SPARQL) == []
 
     def test_deep_reasoning_pin_selects_only_deep_reasoning(self):
         picked = self._tier()._strategies_for(StrategyOption.DEEP_REASONING)

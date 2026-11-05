@@ -34,15 +34,25 @@ class TtlLruCache[K, V]:
             least-recently-used entry.
         time_fn: Monotonic clock, injectable for tests. Defaults to
             ``time.monotonic``.
+        on_evict: Called with each value the cache drops — expired on read,
+            LRU-evicted, or replaced by a ``set`` of the same key — so a value that
+            owns a resource (a pooled HTTP client) can release it.
     """
 
-    def __init__(self, ttl_s: float, max_size: int, time_fn: Callable[[], float] = time.monotonic) -> None:
+    def __init__(
+        self,
+        ttl_s: float,
+        max_size: int,
+        time_fn: Callable[[], float] = time.monotonic,
+        on_evict: Callable[[V], None] | None = None,
+    ) -> None:
         """Initialize the cache with a freshness window, size bound, and clock.
 
         Args:
             ttl_s: Seconds an entry stays fresh; must be positive.
             max_size: Maximum entries retained; must be positive.
             time_fn: Monotonic clock, injectable for tests.
+            on_evict: Optional callback receiving every dropped value.
 
         Raises:
             ValueError: If ``ttl_s`` or ``max_size`` is not positive.
@@ -54,7 +64,12 @@ class TtlLruCache[K, V]:
         self._ttl_s = ttl_s
         self._max_size = max_size
         self._time_fn = time_fn
+        self._on_evict = on_evict
         self._store: OrderedDict[K, tuple[V, float]] = OrderedDict()
+
+    def _evicted(self, value: V) -> None:
+        if self._on_evict is not None:
+            self._on_evict(value)
 
     def get(self, key: K) -> V | None:
         """Return the cached value, or ``None`` if absent or expired.
@@ -68,16 +83,27 @@ class TtlLruCache[K, V]:
         value, ts = entry
         if self._time_fn() - ts >= self._ttl_s:
             del self._store[key]  # drop the stale entry
+            self._evicted(value)
             return None
         self._store.move_to_end(key)  # LRU touch
         return value
 
     def set(self, key: K, value: V) -> None:
         """Insert/refresh ``key`` and evict the least-recently-used entry if over size."""
+        previous = self._store.get(key)
         self._store[key] = (value, self._time_fn())
         self._store.move_to_end(key)
+        if previous is not None and previous[0] is not value:
+            self._evicted(previous[0])
         while len(self._store) > self._max_size:
-            self._store.popitem(last=False)  # evict least-recently-used
+            _, (evicted, _) = self._store.popitem(last=False)  # evict least-recently-used
+            self._evicted(evicted)
+
+    def clear(self) -> list[V]:
+        """Remove every entry WITHOUT calling ``on_evict``; returns the removed values."""
+        values = [value for value, _ in self._store.values()]
+        self._store.clear()
+        return values
 
     def __len__(self) -> int:
         """Return the number of entries currently held (including any not yet expired)."""

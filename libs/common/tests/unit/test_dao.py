@@ -102,6 +102,16 @@ class TestDynamoDBDAOGet:
         call_kwargs = table.get_item.call_args[1]
         assert "ProjectionExpression" in call_kwargs
         assert "ExpressionAttributeNames" in call_kwargs
+        assert "ConsistentRead" not in call_kwargs
+
+    def test_get_can_read_consistently(self, mock_table):
+        table, _ = mock_table
+        table.get_item.return_value = {"Item": {"status": "ok"}}
+
+        dao = DynamoDBDAO("test-table", region="us-east-1")
+        dao.get({"PK": "a"}, consistent_read=True)
+
+        assert table.get_item.call_args[1]["ConsistentRead"] is True
 
 
 class TestDynamoDBDAOGetAttribute:
@@ -262,6 +272,16 @@ class TestDynamoDBDAOQuery:
         call_args = table.query.call_args.kwargs
         assert call_args["IndexName"] == "GSI1"
         assert call_args["Limit"] == 10
+        assert "ConsistentRead" not in call_args
+
+    def test_query_can_read_consistently(self, mock_table):
+        table, _ = mock_table
+        table.query.return_value = {"Items": [], "LastEvaluatedKey": None}
+
+        dao = DynamoDBDAO("test-table", region="us-east-1")
+        dao.query(QueryParams(key_condition="PK = :pk", expression_values={":pk": "ns#1"}, consistent_read=True))
+
+        assert table.query.call_args.kwargs["ConsistentRead"] is True
 
 
 class TestDynamoDBDAOQueryAll:

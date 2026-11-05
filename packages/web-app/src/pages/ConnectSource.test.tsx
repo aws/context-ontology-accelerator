@@ -10,6 +10,8 @@ import { LocaleProvider } from "../i18n/LocaleProvider";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { readFileSync } from "node:fs";
 import path from "node:path";
+import { RuntimeConfigContext } from "@components/RuntimeContext";
+import type { RuntimeContext } from "@components/RuntimeContext";
 import { ConnectSource } from "./ConnectSource";
 // The shim defined by the vi.mock factory below, so `instanceof` inside the page
 // sees the same class a real service error would present.
@@ -90,6 +92,7 @@ vi.mock("@api-hooks", () => ({
 // component; provide a minimal shim that satisfies both call sites.
 vi.mock("@coa/control-plane-client", () => ({
   SourceType: { DATABASE: "DATABASE", DOCUMENTS: "DOCUMENTS" },
+  SparqlStore: { NEPTUNE: "neptune" },
   ControlPlaneServiceServiceException: class extends Error {
     constructor(msg = "ControlPlaneServiceServiceException") {
       super(msg);
@@ -1713,6 +1716,221 @@ describe("ConnectSource — External ID unavailable state", () => {
     expect(screen.getByText("Loading…")).toBeInTheDocument();
     expect(screen.queryByText(/Unavailable/)).toBeNull();
   });
+});
+
+// ---------------------------------------------------------------------------
+// RDF_SPARQL (graph) source — reachability verify, no enrichment step
+// ---------------------------------------------------------------------------
+
+const SPARQL_ENDPOINT_PLACEHOLDER =
+  "my-graph.cluster-xxxx.us-east-1.neptune.amazonaws.com";
+
+async function fillSparqlStep(
+  endpoint = "db.cluster-abc.us-east-1.neptune.amazonaws.com",
+) {
+  await user.click(screen.getByLabelText("Graph database (SPARQL)"));
+  await clickNext();
+  await user.type(
+    screen.getByPlaceholderText("support-graph"),
+    "support-graph",
+  );
+  await user.type(
+    screen.getByPlaceholderText(SPARQL_ENDPOINT_PLACEHOLDER),
+    endpoint,
+  );
+}
+
+async function submitFromReview() {
+  await clickNext(); // → review (no enrichment step for a graph source)
+  await user.click(screen.getByRole("button", { name: /^connect source$/i }));
+}
+
+const BASE_RUNTIME_CONFIG: RuntimeContext = {
+  region: "us-east-1",
+  authority: "https://issuer.example.com",
+  clientId: "client-abc",
+  oidcConfig: {
+    authority: "https://issuer.example.com",
+    clientId: "client-abc",
+  },
+};
+
+function wrapperWithRuntimeConfig(ctx: RuntimeContext) {
+  return ({ children }: { children: React.ReactNode }) => (
+    <RuntimeConfigContext.Provider value={ctx}>
+      {wrapper({ children })}
+    </RuntimeConfigContext.Provider>
+  );
+}
+
+const graphOnWrapper = wrapperWithRuntimeConfig({
+  ...BASE_RUNTIME_CONFIG,
+  graphSourcesEnabled: true,
+});
+
+describe("ConnectSource — graph sources switch", () => {
+  it("hides the graph tile when there is no runtime config", () => {
+    render(<ConnectSource />, { wrapper });
+    expect(screen.getByLabelText("Glue database")).toBeInTheDocument();
+    expect(
+      screen.queryByLabelText("Graph database (SPARQL)"),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText(/queried natively with SPARQL/)).toBeNull();
+  });
+
+  it("hides the graph tile when graphSourcesEnabled is false", () => {
+    render(<ConnectSource />, {
+      wrapper: wrapperWithRuntimeConfig({
+        ...BASE_RUNTIME_CONFIG,
+        graphSourcesEnabled: false,
+      }),
+    });
+    expect(
+      screen.queryByLabelText("Graph database (SPARQL)"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows the graph tile when graphSourcesEnabled is true", () => {
+    render(<ConnectSource />, { wrapper: graphOnWrapper });
+    expect(
+      screen.getByLabelText("Graph database (SPARQL)"),
+    ).toBeInTheDocument();
+  });
+});
+
+describe("ConnectSource — RDF_SPARQL graph source", () => {
+  beforeEach(() => {
+    mockCreate.mockReset();
+    mockCreateAsync.mockReset();
+  });
+
+  it("offers the graph source as a step-1 source kind", () => {
+    render(<ConnectSource />, { wrapper: graphOnWrapper });
+    expect(
+      screen.getByText(/queried natively with SPARQL/),
+    ).toBeInTheDocument();
+  });
+
+  it("goes straight to review — a graph source is not enriched", async () => {
+    render(<ConnectSource />, { wrapper: graphOnWrapper });
+    await fillSparqlStep();
+    await clickNext();
+    expect(
+      screen.queryByText(/Enable AI metadata enrichment/i),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /^connect source$/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/coa_import:dataSourceName/)).toBeInTheDocument();
+  }, 15000);
+
+  it("submits only sparqlConfiguration, with the LLD field names", async () => {
+    render(<ConnectSource />, { wrapper: graphOnWrapper });
+    await fillSparqlStep();
+    await submitFromReview();
+
+    expect(mockCreate).toHaveBeenCalledTimes(1);
+    const body = mockCreate.mock.calls[0][0].body;
+    expect(body.sourceType).toBe("DATABASE");
+    const { databaseSource } = body;
+    expect(databaseSource.name).toBe("support-graph");
+    expect(databaseSource.sparqlConfiguration).toEqual({
+      store: "neptune",
+      dataEndpoint: "db.cluster-abc.us-east-1.neptune.amazonaws.com",
+      port: 8182,
+      region: undefined,
+      dataNamedGraph: undefined,
+    });
+    expect(databaseSource.glueConfiguration).toBeUndefined();
+    expect(databaseSource.jdbcConfiguration).toBeUndefined();
+    expect(databaseSource.customConnectorConfiguration).toBeUndefined();
+    expect(databaseSource.databricksSqlWarehouseConfiguration).toBeUndefined();
+    expect(databaseSource.metadataEnrichmentEnabled).toBeUndefined();
+  }, 15000);
+
+  it("sends the optional region and named graph when given", async () => {
+    render(<ConnectSource />, { wrapper: graphOnWrapper });
+    await fillSparqlStep();
+    await user.type(screen.getByPlaceholderText("us-east-1"), "eu-west-1");
+    await user.type(
+      screen.getByPlaceholderText("https://example.com/graphs/support"),
+      "https://coa.example.com/graphs/support",
+    );
+    await submitFromReview();
+    const cfg =
+      mockCreate.mock.calls[0][0].body.databaseSource.sparqlConfiguration;
+    expect(cfg.region).toBe("eu-west-1");
+    expect(cfg.dataNamedGraph).toBe("https://coa.example.com/graphs/support");
+  }, 15000);
+
+  it("omits the port when it is cleared, so the server default applies", async () => {
+    render(<ConnectSource />, { wrapper: graphOnWrapper });
+    await fillSparqlStep();
+    await user.clear(screen.getByPlaceholderText("8182"));
+    await submitFromReview();
+    expect(
+      mockCreate.mock.calls[0][0].body.databaseSource.sparqlConfiguration.port,
+    ).toBeUndefined();
+  }, 15000);
+
+  it("warns that only port 8182 is reachable", async () => {
+    render(<ConnectSource />, { wrapper: graphOnWrapper });
+    await user.click(screen.getByLabelText("Graph database (SPARQL)"));
+    await clickNext();
+    expect(screen.getByText(/allow only port 8182/)).toBeInTheDocument();
+  }, 15000);
+
+  it("shows authentication as read-only SigV4 / IAM", async () => {
+    render(<ConnectSource />, { wrapper: graphOnWrapper });
+    await user.click(screen.getByLabelText("Graph database (SPARQL)"));
+    await clickNext();
+    expect(screen.getByDisplayValue("SigV4 / IAM")).toHaveAttribute("readonly");
+  }, 15000);
+
+  it("blocks Next without an endpoint", async () => {
+    render(<ConnectSource />, { wrapper: graphOnWrapper });
+    await user.click(screen.getByLabelText("Graph database (SPARQL)"));
+    await clickNext();
+    await user.type(
+      screen.getByPlaceholderText("support-graph"),
+      "support-graph",
+    );
+    await clickNext();
+    expect(
+      screen.getByText("SPARQL endpoint is required."),
+    ).toBeInTheDocument();
+    expect(mockCreate).not.toHaveBeenCalled();
+  }, 15000);
+
+  it("rejects an endpoint that is not a host or https URL", async () => {
+    render(<ConnectSource />, { wrapper: graphOnWrapper });
+    await fillSparqlStep("http://db.example.com");
+    await clickNext();
+    expect(screen.getByText(/Must be a host/)).toBeInTheDocument();
+  }, 15000);
+
+  it("rejects a named graph that could break out of an IRI", async () => {
+    render(<ConnectSource />, { wrapper: graphOnWrapper });
+    await fillSparqlStep();
+    await user.type(
+      screen.getByPlaceholderText("https://example.com/graphs/support"),
+      "https://x/a>b",
+    );
+    await clickNext();
+    expect(
+      screen.getByText(/Must be an absolute http\(s\) IRI/),
+    ).toBeInTheDocument();
+  }, 15000);
+
+  it("rejects an out-of-range port", async () => {
+    render(<ConnectSource />, { wrapper: graphOnWrapper });
+    await fillSparqlStep();
+    const port = screen.getByPlaceholderText("8182");
+    await user.clear(port);
+    await user.type(port, "70000");
+    await clickNext();
+    expect(screen.getByText(/between 1 and 65535/)).toBeInTheDocument();
+  }, 15000);
 });
 
 describe("ConnectSource — Japanese document configuration", () => {

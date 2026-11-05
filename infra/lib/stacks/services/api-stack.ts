@@ -190,7 +190,9 @@ export class ApiStack extends SCLStack {
       handler: "coa_control_plane.authorization.handler.handler",
       code: bundlePython({
         srcDirs: [Paths.controlPlaneSrc, Paths.commonLib],
-        requirementsFile: fromRoot("packages/control-plane/requirements.txt"),
+        requirementsFile: fromRoot(
+          "packages/control-plane/requirements.lock.txt",
+        ),
       }),
       timeout: cdk.Duration.seconds(10),
       memorySize: 256,
@@ -235,7 +237,9 @@ export class ApiStack extends SCLStack {
         handler: "coa_control_plane.authorization.stream_handler.handler",
         code: bundlePython({
           srcDirs: [Paths.controlPlaneSrc, Paths.commonLib],
-          requirementsFile: fromRoot("packages/control-plane/requirements.txt"),
+          requirementsFile: fromRoot(
+            "packages/control-plane/requirements.lock.txt",
+          ),
         }),
         timeout: cdk.Duration.seconds(10),
         memorySize: 128,

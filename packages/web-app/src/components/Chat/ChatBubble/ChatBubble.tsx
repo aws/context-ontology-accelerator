@@ -183,6 +183,8 @@ export const ChatBubble: React.FC<ChatBubbleProps> = ({
   // emits SPARQL that Ontop compiles to SQL, so "(Tier 2)" is accurate there.
   // Deep Reasoning also emits SPARQL/SQL but through its agentic loop, not the
   // Tier-2 cascade — labelling its artifacts "(Tier 2)" mislabels them (#1166).
+  // A native graph answer carries SPARQL and no SQL: it ran directly against the
+  // graph source. Ontop answers carry both — the SPARQL and the SQL it compiled to.
   const isDeepReasoning = response.executionMode === "deep-reasoning";
   const sqlArtifactCaption = response.sparqlGenerated
     ? isDeepReasoning
@@ -190,12 +192,16 @@ export const ChatBubble: React.FC<ChatBubbleProps> = ({
           "The SPARQL and SQL Deep Reasoning generated and {engine} executed.",
           { engine: executionEngineLabel },
         )
-      : t(
-          "The SPARQL the LLM emitted (Tier 2) and the SQL {engine} executed.",
-          {
-            engine: executionEngineLabel,
-          },
-        )
+      : response.queryUsed
+        ? t(
+            "The SPARQL the LLM emitted (Tier 2) and the SQL {engine} executed.",
+            {
+              engine: executionEngineLabel,
+            },
+          )
+        : t(
+            "The SPARQL the LLM emitted (Tier 2), executed directly against the graph.",
+          )
     : t("The SQL {engine} executed.", { engine: executionEngineLabel });
 
   return (

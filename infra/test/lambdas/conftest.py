@@ -45,6 +45,11 @@ import pytest
 # because there an inherited value genuinely changes behaviour.)
 os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
 os.environ.setdefault("AWS_REGION", "us-east-1")
+# No test here talks to AWS, so never probe the EC2 instance metadata endpoint.
+# Without this, a CI runner with no AWS profile falls through to that endpoint and
+# waits ~5s for it to time out, which made this 55-test suite take ~250s in CI
+# instead of ~1s.
+os.environ.setdefault("AWS_EC2_METADATA_DISABLED", "true")
 
 _VKG_RELOAD_DIR = Path(__file__).resolve().parents[2] / "lambda" / "vkg-reload"
 

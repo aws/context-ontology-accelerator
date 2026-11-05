@@ -130,3 +130,40 @@ def test_worker_enters_wait_only_after_embeddings_sync(monkeypatch):
     # (and completed had not yet been written).
     assert captured["at_wait"][-1] == "embeddings_sync"
     assert "completed" not in captured["at_wait"]
+
+
+def test_worker_reports_validation_failures_to_the_author(monkeypatch):
+    """A rejected graph binding must reach the job, not just its exception class."""
+    import coa_ontology.catalog.ingest as ingest_mod
+    import coa_ontology.catalog.routers.ontologies as mod
+
+    errors: list[str] = []
+    stub_failures: list[str] = []
+
+    def _update_ingest_job(job_id, state, namespace=None, **kw):
+        if "error" in kw:
+            errors.append(kw["error"])
+
+    def _reject(**kw):
+        raise ingest_mod.IngestValidationError('Class http://ex/A: No data source named "g"', findings=[])
+
+    s3 = MagicMock()
+    s3.get_object.return_value = {"ContentLength": 8, "Body": MagicMock(read=lambda: b"@prefix ex: <http://ex/> .")}
+    with (
+        patch.object(mod.dynamo_store, "update_ingest_job", _update_ingest_job),
+        patch.object(mod, "_fail_ingest_stub", lambda ns, oid, msg: stub_failures.append(msg)),
+        patch("boto3.client", lambda *a, **k: s3),
+        patch.object(mod, "_stores", lambda ns: (MagicMock(), MagicMock())),
+        patch.object(ingest_mod, "ingest_ontology", _reject),
+    ):
+        mod._run_ingest_from_s3(
+            job_id="j-1",
+            ontology_id="http://ex/onto",
+            s3_key="ontology-uploads/ns-a/u1/my.ttl",
+            fmt="turtle",
+            title="My Ontology",
+            ontology_type="user_created",
+            namespace="ns-a",
+        )
+    assert errors == ['Validation failed: Class http://ex/A: No data source named "g"']
+    assert stub_failures == errors

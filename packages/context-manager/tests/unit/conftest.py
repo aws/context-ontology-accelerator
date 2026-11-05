@@ -72,6 +72,7 @@ SEED_METRICS_ALL = SEED_METRICS_FINANCE + SEED_METRICS_INSURANCE
 # graphrag_toolkit (botocore sync-only invariant).
 
 import pytest
+from coa_common.sparql_config import GRAPH_SOURCES_ENV  # noqa: E402
 
 from .lexical_helpers import (  # noqa: E402
     AOSS_ENDPOINT,
@@ -132,3 +133,15 @@ def na_endpoint():
 def aoss_endpoint():
     """A representative AOSS endpoint + its derived vector-store URI."""
     return {"endpoint": AOSS_ENDPOINT, "vector_store_uri": AOSS_VECTOR_STORE_URI}
+
+
+@pytest.fixture
+def graph_sources_on(monkeypatch):
+    """Deploy-time graph-sources switch on: serve behaves as it does with graph sources."""
+    monkeypatch.setenv(GRAPH_SOURCES_ENV, "true")
+
+
+@pytest.fixture
+def graph_sources_off(monkeypatch):
+    """Deploy-time graph-sources switch off (the default): serve behaves as main."""
+    monkeypatch.delenv(GRAPH_SOURCES_ENV, raising=False)

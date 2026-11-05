@@ -152,6 +152,7 @@ make generate
 
 This runs `scripts/smithy-generate.sh` which:
 1. Runs `./gradlew build` in `models/` — produces TypeScript clients and OpenAPI specs
-2. Runs `openapi-generator-cli -g python` — produces Pydantic v2 server models from the OpenAPI specs
+2. Installs the workspace from `pnpm-lock.yaml` with `pnpm install --frozen-lockfile` and builds the TypeScript clients
+3. Runs `openapi-generator-cli -g python` — produces Pydantic v2 server models from the OpenAPI specs
 
-After generation, run `pnpm install` and `uv sync` to link the new workspace packages.
+The script needs pnpm on `PATH` and stops before the Gradle build if it is missing. `make setup` installs the version `.mise.toml` pins when pnpm is missing (`scripts/install-pnpm.sh`). To run the script on its own, install it first, with `mise install` or `./scripts/install-pnpm.sh`. After generation, run `uv sync` to link the new Python workspace packages.

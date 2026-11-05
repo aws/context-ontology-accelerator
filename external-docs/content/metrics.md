@@ -62,6 +62,9 @@ Current constraints to factor into the decision:
 1. Navigate to your namespace → **Metrics** → **Create Metric**
 2. Fill in:
    - **Name**: unique within the namespace
+   - **Display label (optional)**: a display-only name shown in place of the
+     name in the console's metric lists and on the metric's page; leave it
+     empty for none (see [label rules](#label-rules))
    - **Description**: explain what this metric measures
    - **Data Source**: select an approved source
    - **Source Table**: the table containing the data
@@ -87,9 +90,16 @@ invisible format characters, `<` or `>` (the full list is under
 metric is a full replace, so an update that leaves `label` out, or sends `null`,
 clears it. A read-modify-write must send the label it read back unchanged.
 
-The console does not show or edit labels yet. Set them through the API or an
-[OSI import](#bulk-import-osi-format). Saving a metric from the console's edit
-form keeps its existing label.
+In the console, set it in the **Display label (optional)** field of the metric
+form, or through the API or an [OSI import](#bulk-import-osi-format). The field
+counts code points after NFC normalization, as the service does. Leaving it
+empty, or with only whitespace, removes the label when you save. The metric
+lists (the **Metrics** page and the namespace page's **Metrics** tab) show the
+label in place of the name, with the name beneath it. The **Metrics** page sorts
+by what it shows and can be filtered by display label. The metric's page shows
+the label as its heading and lists the name. Breadcrumbs, the edit page, the
+delete confirmation and the message after a delete keep the name, which is what
+the metric is addressed by.
 
 #### Label rules
 
@@ -320,7 +330,7 @@ metrics:
 | `return_type`       | no       | Scalar type of the result (e.g. `decimal`, `integer`).                                                             |
 | `time_dimension`    | no       | Default time grain: one of `day`, `week`, `month`, `quarter`, `year`.                                              |
 | `ontology_concepts` | no       | Ontology classes this metric governs (`:governedMetricFor`). Validated against the published ontology by Check 6.  |
-| `label`             | no       | Display-only label for showing beside `name` (the console does not show it yet). Put matching terms in `synonyms`. |
+| `label`             | no       | Display-only label for the console's metric lists and the metric page's heading. Put matching terms in `synonyms`. |
 
 \* If the document has exactly one `datasets` entry, `data_source_id` is
 inferred from it, and a missing `source_table` defaults to the metric name. Both
@@ -348,8 +358,11 @@ and is a convenient way to see the expected layout for existing metrics.
 
 When a user asks a question that names a metric, the query engine:
 
-1. **Tier 1 (Metric Resolution)**: matches the question to the metric via
-   semantic similarity over names and synonyms
+1. **Tier 1 (Metric Resolution)**: matches the question to the metric by
+   name or synonym: first an exact, case-insensitive match, then a fuzzy string match (similarity of at least 0.88) that
+   catches typos and plurals. Tier 1 does not use embeddings, so a question
+   that paraphrases a metric without its name or a synonym falls through to
+   Tier 2. Add the phrasings your users use as synonyms
 2. Checks that the metric accounts for the **whole** question
 3. Retrieves the metric's SQL expression and executes it **verbatim** through
    the SQL Firewall (enforcing table/column access controls)
@@ -377,6 +390,10 @@ This is also why the **description** field is worth writing properly: it is the
 only place the *meaning* of the metric travels, and Tier 2 reads it alongside the
 SQL when extending your definition. An expression alone does not say that
 `active_customer` means operational recency rather than account status.
+
+### When a metric change reaches queries
+
+Each query-serving instance caches a namespace's metrics and reads them again at most once every **5 minutes**, on the next question for that namespace after the interval. A created, updated or deleted metric therefore reaches an instance within 5 minutes of that instance's last read of the namespace. A question that misses Tier 1 also reads the namespace at once unless it was read within the interval, so a new metric often appears sooner. If the graph database is slow, the question is answered from the cache while the read finishes in the background (except on a newly started instance, whose first full load the question waits for); if the read fails, the cached metrics stay in use and the next read is tried after another interval. The interval is the serve runtime's `SERVE_TIER1_LOOKUP_TTL_S` (see *Internal Environment Variables* in [Deploying](deploying.md)); a shorter interval means more metric reads against the graph database.
 
 ## Managing Metrics
 

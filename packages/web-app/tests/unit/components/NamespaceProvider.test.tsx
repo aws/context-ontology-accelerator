@@ -14,6 +14,14 @@ const mockUseListNamespaces = vi.fn();
 
 vi.mock("../../../src/api-hooks", () => ({
   useListNamespaces: () => mockUseListNamespaces(),
+  // The provider looks up a namespace by id only when the URL names one that
+  // is not in the list; these tests never do, so the lookup stays idle.
+  useGetNamespace: () => ({
+    data: undefined,
+    isSuccess: false,
+    isError: false,
+    isLoading: false,
+  }),
 }));
 
 function TestConsumer() {

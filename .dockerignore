@@ -10,6 +10,10 @@
 # Allow shared library (both Dockerfiles need this)
 !libs/common/
 
+# Allow the lock and the script that turns it into install constraints (context-manager image)
+!uv.lock
+!scripts/uv_lock_constraints.py
+
 # Allow context-manager package
 !packages/context-manager/Dockerfile
 !packages/context-manager/pyproject.toml

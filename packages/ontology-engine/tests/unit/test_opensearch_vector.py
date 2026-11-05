@@ -68,6 +68,26 @@ class TestStoreEmbedding:
         assert doc["namespace"] == "default"
         assert "context_text" not in doc
         assert "data_source_id" not in doc
+        # Absent == SQL: a SQL or legacy class document carries no backend marker.
+        assert "query_backend" not in doc
+
+    def test_graph_class_document_carries_query_backend(self):
+        client = MagicMock()
+        store = OpenSearchVectorStore(namespace="ns1")
+        store._client = client
+        store._ensure_index = lambda namespace=None: "idx-ns1"
+        doc = store.store_embedding(
+            {
+                "entity_uri": "http://x/SupportTicket",
+                "embedding_type": "class",
+                "model_id": "titan",
+                "vector": [0.0] * 1024,
+                "data_source_id": "src-graph-1",
+                "query_backend": "RDF_SPARQL",
+            }
+        )
+        assert doc["query_backend"] == "RDF_SPARQL"
+        assert doc["data_source_id"] == "src-graph-1"
 
 
 # ── store_embeddings_batch (namespace grouping) ─────────────────────────

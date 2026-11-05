@@ -1,1 +1,10 @@
-# No external dependencies — uses only Python stdlib (urllib, json, os)
+# The Lambda installs from requirements.lock.txt (hash-pinned), not this file.
+# After editing it, run scripts/relock-python-requirements.sh.
+# Bundle deps for the data-layer Lambda. handler.py imports coa_common, whose
+# runtime deps are listed here; boto3/botocore come from the Lambda runtime.
+pydantic
+pydantic-settings
+structlog
+# Runtime boto3 prefers a bundled certifi to the CA bundle botocore ships; this is
+# the first certifi without the roots behind the compromised emSign intermediates.
+certifi>=2026.10.19

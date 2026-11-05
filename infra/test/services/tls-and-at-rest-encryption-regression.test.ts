@@ -40,6 +40,8 @@ const SOURCES_TEST_CONTEXT = {
   sources_kg_build_image_uri:
     "123456789012.dkr.ecr.us-east-1.amazonaws.com/coa-test:kg-build-test",
   "aws:cdk:bundling-stacks": [],
+  // The graph-verify queues below exist only with graph sources on.
+  graph_sources: "on",
 };
 
 const METRIC_TEST_CONTEXT = { "aws:cdk:bundling-stacks": [] };
@@ -58,6 +60,8 @@ const SOURCES_TLS_QUEUES = [
   "sources-doc-ingestion-queue",
   "sources-glue-event-dlq",
   "sources-glue-event-queue",
+  "sources-graph-verify-dlq",
+  "sources-graph-verify-queue",
 ];
 const METRIC_TLS_QUEUES = ["metric-import-dlq", "metric-import-queue"];
 

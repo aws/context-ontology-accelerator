@@ -26,6 +26,7 @@ import {
   resolveContext,
   resolveLambdaReservedConcurrency,
 } from "../../context";
+import { grantGuardDutyAgentPull } from "../../utils/guardduty-agent";
 import { NetworkStack } from "../foundation/network-stack";
 
 export interface VkgStackProps extends cdk.StackProps {
@@ -135,6 +136,8 @@ export class VkgStack extends SCLStack {
         operatingSystemFamily: ecs.OperatingSystemFamily.LINUX,
       },
     });
+    // Per-namespace VKG task definitions reuse this execution role.
+    grantGuardDutyAgentPull(taskDef);
 
     // ── Container ────────────────────────────────────────────────────
     // Support pre-built image from CI (Kaniko) or local Docker build (fromAsset)

@@ -196,7 +196,7 @@ else
   warn "No container engine — skipping ECR Public authentication"
 fi
 
-# ── 6. Pending teardown and VPC limit (requires AWS credentials) ─────────
+# ── 6. Pending teardown and network quotas (requires AWS credentials) ────
 # Resolved the way the CDK CLI resolves it, the profile's region included, so
 # preflight validates the same region CDK will actually deploy to.
 # shellcheck source=lib/resolve-region.sh source-path=SCRIPTDIR

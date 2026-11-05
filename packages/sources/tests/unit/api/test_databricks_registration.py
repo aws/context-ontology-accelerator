@@ -108,6 +108,7 @@ def _make_databricks_db_req(**overrides):
     dbx.database_name = config["databaseName"]
     dbx.to_dict.return_value = config
     req.databricks_sql_warehouse_configuration = dbx
+    req.sparql_configuration = None
     req.metadata_enrichment_enabled = None
     return req
 
@@ -1088,6 +1089,7 @@ class TestFourWayConfigurationGuard:
     def test_the_no_configuration_error_names_all_four_members(self, harness):
         req = _make_databricks_db_req()
         req.databricks_sql_warehouse_configuration = None
+        req.sparql_configuration = None
         status, body = harness.create(req)
         assert status == 400
         for member in (

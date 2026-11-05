@@ -1,16 +1,20 @@
 # kg-build runtime deps (standalone Docker image, built with plain pip).
 #
 # The boto3 trio is pinned EXACTLY to eliminate pip backtracking (~50 metadata
-# downloads per build). These are known-good versions for the current
-# graphrag-lexical-graph pin (validated end-to-end: doc ingest succeeded
-# 2026-07-10). This image builds via standalone pip, NOT the uv workspace, so
-# the exact patch may differ from uv.lock's boto3 (1.43.x); both are compatible
-# with graphrag 3.18.7 now that the aiobotocore botocore<1.41 cap is gone. Bump
-# in lockstep when upgrading graphrag-lexical-graph.
+# downloads per build). These are known-good versions: the last end-to-end
+# doc-ingest validation ran 2026-07-10 on graphrag-lexical-graph 3.19.1 (itself
+# carried forward from the 3.18.7 run). The 3.20.0 bump has NOT been re-validated
+# by a doc-ingest run — it is covered by unit tests and the kg-build image builds
+# and deploys — and 3.20.0 rewrote batch_inference_utils.get_request_body, which
+# changes the batch-inference code path this image exercises; re-run a doc-ingest
+# and update this note when convenient. This image builds via standalone pip, NOT
+# the uv workspace, so the exact patch may differ from uv.lock's boto3 (1.43.x);
+# the boto3 trio stays compatible now that the aiobotocore botocore<1.41 cap is
+# gone. Bump in lockstep when upgrading graphrag-lexical-graph.
 boto3==1.43.45
 botocore==1.43.45
 s3transfer==0.19.0
-graphrag-lexical-graph==3.18.7
+graphrag-lexical-graph==3.20.0
 # Pin the LlamaIndex OpenSearch vector-store stack EXACTLY. These were left
 # floating and a rebuild pulled newer releases whose VectorStoreFactory /
 # VectorIndexing integration broke against graphrag-lexical-graph
@@ -19,7 +23,7 @@ graphrag-lexical-graph==3.18.7
 # 2026-07-06). Bump in lockstep with graphrag-lexical-graph, not independently.
 opensearch-py==3.2.0
 llama-index-vector-stores-opensearch==1.2.0
-llama-index-core==0.14.23
+llama-index-core==0.14.25
 # 2026.10.19 is the first certifi bundle without the roots behind the compromised
 # emSign intermediates. botocore also uses certifi's bundle over its own when installed.
 certifi>=2026.10.19

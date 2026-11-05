@@ -7,10 +7,11 @@ Extracted from the original synchronous ``delete_handler.py`` so both the
 async DELETE handler's error paths and the Step Functions deletion pipeline
 (``deletion_pipeline/``) can reuse the same, tested cleanup logic.
 
-Each function here is best-effort unless noted otherwise: it logs and
-swallows errors rather than raising, because the deletion pipeline drives
-retries at the Step Functions level (see ``deletion_pipeline/pipeline.py``
-step definitions) rather than inside a single Lambda invocation.
+Each function's docstring says whether it raises or logs and continues. All
+but ``delete_ontology_artifacts`` raise, treating an already-deleted resource as done, because the deletion
+pipeline drives retries at the Step Functions level (see
+``deletion_pipeline/pipeline.py`` step definitions) rather than inside a single
+Lambda invocation.
 """
 
 from __future__ import annotations
@@ -34,7 +35,7 @@ logger = structlog.get_logger(__name__)
 _MAX_PAGINATION_PAGES = 1000
 
 
-# ── Athena / DataZone (external, best-effort) ──────────────────────────────
+# ── Athena / DataZone (raise on failure; already-gone is a no-op) ──────────
 
 
 def delete_athena_workgroup(workgroup_name: str | None) -> None:
@@ -116,13 +117,13 @@ def _datazone_client(*, region: str, assume_role_arn: str | None):
 
 
 def delete_role_mappings(namespace_id: str) -> None:
-    """Delete resource-role-mappings for namespace."""
+    """Delete resource-role-mappings for namespace. Raises on failure."""
     if table := os.environ.get("RESOURCE_ROLE_MAPPINGS_TABLE"):
         _delete_all_by_index(table, "NamespaceGrantsIndex", "namespaceKey", f"NS#{namespace_id}")
 
 
 def delete_roles(namespace_id: str) -> None:
-    """Delete roles for namespace."""
+    """Delete roles for namespace. Raises on failure."""
     if table := os.environ.get("ROLES_TABLE"):
         _delete_all_by_pk(table, f"NS#{namespace_id}")
 
@@ -233,13 +234,16 @@ def _paginated_query_all(dao: DynamoDBDAO, params: QueryParams) -> list[dict[str
 
 
 def teardown_vkg_service(namespace_id: str) -> None:
-    """Delete VKG ECS service + Cloud Map entry for a namespace. Best-effort.
+    """Delete VKG ECS service + Cloud Map entry for a namespace.
 
     Steps:
-    1. Delete ECS service (force=True stops running tasks)
+    1. Delete ECS service (force=True stops running tasks), then confirm it
+       is no longer ACTIVE
     2. Deregister Cloud Map instances + delete Cloud Map service
 
-    Logs errors but does not raise — namespace deletion continues on failure.
+    Raises on any failure other than "already gone" so the deletion
+    pipeline's DeletePlatform step fails retryably instead of orphaning a
+    running service. Safe to re-run after a partial or completed teardown.
     """
     region = os.environ.get("AWS_REGION", "us-east-1")
     prefix = os.environ.get("RESOURCE_PREFIX", "").rstrip("-")
@@ -247,58 +251,82 @@ def teardown_vkg_service(namespace_id: str) -> None:
     cloud_map_ns_id = os.environ.get("CLOUD_MAP_NAMESPACE_ID", "")
 
     if not cluster_arn:
+        logger.warning("vkg_teardown_skipped_no_cluster_arn", namespace_id=namespace_id)
         return
 
     ecs_client = boto3.client("ecs", region_name=region, config=async_boto_config())
     service_name = f"{prefix}-vkg-{namespace_id}" if prefix else f"vkg-{namespace_id}"
+    _delete_vkg_ecs_service(ecs_client, cluster_arn, service_name, namespace_id)
 
-    try:
-        ecs_client.delete_service(cluster=cluster_arn, service=service_name, force=True)
-        logger.info("vkg_service_deleted", namespace_id=namespace_id, service_name=service_name)
-    except ecs_client.exceptions.ServiceNotFoundException:
-        logger.info("vkg_service_not_found", namespace_id=namespace_id, service_name=service_name)
-    except Exception as e:
-        logger.error(
-            "vkg_service_delete_failed",
-            namespace_id=namespace_id,
-            service_name=service_name,
-            error_type=type(e).__name__,
-        )
-
-    # Clean up Cloud Map service discovery entry
     if not cloud_map_ns_id:
         return
 
     sd_client = boto3.client("servicediscovery", region_name=region, config=async_boto_config())
+    _delete_vkg_cloud_map_service(sd_client, cloud_map_ns_id, namespace_id)
+
+
+def _delete_vkg_ecs_service(ecs_client: Any, cluster_arn: str, service_name: str, namespace_id: str) -> None:
+    """Force-delete the ECS service; raise unless it (or its cluster) is gone, DRAINING or INACTIVE afterwards."""
     try:
-        svc_paginator = sd_client.get_paginator("list_services")
-        for page in svc_paginator.paginate(
-            Filters=[{"Name": "NAMESPACE_ID", "Values": [cloud_map_ns_id], "Condition": "EQ"}]
-        ):
-            for svc in page.get("Services", []):
-                if svc["Name"] == f"vkg-{namespace_id}":
-                    inst_paginator = sd_client.get_paginator("list_instances")
-                    for inst_page in inst_paginator.paginate(ServiceId=svc["Id"]):
-                        for inst in inst_page.get("Instances", []):
-                            sd_client.deregister_instance(ServiceId=svc["Id"], InstanceId=inst["Id"])
-                    # Retry: ECS may still hold a reference briefly after force-delete
-                    for attempt in range(4):
-                        try:
-                            sd_client.delete_service(Id=svc["Id"])
-                            break
-                        except sd_client.exceptions.ResourceInUse:
-                            if attempt == 3:
-                                raise
-                            time.sleep(2**attempt)
-                    logger.info("vkg_cloud_map_deleted", namespace_id=namespace_id)
-                    return
+        response = ecs_client.delete_service(cluster=cluster_arn, service=service_name, force=True)
+    except ecs_client.exceptions.ServiceNotFoundException:
+        logger.info("vkg_service_not_found", namespace_id=namespace_id, service_name=service_name)
+        return
+    except ecs_client.exceptions.ClusterNotFoundException:
+        # A deleted cluster has no services left to delete.
+        logger.info("vkg_cluster_not_found", namespace_id=namespace_id, service_name=service_name)
+        return
+    except ecs_client.exceptions.ServiceNotActiveException:
+        logger.info("vkg_service_not_active", namespace_id=namespace_id, service_name=service_name)
+        return
+
+    # The delete's own response carries the new status; a describe straight after
+    # can still read the old one.
+    status = (response.get("service") or {}).get("status")
+    if status == "ACTIVE":
+        raise RuntimeError(f"VKG service {service_name} is still ACTIVE after delete_service")
+    logger.info("vkg_service_deleted", namespace_id=namespace_id, service_name=service_name, status=status)
+
+
+def _delete_vkg_cloud_map_service(sd_client: Any, cloud_map_ns_id: str, namespace_id: str) -> None:
+    """Deregister instances and delete the Cloud Map service; already-gone counts as done."""
+    service_id = _find_cloud_map_service_id(sd_client, cloud_map_ns_id, f"vkg-{namespace_id}")
+    if service_id is None:
         logger.info("vkg_cloud_map_not_found", namespace_id=namespace_id)
-    except Exception as e:
-        logger.error(
-            "vkg_cloud_map_delete_failed",
-            namespace_id=namespace_id,
-            error_type=type(e).__name__,
-        )
+        return
+
+    inst_paginator = sd_client.get_paginator("list_instances")
+    for inst_page in inst_paginator.paginate(ServiceId=service_id):
+        for inst in inst_page.get("Instances", []):
+            try:
+                sd_client.deregister_instance(ServiceId=service_id, InstanceId=inst["Id"])
+            except (sd_client.exceptions.InstanceNotFound, sd_client.exceptions.DuplicateRequest):
+                # DuplicateRequest: ECS is deregistering the same task after the force-delete.
+                continue
+
+    # Retry: ECS may still hold a reference briefly after force-delete
+    for attempt in range(4):
+        try:
+            sd_client.delete_service(Id=service_id)
+            break
+        except sd_client.exceptions.ServiceNotFound:
+            break
+        except sd_client.exceptions.ResourceInUse:
+            if attempt == 3:
+                raise
+            time.sleep(2**attempt)
+    logger.info("vkg_cloud_map_deleted", namespace_id=namespace_id)
+
+
+def _find_cloud_map_service_id(sd_client: Any, cloud_map_ns_id: str, service_name: str) -> str | None:
+    svc_paginator = sd_client.get_paginator("list_services")
+    for page in svc_paginator.paginate(
+        Filters=[{"Name": "NAMESPACE_ID", "Values": [cloud_map_ns_id], "Condition": "EQ"}]
+    ):
+        for svc in page.get("Services", []):
+            if svc["Name"] == service_name:
+                return svc["Id"]
+    return None
 
 
 def delete_graphrag_indexes(namespace_id: str) -> list[str]:

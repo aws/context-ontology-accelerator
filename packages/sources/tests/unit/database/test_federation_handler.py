@@ -464,6 +464,21 @@ class TestDatabricksBranch:
         dao.update.assert_called_once()
 
 
+class TestGraphBackedBranch:
+    """An RDF_SPARQL source is never scanned — its reachability verify owns ``queryable``
+    — so a row that reaches this handler is mis-routed and must be a no-op."""
+
+    def test_is_a_no_op_that_leaves_queryable_alone(self):
+        from coa_sources.database.pipeline.federation_handler import handler
+
+        ctx, dao = _patch_dao({"sourceSubType": "RDF_SPARQL"})
+        with ctx, patch(f"{MODULE}.provision_federated_catalog") as prov:
+            out = handler(_EVENT)
+        assert out == {"provisioned": False, "reason": "graph-backed"}
+        dao.update.assert_not_called()
+        prov.assert_not_called()
+
+
 class TestUnhandledSubType:
     """An absent sub-type must stay a no-op; a recognised DATABASE sub-type with
     no branch here must not."""

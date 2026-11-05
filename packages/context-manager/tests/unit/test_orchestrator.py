@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import structlog
+from coa_common.constants import StructuredBackend
 from coa_serve.clients.base import QueryResult
 from coa_serve.exceptions import AccessDeniedError, NoResultError
 from coa_serve.graph_context import encode_supporting_statements
@@ -101,6 +102,7 @@ def _make_orchestrator(
 
     mock_strategy = MagicMock()
     mock_strategy.name = StrategyOption.ONTOP
+    mock_strategy.supported_backends = frozenset({StructuredBackend.SQL})
     mock_strategy.resolve = strategy_resolve
     structured_query_tier = StructuredQueryTier(strategies=[mock_strategy])
 
@@ -1675,6 +1677,98 @@ def _registry_with_composition(*, has_structured_source, has_unstructured_source
     return registry
 
 
+def _backend_registry(*backends, has_unstructured_source=False):
+    from coa_serve.clients.sources_registry import SourceComposition
+
+    registry = MagicMock()
+    registry.get_source_composition = AsyncMock(
+        return_value=SourceComposition(
+            has_structured_source=bool(backends),
+            has_unstructured_source=has_unstructured_source,
+            structured_backends=frozenset(backends),
+        )
+    )
+    return registry
+
+
+def _spy_tier(orch):
+    """Wrap the structured tier's resolve to capture the backends it is given."""
+    real = orch._structured_query_tier.resolve
+    spy = AsyncMock(side_effect=real)
+    orch._structured_query_tier.resolve = spy
+    return spy
+
+
+@pytest.mark.unit
+@pytest.mark.usefixtures("graph_sources_on")
+class TestStructuredBackendRouting:
+    """Composition → which tiers run and which Tier-2 strategies are eligible."""
+
+    SQL = StructuredBackend.SQL
+    GRAPH = StructuredBackend.RDF_SPARQL
+
+    async def test_graph_only_namespace_skips_tier1_and_selects_graph_strategies(self):
+        orch, parts = _make_orchestrator(
+            metric_found=True, sources_registry=_backend_registry(self.GRAPH), return_parts=True
+        )
+        spy = _spy_tier(orch)
+        await orch.resolve(InvokeRequest(query="q", namespace="ns-graph"))
+        parts["metric_resolver"].match.assert_not_called()
+        assert spy.call_args.kwargs["structured_backends"] == {self.GRAPH}
+
+    async def test_mixed_namespace_keeps_tier1_and_selects_both(self):
+        orch, parts = _make_orchestrator(sources_registry=_backend_registry(self.SQL, self.GRAPH), return_parts=True)
+        spy = _spy_tier(orch)
+        await orch.resolve(InvokeRequest(query="q", namespace="ns-mixed"))
+        parts["metric_resolver"].match.assert_awaited()
+        assert spy.call_args.kwargs["structured_backends"] == {self.SQL, self.GRAPH}
+
+    async def test_a_tier2_pin_on_a_graph_namespace_keeps_the_graph_backend(self):
+        orch = _make_orchestrator(sources_registry=_backend_registry(self.GRAPH))
+        spy = _spy_tier(orch)
+        # The only registered strategy here is a SQL one, so nothing is eligible and
+        # the pinned tier reports "no result" rather than running a SQL strategy.
+        with pytest.raises(NoResultError):
+            await orch.resolve(InvokeRequest(query="q", namespace="ns-graph", options={"tierOverride": 2}))
+        assert spy.call_args.kwargs["structured_backends"] == {self.GRAPH}
+
+    async def test_an_unknown_composition_selects_the_sql_default(self):
+        orch = _make_orchestrator(
+            sources_registry=_registry_with_composition(
+                has_structured_source=True, has_unstructured_source=True, unknown=True
+            )
+        )
+        spy = _spy_tier(orch)
+        await orch.resolve(InvokeRequest(query="q", namespace="ns"))
+        assert spy.call_args.kwargs["structured_backends"] == {self.SQL}
+
+    async def test_a_sparql_answer_names_its_graph_source_and_carries_no_sql(self):
+        orch = _make_orchestrator(sources_registry=_backend_registry(self.GRAPH))
+        orch._structured_query_tier.resolve = AsyncMock(
+            return_value=StrategyResult(
+                sql="",
+                rows=[{"ticket": "t1"}],
+                columns=["ticket"],
+                confidence=0.85,
+                strategy_name=StrategyOption.NL_TO_SPARQL,
+                trace_steps=[],
+                data_source_id="src-g1",
+                row_count=1,
+                sparql="SELECT ?ticket WHERE { ?ticket ?p ?o } LIMIT 10",
+            )
+        )
+        response = await orch.resolve(
+            InvokeRequest(query="q", namespace="ns-graph", options={"includeDebugInfo": True})
+        )
+        result = response.result
+        assert result.tier == 2
+        assert result.query_used is None
+        assert result.sparql_generated.startswith("SELECT ?ticket")
+        assert result.data_sources == ["src-g1"]
+        assert result.metadata["strategy"] == StrategyOption.NL_TO_SPARQL
+        assert result.result_rows == [{"ticket": "t1"}]
+
+
 @pytest.mark.unit
 class TestSourceCompositionGating:
     """Skip inapplicable tiers based on a namespace's source composition.
@@ -1769,9 +1863,25 @@ class TestSourceCompositionGating:
         parts["strategy_resolve"].assert_awaited()
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("graph_sources_on")
     async def test_explicit_tier_override_bypasses_gating(self):
         """A user tierOverride is intent — gating must not override it. tierOverride=2
-        on a document-only namespace still runs Tier 2 (registry not consulted)."""
+        on a document-only namespace still runs Tier 2. The registry IS read, but only
+        to select strategies by backend; an empty backend set keeps the SQL default."""
+        registry = _registry_with_composition(has_structured_source=False, has_unstructured_source=True)
+        orch, parts = _make_orchestrator(tier2_success=True, sources_registry=registry, return_parts=True)
+        request = InvokeRequest(query="q", namespace="doc-only", options={"tierOverride": 2})
+        response = await orch.resolve(request)
+
+        assert response.result.tier == 2
+        parts["strategy_resolve"].assert_awaited()
+        registry.get_source_composition.assert_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("graph_sources_off")
+    async def test_explicit_tier_override_skips_the_lookup_without_graph_sources(self):
+        """As on main: tierOverride=2 on a document-only namespace still runs Tier 2, and
+        the registry is not consulted (no backend selection to feed)."""
         registry = _registry_with_composition(has_structured_source=False, has_unstructured_source=True)
         orch, parts = _make_orchestrator(tier2_success=True, sources_registry=registry, return_parts=True)
         request = InvokeRequest(query="q", namespace="doc-only", options={"tierOverride": 2})
@@ -1780,6 +1890,31 @@ class TestSourceCompositionGating:
         assert response.result.tier == 2
         parts["strategy_resolve"].assert_awaited()
         registry.get_source_composition.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("graph_sources_off")
+    async def test_graph_only_namespace_skips_tier2_without_graph_sources(self):
+        """Its graph sources answer nothing, so it gates like a namespace with no
+        structured source: no empty Tier-2 pass before Tier 3."""
+        registry = _backend_registry(StructuredBackend.RDF_SPARQL, has_unstructured_source=True)
+        orch, parts = _make_orchestrator(metric_found=True, sources_registry=registry, return_parts=True)
+        spy = _spy_tier(orch)
+        response = await orch.resolve(InvokeRequest(query="q", namespace="ns-graph"))
+
+        assert response.result.tier == 3
+        parts["metric_resolver"].match.assert_not_called()
+        spy.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("graph_sources_off")
+    async def test_mixed_namespace_selects_only_sql_without_graph_sources(self):
+        registry = _backend_registry(StructuredBackend.SQL, StructuredBackend.RDF_SPARQL)
+        orch, parts = _make_orchestrator(sources_registry=registry, return_parts=True)
+        spy = _spy_tier(orch)
+        await orch.resolve(InvokeRequest(query="q", namespace="ns-mixed"))
+
+        parts["metric_resolver"].match.assert_awaited()
+        assert spy.call_args.kwargs["structured_backends"] == {StructuredBackend.SQL}
 
     @pytest.mark.asyncio
     async def test_no_registry_skips_nothing(self):

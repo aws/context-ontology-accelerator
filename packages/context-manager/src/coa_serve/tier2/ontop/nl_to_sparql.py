@@ -20,11 +20,12 @@ import os
 import re
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any
 
 import structlog
+from coa_common.constants import StructuredBackend
 
 from ...clients.base import GraphClient, LLMClient
 from .sparql_validator import SPARQLValidator, ValidationResult
@@ -350,6 +351,20 @@ _SYSTEM_PROMPT = (
     "   - Keep the projection SHAPE fixed: answer the asked question with the\n"
     "     minimal columns. Do not sometimes return pairs/extra columns for a\n"
     "     question about single entities.\n\n"
+    "4. BLANKS, OUT-OF-RANGE PERIODS AND MISSING MEASURES — never invent a value:\n"
+    "   - A blank (unbound) value means not recorded. Never turn it into 0, 'N', 'No', 'None' or\n"
+    "     an empty string with COALESCE or IF. Use OPTIONAL and leave it unbound.\n"
+    "   - A SUM over no matching rows returns 0, which looks like a real total. If a class description\n"
+    "     states a data range, use an aggregate for a period or snapshot only when it lies inside it.\n"
+    "   - If a class description states a data range or snapshot date and the question names a date,\n"
+    "     month, year or snapshot outside it, do not use the nearest one and do not answer 0.\n"
+    "     Return exactly:\n"
+    '     SELECT ?answer WHERE { BIND("NOT_ANSWERABLE_RANGE: <what was asked> is outside the data; '
+    '<class> covers <range>" AS ?answer) }\n'
+    "   - A measure (cost, price, amount, duration) must come from a property of the entity asked\n"
+    "     about. If that class and the classes it joins to have no such property, do not use a\n"
+    "     property of another entity. Return exactly:\n"
+    '     SELECT ?answer WHERE { BIND("NOT_ANSWERABLE_FIELD: no <measure> field for <entity>" AS ?answer) }\n\n'
     "REMEMBER: When comparing categories, ALWAYS use SUM(IF(...)) in ONE flat query. "
     "NEVER use nested subqueries { SELECT ... WHERE { ... } }."
 )
@@ -405,6 +420,17 @@ _CAL_MID_COMPLEXITY = 4
 _CAL_MID_COMPLEXITY_PENALTY = 0.05
 
 
+def _without_properties(tbox: TBoxContext, excluded: frozenset[str]) -> TBoxContext:
+    """``tbox`` without the properties the caller may not read."""
+    if not excluded:
+        return tbox
+    return replace(
+        tbox,
+        properties=[p for p in tbox.properties if p.get("uri") not in excluded],
+        object_properties=[p for p in tbox.object_properties if p.get("uri") not in excluded],
+    )
+
+
 class NLtoSPARQL:
     """Translates natural language queries to SPARQL via LLM.
 
@@ -422,6 +448,8 @@ class NLtoSPARQL:
         few_shot_loader=None,
         *,
         guardrail_id_provider: Callable[[], str] | None = None,
+        backend: StructuredBackend = StructuredBackend.SQL,
+        system_prompt: str = _SYSTEM_PROMPT,
     ):
         """Assemble the T-Box builder, validator, and few-shot loader for translation.
 
@@ -441,6 +469,11 @@ class NLtoSPARQL:
                 full metric definitions.
             few_shot_loader: Optional loader of namespace-scoped few-shot examples;
                 falls back to generic examples when absent.
+            backend: The structured backend whose classes the T-Box is gated to (the
+                second T-Box gate signal). ``SQL`` for Ontop; the native SPARQL
+                translator passes ``RDF_SPARQL``.
+            system_prompt: LLM system prompt. Defaults to the Ontop-constrained one;
+                the native SPARQL translator supplies a full SPARQL 1.1 prompt.
         """
         # pass the Tier-1 MetricResolver to the T-Box builder so metric
         # hits are enriched with full Neptune metric definitions in the prompt.
@@ -454,6 +487,8 @@ class NLtoSPARQL:
         # examples from S3 are injected into the prompt, replacing the generic
         # hardcoded examples. None / no file → generic examples (graceful fallback).
         self._few_shot_loader = few_shot_loader
+        self._backend = backend
+        self._system_prompt = system_prompt
 
     def _effective_guardrail_id(self) -> str | None:
         """Resolve the guardrail id LIVE via the provider when injected.
@@ -475,6 +510,7 @@ class NLtoSPARQL:
         vkg_error_hint: str = "",
         model_id: str | None = None,
         tbox_context: TBoxContext | None = None,
+        exclude_properties: frozenset[str] = frozenset(),
     ) -> TranslationResult:
         """Translate a natural language query to SPARQL.
 
@@ -489,6 +525,8 @@ class NLtoSPARQL:
                 (e.g. on a VKG retry), the ontology is NOT re-fetched from Neptune —
                 only the LLM re-prompt runs. The ontology is unchanged within a single
                 request, so re-assembly is pure waste (~1.3s + Neptune round-trips).
+            exclude_properties: Property IRIs the caller may not read; they are dropped
+                from the T-Box before the LLM sees it.
 
         Returns:
             TranslationResult with SPARQL, confidence, and validation status.
@@ -502,6 +540,7 @@ class NLtoSPARQL:
                     vkg_error_hint=vkg_error_hint,
                     model_id=model_id,
                     tbox_context=tbox_context,
+                    exclude_properties=exclude_properties,
                 ),
                 timeout=self._timeout_s,
             )
@@ -532,6 +571,7 @@ class NLtoSPARQL:
         vkg_error_hint: str = "",
         model_id: str | None = None,
         tbox_context: TBoxContext | None = None,
+        exclude_properties: frozenset[str] = frozenset(),
     ) -> TranslationResult:
         start = time.perf_counter()
         trace_steps: list[dict[str, Any]] = []
@@ -552,7 +592,7 @@ class NLtoSPARQL:
         else:
             tbox, ok = await self._traced_step(
                 PipelineStep.CONTEXT_ASSEMBLY,
-                self._tbox_builder.build(vector_hits, namespace, query=query),
+                self._tbox_builder.build(vector_hits, namespace, query=query, backend=self._backend),
                 trace_steps,
                 start,
             )
@@ -561,6 +601,8 @@ class NLtoSPARQL:
             assert isinstance(tbox, TBoxContext)
 
             trace_steps[-1]["detail"] = f"{len(tbox.classes)} classes, {len(tbox.properties)} properties"
+
+        tbox = _without_properties(tbox, exclude_properties)
 
         # No classes matched — cannot generate meaningful SPARQL
         if not tbox.classes:
@@ -617,7 +659,7 @@ class NLtoSPARQL:
                 PipelineStep.LLM_CALL,
                 self._llm.converse(
                     prompt=user_prompt,
-                    system=_SYSTEM_PROMPT,
+                    system=self._system_prompt,
                     guardrail_id=self._effective_guardrail_id(),
                     guard_content=query,
                     temperature=0,

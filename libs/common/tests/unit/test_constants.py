@@ -749,3 +749,31 @@ class TestValidatorsDoNotEchoInput:
             call(self._PROBE)
         assert self._PROBE not in str(exc.value)
         assert "script" not in str(exc.value)
+
+
+_UUID = "550e8400-e29b-41d4-a716-446655440000"
+
+
+@pytest.mark.parametrize(
+    "check",
+    [
+        lambda: validate_id("abc\n", "metricId"),
+        lambda: validate_source_id("src_1\n"),
+        lambda: validate_namespace_id(_UUID + "\n"),
+        lambda: validate_namespace_name("sales\n"),
+        lambda: validate_s3_prefix("imports/2026\n", "prefix"),
+    ],
+    ids=["id", "source id", "namespace id", "namespace name", "S3 prefix"],
+)
+def test_a_shared_validator_refuses_a_trailing_newline(check) -> None:
+    """``^...$`` with ``match`` lets one trailing newline through; each validator checks the whole value."""
+    with pytest.raises(ValueError):
+        check()
+
+
+def test_the_same_values_without_it_are_accepted() -> None:
+    validate_id("abc", "metricId")
+    validate_source_id("src_1")
+    validate_namespace_id(_UUID)
+    validate_namespace_name("sales")
+    validate_s3_prefix("imports/2026", "prefix")

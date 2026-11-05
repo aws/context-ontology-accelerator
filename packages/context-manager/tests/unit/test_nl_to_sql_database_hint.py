@@ -142,7 +142,6 @@ class TestPromptContext:
             text='```sql\nSELECT group_name FROM crm."group"\n```\nConfidence: 0.9'
         )
         vector = AsyncMock()
-        vector.count_documents.return_value = 2
         vector.search.return_value = [
             VectorHit(
                 id="1",

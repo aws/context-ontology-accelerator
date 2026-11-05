@@ -745,6 +745,35 @@ describe("ServeStack - deep-reasoning budget variables", () => {
     });
   });
 
+  it("defaults the stop signals to off when no context is set", () => {
+    createStack().hasResourceProperties("AWS::BedrockAgentCore::Runtime", {
+      EnvironmentVariables: Match.objectLike({
+        DEEP_REASONING_SUFFICIENCY_MIN_CONFIDENCE: "0",
+        DEEP_REASONING_PROGRESS_SIMILARITY_THRESHOLD: "0",
+        DEEP_REASONING_STABILITY_STEPS: "2",
+        DEEP_REASONING_STOP_TELEMETRY: "false",
+      }),
+    });
+  });
+
+  it("stringifies non-string stop-signal context values", () => {
+    // cdk.json or a programmatic context can hand over a JSON number/boolean;
+    // the runtime env var must still be a string.
+    createStack({
+      deep_reasoning_sufficiency_min_confidence: 0.7,
+      deep_reasoning_progress_similarity_threshold: 0.95,
+      deep_reasoning_stability_steps: 3,
+      deep_reasoning_stop_telemetry: true,
+    }).hasResourceProperties("AWS::BedrockAgentCore::Runtime", {
+      EnvironmentVariables: Match.objectLike({
+        DEEP_REASONING_SUFFICIENCY_MIN_CONFIDENCE: "0.7",
+        DEEP_REASONING_PROGRESS_SIMILARITY_THRESHOLD: "0.95",
+        DEEP_REASONING_STABILITY_STEPS: "3",
+        DEEP_REASONING_STOP_TELEMETRY: "true",
+      }),
+    });
+  });
+
   it("sets no pre-rename AGENTIC_* budget variables", () => {
     // Both spellings present would be ambiguous: config.py prefers the new name,
     // so a stale AGENTIC_* would look effective while being ignored.
@@ -769,11 +798,19 @@ describe("ServeStack - deep-reasoning budget variables", () => {
       deep_reasoning_time_budget_s: "150",
       deep_reasoning_per_tool_timeout_s: "60",
       deep_reasoning_synthesis_reserve_s: "30",
+      deep_reasoning_sufficiency_min_confidence: "0.7",
+      deep_reasoning_progress_similarity_threshold: "0.95",
+      deep_reasoning_stability_steps: "3",
+      deep_reasoning_stop_telemetry: "true",
     }).hasResourceProperties("AWS::BedrockAgentCore::Runtime", {
       EnvironmentVariables: Match.objectLike({
         DEEP_REASONING_TIME_BUDGET_S: "150",
         DEEP_REASONING_PER_TOOL_TIMEOUT_S: "60",
         DEEP_REASONING_SYNTHESIS_RESERVE_S: "30",
+        DEEP_REASONING_SUFFICIENCY_MIN_CONFIDENCE: "0.7",
+        DEEP_REASONING_PROGRESS_SIMILARITY_THRESHOLD: "0.95",
+        DEEP_REASONING_STABILITY_STEPS: "3",
+        DEEP_REASONING_STOP_TELEMETRY: "true",
       }),
     });
   });
@@ -901,6 +938,9 @@ describe("ServeStack - SERVE_VKG_TRANSLATION_TIMEOUT_S wiring", () => {
     // The load-bearing case: a numeric 0 in cdk.json context is falsy in JS, so a
     // truthiness check would drop it. serve-stack uses `!== undefined`, so it must
     // survive as "0" and be clamped downstream rather than silently ignored.
+    expect(
+      envOf(createStack({ serve_vkg_translation_timeout_s: 0 })),
+    ).toMatchObject({ SERVE_VKG_TRANSLATION_TIMEOUT_S: "0" });
     expect(
       envOf(createStack({ serve_vkg_translation_timeout_s: 0 })),
     ).toMatchObject({ SERVE_VKG_TRANSLATION_TIMEOUT_S: "0" });
@@ -1055,5 +1095,99 @@ describe("ServeStack with a long resource_prefix", () => {
 describe("ServeStack - AOSS data access", () => {
   it("names every aoss:APIAccessAll role in an AOSS data-access policy", () => {
     expectAossGrantsCoveredByDataPolicies(createStack());
+  });
+});
+
+describe("ServeStack - RDF_SPARQL graph sources", () => {
+  const GRAPH_ON = { graph_sources: "on" };
+  const runtimeEnv = (template: Template): Record<string, unknown> => {
+    const runtimes = Object.values(
+      template.findResources("AWS::BedrockAgentCore::Runtime"),
+    ) as any[];
+    expect(runtimes).toHaveLength(1);
+    return runtimes[0].Properties.EnvironmentVariables ?? {};
+  };
+  const neptuneStatements = (template: Template) =>
+    Object.values(template.findResources("AWS::IAM::Policy"))
+      .flatMap((p: any) => p.Properties.PolicyDocument.Statement)
+      .filter((s: any) => JSON.stringify(s.Action).includes("neptune-db:"));
+  const peer8182Egress = (template: Template, cidr: string) =>
+    Object.values(template.findResources("AWS::EC2::SecurityGroup"))
+      .flatMap((sg: any) => sg.Properties.SecurityGroupEgress ?? [])
+      .filter((e: any) => e.FromPort === 8182 && e.CidrIp === cidr);
+  const PEER = {
+    jdbc_peer_vpc_id: "vpc-peer123",
+    jdbc_peer_cidrs: "10.20.0.0/16",
+  };
+
+  describe("off (the default): main's template", () => {
+    it("sets no graph-sources env var", () => {
+      const env = runtimeEnv(createStack());
+      expect(env).not.toHaveProperty("GRAPH_SOURCES_ENABLED");
+      expect(env).not.toHaveProperty("SERVE_SPARQL_STRATEGY");
+    });
+
+    it("grants only the platform ontology read, without a sid", () => {
+      const statements = neptuneStatements(createStack());
+      expect(statements).toEqual([
+        {
+          Action: "neptune-db:ReadDataViaQuery",
+          Effect: "Allow",
+          Resource:
+            "arn:aws:neptune-db:us-east-1:123456789012:cluster:test-cluster/*",
+        },
+      ]);
+    });
+
+    it("adds no SPARQL egress to a peer network", () => {
+      expect(peer8182Egress(createStack(PEER), "10.20.0.0/16")).toHaveLength(0);
+    });
+  });
+
+  it("turns graph sources on in the runtime when the switch is on", () => {
+    const env = runtimeEnv(createStack(GRAPH_ON));
+    expect(env.GRAPH_SOURCES_ENABLED).toBe("true");
+    expect(env).not.toHaveProperty("SERVE_SPARQL_STRATEGY");
+  });
+
+  it("no longer reads the retired serve_sparql_strategy context", () => {
+    const env = runtimeEnv(createStack({ serve_sparql_strategy: "true" }));
+    expect(env).not.toHaveProperty("SERVE_SPARQL_STRATEGY");
+    expect(env).not.toHaveProperty("GRAPH_SOURCES_ENABLED");
+  });
+
+  it("splits Neptune reads into the ontology cluster and same-account source clusters", () => {
+    const statements = neptuneStatements(createStack(GRAPH_ON));
+    const bySid = Object.fromEntries(statements.map((s: any) => [s.Sid, s]));
+    expect(bySid.ServeNeptuneOntologyRead.Resource).toBe(
+      "arn:aws:neptune-db:us-east-1:123456789012:cluster:test-cluster/*",
+    );
+    const sourceResource = JSON.stringify(
+      bySid.ServeNeptuneSourceDataRead.Resource,
+    );
+    // Same region only: the source contract refuses any other region.
+    expect(sourceResource).toContain("neptune-db:us-east-1:123456789012:*/*");
+    expect(sourceResource).not.toContain("neptune-db:*:");
+    for (const s of statements) {
+      expect(s.Action).toBe("neptune-db:ReadDataViaQuery");
+      expect(s.Resource).not.toBe("*");
+    }
+  });
+
+  it("adds SPARQL egress to each peer network", () => {
+    const template = createStack({
+      ...GRAPH_ON,
+      ...PEER,
+    });
+    template.hasResourceProperties("AWS::EC2::SecurityGroup", {
+      SecurityGroupEgress: Match.arrayWith([
+        Match.objectLike({
+          IpProtocol: "tcp",
+          FromPort: 8182,
+          ToPort: 8182,
+          CidrIp: "10.20.0.0/16",
+        }),
+      ]),
+    });
   });
 });

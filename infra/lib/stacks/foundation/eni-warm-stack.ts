@@ -13,6 +13,8 @@ export interface EniWarmStackProps extends cdk.StackProps {
   readonly discoveryOcspSecurityGroup: ec2.ISecurityGroup;
   readonly ecsSecurityGroup: ec2.ISecurityGroup;
   readonly authorizerSecurityGroup: ec2.ISecurityGroup;
+  /** Set only when graph sources are on (NetworkStack creates it then). */
+  readonly sparqlSourceEgressSecurityGroup?: ec2.ISecurityGroup;
 }
 
 /**
@@ -39,6 +41,13 @@ export class EniWarmStack extends SCLStack {
       // vkg's reload Lambda runs on the ECS SG.
       Ecs: [props.ecsSecurityGroup],
       Authorizer: [props.authorizerSecurityGroup],
+      // graph-verify (SourcesStack).
+      ...(props.sparqlSourceEgressSecurityGroup && {
+        LambdaSparql: [
+          props.lambdaSecurityGroup,
+          props.sparqlSourceEgressSecurityGroup,
+        ],
+      }),
     };
 
     for (const [name, securityGroups] of Object.entries(combos)) {

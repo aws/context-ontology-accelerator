@@ -8,6 +8,8 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from coa_common.constants import StructuredBackend
+from coa_serve.clients.base import VectorClient
 from coa_serve.clients.base import VectorHit as BaseVectorHit
 from coa_serve.exceptions import AccessDeniedError
 from coa_serve.tier2.ontop.strategy import OntopStrategy, _is_retryable_vkg_error
@@ -118,7 +120,8 @@ class TestOntopStrategyResolve:
 
     @pytest.fixture
     def vector_client(self):
-        return AsyncMock()
+        # spec: a re-added count_documents probe fails loudly, not via a TypeError.
+        return AsyncMock(spec=VectorClient)
 
     @pytest.fixture
     def strategy(self, nl_to_sparql, vkg_translator, vector_client):
@@ -412,7 +415,8 @@ class TestOntopStrategyVectorHits:
 
     @pytest.fixture
     def vector_client(self):
-        return AsyncMock()
+        # spec: a re-added count_documents probe fails loudly, not via a TypeError.
+        return AsyncMock(spec=VectorClient)
 
     @pytest.mark.asyncio
     async def test_vector_hits_returned_and_filtered(self, nl_to_sparql, vkg_translator, vector_client):
@@ -428,7 +432,6 @@ class TestOntopStrategyVectorHits:
         class_hit = BaseVectorHit(
             id="1", text="ClassA", score=0.9, metadata={"entity_type": "class", "entity_uri": "uri:A"}
         )
-        vector_client.count_documents.return_value = 5  # namespace has mapped classes
         vector_client.search.side_effect = [
             [class_hit],
             [
@@ -475,10 +478,9 @@ class TestOntopStrategyVectorHits:
         )
 
     @pytest.mark.asyncio
-    async def test_class_search_is_gated_on_mapped_when_mapped_classes_exist(
-        self, nl_to_sparql, vkg_translator, vector_client
-    ):
-        vector_client.count_documents.return_value = 3
+    async def test_class_search_is_always_mapped_gated(self, nl_to_sparql, vkg_translator, vector_client):
+        """#1448: even when the gated class search finds nothing (a namespace with no
+        mapped class), there is no unfiltered class retry and no mapped-count probe."""
         vector_client.search.return_value = []
         nl_to_sparql.translate.return_value = _make_sparql_result(valid=False)
 
@@ -486,16 +488,13 @@ class TestOntopStrategyVectorHits:
             "query", "ns1", _make_context(embedding=[0.1] * 10)
         )
 
-        class_call = next(c for c in vector_client.search.call_args_list if c.kwargs.get("entity_type") == "class")
-        assert class_call.kwargs["require_mapped"] is True
+        class_calls = [c for c in vector_client.search.call_args_list if c.kwargs.get("entity_type") == "class"]
+        assert class_calls and all(c.kwargs["require_mapped"] is True for c in class_calls)
+        assert not hasattr(vector_client, "count_documents")  # spec=VectorClient: no probe exists
 
     @pytest.mark.asyncio
-    async def test_gate_is_dropped_for_a_namespace_with_no_mapped_classes(
-        self, nl_to_sparql, vkg_translator, vector_client
-    ):
-        """Legacy bridge: gating a namespace ingested before data_source_id existed
-        would hide every class and take Tier-2 dark."""
-        vector_client.count_documents.return_value = 0
+    async def test_class_search_excludes_graph_classes(self, nl_to_sparql, vkg_translator, vector_client):
+        """Graph (RDF_SPARQL) classes are answered by the SPARQL strategy, never by Ontop."""
         vector_client.search.return_value = []
         nl_to_sparql.translate.return_value = _make_sparql_result(valid=False)
 
@@ -503,8 +502,8 @@ class TestOntopStrategyVectorHits:
             "query", "ns1", _make_context(embedding=[0.1] * 10)
         )
 
-        class_call = next(c for c in vector_client.search.call_args_list if c.kwargs.get("entity_type") == "class")
-        assert class_call.kwargs["require_mapped"] is False
+        class_calls = [c for c in vector_client.search.call_args_list if c.kwargs.get("entity_type") == "class"]
+        assert class_calls and all(c.kwargs.get("query_backend") is StructuredBackend.SQL for c in class_calls)
 
     @pytest.mark.asyncio
     async def test_unmapped_classes_from_the_unfiltered_pass_are_excluded(
@@ -512,7 +511,6 @@ class TestOntopStrategyVectorHits:
     ):
         """The second (unfiltered) search exists for properties/metrics only — its
         classes must not slip past the gate."""
-        vector_client.count_documents.return_value = 2
         vector_client.search.side_effect = [
             [
                 BaseVectorHit(
@@ -545,7 +543,6 @@ class TestOntopStrategyVectorHits:
     @pytest.mark.asyncio
     async def test_properties_and_metrics_are_not_mapped_gated(self, nl_to_sparql, vkg_translator, vector_client):
         """Only classes carry the data_source_id stamp the gate reads."""
-        vector_client.count_documents.return_value = 4
         vector_client.search.return_value = []
         nl_to_sparql.translate.return_value = _make_sparql_result(valid=False)
 

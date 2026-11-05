@@ -119,11 +119,19 @@ export const MetricDetail: React.FC = () => {
               </SpaceBetween>
             }
           >
-            {metric.name}
+            {metric.label || metric.name}
           </Header>
         }
       >
         <ColumnLayout columns={3} variant="text-grid">
+          <div>
+            <Box variant="awsui-key-label">{t("Name")}</Box>
+            <div>{metric.name}</div>
+          </div>
+          <div>
+            <Box variant="awsui-key-label">{t("Display label")}</Box>
+            <div>{metric.label || "—"}</div>
+          </div>
           <div>
             <Box variant="awsui-key-label">{t("Description")}</Box>
             <div>{metric.description}</div>

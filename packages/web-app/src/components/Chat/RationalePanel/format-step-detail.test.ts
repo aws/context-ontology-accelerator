@@ -9,6 +9,19 @@ const jaTranslate: AppTranslate = (message, values) =>
   formatAppMessage("ja", message, values);
 
 describe("formatStepDetail", () => {
+  it("explains a Tier 2 statement refused for a privacy-masked value", () => {
+    const detail = {
+      reason: "guardrail_masked_literal",
+      message: "The question contained a value the privacy filter masked.",
+    };
+    expect(formatStepDetail("t2.sql.failed", detail)).toBe(
+      "A value in the question was masked by the privacy filter, so the SQL was not run.",
+    );
+    expect(formatStepDetail("t2.sql.failed", detail, jaTranslate)).toBe(
+      "質問内の値がプライバシーフィルターでマスクされたため、SQL を実行しませんでした。",
+    );
+  });
+
   it("formats application-owned trace details in Japanese", () => {
     expect(
       formatStepDetail(
@@ -513,6 +526,97 @@ describe("formatStepDetail", () => {
         bar: true,
       });
       expect(result).toBe("Checked metric catalog.");
+    });
+  });
+
+  describe("native SPARQL (t2.sparql.*) steps", () => {
+    it("explains a firewall rejection by rule", () => {
+      expect(
+        formatStepDetail("t2.sparql.firewall", {
+          strategy: "nl_to_sparql",
+          reason: "sparql_firewall_rejected",
+          rule: "F1_read_only",
+        }),
+      ).toBe("Blocked — only read-only queries are allowed");
+    });
+
+    it("reports the row cap of a passed firewall check", () => {
+      expect(
+        formatStepDetail("t2.sparql.firewall", { form: "SELECT", limit: 100 }),
+      ).toBe("Passed; capped at 100 rows.");
+    });
+
+    it("reports rows and source of a graph query", () => {
+      expect(
+        formatStepDetail("t2.sparql.execute", {
+          rowCount: 3,
+          dataSourceId: "src-g1",
+        }),
+      ).toBe("Returned 3 row(s) from source src-g1.");
+    });
+
+    it("reports rows of a graph query without a source", () => {
+      expect(formatStepDetail("t2.sparql.execute", { rowCount: 0 })).toBe(
+        "Returned 0 row(s).",
+      );
+    });
+
+    it("falls back when a graph query reports no row count", () => {
+      expect(
+        formatStepDetail("t2.sparql.execute", { dataSourceId: "src-g1" }),
+      ).toBe("Graph query executed.");
+    });
+
+    it("passes a firewall check without a row cap", () => {
+      expect(formatStepDetail("t2.sparql.firewall", { form: "SELECT" })).toBe(
+        "Passed.",
+      );
+    });
+
+    it("translates the native SPARQL firewall and execute details", () => {
+      expect(
+        formatStepDetail(
+          "t2.sparql.firewall",
+          { form: "SELECT", limit: 100 },
+          jaTranslate,
+        ),
+      ).toBe("通過しました。上限は 100 行です。");
+      expect(
+        formatStepDetail(
+          "t2.sparql.execute",
+          { rowCount: 3, dataSourceId: "src-g1" },
+          jaTranslate,
+        ),
+      ).toBe("ソース src-g1 から 3 行を返しました。");
+      expect(
+        formatStepDetail("t2.sparql.execute", { rowCount: 3 }, jaTranslate),
+      ).toBe("3 行を返しました。");
+    });
+
+    it("humanizes a graph query failure", () => {
+      expect(
+        formatStepDetail("t2.sparql.execute", {
+          reason: "sparql_strategy_exec_failed",
+          error: "TimeoutError",
+        }),
+      ).toBe("Graph query failed — the request timed out");
+    });
+
+    it("explains a misconfigured graph namespace", () => {
+      expect(
+        formatStepDetail("t2.sparql.failed", {
+          strategy: "nl_to_sparql",
+          reason: "sparql_strategy_misconfigured",
+        }),
+      ).toBe(
+        "Abandoned — no imported ontology links a class to this namespace's graph source.",
+      );
+    });
+
+    it("names the graph strategy when it is selected", () => {
+      expect(
+        formatStepDetail("t2.strategy_selected", { strategy: "nl_to_sparql" }),
+      ).toBe("Chose NL→SPARQL (graph).");
     });
   });
 });

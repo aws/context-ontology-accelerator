@@ -40,6 +40,7 @@ _TAG = re.compile(r"([A-Za-z]{2,8})(?:-([A-Za-z]{4}))?(?:-([A-Za-z]{2}|[0-9]{3})
 # tag whose primary subtag is absent is named by its canonical tag alone.
 _LANGUAGE_NAMES: dict[str, str] = {
     "de": "German",
+    "en": "English",
     "es": "Spanish",
     "fr": "French",
     "it": "Italian",

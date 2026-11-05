@@ -182,6 +182,29 @@ def tables_visible_to(tables: list[str] | None, profile: dict[str, Any] | None) 
     return [t for t in names if (bare := _bare_table_name(t)) and _name_allowed(t, bare, allowlist)]
 
 
+def column_denylist_for(name: str, profile: dict[str, Any] | None) -> frozenset[str] | None:
+    """The names the grant's ``columnDenylist`` denies on the table (or graph source) ``name``.
+
+    Entries are matched like ``tableAllowlist`` entries (case-insensitive, by bare name);
+    the denied names are returned as written. An empty set means no restriction; ``None``
+    means the denylist is malformed (callers fail closed).
+    """
+    raw = (profile or {}).get(_COLUMN_DENYLIST_KEY)
+    if raw is None:
+        return frozenset()
+    if not isinstance(raw, dict):
+        return None
+    bare = _bare_table_name(name)
+    denied: set[str] = set()
+    for table, columns in raw.items():
+        if not _name_allowed(str(table), _bare_table_name(str(table)), {bare}):
+            continue
+        if not isinstance(columns, (list, tuple)):
+            return None
+        denied.update(str(c) for c in columns)
+    return frozenset(denied)
+
+
 def _name_allowed(name: str, bare: str, allowlist: set[str]) -> bool:
     """A listed table name passes a bare entry for its table, or a ``database.table`` entry naming it."""
     if bare in allowlist:

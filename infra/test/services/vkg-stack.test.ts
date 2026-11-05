@@ -7,6 +7,7 @@ import { Template, Match } from "aws-cdk-lib/assertions";
 import { VkgStack } from "../../lib/stacks/services/vkg-stack";
 import { NetworkStack } from "../../lib/stacks/foundation/network-stack";
 import { DEFAULT_RESOURCE_PREFIX, DEFAULT_ENV } from "../../lib/constants";
+import { expectEveryTaskCanPullGuardDutyAgent } from "../utils/guardduty-agent-assertions";
 
 const TEST_CONTEXT = {
   resource_prefix: DEFAULT_RESOURCE_PREFIX,
@@ -74,6 +75,10 @@ describe("VkgStack", () => {
         ontologyBucket,
       }),
     );
+  });
+
+  test("lets the task execution role pull the GuardDuty Fargate agent", () => {
+    expectEveryTaskCanPullGuardDutyAgent(template, 1, "${AWS::Region}");
   });
 
   // ── ECS Cluster ──────────────────────────────────────────────────

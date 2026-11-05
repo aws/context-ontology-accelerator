@@ -18,6 +18,10 @@ ENV="${1:-dev}"
 PREFIX="${SCL_PREFIX:-coa}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
+# The connector builds with Maven once the platform stacks exist, up to ~30 minutes in, so
+# check Maven before starting. deploy.sh's preflight doesn't: a platform-only deploy never runs it.
+"$SCRIPT_DIR/check-maven.sh" || exit 1
+
 # Resolve the region the way the CDK/AWS CLI does (AWS_REGION wins) and pin it for
 # both child scripts, so the stack checks, the platform deploy and the connector
 # all target the same region.

@@ -26,7 +26,7 @@ from coa_common.bedrock_metrics import (
     emit_induction_heartbeat_metrics,
     emit_induction_job_metrics,
 )
-from coa_common.constants import DATABASE_SUB_TYPES, validate_ontology_uri_prefix
+from coa_common.constants import DATABASE_SUB_TYPES, GRAPH_BACKED_SUB_TYPES, validate_ontology_uri_prefix
 from coa_common.language_tags import DEFAULT_LANGUAGE
 from coa_control_plane_server.models.induction_job_status import InductionJobStatus
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -34,6 +34,7 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 from coa_ontology import dynamo_store
 from coa_ontology.datasource_ids import bare_datasource_id, is_valid_datasource_id
+from coa_ontology.inducer.bridge.planner import BridgeOptions
 from coa_ontology.inducer.services.generated_text import render
 from coa_ontology.inducer.strategies import get_strategy
 from coa_ontology.inducer.strategies.rigor_ontology import rigor_supports_language
@@ -225,11 +226,13 @@ class WorkbenchInductionRequest(BaseModel):
     # callers working.
     model_config = ConfigDict(populate_by_name=True)
 
-    datasource_ids: list[str] = []
-    ontology_uri_prefix: str
+    datasource_ids: list[str] = Field(default=[], validation_alias=AliasChoices("datasource_ids", "datasourceIds"))
+    ontology_uri_prefix: str = Field(validation_alias=AliasChoices("ontology_uri_prefix", "ontologyUriPrefix"))
     label: str | None = None
     embedding_backend: str | None = None
-    confidence_threshold: float = 0.80
+    confidence_threshold: float = Field(
+        default=0.80, validation_alias=AliasChoices("confidence_threshold", "confidenceThreshold")
+    )
     # Output-token cap for the ENHANCED-mode LLM grounding rerank. Default 1000
     # (well above the short JSON answer, giving reasoning models headroom so
     # their thinking doesn't truncate the JSON → fail-loud). Per-request so it's
@@ -243,7 +246,13 @@ class WorkbenchInductionRequest(BaseModel):
     )
     scoring_strategy: str = "lexical"
     structural_weight: float = 0.05
-    strategy: str = "table_to_ontology"  # "table_to_ontology" | "rigor_ontology" | "unstructured_lexical_graph"
+    # "table_to_ontology" | "rigor_ontology" | "unstructured_lexical_graph" | "bridge_to_tables"
+    strategy: str = "table_to_ontology"
+    # Options for the ``bridge_to_tables`` strategy, which runs the document-to-table
+    # bridge on the namespace's already-accepted ontology (``ontology_uri_prefix``).
+    bridge_options: BridgeOptions | None = Field(
+        default=None, validation_alias=AliasChoices("bridge_options", "bridgeOptions")
+    )
     grounding_mode: str = Field(
         default="ENHANCED", validation_alias=AliasChoices("grounding_mode", "groundingMode")
     )  # "NONE" | "STANDARD" | "ENHANCED"
@@ -1216,7 +1225,9 @@ def start_induction(body: WorkbenchInductionRequest, request: Request, namespace
     Raises:
         HTTPException: 400 if a table-based strategy gets no ``datasource_ids``,
             404 if the namespace does not exist, 400 if the strategy
-            is ``rigor_ontology`` and the namespace language is not English, 422
+            is ``rigor_ontology`` and the namespace language is not English or
+            ``bridge_options`` is set on a strategy other than
+            ``bridge_to_tables``, 422
             if the requested lexical source is unsupported or the Neptune
             endpoint is unconfigured for an unstructured run, or 409 if another
             induction/proposal is in flight.
@@ -1225,8 +1236,9 @@ def start_induction(body: WorkbenchInductionRequest, request: Request, namespace
     # so an empty list can only fail in the worker ("No tables found in
     # datasources: []") after a 202. Reject it up front. The unstructured
     # strategy reads the lexical graph and records the list as metadata only,
-    # so it keeps accepting an empty one.
-    if body.strategy != _UNSTRUCTURED_STRATEGY and not body.datasource_ids:
+    # so it keeps accepting an empty one, as does the bridge, which runs on the
+    # accepted ontology and reads no data source list.
+    if body.strategy not in (_UNSTRUCTURED_STRATEGY, "bridge_to_tables") and not body.datasource_ids:
         raise HTTPException(400, "datasource_ids must list at least one data source for a table-based strategy")
     # Resolve the immutable namespace language once, before any job state is
     # written, and hand it to whichever pipeline runs.
@@ -1238,6 +1250,25 @@ def start_induction(body: WorkbenchInductionRequest, request: Request, namespace
                 f"The rigor_ontology strategy supports only English namespaces; this namespace's language is "
                 f"{namespace_language}. Use table_to_ontology."
             ),
+        )
+
+    # Any other strategy would silently ignore the bridge options.
+    if body.bridge_options is not None and body.strategy != "bridge_to_tables":
+        raise HTTPException(400, "bridge_options applies only to strategy 'bridge_to_tables'")
+
+    # Bridge run over the accepted ontology: a polled job that ends in a pending proposal.
+    if body.strategy == "bridge_to_tables":
+        from coa_ontology.inducer.bridge.service import start_bridge_job
+
+        job_id = start_bridge_job(
+            namespace,
+            body.ontology_uri_prefix,
+            body.bridge_options or BridgeOptions(),
+            request.app.state.config,
+            namespace_language=namespace_language,
+        )
+        return _schemas_mod.JobResponse(
+            job_id=job_id, status=_schemas_mod.JobStatus.PENDING, created_at=datetime.now(UTC)
         )
 
     # Dispatch to unstructured pipeline if strategy is unstructured_lexical_graph
@@ -1774,7 +1805,8 @@ def list_datasources(request: Request, namespace: str):
     from — the filter is ``coa_common.constants.DATABASE_SUB_TYPES``, derived from the
     mirror of the Smithy enum rather than re-listed here. A sub-type missing from it fails
     CLOSED: its source simply never appears in the workbench's datasource list, with no
-    error raised anywhere.
+    error raised anywhere. Graph (``GRAPH_BACKED_SUB_TYPES``) sources are excluded: they
+    have no tables, and their classes come from an imported ontology, not induction.
 
     Uses the new sources table key schema: PK=NS#{namespaceId}, SK=SRC#{sourceId}.
     """
@@ -1810,6 +1842,8 @@ def list_datasources(request: Request, namespace: str):
 
         # Only include DATABASE sources — documents don't have structured table metadata
         if source_type != "DATABASE" or source_sub_type not in DATABASE_SUB_TYPES:
+            continue
+        if source_sub_type in GRAPH_BACKED_SUB_TYPES:
             continue
 
         result.append(
@@ -1859,6 +1893,10 @@ def list_induced_datasources(
     proposals = dynamo_store.list_proposals(namespace=namespace, status="accepted", limit=None)
     ds_set: dict[str, dict] = {}
     for p in proposals:
+        # A bridge proposal names the data sources of the tables it touched, but it
+        # induced none of them: the source belongs to its table induction's row.
+        if p.get("proposal_type") == "bridge":
+            continue
         meta = p.get("metadata") or {}
         ids = meta.get("datasource_ids") or []
         label = meta.get("label", "")

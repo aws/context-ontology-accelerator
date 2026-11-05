@@ -46,14 +46,17 @@ from typing import Any
 import defusedxml
 import rdflib.plugins.parsers.rdfxml as _rdfxml_parser
 from coa_common import DEFAULT_EMBED_MODEL_ID
-from coa_common.constants import VOCAB_URI
+from coa_common.constants import IMPORT_VOCAB_URI, VOCAB_URI, StructuredBackend
+from coa_common.sparql_config import graph_sources_enabled
 from defusedxml.expatreader import DefusedExpatParser
 from rdflib import OWL, RDF, RDFS, Graph, Namespace, URIRef
 from rdflib.collection import Collection
 from rdflib.namespace import SKOS
 
 from coa_ontology import dynamo_store
+from coa_ontology.catalog.graph_source_resolver import GraphSourceLookupError, resolve_graph_sources
 from coa_ontology.stores.base import GraphStore, VectorStore
+from coa_ontology.validation.schemas import Severity, ValidationFinding, ValidationTier
 
 # ── Security: XXE protection (CWE-611/CWE-502, Issue #572) ──────────────────
 # Patch Python's stdlib XML parsers (xml.sax, xml.etree, xml.dom, minidom) at
@@ -142,6 +145,23 @@ TAG = _COA.tag
 # of the embedding and the prompt. Matches the Ontop context's per-term cap
 # (_MAX_TERMS_IN_PROMPT in the serve T-Box builder), so both paths show the same.
 _MAX_TERMS_PER_HINT = 5
+# Per-column caps on the column description in the class text. A Glue column
+# comment allows 255 characters, and a 100-character cut dropped the deciding
+# clause of long steward notes. The SQL writer's text (rich=True) keeps all 255.
+# The embedded text (rich=False) stays at 100: the embedding input is cut at
+# 8000 characters, and longer notes would push a wide table's last columns out of
+# the vector. The T-Box builder in the serve runtime has its own constant
+# (_MAX_PROPERTY_DESCRIPTION_CHARS), kept equal to _MAX_COLUMN_COMMENT_CHARS on
+# purpose; the two are separate constants and are not linked. Neither is a
+# setting. The 255 cap applies only to ontologies accepted after upgrade.
+_MAX_COLUMN_COMMENT_CHARS = 255
+_MAX_COLUMN_COMMENT_EMBED_CHARS = 100
+# Marks a subject whose description the document-to-table bridge wrote. Its
+# comment is the definition a SQL author needs, so the stored context text keeps
+# it whole instead of cutting it at _MAX_COLUMN_COMMENT_CHARS (the embedded text
+# still applies _MAX_COLUMN_COMMENT_EMBED_CHARS), on every re-embedding,
+# whichever path runs it.
+DEFINITION_SOURCE = _COA.definitionSource
 _SUPERSEDED_ANNOTATION_PREDICATES: dict[URIRef, URIRef] = {
     RDFS.comment: SUPERSEDED_COMMENT,
     SKOS.definition: SUPERSEDED_DEFINITION,
@@ -508,6 +528,239 @@ def _physical_names_from_r2rml(r2rml_content: bytes | str | None) -> tuple[dict[
     return class_tables, prop_columns
 
 
+# ── Graph (RDF_SPARQL) binding channel ──────────────────────────────────────
+# The graph twin of the R2RML channel above. A graph source has no R2RML, so a
+# graph-backed class instead names its registered source with one author
+# directive, ``coa_import:dataSourceName``. Import resolves the name and emits the
+# server-only ``coa:isMapped`` / ``coa:queryBackend`` / ``coa:dataSourceId`` markers
+# from the source record. The directive lives in its own namespace so it survives
+# the ``coa:`` anti-forgery strip (it is an input, not a trusted output); it is
+# removed before the bulk load so it never reaches the queryable graph.
+_DATA_SOURCE_NAME = URIRef(f"{IMPORT_VOCAB_URI}dataSourceName")
+_GRAPH_BINDING_VALIDATOR = "graph_source_binding"
+_GRAPH_SOURCES_DISABLED_MESSAGE = (
+    "This ontology binds a class to a graph source (coa_import:dataSourceName), but graph sources "
+    "are turned off in this deployment. Remove the coa_import:dataSourceName statements, or redeploy "
+    "with -c graph_sources=on (SCL_GRAPH_SOURCES=on make deploy-dev)."
+)
+
+
+def _graph_binding_finding(code: str, message: str, subject: str, source_name: str | None) -> ValidationFinding:
+    return ValidationFinding(
+        validator=_GRAPH_BINDING_VALIDATOR,
+        tier=ValidationTier.tier1_blocking,
+        severity=Severity.error,
+        code=code,
+        message=message,
+        subject=subject,
+        details={"dataSourceName": source_name} if source_name is not None else None,
+    )
+
+
+def _graph_class_markers(source_id: str | None) -> dict[str, str]:
+    """``store_class`` kwargs for a graph-bound class; empty for every other class."""
+    if source_id is None:
+        return {}
+    return {"query_backend": StructuredBackend.RDF_SPARQL.value, "data_source_id": source_id}
+
+
+def _graph_binding_problem(
+    subject_uri: str, values: list[str], is_class: bool, class_to_datasource: dict[str, str]
+) -> ValidationFinding | None:
+    """The finding for one ``coa_import:dataSourceName`` subject, or None when it binds exactly one name."""
+    if not is_class:
+        return _graph_binding_finding(
+            "graph_source_marker_not_on_class",
+            f"coa_import:dataSourceName is only valid on a named owl:Class; {subject_uri} is not one",
+            subject_uri,
+            values[0] if values else None,
+        )
+    if len(values) > 1:
+        return _graph_binding_finding(
+            "graph_source_multiple_names",
+            f"Class {subject_uri} names {len(values)} data sources; a class is backed by exactly one",
+            subject_uri,
+            ", ".join(sorted(values)),
+        )
+    if not values[0]:
+        return _graph_binding_finding(
+            "graph_source_name_empty",
+            f"Class {subject_uri} has an empty coa_import:dataSourceName",
+            subject_uri,
+            values[0],
+        )
+    if subject_uri in class_to_datasource:
+        return _graph_binding_finding(
+            "graph_source_conflicts_r2rml",
+            f"Class {subject_uri} is mapped by R2RML and also names a graph source; "
+            "a class is answered by exactly one backend",
+            subject_uri,
+            values[0],
+        )
+    return None
+
+
+def _graph_resolution_findings(names_by_class: dict[str, str], resolved: dict) -> list[ValidationFinding]:
+    """One finding per class whose source name did not resolve to exactly one registered graph source."""
+    return [
+        _graph_binding_finding(
+            resolved[name].failure.value, f"Class {class_uri}: {resolved[name].message}", class_uri, name
+        )
+        for class_uri, name in sorted(names_by_class.items())
+        if resolved[name].failure is not None
+    ]
+
+
+def _class_graphsource_map_from_payload(
+    g: Graph,
+    classes: set,
+    namespace: str,
+    class_to_datasource: dict[str, str],
+) -> dict[str, str]:
+    """Map each graph-backed class URI → its resolved ``RDF_SPARQL`` source id.
+
+    Every problem is collected before failing, so one rejected import reports all of
+    its bad bindings: a directive on something that is not a named class, several
+    names on one class, an empty name, a class that is also the ``rr:class`` of an
+    R2RML TriplesMap (a class is answered by exactly one backend), and every name
+    that does not resolve to exactly one registered graph source in ``namespace``.
+    Any of these rejects the whole import — a graph class is never half-bound.
+    With the deploy-time ``graph_sources`` switch off, any directive rejects it.
+
+    Raises:
+        IngestValidationError: one class-attributed finding per problem (→ 422).
+        IngestStoreError: the sources table could not be read (→ 502).
+    """
+    subjects = set(g.subjects(_DATA_SOURCE_NAME, None))
+    if subjects and not graph_sources_enabled():
+        finding = _graph_binding_finding(
+            "graph_sources_disabled", _GRAPH_SOURCES_DISABLED_MESSAGE, min(map(str, subjects)), None
+        )
+        raise IngestValidationError(_GRAPH_SOURCES_DISABLED_MESSAGE, findings=[finding])
+
+    findings: list[ValidationFinding] = []
+    names_by_class: dict[str, str] = {}
+    for subject in subjects:
+        values = [str(o).strip() for o in g.objects(subject, _DATA_SOURCE_NAME)]
+        problem = _graph_binding_problem(str(subject), values, subject in classes, class_to_datasource)
+        if problem is not None:
+            findings.append(problem)
+        else:
+            names_by_class[str(subject)] = values[0]
+
+    if names_by_class:
+        try:
+            resolved = resolve_graph_sources(names_by_class.values(), namespace)
+        except GraphSourceLookupError as e:
+            raise IngestStoreError(f"graph source lookup failed: {e}") from e
+        findings.extend(_graph_resolution_findings(names_by_class, resolved))
+
+    if findings:
+        raise IngestValidationError(
+            f"{len(findings)} graph source binding(s) are invalid: "
+            + "; ".join(f.message for f in findings[:5])
+            + (" …" if len(findings) > 5 else ""),
+            findings=findings,
+        )
+    return {class_uri: str(resolved[name].source_id) for class_uri, name in names_by_class.items()}
+
+
+def _refuse_existing_backend_conflicts(
+    graph_store: GraphStore,
+    namespace: str,
+    class_to_datasource: dict[str, str],
+    class_to_graphsource: dict[str, str],
+) -> None:
+    """Reject the import when an incoming mapped class is already answered by the other backend in the namespace.
+
+    The payload check only sees this import's R2RML; this one reads the classes other
+    imports (or earlier appends) already mapped, so a class never ends up in both the
+    SQL and the SPARQL T-Box. Stores without the lookup carry no markers to compare.
+    It runs whatever the graph-sources switch says: unlike main, which has no graph
+    classes, an import must not hand SQL a class bound to a graph source while the
+    switch was on.
+
+    Raises:
+        IngestValidationError: one class-attributed finding per conflict (→ 422).
+        IngestStoreError: the existing markers could not be read (→ 502).
+    """
+    lookup = getattr(graph_store, "mapped_class_backends", None)
+    incoming = set(class_to_datasource) | set(class_to_graphsource)
+    if lookup is None or not incoming:
+        return
+    try:
+        existing = lookup(incoming, namespace)
+    except Exception as e:
+        # Its own event, apart from the router's ontology_ingest_store_failed: this 502 means
+        # only the check's read failed, which can now happen with graph sources off too.
+        log.warning(
+            "ontology_backend_lookup_failed (namespace=%s classes=%d graph_sources_enabled=%s error=%s)",
+            namespace,
+            len(incoming),
+            graph_sources_enabled(),
+            type(e).__name__,
+        )
+        raise IngestStoreError(f"existing class backend lookup failed: {e}") from e
+    findings: list[ValidationFinding] = []
+    for class_uri, backend in sorted(existing.items()):
+        if class_uri in class_to_graphsource and backend != StructuredBackend.RDF_SPARQL.value:
+            findings.append(
+                _graph_binding_finding(
+                    "graph_source_conflicts_r2rml",
+                    f"Class {class_uri} is already mapped by R2RML in this namespace and cannot also name "
+                    "a graph source; a class is answered by exactly one backend",
+                    class_uri,
+                    None,
+                )
+            )
+        elif class_uri in class_to_datasource and backend == StructuredBackend.RDF_SPARQL.value:
+            findings.append(
+                _graph_binding_finding(
+                    "r2rml_conflicts_graph_source",
+                    f"Class {class_uri} is already bound to a graph source in this namespace and cannot also "
+                    "be mapped by R2RML; a class is answered by exactly one backend",
+                    class_uri,
+                    None,
+                )
+            )
+    findings.extend(_graph_source_rebinding_findings(graph_store, namespace, class_to_graphsource, existing))
+    if findings:
+        raise IngestValidationError(
+            f"{len(findings)} class(es) are already answered by another backend or graph source: "
+            + "; ".join(f.message for f in findings[:5]),
+            findings=findings,
+        )
+
+
+def _graph_source_rebinding_findings(
+    graph_store: GraphStore, namespace: str, class_to_graphsource: dict[str, str], existing: dict[str, str]
+) -> list[ValidationFinding]:
+    """A finding per incoming graph-bound class the namespace already binds to a different graph source.
+
+    Serve picks a graph class's source from the top retrieval hit, so one class bound to two sources
+    would be answered from either.
+    """
+    already_graph = {c for c in class_to_graphsource if existing.get(c) == StructuredBackend.RDF_SPARQL.value}
+    lookup = getattr(graph_store, "mapped_class_graph_sources", None)
+    if lookup is None or not already_graph:
+        return []
+    try:
+        bound = lookup(already_graph, namespace)
+    except Exception as e:
+        raise IngestStoreError(f"existing class graph source lookup failed: {e}") from e
+    return [
+        _graph_binding_finding(
+            "graph_source_conflicts_graph_source",
+            f"Class {class_uri} is already bound to another graph source in this namespace; "
+            "a class is answered by exactly one source",
+            class_uri,
+            None,
+        )
+        for class_uri in sorted(already_graph)
+        if bound.get(class_uri) and class_to_graphsource[class_uri] not in bound[class_uri]
+    ]
+
+
 def ingest_ontology(
     graph_store: GraphStore,
     vector_store: VectorStore,
@@ -602,20 +855,22 @@ def ingest_ontology(
     if last_err is not None:
         raise IngestParseError(f"Invalid {md.format or 'turtle'} input: {last_err}") from last_err
 
-    # ── 1b. Strip any caller-supplied coa:isMapped triples ──────────────
-    # ``coa:isMapped`` is a TRUST-BOUNDARY marker: the serve Tier-2 filter treats
-    # a class carrying it as SQL-answerable. It must be derivable ONLY from the
-    # R2RML (server-side, via store_class) — never asserted by the payload. Left
-    # in place, a user-uploaded/edited ontology could FORGE ``<Class> coa:isMapped
-    # true`` and, since the raw Turtle is bulk-loaded verbatim (step 6), that
-    # forged triple would be queryable by the serve filter and force an
-    # unmapped/unbacked class into the structured-query prompt. Strip every
-    # ``(?, coa:isMapped, ?)`` here so only store_class can (re)emit it.
-    stripped_markers = _strip_ismapped_triples(g)
+    # ── 1b. Strip any caller-supplied coa: trust markers ────────────────
+    # ``coa:isMapped`` / ``coa:queryBackend`` / ``coa:dataSourceId`` are
+    # TRUST-BOUNDARY markers: the serve Tier-2 gate treats a class carrying them as
+    # structured-answerable and routes on them. They must be derivable ONLY
+    # server-side (from R2RML for SQL, from a resolved ``coa_import:dataSourceName``
+    # for graph), never asserted by the payload. Left in place, a user-uploaded
+    # ontology could FORGE ``<Class> coa:isMapped true`` and, since the raw Turtle
+    # is bulk-loaded verbatim (step 6), that forged triple would be queryable by
+    # the serve gate and force an unbacked class into the structured-query prompt.
+    # Strip them here so only store_class can (re)emit them. The coa_import:
+    # directive is NOT stripped here — it is consumed below, then removed (step 6).
+    stripped_markers = _strip_server_markers(g)
     if stripped_markers:
         log.warning(
-            "ingest: stripped %d caller-supplied coa:isMapped triple(s) — the marker is "
-            "server-derived from R2RML only (ontology_id=%s namespace=%s)",
+            "ingest: stripped %d caller-supplied coa: trust-marker triple(s) — isMapped/queryBackend/"
+            "dataSourceId are server-derived only (ontology_id=%s namespace=%s)",
             stripped_markers,
             md.ontology_id or "?",
             namespace,
@@ -670,6 +925,16 @@ def ingest_ontology(
     # presence of any ds-id = answerable). Multi-source routing (federate instead
     # of pinning one source) is a planned follow-up — widen to dict[str, set[str]].
     class_to_datasource: dict[str, str] = _class_datasource_map_from_r2rml(r2rml_content)
+    # The graph twin: classes bound to a registered RDF_SPARQL source by name. Empty
+    # for every ontology without the directive, so SQL and legacy imports are
+    # unaffected. Validated before ANY write, so a bad binding rejects the import
+    # whole. NOTE: append (proposal-accept) payloads are induced and never carry the
+    # directive; re-binding a class through an append would add a second
+    # coa:dataSourceId rather than replace the first.
+    class_to_graphsource: dict[str, str] = _class_graphsource_map_from_payload(
+        g, classes, namespace, class_to_datasource
+    )
+    _refuse_existing_backend_conflicts(graph_store, namespace, class_to_datasource, class_to_graphsource)
 
     # ── 3. Tier-1 validators (optional) ─────────────────────────────────
     if validate:
@@ -749,7 +1014,9 @@ def ingest_ontology(
             }
         )
 
-    mapped_class_count = sum(1 for cls_uri in classes if str(cls_uri) in class_to_datasource)
+    mapped_class_count = sum(
+        1 for cls_uri in classes if str(cls_uri) in class_to_datasource or str(cls_uri) in class_to_graphsource
+    )
     # Batch the class projection into a few chunked INSERTs when the backend
     # supports it (Neptune DB), instead of one HTTP round-trip per class. Falls
     # back to per-class store_class for backends without the batch method (NA).
@@ -759,7 +1026,10 @@ def ingest_ontology(
             "labels": [str(o) for o in g.objects(cls_uri, RDFS.label)],
             "comments": _definitions(g, cls_uri),
             "super_classes": [str(o) for o in g.objects(cls_uri, RDFS.subClassOf) if o in classes],
-            "is_mapped": str(cls_uri) in class_to_datasource,
+            "is_mapped": str(cls_uri) in class_to_datasource or str(cls_uri) in class_to_graphsource,
+            # Graph markers ride only on graph classes, so a SQL spec keeps the exact
+            # keys every GraphStore.store_class already accepts.
+            **_graph_class_markers(class_to_graphsource.get(str(cls_uri))),
         }
         for cls_uri in classes
     ]
@@ -857,6 +1127,10 @@ def ingest_ontology(
     stripped = _strip_dangling_bnode_objects(g)
     if stripped:
         log.info("ingest: stripped %d dangling-bnode triples before load_turtle", stripped)
+    # The coa_import: directives have been consumed into class_specs and the
+    # embedding map; they are inputs, not ontology content, so keep them out of the
+    # queryable graph (an author's source name would otherwise be readable back).
+    _strip_import_directives(g)
 
     # Always serialise from the cleaned rdflib graph — we cannot reuse
     # the caller's original bytes verbatim because those may still
@@ -897,7 +1171,10 @@ def ingest_ontology(
         obj_props=obj_props,
         dt_props=dt_props,
         namespace=namespace,
-        class_to_datasource=class_to_datasource,
+        # One id per class: the R2RML and graph channels are exclusive (enforced
+        # by _class_graphsource_map_from_payload).
+        class_to_datasource={**class_to_datasource, **class_to_graphsource},
+        class_to_graphsource=class_to_graphsource,
         physical_names=_physical_names_from_r2rml(r2rml_content),
     )
     log.info(
@@ -1346,6 +1623,11 @@ def _run_tier1_validators(g: Graph) -> list[Any]:
     return findings
 
 
+def _backend_fields(entity_type: str, uri: str, graph_map: dict[str, str]) -> dict[str, str]:
+    """``query_backend`` for a graph-backed class document; empty for every other document (absent == SQL)."""
+    return {"query_backend": StructuredBackend.RDF_SPARQL.value} if entity_type == "class" and uri in graph_map else {}
+
+
 def _accumulate_embeddings(
     *,
     vector_store: VectorStore,
@@ -1357,8 +1639,14 @@ def _accumulate_embeddings(
     namespace: str,
     class_to_datasource: dict[str, str] | None = None,
     physical_names: tuple[dict[str, str], dict[str, str]] | None = None,
+    before_store: Callable[[], None] | None = None,
+    class_to_graphsource: dict[str, str] | None = None,
 ) -> dict:
     """Embed every class + property and upsert into the namespace's vector index.
+
+    A class in ``class_to_graphsource`` is graph-backed: its document also gets
+    ``query_backend = "RDF_SPARQL"``, the retrieval-side twin of the T-Box
+    ``coa:queryBackend`` gate. Every other document omits the field (absent == SQL).
 
     The shared index per namespace is owned by the ``VectorStore`` —
     ``store_embeddings_batch`` carries ``namespace`` on each item so
@@ -1370,6 +1658,14 @@ def _accumulate_embeddings(
     after ``Table:`` and in ``Columns:``, so those come from the R2RML; the OWL
     label is added as ``Business name`` only where it differs (#1287). Without it,
     or for an entry the R2RML does not resolve, the label is used as before.
+
+    Each column comment is cut to ``_MAX_COLUMN_COMMENT_EMBED_CHARS`` characters in
+    the embedded text and to ``_MAX_COLUMN_COMMENT_CHARS`` in the stored
+    ``context_text`` (the NL→SQL prompt text), except that a column marked with
+    ``DEFINITION_SOURCE`` keeps its whole comment in ``context_text``.
+    ``before_store`` runs after every vector is computed and before any is
+    written — a caller replacing existing embeddings deletes the old ones there,
+    so the window in which the entities have no embedding is only the write.
     """
     from coa_ontology.bedrock_embeddings import BedrockEmbeddingClient
 
@@ -1481,8 +1777,8 @@ def _accumulate_embeddings(
 
         # (label, target, comment, hints)
         obj_props_list: list[tuple[str, str, str, str]] = []
-        # (column, business name, dtype, comment, distinct_values, hints)
-        data_props_list: list[tuple[str, str, str, str, list[str], str]] = []
+        # (column, business name, dtype, comment, distinct_values, hints, context comment cap or None)
+        data_props_list: list[tuple[str, str, str, str, list[str], str, int | None]] = []
 
         for prop_uri in graph.subjects(RDFS.domain, cls_uri):
             prop_label = _label_of(prop_uri)
@@ -1497,7 +1793,10 @@ def _accumulate_embeddings(
                 distinct_vals = [str(o) for o in graph.objects(prop_uri, _SCL_NS.distinctValues)]
                 column = _column_name(prop_uri)
                 business = _business_name(prop_uri, column)
-                data_props_list.append((column, business, dtype, prop_comment, distinct_vals, _term_hints(prop_uri)))
+                context_cap = None if (prop_uri, DEFINITION_SOURCE, None) in graph else _MAX_COLUMN_COMMENT_CHARS
+                data_props_list.append(
+                    (column, business, dtype, prop_comment, distinct_vals, _term_hints(prop_uri), context_cap)
+                )
 
         if not data_props_list and not obj_props_list:
             thin = _text_for(cls_uri)
@@ -1531,20 +1830,22 @@ def _accumulate_embeddings(
             return parts
 
         def _cols(*, rich: bool) -> str:
-            # rich=False → embedded vector: column names + comments (type, sampled
-            # values and per-column terms are low-signal for retrieval and would
-            # crowd columns out of the 8000-character input).
+            # rich=False → embedded vector: column names + comments cut at
+            # _MAX_COLUMN_COMMENT_EMBED_CHARS (type, sampled values and
+            # per-column terms are low-signal for retrieval and would crowd
+            # columns out of the 8000-character input).
             # rich=True → generation context: adds type, steward terms and allowed
-            # values so the LLM writes correct casts and WHERE literals.
+            # values so the LLM writes correct casts and WHERE literals, and keeps
+            # the comment up to _MAX_COLUMN_COMMENT_CHARS (a bridge-written one whole).
             # A column whose OWL label differs from its physical name (#1287) carries
             # the label as "business name"; the name before ":" is what SQL executes.
             return ", ".join(
                 (f"{column}:{dtype}" if rich else column)
                 + (f" (business name: {business})" if business else "")
-                + (f" ({comment[:100]})" if comment else "")
+                + (f" ({comment[: (context_cap if rich else _MAX_COLUMN_COMMENT_EMBED_CHARS)]})" if comment else "")
                 + (hints if rich else "")
                 + (f" allowed values: [{', '.join(vals[:20])}]" if rich and vals else "")
-                for column, business, dtype, comment, vals, hints in data_props_list
+                for column, business, dtype, comment, vals, hints, context_cap in data_props_list
             )
 
         embed_parts = _head(rich=False)
@@ -1556,6 +1857,8 @@ def _accumulate_embeddings(
         embed_text = " | ".join(embed_parts)
         context_text = " | ".join(context_parts)
         return embed_text, context_text
+
+    graph_map = class_to_graphsource or {}
 
     # (uri, entity_type, embed_text, context_text, datasource_id)
     # embed_text is EMBEDDED (retrieval vector); context_text is STORED for the
@@ -1581,6 +1884,8 @@ def _accumulate_embeddings(
         # must not enter the retrieval vector.
         texts = [embed_text for (_, _, embed_text, _, _) in entries]
         vectors = bedrock.embed_texts(texts)
+        if before_store is not None:
+            before_store()
 
         items = []
         for (uri, entity_type, embed_text, context_text, ds_id), vec in zip(entries, vectors, strict=True):
@@ -1600,6 +1905,7 @@ def _accumulate_embeddings(
                 item["context_text"] = context_text
             if ds_id:
                 item["data_source_id"] = ds_id
+            item |= _backend_fields(entity_type, uri, graph_map)
             items.append(item)
         # store_embeddings_batch returns the docs the store confirms it wrote.
         # With bulk_with_retry now raising PartialIndexError on any doc that
@@ -1708,18 +2014,35 @@ def _strip_dangling_bnode_objects(g: Graph) -> int:
     return removed
 
 
-def _strip_ismapped_triples(g: Graph) -> int:
-    """Remove every ``(?, coa:isMapped, ?)`` triple from a parsed payload graph.
+_SERVER_MARKER_PREDICATES = tuple(URIRef(f"{VOCAB_URI}{name}") for name in ("isMapped", "queryBackend", "dataSourceId"))
 
-    ``coa:isMapped`` is a server-derived TRUST-BOUNDARY marker (see the caller):
-    the serve Tier-2 filter matches it to decide a class is SQL-answerable, and
-    it must be emitted ONLY by ``store_class`` from the R2RML mapping — never
-    accepted from caller-supplied Turtle. Returns the number of triples removed.
+
+def _strip_server_markers(g: Graph) -> int:
+    """Remove every caller-supplied server-derived ``coa:`` trust marker from a payload.
+
+    ``coa:isMapped`` / ``coa:queryBackend`` / ``coa:dataSourceId`` are what the serve
+    Tier-2 gate matches and routes on (see the caller); each must be emitted ONLY by
+    ``store_class`` from a server-side derivation — never accepted from caller Turtle.
+    Returns the number of triples removed.
     """
-    is_mapped_pred = URIRef(f"{VOCAB_URI}isMapped")
-    triples = list(g.triples((None, is_mapped_pred, None)))
+    removed = 0
+    for pred in _SERVER_MARKER_PREDICATES:
+        for triple in list(g.triples((None, pred, None))):
+            g.remove(triple)
+            removed += 1
+    return removed
+
+
+def _strip_import_directives(g: Graph) -> int:
+    """Remove every ``coa_import:*`` directive triple; returns the count removed.
+
+    Matched by namespace prefix so any future directive is covered too.
+    """
+    triples = [t for t in g if str(t[1]).startswith(IMPORT_VOCAB_URI)]
     for triple in triples:
         g.remove(triple)
+    if triples:
+        log.info("ingest: stripped %d coa_import: directive triples before load_turtle", len(triples))
     return len(triples)
 
 

@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pytest
 from coa_common.constants import ONTOLOGY_URI_PREFIX_RE, PRINCIPAL_ID_RE
+from coa_common.sparql_config import NAMED_GRAPH_IRI_RE, SPARQL_ENDPOINT_RE, SPARQL_REGION_RE
 
 pytestmark = pytest.mark.unit
 
@@ -106,3 +107,50 @@ def test_data_source_id_patterns_agree(value: str) -> None:
 
     smithy = _smithy_pattern("metric-service.smithy", "DataSourceId")
     assert bool(smithy.fullmatch(value)) == bool(_DATA_SOURCE_ID_RE.fullmatch(value))
+
+
+_SPARQL_ENDPOINTS = [
+    "db.cluster-abc.us-east-1.neptune.amazonaws.com",
+    "https://db.cluster-abc.us-east-1.neptune.amazonaws.com:8182",
+    "https://stardog.acme.internal:5820/acme/query",
+    "http://db.example.com",
+    "db.example.com;x=1",
+    "db.example.com/<script>",
+    "https://user@db.example.com",
+    "https://db.example.com?x=1",
+    "-db.example.com",
+    "",
+]
+
+_SPARQL_REGIONS = ["us-east-1", "eu-central-2", "us-gov-west-1", "US-EAST-1", "us-east", "useast1", ""]
+
+_NAMED_GRAPHS = [
+    "https://example.test/ns/acme/data",
+    "http://example.com/g#1",
+    "urn:graph:1",
+    "https://example.com/a>b",
+    "https://example.com/a b",
+    'https://example.com/"x',
+    "https://example.com/{x}",
+    "https://example.com/a\\b",
+    "https://example.com/`x`",
+    "https://",
+]
+
+
+@pytest.mark.parametrize("value", _SPARQL_ENDPOINTS)
+def test_sparql_endpoint_patterns_agree(value: str) -> None:
+    smithy = _smithy_pattern("unified-sources.smithy", "SparqlEndpoint")
+    assert bool(smithy.fullmatch(value)) == bool(SPARQL_ENDPOINT_RE.fullmatch(value))
+
+
+@pytest.mark.parametrize("value", _SPARQL_REGIONS)
+def test_sparql_region_patterns_agree(value: str) -> None:
+    smithy = _smithy_pattern("unified-sources.smithy", "SparqlRegion")
+    assert bool(smithy.fullmatch(value)) == bool(SPARQL_REGION_RE.fullmatch(value))
+
+
+@pytest.mark.parametrize("value", _NAMED_GRAPHS)
+def test_named_graph_iri_patterns_agree(value: str) -> None:
+    smithy = _smithy_pattern("unified-sources.smithy", "NamedGraphIri")
+    assert bool(smithy.fullmatch(value)) == bool(NAMED_GRAPH_IRI_RE.fullmatch(value))

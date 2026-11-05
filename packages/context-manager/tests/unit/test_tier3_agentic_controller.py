@@ -43,6 +43,7 @@ from coa_serve.tier3.agentic.controller import (
 from coa_serve.tier3.agentic.models import (
     PlannerDecision,
     StopReason,
+    StopSignalConfig,
     SubQuestion,
 )
 from coa_serve.tier3.agentic.ontology import Ontology
@@ -167,6 +168,43 @@ class ScriptedPlanner:
         return self._default_suff
 
 
+class AssessPlanner(ScriptedPlanner):
+    """A :class:`ScriptedPlanner` that also implements ``assess`` with scripted
+    working answers, so the controller's answer-stability path is exercised.
+
+    ``working_answers`` is consumed one per step; sufficiency stays ``False`` so the
+    loop does not stop on sufficiency and the stability signal is what ends it.
+    """
+
+    def __init__(self, candidates_script, *, working_answers: list[str], **kw) -> None:
+        super().__init__(candidates_script, **kw)
+        self._answers = deque(working_answers)
+
+    async def assess(self, *, sub_question, context):
+        self.sufficiency_calls += 1
+        answer = self._answers.popleft() if self._answers else ""
+        return False, answer
+
+
+class ScriptedEmbed:
+    """A deterministic fake embed client: maps each distinct text to a fixed unit
+    vector, so identical answers embed identically (cosine 1.0) and different ones
+    are orthogonal (cosine 0.0). Lets a test drive 'stable' vs 'moving' answers."""
+
+    _VECTORS = {
+        "A": [1.0, 0.0, 0.0],
+        "B": [0.0, 1.0, 0.0],
+        "C": [0.0, 0.0, 1.0],
+    }
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def embed(self, text: str) -> list[float]:
+        self.calls.append(text)
+        return self._VECTORS.get(text, [0.0, 0.0, 0.0])
+
+
 def make_clock(**cfg) -> tuple[BudgetClock, FakeClockSource]:
     """Build a started BudgetClock over a fake time source."""
     source = FakeClockSource()
@@ -192,6 +230,7 @@ async def run_loop(
     sub_question: SubQuestion | None = None,
     namespace: str = NS,
     ontology_edge_mode: str = "soft_prior",
+    tool_context: dict | None = None,
 ):
     """Drive one controller loop and return (stop_reason, ctx, queue, trace)."""
     clock = clock or make_clock()[0]
@@ -202,7 +241,9 @@ async def run_loop(
         planner, per_tool_timeout_s=per_tool_timeout_s, ontology_edge_mode=ontology_edge_mode
     )
     sub_question = sub_question or SubQuestion(text="why")
-    stop = await controller.run_one_loop(sub_question, ctx, registry, clock, queue, trace, namespace=namespace)
+    stop = await controller.run_one_loop(
+        sub_question, ctx, registry, clock, queue, trace, namespace=namespace, tool_context=tool_context
+    )
     return stop, ctx, queue, trace
 
 
@@ -828,3 +869,157 @@ class TestLazyImportInvariant:
             f"importing controller leaked graphrag_toolkit or failed.\nstdout={result.stdout}\nstderr={result.stderr}"
         )
         assert "OK" in result.stdout
+
+
+# ── options.loopFixes ──────────────────────────────────────────────
+
+FIXES = {"options": {"loopFixes": True}}
+
+
+@pytest.mark.unit
+class TestLoopFixes:
+    async def test_unknown_fields_rejected_without_the_option(self):
+        tool = FakeTool("nl_to_sql", input_schema={"query": "str"})
+        planner = ScriptedPlanner(
+            [[PlannerDecision(tool_name="nl_to_sql", inputs={"query": "q", "top_k": 5})]], sufficiency=[True]
+        )
+        await run_loop(planner, make_registry(tool))
+        assert tool.calls == []
+
+    async def test_unknown_fields_dropped_with_the_option(self):
+        tool = FakeTool("nl_to_sql", input_schema={"query": "str"})
+        planner = ScriptedPlanner(
+            [[PlannerDecision(tool_name="nl_to_sql", inputs={"query": "q", "top_k": 5, "entity_class": "X"})]],
+            sufficiency=[True],
+        )
+        stop, _ctx, _q, trace = await run_loop(planner, make_registry(tool), tool_context=FIXES)
+        assert len(tool.calls) == 1 and "top_k" not in tool.calls[0] and tool.calls[0]["query"] == "q"
+        assert "entity_class" in str(find_step(trace, "unknown_fields_dropped")[0].detail)
+        assert stop == StopReason.sufficiency_satisfied
+
+    async def test_type_mismatch_still_rejected_with_the_option(self):
+        tool = FakeTool("nl_to_sql", input_schema={"query": "str"})
+        planner = ScriptedPlanner([[PlannerDecision(tool_name="nl_to_sql", inputs={"query": 3, "x": 1})]])
+        await run_loop(planner, make_registry(tool), tool_context=FIXES)
+        assert tool.calls == []
+
+    async def test_tool_not_started_when_budget_spent(self):
+        tool = FakeTool("strategy:entity_based", input_schema={"query": "str"})
+        clock, src = make_clock(time_budget_s=60, synthesis_reserve_s=5)
+        src.advance(54)  # 6 s left, 1 s usable after the reserve
+        planner = ScriptedPlanner(
+            [[PlannerDecision(tool_name="strategy:entity_based", inputs={"query": "q"})]], repeat_last=True
+        )
+        stop, _ctx, _q, trace = await run_loop(planner, make_registry(tool), clock=clock, tool_context=FIXES)
+        assert tool.calls == [] and stop == StopReason.time_budget_expired
+        assert find_step(trace, "budget_spent")
+        # No planner call is made either, and the step is given back.
+        assert planner.propose_calls == 0 and clock.steps_consumed == 0
+
+    async def test_planner_called_without_the_option_when_budget_spent(self):
+        tool = FakeTool("strategy:entity_based", input_schema={"query": "str"})
+        clock, src = make_clock(time_budget_s=60, synthesis_reserve_s=5)
+        src.advance(54)
+        planner = ScriptedPlanner(
+            [[PlannerDecision(tool_name="strategy:entity_based", inputs={"query": "q"})]], sufficiency=[True]
+        )
+        await run_loop(planner, make_registry(tool), clock=clock)
+        assert planner.propose_calls == 1
+
+    async def test_small_per_tool_cap_does_not_stop_the_loop(self):
+        # A per-tool cap below the 2 s floor must not read as "no time left".
+        tool = FakeTool("strategy:entity_based", input_schema={"query": "str"})
+        planner = ScriptedPlanner(
+            [[PlannerDecision(tool_name="strategy:entity_based", inputs={"query": "q"})]], sufficiency=[True]
+        )
+        stop, _ctx, _q, trace = await run_loop(planner, make_registry(tool), per_tool_timeout_s=1.0, tool_context=FIXES)
+        assert len(tool.calls) == 1 and not find_step(trace, "budget_spent")
+        assert stop == StopReason.sufficiency_satisfied
+
+    async def test_repeated_read_gets_its_step_back(self):
+        tool = FakeTool("read_document", input_schema={"source_key": "str"}, result=chunk_result("doc:a@0"))
+        clock, _src = make_clock(max_steps=3)
+        planner = ScriptedPlanner(
+            [[PlannerDecision(tool_name="read_document", inputs={"source_key": "a"})]], repeat_last=True
+        )
+        stop, ctx, _q, _trace = await run_loop(planner, make_registry(tool), clock=clock, tool_context=FIXES)
+        # The first read is new; the next two repeats get their steps back (the
+        # refund cap), the third does not; the no-progress streak then ends the loop.
+        assert len(tool.calls) == 4
+        assert clock.steps_consumed == 2
+        assert any(a.get("status") == "already_read" for a in ctx.attempt_history)
+        assert stop == StopReason.no_new_information
+
+
+# ── answer-stability no-progress signal ─────────────────────────────────
+
+
+@pytest.mark.unit
+class TestAnswerStability:
+    async def _run(self, *, working_answers, threshold, stability_steps=2, max_steps=10):
+        """Drive a loop where every step makes RETRIEVAL progress (a new chunk) but
+        the working answer follows ``working_answers``. Returns (stop, trace, embed)."""
+        tool = FakeTool("strategy:entity_based", input_schema={"query": "str"}, incrementing=True)
+        registry = make_registry(tool)
+        planner = AssessPlanner(
+            [[PlannerDecision(tool_name="strategy:entity_based", inputs={"query": "q"})]],
+            repeat_last=True,
+            working_answers=working_answers,
+        )
+        embed = ScriptedEmbed()
+        controller = ReasoningController(
+            planner,
+            embed_fn=embed,
+            stop_signals=StopSignalConfig(similarity_threshold=threshold, stability_steps=stability_steps),
+        )
+        clock = make_clock(max_steps=max_steps)[0]
+        trace = TraceCollector()
+        stop = await controller.run_one_loop(
+            SubQuestion(text="why"), AccumulatedContext(), registry, clock, deque(), trace, namespace=NS
+        )
+        return stop, trace, embed
+
+    async def test_stable_answer_counts_as_no_progress_and_stops(self):
+        """When the working answer stays the SAME across steps (cosine 1.0 >= 0.9),
+        the loop stops with no_new_information even though each step gathered a new
+        chunk — the real redundant-retrieval failure the new_count==0 guard misses."""
+        stop, trace, embed = await self._run(working_answers=["A", "A", "A", "A"], threshold=0.9)
+        assert stop == StopReason.no_new_information
+        # Window 2 (stability_steps): baseline on step 1, stable on steps 2 and 3.
+        assert embed.calls == ["A", "A", "A"]
+        # The stability signal was observed and recorded.
+        assert find_step(trace, "answer_stability")
+
+    async def test_moving_answer_does_not_trip_stability(self):
+        """A working answer that changes each step (cosine 0.0 < 0.9) never counts
+        as no-progress, so the loop runs to the step ceiling instead of stopping."""
+        stop, _trace, _ = await self._run(working_answers=["A", "B", "C", "A", "B", "C"], threshold=0.9, max_steps=4)
+        assert stop == StopReason.max_steps_reached
+
+    async def test_threshold_zero_disables_the_signal(self):
+        """With threshold 0.0 (default) and telemetry off, a perfectly stable answer
+        does NOT stop the loop, and no embed runs at all (R-5(b), R-9)."""
+        stop, trace, embed = await self._run(working_answers=["A", "A", "A", "A"], threshold=0.0, max_steps=4)
+        assert stop == StopReason.max_steps_reached
+        assert not find_step(trace, "answer_stability")
+        assert embed.calls == []
+
+    async def test_no_embed_fn_means_no_stability_calls(self):
+        """Without an embed function the stability path is entirely skipped."""
+        tool = FakeTool("strategy:entity_based", input_schema={"query": "str"}, incrementing=True)
+        registry = make_registry(tool)
+        planner = AssessPlanner(
+            [[PlannerDecision(tool_name="strategy:entity_based", inputs={"query": "q"})]],
+            repeat_last=True,
+            working_answers=["A", "A", "A"],
+        )
+        controller = ReasoningController(
+            planner, embed_fn=None, stop_signals=StopSignalConfig(similarity_threshold=0.9)
+        )
+        clock = make_clock(max_steps=3)[0]
+        trace = TraceCollector()
+        stop = await controller.run_one_loop(
+            SubQuestion(text="why"), AccumulatedContext(), registry, clock, deque(), trace, namespace=NS
+        )
+        assert stop == StopReason.max_steps_reached
+        assert not find_step(trace, "answer_stability")

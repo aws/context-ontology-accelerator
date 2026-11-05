@@ -33,6 +33,14 @@ class TestSourceDBQueryExecutor:
         executor._validate_namespace("my-namespace_v2")
 
     @patch("coa_serve.clients.source_db.boto3")
+    def test_validate_namespace_rejects_a_trailing_newline(self, mock_boto3, _reg):
+        from coa_serve.clients.source_db import SourceDBQueryExecutor
+
+        executor = SourceDBQueryExecutor(data_sources_table="test-table")
+        with pytest.raises(ValueError, match="Invalid namespace"):
+            executor._validate_namespace("demo\n")
+
+    @patch("coa_serve.clients.source_db.boto3")
     async def test_execute_rejects_invalid_timeout(self, mock_boto3, _reg):
         from coa_serve.clients.source_db import SourceDBQueryExecutor
 

@@ -29,7 +29,7 @@ is NOT the same for all three sets:
 
 from __future__ import annotations
 
-from coa_common.constants import CONNECTOR_BACKED_SUB_TYPES
+from coa_common.constants import CONNECTOR_BACKED_SUB_TYPES, GRAPH_BACKED_SUB_TYPES
 from coa_control_plane_server.models.source_sub_type import SourceSubType
 
 # ``CONNECTOR_BACKED_SUB_TYPES`` lives in ``coa_common.constants`` because serve and
@@ -45,9 +45,15 @@ from coa_control_plane_server.models.source_sub_type import SourceSubType
 #   * serve's crawled-name rewrite must NOT apply. It strips a ``{schema}_`` prefix a
 #     Glue crawler added, so applying it here turns ``sales_orders`` in schema ``sales``
 #     into ``orders`` — a table the connector has never heard of.
+#
+# ``GRAPH_BACKED_SUB_TYPES`` (also from ``coa_common.constants``) is the third and last
+# teardown arm: an RDF graph source has no Athena catalog, Glue connection or claimed
+# platform name, so its delete removes the source record and nothing else. It is never
+# scanned either — registration enqueues a reachability verify instead.
 __all__ = [
     "CONNECTOR_BACKED_SUB_TYPES",
     "FEDERATED_TEARDOWN_SUB_TYPES",
+    "GRAPH_BACKED_SUB_TYPES",
     "PLATFORM_CATALOG_CLAIM_SUB_TYPES",
 ]
 

@@ -14,18 +14,27 @@ import { solutionStackDescription } from "../solution";
  * The deploying account and region, when the app imports a VPC (`vpc_id`).
  *
  * `Vpc.fromLookup` needs a concrete environment on the network stack, and every
- * stack that uses the VPC must share it, so all stacks get the account and
- * region the CDK CLI resolved from the credentials. Without `vpc_id` stacks stay
- * environment-agnostic, as before.
+ * stack that uses the VPC must share it (CDK refuses cross-stack references
+ * between an environment-agnostic stack and a concrete one), so all stacks get
+ * the account and region the CDK CLI resolved from the credentials. Without
+ * `vpc_id` stacks stay environment-agnostic, so a deployment that creates its
+ * VPC synthesizes exactly as before.
  */
 function importedVpcEnv(scope: Construct): cdk.Environment | undefined {
   if (!scope.node.tryGetContext("vpc_id")) {
     return undefined;
   }
-  return {
-    account: process.env.CDK_DEFAULT_ACCOUNT,
-    region: process.env.CDK_DEFAULT_REGION,
-  };
+  const account = process.env.CDK_DEFAULT_ACCOUNT;
+  const region = process.env.CDK_DEFAULT_REGION;
+  if (!account || !region) {
+    throw new Error(
+      "vpc_id needs an AWS account and region at synth to look up the VPC, " +
+        "and none was resolved. Configure AWS credentials and a region for " +
+        "the CDK CLI (AWS_PROFILE or credentials, and AWS_REGION), or set " +
+        "CDK_DEFAULT_ACCOUNT and CDK_DEFAULT_REGION.",
+    );
+  }
+  return { account, region };
 }
 
 /**
@@ -62,9 +71,9 @@ export class SCLStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, {
       ...props,
-      env: props?.env ?? importedVpcEnv(scope),
       // AWS Solutions counts stack launches by the `(SO0376)` description prefix.
       description: props?.description ?? solutionStackDescription(id),
+      env: props?.env ?? importedVpcEnv(scope),
     });
 
     const { envName, projectTag } = resolveContext(this.node);

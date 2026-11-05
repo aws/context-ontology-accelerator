@@ -43,6 +43,7 @@ export function useRescanSource(
     ControlPlaneServiceServiceException,
     RescanSourceVariables
   >({
+    ...options,
     mutationFn: ({ confirmDiscardOpenReview }: RescanSourceVariables) =>
       client.send(
         new RescanSourceCommand({
@@ -51,12 +52,14 @@ export function useRescanSource(
           confirmDiscardOpenReview,
         }),
       ),
+    // Spread the caller's options first so a caller onSuccess cannot replace
+    // this one and skip the cache refresh. Return the caller's result so the
+    // mutation still waits for a promise it returns.
     onSuccess: (...args) => {
       queryClient.invalidateQueries({
         queryKey: ["source", namespaceId, sourceId],
       });
-      options?.onSuccess?.(...args);
+      return options?.onSuccess?.(...args);
     },
-    ...options,
   });
 }

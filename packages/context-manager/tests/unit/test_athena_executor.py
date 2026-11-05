@@ -12,6 +12,7 @@ import sqlglot
 from coa_common.constants import (
     CONNECTOR_BACKED_SUB_TYPES,
     DATABASE_SUB_TYPES,
+    GRAPH_BACKED_SUB_TYPES,
     RESOURCE_PREFIX,
     DatabaseSubType,
 )
@@ -1465,9 +1466,12 @@ def test_every_database_sub_type_but_native_glue_has_a_catalog_resolution_label(
     """A sub-type missing from ``_CATALOG_PATH_LABELS`` logs as ``glue_nested`` via the
     ``.get`` default with nothing raised, so this is the only tripwire possible.
     ``glue_nested`` is right for exactly two shapes: a native Glue source in a nested
-    catalog, and a row with no ``sourceSubType``.
+    catalog, and a row with no ``sourceSubType``. A graph source has no Athena catalog
+    and never reaches this resolver, so it needs no label.
     """
-    unlabelled = DATABASE_SUB_TYPES - set(_CATALOG_PATH_LABELS) - {DatabaseSubType.GLUE_DATABASE.value}
+    unlabelled = (
+        DATABASE_SUB_TYPES - set(_CATALOG_PATH_LABELS) - {DatabaseSubType.GLUE_DATABASE.value} - GRAPH_BACKED_SUB_TYPES
+    )
     assert not unlabelled, (
         f"DATABASE sub-type(s) {sorted(unlabelled)} have no catalog_resolution label and would log as "
         "'glue_nested'. Add each to _CATALOG_PATH_LABELS in coa_serve.clients.athena."

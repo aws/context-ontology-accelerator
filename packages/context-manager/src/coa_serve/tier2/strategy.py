@@ -18,11 +18,13 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import structlog
+from coa_common.constants import StructuredBackend
 
 from ..exceptions import AccessDeniedError, AmbiguousReferenceError
 from ..step_ids import StepId
@@ -47,6 +49,7 @@ class StrategyOption(StrEnum):
     ONTOP_FIRST = "ontop_first"  # Sequential: Ontop → NL→SQL fallback
     NL_TO_SQL_FIRST = "nl_to_sql_first"  # Sequential: NL→SQL → Ontop fallback
     DEEP_REASONING = "deep-reasoning"  # Only the bounded tool-use agent (opt-in; never a fallback)
+    NL_TO_SPARQL = "nl_to_sparql"  # Only NL→SPARQL against an RDF_SPARQL source / identifies the graph strategy
 
 
 DEFAULT_STRATEGY = StrategyOption.NL_TO_SQL_FIRST
@@ -134,6 +137,9 @@ class StructuredQueryStrategy(Protocol):
     """Protocol for a pluggable Tier 2 strategy."""
 
     name: str
+    # The structured backends whose classes this strategy can answer; the runner's
+    # fallback chains keep a strategy only when these meet the namespace's backends.
+    supported_backends: frozenset[StructuredBackend]
 
     async def resolve(self, query: str, namespace: str, context: StrategyContext) -> StrategyResult | None:
         """Resolve a query with this strategy, returning a result or None on miss."""
@@ -196,10 +202,25 @@ def capped_evidence(evidence: str) -> str:
 #     ontop      mean_f1 0.055, execution_rate 0.41
 # Revisit this table when the VKG path improves — it is a statement about the
 # current implementation, not about which approach is better in principle.
+#
+# nl_to_sparql only ever competes in a namespace that has a graph source, where it
+# is the only strategy that can see graph classes; it ranks ahead of ontop, matching
+# the fallback-chain order (nl_to_sql → nl_to_sparql → ontop).
 _STRATEGY_PRECEDENCE: dict[str, int] = {
     StrategyOption.NL_TO_SQL: 0,
-    StrategyOption.ONTOP: 1,
+    StrategyOption.NL_TO_SPARQL: 1,
+    StrategyOption.ONTOP: 2,
 }
+
+# Options that pin exactly one strategy by name.
+_PINNABLE_STRATEGIES: frozenset[str] = frozenset(
+    {StrategyOption.DEEP_REASONING, StrategyOption.ONTOP, StrategyOption.NL_TO_SQL, StrategyOption.NL_TO_SPARQL}
+)
+
+# Backends assumed for a namespace whose backends the caller did not supply: SQL,
+# the only backend that existed before graph sources — so old callers keep their
+# behaviour.
+_DEFAULT_BACKENDS: frozenset[StructuredBackend] = frozenset({StructuredBackend.SQL})
 
 
 def _strategy_precedence(strategy_name: str) -> int:
@@ -223,6 +244,76 @@ def is_degenerate_result(result: StrategyResult) -> bool:
     return any(marker in sql for marker in _DEGENERATE_SQL_MARKERS)
 
 
+# A refusal says which kind it is. RANGE: the question names a period the tables do not cover,
+# so the tables are the authority and the refusal is final. FIELD: no column holds the measure,
+# which a document may still answer, so the orchestrator lets it fall through to Tier 3 when the
+# namespace has an unstructured source.
+NOT_ANSWERABLE_RANGE = "range"
+NOT_ANSWERABLE_FIELD = "field"
+_NOT_ANSWERABLE_PREFIXES = {
+    "NOT_ANSWERABLE_RANGE:": NOT_ANSWERABLE_RANGE,
+    "NOT_ANSWERABLE_FIELD:": NOT_ANSWERABLE_FIELD,
+}
+
+# The only statement shape the writer is told to use for a refusal: a bare literal SELECT with
+# one aliased column. Comments and a trailing semicolon are stripped before matching.
+_NOT_ANSWERABLE_SQL_RE = re.compile(
+    r"^select\s+'not_answerable_(?:range|field):(?:[^']|'')*'\s+as\s+\"?answer\"?$",
+    re.IGNORECASE,
+)
+_SQL_LINE_COMMENT_RE = re.compile(r"--[^\n]*")
+
+
+def _is_bare_not_answerable_sql(sql: str | None) -> bool:
+    if not sql:
+        return False
+    flat = _SQL_LINE_COMMENT_RE.sub(" ", sql)
+    flat = " ".join(flat.split()).rstrip(";").strip()
+    return bool(_NOT_ANSWERABLE_SQL_RE.match(flat))
+
+
+def not_answerable_kind(result: StrategyResult) -> str | None:
+    """The refusal kind (``range`` or ``field``) when a strategy answered that the data cannot answer.
+
+    The refusal is exactly one row with one ``answer`` cell that starts with
+    ``NOT_ANSWERABLE_RANGE:`` or ``NOT_ANSWERABLE_FIELD:``, produced by a bare literal
+    ``SELECT '...' AS answer`` statement. All three must hold, so a real data row whose value
+    happens to start with the prefix is not taken for a refusal.
+
+    The SQL writer is told to return this row for a period the tables do not cover or a measure
+    no column holds, and the SPARQL path builds the same row. It wins only when no other strategy
+    produced a real answer (see ``_resolve_parallel``). Whether the confidence floor keeps it
+    depends on the kind (see the orchestrator's Tier-2 gate). Returns None for anything else.
+    """
+    if len(result.rows) != 1 or not _is_bare_not_answerable_sql(result.sql):
+        return None
+    first = result.rows[0]
+    if isinstance(first, dict):
+        if len(first) != 1:
+            return None
+        key, value = next(iter(first.items()))
+        if str(key).lower() != "answer":
+            return None
+    elif isinstance(first, (list, tuple)):
+        if len(first) != 1:
+            return None
+        value = first[0]
+    else:
+        return None
+    if not isinstance(value, str):
+        return None
+    text = value.lstrip()
+    for prefix, kind in _NOT_ANSWERABLE_PREFIXES.items():
+        if text.startswith(prefix):
+            return kind
+    return None
+
+
+def is_not_answerable_result(result: StrategyResult) -> bool:
+    """True when a strategy returned a refusal row of either kind (see ``not_answerable_kind``)."""
+    return not_answerable_kind(result) is not None
+
+
 def is_low_confidence_empty(result: StrategyResult) -> bool:
     """True when a result returned no rows AND the strategy had low confidence.
 
@@ -236,8 +327,8 @@ def is_low_confidence_empty(result: StrategyResult) -> bool:
 
 def _failed_step_id(strategy_name: str) -> str:
     """Trace step ID for an abandoned strategy, namespaced by its family."""
-    family = "sql" if strategy_name == StrategyOption.NL_TO_SQL else "vkg"
-    return f"t2.{family}.failed"
+    families = {StrategyOption.NL_TO_SQL: "sql", StrategyOption.NL_TO_SPARQL: "sparql"}
+    return f"t2.{families.get(strategy_name, 'vkg')}.failed"
 
 
 class StructuredQueryTier:
@@ -262,30 +353,44 @@ class StructuredQueryTier:
         context: StrategyContext,
         *,
         option: str | StrategyOption = DEFAULT_STRATEGY,
+        structured_backends: frozenset[StructuredBackend] | None = None,
     ) -> StrategyResult | None:
-        """Execute strategies for the given option. Returns first successful result, or None."""
-        strategies = self._strategies_for(option)
+        """Execute strategies for the given option. Returns first successful result, or None.
+
+        ``structured_backends`` are the namespace's backends (``SourceComposition``);
+        the fallback chains keep only strategies serving one of them. ``None`` means
+        SQL.
+        """
+        strategies = self._strategies_for(option, structured_backends)
         if option == StrategyOption.BEST:
             return await self._resolve_parallel(query, namespace, context, strategies)
         return await self._resolve_sequential(query, namespace, context, strategies)
 
-    def _strategies_for(self, option: str) -> list[StructuredQueryStrategy]:
-        """Select and order strategies based on the option."""
+    def _strategies_for(
+        self, option: str, structured_backends: frozenset[StructuredBackend] | None = None
+    ) -> list[StructuredQueryStrategy]:
+        """Select and order strategies based on the option and the namespace's backends.
+
+        A pinned strategy runs as asked — caller intent is never overridden by
+        backend selection. Every chain keeps only strategies whose backends meet the
+        namespace's, in registration order: a SQL-only namespace never runs the
+        SPARQL strategy, a graph-only one never runs the SQL ones, and a mixed one
+        runs all of them, each gated to its own classes by the T-Box gate.
+        """
         # Normalize here as well as in the orchestrator: a direct caller (test,
         # benchmark harness) reaching resolve(option=...) with the pre-rename
         # spelling must still get the agent, not the fallback chain.
         option = normalize_strategy_option(option)
-        if option == StrategyOption.DEEP_REASONING:
-            # Opt-in only: the agent runs solely when explicitly pinned, never as a
-            # fallback in any of the sequential/parallel paths below.
-            return [s for s in self._strategies if s.name == StrategyOption.DEEP_REASONING]
-        if option == StrategyOption.ONTOP:
-            return [s for s in self._strategies if s.name == StrategyOption.ONTOP]
-        if option == StrategyOption.NL_TO_SQL:
-            return [s for s in self._strategies if s.name == StrategyOption.NL_TO_SQL]
+        if option in _PINNABLE_STRATEGIES:
+            # The deep-reasoning agent is opt-in only: it runs solely when pinned here,
+            # never as a fallback in any of the sequential/parallel paths below.
+            return [s for s in self._strategies if s.name == option]
         # DEEP_REASONING is never part of a fallback chain — it is an expensive tool-use
         # loop that must not fire implicitly when a cheaper strategy misses.
-        fallback = [s for s in self._strategies if s.name != StrategyOption.DEEP_REASONING]
+        backends = structured_backends if structured_backends is not None else _DEFAULT_BACKENDS
+        fallback = [
+            s for s in self._strategies if s.name != StrategyOption.DEEP_REASONING and s.supported_backends & backends
+        ]
         if option == StrategyOption.ONTOP_FIRST:
             # Stable sort: matching strategy moves to front; others keep insertion order.
             return sorted(fallback, key=lambda s: s.name != StrategyOption.ONTOP)
@@ -300,6 +405,14 @@ class StructuredQueryTier:
         self, query: str, namespace: str, context: StrategyContext, strategies: list[StructuredQueryStrategy]
     ) -> StrategyResult | None:
         attempted: list[str] = []
+        # When the chain includes NL→SPARQL, a non-empty result below the floor does not
+        # end it: the orchestrator discards it unless Tier 2 is pinned, so stopping on it
+        # would starve NL→SPARQL (in a mixed namespace it never ran behind a 0.05 Ontop
+        # answer). The best such result is kept and returned only when no later strategy
+        # does better, so a pinned Tier 2 still gets an answer. Without NL→SPARQL (the
+        # flag off, or a SQL-only namespace) the chain is main's: that result ends it.
+        defers = any(s.name == StrategyOption.NL_TO_SPARQL for s in strategies)
+        deferred: StrategyResult | None = None
         for strategy in strategies:
             attempted.append(strategy.name)
             try:
@@ -326,6 +439,27 @@ class StructuredQueryTier:
                                 "confidence": result.confidence,
                             },
                         )
+                        continue
+                    if defers and result.confidence < EMPTY_RESULT_CONFIDENCE_FLOOR:
+                        logger.info(
+                            "strategy_low_confidence_deferred",
+                            strategy=strategy.name,
+                            confidence=result.confidence,
+                            row_count=result.row_count,
+                            attempted=attempted,
+                        )
+                        context.trace.record(
+                            _failed_step_id(strategy.name),
+                            "failed",
+                            0,
+                            detail={
+                                "strategy": strategy.name,
+                                "reason": "low_confidence",
+                                "confidence": result.confidence,
+                            },
+                        )
+                        if deferred is None or result.confidence > deferred.confidence:
+                            deferred = result
                         continue
                     logger.info(
                         "strategy_resolved",
@@ -359,6 +493,14 @@ class StructuredQueryTier:
                     detail={"strategy": strategy.name, "error": type(e).__name__},
                 )
                 continue
+        if deferred is not None:
+            logger.info(
+                "strategy_resolved_low_confidence",
+                strategy=deferred.strategy_name,
+                confidence=deferred.confidence,
+                attempted=attempted,
+            )
+            return deferred
         logger.info("strategy_all_failed", attempted=attempted)
         return None
 
@@ -472,7 +614,15 @@ class StructuredQueryTier:
         # "SELECT 1 AS uselessVariable" no-mapping result), so neither its own
         # confidence nor its notional authority is a safe ranking signal today.
         # Until the VKG path improves, prefer the strategy that measurably works.
-        acceptable.sort(key=lambda pair: (_strategy_precedence(pair[0].strategy_name), -pair[0].confidence))
+        # A NOT_ANSWERABLE refusal ranks below every real answer, so another strategy's rows beat
+        # it; it wins only when no strategy produced a real answer (it is then final).
+        acceptable.sort(
+            key=lambda pair: (
+                is_not_answerable_result(pair[0]),
+                _strategy_precedence(pair[0].strategy_name),
+                -pair[0].confidence,
+            )
+        )
         winner, winner_ctx = acceptable[0]
         logger.info(
             "tier2_parallel_winner",

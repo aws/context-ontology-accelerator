@@ -9,7 +9,13 @@ import {
   STEP_DISPLAY_NAMES,
   CEDAR_STEP_IDS,
   FIREWALL_STEP_IDS,
+  localizeLiveStep,
+  localizeTraceStep,
+  firewallLabel,
+  isGraphAnswer,
 } from "./step-labels";
+import type { AppTranslate } from "../../i18n/LocaleProvider";
+import { MESSAGES_JA } from "../../i18n/messages.ja";
 
 describe("mapTraceStatus", () => {
   it("maps success-like statuses to success", () => {
@@ -93,12 +99,51 @@ describe("agentic mode trace rendering", () => {
     "agentic_working_answer",
     "agentic_final_semantic_search",
     "agentic_retrieval_stop",
+    "stop_signals",
+    "subquestion_stop",
+    "sufficiency_confidence_hold",
+    "answer_stability",
     "llm_synthesize",
   ];
 
   it("every agentic step ID has a live label", () => {
     for (const id of AGENTIC_STEP_IDS) {
       expect(STEP_LABELS[id]).toBeTruthy();
+    }
+  });
+
+  it("labels the stop-signal steps in the live and trace maps", () => {
+    const translate: AppTranslate = (message) => message;
+    expect(localizeLiveStep(translate, "stop_signals")).toBe(
+      "Checking stop signals",
+    );
+    expect(localizeLiveStep(translate, "sufficiency_confidence_hold")).toBe(
+      "Confidence too low, continuing",
+    );
+    expect(localizeTraceStep(translate, "subquestion_stop")).toBe(
+      "Subquestion Stop",
+    );
+    expect(localizeTraceStep(translate, "answer_stability")).toBe(
+      "Answer Stability",
+    );
+  });
+
+  it("has a Japanese translation for every stop-signal label", () => {
+    for (const id of [
+      "stop_signals",
+      "subquestion_stop",
+      "sufficiency_confidence_hold",
+      "answer_stability",
+    ]) {
+      expect(MESSAGES_JA).toHaveProperty([STEP_LABELS[id]]);
+    }
+    for (const traceName of [
+      "Stop Signals",
+      "Subquestion Stop",
+      "Sufficiency Confidence Hold",
+      "Answer Stability",
+    ]) {
+      expect(MESSAGES_JA).toHaveProperty(traceName);
     }
   });
 
@@ -114,5 +159,42 @@ describe("agentic mode trace rendering", () => {
     expect(mapTraceStatus("timeout")).toBe("warning");
     expect(mapTraceStatus("unknown_tool")).toBe("warning");
     expect(mapTraceStatus("invalid_input")).toBe("warning");
+  });
+});
+
+describe("native SPARQL steps", () => {
+  const ids = [
+    "t2.sparql.context",
+    "t2.sparql.translate",
+    "t2.sparql.validate",
+    "t2.sparql.firewall",
+    "t2.sparql.execute",
+  ];
+
+  it("labels every t2.sparql.* step the backend emits", () => {
+    for (const id of ids) {
+      expect(STEP_LABELS[id]).toBeTruthy();
+      expect(STEP_DISPLAY_NAMES[id]).toBeTruthy();
+    }
+    expect(STEP_DISPLAY_NAMES["t2.sparql.failed"]).toBeTruthy();
+  });
+
+  it("treats the SPARQL firewall as a boundary control with its own label", () => {
+    expect(FIREWALL_STEP_IDS.has("t2.sparql.firewall")).toBe(true);
+    expect(firewallLabel("t2.sparql.firewall")).toBe("SPARQL Firewall");
+    expect(firewallLabel("t2.sql.firewall")).toBe("SQL Firewall");
+    expect(firewallLabel(undefined)).toBe("SQL Firewall");
+  });
+
+  it("recognizes a graph answer only from a successful graph execution", () => {
+    expect(
+      isGraphAnswer([{ step: "t2.sparql.execute", status: "success" }]),
+    ).toBe(true);
+    expect(
+      isGraphAnswer([{ step: "t2.sparql.execute", status: "error" }]),
+    ).toBe(false);
+    expect(isGraphAnswer([{ step: "t2.vkg.execute", status: "success" }])).toBe(
+      false,
+    );
   });
 });

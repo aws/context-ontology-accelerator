@@ -57,6 +57,25 @@ const COLUMNS: Array<{
   { id: "definedBy", label: "Defined by" },
 ];
 
+// The Name column shows the label when there is one, so it sorts on what it
+// shows, compared the way the table sorts its other text columns.
+const byShownName = (
+  a: MetricWithDataSource,
+  b: MetricWithDataSource,
+): number => (a.label || a.name || "").localeCompare(b.label || b.name || "");
+
+// The service stores labels NFC, so typed text is compared in NFC too.
+const nfc = (value: unknown): string =>
+  typeof value === "string" ? value.normalize("NFC") : "";
+const labelContains = (value: unknown, token: unknown): boolean =>
+  nfc(value).toLowerCase().includes(nfc(token).toLowerCase());
+const LABEL_OPERATORS: PropertyFilterProps.FilteringProperty["operators"] = [
+  { operator: "=", match: (value, token) => nfc(value) === nfc(token) },
+  { operator: "!=", match: (value, token) => nfc(value) !== nfc(token) },
+  { operator: ":", match: labelContains },
+  { operator: "!:", match: (value, token) => !labelContains(value, token) },
+];
+
 export const MetricList: React.FC = () => {
   const { t } = useAppI18n();
   const { namespaceId } = useParams<{ namespaceId: string }>();
@@ -112,6 +131,12 @@ export const MetricList: React.FC = () => {
         propertyLabel: t("Name"),
         groupValuesLabel: t("Name values"),
         operators: ["=", "!=", ":", "!:"],
+      },
+      {
+        key: "label",
+        propertyLabel: t("Display label"),
+        groupValuesLabel: t("Display label values"),
+        operators: LABEL_OPERATORS,
       },
       {
         key: "dataSourceName",
@@ -211,6 +236,11 @@ export const MetricList: React.FC = () => {
     () =>
       allMetricsRaw.map((m) => ({
         ...m,
+        // Free text reads a missing value as the string "undefined", so "fin"
+        // would match every metric without a label or definedBy, and the
+        // filtered bulk delete would take them too.
+        label: m.label ?? "",
+        definedBy: m.definedBy ?? "",
         dataSourceName: m.dataSourceId
           ? (sourceNameById.get(m.dataSourceId) ?? m.dataSourceId)
           : "",
@@ -271,7 +301,9 @@ export const MetricList: React.FC = () => {
       ),
     },
     pagination: { pageSize: preferences.pageSize ?? 20 },
-    sorting: { defaultState: { sortingColumn: { sortingField: "name" } } },
+    sorting: {
+      defaultState: { sortingColumn: { sortingComparator: byShownName } },
+    },
   });
 
   // Auto-fetch next server page when user reaches the end of loaded data
@@ -665,18 +697,31 @@ export const MetricList: React.FC = () => {
           {
             id: "name",
             header: t("Name"),
+            // The display label, when the metric has one, with the name it is
+            // addressed by underneath.
             cell: (item: MetricDefinition) => (
-              <Link
-                href={`/namespaces/${namespaceId}/metrics/${item.name}`}
-                onFollow={(e) => {
-                  e.preventDefault();
-                  navigate(`/namespaces/${namespaceId}/metrics/${item.name}`);
-                }}
-              >
-                {item.name}
-              </Link>
+              <>
+                <Link
+                  href={`/namespaces/${namespaceId}/metrics/${item.name}`}
+                  onFollow={(e) => {
+                    e.preventDefault();
+                    navigate(`/namespaces/${namespaceId}/metrics/${item.name}`);
+                  }}
+                >
+                  {item.label || item.name}
+                </Link>
+                {item.label && (
+                  <Box
+                    variant="small"
+                    display="block"
+                    color="text-body-secondary"
+                  >
+                    {item.name}
+                  </Box>
+                )}
+              </>
             ),
-            sortingField: "name",
+            sortingComparator: byShownName,
             minWidth: 180,
           },
           {

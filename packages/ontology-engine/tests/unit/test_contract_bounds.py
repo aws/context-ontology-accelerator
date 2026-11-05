@@ -158,6 +158,55 @@ def test_constraint_config_bound_equals_the_documented_one():
     assert int(m.group(1)) == proposals.MAX_CONSTRAINT_CONFIG_BYTES
 
 
+def _structure_members(text: str, shape: str) -> dict[str, list[str]]:
+    """``member -> trait lines`` for a top-level ``structure``."""
+    m = re.search(rf"structure\s+{shape}\s*\{{(.*?)\n\}}", text, re.S)
+    assert m, f"structure {shape} not found"
+    members: dict[str, list[str]] = {}
+    traits: list[str] = []
+    for line in m.group(1).splitlines():
+        stripped = line.strip()
+        if stripped.startswith("@"):
+            traits.append(stripped)
+        elif mm := re.match(r"([A-Za-z_]\w*)\s*:", stripped):
+            members[mm.group(1)] = traits
+            traits = []
+    return members
+
+
+def _field_bounds(info) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for meta in info.metadata:
+        for attr, key in (("ge", "min"), ("le", "max"), ("min_length", "min"), ("max_length", "max")):
+            if getattr(meta, attr, None) is not None:
+                out[key] = getattr(meta, attr)
+    return out
+
+
+def test_bridge_options_match_the_model_member_for_member():
+    """Same members (by contract name) and the same @range / @length bounds as the runtime."""
+    from coa_ontology.inducer.bridge.planner import BridgeOptions
+
+    model = _structure_members(_INDUCTION, "BridgeOptions")
+    runtime = {info.alias or name: info for name, info in BridgeOptions.model_fields.items()}
+    assert set(model) == set(runtime)
+    for member, traits in model.items():
+        declared: dict[str, float] = {}
+        for trait in traits:
+            if m := re.match(r"@(?:range|length)\((.*)\)", trait):
+                declared = {k: float(v) for k, v in re.findall(r"(min|max):\s*([\d.]+)", m.group(1))}
+        assert declared == _field_bounds(runtime[member]), member
+
+
+def test_bridge_job_values_are_in_the_enums():
+    """The strategy, job status and source type a bridge job uses are modelled values."""
+    from coa_ontology.inducer.bridge import service
+
+    assert "bridge_to_tables" in _enum_values(_INDUCTION, "InductionStrategy")
+    assert {"pending", "running", "completed", "failed"} <= _enum_values(_INDUCTION, "InductionJobStatus")
+    assert service.SOURCE_TYPE in _enum_values(_INDUCTION, "InductionSourceType")
+
+
 def test_ingest_format_enum_is_exactly_what_the_parser_understands():
     """Every enum value must parse as a real format, and every parser spelling be accepted."""
     assert _enum_values(_GRAPH, "OntologyFileFormat") == set(ingest._RDFLIB_FORMATS)

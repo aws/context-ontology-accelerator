@@ -13,7 +13,7 @@ from dataclasses import dataclass
 import regex
 import structlog
 from coa_common import validate_namespace_name
-from coa_common.constants import MAX_QUERY_CODEPOINTS
+from coa_common.constants import MAX_QUERY_CODEPOINTS, VOCAB_URI, StructuredBackend
 
 logger = structlog.get_logger(__name__)
 
@@ -644,6 +644,28 @@ def named_graphs_sparql(graph_uri_prefix: str, *, limit: int) -> str:
         }} LIMIT {int(limit)}"""
 
 
+QUERY_BACKEND_IRI = f"{VOCAB_URI}queryBackend"
+
+
+def backend_gate(var: str, backend: StructuredBackend) -> str:
+    """SPARQL pattern keeping ``?var`` only if it is a class answered by ``backend``.
+
+    The second signal of the T-Box gate (``coa:isMapped`` is the first). Import writes
+    ``coa:queryBackend "RDF_SPARQL"`` on graph classes only, so an ABSENT marker means
+    SQL: the SQL gate excludes graph classes rather than requiring a marker, and every
+    class that predates the marker keeps answering. The literal is plain, matched by
+    term equality, exactly as ``store_class`` writes it.
+
+    Args:
+        var: Variable name without the ``?`` (e.g. ``"class"``, ``"parentClass"``).
+        backend: Which backend's classes to keep.
+    """
+    graph_marker = f'?{var} <{QUERY_BACKEND_IRI}> "{StructuredBackend.RDF_SPARQL.value}" .'
+    if backend == StructuredBackend.RDF_SPARQL:
+        return graph_marker
+    return f"FILTER NOT EXISTS {{ {graph_marker} }}"
+
+
 def object_properties_sparql(
     graph_uri_prefix: str,
     *,
@@ -652,6 +674,7 @@ def object_properties_sparql(
     with_comment: bool = False,
     graph_iris: list[str] | None = None,
     domain_iris: list[str] | None = None,
+    query_backend: StructuredBackend | None = None,
 ) -> str:
     """Build the namespace-scoped ``owl:ObjectProperty`` (FK join path) query.
 
@@ -689,6 +712,9 @@ def object_properties_sparql(
             DOMAIN is anchored, so an edge from an unanchored class into an anchored
             one is dropped. Callers that need the whole FK graph (the traversal tool)
             omit it.
+        query_backend: When given, keep only edges whose BOTH ends are classes of
+            that backend (:func:`backend_gate`). Without it a mixed namespace's SQL
+            prompt could name a graph class through an edge, and vice versa.
 
     Returns:
         A SPARQL SELECT binding ``?op ?opLabel ?domain ?domainLabel ?range
@@ -700,6 +726,9 @@ def object_properties_sparql(
     gate = ""
     if mapped_gate_iri:
         gate = f"?domain <{mapped_gate_iri}> true .\n            ?range <{mapped_gate_iri}> true ."
+    if query_backend is not None:
+        ends = [backend_gate("domain", query_backend), backend_gate("range", query_backend)]
+        gate = "\n            ".join([gate, *ends] if gate else ends)
     comment_select = " ?comment" if with_comment else ""
     comment_pattern = "\n            OPTIONAL { ?op rdfs:comment ?comment }" if with_comment else ""
     # Anchor first so the planner starts from the bound set rather than from

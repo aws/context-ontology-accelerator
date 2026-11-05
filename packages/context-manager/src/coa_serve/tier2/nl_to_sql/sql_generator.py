@@ -28,7 +28,7 @@ from typing import Any, Protocol, runtime_checkable
 
 import sqlglot
 import structlog
-from coa_common.constants import sql_ident
+from coa_common.constants import StructuredBackend, sql_ident
 from sqlglot.dialects.trino import Trino
 
 from ...clients.base import ConverseResult, LLMClient, VectorClient, VectorHit
@@ -179,7 +179,7 @@ _DIALECT_CONFIGS: dict[str, dict[str, str]] = {
         "example_sql": (
             "SELECT\n"
             "  c.region,\n"
-            "  COALESCE(SUM(o.total), 0) AS total_revenue\n"
+            "  SUM(o.total) AS total_revenue\n"
             "FROM orders o\n"
             "JOIN customers c ON o.customer_id = c.id\n"
             "WHERE o.order_date >= DATE '2024-01-01'\n"
@@ -199,7 +199,7 @@ _DIALECT_CONFIGS: dict[str, dict[str, str]] = {
         "example_sql": (
             "SELECT\n"
             "  c.region,\n"
-            "  COALESCE(SUM(o.total), 0) AS total_revenue\n"
+            "  SUM(o.total) AS total_revenue\n"
             "FROM orders o\n"
             "JOIN customers c ON o.customer_id = c.id\n"
             "WHERE o.order_date >= '2024-01-01'::date\n"
@@ -216,7 +216,34 @@ _SHARED_RULES = (
     "exact literals (matching case); do not alter case or invent a value\n"
     "- Use the FK relationship comments (-- FK: ...) to construct correct JOINs\n"
     "- Use table aliases for readability in multi-table queries\n"
-    "- Handle potential NULLs with COALESCE where aggregation results could be empty\n"
+    # A COALESCE to 0 turns "no rows for that period" into a real-looking zero, and a blank
+    # flag turned into 'N' invents a value. Only default to 0 inside the range the table states.
+    "- Use COALESCE(SUM(...), 0) only when the period or entity asked about lies inside the data "
+    "range in the table description. Never turn a blank flag or text value into 'N', 'No', "
+    "'None' or 0: a blank means not recorded\n"
+    # Look-alike identifiers, two-column keys, codes held in another table, exact listed
+    # values, and the same rows held as of different dates. Each is true of any column of that kind.
+    "- Identifiers of different kinds are not interchangeable, even when the numbers look alike "
+    "(order number, ticket number, event ID, line ID). Use the column whose note names that kind "
+    "of identifier. To go from one kind to another, look it up in the table that holds both\n"
+    "- A row identified by two columns (for example order and line) is matched on both. If a "
+    "column note says 'with <other column>', join on both; one column alone repeats rows\n"
+    "- If a column note says its meaning, category or fleet is held in another table, join that "
+    "table by the code instead of guessing from text in other columns. Where a note names a "
+    "different column for matching (a key without its suffix), match on that column\n"
+    "- If a column note lists exact values, use them in full and in the same case\n"
+    "- When two tables hold the same kind of rows as of different dates, pick by the date the "
+    "question names. The table descriptions state each date\n"
+    # Say "not answerable" instead of returning a number for a period the data does not
+    # hold or a measure with no column.
+    "- If a table description states a data range or snapshot date and the question names a "
+    "date, month, year or snapshot outside it, do not use the nearest one and do not answer 0. "
+    "Return exactly: SELECT 'NOT_ANSWERABLE_RANGE: <what was asked> is outside the data; "
+    "<table> covers <range>' AS answer\n"
+    "- A measure (cost, price, amount, duration) must come from a column of the entity asked "
+    "about. If that entity's table and its joined tables have no such column, do not use a column "
+    "of another entity (a part's unit cost is not a service job's cost). Return exactly: "
+    "SELECT 'NOT_ANSWERABLE_FIELD: no <measure> field for <entity>' AS answer\n"
     # Output-shape conventions — cheap, high-frequency correctness fixes measured on
     # BIRD (result-set equality is exact, so column shape / literal format matter):
     "- SELECT EXACTLY the column(s) the question asks for and nothing more — do not add "
@@ -311,6 +338,9 @@ class GraphExpander(Protocol):
 
 # {bare table: data_source_id ("" if unplaced)} -> {bare table: (source_id, database)}.
 TablePlacementResolver = Callable[[dict[str, str]], Awaitable[dict[str, tuple[str, str]]]]
+
+# () -> IRIs of the namespace's uploaded (user_created) ontologies; [] when none.
+UploadedOntologyResolver = Callable[[], Awaitable[list[str]]]
 
 # [bare table] -> {bare table: {database: data_source_id}}, for the names two or more
 # of the namespace's databases hold, whether or not retrieval returned each copy.
@@ -441,6 +471,7 @@ class SQLGenerator:
         governed_metric: str = "",
         table_placements: TablePlacementResolver | None = None,
         same_name_databases: SameNameDatabaseResolver | None = None,
+        uploaded_ontologies: UploadedOntologyResolver | None = None,
     ) -> NLtoSQLResult:
         """Run the NL-to-SQL pipeline: retrieve → expand → generate SQL.
 
@@ -482,6 +513,10 @@ class SQLGenerator:
                 copy), a bare reference is refused naming every database, and a
                 qualified one is routed to that database. ``None``, or an empty mapping (every
                 single-database namespace), leaves prompt and routing unchanged.
+            uploaded_ontologies: Optional resolver of the namespace's uploaded
+                ontology IRIs. Used only when no mapped class is retrieved: the
+                search is retried within those ontologies (an uploaded ontology has
+                no R2RML, so no ``data_source_id``). ``None`` keeps the namespace dark.
         """
         trace: list[dict[str, Any]] = []
 
@@ -505,53 +540,39 @@ class SQLGenerator:
         # Step 2: Retrieve classes (entity_type="class" excludes column/property
         # entries that don't match the "Table: ..." text format).
         #
-        # SERVER-SIDE mapped filter with a legacy bridge. We want only R2RML-mapped
-        # classes (a ``data_source_id``, stamped at ingest from the class's R2RML
-        # TriplesMap): unmapped (unstructured-induced / foundational) classes have
-        # no backing table, so NL->SQL would author SQL against a NONEXISTENT table.
-        # The mapped gate is pushed into the k-NN ``filter`` (exists data_source_id),
-        # so AOSS returns the true top-retrieval_k mapped classes in one round-trip.
-        #
-        # Legacy bridge: namespaces ingested before data_source_id was written carry
-        # ZERO mapped records, so the mapped gate would hide ALL their classes and
-        # silently break Tier-2. A cheap count gate (count_documents) decides once
-        # per request whether the namespace has ANY mapped class; if none, we drop
-        # the gate and run an unfiltered top-k (mirrors the T-Box isMapped bridge).
+        # SERVER-SIDE mapped filter. Only R2RML-mapped classes (a ``data_source_id``,
+        # stamped at ingest from the class's R2RML TriplesMap) have a backing table:
+        # unmapped (unstructured-induced / foundational) classes would make NL->SQL
+        # author SQL against a NONEXISTENT table. The gate is pushed into the k-NN
+        # ``filter`` (exists data_source_id), so AOSS returns the true top-retrieval_k
+        # mapped classes in one round-trip. A namespace with no mapped class goes to
+        # step 2b (uploaded ontologies only); failing that (e.g. a structured
+        # induction proposal not yet accepted) it retrieves nothing and skips SQL
+        # generation.
         start = time.perf_counter()
         try:
-            mapped_count = await self._vector.count_documents(index=index, entity_type="class", require_mapped=True)
-            use_mapped_gate = mapped_count > 0
-
+            # SQL backend gate (here and in step 2b): graph classes belong to the SPARQL strategy.
             hits = await self._vector.search(
                 query_embedding,
                 namespace=namespace,
                 top_k=self._retrieval_k,
                 index=index,
                 entity_type="class",
-                require_mapped=use_mapped_gate,
+                require_mapped=True,
+                query_backend=StructuredBackend.SQL,
             )
             retrieved_tables = _extract_table_names(hits)
             status = "ok" if retrieved_tables else "empty"
 
-            # Log retrieval accounting: whether the mapped gate was applied (vs a
-            # legacy unfiltered fallback) and how many classes came back. WARNING on
-            # an empty result — a chronically dark namespace is worth surfacing.
+            # WARNING on an empty result — a chronically dark namespace is worth surfacing.
             log_fn = logger.warning if not hits else logger.info
-            log_fn(
-                "nl_to_sql_retrieve_hits",
-                namespace=namespace,
-                mapped_gate=use_mapped_gate,
-                mapped_count=mapped_count,
-                kept=len(hits),
-            )
+            log_fn("nl_to_sql_retrieve_hits", namespace=namespace, kept=len(hits))
             trace.append(
                 {
                     "step": "retrieve",
                     "status": status,
                     "ms": _ms(start),
                     "tables": retrieved_tables,
-                    "mapped_gate": use_mapped_gate,
-                    "mapped_count": mapped_count,
                     "kept": len(hits),
                 }
             )
@@ -559,6 +580,15 @@ class SQLGenerator:
             logger.warning("nl_to_sql_retrieve_failed", error=str(e), error_type=type(e).__name__)
             trace.append({"step": "retrieve", "status": "error", "ms": _ms(start), "error": type(e).__name__})
             return NLtoSQLResult(sql="", trace_steps=trace, error=f"retrieve_failed: {type(e).__name__}")
+
+        # Step 2b: top-down fallback. An uploaded ontology carries no R2RML, so none
+        # of its classes has a ``data_source_id`` and the gate above hides them all.
+        # Retry scoped to the namespace's UPLOADED ontologies (``ontology_id`` in
+        # them), never ungated: document-induced and foundational classes stay out,
+        # so an unaccepted proposal stays dark and pays one cheap lookup.
+        if not hits and uploaded_ontologies is not None:
+            hits = await self._retrieve_uploaded(query_embedding, namespace, index, uploaded_ontologies, trace)
+            retrieved_tables = _extract_table_names(hits)
 
         if not retrieved_tables:
             return NLtoSQLResult(sql="", trace_steps=trace, error="no_tables_retrieved")
@@ -912,6 +942,51 @@ class SQLGenerator:
         )
         _warn_if_truncated(result, max_tokens, step="correct")
         return _extract_sql(result.text), _extract_confidence(result.text)
+
+    async def _retrieve_uploaded(
+        self,
+        query_embedding: list[float],
+        namespace: str,
+        index: str | None,
+        uploaded_ontologies: UploadedOntologyResolver,
+        trace: list[dict[str, Any]],
+    ) -> list[VectorHit]:
+        """Top-k classes of the namespace's uploaded ontologies, or [] when it has none.
+
+        Fails soft: an error leaves the namespace dark, as the gate alone would.
+        """
+        start = time.perf_counter()
+        try:
+            ontology_ids = await uploaded_ontologies()
+            hits = (
+                await self._vector.search(
+                    query_embedding,
+                    namespace=namespace,
+                    top_k=self._retrieval_k,
+                    index=index,
+                    entity_type="class",
+                    ontology_ids=ontology_ids,
+                    query_backend=StructuredBackend.SQL,
+                )
+                if ontology_ids
+                else []
+            )
+        except Exception as e:
+            logger.warning("nl_to_sql_retrieve_uploaded_failed", error=f"{type(e).__name__}: {str(e)[:120]}")
+            trace.append({"step": "retrieve_uploaded", "status": "error", "ms": _ms(start), "error": type(e).__name__})
+            return []
+        logger.info("nl_to_sql_retrieve_uploaded", namespace=namespace, ontologies=len(ontology_ids), kept=len(hits))
+        trace.append(
+            {
+                "step": "retrieve_uploaded",
+                "status": "ok" if hits else "empty",
+                "ms": _ms(start),
+                "tables": _extract_table_names(hits),
+                "ontologies": len(ontology_ids),
+                "kept": len(hits),
+            }
+        )
+        return hits
 
     def _expand_with_fk(self, tables: list[str]) -> list[str]:
         """Add 1-hop FK neighbors until max_tables is reached."""

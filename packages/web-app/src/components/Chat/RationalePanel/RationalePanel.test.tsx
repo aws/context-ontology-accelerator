@@ -5,7 +5,7 @@ import React from "react";
 import { render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { RationalePanel } from "./RationalePanel";
-import type { ChatMessage } from "@app-types";
+import type { ChatMessage, TraceStep } from "@app-types";
 import { normalizeResponse } from "@api-hooks/normalize-response";
 
 function renderPanel(props: React.ComponentProps<typeof RationalePanel>) {
@@ -482,6 +482,66 @@ describe("RationalePanel", () => {
     it("does not render supporting content when not provided", () => {
       renderPanel({ message: minimalMessage });
       expect(screen.queryByText(/Supporting content/)).not.toBeInTheDocument();
+    });
+  });
+
+  describe("Tier-2 native SPARQL (graph) answers", () => {
+    function tier2Message(trace: TraceStep[]): ChatMessage {
+      return {
+        id: "msg-graph",
+        role: "assistant",
+        content: "3 tickets are open.",
+        timestamp: new Date("2026-01-01T12:00:00Z"),
+        response: {
+          requestId: "req-graph",
+          result: {
+            tier: 2,
+            confidence: { score: 0.9, rationale: "High confidence match" },
+            trace,
+            partial: false,
+          },
+        },
+      };
+    }
+
+    const graphTrace: TraceStep[] = [
+      { step: "t2.sparql.context", status: "success", durationMs: 30 },
+      { step: "t2.sparql.translate", status: "success", durationMs: 200 },
+      { step: "t2.sparql.firewall", status: "success", durationMs: 2 },
+      { step: "t2.sparql.execute", status: "success", durationMs: 40 },
+    ];
+
+    it("labels the section NL→SPARQL (graph), not VKG (Ontop)", () => {
+      renderPanel({ message: tier2Message(graphTrace) });
+      expect(
+        screen.getAllByText("Tier 2 — Structured Query (NL→SPARQL (graph))")
+          .length,
+      ).toBeGreaterThanOrEqual(1);
+      expect(screen.queryByText(/VKG \(Ontop\)/)).not.toBeInTheDocument();
+    });
+
+    it("labels the firewall badge SPARQL Firewall", () => {
+      renderPanel({ message: tier2Message(graphTrace) });
+      // Badge and the execution-plan step name both read "SPARQL Firewall".
+      expect(
+        screen.getAllByText(/SPARQL Firewall/).length,
+      ).toBeGreaterThanOrEqual(2);
+      expect(screen.queryByText(/^SQL Firewall/)).not.toBeInTheDocument();
+    });
+
+    it("splits a mixed run into one subgroup per strategy", () => {
+      renderPanel({
+        message: tier2Message([
+          { step: "t2.sql.generate", status: "success", durationMs: 100 },
+          { step: "t2.sql.failed", status: "failed", durationMs: 0 },
+          ...graphTrace,
+        ]),
+      });
+      expect(
+        screen.getAllByText(
+          "Tier 2 — Structured Query (NL→SQL + NL→SPARQL (graph))",
+        ).length,
+      ).toBeGreaterThanOrEqual(1);
     });
   });
 });

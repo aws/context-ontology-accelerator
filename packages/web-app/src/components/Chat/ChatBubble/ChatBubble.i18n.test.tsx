@@ -82,3 +82,54 @@ describe("ChatBubble — typed Playground errors", () => {
     expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
   });
 });
+
+describe("ChatBubble — a native graph answer's caption", () => {
+  afterEach(() => {
+    window.localStorage.clear();
+    document.documentElement.lang = "";
+  });
+
+  // nl_to_sparql: SPARQL and no SQL, so the caption says it ran against the graph.
+  function renderGraphAnswer(locale: "en" | "ja") {
+    window.localStorage.setItem("scl.locale", locale);
+    return render(
+      <LocaleProvider>
+        <ChatBubble
+          role="assistant"
+          state="success"
+          content="Two alliances"
+          timestamp={new Date("2026-01-01T12:00:00Z")}
+          response={{
+            tier: 2,
+            confidence: 0.9,
+            rationale: "Answered from the graph",
+            synthesizedAnswer: "Two alliances",
+            latencyMs: 120,
+            sparqlGenerated: "SELECT ?a WHERE { ?a a :Alliance }",
+          }}
+        />
+      </LocaleProvider>,
+    );
+  }
+
+  it("is shown in Japanese for a Japanese user", async () => {
+    renderGraphAnswer("ja");
+    expect(
+      await screen.findByText(
+        "LLM が生成した SPARQL（Tier 2）。グラフに対して直接実行されました。",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(/executed directly against the graph/i),
+    ).not.toBeInTheDocument();
+  });
+
+  it("stays in English for an English user", async () => {
+    renderGraphAnswer("en");
+    expect(
+      await screen.findByText(
+        "The SPARQL the LLM emitted (Tier 2), executed directly against the graph.",
+      ),
+    ).toBeInTheDocument();
+  });
+});

@@ -79,3 +79,41 @@ class TestTtlLruCache:
             TtlLruCache[str, int](ttl_s=0, max_size=10)
         with pytest.raises(ValueError):
             TtlLruCache[str, int](ttl_s=10, max_size=0)
+
+
+@pytest.mark.unit
+class TestOnEvict:
+    def _cache(self, now, evicted, **kwargs):
+        return TtlLruCache(ttl_s=10, max_size=2, time_fn=lambda: now[0], on_evict=evicted.append, **kwargs)
+
+    def test_lru_eviction_reports_the_dropped_value(self):
+        evicted: list[str] = []
+        cache = self._cache([0.0], evicted)
+        cache.set("a", "A")
+        cache.set("b", "B")
+        cache.set("c", "C")
+        assert evicted == ["A"]
+
+    def test_expiry_on_read_reports_the_dropped_value(self):
+        now, evicted = [0.0], []
+        cache = self._cache(now, evicted)
+        cache.set("a", "A")
+        now[0] = 11.0
+        assert cache.get("a") is None
+        assert evicted == ["A"]
+
+    def test_replacing_a_key_reports_the_old_value_only_when_it_changes(self):
+        evicted: list[str] = []
+        cache = self._cache([0.0], evicted)
+        cache.set("a", "A1")
+        cache.set("a", "A1")
+        cache.set("a", "A2")
+        assert evicted == ["A1"]
+
+    def test_clear_returns_values_without_reporting_them(self):
+        evicted: list[str] = []
+        cache = self._cache([0.0], evicted)
+        cache.set("a", "A")
+        assert cache.clear() == ["A"]
+        assert evicted == []
+        assert len(cache) == 0

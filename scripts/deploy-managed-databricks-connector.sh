@@ -207,6 +207,11 @@ echo "  VPC:            ${CONNECTOR_VPC_ID}"
 echo "  Subnets:        ${CONNECTOR_SUBNET_IDS}"
 echo ""
 
+# Checked before the install and build: the jar is built by `mvn package`, whose enforcer
+# rule rejects a Maven running on JDK 25+.
+"$REPO_ROOT/scripts/check-maven.sh" || exit 1
+echo ""
+
 # ── Build and deploy ─────────────────────────────────────────────────────────
 # connectors/ is a workspace of its own (see connectors/pnpm-workspace.yaml), so the
 # repository-root install does not reach it and every pnpm command runs from there.

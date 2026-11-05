@@ -28,6 +28,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 import structlog
+from coa_common.constants import StructuredBackend
 
 from ...clients.base import LLMClient, VectorClient, VectorHit
 
@@ -116,6 +117,8 @@ class TableCatalog:
             top_k=max(top_k * _POOL_MULTIPLIER, _MIN_POOL),
             index=self._index,
             entity_type="class",
+            # A graph class carries a data_source_id too; it is not a SQL table.
+            query_backend=StructuredBackend.SQL,
         )
         mapped = [hit for hit in raw if hit.data_source_id][:top_k]
         candidates: list[TableCandidate] = []
@@ -164,6 +167,7 @@ class TableCatalog:
                 top_k=_MIN_POOL,
                 index=self._index,
                 entity_type="class",
+                query_backend=StructuredBackend.SQL,
             )
         except Exception as e:
             logger.debug("tier2_table_lookup_failed", table=name, error=type(e).__name__, message=str(e)[:200])

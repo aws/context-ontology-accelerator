@@ -11,6 +11,7 @@ import { NetworkStack } from "../../lib/stacks/foundation/network-stack";
 import { StorageStack } from "../../lib/stacks/foundation/storage-stack";
 import { SourcesStack } from "../../lib/stacks/services/sources-stack";
 import { expectAossGrantsCoveredByDataPolicies } from "../utils/aoss-access-assertions";
+import { expectEveryTaskCanPullGuardDutyAgent } from "../utils/guardduty-agent-assertions";
 
 // Mock bundlePython to avoid fingerprinting the entire repo root during tests.
 jest.mock("../../lib/utils/python-bundling", () => ({
@@ -35,24 +36,32 @@ const TEST_CONTEXT = {
   "aws:cdk:bundling-stacks": [],
 };
 
+function synthSources(extraContext: Record<string, unknown> = {}): Template {
+  const app = new cdk.App({ context: { ...TEST_CONTEXT, ...extraContext } });
+  const network = new NetworkStack(app, "TestNetwork", { env: TEST_ENV });
+  const storage = new StorageStack(app, "TestStorage", {
+    network,
+    env: TEST_ENV,
+  });
+  return Template.fromStack(
+    new SourcesStack(app, "TestSources", {
+      network,
+      storage,
+      allowedOrigin: "https://test.example.com",
+      env: TEST_ENV,
+    }),
+  );
+}
+
 describe("SourcesStack", () => {
   let template: Template;
 
   beforeAll(() => {
-    const app = new cdk.App({ context: TEST_CONTEXT });
-    const network = new NetworkStack(app, "TestNetwork", { env: TEST_ENV });
-    const storage = new StorageStack(app, "TestStorage", {
-      network,
-      env: TEST_ENV,
-    });
-    template = Template.fromStack(
-      new SourcesStack(app, "TestSources", {
-        network,
-        storage,
-        allowedOrigin: "https://test.example.com",
-        env: TEST_ENV,
-      }),
-    );
+    template = synthSources();
+  });
+
+  it("lets every task execution role pull the GuardDuty Fargate agent", () => {
+    expectEveryTaskCanPullGuardDutyAgent(template, 2, TEST_ENV.region);
   });
 
   it("names every aoss:APIAccessAll role in an AOSS data-access policy", () => {
@@ -1546,6 +1555,294 @@ describe("SourcesStack", () => {
     });
   });
 
+  describe("graph sources off (the default): main's template", () => {
+    const functionsEnv = () =>
+      Object.values(template.findResources("AWS::Lambda::Function")).map(
+        (f: any) => [
+          f.Properties.FunctionName,
+          f.Properties.Environment?.Variables ?? {},
+        ],
+      ) as [unknown, Record<string, unknown>][];
+
+    it("has no graph-verify function or queues", () => {
+      const names = JSON.stringify([
+        ...Object.values(template.findResources("AWS::Lambda::Function")).map(
+          (f: any) => f.Properties.FunctionName,
+        ),
+        ...Object.values(template.findResources("AWS::SQS::Queue")).map(
+          (q: any) => q.Properties.QueueName,
+        ),
+      ]);
+      expect(names).not.toContain("graph-verify");
+      expect(JSON.stringify(template.toJSON())).not.toContain(
+        "SparqlSourceEgressSG",
+      );
+    });
+
+    it("has no graph-verify IAM statements", () => {
+      const statements = JSON.stringify(
+        Object.values(template.findResources("AWS::IAM::Policy")).map(
+          (p: any) => p.Properties.PolicyDocument.Statement,
+        ),
+      );
+      expect(statements).not.toContain("GraphVerify");
+      expect(statements).not.toContain("neptune-db:GetEngineStatus");
+    });
+
+    it("has no cluster-claim release metric filters or alarm", () => {
+      expect(JSON.stringify(template.toJSON())).not.toContain(
+        "GraphClusterClaimReleaseFailed",
+      );
+      expect(
+        JSON.stringify(template.findResources("AWS::Logs::MetricFilter")),
+      ).not.toContain("graph_cluster_claim_release_failed");
+    });
+
+    it("sets neither GRAPH_VERIFY_QUEUE_URL nor GRAPH_SOURCES_ENABLED on any function", () => {
+      for (const [, env] of functionsEnv()) {
+        expect(env).not.toHaveProperty("GRAPH_VERIFY_QUEUE_URL");
+        expect(env).not.toHaveProperty("GRAPH_SOURCES_ENABLED");
+      }
+    });
+  });
+
+  describe("Graph-verify pipeline (RDF_SPARQL reachability)", () => {
+    // Synthesized with the switch on; the outer template is the default (off).
+    let template: Template;
+    beforeAll(() => {
+      template = synthSources({ graph_sources: "on" });
+    });
+
+    const resourceNamed = (type: string, prop: string, pattern: RegExp) => {
+      const found = Object.entries(template.findResources(type)).find(
+        ([, r]: [string, any]) => pattern.test(r.Properties[prop] ?? ""),
+      );
+      expect(found).toBeDefined();
+      return found! as [string, any];
+    };
+    const verifyFn = () =>
+      resourceNamed(
+        "AWS::Lambda::Function",
+        "FunctionName",
+        /sources-graph-verify$/,
+      );
+    const verifyQueue = () =>
+      resourceNamed(
+        "AWS::SQS::Queue",
+        "QueueName",
+        /sources-graph-verify-queue$/,
+      );
+    const verifyDlq = () =>
+      resourceNamed(
+        "AWS::SQS::Queue",
+        "QueueName",
+        /sources-graph-verify-dlq$/,
+      );
+    const statementsOfRole = (roleId: string) =>
+      Object.values(template.findResources("AWS::IAM::Policy"))
+        .filter((p: any) =>
+          p.Properties.Roles?.some((r: any) => r.Ref === roleId),
+        )
+        .flatMap((p: any) => p.Properties.PolicyDocument.Statement);
+
+    it("has an encrypted queue redriving to a 14-day DLQ after 3 receives", () => {
+      const [, queue] = verifyQueue();
+      const [dlqId, dlq] = verifyDlq();
+      expect(queue.Properties.SqsManagedSseEnabled).toBe(true);
+      expect(queue.Properties.RedrivePolicy.maxReceiveCount).toBe(3);
+      expect(JSON.stringify(queue.Properties.RedrivePolicy)).toContain(dlqId);
+      expect(dlq.Properties.MessageRetentionPeriod).toBe(14 * 24 * 60 * 60);
+    });
+
+    it("rejects non-TLS access to both queues", () => {
+      const [queueId] = verifyQueue();
+      const [dlqId] = verifyDlq();
+      const policies = JSON.stringify(
+        template.findResources("AWS::SQS::QueuePolicy"),
+      );
+      for (const id of [queueId, dlqId]) {
+        const policy = Object.values(
+          template.findResources("AWS::SQS::QueuePolicy"),
+        ).find((p: any) =>
+          JSON.stringify(p.Properties.Queues).includes(id),
+        ) as any;
+        expect(policy).toBeDefined();
+        expect(JSON.stringify(policy.Properties.PolicyDocument)).toContain(
+          "aws:SecureTransport",
+        );
+      }
+      expect(policies).toContain("aws:SecureTransport");
+    });
+
+    it("runs the packaged handler in the VPC with the SPARQL egress SG", () => {
+      const [, fn] = verifyFn();
+      expect(fn.Properties.Handler).toBe(
+        "coa_sources.database.graph_verify.handler.handler",
+      );
+      expect(fn.Properties.Architectures).toEqual(["arm64"]);
+      expect(fn.Properties.Timeout).toBe(30);
+      expect(fn.Properties.VpcConfig.SecurityGroupIds).toHaveLength(2);
+      expect(
+        JSON.stringify(fn.Properties.VpcConfig.SecurityGroupIds),
+      ).toContain("SparqlSourceEgressSG");
+      expect(Object.keys(fn.Properties.Environment.Variables)).toEqual(
+        expect.arrayContaining(["SOURCES_TABLE", "SOURCE_SCAN_JOBS_TABLE"]),
+      );
+    });
+
+    it("consumes its own queue one message at a time", () => {
+      const [queueId] = verifyQueue();
+      const [fnId] = verifyFn();
+      const mapping = Object.values(
+        template.findResources("AWS::Lambda::EventSourceMapping"),
+      ).find((m: any) =>
+        JSON.stringify(m.Properties.EventSourceArn).includes(queueId),
+      ) as any;
+      expect(mapping).toBeDefined();
+      expect(mapping.Properties.BatchSize).toBe(1);
+      expect(JSON.stringify(mapping.Properties.FunctionName)).toContain(fnId);
+    });
+
+    it("may only call GetEngineStatus, on this account's clusters in this region", () => {
+      const [, fn] = verifyFn();
+      const neptune = statementsOfRole(
+        fn.Properties.Role["Fn::GetAtt"][0],
+      ).filter((s: any) => JSON.stringify(s.Action).includes("neptune-db:"));
+      expect(neptune).toHaveLength(1);
+      expect(neptune[0].Action).toBe("neptune-db:GetEngineStatus");
+      const resource = JSON.stringify(neptune[0].Resource);
+      expect(resource).not.toBe('"*"');
+      // The verify refuses a source that signs for another region, so the grant does not reach one.
+      expect(resource).not.toContain("neptune-db:*:");
+      expect(resource).toContain("AWS::Region");
+      expect(resource).toContain("AWS::AccountId");
+    });
+
+    it("may list this account's Neptune clusters and their endpoints in its own region, to confine the probe", () => {
+      const [, fn] = verifyFn();
+      const describe = statementsOfRole(
+        fn.Properties.Role["Fn::GetAtt"][0],
+      ).filter((s: any) => JSON.stringify(s.Action).includes("rds:"));
+      expect(describe).toHaveLength(1);
+      expect(describe[0].Action).toEqual([
+        "rds:DescribeDBClusterEndpoints",
+        "rds:DescribeDBClusters",
+      ]);
+      const resource = JSON.stringify(describe[0].Resource);
+      expect(resource).toContain(":rds:");
+      expect(resource).toContain("AWS::Region");
+      expect(resource).toContain("AWS::AccountId");
+      expect(resource).toContain(":cluster:*");
+      // Custom endpoints are listed by DescribeDBClusterEndpoints, whose resource is the endpoint.
+      expect(resource).toContain(":cluster-endpoint:*");
+    });
+
+    it("tells verify the queue's receive limit, so its last attempt records a failure", () => {
+      const [, fn] = verifyFn();
+      const [, queue] = verifyQueue();
+      expect(
+        fn.Properties.Environment.Variables.GRAPH_VERIFY_MAX_RECEIVES,
+      ).toBe(String(queue.Properties.RedrivePolicy.maxReceiveCount));
+    });
+
+    it("names the platform catalog cluster, so verify refuses its endpoints", () => {
+      const [, fn] = verifyFn();
+      const id =
+        fn.Properties.Environment.Variables.PLATFORM_NEPTUNE_CLUSTER_ID;
+      // The storage stack's fixed dbClusterIdentifier, not an import (see
+      // graph-sources-switch-exports.test.ts).
+      expect(id).toBe("coa-dev-neptune");
+    });
+
+    it("turns graph sources on in the Sources API and graph-verify runtimes", () => {
+      const [, fn] = verifyFn();
+      const [, api] = resourceNamed(
+        "AWS::Lambda::Function",
+        "FunctionName",
+        /-sources-api$/,
+      );
+      expect(fn.Properties.Environment.Variables.GRAPH_SOURCES_ENABLED).toBe(
+        "true",
+      );
+      expect(api.Properties.Environment.Variables.GRAPH_SOURCES_ENABLED).toBe(
+        "true",
+      );
+    });
+
+    it("lets the Sources API enqueue verifies (env + SendMessage)", () => {
+      const [queueId] = verifyQueue();
+      const [, api] = resourceNamed(
+        "AWS::Lambda::Function",
+        "FunctionName",
+        /sources-api$/,
+      );
+      expect(
+        api.Properties.Environment.Variables.GRAPH_VERIFY_QUEUE_URL,
+      ).toEqual({ Ref: queueId });
+      const canSend = statementsOfRole(
+        api.Properties.Role["Fn::GetAtt"][0],
+      ).some(
+        (s: any) =>
+          [s.Action].flat().includes("sqs:SendMessage") &&
+          JSON.stringify(s.Resource).includes(queueId),
+      );
+      expect(canSend).toBe(true);
+    });
+
+    it("alarms on the DLQ and on the Lambda", () => {
+      const [dlqId] = verifyDlq();
+      const [fnId] = verifyFn();
+      const alarms = JSON.stringify(
+        template.findResources("AWS::CloudWatch::Alarm"),
+      );
+      expect(alarms).toContain(dlqId);
+      expect(alarms).toContain(fnId);
+    });
+
+    it("alarms on a failed cluster claim release from verify or delete", () => {
+      const filters = Object.values(
+        template.findResources("AWS::Logs::MetricFilter"),
+      ).filter((f: any) =>
+        JSON.stringify(f.Properties.FilterPattern).includes(
+          "graph_cluster_claim_release_failed",
+        ),
+      ) as any[];
+      // Each filter reads the log group CDK pre-creates for the function (a LogRetention resource naming it).
+      const resources = template.toJSON().Resources;
+      const groups = JSON.stringify(
+        filters.map((f) => {
+          const name = f.Properties.LogGroupName;
+          const owner = name["Fn::GetAtt"]?.[0];
+          return owner ? resources[owner].Properties.LogGroupName : name;
+        }),
+      );
+      const [verifyId] = verifyFn();
+      const [apiId] = resourceNamed(
+        "AWS::Lambda::Function",
+        "FunctionName",
+        /-sources-api$/,
+      );
+      // A deployed stack runs source deletes in the delete worker, which releases the claim too.
+      const [deleteWorkerId] = resourceNamed(
+        "AWS::Lambda::Function",
+        "FunctionName",
+        /-sources-delete-worker$/,
+      );
+      expect(groups).toContain(verifyId);
+      expect(groups).toContain(apiId);
+      expect(groups).toContain(deleteWorkerId);
+      const metricNames = new Set(
+        filters.map((f) => f.Properties.MetricTransformations[0].MetricName),
+      );
+      expect(metricNames).toEqual(new Set(["GraphClusterClaimReleaseFailed"]));
+      template.hasResourceProperties("AWS::CloudWatch::Alarm", {
+        MetricName: "GraphClusterClaimReleaseFailed",
+        Threshold: 1,
+        TreatMissingData: "notBreaching",
+      });
+    });
+  });
+
   describe("Bulk Review Pipeline", () => {
     it("creates a SQS queue with SQS-managed encryption and 6-minute visibility timeout", () => {
       template.hasResourceProperties("AWS::SQS::Queue", {
@@ -2054,7 +2351,9 @@ describe("SourcesStack", () => {
     // built when it triggered the job; they never re-read the namespace.
     const flatDefinitions = (): string =>
       JSON.stringify(
-        Object.values(template.findResources("AWS::StepFunctions::StateMachine")),
+        Object.values(
+          template.findResources("AWS::StepFunctions::StateMachine"),
+        ),
       ).replace(/\\+"/g, '"');
 
     it("passes NAMESPACE_LANGUAGE from $.namespaceLanguage to the enrichment task", () => {
@@ -2309,6 +2608,14 @@ describe("SourcesStack", () => {
       const resourceStr = JSON.stringify(batchJobStatement.Resource);
       expect(resourceStr).toContain("foundation-model/*");
       expect(resourceStr).toContain("inference-profile/*");
+      // CreateModelInvocationJob authorizes against the job resource it creates
+      // too; omitting it fails every batch submit with AccessDenied. Batch
+      // inference is the default ingestion path, so this ARN must stay.
+      expect(resourceStr).toContain("model-invocation-job/*");
+      // The job resource is account-scoped (the account segment is an
+      // AWS::AccountId Ref), never the cross-account wildcard
+      // `arn:aws:bedrock:*::model-invocation-job/*`.
+      expect(resourceStr).not.toContain("*::model-invocation-job");
     });
 
     it("Bedrock InvokeModel is scoped to specific model ARNs", () => {

@@ -35,7 +35,8 @@ to create manually for a first login.
 
 ### What's Already Set Up
 
-The `coa-dev-auth` stack (`IdpAuthenticationStack`) creates, at deploy time:
+The `<prefix>-<env>-auth` stack (`IdpAuthenticationStack`; `coa-dev-auth` with the default `SCL_PREFIX` and
+`dev` environment) creates, at deploy time:
 
 - A Cognito **User Pool** with a hosted UI domain
 - A **web app client** (Authorization Code + PKCE, no client secret) used by the React app
@@ -43,15 +44,17 @@ The `coa-dev-auth` stack (`IdpAuthenticationStack`) creates, at deploy time:
 - An **`Admin` group**, pre-seeded in the authorization tables so that any user
   in this group is automatically granted the `platform-admin` role — no
   manual grant needed
-- An **initial admin user**, created via a CDK custom resource, added to the
-  `Admin` group, with a Cognito-generated temporary password emailed to them
-  (the user must change it on first login)
+- An **initial admin user**, created via a CDK custom resource and added to the
+  `Admin` group. When `initialAdminEmail` is set, Cognito emails it a generated
+  temporary password (the user must change it on first login); the default
+  placeholder user is created without an invitation, so its temporary
+  password is never sent to anyone
 
 Find these values in the CloudFormation outputs:
 
 ```bash
 aws cloudformation describe-stacks \
-  --stack-name coa-dev-auth \
+  --stack-name <prefix>-<env>-auth \
   --query "Stacks[0].Outputs" \
   --output table
 ```
@@ -63,8 +66,8 @@ Key outputs:
 - `CognitoDomainUrl` — the hosted UI domain
 
 **To sign in as the initial admin:** the default username/email is a
-placeholder (`nobody@amazon.com`) that you cannot receive mail at — the
-temporary password Cognito emails on user creation would go nowhere useful.
+placeholder (`nobody@amazon.com`) that you cannot receive mail at, so Cognito
+sends it no invitation and its temporary password is never delivered.
 **Set `initialAdminEmail` in the SSM config at `/<prefix>/config` before your
 first deploy** so the admin user is created under an email you control:
 
@@ -225,7 +228,7 @@ offer every provider.
 Your IdP needs two values from the user pool, and the user pool ID only exists
 after the first deploy. Deploy with the default Cognito config first, or use an
 existing deployment, then read `UserPoolId` and `CognitoDomainUrl` from the
-`coa-dev-auth` stack outputs (see "What's Already Set Up" above).
+`<prefix>-<env>-auth` stack outputs (see "What's Already Set Up" above).
 
 Adding providers to an existing deployment works: the next deploy adds them to
 both app clients.
@@ -311,7 +314,7 @@ assertion, such as
 Microsoft Entra ID or AD FS. Because the mapping is shared, providers in one
 deployment have to send email under the same attribute name.
 
-The OIDC `clientSecret` is written into the `coa-dev-auth` CloudFormation
+The OIDC `clientSecret` is written into the `<prefix>-<env>-auth` CloudFormation
 template.
 
 ### 4. Grant Roles to Federated Users
@@ -408,16 +411,17 @@ Context Ontology Accelerator uses **ID tokens** for all authentication across ev
 
 | Interface | Token type | Key claims |
 |-----------|-----------|------------|
-| **REST API** (API Gateway) | ID token | `aud`, `email`, `groups` |
+| **REST API** (API Gateway) | ID token from the web app client | `aud`, `email`, `groups` |
 | **Playground** (AgentCore SSE) | ID token | `aud`, `email`, `groups` |
-| **MCP** (AgentCore Runtime) | ID token | `aud`, `email`, `groups` |
+| **MCP** (AgentCore Runtime) | ID token from the MCP/CLI client | `aud`, `email`, `groups` |
 
 The ID token carries the user's identity (`email`), group memberships (`groups` claim), and audience (`aud` = client ID). AgentCore Runtime validates the `aud` claim — which is present on ID tokens from any OIDC-compliant provider. Access tokens are **not used**.
 
 ### Getting a token (dev only)
 
 ```bash
-# ID token (used for all APIs)
+# ID token. <CLIENT_ID> is the web app client for the REST API and the
+# MCP/CLI client for the MCP server (see "Which token to send" in agent-access.md)
 aws cognito-idp initiate-auth --auth-flow USER_PASSWORD_AUTH \
   --client-id <CLIENT_ID> --auth-parameters USERNAME=<email>,PASSWORD=<pass> \
   --region <region> --query "AuthenticationResult.IdToken" --output text
@@ -564,7 +568,7 @@ If you used placeholder URLs, update them now:
 1. Get the CloudFront domain from stack outputs:
    ```bash
    aws cloudformation describe-stacks \
-     --stack-name coa-dev-web \
+     --stack-name <prefix>-<env>-web \
      --query "Stacks[0].Outputs[?OutputKey=='DistributionDomainName'].OutputValue" \
      --output text
    ```

@@ -23,8 +23,11 @@ from unittest.mock import MagicMock, patch
 
 import boto3
 import pytest
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, EndpointConnectionError
+from coa_common.constants import SOURCE_ACTIVE_STATUSES
 from coa_common.dao import DynamoDBDAO
+from coa_common.dao.base import PaginatedResult
+from coa_common.sparql_config import GRAPH_SOURCES_ENV
 from moto import mock_aws
 
 _SH = "coa_sources.api.sources_handler"
@@ -669,3 +672,286 @@ class TestFlipToDeletingGuard:
         with pytest.raises(ClientError) as exc:
             self._flip()
         assert exc.value.response["Error"]["Code"] == "ConditionalCheckFailedException"
+
+
+_CLAIM_PK = "GRAPHCLUSTER#us-east-1#cluster-RES1"
+
+
+class TestGraphClusterClaimRelease:
+    """The namespace's last graph source on a cluster releases the claim, and only its own namespace's claim."""
+
+    def _finish(self, others, pages=None):
+        import coa_sources.api.sources_handler as sh
+
+        graph = {"sourceId": _SOURCE_ID, "sourceSubType": "RDF_SPARQL", "graphClusterClaim": _CLAIM_PK}
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = graph
+        mock_dao.query.return_value = PaginatedResult(items=[graph, *others])
+        if pages is not None:
+            mock_dao.query.side_effect = pages
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._delete_source_datazone_assets", return_value=(0, True)),
+            patch(f"{_SH}._delete_source_scan_jobs", return_value=0),
+        ):
+            assert sh.finish_database_source_deletion(_NAMESPACE_ID, _SOURCE_ID, "RDF_SPARQL", "") is True
+        return mock_dao
+
+    def test_the_last_graph_source_on_the_cluster_releases_its_namespaces_claim(self):
+        mock_dao = self._finish([])
+        ((items,), _) = mock_dao.transact_write.call_args
+        (delete,) = [i["Delete"] for i in items]
+        assert delete["Key"] == {"PK": _CLAIM_PK, "SK": "CLAIM"}
+        # No approval has written a token on the claim since it was read.
+        assert delete["ConditionExpression"] == "namespaceId = :ns AND attribute_not_exists(approvalToken)"
+        assert delete["ExpressionAttributeValues"] == {":ns": _NAMESPACE_ID}
+
+    def test_the_claim_is_read_consistently_before_the_release(self):
+        """A stale read of the approval token would cancel a release that should happen, with nothing logged."""
+        mock_dao = self._finish([])
+        claim_reads = [c for c in mock_dao.get.call_args_list if c.args[0] == {"PK": _CLAIM_PK, "SK": "CLAIM"}]
+        assert claim_reads and all(c.kwargs.get("consistent_read") is True for c in claim_reads)
+
+    def test_the_remaining_sources_are_read_consistently(self):
+        """A lagging replica could miss another source's claim note, and the delete would release a claim in use."""
+        mock_dao = self._finish([])
+        assert mock_dao.query.call_args_list
+        assert all(c.args[0].consistent_read for c in mock_dao.query.call_args_list)
+
+    def test_another_source_on_the_same_cluster_keeps_the_claim(self):
+        other = {"sourceId": "other", "sourceSubType": "RDF_SPARQL", "graphClusterClaim": _CLAIM_PK}
+        mock_dao = self._finish([other])
+        mock_dao.transact_write.assert_not_called()
+
+    def test_the_remaining_holders_are_read_after_the_row_is_gone(self):
+        """Two sources on one cluster deleted at once must not each see the other and both keep the claim."""
+        import coa_sources.api.sources_handler as sh
+
+        order: list[str] = []
+        graph = {"sourceId": _SOURCE_ID, "sourceSubType": "RDF_SPARQL", "graphClusterClaim": _CLAIM_PK}
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = graph
+        mock_dao.delete.side_effect = lambda *a, **k: order.append("row")
+        mock_dao.query.side_effect = lambda *a, **k: order.append("holders") or PaginatedResult(items=[])
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._delete_source_datazone_assets", return_value=(0, True)),
+            patch(f"{_SH}._delete_source_scan_jobs", return_value=0),
+        ):
+            assert sh.finish_database_source_deletion(_NAMESPACE_ID, _SOURCE_ID, "RDF_SPARQL", "") is True
+        assert order == ["row", "holders"]
+        mock_dao.transact_write.assert_called_once()
+
+    @pytest.mark.parametrize("then_claimed", [False, True], ids=["approved", "approved-then-claimed"])
+    def test_a_source_approved_while_the_release_reads_the_sources_keeps_the_claim(self, then_claimed):
+        """A sibling's verify that approves between the delete's read of the sources and its release keeps the claim.
+
+        Also when another verify of the namespace claims the cluster after that approval.
+        """
+        import coa_sources.api.sources_handler as sh
+        import coa_sources.database.graph_verify.handler as graph_verify
+
+        claim_key = {"PK": _CLAIM_PK, "SK": "CLAIM"}
+        with mock_aws():
+            ddb = boto3.resource("dynamodb", region_name="us-east-1")
+            ddb.create_table(
+                TableName="sources",
+                KeySchema=[{"AttributeName": "PK", "KeyType": "HASH"}, {"AttributeName": "SK", "KeyType": "RANGE"}],
+                AttributeDefinitions=[{"AttributeName": n, "AttributeType": "S"} for n in ("PK", "SK")],
+                BillingMode="PAY_PER_REQUEST",
+            )
+            table = ddb.Table("sources")
+            table.put_item(Item={**claim_key, "namespaceId": _NAMESPACE_ID})
+            dao = DynamoDBDAO("sources", region="us-east-1")
+            real_query = dao.query
+
+            def sibling_approves_after_the_read(params):
+                page = real_query(params)
+                # The sibling's verify notes the claim and records APPROVED together with it (approvalToken).
+                table.put_item(
+                    Item={
+                        "PK": f"NS#{_NAMESPACE_ID}",
+                        "SK": "SRC#other",
+                        "sourceId": "other",
+                        "status": "APPROVED",
+                        "graphClusterClaim": _CLAIM_PK,
+                    }
+                )
+                table.put_item(Item={**claim_key, "namespaceId": _NAMESPACE_ID, "approvalToken": "t-1"})
+                if then_claimed:
+                    # Another verify of the namespace on the cluster takes the claim afterwards.
+                    with (
+                        patch("coa_sources.database.graph_verify.handler._get_dao", return_value=dao),
+                    ):
+                        assert graph_verify._claim_cluster(_NAMESPACE_ID, claim_key)
+                return page
+
+            with (
+                patch(f"{_SH}._get_dao", return_value=dao),
+                patch(f"{_SH}._SOURCES_TABLE", "sources"),
+                patch.object(dao, "query", side_effect=sibling_approves_after_the_read),
+            ):
+                sh._release_graph_cluster_claim(_NAMESPACE_ID, _SOURCE_ID, _CLAIM_PK)
+            assert table.get_item(Key=claim_key).get("Item") is not None
+
+    def test_a_source_on_a_later_page_of_the_listing_keeps_the_claim(self):
+        other = {"sourceId": "other", "sourceSubType": "RDF_SPARQL", "graphClusterClaim": _CLAIM_PK}
+        first = PaginatedResult(items=[], last_evaluated_key={"PK": f"NS#{_NAMESPACE_ID}", "SK": "SRC#a"})
+        mock_dao = self._finish([], pages=[first, PaginatedResult(items=[other])])
+        mock_dao.transact_write.assert_not_called()
+
+    def _release_on_moto(self, claim, *, approved_meanwhile=False):
+        """Release ``claim`` on a moto table and return what is left of it.
+
+        ``approved_meanwhile``: a sibling's verify approves after the release has read the sources, writing a new token.
+        """
+        import coa_sources.api.sources_handler as sh
+
+        claim_key = {"PK": _CLAIM_PK, "SK": "CLAIM"}
+        with mock_aws():
+            ddb = boto3.resource("dynamodb", region_name="us-east-1")
+            ddb.create_table(
+                TableName="sources",
+                KeySchema=[{"AttributeName": "PK", "KeyType": "HASH"}, {"AttributeName": "SK", "KeyType": "RANGE"}],
+                AttributeDefinitions=[{"AttributeName": n, "AttributeType": "S"} for n in ("PK", "SK")],
+                BillingMode="PAY_PER_REQUEST",
+            )
+            table = ddb.Table("sources")
+            table.put_item(Item={**claim_key, **claim})
+            dao = DynamoDBDAO("sources", region="us-east-1")
+            real_query = dao.query
+
+            def listing(params):
+                page = real_query(params)
+                if approved_meanwhile:
+                    table.put_item(Item={**claim_key, **claim, "approvalToken": "t-2"})
+                return page
+
+            with (
+                patch(f"{_SH}._get_dao", return_value=dao),
+                patch(f"{_SH}._SOURCES_TABLE", "sources"),
+                patch.object(dao, "query", side_effect=listing),
+            ):
+                sh._release_graph_cluster_claim(_NAMESPACE_ID, _SOURCE_ID, _CLAIM_PK)
+            return table.get_item(Key=claim_key).get("Item")
+
+    def test_a_claim_with_an_approval_token_no_source_uses_is_released(self):
+        """Every approval writes a token, so this is the usual release."""
+        assert self._release_on_moto({"namespaceId": _NAMESPACE_ID, "approvalToken": "t-1"}) is None
+
+    def test_a_claim_reapproved_since_its_token_was_read_is_kept(self):
+        claim = {"namespaceId": _NAMESPACE_ID, "approvalToken": "t-1"}
+        left = self._release_on_moto(claim, approved_meanwhile=True)
+        assert left is not None and left["approvalToken"] == "t-2"
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            ClientError({"Error": {"Code": "ProvisionedThroughputExceededException"}}, "GetItem"),
+            EndpointConnectionError(endpoint_url="https://dynamodb.us-east-1"),
+        ],
+        ids=["throttled", "unreachable"],
+    )
+    def test_a_claim_note_that_cannot_be_read_keeps_the_row_for_a_retry(self, error):
+        """Deleting the row without its claim note would orphan the claim, and the namespace would keep the cluster."""
+        import coa_sources.api.sources_handler as sh
+
+        mock_dao = MagicMock()
+        mock_dao.get.side_effect = error
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._delete_source_datazone_assets", return_value=(0, True)),
+            patch(f"{_SH}._delete_source_scan_jobs", return_value=0),
+        ):
+            assert sh.finish_database_source_deletion(_NAMESPACE_ID, _SOURCE_ID, "RDF_SPARQL", "") is False
+        mock_dao.delete.assert_not_called()
+        mock_dao.transact_write.assert_not_called()
+
+    def test_the_claim_note_is_read_consistently_before_the_row_goes(self):
+        mock_dao = self._finish([])
+        note_reads = [
+            c
+            for c in mock_dao.get.call_args_list
+            if c.args[0] == {"PK": f"NS#{_NAMESPACE_ID}", "SK": f"SRC#{_SOURCE_ID}"}
+        ]
+        assert note_reads and all(c.kwargs.get("consistent_read") is True for c in note_reads)
+
+    def test_an_unreachable_table_during_the_release_does_not_fail_the_delete(self):
+        import coa_sources.api.sources_handler as sh
+
+        graph = {"sourceId": _SOURCE_ID, "sourceSubType": "RDF_SPARQL", "graphClusterClaim": _CLAIM_PK}
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = graph
+        mock_dao.query.side_effect = EndpointConnectionError(endpoint_url="https://dynamodb.us-east-1")
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._delete_source_datazone_assets", return_value=(0, True)),
+            patch(f"{_SH}._delete_source_scan_jobs", return_value=0),
+        ):
+            assert sh.finish_database_source_deletion(_NAMESPACE_ID, _SOURCE_ID, "RDF_SPARQL", "") is True
+        mock_dao.delete.assert_called_once()
+
+
+class TestDeleteOfAStrandedGraphSource:
+    """With graph sources off nothing will verify a REGISTERED graph source, so delete takes it; nothing else moves."""
+
+    @pytest.fixture(autouse=True)
+    def _graph_sources_off(self, monkeypatch):
+        monkeypatch.delenv(GRAPH_SOURCES_ENV, raising=False)
+
+    def _delete(self, item, *, queue_url=""):
+        import coa_sources.api.sources_handler as sh
+
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = item
+        mock_dao.query.return_value = PaginatedResult(items=[item])
+        mock_sqs = MagicMock()
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._get_sqs", return_value=mock_sqs),
+            patch(f"{_SH}._SOURCE_DELETE_QUEUE_URL", queue_url),
+            patch(f"{_SH}._delete_source_datazone_assets", return_value=(0, True)),
+            patch(f"{_SH}._delete_source_scan_jobs", return_value=0),
+            patch(f"{_SH}.adjust_namespace_source_count"),
+        ):
+            status, body = _parse(sh._handle_delete(_NAMESPACE_ID, _SOURCE_ID))
+        return status, body, mock_dao, mock_sqs
+
+    @staticmethod
+    def _graph_item(status="REGISTERED"):
+        return {**_db_source_item(status), "sourceSubType": "RDF_SPARQL", "graphClusterClaim": _CLAIM_PK}
+
+    def test_a_registered_graph_source_is_deleted_and_its_claim_released(self):
+        status, body, mock_dao, _ = self._delete(self._graph_item())
+        assert status == 200
+        assert body["status"] == "DELETED"
+        mock_dao.delete.assert_called_once_with({"PK": f"NS#{_NAMESPACE_ID}", "SK": f"SRC#{_SOURCE_ID}"})
+        ((items,), _) = mock_dao.transact_write.call_args
+        (delete,) = [i["Delete"] for i in items]
+        assert delete["Key"] == {"PK": _CLAIM_PK, "SK": "CLAIM"}
+
+    def test_a_registered_graph_source_is_handed_to_the_worker(self):
+        status, body, mock_dao, mock_sqs = self._delete(self._graph_item(), queue_url=_QUEUE_URL)
+        assert status == 202
+        assert body == {"sourceId": _SOURCE_ID, "status": "DELETING"}
+        assert mock_dao.update.call_args.args[1]["status"] == "DELETING"
+        sent = json.loads(mock_sqs.send_message.call_args.kwargs["MessageBody"])
+        assert sent["sub_type"] == "RDF_SPARQL"
+
+    @pytest.mark.parametrize("status", sorted(SOURCE_ACTIVE_STATUSES - {"REGISTERED"}))
+    def test_a_graph_source_in_another_active_status_is_still_409(self, status):
+        code, _, mock_dao, _ = self._delete(self._graph_item(status))
+        assert code == 409
+        mock_dao.delete.assert_not_called()
+
+    def test_a_registered_sql_source_is_still_409(self):
+        code, _, mock_dao, _ = self._delete(_db_source_item("REGISTERED"))
+        assert code == 409
+        mock_dao.delete.assert_not_called()
+
+    def test_with_graph_sources_on_a_registered_graph_source_is_still_409(self, monkeypatch):
+        monkeypatch.setenv(GRAPH_SOURCES_ENV, "true")
+        code, _, mock_dao, _ = self._delete(self._graph_item())
+        assert code == 409
+        mock_dao.delete.assert_not_called()
+        mock_dao.transact_write.assert_not_called()

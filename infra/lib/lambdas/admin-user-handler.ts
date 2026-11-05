@@ -18,6 +18,7 @@ import {
   ResourceNotFoundException,
   UserNotFoundException,
 } from "@aws-sdk/client-cognito-identity-provider";
+import { DEFAULT_ADMIN_EMAIL } from "../constants";
 
 const cognito = new CognitoIdentityProviderClient({});
 
@@ -129,8 +130,8 @@ async function handleDelete(
 }
 
 /**
- * Create the admin user with a temporary password (Cognito emails it)
- * and assign them to the admin group.
+ * Create the admin user with a temporary password (Cognito emails it, except to
+ * the placeholder address) and assign them to the admin group.
  *
  * No permanent password is set — the user must change it on first login.
  * No Secrets Manager secret is created.
@@ -150,7 +151,10 @@ async function createUserAndGroup(
           { Name: "email", Value: email },
           { Name: "email_verified", Value: "true" },
         ],
-        DesiredDeliveryMediums: ["EMAIL"],
+        // The placeholder address is never sent a temporary password.
+        ...(email === DEFAULT_ADMIN_EMAIL
+          ? { MessageAction: "SUPPRESS" as const }
+          : { DesiredDeliveryMediums: ["EMAIL" as const] }),
       }),
     );
     if (!res.User) throw new Error("Failed to create user");

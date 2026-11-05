@@ -434,6 +434,16 @@ export const MESSAGES_JA = {
   "Alphanumeric and underscores, 1-128 characters":
     "英数字とアンダースコア、1〜128 文字",
   monthly_revenue: "monthly_revenue",
+  "Display label (optional)": "表示名（任意）",
+  "Shown in the console instead of the name. Questions are not matched against it; use synonyms for that.":
+    "コンソールで名前の代わりに表示します。質問との照合には使いません（照合には同義語を使います）。",
+  "{count}/{max} characters, counted after Unicode NFC normalization":
+    "{count}/{max} 文字（Unicode の NFC 正規化後に数えます）",
+  "Display label must be {max} characters or fewer":
+    "表示名は {max} 文字以内で入力してください",
+  "Monthly revenue": "月次売上",
+  "Display label": "表示名",
+  "Display label values": "表示名の値",
   "Total revenue from all orders in a calendar month":
     "暦月内のすべての注文による総売上",
   "Select a data source": "データソースを選択",
@@ -774,6 +784,8 @@ export const MESSAGES_JA = {
   "Set the chunk size and overlap in tokens.":
     "チャンクサイズとオーバーラップをトークン数で指定します。",
   "Chunk size (tokens)": "チャンクサイズ（トークン）",
+  "A value in the question was masked by the privacy filter, so the SQL was not run.":
+    "質問内の値がプライバシーフィルターでマスクされたため、SQL を実行しませんでした。",
   "A whole number from 1 to {max}.": "1〜{max} の整数です。",
   "Chunk overlap (tokens)": "チャンクのオーバーラップ（トークン）",
   "Default (25 tokens)": "既定（25 トークン）",
@@ -1145,6 +1157,13 @@ export const MESSAGES_JA = {
     "データからオントロジーを構築する方法を指定します。",
   "Table to Ontology": "テーブルからオントロジー",
   "Unstructured (Lexical Graph)": "非構造化（語彙グラフ）",
+  "Bridge documents to tables": "文書からテーブルへのブリッジ",
+  "Bridge documents to tables — Reads what your documents say about each table and column and proposes definitions for them, so SQL generation knows what a column means. Runs on the accepted ontology after both a table and a document induction; the result is a proposal to review like any other.":
+    "文書からテーブルへのブリッジ — 各テーブルと列について文書に書かれている内容を読み取り、その定義を提案します。これにより SQL 生成が列の意味を把握できます。テーブルと文書の両方の誘導を承認した後、承認済みオントロジーに対して実行します。結果は他と同様にレビューする提案になります。",
+  "Proposes table and column definitions from what the documents say. Needs an accepted table and document induction.":
+    "文書の内容からテーブルと列の定義を提案します。承認済みのテーブル誘導と文書誘導が必要です。",
+  "The bridge runs on this namespace's accepted ontology: it needs an accepted table induction and an accepted document induction. It reads no source selection. When it finishes, its proposal opens for review; nothing changes until you accept it.":
+    "ブリッジはこの名前空間の承認済みオントロジーに対して実行されます。承認済みのテーブル誘導と文書誘導が必要です。データソースの選択は使用しません。完了すると提案がレビュー用に開きます。承認するまで何も変更されません。",
   "Maps relational tables → OWL classes, columns → properties. Best for structured databases.":
     "リレーショナルテーブルを OWL クラス、列をプロパティに対応付けます。構造化データベースに適しています。",
   "Extracts concepts from document sources via NLP and builds a lexical knowledge graph. Exclusively for document sources.":
@@ -1316,6 +1335,8 @@ export const MESSAGES_JA = {
   "Your session has expired. Sign in again.":
     "セッションの有効期限が切れました。もう一度サインインしてください。",
   "The request failed": "リクエストに失敗しました",
+  "The Playground's query service is not available in this environment yet, so questions cannot be sent.":
+    "この環境ではプレイグラウンドのクエリサービスをまだ利用できないため、質問を送信できません。",
   "Kind:": "種別:",
   "Description:": "説明:",
   "Synonyms:": "同義語:",
@@ -1934,6 +1955,7 @@ export const MESSAGES_JA = {
   "Agentic Working Answer": "エージェント回答作成",
   "An unexpected error occurred while rendering this page.":
     "このページの表示中に予期しないエラーが発生しました。",
+  "Answer Stability": "回答の安定性",
   "Applying guardrail": "ガードレールを適用中",
   "Ask a question against the governed surface...":
     "ガバナンスされた情報に質問してください...",
@@ -1955,7 +1977,10 @@ export const MESSAGES_JA = {
   "Catalog context loaded.": "カタログコンテキストを読み込みました。",
   "Cedar authorize": "Cedar 認可",
   "Checked metric catalog.": "メトリクスカタログを確認しました。",
+  "Checking answer stability": "回答の安定性を確認中",
+  "Checking stop signals": "停止シグナルを確認中",
   "Choosing the next tool": "次のツールを選択中",
+  "Confidence too low, continuing": "信頼度が低いため検索を継続中",
   "Chose {strategy}.": "{strategy} を選択しました。",
   "Context Ontology Accelerator": "Context Ontology Accelerator",
   "Copy answer": "回答をコピー",
@@ -1981,6 +2006,7 @@ export const MESSAGES_JA = {
   "Failed to render response": "応答を表示できませんでした",
   Field: "フィールド",
   "Final knowledge-base sweep": "ナレッジベースを最終検索中",
+  "Finishing a sub-question": "サブクエスチョンを終了中",
   "Finishing retrieval": "検索を終了中",
   Firewall: "ファイアウォール",
   "Focusing the graph traversal": "グラフ探索範囲を絞り込み中",
@@ -2111,7 +2137,10 @@ export const MESSAGES_JA = {
     "戦略を中止し、別の方法を試します。",
   "Strategy selected": "戦略を選択",
   "Strategy selected.": "戦略を選択しました。",
+  "Stop Signals": "停止シグナル",
   "Subquestion Start": "サブクエスチョン開始",
+  "Subquestion Stop": "サブクエスチョン終了",
+  "Sufficiency Confidence Hold": "信頼度不足による保留",
   "Supporting content ({count})": "参考コンテンツ（{count} 件）",
   Synthesize: "合成",
   "Synthesize response": "応答を合成",
@@ -2120,6 +2149,8 @@ export const MESSAGES_JA = {
   "Tables: {tables}": "テーブル: {tables}",
   "The SPARQL the LLM emitted (Tier 2) and the SQL {engine} executed.":
     "LLM が生成した SPARQL（Tier 2）と、{engine}が実行した SQL。",
+  "The SPARQL the LLM emitted (Tier 2), executed directly against the graph.":
+    "LLM が生成した SPARQL（Tier 2）。グラフに対して直接実行されました。",
   "The SQL {engine} executed.": "{engine}が実行した SQL。",
   "Thinking...": "考えています...",
   "Tier 1 — Metric Match": "Tier 1 — メトリクス照合",
@@ -2328,4 +2359,96 @@ export const MESSAGES_JA = {
     "。このデータソースは、その誘導を開始した後に再スキャン・再承認されました。",
   "The pending proposal was built on the older source, so accepting it won't include the re-scan's changes. Re-run the induction on the current source, then accept the new proposal.":
     "保留中の提案は以前のデータソースに基づいているため、承認しても再スキャンの変更は含まれません。現在のデータソースで誘導をやり直し、新しい提案を承認してください。",
+  // RDF_SPARQL graph sources (NL→SPARQL strategy).
+  "Blocked — {reason}": "ブロックされました — {reason}",
+  "Graph query failed — {reason}": "グラフクエリに失敗しました — {reason}",
+  "Graph ontology context loaded.":
+    "グラフのオントロジーコンテキストを読み込みました。",
+  "SPARQL firewall passed.": "SPARQL ファイアウォールを通過しました。",
+  "Graph query executed.": "グラフクエリを実行しました。",
+  "Passed; capped at {limit} rows.": "通過しました。上限は {limit} 行です。",
+  "Returned {rows} row(s) from source {source}.":
+    "ソース {source} から {rows} 行を返しました。",
+  "Returned {rows} row(s).": "{rows} 行を返しました。",
+  "NL→SPARQL strategy abandoned.": "NL→SPARQL 戦略を中止しました。",
+  "Loading graph ontology context":
+    "グラフのオントロジーコンテキストを読み込み中",
+  "Checking query safety": "クエリの安全性を確認中",
+  "Querying the graph": "グラフに問い合わせ中",
+  "Assemble graph ontology context": "グラフのオントロジーコンテキストを構築",
+  "SPARQL Firewall": "SPARQL ファイアウォール",
+  "Execute SPARQL on graph": "グラフで SPARQL を実行",
+  "NL→SPARQL strategy failed": "NL→SPARQL 戦略に失敗",
+  "Graph database (SPARQL)": "グラフデータベース（SPARQL）",
+  "Graph (SPARQL)": "グラフ（SPARQL）",
+  "Re-verify": "再検証",
+  "Verification history": "検証履歴",
+  "Reachability check failed": "到達性チェックに失敗しました",
+  "The endpoint could not be reached. Use Re-verify to try again.":
+    "エンドポイントに到達できませんでした。再検証を使ってもう一度お試しください。",
+  "Endpoint verified": "エンドポイントを検証しました",
+  "Graph sources are off": "グラフソースは無効です",
+  "Graph sources are turned off in this deployment, so questions are not answered from this source. You can still view or delete it.":
+    "このデプロイではグラフソースが無効なため、このソースからは質問に回答しません。表示と削除は引き続きできます。",
+  'The graph endpoint is reachable. Questions are answered from it once an imported ontology names this source on its classes with coa_import:dataSourceName "{name}".':
+    'グラフのエンドポイントに到達できます。インポート済みのオントロジーがクラスに coa_import:dataSourceName "{name}" でこのソースを指定すると、質問にはこのエンドポイントから回答します。',
+  "The SPARQL endpoint is reachable and authorized.":
+    "SPARQL エンドポイントに到達でき、アクセスが許可されています。",
+  "Checking endpoint": "エンドポイントを確認中",
+  "Verifying that the SPARQL endpoint is reachable.":
+    "SPARQL エンドポイントに到達できるか確認しています。",
+  "no imported ontology links a class to this namespace's graph source":
+    "この名前空間のグラフデータソースにクラスを関連付けている、インポート済みのオントロジーがありません",
+  "no verified graph source could be resolved for the matched classes":
+    "一致したクラスに対応する、検証済みのグラフデータソースが見つかりませんでした",
+  "the graph source's engine is not supported":
+    "このグラフデータソースのエンジンはサポートされていません",
+  "the generated SPARQL was rejected as unsafe":
+    "生成された SPARQL は安全でないため拒否されました",
+  "the graph endpoint returned an error":
+    "グラフのエンドポイントがエラーを返しました",
+  "(default graph)": "（デフォルトグラフ）",
+  "(deployment region)": "（デプロイ先のリージョン）",
+  "- optional": "（任意）",
+  "Answered from": "回答元",
+  "Graph endpoint": "グラフエンドポイント",
+  "Last verified": "最終検証",
+  "Must be a port number between 1 and 65535.":
+    "1～65535 のポート番号を指定してください。",
+  "Must be an AWS region code, e.g. us-east-1.":
+    "AWS リージョンコードを指定してください（例: us-east-1）。",
+  "Named graph": "名前付きグラフ",
+  "SPARQL Firewall: {status}": "SPARQL ファイアウォール: {status}",
+  "SPARQL endpoint": "SPARQL エンドポイント",
+  "SPARQL endpoint is required.": "SPARQL エンドポイントは必須です。",
+  "A unique name for this source within the namespace. Ontology classes refer to it by this name (coa_import:dataSourceName).":
+    "名前空間内で一意のデータソース名です。オントロジーのクラスはこの名前でソースを参照します（coa_import:dataSourceName）。",
+  "Connect an RDF graph (Amazon Neptune) queried natively with SPARQL. There is no schema scan: registration checks the endpoint is reachable, and the classes come from an ontology you import that names this source.":
+    "SPARQL でネイティブにクエリする RDF グラフ（Amazon Neptune）を接続します。スキーマのスキャンはありません。登録時にはエンドポイントに到達できることを確認し、クラスはこのソースを指定する、インポートしたオントロジーから取得します。",
+  "Context Ontology Accelerator checks the endpoint is reachable and that it may call it. The source then becomes Approved (or Scan failed, with the reason). To answer questions from it, import an ontology whose classes name this source with coa_import:dataSourceName.":
+    "Context Ontology Accelerator は、エンドポイントに到達でき、呼び出しが許可されていることを確認します。その後、ソースは「承認済み」（または理由付きの「スキャン失敗」）になります。このソースから質問に回答するには、クラスが coa_import:dataSourceName でこのソースを指定するオントロジーをインポートしてください。",
+  "Defaults to {port}. The deployed network rules allow only port {port}; an endpoint on any other port will fail its reachability check unless the deployment opens that port.":
+    "既定値は {port} です。デプロイ済みのネットワークルールではポート {port} のみが許可されています。他のポートのエンドポイントは、デプロイでそのポートを開放しない限り到達性チェックに失敗します。",
+  "IAM (SigV4) with this deployment's roles — there is no username, password or secret. The cluster must have IAM authentication enabled and be in this AWS account.":
+    "このデプロイのロールによる IAM（SigV4）認証です。ユーザー名、パスワード、シークレットはありません。クラスターで IAM 認証が有効になっており、この AWS アカウント内にある必要があります。",
+  "Must be a host (db.cluster-x.us-east-1.neptune.amazonaws.com) or an https:// URL with optional port and path.":
+    "ホスト（db.cluster-x.us-east-1.neptune.amazonaws.com）、またはポートとパスを任意で含む https:// URL を指定してください。",
+  "Point at the graph's SPARQL endpoint. No schema is scanned — import an ontology that names this source afterwards.":
+    "グラフの SPARQL エンドポイントを指定します。スキーマはスキャンされません。後で、このソースを指定するオントロジーをインポートしてください。",
+  "Region used to sign requests. Leave blank for this deployment's region.":
+    "リクエストの署名に使うリージョンです。このデプロイのリージョンを使う場合は空欄のままにしてください。",
+  "The SPARQL store. Amazon Neptune is the only engine this release supports.":
+    "SPARQL ストアです。このリリースで対応しているエンジンは Amazon Neptune のみです。",
+  "The cluster endpoint holding the instance data. Queries run directly against it, signed with SigV4.":
+    "インスタンスデータを保持するクラスターエンドポイントです。クエリは SigV4 で署名され、このエンドポイントに対して直接実行されます。",
+  "The named graph holding this source's data. When set, every query is confined to it; leave blank if the data is in the default graph.":
+    "このソースのデータを保持する名前付きグラフです。指定すると、すべてのクエリがこのグラフに限定されます。データがデフォルトグラフにある場合は空欄のままにしてください。",
+  "only read-only queries are allowed":
+    "読み取り専用のクエリのみ許可されています",
+  "the query could not be checked safely": "クエリを安全に検査できませんでした",
+  "the query reached outside the source's graph":
+    "クエリがソースのグラフの外側を参照しました",
+  "the result could not be bounded": "結果の上限を設定できませんでした",
+  'Must be an absolute http(s) IRI without spaces or any of < > " { } | \\ ^ `.':
+    '空白および < > " { } | \\ ^ ` のいずれも含まない、絶対 http(s) IRI を指定してください。',
 } as const;

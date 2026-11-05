@@ -29,6 +29,10 @@ import type {
 import { isStreamingEvent } from "@utils/sse-type-guards";
 import { deriveRuntimeSessionId } from "@utils/runtime-session-id";
 
+/** Shown when the Playground has no query service to send to. */
+export const PLAYGROUND_UNAVAILABLE_MESSAGE =
+  "The Playground's query service is not available in this environment yet, so questions cannot be sent.";
+
 export interface UsePlaygroundStreamOptions {
   /** AgentCore Runtime invocations endpoint (public Bedrock endpoint, fetched cross-origin). */
   queryEndpoint: string | undefined;
@@ -62,7 +66,18 @@ export function usePlaygroundStream({
 
   const submit = useCallback(
     async (request: PlaygroundRequest) => {
-      if (!queryEndpoint || !oidcConfig) return;
+      if (!queryEndpoint || !oidcConfig) {
+        // End the request visibly: returning silently left the chat on "Resolving query" for good.
+        onEventRef.current(
+          makeErrorEvent(
+            request.requestId ?? "",
+            503,
+            PLAYGROUND_UNAVAILABLE_MESSAGE,
+            "PlaygroundUnavailable",
+          ),
+        );
+        return;
+      }
 
       // Cancel any in-flight stream (AbortController pattern per Vercel AI SDK)
       controllerRef.current?.abort();
@@ -209,13 +224,14 @@ function makeErrorEvent(
   requestId: string,
   statusCode: number,
   message: string,
+  error = statusCode === 401 ? "AuthError" : "StreamError",
 ): StreamingErrorEvent {
   return {
     type: "error",
     requestId,
     timestamp: new Date().toISOString(),
     payload: {
-      error: statusCode === 401 ? "AuthError" : "StreamError",
+      error,
       message,
       statusCode,
     },

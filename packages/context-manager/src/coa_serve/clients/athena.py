@@ -120,12 +120,29 @@ class _CatalogContext:
     """
 
 
+_TIMED_OUT_ERROR_TYPES = frozenset({206, 210})
+"""``AthenaError.ErrorType`` values Athena's error catalog describes as "Query timed out" (206 and 210, the only ones).
+
+https://docs.aws.amazon.com/athena/latest/ug/error-reference.html, "Error type reference".
+"""
+
+
+def _engine_timed_out(athena_error: object) -> bool:
+    """Athena stopped the query at its own run-time limit, by its structured error type, never its text."""
+    return isinstance(athena_error, dict) and athena_error.get("ErrorType") in _TIMED_OUT_ERROR_TYPES
+
+
 class AthenaQueryError(RuntimeError):
     """Raised when Athena query execution fails."""
 
 
 class AthenaTimeoutError(TimeoutError):
     """Raised when Athena query exceeds timeout."""
+
+    def __init__(self, message: str, *, remote_cancelled: bool = False) -> None:
+        """``remote_cancelled`` is True only when Athena itself ended the query, so the cancellation is observed."""
+        super().__init__(message)
+        self.remote_cancelled = remote_cancelled
 
 
 _firewall = SQLFirewall()
@@ -367,7 +384,10 @@ class AthenaQueryExecutor:
             if state == "SUCCEEDED":
                 return
             if state in ("FAILED", "CANCELLED"):
-                reason = response["QueryExecution"]["Status"].get("StateChangeReason", "Unknown error")
+                status = response["QueryExecution"]["Status"]
+                reason = status.get("StateChangeReason", "Unknown error")
+                if state == "FAILED" and _engine_timed_out(status.get("AthenaError")):
+                    raise AthenaTimeoutError(f"Athena query {query_id} FAILED: {reason}", remote_cancelled=True)
                 raise AthenaQueryError(f"Athena query {state}: {reason}")
 
             remaining = deadline - time.perf_counter()

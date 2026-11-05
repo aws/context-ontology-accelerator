@@ -55,6 +55,13 @@ def _float_env(name: str, default: float) -> float:
 _PER_SOURCE_TIMEOUT_S = _float_env("TIER3_PER_SOURCE_TIMEOUT_S", 10.0)
 VECTOR_SEARCH_TIMEOUT_S = _float_env("TIER3_VECTOR_TIMEOUT", _PER_SOURCE_TIMEOUT_S)
 GRAPH_TRAVERSE_TIMEOUT_S = _float_env("TIER3_GRAPH_TIMEOUT", _PER_SOURCE_TIMEOUT_S)
+# Bound on the follow-up language detection (one short model call). The language
+# is advisory: when it does not arrive in time, synthesis uses the generic
+# "match the question's language" directive instead of waiting. The call runs
+# alongside retrieval, whose per-source bound is 10 s by default, so the same
+# bound here rarely adds to the request's latency; 5 s timed out live when the
+# model reasoned before naming the tag.
+ANSWER_LANGUAGE_TIMEOUT_S = 10.0
 
 # Callback type aliases
 OnTokenCallback = Callable[[str], Awaitable[None]]
@@ -314,6 +321,10 @@ class KnowledgeRetriever:
         timeout_map = {"vector_search": VECTOR_SEARCH_TIMEOUT_S, "graph_traverse": GRAPH_TRAVERSE_TIMEOUT_S}
         timed_coros = [(name, self._timed_safe_call(coro, timeout_s=timeout_map.get(name))) for name, coro in coros]
 
+        # Resolve the answer language from the CURRENT question while retrieval runs,
+        # so earlier turns in another language cannot decide it (see synthesizer).
+        language_task = asyncio.ensure_future(self._resolve_answer_language(query, conversation_history, model_id))
+
         # Wall-clock timer wraps the gather so parallel retrieval shows true elapsed time
         gather_start = time.perf_counter()
         gathered = await asyncio.gather(*(tc[1] for tc in timed_coros))
@@ -427,6 +438,8 @@ class KnowledgeRetriever:
             )
             trace.record(StepId.T3_CATALOG_CONTEXT, "success", 0, detail=f"{len(catalog_summary)} metrics")
 
+        language = await self._answer_language_kwargs(language_task, trace_steps, trace)
+
         # Synthesize (stream when on_token callback is provided)
         try:
             if on_token and hasattr(self._synthesizer, "synthesize_stream"):
@@ -439,6 +452,7 @@ class KnowledgeRetriever:
                     conversation_history=conversation_history,
                     on_token=on_token,
                     model_id=model_id,
+                    **language,
                 )
             else:
                 synthesis = await self._synthesizer.synthesize(
@@ -449,6 +463,7 @@ class KnowledgeRetriever:
                     catalog_summary=catalog_summary,
                     conversation_history=conversation_history,
                     model_id=model_id,
+                    **language,
                 )
             trace_steps.append(
                 {
@@ -523,6 +538,7 @@ class KnowledgeRetriever:
         lexical_retriever = self._lexical
         if lexical_retriever is None:
             raise RuntimeError("lexical retriever is not configured")
+        language_task = asyncio.ensure_future(self._resolve_answer_language(query, conversation_history, model_id))
         try:
             spec = None
             if retriever_strategy is not None:
@@ -600,6 +616,7 @@ class KnowledgeRetriever:
             )
             trace.record(StepId.T3_CATALOG_CONTEXT, "success", 0, detail=f"{len(catalog_summary)} metrics")
 
+        language = await self._answer_language_kwargs(language_task, trace_steps, trace)
         try:
             synthesis = await self._synthesizer.synthesize(
                 query,
@@ -609,6 +626,7 @@ class KnowledgeRetriever:
                 catalog_summary=catalog_summary,
                 conversation_history=conversation_history,
                 model_id=model_id,
+                **language,
             )
             trace_steps.append(
                 {
@@ -654,6 +672,53 @@ class KnowledgeRetriever:
             trace_steps=tuple(trace_steps),
             degraded_sources=tuple(degraded_sources),
         )
+
+    async def _resolve_answer_language(
+        self, query: str, conversation_history: list[dict[str, str]] | None, model_id: str | None
+    ) -> tuple[str, bool]:
+        """The current question's language tag (or ``""``) and whether detection timed out.
+
+        Bounded by :data:`ANSWER_LANGUAGE_TIMEOUT_S`, counted from when the task
+        starts (alongside retrieval). Never raises.
+        """
+        resolver = getattr(self._synthesizer, "resolve_answer_language", None)
+        if resolver is None:
+            return "", False
+        try:
+            tag = await asyncio.wait_for(
+                resolver(query, conversation_history, model_id=model_id), timeout=ANSWER_LANGUAGE_TIMEOUT_S
+            )
+        except TimeoutError:
+            logger.warning("answer_language_detect_timeout", timeout_s=ANSWER_LANGUAGE_TIMEOUT_S)
+            return "", True
+        except Exception as exc:  # noqa: BLE001 - an unresolved language keeps the old directive.
+            logger.warning("answer_language_resolve_error", error_type=type(exc).__name__)
+            return "", False
+        return (tag if isinstance(tag, str) else ""), False
+
+    @staticmethod
+    async def _answer_language_kwargs(
+        language_task: asyncio.Future[tuple[str, bool]], trace_steps: list[dict], trace: TraceCollector
+    ) -> dict[str, str]:
+        """Await the resolved language; record it and return the synthesis kwargs.
+
+        Only a resolved tag is recorded and passed, so a request whose language
+        is not resolved (a single-turn question, or a follow-up that leaves the
+        language to the model) keeps its previous trace and its "match the
+        question's language" directive. A detection that timed out is recorded
+        as ``timeout`` so a slow request shows why.
+        """
+        tag, timed_out = await language_task
+        if timed_out:
+            detail = f"exceeded {ANSWER_LANGUAGE_TIMEOUT_S:g}s; prompts match the question's language"
+            trace_steps.append({"step": "answer_language", "status": "timeout", "durationMs": 0, "detail": detail})
+            trace.record("answer_language", "timeout", 0, detail=detail)
+            return {}
+        if not tag:
+            return {}
+        trace_steps.append({"step": "answer_language", "status": "success", "durationMs": 0, "detail": tag})
+        trace.record("answer_language", "success", 0, detail=tag)
+        return {"answer_language": tag}
 
     def _record_guardrail_step(
         self, synthesis: SynthesisResult, trace_steps: list[dict], trace: TraceCollector

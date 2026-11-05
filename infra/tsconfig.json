@@ -21,6 +21,7 @@
     "outDir": "./cdk.out/ts",
     "resolveJsonModule": true,
     "esModuleInterop": true,
+    "isolatedModules": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "baseUrl": ".",

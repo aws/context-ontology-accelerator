@@ -148,6 +148,11 @@ class OpenSearchVectorStore(VectorStore):
             doc["context_text"] = item["context_text"]
         if item.get("data_source_id"):
             doc["data_source_id"] = item["data_source_id"]
+        # Retrieval-side twin of the T-Box coa:queryBackend gate. Written only for a
+        # graph (RDF_SPARQL) class; an absent field is read as SQL, so SQL and
+        # pre-existing documents need no re-index.
+        if item.get("query_backend"):
+            doc["query_backend"] = item["query_backend"]
         return doc
 
     def store_embedding(self, data: dict) -> dict:

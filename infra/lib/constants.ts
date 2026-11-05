@@ -199,7 +199,7 @@ export const VECTOR_COLLECTION_SUFFIX = "vector-store";
 /** Default extraction configuration — mirrors constants.py. */
 export const DEFAULT_EXTRACTION_CONFIG = {
   extraction_mode: ExtractionMode.CONTINUOUS,
-  use_batch_inference: "false",
+  use_batch_inference: "true",
   enable_versioning: "true",
   enable_proposition_extraction: "true",
   // Corpus-derived entity-class vocabulary; see graph_build.py.

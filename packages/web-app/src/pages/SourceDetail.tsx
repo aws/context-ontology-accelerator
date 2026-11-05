@@ -1,7 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useContext, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
 import { useNamespace } from "@api-hooks/use-namespace";
@@ -58,6 +58,7 @@ import type {
 } from "@coa/control-plane-client";
 import { useControlPlaneClient } from "@components/ControlPlaneClientProvider";
 import { ButtonWithHint } from "@components/ButtonWithHint";
+import { RuntimeConfigContext } from "@components/RuntimeContext";
 import { sourceStatusType, sourceStatusLabel } from "@utils/source-status";
 import { formatTimestamp } from "@utils/helpers";
 import { tableDetailPath } from "@utils/routes";
@@ -68,6 +69,8 @@ const TABLES_PAGE_SIZE = 25;
 const METADATA_FRESHNESS_THRESHOLD_DAYS = 30;
 // Matches the enricher's publish throttle; polling faster only re-reads the same row.
 const SCAN_PROGRESS_POLL_MS = 5000;
+// sources_handler._GRAPH_VERIFY_STALE_AFTER.
+const GRAPH_VERIFY_STALE_AFTER_MS = 15 * 60 * 1000;
 
 // ── Status helpers ────────────────────────────────────────────────────────────
 
@@ -88,6 +91,7 @@ const DATABASE_SUBTYPE_LABELS: Record<string, AppMessage> = {
   JDBC_DATABASE: "JDBC database",
   CUSTOM_CONNECTOR: "Custom connector",
   DATABRICKS_SQL_WAREHOUSE: "Databricks SQL Warehouse",
+  RDF_SPARQL: "Graph database (SPARQL)",
 };
 
 const SOURCE_STATUS_MESSAGES: Record<string, AppMessage> = {
@@ -219,6 +223,8 @@ function chunkTokens(value: unknown): number | undefined {
 
 export const SourceDetail: React.FC = () => {
   const { t } = useAppI18n();
+  const graphSourcesEnabled =
+    useContext(RuntimeConfigContext)?.graphSourcesEnabled === true;
   const { namespaceId, sourceId } = useParams<{
     namespaceId: string;
     sourceId: string;
@@ -276,6 +282,11 @@ export const SourceDetail: React.FC = () => {
 
   const source = data?.body;
   const isDatabase = source?.sourceType === "DATABASE";
+  // A graph (RDF_SPARQL) source is a DATABASE source with no tables: it is
+  // verified for reachability instead of scanned, and its classes come from an
+  // imported ontology. Everything table-shaped below is gated on isTabular.
+  const isGraph = source?.sourceSubType === "RDF_SPARQL";
+  const isTabular = isDatabase && !isGraph;
 
   // Tables — only fetched for DATABASE sources via the new sources-api tables endpoint.
   // Pages render as they arrive; `tablesLoadingMore` means the list on screen is
@@ -286,10 +297,7 @@ export const SourceDetail: React.FC = () => {
     isLoadingMore: tablesLoadingMore,
     isError: tablesError,
     error: tablesErrorObj,
-  } = useListSourceTables(
-    namespaceId ?? "",
-    isDatabase ? (sourceId ?? "") : "",
-  );
+  } = useListSourceTables(namespaceId ?? "", isTabular ? (sourceId ?? "") : "");
   const approveMutation = useApproveSource(namespaceId ?? "", sourceId ?? "");
   const rejectMutation = useRejectSource(namespaceId ?? "", sourceId ?? "");
   const controlPlaneClient = useControlPlaneClient();
@@ -409,19 +417,39 @@ export const SourceDetail: React.FC = () => {
   const isDocuments = source.sourceType === "DOCUMENTS";
   const isActive = ACTIVE_STATUSES.has(source.status ?? "");
   const status = source.status ?? "";
+  // With graph sources off no verify will ever move a waiting graph source on, and
+  // the backend lets it be deleted (sources_handler._handle_delete).
+  const strandedGraphSource =
+    isGraph && !graphSourcesEnabled && status === SourceStatus.REGISTERED;
+  // With them on, the backend re-verifies a graph source left REGISTERED longer
+  // than any verify can take (sources_handler._waits_for_a_lost_verify).
+  const graphVerifyLost =
+    isGraph &&
+    graphSourcesEnabled &&
+    status === SourceStatus.REGISTERED &&
+    source.updatedAt !== undefined &&
+    Date.now() - new Date(source.updatedAt).getTime() >
+      GRAPH_VERIFY_STALE_AFTER_MS;
 
   // Re-scan entry points mirror the backend's allowed statuses (RescanSource):
   // DATABASE from SCAN_FAILED (recovery), APPROVED / RESCAN_REVIEW (schema-drift
   // re-scan of a live source); DOCUMENTS from COMPLETED (re-ingest) or
   // SCAN_FAILED (retry). Enabling APPROVED is what makes the drift re-scan
   // review flow reachable from the UI.
-  const canRescan = isDatabase
+  // A graph source re-runs its reachability check from APPROVED or SCAN_FAILED,
+  // or after its verify was lost; it never has a re-scan review open.
+  const canRescan = isGraph
     ? status === SourceStatus.SCAN_FAILED ||
       status === SourceStatus.APPROVED ||
-      status === SourceStatus.RESCAN_REVIEW
-    : isDocuments
-      ? status === SourceStatus.COMPLETED || status === SourceStatus.SCAN_FAILED
-      : status === SourceStatus.SCAN_FAILED;
+      graphVerifyLost
+    : isDatabase
+      ? status === SourceStatus.SCAN_FAILED ||
+        status === SourceStatus.APPROVED ||
+        status === SourceStatus.RESCAN_REVIEW
+      : isDocuments
+        ? status === SourceStatus.COMPLETED ||
+          status === SourceStatus.SCAN_FAILED
+        : status === SourceStatus.SCAN_FAILED;
 
   // Type-specific detail objects
   const dbDetails = source.databaseDetails;
@@ -613,7 +641,7 @@ export const SourceDetail: React.FC = () => {
             >
               {t("Refresh")}
             </Button>
-            {isDatabase && (
+            {isTabular && (
               <>
                 <ButtonWithHint
                   hint={
@@ -666,25 +694,27 @@ export const SourceDetail: React.FC = () => {
             )}
             <Button
               onClick={() => setShowDeleteModal(true)}
-              disabled={isActive}
+              disabled={isActive && !strandedGraphSource}
             >
               {t("Delete")}
             </Button>
-            <Button
-              onClick={() => {
-                // An open re-scan review is the only state a re-scan destroys
-                // work in, so it is the only one that asks first.
-                if (status === SourceStatus.RESCAN_REVIEW) {
-                  setShowRescanConfirm(true);
-                  return;
-                }
-                rescan({});
-              }}
-              loading={isRescanning}
-              disabled={!canRescan}
-            >
-              {t("Re-scan")}
-            </Button>
+            {(!isGraph || graphSourcesEnabled) && (
+              <Button
+                onClick={() => {
+                  // An open re-scan review is the only state a re-scan destroys
+                  // work in, so it is the only one that asks first.
+                  if (status === SourceStatus.RESCAN_REVIEW) {
+                    setShowRescanConfirm(true);
+                    return;
+                  }
+                  rescan({});
+                }}
+                loading={isRescanning}
+                disabled={!canRescan}
+              >
+                {isGraph ? t("Re-verify") : t("Re-scan")}
+              </Button>
+            )}
             <Button
               onClick={() => navigate(`/namespaces/${namespaceId}/sources`)}
             >
@@ -736,10 +766,30 @@ export const SourceDetail: React.FC = () => {
         </Alert>
       )}
 
+      {isGraph && status === SourceStatus.APPROVED && graphSourcesEnabled && (
+        <Alert type="info" header={t("Endpoint verified")}>
+          {t(
+            'The graph endpoint is reachable. Questions are answered from it once an imported ontology names this source on its classes with coa_import:dataSourceName "{name}".',
+            { name: source.name ?? "" },
+          )}
+        </Alert>
+      )}
+
+      {isGraph && !graphSourcesEnabled && (
+        <Alert type="warning" header={t("Graph sources are off")}>
+          {t(
+            "Graph sources are turned off in this deployment, so questions are not answered from this source. You can still view or delete it.",
+          )}
+        </Alert>
+      )}
+
       {isDatabase &&
         status === SourceStatus.SCAN_FAILED &&
         scanJobData?.errorMessage && (
-          <Alert type="error" header={t("Scan failed")}>
+          <Alert
+            type="error"
+            header={isGraph ? t("Reachability check failed") : t("Scan failed")}
+          >
             {scanJobData.errorMessage}
           </Alert>
         )}
@@ -847,23 +897,41 @@ export const SourceDetail: React.FC = () => {
                     </StatusIndicator>
                   ),
                 },
+                ...(isGraph
+                  ? [
+                      {
+                        label: t("SPARQL endpoint"),
+                        value: String(
+                          dbDetails?.sparqlConfiguration?.dataEndpoint ?? "—",
+                        ),
+                      },
+                      {
+                        label: t("Named graph"),
+                        value: String(
+                          dbDetails?.sparqlConfiguration?.dataNamedGraph ??
+                            t("(default graph)"),
+                        ),
+                      },
+                    ]
+                  : [
+                      {
+                        label: t("Tables discovered"),
+                        value: String(dbDetails?.tablesDiscovered ?? 0),
+                      },
+                      {
+                        label: t("Tables approved"),
+                        value: `${dbDetails?.tablesApproved ?? 0} / ${dbDetails?.tablesDiscovered ?? 0}`,
+                      },
+                      {
+                        label: t("Metadata enrichment"),
+                        value:
+                          dbDetails?.metadataEnrichmentEnabled === false
+                            ? t("Disabled")
+                            : t("Enabled"),
+                      },
+                    ]),
                 {
-                  label: t("Tables discovered"),
-                  value: String(dbDetails?.tablesDiscovered ?? 0),
-                },
-                {
-                  label: t("Tables approved"),
-                  value: `${dbDetails?.tablesApproved ?? 0} / ${dbDetails?.tablesDiscovered ?? 0}`,
-                },
-                {
-                  label: t("Metadata enrichment"),
-                  value:
-                    dbDetails?.metadataEnrichmentEnabled === false
-                      ? t("Disabled")
-                      : t("Enabled"),
-                },
-                {
-                  label: t("Last scan"),
+                  label: isGraph ? t("Last verified") : t("Last scan"),
                   value: dbDetails?.lastScanAt
                     ? formatTimestamp(dbDetails.lastScanAt)
                     : "—",
@@ -879,286 +947,313 @@ export const SourceDetail: React.FC = () => {
 
           <Tabs
             tabs={[
-              {
-                id: "tables",
-                label: t("Tables ({count})", {
-                  count: `${tables.length}${tablesLoadingMore ? "+" : ""}`,
-                }),
-                content: (
-                  <SpaceBetween size="m">
-                    {tablesError && (
-                      <Alert type="error" header={t("Failed to load tables")}>
-                        {tablesErrorObj instanceof Error
-                          ? tablesErrorObj.message
-                          : t("The table list could not be retrieved.")}{" "}
-                        {(tablesData?.items?.length ?? 0) > 0
-                          ? t("The list below is partial.")
-                          : ""}
-                      </Alert>
-                    )}
-                    {(tablesData?.skippedAssets ?? 0) > 0 && (
-                      <Alert type="warning">
-                        {tablesData?.skippedAssets === 1
-                          ? t(
-                              "1 table could not be loaded due to a data issue. The list below may be incomplete.",
-                            )
-                          : t(
-                              "{count} tables could not be loaded due to data issues. The list below may be incomplete.",
-                              { count: tablesData?.skippedAssets ?? 0 },
-                            )}
-                      </Alert>
-                    )}
-                    <Table
-                      {...collectionProps}
-                      variant="container"
-                      selectionType="multi"
-                      selectedItems={selectedTables}
-                      onSelectionChange={({ detail }) =>
-                        setSelectedTables(detail.selectedItems)
-                      }
-                      loading={tablesLoading}
-                      items={pagedTables}
-                      trackBy="tableId"
-                      columnDefinitions={[
-                        {
-                          id: "name",
-                          header: t("Table"),
-                          sortingField: "tableId",
-                          cell: (item: TableSummary) => (
-                            <Link
-                              onFollow={(e) => {
-                                e.preventDefault();
-                                navigate(
-                                  tableDetailPath(
-                                    namespaceId!,
-                                    sourceId!,
-                                    item.tableId!,
-                                  ),
-                                );
-                              }}
+              ...(isGraph
+                ? []
+                : [
+                    {
+                      id: "tables",
+                      label: t("Tables ({count})", {
+                        count: `${tables.length}${tablesLoadingMore ? "+" : ""}`,
+                      }),
+                      content: (
+                        <SpaceBetween size="m">
+                          {tablesError && (
+                            <Alert
+                              type="error"
+                              header={t("Failed to load tables")}
                             >
-                              {item.tableId}
-                            </Link>
-                          ),
-                        },
-                        {
-                          id: "database",
-                          header: t("Database"),
-                          sortingField: "database",
-                          cell: (item: TableSummary) => item.database,
-                        },
-                        {
-                          id: "columns",
-                          header: t("Columns"),
-                          // No scalar field for the approved/total ratio; sort by
-                          // total column count.
-                          sortingComparator: (
-                            a: TableSummary,
-                            b: TableSummary,
-                          ) => (a.columnCount ?? 0) - (b.columnCount ?? 0),
-                          cell: (item: TableSummary) => {
-                            const total = item.columnCount ?? 0;
-                            const approved = item.columnsApproved ?? 0;
-                            const allApproved = approved >= total && total > 0;
-                            return (
-                              <StatusIndicator
-                                type={allApproved ? "success" : "warning"}
-                              >
-                                {`${approved}/${total}`}
-                              </StatusIndicator>
-                            );
-                          },
-                        },
-                        {
-                          id: "enriched",
-                          header: t("Enriched"),
-                          sortingField: "enrichmentSource",
-                          cell: (item: TableSummary) =>
-                            item.enrichmentSource ? (
-                              <Badge color="blue">
-                                {item.enrichmentSource}
-                              </Badge>
-                            ) : (
-                              "—"
-                            ),
-                        },
-                        {
-                          id: "status",
-                          header: t("Review status"),
-                          sortingField: "reviewStatus",
-                          cell: (item: TableSummary) => {
-                            const s = item.reviewStatus as string;
-                            const type =
-                              s === ReviewStatus.APPROVED
-                                ? "success"
-                                : s === ReviewStatus.REJECTED
-                                  ? "error"
-                                  : "warning";
-                            const label =
-                              s === ReviewStatus.APPROVED
-                                ? t("Approved")
-                                : s === ReviewStatus.REJECTED
-                                  ? t("Rejected")
-                                  : t("Pending review");
-                            return (
-                              <SpaceBetween size="xxs">
-                                <StatusIndicator type={type}>
-                                  {label}
-                                </StatusIndicator>
-                                {item.added && (
-                                  <Badge color="green">{t("New")}</Badge>
-                                )}
-                                {item.pendingDeletion && (
+                              {tablesErrorObj instanceof Error
+                                ? tablesErrorObj.message
+                                : t(
+                                    "The table list could not be retrieved.",
+                                  )}{" "}
+                              {(tablesData?.items?.length ?? 0) > 0
+                                ? t("The list below is partial.")
+                                : ""}
+                            </Alert>
+                          )}
+                          {(tablesData?.skippedAssets ?? 0) > 0 && (
+                            <Alert type="warning">
+                              {tablesData?.skippedAssets === 1
+                                ? t(
+                                    "1 table could not be loaded due to a data issue. The list below may be incomplete.",
+                                  )
+                                : t(
+                                    "{count} tables could not be loaded due to data issues. The list below may be incomplete.",
+                                    { count: tablesData?.skippedAssets ?? 0 },
+                                  )}
+                            </Alert>
+                          )}
+                          <Table
+                            {...collectionProps}
+                            variant="container"
+                            selectionType="multi"
+                            selectedItems={selectedTables}
+                            onSelectionChange={({ detail }) =>
+                              setSelectedTables(detail.selectedItems)
+                            }
+                            loading={tablesLoading}
+                            items={pagedTables}
+                            trackBy="tableId"
+                            columnDefinitions={[
+                              {
+                                id: "name",
+                                header: t("Table"),
+                                sortingField: "tableId",
+                                cell: (item: TableSummary) => (
+                                  <Link
+                                    onFollow={(e) => {
+                                      e.preventDefault();
+                                      navigate(
+                                        tableDetailPath(
+                                          namespaceId!,
+                                          sourceId!,
+                                          item.tableId!,
+                                        ),
+                                      );
+                                    }}
+                                  >
+                                    {item.tableId}
+                                  </Link>
+                                ),
+                              },
+                              {
+                                id: "database",
+                                header: t("Database"),
+                                sortingField: "database",
+                                cell: (item: TableSummary) => item.database,
+                              },
+                              {
+                                id: "columns",
+                                header: t("Columns"),
+                                // No scalar field for the approved/total ratio; sort by
+                                // total column count.
+                                sortingComparator: (
+                                  a: TableSummary,
+                                  b: TableSummary,
+                                ) =>
+                                  (a.columnCount ?? 0) - (b.columnCount ?? 0),
+                                cell: (item: TableSummary) => {
+                                  const total = item.columnCount ?? 0;
+                                  const approved = item.columnsApproved ?? 0;
+                                  const allApproved =
+                                    approved >= total && total > 0;
+                                  return (
+                                    <StatusIndicator
+                                      type={allApproved ? "success" : "warning"}
+                                    >
+                                      {`${approved}/${total}`}
+                                    </StatusIndicator>
+                                  );
+                                },
+                              },
+                              {
+                                id: "enriched",
+                                header: t("Enriched"),
+                                sortingField: "enrichmentSource",
+                                cell: (item: TableSummary) =>
+                                  item.enrichmentSource ? (
+                                    <Badge color="blue">
+                                      {item.enrichmentSource}
+                                    </Badge>
+                                  ) : (
+                                    "—"
+                                  ),
+                              },
+                              {
+                                id: "status",
+                                header: t("Review status"),
+                                sortingField: "reviewStatus",
+                                cell: (item: TableSummary) => {
+                                  const s = item.reviewStatus as string;
+                                  const type =
+                                    s === ReviewStatus.APPROVED
+                                      ? "success"
+                                      : s === ReviewStatus.REJECTED
+                                        ? "error"
+                                        : "warning";
+                                  const label =
+                                    s === ReviewStatus.APPROVED
+                                      ? t("Approved")
+                                      : s === ReviewStatus.REJECTED
+                                        ? t("Rejected")
+                                        : t("Pending review");
+                                  return (
+                                    <SpaceBetween size="xxs">
+                                      <StatusIndicator type={type}>
+                                        {label}
+                                      </StatusIndicator>
+                                      {item.added && (
+                                        <Badge color="green">{t("New")}</Badge>
+                                      )}
+                                      {item.pendingDeletion && (
+                                        <SpaceBetween
+                                          direction="horizontal"
+                                          size="xs"
+                                        >
+                                          <Badge color="red">
+                                            {t("Pending deletion")}
+                                          </Badge>
+                                          <Button
+                                            variant="inline-link"
+                                            loading={
+                                              keepingTableId === item.tableId
+                                            }
+                                            disabled={keepMutation.isPending}
+                                            onClick={() =>
+                                              handleKeepTable(
+                                                item.tableId ?? "",
+                                              )
+                                            }
+                                          >
+                                            {t("Keep")}
+                                          </Button>
+                                        </SpaceBetween>
+                                      )}
+                                      {(item.columnsPendingDeletion ?? 0) >
+                                        0 && (
+                                        <Badge color="red">
+                                          {t(
+                                            item.columnsPendingDeletion === 1
+                                              ? "{count} column pending deletion"
+                                              : "{count} columns pending deletion",
+                                            {
+                                              count:
+                                                item.columnsPendingDeletion ??
+                                                0,
+                                            },
+                                          )}
+                                        </Badge>
+                                      )}
+                                      {(item.pendingRelationships ?? 0) > 0 && (
+                                        <Badge color="blue">
+                                          {t(
+                                            item.pendingRelationships === 1
+                                              ? "{count} relationship pending review"
+                                              : "{count} relationships pending review",
+                                            {
+                                              count:
+                                                item.pendingRelationships ?? 0,
+                                            },
+                                          )}
+                                        </Badge>
+                                      )}
+                                    </SpaceBetween>
+                                  );
+                                },
+                              },
+                            ]}
+                            filter={
+                              <SpaceBetween direction="horizontal" size="xs">
+                                <TextFilter
+                                  {...filterProps}
+                                  filteringPlaceholder={t("Find tables")}
+                                  filteringAriaLabel={t("Filter tables")}
+                                />
+                                <Select
+                                  selectedOption={
+                                    statusFilter
+                                      ? {
+                                          value: statusFilter,
+                                          label: statusFilter,
+                                        }
+                                      : { value: "", label: t("All statuses") }
+                                  }
+                                  onChange={({ detail }) =>
+                                    setStatusFilter(
+                                      detail.selectedOption.value || null,
+                                    )
+                                  }
+                                  options={[
+                                    { value: "", label: t("All statuses") },
+                                    {
+                                      value: ReviewStatus.PENDING_REVIEW,
+                                      label: t("Pending review"),
+                                    },
+                                    {
+                                      value: ReviewStatus.APPROVED,
+                                      label: t("Approved"),
+                                    },
+                                    {
+                                      value: ReviewStatus.REJECTED,
+                                      label: t("Rejected"),
+                                    },
+                                  ]}
+                                  placeholder={t("Filter by status")}
+                                />
+                              </SpaceBetween>
+                            }
+                            pagination={<Pagination {...paginationProps} />}
+                            header={
+                              <Header
+                                variant="h2"
+                                counter={`(${tables.length}${tablesLoadingMore ? "+" : ""})`}
+                                // Text, not just a spinner: a partial list that looks
+                                // complete is worse than a slow one, and screen-reader
+                                // users get no signal from a loading glyph alone.
+                                description={
+                                  tablesLoadingMore
+                                    ? t(
+                                        "Still loading tables — the list below is incomplete.",
+                                      )
+                                    : undefined
+                                }
+                                actions={
                                   <SpaceBetween
                                     direction="horizontal"
                                     size="xs"
                                   >
-                                    <Badge color="red">
-                                      {t("Pending deletion")}
-                                    </Badge>
                                     <Button
-                                      variant="inline-link"
-                                      loading={keepingTableId === item.tableId}
-                                      disabled={keepMutation.isPending}
                                       onClick={() =>
-                                        handleKeepTable(item.tableId ?? "")
+                                        handleBatchReviewTables(
+                                          ReviewDecision.REJECTED,
+                                        )
                                       }
+                                      loading={isBatchReviewing}
+                                      disabled={selectedTables.length === 0}
                                     >
-                                      {t("Keep")}
+                                      {t("Reject selected")}
+                                    </Button>
+                                    <Button
+                                      onClick={() =>
+                                        handleBatchReviewTables(
+                                          ReviewDecision.APPROVED,
+                                        )
+                                      }
+                                      loading={isBatchReviewing}
+                                      disabled={selectedTables.length === 0}
+                                    >
+                                      {t("Approve selected")}
                                     </Button>
                                   </SpaceBetween>
-                                )}
-                                {(item.columnsPendingDeletion ?? 0) > 0 && (
-                                  <Badge color="red">
-                                    {t(
-                                      item.columnsPendingDeletion === 1
-                                        ? "{count} column pending deletion"
-                                        : "{count} columns pending deletion",
-                                      {
-                                        count: item.columnsPendingDeletion ?? 0,
-                                      },
-                                    )}
-                                  </Badge>
-                                )}
-                                {(item.pendingRelationships ?? 0) > 0 && (
-                                  <Badge color="blue">
-                                    {t(
-                                      item.pendingRelationships === 1
-                                        ? "{count} relationship pending review"
-                                        : "{count} relationships pending review",
-                                      { count: item.pendingRelationships ?? 0 },
-                                    )}
-                                  </Badge>
-                                )}
-                              </SpaceBetween>
-                            );
-                          },
-                        },
-                      ]}
-                      filter={
-                        <SpaceBetween direction="horizontal" size="xs">
-                          <TextFilter
-                            {...filterProps}
-                            filteringPlaceholder={t("Find tables")}
-                            filteringAriaLabel={t("Filter tables")}
-                          />
-                          <Select
-                            selectedOption={
-                              statusFilter
-                                ? { value: statusFilter, label: statusFilter }
-                                : { value: "", label: t("All statuses") }
+                                }
+                              >
+                                {t("Tables")}
+                              </Header>
                             }
-                            onChange={({ detail }) =>
-                              setStatusFilter(
-                                detail.selectedOption.value || null,
-                              )
+                            empty={
+                              <Box
+                                textAlign="center"
+                                color="text-status-inactive"
+                                padding="l"
+                              >
+                                {status === "SCANNING" || status === "ENRICHING"
+                                  ? t(
+                                      "Tables will appear here once the scan completes.",
+                                    )
+                                  : status === "REGISTERED"
+                                    ? t("Scan has not started yet.")
+                                    : t("No tables discovered.")}
+                              </Box>
                             }
-                            options={[
-                              { value: "", label: t("All statuses") },
-                              {
-                                value: ReviewStatus.PENDING_REVIEW,
-                                label: t("Pending review"),
-                              },
-                              {
-                                value: ReviewStatus.APPROVED,
-                                label: t("Approved"),
-                              },
-                              {
-                                value: ReviewStatus.REJECTED,
-                                label: t("Rejected"),
-                              },
-                            ]}
-                            placeholder={t("Filter by status")}
                           />
                         </SpaceBetween>
-                      }
-                      pagination={<Pagination {...paginationProps} />}
-                      header={
-                        <Header
-                          variant="h2"
-                          counter={`(${tables.length}${tablesLoadingMore ? "+" : ""})`}
-                          // Text, not just a spinner: a partial list that looks
-                          // complete is worse than a slow one, and screen-reader
-                          // users get no signal from a loading glyph alone.
-                          description={
-                            tablesLoadingMore
-                              ? t(
-                                  "Still loading tables — the list below is incomplete.",
-                                )
-                              : undefined
-                          }
-                          actions={
-                            <SpaceBetween direction="horizontal" size="xs">
-                              <Button
-                                onClick={() =>
-                                  handleBatchReviewTables(
-                                    ReviewDecision.REJECTED,
-                                  )
-                                }
-                                loading={isBatchReviewing}
-                                disabled={selectedTables.length === 0}
-                              >
-                                {t("Reject selected")}
-                              </Button>
-                              <Button
-                                onClick={() =>
-                                  handleBatchReviewTables(
-                                    ReviewDecision.APPROVED,
-                                  )
-                                }
-                                loading={isBatchReviewing}
-                                disabled={selectedTables.length === 0}
-                              >
-                                {t("Approve selected")}
-                              </Button>
-                            </SpaceBetween>
-                          }
-                        >
-                          {t("Tables")}
-                        </Header>
-                      }
-                      empty={
-                        <Box
-                          textAlign="center"
-                          color="text-status-inactive"
-                          padding="l"
-                        >
-                          {status === "SCANNING" || status === "ENRICHING"
-                            ? t(
-                                "Tables will appear here once the scan completes.",
-                              )
-                            : status === "REGISTERED"
-                              ? t("Scan has not started yet.")
-                              : t("No tables discovered.")}
-                        </Box>
-                      }
-                    />
-                  </SpaceBetween>
-                ),
-              },
+                      ),
+                    },
+                  ]),
               {
                 id: "history",
-                label: t("Scan history"),
+                label: isGraph ? t("Verification history") : t("Scan history"),
                 content: (
                   <ScanHistoryTable
                     createdAt={source.createdAt}
@@ -1372,14 +1467,56 @@ export const SourceDetail: React.FC = () => {
                           ]}
                         />
                       )}
+                      {dbDetails?.sparqlConfiguration && (
+                        <KeyValuePairs
+                          columns={2}
+                          items={[
+                            { label: t("Engine"), value: "Amazon Neptune" },
+                            {
+                              label: t("SPARQL endpoint"),
+                              value: String(
+                                dbDetails.sparqlConfiguration.dataEndpoint ??
+                                  "—",
+                              ),
+                            },
+                            {
+                              label: t("Region"),
+                              value: String(
+                                dbDetails.sparqlConfiguration.region ?? "—",
+                              ),
+                            },
+                            {
+                              label: t("Port"),
+                              value: String(
+                                dbDetails.sparqlConfiguration.port ?? 8182,
+                              ),
+                            },
+                            {
+                              label: t("Named graph"),
+                              value: String(
+                                dbDetails.sparqlConfiguration.dataNamedGraph ??
+                                  t("(default graph)"),
+                              ),
+                            },
+                            {
+                              label: t("Authentication"),
+                              value: "SigV4 / IAM",
+                            },
+                          ]}
+                        />
+                      )}
                     </Container>
-                    <RescanScheduleControl
-                      namespaceId={namespaceId ?? ""}
-                      sourceId={sourceId ?? ""}
-                      isGlue={source.sourceSubType === "GLUE_DATABASE"}
-                      schedule={dbDetails?.rescanSchedule}
-                      eventRescan={dbDetails?.eventRescan}
-                    />
+                    {/* A graph source has no schema to re-scan on a schedule or
+                        on Glue events; Re-verify re-checks reachability. */}
+                    {isTabular && (
+                      <RescanScheduleControl
+                        namespaceId={namespaceId ?? ""}
+                        sourceId={sourceId ?? ""}
+                        isGlue={source.sourceSubType === "GLUE_DATABASE"}
+                        schedule={dbDetails?.rescanSchedule}
+                        eventRescan={dbDetails?.eventRescan}
+                      />
+                    )}
                   </SpaceBetween>
                 ),
               },
@@ -1666,6 +1803,10 @@ function scanEntryToRow(
   const tables = entry.tablesDiscovered ?? 0;
   const status = entry.status ?? "";
   const trigger = entry.triggerType ?? undefined;
+  // A graph source's "scan" is a reachability check of its SPARQL endpoint.
+  if (entry.scanType === "reachability") {
+    return reachabilityEntryToRow(entry, id, at, status, trigger, t);
+  }
   if (status === "FAILED") {
     return {
       id,
@@ -1716,6 +1857,41 @@ function scanEntryToRow(
       tables === 1 ? "Scanned {count} table." : "Scanned {count} tables.",
       { count: tables },
     ),
+  };
+}
+
+function reachabilityEntryToRow(
+  entry: ScanJobEntry,
+  id: string,
+  at: string,
+  status: string,
+  trigger: string | undefined,
+  t: AppTranslate,
+): ScanHistoryEntry {
+  const base = { id, at, kind: "scan" as const, trigger };
+  if (status === "FAILED") {
+    return {
+      ...base,
+      type: "error",
+      label: t("Reachability check failed"),
+      detail: entry.errorMessage
+        ? t("Error: {message}", { message: entry.errorMessage })
+        : t("The endpoint could not be reached. Use Re-verify to try again."),
+    };
+  }
+  if (status === "COMPLETED") {
+    return {
+      ...base,
+      type: "success",
+      label: t("Endpoint verified"),
+      detail: t("The SPARQL endpoint is reachable and authorized."),
+    };
+  }
+  return {
+    ...base,
+    type: "in-progress",
+    label: t("Checking endpoint"),
+    detail: t("Verifying that the SPARQL endpoint is reachable."),
   };
 }
 

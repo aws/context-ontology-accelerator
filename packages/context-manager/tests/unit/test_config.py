@@ -6,6 +6,7 @@
 from unittest.mock import MagicMock, patch
 
 import pytest
+import structlog.testing
 from botocore.exceptions import ClientError
 from coa_serve.config import ServiceConfig, load_config
 
@@ -353,6 +354,128 @@ class TestDeepReasoningBudgetConfig:
 
         config = load_config()
         assert config.deep_reasoning_max_no_progress_steps == 5
+
+
+_STOP_SIGNAL_ENV = (
+    "DEEP_REASONING_SUFFICIENCY_MIN_CONFIDENCE",
+    "DEEP_REASONING_PROGRESS_SIMILARITY_THRESHOLD",
+    "DEEP_REASONING_STABILITY_STEPS",
+    "DEEP_REASONING_STOP_TELEMETRY",
+)
+
+
+@pytest.mark.unit
+class TestDeepReasoningStopSignalConfig:
+    """Early-stop knobs: validated once at load_config(), bad values fall back with a warning."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_env(self, monkeypatch):
+        for name in _STOP_SIGNAL_ENV:
+            monkeypatch.delenv(name, raising=False)
+            monkeypatch.delenv(name.replace("DEEP_REASONING", "AGENTIC", 1), raising=False)
+
+    @staticmethod
+    def _load(monkeypatch, **env: str):
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        with patch("coa_serve.config.boto3") as mock_boto3, structlog.testing.capture_logs() as logs:
+            mock_ssm = MagicMock()
+            mock_ssm.get_parameter.return_value = {"Parameter": {"Value": "gr-test"}}
+            mock_boto3.client.return_value = mock_ssm
+            config = load_config()
+        return config, [entry for entry in logs if entry.get("log_level") == "warning"]
+
+    def test_defaults_are_off(self, monkeypatch):
+        config, _ = self._load(monkeypatch)
+        assert config.deep_reasoning_sufficiency_min_confidence == 0.0
+        assert config.deep_reasoning_progress_similarity_threshold == 0.0
+        assert config.deep_reasoning_stability_steps == 2
+        assert config.deep_reasoning_stop_telemetry is False
+
+    def test_valid_values_are_honored(self, monkeypatch):
+        config, warnings = self._load(
+            monkeypatch,
+            DEEP_REASONING_SUFFICIENCY_MIN_CONFIDENCE="0.7",
+            DEEP_REASONING_PROGRESS_SIMILARITY_THRESHOLD="1",
+            DEEP_REASONING_STABILITY_STEPS="3",
+            DEEP_REASONING_STOP_TELEMETRY="true",
+        )
+        assert config.deep_reasoning_sufficiency_min_confidence == 0.7
+        assert config.deep_reasoning_progress_similarity_threshold == 1.0
+        assert config.deep_reasoning_stability_steps == 3
+        assert config.deep_reasoning_stop_telemetry is True
+        assert warnings == []
+
+    @pytest.mark.parametrize("raw", ["true", "85", "-1", "abc"])
+    @pytest.mark.parametrize(
+        "name, field",
+        [
+            ("DEEP_REASONING_SUFFICIENCY_MIN_CONFIDENCE", "deep_reasoning_sufficiency_min_confidence"),
+            ("DEEP_REASONING_PROGRESS_SIMILARITY_THRESHOLD", "deep_reasoning_progress_similarity_threshold"),
+        ],
+    )
+    def test_invalid_threshold_falls_back_with_warning(self, monkeypatch, name, field, raw):
+        config, warnings = self._load(monkeypatch, **{name: raw})
+        assert getattr(config, field) == 0.0
+        assert [w["name"] for w in warnings] == [name]
+
+    @pytest.mark.parametrize(
+        "name, field",
+        [
+            ("DEEP_REASONING_SUFFICIENCY_MIN_CONFIDENCE", "deep_reasoning_sufficiency_min_confidence"),
+            ("DEEP_REASONING_PROGRESS_SIMILARITY_THRESHOLD", "deep_reasoning_progress_similarity_threshold"),
+            ("DEEP_REASONING_STABILITY_STEPS", "deep_reasoning_stability_steps"),
+            ("DEEP_REASONING_STOP_TELEMETRY", "deep_reasoning_stop_telemetry"),
+        ],
+    )
+    def test_empty_value_is_the_default_without_warning(self, monkeypatch, name, field):
+        config, warnings = self._load(monkeypatch, **{name: ""})
+        assert getattr(config, field) == getattr(ServiceConfig, field)
+        assert warnings == []
+
+    @pytest.mark.parametrize("raw", ["true", "85", "-1", "abc", "0", "21"])
+    def test_invalid_stability_steps_falls_back_with_warning(self, monkeypatch, raw):
+        config, warnings = self._load(monkeypatch, DEEP_REASONING_STABILITY_STEPS=raw)
+        assert config.deep_reasoning_stability_steps == 2
+        assert [w["name"] for w in warnings] == ["DEEP_REASONING_STABILITY_STEPS"]
+
+    @pytest.mark.parametrize("raw", ["true", "TRUE", "1", "yes", "On"])
+    def test_telemetry_true_spellings(self, monkeypatch, raw):
+        config, warnings = self._load(monkeypatch, DEEP_REASONING_STOP_TELEMETRY=raw)
+        assert config.deep_reasoning_stop_telemetry is True
+        assert warnings == []
+
+    @pytest.mark.parametrize("raw", ["false", "False", "0", "no", "OFF"])
+    def test_telemetry_false_spellings(self, monkeypatch, raw):
+        config, warnings = self._load(monkeypatch, DEEP_REASONING_STOP_TELEMETRY=raw)
+        assert config.deep_reasoning_stop_telemetry is False
+        assert warnings == []
+
+    @pytest.mark.parametrize("raw", ["85", "-1", "abc", "enabled"])
+    def test_invalid_telemetry_falls_back_with_warning(self, monkeypatch, raw):
+        config, warnings = self._load(monkeypatch, DEEP_REASONING_STOP_TELEMETRY=raw)
+        assert config.deep_reasoning_stop_telemetry is False
+        assert [w["name"] for w in warnings] == ["DEEP_REASONING_STOP_TELEMETRY"]
+
+    def test_agentic_names_are_not_read(self, monkeypatch):
+        """The knobs postdate the AGENTIC_* -> DEEP_REASONING_* rename: no legacy alias."""
+        config, warnings = self._load(
+            monkeypatch,
+            AGENTIC_SUFFICIENCY_MIN_CONFIDENCE="0.5",
+            AGENTIC_PROGRESS_SIMILARITY_THRESHOLD="0.9",
+            AGENTIC_STABILITY_STEPS="4",
+            AGENTIC_STOP_TELEMETRY="1",
+        )
+        assert config.deep_reasoning_sufficiency_min_confidence == 0.0
+        assert config.deep_reasoning_progress_similarity_threshold == 0.0
+        assert config.deep_reasoning_stability_steps == 2
+        assert config.deep_reasoning_stop_telemetry is False
+        assert not [w for w in warnings if w.get("event") == "deprecated_env_var"]
+
+    def test_existing_knobs_keep_their_agentic_alias(self, monkeypatch):
+        monkeypatch.delenv("DEEP_REASONING_MAX_NO_PROGRESS_STEPS", raising=False)
+        config, _ = self._load(monkeypatch, AGENTIC_MAX_NO_PROGRESS_STEPS="4")
+        assert config.deep_reasoning_max_no_progress_steps == 4
 
 
 @pytest.mark.unit

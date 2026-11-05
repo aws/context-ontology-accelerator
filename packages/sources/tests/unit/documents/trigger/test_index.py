@@ -51,7 +51,7 @@ class TestHandlerValidMessage:
         assert call_input["namespace_id"] == "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
         assert "extraction_config" in call_input
         assert call_input["extraction_config"]["extraction_mode"] == "continuous"
-        assert call_input["extraction_config"]["use_batch_inference"] == "false"
+        assert call_input["extraction_config"]["use_batch_inference"] == "true"
 
     @patch.object(index, "sfn_client")
     def test_processes_multiple_records(self, mock_sfn):
@@ -142,7 +142,7 @@ class TestExtractionConfigNormalization:
         call_input = json.loads(mock_sfn.start_execution.call_args.kwargs["input"])
         ec = call_input["extraction_config"]
         assert ec["extraction_mode"] == "continuous"
-        assert ec["use_batch_inference"] == "false"
+        assert ec["use_batch_inference"] == "true"
         assert ec["enable_versioning"] == "true"
         assert ec["enable_proposition_extraction"] == "true"
         assert ec["delete_prev_versions"] == "false"
@@ -155,7 +155,7 @@ class TestExtractionConfigNormalization:
         call_input = json.loads(mock_sfn.start_execution.call_args.kwargs["input"])
         ec = call_input["extraction_config"]
         assert ec["extraction_mode"] == "separated"
-        assert ec["use_batch_inference"] == "false"
+        assert ec["use_batch_inference"] == "true"
         assert ec["enable_versioning"] == "true"
 
     @patch.object(index, "sfn_client")

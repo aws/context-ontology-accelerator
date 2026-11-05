@@ -14,6 +14,8 @@ import {
   expectValidAossNames,
 } from "../utils/aoss-name-assertions";
 import { expectAossGrantsCoveredByDataPolicies } from "../utils/aoss-access-assertions";
+import { matchesEventPattern } from "../utils/event-pattern";
+import { expectEveryTaskCanPullGuardDutyAgent } from "../utils/guardduty-agent-assertions";
 
 const TEST_CONTEXT = {
   resource_prefix: DEFAULT_RESOURCE_PREFIX,
@@ -255,6 +257,28 @@ describe("OntologyStack OoPS! endpoint is opt-in (#171)", () => {
   });
 });
 
+describe("OntologyStack graph-sources switch", () => {
+  const lambdaEnvs = (t: Template) =>
+    Object.values(t.findResources("AWS::Lambda::Function")).map(
+      (f: any) => f.Properties.Environment?.Variables ?? {},
+    );
+
+  test("off (the default) sets GRAPH_SOURCES_ENABLED nowhere", () => {
+    const t = renderOntology({}, "GraphOff");
+    expect(containerEnv(t).some((e) => e.Name === "GRAPH_SOURCES_ENABLED")).toBe(
+      false,
+    );
+    for (const env of lambdaEnvs(t)) {
+      expect(env).not.toHaveProperty("GRAPH_SOURCES_ENABLED");
+    }
+  });
+
+  test("on reaches the ontology-engine container, which runs ontology import", () => {
+    const t = renderOntology({}, "GraphOn", { graph_sources: "on" });
+    expect(envValue(t, "GRAPH_SOURCES_ENABLED")).toBe("true");
+  });
+});
+
 describe("OntologyStack", () => {
   let template: Template;
 
@@ -279,6 +303,10 @@ describe("OntologyStack", () => {
         allowedOrigin: "https://test.example.com",
       }),
     );
+  });
+
+  test("lets the task execution role pull the GuardDuty Fargate agent", () => {
+    expectEveryTaskCanPullGuardDutyAgent(template, 1, "${AWS::Region}");
   });
 
   test("names every aoss:APIAccessAll role in an AOSS data-access policy", () => {
@@ -567,7 +595,8 @@ describe("OntologyStack", () => {
   test("EventBridge rule fires on ECS OOM / exit-137 task stops", () => {
     // A SIGKILL/exit-137 runs neither except nor finally, so the custom
     // metrics never emit — this rule makes the OOM visible from the ECS
-    // Task State Change event (stoppedReason ~ OutOfMemory OR exitCode 137).
+    // Task State Change event (an OutOfMemory reason, or exit 137 from an
+    // essential container that died on its own).
     const rules = template.findResources("AWS::Events::Rule");
     const ruleValues = Object.values(rules);
     const oomRule = ruleValues.find((r) => {
@@ -581,11 +610,129 @@ describe("OntologyStack", () => {
     });
     expect(oomRule).toBeDefined();
     const serialized = JSON.stringify(oomRule!.Properties.EventPattern);
-    // Matches OOM stoppedReason (wildcard) and/or the exit-137 container code.
+    // Matches an OutOfMemory reason (wildcard) or the exit-137 container code.
     expect(serialized).toContain("OutOfMemory");
     expect(serialized).toContain("137");
     // Scoped to STOPPED tasks so it doesn't fire on every state transition.
     expect(serialized).toContain("STOPPED");
+  });
+
+  describe("EventBridge OOM rule against ECS Task State Change events", () => {
+    // ECS stops a task it is replacing with SIGTERM and, after the stop
+    // timeout, SIGKILL: exit 137 with no OOM involved. Only an OutOfMemory
+    // reason, or an essential container that died on its own, is an OOM.
+    const matchesOomRule = (detail: Record<string, unknown>): boolean => {
+      const [rule] = Object.values(
+        template.findResources("AWS::Events::Rule", {
+          Properties: { Name: `${PREFIX}-ontology-oom` },
+        }),
+      );
+      const pattern = rule.Properties.EventPattern;
+      return matchesEventPattern(pattern, {
+        source: "aws.ecs",
+        "detail-type": "ECS Task State Change",
+        detail: {
+          clusterArn: pattern.detail.clusterArn[0],
+          lastStatus: "STOPPED",
+          ...detail,
+        },
+      });
+    };
+
+    test.each([
+      [
+        "a deploy SIGKILLing a task past its stop timeout",
+        {
+          stopCode: "ServiceSchedulerInitiated",
+          stoppedReason:
+            "Scaling activity initiated by (deployment ecs-svc/1234567890123456789)",
+          containers: [{ name: "ontology-engine", exitCode: 137 }],
+        },
+      ],
+      [
+        "a StopTask call SIGKILLing a task past its stop timeout",
+        {
+          stopCode: "UserInitiated",
+          stoppedReason: "Task stopped by user",
+          containers: [{ name: "ontology-engine", exitCode: 137 }],
+        },
+      ],
+      [
+        "a task that exited cleanly",
+        {
+          stopCode: "EssentialContainerExited",
+          stoppedReason: "Essential container in task exited",
+          containers: [{ name: "ontology-engine", exitCode: 0 }],
+        },
+      ],
+    ])("does not match %s", (_case, detail) => {
+      expect(matchesOomRule(detail)).toBe(false);
+    });
+
+    test.each([
+      [
+        "a container OOM-killed by the kernel",
+        {
+          stopCode: "EssentialContainerExited",
+          stoppedReason: "Essential container in task exited",
+          containers: [
+            {
+              name: "ontology-engine",
+              exitCode: 137,
+              reason: "OutOfMemoryError: Container killed due to memory usage",
+            },
+          ],
+        },
+      ],
+      [
+        "an OOM while a deploy is stopping the task",
+        {
+          stopCode: "ServiceSchedulerInitiated",
+          stoppedReason:
+            "Scaling activity initiated by (deployment ecs-svc/1234567890123456789)",
+          containers: [
+            {
+              name: "ontology-engine",
+              exitCode: 137,
+              reason: "OutOfMemoryError: Container killed due to memory usage",
+            },
+          ],
+        },
+      ],
+      [
+        "an OutOfMemory task stoppedReason",
+        {
+          stopCode: "ServiceSchedulerInitiated",
+          stoppedReason:
+            "OutOfMemoryError: Container killed due to memory usage",
+          containers: [{ name: "ontology-engine", exitCode: 137 }],
+        },
+      ],
+      [
+        "an essential container SIGKILLed with no reason given",
+        {
+          stopCode: "EssentialContainerExited",
+          stoppedReason: "Essential container in task exited",
+          containers: [{ name: "ontology-engine", exitCode: 137 }],
+        },
+      ],
+    ])("matches %s", (_case, detail) => {
+      expect(matchesOomRule(detail)).toBe(true);
+    });
+
+    test("is scoped to the ontology cluster", () => {
+      const [clusterId] = Object.keys(
+        template.findResources("AWS::ECS::Cluster"),
+      );
+      template.hasResourceProperties("AWS::Events::Rule", {
+        Name: `${PREFIX}-ontology-oom`,
+        EventPattern: Match.objectLike({
+          detail: Match.objectLike({
+            clusterArn: [{ "Fn::GetAtt": [clusterId, "Arn"] }],
+          }),
+        }),
+      });
+    });
   });
 
   test("EventBridge OOM rule surfaces a CloudWatch metric + alarm", () => {

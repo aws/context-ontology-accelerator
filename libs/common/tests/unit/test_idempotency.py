@@ -429,3 +429,9 @@ def test_claim_that_keeps_losing_to_a_release_is_a_contention_conflict() -> None
     assert isinstance(outcome, idempotency._Conflict)
     assert outcome.reason == "claim_contention"
     assert store.claim.call_count == idempotency._MAX_CLAIM_ATTEMPTS
+
+
+@pytest.mark.parametrize("error", [ValueError("too many digits"), RecursionError("too deep")])
+def test_idempotency_body_parse_leaves_unreadable_json_to_the_handler(error: Exception) -> None:
+    with patch.object(idempotency.json, "loads", side_effect=error):
+        assert idempotency._parse_body({"body": "unreadable"}) is None

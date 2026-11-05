@@ -490,6 +490,7 @@ Consumes SQS messages from the bulk review queue and applies the review decision
 | `TENANT_ID` | Yes | Injected by Step Functions container override |
 | `STAGING_PREFIX` | Yes | Injected by Step Functions container override |
 | `EXTRACTION_MODE` | Yes | Injected by Step Functions container override |
+| `USE_BATCH_INFERENCE` | No | Use Bedrock batch inference for extraction (default: `true`); `false` (or an unset `BATCH_INFERENCE_ROLE_ARN`) selects real-time inference |
 | `EXTRACTION_TIMEOUT_SECONDS` | No | Bedrock extraction read timeout in seconds (default: `300`; range: `1`–`3600`) |
 | `EXTRACTION_CONNECT_TIMEOUT_SECONDS` | No | Bedrock connection timeout in seconds (default: `10`; range: `0.1`–`300`) |
 | `EXTRACTION_MAX_ATTEMPTS` | No | Bounded extraction retry attempts (default: `5`; range: `1`–`20`) |
@@ -536,7 +537,7 @@ Provisioning mirrors the Athena "create PostgreSQL data source" console flow and
 | Lake Formation registration | registers the connection ARN | `register_resource(WithFederation=True)` so the catalog is LF-governed |
 | Glue federated catalog | same name as the Glue Connection | `create_catalog` with a `FederatedCatalog` block pointing at the connection |
 
-Both the connection and catalog names are returned in the `GetSource` response under `databaseDetails.glueConnectionName` and `databaseDetails.athenaDataCatalogName`. They are torn down by `cleanup_federated_resources` when the source is deleted via `DELETE /namespaces/{namespaceId}/sources/{sourceId}`. Dropping an LF-governed catalog requires the federation provisioner's Lake Formation admin role, which the sources-api Lambda assumes for the teardown. Because these are billable resources with no automatic recovery path, a teardown failure **blocks** the delete (HTTP 500) so the source row remains and the delete can be retried — it is not silently orphaned.
+Both the connection and catalog names are returned in the `GetSource` response under `databaseDetails.glueConnectionName` and `databaseDetails.athenaDataCatalogName`. They are torn down by `cleanup_federated_resources` when the source is deleted via `DELETE /namespaces/{namespaceId}/sources/{sourceId}`, and by `make destroy-dev` (`scripts/destroy.sh`) for sources still registered at teardown, in the same order. Glue refuses to delete a connection its catalog still uses, and Lake Formation gives `DROP` on the catalog only to its creator (the provisioner role): an operator who is a data lake admin grants it to themselves first, anyone else gets the commands for an admin instead, and the teardown finishes on the next run. Dropping an LF-governed catalog requires the federation provisioner's Lake Formation admin role, which the sources-api Lambda assumes for the teardown. Because these are billable resources with no automatic recovery path, a teardown failure **blocks** the delete (HTTP 500) so the source row remains and the delete can be retried — it is not silently orphaned.
 
 ### Per-namespace workgroup
 

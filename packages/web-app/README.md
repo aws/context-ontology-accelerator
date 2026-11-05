@@ -124,6 +124,14 @@ id, so it has no default — the same rule the credentials above follow:
 That spec is also gated behind `E2E_SLOW` (it runs a real scan and enrichment,
 several minutes), so it needs both `E2E_SLOW=1` and `E2E_GLUE_CATALOG_ID` to run.
 
+The metric display-label spec (`specs/metrics/display-label.spec.ts`) creates a
+metric, which needs an APPROVED database source, so it runs in an existing
+namespace and skips without one:
+
+| Variable                  | Required                 | Description                                                                                                                             |
+| ------------------------- | ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `E2E_METRIC_NAMESPACE_ID` | Yes (for the label spec) | Id of a namespace whose first APPROVED database source has an `orders` table, e.g. the metric-service integ fixture `integ-metrics-ns`. |
+
 When credentials are absent, every environment-dependent test **skips** (the run
 still exits 0), so the suite is safe to run anywhere.
 

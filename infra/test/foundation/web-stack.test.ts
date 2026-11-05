@@ -348,6 +348,21 @@ describe("buildRuntimeConfig (version include/omit)", () => {
       buildRuntimeConfig({ ...base, mcpRuntimeArn: "" }),
     ).not.toHaveProperty("mcpRuntimeArn");
   });
+
+  test("includes graphSourcesEnabled: true when graph sources are on", () => {
+    expect(
+      buildRuntimeConfig({ ...base, graphSourcesEnabled: true }),
+    ).toMatchObject({ graphSourcesEnabled: true });
+  });
+
+  test.each([undefined, false])(
+    "omits the graphSourcesEnabled key when %p",
+    (graphSourcesEnabled) => {
+      expect(
+        buildRuntimeConfig({ ...base, graphSourcesEnabled }),
+      ).not.toHaveProperty("graphSourcesEnabled");
+    },
+  );
 });
 
 describe("WebStack runtime-config.json artifact (end-to-end)", () => {
@@ -387,6 +402,41 @@ describe("WebStack runtime-config.json artifact (end-to-end)", () => {
       true,
     );
   });
+
+  test.each([
+    [{}, false],
+    [{ graph_sources: "on" }, true],
+  ])(
+    "writes graphSourcesEnabled only when graph sources are on (%p)",
+    (extra, on) => {
+      const outdir = fs.mkdtempSync(path.join(os.tmpdir(), "synth-"));
+      const app = new cdk.App({
+        outdir,
+        context: {
+          resource_prefix: DEFAULT_RESOURCE_PREFIX,
+          env: "dev",
+          ...extra,
+        },
+      });
+      new WebStack(app, "TestWebGraphSources", { isCognitoMode: true });
+      app.synth();
+      const configs: string[] = [];
+      const walk = (d: string) => {
+        for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+          const p = path.join(d, e.name);
+          if (e.isDirectory()) walk(p);
+          else if (e.name === "runtime-config.json")
+            configs.push(fs.readFileSync(p, "utf-8"));
+        }
+      };
+      walk(outdir);
+      expect(configs.length).toBeGreaterThan(0);
+      for (const c of configs) {
+        if (on) expect(c).toContain(`"graphSourcesEnabled":true`);
+        else expect(c).not.toContain("graphSourcesEnabled");
+      }
+    },
+  );
 });
 
 // ═══════════════════════════════════════════════════════════════════

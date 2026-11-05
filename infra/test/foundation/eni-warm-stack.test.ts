@@ -25,12 +25,14 @@ describe("EniWarmStack", () => {
     const discoveryOcspSecurityGroup = mkSg("OcspSG");
     const ecsSecurityGroup = mkSg("EcsSG");
     const authorizerSecurityGroup = mkSg("AuthorizerSG");
+    const sparqlSourceEgressSecurityGroup = mkSg("SparqlSG");
     const stack = new EniWarmStack(app, "TestEniWarm", {
       vpc,
       lambdaSecurityGroup,
       discoveryOcspSecurityGroup,
       ecsSecurityGroup,
       authorizerSecurityGroup,
+      sparqlSourceEgressSecurityGroup,
     });
     template = Template.fromStack(stack);
   });
@@ -42,6 +44,7 @@ describe("EniWarmStack", () => {
     ocsp: "OcspSG",
     ecs: "EcsSG",
     authorizer: "AuthorizerSG",
+    sparql: "SparqlSG",
   };
 
   /** Security-group logical IDs (from the import names) of one warm function. */
@@ -62,16 +65,44 @@ describe("EniWarmStack", () => {
   }
 
   test("holds one never-invoked VPC function per security-group combination", () => {
-    template.resourceCountIs("AWS::Lambda::Function", 4);
+    template.resourceCountIs("AWS::Lambda::Function", 5);
     expect(sgsOf(`${PREFIX}-eni-warm-lambda`)).toEqual(["lambda"]);
     expect(sgsOf(`${PREFIX}-eni-warm-lambdaocsp`).sort()).toEqual(
       ["lambda", "ocsp"].sort(),
     );
     expect(sgsOf(`${PREFIX}-eni-warm-ecs`)).toEqual(["ecs"]);
     expect(sgsOf(`${PREFIX}-eni-warm-authorizer`)).toEqual(["authorizer"]);
+    // graph-verify's set (SourcesStack).
+    expect(sgsOf(`${PREFIX}-eni-warm-lambdasparql`).sort()).toEqual(
+      ["lambda", "sparql"].sort(),
+    );
   });
 
   test("creates no security groups of its own", () => {
     template.resourceCountIs("AWS::EC2::SecurityGroup", 0);
+  });
+});
+
+describe("EniWarmStack without graph sources (no SPARQL egress SG)", () => {
+  test("holds no graph-verify combination, as on main", () => {
+    const app = new cdk.App({ context: TEST_CONTEXT });
+    const depStack = new cdk.Stack(app, "DepStack");
+    const vpc = new ec2.Vpc(depStack, "Vpc");
+    const mkSg = (id: string) => new ec2.SecurityGroup(depStack, id, { vpc });
+    const template = Template.fromStack(
+      new EniWarmStack(app, "TestEniWarm", {
+        vpc,
+        lambdaSecurityGroup: mkSg("LambdaSG"),
+        discoveryOcspSecurityGroup: mkSg("OcspSG"),
+        ecsSecurityGroup: mkSg("EcsSG"),
+        authorizerSecurityGroup: mkSg("AuthorizerSG"),
+      }),
+    );
+    template.resourceCountIs("AWS::Lambda::Function", 4);
+    expect(
+      template.findResources("AWS::Lambda::Function", {
+        Properties: { FunctionName: `${PREFIX}-eni-warm-lambdasparql` },
+      }),
+    ).toEqual({});
   });
 });

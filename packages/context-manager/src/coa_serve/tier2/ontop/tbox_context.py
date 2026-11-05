@@ -17,12 +17,13 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import structlog
-from coa_common.constants import URN_PREFIX, VOCAB_URI
+from coa_common.constants import URN_PREFIX, VOCAB_URI, StructuredBackend
 
 from ...clients.base import GraphClient
 from ...namespace_language import current_label_preference, row_label
 from ...query_utils import (
     DEFAULT_GRAPH_URI_TEMPLATE,
+    backend_gate,
     build_query_search_plan,
     escape_sparql_string_literal,
     get_graph_uri_template,
@@ -74,10 +75,13 @@ _ANNOTATION_MAX_CONCURRENCY = 4
 # truncated. Without it truncation fills the budget and large namespaces, where
 # business wording helps most, would get no annotations at all.
 _ANNOTATION_BUDGET_SHARE = 0.15
-# Prompt caps. Column descriptions match the NL→SQL context's 100-character cut;
-# class descriptions are capped only to bound a pathological catalog entry.
+# Prompt caps. A Glue column comment allows 255 characters, so column descriptions
+# keep 255. The ingest side has its own constant for the NL→SQL class text
+# (_MAX_COLUMN_COMMENT_CHARS in the ontology engine's catalog ingest), kept equal
+# on purpose; the two are not linked. Class descriptions are capped only to bound
+# a pathological catalog entry.
 _MAX_CLASS_DESCRIPTION_CHARS = 500
-_MAX_PROPERTY_DESCRIPTION_CHARS = 100
+_MAX_PROPERTY_DESCRIPTION_CHARS = 255
 _MAX_TERMS_IN_PROMPT = 5
 # ~4 characters per token, the same rough rate the per-element estimates assume.
 _CHARS_PER_TOKEN = 4
@@ -113,82 +117,40 @@ _FULL_CONTEXT_CLASS_THRESHOLD = 200
 _IS_MAPPED_IRI = f"{VOCAB_URI}isMapped"
 _IS_MAPPED_PATTERN = f"?class <{_IS_MAPPED_IRI}> true ."
 # ─────────────────────────────────────────────────────────────────────────────
-# LEGACY-NAMESPACE BRIDGE (temporary compatibility shim)
-#
-# The ``coa:isMapped`` marker is written only by the post-marker ingest path
-# (NDB backend). A namespace ingested BEFORE the marker existed — or via a
-# backend that never writes it — carries ZERO isMapped triples, so the required
-# ``_IS_MAPPED_PATTERN`` gate would hide EVERY class and silently break Tier-2
-# for that namespace (structured queries fall through to Tier-3). To avoid
-# regressing existing users, ``build`` probes once per request whether the
-# namespace has ANY mapped marker (``_namespace_has_mapped_markers``); when it
-# has none it drops the gate entirely (``mapped=False``), restoring the
-# pre-filter behavior (all classes exposed) for that namespace only. A namespace
-# with even ONE mapped class keeps the strict gate. The gate is selected
-# per-request via ``_class_gate(mapped)`` / ``_parent_pattern(mapped)`` so both
-# behaviors coexist across namespaces.
-#
-# ── HOW TO REMOVE THIS BRIDGE (revert to the strict pre-bridge behavior) ──
-# Added 2026-07-16; TEMPORARY. Revisit by ~2026-10 (≈3 months). If you are here
-# after that and the bridge still exists, it has likely outlived its purpose:
-# verify all live namespaces carry coa:isMapped markers, then remove it.
-# The end state is the original strict "absent marker == hidden" behavior —
-# adopt it once all live namespaces have been re-inducted (so they carry
-# coa:isMapped markers) and users have been given notice. Removal is a pure
-# deletion, no logic to re-derive: every bridge site below is tagged
-# ``# BRIDGE:`` and carries the exact PRE-BRIDGE line to restore. To remove:
-# 1. Delete ``_namespace_has_mapped_markers`` and the ``mapped = await …``
-# probe call + fallback log in ``build``.
-# 2. Delete ``_NO_GATE``, ``_UNGATED_PARENT_PATTERN``, ``_class_gate``,
-# ``_parent_pattern``, and the ``mapped`` parameter on the four fetch
-# methods.
-# 3. At each ``# BRIDGE:`` site, replace the ``_class_gate(mapped)`` /
-# ``_parent_pattern(mapped)`` / conditional-gate call with the PRE-BRIDGE
-# line quoted in its comment (the module constants ``_IS_MAPPED_PATTERN`` /
-# ``_MAPPED_PARENT_PATTERN`` used unconditionally).
-# 4. Delete the bridge tests (class ``TestIsMappedLegacyBridge`` in
-# test_tbox_context_strstarts.py) AND revert the two ancillary test edits:
-# the ``graph_client.ask = AsyncMock(...)`` line + bridge comment added to
-# TestTBoxGlossaryMappedGate (same file), and the reworded ``call_count``
-# comment in test_tier2_tbox_context.py.
-# 5. Restore the prose comments that were reworded to mention the bridge (this
-# block, the dark-namespace canary above ``if not context.classes``, and the
-# count/fetch-all/object-property explanatory comments) to their pre-bridge
-# wording — these are comment-only and must be hand-reverted.
-_NO_GATE = ""  # empty triple pattern → no isMapped restriction (legacy fallback)
-# Parent (rdfs:subClassOf) is surfaced to the prompt as ``subClassOf: <parent>``,
-# so it must be gated the same way as the class itself and as object-property
-# ends: bind ?parentClass ONLY when the parent is itself a MAPPED class. Without
-# the inner isMapped guard, a grounded class (``ind:Orders rdfs:subClassOf
-# fibo:PurchaseOrder``) leaks the unmapped foundational parent IRI into the
-# structured prompt — the exact "unmapped class name reaches the LLM" failure the
-# object-property gate prevents. The parent's isMapped marker lives in the same
-# named graph as the subClassOf triple (store_class writes all of a class's
-# triples into one graph), so an inner ``?parentClass <isMapped> true`` matches a
-# mapped sibling parent and correctly excludes any foundational/unmapped parent.
-_MAPPED_PARENT_PATTERN = f"OPTIONAL {{ ?class rdfs:subClassOf ?parentClass . ?parentClass <{_IS_MAPPED_IRI}> true . }}"
-# Legacy-fallback parent pattern: surface the subClassOf parent WITHOUT the
-# parent-is-mapped guard. Used only when the namespace has zero isMapped markers,
-# so there is no mapped/unmapped distinction to enforce — the pre-filter behavior.
-_UNGATED_PARENT_PATTERN = "OPTIONAL { ?class rdfs:subClassOf ?parentClass . }"
 
 
-# BRIDGE: pre-bridge, callers used the module constant ``_IS_MAPPED_PATTERN``
-# directly (always gated). This helper adds the ``mapped=False`` fallback.
-def _class_gate(mapped: bool) -> str:
-    """The ``?class <isMapped> true`` gate, or empty for the legacy fallback.
+# ── Two-signal gate: coa:isMapped AND coa:queryBackend ──────────────────────
+# ``coa:isMapped`` says a class is structured-answerable; ``coa:queryBackend``
+# says WHICH backend answers it (written as "RDF_SPARQL" on graph classes only;
+# absent == SQL). Each strategy builds its T-Box for ONE backend, and the backend
+# gate is applied at all three sites a class name reaches the prompt — the class
+# itself, its subClassOf parent, and both ends of every object property — so a
+# mixed namespace never shows the SQL writer a graph class (or the SPARQL writer a
+# SQL class) by way of a parent or an edge. Graph markers are written by the same
+# import that creates the class, so a graph namespace whose ontology was never
+# imported resolves to zero classes (the strategy then fails loud).
 
-    ``mapped=True`` (the namespace has ≥1 isMapped marker) → the required gate,
-    so unmapped classes stay hidden. ``mapped=False`` (namespace predates the
-    marker / backend never writes it) → empty, exposing all classes.
+
+def _class_gate(backend: StructuredBackend = StructuredBackend.SQL) -> str:
+    """The class gate for ``backend``: the required isMapped marker plus the backend signal."""
+    return f"{_IS_MAPPED_PATTERN}\n            {backend_gate('class', backend)}"
+
+
+def _parent_pattern(backend: StructuredBackend = StructuredBackend.SQL) -> str:
+    """subClassOf-parent OPTIONAL, bound only to a mapped parent of the same backend.
+
+    The parent reaches the prompt as ``subClassOf: <parent>``, so it is gated like the
+    class itself: bound only when it is a class of the same backend (a SQL class never
+    surfaces a graph parent, and vice versa) and only when the parent is itself
+    mapped, so an unmapped foundational parent (``ind:Orders rdfs:subClassOf
+    fibo:PurchaseOrder``) never leaks into the prompt. The parent's marker lives in
+    the same named graph as the subClassOf triple (store_class writes all of a
+    class's triples into one graph).
     """
-    return _IS_MAPPED_PATTERN if mapped else _NO_GATE
-
-
-# BRIDGE: pre-bridge, callers used ``_MAPPED_PARENT_PATTERN`` directly.
-def _parent_pattern(mapped: bool) -> str:
-    """subClassOf-parent OPTIONAL — parent-mapped-gated, or ungated for fallback."""
-    return _MAPPED_PARENT_PATTERN if mapped else _UNGATED_PARENT_PATTERN
+    return (
+        f"OPTIONAL {{ ?class rdfs:subClassOf ?parentClass . ?parentClass <{_IS_MAPPED_IRI}> true . "
+        f"{backend_gate('parentClass', backend)} }}"
+    )
 
 
 # Per-class property OPTIONAL. Restricted to owl:DatatypeProperty (columns) ON
@@ -394,6 +356,7 @@ class TBoxContextBuilder:
         namespace: str,
         query: str = "",
         max_tokens: int = 20_000,
+        backend: StructuredBackend = StructuredBackend.SQL,
     ) -> TBoxContext:
         """Build T-Box context from vector search hits.
 
@@ -402,6 +365,9 @@ class TBoxContextBuilder:
             namespace: Ontology namespace.
             query: Original NL query (used for entity-based fallback if no hits).
             max_tokens: Token budget for the returned context.
+            backend: Which structured backend's classes to include (see the
+                two-signal gate above). ``SQL`` for Ontop / NL→SQL, ``RDF_SPARQL``
+                for the native SPARQL strategy.
 
         Returns:
             TBoxContext with classes, properties, and metric summaries.
@@ -424,22 +390,6 @@ class TBoxContextBuilder:
             if _is_safe_sparql_uri(prefix):
                 graph_iris = await self._resolve_graph_iris(namespace, prefix)
 
-        # BRIDGE: probe ONCE whether this namespace has any coa:isMapped marker
-        # (see the LEGACY-NAMESPACE BRIDGE block at module top). ``mapped`` then
-        # selects the strict gate (has markers) or the pre-filter fallback (none).
-        # Pre-bridge, this probe did not exist and every fetch below was
-        # unconditionally gated — to remove, delete this call and pass nothing.
-        mapped = await self._namespace_has_mapped_markers(namespace, graph_iris=graph_iris)
-        if not mapped:
-            logger.info(
-                "tbox_ismapped_bridge_fallback",
-                namespace=namespace,
-                detail=(
-                    "namespace has 0 coa:isMapped markers — dropping the mapped-class gate "
-                    "and exposing all classes (legacy/pre-marker fallback so Tier-2 keeps working)"
-                ),
-            )
-
         # Fetch ontology definitions from Neptune
         classes: list[dict[str, Any]] = []
         properties: list[dict[str, Any]] = []
@@ -447,23 +397,28 @@ class TBoxContextBuilder:
         # Strategy: For small namespaces (< threshold classes), fetch ALL classes
         # and properties to ensure complete context. This avoids vector-search
         # misses that cause InternalError on valid queries.
-        full_context = await self._try_full_namespace_context(namespace, mapped, graph_iris=graph_iris)
+        full_context = await self._try_full_namespace_context(namespace, graph_iris=graph_iris, backend=backend)
         if full_context is not None:
             classes, properties = full_context
         elif ontology_hits:
             classes, properties = await self._fetch_ontology_context(
-                ontology_hits, namespace, mapped, graph_iris=graph_iris
+                ontology_hits, namespace, graph_iris=graph_iris, backend=backend
             )
         elif query:
             # Fallback: use query entities to fetch context
-            classes, properties = await self._fetch_by_entities(query, namespace, mapped, graph_iris=graph_iris)
+            classes, properties = await self._fetch_by_entities(
+                query, namespace, graph_iris=graph_iris, backend=backend
+            )
 
         # Fetch ObjectProperties (FK join paths) only when multiple classes are
         # present — single-class queries don't need join paths, saving a Neptune roundtrip.
         object_properties: list[dict[str, Any]] = []
         if len(classes) > 1:
             object_properties = await self._fetch_object_properties(
-                namespace, mapped, graph_iris=graph_iris, class_uris=[c["uri"] for c in classes if c.get("uri")]
+                namespace,
+                graph_iris=graph_iris,
+                class_uris=[c["uri"] for c in classes if c.get("uri")],
+                backend=backend,
             )
 
         # fetch :aiContext glossary (synonyms/instructions) for the hit
@@ -505,80 +460,37 @@ class TBoxContextBuilder:
         logger.info(
             "tbox_context_built",
             namespace=namespace,
+            backend=backend.value,
             classes=len(context.classes),
             properties=len(context.properties),
             metrics=len(context.metrics),
             tokens=context.token_estimate,
         )
         # Dark-namespace canary: the structured-query context resolved to zero
-        # classes. Routing still sent a structured question here, so Tier-2
-        # will yield nothing and the router falls back to Tier-3 silently. With the
-        # bridge above, a pre-marker namespace no longer trips this (its gate is
-        # dropped), so reaching here with ``mapped=True`` means a genuinely empty
-        # mapped schema (ontology with no R2RML-mapped classes) and with
-        # ``mapped=False`` means the namespace has no classes at all. Surfaced so
-        # the silent degradation is at least observable in logs.
+        # classes. Routing still sent a structured question here, so Tier-2 will
+        # yield nothing and the router falls back to Tier-3 silently. Surfaced so the
+        # silent degradation is at least observable in logs.
         if not context.classes:
-            # Message branches on ``mapped``: with the bridge, a zero-marker
-            # (legacy/NA) namespace already had its gate dropped, so an empty
-            # result there means the namespace has no classes at all —
-            # re-induction guidance would be wrong. Only the gated (mapped=True)
-            # case is a "no R2RML-mapped classes / may predate the marker" state.
-            if mapped:
+            if backend == StructuredBackend.RDF_SPARQL:
                 detail = (
-                    "0 coa:isMapped classes reachable — Tier-2 structured queries will "
-                    "return no context (ontology has no R2RML-mapped classes; a namespace "
-                    "predating the marker would instead take the legacy fallback)"
+                    "0 RDF_SPARQL classes reachable — no imported ontology binds a class to a "
+                    "graph source (coa_import:dataSourceName) in this namespace"
                 )
             else:
                 detail = (
-                    "namespace has no coa:isMapped markers (legacy fallback active, gate "
-                    "already dropped) yet resolved zero classes — it appears to have no "
-                    "ontology classes at all; re-induction will not change this"
+                    "0 coa:isMapped classes reachable — Tier-2 structured queries will return no "
+                    "context. Expected for a documents-only namespace; with a DATABASE source, "
+                    "accept its structured induction proposal (a namespace built before "
+                    "v0.1.0 (2026-07-31) needs a fresh structured induction)"
                 )
-            logger.warning("tbox_context_no_mapped_classes", namespace=namespace, detail=detail)
+            logger.warning("tbox_context_no_mapped_classes", namespace=namespace, backend=backend.value, detail=detail)
         return context
-
-    async def _namespace_has_mapped_markers(self, namespace: str, graph_iris: list[str] | None = None) -> bool:
-        """Probe whether the namespace has ANY ``coa:isMapped true`` marker.
-
-        The legacy-namespace bridge: returns True when at least one mapped class
-        exists (keep the strict gate), False when none do (drop the gate and
-        expose all classes — the pre-marker fallback).
-
-        Fail-safe default is **True** (keep the strict gate) on any error or when
-        no graph template is configured: an unfiltered fallback exposes MORE (all
-        classes, incl. unmapped/foundational) to the LLM prompt, so defaulting to
-        the gate on uncertainty is the conservative choice — it never leaks
-        unmapped class names on a transient probe failure. A genuinely-legacy
-        namespace whose probe fails simply keeps returning no context (the prior
-        behavior), which the dark-namespace canary already logs.
-        """
-        validate_namespace(namespace)
-        if not self._graph_uri_template:
-            return True
-
-        graph_uri_prefix = namespace_graph_prefix(self._graph_uri_template, namespace)
-        if not _is_safe_sparql_uri(graph_uri_prefix):
-            return True
-
-        ask_sparql = f"""
-        ASK {{
-{graph_scoped_body(f"            ?c <{_IS_MAPPED_IRI}> true .", graph_uri_prefix, graph_iris)}
-        }}
-        """
-        try:
-            # GraphClient.ask returns a plain bool for SPARQL ASK.
-            return bool(await self._graph.ask(ask_sparql))
-        except Exception as e:
-            logger.warning("tbox_ismapped_probe_failed", namespace=namespace, error=str(e))
-            return True  # conservative: keep the gate on probe failure
 
     async def _try_full_namespace_context(
         self,
         namespace: str,
-        mapped: bool = True,
         graph_iris: list[str] | None = None,
+        backend: StructuredBackend = StructuredBackend.SQL,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]] | None:
         """For small namespaces, fetch ALL classes and properties.
 
@@ -595,18 +507,11 @@ class TBoxContextBuilder:
         if not _is_safe_sparql_uri(graph_uri_prefix):
             return None
 
-        # First: count classes to check threshold. When ``mapped`` (the namespace
-        # has isMapped markers), counts only MAPPED classes — the ones we'll
-        # actually expose — so the threshold reflects the size of the structured
-        # schema the LLM sees. In the legacy fallback (``mapped`` False) the gate
-        # is dropped and ALL classes count, matching the pre-filter behavior.
-        # BRIDGE: this ``gate`` local is used in the count/classes/props queries
-        # below. PRE-BRIDGE those queries inlined ``_IS_MAPPED_PATTERN`` directly;
-        # to remove, drop this line and substitute ``_IS_MAPPED_PATTERN`` for every
-        # ``{gate}`` and ``_MAPPED_PARENT_PATTERN`` for every ``{_parent_pattern(mapped)}``.
-        gate = _class_gate(mapped)
+        # First: count classes to check threshold. Counts only MAPPED classes — the
+        # ones we'll actually expose — so the threshold reflects the size of the
+        # structured schema the LLM sees.
         count_body = f"""            ?class a owl:Class .
-            {gate}"""
+            {_class_gate(backend)}"""
         count_sparql = f"""
         SELECT (COUNT(DISTINCT ?class) AS ?cnt)
         WHERE {{
@@ -620,6 +525,11 @@ class TBoxContextBuilder:
             # Neptune client returns flat binding dicts: {"cnt": "75"}
             cnt_val = count_result[0].get("cnt", "0")
             class_count = int(cnt_val) if isinstance(cnt_val, (int, float)) else int(str(cnt_val))
+            if class_count == 0 and "cnt" in count_result[0]:
+                # The store counted no mapped class: every later fetch is gated on the
+                # same marker, so it is guaranteed empty. Skip it. (A row with no
+                # ``cnt`` is an unexpected shape, not a zero; it falls through.)
+                return [], []
             if class_count == 0 or class_count > _FULL_CONTEXT_CLASS_THRESHOLD:
                 logger.info(
                     "full_context_skipped",
@@ -632,11 +542,10 @@ class TBoxContextBuilder:
             logger.warning("full_context_count_failed", namespace=namespace, error=str(e))
             return None
 
-        # Fetch ALL classes and their properties for this namespace. When
-        # ``mapped``, ``gate`` (= _IS_MAPPED_PATTERN) is required (absent marker ==
-        # class hidden) so unmapped (unstructured / foundational) classes never
-        # enter the structured-query prompt; in the legacy fallback ``gate`` is
-        # empty and all classes are fetched (pre-filter behavior).
+        # Fetch ALL classes and their properties for this namespace.
+        # ``_IS_MAPPED_PATTERN`` is required (absent marker == class hidden) so
+        # unmapped (unstructured / foundational) classes never enter the
+        # structured-query prompt.
         #
         # TWO queries, NOT one joined query. A single ``?class … OPTIONAL{{?property}}``
         # SELECT emits one row per (class, property) pair; with up to
@@ -649,9 +558,9 @@ class TBoxContextBuilder:
         # the secondary property list can still truncate, which merely drops some
         # column hints (the class is still present + answerable) and is logged.
         classes_body = f"""            ?class a owl:Class .
-            {gate}
+            {_class_gate(backend)}
             ?class rdfs:label ?label .
-            {_parent_pattern(mapped)}"""
+            {_parent_pattern(backend)}"""
         classes_sparql = f"""
         SELECT DISTINCT ?class ?label (LANG(?label) AS ?labelLang) ?parentClass
         WHERE {{
@@ -668,7 +577,7 @@ class TBoxContextBuilder:
         # ``?distinctValue`` carries per-column allowed-values (categorical enum
         # samples) into NL→SQL/SPARQL generation.
         props_body = f"""            ?class a owl:Class .
-            {gate}
+            {_class_gate(backend)}
             ?property a owl:DatatypeProperty .
             ?property rdfs:domain ?class .
             ?property rdfs:label ?propLabel .
@@ -712,9 +621,9 @@ class TBoxContextBuilder:
     async def _fetch_object_properties(
         self,
         namespace: str,
-        mapped: bool = True,
         graph_iris: list[str] | None = None,
         class_uris: list[str] | None = None,
+        backend: StructuredBackend = StructuredBackend.SQL,
     ) -> list[dict[str, Any]]:
         """Fetch ObjectProperties (FK join paths) for the namespace.
 
@@ -731,18 +640,13 @@ class TBoxContextBuilder:
         if not _is_safe_sparql_uri(graph_uri_prefix):
             return []
 
-        # When ``mapped``: only surface object-property edges where BOTH ends are
+        # Only surface object-property edges where BOTH ends are
         # MAPPED classes (both required patterns). Tier-2 turns these into SQL
         # joins; an edge to an unmapped class can't be joined and would
         # reintroduce an unmapped class name into the prompt. Edges between
         # unmapped classes (e.g. unstructured<->unstructured) stay in the graph
         # for Tier-3 / grounding-traversal — just not structured-query
-        # material. In the legacy fallback (``mapped`` False, no markers exist)
-        # both end-gates are dropped so all join paths surface, matching the
-        # pre-filter behavior.
-        # BRIDGE: passing ``mapped_gate_iri=None`` is the legacy fallback described
-        # above. To remove the bridge, pass ``_IS_MAPPED_IRI`` unconditionally —
-        # that yields the pre-bridge query (both ends mapped-gated).
+        # material.
         #
         # The query text itself lives in ``query_utils.object_properties_sparql``
         # because the Tier-2 FK-traversal tool reads the same edges; keeping one
@@ -756,8 +660,9 @@ class TBoxContextBuilder:
         sparql = object_properties_sparql(
             graph_uri_prefix,
             limit=_OBJECT_PROPERTY_LIMIT,
-            mapped_gate_iri=_IS_MAPPED_IRI if mapped else None,
+            mapped_gate_iri=_IS_MAPPED_IRI,
             graph_iris=graph_iris,
+            query_backend=backend,
             domain_iris=[u for u in (class_uris or []) if _is_safe_sparql_uri(u)][:_MAX_DOMAIN_ANCHOR_URIS],
         )
         try:
@@ -798,8 +703,8 @@ class TBoxContextBuilder:
         self,
         ontology_hits: list[VectorHit],
         namespace: str,
-        mapped: bool = True,
         graph_iris: list[str] | None = None,
+        backend: StructuredBackend = StructuredBackend.SQL,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """Fetch full class/property definitions from Neptune for ontology vector hits."""
         validate_namespace(namespace)
@@ -842,19 +747,15 @@ class TBoxContextBuilder:
         class_values = " ".join(f"(<{uri}>)" for uri in safe_class_uris) if safe_class_uris else ""
         prop_values = " ".join(f"(<{uri}>)" for uri in safe_prop_uris) if safe_prop_uris else ""
 
-        # BRIDGE: PRE-BRIDGE the UNION clauses below inlined ``_IS_MAPPED_PATTERN``
-        # and ``_MAPPED_PARENT_PATTERN`` directly; to remove, drop this local and
-        # substitute those constants for ``{gate}`` / ``{_parent_pattern(mapped)}``.
-        gate = _class_gate(mapped)
         union_clauses: list[str] = []
         if class_values:
             union_clauses.append(f"""
             {{
               VALUES (?class) {{ {class_values} }}
               ?class a owl:Class .
-              {gate}
+              {_class_gate(backend)}
               ?class rdfs:label ?label .
-              {_parent_pattern(mapped)}
+              {_parent_pattern(backend)}
               {_DATATYPE_PROPS_OPTIONAL}
             }}""")
         if prop_values:
@@ -873,9 +774,9 @@ class TBoxContextBuilder:
               OPTIONAL {{ ?property rdfs:range ?range . }}
               OPTIONAL {{ ?property <{_SCL_DISTINCT_VALUES}> ?distinctValue . }}
               ?class a owl:Class .
-              {gate}
+              {_class_gate(backend)}
               ?class rdfs:label ?label .
-              {_parent_pattern(mapped)}
+              {_parent_pattern(backend)}
             }}""")
 
         sparql = f"""
@@ -898,8 +799,8 @@ class TBoxContextBuilder:
         self,
         query: str,
         namespace: str,
-        mapped: bool = True,
         graph_iris: list[str] | None = None,
+        backend: StructuredBackend = StructuredBackend.SQL,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """Fallback: fetch ontology context by matching NL query entities against class labels."""
         validate_namespace(namespace)
@@ -935,10 +836,6 @@ class TBoxContextBuilder:
             logger.warning("tbox_unsafe_graph_uri_prefix", prefix=graph_uri_prefix)
             return [], []
 
-        # BRIDGE: PRE-BRIDGE, ``{_class_gate(mapped)}`` was ``{_IS_MAPPED_PATTERN}``
-        # and ``{_parent_pattern(mapped)}`` was ``{_MAPPED_PARENT_PATTERN}`` (both
-        # unconditional).
-        #
         # Split into a class query and a property query for the same reason
         # ``_try_full_namespace_context`` is split: joined against the datatype
         # OPTIONAL, one class fans out to (properties x distinct values x parents x
@@ -950,10 +847,10 @@ class TBoxContextBuilder:
         # one label per language per class. DISTINCT plus the bounded class list
         # keeps the class query one row per (class, label, parent).
         entity_classes_body = f"""            ?class a owl:Class .
-            {_class_gate(mapped)}
+            {_class_gate(backend)}
             ?class rdfs:label ?label .
             FILTER({filters})
-            {_parent_pattern(mapped)}"""
+            {_parent_pattern(backend)}"""
         classes_sparql = f"""
         SELECT DISTINCT ?class ?label (LANG(?label) AS ?labelLang) ?parentClass
         WHERE {{

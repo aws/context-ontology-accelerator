@@ -294,7 +294,31 @@ def _source_level_chunks(metadata: dict, node_score: float | None) -> list[Chunk
                 )
             )
 
+    return _with_source_statements(chunks, result["topics"])
+
+
+def _with_source_statements(chunks: list[ChunkResult], topics: list) -> list[ChunkResult]:
+    """Carry the source's retrieved statements on its first chunk that has text."""
+    statements = _topic_statements(topics)
+    if not statements:
+        return chunks
+    for index, chunk in enumerate(chunks):
+        if chunk.text.strip():
+            return [*chunks[:index], replace(chunk, statements=statements), *chunks[index + 1 :]]
     return chunks
+
+
+def _topic_statements(topics: list) -> tuple[str, ...]:
+    """Read a source's retrieved statements (toolkit strings or ``Statement`` dumps), bounded."""
+    texts: list[str] = []
+    for topic in topics:
+        if not isinstance(topic, dict) or not isinstance(topic.get("statements"), list):
+            continue
+        for item in topic["statements"]:
+            text = item.get("statement") if isinstance(item, dict) else item
+            if isinstance(text, str) and text.strip():
+                texts.append(text.strip())
+    return tuple(bound_supporting_statements(texts))
 
 
 def _append_graph_statement(entity: GraphEntity, text: str) -> GraphEntity:

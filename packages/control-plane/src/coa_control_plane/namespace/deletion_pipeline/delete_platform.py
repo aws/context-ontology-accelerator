@@ -4,11 +4,11 @@
 """Deletion pipeline step: platform-level cleanup.
 
 Tears down the VKG ECS service, Athena workgroup, DataZone project, and
-namespace role mappings/roles. All best-effort (log + swallow) except role
-mappings/roles, which raise on DynamoDB errors so the state machine's retry
-policy applies — these must succeed for the namespace to be considered
-fully cleaned up (unlike VKG/Athena/DataZone teardown, which are already
-best-effort in ``cleanup.py``).
+namespace role mappings/roles. Each raises on failure (already-deleted is
+not a failure), so the state machine's retry policy applies and, once
+retries are exhausted, the namespace lands in DELETE_FAILED: Finalize
+deletes the namespace record, so a VKG service left running here would be
+orphaned with nothing left to retry its delete.
 """
 
 from __future__ import annotations

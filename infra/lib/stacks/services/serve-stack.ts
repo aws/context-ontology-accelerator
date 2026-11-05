@@ -21,6 +21,10 @@ import { agentCoreSupportedSubnets } from "../../utils/agentcore-az";
 import { retainAgentCoreSecurityGroup } from "../../utils/agentcore-teardown";
 import { brandEnv } from "../../utils/brand-env";
 import { parseEcrImageUri } from "../../utils/ecr-utils";
+import {
+  GRAPH_SOURCES_ENV,
+  graphSourcesEnabled,
+} from "../../utils/graph-sources";
 import { bundlePython } from "../../utils/python-bundling";
 import { fromRoot, Paths } from "../../paths";
 import { DynamoDBTable, SCLStack, SclMonitoring } from "../../constructs";
@@ -258,12 +262,25 @@ export class ServeStack extends SCLStack {
       ...parseCidrs("jdbc_peer_cidrs"),
       ...parseCidrs("jdbc_tgw_cidrs"),
     ];
+    // RDF_SPARQL graph sources ship dark: with `-c graph_sources=on` only, serve
+    // gets the env var, the source-cluster data read and the peer 8182 egress.
+    const graphSources = graphSourcesEnabled(this.node);
     for (const cidr of remoteCidrs) {
       for (const port of jdbcDbPorts) {
         agentCoreSg.addEgressRule(
           ec2.Peer.ipv4(cidr),
           ec2.Port.tcp(port),
           `JDBC port ${port} to peer network ${cidr}`,
+        );
+      }
+      // An RDF_SPARQL graph source can be a Neptune cluster in a peered / TGW
+      // network; the in-VPC 8182 rule above does not reach it. The remote
+      // cluster's own SG must also admit 8182 from this VPC (owned by that cluster).
+      if (graphSources) {
+        agentCoreSg.addEgressRule(
+          ec2.Peer.ipv4(cidr),
+          ec2.Port.tcp(8182),
+          `SPARQL (graph source) to peer network ${cidr}`,
         );
       }
     }
@@ -303,22 +320,12 @@ export class ServeStack extends SCLStack {
         // index.py imports coa_common (resolve_region); include
         // libs/common/src + its runtime deps or the Lambda fails at import
         // with Runtime.ImportModuleError: No module named
-        // 'coa_common'. Each dep is single-quoted in the install command, so a
-        // `>=` spec is not read as a shell redirect.
+        // 'coa_common'.
         fromRoot("libs/common/src"),
       ],
-      pipDeps: [
-        "opensearch-py",
-        "requests-aws4auth",
-        "cedarpy",
-        "cryptography",
-        "pydantic-settings",
-        "PyJWT",
-        "requests",
-        "structlog",
-        // First certifi without the roots behind the compromised emSign intermediates.
-        "certifi>=2026.10.19",
-      ],
+      requirementsFile: fromRoot(
+        "packages/context-manager/lambda/aoss-search-proxy/requirements.lock.txt",
+      ),
       architecture: "arm64",
     });
 
@@ -498,6 +505,11 @@ export class ServeStack extends SCLStack {
           // TODO(aoss-proxy): Remove when AgentCore supports AOSS directly
           OPENSEARCH_PROXY_LAMBDA_ARN: aossProxyFn.functionArn,
           ATHENA_OUTPUT_S3: `s3://${props.athenaResultsBucketName ?? this.prefixed("athena-results")}/`,
+          // Platform bucket that holds UPLOADED documents (<namespaceId>/raw/<uploadId>/...).
+          // Upload sources carry no bucket of their own, so Deep Reasoning's document
+          // reads resolve them here. Same name the sources stack gives the bucket; the
+          // prefix-scoped S3 read grant below already covers it.
+          SOURCES_DATA_BUCKET: `${this.prefixed("sources-data")}-${account}`,
           ATHENA_WORKGROUP_PREFIX: `${this.prefixed("")}`,
           // ATHENA_WORKGROUP_PREFIX is a fallback; primary resolution reads
           // athenaWorkgroupName from the namespaces DDB table at runtime.
@@ -569,6 +581,8 @@ export class ServeStack extends SCLStack {
               return raw;
             })(),
           }),
+          // RDF_SPARQL graph sources (native Tier-2 SPARQL); absent means off.
+          ...(graphSources && { [GRAPH_SOURCES_ENV]: "true" }),
           // Tier-2 flat NL→SQL: append the tables one induced FK hop out from the
           // retrieved ones. On in the code default, so this key exists to turn it
           // OFF (`-c serve_nl2sql_graph_expand=false`) or to pin it explicitly —
@@ -580,6 +594,17 @@ export class ServeStack extends SCLStack {
             undefined && {
             SERVE_NL2SQL_GRAPH_EXPAND: String(
               this.node.tryGetContext("serve_nl2sql_graph_expand"),
+            ),
+          }),
+          // Deployment-wide switch for the recommended Deep Reasoning options that a
+          // request leaves unset. "off" puts every option back to off, for callers
+          // that cannot send per-request options (the REST Query contract carries
+          // none). Absent: the variable is not set and the recommended set applies.
+          ...(this.node.tryGetContext(
+            "serve_deep_reasoning_default_options",
+          ) !== undefined && {
+            DEEP_REASONING_DEFAULT_OPTIONS: String(
+              this.node.tryGetContext("serve_deep_reasoning_default_options"),
             ),
           }),
           // Companion budget: how many walked tables may be appended (default 8 in
@@ -610,6 +635,33 @@ export class ServeStack extends SCLStack {
             (this.node.tryGetContext(
               "deep_reasoning_synthesis_reserve_s",
             ) as string) ?? "25",
+          // Deep-reasoning stop signals. serve parses all four once, in config.py
+          // load_config() at startup: a malformed or out-of-range value logs a
+          // warning and falls back to the code default (it is not clamped). The
+          // defaults below match those code defaults, so a deploy changes nothing
+          // until an operator sets them. SUFFICIENCY_MIN_CONFIDENCE (float 0..1)
+          // holds back a "sufficient" stop whose confidence is below it;
+          // PROGRESS_SIMILARITY_THRESHOLD (float 0..1) stops once the working
+          // answer stays at or above this cosine similarity for STABILITY_STEPS
+          // (int 1..20) compared replies; STOP_TELEMETRY (bool) records per-reply
+          // stop_signals traces even when both thresholds are 0. String() keeps a
+          // JSON-number context value (e.g. from cdk.json) a string env var.
+          DEEP_REASONING_SUFFICIENCY_MIN_CONFIDENCE: String(
+            this.node.tryGetContext(
+              "deep_reasoning_sufficiency_min_confidence",
+            ) ?? "0",
+          ),
+          DEEP_REASONING_PROGRESS_SIMILARITY_THRESHOLD: String(
+            this.node.tryGetContext(
+              "deep_reasoning_progress_similarity_threshold",
+            ) ?? "0",
+          ),
+          DEEP_REASONING_STABILITY_STEPS: String(
+            this.node.tryGetContext("deep_reasoning_stability_steps") ?? "2",
+          ),
+          DEEP_REASONING_STOP_TELEMETRY: String(
+            this.node.tryGetContext("deep_reasoning_stop_telemetry") ?? "false",
+          ),
           // Hard per-request cap inside serve (main.py RESOLVE_TIMEOUT_S, clamped
           // 10..300). Must exceed DEEP_REASONING_TIME_BUDGET_S + SYNTHESIS_RESERVE_S
           // or serve aborts a session the deep-reasoning budget still considers live.
@@ -745,13 +797,33 @@ export class ServeStack extends SCLStack {
         }),
       );
 
-      // Neptune — graph store (read-only)
+      // Neptune — graph store (read-only). Two read surfaces, two statements:
+      //   1. the SHARED ontology endpoint (T-Box) — always the platform cluster;
+      //   2. a graph source's DATA endpoint (A-Box) — a customer-chosen cluster
+      //      whose resource id is known only from the source record at request
+      //      time, so it is granted on every cluster in THIS account and region
+      //      (registration accepts only a cluster of the deployment's region).
+      //      Cross-account Neptune is out of scope. The SPARQL firewall keeps every
+      //      such query read-only.
+      // Off, only the first exists, without a sid (main's statement).
       runtime.addToRolePolicy(
         new iam.PolicyStatement({
+          ...(graphSources && { sid: "ServeNeptuneOntologyRead" }),
           actions: ["neptune-db:ReadDataViaQuery"],
           resources: [props.neptuneClusterArn],
         }),
       );
+      if (graphSources) {
+        runtime.addToRolePolicy(
+          new iam.PolicyStatement({
+            sid: "ServeNeptuneSourceDataRead",
+            actions: ["neptune-db:ReadDataViaQuery"],
+            resources: [
+              `arn:${cdk.Aws.PARTITION}:neptune-db:${region}:${account}:*/*`,
+            ],
+          }),
+        );
+      }
 
       // DynamoDB — data sources registry (read-only)
       runtime.addToRolePolicy(

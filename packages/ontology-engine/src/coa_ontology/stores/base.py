@@ -229,6 +229,8 @@ class GraphStore(Protocol):
         comments: list[str] | None = None,
         super_classes: list[str] | None = None,
         is_mapped: bool = False,
+        query_backend: str | None = None,
+        data_source_id: str | None = None,
     ) -> dict:
         """Persist a class into an ontology's named graph.
 
@@ -238,7 +240,11 @@ class GraphStore(Protocol):
             labels: Human-readable labels for the class.
             comments: Definitions/comments for the class.
             super_classes: Parent class URIs (``rdfs:subClassOf`` targets).
-            is_mapped: Whether the class is R2RML-mapped (SQL-backed, Tier-2).
+            is_mapped: Whether the class is structured-answerable (Tier-2): the
+                ``rr:class`` of an R2RML TriplesMap, or a class bound to a graph source.
+            query_backend: Which structured backend answers it (``"RDF_SPARQL"`` for a
+                graph class). ``None`` for SQL — absence is read as SQL by serve.
+            data_source_id: The source backing a graph class, for serve routing.
 
         Returns:
             The stored class as a dict.
@@ -460,8 +466,13 @@ class GraphStore(Protocol):
         max_results: int = 100,
         include_properties: bool = True,
         label_preference: LabelPreference | None = None,
+        class_prefix: str | None = None,
     ) -> dict:
         """List all classes and properties across all ontologies in a namespace.
+
+        ``class_prefix`` keeps only classes whose IRI equals it or sits under it
+        as an IRI namespace (``#`` / ``/``), applied before ``max_results``
+        truncates the page.
 
         Returns::
             {

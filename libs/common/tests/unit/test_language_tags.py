@@ -101,6 +101,8 @@ def test_needs_language_instruction_invalid_tag_raises(tag):
         ("zh-hant", "Chinese (BCP 47 tag `zh-Hant`)"),
         ("pt-br", "Portuguese (BCP 47 tag `pt-BR`)"),
         ("es-419", "Spanish (BCP 47 tag `es-419`)"),
+        ("en", "English (BCP 47 tag `en`)"),
+        ("en-gb", "English (BCP 47 tag `en-GB`)"),
     ],
 )
 def test_describe_language_names_known_language_with_canonical_tag(tag, expected):

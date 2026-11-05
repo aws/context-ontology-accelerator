@@ -9,6 +9,7 @@ import { Construct } from "constructs";
 
 import { SCLStack } from "../../constructs";
 import { resolveContext } from "../../context";
+import { graphSourcesEnabled } from "../../utils/graph-sources";
 import {
   JdbcConnectivity,
   type PeeringConfig,
@@ -21,7 +22,9 @@ import {
  * network plumbing for the SemanticContext platform.
  *
  * Supports importing an existing VPC by setting the `vpc_id` CDK context
- * key.  When omitted, a new VPC is created.
+ * key.  When omitted, a new VPC is created, on `vpc_cidr` when set (default
+ * `10.0.0.0/16`). `vpc_cidr` only applies to a NEW deployment: changing it on
+ * an existing one replaces the VPC and everything in it.
  *
  * Context keys (in addition to SCLStack defaults):
  *   - `vpc_id` - optional; if provided, looks up an existing VPC instead
@@ -72,6 +75,13 @@ export class NetworkStack extends SCLStack {
 
   /** Port-80 egress used only by direct Snowflake discovery for OCSP. */
   public readonly discoveryOcspSecurityGroup: ec2.SecurityGroup;
+  /**
+   * SPARQL egress for the graph-verify Lambda: reaches a registered RDF_SPARQL
+   * source's endpoint, which may be any cluster in a reachable network. Attached
+   * only to that Lambda, alongside the shared Lambda SG. Undefined unless
+   * `graph_sources` is on.
+   */
+  public readonly sparqlSourceEgressSecurityGroup?: ec2.SecurityGroup;
 
   /**
    * Security group meant for the AOSS VPC endpoint (port 443). It is NOT attached
@@ -101,6 +111,11 @@ export class NetworkStack extends SCLStack {
       | undefined;
 
     if (existingVpcId) {
+      if (this.ctxString("vpc_cidr")) {
+        throw new Error(
+          "vpc_cidr and vpc_id are mutually exclusive: an imported VPC keeps its own CIDR",
+        );
+      }
       if (
         cdk.Token.isUnresolved(this.account) ||
         cdk.Token.isUnresolved(this.region)
@@ -150,8 +165,21 @@ export class NetworkStack extends SCLStack {
       // via ``resolveAgentCoreAzNames`` and passes them in here. When not
       // provided (unit synth), fall back to the default 2-AZ spread.
       const azNames = props?.agentCoreAzNames;
+      const vpcCidr = this.ctxString("vpc_cidr");
+      if (vpcCidr) {
+        validateVpcCidr(vpcCidr, {
+          azCount: azNames && azNames.length > 0 ? azNames.length : 2,
+          peerCidrs: [
+            ...this.ctxList("jdbc_peer_cidrs"),
+            ...this.ctxList("jdbc_tgw_cidrs"),
+          ],
+        });
+      }
       this.vpc = new ec2.Vpc(this, "Vpc", {
         vpcName: this.prefixed("vpc"),
+        // Unset keeps CDK's default (10.0.0.0/16), so existing deployments see
+        // no diff.
+        ...(vpcCidr && { ipAddresses: ec2.IpAddresses.cidr(vpcCidr) }),
         ...(azNames && azNames.length > 0
           ? { availabilityZones: azNames }
           : { maxAzs: 2 }),
@@ -416,6 +444,45 @@ export class NetworkStack extends SCLStack {
       "direct discovery",
     );
 
+    // A graph source's SPARQL endpoint is customer-chosen, so the shared Lambda
+    // SG's 8182 rule (scoped to the platform Neptune SG) does not reach it. Kept
+    // off the shared SG for the same reason as the OCSP egress: only the
+    // graph-verify Lambda probes source endpoints. 8182 is Neptune's port and the
+    // configuration default; a source on another port needs a rule here.
+    // The group and its export exist with the switch off too, with no rules: a
+    // consumer deployed with the switch on still imports the export, and this stack
+    // is updated before it, so dropping the export would fail the off deploy. It
+    // gets its rules, and is handed to consumers, only with `-c graph_sources=on`.
+    const sparqlSg = new ec2.SecurityGroup(this, "SparqlSourceEgressSG", {
+      vpc: this.vpc,
+      securityGroupName: this.prefixed("sparql-source-egress-sg"),
+      description: "Graph source SPARQL endpoint egress security group",
+      allowAllOutbound: false,
+    });
+    this.exportValue(sparqlSg.securityGroupId);
+    if (graphSourcesEnabled(this.node)) {
+      // Only this VPC and the networks it reaches by peering or transit gateway. A
+      // registered endpoint must also be a Neptune cluster endpoint of this account on
+      // 8182 (coa_common.sparql_config, graph_verify), so the probe cannot be pointed at
+      // an outside host.
+      sparqlSg.addEgressRule(
+        ec2.Peer.ipv4(this.vpc.vpcCidrBlock),
+        ec2.Port.tcp(8182),
+        "RDF_SPARQL source endpoint in the VPC (graph-verify reachability probe)",
+      );
+      for (const cidr of [
+        ...this.ctxList("jdbc_peer_cidrs"),
+        ...this.ctxList("jdbc_tgw_cidrs"),
+      ]) {
+        sparqlSg.addEgressRule(
+          ec2.Peer.ipv4(cidr),
+          ec2.Port.tcp(8182),
+          `RDF_SPARQL source endpoint in peer network ${cidr} (graph-verify reachability probe)`,
+        );
+      }
+      this.sparqlSourceEgressSecurityGroup = sparqlSg;
+    }
+
     // Neptune ingress — scoped to the ECS + Lambda SGs (least privilege),
     // replacing the previous VPC-CIDR-wide rule.
     this.neptuneSecurityGroup.addIngressRule(
@@ -665,5 +732,69 @@ export class NetworkStack extends SCLStack {
       .split(",")
       .map((s) => s.trim())
       .filter((s) => s.length > 0);
+  }
+}
+
+/** Each AZ gets one public and one private subnet of this size. */
+const SUBNET_PREFIX = 24;
+
+function parseIpv4Cidr(cidr: string): { base: number; prefix: number } {
+  const match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\/(\d{1,2})$/.exec(
+    cidr,
+  );
+  const octets = match ? match.slice(1, 5).map(Number) : [];
+  const prefix = match ? Number(match[5]) : NaN;
+  if (!match || octets.some((o) => o > 255) || prefix > 32) {
+    throw new Error(`'${cidr}' is not an IPv4 CIDR (e.g. 10.40.0.0/16)`);
+  }
+  const address = octets.reduce((acc, o) => acc * 256 + o, 0);
+  const size = 2 ** (32 - prefix);
+  if (address % size !== 0) {
+    throw new Error(
+      `'${cidr}' has host bits set; use the network address of the block`,
+    );
+  }
+  return { base: address, prefix };
+}
+
+function overlaps(a: string, b: string): boolean {
+  const x = parseIpv4Cidr(a);
+  const y = parseIpv4Cidr(b);
+  const xEnd = x.base + 2 ** (32 - x.prefix);
+  const yEnd = y.base + 2 ** (32 - y.prefix);
+  return x.base < yEnd && y.base < xEnd;
+}
+
+/**
+ * Reject a `vpc_cidr` the platform VPC cannot be built on, at synth rather than
+ * as a CloudFormation failure an hour into a deploy.
+ *
+ * - AWS allows a VPC between /16 and /28.
+ * - It must hold one public and one private /24 per AZ.
+ * - It must not overlap a peered or Transit Gateway network, or the routes to
+ *   that network cannot exist.
+ */
+export function validateVpcCidr(
+  cidr: string,
+  opts: { azCount: number; peerCidrs: string[] },
+): void {
+  const { prefix } = parseIpv4Cidr(cidr);
+  if (prefix < 16 || prefix > 28) {
+    throw new Error(`vpc_cidr ${cidr}: AWS allows a VPC between /16 and /28`);
+  }
+  const subnetsNeeded = opts.azCount * 2;
+  const subnetsAvailable = 2 ** (SUBNET_PREFIX - prefix);
+  if (prefix > SUBNET_PREFIX || subnetsAvailable < subnetsNeeded) {
+    throw new Error(
+      `vpc_cidr ${cidr} is too small: ${opts.azCount} AZs need ${subnetsNeeded} /${SUBNET_PREFIX} subnets ` +
+        `(use /${SUBNET_PREFIX - Math.ceil(Math.log2(subnetsNeeded))} or larger)`,
+    );
+  }
+  for (const peer of opts.peerCidrs) {
+    if (overlaps(cidr, peer)) {
+      throw new Error(
+        `vpc_cidr ${cidr} overlaps peer network ${peer}; peering and its routes need disjoint ranges`,
+      );
+    }
   }
 }

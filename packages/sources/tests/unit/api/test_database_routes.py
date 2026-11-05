@@ -16,9 +16,10 @@ import os
 from unittest.mock import MagicMock, call, create_autospec, patch
 
 import pytest
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, EndpointConnectionError
 from coa_common.dao.base import PaginatedResult
 from coa_common.datazone_forms import FORM_TYPE_NAME
+from coa_common.sparql_config import GRAPH_SOURCES_DISABLED_MESSAGE, GRAPH_SOURCES_ENV
 from coa_control_plane_server.models.source_type import SourceType
 
 # ---------------------------------------------------------------------------
@@ -140,6 +141,7 @@ def _make_glue_db_req(athena_data_catalog_name=None, execution_engine=None, reds
     req.jdbc_configuration = None
     req.custom_connector_configuration = None
     req.databricks_sql_warehouse_configuration = None
+    req.sparql_configuration = None
     req.metadata_enrichment_enabled = None
     return req
 
@@ -153,6 +155,7 @@ def _make_jdbc_db_req(engine="POSTGRESQL"):
     req.glue_configuration = None
     req.custom_connector_configuration = None
     req.databricks_sql_warehouse_configuration = None
+    req.sparql_configuration = None
     req.metadata_enrichment_enabled = None
     return req
 
@@ -612,6 +615,7 @@ def _make_athena_db_req(
         "databaseName": database_name,
     }
     req.databricks_sql_warehouse_configuration = None
+    req.sparql_configuration = None
     req.metadata_enrichment_enabled = None
     return req
 
@@ -6512,3 +6516,228 @@ class TestHandlePutEventRescan:
         assert status == 200
         assert body["eventRescan"] == {"enabled": False}
         assert mock_dao.update.call_args[0][1]["eventRescan"] == {"enabled": False}
+
+
+# ===================================================================
+# _create_database_source — RDF_SPARQL (graph) sources
+# ===================================================================
+
+_NEPTUNE_HOST = "my-graph.cluster-abc.us-east-1.neptune.amazonaws.com"
+_GRAPH_VERIFY_QUEUE = "https://sqs.us-east-1.amazonaws.com/123/graph-verify-queue"
+
+
+def _make_sparql_db_req(**config):
+    """A CreateDatabaseSourceInput carrying only a real generated SparqlConfiguration."""
+    from coa_control_plane_server.models.sparql_configuration import SparqlConfiguration
+
+    req = MagicMock()
+    req.name = "support-graph"
+    req.glue_configuration = None
+    req.jdbc_configuration = None
+    req.custom_connector_configuration = None
+    req.databricks_sql_warehouse_configuration = None
+    req.sparql_configuration = SparqlConfiguration.from_dict({"dataEndpoint": _NEPTUNE_HOST, **config})
+    req.metadata_enrichment_enabled = None
+    return req
+
+
+@pytest.mark.unit
+class TestCreateSparqlSource:
+    """A graph source is registered and verified for reachability, never scanned."""
+
+    @pytest.fixture(autouse=True)
+    def _graph_sources_on(self, monkeypatch):
+        monkeypatch.setenv(GRAPH_SOURCES_ENV, "true")
+
+    def _create(self, req, *, verify_queue=_GRAPH_VERIFY_QUEUE, sqs=None, dao=None):
+        mock_dao = dao or MagicMock()
+        mock_scan_dao = MagicMock()
+        mock_sqs = sqs or MagicMock()
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}._get_scan_dao", return_value=mock_scan_dao),
+            patch(f"{_DR}._get_sqs", return_value=mock_sqs),
+            patch(f"{_DR}._GRAPH_VERIFY_QUEUE_URL", verify_queue),
+            patch(f"{_DR}.adjust_namespace_source_count") as counter,
+            patch(f"{_DR}.register_lambda_catalog") as register_catalog,
+            patch(f"{_DR}.claim_platform_catalog") as claim,
+        ):
+            status, body = _parse(_dr._create_database_source(req, _NAMESPACE_ID, namespace_language="en"))
+        register_catalog.assert_not_called()
+        claim.assert_not_called()
+        return status, body, mock_dao, mock_scan_dao, mock_sqs, counter
+
+    @pytest.mark.parametrize("value", [None, "", "false", "off"])
+    def test_create_sparql_source_with_graph_sources_off_is_400_and_writes_nothing(self, monkeypatch, value):
+        if value is None:
+            monkeypatch.delenv(GRAPH_SOURCES_ENV)
+        else:
+            monkeypatch.setenv(GRAPH_SOURCES_ENV, value)
+        status, body, mock_dao, mock_scan_dao, mock_sqs, counter = self._create(_make_sparql_db_req())
+        assert status == 400
+        assert body == {"error": GRAPH_SOURCES_DISABLED_MESSAGE}
+        mock_dao.put.assert_not_called()
+        mock_scan_dao.put.assert_not_called()
+        mock_sqs.send_message.assert_not_called()
+        counter.assert_not_called()
+
+    def test_create_sparql_source_with_graph_sources_on_registers_it(self, monkeypatch):
+        monkeypatch.setenv(GRAPH_SOURCES_ENV, " On ")
+        status, body, mock_dao, _, mock_sqs, _ = self._create(_make_sparql_db_req())
+        assert status == 202
+        assert body["status"] == "REGISTERED"
+        mock_dao.put.assert_called_once()
+        mock_sqs.send_message.assert_called_once()
+
+    def test_create_sparql_source_persists_rdf_sparql_record_not_yet_queryable(self):
+        status, body, mock_dao, _, _, _ = self._create(_make_sparql_db_req())
+        assert status == 202
+        assert body["status"] == "REGISTERED"
+        item = _source_put(mock_dao)
+        assert item["sourceType"] == "DATABASE"
+        assert item["sourceSubType"] == "RDF_SPARQL"
+        assert item["status"] == "REGISTERED"
+        assert item["queryable"] is False
+        # No catalog machinery for a graph source.
+        assert "athenaCatalog" not in item
+        assert "athenaDataCatalogName" not in item
+        assert "queryEngine" not in item
+
+    def test_create_sparql_source_stores_the_normalised_configuration(self):
+        _, _, mock_dao, _, _, _ = self._create(_make_sparql_db_req(dataNamedGraph="https://example.test/ns/acme/data"))
+        item = _source_put(mock_dao)
+        assert json.loads(item["configuration"]) == {
+            "store": "neptune",
+            "dataEndpoint": _NEPTUNE_HOST,
+            "region": "us-east-1",
+            "dataNamedGraph": "https://example.test/ns/acme/data",
+            "authMode": "sigv4",
+        }
+        assert item["region"] == "us-east-1"
+
+    def test_create_sparql_source_in_another_region_than_the_deployment_is_400(self):
+        """A graph source is a cluster of this deployment's region; another region is refused unsent."""
+        west = "my-graph.cluster-abc.us-west-2.neptune.amazonaws.com"
+        status, body, mock_dao, _, mock_sqs, _ = self._create(
+            _make_sparql_db_req(dataEndpoint=west, region="us-west-2")
+        )
+        assert status == 400
+        assert "us-east-1" in body["error"]
+        mock_dao.put.assert_not_called()
+        mock_sqs.send_message.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {"dataEndpoint": "example.com"},
+            {"dataEndpoint": "10.0.0.5"},
+            {"dataEndpoint": "169.254.169.254"},
+            {"port": 443},
+        ],
+    )
+    def test_create_sparql_source_outside_neptune_or_8182_is_400(self, config):
+        """An outside host, an IP literal or another port never reaches the table or the verify queue."""
+        status, _, mock_dao, _, mock_sqs, _ = self._create(_make_sparql_db_req(**config))
+        assert status == 400
+        mock_dao.put.assert_not_called()
+        mock_sqs.send_message.assert_not_called()
+
+    def test_create_sparql_source_enqueues_reachability_verify(self):
+        status, body, _, mock_scan_dao, mock_sqs, counter = self._create(_make_sparql_db_req())
+        assert status == 202
+        job_row = mock_scan_dao.put.call_args[0][0]
+        assert job_row["scanType"] == "reachability"
+        assert job_row["status"] == "IN_PROGRESS"
+        assert job_row["triggerType"] == "INITIAL"
+        assert body["scanJobId"] == job_row["SK"]
+        kwargs = mock_sqs.send_message.call_args.kwargs
+        assert kwargs["QueueUrl"] == _GRAPH_VERIFY_QUEUE
+        msg = json.loads(kwargs["MessageBody"])
+        assert msg == {"sourceId": body["sourceId"], "namespaceId": _NAMESPACE_ID, "scanJobSK": job_row["SK"]}
+        counter.assert_called_once_with(_NAMESPACE_ID, SourceType.DATABASE, 1)
+
+    def test_create_sparql_source_never_enqueues_a_sql_scan(self):
+        _, _, _, _, mock_sqs, _ = self._create(_make_sparql_db_req())
+        assert mock_sqs.send_message.call_count == 1
+        assert mock_sqs.send_message.call_args.kwargs["QueueUrl"] != os.environ["SCAN_QUEUE_URL"]
+
+    def test_create_sparql_source_enqueue_failure_rolls_back_and_returns_500(self):
+        mock_sqs = MagicMock()
+        mock_sqs.send_message.side_effect = ClientError({"Error": {"Code": "InternalError"}}, "SendMessage")
+        status, _, mock_dao, mock_scan_dao, _, counter = self._create(_make_sparql_db_req(), sqs=mock_sqs)
+        assert status == 500
+        # The row is REGISTERED (an active status) and nothing would verify it, so it
+        # must not survive: delete and re-scan both refuse an active source.
+        assert _source_deletes(mock_dao)
+        mock_scan_dao.delete.assert_called_once()
+        assert counter.call_args_list[-1] == call(_NAMESPACE_ID, SourceType.DATABASE, -1)
+
+    def test_create_sparql_source_unreachable_queue_rolls_back_and_returns_500(self):
+        mock_sqs = MagicMock()
+        mock_sqs.send_message.side_effect = EndpointConnectionError(endpoint_url=_GRAPH_VERIFY_QUEUE)
+        status, _, mock_dao, mock_scan_dao, _, counter = self._create(_make_sparql_db_req(), sqs=mock_sqs)
+        assert status == 500
+        assert _source_deletes(mock_dao)
+        mock_scan_dao.delete.assert_called_once()
+        assert counter.call_args_list[-1] == call(_NAMESPACE_ID, SourceType.DATABASE, -1)
+
+    def test_create_sparql_source_without_a_verify_queue_rolls_back_and_returns_500(self):
+        # No queue means nothing would ever verify the REGISTERED row: the same
+        # stranded source as a failed enqueue, so the same rollback.
+        status, _, mock_dao, mock_scan_dao, mock_sqs, counter = self._create(_make_sparql_db_req(), verify_queue="")
+        assert status == 500
+        mock_sqs.send_message.assert_not_called()
+        assert _source_deletes(mock_dao)
+        mock_scan_dao.delete.assert_called_once()
+        assert counter.call_args_list[-1] == call(_NAMESPACE_ID, SourceType.DATABASE, -1)
+
+    def test_create_sparql_source_ddb_put_failure_returns_500(self):
+        mock_dao = MagicMock()
+        mock_dao.put.side_effect = ClientError({"Error": {"Code": "InternalError"}}, "PutItem")
+        status, _, _, mock_scan_dao, mock_sqs, _ = self._create(_make_sparql_db_req(), dao=mock_dao)
+        assert status == 500
+        mock_scan_dao.put.assert_not_called()
+        mock_sqs.send_message.assert_not_called()
+
+    def test_create_sparql_source_neptune_with_a_credential_secret_is_400(self):
+        req = _make_sparql_db_req(credentialSecretArn="arn:aws:secretsmanager:us-east-1:111122223333:secret:x")
+        status, body, mock_dao, _, mock_sqs, _ = self._create(req)
+        assert status == 400
+        assert "credentialSecretArn" in body["error"]
+        mock_dao.put.assert_not_called()
+        mock_sqs.send_message.assert_not_called()
+
+    def test_create_sparql_source_conflicting_ports_is_400(self):
+        status, body, mock_dao, _, _, _ = self._create(
+            _make_sparql_db_req(dataEndpoint=f"{_NEPTUNE_HOST}:9000", port=8182)
+        )
+        assert status == 400
+        assert "port" in body["error"]
+        mock_dao.put.assert_not_called()
+
+    def test_sparql_and_another_configuration_together_is_400(self):
+        req = _make_sparql_db_req()
+        req.jdbc_configuration = MagicMock()
+        status, body, mock_dao, _, _, _ = self._create(req)
+        assert status == 400
+        assert "sparqlConfiguration" in body["error"]
+        mock_dao.put.assert_not_called()
+
+    def test_sparql_configuration_update_is_not_supported(self):
+        """D5: a graph source's configuration is immutable in v1."""
+        item = {
+            "PK": f"NS#{_NAMESPACE_ID}",
+            "SK": f"SRC#{_SOURCE_ID}",
+            "sourceType": "DATABASE",
+            "sourceSubType": "RDF_SPARQL",
+            "status": "APPROVED",
+            "configuration": json.dumps({"store": "neptune", "dataEndpoint": _NEPTUNE_HOST}),
+        }
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = item
+        event = {"body": json.dumps({"sparqlConfiguration": {"dataEndpoint": "other.example.com"}})}
+        with patch(f"{_DR}._get_dao", return_value=mock_dao):
+            status, body = _parse(_dr._handle_update_metadata(event, _NAMESPACE_ID, _SOURCE_ID))
+        assert status == 400
+        assert "RDF_SPARQL" in body["error"]
+        mock_dao.update.assert_not_called()

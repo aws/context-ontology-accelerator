@@ -102,6 +102,8 @@ class NeptuneAnalyticsGraphStore(GraphStore):
         comments=None,
         super_classes=None,
         is_mapped=False,
+        query_backend=None,
+        data_source_id=None,
     ):
         """Persist a class into the ontology's graph in the bound namespace.
 
@@ -113,6 +115,10 @@ class NeptuneAnalyticsGraphStore(GraphStore):
             super_classes: Parent class URIs (``rdfs:subClassOf`` targets).
             is_mapped: Tier-2 R2RML-answerability marker; accepted for protocol
                 parity but not persisted on this backend (see the note below).
+            query_backend: Graph-backend marker; accepted for protocol parity and,
+                like ``is_mapped``, not persisted on this backend yet.
+            data_source_id: Graph source binding; accepted for protocol parity and
+                not persisted on this backend yet.
 
         Returns:
             The stored class as a dict.
@@ -130,7 +136,9 @@ class NeptuneAnalyticsGraphStore(GraphStore):
         # Until then, NA-backed namespaces carry no isMapped marker and serve treats
         # absent as unmapped (i.e. NA classes are hidden from the structured
         # Tier-2 prompt rather than wrongly exposed).
-        _ = is_mapped  # accepted for protocol parity; NA persistence is a follow-up
+        # The graph-source markers share is_mapped's NA gap: an NA namespace's graph
+        # classes stay dark to the SPARQL strategy until NA persists the markers.
+        _ = (is_mapped, query_backend, data_source_id)  # protocol parity; NA persistence is a follow-up
         return na_store.store_class(
             ontology_uri,
             class_uri,
@@ -283,6 +291,7 @@ class NeptuneAnalyticsGraphStore(GraphStore):
         max_results: int = 100,
         include_properties: bool = True,
         label_preference: LabelPreference | None = None,
+        class_prefix: str | None = None,
     ) -> dict:
         """Raise — Neptune Analytics has no bulk namespace schema query.
 
@@ -291,6 +300,7 @@ class NeptuneAnalyticsGraphStore(GraphStore):
             max_results: Unused; kept for protocol parity.
             include_properties: Unused; kept for protocol parity.
             label_preference: Unused; kept for protocol parity.
+            class_prefix: Unused; kept for protocol parity.
 
         Raises:
             NotImplementedError: Always, on this backend.

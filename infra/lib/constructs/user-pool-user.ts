@@ -16,7 +16,8 @@ import { InitialCognitoUserAttributes } from "../types";
  * Properties for {@link UserPoolUser}.
  *
  * Creates an initial admin user in a Cognito User Pool via a custom resource.
- * Cognito sends a temporary password to the user's email — no Secrets Manager.
+ * Cognito emails a temporary password only to a real `initialAdminEmail`; the
+ * default placeholder user gets no invitation. No Secrets Manager secret.
  */
 export interface UserPoolUserProps {
   /** The Cognito User Pool to create the admin user in. */
@@ -29,11 +30,13 @@ export interface UserPoolUserProps {
  * CDK construct that provisions an initial admin user in a Cognito User Pool.
  *
  * Creates a Lambda-backed custom resource that:
- * - Creates the user in Cognito with a temporary password (emailed to user)
+ * - Creates the user in Cognito with a temporary password (emailed only to a
+ *   real `initialAdminEmail`, never to the default placeholder)
  * - Creates an admin group and assigns the user to it
  *
  * The user must change their password on first login.
- * No Secrets Manager secret is created — credentials are delivered via email.
+ * No Secrets Manager secret is created — a real `initialAdminEmail` receives
+ * its credentials by email.
  */
 export class UserPoolUser extends SCLConstruct {
   constructor(scope: Construct, id: string, props: UserPoolUserProps) {

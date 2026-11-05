@@ -47,7 +47,7 @@ def resolve_namespace_id(namespace: str, table) -> str:
     if namespace in _RESOLVE_CACHE:
         return _RESOLVE_CACHE[namespace]
 
-    if _UUID_RE.match(namespace):
+    if _UUID_RE.fullmatch(namespace):
         resp = table.get_item(Key={"PK": f"NS#{namespace}", "SK": "METADATA"})
         if resp.get("Item"):
             _RESOLVE_CACHE[namespace] = namespace
@@ -63,7 +63,7 @@ def resolve_namespace_id(namespace: str, table) -> str:
         return resolved
 
     # Last attempt: maybe it IS a UUID that doesn't have a METADATA record yet
-    if _UUID_RE.match(namespace):
+    if _UUID_RE.fullmatch(namespace):
         _RESOLVE_CACHE[namespace] = namespace
         return namespace
 

@@ -23,6 +23,7 @@ What's covered:
 from __future__ import annotations
 
 import importlib.util
+import shutil
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -52,21 +53,15 @@ def _load_module(name: str, path: Path):
 
 
 @pytest.fixture
-def stub_config(tmp_path, monkeypatch):
-    """Create a minimal config.yaml in a tmp dir and point the modules at it.
+def stub_config(tmp_path):
+    """Copy demo.py and setup.py into a tmp dir beside a minimal config.yaml, and yield that dir.
 
-    Both demo.py and setup.py do `from pathlib import Path` and compute
-    CONFIG_PATH = Path(__file__).parent / "config.yaml" at module scope.
-    We can't easily redirect that without writing a real file where they
-    expect it, so we create a config.yaml in the real demo/ dir for the
-    test duration. Guard against accidental clobber — back up and restore.
+    Both compute CONFIG_PATH = Path(__file__).parent / "config.yaml" at module scope, so loading the copies reads the
+    stub config. The tracked demo/ dir is never written, so parallel workers can't race on it.
     """
-    real_config = _DEMO_DIR / "config.yaml"
-    backup = None
-    if real_config.exists():
-        backup = real_config.read_text()
-
-    real_config.write_text("""
+    for name in ("demo.py", "setup.py"):
+        shutil.copy(_DEMO_DIR / name, tmp_path / name)
+    (tmp_path / "config.yaml").write_text("""
 services:
   ontology-catalog: "http://localhost:8001"
   data-catalog: "http://localhost:8003"
@@ -79,13 +74,7 @@ induction_defaults:
   namespace: "default"
 foundational_ontologies: []
 """)
-
-    yield real_config
-
-    if backup is not None:
-        real_config.write_text(backup)
-    else:
-        real_config.unlink()
+    return tmp_path
 
 
 # ── demo.py helpers ─────────────────────────────────────────────
@@ -98,7 +87,7 @@ class TestPromptSelection:
 
     @pytest.fixture
     def demo_module(self, stub_config):
-        return _load_module("demo_under_test", _DEMO_DIR / "demo.py")
+        return _load_module("demo_under_test", stub_config / "demo.py")
 
     def test_all_returns_full_range(self, demo_module):
         with patch.object(demo_module, "Prompt") as mock_prompt:
@@ -146,7 +135,7 @@ class TestHttpFetch:
 
     @pytest.fixture
     def demo_module(self, stub_config):
-        return _load_module("demo_under_test", _DEMO_DIR / "demo.py")
+        return _load_module("demo_under_test", stub_config / "demo.py")
 
     def test_success_returns_json(self, demo_module):
         mock_response = MagicMock()
@@ -193,7 +182,7 @@ class TestHttpFetch:
 class TestBuildClassText:
     @pytest.fixture
     def setup_module(self, stub_config):
-        return _load_module("setup_under_test", _DEMO_DIR / "setup.py")
+        return _load_module("setup_under_test", stub_config / "setup.py")
 
     def test_labels_and_comments_joined(self, setup_module):
         entry = {"labels": ["Person", "Human"], "comments": ["A natural person."]}
@@ -214,7 +203,7 @@ class TestBuildClassText:
 class TestBuildPropertyText:
     @pytest.fixture
     def setup_module(self, stub_config):
-        return _load_module("setup_under_test", _DEMO_DIR / "setup.py")
+        return _load_module("setup_under_test", stub_config / "setup.py")
 
     def test_labels_comments_and_types(self, setup_module):
         entry = {
@@ -245,7 +234,7 @@ class TestBuildPropertyText:
 class TestFindExistingOntology:
     @pytest.fixture
     def setup_module(self, stub_config):
-        return _load_module("setup_under_test", _DEMO_DIR / "setup.py")
+        return _load_module("setup_under_test", stub_config / "setup.py")
 
     def test_hit(self, setup_module):
         """ListOntologies answers with a camelCase ``{"ontologies": [...]}`` envelope.
@@ -301,7 +290,7 @@ class TestFindExistingOntology:
 class TestRegisterOntology:
     @pytest.fixture
     def setup_module(self, stub_config):
-        return _load_module("setup_under_test", _DEMO_DIR / "setup.py")
+        return _load_module("setup_under_test", stub_config / "setup.py")
 
     def test_idempotent_when_already_exists(self, setup_module):
         """Re-running setup.py should not create duplicates."""
@@ -348,7 +337,7 @@ class TestServerSideFetch:
 
     @pytest.fixture
     def setup_module(self, stub_config):
-        return _load_module("setup_under_test", _DEMO_DIR / "setup.py")
+        return _load_module("setup_under_test", stub_config / "setup.py")
 
     def test_url_encodes_ontology_id(self, setup_module):
         """PROV-O's URI contains '#' which HTTP clients treat as a fragment
@@ -384,3 +373,11 @@ class TestServerSideFetch:
         ):
             result = setup_module._server_side_fetch("https://schema.org/", "http://example/")
         assert result is None
+
+
+def test_demo_helpers_leave_the_original_configuration_unchanged(request: pytest.FixtureRequest) -> None:
+    config = _DEMO_DIR / "config.yaml"
+    before = config.read_bytes() if config.exists() else None
+    request.getfixturevalue("stub_config")
+    after = config.read_bytes() if config.exists() else None
+    assert after == before
