@@ -10,6 +10,7 @@ import math
 from coa_common.constants import MAX_QUERY_CODEPOINTS, validate_query_text
 from pydantic import BaseModel, Field, field_serializer, field_validator
 
+from .llm_usage import LlmUsageSnapshot
 from .mode import LEGACY_MODE_ALIASES
 
 _MAX_DETAIL_LENGTH = 500  # Matches trace.py centralized truncation
@@ -249,6 +250,18 @@ class InvokeRequest(BaseModel):
 
     @field_validator("options", mode="after")
     @classmethod
+    def _validate_include_llm_usage(cls, options: dict) -> dict:
+        """Validate ``options.includeLlmUsage`` — opt in to ``QueryResult.llmUsage``.
+
+        Observability only: it never changes routing or execution. Must be a real
+        boolean so a string ``"false"`` cannot silently switch accounting on.
+        """
+        if "includeLlmUsage" in options and not isinstance(options["includeLlmUsage"], bool):
+            raise ValueError(f"Invalid includeLlmUsage {_clip(options['includeLlmUsage'])}; must be a boolean")
+        return options
+
+    @field_validator("options", mode="after")
+    @classmethod
     def _normalize_dimensions(cls, options: dict) -> dict:
         """Normalize ``options.dimensions`` from the WIRE shape to the internal one.
 
@@ -390,6 +403,50 @@ class InvokeRequest(BaseModel):
         return options
 
 
+class LlmModelUsage(BaseModel):
+    """Provider-reported token totals for one model used by the request."""
+
+    model_id: str = Field(..., min_length=1, alias="modelId")
+    input_tokens: int = Field(..., ge=0, alias="inputTokens")
+    output_tokens: int = Field(..., ge=0, alias="outputTokens")
+    max_input_tokens_per_call: int = Field(..., ge=0, alias="maxInputTokensPerCall")
+    model_config = {"populate_by_name": True, "strict": True}
+
+
+class LlmUsageMetrics(BaseModel):
+    """Text-LLM usage incurred while serve answered one request.
+
+    Mirrors ``LlmUsageMetrics`` in ``serve.smithy``. Present only when the caller set
+    ``options.includeLlmUsage``. ``complete`` is False when any call's usage was
+    unknown. Model ids are included so downstream benchmark reporting can apply a
+    versioned price table without coupling Serve to AWS pricing.
+    """
+
+    input_tokens: int = Field(..., ge=0, alias="inputTokens")
+    output_tokens: int = Field(..., ge=0, alias="outputTokens")
+    per_model: list[LlmModelUsage] = Field(..., alias="perModel")
+    complete: bool
+    model_config = {"populate_by_name": True, "strict": True}
+
+    @classmethod
+    def from_snapshot(cls, snapshot: LlmUsageSnapshot) -> LlmUsageMetrics:
+        """Build the outbound shape from a finalized tracker snapshot."""
+        return cls(
+            input_tokens=snapshot.input_tokens,
+            output_tokens=snapshot.output_tokens,
+            per_model=[
+                LlmModelUsage(
+                    model_id=usage.model_id,
+                    input_tokens=usage.input_tokens,
+                    output_tokens=usage.output_tokens,
+                    max_input_tokens_per_call=usage.max_input_tokens_per_call,
+                )
+                for usage in snapshot.per_model
+            ],
+            complete=snapshot.complete,
+        )
+
+
 class QueryResult(BaseModel):
     """Resolution result: answer tier, confidence, payloads, and processing trace."""
 
@@ -417,6 +474,9 @@ class QueryResult(BaseModel):
     # on the timeout path (see main.py); this model does not touch it.
     partial: bool = False
     metadata: dict | None = None
+    # Opt-in (options.includeLlmUsage): absent unless requested, so the default
+    # response shape is unchanged.
+    llm_usage: LlmUsageMetrics | None = Field(None, alias="llmUsage")
     # OUT OF SCOPE (flag, do not implement here): no `conformanceWarnings`
     # field. SHACL conformance warnings are P1 and are intentionally absent
     # from this model; do NOT add a conformanceWarnings field here.

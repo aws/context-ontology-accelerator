@@ -31,6 +31,13 @@ from ..graph_context import (
     bound_supporting_statements,
     encode_supporting_statements,
 )
+from ..llm_usage import (
+    REASON_USAGE_PATCH_INACTIVE,
+    CallHandle,
+    LlmUsageTracker,
+    current_tracker,
+    graphrag_retrieval,
+)
 from ..step_ids import StepId
 from ..tier3.graph_traverser import GraphEntity
 from ..tier3.vector_retriever import ChunkResult
@@ -519,11 +526,13 @@ class BaselineLexicalRetriever:
         from graphrag_toolkit.lexical_graph.storage import GraphStoreFactory, VectorStoreFactory
 
         from .cross_script_prune import patch_cross_script_statement_prune
-        from .graphrag_patches import patch_paginated_search_source
+        from .graphrag_patches import patch_llm_usage_accounting, patch_paginated_search_source
 
         # Must run before any index is queried: AOSS NEXTGEN omits knn_vector from the
         # default _source, which silently collapses the TopicBeamSearch beam.
         patch_paginated_search_source()
+        # Opt-in LLM cost accounting reads GraphRAG's keyword-LLM usage below its cache.
+        patch_llm_usage_accounting()
         # A question in one script must not lose the statements written in another
         # because a few same-script statements share a word with it (#1263).
         patch_cross_script_statement_prune()
@@ -599,14 +608,42 @@ class BaselineLexicalRetriever:
     _MAX_QUERY_ATTEMPTS = 3
     _QUERY_RETRY_BACKOFF_S = 0.5
 
-    def _retrieve_sync(self, query: str, namespace: str, strategy: StrategySpec) -> list:
+    def _retrieve_sync(
+        self,
+        query: str,
+        namespace: str,
+        strategy: StrategySpec,
+        tracker: LlmUsageTracker | None = None,
+        work: CallHandle | None = None,
+    ) -> list:
         """Synchronous retrieval call (toolkit does not support async).
 
         Retries a transient Neptune connection drop (idempotent read) up to
         ``_MAX_QUERY_ATTEMPTS`` with linear backoff; any other error propagates on
         the first occurrence (the caller turns it into a degraded result).
+
+        ``tracker`` is the request's LLM usage tracker, captured on the event loop and
+        bound here because ``run_in_executor`` does not carry context variables into
+        this worker, where GraphRAG makes its keyword-LLM call. ``work`` is the pending
+        handle :meth:`retrieve` registered before submission; it closes only when this
+        worker finishes, so a response assembled while the retrieval is still queued or
+        running reports incomplete usage.
         """
+        try:
+            with graphrag_retrieval(tracker):
+                return self._retrieve_with_retry(query, namespace, strategy, tracker)
+        finally:
+            if tracker is not None and work is not None:
+                tracker.end_work(work)
+
+    def _retrieve_with_retry(
+        self, query: str, namespace: str, strategy: StrategySpec, tracker: LlmUsageTracker | None
+    ) -> list:
+        from .graphrag_patches import llm_usage_patch_active
+
         engine = self._get_engine(namespace, strategy)
+        if tracker is not None and not llm_usage_patch_active():
+            tracker.mark_incomplete(REASON_USAGE_PATCH_INACTIVE)
         last_exc: Exception | None = None
         for attempt in range(1, self._MAX_QUERY_ATTEMPTS + 1):
             try:
@@ -652,7 +689,12 @@ class BaselineLexicalRetriever:
 
         try:
             loop = asyncio.get_running_loop()
-            fut = loop.run_in_executor(self._executor, self._retrieve_sync, query, namespace, resolved)
+            # Opt-in LLM usage: the worker can outlive this await (timeout below, or a
+            # caller's deadline cancelling it) and only reaches GraphRAG's LLM later, so
+            # the retrieval is registered as pending work BEFORE submission.
+            tracker = current_tracker()
+            work = tracker.begin_work("graphrag_retrieval") if tracker is not None else None
+            fut = loop.run_in_executor(self._executor, self._retrieve_sync, query, namespace, resolved, tracker, work)
             nodes = await asyncio.wait_for(asyncio.shield(fut), timeout=self._timeout_s)
             duration_ms = int((time.perf_counter() - start) * 1000)
             trace_steps.append(

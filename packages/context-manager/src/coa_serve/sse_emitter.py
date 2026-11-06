@@ -94,11 +94,14 @@ class SSEEmitter:
         payload = result.model_dump(by_alias=True, exclude_none=True, mode="json")
         return self._make_envelope("done", {"result": payload})
 
-    def format_error(self, error: str, message: str, status_code: int) -> dict:
+    def format_error(self, error: str, message: str, status_code: int, *, llm_usage: dict | None = None) -> dict:
         """Build an error event for mid-stream failures."""
+        payload = {"error": error, "message": message, "statusCode": status_code}
+        if llm_usage is not None:
+            payload["llmUsage"] = llm_usage
         return self._make_envelope(
             "error",
-            {"error": error, "message": message, "statusCode": status_code},
+            payload,
         )
 
     async def stream(self):

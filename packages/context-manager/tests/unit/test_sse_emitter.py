@@ -115,6 +115,14 @@ class TestSSEEmitterFormatError:
         assert event["payload"]["message"] == "Query timed out"
         assert event["payload"]["statusCode"] == 504
 
+    def test_format_error_can_include_llm_usage(self):
+        emitter = SSEEmitter("req-1")
+        usage = {"inputTokens": 10, "outputTokens": 1, "perModel": [], "complete": False}
+
+        event = emitter.format_error("TimeoutError", "Query timed out", 504, llm_usage=usage)
+
+        assert event["payload"]["llmUsage"] == usage
+
 
 class TestSSEEmitterStream:
     """Validate the async stream() generator."""
