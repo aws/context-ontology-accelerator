@@ -42,8 +42,9 @@ export function Hero(): React.JSX.Element {
               auditable. It uses AI-assisted induction (with human review) to
               accelerate customers' creation of ontologies that are specific to
               their entities, relationships, rules, and constraints. Customers
-              can edit their ontologies and are able to use them across their
-              systems, built on open W3C standards (OWL, RDF, SHACL). The
+              review and edit each proposed ontology before they accept it, and
+              use the result across their systems, built on open W3C standards
+              (OWL, RDF, SHACL). The
               ontology is stored in a customer-owned knowledge graph that any
               agent can consume through Context Ontology Accelerator MCP.
             </p>

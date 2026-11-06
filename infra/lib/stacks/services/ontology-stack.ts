@@ -20,10 +20,15 @@ import { Construct } from "constructs";
 
 import { SCLStack } from "../../constructs/scl-stack";
 import { SclMonitoring } from "../../constructs";
-import { Paths } from "../../paths";
+import { fromRoot, Paths } from "../../paths";
 import { resolveContext, guardrailProfileResources } from "../../context";
 import { bundlePython } from "../../utils/python-bundling";
+import {
+  GRAPH_SOURCES_ENV,
+  graphSourcesEnabled,
+} from "../../utils/graph-sources";
 import { grantIdempotencyTable } from "../../utils/idempotency";
+import { grantGuardDutyAgentPull } from "../../utils/guardduty-agent";
 import { NetworkStack } from "../foundation/network-stack";
 import {
   DEFAULT_BEDROCK_MODEL_ID,
@@ -120,8 +125,7 @@ export class OntologyStack extends SCLStack {
       props.bedrockChatModelId ?? DEFAULT_BEDROCK_CHAT_MODEL_ID;
     // Grounding rerank defaults to the chat (Haiku-class) model — a cheap
     // reranker — matching the ontology-engine GROUNDING_LLM_MODEL_ID default.
-    const groundingModelId =
-      props.bedrockGroundingLlmModelId ?? chatModelId;
+    const groundingModelId = props.bedrockGroundingLlmModelId ?? chatModelId;
 
     // ── OpenSearch config via SSM ──────────────────────────────────────
     const opensearchEndpoint = ssm.StringParameter.valueForStringParameter(
@@ -212,6 +216,7 @@ export class OntologyStack extends SCLStack {
       cpu,
       memoryLimitMiB,
     });
+    grantGuardDutyAgentPull(taskDef);
 
     const logGroup = new logs.LogGroup(this, "OntologyLogGroup", {
       logGroupName: `/ecs/${this.prefixed("ontology-engine")}`,
@@ -305,6 +310,9 @@ export class OntologyStack extends SCLStack {
         // serialised ontology to this endpoint, so it is opt-in: absent context
         // leaves the variable unset and the validator makes no request.
         ...(oopsEndpoint && { OOPS_ENDPOINT: oopsEndpoint }),
+        // Ontology import binds classes to RDF_SPARQL graph sources only with
+        // `-c graph_sources=on`; absent means off.
+        ...(graphSourcesEnabled(this.node) && { [GRAPH_SOURCES_ENV]: "true" }),
       },
       portMappings: [
         {
@@ -623,17 +631,25 @@ export class OntologyStack extends SCLStack {
     new events.Rule(this, "OntologyTaskOomRule", {
       ruleName: this.prefixed("ontology-oom"),
       description:
-        "Ontology induction ECS task stopped by OOM (exit 137 / OutOfMemory stoppedReason)",
+        "Ontology induction ECS task stopped by OOM (OutOfMemory reason, or an essential container that exited 137)",
       eventPattern: {
         source: ["aws.ecs"],
         detailType: ["ECS Task State Change"],
         detail: {
           clusterArn: [this.cluster.clusterArn],
           lastStatus: ["STOPPED"],
-          // Either the OOM stoppedReason OR any container that exited 137.
+          // Exit 137 alone is any SIGKILL, including ECS killing a task that
+          // outlived its stop timeout during a deploy (stopCode
+          // ServiceSchedulerInitiated). Count it only when the essential
+          // container died on its own; an OOM during a stop still matches on
+          // its OutOfMemory reason.
           $or: [
             { stoppedReason: [{ wildcard: "*OutOfMemory*" }] },
-            { containers: { exitCode: [137] } },
+            { containers: { reason: [{ wildcard: "*OutOfMemory*" }] } },
+            {
+              stopCode: ["EssentialContainerExited"],
+              containers: { exitCode: [137] },
+            },
           ],
         },
       },
@@ -1008,7 +1024,10 @@ export class OntologyStack extends SCLStack {
               ...(groundingDistinct
                 ? {
                     gi: bedrockModelMetric("InputTokenCount", groundingModelId),
-                    go: bedrockModelMetric("OutputTokenCount", groundingModelId),
+                    go: bedrockModelMetric(
+                      "OutputTokenCount",
+                      groundingModelId,
+                    ),
                   }
                 : {}),
               ei: bedrockModelMetric("InputTokenCount", embedModelId),
@@ -1103,23 +1122,14 @@ export class OntologyStack extends SCLStack {
       handler: "coa_ontology.api_proxy_handler.handler",
       // Merges libs/common/src into the asset root so
       // `coa_common` (used for resolve_region) is importable.
-      // Its transitive deps (structlog, pydantic-settings, etc. — see
-      // libs/common/pyproject.toml) must be installed explicitly since this
-      // Lambda has no requirements.txt of its own; mirrors the pipDeps used
-      // wherever else commonLib is bundled (e.g. api-stack.ts).
+      // Its runtime deps (structlog, pydantic-settings, etc. — see
+      // libs/common/pyproject.toml) are listed in the requirements file next
+      // to the handler's lock, since the Lambda has no package of its own.
       code: bundlePython({
         srcDirs: [Paths.ontologyEngineSrc, Paths.commonLib],
-        pipDeps: [
-          "cedarpy>=4.8.0",
-          "pydantic>=2.0",
-          "pydantic-settings>=2.0",
-          "structlog>=24.0",
-          "cryptography>=43.0",
-          "PyJWT>=2.9.0",
-          "requests>=2.32.0",
-          // First certifi without the roots behind the compromised emSign intermediates.
-          "certifi>=2026.10.19",
-        ],
+        requirementsFile: fromRoot(
+          "packages/ontology-engine/lambda/api-proxy/requirements.lock.txt",
+        ),
       }),
       timeout: cdk.Duration.seconds(60),
       memorySize: 256,

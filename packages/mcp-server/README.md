@@ -82,12 +82,15 @@ deployment's resource prefix (default `/coa`).
 checkout and use the absolute path to the built entrypoint:
 
 ```bash
+pnpm install          # from the repo root
 cd packages/mcp-proxy
-npm install
-npx tsc --outDir dist
+pnpm run build
 # use the absolute path printed by:
 echo "$PWD/dist/index.js"
 ```
+
+Without a repo checkout, download the proxy source from the console's MCP Server page instead
+(see `packages/mcp-proxy/README.md`).
 
 ### Step 2: Configure your IDE
 
@@ -198,17 +201,17 @@ Integration tests validate the MCP server against a live deployed AgentCore Runt
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `MCP_RUNTIME_ARN` | Yes | Deployed MCP AgentCore Runtime ARN (from `coa-dev-mcp` stack outputs) |
-| `MCP_BEARER_TOKEN` | Yes | Valid Cognito JWT for a user WITH namespace access |
-| `MCP_NO_ACCESS_TOKEN` | No | Valid Cognito JWT for a user WITHOUT namespace grants (for authz denial tests; skipped if unset) |
-| `MCP_TEST_NAMESPACE` | Yes | Namespace ID the bearer token user has access to |
+| `INTEG_SECRET_ARN` | No (auto-provisioned when unset) | Secrets Manager secret holding the integ test user's credentials. The suite signs that user in through the MCP/CLI client (`/<prefix>/mcp-client-id`), the only client the MCP runtime accepts, and through the web app client for the rejection test |
+| `MCP_NO_ACCESS_TOKEN` | No | ID token from the MCP/CLI client (`/<prefix>/mcp-client-id`) for a user WITHOUT namespace grants (for authz denial tests; skipped if unset) |
+| `INTEG_NAMESPACE_ID` | No | Namespace to test against; when unset the shared integ namespace is found or created |
 | `AWS_REGION` | No | Defaults to `us-east-1` |
 
 ### Running
 
 ```bash
 export MCP_RUNTIME_ARN="arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/..."
-export MCP_BEARER_TOKEN="eyJ..."
-export MCP_TEST_NAMESPACE="550e8400-..."
+export INTEG_SECRET_ARN="arn:aws:secretsmanager:us-east-1:123456789012:secret:..."
+export INTEG_NAMESPACE_ID="550e8400-..."  # optional
 export MCP_NO_ACCESS_TOKEN="eyJ..."  # optional
 
 uv run pytest packages/mcp-server/tests/integ -m integ -v --tb=short

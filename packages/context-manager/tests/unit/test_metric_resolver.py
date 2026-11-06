@@ -841,13 +841,15 @@ class TestLazyNamespaceOnMiss:
         mock_neptune.query.return_value = []
         resolver = MetricResolver(neptune_client=mock_neptune)
         await resolver.start()
-        await resolver.match("x", "emptyns")  # marks emptyns lazily-loaded
-        assert "emptyns" in resolver._lazy_loaded_namespaces
+        await resolver.match("x", "emptyns")  # reads emptyns once
+        await resolver.match("x", "emptyns")
+        reads_before_refresh = mock_neptune.query.await_count
 
-        # The hourly full refresh (replace=True) resets the guard.
-        mock_neptune.query.return_value = []
+        # The hourly full refresh (replace=True) resets the guard: the next miss
+        # reads the namespace again although the lookup TTL has not passed.
         await resolver._refresh_from_neptune()
-        assert "emptyns" not in resolver._lazy_loaded_namespaces
+        await resolver.match("x", "emptyns")
+        assert mock_neptune.query.await_count == reads_before_refresh + 2
 
     async def test_lazy_lookup_query_is_namespace_scoped_not_full_scan(self):
         from unittest.mock import AsyncMock
@@ -859,12 +861,13 @@ class TestLazyNamespaceOnMiss:
         # Capture the SPARQL the lazy lookup sends.
         await resolver.match("no_such_metric", "insurance")
         lazy_sparql = mock_neptune.query.await_args.args[0]
-        # The FILTER must be scoped to this one namespace's graphs (prefix +
-        # "insurance/"), NOT the bare cluster-wide prefix the periodic refresh
-        # uses — otherwise a single miss scans every namespace (the load this
-        # change is meant to avoid).
-        assert 'STRSTARTS(STR(?g), "' in lazy_sparql
-        assert "insurance/" in lazy_sparql
+        # The read is scoped to the namespace's one metric graph with a constant
+        # GRAPH IRI, NOT a STRSTARTS filter, which Neptune evaluates across the
+        # whole store.
+        assert "STRSTARTS" not in lazy_sparql
+        graph = "https://ontology-workbench.local/insurance/urn%3Acoa%3Avocab%23GovernedMetrics"
+        assert f"GRAPH <{graph}>" in lazy_sparql
+        assert f"BIND(<{graph}> AS ?g)" in lazy_sparql
         # The periodic full refresh query stays broad (no per-namespace segment).
         assert "insurance/" not in resolver._metric_list_sparql
 

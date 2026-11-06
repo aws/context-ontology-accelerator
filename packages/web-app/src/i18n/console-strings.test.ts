@@ -27,6 +27,7 @@ import {
 import { validateS3Prefix } from "@utils/helpers";
 import { localizeTraceStatus } from "@components/Chat/step-labels";
 import { describePlaygroundError } from "@components/Chat/playground-errors";
+import { PLAYGROUND_UNAVAILABLE_MESSAGE } from "@api-hooks/use-playground-stream";
 import { proposalStatusText } from "../pages/OntologyPage";
 import { describeSaveFailure } from "../pages/ontology/induce/ProposalDetail";
 
@@ -165,6 +166,20 @@ describe("Playground errors", () => {
     expect(ja("Choose which edits to save")).toBe(
       "保存する編集を選択してください",
     );
+  });
+
+  it("shows the Playground-unavailable error in Japanese without a retry", () => {
+    const text = describePlaygroundError(
+      "PlaygroundUnavailable",
+      PLAYGROUND_UNAVAILABLE_MESSAGE,
+      "ja",
+      ja,
+    );
+    expect(text.summary).toBe(
+      "この環境ではプレイグラウンドのクエリサービスをまだ利用できないため、質問を送信できません。",
+    );
+    expect(text.detail).toBeUndefined();
+    expect(text.retryable).toBe(false);
   });
 
   it("falls back to the server text for an unknown type", () => {

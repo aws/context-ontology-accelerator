@@ -22,6 +22,8 @@ from __future__ import annotations
 
 from .base import Tool, ToolResult
 from .chunk_tool import ChunkExpansionTool, build_chunk_expansion_tool
+from .document_tool import ReadDocumentTool, build_document_tool
+from .find_documents_tool import FindDocumentsTool, build_find_documents_tool
 from .graph_tool import GraphTraversalTool, build_graph_tool
 from .ontology_tool import OntologyLookupTool, build_ontology_tool, ontology_from_result
 from .registry import ToolRegistry
@@ -38,6 +40,10 @@ __all__ = [
     "build_graph_tool",
     "ChunkExpansionTool",
     "build_chunk_expansion_tool",
+    "ReadDocumentTool",
+    "build_document_tool",
+    "FindDocumentsTool",
+    "build_find_documents_tool",
     "VectorSearchTool",
     "build_vector_tool",
     "OntologyLookupTool",

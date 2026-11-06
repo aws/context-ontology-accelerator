@@ -1,6 +1,6 @@
 [project]
 name = "coa-sources"
-version = "0.3.8"
+version = "0.3.9"
 description = "Unified Sources for Context Ontology Accelerator"
 requires-python = ">=3.12"
 
@@ -34,6 +34,8 @@ integ = [
 markers = [
     "unit: Unit tests",
     "integ: Integration tests",
+    "security: Security / data-lifecycle tests (e.g. customer-content removal on delete)",
+    "batch_inference: Runs a real Bedrock batch job; CI runs it in its own jobs, integ-test-sources-batch and integ-test-beta-batch",
     "real_glue_ownership: Opt out of the unit conftest's Glue ownership stub and exercise the real check",
 ]
 pythonpath = ["."]

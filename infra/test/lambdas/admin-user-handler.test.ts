@@ -19,6 +19,7 @@ jest
   .mockImplementation(cognitoSend);
 
 import { handler } from "../../lib/lambdas/admin-user-handler";
+import { DEFAULT_ADMIN_EMAIL } from "../../lib/constants";
 
 const BASE_EVENT = {
   ServiceToken: "arn:aws:lambda:us-east-1:123456789:function:test",
@@ -310,5 +311,40 @@ describe("error handling", () => {
     expect(loggedStr).toContain("[REDACTED]");
     expect(loggedStr).not.toContain("admin@example.com");
     spy.mockRestore();
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// The placeholder admin address is never sent an invite
+// ═══════════════════════════════════════════════════════════════════
+describe("Create with the default placeholder address", () => {
+  const placeholder = {
+    ResourceProperties: {
+      ...BASE_EVENT.ResourceProperties,
+      Username: DEFAULT_ADMIN_EMAIL,
+      Email: DEFAULT_ADMIN_EMAIL,
+    },
+  };
+
+  test("suppresses the invitation to the placeholder address", async () => {
+    await handler(makeEvent("Create", placeholder));
+
+    const cmd = cognitoSend.mock.calls[0][0];
+    expect(cmd.constructor.name).toBe("AdminCreateUserCommand");
+    expect(cmd.input.MessageAction).toBe("SUPPRESS");
+    expect(cmd.input.DesiredDeliveryMediums).toBeUndefined();
+  });
+
+  test("still creates the admin group and its membership", async () => {
+    await handler(makeEvent("Create", placeholder));
+
+    const calls = cognitoSend.mock.calls.map(
+      (c: any[]) => c[0].constructor.name,
+    );
+    expect(calls).toEqual([
+      "AdminCreateUserCommand",
+      "CreateGroupCommand",
+      "AdminAddUserToGroupCommand",
+    ]);
   });
 });

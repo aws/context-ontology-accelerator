@@ -44,13 +44,27 @@ exactly what the user it represents is allowed to do.
 The MCP server runs on AgentCore Runtime, reachable over **Streamable HTTP**.
 Configure your MCP client (Claude Desktop, Kiro, Cursor, etc.) with:
 
-- The MCP server's AgentCore Runtime endpoint (from the `coa-dev-mcp` stack outputs)
-- The user's Bearer token, obtained via the same OIDC 3LO + PKCE flow described below
+- The MCP server's AgentCore Runtime endpoint (from the `<prefix>-<env>-mcp` stack outputs)
+- The user's Bearer token: an **ID token issued to the MCP/CLI app client**
+  (`McpClientId`), obtained via the same OIDC 3LO + PKCE flow described below
 
 For the MCP/CLI flow specifically, the platform provisions a dedicated public
 client with a `localhost:9876/oauth/callback` redirect URI (see the
 [Authentication Setup Guide](authentication-setup.md)) so IDE integrations can
 complete the PKCE login without a server-side secret.
+
+### Which token to send
+
+| You call | Send | Read the client ID from |
+|---|---|---|
+| The MCP server | ID token from the MCP/CLI client | `McpClientId` (auth stack output), or SSM `/<prefix>/mcp-client-id` |
+| The REST API | ID token from the web app client | `UserPoolClientId`, or SSM `/<prefix>/userpool-client-id` |
+
+The MCP server rejects any other token with HTTP 401, starting with the
+first request a client sends. That includes an ID token from the web app
+client, and a Cognito access token from either client, because Cognito access
+tokens carry no `aud` claim. On a deployment that uses an external OIDC
+provider, both interfaces use the same client ID.
 
 Each tool call is authorized exactly like a REST call: the server extracts
 the Bearer token from the request, forwards it to the same authorizer path,
@@ -70,6 +84,11 @@ and the agent uses the resulting tokens to call the API on their behalf.
    and refresh token.
 3. The agent calls the API with the user's bearer token, refreshing it with the
    refresh token as needed.
+
+In the examples below, `CLIENT_ID` is the MCP/CLI client ID for a token you
+send to the MCP server, or the web app client ID for the REST API (see
+[Which token to send](#which-token-to-send)), and `id_token` is the token to
+send.
 
 ```bash
 # Example: exchange an authorization code obtained via the 3LO flow

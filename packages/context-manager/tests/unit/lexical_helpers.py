@@ -102,6 +102,11 @@ class _FakeNode:
     attributes.
     """
 
+    node_id: str
+    text: str
+    score: float
+    metadata: dict
+
     __slots__ = ("node_id", "text", "score", "metadata")
 
 

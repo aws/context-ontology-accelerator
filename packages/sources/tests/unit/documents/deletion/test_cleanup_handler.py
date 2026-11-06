@@ -272,6 +272,7 @@ class TestHandlerReturnValue:
             "raw_objects_deleted",
             "staging_objects_deleted",
             "scan_results_objects_deleted",
+            "batch_inference_objects_deleted",
         }
 
     def test_tenant_id_passed_through(self):
@@ -311,3 +312,55 @@ class TestScanResultsCleanup:
             result = cleanup_handler.handler({**_BASE_EVENT, "source_type": "s3", "s3_prefixes": []}, None)
 
         assert result["scan_results_objects_deleted"] == 1
+
+
+@pytest.mark.unit
+class TestBatchInferenceCleanup:
+    def test_deletes_batch_inference_objects(self):
+        """Bedrock batch-inference input/output under {ns}/batch-inference/{ds}/
+        are copies of the customer's extracted text and must be deleted with the
+        source (DeleteSource "all associated data" contract)."""
+        from coa_sources.documents.deletion import cleanup_handler
+
+        batch_prefix = f"{_NAMESPACE_ID}/batch-inference/{_DOC_SOURCE_ID}/"
+        s3 = _mock_s3(
+            {
+                batch_prefix: [_make_page(f"{batch_prefix}input/records.jsonl", f"{batch_prefix}output/out.jsonl.out")],
+            }
+        )
+        s3.delete_objects.return_value = {
+            "Deleted": [
+                {"Key": f"{batch_prefix}input/records.jsonl"},
+                {"Key": f"{batch_prefix}output/out.jsonl.out"},
+            ],
+            "Errors": [],
+        }
+
+        with patch.object(cleanup_handler, "_s3", s3):
+            result = cleanup_handler.handler({**_BASE_EVENT, "source_type": "s3", "s3_prefixes": []}, None)
+
+        assert result["batch_inference_objects_deleted"] == 2
+
+    def test_only_this_sources_batch_prefix_is_targeted(self):
+        """Deletion is scoped to {ns}/batch-inference/{this doc source}/ — a
+        neighbouring source's batch objects under a different docSourceId are
+        never listed or deleted."""
+        from coa_sources.documents.deletion import cleanup_handler
+
+        this_prefix = f"{_NAMESPACE_ID}/batch-inference/{_DOC_SOURCE_ID}/"
+        other_doc_source = "01BBBBBBBBBBBBBBBBBBBBBB02"
+        other_prefix = f"{_NAMESPACE_ID}/batch-inference/{other_doc_source}/"
+        s3 = _mock_s3(
+            {
+                this_prefix: [_make_page(f"{this_prefix}input/records.jsonl")],
+                other_prefix: [_make_page(f"{other_prefix}input/records.jsonl")],
+            }
+        )
+
+        with patch.object(cleanup_handler, "_s3", s3):
+            cleanup_handler.handler({**_BASE_EVENT, "source_type": "s3", "s3_prefixes": []}, None)
+
+        # Every prefix listed is scoped to this doc source; the neighbour's is never touched.
+        listed_prefixes = {call.kwargs["Prefix"] for call in s3.get_paginator.return_value.paginate.call_args_list}
+        assert this_prefix in listed_prefixes
+        assert other_prefix not in listed_prefixes

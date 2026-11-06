@@ -411,3 +411,80 @@ class TestDistinctValuesNotInClassText:
         assert "return_state" in class_text
         assert "allowed values:" not in class_text
         assert "RETURN_REQUESTED" not in class_text
+
+
+@pytest.mark.unit
+class TestAccumulateEmbeddingsQueryBackend:
+    """The SECOND retrieval signal: _accumulate_embeddings stamps
+    query_backend="RDF_SPARQL" on a graph class doc (from class_to_graphsource)
+    and OMITS it for SQL/plain classes (backward compatible)."""
+
+    @patch("coa_ontology.bedrock_embeddings.BedrockEmbeddingClient")
+    def test_graph_class_gets_query_backend_sql_class_does_not(self, mock_bedrock_cls):
+        from coa_ontology.catalog.ingest import _accumulate_embeddings
+
+        mock_bedrock = MagicMock()
+        mock_bedrock.model_id = "amazon.titan-embed-text-v2:0"
+        mock_bedrock.embed_texts.return_value = [[0.1] * 1024, [0.2] * 1024]
+        mock_bedrock_cls.return_value = mock_bedrock
+
+        mock_vector_store = MagicMock()
+
+        g = Graph()
+        # A graph class (bound to an RDF_SPARQL source) and a plain SQL class.
+        g.add((EX.Alliance, RDF.type, OWL.Class))
+        g.add((EX.Alliance, RDFS.label, Literal("Airline Alliance")))
+        g.add((EX.Orders, RDF.type, OWL.Class))
+        g.add((EX.Orders, RDFS.label, Literal("Orders")))
+
+        result = _accumulate_embeddings(
+            vector_store=mock_vector_store,
+            graph=g,
+            ontology_id="http://example.org/ontology#",
+            classes={EX.Alliance, EX.Orders},
+            obj_props=set(),
+            dt_props=set(),
+            namespace="test-ns",
+            # Alliance is graph-bound; Orders is SQL-mapped (data_source_id only).
+            class_to_datasource={str(EX.Orders): "ds-sql-1", str(EX.Alliance): "src-neptune-1"},
+            class_to_graphsource={str(EX.Alliance): "src-neptune-1"},
+        )
+        assert result["status"] == "ok"
+
+        items = {i["entity_uri"]: i for i in mock_vector_store.store_embeddings_batch.call_args[0][0]}
+        # Graph class carries the second signal.
+        assert items[str(EX.Alliance)]["query_backend"] == "RDF_SPARQL"
+        # SQL class does NOT carry query_backend (absent == SQL, backward compatible),
+        # but still carries its data_source_id.
+        assert "query_backend" not in items[str(EX.Orders)]
+        assert items[str(EX.Orders)]["data_source_id"] == "ds-sql-1"
+
+    @patch("coa_ontology.bedrock_embeddings.BedrockEmbeddingClient")
+    def test_no_graphsource_map_omits_query_backend_everywhere(self, mock_bedrock_cls):
+        # Pure-SQL / legacy ingest (no class_to_graphsource) → no doc gets the
+        # field, so existing namespaces are byte-for-byte unchanged.
+        from coa_ontology.catalog.ingest import _accumulate_embeddings
+
+        mock_bedrock = MagicMock()
+        mock_bedrock.model_id = "m"
+        mock_bedrock.embed_texts.return_value = [[0.1] * 1024]
+        mock_bedrock_cls.return_value = mock_bedrock
+        mock_vector_store = MagicMock()
+
+        g = Graph()
+        g.add((EX.Orders, RDF.type, OWL.Class))
+        g.add((EX.Orders, RDFS.label, Literal("Orders")))
+
+        _accumulate_embeddings(
+            vector_store=mock_vector_store,
+            graph=g,
+            ontology_id="http://example.org/ontology#",
+            classes={EX.Orders},
+            obj_props=set(),
+            dt_props=set(),
+            namespace="test-ns",
+            class_to_datasource={str(EX.Orders): "ds-sql-1"},
+            # class_to_graphsource omitted (None)
+        )
+        item = mock_vector_store.store_embeddings_batch.call_args[0][0][0]
+        assert "query_backend" not in item

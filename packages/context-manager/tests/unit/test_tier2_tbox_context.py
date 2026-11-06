@@ -119,8 +119,7 @@ class TestTBoxContextBuilder:
         # named-graph resolution + count query + entity fallback, which is now TWO
         # queries (matched classes, then their datatype properties) so property-row
         # volume can no longer evict a matched class. OP skipped: 1 class; aiContext
-        # skipped: no URIs. The isMapped bridge probe uses the separate .ask method,
-        # so it does not add to .query's count. The leading resolution query is what
+        # skipped: no URIs. The leading resolution query is what
         # binds every later query to this namespace's graphs instead of filtering a
         # cluster-wide scan; it is cached per namespace, so it is once per build at
         # most, not once per query. The last query fetches the selected classes'

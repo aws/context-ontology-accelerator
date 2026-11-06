@@ -3,7 +3,10 @@
 
 import * as cdk from "aws-cdk-lib";
 import { Template, Match } from "aws-cdk-lib/assertions";
-import { NetworkStack } from "../../lib/stacks/foundation/network-stack";
+import {
+  NetworkStack,
+  validateVpcCidr,
+} from "../../lib/stacks/foundation/network-stack";
 
 // Env required for fromLookup tests
 const TEST_ENV = { account: "123456789012", region: "us-east-1" };
@@ -72,6 +75,43 @@ describe("NetworkStack", () => {
     it("creates exactly one NAT gateway", () => {
       const template = buildStack();
       template.resourceCountIs("AWS::EC2::NatGateway", 1);
+    });
+
+    it("keeps the CDK default CIDR when vpc_cidr is unset", () => {
+      // Existing deployments must see no diff.
+      buildStack().hasResourceProperties("AWS::EC2::VPC", {
+        CidrBlock: "10.0.0.0/16",
+      });
+    });
+
+    it("builds the VPC and its subnets on vpc_cidr when set", () => {
+      const template = buildStack({ vpc_cidr: "10.40.0.0/16" });
+      template.hasResourceProperties("AWS::EC2::VPC", {
+        CidrBlock: "10.40.0.0/16",
+      });
+      const subnets = Object.values(
+        template.findResources("AWS::EC2::Subnet"),
+      ).map((r: any) => r.Properties.CidrBlock);
+      expect(subnets).toHaveLength(4);
+      for (const cidr of subnets) {
+        expect(cidr).toMatch(/^10\.40\.\d+\.0\/24$/);
+      }
+    });
+
+    it("refuses vpc_cidr together with vpc_id", () => {
+      expect(() =>
+        buildStackWithEnv({ vpc_id: "vpc-0abc123", vpc_cidr: "10.40.0.0/16" }),
+      ).toThrow(/mutually exclusive/);
+    });
+
+    it("refuses a vpc_cidr overlapping the peered network", () => {
+      expect(() =>
+        buildStack({
+          vpc_cidr: "10.20.0.0/16",
+          jdbc_peer_vpc_id: "vpc-0peer",
+          jdbc_peer_cidrs: "10.20.0.0/16",
+        }),
+      ).toThrow(/overlaps peer network 10\.20\.0\.0\/16/);
     });
 
     it("uses fromLookup when vpc_id context is set (no VPC resource created)", () => {
@@ -409,6 +449,93 @@ describe("NetworkStack", () => {
     });
   });
 
+  describe("SPARQL source egress", () => {
+    const GRAPH_ON = { graph_sources: "on" };
+    const sparqlSgs = (template: Template) =>
+      Object.values(template.findResources("AWS::EC2::SecurityGroup")).filter(
+        (r: any) =>
+          r.Properties.GroupDescription ===
+          "Graph source SPARQL endpoint egress security group",
+      );
+
+    it("keeps an inert SPARQL egress SG, with no 8182 peer rule, when graph sources are off", () => {
+      const template = buildStack({
+        jdbc_peer_vpc_id: "vpc-0peer123",
+        jdbc_peer_cidrs: "10.50.0.0/16",
+      });
+      // Kept so turning the switch off never drops an export in use; see
+      // graph-sources-switch-exports.test.ts.
+      expect(sparqlSgs(template)).toHaveLength(1);
+      expect(JSON.stringify(template.toJSON())).not.toContain("RDF_SPARQL");
+    });
+
+    it("creates the SPARQL egress SG when graph sources are on", () => {
+      expect(sparqlSgs(buildStack(GRAPH_ON))).toHaveLength(1);
+    });
+
+    it("opens only 8182 egress, to the VPC CIDR, on a dedicated SG", () => {
+      const template = buildStack(GRAPH_ON);
+      const sg = Object.values(
+        template.findResources("AWS::EC2::SecurityGroup"),
+      ).find(
+        (r: any) =>
+          r.Properties.GroupDescription ===
+          "Graph source SPARQL endpoint egress security group",
+      ) as any;
+      expect(sg).toBeDefined();
+      const [vpcId] = Object.keys(template.findResources("AWS::EC2::VPC"));
+      expect(sg.Properties.SecurityGroupEgress).toEqual([
+        expect.objectContaining({
+          IpProtocol: "tcp",
+          FromPort: 8182,
+          ToPort: 8182,
+          CidrIp: { "Fn::GetAtt": [vpcId, "CidrBlock"] },
+        }),
+      ]);
+    });
+
+    it("adds 8182 egress to each peered and transit-gateway CIDR", () => {
+      const template = buildStack({
+        ...GRAPH_ON,
+        jdbc_peer_vpc_id: "vpc-0peer123",
+        jdbc_peer_cidrs: "10.50.0.0/16,10.51.0.0/16",
+        jdbc_tgw_id: "tgw-0abc",
+        jdbc_tgw_cidrs: "10.60.0.0/16",
+      });
+      const sg = Object.values(
+        template.findResources("AWS::EC2::SecurityGroup"),
+      ).find(
+        (r: any) =>
+          r.Properties.GroupDescription ===
+          "Graph source SPARQL endpoint egress security group",
+      ) as any;
+      const remote = sg.Properties.SecurityGroupEgress.filter(
+        (e: any) => typeof e.CidrIp === "string",
+      );
+      expect(
+        remote.map((e: any) => [e.CidrIp, e.FromPort, e.ToPort]).sort(),
+      ).toEqual([
+        ["10.50.0.0/16", 8182, 8182],
+        ["10.51.0.0/16", 8182, 8182],
+        ["10.60.0.0/16", 8182, 8182],
+      ]);
+    });
+
+    it("leaves the shared Lambda SG without a public 8182 rule", () => {
+      const template = buildStack(GRAPH_ON);
+      const lambdaSg = Object.values(
+        template.findResources("AWS::EC2::SecurityGroup"),
+      ).find(
+        (r: any) =>
+          r.Properties.GroupDescription === "Lambda functions security group",
+      ) as any;
+      const public8182 = (lambdaSg.Properties.SecurityGroupEgress ?? []).filter(
+        (e: any) => e.FromPort === 8182 && e.CidrIp === "0.0.0.0/0",
+      );
+      expect(public8182).toHaveLength(0);
+    });
+  });
+
   describe("Cloud Map Namespace", () => {
     it("creates a shared PrivateDnsNamespace associated with the VPC", () => {
       const template = buildStack();
@@ -516,5 +643,51 @@ describe("NetworkStack", () => {
       });
       template.resourceCountIs("AWS::EC2::VPCPeeringConnection", 0);
     });
+  });
+});
+
+describe("validateVpcCidr", () => {
+  const ok = { azCount: 2, peerCidrs: [] as string[] };
+
+  it.each(["10.40.0.0/16", "172.20.0.0/20", "192.168.4.0/22"])(
+    "accepts %s",
+    (cidr) => {
+      expect(() => validateVpcCidr(cidr, ok)).not.toThrow();
+    },
+  );
+
+  it.each([
+    ["10.40.0.0", /not an IPv4 CIDR/],
+    ["10.40.0.300/16", /not an IPv4 CIDR/],
+    ["10.40.1.0/16", /host bits set/],
+    ["10.0.0.0/8", /between \/16 and \/28/],
+    ["10.40.0.0/23", /too small/],
+  ])("rejects %s", (cidr, error) => {
+    expect(() => validateVpcCidr(cidr, ok)).toThrow(error);
+  });
+
+  it("sizes the minimum by AZ count", () => {
+    // 3 AZs need 6 /24s, so a /22 (4) is too small and a /21 (8) fits.
+    expect(() =>
+      validateVpcCidr("10.40.0.0/22", { azCount: 3, peerCidrs: [] }),
+    ).toThrow(/use \/21 or larger/);
+    expect(() =>
+      validateVpcCidr("10.40.0.0/21", { azCount: 3, peerCidrs: [] }),
+    ).not.toThrow();
+  });
+
+  it("rejects partial overlap with a peer and accepts an adjacent range", () => {
+    expect(() =>
+      validateVpcCidr("10.40.0.0/16", {
+        azCount: 2,
+        peerCidrs: ["10.40.128.0/20"],
+      }),
+    ).toThrow(/overlaps/);
+    expect(() =>
+      validateVpcCidr("10.40.0.0/16", {
+        azCount: 2,
+        peerCidrs: ["10.41.0.0/16"],
+      }),
+    ).not.toThrow();
   });
 });

@@ -32,11 +32,20 @@ from typing import TYPE_CHECKING
 
 import structlog
 from coa_common import ontology_vector_index_name
+from coa_common.constants import StructuredBackend
 
 from ...clients.base import GraphClient, QueryExecutor
 from ...exceptions import AccessDeniedError, AmbiguousReferenceError
 from ...identity import display_principal
+from ...query_utils import (
+    SPARQL_PREFIXES,
+    get_graph_uri_template,
+    graph_scoped_body,
+    namespace_graph_prefix,
+    validate_namespace,
+)
 from ...step_ids import StepId
+from ..guardrail_placeholders import masked_literal_in_sql
 from ..sql_firewall import FirewallResult, SQLFirewall, UnsafeSQLError, tables_visible_to
 from ..strategy import StrategyContext, StrategyOption, StrategyResult, capped_max_rows
 from ..table_qualifier import PreparedSQL, SourceLookup, prepare_execution_sql
@@ -206,10 +215,36 @@ def _user_supplied_literal_in_sql(sql: str, query: str) -> bool:
     return False
 
 
+# Written by ontology-engine ingest on each ontology node (NeptuneDBGraphStore.
+# create_ontology), from the OntologyType contract enum. User-loaded ontologies
+# are "user_created" (API default) or "user_uploaded" (the web app's upload flow);
+# induction proposals are "induced" and foundational imports "foundational".
+_ONTOLOGY_TYPE_IRI = "https://ontology-workbench.local/vocab#ontology_type"
+_USER_ONTOLOGY_TYPES = ("user_created", "user_uploaded")
+
+
+async def uploaded_ontology_iris(graph: GraphClient, namespace: str, graph_uri_template: str) -> list[str]:
+    """IRIs of the namespace's user-loaded (``user_created`` / ``user_uploaded``) ontologies.
+
+    These match the ``ontology_id`` of their classes' vector docs. The pattern is
+    one ``owl:Ontology`` triple per ontology, so even the prefix-filter scope is cheap.
+    """
+    validate_namespace(namespace)
+    types = " ".join(f'"{t}"' for t in _USER_ONTOLOGY_TYPES)
+    body = f"            VALUES ?type {{ {types} }}\n            ?o a owl:Ontology ; <{_ONTOLOGY_TYPE_IRI}> ?type ."
+    prefix = namespace_graph_prefix(graph_uri_template, namespace)
+    sparql = f"{SPARQL_PREFIXES}SELECT DISTINCT ?o WHERE {{\n{graph_scoped_body(body, prefix)}\n}}"
+    rows = await graph.query(sparql)
+    return [str(r["o"]) for r in rows if r.get("o")]
+
+
 class NLtoSQLStrategy:
     """StructuredQueryStrategy implementation for direct NL-to-SQL generation."""
 
     name: str = StrategyOption.NL_TO_SQL
+    # Backends this strategy answers; the runner keeps it only for a namespace that
+    # has one of them (see StructuredQueryTier._strategies_for).
+    supported_backends: frozenset[StructuredBackend] = frozenset({StructuredBackend.SQL})
 
     def __init__(
         self,
@@ -354,6 +389,16 @@ class NLtoSQLStrategy:
             async def table_placements(table_sources: dict[str, str]) -> dict[str, tuple[str, str]]:
                 return await executor.resolve_table_placements(namespace, table_sources)
 
+        # The namespace's uploaded ontologies, for the top-down fallback when no
+        # class carries a data_source_id (see SQLGenerator step 2b).
+        uploaded_ontologies = None
+        template = get_graph_uri_template()
+        if self._graph_client is not None and template:
+            graph = self._graph_client
+
+            async def uploaded_ontologies() -> list[str]:
+                return await uploaded_ontology_iris(graph, namespace, template)
+
         # Every database of the namespace holding a retrieved table's name, so one
         # retrieved copy of a shared name is not read as the whole answer.
         same_name_databases = None
@@ -380,6 +425,7 @@ class NLtoSQLStrategy:
             governed_metric=_governed_metric_block(context.declined_metric, data_source_id),
             table_placements=table_placements,
             same_name_databases=same_name_databases,
+            uploaded_ontologies=uploaded_ontologies,
         )
 
         t_ms = int((time.perf_counter() - t_start) * 1000)
@@ -391,9 +437,11 @@ class NLtoSQLStrategy:
             # graceful SKIP with fallthrough to the next strategy (VKG/Ontop),
             # not an error. Reserve "error" for a genuine generation failure so
             # the trace doesn't show a red step on every query when only the
-            # optional NL→SQL retrieval path is degraded.
+            # optional NL→SQL retrieval path is degraded. A namespace with no
+            # SQL-backed class (``no_tables_retrieved``) is a steady state, not a
+            # failure, so it is a skip too.
             err = nl_to_sql_result.error or "empty_sql"
-            skipped = isinstance(err, str) and err.startswith("retrieve_failed")
+            skipped = isinstance(err, str) and (err.startswith("retrieve_failed") or err == "no_tables_retrieved")
             trace.record(
                 StepId.T2_SQL_GENERATE,
                 "skipped" if skipped else "error",
@@ -444,11 +492,14 @@ class NLtoSQLStrategy:
 
         for shot in range(1, self._max_shots + 1):
             shot_start = time.perf_counter()
-            # Firewall (unsafe → skip strategy; denied → 403). Re-run per shot
-            # because each shot produces distinct SQL that must be authorized.
-            fw_result = self._firewall_check(sql, profile, namespace, trace)
+            # Gate + firewall (masked literal or unsafe → abandon, keeping an earlier
+            # clean empty result; denied → 403). Re-run per shot because each shot
+            # produces distinct SQL that must be authorized.
+            fw_result = self._gate_statement(sql, profile, namespace, trace)
             if fw_result is None:
-                return None  # unsafe SQL — abandon the strategy
+                # Unsafe SQL or a guardrail-masked literal: abandon the strategy, keeping
+                # a clean empty result from an earlier shot as the answer.
+                return empty_fallback
 
             # Cross-source qualification, per shot: a corrected statement may
             # reference a different set of tables than the first one. Runs AFTER
@@ -703,6 +754,27 @@ class NLtoSQLStrategy:
             return PreparedSQL(sql=sql)
         routing = sql_table_routing(sql, nl_result.table_sources, nl_result.table_candidates)
         return await prepare_execution_sql(sql, routing, self._sources, namespace=namespace)
+
+    def _gate_statement(self, sql: str, profile: dict, namespace: str, trace) -> FirewallResult | None:
+        """Refuse SQL that filters on a guardrail-masked value, then run the firewall.
+
+        A question naming a value the guardrail anonymized reaches the writer as
+        ``{NAME}``; SQL comparing against it answers a different question, so it is
+        never run.
+        """
+        if masked_literal_in_sql(sql):
+            trace.record(
+                StepId.T2_SQL_FAILED,
+                "error",
+                0,
+                detail={
+                    "reason": "guardrail_masked_literal",
+                    "message": "The question contained a value the privacy filter masked, so the SQL was not run.",
+                },
+            )
+            logger.warning("nl_to_sql_guardrail_masked_literal", namespace=namespace)
+            return None
+        return self._firewall_check(sql, profile, namespace, trace)
 
     def _firewall_check(self, sql: str, profile: dict, namespace: str, trace) -> FirewallResult | None:
         """Run the SQL firewall + Cedar gate for one candidate statement.

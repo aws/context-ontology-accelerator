@@ -28,7 +28,7 @@ import json
 import os
 import time
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import unquote
 
@@ -49,8 +49,15 @@ from coa_common.dao.base import QueryParams
 from coa_common.idempotency import idempotent_create
 from coa_common.language_tags import LanguageTagError
 from coa_common.logging import setup_logging
+from coa_common.neptune_endpoints import (
+    GRAPH_CLUSTER_CLAIM_ATTR,
+    GRAPH_CLUSTER_CLAIM_SK,
+    graph_cluster_claim_release,
+    is_graph_cluster_claim_pk,
+)
 from coa_common.response import api_response, iso_to_epoch
 from coa_common.s3 import regional_s3_client
+from coa_common.sparql_config import GRAPH_SOURCES_DISABLED_MESSAGE, graph_sources_enabled
 from coa_control_plane_server.models.create_source_input import CreateSourceInput
 from coa_control_plane_server.models.extraction_config import ExtractionConfig
 from coa_control_plane_server.models.get_source_output import GetSourceOutput
@@ -77,10 +84,12 @@ from coa_sources.database.databricks import (
     delete_config_parameter,
 )
 from coa_sources.database.glue_ownership import release_platform_catalog
+from coa_sources.database.graph_verify import REACHABILITY_SCAN_TYPE, verify_message
 from coa_sources.database.rescan_backup import BACKUP_SCAN_JOB_FIELD
 from coa_sources.database.sub_types import (
     CONNECTOR_BACKED_SUB_TYPES,
     FEDERATED_TEARDOWN_SUB_TYPES,
+    GRAPH_BACKED_SUB_TYPES,
     PLATFORM_CATALOG_CLAIM_SUB_TYPES,
 )
 from coa_sources.namespace_language import (
@@ -103,6 +112,9 @@ logger = structlog.get_logger(__name__)
 _SOURCES_TABLE: str = os.environ.get("SOURCES_TABLE", "")
 _SOURCE_SCAN_JOBS_TABLE: str = os.environ.get("SOURCE_SCAN_JOBS_TABLE", "")
 _SCAN_QUEUE_URL: str = os.environ.get("SCAN_QUEUE_URL", "")
+# RDF_SPARQL (graph) sources skip the DB-scan pipeline: create and re-scan enqueue a
+# reachability verify here instead (see coa_sources.database.graph_verify).
+_GRAPH_VERIFY_QUEUE_URL: str = os.environ.get("GRAPH_VERIFY_QUEUE_URL", "")
 _INGESTION_QUEUE_URL: str = os.environ.get("INGESTION_QUEUE_URL", "")
 _REVIEW_QUEUE_URL: str = os.environ.get("REVIEW_QUEUE_URL", "")
 _BUCKET_NAME: str = os.environ.get("BUCKET_NAME", "")
@@ -164,6 +176,7 @@ _DETAIL_CONFIG_KEYS: dict[str, str] = {
     SourceSubType.JDBC_DATABASE.value: "jdbcConfiguration",
     SourceSubType.CUSTOM_CONNECTOR.value: "customConnectorConfiguration",
     SourceSubType.DATABRICKS_SQL_WAREHOUSE.value: "databricksSqlWarehouseConfiguration",
+    SourceSubType.RDF_SPARQL.value: "sparqlConfiguration",
 }
 
 # How a row this map does not cover is read: as Glue, which is how every
@@ -1123,7 +1136,14 @@ def _handle_delete(namespace_id: str, source_id: str, context: Any = None) -> di
         return api_response(202, {"sourceId": source_id, "status": SourceStatus.DELETING})
 
     else:  # DATABASE
-        if current_status in SOURCE_ACTIVE_STATUSES:
+        sub_type = item.get("sourceSubType", "")
+        # With graph sources off no verify will ever move a REGISTERED graph source on, so it is not active.
+        stranded_graph_source = (
+            sub_type in GRAPH_BACKED_SUB_TYPES
+            and current_status == SourceStatus.REGISTERED
+            and not graph_sources_enabled()
+        )
+        if current_status in SOURCE_ACTIVE_STATUSES and not stranded_graph_source:
             return api_response(
                 409,
                 {
@@ -1134,7 +1154,6 @@ def _handle_delete(namespace_id: str, source_id: str, context: Any = None) -> di
                     "status": current_status,
                 },
             )
-        sub_type = item.get("sourceSubType", "")
 
         # The one name every teardown below works from, derived from the source id
         # rather than read off the row. `build_catalog_name` is what named the
@@ -1486,6 +1505,10 @@ def finish_database_source_deletion(
     if sub_type in PLATFORM_CATALOG_CLAIM_SUB_TYPES:
         with contextlib.suppress(ClientError):
             release_platform_catalog(_get_dao(), catalog_name=catalog_name)
+    claim_pk = _graph_cluster_claim_of(namespace_id, source_id, sub_type)
+    if claim_pk is None:
+        # Without the note the claim could never be released: keep the row so a retry reads it again.
+        return False
 
     try:
         _get_dao().delete({"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"})
@@ -1493,7 +1516,69 @@ def finish_database_source_deletion(
         logger.exception("ddb_delete_failed", source_id=source_id)
         return False
 
+    _release_graph_cluster_claim(namespace_id, source_id, claim_pk)
     return True
+
+
+def _graph_cluster_claim_of(namespace_id: str, source_id: str, sub_type: str) -> str | None:
+    """The cluster claim a graph source notes, read before its row goes; ``""`` for any other source.
+
+    ``None`` when the note cannot be read: the caller keeps the row, so the claim is not orphaned.
+    """
+    if sub_type not in GRAPH_BACKED_SUB_TYPES:
+        return ""
+    try:
+        item = _get_dao().get({"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"}, consistent_read=True) or {}
+    except (ClientError, BotoCoreError):
+        logger.warning("graph_cluster_claim_read_failed", source_id=source_id, namespace_id=namespace_id)
+        return None
+    claim_pk = item.get(GRAPH_CLUSTER_CLAIM_ATTR)
+    # isinstance narrows for mypy, which reads coa_common (no py.typed) as untyped.
+    return claim_pk if isinstance(claim_pk, str) and is_graph_cluster_claim_pk(claim_pk) else ""
+
+
+def _release_graph_cluster_claim(namespace_id: str, source_id: str, claim_pk: str) -> None:
+    """Release the namespace's claim on a Neptune cluster once its last graph source there is gone. Best-effort.
+
+    Runs after the row delete, so two sources deleted at once cannot each keep the claim for the other; both may
+    release, which the delete's condition on the namespace makes harmless. The claim is read before the sources,
+    so a source approved in between (a new approval token) keeps it.
+    """
+    if not claim_pk:
+        return
+    dao = _get_dao()
+    try:
+        claim = dao.get({"PK": claim_pk, "SK": GRAPH_CLUSTER_CLAIM_SK}, consistent_read=True)
+        if _other_source_holds_claim(dao, namespace_id, source_id, claim_pk):
+            return
+        dao.transact_write([graph_cluster_claim_release(_SOURCES_TABLE, claim_pk, namespace_id, claim)])
+    except ClientError as exc:
+        cancelled = exc.response.get("CancellationReasons") or []
+        if any(r.get("Code") == "ConditionalCheckFailed" for r in cancelled):
+            logger.info("graph_cluster_claim_kept", source_id=source_id, namespace_id=namespace_id)
+        else:
+            logger.warning("graph_cluster_claim_release_failed", source_id=source_id, namespace_id=namespace_id)
+    except BotoCoreError:
+        logger.warning("graph_cluster_claim_release_failed", source_id=source_id, namespace_id=namespace_id)
+
+
+def _other_source_holds_claim(dao: DynamoDBDAO, namespace_id: str, source_id: str, claim_pk: str) -> bool:
+    start: dict[str, Any] | None = None
+    while True:
+        page = dao.query(
+            QueryParams(
+                key_condition="PK = :pk AND begins_with(SK, :prefix)",
+                expression_values={":pk": f"NS#{namespace_id}", ":prefix": "SRC#"},
+                exclusive_start_key=start,
+                # A lagging replica could miss a source's claim note and let the release delete a claim in use.
+                consistent_read=True,
+            )
+        )
+        if any(i.get(GRAPH_CLUSTER_CLAIM_ATTR) == claim_pk and i.get("sourceId") != source_id for i in page.items):
+            return True
+        start = page.last_evaluated_key
+        if not start:
+            return False
 
 
 # ---------------------------------------------------------------------------
@@ -1562,18 +1647,9 @@ def _handle_rescan(
         SourceStatus.APPROVED,
         SourceStatus.RESCAN_REVIEW,
     )
-    if source_type == SourceType.DATABASE and current_status not in _DB_RESCAN_ALLOWED:
-        return api_response(
-            409,
-            {
-                "error": (
-                    f"Re-scan is only allowed when status is one of "
-                    f"{', '.join(_DB_RESCAN_ALLOWED)} (current: '{current_status}')."
-                ),
-                "sourceId": source_id,
-                "status": current_status,
-            },
-        )
+    stale_verify = _waits_for_a_lost_verify(item)
+    if source_type == SourceType.DATABASE and current_status not in _DB_RESCAN_ALLOWED and not stale_verify:
+        return _rescan_status_refusal(item, source_id, current_status, _DB_RESCAN_ALLOWED)
     # Re-scanning a source that already has an OPEN re-scan review is the one
     # transition that destroys steward work, so it needs an explicit
     # acknowledgement. Discovery re-diffs against the last APPROVED state
@@ -1695,7 +1771,7 @@ def _handle_rescan(
         return api_response(200, _item_to_detail(updated_item))
 
     else:  # DATABASE
-        if current_status in SOURCE_ACTIVE_STATUSES:
+        if current_status in SOURCE_ACTIVE_STATUSES and not stale_verify:
             return api_response(
                 409,
                 {
@@ -1703,6 +1779,18 @@ def _handle_rescan(
                     "sourceId": source_id,
                     "status": current_status,
                 },
+            )
+
+        # A graph source has no schema to scan: its "re-scan" re-runs the reachability
+        # verify. Branched before any SQL-scan write so it never enters discovery.
+        if item.get("sourceSubType") in GRAPH_BACKED_SUB_TYPES:
+            return _reverify_graph_source(
+                namespace_id,
+                source_id,
+                current_status,
+                trigger,
+                now,
+                stale_since=item.get("updatedAt") if stale_verify else None,
             )
 
         # One upstream change emits many Glue events; collapse the burst.
@@ -1825,6 +1913,153 @@ def _handle_rescan(
             return api_response(500, {"error": "Internal server error"})
 
         return api_response(202, {"sourceId": source_id, "scanJobId": scan_job_sk, "status": "IN_PROGRESS"})
+
+
+# Longer than any verify can take: the queue redrives a message 3 times, 90 s apart,
+# and each attempt is capped by the Lambda's 30 s timeout.
+_GRAPH_VERIFY_STALE_AFTER = timedelta(minutes=15)
+
+
+def _waits_for_a_lost_verify(item: dict[str, Any]) -> bool:
+    """A graph source still REGISTERED long after any verify could have finished.
+
+    Turning graph sources off drops the verify queue with its messages, so a source that
+    was waiting stays REGISTERED once they are on again. It can then be re-verified.
+    """
+    if (
+        item.get("sourceSubType") not in GRAPH_BACKED_SUB_TYPES
+        or item.get("status") != SourceStatus.REGISTERED
+        or not graph_sources_enabled()
+    ):
+        return False
+    raw = str(item.get("updatedAt", ""))
+    try:
+        updated = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        logger.warning("graph_verify_stale_check_unreadable_updated_at", source_id=item.get("sourceId"), updated_at=raw)
+        return False
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=UTC)
+    return datetime.now(UTC) - updated > _GRAPH_VERIFY_STALE_AFTER
+
+
+def _rescan_status_refusal(
+    item: dict[str, Any], source_id: str, current_status: str, allowed: tuple[str, ...]
+) -> dict[str, Any]:
+    """The 409 for a database re-scan from a status it is not allowed from.
+
+    A graph source with graph sources off gets the switch's 400 instead: no verify is
+    coming for it, so waiting on its status would not help.
+    """
+    if item.get("sourceSubType") in GRAPH_BACKED_SUB_TYPES and not graph_sources_enabled():
+        return api_response(400, {"error": GRAPH_SOURCES_DISABLED_MESSAGE})
+    return api_response(
+        409,
+        {
+            "error": (
+                f"Re-scan is only allowed when status is one of {', '.join(allowed)} (current: '{current_status}')."
+            ),
+            "sourceId": source_id,
+            "status": current_status,
+        },
+    )
+
+
+def _reverify_graph_source(
+    namespace_id: str,
+    source_id: str,
+    current_status: str,
+    trigger: str,
+    now: str,
+    stale_since: str | None = None,
+) -> dict[str, Any]:
+    """Re-run the reachability verify of an RDF_SPARQL source.
+
+    Takes the same conditional status lock the SQL re-scan takes (the status just
+    read → ``REGISTERED``, an active status), so two triggers cannot both enqueue.
+    A source left ``REGISTERED`` (``stale_since``, its ``updatedAt``) is already in that
+    status, so the lock also requires the ``updatedAt`` just read; releasing it restores
+    that value, so a failed enqueue doesn't restart the 15-minute wait.
+    ``queryable`` is left as it is: a source that was serving keeps serving while it
+    is re-verified, and the verify's result is what moves it. With graph sources off it
+    is refused before the lock is taken.
+    """
+    if not graph_sources_enabled():
+        return api_response(400, {"error": GRAPH_SOURCES_DISABLED_MESSAGE})
+    condition = "#st = :prev"
+    condition_names = {"#st": "status"}
+    condition_values = {":prev": current_status}
+    if stale_since is not None:
+        condition += " AND #ua = :prevUpdatedAt"
+        condition_names["#ua"] = "updatedAt"
+        condition_values[":prevUpdatedAt"] = stale_since
+    try:
+        _get_dao().update(
+            {"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"},
+            {"status": SourceStatus.REGISTERED, "updatedAt": now},
+            condition=condition,
+            condition_names=condition_names,
+            condition_values=condition_values,
+        )
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            logger.info("graph_reverify_lost_status_race", source_id=source_id, expected=current_status)
+            return api_response(
+                409,
+                {
+                    "error": f"Source '{source_id}' is already being verified.",
+                    "sourceId": source_id,
+                    "status": current_status,
+                },
+            )
+        logger.exception("ddb_update_status_failed", source_id=source_id)
+        return api_response(500, {"error": "Internal server error"})
+
+    def _release_lock() -> None:
+        _get_dao().update(
+            {"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"},
+            {"status": current_status, "updatedAt": stale_since or _now_iso()},
+            condition="attribute_exists(PK)",
+            raise_on_error=False,
+        )
+
+    scan_job_sk = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    try:
+        _get_scan_dao().put(
+            {
+                "PK": f"SRC#{source_id}",
+                "SK": scan_job_sk,
+                "sourceId": source_id,
+                "namespaceId": namespace_id,
+                "status": "IN_PROGRESS",
+                "scanType": REACHABILITY_SCAN_TYPE,
+                "triggerType": trigger,
+                "startedAt": now,
+                "createdAt": now,
+            }
+        )
+    except ClientError:
+        logger.exception("ddb_put_scan_job_failed", source_id=source_id)
+        _release_lock()
+        return api_response(500, {"error": "Internal server error"})
+
+    try:
+        _get_sqs().send_message(
+            QueueUrl=_GRAPH_VERIFY_QUEUE_URL,
+            MessageBody=verify_message(source_id, namespace_id, scan_job_sk),
+        )
+    except (ClientError, BotoCoreError):
+        logger.exception("graph_verify_enqueue_failed", source_id=source_id)
+        _release_lock()
+        _get_scan_dao().update(
+            {"PK": f"SRC#{source_id}", "SK": scan_job_sk},
+            {"status": "FAILED", "errorMessage": "Could not enqueue the reachability check"},
+            condition="attribute_exists(PK)",
+            raise_on_error=False,
+        )
+        return api_response(500, {"error": "Internal server error"})
+
+    return api_response(202, {"sourceId": source_id, "scanJobId": scan_job_sk, "status": "IN_PROGRESS"})
 
 
 # ---------------------------------------------------------------------------

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import * as cdk from "aws-cdk-lib";
-import { Template, Match } from "aws-cdk-lib/assertions";
+import { Annotations, Template, Match } from "aws-cdk-lib/assertions";
 import { NetworkStack } from "../../lib/stacks/foundation/network-stack";
 import { StorageStack } from "../../lib/stacks/foundation/storage-stack";
 
@@ -412,6 +412,63 @@ describe("StorageStack", () => {
 
     it("rejects min OCU greater than max OCU", () => {
       expect(buildWithOcu(16, 8)).toThrow(/cannot exceed/);
+    });
+  });
+
+  describe("OCU capacity limits", () => {
+    // `cdk deploy --context aoss_min_ocu=4` (what deploy.sh passes) arrives as a string.
+    function storageWithContext(context: Record<string, string>): StorageStack {
+      const app = new cdk.App({ context });
+      const network = new NetworkStack(app, "TestNetwork", { env: TEST_ENV });
+      return new StorageStack(app, "TestStorage", { network, env: TEST_ENV });
+    }
+
+    function capacityLimits(min: number, max: number) {
+      return {
+        CapacityLimits: {
+          MinIndexingCapacityInOcu: min,
+          MinSearchCapacityInOcu: min,
+          MaxIndexingCapacityInOcu: max,
+          MaxSearchCapacityInOcu: max,
+        },
+      };
+    }
+
+    const ZERO_FLOOR_WARNING = Match.stringLikeRegexp("AOSS min OCU is 0");
+
+    it("defaults to a floor of 2 and a ceiling of 96 without a warning", () => {
+      const storage = storageWithContext({});
+      Template.fromStack(storage).hasResourceProperties(
+        "AWS::OpenSearchServerless::CollectionGroup",
+        capacityLimits(2, 96),
+      );
+      Annotations.fromStack(storage).hasNoWarning("*", ZERO_FLOOR_WARNING);
+    });
+
+    it("applies string context values to indexing and search", () => {
+      const storage = storageWithContext({
+        aoss_min_ocu: "4",
+        aoss_max_ocu: "32",
+      });
+      Template.fromStack(storage).hasResourceProperties(
+        "AWS::OpenSearchServerless::CollectionGroup",
+        capacityLimits(4, 32),
+      );
+    });
+
+    it("warns on a string floor of 0", () => {
+      const storage = storageWithContext({ aoss_min_ocu: "0" });
+      Template.fromStack(storage).hasResourceProperties(
+        "AWS::OpenSearchServerless::CollectionGroup",
+        capacityLimits(0, 96),
+      );
+      Annotations.fromStack(storage).hasWarning("*", ZERO_FLOOR_WARNING);
+    });
+
+    it("rejects an invalid string value", () => {
+      expect(() => storageWithContext({ aoss_min_ocu: "3" })).toThrow(
+        /min OCU must be/,
+      );
     });
   });
 });

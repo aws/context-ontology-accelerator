@@ -27,7 +27,7 @@ Environment variables:
 
   Optional:
     EXTRACTION_MODE          — "continuous" (default) or "separated"
-    USE_BATCH_INFERENCE      — "true" or "false" (default) — uses Bedrock batch inference
+    USE_BATCH_INFERENCE      — "true" (default) or "false" — uses Bedrock batch inference
     BATCH_INFERENCE_ROLE_ARN — IAM role for Bedrock batch inference (required if USE_BATCH_INFERENCE=true)
     ENABLE_VERSIONING        — "true" (default) or "false"
     ENABLE_PROPOSITION_EXTRACTION — "true" (default) or "false" — skip for ~50% fewer LLM calls
@@ -111,6 +111,7 @@ from coa_common.logging import setup_logging
 from coa_common.s3 import get_s3_client, list_objects, read_file_bytes
 from coa_control_plane_server.models.source_status import SourceStatus
 
+from coa_sources.documents.kg_build import batch_patches
 from coa_sources.namespace_language import NAMESPACE_LANGUAGE_ENV, require_language_snapshot
 
 # ---------------------------------------------------------------------------
@@ -1072,6 +1073,17 @@ def _setup_graphrag(tenant_id: str):
     # llama_index's OpensearchVectorClient at import time, so our retry wrapper
     # must be assigned last to win.
     _patch_graphrag_bulk_ingest_retry()
+    # AFTER the import: wraps get_request_body in every module that binds it so
+    # batch serialization omits temperature for models that reject it (default is
+    # Sonnet 5). Safe to run post-import — the serializer is read at job build.
+    # Lives in the thin batch_patches module so spawn-started workers that import
+    # the initializer do not pull all of graph_build with them.
+    batch_patches._patch_graphrag_batch_request_body()
+    # AFTER the import: the serializer patch above lives only in THIS process, but
+    # extraction transforms run in spawn-started workers that re-import the toolkit
+    # fresh. Route those workers through our initializer so the patch re-applies in
+    # each one; otherwise the no-temp KeyError resurfaces per worker.
+    batch_patches._patch_graphrag_worker_init()
 
     GraphRAGConfig.aws_region = AWS_REGION
     GraphRAGConfig.enable_versioning = ENABLE_VERSIONING

@@ -6,9 +6,13 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import boto3
 import pytest
+from botocore.exceptions import ClientError
+from botocore.stub import Stubber
 from coa_common.constants import RESOURCE_PREFIX
 
 pytestmark = pytest.mark.unit
@@ -187,6 +191,28 @@ class TestDeletePlatform:
         mock_rrm.assert_called_once_with("ns-123")
         mock_roles.assert_called_once_with("ns-123")
         assert result == {"namespaceId": "ns-123"}
+
+    def test_delete_platform_vkg_delete_denied_fails_step(self, monkeypatch):
+        from coa_control_plane.namespace import cleanup
+        from coa_control_plane.namespace.deletion_pipeline import delete_platform
+
+        monkeypatch.delenv("AWS_PROFILE", raising=False)
+        monkeypatch.setenv("VKG_CLUSTER_ARN", "arn:aws:ecs:us-east-1:111111111111:cluster/vkg")
+        ecs = boto3.session.Session(
+            aws_access_key_id="testing", aws_secret_access_key="testing", region_name="us-east-1"
+        ).client("ecs")
+        monkeypatch.setattr(cleanup, "boto3", SimpleNamespace(client=lambda name, **_: ecs))
+
+        with (
+            Stubber(ecs) as ecs_stub,
+            patch.object(delete_platform, "delete_athena_workgroup"),
+            patch.object(delete_platform, "delete_smu_project"),
+            patch.object(delete_platform, "delete_role_mappings"),
+            patch.object(delete_platform, "delete_roles"),
+            pytest.raises(ClientError),
+        ):
+            ecs_stub.add_client_error("delete_service", service_error_code="AccessDeniedException")
+            delete_platform.handler({"namespaceId": "ns-123"}, None)
 
 
 class TestFinalize:

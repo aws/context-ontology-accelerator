@@ -122,6 +122,23 @@ describe("resolveCompletedInductionAction", () => {
     expect(action).toEqual({ kind: "navigate", proposalId: "job-7" });
   });
 
+  it("navigates to a bridge job's own proposal", () => {
+    const action = resolveCompletedInductionAction(
+      { bridge_report: { proposal_id: "bridge-prop" } },
+      "bridge-job",
+    );
+    expect(action).toEqual({ kind: "navigate", proposalId: "bridge-prop" });
+  });
+
+  it("refreshes, not navigates to the job id, when a bridge job proposed nothing", () => {
+    // No proposal row exists for that job id: navigating would open a 404.
+    const action = resolveCompletedInductionAction(
+      { bridge_report: {} },
+      "bridge-job",
+    );
+    expect(action).toEqual({ kind: "refresh" });
+  });
+
   it("refreshes when there is neither a duplicate nor any id to navigate to", () => {
     const action = resolveCompletedInductionAction({}, null);
     expect(action).toEqual({ kind: "refresh" });
@@ -541,6 +558,16 @@ describe("Induce Ontology modal — grounding is available for both strategies",
     mockApiGet.mockResolvedValue({ items: [] });
   });
 
+  // Cloudscape disables a button with the native attribute, or with
+  // aria-disabled when it also shows a disabled reason: check both.
+  function isButtonDisabled(button: HTMLElement | null | undefined): boolean {
+    return (
+      !!button &&
+      (button.hasAttribute("disabled") ||
+        button.getAttribute("aria-disabled") === "true")
+    );
+  }
+
   async function openInductionModal() {
     renderPage();
     fireEvent.click(await screen.findByText("Start induction"));
@@ -608,6 +635,55 @@ describe("Induce Ontology modal — grounding is available for both strategies",
         screen.getByText("Grounding ontologies (optional)"),
       ).toBeInTheDocument(),
     );
+  });
+
+  it("starts the document-to-table bridge without a source selection", async () => {
+    triggerInduction.mockResolvedValue({ job_id: "bridge-job" });
+    await openInductionModal();
+    const strategyTrigger = screen
+      .getByText("Table to Ontology")
+      .closest("button");
+    expect(strategyTrigger).not.toBeNull();
+    fireEvent.mouseDown(strategyTrigger!);
+    const bridgeOption = await screen.findByRole("option", {
+      name: /Bridge documents to tables/,
+    });
+    fireEvent.mouseUp(bridgeOption);
+    fireEvent.click(bridgeOption);
+
+    // The bridge reads no sources and no grounding: those fields go, the
+    // explanation shows, and Start is enabled with nothing selected.
+    await screen.findByText(
+      /The bridge runs on this namespace's accepted ontology/,
+    );
+    expect(screen.queryByText("Data sources")).toBeNull();
+    expect(screen.queryByText("Grounding ontologies (optional)")).toBeNull();
+    const start = screen
+      .getAllByText("Start induction")
+      .map((el) => el.closest("button"))
+      .at(-1);
+    expect(isButtonDisabled(start)).toBe(false);
+
+    fireEvent.click(start!);
+    await waitFor(() => expect(triggerInduction).toHaveBeenCalledTimes(1));
+    const [, namespace, body] = triggerInduction.mock.calls[0];
+    expect(namespace).toBe("ns");
+    expect(body).toEqual({
+      datasource_ids: [],
+      ontology_uri_prefix:
+        "http://coa.amazon.com/namespace/ns/ontology/induced#",
+      namespace: "ns",
+      strategy: "bridge_to_tables",
+    });
+  });
+
+  it("keeps Start disabled for table induction until a source is selected", async () => {
+    await openInductionModal();
+    const start = screen
+      .getAllByText("Start induction")
+      .map((el) => el.closest("button"))
+      .at(-1);
+    expect(isButtonDisabled(start)).toBe(true);
   });
 
   it("offers induced ontologies as selectable (pre-checked) grounding options alongside foundational", async () => {

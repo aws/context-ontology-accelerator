@@ -89,9 +89,8 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     Output: {"sourcesDeleted": int, "graphragIndexesDeleted": list[str]}
 
     Raises on any failure so the state machine's retry/catch policy applies
-    (see the pipeline construct — this step retries 3x before the chain
-    continues past it, per the #213 acceptance criteria for non-critical
-    steps).
+    (see the pipeline construct — this step retries 3x, then the chain goes
+    to MarkFailed and the namespace ends in DELETE_FAILED).
 
     After the last source is gone, drops the namespace's GraphRAG doc-KG vector
     indexes. Those are namespace-scoped (all doc sources share one GraphRAG

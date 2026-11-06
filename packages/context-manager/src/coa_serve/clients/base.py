@@ -23,6 +23,7 @@ from enum import StrEnum
 from typing import Any, Protocol, runtime_checkable
 
 import structlog
+from coa_common.constants import StructuredBackend
 
 logger = structlog.get_logger(__name__)
 
@@ -135,18 +136,10 @@ class VectorClient(Protocol):
         index: str | None = None,
         entity_type: str | None = None,
         require_mapped: bool = False,
+        ontology_ids: list[str] | None = None,
+        query_backend: StructuredBackend | None = None,
     ) -> list[VectorHit]:
-        """k-NN search scoped by index, optionally filtered by entity_type / mapped-only."""
-        ...
-
-    async def count_documents(
-        self,
-        *,
-        index: str | None = None,
-        require_mapped: bool = False,
-        entity_type: str | None = None,
-    ) -> int:
-        """Count documents matching optional entity_type / mapped filters."""
+        """k-NN search scoped by index, optionally filtered by entity_type / mapped-only / ontology / backend."""
         ...
 
     async def hybrid_search(

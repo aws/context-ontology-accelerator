@@ -320,9 +320,12 @@ def _parse_body(event: dict[str, Any]) -> _ParsedRequest | None:
             raw = base64.b64decode(raw, validate=True).decode("utf-8")
         except (binascii.Error, UnicodeDecodeError):
             return None
+    # Unreadable JSON (a decode error, too many digits, too deep) skips idempotency
+    # and the handler runs unchanged; whether that reads as a 400, a 500 or an
+    # unhandled error is the handler's own parse.
     try:
         body = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
+    except (ValueError, TypeError, RecursionError):
         return None
     if not isinstance(body, dict) or CLIENT_TOKEN_FIELD not in body:
         return None

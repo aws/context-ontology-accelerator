@@ -56,7 +56,13 @@ from coa_sources.database.errors import PermanentScanError, TransientScanError, 
 from coa_sources.database.glue_ownership import assert_namespace_may_catalog
 from coa_sources.database.metadata_writer import write_to_datazone
 from coa_sources.database.metrics import emit_metric
-from coa_sources.database.rescan import diff_tables, merged_write_set, reconstruct_approved_baseline
+from coa_sources.database.rescan import (
+    diff_tables,
+    mark_for_enrichment_backfill,
+    merged_write_set,
+    needs_enrichment_backfill,
+    reconstruct_approved_baseline,
+)
 from coa_sources.database.rescan_backup import BACKUP_SCAN_JOB_FIELD, backup_s3_key, build_rescan_backup
 from coa_sources.database.secret_binding import require_secret_namespace_binding
 from coa_sources.database.sub_types import CONNECTOR_BACKED_SUB_TYPES
@@ -290,7 +296,9 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             # instead of blindly overwriting them. Curated metadata (steward
             # edits, approved AI) is preserved; only changed items reset to
             # PENDING_REVIEW. Unchanged tables are skipped and removed tables
-            # are left in place (deleted only when the steward approves).
+            # are left in place (deleted only when the steward approves). The one
+            # exception: an approved table with no metadata at all goes back
+            # through enrichment (see backfill_ids below).
             #
             # The baseline for the diff / merge / backup must be the last
             # APPROVED state, not the last scan. If a prior re-scan is still open
@@ -323,6 +331,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
                 len(diff.unchanged),
             )
             write_tables = merged_write_set(diff, accepted, metadata.tables)
+            accepted_by_id = {t.table_id: t for t in accepted}
             # Tables an earlier run merged that now diff as unchanged (for example the
             # upstream change was reverted before this run): merged_write_set skips
             # unchanged tables, so their live asset would keep that run's merge. Put
@@ -330,7 +339,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             # count as approved below and do not make anything to review.
             restore_ids: list[str] = []
             if existing_backup:
-                accepted_by_id = {t.table_id: t for t in accepted}
                 unchanged_set = set(diff.unchanged)
                 restore_ids = sorted(
                     tid
@@ -344,6 +352,30 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
                         len(restore_ids),
                         datasource_id,
                     )
+            # Approved tables that have no metadata at all (see
+            # needs_enrichment_backfill): tables approved while enrichment was off,
+            # or ones an earlier enrichment run failed on. Every other approved item
+            # is kept as approved, which left these empty forever, so reset their
+            # empty items to PENDING_REVIEW for enrichment to fill and the steward
+            # to review, as after a first scan. Only when enrichment will run:
+            # otherwise this would park the source in RESCAN_REVIEW with nothing
+            # new to review. The marked version replaces whatever the write set
+            # already holds for the table, so a modified table keeps its merge and
+            # only gains the reset.
+            backfill_ids: list[str] = []
+            if bool(item.get("metadataEnrichmentEnabled", True)):
+                candidate_ids = list(diff.unchanged) + [c.table_id for c in diff.modified]
+                backfill_ids = sorted(tid for tid in candidate_ids if needs_enrichment_backfill(accepted_by_id[tid]))
+            if backfill_ids:
+                write_by_id = {t.table_id: t for t in write_tables}
+                for tid in backfill_ids:
+                    write_by_id[tid] = mark_for_enrichment_backfill(write_by_id.get(tid) or accepted_by_id[tid])
+                write_tables = list(write_by_id.values())
+                logger.info(
+                    "Re-scan sending %d approved table(s) with no metadata back through enrichment for %s",
+                    len(backfill_ids),
+                    datasource_id,
+                )
             write_metadata = DiscoveredMetadata(tables=write_tables)
 
             # Recompute the approved count for the post-merge live state. The merge
@@ -353,8 +385,9 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             # excluded to match the fresh `tablesDiscovered` denominator. Written to
             # the source row below — without it the row keeps the pre-rescan count
             # through the whole RESCAN_REVIEW window and per-table reviews then apply
-            # their +/-1 adjustment on a stale base.
-            unchanged_ids = set(diff.unchanged)
+            # their +/-1 adjustment on a stale base. Backfilled tables are PENDING
+            # now, so they drop out of the count too.
+            unchanged_ids = set(diff.unchanged) - set(backfill_ids)
             rescan_tables_approved = sum(
                 1
                 for t in accepted
@@ -372,18 +405,20 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             orphaned_added = [
                 tid for tid in (existing_backup or {}).get("added_tables", []) if tid not in fresh_table_ids
             ]
-            # Nothing for the steward to review iff the fresh diff is empty AND no
-            # orphaned added tables were carried forward. Drives the no-drift
-            # auto-return to APPROVED (read by enrichment via reviewNeeded).
-            rescan_review_needed = diff.has_changes or bool(orphaned_added)
+            # Nothing for the steward to review iff the fresh diff is empty, no
+            # orphaned added tables were carried forward, and no table went back
+            # through enrichment. Drives the no-drift auto-return to APPROVED (read
+            # by enrichment via reviewNeeded).
+            rescan_review_needed = diff.has_changes or bool(orphaned_added) or bool(backfill_ids)
 
             # Back up the pre-rescan state to S3 BEFORE the merge overwrites any
             # live asset. This blob is the only durable record of what the re-scan
             # changed (the diff is otherwise discarded) and is what approve (delete
             # removed) and reject (restore modified, delete added) read back.
-            # Needed when the diff has changes OR there are orphaned added tables
-            # to reap; a no-drift re-scan with neither writes none.
-            if diff.has_changes or orphaned_added:
+            # Needed when the diff has changes, there are orphaned added tables to
+            # reap, or a table goes back through enrichment; a re-scan with none of
+            # these writes none.
+            if rescan_review_needed:
                 if not BUCKET_NAME:
                     raise RuntimeError(
                         "BUCKET_NAME is not set; cannot write the re-scan backup that "
@@ -407,6 +442,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
                     scan_job_sk=scan_job_sk,
                     prior_summary=prior_summary,
                     orphaned_added_tables=orphaned_added,
+                    backfilled_tables=backfill_ids,
                 )
                 backup_key = backup_s3_key(source_id)
                 upload_json(get_s3_client(), BUCKET_NAME, backup_key, backup)

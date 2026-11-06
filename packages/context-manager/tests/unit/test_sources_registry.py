@@ -10,7 +10,8 @@ import json
 from unittest.mock import MagicMock, patch
 
 import pytest
-from coa_serve.clients.sources_registry import _ITEMS_CACHE_MAX, SourcesRegistry
+from coa_common.constants import StructuredBackend
+from coa_serve.clients.sources_registry import _ITEMS_CACHE_MAX, SourceComposition, SourcesRegistry
 from coa_serve.tier2.nl_to_sql.sql_generator import sql_table_routing
 from coa_serve.tier2.sql_firewall import SQLFirewall
 from coa_serve.tier2.table_qualifier import AMBIGUOUS_SOURCE, prepare_execution_sql
@@ -94,6 +95,20 @@ class TestSourcesRegistry:
         registry = self._make_registry({"PK": "NS#ns-1", "SK": "SRC#s-1", "name": "test"})
         item = await registry.get_source("ns-1", "s-1")
         assert item["name"] == "test"
+
+    @pytest.mark.asyncio
+    async def test_get_graph_cluster_claim_reads_the_claim_row(self):
+        claim_pk = "GRAPHCLUSTER#us-west-2#cluster-RES1"
+        registry = self._make_registry({"PK": claim_pk, "SK": "CLAIM", "namespaceId": "ns-id"})
+        assert (await registry.get_graph_cluster_claim(claim_pk))["namespaceId"] == "ns-id"
+        registry._mock_table.get_item.assert_called_once_with(Key={"PK": claim_pk, "SK": "CLAIM"})
+
+    @pytest.mark.asyncio
+    async def test_get_graph_cluster_claim_reads_no_other_row(self):
+        registry = self._make_registry({"PK": "NS#ns-1", "SK": "CLAIM", "namespaceId": "ns-1"})
+        with pytest.raises(ValueError):
+            await registry.get_graph_cluster_claim("NS#ns-1")
+        registry._mock_table.get_item.assert_not_called()
 
     def test_parse_configuration_string(self):
         item = {"configuration": '{"databaseName": "mydb", "host": "localhost"}'}
@@ -633,6 +648,106 @@ class TestSourceComposition:
 
 
 @pytest.mark.unit
+class TestStructuredBackends:
+    """structured_backends — which Tier-2 strategy families a namespace needs."""
+
+    _GRAPH = {"sourceType": "DATABASE", "sourceSubType": "RDF_SPARQL", "sourceId": "g1"}
+    _JDBC = {"sourceType": "DATABASE", "sourceSubType": "JDBC_DATABASE", "sourceId": "s1"}
+    _DOCS = {"sourceType": "DOCUMENTS", "sourceId": "d1"}
+
+    def _registry(self, items):
+        return TestSourceComposition()._make_registry_with_query(items)
+
+    @pytest.mark.asyncio
+    async def test_sql_only_namespace_is_sql(self):
+        comp = await self._registry([self._JDBC, self._DOCS]).get_source_composition("ns")
+        assert comp.structured_backends == {StructuredBackend.SQL}
+
+    @pytest.mark.asyncio
+    async def test_source_without_sub_type_is_sql(self):
+        comp = await self._registry([{"sourceType": "DATABASE", "sourceId": "legacy"}]).get_source_composition("ns")
+        assert comp.structured_backends == {StructuredBackend.SQL}
+
+    @pytest.mark.asyncio
+    async def test_graph_only_namespace_is_rdf_sparql(self):
+        comp = await self._registry([self._GRAPH]).get_source_composition("ns")
+        assert comp.structured_backends == {StructuredBackend.RDF_SPARQL}
+        assert comp.has_structured_source is True
+
+    @pytest.mark.asyncio
+    async def test_mixed_namespace_has_both(self):
+        comp = await self._registry([self._GRAPH, self._JDBC]).get_source_composition("ns")
+        assert comp.structured_backends == {StructuredBackend.SQL, StructuredBackend.RDF_SPARQL}
+
+    @pytest.mark.asyncio
+    async def test_documents_only_has_none(self):
+        comp = await self._registry([self._DOCS]).get_source_composition("ns")
+        assert comp.structured_backends == frozenset()
+
+    @pytest.mark.asyncio
+    async def test_unknown_composition_fails_safe_to_sql(self):
+        comp = await self._registry([]).get_source_composition("ns")
+        assert comp.unknown is True
+        assert comp.structured_backends == {StructuredBackend.SQL}
+
+    def test_constructor_without_backends_derives_sql(self):
+        assert SourceComposition(has_structured_source=True, has_unstructured_source=False).structured_backends == {
+            StructuredBackend.SQL
+        }
+        assert SourceComposition(has_structured_source=False, has_unstructured_source=True).structured_backends == (
+            frozenset()
+        )
+
+
+@pytest.mark.unit
+class TestGraphSourcesAreNotSqlSources:
+    """A graph row is a DATABASE row, but no SQL lookup may select or count it."""
+
+    _GRAPH = {"sourceType": "DATABASE", "sourceSubType": "RDF_SPARQL", "sourceId": "g1", "queryable": True}
+    _JDBC = {
+        "sourceType": "DATABASE",
+        "sourceSubType": "JDBC_DATABASE",
+        "sourceId": "s1",
+        "athenaDataCatalogName": "coadevds_s1",
+        "discoveredSchemas": ["sales"],
+    }
+
+    def _registry(self, items):
+        return TestSourceComposition()._make_registry_with_query(items)
+
+    @pytest.mark.asyncio
+    async def test_find_database_source_skips_graph_sources(self):
+        assert (await self._registry([self._GRAPH, self._JDBC]).find_database_source("ns"))["sourceId"] == "s1"
+        assert await self._registry([self._GRAPH]).find_database_source("ns") == {}
+
+    @pytest.mark.asyncio
+    async def test_sole_database_source_ignores_a_graph_source(self):
+        """Mixed namespace: the single SQL source must still be pinnable."""
+        sole = await self._registry([self._GRAPH, self._JDBC]).find_sole_database_source("ns")
+        assert sole["sourceId"] == "s1"
+
+    @pytest.mark.asyncio
+    async def test_database_source_count_excludes_graph_sources(self):
+        assert await self._registry([self._GRAPH, self._JDBC]).database_source_count("ns") == 1
+
+    @pytest.mark.asyncio
+    async def test_sql_namespace_scope_excludes_graph_sources(self):
+        scope = await self._registry([self._GRAPH, self._JDBC]).sql_namespace_scope("ns")
+        assert scope.federated_catalog_schemas == {("coadevds_s1", "sales")}
+        assert scope.native_databases == frozenset()
+
+    @pytest.mark.asyncio
+    async def test_find_sole_graph_source(self):
+        assert (await self._registry([self._GRAPH, self._JDBC]).find_sole_graph_source("ns"))["sourceId"] == "g1"
+
+    @pytest.mark.asyncio
+    async def test_find_sole_graph_source_is_none_when_ambiguous_or_absent(self):
+        other = {**self._GRAPH, "sourceId": "g2"}
+        assert await self._registry([self._GRAPH, other]).find_sole_graph_source("ns") is None
+        assert await self._registry([self._JDBC]).find_sole_graph_source("ns") is None
+
+
+@pytest.mark.unit
 class TestNamespaceExists:
     """Namespace existence check used by the serve entrypoint's 404 gate."""
 
@@ -1104,3 +1219,28 @@ class TestPooledGlueDatabases:
             federated_catalog_schemas=scope.federated_catalog_schemas,
             default_catalog="",
         )
+
+
+@pytest.mark.unit
+class TestDocumentSources:
+    """``document_sources`` keeps the fail-closed signal and filters to DOCUMENTS."""
+
+    def _registry(self, items):
+        with patch("boto3.resource"):
+            registry = SourcesRegistry(table_name="test-sources", region="us-west-2")
+
+        async def _query(namespace):
+            return items
+
+        registry._query_sources = _query
+        return registry
+
+    @pytest.mark.asyncio
+    async def test_unavailable_inventory_stays_none(self):
+        assert await self._registry(None).document_sources("ns-a") is None
+
+    @pytest.mark.asyncio
+    async def test_only_documents_sources_returned(self):
+        docs = {"sourceType": "DOCUMENTS", "sourceId": "d1"}
+        registry = self._registry([{"sourceType": "DATABASE", "sourceId": "g1"}, docs])
+        assert await registry.document_sources("ns-a") == [docs]

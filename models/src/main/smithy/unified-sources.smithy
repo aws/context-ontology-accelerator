@@ -432,6 +432,81 @@ structure DatabricksSqlWarehouseConfiguration {
     tableExcludeFilter: FilterPattern
 }
 
+/// SPARQL engine behind an RDF_SPARQL source — a dialect one level below the
+/// sub-type, the way DatabaseEngine sits below JDBC_DATABASE. It selects the
+/// serve-time client and the registration-time reachability probe; adding an
+/// engine adds a member here plus one client and one probe, never a new
+/// sub-type. Values are lowercase because they are persisted verbatim in the
+/// source `configuration` blob.
+enum SparqlStore {
+    /// Amazon Neptune (SPARQL 1.1 over HTTPS, SigV4/IAM auth).
+    NEPTUNE = "neptune"
+}
+
+/// How the SPARQL client authenticates to the endpoint. SIGV4 is the only mode
+/// any v1 store uses (Neptune: the caller's IAM role is the identity, no
+/// secret). Secret- and token-based modes arrive with the first store that
+/// needs them.
+enum SparqlAuthMode {
+    /// AWS Signature V4 with the caller's IAM role. No credential secret.
+    SIGV4 = "sigv4"
+}
+
+/// SPARQL data endpoint: a bare host (`db.cluster-x.us-east-1.neptune.amazonaws.com`)
+/// or an `https://` URL with optional port and path. Patterned so the value can
+/// only ever be a host[:port][/path] — it is used to build the request URL.
+@pattern("^(https://)?[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$")
+@length(min: 1, max: 512)
+string SparqlEndpoint
+
+/// AWS region code used for SigV4 signing, e.g. `us-east-1`, `us-gov-west-1`.
+@pattern("^[a-z]{2}(-[a-z]+)+-[0-9]$")
+@length(min: 1, max: 64)
+string SparqlRegion
+
+/// Absolute http(s) IRI of a named graph. Excludes every character that may not
+/// appear inside a SPARQL IRIREF (`<>"{}|^` backtick, backslash, whitespace):
+/// the SPARQL firewall interpolates it into `GRAPH <...>`, so a `>` here would
+/// be a query injection.
+@pattern("^https?://[^\\s<>\"{}|\\\\^`]+$")
+@length(min: 8, max: 2048)
+string NamedGraphIri
+
+/// RDF/SPARQL graph source configuration — the RDF_SPARQL sub-type. Instance
+/// data (A-Box) lives natively as triples in a SPARQL store and is answered at
+/// serve time by NL→SPARQL executed directly against `dataEndpoint` (no Glue
+/// catalog, no VKG/SQL). There is no schema discovery: the ontology (T-Box) is
+/// imported separately and points its classes at this source by name.
+///
+/// Registration only verifies the endpoint is reachable (no scan). Persisted as
+/// the source `configuration` blob; serve and the verify Lambda both read it.
+/// Cross-field rules enforced server-side: `store = neptune` requires
+/// `authMode = sigv4` and forbids `credentialSecretArn`.
+structure SparqlConfiguration {
+    /// SPARQL engine. Defaults to `neptune` when omitted.
+    store: SparqlStore
+
+    /// SPARQL endpoint for the A-Box (instance data) that serve executes against.
+    @required
+    dataEndpoint: SparqlEndpoint
+
+    /// AWS region for SigV4 signing. Defaults to the deployment region.
+    region: SparqlRegion
+
+    /// Endpoint port. Defaults to 8182 (Neptune).
+    port: Port
+
+    /// Named graph holding the A-Box. When set, generated queries are confined
+    /// to it; when absent, the store's default graph is queried.
+    dataNamedGraph: NamedGraphIri
+
+    /// Authentication mode. Defaults to `sigv4`.
+    authMode: SparqlAuthMode
+
+    /// Credential for non-SigV4 auth modes. Rejected for `neptune`.
+    credentialSecretArn: SecretArn
+}
+
 /// Execution engine choice for a Glue/Iceberg source. A deliberately narrow
 /// enum (only the engines valid for a Glue source) so the onboarding UI/API
 /// cannot select an engine — e.g. direct JDBC — that doesn't apply to Glue.
@@ -1026,6 +1101,12 @@ enum SourceSubType {
     /// name it is invoked under.
     DATABRICKS_SQL_WAREHOUSE
 
+    /// Structured: an RDF graph store queried natively over SPARQL 1.1 (e.g.
+    /// Amazon Neptune). NL→SPARQL executes directly against the source endpoint;
+    /// no Glue catalog and no schema scan — the ontology is imported separately.
+    /// The engine is `SparqlConfiguration.store`, not a further sub-type.
+    RDF_SPARQL
+
     /// Unstructured: S3 bucket prefix
     S3
 
@@ -1217,8 +1298,9 @@ structure CreateSourceInput {
 }
 
 /// Database source creation fields.
-/// Exactly one of glueConfiguration, jdbcConfiguration, customConnectorConfiguration
-/// or databricksSqlWarehouseConfiguration must be provided — it selects the sub-type.
+/// Exactly one of glueConfiguration, jdbcConfiguration, customConnectorConfiguration,
+/// databricksSqlWarehouseConfiguration or sparqlConfiguration must be provided — it
+/// selects the sub-type.
 structure CreateDatabaseSourceInput {
     @required
     name: DisplayName
@@ -1236,6 +1318,10 @@ structure CreateDatabaseSourceInput {
     /// Databricks SQL Warehouse config. Required for the
     /// DATABRICKS_SQL_WAREHOUSE sub-type.
     databricksSqlWarehouseConfiguration: DatabricksSqlWarehouseConfiguration
+
+    /// RDF/SPARQL graph store config. Required for the RDF_SPARQL sub-type.
+    /// Registration verifies reachability only; enrichment does not apply.
+    sparqlConfiguration: SparqlConfiguration
 
     /// Enable AI-powered business metadata enrichment (descriptions,
     /// synonyms, glossary terms, tags). Defaults to true. When false the
@@ -1343,6 +1429,9 @@ structure DatabaseSourceDetail {
 
     /// Populated for the DATABRICKS_SQL_WAREHOUSE sub-type; absent otherwise.
     databricksSqlWarehouseConfiguration: DatabricksSqlWarehouseConfiguration
+
+    /// Populated for the RDF_SPARQL sub-type; absent otherwise.
+    sparqlConfiguration: SparqlConfiguration
 
     /// Whether AI-powered business metadata enrichment runs for this source.
     /// Set at creation time and persisted with the source record. When false

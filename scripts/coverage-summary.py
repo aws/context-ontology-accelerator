@@ -27,9 +27,7 @@ from datetime import datetime
 try:
     from defusedxml import ElementTree as ET
 except ImportError as exc:  # pragma: no cover
-    raise SystemExit(
-        "defusedxml is required. Run `uv sync` from the repo root."
-    ) from exc
+    raise SystemExit("defusedxml is required. Run `uv sync` from the repo root.") from exc
 
 rows = []
 

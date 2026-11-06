@@ -17,7 +17,7 @@ let capturedConfig:
 vi.mock("@coa/control-plane-client", () => ({
   ControlPlaneServiceClient: vi.fn().mockImplementation(function (config) {
     capturedConfig = config;
-    return { config };
+    return { config, middlewareStack: { add: vi.fn() } };
   }),
 }));
 

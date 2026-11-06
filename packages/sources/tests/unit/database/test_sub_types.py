@@ -15,6 +15,7 @@ from coa_control_plane_server.models.source_sub_type import SourceSubType
 from coa_sources.database.sub_types import (
     CONNECTOR_BACKED_SUB_TYPES,
     FEDERATED_TEARDOWN_SUB_TYPES,
+    GRAPH_BACKED_SUB_TYPES,
     PLATFORM_CATALOG_CLAIM_SUB_TYPES,
 )
 
@@ -35,26 +36,36 @@ def test_the_shared_mirror_matches_the_generated_enum():
         "Add the DATABASE member(s) there; document sub-types belong in neither."
     )
     assert CONNECTOR_BACKED_SUB_TYPES <= DATABASE_SUB_TYPES
+    assert GRAPH_BACKED_SUB_TYPES <= DATABASE_SUB_TYPES
 
 
-def test_every_database_sub_type_is_either_connector_backed_or_federated():
-    """The two teardown paths are mutually exclusive and between them must cover every
-    DATABASE sub-type, or a source's catalog is torn down by neither.
+def test_every_database_sub_type_has_exactly_one_teardown_path():
+    """The three teardown paths must between them cover every DATABASE sub-type, or a
+    source's catalog is torn down by none. A graph source has no catalog at all, which is
+    its own explicit arm rather than an omission.
     """
-    covered = CONNECTOR_BACKED_SUB_TYPES | FEDERATED_TEARDOWN_SUB_TYPES
+    covered = CONNECTOR_BACKED_SUB_TYPES | FEDERATED_TEARDOWN_SUB_TYPES | GRAPH_BACKED_SUB_TYPES
     uncovered = _DATABASE_SUB_TYPES - covered
     assert not uncovered, (
-        f"DATABASE sub-type(s) {sorted(uncovered)} belong to neither teardown path. Add each to "
-        f"CONNECTOR_BACKED_SUB_TYPES (a top-level LAMBDA catalog: plain athena:DeleteDataCatalog) or to "
-        f"FEDERATED_TEARDOWN_SUB_TYPES (the Lake-Formation-admin path), and check the delete handler."
+        f"DATABASE sub-type(s) {sorted(uncovered)} belong to no teardown path. Add each to "
+        f"CONNECTOR_BACKED_SUB_TYPES (a top-level LAMBDA catalog: plain athena:DeleteDataCatalog), to "
+        f"FEDERATED_TEARDOWN_SUB_TYPES (the Lake-Formation-admin path) or to GRAPH_BACKED_SUB_TYPES "
+        f"(no catalog), and check the delete handler."
     )
 
 
-def test_the_two_teardown_paths_do_not_overlap():
-    """A sub-type in both would have its catalog deleted by athena:DeleteDataCatalog and
-    then handed to a Lake-Formation-admin teardown that assumes a role scoped to the
-    deployment-wide ``{prefix}ds_*`` window."""
+def test_the_teardown_paths_do_not_overlap():
+    """A sub-type in both catalog paths would have its catalog deleted by
+    athena:DeleteDataCatalog and then handed to a Lake-Formation-admin teardown that
+    assumes a role scoped to the deployment-wide ``{prefix}ds_*`` window. A graph source
+    in either would run a catalog teardown against a catalog that never existed."""
     assert not (CONNECTOR_BACKED_SUB_TYPES & FEDERATED_TEARDOWN_SUB_TYPES)
+    assert not (GRAPH_BACKED_SUB_TYPES & (CONNECTOR_BACKED_SUB_TYPES | FEDERATED_TEARDOWN_SUB_TYPES))
+
+
+def test_a_graph_source_claims_no_platform_catalog():
+    assert not (GRAPH_BACKED_SUB_TYPES & PLATFORM_CATALOG_CLAIM_SUB_TYPES)
+    assert SourceSubType.RDF_SPARQL.value in GRAPH_BACKED_SUB_TYPES
 
 
 def test_every_connector_backed_sub_type_claims_a_platform_catalog():

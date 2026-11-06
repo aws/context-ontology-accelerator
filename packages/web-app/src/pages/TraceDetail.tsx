@@ -25,6 +25,8 @@ import {
   tier2Title,
   CEDAR_STEP_IDS,
   FIREWALL_STEP_IDS,
+  firewallLabel,
+  isGraphAnswer,
   GUARDRAIL_STEP_IDS,
 } from "@components/Chat/step-labels";
 import { useTraceData } from "@api-hooks/use-trace-data";
@@ -265,6 +267,16 @@ export function TraceDetail() {
                   label: t("Model"),
                   value: metadata.modelId ? String(metadata.modelId) : "—",
                 },
+                ...(isGraphAnswer(trace)
+                  ? [
+                      {
+                        label: t("Answered from"),
+                        value: (
+                          <Badge color="blue">{t("Graph (SPARQL)")}</Badge>
+                        ),
+                      },
+                    ]
+                  : []),
               ]}
             />
           </ColumnLayout>
@@ -279,9 +291,15 @@ export function TraceDetail() {
                 })}
               </Badge>
               <Badge color={boundaryColor(firewallStatus)}>
-                {t("SQL Firewall: {status}", {
-                  status: boundaryStatusLabel(firewallStatus, t),
-                })}
+                {firewallLabel(
+                  trace.find((s) => FIREWALL_STEP_IDS.has(s.step))?.step,
+                ) === "SPARQL Firewall"
+                  ? t("SPARQL Firewall: {status}", {
+                      status: boundaryStatusLabel(firewallStatus, t),
+                    })
+                  : t("SQL Firewall: {status}", {
+                      status: boundaryStatusLabel(firewallStatus, t),
+                    })}
               </Badge>
               <Badge color={boundaryColor(guardrailStatus)}>
                 {t("Guardrails: {status}", {

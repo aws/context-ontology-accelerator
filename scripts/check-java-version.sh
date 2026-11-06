@@ -17,7 +17,8 @@ set -uo pipefail
 MIN_JAVA_MAJOR=17
 MAX_JAVA_MAJOR=24
 RECOMMENDED_JAVA_MAJOR=21
-FIX_HINT="Run: mise install, or point JAVA_HOME at JDK $RECOMMENDED_JAVA_MAJOR (macOS: export JAVA_HOME=\$(/usr/libexec/java_home -v $RECOMMENDED_JAVA_MAJOR))"
+# JAVA_FIX_HINT: a caller checking another tool's JDK (check-maven.sh) gives its own fix.
+FIX_HINT="${JAVA_FIX_HINT:-Run: mise install, or point JAVA_HOME at JDK $RECOMMENDED_JAVA_MAJOR (macOS: export JAVA_HOME=\$(/usr/libexec/java_home -v $RECOMMENDED_JAVA_MAJOR))}"
 
 if ! command -v java >/dev/null 2>&1; then
   echo "Java not found — required for Smithy code generation. Run: mise install"
@@ -27,7 +28,7 @@ fi
 JAVA_VERSION_OUTPUT="$(java -version 2>&1)"
 JAVA_COMMAND_STATUS=$?
 if [ "$JAVA_COMMAND_STATUS" -ne 0 ]; then
-  echo "Could not run 'java -version' (exit $JAVA_COMMAND_STATUS). Run: mise install"
+  echo "Could not run 'java -version' (exit $JAVA_COMMAND_STATUS). $FIX_HINT"
   exit 1
 fi
 
@@ -37,7 +38,7 @@ JAVA_VERSION="$(
     | sed -n '1p'
 )"
 if [ -z "$JAVA_VERSION" ]; then
-  echo "Could not parse the Java version from 'java -version' output. Run: mise install"
+  echo "Could not parse the Java version from 'java -version' output. $FIX_HINT"
   exit 1
 fi
 
@@ -52,7 +53,7 @@ case "$JAVA_VERSION" in
 esac
 
 if ! [[ "$JAVA_MAJOR" =~ ^[0-9]+$ ]]; then
-  echo "Could not parse a numeric Java major version from '$JAVA_VERSION'. Run: mise install"
+  echo "Could not parse a numeric Java major version from '$JAVA_VERSION'. $FIX_HINT"
   exit 1
 fi
 

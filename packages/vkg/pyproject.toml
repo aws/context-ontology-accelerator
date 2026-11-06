@@ -1,6 +1,6 @@
 [project]
 name = "coa-vkg"
-version = "0.3.8"
+version = "0.3.9"
 description = "Virtual Knowledge Graph for Context Ontology Accelerator"
 requires-python = ">=3.12"
 

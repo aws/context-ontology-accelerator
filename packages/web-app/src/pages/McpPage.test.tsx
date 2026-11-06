@@ -178,6 +178,33 @@ describe("McpPage", () => {
       expect(screen.getByText(/TypeScript/).textContent).toMatch(/source/i);
     });
 
+    it("tells users to build the bundle with its build script, not npx tsc", () => {
+      renderPage(ctx);
+      // `npx tsc` after a failed install downloads an unrelated npm package
+      // named `tsc`; `npm run build` uses the bundled TypeScript or fails.
+      expect(
+        screen.getByText("cd coa-mcp-proxy && npm install && npm run build"),
+      ).toBeInTheDocument();
+      expect(screen.queryByText(/npx tsc/)).toBeNull();
+    });
+
+    it("says what the checksum covers and how to build from a repo checkout", () => {
+      renderPage(ctx);
+      // The zip pins only the direct dependencies; npm install resolves the
+      // rest, and the .sha256 comes from the same site as the zip.
+      expect(
+        screen.getByText(/not the packages those dependencies pull in/),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByText(/does not prove who published it/),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByText(
+          "pnpm install && pnpm --dir packages/mcp-proxy run build",
+        ),
+      ).toBeInTheDocument();
+    });
+
     it("surfaces the bundle SHA-256 so the download can be verified", async () => {
       renderPage(ctx);
       // Fetched from the .sha256 sidecar (stubbed), shown for sha256sum -c.

@@ -536,7 +536,8 @@ export function OntologyPage() {
 
   async function startInduction() {
     if (!namespaceId) return;
-    if (selectedDatasources.length === 0) return;
+    const isBridge = strategy === "bridge_to_tables";
+    if (!isBridge && selectedDatasources.length === 0) return;
     setInducting(true);
     setInductionError(null);
     setDuplicateProposalId(null);
@@ -554,16 +555,26 @@ export function OntologyPage() {
       // curated keys map to canonical ontology IDs in the catalog, and
       // custom uploads went into the same ontologies table.
       const groundingIds = [...selectedFoundationalKeys];
-      const job = await triggerInduction(apiClient, namespaceId, {
-        datasource_ids: dsIds,
-        ontology_uri_prefix: `http://coa.amazon.com/namespace/${namespaceId}/ontology/induced#`,
-        namespace: namespaceId,
-        strategy,
-        confidence_threshold: confidenceThreshold,
-        grounding_mode: groundingMode,
-        grounding_ontology_ids:
-          groundingIds.length > 0 ? groundingIds : undefined,
-      });
+      // The bridge works on the namespace's accepted induced ontology (the
+      // prefix below, the one table inductions from this page write); it reads
+      // no source selection and no grounding.
+      const job = isBridge
+        ? await triggerInduction(apiClient, namespaceId, {
+            datasource_ids: [],
+            ontology_uri_prefix: `http://coa.amazon.com/namespace/${namespaceId}/ontology/induced#`,
+            namespace: namespaceId,
+            strategy,
+          })
+        : await triggerInduction(apiClient, namespaceId, {
+            datasource_ids: dsIds,
+            ontology_uri_prefix: `http://coa.amazon.com/namespace/${namespaceId}/ontology/induced#`,
+            namespace: namespaceId,
+            strategy,
+            confidence_threshold: confidenceThreshold,
+            grounding_mode: groundingMode,
+            grounding_ontology_ids:
+              groundingIds.length > 0 ? groundingIds : undefined,
+          });
       setActiveTab("proposals");
       setPollingJobId(job.job_id);
       // Re-derive the lock from the server now that a run is in flight.
@@ -738,7 +749,11 @@ export function OntologyPage() {
                 <Button
                   variant="primary"
                   onClick={startInduction}
-                  disabled={selectedDatasources.length === 0 || inductionLocked}
+                  disabled={
+                    (strategy !== "bridge_to_tables" &&
+                      selectedDatasources.length === 0) ||
+                    inductionLocked
+                  }
                   disabledReason={
                     inductionLocked
                       ? t(
@@ -773,6 +788,11 @@ export function OntologyPage() {
                           "Unstructured (Lexical Graph) — Extracts concepts and relationships from document sources (PDFs, text) using NLP and builds a lexical knowledge graph. Exclusively for document sources. Supports grounding against loaded ontologies.",
                         )}
                       </Box>
+                      <Box variant="p">
+                        {t(
+                          "Bridge documents to tables — Reads what your documents say about each table and column and proposes definitions for them, so SQL generation knows what a column means. Runs on the accepted ontology after both a table and a document induction; the result is a proposal to review like any other.",
+                        )}
+                      </Box>
                     </SpaceBetween>
                   }
                 >
@@ -789,7 +809,9 @@ export function OntologyPage() {
                   label:
                     strategy === "unstructured_lexical_graph"
                       ? t("Unstructured (Lexical Graph)")
-                      : t("Table to Ontology"),
+                      : strategy === "bridge_to_tables"
+                        ? t("Bridge documents to tables")
+                        : t("Table to Ontology"),
                 }}
                 onChange={({ detail }) => {
                   setStrategy(
@@ -813,168 +835,75 @@ export function OntologyPage() {
                       "Extracts concepts from document sources via NLP and builds a lexical knowledge graph. Exclusively for document sources.",
                     ),
                   },
+                  {
+                    value: "bridge_to_tables",
+                    label: t("Bridge documents to tables"),
+                    description: t(
+                      "Proposes table and column definitions from what the documents say. Needs an accepted table and document induction.",
+                    ),
+                  },
                 ]}
               />
             </FormField>
-            <FormField
-              label={t("Data sources")}
-              description={
-                strategy === "unstructured_lexical_graph"
-                  ? t("Select one or more document sources to induce from.")
-                  : t(
-                      "Select one or more connected database sources to induce from.",
-                    )
-              }
-            >
-              <Multiselect
-                selectedOptions={selectedDatasources}
-                onChange={({ detail }) =>
-                  setSelectedDatasources([...detail.selectedOptions])
-                }
-                options={
-                  strategy === "unstructured_lexical_graph"
-                    ? docSourceOptions
-                    : datasourceOptions
-                }
-                placeholder={t("Select data sources")}
-                filteringType="auto"
-              />
-            </FormField>
-
-            {/* Grounding ontologies — available for BOTH strategies. The
-                structured path grounds tables and the unstructured (lexical
-                graph) path grounds its induced classes against the same
-                loaded foundational ontologies. */}
-            <FormField
-              label={t("Grounding ontologies (optional)")}
-              info={
-                <Popover
-                  header={t("What is grounding?")}
-                  size="large"
-                  triggerType="custom"
-                  content={
-                    <SpaceBetween size="xs">
-                      <Box variant="p">
-                        {t(
-                          "Grounding aligns your induced ontology against existing well-known ontologies. Instead of creating novel classes for every table or concept, the inducer checks if an equivalent concept already exists in a loaded ontology and reuses it.",
-                        )}
-                      </Box>
-                      <Box variant="p">
-                        {t(
-                          "This improves interoperability — your ontology shares vocabulary with industry standards (Schema.org, FIBO, Dublin Core, etc.) making it easier to integrate with other systems.",
-                        )}
-                      </Box>
-                      <Box variant="p">
-                        {t(
-                          "This run grounds against EXACTLY the ontologies selected here. Your namespace's accepted induced ontologies are pre-selected by default (so new runs converge with prior ones), but you can deselect them. With nothing selected, every table/concept is treated as novel.",
-                        )}
-                      </Box>
-                    </SpaceBetween>
-                  }
-                >
-                  <Link variant="info">{t("Info")}</Link>
-                </Popover>
-              }
-              description={t(
-                "Pick the ontologies to ground against for this run. Accepted induced ontologies are pre-selected (deselect to skip). Load foundational/uploaded ontologies from the Reference ontologies tab first.",
-              )}
-              constraintText={t(
-                "Ontologies still embedding or failed to ingest are shown but not selectable.",
-              )}
-            >
-              {foundationalError && (
-                <Alert
-                  type="warning"
-                  dismissible
-                  onDismiss={() => setFoundationalError(null)}
-                >
-                  {t("Could not load ontologies: {error}", {
-                    error: foundationalError,
-                  })}
-                </Alert>
-              )}
-              <Multiselect
-                placeholder={
-                  foundationalCatalog === null
-                    ? t("Loading…")
-                    : t("Pick loaded ontologies to ground against")
-                }
-                selectedOptions={selectedFoundationalKeys.map((uri) => {
-                  const rec = loadedOntologyRecords.find((r) => r.uri === uri);
-                  return {
-                    value: uri,
-                    label: rec?.title || uri.split("/").pop() || uri,
-                  };
-                })}
-                onChange={({ detail }) =>
-                  setSelectedFoundationalKeys(
-                    detail.selectedOptions
-                      .map((o) => o.value)
-                      .filter((v): v is string => Boolean(v)),
-                  )
-                }
-                // All loaded ontologies are SHOWN — induced, foundational, and
-                // uploaded. Ready ones (finished embedding) are SELECTABLE; the
-                // backend grounds against EXACTLY the selected pool (no
-                // server-side auto-include), and ready induced ontologies are
-                // pre-checked by default (see the load effect) so new runs
-                // converge with prior ones. Ontologies that have not finished
-                // embedding or failed to ingest are shown DISABLED with a
-                // per-row status label so they are not silently hidden from
-                // Start Induction (issue #540). Readiness is derived from
-                // ontologyIngestState() — the single source of truth also used
-                // by the Ontologies-list StatusIndicator — so the two views can
-                // never disagree about whether a row is ready.
-                options={loadedOntologyRecords.map((rec) => {
-                  const ingestState = ontologyIngestState(rec);
-                  const isReady = ingestState === "ready";
-                  const statusLabel =
-                    ingestState === "failed"
-                      ? t("⚠️ Ingest failed")
-                      : ingestState === "ingesting"
-                        ? t("⏳ Embedding…")
-                        : undefined;
-                  return {
-                    value: rec.uri,
-                    label: rec.title || rec.ontologyId,
-                    labelTag:
-                      rec.ontologyType === "induced"
-                        ? t("Induced")
-                        : rec.ontologyType === "foundational"
-                          ? t("Foundational")
-                          : t("Uploaded"),
-                    description: statusLabel ?? rec.uri,
-                    disabled: !isReady,
-                  };
-                })}
-                disabled={foundationalCatalog === null}
-                filteringType="auto"
-              />
-            </FormField>
-
-            {/* Grounding mode + confidence — shown whenever grounding will run,
-                i.e. at least one ontology is selected (induced ontologies are
-                pre-selected by default). If the user deselects everything, no
-                grounding happens, so the mode controls are hidden. */}
-            {selectedFoundationalKeys.length > 0 && (
+            {strategy === "bridge_to_tables" ? (
+              <Box variant="p">
+                {t(
+                  "The bridge runs on this namespace's accepted ontology: it needs an accepted table induction and an accepted document induction. It reads no source selection. When it finishes, its proposal opens for review; nothing changes until you accept it.",
+                )}
+              </Box>
+            ) : (
               <>
                 <FormField
-                  label={t("Grounding mode")}
+                  label={t("Data sources")}
+                  description={
+                    strategy === "unstructured_lexical_graph"
+                      ? t("Select one or more document sources to induce from.")
+                      : t(
+                          "Select one or more connected database sources to induce from.",
+                        )
+                  }
+                >
+                  <Multiselect
+                    selectedOptions={selectedDatasources}
+                    onChange={({ detail }) =>
+                      setSelectedDatasources([...detail.selectedOptions])
+                    }
+                    options={
+                      strategy === "unstructured_lexical_graph"
+                        ? docSourceOptions
+                        : datasourceOptions
+                    }
+                    placeholder={t("Select data sources")}
+                    filteringType="auto"
+                  />
+                </FormField>
+
+                {/* Grounding ontologies — available for BOTH strategies. The
+                    structured path grounds tables and the unstructured (lexical
+                    graph) path grounds its induced classes against the same
+                    loaded foundational ontologies. */}
+                <FormField
+                  label={t("Grounding ontologies (optional)")}
                   info={
                     <Popover
-                      header={t("Grounding modes")}
+                      header={t("What is grounding?")}
                       size="large"
                       triggerType="custom"
                       content={
                         <SpaceBetween size="xs">
                           <Box variant="p">
                             {t(
-                              "Enhanced — Three-stage matching: exact name match → embedding similarity recall → LLM disambiguation for ambiguous candidates. Most accurate but incurs ~1 LLM call per table. Use when precision matters and cost is acceptable.",
+                              "Grounding aligns your induced ontology against existing well-known ontologies. Instead of creating novel classes for every table or concept, the inducer checks if an equivalent concept already exists in a loaded ontology and reuses it.",
                             )}
                           </Box>
                           <Box variant="p">
                             {t(
-                              "Standard — Two-stage matching: exact name match → embedding similarity with a confidence threshold. Fully deterministic, no LLM cost. Use for large schemas where speed and cost are priorities.",
+                              "This improves interoperability — your ontology shares vocabulary with industry standards (Schema.org, FIBO, Dublin Core, etc.) making it easier to integrate with other systems.",
+                            )}
+                          </Box>
+                          <Box variant="p">
+                            {t(
+                              "This run grounds against EXACTLY the ontologies selected here. Your namespace's accepted induced ontologies are pre-selected by default (so new runs converge with prior ones), but you can deselect them. With nothing selected, every table/concept is treated as novel.",
                             )}
                           </Box>
                         </SpaceBetween>
@@ -984,49 +913,163 @@ export function OntologyPage() {
                     </Popover>
                   }
                   description={t(
-                    "How to match source concepts against the selected ontologies.",
+                    "Pick the ontologies to ground against for this run. Accepted induced ontologies are pre-selected (deselect to skip). Load foundational/uploaded ontologies from the Reference ontologies tab first.",
+                  )}
+                  constraintText={t(
+                    "Ontologies still embedding or failed to ingest are shown but not selectable.",
                   )}
                 >
-                  <RadioGroup
-                    value={groundingMode}
-                    onChange={({ detail }) => setGroundingMode(detail.value)}
-                    items={[
-                      {
-                        value: "ENHANCED",
-                        label: t("Enhanced (recommended)"),
-                        description: t(
-                          "Exact-name match + embedding recall + LLM disambiguation. Best accuracy, ~1 LLM call per table.",
-                        ),
-                      },
-                      {
-                        value: "STANDARD",
-                        label: t("Standard"),
-                        description: t(
-                          "Exact-name match + embedding recall only. Deterministic, faster, no LLM cost.",
-                        ),
-                      },
-                    ]}
+                  {foundationalError && (
+                    <Alert
+                      type="warning"
+                      dismissible
+                      onDismiss={() => setFoundationalError(null)}
+                    >
+                      {t("Could not load ontologies: {error}", {
+                        error: foundationalError,
+                      })}
+                    </Alert>
+                  )}
+                  <Multiselect
+                    placeholder={
+                      foundationalCatalog === null
+                        ? t("Loading…")
+                        : t("Pick loaded ontologies to ground against")
+                    }
+                    selectedOptions={selectedFoundationalKeys.map((uri) => {
+                      const rec = loadedOntologyRecords.find(
+                        (r) => r.uri === uri,
+                      );
+                      return {
+                        value: uri,
+                        label: rec?.title || uri.split("/").pop() || uri,
+                      };
+                    })}
+                    onChange={({ detail }) =>
+                      setSelectedFoundationalKeys(
+                        detail.selectedOptions
+                          .map((o) => o.value)
+                          .filter((v): v is string => Boolean(v)),
+                      )
+                    }
+                    // All loaded ontologies are SHOWN — induced, foundational, and
+                    // uploaded. Ready ones (finished embedding) are SELECTABLE; the
+                    // backend grounds against EXACTLY the selected pool (no
+                    // server-side auto-include), and ready induced ontologies are
+                    // pre-checked by default (see the load effect) so new runs
+                    // converge with prior ones. Ontologies that have not finished
+                    // embedding or failed to ingest are shown DISABLED with a
+                    // per-row status label so they are not silently hidden from
+                    // Start Induction (issue #540). Readiness is derived from
+                    // ontologyIngestState() — the single source of truth also used
+                    // by the Ontologies-list StatusIndicator — so the two views can
+                    // never disagree about whether a row is ready.
+                    options={loadedOntologyRecords.map((rec) => {
+                      const ingestState = ontologyIngestState(rec);
+                      const isReady = ingestState === "ready";
+                      const statusLabel =
+                        ingestState === "failed"
+                          ? t("⚠️ Ingest failed")
+                          : ingestState === "ingesting"
+                            ? t("⏳ Embedding…")
+                            : undefined;
+                      return {
+                        value: rec.uri,
+                        label: rec.title || rec.ontologyId,
+                        labelTag:
+                          rec.ontologyType === "induced"
+                            ? t("Induced")
+                            : rec.ontologyType === "foundational"
+                              ? t("Foundational")
+                              : t("Uploaded"),
+                        description: statusLabel ?? rec.uri,
+                        disabled: !isReady,
+                      };
+                    })}
+                    disabled={foundationalCatalog === null}
+                    filteringType="auto"
                   />
                 </FormField>
-                {groundingMode === "STANDARD" && (
-                  <FormField
-                    label={t("Confidence threshold: {percent}%", {
-                      percent: Math.round(confidenceThreshold * 100),
-                    })}
-                    description={t(
-                      "Only concepts above this threshold are auto-matched. Lower = more matches but more false positives.",
-                    )}
-                  >
-                    <Slider
-                      value={confidenceThreshold}
-                      onChange={({ detail }) =>
-                        setConfidenceThreshold(detail.value)
+
+                {/* Grounding mode + confidence — shown whenever grounding will run,
+                    i.e. at least one ontology is selected (induced ontologies are
+                    pre-selected by default). If the user deselects everything, no
+                    grounding happens, so the mode controls are hidden. */}
+                {selectedFoundationalKeys.length > 0 && (
+                  <>
+                    <FormField
+                      label={t("Grounding mode")}
+                      info={
+                        <Popover
+                          header={t("Grounding modes")}
+                          size="large"
+                          triggerType="custom"
+                          content={
+                            <SpaceBetween size="xs">
+                              <Box variant="p">
+                                {t(
+                                  "Enhanced — Three-stage matching: exact name match → embedding similarity recall → LLM disambiguation for ambiguous candidates. Most accurate but incurs ~1 LLM call per table. Use when precision matters and cost is acceptable.",
+                                )}
+                              </Box>
+                              <Box variant="p">
+                                {t(
+                                  "Standard — Two-stage matching: exact name match → embedding similarity with a confidence threshold. Fully deterministic, no LLM cost. Use for large schemas where speed and cost are priorities.",
+                                )}
+                              </Box>
+                            </SpaceBetween>
+                          }
+                        >
+                          <Link variant="info">{t("Info")}</Link>
+                        </Popover>
                       }
-                      min={0.5}
-                      max={0.95}
-                      step={0.05}
-                    />
-                  </FormField>
+                      description={t(
+                        "How to match source concepts against the selected ontologies.",
+                      )}
+                    >
+                      <RadioGroup
+                        value={groundingMode}
+                        onChange={({ detail }) =>
+                          setGroundingMode(detail.value)
+                        }
+                        items={[
+                          {
+                            value: "ENHANCED",
+                            label: t("Enhanced (recommended)"),
+                            description: t(
+                              "Exact-name match + embedding recall + LLM disambiguation. Best accuracy, ~1 LLM call per table.",
+                            ),
+                          },
+                          {
+                            value: "STANDARD",
+                            label: t("Standard"),
+                            description: t(
+                              "Exact-name match + embedding recall only. Deterministic, faster, no LLM cost.",
+                            ),
+                          },
+                        ]}
+                      />
+                    </FormField>
+                    {groundingMode === "STANDARD" && (
+                      <FormField
+                        label={t("Confidence threshold: {percent}%", {
+                          percent: Math.round(confidenceThreshold * 100),
+                        })}
+                        description={t(
+                          "Only concepts above this threshold are auto-matched. Lower = more matches but more false positives.",
+                        )}
+                      >
+                        <Slider
+                          value={confidenceThreshold}
+                          onChange={({ detail }) =>
+                            setConfidenceThreshold(detail.value)
+                          }
+                          min={0.5}
+                          max={0.95}
+                          step={0.05}
+                        />
+                      </FormField>
+                    )}
+                  </>
                 )}
               </>
             )}
@@ -1172,17 +1215,31 @@ export function proposalStatusText(status: string, t: AppTranslate): string {
  *    resilient when induced_ontology_id isn't hydrated on the DDB-fallback poll).
  *  - ``refresh`` — nothing to navigate to (no id at all); just refresh the list.
  *
+ *  A bridge job (``bridge_report`` set) names its proposal in
+ *  ``bridge_report.proposal_id``; without one the run found nothing to change
+ *  and there is no proposal row, so the job id must not be used.
+ *
  *  Exported as a pure function so the duplicate-vs-navigate decision is unit
  *  tested directly (the 4s poll loop + Cloudscape Tabs render is flaky in jsdom).
  */
 export function resolveCompletedInductionAction(
-  job: { duplicate_of?: string; report?: Record<string, unknown> },
+  job: {
+    duplicate_of?: string;
+    report?: Record<string, unknown>;
+    bridge_report?: { proposal_id?: string };
+  },
   polledJobId: string | null,
 ):
   | { kind: "duplicate" | "navigate"; proposalId: string }
   | { kind: "refresh" } {
   if (job.duplicate_of) {
     return { kind: "duplicate", proposalId: job.duplicate_of };
+  }
+  if (job.bridge_report) {
+    const bridged = job.bridge_report.proposal_id;
+    return bridged
+      ? { kind: "navigate", proposalId: bridged }
+      : { kind: "refresh" };
   }
   const proposalId =
     (job.report?.["induced_ontology_id"] as string | undefined) ??

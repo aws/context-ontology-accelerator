@@ -41,6 +41,9 @@ export class StorageStack extends SCLStack {
   /** Neptune cluster writer endpoint (host reachable from VPC). */
   public readonly neptuneClusterEndpoint: string;
 
+  /** Neptune cluster identifier: graph-verify refuses this cluster's endpoints as a graph source. */
+  public readonly neptuneClusterIdentifier: string;
+
   /** Neptune Gremlin/SPARQL port. */
   public readonly neptunePort: number;
 
@@ -134,6 +137,10 @@ export class StorageStack extends SCLStack {
 
     this.neptunePort = 8182;
     this.neptuneClusterEndpoint = neptuneCluster.attrEndpoint;
+    this.neptuneClusterIdentifier = neptuneCluster.ref;
+    // Kept whatever the graph-sources switch says: a sources stack deployed from an
+    // earlier version imports it, and this stack is updated first.
+    this.exportValue(neptuneCluster.ref);
 
     // Neptune IAM data-access ARN uses the cluster *resource* ID
     // (e.g. cluster-ABCD1234...), NOT the cluster identifier.

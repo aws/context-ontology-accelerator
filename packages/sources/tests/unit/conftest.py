@@ -74,7 +74,7 @@ os.environ.setdefault("SOURCES_TABLE", "test-sources")
 # Imported after the env block above: the module reads AWS_REGION at import time.
 from coa_sources.database import glue_ownership  # noqa: E402
 
-_STUB_ACCOUNT = "000000000000"
+_STUB_ACCOUNT = "0" * 12
 
 
 class RealNetworkBlocked(RuntimeError):
@@ -95,6 +95,16 @@ def _is_loopback(address) -> bool:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return False
+
+
+@pytest.fixture(autouse=True)
+def resource_prefix(monkeypatch):
+    """Every test runs with the deployment prefix CDK sets on every Lambda that derives a name from it.
+
+    Its accessor refuses to default (the Athena catalog name and the sts:ExternalId come from it), so a test module
+    must not depend on another one having set it at import.
+    """
+    monkeypatch.setenv("RESOURCE_PREFIX", "coa-dev-")
 
 
 @pytest.fixture(autouse=True)

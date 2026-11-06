@@ -565,6 +565,11 @@ enum QueryStrategy {
 
     /// The bounded tool-use agent only. Opt-in; never reached as a fallback.
     DEEP_REASONING = "deep-reasoning"
+
+    /// Native graph strategy only — NL→SPARQL executed directly against the
+    /// matched RDF_SPARQL source's endpoint (no VKG, no SQL). Auto-selected for
+    /// namespaces with a graph source; never a fallback for a SQL-only namespace.
+    NL_TO_SPARQL = "nl_to_sparql"
 }
 
 // ══════════════════════════════════════════════════════════════════════════════

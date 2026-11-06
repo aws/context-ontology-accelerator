@@ -39,6 +39,18 @@ enum InductionStrategy {
 
     /// Unstructured strategy: induce an ontology from a lexical knowledge graph.
     UNSTRUCTURED_LEXICAL_GRAPH = "unstructured_lexical_graph"
+
+    /// Document-to-table bridge, run on its own on the namespace's already
+    /// accepted ontology named by `ontologyUriPrefix`. Links document-induced
+    /// classes to table and column classes and proposes document-derived
+    /// definitions for those tables and columns. Needs an accepted table
+    /// ontology with R2RML mappings into which a document induction was also
+    /// accepted (the same ontology). Writes nothing itself: the completed job
+    /// names a pending proposal (`bridgeReport.proposalId`) holding the touched
+    /// tables with their new definitions, which is reviewed and accepted like
+    /// any other proposal. `datasourceIds` is ignored; send an empty list.
+    /// Returns a `jobId` to poll with GetInductionJob.
+    BRIDGE_TO_TABLES = "bridge_to_tables"
 }
 
 /// Grounding mode — how aggressively induced classes are aligned to existing
@@ -112,6 +124,12 @@ enum InductionJobStatus {
 
     /// Unstructured stage: serializing the induced ontology.
     SERIALIZING = "serializing"
+
+    // ── Document-to-table bridge ─────────────────────────────────────
+    /// Bridge job (`bridge_to_tables` strategy) in progress. The current step
+    /// is in the job's `progress` field. A bridge job goes
+    /// pending → running → completed | failed.
+    RUNNING = "running"
 }
 
 /// Opt-in expansion for `GetInductionJob`. Omitting it returns the slim poll
@@ -140,6 +158,11 @@ enum InductionSourceType {
 
     /// An unstructured (knowledge-graph-to-ontology) induction run.
     UNSTRUCTURED = "UNSTRUCTURED"
+
+    /// A document-to-table bridge run (`bridge_to_tables` strategy) over an
+    /// accepted ontology. Its result is a pending proposal (or none on a dry
+    /// run); `bridgeReport.proposalId` names it.
+    BRIDGE = "BRIDGE"
 }
 
 /// Proposal status.
@@ -223,6 +246,106 @@ float ConfidenceThreshold
 @range(min: 1, max: 8192)
 integer RerankMaxTokens
 
+/// Switches for one document-to-table bridge run. Every member is optional;
+/// an omitted member takes the default named in its description. An unknown
+/// member is rejected. The run makes one LLM call per batch of up to 25
+/// columns of each table that has document evidence, plus grounding and
+/// embedding calls; `maxTables` caps that one-off cost.
+structure BridgeOptions {
+    /// Most table classes considered in one run. Default 60.
+    @range(min: 1, max: 200)
+    maxTables: Integer
+
+    /// Tables processed in parallel. Default 6.
+    @range(min: 1, max: 16)
+    concurrency: Integer
+
+    /// Compute and report the plan without creating a proposal. Default false.
+    dryRun: Boolean
+}
+
+/// Outcome of a document-to-table bridge run, on a completed bridge job.
+/// Name lists are capped; counts are not. Additional diagnostic counters
+/// may appear.
+structure BridgeReport {
+    /// Ontology the bridge ran on.
+    ontologyId: String
+
+    /// Whether this was a dry run (no proposal created).
+    dryRun: Boolean
+
+    /// The pending proposal holding the planned changes (absent on a dry run
+    /// or when nothing would change). Accept it to write them.
+    proposalId: String
+
+    /// Table classes considered.
+    tablesConsidered: Integer
+
+    /// Tables that had any document evidence and were sent to the LLM.
+    tablesWithEvidence: Integer
+
+    /// Tables with no document evidence (left unchanged).
+    tablesWithoutEvidence: StringList
+
+    /// Definitions proposed for tables.
+    tableDefinitions: Integer
+
+    /// Definitions proposed for columns.
+    columnDefinitions: Integer
+
+    /// Definitions that replaced a placeholder description (the old text is
+    /// kept in the description history).
+    replacedBoilerplate: Integer
+
+    /// Replacements decided by the word-based placeholder check.
+    replacedByRule: Integer
+
+    /// Replacements decided only by the model judging the existing description
+    /// a placeholder: the ones to review before accepting.
+    replacedByModel: Integer
+
+    /// Tables and columns whose description the model alone judged a
+    /// placeholder (capped).
+    replacedByModelSubjects: StringList
+
+    /// Definitions appended after an informative existing description.
+    appendedToExisting: Integer
+
+    /// `skos:closeMatch` / `skos:relatedMatch` links from tables to document classes.
+    tableLinks: Integer
+
+    /// `skos:closeMatch` / `skos:relatedMatch` links from columns to document classes.
+    columnLinks: Integer
+
+    /// Names of the tables given a definition (capped).
+    definedTables: StringList
+
+    /// Names of the columns given a definition (capped).
+    definedColumns: StringList
+
+    /// The links proposed, one per entry as "<table or table.column>
+    /// <closeMatch|relatedMatch> <document class label>" (capped).
+    links: StringList
+
+    /// Definition LLM calls made.
+    llmCalls: Integer
+
+    /// Definition LLM calls that failed after retries.
+    llmFailures: Integer
+
+    /// First LLM error seen, if any.
+    firstLlmError: String
+
+    /// Tables whose definition calls all failed.
+    failedTables: StringList
+
+    /// Run notes (missing evidence sources, search failures).
+    notes: StringList
+
+    /// Wall-clock run time in seconds.
+    elapsedSeconds: Integer
+}
+
 // ── Operations ──────────────────────────────────────────────────────
 /// Start an ontology induction job from one or more data sources.
 /// Returns immediately with a job ID; induction runs asynchronously.
@@ -236,12 +359,15 @@ operation StartInduction {
         /// Data source IDs to induct from. The table-based strategies
         /// (`table_to_ontology`, `rigor_ontology`) need at least one; an empty
         /// list is rejected with a 400. `unstructured_lexical_graph` reads the
-        /// lexical graph instead and accepts an empty list.
+        /// lexical graph instead and accepts an empty list. `bridge_to_tables`
+        /// runs on an accepted ontology and ignores the list; send an empty one.
         @required
         @length(max: 1000)
         datasourceIds: DataSourceIdList
 
-        /// URI prefix for generated ontology classes and properties.
+        /// URI prefix for generated ontology classes and properties. For the
+        /// `bridge_to_tables` strategy, the ID of the accepted ontology to
+        /// bridge (404 if the namespace has no such ontology).
         @required
         ontologyUriPrefix: OntologyUriPrefix
 
@@ -259,6 +385,10 @@ operation StartInduction {
 
         /// Induction strategy to use.
         strategy: InductionStrategy
+
+        /// Options for the `bridge_to_tables` strategy. Omitted → every
+        /// option takes its default. Set on another strategy it returns 400.
+        bridgeOptions: BridgeOptions
 
         /// Existing ontology IDs to ground against (reuse existing concepts).
         groundingOntologyIds: GroundingOntologyIdList
@@ -292,6 +422,7 @@ operation StartInduction {
 
     errors: [
         ValidationError
+        NotFoundError
         ConflictError
     ]
 }
@@ -331,6 +462,17 @@ operation GetInductionJob {
 
         /// Induction report (populated when status is COMPLETED).
         report: InductionReport
+
+        /// Origin of this run; `BRIDGE` for a `bridge_to_tables` job. Items
+        /// lacking it are STRUCTURED.
+        sourceType: InductionSourceType
+
+        /// Current step of a running bridge job, as short free text
+        /// (e.g. "writing definitions for 12 tables").
+        progress: String
+
+        /// Bridge outcome (populated when a `bridge_to_tables` job is COMPLETED).
+        bridgeReport: BridgeReport
 
         /// Error message (populated when status is FAILED).
         error: String

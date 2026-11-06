@@ -254,6 +254,29 @@ describe("ChatBubble", () => {
       ).toBeInTheDocument();
     });
 
+    it("renders only the SPARQL block (no SQL) for a native graph result", () => {
+      // nl_to_sparql: sparqlGenerated present, queryUsed absent → SPARQL block
+      // shows, no SQL block, and the caption says it ran directly against the graph.
+      const nativeResponse = {
+        ...response,
+        sparqlGenerated: "SELECT ?a WHERE { ?a a :Alliance }",
+      };
+      render(
+        <ChatBubble
+          role="assistant"
+          state="success"
+          {...baseProps}
+          response={nativeResponse}
+        />,
+      );
+      expect(screen.getByText("Compiled artifacts")).toBeInTheDocument();
+      expect(screen.getByText("SPARQL")).toBeInTheDocument();
+      expect(screen.queryByText("SQL")).not.toBeInTheDocument();
+      expect(
+        screen.getByText(/executed directly against the graph/i),
+      ).toBeInTheDocument();
+    });
+
     it("renders 'Compiled artifacts' section when queryUsed is present", () => {
       const artifactsResponse = {
         ...response,

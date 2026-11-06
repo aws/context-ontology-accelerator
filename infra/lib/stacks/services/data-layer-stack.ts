@@ -19,6 +19,10 @@ import { SCLStack } from "../../constructs/scl-stack";
 import { resolveContext } from "../../context";
 import { fromRoot, Paths } from "../../paths";
 import { bundlePython } from "../../utils/python-bundling";
+import {
+  GRAPH_SOURCES_ENV,
+  graphSourcesEnabled,
+} from "../../utils/graph-sources";
 
 export interface DataLayerStackProps extends cdk.StackProps {
   /** VPC for Lambda placement (AgentCore Runtime requires VPC connectivity). */
@@ -64,14 +68,7 @@ export class DataLayerStack extends SCLStack {
     // MCP/data-layer parity refactor, so the bundle shipped zero pip deps.)
     const lambdaCode = bundlePython({
       srcDirs: [fromRoot("packages/data-layer/src"), Paths.commonLib],
-      pipDeps: [
-        "pydantic",
-        "pydantic-settings",
-        "structlog",
-        // Runtime boto3 prefers a bundled certifi to the CA bundle botocore ships; this is
-        // the first certifi without the roots behind the compromised emSign intermediates.
-        "certifi>=2026.10.19",
-      ],
+      requirementsFile: fromRoot("packages/data-layer/requirements.lock.txt"),
     });
 
     // ── Data Layer API Lambda ──────────────────────────────────────
@@ -89,6 +86,8 @@ export class DataLayerStack extends SCLStack {
         AGENTCORE_RUNTIME_ARN: runtimeArn,
         ONTOLOGY_PROXY_LAMBDA_ARN: ontologyProxyLambdaArn,
         ALLOWED_ORIGIN: props.allowedOrigin ?? "*",
+        // The REST contract accepts strategy=nl_to_sparql only with `-c graph_sources=on`.
+        ...(graphSourcesEnabled(this.node) && { [GRAPH_SOURCES_ENV]: "true" }),
       },
     });
 

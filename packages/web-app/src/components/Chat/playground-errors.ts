@@ -26,6 +26,8 @@ export const PLAYGROUND_ERROR_MESSAGES: Readonly<Record<string, AppMessage>> = {
   InvalidResponse: "Received malformed response from server",
   AuthError: "Your session has expired. Sign in again.",
   StreamError: "The request failed",
+  PlaygroundUnavailable:
+    "The Playground's query service is not available in this environment yet, so questions cannot be sent.",
 };
 
 /**
@@ -39,6 +41,7 @@ const NOT_RETRYABLE = new Set<string>([
   "NamespaceNotFoundError",
   "NoResult",
   "NoResultError",
+  "PlaygroundUnavailable",
 ]);
 
 export interface PlaygroundErrorText {

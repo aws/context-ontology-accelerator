@@ -14,13 +14,8 @@ else
     echo "✓ UV $(uv --version) found"
 fi
 
-# Check pnpm
-if ! command -v pnpm >/dev/null 2>&1; then
-    echo "Installing pnpm..."
-    npm install -g pnpm
-else
-    echo "✓ pnpm $(pnpm --version) found"
-fi
+# Check pnpm (installs the version .mise.toml pins when it is missing)
+"$(dirname "$0")/install-pnpm.sh"
 
 # Check Java (17-24; see check-java-version.sh for the upper bound)
 if JAVA_CHECK="$("$(dirname "$0")/check-java-version.sh")"; then
@@ -75,5 +70,5 @@ fi
 
 echo ""
 echo "=== Setup complete! ==="
-echo "Run 'make docker-up' to start local services."
-echo "Run 'make test' to run tests."
+echo "Run 'make test' to run the unit tests."
+echo "To deploy to your AWS account, see external-docs/content/deploying.md."

@@ -1,0 +1,15 @@
+{
+  "call_count": 1,
+  "calls": [
+    {
+      "guard_content": "Question: What was ACME's 2024 revenue in the EMEA segment, and who owns that account?",
+      "guardrail_id": null,
+      "max_tokens": 1024,
+      "prompt": "Sub-question: What was ACME's 2024 revenue in the EMEA segment, and who owns that account?\n\nNo document chunks gathered yet.\n\nStructured data rows gathered (1 total, 1 shown) \u2014 these ARE retrieved data and may fully answer the sub-question:\n  [row] {'segment': 'EMEA', 'year': '2024', 'revenue_usd': '41200000'}\n\nDecide whether this context is sufficient, and write your current best answer grounded ONLY in the context above.",
+      "system": "You are the reasoning planner for a server-side knowledge-retrieval agent. Given a sub-question and the context gathered so far (document-chunk snippets, graph entities, and prior findings), do BOTH of the following:\n1. Decide whether the accumulated context is SUFFICIENT to answer the sub-question accurately.\n2. Write your CURRENT BEST ANSWER to the sub-question.\n\nGROUNDING \u2014 this is critical. Base your best answer ONLY on the provided context (the chunk snippets, entities, and findings shown to you). Do NOT use any outside or prior knowledge, and do NOT invent figures, names, dates, or facts that are not present in the context. Prefer specific figures and quotations that appear in the context. If the context is insufficient or only partially answers the question, say what IS supported and state plainly what is still missing \u2014 do not fill gaps from memory. Answer the WHOLE question as asked (e.g. every period/segment requested), not just one sub-part.\n\nLANGUAGE: Write your working_answer in English (BCP 47 tag `en`), the language of the user's question. The gathered context may be in other languages; ignore their language.\n\nRespond with ONLY a JSON object of this exact shape, and no prose outside it:\n{\"sufficient\": <true|false>, \"working_answer\": \"<your grounded best answer>\"}",
+      "temperature": 0.0
+    }
+  ],
+  "scenario": "prefetch_sufficient",
+  "stop_reason": "sufficiency_satisfied"
+}

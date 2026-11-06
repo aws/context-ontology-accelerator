@@ -39,6 +39,22 @@ const ERROR_CODE_LABELS: Readonly<Record<string, AppMessage>> = {
   GraphQueryError: "the graph store did not respond in time",
   TimeoutError: "the request timed out",
   RetrieveError: "the search backend was unavailable",
+  // Native SPARQL strategy decline reasons (t2.sparql.* steps).
+  sparql_strategy_misconfigured:
+    "no imported ontology links a class to this namespace's graph source",
+  sparql_strategy_no_data_endpoint:
+    "no verified graph source could be resolved for the matched classes",
+  sparql_client_build_failed: "the graph source's engine is not supported",
+  sparql_strategy_exec_failed: "the graph endpoint returned an error",
+  sparql_firewall_rejected: "the generated SPARQL was rejected as unsafe",
+};
+
+/** Plain-language reason for a SPARQL firewall rule (backend FirewallRule values). */
+const SPARQL_FIREWALL_RULES: Readonly<Record<string, AppMessage>> = {
+  F1_read_only: "only read-only queries are allowed",
+  F2_graph_scope: "the query reached outside the source's graph",
+  F3_result_bound: "the result could not be bounded",
+  F4_fail_closed: "the query could not be checked safely",
 };
 
 function humanizeError(value: unknown, t: AppTranslate): string {
@@ -340,6 +356,34 @@ const stepFormatters: Record<string, Formatter> = {
 
   "t2.sql.failed": (d, t) => strategyFailedDetail(d, t),
   "t2.vkg.failed": (d, t) => strategyFailedDetail(d, t),
+  "t2.sparql.failed": (d, t) => strategyFailedDetail(d, t),
+
+  "t2.sparql.firewall": (d, t) => {
+    if (d.rule) {
+      const rule = SPARQL_FIREWALL_RULES[String(d.rule)];
+      const why = rule ? t(rule) : humanizeError(d.rule, t);
+      return t("Blocked — {reason}", { reason: why });
+    }
+    return d.limit
+      ? t("Passed; capped at {limit} rows.", { limit: String(d.limit) })
+      : t("Passed.");
+  },
+
+  "t2.sparql.execute": (d, t) => {
+    if (d.reason || d.error) {
+      return t("Graph query failed — {reason}", {
+        reason: humanizeError(d.message ?? d.error ?? d.reason, t),
+      });
+    }
+    if (typeof d.rowCount !== "number") return t("Graph query executed.");
+    const rows = String(d.rowCount);
+    return d.dataSourceId
+      ? t("Returned {rows} row(s) from source {source}.", {
+          rows,
+          source: String(d.dataSourceId),
+        })
+      : t("Returned {rows} row(s).", { rows });
+  },
 
   "t2.strategy_selected": (d, t) => {
     const friendly = STRATEGY_DISPLAY_NAMES[String(d.strategy)] ?? d.strategy;
@@ -353,10 +397,21 @@ const stepFormatters: Record<string, Formatter> = {
 const STRATEGY_DISPLAY_NAMES: Record<string, string> = {
   nl_to_sql: "NL→SQL",
   ontop: "VKG (Ontop)",
+  nl_to_sparql: "NL→SPARQL (graph)",
 };
 
 /** Detail for an abandoned-strategy step: explain why it was skipped. */
 function strategyFailedDetail(d: DetailRecord, t: AppTranslate): string {
+  if (d.reason === "guardrail_masked_literal") {
+    return t(
+      "A value in the question was masked by the privacy filter, so the SQL was not run.",
+    );
+  }
+  if (typeof d.reason === "string" && d.reason.startsWith("sparql_")) {
+    return t(`Abandoned — {reason}.`, {
+      reason: humanizeError(d.reason, t),
+    });
+  }
   if (d.reason === "empty_low_confidence") {
     const conf =
       typeof d.confidence === "number"
@@ -408,6 +463,12 @@ const STEP_FALLBACKS = {
   "t2.vkg.retry": "Retry attempted.",
   "t2.sql.failed": "NL→SQL strategy abandoned.",
   "t2.vkg.failed": "VKG strategy abandoned.",
+  "t2.sparql.context": "Graph ontology context loaded.",
+  "t2.sparql.translate": "SPARQL generated.",
+  "t2.sparql.validate": "Passed.",
+  "t2.sparql.firewall": "SPARQL firewall passed.",
+  "t2.sparql.execute": "Graph query executed.",
+  "t2.sparql.failed": "NL→SPARQL strategy abandoned.",
   "t2.strategy_selected": "Strategy selected.",
   "routing.select": "Intent routed.",
 } satisfies Record<string, AppMessage>;

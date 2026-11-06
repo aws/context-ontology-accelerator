@@ -1,5 +1,7 @@
 line-length = 120
 target-version = "py312"
+# workshop/ is MIT-0 content re-synced from Workshop Studio; not ours to lint or reformat.
+extend-exclude = ["workshop"]
 [lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "D"]
 

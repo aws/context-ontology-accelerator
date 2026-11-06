@@ -63,7 +63,7 @@ Property 6 — the hand-rolled default path is unchanged (Preservation; 3.1, 3.7
 Property 7 — non-targeted invariants hold (Preservation; 3.2–3.5)
     test_strategies.py::TestLazyImportInvariant + test_config.py
         ::test_load_config_does_not_import_graphrag_toolkit (lazy graphrag import)
-    + seam gap here: TestVersionPinInvariant (3.3/3.4 — graphrag-lexical-graph==3.18.7
+    + seam gap here: TestVersionPinInvariant (3.3/3.4 — graphrag-lexical-graph==3.20.0
       pin asserted; previously no unit test).
     Validates: Requirements 3.2, 3.3, 3.4, 3.5
 
@@ -323,14 +323,14 @@ class TestResolveBoundaryDegradation:
 @pytest.mark.unit
 class TestVersionPinInvariant:
     """Requirement 3.3 / 3.4 / Property 7: ``graphrag-lexical-graph`` stays pinned
-    to ``==3.18.7`` (in sync with kg-build's requirements.txt, the root
+    to ``==3.20.0`` (in sync with kg-build's requirements.txt, the root
     ``uv.lock``, and context-manager's own pin). No prior unit test asserted the
     pin; a silent bump would break reader/builder version parity."""
 
     def test_graphrag_lexical_graph_pinned_to_expected_version(self):
         from importlib.metadata import version
 
-        assert version("graphrag-lexical-graph") == "3.18.7"
+        assert version("graphrag-lexical-graph") == "3.20.0"
 
 
 # ── Cross-primitive seam: registry build_engine ↔ adapter cache ─────

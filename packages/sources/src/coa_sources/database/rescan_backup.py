@@ -19,7 +19,10 @@ exactly what the two review outcomes need:
   * ``removed_columns`` — per modified table, the columns gone from the source,
     so an APPROVE can drop them from the asset.
 
-Unchanged tables are never touched by a re-scan, so they are not recorded here.
+Unchanged tables are never touched by a re-scan, so they are not recorded here,
+with one exception: an approved table with no metadata that the re-scan sends
+back through enrichment is rewritten, so its approved form goes into
+``modified_backup`` too.
 This module is pure — it never touches S3, DataZone, or DynamoDB. Writing the
 blob and reading it back at approve/reject time is I/O and lives in the write
 path.
@@ -88,6 +91,7 @@ def build_rescan_backup(
     scan_job_sk: str,
     prior_summary: dict[str, Any] | None = None,
     orphaned_added_tables: Sequence[str] = (),
+    backfilled_tables: Sequence[str] = (),
 ) -> dict[str, Any]:
     """Build the re-scan backup blob from a computed diff and the accepted tables.
 
@@ -109,10 +113,21 @@ def build_rescan_backup(
             removed_tables (approve deletes) and added_tables (reject deletes) so
             either outcome reaps them. They are deliberately left out of
             merged_write_set, so the assets stay live until a review outcome.
+        backfilled_tables: table_ids of approved tables that had no metadata and
+            that this re-scan sends back through enrichment (see
+            ``rescan.needs_enrichment_backfill``). Their live asset is rewritten
+            with PENDING_REVIEW items, so their approved form goes into
+            ``modified_backup`` like a modified table's: a REJECT restores it, and
+            a later re-scan of the open review rebuilds its baseline from it. They
+            have no source-owned change, so the review diff shows none for them.
 
     Returns:
         A JSON-serializable dict (see the module docstring for the fields). Pure
         — performs no I/O.
+
+    Raises:
+        ValueError: a ``backfilled_tables`` id is not in ``accepted``, so there is
+            no approved form to back up for it.
     """
     accepted_by_id = {t.table_id: t for t in accepted}
 
@@ -129,6 +144,16 @@ def build_rescan_backup(
         removed = [col.name for col in change.columns if col.status == RescanColumnChangeStatus.REMOVED]
         if removed:
             removed_columns[change.table_id] = removed
+    for table_id in backfilled_tables:
+        if table_id in modified_backup:
+            continue
+        accepted_table = accepted_by_id.get(table_id)
+        if accepted_table is None:
+            # The caller rewrites this table's live asset with PENDING items, so
+            # without its approved form here a REJECT could not restore it. Fail
+            # before anything is overwritten rather than lose it silently.
+            raise ValueError(f"Backfilled table {table_id} is not among the accepted tables; cannot back it up")
+        modified_backup[table_id] = serialize_form(accepted_table)
 
     # Fold the prior re-scan's now-vanished added tables into BOTH lists so
     # either review outcome reaps them (approve deletes removed_tables, reject

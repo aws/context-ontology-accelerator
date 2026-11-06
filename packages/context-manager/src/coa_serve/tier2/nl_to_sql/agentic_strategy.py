@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import structlog
 from coa_common import ontology_vector_index_name
+from coa_common.constants import StructuredBackend
 
 from ...agents import SqlAgent
 from ...clients.base import GraphClient, QueryExecutor, VectorClient
@@ -124,6 +125,9 @@ class AgenticStrategy:
     """StructuredQueryStrategy: bounded tool-use agent over the serve clients."""
 
     name: str = StrategyOption.DEEP_REASONING
+    # Backends this strategy answers; the runner keeps it only for a namespace that
+    # has one of them (see StructuredQueryTier._strategies_for).
+    supported_backends: frozenset[StructuredBackend] = frozenset({StructuredBackend.SQL})
 
     def __init__(
         self,

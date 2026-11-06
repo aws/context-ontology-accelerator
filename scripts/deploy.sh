@@ -13,6 +13,9 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 #   SCL_PREFIX=myproj  make deploy-dev
 #   SCL_VPC_ID=vpc-abc SCL_AOSS_VPC_ENDPOINT_ID=vpce-0123456789abcdef0 make deploy-dev
 #     (an imported VPC needs its OpenSearch Serverless aoss-data endpoint)
+# CIDR for a NEW VPC (default 10.0.0.0/16; ignored-and-refused with SCL_VPC_ID;
+# never change it on an existing deployment — that replaces the VPC):
+#   SCL_VPC_CIDR=10.40.0.0/16 make deploy-dev
 # Custom domains (all-or-nothing — set all five or none):
 #   SCL_UI_DOMAIN, SCL_UI_CERT_ARN (us-east-1),
 #   SCL_API_DOMAIN, SCL_API_CERT_ARN (API region), SCL_HOSTED_ZONE_ID
@@ -33,6 +36,19 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # and how many walked tables it may append (default 8):
 #   SCL_NL2SQL_GRAPH_EXPAND=false make deploy-dev
 #   SCL_NL2SQL_GRAPH_EXPAND_MAX_TABLES=12 make deploy-dev
+# Deep-reasoning stop signals (all off by default; see deploying.md
+# "Deep-reasoning stop signals"). Confidence and similarity are 0-1 floats,
+# stability steps an int 1-20 (default 2), telemetry true/false (default false):
+#   SCL_DEEP_REASONING_SUFFICIENCY_MIN_CONFIDENCE=0.7 make deploy-dev
+#   SCL_DEEP_REASONING_PROGRESS_SIMILARITY_THRESHOLD=0.95 SCL_DEEP_REASONING_STABILITY_STEPS=2 make deploy-dev
+#   SCL_DEEP_REASONING_STOP_TELEMETRY=true make deploy-dev
+# OpenSearch Serverless capacity floor and ceiling in OCU (default 2 / 96; a
+# floor of 0 scales to zero when idle). Not persisted: set it on every deploy.
+#   SCL_AOSS_MIN_OCU=0 make deploy-dev
+#   SCL_AOSS_MAX_OCU=32 make deploy-dev
+# Graph sources (RDF_SPARQL: Neptune graphs queried directly). Off by default;
+# on/true/1/yes turns them on. Set it on EVERY deploy: an unset value turns them off.
+#   SCL_GRAPH_SOURCES=on make deploy-dev
 # SMUS admin principal(s) — required, comma-separated IAM role/user ARN(s)
 # that human admins federate into (e.g. your IAM Identity Center
 # permission-set role): SCL_SMUS_ADMIN_ARNS=arn:aws:iam::123456789012:role/... make deploy-dev
@@ -40,6 +56,7 @@ CONTEXT=(--context "env=$ENV")
 [ -n "${SCL_PREFIX:-}" ]        && CONTEXT+=(--context "resource_prefix=$SCL_PREFIX")
 [ -n "${SCL_PROJECT_TAG:-}" ]   && CONTEXT+=(--context "project_tag=$SCL_PROJECT_TAG")
 [ -n "${SCL_VPC_ID:-}" ]        && CONTEXT+=(--context "vpc_id=$SCL_VPC_ID")
+[ -n "${SCL_VPC_CIDR:-}" ]      && CONTEXT+=(--context "vpc_cidr=$SCL_VPC_CIDR")
 [ -n "${SCL_AOSS_VPC_ENDPOINT_ID:-}" ] && CONTEXT+=(--context "aoss_vpc_endpoint_id=$SCL_AOSS_VPC_ENDPOINT_ID")
 [ -n "${SCL_UI_DOMAIN:-}" ]     && CONTEXT+=(--context "ui_domain=$SCL_UI_DOMAIN")
 [ -n "${SCL_UI_CERT_ARN:-}" ]   && CONTEXT+=(--context "ui_cert_arn=$SCL_UI_CERT_ARN")
@@ -49,14 +66,23 @@ CONTEXT=(--context "env=$ENV")
 [ -n "${SCL_DB_SCAN_ENRICHMENT_TIMEOUT_MINUTES:-}" ] && CONTEXT+=(--context "dbScanEnrichmentTimeoutMinutes=$SCL_DB_SCAN_ENRICHMENT_TIMEOUT_MINUTES")
 [ -n "${SCL_TIER1_METRIC_TIMEOUT_SECONDS:-}" ] && CONTEXT+=(--context "tier1_metric_timeout_s=$SCL_TIER1_METRIC_TIMEOUT_SECONDS")
 [ -n "${SCL_DEEP_REASONING_TIME_BUDGET_SECONDS:-}" ] && CONTEXT+=(--context "deep_reasoning_time_budget_s=$SCL_DEEP_REASONING_TIME_BUDGET_SECONDS")
+[ -n "${SCL_DEEP_REASONING_SUFFICIENCY_MIN_CONFIDENCE:-}" ] && CONTEXT+=(--context "deep_reasoning_sufficiency_min_confidence=$SCL_DEEP_REASONING_SUFFICIENCY_MIN_CONFIDENCE")
+[ -n "${SCL_DEEP_REASONING_PROGRESS_SIMILARITY_THRESHOLD:-}" ] && CONTEXT+=(--context "deep_reasoning_progress_similarity_threshold=$SCL_DEEP_REASONING_PROGRESS_SIMILARITY_THRESHOLD")
+[ -n "${SCL_DEEP_REASONING_STABILITY_STEPS:-}" ] && CONTEXT+=(--context "deep_reasoning_stability_steps=$SCL_DEEP_REASONING_STABILITY_STEPS")
+[ -n "${SCL_DEEP_REASONING_STOP_TELEMETRY:-}" ] && CONTEXT+=(--context "deep_reasoning_stop_telemetry=$SCL_DEEP_REASONING_STOP_TELEMETRY")
 [ -n "${SCL_RESOLVE_TIMEOUT_SECONDS:-}" ] && CONTEXT+=(--context "resolve_timeout_s=$SCL_RESOLVE_TIMEOUT_SECONDS")
 [ -n "${SCL_NEPTUNE_INSTANCE_CLASS:-}" ] && CONTEXT+=(--context "neptune_instance_class=$SCL_NEPTUNE_INSTANCE_CLASS")
+[ -n "${SCL_AOSS_MIN_OCU:-}" ] && CONTEXT+=(--context "aoss_min_ocu=$SCL_AOSS_MIN_OCU")
+[ -n "${SCL_AOSS_MAX_OCU:-}" ] && CONTEXT+=(--context "aoss_max_ocu=$SCL_AOSS_MAX_OCU")
 [ -n "${SCL_LAMBDA_RESERVED_CONCURRENCY:-}" ] && CONTEXT+=(--context "lambda_reserved_concurrency=$SCL_LAMBDA_RESERVED_CONCURRENCY")
 [ -n "${SCL_GUARDRAIL_TIER:-}" ] && CONTEXT+=(--context "guardrail_tier=$SCL_GUARDRAIL_TIER")
 [ -n "${SCL_GUARDRAIL_PROFILE:-}" ] && CONTEXT+=(--context "guardrail_profile=$SCL_GUARDRAIL_PROFILE")
 [ -n "${SCL_NL2SQL_GRAPH_EXPAND:-}" ] && CONTEXT+=(--context "serve_nl2sql_graph_expand=$SCL_NL2SQL_GRAPH_EXPAND")
 [ -n "${SCL_NL2SQL_GRAPH_EXPAND_MAX_TABLES:-}" ] && CONTEXT+=(--context "serve_nl2sql_graph_expand_max_tables=$SCL_NL2SQL_GRAPH_EXPAND_MAX_TABLES")
 [ -n "${SCL_SMUS_ADMIN_ARNS:-}" ] && CONTEXT+=(--context "smus_admin_principal_arns=$SCL_SMUS_ADMIN_ARNS")
+[ -n "${SCL_GRAPH_SOURCES:-}" ] && CONTEXT+=(--context "graph_sources=$SCL_GRAPH_SOURCES")
+# SCL_SERVE_SPARQL_STRATEGY was replaced by SCL_GRAPH_SOURCES and is no longer read.
+[ -n "${SCL_SERVE_SPARQL_STRATEGY:-}" ] && echo "WARNING: SCL_SERVE_SPARQL_STRATEGY is no longer read; graph sources are now turned on with SCL_GRAPH_SOURCES=on." >&2
 # Optional: enables the OoPS! pitfall scan, which sends the serialised ontology to this endpoint.
 [ -n "${SCL_OOPS_ENDPOINT:-}" ] && CONTEXT+=(--context "oops_endpoint=$SCL_OOPS_ENDPOINT")
 

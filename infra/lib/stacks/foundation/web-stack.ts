@@ -13,6 +13,7 @@ import { RuntimeConfig } from "@coa/shared";
 import { SCLStack } from "../../constructs/scl-stack";
 import { resolveContext } from "../../context";
 import { fromRoot } from "../../paths";
+import { graphSourcesEnabled } from "../../utils/graph-sources";
 import { CustomDomainConfig } from "../../types";
 
 /**
@@ -48,6 +49,7 @@ export function buildRuntimeConfig(args: {
   serveRuntimeArn?: string;
   mcpRuntimeArn?: string;
   version?: string;
+  graphSourcesEnabled?: boolean;
 }): RuntimeConfig {
   const {
     region,
@@ -58,6 +60,7 @@ export function buildRuntimeConfig(args: {
     serveRuntimeArn,
     mcpRuntimeArn,
     version,
+    graphSourcesEnabled,
   } = args;
   return {
     region,
@@ -68,6 +71,8 @@ export function buildRuntimeConfig(args: {
     ...(serveRuntimeArn && { serveRuntimeArn }),
     ...(mcpRuntimeArn && { mcpRuntimeArn }),
     ...(version && { version }),
+    // Written only when on, so an off deployment's runtime-config is unchanged.
+    ...(graphSourcesEnabled === true && { graphSourcesEnabled }),
   };
 }
 
@@ -212,6 +217,7 @@ export class WebStack extends SCLStack {
       serveRuntimeArn: props.serveRuntimeArn,
       mcpRuntimeArn,
       version: readRepoVersion(),
+      graphSourcesEnabled: graphSourcesEnabled(this.node),
     });
 
     if (props.enablePrivateEndpoints) {

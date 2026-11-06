@@ -42,6 +42,10 @@ export interface InductionJob {
    * No new proposal is created in that case, so the client must redirect HERE
    * (not to the job id, which has no proposal row → 404). */
   duplicate_of?: string;
+  /** Set on a document-to-table bridge job (``bridge_to_tables``) once it
+   * completes. ``proposal_id`` names the pending proposal it created; it is
+   * absent when the run found nothing to change (no proposal row). */
+  bridge_report?: { proposal_id?: string } & Record<string, unknown>;
 }
 
 export interface Proposal {

@@ -235,6 +235,7 @@ async function deploy(): Promise<void> {
     discoveryOcspSecurityGroup: network.discoveryOcspSecurityGroup,
     ecsSecurityGroup: network.ecsSecurityGroup,
     authorizerSecurityGroup: network.authorizerSecurityGroup,
+    sparqlSourceEgressSecurityGroup: network.sparqlSourceEgressSecurityGroup,
   });
   const auth = new IdpAuthenticationStack(
     app,
@@ -550,7 +551,7 @@ async function deploy(): Promise<void> {
     agentCoreAzNames,
   });
   mcp.addDependency(serve); // needs CM runtime-arn SSM param
-  mcp.addDependency(auth); // needs /issuer, /userpool-client-id, /mcp-client-id SSM params
+  mcp.addDependency(auth); // needs /issuer, /mcp-client-id, /authentication-group-token-name SSM params
   // web reads ${ssmPrefix}/mcp/runtime-arn (published by mcp) to surface the MCP
   // endpoint in runtime-config.json for the console's MCP page (#1166). CDK can't
   // infer the ordering from valueForStringParameter, so declare it explicitly —

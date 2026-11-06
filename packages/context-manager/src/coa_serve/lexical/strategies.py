@@ -71,8 +71,9 @@ class RetrieverStrategy(StrEnum):
     ENTITY_NETWORK = "entity_network"
     TOPIC_BASED = "topic_based"
     TRAVERSAL = "traversal"
-    # TopicGraphRAG (graphrag-lexical-graph 3.18.7, PR #318). Unlike the seven above
-    # it is constructed as the engine's retriever directly (engine_family="direct"),
+    # TopicGraphRAG (graphrag-lexical-graph PR #318, introduced 3.18.7; pinned 3.20.0).
+    # Unlike the seven above it is constructed as the engine's retriever directly
+    # (engine_family="direct"),
     # and it REQUIRES a populated ``topic`` vector index — ingests before the
     # chunk,topic index change (EMBEDDING_INDEXES in kg-build) have no topic vectors and
     # it will seed empty. Registered so the agentic ToolRegistry can expose it as an
@@ -149,7 +150,7 @@ class StrategySpec:
 # those knobs would be inert. Topic-beam-specific knobs are likewise omitted —
 # TopicBeamSearch is not in the pinned toolkit release yet.
 #
-# Deviations from the installed 3.18.7 defaults: ``max_search_results`` (5 → 10,
+# Deviations from the installed 3.20.0 defaults: ``max_search_results`` (5 → 10,
 # per the benchmark config) and ``vss_top_k`` (10 → 20, a deliberate recall-widening
 # override above the benchmarked 10 — surfaces more seed chunks to the beam /
 # statement expansion). The rest re-assert current defaults so a toolkit upgrade
@@ -401,7 +402,7 @@ def _build_traversal_engine(graph_store, vector_store, *, tenant_id):
 
 
 def _build_topic_beam_engine(graph_store, vector_store, *, tenant_id):
-    """``topic_beam``: TopicGraphRAG via TopicBeamSearch (graphrag 3.18.7, PR #318).
+    """``topic_beam``: TopicGraphRAG via TopicBeamSearch (graphrag PR #318, introduced 3.18.7; pinned at 3.20.0).
 
     Constructed as the engine's retriever directly (``LexicalGraphQueryEngine(...,
     retriever=...)``), matching how the graphrag-toolkit benchmark builds it
@@ -416,7 +417,7 @@ def _build_topic_beam_engine(graph_store, vector_store, *, tenant_id):
 
     Params are the graphrag-toolkit
     benchmark's best SEC-10-Q config (``topic-beam-chunk_only``, 45.6% — the top
-    toolkit retriever on this dataset), restricted to the kwargs 3.18.7's
+    toolkit retriever on this dataset), restricted to the kwargs 3.20.0's
     ``TopicBeamSearch.__init__`` actually accepts (verified against the pinned source;
     the benchmark's extra v2 kwargs — use_mmr / cross_doc / entity_seed_boost — are
     from an unreleased graphrag and would be silently swallowed by ``**kwargs``, so

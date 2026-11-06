@@ -217,7 +217,11 @@ async function handleUpdate(
 
   // GetAssetType can briefly lag the create; retry a few times before failing.
   let after = await pinnedFormRevision(params);
-  for (let attempt = 0; attempt < 3 && after?.formRevision !== params.formRevision; attempt++) {
+  for (
+    let attempt = 0;
+    attempt < 3 && after?.formRevision !== params.formRevision;
+    attempt++
+  ) {
     await new Promise((resolve) => setTimeout(resolve, 2000 * (attempt + 1)));
     after = await pinnedFormRevision(params);
   }

@@ -32,6 +32,8 @@ class StopReason(StrEnum):
     sufficiency_check_timeout = "sufficiency_check_timeout"
     time_budget_expired = "time_budget_expired"
     queue_drained = "queue_drained"
+    # The working answer stopped changing (single-call answer-stability signal).
+    answer_stable = "answer_stable"
 
 
 @dataclass(frozen=True)
@@ -105,3 +107,61 @@ class PlannerDecision:
     inputs: dict[str, Any] = field(default_factory=dict)
     reasoning: str = ""
     is_ad_hoc: bool = False
+
+
+@dataclass(frozen=True)
+class StopSignalConfig:
+    """Service-scoped settings for the deep-reasoning early-stop signals.
+
+    Built once from ``ServiceConfig`` at startup and passed by constructor to the
+    planner and the controller (never stored on the per-request context, so a
+    sub-question fork cannot drop it). The defaults turn every signal off.
+
+    Attributes:
+        min_confidence: Planner confidence a "that is enough" stop needs (0 = no bar).
+        similarity_threshold: Working-answer cosine at which a step counts as
+            stable (0 = signal off).
+        stability_steps: Stable steps in a row that stop the loop.
+        telemetry: Record the per-reply stop signals even with both thresholds at 0.
+    """
+
+    min_confidence: float = 0.0
+    similarity_threshold: float = 0.0
+    stability_steps: int = 2
+    telemetry: bool = False
+
+    @property
+    def elicit(self) -> bool:
+        """Whether the planner prompts ask for the stop signals (confidence, working answer)."""
+        return self.min_confidence > 0 or self.similarity_threshold > 0 or self.telemetry
+
+
+@dataclass(frozen=True)
+class ReplySignals:
+    """The stop signals the planner parsed from one reply (``ctx.last_stop_signals``).
+
+    The controller clears the carrier before every planner call, and the planner
+    writes it only after a parsed reply while the stop signals are elicited, so
+    ``None`` always means "no signal" (a failed call, a fake planner, no tools).
+
+    Attributes:
+        confidence: The reported probability, in ``[0, 1]``, that the content
+            gathered so far answers every part of the question; ``None`` when it
+            was missing or not a plain number in range.
+        working_answer: The reply's grounded best answer (``""`` when absent).
+        repaired: The reply came from the parse-repair turn.
+        reply_chars: Length of the reply text the signals were parsed from.
+    """
+
+    confidence: float | None = None
+    working_answer: str = ""
+    repaired: bool = False
+    reply_chars: int = 0
+
+
+# What counts as a "named term" in a question (options.entityRouting): shared by the
+# term extraction, the find_documents tool description and the planner guidance.
+NAMED_TERM_KINDS = (
+    "specific identifiers (account or record numbers, ids), people, document or message "
+    "subjects, product features, systems, field or table names, and short quoted phrases"
+)

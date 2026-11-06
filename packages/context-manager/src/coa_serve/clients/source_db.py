@@ -278,7 +278,7 @@ class SourceDBQueryExecutor:
             return {"status": "error", "detail": "DDB connectivity check failed"}
 
     def _validate_namespace(self, namespace: str) -> None:
-        if not _NAMESPACE_PATTERN.match(namespace):
+        if not _NAMESPACE_PATTERN.fullmatch(namespace):
             raise ValueError(f"Invalid namespace format: {namespace!r}")
 
     async def _get_connection(self, namespace: str, data_source_id: str) -> tuple[EngineAdapter, ConnHandle, str, str]:

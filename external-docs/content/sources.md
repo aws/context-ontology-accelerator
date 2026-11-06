@@ -45,6 +45,7 @@ flowchart LR
 | Databricks | `DATABRICKS_SQL_WAREHOUSE` | Databricks SQL Warehouse — nothing to deploy, the connector is operated for you | Athena only (Lambda-backed catalog) |
 | Custom connector | `CUSTOM_CONNECTOR` | Databricks SQL Warehouse, deployed and operated by you from `connectors/databricks/` | Athena only (Lambda-backed catalog) |
 | Custom connector | `CUSTOM_CONNECTOR` | Any other source you can wrap in an Athena Query Federation SDK connector Lambda | Athena only (Lambda-backed catalog) |
+| Graph (SPARQL) | `RDF_SPARQL` | Amazon Neptune | Direct SPARQL against the source's endpoint — see [Registering an RDF/SPARQL Graph Source](#registering-an-rdfsparql-graph-source) |
 
 !!! tip "Sources with no native support"
     For a source none of the rows above covers — SAP, a mainframe, an internal
@@ -461,6 +462,179 @@ Create calls are retry-safe with an optional `clientToken` — see [Retrying Cre
     and create it again against the new target. Echoing the stored values back is
     allowed, so other fields in the blob stay editable.
 
+## Registering an RDF/SPARQL Graph Source
+
+A graph source (`RDF_SPARQL`) connects an RDF store whose instance data already
+lives as triples. Questions about it are answered by NL→SPARQL run directly
+against the store's endpoint — no Athena catalog, no VKG, no SQL.
+
+Graph sources are **off by default**: a deployment accepts them only when it is deployed with `SCL_GRAPH_SOURCES=on` (see [Deploying](deploying.md#graph-sources)). Otherwise the API refuses to register or re-verify one, and the console does not offer it.
+
+A graph source is **bring your own ontology**. There is nothing to discover,
+enrich or review: registration only verifies that the endpoint is reachable, and
+the classes come from an ontology you upload separately that names this source.
+
+```mermaid
+flowchart LR
+    A[Register Source] --> B[Reachability Verify]
+    B --> C[Approved Source]
+    D[Upload Ontology<br/>naming the source] --> E[Graph-bound Classes]
+    C --> F[NL→SPARQL]
+    E --> F
+
+    style A fill:#1f77b4,color:#fff
+    style F fill:#2ca02c,color:#fff
+```
+
+### Prerequisites
+
+- **An Amazon Neptune cluster in the deployment's AWS account and region.** A cluster
+  in another region or account is refused when the source is verified, before any request is sent
+  to it. Neptune is the only engine today.
+- **IAM database authentication enabled on the cluster.** Verify refuses a cluster
+  without it.
+- **A grant that reaches the source.** A caller whose grant declares a
+  `tableAllowlist` reads the graph source only if the list names the source's id
+  (`sourceId`); an empty list reads no graph source. A grant without a
+  `tableAllowlist` is not restricted. A grant's `columnDenylist` can also deny
+  predicates of a graph source; see [Denying predicates of a graph source](#denying-predicates-of-a-graph-source).
+  See [Role & Permission Management](role-permission-management.md).
+- **A network path from the COA VPC to the cluster on port 8182** — the same VPC,
+  peering, or a transit gateway, with the cluster's security group allowing ingress
+  on 8182. Only port 8182 is accepted. See [Cross-Network Connectivity](cross-network-connectivity.md).
+- **One namespace per cluster.** Verify claims the cluster for the namespace that
+  registers it; another namespace's source on the same cluster (by any of its
+  writer, reader or custom endpoints) is refused.
+- **Not the platform's own Neptune cluster.** It holds every namespace's ontology,
+  and its default graph is their union, so a source pointing at it is refused at
+  verify time.
+- **Graph sources turned on** for the deployment (`SCL_GRAPH_SOURCES=on`); they are off by default.
+  See [Graph sources](deploying.md#graph-sources).
+
+There are no IAM roles or policies to create on your side. Requests are SigV4-signed
+with COA's own roles, which are granted `neptune-db:GetEngineStatus` (verify) and
+`neptune-db:ReadDataViaQuery` (serve) on every Neptune cluster in the deployment's
+own account and region. So any cluster there with IAM database authentication can be
+registered as a graph source, and the first namespace whose source on it passes
+verify claims it. Keep clusters whose data no namespace should read in another
+account or region. Every generated query passes the read-only SPARQL firewall before
+it runs.
+
+### Denying predicates of a graph source
+
+A grant's `columnDenylist` stops a caller from reading some predicates of a graph
+source, the way it stops a SQL caller from reading some columns:
+
+```json
+"columnDenylist": {
+  "src-1a2b3c": ["https://example.com/ontology#ssn", "https://example.com/ontology#salary"]
+}
+```
+
+- **Key the entry by the source's id** (`sourceId`), not its name. An entry for a
+  graph source keyed by its name, or by `*`, is refused rather than ignored: the
+  source answers nothing for that caller until the entry is keyed by its id.
+- **List full predicate IRIs** (`http://`, `https://` or `urn:`), exactly as the
+  ontology spells them. A prefixed name such as `ex:ssn`, or any other value, can't
+  be matched to a predicate, so the source answers nothing for that caller.
+- **The schema the model sees leaves the denied predicates out**, and a generated
+  query that names one is refused, wherever it names it.
+- **A query that could read a predicate it doesn't name is refused too** while any
+  predicate is denied: a variable in the predicate position (`?s ?p ?o`) or a
+  negated property set (`!ex:name`).
+
+A grant without a `columnDenylist` entry for the source is not restricted by it.
+
+### Register via API
+
+Create via `POST /namespaces/{namespaceId}/sources` with `sourceType: "DATABASE"`
+and a `databaseSource.sparqlConfiguration` body — providing `sparqlConfiguration`
+selects the `RDF_SPARQL` sub-type. See **CreateSource** in the
+[API Reference](#/api-reference) for the full request schema and response.
+
+```json
+{
+  "sourceType": "DATABASE",
+  "databaseSource": {
+    "name": "orders-knowledge-graph",
+    "sparqlConfiguration": {
+      "dataEndpoint": "orders-kg.cluster-abc123.us-east-1.neptune.amazonaws.com",
+      "dataNamedGraph": "https://example.com/graphs/orders-kg"
+    }
+  }
+}
+```
+
+### Register via Web UI
+
+1. Navigate to **Sources** within your namespace
+2. Click **Connect source**
+3. Select **Graph database (SPARQL)**
+4. Enter a name, the SPARQL endpoint, and optionally the region, port and named graph
+5. Click **Connect source** — the source is verified in the background
+
+### SPARQL Configuration Fields
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `dataEndpoint` | **Yes** | SPARQL endpoint for the instance data: a Neptune cluster, reader or custom endpoint (`db.cluster-x.us-east-1.neptune.amazonaws.com`, `db.cluster-ro-x…`, `db.cluster-custom-x…`) of a cluster in this account and region, as a bare host or an `https://` URL with an optional path. Instance endpoints and IP addresses are refused. 1–512 chars |
+| `store` | No | SPARQL engine. Only `neptune`, the default |
+| `region` | No | AWS region used for SigV4 signing. Defaults to the deployment region |
+| `port` | No | Endpoint port. Must be `8182`, the default |
+| `dataNamedGraph` | No | Absolute `http(s)` IRI of the named graph holding the data. When set, every generated query is confined to that graph; when absent, the store's default graph is queried |
+| `authMode` | No | Authentication mode. Only `sigv4`, the default |
+| `credentialSecretArn` | No | Reserved for future non-SigV4 modes. **Rejected** for `neptune` |
+
+### Verification
+
+A graph source has no scan. Creating it writes the record as `REGISTERED` and
+not queryable, then a verify calls Neptune's `GetEngineStatus` on the endpoint:
+
+| Result | Status | `queryable` |
+|--------|--------|-------------|
+| Reachable and authorized | `APPROVED` | `true` |
+| Unreachable, access denied, invalid configuration, or the platform cluster | `SCAN_FAILED` (`errorMessage` says why) | `false` |
+
+`POST .../sources/{sourceId}/rescan` re-runs the verify — use it after fixing a
+network or permission problem. A scheduled re-scan re-verifies the same way. A
+source that is already serving stays queryable while it is re-verified.
+
+| Current status | Re-verify |
+|----------------|-----------|
+| `APPROVED` or `SCAN_FAILED` | Runs the verify again (`202`). |
+| `REGISTERED`, unchanged for more than 15 minutes | Runs the verify again (`202`). Its first verify was lost, for example because graph sources were turned off before it ran. |
+| `REGISTERED`, more recently | `409 Conflict`: its verify is still on the way. |
+
+While graph sources are turned off in the deployment, re-verify returns `400`
+naming the switch, whatever the status. A verify proves the endpoint answers; it does not prove
+the namespace can answer graph questions, which also needs the ontology below.
+
+### Binding an ontology to the source
+
+The source answers questions only for classes that name it. In the ontology you
+upload (see [Ontologies](ontologies.md)), give each graph-backed class a
+`coa_import:dataSourceName` with the source's `name`:
+
+```turtle
+@prefix coa_import: <http://coa.amazon.com/vocab/coa_import#> .
+
+graph:Household a owl:Class ;
+    rdfs:label "Household" ;
+    coa_import:dataSourceName "orders-knowledge-graph" .
+```
+
+On upload the name is resolved to the source and the class is marked as answered
+by it; the directive itself is not stored. The upload is rejected with **422**,
+listing every problem, when a name does not match exactly one `RDF_SPARQL` source
+in the namespace, when a class names more than one source, or when the directive
+is on something that is not a named `owl:Class`.
+
+!!! tip "Keep each graph class in one module"
+    Declare a graph-backed class, its labels and the properties whose domain it is
+    in a single uploaded ontology. The query context is assembled per ontology, so
+    a property declared in a different module from its class is not offered to the
+    query writer.
+
 ## Monitoring Scans
 
 After registering a source, a scan pipeline runs automatically. Monitor its progress:
@@ -487,6 +661,10 @@ A first scan ends in `PENDING_REVIEW`. A re-scan of an already-approved source
 ends in `RESCAN_REVIEW` instead, so the two are easy to tell apart: the first
 means "nothing here has been reviewed yet", the second means "this was approved
 before, and something has changed since".
+
+A graph source (`RDF_SPARQL`) has no scan: it goes from `REGISTERED` straight to
+`APPROVED` or `SCAN_FAILED` when its verify finishes (see
+[Verification](#verification)).
 
 ### Poll Source Status
 
@@ -521,7 +699,7 @@ If you don't need AI-generated metadata and want faster scans, disable enrichmen
 { "metadataEnrichmentEnabled": false }
 ```
 
-The source transitions `SCANNING → PENDING_REVIEW` directly, skipping the `ENRICHING` phase. You can toggle `metadataEnrichmentEnabled` later (see "Updating Source-Level Metadata" below), then re-scan the source to run enrichment over it (see "Triggering Re-scans" below). Note that a re-scan only regenerates metadata for items still pending review — anything you have already approved keeps the metadata you approved.
+The source transitions `SCANNING → PENDING_REVIEW` directly, skipping the `ENRICHING` phase. You can toggle `metadataEnrichmentEnabled` later (see "Updating Source-Level Metadata" below), then re-scan the source to run enrichment over it (see "Triggering Re-scans" below). A re-scan generates metadata for items still pending review and for approved tables that have no metadata at all (see "What Happens on Re-scan"). Anything else you have already approved keeps the metadata you approved.
 
 ### Language of Generated Metadata
 
@@ -721,11 +899,13 @@ jobs, depending on the status the source is in when you call it:
 | Current status | What a re-scan does |
 |----------------|---------------------|
 | `SCAN_FAILED` | **Recovery.** Retries the scan that failed. Treated as a first scan, so it ends in `PENDING_REVIEW`. |
-| `APPROVED` | **Schema drift.** Picks up changes made to the source since you approved it. Ends in `RESCAN_REVIEW` for you to review the changes. |
+| `APPROVED` | **Schema drift.** Picks up changes made to the source since you approved it, and generates metadata for approved tables that have none. Ends in `RESCAN_REVIEW` for you to review the changes, or straight back in `APPROVED` when there is nothing to review. |
 | `RESCAN_REVIEW` | **Redo the drift check.** Re-runs discovery and rebuilds the diff, for when the source changed again mid-review. |
 
 Calling re-scan on a database source in any other status returns a
-`409 Conflict` naming the statuses that are allowed.
+`409 Conflict` naming the statuses that are allowed. For a graph source
+(`RDF_SPARQL`), re-scan re-runs its reachability verify instead and never ends in a
+review; see [Verification](#verification) for the statuses it is allowed from.
 
 !!! tip "Automatic re-scans"
     Instead of calling re-scan by hand, a database source can re-scan itself:
@@ -754,11 +934,28 @@ Calling re-scan on a database source in any other status returns a
 1. The source moves to `SCANNING` and the pipeline restarts.
 2. Discovery, federation (JDBC only), and AI enrichment run again.
 3. Your edits are preserved (see the metadata priority hierarchy above), and
-   enrichment only regenerates items still pending review.
+   enrichment only regenerates items still pending review, with one exception
+   described below.
 4. A recovery re-scan ends in `PENDING_REVIEW`. A drift re-scan of an approved
    source ends in `RESCAN_REVIEW` instead.
 
-Re-scanning while a re-scan review is **already open** is the one exception to
+**Approved tables with no metadata.** When enrichment is on, a re-scan of an
+approved source also sends back through enrichment every approved table that
+has no description, synonyms, glossary terms or tags at table level, no
+steward edit, and no primary key other than one discovered from the database
+itself. (Enrichment would replace any other key, such as one from a
+third-party catalog, so a table with such a key is left as it is.) This covers
+tables approved while enrichment was off and tables an earlier enrichment run
+failed on. The table and its columns that have no metadata go back to *Pending
+review* with the new AI metadata, and the source ends in `RESCAN_REVIEW`, so you
+review them as after a first scan. Columns of such a table that already have
+metadata keep it. A table that has any table-level metadata is left exactly as
+it is, even if some of its columns are empty; fill those columns by hand.
+Rejecting the re-scan restores these tables to their approved, empty state.
+A source in `PENDING_REVIEW` cannot be re-scanned; approve it first, then
+re-scan.
+
+Re-scanning while a re-scan review is **already open** is the other exception to
 step 3. That path compares against the last state you *approved*, so any review
 decisions or edits you made inside the open review are discarded. Tables and
 columns you approved earlier are unaffected. Because this loses work, the API
@@ -791,6 +988,9 @@ with the change counts in its header. It groups the differences into:
 Special cases get called out rather than shown as an empty diff:
 
 - A table the re-scan found for the first time shows a **New table** note.
+- An approved table that had no metadata and was enriched again shows no
+  changes panel, because its structure did not change. Its new metadata is
+  *Pending review*.
 - A table that has disappeared from the source shows a **Dropped table** panel,
   warning that it will be deleted when you approve unless you keep it.
 
@@ -942,11 +1142,18 @@ guide (`connectors/README.md`) covers each in more depth.
 
 Upload files directly through the web app:
 
-1. Navigate to your namespace → **Sources** → **Connect Source**
-2. Select **Documents** source type
-3. Click **Get Upload URLs** to obtain pre-signed S3 URLs
-4. Upload files (PDF, TXT, DOCX, HTML — max 50MB per file)
-5. Click **Create Source** — files are preprocessed and ingested into the knowledge graph
+1. Navigate to your namespace → **Sources** → **Connect source**
+2. Select the **Documents** source type
+3. On the **Upload files** tab, choose up to 100 files in `.pdf`, `.docx`, `.txt` or `.md` format. The
+   console rejects a file whose type it does not recognise. Use `.md` for Markdown: a `.markdown` file is
+   accepted by the console but skipped during preprocessing
+4. Click **Connect source**. The console requests pre-signed upload URLs, uploads the files and
+   creates the source; the files are then preprocessed and ingested into the knowledge graph
+
+Files are limited to 200 MB each by default. The console does not check the size: a larger file
+uploads, then is skipped during preprocessing. There is no deploy-time setting for the limit. To
+change it, edit `DEFAULT_MAX_FILE_SIZE_MB` in `infra/lib/constants.ts` and the copy in
+`libs/common/src/coa_common/constants.py`, then redeploy the `<prefix>-<env>-sources` stack.
 
 ### Via the API
 
@@ -957,8 +1164,11 @@ Creating a document source from local files is a three-call sequence — see
 [Retrying Creates Safely](namespaces.md#retrying-creates-safely)):
 
 1. `POST /namespaces/{namespaceId}/sources/upload-urls` with the list of
-   files (`fileName`, `contentType`) to get back a pre-signed S3 URL per file,
-   plus a server-issued `uploadId` for the session.
+   files (`filename`, `contentType`) to get back a pre-signed S3 URL per file,
+   plus a server-issued `uploadId` for the session. A `contentType` other than
+   `application/pdf`, the `.docx` type, `text/plain` or `text/markdown` returns
+   `400`, as does a request for more than 100 files. The filename must end in `.pdf`, `.docx`, `.txt`
+   or `.md`: other extensions are accepted here but skipped during preprocessing.
 2. `PUT` each file's bytes directly to its pre-signed URL.
 3. `POST /namespaces/{namespaceId}/sources` with `sourceType: "DOCUMENTS"` and
    the `uploadId` returned in step 1, to create the source and kick off
@@ -1040,6 +1250,18 @@ After creation, documents go through:
 2. **Entity extraction** — identifies concepts and relationships from text
 3. **Knowledge graph build** — creates nodes/edges in Neptune
 4. **Embedding** — vectorizes chunks for semantic search in OpenSearch
+
+Entity extraction runs via **Amazon Bedrock batch inference by default** (it
+falls back to real-time inference only when no batch-inference role is
+configured). Compared with real-time calls, batch jobs are queued
+asynchronously, so expect ingestion of small corpora to take longer while
+costing less per token. Intermediate batch input/output files are written to
+the sources bucket under `<namespace>/batch-inference/<docSourceId>/` during the
+run.
+
+Once processing finishes, you can turn the extracted knowledge graph into a
+formal ontology with
+[unstructured induction](ontologies.md#unstructured-induction-documents).
 
 ### Language of Extracted Content
 

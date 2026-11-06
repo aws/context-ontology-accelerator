@@ -4,7 +4,8 @@
 """Deletion Pipeline — Stage 1: S3 Cleanup Lambda.
 
 Invoked by the deletion Step Functions state machine.
-Removes S3 objects (raw + staging) for the doc source.
+Removes all S3 objects for the doc source: raw (upload sources), staging,
+scan-results diagnostics, and Bedrock batch-inference input/output.
 
 The DynamoDB record is deleted by the state machine itself (as a final
 DynamoDeleteItem task) after all stages succeed, so that the record
@@ -100,6 +101,14 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     scan_results_prefix = f"{namespace_id}/scan-results/{doc_source_id}/"
     scan_results_deleted = _delete_s3_prefix(bucket_name, scan_results_prefix)
 
+    # Bedrock batch-inference input/output written by kg-build when batch
+    # inference is used (now the default): {namespaceId}/batch-inference/{docSourceId}/
+    # (BatchConfig.key_prefix in graph_build.py). The input JSONL and model output
+    # are copies of the customer's extracted document text, so they must not
+    # outlive the source — DeleteSource promises to remove all associated data.
+    batch_inference_prefix = f"{namespace_id}/batch-inference/{doc_source_id}/"
+    batch_inference_deleted = _delete_s3_prefix(bucket_name, batch_inference_prefix)
+
     logger.info(
         "s3_cleanup_complete",
         namespace_id=namespace_id,
@@ -107,6 +116,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         raw_deleted=raw_deleted,
         staging_deleted=staging_deleted,
         scan_results_deleted=scan_results_deleted,
+        batch_inference_deleted=batch_inference_deleted,
     )
 
     return {
@@ -116,4 +126,5 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         "raw_objects_deleted": raw_deleted,
         "staging_objects_deleted": staging_deleted,
         "scan_results_objects_deleted": scan_results_deleted,
+        "batch_inference_objects_deleted": batch_inference_deleted,
     }

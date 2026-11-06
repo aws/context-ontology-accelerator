@@ -16,6 +16,8 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 import pytest
+from coa_common.constants import StructuredBackend
+from coa_serve.clients.opensearch import _SOURCE_FIELDS
 
 
 def _client(**aoss_attrs):
@@ -224,21 +226,57 @@ class TestSearchDelegation:
             {"exists": {"field": "data_source_id"}},
         ]
 
+    async def test_ontology_ids_adds_terms_filter(self):
+        client, aoss = _client(knn_search=[])
+        await client.search([0.1] * 8, top_k=5, entity_type="class", ontology_ids=["https://ex.org/up"])
+        assert aoss.knn_search.call_args.kwargs["filters"] == [
+            {"term": {"entity_type": "class"}},
+            {"terms": {"ontology_id": ["https://ex.org/up"]}},
+        ]
+
     async def test_no_filters_passes_none(self):
         client, aoss = _client(knn_search=[])
         await client.search([0.1] * 8, top_k=7)
         assert aoss.knn_search.call_args.kwargs["filters"] is None
         assert aoss.knn_search.call_args.kwargs["top_k"] == 7
 
-    async def test_count_documents_delegates_with_filters(self):
-        client, aoss = _client(count=3)
-        n = await client.count_documents(index="ont-idx", entity_type="class", require_mapped=True)
-        assert n == 3
-        assert aoss.count.call_args.args[0] == "ont-idx"
-        assert aoss.count.call_args.kwargs["filters"] == [
+
+@pytest.mark.unit
+class TestQueryBackendFilter:
+    """Absent query_backend == SQL; graph documents are matched on keyword or .keyword."""
+
+    _IS_GRAPH = [
+        {"term": {"query_backend": "RDF_SPARQL"}},
+        {"term": {"query_backend.keyword": "RDF_SPARQL"}},
+    ]
+
+    async def test_rdf_sparql_backend_requires_the_graph_marker(self):
+        client, aoss = _client(knn_search=[])
+        await client.search([0.1] * 8, entity_type="class", query_backend=StructuredBackend.RDF_SPARQL)
+        assert aoss.knn_search.call_args.kwargs["filters"] == [
             {"term": {"entity_type": "class"}},
-            {"exists": {"field": "data_source_id"}},
+            {"bool": {"should": self._IS_GRAPH, "minimum_should_match": 1}},
         ]
+
+    async def test_sql_backend_excludes_graph_documents_and_keeps_unmarked_ones(self):
+        client, aoss = _client(knn_search=[])
+        await client.search([0.1] * 8, query_backend=StructuredBackend.SQL)
+        assert aoss.knn_search.call_args.kwargs["filters"] == [{"bool": {"must_not": self._IS_GRAPH}}]
+
+    async def test_hit_metadata_carries_query_backend(self):
+        client, _ = _client(
+            knn_search=[
+                {"_id": "g", "text": "Ticket", "data_source_id": "src-g", "query_backend": "RDF_SPARQL"},
+                {"_id": "s", "text": "Order", "data_source_id": "ds-s"},
+            ]
+        )
+        graph_hit, sql_hit = await client.search([0.1] * 8)
+        assert graph_hit.metadata["query_backend"] == "RDF_SPARQL"
+        assert graph_hit.metadata["data_source_id"] == "src-g"
+        assert sql_hit.metadata["query_backend"] == ""
+
+    def test_projection_requests_query_backend(self):
+        assert "query_backend" in _SOURCE_FIELDS
 
 
 @pytest.mark.unit

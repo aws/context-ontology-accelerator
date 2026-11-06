@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 import structlog.testing
-from coa_serve.clients.base import ConverseResult, VectorHit
+from coa_serve.clients.base import ConverseResult, VectorClient, VectorHit
 from coa_serve.tier2.nl_to_sql.sql_generator import (
     DEFAULT_MAX_TABLES,
     DEFAULT_RETRIEVAL_K,
@@ -41,13 +41,11 @@ def mock_llm():
 
 @pytest.fixture
 def mock_vector():
-    vector = AsyncMock()
-    # generate() gates retrieval on count_documents(require_mapped=True): a
-    # positive count means the namespace has mapped classes, so search() is
-    # called with require_mapped=True and AOSS returns only mapped classes
-    # server-side. The fixture returns two mapped classes and reports a
-    # non-zero mapped count.
-    vector.count_documents.return_value = 2
+    # spec: a call to a method VectorClient no longer has (e.g. a re-added
+    # count_documents probe) fails loudly instead of returning a mock.
+    vector = AsyncMock(spec=VectorClient)
+    # generate() always searches with require_mapped=True, so AOSS returns only
+    # R2RML-mapped classes server-side. The fixture returns two mapped classes.
     vector.search.return_value = [
         VectorHit(
             id="1",
@@ -98,16 +96,10 @@ class TestSQLGeneratorGenerate:
         mock_vector.search.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_mapped_gate_applied_when_namespace_has_mapped_classes(self, generator, mock_vector):
-        """When count_documents reports ≥1 mapped class, search() is called with
-        require_mapped=True (server-side gate) and exactly retrieval_k — no
-        over-fetch, no client-side filtering."""
+    async def test_mapped_gate_always_applied(self, generator, mock_vector):
+        """search() is called with require_mapped=True (server-side gate) and
+        exactly retrieval_k — no over-fetch, no client-side filtering."""
         await generator.generate("How many orders?", namespace="demo")
-
-        mock_vector.count_documents.assert_awaited_once()
-        count_kwargs = mock_vector.count_documents.call_args.kwargs
-        assert count_kwargs["require_mapped"] is True
-        assert count_kwargs["entity_type"] == "class"
 
         search_kwargs = mock_vector.search.call_args.kwargs
         assert search_kwargs["require_mapped"] is True
@@ -115,24 +107,27 @@ class TestSQLGeneratorGenerate:
         assert search_kwargs["top_k"] == DEFAULT_RETRIEVAL_K  # exact top-k, no over-fetch
 
     @pytest.mark.asyncio
-    async def test_legacy_namespace_drops_mapped_gate(self, generator, mock_vector):
-        """A namespace with ZERO mapped records (pre-marker / legacy) must fall
-        back to an UNFILTERED search so its classes stay visible to Tier-2 —
-        mirrors the T-Box isMapped legacy bridge."""
-        mock_vector.count_documents.return_value = 0  # legacy namespace
-        # search() then returns whatever the (unfiltered) k-NN finds.
-        mock_vector.search.return_value = [
-            VectorHit(id="1", text="Table: orders | Columns: id (int)", score=0.9, metadata={"entity_type": "class"}),
-        ]
-        result = await generator.generate("How many orders?", namespace="legacy-ns")
+    async def test_graph_classes_are_excluded_from_retrieval(self, generator, mock_vector):
+        """Graph (RDF_SPARQL) classes carry a data_source_id too: retrieving them would
+        hand the SQL writer a class with no table behind it."""
+        from coa_common.constants import StructuredBackend
 
-        assert result.error is None
-        assert "orders" in result.retrieved_tables
-        search_kwargs = mock_vector.search.call_args.kwargs
-        assert search_kwargs["require_mapped"] is False  # gate dropped
-        retrieve_step = next(s for s in result.trace_steps if s["step"] == "retrieve")
-        assert retrieve_step["mapped_gate"] is False
-        assert retrieve_step["mapped_count"] == 0
+        await generator.generate("How many orders?", namespace="demo")
+        assert mock_vector.search.call_args.kwargs["query_backend"] is StructuredBackend.SQL
+
+    @pytest.mark.asyncio
+    async def test_namespace_without_mapped_classes_writes_no_sql(self, generator, mock_vector, mock_llm):
+        """#1448: a namespace with no R2RML-mapped class (e.g. only document-induced
+        classes, structured proposal not yet accepted) retrieves nothing through the
+        gated search and must NOT fall back to an unfiltered search that would hand
+        unmapped classes to the SQL writer as tables."""
+        mock_vector.search.return_value = []  # the gated search finds no mapped class
+        result = await generator.generate("What is the inspection interval?", namespace="docs-only")
+
+        assert result.error == "no_tables_retrieved"
+        mock_vector.search.assert_awaited_once()
+        assert mock_vector.search.call_args.kwargs["require_mapped"] is True
+        mock_llm.converse.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_no_classes_retrieved_yields_no_tables(self, generator, mock_vector):
@@ -145,7 +140,7 @@ class TestSQLGeneratorGenerate:
 
     @pytest.mark.asyncio
     async def test_retrieve_logs_hit_counts(self, generator, mock_vector):
-        """The retrieve step logs the mapped gate + kept-hit accounting so a
+        """The retrieve step logs kept-hit accounting so a
         chronically dark namespace is visible in logs. Uses
         structlog.testing.capture_logs (this package does not configure caplog)."""
         import structlog
@@ -154,8 +149,6 @@ class TestSQLGeneratorGenerate:
             await generator.generate("q", namespace="ns")
         rec = next((e for e in logs if e.get("event") == "nl_to_sql_retrieve_hits"), None)
         assert rec is not None
-        assert rec["mapped_gate"] is True
-        assert rec["mapped_count"] == 2
         assert rec["kept"] == 2
 
     @pytest.mark.asyncio
@@ -909,6 +902,117 @@ class TestSQLGeneratorDialect:
         assert "PostgreSQL" not in system_prompt
 
 
+def _gate(vector, hits: list[VectorHit]) -> None:
+    """Make ``vector.search`` honour its filters like AOSS (mapped-only, ontology_ids, backend)."""
+
+    async def search(*_args, require_mapped: bool = False, ontology_ids=None, query_backend=None, **_kwargs):
+        out = [h for h in hits if h.data_source_id] if require_mapped else list(hits)
+        if ontology_ids:
+            out = [h for h in out if h.metadata.get("ontology_id") in ontology_ids]
+        if query_backend is not None:
+            out = [h for h in out if (h.metadata.get("query_backend") or "SQL") == query_backend.value]
+        return out
+
+    vector.search.side_effect = search
+
+
+_UPLOADED = "https://example.org/uploaded"
+_UP = {"ontology_id": _UPLOADED}
+_TOP_DOWN = [
+    VectorHit(id="1", text="Table: orders | Columns: id (int)", score=0.9, metadata={"ontology_id": _UPLOADED}),
+    # A document-induced class: no table behind it, from another ontology.
+    VectorHit(
+        id="2",
+        text="Table: notes | Columns: body (varchar)",
+        score=0.95,
+        metadata={"ontology_id": "https://example.org/induced-docs"},
+    ),
+]
+
+
+def _uploaded(*iris: str):
+    async def resolver() -> list[str]:
+        return list(iris)
+
+    return resolver
+
+
+@pytest.mark.unit
+class TestTopDownFallback:
+    """No mapped class: retry within the namespace's uploaded ontologies only."""
+
+    @pytest.mark.asyncio
+    async def test_retries_within_uploaded_ontologies(self, generator, mock_vector, mock_llm):
+        _gate(mock_vector, _TOP_DOWN)
+
+        result = await generator.generate("How many orders?", namespace="td", uploaded_ontologies=_uploaded(_UPLOADED))
+
+        assert result.error is None
+        assert result.retrieved_tables == ["orders"]
+        calls = [c.kwargs for c in mock_vector.search.call_args_list]
+        assert calls[0]["require_mapped"] is True
+        assert calls[1]["ontology_ids"] == [_UPLOADED] and not calls[1].get("require_mapped")
+        assert "notes" not in mock_llm.converse.call_args.args[0]
+        step = next(s for s in result.trace_steps if s["step"] == "retrieve_uploaded")
+        assert step["ontologies"] == 1 and step["kept"] == 1
+
+    @pytest.mark.asyncio
+    async def test_the_fallback_keeps_graph_classes_out(self, generator, mock_vector, mock_llm):
+        """An uploaded graph ontology's classes (RDF_SPARQL) belong to the SPARQL strategy."""
+        graph = VectorHit(
+            id="4",
+            text="Table: tickets | Columns: id (varchar)",
+            score=0.99,
+            metadata={"ontology_id": _UPLOADED, "data_source_id": "src-graph", "query_backend": "RDF_SPARQL"},
+        )
+        _gate(mock_vector, [*_TOP_DOWN, graph])
+
+        result = await generator.generate("How many orders?", namespace="td", uploaded_ontologies=_uploaded(_UPLOADED))
+
+        assert result.retrieved_tables == ["orders"]
+        assert "tickets" not in mock_llm.converse.call_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_no_uploaded_ontology_writes_no_sql_and_searches_once(self, generator, mock_vector, mock_llm):
+        """#1448: an unaccepted proposal's namespace has no upload, so it stays dark
+        with no second search."""
+        _gate(mock_vector, _TOP_DOWN)
+
+        result = await generator.generate("What is the interval?", namespace="docs", uploaded_ontologies=_uploaded())
+
+        assert result.error == "no_tables_retrieved"
+        mock_vector.search.assert_awaited_once()
+        mock_llm.converse.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_resolver_failure_stays_dark(self, generator, mock_vector, mock_llm):
+        _gate(mock_vector, _TOP_DOWN)
+
+        async def broken() -> list[str]:
+            raise RuntimeError("neptune down")
+
+        result = await generator.generate("How many orders?", namespace="td", uploaded_ontologies=broken)
+
+        assert result.error == "no_tables_retrieved"
+        mock_llm.converse.assert_not_called()
+        assert any(s["step"] == "retrieve_uploaded" and s["status"] == "error" for s in result.trace_steps)
+
+    @pytest.mark.asyncio
+    async def test_mapped_hits_skip_the_fallback(self, generator, mock_vector):
+        mapped = VectorHit(id="3", text="Table: customers", score=0.7, metadata={"data_source_id": "ds-sales"})
+        _gate(mock_vector, [*_TOP_DOWN, mapped])
+        asked = []
+
+        async def resolver() -> list[str]:
+            asked.append(True)
+            return [_UPLOADED]
+
+        await generator.generate("How many customers?", namespace="mixed", uploaded_ontologies=resolver)
+
+        mock_vector.search.assert_awaited_once()
+        assert asked == []
+
+
 @pytest.mark.unit
 class TestTablePlacements:
     """Pooled namespaces: each retrieved table is shown with, and routed to, its database."""
@@ -934,15 +1038,25 @@ class TestTablePlacements:
         # A top-down ontology's classes carry no data_source_id. Without a
         # placement the executor has no source for a bare statement and refuses
         # it as ambiguous in a namespace with several DATABASE sources.
-        mock_vector.search.return_value = [
-            VectorHit(id="1", text="Table: orders | Columns: id (int)", score=0.9, metadata={}),
-            VectorHit(id="2", text="Table: branches | Columns: id (int)", score=0.8, metadata={}),
-        ]
+        # Through the mapped gate: id-less classes reach the writer only via step 2b.
+        _gate(
+            mock_vector,
+            [
+                VectorHit(
+                    id="1", text="Table: orders | Columns: id (int)", score=0.9, metadata={"ontology_id": _UPLOADED}
+                ),
+                VectorHit(
+                    id="2", text="Table: branches | Columns: id (int)", score=0.8, metadata={"ontology_id": _UPLOADED}
+                ),
+            ],
+        )
 
         async def resolver(_):
             return {"orders": ("ds-sales", "sales_db"), "branches": ("ds-party", "party_db")}
 
-        result = await generator.generate("How many orders?", namespace="demo", table_placements=resolver)
+        result = await generator.generate(
+            "How many orders?", namespace="demo", table_placements=resolver, uploaded_ontologies=_uploaded(_UPLOADED)
+        )
 
         assert result.table_sources == {"orders": "ds-sales", "branches": "ds-party"}
         # The SQL touches only `orders`, so the statement pins that one source.

@@ -15,6 +15,8 @@ import re
 from unittest.mock import MagicMock
 
 import pytest
+from coa_common.constants import StructuredBackend
+from coa_serve.query_utils import backend_gate
 from coa_serve.tier2.tools import graph_tools
 from coa_serve.tier2.tools.graph_tools import (
     MAX_HOPS,
@@ -282,6 +284,16 @@ class TestExploreGraph:
         await tool.explore_graph("customers", hops=1, node_types=["table"])
 
         assert sum("owl:ObjectProperty" in c for c in graph.calls) == 1
+
+    async def test_fk_edges_never_reach_a_graph_backed_class(self):
+        # The SQL agent's expander walks to tables it can query; a graph source's class is answered by SPARQL only.
+        graph = _MockGraph()
+        tool = _tool(graph, catalog=_catalog({"orders": _iri("Shop_Orders")}))
+        await tool.explore_graph("orders", hops=1, node_types=["table"])
+
+        (edges,) = [c for c in graph.calls if "owl:ObjectProperty" in c]
+        assert backend_gate("domain", StructuredBackend.SQL) in edges
+        assert backend_gate("range", StructuredBackend.SQL) in edges
 
     async def test_hops_and_limit_are_clamped(self):
         tool = _tool(catalog=_catalog({"orders": _iri("Shop_Orders")}))

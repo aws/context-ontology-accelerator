@@ -110,6 +110,23 @@ class ServiceConfig:
     # round-trips for marginal gain — a longer streak rarely recovered accuracy in
     # the coa100 runs but did inflate latency.
     deep_reasoning_max_no_progress_steps: int = 2
+    # Deep-reasoning early-stop signals, all off by default (prompts, model calls
+    # and stop decisions then match a build without them). Read once at startup,
+    # from their DEEP_REASONING_* names only (no AGENTIC_* alias).
+    # Sufficiency confidence (0.0-1.0): a "that is enough" stop needs the planner's
+    # reported confidence to be at least this. 0.0 disables the bar.
+    deep_reasoning_sufficiency_min_confidence: float = 0.0
+    # Answer-stability threshold (0.0-1.0): consecutive working answers whose
+    # embedding cosine is at least this count as stable; enough stable steps in a
+    # row stop the loop. 0.0 disables the signal.
+    deep_reasoning_progress_similarity_threshold: float = 0.0
+    # Stable steps in a row that stop the loop (1-20). Separate from
+    # deep_reasoning_max_no_progress_steps, which only counts steps that retrieved
+    # nothing new.
+    deep_reasoning_stability_steps: int = 2
+    # Record the per-reply stop signals (confidence, cosine, streak) in the trace
+    # and logs even when both thresholds are 0, for offline threshold tuning.
+    deep_reasoning_stop_telemetry: bool = False
     # Where the deep-reasoning Ontology_Lookup_Tool reads the per-namespace ontology.
     # "graph" (default) queries the live published RDF graph in Neptune via the
     # serve graph client — correct for document-induced namespaces, which have no
@@ -160,13 +177,22 @@ def env_with_legacy_name(name: str, default: str = "") -> str:
     return default
 
 
-def _parse_int_in_range(name: str, default: int, low: int, high: int) -> int:
+def _read_env(name: str, *, legacy_alias: bool) -> str:
+    """Read env var ``name``; with ``legacy_alias`` also its pre-rename ``AGENTIC`` spelling.
+
+    Settings added after the rename pass ``legacy_alias=False``: no deployment
+    ever set an ``AGENTIC_*`` name for them, so there is nothing to keep working.
+    """
+    return env_with_legacy_name(name) if legacy_alias else os.environ.get(name, "")
+
+
+def _parse_int_in_range(name: str, default: int, low: int, high: int, *, legacy_alias: bool = True) -> int:
     """Parse an int env var, falling back to ``default`` when absent/invalid/out-of-range.
 
     A malformed or out-of-range value logs a warning and returns ``default`` rather
     than raising, so a bad env var can never crash service startup.
     """
-    raw = env_with_legacy_name(name)
+    raw = _read_env(name, legacy_alias=legacy_alias)
     if not raw:
         return default
     try:
@@ -178,6 +204,47 @@ def _parse_int_in_range(name: str, default: int, low: int, high: int) -> int:
         logger.warning("int_config_out_of_range", name=name, value=value, low=low, high=high, fallback=default)
         return default
     return value
+
+
+def _parse_float_in_range(name: str, default: float, low: float, high: float, *, legacy_alias: bool = True) -> float:
+    """Parse a float env var, falling back to ``default`` when absent/invalid/out-of-range.
+
+    A malformed or out-of-range value logs a warning and returns ``default`` rather
+    than raising, so a bad env var can never crash service startup.
+    """
+    raw = _read_env(name, legacy_alias=legacy_alias)
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("invalid_float_config", name=name, value=raw, fallback=default)
+        return default
+    if not (low <= value <= high):
+        logger.warning("float_config_out_of_range", name=name, value=value, low=low, high=high, fallback=default)
+        return default
+    return value
+
+
+_TRUE_VALUES = frozenset({"true", "1", "yes", "on"})
+_FALSE_VALUES = frozenset({"false", "0", "no", "off"})
+
+
+def _parse_bool(name: str, default: bool, *, legacy_alias: bool = True) -> bool:
+    """Parse a boolean env var (``true/1/yes/on`` or ``false/0/no/off``, any case).
+
+    Absent or empty gives ``default``. Any other value logs a warning and gives
+    ``default`` rather than raising, so a bad env var can never crash startup.
+    """
+    raw = _read_env(name, legacy_alias=legacy_alias).strip().lower()
+    if not raw:
+        return default
+    if raw in _TRUE_VALUES:
+        return True
+    if raw in _FALSE_VALUES:
+        return False
+    logger.warning("invalid_bool_config", name=name, value=raw, fallback=default)
+    return default
 
 
 _GUARDRAILS_DISABLED_ENV = "SERVE_GUARDRAILS_DISABLED"
@@ -266,6 +333,14 @@ def load_config() -> ServiceConfig:
     deep_reasoning_max_fanout = _parse_int_in_range("DEEP_REASONING_MAX_FANOUT", 5, 1, 20)
     deep_reasoning_synthesis_reserve_s = _parse_int_in_range("DEEP_REASONING_SYNTHESIS_RESERVE_S", 8, 0, 120)
     deep_reasoning_max_no_progress_steps = _parse_int_in_range("DEEP_REASONING_MAX_NO_PROGRESS_STEPS", 2, 1, 20)
+    deep_reasoning_sufficiency_min_confidence = _parse_float_in_range(
+        "DEEP_REASONING_SUFFICIENCY_MIN_CONFIDENCE", 0.0, 0.0, 1.0, legacy_alias=False
+    )
+    deep_reasoning_progress_similarity_threshold = _parse_float_in_range(
+        "DEEP_REASONING_PROGRESS_SIMILARITY_THRESHOLD", 0.0, 0.0, 1.0, legacy_alias=False
+    )
+    deep_reasoning_stability_steps = _parse_int_in_range("DEEP_REASONING_STABILITY_STEPS", 2, 1, 20, legacy_alias=False)
+    deep_reasoning_stop_telemetry = _parse_bool("DEEP_REASONING_STOP_TELEMETRY", False, legacy_alias=False)
     deep_reasoning_ontology_source = env_with_legacy_name("DEEP_REASONING_ONTOLOGY_SOURCE", "graph")
     if deep_reasoning_ontology_source not in ("graph", "file"):
         logger.warning(
@@ -336,6 +411,10 @@ def load_config() -> ServiceConfig:
         deep_reasoning_max_fanout=deep_reasoning_max_fanout,
         deep_reasoning_synthesis_reserve_s=deep_reasoning_synthesis_reserve_s,
         deep_reasoning_max_no_progress_steps=deep_reasoning_max_no_progress_steps,
+        deep_reasoning_sufficiency_min_confidence=deep_reasoning_sufficiency_min_confidence,
+        deep_reasoning_progress_similarity_threshold=deep_reasoning_progress_similarity_threshold,
+        deep_reasoning_stability_steps=deep_reasoning_stability_steps,
+        deep_reasoning_stop_telemetry=deep_reasoning_stop_telemetry,
         deep_reasoning_ontology_source=deep_reasoning_ontology_source,
         deep_reasoning_ontology_file=deep_reasoning_ontology_file,
         deep_reasoning_ontology_edge_mode=deep_reasoning_ontology_edge_mode,

@@ -61,16 +61,12 @@ export class McpStack extends SCLStack {
       `${ssmPrefix}/serve/runtime-arn`,
     );
 
-    // IdP issuer/client IDs via SSM (avoids a cross-stack export on the auth
-    // stack's UserPool/UserPoolClient/McpClient — see idp-authentication-stack.ts
-    // for the writer).
+    // IdP issuer and MCP client ID via SSM (avoids a cross-stack export on the
+    // auth stack's UserPool/McpClient — see idp-authentication-stack.ts for the
+    // writer).
     const issuerUrl = ssm.StringParameter.valueForStringParameter(
       this,
       `${ssmPrefix}/issuer`,
-    );
-    const clientId = ssm.StringParameter.valueForStringParameter(
-      this,
-      `${ssmPrefix}/userpool-client-id`,
     );
     const mcpClientId = ssm.StringParameter.valueForStringParameter(
       this,
@@ -150,10 +146,13 @@ export class McpStack extends SCLStack {
         bedrockagentcore.RuntimeAuthorizerConfiguration.usingJWT(
           `${issuerUrl}/.well-known/openid-configuration`,
           // allowedClients omitted: AgentCore uses AND semantics, and ID tokens
-          // don't carry client_id. We use allowedAudience (aud claim) instead,
-          // which is present on both ID tokens and works with the CM runtime.
+          // don't carry client_id. We use allowedAudience (aud claim) instead.
+          // Only the MCP client: this must match JWT_CLIENT_ID below, because
+          // the server's own JWT check rejects any other audience. Admitting
+          // more here would let initialize succeed and every tool call fail.
+          // (The serve runtime, which MCP forwards to, accepts both clients.)
           undefined,
-          [clientId, mcpClientId],
+          [mcpClientId],
         ),
       networkConfiguration:
         bedrockagentcore.RuntimeNetworkConfiguration.usingVpc(this, {
@@ -189,7 +188,7 @@ export class McpStack extends SCLStack {
         SCL_MCP_MODE: "true",
         // Independent JWT signature verification in claims.py, as
         // defense-in-depth behind the AgentCore RuntimeAuthorizerConfiguration
-        // below. Same issuer/audience trust anchor, IdP-agnostic (Cognito,
+        // above. Same issuer/audience trust anchor, IdP-agnostic (Cognito,
         // Okta, EntraID, ...) via coa_common.auth.build_token_authorizer.
         // MCP callers authenticate as the MCP/CLI client, so JWT_CLIENT_ID
         // uses mcpClientId (not the web app's clientId).

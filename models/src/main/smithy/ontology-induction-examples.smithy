@@ -23,6 +23,17 @@ apply StartInduction @examples([
         }
         output: { jobId: "3f8a1c2d-9b4e-4a6f-8c1d-2e5f7a9b0c3d" }
     }
+    {
+        title: "Preview the document-to-table bridge on an accepted ontology"
+        input: {
+            namespaceId: "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"
+            datasourceIds: []
+            ontologyUriPrefix: "https://ontology.example.com/sales#"
+            strategy: "bridge_to_tables"
+            bridgeOptions: { dryRun: true, maxTables: 20 }
+        }
+        output: { jobId: "7c2e4b1a-5d3f-4e8a-9b6c-1a2b3c4d5e6f" }
+    }
 ])
 
 apply GetInductionJob @examples([

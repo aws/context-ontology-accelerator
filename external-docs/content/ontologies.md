@@ -23,15 +23,68 @@ Context Ontology Accelerator stores ontologies in OWL/Turtle format and material
 
 ### Automatic Induction
 
-Context Ontology Accelerator can induce an ontology from your approved data sources:
+Context Ontology Accelerator can induce an ontology from your approved data
+sources. The console offers two induction strategies, one per kind of source:
+
+| Strategy | Console label | Induces from | Output |
+|----------|---------------|--------------|--------|
+| `table_to_ontology` *(default)* | **Table to Ontology** | Connected database sources: table and column names, keys and the approved catalog metadata | OWL classes and properties **plus R2RML mappings**, so the classes are SQL-queryable |
+| `unstructured_lexical_graph` | **Unstructured (Lexical Graph)** | [Document sources](sources.md#document-sources): the lexical knowledge graph built when the documents were ingested | OWL classes, properties and SKOS concepts, with **no R2RML mappings** |
+
+To run an induction in the web app:
 
 1. Navigate to your namespace → **Ontology** → **Induction**
 2. Click **Start induction**
-3. Select the data sources to analyze
-4. Context Ontology Accelerator examines table structures, column relationships, and metadata to generate an ontology
-5. Review and refine the generated model
+3. Choose a **Strategy**. The data source list then shows only sources of the
+   matching kind: database sources for **Table to Ontology**, document sources
+   for **Unstructured (Lexical Graph)**
+4. Select the data sources and, optionally, the grounding ontologies (see
+   [Grounding](#grounding) below)
+5. Review and refine the generated proposal, then accept it
 
-Induction uses Bedrock (Claude) to analyze table schemas and infer semantic relationships between entities.
+Both strategies use Amazon Bedrock (Claude) to describe the induced classes
+and to verify grounding matches.
+
+#### Unstructured induction (documents)
+
+`unstructured_lexical_graph` turns the knowledge COA extracts from your
+documents into a formal ontology. When a document source is ingested (see
+[Document Processing Pipeline](sources.md#document-processing-pipeline)), COA
+builds a knowledge graph of the entities, facts and topics found in the text.
+Unstructured induction generalizes that graph:
+
+| From your documents | Becomes |
+|---------------------|---------|
+| Recurring entity types (e.g. `Aircraft`, `Engine`) | Classes, each with a generated description. Near-duplicate types are merged, and closely related ones are linked |
+| Relationships between entities | Object properties between those classes |
+| Attribute values of entities | Datatype properties (typically few) |
+| Topics | SKOS concepts |
+
+Things to know:
+
+- **Ingest first.** Induction works from the processed documents, so wait
+  until the document source has finished processing. A run with too little
+  extracted content completes with an empty or sparse proposal; reject it and
+  re-run later. To influence which entity types are extracted, use
+  [`extractionConfig`](sources.md#configuring-document-extraction) when you
+  create the source.
+- **Scope is the namespace.** The run covers all document content in the
+  namespace, not only the sources you select.
+- **Grounding works the same way** as for structured induction (see
+  [Grounding](#grounding)).
+- **Not SQL-queryable.** The induced classes have no table behind them, so
+  they are [unmapped](#mapped-classes-and-tier-2-answerability) and serve
+  Tier-3 knowledge retrieval rather than NL→SQL/SPARQL. Which Tier-3 paths
+  use the ontology is described in
+  [Which Tier-3 path consults the published ontology?](serve.md#which-tier-3-path-consults-the-published-ontology).
+- **Flat class model.** Induced classes are not arranged into a hierarchy;
+  parent classes come only from grounding against a loaded ontology.
+- **One run at a time.** A pending unstructured proposal does not block a
+  structured induction, and vice versa, but only one induction can run in a
+  namespace at a time; a second request returns `409` until the first
+  finishes.
+
+Review, edit and accept the proposal the same way as a structured one.
 
 #### Grounding
 
@@ -42,12 +95,12 @@ The **`groundingMode`** parameter controls how aggressively this runs:
 | Mode | Behavior |
 |------|----------|
 | `NONE` | Grounding is disabled — every class is treated as novel. |
-| `STANDARD` | Auto-grounds exact-name matches only; no LLM involved. Fast, conservative. |
+| `STANDARD` | No LLM. A unique exact-name match is grounded as `exact`; several exact-name matches are told apart by embedding score (`high_confidence`, or novel on a tie). With no exact-name match, the best embedding-recall candidate is classified by its similarity score: `exact` at 0.95 or above, `high_confidence` at `confidenceThreshold` (default 0.80) or above, `ambiguous` at 0.50 or above, otherwise novel; a score from a recall whose candidates scored almost alike is capped at `ambiguous`. Fast and deterministic, but there is no domain check, so a same-name-different-meaning concept can be grounded. |
 | `ENHANCED` *(default)* | Always defers to the LLM reranker to verify domain alignment before grounding — catches semantic matches that names miss, and rejects same-name-different-meaning false matches (e.g. Dublin Core "Policy" ≠ insurance "policy"). |
 
-`ENHANCED` is the default and the right choice for most cases. Use `STANDARD` when you want speed and only trust exact-name alignment, or `NONE` to keep an induced ontology fully independent.
+`ENHANCED` is the default and the right choice for most cases. Use `STANDARD` when you want speed and no LLM cost and can review the embedding-score matches yourself, or `NONE` to keep an induced ontology fully independent.
 
-Grounding targets come from `groundingOntologyIds` (foundational/uploaded ontologies you explicitly select) plus the namespace's accepted induced ontologies, which are always grounded against.
+Grounding targets are the ontologies you list in `groundingOntologyIds` (foundational, uploaded or previously accepted induced ontologies); with none listed, every class is treated as novel. The console pre-selects the namespace's accepted induced ontologies so new runs stay consistent with earlier ones. When calling the API, include them yourself.
 
 In `ENHANCED` mode the LLM reranker returns a small JSON verdict per class or table. Reasoning models spend part of their output budget on internal thinking before that JSON, so on a very long or complex source the answer can be truncated. When that happens the induction job **fails with a clear error** (rather than silently marking everything novel) and the error tells you to raise **`rerankMaxTokens`**. This optional `StartInduction` parameter caps the reranker's output-token budget; it defaults to `1000` (ample for the short verdict on all current models) and accepts `1`–`8192`. You only need to set it in the rare case that error names it — raise it (e.g. to `2000`) and re-run. It has no effect in `STANDARD` or `NONE` mode, which don't call the LLM.
 
@@ -58,24 +111,13 @@ foreign-key notes and default proposal titles, in the
 [namespace language](namespaces.md#namespace-language). Table names, column
 names and source-authored metadata are kept as-is.
 
-- **Strategy:** `rigor_ontology` supports only English namespaces. In any other
-  namespace, **StartInduction** with that strategy returns `400` before a job
-  starts; use `table_to_ontology` instead.
-  - **Who this affects:** only namespaces whose language is not English. A
-    namespace's language is fixed at creation and every namespace created
-    before languages existed is `en`, so existing namespaces, their
-    `rigor_ontology` runs and their proposals are unchanged and need no
-    re-induction.
-  - **Switching:** in a non-English namespace, omit `strategy` or set it to
-    `table_to_ontology`, the default; the rest of the request is the same.
-    `table_to_ontology` builds classes from table and column names, matches them
-    against existing ontologies by embedding similarity and keeps the unmatched
-    ones. `rigor_ontology` instead asks an LLM to write and then review a Turtle
-    fragment per table, with related existing concepts as context. Its semantic
-    naming and grounding are not localized yet, which is why it is limited to
-    English namespaces.
-  - **Unstructured sources:** document induction (`unstructured_lexical_graph`)
-    is not limited by the namespace language.
+- **Strategies:** both `table_to_ontology` and `unstructured_lexical_graph`
+  work in every namespace language. For document sources, the lexical graph is
+  already extracted in the namespace language (see
+  [Language of Extracted Content](sources.md#language-of-extracted-content)).
+- **`rigor_ontology`:** still accepted by the API for compatibility but not
+  offered in the console, and it works only in English namespaces. In other
+  namespaces **StartInduction** rejects it with `400`; use `table_to_ontology`.
 - **RDF language tags:** in a Japanese (`ja`), Korean (`ko`) or Chinese
   (exactly `zh`) namespace, a generated literal written only in that
   language's scripts carries the namespace tag, e.g. `"制御盤"@ja`. Catalog
@@ -141,6 +183,138 @@ Grounding choices rebuild the generated ontology and mappings. Save them in a
 separate request from `ontologyTurtle` or `r2rmlTurtle` edits; the service
 rejects a mixed request and saves neither change.
 
+For **unstructured proposals**, the match artifact has no
+`source_table_identity`; use the class label in `source_table` as the key.
+
+#### Bridging documents to tables
+
+An ontology induced from both database sources and document sources holds two
+separate halves: table classes (one per mapped table, one property per column)
+and document classes (concepts found in your documents). Often the business
+meaning of a table or column, such as what a coded value stands for or which
+of two similar columns to use, is written only in the documents. The
+**document-to-table bridge** links the two halves and copies that meaning onto
+the tables and columns, where natural-language-to-SQL answering reads it.
+
+The bridge is **off unless you ask for it**. Nothing runs at query time and no
+existing induction changes behavior.
+
+**Before you start**, you need:
+
+- an accepted ontology induced from your database sources (with its mappings),
+  and
+- document induction (`unstructured_lexical_graph`) accepted into **that same
+  ontology** (the same `ontologyUriPrefix`), so the ontology holds document
+  classes. Document passages are read from the namespace's document index.
+
+**Running it.** In the console, open the namespace's **Ontology** page, choose
+**Start induction**, and pick the **Bridge documents to tables** strategy; it
+needs no source selection. Through the API, call **StartInduction** with
+`strategy: "bridge_to_tables"`. `ontologyUriPrefix` names the accepted ontology
+to bridge (the console uses the namespace's induced ontology), and
+`datasourceIds` is ignored (send `[]`). The bridge writes nothing itself: it
+creates a **pending proposal** with the tables it changes, which you review and
+accept like any other proposal (in the console it opens when the run finishes).
+Nothing reaches the ontology until you accept it.
+
+```json
+POST /namespaces/{namespaceId}/induce
+{
+  "datasourceIds": [],
+  "ontologyUriPrefix": "https://ontology.example.com/sales#",
+  "strategy": "bridge_to_tables"
+}
+```
+
+The call returns a `jobId`. It returns `404` if the namespace has no ontology
+with that ID, `400` if `bridgeOptions` is set on another strategy, and `409` if
+another induction is running in the namespace or a proposal accept is in
+progress when the call is made. The job holds the namespace's induction lock,
+so no other induction starts while it runs. A proposal accepted in the
+namespace while the job runs is not reflected in the bridge's proposal: run the
+bridge again afterwards.
+
+**What the proposal changes**, for each table and column that the documents
+support:
+
+| Change | Meaning |
+|---------|---------|
+| `skos:closeMatch` / `skos:relatedMatch` | A link from the table or column class to the document class it matches (close) or is related to. |
+| `skos:definition` | The definition written from the document evidence, in the namespace language. |
+| `rdfs:comment` (description) | If the current description says nothing beyond the name, data type and storage constraints (for example "The order_status column" or "varchar(20); not null"), or the LLM judges it a load or provenance stamp, it is **replaced** by the definition. Otherwise the definition is **appended** after the existing text. |
+
+The proposal holds each changed table whole (the class, its columns and
+relationships, and its mapping), so accepting it works exactly like accepting a
+table induction: descriptions are replaced, the earlier text is kept as history
+on the class or property (`superseded` on `GET /graph/class`), the search
+entries of those tables and columns are rebuilt so the new definitions reach
+query answering, and the stored ontology copies and the virtual knowledge graph
+are refreshed. Running the bridge again starts from the description as it was
+before the first bridge run, so definitions do not pile up.
+
+A later accept of a table induction for the same tables replaces their
+descriptions again, including the bridge's definitions: run the bridge again
+after it. To go back, restore a description from its history, or re-accept the
+earlier table proposal (the bridge's links stay, as relationships do on any
+re-accept).
+
+The definitions are written by an LLM from your documents. Text in a document
+can therefore end up in the descriptions that guide SQL generation for
+everyone in the namespace. Document text is passed to the LLM as data, marked
+off from the instructions, and the LLM is told never to follow instructions
+found in it or copy SQL into a definition. Still, only bridge documents you
+trust, and review the proposal before accepting it. The report lists, in
+`replacedByModelSubjects`, the descriptions the LLM alone judged to be
+placeholders; those are the ones to check, since a description the word-based
+check keeps is never replaced on the LLM's say-so without showing up there.
+
+**Dry run.** With `bridgeOptions.dryRun: true` the bridge does all the reading
+and LLM work and reports what it would change, but creates no proposal.
+
+**Options** (`bridgeOptions`, all optional):
+
+| Option | Default | Range | What it does |
+|--------|---------|-------|--------------|
+| `dryRun` | `false` | | Report only, create no proposal. |
+| `maxTables` | 60 | 1–200 | Most tables considered (the first in name order). When a namespace has more mapped tables, `bridgeReport.notes` says how many were left out. |
+| `concurrency` | 6 | 1–16 | Tables processed in parallel. |
+
+An unknown option is rejected rather than ignored.
+
+**Cost and time.** All cost is paid once, when the bridge runs. For a run over
+*T* tables, of which *E* have document evidence, with *c*ᵢ columns in table *i*
+(at most 120 count):
+
+- definition LLM calls: the sum over the *E* tables of ⌈*c*ᵢ / 25⌉, plus a few
+  more when an answer comes back cut off and its columns are split;
+- grounding: one alignment per document class, for at most 150 document
+  classes (each may make one LLM rerank call);
+- embeddings: one batch over the *T* tables, their columns and the document
+  classes; accepting the proposal then re-embeds the changed tables and their
+  columns;
+- passage search: at most two searches per table.
+
+Tables without document evidence cost no LLM call. Time is roughly the
+definition calls times the time of one call, divided by `concurrency`. Lower
+`maxTables` to make a run cheaper, and raise `concurrency` to make it faster.
+Afterwards, query answering makes no extra calls; it reads the longer
+descriptions as part of the context it already uses.
+
+**Following the job.** Poll **GetInductionJob** with the returned `jobId`. A
+bridge job goes `pending` → `running` → `completed` or `failed`, its source
+type is `BRIDGE`, and while it runs `progress` names the current step. A
+completed job carries a `bridgeReport` with the `proposalId` to review and
+accept, and what was found: table and column definition counts, links,
+`replacedBoilerplate` (split into `replacedByRule` and `replacedByModel`), LLM
+calls and failures, the tables with no document evidence, and notes such as a
+missing passage index. The job fails, proposing nothing, when the ontology has
+no document classes yet, when every definition call fails, when the LLM returns
+an error that every call would hit (for example the model is not enabled), when
+several definition calls in a row fail, or when the run uses most of the
+induction lock's timeout (default one hour). As with the rest
+of the induction job response, the raw REST JSON currently uses snake_case
+field names (`bridge_report`, `tables_considered`, `source_type`).
+
 ### Manual Upload
 
 Upload an existing ontology file:
@@ -149,16 +323,48 @@ Upload an existing ontology file:
 2. Select your file (formats: Turtle `.ttl`, RDF/XML `.xml`, OWL/XML, JSON-LD)
 3. The ontology is ingested into the knowledge graph
 
+To have a class answered by a graph source, see the graph-backed classes in
+[Mapped classes and Tier-2 answerability](#mapped-classes-and-tier-2-answerability).
+
 ### Via the API
 
-Ontologies are managed under `/namespaces/{namespaceId}/ontologies` —
-creating an entry, uploading a Turtle/RDF file, and triggering induction (with
-optional `groundingOntologyIds` / `groundingMode`, defaulting to `ENHANCED`)
-are each separate calls. See **CreateOntology**, **UploadOntology**, and
-**StartInduction** in the [API Reference](#/api-reference) for the full
-request/response schemas. StartInduction, IngestOntologyFromS3, and
-LoadFoundationalOntology are retry-safe with an optional `clientToken` — see
+Ontologies are managed under `/namespaces/{namespaceId}/ontologies`. To
+import a Turtle, RDF/XML or JSON-LD file, get a pre-signed URL with
+**GetOntologyUploadUrl**, upload the file to it, then call
+**IngestOntologyFromS3** (the direct **UploadOntology** path answers `501`).
+To induce one, call **StartInduction** (with optional `groundingOntologyIds` /
+`groundingMode`, defaulting to `ENHANCED`). See the
+[API Reference](#/api-reference) for the full request/response schemas.
+StartInduction, IngestOntologyFromS3, and LoadFoundationalOntology are
+retry-safe with an optional `clientToken` — see
 [Retrying Creates Safely](namespaces.md#retrying-creates-safely).
+
+### Listing proposals
+
+`GET /namespaces/{namespaceId}/proposals` (**ListProposals**) returns a page
+object, not a bare array:
+
+```json
+{
+  "proposals": [{ "proposal_id": "…", "status": "pending", "…": "…" }],
+  "nextToken": "eyJ…"
+}
+```
+
+The proposals carry the stored keys in snake_case (for example `proposal_id`),
+not the camelCase names in the API Reference example.
+
+Pass the returned `nextToken` back to get the next page, and keep going until a
+response has no `nextToken`. A client that reads only the first page can miss an
+open proposal, and starting an induction while a proposal from the same kind of
+source is still open fails with `409`.
+
+The `status` and `source_type` filters accept only the values defined in the
+API Reference (`ProposalStatus` and `InductionSourceType`); any other value
+returns `400` with a message listing the allowed values. An empty value means no
+filter. The same check applies to the induction-job `status` filter, the
+`ontology_type` filter on the ontology routes and the `kind` filter on the graph
+routes.
 
 ### Saving large proposal edits
 
@@ -219,11 +425,10 @@ current revision unchanged. Keep grounding-choice changes in a separate
 
 | Action | Description |
 |--------|-------------|
-| **Create** | Register an ontology entry (metadata only) |
-| **Induce** | Auto-generate from data source schemas |
-| **Upload** | Import from OWL/Turtle/RDF file |
-| **Fetch** | Pull from an external URL |
-| **Update** | Modify metadata or re-upload |
+| **Induce** | Auto-generate from database source schemas or from the document lexical graph |
+| **Upload** | Import a Turtle, RDF/XML or JSON-LD file: get a pre-signed URL with **GetOntologyUploadUrl**, upload the file, then call **IngestOntologyFromS3** |
+| **Fetch** | Re-fetch an already registered ontology from its source URL (**FetchOntology**; `404` if it isn't registered) |
+| **Change** | An accepted ontology cannot be edited in place. Edit a proposal before you accept it, or re-induce and accept the new proposal (see "Curating an ontology: re-induce and re-accept" below); for an uploaded or fetched ontology, delete it and import the corrected file |
 | **Validate** | Run consistency + quality checks on a proposal before accepting, including datatype checks (see "Validating and repairing datatype issues" below) |
 | **Delete** | Remove an ontology's graph triples, vector embeddings, and registry entry from the namespace (see "Deleting ontologies" below) |
 
@@ -279,14 +484,15 @@ Induction runs **asynchronously**. When you trigger it (via **Start induction** 
 | Status | Meaning |
 |--------|---------|
 | `pending` | Queued, not yet started. |
-| *in-progress* (`fetching_metadata`, `matching`, `building_ontology`, `storing`, …) | The job is running through its stages. |
-| `completed` | Success — a proposal is ready to review and accept. |
+| *in-progress* (`fetching_metadata`, `matching`, `building_ontology`, `storing`, …) | The job is running through its stages. Unstructured runs report their own stage names. |
+| `running` | A document-to-table bridge job is in progress (see [Bridging documents to tables](#bridging-documents-to-tables)). |
+| `completed` | Success — a proposal is ready to review and accept. A bridge job also reports what it proposes in `bridgeReport`; there is no proposal on a dry run or when nothing would change. |
 | `failed` | No proposal was produced; check the job's `error` field. |
 
 ### Why a job fails
 
 - **Grounding can't reach OpenSearch (the vector search backend).** The most common cause: the grounding step hits a transport error against OpenSearch — throttling (`429`), a `5xx`, or a connection/timeout — that persists after automatic retries. Transient OpenSearch errors are retried automatically (6 attempts with increasing backoff), so most blips never surface as a failure.
-- **Data or configuration problems** — for example, no tables were found in the selected data sources.
+- **Data or configuration problems** — for example, no tables were found in the selected database sources.
 
 ### Fail-loud reliability guarantee
 
@@ -381,6 +587,33 @@ backed by a real SQL table can — Context Ontology Accelerator marks these as *
   authoring a query against a class that has no data behind it (which would
   return nothing). Unmapped classes still power Tier-3 knowledge retrieval and
   graph traversal — they're only excluded from structured queries.
+- **A namespace with no mapped class gets no Tier 2 answer.** If the namespace
+  has only document sources, or its structured induction proposal has not been
+  accepted yet, Tier 2 finds no tables and the question is answered from Tier 3.
+  Accept the structured induction proposal to enable Tier 2. A namespace built
+  before v0.1.0 (2026-07-31) needs a fresh structured induction, or a new
+  namespace: re-accepting an already-accepted proposal does not add the marker.
+- **Uploaded ontologies (no R2RML).** Their classes are not mapped. When a
+  namespace has no mapped class, NL→SQL searches the classes of its uploaded
+  (`user_created` or `user_uploaded`) ontologies instead, so a top-down ontology describing your
+  tables still works. Upload an ontology of concepts with no tables behind them
+  as `foundational` so NL→SQL does not treat its classes as tables.
+- **Graph-backed classes (`coa_import:dataSourceName`).** A class can instead be
+  answered by a graph (`RDF_SPARQL`) source. Give it
+  `coa_import:dataSourceName "<source name>"` in the uploaded ontology (example in
+  [Binding an ontology to the source](sources.md#binding-an-ontology-to-the-source)).
+  On upload the name is resolved to the source and the directive itself is not
+  stored. A class is answered by exactly one backend, so the upload is rejected with
+  **422** when the name does not match exactly one graph source in the namespace,
+  when a class names more than one source, when the directive is not on a named
+  `owl:Class`, or when the class is already mapped by R2RML
+  (`graph_source_conflicts_r2rml`). An R2RML import of a class already bound to a
+  graph source is rejected the same way (`r2rml_conflicts_graph_source`).
+- **Graph sources are off by default.** Unless the deployment was deployed with
+  graph sources on (see [Graph sources](deploying.md#graph-sources)), any upload
+  that uses `coa_import:dataSourceName` is refused before anything is written: a
+  **422** with the finding `graph_sources_disabled` on a direct upload, or a failed
+  job for **IngestOntologyFromS3**. Uploads without the directive are unaffected.
 - **How to tell:** `GET /graph/class` returns an **`is_mapped`** boolean per
   class. `true` means R2RML-backed and eligible for Tier 2; `false`/absent means
   it is not.
@@ -445,4 +678,5 @@ it to the full class detail including all its relationships and attributes.
 ## Best Practices
 
 - **Start with induction**: let Context Ontology Accelerator generate a baseline ontology from your sources, then refine
+- **Pick the strategy by source kind**: `table_to_ontology` for databases you want to query with SQL, `unstructured_lexical_graph` for document collections you want to retrieve from
 - **One ontology per domain**: keep ontologies focused on a single business domain. Spread ontologies across logically separated namespaces as needed.

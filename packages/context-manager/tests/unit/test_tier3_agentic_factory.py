@@ -39,8 +39,10 @@ from coa_serve.tier3.agentic.factory import (
     build_agentic_retriever,
     build_budget_config,
     build_ontology_source,
+    build_stop_signal_config,
     build_tool_registry,
 )
+from coa_serve.tier3.agentic.models import StopSignalConfig
 from coa_serve.tier3.agentic.ontology import (
     OntologyFileSource,
     OntologyGraphSource,
@@ -314,6 +316,101 @@ class TestBuildAgenticRetriever:
         current["gid"] = "gr-new"
         assert retriever._synthesizer._effective_guardrail_id() == "gr-new"
         assert retriever._decomposer._effective_guardrail_id() == "gr-new"
+
+    def test_controller_embeds_with_clients_llm_without_an_embed_client(self, monkeypatch):
+        """Prod wiring passes no embed_client: the controller still gets the shared embed backend."""
+        monkeypatch.setenv("ENVIRONMENT", "local")
+        clients = make_clients()
+
+        retriever = build_agentic_retriever(make_config(), clients, FakeStepPlanner())
+
+        assert retriever._controller._embed_fn is not None
+        assert retriever._controller._embed_fn is clients.llm
+        assert retriever._embed_client is clients.llm
+
+    def test_controller_embeds_with_an_explicit_embed_client(self, monkeypatch):
+        monkeypatch.setenv("ENVIRONMENT", "local")
+        embed = FakeLLM()
+
+        retriever = build_agentic_retriever(make_config(), make_clients(), FakeStepPlanner(), embed_client=embed)
+
+        assert retriever._controller._embed_fn is embed
+        assert retriever._embed_client is embed
+
+    def test_controller_gets_the_stop_signal_config(self, monkeypatch):
+        monkeypatch.setenv("ENVIRONMENT", "local")
+        config = make_config(
+            deep_reasoning_sufficiency_min_confidence=0.7,
+            deep_reasoning_progress_similarity_threshold=0.9,
+            deep_reasoning_stability_steps=3,
+            deep_reasoning_stop_telemetry=True,
+        )
+
+        retriever = build_agentic_retriever(config, make_clients(), FakeStepPlanner())
+
+        assert retriever._controller._stop_signals == StopSignalConfig(
+            min_confidence=0.7, similarity_threshold=0.9, stability_steps=3, telemetry=True
+        )
+
+    def test_planner_built_without_the_stop_signal_config_warns(self, monkeypatch):
+        """R18-n4: a planner left at the default config while the controller elicits is logged."""
+        import structlog.testing
+        from coa_serve.tier3.agentic.planner import BedrockStepPlanner
+
+        monkeypatch.setenv("ENVIRONMENT", "local")
+        config = make_config(deep_reasoning_sufficiency_min_confidence=0.7)
+
+        with structlog.testing.capture_logs() as logs:
+            build_agentic_retriever(config, make_clients(), BedrockStepPlanner(FakeLLM()))
+            build_agentic_retriever(
+                config, make_clients(), BedrockStepPlanner(FakeLLM(), stop_signals=build_stop_signal_config(config))
+            )
+
+        assert [e["event"] for e in logs].count("deep_reasoning_stop_signal_config_mismatch") == 1
+
+
+@pytest.mark.unit
+class TestStopSignalConfig:
+    def test_built_from_config_fields(self):
+        config = make_config(
+            deep_reasoning_sufficiency_min_confidence=0.6,
+            deep_reasoning_progress_similarity_threshold=0.95,
+            deep_reasoning_stability_steps=4,
+            deep_reasoning_stop_telemetry=True,
+        )
+        assert build_stop_signal_config(config) == StopSignalConfig(
+            min_confidence=0.6, similarity_threshold=0.95, stability_steps=4, telemetry=True
+        )
+
+    def test_defaults_are_off(self):
+        signals = build_stop_signal_config(make_config())
+        assert signals == StopSignalConfig()
+        assert signals.elicit is False
+
+    @pytest.mark.parametrize(
+        "signals",
+        [
+            StopSignalConfig(min_confidence=0.5),
+            StopSignalConfig(similarity_threshold=0.9),
+            StopSignalConfig(telemetry=True),
+        ],
+    )
+    def test_any_signal_elicits(self, signals):
+        assert signals.elicit is True
+
+    def test_planner_and_controller_default_to_off(self):
+        from coa_serve.tier3.agentic.controller import ReasoningController
+        from coa_serve.tier3.agentic.planner import BedrockStepPlanner
+
+        planner = BedrockStepPlanner(FakeLLM())
+        assert planner._stop_signals == StopSignalConfig()
+        assert ReasoningController(planner)._stop_signals == StopSignalConfig()
+
+    def test_planner_takes_the_config_by_constructor(self):
+        from coa_serve.tier3.agentic.planner import BedrockStepPlanner
+
+        signals = StopSignalConfig(min_confidence=0.8)
+        assert BedrockStepPlanner(FakeLLM(), stop_signals=signals)._stop_signals is signals
 
 
 # ── lazy-import invariant (Req 12.3) ───────────────────────────────

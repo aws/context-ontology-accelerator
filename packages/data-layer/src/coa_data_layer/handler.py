@@ -31,6 +31,7 @@ from coa_common.constants import (
     validate_query_text,
 )
 from coa_common.smithy_shapes import normalize_dimensions
+from coa_common.sparql_config import graph_sources_enabled
 
 from coa_data_layer import contract
 
@@ -201,6 +202,13 @@ _QUERY_ENUM_MEMBERS: dict[str, frozenset[str]] = {
 _QUERY_BOOL_MEMBERS: tuple[str, ...] = ("includeSupporting", "includeDebugInfo")
 
 
+def _enum_values(name: str, allowed: frozenset[str]) -> frozenset[str]:
+    """The values ``name`` accepts here: with graph sources off ``nl_to_sparql`` is no strategy, as on main."""
+    if name == "strategy" and not graph_sources_enabled():
+        return allowed - {"nl_to_sparql"}
+    return allowed
+
+
 def _parse_query_options(body: dict) -> dict[str, Any]:
     """Validate the optional ``Query`` members and return the CM ``options`` map.
 
@@ -236,7 +244,7 @@ def _parse_query_options(body: dict) -> dict[str, Any]:
             options[name] = contract.require_int(value, name, lo, hi)
     for name, allowed in _QUERY_ENUM_MEMBERS.items():
         if (value := body.get(name)) is not None:
-            options[name] = contract.require_enum(value, name, allowed)
+            options[name] = contract.require_enum(value, name, _enum_values(name, allowed))
     for name in _QUERY_BOOL_MEMBERS:
         if (value := body.get(name)) is not None:
             options[name] = contract.require_bool(value, name)

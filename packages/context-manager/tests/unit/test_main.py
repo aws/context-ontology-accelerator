@@ -360,6 +360,23 @@ class TestInvokeFunction:
         stub_orchestrator.resolve.assert_not_called()
 
     @patch("coa_serve.main._ensure_initialized")
+    async def test_invoke_namespace_with_trailing_newline_rejected_before_existence_lookup(self, mock_init, config):
+        """`$` also matches before a final newline, so "demo\\n" passed a `.match` pre-gate and ended as a 404."""
+        mock_init.return_value = None
+        import coa_serve.main as main_mod
+
+        main_mod._orchestrator = MagicMock()
+        registry = MagicMock()
+        registry.namespace_exists = AsyncMock(return_value=False)
+        main_mod._sources_registry = registry
+
+        result = await _invoke_collect({"query": "test", "namespace": "demo\n"})
+
+        assert result["statusCode"] == 400
+        assert result["error"] == "ValidationError"
+        registry.namespace_exists.assert_not_called()
+
+    @patch("coa_serve.main._ensure_initialized")
     async def test_invoke_malformed_namespace_rejected_before_existence_lookup(self, mock_init, config):
         """Path-traversal / special-char namespaces must return 400, never fall through
         to the namespace_exists 404 gate — otherwise callers can't distinguish "bad
@@ -805,6 +822,50 @@ class TestStreamingSSEMode:
         assert isinstance(result, dict)
         assert "requestId" in result
         assert result.get("result", {}).get("tier") == 2
+
+
+class TestRequestIdLogContext:
+    """invoke() binds the request id for the resolve path (deep-reasoning stop-signal log)."""
+
+    @pytest.fixture(autouse=True)
+    def seen_request_ids(self, config):
+        import coa_serve.main as main_mod
+        from coa_serve.tier3.agentic.controller import _request_id
+
+        seen: list[str | None] = []
+
+        async def resolve(request, trace=None, on_token=None, conversation_history=None, deadline=None):
+            # The value the deep_reasoning_stop_signals log line reads.
+            seen.append(_request_id())
+            return InvokeResponse(
+                result=QueryResult(
+                    tier=2,
+                    confidence=ConfidenceScore(score=0.85, rationale="high"),
+                    trace=[TraceStep(step="t2.sql", status="done", durationMs=50)],
+                ),
+            )
+
+        mock_orch = MagicMock()
+        mock_orch.resolve = resolve
+        main_mod._config = config
+        main_mod._orchestrator = mock_orch
+        main_mod._session_manager = None
+        main_mod._session_metadata = None
+        yield seen
+        main_mod._config = None
+        main_mod._orchestrator = None
+
+    @pytest.mark.parametrize("stream", [False, True])
+    @patch("coa_serve.main._ensure_initialized")
+    async def test_resolve_sees_the_request_id_and_it_is_unbound_after(self, mock_init, stream, seen_request_ids):
+        import structlog
+
+        mock_init.return_value = None
+
+        await _invoke_collect({"query": "show data", "namespace": "demo", "stream": stream, "requestId": "req-42"})
+
+        assert seen_request_ids == ["req-42"]
+        assert "request_id" not in structlog.contextvars.get_contextvars()
 
 
 @agentcore_required

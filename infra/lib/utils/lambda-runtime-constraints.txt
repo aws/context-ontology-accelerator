@@ -1,0 +1,10 @@
+# Bounds the Lambda Python runtime's botocore declares on packages a bundle can also
+# install. Bundles install without boto3/botocore, which the runtime provides,
+# so the resolver never sees these bounds; the bundle precedes the runtime on sys.path,
+# so a bundled copy outside them is what botocore imports. Compiled into every lock
+# by scripts/relock-python-requirements.sh, passed to an unlocked install
+# (uv --constraint / pip -c), and folded into the asset hash.
+# Source: botocore 1.43.65 Requires-Dist.
+python-dateutil>=2.1,<3.0.0
+jmespath>=0.7.1,<2.0.0
+urllib3>=1.25.4,!=2.2.0,<3

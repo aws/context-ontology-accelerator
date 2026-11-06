@@ -39,6 +39,7 @@ const SOURCE_SUBTYPE_LABELS: Record<string, AppMessage> = {
   JDBC_DATABASE: "JDBC",
   CUSTOM_CONNECTOR: "Custom connector",
   DATABRICKS_SQL_WAREHOUSE: "Databricks",
+  RDF_SPARQL: "Graph (SPARQL)",
   S3: "S3",
   LOCAL_UPLOAD: "Upload",
 };

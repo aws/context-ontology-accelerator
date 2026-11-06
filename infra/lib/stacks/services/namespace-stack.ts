@@ -653,7 +653,9 @@ export class NamespaceStack extends SCLStack {
         Paths.commonLib,
         Paths.smithyGeneratedControlPlanePythonServer,
       ],
-      requirementsFile: fromRoot("packages/control-plane/requirements.txt"),
+      requirementsFile: fromRoot(
+        "packages/control-plane/requirements.lock.txt",
+      ),
     });
 
     // ── Namespace API Lambda (combined create + list + delete-trigger) ──

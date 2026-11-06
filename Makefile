@@ -1,6 +1,10 @@
-.PHONY: setup generate format lint test test-unit test-integ build load-test load-test-slow load-test-teardown deploy-dev deploy-serve deploy-example-connector deploy-databricks-connector destroy-dev preflight docs web-dev vkg-dev version version-check
+.PHONY: setup generate format lint test test-unit test-integ build load-test load-test-slow load-test-teardown deploy-dev deploy-serve deploy-example-connector deploy-databricks-connector destroy-dev gc-assets preflight docs web-dev vkg-dev version version-check
 
-setup: generate
+# smithy-generate.sh needs pnpm, and setup-dev.sh needs the members it generates,
+# so setup first installs the pnpm version .mise.toml pins when pnpm is missing.
+setup:
+	./scripts/install-pnpm.sh
+	./scripts/smithy-generate.sh
 	./scripts/setup-dev.sh
 
 generate:
@@ -48,7 +52,9 @@ coverage:
 test-integ:
 	@if ls packages/*/tests/integ/ >/dev/null 2>&1; then \
 		uv run pytest packages/*/tests/integ/ -m integ -v --tb=short --import-mode=importlib && \
-		uv run pytest benchmarks/coa100-benchmark/tests/integ/test_rolling_metric_publish.py \
+		uv run pytest \
+			benchmarks/coa100-benchmark/tests/integ/test_nightly_history_discovery.py \
+			benchmarks/coa100-benchmark/tests/integ/test_rolling_metric_publish.py \
 			-m integ -v --tb=short --import-mode=importlib; \
 	else echo "⚠ integ tests not available (stripped from public mirror)"; fi
 
@@ -136,6 +142,12 @@ destroy-dev:
 	make generate
 	pnpm install --frozen-lockfile
 	./scripts/destroy.sh dev
+
+## Prune stale images from the shared CDK bootstrap image repository with `cdk gc`
+## (see infra/README.md). Read-only by default; GC_ACTION=full tags unreferenced
+## images, and deletes those unreferenced for GC_ROLLBACK_BUFFER_DAYS (default 30).
+gc-assets:
+	./scripts/gc-cdk-assets.sh
 
 docs:
 	@if [ -d docs ]; then cd docs && mkdocs serve; \

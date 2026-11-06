@@ -33,8 +33,8 @@ from coa_serve.tier3.agentic import (
 
 @pytest.mark.unit
 class TestStopReason:
-    def test_has_exactly_the_six_enumerated_members(self):
-        """StopReason carries exactly the Req 6.6 / Req 7 stop-reason set."""
+    def test_has_exactly_the_seven_enumerated_members(self):
+        """StopReason carries the Req 6.6 / Req 7 stop-reason set plus answer_stable."""
         assert {r.value for r in StopReason} == {
             "sufficiency_satisfied",
             "no_new_information",
@@ -42,6 +42,7 @@ class TestStopReason:
             "sufficiency_check_timeout",
             "time_budget_expired",
             "queue_drained",
+            "answer_stable",
         }
 
     def test_is_a_str_enum(self):

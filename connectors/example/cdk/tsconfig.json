@@ -10,6 +10,7 @@
     "noImplicitThis": true,
     "alwaysStrict": true,
     "esModuleInterop": true,
+    "isolatedModules": true,
     "outDir": "./cdk.out/ts",
     "rootDir": ".",
     "skipLibCheck": true

@@ -22,6 +22,13 @@ const TEST_CONTEXT = {
   "aws:cdk:bundling-stacks": [],
 };
 
+/** Read `key` from a synthesized template node, or undefined, without casts. */
+function field(node: unknown, key: string): unknown {
+  return typeof node === "object" && node !== null
+    ? Object.entries(node).find(([k]) => k === key)?.[1]
+    : undefined;
+}
+
 describe("McpStack", () => {
   let template: Template;
 
@@ -127,6 +134,42 @@ describe("McpStack", () => {
           JWT_CLIENT_ID: Match.anyValue(),
         }),
       }),
+    );
+  });
+
+  it("authorizer accepts exactly the audience the server's JWT check accepts", () => {
+    // Regression (GH #331): the authorizer allowed [web client, MCP client]
+    // while JWT_CLIENT_ID was the MCP client only, so a web-client ID token
+    // passed initialize and then failed every tool call with "Token audience
+    // mismatch". Both layers must accept the same ID-token audience, so a
+    // web-client token gets a 401 at the edge instead.
+    const runtimes = Object.values(
+      template.findResources("AWS::BedrockAgentCore::Runtime"),
+    );
+    expect(runtimes).toHaveLength(1);
+    const properties = field(runtimes[0], "Properties");
+    const audience = field(
+      field(
+        field(properties, "AuthorizerConfiguration"),
+        "CustomJWTAuthorizer",
+      ),
+      "AllowedAudience",
+    );
+    const jwtClientId = field(
+      field(properties, "EnvironmentVariables"),
+      "JWT_CLIENT_ID",
+    );
+    expect(audience).toEqual([jwtClientId]);
+
+    // ...and that audience is the MCP client's id, not the web client's.
+    const ref = field(jwtClientId, "Ref");
+    expect(typeof ref).toBe("string");
+    const parameter = field(
+      field(template.toJSON(), "Parameters"),
+      String(ref),
+    );
+    expect(field(parameter, "Default")).toBe(
+      `/${DEFAULT_RESOURCE_PREFIX}/mcp-client-id`,
     );
   });
 
@@ -273,7 +316,7 @@ describe("McpStack", () => {
   });
 
   // Deliberately NOT narrowed: the role reads across the whole `${ssmPrefix}` tree
-  // (`/issuer`, `/userpool-client-id`, the Context Manager runtime ARN), so scoping
+  // (`/issuer`, `/mcp-client-id`, the Context Manager runtime ARN), so scoping
   // it to a subtree presents as a runtime AccessDenied that reads as a config error.
   // Accepted residual: the Databricks connector parameters are readable here too,
   // a metadata side channel over non-secret values.

@@ -14,13 +14,14 @@
  *   (any step's Catch -> MarkFailed -> Fail)
  *
  * DeleteSources/DeleteMetrics/DeletePlatform are steps whose underlying
- * cleanup is itself already best-effort (see cleanup.py — VKG, Athena,
- * DataZone, S3 all log-and-continue on failure) or safe to retry
- * (source/metric deletes are idempotent against a 404).  Each step gets 3
+ * cleanup is safe to retry: source/metric deletes are idempotent against a
+ * 404, and the platform teardown in cleanup.py (VKG service, Athena
+ * workgroup, DataZone project) raises on failure but treats already-deleted
+ * as done.  Each step gets 3
  * retries with backoff before the chain proceeds to MarkFailed, per the #213
- * acceptance criteria for non-critical steps.
+ * acceptance criteria.
  *
- * DeleteOntology is NOT in that best-effort group. It owns the AOSS vector
+ * DeleteOntology is NOT in that group. It owns the AOSS vector
  * index, which is one index per namespace against a collection with a hard
  * 1000-index cap. Finalize deletes the namespace record, so an ontology
  * teardown that "logged and continued" would orphan that index forever —

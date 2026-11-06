@@ -17,13 +17,15 @@ import re
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import boto3
 import structlog
 from coa_common import resolve_namespace_id, resolve_region, sync_boto_config
+from coa_common.constants import GRAPH_BACKED_SUB_TYPES, StructuredBackend
 from coa_common.language_tags import LanguageTagError, canonicalize_language_tag, effective_namespace_language
+from coa_common.neptune_endpoints import GRAPH_CLUSTER_CLAIM_SK, is_graph_cluster_claim_pk
 
 from ..query_utils import validate_namespace
 from ..tier2.table_qualifier import AMBIGUOUS_SOURCE
@@ -98,16 +100,53 @@ class SourceComposition:
     ``unknown`` is True when the composition could not be determined (registry
     unavailable, timeout, or error). Callers MUST fail open on unknown — i.e. run
     every tier — so a lookup miss never silently drops a tier that would answer.
+
+    ``structured_backends`` says WHICH structured backends the DATABASE sources need:
+    ``SQL`` for relational sources, ``RDF_SPARQL`` for graph sources. Tier-2 runs only
+    the strategies whose backends intersect it. When not given it is derived from
+    ``has_structured_source`` as ``{SQL}`` — the meaning every composition had before
+    graph sources existed.
     """
 
     has_structured_source: bool
     has_unstructured_source: bool
     unknown: bool = False
+    structured_backends: frozenset[StructuredBackend] | None = field(default=None)
+
+    def __post_init__(self) -> None:
+        """Derive ``structured_backends`` from ``has_structured_source`` when not given."""
+        if self.structured_backends is None:
+            derived = frozenset({StructuredBackend.SQL}) if self.has_structured_source else frozenset()
+            object.__setattr__(self, "structured_backends", derived)
 
     @classmethod
     def unknown_composition(cls) -> SourceComposition:
-        """Fail-open sentinel: treat the namespace as if it has every source type."""
-        return cls(has_structured_source=True, has_unstructured_source=True, unknown=True)
+        """Fail-open sentinel: treat the namespace as if it has every source type.
+
+        Tier gating fails open (every tier runs), but strategy selection fails SAFE to
+        the SQL default: an uncertain read must not start routing questions to a graph
+        strategy the namespace may not have.
+        """
+        return cls(
+            has_structured_source=True,
+            has_unstructured_source=True,
+            unknown=True,
+            structured_backends=frozenset({StructuredBackend.SQL}),
+        )
+
+
+def _is_graph_source(item: dict[str, Any]) -> bool:
+    """A DATABASE row whose data is an RDF graph served over SPARQL, not SQL."""
+    return item.get("sourceType") == _SOURCE_TYPE_DATABASE and item.get("sourceSubType") in GRAPH_BACKED_SUB_TYPES
+
+
+def _is_sql_source(item: dict[str, Any]) -> bool:
+    """A DATABASE row answered by SQL.
+
+    Graph rows share sourceType DATABASE but have no catalog, database or schema, so
+    every SQL lookup must skip them.
+    """
+    return item.get("sourceType") == _SOURCE_TYPE_DATABASE and not _is_graph_source(item)
 
 
 def _glue_database_mismatch(item: dict[str, Any], database: str, namespace: str) -> bool:
@@ -330,6 +369,26 @@ class SourcesRegistry:
             return {}
         return response.get("Item", {})
 
+    async def get_graph_cluster_claim(self, claim_pk: str) -> dict[str, Any]:
+        """Fetch a Neptune cluster's claim row, ``{}`` when there is none; reads no other row."""
+        if not is_graph_cluster_claim_pk(claim_pk):
+            raise ValueError(f"Invalid graph cluster claim key: {claim_pk!r}")
+        if not self.available:
+            return {}
+        loop = asyncio.get_running_loop()
+        table = self._dynamodb.Table(self._table_name)
+        try:
+            response = await asyncio.wait_for(
+                loop.run_in_executor(
+                    self._executor, lambda: table.get_item(Key={"PK": claim_pk, "SK": GRAPH_CLUSTER_CLAIM_SK})
+                ),
+                timeout=_RESOLVE_TIMEOUT_S,
+            )
+        except TimeoutError:
+            logger.warning("sources_registry_timeout", op="get_graph_cluster_claim")
+            return {}
+        return response.get("Item") or {}
+
     async def _query_sources(self, namespace: str) -> list[dict[str, Any]] | None:
         """Shared, cached DDB query for the SRC# records under a namespace.
 
@@ -407,9 +466,24 @@ class SourcesRegistry:
         if items is None:
             return {}
         for item in items:
-            if item.get("sourceType") == _SOURCE_TYPE_DATABASE:
+            if _is_sql_source(item):
                 return item
         return {}
+
+    async def document_sources(self, namespace: str) -> list[dict[str, Any]] | None:
+        """Return every DOCUMENTS source record registered to ``namespace``.
+
+        Used to scope reads of original document objects to the buckets and
+        prefixes a namespace actually ingested from. Returns ``None`` when the
+        inventory is uncertain (registry unavailable, timeout, or a truncated
+        page) so a caller that authorizes on this list can fail CLOSED rather
+        than treat a partial read as the complete set. Reuses the cached
+        ``_query_sources`` round-trip.
+        """
+        items = await self._query_sources(namespace)
+        if items is None:
+            return None
+        return [item for item in items if item.get("sourceType") == _SOURCE_TYPE_DOCUMENTS]
 
     async def find_sole_database_source(self, namespace: str) -> dict[str, Any] | None:
         """Find the sole DATABASE source in a namespace, or None if ambiguous.
@@ -424,8 +498,21 @@ class SourcesRegistry:
         items = await self._query_sources(namespace)
         if items is None:
             return None
-        db_sources = [item for item in items if item.get("sourceType") == _SOURCE_TYPE_DATABASE]
+        db_sources = [item for item in items if _is_sql_source(item)]
         return db_sources[0] if len(db_sources) == 1 else None
+
+    async def find_sole_graph_source(self, namespace: str) -> dict[str, Any] | None:
+        """The namespace's only RDF_SPARQL source, or None when there are zero or several.
+
+        The SPARQL strategy's last-resort routing when no retrieved class names its
+        source: sound only when exactly one graph source exists, since a guess in a
+        multi-graph namespace would query the wrong endpoint.
+        """
+        items = await self._query_sources(namespace)
+        if items is None:
+            return None
+        graph_sources = [item for item in items if _is_graph_source(item)]
+        return graph_sources[0] if len(graph_sources) == 1 else None
 
     async def database_source_count(self, namespace: str) -> int:
         """Number of DATABASE sources registered to ``namespace``.
@@ -439,7 +526,7 @@ class SourcesRegistry:
         items = await self._query_sources(namespace)
         if items is None:
             return 0
-        return sum(1 for item in items if item.get("sourceType") == _SOURCE_TYPE_DATABASE)
+        return sum(1 for item in items if _is_sql_source(item))
 
     async def sql_namespace_scope(self, namespace: str) -> SQLNamespaceScope | None:
         """Return the physical SQL objects registered to ``namespace``.
@@ -457,7 +544,7 @@ class SourcesRegistry:
         native_databases: set[str] = set()
         federated_catalog_schemas: set[tuple[str, str]] = set()
         for item in items:
-            if item.get("sourceType") != _SOURCE_TYPE_DATABASE or item.get("queryable") is False:
+            if not _is_sql_source(item) or item.get("queryable") is False:
                 continue
 
             catalog = str(item.get("athenaDataCatalogName") or "").lower()
@@ -766,8 +853,18 @@ class SourcesRegistry:
 
         has_structured_source = any(item.get("sourceType") == _SOURCE_TYPE_DATABASE for item in items)
         has_unstructured_source = any(item.get("sourceType") == _SOURCE_TYPE_DOCUMENTS for item in items)
+        # Derived from the sub-type alone (absent or any non-graph sub-type → SQL), so
+        # every pre-existing source keeps meaning {SQL}.
+        structured_backends: set[StructuredBackend] = set()
+        for item in items:
+            if _is_graph_source(item):
+                structured_backends.add(StructuredBackend.RDF_SPARQL)
+            elif _is_sql_source(item):
+                structured_backends.add(StructuredBackend.SQL)
         return SourceComposition(
-            has_structured_source=has_structured_source, has_unstructured_source=has_unstructured_source
+            has_structured_source=has_structured_source,
+            has_unstructured_source=has_unstructured_source,
+            structured_backends=frozenset(structured_backends),
         )
 
     async def resolve_database_name(self, namespace: str, data_source_id: str = "") -> str:

@@ -38,8 +38,13 @@ import {
 } from "../../context";
 import { Paths, fromRoot } from "../../paths";
 import { bundlePython } from "../../utils/python-bundling";
+import {
+  GRAPH_SOURCES_ENV,
+  graphSourcesEnabled,
+} from "../../utils/graph-sources";
 import { grantIdempotencyTable } from "../../utils/idempotency";
 import { bedrockModelArn } from "../../utils/bedrock-utils";
+import { grantGuardDutyAgentPull } from "../../utils/guardduty-agent";
 import { NetworkStack } from "../foundation/network-stack";
 import { StorageStack } from "../foundation/storage-stack";
 import { TABLE_NAMES } from "@coa/shared";
@@ -627,7 +632,7 @@ export class SourcesStack extends SCLStack {
           Paths.commonLib,
           Paths.smithyGeneratedControlPlanePythonServer,
         ],
-        requirementsFile: fromRoot("packages/sources/requirements.txt"),
+        requirementsFile: fromRoot("packages/sources/requirements.lock.txt"),
         architecture: "arm64",
       }),
       timeout: cdk.Duration.minutes(15),
@@ -892,7 +897,7 @@ export class SourcesStack extends SCLStack {
             Paths.commonLib,
             Paths.smithyGeneratedControlPlanePythonServer,
           ],
-          requirementsFile: fromRoot("packages/sources/requirements.txt"),
+          requirementsFile: fromRoot("packages/sources/requirements.lock.txt"),
           architecture: "arm64",
         }),
         timeout: cdk.Duration.minutes(5),
@@ -1282,6 +1287,7 @@ export class SourcesStack extends SCLStack {
         memoryLimitMiB: 8192,
       },
     );
+    grantGuardDutyAgentPull(dbEnrichmentTaskDef);
 
     const dbEnrichmentImageUri = this.node.tryGetContext(
       "sources_db_enrichment_image_uri",
@@ -1708,7 +1714,7 @@ export class SourcesStack extends SCLStack {
           Paths.commonLib,
           Paths.smithyGeneratedControlPlanePythonServer,
         ],
-        requirementsFile: fromRoot("packages/sources/requirements.txt"),
+        requirementsFile: fromRoot("packages/sources/requirements.lock.txt"),
         architecture: "arm64",
       }),
       timeout: cdk.Duration.seconds(30),
@@ -1769,6 +1775,119 @@ export class SourcesStack extends SCLStack {
       }),
     );
 
+    // ── Graph-verify Queue + Lambda (RDF_SPARQL reachability) ────────
+    //
+    // A graph source has no schema to scan. Create and re-scan enqueue here
+    // instead of on the db-scan queue, and this Lambda runs the reachability
+    // probe chosen by the source's configuration.store (Neptune:
+    // neptunedata GetEngineStatus over SigV4), then flips the source to
+    // APPROVED/queryable or SCAN_FAILED. One queue and one Lambda serve every
+    // SPARQL engine — a new engine is a new probe in the handler.
+    //
+    // Built only with `-c graph_sources=on`: off, the stack is main's.
+    let graphVerify:
+      | { fn: lambda.Function; queue: sqs.Queue; dlq: sqs.Queue }
+      | undefined;
+    if (graphSourcesEnabled(this.node)) {
+      const sparqlSourceEgressSecurityGroup =
+        props.network.sparqlSourceEgressSecurityGroup;
+      if (!sparqlSourceEgressSecurityGroup) {
+        throw new Error(
+          "graph_sources is on but the NetworkStack has no SPARQL source egress security group",
+        );
+      }
+      const graphVerifyDlq = new sqs.Queue(this, "GraphVerifyDLQ", {
+        queueName: this.prefixed("sources-graph-verify-dlq"),
+        retentionPeriod: cdk.Duration.days(14),
+        encryption: sqs.QueueEncryption.SQS_MANAGED,
+        enforceSSL: true,
+      });
+      // Verify records its last attempt rather than raising, so a source is never left REGISTERED by the DLQ.
+      const graphVerifyMaxReceives = 3;
+      const graphVerifyQueue = new sqs.Queue(this, "GraphVerifyQueue", {
+        queueName: this.prefixed("sources-graph-verify-queue"),
+        // Above the Lambda timeout, so a message stays invisible until the verify
+        // has either recorded its result or failed.
+        visibilityTimeout: cdk.Duration.seconds(90),
+        encryption: sqs.QueueEncryption.SQS_MANAGED,
+        enforceSSL: true,
+        deadLetterQueue: {
+          maxReceiveCount: graphVerifyMaxReceives,
+          queue: graphVerifyDlq,
+        },
+      });
+      const graphVerifyFn = new lambda.Function(this, "GraphVerifyFn", {
+        functionName: this.prefixed("sources-graph-verify"),
+        runtime: lambda.Runtime.PYTHON_3_12,
+        architecture: lambda.Architecture.ARM_64,
+        handler: "coa_sources.database.graph_verify.handler.handler",
+        code: bundlePython({
+          srcDirs: [fromRoot("packages/sources/src"), Paths.commonLib],
+          requirementsFile: fromRoot("packages/sources/requirements.lock.txt"),
+          architecture: "arm64",
+        }),
+        // The probe itself is capped at GRAPH_VERIFY_TIMEOUT_S (8s default).
+        timeout: cdk.Duration.seconds(30),
+        memorySize: 256,
+        vpc,
+        vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+        securityGroups: [lambdaSecurityGroup, sparqlSourceEgressSecurityGroup],
+        environment: {
+          SOURCES_TABLE: this.sourcesTable.tableName,
+          SOURCE_SCAN_JOBS_TABLE: this.sourceScanJobsTable.tableName,
+          // The platform catalog cluster: it holds every namespace's ontology, so
+          // verify refuses its endpoints (and approves nothing without it).
+          // The storage stack's fixed `dbClusterIdentifier`: a name, not an import, so
+          // turning the switch off never has to drop an export this stack uses.
+          PLATFORM_NEPTUNE_CLUSTER_ID: this.prefixed("neptune"),
+          GRAPH_VERIFY_MAX_RECEIVES: String(graphVerifyMaxReceives),
+          [GRAPH_SOURCES_ENV]: "true",
+        },
+      });
+      // Reads the source record; writes its status/queryable/errorMessage.
+      this.sourcesTable.grantReadWriteData(graphVerifyFn);
+      // Closes the Scan History row the API opened.
+      this.sourceScanJobsTable.grantReadWriteData(graphVerifyFn);
+      // GetEngineStatus is the whole probe: no data read, write or delete. The
+      // cluster is customer-chosen and its resource id is known only at run time,
+      // so the grant is every cluster in THIS account and region: the verify
+      // refuses a source that signs for another region before it sends anything.
+      // Cross-account Neptune is out of scope.
+      graphVerifyFn.addToRolePolicy(
+        new iam.PolicyStatement({
+          sid: "GraphVerifyNeptuneEngineStatus",
+          actions: ["neptune-db:GetEngineStatus"],
+          resources: [
+            `arn:${cdk.Aws.PARTITION}:neptune-db:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:*/*`,
+          ],
+        }),
+      );
+      // Before it probes, the verify lists this account's Neptune clusters in its
+      // region and probes only one of their endpoints. Custom endpoints are listed
+      // only by DescribeDBClusterEndpoints.
+      graphVerifyFn.addToRolePolicy(
+        new iam.PolicyStatement({
+          sid: "GraphVerifyListAccountNeptuneClusters",
+          actions: ["rds:DescribeDBClusterEndpoints", "rds:DescribeDBClusters"],
+          resources: [
+            `arn:${cdk.Aws.PARTITION}:rds:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:cluster:*`,
+            `arn:${cdk.Aws.PARTITION}:rds:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:cluster-endpoint:*`,
+          ],
+        }),
+      );
+      graphVerifyFn.addEventSource(
+        new lambdaEventSources.SqsEventSource(graphVerifyQueue, {
+          batchSize: 1,
+          maxConcurrency: 5,
+        }),
+      );
+      graphVerify = {
+        fn: graphVerifyFn,
+        queue: graphVerifyQueue,
+        dlq: graphVerifyDlq,
+      };
+    }
+
     // ── Bulk Review Queue + Worker Lambda ────────────────────────────
     //
     // Async pipeline for ApproveSource / RejectSource. The API Lambda
@@ -1815,7 +1934,7 @@ export class SourcesStack extends SCLStack {
           Paths.commonLib,
           Paths.smithyGeneratedControlPlanePythonServer,
         ],
-        requirementsFile: fromRoot("packages/sources/requirements.txt"),
+        requirementsFile: fromRoot("packages/sources/requirements.lock.txt"),
         architecture: "arm64",
       }),
       timeout: cdk.Duration.minutes(5),
@@ -1918,7 +2037,7 @@ export class SourcesStack extends SCLStack {
             Paths.commonLib,
             Paths.smithyGeneratedControlPlanePythonServer,
           ],
-          requirementsFile: fromRoot("packages/sources/requirements.txt"),
+          requirementsFile: fromRoot("packages/sources/requirements.lock.txt"),
           architecture: "arm64",
         }),
         // The whole point: 15 minutes instead of the API's 30 seconds.
@@ -2126,6 +2245,7 @@ export class SourcesStack extends SCLStack {
         memoryLimitMiB: 16384,
       },
     );
+    grantGuardDutyAgentPull(kgBuildTaskDef);
 
     const kgBuildImageUri = this.node.tryGetContext(
       "sources_kg_build_image_uri",
@@ -2277,8 +2397,11 @@ export class SourcesStack extends SCLStack {
         },
       }),
     );
-    // Bedrock batch job actions scoped to the same model ARN patterns as InvokeModel above.
-    // Prevents launching batch jobs against arbitrary models or stopping jobs from other workloads.
+    // Bedrock batch job actions. CreateModelInvocationJob authorizes against BOTH the
+    // model it runs (foundation-model / inference-profile — same patterns as InvokeModel
+    // above) AND the model-invocation-job resource it creates; Get/List/Stop act on the
+    // job resource. All three ARN patterns are required — omitting model-invocation-job
+    // fails every batch submit with AccessDenied on CreateModelInvocationJob.
     kgBuildTaskDef.taskRole.addToPrincipalPolicy(
       new iam.PolicyStatement({
         actions: [
@@ -2290,6 +2413,7 @@ export class SourcesStack extends SCLStack {
         resources: [
           `arn:aws:bedrock:*::foundation-model/*`,
           `arn:aws:bedrock:*:${this.account}:inference-profile/*`,
+          `arn:aws:bedrock:*:${this.account}:model-invocation-job/*`,
         ],
       }),
     );
@@ -2705,7 +2829,7 @@ export class SourcesStack extends SCLStack {
         code: bundlePython({
           srcDirs: [Paths.sourcesDocumentsDeletion, Paths.commonLib],
           requirementsFile: fromRoot(
-            "packages/sources/documents/deletion/requirements.txt",
+            "packages/sources/documents/deletion/requirements.lock.txt",
           ),
           architecture: "arm64",
         }),
@@ -2864,7 +2988,7 @@ export class SourcesStack extends SCLStack {
         code: bundlePython({
           srcDirs: [Paths.sourcesDocumentsTrigger, Paths.commonLib],
           requirementsFile: fromRoot(
-            "packages/sources/documents/trigger/requirements.txt",
+            "packages/sources/documents/trigger/requirements.lock.txt",
           ),
           architecture: "arm64",
         }),
@@ -2925,7 +3049,7 @@ export class SourcesStack extends SCLStack {
           Paths.commonLib,
           Paths.smithyGeneratedControlPlanePythonServer,
         ],
-        requirementsFile: fromRoot("packages/sources/requirements.txt"),
+        requirementsFile: fromRoot("packages/sources/requirements.lock.txt"),
         architecture: "arm64",
       }),
       timeout: cdk.Duration.seconds(30),
@@ -2938,6 +3062,10 @@ export class SourcesStack extends SCLStack {
         SOURCE_SCAN_JOBS_TABLE: this.sourceScanJobsTable.tableName,
         NAMESPACES_TABLE: namespacesTableName,
         SCAN_QUEUE_URL: dbScanQueue.queueUrl,
+        ...(graphVerify && {
+          GRAPH_VERIFY_QUEUE_URL: graphVerify.queue.queueUrl,
+          [GRAPH_SOURCES_ENV]: "true",
+        }),
         INGESTION_QUEUE_URL: docIngestionQueue.queueUrl,
         REVIEW_QUEUE_URL: bulkReviewQueue.queueUrl,
         // Database-source deletes hand their unbounded DataZone teardown here.
@@ -3015,6 +3143,7 @@ export class SourcesStack extends SCLStack {
     this.sourceScanJobsTable.grantReadWriteData(sourcesApiFn);
     namespacesTable.grantReadWriteData(sourcesApiFn);
     dbScanQueue.grantSendMessages(sourcesApiFn);
+    graphVerify?.queue.grantSendMessages(sourcesApiFn);
     docIngestionQueue.grantSendMessages(sourcesApiFn);
     bulkReviewQueue.grantSendMessages(sourcesApiFn);
     sourceDeleteQueue.grantSendMessages(sourcesApiFn);
@@ -3374,6 +3503,57 @@ export class SourcesStack extends SCLStack {
         action: props.alarmAction,
       });
     }
+    if (graphVerify) {
+      // A cluster claim whose release failed locks the cluster for every other namespace and nothing reaps it,
+      // so verify's and the delete path's release failures are counted from their logs, as one metric.
+      for (const [id, fn] of [
+        ["GraphVerify", graphVerify.fn],
+        ["SourcesApi", sourcesApiFn],
+        ["SourceDeleteWorker", sourceDeleteWorkerFn],
+      ] as const) {
+        new logs.MetricFilter(this, `${id}ClaimReleaseFailedFilter`, {
+          logGroup: fn.logGroup,
+          filterPattern: logs.FilterPattern.stringValue(
+            "$.event",
+            "=",
+            "graph_cluster_claim_release_failed",
+          ),
+          metricNamespace: sourcesNamespace,
+          metricName: "GraphClusterClaimReleaseFailed",
+          metricValue: "1",
+        });
+      }
+      const claimReleaseFailures = new cloudwatch.Metric({
+        namespace: sourcesNamespace,
+        metricName: "GraphClusterClaimReleaseFailed",
+        statistic: "Sum",
+        period: cdk.Duration.minutes(5),
+      });
+      const claimReleaseAlarm = new cloudwatch.Alarm(
+        this,
+        "GraphClusterClaimReleaseFailedAlarm",
+        {
+          alarmName: this.prefixed("graph-cluster-claim-release-failed"),
+          alarmDescription:
+            "A Neptune cluster claim could not be released after a failed verify or a source delete, so the " +
+            "cluster stays registered to that namespace. Search the graph-verify, sources-api and " +
+            "sources-delete-worker logs for " +
+            "graph_cluster_claim_release_failed and delete the GRAPHCLUSTER# claim row if no source uses it.",
+          metric: claimReleaseFailures,
+          threshold: 1,
+          comparisonOperator:
+            cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+          evaluationPeriods: 1,
+          treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+        },
+      );
+      if (props.alarmAction) {
+        props.alarmAction.addAlarmActions({
+          alarm: claimReleaseAlarm,
+          action: props.alarmAction,
+        });
+      }
+    }
     // Explicit TransactWriteItems grant (grantReadWriteData covers it but be explicit for audit)
     sourcesApiFn.addToRolePolicy(
       new iam.PolicyStatement({
@@ -3577,7 +3757,7 @@ export class SourcesStack extends SCLStack {
           Paths.commonLib,
           Paths.smithyGeneratedControlPlanePythonServer,
         ],
-        requirementsFile: fromRoot("packages/sources/requirements.txt"),
+        requirementsFile: fromRoot("packages/sources/requirements.lock.txt"),
         architecture: "arm64",
       }),
       timeout: cdk.Duration.seconds(30),
@@ -3667,8 +3847,16 @@ export class SourcesStack extends SCLStack {
       .monitorStateMachine(dbScanStateMachine)
       .monitorStateMachine(docIngestionStateMachine)
       .monitorStateMachine(docDeletionStateMachine)
-      .monitorLambda(glueEventRescanFn)
-      .monitorQueueWithDlq(dbScanQueue, dbScanDlq)
+      .monitorLambda(glueEventRescanFn);
+    // Graph verify is monitored in its usual place in the order, when it exists.
+    if (graphVerify) monitoring.monitorLambda(graphVerify.fn);
+    monitoring.monitorQueueWithDlq(dbScanQueue, dbScanDlq);
+    // A DLQ'd verify is a graph source stuck REGISTERED (delete and re-scan
+    // both refuse an active status) — page on it.
+    if (graphVerify) {
+      monitoring.monitorQueueWithDlq(graphVerify.queue, graphVerify.dlq);
+    }
+    monitoring
       .monitorQueueWithDlq(bulkReviewQueue, bulkReviewDlq)
       .monitorQueueWithDlq(docIngestionQueue, docIngestionDlq)
       .monitorQueueWithDlq(glueEventQueue, glueEventDlq)

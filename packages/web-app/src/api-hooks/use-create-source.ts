@@ -34,7 +34,11 @@ export function useCreateSource(
     ControlPlaneServiceServiceException,
     CreateSourceCommandInput
   >({
+    ...options,
     mutationFn: (input) => client.send(new CreateSourceCommand(input)),
+    // Spread the caller's options first so a caller onSuccess cannot replace
+    // this one and skip the cache refresh. Return the caller's result so the
+    // mutation still waits for a promise it returns.
     onSuccess: (data, input, ctx) => {
       queryClient.invalidateQueries({ queryKey: ["sources"] });
       // The source counter lives on the namespace record (sourceCount), so
@@ -46,8 +50,7 @@ export function useCreateSource(
           queryKey: ["namespace", input.namespaceId],
         });
       }
-      options?.onSuccess?.(data, input, ctx);
+      return options?.onSuccess?.(data, input, ctx);
     },
-    ...options,
   });
 }

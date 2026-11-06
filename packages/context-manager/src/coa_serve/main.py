@@ -11,6 +11,7 @@ MCP) and coordinates downstream services through tiered resolution.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import math
 import os
 import re
@@ -24,6 +25,7 @@ from coa_common.constants import validate_query_text
 from coa_common.label_language import LabelPreference
 from coa_common.language_tags import LanguageTagError
 from coa_common.logging import setup_logging
+from coa_common.sparql_config import graph_sources_enabled
 from pydantic import ValidationError
 
 from .clients.athena import AthenaQueryExecutor
@@ -31,6 +33,7 @@ from .clients.bedrock import BedrockLLMClient
 from .clients.composite_executor import CompositeQueryExecutor
 from .clients.neptune import NeptuneGraphClient
 from .clients.opensearch import OpenSearchVectorClient
+from .clients.sparql_clients import SparqlClientCache
 from .config import ServiceConfig, load_config
 from .exceptions import (
     AccessDeniedError,
@@ -66,8 +69,10 @@ from .tier2.ontop.sparql_example_loader import FewShotExampleLoader
 from .tier2.ontop.strategy import OntopStrategy
 from .tier2.ontop.vkg_translator import VKGTranslator
 from .tier2.skip.aoss_provenance import AossProvenanceEvaluator
+from .tier2.sparql.nl_to_sparql import NativeNLtoSPARQL
+from .tier2.sparql.strategy import SparqlStrategy
 from .tier2.sql_firewall import SQLFirewall
-from .tier2.strategy import StructuredQueryTier
+from .tier2.strategy import StrategyOption, StructuredQueryTier
 from .tier3.graph_traverser import GraphTraverser, is_traversable_uri
 from .tier3.knowledge_retriever import (
     KnowledgeRetriever,
@@ -85,7 +90,16 @@ from .trace import TraceCollector
 setup_logging(os.environ.get("LOG_LEVEL", "INFO"))
 logger = structlog.get_logger(__name__)
 
-app = BedrockAgentCoreApp()
+
+@contextlib.asynccontextmanager
+async def _lifespan(_app):
+    """Release long-lived per-source SPARQL clients when the runtime shuts down."""
+    yield
+    if _sparql_client_cache is not None:
+        await _sparql_client_cache.aclose()
+
+
+app = BedrockAgentCoreApp(lifespan=_lifespan)
 
 _config: ServiceConfig | None = None
 _guardrail_provider: GuardrailConfigProvider | None = None
@@ -94,6 +108,7 @@ _session_manager: SessionManager | None = None
 _session_metadata: SessionMetadataStore | None = None
 _sources_registry: SourcesRegistry | None = None
 _nl_to_sparql: NLtoSPARQL | None = None
+_sparql_client_cache: SparqlClientCache | None = None
 _init_lock = asyncio.Lock()
 
 # Hard upper bound on the per-request transport budget: max(10, min(env, 300)).
@@ -131,10 +146,55 @@ def _build_deadline(request) -> Deadline:
 _NAMESPACE_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$")
 
 
+def _register_sparql_strategy(
+    strategies: list,
+    *,
+    graph_client,
+    llm_client,
+    guardrail_id: str,
+    guardrail_id_provider,
+    sources_registry,
+    vector_client,
+    oss_ontology_index: str,
+    firewall: SQLFirewall,
+) -> SparqlStrategy | None:
+    """Register the native SPARQL strategy when the graph-sources switch is on.
+
+    Ships dark: with the switch off the list is untouched. Inserted just before Ontop,
+    so in a mixed namespace the default chain runs NL→SQL, then NL→SPARQL, then
+    Ontop (LLD §3.3): Ontop answers from the SQL mappings with a low measured
+    accuracy, and running it first left graph questions to a weak SQL answer. The
+    runner only selects it for a namespace that has a graph source, or a request
+    that pins it. ``firewall`` is the SQL strategies' own, so Cedar admits the same
+    principals to the graph path as to the SQL path.
+    """
+    if not graph_sources_enabled():
+        return None
+    strategy = SparqlStrategy(
+        translator=NativeNLtoSPARQL(
+            graph_client=graph_client,
+            llm_client=llm_client,
+            guardrail_id=guardrail_id,
+            guardrail_id_provider=guardrail_id_provider,
+        ),
+        sources_registry=sources_registry,
+        vector_client=vector_client,
+        oss_ontology_index=oss_ontology_index,
+        namespace_authorizer=firewall,
+    )
+    ontop_at = next((i for i, s in enumerate(strategies) if getattr(s, "name", None) == StrategyOption.ONTOP), None)
+    if ontop_at is None:
+        strategies.append(strategy)
+    else:
+        strategies.insert(ontop_at, strategy)
+    logger.info("sparql_strategy_registered")
+    return strategy
+
+
 async def _ensure_initialized():
     """Initialize config and orchestrator on first request."""
     global _config, _guardrail_provider, _orchestrator, _session_manager
-    global _session_metadata, _sources_registry, _nl_to_sparql
+    global _session_metadata, _sources_registry, _nl_to_sparql, _sparql_client_cache
     if _orchestrator is not None:
         return
     async with _init_lock:
@@ -361,9 +421,20 @@ async def _ensure_initialized():
             # with the flag off the client is simply never used.
             graph_client=neptune_client,
         )
-        structured_query_tier = StructuredQueryTier(
-            strategies=[ontop_strategy, nl_to_sql_strategy, agentic_strategy],
+        strategies = [ontop_strategy, nl_to_sql_strategy, agentic_strategy]
+        sparql_strategy = _register_sparql_strategy(
+            strategies,
+            graph_client=neptune_client,
+            llm_client=bedrock_client,
+            guardrail_id=config.guardrail_id,
+            guardrail_id_provider=guardrail_provider.guardrail_id,
+            sources_registry=sources_registry,
+            vector_client=opensearch_client,
+            oss_ontology_index=oss_ontology_index,
+            firewall=firewall,
         )
+        _sparql_client_cache = sparql_strategy.client_cache if sparql_strategy is not None else None
+        structured_query_tier = StructuredQueryTier(strategies=strategies)
 
         # Deep-reasoning Tier 3 path. Built so a deployment default
         # (TIER3_STRATEGY=deep-reasoning) OR a per-request
@@ -380,7 +451,7 @@ async def _ensure_initialized():
         agentic_retriever = None
         try:
             from .clients.base import ClientSet
-            from .tier3.agentic.factory import build_agentic_retriever
+            from .tier3.agentic.factory import build_agentic_retriever, build_stop_signal_config
             from .tier3.agentic.planner import BedrockStepPlanner
 
             agentic_clients = ClientSet(
@@ -393,6 +464,7 @@ async def _ensure_initialized():
                 bedrock_client,
                 guardrail_id=config.guardrail_id or None,
                 guardrail_id_provider=guardrail_provider.guardrail_id,
+                stop_signals=build_stop_signal_config(config),
             )
             agentic_retriever = build_agentic_retriever(
                 config,
@@ -400,6 +472,8 @@ async def _ensure_initialized():
                 step_planner,
                 structured_query_tier=structured_query_tier,
                 guardrail_id_provider=guardrail_provider.guardrail_id,
+                # Scopes the read_document tool to each namespace's DOCUMENTS sources.
+                sources_registry=sources_registry,
             )
         except Exception as exc:
             logger.warning("agentic_retriever_unavailable", error=type(exc).__name__, error_msg=str(exc)[:200])
@@ -1231,7 +1305,7 @@ async def invoke(payload: dict, context=None):
     # of a 404 masking their input mistake. The regex matches the constraint on
     # InvokeRequest.namespace so behavior is identical between paths.
     namespace = payload.get("namespace", "")
-    if namespace and not _NAMESPACE_PATTERN.match(namespace):
+    if namespace and not _NAMESPACE_PATTERN.fullmatch(namespace):
         yield {
             "error": "ValidationError",
             "message": "Invalid namespace format",
@@ -1394,15 +1468,21 @@ async def invoke(payload: dict, context=None):
     # Otherwise yield a single dict (backward compat for MCP/data-layer callers).
     stream_mode = payload.get("stream", False)
 
-    if not stream_mode:
-        async for event in _handle_blocking_query(request, request_id):
-            yield event
-        return
+    # Bind the request id for the query, so log lines emitted deep in the
+    # resolve path (merge_contextvars) carry it without threading it through.
+    structlog.contextvars.bind_contextvars(request_id=request_id)
+    try:
+        if not stream_mode:
+            async for event in _handle_blocking_query(request, request_id):
+                yield event
+            return
 
-    # ── Streaming SSE mode ────────────────────────────────────────────────
-    session_user_id = _jwt_user_id or upstream_user_id
-    async for event in _handle_streaming_query(payload, request, request_id, session_user_id):
-        yield event
+        # ── Streaming SSE mode ────────────────────────────────────────────
+        session_user_id = _jwt_user_id or upstream_user_id
+        async for event in _handle_streaming_query(payload, request, request_id, session_user_id):
+            yield event
+    finally:
+        structlog.contextvars.unbind_contextvars("request_id")
 
 
 if __name__ == "__main__":

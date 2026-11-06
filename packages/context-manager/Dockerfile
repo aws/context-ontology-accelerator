@@ -23,9 +23,17 @@ RUN dnf upgrade -y --releasever=latest && \
 
 RUN useradd --no-create-home --shell /bin/false appuser
 
+# Every project dependency install below is constrained to the versions uv.lock pins, which the tests ran on: the query service's SQL and graph parsing depends on those versions, so an untested release inside a pyproject
+# range can change query behavior. The script needs only the standard library.
+COPY uv.lock scripts/uv_lock_constraints.py /tmp/lock/
+RUN python /tmp/lock/uv_lock_constraints.py /tmp/lock/uv.lock > /tmp/constraints.txt && \
+    rm -rf /tmp/lock/ && \
+    pip install --no-cache-dir uv==0.13.4
+
 # Install shared common library (changes less often -> better layer caching)
 COPY libs/common/ /tmp/common/
-RUN pip install --no-cache-dir /tmp/common/ && rm -rf /tmp/common/
+RUN uv pip install --system --python /usr/bin/python3.12 --no-cache --constraint /tmp/constraints.txt /tmp/common/ && \
+    rm -rf /tmp/common/
 
 # Install package with dependencies.
 COPY packages/context-manager/pyproject.toml ./
@@ -35,12 +43,13 @@ COPY packages/context-manager/src/ ./src/
 COPY packages/mcp-server/pyproject.toml /tmp/mcp-server/pyproject.toml
 COPY packages/mcp-server/src/ /tmp/mcp-server/src/
 
-RUN pip install --no-cache-dir uv && \
-    sed -i '/\[tool.uv.sources\]/,$ d' pyproject.toml && \
+# pip itself is upgraded to its newest release, not pinned: like the OS packages above, it floats for security
+# fixes, and the service never imports it. setuptools stays at the lock's version through the constraints.
+RUN sed -i '/\[tool.uv.sources\]/,$ d' pyproject.toml && \
     sed -i '/\[tool.uv.sources\]/,$ d' /tmp/mcp-server/pyproject.toml && \
-    uv pip install --system --python /usr/bin/python3.12 --no-cache . /tmp/mcp-server/ && \
+    uv pip install --system --python /usr/bin/python3.12 --no-cache --constraint /tmp/constraints.txt . /tmp/mcp-server/ && \
     rm -rf /tmp/mcp-server/ && \
-    pip install --no-cache-dir --upgrade pip "setuptools>=78.1.1" && \
+    pip install --no-cache-dir -c /tmp/constraints.txt --upgrade pip "setuptools>=78.1.1" && \
     pip uninstall -y msgpack
 
 EXPOSE 8080

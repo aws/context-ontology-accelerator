@@ -348,13 +348,34 @@ walking `rdfs:domain` edges.
 **`coa:isMapped` is a derived marker, not stored input.** It is computed
 server-side from R2RML `rr:class` membership
 (`ingest.py:_class_datasource_map_from_r2rml`) and any caller-supplied
-`coa:isMapped` triple is **stripped** at ingest (`_strip_ismapped_triples`) —
-it is a trust boundary, since forging it would force an unbacked class into the
-structured-query prompt. Note the deliberate decoupling: **membership** decides
-`isMapped` (Ontop can answer a mapped class even with no datasource id), while
-the **id value** feeds AOSS `data_source_id` for NL→SQL routing. A mapped class
-with no id is still `isMapped` but is dropped by the NL→SQL presence filter.
-Only `"true"` is ever emitted — absent means unmapped.
+`coa:isMapped` triple is **stripped** at ingest (`_strip_server_markers`, which
+also strips `coa:queryBackend` and `coa:dataSourceId`) — it is a trust boundary,
+since forging it would force an unbacked class into the structured-query
+prompt. Note the deliberate decoupling: **membership** decides `isMapped` (Ontop
+can answer a mapped class even with no datasource id), while the **id value**
+feeds AOSS `data_source_id` for NL→SQL routing. A mapped class with no id is
+still `isMapped` but is dropped by the NL→SQL presence filter. Only `"true"` is
+ever emitted — absent means unmapped.
+
+**Graph-backed classes (RDF_SPARQL sources).** A graph source has no R2RML, so
+an imported class names its source with the author directive
+`coa_import:dataSourceName "<source name>"`
+(`ingest.py:_class_graphsource_map_from_payload`). Import resolves the name to
+exactly one registered `RDF_SPARQL` source in the namespace
+(`catalog/graph_source_resolver.py`) and emits, server-side:
+
+```turtle
+ex:SupportTicket coa:isMapped true ;
+    coa:queryBackend "RDF_SPARQL" ;    # second serve gate signal; absent == SQL
+    coa:dataSourceId "src-abc123" .    # routes the query to that source's endpoint
+```
+
+The class's AOSS document gets `query_backend: "RDF_SPARQL"` and the source id
+as `data_source_id`. The import is rejected (422, one class-attributed finding
+per problem) when a name is unknown, ambiguous or not a graph source, when a
+class names more than one source, or when a class is also the `rr:class` of an
+R2RML TriplesMap. The `coa_import:` directives are removed before the bulk load,
+so they never appear in the queryable graph.
 
 ### 2.6 The four internal representations
 
@@ -438,13 +459,12 @@ that into a single document read.
 - `embed_text` / `context_text` are caches with no invalidation hook. Editing
   the ontology, or re-inducing, requires regenerating them or the NL→SQL prompt
   silently describes the old schema.
-- `coa:isMapped` is derived at ingest, so a namespace accepted before the marker
-  existed would be wholly invisible to Tier 2. That required an explicit
-  compatibility shim: `tbox_context.py` probes each namespace once and, finding
-  zero markers, **drops the gate entirely** so pre-marker namespaces stay
-  visible. Strict per-class gating applies only once a namespace has ≥1 marker.
-  Migration is a fresh induction into a **new** namespace — migrating one
-  ontology inside a shared namespace flips the whole namespace strict.
+- `coa:isMapped` (and the AOSS `data_source_id`) is derived at ingest, so a
+  namespace accepted before the marker existed is wholly invisible to Tier 2.
+  A temporary shim that dropped the gate for zero-marker namespaces was removed:
+  it also exposed document-induced classes as tables whenever a
+  structured proposal was not yet accepted. Migration is a fresh structured
+  induction, or a new namespace.
 - Metadata lives in four stores, so "what does this class look like" has four
   possible answers during any window where they disagree.
 

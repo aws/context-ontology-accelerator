@@ -38,6 +38,9 @@ import { isSubmitEnter } from "@utils/keyboard";
 import { useAppI18n } from "../i18n/LocaleProvider";
 import type { AppMessage } from "../i18n/appMessages";
 
+/** `MetricLabel` in metric-service.smithy: 1-256 code points after NFC. */
+const LABEL_MAX_LENGTH = 256;
+
 const DIALECT_OPTIONS: Array<{ value: SqlDialect; label: string }> = [
   { value: SqlDialectEnum.POSTGRESQL, label: "PostgreSQL" },
   { value: SqlDialectEnum.TRINO, label: "Trino" },
@@ -119,11 +122,20 @@ export const MetricForm: React.FC = () => {
   const [defaultTimeGrain, setDefaultTimeGrain] = useState("");
   const [unit, setUnit] = useState("");
   const [returnType, setReturnType] = useState("");
-  // UpdateMetric is a full replace, so the existing label is kept here and
-  // sent back unchanged, or a save would clear it. Undefined when the metric
-  // has none, so the field is omitted (an empty string is rejected by the
-  // 1-256 length rule).
-  const [label, setLabel] = useState<string | undefined>(undefined);
+  // Display-only label. UpdateMetric is a full replace, so the stored label is
+  // loaded here and sent back as it is, or a save would clear it. A field that
+  // is empty or only whitespace sends no label (an empty string is rejected by
+  // the 1-256 rule), so clearing the field and saving removes the label.
+  const [label, setLabel] = useState("");
+  // Spread into an array to count code points, not UTF-16 units, as the
+  // service counts them after NFC.
+  const labelLength = [...label.normalize("NFC")].length;
+  const labelError =
+    labelLength > LABEL_MAX_LENGTH
+      ? t("Display label must be {max} characters or fewer", {
+          max: LABEL_MAX_LENGTH,
+        })
+      : undefined;
 
   // Fetch sources for the data source dropdown
   const { data: sourcesData } = useListSources(
@@ -227,9 +239,7 @@ export const MetricForm: React.FC = () => {
       setDefaultTimeGrain(m.defaultTimeGrain ?? "");
       setUnit(m.unit ?? "");
       setReturnType(m.returnType ?? "");
-      setLabel(
-        typeof m.label === "string" && m.label !== "" ? m.label : undefined,
-      );
+      setLabel(typeof m.label === "string" ? m.label : "");
       setDialects(
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         (m.expression?.dialects ?? []).map((d: any) => ({
@@ -260,6 +270,10 @@ export const MetricForm: React.FC = () => {
 
     if (!name.trim()) {
       setFormError(t("Name is required"));
+      return;
+    }
+    if (labelError) {
+      setFormError(labelError);
       return;
     }
     if (!description.trim()) {
@@ -295,7 +309,11 @@ export const MetricForm: React.FC = () => {
       }),
       ...(unit.trim() && { unit: unit.trim() }),
       ...(returnType.trim() && { returnType: returnType.trim() }),
-      ...(label !== undefined && { label }),
+      // Sent untrimmed: the service normalizes it and decides which characters
+      // it accepts. A field that is only whitespace counts as blank, so it is
+      // left out, which clears the label, instead of reaching the service's
+      // "no visible character" check.
+      ...(label.trim() !== "" && { label }),
     };
 
     const exList = examples.map((e) => e.value).filter(Boolean);
@@ -373,6 +391,23 @@ export const MetricForm: React.FC = () => {
                 onChange={({ detail }) => setName(detail.value)}
                 disabled={isEdit}
                 placeholder={t("monthly_revenue")}
+              />
+            </FormField>
+            <FormField
+              label={t("Display label (optional)")}
+              description={t(
+                "Shown in the console instead of the name. Questions are not matched against it; use synonyms for that.",
+              )}
+              constraintText={t(
+                "{count}/{max} characters, counted after Unicode NFC normalization",
+                { count: labelLength, max: LABEL_MAX_LENGTH },
+              )}
+              errorText={labelError}
+            >
+              <Input
+                value={label}
+                onChange={({ detail }) => setLabel(detail.value)}
+                placeholder={t("Monthly revenue")}
               />
             </FormField>
             <FormField label={t("Description")}>

@@ -448,6 +448,23 @@ class TestListInducedDatasourcesRoute:
         assert [d["datasourceId"] for d in second["datasources"]] == ["c"]
         assert "nextToken" not in second
 
+    def test_a_bridge_proposal_does_not_stand_in_for_the_table_induction(self, client):
+        bridge = {
+            "proposal_id": "p-bridge",
+            "proposal_type": "bridge",
+            "ontology_id": "urn:o",
+            "metadata": {"datasource_ids": ["a"], "label": "Document-to-table bridge"},
+        }
+        tables = {
+            "proposal_id": "p-tables",
+            "proposal_type": "induction",
+            "ontology_id": "urn:o",
+            "metadata": {"datasource_ids": ["a"], "label": "orders"},
+        }
+        with patch.object(induce_catalog.dynamo_store, "list_proposals", return_value=[bridge, tables]):
+            rows = client.get("/induce/datasources/induced?namespace=ns").json()["datasources"]
+        assert [(d["datasourceId"], d["proposal_id"]) for d in rows] == [("a", "p-tables")]
+
     def test_reads_every_accepted_proposal(self, client):
         with patch.object(induce_catalog.dynamo_store, "list_proposals", return_value=[]) as m:
             assert client.get("/induce/datasources/induced?namespace=ns").json() == {"datasources": []}

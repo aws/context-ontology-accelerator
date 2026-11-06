@@ -22,6 +22,7 @@ import logging
 import re
 import time
 import unicodedata
+from collections.abc import Callable
 from dataclasses import dataclass
 from threading import Lock
 
@@ -103,6 +104,9 @@ _BEDROCK_MAX_POOL_CONNECTIONS = 32
 # window (see _llm_rerank), so raising recall depth without raising this cap
 # still lets a token-overlap hit reach the LLM.
 _RERANK_CANDIDATE_WINDOW = 20
+# How many more candidates to recall when a candidate_filter will discard part
+# of the pool (e.g. a doc-class subject whose nearest neighbours are doc classes).
+_FILTERED_RECALL_FACTOR = 4
 
 # When the top recall candidates' embedding scores span less than this, the
 # retriever did not discriminate — the ranking is near-arbitrary (issue 72
@@ -473,6 +477,7 @@ class GroundingService:
         top_k: int = 30,
         exclude_entity_uri: str | None = None,
         rerank_max_tokens: int = 1000,
+        candidate_filter: Callable[[GroundingCandidate], bool] | None = None,
     ) -> GroundingResult:
         """Ground an induced ontology CLASS against loaded ontologies.
 
@@ -489,6 +494,11 @@ class GroundingService:
         ``source_table`` (the field is strategy-agnostic despite its name);
         callers emit ``skos:*Match`` / ``rdfs:subClassOf`` from
         ``result.chosen`` + ``result.relationship``.
+
+        ``candidate_filter`` (optional) keeps only the recalled candidates it
+        accepts, before the exact-name and rerank layers — used to restrict a
+        pool to one kind of entity (e.g. only the table-backed classes of the
+        namespace's own ontology). ``None`` keeps every candidate.
         """
         return self.ground_table(
             table_name=class_label,
@@ -502,6 +512,7 @@ class GroundingService:
             top_k=top_k,
             exclude_entity_uri=exclude_entity_uri,
             rerank_max_tokens=rerank_max_tokens,
+            candidate_filter=candidate_filter,
             _rerank_system=_RERANK_SYSTEM_CLASS,
             _subject_kind="class",
         )
@@ -519,6 +530,7 @@ class GroundingService:
         top_k: int = 30,
         exclude_entity_uri: str | None = None,
         rerank_max_tokens: int = 1000,
+        candidate_filter: Callable[[GroundingCandidate], bool] | None = None,
         *,
         _rerank_system: str = _RERANK_SYSTEM,
         _subject_kind: str = "table",
@@ -550,6 +562,9 @@ class GroundingService:
                 that includes its own ontology).
             rerank_max_tokens: Output-token cap for the ENHANCED-mode LLM rerank
                 call; reasoning models spend part of it on discarded thinking.
+            candidate_filter: Optional predicate applied to the recalled
+                candidates before the exact-name and rerank layers; ``None``
+                (the default) keeps them all.
 
         Returns:
             A ``GroundingResult`` with the chosen match (or ``match_type
@@ -583,11 +598,19 @@ class GroundingService:
         # ontologies), the subject can recall — and then "ground to" — ITSELF.
         # Exclude its own IRI from the candidate set. Fetch one extra so removing
         # self doesn't shrink the effective top-K.
+        # A candidate_filter drops part of the recalled pool, so recall
+        # _FILTERED_RECALL_FACTOR times as many before filtering down to top_k.
         recall_k = top_k + 1 if exclude_entity_uri else top_k
+        if candidate_filter is not None:
+            recall_k *= _FILTERED_RECALL_FACTOR
         raw_candidates = self._recall(concept_vector, model_id, ontology_ids, recall_k, subject_name=table_name)
         if exclude_entity_uri:
             _self = exclude_entity_uri.rstrip("/")
-            raw_candidates = [c for c in raw_candidates if c.entity_uri.rstrip("/") != _self][:top_k]
+            raw_candidates = [c for c in raw_candidates if c.entity_uri.rstrip("/") != _self]
+            if candidate_filter is None:
+                raw_candidates = raw_candidates[:top_k]
+        if candidate_filter is not None:
+            raw_candidates = [c for c in raw_candidates if candidate_filter(c)][:top_k]
         if not raw_candidates:
             return GroundingResult(
                 source_table=table_name,

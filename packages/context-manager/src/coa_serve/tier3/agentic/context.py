@@ -332,6 +332,10 @@ class AccumulatedContext:
     # synthesis), so no step has to guess the language again. Empty means
     # unresolved: those steps fall back to "match the question's language".
     answer_language: str = ""
+    # True when ``answer_language`` was detected from the question, False when it is
+    # the namespace language used as a fallback. A fallback tag is not the
+    # question's language, so final synthesis does not name it for a follow-up.
+    answer_language_detected: bool = False
     # Position of each accumulated entity by its stable dedupe key. Without it,
     # merging an already-seen entity rescanned `entities` linearly and recomputed a
     # key per element, making accumulation O(n^2) in the entity count.
@@ -344,6 +348,33 @@ class AccumulatedContext:
     # retrieval steps, so the contract records the degradation rather than
     # presenting a misleading cumulative count.
     relationship_cap_reached: bool = False
+    # Source documents matched by name (the find_documents tool, options.entityRouting):
+    # one dict per document — source_key, matched_terms, mentions, quality, snippets —
+    # best first. Shared with forked sub-contexts so every sub-question's planner sees
+    # them. Empty otherwise.
+    document_matches: list[dict] = field(default_factory=list)
+    # Per-request planner settings (options.tokenCaps.planner / plannerParseRetry),
+    # carried here because the planner is stateless and reads only the context.
+    planner_max_tokens: int | None = None
+    planner_parse_retry: bool = False
+    # options.sufficiencyGuards: a positive sufficiency check is held back while a top
+    # name-matched document has been read only in part.
+    sufficiency_guards: bool = False
+    # options.singleCallSteps: the planner's next-step call also decides when to stop.
+    single_call_steps: bool = False
+    # options.keepSlowSql: a prefetch SQL call that outlived its timeout keeps running
+    # here (a ``PendingSql``, shared with forks) so the loop can use it instead of
+    # writing a new query.
+    pending_sql: Any = None
+    # The stop signals parsed from the latest planner reply (a ``ReplySignals``).
+    # The controller clears it before every planner call and the planner writes it
+    # after a parsed reply, so ``None`` means "no signal". Per fork: ``fork()``
+    # does not copy it, so concurrent sub-questions never read each other's.
+    last_stop_signals: Any = None
+    # Bumped once by each :meth:`add` / :meth:`merge` that brought in new items, so
+    # the answer-stability signal compares only replies the context grew between.
+    # Per fork, starting at 0.
+    content_version: int = 0
 
     def _record_relationship_cap(self, dropped_in_merge: int) -> None:
         """Record the first relationship-cap event for this request context."""
@@ -401,6 +432,22 @@ class AccumulatedContext:
         for index, existing in enumerate(self.entities):
             self.entity_positions.setdefault(_entity_key(existing), index)
 
+    def add_document_matches(self, matches: list[dict]) -> None:
+        """Merge ``matches`` into :attr:`document_matches` by key, keeping the better entry.
+
+        Entries are compared by their ``rank_key`` (higher is better); the merged
+        list stays sorted best first.
+        """
+        by_key = {m.get("source_key"): m for m in self.document_matches if m.get("source_key")}
+        for match in matches:
+            key = match.get("source_key")
+            if not key:
+                continue
+            old = by_key.get(key)
+            if old is None or tuple(match.get("rank_key", ())) > tuple(old.get("rank_key", ())):
+                by_key[key] = match
+        self.document_matches = sorted(by_key.values(), key=lambda m: tuple(m.get("rank_key", ())), reverse=True)
+
     def add(self, result: ToolResult) -> int:
         """Incorporate a ToolResult's chunks/entities/rows, returning the NEW count.
 
@@ -450,6 +497,8 @@ class AccumulatedContext:
         # de-duplicated — this is an observability record of what ran.
         self.executed_queries.extend(result.executed_queries)
 
+        if new_count > 0:
+            self.content_version += 1
         return new_count
 
     def fork(self) -> AccumulatedContext:
@@ -469,6 +518,13 @@ class AccumulatedContext:
             ontology=self.ontology,
             present_edge_types=list(self.present_edge_types),
             answer_language=self.answer_language,
+            answer_language_detected=self.answer_language_detected,
+            document_matches=list(self.document_matches),
+            planner_max_tokens=self.planner_max_tokens,
+            planner_parse_retry=self.planner_parse_retry,
+            sufficiency_guards=self.sufficiency_guards,
+            single_call_steps=self.single_call_steps,
+            pending_sql=self.pending_sql,
         )
 
     def merge(self, other: AccumulatedContext) -> int:
@@ -515,10 +571,14 @@ class AccumulatedContext:
         self.relationship_cap_reached = self.relationship_cap_reached or other.relationship_cap_reached
         for entry in other.working_answers:
             self.set_working_answer(entry.get("question", ""), entry.get("answer", ""))
+        if other.document_matches:
+            self.add_document_matches(other.document_matches)
         # Union discovered predicates (preserve order, drop dups a sibling already had).
         for edge in other.present_edge_types:
             if edge not in self.present_edge_types:
                 self.present_edge_types.append(edge)
+        if new_count > 0:
+            self.content_version += 1
         return new_count
 
     def record_degraded(self, source: str, reason: str) -> None:

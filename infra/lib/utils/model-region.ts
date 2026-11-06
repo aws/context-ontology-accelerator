@@ -138,7 +138,11 @@ export function resolveConfiguredModelIds(
       const chat = normalized.bedrockChatModelId;
       return chat != null
         ? { key, modelId: chat, origin: "config" as const }
-        : { key, modelId: MODEL_ID_DEFAULTS.bedrockChatModelId, origin: "default" as const };
+        : {
+            key,
+            modelId: MODEL_ID_DEFAULTS.bedrockChatModelId,
+            origin: "default" as const,
+          };
     }
     // Empty values were normalized away before both this check and stack
     // construction, so the effective value here is the value deployed.

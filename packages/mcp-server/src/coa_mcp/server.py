@@ -255,7 +255,10 @@ async def describe_schema(
 
     Returns the schema structure of the namespace — classes, their properties,
     and connected data sources. Use this tool to understand what data is
-    available and how entities are related before querying.
+    available and how entities are related before querying. Classes mapped to
+    tables (queryable through SQL) are listed first, then the rest by label;
+    classFilter (an exact class IRI, or an IRI namespace ending in # or /) is
+    applied before maxResults, so matching classes are not crowded out by the page limit.
 
     This is a read-only, lightweight lookup — no LLM calls, no SQL execution.
 

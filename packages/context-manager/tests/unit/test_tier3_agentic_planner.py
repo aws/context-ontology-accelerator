@@ -31,8 +31,9 @@ import sys
 from types import SimpleNamespace
 
 import pytest
+from coa_serve.tier3.agentic import planner as planner_module
 from coa_serve.tier3.agentic.context import AccumulatedContext
-from coa_serve.tier3.agentic.models import PlannerDecision, SubQuestion
+from coa_serve.tier3.agentic.models import PlannerDecision, ReplySignals, StopSignalConfig, SubQuestion
 from coa_serve.tier3.agentic.planner import BedrockStepPlanner
 
 
@@ -182,25 +183,25 @@ class TestProposeStepsDegradation:
     async def test_empty_on_converse_error(self):
         planner = BedrockStepPlanner(FakeLLM(raises=RuntimeError("bedrock down")))
         decisions = await planner.propose_steps(sub_question=_sq(), context=AccumulatedContext(), tool_specs=_SPECS)
-        assert decisions == []
+        assert decisions is None  # a failed call is "no tool", never the planner's "enough"
 
     @pytest.mark.asyncio
     async def test_empty_on_guardrail_block(self):
         planner = BedrockStepPlanner(FakeLLM(text='{"candidates": []}', guardrail_blocked=True))
         decisions = await planner.propose_steps(sub_question=_sq(), context=AccumulatedContext(), tool_specs=_SPECS)
-        assert decisions == []
+        assert decisions is None  # a failed call is "no tool", never the planner's "enough"
 
     @pytest.mark.asyncio
     async def test_empty_on_unparseable(self):
         planner = BedrockStepPlanner(FakeLLM(text="not json at all"))
         decisions = await planner.propose_steps(sub_question=_sq(), context=AccumulatedContext(), tool_specs=_SPECS)
-        assert decisions == []
+        assert decisions is None  # a failed call is "no tool", never the planner's "enough"
 
     @pytest.mark.asyncio
     async def test_empty_when_candidates_not_list(self):
         planner = BedrockStepPlanner(FakeLLM(text='{"candidates": "nope"}'))
         decisions = await planner.propose_steps(sub_question=_sq(), context=AccumulatedContext(), tool_specs=_SPECS)
-        assert decisions == []
+        assert decisions is None  # a failed call is "no tool", never the planner's "enough"
 
 
 # ── check_sufficiency (Req 6.1-6.2) ─────────────────────────────────────
@@ -370,3 +371,187 @@ class TestLazyImportInvariant:
             f"importing planner leaked graphrag_toolkit or failed.\nstdout={result.stdout}\nstderr={result.stderr}"
         )
         assert "OK" in result.stdout
+
+
+# ── stop signals: elicited prompts, confidence parsing, carrier ─────────
+
+
+class _SeqLLM:
+    """A ``converse`` fake that returns ``replies`` in order and records each call."""
+
+    def __init__(self, *replies):
+        self._replies = list(replies)
+        self.calls: list[dict] = []
+
+    async def converse(self, *, prompt, system=None, **_):
+        self.calls.append({"prompt": prompt, "system": system})
+        return SimpleNamespace(text=self._replies.pop(0), guardrail_blocked=False)
+
+
+def _single_call_ctx(**fields):
+    ctx = AccumulatedContext()
+    ctx.single_call_steps = True
+    for name, value in fields.items():
+        setattr(ctx, name, value)
+    return ctx
+
+
+_ON = StopSignalConfig(telemetry=True)
+
+
+@pytest.mark.unit
+class TestStopSignalPrompts:
+    @pytest.fixture(autouse=True)
+    def _no_env(self, monkeypatch):
+        # The knobs come only from the injected StopSignalConfig; clear both env
+        # names so no test depends on (or leaks) the process environment.
+        monkeypatch.delenv("DEEP_REASONING_SUFFICIENCY_MIN_CONFIDENCE", raising=False)
+        monkeypatch.delenv("AGENTIC_SUFFICIENCY_MIN_CONFIDENCE", raising=False)
+
+    async def test_env_var_does_not_change_the_prompt(self, monkeypatch):
+        monkeypatch.setenv("DEEP_REASONING_SUFFICIENCY_MIN_CONFIDENCE", "0.9")
+        fake = FakeLLM(text='{"sufficient": true, "working_answer": "x"}')
+        await BedrockStepPlanner(fake).assess(sub_question=_sq(), context=AccumulatedContext())
+        assert '"confidence"' not in fake.calls[-1]["system"]
+
+    async def test_default_propose_and_assess_prompts_do_not_ask_for_signals(self):
+        fake = FakeLLM(text='{"candidates": []}')
+        planner = BedrockStepPlanner(fake, stop_signals=StopSignalConfig())
+        await planner.propose_steps(sub_question=_sq(), context=_single_call_ctx(), tool_specs=_SPECS)
+        await planner.assess(sub_question=_sq(), context=AccumulatedContext())
+        assert all('"confidence"' not in c["system"] for c in fake.calls)
+        assert "REPORT YOUR CONFIDENCE" not in fake.calls[0]["system"]
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            StopSignalConfig(telemetry=True),
+            StopSignalConfig(min_confidence=0.7),
+            StopSignalConfig(similarity_threshold=0.9),
+        ],
+    )
+    async def test_any_knob_elicits_on_single_call_propose(self, config):
+        fake = FakeLLM(text='{"candidates": []}')
+        planner = BedrockStepPlanner(fake, stop_signals=config)
+        await planner.propose_steps(sub_question=_sq(), context=_single_call_ctx(), tool_specs=_SPECS)
+        system = fake.calls[0]["system"]
+        assert system.endswith(planner_module._STOP_SIGNALS_INSTRUCTION)
+        assert "at most 600 characters" in system
+
+    async def test_assess_loop_propose_is_not_elicited(self):
+        fake = FakeLLM(text='{"candidates": []}')
+        planner = BedrockStepPlanner(fake, stop_signals=_ON)
+        await planner.propose_steps(sub_question=_sq(), context=AccumulatedContext(), tool_specs=_SPECS)
+        assert "REPORT YOUR CONFIDENCE" not in fake.calls[0]["system"]
+
+    async def test_elicited_assess_only_swaps_the_response_shape(self):
+        plain, elicited = FakeLLM(text="{}"), FakeLLM(text="{}")
+        ctx = AccumulatedContext()
+        ctx.answer_language = "en"
+        await BedrockStepPlanner(plain).assess(sub_question=_sq(), context=ctx)
+        await BedrockStepPlanner(elicited, stop_signals=_ON).assess(sub_question=_sq(), context=ctx)
+        base, new = plain.calls[0]["system"], elicited.calls[0]["system"]
+        prefix = base.removesuffix(planner_module._ASSESS_RESPONSE_SHAPE)
+        assert new == prefix + planner_module._ASSESS_RESPONSE_SHAPE_WITH_CONFIDENCE
+        assert plain.calls[0]["prompt"] == elicited.calls[0]["prompt"]
+
+    async def test_repair_turn_asks_for_the_same_fields(self):
+        repair = '{"candidates": [], "confidence": 0.8, "working_answer": "A"}'
+        fake = _SeqLLM('{"candidates": [', repair)
+        planner = BedrockStepPlanner(fake, stop_signals=_ON)
+        ctx = _single_call_ctx(planner_parse_retry=True)
+        assert await planner.propose_steps(sub_question=_sq(), context=ctx, tool_specs=_SPECS) == []
+        assert fake.calls[1]["prompt"].endswith(planner_module._PARSE_REPAIR_SUFFIX_WITH_SIGNALS)
+        assert '"confidence"' in planner_module._PARSE_REPAIR_SUFFIX_WITH_SIGNALS
+        assert ctx.last_stop_signals == ReplySignals(
+            confidence=0.8, working_answer="A", repaired=True, reply_chars=len(repair)
+        )
+
+    async def test_default_repair_turn_is_mains(self):
+        fake = _SeqLLM('{"candidates": [', '{"candidates": []}')
+        planner = BedrockStepPlanner(fake)
+        ctx = _single_call_ctx(planner_parse_retry=True)
+        await planner.propose_steps(sub_question=_sq(), context=ctx, tool_specs=_SPECS)
+        assert fake.calls[1]["prompt"].endswith(planner_module._PARSE_REPAIR_SUFFIX)
+        assert ctx.last_stop_signals is None
+
+
+@pytest.mark.unit
+class TestConfidenceParsing:
+    @pytest.mark.parametrize("value", [0, 0.0, 0.42, 1, 1.0])
+    def test_accepts_plain_numbers_in_range(self, value):
+        assert planner_module.parse_confidence(value) == float(value)
+
+    @pytest.mark.parametrize(
+        "value",
+        [True, False, "0.8", "high", "nan", 85, 70.0, 1.5, -1, -0.01, float("nan"), float("inf"), None, [0.5], 10**400],
+    )
+    def test_rejects_bool_string_percent_and_out_of_range(self, value):
+        assert planner_module.parse_confidence(value) is None
+
+
+@pytest.mark.unit
+class TestStopSignalCarrier:
+    async def test_propose_writes_parsed_signals(self):
+        reply = (
+            '{"candidates": [{"tool_name": "ontology_lookup"}], "confidence": 0.35, '
+            '"working_answer": "  ' + "x" * 700 + '  "}'
+        )
+        ctx = _single_call_ctx()
+        planner = BedrockStepPlanner(FakeLLM(text=reply), stop_signals=_ON)
+        decisions = await planner.propose_steps(sub_question=_sq(), context=ctx, tool_specs=_SPECS)
+        assert [d.tool_name for d in decisions] == ["ontology_lookup"]
+        signals = ctx.last_stop_signals
+        assert signals.confidence == 0.35
+        assert signals.working_answer == "x" * 600
+        assert signals.repaired is False
+        assert signals.reply_chars == len(reply)
+
+    @pytest.mark.parametrize("raw", ["true", '"0.9"', "85", "1.5", "-1"])
+    async def test_malformed_confidence_is_no_signal(self, raw):
+        ctx = _single_call_ctx()
+        reply = '{"candidates": [], "confidence": ' + raw + ', "working_answer": "A"}'
+        await BedrockStepPlanner(FakeLLM(text=reply), stop_signals=_ON).propose_steps(
+            sub_question=_sq(), context=ctx, tool_specs=_SPECS
+        )
+        assert ctx.last_stop_signals.confidence is None
+        assert ctx.last_stop_signals.working_answer == "A"
+
+    async def test_failed_propose_writes_nothing(self):
+        ctx = _single_call_ctx()
+        planner = BedrockStepPlanner(FakeLLM(raises=RuntimeError("boom")), stop_signals=_ON)
+        assert await planner.propose_steps(sub_question=_sq(), context=ctx, tool_specs=_SPECS) is None
+        assert ctx.last_stop_signals is None
+
+    async def test_no_tools_writes_nothing(self):
+        ctx = _single_call_ctx()
+        fake = FakeLLM(text='{"candidates": [], "confidence": 1.0}')
+        assert (
+            await BedrockStepPlanner(fake, stop_signals=_ON).propose_steps(
+                sub_question=_sq(), context=ctx, tool_specs=[]
+            )
+            == []
+        )
+        assert fake.calls == []
+        assert ctx.last_stop_signals is None
+
+    async def test_assess_writes_confidence_and_keeps_the_working_answer(self):
+        ctx = AccumulatedContext()
+        reply = '{"sufficient": true, "confidence": 0.9, "working_answer": " the answer "}'
+        planner = BedrockStepPlanner(FakeLLM(text=reply), stop_signals=_ON)
+        assert await planner.assess(sub_question=_sq(), context=ctx) == (True, "the answer")
+        assert ctx.last_stop_signals == ReplySignals(
+            confidence=0.9, working_answer="the answer", reply_chars=len(reply)
+        )
+
+    async def test_assess_error_writes_nothing(self):
+        ctx = AccumulatedContext()
+        planner = BedrockStepPlanner(FakeLLM(raises=RuntimeError("boom")), stop_signals=_ON)
+        assert await planner.assess(sub_question=_sq(), context=ctx) == (False, "")
+        assert ctx.last_stop_signals is None
+
+    async def test_default_assess_writes_nothing(self):
+        ctx = AccumulatedContext()
+        planner = BedrockStepPlanner(FakeLLM(text='{"sufficient": true, "confidence": 0.9}'))
+        await planner.assess(sub_question=_sq(), context=ctx)
+        assert ctx.last_stop_signals is None

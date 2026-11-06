@@ -39,6 +39,9 @@ class ChunkResult:
     # Human-readable document name (ingest's ``filename``). Display metadata,
     # not identity — distinct documents may share a name (#985).
     source_doc_name: str = ""
+    # Statements the lexical graph retrieved for this chunk's source, carried on the
+    # source's first chunk. Prompt evidence only; never part of the citation text.
+    statements: tuple[str, ...] = ()
 
 
 class ChunkSearchResults(list[ChunkResult]):

@@ -48,7 +48,7 @@ from coa_sources.database.glue_ownership import (
     assert_namespace_may_catalog,
 )
 from coa_sources.database.secret_binding import require_secret_namespace_binding
-from coa_sources.database.sub_types import CONNECTOR_BACKED_SUB_TYPES
+from coa_sources.database.sub_types import CONNECTOR_BACKED_SUB_TYPES, GRAPH_BACKED_SUB_TYPES
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("LOG_LEVEL", "INFO"))
@@ -83,6 +83,7 @@ _HANDLED_SUB_TYPES = (
         }
     )
     | CONNECTOR_BACKED_SUB_TYPES
+    | GRAPH_BACKED_SUB_TYPES
 )
 # DOCUMENTS sub-types never reach this pipeline, so a row carrying one is a
 # mis-stored record. The right treatment there is the long-standing no-op, not a
@@ -340,6 +341,16 @@ def handler(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
     # DATABRICKS_SQL_WAREHOUSE needs no grant step either, for a different reason from
     # CUSTOM_CONNECTOR's: the connector assumes the CUSTOMER's role at request time, so
     # COA holds no grant on the credential to make or revoke.
+    if sub_type in GRAPH_BACKED_SUB_TYPES:
+        # A graph source is never scanned — registration enqueues a reachability verify,
+        # which owns its `queryable` flag — so a row reaching here was mis-routed. There
+        # is nothing to provision and `queryable` must not be touched from this path.
+        logger.warning(
+            "graph_backed_source_in_scan_pipeline",
+            extra={"datasource_id": datasource_id, "sub_type": sub_type},
+        )
+        return {"provisioned": False, "reason": "graph-backed"}
+
     if sub_type in CONNECTOR_BACKED_SUB_TYPES:
         # Raises on failure, matching the JDBC path: leaving queryable False after
         # a successful discovery would present as a source that scanned fine and

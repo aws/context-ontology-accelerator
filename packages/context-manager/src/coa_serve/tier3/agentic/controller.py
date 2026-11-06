@@ -46,15 +46,18 @@ used structurally), so importing it never pulls the toolkit into ``sys.modules``
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import math
 import time
 from collections import deque
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import structlog
 
 from ...exceptions import AccessDeniedError
-from .models import ExplorationBranch, PlannerDecision, StopReason, SubQuestion
+from .models import ExplorationBranch, PlannerDecision, StopReason, StopSignalConfig, SubQuestion
+from .tools.document_tool import DOCUMENT_CHUNK_PREFIX, WINDOW_HEADER_RE
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, no runtime/graphrag import
     from .budget import BudgetClock
@@ -63,6 +66,23 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, no runtime/graphrag import
     from .tools.registry import ToolRegistry
 
 logger = structlog.get_logger(__name__)
+
+
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    """Cosine similarity of two equal-length embedding vectors, in ``[-1.0, 1.0]``.
+
+    Pure Python, local and deterministic (one pair of ~1k-dimension vectors per
+    compared reply, so no array library is needed). Returns ``0.0`` for an empty,
+    mismatched or zero-norm vector (treated as "cannot compare", i.e. not stable)
+    so a degenerate embedding never spuriously signals a stable answer.
+    """
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    na = math.sqrt(math.fsum(x * x for x in a))
+    nb = math.sqrt(math.fsum(y * y for y in b))
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return math.fsum(x * y for x, y in zip(a, b, strict=True)) / (na * nb)
 
 
 # The hard preference ordering the controller enforces over the planner's
@@ -76,6 +96,143 @@ _RANK_AD_HOC = 2
 
 # Prefix identifying a Retrieval_Strategy_Tool name (``strategy:<value>``).
 _STRATEGY_PREFIX = "strategy:"
+
+# Non-strategy tools ranked WITH the strategy tools. Reading a document the agent
+# already found is a prepared, deterministic retrieval (no generated query), and
+# ranking it below a strategy tool would let any strategy alternative the planner
+# lists beside it silently override the planner's explicit choice to read.
+_STRATEGY_RANK_TOOLS: frozenset[str] = frozenset({"read_document"})
+
+# options.loopFixes bounds: a tool is not started with less time than this left
+# before the synthesis reserve, and at most this many repeated reads get their
+# step back per loop.
+_MIN_USEFUL_TOOL_S = 2.0
+_MAX_REFUNDED_READS = 2
+_READ_DOCUMENT_TOOL = "read_document"
+_NL_TO_SQL_TOOL = "nl_to_sql"
+
+# options.sufficiencyGuards: at most this many positive checks are held back per
+# loop, and only the top name-matched documents count for the partial-read guard.
+_MAX_GUARD_DEFERRALS = 2
+_GUARD_TOP_MATCHES = 3
+# Early-stop signals: at most this many low-confidence "enough" replies are held
+# back per loop, and at most this many stability stops are vetoed by a guard.
+_MAX_CONFIDENCE_DEFERRALS = 2
+_MAX_STABILITY_VETOES = 2
+
+
+@dataclass
+class _LoopSignals:
+    """Per-loop stop-signal state: telemetry indexes and the answer-stability streak."""
+
+    sq: int = 0
+    loop: int = 0
+    # Planner replies that carried stop signals in this loop (the telemetry step index).
+    replies: int = 0
+    # Answer stability: the previous compared working answer's embedding, the run of
+    # consecutive compared replies at or above the threshold, and the context
+    # version at the last compared reply (``None`` until the first one).
+    prev_embedding: list[float] | None = None
+    streak: int = 0
+    compared_version: int | None = None
+    # Bounded hold-backs: low-confidence "enough" replies, and guard vetoes of a
+    # stability stop (separate from the guard's own deferral count).
+    confidence_deferrals: int = 0
+    stability_vetoes: int = 0
+
+
+@dataclass
+class _Stability:
+    """The outcome of one answer-stability update, for telemetry."""
+
+    compared: bool = False
+    cosine: float | None = None
+    streak: int = 0
+    embed_ms: int | None = None
+
+
+def _request_id() -> str | None:
+    """The request id bound to the structlog context, when the caller bound one."""
+    value = structlog.contextvars.get_contextvars().get("request_id")
+    return value if isinstance(value, str) else None
+
+
+class PendingSql:
+    """A prefetch SQL call still running after its timeout (``options.keepSlowSql``)."""
+
+    def __init__(self, task: asyncio.Future, query: str, start: float) -> None:
+        """Hold the running ``task`` for ``query``, started at ``start`` (perf_counter)."""
+        self.task = task
+        self.query = query
+        self.start = start
+        self.consumed = False
+
+    def cancel(self) -> None:
+        """Stop waiting for the call: cancel it unless its result was already taken."""
+        if not self.consumed:
+            self.consumed = True
+            self.task.cancel()
+
+
+async def take_pending_sql(ctx: AccumulatedContext, trace: Any, *, wait_s: float = 0.0) -> bool:
+    """Fold a finished pending prefetch SQL result into ``ctx``; wait up to ``wait_s`` for it.
+
+    Returns True when its result (rows, or an empty result) was taken. A late
+    failure is traced and leaves the context unchanged; an
+    :class:`AccessDeniedError` propagates, as it does from any SQL call.
+    """
+    pending = getattr(ctx, "pending_sql", None)
+    if pending is None or pending.consumed:
+        return False
+    if not pending.task.done() and wait_s > 0:
+        await asyncio.wait({pending.task}, timeout=wait_s)
+    if not pending.task.done() or pending.consumed:
+        return False
+    pending.consumed = True
+    ms = int((time.perf_counter() - pending.start) * 1000)
+    try:
+        result = pending.task.result()
+    except AccessDeniedError:
+        raise
+    except BaseException as exc:  # noqa: BLE001 - a late SQL failure (or cancel) is only traced
+        ctx.record_degraded(_NL_TO_SQL_TOOL, type(exc).__name__)
+        trace.record("prefetch_sql_late", "error", ms, detail=type(exc).__name__, tool_used=_NL_TO_SQL_TOOL)
+        return False
+    new_count = ctx.add(result)
+    ctx.record_attempt(_NL_TO_SQL_TOOL, {"query": pending.query}, new_count, "succeeded", "prefetch SQL, finished late")
+    trace.record("prefetch_sql_late", "success", ms, detail=getattr(result, "detail", ""), tool_used=_NL_TO_SQL_TOOL)
+    return True
+
+
+def insufficiency_reason(ctx: AccumulatedContext) -> str:
+    """Why a positive sufficiency check should be held back (``options.sufficiencyGuards``), or ``""``.
+
+    Bounded by the caller: a top name-matched document was read only in part (its
+    windows end before the document does), or (``options.keepSlowSql``) the
+    prefetch SQL for the whole question is still running and no rows are in yet.
+    The reason is phrased as the next action for the planner.
+    """
+    if not getattr(ctx, "sufficiency_guards", False):
+        return ""
+    pending = getattr(ctx, "pending_sql", None)
+    if pending is not None and not pending.consumed and not (getattr(ctx, "rows", None) or []):
+        return "the SQL query for the whole question is still running: wait for it before answering"
+    top = [m.get("source_key") for m in (getattr(ctx, "document_matches", None) or [])[:_GUARD_TOP_MATCHES]]
+    covered: dict[str, tuple[int, int]] = {}
+    for chunk in getattr(ctx, "chunks", None) or []:
+        if not (getattr(chunk, "chunk_id", "") or "").startswith(DOCUMENT_CHUNK_PREFIX):
+            continue
+        match = WINDOW_HEADER_RE.match(getattr(chunk, "text", "") or "")
+        if not match or match.group("key") not in top:
+            continue
+        end, total = int(match.group("end")), int(match.group("total"))
+        best = covered.get(match.group("key"), (0, total))
+        covered[match.group("key")] = (max(best[0], end), total)
+    for key, (end, total) in covered.items():
+        if end < total:
+            return f"document {key[:120]} was read only to character {end} of {total}: read it from offset {end}"
+    return ""
+
 
 # Instruction the real (Bedrock Converse) planner is given so it proposes
 # preference-ordered candidates; the controller still enforces the ordering below
@@ -109,12 +266,26 @@ class StepPlanner(Protocol):
         sub_question: SubQuestion,
         context: AccumulatedContext,
         tool_specs: list[dict],
-    ) -> list[PlannerDecision]:
-        """Return candidate next-step decisions (empty = no Tool selectable)."""
+    ) -> list[PlannerDecision] | None:
+        """Return candidate next-step decisions (empty = none proposed; ``None`` = the call failed)."""
         ...
 
     async def check_sufficiency(self, *, sub_question: SubQuestion, context: AccumulatedContext) -> bool:
         """Return the boolean Sufficiency_Check decision for the context so far."""
+        ...
+
+
+@runtime_checkable
+class EmbedFn(Protocol):
+    """Minimal embed interface for the answer-stability signal (``async embed(text) -> vector``).
+
+    Satisfied by the same embed client the vector tool uses (``clients.llm``), so
+    the controller reuses the request's existing embedding backend rather than
+    taking a new dependency. Optional: when absent, the stability signal is off.
+    """
+
+    async def embed(self, text: str) -> list[float]:
+        """Return the embedding vector for ``text``."""
         ...
 
 
@@ -150,7 +321,8 @@ def validate_inputs(inputs: dict[str, Any], input_schema: dict[str, Any]) -> lis
     every supplied value matches the declared field type. A Tool may declare more
     fields than a given call supplies (most fields are optional / mode-specific),
     so missing declared fields are NOT a violation — only unknown fields and type
-    mismatches are. An empty ``input_schema`` (a Tool that accepts no planner
+    mismatches are. A declared field sent as ``None`` counts as left out (the
+    planner sometimes sends ``null`` for an optional field). An empty ``input_schema`` (a Tool that accepts no planner
     inputs, e.g. the ontology tool) therefore rejects any supplied field.
 
     Args:
@@ -162,6 +334,8 @@ def validate_inputs(inputs: dict[str, Any], input_schema: dict[str, Any]) -> lis
     """
     violations: list[str] = []
     for key, value in inputs.items():
+        if value is None and key in input_schema:
+            continue
         if key not in input_schema:
             violations.append(f"unknown field {key!r}")
             continue
@@ -204,6 +378,8 @@ class ReasoningController:
         per_tool_timeout_s: float = 30.0,
         max_no_progress_steps: int = 3,
         ontology_edge_mode: str = "soft_prior",
+        embed_fn: EmbedFn | None = None,
+        stop_signals: StopSignalConfig | None = None,
     ) -> None:
         """Bind the planner and per-session loop tuning (timeout, escalation, edge mode)."""
         self._planner = planner
@@ -229,6 +405,16 @@ class ReasoningController:
         # entity → traverse the graph). Still bounded by the aggregate step/time
         # budgets. ``1`` reproduces the old stop-on-first-no-progress behavior.
         self._max_no_progress_steps = max(1, max_no_progress_steps)
+        # Early-stop signals (service-scoped, injected here rather than carried on the
+        # per-request context, which sub-question forks do not copy). Answer
+        # stability: when an embed function is supplied AND the similarity threshold
+        # is > 0, a step that made retrieval progress but left the working ANSWER
+        # semantically unchanged (cosine of consecutive working-answer embeddings >=
+        # the threshold) counts toward a stability streak. This catches the loop
+        # pulling fresh-but-redundant chunks that never move the answer. Default
+        # off: a threshold of 0 never influences the stop decision.
+        self._embed_fn = embed_fn
+        self._stop_signals = stop_signals if stop_signals is not None else StopSignalConfig()
 
     async def run_one_loop(
         self,
@@ -242,6 +428,8 @@ class ReasoningController:
         namespace: str,
         excluded_tools: frozenset[str] | None = None,
         tool_context: dict | None = None,
+        sq_index: int = 0,
+        loop_index: int = 0,
     ) -> StopReason | None:
         """Run the Reasoning_Loop for ``sub_question`` until it stops.
 
@@ -268,14 +456,65 @@ class ReasoningController:
                 (source-composition gating); ``None`` exposes the full registry.
             tool_context: Out-of-band per-request context (e.g. profile, options,
                 model_id) merged into every Tool invocation's inputs.
+            sq_index: Index of the sub-question this loop serves (stop-signal telemetry).
+            loop_index: 0 for the sub-question's own loop, ``n`` for its n-th
+                exploration branch (stop-signal telemetry).
 
         Returns:
             The per-Sub_Question stop reason — ``max_steps_reached`` (Req 4.5/6.4),
-            ``time_budget_expired`` (Req 7.4), ``no_new_information`` (Req 6.3), or
-            ``sufficiency_satisfied`` (Req 6.1-6.2) — or ``None`` when the loop
+            ``time_budget_expired`` (Req 7.4), ``no_new_information`` (Req 6.3),
+            ``sufficiency_satisfied`` (Req 6.1-6.2), or ``answer_stable`` (the
+            single-call answer-stability stop) — or ``None`` when the loop
             ended because no Tool could be selected (Req 4.7). The session
             aggregates these into the terminal stop reason.
         """
+        state = _LoopSignals(sq=sq_index, loop=loop_index)
+        stop: StopReason | None = None
+        try:
+            stop = await self._run_loop(
+                sub_question,
+                ctx,
+                registry,
+                clock,
+                queue,
+                trace,
+                state,
+                namespace=namespace,
+                excluded_tools=excluded_tools,
+                tool_context=tool_context,
+            )
+            return stop
+        finally:
+            if self._stop_signals.elicit:
+                # One record per loop exit, including None and budget stops; an
+                # exception leaves ``stop`` as None.
+                trace.record(
+                    "subquestion_stop",
+                    "success",
+                    clock.elapsed_ms(),
+                    detail={
+                        "sq": state.sq,
+                        "loop": state.loop,
+                        "reason": str(stop) if stop is not None else None,
+                        "steps": state.replies,
+                    },
+                )
+
+    async def _run_loop(
+        self,
+        sub_question: SubQuestion,
+        ctx: AccumulatedContext,
+        registry: ToolRegistry,
+        clock: BudgetClock,
+        queue: deque,
+        trace: Any,
+        state: _LoopSignals,
+        *,
+        namespace: str,
+        excluded_tools: frozenset[str] | None,
+        tool_context: dict | None,
+    ) -> StopReason | None:
+        """The body of :meth:`run_one_loop`; ``state`` holds its stop-signal state."""
         trace.record("subquestion_start", "success", clock.elapsed_ms(), detail=sub_question.text[:80])
 
         # Consecutive no-progress steps tolerated before stopping (reset on progress).
@@ -285,6 +524,16 @@ class ReasoningController:
         # signatures; the aggregate step/time budgets bound it regardless.
         no_progress = 0
         tried: set[str] = set()
+        # options.loopFixes: drop unknown planner fields instead of rejecting the
+        # call, never start a tool once the budget is spent, and give back the step
+        # of a read that returned nothing new (bounded by _MAX_REFUNDED_READS).
+        loop_fixes = ((tool_context or {}).get("options") or {}).get("loopFixes") is True
+        refunded_reads = 0
+        guard_deferrals = 0
+        # The threshold never exceeds the configured per-tool cap, so a cap below it
+        # does not stop every loop.
+        min_useful_s = min(_MIN_USEFUL_TOOL_S, self._per_tool_timeout_s)
+        single_call = getattr(ctx, "single_call_steps", False) is True
 
         while True:
             # Time_Budget bounds the loop in aggregate (Req 7.4): stop before a new
@@ -296,19 +545,127 @@ class ReasoningController:
             if not clock.try_consume_step():
                 return StopReason.max_steps_reached
 
-            # Next-step selection over the accumulated context (Req 4.3).
+            # options.keepSlowSql: a prefetch SQL that finished late joins the context.
+            await take_pending_sql(ctx, trace)
+
+            # options.loopFixes: a planner call whose tool could not start is wasted;
+            # stop on the time budget before making it.
+            if loop_fixes and clock.tool_deadline_s(self._per_tool_timeout_s) < min_useful_s:
+                clock.refund_step()
+                trace.record("budget_spent", "success", clock.elapsed_ms(), detail="no time left for another step")
+                return StopReason.time_budget_expired
+
+            # Next-step selection over the accumulated context (Req 4.3). The
+            # stop-signal carrier is cleared first, so any exit that writes nothing
+            # (a failed call, a fake planner, no tools) reads as "no signal".
+            ctx.last_stop_signals = None
+            propose_start = time.perf_counter()
             candidates = await self._planner.propose_steps(
                 sub_question=sub_question, context=ctx, tool_specs=registry.specs(exclude=excluded_tools)
             )
-            decision = self._select_decision(candidates)
+            propose_ms = int((time.perf_counter() - propose_start) * 1000)
+            decision = self._select_decision(candidates or [])
+            # options.singleCallSteps: the propose reply carries the stop signals. While
+            # any knob is on, every parsed reply first updates the stability streak and
+            # is then recorded, before any stop decision acts on it.
+            tracked = single_call and candidates is not None and self._stop_signals.elicit
+            signals = getattr(ctx, "last_stop_signals", None) if tracked else None
+            answer = signals.working_answer if signals is not None else ""
+            stability = _Stability(streak=state.streak)
+            if tracked:
+                stability = await self._stability_update(
+                    state,
+                    answer,
+                    ctx,
+                    clock,
+                    productive_since_last=state.compared_version != ctx.content_version,
+                )
+            if candidates == [] and single_call:
+                # options.singleCallSteps: an empty proposal is the planner's "enough"
+                # (a failed or unparseable call returns None and never stops the loop).
+                # It took no tool, so the step is given back. The guards can still hold
+                # it back (bounded), as for a positive sufficiency check; after them, a
+                # reported confidence under the configured bar holds it back too (also
+                # bounded, so the loop still ends on its step/time budget).
+                clock.refund_step()
+                reason = insufficiency_reason(ctx) if guard_deferrals < _MAX_GUARD_DEFERRALS else ""
+                confidence_hold = (
+                    not reason
+                    and state.confidence_deferrals < _MAX_CONFIDENCE_DEFERRALS
+                    and not self._confidence_ok(signals)
+                )
+                if tracked:
+                    self._record_reply(
+                        trace,
+                        clock,
+                        state,
+                        phase="loop",
+                        empty=True,
+                        signals=signals,
+                        answer=answer,
+                        stability=stability,
+                        held_back="guard" if reason else "confidence" if confidence_hold else None,
+                        propose_ms=propose_ms,
+                    )
+                if reason:
+                    guard_deferrals += 1
+                    ctx.record_attempt("sufficiency_check", {}, 0, "held_back", reason)
+                    trace.record("sufficiency_guard", "success", clock.elapsed_ms(), detail=reason[:300])
+                    continue
+                if confidence_hold:
+                    state.confidence_deferrals += 1
+                    hold = self._confidence_hold_reason(signals)
+                    ctx.record_attempt("sufficiency_check", {}, 0, "held_back", hold)
+                    trace.record("sufficiency_confidence_hold", "success", clock.elapsed_ms(), detail=hold)
+                    continue
+                trace.record("next_step_select", "success", clock.elapsed_ms(), detail="planner_says_enough")
+                return StopReason.sufficiency_satisfied
+            if tracked and candidates:
+                # The working answer has stopped moving: stop before running the proposed
+                # tool, unless a sufficiency guard still has a reason to continue (its own
+                # bounded count, so the guard's hold-backs on "enough" are untouched).
+                held: str | None = None
+                veto = ""
+                stable_stop = False
+                if self._stability_reached(state, stability):
+                    veto = insufficiency_reason(ctx) if state.stability_vetoes < _MAX_STABILITY_VETOES else ""
+                    if veto:
+                        state.stability_vetoes += 1
+                        held = "stability_veto"
+                    else:
+                        stable_stop = True
+                self._record_reply(
+                    trace,
+                    clock,
+                    state,
+                    phase="loop",
+                    empty=False,
+                    signals=signals,
+                    answer=answer,
+                    stability=stability,
+                    held_back=held,
+                    propose_ms=propose_ms,
+                )
+                if held:
+                    trace.record("answer_stability", "success", clock.elapsed_ms(), detail=f"stop vetoed: {veto[:280]}")
+                if stable_stop:
+                    clock.refund_step()
+                    trace.record(
+                        "answer_stability",
+                        "success",
+                        clock.elapsed_ms(),
+                        detail=f"working answer stable for {state.streak} compared step(s); stopping",
+                    )
+                    return StopReason.answer_stable
             if decision is None:
                 # No Tool can be selected — stop initiating steps (Req 4.7).
                 trace.record("next_step_select", "success", clock.elapsed_ms(), detail="no_tool_selectable")
                 return None
 
             tool = registry.get(decision.tool_name)
-            if tool is None:
-                # The planner named a Tool that is not registered; treat as
+            if tool is None or (excluded_tools and decision.tool_name in excluded_tools):
+                # The planner named a Tool that is not registered — or one withheld
+                # from it for this request, which it was never offered; treat as
                 # nothing-selectable for this step and continue.
                 ctx.record_attempt(decision.tool_name, decision.inputs, 0, "unknown_tool", decision.reasoning)
                 trace.record(
@@ -347,6 +704,19 @@ class ReasoningController:
             # Input-contract validation (Req 2.5): do NOT invoke a non-conforming
             # Tool; record the violation and continue the loop.
             violations = validate_inputs(decision.inputs, tool.input_schema)
+            if violations and loop_fixes:
+                unknown = sorted(k for k in decision.inputs if k not in tool.input_schema)
+                if unknown:
+                    kept = {k: v for k, v in decision.inputs.items() if k in tool.input_schema}
+                    decision = replace(decision, inputs=kept)
+                    violations = validate_inputs(kept, tool.input_schema)
+                    trace.record(
+                        "unknown_fields_dropped",
+                        "success",
+                        clock.elapsed_ms(),
+                        detail=f"{decision.tool_name}: dropped {unknown}",
+                        tool_used=decision.tool_name,
+                    )
             if violations:
                 ctx.record_attempt(decision.tool_name, decision.inputs, 0, "invalid_input", decision.reasoning)
                 trace.record(
@@ -358,11 +728,44 @@ class ReasoningController:
                 )
                 continue
 
+            # options.loopFixes: with less than _MIN_USEFUL_TOOL_S left before the
+            # synthesis reserve the call would time out at once; stop on the time
+            # budget instead of spending a step on it.
+            if loop_fixes and clock.tool_deadline_s(self._per_tool_timeout_s) < min_useful_s:
+                trace.record(
+                    "budget_spent",
+                    "success",
+                    clock.elapsed_ms(),
+                    detail=f"{decision.tool_name} not started: no time left before the synthesis reserve",
+                    tool_used=decision.tool_name,
+                )
+                return StopReason.time_budget_expired
+
             # Invoke under the deadline-aware per-Tool timeout (Req 9.1-9.2): the
             # effective timeout is clamped to the wall-clock time left minus the
             # synthesis reserve, so a late tool cannot overrun the Time_Budget.
+            # A tool that declares ``wants_context`` (the anchored document reader)
+            # also receives the accumulated context and the sub-question, out of
+            # band, so it can anchor on what the loop already retrieved. No other
+            # tool's invocation changes.
+            call_context = tool_context
+            if getattr(tool, "wants_context", False) is True:
+                call_context = {**(tool_context or {}), "accumulated_context": ctx, "sub_question": sub_question.text}
+            pending = getattr(ctx, "pending_sql", None)
+            if decision.tool_name == _NL_TO_SQL_TOOL and pending is not None and not pending.consumed:
+                # options.keepSlowSql: wait for the SQL already running for the whole
+                # question instead of writing a new query with even less time to finish.
+                taken = await take_pending_sql(ctx, trace, wait_s=clock.tool_deadline_s(self._per_tool_timeout_s))
+                trace.record(
+                    "pending_sql_wait",
+                    "success" if taken else "timeout",
+                    clock.elapsed_ms(),
+                    detail="used the prefetch SQL" if taken else "prefetch SQL still running",
+                    tool_used=_NL_TO_SQL_TOOL,
+                )
+                continue
             result, status, ms = await self._invoke_with_timeout(
-                tool, decision.inputs, namespace, clock, tool_context=tool_context
+                tool, decision.inputs, namespace, clock, tool_context=call_context
             )
 
             if status != "success":
@@ -385,6 +788,11 @@ class ReasoningController:
             result_degraded_reason = result.degraded_reason
             if result_degraded_reason:
                 ctx.record_degraded(decision.tool_name, result_degraded_reason)
+            # Documents matched by name (find_documents) are kept on the context so
+            # the planner summary can list them; only that tool emits such items.
+            matches = [i for i in result.items if isinstance(i, dict) and i.get("type") == "document_match"]
+            if matches:
+                ctx.add_document_matches(matches)
             # If the result carried the determined ontology (an Ontology_Lookup_Tool
             # success), cache it on the shared context so the ontology-constrained
             # edge filter (Req 3.4/3.9) and the planner's context summary can use it
@@ -418,6 +826,22 @@ class ReasoningController:
             # consecutive no-progress steps and stop only once the tolerance is spent,
             # so the planner can escalate to a different tool / reframe / switch
             # modality in between. Bounded by the aggregate step/time budgets.
+            if (
+                loop_fixes
+                and new_count == 0
+                and decision.tool_name == _READ_DOCUMENT_TOOL
+                and refunded_reads < _MAX_REFUNDED_READS
+            ):
+                # The window was already in the context: the step did no work.
+                refunded_reads += 1
+                clock.refund_step()
+                ctx.record_attempt(
+                    decision.tool_name,
+                    decision.inputs,
+                    0,
+                    "already_read",
+                    "this window is already in the context; read a different offset or another document",
+                )
             if new_count == 0 and not ontology_resolved and not edges_discovered:
                 # A NOVEL approach (tool+inputs not tried before this sub-question)
                 # RESETS the streak first, so a diversifying planner earns fresh
@@ -444,20 +868,272 @@ class ReasoningController:
                     return StopReason.no_new_information
                 continue
 
-            # Progress was made this step — reset the no-progress streak.
+            # Progress was made this step: reset the retrieval no-progress streak.
+            # (Answer stability keeps its own streak; it never touches this one.)
             no_progress = 0
 
             # Boolean Sufficiency_Check + the agent's running grounded best-guess
             # answer (Req 6.1-6.2; idea 2). ``_assess`` returns both in one planner
             # call; the working answer (grounded ONLY in gathered context) is stored
             # so it carries across steps and is handed to the synthesizer.
+            if single_call:
+                # The next propose call decides whether to stop; no separate check.
+                continue
+            assess_start = time.perf_counter()
             sufficient, working_answer = await self._assess(sub_question, ctx)
+            assess_ms = int((time.perf_counter() - assess_start) * 1000)
+            signals = getattr(ctx, "last_stop_signals", None)
+            voted_enough = sufficient
+            held = None
             if working_answer:
                 ctx.set_working_answer(sub_question.text, working_answer)
+            if sufficient and guard_deferrals < _MAX_GUARD_DEFERRALS:
+                reason = insufficiency_reason(ctx)
+                if reason:
+                    guard_deferrals += 1
+                    sufficient = False
+                    held = "guard"
+                    ctx.record_attempt("sufficiency_check", {}, 0, "held_back", reason)
+                    trace.record("sufficiency_guard", "success", clock.elapsed_ms(), detail=reason[:300])
+            if sufficient and not self._confidence_ok(signals):
+                # The confidence bar, after the guards. Each held-back check followed
+                # a productive tool step, so the step budget bounds it.
+                sufficient = False
+                held = "confidence"
+                hold = self._confidence_hold_reason(signals)
+                ctx.record_attempt("sufficiency_check", {}, 0, "held_back", hold)
+                trace.record("sufficiency_confidence_hold", "success", clock.elapsed_ms(), detail=hold)
+            # Answer stability runs only when the check did not stop the loop. This
+            # step was productive (no-progress steps returned or continued above),
+            # so the reply is compared without the content-growth gate.
+            stability = _Stability(streak=state.streak)
+            if not sufficient:
+                stability = await self._stability_update(state, working_answer, ctx, clock, productive_since_last=True)
+            if self._stop_signals.elicit:
+                self._record_reply(
+                    trace,
+                    clock,
+                    state,
+                    phase="loop",
+                    empty=voted_enough,
+                    signals=signals,
+                    answer=working_answer,
+                    stability=stability,
+                    held_back=held,
+                    propose_ms=assess_ms,
+                )
             if sufficient:
                 return StopReason.sufficiency_satisfied
+            if self._stability_reached(state, stability):
+                # The working answer sat still for ``stability_steps`` compared steps
+                # in a row: the loop pulls redundant content. The assess path keeps
+                # !1345's stop reason for this.
+                trace.record(
+                    "answer_stability",
+                    "success",
+                    clock.elapsed_ms(),
+                    detail=f"working answer stable for {state.streak} compared step(s); stopping",
+                )
+                return StopReason.no_new_information
+
+    # ── early-stop signals ──────────────────────────────────────────────
+
+    def _confidence_ok(self, signals: Any) -> bool:
+        """Whether a reply's reported confidence clears the configured bar.
+
+        Always true with no bar (``min_confidence == 0``). Otherwise a missing
+        signal or confidence counts as below the bar, so a malformed reply leans
+        toward retrieving more rather than stopping.
+        """
+        bar = self._stop_signals.min_confidence
+        if bar <= 0:
+            return True
+        confidence = getattr(signals, "confidence", None)
+        return confidence is not None and confidence >= bar
+
+    def _confidence_hold_reason(self, signals: Any) -> str:
+        """The planner-facing reason a low-confidence "enough" was held back."""
+        confidence = getattr(signals, "confidence", None)
+        reported = f"{confidence:.2f}" if confidence is not None else "not reported"
+        return (
+            f"confidence {reported} < {self._stop_signals.min_confidence:.2f}: "
+            "gather the part of the question still unanswered"
+        )
+
+    def _stability_reached(self, state: _LoopSignals, stability: _Stability) -> bool:
+        """Whether this reply's own comparison left the streak at the configured window.
+
+        A skipped reply carries no stability evidence, so it never stops the loop.
+        Otherwise a streak reached on a held-back empty reply would stop the next
+        reply (skipped, since no tool ran) before the hold-back gathered anything.
+        """
+        return (
+            stability.compared
+            and self._stop_signals.similarity_threshold > 0
+            and state.streak >= self._stop_signals.stability_steps
+        )
+
+    async def _stability_update(
+        self,
+        state: _LoopSignals,
+        answer: str,
+        ctx: AccumulatedContext,
+        clock: BudgetClock,
+        *,
+        productive_since_last: bool,
+    ) -> _Stability:
+        """Compare ``answer`` with the previous compared working answer and update the streak.
+
+        A reply is *skipped* (no increment, no reset, previous answer kept) when
+        the context has not grown since the last compared reply, when the answer
+        is empty, when no embed runs (no embed backend, or the similarity
+        threshold is 0 with telemetry off), when too little time is left, or when
+        the embed fails or times out. A compared reply increments the streak when
+        its cosine with the previous answer is at or above a positive threshold
+        and resets it otherwise; either way it becomes the previous answer, so the
+        recorded cosines are always between consecutive compared answers.
+        """
+        result = _Stability(streak=state.streak)
+        config = self._stop_signals
+        if not productive_since_last or not answer or self._embed_fn is None:
+            return result
+        if not (config.similarity_threshold > 0 or config.telemetry):
+            return result
+        timeout_s = clock.tool_deadline_s(self._per_tool_timeout_s)
+        if timeout_s < min(_MIN_USEFUL_TOOL_S, self._per_tool_timeout_s):
+            return result
+        start = time.perf_counter()
+        vector = await self._embed_answer(answer, timeout_s)
+        result.embed_ms = int((time.perf_counter() - start) * 1000)
+        if vector is None:
+            return result
+        result.compared = True
+        state.compared_version = getattr(ctx, "content_version", 0)
+        if state.prev_embedding is not None:
+            result.cosine = _cosine_similarity(state.prev_embedding, vector)
+            if config.similarity_threshold > 0 and result.cosine >= config.similarity_threshold:
+                state.streak += 1
+            else:
+                state.streak = 0
+        state.prev_embedding = vector
+        result.streak = state.streak
+        return result
+
+    def _record_reply(
+        self,
+        trace: Any,
+        clock: BudgetClock,
+        state: _LoopSignals | None,
+        *,
+        phase: str,
+        empty: bool,
+        signals: Any,
+        answer: str,
+        stability: _Stability,
+        held_back: str | None,
+        propose_ms: int | None,
+    ) -> None:
+        """Record one reply's stop signals: a ``stop_signals`` trace step and one log line.
+
+        ``empty`` is the reply's own stop vote (an empty proposal, or a positive
+        sufficiency check). The working answer is never recorded, only its
+        SHA-256 and length.
+        """
+        if state is not None:
+            state.replies += 1
+        detail = {
+            "phase": phase,
+            "sq": state.sq if state is not None else None,
+            "loop": state.loop if state is not None else None,
+            "step": state.replies if state is not None else 0,
+            "empty": empty,
+            "confidence": getattr(signals, "confidence", None),
+            "cosine": round(stability.cosine, 6) if stability.cosine is not None else None,
+            "streak": stability.streak,
+            "compared": stability.compared,
+            "held_back": held_back,
+            "repaired": getattr(signals, "repaired", False),
+            "reply_chars": getattr(signals, "reply_chars", 0),
+            "propose_ms": propose_ms,
+            "embed_ms": stability.embed_ms,
+            "elapsed_ms": clock.elapsed_ms(),
+            "answer_sha256": hashlib.sha256(answer.encode("utf-8")).hexdigest() if answer else None,
+            "answer_chars": len(answer),
+        }
+        trace.record("stop_signals", "success", clock.elapsed_ms(), detail=detail)
+        logger.info("deep_reasoning_stop_signals", request_id=_request_id(), **detail)
+
+    async def _embed_answer(self, text: str, timeout_s: float) -> list[float] | None:
+        """Embed a working answer for the stability check; ``None`` on any failure.
+
+        Bounded by ``timeout_s`` (the deadline-aware tool timeout, so it never eats
+        the synthesis reserve); a slower embed is cancelled. Never raises and never
+        aborts the loop: an embed error or timeout degrades to ``None`` (the reply
+        is skipped) and the loop continues under the budget/step caps.
+        """
+        if self._embed_fn is None:
+            return None
+        try:
+            vector = await asyncio.wait_for(self._embed_fn.embed(text), timeout=timeout_s)
+        except TimeoutError:
+            logger.warning("answer_stability_embed_timeout", timeout_s=timeout_s)
+            return None
+        except Exception as exc:  # noqa: BLE001 - controller must never raise (Req 9.1)
+            logger.warning("answer_stability_embed_failed", error=str(exc), error_type=type(exc).__name__)
+            return None
+        return vector if vector else None
 
     # ── selection & preference (Req 5) ─────────────────────────────────
+
+    async def assess(self, sub_question: SubQuestion, ctx: AccumulatedContext) -> tuple[bool, str]:
+        """Public form of :meth:`_assess`, for the session's evidence prefetch."""
+        return await self._assess(sub_question, ctx)
+
+    def prefetch_gate(
+        self,
+        sufficient: bool,
+        ctx: AccumulatedContext,
+        trace: Any,
+        clock: BudgetClock,
+        *,
+        guard_held: bool = False,
+    ) -> bool:
+        """Apply the confidence bar to the prefetch sufficiency decision (after its guards).
+
+        Reads the signals the prefetch :meth:`assess` wrote to ``ctx`` and returns
+        ``False`` (run the loop) when the check said sufficient but its reported
+        confidence is under the bar or missing. With no bar the decision is
+        unchanged. While any knob is on, the decision is recorded as a
+        ``stop_signals`` step with ``phase: "prefetch"``, with the loop records'
+        meaning: ``empty`` is the check's own vote, and ``guard_held`` (a guard
+        turned a positive check into "not sufficient") shows as ``held_back:
+        "guard"``. The prefetch working answer never seeds a loop's stability
+        comparison.
+        """
+        if not self._stop_signals.elicit:
+            return sufficient
+        signals = getattr(ctx, "last_stop_signals", None)
+        hold = sufficient and not self._confidence_ok(signals)
+        self._record_reply(
+            trace,
+            clock,
+            None,
+            phase="prefetch",
+            empty=sufficient or guard_held,
+            signals=signals,
+            answer=getattr(signals, "working_answer", "") or "",
+            stability=_Stability(),
+            held_back="guard" if guard_held else "confidence" if hold else None,
+            propose_ms=None,
+        )
+        if hold:
+            trace.record(
+                "sufficiency_confidence_hold",
+                "success",
+                clock.elapsed_ms(),
+                detail=self._confidence_hold_reason(signals),
+            )
+        return sufficient and not hold
 
     async def _assess(self, sub_question: SubQuestion, ctx: AccumulatedContext) -> tuple[bool, str]:
         """Run the Sufficiency_Check and obtain the agent's grounded best-guess (idea 2).
@@ -471,6 +1147,8 @@ class ReasoningController:
         loop continues under the budget/step caps.
         """
         planner = self._planner
+        # Cleared before the call, as for propose: only a parsed reply writes it.
+        ctx.last_stop_signals = None
         assess = getattr(planner, "assess", None)
         if callable(assess):
             try:
@@ -522,7 +1200,7 @@ class ReasoningController:
         """Rank a decision for the preference sort (lower = more preferred)."""
         if decision.is_ad_hoc:
             return _RANK_AD_HOC
-        if decision.tool_name.startswith(_STRATEGY_PREFIX):
+        if decision.tool_name.startswith(_STRATEGY_PREFIX) or decision.tool_name in _STRATEGY_RANK_TOOLS:
             return _RANK_STRATEGY
         return _RANK_TEMPLATE
 
@@ -738,6 +1416,8 @@ class ReasoningController:
         """
         start = time.perf_counter()
         timeout_s = clock.tool_deadline_s(self._per_tool_timeout_s)
+        # A null optional field is the same as leaving it out (see validate_inputs).
+        inputs = {k: v for k, v in inputs.items() if v is not None}
         try:
             result = await asyncio.wait_for(
                 tool.invoke(namespace=namespace, **(tool_context or {}), **inputs),

@@ -644,3 +644,25 @@ class TestNamespaceSchema:
         client.get("/graph/schema", params={"namespace": "insurance"})
         call_args = _patch_build_stores.mock_graph.get_namespace_schema.call_args
         assert call_args[0][0] == "insurance"
+
+    def test_class_filter_pushed_to_store_as_class_prefix(self, _patch_build_stores):
+        _patch_build_stores.mock_graph.get_namespace_schema.return_value = SAMPLE_NAMESPACE_SCHEMA
+        client.get("/graph/schema", params={"namespace": "default", "class_filter": "https://example.org/onto#"})
+        call_kwargs = _patch_build_stores.mock_graph.get_namespace_schema.call_args[1]
+        assert call_kwargs["class_prefix"] == "https://example.org/onto#"
+
+    def test_no_class_filter_passes_none_class_prefix(self, _patch_build_stores):
+        _patch_build_stores.mock_graph.get_namespace_schema.return_value = SAMPLE_NAMESPACE_SCHEMA
+        client.get("/graph/schema", params={"namespace": "default"})
+        call_kwargs = _patch_build_stores.mock_graph.get_namespace_schema.call_args[1]
+        assert call_kwargs["class_prefix"] is None
+
+    def test_class_filter_still_drops_raw_prefix_overmatches(self, _patch_build_stores):
+        lookalike = {"uri": "https://example.org/ontology2#Claim", "label": "Claim", "properties": []}
+        schema = {**SAMPLE_NAMESPACE_SCHEMA, "classes": [*SAMPLE_NAMESPACE_SCHEMA["classes"], lookalike]}
+        _patch_build_stores.mock_graph.get_namespace_schema.return_value = schema
+        resp = client.get("/graph/schema", params={"namespace": "default", "class_filter": "https://example.org/onto"})
+        assert [c["uri"] for c in resp.json()["classes"]] == [
+            "https://example.org/onto#Claim",
+            "https://example.org/onto#Policy",
+        ]

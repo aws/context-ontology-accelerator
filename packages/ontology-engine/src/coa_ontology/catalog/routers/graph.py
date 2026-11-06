@@ -310,18 +310,15 @@ def get_namespace_schema(
     prefix). Matches the Smithy ``DescribeSchema.classFilter`` input; a
     non-matching filter returns an empty ``classes`` list.
 
-    When ``class_filter`` is set the backend is queried with the 500-class
-    ceiling instead of the caller's ``max_results`` and the filter is applied
-    BEFORE the truncation — otherwise a filter targeting a class that isn't
-    in the first ``max_results`` backend rows would return empty even though
-    the class exists. ``max_results`` still bounds the FINAL response so a
-    prefix that matches every class still respects the caller's cap.
+    When ``class_filter`` is set it is passed to the store as ``class_prefix``
+    (the same exact or IRI-namespace match), which the store applies before its
+    LIMIT, so a class outside the first page of the whole namespace is still
+    found. The backend is queried with the 500-class ceiling and the match above
+    is re-applied here, for stores that ignore ``class_prefix``; ``max_results``
+    still bounds the FINAL response.
     """
     graph = _graph(namespace)
     preference = label_preference_for(namespace)
-    # When filtering, fetch the full page so the filter matches even if the
-    # target class isn't in the first ``max_results`` classes the backend
-    # returns; otherwise honour the caller's requested cap directly.
     backend_limit = 500 if class_filter else min(max_results, 500)
     try:
         result = graph.get_namespace_schema(
@@ -329,6 +326,7 @@ def get_namespace_schema(
             max_results=backend_limit,
             include_properties=include_properties,
             label_preference=preference,
+            class_prefix=class_filter,
         )
     except NotImplementedError as e:
         log.warning("namespace schema unsupported by backend: %s", e)

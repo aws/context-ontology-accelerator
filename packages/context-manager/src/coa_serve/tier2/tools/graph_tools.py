@@ -63,6 +63,7 @@ from collections import deque
 from typing import Any
 
 import structlog
+from coa_common.constants import StructuredBackend
 from coa_common.label_language import LabelPreference
 
 from ...clients.base import GraphClient
@@ -228,8 +229,15 @@ class OntologyGraphTool:
         # callers are on the scoped form). NOT anchored on ``domain_iris``: this
         # caller wants the whole FK graph to walk, so it is unaffected by the
         # one-sided ?domain narrowing described in ``object_properties_sparql``.
+        # The SQL backend gate keeps a graph source's classes (answered by SPARQL only) out of the walk.
         graphs = await self._resolve_graph_iris(prefix)
-        sparql = object_properties_sparql(prefix, limit=_EDGE_QUERY_LIMIT, with_comment=True, graph_iris=graphs)
+        sparql = object_properties_sparql(
+            prefix,
+            limit=_EDGE_QUERY_LIMIT,
+            with_comment=True,
+            graph_iris=graphs,
+            query_backend=StructuredBackend.SQL,
+        )
         rows = await self._query(sparql, what="fk_edges")
         # Log the count so an empty traversal is attributable: "this namespace has
         # no induced FKs" reads differently from a query that failed or timed out.

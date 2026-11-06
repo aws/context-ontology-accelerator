@@ -64,6 +64,28 @@ importers:
         specifier: ~5.7.0
         version: 5.7.3
 
+  benchmarks/external-comparators:
+    dependencies:
+      aws-cdk-lib:
+        specifier: ^2.273.0
+        version: 2.273.0(constructs@10.6.0)
+      constructs:
+        specifier: ^10.0.0
+        version: 10.6.0
+    devDependencies:
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.20.1
+      aws-cdk:
+        specifier: ^2.1127.0
+        version: 2.1127.0
+      tsx:
+        specifier: ^4.23.15
+        version: 4.23.15
+      typescript:
+        specifier: ~5.7.0
+        version: 5.7.3
+
   infra:
     dependencies:
       '@coa/shared':

@@ -60,7 +60,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     # Parse request body
     try:
         body = json.loads(event.get("body") or "null")
-    except (json.JSONDecodeError, TypeError):
+    except (ValueError, TypeError, RecursionError):  # a decode error, too many digits, too deep
         return api_response(400, {"message": "Invalid JSON in request body"})
 
     if body is None or not isinstance(body, dict):

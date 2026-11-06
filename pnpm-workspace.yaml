@@ -5,6 +5,7 @@ packages:
   - "infra"
   - "tests/cdk"
   - "benchmarks/dashboard"
+  - "benchmarks/external-comparators"
   - "smithy-generated/control-plane-typescript-client"
   - "smithy-generated/data-layer-typescript-client"
 allowBuilds:

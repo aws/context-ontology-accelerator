@@ -1573,6 +1573,15 @@ def _run_ingest_from_s3(
     except IngestParseError as e:
         _fail_ingest_stub(namespace, ontology_id, f"Parse error: {e}")
         dynamo_store.update_ingest_job(job_id, IngestJobState.FAILED, namespace=namespace, error=f"Parse error: {e}")
+    except IngestValidationError as e:
+        # The author's payload was rejected (Tier-1 findings, or graph source bindings
+        # that do not resolve). The message is built from the payload and the
+        # namespace's own source names, so it is safe and — unlike the generic arm
+        # below — tells the author which class to fix.
+        _fail_ingest_stub(namespace, ontology_id, f"Validation failed: {e}")
+        dynamo_store.update_ingest_job(
+            job_id, IngestJobState.FAILED, namespace=namespace, error=f"Validation failed: {e}"
+        )
     except IngestConflictError as e:
         # A genuine conflict (real row already existed) — do NOT touch that row;
         # only the job reflects the failure. The stub-overwrite path above means

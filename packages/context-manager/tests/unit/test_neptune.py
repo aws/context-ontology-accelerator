@@ -146,9 +146,21 @@ class TestNeptuneGraphClient:
         mock_http.aclose.assert_called_once()
         assert client._http is None
 
-    def test_missing_endpoint_raises(self):
+    async def test_a_closed_client_never_builds_a_new_pool(self):
+        # A retry in flight when the client is closed (serve shutdown, a dropped cache entry) used to open a fresh
+        # httpx pool that nothing ever closed.
         from coa_serve.clients.neptune import NeptuneGraphClient
 
+        client = NeptuneGraphClient(endpoint="test.neptune.amazonaws.com")
+        await client.close()
+        with pytest.raises(RuntimeError, match="closed"):
+            await client._get_http()
+        assert client._http is None
+
+    def test_missing_endpoint_raises(self, monkeypatch):
+        from coa_serve.clients.neptune import NeptuneGraphClient
+
+        monkeypatch.delenv("NEPTUNE_ENDPOINT", raising=False)
         with pytest.raises(ValueError, match="Neptune endpoint must be provided"):
             NeptuneGraphClient(endpoint="")
 
@@ -217,3 +229,74 @@ class TestNeptuneGraphClient:
         call_kwargs = mock_http.post.call_args[1]
         posted_body = call_kwargs["content"]
         assert "LIMIT+100" in posted_body or "LIMIT%20100" in posted_body or "LIMIT 100" in posted_body
+
+
+@pytest.mark.unit
+class TestNeptuneDataEndpointClient:
+    """The per-source data client: transport only, gated upstream by SPARQLFirewall."""
+
+    def _client(self, **kwargs):
+        from coa_serve.clients.neptune import NeptuneGraphClient
+
+        client = NeptuneGraphClient(endpoint="data.neptune.amazonaws.com", **kwargs)
+        response = MagicMock()
+        response.raise_for_status = MagicMock()
+        response.json.return_value = {"results": {"bindings": []}}
+        response.text = (
+            "<http://ex.org/t1> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://ex.org/Ticket> .\n"
+            '<http://ex.org/t1> <http://ex.org/title> "Load balancer down" .\n'
+        )
+        client._http = AsyncMock()
+        client._http.post.return_value = response
+        return client
+
+    async def test_a_read_with_a_keyword_outside_data_passes_only_when_the_guard_is_off(self):
+        from coa_serve.clients.neptune import SPARQLValidationError
+
+        # MCM-2: a keyword inside a literal is blanked even with the guard on, so this witness uses a keyword-named
+        # variable, which the guard refuses; only the opt-out lets this legitimate read through.
+        sparql = "SELECT ?load WHERE { ?s <http://ex.org/p> ?load } LIMIT 10"
+        with pytest.raises(SPARQLValidationError):
+            await self._client().query(sparql)
+        client = self._client(enforce_read_only=False)
+        await client.query(sparql)
+        client._http.post.assert_awaited_once()
+
+    async def test_the_shared_client_keeps_its_keyword_guard(self):
+        from coa_serve.clients.neptune import SPARQLValidationError
+
+        # main blanks literals, IRIs and comments before the keyword check, so a literal "load" is data, not an
+        # update; the guard itself stays on the shared client and still refuses a real SPARQL Update.
+        with pytest.raises(SPARQLValidationError):
+            await self._client().query("LOAD <http://ex.org/data.ttl> INTO GRAPH <http://ex.org/g>")
+        with pytest.raises(SPARQLValidationError):
+            await self._client().query('INSERT DATA { <http://ex.org/a> <http://ex.org/p> "load" }')
+
+    async def test_construct_requests_ntriples_and_returns_triples_as_rows(self):
+        client = self._client(enforce_read_only=False)
+        rows = await client.construct("CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }")
+        assert client._http.post.call_args.kwargs["headers"]["Accept"] == "application/n-triples"
+        assert {
+            "subject": "http://ex.org/t1",
+            "predicate": "http://ex.org/title",
+            "object": "Load balancer down",
+        } in rows
+        assert len(rows) == 2
+
+    async def test_construct_orders_triples_whose_objects_do_not_compare(self):
+        # A NaN double and a decimal under one subject and predicate.
+        xsd = "http://www.w3.org/2001/XMLSchema#"
+        client = self._client(enforce_read_only=False)
+        client._http.post.return_value.text = (
+            f'<http://ex.org/s> <http://ex.org/p> "NaN"^^<{xsd}double> .\n'
+            f'<http://ex.org/s> <http://ex.org/p> "1.5"^^<{xsd}decimal> .\n'
+        )
+        rows = await client.construct("CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }", max_triples=1)
+        assert len(rows) == 1
+
+    async def test_construct_caps_the_triples_it_returns(self):
+        client = self._client(enforce_read_only=False)
+        rows = await client.construct("CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }", max_triples=1)
+        assert rows == [
+            {"subject": "http://ex.org/t1", "predicate": "http://ex.org/title", "object": "Load balancer down"}
+        ]

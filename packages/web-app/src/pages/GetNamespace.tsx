@@ -510,18 +510,27 @@ const MetricsTab: React.FC<{ namespaceId: string }> = ({ namespaceId }) => {
       id: "name",
       header: t("Metric"),
       isRowHeader: true,
+      // As on the Metrics page: the display label, when the metric has one,
+      // with the name it is addressed by underneath.
       cell: (m) => (
-        <Link
-          href={`/namespaces/${namespaceId}/metrics/${encodeURIComponent(m.name ?? "")}`}
-          onFollow={(e) => {
-            e.preventDefault();
-            navigate(
-              `/namespaces/${namespaceId}/metrics/${encodeURIComponent(m.name ?? "")}`,
-            );
-          }}
-        >
-          {m.name}
-        </Link>
+        <>
+          <Link
+            href={`/namespaces/${namespaceId}/metrics/${encodeURIComponent(m.name ?? "")}`}
+            onFollow={(e) => {
+              e.preventDefault();
+              navigate(
+                `/namespaces/${namespaceId}/metrics/${encodeURIComponent(m.name ?? "")}`,
+              );
+            }}
+          >
+            {m.label || m.name}
+          </Link>
+          {m.label && (
+            <Box variant="small" display="block" color="text-body-secondary">
+              {m.name}
+            </Box>
+          )}
+        </>
       ),
     },
     {

@@ -19,9 +19,11 @@ import { formatStepDetail } from "./format-step-detail";
 import {
   CEDAR_STEP_IDS,
   FIREWALL_STEP_IDS,
+  firewallLabel,
   GUARDRAIL_STEP_IDS,
   localizeDisplayStep,
   mapTraceStatus,
+  tier2FamiliesIn,
   tier2Title,
 } from "@components/Chat/step-labels";
 import type { AppMessage } from "../../../i18n/appMessages";
@@ -227,7 +229,9 @@ export const RationalePanel: React.FC<RationalePanelProps> = ({
         <SpaceBetween size="xs" direction="horizontal">
           <BoundaryBadge label="Cedar" status={getCedarStatus(trace)} />
           <BoundaryBadge
-            label="SQL Firewall"
+            label={firewallLabel(
+              trace.find((s) => FIREWALL_STEP_IDS.has(s.step))?.step,
+            )}
             status={getFirewallStatus(trace)}
           />
           <BoundaryBadge
@@ -445,32 +449,27 @@ function buildTierSections(t: AppTranslate, trace: TraceStep[]): TierSection[] {
     stepsByKey.set(key, list);
   }
 
-  // When both Tier 2 strategies ran, split the t2 section's steps into labeled
-  // subgroups so each maps to a name in the title. Setup steps folded into t2
-  // (embed/routing) stay as the section's lead-in steps.
-  const hasSql = trace.some((s) => s.step.startsWith("t2.sql."));
-  const hasVkg = trace.some((s) => s.step.startsWith("t2.vkg."));
-  const splitTier2 = hasSql && hasVkg;
+  // When more than one Tier 2 strategy ran, split the t2 section's steps into
+  // labeled subgroups so each maps to a name in the title. Setup steps folded
+  // into t2 (embed/routing) stay as the section's lead-in steps.
+  const families = tier2FamiliesIn(trace);
+  const splitTier2 = families.length > 1;
 
   return SECTION_ORDER.filter((key) => stepsByKey.has(key)).map((key) => {
     if (key === "t2" && splitTier2) {
       const leadIn = trace.filter(
         (s) => !s.parallelGroup && SETUP_STEP_IDS.has(s.step),
       );
-      const sqlSteps = trace.filter(
-        (s) => !s.parallelGroup && s.step.startsWith("t2.sql."),
-      );
-      const vkgSteps = trace.filter(
-        (s) => !s.parallelGroup && s.step.startsWith("t2.vkg."),
-      );
       return {
         key,
         title: t(SECTION_TITLES.t2),
         steps: leadIn.map(toRow),
-        subgroups: [
-          { label: "NL→SQL", steps: sqlSteps.map(toRow) },
-          { label: "VKG (Ontop)", steps: vkgSteps.map(toRow) },
-        ],
+        subgroups: families.map((f) => ({
+          label: f.label,
+          steps: trace
+            .filter((s) => !s.parallelGroup && s.step.startsWith(f.prefix))
+            .map(toRow),
+        })),
       };
     }
     return {

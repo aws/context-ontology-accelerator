@@ -8,6 +8,14 @@ echo "=== Smithy Code Generation ==="
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 MODELS_DIR="$REPO_ROOT/models"
+
+# The TypeScript clients are installed and built with pnpm, after a slow Gradle build. Check for it first:
+# `make setup` runs scripts/install-pnpm.sh, which installs the version .mise.toml pins, before this.
+if ! command -v pnpm >/dev/null 2>&1; then
+    echo "✗ pnpm is not installed; it builds the generated TypeScript clients."
+    echo "  Install the version .mise.toml pins with ./scripts/install-pnpm.sh (or mise install), then rerun."
+    exit 1
+fi
 GENERATED_DIR="$REPO_ROOT/smithy-generated"
 
 # openapi-generator version for Python server models
@@ -83,15 +91,32 @@ echo "✓ TypeScript clients copied"
 # dist-cjs/, dist-es/, and dist-types/ directories (per package.json "main",
 # "module", "types" fields). Build them now so pnpm can resolve the packages.
 # The generated package.json uses yarn: prefix syntax in the build script —
-# replace it with npm-compatible sequential builds since yarn may not be available.
+# replace it with sequential pnpm runs since yarn may not be available.
+#
+# The clients are workspace packages (pnpm-workspace.yaml), and `rm -rf` above
+# removed their pnpm-linked node_modules. Install the workspace from the committed
+# lockfile, once, at the root, so each client's node_modules is the root install's
+# with the lockfile's versions, as setup-dev.sh installs it. A private `npm install`
+# per client is another install with npm's versions, and the gate's node-deps check
+# refuses it. --frozen-lockfile never rewrites the lockfile: a
+# codegen change to a client's dependencies fails here, loudly, until the lockfile
+# is updated on purpose.
 echo ""
 echo "Building TypeScript clients..."
 
 for client_dir in "$GENERATED_DIR/control-plane-typescript-client" "$GENERATED_DIR/data-layer-typescript-client"; do
-    # Replace yarn: parallel syntax with sequential npm run calls
-    sed -i.bak 's|"build": "concurrently.*"|"build": "npm run build:cjs \&\& npm run build:es \&\& npm run build:types"|' "$client_dir/package.json"
+    # Replace yarn: parallel syntax with sequential pnpm runs
+    sed -i.bak 's|"build": "concurrently.*"|"build": "pnpm run build:cjs \&\& pnpm run build:es \&\& pnpm run build:types"|' "$client_dir/package.json"
     rm -f "$client_dir/package.json.bak"
-    if ! (cd "$client_dir" && npm install --loglevel=error && npm run build --loglevel=error); then
+done
+
+if ! (cd "$REPO_ROOT" && pnpm install --frozen-lockfile); then
+    echo "✗ Failed to install the workspace from pnpm-lock.yaml"
+    exit 1
+fi
+
+for client_dir in "$GENERATED_DIR/control-plane-typescript-client" "$GENERATED_DIR/data-layer-typescript-client"; do
+    if ! (cd "$client_dir" && pnpm run build); then
         echo "✗ Failed to build TypeScript client: $client_dir"
         exit 1
     fi

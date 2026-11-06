@@ -4,7 +4,7 @@
 fastapi>=0.142.2
 uvicorn>=0.54.0
 httpx>=0.28.1
-boto3>=1.43.108
+boto3>=1.43.117
 rdflib>=7.6.0
 owlready2>=0.51
 pyshacl>=0.40.1

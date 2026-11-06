@@ -16,6 +16,7 @@ import { MetricList } from "./MetricList";
 
 let mockMetrics: Array<{
   name: string;
+  label?: string;
   description: string;
   dataSourceId: string;
   sourceTable: string;
@@ -75,9 +76,10 @@ const wrapper = ({ children }: { children: React.ReactNode }) => (
   </LocaleProvider>
 );
 
-function makeMetric(name: string) {
+function makeMetric(name: string, label?: string) {
   return {
     name,
+    ...(label === undefined ? {} : { label }),
     description: `desc for ${name}`,
     dataSourceId: "ds-1",
     sourceTable: "orders",
@@ -287,6 +289,125 @@ describe("MetricList bulk-delete selection sync", () => {
         onError: expect.any(Function),
       }),
     );
+  });
+});
+
+describe("MetricList display label filtering", () => {
+  beforeEach(() => {
+    mockBulkDeleteMutate.mockReset();
+  });
+
+  async function applyFreeText(
+    user: ReturnType<typeof userEvent.setup>,
+    text: string,
+  ) {
+    await user.type(screen.getByPlaceholderText(/find metrics/i), text);
+    await user.click(screen.getByText(new RegExp(`use: "${text}"`, "i")));
+  }
+
+  it("does not let free text match an unlabelled metric's missing label", async () => {
+    // Regression test: the default ":" read an unlabelled metric's label as
+    // the string "undefined", so "fin" matched every unlabelled metric and
+    // the filtered bulk delete took them too.
+    mockMetrics = [makeMetric("finance_total"), makeMetric("monthly_revenue")];
+    const user = userEvent.setup();
+    render(<MetricList />, { wrapper });
+
+    const row = screen.getByRole("row", { name: /finance_total/i });
+    await user.click(within(row).getByRole("checkbox"));
+    await applyFreeText(user, "fin");
+
+    await user.click(
+      screen.getByRole("button", { name: /delete 1 selected/i }),
+    );
+    const heading = screen.getByRole("heading", { name: /delete metrics/i });
+    const dialog = heading.closest('[role="dialog"]') as HTMLElement;
+    await user.click(
+      within(dialog).getByRole("radio", {
+        name: /delete all 1 metrics matching/i,
+      }),
+    );
+    await user.click(within(dialog).getByRole("button", { name: /^delete$/i }));
+
+    expect(mockBulkDeleteMutate).toHaveBeenCalledWith(
+      { names: ["finance_total"] },
+      expect.anything(),
+    );
+  });
+
+  it("narrows the list with the Display label property, comparing in NFC", async () => {
+    mockMetrics = [
+      makeMetric("gas_cost", "ガス代"),
+      makeMetric("water_cost", "水道代"),
+    ];
+    const user = userEvent.setup();
+    render(<MetricList />, { wrapper });
+
+    await user.type(
+      screen.getByPlaceholderText(/find metrics/i),
+      `Display label = ${"ガス代".normalize("NFD")}`,
+    );
+    await user.click(screen.getByText(/^Use: "Display label = /));
+
+    expect(screen.getByRole("row", { name: /gas_cost/i })).toBeInTheDocument();
+    expect(screen.queryByRole("row", { name: /water_cost/i })).toBeNull();
+  });
+
+  it("matches a label typed in NFD against the NFC label the service stores", async () => {
+    mockMetrics = [
+      makeMetric("gas_cost", "ガス代"),
+      makeMetric("water_cost", "水道代"),
+    ];
+    const user = userEvent.setup();
+    render(<MetricList />, { wrapper });
+
+    await applyFreeText(user, "ガス代".normalize("NFD"));
+
+    expect(screen.getByRole("row", { name: /gas_cost/i })).toBeInTheDocument();
+    expect(screen.queryByRole("row", { name: /water_cost/i })).toBeNull();
+  });
+});
+
+describe("MetricList Name column", () => {
+  it("links the label with the name beneath it, and an unlabelled metric by its name", () => {
+    mockMetrics = [makeMetric("gas_cost", "ガス代"), makeMetric("water_cost")];
+    render(<MetricList />, { wrapper });
+
+    const labelled = screen.getByRole("row", { name: /ガス代/ });
+    const link = within(labelled).getByRole("link", { name: "ガス代" });
+    // The page is addressed by the name, not the label.
+    expect(link.getAttribute("href")).toMatch(/\/metrics\/gas_cost$/);
+    expect(within(labelled).getByText("gas_cost")).toBeInTheDocument();
+
+    const unlabelled = screen.getByRole("row", { name: /water_cost/ });
+    expect(
+      within(unlabelled).getByRole("link", { name: "water_cost" }),
+    ).toBeInTheDocument();
+    expect(within(unlabelled).getAllByText("water_cost")).toHaveLength(1);
+  });
+
+  it("sorts by the label it shows, not by the name beneath it", async () => {
+    // By name the order would be a_metric, b_metric; by what is shown it is
+    // b_metric ("b...") before Zeta.
+    mockMetrics = [makeMetric("a_metric", "Zeta"), makeMetric("b_metric")];
+    const user = userEvent.setup();
+    render(<MetricList />, { wrapper });
+
+    const shownNames = () =>
+      screen
+        .getAllByRole("row")
+        .slice(1)
+        .map((row) => within(row).getAllByRole("link")[0].textContent);
+    expect(shownNames()).toEqual(["b_metric", "Zeta"]);
+
+    // A second sort on the column reverses the same order. (The header also
+    // holds a resize button, so click the sorting control's text.)
+    await user.click(
+      within(screen.getByRole("columnheader", { name: /^name/i })).getByText(
+        /^name$/i,
+      ),
+    );
+    expect(shownNames()).toEqual(["Zeta", "b_metric"]);
   });
 });
 

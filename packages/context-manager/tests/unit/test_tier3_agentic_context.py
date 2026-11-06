@@ -782,3 +782,44 @@ class TestEntityBounds:
         assert new_count == 2  # the merge enriched e:shared and added e:new
         assert [entity.uri for entity in parent.entities] == ["e:shared", "e:new"]
         assert parent.dropped_entities == 3
+
+
+@pytest.mark.unit
+class TestContentVersion:
+    """``content_version`` grows once per add()/merge() that brought in new items."""
+
+    def test_starts_at_zero(self):
+        assert AccumulatedContext().content_version == 0
+
+    def test_add_bumps_once_per_call_with_new_items(self):
+        ctx = AccumulatedContext()
+        ctx.add(ToolResult(chunks=(_Chunk("c1"), _Chunk("c2")), entities=(_Entity(uri="e1"),), rows=({"a": 1},)))
+        assert ctx.content_version == 1
+        ctx.add(ToolResult(rows=({"a": 2},)))
+        assert ctx.content_version == 2
+
+    def test_add_with_nothing_new_does_not_bump(self):
+        ctx = AccumulatedContext()
+        ctx.add(ToolResult(chunks=(_Chunk("c1"),)))
+        ctx.add(ToolResult(chunks=(_Chunk("c1"),)))
+        ctx.add(ToolResult())
+        assert ctx.content_version == 1
+
+    def test_merge_bumps_once_when_the_fork_adds_items(self):
+        parent = AccumulatedContext()
+        parent.add(ToolResult(chunks=(_Chunk("c1"),)))
+        fork = parent.fork()
+        fork.add(ToolResult(chunks=(_Chunk("c1"), _Chunk("c2"), _Chunk("c3"))))
+        assert fork.content_version == 1
+        parent.merge(fork)
+        assert parent.content_version == 2
+        parent.merge(fork)  # everything already present
+        assert parent.content_version == 2
+
+    def test_fork_starts_its_own_version_and_carrier(self):
+        parent = AccumulatedContext()
+        parent.add(ToolResult(chunks=(_Chunk("c1"),)))
+        parent.last_stop_signals = object()
+        fork = parent.fork()
+        assert fork.content_version == 0
+        assert fork.last_stop_signals is None

@@ -103,7 +103,10 @@ fixed when the namespace is created.
   has a label in the namespace language next to an untagged one, query context
   and the graph views use the namespace-language label; no resource is hidden
   because of its language. A Tier 3 answer is written in the language of the
-  question.
+  question. In a conversation, that is the language of the current question,
+  not of earlier turns: an English follow-up to a Japanese question is
+  answered in English. A follow-up with no language of its own, such as a
+  bare part number, keeps the language of the user's earlier questions.
 
 ### What Happens on Create
 
@@ -240,11 +243,14 @@ backoff) before giving up:
 5. **Finalize** — deletes the namespace record and releases its name
    reservation
 
-Steps 1–4 are best-effort and retried — the underlying cleanup calls are
-already designed to be safe to retry (idempotent against a resource that's
-already gone). **Finalize is the only step that must succeed outright**: if
-it fails, the namespace stays visible (rather than silently vanishing while
-"mostly" deleted) so it remains retryable.
+Every step is retried, and the underlying cleanup calls are safe to retry (a
+resource that's already gone counts as deleted). In steps 3 and 4, a resource
+that can't be removed fails the step rather than being left behind: for example,
+a VKG service that can't be deleted ends the deletion in `DELETE_FAILED` instead
+of leaving the service running with no namespace to retry it from. The one
+exception is the ontology's stored artifacts, which step 3 deletes best-effort.
+Finalize runs last, so the namespace record, and with it the ability to retry,
+stays until every earlier step has succeeded.
 
 If **any** step exhausts its retries, the namespace lands in `DELETE_FAILED`.
 Simply retry the `DELETE` call — the pipeline resumes from the beginning, and

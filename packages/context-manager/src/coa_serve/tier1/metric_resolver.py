@@ -7,9 +7,11 @@ Builds in-memory indexes (by_id, by_name, by_synonym) for exact
 name/synonym matching during query routing, with a fuzzy near-miss
 fallback (typos/plurals; confidence < 1.0) when exact matching misses.
 
-Loads metric definitions from Neptune at startup and refreshes
-periodically (every REFRESH_INTERVAL_S seconds) so newly-created
-metrics become routable without a service restart.
+Loads metric definitions from Neptune at startup. Freshness comes from
+per-namespace reads: a namespace whose cache is older than LOOKUP_TTL_S is read
+again on its next question, and a miss reads it unless it was read within the
+TTL. The hourly full refresh (REFRESH_INTERVAL_S) re-reads every namespace and
+replaces its cached metrics, except a namespace whose newer read has already landed.
 """
 
 from __future__ import annotations
@@ -17,13 +19,19 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import difflib
+import math
+import os
 import re
+import time
 import unicodedata
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, TypedDict
+from urllib.parse import quote
 
 import sqlglot
 import structlog
+from coa_common import GOVERNED_METRICS_ONTOLOGY_ID
 from coa_common.constants import URN_PREFIX as _URN_PREFIX
 from coa_common.sql_safety import select_tier1_sql_expression
 
@@ -225,16 +233,70 @@ class DeclinedMetricContext:
         return "\n".join(lines)
 
 
+_LOOKUP_TTL_ENV = "SERVE_TIER1_LOOKUP_TTL_S"
+# Five minutes keeps the per-instance cost of namespace reads low. A namespace read
+# names its one metric graph; only full refreshes, and namespace reads under a
+# graph-URI template with text after `{namespace}`, filter graphs by IRI prefix,
+# which Neptune evaluates across the whole store.
+_DEFAULT_LOOKUP_TTL_S = 300.0
+_LOOKUP_TTL_RANGE_S = (1.0, 3600.0)
+# A request waits at most this long for a namespace read; a slower read finishes in
+# the background and the request is answered from the cache.
+_INLINE_READ_TIMEOUT_S = 2.0
+
+
+def _ignored_setting(name: str, raw: str, default: float) -> float:
+    logger.warning("tier1_setting_ignored", name=name, value=raw, default=default)
+    return default
+
+
+def _env_number_in_range(name: str, default: float, low: float, high: float) -> float:
+    """The env var as a number in [low, high]; unset gives ``default``, anything else logs and gives it."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return _ignored_setting(name, raw, default)
+    if not (math.isfinite(value) and low <= value <= high):
+        return _ignored_setting(name, raw, default)
+    return value
+
+
+def lookup_ttl_s() -> float:
+    """``SERVE_TIER1_LOOKUP_TTL_S`` when it is a number of seconds in [1, 3600], else 300."""
+    return _env_number_in_range(_LOOKUP_TTL_ENV, _DEFAULT_LOOKUP_TTL_S, *_LOOKUP_TTL_RANGE_S)
+
+
+_MAX_CONCURRENT_READS_ENV = "SERVE_TIER1_MAX_CONCURRENT_READS"
+
+
+def max_concurrent_reads() -> int:
+    """``SERVE_TIER1_MAX_CONCURRENT_READS`` (a whole number 1-16): namespace reads in flight at once, else 2."""
+    value = _env_number_in_range(_MAX_CONCURRENT_READS_ENV, 2, 1, 16)
+    if not value.is_integer():
+        return int(_ignored_setting(_MAX_CONCURRENT_READS_ENV, str(value), 2))
+    return int(value)
+
+
+LOOKUP_TTL_S = lookup_ttl_s()
+"""Longest a warm instance serves a namespace's metrics without re-reading Neptune.
+
+Bounds how long a created, updated or deleted metric takes to reach an instance
+that already cached the namespace (documented in ``metrics.md``).
+"""
+
 REFRESH_INTERVAL_S = 3600
 """Seconds between Neptune metric refresh polls.
 
-One hour, not seconds: the resolver no longer relies on frequent polling to see
-newly-published metrics. A cache MISS for a namespace triggers a lazy,
-namespace-scoped lookup that fills and persists the cache on demand (see
-``match`` / ``_lazy_namespace_lookup``), so the periodic refresh is only a
-coarse backstop that reconciles edits/deletes. Polling every 30s across every
-serve worker was the dominant source of Neptune ``MemoryLimitExceededException``
-load under concurrency."""
+One hour, not seconds: freshness comes from per-namespace reads scoped to the
+namespace's metric graph (see ``LOOKUP_TTL_S`` and ``_lazy_namespace_lookup``), so
+the store-wide periodic refresh mostly matters for namespaces nobody asks about. It
+still replaces every namespace's cached metrics, except a namespace whose newer read
+has already landed (``_keep_newer_namespace_reads``). Polling every 30s across every
+serve worker was the dominant source of Neptune ``MemoryLimitExceededException`` load
+under concurrency."""
 
 _METRIC_QUERY_MAX_RESULTS = 5000
 """Max metrics fetched per Neptune refresh (MVP volume assumption)."""
@@ -426,9 +488,7 @@ _DEFAULT_GRAPH_URI_TEMPLATE = "https://ontology-workbench.local/{namespace}"
 # under concurrent refreshes. Single-brace, valid SPARQL — placeholders are
 # substituted via str.replace (NOT str.format), so the SPARQL braces stay literal.
 
-_METRIC_LIST_SPARQL_TEMPLATE = """
-SELECT ?name ?description ?aiContext ?expressionDialects ?dataSourceId ?g WHERE {
-  GRAPH ?g {
+_METRIC_PATTERNS = """
     ?s a <http://www.w3.org/2002/07/owl#Class> .
     ?s <http://www.w3.org/2000/01/rdf-schema#subClassOf> <urn:coa:vocab#GovernedMetric> .
     ?s <http://www.w3.org/2000/01/rdf-schema#label> ?name .
@@ -436,11 +496,18 @@ SELECT ?name ?description ?aiContext ?expressionDialects ?dataSourceId ?g WHERE 
     OPTIONAL { ?s <urn:coa:vocab#aiContext> ?aiContext }
     OPTIONAL { ?s <urn:coa:vocab#expressionDialects> ?expressionDialects }
     OPTIONAL { ?s <urn:coa:vocab#dataSourceId> ?dataSourceId }
-  }
-  FILTER(STRSTARTS(STR(?g), "@@PREFIX@@"))
-}
-"""
-_METRIC_LIST_SPARQL_TEMPLATE = _METRIC_LIST_SPARQL_TEMPLATE.replace("urn:coa:", f"urn:{_URN_PREFIX}:")
+""".replace("urn:coa:", f"urn:{_URN_PREFIX}:")
+_METRIC_SELECT = "SELECT ?name ?description ?aiContext ?expressionDialects ?dataSourceId ?g WHERE {"
+_METRIC_LIST_SPARQL_TEMPLATE = (
+    f'{_METRIC_SELECT}\n  GRAPH ?g {{{_METRIC_PATTERNS}  }}\n  FILTER(STRSTARTS(STR(?g), "@@PREFIX@@"))\n}}\n'
+)
+# One namespace's metrics live in one graph, named the way metric-service writes it
+# (``neptune_client._named_graph``); a constant GRAPH is answered from that graph's
+# index instead of a filter Neptune evaluates over every graph in the store.
+_NAMESPACE_METRIC_SPARQL_TEMPLATE = (
+    f"{_METRIC_SELECT}\n  GRAPH <@@GRAPH@@> {{{_METRIC_PATTERNS}  }}\n  BIND(<@@GRAPH@@> AS ?g)\n}}\n"
+)
+_SAFE_NAMESPACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*\Z")
 
 
 def merge_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -555,13 +622,12 @@ def _metric_list_sparql(graph_uri_template: str = "", namespace: str = "") -> st
     regex, which was the memory sink behind Neptune OOMs under concurrent
     refreshes.
 
-    When ``namespace`` is given, the `STRSTARTS` filter is tightened to
-    `{prefix}{namespace}/` so Neptune only touches that one namespace's graphs
-    (the metric graph is `{prefix}{namespace}/{ontology_id}`, so the trailing `/`
-    anchors the segment and keeps `insurance` from also matching `insurance2`).
-    The full periodic refresh passes no namespace and scans all graphs under the
-    prefix; the lazy on-miss lookup passes the namespace so a single miss does a
-    namespace-scoped query, not a cluster-wide scan.
+    When ``namespace`` is given, the query names that namespace's one metric graph,
+    `{prefix}{namespace}/{ontology_id}`, as a constant `GRAPH <iri>` (with `?g`
+    bound to it), so Neptune reads only that graph. A template with text after
+    `{namespace}` doesn't fit that scheme and keeps the `STRSTARTS` filter on
+    `{prefix}{namespace}/`. The full periodic refresh passes no namespace and
+    filters every graph under the prefix, which Neptune evaluates store-wide.
 
     This replaces the legacy hardcoded `urn:coa:{ns}:published` scheme, which no
     writer uses — so the resolver previously loaded 0 metrics and Tier-1 never
@@ -574,6 +640,9 @@ def _metric_list_sparql(graph_uri_template: str = "", namespace: str = "") -> st
         logger.warning("metric_resolver_graph_uri_template_unset_fallback", fallback=_DEFAULT_GRAPH_URI_TEMPLATE)
     template = graph_uri_template or _DEFAULT_GRAPH_URI_TEMPLATE
     prefix = template.split("{namespace}", 1)[0]
+    if namespace and template.endswith("{namespace}"):
+        graph = f"{prefix}{namespace}/{quote(GOVERNED_METRICS_ONTOLOGY_ID, safe='')}"
+        return _NAMESPACE_METRIC_SPARQL_TEMPLATE.replace("@@GRAPH@@", graph)
     filter_prefix = f"{prefix}{namespace}/" if namespace else prefix
     return _METRIC_LIST_SPARQL_TEMPLATE.replace("@@PREFIX@@", filter_prefix)
 
@@ -607,6 +676,7 @@ class MetricResolver:
         self,
         seed: list[MetricSeedItem] | None = None,
         neptune_client: NeptuneGraphClient | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ):
         """Build initial metric indexes from a seed and/or a Neptune source.
 
@@ -615,7 +685,9 @@ class MetricResolver:
             neptune_client: Optional client used to load and periodically refresh
                 metrics from Neptune. With neither seed nor client, the resolver
                 is marked loaded (empty).
+            clock: Monotonic seconds, for the per-namespace lookup TTL.
         """
+        self._clock = clock
         self._snapshot = _IndexSnapshot({}, {}, {}, {})
         self._loaded = False
         self._neptune = neptune_client
@@ -623,11 +695,22 @@ class MetricResolver:
         # Master seed items by metric_id, retained so a lazy per-namespace lookup
         # can MERGE into the index (rebuild from the union) rather than replace it.
         self._seed_by_id: dict[str, MetricSeedItem] = {}
-        # Namespaces already filled by a lazy on-miss lookup this process, so a
-        # genuine "no such metric" miss does not re-hit Neptune every request.
-        # Cleared by the periodic refresh so edits/deletes eventually reconcile.
-        self._lazy_loaded_namespaces: set[str] = set()
-        self._lazy_lock = asyncio.Lock()
+        # When each namespace was last read from Neptune on its own (clock time),
+        # and when the last full refresh succeeded. A namespace is re-read at most
+        # once per LOOKUP_TTL_S, so a created, edited or deleted metric reaches a
+        # warm instance within the TTL without a Neptune read per request.
+        self._namespace_read_at: dict[str, float] = {}
+        # Issue time of each namespace's last read that LANDED (applied its result);
+        # a full refresh issued earlier keeps that namespace's newer data.
+        self._namespace_landed_at: dict[str, float] = {}
+        self._full_refresh_at = -math.inf
+        # In-flight namespace reads: concurrent requests for a namespace await the
+        # same read. Reads for different namespaces share the slots below, and a
+        # question gives up waiting after _INLINE_READ_TIMEOUT_S.
+        self._lazy_reads: dict[str, asyncio.Task[bool]] = {}
+        # Caps namespace reads in flight across namespaces, so a burst of stale
+        # namespaces can't stack up Neptune queries.
+        self._read_slots = asyncio.Semaphore(max_concurrent_reads())
         # Built once from the configured GRAPH_URI_TEMPLATE.
         self._graph_uri_template = get_graph_uri_template()
         _template = self._graph_uri_template or _DEFAULT_GRAPH_URI_TEMPLATE
@@ -661,19 +744,40 @@ class MetricResolver:
         """Query Neptune for all metrics and rebuild indexes."""
         if self._neptune is None:
             return
+        issued_at = self._clock()
         try:
             bindings = await self._neptune.query(self._metric_list_sparql, max_results=_METRIC_QUERY_MAX_RESULTS)
-            items = self._bindings_to_seed(bindings)
+            items, newer_reads = self._keep_newer_namespace_reads(self._bindings_to_seed(bindings), issued_at)
             # Always rebuild with replace=True — even on empty bindings — so a
             # full refresh reconciles deletes and clears the lazy-lookup guard
             # (a namespace emptied since last cycle must be able to refill).
             self._build_indexes(items, replace=True)
+            self._namespace_read_at.update(newer_reads)
+            self._namespace_landed_at.update(newer_reads)
+            # Issue time, not completion time: data read before a concurrent
+            # namespace read must not count as fresher than it.
+            self._full_refresh_at = issued_at
             if items:
                 logger.info("metric_resolver_refreshed_from_neptune", metric_count=len(self._snapshot.by_id))
             else:
                 logger.info("metric_resolver_neptune_empty")
         except Exception as exc:
             logger.warning("metric_resolver_refresh_failed", error=str(exc))
+
+    def _keep_newer_namespace_reads(
+        self, items: list[MetricSeedItem], issued_at: float
+    ) -> tuple[list[MetricSeedItem], dict[str, float]]:
+        """Swap in the cached items of namespaces whose read, issued after this refresh, landed.
+
+        Those reads saw newer data than the refresh, so a slow refresh landing late
+        must not replace them. A read still running or one that failed doesn't count:
+        the refresh's data stands, and a read that lands later still wins.
+        """
+        newer = {ns: read_at for ns, read_at in self._namespace_landed_at.items() if read_at > issued_at}
+        if not newer:
+            return items, {}
+        kept = [item for item in self._seed_by_id.values() if item.get("namespace", "") in newer]
+        return [item for item in items if item.get("namespace", "") not in newer] + kept, newer
 
     async def _periodic_refresh(self) -> None:
         """Background loop that refreshes metrics from Neptune."""
@@ -725,7 +829,10 @@ class MetricResolver:
                 if ai_context_raw:
                     try:
                         ai_ctx = _json.loads(ai_context_raw)
-                        synonyms = ai_ctx.get("synonyms", [])
+                        raw_synonyms = ai_ctx.get("synonyms", []) if isinstance(ai_ctx, dict) else []
+                        synonyms = (
+                            [s for s in raw_synonyms if isinstance(s, str)] if isinstance(raw_synonyms, list) else []
+                        )
                     except (ValueError, TypeError) as exc:
                         logger.warning("metric_json_parse_failed", field="aiContext", name=name, error=str(exc))
 
@@ -775,7 +882,8 @@ class MetricResolver:
         """
         if replace:
             self._seed_by_id = {}
-            self._lazy_loaded_namespaces = set()
+            self._namespace_read_at = {}
+            self._namespace_landed_at = {}
         for item in items:
             mid = item.get("metric_id", "")
             if mid:
@@ -1129,9 +1237,14 @@ class MetricResolver:
         # with legitimately ZERO metrics leaves the index empty but sets
         # ``_loaded`` (see _refresh_from_neptune), so this no-ops thereafter
         # instead of hitting Neptune on every request. A FAILED refresh leaves
-        # ``_loaded`` False, so it correctly retries next time.
+        # ``_loaded`` False, so it retries next time, until a full refresh or a
+        # namespace read has succeeded (``_read_namespace`` sets it). This first
+        # load is not bounded by ``_INLINE_READ_TIMEOUT_S``.
         if self._neptune is not None and not self._loaded:
             await self._refresh_from_neptune()
+        read_before_match = self._cache_is_stale(namespace)
+        if read_before_match:
+            await self._lazy_namespace_lookup(namespace)
 
         exact = self.exact_name_synonym_match(query, namespace)
         if exact.found:
@@ -1144,50 +1257,103 @@ class MetricResolver:
             return fuzzy
 
         # Lazy on-miss fill: a miss can mean "metric published since the last
-        # hourly refresh". Do a one-shot Neptune lookup for this namespace,
-        # persist it into the cache, and retry once. Guarded by
-        # _lazy_loaded_namespaces so a genuine "no such metric" miss hits Neptune
-        # at most once per namespace per refresh cycle, not on every request.
-        if await self._lazy_namespace_lookup(namespace):
+        # refresh". Read this namespace from Neptune, persist it into the cache,
+        # and retry once. A genuine "no such metric" miss reads Neptune at most
+        # once per namespace per LOOKUP_TTL_S, not on every request. A namespace
+        # already read (or waited on) above is not waited on twice.
+        if not read_before_match and await self._lazy_namespace_lookup(namespace):
             exact = self.exact_name_synonym_match(query, namespace)
             if exact.found:
                 return exact
             return self.fuzzy_match(query, namespace)
         return fuzzy
 
-    async def _lazy_namespace_lookup(self, namespace: str) -> bool:
-        """Fill the cache for ``namespace`` from Neptune on a cache miss.
+    def _cache_is_stale(self, namespace: str) -> bool:
+        """True when neither a full refresh nor a namespace read is within LOOKUP_TTL_S."""
+        if self._neptune is None or not namespace:
+            return False
+        read_at = max(self._full_refresh_at, self._namespace_read_at.get(namespace, -math.inf))
+        return self._clock() - read_at >= LOOKUP_TTL_S
 
-        Returns True when a lookup actually ran (so the caller should retry the
-        match), False when it was skipped (no client, or already looked up this
-        cycle). Serialised by ``self._lazy_lock`` so concurrent misses for the
-        same namespace collapse into one Neptune round-trip. Merges into the
-        index (``replace=False``) so other namespaces are preserved.
+    def _read_recently(self, namespace: str) -> bool:
+        return self._clock() - self._namespace_read_at.get(namespace, -math.inf) < LOOKUP_TTL_S
+
+    async def _lazy_namespace_lookup(self, namespace: str) -> bool:
+        """Re-read ``namespace``'s metrics from Neptune and replace them in the cache.
+
+        Returns True when a read finished in time and found metrics (so the caller
+        should retry the match), and False when it was skipped (no client, or this
+        namespace was read within LOOKUP_TTL_S), found none, failed, or is still
+        running after ``_INLINE_READ_TIMEOUT_S``. Concurrent requests for a namespace
+        await the same in-flight read. Keyed by the namespace exactly as spelled,
+        because the read's graph is named by the exact spelling. A namespace that
+        isn't safe to put in a graph IRI is never read.
+
+        The read is stamped when it starts, on purpose: a failed or slow read keeps
+        serving the cache and is retried only after another TTL, so a struggling
+        Neptune isn't queried on every request. A metric created during a failed
+        read can therefore take up to two TTLs to appear.
         """
-        if self._neptune is None:
+        if self._neptune is None or not _SAFE_NAMESPACE_RE.match(namespace):
             return False
-        ns_key = namespace.lower()
-        if ns_key in self._lazy_loaded_namespaces:
+        read = self._lazy_reads.get(namespace)
+        if read is None:
+            if self._read_recently(namespace):
+                return False
+            issued_at = self._clock()
+            self._namespace_read_at[namespace] = issued_at
+            read = asyncio.create_task(self._read_namespace(namespace, issued_at))
+            self._lazy_reads[namespace] = read
+            read.add_done_callback(lambda done: self._lazy_read_done(namespace, done))
+        try:
+            return await asyncio.wait_for(asyncio.shield(read), timeout=_INLINE_READ_TIMEOUT_S)
+        except TimeoutError:
+            logger.warning("metric_resolver_lazy_lookup_slow", namespace=namespace, timeout_s=_INLINE_READ_TIMEOUT_S)
             return False
-        async with self._lazy_lock:
-            # Re-check under the lock: a racing miss may have filled it already.
-            if ns_key in self._lazy_loaded_namespaces:
-                return False
-            try:
-                # Namespace-scoped query: the FILTER is tightened to this one
-                # namespace's graphs, so a miss does NOT trigger a cluster-wide
-                # scan of every namespace (which would recreate the load this MR
-                # removes). The client-side ns_key check below is a cheap guard
-                # against a graph-URI template with no namespace segment.
-                namespace_sparql = _metric_list_sparql(self._graph_uri_template, namespace=namespace)
-                bindings = await self._neptune.query(namespace_sparql, max_results=_METRIC_QUERY_MAX_RESULTS)
-                items = [i for i in self._bindings_to_seed(bindings) if i.get("namespace", "").lower() == ns_key]
-                if items:
-                    self._build_indexes(items, replace=False)
-                self._lazy_loaded_namespaces.add(ns_key)
-                logger.info("metric_resolver_lazy_namespace_filled", namespace=namespace, metric_count=len(items))
-                return bool(items)
-            except Exception as exc:
-                # Do not mark loaded on failure, so the next miss retries.
-                logger.warning("metric_resolver_lazy_lookup_failed", namespace=namespace, error=str(exc))
-                return False
+
+    def _lazy_read_done(self, namespace: str, read: asyncio.Task[bool]) -> None:
+        if self._lazy_reads.get(namespace) is read:
+            del self._lazy_reads[namespace]
+
+    async def _read_namespace(self, namespace: str, issued_at: float) -> bool:
+        try:
+            async with self._read_slots:
+                bindings = await self._neptune.query(
+                    _metric_list_sparql(self._graph_uri_template, namespace=namespace),
+                    max_results=_METRIC_QUERY_MAX_RESULTS,
+                )
+        except Exception as exc:
+            logger.warning("metric_resolver_lazy_lookup_failed", namespace=namespace, error=str(exc))
+            return False
+        if self._full_refresh_at > issued_at:
+            # A full refresh issued after this read already holds newer data.
+            logger.info("metric_resolver_lazy_lookup_superseded", namespace=namespace)
+            return False
+        try:
+            items = [i for i in self._bindings_to_seed(bindings) if i.get("namespace", "") == namespace]
+            self._replace_namespace_items(namespace, items)
+        except Exception:
+            logger.exception("metric_resolver_lazy_index_rebuild_failed", namespace=namespace)
+            return False
+        self._namespace_landed_at[namespace] = issued_at
+        self._loaded = True
+        logger.info("metric_resolver_lazy_namespace_filled", namespace=namespace, metric_count=len(items))
+        return bool(items)
+
+    def _replace_namespace_items(self, namespace: str, items: list[MetricSeedItem]) -> None:
+        """Swap in one namespace's metrics; rebuild the index only when they changed.
+
+        Only items under exactly ``namespace`` are replaced: the read is scoped to
+        that spelling, so a cached item under another casing is not dropped.
+        """
+        current = {mid: item for mid, item in self._seed_by_id.items() if item.get("namespace", "") == namespace}
+        if current == {item.get("metric_id", ""): item for item in items}:
+            return
+        previous = self._seed_by_id
+        self._seed_by_id = {mid: item for mid, item in previous.items() if mid not in current}
+        try:
+            self._build_indexes(items, replace=False)
+        except Exception:
+            # Keep the cache and its index in step: a bad read changes neither.
+            self._seed_by_id = previous
+            raise

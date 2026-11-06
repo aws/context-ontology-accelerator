@@ -29,6 +29,7 @@ class QueryParams:
     limit: int | None = None
     exclusive_start_key: dict[str, Any] | None = None
     scan_forward: bool = True
+    consistent_read: bool = False
 
 
 class DatastoreDAO(ABC):
@@ -40,6 +41,7 @@ class DatastoreDAO(ABC):
         key: dict[str, Any],
         *,
         projection: list[str] | None = None,
+        consistent_read: bool = False,
     ) -> dict[str, Any] | None:
         """Fetch a single item by primary key. Returns ``None`` if not found."""
 

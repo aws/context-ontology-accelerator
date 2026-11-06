@@ -37,7 +37,7 @@ export class MetricsPage {
    */
   async create(
     name: string,
-    opts: { description: string; expression: string },
+    opts: { description: string; expression: string; label?: string },
   ): Promise<void> {
     await this.page.getByRole("button", { name: "Create metric" }).click();
     await expect(
@@ -45,6 +45,9 @@ export class MetricsPage {
     ).toBeVisible();
 
     await this.page.getByPlaceholder("monthly_revenue").fill(name);
+    if (opts.label !== undefined) {
+      await this.labelInput.fill(opts.label);
+    }
     await this.page
       .getByPlaceholder("Total revenue from all orders in a calendar month")
       .fill(opts.description);
@@ -90,6 +93,44 @@ export class MetricsPage {
     ).toBeVisible({ timeout: 30_000 });
   }
 
+  /** The form's Display label field. */
+  get labelInput() {
+    return this.page.getByPlaceholder("Monthly revenue");
+  }
+
+  /** Set a metric's display label from its edit page; "" removes it. */
+  async editLabel(
+    namespaceId: string,
+    name: string,
+    label: string,
+  ): Promise<void> {
+    await this.page.goto(
+      `/namespaces/${namespaceId}/metrics/${encodeURIComponent(name)}/edit`,
+    );
+    await expect(
+      this.page.getByRole("heading", { name: `Edit ${name}` }),
+    ).toBeVisible();
+    // The heading comes from the URL; wait for the stored metric to fill the
+    // form, or Save submits an empty one.
+    await expect(this.page.getByPlaceholder("monthly_revenue")).toHaveValue(
+      name,
+    );
+    await this.labelInput.fill(label);
+    await this.page.getByRole("button", { name: "Save changes" }).click();
+    // A saved edit lands on the detail page. Wait for it there: the edit
+    // page's own "Edit <name>" heading would match a non-exact name.
+    await this.page.waitForURL((url) => !url.pathname.endsWith("/edit"), {
+      timeout: 30_000,
+    });
+    await expect(
+      this.page.getByRole("heading", {
+        name: label || name,
+        exact: true,
+        level: 1,
+      }),
+    ).toBeVisible();
+  }
+
   /** Delete a metric via the list's bulk-delete confirmation modal. */
   async delete(namespaceId: string, name: string): Promise<void> {
     await this.gotoList(namespaceId);
@@ -100,7 +141,9 @@ export class MetricsPage {
     const modal = this.page.getByRole("dialog");
     await expect(modal).toBeVisible();
     await modal.getByRole("button", { name: "Delete" }).click();
-    await expect(modal).toBeHidden();
+    // The modal closes once the delete returns, which takes longer than the
+    // default 5 s on a deployed stack.
+    await expect(modal).toBeHidden({ timeout: 30_000 });
   }
 
   /** Export metrics as OSI; returns the download's suggested name. */

@@ -690,12 +690,17 @@ class TestDiscoveryHandler:
         mock_write.return_value = {"assets_created": 0, "assets_revised": 1}
 
         # Two APPROVED tables. orders is unchanged in the fresh scan; customers
-        # drifts (column type int -> bigint) and so resets to PENDING on merge.
+        # drifts (column type int -> bigint) and so resets to PENDING on merge. orders
+        # carries curated metadata, so it is not sent back through enrichment.
         mock_read_accepted.return_value = [
             Table(
                 name="orders",
                 database="analytics_db",
-                business_metadata=BusinessMetadata(review_status=ReviewStatus.APPROVED),
+                business_metadata=BusinessMetadata(
+                    description="Curated",
+                    enrichment_source=EnrichmentSource.AI_GENERATED,
+                    review_status=ReviewStatus.APPROVED,
+                ),
                 columns=[Column(name="total", data_type="decimal")],
             ),
             Table(
@@ -1017,7 +1022,11 @@ class TestDiscoveryHandler:
             Table(
                 name="orders",
                 database="analytics_db",
-                business_metadata=BusinessMetadata(review_status=ReviewStatus.APPROVED),
+                business_metadata=BusinessMetadata(
+                    description="Curated",
+                    enrichment_source=EnrichmentSource.AI_GENERATED,
+                    review_status=ReviewStatus.APPROVED,
+                ),
                 columns=[Column(name="id", data_type="int"), Column(name="promo_code", data_type="varchar")],
             ),
         ]
@@ -2101,7 +2110,9 @@ def _open_rescan_backup(source_summary: dict | None) -> dict:
     approved_orders = Table(
         name="orders",
         database="analytics_db",
-        business_metadata=BusinessMetadata(review_status=ReviewStatus.APPROVED),
+        business_metadata=BusinessMetadata(
+            description="Curated", enrichment_source=EnrichmentSource.AI_GENERATED, review_status=ReviewStatus.APPROVED
+        ),
         columns=[Column(name="total", data_type="decimal")],
     )
     backup = {

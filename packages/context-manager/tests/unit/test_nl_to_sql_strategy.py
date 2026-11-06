@@ -11,7 +11,7 @@ import pytest
 from coa_serve.deadline import Deadline
 from coa_serve.exceptions import AccessDeniedError, AmbiguousReferenceError
 from coa_serve.tier1.metric_resolver import DeclinedMetricContext
-from coa_serve.tier2.nl_to_sql.strategy import NLtoSQLStrategy
+from coa_serve.tier2.nl_to_sql.strategy import NLtoSQLStrategy, uploaded_ontology_iris
 from coa_serve.tier2.strategy import MAX_RESULT_ROWS, StrategyContext, StrategyOption, StrategyResult
 from coa_serve.tier2.table_qualifier import PreparedSQL
 from coa_serve.trace import TraceCollector
@@ -935,7 +935,6 @@ class TestNLtoSQLCrossSourceQualification:
         llm.converse.return_value = ConverseResult(text=f"```sql\n{sql}\n```\nConfidence: 0.9")
         if writer is not None:
             llm.converse.side_effect = writer
-        vector.count_documents.return_value = 1
         vector.search.return_value = [
             VectorHit(
                 id="ds-102",
@@ -1355,3 +1354,47 @@ class TestNLtoSQLStrategyDeadline:
         # ~50ms measured, NOT the multi-second timeout cap. Generous upper bound
         # to stay non-flaky while still excluding any cap-derived value.
         assert 0 <= exec_steps[0].duration_ms < 1000
+
+
+@pytest.mark.unit
+class TestUploadedOntologyIris:
+    """The top-down fallback's lookup: uploaded (user_created) ontologies of one namespace."""
+
+    @pytest.mark.asyncio
+    async def test_queries_user_created_ontologies_in_the_namespace(self):
+        graph = AsyncMock()
+        graph.query.return_value = [{"o": "https://ex.org/up"}, {"o": ""}]
+
+        iris = await uploaded_ontology_iris(graph, "ns-a", "https://ontology-workbench.local/{namespace}")
+
+        assert iris == ["https://ex.org/up"]
+        sparql = graph.query.call_args.args[0]
+        assert "<https://ontology-workbench.local/vocab#ontology_type> ?type" in sparql
+        # Both user-loaded types: the web app uploads as "user_uploaded".
+        assert '"user_created"' in sparql and '"user_uploaded"' in sparql
+        assert '"induced"' not in sparql and '"foundational"' not in sparql
+        assert "owl:Ontology" in sparql
+        assert '"https://ontology-workbench.local/ns-a/"' in sparql
+
+    @pytest.mark.asyncio
+    async def test_rejects_an_unsafe_namespace(self):
+        graph = AsyncMock()
+        with pytest.raises(ValueError):
+            await uploaded_ontology_iris(graph, 'ns"} INJECT {', "https://g.local/{namespace}")
+        graph.query.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_strategy_passes_the_resolver_when_a_graph_is_wired(self, monkeypatch):
+        monkeypatch.setenv("GRAPH_URI_TEMPLATE", "https://ontology-workbench.local/{namespace}")
+        graph = AsyncMock()
+        graph.query.return_value = [{"o": "https://ex.org/up"}]
+        sql_generator = AsyncMock()
+        sql_generator.generate.return_value = _make_nl_to_sql_result(sql="", error="no_tables_retrieved")
+        strategy = NLtoSQLStrategy(
+            sql_generator=sql_generator, firewall=MagicMock(), query_executor=None, graph_client=graph
+        )
+
+        await strategy.resolve("How many orders?", "ns-a", _make_context())
+
+        resolver = sql_generator.generate.call_args.kwargs["uploaded_ontologies"]
+        assert await resolver() == ["https://ex.org/up"]

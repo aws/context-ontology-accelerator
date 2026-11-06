@@ -10,8 +10,8 @@
 // exception: the function itself has to be attached, so the construct takes a `network`.
 export {
   AthenaFederationConnector,
-  AthenaFederationConnectorProps,
-  ConnectorNetwork,
+  type AthenaFederationConnectorProps,
+  type ConnectorNetwork,
   Provisioning,
   spillPrefixFor,
   CONNECTOR_FUNCTION_SUFFIX,

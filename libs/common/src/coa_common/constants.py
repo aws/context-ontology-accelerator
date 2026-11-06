@@ -63,6 +63,14 @@ VOCAB_PREFIX: str = os.environ.get("VOCAB_PREFIX", BRAND)
 VOCAB_URI: str = os.environ.get("VOCAB_URI", f"{GRAPH_BASE_URI}/vocab/{VOCAB_PREFIX}#")
 """Full RDF vocabulary namespace URI for platform-defined predicates."""
 
+IMPORT_VOCAB_URI: str = os.environ.get("IMPORT_VOCAB_URI", f"{GRAPH_BASE_URI}/vocab/{VOCAB_PREFIX}_import#")
+"""Namespace of AUTHOR-supplied import directives (e.g. ``coa_import:dataSourceName``).
+
+Deliberately separate from :data:`VOCAB_URI`: every caller-supplied ``coa:`` trust marker
+is stripped at import, whereas a ``coa_import:`` directive is an input the server
+validates and derives ``coa:`` markers from. Directives are removed before the ontology
+is loaded, so they never appear in the queryable graph."""
+
 DZ_TYPE_PREFIX: str = os.environ.get("DZ_TYPE_PREFIX", BRAND[:1].upper() + BRAND[1:])
 """PascalCase DataZone type prefix: {DZ_TYPE_PREFIX}TableMetadata."""
 
@@ -153,6 +161,7 @@ class DatabaseSubType(StrEnum):
     JDBC_DATABASE = "JDBC_DATABASE"
     CUSTOM_CONNECTOR = "CUSTOM_CONNECTOR"
     DATABRICKS_SQL_WAREHOUSE = "DATABRICKS_SQL_WAREHOUSE"
+    RDF_SPARQL = "RDF_SPARQL"
 
 
 DATABASE_SUB_TYPES: frozenset[str] = frozenset(s.value for s in DatabaseSubType)
@@ -167,6 +176,25 @@ CONNECTOR_BACKED_SUB_TYPES: frozenset[str] = frozenset(
         DatabaseSubType.DATABRICKS_SQL_WAREHOUSE.value,
     }
 )
+
+
+class StructuredBackend(StrEnum):
+    """Which structured backend answers a class (``coa:queryBackend`` / AOSS ``query_backend``).
+
+    Written by import for graph classes only; an ABSENT marker means :attr:`SQL`, so
+    classes and documents that predate the marker need no migration.
+    """
+
+    SQL = "SQL"
+    RDF_SPARQL = "RDF_SPARQL"
+
+
+# Sub-types whose data is an RDF graph answered natively over SPARQL, not relational
+# tables. They have no Athena/Glue catalog, are never schema-scanned (registration only
+# verifies the endpoint is reachable) and are never induced from: their classes come from
+# an imported ontology. Serve derives the ``RDF_SPARQL`` structured backend from this
+# set. Tested as MEMBERSHIP for the same reason as CONNECTOR_BACKED_SUB_TYPES.
+GRAPH_BACKED_SUB_TYPES: frozenset[str] = frozenset({DatabaseSubType.RDF_SPARQL.value})
 
 
 class ExtractionMode(StrEnum):
@@ -217,7 +245,7 @@ EXTRACTION_BATCH_SIZE: int = 1000
 # ---------------------------------------------------------------------------
 
 DEFAULT_EXTRACTION_MODE: str = ExtractionMode.CONTINUOUS
-DEFAULT_USE_BATCH_INFERENCE: str = "false"
+DEFAULT_USE_BATCH_INFERENCE: str = "true"
 DEFAULT_ENABLE_VERSIONING: str = "true"
 DEFAULT_ENABLE_PROPOSITION_EXTRACTION: str = "true"
 DEFAULT_DELETE_PREV_VERSIONS: str = "false"
@@ -350,6 +378,7 @@ QUERY_STRATEGIES: frozenset[str] = frozenset(
         "ontop_first",
         "nl_to_sql_first",
         "deep-reasoning",
+        "nl_to_sparql",
     }
 )
 
@@ -390,7 +419,7 @@ def validate_id(value: str, name: str) -> None:
     Valid IDs are non-empty strings containing only alphanumeric characters,
     hyphens, or underscores.
     """
-    if not value or not SAFE_ID_RE.match(value):
+    if not value or not SAFE_ID_RE.fullmatch(value):
         raise ValueError(
             f"Invalid {name}. Must be non-empty and contain only alphanumeric characters, hyphens, or underscores."
         )
@@ -398,7 +427,7 @@ def validate_id(value: str, name: str) -> None:
 
 def validate_namespace_id(value: str, name: str = "namespaceId") -> None:
     """Raise ``ValueError`` if *value* is not a valid UUID v4 namespace ID."""
-    if not value or not NAMESPACE_ID_RE.match(value):
+    if not value or not NAMESPACE_ID_RE.fullmatch(value):
         raise ValueError(f"Invalid {name}. Must be a UUID v4 (e.g. '550e8400-e29b-41d4-a716-446655440000').")
 
 
@@ -428,7 +457,7 @@ def validate_namespace_name(value: str) -> None:
     only alphanumeric characters, underscores, or hyphens (max 128 chars).
     Used for safe interpolation in SPARQL graph URIs and OpenSearch index names.
     """
-    if not NAMESPACE_NAME_RE.match(value):
+    if not NAMESPACE_NAME_RE.fullmatch(value):
         raise ValueError("Invalid namespace: must match ^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$")
 
 
@@ -441,7 +470,7 @@ def validate_s3_prefix(value: str, name: str) -> None:
     """
     if not value:
         return
-    if value.startswith("/") or ".." in value or value.startswith("s3://") or not SAFE_S3_PREFIX_RE.match(value):
+    if value.startswith("/") or ".." in value or value.startswith("s3://") or not SAFE_S3_PREFIX_RE.fullmatch(value):
         raise ValueError(f"Invalid {name}. Must be a relative path like 'healthcare/' or 'documents/2024/'.")
 
 

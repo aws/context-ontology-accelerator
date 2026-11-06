@@ -12,10 +12,12 @@ import json
 import os
 import sys
 import uuid
+from datetime import UTC, datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, EndpointConnectionError
+from coa_common.sparql_config import GRAPH_SOURCES_DISABLED_MESSAGE, GRAPH_SOURCES_ENV
 from coa_control_plane_server.models.source_type import SourceType
 
 os.environ.setdefault("SOURCES_TABLE", "test-sources")
@@ -2467,3 +2469,295 @@ class TestRescanStatusTransition:
         from coa_common.response import iso_to_epoch
 
         assert isinstance(iso_to_epoch(sk), int)
+
+
+_GRAPH_VERIFY_QUEUE = "https://sqs.us-east-1.amazonaws.com/123/graph-verify-queue"
+_SCAN_QUEUE = "https://sqs.us-east-1.amazonaws.com/123/scan-queue"
+
+
+def _client_error(code: str, op: str):
+    from botocore.exceptions import ClientError
+
+    return ClientError({"Error": {"Code": code}}, op)
+
+
+def _graph_source_item(status="APPROVED", queryable=True, updated_ago_s=None):
+    item = _db_source_item(status)
+    item["sourceSubType"] = "RDF_SPARQL"
+    item["queryable"] = queryable
+    if updated_ago_s is not None:
+        item["updatedAt"] = (datetime.now(UTC) - timedelta(seconds=updated_ago_s)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return item
+
+
+@pytest.mark.unit
+class TestHandleRescanGraphSource:
+    """Re-scanning an RDF_SPARQL source re-runs its reachability verify, never a scan."""
+
+    @pytest.fixture(autouse=True)
+    def _graph_sources_on(self, monkeypatch):
+        monkeypatch.setenv(GRAPH_SOURCES_ENV, "true")
+
+    @pytest.fixture(autouse=True)
+    def _namespace_item(self):
+        # Every re-scan resolves the namespace-language snapshot first, graph sources included.
+        ns_dao = MagicMock()
+        ns_dao.get.return_value = {"PK": f"NS#{_NAMESPACE_ID}", "SK": "METADATA"}
+        with patch(f"{_SH}._get_ns_dao", return_value=ns_dao):
+            yield ns_dao
+
+    def _rescan(self, item, *, dao=None, sqs=None, scan_dao=None):
+        mock_dao = dao or MagicMock()
+        mock_dao.get.return_value = item
+        mock_scan_dao = scan_dao or MagicMock()
+        mock_sqs = sqs or MagicMock()
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._get_scan_dao", return_value=mock_scan_dao),
+            patch(f"{_SH}._get_sqs", return_value=mock_sqs),
+            patch(f"{_SH}._SCAN_QUEUE_URL", _SCAN_QUEUE),
+            patch(f"{_SH}._GRAPH_VERIFY_QUEUE_URL", _GRAPH_VERIFY_QUEUE),
+        ):
+            status, body = _parse(_current_sh()._handle_rescan({}, _NAMESPACE_ID, _SOURCE_ID))
+        return status, body, mock_dao, mock_scan_dao, mock_sqs
+
+    @pytest.mark.parametrize("entry_status", ["APPROVED", "SCAN_FAILED"])
+    def test_rescan_graph_source_enqueues_reverify_not_scan(self, entry_status):
+        status, body, _, mock_scan_dao, mock_sqs = self._rescan(_graph_source_item(entry_status))
+        assert status == 202
+        job_row = mock_scan_dao.put.call_args[0][0]
+        assert job_row["scanType"] == "reachability"
+        assert job_row["triggerType"] == "MANUAL"
+        assert body["scanJobId"] == job_row["SK"]
+        mock_sqs.send_message.assert_called_once()
+        kwargs = mock_sqs.send_message.call_args.kwargs
+        assert kwargs["QueueUrl"] == _GRAPH_VERIFY_QUEUE
+        assert json.loads(kwargs["MessageBody"]) == {
+            "sourceId": _SOURCE_ID,
+            "namespaceId": _NAMESPACE_ID,
+            "scanJobSK": job_row["SK"],
+        }
+
+    def test_rescan_graph_source_locks_status_and_keeps_queryable(self):
+        """A serving source keeps serving while it is re-verified."""
+        _, _, mock_dao, _, _ = self._rescan(_graph_source_item("APPROVED"))
+        lock = mock_dao.update.call_args_list[0]
+        assert lock.args[1]["status"] == "REGISTERED"
+        assert "queryable" not in lock.args[1]
+        assert lock.kwargs["condition"] == "#st = :prev"
+        assert lock.kwargs["condition_values"] == {":prev": "APPROVED"}
+
+    def test_rescan_graph_source_lost_race_is_409(self):
+        mock_dao = MagicMock()
+        mock_dao.update.side_effect = _client_error("ConditionalCheckFailedException", "UpdateItem")
+        status, _, _, mock_scan_dao, mock_sqs = self._rescan(_graph_source_item("APPROVED"), dao=mock_dao)
+        assert status == 409
+        mock_scan_dao.put.assert_not_called()
+        mock_sqs.send_message.assert_not_called()
+
+    def test_rescan_graph_source_enqueue_failure_releases_lock_and_fails_job(self):
+        mock_sqs = MagicMock()
+        mock_sqs.send_message.side_effect = _client_error("InternalError", "SendMessage")
+        status, _, mock_dao, mock_scan_dao, _ = self._rescan(_graph_source_item("APPROVED"), sqs=mock_sqs)
+        assert status == 500
+        release = mock_dao.update.call_args_list[-1]
+        assert release.args[1]["status"] == "APPROVED"
+        assert mock_scan_dao.update.call_args.args[1]["status"] == "FAILED"
+
+    def test_rescan_graph_source_unreachable_queue_releases_lock_and_fails_job(self):
+        mock_sqs = MagicMock()
+        mock_sqs.send_message.side_effect = EndpointConnectionError(endpoint_url=_GRAPH_VERIFY_QUEUE)
+        status, _, mock_dao, mock_scan_dao, _ = self._rescan(_graph_source_item("APPROVED"), sqs=mock_sqs)
+        assert status == 500
+        release = mock_dao.update.call_args_list[-1]
+        assert release.args[1]["status"] == "APPROVED"
+        assert mock_scan_dao.update.call_args.args[1]["status"] == "FAILED"
+
+    def test_rescan_graph_source_while_verifying_is_409(self):
+        status, _, _, _, mock_sqs = self._rescan(_graph_source_item("REGISTERED", queryable=False, updated_ago_s=60))
+        assert status == 409
+        mock_sqs.send_message.assert_not_called()
+
+    @pytest.mark.parametrize("entry_status", ["APPROVED", "SCAN_FAILED"])
+    def test_rescan_graph_source_with_graph_sources_off_is_400_and_takes_no_lock(self, monkeypatch, entry_status):
+        monkeypatch.delenv(GRAPH_SOURCES_ENV)
+        status, body, mock_dao, mock_scan_dao, mock_sqs = self._rescan(_graph_source_item(entry_status))
+        assert status == 400
+        assert body == {"error": GRAPH_SOURCES_DISABLED_MESSAGE}
+        mock_dao.update.assert_not_called()
+        mock_scan_dao.put.assert_not_called()
+        mock_sqs.send_message.assert_not_called()
+
+    def test_rescan_of_a_stranded_registered_graph_source_with_graph_sources_off_names_the_switch(self, monkeypatch):
+        """No verify is coming for it, so the refusal says why rather than reporting an active scan."""
+        monkeypatch.delenv(GRAPH_SOURCES_ENV)
+        status, body, mock_dao, _, mock_sqs = self._rescan(_graph_source_item("REGISTERED", queryable=False))
+        assert (status, body) == (400, {"error": GRAPH_SOURCES_DISABLED_MESSAGE})
+        mock_dao.update.assert_not_called()
+        mock_sqs.send_message.assert_not_called()
+
+    def test_rescan_of_a_registered_graph_source_with_graph_sources_on_is_still_409(self):
+        """Its verify may still be on the queue, so it is not re-verified a second time."""
+        status, body, _, _, mock_sqs = self._rescan(_graph_source_item("REGISTERED", queryable=False, updated_ago_s=60))
+        assert status == 409
+        assert body["status"] == "REGISTERED"
+        mock_sqs.send_message.assert_not_called()
+
+    def test_a_graph_source_waiting_longer_than_any_verify_can_take_is_re_verified(self):
+        """Turning graph sources off drops the verify queue; once they are on again, a source left
+        REGISTERED would otherwise refuse re-verify and delete forever."""
+        status, body, mock_dao, mock_scan_dao, mock_sqs = self._rescan(
+            _graph_source_item("REGISTERED", queryable=False, updated_ago_s=3600)
+        )
+        assert status == 202
+        assert mock_scan_dao.put.call_args[0][0]["scanType"] == "reachability"
+        mock_sqs.send_message.assert_called_once()
+        assert mock_sqs.send_message.call_args.kwargs["QueueUrl"] == _GRAPH_VERIFY_QUEUE
+
+    def test_a_scheduled_tick_re_verifies_a_graph_source_left_waiting(self):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {
+            **_graph_source_item("REGISTERED", queryable=False, updated_ago_s=3600),
+            "rescanSchedule": _SCHEDULE_ON,
+        }
+        mock_sqs = MagicMock()
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._get_scan_dao", return_value=MagicMock()),
+            patch(f"{_SH}._get_sqs", return_value=mock_sqs),
+            patch(f"{_SH}._GRAPH_VERIFY_QUEUE_URL", _GRAPH_VERIFY_QUEUE),
+        ):
+            resp = _current_sh()._handle_scheduled_rescan({"namespaceId": _NAMESPACE_ID, "sourceId": _SOURCE_ID})
+        assert resp == {"ok": True, "statusCode": 202}
+        mock_sqs.send_message.assert_called_once()
+
+    def test_a_sql_source_left_registered_is_still_409(self):
+        item = _db_source_item("REGISTERED")
+        item["updatedAt"] = "2020-01-01T00:00:00Z"
+        status, _, _, _, mock_sqs = self._rescan(item)
+        assert status == 409
+        mock_sqs.send_message.assert_not_called()
+
+    def test_two_triggers_that_both_read_a_stale_source_enqueue_one_verify(self):
+        """Both read the same stale row before either writes; only the first may take the lock."""
+        stale = _graph_source_item("REGISTERED", queryable=False, updated_ago_s=3600)
+        dao = _ConditionalDao(stale)
+        mock_sqs = MagicMock()
+        first, _, _, _, _ = self._rescan(dict(stale), dao=dao, sqs=mock_sqs)
+        second, body, _, _, _ = self._rescan(dict(stale), dao=dao, sqs=mock_sqs)
+        assert (first, second) == (202, 409)
+        assert body["status"] == "REGISTERED"
+        mock_sqs.send_message.assert_called_once()
+
+    def test_a_lost_enqueue_on_a_stale_source_keeps_it_re_verifiable(self):
+        """Releasing the lock restores the old updatedAt, so the next try doesn't wait 15 more minutes."""
+        stale = _graph_source_item("REGISTERED", queryable=False, updated_ago_s=3600)
+        mock_sqs = MagicMock()
+        mock_sqs.send_message.side_effect = _client_error("InternalError", "SendMessage")
+        status, _, mock_dao, _, _ = self._rescan(stale, sqs=mock_sqs)
+        assert status == 500
+        release = mock_dao.update.call_args_list[-1]
+        assert release.args[1] == {"status": "REGISTERED", "updatedAt": stale["updatedAt"]}
+
+    def test_the_lock_on_a_fresh_status_is_unchanged(self):
+        _, _, mock_dao, _, _ = self._rescan(_graph_source_item("APPROVED"))
+        lock = mock_dao.update.call_args_list[0]
+        assert lock.kwargs["condition"] == "#st = :prev"
+        assert lock.kwargs["condition_values"] == {":prev": "APPROVED"}
+
+    def test_scheduled_rescan_of_graph_source_with_graph_sources_off_is_declined(self, monkeypatch):
+        monkeypatch.delenv(GRAPH_SOURCES_ENV)
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {**_graph_source_item("APPROVED"), "rescanSchedule": _SCHEDULE_ON}
+        mock_scan_dao = MagicMock()
+        mock_sqs = MagicMock()
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._get_scan_dao", return_value=mock_scan_dao),
+            patch(f"{_SH}._get_sqs", return_value=mock_sqs),
+            patch(f"{_SH}._GRAPH_VERIFY_QUEUE_URL", _GRAPH_VERIFY_QUEUE),
+        ):
+            resp = _current_sh()._handle_scheduled_rescan({"namespaceId": _NAMESPACE_ID, "sourceId": _SOURCE_ID})
+        assert resp == {"ok": False, "statusCode": 400}
+        mock_dao.update.assert_not_called()
+        mock_scan_dao.put.assert_not_called()
+        mock_sqs.send_message.assert_not_called()
+
+    def test_scheduled_rescan_of_graph_source_with_graph_sources_on_reverifies(self):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {**_graph_source_item("APPROVED"), "rescanSchedule": _SCHEDULE_ON}
+        mock_sqs = MagicMock()
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._get_scan_dao", return_value=MagicMock()),
+            patch(f"{_SH}._get_sqs", return_value=mock_sqs),
+            patch(f"{_SH}._GRAPH_VERIFY_QUEUE_URL", _GRAPH_VERIFY_QUEUE),
+        ):
+            resp = _current_sh()._handle_scheduled_rescan({"namespaceId": _NAMESPACE_ID, "sourceId": _SOURCE_ID})
+        assert resp == {"ok": True, "statusCode": 202}
+        assert mock_sqs.send_message.call_args.kwargs["QueueUrl"] == _GRAPH_VERIFY_QUEUE
+
+
+class _ConditionalDao:
+    """One source row whose ``update`` evaluates ``a = :b AND …`` conditions like DynamoDB.
+
+    ``get`` keeps returning the snapshot the test sets, as when two triggers read before either writes.
+    """
+
+    def __init__(self, item):
+        self.item = dict(item)
+        self.get = MagicMock(return_value=dict(item))
+
+    def update(self, _key, values, condition=None, condition_names=None, condition_values=None, **_kwargs):
+        names = condition_names or {}
+        for clause in (condition or "").split(" AND "):
+            if "=" not in clause:
+                continue
+            lhs, rhs = (part.strip() for part in clause.split("="))
+            if self.item.get(names.get(lhs, lhs)) != (condition_values or {})[rhs]:
+                raise _client_error("ConditionalCheckFailedException", "UpdateItem")
+        self.item.update(values)
+        return dict(self.item)
+
+
+@pytest.mark.unit
+class TestWaitsForALostVerify:
+    """The 15-minute stale check reads any ISO-8601 updatedAt, not one exact format."""
+
+    @pytest.fixture(autouse=True)
+    def _graph_sources_on(self, monkeypatch):
+        monkeypatch.setenv(GRAPH_SOURCES_ENV, "true")
+
+    @staticmethod
+    def _registered(updated_at):
+        return {**_graph_source_item("REGISTERED", queryable=False), "updatedAt": updated_at}
+
+    @pytest.mark.parametrize(
+        "fmt",
+        [
+            "%Y-%m-%dT%H:%M:%SZ",
+            "%Y-%m-%dT%H:%M:%S.%fZ",
+            "%Y-%m-%dT%H:%M:%S+00:00",
+            "%Y-%m-%dT%H:%M:%S.%f+00:00",
+        ],
+    )
+    def test_an_hour_old_timestamp_is_stale_in_every_iso_form(self, fmt):
+        an_hour_ago = (datetime.now(UTC) - timedelta(hours=1)).strftime(fmt)
+        assert _current_sh()._waits_for_a_lost_verify(self._registered(an_hour_ago))
+
+    @pytest.mark.parametrize(("minutes_ago", "offset_h", "stale"), [(60, 2, True), (5, -5, False)])
+    def test_a_non_utc_offset_is_converted_before_comparing(self, minutes_ago, offset_h, stale):
+        """Read as UTC, the first would look an hour ahead and the second five hours old."""
+        at = (datetime.now(UTC) - timedelta(minutes=minutes_ago)).astimezone(timezone(timedelta(hours=offset_h)))
+        assert _current_sh()._waits_for_a_lost_verify(self._registered(at.isoformat())) is stale
+
+    def test_a_recent_fractional_timestamp_is_not_stale(self):
+        just_now = datetime.now(UTC).isoformat()
+        assert not _current_sh()._waits_for_a_lost_verify(self._registered(just_now))
+
+    def test_an_unreadable_timestamp_is_not_stale_and_is_logged(self):
+        sh = _current_sh()
+        with patch.object(sh, "logger", MagicMock()) as mock_logger:
+            assert not sh._waits_for_a_lost_verify(self._registered("yesterday"))
+        mock_logger.warning.assert_called_once()
+        assert mock_logger.warning.call_args.args[0] == "graph_verify_stale_check_unreadable_updated_at"

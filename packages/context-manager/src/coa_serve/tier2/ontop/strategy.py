@@ -10,11 +10,13 @@ _replay_vkg_steps, so the cause of any retry/fallback is always visible.
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Any
 
 import structlog
 from coa_common import ontology_vector_index_name
+from coa_common.constants import StructuredBackend
 
 from ...clients.base import VectorClient
 from ...exceptions import AccessDeniedError
@@ -44,6 +46,23 @@ _RETRYABLE_VKG_PATTERNS = (
 )
 
 
+# The refusal the Ontop prompt asks for when the data cannot answer: one BIND of a literal that
+# starts with NOT_ANSWERABLE_RANGE: or NOT_ANSWERABLE_FIELD:, and no triple patterns. It touches no
+# table, so it is not translated or executed.
+_NOT_ANSWERABLE_SPARQL_RE = re.compile(
+    r'^\s*SELECT\s+\?answer\s+WHERE\s*\{\s*BIND\s*\(\s*"((?-i:NOT_ANSWERABLE_(?:RANGE|FIELD):)[^"]*)"\s+AS\s+\?answer\s*\)\s*\}\s*(?:LIMIT\s+\d+\s*)?$',
+    re.IGNORECASE,
+)
+
+
+def _not_answerable_reason(sparql: str) -> str | None:
+    """The full ``NOT_ANSWERABLE_<KIND>: <reason>`` text when ``sparql`` is the prompt's refusal, else None."""
+    match = _NOT_ANSWERABLE_SPARQL_RE.match(sparql)
+    if match is None:
+        return None
+    return " ".join(match.group(1).split())
+
+
 def _is_retryable_vkg_error(error: str) -> bool:
     error_lower = error.lower()
     return any(pattern in error_lower for pattern in _RETRYABLE_VKG_PATTERNS)
@@ -53,6 +72,9 @@ class OntopStrategy:
     """StructuredQueryStrategy implementation for SPARQL→VKG→SQL resolution."""
 
     name: str = StrategyOption.ONTOP
+    # Backends this strategy answers; the runner keeps it only for a namespace that
+    # has one of them (see StructuredQueryTier._strategies_for).
+    supported_backends: frozenset[StructuredBackend] = frozenset({StructuredBackend.SQL})
 
     def __init__(
         self,
@@ -107,6 +129,22 @@ class OntopStrategy:
 
         if not (sparql_result.valid and sparql_result.sparql):
             return None
+
+        refusal = _not_answerable_reason(sparql_result.sparql)
+        if refusal is not None:
+            # Same row the NL->SQL writer produces for a refusal: one ``answer`` cell and a bare
+            # literal ``SELECT '...' AS answer``, so the Tier-2 gate treats both paths alike.
+            escaped = refusal.replace("'", "''")
+            return StrategyResult(
+                sql=f"SELECT '{escaped}' AS answer",
+                rows=[{"answer": refusal}],
+                columns=["answer"],
+                confidence=sparql_result.confidence,
+                strategy_name=StrategyOption.ONTOP,
+                trace_steps=[],
+                row_count=1,
+                truncated=False,
+            )
 
         tier2_result = await self._resolve_with_retry(
             query,
@@ -332,23 +370,15 @@ class OntopStrategy:
             # top-k with unmapped classes; the provenance skip evaluator only
             # bails when ALL top-k hits are unmapped, so the partial mix fell
             # through untouched.
-            #
-            # Legacy bridge, same as NL→SQL: namespaces ingested before
-            # ``data_source_id`` was written carry zero mapped records, and gating
-            # them would hide every class. One cheap count decides whether the
-            # gate applies at all.
-            mapped_count = await self._vector_client.count_documents(
-                index=index_name, entity_type="class", require_mapped=True
-            )
-            use_mapped_gate = mapped_count > 0
-
+            # SQL backend gate: graph (RDF_SPARQL) classes are answered by the SPARQL strategy.
             class_hits = await self._vector_client.search(
                 embedding,
                 namespace=namespace,
                 top_k=_VECTOR_TOP_K,
                 index=index_name,
                 entity_type="class",
-                require_mapped=use_mapped_gate,
+                require_mapped=True,
+                query_backend=StructuredBackend.SQL,
             )
             # Properties and metrics are fetched unfiltered: only classes carry the
             # data_source_id stamp the mapped gate reads, and metrics are resolved
@@ -365,8 +395,6 @@ class OntopStrategy:
                 "tier2_aoss_raw_hits",
                 namespace=namespace,
                 count=len(raw_hits),
-                mapped_gate=use_mapped_gate,
-                mapped_count=mapped_count,
                 class_hits=len(class_hits),
                 sample_types=[h.metadata.get("entity_type", "MISSING") for h in raw_hits[:5]],
             )

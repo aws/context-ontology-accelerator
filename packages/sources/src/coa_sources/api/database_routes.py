@@ -32,12 +32,18 @@ from urllib.parse import unquote
 
 import boto3
 import structlog
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 from coa_common.dao import QueryParams
 from coa_common.domain_models import Table
 from coa_common.metadata_store import AssetResult, SMUSClient
 from coa_common.response import api_response, iso_to_epoch
 from coa_common.s3 import get_s3_client, read_file_bytes, upload_json
+from coa_common.sparql_config import (
+    GRAPH_SOURCES_DISABLED_MESSAGE,
+    SparqlConfigurationError,
+    graph_sources_enabled,
+    parse_sparql_configuration,
+)
 from coa_control_plane_server.models.custom_connector_configuration import CustomConnectorConfiguration
 from coa_control_plane_server.models.databricks_sql_warehouse_configuration import DatabricksSqlWarehouseConfiguration
 from coa_control_plane_server.models.glue_configuration import GlueConfiguration
@@ -83,6 +89,7 @@ from coa_sources.database.glue_ownership import (
     claim_platform_catalog,
     release_platform_catalog,
 )
+from coa_sources.database.graph_verify import REACHABILITY_SCAN_TYPE, verify_message
 from coa_sources.database.metrics import emit_metric
 from coa_sources.database.rescan_backup import S3_ABSENT_CODES, backup_s3_key
 from coa_sources.database.secret_binding import NAMESPACE_TAG_KEY, check_secret_namespace_binding
@@ -97,6 +104,7 @@ from .namespace_counters import adjust_namespace_source_count
 from .sources_handler import (
     _AWS_REGION,
     _BUCKET_NAME,
+    _GRAPH_VERIFY_QUEUE_URL,
     _PROJECT_ACCESS_ROLE_ARN,
     _REVIEW_QUEUE_URL,
     _SCAN_QUEUE_URL,
@@ -154,6 +162,7 @@ _CONFIG_MEMBERS = (
     "jdbcConfiguration",
     "customConnectorConfiguration",
     "databricksSqlWarehouseConfiguration",
+    "sparqlConfiguration",
 )
 
 
@@ -681,6 +690,123 @@ def _strip_external_id(config_dict: dict[str, Any], existing_config: Any = None)
     return config_dict
 
 
+def _create_sparql_source(sparql_config: Any, name: str, namespace_id: str) -> dict[str, Any]:
+    """Create an RDF_SPARQL (graph) source and enqueue its reachability verify.
+
+    A graph source is bring-your-own-ontology: its instance data lives as triples in
+    the SPARQL store and its classes come from a separately imported ontology, so
+    there is nothing to discover, enrich or federate. The record is written
+    ``REGISTERED`` and not ``queryable``; the graph-verify Lambda probes the endpoint
+    and moves it to ``APPROVED``/``queryable`` or ``SCAN_FAILED``.
+
+    The stored ``configuration`` is the normalised §4.3 contract
+    (:class:`coa_common.sparql_config.SparqlSourceConfig`), with the store, auth mode
+    and signing region defaults filled in, so serve and the verify Lambda never have
+    to re-derive them. Refused before anything is written while graph sources are off.
+    """
+    if not graph_sources_enabled():
+        return api_response(400, {"error": GRAPH_SOURCES_DISABLED_MESSAGE})
+    requested = sparql_config.to_dict()
+    requested.setdefault("region", _AWS_REGION)
+    try:
+        config = parse_sparql_configuration(requested)
+    except SparqlConfigurationError as exc:
+        return api_response(400, {"error": f"Invalid sparqlConfiguration: {exc}"})
+    # The verify probe reaches only clusters of this deployment's region.
+    if config.signing_region(_AWS_REGION) != _AWS_REGION:
+        return api_response(
+            400,
+            {"error": f"Invalid sparqlConfiguration: the cluster must be in this deployment's region {_AWS_REGION}"},
+        )
+
+    source_id = str(uuid.uuid4())
+    now = _now_iso()
+    item: dict[str, Any] = {
+        "PK": f"NS#{namespace_id}",
+        "SK": f"SRC#{source_id}",
+        "sourceId": source_id,
+        "namespaceId": namespace_id,
+        "name": name,
+        "sourceType": SourceType.DATABASE,
+        "sourceSubType": SourceSubType.RDF_SPARQL,
+        "status": SourceStatus.REGISTERED,
+        "configuration": json.dumps(config.to_record()),
+        "region": config.signing_region(_AWS_REGION),
+        # Flipped by the verify once the endpoint answers; never asserted here, where
+        # nothing has proved the endpoint reachable.
+        "queryable": False,
+        "createdAt": now,
+        "updatedAt": now,
+        "sourceTypeCreatedAt": f"{SourceType.DATABASE.value}#{now}",
+    }
+    try:
+        _get_dao().put(item)
+    except ClientError:
+        logger.exception("ddb_put_failed", source_id=source_id)
+        return api_response(500, {"error": "Internal server error"})
+
+    adjust_namespace_source_count(namespace_id, SourceType.DATABASE, 1)
+
+    scan_job_sk = now
+    try:
+        _get_scan_dao().put(
+            {
+                "PK": f"SRC#{source_id}",
+                "SK": scan_job_sk,
+                "sourceId": source_id,
+                "namespaceId": namespace_id,
+                "status": "IN_PROGRESS",
+                "scanType": REACHABILITY_SCAN_TYPE,
+                "triggerType": ScanTrigger.INITIAL,
+                "startedAt": now,
+                "createdAt": now,
+            }
+        )
+    except ClientError:
+        logger.exception("ddb_put_scan_job_failed", source_id=source_id)
+
+    if not _enqueue_graph_verify(source_id, namespace_id, scan_job_sk):
+        # Nothing would ever verify this source, and REGISTERED is an active status
+        # (delete and re-scan both refuse it), so leaving the row would strand it.
+        # Same rollback as a SQL create whose scan could not be enqueued.
+        with contextlib.suppress(ClientError):
+            _get_scan_dao().delete({"PK": f"SRC#{source_id}", "SK": scan_job_sk})
+        if _rollback_unscanned_source(namespace_id, source_id):
+            adjust_namespace_source_count(namespace_id, SourceType.DATABASE, -1)
+        return api_response(500, {"error": "Failed to create source. Please retry."})
+
+    logger.info("sparql_source_created", source_id=source_id, namespace_id=namespace_id, store=config.store.value)
+    return api_response(
+        202,
+        {
+            "sourceId": source_id,
+            "status": SourceStatus.REGISTERED,
+            "scanJobId": scan_job_sk,
+            "createdAt": iso_to_epoch(now),
+        },
+    )
+
+
+def _enqueue_graph_verify(source_id: str, namespace_id: str, scan_job_sk: str) -> bool:
+    """Send the reachability verify for a new graph source; False when it was not sent.
+
+    A deployment without a verify queue counts as a failed send: the source would
+    otherwise sit REGISTERED with nothing to verify it.
+    """
+    if not _GRAPH_VERIFY_QUEUE_URL:
+        logger.error("graph_verify_queue_not_configured", source_id=source_id)
+        return False
+    try:
+        _get_sqs().send_message(
+            QueueUrl=_GRAPH_VERIFY_QUEUE_URL,
+            MessageBody=verify_message(source_id, namespace_id, scan_job_sk),
+        )
+    except (ClientError, BotoCoreError):
+        logger.exception("graph_verify_enqueue_failed", source_id=source_id)
+        return False
+    return True
+
+
 def _create_database_source(db_req: Any, namespace_id: str, *, namespace_language: str) -> dict[str, Any]:
     """Create a DATABASE source. db_req is a CreateDatabaseSourceInput model instance.
 
@@ -696,7 +822,12 @@ def _create_database_source(db_req: Any, namespace_id: str, *, namespace_languag
     jdbc_config = db_req.jdbc_configuration
     custom_connector_config = db_req.custom_connector_configuration
     databricks_config = db_req.databricks_sql_warehouse_configuration
-    supplied = [c for c in (glue_config, jdbc_config, custom_connector_config, databricks_config) if c is not None]
+    sparql_config = db_req.sparql_configuration
+    supplied = [
+        c
+        for c in (glue_config, jdbc_config, custom_connector_config, databricks_config, sparql_config)
+        if c is not None
+    ]
     if not supplied:
         return api_response(
             400,
@@ -710,6 +841,12 @@ def _create_database_source(db_req: Any, namespace_id: str, *, namespace_languag
             400,
             {"error": f"Provide exactly one of {', '.join(_CONFIG_MEMBERS)}"},
         )
+
+    # A graph source shares none of the catalog, claim or scan machinery below, so it
+    # is created on its own path before any of it runs. Returning here is also what
+    # keeps the trailing `else` of the sub-type resolution from reading it as Glue.
+    if sparql_config is not None:
+        return _create_sparql_source(sparql_config, name, namespace_id)
 
     if custom_connector_config is not None:
         error = _validate_custom_connector_configuration(custom_connector_config)

@@ -3,6 +3,7 @@
 
 import React from "react";
 import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { describe, it, expect, vi, beforeEach } from "vitest";
@@ -58,9 +59,11 @@ vi.mock("../api-hooks/use-list-sources", () => ({
   }),
 }));
 
+let mockMetrics: Array<Record<string, unknown>> = [];
+
 vi.mock("../api-hooks/use-metrics", () => ({
   useListMetrics: () => ({
-    data: { pages: [] },
+    data: { pages: [{ metrics: mockMetrics }] },
     isLoading: false,
     error: null,
   }),
@@ -106,6 +109,7 @@ const wrapper = ({ children }: { children: React.ReactNode }) => (
 describe("GetNamespace", () => {
   beforeEach(() => {
     mockNamespace = { ...baseNamespace };
+    mockMetrics = [];
   });
 
   it("renders the namespace display name as header", () => {
@@ -210,5 +214,38 @@ describe("GetNamespace", () => {
     render(<GetNamespace />, { wrapper });
     const link = screen.getByRole("link", { name: "My Database" });
     expect(link).toHaveAttribute("href", "/namespaces/ns-1/sources/src-1");
+  });
+
+  it("names each metric by its display label, with the name beneath, as the Metrics page does", async () => {
+    mockMetrics = [
+      {
+        name: "gas_cost",
+        label: "ガス代",
+        description: "",
+        dataSourceId: "ds-1",
+        sourceTable: "t",
+      },
+      {
+        name: "water_cost",
+        description: "",
+        dataSourceId: "ds-1",
+        sourceTable: "t",
+      },
+    ];
+    const user = userEvent.setup();
+    render(<GetNamespace />, { wrapper });
+    await user.click(screen.getByRole("tab", { name: /metrics/i }));
+
+    const labelled = screen.getByRole("link", { name: "ガス代" });
+    // The page is addressed by the name, not the label.
+    expect(labelled).toHaveAttribute(
+      "href",
+      "/namespaces/ns-1/metrics/gas_cost",
+    );
+    expect(screen.getByText("gas_cost")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "water_cost" })).toHaveAttribute(
+      "href",
+      "/namespaces/ns-1/metrics/water_cost",
+    );
   });
 });

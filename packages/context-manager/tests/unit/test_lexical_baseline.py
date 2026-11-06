@@ -977,6 +977,72 @@ class TestMapResults:
         assert all(chunk.chunk_id != "random-wrapper-node-id" for chunk in chunks)
         assert all("aggregate" not in chunk.text for chunk in chunks)
 
+    def test_source_level_wrapper_carries_its_topic_statements_on_its_first_chunk(self):
+        # A topic_beam source's statements are the evidence an answer is written
+        # from; they must reach synthesis even when the chunk holding the fact
+        # falls outside the prompt window.
+        node = _make_node(
+            node_id="random-wrapper-node-id",
+            metadata={
+                "result": {
+                    "source": _source_metadata("aws:tenant:source:treaty-re-300"),
+                    "topics": [
+                        {
+                            "topic": "Program overview",
+                            "chunks": [{"chunkId": "chunk-title", "value": "Reinsurance Treaty Summary RE-300."}],
+                            "statements": ["The treaty covers property catastrophe losses."],
+                        },
+                        {
+                            "topic": "Retention",
+                            "chunks": [
+                                {"chunkId": "chunk-title", "value": "Reinsurance Treaty Summary RE-300."},
+                                {"chunkId": "chunk-retention", "value": "Section 4. Retention ..."},
+                            ],
+                            "statements": [
+                                {"statement": "The per-event retention is $1,000,000."},
+                                "The treaty covers property catastrophe losses.",
+                                "   ",
+                            ],
+                        },
+                    ],
+                }
+            },
+        )
+
+        chunks, _ = BaselineLexicalRetriever._map_results([node])
+
+        assert [chunk.chunk_id for chunk in chunks] == ["chunk-title", "chunk-retention"]
+        assert chunks[0].statements == (
+            "The treaty covers property catastrophe losses.",
+            "The per-event retention is $1,000,000.",
+        )
+        assert chunks[1].statements == ()
+        assert all("$1,000,000" not in chunk.text for chunk in chunks)
+
+    def test_source_statements_skip_a_blank_first_chunk(self):
+        node = _make_node(
+            metadata={
+                "result": {
+                    "source": _source_metadata("aws:tenant:source:treaty-re-300"),
+                    "topics": [
+                        {
+                            "chunks": [
+                                {"chunkId": "chunk-blank", "value": "   "},
+                                {"chunkId": "chunk-retention", "value": "Section 4. Retention ..."},
+                            ],
+                            "statements": ["The per-event retention is $1,000,000."],
+                        }
+                    ],
+                }
+            },
+        )
+
+        chunks, _ = BaselineLexicalRetriever._map_results([node])
+
+        by_id = {chunk.chunk_id: chunk.statements for chunk in chunks}
+        assert by_id["chunk-retention"] == ("The per-event retention is $1,000,000.",)
+        assert by_id.get("chunk-blank", ()) == ()
+
     def test_preserved_score_marker_never_reaches_synthesis_text(self):
         # The score marker is an ADAPTER-ONLY key written onto raw chunk metadata.
         # `_BENCHMARK_PROCESSOR_ARGS` sets `include_chunk_details: True`, so the

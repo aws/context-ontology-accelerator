@@ -44,6 +44,15 @@ class StepId(StrEnum):
     T2_VKG_RETRY = "t2.vkg.retry"
     T2_VKG_FAILED = "t2.vkg.failed"
 
+    # Tier 2 — native SPARQL (RDF_SPARQL sources). Separate from VKG so a graph
+    # answer is never mistaken for an Ontop one in a trace.
+    T2_SPARQL_CONTEXT = "t2.sparql.context"
+    T2_SPARQL_TRANSLATE = "t2.sparql.translate"
+    T2_SPARQL_VALIDATE = "t2.sparql.validate"
+    T2_SPARQL_FIREWALL = "t2.sparql.firewall"
+    T2_SPARQL_EXECUTE = "t2.sparql.execute"
+    T2_SPARQL_FAILED = "t2.sparql.failed"
+
     # Tier 2 — strategy selection (parallel mode)
     T2_STRATEGY_SELECTED = "t2.strategy_selected"
 
@@ -76,6 +85,11 @@ TOOL_FOR_STEP: dict[str, str] = {
     StepId.T2_VKG_AUTHORIZE: "cedar",
     StepId.T2_VKG_FIREWALL: "sql-firewall",
     StepId.T2_VKG_EXECUTE: "sql-engine",
+    StepId.T2_SPARQL_CONTEXT: "tbox-builder",
+    StepId.T2_SPARQL_TRANSLATE: "bedrock",
+    StepId.T2_SPARQL_VALIDATE: "sparql-validator",
+    StepId.T2_SPARQL_FIREWALL: "sparql-firewall",
+    StepId.T2_SPARQL_EXECUTE: "sparql-endpoint",
     StepId.T3_VECTOR_SEARCH: "opensearch",
     StepId.T3_GRAPH_TRAVERSE: "neptune",
     StepId.T3_SYNTHESIZE: "bedrock",
