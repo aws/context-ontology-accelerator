@@ -11,6 +11,8 @@ theme:
 
 nav:
   - Home: index.md
+  - Overview:
+    - Architecture: architecture.md
   - User Guide:
     - Deploying Context Ontology Accelerator: user-guide/deploying.md
     - Namespaces: user-guide/namespaces.md

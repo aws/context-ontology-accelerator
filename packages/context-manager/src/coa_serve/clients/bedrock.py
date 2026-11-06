@@ -40,6 +40,13 @@ from coa_common.guardrail_metrics import (
     filter_type_from_assessments,
 )
 
+from ..llm_usage import (
+    REASON_MISSING_USAGE,
+    REASON_PROVIDER_ERROR,
+    REASON_STREAM_ABANDONED,
+    current_tracker,
+    record_usage,
+)
 from .base import (
     STOP_REASON_MAX_TOKENS,
     ContentFilteredError,
@@ -421,10 +428,25 @@ class BedrockLLMClient:
 
         client = self._get_client()
         loop = asyncio.get_running_loop()
+        # Opt-in LLM usage accounting: register on the request's context, record in the
+        # worker through the captured tracker — the worker finishes (and Bedrock bills)
+        # even when this await is cancelled by a deadline.
+        tracker = current_tracker()
+        handle = tracker.register_call("converse", kwargs["modelId"]) if tracker is not None else None
+
+        def _call() -> Any:
+            try:
+                response = self._call_with_temperature_fallback(client.converse, kwargs)
+            except BaseException:
+                if handle is not None:
+                    tracker.fail_call(handle, REASON_PROVIDER_ERROR)
+                raise
+            if handle is not None:
+                record_usage(tracker, handle, response.get("usage"))
+            return response
+
         start = time.monotonic()
-        response = await loop.run_in_executor(
-            _EXECUTOR, lambda: self._call_with_temperature_fallback(client.converse, kwargs)
-        )
+        response = await loop.run_in_executor(_EXECUTOR, _call)
         latency_ms = (time.monotonic() - start) * 1000
 
         stop_reason = response.get("stopReason", "")
@@ -560,9 +582,20 @@ class BedrockLLMClient:
         # event, so it exits at the first opportunity either way.
         stream_holder: dict[str, Any] = {}
         abandoned = threading.Event()
+        # Opt-in LLM usage accounting (see converse()). The final usage arrives in the
+        # stream's metadata event, so the worker records it; a stream closed early or
+        # ending without usage leaves the request incomplete, never zero-cost.
+        tracker = current_tracker()
+        handle = tracker.register_call("converse_stream", kwargs["modelId"]) if tracker is not None else None
+        usage_seen = False
+
+        def _fail_usage(reason: str) -> None:
+            if handle is not None and not usage_seen:
+                tracker.fail_call(handle, reason)
 
         def _run_stream() -> None:
             """Run in thread — iterate EventStream, push text chunks to queue."""
+            nonlocal usage_seen
             guardrail_triggered = False
             guardrail_trace: dict[str, Any] = {}
             try:
@@ -573,10 +606,12 @@ class BedrockLLMClient:
                     # Disconnected while the API call was in flight — nothing was
                     # closeable at that point, so honour the request here.
                     _close_stream_quietly(response["stream"])
+                    _fail_usage(REASON_STREAM_ABANDONED)
                     return
                 for event in response["stream"]:
                     if abandoned.is_set():
                         _close_stream_quietly(response["stream"])
+                        _fail_usage(REASON_STREAM_ABANDONED)
                         return
                     if "contentBlockDelta" in event:
                         text = event["contentBlockDelta"].get("delta", {}).get("text", "")
@@ -599,6 +634,9 @@ class BedrockLLMClient:
                         trace = event["metadata"].get("trace", {}).get("guardrail", {})
                         if trace:
                             guardrail_trace = trace
+                        if handle is not None and not usage_seen:
+                            usage_seen = True
+                            record_usage(tracker, handle, event["metadata"].get("usage"))
                     # Safely ignore: messageStart, contentBlockStart, contentBlockStop
                 # Signal the guardrail outcome if it acted. Classified here rather
                 # than as a bare bool so an unexplained intervention (no trace) is
@@ -613,8 +651,10 @@ class BedrockLLMClient:
                             _classify_guardrail("guardrail_intervened", guardrail_trace),
                         ),
                     )
+                _fail_usage(REASON_MISSING_USAGE)
                 loop.call_soon_threadsafe(queue.put_nowait, None)
             except Exception as e:
+                _fail_usage(REASON_PROVIDER_ERROR)
                 loop.call_soon_threadsafe(queue.put_nowait, e)
 
         task = loop.run_in_executor(_EXECUTOR, _run_stream)

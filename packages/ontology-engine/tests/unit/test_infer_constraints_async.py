@@ -48,6 +48,23 @@ def _stub_proposal(pid, namespace="default"):
     return {"proposal_id": pid, "status": "pending", "ontology_turtle": _VALID_TTL, "metadata": {}}
 
 
+@pytest.fixture(autouse=True)
+def persisted(monkeypatch) -> list[str]:
+    """Statuses the worker writes to DynamoDB, in order.
+
+    The DynamoDB copy is best-effort. Unstubbed, each write waits out botocore's
+    retries against an unreachable endpoint, which can outlast the 5 s poll."""
+    from coa_ontology import proposals
+
+    written: list[str] = []
+    monkeypatch.setattr(
+        proposals.dynamo_store,
+        "put_async_job",
+        lambda kind, job_id, item, namespace="default": written.append(item["status"]),
+    )
+    return written
+
+
 def _poll_until_terminal(proposals, proposal_id, job_id, namespace, timeout_s=5.0):
     deadline = time.time() + timeout_s
     job = None
@@ -79,7 +96,7 @@ def test_infer_constraints_returns_202_pending_job(monkeypatch):
     assert resp["result"] is None
 
 
-def test_infer_constraints_job_polls_to_completed(monkeypatch):
+def test_infer_constraints_job_polls_to_completed(monkeypatch, persisted):
     """End-to-end: POST spawns the real worker thread; the job GET
     eventually returns ``completed`` with ``inferred_constraints``."""
     from coa_ontology import proposals
@@ -91,14 +108,19 @@ def test_infer_constraints_job_polls_to_completed(monkeypatch):
         "coa_ontology.validation.shapes.nl_generator.infer_constraints_from_ontology",
         lambda turtle, existing_config=None: _StubConfig(),
     )
-
     resp = proposals.infer_constraints("p-1", namespace="ns")
 
     job = _poll_until_terminal(proposals, "p-1", resp["job_id"], "ns")
+    # The worker marks the job completed before it sets the result and writes the
+    # terminal record, so wait for that write before asserting on either.
+    deadline = time.monotonic() + 5
+    while persisted[-1:] != ["completed"] and time.monotonic() < deadline:
+        time.sleep(0.01)
     assert job is not None
     assert job["status"] == "completed"
     assert job["result"]["inferred_constraints"]["classes"][0]["class_uri"] == "https://example.org/Policy"
     assert job["error"] is None
+    assert persisted == ["pending", "running", "completed"]
 
 
 def test_infer_constraints_worker_marks_failed_on_llm_error(monkeypatch):

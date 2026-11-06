@@ -874,7 +874,7 @@ SQL) — receive the same approved metadata:
 | Field | In the ontology | Used to answer questions |
 |-------|-----------------|--------------------------|
 | Description | `rdfs:comment` on the class (table) or property (column) | Both paths, as context for the model |
-| Synonyms | `skos:altLabel` | Both paths; a table's synonyms are also matched when finding the tables a question is about |
+| Synonyms | `skos:altLabel` | Both paths, as context for the model. A table's synonyms are also matched when finding the tables a question is about: they are part of the text semantic search compares with the question. In a namespace too large to send every table to the model, when semantic search finds no table, Ontop falls back to keyword matching, which checks table synonyms as well as table labels (one-character synonyms are not matched) |
 | Glossary terms | `coa:glossaryTerm` | Both paths; a table's glossary terms are also matched when finding the tables a question is about |
 | Tags | `coa:tag` | Both paths, as context for the model. Not used to find tables: broad tags such as "financial" would make unrelated tables look alike |
 | Primary key | `owl:hasKey` on the class | Both paths: Ontop's mapping keys rows on it, and NL→SQL is told which column identifies a row |

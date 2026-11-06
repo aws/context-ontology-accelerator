@@ -199,7 +199,7 @@ _QUERY_ENUM_MEMBERS: dict[str, frozenset[str]] = {
     "mode": contract.QUERY_MODES,
     "strategy": QUERY_STRATEGIES,
 }
-_QUERY_BOOL_MEMBERS: tuple[str, ...] = ("includeSupporting", "includeDebugInfo")
+_QUERY_BOOL_MEMBERS: tuple[str, ...] = ("includeSupporting", "includeDebugInfo", "includeLlmUsage")
 
 
 def _enum_values(name: str, allowed: frozenset[str]) -> frozenset[str]:

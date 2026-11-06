@@ -4,11 +4,11 @@
 # the bundle needs libs/common's runtime deps; they are listed here because the
 # Lambda has no package requirements of its own.
 cedarpy>=4.8.0
-pydantic>=2.0
+pydantic>=2.13.4
 pydantic-settings>=2.0
 structlog>=24.0
-cryptography>=43.0
-PyJWT>=2.9.0
-requests>=2.32.0
+cryptography>=50.0.2
+PyJWT>=2.15.1
+requests>=2.34.2
 # First certifi without the roots behind the compromised emSign intermediates.
 certifi>=2026.10.19

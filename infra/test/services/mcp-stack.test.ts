@@ -120,6 +120,20 @@ describe("McpStack", () => {
     );
   });
 
+  it("pins MCP auth on in the deployed runtime", () => {
+    // SCL_AUTH_ENABLED=false is a local-dev switch; the server refuses it under
+    // SCL_MCP_MODE, and the template states the default.
+    template.hasResourceProperties(
+      "AWS::BedrockAgentCore::Runtime",
+      Match.objectLike({
+        EnvironmentVariables: Match.objectLike({
+          SCL_MCP_MODE: "true",
+          SCL_AUTH_ENABLED: "true",
+        }),
+      }),
+    );
+  });
+
   it("sets JWT issuer/client env vars for independent signature verification", () => {
     // Defense-in-depth: claims.py verifies signatures itself using the same
     // issuer/audience the AuthorizerConfiguration below trusts, rather than

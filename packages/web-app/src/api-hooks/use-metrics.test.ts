@@ -19,14 +19,11 @@ import {
 
 const mockPost = vi.fn();
 const mockGet = vi.fn();
+// One client for every render, as the real provider's memoized context gives.
+const apiClient = { post: mockPost, get: mockGet, put: vi.fn(), del: vi.fn() };
 
 vi.mock("@components/ApiClientProvider", () => ({
-  useApiClient: () => ({
-    post: mockPost,
-    get: mockGet,
-    put: vi.fn(),
-    del: vi.fn(),
-  }),
+  useApiClient: () => apiClient,
 }));
 
 const NS_ID = "550e8400-e29b-41d4-a716-446655440000";

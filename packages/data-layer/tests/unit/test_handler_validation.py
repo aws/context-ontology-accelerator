@@ -242,6 +242,7 @@ class TestQuerySuccess:
             "strategy": "ontop",
             "includeSupporting": True,
             "maxResults": 5,
+            "includeLlmUsage": True,
         }
         with patch.object(handler_module, "_invoke_context_manager", side_effect=_fake_invoke):
             event = _api_event(
@@ -273,6 +274,8 @@ class TestQuerySuccess:
         assert payload["options"]["strategy"] == "ontop"
         assert payload["options"]["includeSupporting"] is True
         assert payload["options"]["maxResults"] == 5
+        # Opt-in LLM usage: forwarded so serve attaches result.llmUsage.
+        assert payload["options"]["includeLlmUsage"] is True
         assert payload["profile"]["groups"] == ["g1", "g2"]
         assert payload["profile"]["globalRoles"] == ["admin"]
         assert captured["token"] == "test-token"
@@ -988,3 +991,17 @@ def test_malformed_namespace_id_is_400_before_any_backend_call(namespace, method
     assert "UUID v4" in json.loads(result["body"])["message"]
     invoke.assert_not_called()
     boto.client.assert_not_called()
+
+
+@pytest.mark.unit
+def test_query_without_include_llm_usage_does_not_forward_it():
+    captured: dict = {}
+
+    def _fake_invoke(payload: dict, token: str) -> dict:
+        captured["payload"] = payload
+        return {"statusCode": 200, "result": {}}
+
+    with patch.object(handler_module, "_invoke_context_manager", side_effect=_fake_invoke):
+        handler(_api_event("POST", "/namespaces/{namespaceId}/query", body={"query": "q"}), None)
+
+    assert "includeLlmUsage" not in captured["payload"]["options"]

@@ -15,6 +15,8 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
+from collections.abc import Iterable
 from pathlib import Path
 
 import pytest
@@ -52,20 +54,41 @@ exit {exit_code}""",
     return bin_dir
 
 
+# System dirs may hold a real mvn or java (GitHub's ubuntu-latest has /usr/bin/mvn); mask them so only the stubs run.
+_SYSTEM_DIRS = ("/usr/bin", "/bin")
+_JAVA_ENV = ("JAVA_HOME", "MAVEN_HOME", "M2_HOME")
+
+
 def _run(bin_dir: Path, *, path_java: Path | None = None) -> subprocess.CompletedProcess[str]:
     """Run with only the stubs and coreutils on PATH, plus ``path_java``'s bin if given."""
     search = [str(bin_dir)]
     if path_java is not None:
         search.append(str(path_java / "bin"))
-    search += ["/usr/bin", "/bin"]
+    search += _without_tools(bin_dir.parent, _SYSTEM_DIRS, ("mvn", "java"))
+    env = {key: value for key, value in os.environ.items() if key not in _JAVA_ENV}
     return subprocess.run(
         ["/bin/bash", str(_SCRIPT)],
         cwd=_ROOT,
-        env={**os.environ, "PATH": os.pathsep.join(search)},
+        env={**env, "PATH": os.pathsep.join(search)},
         capture_output=True,
         text=True,
         check=False,
     )
+
+
+def _without_tools(tmp_path: Path, entries: Iterable[str], tools: tuple[str, ...]) -> list[str]:
+    """``entries``, each directory holding one of ``tools`` replaced by a copy of it without them."""
+    dirs = []
+    for i, entry in enumerate(d for d in entries if d):
+        if not any((Path(entry) / tool).exists() for tool in tools):
+            dirs.append(entry)
+            continue
+        shadow = Path(tempfile.mkdtemp(prefix=f"without-{'-'.join(tools)}-{i}-", dir=tmp_path))
+        for tool in Path(entry).iterdir():
+            if tool.name not in tools:
+                (shadow / tool.name).symlink_to(tool)
+        dirs.append(str(shadow))
+    return dirs
 
 
 def test_maven_on_a_supported_jdk_passes(tmp_path: Path) -> None:
@@ -187,18 +210,7 @@ def test_unparseable_mvn_output_only_warns(tmp_path: Path) -> None:
 
 def _path_without_mvn(tmp_path: Path) -> list[str]:
     """The caller's PATH, each directory holding an ``mvn`` replaced by a copy of it without one."""
-    dirs = []
-    for i, entry in enumerate(d for d in os.environ["PATH"].split(os.pathsep) if d):
-        if not (Path(entry) / "mvn").exists():
-            dirs.append(entry)
-            continue
-        shadow = tmp_path / f"no-mvn-{i}"
-        shadow.mkdir()
-        for tool in Path(entry).iterdir():
-            if tool.name != "mvn":
-                (shadow / tool.name).symlink_to(tool)
-        dirs.append(str(shadow))
-    return dirs
+    return _without_tools(tmp_path, os.environ["PATH"].split(os.pathsep), ("mvn",))
 
 
 def test_platform_preflight_does_not_need_maven(tmp_path: Path) -> None:

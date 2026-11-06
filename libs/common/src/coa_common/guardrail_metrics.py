@@ -173,6 +173,37 @@ def assessments_from_trace(trace: dict[str, Any] | None) -> list[dict[str, Any]]
     return flat
 
 
+def redacted_actions(assessments: list[dict[str, Any]] | None) -> list[str]:
+    """Summarise assessments as ``policy:name=action`` labels that are safe to log.
+
+    An assessment echoes the text each policy matched (``{"type": "NAME", "match": "Jane Doe", ...}``),
+    so it must never be logged as is. Only the policy, the configured name (a topic's or a regex's) or
+    else the entity type, and the action are kept.
+
+    Args:
+        assessments: Guardrail assessments, as :func:`assessments_from_trace` returns them.
+
+    Returns:
+        One label per policy item that carries an action, e.g. ``"sensitiveInformationPolicy:NAME=BLOCKED"``;
+        ``[]`` for empty or malformed input (this is a log field, not a gate).
+    """
+    out: list[str] = []
+    for assessment in assessments or []:
+        if not isinstance(assessment, dict):
+            continue
+        for policy_key, items_key, _ in _POLICY_FILTER_TYPES:
+            policy = assessment.get(policy_key)
+            items = policy.get(items_key) if isinstance(policy, dict) else None
+            out.extend(_redacted_label(policy_key, item) for item in (items if isinstance(items, list) else []))
+    return [label for label in out if label]
+
+
+def _redacted_label(policy_key: str, item: Any) -> str:
+    if not isinstance(item, dict) or not item.get("action"):
+        return ""
+    return f"{policy_key}:{item.get('name') or item.get('type') or '-'}={item['action']}"
+
+
 def emit_guardrail_decision(
     *,
     component: str,
