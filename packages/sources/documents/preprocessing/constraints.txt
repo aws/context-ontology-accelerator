@@ -1,4 +1,6 @@
 # Pin CPU-only PyTorch — prevents unstructured/unstructured-inference from
 # pulling the full CUDA variant (~4 GB nvidia-* packages).
 # Must use --extra-index-url https://download.pytorch.org/whl/cpu when installing.
-torch==2.11.0+cpu
+torch==2.13.0+cpu
+# torch brings in setuptools; 83.0.0 fixes CVE-2026-59890 (and has no pkg_resources).
+setuptools>=83

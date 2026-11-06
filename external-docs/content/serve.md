@@ -47,6 +47,14 @@ Options:
   flag is honoured only for a platform admin or a namespace owner, maintainer
   or data steward of the queried namespace. For any other caller the query
   still succeeds, with both fields omitted.
+- `includeLlmUsage` — include provider-reported text-LLM token usage in
+  `result.llmUsage`. Usage is grouped by exact model ID so an external
+  reporting layer can apply its own versioned prices. It contains no prompts,
+  answers, credentials, or per-call traces. When enabled, an error response
+  may instead include top-level `llmUsage` containing usage recorded before
+  the failure. In either response, `complete: false` means at least one known
+  LLM call was not fully accounted, so the reported totals may be partial.
+  **Off by default.**
 - `dimensions` — dimension filters, a list of up to 100 `{name, value}`
   objects (`name` 1–256 characters and unique case-insensitively, `value` up
   to 4000 characters, `operator` only `=`)

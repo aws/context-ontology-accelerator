@@ -55,6 +55,7 @@ test-integ:
 		uv run pytest \
 			benchmarks/coa100-benchmark/tests/integ/test_nightly_history_discovery.py \
 			benchmarks/coa100-benchmark/tests/integ/test_rolling_metric_publish.py \
+			benchmarks/coa100-benchmark/tests/integ/test_llm_cost_metric_publish.py \
 			-m integ -v --tb=short --import-mode=importlib; \
 	else echo "⚠ integ tests not available (stripped from public mirror)"; fi
 

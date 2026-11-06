@@ -43,8 +43,11 @@ vi.mock("../api-hooks/use-list-source-tables", () => ({
   }),
 }));
 
+// One client for every render, as the real provider's memoized context gives.
+const { apiClient } = vi.hoisted(() => ({ apiClient: { get: vi.fn() } }));
+
 vi.mock("@components/ApiClientProvider", () => ({
-  useApiClient: () => ({ get: vi.fn() }),
+  useApiClient: () => apiClient,
 }));
 
 vi.mock("../services/ontology-engine", () => ({

@@ -179,6 +179,11 @@ describe("SourceDetail — degraded scan annotation", () => {
     expect(
       screen.getByText(/could not read 2 of the tables/i),
     ).toBeInTheDocument();
+    // The advice must be one the page allows: a PENDING_REVIEW source cannot be
+    // re-scanned, so the warning points at re-scanning once it is approved.
+    expect(
+      screen.getByText(/re-scan the approved source/i),
+    ).toBeInTheDocument();
     expect(
       screen.getByText("my_connector_db.orders, my_connector_db.customers"),
     ).toBeInTheDocument();

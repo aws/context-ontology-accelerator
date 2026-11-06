@@ -177,7 +177,7 @@ constraints in practice — if either is missing, the region is not usable.
 
 | Service | Used for | Check |
 |---------|----------|-------|
-| **Amazon Bedrock AgentCore Runtime** | Hosts the Serve (query) and MCP server runtimes | [Supported regions](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/agentcore-regions.html) — note this page lists availability per AgentCore *feature*; you need **Runtime** |
+| **Amazon Bedrock AgentCore Runtime** | Hosts the Serve (query) and MCP server runtimes | [Supported regions](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/agentcore-regions.html) — note this page lists availability per AgentCore *feature*; you need **AgentCore Runtime microVMs**, the default compute type. COA does not use **AgentCore Runtime Instances** (EC2 capacity providers), so a region without Instances is still usable |
 | **Amazon DataZone** / SageMaker Unified Studio | Namespace domain, data-asset catalog | [Endpoints and quotas](https://docs.aws.amazon.com/general/latest/gr/datazone.html) |
 | **Amazon Neptune** | Knowledge-graph store | [Endpoints and quotas](https://docs.aws.amazon.com/general/latest/gr/neptune.html) |
 | **Amazon OpenSearch Serverless** | Vector search for retrieval | [Endpoints and quotas](https://docs.aws.amazon.com/general/latest/gr/opensearch-service.html) — Serverless is available in fewer regions than managed OpenSearch |
@@ -795,6 +795,8 @@ Leaving either setting unset leaves the runtime's default in charge; the stack o
 
 `scripts/deploy.sh` maps the variables above to the CDK context parameters `serve_nl2sql_graph_expand` and `serve_nl2sql_graph_expand_max_tables`. On a direct `cdk deploy`, pass them as context instead — `--context serve_nl2sql_graph_expand=false` — or set them in the `context` block of `infra/cdk.json`.
 
+A separate, off-by-default lever votes across several SQL candidates: a request with `options.flatSqlVoteK` set to 2–5 (or a Serve runtime with `SERVE_NL2SQL_VOTE_K` set) generates that many statements from the same schema context, runs each distinct one, and returns the result most of them agree on, at up to that many times the model and warehouse cost. It has no CDK context parameter; the vote is skipped when the request deadline cannot fit it. See the `SERVE_NL2SQL_VOTE_K` row in `packages/context-manager/README.md`.
+
 #### Deep Reasoning default options
 
 A Deep Reasoning request that leaves an option unset gets the recommended value
@@ -865,7 +867,22 @@ finished).
 |-----------------|---------|----------|
 | `cpu` | `1024` (1 vCPU) | Fargate task CPU units. |
 | `memoryLimitMiB` | `2048` (2 GB) | Fargate task memory. |
-| `ontopJavaArgs` | `-Xmx1536m -Xms512m` | JVM args passed to the Ontop launcher via `ONTOP_JAVA_ARGS`. |
+| `ontopJavaArgs` | `-Xmx1536m -Xms512m` | JVM args passed to the Ontop launcher via `ONTOP_JAVA_ARGS`. A blank value counts as unset. The stack appends `-Dserver.address=127.0.0.1` after this value, so Ontop listens only on loopback inside the task, and a `-Dserver.address` in the override is superseded. Other Spring property sources (for example `-Dspring.application.json`) can still change the address. |
+
+A change to these props reaches a running namespace only when the reload Lambda registers a new task
+definition for it: when the namespace is first provisioned, or when the namespace's VKG image URI
+changes.
+
+- A CI deploy from `ci/mainline.yml` tags the VKG image `vkg-<short commit SHA>`, so each deploy of a
+  new commit changes the URI and its deploy-time sweep re-registers every namespace.
+- A deploy that builds the VKG image itself, such as `make deploy-dev` (`scripts/deploy.sh`), names
+  the image by a hash of the `packages/vkg` content. A sizing change alone leaves that URI unchanged
+  and starts no rollout, so existing namespaces keep their old settings until the `packages/vkg`
+  content changes.
+- A deploy that passes the same `vkg_image_uri` again, such as a reused tag like `vkg-latest`, leaves
+  the existing task definition and its old settings in place. Its rollout restarts the service on
+  that task definition unless every running task already has the image's digest.
+- An ontology reload with an unchanged image likewise restarts the existing task definition.
 
 **When to override the defaults:** increase CPU/memory (and heap in step) when a
 namespace's VKG reports `DEGRADED` health, when large-ontology reformulation
@@ -907,8 +924,12 @@ new VkgStack(app, `${stackPrefix}-vkg`, {
 });
 ```
 
-After changing these, redeploy the VKG stack and trigger a reload for existing
-namespaces so their tasks pick up the new sizing.
+After changing these, redeploy the VKG stack. Existing namespaces pick up the
+new values only when their task definition is re-registered, as described above:
+a deploy with a new VKG image URI (a CI deploy of a new commit) re-registers every
+namespace, through a sweep that finishes after the deploy itself. A
+`make deploy-dev` that leaves `packages/vkg` unchanged, and an ontology reload
+with an unchanged image, keep the existing task definition and its old settings.
 
 ### Internal Environment Variables
 

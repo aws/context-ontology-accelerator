@@ -99,7 +99,8 @@
 
     <!-- Reads the credential secret's JSON, and the coa-managed mode's configuration
          parameter. Already on the SDK's classpath; named here so this module does not depend
-         on a transitive, and at the SDK's own version for the reason ${aws.sdk.version} gives:
+         on a transitive, and at the aggregator's jackson.version (at or above the SDK's own)
+         for the reason ${aws.sdk.version} gives:
          a direct declaration wins over the transitive, so a stale one puts the SDK's classes
          next to a Jackson they were not compiled against. -->
     <dependency>

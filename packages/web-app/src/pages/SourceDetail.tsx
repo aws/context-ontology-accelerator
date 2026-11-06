@@ -831,7 +831,7 @@ export const SourceDetail: React.FC = () => {
           <SpaceBetween size="xs">
             <Box variant="p">
               {t(
-                "The last scan succeeded but could not read {failedTables} it listed. Those tables have no columns, no comments and no declared keys below, and any AI-generated descriptions were produced over that gap — do not review this source as complete. Re-scan once the tables are readable.",
+                "The last scan succeeded but could not read {failedTables} it listed, so those tables are not in this source yet, and AI-generated descriptions of the other tables were produced without them. Review and approve the tables below as usual. Once the missing tables are readable, re-scan the approved source: the re-scan adds them for review.",
                 {
                   failedTables:
                     degradedScan.tablesFailed === 1

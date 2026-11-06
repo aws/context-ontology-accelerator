@@ -121,3 +121,113 @@ def patch_paginated_search_source() -> None:
     ovi.OpenSearchIndex.paginated_search = paginated_search
     _patched = True
     logger.info("graphrag_embedding_source_patch_applied", includes=_EMBEDDING_SOURCE_INCLUDES)
+
+
+_llm_usage_patched = False
+# Set on each wrapper so a re-application never wraps a wrapper (which would record
+# every call twice) and so tests can restore the true original.
+_ORIGINAL_ATTR = "__coa_llm_usage_original__"
+# BedrockConverse entry points that bypass ``chat`` and whose usage this patch does
+# not read. GraphRAG's keyword provider uses none of them (LLMCache.predict ->
+# LLM.predict -> chat); a call through one is reported, never silently uncounted.
+_UNACCOUNTED_LLM_METHODS = ("stream_chat", "achat", "astream_chat", "astream_complete", "acomplete")
+
+
+def patch_llm_usage_accounting() -> None:
+    """Record GraphRAG's LlamaIndex Bedrock LLM calls in the request's LLM usage tracker.
+
+    GraphRAG's keyword provider calls its LLM through ``LLMCache.predict``, which
+    returns only text. The usage lives one level down: ``BedrockConverse.chat``
+    returns ``ChatResponse(raw=<Converse response>)`` carrying Bedrock's
+    ``inputTokens``/``outputTokens``. Wrapping ``chat`` sits BELOW the cache, so a
+    cache hit makes no provider call and correctly costs nothing.
+
+    A provider call is attributed to the tracker bound on the calling thread (serve
+    binds it in the lexical worker; see ``llm_usage.graphrag_retrieval``). A call
+    seen with neither a bound tracker nor a deliberate-untracked marker while
+    tracked GraphRAG retrieval is in flight marks those requests incomplete
+    instead of being lost.
+
+    Idempotent and failure-tolerant like :func:`patch_paginated_search_source`: if
+    LlamaIndex has moved, this logs and returns, and :func:`llm_usage_patch_active`
+    stays False so the lexical retriever reports tracked requests incomplete rather
+    than letting GraphRAG's LLM spend go uncounted.
+    """
+    global _llm_usage_patched
+    if _llm_usage_patched:
+        return
+    try:
+        from llama_index.llms.bedrock_converse import BedrockConverse
+    except ImportError:
+        logger.warning("graphrag_llm_usage_patch_skipped", reason="module not importable")
+        return
+
+    from ..llm_usage import (
+        REASON_PROVIDER_ERROR,
+        REASON_UNSUPPORTED_CALL,
+        current_tracker,
+        is_untracked_graphrag_retrieval,
+        note_unattributed_graphrag_call,
+        record_usage,
+    )
+
+    def _original(name: str):
+        method = getattr(BedrockConverse, name, None)
+        return getattr(method, _ORIGINAL_ATTR, method)
+
+    original_chat = _original("chat")
+    if original_chat is None:
+        logger.warning("graphrag_llm_usage_patch_skipped", reason="BedrockConverse.chat missing")
+        return
+
+    def _bound(original, instance):
+        # LlamaIndex wraps these methods in its instrumentation dispatcher, a
+        # descriptor that only binds correctly through ``__get__`` — calling the
+        # class attribute with an explicit ``self`` drops it.
+        return original.__get__(instance, type(instance))
+
+    def chat(self, messages, **kwargs):
+        tracker = current_tracker()
+        if tracker is None:
+            if not is_untracked_graphrag_retrieval():
+                note_unattributed_graphrag_call()
+            return _bound(original_chat, self)(messages, **kwargs)
+        handle = tracker.register_call("graphrag_llm", str(getattr(self, "model", "")))
+        try:
+            response = _bound(original_chat, self)(messages, **kwargs)
+        except BaseException:
+            tracker.fail_call(handle, REASON_PROVIDER_ERROR)
+            raise
+        raw = getattr(response, "raw", None)
+        record_usage(tracker, handle, raw.get("usage") if isinstance(raw, dict) else None)
+        return response
+
+    setattr(chat, _ORIGINAL_ATTR, original_chat)
+    BedrockConverse.chat = chat
+
+    def _unaccounted(name: str, original):
+        def method(self, *args, **kwargs):
+            tracker = current_tracker()
+            if tracker is None:
+                if not is_untracked_graphrag_retrieval():
+                    note_unattributed_graphrag_call()
+            else:
+                tracker.mark_incomplete(REASON_UNSUPPORTED_CALL)
+            return _bound(original, self)(*args, **kwargs)
+
+        method.__name__ = name
+        setattr(method, _ORIGINAL_ATTR, original)
+        return method
+
+    for name in _UNACCOUNTED_LLM_METHODS:
+        original = _original(name)
+        if original is not None:
+            setattr(BedrockConverse, name, _unaccounted(name, original))
+
+    _llm_usage_patched = True
+    logger.info("graphrag_llm_usage_patch_applied")
+
+
+def llm_usage_patch_active() -> bool:
+    """Whether GraphRAG's LLM calls are being recorded (see :func:`patch_llm_usage_accounting`)."""
+    return _llm_usage_patched

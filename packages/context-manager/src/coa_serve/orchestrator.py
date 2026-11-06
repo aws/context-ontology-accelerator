@@ -1311,6 +1311,18 @@ class Orchestrator:
         # value (absent, None, True) keeps the chunks — the Smithy/REST default.
         include_supporting = (options or {}).get("includeSupporting") is not False
 
+        # A caller whose grant declares allowedMetrics sees only the metrics it permits in the catalog, and no
+        # governed metric through graph traversal; any other caller's call is exactly as before.
+        allowed_metrics = (profile or {}).get("allowedMetrics")
+        hidden: dict[str, bool] = {}
+        if allowed_metrics is not None:
+            hidden = {"hide_governed": True}
+            metric_definitions = [
+                m
+                for m in metric_definitions or []
+                if m.get("metric_id") in allowed_metrics or m.get("name") in allowed_metrics
+            ] or None
+
         # Deep-reasoning Tier-3 path (opt-in). Engaged per-request via
         # options.mode=="deep-reasoning" or as the deployment default. Returns the
         # same Tier3Result contract, so the assembler tail below is shared. When
@@ -1408,6 +1420,7 @@ class Orchestrator:
             trace=trace,
             retriever_strategy=retriever_strategy,
             model_id=model_id,
+            **hidden,
         )
         # Trace steps are recorded progressively inside knowledge_retriever.resolve()
         # via the trace collector callback. toolUsed annotation lives

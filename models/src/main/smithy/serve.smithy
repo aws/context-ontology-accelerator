@@ -482,6 +482,55 @@ structure QueryResult {
     /// but is not Standard mode's Tier-3 result). Absent on responses that do
     /// not set it.
     executionMode: String
+
+    /// Text-LLM usage for this request. Present only when the request
+    /// set `includeLlmUsage`.
+    llmUsage: LlmUsageMetrics
+}
+
+/// Provider-reported text-LLM usage incurred while answering one request.
+/// Model-level totals let downstream observability apply its own versioned
+/// pricing without coupling Serve deployments to AWS rate changes.
+structure LlmUsageMetrics {
+    /// Input tokens across every accounted text-LLM call.
+    @required
+    inputTokens: Long
+
+    /// Output tokens across every accounted text-LLM call.
+    @required
+    outputTokens: Long
+
+    /// Token totals grouped by the exact model id used for each call.
+    @required
+    perModel: LlmModelUsageList
+
+    /// False when any call's usage was unknown or unfinished.
+    @required
+    complete: Boolean
+}
+
+list LlmModelUsageList {
+    member: LlmModelUsage
+}
+
+/// Provider-reported token totals for one exact model.
+structure LlmModelUsage {
+    /// Bedrock model or inference-profile id.
+    @required
+    modelId: String
+
+    /// Input tokens accumulated across calls to this model.
+    @required
+    inputTokens: Long
+
+    /// Output tokens accumulated across calls to this model.
+    @required
+    outputTokens: Long
+
+    /// Largest input-token count observed for a single call to this model.
+    /// Downstream pricing uses this to detect unsupported long-context rates.
+    @required
+    maxInputTokensPerCall: Long
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -640,6 +689,11 @@ operation Query {
         /// Maximum number of result rows to return.
         @range(min: 1, max: 10000)
         maxResults: Integer
+
+        /// When true, include `llmUsage` (provider-reported text-LLM tokens,
+        /// grouped by model for downstream pricing) in
+        /// the result. Observability only; it never changes how the query runs.
+        includeLlmUsage: Boolean
     }
 
     output := {

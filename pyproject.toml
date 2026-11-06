@@ -2,7 +2,7 @@
 name = "coa"
 # Single source of truth is the repo-root VERSION file. Do not edit by hand —
 # bump VERSION and run `make version` (verified by `make lint`).
-version = "0.3.9"
+version = "0.3.10"
 description = "Context Ontology Accelerator for AWS"
 requires-python = ">=3.12"
 license = {text = "Apache-2.0"}
@@ -29,7 +29,8 @@ dev = [
 # (GHSA-hq85-5cpj-mr62); refuse to run with an older uv instead of fetching wheels with it.
 required-version = ">=0.13.4"
 # Pin transitive dependencies up to the patched floor for security advisories
-# that are only reachable through dev/test tooling (no direct declaration).
+# in packages nothing here declares directly. The serve image installs from
+# uv.lock, so these floors reach it as well as dev/test tooling.
 #   werkzeug: pulled by moto (AWS mocking, dev group only). CVE-2026-102598
 #   (<3.1.9) — not in any runtime/deploy path, constrained here to clear the
 #   Dependabot HIGH alert without widening moto's own range.
@@ -40,10 +41,19 @@ required-version = ">=0.13.4"
 #   filelock: pulled by huggingface-hub (via tokenizers). 3.20.4-4.2.0 let a
 #   local user who can write the lock directory redirect ReadWriteLock's SQLite
 #   onto other files (GHSA-v4x8-3wr5-3wq8, HIGH). 4.2.1 is the patched floor.
+#   aiohttp: pulled by llama-index-core and opensearch-py[async] into the serve
+#   image. <3.14.4 lets multipart requests exhaust file descriptors and has no
+#   initial request/header timeout (GHSA-9xw5-w5jj-pvcg, GHSA-2g87-pp6c-29x5,
+#   CVE-2026-111064, HIGH). 3.14.4 is the patched floor.
+#   pyasn1: pulled by google-auth (via pyasn1-modules). <0.6.5 has quadratic-time
+#   BER/CER/DER decoding of constructed and REAL values (GHSA-mm57-4v3p-rchx,
+#   GHSA-9m75-vc3g-4x39, CVE-2026-119194/119196, HIGH). 0.6.5 is the patched floor.
 constraint-dependencies = [
     "werkzeug>=3.1.9",
     "fsspec>=2026.6.0",
     "filelock>=4.2.1",
+    "aiohttp>=3.14.4",
+    "pyasn1>=0.6.5",
 ]
 
 [tool.uv.workspace]

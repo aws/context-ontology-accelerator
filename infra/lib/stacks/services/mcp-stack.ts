@@ -186,6 +186,9 @@ export class McpStack extends SCLStack {
         ONTOLOGY_PROXY_LAMBDA_ARN: ontologyProxyLambdaArn,
         // Override entrypoint to run MCP server instead of Context Manager
         SCL_MCP_MODE: "true",
+        // The default, stated so the template shows it. "false" is a local-dev
+        // switch that the server refuses to start with under SCL_MCP_MODE.
+        SCL_AUTH_ENABLED: "true",
         // Independent JWT signature verification in claims.py, as
         // defense-in-depth behind the AgentCore RuntimeAuthorizerConfiguration
         // above. Same issuer/audience trust anchor, IdP-agnostic (Cognito,

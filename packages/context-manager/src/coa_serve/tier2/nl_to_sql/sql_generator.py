@@ -34,6 +34,7 @@ from sqlglot.dialects.trino import Trino
 from ...clients.base import ConverseResult, LLMClient, VectorClient, VectorHit
 from ..sql_firewall import SQLFirewall
 from ..table_qualifier import AMBIGUOUS_KEY, AMBIGUOUS_SOURCE, real_tables
+from .aggregate_aliases import normalize_aggregate_aliases
 
 # Matches opening OR closing <user_context> tags, case-insensitively and
 # tolerant of surrounding whitespace (e.g. "</USER_CONTEXT>",
@@ -166,7 +167,6 @@ def _resolve_graph_expand_max_tables() -> int:
 _SQL_CODE_BLOCK_RE = re.compile(r"```(?:sql)?\s*\n?(.*?)```", re.DOTALL | re.IGNORECASE)
 _CONFIDENCE_RE = re.compile(r"confidence:\s*([01](?:\.\d+)?)", re.IGNORECASE)
 
-# Dialect-specific rules and examples
 _DIALECT_CONFIGS: dict[str, dict[str, str]] = {
     "athena": {
         "engine_description": "Amazon Athena (Trino/Presto SQL dialect)",
@@ -176,17 +176,6 @@ _DIALECT_CONFIGS: dict[str, dict[str, str]] = {
             "- Use DOUBLE for floating point, VARCHAR for strings\n"
             "- String concatenation: use CONCAT() function, not || operator"
         ),
-        "example_sql": (
-            "SELECT\n"
-            "  c.region,\n"
-            "  SUM(o.total) AS total_revenue\n"
-            "FROM orders o\n"
-            "JOIN customers c ON o.customer_id = c.id\n"
-            "WHERE o.order_date >= DATE '2024-01-01'\n"
-            "  AND o.order_date < DATE '2025-01-01'\n"
-            "GROUP BY c.region\n"
-            "ORDER BY total_revenue DESC"
-        ),
     },
     "postgresql": {
         "engine_description": "PostgreSQL",
@@ -195,17 +184,6 @@ _DIALECT_CONFIGS: dict[str, dict[str, str]] = {
             "- For date filtering, use ISO format strings (e.g. '2024-01-01'::date)\n"
             "- Use NUMERIC for decimals, TEXT for strings\n"
             "- String concatenation: use || operator"
-        ),
-        "example_sql": (
-            "SELECT\n"
-            "  c.region,\n"
-            "  SUM(o.total) AS total_revenue\n"
-            "FROM orders o\n"
-            "JOIN customers c ON o.customer_id = c.id\n"
-            "WHERE o.order_date >= '2024-01-01'::date\n"
-            "  AND o.order_date < '2025-01-01'::date\n"
-            "GROUP BY c.region\n"
-            "ORDER BY total_revenue DESC"
         ),
     },
 }
@@ -249,17 +227,19 @@ _SHARED_RULES = (
     "- SELECT EXACTLY the column(s) the question asks for and nothing more — do not add "
     "extra columns, aggregates, or string concatenations unless explicitly requested "
     "(e.g. asked to list a first and last name → select them as two separate columns, "
-    "not concatenated)\n"
-    # DETERMINISM (mitigation, best-effort — the same question must yield the same
-    # column shape run-to-run). This is a prompt pin only: unlike the NL→SPARQL
-    # path there is no ontology-canonical column name to fail-closed on, and the
-    # answer identity is already stable, so we steer shape rather than reject.
+    "not concatenated). The one fixed exception is the DETERMINISM superlative shape "
+    "below, when the question does not name its output columns\n"
     "- DETERMINISM: the SAME question must return the SAME columns every time. "
     "Choose the column set by these fixed rules, not free choice: for a superlative "
-    "singular ('which X has the highest/most …') SELECT only the identifying column of "
-    "X (its primary key / id), NOT the measure being ranked and NOT extra attributes; "
-    "add ORDER BY <measure> DESC LIMIT 1. Project the entity's identifier under its "
-    "own schema column name (e.g. `id` as `id`) — do not rename or alias it "
+    "singular ('which X has the highest/most/lowest/least …'), if the question names the "
+    "columns to return, SELECT exactly those and nothing else; otherwise SELECT exactly "
+    "two columns, in this order: (1) X's display column, the first column of X whose name "
+    "is or ends with `name`, then `title`, then `label`, or X's primary key if it has none; "
+    "(2) the ranked measure, aliased `<function>_<column>` in lowercase when it is an "
+    "aggregate (e.g. `COUNT(o.id) AS count_id`) or under its own column name when it is "
+    "a plain column; then add ORDER BY <measure> DESC LIMIT 1 (ASC for lowest/least). "
+    "Never add the primary key next to a display column. Project schema columns under "
+    "their own schema column names — do not rename or alias them "
     "differently between runs\n"
     "- Write date/time literals in full zero-padded ISO form (e.g. '2019-08-20', not "
     "'2019-8-20')\n"
@@ -270,23 +250,21 @@ _SHARED_RULES = (
     "correctly answers the question"
 )
 
-_EXAMPLE_SCHEMA = (
-    "```sql\n"
-    "-- orders: Customer purchase records\n"
-    "CREATE TABLE orders (\n"
-    "  id (int),\n"
-    "  customer_id (int),\n"
-    "  total (decimal),\n"
-    "  order_date (date)\n"
-    "  -- FK: customers.id\n"
-    ");\n\n"
-    "-- customers: Customer information\n"
-    "CREATE TABLE customers (\n"
-    "  id (int),\n"
-    "  name (varchar),\n"
-    "  region (varchar)\n"
-    ");\n"
-    "```"
+_EXAMPLES = (
+    "Examples:\n\n"
+    "Schema:\n```sql\n"
+    "Table: orders | Primary key: id | Relationships: customer_id->customers (joins orders.customer_id = customers.id) "
+    "| Columns: id:bigint, customer_id:bigint, total:numeric, status:text allowed values: [cancelled, paid, refunded]\n"
+    "Table: customers | Primary key: id | Columns: id:bigint, name:text, region:text allowed values: [EMEA, NA]\n"
+    "```\n\n"
+    "Question: What is the total paid revenue by region?\n"
+    "```sql\nSELECT c.region, SUM(o.total) AS sum_total\nFROM orders o\nJOIN customers c ON o.customer_id = c.id\n"
+    "WHERE o.status = 'paid'\nGROUP BY c.region\n```\nConfidence: 0.9\n\n"
+    "Question: Which customer has the most orders?\n"
+    "```sql\nSELECT c.name, COUNT(o.id) AS count_id\nFROM orders o\nJOIN customers c ON o.customer_id = c.id\n"
+    "GROUP BY c.id, c.name\nORDER BY count_id DESC\nLIMIT 1\n```\nConfidence: 0.9\n\n"
+    "Question: What is the total of the single largest order?\n"
+    "```sql\nSELECT o.total\nFROM orders o\nORDER BY o.total DESC\nLIMIT 1\n```\nConfidence: 0.9"
 )
 
 
@@ -299,11 +277,7 @@ def _build_system_prompt(dialect: str) -> str:
         f"CRITICAL RULES:\n"
         f"{_SHARED_RULES}\n"
         f"{config['syntax_rules']}\n\n"
-        f"Example:\n\n"
-        f"Schema:\n{_EXAMPLE_SCHEMA}\n\n"
-        f"Question: What is the total revenue by region for 2024?\n"
-        f"```sql\n{config['example_sql']}\n```\n"
-        f"Confidence: 0.9"
+        f"{_EXAMPLES}"
     )
 
 
@@ -421,6 +395,7 @@ class SQLGenerator:
         self._fk_adjacency = fk_adjacency or {}
         self._retrieval_k = retrieval_k
         self._max_tables = max_tables
+        self._dialect = dialect
         self._system_prompt = _build_system_prompt(dialect)
         self._guardrail_id = guardrail_id
         self._guardrail_id_provider = guardrail_id_provider
@@ -941,7 +916,7 @@ class SQLGenerator:
             model_id=model_id,
         )
         _warn_if_truncated(result, max_tokens, step="correct")
-        return _extract_sql(result.text), _extract_confidence(result.text)
+        return _parse_response(result.text, self._dialect)
 
     async def _retrieve_uploaded(
         self,
@@ -1101,7 +1076,7 @@ class SQLGenerator:
         )
 
         _warn_if_truncated(result, max_tokens, step="generate")
-        return _extract_sql(result.text), _extract_confidence(result.text)
+        return _parse_response(result.text, dialect or self._dialect)
 
 
 def _warn_if_truncated(result: ConverseResult, max_tokens: int, *, step: str) -> None:
@@ -1779,6 +1754,10 @@ def _extract_sql(text: str) -> str:
         if candidate:
             return candidate
     return ""
+
+
+def _parse_response(text: str, dialect: str) -> tuple[str, float]:
+    return normalize_aggregate_aliases(_extract_sql(text), dialect), _extract_confidence(text)
 
 
 def _extract_confidence(text: str) -> float:

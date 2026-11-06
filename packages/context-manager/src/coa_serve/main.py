@@ -45,7 +45,8 @@ from .exceptions import (
 )
 from .guardrail_config import GuardrailConfigProvider, build_guardrail_config_provider
 from .identity import extract_jwt_identity, resolve_principal, resolve_user_id
-from .models import InvokeRequest, TraceStep
+from .llm_usage import LlmUsageTracker, start_tracked_task
+from .models import InvokeRequest, LlmUsageMetrics, TraceStep
 from .namespace_language import bind_label_preference
 from .orchestrator import Orchestrator
 from .role_resolver import ResolvedProfile, may_view_debug_info, resolve_profile
@@ -786,8 +787,11 @@ def _parse_graph_traverse_options(options: Any) -> tuple[str, int, int]:
     return start_uri, max_depth, max_results
 
 
-async def _handle_graph_traverse(payload: dict, request_id: str) -> dict:
-    """Graph traversal in Neptune — returns entities and relationships."""
+async def _handle_graph_traverse(payload: dict, request_id: str, profile: ResolvedProfile | None = None) -> dict:
+    """Graph traversal in Neptune — returns entities and relationships.
+
+    A caller whose grant declares ``allowedMetrics`` traverses without the governed-metrics graph.
+    """
     namespace = payload.get("namespace", "")
     if not namespace:
         return _error(400, "namespace required", request_id)
@@ -810,6 +814,7 @@ async def _handle_graph_traverse(payload: dict, request_id: str) -> dict:
                 [start_uri],
                 namespace,
                 max_hops=max_depth,
+                **({"hide_governed": True} if profile is not None and profile.allowed_metrics is not None else {}),
             ),
             timeout=RESOLVE_TIMEOUT_S,
         )
@@ -916,7 +921,7 @@ async def _persist_turn(
             turn_metadata = response.result.model_dump(
                 by_alias=True,
                 exclude_none=True,
-                exclude={"synthesized_answer", "supporting_content"},
+                exclude={"synthesized_answer", "supporting_content", "llm_usage"},
             )
             turn_metadata["requestId"] = request_id
             turn_metadata["query"] = query
@@ -934,38 +939,68 @@ async def _persist_turn(
         logger.warning("sse_persist_turn_failed", session_id=session_id, exc_info=True)
 
 
+def _llm_usage_tracker(request) -> LlmUsageTracker | None:
+    """One tracker per request, only when the caller opted in (``options.includeLlmUsage``)."""
+    return LlmUsageTracker() if request.options.get("includeLlmUsage") is True else None
+
+
+def _llm_usage_metrics(tracker: LlmUsageTracker | None) -> LlmUsageMetrics | None:
+    """Finalize the request's LLM usage into its typed shape."""
+    if tracker is None:
+        return None
+    return LlmUsageMetrics.from_snapshot(tracker.snapshot())
+
+
+def _llm_usage_payload(tracker: LlmUsageTracker | None) -> dict | None:
+    """Finalize the request's LLM usage into its wire shape (None when not opted in)."""
+    usage = _llm_usage_metrics(tracker)
+    return usage.model_dump(by_alias=True, mode="json") if usage is not None else None
+
+
+def _with_llm_usage(payload: dict, tracker: LlmUsageTracker | None) -> dict:
+    """Attach usage to an error payload so a failed request's known spend still counts."""
+    usage = _llm_usage_payload(tracker)
+    if usage is not None:
+        payload["llmUsage"] = usage
+    return payload
+
+
 async def _handle_blocking_query(request, request_id: str):
     """Non-streaming query resolution. Yields a single result dict."""
     resolve_start = time.perf_counter()
+    tracker = _llm_usage_tracker(request)
     try:
         response = await asyncio.wait_for(
-            _orchestrator.resolve(request, deadline=_build_deadline(request)),
+            start_tracked_task(_orchestrator.resolve(request, deadline=_build_deadline(request)), tracker),
             timeout=RESOLVE_TIMEOUT_S,
         )
     except TimeoutError:
         total_ms = int((time.perf_counter() - resolve_start) * 1000)
         logger.error("orchestrator_timeout", namespace=request.namespace, request_id=request_id)
-        yield {
-            "error": "TimeoutError",
-            "message": "Query resolution timed out",
-            "requestId": request_id,
-            "statusCode": 504,
-            "metadata": {"totalMs": total_ms},
-        }
+        yield _with_llm_usage(
+            {
+                "error": "TimeoutError",
+                "message": "Query resolution timed out",
+                "requestId": request_id,
+                "statusCode": 504,
+                "metadata": {"totalMs": total_ms},
+            },
+            tracker,
+        )
         return
     except AccessDeniedError as e:
         total_ms = int((time.perf_counter() - resolve_start) * 1000)
         logger.warning("orchestrator_access_denied", request_id=request_id, reason=e.reason)
         d = e.to_dict(request_id)
         d["metadata"] = {"totalMs": total_ms}
-        yield d
+        yield _with_llm_usage(d, tracker)
         return
     except NoResultError as e:
         total_ms = int((time.perf_counter() - resolve_start) * 1000)
         logger.info("orchestrator_no_result", request_id=request_id, tier=e.tier)
         d = e.to_dict(request_id)
         d["metadata"] = {"totalMs": total_ms}
-        yield d
+        yield _with_llm_usage(d, tracker)
         return
     except ServeError as e:
         # Any other typed serve error (e.g. an ambiguous-reference refusal) carries
@@ -976,22 +1011,26 @@ async def _handle_blocking_query(request, request_id: str):
         logger.warning("orchestrator_serve_error", request_id=request_id, error_type=e.error_type, message=e.message)
         d = e.to_dict(request_id)
         d["metadata"] = {"totalMs": total_ms}
-        yield d
+        yield _with_llm_usage(d, tracker)
         return
     except Exception as e:
         total_ms = int((time.perf_counter() - resolve_start) * 1000)
         logger.error("orchestrator_error", error_type=type(e).__name__, error_msg=str(e), request_id=request_id)
-        yield {
-            "error": "InternalError",
-            "message": "Query resolution failed",
-            "requestId": request_id,
-            "statusCode": 500,
-            "metadata": {"totalMs": total_ms},
-        }
+        yield _with_llm_usage(
+            {
+                "error": "InternalError",
+                "message": "Query resolution failed",
+                "requestId": request_id,
+                "statusCode": 500,
+                "metadata": {"totalMs": total_ms},
+            },
+            tracker,
+        )
         return
 
     total_ms = int((time.perf_counter() - resolve_start) * 1000)
     response.result.metadata = {**(response.result.metadata or {}), "totalMs": total_ms}
+    response.result.llm_usage = _llm_usage_metrics(tracker)
     response.requestId = request_id
     yield response.model_dump(by_alias=True, exclude_none=True, mode="json")
 
@@ -1015,6 +1054,7 @@ async def _handle_streaming_query(payload: dict, request, request_id: str, sessi
 
     trace = TraceCollector(on_record=on_step)
     resolve_start = time.perf_counter()
+    tracker = _llm_usage_tracker(request)
 
     async def _run_resolve():
         try:
@@ -1047,7 +1087,7 @@ async def _handle_streaming_query(payload: dict, request, request_id: str, sessi
             emitter.close()
             raise
 
-    resolve_task = asyncio.create_task(_run_resolve())
+    resolve_task = start_tracked_task(_run_resolve(), tracker)
 
     try:
         async for event_str in emitter.stream():
@@ -1063,6 +1103,7 @@ async def _handle_streaming_query(payload: dict, request, request_id: str, sessi
         response = resolve_task.result()
         total_ms = int((time.perf_counter() - resolve_start) * 1000)
         response.result.metadata = {**(response.result.metadata or {}), "totalMs": total_ms}
+        response.result.llm_usage = _llm_usage_metrics(tracker)
         response.requestId = request_id
         response.sessionId = session_id
         yield emitter.format_done(response.result)
@@ -1079,21 +1120,25 @@ async def _handle_streaming_query(payload: dict, request, request_id: str, sessi
     except TimeoutError:
         total_ms = int((time.perf_counter() - resolve_start) * 1000)
         logger.error("sse_timeout", request_id=request_id, total_ms=total_ms)
-        yield emitter.format_error("TimeoutError", "Query resolution timed out", 504)
+        yield emitter.format_error(
+            "TimeoutError", "Query resolution timed out", 504, llm_usage=_llm_usage_payload(tracker)
+        )
     except AccessDeniedError as e:
         logger.warning("sse_access_denied", request_id=request_id, reason=e.reason)
-        yield emitter.format_error("AccessDenied", "Access denied", 403)
+        yield emitter.format_error("AccessDenied", "Access denied", 403, llm_usage=_llm_usage_payload(tracker))
     except NoResultError as e:
         logger.info("sse_no_result", request_id=request_id, tier=e.tier)
-        yield emitter.format_error("NoResult", e.message, e.status_code)
+        yield emitter.format_error("NoResult", e.message, e.status_code, llm_usage=_llm_usage_payload(tracker))
     except ServeError as e:
         logger.warning("sse_serve_error", request_id=request_id, error_type=e.error_type, message=e.message)
-        yield emitter.format_error(e.error_type, e.message, e.status_code)
+        yield emitter.format_error(e.error_type, e.message, e.status_code, llm_usage=_llm_usage_payload(tracker))
     except asyncio.CancelledError:
         logger.info("sse_resolve_cancelled", request_id=request_id)
     except Exception as exc:
         logger.error("sse_resolve_error", request_id=request_id, error_type=type(exc).__name__, exc_info=True)
-        yield emitter.format_error("InternalError", "Query resolution failed", 500)
+        yield emitter.format_error(
+            "InternalError", "Query resolution failed", 500, llm_usage=_llm_usage_payload(tracker)
+        )
 
 
 async def _bind_namespace_label_preference(
@@ -1383,7 +1428,7 @@ async def invoke(payload: dict, context=None):
             yield await _handle_kb_search(payload, request_id)
             return
         if action == "graphTraverse":
-            yield await _handle_graph_traverse(payload, request_id)
+            yield await _handle_graph_traverse(payload, request_id, resolved_profile)
             return
     except ServeError as e:
         yield e.to_dict(request_id)
