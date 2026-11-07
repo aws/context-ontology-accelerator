@@ -16,6 +16,7 @@ import pytest
 from coa_serve.config import ServiceConfig
 from coa_serve.models import ConfidenceScore, InvokeRequest, InvokeResponse, QueryResult, TraceStep
 from coa_serve.orchestrator import Orchestrator
+from coa_serve.schema_visibility import SchemaVisibility
 
 pytestmark = pytest.mark.unit
 
@@ -1703,8 +1704,14 @@ class TestHandleGraphTraverseOptions:
 
 @pytest.mark.unit
 class TestIncludeDebugInfoGate:
-    """``includeDebugInfo`` exposes the physical schema, so it is honoured only for a
-    caller who administers the namespace's schema; others get the default."""
+    """``includeDebugInfo`` is forwarded to the orchestrator unchanged (ADR:
+    decompose-viewnamespace-schema-visibility). The old coarse role-list pre-gate
+    in ``main`` is removed; per-artifact authorization now lives in the
+    orchestrator, which gates the SQL artifact on ``viewSource`` and the SPARQL
+    artifact on ``viewOntology`` through the fail-closed Cedar authorizer. ``main``
+    must therefore pass the flag through verbatim for every role — a schema-blind
+    caller still receives both fields withheld because the orchestrator withholds
+    them, not because ``main`` cleared the flag."""
 
     @staticmethod
     def _resolved(global_roles=(), resource_roles=()):
@@ -1715,20 +1722,20 @@ class TestIncludeDebugInfoGate:
     @patch("coa_serve.main._ensure_initialized")
     @patch("coa_serve.main.resolve_profile")
     @pytest.mark.parametrize(
-        ("global_roles", "resource_roles", "honoured"),
+        ("global_roles", "resource_roles"),
         [
-            (["platform-admin"], [], True),
-            ([], [{"role": "namespace-owner", "resourceUID": "demo"}], True),
-            ([], [{"role": "namespace-maintainer", "resourceUID": "demo"}], True),
-            ([], [{"role": "data-steward", "resourceUID": "demo"}], True),
-            ([], [{"role": "data-analyst", "resourceUID": "demo"}], False),
-            ([], [{"role": "data-steward", "resourceUID": "other-ns"}], False),
-            (["global-viewer"], [], False),
-            ([], [], False),
+            (["platform-admin"], []),
+            ([], [{"role": "namespace-owner", "resourceUID": "demo"}]),
+            ([], [{"role": "data-steward", "resourceUID": "demo"}]),
+            # A schema-blind analyst: the flag is STILL forwarded unchanged — the
+            # orchestrator's per-artifact Cedar gate withholds the fields, not main.
+            ([], [{"role": "data-analyst", "resourceUID": "demo"}]),
+            (["global-viewer"], []),
+            ([], []),
         ],
     )
-    async def test_flag_is_honoured_only_for_schema_administrators(
-        self, mock_resolve, mock_init, global_roles, resource_roles, honoured, config
+    async def test_flag_is_forwarded_unchanged_for_every_role(
+        self, mock_resolve, mock_init, global_roles, resource_roles, config
     ):
         import coa_serve.main as main_mod
 
@@ -1755,14 +1762,529 @@ class TestIncludeDebugInfoGate:
                 }
             )
 
-        assert orch.resolve.call_args[0][0].options["includeDebugInfo"] is honoured
+        # The flag reaches the orchestrator untouched for every role; main no
+        # longer clears it. Per-artifact enforcement is asserted in the
+        # orchestrator's own tests (viewSource gates SQL, viewOntology gates SPARQL).
+        assert orch.resolve.call_args[0][0].options["includeDebugInfo"] is True
 
-    def test_client_supplied_roles_cannot_satisfy_the_gate(self):
-        """The gate reads the server-resolved profile; a body-supplied role is stripped
-        before resolution (see ``test_invoke_strips_injectable_roles_before_orchestrator``),
-        and an empty resolved profile never qualifies."""
-        from coa_serve.role_resolver import may_view_debug_info
 
-        assert may_view_debug_info({}, "demo") is False
-        assert may_view_debug_info({"resourceRoles": ["namespace-owner"]}, "demo") is False
-        assert may_view_debug_info({"resourceRoles": [{"role": "namespace-owner", "resourceUID": "demo"}]}, "") is False
+# ── Results-only scrub at the serve entrypoint (ADR: schema-blind analyst) ──
+#
+# Sentinel scan: each test plants distinctive schema names in every field that
+# can carry them and asserts NONE survives anywhere in the serialized output —
+# so a leak through a field nobody listed still fails the test.
+_SB_TABLE = "sb_sentinel_orders"
+_SB_CLASS = "http://example.com/sb#SentinelOrder"
+_SB_PROP = "http://example.com/sb#hasSentinelLine"
+_SB_SENTINELS = (_SB_TABLE, _SB_CLASS, _SB_PROP)
+
+
+def _sb_vis(source: bool, ontology: bool):
+    from coa_serve.schema_visibility import SchemaVisibility
+
+    return SchemaVisibility(source=source, ontology=ontology)
+
+
+def _sb_leaks(obj) -> list[str]:
+    import json
+
+    blob = json.dumps(obj, default=str)
+    return [s for s in _SB_SENTINELS if s in blob]
+
+
+_SB_SQL = f"SELECT sum(amount) FROM {_SB_TABLE}"
+_SB_SPARQL = f"SELECT ?x WHERE {{ ?x a <{_SB_CLASS}> }}"
+
+
+def _sb_query_result(artifacts: bool = False) -> QueryResult:
+    """What the orchestrator returns: the gated SQL/SPARQL only with ``artifacts``
+    (opt-in AND the right), the ungated pair always kept privately for the scrub."""
+    return QueryResult(
+        tier=3,
+        confidence=ConfidenceScore(score=0.8, rationale="ok"),
+        result_rows=[{"total": 42}],
+        synthesized_answer="The total is 42.",
+        query_used=_SB_SQL if artifacts else None,
+        sparql_generated=_SB_SPARQL if artifacts else None,
+        graph_context={"entities": [{"uri": "urn:i:1", "type": _SB_CLASS, "relationships": [_SB_PROP]}]},
+        trace=[
+            TraceStep(step="t2.sql.generate", status="success", duration_ms=5, detail={"tables": [_SB_TABLE]}),
+            TraceStep(step="t3.ontology_edge_filter", status="success", duration_ms=1, detail=f"kept {_SB_PROP}"),
+        ],
+        metadata={"retrieved_tables": [_SB_TABLE], "expanded_tables": [_SB_TABLE], "columns": ["total"]},
+    ).with_raw_artifacts(query_used=_SB_SQL, sparql=_SB_SPARQL)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+class TestSchemaBlindEntrypointScrub:
+    """Every serve exit withholds schema from a caller lacking viewSource/viewOntology."""
+
+    def _orch(self, vis, result: QueryResult | None = None):
+        import coa_serve.main as main_mod
+
+        orch = MagicMock()
+        orch.schema_visibility = MagicMock(return_value=vis)
+        artifacts = isinstance(vis, SchemaVisibility) and vis.source
+        orch.resolve = AsyncMock(return_value=InvokeResponse(result=result or _sb_query_result(artifacts)))
+        main_mod._orchestrator = orch
+        main_mod._session_manager = None
+        main_mod._session_metadata = None
+        return orch
+
+    @patch("coa_serve.main._ensure_initialized")
+    async def test_blocking_query_schema_blind_gets_results_only(self, mock_init):
+        mock_init.return_value = None
+        self._orch(_sb_vis(False, False))
+        out = await _invoke_collect({"query": "total?", "namespace": "demo", "options": {"includeDebugInfo": True}})
+        result = out["result"]
+        assert result["resultRows"] == [{"total": 42}]
+        assert result["synthesizedAnswer"] == "The total is 42."
+        assert [s["step"] for s in result["trace"]] == ["t2.sql.generate", "t3.ontology_edge_filter"]
+        assert all("detail" not in s for s in result["trace"])
+        assert result["metadata"]["columns"] == ["total"]  # result shape kept
+        assert _sb_leaks(out) == []
+
+    @patch("coa_serve.main._ensure_initialized")
+    async def test_blocking_query_full_visibility_is_unchanged(self, mock_init):
+        mock_init.return_value = None
+        self._orch(_sb_vis(True, True))
+        out = await _invoke_collect({"query": "total?", "namespace": "demo"})
+        result = out["result"]
+        assert _SB_TABLE in result["queryUsed"]
+        assert result["graphContext"]["entities"][0]["type"] == _SB_CLASS
+        assert result["metadata"]["retrieved_tables"] == [_SB_TABLE]
+        assert result["trace"][0]["detail"] == {"tables": [_SB_TABLE]}
+
+    @patch("coa_serve.main._ensure_initialized")
+    async def test_blocking_query_source_only_keeps_sql_withholds_ontology(self, mock_init):
+        mock_init.return_value = None
+        self._orch(_sb_vis(True, False))
+        result = (await _invoke_collect({"query": "total?", "namespace": "demo"}))["result"]
+        assert _SB_TABLE in result["queryUsed"]
+        assert result["metadata"]["retrieved_tables"] == [_SB_TABLE]
+        assert "sparqlGenerated" not in result
+        assert result["graphContext"] == {"entities": []}
+        assert all("detail" not in s for s in result["trace"])  # trace details need BOTH rights
+
+    @patch("coa_serve.main._ensure_initialized")
+    async def test_unresolved_visibility_fails_closed(self, mock_init):
+        """A stand-in (non-SchemaVisibility) decision must never read as 'may see all'."""
+        mock_init.return_value = None
+        self._orch(MagicMock())  # truthy .full — must still withhold
+        out = await _invoke_collect({"query": "total?", "namespace": "demo"})
+        assert _sb_leaks(out) == []
+
+    @patch("coa_serve.main._ensure_initialized")
+    @pytest.mark.parametrize("full", [False, True])
+    async def test_streaming_query_scrubs_steps_and_done(self, mock_init, full):
+        import json
+
+        mock_init.return_value = None
+        orch = self._orch(_sb_vis(full, full))
+
+        async def resolve(request, trace=None, on_token=None, conversation_history=None, deadline=None):
+            if trace:
+                trace.record(step="t2.sql.generate", status="success", duration_ms=5, detail={"tables": [_SB_TABLE]})
+            return InvokeResponse(result=_sb_query_result(full))
+
+        orch.resolve = resolve
+        events = await _invoke_collect({"query": "total?", "namespace": "demo", "stream": True})
+        steps = [e for e in events if isinstance(e, dict) and e.get("type") == "step"]
+        done = [e for e in events if isinstance(e, dict) and e.get("type") == "done"]
+        assert steps, "expected the recorded step to be streamed"
+        assert len(done) == 1 and done[0]["payload"]["result"]["resultRows"] == [{"total": 42}]
+        if full:  # positive control: the same step carries the sentinel for a full-visibility caller
+            assert _SB_TABLE in json.dumps(steps[0], default=str)
+        else:
+            assert _sb_leaks(events) == []
+
+    @patch("coa_serve.main._ensure_initialized")
+    async def test_translate_schema_blind_withholds_sparql(self, mock_init):
+        mock_init.return_value = None
+        self._orch(_sb_vis(False, False))
+        nl = AsyncMock()
+        nl.translate.return_value = MagicMock(
+            sparql=f"SELECT ?x WHERE {{ ?x a <{_SB_CLASS}> }}", confidence=0.9, trace_steps=[]
+        )
+        with patch("coa_serve.main._nl_to_sparql", nl):
+            out = await _invoke_collect({"action": "translate", "query": "orders", "namespace": "demo"})
+        assert out["statusCode"] == 200
+        assert out["sparqlQuery"] == ""
+        assert _sb_leaks(out) == []
+
+    @patch("coa_serve.main._ensure_initialized")
+    async def test_translate_ontology_viewer_gets_sparql(self, mock_init):
+        mock_init.return_value = None
+        self._orch(_sb_vis(True, True))
+        nl = AsyncMock()
+        nl.translate.return_value = MagicMock(
+            sparql=f"SELECT ?x WHERE {{ ?x a <{_SB_CLASS}> }}", confidence=0.9, trace_steps=[]
+        )
+        with patch("coa_serve.main._nl_to_sparql", nl):
+            out = await _invoke_collect({"action": "translate", "query": "orders", "namespace": "demo"})
+        assert _SB_CLASS in out["sparqlQuery"]
+
+    @patch("coa_serve.main._ensure_initialized")
+    @pytest.mark.parametrize(("vis", "expect_entities"), [((False, False), False), ((True, True), True)])
+    async def test_graph_traverse_entities_gated_on_view_ontology(self, mock_init, vis, expect_entities):
+        mock_init.return_value = None
+        orch = self._orch(_sb_vis(*vis))
+        entity = MagicMock(uri="urn:i:1", label="Order 1", type=_SB_CLASS)
+        entity.relationships = [
+            {"source_uri": "urn:i:1", "predicate_uri": _SB_PROP, "target_uri": "urn:i:2", "predicate_label": "Line"}
+        ]
+        orch._knowledge_retriever._graph.traverse_from_uris = AsyncMock(return_value=[entity])
+        out = await _invoke_collect(
+            {"action": "graphTraverse", "namespace": "demo", "options": {"startUri": "urn:i:1"}}
+        )
+        assert out["statusCode"] == 200
+        if expect_entities:
+            assert out["entities"][0]["type"] == _SB_CLASS
+            assert out["relationships"][0]["predicateUri"] == _SB_PROP
+        else:
+            assert out["entities"] == [] and out["relationships"] == []
+            assert _sb_leaks(out) == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+class TestDenyMessageDoesNotNameSchema:
+    """A firewall deny reason names tables/columns; it must stay server-side (G6)."""
+
+    @patch("coa_serve.main._ensure_initialized")
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_access_denied_reason_never_reaches_client(self, mock_init, stream):
+        import coa_serve.main as main_mod
+        from coa_serve.exceptions import AccessDeniedError
+
+        mock_init.return_value = None
+        orch = MagicMock()
+        orch.schema_visibility = MagicMock(return_value=_sb_vis(False, False))
+        orch.resolve = AsyncMock(
+            side_effect=AccessDeniedError(f"Access denied to column(s): {_SB_TABLE}.sb_col_secret")
+        )
+        main_mod._orchestrator = orch
+        main_mod._session_manager = None
+        main_mod._session_metadata = None
+
+        out = await _invoke_collect({"query": "q", "namespace": "demo", "stream": stream})
+        assert _sb_leaks(out) == []
+        assert "sb_col_secret" not in str(out)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+class TestSchemaBlindEntrypointReviewFixes:
+    """Independent-review findings: streamed tokens, schema-naming error text, session replay."""
+
+    def _orch(self, vis):
+        import coa_serve.main as main_mod
+
+        orch = MagicMock()
+        orch.schema_visibility = MagicMock(return_value=vis)
+        main_mod._orchestrator = orch
+        main_mod._session_manager = None
+        main_mod._session_metadata = None
+        return orch
+
+    @patch("coa_serve.main._ensure_initialized")
+    @pytest.mark.parametrize(("vis", "streams_tokens"), [((False, False), False), ((True, True), True)])
+    async def test_answer_tokens_streamed_only_with_full_visibility(self, mock_init, vis, streams_tokens):
+        mock_init.return_value = None
+        orch = self._orch(_sb_vis(*vis))
+
+        async def resolve(request, trace=None, on_token=None, conversation_history=None, deadline=None):
+            if on_token:
+                await on_token(f"see {_SB_CLASS}")
+            return InvokeResponse(result=_sb_query_result())
+
+        orch.resolve = resolve
+        events = await _invoke_collect({"query": "q", "namespace": "demo", "stream": True})
+        tokens = [e for e in events if isinstance(e, dict) and e.get("type") == "token"]
+        assert bool(tokens) is streams_tokens
+        if not streams_tokens:
+            assert _sb_leaks(events) == []
+
+    @patch("coa_serve.main._ensure_initialized")
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_ambiguous_reference_message_withheld_without_view_source(self, mock_init, stream):
+        from coa_serve.exceptions import AmbiguousReferenceError
+
+        mock_init.return_value = None
+        orch = self._orch(_sb_vis(False, False))
+        orch.resolve = AsyncMock(
+            side_effect=AmbiguousReferenceError(f"table {_SB_TABLE!r} exists in more than one data source or schema")
+        )
+        out = await _invoke_collect({"query": "q", "namespace": "demo", "stream": stream})
+        assert _SB_TABLE not in str(out)
+        assert "more than one source" in str(out)
+
+    @patch("coa_serve.main._ensure_initialized")
+    async def test_ambiguous_reference_message_kept_for_source_viewer(self, mock_init):
+        from coa_serve.exceptions import AmbiguousReferenceError
+
+        mock_init.return_value = None
+        orch = self._orch(_sb_vis(True, True))
+        orch.resolve = AsyncMock(side_effect=AmbiguousReferenceError(f"table {_SB_TABLE!r} is ambiguous"))
+        out = await _invoke_collect({"query": "q", "namespace": "demo"})
+        assert _SB_TABLE in out["message"]
+
+    @patch("coa_serve.main._ensure_initialized")
+    async def test_session_history_replay_is_rescrubbed(self, mock_init):
+        import coa_serve.main as main_mod
+
+        mock_init.return_value = None
+        self._orch(_sb_vis(False, False))
+        main_mod._session_manager = MagicMock()
+        stored = [
+            {
+                "role": "assistant",
+                "content": f"see {_SB_CLASS}",
+                "metadata": {"queryUsed": f"SELECT 1 FROM {_SB_TABLE}", "trace": [{"step": "s", "detail": _SB_TABLE}]},
+            }
+        ]
+        history = {"sessionId": "s1", "messages": stored, "statusCode": 200}
+        with (
+            patch("coa_serve.main.handle_get_session_history", AsyncMock(return_value=history)),
+            patch("coa_serve.main._replay_visibility", AsyncMock(return_value=_sb_vis(False, False))) as mock_vis,
+        ):
+            out = await _invoke_collect({"action": "getSessionHistory", "sessionId": "s1", "namespace": "demo"})
+        mock_vis.assert_awaited_once()
+        assert _sb_leaks(out) == []
+        assert out["messages"][0]["metadata"]["trace"] == [{"step": "s"}]
+
+    async def test_replay_visibility_fails_closed_without_namespace_or_on_error(self):
+        from coa_serve.main import _replay_visibility
+
+        assert await _replay_visibility({}, "", "u", None, []) == _sb_vis(False, False)
+        with patch("coa_serve.main.resolve_profile", side_effect=RuntimeError("ddb down")):
+            assert await _replay_visibility({}, "demo", "u", None, []) == _sb_vis(False, False)
+
+
+# ── Visibility is resolved from the SERVER profile, once, and published ──────
+
+_ANALYST_RESOLVED = {"user": "analyst-1", "role": "data-analyst"}
+_SPOOFED_PROFILE = {"userId": "x", "globalRoles": ["platform-admin"]}
+
+
+def _analyst_resolved_profile():
+    from coa_serve.role_resolver import ResolvedProfile
+
+    return ResolvedProfile(user_id="analyst-1", resource_roles=[{"role": "data-analyst", "resourceUID": "demo"}])
+
+
+def _assert_server_profile(orch) -> None:
+    """``schema_visibility`` was asked about the server-resolved analyst, never the spoofed admin."""
+    assert orch.schema_visibility.call_args is not None, "schema_visibility was not consulted"
+    namespace, profile = orch.schema_visibility.call_args[0]
+    assert namespace == "demo"
+    assert profile["resourceRoles"] == [{"role": "data-analyst", "resourceUID": "demo"}]
+    assert "platform-admin" not in str(profile)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+class TestSchemaVisibilityUsesServerProfile:
+    def _orch(self):
+        import coa_serve.main as main_mod
+
+        orch = MagicMock()
+        orch.schema_visibility = MagicMock(return_value=_sb_vis(False, False))
+        orch.resolve = AsyncMock(return_value=InvokeResponse(result=_sb_query_result()))
+        main_mod._orchestrator = orch
+        main_mod._session_manager = None
+        main_mod._session_metadata = None
+        return orch
+
+    @staticmethod
+    def _gate():
+        return patch(
+            "coa_serve.main._authorize_namespace_access",
+            new_callable=AsyncMock,
+            return_value=(_analyst_resolved_profile(), None),
+        )
+
+    @patch("coa_serve.main._ensure_initialized")
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_query_paths(self, mock_init, stream):
+        mock_init.return_value = None
+        orch = self._orch()
+        with self._gate():
+            await _invoke_collect(
+                {"query": "q", "namespace": "demo", "profile": dict(_SPOOFED_PROFILE), "stream": stream}
+            )
+        _assert_server_profile(orch)
+
+    @patch("coa_serve.main._ensure_initialized")
+    async def test_translate(self, mock_init):
+        mock_init.return_value = None
+        orch = self._orch()
+        nl = AsyncMock()
+        nl.translate.return_value = MagicMock(sparql=_SB_SPARQL, confidence=0.9, trace_steps=[])
+        with self._gate(), patch("coa_serve.main._nl_to_sparql", nl):
+            out = await _invoke_collect(
+                {"action": "translate", "query": "o", "namespace": "demo", "profile": dict(_SPOOFED_PROFILE)}
+            )
+        assert out["sparqlQuery"] == ""
+        _assert_server_profile(orch)
+
+    @patch("coa_serve.main._ensure_initialized")
+    async def test_graph_traverse(self, mock_init):
+        mock_init.return_value = None
+        orch = self._orch()
+        orch._knowledge_retriever._graph.traverse_from_uris = AsyncMock(return_value=[])
+        with self._gate():
+            await _invoke_collect(
+                {
+                    "action": "graphTraverse",
+                    "namespace": "demo",
+                    "options": {"startUri": "urn:i:1"},
+                    "profile": dict(_SPOOFED_PROFILE),
+                }
+            )
+        _assert_server_profile(orch)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+class TestSchemaBlindPublishedDuringResolve:
+    """main publishes SCHEMA_BLIND (and the decision) for the resolution, then resets it."""
+
+    @patch("coa_serve.main._ensure_initialized")
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize(("vis", "blind"), [((False, False), True), ((True, False), True), ((True, True), False)])
+    async def test_schema_blind_set_inside_resolve(self, mock_init, stream, vis, blind):
+        import coa_serve.main as main_mod
+        from coa_serve.schema_visibility import SCHEMA_BLIND, request_schema_visibility
+
+        mock_init.return_value = None
+        seen: dict = {}
+
+        async def resolve(request, **kwargs):
+            seen["blind"] = SCHEMA_BLIND.get()
+            seen["vis"] = request_schema_visibility("demo")
+            return InvokeResponse(result=_sb_query_result())
+
+        orch = MagicMock()
+        orch.schema_visibility = MagicMock(return_value=_sb_vis(*vis))
+        orch.resolve = resolve
+        main_mod._orchestrator = orch
+        main_mod._session_manager = None
+        main_mod._session_metadata = None
+        await _invoke_collect({"query": "q", "namespace": "demo", "stream": stream})
+        assert seen == {"blind": blind, "vis": _sb_vis(*vis)}
+        assert SCHEMA_BLIND.get() is False and request_schema_visibility("demo") is None
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+class TestReplayVisibilityAndSessionActions:
+    async def test_replay_visibility_positive_control_unpatched(self):
+        """A steward replays with full visibility; the injected profile carries the steward role."""
+        import coa_serve.main as main_mod
+        from coa_serve.role_resolver import ResolvedProfile
+
+        seen: dict = {}
+
+        def schema_visibility(namespace, profile):
+            seen["args"] = (namespace, dict(profile))
+            return _sb_vis(True, True)
+
+        orch = MagicMock()
+        orch.schema_visibility = schema_visibility
+        main_mod._orchestrator = orch
+        steward = ResolvedProfile(user_id="u", resource_roles=[{"role": "data-steward", "resourceUID": "demo"}])
+        with patch("coa_serve.main.resolve_profile", return_value=steward) as mock_resolve:
+            vis = await main_mod._replay_visibility({}, "demo", "u", None, [])
+        assert vis == SchemaVisibility(True, True)
+        assert mock_resolve.call_args.kwargs["namespace"] == "demo"
+        namespace, profile = seen["args"]
+        assert namespace == "demo"
+        assert profile["resourceRoles"] == [{"role": "data-steward", "resourceUID": "demo"}]
+
+    async def test_replay_visibility_no_user_is_blind(self):
+        import coa_serve.main as main_mod
+
+        orch = MagicMock()
+        main_mod._orchestrator = orch
+        with (
+            patch("coa_serve.main.resolve_principal", return_value=(None, [])),
+            patch("coa_serve.main.resolve_profile") as mock_resolve,
+        ):
+            vis = await main_mod._replay_visibility({}, "demo", None, None, [])
+        assert vis == SchemaVisibility(False, False)
+        mock_resolve.assert_not_called()
+        orch.schema_visibility.assert_not_called()
+
+    @staticmethod
+    def _stored_turn():
+        return [
+            {"role": "user", "content": "how many?"},
+            {
+                "role": "assistant",
+                "content": f"see {_SB_CLASS} in {_SB_TABLE}",
+                "metadata": {
+                    "queryUsed": _SB_SQL,
+                    "sparqlGenerated": _SB_SPARQL,
+                    "metadata": {"retrieved_tables": [_SB_TABLE]},
+                    "trace": [{"step": "s", "detail": _SB_TABLE}],
+                    "resultRows": [{"v": _SB_CLASS}],
+                },
+            },
+        ]
+
+    @patch("coa_serve.main._ensure_initialized")
+    async def test_get_recent_session_is_rescrubbed(self, mock_init):
+        import coa_serve.main as main_mod
+
+        mock_init.return_value = None
+        main_mod._orchestrator = MagicMock()
+        main_mod._session_manager = MagicMock()
+        main_mod._session_metadata = MagicMock()
+        recent = {"sessionId": "s1", "namespace": "demo", "messages": self._stored_turn(), "statusCode": 200}
+        with (
+            patch("coa_serve.main.handle_get_recent_session", AsyncMock(return_value=recent)),
+            patch("coa_serve.main._replay_visibility", AsyncMock(return_value=_sb_vis(False, False))) as mock_vis,
+        ):
+            out = await _invoke_collect({"action": "getRecentSession", "profile": {"userId": "u"}})
+        assert mock_vis.await_args[0][1] == "demo"
+        assert _sb_leaks(out) == []
+        assert out["messages"][0] == {"role": "user", "content": "how many?"}
+        assert out["messages"][1]["metadata"]["trace"] == [{"step": "s"}]
+
+    @patch("coa_serve.main._ensure_initialized")
+    async def test_get_recent_session_full_visibility_positive_control(self, mock_init):
+        import coa_serve.main as main_mod
+
+        mock_init.return_value = None
+        main_mod._orchestrator = MagicMock()
+        main_mod._session_manager = MagicMock()
+        main_mod._session_metadata = MagicMock()
+        recent = {"sessionId": "s1", "namespace": "demo", "messages": self._stored_turn(), "statusCode": 200}
+        with (
+            patch("coa_serve.main.handle_get_recent_session", AsyncMock(return_value=recent)),
+            patch("coa_serve.main._replay_visibility", AsyncMock(return_value=_sb_vis(True, True))),
+        ):
+            out = await _invoke_collect({"action": "getRecentSession", "profile": {"userId": "u"}})
+        assert set(_sb_leaks(out)) == {_SB_TABLE, _SB_CLASS}
+
+    @patch("coa_serve.main._ensure_initialized")
+    async def test_session_history_without_namespace_uses_stored_namespace(self, mock_init):
+        import coa_serve.main as main_mod
+
+        mock_init.return_value = None
+        main_mod._orchestrator = MagicMock()
+        main_mod._session_manager = MagicMock()
+        main_mod._session_metadata = MagicMock()
+        main_mod._session_metadata.get_session_namespace = AsyncMock(return_value="stored-ns")
+        history = {"sessionId": "s1", "messages": self._stored_turn(), "statusCode": 200}
+        with (
+            patch("coa_serve.main.handle_get_session_history", AsyncMock(return_value=history)),
+            patch("coa_serve.main._replay_visibility", AsyncMock(return_value=_sb_vis(False, False))) as mock_vis,
+        ):
+            out = await _invoke_collect({"action": "getSessionHistory", "sessionId": "s1", "profile": {"userId": "u"}})
+        main_mod._session_metadata.get_session_namespace.assert_awaited_once()
+        assert main_mod._session_metadata.get_session_namespace.await_args[0][1] == "s1"
+        assert mock_vis.await_args[0][1] == "stored-ns"
+        assert _sb_leaks(out) == []

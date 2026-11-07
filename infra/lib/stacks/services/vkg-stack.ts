@@ -54,9 +54,13 @@ export interface VkgStackProps extends cdk.StackProps {
 
   /**
    * JVM args for the Ontop launcher, passed via ONTOP_JAVA_ARGS (NOT JAVA_OPTS,
-   * which the launcher ignores). Default "-Xmx1536m -Xms512m". Applied to both
-   * the CDK-provisioned service and the per-namespace reload Lambda so they
-   * stay in sync.
+   * which the launcher ignores). Default "-Xmx1536m -Xms512m"; a blank value
+   * counts as unset. The stack appends -Dserver.address=127.0.0.1 after this
+   * value, so a -Dserver.address in it is superseded (Java keeps the last -D
+   * for a property); other Spring property sources, such as
+   * -Dspring.application.json, can still set the address. Applied to both
+   * the template task definition and the per-namespace reload Lambda, which
+   * registers the task definitions that actually run, so they stay in sync.
    */
   readonly ontopJavaArgs?: string;
 
@@ -106,10 +110,15 @@ export class VkgStack extends SCLStack {
     // (#149 causes B/C). This same value is handed to the reload Lambda so
     // per-namespace reloads and the CDK-provisioned service stay in lockstep
     // from one source of truth.
-    const ontopJavaArgs =
-      props.ontopJavaArgs ??
+    //
+    // Ontop's Spring Boot endpoint is bound to loopback whatever the heap args:
+    // only translate-server calls it (localhost:8081), so it stays unreachable
+    // from outside the task even if the port mappings or security group change.
+    const ontopBaseArgs =
+      props.ontopJavaArgs?.trim() ||
       `-Xmx${Math.max(512, Math.floor((memoryLimitMiB * 3) / 4))}m ` +
         `-Xms${Math.max(256, Math.floor(memoryLimitMiB / 4))}m`;
+    const ontopJavaArgs = `${ontopBaseArgs} -Dserver.address=127.0.0.1`;
     this.containerPort = props.containerPort ?? 8080;
     const namespace = props.serviceNamespace;
     const cloudMapNamespaceName = namespace.namespaceName;

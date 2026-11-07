@@ -3,7 +3,7 @@
 
 import { describe, it, expect } from "vitest";
 import { ControlPlaneServiceServiceException } from "@coa/control-plane-client";
-import { extractErrorMessage } from "./errors";
+import { extractErrorMessage, isForbiddenError } from "./errors";
 
 // Build an instance whose prototype satisfies `instanceof` without invoking
 // the Smithy constructor.
@@ -65,5 +65,26 @@ describe("extractErrorMessage", () => {
     expect(
       extractErrorMessage(makeException({ message: "UnknownError" }), "fb"),
     ).toBe("fb");
+  });
+});
+
+describe("isForbiddenError", () => {
+  it("recognises a Smithy 403", () => {
+    expect(
+      isForbiddenError(makeException({ $metadata: { httpStatusCode: 403 } })),
+    ).toBe(true);
+  });
+  it("recognises an ApiError-shaped 403", () => {
+    expect(
+      isForbiddenError(Object.assign(new Error("x"), { status: 403 })),
+    ).toBe(true);
+  });
+  it("is false for other statuses and non-errors", () => {
+    expect(
+      isForbiddenError(Object.assign(new Error("x"), { status: 404 })),
+    ).toBe(false);
+    expect(isForbiddenError(new Error("x"))).toBe(false);
+    expect(isForbiddenError(null)).toBe(false);
+    expect(isForbiddenError("403")).toBe(false);
   });
 });

@@ -8,6 +8,20 @@ when { principal.globalRoles.contains("platform-viewer") };
 
 permit (
   principal,
+  action == SCL::Action::"viewSource",
+  resource
+)
+when { principal.globalRoles.contains("platform-viewer") };
+
+permit (
+  principal,
+  action == SCL::Action::"viewOntology",
+  resource
+)
+when { principal.globalRoles.contains("platform-viewer") };
+
+permit (
+  principal,
   action == SCL::Action::"list",
   resource
 )

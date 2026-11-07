@@ -57,7 +57,7 @@ Namespace roles are granted per-namespace and only apply within that namespace.
 | `namespace-owner` | Full access within the namespace (manage, delete, grant permissions) |
 | `namespace-maintainer` | Same as owner (functionally identical) |
 | `data-steward` | Manage data sources, ontologies, metrics + read/query access |
-| `data-analyst` | Read-only: query data, view metrics, search documents |
+| `data-analyst` | Read-only and schema-blind: query data, view metrics, search documents; no source or ontology schema |
 
 ### Permission Matrix
 
@@ -71,8 +71,12 @@ Namespace roles are granted per-namespace and only apply within that namespace.
 | Manage data sources | ✅ | ❌ | ✅ | ✅ | ❌ |
 | Manage ontologies | ✅ | ❌ | ✅ | ✅ | ❌ |
 | Manage metrics | ✅ | ❌ | ✅ | ✅ | ❌ |
+| View source schema (sources, tables, SQL, metric SQL) | ✅ | ✅ | ✅ | ✅ | ❌ |
+| View ontology schema (ontologies, graph, SPARQL) | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Query data | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Grant permissions | ✅ | ❌ | ✅ | ❌ | ❌ |
+
+`data-analyst` is schema-blind: it can query and read metrics, but receives results only — no source or ontology schema (see [Cedar Policy Authoring](cedar-policy-authoring.md)).
 
 ## Managing Platform Grants
 

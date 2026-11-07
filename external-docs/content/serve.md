@@ -41,12 +41,26 @@ Options:
 - `strategy` — choose which Tier-2 engine answers a structured query (see below)
 - `maxResults` — limit result rows (1–10000)
 - `includeSupporting` — include supporting context in the response
-- `includeDebugInfo` — include the generated `queryUsed` (SQL) and
-  `sparqlGenerated` fields in the response. **Off by default.** ⚠️ Security:
-  these fields expose internal schema (table and column names, joins), so the
-  flag is honoured only for a platform admin or a namespace owner, maintainer
-  or data steward of the queried namespace. For any other caller the query
-  still succeeds, with both fields omitted.
+- `includeDebugInfo` — request the generated `queryUsed` (SQL) and
+  `sparqlGenerated` fields in the response. ⚠️ Security: these fields expose
+  internal schema, so each is gated independently by exactly the schema it
+  reveals — the **SQL** (`queryUsed`, table/column names) on `viewSource`, the
+  **SPARQL** (`sparqlGenerated`, ontology class/property names) on
+  `viewOntology`. A caller holding a right sees that artifact; a schema-blind
+  `data-analyst` (holding neither) sees neither. For a caller lacking a right
+  the field is omitted — enforcement is fail-closed and per-artifact. See
+  [Schema-blind callers](#schema-blind-callers) for everything else such a
+  caller sees differently. The Playground always requests them, so every role
+  holding the right sees the SQL/SPARQL under **Compiled artifacts** by default
+  and a `data-analyst` never does.
+- `includeLlmUsage` — include provider-reported text-LLM token usage in
+  `result.llmUsage`. Usage is grouped by exact model ID so an external
+  reporting layer can apply its own versioned prices. It contains no prompts,
+  answers, credentials, or per-call traces. When enabled, an error response
+  may instead include top-level `llmUsage` containing usage recorded before
+  the failure. In either response, `complete: false` means at least one known
+  LLM call was not fully accounted, so the reported totals may be partial.
+  **Off by default.**
 - `dimensions` — dimension filters, a list of up to 100 `{name, value}`
   objects (`name` 1–256 characters and unique case-insensitively, `value` up
   to 4000 characters, `operator` only `=`)
@@ -80,7 +94,42 @@ the synchronous REST endpoint. It POSTs to the AgentCore Runtime `/invocations`
 endpoint with SSE (Server-Sent Events) and carries a much larger resolution budget
 (**170 s** by default, `resolve_timeout_s`), so it is not subject to the 29 s API
 Gateway ceiling. It also streams resolution steps, generated SQL, and results as
-they are produced instead of blocking for a single response.
+they are produced instead of blocking for a single response. (A schema-blind
+caller receives step names and timings only, and the answer arrives once, in the
+final `done` event — see below.)
+
+### Schema-blind callers
+
+A caller without `viewSource` or `viewOntology` on the namespace — the built-in
+`data-analyst` role — gets results, the synthesized answer and confidence, but no
+schema. On both REST and streaming:
+
+- **Debug and context fields are empty.** `queryUsed`, `sparqlGenerated`,
+  `metadata.retrieved_tables` / `expanded_tables`, `graphContext` entities and
+  trace step details are withheld for whichever right is missing. Trace steps keep
+  their names and timings.
+- **The answer is not streamed token by token.** The redacted final answer arrives
+  in the `done` event.
+- **Identifiers are redacted from text.** Database-qualified table names from the
+  executed SQL and ontology class/property IRIs from the generated SPARQL or the
+  graph are replaced with `[redacted]` in the answer, in string values of result
+  rows and in supporting content. In a result column built from text in the query
+  itself (`SELECT COUNT(*), 'some text' FROM orders`, a `CASE` or `CONCAT` with a
+  literal), bare table and column names the model was shown are also redacted, and
+  so is any of them the answer repeats. Columns that hold stored data are left as
+  they are. This is best-effort for text the model writes in its own words: a bare
+  table or column name paraphrased by the model is not detected.
+- **Some statements are refused with `403`.** A statement that reads no table
+  (`SELECT 'a' UNION ALL SELECT 'b'`, a CTE over constants) or that returns only
+  text constants (`SELECT 'customer_id' FROM orders`) can only echo schema names,
+  so it is refused. Ask a data question instead.
+- **Errors are generic.** An ambiguous-table or firewall refusal says the query was
+  refused without naming tables or schemas.
+- **Column names still appear** as result-row keys and in `metadata.columns`,
+  because they label the data returned. Use a grant's `columnDenylist` to hide a
+  column entirely.
+- **Session history is re-scrubbed on replay** with the caller's current rights, so
+  turns stored before a role change do not reveal schema.
 
 This is the path the [Playground](#playground-web-app) uses, and the recommended
 default for building interactive clients. Reserve the synchronous REST endpoint for

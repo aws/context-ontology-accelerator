@@ -9,6 +9,7 @@ type NavSection = {
 }
 
 const SECTIONS: NavSection[] = [
+  { stage: 'Overview', items: [{ id: 'architecture', label: 'Architecture' }] },
   { stage: 'Administrate', items: [
     { id: 'namespaces', label: 'Namespaces' },
     { id: 'authentication-setup', label: 'Authentication' },

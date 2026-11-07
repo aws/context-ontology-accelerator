@@ -37,6 +37,7 @@ from coa_common.logging import setup_logging
 from coa_common.response import api_response
 
 from .grant_id import encode_grant_id
+from .schema_visibility import withhold_principal_grant_overrides
 
 setup_logging(os.environ.get("LOG_LEVEL", "INFO"))
 logger = structlog.get_logger(__name__)
@@ -195,6 +196,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
             )
 
         grants, next_cursor = _collect_page(_query_key, principal_keys, cursor, max_results)
+        grants = withhold_principal_grant_overrides(grants, event)
         response: dict[str, Any] = {"grants": grants}
         if next_cursor is not None:
             response["nextToken"] = _encode_cursor(next_cursor, principal_keys)

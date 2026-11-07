@@ -224,6 +224,26 @@ describe("formatStepDetail", () => {
     });
   });
 
+  describe("t2.sql.vote formatter", () => {
+    it("reports how many candidates agreed", () => {
+      expect(formatStepDetail("t2.sql.vote", { k: 3, votes: 2 })).toBe(
+        "2 of 3 SQL candidates agreed on the result.",
+      );
+    });
+
+    it("explains a deadline skip", () => {
+      expect(
+        formatStepDetail("t2.sql.vote", { k: 3, skippedReason: "deadline" }),
+      ).toBe("Vote skipped: not enough time left before the deadline.");
+    });
+
+    it("translates the agreement summary", () => {
+      expect(
+        formatStepDetail("t2.sql.vote", { k: 3, votes: 3 }, jaTranslate),
+      ).toBe("3 件の SQL 候補のうち 3 件の結果が一致しました。");
+    });
+  });
+
   describe("t1.execute formatter", () => {
     it("formats with rowCount and table", () => {
       const result = formatStepDetail("t1.execute", {

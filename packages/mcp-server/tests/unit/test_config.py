@@ -68,6 +68,7 @@ class TestMCPConfig:
         assert MCPConfig().aws_region == "eu-west-1"
 
     def test_auth_enabled_env_override(self, monkeypatch):
+        monkeypatch.delenv("SCL_MCP_MODE", raising=False)
         monkeypatch.setenv("SCL_AUTH_ENABLED", "false")
         assert MCPConfig().auth_enabled is False
 
@@ -76,3 +77,31 @@ class TestMCPConfig:
         config = MCPConfig()
         assert config.mcp_port == 9001
         assert isinstance(config.mcp_port, int)
+
+
+@pytest.mark.unit
+class TestAuthDisabledGuard:
+    """SCL_AUTH_ENABLED=false is a local-dev switch: it must never take effect in the container."""
+
+    @pytest.mark.parametrize("disabled", ["false", "0", "off", "FALSE"])
+    def test_auth_disabled_in_mcp_container_refuses_to_start(self, monkeypatch, disabled):
+        # The container entrypoint runs the MCP server only when SCL_MCP_MODE=true, so
+        # this pair is a deployed runtime with auth switched off.
+        monkeypatch.setenv("SCL_MCP_MODE", "true")
+        monkeypatch.setenv("SCL_AUTH_ENABLED", disabled)
+        with pytest.raises(ValueError, match="SCL_AUTH_ENABLED=false"):
+            MCPConfig()
+
+    def test_auth_enabled_in_mcp_container_is_accepted(self, monkeypatch):
+        monkeypatch.setenv("SCL_MCP_MODE", "true")
+        monkeypatch.delenv("SCL_AUTH_ENABLED", raising=False)
+        assert MCPConfig().auth_enabled is True
+
+    @pytest.mark.parametrize("mcp_mode", [None, "false", ""])
+    def test_auth_disabled_outside_container_still_allowed(self, monkeypatch, mcp_mode):
+        if mcp_mode is None:
+            monkeypatch.delenv("SCL_MCP_MODE", raising=False)
+        else:
+            monkeypatch.setenv("SCL_MCP_MODE", mcp_mode)
+        monkeypatch.setenv("SCL_AUTH_ENABLED", "false")
+        assert MCPConfig().auth_enabled is False

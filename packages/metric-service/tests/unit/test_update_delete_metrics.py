@@ -338,6 +338,74 @@ class TestUpdateMetric:
         mock_neptune.return_value.update_metric.assert_not_called()
 
 
+class TestUpdateOntologyConceptsAndBlankFields:
+    """A save from a form whose concepts were withheld (no viewOntology) omits the
+    field; that must keep the stored concepts, not erase them."""
+
+    _STORED = ["http://example.com/onto#StoredConcept"]
+
+    def _existing_with_concepts(self) -> MetricDefinition:
+        metric = _existing_metric()
+        metric.ontology_concepts = list(self._STORED)
+        return metric
+
+    def _run(self, mock_neptune: MagicMock, body: dict) -> tuple[dict, MetricDefinition | None]:
+        mock_neptune.return_value.get_metric.return_value = self._existing_with_concepts()
+        mock_neptune.return_value.resolve_class_uris.side_effect = lambda ns, concepts: concepts
+        resp = update_handler(_make_update_event(body=body), None)
+        call = mock_neptune.return_value.update_metric.call_args
+        return resp, (call.args[2] if call else None)
+
+    @patch("coa_metrics.api.update_metric._get_eventbridge")
+    @patch("coa_metrics.api.update_metric._get_opensearch")
+    @patch("coa_metrics.api.update_metric._get_neptune")
+    def test_missing_concepts_keep_stored(self, mock_neptune: MagicMock, _os: MagicMock, _eb: MagicMock) -> None:
+        resp, written = self._run(mock_neptune, _valid_update_body())
+        assert resp["statusCode"] == 200
+        assert written is not None and written.ontology_concepts == self._STORED
+        assert json.loads(resp["body"])["metric"]["ontologyConcepts"] == self._STORED
+        mock_neptune.return_value.resolve_class_uris.assert_not_called()
+
+    @patch("coa_metrics.api.update_metric._get_eventbridge")
+    @patch("coa_metrics.api.update_metric._get_opensearch")
+    @patch("coa_metrics.api.update_metric._get_neptune")
+    def test_explicit_empty_clears(self, mock_neptune: MagicMock, _os: MagicMock, _eb: MagicMock) -> None:
+        resp, written = self._run(mock_neptune, {**_valid_update_body(), "ontologyConcepts": []})
+        assert resp["statusCode"] == 200
+        assert written is not None and written.ontology_concepts == []
+
+    @patch("coa_metrics.api.update_metric._get_eventbridge")
+    @patch("coa_metrics.api.update_metric._get_opensearch")
+    @patch("coa_metrics.api.update_metric._get_neptune")
+    def test_explicit_concepts_replace(self, mock_neptune: MagicMock, _os: MagicMock, _eb: MagicMock) -> None:
+        new = ["http://example.com/onto#NewConcept"]
+        resp, written = self._run(mock_neptune, {**_valid_update_body(), "ontologyConcepts": new})
+        assert resp["statusCode"] == 200
+        assert written is not None and written.ontology_concepts == new
+        mock_neptune.return_value.resolve_class_uris.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "patch_body",
+        [
+            {"sourceTable": ""},
+            {"sourceTable": "   "},
+            {"expression": {"dialects": []}},
+            {"expression": {"dialects": [{"dialect": "TRINO", "expression": ""}]}},
+            {"expression": {"dialects": [{"dialect": "TRINO", "expression": "   "}]}},
+        ],
+    )
+    @patch("coa_metrics.api.update_metric._get_eventbridge")
+    @patch("coa_metrics.api.update_metric._get_opensearch")
+    @patch("coa_metrics.api.update_metric._get_neptune")
+    def test_blank_sql_or_table_rejected(
+        self, mock_neptune: MagicMock, _os: MagicMock, _eb: MagicMock, patch_body: dict
+    ) -> None:
+        resp, written = self._run(mock_neptune, {**_valid_update_body(), **patch_body})
+        assert resp["statusCode"] == 400
+        assert written is None
+        mock_neptune.return_value.update_metric.assert_not_called()
+
+
 # ── APPROVED-source enforcement on update (#564) ────────────────────────
 
 

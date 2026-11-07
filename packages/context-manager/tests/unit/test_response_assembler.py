@@ -38,7 +38,7 @@ class TestAssembleTier1:
             sql_used="SELECT sum(r) FROM t",
             trace=trace,
             namespace="demo",
-            include_debug_info=True,  # gate on; verify query_used populates
+            include_sql=True,  # gate on; verify query_used populates
         )
         assert result.tier == 1
         assert result.confidence.score == 1.0
@@ -140,7 +140,8 @@ class TestAssembleTier2:
             data_sources=["table_a"],
             trace=trace,
             namespace="demo",
-            include_debug_info=True,  # gate on; verify both fields populate
+            include_sql=True,  # gate on; verify both fields populate
+            include_sparql=True,
         )
         assert result.tier == 2
         assert result.confidence.score == 0.9
@@ -441,7 +442,8 @@ class TestAssembleTier3:
             namespace="demo",
             query_used="SELECT revenue FROM t",
             sparql_generated="SELECT ?r WHERE { ?x :revenue ?r }",
-            include_debug_info=True,
+            include_sql=True,
+            include_sparql=True,
         )
         assert result.query_used == "SELECT revenue FROM t"
         assert result.sparql_generated == "SELECT ?r WHERE { ?x :revenue ?r }"
@@ -459,7 +461,7 @@ class TestAssembleTier3:
             namespace="demo",
             query_used="SELECT revenue FROM sensitive_t",
             sparql_generated="SELECT ?r WHERE { ?x :revenue ?r }",
-            # include_debug_info defaults to False
+            # include_sql / include_sparql default to False
         )
         assert result.query_used is None
         assert result.sparql_generated is None

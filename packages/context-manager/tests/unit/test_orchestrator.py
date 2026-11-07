@@ -148,6 +148,12 @@ def _make_orchestrator(
     return orch
 
 
+# A schema-visible caller (data-steward on "demo"): opting in to debug artifacts
+# returns them only when the caller holds viewSource/viewOntology, and a caller
+# with no roles never does (not even under the no-roles query bypass).
+_STEWARD_PROFILE = {"userId": "steward-1", "resourceRoles": [{"role": "data-steward", "resourceUID": "demo"}]}
+
+
 def _find_step(trace, step_name):
     return next((s for s in trace if s.step == step_name), None)
 
@@ -166,6 +172,7 @@ class TestOrchestratorTier2:
         request = InvokeRequest(
             query="Show all claims",
             namespace="demo",
+            profile=_STEWARD_PROFILE,
             options={"tierOverride": 2, "includeDebugInfo": True},
         )
         response = await orch.resolve(request)
@@ -365,6 +372,7 @@ class TestOntologyVersionTruthfulness:
             InvokeRequest(
                 query="q",
                 namespace="demo",
+                profile=_STEWARD_PROFILE,
                 options={"mode": "deep-reasoning", "includeDebugInfo": True},
             )
         )
@@ -405,6 +413,7 @@ class TestOrchestratorTier1:
         request = InvokeRequest(
             query="What is revenue?",
             namespace="demo",
+            profile=_STEWARD_PROFILE,
             options={"includeDebugInfo": True},
         )
         response = await orch.resolve(request)
@@ -629,6 +638,7 @@ class TestOrchestratorTier1:
         request = InvokeRequest(
             query="What is revenue?",
             namespace="demo",
+            profile=_STEWARD_PROFILE,
             options={
                 "dimensions": [{"name": "region", "value": "EMEA", "operator": "="}],
                 # opt in so query_used is present for the round-trip assert
@@ -1742,7 +1752,7 @@ class TestStructuredBackendRouting:
         await orch.resolve(InvokeRequest(query="q", namespace="ns"))
         assert spy.call_args.kwargs["structured_backends"] == {self.SQL}
 
-    async def test_a_sparql_answer_names_its_graph_source_and_carries_no_sql(self):
+    def _graph_answer_orchestrator(self):
         orch = _make_orchestrator(sources_registry=_backend_registry(self.GRAPH))
         orch._structured_query_tier.resolve = AsyncMock(
             return_value=StrategyResult(
@@ -1757,15 +1767,37 @@ class TestStructuredBackendRouting:
                 sparql="SELECT ?ticket WHERE { ?ticket ?p ?o } LIMIT 10",
             )
         )
-        response = await orch.resolve(
-            InvokeRequest(query="q", namespace="ns-graph", options={"includeDebugInfo": True})
-        )
+        return orch
+
+    async def test_a_sparql_answer_names_its_graph_source_and_carries_no_sql(self):
+        from coa_serve.schema_visibility import FULL_VISIBILITY, schema_visibility_scope
+
+        orch = self._graph_answer_orchestrator()
+        # The generated SPARQL is returned only to a caller holding viewOntology.
+        with schema_visibility_scope("ns-graph", FULL_VISIBILITY):
+            response = await orch.resolve(
+                InvokeRequest(query="q", namespace="ns-graph", options={"includeDebugInfo": True})
+            )
         result = response.result
         assert result.tier == 2
         assert result.query_used is None
         assert result.sparql_generated.startswith("SELECT ?ticket")
         assert result.data_sources == ["src-g1"]
         assert result.metadata["strategy"] == StrategyOption.NL_TO_SPARQL
+        assert result.result_rows == [{"ticket": "t1"}]
+
+    async def test_a_sparql_answer_withholds_the_sparql_from_a_schema_blind_caller(self):
+        from coa_serve.schema_visibility import NO_VISIBILITY, schema_visibility_scope
+
+        orch = self._graph_answer_orchestrator()
+        with schema_visibility_scope("ns-graph", NO_VISIBILITY):
+            response = await orch.resolve(
+                InvokeRequest(query="q", namespace="ns-graph", options={"includeDebugInfo": True})
+            )
+        result = response.result
+        assert result.tier == 2
+        assert result.query_used is None
+        assert result.sparql_generated is None
         assert result.result_rows == [{"ticket": "t1"}]
 
 
@@ -2220,10 +2252,12 @@ class TestRunTier3SeedsEntityUris:
 
 
 @pytest.mark.unit
-class TestResolveIncludeDebugInfo:
-    """`_resolve_include_debug_info` (#1166): artifacts returned ONLY when the
-    caller opted in (includeDebugInfo) AND holds viewNamespace — the same right
-    that gates the Sources/Tables schema view. Decoupled from the hidden default.
+class TestResolveIncludeArtifacts:
+    """Gating B (ADR: decompose-viewnamespace-schema-visibility): the SQL artifact
+    is returned only when the caller opted in (includeDebugInfo) AND holds
+    ``viewSource``; the SPARQL artifact only when opted in AND holds
+    ``viewOntology``. The two rights are independent — a schema-blind
+    ``data-analyst`` (denied both) gets neither, even with the flag set.
     """
 
     _NS = "ns-1166"
@@ -2236,43 +2270,67 @@ class TestResolveIncludeDebugInfo:
         orch._firewall = SQLFirewall(cedar_authorizer=RealCedarAuthorizer(fail_open_no_roles=fail_open_no_roles))
         return orch
 
-    def _profile(self, role_ns):
-        return {"userId": "u", "resourceRoles": [{"role": "data-analyst", "resourceUID": role_ns}]}
+    def _profile(self, role, role_ns=None):
+        """A profile holding ``role`` on ``role_ns`` (defaults to the test namespace)."""
+        return {"userId": "u", "resourceRoles": [{"role": role, "resourceUID": role_ns or self._NS}]}
 
+    # ── flag-off short circuits (both artifacts) ──────────────────────────
     def test_flag_off_short_circuits_to_false(self):
-        """No opt-in → False without even consulting Cedar (and so no leak)."""
+        """No opt-in → False for both artifacts without consulting Cedar."""
         orch = self._orch_with_real_cedar()
-        assert orch._resolve_include_debug_info({}, self._NS, self._profile(self._NS)) is False
-        assert orch._resolve_include_debug_info({"includeDebugInfo": False}, self._NS, self._profile(self._NS)) is False
+        owner = self._profile("namespace-owner")
+        assert orch._resolve_include_sql({}, self._NS, owner) is False
+        assert orch._resolve_include_sparql({}, self._NS, owner) is False
+        assert orch._resolve_include_sql({"includeDebugInfo": False}, self._NS, owner) is False
+        assert orch._resolve_include_sparql({"includeDebugInfo": False}, self._NS, owner) is False
 
-    def test_flag_on_and_can_view_returns_true(self):
-        """Opt-in + viewNamespace on this namespace → artifacts allowed."""
+    # ── a schema-visible role gets both artifacts ─────────────────────────
+    def test_schema_role_gets_both_artifacts(self):
+        """Opt-in + a role holding viewSource AND viewOntology → both allowed."""
         orch = self._orch_with_real_cedar()
-        assert orch._resolve_include_debug_info({"includeDebugInfo": True}, self._NS, self._profile(self._NS)) is True
+        opts = {"includeDebugInfo": True}
+        # namespace-owner is wildcard and holds every action incl. the two new ones.
+        owner = self._profile("namespace-owner")
+        assert orch._resolve_include_sql(opts, self._NS, owner) is True
+        assert orch._resolve_include_sparql(opts, self._NS, owner) is True
 
-    def test_flag_on_but_cannot_view_returns_false(self):
-        """NEGATIVE CONTROL: opt-in set but principal lacks viewNamespace on this
-        namespace → artifacts STRIPPED. This is the escalation the gate blocks."""
+    # ── the schema-blind analyst gets NEITHER (the core of the ADR) ───────
+    def test_schema_blind_analyst_gets_neither_artifact(self):
+        """NEGATIVE CONTROL: data-analyst holds query but NOT viewSource/viewOntology,
+        so both artifacts are stripped even with includeDebugInfo=true."""
         orch = self._orch_with_real_cedar()
-        assert (
-            orch._resolve_include_debug_info({"includeDebugInfo": True}, self._NS, self._profile("other-ns")) is False
-        )
+        opts = {"includeDebugInfo": True}
+        analyst = self._profile("data-analyst")
+        assert orch._resolve_include_sql(opts, self._NS, analyst) is False
+        assert orch._resolve_include_sparql(opts, self._NS, analyst) is False
 
-    def test_flag_on_no_roles_prod_returns_false(self):
-        """Opt-in + no resolved roles in prod → fail-closed, no artifacts."""
+    def test_wrong_namespace_returns_false(self):
+        """A role held on a DIFFERENT namespace grants neither artifact here."""
+        orch = self._orch_with_real_cedar()
+        opts = {"includeDebugInfo": True}
+        owner_elsewhere = self._profile("namespace-owner", role_ns="other-ns")
+        assert orch._resolve_include_sql(opts, self._NS, owner_elsewhere) is False
+        assert orch._resolve_include_sparql(opts, self._NS, owner_elsewhere) is False
+
+    def test_no_roles_prod_returns_false(self):
+        """Opt-in + no resolved roles in prod → fail-closed, neither artifact."""
         orch = self._orch_with_real_cedar(fail_open_no_roles=False)
-        assert orch._resolve_include_debug_info({"includeDebugInfo": True}, self._NS, {"userId": "u"}) is False
+        opts = {"includeDebugInfo": True}
+        assert orch._resolve_include_sql(opts, self._NS, {"userId": "u"}) is False
+        assert orch._resolve_include_sparql(opts, self._NS, {"userId": "u"}) is False
 
     def test_none_options_returns_false(self):
         orch = self._orch_with_real_cedar()
-        assert orch._resolve_include_debug_info(None, self._NS, self._profile(self._NS)) is False
+        owner = self._profile("namespace-owner")
+        assert orch._resolve_include_sql(None, self._NS, owner) is False
+        assert orch._resolve_include_sparql(None, self._NS, owner) is False
 
 
 @pytest.mark.unit
 class TestArtifactVisibilityEndToEnd:
     """End-to-end through ``resolve()`` (orchestrator → firewall → Cedar →
-    assembler → response): the role gate decides whether the assembled response
-    actually carries query_used / sparql_generated (#1166)."""
+    assembler → response): gating B decides whether the assembled response
+    actually carries query_used (viewSource) / sparql_generated (viewOntology)."""
 
     def _real_cedar_orch(self):
         from coa_serve.tier2.cedar_authorizer import RealCedarAuthorizer
@@ -2283,43 +2341,27 @@ class TestArtifactVisibilityEndToEnd:
         return orch
 
     @pytest.mark.asyncio
-    async def test_viewnamespace_holder_sees_artifacts(self):
-        """A data-analyst on the namespace (holds query AND viewNamespace) opting
-        in gets the SQL/SPARQL in the assembled response — gate must not
-        over-block a legitimate user who can already see the schema."""
+    async def test_schema_role_sees_both_artifacts(self):
+        """A namespace-owner (wildcard — holds viewSource AND viewOntology) opting
+        in gets the SQL/SPARQL in the assembled response — the gate must not
+        over-block a role that can already see the schema."""
         orch = self._real_cedar_orch()
         request = InvokeRequest(
             query="Show all claims",
             namespace="demo",
             options={"tierOverride": 2, "includeDebugInfo": True},
-            profile={"userId": "u", "resourceRoles": [{"role": "data-analyst", "resourceUID": "demo"}]},
+            profile={"userId": "u", "resourceRoles": [{"role": "namespace-owner", "resourceUID": "demo"}]},
         )
         response = await orch.resolve(request)
         assert response.result.query_used == "SELECT id FROM claims"
         assert response.result.sparql_generated == "SELECT ?x WHERE { ?x a :Claim }"
 
     @pytest.mark.asyncio
-    async def test_artifacts_stripped_when_viewnamespace_denied(self):
-        """NEGATIVE CONTROL end-to-end: a caller admitted to query but WITHOUT
-        viewNamespace (modeled via an authorizer whose two actions diverge) opts
-        in, yet the assembled response omits the artifacts. Proves the gate is
-        enforced at assembly, not merely at the flag."""
-
-        class _QueryButNoViewAuthorizer:
-            """Allows the query admission gate but denies viewNamespace — the
-            exact split the artifact gate must honor independently of query."""
-
-            def authorize(self, **kwargs):
-                from coa_serve.tier2.cedar_authorizer import CedarDecision
-
-                return CedarDecision(allowed=True)
-
-            def can_view_namespace(self, **kwargs):
-                return False
-
-        orch = _make_orchestrator(tier2_success=True, tier2_ontop_assembly=True)
-        assert isinstance(orch, Orchestrator)
-        orch._firewall = SQLFirewall(cedar_authorizer=_QueryButNoViewAuthorizer())
+    async def test_schema_blind_analyst_artifacts_stripped(self):
+        """NEGATIVE CONTROL end-to-end: a data-analyst admitted to query but
+        denied viewSource/viewOntology opts in, yet the assembled response omits
+        both artifacts. Proves gating B is enforced at assembly, not at the flag."""
+        orch = self._real_cedar_orch()
         request = InvokeRequest(
             query="Show all claims",
             namespace="demo",
@@ -2330,6 +2372,304 @@ class TestArtifactVisibilityEndToEnd:
         # Query succeeded (admitted) ...
         assert response.result.tier == 2
         assert response.result.result_rows == [{"id": "1"}]
-        # ... but artifacts are withheld because viewNamespace was denied.
+        # ... but both artifacts are withheld because viewSource/viewOntology are denied.
         assert response.result.query_used is None
         assert response.result.sparql_generated is None
+
+    @pytest.mark.asyncio
+    async def test_independent_rights_sql_only(self):
+        """Gating B is INDEPENDENT: a caller holding viewSource but NOT
+        viewOntology (modeled via a divergent authorizer) sees the SQL artifact
+        but not the SPARQL one — the two rights are not collapsed."""
+
+        class _SourceOnlyAuthorizer:
+            """Admits query + viewSource, denies viewOntology."""
+
+            def authorize(self, **kwargs):
+                from coa_serve.tier2.cedar_authorizer import CedarDecision
+
+                return CedarDecision(allowed=True)
+
+            def can_view_source(self, **kwargs):
+                return True
+
+            def can_view_ontology(self, **kwargs):
+                return False
+
+        orch = _make_orchestrator(tier2_success=True, tier2_ontop_assembly=True)
+        assert isinstance(orch, Orchestrator)
+        orch._firewall = SQLFirewall(cedar_authorizer=_SourceOnlyAuthorizer())
+        request = InvokeRequest(
+            query="Show all claims",
+            namespace="demo",
+            options={"tierOverride": 2, "includeDebugInfo": True},
+            profile={"userId": "u", "resourceRoles": [{"role": "custom", "resourceUID": "demo"}]},
+        )
+        response = await orch.resolve(request)
+        assert response.result.query_used == "SELECT id FROM claims"  # viewSource → SQL shown
+        assert response.result.sparql_generated is None  # viewOntology denied → SPARQL withheld
+
+    # ── Tier-1 metric + Deep Reasoning (Tier-3) paths are gated too ────────
+
+    @staticmethod
+    def _source_only_authorizer():
+        from coa_serve.tier2.cedar_authorizer import CedarDecision
+
+        class _SourceOnly:
+            def authorize(self, **kwargs):
+                return CedarDecision(allowed=True)
+
+            def can_view_source(self, **kwargs):
+                return True
+
+            def can_view_ontology(self, **kwargs):
+                return False
+
+        return _SourceOnly()
+
+    @staticmethod
+    def _dr_orch(firewall):
+        orch = _make_orchestrator()
+        orch._agentic_retriever = AsyncMock()
+        orch._agentic_retriever.resolve.return_value = Tier3Result(
+            synthesized_answer="Answer from executed queries.",
+            supporting_content=(),
+            graph_context=(),
+            confidence=0.7,
+            trace_steps=(),
+            query_used="SELECT revenue FROM t",
+            sparql_generated="SELECT ?r WHERE { ?x :revenue ?r }",
+        )
+        orch._firewall = firewall
+        return orch
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("role", "sees_sql"), [("namespace-owner", True), ("data-analyst", False)])
+    async def test_tier1_metric_sql_gated_on_view_source(self, role, sees_sql):
+        from coa_serve.tier2.cedar_authorizer import RealCedarAuthorizer
+
+        orch = _make_orchestrator(metric_found=True)
+        orch._firewall = SQLFirewall(cedar_authorizer=RealCedarAuthorizer(fail_open_no_roles=False))
+        response = await orch.resolve(
+            InvokeRequest(
+                query="What is revenue?",
+                namespace="demo",
+                options={"includeDebugInfo": True},
+                profile={"userId": "u", "resourceRoles": [{"role": role, "resourceUID": "demo"}]},
+            )
+        )
+        assert response.result.tier == 1
+        assert response.result.result_rows == [{"total": 42000}]  # query still answered
+        expected = "SELECT sum(amount) FROM orders" if sees_sql else None
+        assert response.result.query_used == expected
+
+    @pytest.mark.asyncio
+    async def test_deep_reasoning_schema_blind_analyst_gets_neither(self):
+        from coa_serve.tier2.cedar_authorizer import RealCedarAuthorizer
+
+        orch = self._dr_orch(SQLFirewall(cedar_authorizer=RealCedarAuthorizer(fail_open_no_roles=False)))
+        response = await orch.resolve(
+            InvokeRequest(
+                query="q",
+                namespace="demo",
+                options={"mode": "deep-reasoning", "includeDebugInfo": True},
+                profile={"userId": "u", "resourceRoles": [{"role": "data-analyst", "resourceUID": "demo"}]},
+            )
+        )
+        assert response.result.synthesized_answer == "Answer from executed queries."
+        assert response.result.query_used is None
+        assert response.result.sparql_generated is None
+
+    @pytest.mark.asyncio
+    async def test_deep_reasoning_rights_are_independent(self):
+        """viewSource without viewOntology → SQL only. Catches the two Tier-3
+        gates being swapped or collapsed (e.g. include_sparql=include_sql)."""
+        orch = self._dr_orch(SQLFirewall(cedar_authorizer=self._source_only_authorizer()))
+        response = await orch.resolve(
+            InvokeRequest(
+                query="q",
+                namespace="demo",
+                options={"mode": "deep-reasoning", "includeDebugInfo": True},
+                profile={"userId": "u", "resourceRoles": [{"role": "custom", "resourceUID": "demo"}]},
+            )
+        )
+        assert response.result.query_used == "SELECT revenue FROM t"
+        assert response.result.sparql_generated is None
+
+
+# ── Withheld identifiers are collected from the UNGATED artifacts ─────────
+
+_RAW_TABLE = "sales_db.claims_ledger"
+_RAW_IRI = "https://onto.example/kg/ClaimLedger"
+
+
+def _role_profile(role: str) -> dict:
+    return {"userId": "u", "resourceRoles": [{"role": role, "resourceUID": "demo"}]}
+
+
+@pytest.mark.unit
+class TestRawArtifactRedactionThroughRealPaths:
+    """Through the real orchestrator + assembler with ``includeDebugInfo`` UNSET.
+
+    The gated ``queryUsed`` / ``sparqlGenerated`` are blank for every caller here,
+    so the scrub can only redact the table / slash-IRI because the assembler kept
+    the ungated SQL/SPARQL privately. An owner (full visibility) is the positive
+    control: the same values reach them untouched.
+    """
+
+    @staticmethod
+    def _real_cedar(orch):
+        from coa_serve.tier2.cedar_authorizer import RealCedarAuthorizer
+
+        orch._firewall = SQLFirewall(cedar_authorizer=RealCedarAuthorizer(fail_open_no_roles=False))
+        return orch
+
+    def _tier2_orch(self, *, ontop: bool):
+        orch, parts = _make_orchestrator(tier2_success=True, tier2_ontop_assembly=ontop, return_parts=True)
+        parts["strategy_resolve"].return_value = StrategyResult(
+            sql=f"SELECT id, src FROM {_RAW_TABLE}",
+            rows=[{"id": "1", "src": _RAW_TABLE, "cls": _RAW_IRI}],
+            columns=["id", "src", "cls"],
+            confidence=0.8,
+            strategy_name=StrategyOption.ONTOP if ontop else StrategyOption.NL_TO_SQL,
+            trace_steps=[],
+            ontop_assembly=ontop,
+            sparql=f"SELECT ?x WHERE {{ ?x a <{_RAW_IRI}> }}" if ontop else "",
+            row_count=1,
+            truncated=False,
+            retrieved_tables=[],
+            expanded_tables=[],
+            ontology_version="",
+        )
+        return self._real_cedar(orch), {"tierOverride": 2}
+
+    def _tier1_orch(self):
+        orch = _make_orchestrator(metric_found=True)
+        orch._metric_resolver.match.return_value = MetricMatch(
+            found=True,
+            metric_name="revenue",
+            sql_template=f"SELECT sum(amount) AS total, max(src) AS src FROM {_RAW_TABLE}",
+            columns=["total", "src"],
+            data_source_id="ds-orders",
+        )
+        orch._query_executor.execute.return_value = QueryResult(
+            rows=[{"total": 42000, "src": _RAW_TABLE.upper()}], columns=["total", "src"], row_count=1, truncated=False
+        )
+        return self._real_cedar(orch), {}
+
+    def _deep_reasoning_orch(self):
+        orch = _make_orchestrator()
+        orch._agentic_retriever = AsyncMock()
+        orch._agentic_retriever.resolve.return_value = Tier3Result(
+            synthesized_answer=f"Revenue comes from {_RAW_TABLE} via {_RAW_IRI}.",
+            supporting_content=(),
+            graph_context=(),
+            confidence=0.7,
+            trace_steps=(),
+            query_used=f"SELECT revenue FROM {_RAW_TABLE}",
+            sparql_generated=f"SELECT ?r WHERE {{ ?x a <{_RAW_IRI}> }}",
+        )
+        return self._real_cedar(orch), {"mode": "deep-reasoning"}
+
+    def _build(self, path: str):
+        if path == "tier1":
+            return self._tier1_orch()
+        if path == "tier2-vkg":
+            return self._tier2_orch(ontop=True)
+        if path == "tier2-nl-to-sql":
+            return self._tier2_orch(ontop=False)
+        return self._deep_reasoning_orch()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", ["tier1", "tier2-vkg", "tier2-nl-to-sql", "deep-reasoning"])
+    @pytest.mark.parametrize(("role", "blind"), [("data-analyst", True), ("namespace-owner", False)])
+    async def test_table_and_slash_iri_redacted_for_blind_caller(self, path, role, blind):
+        import json
+
+        from coa_serve.schema_visibility import scrub_query_result
+
+        orch, options = self._build(path)
+        profile = _role_profile(role)
+        response = await orch.resolve(InvokeRequest(query="q", namespace="demo", options=options, profile=profile))
+        # includeDebugInfo unset: the gated artifacts are blank for every caller.
+        assert response.result.query_used is None and response.result.sparql_generated is None
+
+        vis = orch.schema_visibility("demo", profile)
+        assert vis.full is (not blind)
+        scrub_query_result(response.result, vis)
+        dumped = json.dumps(response.model_dump(by_alias=True, exclude_none=True, mode="json")).lower()
+
+        expected_present = not blind
+        assert (_RAW_TABLE in dumped) is expected_present
+        if path in ("tier2-vkg", "deep-reasoning"):  # the paths that generate SPARQL
+            assert (_RAW_IRI.lower() in dumped) is expected_present
+        # The answer/rows themselves are still delivered.
+        if path == "deep-reasoning":
+            assert response.result.synthesized_answer.startswith("Revenue comes from")
+        else:
+            assert response.result.result_rows
+
+
+@pytest.mark.unit
+class TestNlToSqlArtifactGate:
+    """The non-Ontop Tier-2 assembly (``assemble_nl_to_sql``) under gating B."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("role", "sees_sql"), [("namespace-owner", True), ("data-analyst", False)])
+    async def test_sql_gated_on_view_source(self, role, sees_sql):
+        from coa_serve.tier2.cedar_authorizer import RealCedarAuthorizer
+
+        orch = _make_orchestrator(tier2_success=True, tier2_ontop_assembly=False)
+        orch._firewall = SQLFirewall(cedar_authorizer=RealCedarAuthorizer(fail_open_no_roles=False))
+        response = await orch.resolve(
+            InvokeRequest(
+                query="Show all claims",
+                namespace="demo",
+                options={"tierOverride": 2, "includeDebugInfo": True},
+                profile=_role_profile(role),
+            )
+        )
+        assert response.result.tier == 2
+        assert response.result.result_rows == [{"id": "1"}]
+        assert response.result.query_used == ("SELECT id FROM claims" if sees_sql else None)
+        assert response.result.sparql_generated is None  # the NL->SQL path has no SPARQL
+
+
+@pytest.mark.unit
+class TestRequestVisibilityReused:
+    """The entrypoint's resolved visibility is reused: no second Cedar evaluation."""
+
+    class _ExplodingAuthorizer:
+        def authorize(self, **kwargs):
+            from coa_serve.tier2.cedar_authorizer import CedarDecision
+
+            return CedarDecision(allowed=True)
+
+        def can_view_source(self, **kwargs):
+            raise AssertionError("Cedar re-evaluated viewSource")
+
+        def can_view_ontology(self, **kwargs):
+            raise AssertionError("Cedar re-evaluated viewOntology")
+
+    def test_scope_decision_used_without_cedar(self):
+        from coa_serve.schema_visibility import FULL_VISIBILITY, NO_VISIBILITY, schema_visibility_scope
+
+        orch = _make_orchestrator()
+        orch._firewall = SQLFirewall(cedar_authorizer=self._ExplodingAuthorizer())
+        opts = {"includeDebugInfo": True}
+        with schema_visibility_scope("demo", FULL_VISIBILITY):
+            assert orch._resolve_include_sql(opts, "demo", {}) is True
+            assert orch._resolve_include_sparql(opts, "demo", {}) is True
+        with schema_visibility_scope("demo", NO_VISIBILITY):
+            assert orch._resolve_include_sql(opts, "demo", {}) is False
+            assert orch._resolve_include_sparql(opts, "demo", {}) is False
+
+    def test_other_namespace_falls_back_to_fail_closed_probe(self):
+        from coa_serve.schema_visibility import FULL_VISIBILITY, schema_visibility_scope
+
+        orch = _make_orchestrator()
+        orch._firewall = SQLFirewall(cedar_authorizer=self._ExplodingAuthorizer())
+        with schema_visibility_scope("other-ns", FULL_VISIBILITY):
+            # The probe raises → the firewall withholds; the other namespace's decision is not borrowed.
+            assert orch._resolve_include_sql({"includeDebugInfo": True}, "demo", {}) is False
+            assert orch._resolve_include_sparql({"includeDebugInfo": True}, "demo", {}) is False

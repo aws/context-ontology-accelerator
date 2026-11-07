@@ -136,9 +136,9 @@ class TestTBoxContextIsMappedFilter:
         await tbox_builder._fetch_by_entities("İstanbul कर्मचारी เครื่องปรับอากาศ", "ns-x")
 
         sparql = graph_client.query.call_args[0][0]
-        assert 'CONTAINS(LCASE(?label), "i̇stanbul")' in sparql
-        assert 'CONTAINS(LCASE(?label), "कर्मचारी")' in sparql
-        assert 'CONTAINS(LCASE(?label), "เครื่องปรับอากาศ")' in sparql
+        assert 'CONTAINS(LCASE(?searchLabel), "i̇stanbul")' in sparql
+        assert 'CONTAINS(LCASE(?searchLabel), "कर्मचारी")' in sparql
+        assert 'CONTAINS(LCASE(?searchLabel), "เครื่องปรับอากาศ")' in sparql
         assert f"<{_IS_MAPPED_IRI}> true" in sparql
 
     async def test_fetch_by_entities_uses_bounded_reverse_containment_for_no_space_scripts(
@@ -147,9 +147,9 @@ class TestTBoxContextIsMappedFilter:
         await tbox_builder._fetch_by_entities("请告诉我这台空调设备的制造商和型号", "ns-x")
 
         sparql = graph_client.query.call_args[0][0]
-        assert 'CONTAINS("请告诉我这台空调设备的制造商和型号", LCASE(STR(?label)))' in sparql
-        assert "STRLEN(STR(?label)) >= 2" in sparql
-        assert 'CONTAINS(LCASE(?label), "请告")' not in sparql
+        assert 'CONTAINS("请告诉我这台空调设备的制造商和型号", LCASE(STR(?searchLabel)))' in sparql
+        assert "STRLEN(STR(?searchLabel)) >= 2" in sparql
+        assert 'CONTAINS(LCASE(?searchLabel), "请告")' not in sparql
 
     async def test_fetch_by_entities_keeps_japanese_suffix_concepts(self, tbox_builder, graph_client):
         await tbox_builder._fetch_by_entities(
@@ -158,9 +158,9 @@ class TestTBoxContextIsMappedFilter:
         )
 
         sparql = graph_client.query.call_args[0][0]
-        assert 'CONTAINS(LCASE(?label), "エレベーター")' in sparql
-        assert 'CONTAINS(LCASE(?label), "メーカー")' in sparql
-        assert 'CONTAINS(LCASE(?label), "型番")' in sparql
+        assert 'CONTAINS(LCASE(?searchLabel), "エレベーター")' in sparql
+        assert 'CONTAINS(LCASE(?searchLabel), "メーカー")' in sparql
+        assert 'CONTAINS(LCASE(?searchLabel), "型番")' in sparql
 
     async def test_fetch_by_entities_skips_the_query_when_no_candidate_survives(self, tbox_builder, graph_client):
         classes, properties = await tbox_builder._fetch_by_entities("of the", "ns-x")

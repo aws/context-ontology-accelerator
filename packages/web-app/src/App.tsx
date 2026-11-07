@@ -53,6 +53,7 @@ import {
   useToolsPanel,
 } from "@components/ToolsPanelProvider";
 import type { DrawerDefinition } from "@components/ToolsPanelProvider";
+import { SchemaAccessGate } from "@components/SchemaAccessGate";
 import {
   BreadcrumbProvider,
   useBreadcrumbs,
@@ -581,7 +582,11 @@ function AppShell() {
               />
               <Route
                 path="/namespaces/:namespaceId/sources"
-                element={<SourceList />}
+                element={
+                  <SchemaAccessGate kind="source">
+                    <SourceList />
+                  </SchemaAccessGate>
+                }
               />
               <Route
                 path="/namespaces/:namespaceId/sources/connect"
@@ -589,31 +594,59 @@ function AppShell() {
               />
               <Route
                 path="/namespaces/:namespaceId/sources/:sourceId"
-                element={<SourceDetail />}
+                element={
+                  <SchemaAccessGate kind="source">
+                    <SourceDetail />
+                  </SchemaAccessGate>
+                }
               />
               <Route
                 path="/namespaces/:namespaceId/sources/:dataSourceId/tables/:tableId"
-                element={<TableDetail />}
+                element={
+                  <SchemaAccessGate kind="source">
+                    <TableDetail />
+                  </SchemaAccessGate>
+                }
               />
               <Route
                 path="/namespaces/:namespaceId/ontology"
-                element={<OntologyPage />}
+                element={
+                  <SchemaAccessGate kind="ontology">
+                    <OntologyPage />
+                  </SchemaAccessGate>
+                }
               />
               <Route
                 path="/namespaces/:namespaceId/ontology/proposals/:proposalId"
-                element={<ProposalDetailPage />}
+                element={
+                  <SchemaAccessGate kind="ontology">
+                    <ProposalDetailPage />
+                  </SchemaAccessGate>
+                }
               />
               <Route
                 path="/namespaces/:namespaceId/ontology/graph"
-                element={<GraphSearchPage />}
+                element={
+                  <SchemaAccessGate kind="ontology">
+                    <GraphSearchPage />
+                  </SchemaAccessGate>
+                }
               />
               <Route
                 path="/namespaces/:namespaceId/ontology/induced"
-                element={<InducedOntologyDetailPage />}
+                element={
+                  <SchemaAccessGate kind="ontology">
+                    <InducedOntologyDetailPage />
+                  </SchemaAccessGate>
+                }
               />
               <Route
                 path="/namespaces/:namespaceId/ontology/induced/class"
-                element={<OntologyClassDetailPage />}
+                element={
+                  <SchemaAccessGate kind="ontology">
+                    <OntologyClassDetailPage />
+                  </SchemaAccessGate>
+                }
               />
               <Route
                 path="/namespaces/:namespaceId/metrics"

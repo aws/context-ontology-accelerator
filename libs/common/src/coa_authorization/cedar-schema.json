@@ -76,6 +76,18 @@
           "resourceTypes": ["Namespace", "Source", "Metric", "Ontology", "OntologyProposal"]
         }
       },
+      "viewSource": {
+        "appliesTo": {
+          "principalTypes": ["User"],
+          "resourceTypes": ["Namespace", "Source", "Metric"]
+        }
+      },
+      "viewOntology": {
+        "appliesTo": {
+          "principalTypes": ["User"],
+          "resourceTypes": ["Namespace", "Ontology", "OntologyProposal"]
+        }
+      },
       "manageNamespace": {
         "appliesTo": {
           "principalTypes": ["User"],

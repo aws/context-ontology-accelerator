@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 from .model_validation import validate_model_id as _validate_model_id
 from .models import InvokeRequest, InvokeResponse
 from .response_assembler import ResponseAssembler
+from .schema_visibility import SchemaVisibility, request_schema_visibility, resolve_schema_visibility
 from .step_ids import StepId
 from .tier1.metric_resolver import DeclinedMetricContext, MetricMatch, MetricResolver
 from .tier2.skip import Tier2SkipDecision
@@ -394,23 +395,45 @@ class Orchestrator:
         """
         return self._firewall.authorize_namespace(namespace, profile)
 
-    def _resolve_include_debug_info(self, options: dict | None, namespace: str, profile: dict | None) -> bool:
-        """Effective includeDebugInfo = caller opt-in AND viewNamespace right (#1166).
+    @staticmethod
+    def _debug_info_requested(options: dict | None) -> bool:
+        """Whether the caller opted in to schema artifacts (``includeDebugInfo=true``)."""
+        return (options or {}).get("includeDebugInfo", False) is True
 
-        The SQL/SPARQL artifacts are returned only when the caller BOTH asked for
-        them (``includeDebugInfo=true``) AND holds ``viewNamespace`` on the
-        namespace — the SAME Cedar right that gates reading a source's
-        table/column schema in the Sources/Tables view. A caller who can already
-        see the schema gains no new disclosure from the query that touches it; a
-        caller who cannot is denied the artifacts even when they pass the flag.
-        Fails CLOSED (the firewall returns False on evaluator error), so a policy
-        failure withholds artifacts rather than leaking them. Decoupling the
-        default (hidden) from this gate keeps the AppSec default-withhold posture.
+    # ADR gating B: each schema artifact is returned only when the caller BOTH
+    # opted in (``includeDebugInfo=true``) AND holds the right for the schema the
+    # artifact discloses — the SQL (``query_used``, table/column names) needs
+    # ``viewSource``; the SPARQL (``sparql_generated``, ontology classes and
+    # properties) needs ``viewOntology``. A schema-blind role (``data-analyst``)
+    # holds neither, so it never receives either artifact, even with the flag.
+    # Both fail CLOSED: the firewall returns False on evaluator error.
+
+    def schema_visibility(self, namespace: str, profile: dict | None) -> SchemaVisibility:
+        """The caller's schema rights (``viewSource`` / ``viewOntology``), fail-closed.
+
+        Used by the serve entrypoint to scrub every response that can carry
+        schema (see :mod:`coa_serve.schema_visibility`).
         """
-        requested = (options or {}).get("includeDebugInfo", False) is True
-        if not requested:
+        return resolve_schema_visibility(self._firewall, namespace, profile or {})
+
+    def _resolve_include_sql(self, options: dict | None, namespace: str, profile: dict | None) -> bool:
+        """Whether the generated SQL artifact may be returned (opt-in AND ``viewSource``).
+
+        Reuses the visibility the serve entrypoint already resolved for this
+        request (no second Cedar evaluation on the event loop); without one it
+        asks the firewall, which fails closed.
+        """
+        if not self._debug_info_requested(options):
             return False
-        return self._firewall.can_view_namespace(namespace, profile)
+        vis = request_schema_visibility(namespace)
+        return vis.source if vis is not None else self._firewall.can_view_source(namespace, profile)
+
+    def _resolve_include_sparql(self, options: dict | None, namespace: str, profile: dict | None) -> bool:
+        """Whether the generated SPARQL artifact may be returned (opt-in AND ``viewOntology``)."""
+        if not self._debug_info_requested(options):
+            return False
+        vis = request_schema_visibility(namespace)
+        return vis.ontology if vis is not None else self._firewall.can_view_ontology(namespace, profile)
 
     # ── Tier run/skip decisions ──────────────────────────────────────
     # Each tier's guard is a named predicate so resolve() reads as a plain
@@ -823,7 +846,8 @@ class Orchestrator:
             namespace,
             profile,
             model_id=model_id,
-            include_debug_info=self._resolve_include_debug_info(options, namespace, profile),
+            include_sql=self._resolve_include_sql(options, namespace, profile),
+            include_sparql=self._resolve_include_sparql(options, namespace, profile),
         )
         return response, result.sparql or None
 
@@ -834,7 +858,8 @@ class Orchestrator:
         namespace: str,
         profile: dict,
         model_id: str | None = None,
-        include_debug_info: bool = False,
+        include_sql: bool = False,
+        include_sparql: bool = False,
     ) -> InvokeResponse:
         """Convert a StrategyResult into the appropriate InvokeResponse."""
         # A native SPARQL answer is shaped like an Ontop one (SPARQL, no SQL leg), but
@@ -861,7 +886,8 @@ class Orchestrator:
                     truncated=result.truncated,
                     strategy=result.strategy_name,
                     model_id=model_id,
-                    include_debug_info=include_debug_info,
+                    include_sql=include_sql,
+                    include_sparql=include_sparql,
                 )
             )
         else:
@@ -881,7 +907,7 @@ class Orchestrator:
                     principal=display_principal(profile),
                     strategy=result.strategy_name,
                     model_id=model_id,
-                    include_debug_info=include_debug_info,
+                    include_sql=include_sql,
                 )
             )
 
@@ -1202,7 +1228,7 @@ class Orchestrator:
                     match_confidence=metric_match.match_confidence,
                     match_source=metric_match.match_source,
                     model_id=model_id,
-                    include_debug_info=self._resolve_include_debug_info(options, namespace, profile),
+                    include_sql=self._resolve_include_sql(options, namespace, profile),
                 )
             ), None
 
@@ -1311,6 +1337,18 @@ class Orchestrator:
         # value (absent, None, True) keeps the chunks — the Smithy/REST default.
         include_supporting = (options or {}).get("includeSupporting") is not False
 
+        # A caller whose grant declares allowedMetrics sees only the metrics it permits in the catalog, and no
+        # governed metric through graph traversal; any other caller's call is exactly as before.
+        allowed_metrics = (profile or {}).get("allowedMetrics")
+        hidden: dict[str, bool] = {}
+        if allowed_metrics is not None:
+            hidden = {"hide_governed": True}
+            metric_definitions = [
+                m
+                for m in metric_definitions or []
+                if m.get("metric_id") in allowed_metrics or m.get("name") in allowed_metrics
+            ] or None
+
         # Deep-reasoning Tier-3 path (opt-in). Engaged per-request via
         # options.mode=="deep-reasoning" or as the deployment default. Returns the
         # same Tier3Result contract, so the assembler tail below is shared. When
@@ -1357,10 +1395,12 @@ class Orchestrator:
                 # as Standard mode's "Tier 3 — Knowledge Retrieval" (#1166).
                 execution_mode=Mode.DEEP_REASONING.value,
                 # Return the SQL/SPARQL the agentic loop ran, same as Standard mode
-                # does — gated by the same includeDebugInfo opt-in (#1166).
+                # does — gated by includeDebugInfo opt-in AND viewSource (SQL) /
+                # viewOntology (SPARQL); see _resolve_include_sql/_resolve_include_sparql.
                 query_used=tier3_result.query_used,
                 sparql_generated=tier3_result.sparql_generated,
-                include_debug_info=self._resolve_include_debug_info(options, namespace, profile),
+                include_sql=self._resolve_include_sql(options, namespace, profile),
+                include_sparql=self._resolve_include_sparql(options, namespace, profile),
             )
             # Also keep the free-form metadata["mode"] stamp for request logs / eval
             # attribution (unchanged observability contract); execution_mode above is
@@ -1408,6 +1448,7 @@ class Orchestrator:
             trace=trace,
             retriever_strategy=retriever_strategy,
             model_id=model_id,
+            **hidden,
         )
         # Trace steps are recorded progressively inside knowledge_retriever.resolve()
         # via the trace collector callback. toolUsed annotation lives
@@ -1425,6 +1466,9 @@ class Orchestrator:
             degraded_sources=tier3_result.degraded_sources or None,
             model_id=model_id,
         )
+        # The Tier-2 SPARQL handed to synthesis as a hint can surface in the
+        # answer; record it so a caller without viewOntology gets its IRIs redacted.
+        result.with_raw_artifacts(query_used=None, sparql=tier2_sparql)
 
         # Surface the resolved strategy in response metadata so request logs and
         # eval runs attribute results to the strategy that produced them (2.18).
