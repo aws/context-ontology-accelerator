@@ -10,6 +10,8 @@ import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "lambda" / "vkg-reload"))
 
 ENV = {
@@ -1125,7 +1127,12 @@ class TestSweep:
 
     @patch.dict(
         os.environ,
-        {**ENV, "VKG_TASK_CPU": "2048", "VKG_TASK_MEMORY": "4096", "VKG_ONTOP_JAVA_ARGS": "-Xmx3072m -Xms1024m"},
+        {
+            **ENV,
+            "VKG_TASK_CPU": "2048",
+            "VKG_TASK_MEMORY": "4096",
+            "VKG_ONTOP_JAVA_ARGS": "-Xmx3072m -Xms1024m",
+        },
     )
     @patch("index.ecs")
     @patch("index.sd")
@@ -1163,9 +1170,59 @@ class TestSweep:
         assert td_kwargs["cpu"] == "2048"
         assert td_kwargs["memory"] == "4096"
         env = {e["name"]: e["value"] for e in td_kwargs["containerDefinitions"][0]["environment"]}
-        assert env["ONTOP_JAVA_ARGS"] == "-Xmx3072m -Xms1024m"
+        # The Lambda enforces the loopback bind itself, even when the env value lacks it.
+        assert env["ONTOP_JAVA_ARGS"] == "-Xmx3072m -Xms1024m -Dserver.address=127.0.0.1"
         # The dead variable must NOT be emitted — that was the #149 cause C no-op.
         assert "JAVA_OPTS" not in env
+
+    @pytest.mark.parametrize(
+        ("java_args", "expected"),
+        [
+            # A whitespace-only value counts as unset: the heap is derived (default 2048 MiB task).
+            ("   ", "-Xmx1536m -Xms512m -Dserver.address=127.0.0.1"),
+            # The stack's value already ends with the flag: no duplicate.
+            ("-Xmx3072m -Xms1024m -Dserver.address=127.0.0.1", "-Xmx3072m -Xms1024m -Dserver.address=127.0.0.1"),
+            # The flag set earlier, then overridden: the guard looks at the last arg, so it appends again.
+            # A "contains the flag" guard would leave 0.0.0.0 as the effective bind.
+            (
+                "-Dserver.address=127.0.0.1 -Dserver.address=0.0.0.0",
+                "-Dserver.address=127.0.0.1 -Dserver.address=0.0.0.0 -Dserver.address=127.0.0.1",
+            ),
+            # A conflicting address is superseded: Java keeps the last -D for a property.
+            (
+                "-Xmx3072m -Dserver.address=0.0.0.0",
+                "-Xmx3072m -Dserver.address=0.0.0.0 -Dserver.address=127.0.0.1",
+            ),
+        ],
+    )
+    @patch("index.ecs")
+    @patch("index.sd")
+    @patch("index.ssm")
+    def test_loopback_bind_enforced_on_any_java_args(self, mock_ssm, mock_sd, mock_ecs, java_args, expected):
+        mock_ssm.get_parameter.return_value = {
+            "Parameter": {"Value": "111.dkr.ecr.us-west-2.amazonaws.com/scl:vkg-NEW"}
+        }
+        mock_ecs.describe_services.return_value = {"services": [{"taskDefinition": "arn:td:old"}]}
+        mock_ecs.describe_task_definition.return_value = {
+            "taskDefinition": {"containerDefinitions": [{"image": "111.dkr.ecr.us-west-2.amazonaws.com/scl:vkg-OLD"}]}
+        }
+        mock_ecs.register_task_definition.return_value = {"taskDefinition": {"taskDefinitionArn": "arn:td:ns-rev2"}}
+        mock_ecs.update_service.return_value = {"service": {"deployments": [{"id": "deploy-1"}]}}
+
+        import importlib
+
+        import index
+
+        with patch.dict(os.environ, {**ENV, "VKG_ONTOP_JAVA_ARGS": java_args}):
+            importlib.reload(index)
+            index.ecs = mock_ecs
+            index.sd = mock_sd
+            index.ssm = mock_ssm
+            result = index.handler(_make_event(), None)
+        assert result["status"] == "reload_triggered"
+        td_kwargs = mock_ecs.register_task_definition.call_args.kwargs
+        env = {e["name"]: e["value"] for e in td_kwargs["containerDefinitions"][0]["environment"]}
+        assert env["ONTOP_JAVA_ARGS"] == expected
 
     @patch.dict(os.environ, ENV)
     @patch("index.ecs")
@@ -1202,7 +1259,7 @@ class TestSweep:
         assert td_kwargs["cpu"] == "1024"
         assert td_kwargs["memory"] == "2048"
         env = {e["name"]: e["value"] for e in td_kwargs["containerDefinitions"][0]["environment"]}
-        assert env["ONTOP_JAVA_ARGS"] == "-Xmx1536m -Xms512m"
+        assert env["ONTOP_JAVA_ARGS"] == "-Xmx1536m -Xms512m -Dserver.address=127.0.0.1"
 
     @patch.dict(os.environ, {**ENV, "VKG_TASK_MEMORY": "8192"}, clear=False)
     @patch("index.ecs")
@@ -1240,7 +1297,7 @@ class TestSweep:
         assert td_kwargs["memory"] == "8192"
         env = {e["name"]: e["value"] for e in td_kwargs["containerDefinitions"][0]["environment"]}
         # 8192 * 3//4 = 6144, 8192 // 4 = 2048
-        assert env["ONTOP_JAVA_ARGS"] == "-Xmx6144m -Xms2048m"
+        assert env["ONTOP_JAVA_ARGS"] == "-Xmx6144m -Xms2048m -Dserver.address=127.0.0.1"
 
     @patch.dict(os.environ, ENV)
     @patch("index.ecs")

@@ -29,11 +29,15 @@
     <surefire.version>3.2.5</surefire.version>
     <shade.version>3.5.1</shade.version>
     <enforcer.version>3.5.0</enforcer.version>
-    <!-- The federation SDK's own Jackson, and above the CVE floor (2.18.9). The BOM below
-         applies it to every Jackson module, the SDK's transitives included, so it has to
-         move with athena.federation.sdk.version: a lower value downgrades the Jackson the
+    <!-- At or above the federation SDK's own Jackson, and at the CVE floor (2.22.4). The BOM
+         below applies it to every Jackson module, the SDK's transitives included, so it has
+         to move with athena.federation.sdk.version: a lower value downgrades the Jackson the
          SDK was compiled against, which compiles and then fails at run time. -->
-    <jackson.version>2.22.3</jackson.version>
+    <jackson.version>2.22.4</jackson.version>
+    <!-- Transitive only: via the federation SDK (33.6.0-jre, still so in 2026.43.1) and its
+         substrait and calcite dependencies. Pinned to the CVE floor because no SDK release
+         carries it yet. -->
+    <guava.version>33.7.2-jre</guava.version>
   </properties>
 
   <!-- Versions live here so a connector's pom names dependencies without pinning them,
@@ -47,6 +51,11 @@
         <version>${jackson.version}</version>
         <type>pom</type>
         <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>com.google.guava</groupId>
+        <artifactId>guava</artifactId>
+        <version>${guava.version}</version>
       </dependency>
       <dependency>
         <groupId>dev.coa</groupId>
@@ -151,6 +160,25 @@
                   <version>[17,25)</version>
                   <message>JDK 17-24 required (21 recommended): the Athena Federation SDK fails on JDK 25+. Point JAVA_HOME at JDK 21, e.g. on macOS: export JAVA_HOME=$(/usr/libexec/java_home -v 21)</message>
                 </requireJavaVersion>
+              </rules>
+            </configuration>
+          </execution>
+          <!-- Fails the build when any module resolves, directly or transitively, a version
+               below its security-advisory floor. The floors are raised in dependencyManagement
+               above; this keeps an SDK bump or a new connector from silently undoing them. -->
+          <execution>
+            <id>enforce-advisory-floors</id>
+            <goals><goal>enforce</goal></goals>
+            <configuration>
+              <rules>
+                <bannedDependencies>
+                  <excludes>
+                    <exclude>com.fasterxml.jackson.core:jackson-databind:[,2.22.4)</exclude>
+                    <!-- -android sorts below -jre, so this bound admits both 33.7.2 flavours. -->
+                    <exclude>com.google.guava:guava:[,33.7.2-android)</exclude>
+                  </excludes>
+                  <message>A dependency is below its security-advisory floor (jackson-databind 2.22.4, guava 33.7.2). Raise it in connectors/pom.xml dependencyManagement.</message>
+                </bannedDependencies>
               </rules>
             </configuration>
           </execution>

@@ -41,12 +41,13 @@ import {
   VkgHealthStatus,
 } from "@coa/control-plane-client";
 import { useApiClient } from "@components/ApiClientProvider";
-import { localizeNamespaceLanguage } from "@utils";
+import { isForbiddenError, localizeNamespaceLanguage } from "@utils";
 import {
   localizeNamespaceStatus,
   localizeVkgHealth,
 } from "@utils/namespace-status";
 import { localizeOntologyType } from "@utils/ontology-display";
+import { NoSchemaAccess } from "@components/SchemaAccessGate";
 import { listOntologies } from "../services/ontology-engine";
 import type { OntologyRecord } from "../services/ontology-engine";
 import { useAppI18n } from "../i18n/LocaleProvider";
@@ -369,7 +370,9 @@ const SourcesTab: React.FC<{ namespaceId: string }> = ({ namespaceId }) => {
         </Header>
       }
       empty={
-        error ? (
+        isForbiddenError(error) ? (
+          <NoSchemaAccess kind="source" />
+        ) : error ? (
           <StatusIndicator type="error">
             {t("Failed to load sources: {message}", {
               message: error.message,
@@ -394,16 +397,22 @@ const OntologiesTab: React.FC<{ namespaceId: string }> = ({ namespaceId }) => {
   const [items, setItems] = useState<OntologyRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [forbidden, setForbidden] = useState(false);
 
   const fetchOntologies = React.useCallback(() => {
     if (!namespaceId) return;
     setLoading(true);
     setError(null);
+    setForbidden(false);
     listOntologies(apiClient, namespaceId)
       .then((res) => {
         setItems(res);
       })
       .catch((e: unknown) => {
+        if (isForbiddenError(e)) {
+          setForbidden(true);
+          return;
+        }
         setError(
           e instanceof Error ? e.message : t("Failed to load ontologies"),
         );
@@ -478,7 +487,9 @@ const OntologiesTab: React.FC<{ namespaceId: string }> = ({ namespaceId }) => {
         </Header>
       }
       empty={
-        error ? (
+        forbidden ? (
+          <NoSchemaAccess kind="ontology" />
+        ) : error ? (
           <StatusIndicator type="error">
             {t("Failed to load ontologies: {message}", { message: error })}
           </StatusIndicator>

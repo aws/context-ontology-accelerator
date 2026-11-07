@@ -36,6 +36,9 @@ _DIGEST_SUFFIX = re.compile(r"@(?P<digest>sha256:[0-9a-f]{64})$")
 # Reload-outcome metrics; the vkg stack alarms on ReloadFailed.
 _METRIC_NAMESPACE = "COA/VKG"
 
+# Binds Ontop's endpoint to loopback; translate-server is its only caller.
+_ONTOP_LOOPBACK_ARG = "-Dserver.address=127.0.0.1"
+
 # Circuit breaker + rollback: paired with the container's functional /health
 # probe, a broken reload never goes healthy and rolls back to the last-good task.
 _DEPLOY_CONFIG = {
@@ -451,7 +454,7 @@ def _register_task_definition(ns, prefix, container_image):
     # explicitly, derive the heap from task memory (max heap ~= 75% of task
     # memory, initial heap ~= 25%) so bumping VKG_TASK_MEMORY alone scales the
     # heap in step rather than leaving a stale hardcoded -Xmx.
-    ontop_java_args = os.environ.get("VKG_ONTOP_JAVA_ARGS", "")
+    ontop_java_args = os.environ.get("VKG_ONTOP_JAVA_ARGS", "").strip()
     if not ontop_java_args:
         try:
             mem_mib = int(task_memory)
@@ -460,6 +463,11 @@ def _register_task_definition(ns, prefix, container_image):
         xmx = max(512, mem_mib * 3 // 4)
         xms = max(256, mem_mib // 4)
         ontop_java_args = f"-Xmx{xmx}m -Xms{xms}m"
+    # Bind Ontop to loopback whatever the env says (VkgStack already appends it):
+    # only translate-server calls Ontop. Appended last, it supersedes any other
+    # -Dserver.address, since Java keeps the last -D for a property.
+    if ontop_java_args.split()[-1:] != [_ONTOP_LOOPBACK_ARG]:
+        ontop_java_args = f"{ontop_java_args} {_ONTOP_LOOPBACK_ARG}"
 
     family = f"{prefix}-vkg-{ns}" if prefix else f"vkg-{ns}"
     td_resp = ecs.register_task_definition(

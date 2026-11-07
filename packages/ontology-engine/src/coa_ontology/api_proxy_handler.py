@@ -253,6 +253,26 @@ def _handle_system_health() -> dict:
     }
 
 
+_ONTOLOGIES = "/namespaces/{namespaceId}/ontologies"
+
+
+def _unnamed_ontology_delete(event: dict) -> dict | None:
+    """Refuse a public ontology DELETE that names no ontology (400), before anything is forwarded.
+
+    The engine's ``DELETE /ontologies/`` deletes the one ontology ``ontology_id`` names and, without it, wipes the
+    whole namespace: every named graph, the AOSS index and every DynamoDB record. That wipe belongs to the namespace
+    deletion pipeline, which calls the engine directly. The forward drops an empty value, so a missing or empty
+    ``ontology_id`` would reach it, as would the camelCase spelling (refused rather than mapped). A blank one is
+    refused too: the API model requires a non-empty ``ontology_id``.
+    """
+    if event.get("resource") != _ONTOLOGIES or event.get("httpMethod") != "DELETE":
+        return None
+    query = event.get("queryStringParameters") or {}
+    if "ontologyId" in query or not str(query.get("ontology_id") or "").strip():
+        return _error(400, "ontology_id is required: name the ontology to delete")
+    return None
+
+
 def handler(event: dict, context) -> dict:
     """Forward an API Gateway proxy event to the ontology-engine ECS service.
 
@@ -286,6 +306,10 @@ def handler(event: dict, context) -> dict:
             validate_namespace_id((event.get("pathParameters") or {}).get("namespaceId") or "")
         except ValueError as exc:
             return _error(400, str(exc))
+
+    refusal = _unnamed_ontology_delete(event)
+    if refusal is not None:
+        return refusal
 
     operation = _IDEMPOTENT_POSTS.get(resource)
     if operation and event.get("httpMethod") == "POST":

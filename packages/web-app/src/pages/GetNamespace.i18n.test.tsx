@@ -8,6 +8,7 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { LocaleProvider } from "../i18n/LocaleProvider";
+import { listOntologies } from "../services/ontology-engine";
 import { GetNamespace } from "./GetNamespace";
 
 // The namespace detail summary and the ontologies tab show API values
@@ -68,8 +69,15 @@ vi.mock("../api-hooks/use-metrics", () => ({
   }),
 }));
 
+// One client for every render, as the real provider's memoized context gives.
+// A fresh object per call changes OntologiesTab's fetch callback on every
+// render, so the tab refetches and flips back to loading in a loop.
+const { apiClient } = vi.hoisted(() => ({
+  apiClient: { get: vi.fn().mockResolvedValue([]) },
+}));
+
 vi.mock("../components/ApiClientProvider", () => ({
-  useApiClient: () => ({ get: vi.fn().mockResolvedValue([]) }),
+  useApiClient: () => apiClient,
 }));
 
 vi.mock("../services/ontology-engine", () => ({
@@ -120,6 +128,7 @@ function renderIn(locale: "en" | "ja") {
 
 describe("GetNamespace — localized API values", () => {
   afterEach(() => {
+    vi.mocked(listOntologies).mockClear();
     window.localStorage.clear();
     document.documentElement.lang = "";
   });
@@ -136,6 +145,7 @@ describe("GetNamespace — localized API values", () => {
       expect(screen.getByText("アップロード済み")).toBeInTheDocument(),
     );
     expect(screen.queryByText("user_created")).not.toBeInTheDocument();
+    expect(listOntologies).toHaveBeenCalledTimes(1);
   });
 
   it("shows the same values as words in English", async () => {
@@ -146,5 +156,6 @@ describe("GetNamespace — localized API values", () => {
     await waitFor(() =>
       expect(screen.getByText("Uploaded")).toBeInTheDocument(),
     );
+    expect(listOntologies).toHaveBeenCalledTimes(1);
   });
 });

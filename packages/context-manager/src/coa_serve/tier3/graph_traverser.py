@@ -13,8 +13,10 @@ from __future__ import annotations
 import asyncio
 import re
 from dataclasses import dataclass, field
+from urllib.parse import quote
 
 import structlog
+from coa_common.constants import GOVERNED_METRICS_ONTOLOGY_ID
 
 from ..clients.base import GraphClient
 from ..namespace_language import current_label_preference, row_label
@@ -29,6 +31,9 @@ from ..query_utils import (
     normalize_label_match_text,
     validate_namespace,
 )
+
+_GOVERNED_GRAPH_SEGMENT = quote(GOVERNED_METRICS_ONTOLOGY_ID, safe="")
+"""The last segment of a namespace's governed-metrics graph URI (``{prefix}{namespace}/{segment}``)."""
 
 logger = structlog.get_logger(__name__)
 
@@ -163,8 +168,13 @@ class GraphTraverser:
         self._graph = graph_client
         self._graph_uri_template = get_graph_uri_template(graph_uri_template)
 
-    async def traverse(self, query: str, namespace: str, entities: list[str] | None = None) -> list[GraphEntity]:
-        """Keyword-based traversal: finds entities whose labels match extracted query terms."""
+    async def traverse(
+        self, query: str, namespace: str, entities: list[str] | None = None, *, hide_governed: bool = False
+    ) -> list[GraphEntity]:
+        """Keyword-based traversal: finds entities whose labels match extracted query terms.
+
+        ``hide_governed`` leaves the governed-metrics graph out, for a caller whose grant declares ``allowedMetrics``.
+        """
         validate_namespace(namespace)
 
         if not self._graph_uri_template:
@@ -187,7 +197,7 @@ class GraphTraverser:
             )
             return []
 
-        sparql = self._build_label_query(namespace, safe_entities, safe_containers)
+        sparql = self._build_label_query(namespace, safe_entities, safe_containers, hide_governed=hide_governed)
         results = await asyncio.wait_for(self._graph.query(sparql), timeout=_GRAPH_QUERY_TIMEOUT_S)
         parsed = self._parse_results(results)
         if len(results) >= _MAX_TRAVERSAL_RESULTS:
@@ -203,8 +213,13 @@ class GraphTraverser:
             )
         return parsed
 
-    async def traverse_from_uris(self, uris: list[str], namespace: str, max_hops: int = 2) -> list[GraphEntity]:
-        """URI-based hop traversal: 1-2 hops outward from known entity URIs."""
+    async def traverse_from_uris(
+        self, uris: list[str], namespace: str, max_hops: int = 2, *, hide_governed: bool = False
+    ) -> list[GraphEntity]:
+        """URI-based hop traversal: 1-2 hops outward from known entity URIs.
+
+        ``hide_governed`` leaves the governed-metrics graph out, for a caller whose grant declares ``allowedMetrics``.
+        """
         validate_namespace(namespace)
 
         if not self._graph_uri_template:
@@ -216,7 +231,7 @@ class GraphTraverser:
             logger.info("graph_traverse_uris_all_rejected", namespace=namespace, in_count=len(uris))
             return []
 
-        sparql = self._build_hop_query(namespace, safe_uris[:10], max_hops)
+        sparql = self._build_hop_query(namespace, safe_uris[:10], max_hops, hide_governed=hide_governed)
         results = await asyncio.wait_for(self._graph.query(sparql), timeout=_GRAPH_QUERY_TIMEOUT_S)
         parsed = self._parse_hop_results(results)
         logger.info(
@@ -284,7 +299,9 @@ class GraphTraverser:
         """
         return namespace_graph_prefix(self._graph_uri_template, namespace)
 
-    def _build_label_query(self, namespace: str, terms: list[str], containers: list[str] | None = None) -> str:
+    def _build_label_query(
+        self, namespace: str, terms: list[str], containers: list[str] | None = None, *, hide_governed: bool = False
+    ) -> str:
         forward_filters = [f'CONTAINS(LCASE(?label), "{escape_sparql_string_literal(term)}")' for term in terms]
         # ``STR()`` is required on the reverse arm and not on the forward one:
         # SPARQL argument compatibility accepts CONTAINS(lang-tagged, simple) but
@@ -324,13 +341,13 @@ class GraphTraverser:
               OPTIONAL {{ ?predicateUri rdfs:label ?predicateLabel . }}
             }}
           }}
-          FILTER(STRSTARTS(STR(?g), "{graph_uri_prefix}"))
+          FILTER(STRSTARTS(STR(?g), "{graph_uri_prefix}")){_unless_governed_hidden(hide_governed)}
         }}
         ORDER BY ?entity
         LIMIT {_MAX_TRAVERSAL_RESULTS}
         """
 
-    def _build_hop_query(self, namespace: str, uris: list[str], max_hops: int) -> str:
+    def _build_hop_query(self, namespace: str, uris: list[str], max_hops: int, *, hide_governed: bool = False) -> str:
         values_clause = " ".join(f"<{uri}>" for uri in uris)
         graph_uri_prefix = self._graph_uri_prefix(namespace)
 
@@ -477,7 +494,7 @@ class GraphTraverser:
             OPTIONAL {{ ?predicateUri rdfs:label ?predicateLabel . }}
             OPTIONAL {{ ?targetUri rdfs:label ?targetLabel . }}
           }}
-          FILTER(STRSTARTS(STR(?g), "{graph_uri_prefix}"))
+          FILTER(STRSTARTS(STR(?g), "{graph_uri_prefix}")){_unless_governed_hidden(hide_governed)}
         }} LIMIT {_MAX_HOP_RESULTS}
         """
 
@@ -486,6 +503,13 @@ class GraphTraverser:
 
     def _parse_hop_results(self, results: list[dict]) -> list[GraphEntity]:
         return _group_entities(results)
+
+
+def _unless_governed_hidden(hide: bool) -> str:
+    """A FILTER leaving the namespace's governed-metrics graph out when ``hide``; else nothing (the text unchanged)."""
+    if not hide:
+        return ""
+    return f'\n          FILTER(!STRENDS(STR(?g), "/{_GOVERNED_GRAPH_SEGMENT}"))'
 
 
 def _group_entities(results: list[dict]) -> list[GraphEntity]:

@@ -57,6 +57,30 @@ when {
 
 permit (
   principal,
+  action == SCL::Action::"viewSource",
+  resource
+)
+when {
+  principal.resourceRoles.contains({
+    "role": "data-steward",
+    "resourceUID": resource.namespace
+  })
+};
+
+permit (
+  principal,
+  action == SCL::Action::"viewOntology",
+  resource
+)
+when {
+  principal.resourceRoles.contains({
+    "role": "data-steward",
+    "resourceUID": resource.namespace
+  })
+};
+
+permit (
+  principal,
   action == SCL::Action::"list",
   resource
 )

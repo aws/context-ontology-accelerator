@@ -1639,6 +1639,39 @@ def _run_separated(
 
 
 # ---------------------------------------------------------------------------
+# Content screening windows
+# ---------------------------------------------------------------------------
+
+# main() screens each document with one ApplyGuardrail call per window of its
+# text. A window is 10,000 chars, i.e. 10 guardrail text units (1 unit = 1,000
+# chars), unchanged from the original non-overlapping scheme.
+_SCREEN_WINDOW_SIZE = 10_000
+# Neighbouring windows share this many chars, so any span up to this length lies
+# wholly inside at least one window. Without the overlap an injected sentence
+# that straddled a window boundary was split in two and each half passed the
+# guardrail on its own. 1,000 chars holds a multi-sentence payload (a
+# reproduction used a sentence of about 100 chars). A document of N > 1,000 chars takes
+# ceil((N - 1,000) / 9,000) calls instead of ceil(N / 10,000): the same up to
+# 19,000 chars, one more at 20,000 or 100,000, and about 11% more when long.
+_SCREEN_WINDOW_OVERLAP = 1_000
+_SCREEN_WINDOW_STEP = _SCREEN_WINDOW_SIZE - _SCREEN_WINDOW_OVERLAP
+
+
+def _screening_windows(length: int) -> list[tuple[int, int]]:
+    """Return the ``(start, end)`` slices that content screening sends for a text of ``length`` chars.
+
+    Windows are ``_SCREEN_WINDOW_SIZE`` chars long and start every
+    ``_SCREEN_WINDOW_STEP`` chars, so neighbours overlap by
+    ``_SCREEN_WINDOW_OVERLAP``. Starts stop once a window reaches the end of the
+    text, so the last window always ends at ``length`` and no window re-screens
+    only a suffix the previous one already covered. A text no longer than one
+    window, including the empty text, gets exactly one window.
+    """
+    starts = range(0, max(1, length - _SCREEN_WINDOW_OVERLAP), _SCREEN_WINDOW_STEP)
+    return [(start, min(start + _SCREEN_WINDOW_SIZE, length)) for start in starts]
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1789,15 +1822,14 @@ def main() -> None:
         # Screen each document individually. ApplyGuardrail evaluates the entire
         # content list as a single input (not per-block), so batching multiple
         # docs in one call doesn't give per-doc results.
-        # Screen in 10k-char windows to catch payloads placed past the API char limit.
-        _WINDOW_SIZE = 10000
+        # Screen in overlapping 10k-char windows to catch payloads placed past the
+        # API char limit, including ones that straddle a window boundary.
         for doc in documents:
             text = doc.text
             try:
                 quarantined = False
-                for start in range(0, max(1, len(text)), _WINDOW_SIZE):
-                    window = text[start : start + _WINDOW_SIZE]
-                    results = screener.screen_texts([window])
+                for start, end in _screening_windows(len(text)):
+                    results = screener.screen_texts([text[start:end]])
                     if not results[0].passed:
                         quarantined = True
                         docs_quarantined += 1

@@ -22,6 +22,7 @@ from coa_common.guardrail_metrics import (
     assessments_from_trace,
     emit_guardrail_decision,
     filter_type_from_assessments,
+    redacted_actions,
 )
 
 logger = logging.getLogger(__name__)
@@ -346,11 +347,11 @@ class BedrockClient:
 
             if blocked:
                 logger.warning(
-                    "Guardrail blocked response: model=%s guardrail=%s filter_type=%s assessments=%s",
+                    "Guardrail blocked response: model=%s guardrail=%s filter_type=%s actions=%s",
                     self._model_id,
                     self._guardrail_id,
                     filter_type_from_assessments(assessments),
-                    assessments,
+                    redacted_actions(assessments),
                 )
                 raise GuardrailBlockedError(f"Guardrail {self._guardrail_id} blocked the response")
 
@@ -363,9 +364,10 @@ class BedrockClient:
                 # `raise`, not nested under `if blocked:` — a masking intervention
                 # must leave an observable log line, not pass silently.
                 logger.warning(
-                    "Guardrail intervened without blocking (values masked): model=%s guardrail=%s",
+                    "Guardrail intervened without blocking (values masked): model=%s guardrail=%s actions=%s",
                     self._model_id,
                     self._guardrail_id,
+                    redacted_actions(assessments),
                 )
 
             if not content_blocks:

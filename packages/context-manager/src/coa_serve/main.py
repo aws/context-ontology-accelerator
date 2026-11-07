@@ -45,10 +45,22 @@ from .exceptions import (
 )
 from .guardrail_config import GuardrailConfigProvider, build_guardrail_config_provider
 from .identity import extract_jwt_identity, resolve_principal, resolve_user_id
-from .models import InvokeRequest, TraceStep
+from .llm_usage import LlmUsageTracker, start_tracked_task
+from .models import InvokeRequest, LlmUsageMetrics, TraceStep
 from .namespace_language import bind_label_preference
 from .orchestrator import Orchestrator
-from .role_resolver import ResolvedProfile, may_view_debug_info, resolve_profile
+from .role_resolver import ResolvedProfile, resolve_profile
+from .schema_visibility import (
+    NO_VISIBILITY,
+    SchemaVisibility,
+    client_error_message,
+    schema_visibility_scope,
+    scrub_graph_traverse_response,
+    scrub_query_result,
+    scrub_session_messages,
+    scrub_trace_step,
+    scrub_translate_response,
+)
 from .session import SessionManager
 from .session_actions import (
     handle_create_session,
@@ -786,8 +798,11 @@ def _parse_graph_traverse_options(options: Any) -> tuple[str, int, int]:
     return start_uri, max_depth, max_results
 
 
-async def _handle_graph_traverse(payload: dict, request_id: str) -> dict:
-    """Graph traversal in Neptune — returns entities and relationships."""
+async def _handle_graph_traverse(payload: dict, request_id: str, profile: ResolvedProfile | None = None) -> dict:
+    """Graph traversal in Neptune — returns entities and relationships.
+
+    A caller whose grant declares ``allowedMetrics`` traverses without the governed-metrics graph.
+    """
     namespace = payload.get("namespace", "")
     if not namespace:
         return _error(400, "namespace required", request_id)
@@ -810,6 +825,7 @@ async def _handle_graph_traverse(payload: dict, request_id: str) -> dict:
                 [start_uri],
                 namespace,
                 max_hops=max_depth,
+                **({"hide_governed": True} if profile is not None and profile.allowed_metrics is not None else {}),
             ),
             timeout=RESOLVE_TIMEOUT_S,
         )
@@ -916,7 +932,7 @@ async def _persist_turn(
             turn_metadata = response.result.model_dump(
                 by_alias=True,
                 exclude_none=True,
-                exclude={"synthesized_answer", "supporting_content"},
+                exclude={"synthesized_answer", "supporting_content", "llm_usage"},
             )
             turn_metadata["requestId"] = request_id
             turn_metadata["query"] = query
@@ -934,38 +950,133 @@ async def _persist_turn(
         logger.warning("sse_persist_turn_failed", session_id=session_id, exc_info=True)
 
 
+def _llm_usage_tracker(request) -> LlmUsageTracker | None:
+    """One tracker per request, only when the caller opted in (``options.includeLlmUsage``)."""
+    return LlmUsageTracker() if request.options.get("includeLlmUsage") is True else None
+
+
+def _llm_usage_metrics(tracker: LlmUsageTracker | None) -> LlmUsageMetrics | None:
+    """Finalize the request's LLM usage into its typed shape."""
+    if tracker is None:
+        return None
+    return LlmUsageMetrics.from_snapshot(tracker.snapshot())
+
+
+def _llm_usage_payload(tracker: LlmUsageTracker | None) -> dict | None:
+    """Finalize the request's LLM usage into its wire shape (None when not opted in)."""
+    usage = _llm_usage_metrics(tracker)
+    return usage.model_dump(by_alias=True, mode="json") if usage is not None else None
+
+
+def _with_llm_usage(payload: dict, tracker: LlmUsageTracker | None) -> dict:
+    """Attach usage to an error payload so a failed request's known spend still counts."""
+    usage = _llm_usage_payload(tracker)
+    if usage is not None:
+        payload["llmUsage"] = usage
+    return payload
+
+
+async def _schema_visibility(namespace: str, profile: dict) -> SchemaVisibility:
+    """Resolve the caller's schema rights off the event loop (Cedar loads policies synchronously).
+
+    Fails closed: with no orchestrator there is no policy to consult, so all
+    schema is withheld.
+    """
+    if _orchestrator is None:
+        return NO_VISIBILITY
+    vis = await asyncio.to_thread(_orchestrator.schema_visibility, namespace, profile)
+    if not isinstance(vis, SchemaVisibility):
+        # Fail closed on anything but a real decision (a truthy stand-in must
+        # never read as "may see all schema").
+        logger.error("schema_visibility_unresolved", namespace=namespace, got=type(vis).__name__)
+        return NO_VISIBILITY
+    return vis
+
+
+async def _replay_visibility(
+    payload: dict, namespace: str, jwt_user_id: str | None, jwt_email: str | None, jwt_groups: list[str] | None
+) -> SchemaVisibility:
+    """The caller's CURRENT schema rights on a session's namespace, for replaying it.
+
+    Stored turns are re-scrubbed with these rights, so a turn saved before the
+    scrub existed, or while the caller held a schema-visible role, cannot be
+    replayed with schema. Fails closed (all schema withheld) when the namespace
+    or the caller's roles cannot be resolved.
+    """
+    blind = NO_VISIBILITY
+    if not namespace:
+        return blind
+    try:
+        user_id, groups = resolve_principal(payload.get("profile", {}) or {}, jwt_user_id, jwt_email, jwt_groups)
+        if not user_id:
+            return blind
+        resolved = await asyncio.to_thread(resolve_profile, user_id, groups, namespace=namespace, email=jwt_email)
+    except Exception:
+        logger.warning("session_replay_visibility_unresolved", namespace=namespace, exc_info=True)
+        return blind
+    profile: dict = {"namespace": namespace}
+    resolved.inject_into(profile)
+    return await _schema_visibility(namespace, profile)
+
+
+def _action_profile(namespace: str, resolved_profile: ResolvedProfile | None) -> dict:
+    """The server-resolved profile for an isolated action (never the client-supplied one)."""
+    profile: dict = {"namespace": namespace}
+    if resolved_profile is not None:
+        resolved_profile.inject_into(profile)
+    return profile
+
+
 async def _handle_blocking_query(request, request_id: str):
-    """Non-streaming query resolution. Yields a single result dict."""
+    """Non-streaming query resolution. Yields a single result dict.
+
+    The caller's schema visibility is resolved once here and published for the
+    resolution (``SCHEMA_BLIND`` for the synthesizer, the decision itself for the
+    orchestrator's artifact gates and the firewall), then reset.
+    """
+    schema_vis = await _schema_visibility(request.namespace, request.profile)
+    with schema_visibility_scope(request.namespace, schema_vis):
+        async with contextlib.aclosing(_resolve_blocking(request, request_id, schema_vis)) as events:
+            async for event in events:
+                yield event
+
+
+async def _resolve_blocking(request, request_id: str, schema_vis: SchemaVisibility):
+    """Body of :func:`_handle_blocking_query`, run inside the visibility scope."""
     resolve_start = time.perf_counter()
+    tracker = _llm_usage_tracker(request)
     try:
         response = await asyncio.wait_for(
-            _orchestrator.resolve(request, deadline=_build_deadline(request)),
+            start_tracked_task(_orchestrator.resolve(request, deadline=_build_deadline(request)), tracker),
             timeout=RESOLVE_TIMEOUT_S,
         )
     except TimeoutError:
         total_ms = int((time.perf_counter() - resolve_start) * 1000)
         logger.error("orchestrator_timeout", namespace=request.namespace, request_id=request_id)
-        yield {
-            "error": "TimeoutError",
-            "message": "Query resolution timed out",
-            "requestId": request_id,
-            "statusCode": 504,
-            "metadata": {"totalMs": total_ms},
-        }
+        yield _with_llm_usage(
+            {
+                "error": "TimeoutError",
+                "message": "Query resolution timed out",
+                "requestId": request_id,
+                "statusCode": 504,
+                "metadata": {"totalMs": total_ms},
+            },
+            tracker,
+        )
         return
     except AccessDeniedError as e:
         total_ms = int((time.perf_counter() - resolve_start) * 1000)
         logger.warning("orchestrator_access_denied", request_id=request_id, reason=e.reason)
         d = e.to_dict(request_id)
         d["metadata"] = {"totalMs": total_ms}
-        yield d
+        yield _with_llm_usage(d, tracker)
         return
     except NoResultError as e:
         total_ms = int((time.perf_counter() - resolve_start) * 1000)
         logger.info("orchestrator_no_result", request_id=request_id, tier=e.tier)
         d = e.to_dict(request_id)
         d["metadata"] = {"totalMs": total_ms}
-        yield d
+        yield _with_llm_usage(d, tracker)
         return
     except ServeError as e:
         # Any other typed serve error (e.g. an ambiguous-reference refusal) carries
@@ -975,29 +1086,52 @@ async def _handle_blocking_query(request, request_id: str):
         total_ms = int((time.perf_counter() - resolve_start) * 1000)
         logger.warning("orchestrator_serve_error", request_id=request_id, error_type=e.error_type, message=e.message)
         d = e.to_dict(request_id)
+        d["message"] = client_error_message(e.error_type, e.message, schema_vis)
         d["metadata"] = {"totalMs": total_ms}
-        yield d
+        yield _with_llm_usage(d, tracker)
         return
     except Exception as e:
         total_ms = int((time.perf_counter() - resolve_start) * 1000)
         logger.error("orchestrator_error", error_type=type(e).__name__, error_msg=str(e), request_id=request_id)
-        yield {
-            "error": "InternalError",
-            "message": "Query resolution failed",
-            "requestId": request_id,
-            "statusCode": 500,
-            "metadata": {"totalMs": total_ms},
-        }
+        yield _with_llm_usage(
+            {
+                "error": "InternalError",
+                "message": "Query resolution failed",
+                "requestId": request_id,
+                "statusCode": 500,
+                "metadata": {"totalMs": total_ms},
+            },
+            tracker,
+        )
         return
 
     total_ms = int((time.perf_counter() - resolve_start) * 1000)
     response.result.metadata = {**(response.result.metadata or {}), "totalMs": total_ms}
+    response.result.llm_usage = _llm_usage_metrics(tracker)
     response.requestId = request_id
+    # Results-only for a schema-blind caller (ADR): withhold every schema-bearing
+    # field, not only the SQL/SPARQL artifacts.
+    scrub_query_result(response.result, schema_vis)
     yield response.model_dump(by_alias=True, exclude_none=True, mode="json")
 
 
 async def _handle_streaming_query(payload: dict, request, request_id: str, session_user_id: str):
-    """Streaming SSE query resolution. Yields SSE event strings."""
+    """Streaming SSE query resolution. Yields SSE event strings.
+
+    Visibility is resolved before any step is streamed (a step's detail can name
+    tables or ontology edges, so it is scrubbed before it leaves) and published
+    for the resolution as in :func:`_handle_blocking_query`.
+    """
+    schema_vis = await _schema_visibility(request.namespace, request.profile)
+    with schema_visibility_scope(request.namespace, schema_vis):
+        stream = _stream_query(payload, request, request_id, session_user_id, schema_vis)
+        async with contextlib.aclosing(stream) as events:
+            async for event in events:
+                yield event
+
+
+async def _stream_query(payload: dict, request, request_id: str, session_user_id: str, schema_vis: SchemaVisibility):
+    """Body of :func:`_handle_streaming_query`, run inside the visibility scope."""
     session_id, conversation_history = await _setup_streaming_session(
         payload=payload,
         session_user_id=session_user_id,
@@ -1008,13 +1142,18 @@ async def _handle_streaming_query(payload: dict, request, request_id: str, sessi
     emitter = SSEEmitter(request_id, session_id)
 
     async def on_step(step: TraceStep) -> None:
-        emitter.queue_step(step)
+        emitter.queue_step(scrub_trace_step(step, schema_vis))
 
     async def on_token(text: str) -> None:
-        emitter.queue_token(text)
+        # Answer tokens can't be redacted reliably (an identifier can span
+        # tokens), so a schema-blind caller gets only the redacted final answer
+        # in the done event.
+        if schema_vis.full:
+            emitter.queue_token(text)
 
     trace = TraceCollector(on_record=on_step)
     resolve_start = time.perf_counter()
+    tracker = _llm_usage_tracker(request)
 
     async def _run_resolve():
         try:
@@ -1047,7 +1186,7 @@ async def _handle_streaming_query(payload: dict, request, request_id: str, sessi
             emitter.close()
             raise
 
-    resolve_task = asyncio.create_task(_run_resolve())
+    resolve_task = start_tracked_task(_run_resolve(), tracker)
 
     try:
         async for event_str in emitter.stream():
@@ -1063,8 +1202,12 @@ async def _handle_streaming_query(payload: dict, request, request_id: str, sessi
         response = resolve_task.result()
         total_ms = int((time.perf_counter() - resolve_start) * 1000)
         response.result.metadata = {**(response.result.metadata or {}), "totalMs": total_ms}
+        response.result.llm_usage = _llm_usage_metrics(tracker)
         response.requestId = request_id
         response.sessionId = session_id
+        # Scrubbed before it is emitted AND before the turn is persisted, so a
+        # replayed session cannot surface what the live response withheld.
+        scrub_query_result(response.result, schema_vis)
         yield emitter.format_done(response.result)
 
         if _session_manager and session_user_id and session_id:
@@ -1079,21 +1222,30 @@ async def _handle_streaming_query(payload: dict, request, request_id: str, sessi
     except TimeoutError:
         total_ms = int((time.perf_counter() - resolve_start) * 1000)
         logger.error("sse_timeout", request_id=request_id, total_ms=total_ms)
-        yield emitter.format_error("TimeoutError", "Query resolution timed out", 504)
+        yield emitter.format_error(
+            "TimeoutError", "Query resolution timed out", 504, llm_usage=_llm_usage_payload(tracker)
+        )
     except AccessDeniedError as e:
         logger.warning("sse_access_denied", request_id=request_id, reason=e.reason)
-        yield emitter.format_error("AccessDenied", "Access denied", 403)
+        yield emitter.format_error("AccessDenied", "Access denied", 403, llm_usage=_llm_usage_payload(tracker))
     except NoResultError as e:
         logger.info("sse_no_result", request_id=request_id, tier=e.tier)
-        yield emitter.format_error("NoResult", e.message, e.status_code)
+        yield emitter.format_error("NoResult", e.message, e.status_code, llm_usage=_llm_usage_payload(tracker))
     except ServeError as e:
         logger.warning("sse_serve_error", request_id=request_id, error_type=e.error_type, message=e.message)
-        yield emitter.format_error(e.error_type, e.message, e.status_code)
+        yield emitter.format_error(
+            e.error_type,
+            client_error_message(e.error_type, e.message, schema_vis),
+            e.status_code,
+            llm_usage=_llm_usage_payload(tracker),
+        )
     except asyncio.CancelledError:
         logger.info("sse_resolve_cancelled", request_id=request_id)
     except Exception as exc:
         logger.error("sse_resolve_error", request_id=request_id, error_type=type(exc).__name__, exc_info=True)
-        yield emitter.format_error("InternalError", "Query resolution failed", 500)
+        yield emitter.format_error(
+            "InternalError", "Query resolution failed", 500, llm_usage=_llm_usage_payload(tracker)
+        )
 
 
 async def _bind_namespace_label_preference(
@@ -1252,12 +1404,23 @@ async def invoke(payload: dict, context=None):
                 "statusCode": 400,
             }
             return
-        yield await handle_get_recent_session(payload, request_id, user_id, _session_metadata, _session_manager)
+        recent = await handle_get_recent_session(payload, request_id, user_id, _session_metadata, _session_manager)
+        if recent.get("messages"):
+            vis = await _replay_visibility(payload, recent.get("namespace", ""), _jwt_user_id, _jwt_email, _jwt_groups)
+            recent["messages"] = scrub_session_messages(recent["messages"], vis)
+        yield recent
         return
 
     if action == "getSessionHistory" and _session_manager:
         user_id = resolve_user_id(payload, _jwt_user_id, _jwt_email)
-        yield await handle_get_session_history(payload, request_id, user_id, _session_manager, _session_metadata)
+        history = await handle_get_session_history(payload, request_id, user_id, _session_manager, _session_metadata)
+        if history.get("messages"):
+            namespace = payload.get("namespace", "")
+            if not namespace and _session_metadata:
+                namespace = await _session_metadata.get_session_namespace(user_id, payload.get("sessionId", "")) or ""
+            vis = await _replay_visibility(payload, namespace, _jwt_user_id, _jwt_email, _jwt_groups)
+            history["messages"] = scrub_session_messages(history["messages"], vis)
+        yield history
         return
 
     if action == "createSession" and _session_metadata:
@@ -1377,13 +1540,23 @@ async def invoke(payload: dict, context=None):
 
     try:
         if action == "translate":
-            yield await _handle_translate(payload, request_id)
+            # Independent, so run concurrently; the scrub still applies to the
+            # result, so a failed visibility check withholds as before.
+            translated, vis = await asyncio.gather(
+                _handle_translate(payload, request_id),
+                _schema_visibility(namespace, _action_profile(namespace, resolved_profile)),
+            )
+            yield scrub_translate_response(translated, vis)
             return
         if action == "kbSearch":
             yield await _handle_kb_search(payload, request_id)
             return
         if action == "graphTraverse":
-            yield await _handle_graph_traverse(payload, request_id)
+            traversed, vis = await asyncio.gather(
+                _handle_graph_traverse(payload, request_id, resolved_profile),
+                _schema_visibility(namespace, _action_profile(namespace, resolved_profile)),
+            )
+            yield scrub_graph_traverse_response(traversed, vis)
             return
     except ServeError as e:
         yield e.to_dict(request_id)
@@ -1449,13 +1622,18 @@ async def invoke(payload: dict, context=None):
         resolved.inject_into(request.profile)
 
     # ``includeDebugInfo`` returns the generated SQL/SPARQL, i.e. the physical
-    # schema. Honour it only for a caller who already administers this
-    # namespace's schema; anyone else gets the default (fields withheld) rather
-    # than an error, so a client that always sets the flag keeps working.
-    if request.options.get("includeDebugInfo") is True and not may_view_debug_info(request.profile, request.namespace):
-        request.options["includeDebugInfo"] = False
-        logger.info("include_debug_info_withheld", namespace=request.namespace, request_id=request_id)
-
+    # schema. The per-artifact authorization now lives in the orchestrator's
+    # response assembly (ADR: decompose-viewnamespace-schema-visibility): the SQL
+    # artifact is gated on ``viewSource`` and the SPARQL artifact on
+    # ``viewOntology``, each evaluated through the fail-closed Cedar authorizer
+    # (``Orchestrator._resolve_include_sql`` / ``_resolve_include_sparql``). That
+    # is the single enforcement point, so the flag is forwarded unchanged here —
+    # a caller who holds neither right still receives both fields withheld, and a
+    # caller who holds one receives only the artifact that right discloses. The
+    # old coarse role-list pre-gate (``may_view_debug_info``) is removed: it
+    # collapsed the two independent rights into one all-or-nothing decision and
+    # would have overridden the finer split, keeping artifacts hidden on the UI
+    # for roles that legitimately regained access under the decomposition.
     logger.info(
         "invoke",
         namespace=request.namespace,

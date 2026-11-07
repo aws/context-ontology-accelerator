@@ -32,6 +32,7 @@ class StepId(StrEnum):
     T2_SQL_FIREWALL = "t2.sql.firewall"
     T2_SQL_EXECUTE = "t2.sql.execute"
     T2_SQL_FAILED = "t2.sql.failed"
+    T2_SQL_VOTE = "t2.sql.vote"
 
     # Tier 2 — VKG (Ontop)
     T2_VKG_CONTEXT = "t2.vkg.context"

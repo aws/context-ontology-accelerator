@@ -274,12 +274,12 @@ class TestSQLFirewallEvaluate:
 
     def test_allows_with_empty_profile(self):
         fw = SQLFirewall()
-        result = fw.evaluate("SELECT 1", profile={})
+        result = fw.evaluate("SELECT id FROM orders", profile={})
         assert not result.denied
 
     def test_allows_with_none_profile(self):
         fw = SQLFirewall()
-        result = fw.evaluate("SELECT 1", profile=None)
+        result = fw.evaluate("SELECT id FROM orders", profile=None)
         assert not result.denied
 
     def test_empty_profile_fail_open_characterization(self):
@@ -776,43 +776,59 @@ class TestRealCedarThroughFirewall:
         result = fw.evaluate("SELECT id FROM orders", profile={"userId": "u1"}, namespace="ns")
         assert not result.denied
 
-    # ── can_view_namespace: the artifact-visibility gate (#1166) ──────────
-    # The SAME viewNamespace right as the Sources/Tables schema view decides
-    # whether generated SQL/SPARQL artifacts may be returned.
-    def test_can_view_namespace_data_analyst_own_namespace_true(self):
+    # ── can_view_source / can_view_ontology: the artifact gates (ADR) ─────
+    @pytest.mark.parametrize("probe", ["can_view_source", "can_view_ontology"])
+    def test_schema_view_steward_own_namespace_true(self, probe):
         fw = self._fw(fail_open_no_roles=False)
-        assert (
-            fw.can_view_namespace(
-                "ns", {"userId": "u1", "resourceRoles": [{"role": "data-analyst", "resourceUID": "ns"}]}
-            )
-            is True
-        )
+        profile = {"userId": "u1", "resourceRoles": [{"role": "data-steward", "resourceUID": "ns"}]}
+        assert getattr(fw, probe)("ns", profile) is True
 
-    def test_can_view_namespace_other_namespace_false(self):
+    @pytest.mark.parametrize("probe", ["can_view_source", "can_view_ontology"])
+    def test_schema_view_data_analyst_false(self, probe):
         fw = self._fw(fail_open_no_roles=False)
-        assert (
-            fw.can_view_namespace(
-                "ns", {"userId": "u1", "resourceRoles": [{"role": "data-analyst", "resourceUID": "other"}]}
-            )
-            is False
-        )
+        profile = {"userId": "u1", "resourceRoles": [{"role": "data-analyst", "resourceUID": "ns"}]}
+        assert getattr(fw, probe)("ns", profile) is False
 
-    def test_can_view_namespace_no_roles_prod_false(self):
+    @pytest.mark.parametrize("probe", ["can_view_source", "can_view_ontology"])
+    def test_schema_view_no_roles_prod_false(self, probe):
         fw = self._fw(fail_open_no_roles=False)
-        assert fw.can_view_namespace("ns", {"userId": "u1"}) is False
+        assert getattr(fw, probe)("ns", {"userId": "u1"}) is False
 
-    def test_can_view_namespace_fails_closed_on_authorizer_error(self):
+    @pytest.mark.parametrize("probe", ["can_view_source", "can_view_ontology"])
+    def test_schema_view_fails_closed_on_authorizer_error(self, probe):
         """A raising authorizer withholds artifacts (returns False), never leaks."""
 
         class _BoomAuthorizer:
             def authorize(self, **kwargs):
                 raise RuntimeError("boom")
 
-            def can_view_namespace(self, **kwargs):
+            def can_view_source(self, **kwargs):
+                raise RuntimeError("boom")
+
+            def can_view_ontology(self, **kwargs):
                 raise RuntimeError("boom")
 
         fw = SQLFirewall(cedar_authorizer=_BoomAuthorizer())
-        assert fw.can_view_namespace("ns", {"userId": "a", "globalRoles": ["platform-admin"]}) is False
+        assert getattr(fw, probe)("ns", {"userId": "a", "globalRoles": ["platform-admin"]}) is False
+
+    @pytest.mark.parametrize("probe", ["can_view_source", "can_view_ontology"])
+    def test_schema_view_namespace_falls_back_to_profile(self, probe):
+        """With no namespace argument the probe evaluates the profile's namespace."""
+        seen: dict = {}
+
+        class _RecordingAuthorizer:
+            def authorize(self, **kwargs):
+                raise AssertionError("not used")
+
+            def can_view_source(self, *, namespace, profile):
+                seen["ns"] = namespace
+                return True
+
+            can_view_ontology = can_view_source
+
+        fw = SQLFirewall(cedar_authorizer=_RecordingAuthorizer())
+        assert getattr(fw, probe)("", {"namespace": "from-profile"}) is True
+        assert seen["ns"] == "from-profile"
 
 
 @pytest.mark.unit
@@ -1016,3 +1032,135 @@ class TestSameNamedTableGrants:
         profile = {"tableAllowlist": ["crm_db.customers", "orders"]}
         names = ["crm_db.customers", "sales_db.customers", "customers", "orders", "x.orders"]
         assert tables_visible_to(names, profile) == ["crm_db.customers", "orders", "x.orders"]
+
+
+@pytest.mark.unit
+class TestSchemaEchoRefused:
+    """A statement that can only echo text from its own SQL is refused without viewSource.
+
+    Real seed policies: the analyst holds neither viewSource nor viewOntology; the
+    steward and the owner hold both and are the positive controls.
+    """
+
+    _NS = "demo"
+    _NO_TABLE = "Query must read from a data source"
+    _CONSTANT = "Query must return data from a data source"
+
+    def _fw(self):
+        from coa_serve.tier2.cedar_authorizer import RealCedarAuthorizer
+
+        return SQLFirewall(cedar_authorizer=RealCedarAuthorizer(fail_open_no_roles=False))
+
+    def _profile(self, role):
+        return {"userId": "u", "resourceRoles": [{"role": role, "resourceUID": self._NS}]}
+
+    def _eval(self, sql, role, dialect="trino"):
+        return self._fw().evaluate(sql, profile=self._profile(role), namespace=self._NS, dialect=dialect)
+
+    @pytest.mark.parametrize(
+        ("sql", "dialect", "reason"),
+        [
+            ("SELECT 'sales_db.customers' AS t UNION ALL SELECT 'x'", "trino", _NO_TABLE),
+            ("WITH t AS (SELECT 'sales.orders' AS n) SELECT n FROM t", "trino", _NO_TABLE),
+            (
+                "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r",
+                "postgres",
+                _NO_TABLE,
+            ),
+            ("SELECT x FROM (VALUES ('sales.orders'), ('b')) AS v(x)", "trino", _NO_TABLE),
+            ("SELECT x FROM UNNEST(ARRAY['sales.orders']) AS u(x)", "trino", _NO_TABLE),
+            ("SELECT * FROM generate_series(1, 3)", "postgres", _NO_TABLE),
+            ("SELECT 'customer_id' AS c FROM orders", "trino", _CONSTANT),
+            ("SELECT 'customer_id' AS c FROM orders UNION ALL SELECT name FROM orders", "trino", _CONSTANT),
+            ("SELECT CHR(99) || CHR(117) AS c FROM orders", "trino", _CONSTANT),
+        ],
+    )
+    def test_refused_for_analyst_with_reason(self, sql, dialect, reason):
+        res = self._eval(sql, "data-analyst", dialect)
+        assert res.denied
+        assert res.reason == reason
+        for role in ("data-steward", "namespace-owner"):
+            assert not self._eval(sql, role, dialect).denied, role
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT COUNT(*) FROM t",
+            "SELECT id, name FROM orders WHERE total > 10",
+            "SELECT 1 FROM orders",
+            "SELECT 'Total' AS label, SUM(amount) AS s FROM orders",
+            "WITH x AS (SELECT a FROM orders) SELECT a FROM x",
+        ],
+    )
+    def test_data_queries_still_allowed_for_analyst(self, sql):
+        assert not self._eval(sql, "data-analyst").denied
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT 'NOT_ANSWERABLE_FIELD: no cost field for service job' AS answer",
+            "SELECT 'NOT_ANSWERABLE_RANGE: 2031 is outside the data' AS answer;",
+        ],
+    )
+    def test_not_answerable_refusal_row_allowed_for_analyst(self, sql):
+        assert not self._eval(sql, "data-analyst").denied
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT 'NOT_ANSWERABLE_FIELD: x' AS answer UNION ALL SELECT 'sales.orders'",
+            "SELECT 'NOT_ANSWERABLE_FIELD: x' AS answer, 'sales.orders' AS t",
+            "SELECT 'NOT_ANSWERABLE_FIELD: x' AS other",
+            "SELECT 'sales.orders' AS answer",
+        ],
+    )
+    def test_not_answerable_look_alikes_still_refused_for_analyst(self, sql):
+        assert self._eval(sql, "data-analyst").denied
+
+    def test_redshift_dialect_table_query_allowed(self):
+        sql = "SELECT APPROXIMATE COUNT(DISTINCT c) AS n FROM orders"
+        assert not self._eval(sql, "data-analyst", dialect="redshift").denied
+
+    def test_from_less_select_allowed_for_source_viewer(self):
+        assert not self._eval("SELECT 1 AS one", "data-steward").denied
+
+    def test_parse_error_is_refused_not_allowed(self):
+        with pytest.raises(UnsafeSQLError):
+            self._eval("SELECT FROM WHERE (", "data-analyst")
+
+    def test_nothing_parsed_counts_as_reading_no_table(self):
+        from coa_serve.tier2.sql_firewall import _references_a_table, _schema_echo_reason
+
+        assert _references_a_table(None) is False
+        assert _schema_echo_reason(None) == self._NO_TABLE
+
+    def test_source_viewer_skips_the_ast_checks(self, monkeypatch):
+        """The cheap rights check runs first: a steward never reaches the echo analysis."""
+        from coa_serve.tier2 import sql_firewall
+
+        calls: list = []
+        monkeypatch.setattr(sql_firewall, "_schema_echo_reason", lambda parsed: calls.append(parsed))
+        assert not self._eval("SELECT id FROM orders", "data-steward").denied
+        assert calls == []
+        self._eval("SELECT id FROM orders", "data-analyst")
+        assert len(calls) == 1
+
+    def test_request_visibility_reused_without_cedar_probe(self):
+        """Inside the entrypoint's scope the firewall uses that decision, not a second probe."""
+        from coa_serve.schema_visibility import FULL_VISIBILITY, schema_visibility_scope
+        from coa_serve.tier2.cedar_authorizer import CedarDecision
+
+        class _NoViewProbe:
+            def authorize(self, **kwargs):
+                return CedarDecision(allowed=True)
+
+            def can_view_source(self, **kwargs):
+                raise AssertionError("viewSource re-evaluated")
+
+            can_view_ontology = can_view_source
+
+        fw = SQLFirewall(cedar_authorizer=_NoViewProbe())
+        with schema_visibility_scope(self._NS, FULL_VISIBILITY):
+            assert not fw.evaluate("SELECT 'x' AS c", profile={}, namespace=self._NS).denied
+        # Outside the scope the probe raises → fails closed → refused.
+        assert fw.evaluate("SELECT 'x' AS c", profile={}, namespace=self._NS).denied

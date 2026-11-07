@@ -8,7 +8,7 @@
  * inline editing. Toggle to "Edit raw" for full Turtle editing.
  * Properties are clickable for editing. R2RML shown as a readable table.
  */
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import Badge from "@cloudscape-design/components/badge";
 import Box from "@cloudscape-design/components/box";
 import Button from "@cloudscape-design/components/button";
@@ -27,6 +27,7 @@ import { SuggestionPanel } from "@components/ontology/SuggestionPanel";
 import { expandIri, parsePrefixes } from "@utils/turtleLexer";
 import type { TurtleEntity } from "./turtle";
 import { GroundingCandidates } from "./GroundingCandidates";
+import { VocabularyReviewPanel } from "./VocabularyReviewPanel";
 import {
   extractQuoted,
   extractUri,
@@ -239,9 +240,16 @@ export function ClassDetailPanel({
   // annotation triples on the expanded subject, but ``fullSubject`` is the
   // compact ``prefix:Local`` form. Expand it through the proposal's prefix
   // table (falls back to the compact token if the prefix is unknown).
-  const classIri =
-    expandIri(g.classEntity.fullSubject, parsePrefixes(prelude ?? "")) ??
-    g.classEntity.fullSubject;
+  const prefixes = useMemo(() => parsePrefixes(prelude ?? ""), [prelude]);
+  const iriOf = (entity: TurtleEntity) =>
+    entity.iri ?? expandIri(entity.fullSubject, prefixes) ?? entity.fullSubject;
+  const classIri = iriOf(g.classEntity);
+  // The vocabulary section covers this class and its own properties.
+  const vocabularyTermIris = [
+    g.classEntity,
+    ...g.attributes,
+    ...g.relationships,
+  ].map(iriOf);
   // Label lookup for the SuggestionPanel headers. This class's own label comes
   // from the group; other classes (the suggested parent) fall back to their
   // local name — the panel's copy reads fine with a local name.
@@ -461,6 +469,24 @@ export function ClassDetailPanel({
             <Button variant="primary" onClick={handleStructuredSave}>
               {t("Apply")}
             </Button>
+          )}
+
+          {fullTurtle && (
+            <SpaceBetween size="xs">
+              {/* A vocabulary edit rewrites the class, which remounts this
+                  panel and would drop the unapplied fields above. */}
+              {!isReadOnly && onUpdateTurtle && dirty && (
+                <Box variant="small" color="text-status-inactive">
+                  {t("Apply the changes above before editing the vocabulary.")}
+                </Box>
+              )}
+              <VocabularyReviewPanel
+                turtle={fullTurtle}
+                termIris={vocabularyTermIris}
+                isReadOnly={isReadOnly || !onUpdateTurtle || dirty}
+                onChange={(updatedTurtle) => onUpdateTurtle?.(updatedTurtle)}
+              />
+            </SpaceBetween>
           )}
 
           {/* Properties — clickable for editing */}

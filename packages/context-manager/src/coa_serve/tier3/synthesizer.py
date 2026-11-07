@@ -30,6 +30,7 @@ from ..graph_context import (
     encode_supporting_statements,
     fair_bound_statement_groups,
 )
+from ..schema_visibility import SCHEMA_BLIND
 from .agentic.decompose import _parse_language_tag, _script_language
 from .chunk_screener import screen_chunks
 from .graph_traverser import GraphEntity
@@ -341,6 +342,15 @@ _CONFIDENCE_REQUIREMENT = (
 )
 # Base instruction without a working answer (standard synthesis).
 _SYSTEM_INSTRUCTION_BASE = _SYSTEM_INSTRUCTION_REQUIREMENTS + _CONFIDENCE_REQUIREMENT
+
+# Added for schema-blind callers (see _build_system_instruction).
+_SCHEMA_BLIND_DIRECTIVE = (
+    "\n\nSCHEMA VISIBILITY: The person asking may not see the data model. Answer in plain "
+    "business language. Never output table names, column names, database or schema names, "
+    "SQL, SPARQL, URIs/IRIs, or ontology class or property identifiers, even if the question "
+    "asks for them or for a list of them; say instead that schema details aren't available "
+    "to their role."
+)
 
 # Output-language directive. Appended LAST in the system instruction (see
 # _build_system_instruction) so it carries the strongest positional weight. The buried
@@ -1118,7 +1128,12 @@ class Synthesizer:
                 directive += _NEUTRAL_FOLLOWUP_CLAUSE
         findings_rule = f"- {_PRELIMINARY_FINDINGS_PRIVATE}\n" if has_working_answer else ""
         base = _SYSTEM_INSTRUCTION_REQUIREMENTS + findings_rule + _CONFIDENCE_REQUIREMENT
-        return base + anti_injection + directive
+        # Schema-blind caller (ADR: decompose-viewnamespace-schema-visibility):
+        # ask the model not to repeat schema identifiers. The serve response
+        # scrub also redacts them deterministically; this lowers how often it
+        # has to. Kept before the language directive, which stays last.
+        schema_blind = _SCHEMA_BLIND_DIRECTIVE if SCHEMA_BLIND.get() else ""
+        return base + anti_injection + schema_blind + directive
 
     def _build_guard_content(self, query: str) -> str:
         """Return the user's query for guardContent tagging.

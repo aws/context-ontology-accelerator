@@ -7,6 +7,7 @@ import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { listOntologies } from "../services/ontology-engine";
 import { GetNamespace } from "./GetNamespace";
 
 const baseNamespace = {
@@ -69,8 +70,13 @@ vi.mock("../api-hooks/use-metrics", () => ({
   }),
 }));
 
+// One client for every render, as the real provider's memoized context gives.
+const { apiClient } = vi.hoisted(() => ({
+  apiClient: { get: vi.fn().mockResolvedValue([]) },
+}));
+
 vi.mock("../components/ApiClientProvider", () => ({
-  useApiClient: () => ({ get: vi.fn().mockResolvedValue([]) }),
+  useApiClient: () => apiClient,
 }));
 
 vi.mock("../services/ontology-engine", () => ({
@@ -110,6 +116,7 @@ describe("GetNamespace", () => {
   beforeEach(() => {
     mockNamespace = { ...baseNamespace };
     mockMetrics = [];
+    vi.mocked(listOntologies).mockClear();
   });
 
   it("renders the namespace display name as header", () => {
@@ -208,6 +215,15 @@ describe("GetNamespace", () => {
     expect(
       screen.queryByRole("tab", { name: /members/i }),
     ).not.toBeInTheDocument();
+  });
+
+  it("loads the ontology list once when the Ontologies tab opens", async () => {
+    render(<GetNamespace />, { wrapper });
+    await userEvent.click(screen.getByRole("tab", { name: /ontologies/i }));
+    expect(
+      await screen.findByText("No ontologies in this namespace yet."),
+    ).toBeInTheDocument();
+    expect(listOntologies).toHaveBeenCalledTimes(1);
   });
 
   it("links each data source name to its detail page", () => {
