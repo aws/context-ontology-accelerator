@@ -37,3 +37,26 @@ export function extractErrorMessage(
   if (err instanceof Error && err.message) return err.message;
   return fallback;
 }
+
+/**
+ * Whether a thrown API error is an HTTP 403 (authorization denied).
+ *
+ * Covers both client families: the fetch-based `ApiError` (`status`) and the
+ * Smithy service exceptions (`$metadata.httpStatusCode`). Used to render a
+ * neutral "your role doesn't include this" state instead of an error panel,
+ * e.g. for a schema-blind `data-analyst`, who is denied source and ontology
+ * reads by design.
+ */
+export function isForbiddenError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const e = err as {
+    status?: unknown;
+    statusCode?: unknown;
+    $metadata?: { httpStatusCode?: unknown };
+  };
+  return (
+    e.status === 403 ||
+    e.statusCode === 403 ||
+    e.$metadata?.httpStatusCode === 403
+  );
+}

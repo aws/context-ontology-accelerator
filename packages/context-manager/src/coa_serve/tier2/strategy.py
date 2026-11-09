@@ -264,7 +264,8 @@ _NOT_ANSWERABLE_SQL_RE = re.compile(
 _SQL_LINE_COMMENT_RE = re.compile(r"--[^\n]*")
 
 
-def _is_bare_not_answerable_sql(sql: str | None) -> bool:
+def is_bare_not_answerable_sql(sql: str | None) -> bool:
+    """True when ``sql`` is exactly the writer's ``SELECT 'NOT_ANSWERABLE_…' AS answer`` refusal."""
     if not sql:
         return False
     flat = _SQL_LINE_COMMENT_RE.sub(" ", sql)
@@ -285,7 +286,7 @@ def not_answerable_kind(result: StrategyResult) -> str | None:
     produced a real answer (see ``_resolve_parallel``). Whether the confidence floor keeps it
     depends on the kind (see the orchestrator's Tier-2 gate). Returns None for anything else.
     """
-    if len(result.rows) != 1 or not _is_bare_not_answerable_sql(result.sql):
+    if len(result.rows) != 1 or not is_bare_not_answerable_sql(result.sql):
         return None
     first = result.rows[0]
     if isinstance(first, dict):

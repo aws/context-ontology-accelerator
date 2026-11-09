@@ -7,7 +7,7 @@ import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { LocaleProvider } from "../i18n/LocaleProvider";
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { MetricList } from "./MetricList";
 
 // ---------------------------------------------------------------------------
@@ -26,6 +26,8 @@ let mockMetrics: Array<{
 const mockBulkDeleteMutate = vi.fn();
 
 const mockExportMutate = vi.fn();
+// Mutable export-mutation outcome so a test can render the modal's error slot.
+let mockExportError: Error | null = null;
 
 // Pagination state for the useListMetrics mock — mutable so tests can
 // simulate an infinite query with unloaded server pages.
@@ -52,7 +54,8 @@ vi.mock("../api-hooks/use-metrics", () => ({
   useExportOsi: () => ({
     mutate: mockExportMutate,
     isPending: false,
-    isError: false,
+    isError: mockExportError !== null,
+    error: mockExportError,
   }),
   useGetImportJob: () => ({ data: undefined }),
   useBulkDeleteMetrics: () => ({
@@ -90,6 +93,7 @@ function makeMetric(name: string, label?: string) {
 describe("MetricList export scope", () => {
   beforeEach(() => {
     mockExportMutate.mockReset();
+    mockExportError = null;
   });
 
   /** Multiple Cloudscape Modals stay mounted in the DOM even when closed, so
@@ -597,5 +601,41 @@ describe("MetricList filtered scope covers the complete namespace", () => {
     rerender(<MetricList />);
 
     expect(mockExportMutate).not.toHaveBeenCalled();
+  });
+});
+
+describe("MetricList export denied for a schema-blind role", () => {
+  beforeEach(() => {
+    mockExportMutate.mockReset();
+    mockMetrics = [makeMetric("metric_a")];
+  });
+  afterEach(() => {
+    mockExportError = null;
+  });
+
+  async function openExportModal() {
+    const user = userEvent.setup();
+    render(<MetricList />, { wrapper });
+    await user.click(screen.getByRole("button", { name: /export osi/i }));
+  }
+
+  it("shows the neutral notice, not the raw error, on a 403", async () => {
+    mockExportError = Object.assign(new Error("RAW-FORBIDDEN-SENTINEL"), {
+      status: 403,
+    });
+    await openExportModal();
+    expect(screen.getByTestId("export-osi-no-schema-access")).toHaveTextContent(
+      "Your role doesn't include access to source schemas, so metrics can't be exported.",
+    );
+    expect(document.body.textContent).not.toContain("RAW-FORBIDDEN-SENTINEL");
+  });
+
+  it("still shows the error message for any other failure", async () => {
+    mockExportError = Object.assign(new Error("export-osi failed (500)"), {
+      status: 500,
+    });
+    await openExportModal();
+    expect(screen.queryByTestId("export-osi-no-schema-access")).toBeNull();
+    expect(screen.getByText("export-osi failed (500)")).toBeInTheDocument();
   });
 });

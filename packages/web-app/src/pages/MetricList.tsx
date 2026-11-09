@@ -31,6 +31,7 @@ import {
 } from "../api-hooks/use-metrics";
 import type { MetricDefinition } from "../api-hooks/use-metrics";
 import { useSourceNameById } from "../api-hooks/use-source-name-by-id";
+import { isForbiddenError } from "@utils";
 import { useAppI18n } from "../i18n/LocaleProvider";
 import type { AppMessage } from "../i18n/appMessages";
 
@@ -1042,11 +1043,20 @@ export const MetricList: React.FC = () => {
               },
             ]}
           />
-          {exportMutation.isError && (
-            <Alert type="error">
-              {exportMutation.error?.message ?? t("Export failed")}
-            </Alert>
-          )}
+          {exportMutation.isError &&
+            (isForbiddenError(exportMutation.error) ? (
+              // Export carries source schema, so a schema-blind role is
+              // denied it by design: a neutral notice, not an error.
+              <Alert type="info" data-testid="export-osi-no-schema-access">
+                {t(
+                  "Your role doesn't include access to source schemas, so metrics can't be exported.",
+                )}
+              </Alert>
+            ) : (
+              <Alert type="error">
+                {exportMutation.error?.message ?? t("Export failed")}
+              </Alert>
+            ))}
           {downloadError && <Alert type="error">{downloadError}</Alert>}
         </SpaceBetween>
       </Modal>

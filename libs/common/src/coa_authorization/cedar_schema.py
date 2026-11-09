@@ -83,6 +83,12 @@ class Action(StrEnum):
     MANAGE_NAMESPACE = "SCL::Action::manageNamespace"
     SET_NAMESPACE_STATUS = "SCL::Action::setNamespaceStatus"
     DELETE_NAMESPACE = "SCL::Action::deleteNamespace"
+    # Schema-visibility reads (decomposed from viewNamespace so a reporting-only
+    # role can run queries while remaining schema-blind). viewSource gates raw
+    # source config / Sources->Tables / compiled-SQL schema; viewOntology gates
+    # ontology classes/properties, describe_schema, and graph structure.
+    VIEW_SOURCE = "SCL::Action::viewSource"
+    VIEW_ONTOLOGY = "SCL::Action::viewOntology"
     # List
     LIST = "SCL::Action::list"
     # Read operations

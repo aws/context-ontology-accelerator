@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -30,12 +31,14 @@ def env_vars(monkeypatch):
 def reset_singletons():
     yield
     import coa_control_plane.namespace.deletion_pipeline.delete_metrics as dm
+    import coa_control_plane.namespace.deletion_pipeline.delete_platform as dp
     import coa_control_plane.namespace.deletion_pipeline.delete_sources as ds
     import coa_control_plane.namespace.deletion_pipeline.mark_failed as mf
 
     ds._lambda_client = None
     dm._lambda_client = None
     mf._ns_dao = None
+    dp._ns_dao = None
 
 
 def _lambda_payload(status_code: int, body: dict) -> dict:
@@ -170,7 +173,70 @@ class TestDeleteOntology:
         assert result == {"namespaceId": "ns-123"}
 
 
+_PLATFORM_CALLS = (
+    "teardown_vkg_service",
+    "delete_athena_workgroup",
+    "delete_smu_project",
+    "delete_role_mappings",
+    "delete_roles",
+)
+
+
 class TestDeletePlatform:
+    @pytest.fixture(autouse=True)
+    def ns_record(self):
+        from coa_control_plane.namespace.deletion_pipeline import delete_platform
+
+        dao = MagicMock()
+        dao.get.return_value = {
+            "PK": "NS#ns-123",
+            "SK": "METADATA",
+            "status": "DELETING",
+            "athenaWorkgroupName": "wg-1",
+            "dataZoneProjectId": "proj-1",
+        }
+        with patch.object(delete_platform, "_get_ns_dao", return_value=dao):
+            yield dao
+
+    def _run(self, event):
+        from coa_control_plane.namespace.deletion_pipeline import delete_platform
+
+        with ExitStack() as stack:
+            mocks = {name: stack.enter_context(patch.object(delete_platform, name)) for name in _PLATFORM_CALLS}
+            try:
+                return delete_platform.handler(event, None), mocks
+            except Exception as exc:  # noqa: BLE001 - surfaced to the test with the mocks
+                return exc, mocks
+
+    @pytest.mark.parametrize("status", ["ACTIVE", "ARCHIVED", "DELETED", "DELETE_FAILED"])
+    def test_a_namespace_not_deleting_is_left_alone(self, ns_record, status):
+        ns_record.get.return_value = {**ns_record.get.return_value, "status": status}
+
+        result, mocks = self._run({"namespaceId": "ns-123"})
+
+        assert isinstance(result, RuntimeError)
+        for mock in mocks.values():
+            mock.assert_not_called()
+
+    def test_a_missing_namespace_is_already_finalized(self, ns_record):
+        ns_record.get.return_value = None
+
+        result, mocks = self._run({"namespaceId": "ns-123"})
+
+        assert result == {"namespaceId": "ns-123"}
+        for mock in mocks.values():
+            mock.assert_not_called()
+
+    def test_resource_ids_come_from_the_record_not_the_input(self, ns_record):
+        result, mocks = self._run(
+            {"namespaceId": "ns-123", "athenaWorkgroupName": "other-wg", "dataZoneProjectId": "x"}
+        )
+
+        assert result == {"namespaceId": "ns-123"}
+        mocks["delete_athena_workgroup"].assert_called_once_with("wg-1")
+        mocks["delete_smu_project"].assert_called_once_with("ns-123", {"dataZoneProjectId": "proj-1"})
+        ns_record.get.assert_called_once_with({"PK": "NS#ns-123", "SK": "METADATA"}, consistent_read=True)
+
     def test_calls_all_platform_cleanup_steps(self):
         from coa_control_plane.namespace.deletion_pipeline import delete_platform
 

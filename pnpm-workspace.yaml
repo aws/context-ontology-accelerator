@@ -100,9 +100,12 @@ overrides:
   # nx 22.7.x pins smol-toml 1.6.1; 1.9.0 carries the malformed-TOML DoS and
   # quadratic parseKey fixes (same major).
   "smol-toml@<1.9.0": 1.9.0
-  # follow-redirects <1.16.1 — cross-origin credential/header leak on redirect
-  # (GHSA, HIGH). Transitive via axios. 1.16.1 is the patched floor; same major.
-  "follow-redirects@<1.16.1": 1.16.1
+  # follow-redirects <1.16.2 — cross-origin credential/header leak on redirect
+  # (GHSA, HIGH). 1.16.1 still drops a sensitiveHeaders array built in another
+  # JS realm (instanceof Array check), GHSA-mrwp-f3q8-3g9p. Transitive via axios
+  # (^1.16.0) and nx 22.7.x, which pins 1.16.0 exactly. 1.16.2 is the patched
+  # floor; same major.
+  "follow-redirects@<1.16.2": 1.16.2
   # source-map-js <1.2.2 — event-loop DoS (GHSA-68fv-2mgg-jv7q, HIGH). Transitive
   # via vite/postcss in web-app. 1.2.2 is the patched floor; same major.
   "source-map-js@<1.2.2": 1.2.2

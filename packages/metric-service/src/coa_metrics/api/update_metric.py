@@ -5,7 +5,8 @@
 
 PUT /namespaces/{namespaceId}/metrics/{name} → 200 OK
 
-Full replacement of metric definition (not partial update).
+Full replacement of metric definition (not partial update), except that an
+omitted ``ontologyConcepts`` keeps the stored concepts (only ``[]`` clears them).
 Flow: validate → check exists → delete old triples → write new → re-embed → emit event.
 """
 
@@ -154,8 +155,9 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         return api_response(400, {"message": blocking[0]["message"], "errors": blocking})
     warnings = [f for f in findings if f.get("field") not in BLOCKING_CHECKS]
 
-    # Resolve ontology concept names to full URIs (best-effort)
-    if metric.ontology_concepts:
+    # Resolve ontology concept names to full URIs (best-effort). Concepts kept
+    # from the stored metric (request omitted the field) are already resolved.
+    if request.ontology_concepts and metric.ontology_concepts:
         try:
             metric.ontology_concepts = _get_neptune().resolve_class_uris(namespace, metric.ontology_concepts)
         except Exception as exc:
@@ -211,7 +213,20 @@ def _build_updated_metric(
     caller: str,
     existing: MetricDefinition,
 ) -> MetricDefinition:
-    """Build updated MetricDefinition from validated Pydantic model. Name comes from path."""
+    """Build updated MetricDefinition from validated Pydantic model. Name comes from path.
+
+    A full replacement, with one exception: ``ontologyConcepts`` omitted from the
+    request KEEPS the stored concepts, and only an explicit ``[]`` clears them. A
+    caller without ``viewOntology`` reads the metric with the field withheld, so
+    "absent" on its save must not erase concepts it was never shown. Blank SQL or
+    a blank ``sourceTable`` (the withheld form of those fields) is rejected rather
+    than written.
+    """
+    if not request.source_table.strip():
+        raise ValueError("sourceTable must not be blank")
+    if not request.expression.dialects or any(not d.expression.strip() for d in request.expression.dialects):
+        raise ValueError("expression must contain at least one non-blank SQL dialect")
+
     dialects = []
     for d in request.expression.dialects:
         dialect_name = d.dialect.upper()
@@ -249,7 +264,9 @@ def _build_updated_metric(
         unit=request.unit,
         return_type=request.return_type,
         ai_context=ai_context,
-        ontology_concepts=request.ontology_concepts or [],
+        ontology_concepts=(
+            list(existing.ontology_concepts) if request.ontology_concepts is None else list(request.ontology_concepts)
+        ),
         defined_by=caller,
         effective_from=existing.effective_from or datetime.now(UTC).strftime("%Y-%m-%d"),
         # Full replace, like unit and returnType: an absent or null label clears it.

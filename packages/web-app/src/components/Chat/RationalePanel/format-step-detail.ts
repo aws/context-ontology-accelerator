@@ -294,6 +294,17 @@ const stepFormatters: Record<string, Formatter> = {
 
   "t1.execute": _executeFormatter,
   "t2.sql.execute": _executeFormatter,
+
+  "t2.sql.vote": (d, t) => {
+    if (d.skippedReason === "deadline")
+      return t("Vote skipped: not enough time left before the deadline.");
+    if (typeof d.votes === "number" && typeof d.k === "number")
+      return t("{votes} of {k} SQL candidates agreed on the result.", {
+        votes: d.votes,
+        k: d.k,
+      });
+    return t("SQL candidates compared.");
+  },
   "t2.vkg.execute": _executeFormatter,
 
   "t3.vector_search": (d, t) => {
@@ -453,6 +464,7 @@ const STEP_FALLBACKS = {
   "t2.vkg.firewall": "SQL firewall passed.",
   "t1.execute": "Query executed.",
   "t2.sql.execute": "Query executed.",
+  "t2.sql.vote": "SQL candidates compared.",
   "t2.vkg.execute": "Query executed.",
   "t3.vector_search": "Knowledge base searched.",
   "t3.graph_traverse": "Graph traversed.",

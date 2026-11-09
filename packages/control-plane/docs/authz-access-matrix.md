@@ -9,7 +9,7 @@
 | Namespace | `namespace-owner` | Full access within their namespace |
 | Namespace | `namespace-maintainer` | Full access within their namespace (same as owner) |
 | Namespace | `data-steward` | Manage data assets + read/query within their namespace |
-| Namespace | `data-analyst` | Read/query only within their namespace |
+| Namespace | `data-analyst` | Read/query only within their namespace; **schema-blind** — denied `viewSource`/`viewOntology`, so it cannot read raw source table/column or ontology class/property names |
 | — | (any authenticated user) | Can list namespaces |
 
 ## API → Cedar Action Mapping
@@ -48,16 +48,17 @@ here, so this table cannot silently drift out of sync with the service again.
 
 | API Endpoint | Method | Cedar Action | Resource Type |
 |---|---|---|---|
-| `/namespaces/{namespaceId}/sources` | GET | `viewNamespace` | Source |
+| `/namespaces/{namespaceId}/sources` | GET | `viewSource` | Source |
 | `/namespaces/{namespaceId}/sources` | POST | `manageSource` | Source |
 | `/namespaces/{namespaceId}/sources/upload-urls` | POST | `manageSource` | Source |
-| `/namespaces/{namespaceId}/sources/{sourceId}` | GET | `viewNamespace` | Source |
+| `/namespaces/{namespaceId}/sources/{sourceId}` | GET | `viewSource` | Source |
 | `/namespaces/{namespaceId}/sources/{sourceId}` | DELETE | `manageSource` | Source |
 | `/namespaces/{namespaceId}/sources/{sourceId}/rescan` | POST | `manageSource` | Source |
 | `/namespaces/{namespaceId}/sources/{sourceId}/metadata` | PUT | `manageSource` | Source |
-| `/namespaces/{namespaceId}/sources/{sourceId}/tables` | GET | `viewNamespace` | Source |
-| `/namespaces/{namespaceId}/sources/{sourceId}/tables/{tableId}` | GET | `viewNamespace` | Source |
-| `/namespaces/{namespaceId}/sources/{sourceId}/scan/{jobId}` | GET | `viewNamespace` | Source |
+| `/namespaces/{namespaceId}/sources/{sourceId}/tables` | GET | `viewSource` | Source |
+| `/namespaces/{namespaceId}/sources/{sourceId}/tables/{tableId}` | GET | `viewSource` | Source |
+| `/namespaces/{namespaceId}/sources/{sourceId}/scan` | GET | `viewSource` | Source |
+| `/namespaces/{namespaceId}/sources/{sourceId}/scan/{jobId}` | GET | `viewSource` | Source |
 | `/namespaces/{namespaceId}/sources/{sourceId}/approve` | POST | `manageSource` | Source |
 | `/namespaces/{namespaceId}/sources/{sourceId}/reject` | POST | `manageSource` | Source |
 | `/namespaces/{namespaceId}/sources/{sourceId}/tables/{tableId}/review` | PUT | `manageSource` | Source |
@@ -79,47 +80,48 @@ here, so this table cannot silently drift out of sync with the service again.
 | `/namespaces/{namespaceId}/bulk-delete-metrics` | POST | `manageMetric` | Metric |
 | `/namespaces/{namespaceId}/import-osi` | POST | `manageMetric` | Metric |
 | `/namespaces/{namespaceId}/import-osi/upload-url` | POST | `manageMetric` | Metric |
-| `/namespaces/{namespaceId}/import-jobs/{jobId}` | GET | `readMetric` | Metric |
-| `/namespaces/{namespaceId}/export-osi` | GET | `readMetric` | Metric |
+| `/namespaces/{namespaceId}/import-jobs/{jobId}` | GET | `viewSource` | Metric |
+| `/namespaces/{namespaceId}/export-osi` | GET | `viewSource` | Metric |
 
 ### Ontology induction, graph & catalog
 
 | API Endpoint | Method | Cedar Action | Resource Type |
 |---|---|---|---|
 | `/namespaces/{namespaceId}/induce` | POST | `manageOntology` | Ontology |
-| `/namespaces/{namespaceId}/induce/jobs` | GET | `viewNamespace` | Ontology |
-| `/namespaces/{namespaceId}/induce/jobs/{jobId}` | GET | `viewNamespace` | Ontology |
-| `/namespaces/{namespaceId}/induce/datasources/induced` | GET | `viewNamespace` | Ontology |
-| `/namespaces/{namespaceId}/proposals` | GET | `viewNamespace` | OntologyProposal |
-| `/namespaces/{namespaceId}/proposals/{proposalId}` | GET | `viewNamespace` | OntologyProposal |
+| `/namespaces/{namespaceId}/induce/jobs` | GET | `viewOntology` | Ontology |
+| `/namespaces/{namespaceId}/induce/jobs/{jobId}` | GET | `viewOntology` | Ontology |
+| `/namespaces/{namespaceId}/induce/datasources/induced` | GET | `viewOntology` | Ontology |
+| `/namespaces/{namespaceId}/proposals` | GET | `viewOntology` | OntologyProposal |
+| `/namespaces/{namespaceId}/proposals/{proposalId}` | GET | `viewOntology` | OntologyProposal |
 | `/namespaces/{namespaceId}/proposals/{proposalId}/accept` | POST | `manageOntology` | OntologyProposal |
 | `/namespaces/{namespaceId}/proposals/{proposalId}/cancel` | POST | `manageOntology` | OntologyProposal |
 | `/namespaces/{namespaceId}/proposals/{proposalId}/validate` | POST | `manageOntology` | OntologyProposal |
-| `/namespaces/{namespaceId}/proposals/{proposalId}/validate/jobs/{jobId}` | GET | `viewNamespace` | OntologyProposal |
+| `/namespaces/{namespaceId}/proposals/{proposalId}/validate/jobs/{jobId}` | GET | `viewOntology` | OntologyProposal |
 | `/namespaces/{namespaceId}/proposals/{proposalId}/infer-constraints` | POST | `manageOntology` | OntologyProposal |
-| `/namespaces/{namespaceId}/proposals/{proposalId}/infer-constraints/jobs/{jobId}` | GET | `viewNamespace` | OntologyProposal |
+| `/namespaces/{namespaceId}/proposals/{proposalId}/infer-constraints/jobs/{jobId}` | GET | `viewOntology` | OntologyProposal |
 | `/namespaces/{namespaceId}/proposals/{proposalId}/compile-constraints` | POST | `manageOntology` | OntologyProposal |
 | `/namespaces/{namespaceId}/proposals/{proposalId}/upload-url` | POST | `manageOntology` | OntologyProposal |
 | `/namespaces/{namespaceId}/proposals/update` | POST | `manageOntology` | OntologyProposal |
 | `/namespaces/{namespaceId}/proposals/reject` | POST | `manageOntology` | OntologyProposal |
-| `/namespaces/{namespaceId}/ontologies` | GET | `viewNamespace` | Ontology |
+| `/namespaces/{namespaceId}/ontologies` | GET | `viewOntology` | Ontology |
 | `/namespaces/{namespaceId}/ontologies` | DELETE | `manageOntology` | Ontology |
-| `/namespaces/{namespaceId}/ontologies/{ontologyId}` | GET | `viewNamespace` | Ontology |
-| `/namespaces/{namespaceId}/ontologies/{ontologyId}/download` | GET | `viewNamespace` | Ontology |
+| `/namespaces/{namespaceId}/ontologies/{ontologyId}` | GET | `viewOntology` | Ontology |
+| `/namespaces/{namespaceId}/ontologies/{ontologyId}/download` | GET | `viewOntology` | Ontology |
 | `/namespaces/{namespaceId}/ontologies/upload-url` | POST | `manageOntology` | Ontology |
 | `/namespaces/{namespaceId}/ontologies/{ontologyId}/upload` | POST | `manageOntology` | Ontology |
 | `/namespaces/{namespaceId}/ontologies/{ontologyId}/fetch` | POST | `manageOntology` | Ontology |
 | `/namespaces/{namespaceId}/ontologies/{ontologyId}/ingest-from-s3` | POST | `manageOntology` | Ontology |
-| `/namespaces/{namespaceId}/ontologies/{ontologyId}/ingest-status/{jobId}` | GET | `viewNamespace` | Ontology |
-| `/namespaces/{namespaceId}/ontology/foundational` | GET | `viewNamespace` | Ontology |
+| `/namespaces/{namespaceId}/ontologies/{ontologyId}/ingest-status/{jobId}` | GET | `viewOntology` | Ontology |
+| `/namespaces/{namespaceId}/ontology/foundational` | GET | `viewOntology` | Ontology |
 | `/namespaces/{namespaceId}/ontology/foundational/{key}/load` | POST | `manageOntology` | Ontology |
 | `/namespaces/{namespaceId}/proposals/{proposalId}/repair-datatypes` | POST | `manageOntology` | OntologyProposal |
 | `/namespaces/{namespaceId}/graph/traverse` | POST | `traverseGraph` | Namespace |
-| `/namespaces/{namespaceId}/graph/ontology-overview` | GET | `viewNamespace` | Ontology |
-| `/namespaces/{namespaceId}/graph/search` | GET | `viewNamespace` | Ontology |
-| `/namespaces/{namespaceId}/graph/class` | GET | `viewNamespace` | Ontology |
-| `/namespaces/{namespaceId}/graph/object-property` | GET | `viewNamespace` | Ontology |
-| `/namespaces/{namespaceId}/graph/datatype-property` | GET | `viewNamespace` | Ontology |
+| `/namespaces/{namespaceId}/graph/ontology-overview` | GET | `viewOntology` | Ontology |
+| `/namespaces/{namespaceId}/schema` | GET | `viewOntology` | Namespace |
+| `/namespaces/{namespaceId}/graph/search` | GET | `viewOntology` | Ontology |
+| `/namespaces/{namespaceId}/graph/class` | GET | `viewOntology` | Ontology |
+| `/namespaces/{namespaceId}/graph/object-property` | GET | `viewOntology` | Ontology |
+| `/namespaces/{namespaceId}/graph/datatype-property` | GET | `viewOntology` | Ontology |
 
 Two judgement calls worth surfacing:
 
@@ -172,6 +174,8 @@ platform-only gate.
 |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 | `list` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ (Namespace only) |
 | `viewNamespace` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| `viewSource` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
+| `viewOntology` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
 | `query` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | `traverseGraph` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | `readMetric` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
@@ -184,6 +188,91 @@ platform-only gate.
 | `deleteNamespace` | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
 | `grantPermissions` | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
 | `manageRoles` | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
+
+## Schema Visibility (`viewSource` / `viewOntology`)
+
+`viewNamespace` was decomposed into three distinct read actions so a
+**schema-blind `data-analyst`** can query and use the namespace console without
+ever seeing the raw schema vocabulary (ADR:
+`decompose-viewnamespace-schema-visibility`). Every role except `data-analyst`
+holds all three, so this is behaviour-preserving for everyone else.
+
+| Action | Gates | Held by `data-analyst`? |
+|---|---|---|
+| `viewNamespace` | Namespace metadata, roles, grants — the reads the console needs | ✅ yes |
+| `viewSource` | Source **schema** reads — table/column names (`/sources…` GET rows) | ❌ no |
+| `viewOntology` | Ontology **schema** reads — class/property names (induce, proposals, ontologies, graph GET rows) | ❌ no |
+
+Enforcement points (all must agree; each fails closed unless stated):
+
+1. **Control-plane route map** (`handler.py` `_PATH_MAPPING`) — the GET rows
+   above are gated on `viewSource`/`viewOntology`; the 5 namespace
+   metadata/roles/grants reads stay on `viewNamespace`.
+2. **Serve response scrub** (`context-manager` `coa_serve/schema_visibility.py`)
+   — for a caller without the right, serve withholds the schema-bearing fields
+   of a query response (generated SQL/SPARQL, trace step details) and redacts
+   withheld identifiers from the synthesized answer, string result-row values
+   and `supportingContent`; error text is sanitized the same way; replayed
+   session turns are re-scrubbed with the caller's CURRENT rights; and SQL that
+   references no table or only literals is refused rather than answered, so it
+   cannot be used to probe the schema.
+3. **MCP tool map** (`mcp-server` `grant_resolver.py` `TOOL_CEDAR_ACTION`) —
+   `describe_schema` is hard-gated on `viewOntology` (pure ontology dump).
+   `translate_sparql` and `graph_traversal` stay on their working-tool action
+   (`query` / `traverseGraph`) so a schema-blind analyst can still RUN them.
+4. **MCP output suppression** (`mcp-server` `server.py`) — the second layer
+   behind serve: those two tools' schema-bearing fields are withheld unless the
+   caller holds `viewOntology` (below).
+5. **Metric-service field withholding** (`metric-service`
+   `coa_metrics/api/schema_visibility.py`) — metric reads stay on `readMetric`,
+   which every role holds; the SQL expression and `sourceTable` are blanked
+   without `viewSource` and `ontologyConcepts` is dropped without
+   `viewOntology`. An update that omits `ontologyConcepts` keeps the stored
+   concepts, and blank SQL or a blank `sourceTable` is rejected, so a save from
+   a withheld form cannot erase them.
+6. **Grant-listing override stripping** (`control-plane`
+   `grants/schema_visibility.py`) — `tableAllowlist` / `columnDenylist` are
+   stripped from namespace grant listings without `canViewSource`, and from the
+   caller's own listing on every grant outside `viewSourceNamespaces` (`*` =
+   platform-wide `viewSource`, every namespace visible).
+
+The authorizer forwards the rights to points 5 and 6 as authorizer-context
+flags (`canViewSource`, `canViewOntology`, `viewSourceNamespaces`; names and
+parsing shared in `libs/common` `coa_authorization/schema_visibility.py`). Only
+`"true"` (case-insensitive) grants. Missing-flag rules:
+
+- **Metric reads:** if NEITHER flag is present the definition is returned in
+  full. This is deliberate, for the deploy window in which the metric service is
+  live before the authorizer that sets the flags, and for dev mode without a
+  roles table. A request carrying one flag withholds the other.
+- **Grant listings:** a missing key withholds (fail closed). The authorizer
+  therefore always emits the key on those routes when it allows the request; in
+  dev mode without a roles table it emits the withholding value (`"false"` /
+  `""`).
+
+### Artifact gate on the serve path (gating B)
+
+The Playground/agent debug artifacts are gated per-artifact by exactly the
+schema each discloses: the generated **SQL** (`query_used`) on `viewSource`, the
+generated **SPARQL** (`sparql_generated`) on `viewOntology`
+(`context-manager` orchestrator `_resolve_include_sql` / `_resolve_include_sparql`,
+fail-closed). Artifacts are returned to any role holding the right (the coarse
+role-list pre-gate was removed in favour of this single per-artifact
+enforcement point); a `data-analyst`, holding neither, never sees them.
+
+### Output suppression on the MCP tools
+
+`translate_sparql` and `graph_traversal` are authorized on `query`/`traverseGraph`
+(which `data-analyst` holds), so the tools run — but their whole schema-bearing
+response fields are withheld unless the caller separately holds `viewOntology`:
+`translate_sparql` drops `sparqlQuery`; `graph_traversal` drops
+`entities`/`relationships`. Whole-field, shape-preserving withhold (the field is
+emptied, not deleted), fail-closed: the `viewOntology` decision is evaluated
+once by `resolve_grant` from the same loaded policy text as the tool action,
+cached on the resolved profile (`schemaVisibility`), and any evaluation error
+yields "withhold". Serve has already stripped these fields and every trace step
+`detail` before MCP sees the response, so this layer is defense in depth.
+Local dev (auth disabled) is exempt so development is not blinded.
 
 ## Scope Notes
 
@@ -209,8 +298,9 @@ role-overridable default.
 
 **Still allowed while `ARCHIVED`:**
 
-- All reads — `viewNamespace`, `list`, `query`, `readMetric`, `searchDocuments`
-  (queries against archived namespaces are intentionally permitted).
+- All reads — `viewNamespace`, `viewSource`, `viewOntology`, `list`, `query`,
+  `readMetric`, `searchDocuments` (queries against archived namespaces are
+  intentionally permitted).
 - `setNamespaceStatus` — so the namespace can be reactivated (`ARCHIVED → ACTIVE`).
   This is why the status endpoint maps to its own action rather than
   `manageNamespace`.

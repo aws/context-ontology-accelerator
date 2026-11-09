@@ -30,6 +30,7 @@ import type {
 } from "../api-hooks/use-metrics";
 import type { TimeGrain, SqlDialect } from "@coa/control-plane-client";
 import { SqlDialect as SqlDialectEnum } from "@coa/control-plane-client";
+import { isMetricDefinitionWithheld } from "../api-hooks/metric-withheld";
 import { useListSources } from "../api-hooks/use-list-sources";
 import { useListSourceTables } from "../api-hooks/use-list-source-tables";
 import { useApiClient } from "@components/ApiClientProvider";
@@ -174,6 +175,14 @@ export const MetricForm: React.FC = () => {
   const [instructions, setInstructions] = useState("");
   const [examples, setExamples] = useState<Array<{ value: string }>>([]);
   const [ontologyConcepts, setOntologyConcepts] = useState<string[]>([]);
+  // Whether the user added or removed a concept. On update an omitted
+  // `ontologyConcepts` keeps the stored list, so the field is sent only when
+  // the user changed it or the loaded metric carried it.
+  const [conceptsTouched, setConceptsTouched] = useState(false);
+  const changeConcepts = (next: string[]) => {
+    setConceptsTouched(true);
+    setOntologyConcepts(next);
+  };
   const [conceptInput, setConceptInput] = useState("");
   const [conceptOptions, setConceptOptions] = useState<
     Array<{ value: string; label: string; description?: string }>
@@ -264,9 +273,39 @@ export const MetricForm: React.FC = () => {
     }
   }, [isEdit, existingData]);
 
+  // The server withholds a metric's SQL and source table from a caller without
+  // source-schema visibility (or when it cannot evaluate that right). Saving
+  // such a form would write the blanks back over the stored definition, so the
+  // edit is blocked instead.
+  const definitionWithheld = useMemo(() => {
+    if (!isEdit || !existingData?.metric) return false;
+    return isMetricDefinitionWithheld(existingData.metric as MetricDefinition);
+  }, [isEdit, existingData]);
+
+  // The server leaves `ontologyConcepts` out both when a metric has none and
+  // when the caller's role cannot see them, so the form cannot tell the two
+  // apart from the response alone.
+  const loadedHadConcepts = Boolean(
+    isEdit &&
+    existingData?.metric &&
+    Object.prototype.hasOwnProperty.call(
+      existingData.metric,
+      "ontologyConcepts",
+    ),
+  );
+
   const handleSubmit = () => {
     setFormError(null);
     setWarnings([]);
+
+    if (definitionWithheld) {
+      setFormError(
+        t(
+          "This metric's definition is hidden for your role, so it can't be edited.",
+        ),
+      );
+      return;
+    }
 
     if (!name.trim()) {
       setFormError(t("Name is required"));
@@ -325,7 +364,13 @@ export const MetricForm: React.FC = () => {
       };
     }
 
-    if (ontologyConcepts.length > 0) {
+    // Create: send only a non-empty list. Update: an omitted field keeps the
+    // stored concepts, so never send `[]` for a list the user did not change
+    // and the response did not carry (it may have been withheld).
+    const sendConcepts = isEdit
+      ? conceptsTouched || loadedHadConcepts
+      : ontologyConcepts.length > 0;
+    if (sendConcepts) {
       (input as Record<string, unknown>).ontologyConcepts = ontologyConcepts;
     }
 
@@ -362,7 +407,12 @@ export const MetricForm: React.FC = () => {
           >
             {t("Cancel")}
           </Button>
-          <Button variant="primary" onClick={handleSubmit} loading={isPending}>
+          <Button
+            variant="primary"
+            onClick={handleSubmit}
+            loading={isPending}
+            disabled={definitionWithheld}
+          >
             {isEdit ? t("Save changes") : t("Create metric")}
           </Button>
         </SpaceBetween>
@@ -370,6 +420,13 @@ export const MetricForm: React.FC = () => {
       errorText={formError}
     >
       <SpaceBetween size="l">
+        {definitionWithheld && (
+          <Alert type="info" data-testid="metric-definition-withheld">
+            {t(
+              "This metric's definition is hidden for your role, so it can't be edited.",
+            )}
+          </Alert>
+        )}
         {warnings.length > 0 && (
           <Alert type="warning" dismissible onDismiss={() => setWarnings([])}>
             {warnings.join("; ")}
@@ -705,7 +762,7 @@ export const MetricForm: React.FC = () => {
                 onSelect={({ detail }) => {
                   const uri = detail.value;
                   if (uri && !ontologyConcepts.includes(uri)) {
-                    setOntologyConcepts([...ontologyConcepts, uri]);
+                    changeConcepts([...ontologyConcepts, uri]);
                   }
                   setConceptInput("");
                 }}
@@ -724,7 +781,7 @@ export const MetricForm: React.FC = () => {
                       key={i}
                       variant="inline-link"
                       onClick={() =>
-                        setOntologyConcepts(
+                        changeConcepts(
                           ontologyConcepts.filter((_, idx) => idx !== i),
                         )
                       }

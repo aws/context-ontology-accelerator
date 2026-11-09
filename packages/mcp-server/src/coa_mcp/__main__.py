@@ -3,7 +3,8 @@
 
 """Entrypoint for `python -m coa_mcp`.
 
-AgentCore Runtime overrides CMD to run this module as the MCP protocol server.
+The shared container image runs this module instead of the Context Manager when
+SCL_MCP_MODE=true (packages/context-manager/Dockerfile CMD); mcp-stack.ts sets it.
 """
 
 from __future__ import annotations

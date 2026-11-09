@@ -22,6 +22,10 @@ from coa_mcp.tools.execution import ContextManagerError
 
 from .conftest import _TEST_AUDIENCE, _TEST_ISSUER, _TEST_KID, _private_key, create_test_token
 
+# Stand-in for the policy text ``grant_resolver._evaluate_cedar`` returns on allow.
+# Not valid Cedar, so every follow-up schema-view evaluation denies (fail closed).
+_NO_POLICY_TEXT = "// stub policy text"
+
 
 class _FakeRequest:
     """Minimal stand-in for a Starlette request with a headers mapping."""
@@ -163,6 +167,10 @@ class TestResolveCallerAndProfile:
     @pytest.mark.asyncio
     async def test_auth_enabled_resolves_profile(self, monkeypatch):
         monkeypatch.setattr(server.config, "auth_enabled", True)
+        # A realistic auth-enabled deployment has a roles table; the Cedar gate
+        # then runs and must allow before the profile resolves.
+        monkeypatch.setattr("coa_mcp.auth.grant_resolver._ROLES_TABLE", "test-roles-table")
+        monkeypatch.setattr("coa_mcp.auth.grant_resolver._evaluate_cedar", lambda *a, **k: _NO_POLICY_TEXT)
         monkeypatch.setattr(
             "coa_serve.role_resolver.resolve_profile",
             lambda **kwargs: _serve_profile(),
@@ -273,6 +281,44 @@ class TestListMetricsTool:
         assert captured["authorizer_context"] is None
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("visibility", "expected"),
+        [
+            ({}, ("false", "false")),
+            ({"viewSource": True, "viewOntology": True}, ("true", "true")),
+            ({"viewSource": True, "viewOntology": False}, ("true", "false")),
+        ],
+    )
+    async def test_authenticated_call_forwards_schema_flags(self, monkeypatch, visibility, expected):
+        """The metric service withholds SQL/tables/concepts unless these flags are "true";
+        they come from the decisions resolve_grant cached on the profile (no reload)."""
+        monkeypatch.setattr(server.config, "auth_enabled", True)
+        monkeypatch.setattr(server, "_get_lambda_client", lambda: object())
+        monkeypatch.setattr(server, "_extract_bearer_token", lambda ctx: "tok")
+
+        async def fake_resolve(namespace_id, ctx, cedar_action=None):
+            caller = server.CallerIdentity(
+                user_id="u@example.com", agent_id=None, namespaces=[namespace_id], roles=[], raw_claims={}
+            )
+            return caller, {
+                "userId": "u@example.com",
+                "globalRoles": [],
+                "resourceRoles": [],
+                "schemaVisibility": visibility,
+            }
+
+        captured: dict = {}
+
+        async def fake_delegate(lc, ns, token, **kwargs):
+            captured["ctx"] = kwargs.get("authorizer_context")
+            return {"metrics": []}
+
+        monkeypatch.setattr(server, "_resolve_caller_and_profile", fake_resolve)
+        monkeypatch.setattr(server.discovery, "list_metrics", fake_delegate)
+        await server.list_metrics(None, "sales")
+        assert (captured["ctx"]["canViewSource"], captured["ctx"]["canViewOntology"]) == expected
+
+    @pytest.mark.asyncio
     async def test_auth_error_maps_to_value_error(self, monkeypatch):
         monkeypatch.setattr(server.config, "auth_enabled", True)
         with pytest.raises(ValueError, match="Missing Authorization header"):
@@ -290,6 +336,8 @@ class TestListMetricsTool:
     @pytest.mark.asyncio
     async def test_auth_enabled_builds_authorizer_context(self, monkeypatch):
         monkeypatch.setattr(server.config, "auth_enabled", True)
+        monkeypatch.setattr("coa_mcp.auth.grant_resolver._ROLES_TABLE", "test-roles-table")
+        monkeypatch.setattr("coa_mcp.auth.grant_resolver._evaluate_cedar", lambda *a, **k: _NO_POLICY_TEXT)
         monkeypatch.setattr(server, "_get_lambda_client", lambda: object())
         monkeypatch.setattr(
             "coa_serve.role_resolver.resolve_profile",
@@ -654,3 +702,175 @@ class TestQueryToolStrategySchema:
             "nl_to_sql_first",
             "deep-reasoning",
         }
+
+
+@pytest.mark.unit
+class TestWithholdSchemaFieldsHelper:
+    """_withhold_schema_fields — whole-field, shape-preserving withhold."""
+
+    def test_list_field_becomes_empty_list(self):
+        out = server._withhold_schema_fields(
+            {"entities": [{"uri": "x", "label": "Acme"}], "relationships": [{"a": 1}], "trace": ["t"]},
+            server._GRAPH_TRAVERSAL_SCHEMA_KEYS,
+        )
+        assert out["entities"] == []
+        assert out["relationships"] == []
+        # Non-schema field is untouched (shape preserved for the client).
+        assert out["trace"] == ["t"]
+
+    def test_string_field_becomes_empty_string(self):
+        out = server._withhold_schema_fields(
+            {"sparqlQuery": "SELECT ?x WHERE { ?x a :Customer }", "confidence": {"score": 0.9}},
+            server._TRANSLATE_SPARQL_SCHEMA_KEYS,
+        )
+        assert out["sparqlQuery"] == ""
+        assert out["confidence"] == {"score": 0.9}
+
+    def test_absent_key_is_noop(self):
+        out = server._withhold_schema_fields({"confidence": {"score": 0.1}}, server._TRANSLATE_SPARQL_SCHEMA_KEYS)
+        assert out == {"confidence": {"score": 0.1}}
+
+
+@pytest.mark.unit
+class TestCallerCanViewOntologyWiring:
+    """The real profile -> suppression-gate wiring (not stubbed).
+
+    A wrong key or action name would withhold the fields from EVERY caller,
+    silently blinding owners; the suppression tests below stub
+    _caller_can_view_ontology, so this pins the mapping itself.
+    """
+
+    @pytest.mark.parametrize(
+        ("visibility", "expected"),
+        [
+            ({"viewSource": True, "viewOntology": True}, True),
+            ({"viewSource": True, "viewOntology": False}, False),
+            ({}, False),
+        ],
+    )
+    def test_reads_view_ontology_from_resolved_profile(self, visibility, expected):
+        from coa_mcp.auth.grant_resolver import ResolvedProfile
+
+        profile = ResolvedProfile(
+            namespace="sales",
+            user_id="owner@example.com",
+            resource_roles=[{"role": "namespace-owner", "resourceUID": "sales"}],
+            schema_visibility=visibility,
+        ).to_profile_dict()
+        assert server._caller_can_view_ontology(profile) is expected
+
+    def test_schema_visibility_is_not_forwarded_to_the_context_manager(self):
+        from coa_mcp.tools.execution import _build_cm_profile
+
+        cm_profile = _build_cm_profile(
+            {"userId": "u", "namespace": "sales", "schemaVisibility": {"viewOntology": True}}
+        )
+        assert "schemaVisibility" not in cm_profile
+
+
+@pytest.mark.unit
+class TestSchemaBlindOutputSuppression:
+    """End-to-end gate: the two working tools RUN for a schema-blind caller but
+    their schema-bearing fields are withheld unless the caller holds viewOntology.
+
+    Drives the real handlers with auth ENABLED, stubbing the auth/profile resolve,
+    token extraction, CM client and backend delegate, and toggling only the
+    viewOntology probe (_caller_can_view_ontology) to prove it is the deciding gate.
+    """
+
+    def _stub_auth(self, monkeypatch, can_view_ontology: bool):
+        monkeypatch.setattr(server.config, "auth_enabled", True)
+
+        async def fake_resolve(namespace_id, ctx, cedar_action=None):
+            return (
+                server.CallerIdentity(
+                    user_id="analyst", agent_id=None, namespaces=[namespace_id], roles=["data-analyst"], raw_claims={}
+                ),
+                {"userId": "analyst", "globalRoles": ["data-analyst"], "resourceRoles": [], "namespace": namespace_id},
+            )
+
+        monkeypatch.setattr(server, "_resolve_caller_and_profile", fake_resolve)
+        monkeypatch.setattr(server, "_extract_bearer_token", lambda ctx: "tok")
+        monkeypatch.setattr(server, "_get_cm_client", lambda: object())
+        monkeypatch.setattr(server, "_caller_can_view_ontology", lambda profile: can_view_ontology)
+
+    @pytest.mark.asyncio
+    async def test_translate_sparql_withheld_without_view_ontology(self, monkeypatch):
+        self._stub_auth(monkeypatch, can_view_ontology=False)
+
+        async def fake_delegate(cm, text, ns, profile, token):
+            return {"sparqlQuery": "SELECT ?x WHERE { ?x a :Customer }", "confidence": {"score": 0.9}}
+
+        monkeypatch.setattr(server.execution, "execute_translate_sparql", fake_delegate)
+        parsed = json.loads(await server.translate_sparql(None, "revenue", "sales"))
+        # Tool ran (confidence present) but the schema-bearing SPARQL is withheld.
+        assert parsed["sparqlQuery"] == ""
+        assert parsed["confidence"] == {"score": 0.9}
+
+    @pytest.mark.asyncio
+    async def test_translate_sparql_returned_with_view_ontology(self, monkeypatch):
+        self._stub_auth(monkeypatch, can_view_ontology=True)
+
+        async def fake_delegate(cm, text, ns, profile, token):
+            return {"sparqlQuery": "SELECT ?x WHERE { ?x a :Customer }", "confidence": {"score": 0.9}}
+
+        monkeypatch.setattr(server.execution, "execute_translate_sparql", fake_delegate)
+        parsed = json.loads(await server.translate_sparql(None, "revenue", "sales"))
+        assert parsed["sparqlQuery"] == "SELECT ?x WHERE { ?x a :Customer }"
+
+    @pytest.mark.asyncio
+    async def test_graph_traversal_withheld_without_view_ontology(self, monkeypatch):
+        self._stub_auth(monkeypatch, can_view_ontology=False)
+
+        async def fake_delegate(cm, start_uri, ns, profile, token, **kwargs):
+            return {
+                "entities": [{"uri": "urn:c:1", "label": "Acme Corp", "type": ":Customer"}],
+                "relationships": [{"sourceUri": "urn:c:1", "targetUri": "urn:o:1", "predicate": ":placedOrder"}],
+                "trace": ["step"],
+            }
+
+        monkeypatch.setattr(server.execution, "execute_graph_traversal", fake_delegate)
+        parsed = json.loads(await server.graph_traversal(None, "urn:c:1", "sales"))
+        # Tool ran (trace present) but entity/relationship schema is withheld.
+        assert parsed["entities"] == []
+        assert parsed["relationships"] == []
+        assert parsed["trace"] == ["step"]
+
+    @pytest.mark.asyncio
+    async def test_graph_traversal_returned_with_view_ontology(self, monkeypatch):
+        self._stub_auth(monkeypatch, can_view_ontology=True)
+
+        async def fake_delegate(cm, start_uri, ns, profile, token, **kwargs):
+            return {
+                "entities": [{"uri": "urn:c:1", "label": "Acme Corp"}],
+                "relationships": [{"sourceUri": "urn:c:1", "targetUri": "urn:o:1"}],
+                "trace": [],
+            }
+
+        monkeypatch.setattr(server.execution, "execute_graph_traversal", fake_delegate)
+        parsed = json.loads(await server.graph_traversal(None, "urn:c:1", "sales"))
+        assert parsed["entities"][0]["label"] == "Acme Corp"
+        assert len(parsed["relationships"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_auth_disabled_keeps_fields_without_view_ontology(self, monkeypatch):
+        # Local dev (auth disabled) is exempt from suppression even when the probe
+        # would deny; the probe must not even be consulted.
+        self._stub_auth(monkeypatch, can_view_ontology=False)
+        monkeypatch.setattr(server.config, "auth_enabled", False)
+        probed: list[dict] = []
+        monkeypatch.setattr(server, "_caller_can_view_ontology", lambda profile: probed.append(profile) or False)
+
+        async def fake_sparql(cm, text, ns, profile, token):
+            return {"sparqlQuery": "SELECT ?x WHERE { ?x a :Customer }", "confidence": {"score": 0.9}}
+
+        async def fake_traverse(cm, start_uri, ns, profile, token, **kwargs):
+            return {"entities": [{"uri": "urn:c:1", "label": "Acme Corp"}], "relationships": [{"p": 1}], "trace": []}
+
+        monkeypatch.setattr(server.execution, "execute_translate_sparql", fake_sparql)
+        monkeypatch.setattr(server.execution, "execute_graph_traversal", fake_traverse)
+        sparql = json.loads(await server.translate_sparql(None, "revenue", "sales"))
+        graph = json.loads(await server.graph_traversal(None, "urn:c:1", "sales"))
+        assert sparql["sparqlQuery"] == "SELECT ?x WHERE { ?x a :Customer }"
+        assert graph["entities"][0]["label"] == "Acme Corp" and graph["relationships"] == [{"p": 1}]
+        assert probed == []

@@ -531,3 +531,58 @@ class TestArchivedGuardRouteMapping:
         assert action == "setNamespaceStatus"
         assert rtype == "Namespace"
         assert resource_id == NS_ID
+
+
+# ─── Schema-visibility actions on the resource types the authorizer uses ─────
+# ADR: decompose-viewnamespace-schema-visibility. The authorizer evaluates
+# viewSource on Source and Metric (source reads, OSI export, import jobs, the
+# canViewSource flag) and viewOntology on Ontology, OntologyProposal and
+# Namespace (/schema). Evaluated against the REAL seed .cedar files.
+
+_SCHEMA_VIEW_CHECKS = [
+    ("viewSource", "Source"),
+    ("viewSource", "Metric"),
+    ("viewOntology", "Ontology"),
+    ("viewOntology", "OntologyProposal"),
+    ("viewOntology", "Namespace"),
+]
+OTHER_NS_ID = "22222222-2222-2222-2222-222222222222"
+
+# (label, global_roles, resource_roles, expected)
+_SCHEMA_VIEW_CALLERS = [
+    ("data-analyst", [], [{"role": "data-analyst", "resourceUID": NS_ID}], False),
+    ("data-steward", [], [{"role": "data-steward", "resourceUID": NS_ID}], True),
+    ("namespace-owner", [], [{"role": "namespace-owner", "resourceUID": NS_ID}], True),
+    ("namespace-maintainer", [], [{"role": "namespace-maintainer", "resourceUID": NS_ID}], True),
+    ("platform-viewer", ["platform-viewer"], [], True),
+    ("platform-admin", ["platform-admin"], [], True),
+    ("steward-other-namespace", [], [{"role": "data-steward", "resourceUID": OTHER_NS_ID}], False),
+    ("no-role", [], [], False),
+]
+
+
+class TestSchemaViewSeedMatrix:
+    @pytest.mark.parametrize(("action", "resource_type"), _SCHEMA_VIEW_CHECKS)
+    @pytest.mark.parametrize(
+        ("label", "global_roles", "resource_roles", "expected"),
+        _SCHEMA_VIEW_CALLERS,
+        ids=[c[0] for c in _SCHEMA_VIEW_CALLERS],
+    )
+    def test_schema_view(self, action, resource_type, label, global_roles, resource_roles, expected):
+        allowed = _eval(
+            action,
+            resource_type=resource_type,
+            resource_id=NS_ID,
+            global_roles=global_roles,
+            resource_roles=resource_roles,
+            resource_attrs={"namespace": NS_ID},
+        )
+        assert allowed is expected, f"{label}: {action} on {resource_type}"
+
+    @pytest.mark.parametrize(("action", "resource_type"), _SCHEMA_VIEW_CHECKS)
+    def test_analyst_still_reads_metrics_where_schema_is_denied(self, action, resource_type):
+        # Positive control: the analyst denial above is specific to the schema
+        # actions, not a broken grant -- the same caller may read metrics.
+        roles = [{"role": "data-analyst", "resourceUID": NS_ID}]
+        assert _eval("readMetric", "Metric", NS_ID, resource_roles=roles, resource_attrs={"namespace": NS_ID})
+        assert not _eval(action, resource_type, NS_ID, resource_roles=roles, resource_attrs={"namespace": NS_ID})

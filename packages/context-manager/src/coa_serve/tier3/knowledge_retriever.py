@@ -254,6 +254,7 @@ class KnowledgeRetriever:
         trace: TraceCollector | None = None,
         retriever_strategy: RetrieverStrategy | None = None,
         model_id: str | None = None,
+        hide_governed: bool = False,
     ) -> Tier3Result:
         """Run parallel retrieval and synthesize a response.
 
@@ -272,6 +273,8 @@ class KnowledgeRetriever:
                 request. Used only when a lexical retriever is configured;
                 ignored entirely on the hand-rolled path (3.1).
             model_id: Optional per-call LLM model override for synthesis.
+            hide_governed: For a caller whose grant declares ``allowedMetrics``: traverse without the
+                governed-metrics graph.
 
         Returns:
             Tier3Result with synthesized answer, supporting content, and trace.
@@ -305,10 +308,11 @@ class KnowledgeRetriever:
 
         # Graph traversal (skip if no graph traverser)
         if self._graph is not None:
+            hidden: dict[str, Any] = {"hide_governed": True} if hide_governed else {}
             if entity_uris:
-                graph_coro = self._graph.traverse_from_uris(entity_uris, namespace)
+                graph_coro = self._graph.traverse_from_uris(entity_uris, namespace, **hidden)
             else:
-                graph_coro = self._graph.traverse(query, namespace)
+                graph_coro = self._graph.traverse(query, namespace, **hidden)
             coros.append(("graph_traverse", graph_coro))
 
         # Vector search requires an embedding and a vector retriever; skip if unavailable

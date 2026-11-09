@@ -622,6 +622,60 @@ backed by a real SQL table can — Context Ontology Accelerator marks these as *
   itself — any caller-supplied `coa:isMapped` triple is stripped on ingest, so
   the flag always reflects a genuine SQL mapping.
 
+## Business vocabulary review
+
+An induction proposal can carry a preferred business term and several observed
+variants for the same class or property. Select a class in **Proposed classes**
+on the proposal detail page; its side panel lists, under **Business
+vocabulary**, the labels of that class and of its own properties:
+
+- the preferred label is `rdfs:label`, which induction writes and the rest of
+  the console shows. If a term also has `skos:prefLabel`, the panel treats
+  `skos:prefLabel` as the preferred label and edits only that; the class list,
+  the graph and Tier 2 keep using `rdfs:label`;
+- spelling, abbreviation, and business-language variants use `skos:altLabel`;
+- each label can carry a BCP 47 language tag such as `ja` or `en`. Tags compare
+  case-insensitively and are stored lowercased, so `en-US` and `en-us` are the
+  same language, and each language has at most one preferred label. The panel
+  checks a tag against the Turtle `LANGTAG` syntax only and keeps it as typed
+  apart from case, so `iw` is not rewritten to `he` and a private-use tag such
+  as `x-foo` is accepted.
+
+Topics (`skos:Concept`) and properties that no class lists are not shown. Edit
+those in the proposal's Turtle.
+
+The actions are:
+
+| Action | Use it when |
+|--------|-------------|
+| **Edit** | The induced preferred label is wrong or awkward |
+| **Add language** | The term needs a preferred label in another language |
+| **Make preferred** | A variant is the term people actually use. The old preferred label for that language becomes a variant |
+| **Add variant** | Induction missed a synonym |
+| **Reject** | The variant is not a synonym |
+
+These edits change the proposal Turtle, not the physical source. A Japanese
+preferred label such as `解約` and a variant such as `顧客離脱` can sit on the
+same class while table and column identifiers remain unchanged. Save the
+proposal after reviewing the vocabulary, then validate and accept it as usual.
+
+Edits apply to this proposal only. A re-induction builds a new proposal from
+the source metadata, without these edits. Accepting it replaces
+`skos:altLabel` (see "Curating an ontology: re-induce and re-accept" above), so
+a variant added here is lost and a rejected one comes back. `rdfs:label` is not
+replaced: an edited preferred label stays in the ontology, and the re-induced
+label is added next to it. The class then has two `rdfs:label` values, and
+which one a query uses is not guaranteed. To keep a synonym, add it to the source metadata
+(see [Editing Metadata as a Steward](sources.md#editing-metadata-as-a-steward)).
+
+Accepted variants are stored as `skos:altLabel` and reach Tier 2 the same way
+source synonyms do (see
+[Where Each Reviewed Field Is Used](sources.md#where-each-reviewed-field-is-used)):
+they are embedded with the class that Tier 2 uses to find a question's tables,
+and passed to the model as synonyms. There is no exact lookup from a variant to
+its class yet, so a question using `顧客離脱` is not guaranteed to find the
+class whose preferred Japanese label is `解約`.
+
 ## How Ontologies Power Queries
 
 Once an ontology is ingested:

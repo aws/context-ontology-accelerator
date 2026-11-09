@@ -97,50 +97,48 @@ class TestRealCedarAuthorizer:
         assert "evaluation failed" in (d.reason or "")
 
 
+_SCHEMA_VIEWERS = [
+    {"userId": "u", "resourceRoles": [{"role": "data-steward", "resourceUID": _NS}]},
+    {"userId": "u", "resourceRoles": [{"role": "namespace-owner", "resourceUID": _NS}]},
+    {"userId": "u", "resourceRoles": [{"role": "namespace-maintainer", "resourceUID": _NS}]},
+    {"userId": "v", "globalRoles": ["platform-viewer"]},
+    {"userId": "a", "globalRoles": ["platform-admin"]},
+]
+_ANALYST = {"userId": "u", "resourceRoles": [{"role": "data-analyst", "resourceUID": _NS}]}
+
+
 @pytest.mark.unit
-class TestCanViewNamespace:
-    """``can_view_namespace`` (#1166): the viewNamespace right that gates whether
-    SQL/SPARQL artifacts may be returned — the SAME right as the Sources/Tables
-    schema view. Every role that reads schema today must get the artifacts; a
-    caller without the right (or on error / no-roles-in-prod) must not."""
+@pytest.mark.parametrize("probe", ["can_view_source", "can_view_ontology"])
+class TestCanViewSchema:
+    """``can_view_source`` / ``can_view_ontology`` against the REAL seed policies
+    (ADR: decompose-viewnamespace-schema-visibility). Every role that read schema
+    before the split keeps it — including the two enumerated seeds that needed new
+    permits (data-steward, platform-viewer) — and data-analyst is schema-blind."""
 
-    @pytest.mark.parametrize(
-        "profile",
-        [
-            {"userId": "u", "resourceRoles": [{"role": "data-analyst", "resourceUID": _NS}]},
-            {"userId": "u", "resourceRoles": [{"role": "data-steward", "resourceUID": _NS}]},
-            {"userId": "u", "resourceRoles": [{"role": "namespace-owner", "resourceUID": _NS}]},
-            {"userId": "u", "resourceRoles": [{"role": "namespace-maintainer", "resourceUID": _NS}]},
-            {"userId": "v", "globalRoles": ["platform-viewer"]},
-            {"userId": "a", "globalRoles": ["platform-admin"]},
-        ],
-    )
-    def test_viewnamespace_roles_may_view(self, profile):
-        """Exactly the roles that hold viewNamespace in the seed policies (and so
-        can read schema in Sources/Tables) are permitted the artifacts."""
+    @pytest.mark.parametrize("profile", _SCHEMA_VIEWERS)
+    def test_schema_viewer_roles_may_view(self, probe, profile):
         auth = RealCedarAuthorizer(fail_open_no_roles=False)
-        assert auth.can_view_namespace(namespace=_NS, profile=profile) is True
+        assert getattr(auth, probe)(namespace=_NS, profile=profile) is True
 
-    def test_data_analyst_other_namespace_cannot_view(self):
+    def test_data_analyst_is_schema_blind(self, probe):
         auth = RealCedarAuthorizer(fail_open_no_roles=False)
-        assert (
-            auth.can_view_namespace(
-                namespace=_NS,
-                profile={"userId": "u", "resourceRoles": [{"role": "data-analyst", "resourceUID": "other"}]},
-            )
-            is False
-        )
+        assert getattr(auth, probe)(namespace=_NS, profile=_ANALYST) is False
 
-    def test_unknown_role_cannot_view(self):
+    def test_steward_other_namespace_cannot_view(self, probe):
         auth = RealCedarAuthorizer(fail_open_no_roles=False)
-        assert auth.can_view_namespace(namespace=_NS, profile={"userId": "x", "globalRoles": ["nope"]}) is False
+        profile = {"userId": "u", "resourceRoles": [{"role": "data-steward", "resourceUID": "other"}]}
+        assert getattr(auth, probe)(namespace=_NS, profile=profile) is False
 
-    def test_no_roles_prod_cannot_view(self):
+    def test_unknown_role_cannot_view(self, probe):
+        auth = RealCedarAuthorizer(fail_open_no_roles=False)
+        assert getattr(auth, probe)(namespace=_NS, profile={"userId": "x", "globalRoles": ["nope"]}) is False
+
+    def test_no_roles_prod_cannot_view(self, probe):
         """Fail-closed: a no-roles caller in prod is denied the artifacts."""
         auth = RealCedarAuthorizer(fail_open_no_roles=False)
-        assert auth.can_view_namespace(namespace=_NS, profile={"userId": "x"}) is False
+        assert getattr(auth, probe)(namespace=_NS, profile={"userId": "x"}) is False
 
-    def test_evaluator_error_cannot_view(self, monkeypatch):
+    def test_evaluator_error_cannot_view(self, probe, monkeypatch):
         """An evaluator exception denies the view (artifacts withheld on error)."""
         import coa_serve.tier2.cedar_authorizer as mod
 
@@ -150,9 +148,7 @@ class TestCanViewNamespace:
         monkeypatch.setattr(mod, "evaluate", _boom, raising=False)
         monkeypatch.setattr("coa_authorization.policy_evaluator.evaluate", _boom)
         auth = RealCedarAuthorizer(fail_open_no_roles=True)
-        assert (
-            auth.can_view_namespace(namespace=_NS, profile={"userId": "a", "globalRoles": ["platform-admin"]}) is False
-        )
+        assert getattr(auth, probe)(namespace=_NS, profile={"userId": "a", "globalRoles": ["platform-admin"]}) is False
 
 
 @pytest.mark.unit
@@ -162,11 +158,12 @@ class TestNullCedarAuthorizer:
         d = auth.authorize(namespace=_NS, tables=["t"], profile={"userId": "x"})
         assert d.allowed
 
-    def test_can_view_namespace_allows(self):
-        """Opt-out posture: with Cedar disabled, the artifact gate must not
-        independently withhold — mirrors the allow-all query decision."""
+    @pytest.mark.parametrize("probe", ["can_view_source", "can_view_ontology"])
+    def test_schema_view_probes_fail_closed(self, probe):
+        """Cedar opted out: no policy to consult, so schema artifacts are WITHHELD
+        (the query gate stays allow-all; disclosure does not)."""
         auth = NullCedarAuthorizer()
-        assert auth.can_view_namespace(namespace=_NS, profile={"userId": "x"}) is True
+        assert getattr(auth, probe)(namespace=_NS, profile={"userId": "x", "globalRoles": ["platform-admin"]}) is False
 
 
 @pytest.mark.unit
@@ -186,6 +183,20 @@ class TestDefaultPostureIsFailClosed:
         auth = RealCedarAuthorizer()
         d = auth.authorize(namespace=_NS, tables=["t"], profile={"userId": "x"})
         assert d.allowed
+
+    @pytest.mark.parametrize("fail_open", [True, False])
+    def test_no_roles_never_grants_schema_views(self, monkeypatch, fail_open):
+        """The no-roles bypass admits queries; it must not also hand out schema."""
+        monkeypatch.setenv("SCL_CEDAR_FAIL_OPEN_NO_ROLES", "true" if fail_open else "false")
+        auth = RealCedarAuthorizer()
+        no_roles = {"userId": "x"}
+        assert auth.authorize(namespace=_NS, tables=["t"], profile=no_roles).allowed is fail_open
+        assert auth.can_view_source(namespace=_NS, profile=no_roles) is False
+        assert auth.can_view_ontology(namespace=_NS, profile=no_roles) is False
+        # Positive control: a steward on the namespace still holds both views under either setting.
+        steward = {"userId": "s", "resourceRoles": [{"role": "data-steward", "resourceUID": _NS}]}
+        assert auth.can_view_source(namespace=_NS, profile=steward) is True
+        assert auth.can_view_ontology(namespace=_NS, profile=steward) is True
 
     def test_firewall_default_authorizer_fails_closed_no_roles(self, monkeypatch):
         """SQLFirewall() with no injected authorizer + no env opt-in → no-roles denied."""

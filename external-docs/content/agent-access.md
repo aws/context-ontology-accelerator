@@ -120,6 +120,26 @@ For restricted access (the user — and therefore the agent — can only query
 specific tables), add `tableAllowlist` / `allowedMetrics` to the same grant
 request.
 
+### Schema visibility
+
+Each MCP tool needs a Cedar action, and two of them return less to a caller
+without schema rights:
+
+| Tool | Action required | Without `viewSource` / `viewOntology` |
+|------|-----------------|----------------------------------------|
+| `list_metrics` | `viewNamespace` | Metrics are listed, but each metric's SQL `expression` and `sourceTable` are empty and `ontologyConcepts` is omitted |
+| `describe_schema` | `viewOntology` | Denied (`isError: true`) |
+| `query` | `query` | Results only: no compiled SQL or generated SPARQL, no table lists, no graph context, no trace step details |
+| `translate_sparql` | `query` | Succeeds, but `sparqlQuery` is an empty string |
+| `rag_retrieval` | `searchDocuments` | Unchanged |
+| `graph_traversal` | `traverseGraph` | Succeeds, but `entities` and `relationships` are empty lists |
+
+A `data-analyst` holds neither schema right, so an agent acting for one gets
+results without schema. An empty field therefore does not always mean "nothing
+found"; it can mean the field was withheld. If the server cannot evaluate
+authorization (for example, its roles table is not configured), tool calls fail
+with an "authorization is temporarily unavailable" error rather than running.
+
 ## Making API Calls (Direct REST, without MCP)
 
 For agents or scripts not using an MCP client, call the REST API directly

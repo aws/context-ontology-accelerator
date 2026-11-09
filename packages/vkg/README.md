@@ -107,7 +107,7 @@ its health check and the namespace reporting `DEGRADED` health indefinitely.
 |----------|---------|---------|
 | `VKG_TASK_CPU` | `1024` (1 vCPU) | Fargate task CPU units. Set on the reload Lambda; used when it registers a new task definition. |
 | `VKG_TASK_MEMORY` | `2048` (2 GB) | Fargate task memory. |
-| `ONTOP_JAVA_ARGS` | `-Xmx1536m -Xms512m` | JVM args for the Ontop launcher (read directly by the container). The reload Lambda's `VKG_ONTOP_JAVA_ARGS` is written into the task def as this variable. |
+| `ONTOP_JAVA_ARGS` | `-Xmx1536m -Xms512m -Dserver.address=127.0.0.1` | JVM args for the Ontop launcher (read directly by the container). The reload Lambda's `VKG_ONTOP_JAVA_ARGS` is written into the task def as this variable. `-Dserver.address=127.0.0.1` binds Ontop's endpoint to loopback, since only translate-server calls it. |
 
 **`ONTOP_JAVA_ARGS`, not `JAVA_OPTS`.** The Ontop launcher reads its heap
 settings from `ONTOP_JAVA_ARGS`. Setting `JAVA_OPTS` has **no effect** — the heap
@@ -121,16 +121,22 @@ only sets `JAVA_OPTS` is honoured, but new configuration should always set
 `VKG_TASK_MEMORY`**, leaving room for JVM overhead and the OS. E.g. a 4 GB task
 pairs with `-Xmx3072m -Xms1024m`.
 
-**Verifying the applied sizing.** Check the running task's definition:
+**Verifying the applied sizing.** Check the task definition the service is
+running. The family's latest revision can differ, for example after a deployment
+rolled back:
 
 ```bash
-aws ecs describe-task-definition --task-definition <family> \
+TD=$(aws ecs describe-services --cluster <cluster> --services <prefix>-vkg-<namespace> \
+  --query 'services[0].taskDefinition' --output text)
+aws ecs describe-task-definition --task-definition "$TD" \
   --query 'taskDefinition.{cpu:cpu,memory:memory,env:containerDefinitions[0].environment}'
 ```
 
 Confirm `cpu`/`memory` match your intended values and that the container
-environment contains `ONTOP_JAVA_ARGS` (and **not** `JAVA_OPTS`). At startup the
-entrypoint also logs the resolved value: `[VKG] Ontop heap args
+environment contains `ONTOP_JAVA_ARGS` (and **not** `JAVA_OPTS`).
+`ONTOP_JAVA_ARGS` should end with `-Dserver.address=127.0.0.1`; if it doesn't, the
+namespace is still running a task definition registered before the loopback change.
+At startup the entrypoint also logs the resolved value: `[VKG] Ontop heap args
 (ONTOP_JAVA_ARGS): '...'`.
 
 For how to configure these from CDK (the `VkgStack` `cpu`, `memoryLimitMiB`, and

@@ -27,15 +27,13 @@ import { useTokenBuffer } from "./use-token-buffer";
 /**
  * Build the request's `options` object.
  *
- * `includeDebugInfo` is set to `false` from the Playground: the compiled SQL
- * (`queryUsed`) and generated SPARQL (`sparqlGenerated`) expose internal schema
- * (table/column/relationship names) and are withheld by default server-side
- * (AppSec gate, commit 594f9c85). The Playground does NOT opt in, so artifacts
- * stay hidden there for every caller — preserving that AppSec default-withhold
- * posture. The server-side artifact gate (`includeDebugInfo && viewNamespace`)
- * remains the authoritative control; whether/when the Playground should opt in
- * for schema-authorized roles is deferred to the pending role-visibility
- * decision, not pinned on here.
+ * `includeDebugInfo` is set to `true` from the Playground, so the "Compiled
+ * artifacts" panel shows the SQL (`queryUsed`) and SPARQL (`sparqlGenerated`)
+ * by default to every role allowed to see them. The flag is only a request:
+ * serve returns the SQL only to a caller holding `viewSource` and the SPARQL
+ * only to one holding `viewOntology`, so a data-analyst (and any custom role
+ * without those rights) still gets neither. Visibility is decided server-side,
+ * not by this flag.
  *
  * One helper rather than conditional spreads, because
  * `...(mode && { options: { mode } })` followed by the same for `strategy` would
@@ -57,7 +55,7 @@ export function buildOptions(
   const options = {
     ...(mode && { mode }),
     ...(strategy && { strategy }),
-    includeDebugInfo: false,
+    includeDebugInfo: true,
   };
   return { options };
 }

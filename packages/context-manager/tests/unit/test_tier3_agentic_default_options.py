@@ -11,6 +11,8 @@ request sets (``false`` included) is kept, ``tokenCaps`` is filled per role, and
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
 from coa_serve.models import InvokeRequest
 from coa_serve.tier3.agentic.defaults import RECOMMENDED_OPTIONS, with_recommended_options
@@ -41,6 +43,7 @@ class TestWithRecommendedOptions:
         assert with_recommended_options({"tokenCaps": {"planner": 2048}})["tokenCaps"] == {
             "planner": 2048,
             "synthesizer": 12000,
+            "nl2sql": 8000,
         }
 
     def test_input_is_not_mutated(self):
@@ -71,4 +74,34 @@ class TestOrchestratorAppliesDefaults:
         options = orch._agentic_retriever.resolve.call_args.kwargs["options"]
         assert options["readDocument"] is False
         assert options["prefetchMode"] == "assess"
-        assert options["tokenCaps"] == {"planner": 4000, "synthesizer": 12000}
+        assert options["tokenCaps"] == {"planner": 4000, "synthesizer": 12000, "nl2sql": 8000}
+        assert options["sqlWithEvidence"] is True and options["sqlWriterEffort"] == "medium"
+
+    @pytest.mark.asyncio
+    async def test_a_direct_tier2_request_gets_no_sql_writer_defaults(self):
+        # The defaults are applied only on the deep-reasoning path; a standard request never reaches it.
+        orch = _deep_reasoning_orchestrator()
+        tier2 = orch._structured_query_tier.resolve
+        orch._structured_query_tier.resolve = AsyncMock(wraps=tier2)
+        await orch.resolve(InvokeRequest(query="q", namespace="demo", options={"mode": "standard"}))
+        orch._agentic_retriever.resolve.assert_not_called()
+        # The options that reach the Tier-2 SQL writer are only the ones the request sent.
+        context = orch._structured_query_tier.resolve.call_args.args[2]
+        assert not set(RECOMMENDED_OPTIONS) & set(context.options or {})
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("options", "may_view", "expected"),
+        [
+            ({}, True, False),  # not requested
+            ({"includeDebugInfo": True}, False, False),  # requested, no viewSource
+            ({"includeDebugInfo": True}, True, True),
+        ],
+    )
+    async def test_schema_visibility_follows_the_query_used_gate(self, options, may_view, expected):
+        orch = _deep_reasoning_orchestrator()
+        orch._firewall.can_view_source = MagicMock(return_value=may_view)
+        # viewOntology alone must not unlock table and column names.
+        orch._firewall.can_view_ontology = MagicMock(return_value=True)
+        await orch.resolve(InvokeRequest(query="q", namespace="demo", options={"mode": "deep-reasoning", **options}))
+        assert orch._agentic_retriever.resolve.call_args.kwargs["schema_visible"] is expected

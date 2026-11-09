@@ -274,6 +274,20 @@ export const MESSAGES_JA = {
   "Loading ontologies…": "オントロジーを読み込み中…",
   "Failed to load ontologies: {message}":
     "オントロジーを読み込めませんでした: {message}",
+  "Your role doesn't include access to this namespace's data sources.":
+    "あなたのロールには、この名前空間のデータソースへのアクセス権が含まれていません。",
+  "Your role doesn't include access to this namespace's ontology.":
+    "あなたのロールには、この名前空間のオントロジーへのアクセス権が含まれていません。",
+  "You can still query this namespace in the Playground.":
+    "プレイグラウンドでは、この名前空間に対して引き続きクエリを実行できます。",
+  "You can still query this namespace in the {playground}.":
+    "{playground}では、この名前空間に対して引き続きクエリを実行できます。",
+  "Your role doesn't include access to this metric's source schema.":
+    "あなたのロールには、このメトリクスのソーススキーマへのアクセス権が含まれていません。",
+  "Your role doesn't include access to source schemas, so metrics can't be exported.":
+    "あなたのロールにはソーススキーマへのアクセス権が含まれていないため、メトリクスをエクスポートできません。",
+  "This metric's definition is hidden for your role, so it can't be edited.":
+    "このメトリクスの定義はあなたのロールでは非表示のため、編集できません。",
   "No ontologies in this namespace yet.":
     "この名前空間にはまだオントロジーがありません。",
   Metric: "メトリクス",
@@ -1043,8 +1057,8 @@ export const MESSAGES_JA = {
     "一括承認を処理中です。このページは自動的に更新されます。",
   "Bulk rejection is in progress. This page will update automatically.":
     "一括却下を処理中です。このページは自動的に更新されます。",
-  "The last scan succeeded but could not read {failedTables} it listed. Those tables have no columns, no comments and no declared keys below, and any AI-generated descriptions were produced over that gap — do not review this source as complete. Re-scan once the tables are readable.":
-    "前回のスキャンは成功しましたが、一覧に含まれるテーブルのうち {failedTables} を読み込めませんでした。これらのテーブルには列、コメント、宣言済みキーが表示されず、AI による説明も欠落した情報を基に生成されています。このデータソースを完全なものとしてレビューせず、テーブルを読み取れる状態にしてから再スキャンしてください。",
+  "The last scan succeeded but could not read {failedTables} it listed, so those tables are not in this source yet, and AI-generated descriptions of the other tables were produced without them. Review and approve the tables below as usual. Once the missing tables are readable, re-scan the approved source: the re-scan adds them for review.":
+    "前回のスキャンは成功しましたが、一覧に含まれるテーブルのうち {failedTables} を読み込めなかったため、これらのテーブルはまだこのデータソースに含まれていません。他のテーブルの AI 生成の説明も、これらのテーブルを含まずに生成されています。以下のテーブルは通常どおりレビューして承認してください。不足しているテーブルを読み取れるようになったら、承認済みのデータソースを再スキャンしてください。再スキャンでそれらのテーブルがレビュー対象として追加されます。",
   "1 of the tables": "1 件",
   "{count} of the tables": "{count} 件",
   "Affected tables ({shown} of {total} shown):":
@@ -2130,6 +2144,13 @@ export const MESSAGES_JA = {
   "Sql Authorize": "SQL 認可",
   "Sql Execute": "SQL 実行",
   "Sql Failed": "SQL 失敗",
+  "Sql Vote": "SQL 投票",
+  "Vote across SQL candidates": "SQL 候補で投票",
+  "{votes} of {k} SQL candidates agreed on the result.":
+    "{k} 件の SQL 候補のうち {votes} 件の結果が一致しました。",
+  "Vote skipped: not enough time left before the deadline.":
+    "期限までの時間が足りないため、投票をスキップしました。",
+  "SQL candidates compared.": "SQL 候補を比較しました。",
   "Sql Firewall": "SQL ファイアウォール",
   "Sql Generate": "SQL 生成",
   "Strategy Selected": "戦略選択",
@@ -2451,4 +2472,54 @@ export const MESSAGES_JA = {
   "the result could not be bounded": "結果の上限を設定できませんでした",
   'Must be an absolute http(s) IRI without spaces or any of < > " { } | \\ ^ `.':
     '空白および < > " { } | \\ ^ ` のいずれも含まない、絶対 http(s) IRI を指定してください。',
+  "Business vocabulary ({count})": "業務用語（{count}）",
+  "Business vocabulary": "業務用語",
+  "Edits apply to this proposal only. A re-induction builds its labels and variants from the source metadata again, so add lasting synonyms there.":
+    "ここでの編集はこの提案にだけ反映されます。再誘導ではラベルと表記ゆれがデータソースのメタデータから改めて作られるため、残したい同義語はメタデータに追加してください。",
+  "Apply the changes above before editing the vocabulary.":
+    "業務用語を編集する前に、上の変更を適用してください。",
+  "Vocabulary review is unavailable": "業務用語を確認できません",
+  "The vocabulary could not be parsed": "業務用語を読み取れませんでした",
+  "The vocabulary edit failed": "業務用語を編集できませんでした",
+  "The edit could not be applied": "編集を適用できませんでした",
+  Concept: "概念",
+  Resource: "リソース",
+  "Preferred labels": "優先ラベル",
+  Variants: "表記ゆれ",
+  "No variants": "表記ゆれなし",
+  "Edit preferred label {label}": "優先ラベル {label} を編集",
+  "Add language": "言語を追加",
+  "Add language to {term}": "{term} に言語を追加",
+  "Make preferred": "優先にする",
+  "Make preferred {label}": "{label} を優先にする",
+  "Reject variant {label}": "表記ゆれ {label} を却下",
+  "Add variant": "表記ゆれを追加",
+  "Add variant to {term}": "{term} に表記ゆれを追加",
+  "Language tag": "言語タグ",
+  "Use a BCP 47 tag such as ja or en. Leave blank for an untagged label.":
+    "ja や en などの BCP 47 タグを入力します。言語タグを付けない場合は空欄にします。",
+  "The proposal changed while this dialog was open. Close it and try again.":
+    "このダイアログを開いている間に提案が変更されました。閉じてからやり直してください。",
+  "Failed to parse Turtle document: {detail}":
+    "Turtle ドキュメントを解析できませんでした: {detail}",
+  "Failed to write Turtle document: {detail}":
+    "Turtle ドキュメントを書き出せませんでした: {detail}",
+  "This concept already has that preferred label":
+    "この概念にはその優先ラベルがすでにあります",
+  "This concept already has that variant":
+    "この概念にはその表記ゆれがすでにあります",
+  "The Turtle writer did not produce a result": "Turtle を書き出せませんでした",
+  "A vocabulary label must not be blank": "ラベルを入力してください",
+  "A vocabulary label must not contain unsafe invisible formatting controls":
+    "ラベルに安全でない不可視の書式制御文字を含めることはできません",
+  "A vocabulary label must not exceed {maximum} characters":
+    "ラベルは {maximum} 文字以内で入力してください",
+  '"{language}" is not a valid language tag':
+    "「{language}」は有効な言語タグではありません",
+  'This concept already has a preferred label for language "{language}"':
+    "この概念には言語「{language}」の優先ラベルがすでにあります",
+  "This concept already has an untagged preferred label":
+    "この概念には言語タグのない優先ラベルがすでにあります",
+  "A preferred label cannot also be added as a variant":
+    "優先ラベルと同じものは表記ゆれとして追加できません",
 } as const;

@@ -40,6 +40,14 @@ from coa_common.guardrail_metrics import (
     filter_type_from_assessments,
 )
 
+from ..llm_usage import (
+    REASON_MISSING_USAGE,
+    REASON_PROVIDER_ERROR,
+    REASON_STREAM_ABANDONED,
+    current_tracker,
+    record_usage,
+)
+from ..schema_visibility import note_prompt_schema
 from .base import (
     STOP_REASON_MAX_TOKENS,
     ContentFilteredError,
@@ -90,6 +98,12 @@ _STREAM_QUEUE_TIMEOUT_S = 300
 # set of str is atomic under the GIL, and a lost race just costs one more
 # rejected call.
 _MODELS_REJECTING_TEMPERATURE: set[str] = set()
+
+# Model ids observed to reject an effort level (``output_config.effort`` in
+# additionalModelRequestFields). Same learn-once, lock-free rationale: a caller's
+# effort option must degrade to the model's default on a model without effort
+# levels, never fail the call.
+_MODELS_REJECTING_EFFORT: set[str] = set()
 
 # Model ids observed to reject `inferenceConfig.topP` with a ValidationException.
 # Symmetric to _MODELS_REJECTING_TEMPERATURE: the SAME newer Anthropic models
@@ -382,6 +396,7 @@ class BedrockLLMClient:
         top_p: float | None = None,
         guard_content: str | None = None,
         model_id: str | None = None,
+        effort: str | None = None,
     ) -> ConverseResult:
         """Send a single-turn prompt via the Bedrock Converse API.
 
@@ -401,6 +416,8 @@ class BedrockLLMClient:
             guard_content: Text wrapped in a guardContent block for prompt-attack
                 evaluation, leaving the main prompt unchecked.
             model_id: Per-call model override; defaults to the client's model.
+            effort: Model effort level, sent as ``output_config.effort`` in
+                ``additionalModelRequestFields``; omitted when None.
 
         Returns:
             A ConverseResult with the generated text and whether a guardrail blocked it.
@@ -418,13 +435,30 @@ class BedrockLLMClient:
             guard_content=guard_content,
             model_id=model_id,
         )
+        if effort and (model_id or self._model_id) not in _MODELS_REJECTING_EFFORT:
+            kwargs["additionalModelRequestFields"] = {"output_config": {"effort": effort}}
 
         client = self._get_client()
         loop = asyncio.get_running_loop()
+        # Opt-in LLM usage accounting: register on the request's context, record in the
+        # worker through the captured tracker — the worker finishes (and Bedrock bills)
+        # even when this await is cancelled by a deadline.
+        tracker = current_tracker()
+        handle = tracker.register_call("converse", kwargs["modelId"]) if tracker is not None else None
+
+        def _call() -> Any:
+            try:
+                response = self._call_with_temperature_fallback(client.converse, kwargs)
+            except BaseException:
+                if handle is not None:
+                    tracker.fail_call(handle, REASON_PROVIDER_ERROR)
+                raise
+            if handle is not None:
+                record_usage(tracker, handle, response.get("usage"))
+            return response
+
         start = time.monotonic()
-        response = await loop.run_in_executor(
-            _EXECUTOR, lambda: self._call_with_temperature_fallback(client.converse, kwargs)
-        )
+        response = await loop.run_in_executor(_EXECUTOR, _call)
         latency_ms = (time.monotonic() - start) * 1000
 
         stop_reason = response.get("stopReason", "")
@@ -560,9 +594,20 @@ class BedrockLLMClient:
         # event, so it exits at the first opportunity either way.
         stream_holder: dict[str, Any] = {}
         abandoned = threading.Event()
+        # Opt-in LLM usage accounting (see converse()). The final usage arrives in the
+        # stream's metadata event, so the worker records it; a stream closed early or
+        # ending without usage leaves the request incomplete, never zero-cost.
+        tracker = current_tracker()
+        handle = tracker.register_call("converse_stream", kwargs["modelId"]) if tracker is not None else None
+        usage_seen = False
+
+        def _fail_usage(reason: str) -> None:
+            if handle is not None and not usage_seen:
+                tracker.fail_call(handle, reason)
 
         def _run_stream() -> None:
             """Run in thread — iterate EventStream, push text chunks to queue."""
+            nonlocal usage_seen
             guardrail_triggered = False
             guardrail_trace: dict[str, Any] = {}
             try:
@@ -573,10 +618,12 @@ class BedrockLLMClient:
                     # Disconnected while the API call was in flight — nothing was
                     # closeable at that point, so honour the request here.
                     _close_stream_quietly(response["stream"])
+                    _fail_usage(REASON_STREAM_ABANDONED)
                     return
                 for event in response["stream"]:
                     if abandoned.is_set():
                         _close_stream_quietly(response["stream"])
+                        _fail_usage(REASON_STREAM_ABANDONED)
                         return
                     if "contentBlockDelta" in event:
                         text = event["contentBlockDelta"].get("delta", {}).get("text", "")
@@ -599,6 +646,9 @@ class BedrockLLMClient:
                         trace = event["metadata"].get("trace", {}).get("guardrail", {})
                         if trace:
                             guardrail_trace = trace
+                        if handle is not None and not usage_seen:
+                            usage_seen = True
+                            record_usage(tracker, handle, event["metadata"].get("usage"))
                     # Safely ignore: messageStart, contentBlockStart, contentBlockStop
                 # Signal the guardrail outcome if it acted. Classified here rather
                 # than as a bare bool so an unexplained intervention (no trace) is
@@ -613,8 +663,10 @@ class BedrockLLMClient:
                             _classify_guardrail("guardrail_intervened", guardrail_trace),
                         ),
                     )
+                _fail_usage(REASON_MISSING_USAGE)
                 loop.call_soon_threadsafe(queue.put_nowait, None)
             except Exception as e:
+                _fail_usage(REASON_PROVIDER_ERROR)
                 loop.call_soon_threadsafe(queue.put_nowait, e)
 
         task = loop.run_in_executor(_EXECUTOR, _run_stream)
@@ -695,7 +747,8 @@ class BedrockLLMClient:
         Some newer models (e.g. claude-sonnet-5, Opus 4.8+) deprecated BOTH
         ``temperature`` and ``top_p`` and reject either with a ValidationException.
         Each rejection is remembered per model id (``_MODELS_REJECTING_TEMPERATURE``
-        / ``_MODELS_REJECTING_TOP_P``), so only the FIRST call to such a model pays
+        / ``_MODELS_REJECTING_TOP_P``; an effort level the model rejects, likewise in
+        ``_MODELS_REJECTING_EFFORT``), so only the FIRST call to such a model pays
         the failed request + retry; later calls omit the offending param up front.
 
         NL→SPARQL sets ``topP=0`` for determinism, so dropping only ``temperature``
@@ -735,15 +788,22 @@ class BedrockLLMClient:
         # versa). Each ValidationException naming a deprecated sampling param is
         # learned, the param stripped, and the call retried; any other error, or
         # running out of strippable params, re-raises.
-        for _ in range(3):
+        for _ in range(4):
             try:
                 return call_fn(**kwargs)
             except ClientError as e:
                 if e.response.get("Error", {}).get("Code") != "ValidationException":
                     raise
+                msg = str(e)
+                extra = kwargs.get("additionalModelRequestFields") or {}
+                if "output_config" in extra and ("effort" in msg or "output_config" in msg):
+                    kwargs.pop("additionalModelRequestFields", None)
+                    if model_id is not None:
+                        _MODELS_REJECTING_EFFORT.add(model_id)
+                    logger.warning("retry_without_effort", model=model_id)
+                    continue
                 if "inferenceConfig" not in kwargs:
                     raise
-                msg = str(e)
                 if "temperature" in msg and "temperature" in inference:
                     inference.pop("temperature", None)
                     if model_id is not None:
@@ -765,10 +825,10 @@ class BedrockLLMClient:
                     )
                     continue
                 raise
-        # Exhausted the retry budget without a return. Only two sampling params
-        # (temperature, topP) can ever be shed, so three iterations should always
+        # Exhausted the retry budget without a return. Only three params (effort,
+        # temperature, topP) can ever be shed, so four iterations should always
         # succeed or re-raise above; reaching here means an unforeseen loop state.
-        # Fail loudly rather than issuing a 4th unguarded call whose exception
+        # Fail loudly rather than issuing a 5th unguarded call whose exception
         # would be indistinguishable from a normal failure.
         raise RuntimeError("converse retry loop exhausted without returning or raising")
 
@@ -806,6 +866,10 @@ class BedrockLLMClient:
         effective_model_id = model_id or self._model_id
         if model_id and model_id != self._model_id:
             logger.info("using_model_override", override=model_id, default=self._model_id)
+        # Every prompt the model sees passes here; for a caller without viewSource
+        # the schema names in it are recorded so the response scrub can redact them
+        # where the model could have copied them into a constant (no-op otherwise).
+        note_prompt_schema(prompt, system, guard_content)
         # Build message content blocks
         content: list[dict[str, Any]] = []
         if prompt:
