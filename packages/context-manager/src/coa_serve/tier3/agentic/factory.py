@@ -164,6 +164,7 @@ def build_tool_registry(
     ontology_source: OntologySource | None = None,
     structured_query_tier: Any | None = None,
     sources_registry: Any | None = None,
+    chunk_screener: Any | None = None,
 ) -> ToolRegistry:
     """Build the internal :class:`ToolRegistry` with endpoint-gated tools (Req 12.4-12.6).
 
@@ -188,6 +189,9 @@ def build_tool_registry(
         sources_registry: Optional serve-layer ``SourcesRegistry``; when supplied
             and available the ``read_document`` tool is registered (the retriever
             still withholds it from the planner unless the request opts in).
+        chunk_screener: Optional retrieval-guardrail screener (``None`` when no
+            retrieval guardrail is configured); the SQL tools screen the document
+            evidence they hand the SQL writer with it.
 
     Returns:
         The populated :class:`ToolRegistry`, never exposed outside the Serve_Layer
@@ -272,7 +276,9 @@ def build_tool_registry(
 
         # embed_client: both strategies use an embedding for ontology vector context
         # (Ontop skips its vector-hit lookup entirely without one).
-        build_structured_tools(registry, structured_query_tier, embed_client=embed_client)
+        build_structured_tools(
+            registry, structured_query_tier, embed_client=embed_client, chunk_screener=chunk_screener
+        )
     else:
         logger.info(
             "agentic_tool_omitted",
@@ -335,6 +341,7 @@ def build_agentic_retriever(
     structured_query_tier: Any | None = None,
     guardrail_id_provider: Callable[[], str] | None = None,
     sources_registry: Any | None = None,
+    chunk_screener: Any | None = None,
 ) -> AgenticRetriever:
     """Compose the :class:`AgenticRetriever` from the registry and its collaborators.
 
@@ -371,6 +378,8 @@ def build_agentic_retriever(
             reaches the warm agentic path without a redeploy.
         sources_registry: Optional serve-layer ``SourcesRegistry`` forwarded to
             :func:`build_tool_registry` to enable the ``read_document`` tool.
+        chunk_screener: Optional retrieval-guardrail screener forwarded to
+            :func:`build_tool_registry` for the SQL tools' document evidence.
 
     Returns:
         The composed :class:`AgenticRetriever`.
@@ -390,6 +399,7 @@ def build_agentic_retriever(
             vector_retriever=vector_retriever,
             structured_query_tier=structured_query_tier,
             sources_registry=sources_registry,
+            chunk_screener=chunk_screener,
         )
     )
     # The agentic path synthesizes over EVERY chunk its multi-step session gathered

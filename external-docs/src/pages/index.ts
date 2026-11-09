@@ -1,6 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import architecture from '@docs/architecture.md?raw'
 import deploying from '@docs/deploying.md?raw'
 import namespaces from '@docs/namespaces.md?raw'
 import authenticationSetup from '@docs/authentication-setup.md?raw'
@@ -20,6 +21,7 @@ import packageGuide from '@docs/package-guide.md?raw'
 import smithyCodegen from '@docs/smithy-codegen.md?raw'
 
 export type PageId =
+  | 'architecture'
   | 'deploying'
   | 'namespaces'
   | 'authentication-setup'
@@ -39,6 +41,7 @@ export type PageId =
   | 'smithy-codegen'
 
 export const pages: Record<PageId, string> = {
+  architecture,
   deploying,
   namespaces,
   'authentication-setup': authenticationSetup,

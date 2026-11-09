@@ -41,12 +41,26 @@ Options:
 - `strategy` — choose which Tier-2 engine answers a structured query (see below)
 - `maxResults` — limit result rows (1–10000)
 - `includeSupporting` — include supporting context in the response
-- `includeDebugInfo` — include the generated `queryUsed` (SQL) and
-  `sparqlGenerated` fields in the response. **Off by default.** ⚠️ Security:
-  these fields expose internal schema (table and column names, joins), so the
-  flag is honoured only for a platform admin or a namespace owner, maintainer
-  or data steward of the queried namespace. For any other caller the query
-  still succeeds, with both fields omitted.
+- `includeDebugInfo` — request the generated `queryUsed` (SQL) and
+  `sparqlGenerated` fields in the response. ⚠️ Security: these fields expose
+  internal schema, so each is gated independently by exactly the schema it
+  reveals — the **SQL** (`queryUsed`, table/column names) on `viewSource`, the
+  **SPARQL** (`sparqlGenerated`, ontology class/property names) on
+  `viewOntology`. A caller holding a right sees that artifact; a schema-blind
+  `data-analyst` (holding neither) sees neither. For a caller lacking a right
+  the field is omitted — enforcement is fail-closed and per-artifact. See
+  [Schema-blind callers](#schema-blind-callers) for everything else such a
+  caller sees differently. The Playground always requests them, so every role
+  holding the right sees the SQL/SPARQL under **Compiled artifacts** by default
+  and a `data-analyst` never does.
+- `includeLlmUsage` — include provider-reported text-LLM token usage in
+  `result.llmUsage`. Usage is grouped by exact model ID so an external
+  reporting layer can apply its own versioned prices. It contains no prompts,
+  answers, credentials, or per-call traces. When enabled, an error response
+  may instead include top-level `llmUsage` containing usage recorded before
+  the failure. In either response, `complete: false` means at least one known
+  LLM call was not fully accounted, so the reported totals may be partial.
+  **Off by default.**
 - `dimensions` — dimension filters, a list of up to 100 `{name, value}`
   objects (`name` 1–256 characters and unique case-insensitively, `value` up
   to 4000 characters, `operator` only `=`)
@@ -80,7 +94,42 @@ the synchronous REST endpoint. It POSTs to the AgentCore Runtime `/invocations`
 endpoint with SSE (Server-Sent Events) and carries a much larger resolution budget
 (**170 s** by default, `resolve_timeout_s`), so it is not subject to the 29 s API
 Gateway ceiling. It also streams resolution steps, generated SQL, and results as
-they are produced instead of blocking for a single response.
+they are produced instead of blocking for a single response. (A schema-blind
+caller receives step names and timings only, and the answer arrives once, in the
+final `done` event — see below.)
+
+### Schema-blind callers
+
+A caller without `viewSource` or `viewOntology` on the namespace — the built-in
+`data-analyst` role — gets results, the synthesized answer and confidence, but no
+schema. On both REST and streaming:
+
+- **Debug and context fields are empty.** `queryUsed`, `sparqlGenerated`,
+  `metadata.retrieved_tables` / `expanded_tables`, `graphContext` entities and
+  trace step details are withheld for whichever right is missing. Trace steps keep
+  their names and timings.
+- **The answer is not streamed token by token.** The redacted final answer arrives
+  in the `done` event.
+- **Identifiers are redacted from text.** Database-qualified table names from the
+  executed SQL and ontology class/property IRIs from the generated SPARQL or the
+  graph are replaced with `[redacted]` in the answer, in string values of result
+  rows and in supporting content. In a result column built from text in the query
+  itself (`SELECT COUNT(*), 'some text' FROM orders`, a `CASE` or `CONCAT` with a
+  literal), bare table and column names the model was shown are also redacted, and
+  so is any of them the answer repeats. Columns that hold stored data are left as
+  they are. This is best-effort for text the model writes in its own words: a bare
+  table or column name paraphrased by the model is not detected.
+- **Some statements are refused with `403`.** A statement that reads no table
+  (`SELECT 'a' UNION ALL SELECT 'b'`, a CTE over constants) or that returns only
+  text constants (`SELECT 'customer_id' FROM orders`) can only echo schema names,
+  so it is refused. Ask a data question instead.
+- **Errors are generic.** An ambiguous-table or firewall refusal says the query was
+  refused without naming tables or schemas.
+- **Column names still appear** as result-row keys and in `metadata.columns`,
+  because they label the data returned. Use a grant's `columnDenylist` to hide a
+  column entirely.
+- **Session history is re-scrubbed on replay** with the caller's current rights, so
+  turns stored before a role change do not reveal schema.
 
 This is the path the [Playground](#playground-web-app) uses, and the recommended
 default for building interactive clients. Reserve the synchronous REST endpoint for
@@ -223,13 +272,28 @@ no DOCUMENTS source.
 | `readDocumentAnchor` | bool (with `readDocument`) | Centres each window on a passage the loop already retrieved, or on a phrase the planner names, instead of paging from the start | Long documents where the relevant passage is far from the start | Negligible |
 | `entityRouting` | bool | The decomposition call also lists the question's named terms (identifiers, people, subjects, systems). Before the loop they are matched to the documents that mention them (graph entity mentions and an exact-phrase search), and the planner is offered `find_documents` for later names. | Questions that name a specific record, person, product or document | One lookup before the loop; no extra model call |
 | `prefetchMode` | `"assess"` or `"off"` | Before the loop, runs the SQL writer on the whole question and reads the top two documents in parallel, then checks sufficiency once and skips the loop when that evidence already answers the question | Mixed questions whose obvious evidence is what the planner would fetch first | Faster when the check passes; the up-front SQL call and reads are spent even when the loop then runs |
-| `tokenCaps` | object of integers: `planner`, `synthesizer` (1,024–16,000) | Output-token cap for this request's planner calls and answer writing. An unset role gets the recommended cap (planner 4,000, answer writing 12,000); with the defaults switched off it keeps the deployment default (planner 1,024, answer writing `TIER3_SYNTH_MAX_TOKENS`, 4,096). A value outside the range is clamped to it | Planner replies or answers cut off in the trace | Higher caps allow longer, costlier calls |
+| `tokenCaps` | object of integers: `planner`, `synthesizer`, `nl2sql` (1,024–16,000) | Output-token cap for this request's planner calls, answer writing and SQL writing (`nl2sql`, generation and correction). An unset role gets the recommended cap (planner 4,000, answer writing 12,000, SQL writing 8,000); with the defaults switched off it keeps the deployment default (planner 1,024, answer writing `TIER3_SYNTH_MAX_TOKENS`, 4,096, SQL writing `SERVE_NL2SQL_MAX_TOKENS`, 4,096). A value outside the range is clamped to it | Planner replies, answers or SQL cut off in the trace | Higher caps allow longer, costlier calls |
 | `plannerParseRetry` | bool | One repair turn when a planner reply cannot be parsed, instead of losing the step | Planner parse failures in the trace | One extra model call, only on a failure |
 | `loopFixes` | bool | Drops unknown fields in a planner tool call instead of rejecting it, makes no planner call and starts no tool once no time is left for a tool to start (the loop stops on the time budget), gives back the step of a document read that added nothing new (at most twice), and drops privacy-mask placeholders from routed names | Any Deep Reasoning request | None |
 | `sufficiencyGuards` | bool (with `entityRouting`) | A positive sufficiency check, in the loop or in the `prefetchMode` check, is held back while a top name-matched document has been read only in part; the reason (read on from the offset where the reading stopped) becomes the planner's next action. At most two checks are held back per loop | Long documents whose answer may sit past the first window read | Up to two more loop steps on a held-back question |
 | `singleCallSteps` | bool | The planner's next-step call also decides when to stop: it is shown the content gathered so far, and an empty proposal ends the loop (still subject to `sufficiencyGuards`). No separate sufficiency call runs after each step | Any Deep Reasoning request | Faster answers: one model call per loop step instead of two |
 | `fastPathSpeculation` | bool (with `prefetchMode`; blocking requests only) | After the prefetch, the answer is written in parallel with the sufficiency check and kept only if the check passes; otherwise it is discarded and the loop runs. When `sufficiencyGuards` already holds the check back, the check is skipped and the loop starts at once. Streamed requests are unchanged | Any request that uses `prefetchMode` | Faster answers when the check passes; one discarded answer-writing call when it fails |
 | `keepSlowSql` | bool (with `prefetchMode`) | A prefetch SQL call that outlives its timeout keeps running instead of being cancelled. The loop adds its result when it finishes, a planner `nl_to_sql` request waits for it instead of writing a new query, and with `sufficiencyGuards` a positive check is held back while it runs. It is cancelled before the answer is written | Namespaces with slow SQL queries | Recovers answers whose SQL is slow, without added latency (the call runs within the request's existing time budget) |
+| `sqlWithEvidence` | bool | The planner's `nl_to_sql` tool also hands the SQL writer the document evidence gathered so far (windows read with `read_document`, name-matched mention chunks, and the most relevant retrieved chunks), and the planner is told to read the documents that define what to compute before querying. `sqlEvidenceMaxChars` (integer, default 14,000, 2,000–20,000) caps that text. When the deployment has a retrieval guardrail, each piece is screened with it first (as Standard mode screens retrieved chunks before its answer step): a flagged piece, or one whose check runs past the guardrail timeout (2 s), is left out, and a guardrail error lets the piece through. Only this SQL-writer evidence is screened; the planner and the answer step read documents unscreened, as before | Questions whose filter or formula is defined in a document (a status meaning, a business rule, which date field counts) | Longer SQL-writer prompts, up to the cap |
+| `sqlOriginalQuestion` | bool | When the planner sends `nl_to_sql` a sub-question, the SQL writer also sees the user's original question, for constraints the sub-question dropped | Decomposed questions whose SQL loses a filter or period from the original wording | Negligible |
+| `sqlTimeRules` | bool | Adds SQL-writer rules to compare timestamps directly (not through whole-unit differences, which round small gaps to zero) and to bound months and periods half-open | Questions with time windows, "within N hours" or "before" conditions, or monthly periods | Negligible |
+| `sqlComputeMetric` | bool | Lets the planner's `nl_to_sql` tool compute a requested share, rate, ratio, average or difference in SQL, and also select the inputs it is built from. Deep Reasoning only: the extra input columns change a result's shape, which the answer step reads without trouble but a direct Tier-2 answer would not, so a Tier-2 request ignores it | Questions asking for a derived figure rather than raw counts | Negligible |
+| `sqlRevision` | bool | The planner's `nl_to_sql` tool also accepts a `revise` reason. Called with one, the SQL writer revises the request's previous query, seeing that query's SQL, the rows it returned and the stated reason. The sufficiency check is also shown the SQL behind the latest rows | Results that look wrong (a negative count, a wrong period, a missing filter) where a fresh query would repeat the mistake | Each revision is one more loop step and one more SQL call |
+| `sqlInAnswer` | bool (with `sqlRevision` or `sqlWithEvidence`) | Needs `sqlRevision` or `sqlWithEvidence` (they record the SQL behind the rows; without either it has no effect). The answer step is shown the SQL queries behind the structured rows (the last four, next to the rows) and is told to treat the rows as evidence for what those queries compute: state the numbers, and say how a query differs from the question when it does. Only for a caller who may see generated SQL (`includeDebugInfo` with the `viewSource` right, the same check as `queryUsed`) does the answer also name the table and column each number comes from; for anyone else it describes the numbers in plain terms and never quotes SQL, table or column names | Answers that hedge on numbers the SQL returned, or that need to say where a figure comes from | A longer answer-writing prompt |
+| `sqlResultCheck` | bool (with `prefetchMode` and `sqlRevision`) | Needs `sqlRevision` (it records the SQL behind the rows; without it there is nothing to check). When a first-pass (`prefetchMode`) SQL result is about to be accepted as enough, one model call sees the question, the SQL and a preview of its rows, and flags only a defect visible in the result: values that contradict each other or the question's own definition of the quantity, or a requested quantity that is missing. It does not see the schema, so it never judges table or column choice. On a flag the query is rewritten once through the `revise` path, and the new rows replace the old ones | First-pass SQL results that are internally inconsistent (parts that do not add up to their total, a value with an impossible sign) | One extra model call when a first-pass SQL result is about to be accepted, run alongside the sufficiency check; one more SQL call on a flag |
+| `sqlWriterEffort` | `"low"`, `"medium"` or `"high"` | The SQL writer's model effort level (how much it reasons before writing) on its generate and correct calls; unset keeps the model's default on a direct Tier-2 request; in Deep Reasoning an unset value gets the recommended `"medium"`. On a model that does not accept an effort level (Bedrock `output_config.effort`) it is ignored and the model's default applies | Slow SQL writing or SQL calls that time out | Faster SQL writing and fewer SQL timeouts; less reasoning per query |
+
+`tokenCaps.nl2sql`, `sqlTimeRules` and `sqlWriterEffort` also apply to a Tier-2
+NL→SQL answer outside Deep Reasoning. `sqlWithEvidence` hands its text to the SQL
+writer through the Tier-2 `evidence` option (labelled untrusted in the prompt),
+with its own larger share of that prompt (set internally, at most 20,000
+characters); a caller's own `evidence` keeps its 500-character share, so it cannot
+crowd out the documents.
 
 **Recommended setting (the default).** These options were validated together and
 are applied as one set to any Deep Reasoning request that leaves them unset:
@@ -244,13 +308,27 @@ are applied as one set to any Deep Reasoning request that leaves them unset:
   "prefetchMode": "assess",
   "loopFixes": true,
   "plannerParseRetry": true,
-  "tokenCaps": {"planner": 4000, "synthesizer": 12000},
+  "tokenCaps": {"planner": 4000, "synthesizer": 12000, "nl2sql": 8000},
   "sufficiencyGuards": true,
   "fastPathSpeculation": true,
   "singleCallSteps": true,
-  "keepSlowSql": true
+  "keepSlowSql": true,
+  "sqlOriginalQuestion": true,
+  "sqlTimeRules": true,
+  "sqlComputeMetric": true,
+  "sqlWithEvidence": true,
+  "sqlRevision": true,
+  "sqlInAnswer": true,
+  "sqlResultCheck": true,
+  "sqlWriterEffort": "medium"
 }
 ```
+
+Why these values: the planner and answer-writing caps leave a reasoning model room to think before its
+reply (at the 1,024 planner default, replies are cut off); 8,000 tokens lets the SQL writer finish a
+multi-step query; a 32,000-character window lets one read cover a typical document; and `"medium"` effort
+keeps the SQL writer's reasoning short enough to finish within its cap and time limit. None of them is tied
+to a particular dataset; raise a cap if the trace shows a cut-off reply.
 
 Document access stays scoped to the namespace: `read_document` and `find_documents`
 return only documents under the bucket and `s3Prefixes` of the namespace's

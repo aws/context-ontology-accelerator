@@ -308,6 +308,7 @@ silently-broken graph is visible rather than masked.
 | List namespaces | Any authenticated user |
 | Create namespace | `platform-admin` only — namespace creation has no existing namespace to scope a `namespace-owner` grant to, so it requires the global role |
 | View namespace details | Any namespace role (`namespace-owner`, `data-steward`, `data-analyst`, etc.) |
+| View source / ontology schema | `namespace-owner`, `namespace-maintainer`, `data-steward`, `platform-viewer`, `platform-admin` (`viewSource` / `viewOntology`) |
 | Update namespace | `namespace-owner`, `namespace-maintainer`, or `platform-admin` |
 | Archive/reactivate | `namespace-owner`, `namespace-maintainer`, or `platform-admin` |
 | Delete namespace | `namespace-owner`, `namespace-maintainer`, or `platform-admin` |
@@ -334,6 +335,10 @@ Platform roles apply across **all namespaces** without requiring per-namespace g
 | Manage data sources | ✅ | ❌ | ✅ | ✅ | ❌ |
 | Manage ontologies | ✅ | ❌ | ✅ | ✅ | ❌ |
 | Manage metrics | ✅ | ❌ | ✅ | ✅ | ❌ |
+| View source schema (sources, tables, SQL, metric SQL) | ✅ | ✅ | ✅ | ✅ | ❌ |
+| View ontology schema (ontologies, graph, SPARQL) | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Query data | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Grant permissions | ✅ | ❌ | ✅ | ❌ | ❌ |
 | Manage platform grants | ✅ | ❌ | ❌ | ❌ | ❌ |
+
+`data-analyst` is schema-blind: it can query and read metrics, but receives results only — no source or ontology schema (see [Cedar Policy Authoring](cedar-policy-authoring.md)).

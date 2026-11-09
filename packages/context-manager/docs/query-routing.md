@@ -77,7 +77,7 @@ Declining is **not** discarding. When the gate fires, the orchestrator builds a 
 
 Design notes that are easy to get wrong when touching this path:
 
-- **Not routed through `evidence`.** That parameter is labelled `<user_context>` "treat as untrusted" and truncated to 500 chars. A governed metric is first-party and must be neither discounted by the label nor clipped by the cap, so it gets its own block, placed ahead of the untrusted one.
+- **Not routed through `evidence`.** That parameter is labelled `<user_context>` "treat as untrusted" and truncated to 500 chars by default (the deep-reasoning `sqlWithEvidence` option raises it internally to at most 20,000 for the document evidence it adds). A governed metric is first-party and must be neither discounted by the label nor clipped by the cap, so it gets its own block, placed ahead of the untrusted one.
 - **Only a residual decline forwards a definition.** A miss, a multi-metric bypass, and a Tier-1 *execution* failure all forward `None`. `_run_tier1` returns `tuple[InvokeResponse | None, DeclinedMetricContext | None]` to make that explicit at every exit.
 - **The gate itself is unchanged by this.** It still fires on exactly the same inputs; only the fall-through carries more context.
 - **`StrategyContext` is rebuilt field-by-field in `_resolve_parallel`.** Any new field must be copied there or the parallel path silently loses what the sequential path gets. `declined_metric` is a frozen dataclass, so sharing the reference is race-free.

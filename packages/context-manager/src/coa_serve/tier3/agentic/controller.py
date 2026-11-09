@@ -1135,6 +1135,27 @@ class ReasoningController:
             )
         return sufficient and not hold
 
+    async def check_sql_result(self, question: str, ctx: AccumulatedContext) -> str:
+        """Ask the planner for a defect in the latest SQL result (options.sqlResultCheck).
+
+        Returns ``""`` when there is no SQL result with rows yet, the planner has
+        no such check, or the check fails; never raises.
+        """
+        check = getattr(self._planner, "check_sql_result", None)
+        last = getattr(ctx, "last_sql", None)
+        if not callable(check) or not last or last.get("row_count") == 0:
+            return ""
+        try:
+            return (
+                await check(
+                    question=question, sql=str(last["sql"]), rows=str(last["rows"]), row_count=last.get("row_count")
+                )
+                or ""
+            )
+        except Exception as exc:  # noqa: BLE001 - controller must never raise (Req 9.1)
+            logger.warning("planner_sql_check_error", error=str(exc), error_type=type(exc).__name__)
+            return ""
+
     async def _assess(self, sub_question: SubQuestion, ctx: AccumulatedContext) -> tuple[bool, str]:
         """Run the Sufficiency_Check and obtain the agent's grounded best-guess (idea 2).
 

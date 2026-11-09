@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import re
 from unittest.mock import AsyncMock
 
 import pytest
@@ -35,7 +36,9 @@ from coa_serve.tier2.table_qualifier import AMBIGUOUS_KEY, ambiguous_reference, 
 def mock_llm():
     llm = AsyncMock()
     llm.embed.return_value = [0.1] * 1024
-    llm.converse.return_value = ConverseResult(text="```sql\nSELECT count(*) FROM orders\n```\nConfidence: 0.85")
+    llm.converse.return_value = ConverseResult(
+        text="```sql\nSELECT count(*) AS count_all FROM orders\n```\nConfidence: 0.85"
+    )
     return llm
 
 
@@ -89,7 +92,7 @@ class TestSQLGeneratorGenerate:
         result = await generator.generate("How many orders?", namespace="demo")
 
         assert result.error is None
-        assert result.sql == "SELECT count(*) FROM orders"
+        assert result.sql == "SELECT count(*) AS count_all FROM orders"
         assert result.confidence == 0.85
         assert "orders" in result.retrieved_tables
         mock_llm.embed.assert_called_once_with("How many orders?")
@@ -445,25 +448,45 @@ class TestDialectSupport:
             assert "SELECT EXACTLY" in p
             assert "2019-08-20" in p  # zero-padded date example
             assert "SELECT DISTINCT" in p
+            assert "one fixed exception is the DETERMINISM superlative shape" in p
 
     def test_determinism_column_shape_pin_in_prompt(self):
-        # B1b (SQL-path column-shape drift): measured N=10 on the deployed default
-        # strategy, the SAME superlative question drifted across 3 column sets
-        # (`id` / `id,amount` / `claim_id,amount`) though answer identity stayed
-        # correct. This prompt pin steers the column shape deterministically. It is
-        # a MITIGATION (prompt-only, best-effort) — the SQL path has no
-        # ontology-canonical column name to fail-closed on, unlike NL→SPARQL. Present
-        # regardless of dialect.
         for dialect in ("postgresql", "athena"):
             gen = SQLGenerator(llm_client=AsyncMock(), vector_client=AsyncMock(), dialect=dialect)
-            p = gen._system_prompt
-            assert "DETERMINISM" in p
+            p = " ".join(gen._system_prompt.split())
             assert "SAME question must return the SAME columns" in p
-            # superlative → identifying column only + ORDER BY ... DESC LIMIT 1
-            assert "superlative" in p
-            assert "ORDER BY <measure> DESC LIMIT 1" in p
-            # stable identifier name (no run-to-run rename: the `id`→`claim_id` drift)
-            assert "do not rename or alias it" in p
+            assert "if the question names the columns to return, SELECT exactly those" in p
+            assert "SELECT exactly two columns" in p
+            display = p.index("(1) X's display column")
+            measure = p.index("(2) the ranked measure")
+            assert display < measure
+            assert "`name`, then `title`, then `label`, or X's primary key if it has none" in p
+            assert "aliased `<function>_<column>` in lowercase" in p
+            assert "`COUNT(o.id) AS count_id`" in p
+            assert "Never add the primary key next to a display column" in p
+            assert "ORDER BY <measure> DESC LIMIT 1 (ASC for lowest/least)" in p
+            assert "SELECT only the identifying column" not in p
+            assert "primary-key column, (2) one display-name" not in p
+
+    @pytest.mark.parametrize("dialect", ["postgresql", "athena"])
+    def test_worked_examples_use_serve_schema_format(self, dialect):
+        p = SQLGenerator(llm_client=AsyncMock(), vector_client=AsyncMock(), dialect=dialect)._system_prompt
+        assert "CREATE TABLE" not in p
+        examples = p[p.index("Examples:") :]
+        schema_block, *answer_blocks = re.findall(r"```sql\n(.*?)```", examples, re.DOTALL)
+        schema_lines = schema_block.strip().splitlines()
+        assert schema_lines
+        assert all(line.startswith("Table: ") and " | Columns: " in line for line in schema_lines)
+        assert len(answer_blocks) == examples.count("Question:")
+
+    @pytest.mark.parametrize("dialect", ["postgresql", "athena"])
+    def test_worked_example_aggregates_alias_function_column(self, dialect):
+        p = SQLGenerator(llm_client=AsyncMock(), vector_client=AsyncMock(), dialect=dialect)._system_prompt
+        examples = p[p.index("Examples:") :]
+        aggregates = re.findall(r"\b(SUM|COUNT|AVG|MIN|MAX)\((?:\w+\.)?(\w+)\)\s+AS\s+(\w+)", examples, re.IGNORECASE)
+        assert aggregates
+        for function, column, alias in aggregates:
+            assert alias == f"{function.lower()}_{column}"
 
 
 @pytest.mark.unit
@@ -812,7 +835,7 @@ class TestSQLGeneratorCorrect:
     @pytest.mark.asyncio
     async def test_correct_returns_sql_and_confidence(self, generator, mock_llm):
         mock_llm.converse.return_value = ConverseResult(
-            text="```sql\nSELECT count(*) FROM orders WHERE total::numeric > 0\n```\nConfidence: 0.9"
+            text="```sql\nSELECT count(*) AS count_all FROM orders WHERE total::numeric > 0\n```\nConfidence: 0.9"
         )
         sql, conf = await generator.correct(
             "How many big orders?",
@@ -820,7 +843,7 @@ class TestSQLGeneratorCorrect:
             failed_sql="SELECT count(*) FROM orders WHERE total > 0",
             execution_error="operator does not exist: text > integer",
         )
-        assert sql == "SELECT count(*) FROM orders WHERE total::numeric > 0"
+        assert sql == "SELECT count(*) AS count_all FROM orders WHERE total::numeric > 0"
         assert conf == 0.9
 
     @pytest.mark.asyncio
@@ -1678,7 +1701,7 @@ class TestUnretrievedSameNameCopies:
             same_name_databases=_owners({"ds": _DS_OWNERS}),
         )
 
-        assert result.sql == f"SELECT count(*) FROM {database}.ds"
+        assert result.sql == f"SELECT count(*) AS count_all FROM {database}.ds"
         routing = sql_table_routing(result.sql, result.table_sources, result.table_candidates)
         assert ambiguous_reference(result.sql, routing) is None
         assert routing[f"{database}.ds"]["datasourceId"] == _DS_OWNERS[database]
@@ -1696,7 +1719,7 @@ class TestUnretrievedSameNameCopies:
             same_name_databases=_owners({"ds": _DS_OWNERS}),
         )
 
-        assert result.sql == "SELECT count(*) FROM ds"
+        assert result.sql == "SELECT count(*) AS count_all FROM ds"
         routing = sql_table_routing(result.sql, result.table_sources, result.table_candidates)
         assert routing == {"ds": {AMBIGUOUS_KEY: "sdtm_cs101.ds,sdtm_cs102.ds,sdtm_cs103.ds"}}
 
@@ -1712,4 +1735,4 @@ async def _schema_reading_writer(prompt, **kwargs):
         listed = [d.strip() for d in segment.split(": ", 1)[1].split(" (", 1)[0].split(",")]
     named = next((d for d in listed if d and d in question), "")
     table = f"{named}.ds" if named else "ds"
-    return ConverseResult(text=f"```sql\nSELECT count(*) FROM {table}\n```\nConfidence: 0.9")
+    return ConverseResult(text=f"```sql\nSELECT count(*) AS count_all FROM {table}\n```\nConfidence: 0.9")

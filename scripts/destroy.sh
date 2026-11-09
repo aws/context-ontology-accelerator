@@ -16,7 +16,8 @@
 #   3. Delete VKG's per-namespace ECS services directly (they were
 #      created outside CFN by the reload Lambda) and wait for them to
 #      reach INACTIVE, so ECS DeleteCluster doesn't fail with
-#      ClusterContainsServicesException.
+#      ClusterContainsServicesException. Then deregister the per-namespace
+#      task definitions the same Lambda registered.
 #   4. Delete the Cloud Map services registered inside the private DNS
 #      namespace. CFN owns the namespace (network-stack) but NOT the
 #      services inside it — those are created at runtime by the VKG
@@ -516,6 +517,32 @@ else
 
     sleep 10
   done
+fi
+
+# The reload Lambda also registers a task-definition family per namespace, named
+# like its service, outside CloudFormation. CloudFormation owns only the template family.
+VKG_TD_DEREGISTERED=0
+VKG_TD_FAILED=0
+if ! TD_ARNS=$(aws ecs list-task-definitions --family-prefix "${STACK_PREFIX}-vkg-" --status ACTIVE \
+    --region "$REGION" --query 'taskDefinitionArns[]' --output text 2>&1); then
+  warn "Could not list the VKG task definitions: $TD_ARNS"
+  VKG_TD_FAILED=1
+  TD_ARNS=""
+fi
+for TD in $TD_ARNS; do
+  [[ "$TD" == *":task-definition/${STACK_PREFIX}-vkg-service:"* ]] && continue
+  if TD_ERR=$(aws ecs deregister-task-definition --task-definition "$TD" \
+      --region "$REGION" 2>&1 >/dev/null); then
+    VKG_TD_DEREGISTERED=$((VKG_TD_DEREGISTERED + 1))
+  else
+    warn "Could not deregister $TD: $TD_ERR"
+    VKG_TD_FAILED=$((VKG_TD_FAILED + 1))
+  fi
+done
+if [ "$VKG_TD_FAILED" -gt 0 ]; then
+  warn "$VKG_TD_FAILED VKG task-definition listing(s) or deregistration(s) failed; leftovers do not block the teardown."
+else
+  ok "Deregistered $VKG_TD_DEREGISTERED VKG task definition(s)."
 fi
 
 # ── Step 4: Delete Cloud Map services (CFN owns the namespace, not the

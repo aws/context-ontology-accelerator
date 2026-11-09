@@ -27,6 +27,7 @@ from coa_metrics.api.contract import (
     check_string,
 )
 from coa_metrics.api.create_metric import _metric_to_dict
+from coa_metrics.api.schema_visibility import visibility_from_event, withhold_metric_schema
 from coa_metrics.neptune_client import MetricNeptuneClient
 
 setup_logging(os.environ.get("LOG_LEVEL", "INFO"))
@@ -97,6 +98,13 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     if filter_error:
         return api_response(400, {"message": filter_error})
 
+    vis = visibility_from_event(event)
+    if source_table is not None and not vis.source:
+        # A sourceTable filter is a table-existence oracle; a caller who may not
+        # see source schema gets the same answer as for a table with no metrics.
+        logger.info("list_metrics_source_table_filter_withheld", namespace=namespace)
+        return api_response(200, {"metrics": []})
+
     # Query Neptune
     metrics = _get_neptune().list_metrics(
         namespace=namespace,
@@ -113,7 +121,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     next_token = str(offset + limit) if has_next else None
 
     response_body: dict[str, Any] = {
-        "metrics": [_metric_to_dict(m) for m in metrics],
+        "metrics": [withhold_metric_schema(_metric_to_dict(m), vis) for m in metrics],
     }
     if next_token:
         response_body["nextToken"] = next_token

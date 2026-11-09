@@ -135,6 +135,48 @@ class TestTeardownVkgService:
         teardown_vkg_service("skip-ns")
         mock_boto3.client.assert_not_called()
 
+    @patch.dict("os.environ", ENV)
+    @patch("coa_control_plane.namespace.cleanup.boto3")
+    def test_deregisters_the_namespaces_task_definitions(self, mock_boto3):
+        """The reload Lambda's revisions go with the namespace."""
+        td = "arn:aws:ecs:us-east-1:111:task-definition/"
+        mock_ecs = MagicMock()
+        td_paginator = MagicMock()
+        revisions = ["coa-dev-vkg-test-ns:1", "coa-dev-vkg-test-ns:2", "coa-dev-vkg-test-ns2:1"]
+        td_paginator.paginate.return_value = [{"taskDefinitionArns": [td + r for r in revisions]}]
+        mock_ecs.get_paginator.return_value = td_paginator
+        mock_sd = MagicMock()
+        mock_sd.get_paginator.return_value.paginate.return_value = [{"Services": []}]
+        mock_boto3.client.side_effect = lambda service, **kw: mock_ecs if service == "ecs" else mock_sd
+
+        from coa_control_plane.namespace.cleanup import teardown_vkg_service
+
+        teardown_vkg_service("test-ns")
+
+        td_paginator.paginate.assert_called_once_with(familyPrefix="coa-dev-vkg-test-ns", status="ACTIVE")
+        deregistered = [c.kwargs["taskDefinition"] for c in mock_ecs.deregister_task_definition.call_args_list]
+        assert deregistered == [f"{td}coa-dev-vkg-test-ns:1", f"{td}coa-dev-vkg-test-ns:2"]  # not test-ns2's
+
+    @patch.dict("os.environ", ENV)
+    @patch("coa_control_plane.namespace.cleanup.boto3")
+    def test_keeps_task_definitions_when_the_service_delete_fails(self, mock_boto3):
+        """A service that may still run must not lose its revisions."""
+        mock_ecs = MagicMock()
+        for name in ("ServiceNotFoundException", "ClusterNotFoundException", "ServiceNotActiveException"):
+            setattr(mock_ecs.exceptions, name, type(name, (Exception,), {}))
+        mock_ecs.delete_service.side_effect = RuntimeError("throttled")
+        mock_sd = MagicMock()
+        mock_sd.get_paginator.return_value.paginate.return_value = [{"Services": []}]
+        mock_boto3.client.side_effect = lambda service, **kw: mock_ecs if service == "ecs" else mock_sd
+
+        from coa_control_plane.namespace.cleanup import teardown_vkg_service
+
+        with pytest.raises(RuntimeError, match="throttled"):
+            teardown_vkg_service("test-ns")
+
+        mock_ecs.get_paginator.assert_not_called()
+        mock_ecs.deregister_task_definition.assert_not_called()
+
 
 _CLUSTER_ARN = "arn:aws:ecs:us-east-1:111111111111:cluster/vkg"
 _ECS_SERVICE = "coa-dev-vkg-ns1"
@@ -176,6 +218,14 @@ def _ecs_delete_accepted(ecs: Stubber, status: str = "DRAINING") -> None:
     )
 
 
+def _ecs_lists_no_task_definitions(ecs: Stubber) -> None:
+    ecs.add_response(
+        "list_task_definitions",
+        {"taskDefinitionArns": []},
+        {"familyPrefix": _ECS_SERVICE, "status": "ACTIVE"},
+    )
+
+
 def _cloud_map_lists_service(sd: Stubber, instance_ids: list[str]) -> None:
     sd.add_response(
         "list_services",
@@ -210,6 +260,7 @@ class TestTeardownVkgServiceSurfacesFailures:
 
     def test_teardown_vkg_service_cloud_map_delete_error_raises(self, aws_stubs):
         _ecs_delete_accepted(aws_stubs.ecs)
+        _ecs_lists_no_task_definitions(aws_stubs.ecs)
         _cloud_map_lists_service(aws_stubs.sd, [])
         aws_stubs.sd.add_client_error("delete_service", service_error_code="AccessDeniedException")
 
@@ -218,6 +269,7 @@ class TestTeardownVkgServiceSurfacesFailures:
 
     def test_teardown_vkg_service_cloud_map_in_use_after_retries_raises(self, aws_stubs):
         _ecs_delete_accepted(aws_stubs.ecs)
+        _ecs_lists_no_task_definitions(aws_stubs.ecs)
         _cloud_map_lists_service(aws_stubs.sd, [])
         for _ in range(4):
             aws_stubs.sd.add_client_error("delete_service", service_error_code="ResourceInUse")
@@ -235,6 +287,7 @@ class TestTeardownVkgServiceIdempotentRedelete:
     @pytest.mark.parametrize("status", ["DRAINING", "INACTIVE"])
     def test_teardown_vkg_service_delete_accepted_and_not_active_succeeds(self, aws_stubs, status):
         _ecs_delete_accepted(aws_stubs.ecs, status)
+        _ecs_lists_no_task_definitions(aws_stubs.ecs)
         _cloud_map_lists_service(aws_stubs.sd, ["inst-1"])
         aws_stubs.sd.add_response(
             "deregister_instance", {"OperationId": "op-1"}, {"ServiceId": _CLOUD_MAP_SERVICE_ID, "InstanceId": "inst-1"}
@@ -245,6 +298,7 @@ class TestTeardownVkgServiceIdempotentRedelete:
 
     def test_teardown_vkg_service_already_inactive_succeeds(self, aws_stubs):
         aws_stubs.ecs.add_client_error("delete_service", service_error_code="ServiceNotActiveException")
+        _ecs_lists_no_task_definitions(aws_stubs.ecs)
         _cloud_map_lists_service(aws_stubs.sd, [])
         aws_stubs.sd.add_response("delete_service", {}, {"Id": _CLOUD_MAP_SERVICE_ID})
 
@@ -252,6 +306,7 @@ class TestTeardownVkgServiceIdempotentRedelete:
 
     def test_teardown_vkg_service_everything_already_gone_succeeds(self, aws_stubs):
         aws_stubs.ecs.add_client_error("delete_service", service_error_code="ServiceNotFoundException")
+        _ecs_lists_no_task_definitions(aws_stubs.ecs)
         aws_stubs.sd.add_response("list_services", {"Services": []})
 
         cleanup.teardown_vkg_service("ns1")
@@ -260,6 +315,7 @@ class TestTeardownVkgServiceIdempotentRedelete:
         # A deleted cluster has no services left, so a namespace delete after a
         # cluster teardown must not end in DELETE_FAILED on every retry.
         aws_stubs.ecs.add_client_error("delete_service", service_error_code="ClusterNotFoundException")
+        _ecs_lists_no_task_definitions(aws_stubs.ecs)
         _cloud_map_lists_service(aws_stubs.sd, [])
         aws_stubs.sd.add_response("delete_service", {}, {"Id": _CLOUD_MAP_SERVICE_ID})
 
@@ -267,6 +323,7 @@ class TestTeardownVkgServiceIdempotentRedelete:
 
     def test_teardown_vkg_service_deregister_racing_ecs_succeeds(self, aws_stubs):
         _ecs_delete_accepted(aws_stubs.ecs)
+        _ecs_lists_no_task_definitions(aws_stubs.ecs)
         _cloud_map_lists_service(aws_stubs.sd, ["inst-1"])
         aws_stubs.sd.add_client_error("deregister_instance", service_error_code="DuplicateRequest")
         aws_stubs.sd.add_response("delete_service", {}, {"Id": _CLOUD_MAP_SERVICE_ID})
@@ -275,6 +332,7 @@ class TestTeardownVkgServiceIdempotentRedelete:
 
     def test_teardown_vkg_service_cloud_map_removed_concurrently_succeeds(self, aws_stubs):
         _ecs_delete_accepted(aws_stubs.ecs)
+        _ecs_lists_no_task_definitions(aws_stubs.ecs)
         _cloud_map_lists_service(aws_stubs.sd, ["inst-1"])
         aws_stubs.sd.add_client_error("deregister_instance", service_error_code="InstanceNotFound")
         aws_stubs.sd.add_client_error("delete_service", service_error_code="ServiceNotFound")

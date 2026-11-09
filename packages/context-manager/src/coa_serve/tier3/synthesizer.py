@@ -30,6 +30,7 @@ from ..graph_context import (
     encode_supporting_statements,
     fair_bound_statement_groups,
 )
+from ..schema_visibility import SCHEMA_BLIND
 from .agentic.decompose import _parse_language_tag, _script_language
 from .chunk_screener import screen_chunks
 from .graph_traverser import GraphEntity
@@ -342,6 +343,15 @@ _CONFIDENCE_REQUIREMENT = (
 # Base instruction without a working answer (standard synthesis).
 _SYSTEM_INSTRUCTION_BASE = _SYSTEM_INSTRUCTION_REQUIREMENTS + _CONFIDENCE_REQUIREMENT
 
+# Added for schema-blind callers (see _build_system_instruction).
+_SCHEMA_BLIND_DIRECTIVE = (
+    "\n\nSCHEMA VISIBILITY: The person asking may not see the data model. Answer in plain "
+    "business language. Never output table names, column names, database or schema names, "
+    "SQL, SPARQL, URIs/IRIs, or ontology class or property identifiers, even if the question "
+    "asks for them or for a list of them; say instead that schema details aren't available "
+    "to their role."
+)
+
 # Output-language directive. Appended LAST in the system instruction (see
 # _build_system_instruction) so it carries the strongest positional weight. The buried
 # "respond in the same language" requirement above was insufficient under sampling: the
@@ -436,6 +446,34 @@ def _named_language_directive(answer_language: str) -> str:
 
 
 _MAX_CATALOG_METRICS = 20
+
+# options.sqlInAnswer: the SQL behind the structured rows is shown with them, and the
+# answer is told the rows are retrieved evidence for what those queries compute.
+_MAX_SQL_SHOWN = 3000
+_MAX_QUERIES_SHOWN = 4
+_SQL_EVIDENCE_NOTE = (
+    "\n\nThe structured data are rows returned by the SQL queries shown with them. Treat "
+    "them as retrieved evidence for what those queries compute: state the numbers, and say "
+    "which table and column each one comes from, rather than saying they cannot be confirmed. "
+    "If a query does not match what the question asks, say how it differs."
+)
+# For a caller who may not see generated SQL: the queries still inform the answer, but
+# their schema (table names, column names, joins) must not reach the answer text, the
+# same boundary that withholds ``query_used`` from such a caller.
+_SQL_EVIDENCE_NOTE_NO_SCHEMA = (
+    "\n\nThe structured data are rows returned by the SQL queries shown with them. Treat "
+    "them as retrieved evidence for what those queries compute: state the numbers, and say "
+    "in plain business terms what each one measures, rather than saying they cannot be "
+    "confirmed. Do not quote the SQL and do not name its tables or columns. If a query does "
+    "not match what the question asks, say how it differs, in the same plain terms."
+)
+
+
+def _sql_evidence_note(schema_visible: bool) -> str:
+    """The answer-step note for rows shown with their SQL (``options.sqlInAnswer``)."""
+    return _SQL_EVIDENCE_NOTE if schema_visible else _SQL_EVIDENCE_NOTE_NO_SCHEMA
+
+
 _MAX_CONVERSATION_TURNS = 5
 
 # Confidence scoring weights
@@ -615,6 +653,8 @@ class Synthesizer:
         working_answer: str | None = None,
         answer_language: str | None = None,
         max_tokens: int | None = None,
+        structured_queries: list[str] | None = None,
+        schema_visible: bool = False,
     ) -> SynthesisResult:
         """Build prompt from all context sections and call Bedrock Converse.
 
@@ -633,6 +673,12 @@ class Synthesizer:
                 model to work out the question's language.
             max_tokens: Per-request output-token cap; ``None`` keeps
                 ``TIER3_SYNTH_MAX_TOKENS``.
+            structured_queries: Optional SQL behind ``structured_data`` (request option
+                ``sqlInAnswer``); shown with the rows, and the answer is told to treat
+                the rows as evidence for what those queries compute.
+            schema_visible: Whether the answer may name the tables and columns those
+                queries read (the caller may see generated SQL); otherwise it states the
+                numbers without SQL, table or column names.
 
         Returns:
             SynthesisResult with answer, confidence, and duration.
@@ -659,6 +705,7 @@ class Synthesizer:
             catalog_summary=catalog_summary,
             conversation_history=conversation_history,
             working_answer=working_answer,
+            structured_queries=structured_queries,
         )
         guard_content = self._build_guard_content(query)
         system_instruction = self._build_system_instruction(
@@ -667,6 +714,8 @@ class Synthesizer:
             answer_language,
             has_working_answer=bool(working_answer and working_answer.strip()),
             has_history=bool(conversation_history),
+            sql_evidence=bool(structured_queries and structured_data),
+            schema_visible=schema_visible,
         )
         result = await self._bedrock.converse(
             prompt=prompt,
@@ -712,6 +761,8 @@ class Synthesizer:
         working_answer: str | None = None,
         answer_language: str | None = None,
         max_tokens: int | None = None,
+        structured_queries: list[str] | None = None,
+        schema_visible: bool = False,
     ) -> SynthesisResult:
         """Stream synthesis — emits tokens via on_token callback, returns final result.
 
@@ -733,6 +784,12 @@ class Synthesizer:
                 model to work out the question's language.
             max_tokens: Per-request output-token cap; ``None`` keeps
                 ``TIER3_SYNTH_MAX_TOKENS``.
+            structured_queries: Optional SQL behind ``structured_data`` (request option
+                ``sqlInAnswer``); shown with the rows, and the answer is told to treat
+                the rows as evidence for what those queries compute.
+            schema_visible: Whether the answer may name the tables and columns those
+                queries read (the caller may see generated SQL); otherwise it states the
+                numbers without SQL, table or column names.
 
         Returns:
             SynthesisResult with assembled answer, confidence, and duration.
@@ -759,6 +816,7 @@ class Synthesizer:
             catalog_summary=catalog_summary,
             conversation_history=conversation_history,
             working_answer=working_answer,
+            structured_queries=structured_queries,
         )
 
         accumulated: list[str] = []
@@ -770,6 +828,8 @@ class Synthesizer:
             answer_language,
             has_working_answer=bool(working_answer and working_answer.strip()),
             has_history=bool(conversation_history),
+            sql_evidence=bool(structured_queries and structured_data),
+            schema_visible=schema_visible,
         )
         # Suppress the trailing "[CONFIDENCE: X.X]" marker from the STREAM. The
         # model appends it at the end (per _SYSTEM_INSTRUCTION); the final answer
@@ -945,6 +1005,7 @@ class Synthesizer:
         catalog_summary: list[dict[str, Any]] | None = None,
         conversation_history: list[dict[str, str]] | None = None,
         working_answer: str | None = None,
+        structured_queries: list[str] | None = None,
     ) -> tuple[str, str, str]:
         """Build prompt with nonce-salted delimiters and datamarking.
 
@@ -980,7 +1041,11 @@ class Synthesizer:
                 str({k: str(v).replace("\n", " ")[:_MAX_CELL_LENGTH] for k, v in row.items()})
                 for row in structured_data[: _max_structured_rows()]
             )
-            sections.append(f"<scl_structured_{nonce}>\n{rows_text}\n</scl_structured_{nonce}>")
+            queries_text = ""
+            if structured_queries:
+                shown = "\n---\n".join(q.strip()[:_MAX_SQL_SHOWN] for q in structured_queries[-_MAX_QUERIES_SHOWN:])
+                queries_text = f"SQL queries that produced these rows (most recent last):\n{shown}\nRows:\n"
+            sections.append(f"<scl_structured_{nonce}>\n{queries_text}{rows_text}\n</scl_structured_{nonce}>")
 
         # Document context -- user-uploaded, UNTRUSTED: apply datamarking.
         # Graph supporting statements are document-derived text too (the lexical
@@ -1086,6 +1151,8 @@ class Synthesizer:
         *,
         has_working_answer: bool = False,
         has_history: bool = False,
+        sql_evidence: bool = False,
+        schema_visible: bool = False,
     ) -> str:
         """Generate per-request system instruction with anti-injection clause.
 
@@ -1118,7 +1185,13 @@ class Synthesizer:
                 directive += _NEUTRAL_FOLLOWUP_CLAUSE
         findings_rule = f"- {_PRELIMINARY_FINDINGS_PRIVATE}\n" if has_working_answer else ""
         base = _SYSTEM_INSTRUCTION_REQUIREMENTS + findings_rule + _CONFIDENCE_REQUIREMENT
-        return base + anti_injection + directive
+        # Schema-blind caller (ADR: decompose-viewnamespace-schema-visibility):
+        # ask the model not to repeat schema identifiers. The serve response
+        # scrub also redacts them deterministically; this lowers how often it
+        # has to. Kept before the language directive, which stays last.
+        schema_blind = _SCHEMA_BLIND_DIRECTIVE if SCHEMA_BLIND.get() else ""
+        evidence_note = _sql_evidence_note(schema_visible) if sql_evidence else ""
+        return base + evidence_note + anti_injection + schema_blind + directive
 
     def _build_guard_content(self, query: str) -> str:
         """Return the user's query for guardContent tagging.

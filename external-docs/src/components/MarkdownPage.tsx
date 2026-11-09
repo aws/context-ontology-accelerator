@@ -9,6 +9,7 @@ import { slugify } from '../utils/slugify'
 
 // Map .md filenames to hash route page IDs
 const mdFileToPageId: Record<string, PageId> = {
+  'architecture.md': 'architecture',
   'deploying.md': 'deploying',
   'namespaces.md': 'namespaces',
   'authentication-setup.md': 'authentication-setup',

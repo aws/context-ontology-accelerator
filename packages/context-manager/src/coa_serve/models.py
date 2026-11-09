@@ -8,9 +8,11 @@ from __future__ import annotations
 import math
 
 from coa_common.constants import MAX_QUERY_CODEPOINTS, validate_query_text
-from pydantic import BaseModel, Field, field_serializer, field_validator
+from pydantic import BaseModel, Field, PrivateAttr, field_serializer, field_validator
 
+from .llm_usage import LlmUsageSnapshot
 from .mode import LEGACY_MODE_ALIASES
+from .request_caps import SQL_WRITER_EFFORT_LEVELS
 
 _MAX_DETAIL_LENGTH = 500  # Matches trace.py centralized truncation
 
@@ -165,7 +167,7 @@ class InvokeRequest(BaseModel):
           sufficiency once and skip the loop when the evidence is enough.
         * ``plannerParseRetry`` (bool) — one repair turn on an unparseable planner
           reply.
-        * ``tokenCaps`` ({planner|synthesizer: int}) — per-request output token caps.
+        * ``tokenCaps`` ({planner|synthesizer|nl2sql: int}) — per-request output token caps.
         * ``loopFixes`` (bool) — drop unknown planner fields instead of rejecting
           the call, do not call the planner or start a tool once no time is left
           for the tool, give back the step of a read that returned nothing new, and
@@ -182,35 +184,72 @@ class InvokeRequest(BaseModel):
           of writing a new query, and it is cancelled before the answer is written.
         * ``singleCallSteps`` (bool) — the planner's next-step call also decides when
           to stop (an empty proposal ends the loop), so each step is one model call.
+        * ``sqlWithEvidence`` (bool) / ``sqlEvidenceMaxChars`` (int) — nl_to_sql
+          hands the loop's gathered document evidence to the SQL writer.
+        * ``sqlOriginalQuestion`` / ``sqlTimeRules`` / ``sqlComputeMetric`` (bool) —
+          SQL-writer adjustments (original question for constraints, direct
+          timestamp comparisons, requested metric computed in SQL). ``sqlComputeMetric``
+          applies inside Deep Reasoning only.
+        * ``sqlInAnswer`` (bool) — the answer step sees the SQL behind the structured
+          rows and treats the rows as evidence for what those queries compute.
+        * ``sqlRevision`` (bool) — nl_to_sql also accepts a ``revise`` reason; the
+          writer then revises the request's previous query from its SQL and rows.
+        * ``sqlResultCheck`` (bool) — with ``prefetchMode: "assess"`` and
+          ``sqlRevision``, before the prefetch SQL result is accepted as enough, one
+          model call checks it for a defect visible in the rows; a named defect
+          rewrites the query once and the new rows replace the old.
+        * ``sqlWriterEffort`` (``"low"`` / ``"medium"`` / ``"high"``) — the SQL
+          writer's model effort level (how much it reasons before writing) on its
+          generate and correct calls; unset keeps the model's default on a direct
+          Tier-2 request (Deep Reasoning fills in the recommended ``"medium"``).
+        * ``tokenCaps.nl2sql``, ``sqlTimeRules`` and ``sqlWriterEffort`` also apply
+          to a direct Tier-2 NL→SQL request.
 
         Only types and enumerations are checked here; ranges are clamped where the
         option is used. A malformed value fails fast instead of silently running
         the default.
         """
+        for key in ("sqlFeedback", "originalQuestion", "evidenceMaxChars", "computeMetric"):
+            # Set internally by the deep-reasoning SQL tool (sqlRevision /
+            # sqlOriginalQuestion / sqlWithEvidence / sqlComputeMetric); a caller
+            # must not shape the SQL writer's prompt this way.
+            if key in options:
+                raise ValueError(f"{key} is set internally and cannot be sent in a request")
         if "tokenCaps" in options:
             caps = options["tokenCaps"]
             if not isinstance(caps, dict) or any(
-                key not in ("planner", "synthesizer") or isinstance(v, bool) or not isinstance(v, int)
+                key not in ("planner", "synthesizer", "nl2sql") or isinstance(v, bool) or not isinstance(v, int)
                 for key, v in caps.items()
             ):
-                raise ValueError(f"Invalid tokenCaps {caps!r}; must map planner/synthesizer to integers")
+                raise ValueError(f"Invalid tokenCaps {caps!r}; must map planner/synthesizer/nl2sql to integers")
         for key in (
             "readDocument",
             "readDocumentAnchor",
             "entityRouting",
+            "sqlWithEvidence",
+            "sqlOriginalQuestion",
+            "sqlTimeRules",
+            "sqlComputeMetric",
             "plannerParseRetry",
             "loopFixes",
             "sufficiencyGuards",
             "singleCallSteps",
             "fastPathSpeculation",
             "keepSlowSql",
+            "sqlRevision",
+            "sqlInAnswer",
+            "sqlResultCheck",
         ):
             if key in options and not isinstance(options[key], bool):
                 raise ValueError(f"Invalid {key} {options[key]!r}; must be a boolean")
-        for key in ("readDocumentMaxChars",):
+        for key in ("readDocumentMaxChars", "sqlEvidenceMaxChars"):
             value = options.get(key)
             if key in options and (isinstance(value, bool) or not isinstance(value, int)):
                 raise ValueError(f"Invalid {key} {value!r}; must be an integer")
+        if "sqlWriterEffort" in options and options["sqlWriterEffort"] not in SQL_WRITER_EFFORT_LEVELS:
+            raise ValueError(
+                f"Invalid sqlWriterEffort {options['sqlWriterEffort']!r}; must be 'low', 'medium' or 'high'"
+            )
         if "prefetchMode" in options and options["prefetchMode"] not in ("assess", "off"):
             raise ValueError(f"Invalid prefetchMode {options['prefetchMode']!r}; must be 'assess' or 'off'")
         if "ontologyLookupMode" in options and options["ontologyLookupMode"] not in ("planner", "preload"):
@@ -245,6 +284,18 @@ class InvokeRequest(BaseModel):
             value = options["mode"]
             if value not in ("deep-reasoning", "standard", *LEGACY_MODE_ALIASES):
                 raise ValueError(f"Invalid mode {value!r}; must be 'deep-reasoning' or 'standard'")
+        return options
+
+    @field_validator("options", mode="after")
+    @classmethod
+    def _validate_include_llm_usage(cls, options: dict) -> dict:
+        """Validate ``options.includeLlmUsage`` — opt in to ``QueryResult.llmUsage``.
+
+        Observability only: it never changes routing or execution. Must be a real
+        boolean so a string ``"false"`` cannot silently switch accounting on.
+        """
+        if "includeLlmUsage" in options and not isinstance(options["includeLlmUsage"], bool):
+            raise ValueError(f"Invalid includeLlmUsage {_clip(options['includeLlmUsage'])}; must be a boolean")
         return options
 
     @field_validator("options", mode="after")
@@ -390,6 +441,50 @@ class InvokeRequest(BaseModel):
         return options
 
 
+class LlmModelUsage(BaseModel):
+    """Provider-reported token totals for one model used by the request."""
+
+    model_id: str = Field(..., min_length=1, alias="modelId")
+    input_tokens: int = Field(..., ge=0, alias="inputTokens")
+    output_tokens: int = Field(..., ge=0, alias="outputTokens")
+    max_input_tokens_per_call: int = Field(..., ge=0, alias="maxInputTokensPerCall")
+    model_config = {"populate_by_name": True, "strict": True}
+
+
+class LlmUsageMetrics(BaseModel):
+    """Text-LLM usage incurred while serve answered one request.
+
+    Mirrors ``LlmUsageMetrics`` in ``serve.smithy``. Present only when the caller set
+    ``options.includeLlmUsage``. ``complete`` is False when any call's usage was
+    unknown. Model ids are included so downstream benchmark reporting can apply a
+    versioned price table without coupling Serve to AWS pricing.
+    """
+
+    input_tokens: int = Field(..., ge=0, alias="inputTokens")
+    output_tokens: int = Field(..., ge=0, alias="outputTokens")
+    per_model: list[LlmModelUsage] = Field(..., alias="perModel")
+    complete: bool
+    model_config = {"populate_by_name": True, "strict": True}
+
+    @classmethod
+    def from_snapshot(cls, snapshot: LlmUsageSnapshot) -> LlmUsageMetrics:
+        """Build the outbound shape from a finalized tracker snapshot."""
+        return cls(
+            input_tokens=snapshot.input_tokens,
+            output_tokens=snapshot.output_tokens,
+            per_model=[
+                LlmModelUsage(
+                    model_id=usage.model_id,
+                    input_tokens=usage.input_tokens,
+                    output_tokens=usage.output_tokens,
+                    max_input_tokens_per_call=usage.max_input_tokens_per_call,
+                )
+                for usage in snapshot.per_model
+            ],
+            complete=snapshot.complete,
+        )
+
+
 class QueryResult(BaseModel):
     """Resolution result: answer tier, confidence, payloads, and processing trace."""
 
@@ -417,10 +512,36 @@ class QueryResult(BaseModel):
     # on the timeout path (see main.py); this model does not touch it.
     partial: bool = False
     metadata: dict | None = None
+    # Opt-in (options.includeLlmUsage): absent unless requested, so the default
+    # response shape is unchanged.
+    llm_usage: LlmUsageMetrics | None = Field(None, alias="llmUsage")
     # OUT OF SCOPE (flag, do not implement here): no `conformanceWarnings`
     # field. SHACL conformance warnings are P1 and are intentionally absent
     # from this model; do NOT add a conformanceWarnings field here.
     model_config = {"populate_by_name": True}
+
+    # The compiled SQL / generated SPARQL as produced, BEFORE the include gates
+    # blank ``query_used`` / ``sparql_generated``. Never serialized (private
+    # attributes are not fields); read only by the schema-visibility scrub, which
+    # needs the withheld identifiers to redact them from the answer and rows.
+    _raw_query_used: str | None = PrivateAttr(default=None)
+    _raw_sparql: str | None = PrivateAttr(default=None)
+
+    def with_raw_artifacts(self, *, query_used: str | None, sparql: str | None = None) -> QueryResult:
+        """Record the ungated SQL/SPARQL for identifier collection; returns ``self``."""
+        self._raw_query_used = query_used or None
+        self._raw_sparql = sparql or None
+        return self
+
+    @property
+    def raw_query_used(self) -> str | None:
+        """The ungated SQL (falls back to ``query_used``); never part of the response."""
+        return self._raw_query_used or self.query_used
+
+    @property
+    def raw_sparql(self) -> str | None:
+        """The ungated SPARQL (falls back to ``sparql_generated``); never part of the response."""
+        return self._raw_sparql or self.sparql_generated
 
 
 class InvokeResponse(BaseModel):

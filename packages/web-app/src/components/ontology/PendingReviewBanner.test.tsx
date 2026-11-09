@@ -4,11 +4,15 @@
 import React from "react";
 import { render, screen } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
-import { describe, it, expect, vi } from "vitest";
+import { beforeEach, describe, it, expect, vi } from "vitest";
+import { listAllProposals } from "../../services/ontology-engine";
 import { PendingReviewBanner } from "./PendingReviewBanner";
 
+// One client for every render, as the real provider's memoized context gives.
+const { apiClient } = vi.hoisted(() => ({ apiClient: {} }));
+
 vi.mock("@components/ApiClientProvider", () => ({
-  useApiClient: () => ({}),
+  useApiClient: () => apiClient,
 }));
 
 vi.mock("../../services/ontology-engine", () => ({
@@ -31,9 +35,14 @@ function renderWithRouter() {
 }
 
 describe("PendingReviewBanner", () => {
+  beforeEach(() => {
+    vi.mocked(listAllProposals).mockClear();
+  });
+
   it("renders banner when there are pending proposals", async () => {
     renderWithRouter();
     expect(await screen.findByText(/awaiting review/)).toBeTruthy();
     expect(screen.getByText("Review proposal")).toBeTruthy();
+    expect(listAllProposals).toHaveBeenCalledTimes(1);
   });
 });

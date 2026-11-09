@@ -15,7 +15,7 @@ requires policies as input — it does not load from disk.
 import logging
 from pathlib import Path
 
-from cedarpy import AuthzResult, is_authorized
+from cedarpy import AuthzResult, is_authorized, is_authorized_batch
 
 from .cedar_schema import SCL_SCHEMA
 
@@ -138,4 +138,51 @@ def evaluate(
         return is_authorized(request, policies, [user, resource])
     except Exception as e:
         logger.error(f"Authorization evaluation failed: {e}")
-        return AuthzResult({"decision": "Deny", "diagnostics": {"reason": [], "errors": []}})
+        return _deny()
+
+
+def _deny() -> AuthzResult:
+    return AuthzResult({"decision": "Deny", "diagnostics": {"reason": [], "errors": []}})
+
+
+def evaluate_batch(
+    policies: str,
+    user_id: str,
+    checks: list[tuple[str, str, str]],
+    global_roles: list[str] | None = None,
+    resource_roles: list[dict[str, str]] | None = None,
+) -> list[AuthzResult]:
+    """Evaluate several ``(action, resource_type, resource_id)`` checks in one Cedar call.
+
+    The policy text is parsed once for the whole batch (``cedarpy.is_authorized_batch``).
+    Each resource entity carries ``namespace = resource_id``, the convention every
+    namespace-scoped caller of :func:`evaluate` already uses. Results are in the
+    order of ``checks``. On any exception every result is an explicit deny
+    (fail closed), matching :func:`evaluate`.
+    """
+    if not checks:
+        return []
+    try:
+        user = build_user_entity(user_id, global_roles, resource_roles)
+        entities: dict[tuple[str, str], dict] = {}
+        requests = []
+        for action, resource_type, resource_id in checks:
+            entities.setdefault(
+                (resource_type, resource_id),
+                build_resource_entity(resource_type, resource_id, {"namespace": resource_id}),
+            )
+            requests.append(
+                {
+                    "principal": f'{SCL_SCHEMA}::User::"{user_id}"',
+                    "action": f'{SCL_SCHEMA}::Action::"{action}"',
+                    "resource": f'{SCL_SCHEMA}::{resource_type}::"{resource_id}"',
+                    "context": {},
+                }
+            )
+        results = is_authorized_batch(requests, policies, [user, *entities.values()])
+        if len(results) != len(checks):
+            raise ValueError("Cedar batch returned a result count that does not match the request count")
+        return list(results)
+    except Exception as e:
+        logger.error(f"Batch authorization evaluation failed: {e}")
+        return [_deny() for _ in checks]

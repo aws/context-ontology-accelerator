@@ -3,6 +3,7 @@
 
 """Tests for grant resolution — the fail-closed security boundary."""
 
+import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -287,6 +288,7 @@ class TestResolvedProfile:
             "tableAllowlist": ["orders", "customers"],
             "columnDenylist": ["ssn", "credit_card"],
             "dataSourceIds": ["ds-001"],
+            "schemaVisibility": {},
         }
 
     def test_empty_profile_dict(self):
@@ -324,7 +326,8 @@ class TestCedarEvaluation:
             caller = _make_caller(namespaces=["sales"])
             profile = await resolve_grant(caller, "sales", cedar_action="query")
             assert profile.namespace == "sales"
-            mock_evaluate.assert_called_once()
+            # The tool action first, then the two schema-view decisions on the same policies.
+            assert mock_evaluate.call_args_list[0].kwargs["action"] == "query"
 
     @pytest.mark.asyncio
     @patch("coa_mcp.auth.grant_resolver._ROLES_TABLE", "test-roles-table")
@@ -372,11 +375,24 @@ class TestCedarEvaluation:
     @pytest.mark.asyncio
     @patch("coa_mcp.auth.grant_resolver._ROLES_TABLE", "")
     @patch("coa_serve.role_resolver.resolve_profile")
-    async def test_cedar_skipped_when_no_roles_table(self, mock_resolve):
-        """Empty ROLES_TABLE_NAME skips Cedar evaluation."""
+    async def test_cedar_action_without_roles_table_fails_closed(self, mock_resolve):
+        """A required cedar_action with ROLES_TABLE_NAME unset now DENIES (fail-closed),
+        rather than silently skipping the gate — matching the schema-view decisions, so the hard
+        tool-gate and the output-suppression probe agree in this misconfiguration."""
         mock_resolve.return_value = _grant()
         caller = _make_caller(namespaces=["sales"])
-        profile = await resolve_grant(caller, "sales", cedar_action="query")
+        with pytest.raises(GrantResolutionError, match="Authorization is temporarily unavailable"):
+            await resolve_grant(caller, "sales", cedar_action="query")
+
+    @pytest.mark.asyncio
+    @patch("coa_mcp.auth.grant_resolver._ROLES_TABLE", "")
+    @patch("coa_serve.role_resolver.resolve_profile")
+    async def test_no_cedar_action_skips_gate_even_without_roles_table(self, mock_resolve):
+        """With NO cedar_action (legacy callers), evaluation is still skipped regardless
+        of the roles table — only a required action triggers the fail-closed deny above."""
+        mock_resolve.return_value = _grant()
+        caller = _make_caller(namespaces=["sales"])
+        profile = await resolve_grant(caller, "sales")
         assert profile.namespace == "sales"
 
     def test_tool_cedar_action_mapping_complete(self):
@@ -390,6 +406,109 @@ class TestCedarEvaluation:
             "graph_traversal",
         }
         assert set(TOOL_CEDAR_ACTION.keys()) == expected_tools
+
+    def test_schema_blind_tool_mappings_are_pinned(self):
+        """describe_schema is HARD-denied to a schema-blind role via viewOntology;
+        graph_traversal and translate_sparql stay on working-tool actions the
+        analyst holds (their output is suppressed instead). Reverting
+        describe_schema to viewNamespace would let a data-analyst dump the
+        ontology vocabulary, so the exact values are pinned."""
+        assert TOOL_CEDAR_ACTION["describe_schema"] == "viewOntology"
+        assert TOOL_CEDAR_ACTION["graph_traversal"] == "traverseGraph"
+        assert TOOL_CEDAR_ACTION["translate_sparql"] == "query"
+
+
+@pytest.mark.unit
+class TestSchemaVisibilityDecisions:
+    """resolve_grant decides viewSource/viewOntology from the SAME policy load as the
+    tool action and caches them on the profile (ADR: decompose-viewnamespace-
+    schema-visibility), so the output-suppression gate and the metric flags never
+    reload policies. Each decision fails closed."""
+
+    @staticmethod
+    def _dao():
+        dao = MagicMock()
+        dao.get.return_value = {"cedarPolicy": "permit(principal, action, resource);"}
+        return dao
+
+    @pytest.mark.asyncio
+    @patch("coa_mcp.auth.grant_resolver._ROLES_TABLE", "test-roles-table")
+    @patch("coa_serve.role_resolver.resolve_profile")
+    @patch("coa_mcp.auth.grant_resolver.cedar_evaluate")
+    async def test_policies_loaded_once_and_rights_cached(self, mock_evaluate, mock_resolve):
+        mock_resolve.return_value = _grant()
+        mock_evaluate.side_effect = lambda **kw: MagicMock(allowed=kw["action"] != "viewOntology")
+        with patch("coa_authorization.policy_loader.load_policies_for_roles", return_value="p") as mock_load:
+            profile = await resolve_grant(_make_caller(namespaces=["sales"]), "sales", cedar_action="query")
+
+        mock_load.assert_called_once()
+        assert [c.kwargs["action"] for c in mock_evaluate.call_args_list] == ["query", "viewSource", "viewOntology"]
+        assert profile.schema_visibility == {"viewSource": True, "viewOntology": False}
+        assert profile.to_profile_dict()["schemaVisibility"] == {"viewSource": True, "viewOntology": False}
+
+    @pytest.mark.asyncio
+    @patch("coa_mcp.auth.grant_resolver._ROLES_TABLE", "test-roles-table")
+    @patch("coa_serve.role_resolver.resolve_profile")
+    @patch("coa_mcp.auth.grant_resolver.cedar_evaluate")
+    async def test_policy_load_and_evaluation_run_off_the_event_loop(self, mock_evaluate, mock_resolve):
+        """The blocking DynamoDB load and cedarpy calls run in a worker thread, not on the loop."""
+        mock_resolve.return_value = _grant()
+        loop_thread = threading.get_ident()
+        threads: list[int] = []
+
+        def load(**_kw):
+            threads.append(threading.get_ident())
+            return "p"
+
+        def evaluate(**_kw):
+            threads.append(threading.get_ident())
+            return MagicMock(allowed=True)
+
+        mock_evaluate.side_effect = evaluate
+        with patch("coa_authorization.policy_loader.load_policies_for_roles", side_effect=load):
+            profile = await resolve_grant(_make_caller(namespaces=["sales"]), "sales", cedar_action="query")
+
+        assert len(threads) == 4  # one load + query + viewSource + viewOntology
+        assert loop_thread not in threads
+        assert profile.schema_visibility == {"viewSource": True, "viewOntology": True}
+
+    @pytest.mark.asyncio
+    @patch("coa_mcp.auth.grant_resolver._ROLES_TABLE", "test-roles-table")
+    @patch("coa_serve.role_resolver.resolve_profile")
+    @patch("coa_mcp.auth.grant_resolver.cedar_evaluate")
+    async def test_schema_view_error_fails_closed_without_failing_the_call(self, mock_evaluate, mock_resolve):
+        """A schema-view evaluation error withholds schema; the tool call itself still runs."""
+        mock_resolve.return_value = _grant()
+
+        def evaluate(**kw):
+            if kw["action"] == "query":
+                return MagicMock(allowed=True)
+            raise RuntimeError("cedar schema bug")
+
+        mock_evaluate.side_effect = evaluate
+        with patch("coa_authorization.policy_loader.DynamoDBDAO", return_value=self._dao()):
+            profile = await resolve_grant(_make_caller(namespaces=["sales"]), "sales", cedar_action="query")
+        assert profile.schema_visibility == {"viewSource": False, "viewOntology": False}
+
+    @pytest.mark.asyncio
+    @patch("coa_mcp.auth.grant_resolver._ROLES_TABLE", "test-roles-table")
+    @patch("coa_serve.role_resolver.resolve_profile")
+    @patch("coa_mcp.auth.grant_resolver.cedar_evaluate")
+    async def test_schema_blind_analyst(self, mock_evaluate, mock_resolve):
+        mock_resolve.return_value = _grant(role="data-analyst")
+        mock_evaluate.side_effect = lambda **kw: MagicMock(allowed=kw["action"] == "query")
+        with patch("coa_authorization.policy_loader.DynamoDBDAO", return_value=self._dao()):
+            profile = await resolve_grant(_make_caller(namespaces=["sales"]), "sales", cedar_action="query")
+        assert profile.schema_visibility == {"viewSource": False, "viewOntology": False}
+
+    @pytest.mark.asyncio
+    @patch("coa_mcp.auth.grant_resolver._ROLES_TABLE", "")
+    @patch("coa_serve.role_resolver.resolve_profile")
+    async def test_no_cedar_action_leaves_rights_empty(self, mock_resolve):
+        """Without a cedar_action nothing is evaluated; consumers treat empty as withhold."""
+        mock_resolve.return_value = _grant()
+        profile = await resolve_grant(_make_caller(namespaces=["sales"]), "sales")
+        assert profile.schema_visibility == {}
 
 
 @pytest.mark.unit

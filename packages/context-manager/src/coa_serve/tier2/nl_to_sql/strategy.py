@@ -25,10 +25,16 @@ one correction shot. Correction likewise fires on a true execution error.
 
 from __future__ import annotations
 
+import asyncio
+import datetime as dt
+import hashlib
+import json
 import os
 import re
 import time
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, replace
+from decimal import Decimal
+from typing import TYPE_CHECKING, Literal
 
 import structlog
 from coa_common import ontology_vector_index_name
@@ -44,18 +50,74 @@ from ...query_utils import (
     namespace_graph_prefix,
     validate_namespace,
 )
+from ...request_caps import SQL_WRITER_EFFORT_LEVELS, token_cap
 from ...step_ids import StepId
 from ..guardrail_placeholders import masked_literal_in_sql
 from ..sql_firewall import FirewallResult, SQLFirewall, UnsafeSQLError, tables_visible_to
-from ..strategy import StrategyContext, StrategyOption, StrategyResult, capped_max_rows
+from ..strategy import (
+    EMPTY_RESULT_CONFIDENCE_FLOOR,
+    StrategyContext,
+    StrategyOption,
+    StrategyResult,
+    capped_max_rows,
+)
 from ..table_qualifier import PreparedSQL, SourceLookup, prepare_execution_sql
 from ..tools import OntologyGraphTool
-from .sql_generator import NLtoSQLResult, SQLGenerator, sql_table_routing, table_sources_need_preparation
+from .sql_generator import (
+    DEFAULT_EVIDENCE_PROMPT_CHARS,
+    NLtoSQLResult,
+    SQLGenerator,
+    WriterOptions,
+    sql_table_routing,
+    table_sources_need_preparation,
+)
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from ...tier1.metric_resolver import DeclinedMetricContext
 
 logger = structlog.get_logger(__name__)
+
+
+# Bounds for ``options.evidenceMaxChars``, which the deep-reasoning loop sets when it
+# hands its gathered document evidence to this strategy (``options.sqlWithEvidence``).
+# Absent, the historical 500-char cap applies, so the prompt is unchanged.
+_EVIDENCE_PROMPT_CHARS_MAX = 20_000
+
+
+def _evidence_prompt_chars(options: dict) -> int:
+    """How many characters of ``options.evidence`` reach the SQL prompt."""
+    value = options.get("evidenceMaxChars")
+    if isinstance(value, bool) or not isinstance(value, int):
+        return DEFAULT_EVIDENCE_PROMPT_CHARS
+    return max(DEFAULT_EVIDENCE_PROMPT_CHARS, min(_EVIDENCE_PROMPT_CHARS_MAX, value))
+
+
+def writer_options(options: dict) -> WriterOptions:
+    """The per-request SQL-writer adjustments named in ``options`` (all off by default).
+
+    * ``sqlOriginalQuestion`` — with the ``originalQuestion`` the deep-reasoning
+      nl_to_sql tool adds, the writer also sees the user's original question.
+    * ``tokenCaps.nl2sql`` — output-token cap for generation and correction.
+    * ``sqlTimeRules`` — the opt-in time rules.
+    * ``computeMetric`` — the compute-metric rule, set only by the deep-reasoning
+      nl_to_sql tool under ``sqlComputeMetric``. Its extra input columns change the
+      result's shape, which is fine for rows read by the answer step but not for a
+      direct Tier-2 answer, so a caller's ``sqlComputeMetric`` is ignored here.
+    * ``sqlFeedback`` — a prior attempt to revise (set by the deep-reasoning
+      nl_to_sql tool under ``sqlRevision``).
+    * ``sqlWriterEffort`` — the writer's model effort level (``low``/``medium``/``high``).
+    """
+    original = options.get("originalQuestion") if options.get("sqlOriginalQuestion") is True else ""
+    return WriterOptions(
+        original_question=original if isinstance(original, str) else "",
+        max_tokens=token_cap(options, "nl2sql"),
+        time_rules=options.get("sqlTimeRules") is True,
+        compute_metric=options.get("computeMetric") is True,
+        feedback=feedback if isinstance(feedback := options.get("sqlFeedback"), str) else "",
+        effort=effort if (effort := options.get("sqlWriterEffort")) in SQL_WRITER_EFFORT_LEVELS else "",
+    )
 
 
 def _governed_metric_block(declined: DeclinedMetricContext | None, resolved_source_id: str) -> str:
@@ -186,6 +248,122 @@ def _graph_expand_enabled(options: dict | None = None) -> bool:
     if deployment is not None:
         return deployment
     return _GRAPH_EXPAND_DEFAULT
+
+
+_VOTE_K_MAX = 5
+_VOTE_UNANIMOUS_CONFIDENCE = 0.6
+_VOTE_MAJORITY_CONFIDENCE = 0.35
+_NULL_SENTINEL = "\x00null"
+_ZERO_ROW_FEEDBACK = (
+    "The query executed successfully but returned ZERO rows, and no value from the "
+    "user's question was used as a filter. The JOINs or non-value filters may be "
+    "over-restrictive or incorrect — reconsider the JOINs and structural filters and "
+    "produce a corrected query. Do NOT invent or alter a specific entity/identifier value."
+)
+
+
+def _resolve_vote_k(options: dict | None) -> int:
+    raw = (options or {}).get("flatSqlVoteK")
+    if raw is None or raw == "":
+        raw = os.environ.get("SERVE_NL2SQL_VOTE_K", "1")
+    try:
+        return min(_VOTE_K_MAX, max(1, int(raw)))
+    except (TypeError, ValueError):
+        return 1
+
+
+_CandidateStatus = Literal["pending", "executed", "exec_error", "no_sql", "refused"]
+
+
+@dataclass(frozen=True)
+class _Candidate:
+    index: int
+    sql: str
+    self_confidence: float
+    exec_sql: str = ""
+    rows: list[dict] | None = None
+    columns: list[str] | None = None
+    row_count: int | None = None
+    truncated: bool = False
+    status: _CandidateStatus = "pending"
+    error: str | None = None
+    # A refusal that must reach the caller if every candidate ends in one.
+    refusal: Exception | None = None
+
+
+@dataclass(frozen=True)
+class _VoteOutcome:
+    winner: _Candidate | None
+    lead: _Candidate
+    votes: int
+    confidence: float
+    group_sizes: tuple[int, ...]
+    executed: int
+    errored: int
+    tie_broken: bool
+
+
+def _normalized_sql(sql: str) -> str:
+    return " ".join(sql.split()).rstrip(";").rstrip()
+
+
+def _signature_value(value: object) -> str:
+    if value is None:
+        return _NULL_SENTINEL
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, float):
+        # Twelve digits absorb float noise between equivalent aggregates; ints and
+        # Decimals stay exact, so distinct IDs or totals never share a vote.
+        value = Decimal(f"{value:.12g}")
+    if isinstance(value, (int, Decimal)):
+        return str(Decimal(value).normalize())
+    if isinstance(value, (dt.date, dt.datetime, dt.time)):
+        return value.isoformat()
+    if isinstance(value, str):
+        return value.strip()
+    return str(value)
+
+
+def _result_signature(rows: list, truncated: bool) -> str:
+    normalized = sorted(
+        sorted(_signature_value(v) for v in (row.values() if isinstance(row, dict) else row)) for row in rows
+    )
+    return hashlib.sha256(json.dumps([normalized, truncated]).encode()).hexdigest()
+
+
+def _pick_winner(cands: Sequence[_Candidate], k: int) -> _VoteOutcome:
+    ordered = sorted(cands, key=lambda c: c.index)
+    groups: dict[str, list[_Candidate]] = {}
+    for cand in ordered:
+        if cand.status == "executed":
+            groups.setdefault(_result_signature(cand.rows or [], cand.truncated), []).append(cand)
+    executed = len({c.exec_sql for c in cands if c.exec_sql})
+    errored = sum(1 for c in cands if c.status == "exec_error")
+    lead = ordered[0]
+    if not groups:
+        return _VoteOutcome(None, lead, 0, _vote_confidence(0, k), (), executed, errored, tie_broken=False)
+    ranked = sorted(groups.values(), key=lambda g: (-len(g), not g[0].row_count, g[0].index))
+    top = ranked[0]
+    tied = sum(1 for g in ranked if len(g) == len(top))
+    return _VoteOutcome(
+        top[0],
+        lead,
+        len(top),
+        _vote_confidence(len(top), k),
+        tuple(len(g) for g in ranked),
+        executed,
+        errored,
+        tie_broken=tied > 1,
+    )
+
+
+def _vote_confidence(votes: int, k: int) -> float:
+    if votes == k:
+        return _VOTE_UNANIMOUS_CONFIDENCE
+    if 2 * votes > k:
+        return _VOTE_MAJORITY_CONFIDENCE
+    return EMPTY_RESULT_CONFIDENCE_FLOOR
 
 
 def _user_supplied_literal_in_sql(sql: str, query: str) -> bool:
@@ -319,11 +497,11 @@ class NLtoSQLStrategy:
             )
         return result
 
-    def _correction_fits_deadline(self, context: StrategyContext, estimated_shot_cost_s: float) -> bool:
-        """True when another correction shot fits the remaining request budget.
+    def _fits_deadline(self, context: StrategyContext, estimated_shot_cost_s: float) -> bool:
+        """True when another shot (a correction or the vote) fits the remaining request budget.
 
-        No deadline threaded → always True (pre-A0 behaviour: the correction shot
-        runs unconditionally, as it always did on the long-budget path). With a
+        No deadline threaded → always True (pre-A0 behaviour: the shot runs
+        unconditionally, as it always did on the long-budget path). With a
         deadline, the next shot is approved only when the time left (minus a margin
         for post-shot assembly/serialization) covers its estimated cost — estimated
         as what the shot just completed took.
@@ -369,7 +547,9 @@ class NLtoSQLStrategy:
             except Exception as e:
                 logger.warning("dialect_resolution_failed", error=str(e), fallback="athena")
 
-        evidence = options.get("evidence", "")[:500]
+        evidence_limit = _evidence_prompt_chars(options)
+        writer = writer_options(options)
+        evidence = options.get("evidence", "")[:evidence_limit]
         # Request-scoped: the tool caches this namespace's FK edges and named graphs
         # for the life of the object, and that cache must not outlive a request (a
         # namespace can be re-ingested between two of them). No catalog is passed —
@@ -408,6 +588,13 @@ class NLtoSQLStrategy:
             async def same_name_databases(tables: list[str]) -> dict[str, dict[str, str]]:
                 return await owners_executor.resolve_same_name_databases(namespace, tables)
 
+        # Forward the declined governed definition — but only when it is safe to
+        # (a real formula, and a source that does not contradict the one resolved
+        # here). ``data_source_id`` at this point is the request pin (empty when
+        # unpinned, so pre-retrieval we forward best-effort). Empty on every
+        # non-declining path, keeping the prompt byte-identical to the baseline.
+        governed_metric = _governed_metric_block(context.declined_metric, data_source_id)
+        vote_k = _resolve_vote_k(options)
         nl_to_sql_result = await self._sql_generator.generate(
             query,
             namespace=namespace,
@@ -417,15 +604,12 @@ class NLtoSQLStrategy:
             model_id=context.model_id,
             dialect=dialect,
             graph_expander=graph_expander,
-            # Forward the declined governed definition — but only when it is safe to
-            # (a real formula, and a source that does not contradict the one resolved
-            # here). ``data_source_id`` at this point is the request pin (empty when
-            # unpinned, so pre-retrieval we forward best-effort). Empty on every
-            # non-declining path, keeping the prompt byte-identical to the baseline.
-            governed_metric=_governed_metric_block(context.declined_metric, data_source_id),
+            governed_metric=governed_metric,
             table_placements=table_placements,
             same_name_databases=same_name_databases,
             uploaded_ontologies=uploaded_ontologies,
+            evidence_max_chars=evidence_limit,
+            writer=writer,
         )
 
         t_ms = int((time.perf_counter() - t_start) * 1000)
@@ -460,11 +644,14 @@ class NLtoSQLStrategy:
         # ``retrieved_tables`` / ``expanded_tables``). The grant filter still applies
         # so a name outside ``tableAllowlist`` never reaches the caller.
         tables = tables_visible_to(SQLFirewall.referenced_tables(nl_to_sql_result.sql), profile)
+        generate_detail: dict = {"confidence": confidence, "tables": tables}
+        if vote_k > 1:
+            generate_detail["candidate"] = 0
         trace.record(
             StepId.T2_SQL_GENERATE,
             "success",
             t_ms,
-            detail={"confidence": confidence, "tables": tables},
+            detail=generate_detail,
             tool_used="bedrock",
         )
 
@@ -483,14 +670,83 @@ class NLtoSQLStrategy:
         sql = nl_to_sql_result.sql
         confidence = nl_to_sql_result.confidence
         data_source_id = nl_to_sql_result.data_source_id or options.get("dataSourceId", "")
+
+        if vote_k > 1 and not self._fits_deadline(context, t_ms / 1000):
+            trace.record(StepId.T2_SQL_VOTE, "skipped", 0, detail={"k": vote_k, "skippedReason": "deadline"})
+            logger.info("nl_to_sql_vote", k=vote_k, skippedReason="deadline")
+            vote_k = 1
         last_error: str | None = None
 
         # Best clean-but-empty result seen so far. A zero-row result is NEVER
         # downgraded to a miss: if a correction shot also comes back empty (or
         # fails), we return this instead of None.
         empty_fallback: StrategyResult | None = None
+        first_shot = 1
 
-        for shot in range(1, self._max_shots + 1):
+        if vote_k > 1:
+            vote_start = time.perf_counter()
+            vote = await self._vote_first_shot(
+                query,
+                namespace,
+                context,
+                nl_to_sql_result,
+                vote_k,
+                dialect=dialect,
+                evidence=evidence,
+                evidence_limit=evidence_limit,
+                writer=writer,
+                governed_metric=governed_metric,
+                data_source_id=data_source_id,
+            )
+            confidence = vote.confidence
+            # The vote IS shot 1. An empty winner, or a candidate 0 that failed to
+            # execute, goes straight to the correction shot with that outcome as
+            # feedback rather than re-running the statement. A refused candidate 0
+            # (and no winner) enters the loop, whose gate re-raises its refusal
+            # without executing anything.
+            seed = vote.winner or vote.lead
+            if seed.status in ("executed", "exec_error"):
+                if seed.status == "executed":
+                    result = StrategyResult(
+                        sql=seed.exec_sql,
+                        rows=seed.rows or [],
+                        columns=seed.columns or [],
+                        confidence=confidence,
+                        strategy_name=StrategyOption.NL_TO_SQL,
+                        trace_steps=nl_to_sql_result.trace_steps,
+                        row_count=seed.row_count or 0,
+                        truncated=seed.truncated,
+                        retrieved_tables=nl_to_sql_result.retrieved_tables,
+                        expanded_tables=nl_to_sql_result.expanded_tables,
+                        data_source_id=nl_to_sql_result.data_source_id or "",
+                    )
+                    if seed.row_count or self._max_shots <= 1 or _user_supplied_literal_in_sql(seed.exec_sql, query):
+                        return result
+                    empty_fallback = result
+                    last_error = _ZERO_ROW_FEEDBACK
+                else:
+                    last_error = seed.error
+                corrected = None
+                if self._max_shots > 1:
+                    corrected = await self._correction_shot(
+                        query,
+                        context,
+                        nl_to_sql_result,
+                        shot=1,
+                        shot_cost_s=time.perf_counter() - vote_start,
+                        failed_sql=seed.exec_sql,
+                        last_error=last_error,
+                        evidence=evidence,
+                        evidence_limit=evidence_limit,
+                        writer=writer,
+                        data_source_id=data_source_id,
+                    )
+                if corrected is None:
+                    return empty_fallback
+                sql, confidence = corrected
+                first_shot = 2
+
+        for shot in range(first_shot, self._max_shots + 1):
             shot_start = time.perf_counter()
             # Gate + firewall (masked literal or unsafe → abandon, keeping an earlier
             # clean empty result; denied → 403). Re-run per shot because each shot
@@ -593,12 +849,7 @@ class NLtoSQLStrategy:
                 # ask for ONE correction — steered at JOINs/structure, explicitly
                 # NOT at inventing or altering a specific entity value.
                 empty_fallback = empty_fallback or result
-                last_error = (
-                    "The query executed successfully but returned ZERO rows, and no value from the "
-                    "user's question was used as a filter. The JOINs or non-value filters may be "
-                    "over-restrictive or incorrect — reconsider the JOINs and structural filters and "
-                    "produce a corrected query. Do NOT invent or alter a specific entity/identifier value."
-                )
+                last_error = _ZERO_ROW_FEEDBACK
             except Exception as e:
                 exec_ms = int((time.perf_counter() - exec_start) * 1000)
                 last_error = f"{type(e).__name__}: {e}"
@@ -618,115 +869,324 @@ class NLtoSQLStrategy:
                 if shot >= self._max_shots:
                     break
 
-            # A shot remains (reached on an execution ERROR, or a zero-row result
-            # with no user-supplied filter value): ask the LLM to correct the SQL
-            # from the feedback in ``last_error`` — model-driven, no rule
-            # catalogue — reusing the already-retrieved schema context.
-            #
-            # A4 — deadline-aware correction: before spending another full
-            # generate→firewall→execute cycle, check it can FIT the remaining
-            # request budget. The correction shot is a latency-doubling accuracy
-            # feature; over a short transport (REST, ~29s) the second shot pushes
-            # total latency past the ceiling and the caller 504s AFTER serve has
-            # already computed a usable first-shot answer. Rather than start work
-            # that cannot return, skip the correction and return the best result in
-            # hand. Estimated cost of the next shot = what THIS shot just took
-            # (generate was already paid once; a correction is generate+execute of
-            # comparable magnitude). No deadline threaded → estimate is None →
-            # never skip (pre-A0 behaviour preserved, e.g. the 170s AgentCore path
-            # where the second shot always fits).
-            shot_cost_s = time.perf_counter() - shot_start
-            if not self._correction_fits_deadline(context, shot_cost_s):
-                # Record ONLY the decision — not a latency. Per the trace model,
-                # step latency is the true elapsed time of a step that ran; this
-                # step represents a correction that did NOT run, so its duration is
-                # genuinely 0. The shot that DID run already recorded its own
-                # latency on its t2.sql.generate/t2.sql.execute steps — we do not
-                # restate a duration here. The deadline is an independent dimension
-                # surfaced at request level (see main.py), so the detail carries
-                # only the boolean reason for the skip, never seconds.
-                trace.record(
-                    StepId.T2_SQL_GENERATE,
-                    "skipped",
-                    0,
-                    detail={
-                        "reason": "deadline_insufficient_for_correction",
-                        "shot": shot,
-                    },
-                    tool_used="bedrock",
-                )
-                logger.info(
-                    "nl_to_sql_correction_skipped_deadline",
-                    shot=shot,
-                    last_shot_s=round(shot_cost_s, 2),
-                    remaining_s=round(context.deadline.remaining_s(), 2) if context.deadline else None,
-                )
-                # Return the best clean result we have. For the zero-row branch this
-                # is the verified-empty first-shot result (never a miss); for the
-                # execution-error branch there is no clean result, so fall through
-                # to the post-loop miss handling by breaking.
-                if empty_fallback is not None:
-                    return empty_fallback
+            corrected = await self._correction_shot(
+                query,
+                context,
+                nl_to_sql_result,
+                shot=shot,
+                shot_cost_s=time.perf_counter() - shot_start,
+                failed_sql=exec_sql,
+                last_error=last_error,
+                evidence=evidence,
+                evidence_limit=evidence_limit,
+                writer=writer,
+                data_source_id=data_source_id,
+            )
+            if corrected is None:
                 break
-
-            correct_start = time.perf_counter()
-            try:
-                sql, confidence = await self._sql_generator.correct(
-                    query,
-                    nl_to_sql_result.ddl_context,
-                    # The statement handed to the executor (post-qualification), which
-                    # is what the engine reported its line/column positions against.
-                    # The pre-qualification text differs from it on a cross-source
-                    # query (catalog/schema rewrite, single-line sqlglot rendering), so
-                    # the error coordinates pointed into a statement the model never
-                    # saw. The executor may still cap LIMIT or transpile, so this is the
-                    # closest text the strategy has to what ran. correct() is reached
-                    # only after execute() ran, so exec_sql is always set here.
-                    failed_sql=exec_sql,
-                    execution_error=last_error,
-                    evidence=evidence,
-                    model_id=context.model_id,
-                    # Forward on the retry too — but now the source is KNOWN
-                    # (``data_source_id`` here is the resolved source, not just the
-                    # pin), so the mismatch suppression actually bites: a formula
-                    # authored against a different source is dropped rather than
-                    # fed into the correction, which would otherwise burn the shot.
-                    governed_metric=_governed_metric_block(context.declined_metric, data_source_id),
-                )
-                correct_ms = int((time.perf_counter() - correct_start) * 1000)
-                if not sql:
-                    logger.warning("nl_to_sql_correction_empty", shot=shot)
-                    trace.record(
-                        StepId.T2_SQL_GENERATE,
-                        "error",
-                        correct_ms,
-                        detail={"correction_shot": shot + 1, "error": "empty SQL returned"},
-                        tool_used="bedrock",
-                    )
-                    break
-                trace.record(
-                    StepId.T2_SQL_GENERATE,
-                    "success",
-                    correct_ms,
-                    detail={"confidence": confidence, "correction_shot": shot + 1},
-                    tool_used="bedrock",
-                )
-            except Exception as e:
-                correct_ms = int((time.perf_counter() - correct_start) * 1000)
-                logger.warning("nl_to_sql_correction_failed", error=type(e).__name__, shot=shot)
-                trace.record(
-                    StepId.T2_SQL_GENERATE,
-                    "error",
-                    correct_ms,
-                    detail={"correction_shot": shot + 1, "error": type(e).__name__},
-                    tool_used="bedrock",
-                )
-                break
+            sql, confidence = corrected
 
         # Every remaining shot ended in an execution ERROR (a clean result — rows,
         # or a verified/exhausted empty — returns inside the loop). Return any
         # clean empty result we saw; otherwise None so the next strategy can try.
         return empty_fallback
+
+    async def _correction_shot(
+        self,
+        query: str,
+        context: StrategyContext,
+        nl_result: NLtoSQLResult,
+        *,
+        shot: int,
+        shot_cost_s: float,
+        failed_sql: str,
+        last_error: str | None,
+        evidence: str,
+        evidence_limit: int,
+        writer: WriterOptions,
+        data_source_id: str,
+    ) -> tuple[str, float] | None:
+        """Regenerate the SQL from ``last_error`` when the deadline fits; None means stop."""
+        trace = context.trace
+        # A shot remains (reached on an execution ERROR, or a zero-row result
+        # with no user-supplied filter value): ask the LLM to correct the SQL
+        # from the feedback in ``last_error`` — model-driven, no rule
+        # catalogue — reusing the already-retrieved schema context.
+        #
+        # A4 — deadline-aware correction: before spending another full
+        # generate→firewall→execute cycle, check it can FIT the remaining
+        # request budget. The correction shot is a latency-doubling accuracy
+        # feature; over a short transport (REST, ~29s) the second shot pushes
+        # total latency past the ceiling and the caller 504s AFTER serve has
+        # already computed a usable first-shot answer. Rather than start work
+        # that cannot return, skip the correction and return the best result in
+        # hand. Estimated cost of the next shot = what THIS shot just took
+        # (generate was already paid once; a correction is generate+execute of
+        # comparable magnitude). No deadline threaded → estimate is None →
+        # never skip (pre-A0 behaviour preserved, e.g. the 170s AgentCore path
+        # where the second shot always fits).
+        if not self._fits_deadline(context, shot_cost_s):
+            # Record ONLY the decision — not a latency. Per the trace model,
+            # step latency is the true elapsed time of a step that ran; this
+            # step represents a correction that did NOT run, so its duration is
+            # genuinely 0. The shot that DID run already recorded its own
+            # latency on its t2.sql.generate/t2.sql.execute steps — we do not
+            # restate a duration here. The deadline is an independent dimension
+            # surfaced at request level (see main.py), so the detail carries
+            # only the boolean reason for the skip, never seconds.
+            trace.record(
+                StepId.T2_SQL_GENERATE,
+                "skipped",
+                0,
+                detail={
+                    "reason": "deadline_insufficient_for_correction",
+                    "shot": shot,
+                },
+                tool_used="bedrock",
+            )
+            logger.info(
+                "nl_to_sql_correction_skipped_deadline",
+                shot=shot,
+                last_shot_s=round(shot_cost_s, 2),
+                remaining_s=round(context.deadline.remaining_s(), 2) if context.deadline else None,
+            )
+            # The caller returns the best clean result it has: the verified-empty
+            # first-shot result (never a miss), or None after an execution error.
+            return None
+
+        correct_start = time.perf_counter()
+        try:
+            sql, confidence = await self._sql_generator.correct(
+                query,
+                nl_result.ddl_context,
+                # The statement handed to the executor (post-qualification), which
+                # is what the engine reported its line/column positions against.
+                # The pre-qualification text differs from it on a cross-source
+                # query (catalog/schema rewrite, single-line sqlglot rendering), so
+                # the error coordinates pointed into a statement the model never
+                # saw. The executor may still cap LIMIT or transpile, so this is the
+                # closest text the strategy has to what ran (a vote's candidate
+                # included: it passes the statement its execution already ran).
+                failed_sql=failed_sql,
+                execution_error=last_error,
+                evidence=evidence,
+                evidence_max_chars=evidence_limit,
+                writer=writer,
+                model_id=context.model_id,
+                # Forward on the retry too — but now the source is KNOWN
+                # (``data_source_id`` here is the resolved source, not just the
+                # pin), so the mismatch suppression actually bites: a formula
+                # authored against a different source is dropped rather than
+                # fed into the correction, which would otherwise burn the shot.
+                governed_metric=_governed_metric_block(context.declined_metric, data_source_id),
+            )
+            correct_ms = int((time.perf_counter() - correct_start) * 1000)
+            if not sql:
+                logger.warning("nl_to_sql_correction_empty", shot=shot)
+                trace.record(
+                    StepId.T2_SQL_GENERATE,
+                    "error",
+                    correct_ms,
+                    detail={"correction_shot": shot + 1, "error": "empty SQL returned"},
+                    tool_used="bedrock",
+                )
+                return None
+            trace.record(
+                StepId.T2_SQL_GENERATE,
+                "success",
+                correct_ms,
+                detail={"confidence": confidence, "correction_shot": shot + 1},
+                tool_used="bedrock",
+            )
+        except Exception as e:
+            correct_ms = int((time.perf_counter() - correct_start) * 1000)
+            logger.warning("nl_to_sql_correction_failed", error=type(e).__name__, shot=shot)
+            trace.record(
+                StepId.T2_SQL_GENERATE,
+                "error",
+                correct_ms,
+                detail={"correction_shot": shot + 1, "error": type(e).__name__},
+                tool_used="bedrock",
+            )
+            return None
+        return sql, confidence
+
+    async def _vote_first_shot(
+        self,
+        query: str,
+        namespace: str,
+        context: StrategyContext,
+        nl_result: NLtoSQLResult,
+        k: int,
+        *,
+        dialect: str,
+        evidence: str,
+        evidence_limit: int,
+        writer: WriterOptions,
+        governed_metric: str,
+        data_source_id: str,
+    ) -> _VoteOutcome:
+        trace = context.trace
+        profile = context.profile
+        vote_start = time.perf_counter()
+
+        async def extra_candidate(index: int) -> _Candidate:
+            start = time.perf_counter()
+            try:
+                sql, self_confidence = await self._sql_generator.generate_from_context(
+                    query,
+                    nl_result.ddl_context,
+                    evidence=evidence,
+                    model_id=context.model_id,
+                    dialect=dialect,
+                    governed_metric=governed_metric,
+                    # The same writer options as candidate 0, so the vote compares
+                    # candidates written under one prompt.
+                    evidence_max_chars=evidence_limit,
+                    writer=writer,
+                )
+                failure = None if sql else "empty SQL returned"
+            except Exception as e:
+                # One failed extra candidate only shrinks the vote, like a failed
+                # correction shot; log it so a broken vote path is not silent.
+                logger.warning(
+                    "nl_to_sql_vote_candidate_failed", candidate=index, error=type(e).__name__, exc_info=True
+                )
+                sql, self_confidence, failure = "", 0.0, type(e).__name__
+            ms = int((time.perf_counter() - start) * 1000)
+            if failure:
+                trace.record(
+                    StepId.T2_SQL_GENERATE,
+                    "error",
+                    ms,
+                    detail={"candidate": index, "error": failure},
+                    tool_used="bedrock",
+                )
+                return _Candidate(index, "", 0.0, status="no_sql", error=failure)
+            trace.record(
+                StepId.T2_SQL_GENERATE,
+                "success",
+                ms,
+                detail={"confidence": self_confidence, "candidate": index},
+                tool_used="bedrock",
+            )
+            return _Candidate(index, sql, self_confidence)
+
+        generated = [
+            _Candidate(0, nl_result.sql, nl_result.confidence),
+            *await asyncio.gather(*(extra_candidate(i) for i in range(1, k))),
+        ]
+
+        by_statement: dict[str, list[_Candidate]] = {}
+        for cand in generated:
+            if cand.sql:
+                by_statement.setdefault(_normalized_sql(cand.sql), []).append(cand)
+
+        settled = [c for c in generated if not c.sql]
+
+        def refuse(group: list[_Candidate], error: Exception | None) -> None:
+            settled.extend(replace(c, status="refused", refusal=error) for c in group)
+
+        async def run(group: list[_Candidate], authorized_sql: str) -> None:
+            lead = group[0].index
+            prepared = await self._prepare_sql(authorized_sql, nl_result, namespace)
+            if prepared.error:
+                trace.record(StepId.T2_SQL_EXECUTE, "error", 0, detail=prepared.error)
+                logger.warning("nl_to_sql_ambiguous_reference", namespace=namespace, error=prepared.error)
+                refuse(group, AmbiguousReferenceError(prepared.error))
+                return
+            exec_start = time.perf_counter()
+            try:
+                exec_result = await self._query_executor.execute(
+                    prepared.sql,
+                    namespace=namespace,
+                    data_source_id=data_source_id,
+                    max_rows=capped_max_rows(context.options),
+                    timeout_seconds=self._exec_timeout_seconds(context),
+                )
+            except Exception as e:
+                exec_ms = int((time.perf_counter() - exec_start) * 1000)
+                trace.record(
+                    StepId.T2_SQL_EXECUTE,
+                    "error",
+                    exec_ms,
+                    detail={"error": type(e).__name__, "shot": 1, "candidate": lead},
+                )
+                logger.warning("nl_to_sql_execute_failed", error=type(e).__name__, duration_ms=exec_ms, candidate=lead)
+                # The full message, as the single-shot loop keeps it: the correction
+                # shot is fed this error instead of re-running the statement.
+                error = f"{type(e).__name__}: {e}"
+                settled.extend(replace(c, exec_sql=prepared.sql, status="exec_error", error=error) for c in group)
+                return
+            exec_ms = int((time.perf_counter() - exec_start) * 1000)
+            truncated = getattr(exec_result, "truncated", False)
+            trace.record(
+                StepId.T2_SQL_EXECUTE,
+                "success",
+                exec_ms,
+                detail={
+                    "rowCount": exec_result.row_count,
+                    "tables": tables_visible_to(SQLFirewall.referenced_tables(authorized_sql), profile),
+                    "truncated": truncated,
+                    "shot": 1,
+                    "engine": getattr(exec_result, "engine", "") or "unknown",
+                    "candidate": lead,
+                },
+            )
+            settled.extend(
+                replace(
+                    c,
+                    exec_sql=prepared.sql,
+                    rows=exec_result.rows,
+                    columns=exec_result.columns,
+                    row_count=exec_result.row_count,
+                    truncated=truncated,
+                    status="executed",
+                )
+                for c in group
+            )
+
+        runs = []
+        for group in by_statement.values():
+            try:
+                fw_result = self._gate_statement(group[0].sql, profile, namespace, trace)
+            except (AccessDeniedError, AmbiguousReferenceError) as e:
+                refuse(group, e)
+                continue
+            if fw_result is None:
+                refuse(group, None)
+                continue
+            runs.append(run(group, fw_result.authorized_sql))
+        # Let every execution finish before an unexpected failure propagates, so no
+        # sibling is left running in the background.
+        failures = [r for r in await asyncio.gather(*runs, return_exceptions=True) if isinstance(r, BaseException)]
+        if failures:
+            logger.warning("nl_to_sql_vote_failed", error=type(failures[0]).__name__, failed=len(failures))
+            raise failures[0]
+
+        outcome = _pick_winner(settled, k)
+        reported = outcome.winner or generated[0]
+        detail = {
+            "k": k,
+            "votes": outcome.votes,
+            "agreement": round(outcome.votes / k, 3),
+            "groupSizes": list(outcome.group_sizes),
+            "distinctSql": len(by_statement),
+            "executed": outcome.executed,
+            "errored": outcome.errored,
+            "dropped": sum(1 for c in settled if c.status in ("no_sql", "refused")),
+            "winnerIndex": reported.index,
+            "tieBroken": outcome.tie_broken,
+            "selfConfidence": reported.self_confidence,
+            "confidence": outcome.confidence,
+            "skippedReason": None,
+        }
+        trace.record(StepId.T2_SQL_VOTE, "success", int((time.perf_counter() - vote_start) * 1000), detail=detail)
+        logger.info("nl_to_sql_vote", **detail)
+        refused = [c for c in settled if c.refusal is not None]
+        if len(refused) == k:
+            raise min(refused, key=lambda c: c.index).refusal
+        return outcome
 
     async def _prepare_sql(self, sql: str, nl_result: NLtoSQLResult, namespace: str) -> PreparedSQL:
         """Make ``sql`` executable, qualifying to ``catalog.schema.table`` if cross-source.

@@ -52,6 +52,8 @@ import structlog
 from ..config import env_with_legacy_name
 from ..deadline import Deadline
 from ..exceptions import AccessDeniedError
+from ..llm_usage import REASON_AGENT_ABNORMAL_EXIT, CallHandle, LlmUsageTracker, current_tracker, record_usage
+from ..schema_visibility import note_prompt_schema
 from ..sql_execution import SqlExecutionService, SqlExecutionStatus
 from ..tier2.tools import (
     DEFAULT_NODE_LIMIT,
@@ -215,16 +217,20 @@ def build_system_prompt(intent_review: bool | None = None) -> str:
     return AGENT_SYSTEM_PROMPT + (INTENT_REVIEW_BLOCK if enabled else "")
 
 
-def _record_strands_usage(agent: object) -> None:
-    """Fold the Strands agent's reasoning-turn token usage into the request total.
+def _record_strands_usage(
+    agent: object, tracker: LlmUsageTracker | None, handle: CallHandle | None, *, normal: bool
+) -> None:
+    """Fold the Strands agent's reasoning-turn token usage into the request's LLM usage.
 
-    Best-effort. The agent drives its turns through Strands' own Bedrock model
-    provider (not ``BedrockClient.converse``), so those turns are otherwise
-    invisible to the request's token accounting. The deployed ``coa_serve`` has no
-    ``token_usage`` accumulator module (unlike the reference build), so this is a
-    no-op hook kept for parity + a future accumulator — never let telemetry break
-    the query path.
+    The agent drives its turns through Strands' own Bedrock model provider (not
+    ``BedrockClient.converse``), so those turns are otherwise invisible to request
+    accounting. ``event_loop_metrics.accumulated_usage`` covers only FINISHED turns,
+    so completed usage is kept on every exit, but the call is completed only on a
+    normal return: after cancellation, access denial, or another error a turn may
+    have been billed without reaching the accumulated total, and the request is
+    reported incomplete. Telemetry never breaks the query path.
     """
+    usage: object = None
     try:
         metrics = getattr(agent, "event_loop_metrics", None)
         usage = getattr(metrics, "accumulated_usage", None) if metrics is not None else None
@@ -235,8 +241,29 @@ def _record_strands_usage(agent: object) -> None:
                 output_tokens=usage.get("outputTokens"),
                 total_tokens=usage.get("totalTokens"),
             )
+    except Exception as exc:
+        logger.warning("agentic_usage_capture_failed", error=type(exc).__name__)
+        usage = None
+    if tracker is None or handle is None:
+        return
+    if not normal:
+        if isinstance(usage, dict):
+            record_usage(tracker, handle, usage)
+            tracker.mark_incomplete(REASON_AGENT_ABNORMAL_EXIT)
+        else:
+            tracker.fail_call(handle, REASON_AGENT_ABNORMAL_EXIT)
+        return
+    record_usage(tracker, handle, usage)
+
+
+def _strands_model_id(agent: object, fallback: str) -> str:
+    """The model id the Strands agent actually runs (its default when none was passed)."""
+    try:
+        config = getattr(getattr(agent, "model", None), "config", None) or {}
+        model_id = config.get("model_id") if isinstance(config, dict) else None
     except Exception:
-        logger.debug("agentic_usage_capture_failed")
+        model_id = None
+    return model_id if isinstance(model_id, str) and model_id else fallback
 
 
 @dataclass
@@ -457,7 +484,9 @@ class SqlAgent:
                 candidates = await self._catalog.search_tables(search, top_k)
             except Exception as e:
                 return json.dumps({"error": str(e)[:200]})
-            return json.dumps({"tables": [{"table": c.table, "preview": c.preview} for c in candidates]})
+            found = json.dumps({"tables": [{"table": c.table, "preview": c.preview} for c in candidates]})
+            note_prompt_schema(found)
+            return found
 
         @tool
         async def get_table_schema(table_name: str) -> str:
@@ -470,6 +499,7 @@ class SqlAgent:
                 schema = await self._catalog.get_table_schema(table_name)
             except Exception as e:
                 return f"-- Schema lookup failed for '{table_name}': {str(e)[:150]}"
+            note_prompt_schema(schema)
             return schema or f"-- Table '{table_name}' not found among mapped classes"
 
         @tool
@@ -531,7 +561,9 @@ class SqlAgent:
                 columns=len(result.get("columns", [])),
                 truncated=result.get("truncated"),
             )
-            return json.dumps(result, default=str)
+            walked = json.dumps(result, default=str)
+            note_prompt_schema(walked)
+            return walked
 
         @tool
         async def generate_sql(table_names: list) -> str:
@@ -710,7 +742,14 @@ class SqlAgent:
         # the execution cap in the SQL tools above and by stopping it just before
         # the request deadline, which keeps ``outcome`` (the last statement that
         # executed successfully) instead of losing it to the outer timeout.
+        #
+        # LLM usage: the agent's reasoning turns are registered as ONE call, recorded
+        # in ``finally`` so a cancellation or denial cannot skip it. Disjoint from
+        # generate_sql's calls (already counted via converse).
         loop_budget_s = deadline.remaining_s() - _DEADLINE_MARGIN_S if deadline is not None else None
+        tracker = current_tracker()
+        handle = None
+        normal = False
         try:
             if loop_budget_s is not None and loop_budget_s <= 0:
                 # Not enough time left to run the loop and still return a result.
@@ -718,8 +757,14 @@ class SqlAgent:
                     "agentic_deadline_stop", budget_s=round(loop_budget_s, 1), executions=0, has_result=False
                 )
             else:
+                handle = (
+                    tracker.register_call("strands_agent", _strands_model_id(agent, self._model_id or ""))
+                    if tracker is not None
+                    else None
+                )
                 async with asyncio.timeout(loop_budget_s) as budget:
                     await agent.invoke_async(user_prompt)
+                normal = True
         except AccessDeniedError:
             raise
         except TimeoutError as e:
@@ -734,13 +779,11 @@ class SqlAgent:
                 logger.warning("agentic_agent_failed", error=type(e).__name__, message=str(e)[:200])
         except Exception as e:
             logger.warning("agentic_agent_failed", error=type(e).__name__, message=str(e)[:200])
+        finally:
+            _record_strands_usage(agent, tracker, handle, normal=normal)
+
         if executions["count"] >= self._max_executions:
             logger.info("agentic_execution_cap_reached", executions=executions["count"], has_result=outcome.succeeded)
-
-        # Telemetry: fold the agent's reasoning-turn usage into the request total
-        # (best-effort — see _record_strands_usage). Disjoint from generate_sql's
-        # calls (already counted via converse).
-        _record_strands_usage(agent)
 
         outcome.tables = self._catalog.known_tables
         outcome.duration_ms = int((time.perf_counter() - t_start) * 1000)

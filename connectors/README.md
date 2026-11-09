@@ -395,9 +395,10 @@ In order, because step 3's failure is invisible until the function is deployed:
    artifact is published as a shaded uber jar carrying its own copy of the SDK and Arrow, so a skew
    puts two SDK builds in one fat jar and the shade plugin keeps whichever it saw first per path.
    `databricks/pom.xml` holds it equal with a property rather than a literal.
-3. **Move every direct declaration of the AWS SDK, Jackson and SLF4J to what the new SDK brings**:
+3. **Move every direct declaration of the AWS SDK, Jackson and SLF4J to (at least) what the new SDK brings**:
    `software.amazon.awssdk:*` to **2.46.17**, `com.fasterxml.jackson.core:jackson-databind` to
-   **2.22.1**, `org.slf4j:*` to **2.0.18**. A direct declaration wins over the SDK's transitive one,
+   `${jackson.version}` (at or above the SDK's own, and never below the advisory floor the
+   enforcer checks), `org.slf4j:*` to **2.0.18**. A direct declaration wins over the SDK's transitive one,
    so a stale pin is not overridden for you. It also builds green and passes its unit suite, and the
    deployed function then fails *every* invocation with a `NoClassDefFoundError` on an AWS SDK core
    class the newer service modules expect. Verify one version per artifact before you deploy:

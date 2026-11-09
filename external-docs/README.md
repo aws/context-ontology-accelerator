@@ -31,6 +31,7 @@ From the `external-docs/` directory, run:
 
 ```bash
 pandoc \
+  content/architecture.md \
   content/getting-started.md \
   content/deploying.md \
   content/namespaces.md \
@@ -48,6 +49,7 @@ pandoc \
   content/databricks-sources.md \
   content/package-guide.md \
   content/smithy-codegen.md \
+  --resource-path=.:public \
   --toc --toc-depth=2 --pdf-engine=lualatex \
   -V mainfont="Helvetica Neue" \
   -V monofont="Menlo" \

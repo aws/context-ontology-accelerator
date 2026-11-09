@@ -254,6 +254,7 @@ export class NamespaceDeletionPipeline extends Construct {
         "coa_control_plane.namespace.deletion_pipeline.delete_platform.handler",
       timeout: cdk.Duration.minutes(2),
       environment: {
+        NAMESPACES_TABLE: props.namespacesTable.tableName,
         RESOURCE_ROLE_MAPPINGS_TABLE: props.resourceRoleMappingsTable.tableName,
         ROLES_TABLE: props.rolesTable.tableName,
         RESOURCE_PREFIX: props.resourcePrefix,
@@ -272,6 +273,14 @@ export class NamespaceDeletionPipeline extends Construct {
     this.deletePlatformFn = deletePlatformFn;
     props.resourceRoleMappingsTable.grantReadWriteData(deletePlatformFn);
     props.rolesTable.grantReadWriteData(deletePlatformFn);
+    // DeletePlatform acts only on a namespace whose record says DELETING, and takes
+    // the workgroup and DataZone project ids from that record.
+    deletePlatformFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["dynamodb:GetItem"],
+        resources: [props.namespacesTable.tableArn],
+      }),
+    );
     deletePlatformFn.addToRolePolicy(
       new iam.PolicyStatement({
         actions: ["athena:DeleteWorkGroup", "athena:GetWorkGroup"],
@@ -302,6 +311,14 @@ export class NamespaceDeletionPipeline extends Construct {
           actions: ["ecs:DeleteService", "ecs:DescribeServices"],
           resources: ["*"],
           conditions: { ArnLike: { "ecs:cluster": props.vkgClusterArn } },
+        }),
+      );
+      deletePlatformFn.addToRolePolicy(
+        new iam.PolicyStatement({
+          // No resource type or cluster key: the handler deregisters only the
+          // namespace's own `<prefix>-vkg-<ns>` family.
+          actions: ["ecs:ListTaskDefinitions", "ecs:DeregisterTaskDefinition"],
+          resources: ["*"],
         }),
       );
     }

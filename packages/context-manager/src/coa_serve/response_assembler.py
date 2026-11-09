@@ -248,7 +248,7 @@ class ResponseAssembler:
         strategy: str | None = None,
         model_id: str | None = None,
         ontology_version: str | None = None,
-        include_debug_info: bool = False,
+        include_sql: bool = False,
     ) -> QueryResult:
         """Build a Tier-2 QueryResult from an NL-to-SQL resolution.
 
@@ -266,12 +266,10 @@ class ResponseAssembler:
             model_id: Optional per-call model id override.
             ontology_version: Version of the ontology the query ran against,
                 when the caller can name one (#986).
-            include_debug_info: When False (default), the generated SQL is
-                withheld from ``query_used``. Executed SQL / SPARQL exposes
-                internal schema (table + column names, joins). Callers opt in
-                via ``options.includeDebugInfo=true``. Withheld by default so
-                the field cannot leak internal schema (table names, column
-                names, joins) to a caller who did not opt in.
+            include_sql: When False (default), the generated SQL is withheld from
+                ``query_used`` — it exposes internal source schema (table + column
+                names, joins). Gated on caller opt-in AND ``viewSource`` (ADR
+                gating B).
 
         Returns:
             A QueryResult tagged as Tier 2.
@@ -286,11 +284,11 @@ class ResponseAssembler:
             tier=2,
             confidence=ConfidenceScore(score=confidence, rationale="LLM-generated SQL from ontology retrieval"),
             result_rows=rows,
-            query_used=sql_used if include_debug_info else None,
+            query_used=sql_used if include_sql else None,
             trace=trace.steps,
             ontology_version=ontology_version,
             metadata=metadata,
-        )
+        ).with_raw_artifacts(query_used=sql_used)
 
     def assemble_tier1(
         self,
@@ -306,7 +304,7 @@ class ResponseAssembler:
         match_source: str = "name",
         model_id: str | None = None,
         ontology_version: str | None = None,
-        include_debug_info: bool = False,
+        include_sql: bool = False,
     ) -> QueryResult:
         """Build a Tier-1 QueryResult from a pre-defined metric resolution.
 
@@ -323,10 +321,10 @@ class ResponseAssembler:
             model_id: Optional per-call model id override.
             ontology_version: Version of the ontology the query ran against,
                 when the caller can name one (#986).
-            include_debug_info: When False (default), the executed metric SQL
-                is withheld from ``query_used`` — it exposes internal schema
-                (table + column names). Opt in via
-                ``options.includeDebugInfo=true``.
+            include_sql: When False (default), the executed metric SQL is withheld
+                from ``query_used`` — it exposes internal source schema (table +
+                column names). Gated on caller opt-in AND the ``viewSource`` right
+                (ADR gating B).
 
         Returns:
             A QueryResult tagged as Tier 1; confidence is 1.0 for exact matches
@@ -347,11 +345,11 @@ class ResponseAssembler:
             tier=1,
             confidence=ConfidenceScore(score=score, rationale=rationale),
             result_rows=rows,
-            query_used=sql_used if include_debug_info else None,
+            query_used=sql_used if include_sql else None,
             trace=trace.steps,
             ontology_version=ontology_version,
             metadata=metadata,
-        )
+        ).with_raw_artifacts(query_used=sql_used)
 
     @staticmethod
     def _calibrate_tier2(base_confidence: float, row_count: int | None, truncated: bool) -> ConfidenceScore:
@@ -403,7 +401,8 @@ class ResponseAssembler:
         truncated: bool = False,
         strategy: str | None = None,
         model_id: str | None = None,
-        include_debug_info: bool = False,
+        include_sql: bool = False,
+        include_sparql: bool = False,
     ) -> QueryResult:
         """Build a Tier-2 QueryResult from a VKG (NL-to-SPARQL) resolution.
 
@@ -425,10 +424,12 @@ class ResponseAssembler:
             truncated: Whether the result set was capped.
             strategy: Optional Tier-2 strategy label recorded in metadata.
             model_id: Optional per-call model id override.
-            include_debug_info: When False (default), the compiled SQL and
-                generated SPARQL are withheld from ``query_used`` /
-                ``sparql_generated`` — both expose internal schema (tables,
-                columns, joins). Opt in via ``options.includeDebugInfo=true``.
+            include_sql: When False (default), the compiled SQL is withheld from
+                ``query_used`` — it exposes source table/column names. Gated on
+                caller opt-in AND ``viewSource`` (ADR gating B).
+            include_sparql: When False (default), the generated SPARQL is withheld
+                from ``sparql_generated`` — it exposes ontology class/property
+                names. Gated on caller opt-in AND ``viewOntology`` (ADR gating B).
 
         Returns:
             A QueryResult tagged as Tier 2 with calibrated confidence.
@@ -449,13 +450,13 @@ class ResponseAssembler:
             tier=2,
             confidence=self._calibrate_tier2(confidence, row_count, truncated),
             result_rows=rows,
-            query_used=sql_used if include_debug_info else None,
-            sparql_generated=sparql if include_debug_info else None,
+            query_used=sql_used if include_sql else None,
+            sparql_generated=sparql if include_sparql else None,
             trace=trace.steps,
             ontology_version=ontology_version,
             data_sources=data_sources,
             metadata=metadata,
-        )
+        ).with_raw_artifacts(query_used=sql_used, sparql=sparql)
 
     def assemble_tier3(
         self,
@@ -475,7 +476,8 @@ class ResponseAssembler:
         execution_mode: str | None = None,
         query_used: str | None = None,
         sparql_generated: str | None = None,
-        include_debug_info: bool = False,
+        include_sql: bool = False,
+        include_sparql: bool = False,
     ) -> QueryResult:
         """Build a Tier-3 QueryResult from an agentic synthesis.
 
@@ -506,10 +508,12 @@ class ResponseAssembler:
                 (#1166). ``None`` leaves the field unset.
             query_used: SQL the agentic loop built + executed (#1166).
             sparql_generated: SPARQL the agentic loop built + executed (#1166).
-            include_debug_info: When False (default), ``query_used`` /
-                ``sparql_generated`` are WITHHELD — they expose internal schema,
-                exactly as the Tier-2 assembler withholds them. Opt in via
-                ``options.includeDebugInfo=true``.
+            include_sql: When False (default), ``query_used`` is WITHHELD — it
+                exposes source table/column schema. Gated on caller opt-in AND
+                ``viewSource`` (ADR gating B).
+            include_sparql: When False (default), ``sparql_generated`` is WITHHELD
+                — it exposes ontology schema. Gated on caller opt-in AND
+                ``viewOntology`` (ADR gating B).
 
         Returns:
             A QueryResult tagged as Tier 3.
@@ -563,12 +567,12 @@ class ResponseAssembler:
             supporting_content=None if supporting_content is None else list(supporting_content),
             graph_context=canonical_graph_context,
             guardrail_blocked=guardrail_blocked,
-            # Same includeDebugInfo gate as the Tier-2 assembler: the compiled SQL
-            # and generated SPARQL expose internal schema, so withhold them unless
-            # the caller opted in. This closes the Deep-Reasoning artifact gap
-            # (#1166) without widening what a default request leaks.
-            query_used=query_used if include_debug_info else None,
-            sparql_generated=sparql_generated if include_debug_info else None,
+            # Gating B (ADR): the compiled SQL is gated on viewSource and the
+            # generated SPARQL on viewOntology, independently — each artifact
+            # exposes a different schema surface. This closes the Deep-Reasoning
+            # artifact gap (#1166) without widening what a schema-blind caller sees.
+            query_used=query_used if include_sql else None,
+            sparql_generated=sparql_generated if include_sparql else None,
             execution_mode=execution_mode,
             trace=trace.steps,
             # ``partial`` signals the answer was built from INCOMPLETE inputs.
@@ -581,4 +585,4 @@ class ResponseAssembler:
             partial=bool(all_degraded_sources) or partial,
             ontology_version=ontology_version,
             metadata=metadata,
-        )
+        ).with_raw_artifacts(query_used=query_used, sparql=sparql_generated)

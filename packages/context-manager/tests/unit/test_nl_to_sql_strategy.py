@@ -5,14 +5,29 @@
 
 from __future__ import annotations
 
+from datetime import date
+from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from coa_serve.deadline import Deadline
 from coa_serve.exceptions import AccessDeniedError, AmbiguousReferenceError
 from coa_serve.tier1.metric_resolver import DeclinedMetricContext
-from coa_serve.tier2.nl_to_sql.strategy import NLtoSQLStrategy, uploaded_ontology_iris
-from coa_serve.tier2.strategy import MAX_RESULT_ROWS, StrategyContext, StrategyOption, StrategyResult
+from coa_serve.tier2.nl_to_sql.sql_generator import WriterOptions
+from coa_serve.tier2.nl_to_sql.strategy import (
+    NLtoSQLStrategy,
+    _Candidate,
+    _pick_winner,
+    _result_signature,
+    uploaded_ontology_iris,
+)
+from coa_serve.tier2.strategy import (
+    EMPTY_RESULT_CONFIDENCE_FLOOR,
+    MAX_RESULT_ROWS,
+    StrategyContext,
+    StrategyOption,
+    StrategyResult,
+)
 from coa_serve.tier2.table_qualifier import PreparedSQL
 from coa_serve.trace import TraceCollector
 
@@ -1398,3 +1413,468 @@ class TestUploadedOntologyIris:
 
         resolver = sql_generator.generate.call_args.kwargs["uploaded_ontologies"]
         assert await resolver() == ["https://ex.org/up"]
+
+
+def _exec_rows(rows: list[dict]):
+    result = MagicMock()
+    result.rows = rows
+    result.columns = list(rows[0]) if rows else []
+    result.row_count = len(rows)
+    result.truncated = False
+    result.engine = "athena"
+    return result
+
+
+def _vote_context(k: object | None = 3) -> StrategyContext:
+    ctx = _make_context()
+    if k is not None:
+        ctx.options["flatSqlVoteK"] = k
+    return ctx
+
+
+def _steps(context: StrategyContext, step: str) -> list:
+    return [s for s in context.trace.steps if s.step == step]
+
+
+@pytest.mark.unit
+class TestNLtoSQLVote:
+    @pytest.fixture(autouse=True)
+    def _no_vote_env(self, monkeypatch):
+        monkeypatch.delenv("SERVE_NL2SQL_VOTE_K", raising=False)
+
+    @pytest.fixture
+    def sql_generator(self):
+        return AsyncMock()
+
+    @pytest.fixture
+    def firewall(self):
+        return MagicMock()
+
+    @pytest.fixture
+    def query_executor(self):
+        return AsyncMock()
+
+    @pytest.fixture
+    def strategy(self, sql_generator, firewall, query_executor):
+        return NLtoSQLStrategy(
+            sql_generator=sql_generator,
+            firewall=firewall,
+            query_executor=query_executor,
+            oss_ontology_index="test-index",
+        )
+
+    @pytest.fixture
+    def wire(self, sql_generator, firewall, query_executor):
+        def _wire(statements: list[str], results: dict, *, denied: tuple[str, ...] = ()):
+            sql_generator.generate.return_value = _make_nl_to_sql_result(sql=statements[0], confidence=0.9)
+            sql_generator.generate_from_context.side_effect = [(s, 0.8) for s in statements[1:]]
+            firewall.evaluate.side_effect = lambda sql, profile, namespace: _make_firewall_result(
+                denied=sql in denied, authorized_sql=sql, reason="table not granted" if sql in denied else None
+            )
+
+            async def execute(sql, **_kwargs):
+                out = results[sql]
+                if isinstance(out, Exception):
+                    raise out
+                return out
+
+            query_executor.execute.side_effect = execute
+
+        return _wire
+
+    @pytest.mark.asyncio
+    async def test_extra_candidates_get_the_first_candidates_writer_options(self, strategy, sql_generator, wire):
+        same = "SELECT count(*) FROM orders"
+        wire([same, same, same], {same: _exec_rows([{"count": 42}])})
+        context = _vote_context(3)
+        context.options.update({"evidence": "E" * 3000, "evidenceMaxChars": 3000, "sqlTimeRules": True})
+
+        await strategy.resolve("How many orders?", "ns", context)
+
+        first = sql_generator.generate.call_args.kwargs
+        assert first["writer"].time_rules is True
+        assert sql_generator.generate_from_context.await_count == 2
+        for call in sql_generator.generate_from_context.call_args_list:
+            assert call.kwargs["writer"] == first["writer"]
+            assert call.kwargs["evidence_max_chars"] == first["evidence_max_chars"] == 3000
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("env", "option"), [(None, None), ("1", None), ("3", "1")])
+    async def test_k1_runs_the_single_shot_path(
+        self, monkeypatch, strategy, sql_generator, query_executor, wire, env, option
+    ):
+        if env is not None:
+            monkeypatch.setenv("SERVE_NL2SQL_VOTE_K", env)
+        wire(["SELECT count(*) FROM orders"], {"SELECT count(*) FROM orders": _exec_rows([{"count": 42}])})
+        context = _vote_context(option)
+
+        result = await strategy.resolve("How many orders?", "ns", context)
+
+        assert result.rows == [{"count": 42}]
+        assert result.confidence == 0.9
+        sql_generator.generate_from_context.assert_not_awaited()
+        assert query_executor.execute.await_count == 1
+        assert _steps(context, "t2.sql.vote") == []
+        assert [s.step for s in context.trace.steps] == [
+            "t2.sql.generate",
+            "t2.sql.authorize",
+            "t2.sql.firewall",
+            "t2.sql.execute",
+        ]
+        assert "candidate" not in _steps(context, "t2.sql.generate")[0].detail
+
+    @pytest.mark.asyncio
+    async def test_identical_statements_execute_once_and_are_unanimous(self, strategy, query_executor, wire):
+        wire(
+            ["SELECT count(*) FROM orders", "SELECT count(*)\n  FROM orders;", "SELECT  count(*) FROM orders"],
+            {"SELECT count(*) FROM orders": _exec_rows([{"count": 42}])},
+        )
+        context = _vote_context()
+
+        result = await strategy.resolve("How many orders?", "ns", context)
+
+        assert result.rows == [{"count": 42}]
+        assert result.confidence == 0.6
+        assert query_executor.execute.await_count == 1
+        (vote,) = _steps(context, "t2.sql.vote")
+        assert vote.detail["votes"] == 3
+        assert vote.detail["distinctSql"] == 1
+        assert vote.detail["selfConfidence"] == 0.9
+
+    @pytest.mark.asyncio
+    async def test_majority_wins_across_aliases_and_row_order(self, strategy, wire):
+        b = "SELECT region FROM orders"
+        a1 = "SELECT id AS order_id, region FROM orders WHERE amount > 10"
+        a2 = "SELECT region, id FROM orders WHERE amount > 10 ORDER BY id DESC"
+        wire(
+            [b, a1, a2],
+            {
+                b: _exec_rows([{"region": "west"}]),
+                a1: _exec_rows([{"order_id": 1, "region": "east"}, {"order_id": 2, "region": "west"}]),
+                a2: _exec_rows([{"region": "west", "id": 2}, {"region": "east", "id": 1}]),
+            },
+        )
+        context = _vote_context()
+
+        result = await strategy.resolve("Which orders are over 10?", "ns", context)
+
+        assert result.sql == a1
+        assert result.row_count == 2
+        assert result.confidence == 0.35
+        (vote,) = _steps(context, "t2.sql.vote")
+        assert vote.detail["winnerIndex"] == 1
+        assert vote.detail["groupSizes"] == [2, 1]
+
+    @pytest.mark.asyncio
+    async def test_no_agreement_returns_candidate_zero_at_the_floor(self, strategy, wire):
+        s0, s1, s2 = "SELECT 1 FROM orders", "SELECT 2 FROM orders", "SELECT 3 FROM orders"
+        wire([s0, s1, s2], {s: _exec_rows([{"n": i}]) for i, s in enumerate([s0, s1, s2])})
+
+        result = await strategy.resolve("q", "ns", _vote_context())
+
+        assert result.sql == s0
+        assert result.confidence == EMPTY_RESULT_CONFIDENCE_FLOOR
+
+    @pytest.mark.asyncio
+    async def test_non_empty_breaks_a_tie_with_empty(self, strategy, wire):
+        s0, s1, s2 = "SELECT 1 FROM orders", "SELECT 2 FROM orders", "SELECT 3 FROM orders"
+        wire([s0, s1, s2], {s0: _exec_rows([]), s1: _exec_rows([{"n": 7}]), s2: RuntimeError("boom")})
+        context = _vote_context()
+
+        result = await strategy.resolve("q", "ns", context)
+
+        assert result.sql == s1
+        assert result.rows == [{"n": 7}]
+        (vote,) = _steps(context, "t2.sql.vote")
+        assert vote.detail["tieBroken"] is True
+
+    @pytest.mark.asyncio
+    async def test_failed_execution_still_counts_toward_k(self, strategy, sql_generator, wire):
+        s0, s1, s2 = "SELECT bad FROM orders", "SELECT count(*) FROM orders", "SELECT count(id) FROM orders"
+        wire([s0, s1, s2], {s0: RuntimeError("no column bad"), s1: _exec_rows([{"c": 5}]), s2: _exec_rows([{"n": 5}])})
+        context = _vote_context()
+
+        result = await strategy.resolve("q", "ns", context)
+
+        assert result.rows == [{"c": 5}]
+        assert result.confidence == 0.35
+        sql_generator.correct.assert_not_awaited()
+        (vote,) = _steps(context, "t2.sql.vote")
+        assert vote.detail["errored"] == 1
+        assert vote.detail["votes"] == 2
+        failed = [s for s in _steps(context, "t2.sql.execute") if s.status == "error"]
+        assert failed[0].detail["candidate"] == 0
+
+    @pytest.mark.asyncio
+    async def test_denied_candidate_never_runs_and_the_rest_answer(self, strategy, query_executor, wire):
+        s0, s1, s2 = "SELECT * FROM salaries", "SELECT count(*) FROM orders", "SELECT count(1) FROM orders"
+        wire([s0, s1, s2], {s1: _exec_rows([{"c": 5}]), s2: _exec_rows([{"c": 5}])}, denied=(s0,))
+
+        result = await strategy.resolve("q", "ns", _vote_context())
+
+        assert result.rows == [{"c": 5}]
+        assert result.confidence == 0.35
+        assert s0 not in [c.args[0] for c in query_executor.execute.await_args_list]
+
+    @pytest.mark.asyncio
+    async def test_every_candidate_denied_raises(self, strategy, query_executor, wire):
+        s0, s1, s2 = "SELECT * FROM salaries", "SELECT pay FROM salaries", "SELECT * FROM salaries s"
+        wire([s0, s1, s2], {}, denied=(s0, s1, s2))
+
+        context = _vote_context()
+        with pytest.raises(AccessDeniedError):
+            await strategy.resolve("q", "ns", context)
+
+        query_executor.execute.assert_not_awaited()
+        denials = [s for s in _steps(context, "t2.sql.authorize") if s.status == "denied"]
+        assert len(denials) == 3
+
+    @pytest.mark.asyncio
+    async def test_empty_majority_without_user_literal_gets_one_correction(
+        self, strategy, sql_generator, query_executor, wire
+    ):
+        s0 = "SELECT * FROM orders o JOIN customers c ON o.cid = c.id"
+        s1 = "SELECT * FROM orders o JOIN customers c ON o.id = c.id"
+        s2 = "SELECT id FROM orders"
+        fixed = "SELECT * FROM orders o LEFT JOIN customers c ON o.cid = c.id"
+        wire(
+            [s0, s1, s2],
+            {s0: RuntimeError("x"), s1: _exec_rows([]), s2: _exec_rows([]), fixed: _exec_rows([{"id": 1}])},
+        )
+        sql_generator.correct.return_value = (fixed, 0.7)
+
+        result = await strategy.resolve("Which orders have customers?", "ns", _vote_context())
+
+        assert result.rows == [{"id": 1}]
+        assert sql_generator.correct.await_count == 1
+        assert sql_generator.correct.call_args.kwargs["failed_sql"] == s1
+        assert "ZERO rows" in sql_generator.correct.call_args.kwargs["execution_error"]
+        assert sql_generator.generate_from_context.await_count == 2
+        # The empty winner is corrected from the vote's own result, not re-run.
+        assert [c.args[0] for c in query_executor.execute.await_args_list].count(s1) == 1
+
+    @pytest.mark.asyncio
+    async def test_empty_majority_with_user_literal_is_the_answer(self, strategy, sql_generator, query_executor, wire):
+        s0 = "SELECT * FROM customers WHERE name = 'Zyxcorp'"
+        s1 = "SELECT id FROM customers WHERE name = 'Zyxcorp'"
+        wire([s0, s1, s0], {s0: _exec_rows([]), s1: _exec_rows([])})
+        context = _vote_context()
+
+        result = await strategy.resolve("Show the customer Zyxcorp", "ns", context)
+
+        assert result is not None
+        assert result.row_count == 0
+        sql_generator.correct.assert_not_awaited()
+        assert query_executor.execute.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_no_clean_candidate_corrects_from_candidate_zero_error(
+        self, strategy, sql_generator, query_executor, wire
+    ):
+        s0, s1, s2 = "SELECT bad FROM orders", "SELECT worse FROM orders", "SELECT worst FROM orders"
+        fixed = "SELECT count(*) FROM orders"
+        wire(
+            [s0, s1, s2],
+            {
+                s0: RuntimeError("no column bad"),
+                s1: RuntimeError("no column worse"),
+                s2: RuntimeError("no column worst"),
+                fixed: _exec_rows([{"c": 5}]),
+            },
+        )
+        sql_generator.correct.return_value = (fixed, 0.7)
+
+        result = await strategy.resolve("q", "ns", _vote_context())
+
+        assert result.rows == [{"c": 5}]
+        kwargs = sql_generator.correct.call_args.kwargs
+        assert kwargs["failed_sql"] == s0
+        assert kwargs["execution_error"] == "RuntimeError: no column bad"
+        assert [c.args[0] for c in query_executor.execute.await_args_list].count(s0) == 1
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_candidate_is_dropped_and_the_rest_answer(self, strategy, query_executor, wire):
+        s0, s1, s2 = "SELECT * FROM claims", "SELECT count(*) FROM orders", "SELECT count(1) FROM orders"
+        wire([s0, s1, s2], {s1: _exec_rows([{"c": 5}]), s2: _exec_rows([{"c": 5}])})
+
+        async def prepare(sql, _nl_result, _namespace):
+            return PreparedSQL(sql=sql, error="table 'claims' is ambiguous" if sql == s0 else None)
+
+        with patch.object(strategy, "_prepare_sql", side_effect=prepare):
+            result = await strategy.resolve("q", "ns", _vote_context())
+
+        assert result.rows == [{"c": 5}]
+        assert result.confidence == 0.35
+        assert s0 not in [c.args[0] for c in query_executor.execute.await_args_list]
+
+    @pytest.mark.asyncio
+    async def test_all_refused_raises_the_lowest_index_refusal(self, strategy, query_executor, wire):
+        s0, s1, s2 = "SELECT * FROM claims", "SELECT pay FROM salaries", "SELECT * FROM salaries s"
+        wire([s0, s1, s2], {}, denied=(s1, s2))
+
+        async def prepare(sql, _nl_result, _namespace):
+            return PreparedSQL(sql=sql, error="table 'claims' is ambiguous")
+
+        with patch.object(strategy, "_prepare_sql", side_effect=prepare), pytest.raises(AmbiguousReferenceError):
+            await strategy.resolve("q", "ns", _vote_context())
+
+        query_executor.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unexpected_failure_waits_for_sibling_executions(self, strategy, query_executor, wire):
+        s0, s1 = "SELECT 1 FROM orders", "SELECT 2 FROM orders"
+        wire([s0, s1, s1], {s1: _exec_rows([{"n": 2}])})
+
+        async def prepare(sql, _nl_result, _namespace):
+            if sql == s0:
+                raise KeyError("routing")
+            return PreparedSQL(sql=sql)
+
+        with patch.object(strategy, "_prepare_sql", side_effect=prepare), pytest.raises(KeyError):
+            await strategy.resolve("q", "ns", _vote_context())
+
+        assert query_executor.execute.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_short_deadline_skips_the_vote(self, strategy, sql_generator, query_executor, wire):
+        wire(["SELECT count(*) FROM orders"], {"SELECT count(*) FROM orders": _exec_rows([{"count": 42}])})
+        context = _make_context_with_deadline(1.0)
+        context.options["flatSqlVoteK"] = 3
+
+        result = await strategy.resolve("How many orders?", "ns", context)
+
+        assert result.rows == [{"count": 42}]
+        sql_generator.generate_from_context.assert_not_awaited()
+        assert query_executor.execute.await_count == 1
+        (vote,) = _steps(context, "t2.sql.vote")
+        assert vote.status == "skipped"
+        assert vote.detail["skippedReason"] == "deadline"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("env", "option", "k"), [("0", None, 1), ("9", None, 5), ("x", None, 1), ("5", 2, 2)])
+    async def test_vote_k_is_clamped_and_overridable(self, monkeypatch, strategy, sql_generator, wire, env, option, k):
+        monkeypatch.setenv("SERVE_NL2SQL_VOTE_K", env)
+        stmt = "SELECT count(*) FROM orders"
+        wire([stmt] * k, {stmt: _exec_rows([{"count": 42}])})
+
+        await strategy.resolve("How many orders?", "ns", _vote_context(option))
+
+        assert sql_generator.generate_from_context.await_count == k - 1
+
+
+@pytest.mark.unit
+class TestVoteHelpers:
+    def test_signature_ignores_aliases_value_order_and_row_order(self):
+        a = [{"id": 1, "region": "east"}, {"id": 2, "region": "west"}]
+        b = [{"region": "west ", "order_id": 2}, {"region": "east", "order_id": 1}]
+        assert _result_signature(a, False) == _result_signature(b, False)
+
+    def test_signature_normalizes_numbers_dates_and_nulls(self):
+        assert _result_signature([{"x": 0.1 + 0.2}], False) == _result_signature([{"x": Decimal("0.30")}], False)
+        assert _result_signature([{"x": 100}], False) == _result_signature([{"x": 100.0}], False)
+        assert _result_signature([{"x": 1234567}], False) != _result_signature([{"x": 1234568}], False)
+        assert _result_signature([{"x": Decimal("0.30000001")}], False) != _result_signature([{"x": 0.3}], False)
+        assert _result_signature([{"d": date(2024, 1, 2)}], False) == _result_signature([{"d": "2024-01-02"}], False)
+        assert _result_signature([{"x": None}], False) != _result_signature([{"x": ""}], False)
+        assert _result_signature([{"x": 1}], False) != _result_signature([{"x": 2}], False)
+
+    def test_signature_counts_duplicate_rows_and_truncation(self):
+        assert _result_signature([{"x": 1}, {"x": 1}], False) != _result_signature([{"x": 1}], False)
+        assert _result_signature([{"x": 1}], True) != _result_signature([{"x": 1}], False)
+
+    def test_pick_winner_with_no_clean_execution_has_no_winner(self):
+        cands = [
+            _Candidate(1, "s1", 0.5, status="exec_error", error="RuntimeError"),
+            _Candidate(0, "s0", 0.9, status="refused"),
+        ]
+        outcome = _pick_winner(cands, 3)
+        assert outcome.winner is None
+        assert outcome.votes == 0
+        assert outcome.errored == 1
+
+    def test_pick_winner_prefers_size_then_non_empty_then_lowest_index(self):
+        rows = [{"n": 1}]
+        empty = [
+            _Candidate(0, "e0", 0.5, rows=[], row_count=0, status="executed"),
+            _Candidate(1, "e1", 0.5, rows=[], row_count=0, status="executed"),
+        ]
+        full = [_Candidate(2, "f", 0.5, rows=rows, row_count=1, status="executed")]
+        assert _pick_winner(empty + full, 3).winner.index == 0
+        tie = _pick_winner(
+            [
+                _Candidate(0, "e", 0.5, rows=[], row_count=0, status="executed"),
+                _Candidate(1, "f", 0.5, rows=rows, row_count=1, status="executed"),
+            ],
+            2,
+        )
+        assert tie.winner.index == 1
+        assert tie.tie_broken is True
+        distinct = _pick_winner(
+            [_Candidate(i, f"s{i}", 0.5, rows=[{"n": i}], row_count=1, status="executed") for i in (2, 0, 1)], 3
+        )
+        assert distinct.winner.index == 0
+
+
+@pytest.mark.unit
+class TestNLtoSQLStrategyWriterOptions:
+    """The per-request evidence cap and writer options reach both the first shot and the correction."""
+
+    @pytest.mark.asyncio
+    async def test_evidence_cap_and_writer_reach_generate_and_correct(self):
+        sql_generator, firewall, query_executor = AsyncMock(), MagicMock(), AsyncMock()
+        strategy = NLtoSQLStrategy(
+            sql_generator=sql_generator,
+            firewall=firewall,
+            query_executor=query_executor,
+            oss_ontology_index="test-index",
+        )
+        sql_generator.generate.return_value = _make_nl_to_sql_result(sql="SELECT bad FROM orders")
+        sql_generator.correct.return_value = ("SELECT count(*) FROM orders", 0.9)
+        firewall.evaluate.side_effect = [
+            _make_firewall_result(authorized_sql="SELECT bad FROM orders"),
+            _make_firewall_result(authorized_sql="SELECT count(*) FROM orders"),
+        ]
+        query_executor.execute.side_effect = [Exception('column "bad" does not exist'), _make_exec_result()]
+        evidence = "E" * 3000
+        context = StrategyContext(
+            embedding=[0.1] * 10,
+            profile={"userId": "user-1"},
+            options={
+                "dataSourceId": "ds-1",
+                "evidence": evidence,
+                "evidenceMaxChars": 3000,
+                "sqlTimeRules": True,
+                "tokenCaps": {"nl2sql": 8000},
+            },
+            trace=TraceCollector(),
+        )
+
+        await strategy.resolve("How many orders?", "ns1", context)
+
+        gen = sql_generator.generate.call_args.kwargs
+        assert gen["evidence"] == evidence and gen["evidence_max_chars"] == 3000
+        assert gen["writer"].time_rules is True and gen["writer"].max_tokens == 8000
+        fix = sql_generator.correct.call_args.kwargs
+        assert fix["evidence"] == evidence and fix["evidence_max_chars"] == 3000
+        assert fix["writer"] == gen["writer"]
+
+    @pytest.mark.asyncio
+    async def test_default_keeps_the_500_char_cap_and_baseline_writer(self):
+        sql_generator, firewall, query_executor = AsyncMock(), MagicMock(), AsyncMock()
+        strategy = NLtoSQLStrategy(
+            sql_generator=sql_generator,
+            firewall=firewall,
+            query_executor=query_executor,
+            oss_ontology_index="test-index",
+        )
+        sql_generator.generate.return_value = _make_nl_to_sql_result()
+        firewall.evaluate.return_value = _make_firewall_result()
+        query_executor.execute.return_value = _make_exec_result()
+        context = _make_context()
+        context.options["evidence"] = "E" * 3000
+
+        await strategy.resolve("How many orders?", "ns1", context)
+
+        gen = sql_generator.generate.call_args.kwargs
+        assert gen["evidence"] == "E" * 500 and gen["evidence_max_chars"] == 500
+        assert gen["writer"] == WriterOptions()

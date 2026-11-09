@@ -177,7 +177,7 @@ constraints in practice — if either is missing, the region is not usable.
 
 | Service | Used for | Check |
 |---------|----------|-------|
-| **Amazon Bedrock AgentCore Runtime** | Hosts the Serve (query) and MCP server runtimes | [Supported regions](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/agentcore-regions.html) — note this page lists availability per AgentCore *feature*; you need **Runtime** |
+| **Amazon Bedrock AgentCore Runtime** | Hosts the Serve (query) and MCP server runtimes | [Supported regions](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/agentcore-regions.html) — note this page lists availability per AgentCore *feature*; you need **AgentCore Runtime microVMs**, the default compute type. COA does not use **AgentCore Runtime Instances** (EC2 capacity providers), so a region without Instances is still usable |
 | **Amazon DataZone** / SageMaker Unified Studio | Namespace domain, data-asset catalog | [Endpoints and quotas](https://docs.aws.amazon.com/general/latest/gr/datazone.html) |
 | **Amazon Neptune** | Knowledge-graph store | [Endpoints and quotas](https://docs.aws.amazon.com/general/latest/gr/neptune.html) |
 | **Amazon OpenSearch Serverless** | Vector search for retrieval | [Endpoints and quotas](https://docs.aws.amazon.com/general/latest/gr/opensearch-service.html) — Serverless is available in fewer regions than managed OpenSearch |
@@ -795,6 +795,8 @@ Leaving either setting unset leaves the runtime's default in charge; the stack o
 
 `scripts/deploy.sh` maps the variables above to the CDK context parameters `serve_nl2sql_graph_expand` and `serve_nl2sql_graph_expand_max_tables`. On a direct `cdk deploy`, pass them as context instead — `--context serve_nl2sql_graph_expand=false` — or set them in the `context` block of `infra/cdk.json`.
 
+A separate, off-by-default lever votes across several SQL candidates: a request with `options.flatSqlVoteK` set to 2–5 (or a Serve runtime with `SERVE_NL2SQL_VOTE_K` set) generates that many statements from the same schema context, runs each distinct one, and returns the result most of them agree on, at up to that many times the model and warehouse cost. It has no CDK context parameter; the vote is skipped when the request deadline cannot fit it. See the `SERVE_NL2SQL_VOTE_K` row in `packages/context-manager/README.md`.
+
 #### Deep Reasoning default options
 
 A Deep Reasoning request that leaves an option unset gets the recommended value
@@ -865,7 +867,22 @@ finished).
 |-----------------|---------|----------|
 | `cpu` | `1024` (1 vCPU) | Fargate task CPU units. |
 | `memoryLimitMiB` | `2048` (2 GB) | Fargate task memory. |
-| `ontopJavaArgs` | `-Xmx1536m -Xms512m` | JVM args passed to the Ontop launcher via `ONTOP_JAVA_ARGS`. |
+| `ontopJavaArgs` | `-Xmx1536m -Xms512m` | JVM args passed to the Ontop launcher via `ONTOP_JAVA_ARGS`. A blank value counts as unset. The stack appends `-Dserver.address=127.0.0.1` after this value, so Ontop listens only on loopback inside the task, and a `-Dserver.address` in the override is superseded. Other Spring property sources (for example `-Dspring.application.json`) can still change the address. |
+
+A change to these props reaches a running namespace only when the reload Lambda registers a new task
+definition for it: when the namespace is first provisioned, or when the namespace's VKG image URI
+changes.
+
+- A CI deploy from `ci/mainline.yml` tags the VKG image `vkg-<short commit SHA>`, so each deploy of a
+  new commit changes the URI and its deploy-time sweep re-registers every namespace.
+- A deploy that builds the VKG image itself, such as `make deploy-dev` (`scripts/deploy.sh`), names
+  the image by a hash of the `packages/vkg` content. A sizing change alone leaves that URI unchanged
+  and starts no rollout, so existing namespaces keep their old settings until the `packages/vkg`
+  content changes.
+- A deploy that passes the same `vkg_image_uri` again, such as a reused tag like `vkg-latest`, leaves
+  the existing task definition and its old settings in place. Its rollout restarts the service on
+  that task definition unless every running task already has the image's digest.
+- An ontology reload with an unchanged image likewise restarts the existing task definition.
 
 **When to override the defaults:** increase CPU/memory (and heap in step) when a
 namespace's VKG reports `DEGRADED` health, when large-ontology reformulation
@@ -907,8 +924,12 @@ new VkgStack(app, `${stackPrefix}-vkg`, {
 });
 ```
 
-After changing these, redeploy the VKG stack and trigger a reload for existing
-namespaces so their tasks pick up the new sizing.
+After changing these, redeploy the VKG stack. Existing namespaces pick up the
+new values only when their task definition is re-registered, as described above:
+a deploy with a new VKG image URI (a CI deploy of a new commit) re-registers every
+namespace, through a sweep that finishes after the deploy itself. A
+`make deploy-dev` that leaves `packages/vkg` unchanged, and an ontology reload
+with an unchanged image, keep the existing task definition and its old settings.
 
 ### Internal Environment Variables
 
@@ -1411,7 +1432,7 @@ This runs `scripts/destroy.sh dev`, which orchestrates teardown of resources CFN
 
 1. **Deletes AgentCore Runtimes** (serve + mcp) directly via the Bedrock AgentCore API.
 2. **Checks the runtimes' ENIs without waiting for them.** AWS releases them up to 8 hours after the runtimes are deleted, and they hold only the runtime security groups, the private subnets and the VPC — see [AgentCore ENIs outlive the runtimes](#agentcore-enis-outlive-the-runtimes).
-3. **Deletes VKG's per-namespace ECS services** (created outside CloudFormation by the ontology-reload Lambda) and waits for them to reach `INACTIVE`.
+3. **Deletes VKG's per-namespace ECS services** (created outside CloudFormation by the ontology-reload Lambda) and waits for them to reach `INACTIVE`, then deregisters their task definitions.
 4. **Deletes the Cloud Map services** the VKG reload Lambda registered in the private DNS namespace, which CloudFormation cannot delete while they exist.
 5. **Force-deletes the DataZone domain** via `delete-domain --skip-deletion-check`, which cascades through every project, asset, and asset type under it — CloudFormation's own delete can't do this (see [FAQ](#why-does-namespace-stack-fail-to-delete-with-domain-not-empty)).
 6. **Starts deleting the connector stacks** (`<PREFIX>-dev-*-coa-connector`), which are separate CDK apps; step 8 waits for them. Then **deletes the federated Glue connections of registered database sources**, with their federated catalogs and Lake Formation registrations, the way deleting a source through the API does: the sources service creates them at runtime, so no stack deletes them, and each keeps an ENI in the network stack's connector security group. Glue deletes no connection its federated catalog still uses, and only a Lake Formation data lake administrator can drop those catalogs: run the teardown as one, or delete your database sources through the API first. See [A database source's Glue connection keeps the network stack](#a-database-sources-glue-connection-keeps-the-network-stack).
@@ -1859,6 +1880,19 @@ namespaces are added — relevant to the Fargate vCPU and ENI quotas in
 [A.3](#a3-quotas-to-check-before-deploying), and the reason those quotas are
 worth checking against your expected namespace count rather than against a
 single-namespace evaluation.
+
+Each of those services also has its own task-definition family,
+`<prefix>-<env>-vkg-<namespaceId>`, registered by the reload Lambda. When it
+starts an update or a provision, the Lambda deregisters the family's older
+revisions, but keeps every revision a PRIMARY or ACTIVE deployment still uses
+(the ECS circuit breaker rolls back to the last completed one) and any newer
+revision a concurrent reload registered. So during a rollout a family can have
+more than one ACTIVE revision. When the invocation runs low on time, the
+Lambda stops the cleanup and leaves the rest for the next reload (log event
+`task_defs_deregister_deferred`). Deleting a namespace deletes its service and its
+revisions. If the service delete fails, the revisions are kept: the namespace
+delete ends in `DELETE_FAILED` and deregisters them when you retry it.
+`make destroy-dev` deregisters them for the whole deployment.
 
 **Runtime-only services expand the IAM and regional surface.** The services in
 [A.2](#a2-services-called-at-runtime-but-not-provisioned) — Athena, Glue, Lake

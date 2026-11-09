@@ -270,6 +270,7 @@ class LLMClient(Protocol):
         top_p: float | None = None,
         guard_content: str | None = None,
         model_id: str | None = None,
+        effort: str | None = None,
     ) -> ConverseResult:
         """Call Bedrock Converse API. Returns ConverseResult with text and guardrail status.
 
@@ -283,6 +284,9 @@ class LLMClient(Protocol):
 
         ``model_id`` overrides the default LLM model for this call. When None,
         the client's configured default is used.
+
+        ``effort`` is the model's effort level (how much it reasons before
+        answering); None sends none, so the model's default applies.
         """
         ...
 
