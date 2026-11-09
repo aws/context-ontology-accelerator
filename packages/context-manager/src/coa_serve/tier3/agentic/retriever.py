@@ -184,6 +184,8 @@ _PREFETCH_TEXT_BUDGET = 60_000
 _PREFETCH_MIN_WINDOW = 2_000
 # Below this much time left, the prefetch does not start (a call could not finish).
 _PREFETCH_MIN_TIME_S = 1.0
+# options.sqlResultCheck: the least tool time worth starting a SQL rewrite with.
+_SQL_REVISE_MIN_TIME_S = 10.0
 
 
 class _RequestTools:
@@ -330,6 +332,7 @@ class AgenticRetriever:
         profile: dict | None = None,
         options: dict | None = None,
         model_id: str | None = None,
+        schema_visible: bool = False,
         **_: Any,
     ) -> Tier3Result:
         """Run one agentic reasoning session and synthesize a best-effort answer.
@@ -367,6 +370,9 @@ class AgenticRetriever:
             options: Optional per-request options bag threaded to the tools
                 out-of-band.
             model_id: Optional per-request model id override for synthesis / tools.
+            schema_visible: Whether the caller may see generated SQL (resolved by the
+                orchestrator: ``includeDebugInfo`` plus ``viewSource``). Only then may
+                the answer name the tables and columns behind its numbers.
 
         Returns:
             A :class:`Tier3Result` with ``synthesized_answer``,
@@ -397,6 +403,12 @@ class AgenticRetriever:
         # options.sufficiencyGuards: hold back a positive sufficiency check while a top
         # name-matched document has been read only in part.
         ctx.sufficiency_guards = opts.get("sufficiencyGuards") is True
+        # options.sqlInAnswer: the SQL behind the rows reaches the answer step.
+        ctx.sql_in_answer = opts.get("sqlInAnswer") is True
+        # Whether the answer may name the tables and columns behind the rows: only for a
+        # caller who may see the generated SQL itself (includeDebugInfo + viewSource,
+        # resolved by the orchestrator). Never read from request options.
+        ctx.schema_visible = schema_visible is True
         # options.singleCallSteps: one model call per loop step (the next-step call
         # also decides when to stop) instead of a step call plus a sufficiency call.
         ctx.single_call_steps = opts.get("singleCallSteps") is True
@@ -432,6 +444,7 @@ class AgenticRetriever:
         # nothing to read on a namespace with no DOCUMENTS source.
         option_gated = _OPT_IN_TOOL_NAMES
         tools: Any = self._registry
+        overrides: dict[str, Any] = {}
         # options.entityRouting: offer find_documents (names -> source documents),
         # extract the question's named terms during decomposition and route them
         # once up front.
@@ -445,7 +458,30 @@ class AgenticRetriever:
             if opts.get("readDocumentAnchor") is True:
                 variant = getattr(self._registry.get(READ_DOCUMENT_TOOL), "anchored_variant", None)
                 if callable(variant):
-                    tools = _RequestTools(self._registry, {READ_DOCUMENT_TOOL: variant()})
+                    overrides[READ_DOCUMENT_TOOL] = variant()
+        # options.sqlWithEvidence: nl_to_sql hands the gathered document evidence
+        # (read windows, raw mentions, top chunks) to the SQL writer.
+        if opts.get("sqlWithEvidence") is True:
+            variant = getattr(self._registry.get(NL_TO_SQL_TOOL), "evidence_variant", None)
+            if callable(variant):
+                overrides[NL_TO_SQL_TOOL] = variant()
+            else:
+                logger.warning("agentic_option_unavailable", option="sqlWithEvidence", tool=NL_TO_SQL_TOOL)
+                trace.record(
+                    "option_unavailable",
+                    "skipped",
+                    clock.elapsed_ms(),
+                    detail=f"sqlWithEvidence: {NL_TO_SQL_TOOL} has no evidence variant",
+                    tool_used=NL_TO_SQL_TOOL,
+                )
+        # options.sqlRevision: nl_to_sql also takes a 'revise' reason (see the tool).
+        if opts.get("sqlRevision") is True:
+            current = overrides.get(NL_TO_SQL_TOOL) or self._registry.get(NL_TO_SQL_TOOL)
+            variant = getattr(current, "revision_variant", None)
+            if callable(variant):
+                overrides[NL_TO_SQL_TOOL] = variant()
+        if overrides:
+            tools = _RequestTools(self._registry, overrides)
 
         # options.ontologyLookupMode == "preload": resolve the ontology up front and
         # take the tool away from the planner. Only when the planner could have used
@@ -463,6 +499,15 @@ class AgenticRetriever:
         # fail CLOSED on an empty profile, so without it every nl_to_sql / nl_to_sparql
         # call is an AccessDeniedError silently rendered as "0 rows".
         tool_context = {"profile": profile or {}, "options": opts, "model_id": model_id}
+        # options.sqlOriginalQuestion: the structured tools also get the user's
+        # original question (decomposed sub-questions can drop its constraints).
+        if opts.get("sqlOriginalQuestion") is True:
+            tool_context["original_question"] = query
+        # options.sqlComputeMetric: the structured tools let the SQL writer compute a
+        # requested metric and select its inputs. Passed here, not read from the
+        # request options by the writer, so a direct Tier-2 answer keeps its shape.
+        if opts.get("sqlComputeMetric") is True:
+            tool_context["compute_metric"] = True
         if requested_gated:
             trace.record(
                 "tools_gated",
@@ -820,6 +865,12 @@ class AgenticRetriever:
             trace.record("prefetch_done", "success", clock.elapsed_ms(), detail="guard held; running the loop")
             return False
         spec_task = asyncio.ensure_future(speculate()) if speculate is not None else None
+        # options.sqlResultCheck: check the SQL result alongside the "enough?" call.
+        check_task = (
+            asyncio.ensure_future(self._controller.check_sql_result(query, ctx))
+            if (tool_context.get("options") or {}).get("sqlResultCheck") is True and sql_allowed and ctx.last_sql
+            else None
+        )
         try:
             sufficient, working_answer = await self._controller.assess(SubQuestion(text=query), ctx)
             if working_answer:
@@ -833,9 +884,28 @@ class AgenticRetriever:
             gate = getattr(self._controller, "prefetch_gate", None)
             if callable(gate):
                 sufficient = gate(sufficient, ctx, trace, clock, guard_held=bool(reason))
+            if check_task is not None and not sufficient:
+                # The loop runs anyway; the check only matters for a result about to be accepted.
+                check_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await check_task
+                check_task = None
+            problem = (await check_task) if check_task is not None else ""
+            if problem and await self._revise_prefetch_sql(
+                problem, query, ctx, clock, trace, namespace=namespace, tools=tools, tool_context=tool_context
+            ):
+                # The working answer and the speculative answer were written from the
+                # rejected rows.
+                ctx.working_answers = [e for e in ctx.working_answers if e.get("question") != query]
+                if spec_task is not None:
+                    spec_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await spec_task
+                    spec_task = None
         except BaseException:
-            if spec_task is not None:
-                spec_task.cancel()
+            for task in (spec_task, check_task):
+                if task is not None:
+                    task.cancel()
             raise
         trace.record(
             "prefetch_done",
@@ -851,6 +921,64 @@ class AgenticRetriever:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await spec_task
         return sufficient
+
+    async def _revise_prefetch_sql(
+        self,
+        problem: str,
+        query: str,
+        ctx: AccumulatedContext,
+        clock: BudgetClock,
+        trace: TraceCollector,
+        *,
+        namespace: str,
+        tools: Any,
+        tool_context: dict,
+    ) -> bool:
+        """Rewrite the prefetch SQL once for a defect the result check named (options.sqlResultCheck).
+
+        The previous SQL, its rows and ``problem`` go to the writer through the
+        ``revise`` input (options.sqlRevision). When the new query returns rows they
+        REPLACE the rejected ones (and its SQL replaces the rejected SQL in the log);
+        otherwise the old rows stay. Returns whether the rows were replaced. Raises
+        only an SQL :class:`AccessDeniedError`, as the first prefetch call does.
+        """
+        # The check's reason was written from the SQL and its rows, and the trace goes back
+        # to every caller: only a caller who may see the schema gets the reason itself.
+        detail = f"flagged: {problem[:300]}" if ctx.schema_visible else "flagged"
+        trace.record("sql_result_check", "success", clock.elapsed_ms(), detail=detail)
+        tool = tools.get(NL_TO_SQL_TOOL)
+        timeout_s = clock.tool_deadline_s(self._budget.per_tool_timeout_s)
+        if tool is None or timeout_s < _SQL_REVISE_MIN_TIME_S:
+            trace.record("sql_result_revise", "skipped", clock.elapsed_ms(), detail="no time or no SQL tool")
+            return False
+        old_sql = (ctx.last_sql or {}).get("sql")
+        extra = {"sub_question": query} if getattr(tool, "wants_context", False) else {}
+        start = time.perf_counter()
+        try:
+            result = await asyncio.wait_for(
+                tool.invoke(
+                    namespace=namespace, **tool_context, **extra, query=query, accumulated_context=ctx, revise=problem
+                ),
+                timeout=timeout_s,
+            )
+        except AccessDeniedError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - prefetch must never raise (Req 9.1)
+            ms = int((time.perf_counter() - start) * 1000)
+            trace.record("sql_result_revise", "error", ms, detail=type(exc).__name__, tool_used=NL_TO_SQL_TOOL)
+            return False
+        ms = int((time.perf_counter() - start) * 1000)
+        if not result.rows:
+            trace.record("sql_result_revise", "success", ms, detail=f"no rows; kept the first result. {result.detail}")
+            return False
+        ctx.replace_rows(result)
+        if old_sql and old_sql != (ctx.last_sql or {}).get("sql") and old_sql in ctx.sql_log:
+            ctx.sql_log.remove(old_sql)
+        ctx.record_attempt(
+            NL_TO_SQL_TOOL, {"query": query}, len(ctx.rows), "succeeded", "revised after the result check"
+        )
+        trace.record("sql_result_revise", "success", ms, detail=result.detail, tool_used=NL_TO_SQL_TOOL)
+        return True
 
     # ── reading the best-supported documents (prefetch) ────────────────
 
@@ -1356,12 +1484,14 @@ class AgenticRetriever:
         # synthesizer so it can be compared against the final synthesized answer
         # (measuring how often synthesis refines/corrects the agent's interim guess).
         if ctx.working_answer:
-            trace.record(
-                "agentic_working_answer",
-                "success",
-                clock.elapsed_ms(),
-                detail=ctx.working_answer[:2000],
-            )
+            # Written by the planner from rows (and, with sqlRevision, their SQL): for a
+            # caller who may not see the schema the trace keeps only its length, as the
+            # sql_result_check step keeps only "flagged".
+            if ctx.schema_visible or not ctx.rows:
+                detail = ctx.working_answer[:2000]
+            else:
+                detail = f"{len(ctx.working_answer)} chars (withheld: written from structured rows)"
+            trace.record("agentic_working_answer", "success", clock.elapsed_ms(), detail=detail)
         try:
             # Bound synthesis by the wall-clock actually left. synthesis_reserve_s
             # only SHRINKS tool timeouts (budget.tool_deadline_s) — it reserves a
@@ -1537,7 +1667,12 @@ class AgenticRetriever:
         # would call the namespace language "the language of the user's question" and
         # contradict the history clause, so synthesis matches the question instead.
         name_language = ctx.answer_language and (ctx.answer_language_detected or not conversation_history)
-        language = {"answer_language": ctx.answer_language} if name_language else {}
+        synth_kw: dict[str, Any] = {"answer_language": ctx.answer_language} if name_language else {}
+        # options.sqlInAnswer: show the SQL behind the rows (only when there is some,
+        # so synthesizers that predate the parameter keep working).
+        if getattr(ctx, "sql_in_answer", False) and getattr(ctx, "sql_log", None) and structured_data:
+            synth_kw["structured_queries"] = list(ctx.sql_log)
+            synth_kw["schema_visible"] = getattr(ctx, "schema_visible", False)
         if on_token is not None and hasattr(self._synthesizer, "synthesize_stream"):
             return await self._synthesizer.synthesize_stream(
                 query,
@@ -1548,7 +1683,7 @@ class AgenticRetriever:
                 conversation_history=conversation_history,
                 on_token=on_token,
                 working_answer=working_answer,
-                **language,
+                **synth_kw,
                 **cap_kw,
             )
         return await self._synthesizer.synthesize(
@@ -1559,7 +1694,7 @@ class AgenticRetriever:
             catalog_summary=catalog_summary,
             conversation_history=conversation_history,
             working_answer=working_answer,
-            **language,
+            **synth_kw,
             **cap_kw,
         )
 

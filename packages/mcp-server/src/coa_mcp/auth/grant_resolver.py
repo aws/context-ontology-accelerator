@@ -12,11 +12,13 @@ never default-allow.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from dataclasses import dataclass, field
 
 import structlog
 from coa_authorization.policy_evaluator import evaluate as cedar_evaluate
+from coa_authorization.schema_visibility import VIEW_ONTOLOGY_ACTION, VIEW_SOURCE_ACTION
 from coa_common import resolve_region
 
 from .claims import CallerIdentity
@@ -35,11 +37,18 @@ class GrantResolutionError(Exception):
 
 TOOL_CEDAR_ACTION: dict[str, str] = {
     "list_metrics": "viewNamespace",
-    "describe_schema": "viewNamespace",
+    # describe_schema is a pure ontology-vocabulary dump (classes/properties)
+    # with no query utility, so it is HARD-denied to a schema-blind role via
+    # viewOntology. translate_sparql/graph_traversal remain gated on their
+    # working-tool actions (query / traverseGraph) — a schema-blind analyst
+    # KEEPS these tools (ADR decision #1), and their raw ontology/schema
+    # identifiers are removed by the output-suppression layer, not by denying
+    # the action.
+    "describe_schema": VIEW_ONTOLOGY_ACTION,
     "query": "query",
     "translate_sparql": "query",
     "rag_retrieval": "searchDocuments",
-    "graph_traversal": "viewNamespace",
+    "graph_traversal": "traverseGraph",
 }
 
 
@@ -50,43 +59,25 @@ def _evaluate_cedar(
     *,
     global_roles: list[str],
     resource_roles: list[dict[str, str]],
-) -> None:
+) -> str:
     """Load Cedar policies for the principal's roles and evaluate.
 
     Mirrors the control-plane authorizer pattern: loads cedarPolicy from the
     Roles table for each resolved role + default, then calls
     coa_authorization.policy_evaluator.evaluate().
 
-    Raises GrantResolutionError on deny (fail-closed).
+    Raises GrantResolutionError on deny (fail-closed). Returns the loaded
+    policies so the caller can evaluate further actions without reloading them.
     """
-    from coa_authorization.policy_loader import load_policies_for_roles
-
-    role_ids: set[str] = {"default"}
-    role_ids.update(global_roles)
-    role_ids.update(r.get("role", "") for r in resource_roles if r.get("role"))
-
-    policies = load_policies_for_roles(
-        role_ids=role_ids,
-        table_name=_ROLES_TABLE,
-        region=_AWS_REGION,
-    )
+    policies, role_ids = _load_policies(global_roles, resource_roles)
 
     if not policies:
         logger.warning("cedar_no_policies_loaded", user_id=user_id, roles=list(role_ids))
         raise GrantResolutionError(f"No Cedar policies found for user '{user_id}'")
 
-    result = cedar_evaluate(
-        policies=policies,
-        user_id=user_id,
-        action=action,
-        resource_type="Namespace",
-        resource_id=namespace_id,
-        global_roles=global_roles,
-        resource_roles=resource_roles,
-        resource_attrs={"namespace": namespace_id},
-    )
-
-    if not result.allowed:
+    if not _is_allowed(
+        policies, user_id, action, namespace_id, global_roles=global_roles, resource_roles=resource_roles
+    ):
         logger.warning(
             "cedar_access_denied",
             user_id=user_id,
@@ -97,6 +88,97 @@ def _evaluate_cedar(
         raise GrantResolutionError(
             f"Cedar policy denied action '{action}' for user '{user_id}' on namespace '{namespace_id}'"
         )
+    return policies
+
+
+# Schema rights decided alongside the tool action (ADR: decompose-viewnamespace-
+# schema-visibility). Cached on the resolved profile so the output-suppression
+# gate and the metric-service flags never reload the policies.
+SCHEMA_VIEW_ACTIONS: tuple[str, ...] = (VIEW_SOURCE_ACTION, VIEW_ONTOLOGY_ACTION)
+
+
+def _load_policies(global_roles: list[str], resource_roles: list[dict[str, str]]) -> tuple[str, set[str]]:
+    """Load the Cedar policy text for the principal's roles (plus ``default``) once."""
+    from coa_authorization.policy_loader import load_policies_for_roles
+
+    role_ids: set[str] = {"default"}
+    role_ids.update(global_roles)
+    role_ids.update(r.get("role", "") for r in resource_roles if r.get("role"))
+    policies = load_policies_for_roles(role_ids=role_ids, table_name=_ROLES_TABLE, region=_AWS_REGION)
+    return policies, role_ids
+
+
+def _is_allowed(
+    policies: str,
+    user_id: str,
+    action: str,
+    namespace_id: str,
+    *,
+    global_roles: list[str],
+    resource_roles: list[dict[str, str]],
+) -> bool:
+    """Evaluate ``action`` on the namespace against already-loaded policies."""
+    result = cedar_evaluate(
+        policies=policies,
+        user_id=user_id,
+        action=action,
+        resource_type="Namespace",
+        resource_id=namespace_id,
+        global_roles=global_roles,
+        resource_roles=resource_roles,
+        resource_attrs={"namespace": namespace_id},
+    )
+    return bool(result.allowed)
+
+
+def _schema_visibility(
+    policies: str,
+    user_id: str,
+    namespace_id: str,
+    *,
+    global_roles: list[str],
+    resource_roles: list[dict[str, str]],
+) -> dict[str, bool]:
+    """``viewSource`` / ``viewOntology`` decisions from the same policy set, fail-closed.
+
+    An evaluation error yields False for that action (schema withheld) and is
+    logged at error level, so an outage is not mistaken for a real deny.
+    """
+    decisions: dict[str, bool] = {}
+    for action in SCHEMA_VIEW_ACTIONS:
+        try:
+            decisions[action] = _is_allowed(
+                policies, user_id, action, namespace_id, global_roles=global_roles, resource_roles=resource_roles
+            )
+        except Exception as exc:  # fail closed — withhold schema on any error
+            logger.error(
+                "cedar_schema_view_error",
+                user_id=user_id,
+                action=action,
+                namespace=namespace_id,
+                error=type(exc).__name__,
+                error_msg=str(exc),
+                exc_info=True,
+            )
+            decisions[action] = False
+    return decisions
+
+
+def _authorize_and_decide_visibility(
+    user_id: str,
+    action: str,
+    namespace_id: str,
+    *,
+    global_roles: list[str],
+    resource_roles: list[dict[str, str]],
+) -> dict[str, bool]:
+    """One policy load: gate ``action`` (raises on deny), then decide the schema rights.
+
+    Blocking (DynamoDB read + cedarpy), so :func:`resolve_grant` runs it off the
+    event loop.
+    """
+    policies = _evaluate_cedar(user_id, action, namespace_id, global_roles=global_roles, resource_roles=resource_roles)
+    return _schema_visibility(policies, user_id, namespace_id, global_roles=global_roles, resource_roles=resource_roles)
 
 
 @dataclass
@@ -118,6 +200,9 @@ class ResolvedProfile:
     table_allowlist: list[str] | None = None
     column_denylist: dict[str, list[str]] | None = None
     data_source_ids: list[str] | None = None
+    # viewSource / viewOntology decided with the tool action; empty when no
+    # cedar_action was evaluated, which consumers treat as "withhold".
+    schema_visibility: dict[str, bool] = field(default_factory=dict)
 
     def to_profile_dict(self) -> dict:
         """Convert to the dict format expected by InvokeRequest.profile.
@@ -133,6 +218,7 @@ class ResolvedProfile:
             "userId": self.user_id,
             "globalRoles": self.global_roles,
             "resourceRoles": self.resource_roles,
+            "schemaVisibility": dict(self.schema_visibility),
         }
         if self.table_allowlist is not None:
             profile["tableAllowlist"] = self.table_allowlist
@@ -265,14 +351,33 @@ async def resolve_grant(
         )
 
     # ── Cedar policy evaluation (OUTSIDE try/except, never bypassed) ──
-    if cedar_action and _ROLES_TABLE:
-        _evaluate_cedar(
+    # resolve_grant is only reached on the authenticated path (local dev returns
+    # before calling it), so a caller-supplied cedar_action MUST be evaluated.
+    # Fail CLOSED when the roles table is unset: skipping the gate would let a
+    # hard-gated tool (e.g. describe_schema -> viewOntology) run for a role that
+    # should be denied, and the schema-view decisions below (taken from the same
+    # policy set) would have no policy source either.
+    if cedar_action:
+        if not _ROLES_TABLE:
+            # The detail (env var name) stays in the log; the client gets a
+            # message it can act on, not an internal deployment detail.
+            logger.error(
+                "cedar_gate_no_roles_table",
+                user_id=caller.user_id,
+                action=cedar_action,
+                detail="Cedar evaluation required but ROLES_TABLE_NAME is unset",
+            )
+            raise GrantResolutionError("Authorization is temporarily unavailable; contact your administrator.")
+        schema_visibility = await asyncio.to_thread(
+            _authorize_and_decide_visibility,
             caller.user_id,
             cedar_action,
             namespace_id,
             global_roles=resolved.global_roles,
             resource_roles=resolved.resource_roles,
         )
+    else:
+        schema_visibility = {}
 
     logger.info(
         "grant_resolved",
@@ -294,4 +399,5 @@ async def resolve_grant(
         table_allowlist=resolved.table_allowlist,
         column_denylist=resolved.column_denylist,
         data_source_ids=resolved.allowed_metrics,
+        schema_visibility=schema_visibility,
     )

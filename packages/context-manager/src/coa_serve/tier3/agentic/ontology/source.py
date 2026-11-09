@@ -51,8 +51,10 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from textwrap import indent
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from urllib.parse import quote
 
 import structlog
+from coa_common.constants import GOVERNED_METRICS_ONTOLOGY_ID
 
 from ....namespace_language import current_label_preference, row_label
 from ....query_utils import validate_namespace
@@ -68,6 +70,8 @@ logger = structlog.get_logger(__name__)
 # cap and falls back to the prefix filter above it, so this value never forces a
 # slow query — it only caps how many IRIs we fetch.
 _MAX_ONTOLOGY_GRAPHS = 50
+_GOVERNED_GRAPH = quote(GOVERNED_METRICS_ONTOLOGY_ID, safe="")
+"""The last segment of a namespace's governed-metrics graph URI."""
 
 # Inner fast-fail cap on JUST the owl:Ontology graph-IRI resolve (seconds). The
 # resolve is a cheap optimisation that lets the type queries use a constant
@@ -221,7 +225,9 @@ def _graph_wrapped_query(select: str, body: str, graph_uri_prefix: str, graph_ir
     """
     from ....query_utils import graph_scoped_body
 
-    scoped = graph_scoped_body(indent(body, " " * 8), graph_uri_prefix, graph_iris)
+    # Governed metrics are owl:Class subjects labelled with their names; a node-type list has no use for them, and
+    # this result is cached for every caller, so the governed-metrics graph is always left out.
+    scoped = graph_scoped_body(indent(body, " " * 8), graph_uri_prefix, graph_iris, without_graph=_GOVERNED_GRAPH)
     return f"{_ONTOLOGY_PREFIXES}\n\n{select}\nWHERE {{\n{scoped}\n}}\n"
 
 

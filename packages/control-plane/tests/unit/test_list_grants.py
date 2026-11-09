@@ -48,13 +48,52 @@ def _token(decoded: object) -> str:
     return base64.b64encode(json.dumps(decoded).encode()).decode()
 
 
-def _event(namespace_id: str = VALID_NS_ID, query_params: dict | None = None) -> dict:
+def _event(
+    namespace_id: str = VALID_NS_ID, query_params: dict | None = None, can_view_source: str | None = "true"
+) -> dict:
+    # Default to a source-schema viewer: the serialization tests below assert the
+    # full grant shape. Schema-blind withholding is covered in TestListGrantsSchemaVisibility.
+    authorizer = {} if can_view_source is None else {"canViewSource": can_view_source}
     return {
         "httpMethod": "GET",
         "resource": "/namespaces/{namespaceId}/grants",
         "pathParameters": {"namespaceId": namespace_id},
         "queryStringParameters": query_params,
+        "requestContext": {"authorizer": authorizer},
     }
+
+
+class TestListGrantsSchemaVisibility:
+    """The handler routes every listing through withhold_namespace_grant_overrides."""
+
+    ITEM = {
+        "PK": f"Namespace::{VALID_NS_ID}#User::alice@company.com",
+        "SK": "ROLE#analyst",
+        "principalType": "User",
+        "principalId": "alice@company.com",
+        "role": "analyst",
+        "grantedBy": "bob@company.com",
+        "grantedAt": "2026-04-09T10:00:00Z",
+        "tableAllowlist": ["sentinel_orders_tbl"],
+        "columnDenylist": {"sentinel_orders_tbl": ["sentinel_ssn_col"]},
+        "allowedMetrics": ["revenue"],
+    }
+
+    @pytest.mark.parametrize(
+        ("can_view_source", "kept"),
+        [("true", True), ("TRUE", True), ("false", False), ("", False), (None, False)],
+    )
+    @patch("coa_control_plane.grants.list_handler.DynamoDBDAO")
+    def test_overrides_follow_can_view_source(self, mock_dao_cls, can_view_source, kept):
+        mock_dao_cls.return_value.query.return_value = PaginatedResult(items=[self.ITEM], last_evaluated_key=None)
+        resp = handler(_event(can_view_source=can_view_source), None)
+        assert resp["statusCode"] == 200
+        mock_dao_cls.return_value.query.assert_called_once()
+        (grant,) = json.loads(resp["body"])["grants"]
+        assert grant["allowedMetrics"] == ["revenue"]  # metric names are not schema
+        leaked = "sentinel_orders_tbl" in resp["body"] or "sentinel_ssn_col" in resp["body"]
+        assert leaked is kept
+        assert ("tableAllowlist" in grant) is kept and ("columnDenylist" in grant) is kept
 
 
 class TestListGrants:

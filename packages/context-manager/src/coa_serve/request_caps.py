@@ -4,10 +4,10 @@
 """Per-request output-token caps (``options.tokenCaps``), shared by every caller.
 
 ``options.tokenCaps`` is an optional object mapping a model-call role to an output
-token cap for this request only — ``planner`` (deep-reasoning planner calls) and
-``synthesizer`` (deep-reasoning answer writing). An absent or malformed entry
-leaves that role on its configured default. Dependency-free so any layer can
-import it.
+token cap for this request only — ``planner`` (deep-reasoning planner calls),
+``synthesizer`` (deep-reasoning answer writing) and ``nl2sql`` (the NL→SQL writer,
+first shot and correction). An absent or malformed entry leaves that role on its
+configured default. Dependency-free so any layer can import it.
 """
 
 from __future__ import annotations
@@ -26,3 +26,7 @@ def token_cap(options: dict[str, Any] | None, role: str) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         return None
     return max(TOKEN_CAP_RANGE[0], min(TOKEN_CAP_RANGE[1], value))
+
+
+# options.sqlWriterEffort: the model effort levels the SQL writer accepts.
+SQL_WRITER_EFFORT_LEVELS = ("low", "medium", "high")

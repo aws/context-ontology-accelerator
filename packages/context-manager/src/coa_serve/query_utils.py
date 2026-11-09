@@ -554,7 +554,9 @@ _MAX_INLINED_GRAPHS = 8
 _SAFE_GRAPH_IRI_RE = regex.compile(r"^https?://[^\s<>\"{}|\\^`]+\Z")
 
 
-def graph_scoped_body(body: str, graph_uri_prefix: str, graph_iris: list[str] | None = None) -> str:
+def graph_scoped_body(
+    body: str, graph_uri_prefix: str, graph_iris: list[str] | None = None, *, without_graph: str | None = None
+) -> str:
     """Scope a triple-pattern body to one namespace's named graphs.
 
     Scoping matters because the bare ``GRAPH ?g`` + ``STRSTARTS`` form matches in
@@ -586,6 +588,9 @@ def graph_scoped_body(body: str, graph_uri_prefix: str, graph_iris: list[str] | 
             that is not a safe IRI ref is dropped here rather than interpolated —
             callers resolve these from the store, so the guard belongs at the point
             of interpolation as well as at the point of resolution.
+        without_graph: The last path segment of a graph to leave out, in both
+            forms (a resolved IRI ending ``/<segment>``, and a fallback filter).
+            None, the default, leaves the query text unchanged.
 
     Returns:
         The ``GRAPH``-wrapped body: one constant-graph block, a ``UNION`` of them,
@@ -600,6 +605,8 @@ def graph_scoped_body(body: str, graph_uri_prefix: str, graph_iris: list[str] | 
                 detail="graph IRI is not safe for angle-bracket interpolation; excluded from the scoped query",
             )
         graph_iris = safe
+    if graph_iris and without_graph is not None:
+        graph_iris = [g for g in graph_iris if not g.endswith(f"/{without_graph}")]
     if graph_iris and len(graph_iris) <= _MAX_INLINED_GRAPHS:
         blocks = [f"          GRAPH <{g}> {{\n{body}\n          }}" for g in graph_iris]
         if len(blocks) == 1:
@@ -619,7 +626,9 @@ def graph_scoped_body(body: str, graph_uri_prefix: str, graph_iris: list[str] | 
             max_inlined=_MAX_INLINED_GRAPHS,
             detail="graph IRIs resolved but exceed the inlining cap; falling back to the cluster-wide prefix filter",
         )
-    return f'          GRAPH ?g {{\n{body}\n          }}\n          FILTER(STRSTARTS(STR(?g), "{graph_uri_prefix}"))'
+    left_out = "" if without_graph is None else f'\n          FILTER(!STRENDS(STR(?g), "/{without_graph}"))'
+    prefixed = f'FILTER(STRSTARTS(STR(?g), "{graph_uri_prefix}"))'
+    return f"          GRAPH ?g {{\n{body}\n          }}\n          {prefixed}{left_out}"
 
 
 def named_graphs_sparql(graph_uri_prefix: str, *, limit: int) -> str:

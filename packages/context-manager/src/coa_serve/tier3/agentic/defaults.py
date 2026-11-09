@@ -27,11 +27,20 @@ RECOMMENDED_OPTIONS: dict[str, Any] = {
     "prefetchMode": "assess",
     "loopFixes": True,
     "plannerParseRetry": True,
-    "tokenCaps": {"planner": 4000, "synthesizer": 12000},
+    "tokenCaps": {"planner": 4000, "synthesizer": 12000, "nl2sql": 8000},
     "sufficiencyGuards": True,
     "fastPathSpeculation": True,
     "singleCallSteps": True,
     "keepSlowSql": True,
+    # SQL writer
+    "sqlOriginalQuestion": True,
+    "sqlTimeRules": True,
+    "sqlComputeMetric": True,
+    "sqlWithEvidence": True,
+    "sqlRevision": True,
+    "sqlInAnswer": True,
+    "sqlResultCheck": True,
+    "sqlWriterEffort": "medium",
 }
 
 

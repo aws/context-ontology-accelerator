@@ -53,6 +53,7 @@ _MAX_DISTINCT_VALUES_IN_PROMPT = 12
 # rdfs:/owl: are Neptune defaults.
 _RDFS_COMMENT = "http://www.w3.org/2000/01/rdf-schema#comment"
 _SKOS_ALT_LABEL = "http://www.w3.org/2004/02/skos/core#altLabel"
+_SKOS_PREF_LABEL = "http://www.w3.org/2004/02/skos/core#prefLabel"
 _SCL_GLOSSARY_TERM = f"{VOCAB_URI}glossaryTerm"
 _SCL_TAG = f"{VOCAB_URI}tag"
 _ANNOTATION_KEYS = {
@@ -802,7 +803,11 @@ class TBoxContextBuilder:
         graph_iris: list[str] | None = None,
         backend: StructuredBackend = StructuredBackend.SQL,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        """Fallback: fetch ontology context by matching NL query entities against class labels."""
+        """Fallback: fetch ontology context by matching NL query entities against class labels.
+
+        ``skos:prefLabel`` and ``skos:altLabel`` are matched like ``rdfs:label``. Only
+        classes with an ``rdfs:label`` are returned, under that label, whichever matched.
+        """
         validate_namespace(namespace)
         search_plan = build_query_search_plan(query, max_count=5)
 
@@ -814,21 +819,19 @@ class TBoxContextBuilder:
             logger.warning("tbox_missing_graph_uri_template")
             return [], []
 
-        forward_filters = [
-            f'CONTAINS(LCASE(?label), "{escape_sparql_string_literal(normalize_label_match_text(term))}")'
-            for term in search_plan.terms
-        ]
+        terms = [normalize_label_match_text(term) for term in search_plan.terms]
+        containers = [normalize_label_match_text(container) for container in search_plan.containers]
+        forward_filters = [f'CONTAINS(LCASE(?searchLabel), "{escape_sparql_string_literal(term)}")' for term in terms]
         # ``STR()`` is required on the reverse arm and not on the forward one:
         # SPARQL argument compatibility accepts CONTAINS(lang-tagged, simple) but
         # rejects CONTAINS(simple, lang-tagged) as a type error, which FILTER then
-        # swallows as false. Without STR() every ``@ja``/``@th`` label would be
-        # invisible to reverse containment. STRLEN keeps one-character labels from
-        # matching any query that happens to contain that character.
+        # swallows as false. Without STR() every ``@ja``/``@th`` label or synonym would
+        # be invisible to reverse containment. STRLEN keeps one-character labels and
+        # synonyms from matching any query that happens to contain that character.
         reverse_filters = [
-            "(STRLEN(STR(?label)) >= 2 && "
-            f'CONTAINS("{escape_sparql_string_literal(normalize_label_match_text(container))}", '
-            "LCASE(STR(?label))))"
-            for container in search_plan.containers
+            "(STRLEN(STR(?searchLabel)) >= 2 && "
+            f'CONTAINS("{escape_sparql_string_literal(container)}", LCASE(STR(?searchLabel))))'
+            for container in containers
         ]
         filters = " || ".join(forward_filters + reverse_filters)
         graph_uri_prefix = namespace_graph_prefix(self._graph_uri_template, namespace)
@@ -845,10 +848,12 @@ class TBoxContextBuilder:
         # containment made that reachable: it matches far more classes than a
         # handful of short forward terms did, and a multilingual namespace carries
         # one label per language per class. DISTINCT plus the bounded class list
-        # keeps the class query one row per (class, label, parent).
+        # keeps the class query one row per (class, label, parent); ``?searchLabel``
+        # is not projected, so a class's synonyms add no rows.
         entity_classes_body = f"""            ?class a owl:Class .
             {_class_gate(backend)}
             ?class rdfs:label ?label .
+            ?class (rdfs:label|<{_SKOS_PREF_LABEL}>|<{_SKOS_ALT_LABEL}>) ?searchLabel .
             FILTER({filters})
             {_parent_pattern(backend)}"""
         classes_sparql = f"""
@@ -892,6 +897,15 @@ class TBoxContextBuilder:
         )
         if not matched_uris:
             return self._parse_results(class_results)
+
+        # Classes whose own label matched take the VALUES slots before classes found
+        # only through a synonym.
+        def _label_matched(label: str) -> bool:
+            text = label.lower()
+            return any(term in text for term in terms) or (len(text) >= 2 and any(text in c for c in containers))
+
+        label_matched = {row["class"] for row in class_results if _label_matched(str(row.get("label", "")))}
+        matched_uris.sort(key=lambda uri: uri not in label_matched)
 
         if len(matched_uris) > _MAX_SPARQL_VALUES_URIS:
             logger.info(

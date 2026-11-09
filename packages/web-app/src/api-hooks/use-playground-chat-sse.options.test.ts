@@ -13,22 +13,22 @@ import { describe, it, expect } from "vitest";
 import { buildOptions } from "./use-playground-chat-sse";
 
 describe("buildOptions", () => {
-  it("sends includeDebugInfo:false even when nothing else is set", () => {
-    // The Playground does NOT opt into the compiled SQL/SPARQL — those expose
-    // internal schema and are withheld by the AppSec gate (594f9c85). Keeping
-    // the flag explicitly false preserves the default-withhold posture. #1166.
-    expect(buildOptions()).toEqual({ options: { includeDebugInfo: false } });
+  it("requests the compiled artifacts even when nothing else is set", () => {
+    // The Playground asks for the SQL/SPARQL so roles allowed to see them get the
+    // "Compiled artifacts" panel by default; serve withholds them from callers
+    // without viewSource/viewOntology (the data-analyst), whatever this flag says.
+    expect(buildOptions()).toEqual({ options: { includeDebugInfo: true } });
   });
 
   it("sends mode alongside includeDebugInfo", () => {
     expect(buildOptions("deep-reasoning")).toEqual({
-      options: { mode: "deep-reasoning", includeDebugInfo: false },
+      options: { mode: "deep-reasoning", includeDebugInfo: true },
     });
   });
 
   it("sends strategy alongside includeDebugInfo", () => {
     expect(buildOptions(undefined, "ontop")).toEqual({
-      options: { strategy: "ontop", includeDebugInfo: false },
+      options: { strategy: "ontop", includeDebugInfo: true },
     });
   });
 
@@ -39,7 +39,7 @@ describe("buildOptions", () => {
       options: {
         mode: "standard",
         strategy: "ontop_first",
-        includeDebugInfo: false,
+        includeDebugInfo: true,
       },
     });
   });
@@ -48,7 +48,7 @@ describe("buildOptions", () => {
     // Guards the falsy-check: `""` must not reach the API as a pin, which serve
     // would fail to match and silently resolve to its default.
     expect(buildOptions("" as never, "" as never)).toEqual({
-      options: { includeDebugInfo: false },
+      options: { includeDebugInfo: true },
     });
   });
 });

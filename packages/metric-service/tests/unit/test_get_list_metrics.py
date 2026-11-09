@@ -51,6 +51,9 @@ def _sample_metric(name: str = "revenue") -> MetricDefinition:
     )
 
 
+_VIEWER_FLAGS = {"canViewSource": "true", "canViewOntology": "true"}
+
+
 # ── Get Metric tests ───────────────────────────────────────────────────
 
 
@@ -127,10 +130,9 @@ class TestListMetrics:
     def test_list_passes_filters(self, mock_neptune: MagicMock) -> None:
         mock_neptune.return_value.list_metrics.return_value = []
 
-        list_handler(
-            _make_list_event(query_params={"dataSourceId": "ds-x", "sourceTable": "orders"}),
-            None,
-        )
+        event = _make_list_event(query_params={"dataSourceId": "ds-x", "sourceTable": "orders"})
+        event["requestContext"]["authorizer"].update(_VIEWER_FLAGS)
+        list_handler(event, None)
 
         call_kwargs = mock_neptune.return_value.list_metrics.call_args[1]
         assert call_kwargs["data_source_id"] == "ds-x"
@@ -216,3 +218,99 @@ class TestListMetrics:
 
         assert resp["statusCode"] == 200
         assert mock_neptune.return_value.list_metrics.call_args[1]["offset"] == 2147483647
+
+
+# ── Schema-blind callers (ADR: decompose-viewnamespace-schema-visibility) ──
+
+
+def _schema_metric() -> MetricDefinition:
+    metric = _sample_metric()
+    metric.ontology_concepts = ["http://example.com/sb#SentinelOrder"]
+    return metric
+
+
+def _with_flags(event: dict, **flags: str) -> dict:
+    event["requestContext"]["authorizer"].update(flags)
+    return event
+
+
+class TestMetricSchemaVisibility:
+    """expression/sourceTable need canViewSource; ontologyConcepts needs canViewOntology."""
+
+    @patch("coa_metrics.api.get_metric._get_neptune")
+    def test_get_schema_blind_withholds_sql_table_and_concepts(self, mock_neptune: MagicMock) -> None:
+        mock_neptune.return_value.get_metric.return_value = _schema_metric()
+        resp = get_handler(_with_flags(_make_get_event(), canViewSource="false", canViewOntology="false"), None)
+        metric = json.loads(resp["body"])["metric"]
+        assert metric["name"] == "revenue" and metric["description"] == "Test metric"
+        assert metric["expression"] == {"dialects": []}
+        assert metric["sourceTable"] == ""
+        assert "ontologyConcepts" not in metric
+        assert "SUM(x)" not in resp["body"] and "orders" not in resp["body"] and "SentinelOrder" not in resp["body"]
+
+    @patch("coa_metrics.api.get_metric._get_neptune")
+    def test_get_without_any_flag_keeps_pre_flag_behaviour(self, mock_neptune: MagicMock) -> None:
+        """No flag at all = a pre-flag path (deploy window, dev without roles table):
+        withholding there would blank every caller and a save would erase fields."""
+        mock_neptune.return_value.get_metric.return_value = _schema_metric()
+        metric = json.loads(get_handler(_make_get_event(), None)["body"])["metric"]
+        assert metric["expression"]["dialects"][0]["expression"] == "SUM(x)"
+        assert metric["sourceTable"] == "orders"
+
+    @patch("coa_metrics.api.get_metric._get_neptune")
+    def test_get_one_flag_present_other_missing_withholds_the_missing_one(self, mock_neptune: MagicMock) -> None:
+        mock_neptune.return_value.get_metric.return_value = _schema_metric()
+        resp = get_handler(_with_flags(_make_get_event(), canViewSource="true"), None)
+        metric = json.loads(resp["body"])["metric"]
+        assert metric["sourceTable"] == "orders"
+        assert "ontologyConcepts" not in metric
+
+    @pytest.mark.parametrize("value", ["FALSE", "False"])
+    @patch("coa_metrics.api.get_metric._get_neptune")
+    def test_get_false_flag_case_folds_and_withholds(self, mock_neptune: MagicMock, value: str) -> None:
+        mock_neptune.return_value.get_metric.return_value = _schema_metric()
+        event = _with_flags(_make_get_event(), canViewSource=value, canViewOntology=value)
+        resp = get_handler(event, None)
+        assert resp["statusCode"] == 200
+        mock_neptune.return_value.get_metric.assert_called_once()
+        assert "SUM(x)" not in resp["body"] and "orders" not in resp["body"] and "SentinelOrder" not in resp["body"]
+
+    @pytest.mark.parametrize("value", ["TRUE", "True"])
+    @patch("coa_metrics.api.get_metric._get_neptune")
+    def test_get_true_flag_case_folds_and_keeps(self, mock_neptune: MagicMock, value: str) -> None:
+        mock_neptune.return_value.get_metric.return_value = _schema_metric()
+        event = _with_flags(_make_get_event(), canViewSource=value, canViewOntology=value)
+        resp = get_handler(event, None)
+        assert "SUM(x)" in resp["body"] and "orders" in resp["body"] and "SentinelOrder" in resp["body"]
+
+    @patch("coa_metrics.api.get_metric._get_neptune")
+    def test_get_schema_viewer_sees_full_definition(self, mock_neptune: MagicMock) -> None:
+        mock_neptune.return_value.get_metric.return_value = _schema_metric()
+        metric = json.loads(get_handler(_with_flags(_make_get_event(), **_VIEWER_FLAGS), None)["body"])["metric"]
+        assert metric["expression"]["dialects"][0]["expression"] == "SUM(x)"
+        assert metric["sourceTable"] == "orders"
+        assert metric["ontologyConcepts"] == ["http://example.com/sb#SentinelOrder"]
+
+    @patch("coa_metrics.api.get_metric._get_neptune")
+    def test_get_source_only_keeps_sql_drops_concepts(self, mock_neptune: MagicMock) -> None:
+        mock_neptune.return_value.get_metric.return_value = _schema_metric()
+        event = _with_flags(_make_get_event(), canViewSource="true", canViewOntology="false")
+        metric = json.loads(get_handler(event, None)["body"])["metric"]
+        assert metric["sourceTable"] == "orders"
+        assert "ontologyConcepts" not in metric
+
+    @patch("coa_metrics.api.list_metrics._get_neptune")
+    def test_list_schema_blind_withholds_per_metric(self, mock_neptune: MagicMock) -> None:
+        mock_neptune.return_value.list_metrics.return_value = [_schema_metric()]
+        resp = list_handler(_with_flags(_make_list_event(), canViewSource="false", canViewOntology="false"), None)
+        metrics = json.loads(resp["body"])["metrics"]
+        assert [m["name"] for m in metrics] == ["revenue"]
+        assert "SUM(x)" not in resp["body"] and "orders" not in resp["body"] and "SentinelOrder" not in resp["body"]
+
+    @patch("coa_metrics.api.list_metrics._get_neptune")
+    def test_list_source_table_filter_is_not_an_oracle(self, mock_neptune: MagicMock) -> None:
+        """Without viewSource a sourceTable filter must not reveal whether the table has metrics."""
+        mock_neptune.return_value.list_metrics.return_value = [_schema_metric()]
+        event = _with_flags(_make_list_event(query_params={"sourceTable": "orders"}), canViewSource="false")
+        assert json.loads(list_handler(event, None)["body"]) == {"metrics": []}
+        mock_neptune.return_value.list_metrics.assert_not_called()

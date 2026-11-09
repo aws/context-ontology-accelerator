@@ -194,6 +194,30 @@ describe("NamespaceDeletionPipeline", () => {
     expect(hasDirectDeleteProject).toBe(false);
   });
 
+  test("DeletePlatformFn can read the namespace record it checks before acting", () => {
+    template.hasResourceProperties("AWS::Lambda::Function", {
+      FunctionName: Match.stringLikeRegexp("ns-deletion-platform"),
+      Environment: {
+        Variables: Match.objectLike({ NAMESPACES_TABLE: Match.anyValue() }),
+      },
+    });
+    template.hasResourceProperties("AWS::IAM::Policy", {
+      PolicyDocument: {
+        Statement: Match.arrayWith([
+          Match.objectLike({
+            Action: "dynamodb:GetItem",
+            Resource: Match.objectLike({
+              "Fn::GetAtt": Match.arrayWith([
+                Match.stringLikeRegexp("Namespaces"),
+              ]),
+            }),
+          }),
+        ]),
+      },
+      PolicyName: Match.stringLikeRegexp("DeletePlatformFn"),
+    });
+  });
+
   test("DeletePlatformFn has Athena and ECS/Cloud Map delete permissions", () => {
     template.hasResourceProperties("AWS::IAM::Policy", {
       PolicyDocument: {
@@ -209,6 +233,18 @@ describe("NamespaceDeletionPipeline", () => {
         Statement: Match.arrayWith([
           Match.objectLike({
             Action: Match.arrayWith(["ecs:DeleteService"]),
+          }),
+        ]),
+      },
+    });
+  });
+
+  test("DeletePlatformFn may deregister the namespace's VKG task definitions", () => {
+    template.hasResourceProperties("AWS::IAM::Policy", {
+      PolicyDocument: {
+        Statement: Match.arrayWith([
+          Match.objectLike({
+            Action: ["ecs:ListTaskDefinitions", "ecs:DeregisterTaskDefinition"],
           }),
         ]),
       },

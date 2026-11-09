@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import sys
 import time
 
 import pytest
@@ -904,6 +905,25 @@ def _nested_subqueries(depth: int) -> str:
     return _EX + "SELECT ?s WHERE { ?s ex:name ?m FILTER EXISTS " + inner + " }"
 
 
+def _firewall_calls_to_check(depth: int) -> int:
+    """Python calls into firewall.py while checking a query nested ``depth`` deep."""
+    calls = 0
+
+    def count(frame, event, _arg):
+        nonlocal calls
+        if event == "call" and frame.f_code.co_filename == firewall.__file__:
+            calls += 1
+
+    query = _nested_subqueries(depth)
+    previous = sys.getprofile()
+    sys.setprofile(count)
+    try:
+        _check(query, denied_predicates=frozenset({_TITLE}))
+    finally:
+        sys.setprofile(previous)
+    return calls
+
+
 def _seconds(call) -> float:
     started = time.perf_counter()
     call()
@@ -916,9 +936,10 @@ class TestDeepNestingStaysLinear:
     _DEPTH = 18
     _BOUND_S = 1.0
 
-    def test_a_deeply_nested_query_is_checked_quickly(self):
-        query = _nested_subqueries(self._DEPTH)
-        assert _seconds(lambda: _check(query, denied_predicates=frozenset({_TITLE}))) < self._BOUND_S
+    def test_a_level_of_nesting_costs_no_more_calls_than_the_one_before(self):
+        """Counted, not timed: a wall-clock bound fails on a loaded machine and misses a quadratic walk."""
+        shallow, middle, deep = (_firewall_calls_to_check(depth) for depth in (2, 4, 6))
+        assert 0 < deep - middle <= middle - shallow
 
     @pytest.mark.parametrize("view", ["algebra", "parse-tree"])
     def test_every_walk_is_quick_on_both_views(self, view):

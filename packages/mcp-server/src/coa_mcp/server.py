@@ -25,6 +25,12 @@ import time
 from typing import Any, Literal
 
 import structlog
+from coa_authorization.schema_visibility import (
+    VIEW_ONTOLOGY_ACTION,
+    VIEW_SOURCE_ACTION,
+    SchemaVisibility,
+    to_authorizer_flags,
+)
 from mcp.server.fastmcp import Context, FastMCP
 
 from .audit import log_tool_invocation
@@ -132,6 +138,69 @@ async def _resolve_caller_and_profile(
     return caller, profile
 
 
+def _schema_right(profile: dict, action: str) -> bool:
+    """A schema right (``viewSource`` / ``viewOntology``) decided by ``resolve_grant``.
+
+    Read from the decisions cached on the resolved profile, so no policy is
+    reloaded. Absent means withhold (fail closed).
+    """
+    return (profile.get("schemaVisibility") or {}).get(action) is True
+
+
+def _caller_can_view_ontology(profile: dict) -> bool:
+    """Whether the caller may see ontology schema (``viewOntology``) (ADR split).
+
+    Output-suppression gate for ``translate_sparql`` / ``graph_traversal``,
+    which run for a schema-blind ``data-analyst`` (authorized on ``query`` /
+    ``traverseGraph``). Defense in depth: serve already withholds these fields.
+    """
+    return _schema_right(profile, VIEW_ONTOLOGY_ACTION)
+
+
+# Response keys withheld from a caller lacking ``viewOntology`` (ADR split). Each
+# names an all-or-nothing schema-bearing field — no per-value redaction; the whole
+# field is dropped so no ontology class/property identifier leaks to a
+# schema-blind caller through a tool they are otherwise entitled to run.
+#
+# The sibling ``trace`` field these tools also return is not withheld here:
+# serve's response scrub (coa_serve/schema_visibility.py) already strips every
+# trace step ``detail`` for a caller without the right before the response
+# reaches MCP, and the remaining step fields carry no schema identifiers. This
+# layer is the second line; if serve ever stops stripping trace details, the
+# trace must be routed through _withhold_schema_fields as well.
+_TRANSLATE_SPARQL_SCHEMA_KEYS = ("sparqlQuery",)
+_GRAPH_TRAVERSAL_SCHEMA_KEYS = ("entities", "relationships")
+
+
+def _withhold_schema_fields(result: dict, keys: tuple[str, ...]) -> dict:
+    """Blank the named schema-bearing keys in a tool result (whole-field withhold).
+
+    Replaces each present key with ``[]`` if its value is a list, otherwise with
+    ``""``, rather than deleting it, so the response keeps the Smithy output shape
+    and a client that reads the field by name does not break — it simply sees
+    nothing. Returns the same dict (mutated in place).
+    """
+    for key in keys:
+        if key in result:
+            result[key] = [] if isinstance(result[key], list) else ""
+    return result
+
+
+def _suppress_schema_unless_viewer(
+    result: dict, profile: dict, namespace_id: str, keys: tuple[str, ...], tool: str
+) -> dict:
+    """Withhold ``keys`` unless the caller holds ``viewOntology`` (ADR split).
+
+    The decision was made with the tool action in ``resolve_grant`` (one policy
+    load per call). Each withhold is logged so an operator can tell "withheld by
+    policy" from "the tool found nothing".
+    """
+    if _caller_can_view_ontology(profile):
+        return result
+    logger.info("schema_fields_withheld", tool=tool, namespace=namespace_id, fields=list(keys))
+    return _withhold_schema_fields(result, keys)
+
+
 def _extract_bearer_token(ctx: Any) -> str:
     """Extract the raw Bearer token from the request context for forwarding.
 
@@ -171,6 +240,22 @@ def _build_authorizer_context(caller: CallerIdentity, profile: dict) -> dict:
         "groups": ",".join(caller.roles),
         "globalRoles": ",".join(profile.get("globalRoles", [])),
     }
+
+
+def _metric_schema_flags(profile: dict) -> dict[str, str]:
+    """Schema-visibility flags (``canViewSource`` / ``canViewOntology``) for the metric service.
+
+    The metric service withholds metric SQL, source tables and ontology concepts
+    unless these are ``"true"``. This mirrors what the API Gateway authorizer adds
+    on ``readMetric`` requests; this path invokes the metric Lambda directly, so
+    MCP supplies the same flags, from the decisions cached by ``resolve_grant``.
+    """
+    return to_authorizer_flags(
+        SchemaVisibility(
+            source=_schema_right(profile, VIEW_SOURCE_ACTION),
+            ontology=_schema_right(profile, VIEW_ONTOLOGY_ACTION),
+        )
+    )
 
 
 # ── Discovery Tools ───────────────────────────────────────────────────
@@ -218,7 +303,12 @@ async def list_metrics(
         )
         token = _extract_bearer_token(ctx)
         lc = _get_lambda_client()
-        authz_ctx = _build_authorizer_context(caller, profile) if caller.user_id != "local-dev" else None
+        # Local dev: no authorizer context, so metric-service sees neither flag and
+        # returns full definitions (its deliberate missing-flag rule).
+        authz_ctx = None
+        if caller.user_id != "local-dev":
+            authz_ctx = _build_authorizer_context(caller, profile)
+            authz_ctx.update(_metric_schema_flags(profile))
         result = await discovery.list_metrics(
             lc,
             namespaceId,
@@ -466,6 +556,15 @@ async def translate_sparql(
         token = _extract_bearer_token(ctx)
         cm = _get_cm_client()
         result = await execution.execute_translate_sparql(cm, query, namespaceId, profile, token)
+        # Schema-blind output suppression (ADR): the generated SPARQL names
+        # ontology classes/properties. The tool is authorized on ``query`` (which
+        # a schema-blind analyst holds), so withhold the SPARQL field unless the
+        # caller separately holds ``viewOntology``. Local dev (auth disabled) is
+        # exempt so development is not blinded.
+        if config.auth_enabled:
+            result = _suppress_schema_unless_viewer(
+                result, profile, namespaceId, _TRANSLATE_SPARQL_SCHEMA_KEYS, "translate_sparql"
+            )
         duration_ms = int((time.perf_counter() - start) * 1000)
         if caller:
             log_tool_invocation(caller, "translate_sparql", namespaceId, duration_ms=duration_ms)
@@ -608,6 +707,15 @@ async def graph_traversal(
             max_results=maxResults,
             relationship_filter=relationshipFilter,
         )
+        # Schema-blind output suppression (ADR): the returned entities /
+        # relationships carry ontology class/property IRIs and labels. The tool is
+        # authorized on ``traverseGraph`` (which a schema-blind analyst holds), so
+        # withhold those fields unless the caller separately holds ``viewOntology``.
+        # Local dev (auth disabled) is exempt so development is not blinded.
+        if config.auth_enabled:
+            result = _suppress_schema_unless_viewer(
+                result, profile, namespaceId, _GRAPH_TRAVERSAL_SCHEMA_KEYS, "graph_traversal"
+            )
         duration_ms = int((time.perf_counter() - start) * 1000)
         if caller:
             log_tool_invocation(caller, "graph_traversal", namespaceId, duration_ms=duration_ms)

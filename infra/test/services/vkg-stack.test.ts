@@ -158,7 +158,7 @@ describe("VkgStack", () => {
       ContainerDefinitions: Match.arrayWith([
         Match.objectLike({
           Environment: Match.arrayWith([
-            Match.objectLike({ Name: "ONTOP_JAVA_ARGS", Value: "-Xmx1536m -Xms512m" }),
+            Match.objectLike({ Name: "ONTOP_JAVA_ARGS", Value: "-Xmx1536m -Xms512m -Dserver.address=127.0.0.1" }),
           ]),
         }),
       ]),
@@ -183,7 +183,7 @@ describe("VkgStack", () => {
         Variables: Match.objectLike({
           VKG_TASK_CPU: Match.anyValue(),
           VKG_TASK_MEMORY: Match.anyValue(),
-          VKG_ONTOP_JAVA_ARGS: "-Xmx1536m -Xms512m",
+          VKG_ONTOP_JAVA_ARGS: "-Xmx1536m -Xms512m -Dserver.address=127.0.0.1",
         }),
       },
     });
@@ -212,7 +212,7 @@ describe("VkgStack", () => {
       ContainerDefinitions: Match.arrayWith([
         Match.objectLike({
           Environment: Match.arrayWith([
-            Match.objectLike({ Name: "ONTOP_JAVA_ARGS", Value: "-Xmx6144m -Xms2048m" }),
+            Match.objectLike({ Name: "ONTOP_JAVA_ARGS", Value: "-Xmx6144m -Xms2048m -Dserver.address=127.0.0.1" }),
           ]),
         }),
       ]),
@@ -221,7 +221,104 @@ describe("VkgStack", () => {
       Environment: {
         Variables: Match.objectLike({
           VKG_TASK_MEMORY: "8192",
-          VKG_ONTOP_JAVA_ARGS: "-Xmx6144m -Xms2048m",
+          VKG_ONTOP_JAVA_ARGS: "-Xmx6144m -Xms2048m -Dserver.address=127.0.0.1",
+        }),
+      },
+    });
+  });
+
+  test("Ontop binds to loopback even when ontopJavaArgs is overridden", () => {
+    // Only translate-server talks to Ontop, over localhost:8081, and the task
+    // maps only port 8080. Binding Spring Boot to 127.0.0.1 keeps Ontop's
+    // endpoint unreachable from outside the task even if the security group
+    // or port mappings change. An override sets the other JVM args; the
+    // stack appends its loopback flag after them.
+    const app = new cdk.App({ context: TEST_CONTEXT });
+    const network = new NetworkStack(app, "OverrideNetwork");
+    const bucketStack = new cdk.Stack(app, "OverrideBucketStack");
+    const bucket = new s3.Bucket(bucketStack, "OntologyBucket", {
+      bucketName: `${PREFIX}-ontology-artifacts`,
+    });
+    const overridden = Template.fromStack(
+      new VkgStack(app, "OverrideVkg", {
+        network,
+        serviceNamespace: network.serviceNamespace,
+        ontologyBucket: bucket,
+        ontopJavaArgs: "-Xmx2g",
+      }),
+    );
+    overridden.hasResourceProperties("AWS::ECS::TaskDefinition", {
+      ContainerDefinitions: Match.arrayWith([
+        Match.objectLike({
+          Environment: Match.arrayWith([
+            Match.objectLike({
+              Name: "ONTOP_JAVA_ARGS",
+              Value: "-Xmx2g -Dserver.address=127.0.0.1",
+            }),
+          ]),
+        }),
+      ]),
+    });
+    overridden.hasResourceProperties("AWS::Lambda::Function", {
+      Environment: {
+        Variables: Match.objectLike({
+          VKG_ONTOP_JAVA_ARGS: "-Xmx2g -Dserver.address=127.0.0.1",
+        }),
+      },
+    });
+  });
+
+  test.each([
+    ["blank", ""],
+    ["whitespace-only", "   "],
+  ])("a %s ontopJavaArgs is treated as unset", (_label, value) => {
+    // A blank override must not replace the derived heap: the reload Lambda
+    // uses any non-blank VKG_ONTOP_JAVA_ARGS as the heap args, and without
+    // -Xmx the launcher would fall back to its 512m default.
+    const app = new cdk.App({ context: TEST_CONTEXT });
+    const network = new NetworkStack(app, "BlankNetwork");
+    const bucketStack = new cdk.Stack(app, "BlankBucketStack");
+    const bucket = new s3.Bucket(bucketStack, "OntologyBucket", {
+      bucketName: `${PREFIX}-ontology-artifacts`,
+    });
+    const blank = Template.fromStack(
+      new VkgStack(app, "BlankVkg", {
+        network,
+        serviceNamespace: network.serviceNamespace,
+        ontologyBucket: bucket,
+        ontopJavaArgs: value,
+      }),
+    );
+    blank.hasResourceProperties("AWS::Lambda::Function", {
+      Environment: {
+        Variables: Match.objectLike({
+          VKG_ONTOP_JAVA_ARGS: "-Xmx1536m -Xms512m -Dserver.address=127.0.0.1",
+        }),
+      },
+    });
+  });
+
+  test("an override's own -Dserver.address is superseded by the loopback flag", () => {
+    // Java keeps the last -D value for a property, so the stack's flag, which
+    // comes last, wins over one in the override.
+    const app = new cdk.App({ context: TEST_CONTEXT });
+    const network = new NetworkStack(app, "ConflictNetwork");
+    const bucketStack = new cdk.Stack(app, "ConflictBucketStack");
+    const bucket = new s3.Bucket(bucketStack, "OntologyBucket", {
+      bucketName: `${PREFIX}-ontology-artifacts`,
+    });
+    const conflicting = Template.fromStack(
+      new VkgStack(app, "ConflictVkg", {
+        network,
+        serviceNamespace: network.serviceNamespace,
+        ontologyBucket: bucket,
+        ontopJavaArgs: "-Xmx2g -Dserver.address=0.0.0.0",
+      }),
+    );
+    conflicting.hasResourceProperties("AWS::Lambda::Function", {
+      Environment: {
+        Variables: Match.objectLike({
+          VKG_ONTOP_JAVA_ARGS: Match.stringLikeRegexp(" -Dserver\\.address=127\\.0\\.0\\.1$"),
         }),
       },
     });
@@ -612,6 +709,18 @@ describe("VkgStack", () => {
     const describe = statements.find((st) => st.Action === "ecs:DescribeTasks");
     expect(describe).toBeDefined();
     expect(JSON.stringify(describe!.Resource)).toContain(":task/");
+  });
+
+  test("the reload Lambda may deregister the task-definition revisions it replaced", () => {
+    const statement = reloadStatements(template).find((st) =>
+      JSON.stringify(st.Action).includes("ecs:RegisterTaskDefinition"),
+    );
+    expect(statement?.Action).toEqual(
+      expect.arrayContaining([
+        "ecs:ListTaskDefinitions",
+        "ecs:DeregisterTaskDefinition",
+      ]),
+    );
   });
 
   test("the rollout runs after the SSM image parameter and the reload Lambda exist", () => {

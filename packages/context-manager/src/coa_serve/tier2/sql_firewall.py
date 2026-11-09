@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -38,7 +39,9 @@ from coa_common.sql_safety import (
     executable_select_shape_error,
 )
 
+from ..schema_visibility import request_schema_visibility
 from .cedar_authorizer import CedarAuthorizer, NullCedarAuthorizer, RealCedarAuthorizer
+from .strategy import is_bare_not_answerable_sql
 
 logger = structlog.get_logger(__name__)
 
@@ -80,6 +83,88 @@ _DATA_MODIFYING_NODES: tuple[type[sqlglot.exp.Expression], ...] = (
 # grant API (tableAllowlist: list[str], columnDenylist: dict[str, list[str]]).
 _TABLE_ALLOWLIST_KEY = "tableAllowlist"
 _COLUMN_DENYLIST_KEY = "columnDenylist"
+
+
+# Nodes whose presence makes a projection depend on the rows read (a column, a
+# star, an aggregate or a window); a projection with none of them is a constant.
+_DATA_DEPENDENT_NODES: tuple[type[sqlglot.exp.Expression], ...] = (
+    sqlglot.exp.Column,
+    sqlglot.exp.Star,
+    sqlglot.exp.AggFunc,
+    sqlglot.exp.Window,
+)
+
+
+def _references_a_table(parsed: sqlglot.exp.Expression | None) -> bool:
+    """Whether ``parsed`` reads at least one real table.
+
+    CTE names and table functions (``generate_series(...)``, ``UNNEST``) parse
+    as ``Table`` nodes but read no stored data, so they do not count. ``None``
+    (nothing parsed) returns False, so the caller refuses it.
+    """
+    if parsed is None:
+        return False
+    cte_names = {cte.alias_or_name.lower() for cte in parsed.find_all(sqlglot.exp.CTE)}
+    return any(
+        table.name and table.name.lower() not in cte_names and not isinstance(table.this, sqlglot.exp.Func)
+        for table in parsed.find_all(sqlglot.exp.Table)
+    )
+
+
+def _set_operation_branches(parsed: sqlglot.exp.Expression) -> list[sqlglot.exp.Expression]:
+    """The SELECT branches of a top-level (possibly nested) UNION/INTERSECT/EXCEPT."""
+    if isinstance(parsed, sqlglot.exp.SetOperation):
+        return _set_operation_branches(parsed.left) + _set_operation_branches(parsed.right)
+    if isinstance(parsed, sqlglot.exp.Subquery):
+        return _set_operation_branches(parsed.this)
+    return [parsed]
+
+
+def _is_inert_constant(projection: sqlglot.exp.Expression) -> bool:
+    """A bare number, boolean or NULL (optionally aliased): a constant that cannot spell a name."""
+    node = projection.this if isinstance(projection, sqlglot.exp.Alias) else projection
+    if isinstance(node, sqlglot.exp.Literal):
+        return not node.is_string
+    return isinstance(node, sqlglot.exp.Boolean | sqlglot.exp.Null)
+
+
+def _projects_only_constants(parsed: sqlglot.exp.Expression) -> bool:
+    """Whether any top-level (UNION) branch projects only constants, at least one text-capable.
+
+    ``SELECT 'customer_id' AS c FROM orders`` reads a table but returns only
+    text from the statement itself, so for a schema-blind caller it is the same
+    echo channel as a FROM-less SELECT. A projection is data-dependent when it
+    contains a column, star, aggregate or window; a constant that is a bare
+    number/boolean/NULL (``SELECT 1 FROM t``) cannot carry a name and is not
+    counted against the statement, but string literals and constant
+    expressions (``CHR(99) || CHR(117)``) are. One such branch is enough: a
+    UNION with a data branch still returns the constant branch's text.
+    """
+    return any(_branch_echoes_text(branch) for branch in _set_operation_branches(parsed))
+
+
+def _branch_echoes_text(branch: sqlglot.exp.Expression) -> bool:
+    if not isinstance(branch, sqlglot.exp.Select) or not branch.expressions:
+        return False
+    text_constant = False
+    for projection in branch.expressions:
+        if any(isinstance(node, _DATA_DEPENDENT_NODES) for node in projection.walk()):
+            return False
+        text_constant = text_constant or not _is_inert_constant(projection)
+    return text_constant
+
+
+def _schema_echo_reason(parsed: sqlglot.exp.Expression | None) -> str | None:
+    """Why a statement can only echo text from its own SQL, or None when it reads data."""
+    if not _references_a_table(parsed):
+        return _NO_TABLE_REASON
+    if parsed is not None and _projects_only_constants(parsed):
+        return _CONSTANT_PROJECTION_REASON
+    return None
+
+
+_NO_TABLE_REASON = "Query must read from a data source"
+_CONSTANT_PROJECTION_REASON = "Query must return data from a data source"
 
 
 def _normalized_table_allowlist(allowlist_raw: list[Any] | tuple[Any, ...] | None) -> set[str] | None:
@@ -340,6 +425,10 @@ class SQLFirewall:
         Raises:
             UnsafeSQLError: If SQL is not a safe read-only statement.
         """
+        self._parse_validated(sql, dialect)
+
+    def _parse_validated(self, sql: str, dialect: str) -> sqlglot.exp.Expression:
+        """Run every :meth:`validate` check and return the parsed statement."""
         self.check_statement_type(sql)
         if contains_mysql_executable_comment(sql, dialect):
             raise UnsafeSQLError("MySQL executable comments are not allowed")
@@ -370,6 +459,7 @@ class SQLFirewall:
             func_name = getattr(func, "name", "").lower()
             if func_name in blocked_functions:
                 raise UnsafeSQLError(f"Function not allowed: {func_name}")
+        return parsed
 
     def evaluate(
         self, sql: str, profile: dict[str, Any] | None = None, namespace: str = "", dialect: str = "trino"
@@ -403,9 +493,22 @@ class SQLFirewall:
         Raises:
             UnsafeSQLError: If SQL fails safety validation (incl. parse errors).
         """
-        self.validate(sql, dialect=dialect)
+        parsed = self._parse_validated(sql, dialect)
 
         profile = profile or {}
+        # A statement that reads no table (``SELECT 'a' UNION ALL SELECT 'b'``),
+        # or projects only constants (``SELECT 'customer_id' FROM orders``),
+        # answers no data question; for a schema-blind caller it is only a way to
+        # return schema names from the generation prompt as row values (ADR:
+        # decompose-viewnamespace-schema-visibility). Refused unless the caller
+        # holds viewSource — checked first, so a source viewer pays nothing.
+        # The one exception is the writer's NOT_ANSWERABLE refusal row, matched
+        # by its exact statement shape: its message is a constant result column,
+        # so the response scrub redacts any schema name in it for this caller.
+        if not is_bare_not_answerable_sql(sql) and not self._source_visible(namespace, profile):
+            echo_reason = _schema_echo_reason(parsed)
+            if echo_reason is not None:
+                return self._deny(echo_reason)
         allowlist_raw = profile.get(_TABLE_ALLOWLIST_KEY)
         denylist_raw = profile.get(_COLUMN_DENYLIST_KEY)
 
@@ -508,23 +611,40 @@ class SQLFirewall:
             return FirewallResult(denied=True, authorized_sql="", reason=reason)
         return FirewallResult(denied=False, authorized_sql="")
 
-    def can_view_namespace(self, namespace: str, profile: dict[str, Any] | None = None) -> bool:
-        """Whether the principal may view this namespace (``viewNamespace``) (#1166).
+    def can_view_source(self, namespace: str, profile: dict[str, Any] | None = None) -> bool:
+        """Whether the principal holds ``viewSource`` (gates the SQL artifact) (ADR)."""
+        # A lambda so a missing method surfaces inside the probe (and fails closed).
+        return self._probe_view(
+            lambda **kw: self._cedar.can_view_source(**kw), "cedar_view_source_error", namespace, profile
+        )
 
-        The SAME right that gates reading a source's table/column schema on the
-        control-plane read routes. Used to decide whether generated SQL/SPARQL
-        artifacts may be returned: a caller who can already see the schema gains
-        no new disclosure from the query that touches it. Fails CLOSED — any
-        evaluator error returns False, so artifacts are withheld on error rather
-        than leaked. Delegates to the single ``CedarAuthorizer`` so the artifact
-        gate shares the query gate's policy source and fail-closed posture.
+    def can_view_ontology(self, namespace: str, profile: dict[str, Any] | None = None) -> bool:
+        """Whether the principal holds ``viewOntology`` (gates the SPARQL artifact) (ADR)."""
+        return self._probe_view(
+            lambda **kw: self._cedar.can_view_ontology(**kw), "cedar_view_ontology_error", namespace, profile
+        )
+
+    def _source_visible(self, namespace: str, profile: dict[str, Any]) -> bool:
+        """``viewSource`` for this request: the entrypoint's resolved decision, else a fail-closed probe."""
+        ns = namespace or str(profile.get("namespace", ""))
+        vis = request_schema_visibility(ns)
+        return vis.source if vis is not None else self.can_view_source(ns, profile)
+
+    def _probe_view(
+        self, probe: Callable[..., bool], error_event: str, namespace: str, profile: dict[str, Any] | None
+    ) -> bool:
+        """Ask the single ``CedarAuthorizer`` a schema-view question, failing CLOSED.
+
+        Shares the query gate's policy source. The namespace falls back to the
+        profile's when not passed. Any evaluator error returns False, so the
+        artifact is withheld on error rather than leaked.
         """
         ns = namespace or str((profile or {}).get("namespace", ""))
         try:
-            return self._cedar.can_view_namespace(namespace=ns, profile=profile or {})
+            return bool(probe(namespace=ns, profile=profile or {}))
         except Exception as exc:
             logger.warning(
-                "cedar_view_namespace_error",
+                error_event,
                 namespace=ns,
                 error=type(exc).__name__,
                 error_msg=str(exc),

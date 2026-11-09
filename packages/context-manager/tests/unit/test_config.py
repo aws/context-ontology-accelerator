@@ -13,6 +13,10 @@ from coa_serve.config import ServiceConfig, load_config
 
 @pytest.mark.unit
 class TestLoadConfig:
+    @pytest.fixture(autouse=True)
+    def _clean_env(self, monkeypatch):
+        monkeypatch.delenv("SERVE_GUARDRAILS_DISABLED", raising=False)
+
     @patch("coa_serve.config.boto3")
     def test_loads_config_with_ssm(self, mock_boto3):
         mock_ssm = MagicMock()

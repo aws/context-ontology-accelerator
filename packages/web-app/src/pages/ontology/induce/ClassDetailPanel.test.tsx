@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import React from "react";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, it, expect, vi } from "vitest";
 import { ClassDetailPanel, type ClassGroup } from "./ClassDetailPanel";
-import type { TurtleEntity } from "./turtle";
+import { parseTurtleEntities, type TurtleEntity } from "./turtle";
+import { parseVocabulary } from "./vocabulary";
 import { parseR2rmlByClass, type ConceptMatch } from "./grounding";
 
 const classEntity: TurtleEntity = {
@@ -358,5 +359,139 @@ ex:Policy a owl:Class ;
     fireEvent.click(screen.getByText("Edit raw Turtle"));
     expect(container.querySelector("textarea")).toBeTruthy();
     expect(container.querySelector("textarea")?.value).toContain("owl:Class");
+  });
+
+  it("reviews the vocabulary of this class and its own properties only", () => {
+    const fullTurtle = `@prefix ex: <http://example.com/> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+
+ex:Claim a owl:Class ;
+    rdfs:label "Claim" ;
+    skos:altLabel "Insurance claim"@en .
+
+ex:amount a owl:DatatypeProperty ;
+    rdfs:label "amount" ;
+    rdfs:domain ex:Claim ;
+    skos:altLabel "claim amount"@en .
+
+ex:Policy a owl:Class ;
+    rdfs:label "Policy" ;
+    skos:altLabel "Contract"@en .`;
+    const onUpdateTurtle = vi.fn();
+    render(
+      <ClassDetailPanel
+        group={group}
+        r2rml={null}
+        prelude={`@prefix ex: <http://example.com/> .`}
+        fullTurtle={fullTurtle}
+        isReadOnly={false}
+        onSave={vi.fn()}
+        onUpdateTurtle={onUpdateTurtle}
+      />,
+    );
+    const table = screen.getByRole("table", { name: "Business vocabulary" });
+    expect(within(table).getByText("Insurance claim @en")).toBeTruthy();
+    expect(within(table).getByText("claim amount @en")).toBeTruthy();
+    expect(within(table).queryByText("Contract @en")).toBeNull();
+
+    fireEvent.click(
+      within(table).getByRole("button", {
+        name: "Reject variant claim amount @en",
+      }),
+    );
+    expect(onUpdateTurtle).toHaveBeenCalledTimes(1);
+    const concepts = parseVocabulary(onUpdateTurtle.mock.calls[0][0]);
+    const variants = (id: string) =>
+      concepts
+        .find((concept) => concept.id === id)
+        ?.alternativeLabels.map((l) => `${l.value}@${l.language}`);
+    expect(variants("http://example.com/amount")).toEqual([]);
+    expect(variants("http://example.com/Claim")).toEqual([
+      "Insurance claim@en",
+    ]);
+    expect(variants("http://example.com/Policy")).toEqual(["Contract@en"]);
+  });
+
+  it("finds the terms by the IRIs n3 resolved, whatever the prefix form", () => {
+    const fullTurtle = `PREFIX : <http://example.com/>
+PREFIX owl: <http://www.w3.org/2002/07/owl#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+
+:Claim a owl:Class ;
+    rdfs:label "Claim" ;
+    skos:altLabel "Insurance claim"@en .
+
+<http://example.com/amount> a owl:DatatypeProperty ;
+    rdfs:label "amount" ;
+    rdfs:domain :Claim .`;
+    const { entities, prelude } = parseTurtleEntities(fullTurtle);
+    const claim = entities.find((e) => e.fullSubject === ":Claim")!;
+    const amount = entities.find(
+      (e) => e.fullSubject === "<http://example.com/amount>",
+    )!;
+    render(
+      <ClassDetailPanel
+        group={{
+          ...group,
+          classEntity: claim,
+          relationships: [],
+          attributes: [amount],
+        }}
+        r2rml={null}
+        prelude={prelude}
+        fullTurtle={fullTurtle}
+        isReadOnly={false}
+        onSave={vi.fn()}
+        onUpdateTurtle={vi.fn()}
+      />,
+    );
+    const table = screen.getByRole("table", { name: "Business vocabulary" });
+    expect(within(table).getByText("Insurance claim @en")).toBeTruthy();
+    expect(
+      within(table).getByRole("button", { name: "Add variant to amount" }),
+    ).toBeTruthy();
+  });
+
+  it("holds vocabulary edits while the label or description has unapplied changes", () => {
+    const fullTurtle = `@prefix ex: <http://example.com/> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+
+ex:Claim a owl:Class ;
+    rdfs:label "Claim" ;
+    skos:altLabel "Insurance claim"@en .`;
+    render(
+      <ClassDetailPanel
+        group={group}
+        r2rml={null}
+        prelude={`@prefix ex: <http://example.com/> .`}
+        fullTurtle={fullTurtle}
+        isReadOnly={false}
+        onSave={vi.fn()}
+        onUpdateTurtle={vi.fn()}
+      />,
+    );
+    const table = () =>
+      screen.getByRole("table", { name: "Business vocabulary" });
+    expect(
+      within(table()).getByRole("button", {
+        name: "Reject variant Insurance claim @en",
+      }),
+    ).toBeTruthy();
+
+    fireEvent.change(screen.getByDisplayValue("Claim"), {
+      target: { value: "Claim draft" },
+    });
+
+    expect(within(table()).queryAllByRole("button")).toHaveLength(0);
+    expect(
+      screen.getByText(
+        "Apply the changes above before editing the vocabulary.",
+      ),
+    ).toBeTruthy();
   });
 });

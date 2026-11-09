@@ -29,18 +29,67 @@ pytestmark = pytest.mark.unit
 VALID_NS_ID = "550e8400-e29b-41d4-a716-446655440000"
 
 
-def _event_me(email: str = "alice@company.com", groups: str = "") -> dict:
+def _event_me(email: str = "alice@company.com", groups: str = "", view_source_namespaces: str | None = "*") -> dict:
+    # Default to a platform-wide source viewer so the serialization tests see the
+    # full grant shape; withholding is covered in TestListPrincipalGrantsSchemaVisibility.
+    authorizer: dict[str, str] = {"email": email, "groups": groups}
+    if view_source_namespaces is not None:
+        authorizer["viewSourceNamespaces"] = view_source_namespaces
     return {
         "httpMethod": "GET",
         "resource": "/principals/{principalId}/grants",
         "pathParameters": {"principalId": "me"},
-        "requestContext": {
-            "authorizer": {
-                "email": email,
-                "groups": groups,
-            }
-        },
+        "requestContext": {"authorizer": authorizer},
     }
+
+
+class TestListPrincipalGrantsSchemaVisibility:
+    """The handler routes the caller's own listing through withhold_principal_grant_overrides."""
+
+    @staticmethod
+    def _item(resource_id: str) -> dict:
+        return {
+            "PK": f"Namespace::{resource_id}#User::alice@company.com",
+            "SK": "ROLE#analyst",
+            "resourceId": resource_id,
+            "principalType": "User",
+            "principalId": "alice@company.com",
+            "role": "analyst",
+            "grantedBy": "bob@company.com",
+            "grantedAt": "2026-04-09T10:00:00Z",
+            "tableAllowlist": [f"sentinel_tbl_{resource_id}"],
+            "columnDenylist": {"t": [f"sentinel_col_{resource_id}"]},
+            "allowedMetrics": ["revenue"],
+        }
+
+    def _run(self, mock_dao_cls, resource_ids: list[str], view_source_namespaces: str | None) -> dict[str, dict]:
+        mock_dao_cls.return_value.query.return_value = PaginatedResult(items=[self._item(r) for r in resource_ids])
+        resp = handler(_event_me(view_source_namespaces=view_source_namespaces), None)
+        assert resp["statusCode"] == 200
+        mock_dao_cls.return_value.query.assert_called()
+        return {g["namespaceId"]: g for g in json.loads(resp["body"])["grants"]}
+
+    @pytest.mark.parametrize(
+        ("view_source_namespaces", "kept"),
+        [
+            ("*", {"ns-1", "ns-2", "GLOBAL"}),  # platform-wide viewSource: every grant
+            ("ns-1", {"ns-1"}),  # GLOBAL grant is stripped without "*"
+            ("ns-1,*", {"ns-1", "ns-2", "GLOBAL"}),
+            ("", set()),
+            (None, set()),  # key missing: fail closed
+        ],
+    )
+    @patch("coa_control_plane.grants.list_principal_grants_handler.DynamoDBDAO")
+    def test_overrides_follow_view_source_namespaces(self, mock_dao_cls, view_source_namespaces, kept):
+        grants = self._run(mock_dao_cls, ["ns-1", "ns-2", "GLOBAL"], view_source_namespaces)
+        assert set(grants) == {"ns-1", "ns-2", "GLOBAL"}
+        for ns, grant in grants.items():
+            assert grant["allowedMetrics"] == ["revenue"]
+            has = "tableAllowlist" in grant or "columnDenylist" in grant
+            assert has is (ns in kept), ns
+        body = json.dumps(grants)
+        for ns in {"ns-1", "ns-2", "GLOBAL"} - kept:
+            assert f"sentinel_tbl_{ns}" not in body and f"sentinel_col_{ns}" not in body
 
 
 def _event_me_claims(email: str = "alice@company.com", groups: str = "") -> dict:

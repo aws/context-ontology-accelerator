@@ -35,7 +35,9 @@ The Cedar namespace for all COA entities is `COA`.
 | Action | Category | Description |
 |--------|----------|-------------|
 | `list` | Discovery | Enumerate resources the principal can see |
-| `viewNamespace` | Read | View namespace details and child resources |
+| `viewNamespace` | Read | View the namespace itself: metadata, roles and grants |
+| `viewSource` | Read | View source schema: source configuration, tables and columns, compiled SQL, metric SQL and source tables |
+| `viewOntology` | Read | View ontology schema: ontologies, classes and properties, proposals and induction, the graph explorer, generated SPARQL, graph context |
 | `query` | Read | Execute data queries |
 | `readMetric` | Read | Read metric definitions |
 | `searchDocuments` | Read | Search document sources |
@@ -87,11 +89,17 @@ Allows everything, everywhere.
 permit (principal, action == SCL::Action::"viewNamespace", resource)
 when { principal.globalRoles.contains("platform-viewer") };
 
+permit (principal, action == SCL::Action::"viewSource", resource)
+when { principal.globalRoles.contains("platform-viewer") };
+
+permit (principal, action == SCL::Action::"viewOntology", resource)
+when { principal.globalRoles.contains("platform-viewer") };
+
 permit (principal, action == SCL::Action::"query", resource)
 when { principal.globalRoles.contains("platform-viewer") };
 ```
 
-Read-only access across all namespaces.
+Read-only access across all namespaces, including source and ontology schema. (Abbreviated: the shipped policy also permits the other read actions.)
 
 ### `namespace-owner` (scoped)
 
@@ -109,11 +117,13 @@ Full access, but only when the resource's `id` matches the namespace where the r
 
 ### `data-steward` (scoped)
 
-Permits `manageSource`, `manageOntology`, `manageMetric`, `query`, `readMetric`, `searchDocuments`, `viewNamespace`, and `list` — all scoped to the granted namespace.
+Permits `manageSource`, `manageOntology`, `manageMetric`, `query`, `readMetric`, `searchDocuments`, `viewNamespace`, `viewSource`, `viewOntology`, and `list` — all scoped to the granted namespace.
 
 ### `data-analyst` (scoped)
 
-Permits `query`, `readMetric`, `searchDocuments`, `viewNamespace`, and `list` — read-only access scoped to the granted namespace.
+Permits `query`, `readMetric`, `searchDocuments`, `translateQuery`, `traverseGraph`, `viewNamespace`, and `list` — scoped to the granted namespace.
+
+The role is **schema-blind**: it holds neither `viewSource` nor `viewOntology`. An analyst can run queries and read metrics, and receives results only — result rows, the answer and confidence. Source and ontology schema is withheld everywhere: the Sources, Ontology and graph pages return 403, and query, translate, graph-traversal and metric responses omit compiled SQL, generated SPARQL, table lists, graph context, trace step details, metric SQL and source tables.
 
 ### `default` (all users)
 
@@ -177,3 +187,8 @@ Set `ALLOW_WITHOUT_ROLES=true` on the authorizer Lambda in a **dev-only** enviro
 ## Reference
 
 - [Cedar language specification](https://docs.cedarpolicy.com/policies/syntax-policy.html)
+
+## Upgrading custom policies: `viewSource` and `viewOntology`
+
+Source and ontology reads used to be authorized by `viewNamespace`. They now require `viewSource` (source configuration, tables, scans, OSI metric export) or `viewOntology` (ontologies, proposals, induction, graph, `describe_schema`). The built-in roles are updated on deploy. A **custom** policy that granted `viewNamespace` to let a role read sources or ontologies will get 403 on those reads after upgrading: add explicit `viewSource` and/or `viewOntology` permits to keep that access, or leave them out to make the role schema-blind.
+

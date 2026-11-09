@@ -1,6 +1,6 @@
 {
   "name": "coa-web-app",
-  "version": "0.3.9",
+  "version": "0.3.10",
   "private": true,
   "type": "module",
   "scripts": {
@@ -30,6 +30,7 @@
     "d3-force": "3.0.0",
     "eventsource-parser": "^3.1.0",
     "marked": "^18.0.4",
+    "n3": "1.26.0",
     "oidc-client-ts": "^3.1.0",
     "react": "^18.3.0",
     "react-dom": "^18.3.0",
@@ -46,6 +47,7 @@
     "@testing-library/user-event": "^14.6.1",
     "@types/d3-force": "3.0.10",
     "@types/marked": "^6.0.0",
+    "@types/n3": "1.26.5",
     "@types/node": "^22.19.21",
     "@types/react": "^18.3.0",
     "@types/react-dom": "^18.3.0",

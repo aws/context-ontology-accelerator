@@ -18,6 +18,7 @@ import Modal from "@cloudscape-design/components/modal";
 import Input from "@cloudscape-design/components/input";
 import FormField from "@cloudscape-design/components/form-field";
 import Spinner from "@cloudscape-design/components/spinner";
+import { isMetricDefinitionWithheld } from "../api-hooks/metric-withheld";
 import { useGetMetric, useDeleteMetric } from "../api-hooks/use-metrics";
 import { useSourceNameById } from "../api-hooks/use-source-name-by-id";
 import { useAppI18n } from "../i18n/LocaleProvider";
@@ -92,6 +93,15 @@ export const MetricDetail: React.FC = () => {
     return <Alert type="warning">{t("Metric not found.")}</Alert>;
   }
 
+  // Withheld for a role without source-schema visibility: say so rather than
+  // render a blank source table and an empty expressions table.
+  const definitionWithheld = isMetricDefinitionWithheld(metric);
+  const withheldNotice = (
+    <Alert type="info" data-testid="metric-source-withheld">
+      {t("Your role doesn't include access to this metric's source schema.")}
+    </Alert>
+  );
+
   return (
     <SpaceBetween size="l">
       {/* Overview */}
@@ -161,55 +171,62 @@ export const MetricDetail: React.FC = () => {
 
       {/* Source */}
       <Container header={<Header variant="h2">{t("Source")}</Header>}>
-        <ColumnLayout columns={3} variant="text-grid">
-          <div>
-            <Box variant="awsui-key-label">{t("Data source")}</Box>
+        <SpaceBetween size="m">
+          {definitionWithheld && withheldNotice}
+          <ColumnLayout columns={3} variant="text-grid">
             <div>
-              {metric.dataSourceId
-                ? (sourceNameById.get(metric.dataSourceId) ??
-                  metric.dataSourceId)
-                : "—"}
+              <Box variant="awsui-key-label">{t("Data source")}</Box>
+              <div>
+                {metric.dataSourceId
+                  ? (sourceNameById.get(metric.dataSourceId) ??
+                    metric.dataSourceId)
+                  : "—"}
+              </div>
             </div>
-          </div>
-          <div>
-            <Box variant="awsui-key-label">{t("Source table")}</Box>
-            <div>{metric.sourceTable}</div>
-          </div>
-          <div>
-            <Box variant="awsui-key-label">{t("Time grain")}</Box>
-            <div>{metric.defaultTimeGrain ?? "—"}</div>
-          </div>
-        </ColumnLayout>
+            <div>
+              <Box variant="awsui-key-label">{t("Source table")}</Box>
+              <div>{metric.sourceTable || "—"}</div>
+            </div>
+            <div>
+              <Box variant="awsui-key-label">{t("Time grain")}</Box>
+              <div>{metric.defaultTimeGrain ?? "—"}</div>
+            </div>
+          </ColumnLayout>
+        </SpaceBetween>
       </Container>
 
       {/* Expressions */}
       <Container header={<Header variant="h2">{t("Expressions")}</Header>}>
-        <Table
-          items={metric.expression?.dialects ?? []}
-          columnDefinitions={[
-            {
-              id: "dialect",
-              header: t("Dialect"),
-              cell: (item) => <Badge>{item.dialect}</Badge>,
-              width: 150,
-            },
-            {
-              id: "expression",
-              header: t("SQL Expression"),
-              cell: (item) => (
-                <code
-                  style={{
-                    fontFamily: "monospace",
-                    whiteSpace: "pre-wrap",
-                  }}
-                >
-                  {item.expression}
-                </code>
-              ),
-            },
-          ]}
-          variant="embedded"
-        />
+        {definitionWithheld ? (
+          withheldNotice
+        ) : (
+          <Table
+            items={metric.expression?.dialects ?? []}
+            columnDefinitions={[
+              {
+                id: "dialect",
+                header: t("Dialect"),
+                cell: (item) => <Badge>{item.dialect}</Badge>,
+                width: 150,
+              },
+              {
+                id: "expression",
+                header: t("SQL Expression"),
+                cell: (item) => (
+                  <code
+                    style={{
+                      fontFamily: "monospace",
+                      whiteSpace: "pre-wrap",
+                    }}
+                  >
+                    {item.expression}
+                  </code>
+                ),
+              },
+            ]}
+            variant="embedded"
+          />
+        )}
       </Container>
 
       {/* AI Context */}

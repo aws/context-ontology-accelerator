@@ -343,7 +343,12 @@ _FAKE_AWS = textwrap.dedent(
         for (( i = 1; i <= n; i++ )); do
           printf 'arn:aws:ecs:us-east-1:123456789012:service/coa-dev-vkg-cluster/coa-dev-vkg-ns%s\t' "$i"
         done ;;
-      *"ecs update-service"*|*"ecs delete-service"*) echo '{}' ;;
+      *"ecs update-service"*|*"ecs delete-service"*|*"ecs deregister-task-definition"*) echo '{}' ;;
+      *"ecs list-task-definitions"*)  # the template family is CloudFormation's
+        [ "$S" = vkg_taskdefsdenied ] && { echo "An error occurred (AccessDeniedException)" >&2; exit 254; }
+        td=arn:aws:ecs:us-east-1:123456789012:task-definition
+        [ "$S" = vkg_taskdefs ] && printf '%s\t' "$td/coa-dev-vkg-service:7" "$td/coa-dev-vkg-ns1:1" \
+          "$td/coa-dev-vkg-ns1:2" "$td/coa-dev-vkg-ns10:1" ;;
       *"ecs describe-services"*)
         if [ "$(grep -o 'service/coa-dev-vkg-cluster/' <<< "$a" | wc -l)" -gt 10 ]; then
           echo "An error occurred (InvalidParameterException) when calling the DescribeServices operation:" \
@@ -1460,3 +1465,20 @@ def test_an_error_that_only_mentions_cluster_not_found_is_retried(tmp_path: Path
     assert "describe-services failed: An error occurred (AccessDeniedException)" in output
     assert "no longer exists" not in output
     assert "All VKG services INACTIVE." in output
+
+
+def test_the_namespaces_task_definitions_are_deregistered_once_each(tmp_path: Path) -> None:
+    code, output, calls = _run(tmp_path, "vkg_taskdefs")
+    assert code == 0, output
+    deregistered = re.findall(r"deregister-task-definition --task-definition \S+/(\S+)", calls)
+    assert sorted(deregistered) == sorted(["coa-dev-vkg-ns1:1", "coa-dev-vkg-ns1:2", "coa-dev-vkg-ns10:1"])
+    assert "Deregistered 3 VKG task definition(s)." in output
+
+
+def test_a_failed_listing_ends_with_the_warning_not_the_success_line(tmp_path: Path) -> None:
+    code, output, calls = _run(tmp_path, "vkg_taskdefsdenied")
+    assert code == 0, output  # leftover revisions don't block the teardown
+    assert "Could not list the VKG task definitions" in output
+    assert "1 VKG task-definition listing(s) or deregistration(s) failed" in output
+    assert "Deregistered 0 VKG task definition(s)" not in output
+    assert "ecs deregister-task-definition" not in calls

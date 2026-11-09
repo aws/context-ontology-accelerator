@@ -234,16 +234,18 @@ def _paginated_query_all(dao: DynamoDBDAO, params: QueryParams) -> list[dict[str
 
 
 def teardown_vkg_service(namespace_id: str) -> None:
-    """Delete VKG ECS service + Cloud Map entry for a namespace.
+    """Delete a namespace's VKG ECS service, task definitions and Cloud Map entry.
 
     Steps:
     1. Delete ECS service (force=True stops running tasks), then confirm it
        is no longer ACTIVE
-    2. Deregister Cloud Map instances + delete Cloud Map service
+    2. Deregister the service's task-definition revisions
+    3. Deregister Cloud Map instances + delete Cloud Map service
 
     Raises on any failure other than "already gone" so the deletion
     pipeline's DeletePlatform step fails retryably instead of orphaning a
     running service. Safe to re-run after a partial or completed teardown.
+    Step 2 only logs its failures: a leftover revision costs nothing.
     """
     region = os.environ.get("AWS_REGION", "us-east-1")
     prefix = os.environ.get("RESOURCE_PREFIX", "").rstrip("-")
@@ -257,6 +259,7 @@ def teardown_vkg_service(namespace_id: str) -> None:
     ecs_client = boto3.client("ecs", region_name=region, config=async_boto_config())
     service_name = f"{prefix}-vkg-{namespace_id}" if prefix else f"vkg-{namespace_id}"
     _delete_vkg_ecs_service(ecs_client, cluster_arn, service_name, namespace_id)
+    _deregister_vkg_task_definitions(ecs_client, namespace_id, service_name)
 
     if not cloud_map_ns_id:
         return
@@ -327,6 +330,36 @@ def _find_cloud_map_service_id(sd_client: Any, cloud_map_ns_id: str, service_nam
             if svc["Name"] == service_name:
                 return svc["Id"]
     return None
+
+
+def _deregister_vkg_task_definitions(ecs_client: Any, namespace_id: str, family: str) -> None:
+    """Deregister every ACTIVE revision the VKG reload Lambda registered for the namespace. Best-effort.
+
+    The family is named like the service. ``familyPrefix`` is a prefix match, so
+    the exact family is compared on each ARN.
+    """
+    arns: list[str] = []
+    done = 0
+    try:
+        arns = [
+            arn
+            for page in ecs_client.get_paginator("list_task_definitions").paginate(familyPrefix=family, status="ACTIVE")
+            for arn in page.get("taskDefinitionArns", [])
+            if arn.rpartition("/")[2].rpartition(":")[0] == family
+        ]
+        for arn in arns:
+            ecs_client.deregister_task_definition(taskDefinition=arn)
+            done += 1
+        logger.info("vkg_task_definitions_deregistered", namespace_id=namespace_id, count=len(arns))
+    except Exception as e:
+        logger.error(
+            "vkg_task_definitions_deregister_failed",
+            namespace_id=namespace_id,
+            family=family,
+            deregistered=done,
+            listed=len(arns),
+            error_type=type(e).__name__,
+        )
 
 
 def delete_graphrag_indexes(namespace_id: str) -> list[str]:

@@ -19,6 +19,7 @@ from coa_common.response import api_response
 
 from coa_metrics.api.contract import check_metric_name
 from coa_metrics.api.create_metric import _metric_to_dict
+from coa_metrics.api.schema_visibility import visibility_from_event, withhold_metric_schema
 from coa_metrics.neptune_client import MetricNeptuneClient
 
 setup_logging(os.environ.get("LOG_LEVEL", "INFO"))
@@ -50,4 +51,4 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     if metric is None:
         return api_response(404, {"message": "Metric not found in namespace"})
 
-    return api_response(200, {"metric": _metric_to_dict(metric)})
+    return api_response(200, {"metric": withhold_metric_schema(_metric_to_dict(metric), visibility_from_event(event))})

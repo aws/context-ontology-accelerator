@@ -375,6 +375,14 @@ class AccumulatedContext:
     # the answer-stability signal compares only replies the context grew between.
     # Per fork, starting at 0.
     content_version: int = 0
+    # options.sqlRevision: the latest SQL of this (sub-)question and a preview of its rows.
+    last_sql: Any = None
+    # options.sqlInAnswer / sqlRevision: every SQL query that returned rows (shared
+    # with forks) and whether the answer step is shown them.
+    sql_log: list = field(default_factory=list)
+    sql_in_answer: bool = False
+    # Whether the answer step may name the tables and columns behind the rows.
+    schema_visible: bool = False
 
     def _record_relationship_cap(self, dropped_in_merge: int) -> None:
         """Record the first relationship-cap event for this request context."""
@@ -431,6 +439,16 @@ class AccumulatedContext:
         self.entity_positions = {}
         for index, existing in enumerate(self.entities):
             self.entity_positions.setdefault(_entity_key(existing), index)
+
+    def replace_rows(self, result: ToolResult) -> int:
+        """Drop every structured row gathered so far, then :meth:`add` ``result``.
+
+        Used when a SQL result was rejected and rewritten (options.sqlResultCheck):
+        the rejected rows must not reach the answer beside the new ones.
+        """
+        self.seen_keys -= {_row_key(row) for row in self.rows}
+        self.rows = []
+        return self.add(result)
 
     def add_document_matches(self, matches: list[dict]) -> None:
         """Merge ``matches`` into :attr:`document_matches` by key, keeping the better entry.
@@ -525,6 +543,10 @@ class AccumulatedContext:
             sufficiency_guards=self.sufficiency_guards,
             single_call_steps=self.single_call_steps,
             pending_sql=self.pending_sql,
+            last_sql=self.last_sql,
+            sql_log=self.sql_log,
+            sql_in_answer=self.sql_in_answer,
+            schema_visible=self.schema_visible,
         )
 
     def merge(self, other: AccumulatedContext) -> int:
