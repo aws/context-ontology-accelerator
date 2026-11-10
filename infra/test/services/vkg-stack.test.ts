@@ -540,6 +540,31 @@ describe("VkgStack", () => {
     expect(sources).toContain("sclz.ontology");
   });
 
+  test("reload rule of a non-default prefix does not match the default deployment's source", () => {
+    // `coa.ontology` is what a default-prefix deployment emits. Matching it in
+    // another deployment provisions VKG services there for namespaces it does
+    // not own, and its namespace teardown never deletes them.
+    const app = new cdk.App({
+      context: { ...TEST_CONTEXT, resource_prefix: "sclz" },
+    });
+    const network = new NetworkStack(app, "IsoNetwork");
+    const isoBucketStack = new cdk.Stack(app, "IsoBucketStack");
+    const isoBucket = new s3.Bucket(isoBucketStack, "OntologyBucket", {
+      bucketName: "sclz-dev-ontology-artifacts",
+    });
+    const stack = new VkgStack(app, "IsoVkg", {
+      network,
+      serviceNamespace: network.serviceNamespace,
+      ontologyBucket: isoBucket,
+    });
+    Template.fromStack(stack).hasResourceProperties("AWS::Events::Rule", {
+      EventPattern: {
+        source: ["sclz.ontology"],
+        "detail-type": ["ontology.published"],
+      },
+    });
+  });
+
   // ── Scheduled reload sweep ────────────────────────────────────────
 
   test("schedules a weekly VKG reload sweep invoking the reload Lambda with {sweep:true}", () => {
