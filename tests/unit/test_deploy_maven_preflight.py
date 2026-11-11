@@ -56,7 +56,6 @@ exit {exit_code}""",
 
 # System dirs may hold a real mvn or java (GitHub's ubuntu-latest has /usr/bin/mvn); mask them so only the stubs run.
 _SYSTEM_DIRS = ("/usr/bin", "/bin")
-_JAVA_ENV = ("JAVA_HOME", "MAVEN_HOME", "M2_HOME")
 
 
 def _run(bin_dir: Path, *, path_java: Path | None = None) -> subprocess.CompletedProcess[str]:
@@ -65,28 +64,35 @@ def _run(bin_dir: Path, *, path_java: Path | None = None) -> subprocess.Complete
     if path_java is not None:
         search.append(str(path_java / "bin"))
     search += _without_tools(bin_dir.parent, _SYSTEM_DIRS, ("mvn", "java"))
-    env = {key: value for key, value in os.environ.items() if key not in _JAVA_ENV}
     return subprocess.run(
         ["/bin/bash", str(_SCRIPT)],
         cwd=_ROOT,
-        env={**env, "PATH": os.pathsep.join(search)},
+        env={**os.environ, "PATH": os.pathsep.join(search)},
         capture_output=True,
         text=True,
         check=False,
     )
 
 
-def _without_tools(tmp_path: Path, entries: Iterable[str], tools: tuple[str, ...]) -> list[str]:
-    """``entries``, each directory holding one of ``tools`` replaced by a copy of it without them."""
+def _without_tools(tmp_path: Path, entries: Iterable[str], hidden: tuple[str, ...]) -> list[str]:
+    """``entries``, each directory holding one of ``hidden`` replaced by a copy of it without them.
+
+    A directory seen before under another path (merged /usr: /bin -> /usr/bin) is dropped.
+    """
     dirs = []
+    seen = set()
     for i, entry in enumerate(d for d in entries if d):
-        if not any((Path(entry) / tool).exists() for tool in tools):
+        real = os.path.realpath(entry)
+        if real in seen:
+            continue
+        seen.add(real)
+        if not any((Path(entry) / name).exists() for name in hidden):
             dirs.append(entry)
             continue
-        shadow = Path(tempfile.mkdtemp(prefix=f"without-{'-'.join(tools)}-{i}-", dir=tmp_path))
-        for tool in Path(entry).iterdir():
-            if tool.name not in tools:
-                (shadow / tool.name).symlink_to(tool)
+        shadow = Path(tempfile.mkdtemp(prefix=f"without-{'-'.join(hidden)}-{i}-", dir=tmp_path))
+        for child in Path(entry).iterdir():
+            if child.name not in hidden:
+                (shadow / child.name).symlink_to(child)
         dirs.append(str(shadow))
     return dirs
 

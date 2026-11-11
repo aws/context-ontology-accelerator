@@ -47,8 +47,7 @@ class MCPConfig(BaseSettings):
     mcp_host: str = "0.0.0.0"
     mcp_port: int = 8000
 
-    # Auth. False is a local-dev switch only; the validator below refuses it
-    # inside the deployed container.
+    # Auth
     auth_enabled: bool = True
 
     @model_validator(mode="after")

@@ -1525,6 +1525,25 @@ class TestDeleteAllNamespaceItemsS3Sweep:
         assert not any(key.startswith(prefix) for (_b, key) in s3.objects)
         assert any(key.startswith("jobs/other-ns/") for (_b, key) in s3.objects)
 
+    def test_sweeps_proposal_artifacts_and_ontology_uploads(self, fake_dynamo):
+        from coa_ontology import dynamo_store as ds
+
+        ns = "sweep-ns"
+        s3 = ds._get_s3()
+        for owner in (ns, "sweep-ns-2", "other-ns"):
+            ds._put_artifact_s3(owner, "p1", "ontology", "@prefix : <urn:x#> .", version="original")
+            ds._put_artifact_s3(owner, "p1", "ontology", "@prefix : <urn:x#> .")
+            s3.put_object(Bucket=ds._S3_BUCKET, Key=f"ontology-uploads/{owner}/u1/o.ttl", Body=b"x")
+
+        ds.delete_all_namespace_items(ns)
+
+        left = {key for (_b, key) in s3.objects}
+        assert not any(key.startswith((f"proposals/{ns}/", f"ontology-uploads/{ns}/")) for key in left)
+        # Another namespace, including one whose name starts with this one's, is untouched.
+        for owner in ("sweep-ns-2", "other-ns"):
+            assert any(key.startswith(f"proposals/{owner}/") for key in left)
+            assert f"ontology-uploads/{owner}/u1/o.ttl" in left
+
     def test_s3_failure_does_not_block_ddb_delete(self, fake_dynamo, monkeypatch):
         from botocore.exceptions import BotoCoreError
         from coa_ontology import dynamo_store as ds

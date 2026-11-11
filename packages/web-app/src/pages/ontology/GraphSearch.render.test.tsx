@@ -244,6 +244,42 @@ describe("GraphSearchPage — initial Graph view builds from ontology-overview",
     );
   });
 
+  it("opens the graph on the induced ontology, like the list", async () => {
+    listOntologies.mockResolvedValue([
+      { ontologyId: "o", title: "Insurance", ontologyType: "induced" },
+      { ontologyId: "ref", title: "Schema.org", ontologyType: "foundational" },
+    ] as OntologyRecord[]);
+    getOntologyOverview.mockImplementation(
+      (_client: unknown, _ns: string, id: string) =>
+        Promise.resolve(
+          id === "ref"
+            ? {
+                ontology_id: "ref",
+                classes: [
+                  {
+                    uri: "https://schema.org/Thing",
+                    label: "Thing",
+                    comment: null,
+                    subClassOf: [],
+                  },
+                ],
+              }
+            : OVERVIEW,
+        ),
+    );
+
+    renderPage();
+    await waitFor(() => expect(listOntologies).toHaveBeenCalled());
+    await userEvent.click(screen.getByText("Graph"));
+    const graph = await screen.findByTestId("graph-flow");
+    await waitFor(() => expect(within(graph).getByText("Claim")).toBeTruthy());
+
+    expect(
+      screen.getByRole("button", { name: /Show one ontology or all/i }),
+    ).toHaveTextContent("Insurance");
+    expect(within(graph).queryByText("Thing")).toBeNull();
+  });
+
   it("keeps a small induced ontology in full (with relationships) beside an oversized reference", async () => {
     // The realistic namespace shape, and the one a combined-total cap got
     // wrong: a small induced ontology plus a large foundational reference
@@ -294,6 +330,13 @@ describe("GraphSearchPage — initial Graph view builds from ontology-overview",
     await userEvent.click(screen.getByText("Graph"));
     await waitFor(() =>
       expect(screen.getByTestId("graph-flow")).toBeInTheDocument(),
+    );
+    // The graph opens on the induced ontology; widen it to every ontology.
+    await userEvent.click(
+      screen.getByRole("button", { name: /Show one ontology or all/i }),
+    );
+    await userEvent.click(
+      screen.getByRole("option", { name: "All ontologies" }),
     );
 
     // Only the oversized ontology is re-fetched sampled.
