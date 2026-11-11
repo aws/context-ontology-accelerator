@@ -14,7 +14,7 @@ vi.mock("../src/auth.js", () => ({ getToken: vi.fn() }));
 vi.mock("../src/config.js", () => ({ resolveConfig: vi.fn() }));
 vi.mock("node:child_process", () => ({ spawn: vi.fn() }));
 
-const { findUvx, buildPath } = await import("../src/index.js");
+const { findUvx, buildPath, buildProxyArgs } = await import("../src/index.js");
 
 describe("findUvx", () => {
   beforeEach(() => existsSyncMock.mockReset());
@@ -90,5 +90,20 @@ describe("buildPath", () => {
     const parts = buildPath().split(":");
     expect(parts).toContain("/usr/bin");
     expect(parts).toContain("/bin");
+  });
+});
+
+describe("buildProxyArgs", () => {
+  it("runs mcp-proxy 0.13.3 over streamablehttp with the bearer header", () => {
+    expect(buildProxyArgs("tok", "https://rt.example/mcp")).toEqual([
+      "mcp-proxy==0.13.3",
+      "--transport", "streamablehttp",
+      "--headers", "Authorization", "Bearer tok",
+      "https://rt.example/mcp",
+    ]);
+  });
+
+  it("leaves the mcp SDK version to mcp-proxy instead of pinning it", () => {
+    expect(buildProxyArgs("tok", "https://rt.example/mcp")).not.toContain("--with");
   });
 });

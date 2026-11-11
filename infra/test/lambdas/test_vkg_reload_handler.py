@@ -557,6 +557,60 @@ class TestHandler:
         assert len(undimensioned) == 1
 
 
+class TestEventFromAnotherDeployment:
+    """The default event bus is shared, so an event naming another deployment's bucket is skipped."""
+
+    @patch.dict(os.environ, ENV)
+    @patch("index.ecs")
+    @patch("index.sd")
+    @patch("index.ssm")
+    def test_event_for_another_deployments_bucket_provisions_nothing(self, mock_ssm, mock_sd, mock_ecs):
+        import importlib
+
+        import index
+
+        importlib.reload(index)
+        index.ecs = mock_ecs
+        index.sd = mock_sd
+        index.ssm = mock_ssm
+
+        event = {"detail": {"namespace": "test-ns", "version": "v1", "s3Bucket": "other-deployment-bucket"}}
+        result = index.handler(event, None)
+
+        assert result == {"status": "skipped", "reason": "event from another deployment"}
+        mock_ecs.describe_services.assert_not_called()
+        mock_ecs.register_task_definition.assert_not_called()
+        mock_ecs.create_service.assert_not_called()
+        mock_ecs.update_service.assert_not_called()
+        mock_sd.create_service.assert_not_called()
+
+    @patch.dict(os.environ, ENV)
+    @patch("index.ecs")
+    @patch("index.sd")
+    @patch("index.ssm")
+    def test_event_for_this_deployments_bucket_is_reloaded(self, mock_ssm, mock_sd, mock_ecs):
+        mock_ssm.get_parameter.return_value = {"Parameter": {"Value": "111.dkr.ecr.us-west-2.amazonaws.com/scl:vkg-A"}}
+        mock_ecs.describe_services.return_value = {"services": [{"taskDefinition": "arn:td:old"}]}
+        mock_ecs.describe_task_definition.return_value = {
+            "taskDefinition": {"containerDefinitions": [{"image": "111.dkr.ecr.us-west-2.amazonaws.com/scl:vkg-B"}]}
+        }
+        mock_ecs.register_task_definition.return_value = {"taskDefinition": {"taskDefinitionArn": "arn:td:rev2"}}
+        mock_ecs.update_service.return_value = {"service": {"deployments": [{"id": "d1"}]}}
+
+        import importlib
+
+        import index
+
+        importlib.reload(index)
+        index.ecs = mock_ecs
+        index.sd = mock_sd
+        index.ssm = mock_ssm
+
+        event = {"detail": {"namespace": "test-ns", "version": "v1", "s3Bucket": ENV["ONTOLOGY_BUCKET"]}}
+        assert index.handler(event, None)["status"] == "reload_triggered"
+        mock_ecs.update_service.assert_called_once()
+
+
 class TestSweep:
     """Scheduled-sweep mode: reconcile every per-namespace VKG service."""
 
