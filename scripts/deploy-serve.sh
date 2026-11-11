@@ -15,6 +15,10 @@ set -euo pipefail
 #   - AWS credentials configured
 #   - Docker with buildx (arm64 emulation via QEMU or native)
 #   - pnpm installed (for CDK)
+#   - The rest of the environment already deployed (`make deploy-dev`); only the
+#     serve stack is updated (--exclusively)
+#   - The same SCL_* variables used for `make deploy-dev`: CDK context is not
+#     persisted, so an unset one goes back to its default
 #
 # Usage:
 #   ./scripts/deploy-serve.sh [env]          # default: dev
@@ -96,14 +100,26 @@ echo ""
 echo "--- Deploying CDK stack ---"
 
 CONTEXT=(--context "env=${ENV}" --context "context_manager_image_uri=${IMAGE_FULL}")
-[ -n "${SCL_PREFIX:-}" ] && CONTEXT+=(--context "resource_prefix=${SCL_PREFIX}")
+# Same SCL_* settings as deploy.sh, so the serve stack synthesizes the way it was
+# created. Set the variables you used for `make deploy-dev`: CDK context is not
+# persisted, and any one left unset goes back to its default.
+# shellcheck source=lib/cdk-context.sh source-path=SCRIPTDIR
+source "${REPO_ROOT}/scripts/lib/cdk-context.sh"
+# serve-stack reads the peering CIDRs too (cross-VPC JDBC egress on its security
+# group), so leaving them out would delete those rules on every serve deploy.
+coa_add_jdbc_peering_context
 
 APPROVAL="--require-approval=never"
 if [ "${ENV}" = "prod" ] || [ "${ENV}" = "production" ]; then
   APPROVAL="--require-approval=broadening"
 fi
 
+# --exclusively: only the serve stack. Without it CDK also deploys the stacks serve
+# depends on (network, storage, auth, authnz, namespace), which would apply defaults
+# for VPC, OpenSearch capacity and SMUS admin settings. Needs those stacks already
+# deployed; use `make deploy-dev` for a fresh environment.
 pnpm --filter coa-infra exec cdk deploy "${PREFIX}-${ENV}-serve" \
+  --exclusively \
   "${CONTEXT[@]}" \
   ${APPROVAL}
 

@@ -4,7 +4,7 @@
 """MCP Server for Context Ontology Accelerator.
 
 Exposes 6 MCP tools (2 discovery + 4 execution) on AgentCore Runtime
-via Streamable HTTP transport. See LLD §3.2.5.
+via Streamable HTTP transport.
 """
 
 __version__ = "0.3.10"

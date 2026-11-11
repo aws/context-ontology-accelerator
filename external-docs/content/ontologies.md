@@ -514,6 +514,12 @@ graph and embeddings are actually clean, then the row disappears. Deleting an
 ontology also removes the proposals tied to it (those that fed into it and those
 grounded against it).
 
+Each API request deletes one ontology, named by its full IRI in the
+`ontology_id` query parameter. A request with a missing or empty `ontology_id`,
+or one that sends `ontologyId`, is rejected with `400`. To remove every ontology
+in a namespace, delete the namespace (see
+[Deleting a Namespace](namespaces.md#deleting-a-namespace)).
+
 **Reversibility depends on the ontology type:**
 
 - **Foundational** (curated references such as FIBO or Schema.org, loaded from

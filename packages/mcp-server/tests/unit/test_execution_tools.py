@@ -61,8 +61,7 @@ class TestExecuteQuery:
 
     @pytest.mark.asyncio
     async def test_returns_query_result_envelope(self, mock_cm, profile):
-        """Response now matches the Smithy ``Query`` output shape:
-        ``{result, requestId, sessionId}`` — same envelope data-layer returns."""
+        """Response is the Smithy ``Query`` envelope ``{result, requestId, sessionId}``."""
         mock_cm.invoke.return_value = {
             "result": {
                 "tier": 2,
@@ -85,9 +84,7 @@ class TestExecuteQuery:
 
     @pytest.mark.asyncio
     async def test_flat_cm_response_wrapped_into_envelope(self, mock_cm, profile):
-        """If CM returns a flat dict (no ``result`` key), the tool still wraps
-        it in the Smithy envelope so callers see a consistent shape. Missing
-        identifiers surface as ``None``."""
+        """A flat CM dict is wrapped in the envelope; missing ids are ``None``."""
         mock_cm.invoke.return_value = {
             "tier": 1,
             "confidence": {"score": 1.0, "rationale": "metric"},
@@ -126,8 +123,7 @@ class TestExecuteQuery:
 
     @pytest.mark.asyncio
     async def test_dimensions_and_mode_forwarded(self, mock_cm, profile):
-        """The Smithy inputs the old tool signature dropped (``dimensions``,
-        ``mode``) now reach the CM payload. ``dimensions`` is normalized from
+        """``dimensions`` and ``mode`` reach the CM payload. ``dimensions`` is normalized from
         the Smithy list-of-DimensionFilter wire shape into the ``{name: value}``
         mapping CM's Tier-1 resolver expects — reverting this normalization
         500s every dimensioned Tier-1 query with ``AttributeError`` on
@@ -180,12 +176,10 @@ class TestExecuteQuery:
         payload = mock_cm.invoke.call_args[0][0]
         assert "dimensions" not in payload["options"]
 
-    # ── timeoutMs forwarding (issue #185: MCP surface must not decline it) ──
+    # ── timeoutMs forwarding ──
     @pytest.mark.asyncio
     async def test_positive_timeout_ms_forwarded(self, mock_cm, profile):
-        """A positive int ``timeoutMs`` reaches ``options.timeoutMs`` so the CM
-        can clamp the request deadline. This is the MCP half of issue #185 — the
-        REST layer already forwards it; the MCP tool used to decline it."""
+        """A positive int ``timeoutMs`` reaches ``options.timeoutMs``."""
         await execute_query(mock_cm, "test", "ns", profile, "tok", timeout_ms=5000)
         payload = mock_cm.invoke.call_args[0][0]
         assert payload["options"]["timeoutMs"] == 5000
@@ -319,15 +313,13 @@ class TestExecuteGraphTraversal:
         await execute_graph_traversal(mock_cm, "urn:customer:1", "sales", profile, "tok")
         payload = mock_cm.invoke.call_args[0][0]
         assert payload["action"] == "graphTraverse"
-        # ``startUri`` now lives inside ``options`` to match the data-layer
-        # handler shape (see ``_handle_graph_traverse``). This is the CM
-        # contract; the previous top-level placement diverged from data-layer.
+        # ``startUri`` lives inside ``options``, matching the data-layer handler.
         assert payload["options"]["startUri"] == "urn:customer:1"
         assert payload["namespace"] == "sales"
 
     @pytest.mark.asyncio
     async def test_relationship_filter_forwarded(self, mock_cm, profile):
-        """Missing input the previous signature dropped — now reaches CM."""
+        """relationship_filter is forwarded to CM."""
         mock_cm.invoke.return_value = {"result": {"graphContext": {"entities": [], "relationships": []}, "trace": []}}
         await execute_graph_traversal(
             mock_cm,
@@ -378,14 +370,7 @@ class TestExecuteGraphTraversal:
 
 @pytest.mark.unit
 class TestQueryStrategyForwarding:
-    """``strategy`` must reach CM's ``options`` — it is the only way a caller can
-    deliberately select the Ontop/VKG engine rather than getting it as a fallback.
-
-    CM has a reader for it (``Orchestrator._resolve_strategy_selection``), so
-    dropping it would reinstate
-    the original defect — the Ontop/VKG engine reachable only as an automatic
-    fallback — rather than guarding against a phantom field.
-    """
+    """``strategy`` must reach CM's ``options`` so callers can select the Ontop/VKG engine."""
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

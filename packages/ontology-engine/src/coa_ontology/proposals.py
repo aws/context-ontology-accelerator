@@ -2651,7 +2651,6 @@ def _run_proposal_validation(
 
         passed = not any(f.severity == "error" for f in all_findings)
 
-        job["status"] = "completed"
         job["report"] = {
             "job_id": job_id,
             "proposal_id": proposal_id,
@@ -2661,11 +2660,12 @@ def _run_proposal_validation(
             "tiers_run": body.tiers,
             "created_at": job["created_at"],
         }
+        job["status"] = "completed"
         _persist_async_job("VALIDATE", job, namespace)
     except Exception as e:
         _log.error("Proposal validation failed for job %s: %s", job_id, e, exc_info=True)
-        job["status"] = "failed"
         job["error"] = f"Validation failed: {type(e).__name__}"
+        job["status"] = "failed"
         _persist_async_job("VALIDATE", job, namespace)
 
 
@@ -2782,20 +2782,20 @@ def _run_infer_constraints(
     try:
         existing_config = ConstraintConfig(**existing_config_dict) if existing_config_dict else None
         inferred = infer_constraints_from_ontology(turtle, existing_config=existing_config)
-        job["status"] = "completed"
         job["result"] = {"inferred_constraints": inferred.model_dump()}
+        job["status"] = "completed"
     except RuntimeError as e:
         # The LLM/parse failure path raises RuntimeError with a scrubbed
         # message (``Constraint inference failed: …``); surface it verbatim
         # so the UI can show what went wrong, matching the synchronous
         # 500-with-str(e) behaviour it replaced.
         _log.error("Constraint inference failed for job %s: %s", job_id, e, exc_info=True)
-        job["status"] = "failed"
         job["error"] = str(e)
+        job["status"] = "failed"
     except Exception as e:
         _log.error("Constraint inference failed for job %s: %s", job_id, e, exc_info=True)
-        job["status"] = "failed"
         job["error"] = f"Constraint inference failed: {type(e).__name__}"
+        job["status"] = "failed"
     _persist_async_job("INFER", job, namespace)
 
 

@@ -46,16 +46,14 @@ RUN pip install --no-cache-dir --root-user-action=ignore /tmp/common/ && rm -rf 
 COPY packages/sources/documents/preprocessing/constraints.txt /tmp/constraints.txt
 RUN pip install --no-cache-dir --root-user-action=ignore \
     -c /tmp/constraints.txt \
-    torch==2.13.0+cpu \
+    torch \
     --extra-index-url https://download.pytorch.org/whl/cpu
 
 # Install remaining deps (constrained to keep CPU torch), then:
 #  - Swap opencv-python → headless (unstructured pulls in opencv which needs libGL, absent in Lambda)
-#  - Ensure spaCy is present (newer unstructured releases no longer pin it as a hard
-#    dependency, so install it explicitly before downloading the model — otherwise
-#    `spacy download` fails with "No module named spacy" under a constrained install)
+#  - Pin spaCy (unstructured depends on it) and pre-install its model (unstructured
+#    loads it at runtime but Lambda fs is read-only)
 #  - Only the opencv-python uninstall may fail; any other failure stops the build
-#  - Pre-install spaCy model (unstructured loads it at runtime but Lambda fs is read-only)
 #  - Lift filelock past unstructured's `filelock<4` cap to 4.2.1+ (CVE-2026-112940).
 #    Every unstructured release still declares the cap, but its only use is
 #    `FileLock(path, timeout=-1)` in unstructured/nlp/tokenize.py, an API 4.x keeps;

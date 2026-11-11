@@ -16,6 +16,7 @@ from coa_common.guardrail_metrics import (
     assessments_from_trace,
     emit_guardrail_decision,
     filter_type_from_assessments,
+    redacted_actions,
 )
 
 pytestmark = pytest.mark.unit
@@ -80,6 +81,15 @@ class TestFilterTypeFromAssessments:
 
     def test_content_wins_over_pii_when_both_fire(self):
         assert filter_type_from_assessments([_ANONYMIZE, _BLOCK]) == "CONTENT"
+
+
+def test_redacted_actions_skips_an_action_of_none_like_filter_type():
+    assessment = {
+        "contentPolicy": {
+            "filters": [{"type": "HATE", "action": "NONE"}, {"type": "PROMPT_ATTACK", "action": "BLOCKED"}]
+        }
+    }
+    assert redacted_actions([assessment]) == ["contentPolicy:PROMPT_ATTACK=BLOCKED"]
 
 
 class TestAssessmentsFromTrace:

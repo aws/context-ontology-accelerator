@@ -100,9 +100,7 @@ class TestSignatureVerification:
     independent of whether AgentCore's own authorizer would have caught it."""
 
     def test_forged_admin_token_with_wrong_key_rejected(self):
-        """Self-signed with a DIFFERENT RSA key than the one in the test JWKS —
-        the exact attack the MR/issue describes: forge a JWT claiming
-        {"cognito:groups": ["admin"]} and hope nothing checks the signature."""
+        """Self-signed with a different RSA key than the test JWKS: a forged admin JWT must fail the signature check."""
         from cryptography.hazmat.primitives.asymmetric import rsa
 
         attacker_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -116,9 +114,7 @@ class TestSignatureVerification:
             },
             attacker_key,
             algorithm="RS256",
-            # Reuses the real kid so the verifier looks up the real (non-matching)
-            # public key rather than failing early on an unknown kid — the
-            # signature check itself must be what rejects this.
+            # Real kid, so the signature check itself rejects this, not an unknown kid.
             headers={"kid": _TEST_KID},
         )
         with pytest.raises(ClaimsExtractionError, match="JWT verification failed"):
@@ -176,8 +172,6 @@ class TestGetAuthorizerConfiguration:
 
 @pytest.mark.unit
 class TestCreateTestToken:
-    """Test the test-token helper used across this package's test suite."""
-
     def test_creates_verifiable_token(self):
         token = create_test_token(user_id="test-user")
         identity = extract_caller_identity(f"Bearer {token}")
@@ -205,21 +199,13 @@ class TestEmailExtraction:
         assert identity.email == "alice@example.com"
 
     def test_missing_email_defaults_to_empty_string(self):
-        # Cognito access tokens do not carry the email claim. Absence must
-        # produce ``""``, not ``None`` — downstream grant resolution treats an
-        # empty string as "no email lookup" (build_principal_keys skips empty
-        # identifiers), whereas ``None`` would break the type contract.
+        # Cognito access tokens carry no email claim; absence must yield ``""``, not ``None``.
         token = create_test_token(user_id="uuid-1234")  # no email kwarg
         identity = extract_caller_identity(f"Bearer {token}")
         assert identity.email == ""
 
     def test_none_email_coalesced_to_empty_string(self):
-        """An explicit ``"email": None`` in the JWT (e.g. some IdPs emit this
-        for unverified/hidden emails) is coalesced to ``""`` via the ``or ""``
-        guard in extract_caller_identity — otherwise it would land on
-        CallerIdentity as ``None`` and later crash sanitize_principal_key,
-        which calls ``urllib.parse.quote`` on the value.
-        """
+        """An explicit ``"email": None`` in the JWT is coalesced to ``""``."""
         token = jwt.encode(
             {
                 "sub": "uuid-1234",

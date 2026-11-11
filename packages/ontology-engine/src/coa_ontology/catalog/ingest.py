@@ -362,6 +362,8 @@ class IngestMetadata:
     imports: list[str] | None = None
     file_path: str | None = None  # local path of the uploaded bytes
     source: str = "import"  # import | import-from-url | proposal-accept
+    # Narrows the catalog to the file's own namespace. Set server-side only (``ontology_type`` is caller-supplied).
+    platform_foundational: bool = False
 
 
 def _class_datasource_map_from_r2rml(r2rml_content: bytes | str | None) -> dict[str, str]:
@@ -893,7 +895,8 @@ def ingest_ontology(
     def _named(subjects):
         return {s for s in subjects if isinstance(s, URIRef)}
 
-    classes = _named(g.subjects(RDF.type, OWL.Class)) | _named(g.subjects(RDF.type, RDFS.Class))
+    # Edges may point at any declared class; ``classes`` (what is cataloged) is narrowed below.
+    declared_classes = _named(g.subjects(RDF.type, OWL.Class)) | _named(g.subjects(RDF.type, RDFS.Class))
     dt_props = _named(g.subjects(RDF.type, OWL.DatatypeProperty))
     obj_props = (
         _named(g.subjects(RDF.type, OWL.ObjectProperty))
@@ -928,13 +931,21 @@ def ingest_ontology(
     # The graph twin: classes bound to a registered RDF_SPARQL source by name. Empty
     # for every ontology without the directive, so SQL and legacy imports are
     # unaffected. Validated before ANY write, so a bad binding rejects the import
-    # whole. NOTE: append (proposal-accept) payloads are induced and never carry the
+    # whole. Built before narrowing, so a bound foreign class is kept like a mapped one.
+    # NOTE: append (proposal-accept) payloads are induced and never carry the
     # directive; re-binding a class through an append would add a second
     # coa:dataSourceId rather than replace the first.
     class_to_graphsource: dict[str, str] = _class_graphsource_map_from_payload(
-        g, classes, namespace, class_to_datasource
+        g, declared_classes, namespace, class_to_datasource
     )
     _refuse_existing_backend_conflicts(graph_store, namespace, class_to_datasource, class_to_graphsource)
+    classes = _catalog_classes(
+        declared_classes,
+        ontology_id,
+        md.platform_foundational,
+        mapped=set(class_to_datasource) | set(class_to_graphsource),
+        namespace=namespace,
+    )
 
     # ── 3. Tier-1 validators (optional) ─────────────────────────────────
     if validate:
@@ -978,7 +989,7 @@ def ingest_ontology(
     superseded_embedding_count = 0
     if appending:
         superseded_embedding_count = _supersede_incoming_embeddings(
-            vector_store, namespace, ontology_id, classes | obj_props | dt_props
+            vector_store, namespace, ontology_id, declared_classes | obj_props | dt_props
         )
 
     # ── 4b. Supersede annotations on append ───────────────────────────────
@@ -992,7 +1003,9 @@ def ingest_ontology(
     # ingest — there is nothing live to supersede.
     superseded_count = 0
     if appending:
-        superseded_count = _supersede_incoming_annotations(graph_store, ontology_id, classes | obj_props | dt_props)
+        superseded_count = _supersede_incoming_annotations(
+            graph_store, ontology_id, declared_classes | obj_props | dt_props
+        )
 
     # ── 5. Catalog projection ───────────────────────────────────────────
     _s1 = time.perf_counter()
@@ -1025,7 +1038,7 @@ def ingest_ontology(
             "class_uri": str(cls_uri),
             "labels": [str(o) for o in g.objects(cls_uri, RDFS.label)],
             "comments": _definitions(g, cls_uri),
-            "super_classes": [str(o) for o in g.objects(cls_uri, RDFS.subClassOf) if o in classes],
+            "super_classes": [str(o) for o in g.objects(cls_uri, RDFS.subClassOf) if o in declared_classes],
             "is_mapped": str(cls_uri) in class_to_datasource or str(cls_uri) in class_to_graphsource,
             # Graph markers ride only on graph classes, so a SQL spec keeps the exact
             # keys every GraphStore.store_class already accepts.
@@ -1090,8 +1103,8 @@ def ingest_ontology(
                 "prop_uri": str(prop_uri),
                 "label": str(next(g.objects(prop_uri, RDFS.label), "")),
                 "comment": prop_defs[0] if prop_defs else "",
-                "domains": [str(o) for o in g.objects(prop_uri, RDFS.domain) if o in classes],
-                "ranges": [str(o) for o in g.objects(prop_uri, RDFS.range) if o in classes],
+                "domains": [str(o) for o in g.objects(prop_uri, RDFS.domain) if o in declared_classes],
+                "ranges": [str(o) for o in g.objects(prop_uri, RDFS.range) if o in declared_classes],
             }
         )
     # Same fresh-ingest rollback as the class projection above: a partial
@@ -1579,6 +1592,38 @@ def _extract_ontology_iri(g: Graph) -> str | None:
     for s in g.subjects(RDF.type, OWL.Ontology):
         return str(s)
     return None
+
+
+def _catalog_classes(
+    classes: set[URIRef], ontology_id: str, platform_foundational: bool, *, mapped: set[str], namespace: str
+) -> set[URIRef]:
+    """Return the declared classes to catalog and embed under ``ontology_id``.
+
+    A platform foundational load (e.g. schema.org, which also declares
+    ``foaf:Person``) keeps only classes in the ontology's namespace, plus mapped
+    or graph-bound ones; an IRI without a trailing ``/`` or ``#`` matches either.
+    Every class is kept unless the own-namespace ones are the majority, since an
+    ontology IRI is not always its classes' namespace (``.../bfo.owl``). Neptune
+    Analytics drops an edge to a skipped class unless that class is cataloged.
+    """
+    if not platform_foundational:
+        return classes
+    prefixes = (ontology_id,) if ontology_id.endswith(("/", "#")) else (f"{ontology_id}#", f"{ontology_id}/")
+    own = {c for c in classes if str(c).startswith(prefixes)}
+    if len(own) * 2 <= len(classes):
+        return classes
+    own |= {c for c in classes if str(c) in mapped}
+    if len(own) < len(classes):
+        log.info(
+            "ingest: not cataloging %d class(es) outside the ontology IRI (ontology_id=%s namespace=%s, e.g. %s); "
+            "edges to them survive only where the raw Turtle is loaded "
+            "or the class is already cataloged in this namespace",
+            len(classes) - len(own),
+            ontology_id,
+            namespace,
+            sorted(str(c) for c in classes - own)[:5],
+        )
+    return own
 
 
 def _first_literal(g: Graph, subject: str, predicate) -> str | None:

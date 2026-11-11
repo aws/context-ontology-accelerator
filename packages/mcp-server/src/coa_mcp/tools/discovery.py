@@ -1,17 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Discovery tools — list_metrics and describe_schema.
-
-Delegated to backend Lambdas via direct invocation (bypassing API Gateway).
-The MCP server is a thin protocol adapter; all DB/Bedrock access is in the
-Lambdas.
-
-Contract note: the endpoints and query-param names below match the Smithy
-operations on the data-layer/metric-service services — ``ListMetrics`` and
-``DescribeSchema``. Passing the same params to either surface yields the
-same result.
-"""
+"""Discovery tools — list_metrics and describe_schema, delegated to backend Lambdas."""
 
 from __future__ import annotations
 
@@ -45,24 +35,11 @@ async def list_metrics(
 ) -> dict[str, Any]:
     """List governed metric definitions via Lambda invocation.
 
-    The Smithy ``ListMetrics`` operation declares a ``status`` filter, but the
-    metric-service backend does not yet apply it (see MR !939 review comment
-    ``b6dea1de``). Rather than accept ``status`` here and silently forward it as
-    a no-op — making the response look filtered when it is not — the parameter
-    is intentionally omitted until the backend can honour it.
+    The backend does not apply the ``status`` filter, so the parameter is
+    omitted rather than forwarded as a no-op that would make the response look
+    filtered when it is not.
 
-    Args:
-        lambda_client: Lambda client for direct invocation.
-        namespace_id: The namespace to query.
-        bearer_token: Caller's JWT for identity propagation.
-        max_results: Maximum metrics to return (default 100, max 200 — the
-            ListMetrics page-size cap; larger values are reduced to it).
-        next_token: Continuation token from a prior response (``nextToken``).
-        authorizer_context: Optional authorizer context for the synthetic event.
-
-    Returns:
-        Dict with ``metrics`` list and, when the backend paginates, a
-        ``nextToken`` string to pass on the next call.
+    ``max_results`` is capped at 200 (the ListMetrics page size).
     """
     query_params: dict[str, str] = {"maxResults": str(min(max_results, 200))}
     if next_token:
@@ -91,23 +68,7 @@ async def describe_schema(
 ) -> dict[str, Any]:
     """Describe ontology classes and properties via Lambda invocation.
 
-    Uses the ``/namespaces/{namespaceId}/schema`` Smithy path — the same URI
-    data-layer's ``DescribeSchema`` operation targets — so the two surfaces
-    stay on one endpoint. The path was previously ``/graph/schema`` on the
-    ontology-engine service; the ontology-engine api-proxy accepts both, so
-    the change is transparent server-side.
-
-    Args:
-        lambda_client: Lambda client for direct invocation.
-        namespace_id: The namespace to query.
-        bearer_token: Caller's JWT for identity propagation.
-        max_results: Maximum classes to return (default 100, max 500).
-        include_properties: Whether to include properties (default True).
-        class_filter: Optional class URI or prefix filter (matches Smithy input).
-        authorizer_context: Optional authorizer context for the synthetic event.
-
-    Returns:
-        Dict with ``classes`` and ``ontologyVersion``.
+    ``max_results`` is capped at 500. ``class_filter`` is a class URI or prefix.
     """
     query_params: dict[str, str] = {
         "maxResults": str(min(max_results, 500)),
@@ -125,11 +86,7 @@ async def describe_schema(
         bearer_token=bearer_token,
         authorizer_context=authorizer_context,
     )
-    # Project to the Smithy ``DescribeSchema`` output shape so MCP and
-    # data-layer return byte-identical bodies for the same input. The
-    # ontology-engine backend includes an extra ``namespace`` echo that
-    # data-layer's ``_handle_describe_schema`` strips; without this
-    # projection MCP would leak that field on top of the Smithy contract.
+    # Project to the Smithy DescribeSchema shape; the backend adds a namespace echo.
     return {
         "classes": raw.get("classes", []) if isinstance(raw, dict) else [],
         "ontologyVersion": raw.get("ontologyVersion") if isinstance(raw, dict) else None,

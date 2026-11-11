@@ -13,9 +13,15 @@ Environment:
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import os
+import queue
+import threading
+import time
+from collections.abc import Callable
+from contextvars import ContextVar
 from typing import Any
 from urllib import request as urllib_request
 from urllib.error import HTTPError, URLError
@@ -71,6 +77,102 @@ CORS_HEADERS = {
 
 REST_TIMEOUT_MS = 29_000
 
+# Kept back from the gateway's limit (which counts from requestTimeEpoch, cold start included)
+# so that rest_deadline_exceeded reaches the client before the gateway's own 504.
+_GATEWAY_RESPONSE_MARGIN_S = 1.0
+# Budget from handler entry when the event has no requestTimeEpoch (direct invocation).
+_UNANCHORED_BUDGET_S = REST_TIMEOUT_MS / 1000 - _GATEWAY_RESPONSE_MARGIN_S
+# Time kept back from the Lambda's own timeout for the same.
+_LAMBDA_EXIT_MARGIN_S = 1.0
+_READ_CHUNK_BYTES = 64 * 1024
+# Deadline (time.monotonic()) for the current request's Context Manager call.
+_cm_call_deadline: ContextVar[float | None] = ContextVar("_cm_call_deadline", default=None)
+
+
+def _cm_call_budget_s(event: dict, context) -> float:
+    """Seconds the Context Manager call may take: within the gateway's clock and the Lambda's time left."""
+    budget = _UNANCHORED_BUDGET_S
+    received_ms = (event.get("requestContext") or {}).get("requestTimeEpoch")
+    if isinstance(received_ms, int | float) and not isinstance(received_ms, bool):
+        # A requestTimeEpoch ahead of this clock (skew, crafted event) must not extend the budget.
+        anchored = received_ms / 1000 + REST_TIMEOUT_MS / 1000 - time.time() - _GATEWAY_RESPONSE_MARGIN_S
+        budget = min(budget, anchored)
+    remaining_ms = getattr(context, "get_remaining_time_in_millis", None)
+    if remaining_ms is not None:
+        budget = min(budget, remaining_ms() / 1000 - _LAMBDA_EXIT_MARGIN_S)
+    return budget
+
+
+def _close_late_http_error(outcome: queue.Queue) -> None:
+    """Close an HTTP error the abandoned call queued around the time it was given up on."""
+    try:
+        _, error = outcome.get_nowait()
+    except queue.Empty:
+        return
+    if isinstance(error, HTTPError):
+        error.close()
+
+
+def _read_body(resp, abandoned: threading.Event) -> bytes:
+    """Read ``resp`` to the end, stopping early once the call is given up on.
+
+    ``read1`` (one socket read), not ``read(n)``, so a trickling response cannot hold an abandoned call.
+    """
+    chunks: list[bytes] = []
+    while not abandoned.is_set() and (chunk := resp.read1(_READ_CHUNK_BYTES)):
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _buffered_http_error(error: HTTPError, abandoned: threading.Event) -> HTTPError:
+    """Read ``error``'s body to the end and close it, returning a copy that holds the body in memory."""
+    if error.fp is None:
+        return error
+    try:
+        body = _read_body(error.fp, abandoned)
+    finally:
+        error.close()
+    return HTTPError(error.filename, error.code, error.msg, error.hdrs, io.BytesIO(body))
+
+
+def _post(req: urllib_request.Request, timeout_s: float, abandoned: threading.Event) -> bytes:
+    """POST ``req`` and return the body; an HTTP error's body is read here too, not by whoever catches it."""
+    try:
+        with urllib_request.urlopen(req, timeout=timeout_s) as resp:
+            return _read_body(resp, abandoned)
+    except HTTPError as exc:
+        raise _buffered_http_error(exc, abandoned) from None
+
+
+def _read_within(req: urllib_request.Request, timeout_s: float) -> bytes:
+    """POST ``req`` and return the body, raising ``TimeoutError`` after ``timeout_s`` in total.
+
+    ``urlopen``'s timeout is per socket operation, so the call runs on a thread waited on for ``timeout_s``.
+    """
+    outcome: queue.Queue[tuple[bytes | None, BaseException | None]] = queue.Queue(maxsize=1)
+    abandoned = threading.Event()
+
+    def call() -> None:
+        try:
+            body = _post(req, timeout_s, abandoned)
+        except BaseException as exc:  # noqa: BLE001 — re-raised on the caller's thread
+            outcome.put_nowait((None, exc))
+            if abandoned.is_set():
+                _close_late_http_error(outcome)
+            return
+        outcome.put_nowait((body, None))
+
+    threading.Thread(target=call, name="context-manager-call", daemon=True).start()
+    try:
+        body, error = outcome.get(timeout=timeout_s)
+    except queue.Empty:
+        abandoned.set()
+        _close_late_http_error(outcome)
+        raise TimeoutError(f"Context Manager call exceeded {timeout_s:.1f}s") from None
+    if error is not None:
+        raise error
+    return body or b""
+
 
 def _parse_first_sse_event(raw: str) -> dict:
     r"""Extract the first JSON payload from an SSE response.
@@ -100,10 +202,13 @@ def _invoke_context_manager(payload: dict, token: str) -> dict:
         },
         method="POST",
     )
-    # Sync customer path behind API Gateway (30s cap): explicit 29s timeout and
+    # Sync customer path behind API Gateway: bounded by the request's budget and
     # no retry by design — fail fast and let the client decide when to retry.
-    with urllib_request.urlopen(req, timeout=29) as resp:
-        raw = resp.read().decode("utf-8")
+    deadline = _cm_call_deadline.get()
+    remaining_s = _UNANCHORED_BUDGET_S if deadline is None else deadline - time.monotonic()
+    if remaining_s <= 0:
+        raise TimeoutError("REST budget spent before the Context Manager call")
+    raw = _read_within(req, remaining_s).decode("utf-8")
     return _parse_first_sse_event(raw)
 
 
@@ -672,7 +777,15 @@ def handler(event: dict, context) -> dict:
     route_handler = _ROUTE_MAP.get((method, resource))
     if not route_handler:
         return _error_response(501, f"Not implemented: {method} {resource}")
+    token = _cm_call_deadline.set(time.monotonic() + _cm_call_budget_s(event, context))
+    try:
+        return _dispatch(route_handler, namespace, event)
+    finally:
+        _cm_call_deadline.reset(token)
 
+
+def _dispatch(route_handler: Callable[[str, dict], dict], namespace: str, event: dict) -> dict:
+    """Run ``route_handler`` and map Context Manager transport errors to client-safe responses."""
     try:
         return route_handler(namespace, event)
     except HTTPError as e:
@@ -681,7 +794,7 @@ def handler(event: dict, context) -> dict:
         msg, error = _client_safe_upstream_error(resp_body, e.code)
         return _error_response(e.code, msg, **({"error": error} if error else {}))
     except URLError as e:
-        # A urlopen timeout (the 29s REST budget in _invoke_context_manager) surfaces
+        # A urlopen timeout (the REST budget in _invoke_context_manager) surfaces
         # as URLError whose .reason is a socket timeout. Distinguish it from a genuine
         # connectivity failure: the request did reach the Context Manager and is likely
         # still running server-side (e.g. Tier-3 synthesis routinely needs 20-90s),
@@ -689,13 +802,14 @@ def handler(event: dict, context) -> dict:
         # naming the streaming path rather than a misleading 502 "cannot reach", so a
         # builder does not chase a phantom connectivity/timeout bug.
         if isinstance(e.reason, TimeoutError):
+            logger.warning("context_manager_rest_deadline_exceeded cause=socket timeout (%s)", e.reason)
             return _rest_deadline_exceeded()
         # ``reason`` names the endpoint host and the socket error; log it, don't return it.
         logger.warning("context_manager_unreachable reason=%s", e.reason)
         return _error_response(502, "Cannot reach Context Manager")
-    except TimeoutError:
-        # A read timeout (the response did not arrive within the budget) is raised by
-        # urlopen as a bare TimeoutError, not wrapped in URLError like a connect timeout.
+    except TimeoutError as e:
+        # Budget spent before the call, wall-clock wait expired, or a read timed out (bare TimeoutError).
+        logger.warning("context_manager_rest_deadline_exceeded cause=%s", e)
         return _rest_deadline_exceeded()
     except Exception as e:
         logger.exception("context_manager_invocation_failed")

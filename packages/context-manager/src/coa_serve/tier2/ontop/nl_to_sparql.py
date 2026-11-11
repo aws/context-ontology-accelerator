@@ -19,7 +19,7 @@ import asyncio
 import os
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any
@@ -54,8 +54,9 @@ def _resolve_translation_timeout_s() -> float:
     benchmark harness does) is under none of them: ``RESOLVE_TIMEOUT_S`` (170s
     deployed, ≤300s in ``main.py``), half of it when ``OntopStrategy._retry_vkg``
     re-enters :meth:`translate` with a fresh budget, ``_PARALLEL_STRATEGY_TIMEOUT_S``
-    (90s) under ``strategy="best"``, and ~29s over REST where the data-layer handler
-    severs the socket. ``external-docs/content/deploying.md`` has the deployment view.
+    (90s) under ``strategy="best"``, and ~28s over REST, where the data-layer handler
+    ends the call about 1s under API Gateway's 29s limit.
+    ``external-docs/content/deploying.md`` has the deployment view.
     """
     raw = os.environ.get("SERVE_VKG_TRANSLATION_TIMEOUT_S")
     if raw is None:
@@ -511,6 +512,7 @@ class NLtoSPARQL:
         model_id: str | None = None,
         tbox_context: TBoxContext | None = None,
         exclude_properties: frozenset[str] = frozenset(),
+        allowed_metrics: Collection[str] | None = None,
     ) -> TranslationResult:
         """Translate a natural language query to SPARQL.
 
@@ -527,6 +529,8 @@ class NLtoSPARQL:
                 request, so re-assembly is pure waste (~1.3s + Neptune round-trips).
             exclude_properties: Property IRIs the caller may not read; they are dropped
                 from the T-Box before the LLM sees it.
+            allowed_metrics: The caller's ``allowedMetrics`` grant; the T-Box carries only the metrics it names.
+                None means no metric restriction.
 
         Returns:
             TranslationResult with SPARQL, confidence, and validation status.
@@ -541,6 +545,7 @@ class NLtoSPARQL:
                     model_id=model_id,
                     tbox_context=tbox_context,
                     exclude_properties=exclude_properties,
+                    allowed_metrics=allowed_metrics,
                 ),
                 timeout=self._timeout_s,
             )
@@ -572,6 +577,7 @@ class NLtoSPARQL:
         model_id: str | None = None,
         tbox_context: TBoxContext | None = None,
         exclude_properties: frozenset[str] = frozenset(),
+        allowed_metrics: Collection[str] | None = None,
     ) -> TranslationResult:
         start = time.perf_counter()
         trace_steps: list[dict[str, Any]] = []
@@ -592,7 +598,9 @@ class NLtoSPARQL:
         else:
             tbox, ok = await self._traced_step(
                 PipelineStep.CONTEXT_ASSEMBLY,
-                self._tbox_builder.build(vector_hits, namespace, query=query, backend=self._backend),
+                self._tbox_builder.build(
+                    vector_hits, namespace, query=query, backend=self._backend, allowed_metrics=allowed_metrics
+                ),
                 trace_steps,
                 start,
             )

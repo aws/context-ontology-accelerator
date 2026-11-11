@@ -1,22 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Execution tools — query, translate_sparql, rag_retrieval, graph_traversal.
-
-These tools delegate to the Context Manager via its AgentCore HTTP invocation
-endpoint. The MCP server is a thin protocol adapter: it handles MCP framing,
-auth extraction, and tool dispatch, but all orchestration (SQL generation,
-Cedar authorization, DB access, LLM calls) happens in the Context Manager.
-
-Identity propagation: the caller's JWT is forwarded to the CM, which validates
-it independently and resolves roles from the same Cognito pool.
-
-Contract note: the payload keys sent to CM and the wrapper keys these helpers
-return are the same Smithy shape data-layer uses (``query``, ``startUri``,
-``topK``, ``maxDepth`` etc. on input; ``{result, requestId, sessionId}`` on
-output where applicable). A single SDK generated from the Smithy models can
-target either surface without a translation layer.
-"""
+"""Execution tools — query, translate_sparql, rag_retrieval, graph_traversal via the Context Manager."""
 
 from __future__ import annotations
 
@@ -29,11 +14,8 @@ from ..clients.context_manager import _INVOKE_TIMEOUT_S, ContextManagerClient
 
 logger = structlog.get_logger(__name__)
 
-# ``timeoutMs`` budget accepted on the MCP surface. ``serve.smithy``'s
-# ``Query.timeoutMs`` @range(max: 29000) is the REST bound, set by the API
-# Gateway integration timeout; MCP calls the Context Manager directly over a
-# transport with its own read timeout, so the useful upper bound here is that
-# transport budget — a larger value could never be honoured.
+# MCP calls the Context Manager directly, so the upper bound is the transport
+# read timeout, not the REST 29000 ms API Gateway limit.
 QUERY_TIMEOUT_MS_MIN = 1
 QUERY_TIMEOUT_MS_MAX = _INVOKE_TIMEOUT_S * 1000
 
@@ -98,31 +80,14 @@ async def execute_query(
 ) -> dict[str, Any]:
     """End-to-end NL query with tiered resolution.
 
-    Mirrors the Smithy ``Query`` operation on the data-layer service — the
-    payload keys and response envelope match one-for-one so a client can call
-    either surface identically. Options mapped from Smithy input fields:
-    ``execute``, ``tierOverride``, ``mode``, ``strategy``, ``dimensions``,
-    ``includeSupporting``, ``maxResults``, ``timeoutMs``.
+    ``strategy`` pins the resolution path (the only way to reach Ontop/VKG
+    deliberately). ``timeout_ms`` may request a shorter budget than the transport
+    allows; it must be an int in range (bools, floats and strings are rejected,
+    since ``int(1.5)`` would smuggle a 1ms budget).
 
-    ``strategy`` is forwarded because CM *does* read it:
-    ``Orchestrator._resolve_strategy_selection`` takes ``options["strategy"]``
-    and an explicit pin outranks automatic tier gating. It is the only way a
-    caller can reach the Ontop/VKG path deliberately rather than as a fallback.
-
-    ``timeoutMs`` is honoured by the Context Manager (it builds a request-scoped
-    deadline from ``options.timeoutMs``, clamping to ``min(transport, caller)``),
-    so a caller may ask for a SHORTER budget and get a graceful structured
-    return instead of waiting the full transport budget. Validated on the same
-    terms as the data-layer handler, but bounded by the MCP transport timeout
-    (``QUERY_TIMEOUT_MS_MAX``) rather than the REST surface's 29000: a genuine
-    integer in range is forwarded; anything else (``bool``, a float, a string,
-    out of range) is rejected with ``ValueError`` rather than dropped or coerced
-    (``int(1.5) == 1`` would smuggle a 1ms budget).
-
-    Returns the ``{result, requestId, sessionId}`` envelope; the caller should
-    forward it verbatim so downstream identifiers stay observable in traces.
-    Raises :class:`ContextManagerError` on CM >=400 with the code preserved, and
-    ``ValueError`` on an out-of-contract ``timeoutMs`` (before calling the CM).
+    Returns the ``{result, requestId, sessionId}`` envelope. Raises
+    :class:`ContextManagerError` on CM >=400 and ``ValueError`` on invalid
+    ``timeout_ms``.
     """
     if timeout_ms is not None and (
         isinstance(timeout_ms, bool)

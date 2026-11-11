@@ -282,6 +282,7 @@ def _run_foundational_load(job_id: str, entry: FoundationalOntology, namespace: 
                 domain_tags=entry.domain_tags,
                 file_path=fetched_file_path,
                 source="foundational-load",
+                platform_foundational=True,
             ),
             validate=False,
             allow_append=True,

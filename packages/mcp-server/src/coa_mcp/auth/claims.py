@@ -3,21 +3,9 @@
 
 """JWT claims extraction with independent signature verification.
 
-AgentCore Runtime's ``RuntimeAuthorizerConfiguration.usingJWT`` already
-verifies signature/issuer/audience against the configured IdP's JWKS before
-a request reaches this server (see infra/lib/stacks/services/mcp-stack.ts).
-This module adds defense-in-depth on top of that platform control: if the
-AgentCore authorizer is ever misconfigured, disabled, or bypassed by a caller
-reaching this code through a path that skips it, an attacker-forged JWT
-(e.g. self-signed with ``{"roles": ["admin"]}``) must still fail here rather
-than being trusted blindly.
-
-Reuses ``coa_common.auth.build_token_authorizer`` — the same IdP-agnostic
-JWKS/RS256 verification already relied on by the control-plane API Gateway
-authorizer — rather than re-implementing JWKS fetch/cache/signature-check
-logic here. Works with any OIDC-compliant IdP (Cognito, Okta, EntraID,
-Auth0, ...), selected by ``JWT_ISSUER_URL`` at deploy time; no MCP-specific
-IdP assumption is hardcoded.
+Verifies the JWT signature here as defense in depth, in case the AgentCore
+authorizer is misconfigured or bypassed. Reuses ``coa_common.auth``; the issuer
+comes from ``JWT_ISSUER_URL``.
 """
 
 from __future__ import annotations
@@ -50,14 +38,9 @@ class ClaimsExtractionError(Exception):
 
 @lru_cache(maxsize=1)
 def _get_authorizer() -> TokenAuthorizer:
-    """Build the token authorizer once per container (JWKS is cached internally).
+    """Build the token authorizer once per container.
 
-    ``JWT_ISSUER_URL`` / ``JWT_CLIENT_ID`` are set by mcp-stack.ts from the same
-    IdP coordinates AgentCore's ``RuntimeAuthorizerConfiguration.usingJWT``
-    uses, so this independent check validates against the same trust anchor.
-    Cleared via ``_get_authorizer.cache_clear()`` in tests. Missing
-    configuration raises on first call — fail closed, never silently skip
-    verification.
+    Missing configuration raises on first call: fail closed, never skip verification.
     """
     issuer = os.environ["JWT_ISSUER_URL"]
     return build_token_authorizer(
@@ -71,12 +54,6 @@ def _get_authorizer() -> TokenAuthorizer:
 
 def extract_caller_identity(authorization_header: str | None) -> CallerIdentity:
     """Verify the JWT's signature and extract the delegating user's identity.
-
-    Args:
-        authorization_header: The full Authorization header value (e.g. "Bearer <token>").
-
-    Returns:
-        CallerIdentity with the delegating user's info.
 
     Raises:
         ClaimsExtractionError: If the header is missing, malformed, the
@@ -100,15 +77,10 @@ def extract_caller_identity(authorization_header: str | None) -> CallerIdentity:
     if not user_id:
         raise ClaimsExtractionError("JWT lacks required 'sub' / 'user_id' claim for delegating user")
 
-    # Agent identity — logged for audit but NOT used for authorization
     agent_id = claims.get("agent_id") or claims.get("client_id") or claims.get("azp")
 
-    # Namespace access (from custom claims or scope)
     namespaces = _extract_list_claim(claims, "namespaces", "custom:namespaces", "scl_namespaces")
 
-    # Roles — reuses the same group-claim extraction TokenAuthorizer subclasses
-    # use (cognito:groups for Cognito, configurable claim name for generic OIDC),
-    # so the IdP-specific claim-name handling lives in exactly one place.
     roles = authorizer.extract_groups(claims)
 
     logger.info(

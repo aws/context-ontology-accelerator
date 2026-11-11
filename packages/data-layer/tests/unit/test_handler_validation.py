@@ -174,10 +174,15 @@ class TestCorsHeaders:
 
 def _fake_urlopen(response_body: dict):
     """Build a urlopen replacement whose context-manager yields JSON bytes."""
-    cm = MagicMock()
-    cm.__enter__.return_value.read.return_value = json.dumps(response_body).encode("utf-8")
-    cm.__exit__.return_value = False
-    return MagicMock(return_value=cm)
+    payload = json.dumps(response_body).encode("utf-8")
+
+    def open_(*_args, **_kwargs):
+        cm = MagicMock()
+        cm.__enter__.return_value.read1.side_effect = [payload, b""]
+        cm.__exit__.return_value = False
+        return cm
+
+    return MagicMock(side_effect=open_)
 
 
 @pytest.mark.unit
