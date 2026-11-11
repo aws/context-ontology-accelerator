@@ -131,6 +131,16 @@ def handler(event, context):
         print(json.dumps({"action": "reload_skipped", "reason": "missing or invalid namespace"}))
         return {"status": "skipped", "reason": "missing or invalid namespace"}
 
+    # The default event bus is shared by every deployment in the account and Region.
+    # An event emitted from another deployment names that deployment's bucket, so a
+    # namespace this one does not own is skipped instead of getting a service that
+    # no teardown here would ever delete.
+    event_bucket = event.get("detail", {}).get("s3Bucket")
+    own_bucket = os.environ.get("ONTOLOGY_BUCKET", "")
+    if event_bucket and own_bucket and event_bucket != own_bucket:
+        print(json.dumps({"action": "reload_skipped", "reason": "event from another deployment", "namespace": ns}))
+        return {"status": "skipped", "reason": "event from another deployment"}
+
     return _reload_one(ns, version, cluster, prefix, context=context)
 
 

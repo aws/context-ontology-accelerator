@@ -649,6 +649,14 @@ The gather loop is also bounded by **step** caps, not just the time budget, and 
 - `DEEP_REASONING_MAX_NO_PROGRESS_STEPS` (default **2**) — consecutive no-progress steps tolerated before the loop stops with `no_new_information`. Lowered from 3 so a wandering loop stops quickly. `1` restores stop-on-first-miss.
 - `DEEP_REASONING_ONTOLOGY_TIMEOUT_S` (default **6**, floored at 1) — a fast-fail cap on a single graph-backed ontology lookup. The lookup is one preparatory step, so it must not swallow a large slice of the gather budget when Neptune is slow: the underlying graph client's own read-timeout × retry can otherwise stack to ~16 s per lookup. On timeout the ontology degrades to empty (the soft-prior traversal still runs) rather than starving the step budget. Raise it only if ontology lookups legitimately need longer on a very large namespace; it cannot be disabled.
 
+A namespace with many published ontologies (tens of ontologies, over a thousand classes) can exceed both this cap and the graph client's own read timeout, `NEPTUNE_TIMEOUT` (default **8** s). The trace then shows `ontology_lookup failed: TimeoutError`, or `RetryError` once only the cap is raised. Raise both, keeping the lookup cap below `DEEP_REASONING_PER_TOOL_TIMEOUT_S` (45 s). Synth fails if it isn't, or if either value is not a positive number:
+
+```bash
+SCL_DEEP_REASONING_ONTOLOGY_TIMEOUT_SECONDS=20 SCL_NEPTUNE_TIMEOUT_SECONDS=25 make deploy-dev
+```
+
+`scripts/deploy.sh` maps these to the CDK context keys `deep_reasoning_ontology_timeout_s` and `neptune_timeout_s`. `NEPTUNE_TIMEOUT` applies to every query through serve's Neptune client, not only this lookup.
+
 `MAX_NO_PROGRESS_STEPS` counts only steps that gather nothing new. It is separate from the answer-stability signal described in [Deep-reasoning stop signals](#deep-reasoning-stop-signals) below.
 
 Raise `MAX_STEPS` back toward 10 only if deep-reasoning accuracy demonstrably climbs with more steps on your workload — otherwise fewer steps is both faster and no less accurate.
@@ -1476,6 +1484,12 @@ If `make destroy-dev` reports stacks that didn't fully delete, it also scans the
 ```bash
 aws cloudformation describe-stack-events --stack-name <PREFIX>-dev-<stack> --region <REGION>
 ```
+
+#### The region's API Gateway CloudWatch role is left behind
+
+API Gateway has one CloudWatch Logs role per account and Region, used by every REST API there. By default the API stack creates a role and sets it as that account-wide role, replacing whatever was set before, including another COA deployment's role. CloudFormation keeps both the role (`<PREFIX>-<env>-api-RestApiCloudWatchRole…`) and the setting when the stack is deleted. Don't delete that role while `aws apigateway get-account --query cloudwatchRoleArn` still names it: every REST API in the Region would stop writing execution and access logs.
+
+If the account and Region already have a role set, deploy with `SCL_API_GATEWAY_CLOUDWATCH_ROLE=false` (CDK context `api_gateway_cloudwatch_role=false`) to keep it. The stage has logging enabled, so a Region with no role set needs the default.
 
 ### Manual destroy (advanced / non-`dev` environments)
 

@@ -21,7 +21,6 @@ import type { IAlarmActionStrategy } from "cdk-monitoring-constructs/lib/common/
 
 import { SCLStack } from "../../constructs/scl-stack";
 import { SclMonitoring } from "../../constructs";
-import { BRAND } from "../../constants";
 import {
   resolveContext,
   resolveLambdaReservedConcurrency,
@@ -429,28 +428,15 @@ export class VkgStack extends SCLStack {
     );
 
     const { eventSourcePrefix } = resolveContext(this.node);
-    // Matches BOTH the deployment-scoped source and the legacy static `coa`
-    // one. TRANSITIONAL: the rule (CloudFormation) and the emitter's
-    // EVENT_SOURCE_PREFIX env var (ontology-stack, injected by BrandEnvAspect)
-    // do not flip atomically — they are separate stacks, so whichever updates
-    // second leaves a window where emitted and matched sources disagree. A miss
-    // there is SILENT: ontology accept still succeeds, VKG just never reloads
-    // and serves stale mappings (and #851 means a skipped notify_vkg has no
-    // in-product retry). Accepting both closes that window.
-    //
-    // REMOVE the legacy entry once every environment has deployed past this
-    // change. Note it re-opens cross-deployment triggering for any deployment
-    // still emitting `coa.ontology`, so do not stand up a second co-located
-    // deployment until the legacy entry is gone.
-    const legacySource = `${BRAND}.ontology`;
+    // Matches only this deployment's own event source. The default bus is shared
+    // by every deployment in the account and Region, so a rule that also matched
+    // the static `coa` source would provision this deployment's VKG services for
+    // namespaces accepted in a `coa`-prefixed one, and nothing here deletes them.
     const scopedSource = `${eventSourcePrefix}.ontology`;
     new events.Rule(this, "OntologyPublishedRule", {
       ruleName: this.prefixed("ontology-reload"),
       eventPattern: {
-        source:
-          scopedSource === legacySource
-            ? [scopedSource]
-            : [scopedSource, legacySource],
+        source: [scopedSource],
         detailType: ["ontology.published"],
       },
       targets: [
