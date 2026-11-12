@@ -21,18 +21,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 /**
  * The SPI's one structural guarantee: the Athena catalog name reaches the implementation.
  *
- * <h2>Why this is worth a test of its own</h2>
- *
- * The first version of this class passed {@code request.getCatalogName()} to the <i>response</i> and
- * not to {@link CoaMetadataHandler#listDatabases(String)}. Every connector that needed the value —
- * which is every multiplexed one — reached it by overriding a {@code doXxx} method purely to stash it
- * in a field, then reading the field back from these methods. That is mutable handler state, correct
- * only because the Lambda runtime happens to serialise invocations per container, and invisible in
- * the signature that depends on it.
- *
- * <p>So these three assertions are what stop the parameter from being quietly dropped again: a
- * regression here does not break any single-source connector, which is exactly why nothing else would
- * catch it.
+ * <p>A regression here does not break any single-source connector, so nothing else would catch it.
  */
 class CoaMetadataHandlerTest
 {
@@ -111,9 +100,7 @@ class CoaMetadataHandlerTest
     @Test
     void twoRequestsWithDifferentCatalogsEachSeeTheirOwn()
     {
-        // The property the removed field could not offer: no ordering, no container affinity, and no
-        // reliance on the runtime serialising invocations. One handler, two catalogs, each carried on
-        // its own request.
+        // One handler, two catalogs, each carried on its own request.
         RecordingHandler handler = new RecordingHandler();
         Map<String, String> noProperties = Collections.emptyMap();
 

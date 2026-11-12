@@ -44,11 +44,7 @@ contracts between services, and into DataZone metadata. They must stay stable
 across deployments, so they are fixed here rather than derived from
 ``resource_prefix``.
 
-The tokens below previously derived from ``RESOURCE_PREFIX``, which CDK sets to
-``{prefix}-{env}-``. Under ``resource_prefix=scl`` that yielded
-``http://scl-dev.amazon.com/vocab/scl-dev#`` for writers while readers used their
-own compiled-in default — the two silently stopped matching. Mirrors the BRAND
-block in libs/ts-shared/src/constants.ts.
+Mirrors the BRAND block in libs/ts-shared/src/constants.ts.
 """
 
 GRAPH_BASE_URI: str = os.environ.get("GRAPH_BASE_URI", f"http://{BRAND}.amazon.com")
@@ -134,17 +130,6 @@ SOURCE_ACTIVE_STATUSES: frozenset[str] = frozenset(
         "ENRICHING",
         "DELETING",
     }
-)
-
-# Fields written by the unified pipeline that should be cleared on rescan.
-SOURCE_PIPELINE_RUN_FIELDS: tuple[str, ...] = (
-    "errorMessage",
-    "filesTotal",
-    "filesSkipped",
-    "filesErrored",
-    "preprocessingIssues",
-    "preprocessingIssuesS3Key",
-    "preprocessingIssuesTruncated",
 )
 
 # The DATABASE members of the Smithy SourceSubType enum, mirrored for the same reason as
@@ -263,11 +248,6 @@ DEFAULT_PREFERRED_ENTITY_CLASSIFICATIONS_JSON: str = "[]"
 # the extractor assigns chunks to (``__Topic__`` nodes, later induced as
 # ``skos:Concept``); entity classifications are what a thing *is*
 # (``__Entity__.class``, induced as ``owl:Class``). Two different axes.
-#
-# Note there is deliberately NO ``infer_topics`` flag: graphrag-toolkit has no
-# topic analogue of ``InferClassificationsConfig``, so "let the model decide" is
-# simply an empty list — the extractor then names topics freely from the chunk
-# text. Adding a flag would imply a corpus-inference pass that does not exist.
 DEFAULT_PREFERRED_TOPICS_JSON: str = "[]"
 
 # Hard API cap on either vocabulary list. Not a modelling limit — a guard against
@@ -349,12 +329,6 @@ The bound the request body actually imposes therefore depends on encoding:
     ASCII (1 byte/char)      ~4000 code points — the full allowance
     CJK (3 bytes/char)       ~2725 code points
     astral (4 bytes/char)    ~2045 code points
-
-Left as is deliberately. A natural-language question does not approach 2,725
-characters, so raising the WAF limit would widen a security control for input
-nobody sends. Recorded here instead so a generated client does not accept 4,000
-characters and then surface an unexplained 403 — and so the decision can be
-revisited with evidence if a real query is ever refused.
 """
 
 
@@ -434,18 +408,8 @@ def validate_namespace_id(value: str, name: str = "namespaceId") -> None:
 def validate_source_id(value: str, name: str = "sourceId") -> None:
     """Raise ``ValueError`` if *value* is not a safe source ID.
 
-    Source IDs are server-generated ``uuid.uuid4()`` values (see
-    ``coa_sources.api.database_routes._create_database_source`` /
-    ``document_routes``). Validating at the API boundary is defense-in-depth: it
-    keeps a malformed path parameter from flowing into DynamoDB keys, a DataZone
-    search prefix, a derived catalog name, or an STS ``RoleSessionName`` (whose
-    charset is constrained), and keeps CloudTrail attribution well-formed.
-
-    Uses the shared safe-id character class (alphanumeric, hyphen, underscore)
-    rather than a strict UUID v4 match — that rejects every unsafe character
-    that could break the downstream sinks (whitespace, ``:``, ``%``, ``.``,
-    ``/``, path traversal) while still accepting the server-minted UUIDs. Reuses
-    ``validate_id`` so the class stays single-sourced.
+    Source IDs are server-generated UUIDs. Uses the shared safe-id character
+    class (alphanumeric, hyphen, underscore) via ``validate_id``.
     """
     validate_id(value, name)
 
@@ -613,31 +577,6 @@ def graphrag_index_names(namespace_id: str) -> list[str]:
     return [f"{prefix}_{tenant}" for prefix in GRAPHRAG_INDEX_PREFIXES]
 
 
-def canonical_col(name: str) -> str:
-    """Convert a column name to a valid SQL/H2 identifier for R2RML and schema.sql.
-
-    Strips characters that are illegal in unquoted SQL identifiers (parens,
-    percent signs, slashes, hyphens, etc.), lowercases, and prefixes
-    digit-leading names with underscore.
-
-    Must be used consistently across R2RML ``rr:column`` values, schema.sql
-    ``CREATE TABLE`` DDL, and subject-map templates — Ontop requires all three
-    to reference the same canonical identifier.
-
-    .. deprecated::
-        Prefer :func:`sql_ident` for SQL identifiers. Canonicalizing mangled
-        the real source column name (``"aCL IgG"`` → ``acl_igg``) so the SQL
-        Ontop emitted no longer matched the underlying datasource. SQL-delimited
-        (double-quoted) identifiers preserve the original name and are accepted
-        by H2/Ontop verbatim, removing the need for a reverse lookup map.
-    """
-    result = name.replace(" ", "_").lower()
-    result = re.sub(r"[^a-z0-9_]", "", result)
-    if result and result[0].isdigit():
-        result = f"_{result}"
-    return result or "col"
-
-
 def sql_ident(name: str) -> str:
     """Return ``name`` as a SQL-delimited (double-quoted) identifier.
 
@@ -653,27 +592,6 @@ def sql_ident(name: str) -> str:
     """
     escaped = (name or "").replace('"', '""')
     return f'"{escaped}"'
-
-
-def sql_qualified_table(name: str, schema: str | None = None) -> str:
-    """Return a (schema-)qualified SQL-delimited table identifier.
-
-    ``sql_qualified_table("orders", "sales")`` -> ``'"sales"."orders"'`` and
-    ``sql_qualified_table("orders")`` -> ``'"orders"'``.
-
-    SUPERSEDED for the inducer path. It once UNCONDITIONALLY schema-qualified
-    every ``rr:tableName`` / H2 table (cause A of the cross-catalog defect), but that forced every
-    already-accepted single-source mapping to re-induce. The inducer now qualifies
-    ONLY on a genuine collision via
-    ``inducer/strategies/base.py:disambiguated_refs`` / ``logical_table_names`` (a
-    unique name stays bare), so this helper has no remaining inducer caller. It is
-    retained only as a generic identifier utility; do NOT reintroduce
-    unconditional qualification from it. For any qualification that must AGREE with
-    the mapping, go through ``logical_table_names`` instead.
-    """
-    if schema:
-        return f"{sql_ident(schema)}.{sql_ident(name)}"
-    return sql_ident(name)
 
 
 def split_sql_ident_path(literal: str) -> list[str]:
@@ -747,11 +665,9 @@ class NamespaceStatus(StrEnum):
 # Ontology artifact S3 paths — shared between Model (publish) and Serve (read)
 # ---------------------------------------------------------------------------
 # Base: s3://{ONTOLOGY_BUCKET}/ontologies/{namespace}/{version}/
-# See docs/contracts/few-shot-examples-contract.md for full specification.
 
 ONTOLOGY_ARTIFACTS_PREFIX = "ontologies"
 ONTOLOGY_ARTIFACT_EXAMPLES = "examples.json"
-ONTOLOGY_ARTIFACT_MANIFEST = "manifest.json"
 
 
 def ontology_artifact_s3_key(namespace: str, version: str, filename: str) -> str:
@@ -824,7 +740,6 @@ class SqlDialect(StrEnum):
     MYSQL = "MYSQL"
 
 
-# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # Governed Metrics — ontology integration constants
 # ---------------------------------------------------------------------------
@@ -944,9 +859,6 @@ def require_resource_prefix() -> str:
     after the customer has already written the wrong ExternalId into their policy. The
     Java connector refuses to construct without it; this is the same refusal.
 
-    Distinct from the module-level ``RESOURCE_PREFIX`` constant above, which is stripped to
-    the bare brand token and does default. See that docstring for which is which.
-
     Raises:
         RuntimeError: ``RESOURCE_PREFIX`` is unset or empty.
     """
@@ -973,11 +885,6 @@ def datasource_external_id(namespace_id: str) -> str:
     the control plane shows it to the customer for their trust policy — if the two
     derivations drifted, every cross-account onboarding would fail ``AccessDenied``
     with nothing to point at.
-
-    Reads ``RESOURCE_PREFIX`` per call through :func:`require_resource_prefix`, so the
-    value matches the deployment's ``{prefix}-{env}-`` naming, the same form as
-    ``athenaWorkgroupName``. The module-level constant above is a different rule: it is
-    stripped to the bare brand token and it does default.
 
     Raises:
         RuntimeError: ``RESOURCE_PREFIX`` is unset. A returned default here becomes an

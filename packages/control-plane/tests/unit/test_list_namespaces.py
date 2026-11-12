@@ -194,23 +194,12 @@ class TestGlobalRoleUser:
 
     @patch("coa_control_plane.namespace.list_handler.DynamoDBDAO")
     def test_single_page_over_limit_with_no_last_evaluated_key_still_paginates(self, mock_dao_cls):
-        """Regression: a single Scan page can return MORE matching items than
-        `limit` (the over-fetch is `limit * 3`) while the underlying DynamoDB
-        scan is simultaneously exhausted (no LastEvaluatedKey — the raw table
-        had fewer total items than the Limit passed to Scan). The handler
-        must NOT drop the leftover items past the truncation point just
-        because `last_evaluated_key` is absent — it must still emit a
-        nextToken derived from the last item actually returned, so a
-        follow-up call resumes and eventually surfaces every matching item.
-        """
+        """A scan page with more matches than `limit` and no LastEvaluatedKey still emits a nextToken."""
         mock_ns_dao = MagicMock()
         mock_mappings_dao = MagicMock()
         mock_dao_cls.side_effect = [mock_ns_dao, mock_mappings_dao]
 
         third_item = {**NS_ITEM_2, "PK": "NS#33333333-3333-3333-3333-333333333333", "name": "extra"}
-        # One Scan call returns 3 matching items with NO LastEvaluatedKey
-        # (the whole table was scanned in a single page), while the caller
-        # only asked for maxResults=2.
         mock_ns_dao.scan.return_value = PaginatedResult(
             items=[NS_ITEM, NS_ITEM_2, third_item],
             last_evaluated_key=None,
@@ -221,17 +210,7 @@ class TestGlobalRoleUser:
         assert resp["statusCode"] == 200
         body = json.loads(resp["body"])
         assert len(body["namespaces"]) == 2
-        # The bug: this key assertion used to fail because out_token was
-        # None (last_evaluated_key was None), silently dropping `third_item`
-        # with no way for the client to ever retrieve it.
-        assert "nextToken" in body, (
-            "nextToken must be present when the scan page had more matching "
-            "items than the requested page size, even if the underlying "
-            "DynamoDB scan itself returned no LastEvaluatedKey"
-        )
-
-        # Resuming with that token must surface the dropped item, not repeat
-        # the ones already returned or return nothing.
+        assert "nextToken" in body
         mock_ns_dao.scan.reset_mock()
         mock_ns_dao.scan.return_value = PaginatedResult(items=[third_item], last_evaluated_key=None)
         mock_dao_cls.side_effect = [mock_ns_dao, mock_mappings_dao]
@@ -242,8 +221,6 @@ class TestGlobalRoleUser:
         assert resp2["statusCode"] == 200
         body2 = json.loads(resp2["body"])
         assert [ns["name"] for ns in body2["namespaces"]] == ["extra"]
-        # The resume call must pass NS_ITEM_2's key (the last item actually
-        # returned on the first call) as exclusive_start_key, not None.
         call_kwargs = mock_ns_dao.scan.call_args[1]
         assert call_kwargs["exclusive_start_key"] == {"PK": NS_ITEM_2["PK"], "SK": NS_ITEM_2["SK"]}
 
@@ -452,7 +429,7 @@ def _token(decoded: object) -> str:
     return base64.b64encode(json.dumps(decoded).encode()).decode()
 
 
-# Decodable tokens neither listing mints: each was a 500 before.
+# Decodable tokens that neither listing mints.
 _FOREIGN_TOKENS = [
     _token({"foo": "bar"}),
     _token([1, 2]),

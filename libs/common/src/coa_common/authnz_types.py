@@ -29,12 +29,8 @@ class ResourceType(StrEnum):
     PLATFORM = "Platform"
 
 
-# The seeded ``default`` row in the roles table (PK=GLOBAL, SK=ROLE#default) is
-# the baseline Cedar policy bundle that the authorizer loads for EVERY
-# authenticated principal (policy_loader always includes it). It is not a role
-# anyone can be granted: a GLOBAL grant carrying it makes the principal look
-# like a cross-namespace role holder to filtering code (#988). Keep it out of
-# the assignable platform-role surface.
+# The seeded ``default`` role row is not an assignable role and must not appear
+# in the platform-role surface.
 NON_ASSIGNABLE_ROLE_IDS: frozenset[str] = frozenset({"default"})
 
 

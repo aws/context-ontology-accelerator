@@ -12,13 +12,6 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _no_real_cloudwatch():
-    """Keep guardrail decision metrics off the real CloudWatch API.
-
-    Every guardrail allow/block decision emits metrics now, so any test
-    exercising a decision path would otherwise build a real client and let
-    ``put_metric_data`` retry against the network. Emission swallows its own
-    errors, so this is about test speed and noise, not correctness. Tests that
-    assert on the emitted metrics patch the same seam with their own mock.
-    """
+    """Keep guardrail decision metrics off the real CloudWatch API."""
     with patch("coa_common.guardrail_metrics._cloudwatch_client", return_value=MagicMock()) as factory:
         yield factory

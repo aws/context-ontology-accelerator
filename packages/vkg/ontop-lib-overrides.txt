@@ -1,14 +1,12 @@
 # Patched replacements for JARs bundled in the Ontop 5.5.0 CLI (/opt/ontop/lib).
 #
-# Ontop 5.5.0 is the latest release, and its bundled Tomcat, Spring Framework,
-# Thymeleaf, Jackson, commons-beanutils and Guava carry Critical/High CVEs.
-# These versions mirror what Ontop's own `version5` branch now pins on the SAME
-# Spring Boot 2.7.18 line (ontop/ontop pom.xml: tomcat-embed 9.0.122,
-# spring-framework 5.3.39, thymeleaf 3.1.5.RELEASE, jackson 2.18.11,
-# commons-beanutils 1.11.0), so they are drop-in for the endpoint we run. Guava
-# goes past upstream's 32.0.1 to 33.7.2 for CVE-2026-102554; it is API-compatible
-# and brings its failureaccess 1.0.3 runtime dependency. Thymeleaf 3.1 needs
-# attoparser 2.0.7 and absorbed thymeleaf-extras-java8time, which is removed.
+# Ontop 5.5.0's bundled Tomcat, Spring Framework, Thymeleaf, Jackson,
+# commons-beanutils and Guava carry Critical/High CVEs. These versions mirror what
+# Ontop's own `version5` branch pins on the same Spring Boot 2.7.18 line, so they
+# are drop-in for the endpoint we run. Guava goes past upstream's 32.0.1 to 33.7.2
+# for CVE-2026-102554; it is API-compatible and brings its failureaccess 1.0.3
+# runtime dependency. Thymeleaf 3.1 needs attoparser 2.0.7 and absorbed
+# thymeleaf-extras-java8time, which is removed.
 #
 # Format: <Maven Central path> <sha256>. ontop-lib-overrides.sh verifies each pin
 # and swaps it in for every bundled lib/<artifactId>-<version>.jar, refusing to

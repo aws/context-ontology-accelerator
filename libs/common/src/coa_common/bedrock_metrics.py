@@ -9,7 +9,7 @@ Format (EMF) from stdout. Metrics must therefore be published with an explicit
 boto3 ``PutMetricData`` call. The EMF helper in ``metrics.py`` is Lambda-only
 and is deliberately NOT reused here.
 
-Usage (phase 1 is a pure library — no callers wired yet):
+Usage:
 
     tracker = CostTracker()
     tracker.record("generate", model_id, in_tokens, out_tokens)
@@ -31,9 +31,7 @@ logger = structlog.get_logger(__name__)
 
 METRICS_NAMESPACE = "COA/Ontology"
 
-_STAGE_GENERATE = "generate"
 _STAGE_RERANK = "rerank"
-_STAGE_EMBED = "embed"
 
 # ponytail: hardcoded prices mirror enrichment_metrics.py; confirm vs AWS pricing page
 # USD cost per single token, keyed by Bedrock model id (input/output priced separately).

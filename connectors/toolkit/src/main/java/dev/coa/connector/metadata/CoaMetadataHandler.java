@@ -60,12 +60,8 @@ import java.util.Map;
  *
  * <h2>Why all three take the Athena catalog name</h2>
  *
- * A connector serving one source will ignore it, but a multiplexed one cannot get it from anywhere else:
- * the catalog name is what selects which endpoint, credential and configuration a request is served
- * from. Without the parameter the only route is to override one of the {@code doXxx} methods to stash
- * {@code request.getCatalogName()} in a field and read it back here — mutable handler state, correct
- * only because the Lambda runtime serialises invocations per container, and invisible in the signature
- * that depends on it. Ignoring an argument is free; smuggling one through a field is not.
+ * A connector serving one source will ignore it, but a multiplexed one selects its endpoint, credential
+ * and configuration by it, and would otherwise have to stash it in a handler field.
  */
 public abstract class CoaMetadataHandler extends MetadataHandler
 {
@@ -133,8 +129,6 @@ public abstract class CoaMetadataHandler extends MetadataHandler
             throw new IllegalArgumentException(
                     "Unknown table: " + request.getTableName().getQualifiedTableName());
         }
-        // The line this class exists for: toTableSchema() encodes declared keys into comments and
-        // places them where Athena reads them.
         return new GetTableResponse(
                 request.getCatalogName(),
                 request.getTableName(),

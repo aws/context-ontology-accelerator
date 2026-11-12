@@ -182,8 +182,8 @@ updatable fields.
 Deletion is destructive and asynchronous. Calling `DELETE` starts a Step
 Functions pipeline that cascades through and removes **all** of the
 namespace's resources — sources, metrics, ontology data, and the underlying
-AWS resources (Athena workgroup, DataZone project, VKG service, Cloud Map
-entries, role mappings, and role definitions) — before deleting the namespace
+AWS resources (Athena workgroup, DataZone project, VKG service and its log
+groups, Cloud Map entries, role mappings, and role definitions) — before deleting the namespace
 record itself. You do **not** need to delete sources, ontologies, or metrics
 yourself first; the pipeline deletes all child resources for you.
 
@@ -238,8 +238,8 @@ backoff) before giving up:
 3. **Delete Ontology** — tears down ontology graph data and artifacts via the
    ontology engine
 4. **Delete Platform Resources** — Athena workgroup, DataZone project, VKG
-   ECS service, Cloud Map service-discovery entries, role mappings, and role
-   definitions
+   ECS service with its task-definition revisions and CloudWatch log groups,
+   Cloud Map service-discovery entries, role mappings, and role definitions
 5. **Finalize** — deletes the namespace record and releases its name
    reservation
 
@@ -247,8 +247,11 @@ Every step is retried, and the underlying cleanup calls are safe to retry (a
 resource that's already gone counts as deleted). In steps 3 and 4, a resource
 that can't be removed fails the step rather than being left behind: for example,
 a VKG service that can't be deleted ends the deletion in `DELETE_FAILED` instead
-of leaving the service running with no namespace to retry it from. The one
-exception is the ontology's stored artifacts, which step 3 deletes best-effort.
+of leaving the service running with no namespace to retry it from. Some
+leftovers keep nothing running, so they are deleted best-effort: the
+ontology's stored artifacts in step 3, and the VKG service's task-definition
+revisions and log groups in step 4. Deleting the log groups removes the VKG
+logs of that namespace for good.
 Finalize runs last, so the namespace record, and with it the ability to retry,
 stays until every earlier step has succeeded.
 
@@ -292,7 +295,7 @@ reports the current state of that service in two fields:
 | `vkgHealth` | Meaning | What to do |
 |-------------|---------|-----------|
 | `HEALTHY` | A running VKG task is passing its container health check and can answer queries. | Nothing — normal operation. |
-| `DEGRADED` | A VKG task **is running** but its container health check is failing (e.g. Ontop could not load the R2RML mappings, or the OWL2QL translation is not completing). Distinct from `UNAVAILABLE`. | Check the VKG service logs in CloudWatch. Common causes: an under-provisioned task (see [VKG Task Sizing](deploying.md#vkg-task-sizing)) or a malformed mapping. |
+| `DEGRADED` | A VKG task **is running** but its container health check is failing (e.g. Ontop could not load the R2RML mappings, or the OWL2QL translation is not completing). Distinct from `UNAVAILABLE`. | Check the VKG service logs in CloudWatch, log group `/ecs/<prefix>-<env>-vkg-<namespaceId>` (see "VKG log groups" in [Considerations](deploying.md#a4-considerations)). Common causes: an under-provisioned task (see [VKG Task Sizing](deploying.md#vkg-task-sizing)) or a malformed mapping. |
 | `UNAVAILABLE` | No VKG task is running for this namespace (desired count 0, or all tasks stopped). | Trigger a reload, or check for a failed deployment / circuit-breaker rollback. |
 | `PROVISIONING` | A VKG task is starting up or a new deployment is rolling out; health is not yet confirmed. | Wait — this is transient during create/reload. |
 | `UNKNOWN` | No VKG service exists for this namespace (e.g. no accepted ontology yet), or the health could not be determined. | Expected before an ontology is accepted; otherwise verify the service was provisioned. |

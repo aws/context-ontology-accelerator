@@ -449,6 +449,34 @@ class TestUploadEndpoint:
         assert ont_row["ontology_type"] == "user_created"
         assert ont_row["source"] == "upload"
 
+    def test_upload_typed_foundational_is_not_narrowed_to_its_namespace(self, import_client):
+        """ontology_type is caller-supplied: only the platform's foundational loader narrows a file's classes."""
+        http, mock_graph, _mock_vec, _mock_bedrock, ddb = import_client
+        turtle = """
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+<https://example.com/onto> a owl:Ontology .
+<https://example.com/onto#A> a owl:Class .
+<https://example.com/onto#B> a owl:Class .
+<https://example.com/onto#C> a owl:Class .
+<https://example.com/onto-ext#D> a owl:Class .
+"""
+        resp = http.post(
+            "/ontologies/https://example.com/onto/upload",
+            data={"namespace": "default", "ontology_type": "foundational"},
+            files={"file": ("onto.ttl", turtle.encode("utf-8"), "text/turtle")},
+        )
+        assert resp.status_code == 200, resp.text
+
+        classes = mock_graph.store_classes_batch.call_args.kwargs["classes"]
+        assert {c["class_uri"] for c in classes} == {
+            "https://example.com/onto#A",
+            "https://example.com/onto#B",
+            "https://example.com/onto#C",
+            "https://example.com/onto-ext#D",
+        }
+        ont_row = ddb.items[("NAMESPACE#default", "ONTOLOGY#https://example.com/onto")]
+        assert ont_row["ontology_type"] == "foundational"
+
     def test_second_upload_returns_409(self, import_client):
         """Same ontology_id twice in the same namespace → 409 Conflict.
 

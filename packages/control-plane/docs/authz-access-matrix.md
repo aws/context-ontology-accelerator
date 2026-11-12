@@ -152,11 +152,11 @@ same basis `GET /namespaces` and `GET /roles` stand on), rather than to a new
 platform-only gate.
 
 !!! note "`query` and `searchDocuments`"
-    The `query` and `searchDocuments` Cedar actions are **not** invoked by the
-    control-plane API authorizer — no `ControlPlaneService` route maps to them.
-    They are evaluated on the serve / context-manager path (the Playground/agent
-    runtime), which uses its own JWT authorizer. They remain in the schema and
-    seed policies because that path shares the same role model.
+    The control-plane authorizer maps `POST /namespaces/{namespaceId}/query` to
+    `query` and `POST /namespaces/{namespaceId}/kb/search` to `searchDocuments`.
+    They are also evaluated on the serve / context-manager path (the
+    Playground/agent runtime), which uses its own JWT authorizer and the same
+    role model.
 
     On that path, `query` is evaluated by the **namespace admission gate** at the
     top of the runtime entrypoint — before any dispatch, and for every
@@ -193,8 +193,7 @@ platform-only gate.
 
 `viewNamespace` was decomposed into three distinct read actions so a
 **schema-blind `data-analyst`** can query and use the namespace console without
-ever seeing the raw schema vocabulary (ADR:
-`decompose-viewnamespace-schema-visibility`). Every role except `data-analyst`
+ever seeing the raw schema vocabulary. Every role except `data-analyst`
 holds all three, so this is behaviour-preserving for everyone else.
 
 | Action | Gates | Held by `data-analyst`? |
@@ -250,7 +249,7 @@ parsing shared in `libs/common` `coa_authorization/schema_visibility.py`). Only
   dev mode without a roles table it emits the withholding value (`"false"` /
   `""`).
 
-### Artifact gate on the serve path (gating B)
+### Artifact gate on the serve path
 
 The Playground/agent debug artifacts are gated per-artifact by exactly the
 schema each discloses: the generated **SQL** (`query_used`) on `viewSource`, the
@@ -313,11 +312,8 @@ and lifecycle actions skip the status fetch entirely, so they incur no extra
 latency and remain available. If the status lookup fails, the request is denied
 (fail-closed).
 
-> **Propagation:** the API Gateway authorizer result is cached per token for
-> `resultTtlInSeconds = 60`. As with role changes, archiving therefore takes
-> effect within ~60s for principals with a warm cached decision.
-
-
+> **Propagation:** the namespace status is read on every mutating request and
+> never cached, so archiving takes effect on the next request.
 
 ## Data-Level Authorization (SQL Firewall)
 

@@ -8,7 +8,6 @@ import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** Databricks {@code full_data_type} to Arrow. */
 class DatabricksTypesTest
@@ -89,17 +88,7 @@ class DatabricksTypesTest
             "array<string>", "map<string,int>", "struct<a:int,b:string>", "variant", "object",
             "geometry", "geography", "interval day to second", "interval year to month"}) {
             maps(complex, Types.MinorType.VARCHAR);
-            assertTrue(DatabricksTypes.isFlattenedToString(complex),
-                    complex + " should be reported as flattened");
         }
-    }
-
-    @Test
-    void anActualStringIsNotReportedAsFlattened()
-    {
-        assertTrue(!DatabricksTypes.isFlattenedToString("string"));
-        assertTrue(!DatabricksTypes.isFlattenedToString("varchar(10)"));
-        assertTrue(!DatabricksTypes.isFlattenedToString("bigint"));
     }
 
     @Test

@@ -54,11 +54,6 @@ def _event(body: dict | None = None, method: str = "POST") -> dict:
 VALID_BODY = {"name": "sales", "owner": "alice@co.com"}
 
 
-# ═══════════════════════════════════════════════════════════════════
-# HTTP method validation
-# ═══════════════════════════════════════════════════════════════════
-
-
 class TestHttpMethod:
     def test_get_returns_405(self):
         resp = handler(_event(method="GET"), None)
@@ -68,11 +63,6 @@ class TestHttpMethod:
     def test_put_returns_405(self):
         resp = handler(_event(VALID_BODY, method="PUT"), None)
         assert resp["statusCode"] == 405
-
-
-# ═══════════════════════════════════════════════════════════════════
-# Validation
-# ═══════════════════════════════════════════════════════════════════
 
 
 class TestValidation:
@@ -163,11 +153,6 @@ class TestValidation:
         assert resp["statusCode"] == 201
 
 
-# ═══════════════════════════════════════════════════════════════════
-# Happy path
-# ═══════════════════════════════════════════════════════════════════
-
-
 class TestCreateNamespace:
     @patch("coa_control_plane.namespace.create_handler._get_service")
     def test_returns_201(self, mock_get_svc):
@@ -212,11 +197,6 @@ class TestCreateNamespace:
         assert json.loads(resp["body"])["namespace"]["displayName"] == "Sales Domain"
 
 
-# ═══════════════════════════════════════════════════════════════════
-# Conflict
-# ═══════════════════════════════════════════════════════════════════
-
-
 class TestConflict:
     @patch("coa_control_plane.namespace.create_handler._get_service")
     def test_returns_409(self, mock_get_svc):
@@ -224,11 +204,6 @@ class TestConflict:
         resp = handler(_event(VALID_BODY), None)
         assert resp["statusCode"] == 409
         assert "already exists" in json.loads(resp["body"])["message"]
-
-
-# ═══════════════════════════════════════════════════════════════════
-# Error handling
-# ═══════════════════════════════════════════════════════════════════
 
 
 class TestErrorHandling:
@@ -247,11 +222,6 @@ class TestErrorHandling:
         mock_get_svc.return_value.create.side_effect = RuntimeError("boom")
         resp = handler(_event(VALID_BODY), None)
         assert resp["statusCode"] == 500
-
-
-# ═══════════════════════════════════════════════════════════════════
-# Service unit tests (using DynamoDBDAO)
-# ═══════════════════════════════════════════════════════════════════
 
 
 class TestNamespaceService:
@@ -460,43 +430,13 @@ class TestNamespaceService:
         svc = self._make_service()
         req = CreateNamespaceRequestContent(name="sales", owner="alice@co.com")
 
-        with patch.dict(
-            os.environ,
-            {
-                "PROJECT_ACCESS_ROLE_ARN_SSM": "/coa/smus/dz-project-access-role-arn",
-            },
-        ):
-            svc.create(req)
-
-        # Should NOT call ensure_user_profile (profile created at deploy time)
+        svc.create(req)
 
         # Should call create_project_membership for project-access role only
         membership_calls = svc._metadata_store.create_project_membership.call_args_list
         assert len(membership_calls) == 1
         assert membership_calls[0].kwargs["project_id"] == "proj-abc"
         assert membership_calls[0].kwargs["user_identifier"] == "arn:aws:iam::123:role/project-access"
-
-    @patch("coa_control_plane.namespace.service.boto3")
-    def test_create_fails_if_project_membership_fails(self, mock_boto3):
-        mock_ssm = MagicMock()
-        mock_boto3.client.return_value = mock_ssm
-        mock_ssm.get_parameter.return_value = {"Parameter": {"Value": "arn:aws:iam::123:role/project-access"}}
-
-        svc = self._make_service()
-        svc._metadata_store.create_project_membership.side_effect = MetadataStoreError("membership failed")
-
-        req = CreateNamespaceRequestContent(name="sales", owner="alice@co.com")
-
-        with (
-            patch.dict(
-                os.environ,
-                {
-                    "PROJECT_ACCESS_ROLE_ARN_SSM": "/coa/smus/dz-project-access-role-arn",
-                },
-            ),
-            pytest.raises(MetadataStoreError, match="membership failed"),
-        ):
-            svc.create(req)
 
     @patch("coa_control_plane.namespace.service.boto3")
     def test_membership_failure_rolls_back_project_and_reservation(self, mock_boto3):
@@ -515,10 +455,7 @@ class TestNamespaceService:
 
         req = CreateNamespaceRequestContent(name="sales", owner="alice@co.com")
 
-        with (
-            patch.dict(os.environ, {"PROJECT_ACCESS_ROLE_ARN_SSM": "/coa/smus/dz-project-access-role-arn"}),
-            pytest.raises(MetadataStoreError, match="membership failed"),
-        ):
+        with pytest.raises(MetadataStoreError, match="membership failed"):
             svc.create(req)
 
         # DataZone project torn down.
@@ -545,12 +482,7 @@ class TestNamespaceService:
 
     @patch("coa_control_plane.namespace.service.boto3")
     def test_create_fails_when_ssm_parameter_not_found(self, mock_boto3):
-        """Regression test — missing SSM param must fail namespace creation.
-
-        Previously this would log a warning and silent-return, creating a
-        namespace that can never scan (DataZone Search requires project
-        membership).
-        """
+        """A missing SSM param must fail namespace creation."""
         mock_ssm = MagicMock()
         mock_boto3.client.return_value = mock_ssm
         error_response = {"Error": {"Code": "ParameterNotFound", "Message": "not found"}}
@@ -559,21 +491,8 @@ class TestNamespaceService:
         svc = self._make_service()
         req = CreateNamespaceRequestContent(name="sales", owner="alice@co.com")
 
-        with (
-            patch.dict(
-                os.environ,
-                {
-                    "PROJECT_ACCESS_ROLE_ARN_SSM": "/coa/smus/dz-project-access-role-arn",
-                },
-            ),
-            pytest.raises(MetadataStoreError, match="not found"),
-        ):
+        with pytest.raises(MetadataStoreError, match="not found"):
             svc.create(req)
-
-
-# ═══════════════════════════════════════════════════════════════════
-# Namespace language (immutable, canonicalized before provisioning)
-# ═══════════════════════════════════════════════════════════════════
 
 
 def _ssm_ok(mock_boto3: MagicMock) -> None:

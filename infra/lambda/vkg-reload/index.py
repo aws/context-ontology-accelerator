@@ -10,6 +10,7 @@ ontology reloads always pick up the latest VKG image, not a stale one from provi
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -22,6 +23,7 @@ sd = boto3.client("servicediscovery")
 ssm = boto3.client("ssm")
 autoscaling = boto3.client("application-autoscaling")
 cloudwatch = boto3.client("cloudwatch")
+logs = boto3.client("logs")
 
 _NS_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$")
 
@@ -38,6 +40,8 @@ _METRIC_NAMESPACE = "COA/VKG"
 
 # Binds Ontop's endpoint to loopback; translate-server is its only caller.
 _ONTOP_LOOPBACK_ARG = "-Dserver.address=127.0.0.1"
+
+_LOG_RETENTION_DAYS = 30
 
 # Revision cleanup stops when less than this much invocation time is left, so a
 # backlog of stale revisions can't time the Lambda out; the next reload goes on.
@@ -130,6 +134,16 @@ def handler(event, context):
     if ns == "unknown" or not _NS_PATTERN.match(ns):
         print(json.dumps({"action": "reload_skipped", "reason": "missing or invalid namespace"}))
         return {"status": "skipped", "reason": "missing or invalid namespace"}
+
+    # The default event bus is shared by every deployment in the account and Region.
+    # An event emitted from another deployment names that deployment's bucket, so a
+    # namespace this one does not own is skipped instead of getting a service that
+    # no teardown here would ever delete.
+    event_bucket = event.get("detail", {}).get("s3Bucket")
+    own_bucket = os.environ.get("ONTOLOGY_BUCKET", "")
+    if event_bucket and own_bucket and event_bucket != own_bucket:
+        print(json.dumps({"action": "reload_skipped", "reason": "event from another deployment", "namespace": ns}))
+        return {"status": "skipped", "reason": "event from another deployment"}
 
     return _reload_one(ns, version, cluster, prefix, context=context)
 
@@ -548,6 +562,23 @@ def _register_task_definition(ns, prefix, container_image):
         ontop_java_args = f"{ontop_java_args} {_ONTOP_LOOPBACK_ARG}"
 
     family = f"{prefix}-vkg-{ns}" if prefix else f"vkg-{ns}"
+    log_group = f"/ecs/{family}"
+    with contextlib.suppress(logs.exceptions.ResourceAlreadyExistsException):
+        logs.create_log_group(logGroupName=log_group)
+    logs.put_retention_policy(logGroupName=log_group, retentionInDays=_LOG_RETENTION_DAYS)
+    # The unprefixed group of a revision registered before the prefix gets no new
+    # writes once this revision runs; retention lets its history expire. Best-effort.
+    legacy_group = f"/ecs/vkg-{ns}"
+    try:
+        logs.put_retention_policy(logGroupName=legacy_group, retentionInDays=_LOG_RETENTION_DAYS)
+    except logs.exceptions.ResourceNotFoundException:
+        pass
+    except Exception as e:
+        print(
+            json.dumps(
+                {"action": "legacy_log_retention_failed", "namespace": ns, "log_group": legacy_group, "error": str(e)}
+            )
+        )
     td_resp = ecs.register_task_definition(
         family=family,
         taskRoleArn=task_role_arn,
@@ -581,9 +612,11 @@ def _register_task_definition(ns, prefix, container_image):
                 "logConfiguration": {
                     "logDriver": "awslogs",
                     "options": {
-                        "awslogs-group": f"/ecs/vkg-{ns}",
+                        "awslogs-group": log_group,
                         "awslogs-region": region,
                         "awslogs-stream-prefix": "vkg",
+                        # Recreates the group if it was deleted: an unchanged image
+                        # reuses this revision without calling create_log_group.
                         "awslogs-create-group": "true",
                     },
                 },

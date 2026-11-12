@@ -12,8 +12,6 @@ so that writers and readers stay in sync.
 from __future__ import annotations
 
 import json
-
-# ── Constants ────────────────────────────────────────────────────────────
 from typing import Any
 
 from coa_common.domain_models import (
@@ -29,12 +27,8 @@ from coa_common.domain_models import (
 
 from .constants import DZ_TYPE_PREFIX as _DZ_TYPE_PREFIX
 
-# ── Constants ────────────────────────────────────────────────────────────
 FORM_TYPE_NAME = f"{_DZ_TYPE_PREFIX}TableMetadata"
 ASSET_TYPE_NAME = f"{_DZ_TYPE_PREFIX}RelationalTable"
-
-
-# ── Serialization (Table → flat form payload) ────────────────────────────
 
 
 def serialize_form(table: Table) -> dict[str, Any]:
@@ -88,9 +82,6 @@ def build_forms_input(table: Table) -> list[dict[str, str]]:
             "typeIdentifier": FORM_TYPE_NAME,
         }
     ]
-
-
-# ── Deserialization (flat form payload → Table) ──────────────────────────
 
 
 def deserialize_form(payload: dict[str, Any], *, data_source_id: str = "") -> Table:

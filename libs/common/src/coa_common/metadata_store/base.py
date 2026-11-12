@@ -43,8 +43,6 @@ class MetadataStoreClient(ABC):
     AWS Glue Data Catalog, or any other catalog backend.
     """
 
-    # ── Projects ──────────────────────────────────────────────────
-
     @abstractmethod
     def create_project(self, *, name: str, description: str = "", project_profile_id: str = "") -> ProjectResult:
         """Create a project.
@@ -60,16 +58,6 @@ class MetadataStoreClient(ABC):
         Raises:
             MetadataStoreError: on failure.
         """
-
-    @abstractmethod
-    def get_project(self, *, project_id: str) -> ProjectResult:
-        """Retrieve a project by ID.
-
-        Raises:
-            MetadataStoreError: on failure or if not found.
-        """
-
-    # ── Assets ────────────────────────────────────────────────────
 
     @abstractmethod
     def create_asset(
@@ -111,14 +99,6 @@ class MetadataStoreClient(ABC):
         """
 
     @abstractmethod
-    def get_asset(self, *, asset_id: str) -> AssetResult:
-        """Retrieve a data asset by ID.
-
-        Raises:
-            MetadataStoreError: on failure or if not found.
-        """
-
-    @abstractmethod
     def search_assets(
         self,
         *,
@@ -128,7 +108,6 @@ class MetadataStoreClient(ABC):
         next_token: str | None = None,
         include_forms: bool = False,
         search_in_attributes: list[str] | None = None,
-        filters: dict[str, Any] | None = None,
     ) -> SearchResult:
         """Search for assets within a project.
 
@@ -138,10 +117,7 @@ class MetadataStoreClient(ABC):
         in :pyattr:`AssetResult.forms_output` only when requested.
 
         *search_in_attributes* narrows which asset attributes the backend
-        matches *search_text* against, and *filters* applies backend-side
-        equality filters. Both let a caller ask an exact question instead of
-        paging a broad result set — see the foreign-key target resolution in
-        ``coa_sources``.
+        matches *search_text* against.
 
         Raises:
             MetadataStoreError: on failure.
@@ -156,8 +132,6 @@ class MetadataStoreClient(ABC):
         Raises:
             MetadataStoreError: on failure or if not found.
         """
-
-    # ── User Profiles & Memberships ───────────────────────────────
 
     @abstractmethod
     def create_project_membership(

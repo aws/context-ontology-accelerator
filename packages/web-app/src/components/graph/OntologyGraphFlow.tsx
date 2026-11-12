@@ -1206,6 +1206,16 @@ function OntologyGraphFlowInner({
     [liveNodes, attributeOverlay],
   );
 
+  // Only callers that classify grounding (the proposal view) draw grounded
+  // nodes, so list the legend entry only when one is drawn.
+  const legendItems = useMemo(
+    () =>
+      displayNodes.some((n) => n.data?.kind === "grounded")
+        ? LEGEND_ITEMS
+        : LEGEND_ITEMS.filter((item) => item.kind !== "grounded"),
+    [displayNodes],
+  );
+
   const displayEdges = useMemo(() => {
     // Pass each edge's topology-derived `labelT` through on its data. The
     // `FloatingEdge` projects the actual coordinate from the current source
@@ -1333,7 +1343,7 @@ function OntologyGraphFlowInner({
                 border: "1px solid #e5e7eb",
               }}
             >
-              {LEGEND_ITEMS.map(({ kind, label }) => (
+              {legendItems.map(({ kind, label }) => (
                 <div
                   key={kind}
                   style={{

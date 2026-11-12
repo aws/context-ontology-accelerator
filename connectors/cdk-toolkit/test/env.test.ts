@@ -91,14 +91,8 @@ describe("loading .env", () => {
     fs.mkdirSync(app, { recursive: true });
   });
 
-  // These assert the returned paths, not process.env: process.loadEnvFile writes to the real
-  // environment, and Jest gives each test file a private copy of process.env, so the write is
-  // invisible here. Which files get loaded, and in what order, is what this function decides.
-
   it("loads only the directories it is given, never their parents", () => {
-    // The reason this function takes explicit directories: an earlier version walked upwards
-    // and from connectors/<id>/cdk it reached the repository root, then /Volumes, then / — so
-    // an unrelated .env could silently supply a connector's deployment settings.
+    // Walking upwards could reach an unrelated .env and silently supply deployment settings.
     fs.writeFileSync(path.join(root, ".env"), "PROBE_VALUE=from_parent\n");
     expect(loadEnvFiles(app)).toEqual([]);
   });

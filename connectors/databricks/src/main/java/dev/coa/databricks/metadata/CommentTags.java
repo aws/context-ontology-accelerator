@@ -95,19 +95,6 @@ public final class CommentTags
     }
 
     /**
-     * Whether {@link #strip(String)} would remove anything. For logging that it happened; the strip
-     * itself is unconditional.
-     */
-    public static boolean carriesTag(String comment)
-    {
-        if (comment == null || comment.isEmpty()) {
-            return false;
-        }
-        // Asked of strip() rather than restated, so the two cannot disagree about a near miss.
-        return !strip(comment).equals(collapseWhitespace(comment));
-    }
-
-    /**
      * Removes every {@code @fk(...)} COA would act on, and keeps every other one verbatim. Left to right,
      * one pass.
      *

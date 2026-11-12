@@ -6,10 +6,7 @@ requires-python = ">=3.12"
 
 dependencies = [
     "coa-common",
-    # Runtime deps imported by translate-server.py. Kept in sync with
-    # requirements.txt (the container install manifest); declared here so the
-    # uv workspace env — and the unit tests that import translate-server.py —
-    # resolve them like any other package dependency.
+    # Runtime deps imported by translate-server.py (the container installs from requirements.txt).
     "sqlglot>=20.0.0",
     "rdflib>=7.0.0",
     # 2026.10.19 is the first certifi bundle without the roots behind the compromised

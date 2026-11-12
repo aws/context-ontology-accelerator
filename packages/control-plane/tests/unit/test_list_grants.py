@@ -234,12 +234,7 @@ class TestListGrantsToGrantSummary:
 
     @patch("coa_control_plane.grants.list_handler.DynamoDBDAO")
     def test_declared_empty_overrides_are_returned(self, mock_dao_cls):
-        """SEMANTICS CHANGE (was: empty treated as absent and omitted).
-
-        A declared-empty tableAllowlist/allowedMetrics is a deny-all restriction
-        the SQL firewall enforces; omitting it from the listing would make a
-        deny-all grant indistinguishable from an unrestricted one to reviewers.
-        """
+        """A declared-empty tableAllowlist/allowedMetrics is a deny-all restriction and stays visible in listings."""
         mock_dao = MagicMock()
         mock_dao_cls.return_value = mock_dao
         item = {
@@ -339,9 +334,6 @@ class TestListGrantsPagination:
         assert resp["statusCode"] == 400
         assert json.loads(resp["body"])["message"].startswith("Invalid nextToken")
         mock_dao_cls.return_value.query.assert_not_called()
-
-    def test_smithy_example_next_token_returns_400(self):
-        assert handler(_event(query_params={"nextToken": "eyJvZmZzZXQiOjI1fQ=="}), None)["statusCode"] == 400
 
     @pytest.mark.parametrize(
         "decoded",

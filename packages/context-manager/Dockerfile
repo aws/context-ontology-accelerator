@@ -71,6 +71,10 @@ EXPOSE 8080
 
 USER appuser
 
+# Fail the build if the code this image runs imports anything the image cannot (scripts/image_import_check.py).
+COPY scripts/image_import_check.py /tmp/
+RUN python /tmp/image_import_check.py coa_serve.main coa_mcp.__main__
+
 # Health probe for container orchestrators (ECS, etc.) to detect unresponsive processes.
 # BedrockAgentCoreApp exposes GET /ping per the AgentCore protocol.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \

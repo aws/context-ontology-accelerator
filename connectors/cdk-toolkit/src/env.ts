@@ -3,15 +3,9 @@
 import * as fs from "fs";
 import * as path from "path";
 
-/**
- * Deployment facts for a connector's CDK app.
- *
- * <p>What a connector *is* — handler, jar, timeout — belongs in its stack, committed. Where it is
- * *going* differs per deployment and some of it must never be committed, so it comes from the
- * environment, which is where a pipeline puts it anyway.
- *
- * <p><b>Real environment variables beat `.env`</b>, so a pipeline's exported values always win.
- */
+// Deployment facts for a connector's CDK app. What a connector is (handler, jar, timeout) lives in
+// its stack, committed. Where it is going differs per deployment and some of it must never be
+// committed, so it comes from the environment. Real environment variables beat `.env`.
 
 /** File holding local, uncommitted environment facts. Ignored by the repository's gitignore. */
 export const ENV_FILE = ".env";
@@ -22,9 +16,6 @@ export const ENV_FILE = ".env";
  *
  * <p>Directories are named, never searched upwards: a walk from `connectors/<id>/cdk` reaches the
  * repository root and then `/`, so an unrelated file could silently supply deployment settings.
- *
- * @param directories directories that may hold a {@link ENV_FILE}.
- * @returns the paths loaded, in order.
  */
 export function loadEnvFiles(...directories: string[]): string[] {
   const loaded: string[] = [];

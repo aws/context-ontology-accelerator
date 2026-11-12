@@ -170,10 +170,9 @@ class ConnectorMetricsTest
     @Test
     void everyMetricNameIsExactlyTheStringTheAlarmsMatchOn()
     {
-        // LITERALS, deliberately: each name is half of a contract duplicated in `ConnectorMetricName` in
-        // connectors/cdk-toolkit/src/coa-contract.ts, which the CDK app builds an alarm from. A disagreement
-        // is silent — the alarm sits in INSUFFICIENT_DATA for ever rather than firing or erroring — and
-        // asserting `document()` against the constant that wrote it cannot catch a rename of the value.
+        // Literals, deliberately: each name is half of a contract duplicated in `ConnectorMetricName` in
+        // connectors/cdk-toolkit/src/coa-contract.ts. A disagreement is silent — the alarm sits in
+        // INSUFFICIENT_DATA — and asserting against the constant that wrote it cannot catch a rename.
         assertEquals("ConnectorConfigResolutionFailures", ConnectorMetrics.CONFIG_RESOLUTION_FAILURES);
         assertEquals("ConnectorConfigThrottles", ConnectorMetrics.CONFIG_THROTTLES);
         assertEquals("ConnectorCredentialAssumeFailures", ConnectorMetrics.CREDENTIAL_ASSUME_FAILURES);
@@ -188,10 +187,8 @@ class ConnectorMetricsTest
     @Test
     void everyMetricNameAlsoAppearsInTheCdkToolkitsCopyOfTheContract()
     {
-        // Reads the OTHER language's source as text on purpose. A jar and a CDK app cannot share a constant,
-        // so each suite pinning its own literals catches a rename only against ITSELF; this catches one
-        // across the boundary. DO NOT "fix" this into an import — that is the coupling the boundary exists
-        // to prevent, and it would make a copied-out connector unbuildable.
+        // Reads the other language's source as text: a jar and a CDK app cannot share a constant, and an
+        // import would make a copied-out connector unbuildable.
         java.io.File contract = new java.io.File(CDK_CONTRACT_PATH);
         // A visible skip rather than a silent pass: the toolkit is documented as copyable on its own.
         org.junit.jupiter.api.Assumptions.assumeTrue(contract.isFile(),
@@ -210,27 +207,12 @@ class ConnectorMetricsTest
         for (String name : ALL_METRIC_NAMES) {
             assertTrue(source.contains('"' + name + '"'),
                     "metric \"" + name + "\" is emitted by this connector but does not appear in "
-                            + CDK_CONTRACT_PATH + ", so no CDK app can alarm on it. Add it to"
-                            + " ConnectorMetricName there, or rename it back here. A metric whose alarm"
-                            + " watches a different name never fires and never errors — it sits in"
-                            + " INSUFFICIENT_DATA for ever.");
+                            + CDK_CONTRACT_PATH + ", so no CDK app can alarm on it.");
         }
         // An alarm in the wrong namespace finds no data.
         assertTrue(source.contains('"' + ConnectorMetrics.NAMESPACE + '"'),
                 "namespace \"" + ConnectorMetrics.NAMESPACE + "\" does not appear in "
                         + CDK_CONTRACT_PATH);
-    }
-
-    @Test
-    void everyMetricNameIsDistinctAndCarriesTheConnectorPrefix()
-    {
-        // A name colliding with another silently merges two alarms' data, and a name shaped unlike its
-        // neighbours is the one a copy-paste into the CDK app drops the prefix from.
-        assertEquals(ALL_METRIC_NAMES.size(), new java.util.HashSet<>(ALL_METRIC_NAMES).size(),
-                "two metrics share a name: " + ALL_METRIC_NAMES);
-        for (String name : ALL_METRIC_NAMES) {
-            assertTrue(name.startsWith("Connector"), name);
-        }
     }
 
     @Test

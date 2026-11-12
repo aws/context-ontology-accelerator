@@ -39,14 +39,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
     Validates the request body, confirms the role exists in the namespace, and
     writes the grant record with a duplicate-prevention condition. Retry-safe
     when the body carries a ``clientToken`` (see ``coa_common.idempotency``).
-
-    Args:
-        event: API Gateway proxy event with path parameters and JSON body.
-        context: Lambda context object (unused).
-
-    Returns:
-        An API Gateway proxy response: 201 with the created grant, or a 4xx/5xx
-        error response.
     """
     path_params = event.get("pathParameters") or {}
     namespace_id = path_params.get("namespaceId", "")
@@ -73,11 +65,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
     principal_id = body["principalId"]
     role = body["role"]
 
-    # Validate optional grant overrides — these fields are passed verbatim to
-    # the SQL firewall via the principal's resolved profile, so the data shape
-    # must be enforced at write time. A malformed value (e.g. tableAllowlist
-    # as a string) would otherwise cause runtime errors or silently incorrect
-    # authorization (set("orders") iterates over characters).
     override_error = validate_grant_overrides(body)
     if override_error is not None:
         return api_response(400, {"message": override_error})
@@ -94,12 +81,10 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
         roles_dao = DynamoDBDAO(roles_table, region=region)
         mappings_dao = DynamoDBDAO(mappings_table, region=region)
 
-        # 1. Validate role exists in namespace
         role_item = roles_dao.get({"PK": f"NS#{namespace_id}", "SK": f"{_ROLE_SK_PREFIX}{role}"})
         if not role_item:
             return api_response(404, {"message": "Role not found in namespace"})
 
-        # 2. Build the grant record
         caller = get_caller_identity(event)
         now = datetime.now(UTC).isoformat()
 
@@ -137,7 +122,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
         key_error = validate_grant_item_keys(item, encode_grant_id(pk, sk))
         if key_error:
             return api_response(400, {"message": key_error})
-        # 3. Write with condition to prevent duplicates
         mappings_dao.put(item, condition="attribute_not_exists(PK) AND attribute_not_exists(SK)", auto_timestamp=False)
 
         grant_response = {

@@ -12,14 +12,6 @@ Lifecycle: only ARCHIVED or DELETE_FAILED namespaces can be deleted.
   - ARCHIVED -> DELETING -> DELETED (happy path)
   - ARCHIVED -> DELETING -> DELETE_FAILED -> (retry) -> DELETING -> DELETED
 
-Deletion is blocked only while an operation is actively running that could
-race with the deletion pipeline's cleanup:
-  - a source is actively scanning/enriching (SOURCE_ACTIVE_STATUSES)
-  - an ontology induction job has not reached a terminal state
-  - a metric import job is IN_PROGRESS
-Completed/failed job records, along with all sources, ontology data, and
-metrics themselves, are deleted by the pipeline — this handler no longer
-blocks on their mere existence.
 
 On Step Functions start failure, reverts status to DELETE_FAILED so the
 caller can retry.
@@ -184,15 +176,8 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
 def _check_active_operations(namespace_id: str) -> list[str]:
     """Check for in-progress operations that should block deletion.
 
-    Unlike the old MVP handler, this does NOT block on the mere existence of
-    sources, ontology records, or completed/failed job records — those are
-    all cleaned up by the deletion pipeline itself. It
-    blocks only on operations actively running against this namespace right
-    now, since the deletion pipeline's cleanup steps (DeleteSources,
-    DeleteOntology, DeleteMetrics) could otherwise race with in-flight
-    writes: deleting a source mid-scan, tearing down ontology graph data an
-    induction job is still writing to, or deleting metrics an import job is
-    still creating.
+    Blocks only on operations actively running against this namespace, which
+    the pipeline's cleanup steps could otherwise race with.
     """
     blockers: list[str] = []
     blockers.extend(_check_active_sources(namespace_id))
@@ -252,26 +237,10 @@ def _check_active_induction_jobs(namespace_id: str) -> list[str]:
     rules) is non-trivial and already implemented there — duplicating it
     here would risk drifting out of sync.
 
-    Reachability policy (see #DELETE-STUCK): the deletion path is only ever
-    reached for an ARCHIVED (or DELETE_FAILED) namespace, and an archived
-    namespace accepts no NEW induction work — so the only thing this check can
-    legitimately be racing with is a job that was already running at archive
-    time, which reaches a terminal state within minutes. A TRANSIENT inability
-    to reach the ontology-engine must therefore NOT permanently block deletion:
-    the previous "fail closed on the first error" behavior meant that whenever
-    the delete Lambda couldn't reach the ontology-engine (VPC/config/transient),
-    EVERY ontology namespace became permanently undeletable (409 "unable to
-    verify ... try again shortly" forever, even a day later — the jobs had long
-    finished). That broke self-contained test teardown and leaked ECS/VKG
-    resources indefinitely.
-
-    New behavior: retry the reachability call a few times with short backoff;
-    if the endpoint returns, honor its answer (block only on a real activeJobs
-    count). If it stays unreachable after all retries, LOG LOUDLY and fail OPEN
-    (allow the delete) — the async deletion pipeline is itself race-tolerant
-    (its DeleteSources/DeleteOntology steps handle in-flight state and a genuine
-    race lands the namespace in DELETE_FAILED, which is retryable), so proceeding
-    is strictly safer than bricking every delete on an unreachable checker.
+    Retries the reachability call a few times with short backoff and honors its
+    answer. If the endpoint stays unreachable, logs loudly and fails open: an
+    archived namespace accepts no new induction work, and the race-tolerant
+    deletion pipeline lands a genuine race in DELETE_FAILED, which is retryable.
     """
     endpoint = os.environ.get("ONTOLOGY_ENGINE_ENDPOINT", "").rstrip("/")
     if not endpoint:

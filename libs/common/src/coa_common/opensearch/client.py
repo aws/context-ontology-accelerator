@@ -97,7 +97,7 @@ _TEXT_FIELDS = (
 
 # Engines that support filtered k-NN. NMSLIB does NOT — a method-less index
 # that resolves to NMSLIB fails every filtered query with
-# "Engine [NMSLIB] does not support filters" (see #174).
+# "Engine [NMSLIB] does not support filters".
 _FILTER_CAPABLE_ENGINES = frozenset({"faiss", "lucene"})
 
 # Explicit Faiss/HNSW method block. Requested by default so index creation does
@@ -110,9 +110,8 @@ class IncompatibleEngineError(RuntimeError):
 
     Raised by :meth:`AossVectorClient.ensure_index` after reading back the
     created index's mapping, when the ``embedding`` field's resolved engine is
-    not in :data:`_FILTER_CAPABLE_ENGINES`. This turns the #174 failure —
-    silently getting an NMSLIB index and only discovering it when a filtered
-    query 400s — into a loud, deploy-time failure.
+    not in :data:`_FILTER_CAPABLE_ENGINES`. This turns silently getting an NMSLIB index, discovered only when a filtered
+    query 400s, into a loud, deploy-time failure.
     """
 
 
@@ -155,7 +154,7 @@ def build_index_mapping(dims: int, *, method: bool = True) -> dict:
     ``embedding`` is a ``knn_vector``. By default (``method=True``) it carries
     an explicit Faiss/HNSW ``method`` block, because the service's method-less
     default engine is NOT stable and has been observed to resolve to NMSLIB
-    (which cannot serve filtered k-NN — see #174). ``method=False`` emits the
+    (which cannot serve filtered k-NN). ``method=False`` emits the
     legacy method-less mapping, used as a fallback by :meth:`ensure_index` when
     the service rejects an explicit ``method.engine`` at creation.
 
@@ -176,7 +175,7 @@ def _rejects_explicit_method(e: Exception) -> bool:
 
     Some NEXTGEN AOSS generations reject an explicit ``method.engine`` block at
     index creation (observed live as HTTP 400 ``illegal_argument_exception`` /
-    "Field parameter 'engine' is not supported"; see #174). We detect it by the
+    "Field parameter 'engine' is not supported"). We detect it by the
     error code and message rather than status alone, so a genuine 400 for some
     OTHER reason still propagates instead of silently falling back.
     """
@@ -326,27 +325,11 @@ class AossVectorClient:
         self._transport = transport
         self._client: _RetryingClient | None = None
         self._ensured_indices: set[str] = set()
-        # Engine strategy, classified ONCE per collection then cached (#174 long-term):
-        #   None  = not yet probed
-        #   True  = this collection accepts an explicit knn_vector method.engine
-        #           (the normal NEXTGEN case) → always create explicit Faiss/HNSW,
-        #           and get_mapping MUST echo a filter-capable engine.
-        #   False = this collection REJECTS an explicit method at create time →
-        #           create method-less and let the service resolve the engine;
-        #           an unreported engine in get_mapping is then tolerated (the
-        #           service does not always echo a server-resolved default) while
-        #           a reported non-filtering engine (NMSLIB) is still fatal.
-        # Caching the classification removes the per-index guessing that caused
-        # the F1 false-reject risk: after the first ensure_index, every later
-        # index takes the known-good path deterministically.
+        # Cached per collection: None = not yet probed, True = explicit
+        # method.engine accepted, False = rejected (create method-less).
         self._explicit_method_supported: bool | None = None
 
     # ── transport ──────────────────────────────────────────────────────
-
-    @property
-    def is_proxy(self) -> bool:
-        """True when configured for search-only proxy transport (no direct client)."""
-        return self._transport is not None
 
     def _c(self) -> _RetryingClient:
         """Retry-wrapped direct client. Raises if this client is proxy-only."""
@@ -393,8 +376,8 @@ class AossVectorClient:
     def ensure_index(self, index: str) -> str:
         """Create ``index`` with the canonical mapping if it doesn't exist, engine-verified.
 
-        Creation strategy (see #174 — the resolved ANN engine is a server-side
-        default that has been observed unstable across accounts/dates):
+        Creation strategy (the resolved ANN engine is a server-side default
+        that has been observed unstable across accounts):
 
         1. Try create with an EXPLICIT Faiss/HNSW ``method`` block.
         2. If the service rejects the explicit ``method`` at creation (some
@@ -410,15 +393,9 @@ class AossVectorClient:
         if index in self._ensured_indices:
             return index
         c = self._c()
-        # Strict verification (an unreported engine is fatal) applies ONLY to an
-        # index THIS call created with an explicit method — the one case where we
-        # know what was asked for. A pre-existing index was created by another
-        # process or by code that predates the explicit method, so how it was
-        # created is unknown: method-less creation is valid and on some
-        # collections never echoes an engine in get_mapping. Treating it as
-        # explicit (the previous default, and the cached flag on a collection
-        # that accepts explicit methods) rejected every pre-existing index on a
-        # fresh process — failing the readiness probe and proposal-accept ingest.
+        # Strict verification (an unreported engine is fatal) applies only to an
+        # index this call created with an explicit method; a pre-existing index
+        # may be method-less and never echo an engine in get_mapping.
         created_with_explicit_method = False
         if not c.indices.exists(index=index):
             created_with_explicit_method = self._create_with_engine_fallback(c, index)
@@ -433,15 +410,9 @@ class AossVectorClient:
         """Create ``index`` explicit-Faiss-first, method-less on rejection.
 
         Returns True if the index was created (or is being verified) via the
-        EXPLICIT-method path, False if it went via the METHOD-LESS fallback —
-        the caller uses this to choose engine-verification strictness.
-
-        The explicit/method-less classification is cached on the instance
-        (``_explicit_method_supported``) after the first create, so every later
-        index on the same collection takes the known-good path with no re-probe
-        and no per-index guessing. A concurrent-create race
-        (``resource_already_exists_exception``) does not change the cache; it
-        reports the strategy this collection is known/assumed to use.
+        explicit-method path, False via the method-less fallback; the caller uses
+        this to choose engine-verification strictness. The classification is
+        cached in ``_explicit_method_supported`` after the first create.
         """
         # If we already classified this collection, go straight to the known path.
         if self._explicit_method_supported is False:
@@ -494,28 +465,14 @@ class AossVectorClient:
         """Read the index mapping back and raise if the ANN engine can't filter.
 
         Filter-capable engines are Faiss/Lucene; NMSLIB cannot serve filtered
-        k-NN. Logs the resolved engine at INFO so a deployment can finally read
-        which engine its indices got (#174 — "nothing reported the engine").
-
-        Path-aware strictness (resolves F1):
-
-        - ``explicit_method=True`` (default/normal path): we asked for Faiss, so
-          the mapping MUST confirm a filter-capable engine. A reported NMSLIB
-          OR an UNREPORTED engine is fatal — if the service accepted our explicit
-          method it must echo it back; silence means something is wrong.
-        - ``explicit_method=False`` (method-less fallback path): the service
-          resolves the engine and does NOT always echo a server-resolved default
-          in get_mapping. A reported NMSLIB is still fatal, but an UNREPORTED
-          (None) engine is TOLERATED with a WARNING — raising here would
-          false-reject a valid Faiss index on the exact generation the fallback
-          exists to serve. The residual "unreported-but-secretly-NMSLIB" risk is
-          caught by the live filtered-kNN integration test, not by inference.
+        k-NN. A reported NMSLIB is always fatal. An unreported engine is fatal
+        when ``explicit_method`` is True (we asked for Faiss, so it must be
+        echoed) and only warned about on the method-less fallback path, where
+        the service does not always echo its default.
         """
         try:
             mapping = c.indices.get_mapping(index=index)
         except Exception as e:  # noqa: BLE001 — verification failure must not be silently ignored
-            # A verification read failure is itself a signal — do not proceed as
-            # if the engine were fine. Re-raise so the caller sees it.
             raise IncompatibleEngineError(
                 f"could not read back mapping for index {index!r} to verify its ANN engine: {e}"
             ) from e
@@ -523,11 +480,10 @@ class AossVectorClient:
         log.info("OpenSearch index %s resolved ANN engine: %s", index, engine or "<none reported>")
 
         if engine is not None and engine not in _FILTER_CAPABLE_ENGINES:
-            # A reported non-filtering engine (NMSLIB) is fatal on BOTH paths.
             raise IncompatibleEngineError(
                 f"index {index!r} resolved to ANN engine {engine!r}, which cannot serve filtered k-NN "
                 f"(need one of {sorted(_FILTER_CAPABLE_ENGINES)}). Filtered vector search would fail with "
-                f"'Engine [{engine.upper()}] does not support filters'. See #174."
+                f"'Engine [{engine.upper()}] does not support filters'."
             )
         if engine is None:
             if explicit_method:
@@ -535,13 +491,13 @@ class AossVectorClient:
                 # it. Silence means the create did not apply what we asked for.
                 raise IncompatibleEngineError(
                     f"index {index!r} was created with an explicit filter-capable method but its mapping "
-                    f"reports no ANN engine; refusing to trust an unverifiable index. See #174."
+                    f"reports no ANN engine; refusing to trust an unverifiable index."
                 )
             # Method-less fallback: tolerate an unreported engine (see docstring).
             log.warning(
                 "OpenSearch index %s reports no ANN engine after method-less creation; "
                 "trusting the service default. Filter-capability is confirmed by the live "
-                "filtered-kNN integration test, not by this mapping read. See #174.",
+                "filtered-kNN integration test, not by this mapping read.",
                 index,
             )
 
@@ -590,23 +546,12 @@ class AossVectorClient:
         wrapped in a ``bool.must`` alongside the extra filters; when omitted the
         query is the bare term/terms as before.
 
-        AOSS has no ``_delete_by_query`` on VECTORSEARCH, so we search for
-        matching docs and delete each by its auto-assigned ``_id``. AOSS
-        ``search`` is also NOT read-your-writes consistent (near-real-time
-        refresh lag), so a naive "delete visible hits until a search returns
-        empty" loop can stop early: an intermediate search returns 0 hits from a
-        stale index view and breaks the loop, leaving a tail of docs that were
-        never issued a delete. (Observed live: property embeddings orphaned after
-        an ontology delete.)
-
-        To be correct against that lag, we loop delete-then-recount until the
-        term-query ``count`` is a *stable* zero, tracking a no-progress stall
-        deadline (resets whenever we delete ≥1 more doc, mirrors ingest.py's
-        readiness wait). A per-document delete that raises is counted rather than
-        raised on the spot (the recount is the gate, and a document a stale
-        search view returned may already be gone). On a genuine stall we log and
-        raise :class:`DeleteIncompleteError` rather than spin forever or report a
-        partial delete as done. Returns the number of docs deleted.
+        AOSS has no ``_delete_by_query`` on VECTORSEARCH and ``search`` is not
+        read-your-writes consistent, so this deletes each hit by ``_id`` and
+        recounts until the term-query ``count`` is a stable zero. A per-document
+        delete that raises is counted, not raised; the recount is the gate. A
+        no-progress stall raises :class:`DeleteIncompleteError` rather than
+        reporting a partial delete as done. Returns the number of docs deleted.
         """
         c = self._c()
         if isinstance(value, str):
@@ -634,10 +579,7 @@ class AossVectorClient:
         stall_deadline = time.perf_counter() + _DELETE_VERIFY_STALL_TIMEOUT_S
 
         while True:
-            # 1. Fetch a page of matching doc ids and delete them. Goes through
-            #    _search so a missing index reads as zero hits (nothing to
-            #    delete) instead of raising — callers no longer ensure_index on
-            #    the delete path, since doing so resurrected empty shells.
+            # Goes through _search so a missing index reads as zero hits.
             resp = self._search(
                 index,
                 {"size": page, "_source": False, "query": query},
@@ -657,11 +599,8 @@ class AossVectorClient:
                         failed += 1
                         last_error = e
 
-            # 2. Terminal check via count (does NOT rely on this page being
-            #    empty — that empty could be a stale view). Only a real zero
-            #    count means the term matches nothing left. A missing index →
-            #    done (0); any other (transient) count error → -1 so the stall
-            #    timer governs whether we keep retrying.
+            # Count, not an empty page, is the terminal check: an empty page can be a
+            # stale search view. A transient count error is -1 so the stall timer governs.
             try:
                 remaining = self.count(index, filters=count_filters)
             except Exception as e:  # noqa: BLE001
@@ -670,11 +609,6 @@ class AossVectorClient:
             if remaining == 0:
                 return deleted
 
-            # 3. Progress / stall bookkeeping. "Progress" = we actually deleted
-            #    at least one doc THIS pass (count alone can lag). Real progress
-            #    resets the no-progress deadline; a pass that deletes nothing and
-            #    still sees count > 0 counts against the deadline, so a persistent
-            #    search-empty-but-count-nonzero disagreement can't spin forever.
             if deleted_this_pass > 0:
                 stall_deadline = time.perf_counter() + _DELETE_VERIFY_STALL_TIMEOUT_S
             elif time.perf_counter() >= stall_deadline:

@@ -52,8 +52,7 @@ logger = structlog.get_logger(__name__)
 
 # Character cap applied before embedding. Cohere's limit is ~2048 TOKENS and
 # Titan's is 8192 tokens; at ~4 chars/token an 8k-char bound stays safely within
-# both while preserving long class comments / metric descriptions (the previous
-# direct-invoke code used 8000 chars, so this keeps parity — do not lower it).
+# both while preserving long class comments / metric descriptions.
 _MAX_INPUT_CHARS = 8000
 
 # Bedrock ModelTimeoutException (HTTP 408) is not in any botocore retryable
@@ -71,14 +70,14 @@ _EMBED_MAX_BACKOFF_S = float(os.getenv("BEDROCK_EMBED_MAX_BACKOFF_S", "8"))
 # Cohere Embed accepts up to 96 texts per InvokeModel (v3 + v4). Default the
 # batch size to that documented hard cap (>96 → 400); clamp to [1,96] in
 # __init__ so a bad operator value can never send an oversized body or a
-# zero-width chunk. See HLD §3.5.
+# zero-width chunk.
 _DEFAULT_EMBED_BATCH_SIZE = 96
 
 # Per-instance socket read timeout default (seconds) — boto3's own default, kept
-# for serve parity. See BedrockEmbedder.read_timeout / HLD §3.4.
+# for serve parity.
 _DEFAULT_EMBED_READ_TIMEOUT = 60
 
-# CloudWatch EMF namespace for embed-path counters (§3.6). Reuses the existing
+# CloudWatch EMF namespace for embed-path counters. Reuses the existing
 # emit_metric helper — stdout EMF, no PutMetricData, no IAM grant, never raises.
 _METRIC_NAMESPACE = "SemanticContext/Embeddings"
 
@@ -100,20 +99,20 @@ def _is_cohere_v4(model_id: str) -> bool:
     # assumption (output_dimension, 96-cap, per-text token budget) is verified
     # for v4 only, so a non-v4 Cohere id ("cohere.embed-english-v3") falls back
     # to per-text fan-out rather than a v4-shaped body that may 400. Covers the
-    # "us."/"global." profile prefixes; excludes v3 and Titan. HLD §3.2.
+    # "us."/"global." profile prefixes; excludes v3 and Titan.
     return "cohere.embed-v4" in model_id
 
 
 def _is_retryable(exc: Exception) -> bool:
     # ClientError-only: BotoCoreError (Read/ConnectTimeout) has no .response, so
-    # guard the isinstance check first to avoid an AttributeError. HLD §3.4.1.
+    # guard the isinstance check first to avoid an AttributeError.
     return isinstance(exc, ClientError) and exc.response.get("Error", {}).get("Code") in _EMBED_RETRY_ERROR_CODES
 
 
 # Errors that halving can isolate: model/read/connect timeouts subdivide toward
 # the timeout budget; a per-text ValidationException subdivides to pinpoint the
 # offender. Throttle/5xx/AccessDenied are NOT here — they propagate to botocore
-# adaptive retry or surface as a real failure. HLD §3.3.1 / §3.4.
+# adaptive retry or surface as a real failure.
 _SUBDIVIDE_ON = (ClientError, ReadTimeoutError, ConnectTimeoutError)
 
 
@@ -134,7 +133,7 @@ def _fatal_if_validation(exc: Exception, chunk: list[str]) -> Exception:
 
     At a size-1 leaf, turn a ValidationException into a loud ValueError that
     names the offending text; re-raise everything else unchanged. Never silently
-    drop a text — that would break the len==len / index-zip contract. HLD §3.3.1.
+    drop a text — that would break the len==len / index-zip contract.
     """
     if _error_code(exc) == "ValidationException":
         msg = (getattr(exc, "response", None) or {}).get("Error", {}).get("Message", "")
@@ -148,7 +147,7 @@ def _prep(text: str) -> str:
     # Shared by single + batch paths. Per-text char cap (unchanged), then a
     # single-space sentinel for empty/whitespace-only input — Cohere 400s on
     # empty/whitespace, and whitespace is truthy so `text or " "` would NOT
-    # catch it. HLD §3.3.
+    # catch it.
     if len(text) > _MAX_INPUT_CHARS:
         # The tail is silently absent from the vector (a wide table's last columns
         # stop being searchable), so make the cut visible and countable.
@@ -170,7 +169,7 @@ def _env_batch_size() -> int:
         return int(raw)  # clamp in __init__
     except ValueError:
         # Bad env → default, never crash import for every service that imports
-        # embeddings.py (serve / metric-service). HLD §3.5.
+        # embeddings.py (serve / metric-service).
         return _DEFAULT_EMBED_BATCH_SIZE
 
 
@@ -182,7 +181,7 @@ def _env_read_timeout() -> int:
         return int(raw)
     except ValueError:
         # Bad env (e.g. "120s") → default, never crash BedrockEmbedder()
-        # construction for serve / metric-service / induction. HLD §3.4.
+        # construction for serve / metric-service / induction.
         return _DEFAULT_EMBED_READ_TIMEOUT
 
 
@@ -198,10 +197,10 @@ class BedrockEmbedder:
         read_timeout: Per-instance socket read timeout (seconds). Defaults to
             ``BEDROCK_EMBED_READ_TIMEOUT`` then boto3's 60s (serve parity);
             induction opts up to 120s for the 96-text worst case. Per-instance
-            so serve's single-text ``embed_query`` is never slowed. HLD §3.4.
+            so serve's single-text ``embed_query`` is never slowed.
         batch_size: Cohere v4 texts-per-``InvokeModel`` (clamped to [1,96]).
             Defaults to ``BEDROCK_EMBED_BATCH_SIZE`` then 96. ``=1`` is a
-            per-instance batch kill-switch. HLD §3.5.
+            per-instance batch kill-switch.
         cost_tracker: Optional per-job Bedrock usage accumulator. When present,
             every successful embed call records input tokens under the "embed"
             stage; when ``None`` the embedder behaves exactly as before.
@@ -255,7 +254,6 @@ class BedrockEmbedder:
         """
         self._cost_tracker = cost_tracker
 
-    # ── request/response encoding per provider ──────────────────────────
     def _request_body(self, text: str, input_type: InputType) -> str:
         payload = _prep(text)
         if _is_cohere(self.model_id):
@@ -272,7 +270,7 @@ class BedrockEmbedder:
 
     def _batch_request_body(self, chunk: list[str], input_type: InputType) -> str:
         # Populated texts[] (all N, _prep'd) — the actual batch. Mirrors
-        # _request_body's single-element Cohere body. HLD §3.3.
+        # _request_body's single-element Cohere body.
         return json.dumps(
             {
                 "texts": [_prep(t) for t in chunk],
@@ -298,7 +296,7 @@ class BedrockEmbedder:
         # Read the WHOLE by-type list (not [0]) and enforce len==len at the
         # source — a partial/truncated response becomes a loud ValueError at the
         # InvokeModel boundary, not a silent index-misalign in a rigor caller or
-        # an opaque strict-zip failure deep in ingest. HLD §3.3 (C3a).
+        # an opaque strict-zip failure deep in ingest.
         floats = body.get("embeddings", {}).get("float")
         if not floats:
             raise ValueError(f"No Cohere embeddings in batch response: keys={list(body.keys())}")
@@ -326,23 +324,22 @@ class BedrockEmbedder:
         # input tokens exclusively (output_tokens always 0). Sum over the texts
         # so a batched call meters the same total as the old per-text calls did.
         # A per-call Titan `inputTextTokenCount` only appears on the single-text
-        # path (Titan is never batched), so it maps to its one text. HLD §335e41e5.
+        # path (Titan is never batched), so it maps to its one text.
         if self._cost_tracker is None:
             return
         tokens = sum(self._input_tokens(t, body) for t in texts)
         self._cost_tracker.record("embed", self.model_id, tokens, 0)
 
-    # ── transport + retry core (shared by single + batch) ────────────────
     def _invoke(self, body: str, *, retry_timeouts: bool = True) -> dict[str, Any]:
         """Invoke the model, retrying app-level timeouts only when subdivision is impossible.
 
         Botocore owns throttle/5xx + transport-timeout retry.
-        App-level 408 (ModelTimeoutException, #777) retry applies ONLY when
+        App-level 408 (ModelTimeoutException) retry applies ONLY when
         ``retry_timeouts`` — i.e. the caller cannot subdivide (single text /
         size-1 leaf). Batch chunks pass ``False`` so a timeout bubbles on first
         occurrence and the caller halves. ``except ClientError`` only — a
         BotoCoreError (Read/ConnectTimeout) propagates untouched to the
-        subdivide. HLD §3.1 / §3.4.1.
+        subdivide.
         """
         attempt = 0
         while True:
@@ -361,7 +358,6 @@ class BedrockEmbedder:
         self._record_cost([text], body)
         return self._parse_response(body)
 
-    # ── observability (§3.6) ─────────────────────────────────────────────
     def _emit(self, name: str, value: float = 1.0, input_type: InputType | None = None) -> None:
         emit_metric(
             _METRIC_NAMESPACE,
@@ -372,11 +368,10 @@ class BedrockEmbedder:
             input_type=input_type,
         )
 
-    # ── batch path (Cohere v4 only) ──────────────────────────────────────
     def _embed_batch(self, texts: list[str], input_type: InputType) -> list[list[float]]:
         # Chunk ≤ batch_size, keep the ~10× thread-pool fan-out over chunks.
         # Executor.map yields in submission order, so flattening preserves the
-        # len==len / input-order contract by construction. HLD §3.3.
+        # len==len / input-order contract by construction.
         chunks = [texts[i : i + self._batch_size] for i in range(0, len(texts), self._batch_size)]
         with ThreadPoolExecutor(max_workers=self._max_workers) as pool:
             per_chunk = pool.map(lambda c: self._embed_chunk(c, input_type), chunks)
@@ -385,13 +380,13 @@ class BedrockEmbedder:
     def _embed_chunk(self, chunk: list[str], input_type: InputType) -> list[list[float]]:
         # Subdivide-on-timeout: halve toward the timeout budget and cap the blast
         # radius to the genuinely-failing texts. Recursion runs inside each worker
-        # so concurrency never perturbs ordering. HLD §3.3 / §3.3.1.
+        # so concurrency never perturbs ordering.
         self._emit("EmbedBatchSizeUsed", value=len(chunk), input_type=input_type)
         try:
             body = self._batch_request_body(chunk, input_type)
             parsed = self._invoke(body, retry_timeouts=len(chunk) == 1)
             vectors = self._parse_batch(parsed, len(chunk))
-            self._record_cost(chunk, parsed)  # meter cost on the batch success path too (335e41e5)
+            self._record_cost(chunk, parsed)  # meter cost on the batch success path too
             return vectors
         except _SUBDIVIDE_ON as exc:
             if isinstance(exc, (ReadTimeoutError, ConnectTimeoutError)):
@@ -402,7 +397,6 @@ class BedrockEmbedder:
             mid = len(chunk) // 2
             return self._embed_chunk(chunk[:mid], input_type) + self._embed_chunk(chunk[mid:], input_type)
 
-    # ── public API ──────────────────────────────────────────────────────
     def embed_document(self, text: str) -> list[float]:
         """Embed indexable content (Cohere ``search_document``)."""
         return self._embed(text, "document")
@@ -416,7 +410,7 @@ class BedrockEmbedder:
 
         Cohere Embed v4 batches ≤ ``batch_size`` texts per ``InvokeModel``
         (~96× fewer requests). Titan / non-v4 Cohere keep the per-text
-        thread-pool fan-out — no verified v4 ``texts[]`` batch there. HLD §3.2.
+        thread-pool fan-out — no verified v4 ``texts[]`` batch there.
         """
         if not _is_cohere_v4(self.model_id):
             with ThreadPoolExecutor(max_workers=self._max_workers) as pool:
@@ -431,25 +425,12 @@ def make_llama_index_embedding(
 ) -> Any:
     """A LlamaIndex ``BaseEmbedding`` backed by :class:`BedrockEmbedder`.
 
-    graphrag-toolkit configures embeddings via ``GraphRAGConfig.embed_model``.
-    If given a model-id STRING it builds its own ``llama_index`` ``BedrockEmbedding``,
-    whose Cohere request omits ``output_dimension`` — so Cohere Embed v4 returns
-    its DEFAULT 1536-dim vector instead of the 1024 the index is created with,
-    breaking ingestion. Passing a ``BaseEmbedding`` INSTANCE instead makes the
-    toolkit use it as-is (``GraphRAGConfig.to_embedding_model`` returns instances
-    unchanged), so we control the exact request and guarantee ``dimensions`` and
-    the search_document/search_query asymmetry are honoured.
-
-    Imported lazily: only the graphrag paths (doc-kg-build, serve lexical
-    retriever) depend on ``llama_index``; other services must not.
-
-    MUST be picklable: graphrag's build pipeline fans out over a
-    ProcessPoolExecutor, so ``embed_model`` is pickled to worker processes. The
-    adapter is therefore a MODULE-LEVEL class (not a closure) that reconstructs
-    its :class:`BedrockEmbedder` from plain fields — a locally-defined class or a
-    captured closure fails to pickle and graphrag silently drops the vector
-    store, breaking ingestion. The class is built lazily; the module
-    ``__getattr__`` below makes its name resolvable in a freshly spawned worker.
+    Passing an instance (not a model-id string) to ``GraphRAGConfig.embed_model``
+    keeps ``dimensions`` and the search_document/search_query asymmetry, which
+    llama_index's own Cohere request omits. Imported lazily because only the
+    graphrag paths depend on ``llama_index``. The adapter must be picklable
+    (graphrag pickles ``embed_model`` to worker processes), so it is a
+    module-level class reconstructed from plain fields.
     """
     cls = _bedrock_embedder_llama_index_cls()
     resolved_id = model_id or os.environ.get("BEDROCK_EMBED_MODEL_ID", DEFAULT_EMBED_MODEL_ID)

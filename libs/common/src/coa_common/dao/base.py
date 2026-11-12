@@ -86,27 +86,9 @@ class DatastoreDAO(ABC):
     def query_all(self, params: QueryParams, *, max_pages: int = 100) -> list[dict[str, Any]]:
         """Query every matching item, following the pagination cursor to exhaustion.
 
-        :meth:`query` returns ONE page. DynamoDB caps a response at 1 MB
-        regardless of how many items match, so a caller that reads
-        ``result.items`` and stops silently truncates its result set with no
-        error — the failure mode is invisible at the call site. That is merely a
-        short list for a listing endpoint, but for authorization data it means
-        roles or data restrictions disappear, so every authorization-critical
-        read must use this method rather than ``query``.
-
-        ``params.limit`` is left untouched (it bounds each page, not the total).
-        Any ``exclusive_start_key`` on ``params`` is honoured as the starting
-        cursor.
-
-        Args:
-            params: Query parameters; the cursor is advanced internally.
-            max_pages: Safety bound on pages read. Reaching it raises rather than
-                returning a partial set — a silent truncation here is exactly the
-                bug this method exists to prevent, and a partition needing more
-                than this indicates a data-model problem worth surfacing.
-
-        Returns:
-            Every matching item across all pages.
+        :meth:`query` returns one page, and DynamoDB caps a response at 1 MB, so
+        reading ``result.items`` alone silently truncates; authorization-critical
+        reads must use this method. ``params.limit`` bounds each page.
 
         Raises:
             RuntimeError: If ``max_pages`` is exhausted while a cursor remains.

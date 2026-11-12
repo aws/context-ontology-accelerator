@@ -745,6 +745,38 @@ describe("ServeStack - deep-reasoning budget variables", () => {
     });
   });
 
+  it("passes the ontology-lookup and Neptune read timeouts, overridable by context", () => {
+    createStack().hasResourceProperties("AWS::BedrockAgentCore::Runtime", {
+      EnvironmentVariables: Match.objectLike({
+        DEEP_REASONING_ONTOLOGY_TIMEOUT_S: "6",
+        NEPTUNE_TIMEOUT: "8",
+      }),
+    });
+    createStack({
+      deep_reasoning_ontology_timeout_s: 20,
+      neptune_timeout_s: "25",
+    }).hasResourceProperties("AWS::BedrockAgentCore::Runtime", {
+      EnvironmentVariables: Match.objectLike({
+        DEEP_REASONING_ONTOLOGY_TIMEOUT_S: "20",
+        NEPTUNE_TIMEOUT: "25",
+      }),
+    });
+  });
+
+  it.each([
+    [
+      { neptune_timeout_s: "8s" },
+      /neptune_timeout_s must be a positive number/,
+    ],
+    [{ neptune_timeout_s: "0" }, /neptune_timeout_s must be a positive number/],
+    [
+      { deep_reasoning_ontology_timeout_s: "45" },
+      /deep_reasoning_ontology_timeout_s \(45\) must be below deep_reasoning_per_tool_timeout_s \(45\)/,
+    ],
+  ])("refuses timeout context %o at synth", (context, message) => {
+    expect(() => createStack(context)).toThrow(message);
+  });
+
   it("defaults the stop signals to off when no context is set", () => {
     createStack().hasResourceProperties("AWS::BedrockAgentCore::Runtime", {
       EnvironmentVariables: Match.objectLike({

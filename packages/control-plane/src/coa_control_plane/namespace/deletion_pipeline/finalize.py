@@ -4,11 +4,7 @@
 """Deletion pipeline step: finalize namespace deletion.
 
 Atomically deletes the namespace DDB record + name reservation. This is the
-terminal, must-succeed step — if this fails, the state machine's catch
-routes to ``mark_failed`` (status -> DELETE_FAILED) rather than continuing,
-since a namespace stuck in DELETING with everything else cleaned up but no
-final record deletion is a worse state than DELETE_FAILED (which supports
-retry).
+terminal, must-succeed step.
 """
 
 from __future__ import annotations

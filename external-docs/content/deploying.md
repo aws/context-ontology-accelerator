@@ -649,6 +649,14 @@ The gather loop is also bounded by **step** caps, not just the time budget, and 
 - `DEEP_REASONING_MAX_NO_PROGRESS_STEPS` (default **2**) — consecutive no-progress steps tolerated before the loop stops with `no_new_information`. Lowered from 3 so a wandering loop stops quickly. `1` restores stop-on-first-miss.
 - `DEEP_REASONING_ONTOLOGY_TIMEOUT_S` (default **6**, floored at 1) — a fast-fail cap on a single graph-backed ontology lookup. The lookup is one preparatory step, so it must not swallow a large slice of the gather budget when Neptune is slow: the underlying graph client's own read-timeout × retry can otherwise stack to ~16 s per lookup. On timeout the ontology degrades to empty (the soft-prior traversal still runs) rather than starving the step budget. Raise it only if ontology lookups legitimately need longer on a very large namespace; it cannot be disabled.
 
+A namespace with many published ontologies (tens of ontologies, over a thousand classes) can exceed both this cap and the graph client's own read timeout, `NEPTUNE_TIMEOUT` (default **8** s). The trace then shows `ontology_lookup failed: TimeoutError`, or `RetryError` once only the cap is raised. Raise both, keeping the lookup cap below `DEEP_REASONING_PER_TOOL_TIMEOUT_S` (45 s). Synth fails if it isn't, or if either value is not a positive number:
+
+```bash
+SCL_DEEP_REASONING_ONTOLOGY_TIMEOUT_SECONDS=20 SCL_NEPTUNE_TIMEOUT_SECONDS=25 make deploy-dev
+```
+
+`scripts/deploy.sh` maps these to the CDK context keys `deep_reasoning_ontology_timeout_s` and `neptune_timeout_s`. `NEPTUNE_TIMEOUT` applies to every query through serve's Neptune client, not only this lookup.
+
 `MAX_NO_PROGRESS_STEPS` counts only steps that gather nothing new. It is separate from the answer-stability signal described in [Deep-reasoning stop signals](#deep-reasoning-stop-signals) below.
 
 Raise `MAX_STEPS` back toward 10 only if deep-reasoning accuracy demonstrably climbs with more steps on your workload — otherwise fewer steps is both faster and no less accurate.
@@ -725,7 +733,7 @@ cdk deploy --context serve_vkg_translation_timeout_s=120
 The value is seconds, clamped to 10–600; out-of-range values are clamped and logged, and an unparseable one keeps the default. Unset leaves the shipped 60 s, so upgrading moves nothing. It can also go in the `context` block of `infra/cdk.json`.
 
 !!! warning "This route does not fit inside the 29-second REST timeout"
-    A *median* translation already exceeds the whole REST budget, so raising this value does not make the Ontop route work over `POST /query` — the REST path's own timeout is pinned at 29 s in the data-layer handler, is not settable from `infra/`, and severs the socket first, which surfaces as the `504` in [Serve → Troubleshooting](serve.md#troubleshooting). Reach this route over the SSE-streaming Playground or the MCP server instead — neither sits behind API Gateway. See [Serve → Query Interfaces](serve.md#query-interfaces).
+    A *median* translation already exceeds the whole REST budget, so raising this value does not make the Ontop route work over `POST /query` — the REST path's own deadline in the data-layer handler, about 28 s from when API Gateway calls the data layer after the authorizer (1 s under its fixed 29 s integration timeout), is not settable from `infra/` and ends the call first, which surfaces as the `504` in [Serve → Troubleshooting](serve.md#troubleshooting). Reach this route over the SSE-streaming Playground or the MCP server instead — neither sits behind API Gateway. See [Serve → Query Interfaces](serve.md#query-interfaces).
 
 Three further ceilings sit above this knob and it cannot raise any of them: `resolve_timeout_s` (the whole-request budget above); roughly **half** of that if the request retries, because a rejected first SPARQL re-enters translation with a fresh budget; and **90 s** under `strategy="best"`, where each Tier-2 strategy is wrapped in its own timeout. On the default `nl_to_sql_first` strategy this route runs *second*, so whatever it spends is taken off Tier 3 within the same request. Raise it well past 60 s only for callers that pin `options.strategy` to `ontop` or `ontop_first`, or raise `resolve_timeout_s` in step.
 
@@ -925,11 +933,7 @@ new VkgStack(app, `${stackPrefix}-vkg`, {
 ```
 
 After changing these, redeploy the VKG stack. Existing namespaces pick up the
-new values only when their task definition is re-registered, as described above:
-a deploy with a new VKG image URI (a CI deploy of a new commit) re-registers every
-namespace, through a sweep that finishes after the deploy itself. A
-`make deploy-dev` that leaves `packages/vkg` unchanged, and an ontology reload
-with an unchanged image, keep the existing task definition and its old settings.
+new values only when their task definition is re-registered, as described above.
 
 ### Internal Environment Variables
 
@@ -1402,10 +1406,11 @@ SCL_AOSS_MIN_OCU=0 make deploy-dev
 
 On a direct `cdk deploy`, pass `--context aoss_min_ocu=0` along with the rest of
 your deployment's context. The value is not stored: a later deploy without it
-puts the floor back to `2`. `make deploy-serve` always does, since it also
-updates the storage stack and doesn't pass `SCL_AOSS_*` through; run
-`make deploy-dev` with the variables again afterwards. Changing it updates the
-collection group in place; the collection and its data are kept.
+puts the floor back to `2`. `make deploy-serve` updates only the serve stack
+(`--exclusively`), so it leaves the storage stack, and the limits, as they are.
+It passes the same `SCL_*` settings as `make deploy-dev`, so set the ones you
+used there. Changing the floor updates the collection group in place; the
+collection and its data are kept.
 
 For the operator-facing scale-to-zero cost/latency tradeoff (cold-start return
 time and how it interacts with ingest), see the `aoss_min_ocu` section in
@@ -1476,6 +1481,12 @@ If `make destroy-dev` reports stacks that didn't fully delete, it also scans the
 ```bash
 aws cloudformation describe-stack-events --stack-name <PREFIX>-dev-<stack> --region <REGION>
 ```
+
+#### The region's API Gateway CloudWatch role is left behind
+
+API Gateway has one CloudWatch Logs role per account and Region, used by every REST API there. By default the API stack creates a role and sets it as that account-wide role, replacing whatever was set before, including another COA deployment's role. CloudFormation keeps both the role (`<PREFIX>-<env>-api-RestApiCloudWatchRole…`) and the setting when the stack is deleted. Don't delete that role while `aws apigateway get-account --query cloudwatchRoleArn` still names it: every REST API in the Region would stop writing execution and access logs.
+
+If the account and Region already have a role set, deploy with `SCL_API_GATEWAY_CLOUDWATCH_ROLE=false` (CDK context `api_gateway_cloudwatch_role=false`) to keep it. The stage has logging enabled, so a Region with no role set needs the default.
 
 ### Manual destroy (advanced / non-`dev` environments)
 
@@ -1889,10 +1900,23 @@ revisions, but keeps every revision a PRIMARY or ACTIVE deployment still uses
 revision a concurrent reload registered. So during a rollout a family can have
 more than one ACTIVE revision. When the invocation runs low on time, the
 Lambda stops the cleanup and leaves the rest for the next reload (log event
-`task_defs_deregister_deferred`). Deleting a namespace deletes its service and its
-revisions. If the service delete fails, the revisions are kept: the namespace
-delete ends in `DELETE_FAILED` and deregisters them when you retry it.
-`make destroy-dev` deregisters them for the whole deployment.
+`task_defs_deregister_deferred`). Deleting a namespace deletes its service, its
+revisions and its log groups. If the service delete fails, the revisions and log
+groups are kept: the namespace delete ends in `DELETE_FAILED` and deletes them
+when you retry it. `make destroy-dev` deregisters the revisions for the whole
+deployment.
+
+**VKG log groups.** Each service logs to `/ecs/<prefix>-<env>-vkg-<namespaceId>`.
+The reload Lambda creates the group with 30-day retention before it registers a
+revision, and ECS recreates it if it is missing when a task starts. A recreated
+group has no retention until the next revision is registered. A service still on a
+revision registered before log groups carried the deployment prefix logs to
+`/ecs/vkg-<namespaceId>`, with no retention, until a reload with a new VKG image
+registers a new revision. That reload also sets 30-day retention on the old
+group, so its history, including logs older than 30 days, then expires.
+Deleting a namespace deletes both groups, and their logs
+are gone for good. `make destroy-dev` deletes neither: the prefixed groups expire,
+and you delete legacy groups that never got retention by hand.
 
 **Runtime-only services expand the IAM and regional surface.** The services in
 [A.2](#a2-services-called-at-runtime-but-not-provisioned) — Athena, Glue, Lake

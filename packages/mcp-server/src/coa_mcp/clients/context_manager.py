@@ -7,15 +7,6 @@ The MCP server is a thin protocol adapter. Execution tools (query,
 translate_sparql, rag_retrieval, graph_traversal) delegate to the Context
 Manager via its AgentCore invocations endpoint. This avoids duplicating
 DB/Neptune/OpenSearch/Bedrock access in the MCP runtime.
-
-The Context Manager's @app.entrypoint handles:
-- {"query": ..., "namespace": ..., "profile": ...} → full tiered resolve
-- {"action": "translate", "query": ..., "namespace": ...} → NL-to-SPARQL
-- {"action": "kbSearch", "query": ..., "namespace": ...} → vector search
-- {"action": "graphTraverse", "startUri": ..., "namespace": ...} → graph
-
-Identity propagation: the caller's JWT is forwarded as-is. The CM validates
-it again (same Cognito pool) and resolves roles independently.
 """
 
 from __future__ import annotations
@@ -39,14 +30,7 @@ class ContextManagerClient:
     """Async HTTP client for invoking the Context Manager via AgentCore."""
 
     def __init__(self, runtime_arn: str, region: str):
-        """Initialize the client and build the AgentCore invocation URL.
-
-        Args:
-            runtime_arn: ARN of the Context Manager AgentCore runtime.
-            region: AWS region hosting the runtime.
-        """
-        self._region = region
-        self._runtime_arn = runtime_arn
+        """Initialize the client and build the AgentCore invocation URL."""
         encoded_arn = quote(runtime_arn, safe="")
         self._url = (
             f"https://bedrock-agentcore.{region}.amazonaws.com/runtimes/{encoded_arn}/invocations?qualifier=DEFAULT"
@@ -74,16 +58,6 @@ class ContextManagerClient:
         The Context Manager's @app.entrypoint is an async generator. AgentCore
         returns responses as text/event-stream (SSE). We use httpx-sse to parse
         the stream per the SSE spec and return the first event's JSON payload.
-
-        Args:
-            payload: JSON body matching InvokeRequest schema.
-            bearer_token: The caller's JWT (forwarded as-is for identity propagation).
-
-        Returns:
-            Parsed JSON response from the Context Manager.
-
-        Raises:
-            ContextManagerError: On HTTP errors or timeouts.
         """
         headers = {
             "Content-Type": "application/json",

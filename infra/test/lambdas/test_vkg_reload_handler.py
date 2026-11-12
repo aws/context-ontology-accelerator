@@ -557,6 +557,60 @@ class TestHandler:
         assert len(undimensioned) == 1
 
 
+class TestEventFromAnotherDeployment:
+    """The default event bus is shared, so an event naming another deployment's bucket is skipped."""
+
+    @patch.dict(os.environ, ENV)
+    @patch("index.ecs")
+    @patch("index.sd")
+    @patch("index.ssm")
+    def test_event_for_another_deployments_bucket_provisions_nothing(self, mock_ssm, mock_sd, mock_ecs):
+        import importlib
+
+        import index
+
+        importlib.reload(index)
+        index.ecs = mock_ecs
+        index.sd = mock_sd
+        index.ssm = mock_ssm
+
+        event = {"detail": {"namespace": "test-ns", "version": "v1", "s3Bucket": "other-deployment-bucket"}}
+        result = index.handler(event, None)
+
+        assert result == {"status": "skipped", "reason": "event from another deployment"}
+        mock_ecs.describe_services.assert_not_called()
+        mock_ecs.register_task_definition.assert_not_called()
+        mock_ecs.create_service.assert_not_called()
+        mock_ecs.update_service.assert_not_called()
+        mock_sd.create_service.assert_not_called()
+
+    @patch.dict(os.environ, ENV)
+    @patch("index.ecs")
+    @patch("index.sd")
+    @patch("index.ssm")
+    def test_event_for_this_deployments_bucket_is_reloaded(self, mock_ssm, mock_sd, mock_ecs):
+        mock_ssm.get_parameter.return_value = {"Parameter": {"Value": "111.dkr.ecr.us-west-2.amazonaws.com/scl:vkg-A"}}
+        mock_ecs.describe_services.return_value = {"services": [{"taskDefinition": "arn:td:old"}]}
+        mock_ecs.describe_task_definition.return_value = {
+            "taskDefinition": {"containerDefinitions": [{"image": "111.dkr.ecr.us-west-2.amazonaws.com/scl:vkg-B"}]}
+        }
+        mock_ecs.register_task_definition.return_value = {"taskDefinition": {"taskDefinitionArn": "arn:td:rev2"}}
+        mock_ecs.update_service.return_value = {"service": {"deployments": [{"id": "d1"}]}}
+
+        import importlib
+
+        import index
+
+        importlib.reload(index)
+        index.ecs = mock_ecs
+        index.sd = mock_sd
+        index.ssm = mock_ssm
+
+        event = {"detail": {"namespace": "test-ns", "version": "v1", "s3Bucket": ENV["ONTOLOGY_BUCKET"]}}
+        assert index.handler(event, None)["status"] == "reload_triggered"
+        mock_ecs.update_service.assert_called_once()
+
+
 class TestSweep:
     """Scheduled-sweep mode: reconcile every per-namespace VKG service."""
 
@@ -1259,6 +1313,112 @@ class TestSweep:
         env = {e["name"]: e["value"] for e in td_kwargs["containerDefinitions"][0]["environment"]}
         assert env["ONTOP_JAVA_ARGS"] == "-Xmx1536m -Xms512m -Dserver.address=127.0.0.1"
 
+    @staticmethod
+    def _new_image_reload(mock_ssm, mock_sd, mock_ecs, create_raises=None, legacy_raises=None):
+        """Load the handler for a reload that registers a new revision; return it and the call order.
+
+        ``create_raises`` is ``"exists"`` or ``"denied"`` to make ``create_log_group`` raise;
+        ``legacy_raises`` is ``"missing"`` or ``"denied"`` for retention on the legacy group.
+        """
+        import importlib
+
+        import index
+
+        mock_ssm.get_parameter.return_value = {
+            "Parameter": {"Value": "111.dkr.ecr.us-west-2.amazonaws.com/scl:vkg-NEW"}
+        }
+        mock_ecs.describe_services.return_value = {"services": [{"taskDefinition": "arn:td:old"}]}
+        mock_ecs.describe_task_definition.return_value = {
+            "taskDefinition": {"containerDefinitions": [{"image": "111.dkr.ecr.us-west-2.amazonaws.com/scl:vkg-OLD"}]}
+        }
+        mock_ecs.update_service.return_value = {"service": {"deployments": [{"id": "deploy-1"}]}}
+        importlib.reload(index)
+        index.ecs = mock_ecs
+        index.sd = mock_sd
+        index.ssm = mock_ssm
+        order = []
+        already_exists = type("ResourceAlreadyExistsException", (Exception,), {})
+        not_found = type("ResourceNotFoundException", (Exception,), {})
+        index.logs.exceptions.ResourceAlreadyExistsException = already_exists
+        index.logs.exceptions.ResourceNotFoundException = not_found
+        errors = {"exists": already_exists("exists"), "denied": RuntimeError("AccessDenied")}
+        legacy_errors = {"missing": not_found("missing"), "denied": RuntimeError("AccessDenied")}
+
+        def create_log_group(**_):
+            order.append("create_log_group")
+            if create_raises:
+                raise errors[create_raises]
+
+        def put_retention_policy(logGroupName, **_):
+            order.append(("put_retention_policy", logGroupName))
+            if legacy_raises and logGroupName == "/ecs/vkg-test-ns":
+                raise legacy_errors[legacy_raises]
+
+        def register_task_definition(**_):
+            order.append("register_task_definition")
+            return {"taskDefinition": {"taskDefinitionArn": "arn:td:ns-rev2"}}
+
+        index.logs.create_log_group.side_effect = create_log_group
+        index.logs.put_retention_policy.side_effect = put_retention_policy
+        mock_ecs.register_task_definition.side_effect = register_task_definition
+        return index, order
+
+    @pytest.mark.parametrize("create_raises", [None, "exists"])
+    @patch.dict(os.environ, ENV)
+    @patch("index.ecs")
+    @patch("index.sd")
+    @patch("index.ssm")
+    def test_task_logs_to_a_prefixed_group_that_has_retention(self, mock_ssm, mock_sd, mock_ecs, create_raises):
+        """New or already there, the group has 30-day retention before the revision is registered."""
+        index, order = self._new_image_reload(mock_ssm, mock_sd, mock_ecs, create_raises)
+
+        assert index.handler(_make_event(), None)["status"] == "reload_triggered"
+
+        options = mock_ecs.register_task_definition.call_args.kwargs["containerDefinitions"][0]["logConfiguration"][
+            "options"
+        ]
+        assert options["awslogs-group"] == "/ecs/coa-dev-vkg-test-ns"
+        assert options["awslogs-create-group"] == "true"
+        index.logs.create_log_group.assert_called_once_with(logGroupName="/ecs/coa-dev-vkg-test-ns")
+        assert order == [
+            "create_log_group",
+            ("put_retention_policy", "/ecs/coa-dev-vkg-test-ns"),
+            ("put_retention_policy", "/ecs/vkg-test-ns"),
+            "register_task_definition",
+        ]
+        assert {c.kwargs["retentionInDays"] for c in index.logs.put_retention_policy.call_args_list} == {30}
+
+    @pytest.mark.parametrize("legacy_raises", ["missing", "denied"])
+    @patch.dict(os.environ, ENV)
+    @patch("index.ecs")
+    @patch("index.sd")
+    @patch("index.ssm")
+    def test_legacy_group_retention_is_best_effort(self, mock_ssm, mock_sd, mock_ecs, legacy_raises, capsys):
+        """A missing or unwritable legacy group does not stop the reload; only a real failure is logged."""
+        index, _ = self._new_image_reload(mock_ssm, mock_sd, mock_ecs, legacy_raises=legacy_raises)
+
+        assert index.handler(_make_event(), None)["status"] == "reload_triggered"
+
+        mock_ecs.register_task_definition.assert_called_once()
+        assert ("legacy_log_retention_failed" in capsys.readouterr().out) == (legacy_raises == "denied")
+
+    @patch.dict(os.environ, ENV)
+    @patch("index.ecs")
+    @patch("index.sd")
+    @patch("index.ssm")
+    def test_a_failed_log_group_setup_fails_the_reload_before_registering(self, mock_ssm, mock_sd, mock_ecs):
+        mock_ecs.exceptions.ServiceNotFoundException = type("ServiceNotFoundException", (Exception,), {})
+        mock_ecs.exceptions.ServiceNotActiveException = type("ServiceNotActiveException", (Exception,), {})
+        index, _ = self._new_image_reload(mock_ssm, mock_sd, mock_ecs, "denied")
+
+        with pytest.raises(RuntimeError, match="AccessDenied"):
+            index.handler(_make_event(), None)
+
+        mock_ecs.register_task_definition.assert_not_called()
+        mock_ecs.update_service.assert_not_called()
+        metrics = [c.kwargs["MetricData"][0]["MetricName"] for c in index.cloudwatch.put_metric_data.call_args_list]
+        assert "ReloadFailed" in metrics
+
     @patch.dict(os.environ, {**ENV, "VKG_TASK_MEMORY": "8192"}, clear=False)
     @patch("index.ecs")
     @patch("index.sd")
@@ -1415,6 +1575,27 @@ class TestTaskDefinitionLifecycle:
 
         assert result["status"] == "provisioned"
         assert mock_ecs.register_task_definition.call_count == 1
+
+    @patch.dict(os.environ, ENV)
+    @patch("index.ecs")
+    @patch("index.sd")
+    @patch("index.ssm")
+    def test_first_provision_logs_to_the_prefixed_group_with_retention(self, mock_ssm, mock_sd, mock_ecs):
+        index = self._load(mock_ssm, mock_sd, mock_ecs)
+        mock_ecs.describe_services.return_value = {"services": [], "failures": [{"reason": "MISSING"}]}
+        mock_ecs.update_service.side_effect = mock_ecs.exceptions.ServiceNotFoundException("not found")
+        self._registers(mock_ecs, 1)
+        mock_sd.create_service.return_value = {"Service": {"Arn": "arn:sd:svc"}}
+
+        assert index.handler(_make_event(), None)["status"] == "provisioned"
+
+        td_kwargs = mock_ecs.register_task_definition.call_args.kwargs
+        assert td_kwargs["family"] == self.FAMILY
+        assert td_kwargs["containerDefinitions"][0]["logConfiguration"]["options"]["awslogs-group"] == (
+            f"/ecs/{self.FAMILY}"
+        )
+        index.logs.create_log_group.assert_called_once_with(logGroupName=f"/ecs/{self.FAMILY}")
+        index.logs.put_retention_policy.assert_any_call(logGroupName=f"/ecs/{self.FAMILY}", retentionInDays=30)
 
     @patch.dict(os.environ, ENV)
     @patch("index.ecs")

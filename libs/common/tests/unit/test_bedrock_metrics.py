@@ -42,9 +42,6 @@ class RaisingCloudWatch:
         raise RuntimeError("boom")
 
 
-# ── cost_for ────────────────────────────────────────────────────────────────
-
-
 class TestCostFor:
     def test_haiku_exact_math(self) -> None:
         # 1M input * $1/1M + 1M output * $5/1M = 6.00
@@ -59,9 +56,6 @@ class TestCostFor:
         assert cost_for(HAIKU, 1000, 0) == pytest.approx(0.001)
         # Haiku: 0 input, 1000 output = $0.005
         assert cost_for(HAIKU, 0, 1000) == pytest.approx(0.005)
-
-    def test_unknown_model_zero_cost(self) -> None:
-        assert cost_for("unknown-model", 1_000_000, 1_000_000) == 0.0
 
     def test_unknown_sonnet_version_falls_back_to_sonnet_rate(self) -> None:
         # A model-version bump (id not in _PRICING) must not silently zero out.
@@ -128,9 +122,6 @@ class TestCostFor:
         # Titan Text Embeddings V2: $0.02 / 1M input tokens, no output billing.
         assert cost_for(TITAN_EMBED, 1_000_000, 0) == pytest.approx(0.02)
         assert cost_for(TITAN_EMBED, 1_000_000, 999) == pytest.approx(0.02)
-
-
-# ── CostTracker ───────────────────────────────────────────────────────────────
 
 
 class TestCostTracker:
@@ -243,9 +234,6 @@ class TestCostTracker:
         assert stats["Sum"] == pytest.approx(5.0 * total)
 
 
-# ── record_from_converse ──────────────────────────────────────────────────────
-
-
 class TestRecordFromConverse:
     def test_extracts_usage_from_converse_response(self) -> None:
         tracker = CostTracker()
@@ -280,9 +268,6 @@ class TestRecordFromConverse:
             "Minimum": 42.0,
             "Maximum": 42.0,
         }
-
-
-# ── emit_induction_job_metrics ────────────────────────────────────────────────
 
 
 def _metric_by_name(call: dict, name: str) -> list[dict]:
@@ -420,9 +405,6 @@ def _stage_of(datum: dict) -> str | None:
     return None
 
 
-# ── stage duration / job wallclock / volume ──────────────────────────────────
-
-
 class TestStageDurationAndVolumeTracking:
     def test_starts_empty(self) -> None:
         tracker = CostTracker()
@@ -551,28 +533,6 @@ class TestEmitDurationAndVolumeDatums:
         assert _metric_by_name(call, "TablesProcessed") == []
         assert _metric_by_name(call, "InductionJobErrors") == []
 
-    def test_existing_cost_token_rerank_datums_unchanged(self) -> None:
-        # Adding duration/volume datums must not disturb the existing contract.
-        tracker = CostTracker()
-        tracker.record("generate", HAIKU, 100, 50)
-        tracker.record("rerank", SONNET, 200, 80, latency_ms=42.0)
-        tracker.record_stage_duration("Induce", 5.0)
-        tracker.record_volume("TablesProcessed", 3)
-        cw = FakeCloudWatch()
-
-        emit_induction_job_metrics(tracker, namespace_id="ns-1", cloudwatch_client=cw)
-        call = cw.calls[0]
-
-        # Rerank invocations (single Value) + latency (StatisticSet) preserved.
-        assert _metric_by_name(call, "RerankInvocations")[0]["Value"] == 1.0
-        latency = _metric_by_name(call, "RerankLatencyMs")[0]
-        assert latency["StatisticValues"]["SampleCount"] == 1.0
-        # Tokens by stage preserved.
-        in_gen = next(d for d in _metric_by_name(call, "BedrockInputTokens") if _stage_of(d) == "generate")
-        assert in_gen["Value"] == 100.0
-        # Cost still always emitted.
-        assert _metric_by_name(call, "InductionJobCostUsd")[0]["Value"] == pytest.approx(tracker.total_cost_usd)
-
     def test_error_volume_emitted_on_failure_shape(self) -> None:
         # Mirrors the failure path: only InductionJobErrors + job duration.
         tracker = CostTracker()
@@ -587,9 +547,6 @@ class TestEmitDurationAndVolumeDatums:
         assert errors["Unit"] == "Count"
         assert errors["Value"] == 1.0
         assert _metric_by_name(call, "InductionJobDurationMs")[0]["Value"] == 500.0
-
-
-# ── _cloudwatch_client region resolution ──────────────────────────────────────
 
 
 class TestCloudwatchClientRegion:

@@ -53,7 +53,7 @@ const TOUCHED = [
 /**
  * Writes the fixture jar and resets every variable either stack reads around each test.
  *
- * The single-target variables are set for every suite, including the managed ones: a stage-1 `.env`
+ * The single-target variables are set for every suite, including the managed ones: a single-endpoint `.env`
  * sourced in the deployer's shell is the usual mistake, and the managed stack reading none of them is
  * what makes it harmless.
  */

@@ -10,7 +10,7 @@ import time
 from typing import Any
 
 import boto3
-from boto3.dynamodb.conditions import ConditionBase, Key  # noqa: F401 — re-exported for callers
+from boto3.dynamodb.conditions import ConditionBase
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
@@ -39,13 +39,7 @@ class DynamoDBDAO(DatastoreDAO):
     """
 
     def __init__(self, table_name: str, *, region: str, config: Config | None = None) -> None:
-        """Bind the DAO to a DynamoDB table resource.
-
-        Args:
-            table_name: The DynamoDB table name.
-            region: AWS region hosting the table.
-            config: Optional botocore timeout/retry configuration.
-        """
+        """Bind the DAO to a DynamoDB table resource."""
         self._table_name = table_name
         self._resource = boto3.resource(
             "dynamodb",
@@ -53,10 +47,6 @@ class DynamoDBDAO(DatastoreDAO):
             config=config if config is not None else async_boto_config(),
         )
         self._table = self._resource.Table(table_name)
-
-    # ------------------------------------------------------------------
-    # Read
-    # ------------------------------------------------------------------
 
     def get(
         self,
@@ -94,21 +84,9 @@ class DynamoDBDAO(DatastoreDAO):
             raise
 
     def get_attribute(self, key: dict[str, Any], attribute: str) -> Any | None:
-        """Fetch a single attribute of an item by primary key.
-
-        Args:
-            key: Primary key attributes identifying the item.
-            attribute: Name of the attribute to project and return.
-
-        Returns:
-            The attribute value, or None if the item or attribute is absent.
-        """
+        """Fetch a single attribute of an item by primary key, or None if absent."""
         item = self.get(key, projection=[attribute])
         return item.get(attribute) if item else None
-
-    # ------------------------------------------------------------------
-    # Write
-    # ------------------------------------------------------------------
 
     def put(
         self,
@@ -230,11 +208,7 @@ class DynamoDBDAO(DatastoreDAO):
             return False
 
     def delete(self, key: dict[str, Any]) -> None:
-        """Delete a single item by primary key.
-
-        Args:
-            key: Primary key attributes identifying the item to delete.
-        """
+        """Delete a single item by primary key."""
         self._table.delete_item(Key=key)
 
     def atomic_increment(
@@ -293,20 +267,8 @@ class DynamoDBDAO(DatastoreDAO):
             ExpressionAttributeValues=values,
         )
 
-    # ------------------------------------------------------------------
-    # Query
-    # ------------------------------------------------------------------
-
     def query(self, params: QueryParams) -> PaginatedResult:
-        """Run a key-conditioned query against the table or a secondary index.
-
-        Args:
-            params: Query parameters (key condition, expression bindings, index,
-                sort direction, limit, pagination cursor, and read consistency).
-
-        Returns:
-            A page of matching items plus the ``LastEvaluatedKey`` cursor, if any.
-        """
+        """Run a key-conditioned query against the table or a secondary index."""
         kwargs: dict[str, Any] = {
             "KeyConditionExpression": params.key_condition,
             "ExpressionAttributeValues": params.expression_values,
@@ -328,10 +290,6 @@ class DynamoDBDAO(DatastoreDAO):
             items=resp.get("Items", []),
             last_evaluated_key=resp.get("LastEvaluatedKey"),
         )
-
-    # ------------------------------------------------------------------
-    # Batch
-    # ------------------------------------------------------------------
 
     def batch_get(self, keys: list[dict[str, Any]], *, _max_retries: int = 3) -> list[dict[str, Any]]:
         """Fetch multiple items by key, chunking and retrying unprocessed keys.
@@ -394,10 +352,6 @@ class DynamoDBDAO(DatastoreDAO):
                         f"after {_max_retries} retries"
                     )
 
-    # ------------------------------------------------------------------
-    # Scan
-    # ------------------------------------------------------------------
-
     def scan(
         self,
         *,
@@ -406,17 +360,7 @@ class DynamoDBDAO(DatastoreDAO):
         limit: int | None = None,
         exclusive_start_key: dict[str, Any] | None = None,
     ) -> PaginatedResult:
-        """Scan the table, optionally filtered and paginated.
-
-        Args:
-            filter_expression: Optional filter expression applied server-side.
-            expression_values: Placeholder → value bindings for the filter.
-            limit: Maximum number of items to evaluate for this page.
-            exclusive_start_key: Pagination cursor from a prior scan.
-
-        Returns:
-            A page of items plus the ``LastEvaluatedKey`` cursor, if any.
-        """
+        """Scan the table, optionally filtered and paginated."""
         kwargs: dict[str, Any] = {}
         if filter_expression:
             kwargs["FilterExpression"] = filter_expression
@@ -432,10 +376,6 @@ class DynamoDBDAO(DatastoreDAO):
             items=resp.get("Items", []),
             last_evaluated_key=resp.get("LastEvaluatedKey"),
         )
-
-    # ------------------------------------------------------------------
-    # Transaction
-    # ------------------------------------------------------------------
 
     def transact_write(self, items: list[dict[str, Any]]) -> None:
         """Atomically write items using the low-level DynamoDB client.

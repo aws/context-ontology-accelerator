@@ -35,6 +35,7 @@ TABLE_NAME = os.getenv("DYNAMODB_TABLE", "ontology-engine")
 REGION = os.getenv("DYNAMODB_REGION", os.getenv("NA_REGION", "us-east-1"))
 DEFAULT_NAMESPACE = os.getenv("DYNAMODB_DEFAULT_NAMESPACE", "default")
 _S3_PROPOSALS_PREFIX = "proposals"
+_S3_UPLOADS_PREFIX = "ontology-uploads"
 
 _log = logging.getLogger(__name__)
 
@@ -2017,8 +2018,15 @@ def delete_all_namespace_items(namespace: str) -> int:
             if not last_key:
                 break
 
-    # Best-effort S3 teardown: sweep every offloaded job manifest under jobs/{ns}/
-    # (put_job_datasources_s3) — deleting the DDB job rows above orphans them otherwise.
-    _best_effort_delete_s3_prefix(f"jobs/{namespace}/", f"namespace {namespace} job manifests")
+    # Best-effort S3 teardown of everything this namespace wrote outside DynamoDB:
+    # offloaded job manifests (put_job_datasources_s3), every proposal's turtle and
+    # matches artifacts, and custom ontology uploads. Deleting the rows above leaves
+    # nothing that can reach these objects, so they would otherwise stay forever.
+    for s3_prefix, what in (
+        ("jobs", "job manifests"),
+        (_S3_PROPOSALS_PREFIX, "proposal artifacts"),
+        (_S3_UPLOADS_PREFIX, "ontology uploads"),
+    ):
+        _best_effort_delete_s3_prefix(f"{s3_prefix}/{namespace}/", f"namespace {namespace} {what}")
 
     return deleted

@@ -50,7 +50,7 @@ class ConnectionConfigProvidersTest
     @Test
     void theDefaultIsTheSingleEndpointMode()
     {
-        // A deployed stage-1 stack that pulls a newer jar has never heard of this variable and has to
+        // An existing single-endpoint deployment that pulls a newer jar has never heard of this variable and has to
         // behave no differently.
         assertEquals(ConfigSource.ENVIRONMENT, Settings.configSource(singleTarget()));
 
@@ -239,8 +239,7 @@ class ConnectionConfigProvidersTest
     {
         // Reads the TypeScript as text, deliberately: the CDK app writes the function's environment and the
         // jar reads it, with no compiler across the boundary and a list on each side. A one-sided rename
-        // ships green on both suites and fails at the function's initialisation. The CDK app is a separate
-        // pnpm workspace and this is a Maven module, so do not "fix" this into an import.
+        // ships green on both suites and fails at the function's initialisation.
         String source = cdkStackSource();
 
         // CONTAINMENT, not equality, and in this direction only. The app legitimately names a key the jar

@@ -65,13 +65,19 @@ Options:
   objects (`name` 1–256 characters and unique case-insensitively, `value` up
   to 4000 characters, `operator` only `=`)
 - `timeoutMs` — cap the server-side resolution budget for this request, an
-  integer from 1 to 29000 (the REST ceiling). It can only *lower* the budget;
-  a value outside that range is rejected with `400`.
+  integer from 1 to 29000. It can only *lower* the budget. Over REST the
+  answer must also arrive within the REST deadline (about 28 s from when API
+  Gateway passes the authorized request on, see below), so a larger value gives no extra
+  time. A value outside that range is rejected with `400`.
 
 > **⚠️ REST has a hard 29-second timeout.** The REST endpoint runs behind API
 > Gateway, whose integration timeout is a fixed **29 s** (`timeoutInMillis: 29000`)
-> that **cannot be raised**. A query that needs longer than 29 s server-side does
-> not return over REST — it responds with:
+> that **cannot be raised**. The data layer stops waiting for the Context Manager
+> about 1 s before that limit, counted from when the gateway calls the data layer
+> after the authorizer has returned (so a data-layer cold start counts against it,
+> the authorizer's time does not), so that its own error reaches you instead
+> of the gateway's. A query that needs longer does not return over REST — it
+> responds with `504`:
 >
 > ```json
 > { "error": "rest_deadline_exceeded", "limitMs": 29000,
@@ -83,8 +89,8 @@ Options:
 > server-side; the error means only that it cannot be delivered within the REST
 > budget, **not** that the service is down or the query is malformed. For those
 > queries, use the **streaming endpoint** (below), which has a much larger budget.
-> Fast structured lookups (Tier 1 / Tier 2 single-shot) fit comfortably inside 29 s
-> and are well suited to REST.
+> Fast structured lookups (Tier 1 / Tier 2 single-shot) usually finish well inside
+> the REST deadline and are well suited to REST.
 
 ### Streaming (recommended for interactive query)
 
@@ -134,7 +140,7 @@ schema. On both REST and streaming:
 This is the path the [Playground](#playground-web-app) uses, and the recommended
 default for building interactive clients. Reserve the synchronous REST endpoint for
 short, scriptable calls where a single blocking request is simpler and the work
-reliably fits inside 29 s.
+reliably fits inside the REST deadline (about 28 s).
 
 #### Selecting a Tier-2 engine — `strategy`
 
@@ -956,5 +962,5 @@ See these operations in the [API Reference](#/api-reference) for their full requ
 | 403 Access Denied | No role grant for this namespace | Grant the user a role via Permissions |
 | Empty results | No metrics/ontology defined | Connect sources, define metrics, or induce ontology first |
 | SQL Firewall denied | User's grant restricts access to referenced tables | Update the user's table allowlist |
-| 504 Timeout / `rest_deadline_exceeded` | Query exceeded the hard 29 s REST (API Gateway) ceiling — common for Tier 3 synthesis (20–90 s) | Use the [streaming endpoint](#streaming-recommended-for-interactive-query) (170 s budget), lower scope via `tierOverride`, or simplify the question. Not a connectivity failure — the query may still be completing server-side. |
+| 504 Timeout / `rest_deadline_exceeded` | Query did not finish within the REST deadline (about 28 s, just under the hard 29 s API Gateway ceiling) — common for Tier 3 synthesis (20–90 s) | Use the [streaming endpoint](#streaming-recommended-for-interactive-query) (170 s budget), lower scope via `tierOverride`, or simplify the question. Not a connectivity failure — the query may still be completing server-side. |
 | "No tier produced results" | Question doesn't match any resolution strategy | Rephrase, or ensure relevant data is modeled |

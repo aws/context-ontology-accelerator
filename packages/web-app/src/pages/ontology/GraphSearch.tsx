@@ -929,9 +929,10 @@ export function GraphSearchPage() {
   // The "loaded once" latch is a ref (only read as a guard, never rendered), so
   // setting it never re-runs the effect — that self-invalidation was the earlier
   // spinner deadlock. Reset on namespace change so a fresh namespace re-seeds.
-  // Graph-view ontology scope: "All ontologies" (default, seed everything) or a
-  // single ontology (seed just that one). Separate from the List view's filter,
-  // and declared here so the seed effect below can depend on it.
+  // Graph-view ontology scope: "All ontologies" (seed everything) or a single
+  // ontology (seed just that one). Separate from the List view's filter but
+  // defaulted the same way when the registry loads, and declared here so the
+  // seed effect below can depend on it.
   const [graphOntologyFilter, setGraphOntologyFilter] =
     useState(ALL_ONTOLOGIES_VALUE);
   const graphOntologyId =
@@ -1085,6 +1086,7 @@ export function GraphSearchPage() {
         // Defaulted here, once per registry load. The filter control is
         // disabled until then, so this never overwrites a user's choice.
         setOntologyFilter(defaultOntologyFilterValue(byId));
+        setGraphOntologyFilter(defaultOntologyFilterValue(byId));
         setRegistrySettledFor(namespaceId);
       })
       .catch(() => {
@@ -1749,6 +1751,7 @@ export function GraphSearchPage() {
                     )
                   }
                   options={ontologyFilterOptions}
+                  disabled={!ontologyRegistrySettled}
                   ariaLabel="Show one ontology or all"
                   expandToViewport
                 />

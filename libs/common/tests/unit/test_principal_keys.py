@@ -45,8 +45,7 @@ class TestSanitizePrincipalKey:
         the ``email`` claim on a JWT and the string an admin types into the
         UI grant form aren't guaranteed to match case. Without normalization,
         ``User::Alice@Example.com`` and ``User::alice@example.com`` would be
-        two DIFFERENT rows in the RRM table — the exact silent-miss bug the
-        rest of this MR is trying to eliminate.
+        two DIFFERENT rows in the RRM table — a silent-miss bug.
         """
         assert sanitize_principal_key("Alice@Example.com") == "alice@example.com"
         assert sanitize_principal_key("ALICE@EXAMPLE.COM") == "alice@example.com"

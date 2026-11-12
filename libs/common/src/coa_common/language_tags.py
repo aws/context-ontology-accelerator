@@ -62,11 +62,7 @@ def canonicalize_language_tag(value: str) -> str:
     rejected. The language subtag is lower-cased, the script title-cased and an
     alphabetic region upper-cased; a numeric region is unchanged.
 
-    Args:
-        value: The tag as supplied by the caller.
-
-    Returns:
-        The canonical tag, e.g. ``"pt-BR"`` for ``" PT-br "``.
+    Returns the canonical tag, e.g. ``"pt-BR"`` for ``" PT-br "``.
 
     Raises:
         LanguageTagError: If the value is empty or outside the supported
@@ -105,12 +101,7 @@ def effective_namespace_language(namespace_item: Mapping[str, Any]) -> str:
     must have already loaded the item: a missing item or a failed read is an
     error the caller reports, never an English default.
 
-    Args:
-        namespace_item: The ``NS#<id>`` / ``METADATA`` item from the
-            namespaces table.
-
-    Returns:
-        The stored canonical language, or ``"en"`` for a legacy item.
+    Returns the stored canonical language, or ``"en"`` for a legacy item.
 
     Raises:
         TypeError: If no item was supplied.

@@ -34,23 +34,10 @@ public final class DatabricksCredential
     public enum Mode
     {
         /** {@code AuthMech=3} — a personal access token, presented as user {@code token}. */
-        PERSONAL_ACCESS_TOKEN("personal access token"),
+        PERSONAL_ACCESS_TOKEN,
 
         /** {@code AuthMech=11}, {@code Auth_Flow=1} — OAuth 2.0 client credentials. */
-        OAUTH_M2M("OAuth machine-to-machine");
-
-        private final String description;
-
-        Mode(String description)
-        {
-            this.description = description;
-        }
-
-        /** A phrase for a log line or an error message. */
-        public String description()
-        {
-            return description;
-        }
+        OAUTH_M2M
     }
 
     /** Secret key selecting {@link Mode#PERSONAL_ACCESS_TOKEN}. */

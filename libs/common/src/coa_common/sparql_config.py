@@ -215,14 +215,6 @@ class SparqlSourceConfig(BaseModel):
         """``https://host:port`` — the root a management/status probe addresses."""
         return f"https://{self.host}:{self.effective_port}"
 
-    @property
-    def query_url(self) -> str:
-        """The SPARQL query endpoint the A-Box is read through."""
-        path = _split_endpoint(self.data_endpoint).path
-        if not path or path == "/":
-            path = self.spec.default_query_path
-        return f"{self.base_url}{path}"
-
     def signing_region(self, default: str) -> str:
         """Region to sign SigV4 requests for: the configured one, else ``default``."""
         return self.region or default

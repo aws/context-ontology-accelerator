@@ -54,7 +54,82 @@ def test_library_error_keeps_type_and_redacted_reason() -> None:
         pass
 
     msg = client_safe_error(PdfReadError("EOF marker not found in s3://bucket/123456789012/a.pdf"))
-    assert msg == "PdfReadError: EOF marker not found in s3://bucket/<account>/a.pdf"
+    assert msg == "PdfReadError: EOF marker not found in <s3-uri>"
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        (
+            "Failed to list staged files under s3://example-staging-bucket/ns-1/staging/",
+            "Failed to list staged files under <s3-uri>",
+        ),
+        (
+            "Unable to read input data from s3://example-batch-bucket/batch/in/records.jsonl. Check the role's access.",
+            "Unable to read input data from <s3-uri>. Check the role's access.",
+        ),
+    ],
+    ids=["kg-build-staging", "bedrock-batch"],
+)
+def test_s3_uris_are_not_returned(message: str, expected: str) -> None:
+    assert redact(message) == expected
+
+
+def test_toolkit_message_naming_a_bucket_is_redacted() -> None:
+    message = "No output files found in bucket example-sources-bucket under prefix ns-1/batch-inference/ds-1/"
+    assert redact(message) == "No output files found in bucket <bucket> under prefix ns-1/batch-inference/ds-1/"
+    assert redact("Output not found in bucket example-sources-bucket.") == "Output not found in bucket <bucket>."
+
+
+@pytest.mark.parametrize(
+    "message",
+    ["Check the bucket policy.", "No such bucket exists.", "The S3 bucket specified."],
+    ids=["policy", "exists", "specified"],
+)
+def test_ordinary_word_after_bucket_is_kept(message: str) -> None:
+    assert redact(message) == message
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("Access denied for bucket coa-spill-bkt: check policy", "Access denied for bucket <bucket>: check policy"),
+        ("in bucket 'coa-data-1': Access Denied", "in bucket <bucket>: Access Denied"),
+    ],
+    ids=["unquoted", "quoted"],
+)
+def test_bucket_name_followed_by_a_colon_is_redacted(message: str, expected: str) -> None:
+    assert redact(message) == expected
+
+
+def test_bare_service_bucket_names_are_not_returned(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BUCKET_NAME", "example-sources-bucket")
+    monkeypatch.setenv("ATHENA_SPILL_BUCKET", "example-spill-bucket")
+    message = "Cannot read example-sources-bucket/ns-1/in.jsonl or write example-spill-bucket/ns-1/out.csv"
+    assert "example-" not in redact(message)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://s3.us-east-1.amazonaws.com/example-other-bucket/ns-1/in.jsonl",
+        "https://example-other-bucket.s3.us-east-1.amazonaws.com/ns-1/in.jsonl",
+    ],
+    ids=["path-style", "virtual-hosted"],
+)
+def test_s3_https_urls_are_not_returned(monkeypatch: pytest.MonkeyPatch, url: str) -> None:
+    monkeypatch.delenv("BUCKET_NAME", raising=False)
+    monkeypatch.delenv("ATHENA_SPILL_BUCKET", raising=False)
+    assert redact(f"Access denied: {url}") == "Access denied: <s3-uri>"
+
+
+def test_tag_guidance_keeps_the_tag_key() -> None:
+    message = (
+        "bucket 'example-customer-bucket' does not authorize namespace ns-1: "
+        "tag the bucket my-coa:namespace=<namespaceId> (space-separated for several namespaces)"
+    )
+    assert "tag the bucket my-coa:namespace=<namespaceId>" in redact(message)
+    assert redact("tag the bucket 'my-coa:namespace=x'") == "tag the bucket 'my-coa:namespace=x'"
 
 
 def test_library_error_without_safe_text_names_only_its_type() -> None:

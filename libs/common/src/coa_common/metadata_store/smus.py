@@ -41,14 +41,8 @@ _RETRYABLE_MEMBERSHIP_ERROR_CODES = frozenset(
 )
 
 
-# Adaptive retry for the DataZone client. Bulk discovery writes one CreateAsset
-# per table; at scale (many sources scanning concurrently) these collide on
-# DataZone's account-wide write rate limit and return TooManyRequestsException.
-# botocore's default (~4 attempts, no client-side rate limiter) exhausts and
-# leaves tables unwritten (issue #857). "adaptive" mode adds a client-side rate
-# limiter that backs the WHOLE client off under throttling — the right lever for
-# an aggregate-rate problem — and the higher attempt cap lets a transient
-# throttle retry to completion.
+# Adaptive mode adds a client-side rate limiter for DataZone's account-wide write
+# limit, which bulk CreateAsset calls hit.
 # ponytail: config-only retry tuning; per-Lambda write concurrency is already
 # bounded by the ThreadPoolExecutor in metadata_writer and scan-Lambda fan-out
 # by the scan queue's maxConcurrency=5. Raise max_attempts if throttling still
@@ -79,14 +73,7 @@ class SMUSClient(MetadataStoreClient):
         assume_role_arn: str | None = None,
         session_name: str | None = None,
     ) -> None:
-        """Build the DataZone client, optionally assuming an IAM role first.
-
-        Args:
-            domain_id: SMUS domain identifier.
-            region_name: AWS region; defaults to the SDK default chain.
-            assume_role_arn: Optional IAM role ARN to assume before DataZone calls.
-            session_name: Optional STS session name for the CloudTrail audit trail.
-        """
+        """Build the DataZone client, optionally assuming an IAM role first."""
         self._domain_id = domain_id
 
         if assume_role_arn:
@@ -105,18 +92,8 @@ class SMUSClient(MetadataStoreClient):
         else:
             self._client = boto3.client("datazone", region_name=region_name, config=_DATAZONE_RETRY_CONFIG)
 
-    # ── Projects ──────────────────────────────────────────────────
-
     def create_project(self, *, name: str, description: str = "", project_profile_id: str = "") -> ProjectResult:
         """Create a DataZone project in the configured domain.
-
-        Args:
-            name: Display name for the new project.
-            description: Optional project description.
-            project_profile_id: Optional project profile to instantiate from.
-
-        Returns:
-            The created project's id and name.
 
         Raises:
             MetadataStoreError: If the API call fails or returns no project id.
@@ -143,9 +120,6 @@ class SMUSClient(MetadataStoreClient):
     def delete_project(self, *, project_id: str) -> None:
         """Delete a DataZone project by id.
 
-        Args:
-            project_id: Identifier of the project to delete.
-
         Raises:
             MetadataStoreError: If the API call fails.
         """
@@ -159,35 +133,6 @@ class SMUSClient(MetadataStoreClient):
             msg = exc.args[0] if exc.args else str(exc)
             raise MetadataStoreError(f"Failed to delete project: {msg}") from exc
 
-    def get_project(self, *, project_id: str) -> ProjectResult:
-        """Fetch a DataZone project by id.
-
-        Args:
-            project_id: Identifier of the project to fetch.
-
-        Returns:
-            The project's id and name.
-
-        Raises:
-            MetadataStoreError: If the call fails or returns incomplete data.
-        """
-        try:
-            resp = self._client.get_project(
-                domainIdentifier=self._domain_id,
-                identifier=project_id,
-            )
-        except Exception as exc:
-            msg = exc.args[0] if exc.args else str(exc)
-            raise MetadataStoreError(f"Failed to get project: {msg}") from exc
-
-        pid = resp.get("id")
-        pname = resp.get("name")
-        if not pid or not pname:
-            raise MetadataStoreError("SMUS API returned incomplete project data")
-        return ProjectResult(project_id=pid, name=pname)
-
-    # ── Assets ────────────────────────────────────────────────────
-
     def create_asset(
         self,
         *,
@@ -198,16 +143,6 @@ class SMUSClient(MetadataStoreClient):
         forms_input: list[dict[str, str]] | None = None,
     ) -> AssetResult:
         """Create a new asset in a project.
-
-        Args:
-            project_id: Owning project identifier.
-            name: Asset display name.
-            type_identifier: DataZone asset type identifier.
-            description: Optional description (truncated to 2048 chars).
-            forms_input: Optional metadata form values to attach.
-
-        Returns:
-            The created asset's id, name, and owning project.
 
         Raises:
             MetadataStoreError: If the API call fails or returns no asset id.
@@ -252,15 +187,6 @@ class SMUSClient(MetadataStoreClient):
     ) -> AssetResult:
         """Publish a new revision of an existing asset.
 
-        Args:
-            asset_id: Identifier of the asset to revise.
-            name: Asset display name for the revision.
-            description: Optional description (truncated to 2048 chars).
-            forms_input: Optional metadata form values to attach.
-
-        Returns:
-            The revised asset's id, name, and owning project.
-
         Raises:
             MetadataStoreError: If the API call fails or returns no asset id.
         """
@@ -296,9 +222,6 @@ class SMUSClient(MetadataStoreClient):
     def delete_asset(self, *, asset_id: str) -> None:
         """Delete an asset by id.
 
-        Args:
-            asset_id: Identifier of the asset to delete.
-
         Raises:
             MetadataStoreError: If the API call fails.
         """
@@ -311,37 +234,6 @@ class SMUSClient(MetadataStoreClient):
             msg = exc.args[0] if exc.args else str(exc)
             raise MetadataStoreError(f"Failed to delete asset: {msg}") from exc
 
-    def get_asset(self, *, asset_id: str) -> AssetResult:
-        """Fetch an asset by id.
-
-        Args:
-            asset_id: Identifier of the asset to fetch.
-
-        Returns:
-            The asset's id, name, and owning project.
-
-        Raises:
-            MetadataStoreError: If the call fails or returns incomplete data.
-        """
-        try:
-            resp = self._client.get_asset(
-                domainIdentifier=self._domain_id,
-                identifier=asset_id,
-            )
-        except Exception as exc:
-            msg = exc.args[0] if exc.args else str(exc)
-            raise MetadataStoreError(f"Failed to get asset: {msg}") from exc
-
-        aid = resp.get("id")
-        aname = resp.get("name")
-        if not aid or not aname:
-            raise MetadataStoreError("SMUS API returned incomplete asset data")
-        return AssetResult(
-            asset_id=aid,
-            name=aname,
-            project_id=resp.get("owningProjectId", ""),
-        )
-
     def search_assets(
         self,
         *,
@@ -351,7 +243,6 @@ class SMUSClient(MetadataStoreClient):
         next_token: str | None = None,
         search_in_attributes: list[str] | None = None,
         include_forms: bool = False,
-        filters: dict[str, Any] | None = None,
     ) -> SearchResult:
         """Full-text search assets within a project.
 
@@ -368,8 +259,6 @@ class SMUSClient(MetadataStoreClient):
                 ``additionalAttributes=["FORMS"]``. Each returned
                 :class:`AssetResult` will have its ``forms_output``
                 populated from the response (or ``None`` when absent).
-            filters: Optional DataZone search filter clause. Use an ``EQ``
-                filter on ``name`` for an exact asset-name lookup.
 
         Returns:
             Matching assets plus the next pagination token, if any.
@@ -387,8 +276,6 @@ class SMUSClient(MetadataStoreClient):
             }
             if search_in_attributes:
                 kwargs["searchIn"] = [{"attribute": a} for a in search_in_attributes]
-            if filters:
-                kwargs["filters"] = filters
             if next_token:
                 kwargs["nextToken"] = next_token
             if include_forms:
@@ -424,17 +311,8 @@ class SMUSClient(MetadataStoreClient):
         ``DS#<sourceId>:<db>.orders`` can also match ``order_items`` and require
         many pages before the exact asset appears.
 
-        The obvious alternative — an ``EQ`` filter on the ``name`` attribute —
-        does not work here: DataZone's ``Search`` API rejects ``EQ`` against a
-        string attribute with ``ValidationException: Operator 'EQ' requires
-        'intValue' (numeric), not 'value' (string)`` (confirmed live against
-        this project's domain; ``TEXT_SEARCH`` filters and quoted phrases both
-        fail too, since the tokenizer splits on ``#``/``:``, which every asset
-        name here contains). There is no reliable server-side exact-match
-        primitive exposed for this attribute, so this pages the token search
-        instead and verifies every candidate by exact string equality — the
-        ranking noise only matters for which page a match lands on, not
-        whether it is genuinely the one asked for.
+        DataZone's ``Search`` rejects an ``EQ`` filter on string attributes, so this
+        pages the token search and compares names exactly.
 
         Args:
             project_id: Owning project to scope the search to.
@@ -471,12 +349,6 @@ class SMUSClient(MetadataStoreClient):
     def get_asset_forms(self, *, asset_id: str) -> dict[str, Any]:
         """Return the raw DataZone asset payload (including its metadata forms).
 
-        Args:
-            asset_id: Identifier of the asset to fetch.
-
-        Returns:
-            The full ``get_asset`` response as a dict.
-
         Raises:
             MetadataStoreError: If the API call fails.
         """
@@ -491,33 +363,14 @@ class SMUSClient(MetadataStoreClient):
             msg = exc.args[0] if exc.args else str(exc)
             raise MetadataStoreError(f"Failed to get asset forms: {msg}") from exc
 
-    # ── User Profiles & Memberships ───────────────────────────────
-
     def create_project_membership(
         self, *, project_id: str, user_identifier: str, designation: str = "PROJECT_CONTRIBUTOR"
     ) -> None:
         """Add a user as a project member. Raises MetadataStoreError on failure.
 
-        DataZone can return a transient ``ConflictException`` immediately after
-        ``CreateProject`` (its optimistic-lock version state has not settled),
-        and can throttle the call. Both are retried with bounded exponential
-        backoff + jitter up to ``_MEMBERSHIP_MAX_ATTEMPTS``.
-
-        A conflict (or retryable error) that survives the retries is raised,
-        NOT treated as success. The DataZone API does not document a distinct
-        "member already exists" outcome — the ``CreateProjectMembership`` model
-        does not even list ``ConflictException``, and the shape's only
-        documentation is "There is a conflict while performing this action" —
-        so we cannot safely assume a surviving conflict means the member is
-        already present. Failing loud is correct here: the sole caller adds the
-        member to a freshly created project (where it cannot pre-exist), and a
-        namespace whose role is not actually registered must not be reported as
-        successfully created.
-
-        NOTE: because of the above this is intentionally not idempotent on an
-        existing membership — re-adding an already-present member raises after
-        the retries. Reintroduce an idempotency check (e.g. verify via
-        ListProjectMemberships) before calling this from any reconcile path.
+        Transient conflicts and throttling are retried with backoff; a conflict
+        or error that persists is raised. Not idempotent on an existing
+        membership: DataZone documents no distinct "already a member" outcome.
         """
         max_attempts = _MEMBERSHIP_MAX_ATTEMPTS
         for attempt in range(1, max_attempts + 1):

@@ -9,7 +9,6 @@ from coa_common.metadata_store import (
     MetadataStoreError,
     ProjectResult,
     SMUSClient,
-    smus,  # noqa: F401 — enables mock.patch paths
 )
 
 __all__ = [

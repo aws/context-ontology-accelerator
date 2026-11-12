@@ -6,8 +6,6 @@ import * as cdk from "aws-cdk-lib";
 import { Match, Template } from "aws-cdk-lib/assertions";
 import { Provisioning } from "coa-connector-cdk";
 import {
-  CONNECTOR_DATABASE,
-  CONNECTOR_TABLES,
   DEFAULT_JAR_PATH,
   HANDLER,
   ExampleConnectorStack,
@@ -133,8 +131,6 @@ describe("bulk_rows sizing from the environment", () => {
         }),
       },
     });
-    // 4096 x 2048 = 8 MiB in one split, comfortably over Athena's 6 MB response limit.
-    expect(4096 * 2048).toBeGreaterThan(6 * 1024 * 1024);
   });
 });
 
@@ -170,12 +166,10 @@ describe("outputs the integration tests read", () => {
 
   it("names the database and tables the Java declares", () => {
     // Restated across languages with nothing enforcing it, so at least pin what is published.
-    expect(CONNECTOR_DATABASE).toBe("example_source");
     synth().hasOutput("ConnectorDatabase", { Value: "example_source" });
     synth().hasOutput("ConnectorTables", {
       Value: "customers,orders,order_lines,shipment_lines,bulk_rows",
     });
-    expect(CONNECTOR_TABLES).toHaveLength(5);
   });
 
   it("reports spill resources as absent rather than omitting them under Provisioning.NONE", () => {

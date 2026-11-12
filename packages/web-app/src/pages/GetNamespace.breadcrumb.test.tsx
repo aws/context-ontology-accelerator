@@ -58,7 +58,6 @@ vi.mock("../api-hooks/use-metrics", () => ({
   }),
 }));
 
-// One client for every render, as the real provider's memoized context gives.
 const { apiClient } = vi.hoisted(() => ({
   apiClient: { get: vi.fn().mockResolvedValue([]) },
 }));

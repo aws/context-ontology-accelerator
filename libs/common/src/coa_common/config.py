@@ -40,11 +40,8 @@ class SCLConfig(BaseSettings):
     environment: str = "dev"
     log_level: str = "INFO"
 
-    # AWS — SCL_AWS_REGION wins when set; otherwise resolve from the runtime
-    # environment (AWS_REGION, then AWS_DEFAULT_REGION, then us-east-1).
-    # Nothing in infra/ sets SCL_AWS_REGION, so a hardcoded default here would
-    # silently pin any consumer to us-east-1 in every other region — the same
-    # mismatch that broke every MCP tool outside us-east-1 (#92).
+    # AWS — SCL_AWS_REGION wins when set; otherwise resolve_region(). A hardcoded
+    # default would pin every region to us-east-1.
     aws_region: str = Field(default_factory=resolve_region)
 
     # DynamoDB

@@ -74,14 +74,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
     platform namespace key; with a ``principal`` filter, queries the principal
     GSI and restricts results to the platform resource. Supports pagination via
     ``maxResults`` and ``nextToken``.
-
-    Args:
-        event: API Gateway proxy event with optional query-string filters.
-        context: Lambda context object (unused).
-
-    Returns:
-        An API Gateway proxy response: 200 with the grant page and next token,
-        or a 4xx/5xx error response.
     """
     query_params = event.get("queryStringParameters") or {}
     principal = query_params.get("principal")

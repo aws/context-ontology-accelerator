@@ -14,7 +14,7 @@ import java.util.Locale;
  */
 public enum ConfigSource
 {
-    /** Stage-1 behaviour: one deployment, one endpoint, fixed at deploy time. The default. */
+    /** Single-endpoint behaviour: one deployment, one endpoint, fixed at deploy time. The default. */
     ENVIRONMENT("environment"),
 
     /** One deployment serving every Databricks source in a COA deployment, resolved per catalog. */

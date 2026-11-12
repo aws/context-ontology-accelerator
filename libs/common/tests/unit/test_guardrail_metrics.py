@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for guardrail decision observability (#111 AC10/AC11/AC12)."""
+"""Unit tests for guardrail decision observability."""
 
 from __future__ import annotations
 
@@ -10,12 +10,15 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from coa_common.guardrail_metrics import (
+    DECISION_ANONYMIZED,
+    DECISION_UNKNOWN,
     METRICS_NAMESPACE,
     _client_for_region,
     _cloudwatch_client,
     assessments_from_trace,
     emit_guardrail_decision,
     filter_type_from_assessments,
+    redacted_actions,
 )
 
 pytestmark = pytest.mark.unit
@@ -80,6 +83,15 @@ class TestFilterTypeFromAssessments:
 
     def test_content_wins_over_pii_when_both_fire(self):
         assert filter_type_from_assessments([_ANONYMIZE, _BLOCK]) == "CONTENT"
+
+
+def test_redacted_actions_skips_an_action_of_none_like_filter_type():
+    assessment = {
+        "contentPolicy": {
+            "filters": [{"type": "HATE", "action": "NONE"}, {"type": "PROMPT_ATTACK", "action": "BLOCKED"}]
+        }
+    }
+    assert redacted_actions([assessment]) == ["contentPolicy:PROMPT_ATTACK=BLOCKED"]
 
 
 class TestAssessmentsFromTrace:
@@ -238,7 +250,7 @@ class TestEmitEmfTransport:
 
 
 class TestDecisionLogLine:
-    """AC11: one structured decision line, on allow AND block."""
+    """One structured decision line, on allow AND block."""
 
     @pytest.mark.parametrize(
         ("blocked", "expected_decision"),
@@ -274,8 +286,6 @@ class TestUnknownDecision:
     """
 
     def test_explicit_decision_overrides_the_derived_one(self, capsys):
-        from coa_common.guardrail_metrics import DECISION_UNKNOWN, emit_guardrail_decision
-
         emit_guardrail_decision(
             component="serve",
             blocked=False,
@@ -292,8 +302,6 @@ class TestUnknownDecision:
 
     def test_omitted_decision_still_derives_from_blocked(self, capsys):
         """Back-compat: every pre-existing call site omits ``decision``."""
-        from coa_common.guardrail_metrics import emit_guardrail_decision
-
         emit_guardrail_decision(component="serve", blocked=True, latency_ms=1.0, transport="emf")
 
         out = capsys.readouterr().out
@@ -302,8 +310,6 @@ class TestUnknownDecision:
         assert "GuardrailUnknown" not in out
 
     def test_anonymized_decision_is_not_a_block(self, capsys):
-        from coa_common.guardrail_metrics import DECISION_ANONYMIZED, emit_guardrail_decision
-
         emit_guardrail_decision(
             component="serve",
             blocked=False,
@@ -318,8 +324,6 @@ class TestUnknownDecision:
         assert "GuardrailUnknown" not in out
 
     def test_put_transport_emits_unknown_metric(self):
-        from coa_common.guardrail_metrics import DECISION_UNKNOWN, emit_guardrail_decision
-
         cw = MagicMock()
         emit_guardrail_decision(
             component="kg-build",

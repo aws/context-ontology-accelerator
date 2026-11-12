@@ -36,12 +36,8 @@ def handler(event: dict[str, Any], context: Any) -> None:  # noqa: ARG001
 
     dao = DynamoDBDAO(table_name, region=region)
 
-    try:
-        dao.atomic_increment(
-            key={"PK": "CACHE_VERSION", "SK": "CURRENT"},
-            attribute="version",
-        )
-        logger.info("Cache version bumped")
-    except Exception:
-        logger.exception("Failed to bump cache version")
-        raise
+    dao.atomic_increment(
+        key={"PK": "CACHE_VERSION", "SK": "CURRENT"},
+        attribute="version",
+    )
+    logger.info("Cache version bumped")

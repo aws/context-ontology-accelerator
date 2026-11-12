@@ -28,15 +28,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
 
     Verifies the decoded grant belongs to the target namespace before deleting
     so grants from other namespaces cannot be revoked through this endpoint.
-
-    Args:
-        event: API Gateway proxy event with ``namespaceId`` and ``grantId``
-            path parameters.
-        context: Lambda context object (unused).
-
-    Returns:
-        An API Gateway proxy response: 200 on success, or a 4xx/5xx error
-        response.
     """
     path_params = event.get("pathParameters") or {}
     namespace_id = path_params.get("namespaceId", "")

@@ -48,12 +48,20 @@ required-version = ">=0.13.4"
 #   pyasn1: pulled by google-auth (via pyasn1-modules). <0.6.5 has quadratic-time
 #   BER/CER/DER decoding of constructed and REAL values (GHSA-mm57-4v3p-rchx,
 #   GHSA-9m75-vc3g-4x39, CVE-2026-119194/119196, HIGH). 0.6.5 is the patched floor.
+#   multidict: pulled by aiohttp and yarl. 6.7.0-6.9.0 leak references in the
+#   items-view union and subtraction of CIMultiDict/MultiDict (GHSA-54p9-h82j-f925,
+#   CVE-2026-104874, MEDIUM). 6.9.1 is the patched floor.
+#   tinytag: pulled by llama-index-core. 2.0.0-2.2.x loop forever on some M4A
+#   files with invalid atoms (GHSA-24cc-9352-h2pg, CVE-2026-104266, MEDIUM).
+#   2.3.0 is the patched floor.
 constraint-dependencies = [
     "werkzeug>=3.1.9",
     "fsspec>=2026.6.0",
     "filelock>=4.2.1",
     "aiohttp>=3.14.4",
     "pyasn1>=0.6.5",
+    "multidict>=6.9.1",
+    "tinytag>=2.3.0",
 ]
 
 [tool.uv.workspace]

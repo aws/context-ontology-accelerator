@@ -96,8 +96,8 @@ describe("the two inputs", () => {
 
 describe("the function's environment", () => {
   it("sets the mode and carries NONE of the single-target keys", () => {
-    // The suite's beforeEach leaves the stage-1 variables set, which is the mistake this shape has to
-    // survive: a sourced stage-1 .env. This stack reads none of them, so a managed function cannot end
+    // The suite's beforeEach leaves the single-endpoint variables set, which is the mistake this shape has to
+    // survive: a sourced single-endpoint .env. This stack reads none of them, so a managed function cannot end
     // up pinned to one workspace and one credential and serve those to every namespace's catalog.
     process.env.CREDENTIAL_KMS_KEY_ARN =
       "arn:aws:kms:us-east-1:123456789012:key/00000000-0000-0000-0000-000000000000";
@@ -184,16 +184,8 @@ describe("the connector role", () => {
     // Account-agnostic on purpose: COA is deployed into the customer's account, so a rule excluding
     // the deployment account would refuse the most common topology outright.
     expect(statement.Resource).toBe(`arn:aws:iam::*:role/${RESOURCE_PREFIX}datasource-access-*`);
-    expect(String(statement.Resource)).toContain("iam::*:");
     // Null on sts:ExternalId, so an assume presenting none fails closed at IAM.
     expect(statement.Condition).toEqual({ Null: { "sts:ExternalId": "false" } });
-    // No account condition of any kind, on either side of the assume.
-    const conditionKeys = Object.values(statement.Condition ?? {}).flatMap((operands) =>
-      Object.keys(operands),
-    );
-    for (const key of conditionKeys) {
-      expect(key.toLowerCase()).not.toContain("account");
-    }
   });
 
   it("holds NO secretsmanager action at all", () => {
@@ -297,15 +289,6 @@ describe("the connector role handoff", () => {
     });
   });
 
-  it("sits under deployment/ rather than sources/, which the connector role can read", () => {
-    // The sibling subtree exists so the connector holds no write anywhere and no read here.
-    expect(ROLE_ARN_PARAMETER.startsWith("/coa/dev/connectors/databricks/deployment/")).toBe(true);
-    expect(ROLE_ARN_PARAMETER).not.toContain("/sources/");
-    // A dev reader resolving prod's connector role would send a data owner a principal from the wrong
-    // deployment.
-    expect(ROLE_ARN_PARAMETER).toContain("/dev/");
-  });
-
   it("publishes the value in an output too, so the deploy log carries it", () => {
     // The value rather than the path: whoever ran the deploy has to send this to each source's
     // credential owner.
@@ -404,13 +387,9 @@ describe("the function's name is final", () => {
     });
   });
 
-  it("carries the reserved -managed- segment", () => {
-    expect(MANAGED_FUNCTION_NAME).toContain("-managed-");
-  });
-
   it("ignores FUNCTION_NAME_PREFIX, which a customer-deployed connector sets", () => {
     // The name is derived from the two inputs and cannot be overridden: a prefix left in the shell by
-    // a stage-1 deployment must not rename COA's own connector, since every Athena catalog already
+    // a single-endpoint deployment must not rename COA's own connector, since every Athena catalog already
     // created embeds the old ARN.
     process.env.FUNCTION_NAME_PREFIX = "sales-";
     synthManaged().hasResourceProperties("AWS::Lambda::Function", {

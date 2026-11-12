@@ -1,16 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Shared test fixtures for unit tests.
-
-``create_test_token`` produces a genuinely RS256-signed JWT (not the old
-unsigned-HS256 stub) because ``extract_caller_identity`` now performs real
-signature verification (see auth/claims.py — defense-in-depth behind
-AgentCore's own JWT authorizer). ``_mock_jwks`` is an autouse fixture that
-points the claims-module authorizer's JWKS lookup at the matching public key,
-so every test in this package gets a working verifier without repeating the
-mock setup per test.
-"""
+"""Shared unit-test fixtures: an RS256 token factory and an autouse JWKS mock."""
 
 from __future__ import annotations
 
@@ -55,27 +46,10 @@ def create_test_token(
     audience: str = _TEST_AUDIENCE,
     email: str | None = None,
 ) -> str:
-    """Create a signed test JWT for local development/testing.
+    """Create an RS256-signed test JWT matching the key served by ``_mock_jwks``.
 
-    Signed with a real RSA key matching the JWKS served by the ``_mock_jwks``
-    autouse fixture, so ``extract_caller_identity``'s signature check passes
-    for legitimately-constructed test tokens.
-
-    Args:
-        user_id: Subject claim (delegating user).
-        agent_id: Agent identity claim.
-        namespaces: Namespace access list.
-        roles: Role claims (mapped to ``cognito:groups`` — the test issuer is
-            shaped like a Cognito user pool, matching production's IdP).
-        exp_offset: Seconds from now until token expires (default 1 hour).
-        issuer: ``iss`` claim. Override to test issuer-mismatch rejection.
-        audience: ``aud`` claim. Override to test audience-mismatch rejection.
-        email: Optional ``email`` claim. Omitted from the payload when ``None``
-            (matches Cognito access tokens, which do not carry email); set to
-            an address to exercise the email-plumbing path.
-
-    Returns:
-        Encoded JWT string.
+    ``roles`` map to ``cognito:groups``. ``email`` is omitted when ``None``,
+    as in Cognito access tokens.
     """
     payload = {
         "sub": user_id,
@@ -91,20 +65,9 @@ def create_test_token(
     return jwt.encode(payload, _private_key, algorithm="RS256", headers={"kid": _TEST_KID})
 
 
-@pytest.fixture
-def test_token_factory():
-    """Fixture providing a factory for test JWT tokens."""
-    return create_test_token
-
-
 @pytest.fixture(autouse=True)
 def _mock_jwks(monkeypatch):
-    """Point claims.py's authorizer at the test JWKS instead of a real network call.
-
-    Sets the env vars claims.py's ``_get_authorizer()`` reads, clears its
-    ``lru_cache`` so each test gets a fresh authorizer bound to the current
-    monkeypatched env, and mocks the JWKS fetch to return the test key.
-    """
+    """Point claims.py's authorizer at the test JWKS instead of a real network call."""
     from coa_mcp.auth import claims
 
     monkeypatch.setenv("JWT_ISSUER_URL", _TEST_ISSUER)

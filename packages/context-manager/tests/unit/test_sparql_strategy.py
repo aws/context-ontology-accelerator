@@ -327,6 +327,12 @@ class TestCallerGrant:
         result = await h.resolve(profile=profile)
         assert result is not None and result.rows == [{"ticket": "t1", "title": "x"}]
 
+    @pytest.mark.parametrize("profile", [{"allowedMetrics": ["m-rev"]}, {}], ids=["restricted", "unrestricted"])
+    async def test_the_metric_grant_reaches_the_schema_the_llm_sees(self, profile):
+        h = _Harness(sole=_source())
+        await h.resolve(profile=profile)
+        assert h.translator.translate.call_args.kwargs["allowed_metrics"] == profile.get("allowedMetrics")
+
 
 class TestNamespaceAuthorization:
     """Cedar's namespace "query" decision gates the graph path as it gates the SQL path (a terminal 403)."""

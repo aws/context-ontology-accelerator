@@ -63,7 +63,7 @@ export const PlaygroundHelpPanel: React.FC = () => {
         </li>
         <li>
           {t(
-            "The SQL Firewall rewrites compiled SQL with Cedar-derived row filters.",
+            "The SQL Firewall checks compiled SQL against each role's table allowlist and column denylist.",
           )}
         </li>
         <li>{t("Bedrock Guardrails filter prompts and outputs.")}</li>

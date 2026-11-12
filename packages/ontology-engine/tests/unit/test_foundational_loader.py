@@ -284,3 +284,11 @@ def test_load_foundational_and_wait_tolerates_existing_row(patched_loader):
     assert ok is True
     patched_loader["create"].assert_called_once()
     patched_loader["fetch"].assert_called_once()  # proceeded past the 409
+
+
+def test_worker_marks_its_ingest_as_platform_foundational(patched_loader):
+    from coa_ontology.catalog.routers.foundational import _BY_KEY, _run_foundational_load
+
+    _run_foundational_load("job-1", _BY_KEY["schema-org"], namespace="ns-1")
+
+    assert patched_loader["ingest"].call_args.kwargs["metadata"].platform_foundational is True

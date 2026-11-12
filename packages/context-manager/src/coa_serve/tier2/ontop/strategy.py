@@ -118,7 +118,11 @@ class OntopStrategy:
             vector_hits = await self._fetch_vector_hits(embedding, namespace)
 
         sparql_result = await self._nl_to_sparql.translate(
-            query, namespace, vector_hits=vector_hits, model_id=context.model_id
+            query,
+            namespace,
+            vector_hits=vector_hits,
+            model_id=context.model_id,
+            allowed_metrics=profile.get("allowedMetrics"),
         )
         if sparql_result.trace_steps:
             annotated = [

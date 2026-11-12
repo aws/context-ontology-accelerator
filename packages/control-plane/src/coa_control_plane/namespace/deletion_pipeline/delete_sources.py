@@ -92,13 +92,8 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     (see the pipeline construct — this step retries 3x, then the chain goes
     to MarkFailed and the namespace ends in DELETE_FAILED).
 
-    After the last source is gone, drops the namespace's GraphRAG doc-KG vector
-    indexes. Those are namespace-scoped (all doc sources share one GraphRAG
-    tenant), so an individual source delete must not remove them — it only
-    clears its own documents from the shared index. This step is where "no
-    sources remain in this namespace" becomes true, so it is where they can be
-    dropped. Nothing deleted them before, leaving one index set per deleted
-    namespace against a collection AOSS caps at 1000 indexes.
+    After the last source is gone, drops the namespace-scoped GraphRAG doc-KG
+    vector indexes, which an individual source delete must not remove.
     """
     namespace_id = event["namespaceId"]
     deleted = 0

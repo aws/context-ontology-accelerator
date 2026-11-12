@@ -143,7 +143,12 @@ class SparqlStrategy:
         excluded = _denied_iris(context.profile)
         extra = {"exclude_properties": excluded} if excluded else {}
         translation = await self._translator.translate(
-            query, namespace, vector_hits=hits, model_id=context.model_id, **extra
+            query,
+            namespace,
+            vector_hits=hits,
+            model_id=context.model_id,
+            allowed_metrics=context.profile.get("allowedMetrics"),
+            **extra,
         )
         if translation.trace_steps:
             context.trace.add_dicts(_as_sparql_steps(translation.trace_steps))

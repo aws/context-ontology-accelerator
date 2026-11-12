@@ -64,7 +64,6 @@ def test_opensearch_async_kwargs():
 def test_retry_policy_presets():
     from coa_common.aws_config import RetryPolicy
 
-    assert RetryPolicy.for_sync().attempts == 2
     assert RetryPolicy.for_async().attempts == 3
     assert RetryPolicy.for_async().max_delay >= RetryPolicy.for_async().base_delay
 
@@ -93,18 +92,6 @@ def test_existing_default_client_config_is_preserved():
     # Caller's explicit value wins; our connect_timeout fills the gap.
     assert default.read_timeout == 999
     assert default.connect_timeout == 2
-
-
-def test_per_client_config_overrides_default_direction():
-    # Sanity check of botocore merge direction relied on by the safety-net.
-    from botocore.config import Config
-
-    default = Config(connect_timeout=2, read_timeout=30)
-    per_client = Config(read_timeout=None, retries={"total_max_attempts": 1})
-    merged = default.merge(per_client)
-    assert merged.connect_timeout == 2
-    assert merged.read_timeout is None
-    assert merged.retries == {"total_max_attempts": 1}
 
 
 def test_new_client_inherits_default_timeouts():

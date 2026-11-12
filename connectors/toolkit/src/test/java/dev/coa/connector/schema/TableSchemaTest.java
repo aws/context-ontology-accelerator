@@ -6,16 +6,13 @@ import dev.coa.connector.constraints.ColumnComment;
 import org.apache.arrow.vector.types.Types;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
-import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.Test;
 
-import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -73,13 +70,8 @@ class TableSchemaTest
     void columnNamesAreTheOnlyKeysInTheSchemaMetadata()
     {
         // Nothing but a column name may claim a key here — in particular not the table-level
-        // "comment" slot Athena's convention allows, which is deliberately never written because
-        // no Athena read path surfaces it.
-        //
-        // Asserted as a subset rather than by comparing sizes: equal sizes also require every
-        // column to carry a comment, so dropping one from the fixture broke this test for a
-        // reason unrelated to its name, and adding a stray key while dropping one comment would
-        // have passed it.
+        // "comment" slot, which is deliberately never written because no Athena read path surfaces it.
+        // Asserted as a subset: not every column carries a comment.
         assertTrue(
                 orders().columnNames().containsAll(orders().toArrowSchema().getCustomMetadata().keySet()),
                 "schema metadata carried a key that is not a column name: "
@@ -89,9 +81,7 @@ class TableSchemaTest
     @Test
     void aColumnNamedCommentIsAnOrdinaryColumn()
     {
-        // Verified against Athena before the table description was dropped: DESCRIBE shows
-        // this column's comment correctly. With the table-level slot unused there is nothing
-        // left for it to collide with.
+        // The table-level comment slot is unused, so nothing collides with this column's comment.
         TableSchema tickets = TableSchema.named("tickets")
                 .column("id", BIGINT, ColumnComment.of("Surrogate key").primaryKey())
                 .column("comment", VARCHAR, ColumnComment.of("Free text left by the user"))
@@ -125,9 +115,6 @@ class TableSchemaTest
     {
         assertNull(orders().comment("nope"));
     }
-
-
-
 
     @Test
     void aDuplicateColumnNameIsRefused()

@@ -53,4 +53,9 @@ RUN pip install --no-cache-dir /tmp/sources/ && rm -rf /tmp/sources/ && \
     python -c "import os, shutil, spacy; shutil.rmtree(os.path.join(os.path.dirname(spacy.__file__), 'tests'), ignore_errors=True)"
 
 USER appuser
+
+# Fail the build if the code this image runs imports anything the image cannot (scripts/image_import_check.py).
+COPY scripts/image_import_check.py /tmp/
+RUN python /tmp/image_import_check.py coa_sources.documents.kg_build.graph_build coa_sources.documents.kg_build.graph_cleanup
+
 CMD ["python", "-m", "coa_sources.documents.kg_build.graph_build"]

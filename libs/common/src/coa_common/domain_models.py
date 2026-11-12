@@ -16,8 +16,6 @@ from dataclasses import dataclass, field
 from enum import Enum, StrEnum
 from typing import Any
 
-# ── Enums ─────────────────────────────────────────────────────────────
-
 
 class EnrichmentSource(StrEnum):
     """Origin of a metadata annotation."""
@@ -58,9 +56,6 @@ class ReviewStatus(StrEnum):
     PENDING_REVIEW = "PENDING_REVIEW"
     APPROVED = "APPROVED"
     REJECTED = "REJECTED"
-
-
-# ── Business Metadata ─────────────────────────────────────────────────
 
 
 @dataclass
@@ -104,9 +99,6 @@ class BusinessMetadata:
     generated_fields: list[str] = field(default_factory=list)  # GeneratedField values
 
 
-# ── Constraints ───────────────────────────────────────────────────────
-
-
 @dataclass
 class PrimaryKey:
     """Primary key definition for a table."""
@@ -121,7 +113,7 @@ class ForeignKey:
     """Foreign key relationship between tables.
 
     ``review_status`` gives inferred relationships the same infer -> review -> use
-    governance descriptions already have (issue #1088). Semantics of the value:
+    governance descriptions already have. Semantics of the value:
       * ``""`` (empty) — unspecified. Deterministic/steward FKs, and any FK stored
         before this field existed, carry no explicit status; they are treated as
         authoritative/grandfathered by downstream gating so existing ontologies do
@@ -147,9 +139,6 @@ class ForeignKey:
     review_status: str = ""  # ReviewStatus value; "" == unspecified/grandfathered
     target_datasource_id: str = ""  # set only for cross-source relationships
     provenance: str = ""  # what the relationship was inferred from (for review)
-
-
-# ── Column ────────────────────────────────────────────────────────────
 
 
 @dataclass
@@ -183,9 +172,6 @@ class Column:
     relationship inferrer must not guess a different one for it."""
 
 
-# ── Technical Metadata ────────────────────────────────────────────────
-
-
 @dataclass
 class TechnicalMetadata:
     """Source-level technical metadata for a table."""
@@ -194,9 +180,6 @@ class TechnicalMetadata:
     partition_keys: list[str] = field(default_factory=list)
     format: str = ""  # e.g. "parquet", "iceberg", "redshift"
     location: str = ""  # S3 path or connection URI
-
-
-# ── Table ─────────────────────────────────────────────────────────────
 
 
 @dataclass
@@ -231,9 +214,6 @@ class Table:
         return f"{self.database}.{self.name}"
 
 
-# ── Discovery Result ──────────────────────────────────────────────────
-
-
 @dataclass
 class DiscoveredMetadata:
     """Output of a connector's discover_metadata call."""
@@ -242,14 +222,8 @@ class DiscoveredMetadata:
     failed_tables: list[str] = field(default_factory=list)
     """Tables the connector listed but could not read, as ``database.table``.
 
-    Stays empty for connectors that read a table's schema in the same call that
-    lists it, since those cannot partially fail. It is populated by connectors
-    that read each table separately and degrade per table — losing that table's
-    columns, comments, and keys while the scan as a whole still succeeds. Because
-    the source still advances to PENDING_REVIEW and enrichment then backfills
-    AI-generated descriptions over the gap, a steward would otherwise review a
-    silently incomplete ontology as if it were complete. The pipeline therefore
-    records this as a scan-level signal rather than a log line."""
+    Populated by connectors that read each table separately and degrade per
+    table; the pipeline records it as a scan-level signal for the steward."""
     filter_warnings: list[str] = field(default_factory=list)
     """Plain-language warnings about the source's schema/table filters.
 
@@ -262,9 +236,6 @@ class DiscoveredMetadata:
     def total_columns(self) -> int:
         """Total column count across all discovered tables."""
         return sum(len(t.columns) for t in self.tables)
-
-
-# ── Serialization ─────────────────────────────────────────────────────
 
 
 def to_dict(obj: Any) -> Any:

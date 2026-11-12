@@ -12,8 +12,7 @@ resource regardless of how it is created — module-level ``boto3.client(...)``,
 explicit ``boto3.Session(...)``, or assumed-role sessions — and composes with
 any per-client ``botocore.config.Config`` a call site already passes (the
 session's ``user_agent_extra`` is appended in addition to a client config's own
-``user_agent_extra``). Centralizing here avoids having to remember to set the
-header at each of the ~30 client-creation sites across the workspace.
+``user_agent_extra``).
 """
 
 from __future__ import annotations

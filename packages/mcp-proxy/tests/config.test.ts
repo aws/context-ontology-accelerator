@@ -78,7 +78,7 @@ describe("resolveConfig", () => {
     );
   });
 
-  it("falls back to SSM for missing values using the default scl prefix", async () => {
+  it("falls back to SSM for missing values using the default coa prefix", async () => {
     // Only runtime provided via env; clientId + issuer come from SSM.
     process.env.SCL_RUNTIME_URL = "https://runtime.example/invoke";
     sendMock.mockImplementation((cmd: { input: { Name: string } }) => {

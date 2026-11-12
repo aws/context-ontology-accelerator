@@ -19,7 +19,7 @@ describe("the mode selector", () => {
     }
   });
 
-  it("defaults to environment mode, so a deployed stage-1 stack is unchanged", () => {
+  it("defaults to environment mode, so an unset variable keeps existing deployments unchanged", () => {
     expect(connectorMode()).toBe(ENVIRONMENT_MODE);
   });
 

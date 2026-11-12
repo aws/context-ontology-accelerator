@@ -29,18 +29,16 @@ def test_parse_minimal_neptune_config_applies_store_defaults():
     assert cfg.auth_mode is SparqlAuthMode.SIGV4
     assert cfg.effective_port == 8182
     assert cfg.base_url == f"https://{_HOST}:8182"
-    assert cfg.query_url == f"https://{_HOST}:8182/sparql"
 
 
 def test_parse_accepts_the_stored_json_string():
     cfg = parse_sparql_configuration(json.dumps({"store": "neptune", "dataEndpoint": _HOST, "port": 8182}))
-    assert cfg.query_url == f"https://{_HOST}:8182/sparql"
+    assert cfg.base_url == f"https://{_HOST}:8182"
 
 
 def test_endpoint_url_with_port_and_path_is_used_verbatim():
     cfg = parse_sparql_configuration({"dataEndpoint": f"https://{_HOST}:8182/custom/sparql"})
     assert cfg.effective_port == 8182
-    assert cfg.query_url == f"https://{_HOST}:8182/custom/sparql"
 
 
 def test_endpoint_port_conflicting_with_port_field_is_rejected():

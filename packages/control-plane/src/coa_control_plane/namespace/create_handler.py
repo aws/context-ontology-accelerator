@@ -4,8 +4,7 @@
 """Create Namespace Lambda handler.
 
 Thin entry point: validates input, delegates to NamespaceService, returns
-API Gateway proxy response.  Uses the common ``setup_logging()`` for
-consistent structured JSON logging across all Lambda handlers.
+API Gateway proxy response.
 """
 
 from __future__ import annotations
@@ -54,15 +53,6 @@ def _create(event: dict[str, Any], context: Any) -> dict[str, Any]:
     Rejects non-POST methods, parses and validates the request body, then
     delegates provisioning to ``NamespaceService`` and maps the outcome to an
     API Gateway proxy response.
-
-    Args:
-        event: API Gateway proxy event carrying the JSON namespace request
-            body.
-        context: Lambda context object.
-
-    Returns:
-        An API Gateway proxy response: 201 with the created namespace, 405 for
-        a disallowed method, or a 4xx/5xx error response.
     """
     logger.info("event", path=event.get("path"), method=event.get("httpMethod"))
 

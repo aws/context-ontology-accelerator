@@ -132,48 +132,6 @@ class TestDeleteProject:
 
 
 @pytest.mark.unit
-class TestGetProject:
-    @patch("coa_common.metadata_store.smus.boto3")
-    def test_returns_project_result(self, mock_boto3):
-        mock_dz = MagicMock()
-        mock_dz.get_project.return_value = {"id": "proj_abc", "name": "550e8400-e29b-41d4-a716-446655440000"}
-        mock_boto3.client.return_value = mock_dz
-
-        client = SMUSClient(domain_id=DOMAIN)
-        result = client.get_project(project_id="proj_abc")
-
-        assert result == ProjectResult(project_id="proj_abc", name="550e8400-e29b-41d4-a716-446655440000")
-
-    @patch("coa_common.metadata_store.smus.boto3")
-    def test_raises_on_not_found(self, mock_boto3):
-        mock_dz = MagicMock()
-        mock_dz.get_project.side_effect = ClientError(
-            {"Error": {"Code": "ResourceNotFoundException", "Message": "not found"}},
-            "GetProject",
-        )
-        mock_boto3.client.return_value = mock_dz
-
-        client = SMUSClient(domain_id=DOMAIN)
-        with pytest.raises(MetadataStoreError, match="Failed to get"):
-            client.get_project(project_id="proj_abc")
-
-    @patch("coa_common.metadata_store.smus.boto3")
-    def test_raises_on_incomplete_response(self, mock_boto3):
-        mock_dz = MagicMock()
-        mock_dz.get_project.return_value = {"id": "proj_abc"}
-        mock_boto3.client.return_value = mock_dz
-
-        client = SMUSClient(domain_id=DOMAIN)
-        with pytest.raises(MetadataStoreError, match="incomplete project data"):
-            client.get_project(project_id="proj_abc")
-
-
-# ---------------------------------------------------------------------------
-# SMUSClient — Assets
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.unit
 class TestCreateAsset:
     @patch("coa_common.metadata_store.smus.boto3")
     def test_returns_asset_result(self, mock_boto3):
@@ -219,40 +177,6 @@ class TestDeleteAsset:
         client.delete_asset(asset_id="asset_1")
 
         mock_dz.delete_asset.assert_called_once_with(domainIdentifier=DOMAIN, identifier="asset_1")
-
-
-@pytest.mark.unit
-class TestGetAsset:
-    @patch("coa_common.metadata_store.smus.boto3")
-    def test_returns_asset_result(self, mock_boto3):
-        mock_dz = MagicMock()
-        mock_dz.get_asset.return_value = {
-            "id": "asset_1",
-            "name": "my-asset",
-            "owningProjectId": "proj_abc",
-        }
-        mock_boto3.client.return_value = mock_dz
-
-        client = SMUSClient(domain_id=DOMAIN)
-        result = client.get_asset(asset_id="asset_1")
-
-        assert result.asset_id == "asset_1"
-        assert result.name == "my-asset"
-
-    @patch("coa_common.metadata_store.smus.boto3")
-    def test_raises_on_incomplete_response(self, mock_boto3):
-        mock_dz = MagicMock()
-        mock_dz.get_asset.return_value = {"id": "asset_1"}
-        mock_boto3.client.return_value = mock_dz
-
-        client = SMUSClient(domain_id=DOMAIN)
-        with pytest.raises(MetadataStoreError, match="incomplete asset data"):
-            client.get_asset(asset_id="asset_1")
-
-
-# ---------------------------------------------------------------------------
-# _sleep_membership_backoff
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit

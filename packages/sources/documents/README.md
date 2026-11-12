@@ -32,6 +32,43 @@ docker run -p 9000:8080 \
 curl -s http://localhost:9000/2015-03-31/functions/function/invocations -d '{}'
 ```
 
+### Running preprocessing outside the image
+
+`preprocessing/requirements.txt` alone is not enough to run the step; the `Dockerfile` adds the rest. On a host without the image (for example Amazon Linux 2023), run these steps from the repository root:
+
+```bash
+# System packages: poppler for PDF text, file-libs for libmagic file-type detection
+sudo dnf install -y poppler-utils file-libs
+
+# First-party library the handler imports
+pip install libs/common/
+
+# CPU-only torch first, constrained so the next install can't pull the ~4 GB CUDA build
+pip install -c packages/sources/documents/preprocessing/constraints.txt \
+  torch==2.13.0+cpu --extra-index-url https://download.pytorch.org/whl/cpu
+pip install -c packages/sources/documents/preprocessing/constraints.txt \
+  --extra-index-url https://download.pytorch.org/whl/cpu \
+  -r packages/sources/documents/preprocessing/requirements.txt
+
+# unstructured pulls in opencv-python, which needs libGL.so.1 (not on AL2023);
+# the headless build doesn't
+pip uninstall -y opencv-python && pip install opencv-python-headless
+
+# unstructured loads spaCy's English model at runtime
+pip install spacy==3.8.7 && python -m spacy download en_core_web_sm
+
+# Lift unstructured's filelock<4 cap past CVE-2026-112940
+pip install --no-deps "filelock>=4.2.1,<5"
+
+# The generated server models and the sources package, which holds the handler
+# (run `make generate` first if smithy-generated/ is empty)
+pip install smithy-generated/control-plane-python-server/ packages/sources/
+```
+
+The `Dockerfile` is the source of truth; check it for the current versions.
+
+The step logs `No languages specified, defaulting to English.` for DOCX files and for text-native PDFs, including Japanese ones. Those go through `unstructured`, and preprocessing passes it no language. Text-native PDFs use its `fast` strategy, which reads the PDF's embedded text layer without OCR. Scanned PDFs, and every PDF when `enableTableExtraction` is on, go to Textract instead and don't log this line. The namespace language is applied later, during extraction and enrichment (see [Namespace Language](../../../external-docs/content/namespaces.md#namespace-language)).
+
 ## Relationship to unstructured-data-ingestion
 
 This is a copy of `packages/unstructured-data-ingestion` with the business logic moved into `src/coa_sources/documents/` following the standard `src/` package layout used by `structured-data-ingestion` and `context-manager`. The original package remains unchanged and continues to serve the existing `/doc-sources` API.

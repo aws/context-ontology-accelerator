@@ -44,16 +44,7 @@ class NamespaceService:
         metadata_store: MetadataStoreClient,
         project_profile_id: str = "",
     ) -> None:
-        """Initialize the service with its persistence and provisioning collaborators.
-
-        Args:
-            namespaces_dao: DAO for the namespaces table.
-            roles_dao: DAO for the roles table.
-            mappings_dao: DAO for the resource-role-mappings table.
-            metadata_store: Client used to provision the DataZone project.
-            project_profile_id: DataZone project profile id applied to new
-                projects.
-        """
+        """Initialize the service with its persistence and provisioning collaborators."""
         self._ns_dao = namespaces_dao
         self._roles_dao = roles_dao
         self._mappings_dao = mappings_dao
@@ -67,12 +58,6 @@ class NamespaceService:
         the name, provisions the DataZone project and Athena workgroup, then
         writes the namespace record, roles, and mappings, rolling back the
         reservation if project creation fails.
-
-        Args:
-            request: The validated create-namespace request.
-
-        Returns:
-            The detail of the newly created namespace.
 
         Raises:
             LanguageTagError: If the requested language is not a supported
@@ -158,8 +143,6 @@ class NamespaceService:
         caller MUST NOT persist a name returned as None — doing so creates
         a namespace record that references a non-existent workgroup.
         """
-        from botocore.exceptions import ClientError as BotoClientError
-
         resource_prefix = os.environ.get("RESOURCE_PREFIX", "coa-dev-")
         workgroup_name = f"{resource_prefix}{namespace_id}"
         results_bucket_ssm = os.environ.get("ATHENA_RESULTS_BUCKET_SSM", "")
@@ -173,7 +156,7 @@ class NamespaceService:
         try:
             resp = ssm.get_parameter(Name=results_bucket_ssm)
             results_bucket = resp["Parameter"]["Value"]
-        except BotoClientError:
+        except ClientError:
             logger.warning("athena_results_bucket_ssm_not_found", param=results_bucket_ssm)
             return None
 
@@ -206,7 +189,7 @@ class NamespaceService:
             # claim the workgroup exists.
             logger.exception("athena_workgroup_create_failed", workgroup_name=workgroup_name)
             return None
-        except BotoClientError:
+        except ClientError:
             logger.exception("athena_workgroup_create_failed", workgroup_name=workgroup_name)
             return None
 
@@ -358,23 +341,9 @@ class NamespaceService:
     def _add_service_role_memberships(self, project_id: str) -> None:
         """Add the shared project-access role as a project member.
 
-        The project-access role has a CfnUserProfile created at deploy time.
-        Service lambdas (connector, enrichment, datasource-api) assume into
-        this role for DataZone project operations (Search, GetAsset,
-        CreateAssetRevision) — the default PROJECT_CONTRIBUTOR designation
-        is sufficient for those. Namespace deletion's DeleteProject call
-        instead assumes namespaceApiFn's own execution role (the actual
-        DataZone-recorded project owner, since it is the role that called
-        CreateProject) rather than this role — see
-        namespace-deletion-pipeline.ts / cleanup.delete_smu_project.
-
         Raises MetadataStoreError if the SSM parameter is missing or the
-        membership cannot be created — creating a namespace without this
-        membership leaves scans permanently broken (Search requires project
-        membership).
+        membership cannot be created, since scans need project membership.
         """
-        from botocore.exceptions import ClientError as BotoClientError
-
         ssm = boto3.client("ssm", region_name=os.environ.get("AWS_REGION", "us-east-1"))
 
         param_name = os.environ.get("PROJECT_ACCESS_ROLE_ARN_SSM")
@@ -384,7 +353,7 @@ class NamespaceService:
         try:
             resp = ssm.get_parameter(Name=param_name)
             role_arn = resp["Parameter"]["Value"]
-        except BotoClientError as exc:
+        except ClientError as exc:
             if exc.response["Error"]["Code"] == "ParameterNotFound":
                 raise MetadataStoreError(
                     f"SSM parameter {param_name} not found — cannot register project-access role"

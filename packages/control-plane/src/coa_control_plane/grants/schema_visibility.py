@@ -3,7 +3,7 @@
 
 """Withhold table/column overrides from grant summaries for schema-blind callers.
 
-ADR: decompose-viewnamespace-schema-visibility. A grant's ``tableAllowlist`` and
+A grant's ``tableAllowlist`` and
 ``columnDenylist`` name physical tables and columns, which a caller without
 ``viewSource`` (e.g. ``data-analyst``) must not see. ``allowedMetrics`` names
 governed metrics, which every role may read, so it is kept.
@@ -18,10 +18,8 @@ are shared through :mod:`coa_authorization.schema_visibility`):
   visible.
 
 Fail closed: a request whose context lacks the key is treated as schema-blind
-and the overrides are stripped. The authorizer therefore always emits the key on
-these routes when it allows the request, including dev mode without a roles
-table, where it emits the withholding values (``"false"`` / ``""``), the same
-outcome as a Cedar-disabled serve.
+and the overrides are stripped. The authorizer always emits the key on these
+routes (see ``authorization/handler.py``).
 """
 
 from __future__ import annotations

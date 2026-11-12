@@ -321,6 +321,19 @@ export class NamespaceDeletionPipeline extends Construct {
           resources: ["*"],
         }),
       );
+      deletePlatformFn.addToRolePolicy(
+        new iam.PolicyStatement({
+          // `/ecs/vkg-*` is the unprefixed legacy name, and IAM allows every such
+          // group in the account. The handler deletes only `/ecs/vkg-<id>` of a
+          // namespace in DELETING state. Remove it with the execution role's
+          // legacy grant in vkg-stack.ts.
+          actions: ["logs:DeleteLogGroup"],
+          resources: [
+            `arn:aws:logs:${region}:${account}:log-group:/ecs/${props.resourcePrefix.replace(/-+$/, "")}-vkg-*`,
+            `arn:aws:logs:${region}:${account}:log-group:/ecs/vkg-*`,
+          ],
+        }),
+      );
     }
     if (props.cloudMapNamespaceId) {
       deletePlatformFn.addToRolePolicy(

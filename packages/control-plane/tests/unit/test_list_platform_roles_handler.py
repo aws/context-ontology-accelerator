@@ -84,7 +84,7 @@ class TestListPlatformRoles:
 
     @patch("coa_control_plane.roles.list_platform_roles_handler.DynamoDBDAO")
     def test_default_baseline_policy_is_not_advertised_as_a_role(self, mock_dao_cls):
-        """#988: the seeded ``default`` policy bundle shares the GLOBAL partition
+        """The seeded ``default`` policy bundle shares the GLOBAL partition
         but is not grantable; it must not appear in the platform-role picker."""
         mock_dao = MagicMock()
         mock_dao_cls.return_value = mock_dao
@@ -131,8 +131,5 @@ class TestListPlatformRoles:
 
     @patch.dict(os.environ, {"ALLOWED_ORIGIN": "https://test.example.com"}, clear=True)
     def test_missing_env_vars_returns_500(self):
-        # AWS_REGION and ROLES_TABLE not set
-        os.environ.pop("AWS_REGION", None)
-        os.environ.pop("ROLES_TABLE", None)
         resp = handler({"httpMethod": "GET", "path": "/roles"}, None)
         assert resp["statusCode"] == 500

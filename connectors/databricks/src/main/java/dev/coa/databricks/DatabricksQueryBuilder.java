@@ -14,11 +14,7 @@ import java.util.Objects;
  * Spells the {@code FROM} clause for Databricks. Everything else about the statement is inherited.
  *
  * <p>{@link JdbcSplitQueryBuilder} turns Athena's constraint model into a prepared statement: the
- * projection list, a {@code WHERE} clause built from each column's value set (null checks, bounded
- * ranges, equality, {@code IN}), typed parameter binding for eleven Arrow types, {@code ORDER BY} with
- * explicit null ordering, and {@code LIMIT}. That is the part of a connector most likely to carry a
- * subtle type or quoting bug if hand-written, and it is shared with every AWS-authored JDBC connector,
- * so it is exercised far more than this module will be.
+ * projection, the {@code WHERE} clause, typed parameter binding, {@code ORDER BY} and {@code LIMIT}.
  *
  * <p>The catalog Athena names is not the catalog this reads. The base class passes
  * {@code ReadRecordsRequest.getCatalogName()} into {@link #getFromClauseWithSplit}, and that is the

@@ -63,8 +63,7 @@ class ColumnCommentTest
     void theTagOrderIsProseThenPrimaryKeyThenNotNullThenForeignKeys()
     {
         // The operand-free tags come first so the @fk list stays last and contiguous, and @notnull goes
-        // AFTER @pk so a primary-key-only column's comment is byte-identical to what was emitted before
-        // @notnull existed.
+        // AFTER @pk.
         assertEquals("Order this line belongs to @pk @notnull @fk(orders.order_id)",
                 ColumnComment.of("Order this line belongs to")
                         .primaryKey()
@@ -112,9 +111,8 @@ class ColumnCommentTest
     @Test
     void twoForeignKeysOnOneColumnBothAppear()
     {
-        // Legal: one column can reference two different parents. A COMPOSITE foreign key is
-        // the other shape — one tag on each of several columns — and is covered in
-        // ExampleCatalogTest against the fixture.
+        // Legal: one column can reference two different parents. A composite foreign key is the other
+        // shape: one tag on each of several columns.
         assertEquals("Shared @fk(orders.order_id) @fk(invoices.order_id)",
                 ColumnComment.of("Shared")
                         .foreignKey("orders", "order_id")

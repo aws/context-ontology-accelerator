@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // The customer-deployed connector: one workspace, one warehouse, one catalog, one credential. A
-// stage-1 customer already deployed this shape and it must keep synthesising the same stack from the
+// single-endpoint customer already deployed this shape and it must keep synthesising the same stack from the
 // same variables, so this suite passing unchanged IS the compatibility assertion. COA's own
 // deployment is covered by managed-databricks-connector-stack.test.ts.
 import * as fs from "fs";
@@ -133,7 +133,7 @@ describe("the connector's environment", () => {
   });
 
   it("sets no config source, so the jar's own default keeps this deployment in environment mode", () => {
-    // Must stay this way: an already-deployed stage-1 stack pulling a newer jar has to behave exactly
+    // Must stay this way: an already-deployed single-endpoint stack pulling a newer jar has to behave exactly
     // as before. Only COA's own entry point sets the variable.
     expect(connectorEnvironment(synth())[CONFIG_SOURCE_ENV_VAR]).toBeUndefined();
   });
@@ -315,7 +315,7 @@ describe("COA's two roles", () => {
 });
 
 describe("the VPC", () => {
-  it("stays outside any VPC by default, as a stage-1 deployment did", () => {
+  it("stays outside any VPC by default, as a single-endpoint deployment always did", () => {
     const template = synth();
     const [fn] = Object.values(template.findResources("AWS::Lambda::Function")).filter(
       (resource) => resource.Properties?.Handler === HANDLER,
@@ -371,7 +371,7 @@ describe("what only COA's own deployment has", () => {
 
   it("pins no role name", () => {
     // A customer-deployed connector's role is named in no trust policy, and pinning it would replace
-    // the role in every stage-1 deployment on the next deploy for no gain.
+    // the role in every single-endpoint deployment on the next deploy for no gain.
     const named = Object.values(synth().findResources("AWS::IAM::Role")).filter(
       (role) => typeof role.Properties?.RoleName === "string",
     );

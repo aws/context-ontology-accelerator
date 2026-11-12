@@ -708,7 +708,7 @@ export function OntologyPage() {
           <SpaceBetween size="xs">
             <Box>
               {t(
-                "This selection has the same structure as an existing accepted proposal, so no new proposal was created. Open the existing proposal to review or edit it.",
+                "This selection has the same structure as an existing accepted proposal, so no new proposal was created. An accepted proposal can't be edited. To induce again with updated metadata, delete the ontology and induce again (this also removes the classes other sources accepted into it), or induce into a new namespace.",
               )}
             </Box>
             <Link
