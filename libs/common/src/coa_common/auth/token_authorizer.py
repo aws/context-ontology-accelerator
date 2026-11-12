@@ -80,14 +80,7 @@ class TokenAuthorizer(ABC):
         jwks_uri: str | None = None,
         jwks_cache_ttl: int = 300,
     ) -> None:
-        """Store issuer/audience config and initialize the JWKS cache.
-
-        Args:
-            issuer: The expected ``iss`` claim value.
-            audience: The expected ``aud`` claim value; if ``None``, audience is not verified.
-            jwks_uri: Explicit JWKS endpoint; if ``None``, discovered via OIDC well-known.
-            jwks_cache_ttl: Seconds to cache the JWKS key set (default 300 = 5 min).
-        """
+        """Store issuer/audience config and initialize the JWKS cache."""
         self._issuer = issuer.rstrip("/")
         self._audience = audience
         self._configured_jwks_uri = jwks_uri
@@ -96,10 +89,6 @@ class TokenAuthorizer(ABC):
         self._jwks: dict[str, Any] | None = None
         self._jwks_last_updated: float = 0
         self._discovered_jwks_uri: str | None = None
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
 
     def validate(self, authorization_header: str) -> TokenValidationResult:
         """Validate a ``Bearer <token>`` header and return structured claims.
@@ -113,12 +102,8 @@ class TokenAuthorizer(ABC):
     def verify_claims(self, authorization_header: str) -> dict[str, Any]:
         """Verify a ``Bearer <token>`` header's signature/issuer/audience/expiry and return raw claims.
 
-        Returned claims skip the ``email`` requirement ``validate`` imposes.
-        Use this instead of :meth:`validate` when the caller's identity model
-        is not email-keyed (``validate``'s ``TokenValidationResult`` always
-        requires ``email`` — the control-plane authorizer's principal model).
-        The cryptographic verification performed is identical to ``validate``;
-        only the post-verification claim requirements differ.
+        Skips the ``email`` requirement ``validate`` imposes; the cryptographic
+        checks are identical.
 
         Raises ``ValueError`` if the token is missing, malformed, expired,
         or has an invalid signature.
@@ -127,18 +112,8 @@ class TokenAuthorizer(ABC):
         return self._verify_and_decode(token)
 
     def extract_groups(self, claims: dict[str, Any]) -> list[str]:
-        """Public entry point for the IdP-specific group-claim extraction.
-
-        Delegates to the same :meth:`_extract_groups` hook subclasses
-        implement for :meth:`validate`, so callers using :meth:`verify_claims`
-        (email-agnostic identity models) get identical group/role resolution
-        without duplicating the Cognito-vs-generic-OIDC claim-name handling.
-        """
+        """Extract groups from verified claims via the subclass hook."""
         return self._extract_groups(claims)
-
-    # ------------------------------------------------------------------
-    # Template-method hooks for subclasses
-    # ------------------------------------------------------------------
 
     @abstractmethod
     def _extract_groups(self, claims: dict[str, Any]) -> list[str]:
@@ -165,10 +140,6 @@ class TokenAuthorizer(ABC):
         the delegating user's authorization decision.
         """
         return None
-
-    # ------------------------------------------------------------------
-    # JWKS helpers
-    # ------------------------------------------------------------------
 
     def _get_jwks_uri(self) -> str:
         if self._configured_jwks_uri:
@@ -215,10 +186,6 @@ class TokenAuthorizer(ABC):
             raise ValueError(f"Key ID {kid} not found in JWKS")
         return jwt.api_jwk.PyJWK.from_json(json.dumps(key)).key
 
-    # ------------------------------------------------------------------
-    # Core verification
-    # ------------------------------------------------------------------
-
     def _verify_and_decode(self, token: str) -> dict[str, Any]:
         try:
             header = jwt.get_unverified_header(token)
@@ -228,19 +195,15 @@ class TokenAuthorizer(ABC):
 
             public_key = self._get_public_key(kid)
 
-            decode_opts: dict[str, Any] = {"verify_exp": True, "verify_iss": True}
+            # Cognito access tokens have client_id but no aud claim, so the audience
+            # is checked manually after decoding.
+            decode_opts: dict[str, Any] = {"verify_exp": True, "verify_iss": True, "verify_aud": False}
             kwargs: dict[str, Any] = {
                 "algorithms": ["RS256"],
                 "options": decode_opts,
                 "issuer": self._issuer,
                 "leeway": 30,
             }
-            if self._audience:
-                # Cognito access tokens have client_id but no aud claim.
-                # Decode without aud verification first, then check manually.
-                decode_opts["verify_aud"] = False
-            else:
-                decode_opts["verify_aud"] = False
 
             claims = jwt.decode(token, public_key, **kwargs)
 
@@ -255,18 +218,14 @@ class TokenAuthorizer(ABC):
             logger.warning("JWT validation failed", error=str(exc))
             raise ValueError(f"Invalid token: {exc}") from exc
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _extract_bearer_token(authorization_header: str) -> str:
         if not authorization_header or not authorization_header.startswith("Bearer "):
             raise ValueError("Missing or malformed Authorization header")
-        parts = authorization_header.split(" ", maxsplit=1)
-        if len(parts) < 2 or not parts[1]:  # noqa: PLR2004
+        token = authorization_header.removeprefix("Bearer ")
+        if not token:
             raise ValueError("Bearer token is empty")
-        return parts[1]
+        return token
 
     def _build_result(self, claims: dict[str, Any]) -> TokenValidationResult:
         email = self._extract_email(claims)

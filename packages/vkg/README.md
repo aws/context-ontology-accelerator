@@ -4,9 +4,9 @@ Translation-only service wrapping Ontop 5.x. Translates SPARQL queries into SQL 
 
 ## Architecture
 
-- **Ontop 5.x** — SPARQL-to-SQL translator (runs on port 8081 internally)
-- **translate-server.py** — Python HTTP facade (port 8080) exposing `/translate` and `/health`
-- **H2 in-memory** — schema-only database for Ontop's mapping parser (no real data)
+- **Ontop 5.x**: SPARQL-to-SQL translator (runs on port 8081 internally)
+- **translate-server.py**: Python HTTP facade (port 8080) exposing `/sparql/translate` and `/health`
+- **H2 in-memory**: schema-only database for Ontop's mapping parser (no real data)
 
 At startup, the entrypoint downloads ontology + mappings from S3, loads the schema into H2, and starts both services.
 
@@ -74,7 +74,7 @@ curl -s http://localhost:8090/sparql/translate \
 
 ### S3 download retry
 
-At startup, the entrypoint downloads ontology artifacts from S3 with **3 attempts** and exponential backoff (2s, 4s, 8s delays). Expected log output during a transient failure:
+At startup, the entrypoint downloads ontology artifacts from S3 with **3 attempts** and exponential backoff (2s and 4s delays). Expected log output during a transient failure:
 
 ```
 [VKG] Downloading artifacts...
@@ -99,9 +99,9 @@ If all 3 attempts fail, the container enters **degraded mode** (503 on all `/spa
 
 The VKG task's resource allocation and JVM heap are controlled by environment
 variables set on the ECS task definition (and passed through by the reload
-Lambda). Getting these right matters: an under-provisioned task cannot finish the
-OWL2QL translation pass for larger ontologies, which leaves the container failing
-its health check and the namespace reporting `DEGRADED` health indefinitely.
+Lambda). An under-provisioned task cannot finish the OWL2QL translation pass for
+larger ontologies, which leaves the container failing its health check and the
+namespace reporting `DEGRADED` health indefinitely.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
@@ -110,12 +110,10 @@ its health check and the namespace reporting `DEGRADED` health indefinitely.
 | `ONTOP_JAVA_ARGS` | `-Xmx1536m -Xms512m -Dserver.address=127.0.0.1` | JVM args for the Ontop launcher (read directly by the container). The reload Lambda's `VKG_ONTOP_JAVA_ARGS` is written into the task def as this variable. `-Dserver.address=127.0.0.1` binds Ontop's endpoint to loopback, since only translate-server calls it. |
 
 **`ONTOP_JAVA_ARGS`, not `JAVA_OPTS`.** The Ontop launcher reads its heap
-settings from `ONTOP_JAVA_ARGS`. Setting `JAVA_OPTS` has **no effect** — the heap
+settings from `ONTOP_JAVA_ARGS`. Setting `JAVA_OPTS` has **no effect**: the heap
 is silently ignored and Ontop starts at its small built-in default regardless of
-task memory. The entrypoint keeps a backward-compatibility fallback
-(`ONTOP_JAVA_ARGS="${ONTOP_JAVA_ARGS:-${JAVA_OPTS:-}}"`) so a task def that still
-only sets `JAVA_OPTS` is honoured, but new configuration should always set
-`ONTOP_JAVA_ARGS`.
+task memory. The entrypoint falls back to `JAVA_OPTS` when `ONTOP_JAVA_ARGS` is
+unset, but new configuration should always set `ONTOP_JAVA_ARGS`.
 
 **Heap vs. task memory.** Size the max heap (`-Xmx`) at roughly **60–75% of
 `VKG_TASK_MEMORY`**, leaving room for JVM overhead and the OS. E.g. a 4 GB task
@@ -186,7 +184,7 @@ aws ecs describe-tasks --cluster $CLUSTER --tasks $TASK_ARN \
 ## Image Reloads and the Scheduled Sweep
 
 VKG runs **one ECS service per namespace** (`<prefix>-vkg-<namespace>`). No static
-"default" service exists — a namespace's service is created the first time its
+"default" service exists: a namespace's service is created the first time its
 ontology is published. The `<prefix>-vkg-reload` Lambda owns provisioning and
 image refresh; the latest image URI is published to SSM
 (`/<prefix>/vkg/container-image`) on every CDK deploy.
@@ -252,7 +250,7 @@ cat /tmp/out.json   # -> {"status":"sweep_complete","total":N,"triggered":M,"unc
 ### IAM
 
 The reload Lambda role holds, in addition to the per-namespace deploy
-permissions, **`ecs:ListServices` scoped to the VKG cluster** — the sweep needs
+permissions, **`ecs:ListServices` scoped to the VKG cluster**, because the sweep needs
 it to enumerate `<prefix>-vkg-*` services. It is read-only and cluster-scoped
 via the `ecs:cluster` condition key (`ecs:ListServices` has no IAM resource
 type, so it is granted on `Resource: "*"` and constrained to this cluster by
@@ -270,6 +268,6 @@ whose role holds only **`lambda:InvokeFunction` on the reload Lambda**.
 
 All three paths emit `ReloadTriggered` / `ReloadFailed` CloudWatch metrics under the
 `COA/VKG` namespace (dimensioned by `Namespace` plus an undimensioned roll-up the
-`ReloadFailed` alarm evaluates). Sweep-level failures — the SSM image can't be
-resolved, or `ListServices` errors — emit `ReloadFailed` with namespace `sweep`
+`ReloadFailed` alarm evaluates). Sweep-level failures (the SSM image can't be
+resolved, or `ListServices` errors) emit `ReloadFailed` with namespace `sweep`
 and end the run cleanly rather than raising uncaught.

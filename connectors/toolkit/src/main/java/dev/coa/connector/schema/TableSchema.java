@@ -20,8 +20,7 @@ import java.util.Map;
  * from.
  *
  * <p>Most connectors never call this either — {@code CoaTable.toTableSchema()} does. It exists as a
- * separate class because it owns exactly one fact, and that fact is the most expensive thing on this
- * page to learn the hard way.
+ * separate class because it owns exactly one fact, below.
  *
  * <h2>Where a column comment has to live</h2>
  *

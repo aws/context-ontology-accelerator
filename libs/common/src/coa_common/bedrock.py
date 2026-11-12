@@ -28,14 +28,10 @@ from coa_common.guardrail_metrics import (
 logger = logging.getLogger(__name__)
 
 # Chat/completion model used when a caller constructs BedrockClient without an
-# explicit model_id (table enrichment, constraint inference). Resolved from the
-# BEDROCK_CHAT_MODEL_ID environment variable so a deployment can point these
-# paths at a region-appropriate model (#94) — the `us.` inference profile
-# fallback is only invocable from US regions. Deliberately NOT BEDROCK_MODEL_ID:
-# that name is already taken by the serve query LLM (context-manager) and the
-# metric-service embed fallback chain, and reusing it here would cross-wire
-# those models into this client. Must stay in step with the TypeScript
-# DEFAULT_BEDROCK_CHAT_MODEL_ID (libs/ts-shared/src/constants.ts).
+# explicit model_id (table enrichment, constraint inference). Resolved from
+# BEDROCK_CHAT_MODEL_ID; the `us.` inference profile fallback is only invocable
+# from US regions. Not BEDROCK_MODEL_ID, which other services use for other models.
+# Keep in step with DEFAULT_BEDROCK_CHAT_MODEL_ID in libs/ts-shared/src/constants.ts.
 FALLBACK_CHAT_MODEL_ID = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 
 
@@ -81,14 +77,8 @@ def _assessment_has_block(assessment: dict) -> bool:
 def extract_text_blocks(content_blocks: list[dict]) -> str:
     """Join the text of every ``text`` ContentBlock in a Converse response.
 
-    A Converse ``output.message.content`` is an array of ContentBlocks, and a
-    reasoning model (e.g. Claude with extended thinking) emits a
-    ``reasoningContent`` block — which has NO top-level ``text`` key — before
-    the ``text`` block that carries the answer. Indexing ``content[0]["text"]``
-    therefore raises ``KeyError`` whenever reasoning is present. Select blocks
-    by the presence of a ``text`` key instead of by position, and concatenate
-    them (there is normally one, but joining is safe if a model splits its
-    answer across several).
+    A reasoning model emits a ``reasoningContent`` block with no ``text`` key
+    before the answer, so blocks are selected by the ``text`` key, not position.
 
     Raises:
         ValueError: if no ``text`` block is present (e.g. a response that is
@@ -166,10 +156,8 @@ class BedrockClient:
         guardrail_version: Guardrail version (default DRAFT).
         max_input_chars: Maximum combined prompt length in characters (default 200,000).
             Requests exceeding this raise InputTooLargeError.
-        component: ``Component`` dimension for the guardrail decision metrics
-            (#111 AC10). Both consumers of this client run as ECS Fargate tasks,
-            which publish their custom metrics via PutMetricData, so decisions
-            go out the same way rather than as stdout EMF.
+        component: ``Component`` dimension for guardrail decision metrics,
+            published via PutMetricData.
     """
 
     def __init__(
@@ -183,10 +171,6 @@ class BedrockClient:
         component: str = COMPONENT_ENRICHMENT,
     ) -> None:
         """Build the Bedrock runtime client with adaptive retries (see class Args)."""
-        # resolve_region (AWS_REGION → AWS_DEFAULT_REGION → us-east-1) rather than a
-        # bespoke getenv: this region reaches both the Bedrock client and the
-        # guardrail decision metrics, and no ECS task definition sets AWS_REGION —
-        # so a lone getenv silently files metrics in us-east-1. See config.resolve_region.
         self._region = region or resolve_region()
         self._model_id = model_id
         self._guardrail_id = guardrail_id
@@ -333,7 +317,7 @@ class BedrockClient:
 
             # Emit the decision only when a guardrail was actually applied —
             # counting unguarded invocations as ALLOW would make the block rate
-            # meaningless. Emitted for allow AND block (#111 AC10/AC11).
+            # meaningless. Emitted for allow AND block.
             if self._guardrail_id:
                 emit_guardrail_decision(
                     component=self._component,
@@ -356,13 +340,7 @@ class BedrockClient:
                 raise GuardrailBlockedError(f"Guardrail {self._guardrail_id} blocked the response")
 
             if intervened:
-                # Intervened without blocking — the response is still usable but
-                # matched values were substituted with placeholders (e.g.
-                # "{NAME}"). Note this masks values, it does not drop fields, so
-                # it cannot by itself explain a wholly missing output field. This
-                # branch is reachable only because it now sits AFTER the blocked
-                # `raise`, not nested under `if blocked:` — a masking intervention
-                # must leave an observable log line, not pass silently.
+                # Intervened without blocking: values are masked, not dropped.
                 logger.warning(
                     "Guardrail intervened without blocking (values masked): model=%s guardrail=%s actions=%s",
                     self._model_id,
@@ -373,10 +351,6 @@ class BedrockClient:
             if not content_blocks:
                 logger.error("Bedrock returned no content blocks")
                 raise ValueError("Bedrock returned no content blocks")
-            # Select the text block(s) by key, not position: a reasoning model
-            # returns a reasoningContent block (no "text" key) ahead of the
-            # answer, so content[0]["text"] would KeyError. extract_text_blocks
-            # raises ValueError if there is no text block at all.
             content = extract_text_blocks(content_blocks)
             if not content.strip():
                 logger.error("Bedrock returned empty content")

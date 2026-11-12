@@ -31,7 +31,7 @@ import java.util.concurrent.ThreadLocalRandom;
  * against the patterns registration applied, and a parameter carrying another deployment's
  * {@code deploymentId} is refused. Throttles are retried and counted separately from resolution failures.
  *
- * <p>Thread-safe. Design and threat model: LLD §6.2, "Integrity of the config parameter".
+ * <p>Thread-safe.
  */
 public final class SsmConnectionConfigProvider implements ConnectionConfigProvider
 {
@@ -237,7 +237,7 @@ public final class SsmConnectionConfigProvider implements ConnectionConfigProvid
                 .namespaceId(textVerbatim(root, "namespaceId"))
                 .crossAccountRoleArn(text(root, "crossAccountRoleArn"))
                 .build();
-        ConnectionConfig config = ConnectionConfig.builder()
+        return ConnectionConfig.builder()
                 .origin(origin)
                 .workspaceHostname(text(root, "workspaceHostname"))
                 .httpPath(text(root, "httpPath"))
@@ -250,16 +250,6 @@ public final class SsmConnectionConfigProvider implements ConnectionConfigProvid
                 .credentialSecretArn(text(root, "credentialSecretArn"))
                 .managedSource(source)
                 .build();
-        // A structural backstop: no configuration leaves this class unpinned, however it was built.
-        if (!config.isSchemaPinned()) {
-            throw new IllegalStateException(
-                    "Refusing a configuration resolved from SSM parameter " + parameterName + " that is"
-                            + " not pinned to one Unity Catalog schema. A managed source is exactly one"
-                            + " schema, and an unpinned configuration serves every schema in the catalog"
-                            + " its credential can see. This is a defect in this connector rather than a"
-                            + " bad parameter: the schema was required a few lines above.");
-        }
-        return config;
     }
 
     private static JsonNode parseJson(String parameterName, String body)

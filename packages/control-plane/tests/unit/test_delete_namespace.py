@@ -391,13 +391,7 @@ class TestCheckActiveInductionJobs:
         assert _check_active_induction_jobs("11111111-1111-4111-8111-111111111111") == []
 
     def test_unreachable_endpoint_fails_open_after_retries(self, monkeypatch):
-        """If the ontology-engine can't be reached after retries, ALLOW deletion
-        (fail open) rather than blocking forever. The delete path is only reached
-        for an already-ARCHIVED namespace (no new induction can start), so a
-        transient unreachable checker must not permanently brick every delete —
-        it previously did, leaking resources indefinitely. The async deletion
-        pipeline is itself race-tolerant (genuine races land in DELETE_FAILED).
-        """
+        """If the ontology-engine can't be reached after retries, deletion is allowed (fail open)."""
         from urllib.error import URLError
 
         from coa_control_plane.namespace.delete_handler import _check_active_induction_jobs
@@ -412,9 +406,7 @@ class TestCheckActiveInductionJobs:
         assert result == []
 
     def test_transient_error_then_success_honors_endpoint(self, monkeypatch):
-        """A retry that eventually succeeds honors the endpoint's answer rather
-        than failing open early: recovers on the 2nd attempt and blocks on a
-        real activeJobs count."""
+        """A retry that succeeds on the 2nd attempt honors the endpoint's activeJobs count."""
         from urllib.error import URLError
 
         from coa_control_plane.namespace.delete_handler import _check_active_induction_jobs
@@ -451,7 +443,7 @@ class TestCheckActiveImportJobs:
         assert result == []
 
     def test_completed_and_failed_jobs_do_not_block(self):
-        """Regression for #215: terminal job records must never block deletion."""
+        """Terminal job records must never block deletion."""
         mock_dao = MagicMock()
         mock_dao.query.return_value = MagicMock(
             items=[

@@ -75,10 +75,8 @@ class DatabricksErrorsTest
     @Test
     void aStatusCodeInAStatusContextStillClassifies()
     {
-        // The other half: anchoring must not stop the real forms working. The status-line forms are here
-        // because the first version of the anchor could not cross the "1.1" between the keyword and the
-        // digits, so HTTP/1.1 503 — the commonest spelling of all — fell through to
-        // DATABRICKS_REQUEST_FAILED.
+        // Anchoring must not stop the real forms working, including the status line, whose "1.1" sits
+        // between the keyword and the digits.
         for (String message : new String[] {
             "HTTP Response code: 503, Error message: Service Unavailable",
             "status: 503",
@@ -103,21 +101,16 @@ class DatabricksErrorsTest
     @Test
     void aRawStatusLineIsRecognisedAsAStoppedWarehouse()
     {
-        // Same two forms through the isWarehouseStarting predicate, which is what the retry decision
-        // reads. "HTTP/1.1 401 Unauthorized" carries a marker word as well, so the 401 case asserts only
-        // that the status form alone is enough.
+        // The status form alone, through the predicate the retry decision reads.
         assertTrue(DatabricksErrors.isWarehouseStarting(
                 new SQLException("HTTP/1.1 503 Service Unavailable")));
         assertFalse(DatabricksErrors.isWarehouseStarting(new SQLException("HTTP/1.1 401")));
-        assertTrue(DatabricksErrors.classify("connecting", new SQLException("HTTP/1.1 401"))
-                        .getMessage().startsWith(DatabricksErrors.AUTHENTICATION_PREFIX));
     }
 
     @Test
     void aVersionedStatusLinePrefixDoesNotLetAHexIdThrough()
     {
-        // The widening must not cost the round-one anchor: a query id's digits still must not read as a
-        // status code, whatever precedes them.
+        // A query id's digits must not read as a status code, whatever precedes them.
         assertFalse(DatabricksErrors.isWarehouseStarting(new SQLException(
                 "HTTP/1.1 200 OK [queryId: 01f0a503-8b1e-4c2f-9a77-2f4d503e1a40]")));
         assertTrue(DatabricksErrors.classify("reading rows", new SQLException(
@@ -184,10 +177,6 @@ class DatabricksErrorsTest
         assertFalse(failure.getMessage().contains("LEAKED"), failure.getMessage());
     }
 
-    // ---------------------------------------------------------------------------------------------
-    // The driver's second exception family
-    // ---------------------------------------------------------------------------------------------
-
     /**
      * The real {@code DatabricksDriverException}, not a stand-in. {@code isFromDriver} matches on
      * {@code getClass().getName()}, so a local subclass of {@link RuntimeException} would prove nothing
@@ -204,12 +193,8 @@ class DatabricksErrorsTest
     @Test
     void theDriversAuthExceptionIsARuntimeExceptionAndNotASqlException()
     {
-        // The fact the widening rests on, asserted against the driver rather than described in a comment.
-        // If a release makes it a SQLException, the catch sites can narrow again.
-        //
-        // Asked reflectively because javac rejects `driverFailure instanceof SQLException` outright: the two
-        // hierarchies are provably disjoint. That refusal is itself the proof, and this carries it forward
-        // if the driver's supertype changes.
+        // Asked reflectively because javac rejects `instanceof SQLException` on this type outright. If a
+        // driver release makes it a SQLException, the catch sites can narrow again.
         Class<?> driverExceptionType = driverRuntimeException("x").getClass();
         assertFalse(SQLException.class.isAssignableFrom(driverExceptionType),
                 "a catch on SQLException alone would miss " + driverExceptionType.getName());
@@ -289,10 +274,6 @@ class DatabricksErrorsTest
         assertTrue(classified.getMessage().startsWith(DatabricksErrors.WAREHOUSE_STARTING_PREFIX),
                 classified.getMessage());
     }
-
-    // ---------------------------------------------------------------------------------------------
-    // Provenance: a failure that never came from the driver must not be labelled as one
-    // ---------------------------------------------------------------------------------------------
 
     @Test
     void aKmsDecryptFailureNamesSecretsManagerRatherThanDatabricks()

@@ -13,22 +13,7 @@ _SCHEMA_PATH = Path(__file__).parent / "cedar-schema.json"
 DATA_SCHEMA: dict[str, Any] = json.loads(_SCHEMA_PATH.read_text())
 
 SCL_SCHEMA = "SCL"
-"""Cedar namespace prefix used to qualify all entity and action references.
-
-Example usage with the policy evaluator::
-
-    from coa_authorization.cedar_schema import SCL_SCHEMA, EntityType, Action
-    from coa_authorization.policy_evaluator import evaluate
-
-    result = evaluate(
-        policies=loaded_policies,
-        user_id="user-42",
-        action="viewNamespace",
-        resource_type="Namespace",
-        resource_id="a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-        global_roles=["VIEWER"],
-    )
-"""
+"""Cedar namespace prefix used to qualify all entity and action references."""
 
 
 class EntityType(StrEnum):
@@ -57,26 +42,7 @@ class EntityType(StrEnum):
 
 
 class Action(StrEnum):
-    """Cedar actions controlling access to SCL resources.
-
-    Actions are grouped by category:
-
-    Namespace lifecycle:
-        VIEW_NAMESPACE, MANAGE_NAMESPACE, DELETE_NAMESPACE
-
-    Discovery:
-        LIST — enumerate resources the principal can see.
-
-    Read operations:
-        QUERY, READ_METRIC, SEARCH_DOCUMENTS
-
-    Write operations:
-        MANAGE_SOURCE, MANAGE_METRIC, MANAGE_ONTOLOGY
-
-    Administrative:
-        GRANT_PERMISSIONS — assign roles to other principals.
-        MANAGE_ROLES — create/edit role definitions.
-    """
+    """Cedar actions controlling access to SCL resources."""
 
     # Namespace operations
     VIEW_NAMESPACE = "SCL::Action::viewNamespace"

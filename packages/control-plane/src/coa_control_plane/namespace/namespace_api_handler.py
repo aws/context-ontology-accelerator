@@ -17,7 +17,6 @@ from __future__ import annotations
 import os
 from typing import Any
 
-import structlog
 from coa_common.logging import setup_logging
 from coa_common.response import api_response
 
@@ -29,7 +28,6 @@ from .update_handler import handler as update_handler
 from .update_status_handler import handler as update_status_handler
 
 setup_logging(os.environ.get("LOG_LEVEL", "INFO"))
-logger = structlog.get_logger(__name__)
 
 
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:

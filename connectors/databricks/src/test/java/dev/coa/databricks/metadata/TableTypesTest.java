@@ -5,12 +5,12 @@ package dev.coa.databricks.metadata;
 import org.junit.jupiter.api.Test;
 
 import java.util.Arrays;
-import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** The allowlist, its three deliberate exclusions, and the ANSI value that does not exist here. */
@@ -28,10 +28,7 @@ class TableTypesTest
     void baseTableIsNotADatabricksValue()
     {
         // The ANSI spelling does not appear in Unity Catalog, so a filter of
-        // table_type IN ('BASE TABLE', 'VIEW') discards every table. And because 'VIEW' IS a Databricks
-        // value it does not return nothing: on an eleven-row fixture schema it returns one row, the view.
-        // The symptom is "views appear, tables are missing", which reads as a permissions problem rather
-        // than a dialect bug.
+        // table_type IN ('BASE TABLE', 'VIEW') discards every table and returns only the views.
         assertFalse(TableTypes.allowed().contains("BASE TABLE"));
     }
 
@@ -68,12 +65,6 @@ class TableTypesTest
     void theSetsAreImmutable()
     {
         Set<String> allowed = TableTypes.allowed();
-        try {
-            allowed.add("FOREIGN");
-            assertTrue(false, "the allowlist must not be mutable");
-        }
-        catch (UnsupportedOperationException expected) {
-            assertEquals(Collections.emptySet(), Collections.emptySet());
-        }
+        assertThrows(UnsupportedOperationException.class, () -> allowed.add("FOREIGN"));
     }
 }

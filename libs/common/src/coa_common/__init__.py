@@ -48,12 +48,10 @@ from coa_common.constants import (
     IngestionStatus,
     NamespaceStatus,
     SqlDialect,
-    canonical_col,
     graphrag_chunk_index_name,
     graphrag_index_names,
     ontology_vector_index_name,
     sql_ident,
-    sql_qualified_table,
     to_graphrag_tenant_id,
     validate_id,
     validate_namespace_id,
@@ -99,7 +97,6 @@ from coa_common.metadata_store import (
 from coa_common.namespace_resolver import resolve_namespace_id
 from coa_common.principal_keys import build_principal_keys, sanitize_principal_key
 from coa_common.response import (
-    CORS_HEADERS,
     api_response,
     get_caller_identity,
     iso_to_epoch,
@@ -132,7 +129,6 @@ __all__ = [
     "GuardrailScreenerError",
     "InputTooLargeError",
     "BusinessMetadata",
-    "CORS_HEADERS",
     "Column",
     "DEFAULT_DELETE_PREV_VERSIONS",
     "DEFAULT_EMBED_DIMENSIONS",
@@ -180,9 +176,7 @@ __all__ = [
     "deserialize_form",
     "serialize_form",
     "to_dict",
-    "canonical_col",
     "sql_ident",
-    "sql_qualified_table",
     "graphrag_chunk_index_name",
     "graphrag_index_names",
     "ontology_vector_index_name",

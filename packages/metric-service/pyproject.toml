@@ -14,6 +14,8 @@ dependencies = [
     "requests-aws4auth>=1.2",
     "sqlglot>=25.0",
     "pyyaml>=6.0",
+    "botocore>=1.34",
+    "pydantic>=2.13.4",
 ]
 
 [build-system]

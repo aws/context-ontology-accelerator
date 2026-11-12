@@ -94,9 +94,8 @@ the default `coa` deployment, not yours.
 
 > **Set it on every deploy.** The value is not stored anywhere. A later
 > `make deploy-dev` without `SCL_AOSS_MIN_OCU` puts the floor back to 2 OCU.
-> `make deploy-serve` always puts the limits back to 2 / 96: it also updates the
-> storage stack and doesn't pass `SCL_AOSS_*` through, so run `make deploy-dev`
-> with the variables again afterwards.
+> `make deploy-serve` updates only the serve stack, so it leaves the limits as
+> they are.
 
 The floor and ceiling are set on this deployment's own collection group, so each
 `SCL_PREFIX` pays its own floor; the ceiling is also capped by the account's

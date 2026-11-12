@@ -12,7 +12,7 @@ const MODES: readonly ConnectorMode[] = [ENVIRONMENT_MODE, MANAGED_MODE];
  * Which shape this deploy builds, from `DATABRICKS_CONFIG_SOURCE`.
  *
  * The same variable the app then sets on the Lambda, so synth and runtime cannot disagree about the
- * mode. Unset means `environment`, as in the jar, so a deployed stage-1 stack is unchanged.
+ * mode. Unset means `environment`, as in the jar, so an unset variable keeps existing deployments unchanged.
  *
  * Unlike the jar's operational settings, a typo is refused rather than defaulted: defaulting would
  * choose the single-endpoint mode for a deployment that asked for the multiplexed one, and the two

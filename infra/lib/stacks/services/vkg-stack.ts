@@ -21,7 +21,6 @@ import type { IAlarmActionStrategy } from "cdk-monitoring-constructs/lib/common/
 
 import { SCLStack } from "../../constructs/scl-stack";
 import { SclMonitoring } from "../../constructs";
-import { BRAND } from "../../constants";
 import {
   resolveContext,
   resolveLambdaReservedConcurrency,
@@ -55,12 +54,8 @@ export interface VkgStackProps extends cdk.StackProps {
   /**
    * JVM args for the Ontop launcher, passed via ONTOP_JAVA_ARGS (NOT JAVA_OPTS,
    * which the launcher ignores). Default "-Xmx1536m -Xms512m"; a blank value
-   * counts as unset. The stack appends -Dserver.address=127.0.0.1 after this
-   * value, so a -Dserver.address in it is superseded (Java keeps the last -D
-   * for a property); other Spring property sources, such as
-   * -Dspring.application.json, can still set the address. Applied to both
-   * the template task definition and the per-namespace reload Lambda, which
-   * registers the task definitions that actually run, so they stay in sync.
+   * counts as unset. The stack appends -Dserver.address=127.0.0.1; see "VKG
+   * Task Sizing" in external-docs/content/deploying.md.
    */
   readonly ontopJavaArgs?: string;
 
@@ -98,6 +93,10 @@ export class VkgStack extends SCLStack {
 
     const { prefix, envName, ssmPrefix } = resolveContext(this.node);
     const resourcePrefix = `${prefix}-${envName}`;
+    const vkgLogGroupArns = [
+      `arn:aws:logs:${this.region}:${this.account}:log-group:/ecs/${resourcePrefix}-vkg-*`,
+      `arn:aws:logs:${this.region}:${this.account}:log-group:/ecs/${resourcePrefix}-vkg-*:*`,
+    ];
     const vpc = props.network.vpc;
     const ecsSecurityGroup = props.network.ecsSecurityGroup;
 
@@ -228,7 +227,19 @@ export class VkgStack extends SCLStack {
     // also use this role and scope to their prefix via ONTOLOGY_PREFIX env var).
     this.ontologyBucket.grantRead(taskDef.taskRole, "ontologies/*");
 
-    // Allow execution role to create log streams for per-namespace VKG services
+    // CreateLogGroup: awslogs-create-group recreates a deleted group.
+    taskDef.executionRole!.addToPrincipalPolicy(
+      new iam.PolicyStatement({
+        actions: [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents",
+        ],
+        resources: vkgLogGroupArns,
+      }),
+    );
+    // Revisions registered before log groups carried the deployment prefix log
+    // to `/ecs/vkg-<ns>`. Remove once no VKG service runs such a revision.
     taskDef.executionRole!.addToPrincipalPolicy(
       new iam.PolicyStatement({
         actions: [
@@ -405,14 +416,17 @@ export class VkgStack extends SCLStack {
     );
     reloadFn.addToRolePolicy(
       new iam.PolicyStatement({
-        actions: [
-          "logs:CreateLogGroup",
-          "logs:CreateLogStream",
-          "logs:PutLogEvents",
-        ],
+        actions: ["logs:CreateLogGroup", "logs:PutRetentionPolicy"],
+        resources: vkgLogGroupArns,
+      }),
+    );
+    // Retention on the unprefixed legacy group. Remove with the execution role's
+    // legacy grant.
+    reloadFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["logs:PutRetentionPolicy"],
         resources: [
           `arn:aws:logs:${this.region}:${this.account}:log-group:/ecs/vkg-*`,
-          `arn:aws:logs:${this.region}:${this.account}:log-group:/ecs/vkg-*:*`,
         ],
       }),
     );
@@ -429,28 +443,15 @@ export class VkgStack extends SCLStack {
     );
 
     const { eventSourcePrefix } = resolveContext(this.node);
-    // Matches BOTH the deployment-scoped source and the legacy static `coa`
-    // one. TRANSITIONAL: the rule (CloudFormation) and the emitter's
-    // EVENT_SOURCE_PREFIX env var (ontology-stack, injected by BrandEnvAspect)
-    // do not flip atomically — they are separate stacks, so whichever updates
-    // second leaves a window where emitted and matched sources disagree. A miss
-    // there is SILENT: ontology accept still succeeds, VKG just never reloads
-    // and serves stale mappings (and #851 means a skipped notify_vkg has no
-    // in-product retry). Accepting both closes that window.
-    //
-    // REMOVE the legacy entry once every environment has deployed past this
-    // change. Note it re-opens cross-deployment triggering for any deployment
-    // still emitting `coa.ontology`, so do not stand up a second co-located
-    // deployment until the legacy entry is gone.
-    const legacySource = `${BRAND}.ontology`;
+    // Matches only this deployment's own event source. The default bus is shared
+    // by every deployment in the account and Region, so a rule that also matched
+    // the static `coa` source would provision this deployment's VKG services for
+    // namespaces accepted in a `coa`-prefixed one, and nothing here deletes them.
     const scopedSource = `${eventSourcePrefix}.ontology`;
     new events.Rule(this, "OntologyPublishedRule", {
       ruleName: this.prefixed("ontology-reload"),
       eventPattern: {
-        source:
-          scopedSource === legacySource
-            ? [scopedSource]
-            : [scopedSource, legacySource],
+        source: [scopedSource],
         detailType: ["ontology.published"],
       },
       targets: [
@@ -532,6 +533,8 @@ export class VkgStack extends SCLStack {
     });
     imageRollout.node.addDependency(vkgImageParam);
     imageRollout.node.addDependency(reloadFn);
+    // The sweep registers revisions that log through the execution role's grants.
+    imageRollout.node.addDependency(taskDef.executionRole!);
 
     // ================================================================
     // OE monitoring (cdk-monitoring-constructs)

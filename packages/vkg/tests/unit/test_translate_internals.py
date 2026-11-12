@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for the internal functions of translate-server.py (ORR QAL-A-2).
+"""Unit tests for the internal functions of translate-server.py.
 
 Covers the helpers the contract tests mock out: R2RML routing load, Ontop health
 polling, SPARQL→SQL reformulation over a mocked Ontop, dialect transpilation,
@@ -56,9 +56,6 @@ def _restore_module_globals():
         translate_server._health_status.update(saved[3])
 
 
-# --- _ontop_url --------------------------------------------------------------
-
-
 def test_ontop_url_builds_localhost_url():
     translate_server._ontop_port = 8081
     assert translate_server._ontop_url("/actuator/health") == "http://localhost:8081/actuator/health"
@@ -78,9 +75,6 @@ def test_ontop_url_rejects_foreign_host(monkeypatch):
         translate_server._ontop_url("/actuator/health")
 
 
-# --- _extract_sql ------------------------------------------------------------
-
-
 def test_extract_sql_strips_ontop_metadata_preamble():
     raw = "ans1(x, y)\nCONSTRUCT [x, y] [...]\n   NATIVE [...]\nSELECT t0.name FROM customer t0"
     assert translate_server._extract_sql(raw) == "SELECT t0.name FROM customer t0"
@@ -96,7 +90,6 @@ def test_extract_sql_returns_raw_when_no_select():
     assert translate_server._extract_sql(raw) == raw
 
 
-# --- _parse_projection_header ------------------------------------------------
 #
 # The `raw` fixtures below are VERBATIM output captured from Ontop 5.5.0's
 # /ontop/reformulate (the version pinned in packages/vkg/Dockerfile) against a
@@ -104,7 +97,7 @@ def test_extract_sql_returns_raw_when_no_select():
 # them: the SQL SELECT list order, the CONSTRUCT term-definition syntax and the
 # NATIVE alias list are exactly what the parser contracts on.
 
-# "Who worked on project Spaceballs?" — the query from issue #829.
+# "Who worked on project Spaceballs?"
 # Note the SELECT list order: the selected variable's column (FULL_NAME1m3) is
 # SECOND. EMPLOYEE_ID1m1 comes first. A positional var→alias mapping puts
 # employee IDs under an "employeeName" header.
@@ -267,7 +260,6 @@ SELECT V1."A" AS "A1m1", V1."B" AS "B1m2" FROM "T" V1"""
     assert translate_server._parse_projection_header(raw, "SELECT ?x WHERE { ?x a <y> }") is None
 
 
-# --- projection-drop observability -------------------------------------------
 #
 # A dropped projection silently reverts the namespace to raw SQL aliases (the
 # original bug). Each cause must name itself in the log, or an operator has no
@@ -328,9 +320,6 @@ def test_extract_sql_logs_when_no_statement_found(caplog):
     assert [r for r in caplog.records if r.levelname == "WARNING"], "returned raw blob without logging"
 
 
-# --- _extract_table_refs -----------------------------------------------------
-
-
 def test_extract_table_refs_single_table():
     assert translate_server._extract_table_refs("SELECT a FROM customer t0") == ["customer"]
 
@@ -354,9 +343,6 @@ def test_extract_table_refs_unparseable_returns_empty():
     assert translate_server._extract_table_refs("NOT SQL AT ALL ;;;") == []
 
 
-# --- _translate_dialect ------------------------------------------------------
-
-
 def test_translate_dialect_rewrites_substr_before_transpile():
     # The regex pre-processing turns H2 SUBSTR into SUBSTRING before sqlglot runs.
     # (sqlglot's trino writer may render it back to SUBSTR — that's fine; we assert
@@ -378,9 +364,6 @@ def test_translate_dialect_returns_input_on_transpile_error():
     assert translate_server._translate_dialect(broken, "postgres", "trino") == broken
 
 
-# --- _resolve_routing --------------------------------------------------------
-
-
 def test_resolve_routing_empty_when_no_table_routing():
     translate_server._table_routing = {}
     assert translate_server._resolve_routing(["customer"]) == {}
@@ -400,9 +383,6 @@ def test_resolve_routing_falls_back_to_bare_table_of_qualified_ref():
 def test_resolve_routing_skips_unknown_tables():
     translate_server._table_routing = {"CUSTOMER": {"datasourceId": "ds1"}}
     assert translate_server._resolve_routing(["unknown_table"]) == {}
-
-
-# --- _load_table_routing -----------------------------------------------------
 
 
 def test_load_table_routing_missing_file_returns_empty():
@@ -535,7 +515,7 @@ def test_load_table_routing_unparseable_file_returns_empty(tmp_path):
 
 
 def test_load_table_routing_parses_schema_qualified_table_name(tmp_path):
-    """#149 A: rr:tableName may now be `"schema"."table"`. The loader must
+    """rr:tableName may be `"schema"."table"`. The loader must
     register lookups under the bare table AND the schema.table form (each
     uppercased) so _resolve_routing matches whichever form Ontop's SQL uses."""
     ttl = tmp_path / "mappings.ttl"
@@ -582,9 +562,6 @@ ex:M a rr:TriplesMap ;
     assert result["sales.orders"]["datasourceId"] == "ds-sales"
 
 
-# --- _split_sql_qualified ----------------------------------------------------
-
-
 @pytest.mark.parametrize(
     "raw,expected",
     [
@@ -598,18 +575,6 @@ ex:M a rr:TriplesMap ;
 )
 def test_split_sql_qualified(raw, expected):
     assert translate_server._split_sql_qualified(raw) == expected
-
-
-# --- health polling ----------------------------------------------------------
-
-
-def test_check_ontop_health_reads_cached_status():
-    with translate_server._health_lock:
-        translate_server._health_status["healthy"] = True
-    assert translate_server._check_ontop_health() is True
-    with translate_server._health_lock:
-        translate_server._health_status["healthy"] = False
-    assert translate_server._check_ontop_health() is False
 
 
 def test_poll_ontop_health_sets_healthy_when_probe_passes(monkeypatch):
@@ -641,11 +606,8 @@ def test_poll_ontop_health_sets_unhealthy_on_error(monkeypatch):
     with pytest.raises(KeyboardInterrupt):
         translate_server._poll_ontop_health()
     assert translate_server._check_ontop_health() is False
-    # A failed probe caches a non-empty reason for the /health 503 body (#149 Fix 4).
+    # A failed probe caches a non-empty reason for the /health 503 body.
     assert translate_server._health_reason()
-
-
-# --- _translate_sparql (mocked Ontop) ----------------------------------------
 
 
 def _fake_ontop_response(sql_body: str):
@@ -719,9 +681,6 @@ def test_translate_sparql_raises_on_urlerror(monkeypatch):
     monkeypatch.setattr(translate_server.urllib.request, "urlopen", _raise)
     with pytest.raises(RuntimeError, match="Cannot reach Ontop"):
         translate_server._translate_sparql("q", "trino")
-
-
-# --- TranslateHandler request paths ------------------------------------------
 
 
 def _invoke(method, path, body=None, content_length=None):

@@ -15,10 +15,8 @@ import java.util.Set;
  * {@code VIEW}, {@code MATERIALIZED_VIEW}, {@code STREAMING_TABLE}, {@code FOREIGN},
  * {@code MANAGED_SHALLOW_CLONE} and {@code EXTERNAL_SHALLOW_CLONE}, so the filter every other
  * {@code information_schema} dialect writes, {@code table_type IN ('BASE TABLE', 'VIEW')}, discards
- * every table. And it does not return nothing, because {@code 'VIEW'} is a Databricks value: on an
- * eleven-row fixture schema it returns one row, the view. A steward then sees a source that scanned
- * successfully and contains views but no tables, which reads as a permissions problem rather than a
- * dialect bug.
+ * every table. It does not return nothing, because {@code 'VIEW'} is a Databricks value: a source scans
+ * successfully and contains views but no tables.
  *
  * <p>Three types are excluded. {@code FOREIGN} is a table federated into Unity Catalog from somewhere
  * else, and reading it through two federation layers is slower and less faithful than onboarding its own

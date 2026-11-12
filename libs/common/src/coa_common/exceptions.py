@@ -8,12 +8,7 @@ class SCLError(Exception):
     """Base exception for all services."""
 
     def __init__(self, message: str, code: str = "INTERNAL_ERROR") -> None:
-        """Initialize the error with a human-readable message and machine code.
-
-        Args:
-            message: Human-readable description of the failure.
-            code: Stable machine-readable error code for classification.
-        """
+        """Initialize the error with a human-readable message and machine code."""
         self.code = code
         super().__init__(message)
 

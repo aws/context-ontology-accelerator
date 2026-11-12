@@ -60,6 +60,23 @@ describe("OntologyGraphFlow", () => {
     );
   });
 
+  it("lists the grounded legend entry only when a grounded node is drawn", () => {
+    const { unmount } = render(
+      <OntologyGraphFlow nodes={nodes} edges={edges} />,
+    );
+    expect(screen.getByText("Grounded class")).toBeTruthy();
+    unmount();
+
+    render(
+      <OntologyGraphFlow
+        nodes={nodes.filter((n) => n.kind !== "grounded")}
+        edges={[]}
+      />,
+    );
+    expect(screen.getByText("Novel class")).toBeTruthy();
+    expect(screen.queryByText("Grounded class")).toBeNull();
+  });
+
   it("renders with empty nodes/edges", () => {
     const { container } = render(<OntologyGraphFlow nodes={[]} edges={[]} />);
     expect(container.querySelector(".react-flow")).toBeTruthy();

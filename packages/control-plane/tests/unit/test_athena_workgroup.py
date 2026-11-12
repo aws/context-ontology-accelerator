@@ -28,11 +28,6 @@ def env_vars(monkeypatch):
     monkeypatch.setenv("PROJECT_ACCESS_ROLE_ARN_SSM", "/coa/smus/dz-project-access-role-arn")
 
 
-# ═══════════════════════════════════════════════════════════════════
-# Workgroup Creation (namespace service)
-# ═══════════════════════════════════════════════════════════════════
-
-
 class TestAthenaWorkgroupCreation:
     def _make_service(self):
         from coa_common.dao import PaginatedResult
@@ -154,14 +149,6 @@ class TestAthenaWorkgroupCreation:
         svc.create(req)
         # Athena create_work_group should NOT be called (SSM param missing)
         mock_athena.create_work_group.assert_not_called()
-
-
-# ═══════════════════════════════════════════════════════════════════
-# Workgroup Deletion (cleanup.py — invoked by the deletion pipeline's
-# delete_platform step, see test_namespace_deletion_pipeline.py for the
-# step-level test and test_namespace_cleanup.py for delete_athena_workgroup
-# unit coverage). This section only covers the not-found edge case.
-# ═══════════════════════════════════════════════════════════════════
 
 
 class TestAthenaWorkgroupDeletion:

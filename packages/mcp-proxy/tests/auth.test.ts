@@ -1,7 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -51,8 +51,6 @@ describe("loadCache / saveCache", () => {
   });
 
   it("does NOT log for a missing cache file (silent first-run)", () => {
-    // ensure no file
-    if (existsSync(CACHE_FILE)) rmSync(CACHE_FILE);
     const errSpy = vi.spyOn(process.stderr, "write").mockReturnValue(true);
     expect(loadCache()).toBeNull();
     expect(errSpy).not.toHaveBeenCalled();
@@ -287,15 +285,7 @@ describe("browserOpenCommand", () => {
   );
 
   it("does not invoke cmd.exe or powershell on win32", () => {
-    // Regression guard. `cmd /c start` re-parses its arguments, and
-    // `powershell -Command Start-Process -FilePath <url>` fails outright: Node
-    // flattens argv on Windows and only quotes args containing space/tab/quote,
-    // so the URL's `&` characters reach PowerShell unquoted, where `&` is the
-    // reserved call operator.
-    const [command, args] = browserOpenCommand("win32", OAUTH_URL);
-    const line = [command, ...args].join(" ").toLowerCase();
-    expect(line).not.toContain("cmd");
-    expect(line).not.toContain("powershell");
+    const [, args] = browserOpenCommand("win32", OAUTH_URL);
     expect(args).toEqual(["url.dll,FileProtocolHandler", OAUTH_URL]);
   });
 

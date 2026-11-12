@@ -8,9 +8,6 @@ Invokes the metric-api Lambda's bulk-delete-metrics route with
 namespace-scoped deletion does NOT depend on enumerating metric names from
 DynamoDB — it directly purges all governed-metric triples from Neptune via
 SPARQL DELETE WHERE. Idempotent and immune to DDB/Neptune drift.
-
-Reuses the existing, tested Neptune + OpenSearch cleanup in
-``bulk_delete_metrics.py`` rather than duplicating SPARQL logic here.
 """
 
 from __future__ import annotations

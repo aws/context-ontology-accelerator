@@ -72,8 +72,8 @@ describe("connector Lambda", () => {
     expect(() => synth({ functionNamePrefix: "x".repeat(60) })).toThrow(
       /Lambda allows 64/,
     );
-    // The two Lambda accepts and CloudFormation does not. Both used to pass here, synth clean,
-    // and fail at CreateStack — after the jar had already been built and staged.
+    // Lambda accepts both of these; CloudFormation does not, and would fail at CreateStack after
+    // the jar had been built and staged.
     expect(() => synth({ functionNamePrefix: "acme_dev-" })).toThrow(
       /no underscores/,
     );
@@ -121,7 +121,6 @@ describe("connector Lambda", () => {
 
   it("runs on a supported Java runtime with room to buffer a block", () => {
     // java21, not java17: java17 is the Amazon Linux 2 variant and AL2 is past end of life.
-    // arm64 matches every Lambda `infra` deploys, and the jar carries no amd64-only native.
     synth().hasResourceProperties("AWS::Lambda::Function", {
       Runtime: "java21",
       Architectures: ["arm64"],
@@ -214,8 +213,8 @@ describe("spill bucket", () => {
   });
 
   it("survives the same role given twice, which is how one role does both COA jobs", () => {
-    // grantInvoke derives its construct id from the principal, so a duplicate used to fail synth
-    // with "There is already a Construct with name..." — naming neither the ARN nor the caller.
+    // grantInvoke derives its construct id from the principal, so a duplicate must not fail synth
+    // with "There is already a Construct with name...".
     const template = synth({ queryRoleArns: [SERVE_ROLE, SERVE_ROLE] });
     template.resourceCountIs("AWS::Lambda::Permission", 1);
     const statements = Object.values(template.findResources("AWS::S3::BucketPolicy"))
@@ -306,7 +305,6 @@ describe("spill bucket", () => {
       Principal: SERVE_ROLE,
     });
   });
-
 });
 
 describe("COA access", () => {
@@ -318,21 +316,8 @@ describe("COA access", () => {
     });
   });
 
-  it("lets the serve role read spilled blocks", () => {
-    // Spill objects are read with the querying role's credentials, not the connector's.
-    synth().hasResourceProperties("AWS::S3::BucketPolicy", {
-      PolicyDocument: Match.objectLike({
-        Statement: Match.arrayWith([
-          Match.objectLike({
-            Principal: { AWS: SERVE_ROLE },
-            Action: Match.anyValue(),
-          }),
-        ]),
-      }),
-    });
-  });
-
   it("grants GetObject under the spill prefix, since the querying role reads the blocks", () => {
+    // Spill objects are read with the querying role's credentials, not the connector's.
     synth().hasResourceProperties("AWS::S3::BucketPolicy", {
       PolicyDocument: Match.objectLike({
         Statement: Match.arrayWith([
@@ -497,9 +482,8 @@ describe("operational alarms", () => {
   it("treats missing data as not breaching, so an idle connector does not alarm", () => {
     const alarms = synth().findResources("AWS::CloudWatch::Alarm");
 
-    for (const [name, alarm] of Object.entries(alarms)) {
+    for (const alarm of Object.values(alarms)) {
       expect(alarm.Properties.TreatMissingData).toBe("notBreaching");
-      expect(name).toBeTruthy();
     }
   });
 

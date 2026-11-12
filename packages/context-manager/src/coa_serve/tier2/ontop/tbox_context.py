@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -358,6 +359,7 @@ class TBoxContextBuilder:
         query: str = "",
         max_tokens: int = 20_000,
         backend: StructuredBackend = StructuredBackend.SQL,
+        allowed_metrics: Collection[str] | None = None,
     ) -> TBoxContext:
         """Build T-Box context from vector search hits.
 
@@ -369,16 +371,19 @@ class TBoxContextBuilder:
             backend: Which structured backend's classes to include (see the
                 two-signal gate above). ``SQL`` for Ontop / NL→SQL, ``RDF_SPARQL``
                 for the native SPARQL strategy.
+            allowed_metrics: The caller's ``allowedMetrics`` grant. When set, only the metric hits it names reach the
+                context (definitions and glossary); None means no metric restriction.
 
         Returns:
             TBoxContext with classes, properties, and metric summaries.
         """
+        vector_hits = await self._permitted_hits(vector_hits, namespace, allowed_metrics)
         # Partition hits by type
         ontology_hits = [h for h in vector_hits if h.type in ("ontology_class", "ontology_property", "ontology")]
         metric_hits = [h for h in vector_hits if h.type == "metric"]
 
         # Build metric context from metric hits
-        metrics = self._build_metric_context(metric_hits)
+        metrics = self._build_metric_context(metric_hits, namespace)
 
         # Bind the namespace's named graphs ONCE for every Neptune query below
         # (see the _MAX_GRAPHS block at module top). Resolved here rather than in
@@ -1049,7 +1054,7 @@ class TBoxContextBuilder:
                 )
         return terms
 
-    def _build_metric_context(self, metric_hits: list[VectorHit]) -> list[MetricContext]:
+    def _build_metric_context(self, metric_hits: list[VectorHit], namespace: str) -> list[MetricContext]:
         """Build metric context for the prompt from metric vector hits.
 
         when a Tier-1 MetricResolver is available, enrich each hit with
@@ -1066,7 +1071,7 @@ class TBoxContextBuilder:
             formula = meta.get("formula", "")
             dimensions = meta.get("dimensions", [])
 
-            defn = self._resolve_full_metric(hit, name)
+            defn = self._resolve_full_metric(hit, name, namespace)
             if defn is not None:
                 # Prefer the authoritative Neptune definition; keep hit metadata
                 # only where the resolver leaves a field empty.
@@ -1078,18 +1083,59 @@ class TBoxContextBuilder:
             metrics.append(MetricContext(name=name, description=description, formula=formula, dimensions=dimensions))
         return metrics
 
-    def _resolve_full_metric(self, hit: VectorHit, name: str):
-        """Look up the full metric definition for a hit (by id then name). Best-effort."""
+    async def _permitted_hits(
+        self, vector_hits: list[VectorHit], namespace: str, allowed: Collection[str] | None
+    ) -> list[VectorHit]:
+        """The hits without the metrics ``allowed`` doesn't name; every hit when ``allowed`` is None."""
+        if allowed is None:
+            return vector_hits
+        # Concurrently, so a slow metric read delays the prompt once, not once per metric.
+        permitted = iter(
+            await asyncio.gather(
+                *(self._metric_permitted(h, namespace, allowed) for h in vector_hits if h.type == "metric")
+            )
+        )
+        return [h for h in vector_hits if h.type != "metric" or next(permitted)]
+
+    async def _metric_permitted(self, hit: VectorHit, namespace: str, allowed: Collection[str]) -> bool:
+        """Whether ``allowed`` names the hit's metric: by its resolved definition, else its metadata or URI suffix."""
+        meta = hit.metadata
+        # By id here; a name is checked below against a fresh read of the namespace's own definitions.
+        defn = self._resolve_full_metric(hit, "", namespace)
+        if defn is not None:
+            names = {defn.metric_id, defn.name}
+        else:
+            prefix = f"urn:{URN_PREFIX}:{namespace}:metric:"
+            name = meta.get("name") or (hit.uri[len(prefix) :] if hit.uri.startswith(prefix) else "")
+            named = [d for d in await self._definitions_named(name, namespace) if d.name == name]
+            names = {meta.get("metric_id"), name, *(d.metric_id for d in named if len(named) == 1)}
+        return any(n and n in allowed for n in names)
+
+    async def _definitions_named(self, name: str, namespace: str) -> list:
+        """``namespace``'s resolver definitions named ``name``, read within the resolver's TTL. None on any failure."""
+        if self._metric_resolver is None or not name:
+            return []
+        try:
+            return await self._metric_resolver.definitions_named(name, namespace) or []
+        except Exception:
+            return []
+
+    def _resolve_full_metric(self, hit: VectorHit, name: str, namespace: str):
+        """The hit's full metric definition: by id, else the one ``namespace`` definition of exactly ``name``.
+
+        Best-effort: None when there is no single match or the lookup fails.
+        """
         if self._metric_resolver is None:
             return None
+        entity_id = hit.metadata.get("metric_id") or hit.entity_id
         try:
-            entity_id = hit.metadata.get("metric_id") or hit.entity_id
             defn = self._metric_resolver.lookup(entity_id) if entity_id else None
-            if defn is None and name:
-                # Fall back to name-keyed lookup via the resolver's snapshot.
-                defn = self._metric_resolver._snapshot.by_name.get(name.lower())
+            if defn is None and name and namespace:
+                named = [d for d in self._metric_resolver._named(name, namespace) if d.name == name]
+                defn = named[0] if len(named) == 1 else None
             return defn
         except Exception:
+            logger.warning("tbox_metric_resolve_failed", entity_id=entity_id, exc_info=True)
             return None
 
     async def _fetch_annotations(

@@ -175,13 +175,21 @@ class TestGuardrailScreenerAsync:
         assert len(results) == 1
         assert results[0].passed is True
 
+    async def test_async_forwards_source(self):
+        mock_client = MagicMock()
+        mock_client.apply_guardrail.return_value = {"action": "NONE", "outputs": [], "assessments": []}
+        screener = GuardrailScreener(guardrail_id="gr-test", guardrail_version="1", region="us-east-1")
+        screener._client = mock_client
+
+        await screener.ascreen_texts(["hello"], source="OUTPUT")
+
+        assert mock_client.apply_guardrail.call_args.kwargs["source"] == "OUTPUT"
+
 
 class TestGuardrailScreenerCoverage:
     """Additional tests to cover _get_client, _call_with_retry internals, and _parse_response."""
 
     def test_get_client_creates_boto3_client(self):
-        from unittest.mock import patch
-
         with patch("coa_common.guardrail_screener.boto3") as mock_boto3:
             mock_boto3.client.return_value = MagicMock()
             screener = GuardrailScreener(guardrail_id="gr-1", guardrail_version="1", region="us-east-1")
@@ -235,7 +243,7 @@ class TestGuardrailScreenerCoverage:
                 {
                     "contentPolicy": {"filters": [{"type": "PROMPT_ATTACK", "action": "NONE"}]},
                     "sensitiveInformationPolicy": {
-                        "piiEntities": [{"type": "NAME", "action": "ANONYMIZED", "match": "Mark Relph"}]
+                        "piiEntities": [{"type": "NAME", "action": "ANONYMIZED", "match": "Jane Doe"}]
                     },
                 }
             ],
@@ -317,7 +325,7 @@ class TestGuardrailScreenerCoverage:
 
 
 class TestGuardrailScreenerDecisionMetrics:
-    """#111 AC10/AC11 — every screening decision is counted and logged."""
+    """Every screening decision is counted and logged."""
 
     @staticmethod
     def _screen(response: dict, **kwargs):
@@ -352,12 +360,12 @@ class TestGuardrailScreenerDecisionMetrics:
         assert "GuardrailInvocations" in metrics
 
     def test_anonymize_only_counts_as_allow(self):
-        """PII masking is not a block (#795) — it must not inflate GuardrailBlocked."""
+        """PII masking is not a block, so it must not inflate GuardrailBlocked."""
         anonymized = {"sensitiveInformationPolicy": {"piiEntities": [{"type": "NAME", "action": "ANONYMIZED"}]}}
         response = {"action": "GUARDRAIL_INTERVENED", "assessments": [anonymized]}
         cw = MagicMock()
         with patch("coa_common.guardrail_metrics._cloudwatch_client", return_value=cw):
-            self._screen(response).screen_texts(["Mark deployed agents"])
+            self._screen(response).screen_texts(["Jane deployed agents"])
 
         metrics = {m["MetricName"]: m for m in cw.put_metric_data.call_args.kwargs["MetricData"]}
         assert "GuardrailBlocked" not in metrics

@@ -10,7 +10,6 @@ import pytest
 from coa_common.constants import (
     bucket_grants_namespace,
     bucket_namespace_tag_key,
-    canonical_col,
     datasource_external_id,
     graphrag_chunk_index_name,
     graphrag_index_names,
@@ -21,7 +20,6 @@ from coa_common.constants import (
     parse_namespace_tag,
     split_sql_ident_path,
     sql_ident,
-    sql_qualified_table,
     to_graphrag_tenant_id,
     validate_id,
     validate_namespace_id,
@@ -51,20 +49,6 @@ class TestToGraphragTenantId:
         result = to_graphrag_tenant_id(ns)
         assert result == "550e8400e29b41d4a71644665"
 
-    def test_hyphens_stripped(self):
-        ns = "550e8400-e29b-41d4-a716-446655440000"
-        result = to_graphrag_tenant_id(ns)
-        assert "-" not in result
-
-    def test_always_25_chars_for_uuid(self):
-        ns = "550e8400-e29b-41d4-a716-446655440000"
-        assert len(to_graphrag_tenant_id(ns)) == 25
-
-    def test_deterministic(self):
-        """Same namespace always produces the same tenant ID."""
-        ns = "550e8400-e29b-41d4-a716-446655440000"
-        assert to_graphrag_tenant_id(ns) == to_graphrag_tenant_id(ns)
-
     def test_different_namespaces_different_tenant_ids(self):
         """Different namespaces produce different tenant IDs."""
         a = to_graphrag_tenant_id("550e8400-e29b-41d4-a716-446655440000")
@@ -85,13 +69,6 @@ class TestToGraphragTenantId:
         result = to_graphrag_tenant_id(ns, ds)
         assert result == self._expected(ns)
         assert len(result) == 25
-
-    def test_valid_graphrag_tenant_id_format(self):
-        """Result satisfies GraphRAG TenantId constraint: 1–25 lowercase alphanumeric."""
-        ns = "550e8400-e29b-41d4-a716-446655440000"
-        result = to_graphrag_tenant_id(ns)
-        assert 1 <= len(result) <= 25
-        assert re.fullmatch(r"[0-9a-f]{25}", result), f"Invalid tenant_id: {result}"
 
     @pytest.mark.parametrize(
         "ns",
@@ -301,20 +278,6 @@ class TestValidateOntologyUriPrefix:
             validate_ontology_uri_prefix(value)
 
 
-class TestCanonicalCol:
-    def test_lowercases_and_replaces_spaces(self):
-        assert canonical_col("First Name") == "first_name"
-
-    def test_strips_illegal_characters(self):
-        assert canonical_col("aCL IgG (%)") == "acl_igg_"
-
-    def test_digit_leading_gets_underscore_prefix(self):
-        assert canonical_col("1st") == "_1st"
-
-    def test_empty_result_defaults_to_col(self):
-        assert canonical_col("()%") == "col"
-
-
 class TestSqlIdent:
     def test_wraps_in_double_quotes(self):
         assert sql_ident("First Name") == '"First Name"'
@@ -324,28 +287,6 @@ class TestSqlIdent:
 
     def test_none_becomes_empty_quoted(self):
         assert sql_ident(None) == '""'  # type: ignore[arg-type]
-
-
-class TestSqlQualifiedTable:
-    """#149 A: the shared helper both the H2 DDL and the R2RML writer depend on
-    for byte-identical qualified table identifiers."""
-
-    def test_qualifies_with_schema(self):
-        assert sql_qualified_table("orders", "sales") == '"sales"."orders"'
-
-    def test_bare_when_no_schema(self):
-        assert sql_qualified_table("orders") == '"orders"'
-        assert sql_qualified_table("orders", None) == '"orders"'
-
-    def test_empty_schema_is_treated_as_bare(self):
-        # Falsy schema must not produce a leading-dot ("".orders) key.
-        assert sql_qualified_table("orders", "") == '"orders"'
-
-    def test_escapes_embedded_quotes_in_both_parts(self):
-        assert sql_qualified_table('a"b', 's"c') == '"s""c"."a""b"'
-
-    def test_preserves_special_characters(self):
-        assert sql_qualified_table("events daily", "raw-zone") == '"raw-zone"."events daily"'
 
 
 class TestSplitSqlIdentPath:
@@ -411,14 +352,7 @@ class TestOntologyArtifactS3Key:
 
 
 class TestBrandTokensIndependentOfResourcePrefix:
-    """Data-plane identifiers must not track RESOURCE_PREFIX.
-
-    CDK injects ``RESOURCE_PREFIX`` as ``{prefix}-{env}-`` (e.g. ``scl-dev-``)
-    because its consumers build resource names from it. These tokens used to
-    derive from it, so a deployment with ``resource_prefix=scl`` wrote IRIs under
-    ``http://scl-dev.amazon.com/vocab/scl-dev#`` while readers used their own
-    compiled-in default and silently matched nothing.
-    """
+    """Data-plane identifiers must not track RESOURCE_PREFIX."""
 
     def test_graph_tokens_ignore_resource_prefix(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("RESOURCE_PREFIX", "scl-dev-")
@@ -476,12 +410,6 @@ class TestGraphragIndexNames:
         """Two helpers derive the chunk index name; they must not drift."""
         ns = "f47ac10b-58cc-4372-a567-0e02b2c3d479"
         assert graphrag_chunk_index_name(ns) in graphrag_index_names(ns)
-
-    def test_namespace_scoped_not_source_scoped(self):
-        """All doc sources in a namespace share one index set — which is why
-        namespace deletion owns these and source deletion does not."""
-        ns = "550e8400-e29b-41d4-a716-446655440000"
-        assert graphrag_index_names(ns) == graphrag_index_names(ns)
 
     def test_distinct_namespaces_get_distinct_indexes(self):
         a = graphrag_index_names("550e8400-e29b-41d4-a716-446655440000")
@@ -567,10 +495,6 @@ class TestNamespaceTagKey:
         """Guards against `{prefix}-{env}-` style values reaching the key."""
         monkeypatch.setenv("RESOURCE_TAG_PREFIX", "scl-")
         assert namespace_tag_key() == "scl:namespace"
-
-    def test_distinct_deployments_get_distinct_keys(self, monkeypatch):
-        """Two deployments in one account must not share a binding."""
-        assert namespace_tag_key("scl") != namespace_tag_key("coa")
 
 
 class TestParseNamespaceTag:

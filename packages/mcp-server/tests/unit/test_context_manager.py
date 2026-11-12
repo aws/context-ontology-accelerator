@@ -22,12 +22,11 @@ from coa_mcp.clients.context_manager import (
 
 
 def _make_client() -> ContextManagerClient:
-    """Build a client with a real httpx.AsyncClient (mocked at the SSE layer)."""
-    client = ContextManagerClient(
+    """Build a client; the SSE layer is mocked per test."""
+    return ContextManagerClient(
         runtime_arn="arn:aws:bedrock-agentcore:us-east-1:123:runtime/cm-abc",
         region="us-east-1",
     )
-    return client
 
 
 def _mock_sse_response(status_code: int = 200, events: list[dict] | None = None, body: bytes = b""):
@@ -55,7 +54,6 @@ def _mock_sse_response(status_code: int = 200, events: list[dict] | None = None,
 
     @asynccontextmanager
     async def _aconnect_sse(*args, **kwargs):
-        # Store call args for assertion
         _aconnect_sse.last_call_args = args
         _aconnect_sse.last_call_kwargs = kwargs
         yield mock_event_source
@@ -102,7 +100,7 @@ class TestContextManagerInvoke:
         assert kwargs["headers"]["Content-Type"] == "application/json"
 
     @pytest.mark.asyncio
-    async def test_http_400_raises_context_manager_error(self):
+    async def test_http_error_status_raises_context_manager_error(self):
         client = _make_client()
         mock_sse = _mock_sse_response(403, body=b"Forbidden")
 

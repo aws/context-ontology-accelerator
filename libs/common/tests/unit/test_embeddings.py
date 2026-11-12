@@ -5,8 +5,8 @@
 
 Cover the two provider wire formats and the Cohere document/query asymmetry —
 the correctness the whole "one embedding model everywhere" change hinges on —
-plus the #784 item #2 batch path: v4-gated ≤96-text batching, subdivide-on-
-timeout, per-text sanitisation, and the retry↔subdivide layering.
+plus the batch path: v4-gated ≤96-text batching, subdivide-on-timeout,
+per-text sanitisation, and the retry↔subdivide layering.
 """
 
 from __future__ import annotations
@@ -144,9 +144,7 @@ class TestBatch:
         return e
 
     def test_embed_documents_preserves_order(self):
-        # Rewritten from the old single-text mock (invalidated by §3.2): v4 now
-        # sends ONE InvokeModel with a populated texts[]. call_count==1 also
-        # fails this if batching silently regresses to fan-out.
+        # call_count==1 fails if batching regresses to per-text fan-out.
         client = _mock_bedrock_batch_echo(f=lambda t: [float(len(t))])
         out = self._embedder(client).embed_documents(["a", "bbb", "cc"])
         assert client.invoke_model.call_count == 1
@@ -286,7 +284,7 @@ class TestSubdivideOnTimeout:
 
     def test_read_timeout_subdivides_but_not_app_retried(self):
         # ReadTimeoutError is a BotoCoreError: _invoke's `except ClientError`
-        # misses it (no double-retry stacking, §3.4.1), so a size-1 chunk that
+        # misses it (no double-retry stacking), so a size-1 chunk that
         # read-times-out is invoked EXACTLY ONCE, then re-raised.
         client = MagicMock()
         client.invoke_model.side_effect = ReadTimeoutError(endpoint_url="https://bedrock")
@@ -381,7 +379,7 @@ class TestBatchSizeConfig:
         e = BedrockEmbedder(model_id="us.cohere.embed-v4:0")
         e._client = client
         out = e.embed_documents([f"t{i}" for i in range(100)])
-        assert client.invoke_model.call_count == 100  # restores pre-fix one-call-per-text
+        assert client.invoke_model.call_count == 100
         assert len(out) == 100
 
 
@@ -436,8 +434,6 @@ class TestLlamaIndexAdapter:
     def test_adapter_is_picklable(self):
         # graphrag's build pipeline pickles embed_model across a
         # ProcessPoolExecutor; a closure/local class silently breaks ingestion.
-        import pickle
-
         adapter = make_llama_index_embedding(model_id="us.cohere.embed-v4:0", dimensions=1024)
         restored = pickle.loads(pickle.dumps(adapter))
         assert restored.model_name == "us.cohere.embed-v4:0"
@@ -487,7 +483,6 @@ class TestLlamaIndexAdapterAcrossProcesses:
         assert restored.embed_dimensions == 1024
 
     def test_module_getattr_returns_cached_class(self):
-        assert embeddings.BedrockEmbedderLlamaIndex is embeddings.BedrockEmbedderLlamaIndex
         adapter = make_llama_index_embedding(model_id="us.cohere.embed-v4:0", dimensions=1024)
         assert type(adapter) is embeddings.BedrockEmbedderLlamaIndex
 
@@ -610,7 +605,7 @@ class TestTruncation:
         e = BedrockEmbedder(model_id="us.cohere.embed-v4:0")
         e._client = client
         e.embed_document("x" * 12000)
-        # Bounded to _MAX_INPUT_CHARS (8000) — parity with the prior direct-invoke code.
+        # Bounded to _MAX_INPUT_CHARS (8000).
         assert len(_sent_body(client)["texts"][0]) == 8000
 
 
@@ -673,7 +668,7 @@ class TestEmbedRetry:
 
 
 class TestMetricEmission:
-    """EMF counters (§3.6) must fire with the right NAME + model_id dimension,
+    """EMF counters must fire with the right NAME + model_id dimension,
     and input_type where the counter carries it — proves observability wiring,
     not just the happy path."""
 

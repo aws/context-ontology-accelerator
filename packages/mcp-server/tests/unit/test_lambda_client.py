@@ -133,7 +133,6 @@ async def test_bearer_token_in_headers(lambda_client, mock_boto3_client):
         bearer_token="secret-jwt-token",
     )
 
-    # Extract the event payload passed to Lambda invoke
     call_kwargs = mock_boto3_client.invoke.call_args[1]
     event = json.loads(call_kwargs["Payload"])
     assert event["headers"]["Authorization"] == "Bearer secret-jwt-token"

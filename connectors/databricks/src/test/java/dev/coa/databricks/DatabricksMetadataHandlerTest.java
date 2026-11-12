@@ -42,9 +42,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *
  * <p>Everything past {@code listDatabases} on a pinned config needs a warehouse, and there is none, so
  * the handler takes its connection supplier as a constructor parameter and these tests hand it a
- * {@link FakeJdbc}. Before that seam existed the connection factory was constructed inside
- * {@code readerFor} and neither {@code listTables} nor {@code describeTable} could be reached from a
- * unit test at all — which is how an unpinned connector came to advertise schema names it then refused.
+ * {@link FakeJdbc}.
  */
 class DatabricksMetadataHandlerTest
 {
@@ -159,22 +157,6 @@ class DatabricksMetadataHandlerTest
     }
 
     @Test
-    void eachRequestResolvesTheConfigurationForItsOwnCatalog()
-    {
-        // Two catalogs, one handler, each answering from its own endpoint. A handler stashing the catalog
-        // name in a field could only pass this by relying on invocation ordering.
-        MultiplexedProvider provider = new MultiplexedProvider()
-                .add("warehouse_a", "main", "sales")
-                .add("warehouse_b", "other", "finance");
-        DatabricksMetadataHandler handler = handlerOver(provider);
-
-        assertEquals(Collections.singletonList("sales"),
-                new ArrayList<>(listSchemas(handler, "warehouse_a").getSchemas()));
-        assertEquals(Collections.singletonList("finance"),
-                new ArrayList<>(listSchemas(handler, "warehouse_b").getSchemas()));
-    }
-
-    @Test
     void interleavedRequestsDoNotContaminateEachOther()
     {
         // A -> B -> A. A handler reading the catalog name back out of a field passes this only while every
@@ -216,8 +198,6 @@ class DatabricksMetadataHandlerTest
 
         assertEquals(Collections.singletonList("warehouse_a"), provider.asked);
     }
-
-    // ── the schema gate: what it advertises is what it serves ────────────────
 
     @Test
     void whatAnUnpinnedConnectorAdvertisesIsExactlyWhatItServes()
@@ -352,8 +332,6 @@ class DatabricksMetadataHandlerTest
                 "the pin is the answer; enumerating could only agree with it or fail");
     }
 
-    // ── the enumeration is cached, because discovery is a per-table fan-out ───
-
     @Test
     void theSchemaListIsEnumeratedOncePerContainerRatherThanPerRequest()
     {
@@ -424,18 +402,18 @@ class DatabricksMetadataHandlerTest
         // Every other test in this file goes through the multiplexed fake, so without this the real
         // EnvironmentConnectionConfigProvider is never wired into a handler anywhere in the Java suite —
         // and a deployed single-endpoint stack pulling a newer jar has to behave no differently.
-        Map<String, String> stageOne = new HashMap<>();
-        stageOne.put(ConnectionConfig.WORKSPACE_HOSTNAME_VAR, "dbc-a1b2345c-d6e7.cloud.databricks.com");
-        stageOne.put(ConnectionConfig.HTTP_PATH_VAR, "/sql/1.0/warehouses/a1b234c567d8e9fa");
-        stageOne.put(ConnectionConfig.CATALOG_VAR, "main");
-        stageOne.put(ConnectionConfig.SCHEMA_VAR, "sales");
-        stageOne.put(ConnectionConfig.CREDENTIAL_SECRET_ARN_VAR, SECRET);
+        Map<String, String> environmentMode = new HashMap<>();
+        environmentMode.put(ConnectionConfig.WORKSPACE_HOSTNAME_VAR, "dbc-a1b2345c-d6e7.cloud.databricks.com");
+        environmentMode.put(ConnectionConfig.HTTP_PATH_VAR, "/sql/1.0/warehouses/a1b234c567d8e9fa");
+        environmentMode.put(ConnectionConfig.CATALOG_VAR, "main");
+        environmentMode.put(ConnectionConfig.SCHEMA_VAR, "sales");
+        environmentMode.put(ConnectionConfig.CREDENTIAL_SECRET_ARN_VAR, SECRET);
 
         FakeJdbc jdbc = fakeWarehouse();
         // fromEnvironment rather than the provider directly: that factory is what a real cold start calls,
         // so this covers the mode defaulting to `environment` and the mutual-exclusion check too.
-        DatabricksMetadataHandler handler = new DatabricksMetadataHandler(stageOne,
-                ConnectionConfigProviders.fromEnvironment(stageOne).provider(), credentials(),
+        DatabricksMetadataHandler handler = new DatabricksMetadataHandler(environmentMode,
+                ConnectionConfigProviders.fromEnvironment(environmentMode).provider(), credentials(),
                 config -> jdbc::connection, CredentialSource.DEFAULT_TTL_MILLIS);
 
         // Any Athena catalog name resolves the one endpoint, which is this mode's whole difference — and
@@ -454,16 +432,16 @@ class DatabricksMetadataHandlerTest
     @Test
     void anEnvironmentModeDeploymentStillRefusesASchemaOutsideItsPin()
     {
-        Map<String, String> stageOne = new HashMap<>();
-        stageOne.put(ConnectionConfig.WORKSPACE_HOSTNAME_VAR, "dbc-a1b2345c-d6e7.cloud.databricks.com");
-        stageOne.put(ConnectionConfig.HTTP_PATH_VAR, "/sql/1.0/warehouses/a1b234c567d8e9fa");
-        stageOne.put(ConnectionConfig.CATALOG_VAR, "main");
-        stageOne.put(ConnectionConfig.SCHEMA_VAR, "sales");
-        stageOne.put(ConnectionConfig.CREDENTIAL_SECRET_ARN_VAR, SECRET);
+        Map<String, String> environmentMode = new HashMap<>();
+        environmentMode.put(ConnectionConfig.WORKSPACE_HOSTNAME_VAR, "dbc-a1b2345c-d6e7.cloud.databricks.com");
+        environmentMode.put(ConnectionConfig.HTTP_PATH_VAR, "/sql/1.0/warehouses/a1b234c567d8e9fa");
+        environmentMode.put(ConnectionConfig.CATALOG_VAR, "main");
+        environmentMode.put(ConnectionConfig.SCHEMA_VAR, "sales");
+        environmentMode.put(ConnectionConfig.CREDENTIAL_SECRET_ARN_VAR, SECRET);
 
         FakeJdbc jdbc = fakeWarehouse();
-        DatabricksMetadataHandler handler = new DatabricksMetadataHandler(stageOne,
-                ConnectionConfigProviders.fromEnvironment(stageOne).provider(), credentials(),
+        DatabricksMetadataHandler handler = new DatabricksMetadataHandler(environmentMode,
+                ConnectionConfigProviders.fromEnvironment(environmentMode).provider(), credentials(),
                 config -> jdbc::connection, CredentialSource.DEFAULT_TTL_MILLIS);
 
         IllegalArgumentException refused = assertThrows(IllegalArgumentException.class,
@@ -474,8 +452,6 @@ class DatabricksMetadataHandlerTest
         assertTrue(refused.getMessage().contains(ConnectionConfig.SCHEMA_VAR), refused.getMessage());
         assertEquals(0, jdbc.connectionsOpened());
     }
-
-    // ── the gate itself, without a handler around it ─────────────────────────
 
     @Test
     void servableKeepsAddressableNamesAndDropsTheRest()

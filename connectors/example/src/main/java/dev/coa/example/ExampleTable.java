@@ -42,31 +42,21 @@ final class ExampleTable
         this.rowFactory = builder.rowFactory;
     }
 
-    /**
-     * @param name the table name as Athena will see it.
-     * @return a builder.
-     */
     static Builder named(String name)
     {
         return new Builder(name);
     }
 
-    /** @return the table's name, as {@link ExampleMetadataHandler} declares it. */
     String name()
     {
         return name;
     }
 
-    /** @return how many rows this table serves. */
     int rowCount()
     {
         return rowCount;
     }
 
-    /**
-     * @param rowNumber 1-based row ordinal, up to {@link #rowCount()}.
-     * @return the row's values by column name.
-     */
     Map<String, Object> row(int rowNumber)
     {
         return rowFactory.row(rowNumber);
@@ -84,20 +74,12 @@ final class ExampleTable
             this.name = name;
         }
 
-        /**
-         * @param count how many rows the table serves.
-         * @return this builder.
-         */
         Builder rows(int count)
         {
             this.rowCount = count;
             return this;
         }
 
-        /**
-         * @param factory makes one row; see {@link RowFactory}.
-         * @return this builder.
-         */
         Builder rowsFrom(RowFactory factory)
         {
             this.rowFactory = factory;

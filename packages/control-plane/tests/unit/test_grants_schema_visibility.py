@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Grant summaries withhold table/column overrides from schema-blind callers (ADR)."""
+"""Grant summaries withhold table/column overrides from schema-blind callers."""
 
 from __future__ import annotations
 

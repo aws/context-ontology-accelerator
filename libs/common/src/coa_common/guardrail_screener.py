@@ -13,12 +13,13 @@ Used by:
 
 References:
 - AWS ApplyGuardrail API: https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-use-independent-api.html
-- SDO-188: indirect prompt injection via unscreened RAG content.
+- Indirect prompt injection via unscreened RAG content.
 """
 
 from __future__ import annotations
 
 import asyncio
+import functools
 import os
 import random
 import time
@@ -42,7 +43,6 @@ from coa_common.guardrail_metrics import (
 logger = structlog.get_logger(__name__)
 
 # Guardrail policy paths covering all assessment types.
-# Consolidated from libs/common/bedrock.py and clients/bedrock.py (DRY).
 GUARDRAIL_POLICY_PATHS: list[tuple[str, str]] = [
     ("topicPolicy", "topics"),
     ("contentPolicy", "filters"),
@@ -108,7 +108,7 @@ class GuardrailScreener:
         guardrail_id: Bedrock guardrail identifier (retrieval guardrail).
         guardrail_version: Guardrail version string.
         region: AWS region. Defaults to AWS_REGION env var.
-        component: ``Component`` dimension for the decision metrics (#111 AC10).
+        component: ``Component`` dimension for the decision metrics.
         metrics_transport: ``"put"`` (PutMetricData) or ``"emf"`` (stdout EMF).
             Defaults to ``"put"`` because the primary caller is the kg-build ECS
             Fargate task, which publishes its other custom metrics the same way.
@@ -185,13 +185,7 @@ class GuardrailScreener:
         For per-document screening, call with one text at a time.
         When called with multiple texts, the single overall result is applied
         to all texts (conservative: if any triggers, all are marked as failed).
-
-        Args:
-            texts: List of text strings to evaluate.
-            source: "INPUT" for content entering the system, "OUTPUT" for responses.
-
-        Returns:
-            ScreeningResult per text in the same order as input.
+        ``source`` is "INPUT" for content entering the system, "OUTPUT" for responses.
 
         Raises:
             GuardrailScreenerError: After exhausting retries on transient errors.
@@ -223,7 +217,7 @@ class GuardrailScreener:
             GuardrailScreenerError: After exhausting retries on transient errors.
         """
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(_EXECUTOR, self.screen_texts, texts)
+        return await loop.run_in_executor(_EXECUTOR, functools.partial(self.screen_texts, texts, source=source))
 
     def _call_with_retry(self, content: list[dict], source: str) -> dict:
         """Call ApplyGuardrail with exponential backoff on transient errors."""
@@ -269,7 +263,7 @@ class GuardrailScreener:
                 raise GuardrailScreenerError(f"Unexpected error calling ApplyGuardrail: {e}") from e
 
     def _emit_decision(self, *, blocked: bool, latency_ms: float, assessments: list[dict]) -> None:
-        """Emit the allow/block decision metrics + structured log line (#111 AC10/AC11)."""
+        """Emit the allow/block decision metrics + structured log line."""
         emit_guardrail_decision(
             component=self._component,
             blocked=blocked,

@@ -14,6 +14,9 @@
 !uv.lock
 !scripts/uv_lock_constraints.py
 
+# Allow the build-time import check (the last step of each Python service image)
+!scripts/image_import_check.py
+
 # Allow context-manager package
 !packages/context-manager/Dockerfile
 !packages/context-manager/pyproject.toml

@@ -1,6 +1,6 @@
 # Data Layer
 
-REST API for programmatic query/retrieval — thin Lambda adapter that forwards requests to the Context Manager via AgentCore Runtime.
+REST API for programmatic query/retrieval. Thin Lambda adapter that forwards requests to the Context Manager via AgentCore Runtime.
 
 ## Endpoints
 
@@ -10,7 +10,7 @@ REST API for programmatic query/retrieval — thin Lambda adapter that forwards 
 | POST | `/namespaces/{namespaceId}/translate` | NL-to-SPARQL translation only |
 | POST | `/namespaces/{namespaceId}/kb/search` | Vector search (OpenSearch) |
 | POST | `/namespaces/{namespaceId}/graph/traverse` | Graph traversal (Neptune) |
-| GET  | `/namespaces/{namespaceId}/schema` | Schema discovery — returns queryable classes and properties |
+| GET  | `/namespaces/{namespaceId}/schema` | Schema discovery, returns queryable classes and properties |
 
 ## How it works
 

@@ -6,9 +6,6 @@
  *
  * Stdio bridge to AgentCore MCP Runtime with Cognito PKCE auth.
  * Auto-discovers config from SSM. Caches tokens for 30 days.
- *
- * Usage in .kiro/settings/mcp.json:
- *   { "command": "npx", "args": ["tsx", "./packages/mcp-proxy/src/index.ts"] }
  */
 
 import { spawn } from "node:child_process";
@@ -30,6 +27,20 @@ export function findUvx(): string | null {
     if (existsSync(p)) return p;
   }
   return null;
+}
+
+/**
+ * uvx arguments for the stdio-to-HTTP bridge. mcp-proxy 0.13.x declares
+ * `mcp>=1.30.0,<2` itself (the v2 SDK removed the `request_ctx` API it uses),
+ * so the SDK version is resolved by mcp-proxy and not pinned here.
+ */
+export function buildProxyArgs(token: string, runtimeUrl: string): string[] {
+  return [
+    "mcp-proxy==0.13.3",
+    "--transport", "streamablehttp",
+    "--headers", "Authorization", `Bearer ${token}`,
+    runtimeUrl,
+  ];
 }
 
 export function buildPath(): string {
@@ -67,19 +78,9 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const child = spawn(
-    uvxPath,
-    [
-      // Pin mcp too: mcp-proxy 0.12.0 needs mcp's pre-v2 `request_ctx` API,
-      // which the v2 rewrite removed. Bump once mcp-proxy supports v2.
-      "--with", "mcp==1.27.1",
-      "mcp-proxy==0.12.0",
-      "--transport", "streamablehttp",
-      "--headers", "Authorization", `Bearer ${token}`,
-      config.runtimeUrl,
-    ],
-    { stdio: "inherit", env: { ...process.env, PATH: buildPath() } },
-  );
+  const child = spawn(uvxPath, buildProxyArgs(token, config.runtimeUrl), {
+    stdio: "inherit",
+  });
 
   child.on("exit", (code) => process.exit(code ?? 1));
   child.on("error", (err) => {

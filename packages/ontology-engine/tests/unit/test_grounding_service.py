@@ -444,7 +444,7 @@ class TestEnhancedMode:
         assert result.chosen is candidates[1]
 
     @pytest.mark.parametrize("reverse", [False, True])
-    def test_llm_duplicate_exact_choice_abstains_independent_of_recall_order(self, service, reverse: bool):
+    def test_llm_duplicate_exact_choice_is_ambiguous_independent_of_recall_order(self, service, reverse: bool):
         candidates = [
             GroundingCandidate(
                 entity_uri="http://ontology-a.test/Duplicate",
@@ -483,7 +483,7 @@ class TestEnhancedMode:
                 ontology_ids=["ontology-a", "ontology-b"],
             )
         assert result.chosen is None
-        assert result.match_type == "novel"
+        assert result.match_type == "ambiguous"
         assert "did not uniquely identify" in (result.reason or "")
         assert "http://ontology-a.test/Duplicate" in (result.reason or "")
         assert "http://ontology-b.test/Duplicate" in (result.reason or "")

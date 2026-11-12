@@ -84,11 +84,6 @@ _PATH_NAMES = {"path_params"}
 _QUERY_NAMES = {"query_params", "raw_params"}
 _BODY_NAMES = {"body"}
 
-# Declared members a handler deliberately does not read: (operationId, member) -> why.
-_KNOWN_GAPS: dict[tuple[str, str], str] = {}
-# Undeclared query parameters a handler still reads: (operationId, param) -> why.
-_LEGACY_QUERY_ALIASES: dict[tuple[str, str], str] = {}
-
 
 def _spec() -> dict[str, Any]:
     if not _OPENAPI.is_file():
@@ -191,12 +186,7 @@ def test_declared_members_are_read(operation: str) -> None:
     reads, wrapped = _reads(_HANDLERS[operation])
     if wrapped:
         reads["body"].add("clientToken")
-    missing = {
-        (location, member)
-        for location, members in declared.items()
-        for member in members - reads[location]
-        if (operation, member) not in _KNOWN_GAPS
-    }
+    missing = {(location, member) for location, members in declared.items() for member in members - reads[location]}
     assert not missing, f"{operation} never reads declared members {sorted(missing)}"
 
 
@@ -206,7 +196,7 @@ def test_no_undeclared_query_parameters(operation: str) -> None:
     _, _, op = _operations(spec)[operation]
     declared = _declared(spec, op)["query"]
     reads, _ = _reads(_HANDLERS[operation])
-    extra = {q for q in reads["query"] - declared if (operation, q) not in _LEGACY_QUERY_ALIASES}
+    extra = reads["query"] - declared
     assert not extra, f"{operation} reads undeclared query parameters {sorted(extra)}"
 
 

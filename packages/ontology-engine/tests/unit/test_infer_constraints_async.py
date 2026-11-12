@@ -111,8 +111,8 @@ def test_infer_constraints_job_polls_to_completed(monkeypatch, persisted):
     resp = proposals.infer_constraints("p-1", namespace="ns")
 
     job = _poll_until_terminal(proposals, "p-1", resp["job_id"], "ns")
-    # The worker marks the job completed before it sets the result and writes the
-    # terminal record, so wait for that write before asserting on either.
+    # The poll can see the job completed before the worker writes the terminal
+    # record, so wait for that write before asserting on it.
     deadline = time.monotonic() + 5
     while persisted[-1:] != ["completed"] and time.monotonic() < deadline:
         time.sleep(0.01)

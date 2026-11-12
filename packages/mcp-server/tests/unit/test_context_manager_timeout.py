@@ -20,5 +20,4 @@ def test_cm_client_split_timeout():
     )
     assert isinstance(client._client.timeout, httpx.Timeout)
     assert client._client.timeout.connect == 2.0
-    # Long read budget preserved (full tiered resolve, no API GW cap).
     assert client._client.timeout.read == cm._INVOKE_TIMEOUT_S

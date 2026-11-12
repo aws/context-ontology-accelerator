@@ -237,7 +237,7 @@ def select_tier1_sql_expression(dialects: Sequence[Mapping[str, Any]]) -> str:
     """Select the expression Tier 1 will execute.
 
     Tier 1 consumes Trino SQL. It prefers an explicitly labelled TRINO entry
-    and retains the historical fallback to the first entry when one is absent.
+    and falls back to the first entry when one is absent.
     Onboarding uses this same helper so it validates the exact expression and
     ordering the resolver will later execute.
     """

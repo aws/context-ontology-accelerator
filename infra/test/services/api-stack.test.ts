@@ -150,6 +150,44 @@ describe("ApiStack OE monitoring", () => {
   });
 });
 
+describe("ApiStack account-wide CloudWatch role", () => {
+  const synth = (context: Record<string, unknown> = {}) => {
+    const app = new cdk.App({ context: { ...TEST_CONTEXT, ...context } });
+    const depStack = new cdk.Stack(app, "DepStack", {
+      env: { account: "123456789012", region: "us-east-1" },
+    });
+    const vpc = new ec2.Vpc(depStack, "Vpc");
+    return Template.fromStack(
+      new ApiStack(app, "TestApiCwRole", {
+        env: { account: "123456789012", region: "us-east-1" },
+        allowedOrigin: "*",
+        vpc,
+        ...mkTestSgs(depStack, vpc),
+        rolesTable: mkTestTable(depStack, "Roles"),
+        resourceRoleMappingsTable: mkTestTable(depStack, "RRM"),
+        cacheInvalidationTable: mkTestTable(depStack, "Cache"),
+      }),
+    );
+  };
+
+  it("sets the region's API Gateway CloudWatch role by default", () => {
+    synth().resourceCountIs("AWS::ApiGateway::Account", 1);
+  });
+
+  it("leaves the region's role alone when api_gateway_cloudwatch_role is false", () => {
+    synth({ api_gateway_cloudwatch_role: " FALSE " }).resourceCountIs(
+      "AWS::ApiGateway::Account",
+      0,
+    );
+  });
+
+  it("refuses an api_gateway_cloudwatch_role that is neither true nor false", () => {
+    expect(() => synth({ api_gateway_cloudwatch_role: "no" })).toThrow(
+      /must be true or false, got "no"/,
+    );
+  });
+});
+
 describe("ApiStack WAF WebACL", () => {
   const mkApi = (webAclId?: string) => {
     const app = new cdk.App({ context: TEST_CONTEXT });

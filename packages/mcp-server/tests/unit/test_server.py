@@ -3,10 +3,7 @@
 
 """Tests for the MCP server tool handlers and auth/profile helpers.
 
-The 6 tools are thin protocol adapters: authenticate, resolve profile,
-delegate to a backend client, serialize JSON, audit-log. These tests mock
-the backend clients and delegate functions to verify the adapter behavior
-(JSON output, auth branching, error mapping) without any network calls.
+Backend clients and delegates are mocked, so no network calls are made.
 """
 
 from __future__ import annotations
@@ -22,8 +19,8 @@ from coa_mcp.tools.execution import ContextManagerError
 
 from .conftest import _TEST_AUDIENCE, _TEST_ISSUER, _TEST_KID, _private_key, create_test_token
 
-# Stand-in for the policy text ``grant_resolver._evaluate_cedar`` returns on allow.
-# Not valid Cedar, so every follow-up schema-view evaluation denies (fail closed).
+# Stands in for the policy text ``_evaluate_cedar`` returns on allow. It is not
+# valid Cedar, so every follow-up schema-view evaluation denies (fail closed).
 _NO_POLICY_TEXT = "// stub policy text"
 
 
@@ -79,9 +76,6 @@ def _serve_profile(namespace: str = "sales", allowed_metrics: list[str] | None =
     )
 
 
-# ── _extract_bearer_token ─────────────────────────────────────────────
-
-
 @pytest.mark.unit
 class TestExtractBearerToken:
     def test_auth_disabled_returns_empty_string(self, monkeypatch):
@@ -112,9 +106,6 @@ class TestExtractBearerToken:
             server._extract_bearer_token(_BadCtx())
 
 
-# ── _build_authorizer_context ─────────────────────────────────────────
-
-
 @pytest.mark.unit
 class TestBuildAuthorizerContext:
     def test_builds_context_from_caller_and_profile(self):
@@ -143,9 +134,6 @@ class TestBuildAuthorizerContext:
         ctx = server._build_authorizer_context(caller, {})
         assert ctx["email"] == "bob"
         assert ctx["groups"] == ""
-
-
-# ── _resolve_caller_and_profile ───────────────────────────────────────
 
 
 @pytest.mark.unit
@@ -204,9 +192,6 @@ class TestResolveCallerAndProfile:
         assert profile["userId"] == "alice@example.com"
 
 
-# ── Lazy client singletons ────────────────────────────────────────────
-
-
 @pytest.mark.unit
 class TestClientSingletons:
     def test_lambda_client_is_cached(self, monkeypatch):
@@ -242,9 +227,6 @@ class TestClientSingletons:
         assert len(created) == 1
 
 
-# ── Tool handlers ─────────────────────────────────────────────────────
-
-
 @pytest.fixture
 def _local_dev(monkeypatch):
     """Run tools in local-dev (auth-disabled) mode with a mocked Lambda client."""
@@ -257,8 +239,6 @@ def _local_dev(monkeypatch):
 class TestListMetricsTool:
     @pytest.mark.asyncio
     async def test_returns_serialized_metrics(self, monkeypatch, _local_dev):
-        # Use **kwargs so the fake tolerates the added Smithy-parity kwargs
-        # (next_token, status) without every test being updated in lockstep.
         async def fake_delegate(lc, ns, token, **kwargs):
             return {"metrics": [{"name": "Revenue"}], "namespace": ns}
 
@@ -359,16 +339,7 @@ class TestListMetricsTool:
 
     @pytest.mark.asyncio
     async def test_forwards_next_token(self, monkeypatch, _local_dev):
-        """Regression for the pagination gap: nextToken must reach the
-        discovery helper. The MCP tool accepts it in camelCase (matching
-        Smithy) and hands it to the helper as snake_case.
-
-        ``status`` is intentionally not part of the MCP tool signature — the
-        metric-service backend does not filter on it today, so accepting it
-        here would silently return an unfiltered response as if filtered.
-        Pin its absence so a future revert reintroduces the failure here
-        rather than as a silent-wrong-answer bug in production.
-        """
+        """``nextToken`` reaches the helper as ``next_token``; ``status`` is not exposed (backend ignores it)."""
         captured: dict = {}
 
         async def fake_delegate(lc, ns, token, **kwargs):
@@ -382,7 +353,7 @@ class TestListMetricsTool:
 
     @pytest.mark.asyncio
     async def test_metric_label_reaches_the_tool_output(self, monkeypatch, _local_dev):
-        """The display-only ``label`` stays in the output so an agent can show it (#1259)."""
+        """The display-only ``label`` stays in the output so an agent can show it."""
 
         async def fake_delegate(lc, ns, token, **kwargs):
             return {"metrics": [{"name": "revenue_total", "label": "売上合計"}, {"name": "order_count"}]}
@@ -405,8 +376,6 @@ class TestListMetricsTool:
 class TestDescribeSchemaTool:
     @pytest.mark.asyncio
     async def test_returns_serialized_classes(self, monkeypatch, _local_dev):
-        # **kwargs to absorb newly-added class_filter without churn on
-        # unrelated tests.
         async def fake_delegate(lc, ns, token, **kwargs):
             return {"classes": [{"label": "Order"}], "ontologyVersion": "v2"}
 
@@ -417,8 +386,7 @@ class TestDescribeSchemaTool:
 
     @pytest.mark.asyncio
     async def test_forwards_class_filter(self, monkeypatch, _local_dev):
-        """Missing Smithy input the previous tool signature dropped — now
-        reaches the discovery helper."""
+        """``classFilter`` reaches the discovery helper."""
         captured: dict = {}
 
         async def fake_delegate(lc, ns, token, **kwargs):
@@ -466,7 +434,7 @@ class TestQueryTool:
         monkeypatch.setattr(server.execution, "execute_query", fake_delegate)
         out = await server.query(None, "revenue?", "sales")
         parsed = json.loads(out)
-        # Envelope now surfaces top-level, matching data-layer's Query output.
+        # Envelope surfaces top-level, matching data-layer's Query output.
         assert parsed["result"]["tier"] == 2
         assert parsed["result"]["resultRows"] == [{"n": 1}]
         assert parsed["requestId"] == "req-1"
@@ -493,7 +461,7 @@ class TestQueryTool:
     @pytest.mark.asyncio
     async def test_cm_error_preserves_status_code(self, monkeypatch, _local_dev):
         """When CM returns a >=400 the tool must surface the code, not
-        collapse it into a generic Python exception the way ``raise`` used to.
+        collapse it into a generic Python exception.
         Same posture as data-layer's ``_error_response(status_code, message)``."""
 
         async def deny(cm, query_text, ns, profile, token, **kwargs):
@@ -505,10 +473,7 @@ class TestQueryTool:
 
     @pytest.mark.asyncio
     async def test_forwards_new_smithy_inputs(self, monkeypatch, _local_dev):
-        """execute + dimensions + mode — Smithy inputs the previous signature
-        dropped — now reach the helper. ``timeoutMs`` is absent from the
-        captured kwargs when the caller does not pass it (default None).
-        """
+        """execute, dimensions and mode reach the helper; ``timeoutMs`` defaults to None."""
         captured: dict = {}
 
         async def fake_delegate(cm, query_text, ns, profile, token, **kwargs):
@@ -532,9 +497,7 @@ class TestQueryTool:
 
     @pytest.mark.asyncio
     async def test_forwards_timeout_ms(self, monkeypatch, _local_dev):
-        """issue #185: the ``query`` tool now accepts Smithy ``timeoutMs`` and
-        hands it to the helper as ``timeout_ms`` so an MCP caller can lower the
-        deadline — the MCP half the issue said 'declines to forward it'."""
+        """camelCase ``timeoutMs`` reaches the helper as ``timeout_ms``."""
         captured: dict = {}
 
         async def fake_delegate(cm, query_text, ns, profile, token, **kwargs):
@@ -597,7 +560,7 @@ class TestRagRetrievalTool:
 
     @pytest.mark.asyncio
     async def test_forwards_source_and_entity_filters(self, monkeypatch, _local_dev):
-        """Missing Smithy inputs the previous tool signature dropped — now reach the helper."""
+        """``sourceFilter`` and ``entityFilter`` reach the helper."""
         captured: dict = {}
 
         async def fake_delegate(cm, query_text, ns, profile, token, **kwargs):
@@ -648,7 +611,7 @@ class TestGraphTraversalTool:
 
     @pytest.mark.asyncio
     async def test_forwards_relationship_filter(self, monkeypatch, _local_dev):
-        """relationshipFilter — Smithy input the previous tool signature dropped."""
+        """``relationshipFilter`` reaches the helper."""
         captured: dict = {}
 
         async def fake_delegate(cm, start_uri, ns, profile, token, **kwargs):
@@ -667,28 +630,17 @@ class TestGraphTraversalTool:
 
 @pytest.mark.unit
 class TestQueryToolStrategySchema:
-    """``strategy`` must reach the published tool schema as an optional enum.
-
-    The type hint alone is not the contract — FastMCP derives the JSON schema the
-    agent actually sees. If ``strategy`` were typed ``str`` the schema would carry no
-    constraint, and an agent inventing a plausible value would get the cheap fallback
-    chain: serve treats an unrecognised strategy as "no pin" and silently runs
-    DEFAULT_STRATEGY.
-    """
+    """``strategy`` must reach the published tool schema as an optional enum, not a bare ``str``."""
 
     @pytest.mark.asyncio
     async def test_strategy_is_an_optional_enum_in_the_tool_schema(self):
-        from coa_mcp import server as server_mod
-
-        tools = await server_mod.mcp.list_tools()
+        tools = await server.mcp.list_tools()
         query_tool = next(t for t in tools if t.name == "query")
         schema = query_tool.inputSchema
 
-        # Optional: absent from `required`, and defaulted so omitting it is valid.
         assert "strategy" not in schema.get("required", [])
 
         prop = schema["properties"]["strategy"]
-        # Nullable enum shape: anyOf[{enum: [...]}, {type: "null"}].
         enum_values = next(
             (branch["enum"] for branch in prop["anyOf"] if "enum" in branch),
             None,
@@ -733,12 +685,7 @@ class TestWithholdSchemaFieldsHelper:
 
 @pytest.mark.unit
 class TestCallerCanViewOntologyWiring:
-    """The real profile -> suppression-gate wiring (not stubbed).
-
-    A wrong key or action name would withhold the fields from EVERY caller,
-    silently blinding owners; the suppression tests below stub
-    _caller_can_view_ontology, so this pins the mapping itself.
-    """
+    """Real profile -> suppression-gate mapping; the tests below stub the gate."""
 
     @pytest.mark.parametrize(
         ("visibility", "expected"),

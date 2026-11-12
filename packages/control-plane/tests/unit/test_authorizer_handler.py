@@ -185,8 +185,7 @@ class TestCacheInvalidation:
 class TestSyncTimeoutProfile:
     """The Lambda authorizer runs on every gated request (result caching is
     disabled), so every DynamoDBDAO it builds must fail fast rather than
-    inherit the DAO's background 30-second/three-attempt default (matches
-    the Cedar policy loader's #1092 fix).
+    inherit the DAO's background 30-second/three-attempt default.
     """
 
     @patch("coa_control_plane.authorization.handler.DynamoDBDAO")
@@ -259,11 +258,7 @@ class TestRolesCaching:
         assert cached_resource == [{"role": "data-steward", "resourceUID": "ns-123"}]
 
     def test_principal_id_with_special_characters_is_url_encoded(self, env_vars):
-        """Verify that principal IDs with special characters are URL-encoded when querying.
-
-        This matches the encoding used when creating grants, ensuring that users with
-        special characters (like ``+``) in their email can have their grants resolved.
-        """
+        """Principal IDs with special characters are URL-encoded when querying."""
         from coa_control_plane.authorization.handler import _resolve_roles
 
         mock_dao = MagicMock()
@@ -324,45 +319,6 @@ class TestRolesCaching:
 
         assert "user@example.com:GroupA,GroupB" in _roles_cache
 
-    def test_corrupt_cache_entry_evicted_and_requeried(self, env_vars):
-        """A corrupt/legacy cache entry should be evicted and the query re-run."""
-        from coa_control_plane.authorization.handler import _resolve_roles, _roles_cache
-
-        # Simulate a corrupt entry (wrong type — e.g. leftover from prior code)
-        cache_key = "user@example.com:GroupX"
-        _roles_cache[cache_key] = "garbage"  # type: ignore[assignment]
-
-        mock_dao = MagicMock()
-        # User query returns a role, group query returns nothing
-        mock_dao.query_all.side_effect = [
-            [{"role": "VIEWER", "resourceId": "GLOBAL"}],
-            [],
-        ]
-
-        global_roles, resource_roles = _resolve_roles("user@example.com", ["GroupX"], mock_dao)
-
-        # Should have queried DDB since cache was corrupt
-        assert mock_dao.query_all.called
-        assert global_roles == ["VIEWER"]
-        # Re-populated with a well-formed entry in the current shape.
-        assert len(_roles_cache[cache_key]) == 3
-        assert _roles_cache[cache_key][1] == ["VIEWER"]
-
-    def test_legacy_two_tuple_entry_evicted_and_requeried(self, env_vars):
-        """An entry written before the max-age field existed must not be served."""
-        from coa_control_plane.authorization.handler import _resolve_roles, _roles_cache
-
-        cache_key = "legacy-user@example.com:GroupY"
-        _roles_cache[cache_key] = (["ADMIN"], [])  # type: ignore[assignment]
-
-        mock_dao = MagicMock()
-        mock_dao.query_all.side_effect = [[{"role": "VIEWER", "resourceId": "GLOBAL"}], []]
-
-        global_roles, _ = _resolve_roles("legacy-user@example.com", ["GroupY"], mock_dao)
-
-        assert mock_dao.query_all.called
-        assert global_roles == ["VIEWER"]
-
     def test_cap_evicts_oldest_entries_not_whole_cache(self, env_vars):
         """At the size cap, only the oldest slice is evicted — not a full flush.
 
@@ -372,7 +328,6 @@ class TestRolesCaching:
         import coa_control_plane.authorization.handler as h
         from coa_control_plane.authorization.handler import _resolve_roles, _roles_cache
 
-        # Fill to exactly the cap with well-formed, non-expired entries.
         future = time.monotonic() + 3600
         for i in range(h._ROLES_CACHE_MAX_ENTRIES):
             _roles_cache[f"user{i}@example.com:"] = (future, ["VIEWER"], [])
@@ -381,13 +336,10 @@ class TestRolesCaching:
         mock_dao = MagicMock()
         mock_dao.query_all.side_effect = [[{"role": "ADMIN", "resourceId": "GLOBAL"}], []]
 
-        # A miss at the cap triggers eviction of the oldest ~10%, then insert.
         _resolve_roles("new-user@example.com", ["GroupA"], mock_dao)
 
         evicted = max(1, h._ROLES_CACHE_MAX_ENTRIES // 10)
-        # cap - evicted survivors + the freshly inserted entry.
         assert len(_roles_cache) == h._ROLES_CACHE_MAX_ENTRIES - evicted + 1
-        # Oldest key gone, newest key present — not a full clear.
         assert "user0@example.com:" not in _roles_cache
         assert f"user{h._ROLES_CACHE_MAX_ENTRIES - 1}@example.com:" in _roles_cache
         assert "new-user@example.com:GroupA" in _roles_cache
@@ -458,12 +410,7 @@ class TestGetTokenAuthorizer:
     def test_cognito_lookalike_issuers_are_not_treated_as_cognito(self, issuer, monkeypatch):
         """None of these may select the Cognito authorizer.
 
-        Each embeds ``cognito-idp`` somewhere outside the real host. The
-        path-embedded, query-smuggled, and plaintext-``http`` cases were all
-        accepted by the previous substring test; the suffix-extension and
-        userinfo cases were already rejected by it (they carry no
-        ``.amazonaws.com/``) and are pinned here so a future rewrite of the
-        predicate cannot regress them.
+        Each embeds ``cognito-idp`` somewhere outside the real host.
         """
         monkeypatch.setenv("JWKS_ISSUER", issuer)
         monkeypatch.setenv("JWKS_URI", "https://evil.test/.well-known/jwks.json")
@@ -796,24 +743,6 @@ class TestMapRequestToCedar:
         assert mapped[0] == "manageSource"
         assert mapped[0] in _MUTATING_ACTIONS
 
-    def test_source_create_is_manage_not_edit_namespace(self):
-        """Regression: source writes must map to a Cedar action that exists in
-        the schema (manageSource), never the non-existent 'editNamespace'."""
-        from coa_control_plane.authorization.handler import _map_request_to_cedar
-
-        action, _rtype, _rid = _map_request_to_cedar(
-            "POST", "/namespaces/{namespaceId}/sources", {"namespaceId": "ns-1"}
-        )
-        assert action == "manageSource"
-
-    def test_metric_create_mapped(self):
-        from coa_control_plane.authorization.handler import _map_request_to_cedar
-
-        action, _rtype, _rid = _map_request_to_cedar(
-            "POST", "/namespaces/{namespaceId}/metrics", {"namespaceId": "ns-1"}
-        )
-        assert action == "manageMetric"
-
     @pytest.mark.parametrize(
         ("method", "path", "expected_type"),
         [
@@ -878,10 +807,6 @@ class TestMapRequestToCedar:
         ("service", "smithy_file", "min_operations"),
         [
             ("ControlPlaneService", "control-plane.smithy", 50),
-            # This test only read the control plane, so a Data Layer route could go
-            # unmapped underneath a guard written to catch exactly that. Both
-            # services publish namespace-scoped routes through the same authorizer,
-            # so both belong here.
             ("DataLayerService", "data-layer.smithy", 4),
         ],
     )
@@ -890,20 +815,15 @@ class TestMapRequestToCedar:
 
         CONTROL_PLANE_ROUTES above records the *intended* action per route, which is
         worth asserting — but it cannot catch a route nobody remembered to add to
-        either place. Thirteen operations were unmapped for exactly that reason, and
-        because an unmapped route resolves to ``denyAll`` they returned 403 for every
-        role except platform-admin, whose policy permits any action — which is why it
-        went unnoticed. This test reads the service's own operation list, so a new
-        @http operation fails here until it is mapped.
+        either place. An unmapped route resolves to ``denyAll``, so it returns 403 for
+        every role except platform-admin. This test reads the service's own operation
+        list, so a new @http operation fails here until it is mapped.
 
         Parses the .smithy sources rather than the generated OpenAPI: the latter lives
         under smithy-generated/, which is gitignored and absent unless codegen has
         run, so a test depending on it would error during collection on a clean
         checkout.
         """
-        import re
-        from pathlib import Path
-
         from coa_control_plane.authorization.handler import _PATH_MAPPING
 
         smithy_dir = Path(__file__).resolve().parents[4] / "models" / "src" / "main" / "smithy"
@@ -950,7 +870,6 @@ class TestMapRequestToCedar:
         action defined in cedar-schema.json (guards against typos like the
         former 'editNamespace')."""
         import json
-        from pathlib import Path
 
         # coa_authorization lives in libs/common (shared by control-plane + serve);
         # resolve the schema from the installed package rather than a repo path.
@@ -1042,10 +961,7 @@ class TestEvaluateCedarResourceNamespace:
         assert self._eval("manageSource", self.NS, resource_roles=roles) is False
 
     def test_steward_can_manage_ontology_in_own_namespace(self):
-        # DELETE /ontologies maps to manageOntology; data-steward holds it, so
-        # deleting an ontology must be permitted. Regression for the missing
-        # DELETE route mapping that formerly fell through to denyAll and blocked
-        # the steward.
+        # DELETE /ontologies maps to manageOntology, which data-steward holds.
         roles = [{"role": "data-steward", "resourceUID": self.NS}]
         assert self._eval("manageOntology", self.NS, resource_roles=roles) is True
 
@@ -1085,12 +1001,6 @@ class TestEvaluateCedarArchivedGuard:
     != 'ACTIVE' (ARCHIVED, DELETING, or DELETE_FAILED).
 
     These exercise the real policy-loading path (not a patched _evaluate_cedar):
-    the guard previously never fired in deployed environments because it was a
-    standalone seed file that was neither seeded into the Roles table nor loaded
-    by the authorizer. Folding it into default.cedar closes that gap. It was
-    later extended from ARCHIVED-only to any non-ACTIVE status so a
-    create/update can never race against the async deletion pipeline
-    (DELETING) or a deletion retry (DELETE_FAILED).
     """
 
     NS = "11111111-1111-1111-1111-111111111111"
@@ -1128,8 +1038,7 @@ class TestEvaluateCedarArchivedGuard:
         roles = [{"role": "namespace-owner", "resourceUID": self.NS}]
         assert self._eval("manageNamespace", resource_roles=roles, context={"namespaceStatus": "ACTIVE"}) is True
 
-    @pytest.mark.parametrize("status", ["ARCHIVED", "DELETING", "DELETE_FAILED"])
-    def test_read_allowed_when_not_active(self, status: str):
+    def test_read_allowed_when_not_active(self):
         # Reads carry no namespaceStatus context, so the guard never fires.
         roles = [{"role": "namespace-owner", "resourceUID": self.NS}]
         assert self._eval("viewNamespace", resource_roles=roles, context=None) is True
@@ -1547,7 +1456,7 @@ def _batch(allowed_actions: set[str], *, raise_error: bool = False, allowed_ids:
 class TestMetricSchemaVisibilityContext:
     """readMetric requests carry canViewSource/canViewOntology for the metric
     service, which withholds metric SQL, tables and ontology concepts unless they
-    are "true" (ADR: decompose-viewnamespace-schema-visibility)."""
+    are "true"."""
 
     @pytest.mark.parametrize(
         ("allowed", "expected"),

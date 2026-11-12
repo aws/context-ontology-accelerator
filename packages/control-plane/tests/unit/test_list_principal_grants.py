@@ -165,7 +165,6 @@ class TestListPrincipalGrants:
     def test_deduplicates_grants(self, mock_dao_cls):
         mock_dao = MagicMock()
         mock_dao_cls.return_value = mock_dao
-        # Same grant returned for both user and group query
         grant_item = {
             "PK": f"Namespace::{VALID_NS_ID}#User::alice@co.com",
             "SK": "ROLE#analyst",
@@ -180,7 +179,6 @@ class TestListPrincipalGrants:
 
         resp = handler(_event_me("alice@co.com", "team"), None)
         body = json.loads(resp["body"])
-        # Should be deduplicated to 1 even though queried twice
         assert len(body["grants"]) == 1
 
     @patch("coa_control_plane.grants.list_principal_grants_handler.DynamoDBDAO")
@@ -196,14 +194,8 @@ class TestListPrincipalGrants:
         assert key == "User::alice@company.com"
 
     @patch("coa_control_plane.grants.list_principal_grants_handler.DynamoDBDAO")
-    def test_does_not_truncate_realistic_amazon_internal_group_counts(self, mock_dao_cls):
-        # Regression: the old _MAX_GROUPS = 10 silently dropped any group past
-        # the 10th, which is well within normal range for an enterprise SSO
-        # user (real observed tokens carry 100+
-        # groups). A caller's own platform-admin grant could vanish from this
-        # listing while still being correctly enforced by the (uncapped)
-        # authorization handler — a confusing, hard-to-diagnose split between
-        # what a user can do and what they're shown they can do.
+    def test_does_not_truncate_large_group_counts(self, mock_dao_cls):
+        # Groups beyond the old cap of 10 are still queried.
         mock_dao = MagicMock()
         mock_dao_cls.return_value = mock_dao
         mock_dao.query.return_value = PaginatedResult(items=[])
@@ -211,8 +203,7 @@ class TestListPrincipalGrants:
         many_groups = ",".join(f"group{i}" for i in range(140))
         resp = handler(_event_me("a@b.com", many_groups), None)
         assert resp["statusCode"] == 200
-        # 1 user + all 140 groups queried — nothing truncated below _MAX_GROUPS.
-        # See the ``call_args_list`` comment on ``test_queries_user_and_groups``.
+        # 1 user + all 140 groups queried, nothing truncated.
         assert len(mock_dao.query.call_args_list) == 141
 
     @patch("coa_control_plane.grants.list_principal_grants_handler.DynamoDBDAO")
@@ -224,9 +215,7 @@ class TestListPrincipalGrants:
         many_groups = ",".join(f"group{i}" for i in range(300))
         resp = handler(_event_me("a@b.com", many_groups), None)
         assert resp["statusCode"] == 200
-        # 1 user + max 250 groups = 251 queries; the circuit breaker still
-        # exists, just sized well above any observed real-world group count.
-        # See the ``call_args_list`` comment on ``test_queries_user_and_groups``.
+        # 1 user + max 250 groups = 251 queries; the circuit breaker still fires.
         assert len(mock_dao.query.call_args_list) == 251
 
     @patch("coa_control_plane.grants.list_principal_grants_handler.DynamoDBDAO")
@@ -237,8 +226,7 @@ class TestListPrincipalGrants:
 
         resp = handler(_event_me("a@b.com", "valid-group,bad::group,ok_group"), None)
         assert resp["statusCode"] == 200
-        # 1 user + 2 valid groups (bad::group skipped). See the
-        # ``call_args_list`` comment on ``test_queries_user_and_groups``.
+        # 1 user + 2 valid groups (bad::group skipped).
         assert len(mock_dao.query.call_args_list) == 3
 
     @patch("coa_control_plane.grants.list_principal_grants_handler.DynamoDBDAO")
@@ -338,12 +326,7 @@ class TestListPrincipalGrantsToGrantSummary:
 
     @patch("coa_control_plane.grants.list_principal_grants_handler.DynamoDBDAO")
     def test_declared_empty_overrides_are_returned(self, mock_dao_cls):
-        """SEMANTICS CHANGE (was: empty treated as unset and omitted).
-
-        A declared-empty override is a deny-all restriction — the principal must
-        be able to see it on their own grant rather than it reading as
-        unrestricted.
-        """
+        """A declared-empty override is a deny-all restriction and must stay visible to the principal."""
         mock_dao = MagicMock()
         mock_dao_cls.return_value = mock_dao
         item = {
@@ -372,11 +355,6 @@ class TestListPrincipalGrantsToGrantSummary:
         assert grant["columnDenylist"] == {"customers": ["ssn"]}
         assert "tableAllowlist" not in grant
         assert "allowedMetrics" not in grant
-
-
-# ---------------------------------------------------------------------------
-# Pagination (moto-backed PrincipalIndex)
-# ---------------------------------------------------------------------------
 
 
 @pytest.fixture

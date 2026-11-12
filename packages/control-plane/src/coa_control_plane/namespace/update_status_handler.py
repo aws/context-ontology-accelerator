@@ -9,28 +9,16 @@ import json
 import os
 from typing import Any
 
-import structlog
 from coa_common.constants import validate_namespace_id
 from coa_common.dao import DynamoDBDAO
 from coa_common.language_tags import effective_namespace_language
 from coa_common.response import api_response
 from coa_control_plane_server.models.namespace_status import NamespaceStatus
 
-logger = structlog.get_logger(__name__)
-
 _ns_dao: DynamoDBDAO | None = None
 
-# Valid state transitions per the LLD state machine:
-#
-#   ACTIVE ──────► ARCHIVED
-#     ▲               │
-#     └───────────────┘
-#
-# DELETING/DELETED are only reachable via the DELETE endpoint
-# (delete_handler.py + the async deletion pipeline), which performs the
-# actual resource cleanup. DELETE_FAILED→DELETING is also handled
-# exclusively by the DELETE endpoint (retry pattern) — none of these three
-# statuses are valid PATCH targets or sources here.
+# DELETING, DELETED and DELETE_FAILED are handled only by the DELETE endpoint
+# and are never valid PATCH sources or targets here.
 _VALID_TRANSITIONS: dict[str, set[str]] = {
     NamespaceStatus.ACTIVE: {NamespaceStatus.ARCHIVED},
     NamespaceStatus.ARCHIVED: {NamespaceStatus.ACTIVE},
@@ -72,21 +60,18 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     if not new_status:
         return api_response(400, {"message": "status is required"})
 
-    # Validate status value
     try:
         NamespaceStatus(new_status)
     except (ValueError, TypeError):
         valid = [s.value for s in NamespaceStatus]
         return api_response(400, {"message": f"Invalid status. Must be one of: {valid}"})
 
-    # Fetch current namespace
     item = _get_ns_dao().get({"PK": f"NS#{namespace_id}", "SK": "METADATA"})
     if not item:
         return api_response(404, {"message": "Namespace not found"})
 
     current_status = item.get("status")
 
-    # Enforce state machine transitions
     allowed = _VALID_TRANSITIONS.get(current_status, set())
     if new_status not in allowed:
         return api_response(
@@ -96,7 +81,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
 
     _get_ns_dao().update(key={"PK": f"NS#{namespace_id}", "SK": "METADATA"}, update_fields={"status": new_status})
 
-    # Return updated namespace
     updated = _get_ns_dao().get({"PK": f"NS#{namespace_id}", "SK": "METADATA"})
     ns = {
         "namespaceId": updated.get("namespaceId"),

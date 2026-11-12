@@ -31,16 +31,10 @@ _ROLE_ARN_RE = re.compile(r"^arn:aws:iam::\d{12}:role/.+$")
 def regional_s3_client(region: str) -> Any:
     """Return a SigV4 S3 client that addresses buckets by their regional hostname.
 
-    Use it for presigned URLs a browser follows. They name
-    ``<bucket>.s3.<region>.amazonaws.com``, where boto3's default names the global
-    ``<bucket>.s3.amazonaws.com``. S3 answers the global name with a 307 redirect for
-    a bucket created outside us-east-1 until its DNS propagates (up to about 24
-    hours), and a browser does not follow that redirect on a cross-origin request.
-
-    Virtual addressing is what stops botocore rewriting a presigned URL onto the
-    global name. The endpoint itself still comes from botocore's resolver, so every
-    partition keeps its own DNS suffix (``amazonaws.com.cn`` in China). In us-east-1
-    the resolver's endpoint is the global name, which serves that region directly.
+    Use it for presigned URLs a browser follows: the global name answers with a
+    307 redirect for a bucket outside us-east-1 until DNS propagates, and a
+    browser does not follow it on a cross-origin request. Virtual addressing
+    stops botocore rewriting the presigned URL onto the global name.
     """
     return boto3.client(
         "s3",
@@ -192,16 +186,9 @@ def get_object_metadata_and_tags(
 def get_bucket_tags(s3_client: Any, bucket: str) -> dict[str, str]:
     """Return *bucket*'s tag set as a plain ``{key: value}`` dict.
 
-    Unlike :func:`get_object_metadata_and_tags` above, this does **not** swallow
-    errors. That function's tags are enrichment, so losing them degrades a result;
-    these tags are an authorization input, so losing them must not read as "no
-    tags" and therefore "not authorized for anything" by accident — an
-    ``AccessDenied`` on the tag read is an operational fault, not a decision. Every
-    error except a genuinely absent tag set propagates so the caller fails closed
-    on a fault rather than silently treating it as a denial it can report.
-
-    ``NoSuchTagSet`` is the one exception: it means the bucket really carries no
-    tags, which is a legitimate answer, and an empty dict authorizes nothing.
+    These tags are an authorization input, so every error except ``NoSuchTagSet``
+    propagates: the caller must fail closed on a fault rather than read it as no
+    tags. ``NoSuchTagSet`` means the bucket genuinely has none and returns ``{}``.
     """
     try:
         resp = s3_client.get_bucket_tagging(Bucket=bucket)

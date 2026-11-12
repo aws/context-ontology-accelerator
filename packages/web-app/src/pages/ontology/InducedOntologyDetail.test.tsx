@@ -89,7 +89,6 @@ vi.mock("@components/ontology/PendingReviewBanner", () => ({
   PendingReviewBanner: () => null,
 }));
 
-// One client for every render, as the real provider's memoized context gives.
 const { apiClient } = vi.hoisted(() => ({
   apiClient: { get: vi.fn(), getText: vi.fn() },
 }));

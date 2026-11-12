@@ -156,7 +156,5 @@ class TestGetNamespaceRole:
 
     @patch.dict(os.environ, {"ALLOWED_ORIGIN": "https://test.example.com"}, clear=True)
     def test_missing_env_vars_returns_500(self):
-        os.environ.pop("AWS_REGION", None)
-        os.environ.pop("ROLES_TABLE", None)
         resp = handler(_event(role_id="analyst"), None)
         assert resp["statusCode"] == 500

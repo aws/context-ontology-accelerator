@@ -77,7 +77,7 @@ class TestAiContextGlossary:
         builder = TBoxContextBuilder(AsyncMock(), graph_uri_template="https://t/{namespace}", metric_resolver=resolver)
         # Hit carries only a sparse name; resolver supplies the full definition.
         hit = VectorHit(type="metric", score=0.95, entity_id="m-rev", uri="", metadata={"name": "total_revenue"})
-        metrics = builder._build_metric_context([hit])
+        metrics = builder._build_metric_context([hit], "finance")
         assert len(metrics) == 1
         assert metrics[0].description == "Sum of net revenue"
         assert metrics[0].dimensions == ["region", "quarter"]
@@ -88,7 +88,7 @@ class TestAiContextGlossary:
         hit = VectorHit(
             type="metric", score=0.9, entity_id="x", uri="", metadata={"name": "m", "description": "from-meta"}
         )
-        metrics = builder._build_metric_context([hit])
+        metrics = builder._build_metric_context([hit], "ns")
         assert metrics[0].description == "from-meta"
 
     def test_glossary_rendered_in_prompt(self):

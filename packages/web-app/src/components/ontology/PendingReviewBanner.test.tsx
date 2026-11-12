@@ -8,7 +8,6 @@ import { beforeEach, describe, it, expect, vi } from "vitest";
 import { listAllProposals } from "../../services/ontology-engine";
 import { PendingReviewBanner } from "./PendingReviewBanner";
 
-// One client for every render, as the real provider's memoized context gives.
 const { apiClient } = vi.hoisted(() => ({ apiClient: {} }));
 
 vi.mock("@components/ApiClientProvider", () => ({

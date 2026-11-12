@@ -57,12 +57,6 @@ _OPENAPI = (
 # applied by the Context Manager; the model's member docs say so, rather than this
 # list hiding them.
 _CHECKED_OPERATIONS = ("Query", "TranslateSPARQL", "KBSearch", "GraphTraverse", "DescribeSchema")
-_SKIPPED_OPERATIONS: set[str] = set()
-
-# Known gaps: (operationId, member) -> why it is acceptable for now. Keep empty
-# unless a gap is deliberate and tracked; every entry is a member the contract
-# promises the handler and the handler never reads.
-_KNOWN_GAPS: dict[tuple[str, str], str] = {}
 
 # The variable names the handlers bind the parsed request body / query string to.
 _BODY_NAMES = {"body"}
@@ -202,8 +196,7 @@ def test_every_declared_input_member_is_read(operation):
     read_body, read_query = _reads(_handler_for(method, path))
 
     missing = sorted(
-        [f"body.{m}" for m in declared_body - read_body if (operation, m) not in _KNOWN_GAPS]
-        + [f"query.{m}" for m in declared_query - read_query if (operation, m) not in _KNOWN_GAPS]
+        [f"body.{m}" for m in declared_body - read_body] + [f"query.{m}" for m in declared_query - read_query]
     )
     assert not missing, (
         f"{operation}: members declared in the Smithy model but never read by "
@@ -211,20 +204,10 @@ def test_every_declared_input_member_is_read(operation):
     )
 
 
-def test_every_operation_is_checked_or_explicitly_skipped():
+def test_every_operation_is_checked():
     """A new DataLayerService operation must be added to the check, not missed by it."""
-    unaccounted = set(_operations(_spec())) - set(_CHECKED_OPERATIONS) - _SKIPPED_OPERATIONS
+    unaccounted = set(_operations(_spec())) - set(_CHECKED_OPERATIONS)
     assert not unaccounted, f"add these operations to _CHECKED_OPERATIONS: {sorted(unaccounted)}"
-
-
-def test_known_gaps_are_still_gaps():
-    """An allowlist entry that has been fixed must be removed, so the list stays honest."""
-    spec = _spec()
-    ops = _operations(spec)
-    for operation, member in _KNOWN_GAPS:
-        method, path, _ = ops[operation]
-        read_body, read_query = _reads(_handler_for(method, path))
-        assert member not in read_body | read_query, f"{operation}.{member} is now read — drop it from _KNOWN_GAPS"
 
 
 def test_scanner_detects_reads_and_follows_helpers():

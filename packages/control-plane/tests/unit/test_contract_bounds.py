@@ -49,9 +49,6 @@ _NS_ID = "550e8400-e29b-41d4-a716-446655440000"
 _SENTINEL = "zz-rejected-value-zz"
 
 
-# ── Minimal Smithy reader ────────────────────────────────────────────────────
-
-
 def _model(name: str) -> str:
     path = _SMITHY_DIR / f"{name}.smithy"
     assert path.is_file(), f"{path} not found"
@@ -116,9 +113,6 @@ def _op_input(text: str, operation: str) -> str:
     return _block(_block(text, rf"operation\s+{operation}\b"), r"input\s*:=")
 
 
-# ── Parity ───────────────────────────────────────────────────────────────────
-
-
 class TestGrantContractParity:
     def test_create_grant_request_bounds(self) -> None:
         text = _model("grant")
@@ -181,9 +175,6 @@ class TestGrantContractParity:
     def test_role_listing_bound_is_documented(self) -> None:
         traits = _shape_traits(_model("role"), "list", "RoleSummaryList")
         assert _bound(traits, "length")[1] == 100
-
-
-# ── Enforcement ──────────────────────────────────────────────────────────────
 
 
 def _create_event(body: Any, *, namespace_id: str | None = _NS_ID) -> dict[str, Any]:

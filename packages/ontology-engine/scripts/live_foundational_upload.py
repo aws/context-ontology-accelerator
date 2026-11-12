@@ -172,6 +172,7 @@ def main() -> int:
         ontology_id=ontology_id,
         ontology_type="foundational",
         source="upload",
+        platform_foundational=True,
         domain_tags=["foundational"],
         file_path=str(turtle_path),
     )

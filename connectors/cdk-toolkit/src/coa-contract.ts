@@ -25,8 +25,7 @@ export const CONNECTOR_SPILL_KEY_GLOB = "connectors/*/spills/*";
  * because it usually runs in another account and SSM parameters are not readable across accounts.
  *
  * Both paths carry the COA environment name, so a second COA environment in the same account and prefix
- * cannot overwrite these values. A script still reading the older `/{prefix}/serve/runtime-role-arn`
- * finds nothing.
+ * cannot overwrite these values.
  */
 export const COA_ROLE_SSM_PARAMS = {
   /** Runs queries. `/{prefix}/{envName}/serve/runtime-role-arn`. */

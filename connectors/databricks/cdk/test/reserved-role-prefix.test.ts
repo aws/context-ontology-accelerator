@@ -1,11 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// The reserved datasource-access role prefix. The managed stack hands out `sts:AssumeRole` on
-// `arn:aws:iam::*:role/{resourcePrefix}datasource-access-*` with no account restriction, so the prefix
-// must stay reserved for customer-owned roles: a COA-internal role named under it would be assumable
-// by the connector. `infra`'s aspect never sees this app, which keeps its own CDK app, so the managed
-// stack attaches its own copy.
+// The reserved datasource-access role prefix; see lib/reserved-role-prefix.ts.
 import * as iam from "aws-cdk-lib/aws-iam";
 import { Template } from "aws-cdk-lib/assertions";
 import { RESERVED_DATASOURCE_ROLE_SEGMENT } from "../lib/reserved-role-prefix";

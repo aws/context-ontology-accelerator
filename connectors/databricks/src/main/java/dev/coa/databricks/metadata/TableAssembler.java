@@ -14,8 +14,7 @@ import java.util.List;
  * becomes a comment tag. Pure and static, so every rule here is assertable without a warehouse.
  *
  * <p>The toolkit does the encoding. Declared keys and nullability reach COA inside column comments,
- * since the
- * federation protocol has no field for either, and getting that wrong fails silently in two places: a
+ * since the federation protocol has no field for either, and getting that wrong fails silently in two places: a
  * mis-spelled tag is stored as literal prose, and Athena reads comments from the Arrow <b>schema's</b>
  * metadata map rather than a field's, so a comment on a field is delivered and ignored. This class
  * expresses intent through {@link CoaColumn#primaryKey()} and
@@ -73,10 +72,8 @@ public final class TableAssembler
                 definition.name(),
                 DatabricksTypes.toArrowType(definition.fullDataType()));
 
-        // Both steps. strip() mirrors COA's parser, which leaves a malformed @fk( in place as feedback
-        // to whoever wrote it. The toolkit's encoder refuses ANY @fk( in prose, closed or not, and
-        // refuses by throwing, so forwarding strip()'s output directly lets one bad customer comment
-        // fail this table's DESCRIBE permanently and take the schema's scan with it.
+        // strip() leaves a malformed @fk( in place, but the toolkit's encoder throws on ANY @fk( in prose,
+        // so forwarding strip()'s output directly lets one bad comment fail this table's DESCRIBE.
         String stripped = CommentTags.strip(definition.comment());
         String prose = CommentTags.neutralise(stripped);
         if (!prose.equals(stripped)) {

@@ -2,17 +2,11 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Replace JARs bundled in the Ontop CLI with the pinned, patched versions listed
-# in a manifest (see ontop-lib-overrides.txt for the rationale).
+# Replace JARs bundled in the Ontop CLI with the pinned versions in a manifest
+# (see ontop-lib-overrides.txt for the rationale).
 #
 # usage: ontop-lib-overrides.sh <manifest> <ontop-lib-dir>
 #   MAVEN_BASE  repository root to download from (default: Maven Central)
-#
-# For each manifest entry the pinned JAR is downloaded and its sha256 verified
-# before it replaces every existing <artifactId>-<version>.jar; a mismatch fails
-# the build and leaves lib/ without the unverified file. The script also refuses
-# to replace a bundled JAR that is newer than the pin. JARs that the patched set
-# makes obsolete are listed in REMOVE.
 set -eu
 
 MANIFEST="$1"

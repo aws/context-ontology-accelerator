@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import time
 import unicodedata
@@ -133,13 +134,16 @@ _LEXICAL_INDEX_MAX_TOTAL_UTF8_BYTES = 4 * 1024 * 1024
 _LEXICAL_INDEX_MAX_ID_UTF8_BYTES = 2_048
 _LEXICAL_INDEX_MAX_DEFINITION_UTF8_BYTES = 512
 
+# Just under the 0.85 ``exact`` threshold in ``classify_score_tier``.
+_TIED_RERANK_SCORE_CAP = 0.84
+
 _RERANK_SYSTEM = (
     "You are an ontology grounding expert. Given a source database table "
     "(with its columns and description) and a list of candidate ontology "
     "classes (each with its formal definition), decide which candidate "
     "the table should be grounded to.\n\n"
     "Output EXACTLY one JSON object with these fields:\n"
-    '  {"choice": "<localName or NONE>", '
+    '  {"choice": "<the candidate\'s IRI, exactly as shown in <...>, or NONE>", '
     '"relationship": "<exactMatch|closeMatch|broadMatch|'
     'narrowMatch|relatedMatch|none>", '
     '"confidence": <0.0-1.0>, "reason": "<one sentence>"}\n\n'
@@ -150,7 +154,7 @@ _RERANK_SYSTEM = (
     "- When multiple candidates share the same name (e.g. from different "
     "ontologies), pick the one whose definition best matches the table's "
     "domain. If one has a definition and the other doesn't, prefer the "
-    "one with a definition.\n"
+    "one with a definition. Answer with its IRI so the pick is unambiguous.\n"
     "- Pick NONE only if no candidate genuinely represents the same or "
     "closely related concept — i.e., the table is a truly novel domain "
     "concept not covered by any candidate.\n"
@@ -174,7 +178,7 @@ _RERANK_SYSTEM_CLASS = (
     "classes (each with its formal definition), decide which candidate "
     "the source class should be grounded to.\n\n"
     "Output EXACTLY one JSON object with these fields:\n"
-    '  {"choice": "<localName or NONE>", '
+    '  {"choice": "<the candidate\'s IRI, exactly as shown in <...>, or NONE>", '
     '"relationship": "<exactMatch|closeMatch|broadMatch|'
     'narrowMatch|relatedMatch|none>", '
     '"confidence": <0.0-1.0>, "reason": "<one sentence>"}\n\n'
@@ -185,7 +189,7 @@ _RERANK_SYSTEM_CLASS = (
     "- When multiple candidates share the same name (e.g. from different "
     "ontologies), pick the one whose definition best matches the source "
     "class's domain. If one has a definition and the other doesn't, prefer "
-    "the one with a definition.\n"
+    "the one with a definition. Answer with its IRI so the pick is unambiguous.\n"
     "- Pick NONE only if no candidate genuinely represents the same or "
     "closely related concept — i.e., the source class is a truly novel domain "
     "concept not covered by any candidate.\n"
@@ -348,6 +352,87 @@ def _local_name(uri: str) -> str:
     """Extract and strictly percent-decode the local name from an IRI."""
     local_name = uri.rsplit("#", 1)[1] if "#" in uri else uri.rsplit("/", 1)[-1]
     return strict_percent_decode(local_name)
+
+
+def _ownership_key(iri: str, ontology_id: str | None) -> tuple[bool, int, str]:
+    """Sort key, best first: the ontology whose namespace holds the IRI, then the longest id, then the smallest."""
+    oid = ontology_id or ""
+    prefixes = (oid,) if oid.endswith(("/", "#")) else (f"{oid}#", f"{oid}/")
+    return (not (oid and iri.startswith(prefixes)), -len(oid), oid)
+
+
+def _owning_copy(copies: list[GroundingCandidate]) -> GroundingCandidate:
+    """Pick one of several recalled copies of the same IRI, independent of recall order."""
+    return min(copies, key=lambda c: _ownership_key(c.entity_uri, c.ontology_id))
+
+
+def _merge_same_iri(rows: list[dict]) -> dict:
+    """Merge recall rows of one IRI: the best score (earliest on a tie), credited to the owning ontology."""
+    best = max(rows, key=lambda r: r.get("score") or 0.0)
+    owner = min(rows, key=lambda r: _ownership_key(r.get("entity_uri", ""), r.get("ontology_id")))
+    return best if owner is best else {**best, "ontology_id": owner.get("ontology_id")}
+
+
+def _single_concept(matches: list[GroundingCandidate]) -> GroundingCandidate | None:
+    """Return the owning copy when every match is the same IRI, else ``None``."""
+    return _owning_copy(matches) if matches and len({m.entity_uri for m in matches}) == 1 else None
+
+
+def _match_name(name: str, candidates: list[GroundingCandidate]) -> list[GroundingCandidate]:
+    """Candidates whose label or local name is ``name``: exact spelling, else normalized."""
+    exact = [c for c in candidates if name in (c.label, _local_name(c.entity_uri))]
+    norm_name = _normalize(name)
+    if exact or not norm_name:
+        return exact
+    return [
+        c for c in candidates if _normalize(c.label) == norm_name or _normalize(_local_name(c.entity_uri)) == norm_name
+    ]
+
+
+def _namespace_key(iri: str) -> str:
+    """An IRI up to its last ``#`` or ``/``, without its scheme and lower-cased, for tolerant comparison."""
+    cut = max(iri.rfind("#"), iri.rfind("/"))
+    return iri[: cut + 1].lower().removeprefix("https://").removeprefix("http://")
+
+
+def _same_vocabulary(iri: str, candidates: list[GroundingCandidate]) -> tuple[str | None, list[GroundingCandidate]]:
+    """For an absolute IRI answer, its local name and the candidates in its namespace (ignoring scheme and case)."""
+    if "://" not in iri:
+        return None, []
+    key = _namespace_key(iri)
+    return _local_name(iri) or None, [c for c in candidates if _namespace_key(c.entity_uri) == key]
+
+
+def _resolve_rerank_choice(
+    choice: object, candidates: list[GroundingCandidate]
+) -> tuple[GroundingCandidate | None, list[GroundingCandidate]]:
+    """Map the reranker's ``choice`` to ``(candidate, [])``, ``(None, tied)`` or ``(None, [])``.
+
+    Tried in order: the candidate IRI; the label or local name; and, for a
+    miscopied IRI, its local name within the same namespace only.
+    """
+    if not isinstance(choice, str):
+        return None, []
+    iri = choice.strip().removeprefix("<").removesuffix(">")
+    by_iri = [c for c in candidates if c.entity_uri == iri]
+    if by_iri:
+        return _owning_copy(by_iri), []
+    matches = _match_name(choice, candidates)
+    if not matches:
+        local, same_vocabulary = _same_vocabulary(iri, candidates)
+        matches = _match_name(local, same_vocabulary) if local else []
+    single = _single_concept(matches)
+    return (single, []) if single else (None, matches)
+
+
+def _rerank_confidence(rerank_result: dict) -> float:
+    """The reranker's confidence, or 0.5 when it is missing, not a number or not finite."""
+    try:
+        confidence = float(rerank_result.get("confidence", 0.5))
+    except (TypeError, ValueError):
+        return 0.5
+    # JSON's -1e999 parses to -inf; matches.json must stay parseable by a browser.
+    return confidence if math.isfinite(confidence) else 0.5
 
 
 def _recall_spread(candidates: list[GroundingCandidate]) -> float | None:
@@ -732,50 +817,36 @@ class GroundingService:
                 mode="ENHANCED",
             )
 
-        # Resolve the model's returned local name without letting a lossy
-        # comparison key choose the wrong candidate. Prefer the exact label/local
-        # spelling; use normalization only when it identifies one candidate.
         choice_name = rerank_result["choice"]
-        exact_choices = [
-            candidate
-            for candidate in raw_candidates
-            if choice_name in (candidate.label, _local_name(candidate.entity_uri))
-        ]
-        normalized_choices: list[GroundingCandidate] = []
-        if len(exact_choices) == 1:
-            chosen = exact_choices[0]
-        elif exact_choices:
-            # The reranker returns only a local name, so duplicate exact names
-            # from different ontologies are not distinguishable. Never let
-            # recall ordering silently choose one ontology's concept.
-            chosen = None
-        else:
-            norm_choice = _normalize(choice_name)
-            normalized_choices = (
-                [
-                    candidate
-                    for candidate in raw_candidates
-                    if _normalize(candidate.label) == norm_choice
-                    or _normalize(_local_name(candidate.entity_uri)) == norm_choice
-                ]
-                if norm_choice
-                else []
-            )
-            chosen = normalized_choices[0] if len(normalized_choices) == 1 else None
-        if not chosen:
-            # Preserve the established missing-choice diagnostic while failing
-            # closed with a distinct message when the name is ambiguous.
-            ambiguous = bool(exact_choices or normalized_choices)
-            conflicting_candidates = sorted(
-                {candidate.entity_uri for candidate in (exact_choices or normalized_choices)}
-            )
+        chosen, tied = _resolve_rerank_choice(choice_name, raw_candidates)
+        llm_confidence = _rerank_confidence(rerank_result)
+        relationship = rerank_result.get("relationship", "relatedMatch")
+        if tied:
+            # Left to a steward; tied candidates go first so they are among the persisted ones.
+            conflicting_candidates = sorted({candidate.entity_uri for candidate in tied})
             displayed_candidates = [uri if len(uri) <= 160 else f"{uri[:157]}..." for uri in conflicting_candidates[:5]]
-            candidate_context = f"; conflicting candidate URIs: {displayed_candidates}" if ambiguous else ""
             reason = (
-                f"LLM choice '{choice_name}' did not uniquely identify a candidate{candidate_context}"
-                if ambiguous
-                else f"LLM choice '{choice_name}' not in candidates"
+                f"LLM choice '{choice_name}' did not uniquely identify a candidate; "
+                f"conflicting candidate URIs: {displayed_candidates}"
             )
+            log.warning("%s for table '%s'", reason, table_name)
+            # The reranker judged the shared name, so a steward's pick is graded by it, below exact.
+            for candidate in tied:
+                candidate.rerank_score = min(llm_confidence, _TIED_RERANK_SCORE_CAP)
+            tied_ids = {id(candidate) for candidate in tied}
+            return GroundingResult(
+                source_table=table_name,
+                source_column="",
+                candidates=tied + [candidate for candidate in raw_candidates if id(candidate) not in tied_ids],
+                chosen=None,
+                match_type="ambiguous",
+                relationship=None,
+                confidence=None,
+                reason=reason,
+                mode="ENHANCED",
+            )
+        if not chosen:
+            reason = f"LLM choice '{choice_name}' not in candidates"
             log.warning("%s for table '%s'", reason, table_name)
             return GroundingResult(
                 source_table=table_name,
@@ -789,11 +860,6 @@ class GroundingService:
                 mode="ENHANCED",
             )
 
-        try:
-            llm_confidence = float(rerank_result.get("confidence", 0.5))
-        except (TypeError, ValueError):
-            llm_confidence = 0.5
-        relationship = rerank_result.get("relationship", "relatedMatch")
         match_type = classify_score_tier(
             llm_confidence,
             has_rerank=True,
@@ -905,21 +971,16 @@ class GroundingService:
             nb = math.sqrt(sum(b[i] ** 2 for i in range(n)))
             return dot / (na * nb) if na and nb else 0.0
 
-        # Deduplicate: first by normalized URI, then by (local_name, ontology_id)
+        # Deduplicate: first by normalized URI, then by (namespace, local_name, ontology_id)
         # to collapse duplicates from http/https variants or multiple embedding runs.
-        seen_uri: dict[str, dict] = {}
+        rows_by_uri: dict[str, list[dict]] = {}
         for r in all_results:
             uri = r.get("entity_uri", "").rstrip("/")
-            score = r.get("score") or 0.0
-            if not uri:
-                continue
-            if uri in seen_uri:
-                if score > (seen_uri[uri].get("score") or 0):
-                    seen_uri[uri] = r
-            else:
-                seen_uri[uri] = r
-        # Secondary dedup: same local name + same ontology → keep highest score
-        seen_name: dict[tuple[str, str], dict] = {}
+            if uri:
+                rows_by_uri.setdefault(uri, []).append(r)
+        seen_uri = {uri: _merge_same_iri(rows) for uri, rows in rows_by_uri.items()}
+        # Secondary dedup: same namespace + local name + ontology → keep highest score
+        seen_name: dict[tuple[str, str, str], dict] = {}
         for r in seen_uri.values():
             uri = r.get("entity_uri", "")
             local = _local_name(uri)
@@ -933,7 +994,9 @@ class GroundingService:
                 "NFC",
                 simple_case_identity(width_only_nfkc(local)),
             )
-            key = (candidate_identity or uri, oid)
+            # The namespace keeps distinct IRIs credited to one ontology apart
+            # (``onto#Person`` and ``onto/nested/Person``).
+            key = (_namespace_key(uri), candidate_identity or uri, oid)
             existing = seen_name.get(key)
             if existing is None or (r.get("score") or 0) > (existing.get("score") or 0):
                 seen_name[key] = r
@@ -1215,8 +1278,9 @@ class GroundingService:
         cand_lines = []
         for c in window:
             defn = c.definition or "(no definition available)"
-            source = _local_name(c.ontology_id) if c.ontology_id else "unknown"
-            cand_lines.append(f"  - {c.label} [from {source}]: {defn[:200]}")
+            # A namespace-style id ("https://schema.org/") has an empty local name.
+            source = (_local_name(c.ontology_id) or c.ontology_id) if c.ontology_id else "unknown"
+            cand_lines.append(f"  - {c.label} <{c.entity_uri}> [from {source}]: {defn[:200]}")
 
         header = f"SOURCE {'CLASS' if is_class else 'TABLE'}: {table_name}\n"
         columns_block = "" if is_class else ("Columns:\n" + "\n".join(col_lines) + "\n")

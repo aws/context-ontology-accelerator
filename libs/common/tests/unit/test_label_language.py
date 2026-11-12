@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for namespace-language label selection (LLD §2.2.5)."""
+"""Unit tests for namespace-language label selection."""
 
 from __future__ import annotations
 

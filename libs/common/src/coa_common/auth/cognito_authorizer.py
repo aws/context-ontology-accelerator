@@ -32,13 +32,7 @@ class CognitoTokenAuthorizer(TokenAuthorizer):
         region: str,
         client_id: str | None = None,
     ) -> None:
-        """Derive the Cognito issuer and JWKS URI from the pool coordinates.
-
-        Args:
-            user_pool_id: The Cognito User Pool ID (e.g. ``us-east-1_ABC123``).
-            region: AWS region where the user pool is deployed.
-            client_id: Optional app client ID for audience validation.
-        """
+        """Derive the Cognito issuer and JWKS URI from the pool coordinates."""
         issuer = f"https://cognito-idp.{region}.amazonaws.com/{user_pool_id}"
         jwks_uri = f"{issuer}/.well-known/jwks.json"
         super().__init__(issuer=issuer, audience=client_id, jwks_uri=jwks_uri)

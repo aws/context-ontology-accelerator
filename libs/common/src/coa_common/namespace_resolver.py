@@ -28,21 +28,8 @@ _RESOLVE_CACHE: dict[str, str] = {}
 def resolve_namespace_id(namespace: str, table) -> str:
     """Resolve a namespace name or UUID to the canonical UUID.
 
-    Args:
-        namespace: Either a namespace name (e.g. "bird-benchmark") or UUID.
-        table: A boto3 DynamoDB Table resource for the namespaces table.
-
-    Returns:
-        The namespace UUID (always lowercase, hyphenated).
-
     Raises:
         ValueError: If the namespace cannot be resolved.
-
-    Resolution logic:
-        1. If it looks like a UUID, verify ``NS#{uuid}`` exists → return as-is.
-        2. Otherwise treat as name → look up ``NS_NAME#{name}`` reservation →
-           extract ``namespaceId`` → return UUID.
-        3. Cache results in-process (namespace topology rarely changes).
     """
     if namespace in _RESOLVE_CACHE:
         return _RESOLVE_CACHE[namespace]

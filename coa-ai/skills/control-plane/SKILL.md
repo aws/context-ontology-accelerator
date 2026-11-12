@@ -45,7 +45,7 @@ COA has two public app clients. Use the one that matches the call:
 
 Every REST endpoint, including the serve runtime's `POST /namespaces/{ns}/query`, takes `web` tokens only and rejects `mcp` tokens with 403 "explicit deny". Use `mcp` tokens with the MCP server, or when invoking the serve AgentCore runtime directly. The `web` redirect is registered only on `dev` deployments. On other environments, add it to the web client first.
 
-Run these from the repository root. The script is at `coa-skills/control-plane/scripts/coa_login.py`.
+Run these from the repository root. The script is at `coa-ai/skills/control-plane/scripts/coa_login.py`.
 
 1. Set three values. `COA_DOMAIN` is the OAuth base URL that serves `/oauth2/authorize` and `/oauth2/token`: the Cognito hosted-UI domain by default, or a custom domain in front of it. On a Cognito deployment, read all three from SSM (`<prefix>` is the deployment's `resource_prefix`):
    ```bash
@@ -56,13 +56,13 @@ Run these from the repository root. The script is at `coa-skills/control-plane/s
    ```
 2. Sign in once. The browser must run on the same machine as the script:
    ```bash
-   python3 coa-skills/control-plane/scripts/coa_login.py login --client web
-   python3 coa-skills/control-plane/scripts/coa_login.py status --client web   # expiry only, never tokens
+   python3 coa-ai/skills/control-plane/scripts/coa_login.py login --client web
+   python3 coa-ai/skills/control-plane/scripts/coa_login.py status --client web   # expiry only, never tokens
    ```
    Tokens are cached in `~/.coa/tokens-web.json` and `~/.coa/tokens.json` (mode 600). Pass `--file` to put either somewhere else. `COA_TOKEN_FILE` changes the `mcp` cache only.
 3. Call the API with a fresh ID token. The helper refreshes it on its own, and tells you to sign in again when the refresh token has expired:
    ```bash
-   TOKEN=$(python3 coa-skills/control-plane/scripts/coa_login.py token --client web)
+   TOKEN=$(python3 coa-ai/skills/control-plane/scripts/coa_login.py token --client web)
    curl -s -H "Authorization: Bearer $TOKEN" "$API/namespaces/$NS/sources" | jq '.items[]'
    ```
    In Python, with the scripts folder on `sys.path`: `from coa_login import get_token; get_token("id", client="web")`.

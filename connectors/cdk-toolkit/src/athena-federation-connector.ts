@@ -100,7 +100,6 @@ export const RESERVED_ENVIRONMENT_KEYS = [
   "disable_spill_encryption",
 ] as const;
 
-/** Properties for {@link AthenaFederationConnector}. */
 /**
  * Where a VPC-attached connector runs. Grouped so a VPC cannot be given without its subnets.
  */
@@ -161,10 +160,8 @@ export interface AthenaFederationConnectorProps {
    * Instruction-set architecture. Defaults to `arm64`, which every Lambda COA's own `infra` deploys
    * uses and which is cheaper per GB-second at the same memory.
    *
-   * Safe for a pure-Java connector, and this one is: the fat jar's only native code is the Databricks
-   * driver's bundled lz4, which ships `linux/aarch64` alongside `linux/amd64`. Set `X86_64` if you add
-   * a dependency carrying an amd64-only native — the failure is an `UnsatisfiedLinkError` at the first
-   * invocation that reaches it, not at deploy.
+   * Safe for a pure-Java jar. Set `X86_64` if a dependency carries an amd64-only native library; the
+   * failure is an `UnsatisfiedLinkError` at the first invocation that reaches it, not at deploy.
    */
   readonly architecture?: lambda.Architecture;
 
@@ -292,7 +289,6 @@ export class AthenaFederationConnector extends Construct {
         encryptionKey: this.spillKey,
         // Without this a CMK turns every spilled block into billable KMS traffic.
         bucketKeyEnabled: true,
-        versioned: false,
         lifecycleRules: [
           { id: "expire-spill", expiration: cdk.Duration.days(1), enabled: true },
         ],
@@ -425,10 +421,6 @@ export class AthenaFederationConnector extends Construct {
     });
   }
 
-  /**
-   * Renames the role this construct's Lambda L2 created. The L2 only accepts a whole role through
-   * `role`, and a role passed that way gets none of the managed policies the L2 attaches to its own.
-   */
   private httpsOnlySecurityGroup(vpc: ec2.IVpc): ec2.SecurityGroup {
     const group = new ec2.SecurityGroup(this, "SecurityGroup", {
       vpc,
@@ -443,6 +435,10 @@ export class AthenaFederationConnector extends Construct {
     return group;
   }
 
+  /**
+   * Renames the role this construct's Lambda L2 created. The L2 only accepts a whole role through
+   * `role`, and a role passed that way gets none of the managed policies the L2 attaches to its own.
+   */
   private pinRoleName(roleName: string, functionName: string): void {
     const cfnRole = this.connectorFunction.role?.node.defaultChild;
     if (!(cfnRole instanceof iam.CfnRole)) {
@@ -592,8 +588,6 @@ export class AthenaFederationConnector extends Construct {
       const spillBucket = this.spillBucket;
       const spillKey = this.spillKey;
       if (spillBucket === undefined || spillKey === undefined) {
-        // Nothing to read: with no bucket, a response that would have spilled never becomes an
-        // object anyone could fetch.
         return;
       }
 

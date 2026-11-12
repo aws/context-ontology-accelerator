@@ -28,7 +28,7 @@ final class MultiplexedProvider implements ConnectionConfigProvider
 
     final List<String> asked = new ArrayList<>();
 
-    /** A stage-1-shaped endpoint: no source record, so no role to assume and no namespace. */
+    /** An environment-mode endpoint: no source record, so no role to assume and no namespace. */
     MultiplexedProvider add(String athenaCatalog, String ucCatalog, String schema)
     {
         byCatalog.put(athenaCatalog, base(ucCatalog, schema).build());
@@ -54,10 +54,9 @@ final class MultiplexedProvider implements ConnectionConfigProvider
      * A COA-managed source on a named workspace, so a fixture can put two sources on <b>one</b>
      * workspace and a third on another.
      *
-     * <p>That shape is exit requirement 5's, and it is the interesting one: two sources sharing a
-     * workspace differ only in their schema, namespace, role and secret, so a cache keyed on the
-     * warehouse — or on anything else they share — collapses two tenants onto one credential while every
-     * two-workspace test still passes.
+     * <p>Two sources sharing a workspace differ only in their schema, namespace, role and secret, so a
+     * cache keyed on the warehouse — or on anything else they share — collapses two tenants onto one
+     * credential while every two-workspace test still passes.
      */
     MultiplexedProvider addManaged(String athenaCatalog, String ucCatalog, String schema,
                                    String workspaceHostname)
@@ -95,9 +94,8 @@ final class MultiplexedProvider implements ConnectionConfigProvider
     {
         asked.add(athenaCatalogName);
         if (athenaCatalogName == null) {
-            // Nothing in the connector passes null any more; both cold-start sites that used to now ask
-            // describe() instead. Refused rather than answered, because a multiplexed provider answering
-            // it has to pick one tenant's endpoint, and the real parameter-backed provider refuses too.
+            // Refused rather than answered: a multiplexed provider would have to pick one tenant's
+            // endpoint, and the real parameter-backed provider refuses too.
             throw new IllegalStateException(
                     "asked to resolve configuration before Athena named a catalog");
         }

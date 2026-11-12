@@ -56,9 +56,9 @@ public final class CoaColumn
     }
 
     /**
-     * A copy of the declaration state. {@link ColumnComment.Reference} is immutable and an Arrow
-     * {@link Field} is treated as such, so only what a caller can still change is duplicated. Lets
-     * {@link CoaTable} snapshot what it is handed, which is what makes its immutability real.
+     * A copy of the declaration state, so {@link CoaTable} can snapshot what it is handed. Only what a
+     * caller can still change is duplicated: {@link ColumnComment.Reference} and the Arrow type are
+     * immutable.
      */
     CoaColumn copy()
     {

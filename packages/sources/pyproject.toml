@@ -12,7 +12,16 @@ dependencies = [
     # 2026.10.19 is the first certifi bundle without the roots behind the compromised
     # emSign intermediates. botocore also uses certifi's bundle over its own when installed.
     "certifi>=2026.10.19",
+    "botocore>=1.35.0",
+    "pydantic>=2.13.4",
+    "structlog>=25.5.0",
 ]
+
+# deptry (ci/deptry.yml). Imported inside the code for one image or Lambda bundle, and installed
+# there from that code's requirements.txt (database drivers, the preprocessing and kg-build stacks).
+[tool.deptry.per_rule_ignores]
+DEP001 = ["graphrag_toolkit", "llama_index", "opensearchpy", "oracledb", "pg8000", "pymysql", "pypdfium2", "pytds", "snowflake", "unstructured"]
+DEP003 = ["graphrag_toolkit", "llama_index", "opensearchpy", "oracledb", "pg8000", "pymysql", "pypdfium2", "pytds", "snowflake", "unstructured"]
 
 [build-system]
 requires = ["hatchling"]

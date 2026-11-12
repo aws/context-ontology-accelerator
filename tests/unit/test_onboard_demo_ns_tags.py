@@ -94,11 +94,43 @@ def test_output_is_canonical_for_untidy_input() -> None:
     assert "  " not in merged
 
 
-def test_caps_at_six_namespaces_to_fit_the_tag_value_limit() -> None:
-    """An AWS tag value caps at 256 chars; a uuid plus separator is 37."""
-    existing = " ".join(f"{i}1111111-1111-4111-8111-111111111111" for i in range(1, 7))
-    merged = _merge(existing)
-    ids = merged.split(" ")
-    assert len(ids) == 6
-    assert ids[-1] == _NS, "the namespace being onboarded must always be present"
+def _ids(n: int) -> list[str]:
+    return [f"{i}1111111-1111-4111-8111-11111111111{i}" for i in range(2, 2 + n)]
+
+
+def test_sixth_namespace_still_fits_the_tag_value_limit() -> None:
+    """An AWS tag value caps at 256 chars; a uuid plus separator is 37, so six fit."""
+    existing = _ids(5)
+    merged = _merge(" ".join(existing))
+    assert merged.split(" ") == [*existing, _NS]
+    assert len(merged) <= 256
+
+
+def test_rerun_with_six_bound_is_idempotent() -> None:
+    """A namespace already among the six is not a seventh."""
+    existing = " ".join([*_ids(5), _NS])
+    assert _merge(existing) == existing
+
+
+def test_seventh_namespace_is_a_hard_error_not_a_silent_eviction() -> None:
+    """Dropping the oldest id would unbind that namespace, so refuse instead."""
+    existing = _ids(6)
+    script = f'NS="{_NS}"\n{_merge_fn()}\nmerge_ns_value "$1"\n'
+    proc = subprocess.run(
+        ["bash", "-c", script, "bash", " ".join(existing)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode != 0
+    assert proc.stdout.strip() == "", "no tag value may be emitted on overflow"
+    assert "ERROR" in proc.stderr
+    assert existing[0] in proc.stderr, "the error names the id that would have been unbound"
+
+
+def test_all_wildcard_does_not_count_toward_the_six_cap() -> None:
+    """``ALL`` is dropped before counting, so ``ALL`` plus five ids still fits a sixth."""
+    existing = _ids(5)
+    merged = _merge(" ".join(["ALL", *existing]))
+    assert merged.split(" ") == [*existing, _NS]
     assert len(merged) <= 256

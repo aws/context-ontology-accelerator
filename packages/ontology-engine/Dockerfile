@@ -75,6 +75,11 @@ RUN mkdir -p /app/output /app/data && chown appuser:appuser /app/output /app/dat
 ENV PYTHONPATH=/app/src
 
 USER appuser
+
+# Fail the build if the code this image runs imports anything the image cannot (scripts/image_import_check.py).
+# llama_index is optional: coa_common.embeddings imports it lazily, for kg-build and serve only.
+COPY scripts/image_import_check.py /tmp/
+RUN python /tmp/image_import_check.py coa_ontology.main --optional llama_index
 EXPOSE 8001
 
 CMD ["sh", "-c", "uvicorn coa_ontology.main:app --host 0.0.0.0 --port ${PORT:-8001}"]

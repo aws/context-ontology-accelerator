@@ -1,6 +1,6 @@
 # Control Plane
 
-- **Owner**: Noah Paig
+- **Owner**: TBD
 - **Status**: Active
 
 ## Overview
@@ -145,12 +145,9 @@ query parameters:
 
 ### `DELETE /grants/{grantId}` — revoke a platform grant
 
-Returns `204`/`200` on success and `404` if the grant does not exist (the handler
+Returns `200` on success and `404` if the grant does not exist (the handler
 verifies existence before deleting). A `grantId` that does not decode to a
 platform resource also returns `404`, so namespace grants cannot be revoked here.
-
-> Note: `GET /namespaces/{id}/grants` is paginated with the same `maxResults` /
-> `nextToken` parameters described above.
 
 ## Grants API — Data Access Restrictions
 
@@ -158,9 +155,9 @@ In addition to the role-based action authorization enforced by Cedar at the API 
 
 | Field | Type | Purpose | Enforced by |
 |---|---|---|---|
-| `tableAllowlist` | `list[string]` | Whitelist of bare table names the principal may reference. Schema-qualified references match the bare name. | SQL Firewall, table check |
+| `tableAllowlist` | `list[string]` | Allowlist of bare table names the principal may reference. Schema-qualified references match the bare name. | SQL Firewall, table check |
 | `columnDenylist` | `map[string, list[string]]` | Per-table list of columns that may not be projected. `SELECT *` over a restricted table is denied. | SQL Firewall, column check |
-| `allowedMetrics` | `list[string]` | Whitelist of metric IDs the principal may evaluate via Tier 1. | Metric service (Tier 1) |
+| `allowedMetrics` | `list[string]` | Allowlist of metric IDs the principal may evaluate via Tier 1. | Metric service (Tier 1) |
 
 All three fields are validated for shape at write time (`tableAllowlist`/`allowedMetrics` must be `list[string]`; `columnDenylist` must be `map[string, list[string]]`); malformed payloads return `400 Bad Request`. All comparisons in the SQL Firewall are case-insensitive — see [context-manager SQL Firewall docs](../context-manager/README.md#sql-firewall) for enforcement details.
 
@@ -270,7 +267,7 @@ See [`docs/authz-access-matrix.md`](docs/authz-access-matrix.md) for the full ro
 
 Source: [`src/coa_control_plane/authorization/handler.py`](src/coa_control_plane/authorization/handler.py)
 
-The authorizer is an API Gateway REQUEST-type Lambda authorizer. It runs on every API call and produces an IAM policy document that API Gateway caches per JWT for a configured TTL.
+The authorizer is an API Gateway REQUEST-type Lambda authorizer. It runs on every API call and produces an IAM policy document. API Gateway does not cache the result (`authorizerResultTtl` is 0).
 
 ### Token Validation
 
@@ -320,9 +317,9 @@ independent bounds keep that cache from serving revoked authorization:
    instead of the container's lifetime. The cache is also capped at 1000
    entries.
 
-### API Gateway Caching Strategy
+### Wildcard Resource ARN
 
-When Cedar allows a request, the returned IAM policy uses a wildcard resource ARN (`arn:.../*`) rather than the specific method ARN. This prevents a pathological cache interaction: API Gateway caches the authorizer response by token, so a policy scoped to one method would 403 all subsequent methods on the same token until TTL expires.
+When Cedar allows a request, the returned IAM policy uses a wildcard resource ARN (`arn:.../*`) rather than the specific method ARN. Cedar has already enforced the (action, resource) for the request, so the policy covers every method on the stage.
 
 ### Authorizer Environment Variables
 
@@ -445,15 +442,15 @@ If any phase fails, status is set to `DELETE_FAILED`. Retry the DELETE to resume
 
 | Key | Pattern | Description |
 |-----|---------|-------------|
-| PK | `NS#{namespaceId}` or `NS#GLOBAL` | Scope |
+| PK | `NS#{namespaceId}` or `GLOBAL` | Scope |
 | SK | `ROLE#{roleId}` | Role definition |
 
 ### ResourceRoleMappings Table
 
 | Key | Pattern | Description |
 |-----|---------|-------------|
-| PK | `{principalType}::{principalId}` | Who has the grant |
-| SK | `{resourceType}::{resourceId}#ROLE#{roleId}` | What they can access |
+| PK | `{resourceType}::{resourceId}#{principalType}::{principalId}` | What the grant covers and who holds it |
+| SK | `ROLE#{roleId}` | Role granted |
 
 **GSI: NamespaceGrantsIndex** — `namespaceKey` (PK), `principalRoleKey` (SK) for listing grants by namespace.
 
@@ -463,16 +460,16 @@ The grant item may also carry the following sparse top-level attributes — they
 
 | Attribute | Type | Description |
 |---|---|---|
-| `tableAllowlist` | `List<String>` | Whitelist of bare table names the principal may query. |
+| `tableAllowlist` | `List<String>` | Allowlist of bare table names the principal may query. |
 | `columnDenylist` | `Map<String, List<String>>` | Per-table list of columns that must not be projected. |
-| `allowedMetrics` | `List<String>` | Whitelist of metric IDs the principal may evaluate (Tier 1). |
+| `allowedMetrics` | `List<String>` | Allowlist of metric IDs the principal may evaluate (Tier 1). |
 
 Example item with overrides populated:
 
 ```json
 {
-  "PK": "User::alice@company.com",
-  "SK": "Namespace::demo#ROLE#data-analyst",
+  "PK": "Namespace::demo#User::alice@company.com",
+  "SK": "ROLE#data-analyst",
   "principalType": "User",
   "principalId": "alice@company.com",
   "role": "data-analyst",
@@ -495,7 +492,7 @@ Example item with overrides populated:
 | Symptom | Likely Cause | Fix |
 |---------|--------------|-----|
 | 403 on all requests after deploying new roles | Authorizer Lambda's local cache is stale and the stream handler hasn't bumped the version counter | Check that the DynamoDB Streams trigger is active on the Roles/ResourceRoleMappings tables; verify `CACHE_INVALIDATION_TABLE_NAME` is set |
-| 403 on second API call with same token, first call succeeds | API Gateway cached a method-specific IAM policy (old bug) | Verify the authorizer returns wildcard resource ARN (`/*`) on Allow decisions |
+| 403 on second API call with same token, first call succeeds | Authorizer returned a method-specific IAM policy | Verify the authorizer returns wildcard resource ARN (`/*`) on Allow decisions |
 | `ConditionalCheckFailedException` on namespace create | Name reservation already exists (possibly orphaned from a crashed attempt) | Wait for TTL expiry (5 min) or manually delete the `NS_NAME#<name>` / `RESERVATION` item |
 | `Role 'X' not found in namespace` on grant creation | Role templates weren't copied to the namespace during creation | Check `NAMESPACE_TEMPLATE` partition in the Roles table; re-run namespace creation if templates are missing |
 | Athena workgroup not created (namespace has no `athenaWorkgroupName`) | `ATHENA_RESULTS_BUCKET_SSM` env var missing or SSM param not found | Set the SSM parameter and update the namespace (or delete/recreate) |

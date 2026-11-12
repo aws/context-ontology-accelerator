@@ -62,12 +62,8 @@ final class ExampleCatalog
     }
 
     /**
-     * Builds the catalog.
-     *
-     * @param configOptions the Lambda's environment, as handed to the handlers. Only the
-     *                      {@code bulk_rows} sizing options are read; everything else is
-     *                      fixed.
-     * @return table name to definition, in the order {@code SHOW TABLES} should list them.
+     * Builds the catalog: table name to definition, in the order {@code SHOW TABLES} should list them.
+     * Only the {@code bulk_rows} sizing options are read from {@code configOptions}.
      */
     static Map<String, ExampleTable> tables(Map<String, String> configOptions)
     {
@@ -156,17 +152,13 @@ final class ExampleCatalog
     /**
      * The spill driver: {@code rowCount} rows of a {@code rowBytes}-wide string, so a single
      * split's response size is set from the environment rather than fixed by the fixture.
-     *
-     * @param rowCount rows to serve.
-     * @param rowBytes characters per {@code payload} value.
-     * @return the table.
      */
     private static ExampleTable bulkRows(int rowCount, int rowBytes)
     {
         // One filler string, reused, with the row number stamped over its head so no two payloads
         // are byte-identical — insurance against anything in the path deduplicating them and
         // keeping the response under the limit this table exists to cross.
-        final String filler = repeat('x', rowBytes);
+        final String filler = "x".repeat(rowBytes);
         return ExampleTable.named("bulk_rows")
                 .rows(rowCount)
                 .rowsFrom(n -> {
@@ -219,15 +211,6 @@ final class ExampleCatalog
         catch (NumberFormatException e) {
             return fallback;
         }
-    }
-
-    private static String repeat(char character, int count)
-    {
-        StringBuilder out = new StringBuilder(Math.max(count, 0));
-        for (int i = 0; i < count; i++) {
-            out.append(character);
-        }
-        return out.toString();
     }
 
     /** @return {@code filler} with the decimal form of {@code n} written over its head. */

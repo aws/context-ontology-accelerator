@@ -3,8 +3,8 @@
 
 """Audit logging for MCP tool invocations.
 
-Logs agent identity for audit trail. Per LLD §3.2.5:
-"The agent identity is logged for audit but does not drive authorization decisions."
+Logs agent identity for audit trail. The agent identity is logged for audit
+but does not drive authorization decisions.
 """
 
 from __future__ import annotations

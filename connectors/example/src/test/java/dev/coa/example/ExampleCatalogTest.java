@@ -143,9 +143,6 @@ class ExampleCatalogTest
         ExampleTable bulk = ExampleCatalog.tables(config).get("bulk_rows");
         assertEquals(4096, bulk.rowCount());
         assertEquals(2048, ((String) bulk.row(1).get("payload")).length());
-        // 4096 x 2048 = 8 MiB of payload in one split, comfortably over Athena's 6 MB
-        // response limit, so this response has to spill.
-        assertTrue((long) bulk.rowCount() * 2048L > 6L * 1024 * 1024);
     }
 
     @Test

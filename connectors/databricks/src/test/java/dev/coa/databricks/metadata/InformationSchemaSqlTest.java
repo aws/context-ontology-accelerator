@@ -26,9 +26,8 @@ class InformationSchemaSqlTest
     {
         // Not information_schema.tables: creating a materialized view or streaming table also creates
         // __materialization_* and event_log_* side tables, which that view lists as ordinary MANAGED
-        // tables with nothing marking them internal. Four junk rows out of eleven on the fixture schema.
-        assertTrue(InformationSchemaSql.showTables("main", "sales")
-                .equals("SHOW TABLES IN `main`.`sales`"));
+        // tables with nothing marking them internal.
+        assertEquals("SHOW TABLES IN `main`.`sales`", InformationSchemaSql.showTables("main", "sales"));
     }
 
     /**

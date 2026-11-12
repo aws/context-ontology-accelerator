@@ -3,7 +3,7 @@
 
 """Guardrail allow/block observability — CloudWatch metrics + structured decision log.
 
-One helper for every site that decides a guardrail outcome (issue #111, AC10/AC11).
+One helper for every site that decides a guardrail outcome.
 Emits three metrics under ``COA/Guardrails``:
 
 * ``GuardrailInvocations`` (Count) — every decision, whatever the outcome. Carries the
@@ -23,14 +23,8 @@ over the two counters, so publishing it would be a third source of truth.
 Two transports, because the callers run on different compute:
 
 * ``transport="put"`` — explicit ``PutMetricData``, used by the ECS Fargate
-  tasks (kg-build, enrichment, ontology). Not a constraint: ``awsLogs`` writes
-  through ``PutLogEvents`` and CloudWatch Logs *does* extract Embedded Metric
-  Format from those events. It is a choice — these containers already publish
-  their other custom metrics (cost, stage durations) via ``PutMetricData``, and
-  keeping the decision metric off the log pipeline means it does not depend on
-  a JSON line surviving a stdout stream shared with human-readable logs, nor
-  carry per-log-event ingestion cost for every guardrail call. Needs a
-  ``cloudwatch:PutMetricData`` grant conditioned on the metric namespace.
+  tasks (kg-build, enrichment, ontology). Needs a ``cloudwatch:PutMetricData``
+  grant conditioned on the metric namespace.
 * ``transport="emf"`` — stdout EMF via :func:`coa_common.metrics.emit_metric`.
   No IAM grant and no API latency on the request path, at the cost of log
   ingestion. Used by the serve path, which already emits its other metrics
@@ -71,9 +65,8 @@ COMPONENT_ONTOLOGY_SHAPES = "ontology-shapes"
 
 DECISION_ALLOW = "ALLOW"
 DECISION_BLOCK = "BLOCK"
-# Masked, not blocked. Its own value because masking is invisible otherwise: an
-# NTSB/TimeBank benchmark found 68% of one arm's answers silently carrying {NAME}
-# placeholders, which no existing metric would have surfaced.
+# Masked, not blocked. Its own value because masking is otherwise invisible
+# (answers silently carry placeholders such as {NAME}).
 DECISION_ANONYMIZED = "ANONYMIZED"
 # Guardrail intervened but no trace was returned, so the action is unknown. The call
 # is suppressed (fail closed) yet deliberately NOT counted as a confirmed block.
@@ -123,12 +116,8 @@ def filter_type_from_assessments(assessments: list[dict[str, Any]] | None) -> st
     ANONYMIZE still reports ``PII``, not ``NONE``). When several families fire,
     the most severe wins per :data:`_FILTER_TYPE_PRIORITY`.
 
-    Args:
-        assessments: Guardrail assessment traces, in any API's shape.
-
-    Returns:
-        ``"CONTENT"``, ``"TOPIC"``, ``"PII"``, or ``"NONE"`` when nothing fired
-        (also the answer for malformed input — this is a log field, not a gate).
+    Returns ``"NONE"`` when nothing fired or the input is malformed (this is a
+    log field, not a gate).
     """
     found: set[str] = set()
     try:
@@ -152,11 +141,7 @@ def assessments_from_trace(trace: dict[str, Any] | None) -> list[dict[str, Any]]
     (``inputAssessment`` vs ``outputAssessment``/``outputAssessments``). Accepts
     all of those shapes so callers do not have to care which they got.
 
-    Args:
-        trace: The ``trace.guardrail`` sub-document from a Converse response.
-
-    Returns:
-        Every assessment found, or ``[]`` for an empty or malformed trace.
+    Returns ``[]`` for an empty or malformed trace.
     """
     flat: list[dict[str, Any]] = []
     try:
@@ -178,14 +163,8 @@ def redacted_actions(assessments: list[dict[str, Any]] | None) -> list[str]:
 
     An assessment echoes the text each policy matched (``{"type": "NAME", "match": "Jane Doe", ...}``),
     so it must never be logged as is. Only the policy, the configured name (a topic's or a regex's) or
-    else the entity type, and the action are kept.
-
-    Args:
-        assessments: Guardrail assessments, as :func:`assessments_from_trace` returns them.
-
-    Returns:
-        One label per policy item that carries an action, e.g. ``"sensitiveInformationPolicy:NAME=BLOCKED"``;
-        ``[]`` for empty or malformed input (this is a log field, not a gate).
+    else the entity type, and the action are kept. Like :func:`filter_type_from_assessments`, an item
+    whose action is ``"NONE"`` did not fire and gets no label.
     """
     out: list[str] = []
     for assessment in assessments or []:
@@ -194,14 +173,11 @@ def redacted_actions(assessments: list[dict[str, Any]] | None) -> list[str]:
         for policy_key, items_key, _ in _POLICY_FILTER_TYPES:
             policy = assessment.get(policy_key)
             items = policy.get(items_key) if isinstance(policy, dict) else None
-            out.extend(_redacted_label(policy_key, item) for item in (items if isinstance(items, list) else []))
-    return [label for label in out if label]
-
-
-def _redacted_label(policy_key: str, item: Any) -> str:
-    if not isinstance(item, dict) or not item.get("action"):
-        return ""
-    return f"{policy_key}:{item.get('name') or item.get('type') or '-'}={item['action']}"
+            for item in items if isinstance(items, list) else []:
+                action = item.get("action") if isinstance(item, dict) else None
+                if action and action != "NONE":
+                    out.append(f"{policy_key}:{item.get('name') or item.get('type') or '-'}={action}")
+    return out
 
 
 def emit_guardrail_decision(

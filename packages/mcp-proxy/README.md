@@ -41,20 +41,8 @@ unzip coa-mcp-proxy-src.zip
 cd coa-mcp-proxy && npm install && npm run build
 ```
 
-The zip carries a build-only `package.json`, generated from this package's `package.json` when the
-web app is built. It keeps every runtime dependency and the `build` and `start` scripts, and adds only
-`typescript` and `@types/node` for the build. The test toolchain is left out, so `npm install` works with
-the npm that ships with Node 22. `tsx` stays in because the `start` script (`tsx src/index.ts`, which runs
-the source without building) uses it; the steps above run `dist/index.js` and do not need it. The
-`tests/` folder is in the zip for review only; run the tests from a repo checkout with
+The zip omits the test toolchain; `tests/` is included for review only. Run the tests from a repo checkout with
 `pnpm --dir packages/mcp-proxy test`.
-
-Each of those dependencies is pinned to the exact version recorded for this package in the repo's
-`pnpm-lock.yaml`, the versions the repo builds and tests with. Their own dependencies are not pinned:
-`npm install` resolves them from the npm registry when you run it. The SHA-256 on the MCP Server page
-covers the zip, so it covers the source and the pinned direct versions, not the whole installed tree. It
-shows the download is complete and intact; it is served from the same site as the zip, so it does not
-prove who published it.
 
 Use `npm run build`, not `npx tsc`: if TypeScript is not installed, `npx tsc` downloads an unrelated
 npm package named `tsc` instead of failing.
@@ -96,7 +84,8 @@ All optional (auto-discovered from SSM if not set):
 |----------|-------------|---------|
 | `AWS_REGION` | AWS region | `us-east-1` |
 | `AWS_PROFILE` | AWS profile for SSM lookup | default credential chain |
-| `SCL_PREFIX` | SSM parameter prefix | `/scl` |
+| `RESOURCE_PREFIX` | Resource prefix used to build the default SSM prefix | `coa` |
+| `SCL_PREFIX` | SSM parameter prefix | `/<RESOURCE_PREFIX>` |
 | `SCL_CLIENT_ID` | Override Cognito client ID | from SSM |
 | `SCL_ISSUER` | Override Cognito issuer URL | from SSM |
 | `SCL_RUNTIME_ARN` | Override runtime ARN | from SSM |
@@ -104,7 +93,7 @@ All optional (auto-discovered from SSM if not set):
 
 ### First Run
 
-On first connection, the proxy opens your browser to the Cognito login page. Sign in with your credentials. The token is cached for 30 days. No password is stored anywhere on disk.
+On first connection, the proxy opens your browser to the Cognito login page. Sign in with your credentials. The token is cached for 30 days.
 
 ### Token Refresh
 
