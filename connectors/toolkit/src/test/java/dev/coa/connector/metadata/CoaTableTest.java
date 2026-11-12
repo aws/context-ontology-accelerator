@@ -6,11 +6,9 @@ import dev.coa.connector.constraints.ColumnComment;
 import org.apache.arrow.vector.types.Types;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
-import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.Test;
 
-import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 
@@ -134,7 +132,6 @@ class CoaTableTest
         }
     }
 
-
     @Test
     void proseAlreadyContainingALiveTagIsRefused()
     {
@@ -175,7 +172,6 @@ class CoaTableTest
                 .build();
         assertEquals("@fk(orders.order_id)", commentsOf(table).get("c"));
     }
-
 
     @Test
     void mutatingAColumnAfterTheTableIsBuiltCannotChangeTheTable()

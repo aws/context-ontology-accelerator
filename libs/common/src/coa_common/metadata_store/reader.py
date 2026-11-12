@@ -29,12 +29,7 @@ def read_assets_for_datasource(domain_id: str, project_id: str, data_source_id: 
     # Assets are stored with DS# prefix in their name
     ds_key = f"DS#{data_source_id}" if not data_source_id.startswith("DS#") else data_source_id
 
-    client = SMUSClient(
-        domain_id=domain_id,
-        region_name=AWS_REGION,
-        assume_role_arn=os.getenv("PROJECT_ACCESS_ROLE_ARN") or None,
-        session_name="enrichment-reader",
-    )
+    client = _client(domain_id, "enrichment-reader")
     tables: list[Table] = []
 
     logger.info(
@@ -113,9 +108,9 @@ def read_asset_names_for_datasource(domain_id: str, project_id: str, data_source
     :func:`read_assets_for_datasource` instead issues one ``get_asset_forms`` per
     asset because it must return full ``Table`` objects. Used for an existence
     check that is O(tables) in sequential DataZone round-trips: 88 assets measured
-    at 0.186s each is 16s of a 30s Lambda budget, and metric creation was timing
-    out behind it (job 10909663). Callers that need columns or review status should
-    fetch the ONE asset they care about via :func:`read_table_for_asset`.
+    at 0.186s each is 16s of a 30s Lambda budget. Callers that need columns or
+    review status should fetch the ONE asset they care about via
+    :func:`read_table_for_asset`.
 
     Returns an empty mapping when the source has no assets. Raises when the search
     itself fails, so callers can distinguish "no tables" from "could not look".
@@ -198,7 +193,6 @@ def _parse_asset(
             except (json.JSONDecodeError, TypeError) as e:
                 logger.error("Failed to parse form content for asset %s: %s", asset_id, e)
                 return None
-            table = deserialize_form(payload, data_source_id=data_source_id)
-            return table
+            return deserialize_form(payload, data_source_id=data_source_id)
 
     return None

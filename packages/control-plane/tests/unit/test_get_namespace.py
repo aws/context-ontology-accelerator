@@ -59,7 +59,6 @@ class TestDatasourceExternalId:
     """
 
     def test_returns_the_derived_external_id(self, monkeypatch):
-        monkeypatch.setenv("RESOURCE_PREFIX", "coa-dev-")
         with patch(f"{MODULE}._get_ns_dao") as mock:
             dao = MagicMock()
             mock.return_value = dao
@@ -79,7 +78,6 @@ class TestDatasourceExternalId:
         """Must equal what the sources connector sends, or every assume fails."""
         from coa_common.constants import datasource_external_id
 
-        monkeypatch.setenv("RESOURCE_PREFIX", "coa-dev-")
         with patch(f"{MODULE}._get_ns_dao") as mock:
             dao = MagicMock()
             mock.return_value = dao

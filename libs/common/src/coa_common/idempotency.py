@@ -142,11 +142,6 @@ def _default_headers() -> dict[str, str]:
     return {"Content-Type": "application/json", **cors_headers()}
 
 
-# ---------------------------------------------------------------------------
-# Store
-# ---------------------------------------------------------------------------
-
-
 class IdempotencyStore:
     """Thin DynamoDB wrapper for idempotency records (PK-only table, TTL on ``ttl``).
 
@@ -293,11 +288,6 @@ def reset_store_cache() -> None:
     _STORES.clear()
 
 
-# ---------------------------------------------------------------------------
-# Request parsing
-# ---------------------------------------------------------------------------
-
-
 @dataclass(frozen=True)
 class _ParsedRequest:
     """The request body with ``clientToken`` split out."""
@@ -350,11 +340,6 @@ def request_fingerprint(body: dict[str, Any], path_parameters: dict[str, Any] | 
     """sha256 of the canonical token-free body plus the path parameters."""
     payload = {"body": body, "pathParameters": path_parameters or {}}
     return hashlib.sha256(_canonical(payload).encode("utf-8")).hexdigest()
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 
 
 def idempotent_create(
@@ -535,11 +520,6 @@ def _release_quietly(store: IdempotencyStore, key: str, created_at: int, log: Fi
         store.release(key, created_at=created_at)
     except IdempotencyStoreError as exc:
         log.error("idempotency_release_failed", error=str(exc))
-
-
-# ---------------------------------------------------------------------------
-# Claim state machine
-# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)

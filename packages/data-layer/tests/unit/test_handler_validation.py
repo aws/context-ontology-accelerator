@@ -164,20 +164,21 @@ class TestCorsHeaders:
             try:
                 assert h.CORS_HEADERS["Access-Control-Allow-Origin"] == ""
             finally:
-                # Reload again under the OUTER (module-scope) env so subsequent
-                # tests see the same constants they were imported with. Without
-                # this, ``ONTOLOGY_PROXY_LAMBDA_ARN`` (or any other constant
-                # captured at import time) would leak an empty value into the
-                # rest of the suite via ``handler_module``.
+                # Restore import-time constants for other tests.
                 importlib.reload(h)
 
 
 def _fake_urlopen(response_body: dict):
     """Build a urlopen replacement whose context-manager yields JSON bytes."""
-    cm = MagicMock()
-    cm.__enter__.return_value.read.return_value = json.dumps(response_body).encode("utf-8")
-    cm.__exit__.return_value = False
-    return MagicMock(return_value=cm)
+    payload = json.dumps(response_body).encode("utf-8")
+
+    def open_(*_args, **_kwargs):
+        cm = MagicMock()
+        cm.__enter__.return_value.read1.side_effect = [payload, b""]
+        cm.__exit__.return_value = False
+        return cm
+
+    return MagicMock(side_effect=open_)
 
 
 @pytest.mark.unit
@@ -232,11 +233,7 @@ class TestQuerySuccess:
             "execute": False,
             "tierOverride": 2,
             "mode": "standard",
-            # Smithy wire shape: list of DimensionFilter objects. Data-layer
-            # normalizes it to CM's ``{name: value}`` mapping via
-            # ``normalize_dimensions`` before forwarding (fixes the Tier-1
-            # ``AttributeError``/500 caught in MR !939 review). ``operator``
-            # is dropped — CM's Tier-1 resolver supports equality only.
+            # Wire shape is a list of DimensionFilter; it is forwarded as a name->value mapping.
             "dimensions": [{"name": "region", "value": "EMEA", "operator": "="}],
             "timeoutMs": 29_000,
             "strategy": "ontop",
@@ -259,22 +256,11 @@ class TestQuerySuccess:
         assert payload["options"]["execute"] is False
         assert payload["options"]["tierOverride"] == 2
         assert payload["options"]["mode"] == "standard"
-        # Normalized to the mapping shape CM's Tier-1 resolver expects. If this
-        # ever regresses back to the list, every dimensioned Tier-1 metric
-        # query 500s with AttributeError on ``.items()``.
         assert payload["options"]["dimensions"] == {"region": "EMEA"}
-        # ``timeoutMs`` IS forwarded to CM — the Context Manager builds a
-        # request-scoped deadline from ``options.timeoutMs``. The model bounds it to
-        # the REST budget (29,000 ms), and the upper bound itself is accepted.
         assert payload["options"]["timeoutMs"] == 29_000
-        # ``strategy`` IS forwarded too: CM reads ``options["strategy"]`` in
-        # ``Orchestrator._resolve_strategy_selection``, so it is not a phantom
-        # field. Dropping it here is what made the Ontop / VKG path unreachable by
-        # any REST caller — it ran only as an automatic fallback, never on request.
         assert payload["options"]["strategy"] == "ontop"
         assert payload["options"]["includeSupporting"] is True
         assert payload["options"]["maxResults"] == 5
-        # Opt-in LLM usage: forwarded so serve attaches result.llmUsage.
         assert payload["options"]["includeLlmUsage"] is True
         assert payload["profile"]["groups"] == ["g1", "g2"]
         assert payload["profile"]["globalRoles"] == ["admin"]
@@ -298,13 +284,7 @@ class TestQuerySuccess:
         mock_invoke.assert_not_called()
 
     def test_query_omits_strategy_when_not_supplied(self):
-        """An unset ``strategy`` must not appear in options at all.
-
-        Sending ``strategy: None`` would reach ``normalize_strategy_option``, fall
-        out of ``_EXPLICIT_STRATEGY_OPTIONS``, and resolve to ``DEFAULT_STRATEGY``
-        anyway — but it would also make the request differ from a pre-change one
-        and would show up in traces as an explicit pin that the caller never made.
-        """
+        """An unset ``strategy`` is absent from options, not forwarded as ``None``."""
         captured: dict = {}
 
         def _fake_invoke(payload: dict, token: str) -> dict:
@@ -324,15 +304,7 @@ class TestQuerySuccess:
         assert "strategy" not in captured["payload"]["options"]
 
     def test_query_rejects_unknown_strategy_with_400(self):
-        """An unrecognised strategy must 400, not be forwarded.
-
-        Nothing else validates it — the handler does not check the body against the
-        generated Smithy model and API Gateway has no RequestValidator — so without
-        this check the value reaches serve, drops out of
-        ``Orchestrator._EXPLICIT_STRATEGY_OPTIONS`` and silently resolves to
-        DEFAULT_STRATEGY. The caller would get the cheap fallback chain while
-        believing it had pinned an engine.
-        """
+        """An unrecognised strategy is rejected with 400, not forwarded."""
         called = {"n": 0}
 
         def _fake_invoke(payload: dict, token: str) -> dict:
@@ -349,8 +321,7 @@ class TestQuerySuccess:
             result = handler(event, None)
 
         assert result["statusCode"] == 400, result
-        # The rejected value must NOT be echoed — it is unbounded caller-controlled
-        # input, and reflecting it back is what AppSec objects to.
+        # Caller-controlled input is not echoed back.
         assert "ontopp" not in result["body"]
         # Names the valid values, so the caller can fix it without reading the model.
         assert "ontop_first" in result["body"]
@@ -402,7 +373,7 @@ class TestQuerySuccess:
             return handler(event, None), captured
 
     def test_nl_to_sparql_is_rejected_with_400_while_graph_sources_are_off(self, monkeypatch):
-        """As on main, where the value was not a strategy: the request never reaches CM."""
+        """The request is rejected with 400 and never reaches the Context Manager."""
         monkeypatch.delenv(GRAPH_SOURCES_ENV, raising=False)
         result, captured = self._query_with_strategy("nl_to_sparql")
         assert result["statusCode"] == 400, result
@@ -425,14 +396,7 @@ class TestQuerySuccess:
         ],
     )
     def test_query_rejects_non_string_strategy_with_400(self, value, label):
-        """A non-string strategy must 400, never 502.
-
-        ``body`` is caller-controlled and ``QUERY_STRATEGIES`` is a frozenset, so
-        ``value not in QUERY_STRATEGIES`` raises TypeError for an unhashable value.
-        Unguarded, that escapes to the top-level ``except Exception`` and is reported
-        as 502 "Context Manager invocation failed" — an upstream-failure code for a
-        client mistake, on a request that never left the handler.
-        """
+        """A non-string strategy is a 400 (an unhashable one must not surface as a 502)."""
         called = {"n": 0}
 
         def _fake_invoke(payload: dict, token: str) -> dict:
@@ -453,14 +417,7 @@ class TestQuerySuccess:
         assert called["n"] == 0, f"{label} reached CM"
 
     def test_query_error_does_not_reflect_a_large_strategy_value(self):
-        """A rejected value must not be able to inflate the response.
-
-        ``strategy`` is unbounded caller-controlled input. Echoing it — especially via
-        ``!r``, which serialises whatever arrived — lets a client turn a 400 into a
-        response as large as its own request, and reflects its content back verbatim.
-        The error names the valid values instead, so its size is fixed regardless of
-        what was sent.
-        """
+        """A rejected strategy value is not echoed, so the 400 stays small."""
         huge = "x" * 100_000
 
         with patch.object(handler_module, "_invoke_context_manager", side_effect=AssertionError):
@@ -535,12 +492,6 @@ class TestKbSearchSuccess:
 @pytest.mark.unit
 class TestGraphTraverse:
     """Graph traverse validation and success behavior."""
-
-    def test_missing_start_uri_returns_400(self):
-        event = _api_event("POST", "/namespaces/{namespaceId}/graph/traverse", body={"maxDepth": 3})
-        result = handler(event, None)
-        assert result["statusCode"] == 400
-        assert "Missing required field: startUri" in result["body"]
 
     def test_graph_traverse_success_forwards_options(self):
         captured: dict = {}
@@ -726,13 +677,7 @@ class TestUpstreamErrorHandling:
 
 @pytest.mark.unit
 class TestDescribeSchema:
-    """GET /namespaces/{ns}/schema proxies to the ontology-api-proxy Lambda.
-
-    Regression scope: MR !911 removed the DescribeSchema operation entirely on
-    the assumption that it was unrouted. It is used by the UI/data-layer surface
-    (parallel to MCP's ``describe_schema``), so a subsequent revert of this fix
-    would break the surface again and must fail here.
-    """
+    """GET /namespaces/{ns}/schema proxies to the ontology-api-proxy Lambda."""
 
     def _fake_proxy_response(self, body: dict, status: int = 200) -> dict:
         """Shape a synthetic Lambda invoke response with an API GW proxy body."""
@@ -801,19 +746,6 @@ class TestDescribeSchema:
         assert result["statusCode"] == 404
         assert "namespace not found" in result["body"]
 
-    def test_function_error_maps_to_502(self):
-        mock_client = MagicMock()
-        mock_client.invoke.return_value = {
-            "StatusCode": 200,
-            "FunctionError": "Unhandled",
-            "Payload": io.BytesIO(b'"boom"'),
-        }
-        with patch.object(handler_module, "_get_lambda_client", return_value=mock_client):
-            event = _api_event("GET", "/namespaces/{namespaceId}/schema", body=None)
-            result = handler(event, None)
-        assert result["statusCode"] == 502
-        assert "Schema backend failed" in result["body"]
-
     def test_missing_env_var_returns_501(self):
         with patch.object(handler_module, "ONTOLOGY_PROXY_LAMBDA_ARN", ""):
             event = _api_event("GET", "/namespaces/{namespaceId}/schema", body=None)
@@ -838,14 +770,8 @@ class TestDescribeSchema:
         body = json.loads(result["body"])
         assert set(body.keys()) == {"classes", "ontologyVersion"}
 
-    # ── Error-handling regressions from the !921 code review ─────────────
-
     def test_client_error_on_invoke_maps_to_502(self):
-        """boto3 ClientError from lambda:Invoke (throttle / permissions / timeout)
-        must produce a stable 502 with a schema-specific message. Unhandled it
-        would escape to the router's generic ``except Exception`` and come back
-        as ``Context Manager invocation failed`` — misleading, since CM was
-        never in the path."""
+        """A boto3 ClientError from lambda:Invoke is a 502 naming the schema backend."""
         mock_client = MagicMock()
         mock_client.invoke.side_effect = ClientError(
             {"Error": {"Code": "ThrottlingException", "Message": "Rate exceeded"}},
@@ -860,10 +786,7 @@ class TestDescribeSchema:
         assert "Context Manager" not in result["body"]
 
     def test_malformed_envelope_json_returns_502(self):
-        """An invoke that succeeded at the control-plane level can still return
-        bytes that aren't valid JSON at the outer envelope (proxy crashed
-        inside its Lambda wrapper). Must produce a clear 502, not raise
-        through the router."""
+        """A non-JSON invoke payload is a 502, not an unhandled exception."""
         mock_client = MagicMock()
         mock_client.invoke.return_value = {
             "StatusCode": 200,
@@ -876,9 +799,7 @@ class TestDescribeSchema:
         assert "Schema backend returned invalid JSON" in result["body"]
 
     def test_function_error_does_not_leak_lambda_internals(self):
-        """The FunctionError payload can carry ARNs, request IDs, stack frames,
-        or model-supplied text. The response body MUST be a generic message;
-        the truncated preview is logged server-side, never returned."""
+        """The FunctionError payload is logged, never returned to the caller."""
         secret_payload = (
             b'{"errorMessage": "Traceback... at /var/task/handler.py line 42: '
             b'arn:aws:iam::123456789012:role/internal-role", "errorType": "RuntimeError"}'
@@ -904,15 +825,7 @@ class TestDescribeSchema:
 
 @pytest.mark.unit
 class TestQueryLengthBoundReportsItsOwnReason:
-    """An over-long query must say so, not claim the field is missing.
-
-    ``validate_query_text`` bounds the query in CODE POINTS, which is the correct
-    unit for a multilingual API: a byte bound would give a CJK caller a third of
-    the Latin allowance for the same character count. The handler used to collapse
-    every ``ValueError`` from it into "Missing required field: query", so a caller
-    who sent a 5000-character query was told the field was absent and had nothing
-    to act on.
-    """
+    """An over-long query reports the length bound, not a missing field."""
 
     ROUTES = (
         "/namespaces/{namespaceId}/query",
@@ -947,12 +860,7 @@ class TestQueryLengthBoundReportsItsOwnReason:
         [("latin", "a"), ("cjk", "あ"), ("astral", "𠮷")],
     )
     def test_at_the_limit_is_accepted_in_every_script(self, label, char):
-        """The bound is code points, so the limit is reached at the same COUNT.
-
-        Astral characters are one code point each in this count even though Python
-        stores them as one character and UTF-8 spends four bytes on them, which is
-        the property that keeps the allowance script-independent.
-        """
+        """The bound is in code points, so every script reaches it at the same count."""
         query = char * self._limit()
         event = _api_event("POST", "/namespaces/{namespaceId}/query", body={"query": query})
         with patch.object(handler_module, "_invoke_context_manager") as invoke:

@@ -523,10 +523,26 @@ def _build_document_detail(item: dict[str, Any], metrics: dict[str, Any] | None 
         val = item["preprocessingIssues"]
         if isinstance(val, str):
             with contextlib.suppress(json.JSONDecodeError, ValueError):
-                doc["preprocessingIssues"] = json.loads(val)
+                doc["preprocessingIssues"] = _redacted_issues(json.loads(val))
         else:
-            doc["preprocessingIssues"] = val
+            doc["preprocessingIssues"] = _redacted_issues(val)
     return doc or None
+
+
+def _redacted_issues(issues: Any) -> Any:
+    """Stored preprocessing issues with every reason redacted.
+
+    Rows written before reasons were redacted at write time hold the raw exception text, which can name
+    a service bucket or endpoint.
+    """
+    if not isinstance(issues, list):
+        return issues
+    return [
+        {**issue, "reason": redact(issue["reason"])}
+        if isinstance(issue, dict) and isinstance(issue.get("reason"), str)
+        else issue
+        for issue in issues
+    ]
 
 
 def _parse_error_message(raw: Any) -> str:

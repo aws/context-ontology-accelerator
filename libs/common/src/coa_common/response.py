@@ -38,15 +38,6 @@ def cors_headers() -> dict[str, str]:
     }
 
 
-# Backward-compatible private alias for existing callers.
-_cors_headers = cors_headers
-
-
-# Backward-compatible module-level constant — evaluates lazily on first access
-# via api_response(). Services that never call api_response() won't crash.
-CORS_HEADERS: dict[str, str] = {}
-
-
 def api_response(status: int, body: dict, extra_headers: dict | None = None) -> dict[str, Any]:
     """Build an API Gateway proxy response with CORS headers."""
     headers = {"Content-Type": "application/json", **cors_headers()}
@@ -82,19 +73,16 @@ def get_caller_identity(event: dict[str, Any]) -> str:
     rc = event.get("requestContext", {})
     authorizer = rc.get("authorizer", {})
 
-    # 1. Custom authorizer context (flat keys set by token authorizer)
     caller = authorizer.get("email") or authorizer.get("userId") or authorizer.get("principalId")
     if caller:
         return caller
 
-    # 2. Cognito authorizer claims
     claims = authorizer.get("claims", {})
     if claims:
         caller = claims.get("email") or claims.get("sub")
         if caller:
             return caller
 
-    # 3. IAM identity
     identity = rc.get("identity", {})
     if identity and identity.get("userArn"):
         return identity["userArn"]

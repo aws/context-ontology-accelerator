@@ -18,18 +18,10 @@ import java.util.Map;
  * The capability map {@code doGetDataSourceCapabilities} returns: predicates, {@code LIMIT n} and
  * {@code ORDER BY ... LIMIT n}, always.
  *
- * <p>Advertising is not what causes push-down. Measured against a live warehouse with an EMPTY map,
- * {@code system.query.history} showed Athena had already sent the predicate, the limit and the top-N, and
- * advertising the three produced byte-identical statements across six query shapes:
- * {@code Constraints.getSummary()}, {@code getLimit()} and {@code getOrderByClause()} are part of the base
- * {@code ReadRecords} payload. What the map grants is Athena's permission to stop re-applying them, which
- * is safe to give for these three only because {@code JdbcSplitQueryBuilder} applies all three with no
- * reference to the map. They are advertised so push-down does not rest on undocumented behaviour: Athena's
- * engine versions independently of this SDK, and a release that began honouring the map strictly would
- * silently read every predicate-matching row out of customer-billed compute.
- *
- * <p>Measured nuance: given a predicate AND a limit, Athena pushes the predicate but applies the limit
- * itself.
+ * <p>Advertising does not cause push-down: Athena sends the predicate, limit and top-N in the base
+ * {@code ReadRecords} payload either way. The map grants Athena permission to stop re-applying them,
+ * which is safe because {@code JdbcSplitQueryBuilder} applies all three. See DESIGN.md for the
+ * measurement.
  *
  * <p>Complex expressions are absent: {@code DatabricksQueryBuilder} inherits
  * {@code DefaultJdbcFederationExpressionParser}, whose {@code mapFunctionToDataSourceSyntax} is an

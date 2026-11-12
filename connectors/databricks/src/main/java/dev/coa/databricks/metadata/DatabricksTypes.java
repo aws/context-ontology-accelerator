@@ -110,43 +110,10 @@ public final class DatabricksTypes
                 return Types.MinorType.DATEMILLI.getType();
             case "binary":
                 return Types.MinorType.VARBINARY.getType();
-            case "string":
-            case "varchar":
-            case "char":
-                return Types.MinorType.VARCHAR.getType();
             default:
                 // ARRAY, MAP, STRUCT, VARIANT, OBJECT, GEOMETRY, GEOGRAPHY, every INTERVAL spelling, and
                 // anything Databricks adds later.
                 return Types.MinorType.VARCHAR.getType();
-        }
-    }
-
-    /**
-     * Whether {@code fullDataType} maps to {@code VARCHAR} because nothing better exists rather than
-     * because it is a string. Used by the README's type table and by tests, not by the record path.
-     */
-    public static boolean isFlattenedToString(String fullDataType)
-    {
-        if (fullDataType == null) {
-            return false;
-        }
-        String base = fullDataType.trim().toLowerCase(Locale.ROOT);
-        int cut = base.length();
-        for (int i = 0; i < base.length(); i++) {
-            char character = base.charAt(i);
-            if (character == '(' || character == '<') {
-                cut = i;
-                break;
-            }
-        }
-        base = base.substring(0, cut).trim();
-        switch (base) {
-            case "string":
-            case "varchar":
-            case "char":
-                return false;
-            default:
-                return Types.MinorType.VARCHAR.getType().equals(toArrowType(fullDataType));
         }
     }
 }

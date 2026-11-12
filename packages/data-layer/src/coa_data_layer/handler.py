@@ -13,10 +13,16 @@ Environment:
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import os
-from typing import Any
+import queue
+import threading
+import time
+from collections.abc import Callable
+from contextvars import ContextVar
+from typing import Any, TypeGuard
 from urllib import request as urllib_request
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
@@ -71,6 +77,112 @@ CORS_HEADERS = {
 
 REST_TIMEOUT_MS = 29_000
 
+# Kept back from the gateway's limit (which starts when the gateway calls this Lambda, after the
+# authorizer, cold start included) so that rest_deadline_exceeded reaches the client before the
+# gateway's own 504.
+_GATEWAY_RESPONSE_MARGIN_S = 1.0
+# Budget from handler entry when the event has no requestTimeEpoch (direct invocation).
+_UNANCHORED_BUDGET_S = REST_TIMEOUT_MS / 1000 - _GATEWAY_RESPONSE_MARGIN_S
+# Time kept back from the Lambda's own timeout for the same.
+_LAMBDA_EXIT_MARGIN_S = 1.0
+_READ_CHUNK_BYTES = 64 * 1024
+# Deadline (time.monotonic()) for the current request's Context Manager call.
+_cm_call_deadline: ContextVar[float | None] = ContextVar("_cm_call_deadline", default=None)
+
+
+def _is_number(value: object) -> TypeGuard[int | float]:
+    return isinstance(value, int | float) and not isinstance(value, bool)
+
+
+def _cm_call_budget_s(event: dict, context) -> float:
+    """Seconds the Context Manager call may take: within the gateway's clock and the Lambda's time left."""
+    budget = _UNANCHORED_BUDGET_S
+    request_context = event.get("requestContext") or {}
+    received_ms = request_context.get("requestTimeEpoch")
+    if _is_number(received_ms):
+        # The integration timeout starts once the Lambda authorizer has returned.
+        authorizer_ms = (request_context.get("authorizer") or {}).get("integrationLatency")
+        if _is_number(authorizer_ms) and authorizer_ms > 0:
+            received_ms += authorizer_ms
+        # A start ahead of this clock (skew, crafted event) must not extend the budget.
+        anchored = received_ms / 1000 + REST_TIMEOUT_MS / 1000 - time.time() - _GATEWAY_RESPONSE_MARGIN_S
+        budget = min(budget, anchored)
+    remaining_ms = getattr(context, "get_remaining_time_in_millis", None)
+    if remaining_ms is not None:
+        budget = min(budget, remaining_ms() / 1000 - _LAMBDA_EXIT_MARGIN_S)
+    return budget
+
+
+def _close_late_http_error(outcome: queue.Queue) -> None:
+    """Close an HTTP error the abandoned call queued around the time it was given up on."""
+    try:
+        _, error = outcome.get_nowait()
+    except queue.Empty:
+        return
+    if isinstance(error, HTTPError):
+        error.close()
+
+
+def _read_body(resp, abandoned: threading.Event) -> bytes:
+    """Read ``resp`` to the end, stopping early once the call is given up on.
+
+    ``read1`` (one socket read), not ``read(n)``, so a trickling response cannot hold an abandoned call.
+    """
+    chunks: list[bytes] = []
+    while not abandoned.is_set() and (chunk := resp.read1(_READ_CHUNK_BYTES)):
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _buffered_http_error(error: HTTPError, abandoned: threading.Event) -> HTTPError:
+    """Read ``error``'s body to the end and close it, returning a copy that holds the body in memory."""
+    if error.fp is None:
+        return error
+    try:
+        body = _read_body(error.fp, abandoned)
+    finally:
+        error.close()
+    return HTTPError(error.filename, error.code, error.msg, error.hdrs, io.BytesIO(body))
+
+
+def _post(req: urllib_request.Request, timeout_s: float, abandoned: threading.Event) -> bytes:
+    """POST ``req`` and return the body; an HTTP error's body is read here too, not by whoever catches it."""
+    try:
+        with urllib_request.urlopen(req, timeout=timeout_s) as resp:
+            return _read_body(resp, abandoned)
+    except HTTPError as exc:
+        raise _buffered_http_error(exc, abandoned) from None
+
+
+def _read_within(req: urllib_request.Request, timeout_s: float) -> bytes:
+    """POST ``req`` and return the body, raising ``TimeoutError`` after ``timeout_s`` in total.
+
+    ``urlopen``'s timeout is per socket operation, so the call runs on a thread waited on for ``timeout_s``.
+    """
+    outcome: queue.Queue[tuple[bytes | None, BaseException | None]] = queue.Queue(maxsize=1)
+    abandoned = threading.Event()
+
+    def call() -> None:
+        try:
+            body = _post(req, timeout_s, abandoned)
+        except BaseException as exc:  # noqa: BLE001 — re-raised on the caller's thread
+            outcome.put_nowait((None, exc))
+            if abandoned.is_set():
+                _close_late_http_error(outcome)
+            return
+        outcome.put_nowait((body, None))
+
+    threading.Thread(target=call, name="context-manager-call", daemon=True).start()
+    try:
+        body, error = outcome.get(timeout=timeout_s)
+    except queue.Empty:
+        abandoned.set()
+        _close_late_http_error(outcome)
+        raise TimeoutError(f"Context Manager call exceeded {timeout_s:.1f}s") from None
+    if error is not None:
+        raise error
+    return body or b""
+
 
 def _parse_first_sse_event(raw: str) -> dict:
     r"""Extract the first JSON payload from an SSE response.
@@ -100,10 +212,13 @@ def _invoke_context_manager(payload: dict, token: str) -> dict:
         },
         method="POST",
     )
-    # Sync customer path behind API Gateway (30s cap): explicit 29s timeout and
+    # Sync customer path behind API Gateway: bounded by the request's budget and
     # no retry by design — fail fast and let the client decide when to retry.
-    with urllib_request.urlopen(req, timeout=29) as resp:
-        raw = resp.read().decode("utf-8")
+    deadline = _cm_call_deadline.get()
+    remaining_s = _UNANCHORED_BUDGET_S if deadline is None else deadline - time.monotonic()
+    if remaining_s <= 0:
+        raise TimeoutError("REST budget spent before the Context Manager call")
+    raw = _read_within(req, remaining_s).decode("utf-8")
     return _parse_first_sse_event(raw)
 
 
@@ -138,21 +253,7 @@ def _parse_body(event: dict) -> dict | None:
 
 
 def _parse_query(body: dict) -> str:
-    """Return a bounded, non-blank query, or raise ``ValueError`` explaining why not.
-
-    The ``ValueError`` message reaches the client rather than being collapsed into
-    one string, because there are four distinct client mistakes here and they call
-    for different corrections: the field is absent (detected below), or
-    ``validate_query_text`` rejects it as a non-string, blank after stripping, or
-    longer than :data:`~coa_common.constants.MAX_QUERY_CODEPOINTS`. Reporting all
-    of them as "Missing required field: query" tells a caller whose field IS
-    present to look in the wrong place.
-
-    The length bound is the one a non-Latin caller is most likely to hit, since a
-    CJK query of the same character count says considerably more than a Latin one.
-    All four messages describe the caller's own input, so propagating them
-    discloses nothing about the service.
-    """
+    """Return a bounded, non-blank query, or raise ``ValueError`` with a client-safe reason."""
     raw = body.get("query")
     if raw is None:
         raise ValueError("Missing required field: query")
@@ -203,7 +304,7 @@ _QUERY_BOOL_MEMBERS: tuple[str, ...] = ("includeSupporting", "includeDebugInfo",
 
 
 def _enum_values(name: str, allowed: frozenset[str]) -> frozenset[str]:
-    """The values ``name`` accepts here: with graph sources off ``nl_to_sparql`` is no strategy, as on main."""
+    """The values ``name`` accepts; ``nl_to_sparql`` is not a valid strategy when graph sources are disabled."""
     if name == "strategy" and not graph_sources_enabled():
         return allowed - {"nl_to_sparql"}
     return allowed
@@ -212,27 +313,12 @@ def _enum_values(name: str, allowed: frozenset[str]) -> frozenset[str]:
 def _parse_query_options(body: dict) -> dict[str, Any]:
     """Validate the optional ``Query`` members and return the CM ``options`` map.
 
-    Each member is checked against its ``serve.smithy`` type and bound (see
-    :mod:`coa_data_layer.contract`) and an out-of-contract value raises
-    :class:`~coa_data_layer.contract.ContractViolation` — the request is rejected,
-    never clamped, coerced or silently dropped. Nothing upstream validates the body
-    against the model, so this is where the contract is enforced. ``null`` is
-    treated as absent.
+    An out-of-contract value raises :class:`~coa_data_layer.contract.ContractViolation`;
+    it is never clamped, coerced or dropped. ``null`` is treated as absent.
 
-    ``strategy`` deserves a note: an unrecognised value forwarded blind would fall
-    out of ``Orchestrator._EXPLICIT_STRATEGY_OPTIONS`` in serve and resolve to the
-    default chain, leaving the caller believing it had pinned an engine.
-
-    ``timeoutMs`` narrows the Context Manager's request-scoped deadline; the
-    upper bound is this handler's own REST ceiling, so a caller cannot ask for a
-    budget the transport could never honour.
-
-    ``includeDebugInfo`` is forwarded as sent; the Context Manager honours it only
-    for a caller entitled to see the generated SQL/SPARQL (it resolves the
-    caller's namespace roles, which this handler does not have).
-
-    Raises:
-        ContractViolation: A member has the wrong type or is out of range.
+    ``strategy`` is validated because an unrecognised value would silently fall back to
+    the default chain. ``timeoutMs`` is capped at this handler's REST ceiling.
+    ``includeDebugInfo`` is forwarded as sent; the Context Manager decides who may see it.
     """
     options: dict[str, Any] = {}
 
@@ -269,9 +355,6 @@ def _parse_kb_search_options(body: dict) -> dict[str, Any]:
     forwarded. Neither is supported yet: the Context Manager rejects a non-empty
     filter with 400 rather than return unfiltered chunks as if it had applied it.
     An empty list is accepted and restricts nothing.
-
-    Raises:
-        ContractViolation: A member has the wrong type or is out of range.
     """
     top_k = body.get("topK")
     options: dict[str, Any] = {
@@ -300,10 +383,6 @@ def _parse_graph_traverse_options(body: dict) -> dict[str, Any]:
     when absent. ``direction`` and ``relationshipFilter`` are validated and
     forwarded although the Context Manager does not apply them yet (the model
     documents this), so a malformed value is still a 400 rather than ignored.
-
-    Raises:
-        ValueError: ``startUri`` is absent.
-        ContractViolation: A member has the wrong type or is out of range.
     """
     start_uri = body.get("startUri")
     if start_uri is None or start_uri == "":
@@ -344,9 +423,6 @@ def _parse_describe_schema_query(query: dict) -> dict[str, str]:
     Query-string values always arrive as strings, so the booleans and integers
     are parsed here. The camelCase (Smithy wire) names are kept: the
     ontology-api-proxy's per-path alias table renames them for FastAPI.
-
-    Raises:
-        ContractViolation: A parameter is malformed or out of range.
     """
     forwarded: dict[str, str] = {}
     include_properties = query.get("includeProperties")
@@ -365,9 +441,6 @@ def _parse_describe_schema_query(query: dict) -> dict[str, str]:
             )
         )
     return forwarded
-
-
-# ── Route handlers ───────────────────────────────────────────────────────────
 
 
 def _handle_query(namespace: str, event: dict) -> dict:
@@ -513,18 +586,11 @@ def _handle_describe_schema(namespace: str, event: dict) -> dict:
         return _error_response(501, "DescribeSchema unavailable: ONTOLOGY_PROXY_LAMBDA_ARN not configured")
 
     query = event.get("queryStringParameters") or {}
-    # camelCase (Smithy wire form) → forward as-is; the ontology-api-proxy's
-    # per-path alias table renames them to snake_case for FastAPI binding.
     try:
         forwarded_query = _parse_describe_schema_query(query)
     except contract.ContractViolation as exc:
         return _error_response(400, str(exc))
 
-    # Send the canonical Smithy path (``/namespaces/{namespaceId}/schema``); the
-    # ontology-api-proxy's alias table renames it to the FastAPI ``/graph/schema``
-    # route. Both this handler and MCP's ``discovery.describe_schema`` now use
-    # the same path, so the legacy ``/graph/schema`` alias in the api-proxy can
-    # be retired once no caller depends on it.
     proxy_event = {
         "httpMethod": "GET",
         "resource": DESCRIBE_SCHEMA_RESOURCE,
@@ -537,12 +603,7 @@ def _handle_describe_schema(namespace: str, event: dict) -> dict:
         "requestContext": {"stage": "data-layer"},
     }
 
-    # boto3's Lambda invoke raises on throttling, permissions failures,
-    # invalid function names, and connect/read timeouts. Left unhandled these
-    # bubble up to the top-level ``except Exception`` in ``handler`` and come
-    # back as "Context Manager invocation failed" — misleading, since CM was
-    # never in the path. Map them to a 502 with a stable message; the full
-    # error is logged so operators can still diagnose.
+    # Map invoke failures to a 502 naming the schema backend, not the Context Manager.
     try:
         response = _get_lambda_client().invoke(
             FunctionName=ONTOLOGY_PROXY_LAMBDA_ARN,
@@ -554,10 +615,7 @@ def _handle_describe_schema(namespace: str, event: dict) -> dict:
         return _error_response(502, "Failed to invoke schema backend Lambda")
 
     if "FunctionError" in response:
-        # The Lambda payload from a FunctionError contains a Python traceback
-        # or a modelled error — either can carry ARNs, request IDs, or line
-        # numbers that shouldn't reach the customer. Log the truncated
-        # payload for operators and return a generic message.
+        # The payload can carry ARNs and tracebacks: log a preview, return a generic message.
         err_preview = response["Payload"].read().decode("utf-8", errors="replace")[:500]
         logger.warning(
             "describe_schema_function_error function_error=%s request_id=%s err_preview=%s",
@@ -567,13 +625,10 @@ def _handle_describe_schema(namespace: str, event: dict) -> dict:
         )
         return _error_response(502, "Schema backend failed")
 
-    # An invoke that succeeded at the Lambda control-plane level can still
-    # return a body that isn't valid JSON (e.g. the proxy Lambda crashed
-    # inside its handler wrapper). Catch that here so we produce a 502 with
-    # a stable message rather than the router's generic "invocation failed".
+    # A successful invoke can still return a non-JSON payload.
     try:
         proxy_response = json.loads(response["Payload"].read().decode("utf-8"))
-    except (json.JSONDecodeError, ValueError, UnicodeDecodeError) as exc:
+    except ValueError as exc:
         logger.warning("describe_schema_invalid_envelope", exc_info=exc)
         return _error_response(502, "Schema backend returned invalid JSON")
 
@@ -589,10 +644,7 @@ def _handle_describe_schema(namespace: str, event: dict) -> dict:
         message = body.get("message") if isinstance(body, dict) else None
         return _error_response(status_code, message or f"Schema backend returned {status_code}")
 
-    # Shape the response to match the Smithy DescribeSchema output. The
-    # ontology-engine already returns ``classes`` and ``ontologyVersion`` in
-    # the right shape; project them explicitly so a future backend change can't
-    # leak internal fields into the customer-visible response.
+    # Project only the modelled fields so backend changes cannot leak internal ones.
     return _success_response(
         200,
         {
@@ -601,8 +653,6 @@ def _handle_describe_schema(namespace: str, event: dict) -> dict:
         },
     )
 
-
-# ── Main handler ─────────────────────────────────────────────────────────────
 
 # Error types the Context Manager itself emits (``coa_serve.exceptions`` plus the
 # entrypoint's own validation/internal errors). An HTTP error body carrying one of
@@ -672,7 +722,15 @@ def handler(event: dict, context) -> dict:
     route_handler = _ROUTE_MAP.get((method, resource))
     if not route_handler:
         return _error_response(501, f"Not implemented: {method} {resource}")
+    token = _cm_call_deadline.set(time.monotonic() + _cm_call_budget_s(event, context))
+    try:
+        return _dispatch(route_handler, namespace, event)
+    finally:
+        _cm_call_deadline.reset(token)
 
+
+def _dispatch(route_handler: Callable[[str, dict], dict], namespace: str, event: dict) -> dict:
+    """Run ``route_handler`` and map Context Manager transport errors to client-safe responses."""
     try:
         return route_handler(namespace, event)
     except HTTPError as e:
@@ -681,21 +739,16 @@ def handler(event: dict, context) -> dict:
         msg, error = _client_safe_upstream_error(resp_body, e.code)
         return _error_response(e.code, msg, **({"error": error} if error else {}))
     except URLError as e:
-        # A urlopen timeout (the 29s REST budget in _invoke_context_manager) surfaces
-        # as URLError whose .reason is a socket timeout. Distinguish it from a genuine
-        # connectivity failure: the request did reach the Context Manager and is likely
-        # still running server-side (e.g. Tier-3 synthesis routinely needs 20-90s),
-        # it just cannot fit the hard 29s API Gateway ceiling. Return a diagnosable 504
-        # naming the streaming path rather than a misleading 502 "cannot reach", so a
-        # builder does not chase a phantom connectivity/timeout bug.
+        # A urlopen timeout means the REST budget was exceeded; it is not a connectivity failure.
         if isinstance(e.reason, TimeoutError):
+            logger.warning("context_manager_rest_deadline_exceeded cause=socket timeout (%s)", e.reason)
             return _rest_deadline_exceeded()
         # ``reason`` names the endpoint host and the socket error; log it, don't return it.
         logger.warning("context_manager_unreachable reason=%s", e.reason)
         return _error_response(502, "Cannot reach Context Manager")
-    except TimeoutError:
-        # A read timeout (the response did not arrive within the budget) is raised by
-        # urlopen as a bare TimeoutError, not wrapped in URLError like a connect timeout.
+    except TimeoutError as e:
+        # Budget spent before the call, wall-clock wait expired, or a read timed out (bare TimeoutError).
+        logger.warning("context_manager_rest_deadline_exceeded cause=%s", e)
         return _rest_deadline_exceeded()
     except Exception as e:
         logger.exception("context_manager_invocation_failed")

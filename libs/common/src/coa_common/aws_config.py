@@ -4,9 +4,7 @@
 """Shared retry/timeout policy for outbound clients.
 
 Single source of truth for the retry and socket-timeout configuration applied
-to AWS SDK (boto3) clients and non-boto3 HTTP clients, per Amazon's
-Timeouts/Retries/Jitter best practices:
-https://w.amazon.com/index.php/Services/TimeoutsAndRetries
+to AWS SDK (boto3) clients and non-boto3 HTTP clients.
 
 - Synchronous customer-path calls fail fast and retry at most once.
 - Asynchronous/background calls use capped exponential backoff with jitter.
@@ -51,9 +49,7 @@ def sync_boto_config(
 
 # --- Non-boto3 HTTP client policy -------------------------------------------
 
-SYNC_HTTP_CONNECT_TIMEOUT = 2.0
 SYNC_HTTP_READ_TIMEOUT = 8.0
-ASYNC_HTTP_CONNECT_TIMEOUT = 2.0
 ASYNC_HTTP_READ_TIMEOUT = 30.0
 
 
@@ -81,11 +77,6 @@ class RetryPolicy:
     attempts: int
     base_delay: float
     max_delay: float
-
-    @classmethod
-    def for_sync(cls) -> RetryPolicy:
-        """Fail-fast preset for synchronous customer-path retries (1 retry, tight backoff)."""
-        return cls(attempts=2, base_delay=0.1, max_delay=1.0)
 
     @classmethod
     def for_async(cls) -> RetryPolicy:

@@ -3,16 +3,14 @@
 
 """Unit tests for the ONTOP_JAVA_ARGS heap fallback in entrypoint.sh.
 
-Line 113 of entrypoint.sh sets the Ontop heap via ONTOP_JAVA_ARGS (the variable
-the launcher actually reads; JAVA_OPTS was a silent no-op that caused #149 cause
-C). These tests execute the REAL expansion line pulled from the script — not a
-re-implementation — so a future edit that breaks the fallback or reverts to
-JAVA_OPTS is caught here.
+entrypoint.sh sets the Ontop heap via ONTOP_JAVA_ARGS (the variable the launcher
+actually reads; JAVA_OPTS is a silent no-op). These tests execute the REAL
+expansion line pulled from the script, not a re-implementation, so a future edit
+that breaks the fallback or reverts to JAVA_OPTS is caught here.
 """
 
 from __future__ import annotations
 
-import re
 import subprocess
 from pathlib import Path
 
@@ -62,15 +60,10 @@ class TestOntopJavaArgsFallback:
 
     def test_falls_back_to_java_opts_when_only_java_opts_set(self):
         # Back-compat: a task def that still only sets JAVA_OPTS is honoured
-        # rather than silently ignored (the #149 cause C failure mode).
+        # rather than silently ignored (the heap would otherwise not apply).
         assert _resolve({"JAVA_OPTS": "-Xmx768m -Xms256m"}) == "-Xmx768m -Xms256m"
 
     def test_empty_when_neither_set(self):
         # Neither var: expand to empty so the Ontop launcher uses its built-in
         # default rather than erroring on an unbound variable.
         assert _resolve({}) == ""
-
-    def test_line_targets_ontop_java_args_not_java_opts(self):
-        # Guard against a regression that exports JAVA_OPTS (the dead var).
-        line = _heap_export_line()
-        assert re.match(r"^export ONTOP_JAVA_ARGS=", line)

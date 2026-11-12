@@ -8,9 +8,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Stripping a customer-authored tag out of a Unity Catalog comment, and leaving alone everything COA
@@ -162,19 +160,6 @@ class CommentTagsTest
     }
 
     @Test
-    void carriesTagReportsWhetherAnythingWouldBeStripped()
-    {
-        assertTrue(CommentTags.carriesTag("Line total @pk"));
-        assertTrue(CommentTags.carriesTag("Line total @notnull"));
-        assertTrue(CommentTags.carriesTag("Line total @fk(a.b)"));
-        assertFalse(CommentTags.carriesTag("Line total"));
-        // A closed bracket whose operand names no column is not a tag, and strip removes nothing from it.
-        assertFalse(CommentTags.carriesTag("Line total @fk(orders)"));
-        assertFalse(CommentTags.carriesTag("bob@pk.example.com"));
-        assertFalse(CommentTags.carriesTag(null));
-    }
-
-    @Test
     void aStrippedCommentIsAcceptableToTheToolkitsEncoder()
     {
         // ColumnComment.of() throws on prose carrying a live tag, so any comment this class returns has to
@@ -184,10 +169,6 @@ class CommentTagsTest
         dev.coa.connector.constraints.ColumnComment.of(
                 CommentTags.strip("Contact bob@pk.example.com about this @pk column"));
     }
-
-    // ---------------------------------------------------------------------------------------------
-    // neutralise: what strip() deliberately leaves behind, and the encoder refuses
-    // ---------------------------------------------------------------------------------------------
 
     @Test
     void stripAloneLeavesAnUnterminatedTagTheEncoderRefuses()

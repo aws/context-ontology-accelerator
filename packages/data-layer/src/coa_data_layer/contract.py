@@ -3,20 +3,11 @@
 
 """Runtime enforcement of the bounds declared in ``serve.smithy``.
 
-Nothing validates a data-plane request against the Smithy model before it reaches
-this Lambda: API Gateway has no request validator on these routes and the handler
-parses ``body`` by hand. Each bound below is therefore the only place the
-contract is actually enforced, so a value outside it is REJECTED with a 400
-rather than clamped or forwarded — a clamped value is a silent rewrite of what
-the caller asked for, and a forwarded one reaches serve unchecked.
-
+Nothing upstream validates a data-plane request against the Smithy model, so a
+value outside a bound is rejected with a 400, never clamped or forwarded.
 Every constant mirrors one trait in ``models/src/main/smithy/serve.smithy``;
-``tests/unit/test_contract_bounds.py`` parses the model and fails if they drift.
-Change the model first, then the constant here.
-
-Error messages name the field and the accepted range but never echo the rejected
-value: it is unbounded, caller-controlled input, and reflecting it back would
-serialize whatever arrived (a multi-KB string, a nested object) into the response.
+``tests/unit/test_contract_bounds.py`` fails if they drift. Error messages name
+the field and the accepted range but never echo the rejected, caller-controlled value.
 """
 
 from __future__ import annotations
@@ -25,7 +16,6 @@ import math
 import re
 from typing import Any
 
-# ── Query ────────────────────────────────────────────────────────────────────
 # ``tierOverride``: @range(min: 1, max: 3)
 QUERY_TIER_OVERRIDE_MIN = 1
 QUERY_TIER_OVERRIDE_MAX = 3
@@ -47,7 +37,6 @@ DIMENSION_NAME_MAX_LENGTH = 256
 DIMENSION_VALUE_MAX_LENGTH = 4000
 DIMENSION_OPERATORS: frozenset[str] = frozenset({"="})
 
-# ── KBSearch ─────────────────────────────────────────────────────────────────
 # ``topK``: @range(min: 1, max: 100). The default applies when the field is absent.
 KB_SEARCH_TOP_K_MIN = 1
 KB_SEARCH_TOP_K_MAX = 100
@@ -63,7 +52,6 @@ FILTER_VALUE_LIST_MAX_ITEMS = 50
 FILTER_VALUE_MIN_LENGTH = 1
 FILTER_VALUE_MAX_LENGTH = 2048
 
-# ── GraphTraverse ────────────────────────────────────────────────────────────
 # ``startUri``: TraversalStartUri @length(min: 1, max: 2048) + @pattern. The
 # pattern is the model's, character for character, and is applied as a full match.
 GRAPH_TRAVERSE_START_URI_MIN_LENGTH = 1
@@ -80,9 +68,7 @@ GRAPH_TRAVERSE_MAX_RESULTS_DEFAULT = 100
 # ``direction``: enum TraversalDirection
 GRAPH_TRAVERSE_DIRECTIONS: frozenset[str] = frozenset({"outgoing", "incoming", "both"})
 GRAPH_TRAVERSE_DIRECTION_DEFAULT = "both"
-# ``relationshipFilter``: FilterValueList (bounds above).
 
-# ── DescribeSchema ───────────────────────────────────────────────────────────
 # ``maxResults`` (query string): @range(min: 1, max: 1000)
 DESCRIBE_SCHEMA_MAX_RESULTS_MIN = 1
 DESCRIBE_SCHEMA_MAX_RESULTS_MAX = 1000
@@ -212,18 +198,9 @@ def _is_dimension_value(value: Any) -> bool:
 def require_dimensions(value: Any) -> list[dict[str, Any]] | dict[str, Any]:
     """Return ``value`` if it is a ``DimensionFilterList`` within the model's bounds.
 
-    Each entry needs a ``name`` (1-256 characters, not blank) and a scalar ``value``:
-    a string of at most 4000 characters, a finite number, or a boolean. Numbers and
-    booleans are accepted for parity with the Context Manager, which binds them as
-    typed SQL literals; ``null``, objects, arrays, NaN and infinities are rejected.
-    ``operator`` is optional: absent, blank, or ``=`` (after trimming) all mean
-    equality, the only operator the SQL templates can express; anything else is
-    rejected. Names must be unique case-insensitively: the list is folded into a
-    ``{name: value}`` mapping downstream, which would otherwise keep one of two
-    filters on the same dimension and silently drop the other.
-
-    A ``{name: value}`` object — the pre-normalized form this handler accepted
-    before the list shape was enforced — is still accepted, under the same bounds.
+    Each entry needs a non-blank ``name`` and a scalar ``value`` (string, finite number or
+    boolean). ``operator`` may be absent, blank or ``=``. Names are unique case-insensitively.
+    A ``{name: value}`` object is also accepted under the same bounds.
     """
     entries: list[tuple[Any, Any]]
     if isinstance(value, dict):

@@ -150,8 +150,6 @@ public class ExampleMetadataHandler extends CoaMetadataHandler
                         .describedAs("When the order was placed"))
                 .build());
 
-        // Composite primary key (order_id, line_no), and order_id is also a foreign key — so it
-        // carries both declarations.
         tables.put("order_lines", CoaTable.named("order_lines")
                 .column(CoaColumn.of("order_id", Types.MinorType.BIGINT.getType())
                         .describedAs("Order this line belongs to")
@@ -166,8 +164,6 @@ public class ExampleMetadataHandler extends CoaMetadataHandler
                         .describedAs("Units ordered on this line"))
                 .build());
 
-        // The composite-foreign-key child: one declaration per participating column, each naming
-        // its own parent column. Two columns, two declarations — never one listing both.
         tables.put("shipment_lines", CoaTable.named("shipment_lines")
                 .column(CoaColumn.of("shipment_line_id", Types.MinorType.BIGINT.getType())
                         .describedAs("Surrogate key for the shipped line")
@@ -182,8 +178,6 @@ public class ExampleMetadataHandler extends CoaMetadataHandler
                         .describedAs("When the line shipped"))
                 .build());
 
-        // The spill driver. Its shape is fixed; only how many rows and how wide they are comes from
-        // the environment, which is a row concern — see ExampleCatalog.
         tables.put("bulk_rows", CoaTable.named("bulk_rows")
                 .column(CoaColumn.of("row_id", Types.MinorType.BIGINT.getType())
                         .describedAs("Sequential row number")

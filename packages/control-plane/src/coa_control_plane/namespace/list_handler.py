@@ -44,9 +44,6 @@ _TABLE_KEY_ATTRS = ("PK", "SK")
 _INVALID_TOKEN = "Invalid nextToken"
 
 
-# ── Pydantic input models ─────────────────────────────────────────
-
-
 class ListNamespacesParams(BaseModel):
     """Validated query string parameters."""
 
@@ -85,24 +82,12 @@ class AuthorizerContext(BaseModel):
         return v or []
 
 
-# ── Handler ───────────────────────────────────────────────────────
-
-
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG001
     """List namespaces visible to the authenticated caller.
 
     Callers with a built-in cross-namespace role see every namespace; others
     see only namespaces where they hold a scoped role assignment. Rejects
     non-GET methods.
-
-    Args:
-        event: API Gateway proxy event with authorizer-populated caller
-            context.
-        context: Lambda context object (unused).
-
-    Returns:
-        An API Gateway proxy response: 200 with the visible namespaces, 405 for
-        a disallowed method, or a 5xx error response.
     """
     logger.info("list_namespaces", path=event.get("path"), method=event.get("httpMethod"))
 
@@ -163,9 +148,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
         return api_response(500, {"message": "Internal server error"})
 
 
-# ── Pagination tokens ─────────────────────────────────────────────
-
-
 def _decode_scan_token(token: str | None) -> dict[str, str] | None:
     """The scan resume key in ``token`` (None for the first page); ValueError if malformed."""
     if not token:
@@ -191,9 +173,6 @@ def _decode_offset_token(token: str | None) -> int:
     return int(raw)
 
 
-# ── Data access ───────────────────────────────────────────────────
-
-
 def _list_all(
     ns_dao: DynamoDBDAO,
     limit: int,
@@ -203,17 +182,8 @@ def _list_all(
 
     Loops the scan until we collect `limit` items or exhaust the table.
 
-    A single DynamoDB Scan page can return MORE matching items than the
-    caller's `limit` (that's the point of over-fetching with `limit * 3`).
-    When that happens, the inner loop breaks early, but the *scan itself*
-    may already be exhausted (``result.last_evaluated_key`` is ``None``)
-    even though the current page still has leftover, un-returned items
-    past the truncation point. Relying on ``last_evaluated_key`` alone in
-    that case drops those leftover items silently (no way for the caller
-    to ever see them). Instead, whenever the inner loop truncates early,
-    synthesize the next token from the DynamoDB key of the last item we
-    actually returned, so the next call resumes the SAME scan page from
-    there rather than skipping straight to (a nonexistent) subsequent page.
+    When a page is truncated mid-way, the next token is built from the key of
+    the last returned item so the next call resumes inside the same scan page.
     """
     items: list[NamespaceSummary] = []
     last_key = exclusive_start_key
@@ -235,11 +205,6 @@ def _list_all(
                 break
 
         if truncated_mid_page and last_returned_raw_item is not None:
-            # More matching items exist in THIS already-fetched page past
-            # where we stopped — resume from the last item we kept, not
-            # from result.last_evaluated_key (which may be None/exhausted
-            # for the underlying scan even though we still have unreturned
-            # items in hand).
             last_key = {"PK": last_returned_raw_item["PK"], "SK": last_returned_raw_item["SK"]}
             break
 
@@ -290,10 +255,7 @@ def resolve_accessible_namespace_ids(
     user_id: str,
     groups: list[str],
 ) -> set[str]:
-    """Query PrincipalIndex for all namespace IDs accessible to a user.
-
-    Reusable by other handlers that need to scope queries to visible namespaces.
-    """
+    """Query PrincipalIndex for all namespace IDs accessible to a user."""
     principal_keys = [f"{PrincipalType.USER}::{sanitize_principal_key(user_id)}"]
     principal_keys.extend(f"{PrincipalType.GROUP}::{sanitize_principal_key(g)}" for g in groups)
 

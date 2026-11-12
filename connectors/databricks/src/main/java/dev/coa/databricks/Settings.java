@@ -28,10 +28,8 @@ public final class Settings
     public static final String CONFIG_SOURCE_VAR = "DATABRICKS_CONFIG_SOURCE";
 
     /**
-     * Rows one table may return before the connector fails with an error naming it. A ceiling exists
-     * because federation cannot express aggregation: a {@code GROUP BY} reads every predicate-matching
-     * row out of the warehouse for Athena to aggregate. At 3008 MB, a table well past this ceiling
-     * exhausts the invocation, and neither an out-of-memory nor a timeout says which table was too big.
+     * Rows one table may return before the connector fails with an error naming it; see
+     * {@link RowCeilingSpiller}.
      */
     public static final String MAX_ROWS_PER_TABLE_VAR = "DATABRICKS_MAX_ROWS_PER_TABLE";
 
@@ -87,12 +85,6 @@ public final class Settings
      * <p>Public because the mode switch reads two variables that are neither operational settings nor
      * connection coordinates, and reading them by any other route would apply a different
      * case-sensitivity rule to them than to everything else this connector reads.
-     *
-     * <p><b>The CDK app's own {@code optionalEnv} is case-SENSITIVE, and the asymmetry is deliberate
-     * rather than an oversight.</b> The two read different things: that one reads a deployer's shell, where
-     * a variable is typed by hand and a case-insensitive match would silently accept
-     * {@code databricks_catalog} as a synonym it never documented; this one reads the Lambda's own
-     * environment, which CDK writes in full and in one case.
      */
     public static String lookUp(Map<String, String> environment, String name)
     {

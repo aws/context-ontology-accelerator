@@ -428,7 +428,7 @@ current revision unchanged. Keep grounding-choice changes in a separate
 | **Induce** | Auto-generate from database source schemas or from the document lexical graph |
 | **Upload** | Import a Turtle, RDF/XML or JSON-LD file: get a pre-signed URL with **GetOntologyUploadUrl**, upload the file, then call **IngestOntologyFromS3** |
 | **Fetch** | Re-fetch an already registered ontology from its source URL (**FetchOntology**; `404` if it isn't registered) |
-| **Change** | An accepted ontology cannot be edited in place. Edit a proposal before you accept it, or re-induce and accept the new proposal (see "Curating an ontology: re-induce and re-accept" below); for an uploaded or fetched ontology, delete it and import the corrected file |
+| **Change** | An accepted ontology cannot be edited in place. Edit a proposal before you accept it, or re-induce and accept the new proposal (for an unchanged schema, delete the ontology first; see "Curating an ontology: re-induce and re-accept" below); for an uploaded or fetched ontology, delete it and import the corrected file |
 | **Validate** | Run consistency + quality checks on a proposal before accepting, including datatype checks (see "Validating and repairing datatype issues" below) |
 | **Delete** | Remove an ontology's graph triples, vector embeddings, and registry entry from the namespace (see "Deleting ontologies" below) |
 
@@ -441,6 +441,20 @@ get curated text into an accepted ontology, **re-induce the source and accept
 the new proposal into the same ontology**. Accepting a proposal into an
 ontology that already exists is an *append*: the new proposal is merged into
 the existing graph.
+
+!!! warning "An unchanged schema creates no new proposal"
+    Re-inducing a source whose tables and columns have not changed creates no
+    new proposal: the console reports that an accepted proposal already has the
+    same structure, and an accepted proposal cannot be edited. Edited
+    descriptions or synonyms alone do not count as a change. To get them into
+    the ontology, either:
+
+    - **Delete the ontology and induce again** (Explorer → Ontologies →
+      **Delete ontology**). The new proposal carries the current metadata,
+      including edits made after the source was approved. Deleting the
+      ontology also removes the classes that other sources accepted into it,
+      so re-induce and re-accept those sources too.
+    - **Induce into a new namespace** and accept the proposal there.
 
 What happens to the class or property you curated:
 
@@ -460,11 +474,11 @@ replaces: the model that answers questions sees one definition, not two.
     the suggestions are saved too. Use **Clear all** in the synonyms field to
     start from an empty, authored list — saving replaces the whole list.
 
-!!! warning "Curate before you approve the source"
-    Today a metadata edit made *after* the source is approved is saved and
-    shown, but does not reach the next induction. Edit descriptions and
-    synonyms while the source is still in review, then approve, then induce.
-    Propagating post-approval edits is tracked separately.
+!!! tip "Curate before the first induction"
+    Edit descriptions and synonyms while the source is still in review, then
+    approve, then induce. An edit made after the source is approved is saved
+    and reaches the next induction too, but for an unchanged schema that next
+    induction needs the ontology deleted first (see above).
 
 ## Re-scanning and re-induction
 
@@ -513,6 +527,12 @@ asynchronously: the ontology stays listed as **Delete in progress** until the
 graph and embeddings are actually clean, then the row disappears. Deleting an
 ontology also removes the proposals tied to it (those that fed into it and those
 grounded against it).
+
+Each API request deletes one ontology, named by its full IRI in the
+`ontology_id` query parameter. A request with a missing, empty or blank
+`ontology_id`, or one that sends `ontologyId`, is rejected with `400`. To remove every ontology
+in a namespace, delete the namespace (see
+[Deleting a Namespace](namespaces.md#deleting-a-namespace)).
 
 **Reversibility depends on the ontology type:**
 

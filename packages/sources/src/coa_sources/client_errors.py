@@ -15,6 +15,7 @@ and drops the internals. The full exception is still logged at the failure site.
 
 from __future__ import annotations
 
+import os
 import re
 
 from botocore.exceptions import BotoCoreError, ClientError
@@ -25,6 +26,22 @@ MAX_CLIENT_ERROR_CHARS = 500
 GENERIC_FAILURE = "The operation failed; see the service logs for details."
 
 _ARN_RE = re.compile(r"\barn:aws[a-z-]*:[^\s'\"`,;)\]}]+")
+# The service's own buckets (staging, batch, spill) must never reach a caller; a trailing period ends the sentence.
+_S3_URI_RE = re.compile(r"\bs3://[^\s'\"`,;)\]}]*[^\s'\"`,;)\]}.]")
+# S3 https URLs, path-style and virtual-hosted, whose path or host names the bucket.
+_S3_HTTPS_RE = re.compile(
+    r"\bhttps?://(?:[a-z0-9.-]+\.)?s3[.-][a-z0-9.-]*amazonaws\.com(?:\.cn)?(?:/[^\s'\"`,;)\]}]*[^\s'\"`,;)\]}.])?", re.I
+)
+# A bucket named in prose. The name must end there, so a tag key such as "tag the bucket my-coa:namespace=..." is
+# kept, while "bucket my-bkt: Access Denied" is not.
+_BUCKET_PHRASE_RE = re.compile(
+    r"\b(bucket)\s+['\"`]?(?P<name>[a-z0-9][a-z0-9.-]{1,61}[a-z0-9])['\"`]?(?![\w=-]|[.:]\w)",
+    re.I,
+)
+# A bucket name has a letter and a "-", "." or digit, so "bucket policy" and "bucket does not exist" are left alone.
+_BUCKET_NAME_SHAPE_RE = re.compile(r"(?=.*[a-z])(?=.*[-.0-9])", re.I)
+# Environment variables that name the service's own buckets in the sources Lambdas and tasks.
+_SERVICE_BUCKET_ENV = ("BUCKET_NAME", "ATHENA_SPILL_BUCKET")
 # A UUID is matched first, as its own alternative, so the account-id rule never
 # fires on a UUID whose last group happens to be twelve digits.
 _ACCOUNT_RE = re.compile(
@@ -59,11 +76,23 @@ def _keep_uuid(match: re.Match[str]) -> str:
     return match.group("uuid") or "<account>"
 
 
+def _redact_bucket_phrase(match: re.Match[str]) -> str:
+    if _BUCKET_NAME_SHAPE_RE.match(match.group("name")):
+        return f"{match.group(1)} <bucket>"
+    return match.group(0)
+
+
 def _redacted_or_empty(text: str) -> str:
     """:func:`redact` without the generic fallback: ``""`` when nothing safe is left."""
     if any(marker in text for marker in _TRACEBACK_MARKERS):
         return ""
+    text = _S3_URI_RE.sub("<s3-uri>", text)
+    text = _S3_HTTPS_RE.sub("<s3-uri>", text)
+    # Before the account rule, which would rewrite an account id inside a bucket name.
+    for bucket in filter(None, (os.environ.get(var, "") for var in _SERVICE_BUCKET_ENV)):
+        text = text.replace(bucket, "<bucket>")
     text = _ARN_RE.sub("<arn>", text)
+    text = _BUCKET_PHRASE_RE.sub(_redact_bucket_phrase, text)
     text = _AWS_HOST_RE.sub("<aws-endpoint>", text)
     text = _ACCOUNT_RE.sub(_keep_uuid, text)
     text = text.strip()
@@ -73,7 +102,7 @@ def _redacted_or_empty(text: str) -> str:
 
 
 def redact(text: str, *, client_safe: bool = False) -> str:
-    """Strip ARNs, account ids and AWS hostnames from ``text`` and bound its length.
+    """Strip ARNs, S3 locations, service bucket names, account ids and AWS hostnames from ``text``; bound its length.
 
     A traceback is never returned: it is replaced by :data:`GENERIC_FAILURE`.
     ``client_safe=True`` marks text written from a :class:`ClientSafeError`

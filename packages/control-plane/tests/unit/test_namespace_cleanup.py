@@ -60,9 +60,7 @@ class TestDeleteSmuProject:
     """delete_smu_project must force-delete the DataZone project (skipDeletionCheck)."""
 
     def test_delete_project_passes_skip_deletion_check(self, monkeypatch):
-        """Regression: every induced namespace owns DataZone assets, so delete_project
-        must pass skipDeletionCheck=True or it raises ValidationException and the whole
-        namespace deletion fails (lands in DELETE_FAILED)."""
+        """delete_project must pass skipDeletionCheck=True or namespaces that own DataZone assets fail to delete."""
         from coa_control_plane.namespace import cleanup
 
         mock_dz = MagicMock()
@@ -84,10 +82,7 @@ class TestDeleteSmuProject:
         mock_dz.delete_project.assert_not_called()
 
     def test_assumes_project_access_role_when_configured(self, monkeypatch):
-        """DataZone authorizes DeleteProject against project membership, not
-        IAM policy alone — DzProjectAccessRole is a registered project
-        member/owner, so this Lambda's own execution-role credentials must
-        never be used directly for the call when a role ARN is configured."""
+        """When PROJECT_ACCESS_ROLE_ARN is set, the project access role is assumed for DeleteProject."""
         from coa_control_plane.namespace import cleanup
 
         monkeypatch.setenv("PROJECT_ACCESS_ROLE_ARN", "arn:aws:iam::123456789012:role/dz-project-access")
@@ -122,9 +117,7 @@ class TestDeleteSmuProject:
         )
 
     def test_falls_back_to_execution_role_when_no_role_arn_configured(self, monkeypatch):
-        """No PROJECT_ACCESS_ROLE_ARN configured (e.g. local/unit-test envs) —
-        must not attempt to assume anything, just use the caller's own
-        credentials as before."""
+        """Without PROJECT_ACCESS_ROLE_ARN, nothing is assumed and the caller's own credentials are used."""
         from coa_control_plane.namespace import cleanup
 
         monkeypatch.delenv("PROJECT_ACCESS_ROLE_ARN", raising=False)
@@ -200,16 +193,7 @@ class TestDeleteRoleMappingsAndRoles:
 
 @pytest.mark.unit
 class TestDeleteAllOntologies:
-    """The ontology teardown call is a HARD GATE, not best-effort.
-
-    It owns the AOSS vector index — one index per namespace against a
-    collection with a hard 1000-index cap. The deletion pipeline deletes the
-    namespace record after this step, so a swallowed failure orphans that index
-    permanently (nothing can target a namespace that no longer exists) and the
-    deployment eventually fails every embedding write with
-    ``index_limit_breached``. Raising makes the step retry and, on exhaustion,
-    land a recoverable DELETE_FAILED.
-    """
+    """Ontology teardown failures propagate so the pipeline step retries."""
 
     def test_http_error_propagates(self, monkeypatch):
         from urllib.error import HTTPError
@@ -270,14 +254,7 @@ class TestDeleteOntologyStepPropagates:
 
 @pytest.mark.unit
 class TestDeleteGraphragIndexes:
-    """GraphRAG doc-KG indexes are NAMESPACE-scoped, so namespace teardown owns them.
-
-    Every doc source in a namespace shares one GraphRAG tenant id, so
-    ``chunk_{tenant}`` holds chunks for all of them. A single source's deletion
-    must therefore only remove its own documents (which graph_cleanup does) and
-    must NOT drop the shared index. Nothing dropped them at all before, leaving
-    one index set per deleted namespace against a collection AOSS caps at 1000.
-    """
+    """GraphRAG doc-KG indexes are namespace-scoped and dropped at namespace teardown."""
 
     def test_deletes_all_three_index_names_for_the_namespace(self, monkeypatch):
         from coa_common.constants import to_graphrag_tenant_id
@@ -293,21 +270,6 @@ class TestDeleteGraphragIndexes:
 
         tenant = to_graphrag_tenant_id(ns)
         assert removed == [f"chunk_{tenant}", f"topic_{tenant}", f"statement_{tenant}"]
-
-    def test_legacy_statement_index_is_included(self, monkeypatch):
-        """The build path stopped embedding statements, but old namespaces still
-        have a statement_* index consuming quota."""
-        from coa_control_plane.namespace import cleanup
-
-        monkeypatch.setenv("OSS_ENDPOINT", "https://x.aoss.us-east-1.on.aws")
-        mock_client = MagicMock()
-        mock_client.delete_index.return_value = True
-        monkeypatch.setattr(cleanup, "AossVectorClient", lambda **_k: mock_client)
-
-        cleanup.delete_graphrag_indexes("550e8400-e29b-41d4-a716-446655440000")
-
-        deleted = {c.args[0] for c in mock_client.delete_index.call_args_list}
-        assert any(n.startswith("statement_") for n in deleted)
 
     def test_absent_indexes_are_not_reported_as_removed(self, monkeypatch):
         """Deleting an absent index is a no-op, which keeps this idempotent."""

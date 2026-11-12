@@ -188,11 +188,8 @@ already emits, as three tags COA parses out and strips:
 ```
 
 COA's parser is the other side of this format, and nothing here can validate a tag you write
-by hand. That is the reason not to write one: the failure mode for a malformed tag is that COA
-leaves it in the stored description verbatim, because its warning goes to *its own* logs, not
-yours.
-
-Which is why you should not hand-write them. `ColumnComment`
+by hand. A malformed tag is left in the stored description verbatim, because COA's warning goes
+to *its own* logs, not yours. Do not hand-write them. `ColumnComment`
 (`toolkit/src/main/java/dev/coa/connector/constraints/ColumnComment.java`) is a
 dependency-free, single-file fluent builder — no Athena SDK, no Arrow, no logging — meant
 to be copied into your own connector:
@@ -243,12 +240,8 @@ public class YourMetadataHandler extends CoaMetadataHandler {
         super("your_source", configOptions);
     }
 
-    // Every method takes the Athena catalog name of the request being served. Ignore it in a
-    // single-source connector, as this one and the example do; it is there because a MULTIPLEXED
-    // connector has no other way to learn which endpoint, credential and configuration a request
-    // wants. Without the parameter the only route would be overriding a doXxx method to stash
-    // request.getCatalogName() in a field — mutable handler state, correct only because the Lambda
-    // runtime serialises invocations per container, and invisible in the signature that needs it.
+    // Every method takes the Athena catalog name of the request. Ignore it in a single-source
+    // connector; a multiplexed connector uses it to pick the endpoint and credential.
 
     @Override
     protected List<String> listDatabases(String catalog) { return List.of("your_db"); }
@@ -533,9 +526,8 @@ roles belong to, so a `dev` and a `prod` deployment under one prefix publish the
 export them: SSM parameters are not readable across accounts, and a connector usually runs in a
 different account from COA.
 
-Both are in COA's account and the connector usually is not, and a cross-account
-principal needs an allow **on both sides** — so the stack puts the connector's half in place
-for each:
+A cross-account principal needs an allow **on both sides**, so the stack puts the connector's
+half in place for each:
 
 - `lambda:InvokeFunction` on the connector, as a Lambda resource policy;
 - `s3:GetObject` under `connectors/{id}/spills/`, as a bucket policy on the connector's own spill
@@ -553,8 +545,7 @@ write. What it matches, and what this stack emits so that it matches:
 | `kms:Decrypt`           | tag `coa:connector-spill = true` on the key                     | that tag, on the CMK      |
 
 Invoke is scoped on the **tag**, not the function name. The `-coa-connector` suffix is a naming
-convention that grants nothing; an earlier COA release matched on the name, and any comment
-claiming the name carries the grant is out of date.
+convention that grants nothing.
 
 The spill grant is matchable per connector — `connectors/example/spills/*` — so onboarding one
 can be an explicit grant rather than something a wildcard already permitted. It is bounded by that
@@ -588,9 +579,6 @@ function ARN from the `ConnectorFunctionArn` output:
 aws athena create-data-catalog --name example --type LAMBDA \
   --parameters function=arn:aws:lambda:<region>:<acct>:function:example-coa-connector
 ```
-
-Catalog names are account-global, so a second deployment of the same connector needs a different
-name from the first.
 
 Then, in Athena:
 
@@ -985,13 +973,9 @@ sits below the 6 MB response cap; 32 MiB is over any value Athena has been obser
     named anything — COA's own resource prefix included — and its spill bucket is readable in
     COA's account on the same terms as in yours.
 
-    Earlier releases differed in both respects, and notes to that effect are out of date. The
-    serve role's `AthenaFederationSpillRead` carried a
-    `StringNotEquals aws:ResourceAccount = <COA's account>` exclusion, and the Athena-invoke
-    `Deny` was scoped to `<COA's prefix>-*` by name, which silently caught any same-account
-    connector named that way. Neither holds now: the spill statement is bounded by the key glob
-    alone, and the `Deny` — `DenyAthenaInvokeOfUntaggedFunctions` — is scoped by the *absence* of
-    the connector tag, so a tagged connector is exempt wherever it sits.
+    The spill statement is bounded by the key glob alone, and the `Deny`
+    (`DenyAthenaInvokeOfUntaggedFunctions`) is scoped by the *absence* of the connector tag, so a
+    tagged connector is exempt wherever it sits.
 
     What is still true, and the reason to prefer cross-account: a same-account request is
     authorised by an allow from *either* the identity or the resource policy rather than needing

@@ -188,8 +188,6 @@ class ConnectionConfigTest
                 failure.getMessage());
     }
 
-    // ── The schema is the one optional coordinate ────────────────────────────
-
     @Test
     void anOmittedSchemaLeavesTheConnectorUnpinned()
     {
@@ -287,7 +285,7 @@ class ConnectionConfigTest
         for (String name : new String[] {
             "sales", "SALES", "  sales  ", "_private", "s1", "sales_eu",
             "sales-eu", "sales eu", "sales;drop", "sales.eu", "1sales", "", "   ", null,
-            "\"quoted\"", "sales`eu", repeat("s", 255), repeat("s", 256)}) {
+            "\"quoted\"", "sales`eu", "s".repeat(255), "s".repeat(256)}) {
             boolean servable = ConnectionConfig.isServableSchemaName(name);
             boolean pinnable;
             try {
@@ -300,15 +298,6 @@ class ConnectionConfigTest
             assertEquals(pinnable, servable,
                     "isServableSchemaName and withSchema disagree about " + name);
         }
-    }
-
-    private static String repeat(String unit, int times)
-    {
-        StringBuilder out = new StringBuilder(unit.length() * times);
-        for (int i = 0; i < times; i++) {
-            out.append(unit);
-        }
-        return out.toString();
     }
 
     @Test

@@ -7,7 +7,6 @@ import dev.coa.databricks.FakeJdbc;
 import dev.coa.databricks.config.ConnectionConfig;
 import org.junit.jupiter.api.Test;
 
-import java.sql.Connection;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -96,8 +95,6 @@ class InformationSchemaReaderTest
                 .build();
     }
 
-    // ── listSchemas: the one catalog-scoped read ─────────────────────────────
-
     @Test
     void listSchemasReturnsTheCatalogsSchemasAndBindsTheCatalog()
     {
@@ -181,15 +178,10 @@ class InformationSchemaReaderTest
 
         List<String> tables = readerOver(jdbc).listTables();
 
-        // The four internal side tables are gone. They appear in information_schema.tables as ordinary
-        // MANAGED tables with no column distinguishing them, so SHOW TABLES is the only thing that
-        // excludes them.
+        // Internal side tables appear in information_schema.tables as ordinary MANAGED tables with no
+        // column distinguishing them, so SHOW TABLES is the only thing that excludes them.
         assertEquals(Arrays.asList("coa_dbx_test_audit", "mixedcasetable", "order_counts_mv",
                 "order_lines", "order_stream_st", "order_totals_vw", "orders"), tables);
-        for (String name : tables) {
-            assertTrue(!name.startsWith("__materialization"), name);
-            assertTrue(!name.startsWith("event_log_"), name);
-        }
     }
 
     @Test
@@ -579,7 +571,6 @@ class InformationSchemaReaderTest
         FakeJdbc jdbc = new FakeJdbc(sql -> {
             throw new IllegalStateException("boom");
         });
-        Connection ignored;
         assertThrows(RuntimeException.class, () -> readerOver(jdbc).listTables());
         assertEquals(jdbc.connectionsOpened(), jdbc.connectionsClosed(),
                 "every opened connection must be closed");

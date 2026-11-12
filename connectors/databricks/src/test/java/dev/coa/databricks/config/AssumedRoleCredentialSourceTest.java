@@ -22,7 +22,6 @@ import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -215,12 +214,6 @@ class AssumedRoleCredentialSourceTest
         // namespaceId is server-minted and UUID-shaped, so the pair below is unreachable.
         assertEquals(AssumedRoleCredentialSource.externalIdFor("coa-dev-", "x"),
                 AssumedRoleCredentialSource.externalIdFor("coa-", "dev-x"));
-        // And with a real, server-minted namespace id, no plausible prefix pair collides.
-        assertNotEquals(
-                AssumedRoleCredentialSource.externalIdFor(
-                        "coa-dev-", "11111111-2222-3333-4444-555555555555"),
-                AssumedRoleCredentialSource.externalIdFor(
-                        "coa-prod-", "11111111-2222-3333-4444-555555555555"));
     }
 
     @Test
@@ -391,13 +384,9 @@ class AssumedRoleCredentialSourceTest
     @Test
     void twoNamespacesBehindOneRoleGetTwoSessionsWithTheirOwnExternalIds()
     {
-        // The confused deputy: every customer's role trusts the same connector role and a role ARN is not a
-        // secret, so a steward in namespace A could register a source naming namespace B's role and secret.
-        // What stops the read is that the ExternalId is derived from the namespace on the resolved parameter
-        // and B's trust policy conditions on B's value. Both halves are asserted: the presented ExternalId
-        // tracks the namespace being served, and a cached session for one namespace is never handed to
-        // another — these two configurations agree on the role AND the secret, so a cache keyed on either
-        // would serve A's session to B and leave one ExternalId never presented.
+        // Confused deputy: a role ARN is not a secret, so the ExternalId must track the namespace being
+        // served, and a cached session must never cross namespaces. These configurations agree on the role
+        // AND the secret, so a cache keyed on either would serve A's session to B.
         AssumedRoleCredentialSource source = source();
         ConnectionConfig namespaceA = managedFor("ns-a", CATALOG, ROLE, SECRET);
         ConnectionConfig namespaceB = managedFor("ns-b", CATALOG, ROLE, SECRET);

@@ -11,9 +11,9 @@ reads) picks one the same way, so a class is not named one thing in a query
 context and another on screen.
 
 The preference comes from the namespace's immutable language, never from the
-request (namespace-language LLD §2.2.5):
+request:
 
-1. the tag COA asserts on generated literals in that namespace (§2.2.4);
+1. the tag COA asserts on generated literals in that namespace;
 2. an untagged literal;
 3. any remaining literal, in deterministic lexical order.
 
@@ -47,7 +47,7 @@ _PREFERRED, _UNTAGGED, _OTHER = 0, 1, 2
 def asserted_language_tag(namespace_language: str) -> str | None:
     """Return the tag COA asserts on generated literals in this namespace.
 
-    This is the shape half of ``languageTagCompatibilityV1`` (LLD §2.2.4): it
+    This is the shape half of ``languageTagCompatibilityV1``: it
     decides which tag a compatible literal would carry, not whether a given
     text is compatible.
 

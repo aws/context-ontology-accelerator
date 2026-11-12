@@ -243,7 +243,7 @@ def _fk(target: str, status: str, *, source: str = EnrichmentSource.AI_INFERRED,
 
 @pytest.mark.unit
 class TestRelationshipCascade:
-    """#1088 follow-up: a review decision on a table must also decide its inferred
+    """A review decision on a table must also decide its inferred
     relationships. Both callers (per-asset handler, bulk worker) go through the
     same function, so ``bulk`` is parametrized rather than tested per caller."""
 
@@ -298,7 +298,7 @@ class TestRelationshipCascade:
 
     @pytest.mark.parametrize("decision", ["APPROVED", "REJECTED"])
     def test_authoritative_relationships_are_never_touched(self, decision):
-        # Deterministic / steward FKs (and pre-#1088 rows) carry no review status;
+        # Deterministic / steward FKs (and older rows) carry no review status;
         # they are not reviewable and the cascade must leave them alone.
         t = _table()
         t.foreign_keys = [

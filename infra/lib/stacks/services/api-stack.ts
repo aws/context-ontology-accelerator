@@ -553,7 +553,23 @@ export class ApiStack extends SCLStack {
       restApiName: this.prefixed("api"),
       description: "Context Ontology Accelerator REST API",
       apiDefinition: apigw.ApiDefinition.fromInline(spec),
-      cloudWatchRole: true,
+      // This role is the region's account-wide API Gateway logging role, so it
+      // repoints every REST API in the region. Set api_gateway_cloudwatch_role=false
+      // to keep a role that is already configured; stage logging needs one.
+      cloudWatchRole: (() => {
+        const raw = String(
+          this.node.tryGetContext("api_gateway_cloudwatch_role") ?? "true",
+        )
+          .trim()
+          .toLowerCase();
+        // A misspelt "false" must not silently repoint the Region's role.
+        if (raw !== "true" && raw !== "false") {
+          throw new Error(
+            `api_gateway_cloudwatch_role must be true or false, got "${raw}"`,
+          );
+        }
+        return raw === "true";
+      })(),
       ...(apiCustomDomain && {
         disableExecuteApiEndpoint: true,
         domainName: {

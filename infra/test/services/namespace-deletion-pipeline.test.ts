@@ -251,6 +251,43 @@ describe("NamespaceDeletionPipeline", () => {
     });
   });
 
+  test("the only CloudWatch Logs grant is DeletePlatformFn deleting the prefixed and legacy VKG log groups", () => {
+    const flat = (v: unknown): string => {
+      if (typeof v === "string") return v;
+      const o = v as { "Fn::Join"?: [string, unknown[]]; Ref?: string };
+      if (o["Fn::Join"]) return o["Fn::Join"][1].map(flat).join(o["Fn::Join"][0]);
+      return o.Ref ? `\${${o.Ref}}` : JSON.stringify(v);
+    };
+    type Statement = { Action: string | string[]; Resource: unknown };
+    type Policy = {
+      Properties: {
+        Roles: { Ref: string }[];
+        PolicyDocument: { Statement: Statement[] };
+      };
+    };
+    const grants = Object.values(
+      template.findResources("AWS::IAM::Policy"),
+    ).flatMap((p) => {
+      const { Roles, PolicyDocument } = (p as Policy).Properties;
+      return PolicyDocument.Statement.filter((st) =>
+        [st.Action].flat().some((a) => a.startsWith("logs:")),
+      ).map((st) => ({
+        role: Roles.map((r) => r.Ref).join(","),
+        actions: [st.Action].flat(),
+        resources: [st.Resource].flat().map(flat),
+      }));
+    });
+    const arn = (name: string) =>
+      `arn:aws:logs:\${AWS::Region}:\${AWS::AccountId}:log-group:${name}`;
+    expect(grants).toEqual([
+      {
+        role: expect.stringMatching(/DeletePlatformFn/),
+        actions: ["logs:DeleteLogGroup"],
+        resources: [arn("/ecs/coa-dev-vkg-*"), arn("/ecs/vkg-*")],
+      },
+    ]);
+  });
+
   test("FinalizeFn is granted TransactWriteItems and DeleteItem on the namespaces table", () => {
     template.hasResourceProperties("AWS::IAM::Policy", {
       PolicyDocument: {

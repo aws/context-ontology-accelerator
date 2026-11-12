@@ -626,6 +626,49 @@ class TestDocumentDetailMetrics:
         assert "chunkOverlap" not in ec
 
 
+_STAGING_URL = "https://coa-staging-123456789012.s3.us-east-1.amazonaws.com/docs/report.pdf"
+_STAGING_URI = "s3://coa-staging-123456789012/docs/report.pdf"
+
+
+@pytest.mark.unit
+class TestDocumentDetailPreprocessingIssues:
+    """Rows written before preprocessing reasons were redacted at write time hold the raw exception text,
+    e.g. an EndpointConnectionError naming the staging bucket's endpoint. GetSource redacts them on read."""
+
+    @pytest.mark.parametrize("stored_as_json", [True, False], ids=["json-string", "list"])
+    @pytest.mark.parametrize(
+        "raw_reason",
+        [
+            f'Could not connect to the endpoint URL: "{_STAGING_URL}"',
+            f"Error processing report.pdf: An error occurred (NoSuchKey) reading {_STAGING_URI}",
+        ],
+        ids=["endpoint-url", "s3-uri"],
+    )
+    def test_historical_reasons_are_redacted_and_filename_and_type_kept(self, raw_reason, stored_as_json):
+        from coa_sources.api.sources_handler import _build_document_detail
+        from coa_sources.client_errors import redact
+
+        issues = [
+            {"filename": "docs/report.pdf", "type": "error", "reason": raw_reason},
+            {"filename": "docs/huge.zip", "type": "skipped", "reason": "File exceeds the 50 MB limit"},
+        ]
+        item = {
+            "sourceType": "DOCUMENTS",
+            "name": "docs",
+            "status": "READY",
+            "preprocessingIssues": json.dumps(issues) if stored_as_json else issues,
+        }
+
+        detail = _build_document_detail(item, None)
+
+        assert detail is not None
+        assert detail["preprocessingIssues"] == [
+            {"filename": "docs/report.pdf", "type": "error", "reason": redact(raw_reason)},
+            {"filename": "docs/huge.zip", "type": "skipped", "reason": "File exceeds the 50 MB limit"},
+        ]
+        assert "coa-staging-123456789012" not in json.dumps(detail)
+
+
 @pytest.mark.unit
 class TestDatabaseDetailEngineProjection:
     """The GET-source database detail surfaces the execution engine.

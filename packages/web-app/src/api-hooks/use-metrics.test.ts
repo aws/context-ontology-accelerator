@@ -17,10 +17,15 @@ import {
 // Mocks
 // ---------------------------------------------------------------------------
 
-const mockPost = vi.fn();
-const mockGet = vi.fn();
-// One client for every render, as the real provider's memoized context gives.
-const apiClient = { post: mockPost, get: mockGet, put: vi.fn(), del: vi.fn() };
+const { mockPost, mockGet, apiClient } = vi.hoisted(() => {
+  const mockPost = vi.fn();
+  const mockGet = vi.fn();
+  return {
+    mockPost,
+    mockGet,
+    apiClient: { post: mockPost, get: mockGet, put: vi.fn(), del: vi.fn() },
+  };
+});
 
 vi.mock("@components/ApiClientProvider", () => ({
   useApiClient: () => apiClient,

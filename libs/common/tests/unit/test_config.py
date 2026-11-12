@@ -38,9 +38,7 @@ class TestSCLConfig:
         assert config.aws_region == "eu-west-1"
 
     def test_aws_region_follows_runtime_environment(self, monkeypatch):
-        """#92 class-of-bug: infra sets AWS_REGION, never SCL_AWS_REGION, so
-        the config default must track the runtime region rather than pin
-        us-east-1."""
+        """Infra sets AWS_REGION, not SCL_AWS_REGION, so the default must follow the runtime region."""
         monkeypatch.delenv("SCL_AWS_REGION", raising=False)
         monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
         monkeypatch.setenv("AWS_REGION", "us-west-2")
@@ -55,12 +53,7 @@ class TestSCLConfig:
 
 @pytest.mark.unit
 class TestResolveRegion:
-    """Tests for the shared resolve_region() helper.
-
-    Covers region-resolution regression scenarios — region resolution must be
-    consistent across all Python services regardless of which region env
-    vars happen to be set in a given environment.
-    """
+    """Tests for the shared resolve_region() helper."""
 
     def test_prefers_aws_region(self, monkeypatch):
         """AWS_REGION takes precedence over AWS_DEFAULT_REGION."""
@@ -86,13 +79,8 @@ class TestResolveRegion:
         monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
         assert resolve_region(default="ap-southeast-2") == "ap-southeast-2"
 
-    def test_empty_aws_region_falls_through(self, monkeypatch):
-        """An empty-string AWS_REGION is still treated as 'set' by os.environ.get.
-
-        This documents current behavior: only unset (missing) vars fall
-        through the chain, not empty strings. Matches the pre-existing
-        Pattern B behavior in config.py/worker.py this helper replaces.
-        """
+    def test_empty_aws_region_is_returned_as_set(self, monkeypatch):
+        """An empty-string AWS_REGION counts as set; only missing vars fall through."""
         monkeypatch.setenv("AWS_REGION", "")
         monkeypatch.setenv("AWS_DEFAULT_REGION", "eu-west-1")
         assert resolve_region() == ""

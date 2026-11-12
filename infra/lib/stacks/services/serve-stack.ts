@@ -456,6 +456,36 @@ export class ServeStack extends SCLStack {
         expirationDuration: cdk.Duration.days(30),
       });
 
+      // serve reads NEPTUNE_TIMEOUT with a bare float() on every Neptune query,
+      // so a bad value must fail synth, not the first request. The ontology
+      // lookup must time out before the tool step does, or it never degrades
+      // to empty. Defaults match the code defaults.
+      const secondsContext = (key: string, fallback: number): number => {
+        const raw: unknown = this.node.tryGetContext(key) ?? fallback;
+        const value = Number(raw);
+        if (!Number.isFinite(value) || value <= 0) {
+          throw new Error(
+            `${key} must be a positive number of seconds, got "${String(raw)}"`,
+          );
+        }
+        return value;
+      };
+      const ontologyTimeoutS = secondsContext(
+        "deep_reasoning_ontology_timeout_s",
+        6,
+      );
+      const neptuneTimeoutS = secondsContext("neptune_timeout_s", 8);
+      const perToolTimeoutS = secondsContext(
+        "deep_reasoning_per_tool_timeout_s",
+        45,
+      );
+      if (ontologyTimeoutS >= perToolTimeoutS) {
+        throw new Error(
+          `deep_reasoning_ontology_timeout_s (${ontologyTimeoutS}) must be below ` +
+            `deep_reasoning_per_tool_timeout_s (${perToolTimeoutS})`,
+        );
+      }
+
       const runtime = new bedrockagentcore.Runtime(this, "AgentCoreRuntime", {
         runtimeName,
         agentRuntimeArtifact:
@@ -635,6 +665,8 @@ export class ServeStack extends SCLStack {
             (this.node.tryGetContext(
               "deep_reasoning_synthesis_reserve_s",
             ) as string) ?? "25",
+          DEEP_REASONING_ONTOLOGY_TIMEOUT_S: String(ontologyTimeoutS),
+          NEPTUNE_TIMEOUT: String(neptuneTimeoutS),
           // Deep-reasoning stop signals. serve parses all four once, in config.py
           // load_config() at startup: a malformed or out-of-range value logs a
           // warning and falls back to the code default (it is not clamped). The

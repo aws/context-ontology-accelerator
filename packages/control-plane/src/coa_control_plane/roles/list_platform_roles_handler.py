@@ -31,14 +31,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
 
     Rejects non-GET methods, then queries the roles table for the ``GLOBAL``
     partition (SK begins with ``ROLE#``).
-
-    Args:
-        event: API Gateway proxy event.
-        context: Lambda context object (unused).
-
-    Returns:
-        An API Gateway proxy response: 200 with the platform roles, 405 for a
-        disallowed method, or a 5xx error response.
     """
     logger.info("list_platform_roles", path=event.get("path"), method=event.get("httpMethod"))
 
@@ -64,7 +56,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
 
         # The GLOBAL partition also holds the ``default`` baseline policy bundle,
         # which is applied to every principal and must not be offered as a
-        # grantable role (#988).
+        # grantable role.
         roles = [
             _to_summary(item)
             for item in result.items

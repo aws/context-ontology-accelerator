@@ -62,7 +62,7 @@ class TestSMUSClientInit:
         args, kwargs = mock_boto3.client.call_args
         assert args == ("datazone",)
         assert kwargs["region_name"] == "eu-west-1"
-        # Adaptive retry config is attached (issue #857) — see TestDataZoneRetryConfig.
+        # Adaptive retry config is attached — see TestDataZoneRetryConfig.
         assert kwargs.get("config") is not None
         assert client._client is datazone
 
@@ -70,7 +70,7 @@ class TestSMUSClientInit:
 class TestDataZoneRetryConfig:
     """The DataZone client must be built with an adaptive, high-attempt retry
     config so per-table CreateAsset writes survive sustained account-wide
-    TooManyRequestsException throttling (issue #857) instead of exhausting the
+    TooManyRequestsException throttling instead of exhausting the
     botocore default (~4 attempts) and dead-ending discovery."""
 
     @patch("coa_common.metadata_store.smus.boto3")

@@ -17,7 +17,7 @@ does not** (``Engine [NMSLIB] does not support filters``). Which engine a
 method-less ``knn_vector`` field resolves to is a SERVER-SIDE default that has
 NOT been stable: it has been observed to resolve to NMSLIB in one account/date
 and to Faiss in another, and an explicit ``method.engine`` block has been both
-accepted and rejected at index creation across those same accounts (see #174).
+accepted and rejected at index creation across those same accounts.
 
 We therefore do NOT assume the default. :func:`build_index_mapping` requests an
 explicit Faiss/HNSW ``method`` by default; :meth:`AossVectorClient.ensure_index`
@@ -45,15 +45,11 @@ AOSS quirks this client encapsulates
 - **No scroll API** — paginate with ``search_after`` on a stable sort.
 - **Root ``/`` returns 404** — ``client.info()`` is unusable as a liveness
   probe; probe by ensuring an index exists instead.
-- **Engine not assumed** — a method-less ``knn_vector`` can resolve to a
-  non-filtering engine (NMSLIB); ``ensure_index`` requests explicit Faiss/HNSW,
-  falls back to method-less on rejection, then verifies the resolved engine is
-  filter-capable via ``get_mapping`` (see the engine contract above and #174).
 - **Transient 429/5xx** under OCU pressure / node faults — every op is wrapped
   in capped exponential backoff (:func:`oss_retry`), and bulk writes re-submit
   only the transiently-failed per-item docs and RAISE :class:`PartialIndexError`
   if any doc fails to land after retries (:func:`bulk_with_retry`) — a partial
-  write is never reported as success (see #173).
+  write is never reported as success.
 
 Auth
 ----

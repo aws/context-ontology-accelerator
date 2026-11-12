@@ -29,10 +29,6 @@ import java.util.regex.Pattern;
  * <p>{@link #managedSource()} is present only when the configuration came from a COA-managed source
  * parameter rather than the connector's own environment. It carries the source and namespace ids and the
  * customer-owned role the credential is behind, and is what {@link #isCoaManaged()} answers on.
- *
- * <p>The hostname is lower-cased because DNS is case-insensitive and the pattern is not. The catalog and
- * schema are lower-cased because {@code information_schema} stores identifiers that way; the folded schema
- * is also the Athena schema name advertised, so the two agree.
  */
 public final class ConnectionConfig
 {

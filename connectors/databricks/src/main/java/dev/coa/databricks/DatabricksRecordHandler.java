@@ -35,23 +35,15 @@ import java.util.function.Supplier;
 /**
  * The record half: streams rows for one split, as Arrow.
  *
- * <p>{@link JdbcRecordHandler} supplies the read loop and {@code makeExtractor}, a typed extractor per
- * projected column for eleven Arrow types, with two corrections that are only obvious once they have
- * bitten: a date before 1970 is off by one if read as millis, and {@code FLOAT8} sometimes arrives as a
- * currency-formatted string. The loop honours schema projection (writing a column absent from the
- * request's schema throws inside {@code BlockUtils.setValue}, and unprojected queries pass, so the
- * mistake surfaces late) and checks for query cancellation between rows.
+ * <p>{@link JdbcRecordHandler} supplies the read loop and a typed extractor per projected column;
  * {@link DatabricksQueryBuilder} supplies the statement. This class supplies configuration, the
  * connection, the row ceiling, error classification, and the pinned-schema check that keeps the schema
  * pin a boundary on this path too ({@link #requireServableSchema}).
  *
- * <p><b>Everything endpoint-shaped is resolved per request, not at construction</b> — the
+ * <p>Everything endpoint-shaped is resolved per request, not at construction: the
  * {@code DatabaseConnectionConfig} handed to {@code super}, the Unity Catalog catalog in the query
- * builder's {@code FROM} clause, and the JDBC URL — because one deployment serves every Databricks source
- * in a COA deployment and the only thing that says which source a request belongs to is the Athena catalog
- * name on the request itself. {@link CatalogRoutingConnectionFactory} resolves the connection per request
- * and a query builder is held per Unity Catalog catalog, so nothing endpoint-specific is shared across
- * catalogs.
+ * builder's {@code FROM} clause, and the JDBC URL. One deployment serves every Databricks source in a COA
+ * deployment, and only the Athena catalog name on the request says which source it belongs to.
  */
 public class DatabricksRecordHandler extends JdbcRecordHandler
 {
@@ -66,11 +58,8 @@ public class DatabricksRecordHandler extends JdbcRecordHandler
     /**
      * The catalog name on the {@code DatabaseConnectionConfig} handed to {@code super}.
      *
-     * <p>An inert placeholder, spelled to say so: audited in the 2026.33.1 bytecode, {@code catalog} and
-     * {@code jdbcConnectionString} are read only by {@code JDBCUtil}, which serves the multiplexing
-     * handler this connector does not use, so <b>nothing</b> on any path it takes reads them, and in
-     * {@code coa-managed} mode no single catalog or URL would be true. Neither carries a host, a
-     * credential or a predicate, so both are safe even in a log line.
+     * <p>An inert placeholder: in SDK 2026.33.1 {@code catalog} and {@code jdbcConnectionString} are read
+     * only by {@code JDBCUtil}, which serves the multiplexing handler this connector does not use.
      */
     private static final String UNUSED_CATALOG_NAME = "resolved-per-request";
 
@@ -83,12 +72,7 @@ public class DatabricksRecordHandler extends JdbcRecordHandler
     private final ConnectorMetrics metrics;
 
     /**
-     * One query builder per <b>Unity Catalog</b> catalog, since that is all a builder depends on: it
-     * spells {@code FROM `ucCatalog`.`schema`.`table`} and inherits everything else.
-     *
-     * <p>Keyed on the Unity Catalog name rather than the Athena one, so two Athena catalogs resolving the
-     * same Unity Catalog catalog share a builder. A builder cannot itself cross a tenant boundary: schema
-     * and table come from the request, the catalog from the configuration resolved for it.
+     * One query builder per Unity Catalog catalog, keyed on that name rather than the Athena catalog name.
      */
     private final ConcurrentMap<String, DatabricksQueryBuilder> queryBuilders =
             new ConcurrentHashMap<>();
@@ -217,7 +201,6 @@ public class DatabricksRecordHandler extends JdbcRecordHandler
             throws Exception
     {
         String catalog = request.getCatalogName();
-        
         ConnectionConfig config = configs.configFor(catalog);
         requireServableSchema(config, request.getTableName());
         String table = request.getTableName().getTableName();
@@ -284,23 +267,11 @@ public class DatabricksRecordHandler extends JdbcRecordHandler
     /**
      * Refuses a read of a schema a pinned connector does not serve.
      *
-     * <p>The schema pin is a containment boundary independent of the credential's Unity Catalog grants, and
-     * without this check it is one only on the metadata path: Athena reaches a read through
-     * {@code GetTable}, which the metadata handler refuses first, but a principal holding
-     * {@code lambda:InvokeFunction} can post a hand-built {@code ReadRecordsRequest} naming any schema, and
-     * every statement this connector builds takes the schema from the request.
-     *
-     * <p>In {@code coa-managed} mode the configuration is <b>always</b> pinned — a managed source is
-     * exactly one Unity Catalog schema — so this check is unconditional there, and it is the boundary
-     * that keeps one source's catalog from reading another schema in the same Unity Catalog catalog even
-     * where the credential's own grants would allow it.
-     *
-     * <p>Nothing to check when the connector is unpinned, which only a stage-1 deployment can be: there
-     * the credential's grants are the boundary, and the metadata handler's own gate decides which schemas
-     * are addressable.
-     *
-     * <p>Static, and taking the configuration rather than reading a field, so it is testable: this class
-     * builds three AWS clients in its constructor.
+     * <p>The schema pin is a containment boundary independent of the credential's Unity Catalog grants,
+     * and without this check it holds only on the metadata path: a principal holding
+     * {@code lambda:InvokeFunction} can post a hand-built {@code ReadRecordsRequest} naming any schema.
+     * A {@code coa-managed} configuration is always pinned; an unpinned (environment-mode) connector has
+     * nothing to check, because the credential's grants are the boundary.
      *
      * @throws IllegalArgumentException if {@code config} is pinned to another schema.
      */

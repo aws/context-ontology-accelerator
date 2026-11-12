@@ -8,15 +8,12 @@ from __future__ import annotations
 import os
 from typing import Any
 
-import structlog
 from coa_common.constants import datasource_external_id, validate_namespace_id
 from coa_common.dao import DynamoDBDAO
 from coa_common.language_tags import effective_namespace_language
 from coa_common.response import api_response
 
 from coa_control_plane.namespace.vkg_health import resolve_vkg_health_with_reason
-
-logger = structlog.get_logger(__name__)
 
 _ns_dao: DynamoDBDAO | None = None
 

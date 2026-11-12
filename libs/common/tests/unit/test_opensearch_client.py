@@ -43,7 +43,7 @@ def _no_sleep():
         yield
 
 
-# ── ensure_index engine verification & fallback (#174) ───────────────────
+# ── ensure_index engine verification & fallback ───────────────────
 
 
 def _direct_client_with_indices(indices_mock) -> AossVectorClient:
@@ -242,7 +242,7 @@ class TestEnsureIndexEngineVerification:
 class TestBuildIndexMapping:
     def test_embedding_defaults_to_explicit_faiss_hnsw(self):
         # Default (method=True): explicit Faiss/HNSW so creation does not depend
-        # on the service's observed-unstable method-less default engine (#174).
+        # on the service's observed-unstable method-less default engine.
         m = build_index_mapping(1024)["mappings"]["properties"]
         assert m["embedding"]["type"] == "knn_vector"
         assert m["embedding"]["dimension"] == 1024
@@ -343,7 +343,7 @@ class TestBulkWithRetry:
     (raise_on_error=False) rather than catching BulkIndexError, so an exhausted
     per-item 429 that opensearch-py silently drops is still visible as an error
     entry. It re-submits only transient failures and RAISES PartialIndexError if
-    any doc fails to land — a partial write is never reported as success (#173).
+    any doc fails to land — a partial write is never reported as success.
     """
 
     def _ok_errors(self, error_items):
@@ -379,7 +379,7 @@ class TestBulkWithRetry:
         assert ei.value.failed == 1 and ei.value.submitted == 1
 
     def test_transient_exhaustion_raises_partial_index_error(self):
-        """The core #173 fix: docs that keep failing transiently until retries
+        """Docs that keep failing transiently until retries
         are exhausted must RAISE, not return cleanly — otherwise the caller
         reports a full write while docs were silently dropped."""
         client = MagicMock()
@@ -531,7 +531,7 @@ class TestDeleteByTerm:
         assert fake.delete.call_count == 4
 
     def test_list_of_values_uses_one_terms_query_and_one_verify_loop(self):
-        # #1118: retiring the stale embeddings of N subjects on re-accept must
+        # Retiring the stale embeddings of N subjects on re-accept must
         # not pay the refresh-lag verify wait N times — one `terms` query, one
         # count gate, for the whole set.
         c, fake = _delete_client(search_pages=[["a", "b"]], count_seq=[0])
@@ -779,7 +779,6 @@ class TestTransportSplit:
             return {"hits": {"hits": [{"_id": "1", "_score": 0.5, "_source": {"entity_uri": "u"}}]}}
 
         c = AossVectorClient(transport=transport, dimensions=4)
-        assert c.is_proxy is True
         hits = c.knn_search("idx", [0.1] * 4, top_k=2, filters=[{"term": {"entity_type": "class"}}])
         assert seen["action"] == "search" and seen["index"] == "idx"
         assert hits[0]["entity_uri"] == "u"

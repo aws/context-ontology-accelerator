@@ -361,3 +361,44 @@ def test_identity_keyed_clear_updates_only_the_selected_same_named_table(monkeyp
     assert by_identity["DS#finance::finance.public.publication"]["similarity"] is None
     assert by_identity["DS#identity::identity.public.publication"]["matched_class_uri"] == _PUBLICATION
     assert by_identity["DS#identity::identity.public.publication"]["similarity"] == 0.95
+
+
+def test_override_on_same_name_tie_is_graded_by_reranker_verdict(monkeypatch):
+    """A steward's pick from a same-name tie is graded by the reranker, capped below exact, not as novel."""
+    other_publication = "http://other.example.org/Publication"
+    candidates = [
+        GroundingCandidate(
+            entity_uri=uri,
+            ontology_id=ontology_id,
+            label="Publication",
+            definition="A published work.",
+            lexical_sim=sim,
+        )
+        for uri, ontology_id, sim in [
+            (_PUBLICATION, "http://example.org/myonto/", 0.46),
+            (other_publication, "http://other.example.org/", 0.45),
+        ]
+    ]
+    service = GroundingService(ontology_catalog=None, embedding_generator=None)
+    rerank = {"choice": "Publication", "relationship": "exactMatch", "confidence": 0.95, "reason": "same concept"}
+    monkeypatch.setattr(service, "_recall", lambda *a, **k: candidates)
+    monkeypatch.setattr(service, "_llm_rerank", lambda *a, **k: rerank)
+    result = service.ground_table(
+        table_name="publication",
+        table_description="",
+        columns=[],
+        concept_vector=[0.1],
+        model_id="titan",
+        grounding_mode="ENHANCED",
+        ontology_ids=["http://example.org/myonto/", "http://other.example.org/"],
+    )
+    assert result.match_type == "ambiguous"
+    item = _proposal_item()
+    item["metadata"]["matches"] = [service.to_concept_match(result).model_dump()]
+
+    proposals, captured = _patch_store_and_pipeline(monkeypatch)
+    pub = _match_after_override(proposals, captured, item, other_publication)
+
+    assert pub["matched_class_uri"] == other_publication
+    assert pub["match_type"] == "high_confidence"
+    assert pub["similarity"] == 0.84

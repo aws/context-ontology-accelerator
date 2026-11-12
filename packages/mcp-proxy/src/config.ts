@@ -17,9 +17,7 @@ export interface ProxyConfig {
 
 export async function resolveConfig(): Promise<ProxyConfig> {
   const region = process.env.AWS_REGION || "us-east-1";
-  // SSM prefix matches CDK's ssmPrefix = `/${resource_prefix}`.
-  // Default "coa" aligns with infra/cdk.json context.resource_prefix.
-  // Override via RESOURCE_PREFIX (same env var used by other packages).
+  // RESOURCE_PREFIX (default "coa") sets the SSM parameter prefix.
   const resourcePrefix = process.env.RESOURCE_PREFIX || "coa";
   const prefix = process.env.SCL_PREFIX || `/${resourcePrefix}`;
 

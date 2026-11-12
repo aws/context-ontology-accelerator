@@ -128,8 +128,7 @@ class TestDeserializeForm:
         assert restored.technical_metadata.format == "parquet"
 
     def test_roundtrip_preserves_fk_governance_fields(self):
-        # #1088: inferred relationships carry review_status, target_datasource_id
-        # (cross-source), and provenance through serialize -> deserialize.
+        # review_status, target_datasource_id and provenance survive a round trip.
         table = Table(
             name="orders",
             database="sales",

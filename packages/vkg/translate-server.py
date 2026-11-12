@@ -21,16 +21,6 @@ SQL Extraction Strategy:
       auto-restart never triggers unintentionally
     - No documented performance penalty, caching changes, or security concerns
     - See: https://ontop-vkg.org/guide/cli.html#ontop-endpoint
-
-  Previous approaches considered and rejected:
-    - X-Ontop-Reformulated-Query header: does not exist in Ontop 5.x
-    - DEBUG log parsing (--dev + log file): fragile, disk growth risk, format-dependent
-    - Structured query logging (ontop.queryLogging): still file-based, async flush issues
-    - /ontop/reformulate: direct HTTP, no file I/O, no parsing — cleanest solution
-
-Runtime note: entrypoint.sh runs this file with ``python3``, which the Dockerfile
-links to python3.12 from the AL2023 repos — the same version the rest of the repo
-targets. The image's /usr/bin/python3 (3.9) is left in place only for dnf.
 """
 
 from __future__ import annotations
@@ -45,8 +35,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from socketserver import ThreadingMixIn
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 import sqlglot
@@ -75,15 +64,11 @@ _table_routing: dict[str, dict[str, str]] = {}
 AMBIGUOUS_KEY = "ambiguousWith"
 
 # Cached health state (refreshed by background thread)
-_health_status = {"healthy": False, "last_check": 0.0, "reason": "starting up"}
+_health_status = {"healthy": False, "reason": "starting up"}
 _health_lock = threading.Lock()
 _HEALTH_TTL_SECONDS = 10
 
 
-# The Ontop sidecar is always reached over plain HTTP on the loopback interface.
-# Scheme and host are fixed constants; only the port varies (ONTOP_PORT /
-# --ontop-port) and is coerced to an int, so it cannot smuggle in a different
-# scheme or host. Every request URL is rebuilt from these constants.
 _ONTOP_SCHEME = "http"
 _ONTOP_HOST = "localhost"
 _ONTOP_ALLOWED_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
@@ -110,9 +95,7 @@ def _ontop_url(path):
 def _split_sql_qualified(name: str) -> list[str]:
     """Split a possibly schema-qualified SQL identifier into its parts.
 
-    ``'"sales"."orders"'`` -> ``['"sales"', '"orders"']``; ``'"orders"'`` ->
-    ``['"orders"']``; ``'sales.orders'`` -> ``['sales', 'orders']``. Splits only
-    on dots that sit *outside* double-quoted segments, so a dot embedded in a
+    Splits only on dots outside double-quoted segments, so a dot embedded in a
     quoted identifier (``"a.b"``) is preserved. Callers strip the quotes.
     """
     parts: list[str] = []
@@ -142,8 +125,10 @@ def _split_sql_qualified(name: str) -> list[str]:
 def _load_table_routing(mappings_path: str) -> dict[str, dict[str, str]]:
     """Parse coa:datasourceId and coa:sourceSchema annotations from an R2RML file.
 
-    Returns a dict mapping uppercase table names to their datasource routing info.
-    Silently returns empty dict if the file is missing or unparseable.
+    Returns a dict mapping table references (original case, uppercase, qualified and
+    bare) to their datasource routing info, or an ambiguity marker for a bare name
+    shared by several tables. Logs a warning and returns an empty dict if the file
+    is unparseable; returns an empty dict if it is missing.
     """
     if not mappings_path or not os.path.isfile(mappings_path):
         return {}
@@ -165,7 +150,6 @@ def _load_table_routing(mappings_path: str) -> dict[str, dict[str, str]]:
         for tmap in g.subjects(predicate=None, object=RR.TriplesMap):
             ds_id = str(next(g.objects(tmap, SCL.datasourceId), "")) or None
             schema = str(next(g.objects(tmap, SCL.sourceSchema), "")) or None
-            # Get table name from logicalTable
             for lt in g.objects(tmap, RR.logicalTable):
                 table_name = str(next(g.objects(lt, RR.tableName), ""))
                 if table_name:
@@ -175,12 +159,7 @@ def _load_table_routing(mappings_path: str) -> dict[str, dict[str, str]]:
                     if schema:
                         entry["sourceSchema"] = schema
                     if entry:
-                        # rr:tableName may be schema-qualified (`"schema"."table"`)
-                        # to disambiguate same-named tables across schemas/datasources.
-                        # Parse per-segment (via _split_sql_qualified, which honours
-                        # quoted dots), then register the QUALIFIED ref and, when
-                        # unambiguous, the bare name too — each also uppercased so
-                        # lookups match regardless of sqlglot case handling.
+                        # Quotes are stripped per segment so quoted dots survive.
                         parts = [p.strip('"') for p in _split_sql_qualified(table_name)]
                         bare = parts[-1]
                         ref = ".".join(parts)
@@ -192,12 +171,8 @@ def _load_table_routing(mappings_path: str) -> dict[str, dict[str, str]]:
                         owners = bare_owners.setdefault(bare.upper(), set())
                         owners.add(ref.upper())
                         if len(owners) > 1:
-                            # Publish the ambiguity itself: the marker names the
-                            # candidates and carries no datasourceId, so serve refuses
-                            # the query rather than routing a bare reference to the
-                            # wrong catalog. Withholding the bare key instead would
-                            # read to serve as "nothing to route" and silently run
-                            # against the default context.
+                            # Absent bare key would read as "nothing to route" and
+                            # run against the default context; the marker makes serve refuse.
                             marker = {AMBIGUOUS_KEY: ",".join(sorted(owners))}
                             for key in {bare, bare.upper()}:
                                 routing[key] = marker
@@ -212,9 +187,8 @@ def _load_table_routing(mappings_path: str) -> dict[str, dict[str, str]]:
 
 
 # Health probe query. A namespace-agnostic query that reformulates to SQL only
-# once the mappings load. The unbound triple pattern is intentional: it reports
-# healthy only when Ontop can actually reformulate a query, not just when its
-# process is up (the functional-probe design #149 relies on).
+# once the mappings load, so it proves reformulation works, not just that the
+# process is up.
 _PROBE_SPARQL = "SELECT ?s WHERE { ?s ?p ?o } LIMIT 1"
 
 
@@ -234,8 +208,7 @@ def _reformulate_probe():
         return False, f"reformulation probe failed: {e}"
     if _extract_sql(raw).upper().startswith(("SELECT", "WITH")):
         return True, None
-    # Actuator was UP but the query did not reformulate — the mappings/ontology
-    # loaded partially or not at all (the silent-failure case behind #170/#149).
+    # Actuator was UP but the query did not reformulate: mappings/ontology loaded partially or not at all.
     return False, "mappings did not reformulate a probe query (ontology/R2RML not fully loaded)"
 
 
@@ -265,7 +238,6 @@ def _poll_ontop_health():
         with _health_lock:
             _health_status["healthy"] = healthy
             _health_status["reason"] = None if healthy else (reason or "unhealthy")
-            _health_status["last_check"] = time.time()
 
         time.sleep(_HEALTH_TTL_SECONDS)
 
@@ -297,22 +269,13 @@ def _translate_sparql(sparql, target_dialect):
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             raw = resp.read().decode("utf-8").strip()
-            # Parse SPARQL projection metadata from the ans1(...) / CONSTRUCT
-            # header before _extract_sql discards it. The SPARQL is needed for
-            # the DISTINCT modifier, which is not recoverable from the SQL.
+            # The header must be parsed before _extract_sql discards it.
             projection = _parse_projection_header(raw, sparql)
-            # Ontop's reformulate output includes metadata before the SQL.
-            # Extract only the SQL portion (starts with SELECT/WITH).
             sql = _extract_sql(raw)
-            # Translate from H2 dialect to target dialect (default: trino for Athena).
-            # Ontop's /ontop/reformulate outputs H2 SQL. sqlglot has no H2 dialect, so
-            # we use "postgres" as the closest parser — H2 syntax is largely compatible.
-            # H2-specific coercions (e.g. REAL + VARCHAR) are pre-processed in
-            # _translate_dialect before sqlglot sees the SQL.
+            # Ontop emits H2 SQL; sqlglot has no H2 dialect, so postgres is the closest parser.
             if target_dialect and target_dialect != "h2":
                 sql = _translate_dialect(sql, "postgres", target_dialect)
             source_table_refs = _extract_table_refs(sql)
-            # Enrich table refs with datasource routing from R2RML annotations
             datasource_routing = _resolve_routing(source_table_refs)
             result = {
                 "sql": sql,
@@ -341,34 +304,13 @@ def _rewrite_h2_functions(sql: str) -> str:
     Registry of H2 rewrites (extend by adding a branch on ``fn_name``):
       - ``FORMATDATETIME(expr, pattern)`` → ``CAST(expr AS VARCHAR)``
 
-    Note: ``SUBSTR`` is intentionally NOT rewritten here. sqlglot's parser
-    (all dialects tested — postgres/trino/duckdb/etc.) already models
-    ``SUBSTR(...)`` as ``exp.Substring`` and its Trino/Postgres writer
-    emits ``SUBSTRING`` unchanged, so no Anonymous-node branch is needed
-    on the current sqlglot pin (30.8.0). A future upgrade that regresses
-    this behaviour would need a new branch here.
+    ``SUBSTR`` needs no rewrite: sqlglot already parses it as ``exp.Substring``.
 
-    On sqlglot parse failure — Ontop occasionally emits SQL that sqlglot's
-    postgres dialect can't tokenise — returns ``sql`` unchanged. The
-    downstream ``_translate_dialect`` transpile then either handles it or
-    falls back to the same unchanged input. There is intentionally no
-    regex fallback here: the previous regex could not match nested
-    ``FORMATDATETIME(DATEADD(..., ...))`` (``[^,]+`` stops at the first
-    comma), which is precisely the shape the AST rewrite was introduced
-    to handle. Keeping the regex as a "safety net" would silently keep
-    that failure mode alive for exactly the cases the fix targets.
-
-    Only ``SqlglotError`` is caught. Implementation bugs in the transform
-    callback (``AttributeError``/``IndexError``) propagate so tests catch
-    them rather than degrading the pipeline silently.
+    SQL that sqlglot cannot parse is returned unchanged. Only ``SqlglotError`` is
+    caught; bugs in the transform callback propagate.
     """
     try:
-        # error_level=RAISE surfaces genuine parse failures instead of
-        # silently reconstructing a mangled AST — see the pre-existing test
-        # `test_translate_dialect_returns_input_on_transpile_error` for a
-        # concrete case (`"SELECT ((( FROM"` becomes `"SELECT (((SELECT * FROM )))"`
-        # under IGNORE, which then flows through to transpile and defeats the
-        # "return input unchanged on error" contract of `_translate_dialect`).
+        # RAISE is required: IGNORE would rebuild a mangled AST from broken SQL.
         parsed = sqlglot.parse_one(sql, read="postgres", error_level=sqlglot.ErrorLevel.RAISE)
     except sqlglot.errors.SqlglotError as e:
         logger.warning("H2 function rewrite: sqlglot parse failed, leaving SQL unchanged: %s", e)
@@ -380,11 +322,7 @@ def _rewrite_h2_functions(sql: str) -> str:
 
         fn_name = node.this.upper() if isinstance(node.this, str) else str(node.this).upper()
 
-        # FORMATDATETIME(expr, pattern) → CAST(expr AS VARCHAR).
-        # Malformed calls with no arguments fall through to `return node`
-        # at the end — returning None here would delete the node from the
-        # AST, silently mangling e.g. `SELECT FORMATDATETIME() FROM t` into
-        # `SELECT FROM t`.
+        # FORMATDATETIME(expr, pattern) → CAST(expr AS VARCHAR); no-arg calls fall through.
         if fn_name == "FORMATDATETIME" and node.expressions:
             return sqlglot.exp.Cast(
                 this=node.expressions[0],
@@ -402,9 +340,6 @@ def _translate_dialect(sql, source_dialect, target_dialect):
 
     Handles H2-specific functions that sqlglot doesn't transpile automatically.
     """
-    # Pre-process H2-specific constructs that sqlglot's postgres parser doesn't handle.
-    # H2 allows implicit coercions that Trino rejects — convert them explicitly before
-    # handing off to sqlglot so the transpiler sees valid postgres-dialect SQL.
     sql = _rewrite_h2_functions(sql)
 
     try:
@@ -466,20 +401,10 @@ def _parse_projection_header(raw: str, sparql: str) -> dict[str, Any] | None:
     rows behind a composite-key IRI template) on queries whose SPARQL has no
     DISTINCT, and conversely omits it when it can prove distinctness redundant.
 
-    Returns a dict with:
-        selectVars: list of SPARQL variable names (in SELECT order)
-        varToColumn: dict mapping SPARQL var -> SQL output alias
-        distinct: bool (true only for SPARQL SELECT DISTINCT / REDUCED)
-
     Returns None if the header is absent or unparseable, or if any selected
-    variable cannot be resolved to exactly one SQL alias — the caller then
-    falls back to returning raw SQL columns rather than mislabelling data.
-
-    Every degradation path logs its reason. Without that, a namespace silently
-    reverts to showing raw SQL aliases and there is no way to tell which of the
-    causes below fired (--dev disabled, an Ontop version change, or a genuine
-    parser bug). Non-SELECT queries have no ans1 header at all, so that one
-    case logs at debug to keep ASK/CONSTRUCT traffic quiet.
+    variable cannot be resolved to exactly one SQL alias; the caller then falls
+    back to raw SQL columns rather than mislabelling data. Every degradation path
+    logs its reason (non-SELECT queries log at debug).
     """
     # A missing header is expected for non-SELECT forms and unexpected otherwise.
     is_select = bool(re.search(r"\bSELECT\b", sparql, re.IGNORECASE))
@@ -492,7 +417,6 @@ def _parse_projection_header(raw: str, sparql: str) -> dict[str, Any] | None:
             logger.debug("Projection unavailable (%s); non-SELECT query", reason)
         return None
 
-    # Parse ans1(...) signature — the SPARQL SELECT variables, in SELECT order.
     ans_match = re.search(r"ans1\(([\w,\s]+)\)", raw)
     if not ans_match:
         return _drop("no ans1(...) signature in reformulate output")
@@ -500,7 +424,6 @@ def _parse_projection_header(raw: str, sparql: str) -> dict[str, Any] | None:
     if not var_names:
         return _drop("ans1(...) signature lists no variables")
 
-    # Parse NATIVE [...] — the SQL output aliases.
     native_match = re.search(r"NATIVE\s+\[([^\]]*)\]", raw, re.IGNORECASE)
     if not native_match:
         return _drop("no NATIVE [...] alias list")
@@ -553,17 +476,7 @@ def _parse_projection_header(raw: str, sparql: str) -> dict[str, Any] | None:
 
 
 def _extract_sql(raw):
-    """Extract the SQL SELECT statement from Ontop's reformulation output.
-
-    Ontop's /ontop/reformulate endpoint returns metadata before the SQL:
-        ans1(x, y)
-        CONSTRUCT [x, y] [...]
-           NATIVE [...]
-        SELECT ...
-
-    This function extracts only the SQL portion.
-    """
-    # Find first SELECT or WITH statement
+    """Extract the SQL portion (first SELECT or WITH line) of Ontop's reformulation output."""
     match = re.search(r"(?m)^(SELECT|WITH)\b", raw, re.IGNORECASE)
     if match:
         return raw[match.start() :].strip()
@@ -613,33 +526,21 @@ def _resolve_routing(source_table_refs: list[str]) -> dict[str, dict[str, str]]:
         return {}
     routing: dict[str, dict[str, str]] = {}
     for ref in source_table_refs:
-        # Table refs may be "schema.table" or just "table" — try both
         table_upper = ref.upper()
-        # Try exact match first
         if table_upper in _table_routing:
             routing[ref] = _table_routing[table_upper]
         else:
-            # Try just the table part (last segment)
             bare_table = ref.rsplit(".", 1)[-1].upper()
             if bare_table in _table_routing:
                 routing[ref] = _table_routing[bare_table]
-        # If this reference is SCHEMA-QUALIFIED and its bare name is shared (an
-        # ambiguity marker was recorded for the bare name at load time), surface the
-        # sibling candidates so a downstream consumer can see the name spans
-        # datasources and add the catalog. This applies ONLY to a qualified ref: it
-        # names one physical table unambiguously, but the bare name it shares still
-        # needs the catalog to stay context-independent. A BARE ref is deliberately
-        # left with the marker alone (below / via the exact-match path) so it is
-        # refused, not silently qualified against a guessed candidate.
         if "." not in ref:
             continue
         bare_upper = ref.rsplit(".", 1)[-1].upper()
-        marker = _table_routing.get(bare_upper)
-        if isinstance(marker, dict) and AMBIGUOUS_KEY in marker:
+        marker = _table_routing.get(bare_upper, {})
+        if AMBIGUOUS_KEY in marker:
             for candidate in marker[AMBIGUOUS_KEY].split(","):
-                candidate = candidate.strip()
-                entry = _table_routing.get(candidate) or _table_routing.get(candidate.upper())
-                if isinstance(entry, dict) and entry.get("datasourceId") and candidate not in routing:
+                entry = _table_routing.get(candidate, {})
+                if entry.get("datasourceId") and candidate not in routing:
                     routing[candidate] = entry
     return routing
 
@@ -727,19 +628,8 @@ class TranslateHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def log_message(self, fmt, *args):
-        """Log each request through the module logger instead of stderr.
-
-        Args:
-            fmt: printf-style format string supplied by the base handler.
-            *args: Positional arguments interpolated into ``fmt``.
-        """
+        """Log each request through the module logger instead of stderr."""
         logger.info("%s %s", self.client_address[0], fmt % args)
-
-
-class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
-    """HTTP server that serves each request in its own daemon thread."""
-
-    daemon_threads = True
 
 
 def main():
@@ -757,10 +647,8 @@ def main():
     _ontop_port = args.ontop_port
     _ontology_version = args.ontology_version
 
-    # Load datasource routing from R2RML annotations
     _table_routing = _load_table_routing(args.mappings_file)
 
-    # Start background health poller
     health_thread = threading.Thread(target=_poll_ontop_health, daemon=True)
     health_thread.start()
 

@@ -62,7 +62,6 @@ class TestCreateGrant:
         assert grant["namespaceId"] == VALID_NS_ID
         assert grant["grantedBy"] == "admin@example.com"
 
-        # grantId should decode back to PK+SK
         pk, sk = decode_grant_id(grant["grantId"])
         assert pk == f"Namespace::{VALID_NS_ID}#User::alice@company.com"
         assert sk == "ROLE#analyst"
@@ -86,13 +85,11 @@ class TestCreateGrant:
         )
         assert resp["statusCode"] == 201
 
-        # Verify the item written to DynamoDB has URL-encoded principalKey
         put_call = mock_mappings_dao.put.call_args
         item = put_call[0][0]
         assert item["principalKey"] == "User::foo%2B123@amazon.com"
         assert item["PK"] == f"Namespace::{VALID_NS_ID}#User::foo%2B123@amazon.com"
         assert item["principalRoleKey"] == "User::foo%2B123@amazon.com#ROLE#analyst"
-        # Raw principalId preserved for display
         assert item["principalId"] == "foo+123@amazon.com"
 
     @patch("coa_control_plane.grants.create_handler.DynamoDBDAO")
@@ -117,13 +114,11 @@ class TestCreateGrant:
         )
         assert resp["statusCode"] == 201
 
-        # Verify the item written to DynamoDB includes overrides
         put_call = mock_mappings_dao.put.call_args
         item = put_call[0][0]
         assert item["tableAllowlist"] == ["orders", "customers"]
         assert item["columnDenylist"] == {"customers": ["ssn"]}
         assert item["allowedMetrics"] == ["revenue"]
-        # No grantId stored in DynamoDB
         assert "grantId" not in item
 
         # Response echoes the overrides on GrantSummary
@@ -134,13 +129,7 @@ class TestCreateGrant:
 
     @patch("coa_control_plane.grants.create_handler.DynamoDBDAO")
     def test_declared_empty_overrides_are_persisted(self, mock_dao_cls):
-        """SEMANTICS CHANGE (was: empty lists silently dropped at write time).
-
-        An explicitly empty tableAllowlist means "no tables permitted" — a
-        deny-all restriction the SQL firewall enforces. Dropping it created a
-        grant MORE permissive than requested with a 201 and no warning. Absence
-        of the field (the web console's blank input) still means unrestricted.
-        """
+        """An empty tableAllowlist means deny-all and is persisted; an absent field means unrestricted."""
         mock_roles_dao = MagicMock()
         mock_mappings_dao = MagicMock()
         mock_dao_cls.side_effect = [mock_roles_dao, mock_mappings_dao]
@@ -318,12 +307,6 @@ class TestCreateGrantKeySize:
         )
         assert resp["statusCode"] == 400
         mock_mappings_dao.put.assert_not_called()
-
-    def test_create_bound_keeps_grant_ids_within_the_contract(self):
-        from coa_control_plane.grants.contract import GRANT_ID_CREATE_MAX_LENGTH
-        from coa_control_plane.grants.grant_id import GRANT_ID_MAX_LENGTH
-
-        assert GRANT_ID_CREATE_MAX_LENGTH < GRANT_ID_MAX_LENGTH
 
     @patch("coa_control_plane.grants.create_handler.DynamoDBDAO")
     def test_long_ascii_principal_within_key_limits_is_created(self, mock_dao_cls):

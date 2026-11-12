@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 package dev.coa.connector.metadata;
 
-import dev.coa.connector.constraints.ColumnComment;
 import dev.coa.connector.schema.TableSchema;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 
@@ -97,15 +96,9 @@ public final class CoaTable
     {
         TableSchema.Builder schema = TableSchema.named(name);
         for (CoaColumn column : columns) {
-            ColumnComment comment = column.toColumnComment();
-            // TableSchema renders it. Rendering here and passing the string back through
+            // TableSchema renders the comment. Rendering here and passing the string back through
             // ColumnComment.of() would hit its guard against prose already carrying a live tag.
-            if (comment.build().isEmpty()) {
-                schema.column(column.name(), column.type());
-            }
-            else {
-                schema.column(column.name(), column.type(), comment);
-            }
+            schema.column(column.name(), column.type(), column.toColumnComment());
         }
         return schema.build();
     }

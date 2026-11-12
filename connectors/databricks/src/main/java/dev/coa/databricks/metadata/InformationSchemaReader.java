@@ -115,8 +115,8 @@ public final class InformationSchemaReader
      * <p>Two statements intersected, and both are load-bearing. {@code SHOW TABLES} answers what
      * exists: creating a materialized view or a streaming table also creates internal side tables
      * ({@code __materialization_mat_<uuid>_<name>_1}, {@code event_log_<uuid>}), which
-     * {@code information_schema.tables} lists as ordinary {@code MANAGED} tables with nothing in any
-     * of its fifteen columns marking them internal, and {@code SHOW TABLES} omits.
+     * {@code information_schema.tables} lists as ordinary {@code MANAGED} tables with nothing marking
+     * them internal, and {@code SHOW TABLES} omits.
      * {@code information_schema.tables} answers what kind each one is, which {@code SHOW TABLES} does
      * not say, and is what excludes a {@code FOREIGN} table and a shallow clone (see
      * {@link TableTypes}). The intersection also drops a session-scoped temporary view, which

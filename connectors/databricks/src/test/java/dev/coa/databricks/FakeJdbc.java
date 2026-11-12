@@ -138,10 +138,7 @@ public final class FakeJdbc
      * asks for {@code getDatabaseProductName()} before it does anything else — it compares the answer to
      * {@code "clickhouse"} to decide whether to disable auto-commit.
      *
-     * <p>The product name is the driver's own, not a Databricks constant, so it is spelled here as the
-     * driver spells it. Anything but {@code "clickhouse"} takes the same branch, so nothing depends on
-     * the exact value; what depends on this existing at all is that a read can be driven through the real
-     * loop rather than stopping at the first metadata call.
+     * <p>Anything but {@code "clickhouse"} takes the same branch, so the exact name is immaterial.
      */
     private java.sql.DatabaseMetaData databaseMetaData()
     {
@@ -230,12 +227,8 @@ public final class FakeJdbc
     /**
      * The value at {@code label}.
      *
-     * @throws SQLException if the row has no such column, which is what a real driver does and what makes
-     *         a column label assertable. Returning null instead lets the unit tests pin the labels against
-     *         themselves: a fixture keyed {@code table_name} and production code asking for
-     *         {@code tableName} both "work", leaving the real labels ({@code tableName},
-     *         {@code full_data_type}, {@code position_in_unique_constraint}) load-bearing only in the
-     *         integration suite, which skips without a warehouse.
+     * @throws SQLException if the row has no such column, as a real driver does, so a wrong column label
+     *         fails a unit test instead of passing against a fixture keyed the same wrong way.
      */
     private static Object byLabel(Map<String, Object> row, String label) throws SQLException
     {

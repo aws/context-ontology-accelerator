@@ -3,15 +3,12 @@
 --
 -- Databricks fixtures for verifying this connector against a real Unity Catalog schema.
 --
--- NOT RUN BY CI, AND NO COMMITTED TEST DEPENDS ON IT. There is no Databricks workspace available to
--- this project — the one used during design was a 14-day trial — so the connector ships with unit
--- tests only, and its behaviour against real Databricks is evidenced by the one-off manual record in
--- the connector LLD (section 8.1, "One-off manual verification record") rather than by a suite.
+-- NOT RUN BY CI, AND NO COMMITTED TEST DEPENDS ON IT. The connector ships with unit tests only, and its
+-- behaviour against real Databricks was verified once by hand against the schema this script creates.
 --
--- This file is kept for two reasons. It is the **provenance** of that record: every observation in it
--- was made against the schema this script creates. And it is the starting point for anyone who
--- acquires a workspace and wants to build the suite section 8.1 describes — which should be done
--- before changing discovery, since nothing automated would catch a regression there today.
+-- Kept as the starting point for anyone who acquires a workspace and wants to build an integration
+-- suite, which should be done before changing discovery, since nothing automated would catch a
+-- regression there today.
 --
 -- To use it: run it once against a Unity Catalog schema, point DATABRICKS_* at that schema, and write
 -- the tests. The fixtures are deliberately chosen to catch specific bugs rather than to be

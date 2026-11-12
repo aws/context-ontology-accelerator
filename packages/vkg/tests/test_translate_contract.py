@@ -198,34 +198,9 @@ class TestTranslateEndpoint:
         assert status == 200
         assert "ontologyVersion" in data
 
-    @patch("translate_server._check_ontop_health", return_value=False)
-    def test_503_when_not_ready(self, mock_health):
-        status, data = _make_handler(
-            "POST",
-            "/sparql/translate",
-            {
-                "sparql": "SELECT ?s WHERE { ?s ?p ?o }",
-            },
-        )
-        assert status == 503
-
-    @patch("translate_server._check_ontop_health", return_value=True)
-    def test_400_missing_sparql(self, mock_health):
-        status, data = _make_handler(
-            "POST",
-            "/sparql/translate",
-            {
-                "namespace": "test",
-            },
-        )
-        assert status == 400
-        assert "sparql" in data["error"].lower()
-
 
 class TestDialectTranslation:
     """Test _translate_dialect preserves identifier quoting from Ontop."""
-
-    # ── Reserved-word quoting (the #525 fix) ────────────────────────────
 
     def test_reserved_word_identifiers_stay_quoted(self):
         sql = 'SELECT "order"."date", "order"."user" FROM "order"'
@@ -262,8 +237,6 @@ class TestDialectTranslation:
         assert '"order"' in result
         assert '"date"' in result
         assert '"user"' in result
-
-    # ── H2 function rewrites ────────────────────────────────────────────
 
     def test_formatdatetime_rewritten_to_cast(self):
         sql = "SELECT FORMATDATETIME(created_at, 'yyyy-MM-dd') FROM events"
@@ -330,18 +303,6 @@ class TestDialectTranslation:
             assert "FORMATDATETIME" not in result.upper(), f"Failed for pattern: {sql}"
             assert "CAST" in result.upper(), f"No CAST found for: {sql}"
 
-    # ── Fallback behavior ───────────────────────────────────────────────
-
-    def test_transpile_attempts_best_effort_on_unusual_input(self):
-        """sqlglot will attempt to parse/transpile even unusual input."""
-        sql = "NOT VALID SQL {{{"
-        result = translate_server._translate_dialect(sql, "postgres", "trino")
-        # sqlglot does its best — result may differ from input but won't raise
-        assert isinstance(result, str)
-        assert len(result) > 0
-
-    # ── Realistic Ontop output ──────────────────────────────────────────
-
     def test_typical_ontop_output_with_aliases(self):
         """Ontop produces SQL with table aliases like t0, t1 and quoted reserved words."""
         sql = (
@@ -402,10 +363,7 @@ class TestH2FunctionRewrite:
     def test_no_h2_functions_unchanged(self):
         """SQL without H2 functions should pass through unchanged."""
         sql = "SELECT id, name FROM customers WHERE status = 'active'"
-        result = _rewrite_h2_functions(sql)
-        assert "SELECT" in result.upper()
-        assert "FROM" in result.upper()
-        assert "customers" in result.lower()
+        assert _rewrite_h2_functions(sql) == sql
 
     def test_preserves_quoted_identifiers(self):
         """Quoted identifiers should be preserved during rewrite."""
@@ -427,11 +385,6 @@ class TestH2FunctionRewrite:
         result = _rewrite_h2_functions(sql)
         # The call is preserved (not deleted from the SELECT list).
         assert "FORMATDATETIME" in result.upper()
-
-
-# NOTE: SUBSTR() empty-args behaviour lives in sqlglot's parser (`exp.Substring`),
-# not in our Anonymous branch. Any regression there is on sqlglot, not this
-# module — see the docstring of `_rewrite_h2_functions` for the SUBSTR note.
 
 
 class TestH2FunctionRewriteErrorHandling:

@@ -3,7 +3,7 @@
 
 """Shared contract for the schema-visibility authorizer flags.
 
-ADR: decompose-viewnamespace-schema-visibility. A caller's right to see
+A caller's right to see
 physical source schema (``viewSource``) and ontology schema (``viewOntology``)
 is decided by Cedar and forwarded to downstream handlers as string flags in the
 API Gateway authorizer context. The control-plane authorizer and the MCP server

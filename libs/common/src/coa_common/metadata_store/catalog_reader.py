@@ -52,8 +52,7 @@ def read_approved_catalog(
     sources: list[dict[str, Any]] = []
 
     for ds_id in data_source_ids:
-        # Get source type from DynamoDB.
-        # New sources table key schema: PK=NS#{namespaceId}, SK=SRC#{sourceId}
+        # Sources table key schema: PK=NS#{namespaceId}, SK=SRC#{sourceId}
         bare_id = ds_id.removeprefix("DS#").removeprefix("SRC#")
         ds_item = ds_dao.get({"PK": f"NS#{namespace_id}", "SK": f"SRC#{bare_id}"})
         if not ds_item:
@@ -62,32 +61,27 @@ def read_approved_catalog(
 
         source_type = ds_item.get("sourceType", "UNKNOWN")
 
-        # Only induct from fully-approved sources
         source_status = ds_item.get("status", "")
         if source_status != "APPROVED":
             logger.info("Source %s is in %s status (not APPROVED), skipping", ds_id, source_status)
             continue
 
-        # Fetch all tables from SMUS
         tables = read_assets_for_datasource(domain_id, project_id, ds_id)
 
-        # Filter to approved tables only
         approved_tables = [t for t in tables if t.business_metadata.review_status == ReviewStatus.APPROVED]
 
         if not approved_tables:
             logger.info("No approved tables for data source %s, skipping", ds_id)
             continue
 
-        # Group tables by database
         databases: dict[str, list[Table]] = {}
         for table in approved_tables:
             db_name = table.database or "default"
             databases.setdefault(db_name, []).append(table)
 
-        # Build database entries
         db_entries: list[dict[str, Any]] = []
         for db_name, db_tables in databases.items():
-            db_desc = db_tables[0].database_description if db_tables else ""
+            db_desc = db_tables[0].database_description
             db_entries.append(
                 {
                     "name": db_name,
@@ -112,7 +106,6 @@ def _table_to_induction_format(table: Table) -> dict[str, Any]:
     tech = table.technical_metadata
     biz = table.business_metadata
 
-    # Filter columns to approved only
     approved_cols = [c for c in table.columns if c.business_metadata.review_status == ReviewStatus.APPROVED]
 
     return {
@@ -147,8 +140,7 @@ def _table_to_induction_format(table: Table) -> dict[str, Any]:
                 "targetColumn": fk.target_column,
                 "source": fk.source,
                 "confidence": fk.confidence,
-                # Governance (#1088): carried through so the inducer can gate on
-                # approval and resolve a cross-source target's datasource.
+                # The inducer gates on review status and resolves a cross-source target.
                 "reviewStatus": fk.review_status,
                 "targetDatasourceId": fk.target_datasource_id,
                 "provenance": fk.provenance,

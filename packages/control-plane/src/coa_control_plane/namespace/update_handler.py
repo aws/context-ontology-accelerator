@@ -9,7 +9,6 @@ import json
 import os
 from typing import Any
 
-import structlog
 from coa_common.constants import validate_namespace_id
 from coa_common.dao import DynamoDBDAO
 from coa_common.language_tags import effective_namespace_language
@@ -20,8 +19,6 @@ from coa_control_plane_server.models.update_namespace_request_content import (
 from pydantic import ValidationError
 
 from .validation_errors import format_validation_error
-
-logger = structlog.get_logger(__name__)
 
 _ns_dao: DynamoDBDAO | None = None
 
@@ -58,12 +55,10 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     except ValidationError as exc:
         return api_response(400, {"message": format_validation_error(exc)})
 
-    # Verify namespace exists
     item = _get_ns_dao().get({"PK": f"NS#{namespace_id}", "SK": "METADATA"})
     if not item:
         return api_response(404, {"message": "Namespace not found"})
 
-    # Build update fields from validated request
     update_fields: dict[str, Any] = {}
     if req.display_name is not None:
         if len(req.display_name) > _MAX_DISPLAY_NAME:
@@ -79,7 +74,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
 
     _get_ns_dao().update(key={"PK": f"NS#{namespace_id}", "SK": "METADATA"}, update_fields=update_fields)
 
-    # Return updated namespace
     updated = _get_ns_dao().get({"PK": f"NS#{namespace_id}", "SK": "METADATA"})
     ns = {
         "namespaceId": updated.get("namespaceId"),

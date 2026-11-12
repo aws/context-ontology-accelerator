@@ -120,7 +120,7 @@ class MeteredConnectionConfigProviderTest
     void aCatalogNameCoaCouldHaveDerivedStillBecomesADimension()
     {
         // The other side of it: the check must not cost the dimension for a real name — `<prefix>ds_<digest>`
-        // for COA, whatever the operator registered for stage-1, letters, digits and underscores either way.
+        // for COA, or whatever the operator registered for a single-endpoint deployment, letters, digits and underscores either way.
         ConnectionConfigProvider failing = catalog -> {
             throw new IllegalArgumentException("no such source");
         };

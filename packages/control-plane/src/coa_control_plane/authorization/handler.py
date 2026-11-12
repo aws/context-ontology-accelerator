@@ -59,18 +59,9 @@ logger = structlog.get_logger(__name__)
 
 EXECUTE_API_ACTION = "execute-api:Invoke"
 
-# ---------------------------------------------------------------------------
-# Mutating actions blocked while a namespace is ARCHIVED
-# ---------------------------------------------------------------------------
-# An ARCHIVED namespace is frozen (data retained for audit, no management).
-# These Cedar actions are the mutating operations that must be denied while a
-# namespace is ARCHIVED. The actual deny is enforced by the archived-namespace
-# mutation guard (a ``forbid`` folded into ``default.cedar``, which is always
-# loaded) — this set decides when the authorizer fetches namespace status and
-# populates ``context.namespaceStatus`` so the guard can fire. Reads/queries
-# are intentionally excluded (queries remain allowed on ARCHIVED namespaces),
-# as are the lifecycle actions needed to recover an archived namespace
-# (``setNamespaceStatus``, ``deleteNamespace``).
+# Mutating Cedar actions denied on ARCHIVED namespaces by the ``forbid`` in
+# ``default.cedar``. This set decides when namespace status is fetched for
+# ``context.namespaceStatus``. Reads and the recovery actions are excluded.
 _MUTATING_ACTIONS: frozenset[str] = frozenset(
     {
         "manageSource",
@@ -81,12 +72,6 @@ _MUTATING_ACTIONS: frozenset[str] = frozenset(
         "manageRoles",
     }
 )
-
-_ARCHIVED_STATUS = "ARCHIVED"
-
-# ---------------------------------------------------------------------------
-# Token authorizer singleton (created on first invocation)
-# ---------------------------------------------------------------------------
 
 _token_authorizer: TokenAuthorizer | None = None
 
@@ -105,10 +90,6 @@ def _get_token_authorizer() -> TokenAuthorizer:
     )
     return _token_authorizer
 
-
-# ---------------------------------------------------------------------------
-# Cache invalidation (version-based — clears stale role data)
-# ---------------------------------------------------------------------------
 
 _cache_invalidation_dao: DynamoDBDAO | None = None
 _local_cache_version: int = 0
@@ -156,10 +137,8 @@ def _get_cache_invalidation_dao() -> DynamoDBDAO | None:
     table = os.environ.get("CACHE_INVALIDATION_TABLE_NAME")
     if not table:
         return None
-    # The Lambda authorizer runs on every gated request (result caching is
-    # disabled). Fail fast instead of inheriting the DAO's background
-    # 30-second/three-attempt default (matches the Cedar policy loader's
-    # #1092 fix) — a DynamoDB brownout here must not stall the authorizer.
+    # The authorizer runs on every gated request (result caching is disabled).
+    # Fail fast instead of inheriting the DAO's 30-second/three-attempt default.
     _cache_invalidation_dao = DynamoDBDAO(table, region=os.environ["AWS_REGION"], config=sync_boto_config())
     return _cache_invalidation_dao
 
@@ -180,10 +159,6 @@ def _check_cache_version() -> None:
     except Exception:
         logger.warning("Failed to check cache version, proceeding with stale cache")
 
-
-# ---------------------------------------------------------------------------
-# Namespace status lookup (for the ARCHIVED mutation guard)
-# ---------------------------------------------------------------------------
 
 _namespaces_dao: DynamoDBDAO | None = None
 
@@ -219,24 +194,10 @@ def _get_namespaces_dao() -> DynamoDBDAO:
 
 
 def _get_namespace_status(namespace_id: str) -> str | None:
-    """Return the lifecycle status of an existing namespace.
+    """Return the namespace status, or ``None`` only when the record is absent.
 
-    Contract — the caller relies on this to act correctly:
-
-    * Returns a **status string** when the namespace record exists.
-    * Returns ``None`` *only* when the namespace record is absent — a genuine
-      "not found", which the downstream handler resolves to 404. Mutating a
-      namespace that does not exist has no data to protect, so the guard
-      intentionally lets these through (role policies still apply).
-    * **Raises** on any error condition — missing configuration (see
-      :func:`_get_namespaces_dao`) or a DynamoDB failure (``dao.get`` raises) —
-      so the caller fails closed rather than guessing. This makes "not found"
-      (``None``) cleanly distinguishable from "error" (exception).
-
-    Read fresh on every mutating request (never cached) so that archiving takes
-    effect on the next authorizer cache miss — a stale ``ACTIVE`` would wrongly
-    permit a mutation. Mutations are not the hot path (reads/queries are), so
-    the extra GetItem is acceptable.
+    Raises on missing configuration or a DynamoDB failure so the caller fails
+    closed. Never cached, so archiving takes effect on the next request.
     """
     dao = _get_namespaces_dao()  # raises (fail-closed) if misconfigured
     item = dao.get({"PK": f"NS#{namespace_id}", "SK": "METADATA"})
@@ -249,11 +210,6 @@ def _get_namespace_status(namespace_id: str) -> str | None:
         # visible rather than silent.
         logger.warning("Unrecognized namespace status", namespace_id=namespace_id, status=status)
     return status
-
-
-# ---------------------------------------------------------------------------
-# Policy builder
-# ---------------------------------------------------------------------------
 
 
 def _build_policy(
@@ -278,11 +234,6 @@ def _build_policy(
     }
 
 
-# ---------------------------------------------------------------------------
-# Role resolution from ResourceRoleMappings table
-# ---------------------------------------------------------------------------
-
-
 def _resolve_roles(
     principal_id: str,
     groups: list[str],
@@ -300,17 +251,10 @@ def _resolve_roles(
     cache_key = f"{principal_id}:{','.join(sorted(groups))}"
     cached = _roles_cache.get(cache_key)
     if cached is not None:
-        # Defensive: validate the entry shape before trusting it. Anything else
-        # (e.g. a 2-tuple written by a prior code version) is evicted and
-        # re-queried rather than unpacked blindly.
-        if isinstance(cached, tuple) and len(cached) == 3:
-            expires_at, cached_global, cached_resource = cached
-            if time.monotonic() < expires_at:
-                return cached_global, cached_resource
-            del _roles_cache[cache_key]
-        else:
-            del _roles_cache[cache_key]
-            logger.warning("Evicted corrupt cache entry", cache_key=cache_key)
+        expires_at, cached_global, cached_resource = cached
+        if time.monotonic() < expires_at:
+            return cached_global, cached_resource
+        del _roles_cache[cache_key]
 
     global_roles: list[str] = []
     resource_roles: list[dict[str, str]] = []
@@ -320,24 +264,16 @@ def _resolve_roles(
     principal_keys.extend(f"Group::{sanitize_principal_key(g)}" for g in groups)
 
     for pk in principal_keys:
-        try:
-            # query_all, not query: a single query returns one 1 MB page, so a
-            # principal whose grants span more than that would have the roles on
-            # later pages silently dropped — yielding a 403 on a namespace the
-            # user holds a valid grant for. Page boundaries depend on internal
-            # item ordering, so which roles vanish can change between
-            # invocations, making it look intermittent and unreproducible.
-            items = dao.query_all(
-                QueryParams(
-                    key_condition="#pk = :pk",
-                    expression_values={":pk": pk},
-                    expression_names={"#pk": "principalKey"},
-                    index_name="PrincipalIndex",
-                )
+        # query_all, not query: one query returns a single 1 MB page and would
+        # silently drop roles on later pages.
+        items = dao.query_all(
+            QueryParams(
+                key_condition="#pk = :pk",
+                expression_values={":pk": pk},
+                expression_names={"#pk": "principalKey"},
+                index_name="PrincipalIndex",
             )
-        except Exception:
-            logger.exception("Failed to query roles", principal_key=pk)
-            raise
+        )
         for item in items:
             role = item.get("role", "")
             resource_id = item.get("resourceId", "")
@@ -346,14 +282,8 @@ def _resolve_roles(
             elif resource_id and role:
                 resource_roles.append({"role": role, "resourceUID": resource_id})
 
-    # At the cap, evict the oldest entries (insertion order — dicts preserve it)
-    # rather than clearing the whole cache. A full flush would send the next
-    # burst of authorization requests to the PrincipalIndex GSI all at once
-    # (the API Gateway authorizer result cache is disabled), risking a DynamoDB
-    # throttle spike on the auth hot path. Bounded eviction keeps the
-    # runaway-memory guard without that thundering herd. Not true LRU (no
-    # access-order tracking); upgrade to OrderedDict.move_to_end if hit rate
-    # ever matters.
+    # At the cap, evict the oldest entries rather than flushing everything, so a
+    # burst does not hit the PrincipalIndex GSI all at once. Not true LRU.
     if len(_roles_cache) >= _ROLES_CACHE_MAX_ENTRIES:
         evict_count = max(1, _ROLES_CACHE_MAX_ENTRIES // 10)
         for stale_key in list(_roles_cache)[:evict_count]:
@@ -369,11 +299,6 @@ def _resolve_roles(
         resource_roles,
     )
     return global_roles, resource_roles
-
-
-# ---------------------------------------------------------------------------
-# Cedar evaluation
-# ---------------------------------------------------------------------------
 
 
 # Routes whose downstream handler withholds grant overrides by schema visibility.
@@ -536,10 +461,6 @@ def _evaluate_cedar(
     return result.allowed
 
 
-# ---------------------------------------------------------------------------
-# Request → Cedar action mapping
-# ---------------------------------------------------------------------------
-
 # Maps (API GW resource template, HTTP method) → (Cedar action, Cedar resource type)
 # See docs/authz-access-matrix.md for the full role × action permission matrix.
 #
@@ -642,7 +563,6 @@ _PATH_MAPPING: dict[str, dict[str, tuple[str, str]]] = {
     "/namespaces/{namespaceId}/sources/{sourceId}/scan/{jobId}": {
         "GET": ("viewSource", "Source"),
     },
-    # Resource-oriented review (replaces the legacy bulk POST /review endpoint)
     "/namespaces/{namespaceId}/sources/{sourceId}/approve": {
         "POST": ("manageSource", "Source"),
     },
@@ -694,7 +614,7 @@ _PATH_MAPPING: dict[str, dict[str, tuple[str, str]]] = {
     # OSI export is a full dump of every metric definition (SQL expressions and
     # source tables), and import-job status reports on authoring that names them,
     # so both need source-schema visibility, not just readMetric — a schema-blind
-    # data-analyst is denied them (ADR: decompose-viewnamespace-schema-visibility).
+    # data-analyst is denied them.
     "/namespaces/{namespaceId}/import-jobs/{jobId}": {
         "GET": ("viewSource", "Metric"),
     },
@@ -878,11 +798,6 @@ def _map_request_to_cedar(
     return action, resource_type, resource_id
 
 
-# ---------------------------------------------------------------------------
-# Handler
-# ---------------------------------------------------------------------------
-
-
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG001
     """Lambda handler for API Gateway REQUEST authorizer.
 
@@ -898,10 +813,8 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
 
     logger.info("Authorizer invoked", method_arn=method_arn, resource=resource_path, method=http_method)
 
-    # 1. Check role cache version (invalidation)
     _check_cache_version()
 
-    # 2. Validate token
     try:
         authorizer = _get_token_authorizer()
         result: TokenValidationResult = authorizer.validate(auth_token)
@@ -920,7 +833,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
         emit_authorizer_error(reason="no_principal")
         return _build_policy("", "Deny", method_arn)
 
-    # 3. Resolve roles from ResourceRoleMappings
     region = os.environ["AWS_REGION"]
     rrm_table = os.environ.get("RESOURCE_ROLE_MAPPINGS_TABLE_NAME")
     roles_table = os.environ.get("ROLES_TABLE_NAME")
@@ -939,7 +851,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
             emit_authorizer_error(reason="role_resolution_error")
             return _build_policy(principal_id, "Deny", method_arn)
 
-    # 4. Cedar policy evaluation
     is_allowed = False
     cedar_action, _cedar_resource_type, _cedar_resource_id = _map_request_to_cedar(
         http_method, resource_path, path_params
@@ -964,12 +875,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
                 return _build_policy(principal_id, "Deny", method_arn)
             if namespace_status:
                 cedar_context = {"namespaceStatus": namespace_status}
-            # namespace_status is None only when the namespace record does not
-            # exist (see _get_namespace_status). We intentionally leave the
-            # context unset and let Cedar's role policies evaluate normally —
-            # the downstream handler resolves a missing namespace to 404, and
-            # there is no archived data to protect on a namespace that does not
-            # exist. (Configuration/DynamoDB errors raise above and fail closed.)
 
     route = (http_method, resource_path)
     policies = ""
@@ -1010,11 +915,8 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
 
     effect = "Allow" if is_allowed else "Deny"
 
-    # API GW caches the authorizer response by JWT for the configured TTL.
-    # The cached IAM policy must cover every method on the stage, otherwise
-    # the first request locks the cache to that specific method ARN and
-    # subsequent methods on the same JWT 403 until TTL expires. Cedar
-    # already enforced the (action, resource) for this request.
+    # Cedar already enforced the (action, resource) for this request, so the
+    # Allow policy covers every method on the stage.
     resource_arn = method_arn
     if effect == "Allow":
         arn_prefix = method_arn.split("/", 1)[0]

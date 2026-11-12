@@ -20,7 +20,24 @@ dependencies = [
     "PyJWT>=2.15.1",
     "requests>=2.34.2",
     "structlog>=24.0",
+    "botocore>=1.35.0",
+    "pydantic>=2.13.4",
 ]
+
+# coa_common.testing (moto-backed fixtures for the packages' unit tests) ships in
+# the wheel but is imported only from tests, so moto is a dev dependency.
+[dependency-groups]
+dev = [
+    "moto[dynamodb]>=5.2.1",
+]
+
+# deptry (ci/deptry.yml). Imported inside a function on purpose: llama_index (only kg-build and
+# serve use the embedder adapter) and the Smithy models (review_logic; its callers in sources
+# declare them).
+[tool.deptry.per_rule_ignores]
+DEP001 = ["llama_index", "coa_control_plane_server"]
+DEP003 = ["llama_index", "coa_control_plane_server"]
+DEP004 = ["moto"]
 
 [build-system]
 requires = ["hatchling"]

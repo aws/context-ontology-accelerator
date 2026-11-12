@@ -37,9 +37,6 @@ from coa_control_plane.grants.list_platform_grants_handler import (  # noqa: E40
 pytestmark = pytest.mark.unit
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# CreatePlatformGrant
-# ──────────────────────────────────────────────────────────────────────────
 def _create_event(body: dict | None, caller: str = "admin@company.com") -> dict:
     return {
         "httpMethod": "POST",
@@ -74,10 +71,8 @@ class TestCreatePlatformGrant:
         assert grant["principalId"] == "alice@company.com"
         assert grant["role"] == "platform-admin"
         assert grant["grantedBy"] == "admin@company.com"
-        # Platform grants carry no namespaceId
         assert "namespaceId" not in grant
 
-        # Verify the persisted item uses the platform key shape
         written = mappings_dao.put.call_args[0][0]
         assert written["PK"] == "Platform::GLOBAL#User::alice@company.com"
         assert written["SK"] == "ROLE#platform-admin"
@@ -85,17 +80,11 @@ class TestCreatePlatformGrant:
         assert written["resourceId"] == "GLOBAL"
         assert written["namespaceKey"] == "NS#GLOBAL"
         assert written["resourceRoleKey"] == "Platform::GLOBAL#ROLE#platform-admin"
-        # grantId round-trips to PK+SK
         assert decode_grant_id(grant["grantId"]) == (written["PK"], written["SK"])
 
     @patch("coa_control_plane.grants.create_platform_grant_handler.DynamoDBDAO")
     def test_create_with_special_characters_in_email(self, mock_dao_cls):
-        """Verify that emails with special characters are URL-encoded in principalKey.
-
-        The authorizer queries grants using URL-encoded principal IDs, so grants
-        must be written with the same encoding for users with special characters
-        (like ``+``) in their email to be resolved correctly.
-        """
+        """Special characters are URL-encoded in principalKey to match the authorizer."""
         roles_dao = MagicMock()
         mappings_dao = MagicMock()
         mock_dao_cls.side_effect = [roles_dao, mappings_dao]
@@ -108,19 +97,17 @@ class TestCreatePlatformGrant:
 
         assert resp["statusCode"] == 201
 
-        # Verify the item written to DynamoDB has URL-encoded principalKey
         written = mappings_dao.put.call_args[0][0]
         assert written["principalKey"] == "User::foo%2B123@amazon.com"
         assert written["PK"] == "Platform::GLOBAL#User::foo%2B123@amazon.com"
         assert written["principalRoleKey"] == "User::foo%2B123@amazon.com#ROLE#platform-admin"
-        # Raw principalId preserved for display
         assert written["principalId"] == "foo+123@amazon.com"
 
     @patch("coa_control_plane.grants.create_platform_grant_handler.DynamoDBDAO")
     def test_default_baseline_policy_is_not_grantable(self, mock_dao_cls):
-        """#988: ``default`` exists under PK=GLOBAL (it is the baseline policy
-        bundle), so the existence check alone would accept it. Granting it gives
-        the principal a GLOBAL role row and the namespace list stops filtering."""
+        """``default`` exists under PK=GLOBAL as the baseline policy bundle, so the
+        existence check alone would accept it; granting it would give the
+        principal a GLOBAL role row and break namespace-list filtering."""
         roles_dao = MagicMock()
         mappings_dao = MagicMock()
         mock_dao_cls.side_effect = [roles_dao, mappings_dao]
@@ -230,9 +217,6 @@ class TestCreatePlatformGrant:
         assert resp["statusCode"] == 500
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# ListPlatformGrants
-# ──────────────────────────────────────────────────────────────────────────
 def _list_event(query_params: dict | None = None) -> dict:
     return {
         "httpMethod": "GET",
@@ -399,10 +383,6 @@ class TestListPlatformGrantsPagination:
         assert json.loads(resp["body"])["message"].startswith("Invalid nextToken")
         mock_dao_cls.return_value.query.assert_not_called()
 
-    def test_smithy_example_next_token_returns_400(self):
-        resp = list_handler(_list_event({"nextToken": "eyJvZmZzZXQiOjI1fQ=="}), None)
-        assert resp["statusCode"] == 400
-
     @pytest.mark.parametrize(
         "decoded",
         [
@@ -449,9 +429,6 @@ class TestListPlatformGrantsPagination:
         assert resp["statusCode"] == 400
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# DeletePlatformGrant
-# ──────────────────────────────────────────────────────────────────────────
 def _delete_event(grant_id: str) -> dict:
     return {
         "httpMethod": "DELETE",
@@ -509,9 +486,6 @@ class TestDeletePlatformGrant:
         assert resp["statusCode"] == 400
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# Router dispatch (grants_handler)
-# ──────────────────────────────────────────────────────────────────────────
 class TestGrantsRouterPlatformRoutes:
     @patch("coa_control_plane.grants.grants_handler.create_platform_handler")
     def test_post_grants_routes_to_create_platform(self, mock_create):

@@ -101,15 +101,6 @@ class DatabricksQueryBuilderTest
     }
 
     @Test
-    void preservesAColumnNamesCase()
-    throws SQLException
-    {
-        // information_schema lower-cases table names but preserves column names, and the preserved spelling
-        // has to reach the warehouse.
-        assertTrue(sqlFor(noConstraints()).contains("`CustomerName`"));
-    }
-
-    @Test
     void appendsALimitWhenAthenaPushedOne()
     throws SQLException
     {

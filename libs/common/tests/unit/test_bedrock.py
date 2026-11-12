@@ -26,17 +26,10 @@ pytestmark = pytest.mark.unit
 
 
 class TestDefaultModelIdResolution:
-    """The chat model default is resolved from the environment (#94).
+    """The chat model default is resolved from the environment.
 
-    Table enrichment and constraint inference construct ``BedrockClient``
-    without a ``model_id``, so before this the module constant was the only
-    input and an infrastructure change could not reach those paths — they
-    stayed on a ``us.`` inference profile that a non-US region cannot invoke.
-
-    Tests target ``resolve_chat_model_id`` rather than reloading the module:
-    ``DEFAULT_MODEL_ID`` is read once at import (matching a container's static
-    environment), and reloading swaps the module object out from under the rest
-    of this file's patches.
+    Tests target ``resolve_chat_model_id`` rather than reloading the module,
+    which would swap the module object out from under the rest of this file's patches.
     """
 
     def test_env_var_wins(self, monkeypatch):
@@ -399,14 +392,7 @@ class TestGuardrailIntegration:
     @patch("coa_common.bedrock.logger")
     @patch("coa_common.bedrock.boto3")
     def test_guardrail_intervened_without_block_logs_masking_warning(self, mock_boto3, mock_logger):
-        """A masking (ANONYMIZE) intervention must leave an observable log line.
-
-        Regression for the dead-code bug: the masking warning sat AFTER a
-        ``raise`` inside ``if blocked:``, so it was unreachable AND wrongly nested
-        — an intervention that masked values (but did not block) produced no log
-        at all. The warning now sits in its own ``if intervened:`` branch after
-        the blocked ``raise``, so an unblocked intervention is logged.
-        """
+        """A masking (ANONYMIZE) intervention must leave an observable log line."""
         mock_client = MagicMock()
         mock_boto3.client.return_value = mock_client
 
@@ -650,7 +636,7 @@ class TestPromptSegments:
 
 
 class TestGuardrailDecisionMetrics:
-    """#111 AC10/AC11 — Converse guardrail decisions are counted and logged."""
+    """Converse guardrail decisions are counted and logged."""
 
     _ALLOW_RESPONSE = {
         "output": {"message": {"content": [{"text": '{"ok": true}'}]}},

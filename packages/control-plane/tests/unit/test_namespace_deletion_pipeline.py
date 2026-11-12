@@ -133,7 +133,6 @@ class TestDeleteMetrics:
         delete_event = json.loads(mock_client.invoke.call_args.kwargs["Payload"])
         assert delete_event["resource"] == "/namespaces/{namespaceId}/bulk-delete-metrics"
         body = json.loads(delete_event["body"])
-        # Uses deleteAll: true, NOT explicit names list
         assert body == {"deleteAll": True}
 
     def test_returns_zero_when_no_metrics_deleted(self):

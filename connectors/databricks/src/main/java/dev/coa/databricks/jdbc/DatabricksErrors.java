@@ -18,7 +18,7 @@ import java.util.regex.Pattern;
  *
  * <p>A SQL Warehouse that is not running answers with a temporarily-unavailable error and resumes in
  * the background, taking seconds for serverless and minutes for classic and pro. The driver would
- * retry that for up to 900 seconds, outliving the connector's 120-second timeout, so
+ * retry that for up to 900 seconds, outliving the connector's 600-second timeout, so
  * {@link DatabricksConnectionFactory} turns the retry off and this class labels the result. Athena
  * re-invokes a failed connector, so blocking turns one query into several billed Lambda-minutes and
  * several warehouse resumes.
@@ -66,11 +66,8 @@ public final class DatabricksErrors
      * digits have to be preceded by a status-code word within a short distance and must not run into
      * further alphanumerics or a hyphen on either side, which is what excludes a UUID segment.
      *
-     * <p>The optional version group is what admits a raw status line, {@code HTTP/1.1 503 Service
-     * Unavailable}. Without it the gap between the keyword and the digits is
-     * {@code [^0-9a-z]{0,12}}, which cannot cross the {@code 1.1}, so the commonest form of all did not
-     * match. It failed safe — {@code DATABRICKS_REQUEST_FAILED} rather than a wrong retry hint — but it
-     * failed.
+     * <p>The optional version group admits a raw status line such as {@code HTTP/1.1 503 Service
+     * Unavailable}.
      */
     private static final Pattern HTTP_STATUS = Pattern.compile(
             "(?i)\\b(?:http|https|status|statuscode|status code|response code|code|error code)\\b"
@@ -104,9 +101,7 @@ public final class DatabricksErrors
     public static final String QUERY_FAILED_PREFIX = "DATABRICKS_REQUEST_FAILED";
 
     /**
-     * Prefix on the message for a table that exceeded the connector's row ceiling. Kept here beside
-     * the other three rather than inline at its throw site: it is the same kind of thing, a stable
-     * token the README documents and an alarm can match on.
+     * Prefix on the message for a table that exceeded the connector's row ceiling.
      */
     public static final String TABLE_TOO_LARGE_PREFIX = "DATABRICKS_TABLE_TOO_LARGE";
 
@@ -305,11 +300,8 @@ public final class DatabricksErrors
     /**
      * Whether any exception in {@code cause}'s chain comes from the Databricks driver.
      *
-     * <p>Matched on the package rather than on a type, so all four of the driver's exception
-     * hierarchies are covered and a fifth would be too. The call sites reach three of them directly;
-     * {@code DatabricksRetryHandlerException} extends {@link java.io.IOException} and arrives converted,
-     * as {@code DatabricksHttpClient.throwHttpException} turns it into a {@code DatabricksHttpException},
-     * which is a {@code SQLException}. Matching on the package makes that conversion irrelevant here.
+     * <p>Matched on the package rather than on a type, so every one of the driver's exception
+     * hierarchies is covered.
      */
     public static boolean isFromDriver(Throwable cause)
     {

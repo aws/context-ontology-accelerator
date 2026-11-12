@@ -30,31 +30,20 @@ public class DatabricksCompositeHandler extends CompositeHandler
         this(System.getenv());
     }
 
-    /**
-     * @param environment the Lambda's environment. A parameter so a test can build a whole container, and
-     *                    so the read happens in one place.
-     */
+    /** Builds a container from an explicit environment, so a test can build a whole one. */
     DatabricksCompositeHandler(Map<String, String> environment)
     {
         this(environment, ConnectionConfigProviders.fromEnvironment(environment));
     }
 
-    /**
-     * @param wiring the one provider and one credential cache both halves resolve through. A parameter so
-     *               a test can count the reads a container makes.
-     */
+    /** Builds a container over one provider and credential cache shared by both halves. */
     DatabricksCompositeHandler(Map<String, String> environment,
                                ConnectionConfigProviders.Wiring wiring)
     {
         this(environment, wiring.provider(), wiring.credentials());
     }
 
-    /**
-     * @param configs     the one provider both halves resolve through.
-     * @param credentials the one credential cache both halves read through. Package-private and taken
-     *                    loose only here, so a test can hand over a fake provider; every public route in
-     *                    takes the pair {@link ConnectionConfigProviders#fromEnvironment} built.
-     */
+    /** Takes the provider and credential cache loose so a test can hand over a fake provider. */
     DatabricksCompositeHandler(Map<String, String> environment, ConnectionConfigProvider configs,
                                CredentialSource credentials)
     {

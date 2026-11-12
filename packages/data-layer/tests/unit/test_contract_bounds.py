@@ -48,9 +48,6 @@ _GRAPH_TRAVERSE = "/namespaces/{namespaceId}/graph/traverse"
 _SCHEMA = "/namespaces/{namespaceId}/schema"
 
 
-# ── Minimal Smithy reader ────────────────────────────────────────────────────
-
-
 def _model() -> str:
     assert _SERVE_SMITHY.is_file(), f"serve.smithy not found at {_SERVE_SMITHY}"
     return _SERVE_SMITHY.read_text()
@@ -145,9 +142,6 @@ def _member_bound(text: str, operation: str, member: str, trait: str) -> tuple[f
     if bound == (None, None) and target[0].isupper() and target not in {"Integer", "Long", "Float", "Boolean"}:
         bound = _bound(_shape_traits(text, target), trait)
     return bound
-
-
-# ── Parity ───────────────────────────────────────────────────────────────────
 
 
 class TestBoundsMatchSmithyModel:
@@ -253,9 +247,6 @@ class TestBoundsMatchSmithyModel:
     def test_parser_reads_a_known_bound(self):
         """Negative control: the parser must actually find traits, or parity passes vacuously."""
         assert _member_bound(_model(), "Query", "tierOverride", "range") != (None, None)
-
-
-# ── Enforcement ──────────────────────────────────────────────────────────────
 
 
 def _event(method: str, resource: str, body: dict | None = None, query: dict | None = None) -> dict:

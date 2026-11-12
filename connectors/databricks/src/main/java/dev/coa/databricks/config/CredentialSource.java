@@ -61,13 +61,6 @@ public final class CredentialSource
     /**
      * The parsed credential, from cache when it is still fresh.
      *
-     * <p>No catch here on purpose. Unreadable and unusable leave as different types, each already
-     * classified one layer out: {@link DatabricksCredential#fromSecretJson} names the secret and the
-     * accepted shapes, {@link AssumedRoleCredentialSource} separates assume-denied from
-     * readable-but-not-through-this-role, and {@code DatabricksConnectionFactory.open()} turns a raw
-     * Secrets Manager exception into {@code CONNECTOR_CREDENTIAL_UNREADABLE}. A catch here could only
-     * restate one of them.
-     *
      * @throws IllegalArgumentException if the secret is not a supported shape.
      */
     public DatabricksCredential credentialFor(ConnectionConfig config)
@@ -80,12 +73,10 @@ public final class CredentialSource
      * The cache key: namespace, the role the secret is reached through, then the secret, newline-separated
      * so no combination of values can concatenate into another combination's key.
      *
-     * <p>The namespace is in the key even though nothing can currently exercise it. A hit short-circuits
-     * {@link SecretReader#read}, where the assume presents the ExternalId binding a read to one tenant, so
-     * a key omitting the namespace would let two namespaces sharing a role and secret serve each other's
-     * cached credential with no assume made. What makes that unreachable today is upstream: the sources
-     * API's role claim refuses a {@code crossAccountRoleArn} another namespace already claimed. Different
-     * service, different language, so neither side may be weakened because the other covers it.
+     * <p>The namespace is in the key so two namespaces sharing a role and secret cannot serve each
+     * other's cached credential: a hit skips the assume that presents the ExternalId binding a read to
+     * one tenant. The sources API refuses a role claimed by another namespace, but neither side may rely
+     * on the other.
      */
     private static String keyFor(ConnectionConfig config)
     {
@@ -98,5 +89,4 @@ public final class CredentialSource
         return source.namespaceId() + '\n' + source.crossAccountRoleArn() + '\n'
                 + config.credentialSecretArn();
     }
-
 }

@@ -35,14 +35,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
     Verifies the decoded grant belongs to the platform resource and that it
     exists before deleting, so namespace grants cannot be revoked here and a
     missing grant returns 404 rather than a misleading 200.
-
-    Args:
-        event: API Gateway proxy event with a ``grantId`` path parameter.
-        context: Lambda context object (unused).
-
-    Returns:
-        An API Gateway proxy response: 200 on success, or a 4xx/5xx error
-        response.
     """
     path_params = event.get("pathParameters") or {}
     grant_id = path_params.get("grantId", "")

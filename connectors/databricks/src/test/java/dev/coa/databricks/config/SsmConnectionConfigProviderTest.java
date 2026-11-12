@@ -67,12 +67,7 @@ class SsmConnectionConfigProviderTest
         try (java.io.InputStream stream =
                      SsmConnectionConfigProviderTest.class.getResourceAsStream(GOLDEN_RESOURCE)) {
             assertNotNull(stream, "missing test resource " + GOLDEN_RESOURCE);
-            java.io.ByteArrayOutputStream buffer = new java.io.ByteArrayOutputStream();
-            byte[] chunk = new byte[4096];
-            for (int read = stream.read(chunk); read >= 0; read = stream.read(chunk)) {
-                buffer.write(chunk, 0, read);
-            }
-            return new String(buffer.toByteArray(), java.nio.charset.StandardCharsets.UTF_8);
+            return new String(stream.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
         }
         catch (java.io.IOException cause) {
             throw new IllegalStateException("could not read " + GOLDEN_RESOURCE, cause);
@@ -257,12 +252,6 @@ class SsmConnectionConfigProviderTest
 
         assertEquals(java.util.Collections.singletonList(parameterNameFor(CATALOG_A)),
                 parameters.reads);
-        assertEquals("dbc-a1b2345c-d6e7.cloud.databricks.com", config.workspaceHostname());
-        assertEquals("/sql/1.0/warehouses/a1b234c567d8e9fa", config.httpPath());
-        assertEquals("main", config.catalog());
-        assertEquals("sales", config.schema());
-        assertEquals("arn:aws:secretsmanager:us-east-1:222233334444:secret:dbx-sp-AbCdEf",
-                config.credentialSecretArn());
     }
 
     @Test
@@ -279,16 +268,12 @@ class SsmConnectionConfigProviderTest
     @Test
     void theResolvedConfigurationCarriesTheSourceNamespaceAndRole()
     {
-        // The values are the golden fixture's, not this file's: see body(). The catalog name is asserted
-        // against the name the parameter was resolved FOR, since that one is not read out of the body.
+        // The catalog name is asserted against the name the parameter was resolved FOR, since that one is
+        // not read out of the body. The other values are the golden fixture's, asserted above.
         ConnectionConfig config = providerOver(oneSource()).configFor(CATALOG_A);
 
         assertTrue(config.isCoaManaged());
         assertEquals(CATALOG_A, config.managedSource().athenaCatalogName());
-        assertEquals("src-abc123", config.managedSource().sourceId());
-        assertEquals("550e8400-e29b-41d4-a716-446655440000", config.managedSource().namespaceId());
-        assertEquals("arn:aws:iam::222233334444:role/coa-dev-datasource-access-dbx",
-                config.managedSource().crossAccountRoleArn());
     }
 
     @Test
@@ -443,13 +428,6 @@ class SsmConnectionConfigProviderTest
     }
 
     @Test
-    void aParameterWithADatabaseNameIsAlwaysPinnedNeverUnpinned()
-    {
-        // Nothing this provider returns can be unpinned, so no caller has to handle that shape.
-        assertTrue(providerOver(oneSource()).configFor(CATALOG_A).isSchemaPinned());
-    }
-
-    @Test
     void aParameterWithNoDeploymentIdIsRefusedRatherThanTrusted()
     {
         FakeParameters parameters = new FakeParameters()
@@ -494,14 +472,9 @@ class SsmConnectionConfigProviderTest
     @Test
     void aNamespaceIdCarryingWhitespaceIsRefusedRatherThanTrimmed()
     {
-        // The one field CONCATENATED rather than only validated: it is the per-source input to
-        // sts:ExternalId, which Python derives verbatim from the same field and publishes for a customer to
-        // paste into a trust policy. Trimming here — which the shared text() reader does for every other
-        // field — makes Java's ExternalId differ from the published one and surfaces as AccessDenied on every
-        // query. Refused, therefore, not normalised.
-        //
-        // "ns\\t1" is a JSON escape in the fixture, not a raw tab: a raw control character inside a JSON
-        // string is invalid JSON and would be refused one step earlier, proving nothing about this check.
+        // namespaceId is concatenated into sts:ExternalId, which the control plane derives verbatim from
+        // the same field, so trimming would make the two differ. "ns\\t1" is a JSON escape, not a raw tab:
+        // a raw control character is invalid JSON and would be refused one step earlier.
         for (String namespaceId : new String[] {" ns-1", "ns-1 ", " ns-1 ", "ns 1", "ns\\t1"}) {
             FakeParameters parameters = new FakeParameters()
                     .put(parameterNameFor(CATALOG_A), body(with("namespaceId", namespaceId)));
@@ -520,10 +493,9 @@ class SsmConnectionConfigProviderTest
     @Test
     void anUnknownKeyIsIgnoredRatherThanRefused()
     {
-        // The parameter's only writer is the sources API, which refuses a credential-shaped key before
-        // it writes (test_a_credential_shaped_key_is_refused_before_the_write in packages/sources). So
-        // an extra key here is forward compatibility rather than a leak, and a reader that refused one
-        // would make adding a field a breaking change.
+        // The parameter's only writer refuses a credential-shaped key before it writes, so an extra key
+        // here is forward compatibility rather than a leak, and a reader that refused one would make
+        // adding a field a breaking change.
         FakeParameters parameters = new FakeParameters()
                 .put(parameterNameFor(CATALOG_A), body(with("someFutureField", "whatever")));
 

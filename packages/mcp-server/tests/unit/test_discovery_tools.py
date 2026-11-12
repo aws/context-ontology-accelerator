@@ -19,8 +19,7 @@ from coa_mcp.tools.discovery import describe_schema, list_metrics
 @pytest.fixture
 def mock_lambda_client():
     """Mock LambdaClient with async invoke_api."""
-    client = AsyncMock()
-    return client
+    return AsyncMock()
 
 
 @pytest.mark.unit
@@ -92,11 +91,7 @@ class TestListMetrics:
         )
         call_kwargs = mock_lambda_client.invoke_api.call_args[1]
         assert call_kwargs["query_params"]["nextToken"] == "opaque-continuation-cursor"
-        # ``status`` is intentionally not part of the signature — the Smithy
-        # contract declares it but the metric-service backend does not filter
-        # on it today, so forwarding would produce a silently-unfiltered
-        # result. Pin its absence from the query so a future revert of the
-        # drop shows up here rather than as a silent-wrong-answer bug.
+        # The backend does not filter on status, so it must not be forwarded.
         assert "status" not in call_kwargs["query_params"]
 
 
@@ -112,10 +107,6 @@ class TestDescribeSchema:
             "-dev-ontology-api-proxy",
         ):
             await describe_schema(mock_lambda_client, "ns1", "tok")
-        # Path is ``/namespaces/{namespaceId}/schema`` (the Smithy path
-        # data-layer's DescribeSchema targets), not the older
-        # ``/graph/schema`` — the ontology-engine api-proxy handles both,
-        # so both MCP and data-layer converge on one endpoint.
         mock_lambda_client.invoke_api.assert_called_once_with(
             function_name="-dev-ontology-api-proxy",
             method="GET",
@@ -128,7 +119,7 @@ class TestDescribeSchema:
 
     @pytest.mark.asyncio
     async def test_class_filter_forwarded(self, mock_lambda_client):
-        """Missing input the previous signature dropped — now reaches the backend."""
+        """class_filter is forwarded to the backend."""
         mock_lambda_client.invoke_api.return_value = {"classes": [], "ontologyVersion": ""}
         await describe_schema(mock_lambda_client, "ns", "tok", class_filter="https://schema.org/Order")
         call_kwargs = mock_lambda_client.invoke_api.call_args[1]
@@ -169,20 +160,11 @@ class TestDescribeSchema:
 
     @pytest.mark.asyncio
     async def test_projects_to_smithy_shape(self, mock_lambda_client):
-        """Response is projected to the Smithy ``DescribeSchema`` output —
-        ``{classes, ontologyVersion}`` — even when the backend returns extra
-        fields. Data-layer's ``_handle_describe_schema`` does the same
-        projection; both surfaces must return byte-identical bodies for the
-        same input. Regression for the parity delta caught end-to-end:
-        the ontology-engine backend echoes a ``namespace`` field the Smithy
-        shape doesn't declare, which used to leak through MCP unchanged.
-        """
+        """Response is projected to {classes, ontologyVersion}, dropping extra backend fields."""
         mock_lambda_client.invoke_api.return_value = {
             "classes": [{"uri": "urn:c:A", "label": "A"}],
             "ontologyVersion": "v2",
-            # Backend adds this — MUST be stripped.
             "namespace": "sales",
-            # Belt-and-braces: any other future backend echo also drops.
             "sourceGraphs": ["urn:g:1"],
         }
         result = await describe_schema(mock_lambda_client, "sales", "tok")

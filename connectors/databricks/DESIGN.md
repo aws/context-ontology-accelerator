@@ -30,10 +30,9 @@ and ignores the argument, because one deployment is one endpoint. The seam exist
 the registered catalog name to a connector verbatim on every call path, and that name is the
 discriminator a multiplexed deployment resolves on.
 
-**The multiplexed deployment now exists**, and the prediction the seam was built on held: it is a second
-implementation of that interface plus a second credential path, not a reshaping of every call site. What
-it did cost is described below — and the UC-catalog-cannot-travel argument above is untouched by it,
-because in that mode the UC catalog comes from the source's own parameter rather than from a request.
+A multiplexed deployment is a second implementation of that interface plus a second credential path,
+not a reshaping of every call site. The UC-catalog-cannot-travel argument above still holds, because in
+that mode the UC catalog comes from the source's own parameter rather than from a request.
 
 ## One jar, two modes, and where the seam had to go
 
@@ -52,7 +51,7 @@ connector factory and the same shared alarms, so the branch costs no duplicated 
 variable the app then sets on the Lambda, so synth and runtime cannot disagree about the mode, and it is
 the same name the operator already has to reason about rather than a second selector beside it.
 
-Unset means `environment`, as in the jar, so a stage-1 deployment is unchanged. An unrecognised value is
+Unset means `environment`, as in the jar, so an existing single-endpoint deployment is unchanged. An unrecognised value is
 refused rather than defaulted: the two modes require different variables, and defaulting would report the
 typo as a missing coordinate.
 
@@ -67,8 +66,7 @@ A COA-operated connector left in `environment` mode with the single-target varia
 catalog name entirely, so every namespace's catalog resolves the one workspace and one credential that
 function was given and namespace A's query returns namespace B's rows with nothing erroring.
 
-**The per-request catalog re-check is no defence against that**, and the reason is worth stating
-plainly: in `environment` mode nothing is bound to a catalog to re-check against. Which is why the check
+**The per-request catalog re-check is no defence against that**, because in `environment` mode nothing is bound to a catalog to re-check against. Which is why the check
 reads the function's own environment rather than the request path, refuses at initialisation rather than
 per request, and runs in both directions with two different messages. It is the guard that survives a
 variable edited onto a deployed function by hand or written by a deployment tool other than this app,
@@ -114,16 +112,15 @@ every onboarding with a plain `AccessDenied` and nothing in it to point at. The 
 Python function out in a comment and the test asserts against a literal rather than against the
 derivation, so the two cannot drift together.
 
-**Trimming was there, and removing it is not the same as leaving whitespace alone.** The Java trimmed
-both operands while Python trims neither, so a `RESOURCE_PREFIX` carrying stray whitespace produced two
-different strings — and, because the value the customer pastes into their trust policy is the *Python*
-one, the mismatch surfaced as `AccessDenied` on every query rather than as a bad deployment. Trimming is
-the tempting fix and it is the wrong direction: it makes the connector *succeed* on an input the
-authority got wrong. So the connector **refuses** whitespace instead, at initialisation for the prefix
+**Whitespace is refused, not trimmed.** Python trims neither operand, and the value the customer pastes
+into their trust policy is the *Python* one, so a connector that trimmed would derive a different string
+from a `RESOURCE_PREFIX` carrying stray whitespace and surface it as `AccessDenied` on every query.
+Trimming would also make the connector *succeed* on an input the authority got wrong. So the connector
+**refuses** whitespace, at initialisation for the prefix
 and at the request for the namespace, with a message that says the value must match Python's derivation
 byte for byte. Being stricter than the authority is safe; being looser is not.
 
-**One property of the derivation is weaker than it reads, and is worth stating rather than relying on.**
+**One property of the derivation is weaker than it reads.**
 The concatenation carries no separator, so `prefixA + namespaceX` can equal `prefixB + namespaceY`
 whenever one prefix is a strict prefix of the other — `coa-dev-` + `x` and `coa-` + `dev-x` are the same
 eleven characters. So carrying the deployment's prefix makes replaying one deployment's ExternalId
@@ -251,9 +248,7 @@ SDK's Arrow.
 **This connector always advertises `filter,limit,topn`, which are exactly the three its query builder
 implements**, and, measured against a live warehouse, the advertisement changes nothing observable.
 Advertising is not what causes push-down; it is what tells Athena it may stop re-applying the same
-optimisation itself. This section was rewritten twice: once after the end-to-end pass, because the
-premise it previously rested on turned out to be false, and again when what ships went from silence to
-these three.
+optimisation itself.
 
 ### What was measured
 
@@ -291,13 +286,7 @@ capability map.** Those are part of the base `ReadRecords` payload, not somethin
 unlocks. Since this connector's query builder reads all three unconditionally, the predicate and the
 limit reach the warehouse either way.
 
-> An earlier version of this section — and the design it came from — claimed that *"Athena pushes
-> nothing into a connector that advertises nothing: it requests whole tables and applies the predicate
-> and the `LIMIT` itself."* **That is wrong**, at least for simple single-table predicates, integer
-> limits and top-N. It is the premise the whole feature was justified on, so it is worth stating
-> plainly rather than quietly fixing.
-
-One shape behaves differently and is worth knowing: with **both** a predicate and a limit
+One shape behaves differently: with **both** a predicate and a limit
 (`WHERE region_code='EU' LIMIT 1`), Athena pushes the predicate but **not** the limit — 2 rows, in both
 configurations. It applies the limit itself after filtering.
 
@@ -339,7 +328,7 @@ as well. The cold-start log line reports the set the deployed jar advertised, so
 readable without inspecting the artifact.
 
 **What is still missing is a canary.** Nothing asserts that push-down is still reaching the warehouse:
-the test that would is skipped in CI for want of a workspace (R-3), and `ConnectorRowsReturned` cannot
+the test that would is skipped in CI for want of a workspace, and `ConnectorRowsReturned` cannot
 tell a push-down regression from an aggregate-heavy workload. A canary is the real protection against
 the scenario above. An advertisement only states an intent; it cannot report whether the intent held.
 
@@ -371,8 +360,8 @@ From the end-to-end pass against a Serverless PRO **Small** warehouse (10-minute
 | Athena total, cold Lambda | ~18 s wall clock | measured end to end |
 | Warehouse statement duration, average | 784 ms | `system.query.history` |
 
-**The warm end-to-end figure is the surprising one, and it does not meet the design target.** The LLD
-budgets p50 3 s / p95 6 s for a warm single-source query; the measured floor on a five-row table is
+**The warm end-to-end figure is the surprising one, and it does not meet the design target.** The
+target is p50 3 s / p95 6 s for a warm single-source query; the measured floor on a five-row table is
 8.3 s, with 12.7 s seen. The time is not in the Lambda (milliseconds for metadata, under 1.4 s for the
 read) and not in Athena planning (under 0.8 s) — it is Athena's federation orchestration, which makes
 a separate Lambda invocation per protocol step and schedules each one. **Anyone quoting a latency
@@ -448,7 +437,7 @@ Catalog from somewhere else, and reading it through two federation layers is slo
 than onboarding its own source; the two shallow-clone types are excluded because their rows duplicate
 another table's, and including them would put the same facts in the ontology twice under two names.
 
-The failure mode of getting this wrong is worth knowing, because it is not the obvious one. A filter of
+The failure mode of getting this wrong is not the obvious one. A filter of
 `table_type IN ('BASE TABLE', 'VIEW')` does not return nothing: `'VIEW'` *is* a Databricks value, so
 measured on that fixture schema it returns **one** row. A steward sees a source that scanned
 successfully and contains views but no tables, which reads as a permissions problem rather than as a
@@ -481,8 +470,7 @@ against a two-column foreign key it returns **four rows, two of them wrong**.
 
 This connector walks `referential_constraints` to the referenced constraint and matches
 `kcu.position_in_unique_constraint = ref.ordinal_position`, which is the ANSI-defined pairing and the
-only one correct for a composite key. It was verified live, once, by hand — the record is the connector
-LLD's §8.1. **Nothing in the committed test suite asserts it**, because the integration suites that did
+only one correct for a composite key. It was verified live, once, by hand. **Nothing in the committed test suite asserts it**, because the integration suites that did
 were removed with the workspace they needed; see [Tests](README.md#tests). So the reason for the
 complexity is now asserted in a comment rather than checked, which is exactly the shape of thing that
 gets simplified back into a bug. Rebuilding that assertion is the first thing to do on acquiring a
@@ -503,7 +491,7 @@ prose on both sides — removing them here would delete text a customer wrote an
 
 ### A tag can become live after an earlier one is removed, and that is why it is disarmed rather than deleted
 
-Two rules that each look obviously right are incompatible, and the resolution is worth recording because
+Two rules that each look obviously right are incompatible, and
 both of the obvious implementations are wrong.
 
 **COA's parser scans the customer's original string**, so a tag preceded by an identifier character is

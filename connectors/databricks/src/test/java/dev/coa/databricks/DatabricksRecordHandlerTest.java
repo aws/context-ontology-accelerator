@@ -188,7 +188,7 @@ class DatabricksRecordHandlerTest
      *
      * <p>{@code QueryStatusChecker.isQueryRunning()} starts a background poller against Athena the first
      * time it is called, so the real one cannot be used here — and passing null makes the loop NPE on its
-     * first row, which is why no test in this file reached a second row before. Overriding is enough: the
+     * first row. Overriding is enough: the
      * constructor only assigns its arguments, so the nulls are never dereferenced.
      */
     private static final class AlwaysRunning extends QueryStatusChecker
@@ -423,19 +423,19 @@ class DatabricksRecordHandlerTest
         // The only place in the Java suite where the REAL EnvironmentConnectionConfigProvider is wired into a
         // handler — every other handler test goes through the multiplexed fake, so without this the mode
         // switch could break the default path with the whole suite green.
-        Map<String, String> stageOne = new HashMap<>();
-        stageOne.put(ConnectionConfig.WORKSPACE_HOSTNAME_VAR, MultiplexedProvider.HOST);
-        stageOne.put(ConnectionConfig.HTTP_PATH_VAR, "/sql/1.0/warehouses/a1b234c567d8e9fa");
-        stageOne.put(ConnectionConfig.CATALOG_VAR, "workspace");
-        stageOne.put(ConnectionConfig.SCHEMA_VAR, "coa_dbx_test");
-        stageOne.put(ConnectionConfig.CREDENTIAL_SECRET_ARN_VAR,
+        Map<String, String> environmentMode = new HashMap<>();
+        environmentMode.put(ConnectionConfig.WORKSPACE_HOSTNAME_VAR, MultiplexedProvider.HOST);
+        environmentMode.put(ConnectionConfig.HTTP_PATH_VAR, "/sql/1.0/warehouses/a1b234c567d8e9fa");
+        environmentMode.put(ConnectionConfig.CATALOG_VAR, "workspace");
+        environmentMode.put(ConnectionConfig.SCHEMA_VAR, "coa_dbx_test");
+        environmentMode.put(ConnectionConfig.CREDENTIAL_SECRET_ARN_VAR,
                 "arn:aws:secretsmanager:us-east-1:111122223333:secret:dbx-AbCdEf");
 
         FakeJdbc jdbc = warehouseReturning(2);
-        DatabricksRecordHandler handler = new DatabricksRecordHandler(stageOne,
+        DatabricksRecordHandler handler = new DatabricksRecordHandler(environmentMode,
                 // fromEnvironment, not the provider directly: the factory is what a real cold start calls,
                 // so this covers the mode default and the mutual-exclusion check as well.
-                ConnectionConfigProviders.fromEnvironment(stageOne).provider(),
+                ConnectionConfigProviders.fromEnvironment(environmentMode).provider(),
                 recordingConnections(jdbc),
                 new ConnectorMetrics("databricks", emitted::add));
         CountingSpiller spiller = new CountingSpiller();
@@ -454,18 +454,18 @@ class DatabricksRecordHandlerTest
     @Test
     void anEnvironmentModeDeploymentStillRefusesASchemaOutsideItsPin()
     {
-        // The pin is a containment boundary in this mode too, and it is the one a stage-1 deployer set
+        // The pin is a containment boundary in this mode too, and it is the one an environment-mode deployer set
         // themselves — so the message names the variable, unlike the managed case below.
-        Map<String, String> stageOne = new HashMap<>();
-        stageOne.put(ConnectionConfig.WORKSPACE_HOSTNAME_VAR, MultiplexedProvider.HOST);
-        stageOne.put(ConnectionConfig.HTTP_PATH_VAR, "/sql/1.0/warehouses/a1b234c567d8e9fa");
-        stageOne.put(ConnectionConfig.CATALOG_VAR, "workspace");
-        stageOne.put(ConnectionConfig.SCHEMA_VAR, "coa_dbx_test");
-        stageOne.put(ConnectionConfig.CREDENTIAL_SECRET_ARN_VAR,
+        Map<String, String> environmentMode = new HashMap<>();
+        environmentMode.put(ConnectionConfig.WORKSPACE_HOSTNAME_VAR, MultiplexedProvider.HOST);
+        environmentMode.put(ConnectionConfig.HTTP_PATH_VAR, "/sql/1.0/warehouses/a1b234c567d8e9fa");
+        environmentMode.put(ConnectionConfig.CATALOG_VAR, "workspace");
+        environmentMode.put(ConnectionConfig.SCHEMA_VAR, "coa_dbx_test");
+        environmentMode.put(ConnectionConfig.CREDENTIAL_SECRET_ARN_VAR,
                 "arn:aws:secretsmanager:us-east-1:111122223333:secret:dbx-AbCdEf");
 
-        DatabricksRecordHandler handler = new DatabricksRecordHandler(stageOne,
-                ConnectionConfigProviders.fromEnvironment(stageOne).provider(),
+        DatabricksRecordHandler handler = new DatabricksRecordHandler(environmentMode,
+                ConnectionConfigProviders.fromEnvironment(environmentMode).provider(),
                 recordingConnections(warehouseReturning(1)),
                 new ConnectorMetrics("databricks", emitted::add));
 
@@ -547,8 +547,7 @@ class DatabricksRecordHandlerTest
         //   connections   — a ThreadLocal binding whose lifetime is one super.readWithConstraint call on
         //     one thread, per-thread by construction where a field is not.
         // Sorted, because getDeclaredFields() has no specified order.
-        List<String> allowedMutable = new ArrayList<>(Arrays.asList("connections", "queryBuilders"));
-        Collections.sort(allowedMutable);
+        List<String> allowedMutable = Arrays.asList("connections", "queryBuilders");
         List<String> mutableFound = new ArrayList<>();
 
         for (Field field : DatabricksRecordHandler.class.getDeclaredFields()) {
@@ -636,7 +635,7 @@ class DatabricksRecordHandlerTest
     {
         // Nothing to compare against: the unpinned mode's contract is that the credential's Unity Catalog
         // grants decide, and the metadata handler's own gate decides which names are addressable at all.
-        // Only a stage-1 deployment can be unpinned; a managed source is always one schema.
+        // Only an environment-mode deployment can be unpinned; a managed source is always one schema.
         ConnectionConfig unpinned = valid().build();
 
         assertDoesNotThrow(() -> DatabricksRecordHandler.requireServableSchema(

@@ -143,8 +143,6 @@ export const MESSAGES_JA = {
   "Boundary controls (cross-cutting)": "境界制御（全層共通）",
   "authorize on (principal, action, resource) before any tier runs.":
     "各層を実行する前に（principal、action、resource）で認可します。",
-  "rewrites compiled SQL with Cedar-derived row filters.":
-    "コンパイル済み SQL に Cedar 由来の行フィルターを適用します。",
   "content filter on prompts and outputs.":
     "プロンプトと出力にコンテンツフィルターを適用します。",
   "Demos to try": "試せるデモ",
@@ -1156,8 +1154,8 @@ export const MESSAGES_JA = {
   "You'll be redirected to the new proposal as soon as it's ready.":
     "新しい提案の準備ができ次第、自動的に移動します。",
   "Datasource already inducted": "データソースは誘導済みです",
-  "This selection has the same structure as an existing accepted proposal, so no new proposal was created. Open the existing proposal to review or edit it.":
-    "この選択内容は承認済みの既存提案と同じ構造のため、新しい提案は作成されませんでした。既存の提案を開いて確認または編集してください。",
+  "This selection has the same structure as an existing accepted proposal, so no new proposal was created. An accepted proposal can't be edited. To induce again with updated metadata, delete the ontology and induce again (this also removes the classes other sources accepted into it), or induce into a new namespace.":
+    "この選択内容は承認済みの既存提案と同じ構造のため、新しい提案は作成されませんでした。承認済みの提案は編集できません。更新したメタデータで誘導し直すには、オントロジーを削除してから再度誘導するか（他のソースがこのオントロジーに承認したクラスも削除されます）、新しいネームスペースで誘導してください。",
   "View existing proposal": "既存の提案を表示",
   "Could not load data sources": "データソースを読み込めませんでした",
   "Induce Ontology": "オントロジーを誘導",
@@ -1438,8 +1436,8 @@ export const MESSAGES_JA = {
     "このクラスにはデータタイププロパティの属性がありません。",
   "Cedar authorizes each request on principal, action, and resource before any tier runs.":
     "Cedar は各層の実行前に、principal、action、resource に基づいてリクエストを認可します。",
-  "The SQL Firewall rewrites compiled SQL with Cedar-derived row filters.":
-    "SQL Firewall は、コンパイル済み SQL に Cedar 由来の行フィルターを適用します。",
+  "The SQL Firewall checks compiled SQL against each role's table allowlist and column denylist.":
+    "SQL Firewall は、コンパイル済み SQL をロールごとのテーブル許可リストと列拒否リストに照らして検査します。",
   "Bedrock Guardrails filter prompts and outputs.":
     "Bedrock Guardrails はプロンプトと出力をフィルターします。",
   "Demo 1. Ask “total claims by region” for deterministic Tier 1, then “claims count” to reach the same metric through a synonym.":

@@ -7,19 +7,15 @@ The health signal must reflect whether the container can actually answer
 queries, not merely whether a task is running. ECS keeps ``runningCount`` at 1
 for a task whose container health check is failing (it only replaces the task
 when the deployment circuit breaker trips), so ``runningCount`` alone reports a
-degraded container as HEALTHY (#170). We therefore read the container's ECS
-health check status (which runs the functional ``/health`` probe — see
-``vkg-stack.ts`` / the reload Lambda health check) via ``describe_tasks``.
+degraded container as HEALTHY. We therefore read the container's ECS health
+check status (the functional ``/health`` probe) via ``describe_tasks``.
 
-State machine:
-
-- ``HEALTHY``      — a running task whose container ``healthStatus`` is HEALTHY (can translate).
-- ``DEGRADED``     — a running task whose container ``healthStatus`` is UNHEALTHY (up, cannot
-  translate — e.g. published R2RML/schema will not load). Distinct from UNAVAILABLE.
-- ``PROVISIONING`` — not yet serving (running < desired) with an IN_PROGRESS primary deployment,
-  OR a running task whose container health is still UNKNOWN during its start period.
-- ``UNAVAILABLE``  — the service exists but no task is running and it is not rolling out.
-- ``UNKNOWN``      — no service / missing config / any API error.
+- ``HEALTHY``: running task, container health HEALTHY.
+- ``DEGRADED``: running task, container health UNHEALTHY.
+- ``PROVISIONING``: running < desired with an IN_PROGRESS primary deployment, or
+  container health still UNKNOWN during its start period.
+- ``UNAVAILABLE``: service exists, no task running, not rolling out.
+- ``UNKNOWN``: no service, missing config, or any API error.
 
 Read on demand from GetNamespace; any failure degrades to UNKNOWN.
 """
@@ -35,10 +31,6 @@ from coa_control_plane_server.models import VkgHealthStatus
 logger = structlog.get_logger(__name__)
 
 _ecs = None
-
-# The VKG task definition has a single application container. Its ECS health
-# check runs `curl -sf localhost:8080/health` (the functional reformulation
-# probe), so its healthStatus is the authoritative "can translate" signal.
 
 
 def _ecs_client():
@@ -93,18 +85,6 @@ def _container_health(cluster: str, service_name: str) -> str | None:
     return "UNKNOWN"
 
 
-def resolve_vkg_health(namespace_id: str) -> str:
-    """Return a VkgHealthStatus value for the namespace's VKG service.
-
-    Convenience wrapper around :func:`resolve_vkg_health_with_reason` for the
-    callers that only need the status enum and not the human-readable reason
-    (e.g. status-only checks and the existing test surface). The GET namespace
-    handler uses :func:`resolve_vkg_health_with_reason` directly and surfaces
-    both the status and the reason.
-    """
-    return resolve_vkg_health_with_reason(namespace_id)[0]
-
-
 def _reason_for(status: str) -> str | None:
     """Coarse, always-available reason for a non-HEALTHY status.
 
@@ -157,7 +137,7 @@ def _resolve_status(namespace_id: str) -> str:
 
     if running >= 1 and running >= desired:
         # A task is running, but "running" does NOT mean "can translate" — read
-        # the container's functional-probe health before trusting it (#170).
+        # the container's functional-probe health before trusting it.
         container_health = _container_health(cluster, service_name)
         if container_health == "HEALTHY":
             return VkgHealthStatus.HEALTHY.value
@@ -170,19 +150,12 @@ def _resolve_status(namespace_id: str) -> str:
         # Could not read task health (transient API issue / race). Fall back to
         # the deployment-state logic below rather than asserting HEALTHY.
 
-    # Not yet serving, or task health unreadable. Distinguish a service that is
-    # still starting up (primary deployment rolling out) from one that is
-    # genuinely down, so the UI can set the expectation that it will become
-    # healthy shortly rather than showing an error. First-time provisioning
-    # starts with runningCount 0 < desired and an IN_PROGRESS primary
-    # deployment; reloads keep the old task serving (minimumHealthyPercent 100).
+    # A primary deployment still rolling out means PROVISIONING, not down.
     deployments = svc.get("deployments", [])
     primary = next((d for d in deployments if d.get("status") == "PRIMARY"), None)
     if primary is not None and primary.get("rolloutState") == "IN_PROGRESS":
         return VkgHealthStatus.PROVISIONING.value
     if running >= 1:
-        # A task is running but we could not confirm its container health and it
-        # is not rolling out — report DEGRADED (up, unconfirmed) rather than the
-        # old false HEALTHY or a misleading UNAVAILABLE (which means "no task").
+        # Running but container health unconfirmed: DEGRADED, not UNAVAILABLE.
         return VkgHealthStatus.DEGRADED.value
     return VkgHealthStatus.UNAVAILABLE.value

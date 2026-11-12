@@ -24,29 +24,10 @@ _SHARED_PROCESSORS: list[Processor] = [
 
 
 def setup_logging(log_level: str = "INFO", stdlib_log_level: str | None = None) -> None:
-    """Configure structlog, and bridge the stdlib ``logging`` module into it.
+    """Bridge stdlib ``logging`` into structlog and configure both.
 
-    Third-party libraries (graphrag-toolkit, botocore, opensearch-py) log via
-    stdlib ``logging.getLogger(__name__)``, not structlog. Configuring structlog
-    alone leaves the stdlib root logger with no handler, so those records fall
-    through to ``logging.lastResort`` — a hardcoded stderr handler pinned at
-    WARNING that ignores logger levels. The effect is that every third-party
-    INFO/DEBUG record is silently discarded, and the WARNINGs that do escape are
-    unstructured (no timestamp, no logger name, and an inconsistent prefix
-    depending on whether something already triggered ``basicConfig``).
-
-    Installing a root handler backed by ``ProcessorFormatter`` routes stdlib
-    records through the same processor chain, so third-party logs land in
-    CloudWatch as queryable JSON alongside our own.
-
-    Args:
-        log_level: Level for structlog-native loggers (our own code).
-        stdlib_log_level: Level for the stdlib root logger (third-party
-            libraries). Defaults to WARNING, which matches the volume
-            ``lastResort`` already let through — so existing callers keep the
-            same log volume and only gain structure. Lower it per-service (e.g.
-            INFO) where third-party progress logs are worth the extra lines;
-            botocore/boto3 at INFO is chatty on request-heavy workloads.
+    ``log_level`` is for structlog-native loggers; ``stdlib_log_level`` is for the
+    stdlib root logger (third-party libraries) and defaults to WARNING.
     """
     structlog.configure(
         processors=[

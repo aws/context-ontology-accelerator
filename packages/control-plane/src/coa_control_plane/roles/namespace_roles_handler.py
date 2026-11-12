@@ -33,15 +33,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
 
     Rejects non-GET methods, then routes on the presence of a ``roleId`` path
     parameter to either list namespace roles or fetch one role.
-
-    Args:
-        event: API Gateway proxy event with a ``namespaceId`` and optional
-            ``roleId`` path parameter.
-        context: Lambda context object (unused).
-
-    Returns:
-        An API Gateway proxy response: 200 with the role(s), 405 for a
-        disallowed method, or a 4xx/5xx error response.
     """
     logger.info("namespace_roles", path=event.get("path"), method=event.get("httpMethod"))
 

@@ -1138,6 +1138,26 @@ class MetricResolver:
         """Look up a metric definition by ID."""
         return self._snapshot.by_id.get(metric_id)
 
+    async def definitions_named(self, name: str, namespace: str) -> list[MetricDefinition] | None:
+        """``namespace``'s definitions named ``name`` (case-insensitively), from data read within LOOKUP_TTL_S.
+
+        Like :meth:`match`, a stale namespace is read first and a miss reads it unless it was read within the
+        TTL. None when no read within the TTL has landed (the read failed or is still running), so a caller
+        never confirms a metric from older data.
+        """
+        if self._cache_is_stale(namespace) or not self._named(name, namespace):
+            await self._lazy_namespace_lookup(namespace)
+        if self._neptune is not None and namespace and not self._landed_recently(namespace):
+            return None
+        return self._named(name, namespace)
+
+    def _named(self, name: str, namespace: str) -> list[MetricDefinition]:
+        return [d for d in self._snapshot.by_name.get(_fold(name), []) if d.namespace == namespace]
+
+    def _landed_recently(self, namespace: str) -> bool:
+        landed_at = max(self._full_refresh_at, self._namespace_landed_at.get(namespace, -math.inf))
+        return self._clock() - landed_at < LOOKUP_TTL_S
+
     @staticmethod
     def substitute_dimensions(sql_template: str, dimensions: dict[str, Any], allowed: list[str]) -> str:
         """Substitute dimension values into a metric SQL template.

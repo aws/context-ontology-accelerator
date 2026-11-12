@@ -13,7 +13,6 @@ import dev.coa.connector.metadata.CoaTable;
 import dev.coa.connector.metrics.ConnectorMetrics;
 import dev.coa.databricks.config.ConnectionConfig;
 import dev.coa.databricks.config.ConnectionConfigProvider;
-import dev.coa.databricks.config.ConnectionConfigProviders;
 import dev.coa.databricks.config.CredentialSource;
 import dev.coa.databricks.config.ExpiringCache;
 import dev.coa.databricks.jdbc.DatabricksConnectionFactory;
@@ -52,13 +51,6 @@ import java.util.function.Supplier;
  * What it advertises and what it serves are the same set either way, see {@link #servable}. The record half
  * enumerates nothing but enforces the pin as well, so the boundary does not depend on Athena having called
  * {@code GetTable} first.
- *
- * <p>{@link #doGetSplits} emits a split with no properties. The toolkit's default puts the table name on it
- * under the key {@code "table"}, and {@code athena-jdbc}'s query builder reads every split property as a
- * partition value: it drops those names from the projection, skips their constraints, and feeds the split's
- * value to the extractor instead of the result set. A Databricks table with a column named {@code table}
- * would silently return the literal string {@code orders} in it for every row. The table name is already on
- * the request.
  */
 public class DatabricksMetadataHandler extends CoaMetadataHandler
 {
@@ -90,30 +82,6 @@ public class DatabricksMetadataHandler extends CoaMetadataHandler
      * session per role, and one {@code GetSecretValue} per source per TTL window.
      */
     private final CredentialSource credentials;
-
-    /**
-     * A metadata-only Lambda's entry point, which resolves everything from the environment itself.
-     *
-     * @throws IllegalArgumentException if the environment is missing or invalid, naming the variable.
-     *                                 Thrown during initialisation so a misconfigured connector fails
-     *                                 once, loudly, rather than once per request.
-     */
-    public DatabricksMetadataHandler(Map<String, String> configOptions)
-    {
-        this(configOptions, ConnectionConfigProviders.fromEnvironment(configOptions));
-    }
-
-    /**
-     * @param wiring the provider and the credential path the environment described, from one read of the
-     *               mode. Taken as a pair so nothing here can combine a provider with a credential path
-     *               the mode did not choose, and so both halves of a container share one of each cache.
-     */
-    public DatabricksMetadataHandler(Map<String, String> configOptions,
-                                     ConnectionConfigProviders.Wiring wiring)
-    {
-        this(configOptions, wiring.provider(), wiring.credentials(), null,
-                CredentialSource.DEFAULT_TTL_MILLIS);
-    }
 
     /**
      * The constructor a test uses.
@@ -184,8 +152,9 @@ public class DatabricksMetadataHandler extends CoaMetadataHandler
     /**
      * {@inheritDoc}
      *
-     * <p>One split with no properties, since {@code athena-jdbc}'s query builder reads every split
-     * property as a partition column.
+     * <p>One split with no properties. The toolkit's default puts the table name on the split under
+     * {@code "table"}, and {@code athena-jdbc}'s query builder reads every split property as a partition
+     * value, so a column named {@code table} would silently return the table name for every row.
      */
     @Override
     public GetSplitsResponse doGetSplits(BlockAllocator allocator, GetSplitsRequest request)
@@ -267,7 +236,7 @@ public class DatabricksMetadataHandler extends CoaMetadataHandler
     /**
      * How to make {@code database} readable, which differs by mode.
      *
-     * <p>Naming {@link ConnectionConfig#SCHEMA_VAR} is the actionable answer for a stage-1 deployment,
+     * <p>Naming {@link ConnectionConfig#SCHEMA_VAR} is the actionable answer for an environment-mode deployment,
      * where it is set and unsetting it is one of the two fixes. It is the wrong answer for a COA-managed
      * source: that variable is absent from such a deployment by construction — the mode switch refuses to
      * start if it is present alongside the others — so pointing an operator at it sends them looking for

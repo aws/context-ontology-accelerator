@@ -60,8 +60,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     delete_athena_workgroup(record.get("athenaWorkgroupName"))
     delete_smu_project(namespace_id, {"dataZoneProjectId": record.get("dataZoneProjectId")})
 
-    # Role mappings/roles use the real DynamoDBDAO path (not best-effort) —
-    # a failure here must fail the step so Step Functions retries it.
     delete_role_mappings(namespace_id)
     delete_roles(namespace_id)
 

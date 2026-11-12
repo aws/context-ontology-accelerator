@@ -42,10 +42,6 @@ from .schema_visibility import withhold_principal_grant_overrides
 setup_logging(os.environ.get("LOG_LEVEL", "INFO"))
 logger = structlog.get_logger(__name__)
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
 SELF_PRINCIPAL = "me"
 """Sentinel value for principalId that resolves to the authenticated caller."""
 
@@ -54,35 +50,10 @@ _CLAIM_GROUPS = "groups"
 _CLAIM_COGNITO_GROUPS = "cognito:groups"
 
 _MAX_GROUPS = 250
-"""Hard circuit-breaker on group fan-out, not an expected ceiling.
-
-Enterprise SSO users routinely carry 100+ group
-memberships (a real observed token had ~140) — a low cap here silently
-truncates the group list wherever a caller's granted group happens to fall
-past the cutoff, causing a principal's own grant to vanish from THIS listing
-(while `coa_control_plane.authorization.handler`'s uncapped `_resolve_roles`
-still enforces it correctly) with no error, no indication of an incomplete
-result, and no correlation to anything the caller did. That silent split
-between "what you're allowed to do" and "what you're shown you're allowed to
-do" is what the old `_MAX_GROUPS = 10` produced.
-
-250 is sized to comfortably exceed real-world group counts while still
-bounding the fan-out below (see `_MAX_GROUP_QUERY_WORKERS`). If a caller ever
-exceeds it, log loudly (``logger.error``, not ``warning``) rather than
-truncating silently — see the log call below.
-"""
+"""Circuit breaker on group fan-out; exceeding it logs an error instead of truncating silently."""
 
 _MAX_GROUP_QUERY_WORKERS = 20
-"""Bound on concurrent DynamoDB queries for the group fan-out.
-
-Each principal key (self + each group) is one PrincipalIndex GSI query;
-executed sequentially, that scales request latency linearly with the
-caller's group count (100+ groups would add seconds to a single page load).
-Parallelizing over a small thread pool keeps latency roughly constant
-(bounded by the slowest single query, not their sum) while still bounding
-concurrent read load against the table — the DAO's boto3 client is safe for
-concurrent use across threads.
-"""
+"""Bound on concurrent PrincipalIndex queries for the group fan-out."""
 
 _GROUP_NAME_RE = re.compile(r"^[\w.@\-]+$")
 """Valid group name pattern — alphanumeric, dots, @, hyphens."""
@@ -103,15 +74,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
     sentinel. The caller's email and group memberships are resolved from the
     authorizer context; ``maxResults`` / ``nextToken`` page through the
     matching grants.
-
-    Args:
-        event: API Gateway proxy event with a ``principalId`` path parameter
-            and authorizer-populated caller context.
-        context: Lambda context object (unused).
-
-    Returns:
-        An API Gateway proxy response: 200 with the caller's grants, or a
-        4xx/5xx error response.
     """
     path_params = event.get("pathParameters") or {}
     principal_id = path_params.get("principalId", "")
@@ -140,7 +102,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
     if not email:
         return api_response(400, {"message": "Unable to resolve caller identity"})
 
-    # Normalize email to lowercase for consistent lookups
     email = email.strip().lower()
 
     principal_keys: list[str] = [f"User::{sanitize_principal_key(email)}"]
@@ -155,11 +116,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
                 logger.warning("invalid_group_name_skipped", group=group)
                 continue
             if groups_added >= _MAX_GROUPS:
-                # Loud, not silent: this caller's own grant listing WILL be
-                # incomplete past this point (unlike the old cap, which hit
-                # real users' normal group counts and dropped their grants
-                # with no signal at all). error, not warning, so this is
-                # visible without needing debug-level log access.
+                # error, not warning: the listing is incomplete past this point.
                 logger.error(
                     "group_fanout_cap_hit_grants_may_be_incomplete",
                     total_groups=groups_str.count(",") + 1,

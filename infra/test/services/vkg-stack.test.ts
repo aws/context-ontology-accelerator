@@ -17,6 +17,33 @@ const TEST_CONTEXT = {
 
 const PREFIX = `${DEFAULT_RESOURCE_PREFIX}-${DEFAULT_ENV}`;
 
+/** Every IAM statement with a `logs:` action: its role's logical id, actions and ARNs. */
+function logsGrants(t: Template) {
+  const flat = (v: unknown): string => {
+    if (typeof v === "string") return v;
+    const o = v as { "Fn::Join"?: [string, unknown[]]; Ref?: string };
+    if (o["Fn::Join"]) return o["Fn::Join"][1].map(flat).join(o["Fn::Join"][0]);
+    return o.Ref ? `\${${o.Ref}}` : JSON.stringify(v);
+  };
+  type Statement = { Action: string | string[]; Resource: unknown };
+  type Policy = {
+    Properties: {
+      Roles: { Ref: string }[];
+      PolicyDocument: { Statement: Statement[] };
+    };
+  };
+  return Object.values(t.findResources("AWS::IAM::Policy")).flatMap((p) => {
+    const { Roles, PolicyDocument } = (p as Policy).Properties;
+    return PolicyDocument.Statement.filter((st) =>
+      [st.Action].flat().some((a) => a.startsWith("logs:")),
+    ).map((st) => ({
+      role: Roles.map((r) => r.Ref).join(","),
+      actions: [st.Action].flat(),
+      resources: [st.Resource].flat().map(flat),
+    }));
+  });
+}
+
 /**
  * Render a VkgStack template with additional CDK context merged over the
  * defaults. Each call gets its own App so context does not leak between tests.
@@ -540,6 +567,31 @@ describe("VkgStack", () => {
     expect(sources).toContain("sclz.ontology");
   });
 
+  test("reload rule of a non-default prefix does not match the default deployment's source", () => {
+    // `coa.ontology` is what a default-prefix deployment emits. Matching it in
+    // another deployment provisions VKG services there for namespaces it does
+    // not own, and its namespace teardown never deletes them.
+    const app = new cdk.App({
+      context: { ...TEST_CONTEXT, resource_prefix: "sclz" },
+    });
+    const network = new NetworkStack(app, "IsoNetwork");
+    const isoBucketStack = new cdk.Stack(app, "IsoBucketStack");
+    const isoBucket = new s3.Bucket(isoBucketStack, "OntologyBucket", {
+      bucketName: "sclz-dev-ontology-artifacts",
+    });
+    const stack = new VkgStack(app, "IsoVkg", {
+      network,
+      serviceNamespace: network.serviceNamespace,
+      ontologyBucket: isoBucket,
+    });
+    Template.fromStack(stack).hasResourceProperties("AWS::Events::Rule", {
+      EventPattern: {
+        source: ["sclz.ontology"],
+        "detail-type": ["ontology.published"],
+      },
+    });
+  });
+
   // ── Scheduled reload sweep ────────────────────────────────────────
 
   test("schedules a weekly VKG reload sweep invoking the reload Lambda with {sweep:true}", () => {
@@ -721,6 +773,62 @@ describe("VkgStack", () => {
         "ecs:DeregisterTaskDefinition",
       ]),
     );
+  });
+
+  test("the reload and execution roles may touch only the per-namespace VKG log groups, on this deployment's prefix", () => {
+    const groups = (name: string) => [
+      `arn:aws:logs:\${AWS::Region}:\${AWS::AccountId}:log-group:${name}`,
+      `arn:aws:logs:\${AWS::Region}:\${AWS::AccountId}:log-group:${name}:*`,
+    ];
+    const writeLogs = [
+      "logs:CreateLogGroup",
+      "logs:CreateLogStream",
+      "logs:PutLogEvents",
+    ];
+    // The execution role's grant on the static task definition's own log group
+    // is not a per-namespace one.
+    const grants = logsGrants(template).filter(
+      (g) =>
+        /^(VkgReloadFnServiceRole|VkgTaskDefExecutionRole)/.test(g.role) &&
+        !(
+          g.resources.length === 1 &&
+          g.resources[0].includes("VkgTaskDefOntopContainerLogGroup")
+        ),
+    );
+    expect(grants).toEqual(
+      expect.arrayContaining([
+        {
+          role: expect.stringMatching(/^VkgReloadFnServiceRole/),
+          actions: ["logs:CreateLogGroup", "logs:PutRetentionPolicy"],
+          resources: groups(`/ecs/${PREFIX}-vkg-*`),
+        },
+        {
+          role: expect.stringMatching(/ExecutionRole/),
+          actions: writeLogs,
+          resources: groups(`/ecs/${PREFIX}-vkg-*`),
+        },
+        {
+          role: expect.stringMatching(/ExecutionRole/),
+          actions: writeLogs,
+          resources: groups("/ecs/vkg-*"),
+        },
+        {
+          role: expect.stringMatching(/^VkgReloadFnServiceRole/),
+          actions: ["logs:PutRetentionPolicy"],
+          resources: [groups("/ecs/vkg-*")[0]],
+        },
+      ]),
+    );
+    expect(grants).toHaveLength(4);
+  });
+
+  test("the rollout runs after the execution role can write the logs of the revisions it registers", () => {
+    const { res } = rolloutResource(template);
+    const execPolicies = Object.keys(
+      template.findResources("AWS::IAM::Policy"),
+    ).filter((id) => id.includes("ExecutionRoleDefaultPolicy"));
+    expect(execPolicies).toHaveLength(1);
+    expect(res.DependsOn).toEqual(expect.arrayContaining(execPolicies));
   });
 
   test("the rollout runs after the SSM image parameter and the reload Lambda exist", () => {

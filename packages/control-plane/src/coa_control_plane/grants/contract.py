@@ -140,9 +140,6 @@ def validate_grant_overrides(body: dict[str, Any]) -> str | None:
         if len(column_denylist) > OVERRIDE_MAX_ITEMS:
             return f"columnDenylist may contain at most {OVERRIDE_MAX_ITEMS} tables"
         for table, columns in column_denylist.items():
-            # JSON object keys are always strings; the check guards direct callers.
-            if not isinstance(table, str):
-                return "columnDenylist keys must be strings"
             if len(table) > COLUMN_DENYLIST_KEY_MAX_LENGTH:
                 return f"columnDenylist table names must be at most {COLUMN_DENYLIST_KEY_MAX_LENGTH} characters"
             error = _string_list_error(

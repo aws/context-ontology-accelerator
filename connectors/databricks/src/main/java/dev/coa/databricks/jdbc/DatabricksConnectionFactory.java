@@ -105,19 +105,10 @@ public final class DatabricksConnectionFactory implements JdbcConnectionFactory
      */
     public Connection open()
     {
-        // Resolved before the connection attempt and in its own try, because three non-Databricks faults
-        // live in this one call:
-        //
-        //   - an unusable secret SHAPE, an IllegalArgumentException whose message already names the
-        //     secret and the two accepted shapes. Rethrown untouched;
-        //   - a credential failure the reader has already classified, which in coa-managed mode says
-        //     whether the assume or the read failed and whose policy to look at. Rethrown untouched too:
-        //     re-wrapping it would replace CONNECTOR_CREDENTIAL_ASSUME_DENIED with
-        //     CONNECTOR_CREDENTIAL_UNREADABLE and send the operator to the connector's own role, which in
-        //     that mode holds no Secrets Manager grant to fix;
-        //   - a secret that cannot be READ with the connector's own role, for want of
-        //     secretsmanager:GetSecretValue or of kms:Decrypt on the customer-managed key. That is what a
-        //     first deployment usually hits, and going through classify() would blame the warehouse.
+        // Resolved in its own try: an unusable secret shape and an already-classified credential failure
+        // are rethrown untouched, while a secret the connector's own role cannot read (missing
+        // secretsmanager:GetSecretValue or kms:Decrypt) must not go through classify(), which would blame
+        // the warehouse.
         Properties properties;
         try {
             properties = properties();
@@ -230,27 +221,11 @@ public final class DatabricksConnectionFactory implements JdbcConnectionFactory
         // expects: BlockUtils has no case for a struct, list or map vector, so a complex column served
         // as anything else fails at read time with "Unknown type Struct".
         hardening.put("EnableComplexDatatypeSupport", "0");
-        // Makes setAutoCommit, commit and rollback no-ops.
-        //
-        // The inherited read loop calls both, for Databricks. The guard in
-        // JdbcRecordHandler.readWithConstraint (2026.33.1) is NEGATED:
-        //
-        //     // clickhouse does not support disabling auto-commit
-        //     if (!CLICKHOUSE_DB.equalsIgnoreCase(databaseProductName)) {
-        //         connection.setAutoCommit(false);
-        //     }
-        //
-        // so the block is skipped only for ClickHouse and every other engine runs it, commit() included
-        // under the same guard later in the method. Confirmed in the bytecode: "ifne" jumps PAST the
-        // setAutoCommit call when equalsIgnoreCase("clickhouse") returns true.
-        //
-        // Neither call buys anything here. They exist for engines that need cursor-based streaming, and
-        // the Databricks driver streams in Arrow chunks regardless. Without this flag each one executes
-        // a real statement on the warehouse, two extra round trips per read, against a warehouse whose
-        // transaction support depends on its runtime version.
-        //
-        // The driver marks the flag deprecated. If a release removes it, the driver's own setAutoCommit
-        // path takes over and the reads still work, with those two round trips back.
+        // The SDK's JdbcRecordHandler.readWithConstraint (2026.33.1) calls setAutoCommit and commit for
+        // every engine except ClickHouse. Each would execute a real statement on the warehouse, two extra
+        // round trips per read, and the driver streams in Arrow chunks regardless. This flag makes both
+        // no-ops. The driver marks it deprecated; if a release removes it, reads still work with the
+        // round trips back.
         hardening.put("IgnoreTransactions", "1");
         hardening.put("UserAgentEntry", "COA-Databricks-Connector");
         HARDENING = Collections.unmodifiableMap(hardening);

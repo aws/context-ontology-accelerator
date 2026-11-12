@@ -144,27 +144,9 @@ export function isSafeBrowserUrl(raw: string): boolean {
 }
 
 /**
- * The `[command, argv]` pair used to hand `url` to the platform browser.
- *
- * Every platform passes the URL as its own argv entry so that no shell or
- * script parser ever sees it:
- *
- * - macOS `open` / Linux `xdg-open` — plain execs, no shell involved.
- * - Windows `rundll32 url.dll,FileProtocolHandler <url>` — the documented
- *   shell-free way to open a URL in the default browser.
- *
- * Windows deliberately avoids the two obvious alternatives. `cmd /c start ""`
- * re-parses its arguments, which reintroduces command injection even under
- * `spawn`. `powershell -Command Start-Process -FilePath` is worse than it
- * looks: Node has no `execve` on Windows, so `spawn` flattens argv into one
- * command-line string and only quotes arguments containing a space, tab, or
- * double-quote. An OAuth URL contains none of those but always contains several
- * `&` characters, which reach PowerShell unquoted — `&` is PowerShell's
- * reserved call operator, so the command fails to parse every time.
- *
- * Exported for tests: this is the security-relevant part of the browser-open
- * path, and asserting the URL occupies its own argv slot is what proves it is
- * never re-tokenized.
+ * The `[command, argv]` pair used to open `url` in the platform browser.
+ * The URL is always its own argv entry and no shell is involved: `cmd /c start`
+ * re-parses arguments, and PowerShell treats the `&` in OAuth URLs as an operator.
  */
 export function browserOpenCommand(platform: string, url: string): [string, string[]] {
   if (platform === "darwin") return ["open", [url]];

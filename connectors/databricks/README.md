@@ -226,7 +226,7 @@ thing it takes from you: **a name.**
 | Onboarded as | a `CUSTOM_CONNECTOR` source | a `DATABRICKS_SQL_WAREHOUSE` source |
 
 **Mode selection is `DATABRICKS_CONFIG_SOURCE`, read once by `bin/app.ts` at synth.** Unset selects
-`environment`, as in the jar, so a stage-1 deployment is unchanged; `coa-managed` selects the multiplexed
+`environment`, as in the jar, so an existing single-endpoint deployment is unchanged; `coa-managed` selects the multiplexed
 stack; anything else is refused rather than defaulted. The chosen branch then builds one stack class from
 one set of variables — the single-endpoint stack reads the four coordinates above and sets no `COA_*`
 variable, the multiplexed one reads two scalars and no coordinate — and the app passes the same value to
@@ -283,9 +283,7 @@ another namespace's data. Nothing is repairable by renaming afterwards, because 
 repointed.
 
 So **`cdk synth` refuses it**: `environment` mode with a `FUNCTION_NAME_PREFIX` ending in `-managed-`
-fails at synth, with no override, and the message explains the above. An earlier version of this
-section said "nothing enforces this, and nothing can" — that was wrong, and wrong in the dangerous
-direction. `FUNCTION_NAME_PREFIX` has no default, so the normal case — leaving it unset, giving
+fails at synth, with no override, and the message explains the above. `FUNCTION_NAME_PREFIX` has no default, so the normal case — leaving it unset, giving
 `databricks-coa-connector` — is unaffected, and a prefix that merely *contains* the segment
 (`acme-managed-eu-`) is fine: only ending in it produces COA's function name.
 
@@ -375,8 +373,7 @@ going unused while a stale one authenticates.
 ### OAuth machine-to-machine — preferred
 
 A service principal's credential carries no human identity, which is the reason to prefer it. **It does
-expire**, though — see the warning below; an earlier version of this section claimed otherwise and was
-wrong.
+expire**, though — see the warning below.
 
 Create the service principal in the Databricks UI (*Settings → Identity and access → Service
 principals*), then generate a secret. The UI is *Secrets → Generate secret*; the API call, verified
@@ -532,9 +529,7 @@ Cross-account is still the topology to prefer, for one reason: a cross-account i
 by the resource policy **as well as** the identity policy, so you get a second, independent barrier
 that a same-account deployment does not have.
 
-Beyond that, same-account works with no caveats and needs no resource policies. Both of the
-constraints an earlier version of this section listed are gone, so if you have them written down
-anywhere they are wrong:
+Beyond that, same-account needs no caveats and no resource policies:
 
 - **The function name does not matter.** COA's Athena-invoke `Deny` was once scoped to `<prefix>-*` by
   name, which caught a same-account connector named that way. It is now scoped by the *absence* of the
@@ -593,9 +588,6 @@ request and response schema, the resource policies, and the spill requirements a
 COA discovers the source through Athena `SHOW`/`DESCRIBE`, which it already implements — there is no
 Databricks-specific code on COA's side.
 
-If COA finds no keys, the **discovery** role was not granted invoke, so nothing ever ran `DESCRIBE`.
-`SELECT` works throughout, which is what makes it hard to spot.
-
 ### Checking the tags arrived, in your own account
 
 Optional, and worth doing before you hand anything to COA: register an Athena data catalog of your own,
@@ -608,8 +600,6 @@ Register it against the function ARN from the stack's `ConnectorFunctionArn` out
 aws athena create-data-catalog --name databricks --type LAMBDA \
   --parameters function=arn:aws:lambda:<region>:111122223333:function:databricks-coa-connector
 ```
-
-Catalog names are account-global, so a second deployment needs a different name from the first.
 
 Then the check itself — the one thing that fails silently:
 
@@ -650,7 +640,7 @@ What bounds it:
 1. **A stopped warehouse fails fast rather than waiting.** A warehouse that is not running answers
    with a temporarily-unavailable error and resumes in the background — seconds for serverless,
    minutes for classic and pro. The driver would retry that for up to 900 seconds by default, which
-   outlives the 120-second invocation timeout, so the retry is turned off and the error is labelled
+   outlives the 600-second invocation timeout, so the retry is turned off and the error is labelled
    `DATABRICKS_WAREHOUSE_NOT_RUNNING`. Retry the query shortly. Failing fast is also cheaper: Athena
    re-invokes a failed connector, so a connector that blocks turns one query into several billed
    Lambda-minutes and several warehouse resumes.
@@ -745,29 +735,24 @@ cd databricks/cdk && pnpm test     # the stack
 **There is no integration suite. Unit tests and the CDK stack test are the whole of this connector's
 automated coverage.**
 
-No Databricks workspace is available to this project — the one used during design was a 14-day
-trial — so the suites that ran against a real warehouse were **removed** rather than left in place to
-skip. A skipped test reports green and reads as a pass, which is a worse outcome than an absence you
-can see.
+No Databricks workspace is available to this project, so the suites that ran against a real warehouse
+were **removed** rather than left in place to skip. A skipped test reports green and reads as a pass.
 
-Behaviour against real Databricks is instead evidenced by a **one-off manual verification record**, in
-the connector LLD's §8.1 ("One-off manual verification record"). Its provenance is
-`src/test/resources/fixtures.sql`: every observation in that record was made against the schema that
-script creates, and the script's own header says the same thing. It is kept for that reason, and
-because it is the starting point for anyone who acquires a workspace and wants to build the suite §8.1
-describes — read its header first, especially the note that its row *values* are illustrative while its
-column names, comments, types and constraints are the part to assert on.
+Behaviour against real Databricks was checked once by hand against the schema that
+`src/test/resources/fixtures.sql` creates. Read its header before building an integration suite from it:
+its row *values* are illustrative, while its column names, comments, types and constraints are the part
+to assert on.
 
-**What the absence costs, concretely.** Every claim this connector makes about *Databricks'* behaviour
-is now unchecked by CI, because none of them has a unit-test equivalent: that `table_type` is never
-`'BASE TABLE'`; that `information_schema.tables` reports internal side tables which `SHOW TABLES`
-omits; that table names fold to lower case while column names do not; that `ordinal_position` counts
-from a different base in two views; and, most expensively, that the ANSI constraint join pairs a
-composite foreign key's columns correctly where the obvious join silently does not. That last one was
-previously covered by a test that ran **both** joins and required the naive one to be wrong, so the
-reason for the complexity was checkable. **It is now asserted only in a comment.** Anyone changing
-discovery should build the suite from §8.1's table before doing so; nothing automated would catch a
-regression there today.
+CI therefore does not check these claims about Databricks' behaviour:
+
+- `table_type` is never `'BASE TABLE'`.
+- `information_schema.tables` reports internal side tables which `SHOW TABLES` omits.
+- Table names fold to lower case while column names do not.
+- `ordinal_position` counts from a different base in two views.
+- The ANSI constraint join pairs a composite foreign key's columns correctly where the obvious join
+  silently does not. This one is asserted only in a comment.
+
+Anyone changing discovery should check these by hand first.
 
 ### Unit tests
 
@@ -805,7 +790,7 @@ nobody — an alarm without an action changes state in the console and stops the
 Four of them watch metrics the connector emits itself, in the CloudWatch namespace **`COA/Connectors`**,
 dimensioned `Connector=databricks`. They are written as Embedded Metric Format on stdout and extracted
 from the log group, so they cost no `PutMetricData` call and need no IAM grant — but they share the log
-group's **7-day** retention, and a metric is only as durable as CloudWatch's own 15 months.
+group's **one-month** retention, and a metric is only as durable as CloudWatch's own 15 months.
 
 **Why the connector emits its own at all**, given the Lambda already has metrics: each of these four
 failures is caught, classified and reported, so **the invocation succeeds**. It appears in neither the
@@ -820,7 +805,7 @@ looks perfectly healthy.
 | `-rows-returned-p95` | p95 rows per read is within 20% of the ceiling, twice running | The only one here that fires before anything has failed: the next slightly wider question breaches the ceiling. A push-down regression and an aggregate-heavy workload look identical from Athena's side, so read the `pushdown=` set on the cold-start log line before concluding the workload changed: it reports what the deployed jar advertised, and an empty or short set means the capability map moved rather than the questions |
 
 The other three are the function's own — throttles above zero, error rate above 1%, and p99 duration
-within 20% of the 120 s timeout. The throttle one matters more than it looks: **one connector serves
+within 20% of the 600 s timeout. The throttle one matters more than it looks: **one connector serves
 every COA source pointed at it**, so a throttle is not one source degrading but all of them at once, and
 nothing on COA's side can see that.
 

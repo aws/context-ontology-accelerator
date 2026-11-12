@@ -13,14 +13,10 @@ from __future__ import annotations
 
 from typing import Any
 
-import structlog
-
 from coa_control_plane.namespace.cleanup import (
     delete_all_ontologies,
     delete_ontology_artifacts,
 )
-
-logger = structlog.get_logger(__name__)
 
 
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
@@ -29,18 +25,9 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     Input: {"namespaceId": str}
     Output: {"namespaceId": str}
 
-    ``delete_all_ontologies`` RAISES on failure and is not caught here: it owns
-    the AOSS vector index, which is one index per namespace against a
-    collection with a hard 1000-index cap. Because a later step deletes the
-    namespace record, a swallowed failure here orphans that index forever —
-    nothing can target a namespace that no longer exists — and the deployment
-    eventually fails every embedding write with ``index_limit_breached``.
-    Letting it raise means the step's own retry policy retries it and, on
-    exhaustion, the pipeline catch lands the namespace in DELETE_FAILED, which
-    is recoverable. A silent, unreclaimable leak is not.
-
-    ``delete_ontology_artifacts`` (S3) stays best-effort — orphaned S3 objects
-    cost storage but consume no quota that can wedge the deployment.
+    ``delete_all_ontologies`` raises on purpose: the step retries and then lands
+    the namespace in DELETE_FAILED rather than orphaning its AOSS vector index.
+    ``delete_ontology_artifacts`` (S3) stays best-effort.
     """
     namespace_id = event["namespaceId"]
     delete_all_ontologies(namespace_id)

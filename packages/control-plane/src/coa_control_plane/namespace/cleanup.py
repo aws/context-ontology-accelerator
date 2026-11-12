@@ -3,15 +3,9 @@
 
 """Shared namespace-teardown cleanup primitives.
 
-Extracted from the original synchronous ``delete_handler.py`` so both the
-async DELETE handler's error paths and the Step Functions deletion pipeline
-(``deletion_pipeline/``) can reuse the same, tested cleanup logic.
-
-Each function's docstring says whether it raises or logs and continues. All
-but ``delete_ontology_artifacts`` raise, treating an already-deleted resource as done, because the deletion
-pipeline drives retries at the Step Functions level (see
-``deletion_pipeline/pipeline.py`` step definitions) rather than inside a single
-Lambda invocation.
+Used by the async DELETE handler's error paths and the Step Functions deletion
+pipeline (``deletion_pipeline/``). Each function's docstring says whether it
+raises or logs and continues.
 """
 
 from __future__ import annotations
@@ -35,9 +29,6 @@ logger = structlog.get_logger(__name__)
 _MAX_PAGINATION_PAGES = 1000
 
 
-# ── Athena / DataZone (raise on failure; already-gone is a no-op) ──────────
-
-
 def delete_athena_workgroup(workgroup_name: str | None) -> None:
     """Delete Athena workgroup. Raises on failure (not-found is OK)."""
     if not workgroup_name:
@@ -56,17 +47,10 @@ def delete_athena_workgroup(workgroup_name: str | None) -> None:
 def delete_smu_project(namespace_id: str, item: dict[str, Any]) -> None:
     """Delete DataZone project. Raises on failure (not-found is OK).
 
-    Assumes PROJECT_ACCESS_ROLE_ARN (DzProjectAccessRole) rather than
-    calling DeleteProject with this Lambda's own execution role. DataZone
-    authorizes project deletion against project *ownership*, not IAM policy
-    alone. DzProjectAccessRole is registered as PROJECT_OWNER at
-    project-creation time (see service.py's _add_service_role_memberships,
-    which explicitly passes designation="PROJECT_OWNER" rather than the
-    create_project_membership default of PROJECT_CONTRIBUTOR — a
-    contributor-level membership is not sufficient for DeleteProject).
-    Calling with the execution role's own (IAM-permitted but non-owner)
-    identity returns AccessDeniedException regardless of the execution
-    role's IAM policy.
+    Assumes PROJECT_ACCESS_ROLE_ARN: DataZone authorizes DeleteProject against
+    project ownership, and only that role is registered as PROJECT_OWNER (see
+    ``_add_service_role_memberships`` in service.py). The Lambda's own role gets
+    AccessDeniedException regardless of its IAM policy.
     """
     project_id = item.get("dataZoneProjectId")
     domain_id = os.environ.get("DATAZONE_DOMAIN_ID")
@@ -93,8 +77,7 @@ def _datazone_client(*, region: str, assume_role_arn: str | None):
     """Return a DataZone client, optionally assuming PROJECT_ACCESS_ROLE_ARN first.
 
     Falls back to the caller's own execution-role credentials when no role
-    ARN is configured (e.g. local/unit-test environments) so this stays a
-    drop-in replacement for the previous direct ``boto3.client("datazone")``.
+    ARN is configured (e.g. local/unit-test environments).
     """
     if not assume_role_arn:
         return boto3.client("datazone", region_name=region, config=async_boto_config())
@@ -113,9 +96,6 @@ def _datazone_client(*, region: str, assume_role_arn: str | None):
     return session.client("datazone")
 
 
-# ── Role mappings / roles (DDB, batch, non-atomic) ─────────────────────────
-
-
 def delete_role_mappings(namespace_id: str) -> None:
     """Delete resource-role-mappings for namespace. Raises on failure."""
     if table := os.environ.get("RESOURCE_ROLE_MAPPINGS_TABLE"):
@@ -126,9 +106,6 @@ def delete_roles(namespace_id: str) -> None:
     """Delete roles for namespace. Raises on failure."""
     if table := os.environ.get("ROLES_TABLE"):
         _delete_all_by_pk(table, f"NS#{namespace_id}")
-
-
-# ── Namespace record + name reservation (atomic transaction) ──────────────
 
 
 def delete_namespace_records(namespace_id: str, namespace_name: str | None) -> None:
@@ -171,21 +148,18 @@ def delete_namespace_records(namespace_id: str, namespace_name: str | None) -> N
     logger.info("namespace_records_deleted", namespace_id=namespace_id, name=namespace_name)
 
 
-# ── DynamoDB helpers ────────────────────────────────────────────────────────
-
-
 def _delete_all_by_index(table_name: str, index_name: str, pk_attr: str, pk_value: str) -> None:
     """Query all items from a GSI and batch-delete them."""
     region = os.environ["AWS_REGION"]
     dao = DynamoDBDAO(table_name, region=region)
-    items = _paginated_query_all(
-        dao,
+    items = dao.query_all(
         QueryParams(
             key_condition="#pk = :val",
             expression_names={"#pk": pk_attr},
             expression_values={":val": pk_value},
             index_name=index_name,
         ),
+        max_pages=_MAX_PAGINATION_PAGES,
     )
     if items:
         keys = [{"PK": item["PK"], "SK": item["SK"]} for item in items]
@@ -196,56 +170,34 @@ def _delete_all_by_pk(table_name: str, pk_value: str) -> None:
     """Query all items by PK and batch-delete them."""
     region = os.environ["AWS_REGION"]
     dao = DynamoDBDAO(table_name, region=region)
-    items = _paginated_query_all(
-        dao,
+    items = dao.query_all(
         QueryParams(
             key_condition="PK = :pk",
             expression_values={":pk": pk_value},
         ),
+        max_pages=_MAX_PAGINATION_PAGES,
     )
     if items:
         keys = [{"PK": item["PK"], "SK": item["SK"]} for item in items]
         dao.batch_delete(keys)
 
 
-def _paginated_query_all(dao: DynamoDBDAO, params: QueryParams) -> list[dict[str, Any]]:
-    """Query all pages following LastEvaluatedKey pagination."""
-    all_items: list[dict[str, Any]] = []
-    last_key = None
-    for _ in range(_MAX_PAGINATION_PAGES):
-        p = QueryParams(
-            key_condition=params.key_condition,
-            expression_names=params.expression_names,
-            expression_values=params.expression_values,
-            index_name=params.index_name,
-            exclusive_start_key=last_key,
-        )
-        result = dao.query(p)
-        all_items.extend(result.items)
-        if not result.last_evaluated_key:
-            break
-        last_key = result.last_evaluated_key
-    if last_key is not None:
-        raise RuntimeError(f"Query exceeded {_MAX_PAGINATION_PAGES} pages, data may be incomplete")
-    return all_items
-
-
-# ── VKG Teardown ───────────────────────────────────────────────────────────
-
-
 def teardown_vkg_service(namespace_id: str) -> None:
-    """Delete a namespace's VKG ECS service, task definitions and Cloud Map entry.
+    """Delete a namespace's VKG ECS service, task definitions, log groups and Cloud Map entry.
 
     Steps:
     1. Delete ECS service (force=True stops running tasks), then confirm it
        is no longer ACTIVE
     2. Deregister the service's task-definition revisions
-    3. Deregister Cloud Map instances + delete Cloud Map service
+    3. Delete the service's log group and the legacy ``/ecs/vkg-<ns>`` one
+    4. Deregister Cloud Map instances + delete Cloud Map service
 
     Raises on any failure other than "already gone" so the deletion
     pipeline's DeletePlatform step fails retryably instead of orphaning a
     running service. Safe to re-run after a partial or completed teardown.
-    Step 2 only logs its failures: a leftover revision costs nothing.
+    Steps 2 and 3 only log their failures: neither leftover keeps anything running.
+    Step 3 runs while the service is still DRAINING, so the last lines of tasks
+    that are still stopping can be lost with the log groups.
     """
     region = os.environ.get("AWS_REGION", "us-east-1")
     prefix = os.environ.get("RESOURCE_PREFIX", "").rstrip("-")
@@ -260,6 +212,9 @@ def teardown_vkg_service(namespace_id: str) -> None:
     service_name = f"{prefix}-vkg-{namespace_id}" if prefix else f"vkg-{namespace_id}"
     _delete_vkg_ecs_service(ecs_client, cluster_arn, service_name, namespace_id)
     _deregister_vkg_task_definitions(ecs_client, namespace_id, service_name)
+    logs_client = boto3.client("logs", region_name=region, config=async_boto_config())
+    for log_group in (f"/ecs/{service_name}", f"/ecs/vkg-{namespace_id}"):
+        _delete_vkg_log_group(logs_client, namespace_id, log_group)
 
     if not cloud_map_ns_id:
         return
@@ -362,32 +317,34 @@ def _deregister_vkg_task_definitions(ecs_client: Any, namespace_id: str, family:
         )
 
 
+def _delete_vkg_log_group(logs_client: Any, namespace_id: str, log_group: str) -> None:
+    try:
+        logs_client.delete_log_group(logGroupName=log_group)
+        logger.info("vkg_log_group_deleted", namespace_id=namespace_id, log_group=log_group)
+    except logs_client.exceptions.ResourceNotFoundException:
+        logger.info("vkg_log_group_not_found", namespace_id=namespace_id, log_group=log_group)
+    except Exception as e:
+        logger.error(
+            "vkg_log_group_delete_failed",
+            namespace_id=namespace_id,
+            log_group=log_group,
+            error_type=type(e).__name__,
+            error=str(e),
+        )
+
+
 def delete_graphrag_indexes(namespace_id: str) -> list[str]:
     """Delete the namespace's GraphRAG doc-KG vector indexes. Returns those removed.
 
-    These indexes (``chunk_*``/``topic_*``, plus legacy ``statement_*``) are
-    NAMESPACE-scoped, not source-scoped: every doc source in a namespace shares
-    one GraphRAG tenant id, so ``chunk_{tenant}`` holds chunks for ALL of them.
-    Source deletion therefore must NOT drop them — it only removes its own
-    documents from the shared index, which is what graph_cleanup already does.
-    They become garbage exactly when the namespace goes away, which is why this
-    lives in namespace teardown.
+    The ``chunk_*``/``topic_*`` (and legacy ``statement_*``) indexes are
+    namespace-scoped: every doc source in a namespace shares one GraphRAG tenant
+    id, so they are dropped here and not on source deletion. AOSS caps a
+    collection at 1000 indexes, so leaking them eventually fails every embedding
+    write.
 
-    Nothing deleted these before, so every deleted namespace left its index set
-    behind forever. AOSS caps a collection at 1000 indexes and this is one set
-    per namespace, so they accumulate until every embedding write in the
-    deployment fails with ``index_limit_breached``.
-
-    Safe against an in-flight ``graph_cleanup`` ECS task: that task installs the
-    non-creating AOSS patch (``allow_create=False``), so it can no longer
-    recreate an index we just dropped — it sees the index absent, falls back to
-    graphrag's dummy client, and its remaining embedding deletes become no-ops.
-    Which is correct: the vectors it was going to delete went with the index.
-
-    Deleting an absent index is a no-op, so this is idempotent and safe to
-    retry. Raises on a real failure, for the same reason
-    :func:`delete_all_ontologies` does — a swallowed error here is an
-    unreclaimable leak once the namespace record is gone.
+    Deleting an absent index is a no-op, so this is safe to retry. Raises on a
+    real failure, because the leak is unreclaimable once the namespace record is
+    gone.
     """
     endpoint = os.environ.get("OSS_ENDPOINT", "")
     if not endpoint:
@@ -412,23 +369,15 @@ def delete_graphrag_indexes(namespace_id: str) -> list[str]:
     return removed
 
 
-# ── Ontology teardown (delegates to ontology-engine service) ──────────────
-
-
 def delete_all_ontologies(namespace_id: str) -> None:
     """Call the ontology-engine to delete all ontology data for a namespace.
 
     Drops Neptune named graphs, deletes the AOSS vector index, and purges
     all ontology DynamoDB records (registry, jobs, proposals).
 
-    NOT best-effort: raises on failure. The AOSS vector index is one index per
-    namespace against a collection with a hard 1000-index cap, and the caller
-    goes on to delete the namespace record — so swallowing a failure here
-    permanently orphans that index (nothing can ever target a namespace that no
-    longer exists) and the deployment eventually fails every embedding write
-    with ``index_limit_breached``. Raising lets the pipeline step retry and, if
-    it keeps failing, land the namespace in DELETE_FAILED, which is
-    recoverable. A silent leak is not.
+    NOT best-effort: raises on failure. The AOSS index is capped at 1000 per
+    collection and cannot be targeted once the namespace record is gone, so
+    raising lets the pipeline retry or land in DELETE_FAILED instead of leaking.
     """
     endpoint = os.environ.get("ONTOLOGY_ENGINE_ENDPOINT", "").rstrip("/")
     if not endpoint:

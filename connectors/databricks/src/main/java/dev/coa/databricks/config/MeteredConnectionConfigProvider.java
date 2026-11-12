@@ -47,17 +47,9 @@ public final class MeteredConnectionConfigProvider implements ConnectionConfigPr
     /**
      * The catalog name as a metric dimension, or {@code null} for a name that is not one.
      *
-     * <p>This runs <b>before</b> the delegate has validated anything, which is why the name cannot be
-     * trusted here. A principal holding {@code lambda:InvokeFunction} directly can post a request naming
-     * anything, and each distinct value would mint a custom CloudWatch metric at about $0.30 a month. Not
-     * an injection — {@code ConnectorMetrics} escapes the JSON — just unbounded cardinality, billed.
-     *
-     * <p>So an unrecognised name loses the {@code Catalog} dimension and keeps the count, that way round
-     * because the dimension is for triage and the count is the alarm. {@code ConnectorMetrics} already
-     * emits the fleet-only dimension set for a null name, as it does at cold start.
-     *
-     * <p>The rule is {@link ManagedSource#isAthenaCatalogName}, shared with the provider that builds a
-     * parameter path from the same string, rather than a looser pattern invented here.
+     * <p>The name is unvalidated at this point, and each distinct value would mint a custom metric, so a
+     * name that does not match {@link ManagedSource#isAthenaCatalogName} drops the {@code Catalog}
+     * dimension and keeps the count.
      */
     private static String dimension(String athenaCatalogName)
     {
