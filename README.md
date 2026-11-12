@@ -89,6 +89,8 @@ semantic-context/
 
 This repository is published as a read-only mirror. We are not accepting pull requests at this time. You are welcome to report bugs and share feedback through GitHub Issues. See [CONTRIBUTING.md](CONTRIBUTING.md) for details including direction for Amazon employees.
 
+Because this repository is a squashed mirror, the people who build COA are credited as co-authors on its commits rather than as commit authors.
+
 ## External Dependencies
 
 This package depends on and may incorporate or retrieve a number of third-party
