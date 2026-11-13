@@ -88,14 +88,18 @@ _UNMIRRORED_TESTS_REF = re.compile(r'"tests"\s*/\s*"(?!unit)|/\s*"(?:integ|cdk)"
 def _mirrored_unit_test_files() -> list[Path]:
     """Every unit test file that ships to the public mirror.
 
-    Not just the repo-root suite: `.npmignore` re-includes `/packages/` and `/libs/`
+    Not just the repo-root suite: `.npmignore` re-includes `/packages/`, `/libs/` and `/coa-ai/`
     wholesale, so each package's own `tests/unit/` ships too, nested directories
     included, and each is just as capable of reaching into that package's stripped
     `tests/integ/` at import time.
     """
     files = list((_REPO_ROOT / "tests" / "unit").glob("*.py"))
     for unit_dir in sorted(
-        [*(_REPO_ROOT / "packages").glob("*/tests/unit"), *(_REPO_ROOT / "libs").glob("*/tests/unit")]
+        [
+            *(_REPO_ROOT / "packages").glob("*/tests/unit"),
+            *(_REPO_ROOT / "libs").glob("*/tests/unit"),
+            *(_REPO_ROOT / "coa-ai").glob("*/tests/unit"),
+        ]
     ):
         files.extend(unit_dir.rglob("*.py"))
     return files
@@ -164,14 +168,15 @@ def test_the_ci_check_sees_every_spelling_of_a_ci_path(source: str) -> None:
 
 
 def test_the_mirror_checks_scan_nested_and_library_unit_tests() -> None:
-    """`/packages/` and `/libs/` ship wholesale, so every `tests/unit/` file under them is mirrored, nested ones too."""
+    """`/packages/`, `/libs/` and `/coa-ai/` ship wholesale, so every `tests/unit/` file under them is mirrored, nested ones too."""
     scanned = {str(path.relative_to(_REPO_ROOT)) for path in _mirrored_unit_test_files()}
     expected = {
         str(path.relative_to(_REPO_ROOT))
-        for pattern in ("packages/*/tests/unit/**/*.py", "libs/*/tests/unit/**/*.py")
+        for pattern in ("packages/*/tests/unit/**/*.py", "libs/*/tests/unit/**/*.py", "coa-ai/*/tests/unit/**/*.py")
         for path in _REPO_ROOT.glob(pattern)
     }
     assert any(name.startswith("libs/") for name in expected)
+    assert any(name.startswith("coa-ai/") for name in expected)
     assert expected <= scanned, sorted(expected - scanned)
 
 

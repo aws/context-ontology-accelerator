@@ -3,10 +3,10 @@
 
 """Registration-time rules and the connector configuration store for ``DATABRICKS_SQL_WAREHOUSE``.
 
-Security invariants, all of which have no local evidence in the code:
+Security invariants:
 
 * The configuration parameter is a plaintext ``String``, which is only defensible
-  while nothing in the payload is secret. ``write_config_parameter`` enforces that.
+  while nothing in the payload is secret. The payload type fixes its key set.
 * The parameter path must carry the environment segment. Environments share an
   account, so without it a dev sources-API role can repoint a prod source's
   parameter and a dev query then resolves prod's credential.
@@ -105,16 +105,6 @@ class DatabricksConnectorUnavailableError(RuntimeError):
     """
 
 
-def resource_prefix() -> str:
-    """This deployment's ``{prefix}-{env}-`` resource prefix.
-
-    Same accessor as ``derive_catalog_name`` and ``datasource_external_id``; all three
-    appear in the contract the customer's trust policy and role name are written against,
-    and all three refuse to default. See ``require_resource_prefix``.
-    """
-    return require_resource_prefix()
-
-
 def deployment_id() -> str:
     """Deployment identifier the connector checks its own environment against.
 
@@ -122,12 +112,12 @@ def deployment_id() -> str:
     ``COA_DEPLOYMENT_ID``, and the connector refuses a parameter whose ``deploymentId``
     disagrees with what it was given. Change both sides together.
     """
-    return resource_prefix().rstrip("-")
+    return require_resource_prefix().rstrip("-")
 
 
 def reserved_role_name_prefix() -> str:
     """The ``{RESOURCE_PREFIX}datasource-access-`` name prefix COA will assume within."""
-    return f"{resource_prefix()}{_ROLE_NAME_INFIX}"
+    return f"{require_resource_prefix()}{_ROLE_NAME_INFIX}"
 
 
 def role_path_and_name(role_arn: str) -> str:
@@ -194,18 +184,10 @@ def secret_arn_is_connector_readable(secret_arn: str) -> bool:
 # Narrower than `ManagedSource.IAM_ROLE_ARN` in the Java connector in one place, and
 # narrower than the shared Smithy `IamRoleArn` in two.
 #
-# The path-and-name set, for the same reason as `_CONNECTOR_SECRET_ARN`: the Smithy
-# `IamRoleArn` permits an IAM path that admits `;`, `%` and quote characters, so
-# `…:role/coa-dev-datasource-access-a/x;y/name` clears registration and then fails every
-# query on the connector's re-validation.
-#
-# The PARTITION, pinned to `aws`, because this platform's own assume grant is written
-# `arn:aws:iam::*:role/{RESOURCE_PREFIX}datasource-access-*`. A partition-agnostic pattern
-# accepts an `aws-cn` or `aws-us-gov` role, registration succeeds, and every assume is then
-# denied by our own policy with an AccessDenied whose message points the customer at their
-# principal and their ExternalId condition — both of which are correct. Refused at submit
-# instead, with the partition named. The Java side stays partition-agnostic: registration is
-# the only writer of these values, so it is the place the refusal belongs.
+# The path-and-name charset matches the Java connector's re-validation, which the Smithy
+# `IamRoleArn` (it admits `;`, `%` and quotes) does not. The partition is pinned to `aws`
+# because this platform's assume grant is written `arn:aws:iam::*:role/...`, so another
+# partition's role would be denied on every assume.
 _CONNECTOR_ROLE_ARN = re.compile(r"^arn:aws:iam::\d{12}:role/[A-Za-z0-9+=,.@_/-]+$")
 
 
@@ -370,17 +352,7 @@ class WiringVerdict:
 
 
 def _assume_error_code(exc: ValueError) -> str:
-    """STS error code carried by an ``assume_datasource_session`` failure.
-
-    That helper masks the ``ClientError`` deliberately, so the role ARN cannot leak into an
-    API response, and puts the code on :class:`DatasourceAssumeError` as an attribute. Read
-    as an attribute rather than split back out of the message: every branch below turns on
-    this value, and a reworded message would make the whole set stop matching and return a
-    server error on every registration.
-
-    A plain ``ValueError`` from the same call is an empty-argument rejection, which carries
-    no STS code. It reads as ``""``, which matches no branch and is treated as inconclusive.
-    """
+    """STS error code from :class:`DatasourceAssumeError` ``.code``; ``""`` for a plain ``ValueError``."""
     return getattr(exc, "code", "")
 
 

@@ -63,7 +63,6 @@ class TestDiscoveryHandler:
             handler,
         )
 
-        # Mock DAOs
         mock_ds_dao = MagicMock()
         mock_ds_dao.get.return_value = {
             "sourceSubType": "GLUE_DATABASE",
@@ -82,7 +81,6 @@ class TestDiscoveryHandler:
         mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
         mock_get_ns.return_value = mock_ns_dao
 
-        # Mock connector
         mock_connector = MagicMock()
         mock_connector.test_connection.return_value = ConnectionTestResult(success=True, message="OK", checks=[])
         test_table = Table(
@@ -981,7 +979,7 @@ class TestDiscoveryHandler:
         the fresh scan equals live, so with the backup ignored the diff is empty —
         nothing is re-flagged, no new backup is written, no live asset is rewritten.
         If the stale backup were read, its added_tables entry would drop orders and
-        re-add it, manufacturing drift on a clean re-scan (the bug this fix closes)."""
+        re-add it, manufacturing drift on a clean re-scan."""
         import json as _json
 
         from coa_common.datazone_forms import serialize_form
@@ -1065,7 +1063,7 @@ class TestDiscoveryHandler:
 
 
 class TestGlueOwnershipGate:
-    """F-8: the last gate before the connector reads Glue, samples through Athena
+    """The last gate before the connector reads Glue, samples through Athena
     and (in strict-LF accounts) self-grants Lake Formation access.
 
     Re-checked here rather than trusted from source-create because this path is
@@ -1198,7 +1196,6 @@ class TestDiscoveryHandlerStatusLifecycle:
 
         handler({"datasourceId": "DS#ds-1", "scanJobId": "SCAN#s-1", "namespaceId": "ns-1", "scanType": "full"}, None)
 
-        # First update call should set SCANNING
         first_update = mock_ds_dao.update.call_args_list[0]
         assert first_update[1]["update_fields"]["status"] == SourceStatus.SCANNING
 
@@ -1211,7 +1208,7 @@ class TestDiscoveryHandlerStatusLifecycle:
         self, mock_get_connector, mock_get_ds, mock_get_scan, mock_get_ns, mock_write
     ):
         """If DataZone asset writes exhaust their retries and the writer raises
-        (e.g. sustained TooManyRequestsException, issue #857), discovery must
+        (e.g. sustained TooManyRequestsException), discovery must
         still write a TERMINAL source status (SCAN_FAILED) — never leave the
         source stuck in SCANNING."""
         from coa_sources.database.pipeline.discovery_handler import handler
@@ -1261,7 +1258,7 @@ class TestDiscoveryHandlerStatusLifecycle:
         from coa_sources.database.pipeline.discovery_handler import handler
 
         mock_ds_dao = MagicMock()
-        mock_ds_dao.get.return_value = None  # Will cause ValueError
+        mock_ds_dao.get.return_value = None
         mock_get_ds.return_value = mock_ds_dao
 
         mock_scan_dao = dao_double()
@@ -1270,12 +1267,10 @@ class TestDiscoveryHandlerStatusLifecycle:
         with pytest.raises(PermanentScanError):
             handler({"datasourceId": "DS#ds-1", "scanJobId": "SCAN#s-1", "namespaceId": "ns-1"}, None)
 
-        # Data source status set to SCAN_FAILED
         ds_update = mock_ds_dao.update.call_args_list
         assert len(ds_update) == 1
         assert ds_update[0][1]["update_fields"]["status"] == SourceStatus.SCAN_FAILED
 
-        # errorMessage set on scan job
         scan_update = mock_scan_dao.update.call_args_list
         assert len(scan_update) == 1
         assert "errorMessage" in scan_update[0][1]["update_fields"]
@@ -1327,16 +1322,6 @@ class TestDiscoveryHandlerStatusLifecycle:
         fields = mock_scan_dao.update.call_args_list[0][1]["update_fields"]
         assert fields["errorMessage"] == hint
         assert fields["errorMessageClientSafe"] is True
-
-
-# ═══════════════════════════════════════════════════════════════════
-# _provision_athena_federation — error isolation + rollback
-# ═══════════════════════════════════════════════════════════════════
-
-
-# ═══════════════════════════════════════════════════════════════════
-# MAX_TABLES_PER_SOURCE env-var parsing — cold-start safety
-# ═══════════════════════════════════════════════════════════════════
 
 
 class TestMaxTablesEnvParsing:
@@ -1514,7 +1499,7 @@ class TestCustomConnectorDiscovery:
         self, mock_get_connector, mock_get_ds, mock_get_scan, mock_get_ns, mock_write
     ):
         """A regex filter that matched nothing leaves the scan successful but unfiltered;
-        the reason must reach the scan job the steward sees (#168)."""
+        the reason must reach the scan job the steward sees."""
         from coa_sources.database.pipeline.discovery_handler import handler
 
         metadata = DiscoveredMetadata(

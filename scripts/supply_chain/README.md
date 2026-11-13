@@ -2,7 +2,7 @@
 
 Generates the root `NOTICE` that attributes every redistributed third-party
 component with its version and license, satisfying the Apache-2.0 §4(d)
-attribution obligation (ORR **PAK-A-3**).
+attribution obligation.
 
 Stdlib-only: the inventory is read from the installed environment via
 `importlib.metadata`, so it runs in any build without an extra scanner

@@ -3,10 +3,8 @@
 """Retrying a failed re-scan must keep the merge path.
 
 A re-scan of an APPROVED source that fails leaves the source SCAN_FAILED with
-its curated assets still live. Re-scanning from SCAN_FAILED used to send
-``isRescan=false``, so discovery took the first-scan path and revised every live
-asset with fresh, uncurated metadata. v0.3.4's SCHEDULED and EVENT triggers made
-that retry run with nobody watching.
+its curated assets still live, so re-scanning from SCAN_FAILED must send
+``isRescan=true`` rather than revise them with fresh, uncurated metadata.
 """
 
 from __future__ import annotations

@@ -29,7 +29,6 @@ interface ToolsPanelContextValue {
   unregisterDrawer: (id: string) => void;
   openDrawer: (id: string) => void;
   closeDrawer: () => void;
-  toggleDrawer: (id: string) => void;
 }
 
 const ToolsPanelContext = createContext<ToolsPanelContextValue>({
@@ -38,7 +37,6 @@ const ToolsPanelContext = createContext<ToolsPanelContextValue>({
   unregisterDrawer: () => {},
   openDrawer: () => {},
   closeDrawer: () => {},
-  toggleDrawer: () => {},
 });
 
 export function ToolsPanelProvider({
@@ -78,13 +76,6 @@ export function ToolsPanelProvider({
     setState((prev) => ({ ...prev, activeDrawerId: null }));
   }, []);
 
-  const toggleDrawer = useCallback((id: string) => {
-    setState((prev) => ({
-      ...prev,
-      activeDrawerId: prev.activeDrawerId === id ? null : id,
-    }));
-  }, []);
-
   return (
     <ToolsPanelContext.Provider
       value={{
@@ -93,7 +84,6 @@ export function ToolsPanelProvider({
         unregisterDrawer,
         openDrawer,
         closeDrawer,
-        toggleDrawer,
       }}
     >
       {children}

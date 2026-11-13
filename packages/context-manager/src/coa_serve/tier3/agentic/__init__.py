@@ -7,7 +7,7 @@ A server-side reasoning agent that iteratively explores the graphrag-toolkit
 knowledge graph through an internal-only tool set, then synthesizes a
 best-effort answer via the existing guardrailed ``Synthesizer``.
 
-Import discipline (Requirement 12.3): module load of this subpackage MUST NOT
+Import discipline: module load of this subpackage MUST NOT
 import ``graphrag_toolkit``. All toolkit access is delegated to the already-lazy
 ``BaselineLexicalRetriever`` / ``STRATEGY_REGISTRY`` ``build_engine`` callables,
 imported lazily inside the tool ``invoke`` methods — never at module load. This

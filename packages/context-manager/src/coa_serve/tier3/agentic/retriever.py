@@ -1,42 +1,22 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The Agentic Retriever session orchestration (Req 1, 4, 6, 7, 8, 9, 13).
+"""The Agentic Retriever session orchestration.
 
-:class:`AgenticRetriever` is the Tier 3 agentic path. It owns one **reasoning
-session** per request and returns the existing frozen
+:class:`AgenticRetriever` is the Tier 3 agentic path. It owns one reasoning
+session per request and returns the frozen
 :class:`~coa_serve.tier3.knowledge_retriever.Tier3Result`, so
 ``Orchestrator._run_tier3`` and ``ResponseAssembler.assemble_tier3`` consume its
-output unchanged (design tenet 1). A session:
+output unchanged. One :class:`BudgetClock` and one :class:`AccumulatedContext` are
+shared across every Sub_Question and Exploration_Branch, so the time budget, step
+cap and fan-out cap are enforced for the whole request. Every tool invocation is
+scoped to the request Namespace.
 
-1. starts a single :class:`BudgetClock` and a single
-   :class:`AccumulatedContext`, both **shared** across every Sub_Question and
-   Exploration_Branch so the Time_Budget, the max-step cap, and the fan-out cap
-   are enforced in aggregate for the whole request (Req 13.9);
-2. decomposes the input question into one or more Sub_Questions via the
-   :class:`DecompositionPlanner` (Req 13.1-13.3);
-3. drives the Sub_Question / Exploration_Branch FIFO queue through the
-   :class:`ReasoningController`, one loop per queued item, until the queue drains
-   or the wall-clock Time_Budget expires (Req 4, 6, 7.4-7.5);
-4. derives exactly one terminal stop reason from the :class:`StopReason` enum
-   (Req 6.6) and records it; and
-5. synthesizes once over the merged accumulated context via the existing
-   guardrailed :class:`Synthesizer` (Req 8.1).
-
-The session sets ``partial`` on the time-budget-expiry, all-tools-fail, and
-degraded-source paths (Req 7.5-7.8, 9.6-9.7); populates ``supporting_content`` /
-``graph_context`` from the accumulated context (empty when nothing was gathered,
-Req 8.2); honors a guardrail block (Req 8.3-8.4) and a synthesis failure
-(Req 8.6); and scopes every Tool invocation, Sub_Question, and Exploration_Branch
-to the originating request Namespace, blocking and tracing any cross-Namespace
-access (Req 1.5, 1.7).
-
-Import discipline (Requirement 12.3): this module imports only dependency-free
-siblings (the budget clock, the accumulated context, the shared models) and the
-graphrag-free :class:`Tier3Result` at load. The
-controller, decomposer, synthesizer, registry, embed client, and trace collector
-are referenced structurally and typed under ``TYPE_CHECKING``, so importing this
-module never pulls ``graphrag_toolkit`` into ``sys.modules``.
+Import discipline: this module imports only dependency-free siblings and the
+graphrag-free :class:`Tier3Result` at load. The controller, decomposer,
+synthesizer, registry, embed client and trace collector are typed under
+``TYPE_CHECKING``, so importing this module never pulls ``graphrag_toolkit`` into
+``sys.modules``.
 """
 
 from __future__ import annotations
@@ -86,7 +66,7 @@ logger = structlog.get_logger(__name__)
 
 
 def _last_executed_queries(ctx: AccumulatedContext) -> tuple[str | None, str | None]:
-    """Return the last executed (SQL, SPARQL) statements from the session (#1166).
+    """Return the last executed (SQL, SPARQL) statements from the session.
 
     Deep Reasoning may run several structured statements across its sub-questions;
     Standard mode exposes a single ``queryUsed`` / ``sparqlGenerated``. To match
@@ -104,18 +84,10 @@ def _last_executed_queries(ctx: AccumulatedContext) -> tuple[str | None, str | N
     return sql, sparql
 
 
-# Floor for the synthesis timeout. A session that has already consumed its whole
-# Time_Budget must still get a real synthesis attempt — without a floor,
-# ``remaining_s()`` clamps to 0.0 and every overrunning session would time out
-# instantly, turning a slow answer into no answer.
-#
-# MUST clear real synthesis latency, or the timeout kills GOOD answers and
-# substitutes the cruder working answer. Measured on the SEC-10-Q eval
-# (195 questions): answer_ms p50 17.4s / p90 32.4s / p99 40.1s. An earlier 20s
-# floor sat between p50 and p90, fired on 45/195 sessions (23%), and cost 40
-# correct→incorrect flips against only 15 the other way — accuracy fell 51.35% →
-# 38.50%. 60s clears p99 with headroom, so the fallback is reserved for a genuinely
-# hung synthesis (its actual purpose) instead of routinely pre-empting a slow one.
+# Floor for the synthesis timeout, so a session that has used its whole
+# Time_Budget still gets a real synthesis attempt. It must clear real synthesis
+# latency (measured p99 40.1s) or the timeout replaces good answers with the
+# cruder working answer.
 _MIN_SYNTHESIS_TIMEOUT_S = 60.0
 
 # Tools withheld from the planner on a namespace with no structured source. Only
@@ -226,7 +198,7 @@ class _RequestTools:
 
 @dataclass(frozen=True)
 class _FinalSearch:
-    """Handle for the P1 guaranteed-final-search task launched alongside the loop.
+    """Handle for the guaranteed-final-search task launched alongside the loop.
 
     ``tool`` is the resolved semantic retrieval tool (``None`` when none was
     registered); ``task`` is the in-flight ``asyncio`` future for its invocation
@@ -245,20 +217,20 @@ OnTokenCallback = Callable[[str], Awaitable[None]]
 class AgenticRetriever:
     """Tier 3 agentic path — same ``resolve`` contract as ``KnowledgeRetriever``.
 
-    A single instance is built once per process by the registry factory (task 17)
-    and reused across requests; per-request state lives entirely on the
+    A single instance is built once per process by the registry factory and reused across
+    requests; per-request state lives entirely on the
     :class:`BudgetClock` and :class:`AccumulatedContext` created inside
     :meth:`resolve`, so the retriever itself is stateless and safe to share.
 
     Args:
         registry: The internal :class:`ToolRegistry` the controller selects Tools
-            from. Never exposed outside the Serve_Layer (Req 2.7).
+            from. Never exposed outside the Serve_Layer.
         controller: The :class:`ReasoningController` that drives one
             Sub_Question's Reasoning_Loop. Reused across every queued item.
         decomposer: The :class:`DecompositionPlanner` that splits the input
-            question into Sub_Questions (Req 13.1-13.3).
+            question into Sub_Questions.
         synthesizer: The existing guardrailed :class:`Synthesizer` used for the
-            single final synthesis call (Req 8.1).
+            single final synthesis call.
         budget: The :class:`AgenticBudgetConfig` whose four budgets bound every
             session; a fresh :class:`BudgetClock` is built from it per request.
         embed_client: Optional planner/embedding :class:`LLMClient`. Held for
@@ -286,8 +258,6 @@ class AgenticRetriever:
         embed_client: LLMClient | None = None,
         clock_source: Callable[[], float] = time.monotonic,
         final_semantic_search: bool = True,
-        synthesize_working_answer_only: bool = False,
-        synthesize_without_working_answer: bool = False,
     ) -> None:
         """Wire the registry, controller, decomposer, synthesizer, budget, and flags."""
         self._registry = registry
@@ -298,19 +268,6 @@ class AgenticRetriever:
         self._embed_client = embed_client
         self._clock_source = clock_source
         self._final_semantic_search = final_semantic_search
-        # Experiment flag (idea-2 ablation): when True, the final synthesis is
-        # given ONLY the agent's grounded running best-guess (working_answer) and
-        # NONE of the gathered chunks/entities — to measure how good the interim
-        # grounded answer alone is, versus full synthesis over the chunk set. The
-        # reasoning loop still runs identically; only what synthesis SEES changes.
-        self._synthesize_working_answer_only = synthesize_working_answer_only
-        # Experiment flag (idea-2 ablation, complement of the above): when True, the
-        # final synthesis is given the full chunks/entities but NOT the working_answer
-        # (no <agent_preliminary_findings> block). Ideas 3 and 4 — and the working
-        # answer's influence on the reasoning LOOP (it is still computed by assess()
-        # and fed back into the planner each step) — are unchanged. Isolates whether
-        # injecting the interim answer into the FINAL synthesis helps/hurts/no-ops.
-        self._synthesize_without_working_answer = synthesize_without_working_answer
 
     async def resolve(
         self,
@@ -342,50 +299,20 @@ class AgenticRetriever:
         (``entity_uris``, ``tier2_sparql_hint``, ``structured_data``,
         ``retriever_strategy``) are accepted for signature parity and ignored.
 
-        Args:
-            query: The natural-language question to resolve.
-            namespace: The originating request Namespace; every Tool invocation,
-                Sub_Question, and Exploration_Branch in the session is scoped to it
-                (Req 1.5).
-            embedding: Optional pre-computed query embedding (passed through to the
-                planner / tools; the session does not require it).
-            entity_uris: Accepted for ``KnowledgeRetriever.resolve`` signature
-                parity; ignored by the agentic path.
-            tier2_sparql_hint: Accepted for signature parity; ignored.
-            catalog_summary: Optional metric definitions supplied to synthesis.
-            structured_data: Accepted for signature parity; ignored (the agentic
-                path gathers its own structured rows via the structured tools).
-            conversation_history: Optional prior turns supplied to synthesis.
-            on_token: Optional streaming callback for synthesis tokens.
-            trace: The session :class:`TraceCollector`; one is created when absent.
-            retriever_strategy: Accepted for signature parity; ignored.
-            has_structured_source: Whether the namespace has a DATABASE source; when
-                False the structured (SQL/SPARQL) tools are withheld from the planner.
-            has_unstructured_source: Whether the namespace has a DOCUMENTS source;
-                when False the chunk/topic vector tools are withheld from the planner.
-            exclude_tools: Additional tool names to withhold from the planner for
-                this request (per-request ablation via ``options.excludeTools``).
-            profile: Optional authenticated caller profile threaded to the tools
-                out-of-band (e.g. for structured-query authorization).
-            options: Optional per-request options bag threaded to the tools
-                out-of-band.
-            model_id: Optional per-request model id override for synthesis / tools.
-            schema_visible: Whether the caller may see generated SQL (resolved by the
-                orchestrator: ``includeDebugInfo`` plus ``viewSource``). Only then may
-                the answer name the tables and columns behind its numbers.
-
-        Returns:
-            A :class:`Tier3Result` with ``synthesized_answer``,
-            ``supporting_content``, ``graph_context``, ``confidence``,
-            ``guardrail_blocked``, ``degraded_sources``, and ``partial`` populated
-            per Requirements 1.4, 7, 8, and 9.
+        Every Tool invocation, Sub_Question and Exploration_Branch is scoped to
+        ``namespace``. ``has_structured_source`` / ``has_unstructured_source`` withhold
+        the structured (SQL/SPARQL) or chunk/topic vector tools from the planner when
+        False, and ``exclude_tools`` withholds more for this request
+        (``options.excludeTools``). ``schema_visible`` (``includeDebugInfo`` plus
+        ``viewSource``, resolved by the orchestrator) is the only way the answer may
+        name the tables and columns behind its numbers.
         """
         if trace is None:
             from ...trace import TraceCollector as _TraceCollector
 
             trace = _TraceCollector()
 
-        # Namespace scoping (Req 1.5, 1.7): validate the request Namespace and use
+        # Namespace scoping: validate the request Namespace and use
         # it — and only it — to scope every Tool invocation below. There is no path
         # by which a Sub_Question or branch can target a different Namespace; the
         # request Namespace is threaded into the controller for every queued item.
@@ -427,15 +354,8 @@ class AgenticRetriever:
         if not has_unstructured_source:
             composition_gated |= _UNSTRUCTURED_TOOL_NAMES
         # Union: automatic composition gating PLUS any per-request ablation
-        # (options.excludeTools). Both withhold tools from the planner's spec list.
-        #
-        # Scope note: exclusion affects only what the PLANNER can select. The
-        # guaranteed final semantic search resolves its own tool directly
-        # (``strategy:chunk_based_semantic``, falling back to ``vector_search``) and
-        # is deliberately NOT gated — it is the session's floor, not a planner
-        # choice. So excluding ``vector_search`` measures the planner's mid-loop use
-        # of it, which is the redundancy question worth asking (the final search
-        # still runs via the chunk-based strategy).
+        # (options.excludeTools). Exclusion gates only the planner; the guaranteed
+        # final semantic search resolves its own tool and is never gated.
         requested_gated = composition_gated | exclude_tools
 
         # Option-gated tools stay withheld unless the request's options turn them on
@@ -539,7 +459,7 @@ class AgenticRetriever:
             else None
         )
 
-        # 1. Decompose the question into >= 1 Sub_Questions (Req 13.1-13.3). The
+        # 1. Decompose the question into >= 1 Sub_Questions. The
         # decomposer is best-effort and never raises (it degrades to a single
         # Sub_Question), so no guard is needed here. The same call reports the
         # question's language, resolved once, so the planner and synthesizer are
@@ -666,10 +586,9 @@ class AgenticRetriever:
             if ctx.pending_sql is not None:
                 ctx.pending_sql.cancel()
 
-        # 3. Derive exactly one terminal stop reason (Req 6.6) and record it with
-        # the total elapsed time (Req 10.3). The queue is drained per sub-question
-        # (each owned its local branch queue), so pass an empty queue here.
-        stop_reason = self._derive_stop_reason(clock, deque(), last_stop)
+        # 3. Derive exactly one terminal stop reason and record it with the total
+        # elapsed time.
+        stop_reason = self._derive_stop_reason(clock, last_stop)
         trace.record(
             "agentic_retrieval_stop",
             "success",
@@ -731,7 +650,7 @@ class AgenticRetriever:
                 tool.invoke(namespace=namespace, terms=list(terms)),
                 timeout=clock.tool_deadline_s(self._budget.per_tool_timeout_s),
             )
-        except Exception as exc:  # noqa: BLE001 - routing must never raise (Req 9.1)
+        except Exception as exc:  # noqa: BLE001 - routing must never raise
             ms = int((time.perf_counter() - start) * 1000)
             logger.warning(
                 "agentic_find_documents_preload_failed",
@@ -823,7 +742,7 @@ class AgenticRetriever:
                     result = await asyncio.wait_for(call, timeout=timeout_s)
             except AccessDeniedError:
                 raise
-            except Exception as exc:  # noqa: BLE001 - prefetch must never raise (Req 9.1)
+            except Exception as exc:  # noqa: BLE001 - prefetch must never raise
                 ms = int((time.perf_counter() - start) * 1000)
                 ctx.record_degraded(NL_TO_SQL_TOOL, type(exc).__name__)
                 trace.record("prefetch_sql", "error", ms, detail=type(exc).__name__, tool_used=NL_TO_SQL_TOOL)
@@ -963,7 +882,7 @@ class AgenticRetriever:
             )
         except AccessDeniedError:
             raise
-        except Exception as exc:  # noqa: BLE001 - prefetch must never raise (Req 9.1)
+        except Exception as exc:  # noqa: BLE001 - prefetch must never raise
             ms = int((time.perf_counter() - start) * 1000)
             trace.record("sql_result_revise", "error", ms, detail=type(exc).__name__, tool_used=NL_TO_SQL_TOOL)
             return False
@@ -1140,7 +1059,7 @@ class AgenticRetriever:
                 tool.invoke(namespace=namespace),
                 timeout=clock.tool_deadline_s(self._budget.per_tool_timeout_s),
             )
-        except Exception as exc:  # noqa: BLE001 - preload must never raise (Req 9.1)
+        except Exception as exc:  # noqa: BLE001 - preload must never raise
             ms = int((time.perf_counter() - start) * 1000)
             logger.warning("agentic_ontology_preload_failed", error_type=type(exc).__name__)
             trace.record("ontology_preload", "error", ms, detail=type(exc).__name__, tool_used=ONTOLOGY_LOOKUP_TOOL)
@@ -1150,8 +1069,6 @@ class AgenticRetriever:
         status = "success" if ontology is not None else "error"
         trace.record("ontology_preload", status, ms, detail=result.detail, tool_used=ONTOLOGY_LOOKUP_TOOL)
         return ontology
-
-    # ── parallel sub-question execution (P2) ───────────────────────────
 
     async def _run_subquestions_parallel(
         self,
@@ -1165,7 +1082,7 @@ class AgenticRetriever:
         tool_context: dict | None = None,
         tools: Any | None = None,
     ) -> StopReason | None:
-        """Run the initial Sub_Questions concurrently, merging results back (P2).
+        """Run the initial Sub_Questions concurrently, merging results back.
 
         Each Sub_Question runs in its own forked sub-context (private ``seen_keys``
         so a sibling's overlapping retrieval cannot spoof its ``no_new_information``
@@ -1239,7 +1156,7 @@ class AgenticRetriever:
         *,
         embedding: list[float] | None,
     ) -> _FinalSearch | None:
-        """Launch the guaranteed final semantic search as a background task (P1).
+        """Launch the guaranteed final semantic search as a background task.
 
         Resolves the graphrag ``strategy:chunk_based_semantic`` retriever (falling
         back to the vector tool), starts its invocation as an ``asyncio.Task`` so
@@ -1253,7 +1170,7 @@ class AgenticRetriever:
 
         Args:
             query: The original request query the semantic search runs over.
-            namespace: The request namespace the search is scoped to (Req 1.5).
+            namespace: The request namespace the search is scoped to.
             clock: The session budget clock (its deadline-aware timeout bounds the
                 invocation so it cannot eat the synthesis reserve).
             embedding: Optional precomputed query embedding handed to the vector
@@ -1285,14 +1202,14 @@ class AgenticRetriever:
         trace: TraceCollector,
         clock: BudgetClock,
     ) -> None:
-        """Await the P1 final search and incorporate its result (never raises, Req 9.1).
+        """Await the final search and incorporate its result (never raises).
 
         Merges the search's chunks into the accumulated context and records the
-        trace step AFTER the loop, so dedup (``ctx.add``) and trace ordering are
-        identical to the pre-P1 sequential behavior — only the tool I/O latency was
-        overlapped. A missing tool / disabled search records a ``skipped`` step; a
-        timeout or error records a degraded source. The awaited task was already
-        bounded by the deadline-aware timeout at launch.
+        trace step after the loop, so dedup (``ctx.add``) and trace ordering are
+        deterministic; only the tool I/O latency overlaps the loop. A missing tool or
+        disabled search records a ``skipped`` step; a timeout or error records a
+        degraded source. The awaited task was already bounded by the
+        deadline-aware timeout at launch.
         """
         if final_search is None:
             if self._final_semantic_search:
@@ -1310,14 +1227,6 @@ class AgenticRetriever:
             return
 
         tool = final_search.tool
-        if tool is None:
-            trace.record(
-                "agentic_final_semantic_search",
-                "skipped",
-                clock.elapsed_ms(),
-                detail="semantic retrieval task has no tool",
-            )
-            return
         try:
             result = await final_search.task
             ms = int((time.perf_counter() - final_search.start) * 1000)
@@ -1350,14 +1259,11 @@ class AgenticRetriever:
             ctx.record_degraded(tool.name, "error")
             trace.record("agentic_final_semantic_search", "error", ms, detail=f"{tool.name} error", tool_used=tool.name)
 
-    # ── stop-reason derivation (Req 6.6) ───────────────────────────────
+    def _derive_stop_reason(self, clock: BudgetClock, last_stop: StopReason | None) -> StopReason:
+        """Derive the single session-level stop reason from the enum.
 
-    def _derive_stop_reason(self, clock: BudgetClock, queue: deque, last_stop: StopReason | None) -> StopReason:
-        """Derive the single session-level stop reason from the enum (Req 6.6).
-
-        Precedence: the wall-clock Time_Budget (Req 7.4) outranks the aggregate
-        step cap (Req 4.5/6.4), which outranks a drained queue. When the queue
-        drained without hitting either aggregate cap, the per-Sub_Question outcome
+        Precedence: the wall-clock Time_Budget outranks the aggregate step cap,
+        which outranks a drained queue. Otherwise the per-Sub_Question outcome
         (a positive Sufficiency_Check or no-new-information) is reported when one
         was produced, otherwise ``queue_drained``.
         """
@@ -1365,11 +1271,7 @@ class AgenticRetriever:
             return StopReason.time_budget_expired
         if clock.steps_consumed >= self._budget.max_steps:
             return StopReason.max_steps_reached
-        if not queue:
-            return last_stop or StopReason.queue_drained
         return last_stop or StopReason.queue_drained
-
-    # ── synthesis & result assembly (Req 7.5-7.8, 8, 9.6-9.7) ──────────
 
     async def _synthesize_and_build(
         self,
@@ -1386,11 +1288,9 @@ class AgenticRetriever:
         """Synthesize once over ``ctx`` and assemble the partial-aware Tier3Result.
 
         Computes the ``partial`` flag (time-budget expiry, any degraded source, or
-        no context gathered — Req 7.5-7.8, 9.6), handles the all-tools-failed /
-        no-context case by returning no Best_Effort_Answer (Req 9.7), runs the
-        single guardrailed synthesis call otherwise, and maps the outcome onto a
-        :class:`Tier3Result` (guardrail block Req 8.3-8.4, synthesis failure
-        Req 8.6, confidence Req 8.5, supporting content Req 8.2).
+        no context gathered), handles the all-tools-failed / no-context case by
+        returning no Best_Effort_Answer, runs the single guardrailed synthesis call
+        otherwise, and maps the outcome onto a :class:`Tier3Result`.
         """
         degraded = list(ctx.degraded_sources)
         # Structured rows count as context: a namespace answered purely by NL→SQL /
@@ -1444,20 +1344,19 @@ class AgenticRetriever:
                     }
                 )
 
-        # Partial on time-budget expiry (Req 7.7-7.8), any degraded source / all
-        # tools failing with context (Req 9.6), or no context gathered (Req 7.8).
+        # Partial on time-budget expiry, any degraded source, or no context gathered.
         partial = clock.expired() or bool(degraded) or no_context
 
-        # Query artifacts the loop executed (#1166): the LAST SQL and LAST SPARQL
+        # Query artifacts the loop executed: the LAST SQL and LAST SPARQL
         # the structured tools ran, mirroring Standard mode's single queryUsed /
         # sparqlGenerated. Empty when no structured tool ran (document/graph-only
         # answer), leaving both None. Threaded through every _build_result exit
-        # that carries a synthesized answer; the no-source (Req 9.7) and
-        # guardrail-blocked (Req 8.3) exits return an empty answer and so leave
+        # that carries a synthesized answer; the no-source and
+        # guardrail-blocked exits return an empty answer and so leave
         # the artifacts unset by design.
         sql_used, sparql_used = _last_executed_queries(ctx)
 
-        # Req 9.7: every Tool invocation failed AND no context was gathered. Return
+        # Every Tool invocation failed AND no context was gathered. Return
         # a partial result with NO Best_Effort_Answer and indicate that no source
         # succeeded — do NOT call the Synthesizer (there is nothing to synthesize).
         if no_context and degraded:
@@ -1479,10 +1378,7 @@ class AgenticRetriever:
                 partial=True,
             )
 
-        # Single guardrailed synthesis over the accumulated context (Req 8.1).
-        # Instrumentation: record the carried grounded best-guess handed to the
-        # synthesizer so it can be compared against the final synthesized answer
-        # (measuring how often synthesis refines/corrects the agent's interim guess).
+        # Single guardrailed synthesis over the accumulated context.
         if ctx.working_answer:
             # Written by the planner from rows (and, with sqlRevision, their SQL): for a
             # caller who may not see the schema the trace keeps only its length, as the
@@ -1493,15 +1389,10 @@ class AgenticRetriever:
                 detail = f"{len(ctx.working_answer)} chars (withheld: written from structured rows)"
             trace.record("agentic_working_answer", "success", clock.elapsed_ms(), detail=detail)
         try:
-            # Bound synthesis by the wall-clock actually left. synthesis_reserve_s
-            # only SHRINKS tool timeouts (budget.tool_deadline_s) — it reserves a
-            # slice but never bounded the synthesis call itself, so a slow LLM ran
-            # unbounded past the Time_Budget and pushed total wall time into the
-            # AgentCore invocation ceiling (~131s), where the endpoint returns HTTP
-            # 200 with an EMPTY envelope and the answer is lost entirely. Measured on
-            # the SEC-10-Q eval: p50 96.9s / p90 117.2s / max 131.8s, with the 131.8s
-            # query coming back empty. Floored so a session that has already overrun
-            # still gets a real attempt rather than an instant timeout.
+            # Bound synthesis by the wall-clock actually left: past the AgentCore
+            # invocation ceiling (~131s) the endpoint returns HTTP 200 with an EMPTY
+            # envelope and the answer is lost. Floored so a session that has already
+            # overrun still gets a real attempt rather than an instant timeout.
             synthesis = await asyncio.wait_for(
                 self._synthesize(
                     query,
@@ -1543,7 +1434,7 @@ class AgenticRetriever:
                 sparql_generated=sparql_used,
             )
         except Exception as exc:  # noqa: BLE001 - synthesis failure must not raise out
-            # Req 8.6: synthesizer raised → partial, empty answer, confidence 0.0,
+            # Synthesizer raised → partial, empty answer, confidence 0.0,
             # trace the failure.
             logger.error(
                 "agentic_synthesis_failure",
@@ -1570,7 +1461,7 @@ class AgenticRetriever:
                 sparql_generated=sparql_used,
             )
 
-        # Req 8.3: a guardrail block excludes the blocked content from the answer.
+        # A guardrail block excludes the blocked content from the answer.
         if synthesis.guardrail_blocked:
             trace.record(
                 "llm_synthesize",
@@ -1590,7 +1481,7 @@ class AgenticRetriever:
                 partial=partial,
             )
 
-        # Req 8.6: a successful call that returns no usable answer is treated as a
+        # A successful call that returns no usable answer is treated as a
         # synthesis failure — partial, empty answer, confidence 0.0, traced.
         if not synthesis.answer or not synthesis.answer.strip():
             trace.record(
@@ -1638,29 +1529,19 @@ class AgenticRetriever:
         on_token: OnTokenCallback | None,
         synth_max_tokens: int | None = None,
     ) -> SynthesisResult:
-        """Run the single Synthesizer call over the accumulated context (Req 8.1).
+        """Run the single Synthesizer call over the accumulated context.
 
         Streams when an ``on_token`` callback is supplied and the Synthesizer
         supports it, mirroring ``KnowledgeRetriever``; otherwise performs a
         single-shot synthesis. Returns the :class:`SynthesisResult` (or raises,
-        which the caller turns into the Req 8.6 partial result).
+        which the caller turns into a partial result).
 
         ``prompt_chunks`` is ``ctx.chunks`` fitted to the document-context budget.
         ``synth_max_tokens`` (``options.tokenCaps.synthesizer``) caps the answer's
         output tokens; it is passed only when set, so the default call is unchanged.
         """
         cap_kw: dict[str, Any] = {"max_tokens": synth_max_tokens} if synth_max_tokens else {}
-        # idea-2 ablation: feed synthesis ONLY the grounded running best-guess,
-        # withholding the gathered chunks/entities, to isolate the interim answer.
-        chunks = [] if self._synthesize_working_answer_only else prompt_chunks
-        entities = [] if self._synthesize_working_answer_only else ctx.entities
-        # Structured rows (NL→SQL / metric tools) flow to synthesis as
-        # ``structured_data`` — the synthesizer already renders a structured-data
-        # section. Withheld under the working-answer-only ablation, like chunks.
-        structured_data = None if self._synthesize_working_answer_only else (ctx.rows or None)
-        # idea-2 ablation (complement): withhold the working answer from synthesis
-        # while keeping the chunks — isolates idea 2's synthesis contribution.
-        working_answer = "" if self._synthesize_without_working_answer else ctx.working_answer
+        structured_data = ctx.rows or None
         # Only pass the resolved language when there is one, so a synthesizer that
         # predates the parameter keeps working on an unresolved session. A follow-up
         # whose tag is only the namespace fallback is not named either: the directive
@@ -1676,52 +1557,33 @@ class AgenticRetriever:
         if on_token is not None and hasattr(self._synthesizer, "synthesize_stream"):
             return await self._synthesizer.synthesize_stream(
                 query,
-                chunks,
-                entities,
+                prompt_chunks,
+                ctx.entities,
                 structured_data=structured_data,
                 catalog_summary=catalog_summary,
                 conversation_history=conversation_history,
                 on_token=on_token,
-                working_answer=working_answer,
+                working_answer=ctx.working_answer,
                 **synth_kw,
                 **cap_kw,
             )
         return await self._synthesizer.synthesize(
             query,
-            chunks,
-            entities,
+            prompt_chunks,
+            ctx.entities,
             structured_data=structured_data,
             catalog_summary=catalog_summary,
             conversation_history=conversation_history,
-            working_answer=working_answer,
+            working_answer=ctx.working_answer,
             **synth_kw,
             **cap_kw,
         )
-
-    # ── context → result mappers (Req 8.2) ─────────────────────────────
-
-    @staticmethod
-    def _supporting_content(ctx: AccumulatedContext) -> tuple[dict, ...]:
-        """Map document-backed chunks to ``supporting_content`` (empty when none).
-
-        Graph traversal can gather statement snippets with no source-document
-        provenance. They remain available to synthesis, while their entities and
-        relationships surface through ``graph_context``; they must not masquerade
-        as document citations. Every accumulated document chunk is returned with
-        no ``MAX_PROMPT_CHUNKS`` slice (Req 8.2).
-        """
-        return AgenticRetriever._supporting_content_with_drops(ctx)[0]
 
     @staticmethod
     def _supporting_content_with_drops(
         ctx: AccumulatedContext, chunks: list[ChunkResult] | None = None
     ) -> tuple[tuple[dict, ...], int, int]:
         """Split accumulated chunks into citations, graph-only text, and anonymous text.
-
-        The hand-rolled and lexical paths both count the chunks they filter for
-        missing provenance, mark the step degraded and add a ``degradedSources``
-        entry. This path filtered silently, so a chunk that should have carried a
-        document id but did not simply vanished from the citation list.
 
         The two counts are kept apart because they mean different things. A
         graph-only statement chunk (``uri`` set, no ``source_doc``) is EXPECTED: the
@@ -1751,7 +1613,7 @@ class AgenticRetriever:
 
     @staticmethod
     def _graph_context(ctx: AccumulatedContext) -> tuple[dict, ...]:
-        """Map the accumulated entities to ``graph_context`` (empty when none, Req 8.2)."""
+        """Map the accumulated entities to ``graph_context`` (empty when none)."""
         return tuple(
             {
                 "uri": e.uri,
@@ -1780,9 +1642,9 @@ class AgenticRetriever:
         """Assemble the frozen :class:`Tier3Result` for the session.
 
         Attaches all trace steps recorded up to this point, ordered by invocation
-        sequence (Req 10.4), and carries the ``partial`` flag and ``degraded_sources``
-        through unchanged (Req 1.4, 7.7, 9.5). ``query_used`` / ``sparql_generated``
-        carry the structured query artifacts the loop executed (#1166); they
+        sequence, and carries the ``partial`` flag and ``degraded_sources``
+        through unchanged. ``query_used`` / ``sparql_generated``
+        carry the structured query artifacts the loop executed; they
         default to ``None`` for paths that ran no structured tool.
         """
         trace_steps = tuple(

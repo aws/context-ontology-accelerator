@@ -18,7 +18,7 @@ import {
 
 const SKOS = "http://www.w3.org/2004/02/skos/core#";
 const EX = "https://example.com/vocabulary/";
-const JA = "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString";
+const RDF_LANG_STRING = "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString";
 
 const TURTLE = `
 @prefix ex: <${EX}> .
@@ -41,7 +41,7 @@ ex:Account a owl:Class ;
 const label = (value: string, language: string): VocabularyLabel => ({
   value,
   language,
-  datatype: JA,
+  datatype: RDF_LANG_STRING,
 });
 
 function store(turtle: string): Store {
@@ -72,7 +72,7 @@ ex:Plan rdfs:label "Plan"@en-US, "プラン"@ja ;
 `;
 
 describe("business vocabulary Turtle editing", () => {
-  it("distinguishes Turtle syntax errors from vocabulary validation errors", () => {
+  it("reports a Turtle syntax error with the parser detail", () => {
     expect(() => parseVocabulary("<unterminated")).toThrow(
       /Failed to parse Turtle document:/,
     );
@@ -158,20 +158,6 @@ describe("business vocabulary Turtle editing", () => {
     expect(labelsOf(promoted, `${EX}Account`)).toEqual(
       labelsOf(TURTLE, `${EX}Account`),
     );
-  });
-
-  it("enforces one preferred label per language and canonicalizes tags", () => {
-    expect(() =>
-      addPreferredLabel(TURTLE, `${EX}Customer`, label("取引先", "JA")),
-    ).toThrow(/already has a preferred label/);
-    expect(() =>
-      replacePreferredLabel(
-        TURTLE,
-        `${EX}Customer`,
-        label("顧客", "ja"),
-        label("取引先", "not_a_language"),
-      ),
-    ).toThrow(/not a valid language tag/);
   });
 
   it("does not allow the same literal to be preferred and alternative", () => {

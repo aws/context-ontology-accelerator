@@ -6,7 +6,7 @@ import { readE2EEnv, MISSING_ENV_REASON } from "../../fixtures/env";
 import { LanguageMenu } from "../../pages/LanguageMenu";
 
 /**
- * Settings → Language (Phase 1 of #1024): switching the UI locale localizes
+ * Settings → Language: switching the UI locale localizes
  * Cloudscape's built-in component strings, is reflected on <html lang>, and
  * survives a reload. Read-only — the preference lives in this test's browser
  * context only; nothing is written to the backend.

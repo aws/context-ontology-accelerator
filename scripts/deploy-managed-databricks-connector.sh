@@ -55,13 +55,8 @@ if [[ ! "$PREFIX" =~ ^[a-zA-Z][a-zA-Z0-9-]*$ ]]; then
 fi
 
 # ── The managed-mode contract ────────────────────────────────────────────────
-# Two scalars, and the managed CDK app derives everything else from them: the per-source
-# parameter prefix, the resource prefix each namespace's sts:ExternalId comes from, the
-# deployment id every parameter is checked against, the function name, the role name and
-# both deployment parameter paths. Two rather than one composed token because recovering
-# them from a single "coa-dev-2-" is ambiguous between (coa, dev-2) and (coa-dev, 2), and
-# this script permits hyphens in the environment name.
-#
+# The managed CDK app derives everything else from these two scalars. They are not one
+# composed token because "coa-dev-2-" is ambiguous between (coa, dev-2) and (coa-dev, 2).
 export COA_PREFIX="$PREFIX"
 export COA_ENV_NAME="$ENV"
 
@@ -71,17 +66,9 @@ export COA_ENV_NAME="$ENV"
 export DATABRICKS_CONFIG_SOURCE="coa-managed"
 
 # ── The name, derived here only to report and check it ───────────────────────
-# athena:CreateDataCatalog stores the handler ARN and never re-resolves it, so every
-# Athena catalog COA creates embeds this function's ARN. Renaming the function later
-# orphans every catalog already created, with no in-place repair — so the name is a pure
-# function of the two variables above, derived by the managed app and never overridden.
-#
-# The `-managed-` segment tells this deployment apart from a customer-deployed connector in
-# the same account, and is RESERVED: connectors/databricks/README.md tells a
-# customer-deployed connector not to use it.
-#
-# FUNCTION_NAME_PREFIX is deliberately neither read nor exported. The managed app ignores
-# it, so a stale value left in a developer's shell cannot rename COA's connector.
+# athena:CreateDataCatalog stores the function ARN and never re-resolves it, so the
+# function name must not change: it is derived from the two variables above, never overridden.
+# The `-managed-` segment is reserved (see connectors/databricks/README.md).
 STACK_NAME="${PREFIX}-${ENV}-managed-databricks-coa-connector"
 
 # Checked here, not left to cdk synth: synth runs after `mvn package`, so an unusable name would
@@ -96,17 +83,8 @@ if [[ ! "$STACK_NAME" =~ ^[A-Za-z][A-Za-z0-9-]*$ ]] || [ ${#STACK_NAME} -gt 64 ]
 fi
 
 # ── Refuse a single-target variable ──────────────────────────────────────────
-# The failure this closes: a developer with a stage-1 `.env` sourced in their shell runs THIS
-# script when they meant scripts/deploy-example-connector.sh, and gets a correct managed
-# connector rather than the single-endpoint one they were configuring. The managed app reads
-# none of these, so they cannot reach the Lambda, and the jar refuses them if they arrive by
-# some other route — what this adds is naming the variables before anything has been built,
-# in the shell the mistake lives in.
-#
-# They are worth naming because of what they would mean if they ever DID reach a managed
-# function: the connector would ignore the Athena catalog name entirely, so every namespace's
-# catalog would resolve the one workspace and credential this stack was given, and the
-# per-request catalog check could not see it — nothing would be bound to a catalog to check.
+# A sourced stage-1 `.env` would pin a managed connector to one endpoint. The managed app
+# ignores these variables; failing here names them before anything is built.
 SINGLE_TARGET_VARS=(
   DATABRICKS_WORKSPACE_HOSTNAME
   DATABRICKS_HTTP_PATH
@@ -158,20 +136,14 @@ read_param() {
     --query Parameter.Value --output text 2>/dev/null || true
 }
 
-# Both paths carry ${ENV}, which is what makes reading them safe in an account where several
-# environments share one prefix. These two values become the connector's
-# lambda:InvokeFunction resource policy plus s3:GetObject on its spill prefix and kms:Decrypt
-# on its spill key, so under an env-less name a sibling environment's platform deploy would
-# hand its serve role a read on THIS environment's spilled query results and leave this
-# environment's discovery role unable to run a single DESCRIBE.
+# Paths carry ${ENV} so that environments sharing one prefix cannot read each other's roles
+# and network (the roles grant invoke and spill-bucket access).
 SERVE_PARAM="${SSM_PREFIX}/${ENV}/serve/runtime-role-arn"
 DISCOVERY_PARAM="${SSM_PREFIX}/${ENV}/sources/db-connector-role-arn"
 SERVE_ROLE_ARN="$(read_param "$SERVE_PARAM")"
 DISCOVERY_ROLE_ARN="$(read_param "$DISCOVERY_PARAM")"
 
-# COA's VPC, which the connector runs in. Read like the roles, from this environment's own path,
-# so the connector cannot land in a sibling environment's network. The CDK app refuses to synth
-# without both.
+# COA's VPC, which the connector runs in. The CDK app refuses to synth without both.
 VPC_PARAM="${SSM_PREFIX}/${ENV}/network/vpc-id"
 SUBNETS_PARAM="${SSM_PREFIX}/${ENV}/network/private-subnet-ids"
 CONNECTOR_VPC_ID="$(read_param "$VPC_PARAM")"
@@ -222,17 +194,8 @@ pnpm install --frozen-lockfile
 
 echo ""
 echo "--- Building the jar and deploying ${STACK_NAME} ---"
-# One `deploy` script for both modes: the mode is DATABRICKS_CONFIG_SOURCE, exported above, and the
-# CDK app reads it. Its `predeploy` hook runs the maven package step, so the fat jar is built here
-# rather than in a separate step above — which also means a hand-run cannot deploy a stale jar.
-#
-# --require-approval never: the IAM diff otherwise stops on a confirmation prompt a pipeline
-# runner can never answer ("terminal (TTY) is not attached"). pnpm forwards flags after the
-# script name, so this reaches `cdk deploy`.
-#
-# --fail-if-no-match: without it pnpm prints "No projects matched the filters" and exits 0,
-# so a renamed package or a broken workspace glob turns the whole build and deploy into a
-# no-op while this script still reports success.
+# --require-approval never: a pipeline has no TTY to answer the IAM diff prompt.
+# --fail-if-no-match: pnpm exits 0 on "No projects matched the filters".
 pnpm --filter coa-databricks-connector-cdk --fail-if-no-match run deploy \
   --require-approval never
 

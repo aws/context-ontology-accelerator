@@ -72,8 +72,6 @@ const SCAN_PROGRESS_POLL_MS = 5000;
 // sources_handler._GRAPH_VERIFY_STALE_AFTER.
 const GRAPH_VERIFY_STALE_AFTER_MS = 15 * 60 * 1000;
 
-// ── Status helpers ────────────────────────────────────────────────────────────
-
 const ACTIVE_STATUSES = new Set([
   "REGISTERED",
   "SCANNING",
@@ -121,32 +119,12 @@ function localizedSourceStatus(
   return message ? t(message) : sourceStatusLabel(status);
 }
 
-// ── Degraded-scan annotation ──────────────────────────────────────────────────
-//
-// Discovery for the connector-backed sub-types — CUSTOM_CONNECTOR and
-// DATABRICKS_SQL_WAREHOUSE — reads one table at a time (a DESCRIBE per table),
-// so a single unreadable table is dropped while the scan as a whole still
-// SUCCEEDS. On a Databricks source that is the common case rather than the
-// exotic one: Unity Catalog privilege-filters results, so a table listed under
-// BROWSE but not SELECT-able is listed and then not readable.
-// The scan job then reports `tablesFailed` — the
-// count of listed-but-unreadable tables, absent rather than zero when the scan
-// was clean, so its presence alone marks the scan degraded — and
-// `failedTables`, the affected tables as `database.table`.
-//
-// `failedTables` is a capped diagnostic sample and may be shorter than
-// `tablesFailed`, so the count is always taken from `tablesFailed` and never
-// derived from the list's length.
-//
-// Both members ARE modelled on `GetSourceScanJobOutput`, but they are read
-// defensively off the response rather than by typed field access, mirroring
-// `normalizeResponse` in `@api-hooks/normalize-response` — the package's idiom
-// for values the API assembles as a raw dict rather than through a model.
-//
-// The `typeof === "number"` check is load-bearing, not decoration. DynamoDB
-// numbers arrive as `Decimal` through boto3's resource interface and serialize to
-// JSON as STRINGS unless the handler coerces them, so a regression on the API
-// side must read here as "not degraded" rather than as a truthy count.
+// Degraded scan: connector-backed sources (CUSTOM_CONNECTOR, DATABRICKS_SQL_WAREHOUSE)
+// DESCRIBE one table at a time, so an unreadable table is dropped while the scan
+// still succeeds (on Databricks, a Unity Catalog table under BROWSE but not SELECT).
+// `tablesFailed` is present only when tables were dropped. `failedTables` is a
+// capped sample, so the count always comes from `tablesFailed`. The
+// `typeof === "number"` check matters: DynamoDB Decimals can arrive as strings.
 
 interface DegradedScan {
   tablesFailed: number;
@@ -219,8 +197,6 @@ function chunkTokens(value: unknown): number | undefined {
     : undefined;
 }
 
-// ── Component ─────────────────────────────────────────────────────────────────
-
 export const SourceDetail: React.FC = () => {
   const { t } = useAppI18n();
   const graphSourcesEnabled =
@@ -288,7 +264,7 @@ export const SourceDetail: React.FC = () => {
   const isGraph = source?.sourceSubType === "RDF_SPARQL";
   const isTabular = isDatabase && !isGraph;
 
-  // Tables — only fetched for DATABASE sources via the new sources-api tables endpoint.
+  // Tables: only fetched for tabular DATABASE sources.
   // Pages render as they arrive; `tablesLoadingMore` means the list on screen is
   // a valid prefix, not the whole source, so the counts are marked provisional.
   const {
@@ -324,10 +300,7 @@ export const SourceDetail: React.FC = () => {
     }
   }, [source?.status, queryClient, namespaceId, sourceId]);
 
-  // Scan-job record for the most recent scan of a database source. Fetched for
-  // every scan, not just failed ones: a scan can succeed and still have dropped
-  // individual tables, and that count lives only on the scan job.
-  // Polled while enriching, which is where per-table progress advances.
+  // Polled while enriching for per-table progress.
   const isEnriching = source?.status === SourceStatus.ENRICHING;
   const { data: scanJobData } = useGetSourceScanJob(
     namespaceId ?? "",
@@ -451,7 +424,6 @@ export const SourceDetail: React.FC = () => {
           status === SourceStatus.SCAN_FAILED
         : status === SourceStatus.SCAN_FAILED;
 
-  // Type-specific detail objects
   const dbDetails = source.databaseDetails;
   const docDetails = source.documentDetails;
 
@@ -873,7 +845,6 @@ export const SourceDetail: React.FC = () => {
         </Alert>
       )}
 
-      {/* ── DATABASE layout — matches DataSourceDetail ── */}
       {isDatabase && (
         <>
           <Container
@@ -1364,10 +1335,6 @@ export const SourceDetail: React.FC = () => {
                           columns={2}
                           items={[
                             {
-                              // One ARN, because CustomConnectorConfiguration models one: the
-                              // connector Lambda serves both the metadata and record
-                              // paths. Athena's split metadata/record pair is not
-                              // offered anywhere — see that Smithy shape for why.
                               label: t("Connector function ARN"),
                               value: String(
                                 dbDetails.customConnectorConfiguration
@@ -1525,7 +1492,6 @@ export const SourceDetail: React.FC = () => {
         </>
       )}
 
-      {/* ── DOCUMENTS layout — matches DocSourceDetail ── */}
       {isDocuments && (
         <>
           <Container header={<Header variant="h2">{t("Overview")}</Header>}>
@@ -1766,14 +1732,11 @@ export const SourceDetail: React.FC = () => {
   );
 };
 
-// ── Scan history (database sources) ──────────────────────────────────────────
-//
-// Rows come from the ListSourceScanJobs event store: discovery/enrichment scan
+// Scan history rows come from the ListSourceScanJobs event store: discovery/enrichment scan
 // rows plus steward approve/reject (REVIEW) events, newest first. When the store
 // is empty or the call errors we fall back to a lightweight view derived from
 // the detail record (createdAt / updatedAt / lastScanAt + current status) so the
-// tab never regresses to blank. The public ScanHistoryEntry shape and the
-// Time/Status/Details columns are unchanged.
+// tab never regresses to blank.
 
 interface ScanHistoryEntry {
   id: string;
@@ -1956,7 +1919,6 @@ function buildScanHistory(args: {
   const updatedAt = toIso(args.updatedAt);
   const lastScanAt = toIso(args.lastScanAt);
 
-  // Preferred path: build rows from the real event store when it has any.
   if (args.scanJobs && args.scanJobs.length > 0) {
     const rows: ScanHistoryEntry[] = [];
     if (createdAt) {
@@ -1980,8 +1942,6 @@ function buildScanHistory(args: {
     return rows.sort((a, b) => (a.at < b.at ? 1 : -1));
   }
 
-  // Fallback: reconstruct a lightweight view from the detail record so the tab
-  // never regresses to blank when the store is empty or the call errored.
   const events: ScanHistoryEntry[] = [];
 
   if (createdAt) {
@@ -2104,16 +2064,12 @@ interface ScanHistoryTableProps {
 
 const ScanHistoryTable: React.FC<ScanHistoryTableProps> = (props) => {
   const { t } = useAppI18n();
-  // Real event store: scan + review rows, newest first.
   const { data: scanJobs } = useListSourceScanJobs(
     props.namespaceId,
     props.sourceId,
   );
 
-  // Fetch the scan job for its errorMessage when the scan failed, and for its
-  // per-table failure count when it succeeded — a scan that completed can still
-  // have dropped tables, and only the scan job records that. It also feeds the
-  // derived fallback used when the event store is empty or the list call errored.
+  // Feeds errorMessage and tablesFailed to the history.
   const { data: scanJob } = useGetSourceScanJob(
     props.namespaceId,
     props.sourceId,

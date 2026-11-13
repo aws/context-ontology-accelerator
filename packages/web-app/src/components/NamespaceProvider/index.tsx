@@ -115,7 +115,7 @@ export const NamespaceProvider: React.FC<React.PropsWithChildren> = ({
     if (listed) return listed;
     if (lookedUp) return toSummary(lookedUp);
     // A remembered choice the server no longer returns (deleted, or access
-    // removed) falls back to the first namespace, as before. A namespace that
+    // removed) falls back to the first namespace. A namespace that
     // is still being resolved, or the one named in the URL, never falls back:
     // a Playground question must not go to a different namespace.
     if (lookupFailed && activeId !== urlId) return namespaces[0];

@@ -94,7 +94,7 @@ def test_distinct_values_propagate_to_columns():
 
 
 def test_fk_governance_fields_propagate_to_constraint():
-    # #1088: reviewStatus + targetDatasourceId must reach CatalogConstraint so the
+    # reviewStatus + targetDatasourceId must reach CatalogConstraint so the
     # induction gate can withhold unapproved FKs and cross-source targets resolve.
     catalog = {
         "databases": [

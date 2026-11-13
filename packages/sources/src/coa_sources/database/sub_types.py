@@ -65,10 +65,6 @@ __all__ = [
 # because a legacy row can carry a provisioned
 # ``glueConnectionName``/``athenaDataCatalogName`` that this teardown is the only thing
 # to remove.
-#
-# An absent ``sourceSubType`` also belongs on this arm, and the guard tests for it
-# separately rather than putting ``""`` in the set, which would make ``""`` a recognised
-# value everywhere the set is used.
 FEDERATED_TEARDOWN_SUB_TYPES: frozenset[str] = frozenset(
     {
         SourceSubType.GLUE_DATABASE.value,

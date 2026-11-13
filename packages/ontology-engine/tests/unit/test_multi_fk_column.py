@@ -2,15 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """A column carrying several foreign keys emits EVERY allowed relationship — in every artifact.
 
-0.3.3 feedback (#1088 follow-up, "the graph stays disconnected"): induction took
-the FIRST ``FOREIGN_KEY`` constraint on a column and ignored the rest, in the
-ontology AND the R2RML mapping. Local FKs are stored first, so the local one always
-won and every cross-source relationship on the same column — including the ones a
-steward had just approved — was silently discarded. The review gate also ran after
-that first-wins pick, so a PENDING relationship sorting first demoted the column
-and took an APPROVED one down with it; and the mapping had no gate at all, so a
-pending relationship could become a live Ontop join.
-
 These tests drive the three artifacts (ontology, R2RML, SHACL) from one fixture and
 assert the INVARIANT the previous drift broke: the set of relationship properties
 the ontology declares == the set of predicates the mapping joins on == the set of
@@ -174,10 +165,9 @@ class TestMultipleForeignKeysOnOneColumn:
         )
 
     def test_grandfathered_local_ai_fk_stored_first_does_not_shadow_approved_cross_source(self):
-        # The reporter's EXACT shape. The within-source pass stores its inferred FK
-        # with no review status (pre-#1088 contract: grandfathered, always emitted)
-        # and it is stored FIRST; the cross-source pass appends approved FKs on the
-        # same column afterwards. First-wins always picked the local one.
+        # The within-source pass stores its inferred FK with no review status
+        # (grandfathered, always emitted) FIRST; the cross-source pass appends
+        # approved FKs on the same column afterwards.
         # Local (ds=None) keeps plain name; cross-sources are qualified.
         tables = _invoice(
             [
@@ -227,8 +217,7 @@ class TestMultipleForeignKeysOnOneColumn:
 
 class TestReviewGateRunsBeforeSelection:
     def test_pending_fk_listed_first_no_longer_hides_the_approved_one(self):
-        # Bug 3: first-wins picked the PENDING constraint, the gate demoted the
-        # column, and the APPROVED relationship behind it was lost.
+        # A PENDING constraint listed first must not hide the APPROVED one behind it.
         tables = _invoice(
             [
                 _fk("ba_no", "account_xref", source="AI_INFERRED", status="PENDING_REVIEW", ds="2"),
@@ -239,8 +228,7 @@ class TestReviewGateRunsBeforeSelection:
         _assert_three_way_invariant(tables, "invoice", {"invoice_baNo": "BillingAccount"})
 
     def test_pending_only_is_a_datatype_property_in_all_three_artifacts(self):
-        # Bug 4 for the mapping: a PENDING relationship used to become a live
-        # Ontop join while the ontology withheld its edge.
+        # A PENDING relationship must not become a live Ontop join.
         tables = _invoice([_fk("ba_no", "account_xref", source="AI_INFERRED", status="PENDING_REVIEW", ds="2")])
         onto, r2rml, shacl = _artifacts(tables)
         assert _onto_object_props(onto, NS.Invoice) == {}

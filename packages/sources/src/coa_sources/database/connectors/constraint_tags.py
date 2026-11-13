@@ -112,7 +112,7 @@ match these, since the encoder helper generates against them):
     closing quote) — is logged with a specific reason and **left in the
     description verbatim**. The two are the same class of author mistake and get
     the same treatment: the parser never deletes text it did not understand, and
-    because these warnings land in Orion's logs rather than the connector
+    because these warnings land in this deployment's logs rather than the connector
     author's, the stored description is the only feedback channel the author can
     actually observe. A leftover ``@fk(orders)`` in a catalog description is the
     signal that gets the tag fixed.
@@ -127,27 +127,6 @@ match these, since the encoder helper generates against them):
     column are one key, not two. Any other rule would store two byte-identical
     ``ForeignKey`` rows.
 
-Resolved limitations (recorded because the previous spelling documented them as
-unavoidable, and an encoder written against that spelling would still be
-avoiding them):
-
-  * **Prose adjacency is no longer a limitation.** With a bare character run,
-    ``@fk=orders.order_id.See notes`` resolved to ``order_id.See``, and that was
-    genuinely undetectable because it is the same shape as the legitimate
-    qualification in ``@fk=public.orders.order_id``. The closing bracket now ends
-    the tag, so the dot and the word after it are prose by construction, and the
-    "separate a tag from following prose with whitespace" rule is gone.
-  * **A trailing sentence dot needs no tolerance.** ``@fk(orders.order_id).``
-    parses without the old ``rstrip(".")`` fudge, so ``@fk(orders.)`` — which
-    that fudge had to accept as a usable reference — is now reported as the empty
-    column name it is.
-  * **Mixed quoting is no longer silently mis-targeted.** Under the
-    all-or-nothing rule ``@fk="db"."orders".order_id`` ended after ``"orders"``
-    and produced a usable-looking key to ``db.orders`` with ``.order_id`` left as
-    prose, indistinguishable from a complete quoted reference followed by prose.
-    Per-segment quoting inside a bracket makes it exactly what it reads as,
-    ``orders.order_id``.
-
 One ambiguity survives, and it follows from the qualification rule rather than
 from the delimiters: **a dotted bare word inside the brackets reads as
 qualification.** ``@fk(orders.order_id.see)`` resolves to ``order_id.see``,
@@ -156,14 +135,6 @@ tolerates extra leading qualification is the same rule that accepts a third
 segment here. It now takes prose written *inside* the operand to hit, and the
 common shapes of that mistake (a space, a comma, a closing bracket) are rejected
 outright; only a single unbroken word attached by a dot gets through.
-
-Note on the examples above: no example here can show a name whose **last**
-character is a quote, because the escaped quote plus the segment's own closing
-quote form a three-quote run that would end this docstring early — which is why
-the escape is illustrated with the quotes in the middle of the name
-(``@fk("say ""hi"" now".x)``). The restriction is the docstring's, not the
-grammar's: a table named ``he said "hi"`` is perfectly expressible, and that
-shape is pinned in the tests instead.
 
 ``_split_reference`` mirrors ``parse_referred_column`` in the ontology engine's
 ``inducer/services/data_catalog.py`` — same tolerance for extra leading
@@ -190,20 +161,14 @@ logger = logging.getLogger(__name__)
 # database/table names (which Athena reaches by backtick-quoting) and "$" appears
 # in Hive-style names. It excludes "." (the segment separator), ")" (the tag
 # terminator), '"' (the quote), and whitespace — each of which has to be spelled
-# inside a quoted segment instead. Unlike the pre-bracket grammar's character
-# class, this one does not decide where a tag ENDS (the bracket does), so it is a
-# validator: a segment it rejects is a malformed tag, reported and left in place,
-# rather than a reference silently cut short.
+# inside a quoted segment instead. It is a validator only (the bracket ends the
+# tag): a segment it rejects is a malformed tag, reported and left in place.
 _UNQUOTED_SEGMENT = re.compile(r"[A-Za-z0-9_$\-]+")
 
 # Finds the HEAD of every tag-shaped token — "@" plus a pk/fk-ish name — in one
 # pass, so each is classified exactly once (valid, malformed, or unrecognised) and
-# only an understood tag is removed. What follows the head (an operand, the retired
-# "=", or nothing) is read by hand rather than folded into this pattern. A regex
-# CAN describe a well-formed operand, but it cannot serve the other two things this
-# parser owes the author: the tag's extent reaches past the head match, which
-# re.sub has no way to replace, and a failed match reports only that it failed,
-# where one quote-aware walk also names WHICH delimiter was left open.
+# only an understood tag is removed. The operand after the head is read by a
+# quote-aware walk so a failure can name which delimiter was left open.
 # "\s*" swallows the whitespace preceding a tag so that removing it leaves no seam
 # in the human text ("a @pk b" → "a b"). The lookbehind demands a left boundary:
 # without it an address in prose ("owner bob@pk.example.com") reads as a "@pk"
@@ -211,10 +176,7 @@ _UNQUOTED_SEGMENT = re.compile(r"[A-Za-z0-9_$\-]+")
 # description. The name group is greedy, so "@pkey"/"@pk_id"/"@fkeys"/"@notnulls"
 # land in the group as typos to report rather than matching a tag; the
 # case-insensitive name lets wrong-case near misses ("@PK", "@NOTNULL") be recognised
-# as mistakes instead of read as prose.
-#
-# "notnull" is spelled out in the alternation rather than reached by a looser name class,
-# so a word that merely starts the same way ("@note") stays prose as it was before.
+# as mistakes instead of read as prose. "notnull" is spelled out so "@note" stays prose.
 _TAG_HEAD = re.compile(r"\s*(?<![A-Za-z0-9_$])@(?P<name>(?i:pk|fk|notnull)[A-Za-z0-9_]*)")
 
 
@@ -249,7 +211,6 @@ class ParsedComment:
     description: str
     is_pk_member: bool
     foreign_keys: tuple[ParsedFk, ...]
-    # Defaulted, not positional, so existing construction sites keep their meaning.
     is_not_null: bool = False
 
 
@@ -317,15 +278,9 @@ def parse_comment(raw: str | None) -> ParsedComment:
         return resume, comment[head.start() : resume]
 
     def _read_tag(head: re.Match[str]) -> tuple[int, str]:
-        """Classify one tag-shaped token and act on it.
+        """Classify one tag-shaped token; return ``(resume index, replacement text)``.
 
-        Args:
-            head: The ``_TAG_HEAD`` match for the token.
-
-        Returns:
-            ``(index to continue scanning from, text that replaces the span from
-            the head's start to that index)``. The replacement is ``""`` for a
-            tag the parser acted on and the span verbatim for anything else.
+        The replacement is ``""`` for a tag the parser acted on, else the span verbatim.
         """
         nonlocal is_pk_member, is_not_null
         name = head.group("name")
@@ -603,16 +558,7 @@ def _split_reference(segments: Sequence[str]) -> tuple[str, str] | None:
 
 
 def _reference_failure(segments: Sequence[str]) -> str:
-    """Name why a reference could not be used, for the operator log.
-
-    Args:
-        segments: The raw segments ``_split_reference`` rejected.
-
-    Returns:
-        A stable reason string for the ``constraint_tag_malformed`` warning. The
-        warning reaches operators rather than the connector author, so it names
-        the rule that was broken, not just the fact that something was.
-    """
+    """Name why a reference could not be used, for the operator log."""
     for segment in segments:
         if not _decode_segment(segment):
             return _segment_failure(segment)
@@ -620,15 +566,7 @@ def _reference_failure(segments: Sequence[str]) -> str:
 
 
 def _segment_failure(segment: str) -> str:
-    """Name why one segment is not a usable identifier.
-
-    Args:
-        segment: The raw segment ``_decode_segment`` rejected or decoded to
-            nothing.
-
-    Returns:
-        A stable reason string.
-    """
+    """Name why one segment is not a usable identifier."""
     # Two ways to name nothing: no text at all between the separators
     # ("@fk(orders.)"), or an explicitly empty delimited identifier ('@fk(""."c")').
     if not segment.strip() or _decode_segment(segment) == "":

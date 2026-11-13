@@ -46,7 +46,6 @@ def test_bedrock_client_caps_connection_pool(monkeypatch) -> None:
 
     assert captured["service_name"] == "bedrock-runtime"
     assert captured["region_name"] == "us-west-2"  # region preserved
-    assert captured["config"] is not None
     assert captured["config"].max_pool_connections == _BEDROCK_MAX_POOL_CONNECTIONS
 
 

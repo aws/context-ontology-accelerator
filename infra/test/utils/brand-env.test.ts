@@ -58,8 +58,6 @@ describe("data-plane brand tokens", () => {
   it("resolves to the coa brand by default", () => {
     const ctx = resolveContext(appWith().stack.node);
     expect(ctx.graphBaseUri).toBe("http://coa.amazon.com");
-    // Default resource_prefix is "coa", so the derived source still reads
-    // "coa" — an unprefixed deployment is unchanged by this behavior.
     expect(ctx.eventSourcePrefix).toBe("coa");
     expect(ctx.dzTypePrefix).toBe("Coa");
   });
@@ -86,12 +84,8 @@ describe("BrandEnvAspect", () => {
     });
     cdk.Aspects.of(app).add(new BrandEnvAspect());
 
-    // GRAPH_BASE_URI stays on the brand — this is what stops the runtime
-    // deriving IRIs from RESOURCE_PREFIX (`{prefix}-{env}-`), which produced
-    // http://scl-dev.amazon.com/... matching nothing already in the graph.
-    // EVENT_SOURCE_PREFIX deliberately DOES track resource_prefix: the emitter
-    // has to agree with the (prefix-scoped) rule pattern, or co-located
-    // deployments cross-trigger on the shared account-global bus.
+    // GRAPH_BASE_URI stays on the brand; EVENT_SOURCE_PREFIX tracks
+    // resource_prefix so the emitter matches the prefix-scoped rule pattern.
     Template.fromStack(stack).hasResourceProperties("AWS::Lambda::Function", {
       Environment: {
         Variables: {

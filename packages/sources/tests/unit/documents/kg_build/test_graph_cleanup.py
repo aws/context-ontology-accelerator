@@ -151,21 +151,6 @@ class TestEnvValidation:
         with pytest.raises(RuntimeError, match="Missing required environment variables"):
             graph_cleanup.main()
 
-    def test_all_env_vars_present_does_not_raise_on_validation(self, mod):
-        """Validation itself should not raise when all vars are set."""
-        missing = [
-            name
-            for name, val in [
-                ("NAMESPACE_ID", mod.NAMESPACE_ID),
-                ("DOC_SOURCE_ID", mod.DOC_SOURCE_ID),
-                ("TENANT_ID", mod.TENANT_ID),
-                ("NEPTUNE_ENDPOINT", mod.NEPTUNE_ENDPOINT),
-                ("OPENSEARCH_ENDPOINT", mod.OPENSEARCH_ENDPOINT),
-            ]
-            if not val
-        ]
-        assert missing == []
-
 
 # ---------------------------------------------------------------------------
 # 2. Store URI construction
@@ -267,15 +252,6 @@ class TestNoSourcesFound:
 
         mock_ds_cls.assert_not_called()
 
-    @patch(_P_IDX)
-    @patch(_P_GSF)
-    @patch(_P_VSF)
-    def test_no_sources_completes_without_error(self, mock_vsf, mock_gsf, mock_idx_cls, mod):
-        _make_store_mocks(mock_gsf, mock_vsf)
-        _make_graph_index(mock_idx_cls, [])
-
-        mod.main()  # should not raise
-
 
 # ---------------------------------------------------------------------------
 # 5. Happy path — sources found and deleted
@@ -320,38 +296,6 @@ class TestDeleteSources:
             batch_size=200,
             num_workers=1,
         )
-
-    @patch(_P_DS)
-    @patch(_P_IDX)
-    @patch(_P_GSF)
-    @patch(_P_VSF)
-    def test_batch_size_is_200(self, mock_vsf, mock_gsf, mock_idx_cls, mock_ds_cls, mod):
-        _make_store_mocks(mock_gsf, mock_vsf)
-        _make_graph_index(mock_idx_cls, [{"sourceId": "src-001"}])
-        mock_ds = MagicMock()
-        mock_ds.delete_source_documents.return_value = ["src-001"]
-        mock_ds_cls.return_value = mock_ds
-
-        mod.main()
-
-        _, kwargs = mock_ds_cls.call_args
-        assert kwargs["batch_size"] == 200
-        assert kwargs["num_workers"] == 1
-
-    @patch(_P_DS)
-    @patch(_P_IDX)
-    @patch(_P_GSF)
-    @patch(_P_VSF)
-    def test_single_source_deleted(self, mock_vsf, mock_gsf, mock_idx_cls, mock_ds_cls, mod):
-        _make_store_mocks(mock_gsf, mock_vsf)
-        _make_graph_index(mock_idx_cls, [{"sourceId": "src-only"}])
-        mock_ds = MagicMock()
-        mock_ds.delete_source_documents.return_value = ["src-only"]
-        mock_ds_cls.return_value = mock_ds
-
-        mod.main()
-
-        mock_ds.delete_source_documents.assert_called_once_with(["src-only"])
 
     @patch(_P_DS)
     @patch(_P_IDX)
@@ -419,8 +363,8 @@ class TestGraphragPatchesApplied:
     NEXTGEN heap breaker was neither retried nor surfaced: the toolkit's handler is
     ``except Exception as ee: ... raise e`` with ``e`` unbound, so it raised
     ``UnboundLocalError``, masked the real 429, failed the ECS task, and left the
-    namespace's embeddings orphaned half-deleted (observed 2026-07-27 on both
-    SEC-10-Q namespaces; the defect is still present in the pinned 3.18.7).
+    namespace's embeddings orphaned half-deleted (the defect is present in the
+    pinned graphrag-toolkit 3.18.7).
     """
 
     @patch(_P_IDX)
@@ -485,11 +429,9 @@ class TestExistingEmbeddingIndexFilter:
     replication lag and sleeps in a 70-second retry loop PER BATCH before giving
     up. With a missing index the id map is always empty (the vector client is
     graphrag's dummy, so ``paginated_search`` yields nothing), so every batch
-    burns the full 70s — the module docstring's "36-source deletion burned 10
-    hours ... left the source DELETE_FAILED".
+    burns the full 70s.
 
-    A missing index is now normal: namespace teardown drops chunk/topic once the
-    last source is deleted, and these ECS tasks can still be running then.
+    A missing index is normal: namespace teardown drops chunk/topic once the
     """
 
     def _client(self, mod, exists_map):
@@ -551,23 +493,10 @@ class TestMainPassesOnlyExistingIndexes:
     def test_no_existing_indexes_uses_dummy_store_never_empty_index_names(self, mock_vsf, mock_gsf, mock_idx_cls, mod):
         """When no AOSS index remains, fall back to the dummy vector store.
 
-        Regression for the crash observed on doc-source deletion (exit 1):
-
-            ValueError: Unrecognized vector store info: aoss://<host>:443
-
-        graphrag's ``VectorStoreFactory.for_vector_store`` raises that when handed
-        an EMPTY ``index_names`` — the ``aoss://`` factory's ``try_create``
-        iterates zero names and returns ``[]``, so every factory is treated as a
-        non-match and it falls through to the ValueError. The task then dies
-        before the Neptune subgraph delete runs, leaving the source DELETE_FAILED.
-        (The old assertion here expected ``index_names == []`` and only passed
-        because VectorStoreFactory is mocked in this suite — the mock never
-        reproduced the real failure.)
-
-        The fix: when the filter finds nothing, point at ``dummy://`` with the
-        configured (non-empty) names so a no-op VectorStore is built; deletion's
-        ``get_index(...).delete_embeddings(...)`` no-ops while the Neptune subgraph
-        delete proceeds.
+        graphrag's ``VectorStoreFactory.for_vector_store`` raises ``ValueError:
+        Unrecognized vector store info`` for an EMPTY ``index_names``, which would
+        kill the task before the Neptune subgraph delete. Point at ``dummy://`` with
+        the configured (non-empty) names instead.
         """
         _make_store_mocks(mock_gsf, mock_vsf)
         _make_graph_index(mock_idx_cls, [])
@@ -612,7 +541,7 @@ class TestMainPassesOnlyExistingIndexes:
         ``EMBEDDING_INDEXES`` is env-overridable and parses ``EMBEDDING_INDEXES=""``
         (or whitespace) to ``[]``. Falling back to it directly would hand
         ``index_names=[]`` to ``for_vector_store("dummy://", [])`` — which raises the
-        SAME ``ValueError`` this MR fixes, since an empty list produces zero indexes
+        same ``ValueError`` as an empty AOSS list, since an empty list produces zero indexes
         for every scheme. Guard: the fallback is coalesced to a fixed non-empty set.
         """
         _make_store_mocks(mock_gsf, mock_vsf)

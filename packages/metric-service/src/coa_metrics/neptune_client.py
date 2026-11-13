@@ -36,8 +36,6 @@ from coa_common.constants import URN_PREFIX
 
 logger = structlog.get_logger(__name__)
 
-# ── Configuration ───────────────────────────────────────────────────────
-
 NEPTUNE_ENDPOINT = os.getenv("NEPTUNE_ENDPOINT", "")
 NEPTUNE_REGION = os.getenv("AWS_REGION", "us-east-1")
 NEPTUNE_TIMEOUT = float(os.getenv("NEPTUNE_TIMEOUT", "30"))
@@ -45,16 +43,12 @@ NEPTUNE_TIMEOUT = float(os.getenv("NEPTUNE_TIMEOUT", "30"))
 NEPTUNE_HTTP_TIMEOUT = httpx.Timeout(connect=2.0, read=NEPTUNE_TIMEOUT, write=NEPTUNE_TIMEOUT, pool=NEPTUNE_TIMEOUT)
 
 
-# ── Namespace prefixes ──────────────────────────────────────────────────
-
 COA = f"urn:{URN_PREFIX}:"
 OWL = "http://www.w3.org/2002/07/owl#"
 RDF = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
 RDFS = "http://www.w3.org/2000/01/rdf-schema#"
 XSD = "http://www.w3.org/2001/XMLSchema#"
 COA_VOCAB = f"urn:{URN_PREFIX}:vocab#"
-
-# ── Graph URI resolution (mirrors ontology-engine neptune_db_graph.py) ──
 
 DEFAULT_NAMESPACE = os.getenv("DYNAMODB_DEFAULT_NAMESPACE", "default")
 
@@ -86,8 +80,6 @@ def _metric_uri(namespace: str, name: str) -> str:
     """Return the URI for a metric within a namespace."""
     return f"{COA}{namespace}:metric:{name}"
 
-
-# ── IRI safety ──────────────────────────────────────────────────────────
 
 _IRI_FORBIDDEN = re.compile(r'[\s<>"{}|\\^`]')
 
@@ -127,9 +119,6 @@ def _esc(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
 
 
-# ── SigV4 helper ────────────────────────────────────────────────────────
-
-
 def _sign(method: str, url: str, body: str | bytes) -> dict[str, str]:
     """Return SigV4 headers for a Neptune HTTP request."""
     credentials = boto3.Session().get_credentials()
@@ -139,9 +128,6 @@ def _sign(method: str, url: str, body: str | bytes) -> dict[str, str]:
     req = botocore.awsrequest.AWSRequest(method=method, url=url, data=body)
     botocore.auth.SigV4Auth(creds, "neptune-db", NEPTUNE_REGION).add_auth(req)
     return dict(req.headers.items())
-
-
-# ── SPARQL transport ────────────────────────────────────────────────────
 
 
 def _sparql_query(query: str) -> dict[str, Any]:
@@ -188,9 +174,6 @@ def _sparql_update(update: str) -> None:
         logger.debug("SPARQL update", elapsed_ms=round(elapsed_ms), body_bytes=len(body))
 
 
-# ── Data classes ────────────────────────────────────────────────────────
-
-
 @dataclass
 class MetricDialect:
     """A single dialect + expression pair."""
@@ -230,9 +213,6 @@ class MetricDefinition:
     label: str | None = None
 
 
-# ── Neptune Metric Client ───────────────────────────────────────────────
-
-
 class MetricNeptuneClient:
     """SPARQL client for metric CRUD operations in Neptune.
 
@@ -269,7 +249,6 @@ class MetricNeptuneClient:
             f"{_iri(governed_metric_uri)} {_iri(RDF + 'type')} {_iri(OWL + 'Class')} .",
             f'{_iri(governed_metric_uri)} {_iri(RDFS + "label")} "Governed Metric" .',
             f'{_iri(governed_metric_uri)} {_iri(RDFS + "comment")} "Base class for all governed business metrics." .',
-            # Declare governedMetricFor as an owl:ObjectProperty
             f"{_iri(COA_VOCAB + 'governedMetricFor')} {_iri(RDF + 'type')} {_iri(OWL + 'ObjectProperty')} .",
             f'{_iri(COA_VOCAB + "governedMetricFor")} {_iri(RDFS + "label")} "governed metric for" .',
             (
@@ -429,20 +408,9 @@ class MetricNeptuneClient:
     def get_metrics_bulk(self, namespace: str, names: list[str] | None = None) -> list[MetricDefinition]:
         """Fetch full metric definitions in a single SPARQL round-trip.
 
-        Unlike ``list_metrics()`` + per-metric ``get_metric()`` (N+1 — one
-        query for URIs, then one additional query per metric to fetch its
-        properties), this issues ONE query that returns every ``?p ?o``
-        triple for every matching metric subject, then groups the results
-        by subject client-side. At 10-50ms per Neptune round-trip (see LLD),
-        the N+1 path is what causes export timeouts at 100+ metrics — this
-        collapses N+1 round-trips into 1.
-
-        Pass ``names`` to fetch a specific subset (used for scoped exports);
+        One query returns every ``?p ?o`` triple for every matching metric subject,
+        grouped by subject client-side. Pass ``names`` to fetch a specific subset;
         omit it to fetch every governed metric in the namespace.
-
-        Intentionally separate from ``list_metrics()``, which other callers
-        (paginated list, bulk-delete-by-filter) use unchanged for URI-only
-        listing with LIMIT/OFFSET semantics.
         """
         graph = _named_graph(namespace)
         values_clause = ""
@@ -522,7 +490,6 @@ class MetricNeptuneClient:
         """
         graph = _named_graph(namespace)
 
-        # First count how many metrics exist
         count_query = f"""
         SELECT (COUNT(DISTINCT ?s) as ?count) WHERE {{
           GRAPH {_iri(graph)} {{
@@ -539,7 +506,6 @@ class MetricNeptuneClient:
             logger.info("No metrics to delete", namespace=namespace)
             return 0
 
-        # Delete all triples where subject is a GovernedMetric
         delete_sparql = f"""
         WITH {_iri(graph)}
         DELETE {{ ?s ?p ?o }}
@@ -552,8 +518,6 @@ class MetricNeptuneClient:
         _sparql_update(delete_sparql)
         logger.info("All metrics deleted", namespace=namespace, count=count)
         return count
-
-    # ── Private helpers ─────────────────────────────────────────────────
 
     def _build_triples(self, namespace: str, metric: MetricDefinition) -> list[str]:
         """Build the RDF triples for a metric definition."""
@@ -571,7 +535,6 @@ class MetricNeptuneClient:
             # language, and readers take the label only from the untagged literal.
             triples.append(f'{_iri(uri)} {_iri(COA_VOCAB + "displayLabel")} "{_esc(metric.label)}" .')
 
-        # Expression dialects — stored as JSON string
         dialects_json = json.dumps(
             [{"dialect": d.dialect, "expression": d.expression} for d in metric.expression_dialects]
         )
@@ -589,7 +552,6 @@ class MetricNeptuneClient:
             effective_literal = f'"{_esc(metric.effective_from)}"^^{_iri(XSD + "date")}'
             triples.append(f"{_iri(uri)} {_iri(COA_VOCAB + 'effectiveFrom')} {effective_literal} .")
 
-        # AI context — stored as JSON string
         if metric.ai_context:
             ai_json = json.dumps(
                 {
@@ -600,7 +562,6 @@ class MetricNeptuneClient:
             )
             triples.append(f'{_iri(uri)} {_iri(COA_VOCAB + "aiContext")} "{_esc(ai_json)}" .')
 
-        # Object property edges to referenced OWL classes (IRI → IRI)
         for class_uri in metric.ontology_concepts:
             if class_uri and class_uri.startswith(("http://", "https://", "urn:")):
                 triples.append(f"{_iri(uri)} {_iri(COA_VOCAB + 'governedMetricFor')} {_iri(class_uri)} .")

@@ -87,8 +87,6 @@ export class StorageStack extends SCLStack {
     //  if longer point-in-time recovery is needed.
     // =====================================================================
 
-    // TODO: Consider adding custom resource to verify Neptune endpoint is connectable
-    // post-deploy for prod reliability.
     const neptuneSubnetGroup = new neptune.CfnDBSubnetGroup(
       this,
       "NeptuneSubnetGroup",
@@ -119,13 +117,7 @@ export class StorageStack extends SCLStack {
       {
         dbInstanceIdentifier: this.prefixed("neptune-primary"),
         // Overridable via `--context neptune_instance_class=...` (local:
-        // `SCL_NEPTUNE_INSTANCE_CLASS`). The default stays db.r8g.large so a
-        // first-time / single-tenant deploy pays the smaller instance; the
-        // dev benchmark environment passes `neptune_instance_class=db.r8g.xlarge`
-        // from the deploy-dev CI job, because the large (2 vCPU → 4 query
-        // threads) OOM'd on SPARQL (`MemoryLimitExceededException`) under the
-        // concurrent deep-reasoning / metric-resolver load the benchmark
-        // generates. Raise it per-environment via context rather than in code.
+        // `SCL_NEPTUNE_INSTANCE_CLASS`). The default is db.r8g.large.
         dbInstanceClass:
           (this.node.tryGetContext("neptune_instance_class") as string) ??
           "db.r8g.large",
@@ -152,12 +144,6 @@ export class StorageStack extends SCLStack {
       arnFormat: cdk.ArnFormat.SLASH_RESOURCE_NAME,
     });
 
-    // =====================================================================
-    //  OpenSearch Serverless  (VECTORSEARCH collection)
-    //
-    //  AOSS requires separate encryption, network, and data-access policies
-    //  (not standard IAM resource policies).
-    // =====================================================================
     // OpenSearch Serverless — NEXTGEN Collection Group
     //
     // Uses NEXTGEN generation for improved indexing performance, lower latency,
@@ -166,13 +152,6 @@ export class StorageStack extends SCLStack {
     // - Standby replicas: must be ENABLED for NEXTGEN (AWS rejects DISABLED).
     //   NEXTGEN strict mode rejects knn_vector method blocks — catches regressions.
     // - Capacity limits: min 2 OCU (default, override via `aoss_min_ocu`; set 0
-    //   for NextGen scale-to-zero), max 96 OCU (cost cap)
-    //
-    // BREAKING CHANGE: Collection renamed to {prefix}-vector-store.
-    // This creates a new collection — existing vector embeddings must be re-ingested
-    // via the Scan pipeline. Vector data is derived (not source-of-truth), so no
-    // data migration is needed — re-run ingestion against existing source documents.
-    // =====================================================================
 
     const collectionName = this.aossName(VECTOR_COLLECTION_SUFFIX);
 
@@ -224,28 +203,13 @@ export class StorageStack extends SCLStack {
     );
 
     const maxOcu = Number(this.node.tryGetContext("aoss_max_ocu") ?? 96);
-    // NEXTGEN valid min OCU values: 0, 2, 4, 8, 16, or multiples of 16.
     const minOcu = Number(this.node.tryGetContext("aoss_min_ocu") ?? 2);
 
-    // Validate min/max OCU explicitly rather than passing an arbitrary
-    // `-c aoss_min_ocu=<n>` straight through to CloudFormation. Two failure
-    // modes this guards against (see #173):
-    //   1. An out-of-range value (e.g. 3, 6, or negative) is only rejected
-    //      LATER by CloudFormation with an opaque error, after a slow stack
-    //      update.
-    //   2. minOcu=0 is a VALID value but has a correctness consequence: it lets
-    //      the collection scale indexing capacity to zero, so under load the
-    //      NEXTGEN circuit breaker sheds bulk writes with 429s. That is exactly
-    //      the condition that produced the #173 silent partial-index. It is
-    //      permitted (useful for cost in dev) but must be a DELIBERATE choice —
-    //      we emit a loud synth-time warning so nobody sets it unaware that
-    //      ingest can now be throttled into partial writes (the runtime path
-    //      fails loud rather than silently after the #173 fix, but 0 makes it
-    //      fire far more often).
-    //
-    // NEXTGEN valid OCU values (both min and max): 0, 2, 4, 8, 16, or a
-    // multiple of 16, up to a maximum of 1696 (per AWS collection-group
-    // capacity limits). max additionally cannot be 0 (it is a ceiling).
+    // Validate min/max OCU explicitly: an out-of-range `-c aoss_min_ocu` is otherwise only
+    // rejected by CloudFormation late, with an opaque error. minOcu=0 is valid but lets
+    // indexing capacity scale to zero, so under load the NEXTGEN circuit breaker sheds bulk
+    // writes with 429s. Valid min values are 0, 2, 4, 8, 16 or multiples of 16 up to 1696
+    // (collection-group capacity limit); max cannot be 0 (it is a ceiling).
     const MAX_OCU_LIMIT = 1696;
     const BASE_VALID_OCU = new Set([0, 2, 4, 8, 16]);
     const isValidOcuValue = (v: number) =>
@@ -274,13 +238,11 @@ export class StorageStack extends SCLStack {
       cdk.Annotations.of(this).addWarning(
         `AOSS min OCU is 0: indexing capacity can scale to zero, so under load the ` +
           `NEXTGEN circuit breaker sheds bulk writes with HTTP 429. Ingest re-submits and ` +
-          `now fails LOUD on unrecoverable partial writes (see #173), but 0 makes throttling ` +
+          `now fails LOUD on unrecoverable partial writes, but 0 makes throttling ` +
           `far more likely. Use a non-zero floor (e.g. 2) for ingest-heavy environments.`,
       );
     }
 
-    // NEXTGEN collection groups require standbyReplicas=ENABLED.
-    // AWS rejects DISABLED for NEXTGEN generation (replicas managed internally).
     const cfnCollectionGroup = new opensearchserverless.CfnCollectionGroup(
       this,
       "VectorStoreGroup",
@@ -298,8 +260,6 @@ export class StorageStack extends SCLStack {
           "Group for SemanticContext vector store for embeddings and similarity search",
       },
     );
-    // TODO: Consider adding custom resource with SDK waiter that polls collection
-    // status until ACTIVE for prod deployments
     const collection = new opensearchserverless.CfnCollection(
       this,
       "VectorStore",
@@ -385,18 +345,11 @@ export class StorageStack extends SCLStack {
         blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
         enforceSSL: true,
         versioned: true,
-        // Allow the web app to talk to S3 directly via presigned URLs:
-        //  - PUT: upload custom-ontology files (and, later, large proposal edits)
-        //  - GET/HEAD: download large proposal/ontology Turtle that is too big
-        //    to inline through the 6 MB API Gateway / Lambda response limit.
-        // Without the matching method in allowedMethods, S3 omits the
-        // Access-Control-Allow-Origin header and the browser fetch fails.
-        // allowedHeaders must be "*": the browser preflights the presigned
-        // fetch and S3 only echoes Access-Control-Allow-Origin when every
-        // requested header is allowed. Restricting to Content-Type makes the
-        // proposal-artifact GET fail as an opaque "CORS error" in the UI even
-        // though the object itself is reachable (reproduced on a v0.3.1
-        // ap-northeast-1 deploy loading an induction proposal). exposedHeaders
+        // Allow the web app to talk to S3 directly via presigned URLs: PUT for custom-ontology
+        // uploads, GET/HEAD for Turtle too big to inline through the 6 MB API Gateway / Lambda
+        // response limit. Without the matching method in allowedMethods, S3 omits
+        // Access-Control-Allow-Origin. allowedHeaders must be "*": S3 only echoes
+        // Access-Control-Allow-Origin when every requested header is allowed. exposedHeaders
         // lets the fetch read ETag/Content-Length/Content-Type off the response.
         cors: [
           {

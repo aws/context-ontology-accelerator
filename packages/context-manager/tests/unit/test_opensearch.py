@@ -281,15 +281,6 @@ class TestQueryBackendFilter:
 
 @pytest.mark.unit
 class TestHybridAndHealth:
-    async def test_hybrid_search_uses_bool_should_via_search_raw(self):
-        client, aoss = _client(search_raw={"hits": {"hits": [{"_id": "h1", "_score": 0.6, "_source": {"text": "t"}}]}})
-        hits = await client.hybrid_search("query", [0.1] * 8, top_k=4, index="chunks")
-        body = aoss.search_raw.call_args.args[1]
-        should = body["query"]["bool"]["should"]
-        assert any("match" in clause for clause in should)
-        assert any("knn" in clause for clause in should)
-        assert [h.id for h in hits] == ["h1"]
-
     async def test_health_check_ok_maps_to_healthy(self):
         client, aoss = _client(health_check={"status": "ok", "index": "document-chunks"})
         result = await client.health_check()

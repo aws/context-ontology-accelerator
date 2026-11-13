@@ -86,10 +86,8 @@ function renderWithExtractionConfig(extractionConfig: Record<string, unknown>) {
   render(<SourceDetail />, { wrapper });
 }
 
-// The Advanced options card is the last place a user can confirm the chunk
-// size they picked when connecting the source (#1286). ValueWithLabel renders
-// <div><label/><div>{value}</div></div>, so the value is the second child of the
-// div whose first child is the label.
+// ValueWithLabel renders <div><label/><div>{value}</div></div>, so the value is
+// the second child of the div whose first child is the label.
 function valueOf(label: string): string {
   const field = Array.from(document.querySelectorAll("div")).find(
     (el) => el.children.length === 2 && el.children[0]?.textContent === label,

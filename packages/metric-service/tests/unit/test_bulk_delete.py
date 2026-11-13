@@ -24,7 +24,6 @@ class TestBulkDeleteByNames:
         neptune = MagicMock()
         neptune.delete_metric.return_value = True
         mock_neptune.return_value = neptune
-        mock_opensearch.return_value = MagicMock()
 
         event = {
             "pathParameters": {"namespaceId": "ns-1"},
@@ -45,7 +44,6 @@ class TestBulkDeleteByNames:
         neptune = MagicMock()
         neptune.delete_metric.side_effect = [True, False, True]
         mock_neptune.return_value = neptune
-        mock_opensearch.return_value = MagicMock()
 
         event = {
             "pathParameters": {"namespaceId": "ns-1"},
@@ -76,7 +74,6 @@ class TestBulkDeleteByFilter:
         neptune.list_metrics.return_value = [metric_a, metric_b, metric_c]
         neptune.delete_metric.return_value = True
         mock_neptune.return_value = neptune
-        mock_opensearch.return_value = MagicMock()
 
         event = {
             "pathParameters": {"namespaceId": "ns-1"},
@@ -110,7 +107,6 @@ class TestBulkDeleteAll:
         neptune = MagicMock()
         neptune.delete_all_metrics_for_namespace.return_value = 5
         mock_neptune.return_value = neptune
-        mock_opensearch.return_value = MagicMock()
 
         event = {
             "pathParameters": {"namespaceId": "test-ns"},
@@ -131,7 +127,6 @@ class TestBulkDeleteAll:
         neptune = MagicMock()
         neptune.delete_all_metrics_for_namespace.return_value = 0
         mock_neptune.return_value = neptune
-        mock_opensearch.return_value = MagicMock()
 
         event = {
             "pathParameters": {"namespaceId": "empty-ns"},

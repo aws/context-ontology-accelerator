@@ -196,15 +196,8 @@ class NeptuneGraphClient:
     async def query(self, sparql: str, *, max_results: int = DEFAULT_MAX_RESULTS) -> list[dict[str, Any]]:
         """Execute a read-only SPARQL SELECT, appending a LIMIT if none is present.
 
-        Args:
-            sparql: The SPARQL query text (write operations are rejected).
-            max_results: LIMIT applied when the query has none.
-
-        Returns:
-            The result bindings as a list of flat ``{var: value}`` dicts.
-
-        Raises:
-            SPARQLValidationError: If the query contains a write operation.
+        Returns flat ``{var: value}`` dicts; write operations raise
+        ``SPARQLValidationError``.
         """
         self._validate_sparql(sparql)
         if "LIMIT" not in sparql.upper():
@@ -217,17 +210,7 @@ class NeptuneGraphClient:
 
     @instrumented("neptune")
     async def ask(self, sparql: str) -> bool:
-        """Execute a read-only SPARQL ASK query.
-
-        Args:
-            sparql: The SPARQL ASK query text (write operations are rejected).
-
-        Returns:
-            The boolean result of the ASK.
-
-        Raises:
-            SPARQLValidationError: If the query contains a write operation.
-        """
+        """Execute a read-only SPARQL ASK query (write operations are rejected)."""
         self._validate_sparql(sparql)
         data = await self._sparql_post(sparql)
         return data.get("boolean", False)

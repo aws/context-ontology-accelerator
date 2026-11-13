@@ -22,20 +22,13 @@ reports what the binding requires. ``--apply`` then writes the tag. It is
 idempotent: a second run over a migrated deployment reports everything ``ok`` and
 changes nothing.
 
-Because the tag value is a **list**, a secret shared by several namespaces is a
-supported configuration rather than a conflict — the fix is to add the missing
-namespaces to the existing value, which ``--apply`` does. Two consequences worth
-knowing:
+The tag value is a list, so a secret shared by several namespaces is supported;
+``--apply`` adds the missing namespaces to the existing value. Two constraints:
 
-* **Single-writer only.** Appending is a read-modify-write on one tag, so two
-  copies of this script (or anything else tagging concurrently) can drop entries.
-  Run it once, from one place. The integ suite deliberately takes per-namespace
-  *copies* of a secret for exactly this reason — see ``bind_secret_to_namespace``
-  in ``tests/integ/fixtures.py``.
-* **There is a ceiling.** Secrets Manager caps a tag value at 256 characters,
-  which is 6 namespace UUIDs. A secret that would exceed it is reported rather
-  than truncated, because a truncated value fails to parse and would take down
-  every namespace already on it.
+* Appending is a read-modify-write on one tag, so concurrent writers can drop
+  entries. Run it once, from one place.
+* Secrets Manager caps a tag value at 256 characters (6 namespace UUIDs). A secret
+  that would exceed it is reported, not truncated.
 
 Outcomes:
 
@@ -83,9 +76,6 @@ Usage
 The tag KEY carries the deployment's prefix, so pass ``--tag-prefix`` when the
 deployment is not the default (or set ``RESOURCE_TAG_PREFIX``) — tagging under the
 wrong key leaves the secret invisible to the deployment's own IAM conditions.
-
-Run this BEFORE deploying the scan-time re-check, so no source scans in the
-window between the deploy and the tagging.
 """
 
 from __future__ import annotations
@@ -150,16 +140,8 @@ class SecretRef:
 def _iter_credential_sources(table: str, region: str):
     """Yield ``(namespaceId, sourceName, credentialSecretArn)`` per credential-holding source.
 
-    A full table scan is right here: this runs once per deployment as a migration,
-    the table holds sources (tens to low thousands), and there is no index on
-    sourceSubType. Paginated so a large table does not truncate silently.
-
-    Items are unwrapped with ``TypeDeserializer`` rather than by taking the single
-    value of each top-level attribute. ``configuration`` is a JSON *string* on
-    records the API wrote, but a DynamoDB *map* on some older ones (the handlers
-    tolerate both — see ``discovery_handler``), and a map's contents are themselves
-    still in wire form. A one-level unwrap would hand back ``{"S": "arn:..."}`` and
-    the ARN would be silently missed.
+    ``configuration`` is a JSON string on current records but a DynamoDB map on older
+    ones, so items are unwrapped with ``TypeDeserializer``.
     """
     deserializer = TypeDeserializer()
     ddb = boto3.client("dynamodb", region_name=region)
@@ -219,9 +201,6 @@ def _classify(refs: dict[str, SecretRef], deployment_account: str, default_regio
             try:
                 existing = parse_namespace_tag(raw)
             except ValueError as exc:
-                # Never overwrite a value we cannot parse: it was written by whoever
-                # owns the secret, and replacing it could revoke a namespace that is
-                # working today.
                 ref.status = "malformed"
                 ref.detail = f"tag {tag_key}={raw!r} does not parse: {exc}"
                 continue

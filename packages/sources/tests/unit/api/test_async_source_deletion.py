@@ -3,17 +3,11 @@
 
 """Asynchronous database-source deletion.
 
-A database source's teardown includes one DataZone ``delete_asset`` per
-discovered table — work proportional to source size — and it ran inside the
-``DELETE`` request on a 30-second Lambda. An 860-table source could not finish,
-so the request was killed mid-cleanup, and because the row was deleted regardless
-of progress the leftover assets were orphaned with nothing left to retry them.
-
-These tests pin the new contract:
+These tests pin the contract:
   * with a queue wired, DELETE answers 202/DELETING and enqueues;
   * the worker runs the same shared cleanup with a 15-minute envelope;
   * the row is deleted LAST, so an incomplete delete stays retryable;
-  * with no queue wired, the old inline behaviour is unchanged.
+  * with no queue wired, deletion runs inline.
 """
 
 from __future__ import annotations

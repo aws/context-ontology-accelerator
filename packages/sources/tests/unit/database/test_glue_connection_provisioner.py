@@ -515,7 +515,6 @@ class TestGrantConsumerSelect:
 
 
 @pytest.mark.unit
-@pytest.mark.unit
 class TestGrantIamAllowedPrincipals:
     """Regression cover: tables inherit access from a database-level
     IAM_ALLOWED_PRINCIPALS grant, and that grant must target the DISCOVERED schemas.
@@ -611,11 +610,7 @@ class TestGrantConsumerSelectNative:
         assert _mocks["lf"].grant_permissions.call_count == 2
 
     def test_invalid_input_exception_treated_as_idempotent_success(self, _mocks):
-        """LF raises InvalidInputException for duplicate grants in some configurations.
-
-        Regression: this was not treated as idempotent, causing re-scans to return
-        False and leave sources non-queryable even though the grant existed.
-        """
+        """LF raises InvalidInputException for duplicate grants in some configurations."""
         from coa_sources.database.connectors.glue_connection_provisioner import (
             grant_consumer_select_native,
         )
@@ -628,20 +623,12 @@ class TestGrantConsumerSelectNative:
         assert _mocks["lf"].grant_permissions.call_count == 2
 
     def test_db_already_exists_still_makes_table_grant(self, _mocks):
-        """Regression: DB DESCRIBE grant already exists must not skip the Table SELECT grant.
-
-        Previously both grants shared one try/except — AlreadyExistsException on the DB grant
-        caused early return, leaving the Table SELECT grant unmade. Each grant is now
-        independent so partial idempotency is handled correctly.
-        """
-        from botocore.exceptions import ClientError as BotoClientError
+        """An existing DB DESCRIBE grant must not skip the Table SELECT grant."""
         from coa_sources.database.connectors.glue_connection_provisioner import (
             grant_consumer_select_native,
         )
 
-        already_exists = BotoClientError(
-            {"Error": {"Code": "AlreadyExistsException", "Message": "x"}}, "GrantPermissions"
-        )
+        already_exists = ClientError({"Error": {"Code": "AlreadyExistsException", "Message": "x"}}, "GrantPermissions")
         # First call (DB DESCRIBE) → AlreadyExists; second call (Table SELECT) → success.
         _mocks["lf"].grant_permissions.side_effect = [already_exists, None]
 

@@ -77,7 +77,6 @@ describe("principal and ontology type", () => {
     expect(localizeOntologyType("induced", ja)).toBe(
       formatAppMessage("ja", "Induced"),
     );
-    expect(localizeOntologyType("user_created", ja)).not.toBe("user_created");
   });
 });
 

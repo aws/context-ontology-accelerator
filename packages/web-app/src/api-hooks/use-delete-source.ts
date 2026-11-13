@@ -36,9 +36,7 @@ export function useDeleteSource(
     ...options,
     mutationFn: () =>
       client.send(new DeleteSourceCommand({ namespaceId, sourceId })),
-    // Spread the caller's options first so a caller onSuccess cannot replace
-    // this one and skip the cache refresh. Return the caller's result so the
-    // mutation still waits for a promise it returns.
+    // See use-create-source: wraps the caller's onSuccess.
     onSuccess: (...args) => {
       queryClient.invalidateQueries({ queryKey: ["sources"] });
       queryClient.invalidateQueries({

@@ -69,39 +69,14 @@ import { InfoPopover } from "@components/InfoPopover";
 import { ButtonWithHint } from "@components/ButtonWithHint";
 import { useAppI18n, type AppTranslate } from "../../../i18n/LocaleProvider";
 
-/**
- * Whether the proposal has a COMPUTED ontology to show constraints for.
- *
- * The SHACL / infer-constraints (beta) panel is gated on this. It must be
- * hidden ONLY while there is genuinely nothing computed yet:
- *   - ``inducing`` — the in-progress stub written at trigger time (worker still
- *     running; no ontology exists),
- *   - ``failed`` — the induction errored; no ontology was produced.
- *
- * Every other status HAS a computed ontology and should show the panel:
- * ``pending``/``updated`` (reviewable — editing enabled), and
- * ``accepting``/``accepted``/``rejected``/``cancelled`` (viewable read-only —
- * the panel's own ``isReadOnly`` disables editing on terminal statuses). The
- * earlier gate wrongly excluded ``accepted`` et al., hiding constraints that
- * exist and were previously viewable — this restores them.
- */
+/** Whether a computed ontology exists to show constraints for. */
 const _NO_ONTOLOGY_STATUSES = new Set(["inducing", "failed"]);
 
 export function proposalHasComputedOntology(status: string): boolean {
   return !_NO_ONTOLOGY_STATUSES.has(status);
 }
 
-/**
- * Whether the proposal disables every edit + accept control on the page.
- *
- * True when the proposal has reached a terminal state (accepted/rejected/
- * cancelled/failed) OR when its ontology has not been produced yet
- * ("inducing" — the worker is still running). "failed" is genuinely terminal;
- * "inducing" is transient but has nothing to act on, so the same disable-all
- * applies. Named for what it gates rather than for the state machine — the
- * state-machine sense of "terminal" stays available for anyone else who needs
- * a stricter predicate.
- */
+/** Whether the proposal disables every edit and accept control. */
 const _READ_ONLY_STATUSES = new Set([
   "accepted",
   "rejected",
@@ -117,9 +92,7 @@ export function proposalIsReadOnly(status: string): boolean {
 /**
  * Origin-based node kind for graph color coding, derived from a
  * ``turtleToGraph`` node's ``data``. Grounding is read from the parsed
- * ``data.isGrounded`` flag (set from skos:exactMatch/closeMatch on the compact
- * prefixed subject) — NOT a string scan of the raw Turtle against the absolute
- * node IRI, which never matched the compact ``ind:Class skos:…`` serialization.
+ * ``data.isGrounded`` flag.
  */
 export function nodeKindFromData(
   data: Record<string, unknown>,
@@ -196,15 +169,9 @@ function extractInferredClasses(payload: unknown): InferredClass[] {
 }
 
 /**
- * Turn a failed save into a message that says whether to retry or to fix input.
- *
- * The update route distinguishes its failures deliberately: a 503 means the
- * attempt was abandoned before any write and is safe to repeat, while a 409 or
- * 400 means the request itself was refused and repeating it unchanged will fail
- * the same way. Rendering only `error.message` collapsed that distinction, so a
- * user who hit a transient DynamoDB throttle was told to fix input that was
- * never wrong. The server's own sentence is always kept — for grounding
- * overrides it names which class aborted the save.
+ * Turn a failed save into a message saying whether to retry or fix input: a 503
+ * means the attempt was abandoned before any write (safe to repeat), a 409 or
+ * 400 means the request was refused. The server's own sentence is always kept.
  */
 export function describeSaveFailure(error: unknown, t: AppTranslate): string {
   if (error instanceof ApiError) {
@@ -483,10 +450,8 @@ function ValidationResults({
             ]}
           />
         )}
-        {/* Findings list — scrollable. Errors first, then warnings, then info.
-            We keep the full list (no truncation) but cap visible height so a
-            proposal with 200 info-level findings doesn't push the page into
-            useless scroll-the-world territory. */}
+        {/* Findings list: full list, height capped so many findings do not
+            stretch the page. */}
         <div
           style={{
             maxHeight: 320,
@@ -553,9 +518,6 @@ function ValidationResults({
 }
 
 function CodeBlock({ children }: { children: string }) {
-  // Darker slate background + near-black text — the previous
-  // light-grey-on-white combo was effectively unreadable. Matches the
-  // contrast level of the new R2RML viewer's pretty-printed Turtle pane.
   return (
     <pre
       style={{
@@ -602,16 +564,10 @@ export function ProposalDetailPage() {
   const [proposal, setProposal] = useState<Proposal | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  // Save failures are recoverable editing errors. Keep them separate from the
-  // initial-load error, which replaces the page with a retry screen.
+  // Recoverable editing errors, kept off the page-level `error`, which replaces
+  // the page with a retry screen.
   const [saveError, setSaveError] = useState<string | null>(null);
-  // Inline error for the entity-edit panel. Kept separate from `error` so an
-  // apply failure surfaces inside the editor rather than replacing the whole
-  // page (the page-level `error` triggers a full-page "Could not load proposal").
   const [editError, setEditError] = useState<string | null>(null);
-  // Inline, non-destructive parse error for the live Turtle editor — kept off
-  // the page-level `error` so a transiently-invalid Turtle while editing does
-  // not replace the whole page with the "Could not load proposal" screen.
   const [parseError, setParseError] = useState<string | null>(null);
   const [accepting, setAccepting] = useState(false);
   const [cancelling, setCancelling] = useState(false);
@@ -641,20 +597,14 @@ export function ProposalDetailPage() {
   } | null>(null);
   const [editedTurtle, setEditedTurtle] = useState<string | null>(null);
   const [editedR2rml, setEditedR2rml] = useState<string | null>(null);
-  // Parsed grounding matches (one per grounded table). Held in state rather than
-  // read inline off ``proposal.metadata.matches`` because the detail endpoint
-  // now serves them out-of-band via ``matches_url`` (a presigned S3 GET) to stay
-  // under the 6 MB response cap, so they arrive asynchronously in refresh().
-  // Legacy proposals still carry them inline; refresh() prefers that when present.
+  // Parsed grounding matches. They may arrive out-of-band via ``matches_url``
+  // (a presigned S3 GET) to stay under the 6 MB response cap, so they are state
+  // set in refresh(). Legacy proposals carry them inline.
   const [groundingMatches, setGroundingMatches] = useState<ConceptMatch[]>([]);
   const [dirty, setDirty] = useState(false);
-  // Staged grounding overrides (stable table identity, with a bare-table
-  // fallback for legacy matches → chosen foundational URI, or ``null`` to keep
-  // the table novel) that are NOT yet persisted. Picking a candidate / marking
-  // novel stages here + marks dirty; sent on the next explicit Save.
-  // The wire contract splits candidate URIs into ``grounding_overrides`` and
-  // clears into ``novel_tables`` so generated OpenAPI clients never need null
-  // map values. The staged UI state keeps the ergonomic nullable form.
+  // Staged grounding overrides (not yet persisted): table identity → chosen
+  // foundational URI, or ``null`` to keep the table novel. Sent on the next
+  // explicit Save.
   const [pendingGroundingOverrides, setPendingGroundingOverrides] = useState<
     Record<string, string | null>
   >({});
@@ -725,10 +675,8 @@ export function ProposalDetailPage() {
                 : Promise.resolve([]),
             resolveConstraintConfig(p, fetchJsonFromUrl),
           ]);
-        // Seed the fetched config back onto metadata rather than holding it in
-        // separate state: every consumer (ConstraintPanel, the Infer merge, the
-        // save path) already reads and writes metadata.constraint_config, and the
-        // detail response no longer carries it inline once it is offloaded.
+        // Seed the fetched config onto metadata: every consumer (ConstraintPanel,
+        // the Infer merge, the save path) reads metadata.constraint_config.
         setProposal(
           constraintConfig === undefined
             ? p
@@ -757,11 +705,7 @@ export function ProposalDetailPage() {
     refresh();
   }, [refresh]);
 
-  // Auto-poll while the proposal is mid-accept so a user who navigates
-  // away and back still sees the terminal status without manually
-  // refreshing. The interval clears when the proposal leaves the
-  // in-progress states (``accepting`` → ``embeddings_sync``) or the page
-  // unmounts.
+  // Poll while an accept is in progress so a returning user sees the final status.
   useEffect(() => {
     if (!isProposalAcceptInProgress(proposal?.status ?? "")) return;
     if (!proposalId || !namespaceId) return;
@@ -775,12 +719,9 @@ export function ProposalDetailPage() {
     return () => window.clearInterval(id);
   }, [apiClient, proposal?.status, proposalId, namespaceId]);
 
-  // Parsing the (potentially multi-MB) Turtle and building the graph are
-  // synchronous and block the main thread for ~1-2s on large ontologies — on
-  // top of the S3 fetch in refresh(). Compute them off the render in a deferred
-  // effect (setTimeout 0) so the loading placeholder paints first; ``parsing``
-  // gates that placeholder. Recompute whenever the (edited) Turtle changes.
-  // (Previously ``turtleParse`` was recomputed on every render — unmemoized.)
+  // Parsing a multi-MB Turtle blocks the main thread for ~1-2s, so it runs in a
+  // deferred effect (setTimeout 0) and the loading placeholder paints first;
+  // ``parsing`` gates that placeholder.
   const [turtleParse, setTurtleParse] = useState<ReturnType<
     typeof parseTurtleEntities
   > | null>(null);
@@ -1147,7 +1088,6 @@ export function ProposalDetailPage() {
       );
       setValidation(initial);
 
-      // Poll until terminal
       const start = Date.now();
       while (Date.now() - start < 90_000) {
         await new Promise((r) => setTimeout(r, 2000));
@@ -1220,11 +1160,6 @@ export function ProposalDetailPage() {
   // Gates every edit + accept control on this page. See proposalIsReadOnly.
   const isReadOnly = proposalIsReadOnly(proposal.status);
   const isAccepting = isProposalAcceptInProgress(proposal.status) || accepting;
-  // Show the SHACL / infer-constraints panel whenever the proposal has a
-  // computed ontology (see proposalHasComputedOntology) — hidden only for the
-  // in-progress "inducing" stub and "failed" runs where nothing exists yet.
-  // Accepted/rejected/cancelled still show it read-only (isReadOnly disables
-  // editing inside the panel).
   const hasComputedOntology = proposalHasComputedOntology(proposal.status);
 
   return (
@@ -1692,10 +1627,6 @@ export function ProposalDetailPage() {
             </ExpandableSection>
           )}
 
-          {/* Foundational grounding is no longer a standalone card — it is
-              folded into each class-card's Matches tab (Item 1). The
-              ConceptMatch records + staged overrides thread down through
-              ProposalEntitiesPanel into ClassDetailPanel. */}
           {updating && groundingMatches.length > 0 && (
             <Box variant="small" color="text-status-info">
               {t("Rebuilding ontology with updated grounding...")}
@@ -1836,10 +1767,6 @@ export function ProposalDetailPage() {
             </ExpandableSection>
           )}
 
-          {/* SHACL / infer-constraints (beta): shown whenever a computed
-              ontology exists. Hidden ONLY for the in-progress "inducing" stub
-              and "failed" runs (nothing to show yet). Accepted/rejected/
-              cancelled show it read-only — isReadOnly disables editing. */}
           {hasComputedOntology && (
             <ConstraintPanel
               isReadOnly={isReadOnly}
@@ -1941,7 +1868,6 @@ export function ProposalDetailPage() {
                     },
                   );
                   setShaclValidation(initial);
-                  // Poll until terminal
                   const start = Date.now();
                   const jobId = initial.job_id;
                   while (Date.now() - start < 30_000) {
@@ -1985,7 +1911,6 @@ export function ProposalDetailPage() {
         </SpaceBetween>
       </div>
 
-      {/* Right edit panel */}
       {editingEntity && (
         <div
           style={{

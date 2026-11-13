@@ -97,10 +97,8 @@ describe("IdpAuthenticationStack provisions admin user", () => {
       new IdpAuthenticationStack(app, "AuthWithUser"),
     );
 
-    // No Secrets Manager secret
     template.resourceCountIs("AWS::SecretsManager::Secret", 0);
 
-    // Custom resource passes user details directly
     template.hasResourceProperties("AWS::CloudFormation::CustomResource", {
       Username: Match.anyValue(),
       Email: Match.anyValue(),

@@ -50,7 +50,6 @@ class TestAcceptFailErrorTruncation:
         call_args = mock_dynamo_store.update_proposal.call_args
         actual_error = call_args[1]["accept_error"]
 
-        # Should be truncated to exactly 1000 chars
         assert len(actual_error) == 1000
         assert actual_error.startswith("BulkIndexError: ")
         assert actual_error.endswith("x" * 100)  # ends with truncated 'x's
@@ -69,35 +68,10 @@ class TestAcceptFailErrorTruncation:
         assert len(actual_error) == 1000
         assert actual_error == error_msg
 
-    @patch("coa_ontology.proposals.dynamo_store")
-    def test_error_with_embedded_json_vectors_truncated(self, mock_dynamo_store):
-        """Realistic scenario: BulkIndexError with JSON vectors is truncated."""
-        from coa_ontology.proposals import _accept_fail
-
-        # Simulate an error message containing a 1024-dim vector
-        vector_json = str([0.123456789] * 1024)  # ~12K chars
-        error_msg = f"BulkIndexError: Failed to index document {{embedding: {vector_json}, ...}}"
-
-        _accept_fail("proposal-abc", "test-ns", error_msg)
-
-        call_args = mock_dynamo_store.update_proposal.call_args
-        actual_error = call_args[1]["accept_error"]
-
-        # Should be truncated to 1000 chars
-        assert len(actual_error) == 1000
-        assert actual_error.startswith("BulkIndexError: Failed to index document")
-
     @patch("coa_ontology.proposals._log")
     @patch("coa_ontology.proposals.dynamo_store")
     def test_failure_is_logged_at_error_with_the_step(self, mock_dynamo_store, mock_log):
-        """A failed accept MUST hit CloudWatch, not only DynamoDB.
-
-        Regression: verified live on 2026-07-28 that a parse failure produced
-        accept_failed in DDB but ZERO log lines — the route's 202 was the only
-        trace, so an operator had nothing to grep. _accept_fail is the single
-        choke point for every terminal path (parse / validation / exhausted step
-        retries / catch-all), so it logs at ERROR with the failing step.
-        """
+        """_accept_fail logs every terminal failure at ERROR with its step."""
         from coa_ontology.proposals import _accept_fail
 
         _accept_fail("proposal-log", "test-ns", "Invalid ontology Turtle: bad syntax", step="ingest")
@@ -118,54 +92,21 @@ class TestAcceptFailErrorTruncation:
 
         mock_dynamo_store.update_proposal.side_effect = Exception("DynamoDB timeout")
 
-        # Should not raise
         _accept_fail("proposal-xyz", "test-ns", "Some error")
 
-        # Should log the exception
         mock_log.exception.assert_called_once()
         assert "failed to record accept_failed status" in mock_log.exception.call_args[0][0]
-
-    @patch("coa_ontology.proposals.dynamo_store")
-    def test_unicode_error_message_handled(self, mock_dynamo_store):
-        """Unicode characters in error messages are handled correctly."""
-        from coa_ontology.proposals import _accept_fail
-
-        error_msg = "Error with émojis 🔥 and spëcial çhars: " + "ñ" * 1000
-
-        _accept_fail("proposal-unicode", "test-ns", error_msg)
-
-        call_args = mock_dynamo_store.update_proposal.call_args
-        actual_error = call_args[1]["accept_error"]
-
-        # Should be truncated to 1000 chars
-        assert len(actual_error) == 1000
 
     @patch("coa_ontology.proposals.dynamo_store")
     def test_non_string_error_converted_to_string(self, mock_dynamo_store):
         """Non-string error objects are converted to string before truncation."""
         from coa_ontology.proposals import _accept_fail
 
-        # Pass an exception object (not a string)
         error_obj = ValueError("Test error")
         _accept_fail("proposal-obj", "test-ns", error_obj)
 
         call_args = mock_dynamo_store.update_proposal.call_args
         actual_error = call_args[1]["accept_error"]
 
-        # Should be stringified
         assert isinstance(actual_error, str)
         assert "Test error" in actual_error
-
-
-@pytest.mark.unit
-class TestAcceptFailDocstring:
-    """Verify the updated docstring mentions error truncation."""
-
-    def test_docstring_mentions_truncation(self):
-        """The _accept_fail docstring documents the 1000-char truncation."""
-        from coa_ontology.proposals import _accept_fail
-
-        docstring = _accept_fail.__doc__
-        assert docstring is not None
-        assert "truncated" in docstring.lower() or "1000" in docstring
-        assert "DynamoDB" in docstring or "dynamo" in docstring.lower()

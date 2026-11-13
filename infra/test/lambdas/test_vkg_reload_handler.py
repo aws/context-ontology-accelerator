@@ -370,8 +370,6 @@ class TestHandler:
         result = index.handler(_make_event(), None)
         assert result["status"] == "provisioned"
 
-    # ── circuit breaker + reload-outcome metrics ────────────────
-
     @patch.dict(os.environ, ENV)
     @patch("index.ecs")
     @patch("index.sd")
@@ -468,8 +466,6 @@ class TestHandler:
         index.ecs = mock_ecs
         index.sd = mock_sd
         index.ssm = mock_ssm
-
-        import pytest
 
         with pytest.raises(RuntimeError, match="ecs boom"):
             index.handler(_make_event(), None)
@@ -1190,13 +1186,7 @@ class TestSweep:
     @patch("index.sd")
     @patch("index.ssm")
     def test_task_sizing_env_threaded_into_task_definition(self, mock_ssm, mock_sd, mock_ecs):
-        """#149 cause B/C: reload reads VKG_TASK_CPU/MEMORY/ONTOP_JAVA_ARGS and
-
-        threads them into the registered task def, so a reloaded task matches the
-        CDK-provisioned initial one instead of the old hardcoded 512/1024 with a
-        dead JAVA_OPTS. Guards against a regression that would silently
-        under-provision and never apply the heap.
-        """
+        """Reload threads VKG_TASK_CPU/MEMORY/ONTOP_JAVA_ARGS into the registered task definition."""
         mock_ssm.get_parameter.return_value = {
             "Parameter": {"Value": "111.dkr.ecr.us-west-2.amazonaws.com/scl:vkg-NEW"}
         }
@@ -1224,7 +1214,7 @@ class TestSweep:
         env = {e["name"]: e["value"] for e in td_kwargs["containerDefinitions"][0]["environment"]}
         # The Lambda enforces the loopback bind itself, even when the env value lacks it.
         assert env["ONTOP_JAVA_ARGS"] == "-Xmx3072m -Xms1024m -Dserver.address=127.0.0.1"
-        # The dead variable must NOT be emitted — that was the #149 cause C no-op.
+        # The unused JAVA_OPTS variable must NOT be emitted.
         assert "JAVA_OPTS" not in env
 
     @pytest.mark.parametrize(
@@ -1281,11 +1271,7 @@ class TestSweep:
     @patch("index.sd")
     @patch("index.ssm")
     def test_task_sizing_defaults_match_cdk_when_env_unset(self, mock_ssm, mock_sd, mock_ecs):
-        """With the sizing env unset, the reload falls back to defaults that match
-
-        the CDK stack (cpu=1024/memory=2048, -Xmx1536m -Xms512m), so an
-        un-parameterised reload is still safe rather than the old 512/1024.
-        """
+        """With the sizing env unset, the reload falls back to the CDK stack defaults."""
         mock_ssm.get_parameter.return_value = {
             "Parameter": {"Value": "111.dkr.ecr.us-west-2.amazonaws.com/scl:vkg-NEW"}
         }
@@ -1424,10 +1410,7 @@ class TestSweep:
     @patch("index.sd")
     @patch("index.ssm")
     def test_heap_derived_from_task_memory_when_java_args_unset(self, mock_ssm, mock_sd, mock_ecs):
-        """When VKG_ONTOP_JAVA_ARGS is unset, the heap is derived from
-        VKG_TASK_MEMORY (max heap ~=75%, initial ~=25%) so bumping memory alone
-        scales the heap in step rather than leaving a stale hardcoded -Xmx.
-        """
+        """When VKG_ONTOP_JAVA_ARGS is unset, the heap is derived from VKG_TASK_MEMORY."""
         # Ensure no explicit heap override leaks in from a broader ENV.
         os.environ.pop("VKG_ONTOP_JAVA_ARGS", None)
         mock_ssm.get_parameter.return_value = {
@@ -1462,20 +1445,12 @@ class TestSweep:
     @patch("index.sd")
     @patch("index.ssm")
     def test_register_task_definition_failure_fails_cleanly_without_creating_service(self, mock_ssm, mock_sd, mock_ecs):
-        """If register_task_definition raises during a provision, the handler
-
-        returns failed and never calls create_service, rather than letting the
-        exception propagate and orphan the just-created Cloud Map entry.
-        """
+        """A failed register_task_definition returns failed and never calls create_service."""
         mock_ecs.exceptions.ServiceNotFoundException = type("ServiceNotFoundException", (Exception,), {})
         mock_ecs.exceptions.ServiceNotActiveException = type("ServiceNotActiveException", (Exception,), {})
         mock_ecs.exceptions.InvalidParameterException = type("InvalidParameterException", (Exception,), {})
         same_image = "111.dkr.ecr.us-west-2.amazonaws.com/scl:vkg-abc"
         mock_ssm.get_parameter.return_value = {"Parameter": {"Value": same_image}}
-        # Same image so the reload path takes the unchanged branch (no task-def
-        # registration there); update_service then raises ServiceNotFound so the
-        # handler routes to the provision path, where _register_task_definition
-        # is called and we force it to fail.
         mock_ecs.describe_services.return_value = {"services": [{"taskDefinition": "arn:td:old"}]}
         mock_ecs.describe_task_definition.return_value = {
             "taskDefinition": {"containerDefinitions": [{"image": same_image}]}
